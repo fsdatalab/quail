@@ -21,9 +21,10 @@ filter answers, join answers, KV regret, and complete physical request
 execution. The benchmark evaluator scores the Arrow answer relations from all
 four backends.
 
-The stock vLLM and SGLang paths were also checked through the public
-`ModalComputeProvider.execute(QueryRequest)` interface. Both returned Arrow
-query results without using a benchmark-specific execution path.
+The stock vLLM and SGLang paths were also checked through the then-current
+Modal submission interface. Both returned Arrow query results without a
+benchmark-specific execution path. Sessions now run in process, as described
+in [the session update](2026-09-09-in-process-sessions.md).
 
 LEP-1 confirmed all four paths on one H100 per backend. The measured query
 times were 1.27 seconds for Quail, 1.50 seconds for stock vLLM, 1.40 seconds

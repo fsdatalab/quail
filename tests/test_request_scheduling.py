@@ -13,7 +13,7 @@ from quail.backends.request_scheduling import (
 )
 
 
-def test_join_regret_buckets_pair0_and_rest():
+def test_join_submission_order_empty_inputs_and_regret():
     # Two anchors, two suffixes each, 16-token blocks. Anchor 0 was
     # computed before (40 seen tokens): pair 0 misses everything
     # (regret 32, the block floor of 40) and pair 1 hits fully.
@@ -24,6 +24,38 @@ def test_join_regret_buckets_pair0_and_rest():
     cached = [0, 32, 16, 16]
 
     assert join_regret_tokens(prefixes, 2, cached, [40, 0], 16) == 48
+
+    for submission in ["anchor-major", "suffix-major"]:
+        prefixes = [[100 + i] * (4 + i) for i in range(5)]
+        suffixes = [[200 + j] * 3 for j in range(4)]
+        client = _ParityClient()
+        result = run_join_grouped(client, object(), prefixes, suffixes, {1},
+                                  submission=submission)
+        expected = ([[100 + i, 200 + j] for i in range(5) for j in range(4)]
+                    if submission == "anchor-major" else
+                    [[100 + i, 200 + j] for j in range(4) for i in range(5)])
+        assert len(client.calls) == 1
+        assert [[p["prompt_token_ids"][0], p["prompt_token_ids"][-1]]
+                for p in client.calls[0]] == expected
+        assert result["answers"] == [
+            int((i + j) % 2 == 0) for i in range(5) for j in range(4)]
+        assert result["cached_per_request"] == [
+            (100 + i) % 7 for i in range(5) for j in range(4)]
+        assert result["cached_tokens"] == sum(result["cached_per_request"])
+        assert result["fresh_tokens"] == sum(
+            len(p) + len(s) for p in prefixes for s in suffixes
+        ) - result["cached_tokens"]
+        assert result["submission"] == submission
+        with pytest.raises(ValueError, match="unknown join submission"):
+            run_join_grouped(_ParityClient(), object(), prefixes, suffixes, {1},
+                             submission="unknown")
+
+    for prefixes, suffixes in [([], [[1]]), ([[1]], []), ([], [])]:
+        result = run_join_grouped(_ParityClient(), object(), prefixes, suffixes, {1},
+                                  submission="suffix-major")
+        assert result["answers"] == []
+        assert result["cached_per_request"] == []
+        assert result["fresh_tokens"] == 0
 
 
 class _FakeFilterEngine:
@@ -49,7 +81,7 @@ class _FakeFilterEngine:
         )]
 
 
-def test_filter_chain_submits_next_stage_before_prior_stage_finishes():
+def test_filter_pipelining_advances_and_refills():
     engine = _FakeFilterEngine()
     result = run_filter_chain(
         engine,
@@ -68,8 +100,6 @@ def test_filter_chain_submits_next_stage_before_prior_stage_finishes():
         engine.events.index(("finish", "test-1-0"))
     assert result["survivors"] == [0, 1]
 
-
-def test_async_filters_advance_and_refill_before_slow_request_finishes():
     async def run():
         release = asyncio.Event()
         events = []
@@ -113,7 +143,7 @@ def test_async_filters_advance_and_refill_before_slow_request_finishes():
     asyncio.run(run())
 
 
-def test_async_filter_failure_cancels_other_requests():
+def test_async_filter_failure_and_empty_input():
     async def run():
         pending = asyncio.Event()
         cancelled = asyncio.Event()
@@ -136,8 +166,6 @@ def test_async_filter_failure_cancels_other_requests():
 
     asyncio.run(run())
 
-
-def test_async_filter_empty_input_submits_nothing():
     async def generate(prompt, sampling_params):
         raise AssertionError("no documents")
 
@@ -162,40 +190,3 @@ class _ParityClient:
                 prompt_token_ids=ids,
                 num_cached_tokens=ids[0] % 7))
         return outs
-
-
-@pytest.mark.parametrize("submission", ["anchor-major", "suffix-major"])
-def test_join_answers_preserve_anchor_major_order(submission):
-    prefixes = [[100 + i] * (4 + i) for i in range(5)]
-    suffixes = [[200 + j] * 3 for j in range(4)]
-    client = _ParityClient()
-    result = run_join_grouped(client, object(), prefixes, suffixes, {1},
-                              submission=submission)
-    expected = ([[100 + i, 200 + j] for i in range(5) for j in range(4)]
-                if submission == "anchor-major" else
-                [[100 + i, 200 + j] for j in range(4) for i in range(5)])
-    assert len(client.calls) == 1
-    assert [[p["prompt_token_ids"][0], p["prompt_token_ids"][-1]]
-            for p in client.calls[0]] == expected
-    assert result["answers"] == [
-        int((i + j) % 2 == 0) for i in range(5) for j in range(4)]
-    assert result["cached_per_request"] == [
-        (100 + i) % 7 for i in range(5) for j in range(4)]
-    assert result["cached_tokens"] == sum(result["cached_per_request"])
-    assert result["fresh_tokens"] == sum(
-        len(p) + len(s) for p in prefixes for s in suffixes
-    ) - result["cached_tokens"]
-    assert result["submission"] == submission
-    with pytest.raises(ValueError, match="unknown join submission"):
-        run_join_grouped(_ParityClient(), object(), prefixes, suffixes, {1},
-                         submission="unknown")
-
-
-@pytest.mark.parametrize("prefixes,suffixes",
-                         [([], [[1]]), ([[1]], []), ([], [])])
-def test_suffix_major_join_empty_input(prefixes, suffixes):
-    result = run_join_grouped(_ParityClient(), object(), prefixes, suffixes, {1},
-                              submission="suffix-major")
-    assert result["answers"] == []
-    assert result["cached_per_request"] == []
-    assert result["fresh_tokens"] == 0

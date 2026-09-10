@@ -21,7 +21,7 @@ Two probe functions on the same image, one cold container per call
   vllm import (falling back to the ephemeral default) and passes no
   revision.
 - probe_pinned: the fixed behavior as shipped in
-  quail.runtime.worker. First call seeds the modelinfos JSON on the
+  quail.bench.quailb_parallel. First call seeds the modelinfos JSON on the
   volume (one-time cost); the second call, in a fresh container, is
   the steady-state cold boot every later container sees.
 
@@ -64,6 +64,7 @@ image = (
           "VLLM_LOGGING_LEVEL": "WARNING",
           "VLLM_USE_FLASHINFER_SAMPLER": "0",
           "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+          "QUAIL_CACHE_DIR": "/root/.cache/kernels",
           "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
           "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
           "TRITON_CACHE_DIR": "/root/.cache/kernels/triton"})

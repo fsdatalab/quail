@@ -70,12 +70,10 @@ def booted(monkeypatch):
                         lambda *a, **k: SimpleNamespace())
     monkeypatch.setattr(worker, "warm_kernels",
                         lambda *a, **k: {"tier": "compiled"})
-    monkeypatch.setattr("quail.runtime.volumes.commit_kernel_cache",
-                        lambda: None)
     return calls
 
 
-def test_single_gpu_context_reads_the_plan_envelope():
+def test_gpu_context_model_reuse_and_graph_state(booted):
     registry = built_in_registry()
     envelope = {"workers": 4, "model": "qwen3-4b-fp8", "device": "h100-sxm"}
 
@@ -87,8 +85,6 @@ def test_single_gpu_context_reads_the_plan_envelope():
     assert context.device.name == "h100-sxm"
     assert dict(context.query_settings) == {}
 
-
-def test_second_query_reuses_the_loaded_model(booted):
     calls = booted
     registry = built_in_registry()
     backend = FakeBackend(calls)
@@ -115,6 +111,20 @@ def test_second_query_reuses_the_loaded_model(booted):
     assert second["warm_kernels_s"] == 0.0
     assert again.chunk_tokens == 4096
     assert calls == ["bind_query:4096"]
+
+    registry = built_in_registry()
+    context = worker._single_gpu_context(registry, {
+        "workers": 1, "model": "qwen3-4b-fp8", "device": "h100-sxm",
+    })
+    gpu, _ = worker._boot_for_query(
+        {}, FakeBackend(booted), context, 8192, [1], [2])
+
+    state = worker._gpu_state(gpu)
+
+    assert state["model_execution"] is gpu.execution
+    assert state["arena"] is gpu.arena
+    assert state["pipeline"] is gpu.pipeline
+    assert state["spec"].name == "qwen3-4b-fp8"
 
 
 ENVELOPE = {
@@ -148,10 +158,6 @@ def test_prepared_boot_is_handed_to_the_query_and_used_once(
     monkeypatch.setattr(worker, "_boot_for_query", counting_boot)
     monkeypatch.setattr(worker, "execute_single",
                         lambda *a, **k: {"_outputs": {}, "wall_s": 1.0})
-    monkeypatch.setattr("quail.runtime.volumes.run_record_path", lambda: None)
-    monkeypatch.setattr("quail.runtime.volumes.commit_results", lambda: None)
-    monkeypatch.setattr("quail.runtime.volumes.commit_kernel_cache",
-                        lambda: None)
 
     worker.prepare_quail_request(SimpleNamespace(
         gpu_count=1, registry=registry, runtime_state=runtime_state,
@@ -175,19 +181,3 @@ def test_prepared_boot_is_handed_to_the_query_and_used_once(
     assert second.metrics["boot_kind"] == "warm"
     assert len(boots) == 2
     assert runtime_state[("quail", "qwen3-4b-fp8")] is gpu
-
-
-def test_gpu_state_carries_what_the_graph_reads(booted):
-    registry = built_in_registry()
-    context = worker._single_gpu_context(registry, {
-        "workers": 1, "model": "qwen3-4b-fp8", "device": "h100-sxm",
-    })
-    gpu, _ = worker._boot_for_query(
-        {}, FakeBackend(booted), context, 8192, [1], [2])
-
-    state = worker._gpu_state(gpu)
-
-    assert state["model_execution"] is gpu.execution
-    assert state["arena"] is gpu.arena
-    assert state["pipeline"] is gpu.pipeline
-    assert state["spec"].name == "qwen3-4b-fp8"

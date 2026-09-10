@@ -80,8 +80,7 @@ with the input document length distribution used for the survivors.
 
 ## The executor
 
-`quail.executor` holds the GPU code and runs only inside the Modal
-image:
+`quail.executor` holds the GPU code and runs in the GPU process:
 
 - `pack.py`: `JoinAdmission` for joins and `FilterAdmission` for filters.
   Both admit work continuously: a chunk mixes stages, and a document

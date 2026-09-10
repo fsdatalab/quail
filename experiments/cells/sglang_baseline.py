@@ -25,16 +25,16 @@ def check():
         'previous tile budget, so removing tiles should preserve their '
         'ordering.'
     )
+    run_dir = f"/results/benchmarks/quailb/{run_label}"
     call = run_sglang_query_family.spawn(
-        model='qwen3-4b-fp8', sf=0.1, lf=1, query_ids_csv='FEV-9',
-        run_label=run_label, prediction=prediction_text,
+        model='qwen3-4b-fp8', sf=0.1, query_ids_csv='FEV-9',
+        run_dir=run_dir,
         ground_truth_collection='gt_77bb8b128743a79aedddaa24c808c3f8',
     )
     print(f'function call id: {call.object_id}', flush=True)
     print(f'prediction: {prediction_text}', flush=True)
     result = json.loads(call.get())
-    for method, suite in result['suites'].items():
-        print(f'{method} result volume path: {suite["aggregate_volume_path"]}',
-              flush=True)
+    print(f'run directory: {run_dir}', flush=True)
     print(f'process cleanup: {result["process_cleanup"]}', flush=True)
-    print(f'comparison volume path: {result["result_volume_path"]}', flush=True)
+    print(f'comparison volume path: {run_dir}/{result["result_path"]}',
+          flush=True)

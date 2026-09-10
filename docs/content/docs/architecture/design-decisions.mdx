@@ -18,13 +18,12 @@ speculation, or forking.
 
 ## Main boundaries
 
-Quail has six main interfaces.
+Quail has five main interfaces.
 
 - Logical nodes describe what a query means.
 - Logical and physical rules rewrite plans.
 - A model backend plans and runs model work.
 - A table provider supplies schemas and bounded Arrow batches.
-- A compute provider chooses where the query runs.
 - An execution observer records physical node metrics.
 
 Built in code uses the same interfaces as extension code.
@@ -71,21 +70,19 @@ One query follows this path.
 
 1. SQL or the builder creates one logical plan.
 2. Logical rules validate and rewrite the plan.
-3. The session creates one `QueryRequest`.
-4. The compute provider sends the logical plan and table bindings to a worker.
-5. The worker opens remote sources or reads Arrow tables sent by the client.
+3. The session keeps the logical plan and registered tables.
+4. `Query.run()` calls the in-process executor with the existing query.
+5. The session reads sources through their providers.
 6. The worker tokenizes only the document columns needed by the query.
 7. The selected backend proposes a typed physical graph.
 8. The worker runs the complete graph.
 9. Arrow combines exact answer relations and applies projection and limit.
-10. The compute provider returns one `QueryResult`.
+10. The query returns one `QueryResult`.
 
 <Mermaid chart={`
 flowchart TD
     A[SQL or builder] --> B[Logical plan]
-    B --> C[QueryRequest]
-    C --> D[Compute provider]
-    D --> E[Source reading and tokenization]
+    B --> E[Source reading and tokenization in the session process]
     E --> F[Physical planning]
     F --> G[Physical graph]
     G --> H[Model backend]
@@ -93,9 +90,9 @@ flowchart TD
     I --> J[QueryResult]
 `} />
 
-The default compute provider runs the model in the calling process.
-`ModalComputeProvider` runs it in Modal Functions in the existing
-`quail-engine` app instead. Quail does not run an application server.
+The session runs the model in the calling process. On Modal, the GPU
+function creates a normal session and runs the whole query there. The supplied
+query example uses the existing `quail-engine` app.
 
 ## Logical plans
 
@@ -111,7 +108,7 @@ Each logical node supplies:
 The built in nodes are `Scan`, `SemanticFilter`, `SemanticJoin`, and
 logical `Project`.
 
-Modal serializes the logical plan as a Python value. The extension module that
+The session keeps the logical plan in process. The extension module that
 defines a custom logical node must be installed in the worker image.
 
 The SQL front end supports Snowflake `AI_FILTER` and BigQuery `AI.IF`.
@@ -195,26 +192,20 @@ scheduling, KV reset, and metrics.
 Another backend can use different physical nodes, scheduling, and KV. It does
 not need to implement Quail's node types.
 
-Physical requests and responses stay inside the compute worker. They use
-`PhysicalRequest` and `PhysicalResponse`. Both contain typed Arrow tables.
-There is one worker entry point for physical execution.
+`PhysicalRequest` and `PhysicalResponse` are the internal interface between
+the runtime and model backend. They carry tokenized inputs and model outputs.
+The runtime calls the backend through `execute_request`.
 
-## Compute providers
+## In-process execution
 
-A compute provider implements:
+A session owns its registered tables, tokenizer, extensions, and temporary
+token files. `Query.run()` runs the existing query directly, so planning
+and tokenization state remain available for reuse.
 
-```python
-class ComputeProvider(Protocol):
-    def execute(self, request: QueryRequest) -> QueryResult: ...
-    def close(self) -> None: ...
-```
-
-`InProcessComputeProvider` is the default. It runs the model on the GPU in
-the calling process. `ModalComputeProvider` uses one Modal Function for each
-supported GPU count in the existing `quail-engine` app.
-
-A different compute provider can run the same logical request elsewhere.
-Modal specific function calls are not part of the public query API.
+Modal wraps the whole query in a GPU function. The function creates a session,
+registers sources, runs queries, and collects or saves results. Image building,
+credentials, GPU allocation, and container lifetime belong to the Modal function.
+The engine has no remote submission interface.
 
 ## Table providers
 
@@ -224,17 +215,15 @@ A table provider supplies:
 - A content identity.
 - Optional statistics.
 - A bounded Arrow batch reader.
-- An optional remote source description.
 
 The built in providers support in memory Arrow tables, Arrow datasets, Parquet,
 and Hugging Face datasets.
 
-A remote Parquet or Hugging Face source is opened by the worker. A client only
-reads enough metadata to check the query. A client-only source sends only the
-columns used by the query.
+Providers open sources in the session's process. A Modal function can open a
+remote source or register an Arrow table passed as a function argument.
 
-Remote source readers are registered by source type. Adding a new source does
-not require a change to the worker.
+Register a table provider directly on the session. Its `scan` method handles
+storage reads without a separate source reader registration.
 
 The worker currently keeps the complete token Arrow column while a query runs.
 Very large sources still need query partitioning or a persistent token store.
@@ -245,20 +234,17 @@ This redesign does not claim to solve that limit.
 Extensions are objects registered on the session's `ExtensionRegistry`,
 for example `registry.register_physical_rule(MyRule())`; a package can
 also expose one entry point, `register_quail_extension(registry)`.
-Registered objects travel to the compute worker pickled, in the
-manifest the query request and the physical plan carry. The registry
-can hold:
+Register objects in the process that owns the session. The registry can hold:
 
 - Logical optimizer rules.
 - Physical planners and optimizer rules.
 - Model backends, models, and devices.
 - Physical node codecs and runtimes.
-- Remote source readers.
 - Execution observers.
 
-The client records the extension module and its packages. The Modal provider
-copies or installs them in the existing worker image. The worker imports the
-same module before planning the logical plan or decoding the physical plan.
+On Modal, include extension code and packages in the function's image.
+Import and register extensions inside that function. The optional multi-GPU
+backend still transfers its registry to its GPU child processes.
 
 The plan and request do not have several independent format version globals.
 Registered physical node names identify codecs. Missing codecs, backends,
@@ -267,23 +253,21 @@ models, devices, or runtimes fail before model execution.
 ## DataFusion use
 
 DataFusion can keep its scans, ordinary joins, and final projection. A custom
-DataFusion operator can submit the Arrow columns needed by a Quail logical
-query through a compute provider.
-
-The current Modal provider is a Python interface. A public Rust client would
-need a separate cross-language interface.
+DataFusion operator can register the needed Arrow columns on a Quail session
+and run the query in the same process. A public Rust client would need a
+separate cross-language interface.
 
 ## Checks
 
 The CPU suite covers:
 
 - Physical codec round trips.
-- Registered physical nodes, rules, and source readers.
+- Registered physical nodes, rules, and table providers.
 - Custom backend dispatch.
 - Full physical graph execution.
 - Observer reports over the complete graph.
 - Local and remote table sources.
-- Modal Function request preparation and Arrow results.
+- Whole-query Modal functions and collected Arrow results.
 - Snowflake and BigQuery SQL forms.
 - Planning for both models and 1, 2, 4, and 8 GPUs.
 

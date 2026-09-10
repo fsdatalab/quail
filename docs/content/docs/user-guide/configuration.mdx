@@ -4,7 +4,7 @@ description: EngineConfig, session arguments, models, and backends.
 ---
 
 Configuration has two layers: `EngineConfig` says what to run, and the
-`Session` arguments say how the client is set up.
+`Session` arguments select its tokenizer and extensions.
 
 ## EngineConfig
 
@@ -49,8 +49,8 @@ session = quail.Session(quail.EngineConfig(
 
 This runs on the GPUs in the calling process. RTX support includes planning
 constants and FlashAttention-2 selection; execution still needs validation on
-RTX hardware. H100 uses FlashAttention-3. `ModalComputeProvider` provisions
-H100s only and rejects an RTX configuration before starting a worker.
+RTX hardware. H100 uses FlashAttention-3. The Modal examples request H100s
+through the function decorator.
 
 ## Session arguments
 
@@ -59,7 +59,6 @@ quail.Session(
     config=EngineConfig(),
     tokenizer=None,
     registry=None,
-    compute_provider=None,
 )
 ```
 
@@ -68,13 +67,10 @@ quail.Session(
   fake tokenizer so they run without downloads.
 - `registry`: an `ExtensionRegistry` with your extensions. See
   [Extending Quail](/docs/extending).
-- `compute_provider`: where queries run. Unset means
-  `InProcessComputeProvider()`, which loads the model in this process
-  and needs a CUDA GPU. Pass `ModalComputeProvider()` to run on Modal.
 
 ## Tokenizers
 
-Quail tokenizes document columns on the client for planning. It loads
+Quail tokenizes document columns in the session's process. It loads
 the model's `transformers` tokenizer and also tries the faster
 `bpe-qwen` tokenizer. It checks both on a sample of 25 documents per
 column and uses the fast one only if they agree. The choice is noted

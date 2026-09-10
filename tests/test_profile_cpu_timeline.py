@@ -8,7 +8,7 @@ import pytest
 from experiments.profile_cpu_timeline import nest_intervals, read_cpu_window
 
 
-def test_nesting_preserves_call_order_and_fills_only_top_level_gaps():
+def test_cpu_nesting_and_invalid_intervals():
     events = [(3, 5, "parent"), (3.5, 4, "child"), (1, 2, "parent"), (8, 12, "tail")]
     assert nest_intervals(events, 0, 10) == [
         [0, 1, 0, "[no recorded CPU operation]"], [1, 2, 0, "parent"],
@@ -17,8 +17,6 @@ def test_nesting_preserves_call_order_and_fills_only_top_level_gaps():
         [8, 10, 0, "tail"],
     ]
 
-
-def test_crossing_intervals_are_rejected():
     with pytest.raises(ValueError, match="cross"):
         nest_intervals([(1, 3, "a"), (2, 4, "b")], 0, 5)
 

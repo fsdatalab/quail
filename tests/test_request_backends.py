@@ -36,7 +36,7 @@ def _table():
     )
 
 
-def test_built_in_request_backends_plan_their_own_model_node():
+def test_request_backends_plan_validate_and_execute(monkeypatch):
     registry = built_in_registry()
     assert set(registry.backends) == {
         "quail",
@@ -79,12 +79,56 @@ def test_built_in_request_backends_plan_their_own_model_node():
         assert decoded.node("request-model") == request_node
         session.close()
 
-
-def test_request_backends_reject_multiple_gpus():
     for backend in (stock_vllm_backend(), pipelined_sglang_backend()):
         support = backend.supports(QWEN3_4B_FP8, H100_SXM, 2)
         assert not support.supported
         assert "one model copy on one GPU" in support.reason
+
+    with monkeypatch.context() as patch:
+        session = quail.Session(
+            EngineConfig(backend="stock_vllm"),
+            tokenizer=_tokens,
+        )
+        session.register("docs", _table())
+        query = (
+            session.docs("docs")
+            .alias("d")
+            .ai_filter(quail.prompt("useful {0}", quail.col("d.body")))
+            .select("d.id")
+        )
+        plan = query.plan()
+        request = query._prepare_physical()
+        client = _Client()
+
+        patch.setattr(
+            "quail.backends.vllm.VLLMEngine.boot",
+            lambda self, model_name, allowed_ids: (
+                {
+                    "client": client,
+                    "sampling_params": object(),
+                    "capacity": {
+                        "kv_cache_size_tokens": 1_000,
+                        "block_size": 1,
+                        "max_num_seqs": 16,
+                    },
+                },
+                {"kind": "cold", "boot_s": 0.1},
+            ),
+        )
+        backend = session.registry.backend("stock_vllm")
+        response = backend.execute_request(BackendExecutionContext(
+            request=request,
+            graph=plan.graph,
+            registry=session.registry,
+            gpu_count=1,
+            runtime_state={},
+        ))
+        result = query.finish(response)
+
+        assert result.report["backend"] == "stock_vllm"
+        assert result.report["backend_metrics"]["requests"] == 2
+        assert result.count() == 0
+        session.close()
 
 
 class _Output:
@@ -131,7 +175,7 @@ def _execution(documents):
     ))
 
 
-def test_request_model_execution_returns_filter_answer_relation():
+def test_filter_and_join_answer_relations():
     node = RequestExecution(
         node_id="request-model",
         backend_name="stock_vllm",
@@ -154,8 +198,6 @@ def test_request_model_execution_returns_filter_answer_relation():
     assert result.outputs["ids:d"] == [0]
     assert result.metrics.evaluated_documents == 2
 
-
-def test_request_model_execution_converts_numpy_token_ids():
     class NativeIntClient(_Client):
         def generate(self, prompts, sampling_params, use_tqdm=False):
             assert all(
@@ -185,8 +227,6 @@ def test_request_model_execution_converts_numpy_token_ids():
 
     assert result.outputs["ids:d"] == [0]
 
-
-def test_request_model_execution_returns_join_answer_relation():
     node = RequestExecution(
         node_id="request-model",
         backend_name="stock_vllm",
@@ -221,54 +261,7 @@ def test_request_model_execution_returns_join_answer_relation():
     assert result.metrics.regret_tokens > 0
 
 
-def test_vllm_backend_executes_a_physical_request(monkeypatch):
-    session = quail.Session(
-        EngineConfig(backend="stock_vllm"),
-        tokenizer=_tokens,
-    )
-    session.register("docs", _table())
-    query = (
-        session.docs("docs")
-        .alias("d")
-        .ai_filter(quail.prompt("useful {0}", quail.col("d.body")))
-        .select("d.id")
-    )
-    plan = query.plan()
-    request = query._prepare_physical()
-    client = _Client()
-
-    monkeypatch.setattr(
-        "quail.backends.vllm.VLLMEngine.boot",
-        lambda self, model_name, allowed_ids: (
-            {
-                "client": client,
-                "sampling_params": object(),
-                "capacity": {
-                    "kv_cache_size_tokens": 1_000,
-                    "block_size": 1,
-                    "max_num_seqs": 16,
-                },
-            },
-            {"kind": "cold", "boot_s": 0.1},
-        ),
-    )
-    backend = session.registry.backend("stock_vllm")
-    response = backend.execute_request(BackendExecutionContext(
-        request=request,
-        graph=plan.graph,
-        registry=session.registry,
-        gpu_count=1,
-        runtime_state={},
-    ))
-    result = query.finish(response)
-
-    assert result.report["backend"] == "stock_vllm"
-    assert result.report["backend_metrics"]["requests"] == 2
-    assert result.count() == 0
-    session.close()
-
-
-def test_filter_chain_splits_cached_tokens_into_regret_and_cross_row():
+def test_cached_token_accounting():
     from quail.backends.request_scheduling import run_filter_chain_async
 
     class Output:
@@ -297,8 +290,6 @@ def test_filter_chain_splits_cached_tokens_into_regret_and_cross_row():
     assert result["cached_other_tokens"] == 2 + 2
     assert result["cached_tokens"] == 14
 
-
-def test_join_cache_accounting_returns_both_sides():
     from quail.backends.request_scheduling import join_cache_accounting
 
     prefixes = [[1] * 10, [2] * 10]
@@ -314,8 +305,6 @@ def test_join_cache_accounting_returns_both_sides():
     assert accounting["cached_own_tokens"] == 4 + 10 + 0 + 0
     assert accounting["cached_other_tokens"] == 0
 
-
-def test_join_cache_accounting_ignores_preamble_and_straddling_block():
     from quail.backends.request_scheduling import join_cache_accounting
 
     # prefix = 2 preamble tokens, a 20 token document, a 3 token frame;
@@ -334,8 +323,6 @@ def test_join_cache_accounting_ignores_preamble_and_straddling_block():
     assert accounting["cached_own_tokens"] == 16
     assert accounting["cached_other_tokens"] == 2 + 16
 
-
-def test_split_cached_tokens_clips_to_the_document():
     from quail.backends.request_scheduling import split_cached_tokens
 
     # the question after a 4 token body was cached too: it is other
@@ -346,7 +333,7 @@ def test_split_cached_tokens_clips_to_the_document():
     assert split_cached_tokens(1, 2, 0, 8) == (1, 0, 0)
 
 
-def test_sglang_submits_full_join_and_preserves_output_order():
+def test_sglang_submission_and_cancellation():
     class Engine:
         def __init__(self):
             self.calls = []
@@ -370,8 +357,6 @@ def test_sglang_submits_full_join_and_preserves_output_order():
     assert client.generate([], {}) == []
     assert len(engine.calls) == 1
 
-
-def test_sglang_cancelled_filter_aborts_its_engine_request():
     async def run():
         started = asyncio.Event()
         submitted = []

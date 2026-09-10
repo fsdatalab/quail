@@ -97,10 +97,10 @@ and `runtime_package`, plus a client with `generate`,
 
 ## Runtime package
 
-If your backend needs a different inference package in the worker
-image, set a `runtime_package` attribute, for example
-`"sglang==0.5.18"`. `ModalComputeProvider` installs it instead of
-vLLM.
+A backend's `runtime_package` attribute documents its inference dependency,
+for example `"sglang==0.5.18"`. Install that package in the environment where
+you create the session. On Modal, use `image.pip_install(...)` in your script.
+The session does not install packages or define images.
 
 ## Registering
 

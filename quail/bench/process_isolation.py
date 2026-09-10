@@ -9,6 +9,7 @@ import subprocess
 import time
 import traceback
 from collections.abc import Sequence
+from pathlib import Path
 
 
 def visible_gpu_uuids() -> tuple[str, ...]:
@@ -29,62 +30,42 @@ def run_backend_group(
     data_dir: str,
     model: str,
     sf: float,
-    lf: int,
     query_ids: Sequence[str],
-    run_label: str,
-    prediction: str,
+    run_dir: str,
     ground_truth_collection: str,
     methods: Sequence[str],
 ) -> dict:
     """Run backend methods while sharing one loaded model when possible."""
-    from quail import InProcessComputeProvider
+    from quail import EngineConfig
     from quail.bench.quailb import run_suite
-    from quail_b.queries import SELECTIVITY_ESTIMATE_COLLECTION, query_family_name
+    from quail_b.queries import query_family_name
 
     query_ids = tuple(query_ids)
     methods = tuple(methods)
     if not methods:
         raise ValueError("at least one backend is required")
     family = query_family_name(query_ids)
-    collection = ground_truth_collection or SELECTIVITY_ESTIMATE_COLLECTION
+    run_dir = Path(run_dir)
     suites = {}
     for method in methods:
         print(
             f"[{family}] running {method} for {len(query_ids)} queries",
             flush=True,
         )
-        output_path = (
-            f"/results/benchmarks/quailb/families/{run_label}/"
-            f"{family}-{method}.json"
-        )
         suite = run_suite(
-            data_dir,
-            sf=sf,
-            lf=lf,
-            gpus=1,
-            only=query_ids,
-            out_path=output_path,
-            model=model,
-            backend=method,
-            accuracy=True,
-            ground_truth_collection=collection,
-            ground_truth_workload=None,
-            prediction=prediction,
-            artifact_stem=f"{run_label}-{family}-{method}",
-            compute_provider=InProcessComputeProvider(),
+            query_ids, sf=sf,
+            config=EngineConfig(model=model, backend=method, gpus=1),
+            data_dir=Path(data_dir) / f"sf{sf}",
+            ground_truth_collection=ground_truth_collection or None,
+            output_dir=run_dir / method / family,
         )
-        suite["query_family"] = {
-            "name": family,
-            "query_ids": list(query_ids),
-        }
+        suite["run_id"] = run_dir.name
+        suite["query_family"] = {"name": family, "query_ids": list(query_ids)}
         suites[method] = suite
     return {
         "query_family": family,
         "query_ids": list(query_ids),
-        "ground_truth_collection": suites[methods[0]]["ground_truth"][
-            "collection_id"
-        ],
-        "ground_truth_workload": None,
+        "ground_truth_collection": suites[methods[0]]["collection_id"],
         "gpu_uuids": list(visible_gpu_uuids()),
         "methods": list(methods),
         "suites": suites,

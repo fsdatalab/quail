@@ -9,7 +9,7 @@ from quail.runtime.prefixes import (
 )
 
 
-def test_distinct_prefix_regret_adds_shared_prefixes_minus_cross_row_hits():
+def test_prefix_metrics_account_for_repeated_columns_and_cross_row_hits():
     stages = [
         {"op": "filter", "alias": "r", "stage": 0},
         {"op": "join", "anchor": "r", "partners": ["a"]},
@@ -25,8 +25,6 @@ def test_distinct_prefix_regret_adds_shared_prefixes_minus_cross_row_hits():
     assert distinct_prefix_regret(100, 50, 30) == 120
     assert distinct_prefix_regret(100, 50, None) is None
 
-
-def test_scanned_shared_prefix_tokens_counts_repeated_columns_in_full():
     class Store:
         def __init__(self, documents):
             self.documents = documents
@@ -51,8 +49,6 @@ def test_scanned_shared_prefix_tokens_counts_repeated_columns_in_full():
     assert scanned_shared_prefix_tokens(
         [("reviews", "text"), ("reviews", "text")], lookup) == 2 + 7
 
-
-def test_prefix_metrics_share_prefixes_across_aliases_of_one_column():
     class Scan:
         def __init__(self, alias, provider, column):
             self.alias, self.provider, self.column = alias, provider, column

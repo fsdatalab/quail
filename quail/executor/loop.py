@@ -8,8 +8,7 @@ Pack on CPU while the GPU runs, gate answers, free pages immediately.
 - run_filter: continuous admission with FilterAdmission, pages freed
   on FALSE or after the last stage.
 
-torch is imported lazily; this module runs only inside the Modal
-image.
+Torch is imported lazily when model execution starts.
 """
 
 import time
@@ -516,9 +515,9 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
 # Three cost tiers:
 #   1. JIT compile (nvcc/Triton) of a kernel configuration: paid once
 #      ever per (software stack, GPU, model, budget) by compile_kernels.
-#      Cached on the kernel cache volume (DG_CACHE_DIR / TRITON_CACHE_DIR);
+#      Cached in the library's configured kernel directories;
 #      a marker file records that the pass ran.
-#   2. Loading a cached binary into the process: paid once per container
+#   2. Loading a cached binary into the process: paid once per process
 #      by touch_kernels.
 #   3. The launch itself: every call, unavoidable.
 #
@@ -641,9 +640,8 @@ def touch_kernels(torch, arena, pipeline, async_ans, budget):
 
 def _marker_path(model_name, budget):
     import os
-    dg = os.environ.get("DG_CACHE_DIR")
-    root = (os.path.dirname(dg) if dg
-            else os.path.expanduser("~/.cache/quail-kernels"))
+    root = os.path.expanduser(os.environ.get(
+        "QUAIL_CACHE_DIR", "~/.cache/quail/kernels"))
     safe = model_name.replace("/", "--")
     return os.path.join(root, f"quail-warm-{safe}-{int(budget)}.json")
 

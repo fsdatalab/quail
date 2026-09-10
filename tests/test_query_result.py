@@ -10,7 +10,7 @@ from quail.runtime.result import (
 )
 
 
-def test_acero_assembles_multiway_result_without_python_rows():
+def test_arrow_result_assembly_streaming_and_collection():
     true_join_tables = [
         document_index_table(
             {"r1": [0, 1], "a1": [0, 0]}, "join_answers"),
@@ -30,8 +30,6 @@ def test_acero_assembles_multiway_result_without_python_rows():
 
     assert count_rows(declaration) == 6
 
-
-def test_result_streams_bounded_arrow_batches():
     relation = document_index_table(
         {"r": list(range(5))}, "filter_survivors")
     survivors = {"r": pa.array(range(5), type=pa.int32())}

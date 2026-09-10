@@ -3,7 +3,6 @@
 import itertools
 
 import pyarrow as pa
-import pytest
 from test_quail_backend import graph_state
 
 import quail
@@ -12,7 +11,7 @@ from quail.bench import quailb
 from quail.execution import PhysicalResponse
 from quail.physical import AnchoredJoin, DocumentInput, PackedFilter, decode_graph
 from quail.planner.plan import EngineConfig
-from quail.runtime.local import execute_worker_query
+from quail.runtime.execute import execute_query
 from quail.runtime.runner import NodeMetrics, NodeResult
 from quail_b import prompts
 from quail_b.queries import FILTER_SELECTIVITY_ESTIMATES
@@ -77,61 +76,59 @@ class FixedFeverAnswers:
         return NodeResult(outputs, NodeMetrics(extension={"answers": all_answers}))
 
 
-@pytest.mark.parametrize("capacity,empty,estimate", [
-    (10, False, 0.001), (1, False, 1.0), (0, False, 0.5), (0, True, 1.0),
-])
-def test_fev9_executes_saved_order_with_actual_survivors(
-        monkeypatch, capacity, empty, estimate):
-    monkeypatch.setitem(FILTER_SELECTIVITY_ESTIMATES, prompts.F11, estimate)
-    monkeypatch.setitem(FILTER_SELECTIVITY_ESTIMATES, prompts.F13, estimate)
-    with quail.Session(EngineConfig(),
-                       tokenizer=lambda text: list(text.encode())) as session:
-        register_fever(session)
-        query = quailb.queries(session)["FEV-9"][1]()
+def test_fixed_order_execution_and_backend_planning(monkeypatch):
+    with monkeypatch.context() as patch:
+        for capacity, empty, estimate in [
+        (10, False, 0.001), (1, False, 1.0), (0, False, 0.5), (0, True, 1.0),
+    ]:
+            patch.setitem(FILTER_SELECTIVITY_ESTIMATES, prompts.F11, estimate)
+            patch.setitem(FILTER_SELECTIVITY_ESTIMATES, prompts.F13, estimate)
+            with quail.Session(EngineConfig(),
+                               tokenizer=lambda text: list(text.encode())) as session:
+                register_fever(session)
+                query = quailb.queries(session)["FEV-9"][1]()
 
-        def execute(request):
-            graph = decode_graph(request.plan["graph"], session.registry.codecs)
-            groups = graph.nodes_by_type(AnchoredJoin.type_name)
-            assert sum(len(group.stages) for group in groups) == 3
-            docs = {node.alias: request.inputs[node.input_id].documents
-                    for node in graph.nodes if isinstance(node, DocumentInput)}
-            state = graph_state(None, docs)
-            model = FixedFeverAnswers(state, capacity, empty)
-            state["model_execution"] = model
+                def execute(request):
+                    graph = decode_graph(request.plan["graph"], session.registry.codecs)
+                    groups = graph.nodes_by_type(AnchoredJoin.type_name)
+                    assert sum(len(group.stages) for group in groups) == 3
+                    docs = {node.alias: request.inputs[node.input_id].documents
+                            for node in graph.nodes if isinstance(node, DocumentInput)}
+                    state = graph_state(None, docs)
+                    model = FixedFeverAnswers(state, capacity, empty)
+                    state["model_execution"] = model
 
-            def unexpected_search(*args, **kwargs):
-                raise AssertionError("execution called the join optimizer")
+                    def unexpected_search(*args, **kwargs):
+                        raise AssertionError("execution called the join optimizer")
 
-            with monkeypatch.context() as execution_patch:
-                execution_patch.setattr(
-                    "quail.planner.joins.search_joins", unexpected_search)
-                report = execute_single_graph(state, request.plan["settings"], graph)
-            assert model.filters[-1] == (groups[0].anchor, True)
-            anchors = {group.anchor for group in groups}
-            assert {alias for alias, keep in model.filters if keep} == anchors
-            assert not state["arena"].accounting.owned
-            assert report["kv_manager"]["retained_after_filters"] == (
-                0 if empty else min(capacity, 2) * len(anchors))
-            assert [step["id"] for step in report["executed_join_plan"]
-                    if step["type"] == AnchoredJoin.type_name] == [
-                        g.node_id for g in groups]
-            return PhysicalResponse(report.pop("_outputs"), report)
+                    with patch.context() as execution_patch:
+                        execution_patch.setattr(
+                            "quail.planner.joins.search_joins", unexpected_search)
+                        report = execute_single_graph(
+                            state, request.plan["settings"], graph)
+                    assert model.filters[-1] == (groups[0].anchor, True)
+                    anchors = {group.anchor for group in groups}
+                    assert {alias for alias, keep in model.filters if keep} == anchors
+                    assert not state["arena"].accounting.owned
+                    assert report["kv_manager"]["retained_after_filters"] == (
+                        0 if empty else min(capacity, 2) * len(anchors))
+                    assert [step["id"] for step in report["executed_join_plan"]
+                            if step["type"] == AnchoredJoin.type_name] == [
+                                g.node_id for g in groups]
+                    return PhysicalResponse(report.pop("_outputs"), report)
 
-        result = execute_worker_query(query, physical_executor=execute).collect()
-        assert result.to_pylist() == ([] if empty else [{
-            "c1.id": "c0", "e1.id": "e0", "c2.id": "c1", "e2.id": "e1",
-        }])
+                result = execute_query(query, physical_executor=execute).collect()
+                assert result.to_pylist() == ([] if empty else [{
+                    "c1.id": "c0", "e1.id": "e0", "c2.id": "c1", "e2.id": "e1",
+                }])
 
-
-@pytest.mark.parametrize(
-    "backend", ["stock_vllm", "pipelined_vllm", "pipelined_sglang"])
-def test_request_backends_filter_their_first_anchor_last(backend):
-    with quail.Session(EngineConfig(backend=backend),
-                       tokenizer=lambda text: list(text.encode())) as session:
-        register_fever(session)
-        plan = quailb.queries(session)["FEV-9"][1]().plan()
-        execution = next(node for node in plan.nodes if hasattr(node, "joins"))
-        assert execution.filters[-1].alias == execution.joins[0].anchor
+    for backend in ["stock_vllm", "pipelined_vllm", "pipelined_sglang"]:
+        with quail.Session(EngineConfig(backend=backend),
+                           tokenizer=lambda text: list(text.encode())) as session:
+            register_fever(session)
+            plan = quailb.queries(session)["FEV-9"][1]().plan()
+            execution = next(node for node in plan.nodes if hasattr(node, "joins"))
+            assert execution.filters[-1].alias == execution.joins[0].anchor
 
 
 def test_distributed_fev9_executes_bound_join_nodes(monkeypatch):
@@ -183,7 +180,7 @@ def test_distributed_fev9_executes_bound_join_nodes(monkeypatch):
             assert all(not child["arena"].accounting.owned for child in children)
             return PhysicalResponse(report.pop("_outputs"), report)
 
-        result = execute_worker_query(query, physical_executor=execute).collect()
+        result = execute_query(query, physical_executor=execute).collect()
         assert result.to_pylist() == [{
             "c1.id": "c0", "e1.id": "e0", "c2.id": "c1", "e2.id": "e1",
         }]

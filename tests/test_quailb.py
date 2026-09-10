@@ -2,7 +2,6 @@
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-import pytest
 
 import quail
 from quail.bench.quailb import queries, register_privacy_sets, register_sets
@@ -58,44 +57,44 @@ def _standin_sets(tmp_path):
     return tmp_path
 
 
-@pytest.mark.parametrize("backend", [
+def test_all_queries_compile_and_plan(tmp_path):
+    for backend in [
     "quail", "stock_vllm", "pipelined_vllm", "pipelined_sglang",
-])
-def test_all_queries_compile_and_plan(tmp_path, backend):
-    _standin_sets(tmp_path)
-    sess = quail.Session(EngineConfig(gpus=1, backend=backend),
-                         tokenizer=lambda text: list(text.encode()))
-    register_sets(sess, tmp_path)
-    register_privacy_sets(sess, tmp_path)
-    qdefs = queries(sess)
-    expected = {
-        *(f"IMDB-{i}" for i in range(1, 11)),
-        *(f"BIO-{i}" for i in range(1, 4)),
-        *(f"FEV-{i}" for i in range(1, 10)),
-        *(f"LEP-{i}" for i in range(1, 9)),
-        "AGENT-1", "AGENT-2",
-        "PRIV-1", "PRIV-2",
-    }
-    assert set(qdefs) == expected
-    assert set(QUERY_ORDER) == expected - {"PRIV-1", "PRIV-2"}
-    for qid, (_, build) in qdefs.items():
-        query = build()
-        _, filters, joins = collect_operators(query.logical)
-        predicates = [predicate for chain in filters.values()
-                      for predicate in chain]
-        if qid.startswith("PRIV-"):
-            assert all(predicate.selectivity is None
-                       for predicate in predicates), qid
-            assert all(join.selectivity is None for join in joins), qid
-        else:
-            assert all(predicate.selectivity is not None
-                       for predicate in predicates), qid
-            assert all(join.selectivity is not None for join in joins), qid
-        plan = query.plan()
-        assert not isinstance(plan, Refusal), f"{qid} refused: {plan}"
-        expected_order = (
-            "as_written" if qid.startswith("PRIV-")
-            else "by_cost"
-        )
-        assert plan.settings["order_rule"] == expected_order, qid
-        assert "physical:" in query.explain(), qid
+]:
+        _standin_sets(tmp_path)
+        sess = quail.Session(EngineConfig(gpus=1, backend=backend),
+                             tokenizer=lambda text: list(text.encode()))
+        register_sets(sess, tmp_path)
+        register_privacy_sets(sess, tmp_path)
+        qdefs = queries(sess)
+        expected = {
+            *(f"IMDB-{i}" for i in range(1, 11)),
+            *(f"BIO-{i}" for i in range(1, 4)),
+            *(f"FEV-{i}" for i in range(1, 10)),
+            *(f"LEP-{i}" for i in range(1, 9)),
+            "AGENT-1", "AGENT-2",
+            "PRIV-1", "PRIV-2",
+        }
+        assert set(qdefs) == expected
+        assert set(QUERY_ORDER) == expected - {"PRIV-1", "PRIV-2"}
+        for qid, (_, build) in qdefs.items():
+            query = build()
+            _, filters, joins = collect_operators(query.logical)
+            predicates = [predicate for chain in filters.values()
+                          for predicate in chain]
+            if qid.startswith("PRIV-"):
+                assert all(predicate.selectivity is None
+                           for predicate in predicates), qid
+                assert all(join.selectivity is None for join in joins), qid
+            else:
+                assert all(predicate.selectivity is not None
+                           for predicate in predicates), qid
+                assert all(join.selectivity is not None for join in joins), qid
+            plan = query.plan()
+            assert not isinstance(plan, Refusal), f"{qid} refused: {plan}"
+            expected_order = (
+                "as_written" if qid.startswith("PRIV-")
+                else "by_cost"
+            )
+            assert plan.settings["order_rule"] == expected_order, qid
+            assert "physical:" in query.explain(), qid

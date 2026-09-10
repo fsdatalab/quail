@@ -75,6 +75,7 @@ image = (
           "VLLM_USE_FLASHINFER_SAMPLER": "0",
           "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
           "HF_HUB_ENABLE_HF_TRANSFER": "1",
+          "QUAIL_CACHE_DIR": "/root/.cache/kernels",
           "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
           "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
           "TRITON_CACHE_DIR": "/root/.cache/kernels/triton",
@@ -128,7 +129,7 @@ def _write(result, name):
 def _boot_state(model):
     """Boot the worker state dict, as the worker's own boot does.
 
-    Mirrors quail.runtime.local._execute_physical's boot with the
+    Mirrors quail.runtime.execute._execute_physical's boot with the
     shipping Pipeline; warm_kernels runs the same tiered warmup.
     """
     import torch
@@ -204,9 +205,9 @@ def _run_query(state, build, captured):
     )
     from quail.execution import PhysicalResponse
     from quail.executor.loop import AsyncAnswers
-    from quail.runtime.local import (
+    from quail.runtime.execute import (
         _validate_physical_request,
-        execute_worker_query,
+        execute_query,
     )
 
     def execute(request):
@@ -231,7 +232,7 @@ def _run_query(state, build, captured):
         return PhysicalResponse(outputs, report)
 
     query = build()
-    return execute_worker_query(query, physical_executor=execute)
+    return execute_query(query, physical_executor=execute)
 
 
 def _cupti_preinit(torch):

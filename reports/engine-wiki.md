@@ -11,8 +11,8 @@ noted.
 
 The table below lists every module, what it does, and what it
 depends on. The data flow is top to bottom: the user calls the
-session, which calls the front end, then the planner, then sends an
-execution request to the compute provider.
+session, which calls the front end, then the planner, then runs the query
+in the same process.
 
 | Module | What it does | Depends on |
 |---|---|---|
@@ -23,7 +23,7 @@ execution request to the compute provider.
 | `builder.py` | Builder API entry point | catalog, logical |
 | `sqlfront/compile.py` | AI SQL entry point (sqlglot parser and binder) | catalog, logical |
 | `extensions.py` | Per session backend, codec, runtime, rule, and provider registration | physical |
-| `builtins.py` | The registry of built in backends, models, devices, codecs, runtimes, and source readers | backends, catalog, runner, specs |
+| `builtins.py` | The registry of built in backends, models, devices, codecs and runtimes | backends, catalog, runner, specs |
 | `execution.py` | Token input, physical request, and Arrow response types | physical |
 | `planning.py` | Backend planning inputs and physical candidates | physical, specs |
 | `physical/` | Typed physical nodes, graph validation, and plan envelope codecs | nothing |
@@ -46,14 +46,12 @@ execution request to the compute provider.
 | `executor/model.py` | Weight loading through vLLM | nothing (vLLM lazy) |
 | `runtime/session.py` | Session, Query, tokenization, input binding, and result assembly | catalog, logical, planner, sqlfront, builder |
 | `runtime/tokens.py` | Memory mapped token files and random document views | Arrow |
-| `runtime/compute.py` | Compute provider interface and Modal Function implementation | catalog, result, worker |
 | `runtime/runner.py` | Generic typed graph runner and standard node metrics | physical |
 | `backends/quail/graph.py` | One GPU Quail node preparation, fixed graph execution, and KV accounting | runner, executor |
 | `backends/quail/coordinator.py` | Multi-GPU payload splitting and answer merging | nothing |
 | `backends/quail/distributed.py` | Several GPU Quail node dispatch and result merging | runner, coordinator |
 | `backends/quail/worker.py` | Quail model boot, single GPU execution, and the GPU child protocol | executor, graph, distributed |
-| `runtime/local.py` | Run one logical query request in the current process: validation, backend dispatch, and result assembly | builtins, session |
-| `runtime/worker.py` | The Modal image, volumes, and functions; opens sources and calls `runtime/local.py` | local, volumes |
+| `runtime/execute.py` | Run the existing query in the current process: validation, backend dispatch, and result assembly | session |
 | `bench/quailb.py` | QUAIL-B benchmark (data, queries, driver) | runtime |
 
 ### Data flow
@@ -67,16 +65,7 @@ Session (runtime/session.py)
   |--- docs() --> builder.py ------------|--> LogicalPlanBuilder
   |
   v
-selected ComputeProvider
-  receives one QueryRequest with the logical plan and table providers
-  |
-  |--- ModalComputeProvider
-  |      sends remote source descriptions
-  |      sends needed raw Arrow columns for client-only sources
-  |      calls a Modal Function
-  |
-  v
-compute worker (runtime/worker.py, then runtime/local.py)
+Query.run() -> runtime/execute.py
   opens sources and tokenizes document columns
   writes tokens, lengths, and projected columns to temporary Arrow files
   runs logical optimizer rules and physical planning
@@ -89,7 +78,8 @@ compute worker (runtime/worker.py, then runtime/local.py)
   |
   v
 QueryResult
-  Modal returns a materialized QueryResult with its plan and metrics
+  collect rows before closing the session
+  a Modal function can return the collected table and report
 ```
 
 ### The result path
@@ -101,13 +91,12 @@ Answers take one shape at every hop the runner or a client sees.
   join answer shapes, plus a metrics mapping.
 - The generic runner finishes the graph from those tables and
   `Query.finish` builds one `QueryResult` over an Acero plan.
-- A compute provider returns that `QueryResult`. The in-process
-  provider returns it as is. The Modal provider materializes it in the
-  worker and returns the `QueryResult` as a Python object. The executed
-  plan and node metrics are already attached.
-- The worker also writes a run record to `/results/runs/` on the
-  `quail-results` volume. That is a record for reports, not a result
-  path.
+- `Query.run()` returns that `QueryResult` with the executed plan and
+  node metrics attached. A Modal function collects or saves its rows
+  before closing the session and returning to the caller.
+- The engine returns reports without writing them to storage. The application
+  chooses output paths and storage. A Modal script mounts its own volumes and
+  commits them explicitly. Benchmark runners save their own records.
 
 Inside the Quail backend, GPU child processes send their answers to
 the parent over pipes as plain Python values. That is transport within
@@ -128,8 +117,8 @@ The current scope is filter queries and joins with Qwen3 4B fp8 or
 Qwen3 32B fp8 weights. KV uses bf16. Each GPU has one model copy,
 with 1, 2, 4, or 8 GPUs per host. The built in device specifications are
 `h100-sxm` and `rtx-pro-6000-blackwell-server`. RTX support includes
-planning and kernel selection; GPU validation is pending. Modal provisions
-H100s only and rejects RTX configurations before starting a worker.
+planning and kernel selection; GPU validation is pending. The supplied Modal
+examples request H100s through their function decorators.
 
 The RTX specification uses 96 GB of GDDR7 memory and 1.597 TB/s of memory
 bandwidth. Its estimated dense peak rates are 1 PFLOP/s for FP8 and
@@ -148,13 +137,11 @@ for sources and validation status. Memory budgets remain per GPU.
    `Scan`, `SemanticFilter`, `SemanticJoin`, and logical `Project`
    nodes. Every logical node implements the same traversal, rewrite,
    validation, schema, and explain interface.
-4. The session creates one `QueryRequest`. The request contains the logical
-   plan, table providers, model settings, and registered extensions.
-5. The selected compute provider runs the request. The in-process provider
-   is the default and runs the rest of these steps in the calling process,
-   which needs a CUDA GPU. `ModalComputeProvider` sends a source description
-   when the worker can open the source. Otherwise, it sends only the raw
-   Arrow columns used by the query.
+4. The session keeps the query, table providers, model settings, and registry.
+5. `Query.run()` calls `execute_query` with that existing query.
+   The remaining steps run in the calling process, which needs a CUDA GPU.
+   On Modal, create the session inside a GPU function. Pass source paths
+   or Arrow tables as ordinary function arguments when needed.
 6. Planning does not wait for tokenization. The session reads each
    document column's byte lengths, tokenizes the first 256 documents to
    measure tokens per byte, and plans on the scaled lengths (within about
@@ -206,9 +193,10 @@ for sources and validation status. Memory budgets remain per GPU.
    alias column contains the source table row number for one document.
    The same graph applies the final projection and limit. Projection reads only
    the selected result positions from memory mapped source columns, so the
-   worker does not scan the source again. The Modal Function
-   returns a materialized `QueryResult` with its report, executed plan, and
-   node metrics attached. `collect()` returns the Arrow table. `count()`
+   session does not scan the source again. The query returns a `QueryResult`
+   with its report, executed plan, and node metrics attached. A Modal wrapper
+   collects or saves rows before closing the session. `collect()` returns
+   the Arrow table. `count()`
    counts rows without creating Python row tuples. LIMIT
    stops the result stream after the requested number of rows.
 
@@ -235,7 +223,7 @@ There are four operators, defined in `logical.py`:
   it fires at the root Project, collects the columns the SELECT list
   returns, and rewrites each Scan to keep only those. The document
   column is kept as a value only when the query returns it. The
-  session and the Modal request builder read the pruned Scans, so a
+  session reads the pruned Scans, so a
   provider is never asked for a column the query does not return.
 - **SemanticFilter**: a conjunction of true/false predicates over a
   single scanned column. Each predicate has a prompt template, column
@@ -370,8 +358,7 @@ structurally identical.
 | `Session.docs` | `session.py:175` | Start the builder API |
 | `Session.scan` | `session.py:210` | Tokenize a column (cached per session) |
 | `Query.plan` | `session.py:310` | Run the planner (cached per Query) |
-| `Query.run` | `session.py` | Build one logical request and call the compute provider |
-| `Query._request` | `session.py` | Bind the logical plan to its table providers and settings |
+| `Query.run` | `session.py` | Run the existing query in the current process |
 | `Query._prepare_physical` | `session.py` | Build the internal physical request inside a worker |
 | `Query.finish` | `session.py` | Build the worker result from physical Arrow outputs |
 | `Query.explain` | `session.py:330` | Print the logical tree and physical plan |
@@ -385,7 +372,6 @@ registered as objects: `register_logical_rule(rule)`,
 `register_backend(backend)`, `register_model(spec)`, `register_device(spec)`,
 `register_node(node_type, runtime=...)`, `register_codec(codec)`,
 `register_runtime(runtime, key=...)`,
-`register_source_reader(reader, source_type=...)`, and
 `register_observer(factory)`. Names come from the objects. A package can also
 expose `register_quail_extension(registry)` and be loaded with
 `load_extension`. A concrete table provider is passed directly to
@@ -399,17 +385,15 @@ site. Failed loads leave the registry unchanged. The built-ins are the
 included specifications and implementations; registering them does not
 load model weights or create processes.
 
-`QueryRequest.registry` contains the session's registry. Modal handles
-moving it to the worker as a Python object. Source preparation, planning,
-and execution use the same registry in that process. Physical plans
-contain no extension manifest. The optional multi-GPU path sends the registry
-to each GPU child once per query and reuses it across stages.
+Create the registry where the session runs. Source preparation, planning,
+and execution use the same registry in that process. Physical plans contain
+no extension manifest. The optional multi-GPU path sends the registry to each
+GPU child once per query and reuses it across stages.
 
-Set `local_python_sources` and `pip_packages` on `ModalComputeProvider`.
-The provider copies and installs those dependencies explicitly. Its optional
-`initialize_worker(registry)` callback runs once per query inside the Modal
-process, before opening sources. It supports registrations that create
-objects inside that process.
+For Modal functions, use `image.pip_install(...)` and
+`image.add_local_python_source(...)` in the calling script.
+Import and register extensions inside the function.
+Connections and locks can be created there normally.
 
 A finished `QueryResult` carries the executed `PhysicalGraph` as `plan` and
 each node's `NodeMetrics` as `node_metrics`. `result.explain()` prints an
@@ -475,24 +459,22 @@ Each physical node has one codec representation that contains everything
 needed for execution. Its separate explain fields omit large runtime values
 when they would make the plan unreadable.
 
-`ComputeProvider` controls where a query runs. It has one `execute` method that
-accepts a `QueryRequest` and returns a `QueryResult`. The request contains the
-logical plan, table providers, model settings, and registered extensions. The
-default `InProcessComputeProvider` runs the request in the calling process,
-which needs a CUDA GPU and the backend's runtime package (vLLM is a package
-dependency on Linux). `ModalComputeProvider` selects the 1, 2, 4, or 8 GPU
-function in the existing `quail-engine` app. It builds the worker image with the selected
-backend package. Quail and vLLM workers install vLLM. SGLang workers install
-SGLang. Modal supplies the GPU container and function lifecycle. Quail does
-not run FastAPI, ASGI, REST, or another application server. A different
-provider can be passed as
-`Session(compute_provider=provider)`. It
-does not need changes to the planner or a model backend.
+`Session` always runs in process. The process needs a CUDA GPU and the
+backend's runtime package. A Modal function wraps the whole query, including
+session creation, data registration, planning, execution, and result collection.
+The supplied example is `demos/quickstart_modal.py`, in the existing `quail-engine`
+app. The script defines its image, mounts, cache settings, report path, and
+volume commits using the Modal SDK. There is no engine integration module.
+The runtime and model backends do not import Modal or set library cache paths.
+`QUAIL_CACHE_DIR` controls only warmup markers and defaults to
+`~/.cache/quail/kernels`.
+Modal function settings control allocation, credentials, and container lifetime.
 
-`ModalComputeProvider` sets the selected function's minimum container count to
-one while the provider is open. Several queries can therefore reuse the same
-loaded model without an idle scale down between queries. `Session.close()`
-sets the minimum back to zero before it closes the Modal app context.
+Run several queries inside one function when they should reuse a session's
+token files. Backends retain loaded models in process state. Separate function
+invocations may run in different containers. `Session.close()` releases token
+files and background tokenization; it does not unload models or change Modal
+container settings. Collect or save rows before closing the session.
 
 Quail is the default backend. `Session()` therefore selects Quail without a
 backend argument. `EngineConfig(model="qwen3-32b-fp8")` selects another built
@@ -500,8 +482,8 @@ in model. An extension can register another `ModelSpec` and a backend that
 supports it. GPU count, model, backend, and hardware specification name all
 live in `EngineConfig`. For example,
 `Session(EngineConfig(gpus=1, device="h100-sxm"))` selects one H100 for planning.
-Both local execution and Modal requests carry that configuration. There is
-no separate `Session.device` argument or device field on `QueryRequest`.
+The session uses that configuration on any host. There is no separate
+`Session.device` constructor argument.
 The session resolves `config.device` through the registry and keeps the
 resulting `DeviceSpec` as `session.device`.
 
@@ -1424,21 +1406,19 @@ for node in the planned graph:
 | `merge_join_round` | `coordinator.py` | Concatenate workers' join answer rows |
 | `ExchangeRuntime.execute` | `runtime/runner.py` | Prune actual survivor IDs using completed full-join answer relations |
 | `gate_group` | `coordinator.py` | Anchor survivors after one group (full/exists/anti keep rules) |
-| `ModalComputeProvider.execute` | `compute.py` | Submit one logical query to the selected Modal Function |
-| `execute_query_request` | `local.py` | Plan and execute one logical query request in the current process |
-| `execute_worker_query` | `local.py` | Plan and execute one already built query in the current process |
-| `_execute_physical` | `worker.py` | Validate and run one typed physical request |
+| `execute_query` | `runtime/execute.py` | Plan and execute one already built query in the current process |
+| `_execute_physical` | `runtime/execute.py` | Validate and run one typed physical request |
 | `_execute_single` | `worker.py` | Single-GPU typed graph entry point |
 
 ### Scaling
 
 The measured scaling on two GPUs: filter 1.99x, join 2.02x
-(`dispatch_gate.json`). Modal Functions are defined for 1, 2, 4, and 8
-GPUs. Each GPU runs one model copy in the same container.
+(`dispatch_gate.json`). A Modal function can allocate 1, 2, 4, or 8
+GPUs and use the matching `EngineConfig`. Each GPU runs one model copy.
 
 ## 7. The benchmark (QUAIL-B)
 
-QUAIL-B (`bench/quailb.py`) has 32 queries over five document sets
+QUAIL-B (`quail_b`) has 32 queries over five document sets
 (IMDB, BioDEX, FEVER, LePaRD, and SWE-Next), plus 2 optional PrivacyPolicies
 queries. Qwen3 32B answers the filter predicates during the judge pass.
 The FEVER annotations and sampled LePaRD citation edges provide source labels
@@ -1586,14 +1566,13 @@ and published to the bucket in a separate step.
 ### Selectivity estimates
 
 Every filter and join carries a fixed selectivity estimate. The estimates
-come from the active sf0.1 Qwen3 32B fp8 collection
+come from the fixed sf0.1 Qwen3 32B fp8 collection
 `gt_77bb8b128743a79aedddaa24c808c3f8` for corpus
 `c_1aa2c4f0d0b6c816fd37aa5748c33341`. Planning does not read the ground
 truth labels.
 
 The source collection is
-`/results/ground_truth/quailb/schema_v1/collections/gt_77bb8b128743a79aedddaa24c808c3f8/manifest.json`
-on the `quail-results` volume. Each builder query ends with
+`s3://quail-bench/ground_truth/quailb/schema_v1/collections/gt_77bb8b128743a79aedddaa24c808c3f8/manifest.json`. Each builder query ends with
 `.select(..., order="by_cost")`, so the benchmark exercises the planner's
 filter and join ordering. The collection contains 21 predicates. It reuses
 the 19 IMDB, BioDEX, FEVER, and LePaRD label sets whose tables did not change.
@@ -1608,6 +1587,17 @@ manifests, evaluation code, SoL script, and migration scripts all use that
 key. The old short predicate codes are not part of the active benchmark code.
 
 ### Protocol and reported values
+
+Quail's callback in `quail/bench/quailb.py` translates and executes queries.
+It returns document IDs, predicate answers, and timings to `quail_b.run()`.
+QUAIL-B loads and validates inputs and reference labels from public S3.
+It saves answers before scoring and writes `run.json` and `report.md`.
+
+The caller chooses engine settings, resources, output directories, and caches.
+The Modal wrapper resolves one label collection for all query families before
+execution. `quail-b report <run-dir>` scores saved answers with that same collection
+without inference. Original experiment reports keep their existing saved formats.
+
 
 Every engine run uses Modal. A benchmark query reports query time,
 throughput, GPU cost, provided selectivity, observed selectivity, answer
@@ -1672,7 +1662,7 @@ Individual attention shapes and forward passes appear at DEBUG level.
 GPU worker logs include the GPU index, including filter and join progress. A completed GEMM sweep does not mean the forward passes have
 finished.
 
-**Cold model load** (`executor/model.py`, `runtime/worker.py`):
+**Cold model load** (`executor/model.py`, `backends/quail/worker.py`):
 the parent resolves and downloads the pinned model snapshot once before
 starting GPU children. An explicit boot request sends the local directory
 and registry to every child. The coordinator waits for all GPUs to finish

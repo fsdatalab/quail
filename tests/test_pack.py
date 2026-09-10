@@ -140,7 +140,7 @@ def _random_join(rng, n_anchors=None):
     return prefix, stages, frames, budget, page_tokens, truth
 
 
-def test_join_admission_random_shapes():
+def test_admission_invariants_over_random_shapes():
     rng = random.Random(17)
     for _ in range(60):
         prefix, stages, frames, budget, page_tokens, truth = \
@@ -163,8 +163,30 @@ def test_join_admission_random_shapes():
         _check_join_invariants(sched, chunks, events, truth, prefix,
                                stages, frames, budget, resident)
 
+    rng = random.Random(23)
+    for trial in range(20):
+        n_docs = rng.randrange(5, 60)
+        n_stages = rng.randrange(1, 6)
+        page_tokens = 16
+        doc_tokens = [rng.randrange(20, 900) for _ in range(n_docs)]
+        stage_tokens = [rng.randrange(10, 60) for _ in range(n_stages)]
+        budget = max(doc_tokens) + max(stage_tokens) \
+            + rng.randrange(0, 2000)
+        # arena sometimes tight (forces waiting), never below one doc
+        arena_pages = max(pages_for(max(doc_tokens), page_tokens),
+                          rng.randrange(4, 200))
+        truth = [[1 if rng.random() < 0.7 else 0
+                  for _ in range(n_stages)] for _ in range(n_docs)]
+        sched = FilterAdmission(doc_tokens, stage_tokens, budget,
+                                arena_pages, page_tokens)
+        chunks = _drive(sched, truth, deliver_lag=rng.choice((0, 1)),
+                        rng=rng)
+        _check_invariants(sched, chunks, truth, doc_tokens,
+                          stage_tokens, budget, arena_pages,
+                          page_tokens)
 
-def test_join_admission_cut_stream_continues_first():
+
+def test_join_token_admission_and_stage_progress():
     # anchor 0's stream is cut; its continuation leads the next chunk
     # and packs no prefix, ahead of fresh anchor 1
     sched = JoinAdmission([100, 50], [[400, 50]], 520,
@@ -174,8 +196,6 @@ def test_join_admission_cut_stream_continues_first():
                                      (1, 0, 0, 1, True)]
     assert sched.next_chunk(100) == [(1, 0, 1, 2, False)]
 
-
-def test_join_admission_mixes_stages_in_one_chunk():
     # anchor 0 answers TRUE at stage 0 and its stage-1 partners lead
     # the next chunk, followed by fresh anchor 1's stage 0
     sched = JoinAdmission([100, 100], [[50], [30, 30]], 250,
@@ -189,8 +209,6 @@ def test_join_admission_mixes_stages_in_one_chunk():
     assert sched.done()
     assert sched.answers == [{0: [1], 1: [0]}, {0: [0, 1]}]
 
-
-def test_join_admission_advances_before_the_stream_is_answered():
     # the whole stage-0 stream is launched over two chunks; the first
     # answers TRUE, so stage 1 starts while the second is in flight
     sched = JoinAdmission([100], [[400, 400], [50]], 600,
@@ -203,8 +221,6 @@ def test_join_admission_advances_before_the_stream_is_answered():
     assert sched.report(0, 1, 0, 1, [1]) == [("finished", 0)]
     assert sched.answers == [{0: [1, 0]}, {0: [1]}]
 
-
-def test_join_admission_waits_for_a_true_before_advancing():
     # a cut stream whose first chunk answered FALSE does not advance
     # until a later chunk answers TRUE; all FALSE drops the anchor
     sched = JoinAdmission([100], [[400, 400], [50]], 600,
@@ -216,8 +232,25 @@ def test_join_admission_waits_for_a_true_before_advancing():
     assert sched.report(0, 0, 1, 2, [0]) == [("dropped", 0)]
     assert sched.done()
 
+    # 100 prefix + 30 frame + 100 partner = 230: the anchor's first
+    # partner alone fills the chunk; later partners fit two at a time
+    sched = JoinAdmission([100], [[100, 100, 100]], 230,
+                          arena_pages=100, page_tokens=16,
+                          frame_tokens=[30])
+    assert sched.next_chunk(100) == [(0, 0, 0, 1, True)]
+    assert sched.next_chunk(100) == [(0, 0, 1, 3, False)]
 
-def test_join_admission_pages_block_in_order():
+    # stage 1 has no partners: a stage-0 survivor stays resident with
+    # no event, and the run still finishes
+    sched = JoinAdmission([100], [[10], []], 400,
+                          arena_pages=100, page_tokens=16)
+    sched.next_chunk(100)
+    assert sched.report(0, 0, 0, 1, [1]) == []
+    assert sched.done()
+    assert sched.answers == [{0: [1]}, {}]
+
+
+def test_join_page_capacity_and_resident_anchors():
     # the arena holds one anchor; the second waits for pages even
     # though it would fit the chunk, and admits once the first drops
     sched = JoinAdmission([160, 160], [[10]], 400,
@@ -229,8 +262,6 @@ def test_join_admission_pages_block_in_order():
     assert sched.report(0, 0, 0, 1, [0]) == [("finished", 0)]
     assert sched.next_chunk(10) == [(1, 0, 0, 1, True)]
 
-
-def test_join_admission_resident_anchors_pass_a_page_block():
     # anchor 1 is resident (no prefix, no pages) and packs even while
     # fresh anchor 0 waits for pages; resident anchors also go first
     sched = JoinAdmission([160, 160], [[10]], 400,
@@ -241,8 +272,6 @@ def test_join_admission_resident_anchors_pass_a_page_block():
     assert sched.report(1, 0, 0, 1, [1]) == [("finished", 1)]
     assert sched.next_chunk(10) == [(0, 0, 0, 1, True)]
 
-
-def test_join_admission_resident_growth_costs_pages():
     # a resident anchor short of frame room needs the difference
     sched = JoinAdmission([160], [[10]], 400, arena_pages=20,
                           page_tokens=16, frame_tokens=[20],
@@ -251,29 +280,6 @@ def test_join_admission_resident_growth_costs_pages():
     assert sched.blocked_pages == 1
     assert sched.next_chunk(2) == [(0, 0, 0, 1, False)]
 
-
-def test_join_admission_frame_counts_against_the_first_partner():
-    # 100 prefix + 30 frame + 100 partner = 230: the anchor's first
-    # partner alone fills the chunk; later partners fit two at a time
-    sched = JoinAdmission([100], [[100, 100, 100]], 230,
-                          arena_pages=100, page_tokens=16,
-                          frame_tokens=[30])
-    assert sched.next_chunk(100) == [(0, 0, 0, 1, True)]
-    assert sched.next_chunk(100) == [(0, 0, 1, 3, False)]
-
-
-def test_join_admission_empty_later_stage_strands_survivors():
-    # stage 1 has no partners: a stage-0 survivor stays resident with
-    # no event, and the run still finishes
-    sched = JoinAdmission([100], [[10], []], 400,
-                          arena_pages=100, page_tokens=16)
-    sched.next_chunk(100)
-    assert sched.report(0, 0, 0, 1, [1]) == []
-    assert sched.done()
-    assert sched.answers == [{0: [1]}, {}]
-
-
-def test_join_admission_refuses_impossible_shapes():
     with pytest.raises(ValueError, match="first stage"):
         JoinAdmission([100], [[]], 400, 100, 16)
     with pytest.raises(ValueError, match="suffixes are atomic"):
@@ -357,31 +363,7 @@ def _check_invariants(sched, chunks, truth, doc_tokens, stage_tokens,
                                  if all(row)]
 
 
-def test_admission_simulator_random_shapes():
-    rng = random.Random(23)
-    for trial in range(20):
-        n_docs = rng.randrange(5, 60)
-        n_stages = rng.randrange(1, 6)
-        page_tokens = 16
-        doc_tokens = [rng.randrange(20, 900) for _ in range(n_docs)]
-        stage_tokens = [rng.randrange(10, 60) for _ in range(n_stages)]
-        budget = max(doc_tokens) + max(stage_tokens) \
-            + rng.randrange(0, 2000)
-        # arena sometimes tight (forces waiting), never below one doc
-        arena_pages = max(pages_for(max(doc_tokens), page_tokens),
-                          rng.randrange(4, 200))
-        truth = [[1 if rng.random() < 0.7 else 0
-                  for _ in range(n_stages)] for _ in range(n_docs)]
-        sched = FilterAdmission(doc_tokens, stage_tokens, budget,
-                                arena_pages, page_tokens)
-        chunks = _drive(sched, truth, deliver_lag=rng.choice((0, 1)),
-                        rng=rng)
-        _check_invariants(sched, chunks, truth, doc_tokens,
-                          stage_tokens, budget, arena_pages,
-                          page_tokens)
-
-
-def test_admission_survivor_priority():
+def test_filter_admission_capacity_and_rewind():
     # one resident survivor's next suffix packs before fresh docs
     sched = FilterAdmission([100, 100], [10, 10], 200,
                             arena_pages=100, page_tokens=16)
@@ -392,8 +374,6 @@ def test_admission_survivor_priority():
     assert second[0] == (0, 1, False)  # survivor suffix leads
     assert (1, 0, True) in second
 
-
-def test_admission_pages_block_in_order():
     # arena holds one big doc; the second waits for pages even though
     # it would fit the chunk
     sched = FilterAdmission([160, 160], [10], 400,
@@ -404,8 +384,6 @@ def test_admission_pages_block_in_order():
     sched.report(0, 0, False)          # FALSE frees the pages
     assert sched.next_chunk() == [(1, 0, True)]
 
-
-def test_admission_starts_with_only_currently_free_pages():
     sched = FilterAdmission([80], [10], 200,
                             arena_pages=10, page_tokens=16,
                             available_pages=2)
@@ -415,8 +393,6 @@ def test_admission_starts_with_only_currently_free_pages():
     sched.add_free_pages(3)
     assert sched.next_chunk() == [(0, 0, True)]
 
-
-def test_admission_keep_credits_the_rewind_tail_pages():
     # a kept document holds pages_for(doc + kept_extra) while in
     # flight but is rewound to its own tokens: pages_for(70+30)=7
     # charged, pages_for(70)=5 kept, 2 back to admission
@@ -432,15 +408,13 @@ def test_admission_keep_credits_the_rewind_tail_pages():
     sched.add_free_pages(5)
     assert sched.next_chunk() == [(1, 0, True)]
 
-
-def test_admission_refuses_impossible_shapes():
     with pytest.raises(ValueError):
         FilterAdmission([1000], [10], 500, 100, 16)     # over chunk
     with pytest.raises(ValueError):
         FilterAdmission([1000], [10], 2000, 2, 16)      # over arena
 
 
-def test_admission_limit_drains_in_flight():
+def test_filter_limits_drain_work_and_reduce_admission():
     # limit=1 with 2 docs admitted in the same chunk: the second
     # answer still lands (in_flight drains) even though the limit is
     # already met
@@ -456,8 +430,6 @@ def test_admission_limit_drains_in_flight():
     assert sched.done()
     assert sched._survivor_count == 2
 
-
-def test_admission_limit_drain_ready_returns_stranded():
     # 3 docs, 2 stages, limit=1. All pass stage 0. The stage-1 suffix
     # is 200 tokens, so the next chunk holds only doc 0's; it passes
     # and meets the limit while docs 1 and 2 still sit in ready.
@@ -474,9 +446,6 @@ def test_admission_limit_drain_ready_returns_stranded():
     assert sched.free_pages == 100
     assert not sched.resident
 
-
-def test_admission_limit_reduces_work():
-    """Check that a limit admits fewer documents and chunks than an unlimited run."""
     rng = random.Random(42)
     n_docs = 80
     n_stages = 3
@@ -516,7 +485,7 @@ def test_admission_limit_reduces_work():
 
 # ----------------------------- no page bin (single-stage, no store) --
 
-def test_admission_no_page_bin_validation():
+def test_filter_admission_without_stored_kv():
     # a document too big for any arena is admitted when there is no
     # page bin; a document too big for the chunk is still refused
     sched = FilterAdmission([1000], [10], 2000, None, 16)
@@ -524,8 +493,6 @@ def test_admission_no_page_bin_validation():
     with pytest.raises(ValueError):
         FilterAdmission([1000], [10], 500, None, 16)
 
-
-def test_admission_no_page_bin_random_shapes():
     rng = random.Random(29)
     for _ in range(20):
         n_docs = rng.randrange(5, 60)
@@ -555,8 +522,6 @@ def test_admission_no_page_bin_random_shapes():
         assert sched.survivors() == [d for d, row in enumerate(truth)
                                      if all(row)]
 
-
-def test_admission_no_page_bin_with_limit():
     # LIMIT composes with the fast path: admission stops at the
     # survivor target, still with no page accounting
     n_docs, limit = 40, 3

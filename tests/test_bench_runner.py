@@ -1,7 +1,6 @@
 """CPU checks for Quail's QUAIL-B runner: specs to queries, results to ids."""
 
 import json
-from datetime import datetime, timezone
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -15,7 +14,7 @@ from quail.planner.plan import EngineConfig, Refusal
 from quail_b.labels import GroundTruthCollection, PredicateLabels
 from quail_b.queries import AliasSpec, JoinSpec, QuerySpec
 from quail_b.queries import queries as query_specs
-from quail_b.scoring import Evaluator
+from quail_b.scoring import evaluate
 
 FILTER = "Judge the review.\n\n{0}\nAnswer TRUE or FALSE."
 JOIN = "Judge the pair.\n\n{0}\nAspect: {1}\nAnswer TRUE or FALSE."
@@ -208,9 +207,9 @@ def _run(query, join_answers):
             "peak_gib": 1.0,
         })
 
-    from quail.runtime.local import execute_worker_query
+    from quail.runtime.execute import execute_query
 
-    return execute_worker_query(query, physical_executor=execute)
+    return execute_query(query, physical_executor=execute)
 
 
 def _run_request_backend(query, join_answers):
@@ -270,12 +269,12 @@ def _run_request_backend(query, join_answers):
             "peak_gib": 1.0,
         })
 
-    from quail.runtime.local import execute_worker_query
+    from quail.runtime.execute import execute_query
 
-    return execute_worker_query(query, physical_executor=execute)
+    return execute_query(query, physical_executor=execute)
 
 
-def test_run_output_translates_indices_to_ids_and_scores(tmp_path):
+def test_benchmark_results_and_scoring(tmp_path):
     sess = _session(tmp_path)
     try:
         result = _run(_query(sess), [1, 0])
@@ -288,15 +287,13 @@ def test_run_output_translates_indices_to_ids_and_scores(tmp_path):
     assert output.join_answers[0].to_pydict() == {
         "r": ["r0", "r0"], "a": ["a0", "a1"], "answer": [True, False]}
     assert output.rows.to_pydict() == {"r": ["r0"], "a": ["a0"]}
-    evaluation = Evaluator(_truth(), CORPUS).evaluate(SPEC, output)
+    evaluation = evaluate(SPEC, output, _truth(), CORPUS)
     assert evaluation["answer_accuracy"]["accuracy"] == 1.0
     assert evaluation["output_accuracy"]["exact_match"] is True
     assert result.report["shared_prefix_tokens"] == 0
     assert result.report["cross_row_cached_tokens"] == 0
     assert result.report["regret_distinct_tokens"] is None
 
-
-def test_request_backend_answer_relations_score_the_same_way(tmp_path):
     sess = _session(tmp_path, backend="stock_vllm")
     try:
         result = _run_request_backend(_query(sess), [0, 0])
@@ -304,7 +301,7 @@ def test_request_backend_answer_relations_score_the_same_way(tmp_path):
     finally:
         sess.close()
 
-    evaluation = Evaluator(_truth(), CORPUS).evaluate(SPEC, output)
+    evaluation = evaluate(SPEC, output, _truth(), CORPUS)
     assert evaluation["answer_accuracy"]["evaluated"] == 4
     assert evaluation["answer_accuracy"]["correct"] == 3
     assert [item["op"] for item in evaluation["per_predicate"]] == [
@@ -316,8 +313,6 @@ def test_request_backend_answer_relations_score_the_same_way(tmp_path):
     # distinct prefix regret is unknown
     assert result.report["regret_distinct_tokens"] is None
 
-
-def test_run_output_requires_id_columns_in_the_select_list(tmp_path):
     spec = QuerySpec(
         "TEST-2", "selects a text column",
         (AliasSpec("r", "reviews", "body", (FILTER,)),
@@ -334,48 +329,44 @@ def test_run_output_requires_id_columns_in_the_select_list(tmp_path):
         sess.close()
 
 
-@pytest.mark.parametrize("backend", [
+def test_benchmark_query_prompts_and_labels():
+    for backend in [
     "quail", "stock_vllm", "pipelined_vllm", "pipelined_sglang",
-])
-def test_fev9_builds_from_its_spec_and_answers_from_labels(backend):
-    corpus, truth = fever_truth()
-    spec = query_specs()["FEV-9"]
-    evaluator = Evaluator(truth, corpus)
-    answer = answer_oracle(evaluator)
+]:
+        corpus, truth = fever_truth()
+        spec = query_specs()["FEV-9"]
+        answer = answer_oracle(truth, corpus)
 
-    with quail.Session(EngineConfig(backend=backend), tokenizer=lambda text: list(
-        text.encode("utf-8"))) as session:
-        for name, table in corpus.items():
-            session.register(name, DocumentProvider.from_table(table, id_col="id"))
-        query = build_query(session, spec)
-        assert not isinstance(query.plan(), Refusal)
-        scans, filters, joins = collect_operators(query.logical)
-        assert [scan.alias for scan in scans] == [
-            alias.alias for alias in spec.aliases]
-        assert {alias: [p.prompt.template for p in chain]
-                for alias, chain in filters.items()} == {
-            alias.alias: [
-                quail.bind_prompt(template, (quail.ColumnRef(
-                    alias.alias, alias.table, alias.column),)).template
-                for template in alias.filters]
-            for alias in spec.aliases}
-        assert [tuple(arg.alias for arg in join.predicate.args)
-                for join in joins] == [join.aliases for join in spec.joins]
-        # c0 is about a person and e0 supports it; c2 is not about a person
-        assert answer(filters["c1"][0].prompt, {"c1": 0}) is True
-        assert answer(filters["c1"][0].prompt, {"c1": 2}) is False
-        assert answer(joins[0].predicate, {"c1": 0, "e1": 0}) is True
-        assert answer(joins[0].predicate, {"c1": 0, "e1": 1}) is False
-        # the same labels drive the speed of light estimate
-        estimate = quail.speed_of_light_estimate(query, answer)
-        assert estimate.post_filter_counts == {
-            "c1": 2, "e1": 2, "c2": 2, "e2": 2}
-        assert len(estimate.join_stages) == 3
-        assert queries(session)["FEV-9"][0] == spec.description
+        with quail.Session(EngineConfig(backend=backend), tokenizer=lambda text: list(
+            text.encode("utf-8"))) as session:
+            for name, table in corpus.items():
+                session.register(name, DocumentProvider.from_table(table, id_col="id"))
+            query = build_query(session, spec)
+            assert not isinstance(query.plan(), Refusal)
+            scans, filters, joins = collect_operators(query.logical)
+            assert [scan.alias for scan in scans] == [
+                alias.alias for alias in spec.aliases]
+            assert {alias: [p.prompt.template for p in chain]
+                    for alias, chain in filters.items()} == {
+                alias.alias: [
+                    quail.bind_prompt(template, (quail.ColumnRef(
+                        alias.alias, alias.table, alias.column),)).template
+                    for template in alias.filters]
+                for alias in spec.aliases}
+            assert [tuple(arg.alias for arg in join.predicate.args)
+                    for join in joins] == [join.aliases for join in spec.joins]
+            # c0 is about a person and e0 supports it; c2 is not about a person
+            assert answer(filters["c1"][0].prompt, {"c1": 0}) is True
+            assert answer(filters["c1"][0].prompt, {"c1": 2}) is False
+            assert answer(joins[0].predicate, {"c1": 0, "e1": 0}) is True
+            assert answer(joins[0].predicate, {"c1": 0, "e1": 1}) is False
+            # the same labels drive the speed of light estimate
+            estimate = quail.speed_of_light_estimate(query, answer)
+            assert estimate.post_filter_counts == {
+                "c1": 2, "e1": 2, "c2": 2, "e2": 2}
+            assert len(estimate.join_stages) == 3
+            assert queries(session)["FEV-9"][0] == spec.description
 
-
-def test_benchmark_prompt_text_matches_what_quail_sends():
-    """The labels answer quailb's text; Quail must send the same text."""
     from quail_b.predicates import PREDICATES
     from quail_b.rendering import render_filter_prompt, render_join_prompt
 
@@ -400,17 +391,12 @@ def test_benchmark_prompt_text_matches_what_quail_sends():
 
 
 def test_report_writer_creates_markdown_and_plot(tmp_path):
-    from quail.bench.quailb import _artifact_stem
     from reports.make_quailb_eval_plots import (
         make_plot,
-        plot_path_for,
         write_report,
     )
 
-    artifact_stem = _artifact_stem(
-        datetime(2026, 8, 25, 12, tzinfo=timezone.utc),
-        0.1, 1, "qwen3-4b-fp8")
-    assert artifact_stem.startswith("20260825T120000Z-")
+    artifact_stem = "quailb-test"
     answer = {
         "evaluated": 4, "correct": 3, "accuracy": 0.75,
         "precision": 1.0, "recall": 0.5, "f1": 2 / 3,
@@ -466,12 +452,69 @@ def test_report_writer_creates_markdown_and_plot(tmp_path):
 
     assert plot_path.read_bytes().startswith(b"\x89PNG")
     report = report_path.read_text()
-    assert "Accuracy will exceed 70%." in report
+    assert "Prediction" not in report
     assert "Cost per 1M tokens" in report
     assert ("Figure: ../../reports/plots/benchmark/"
             f"{data['artifact_stem']}.png") in report
     assert ("Ground truth loading happens before the run starts. It is "
             "excluded from every runtime and cost metric.") in report
     assert data["aggregate_volume_path"] in report
-    generated_plot = plot_path_for(data, report_path)
-    assert generated_plot.name == f"{data['artifact_stem']}.png"
+
+    data.pop("prediction")
+    data.pop("raw_volume_path")
+    data.pop("aggregate_volume_path")
+    write_report(data, input_path, report_path, plot_path)
+    assert "Modal volume" not in report_path.read_text()
+
+    import shutil
+
+    from quail.bench.results import write_json
+    from reports.make_quailb_eval_plots import load_summary
+
+    run_dir = tmp_path / "run"
+    write_json(run_dir / "quail/summary.json", data)
+    manifest = {"status": "complete", "summaries": {"quail": "quail/summary.json"}}
+    write_json(run_dir / "manifest.json", manifest)
+    with pytest.raises(TypeError):
+        write_json(run_dir / "manifest.json", {"invalid": object()})
+    assert json.loads((run_dir / "manifest.json").read_text()) == manifest
+    copied = tmp_path / "copied-run"
+    shutil.copytree(run_dir, copied)
+    loaded, source = load_summary(copied)
+    assert loaded == data
+    assert source == copied.resolve() / "quail/summary.json"
+    write_report(loaded, source, report_path, plot_path)
+    assert str(source) in report_path.read_text()
+
+
+def test_family_summaries_share_one_run_id():
+    from copy import deepcopy
+    from datetime import datetime, timezone
+
+    from quail.bench.quailb_parallel import _merge_suites
+
+    part = {
+        "run_id": "run", "scale_factor": 0.1, "corpus_id": "c_test",
+        "collection_id": "gt_test", "gpu_count": 1, "gpu_hourly_rate_usd": 3.9492,
+        "metadata": {"engine": "quail"},
+        "query_family": {"name": "one", "query_ids": ["TEST-1"]},
+        "queries": [{"id": "TEST-1", "status": "complete"}],
+    }
+    other = deepcopy(part)
+    other["query_family"] = {"name": "two", "query_ids": ["TEST-2"]}
+    other["queries"][0]["id"] = "TEST-2"
+    arguments = (["TEST-1", "TEST-2"], "run", datetime.now(timezone.utc),
+                 4.0, {"one": "fc-one", "two": "fc-two"}, ["quail"])
+    merged = _merge_suites([part, other], *arguments)
+    assert merged["run_id"] == "run"
+    assert "query_family" not in merged
+    assert [item["directory"] for item in merged["queries"]] == [
+        "one/TEST-1", "two/TEST-2"]
+    for field in ("run_id", "corpus_id", "metadata"):
+        bad = dict(other, **{field: "different"})
+        with pytest.raises(ValueError, match=field):
+            _merge_suites([part, bad], *arguments)
+    with pytest.raises(ValueError, match="duplicate query"):
+        _merge_suites([part, part], *arguments)
+    with pytest.raises(ValueError, match="completed queries"):
+        _merge_suites([part], *arguments)

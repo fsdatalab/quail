@@ -1,75 +1,114 @@
 ---
 title: Running on Modal
-description: How the Modal compute provider runs a query and what it costs.
+description: Run an ordinary Quail query inside a Modal GPU function.
 ---
 
-Quail does not run a server. With `ModalComputeProvider`, each query
-is one call to a Modal Function in the `quail-engine` app. It is not
-the default: `Session()` runs the model in the calling process, so pass
-this provider when that process has no GPU.
+All model execution requires a CUDA GPU. Modal supplies that GPU, but Quail
+does not need a Modal integration. Your script defines the image, GPU,
+volumes, cache paths, credentials, and result storage.
 
-```python
-compute = quail.ModalComputeProvider(secrets=(), detach=False)
-session = quail.Session(compute_provider=compute)
+The runnable pair is
+[`demos/quickstart.py`](https://github.com/fsdatalab/quail-exploration/blob/blogs/demos/quickstart.py)
+and
+[`demos/quickstart_modal.py`](https://github.com/fsdatalab/quail-exploration/blob/blogs/demos/quickstart_modal.py).
+The Modal script calls the ordinary script's `run_query()` function.
+Both run QUAIL-B IMDB-1 on 100 published reviews, using the benchmark's
+query definition to find reviews that mention a positive aspect of a movie.
+The shared script calls `benchmark.load_table("reviews", limit=100)`;
+QUAIL-B handles the data download.
+
+```sh
+uv run modal run demos/quickstart_modal.py 2>&1 | tee results/quickstart_modal.log
 ```
 
-- `secrets`: Modal secrets attached to the worker, for example S3
-  credentials for a remote Parquet source.
-- `detach`: keep the Modal app running after the client exits.
+## Define the function
 
-## What one run() does
-
-1. The client collects the logical plan, table providers, and registry into
-   a `QueryRequest`.
-2. For each table it either sends a remote source description (the
-   worker opens it) or reads the needed columns and sends them as raw
-   Arrow.
-3. It picks the Modal Function for the requested GPU count and
-   backend, spawns the call, and prints the function call id.
-4. The worker tokenizes the documents into a memory mapped Arrow file,
-   plans the query, loads the model if the container is cold, runs the
-   physical graph, joins and projects the answers with Arrow, and
-   returns a materialized `QueryResult` with the report, executed plan,
-   and node metrics attached.
-5. The client receives that `QueryResult`.
-
-## Warm containers
-
-While a provider is open, the selected function keeps one container
-running (`min_containers=1`). A second query on the same session
-reuses the loaded model and reports `boot_kind: warm`.
-`Session.close()` sets the minimum back to zero and exits the app
-context. Always close, or use the session as a context manager.
-
-The provider selects its image from the backend, its runtime package,
-and the explicit `local_python_sources` and `pip_packages` settings.
-Changing registered objects alone does not rebuild the image.
-
-## Function call ids
-
-Every `run()` prints:
-
-```text
-function call id: fc-01ABC...
-```
-
-Keep it. If the client disconnects, the result is still retrievable:
+The function needs a CUDA image with Quail and its backend dependencies.
+For the repository checkout:
 
 ```python
 import modal
-result = modal.FunctionCall.from_id("fc-01ABC...").get()
-table, report = result.collect(), result.report
+from demos import quickstart
+
+app = modal.App("quail-engine")
+image = (
+    modal.Image.from_registry(
+        "nvidia/cuda:13.0.1-devel-ubuntu24.04", add_python="3.12")
+    .entrypoint([])
+    .pip_install("vllm==0.26.0", "pyarrow", "sqlglot>=27.0",
+                 "bpe-qwen>=0.1.5", "datasets>=5.0.1")
+    .add_local_python_source("quail", "quail_b", "demos")
+)
+
+@app.function(image=image, gpu="H100!", memory=98304, timeout=1200)
+def run_query():
+    return quickstart.run_query()
 ```
 
-Tee every Modal run to a file, because the CLI drops old log lines.
+The session, data registration, planning, and execution happen inside the
+GPU function. For large sources, pass a path and open it there.
 
-## Cost
+## Choose volumes and cache paths
 
-Report GPU cost as query hours × GPU count × the H100 hourly price in
-`quail.specs.H100_USD_PER_HOUR`. The primary number excludes
-model startup. `report["boot_s"]` has the startup time if you need it.
+Volumes are optional. Mount your volumes wherever you want and point the
+relevant libraries at those paths. For example, a model cache can use:
 
-The cold model load for Qwen3 4B fp8 is about 25 seconds after the
-first container has seeded the kernel cache volume. The first ever
-load in a fresh Modal environment is longer because it also downloads
-the weights.
+```python
+weights = modal.Volume.from_name("quail-hf-cache", create_if_missing=True)
+image = image.env({"HF_HOME": "/model-cache"})
+
+@app.function(
+    image=image, gpu="H100!", memory=98304, timeout=1200,
+    volumes={"/model-cache": weights},
+)
+def run_query():
+    return quickstart.run_query()
+```
+
+Quail does not set Hugging Face, vLLM, Triton, or DeepGEMM cache locations.
+Those libraries use their own defaults or environment settings.
+`QUAIL_CACHE_DIR` controls Quail's warmup marker files. Its default is
+`~/.cache/quail/kernels`; it does not change another library's cache.
+
+The complete demo mounts one volume, `quail-results`, at `/results`.
+Models use `/results/models`, compiled kernels use `/results/kernels`, and
+reports use `/results/quickstart`. You can change the mount and cache paths
+in the script. Keep the existing app names,
+`quail-engine` for demos and `quail-milestone1` for this repository's experiments.
+
+## Save results explicitly
+
+Collect rows before closing the session. The function can return the
+collected Arrow table and report without saving either. To persist them,
+write them to a mounted path and call your volume's `commit()` method.
+Quail does not write run reports or commit volumes.
+
+The complete demo writes its report under `/results/quickstart/` and returns
+the saved path with the rows and report. Change `RESULTS_DIR` and the mount
+in that script to use another location.
+
+## Submit and retrieve
+
+Inside an `@app.local_entrypoint()`:
+
+```python
+call = run_query.spawn()
+print(f"function call id: {call.object_id}", flush=True)
+rows, report = call.get()
+```
+
+Keep the function call id in the tee file. After a disconnect, retrieve the
+return value with `modal.FunctionCall.from_id("fc-...").get()`.
+For long runs, use `modal run --detach`.
+
+## Extensions and lifetime
+
+Use Modal's `image.pip_install(...)` and
+`image.add_local_python_source(...)` for extension dependencies and code.
+Create the registry and extensions inside the function. Attach credentials
+with the function's `secrets` argument.
+
+Several queries can share one session's token files. Backends keep loaded
+models in process state, but separate Modal invocations may use different
+containers. `Session.close()` releases token files and waits for background
+tokenization. It does not unload models or control container lifetime.

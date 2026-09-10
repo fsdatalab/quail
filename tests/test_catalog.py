@@ -12,7 +12,7 @@ from quail.catalog import (
 from quail.logical import CompileError
 
 
-def test_from_dataset_rejects_non_dataset_and_missing_id():
+def test_table_provider_scans_and_validation(monkeypatch):
     with pytest.raises(TypeError, match="pyarrow.dataset.Dataset"):
         DocumentProvider.from_dataset(
             pa.table({"id": ["a"], "body": ["first"]}), id_col="id")
@@ -21,8 +21,6 @@ def test_from_dataset_rejects_non_dataset_and_missing_id():
     with pytest.raises(CompileError, match="id column 'id'"):
         DocumentProvider.from_dataset(dataset, id_col="id")
 
-
-def test_scan_returns_bounded_batches_and_only_requested_columns():
     dataset = ds.dataset(pa.table({
         "id": [str(index) for index in range(10)],
         "body": [f"body {index}" for index in range(10)],
@@ -38,30 +36,29 @@ def test_scan_returns_bounded_batches_and_only_requested_columns():
     assert [batch.num_rows for batch in batches] == [2, 2, 1]
     assert all(batch.schema.names == ["body"] for batch in batches)
 
+    with monkeypatch.context() as patch:
+        class Info:
+            features = {"id": object(), "body": object(), "unused": object()}
 
-def test_hugging_face_provider_reads_through_arrow_dataset(monkeypatch):
-    class Info:
-        features = {"id": object(), "body": object(), "unused": object()}
+        class Builder:
+            info = Info()
 
-    class Builder:
-        info = Info()
+        patch.setattr(
+            "datasets.load_dataset_builder", lambda *args, **kwargs: Builder())
+        patch.setattr(
+            "datasets.load_dataset",
+            lambda *args, **kwargs: Dataset.from_dict({
+                "id": ["a", "b"],
+                "body": ["first", "second"],
+                "unused": [1, 2],
+            }))
 
-    monkeypatch.setattr(
-        "datasets.load_dataset_builder", lambda *args, **kwargs: Builder())
-    monkeypatch.setattr(
-        "datasets.load_dataset",
-        lambda *args, **kwargs: Dataset.from_dict({
+        provider = DocumentProvider.from_hf(
+            "owner/documents", id_col="id", split="test", config="plain")
+        table = provider.scan(ScanRequest(("id", "body"))).read_all()
+
+        assert table.column_names == ["id", "body"]
+        assert table.to_pydict() == {
             "id": ["a", "b"],
             "body": ["first", "second"],
-            "unused": [1, 2],
-        }))
-
-    provider = DocumentProvider.from_hf(
-        "owner/documents", id_col="id", split="test", config="plain")
-    table = provider.scan(ScanRequest(("id", "body"))).read_all()
-
-    assert table.column_names == ["id", "body"]
-    assert table.to_pydict() == {
-        "id": ["a", "b"],
-        "body": ["first", "second"],
-    }
+        }

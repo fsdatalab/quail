@@ -22,7 +22,7 @@ def allocate(arena, key, tokens):
     arena._capacity_rows[key] = None
 
 
-def test_shared_pool_replaces_an_earlier_collection():
+def test_retention_priority_capacity_and_eviction():
     arena = cpu_arena(16, 4, {'early': (1, 0), 'later': (1, 1)})
     allocate(arena, ('later', 0), 32)
     arena.retain(('later', 0), 32)
@@ -33,22 +33,16 @@ def test_shared_pool_replaces_an_earlier_collection():
     assert arena.accounting.retained_pages == 4
     assert arena.evicted_prefix_tokens == 32
 
-
-def test_longer_document_does_not_win_without_future_reuse():
     policy = RetentionPolicy(1, 0.01, {'useful': (1, 0)})
     assert policy.priority(('unused', 0), 1000, 63)[0] == 0
     assert policy.priority(('useful', 0), 100, 7)[0] > 0
 
-
-def test_equal_prefixes_prefer_earlier_use():
     arena = cpu_arena(8, 2, {'first': (1, 0), 'last': (1, 1)})
     for alias in ('last', 'first'):
         allocate(arena, (alias, 0), 32)
         arena.retain((alias, 0), 32)
     assert set(arena.accounting.retained) == {('first', 0)}
 
-
-def test_rejected_candidate_returns_its_pages():
     arena = cpu_arena(8, 2, {'a': (1, 0)})
     allocate(arena, ('a', 0), 32)
     arena.retain(('a', 0), 32)
@@ -56,8 +50,6 @@ def test_rejected_candidate_returns_its_pages():
     assert arena.retain(('a', 1), 1) == 1
     assert ('a', 1) not in arena.accounting.owned
 
-
-def test_stage_update_reorders_only_retained_prefixes():
     arena = cpu_arena(16, 8, {'a': (1, 0), 'b': (1, 1)})
     for alias in ('a', 'b', 'active'):
         allocate(arena, (alias, 0), 32)
@@ -71,13 +63,23 @@ def test_stage_update_reorders_only_retained_prefixes():
     assert ('active', 0) in arena.accounting.pinned
     assert ('b', 0) in arena.accounting.retained
 
-
-def test_zero_capacity_and_oversized_prefix():
     for cap in (0, 1):
         arena = cpu_arena(8, cap, {'a': (1, 0)})
         allocate(arena, ('a', 0), 32)
         assert arena.retain(('a', 0), 32) == 2
         assert not arena.accounting.owned
+
+    from quail.backends.quail.retention import apply_retention
+
+    arena = cpu_arena(16, 8, {'a': (1, 0), 'b': (1, 1)})
+    for key in [('a', 0), ('b', 0), ('b', 1)]:
+        allocate(arena, key, 32)
+        arena.retain(key, 32)
+    config = dict(linear_seconds=1, pair_seconds=0.01, cap_pages=8)
+    apply_retention(arena, config, {'b': (1, 1)}, {'b': [1]})
+    assert set(arena.accounting.retained) == {('b', 1)}
+    assert arena.accounting.retained_pages == 2
+    assert arena.accounting.free_pages == 14
 
 
 def test_filter_chains_share_retention_and_return_evicted_pages(monkeypatch):
@@ -115,7 +117,7 @@ def test_filter_chains_share_retention_and_return_evicted_pages(monkeypatch):
     assert arena.accounting.free_pages == 24
 
 
-def test_expected_allocation_uses_lengths_and_selectivity():
+def test_retention_costs_and_future_use():
     from quail.planner.joins import summarize_alias
     from quail.planner.retention import allocate
 
@@ -130,8 +132,6 @@ def test_expected_allocation_uses_lengths_and_selectivity():
         assert credited[alias].resident_total == 160
         assert credited[alias].resident_squared == 160**2
 
-
-def test_schedule_keeps_future_anchors_and_ends_at_last_use():
     from quail.planner.retention import schedule
 
     def stage(position, aliases):
@@ -146,8 +146,6 @@ def test_schedule_keeps_future_anchors_and_ends_at_last_use():
     assert set(result['after']['group:0']) == {'a', 'c'}
     assert result['after']['group:2'] == {}
 
-
-def test_priority_matches_the_existing_prefix_cost():
     import pytest
 
     from quail.planner.retention import coefficients
@@ -160,17 +158,3 @@ def test_priority_matches_the_existing_prefix_cost():
         pages = -(-length // 16)
         assert policy.priority(('a', 0), length, pages)[0] == pytest.approx(
             0.4 * prefix_recompute_seconds(length, QWEN3_4B_FP8, H100_SXM) / pages)
-
-
-def test_boundary_releases_dead_and_expired_but_preserves_later_alias():
-    from quail.backends.quail.retention import apply_retention
-
-    arena = cpu_arena(16, 8, {'a': (1, 0), 'b': (1, 1)})
-    for key in [('a', 0), ('b', 0), ('b', 1)]:
-        allocate(arena, key, 32)
-        arena.retain(key, 32)
-    config = dict(linear_seconds=1, pair_seconds=0.01, cap_pages=8)
-    apply_retention(arena, config, {'b': (1, 1)}, {'b': [1]})
-    assert set(arena.accounting.retained) == {('b', 1)}
-    assert arena.accounting.retained_pages == 2
-    assert arena.accounting.free_pages == 14

@@ -91,5 +91,5 @@ Register with `registry.register_device(spec)` and select with
 `Session(EngineConfig(device="name"))`. A backend must also accept the device,
 and its kernels must support that GPU. Quail selects FlashAttention-3 on H100
 and FlashAttention-2 on RTX PRO 6000 Blackwell. RTX execution still needs a
-GPU validation run. The Modal provider provisions H100s only and rejects other
-device names. Use the in-process provider on an RTX host.
+GPU validation run. The supplied Modal examples request H100s. On an RTX
+host, use a normal session with the RTX device specification.

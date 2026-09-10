@@ -5,7 +5,7 @@ import pytest
 from experiments.profile_flamegraph import aggregate_intervals
 
 
-def test_repeated_calls_keep_parent_context_and_self_time():
+def test_flamegraph_accounts_for_nested_calls_and_gpu_overlap():
     result = aggregate_intervals([
         (0, 10, "parent"), (2, 5, "child"), (6, 8, "child"),
         (12, 17, "parent"), (13, 14, "child"), (18, 20, "other"),
@@ -19,13 +19,9 @@ def test_repeated_calls_keep_parent_context_and_self_time():
     assert parent["children"][0]["seconds"] == pytest.approx(6e-6)
     assert sum(child["seconds"] for child in result["children"]) == pytest.approx(25e-6)
 
-
-def test_crossing_intervals_are_rejected():
     with pytest.raises(ValueError, match="cross rather than nest"):
         aggregate_intervals([(0, 3, "one"), (2, 4, "two")], 5)
 
-
-def test_gpu_overlap_counts_concurrent_kernels_once_and_covers_unrecorded_time():
     result = aggregate_intervals(
         [(0, 10, "parent"), (2, 5, "child"), (12, 17, "parent")],
         20, [(1, 4), (3, 6), (9, 13), (18, 22)],

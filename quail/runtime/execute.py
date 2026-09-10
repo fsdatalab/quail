@@ -1,36 +1,31 @@
-"""Run a logical query request in the current process.
+"""Run a query in the current process."""
 
-The Modal worker and the in-process compute provider both come here.
-"""
-
-import json
 import time
-from dataclasses import dataclass, field
 
 from quail.backends import BackendExecutionContext
 from quail.execution import PhysicalRequest, PhysicalResponse
 from quail.physical import DocumentInput, check_plan_envelope, decode_graph
 from quail.planner.plan import Refusal
-from quail.runtime.compute import QueryRequest
-from quail.runtime.result import QueryResult
-from quail.runtime.session import Query, RefusalError, Session
-from quail.runtime.volumes import commit_results, run_record_path
+from quail.runtime.session import RefusalError
 
+# Loaded models outlive individual sessions.
+_BACKEND_STATE: dict = {}
 
-@dataclass
-class _WorkerRuntime:
-    """Per process state that backends keep between queries."""
-
-    booted: dict = field(default_factory=dict)
-
-
-_RUNTIME = _WorkerRuntime()
+def gpu_problem() -> str | None:
+    """Return why this process cannot run a model, or None when it can."""
+    try:
+        import torch
+    except ImportError:
+        return "torch is not installed"
+    if not torch.cuda.is_available():
+        return "no CUDA GPU is visible to this process"
+    return None
 
 
 def _validate_physical_request(request, registry):
     """Validate and decode a physical execution request."""
     if not isinstance(request, PhysicalRequest):
-        raise TypeError("the worker needs a PhysicalRequest")
+        raise TypeError("execution requires a PhysicalRequest")
     envelope = request.plan
     check_plan_envelope(envelope)
     backend = registry.backend(envelope["backend"])
@@ -48,64 +43,44 @@ def _validate_physical_request(request, registry):
             "execution request has wrong input bindings; "
             f"missing={sorted(missing)}, extra={sorted(extra)}"
         )
-    return request, registry, graph, backend
+    return graph, backend
 
 
 def _execute_physical(request, registry):
     """Run the backend selected by a registered physical plan."""
-    request, registry, graph, backend = _validate_physical_request(request, registry)
+    graph, backend = _validate_physical_request(request, registry)
     response = backend.execute_request(BackendExecutionContext(
         request=request,
         graph=graph,
         registry=registry,
         gpu_count=request.gpu_count,
-        runtime_state=_RUNTIME.booted,
+        runtime_state=_BACKEND_STATE,
     ))
     if not isinstance(response, PhysicalResponse):
         raise TypeError("a model backend must return PhysicalResponse")
-    result_path = (
-        run_record_path()
-        if response.metrics.get("result_volume_path") is None else None
-    )
-    if result_path is not None:
-        metrics = dict(response.metrics)
-        metrics["result_volume_path"] = result_path
-        with open(result_path, "w") as output:
-            json.dump({
-                key: metrics.get(key)
-                for key in (
-                    "backend",
-                    "wall_s",
-                    "boot_s",
-                    "boot_kind",
-                    "boot",
-                    "fresh_tokens",
-                    "cached_tokens",
-                    "regret_tokens",
-                    "peak_gib",
-                    "node_metrics",
-                    "backend_metrics",
-                )
-            }, output)
-        commit_results()
-        response = PhysicalResponse(response.outputs, metrics)
     return response
 
 
-def execute_worker_query(query, physical_executor=None):
-    """Execute one query inside its current worker process."""
+def execute_query(query, physical_executor=None):
+    """Execute one query in its session's process."""
+    total_started = time.perf_counter()
+    if physical_executor is None:
+        problem = gpu_problem()
+        if problem is not None:
+            raise RuntimeError(
+                f"cannot run the model in this process: {problem}. "
+                "Run your Session in a process with a CUDA GPU "
+                "and the backend installed."
+            )
     plan = query.plan()
     if isinstance(plan, Refusal):
         raise RefusalError(plan)
     plan.graph.validate(runtime_keys=set(query.session.registry.runtimes))
     plan.graph.validate_backend(plan.backend)
     if plan.workers > 8:
-        raise NotImplementedError(
-            "more than 8 GPUs means multiple containers; the "
-            "multi-container coordinator is a later step"
-        )
+        raise NotImplementedError("query execution supports at most 8 GPUs")
     if physical_executor is None:
-        # the model can load while the token file is still being written
+        # Backend startup must not wait for background tokenization.
         _prepare_backend(plan, query.session.registry)
     request = query._prepare_physical()
     started = time.perf_counter()
@@ -117,6 +92,8 @@ def execute_worker_query(query, physical_executor=None):
         raise TypeError("a physical executor must return PhysicalResponse")
     result = query.finish(response, time.perf_counter() - started)
     result.report["token_wait_s"] = round(query.token_wait_s, 4)
+    result.report["worker_total_s"] = round(
+        time.perf_counter() - total_started, 4)
     return result
 
 
@@ -132,23 +109,5 @@ def _prepare_backend(plan, registry) -> None:
         graph=plan.graph,
         registry=registry,
         gpu_count=plan.workers,
-        runtime_state=_RUNTIME.booted,
+        runtime_state=_BACKEND_STATE,
     ))
-
-
-def execute_query_request(
-    request: QueryRequest, physical_executor=None
-) -> QueryResult:
-    """Plan and run one logical query request in this process."""
-    started = time.perf_counter()
-    query = request.planned_query
-    if not isinstance(query, Query):
-        session = Session(request.config, registry=request.registry)
-        for name, provider in request.providers.items():
-            session.register(name, provider)
-        query = Query(session, request.logical_plan, order=request.order)
-    result = execute_worker_query(query, physical_executor)
-    result.report["worker_total_s"] = round(
-        time.perf_counter() - started, 4
-    )
-    return result
