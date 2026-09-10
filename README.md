@@ -14,20 +14,14 @@ From this repository, install the dependencies with Python 3.12 and uv:
 uv sync
 ```
 
-For Modal, run `uv run modal setup` once to configure your account. Then:
+Run the example on a machine with a CUDA GPU:
 
 ```bash
-mkdir -p results
-uv run modal run demos/quickstart_modal.py \
-  2>&1 | tee results/quickstart.log
+uv run python demos/quickstart.py
 ```
 
-The example runs QUAIL-B's IMDB-1 query on 100 reviews using an H100.
+The [example](demos/quickstart.py) runs QUAIL-B's IMDB-1 query on 100 reviews.
 It prints the matching rows and execution report.
-
-- [quickstart.py](demos/quickstart.py) contains the query and runs directly on a CUDA GPU.
-- [quickstart_modal.py](demos/quickstart_modal.py) runs the same code on Modal.
-  The wrapper owns the image, volume, cache settings, and saved report path.
 
 ## Benchmark
 
@@ -38,27 +32,37 @@ Reference labels load directly from QUAIL-B's public S3 bucket.
 For example, run IMDB-4 with Quail:
 
 ```bash
-uv run modal run --detach -m quail.bench.quailb_parallel \
-  --query IMDB-4 --sf 0.1 --no-include-baselines \
-  2>&1 | tee results/benchmark.log
+uv run python -m quail.bench.quailb \
+  --only IMDB-4 --sf 0.1 --output-dir results/imdb-4
 ```
 
-Omit `--query` to run all 32 queries. Omit `--no-include-baselines` to include
-stock vLLM with operator-at-a-time execution, pipelined vLLM, and pipelined SGLang.
+Omit `--only` to run the full benchmark, or pass comma-separated query IDs.
+Choose a new directory with `--output-dir` for each run.
 
-Results are saved on the `quail-results` Modal volume under
-`/results/benchmarks/quailb/<run-id>/`. Set `--output-dir` to change the parent
-directory. The command prints the run directory and function call IDs.
+The run directory contains `run.json`, saved query answers, and `report.md`
+with timings, throughput, GPU cost, and accuracy.
 
-After [downloading the run directory](docs/content/docs/user-guide/benchmark.mdx),
-generate a report without rerunning inference:
+Regenerate the report from saved answers without rerunning inference:
 
 ```bash
-uv run quail-b report /path/to/run-directory/quail
+uv run quail-b report results/imdb-4
 ```
 
-QUAIL-B writes `report.md` inside the backend's directory. Each query family
-also has its own saved run and report.
+## Modal (optional)
+
+To run the quickstart on Modal instead, configure your account and submit it:
+
+```bash
+uv run modal setup
+mkdir -p results
+uv run modal run demos/quickstart_modal.py \
+  2>&1 | tee results/quickstart.log
+```
+
+The [Modal example](demos/quickstart_modal.py) calls the same query function on
+an H100. You control its image, volume mounts, cache settings, and report path.
+See the [benchmark guide](docs/content/docs/user-guide/benchmark.mdx) for running
+Quail and the comparison engines on Modal.
 
 ## Development
 
