@@ -5,7 +5,6 @@ import json
 import math
 from dataclasses import asdict
 from datetime import datetime, timezone
-from importlib.metadata import version
 from pathlib import Path
 
 import pyarrow.parquet as pq
@@ -146,6 +145,7 @@ def run(run_query, *, queries=None, scale_factor=0.1, output_dir,
     Returns:
         The saved run record. Query failures raise after saving their status.
     """
+    from quail_b import __version__
     from quail_b.reporting import _write_report
 
     directory = Path(output_dir)
@@ -164,7 +164,7 @@ def run(run_query, *, queries=None, scale_factor=0.1, output_dir,
             data_dir=data_dir, root=root)
     truth = suite.ground_truth
     record = {
-        "schema_version": 1, "quail_b_version": version("quail-b"),
+        "schema_version": 1, "quail_b_version": __version__,
         "scale_factor": scale_factor, "corpus_id": suite.corpus_id,
         "collection_id": truth.collection_id, "reference_model": truth.reference_model,
         "metadata": metadata or {}, "gpu_count": gpu_count,

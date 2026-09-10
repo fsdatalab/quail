@@ -8,6 +8,8 @@ from quail_b.reporting import report
 from quail_b.run import run
 from quail_b.scoring import RunOutput
 
+__version__ = "0.2.0"
+
 __all__ = [
     "RunOutput", "run", "report", "load_benchmark",
     "select_queries", "load_table",
