@@ -137,7 +137,8 @@ change needs one of them, say so instead of quietly adding it back.
 
 # Reports
 
-All experiment and feature reports live under `reports/`.
+Experiment reports live under `reports/`. Do not add shipped-feature reports
+to this repository.
 
 - Every PR that includes an experiment must produce a report in
   `reports/`. Name the file `YYYY-MM-DD-<short-slug>.md`.
@@ -149,10 +150,6 @@ All experiment and feature reports live under `reports/`.
   `reports/plots/`. Before starting a new task, scan `reports/`
   for outdated reports, orphaned plot scripts, and PNGs not
   referenced by any current report, and delete them all.
-- When a PR ships a new feature (a code change that lands on main),
-  add a short description in `reports/shipped_features/`.
-  Name the file `YYYY-MM-DD-<short-slug>.md`. It should say what
-  changed, why, and the before/after numbers if applicable.
 - `reports/engine-wiki.md` is a living reference doc, not a
   per-PR report. Update it in place when the engine's design changes.
 
