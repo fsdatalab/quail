@@ -9,6 +9,7 @@ of that KV as the arena holds and recomputes the rest.
 import itertools
 from dataclasses import dataclass
 
+from quail.planner.budgets import PAGE_TOKENS
 from quail.planner.sol import speed_of_light
 from quail.planner.work import Work, triangle
 
@@ -154,27 +155,66 @@ def _feasible_anchors(spec, honor_forced, lengths, pre, chunk) -> list:
 
 
 def residency(anchor: str, state: KVState, resident_aliases,
-              same_group: bool = False) -> str:
+              same_group: bool = False, joined=frozenset()) -> str:
     """Name the source of the KV credit recorded for one stage.
 
     A prefix computed once is resident at every later anchor use: by
-    its filter ("filter") or by an earlier anchor use ("kept").
+    its filter ("filter") or by an earlier anchor use ("kept"). A
+    filtered alias that was a partner before its first anchor use (it
+    is in joined, the aliases of the applied stages, but anchored
+    none) had to finish its chain up front, so only what the retention
+    pool holds is resident ("pool").
     """
     if same_group or anchor in state.used_anchors:
         return "kept"
     if anchor in resident_aliases:
-        return "filter"
+        return "pool" if anchor in joined else "filter"
     return "none"
 
 
+def pool_fraction(anchor: str, live: dict, lengths: dict, pre: int,
+                  pool_pages) -> float:
+    """The share of an alias's live documents the retention pool holds."""
+    n = live[anchor]
+    if pool_pages is None or n <= 0:
+        return 1.0
+    pages = -(-(pre + lengths[anchor].mean) // PAGE_TOKENS)
+    return min(1.0, (pool_pages // max(1, pages)) / n)
+
+
+def stage_step(spec: dict, anchor: str, live: dict, lengths: dict,
+               resident_aliases, pre: int, state: KVState, joined,
+               pool_pages) -> tuple:
+    """Price one stage from the KV state; return (record, next state).
+
+    joined holds the aliases of the stages applied so far.
+    """
+    same_group = (state.group_open and state.pending_anchor == anchor
+                  and spec["semantics"] == "full")
+    kind = residency(anchor, state, resident_aliases, same_group, joined)
+    fraction = {"kept": 1.0, "filter": 1.0, "none": 0.0}.get(kind)
+    if fraction is None:
+        fraction = pool_fraction(anchor, live, lengths, pre, pool_pages)
+    work = stage_work(spec, anchor, live, lengths, pre, resident=fraction)
+    record = dict(written_pos=spec["written_pos"], anchor=anchor,
+                  resident=kind,
+                  resident_docs=round(lengths[anchor].count * fraction),
+                  tuples=cross_tuples(spec, live),
+                  tokens=work.tokens, work=work)
+    next_state = KVState(anchor, spec["semantics"] == "full",
+                         state.used_anchors | {anchor})
+    return record, next_state
+
+
 def stage_work(spec: dict, anchor: str, live: dict, lengths: dict,
-               pre: int, *, resident: bool = False) -> Work:
+               pre: int, *, resident: float = 0.0) -> Work:
     """Expected Work of one stage at the current live counts.
 
     The length sums make the calculation constant time in the number
     of documents. A resident prefix pays its frame only. A missing
-    prefix scans the preamble, document, and frame. Every tuple then
-    carries partner labels, partner documents, and the answer cue.
+    prefix scans the preamble, document, and frame; resident is the
+    share of anchor documents whose prefix is resident. Every tuple
+    then carries partner labels, partner documents, and the answer cue.
     """
     stats = lengths[anchor]
     n = live[anchor]
@@ -192,22 +232,21 @@ def stage_work(spec: dict, anchor: str, live: dict, lengths: dict,
     prefix_sum = stats.total + pre * count
     prefix_squared = (
         stats.squared + 2 * pre * stats.total + pre * pre * count)
-    if resident:
-        start = Work(
-            tokens=count * frame,
-            pairs=frame * prefix_sum + count * triangle(frame),
-            kv_written=count * frame,
-            kv_read=prefix_sum,
-        )
-    else:
-        scan_sum = prefix_sum + count * frame
-        scan_squared = (
-            prefix_squared + 2 * frame * prefix_sum + count * frame * frame)
-        start = Work(
-            tokens=scan_sum,
-            pairs=(scan_squared + scan_sum) / 2,
-            kv_written=scan_sum,
-        )
+    kept = Work(
+        tokens=count * frame,
+        pairs=frame * prefix_sum + count * triangle(frame),
+        kv_written=count * frame,
+        kv_read=prefix_sum,
+    )
+    scan_sum = prefix_sum + count * frame
+    scan_squared = (
+        prefix_squared + 2 * frame * prefix_sum + count * frame * frame)
+    scanned = Work(
+        tokens=scan_sum,
+        pairs=(scan_squared + scan_sum) / 2,
+        kv_written=scan_sum,
+    )
+    start = kept * resident + scanned * (1.0 - resident)
     stream = Work(
         tokens=count * per_anchor * u,
         pairs=per_anchor * (
@@ -220,13 +259,14 @@ def stage_work(spec: dict, anchor: str, live: dict, lengths: dict,
 
 
 def walk(seq, live0: dict, lengths: dict, resident, pre: int,
-         model, device):
+         model, device, pool_pages=None):
     """Cost one [(spec, anchor)] sequence.
 
     resident names the aliases whose prefix KV a filter computes
-    before the joins. Returns (work, records): per stage, the written
-    position, the anchor, the residency its cost assumed, and expected
-    tuples and tokens.
+    before the joins; pool_pages is the retention pool, which bounds
+    what a partner-first alias keeps (None: unlimited). Returns (work,
+    records): per stage, the written position, the anchor, the
+    residency its cost assumed, and expected tuples and tokens.
     """
     lengths = _alias_stats(lengths)
     resident = set(resident or ())
@@ -234,6 +274,7 @@ def walk(seq, live0: dict, lengths: dict, resident, pre: int,
     total = Work()
     records = []
     applied = []
+    joined = frozenset()
     for spec, anchor in seq:
         # live counts thin by the applied stages in written order, the
         # convention the search prices with, so a sequence costs the
@@ -241,22 +282,12 @@ def walk(seq, live0: dict, lengths: dict, resident, pre: int,
         live = dict(live0)
         for done in sorted(applied, key=lambda s: s["written_pos"]):
             thin(live, done)
-        same_group = (state.group_open
-                      and state.pending_anchor == anchor
-                      and spec["semantics"] == "full")
-        kind = residency(anchor, state, resident, same_group)
-        kept = lengths[anchor].count if kind != "none" else 0
-        w = stage_work(spec, anchor, live, lengths, pre,
-                       resident=kind != "none")
-        records.append(dict(written_pos=spec["written_pos"],
-                            anchor=anchor, resident=kind,
-                            resident_docs=kept,
-                            tuples=cross_tuples(spec, live),
-                            tokens=w.tokens, work=w))
-        total = total + w
+        record, state = stage_step(spec, anchor, live, lengths, resident,
+                                   pre, state, joined, pool_pages)
+        records.append(record)
+        total = total + record["work"]
         applied.append(spec)
-        state = KVState(anchor, spec["semantics"] == "full",
-                        state.used_anchors | {anchor})
+        joined = joined | frozenset(spec["aliases"])
     return total, records
 
 
@@ -264,7 +295,7 @@ def search_joins(specs, live: dict, lengths: dict, resident,
                  pre: int, chunk_tokens: int, model, device, *,
                  base_work: Work = Work(), fixed_order: bool = False,
                  honor_forced: bool = True,
-                 already_joined=()):
+                 already_joined=(), pool_pages=None):
     """Search stage order and anchor choice; return the cheapest.
 
     Args:
@@ -288,6 +319,9 @@ def search_joins(specs, live: dict, lengths: dict, resident,
         fixed_order: keep the written stage order (order=as_written);
             anchors are still chosen.
         honor_forced: honor forced full-join anchors.
+        pool_pages: The retention pool in pages, which bounds what a
+            filtered alias keeps when it was a partner before its first
+            anchor use; None prices KV reuse as unlimited everywhere.
 
     Returns:
         None when the join graph has no connected left deep order,
@@ -310,7 +344,7 @@ def search_joins(specs, live: dict, lengths: dict, resident,
     def run_walk(order_specs, assign):
         seq = list(zip(order_specs, assign))
         work, records = walk(
-            seq, live, lengths, resident, pre, model, device)
+            seq, live, lengths, resident, pre, model, device, pool_pages)
         return work, records, seq
 
     if fixed_order or (len(specs) == 1 and not already_joined):
@@ -396,23 +430,11 @@ def search_joins(specs, live: dict, lengths: dict, resident,
                 next_applied = applied | {i}
                 for anchor in _feasible_anchors(
                         spec, honor_forced, lengths, pre, chunk_tokens):
-                    same_group = (
-                        state_now.group_open
-                        and state_now.pending_anchor == anchor
-                        and spec["semantics"] == "full")
-                    kind = residency(anchor, state_now, resident,
-                                     same_group)
-                    kept = lengths[anchor].count if kind != "none" else 0
-                    work = stage_work(spec, anchor, live_now, lengths, pre,
-                                      resident=kind != "none")
-                    step = dict(
-                        written_pos=spec["written_pos"], anchor=anchor,
-                        resident=kind, resident_docs=kept,
-                        tuples=cross_tuples(spec, live_now),
-                        tokens=work.tokens, work=work)
-                    next_state = KVState(
-                        anchor, spec["semantics"] == "full",
-                        state_now.used_anchors | {anchor})
+                    step, next_state = stage_step(
+                        spec, anchor, live_now, lengths, resident, pre,
+                        state_now, relations if applied else frozenset(),
+                        pool_pages)
+                    work = step["work"]
                     for old in frontier:
                         generated += 1
                         candidate = Candidate(

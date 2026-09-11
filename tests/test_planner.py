@@ -525,7 +525,8 @@ def test_join_token_costs_and_retention(catalog):
                       doc_tokens=toks, order="as_written")
     groups = plan.graph.nodes_by_type(AiJoin.type_name)
     assert [group.anchor for group in groups] == ["p", "r"]
-    assert groups[1].anchor_resident == "filter"
+    assert groups[1].anchor_resident == "pool"
+    assert "anchor=from the retention pool" in explain(logical, plan)
     chain = filter_chain(plan, "r")
     assert chain.keep_kv is True
     assert chain.pin_survivors is False
@@ -999,3 +1000,47 @@ def test_plan_walkthrough_demo_prints_the_same_row_from_every_plan():
     assert text.count("[{'c.id': 'c0', 'e.id': 'e0'}]") == 3
     assert "'ai_filter:c', 'barrier:c', 'ai_join:c'" in text
     assert "PlanEditError" in text
+
+
+def test_a_partner_first_anchor_is_priced_by_the_retention_pool(catalog):
+    from quail.planner.decide import collect_operators, join_specs
+    from quail.planner.joins import search_joins, walk
+
+    # r is filtered and long. Its join with a must anchor on a, so r is
+    # a partner there; its join with t anchors on r. Pricing KV reuse as
+    # unlimited sees no difference between the two orders for r's
+    # prefixes; the retention pool prices the order that makes r a
+    # partner first as a recompute, so the search puts r's group first.
+    logical = (docs(catalog, "reviews", tok).alias("r")
+               .ai_filter(prompt("f {0}", col("r.review")), selectivity=0.5)
+               .ai_join(docs(catalog, "products", tok).alias("a"),
+                        prompt("j1 {0} {1}", col("a.description"),
+                               col("r.review")),
+                        selectivity=0.5, anchor="a")
+               .ai_join(docs(catalog, "threads", tok).alias("t"),
+                        prompt("j2 {0} {1}", col("r.review"),
+                               col("t.thread")), selectivity=0.5)
+               .select("r.id"))
+    _, _, joins = collect_operators(logical)
+    specs = join_specs(joins)
+    toks = {"r": [400] * 20000, "a": [20] * 10, "t": [20] * 10}
+    live0 = {"r": 10000.0, "a": 10.0, "t": 10.0}
+    pre, chunk, pool = 1, 10_000, 8843    # the pool holds 340 of 10,000
+    partner_first = [(specs[0], "a"), (specs[1], "r")]
+    anchor_first = [(specs[1], "r"), (specs[0], "a")]
+    pooled, records = walk(partner_first, live0, toks, {"r"}, pre,
+                           QWEN3_4B_FP8, H100_SXM, pool)
+    assert records[1]["resident"] == "pool"
+    assert 0 < records[1]["resident_docs"] < 20000
+    streamed, first = walk(anchor_first, live0, toks, {"r"}, pre,
+                           QWEN3_4B_FP8, H100_SXM, pool)
+    assert first[0]["resident"] == "filter"
+    assert first[0]["resident_docs"] == 20000
+    assert pooled.tokens > streamed.tokens
+    unlimited, plain = walk(partner_first, live0, toks, {"r"}, pre,
+                            QWEN3_4B_FP8, H100_SXM)
+    assert plain[1]["resident_docs"] == 20000
+    assert unlimited.tokens < pooled.tokens
+    found = search_joins(specs, live0, toks, {"r"}, pre, chunk,
+                         QWEN3_4B_FP8, H100_SXM, pool_pages=pool)
+    assert found["seq"][0] == (1, "r")

@@ -70,8 +70,11 @@ forward pass.
 
 The planner uses Selinger-style dynamic programming to choose join order and
 anchors before inference. Filter survival is estimated from selectivities.
-KV reuse is priced as unlimited: a document prefix computed once is free at
-every later anchor use, the same assumption as the speed-of-light estimate.
+KV reuse is priced as unlimited where the executor can pin it: a document
+prefix computed once is free at every later anchor use, the same assumption
+as the speed-of-light estimate. A filtered alias that is a partner before it
+anchors is the exception: its chain finishes up front, so the search credits
+only what the retention pool holds and charges a prefix scan for the rest.
 
 - A filtered alias whose first use is as an anchor has its chain run right
   before that group and stream into it. An alias that is a partner first
