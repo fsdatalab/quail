@@ -542,8 +542,9 @@ honored, with a remark at plan time when a free choice prices lower.
 
 The search runs during planning with estimated survivor counts and document
 length summaries. Filter survival is assumed independent of document length.
-Multiple filter selectivities are multiplied. Candidates share a bounded filter KV allocation across legal anchors.
-The first use of each anchor can receive retention credit.
+Multiple filter selectivities are multiplied. KV reuse is priced as unlimited:
+a filtered alias pays no prefix at its first anchor use, and no alias pays
+one at a later anchor use.
 The selected order determines filter scheduling and the executable graph.
 Actual rows and available KV determine the work performed during execution,
 without changing the selected joins or anchors.
@@ -707,7 +708,7 @@ single forward pass, sharing KV across them through a paged arena.
 | `plan_query` | `decide.py` | Top-level: logical plan + token counts -> physical plan or refusal |
 | `order_filters_indexed` | `decide.py` | Price each possible first scan and sort later asks by time per rejected document |
 | `unrounded_seconds` | `sol.py` | Component limits without forward pass rounding |
-| `search_joins` | `joins.py` | Choose join order and anchors from estimated survivors, length summaries, and shared retention credit |
+| `search_joins` | `joins.py` | Choose join order and anchors from estimated survivors and length summaries, pricing KV reuse as unlimited |
 | `schedule` | `retention.py` | Record future anchor use probabilities for the executor's retention priorities |
 | `RetentionPolicy` | `executor/retention.py` | Rank document prefixes by expected computation saved per KV page |
 | `PageArena.pop_retained_victim` | `executor/arena.py` | Pops the retained document with the lowest future reuse priority |

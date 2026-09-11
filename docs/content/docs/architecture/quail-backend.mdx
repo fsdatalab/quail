@@ -69,12 +69,14 @@ forward pass.
   anchors. Evicted documents are processed again.
 
 The planner uses Selinger-style dynamic programming to choose join order and
-anchors before inference. Filter survival is estimated from selectivities,
-with the input document length distribution used for the survivors.
+anchors before inference. Filter survival is estimated from selectivities.
+KV reuse is priced as unlimited: a document prefix computed once is free at
+every later anchor use, the same assumption as the speed-of-light estimate.
 
-- The first anchor's filter chain runs last and streams into its join. Every
-  input used as a later anchor can retain its passing document KV in one
-  shared pool.
+- A filtered alias whose first use is as an anchor has its chain run right
+  before that group and stream into it. An alias that is a partner first
+  finishes its chain before that group, and its passing document KV waits in
+  one shared pool per GPU.
 - Runtime retention prefers expected prefix computation saved per KV page.
   Document lengths determine computation and page counts. The saved plan supplies
   the probability and position of the next use. Exact survivors are known only

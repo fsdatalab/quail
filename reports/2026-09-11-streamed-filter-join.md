@@ -8,11 +8,13 @@
 - IMDB-3 fell from 32.58 to 22.47 seconds, a 31.0% reduction. IMDB-4 fell
   14.6%, IMDB-5 8.6%, and BIO-3 10.4%. On each, recomputed KV tokens went
   to zero and fresh tokens fell by exactly the recomputed count.
-- IMDB-10 did not change (59.00 to 58.97 seconds). Its first join group
-  anchors on the unfiltered `r2`; the filtered `r1` anchors the second
-  group, behind an anchor switch, so the streamed edge never applies and
-  its 1,217,171 recomputed tokens stay. The prediction for IMDB-10 was
-  wrong for that reason, not because of the mechanism.
+- In the first run IMDB-10 did not change (59.00 to 58.97 seconds). Its
+  first join group anchors on the unfiltered `r2`; the filtered `r1`
+  anchored the second group, behind an anchor switch, so the streamed
+  edge never applied and its 1,217,171 recomputed tokens stayed. The
+  prediction for IMDB-10 was wrong for that reason, not because of the
+  mechanism. A planner change then placed `r1`'s chain right before its
+  group and streamed it; the second run below measures that.
 - All 15 answer tables are identical between the two implementations,
   and so are evaluated pairs and returned rows.
 
@@ -149,3 +151,29 @@ Figure: plots/streamed_filter_join.png
   filtered alias anchors a later group (IMDB-10). The agent queries'
   gap to the request backends is a different problem, prefixes shared
   across documents, and this change does not touch it.
+
+## Second run: the planner defers the chain to the group it anchors
+
+- After the first run the planner changed in two ways
+  ([feature note](shipped_features/2026-09-11-unlimited-kv-planning.md)):
+  the join search prices KV reuse as unlimited, the speed-of-light
+  assumption, instead of crediting only what the retention pool could
+  hold; and a filtered alias whose first use is as an anchor has its
+  chain placed right before that group, after any barrier, streaming into
+  it. On IMDB-10 the search keeps the `r2` group first (16.64 estimated
+  seconds against 16.82 for `r1` first) and `r1`'s chain now runs after
+  the barrier. On FEV-9, `e2`'s chain moves after the first group's
+  barrier and streams into the `e2` group; `c1` and `c2` are partners
+  first, so their chains still run up front.
+- Same setup as the first run: one H100, Qwen3 4B fp8, sf=0.1, the same
+  `8338d92` baseline in the same container, one warmup and one measured
+  run per query. Modal function call `fc-01M27NHND7E2RVB4VKD4XZ1JQ0`, data at
+  `/results/ablations/DIR2_PLACEHOLDER/`.
+- Prediction, stated before the run: IMDB-10 loses all 1,217,171
+  recomputed tokens, fresh tokens fall by exactly that count, and query
+  time drops about 10.7 seconds to near 48 from 59.0, with the same
+  144,348 pairs and 64,840,220 rows. FEV-9's 7,309 recomputed tokens go
+  to 0 and its time stays within noise of 41 seconds. Answer tables
+  identical on both.
+
+RESULTS2_PLACEHOLDER

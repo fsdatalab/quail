@@ -57,8 +57,10 @@ Date: 2026-09-11
 
 - IMDB-3: 32.58 to 22.47 seconds (31.0% less), recomputed KV tokens
   1,217,171 to 0. IMDB-4: 20.32 to 17.35. IMDB-5: 18.16 to 16.60.
-  BIO-3: 89.97 to 80.65. IMDB-10: unchanged at 59.0, because its first
-  join group anchors on an unfiltered alias and the filtered alias
-  anchors a later group. Answer tables identical on all five.
+  BIO-3: 89.97 to 80.65. IMDB-10: unchanged at 59.0 in that run, because
+  its first join group anchors on an unfiltered alias and the filtered
+  alias anchors a later group; the
+  [planner follow-up](2026-09-11-unlimited-kv-planning.md) then deferred
+  that chain to its group. Answer tables identical on all five.
 - Details, the prediction, and the plot are in
   [the report](../2026-09-11-streamed-filter-join.md).
