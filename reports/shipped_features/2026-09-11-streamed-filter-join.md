@@ -27,7 +27,7 @@ Date: 2026-09-11
 - A held document's pages cover the join's largest frame, so the join
   never claims a page for a streamed anchor. The chain re-reads the
   arena's free page count before every chunk, because the join frees
-  and claims pages between chunks (the chain reads the arena's free page count into `FilterAdmission.free_pages` before each chunk).
+  and claims pages between chunks (`FilterAdmission.free_pages`).
 - Each operator keeps its own attention path: the chain sets `unified`
   and the join sets `merge_quant` before each of its chunks.
 - On several GPUs the anchor's chain runs inside the join round on each
