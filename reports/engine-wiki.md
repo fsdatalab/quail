@@ -719,6 +719,38 @@ attention term dominates.
 KV is always bf16. The planner does not choose a KV dtype and does
 not model a conversion tax.
 
+### Node ids, per-node estimates, and edits
+
+Node ids name the operator and what it works on: `scan:c1`,
+`ai_filter:c1`, `ai_join:e1` (`ai_join:e1:2` when the alias anchors a
+second group), `barrier:e2` (the next anchor), `exchange:e1`,
+`apply:same_page`, `recombine`, `project`, `limit`. The retention
+settings (`before`, `after`) are keyed by the join node ids.
+
+`PhysicalPlan.estimates` (from `node_estimates` in `decide.py`) prices
+each model node's own work through `speed_of_light`: a filter chain's
+scan and asks, a join group's stages as the search's `walk` records
+them. The parts do not add up to the plan's estimate, which prices the
+packed whole. A chain that a later join anchors on also carries the
+recompute it would pay if its KV were released instead of pinned:
+expected survivors minus what fits the retention pool cap, times the
+prefix tokens, priced as scans. `explain()` shows both. The join
+search never reads the recompute figure.
+
+`PhysicalPlan.insert(node, between=(producer, consumer))`,
+`remove(node_id)`, and `move(node_id, between=...)` (`planner/plan.py`)
+edit one edge at a time and return a new plan. An illegal edit raises
+`PlanEditError` at the call with the rule it broke: no such edge, a
+node with the wrong port type, a removal that would change the query
+(`Scan`, `AiFilter`, `AiJoin`, `Recombine`, `Project`, `Limit`), or a
+graph that fails validation. After an edit `_rederive_pins` sets
+`pin_survivors` true only where the chain's stream still reaches the
+join anchored on its alias through per-batch nodes (a `Barrier` on the
+edge turns it off, and turns `keep_kv` on so the survivors go through
+the pool), `hold_tokens` to the join's largest frame when pinned, and
+the plan's `estimator` reprices every node. `Query.run(plan=...)`
+executes the edited plan.
+
 ## 4. The packed executor
 
 The packed executor is Quail's core contribution. Instead of sending

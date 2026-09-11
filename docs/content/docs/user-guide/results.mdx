@@ -160,7 +160,12 @@ physical:
 The logical part is the `Scan`, `SemanticFilter`, `SemanticJoin`, and
 `Project` tree. The physical part lists every node of the typed graph
 in execution order with its explain fields, then the planner's
-remarks. Each `<-` names the ports a node reads.
+remarks. Each `<-` names the ports a node reads. In the default (not
+verbose) form each model node also shows `estimated_seconds`, its own
+work priced alone, and a filter chain a join anchors on shows the
+recompute it would pay if its KV were released instead of pinned; see
+[physical plans](../architecture/physical-plans) for what the numbers
+mean and how to edit the plan.
 
 If the planner refuses the query, `explain()` prints the refusal
 instead. A refusal names the constraint and the numbers behind it, for

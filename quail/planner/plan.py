@@ -109,12 +109,30 @@ class PhysicalPlan:
         return source, target, ports[0]
 
     def _rebuild(self, nodes) -> "PhysicalPlan":
-        """A new plan over nodes: pins re-derived, validated, re-estimated."""
+        """A new plan over nodes: pins re-derived, validated, re-estimated.
+
+        The plan's seconds are the planner's search estimate plus the
+        recompute expected at every chain an edit unpinned (a chain
+        the planner itself left unpinned already retains its survivors
+        by schedule and is not counted twice).
+        """
         nodes = _rederive_pins(tuple(nodes))
         try:
-            return replace(self, nodes=nodes, root=None, estimates={})
+            edited = replace(self, nodes=nodes, root=None, estimates={})
         except GraphValidationError as error:
             raise PlanEditError(str(error)) from error
+        base = self.settings.get("search_seconds")
+        if base is None:
+            return edited
+        scheduled = set(self.settings.get("retention", {}).get("initial", {}))
+        recompute = sum(
+            edited.estimates.get(node.node_id, {}).get(
+                "release_recompute_seconds", 0.0)
+            for node in edited.nodes
+            if isinstance(node, AiFilter) and not node.pin_survivors
+            and node.alias not in scheduled)
+        return replace(edited, estimated_seconds=base + recompute,
+                       estimates=edited.estimates)
 
     def insert(self, node: PhysicalNode, *, between: tuple) -> "PhysicalPlan":
         """Put node on the edge from producer to consumer.
@@ -238,9 +256,11 @@ def _rederive_pins(nodes: tuple) -> tuple:
 
 def _stream_reaches_join(graph, chain) -> bool:
     """Whether a chain's survivors reach its join through per-batch nodes."""
-    pinned = replace(chain, pin_survivors=True)
+    # only this chain is pinned in the trial, so another chain's old
+    # pin cannot decide this one's
     trial = PhysicalGraph(tuple(
-        pinned if node.node_id == chain.node_id else node
+        replace(node, pin_survivors=node.node_id == chain.node_id)
+        if isinstance(node, AiFilter) else node
         for node in graph.nodes), graph.root)
     try:
         validate_streams(trial)

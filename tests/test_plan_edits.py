@@ -85,6 +85,10 @@ def test_node_ids_estimates_and_the_recompute_column(tmp_path):
     assert edited.estimates["ai_filter:r"]["release_recompute_tokens"] == \
         pytest.approx(recompute["release_recompute_tokens"], rel=0.01)
     assert "expected recompute at the join" in explain(logical, edited)
+    # the edited plan's total carries the recompute the edit causes
+    assert edited.estimated_seconds == pytest.approx(
+        plan.estimated_seconds
+        + edited.estimates["ai_filter:r"]["release_recompute_seconds"])
     # the input plan is untouched, and remove gives the plan back
     assert plan.graph.node("ai_filter:r").pin_survivors
     assert edited.remove("barrier:r") == plan

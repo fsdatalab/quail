@@ -77,6 +77,74 @@ backend-owned `settings` mapping. Quail keeps its chunk size, KV
 capacity, predicate order, and filter limit in `settings`. Another
 backend does not fill those fields.
 
+## Node ids
+
+A node id names the operator and what it works on, so a plan can be
+read and edited without a legend:
+
+| Node | Id | Example |
+|---|---|---|
+| `Scan` | `scan:<alias>` | `scan:c1` |
+| `AiFilter` | `ai_filter:<alias>` | `ai_filter:c1` |
+| `AiJoin` | `ai_join:<anchor>`, then `:2`, `:3` when the alias anchors again | `ai_join:e1`, `ai_join:e1:2` |
+| `Barrier` | `barrier:<next anchor>` | `barrier:e2` |
+| `Exchange` | `exchange:<anchor>` | `exchange:e1` |
+| `Foreign` | `apply:<name>` | `apply:same_page` |
+| `Recombine`, `Project`, `Limit` | `recombine`, `project`, `limit` | |
+
+## Estimates per node
+
+`PhysicalPlan.estimates` maps a node id to its own estimated seconds,
+priced through the same speed of light model as the plan total but
+for that node's work alone. The nodes do not add up to the plan
+estimate: chunk packing shares forward passes across nodes, so the
+whole is cheaper than the parts. A filter chain that a later join
+anchors on also carries `release_recompute_tokens` and
+`release_recompute_seconds`: the survivors expected to overflow the
+retention pool times their prefix cost, which is what the join pays
+if the chain's KV is released instead of pinned. `explain()` shows the
+seconds on each node line and the recompute figure under the chain.
+The figure is information for a reader; the join search never reads
+it.
+
+## Editing a plan
+
+A plan is a DAG of typed nodes joined by ports, and the edits are the
+ordinary graph edits, one edge at a time:
+
+```python
+plan = query.plan()
+plan2 = plan.insert(node, between=("ai_filter:c1", "ai_join:e1"))
+plan3 = plan2.remove("apply:same_page")
+plan4 = plan3.move("apply:same_page", between=("barrier:e2", "ai_join:e2"))
+result = query.run(plan=plan4)
+```
+
+- `insert(node, between=(producer, consumer))` puts a node on one
+  edge. The consumer's port that read the producer reads the new node,
+  and the new node reads the producer; every other node, including
+  other consumers of the same producer port, is untouched. The node is
+  given with its id and attributes and no inputs, and must have one
+  output of the value type the edge carries.
+- `remove(node_id)` takes a node out and rewires its consumers to its
+  own producer. Only `Foreign`, `Barrier`, and `Exchange` nodes with
+  one input and one output of the same type can be removed; removing a
+  `Scan`, `AiFilter`, `AiJoin`, `Recombine`, `Project`, or `Limit`
+  would change what the query means.
+- `move(node_id, between=...)` is `remove` then `insert`.
+
+Every edit returns a new plan and leaves the input plan untouched;
+`remove` after `insert` of the same node gives back an equal plan. An
+illegal edit raises `PlanEditError` at the call, naming the rule it
+broke, and returns nothing: there is no partially edited plan and no
+deferred check at run time. After each edit Quail validates the graph
+(ports, types, cycles, and the stream rule: a pinned chain reaches its
+join through per-batch nodes only), re-derives the two attributes that
+follow from the shape and are never set by hand (`pin_survivors`,
+which a `Barrier` on the edge turns off, and `hold_tokens`), and
+re-estimates every node. `query.run(plan=edited)` executes the edited
+plan.
+
 ## Crossing the process boundary
 
 Every node type has a `NodeCodec`. The codec encodes `node_id`, the

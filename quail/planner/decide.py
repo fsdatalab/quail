@@ -794,6 +794,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
             "retention": retention_plan,
             "order_rule": rule,
             "order_source": source,
+            "search_seconds": estimate,
         },
         estimator=estimator)
 

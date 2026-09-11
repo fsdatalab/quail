@@ -43,6 +43,9 @@ This is QUAIL-B's IMDB-6 with a limit.
 | `.limit(n)` | `LIMIT n` |
 | `.select(*cols, order="as_written")` | The `SELECT` list. Returns the `Query`. |
 
+`Query.run(plan=...)` executes an edited plan from `plan().insert()`,
+`.remove()`, or `.move()`; see [physical plans](../architecture/physical-plans).
+
 `col("r.body")` is a qualified column. `col("body")` is unqualified
 and resolves when exactly one table in scope has that column. `"*"`
 in `select` expands to every column of every table.
