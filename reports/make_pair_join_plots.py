@@ -6,12 +6,15 @@ then run this script on it:
     W=/tmp/quail-pair-join; mkdir -p "$W"
     uv run modal volume get quail-results \
       benchmarks/quailb/<stamp>-pair-join "$W" --force
+    uv run modal volume get quail-results \
+      sol/2026-09-11-fev10-prefix-reuse.json "$W/sol.json" --force
     uv run --with matplotlib python reports/make_pair_join_plots.py \
-      "$W/<stamp>-pair-join"
+      "$W/<stamp>-pair-join" "$W/sol.json"
 
 Writes plots/pair_join.png: query seconds, evaluated pairs, and fresh
-input tokens per query, with the FEV-5 cross join beside FEV-10. The
-reductions are derived here from the saved run record.
+input tokens per query, with the FEV-5 cross join beside FEV-10 and
+the speed of light estimate as a line across each bar. The reductions
+are derived here from the saved run record.
 """
 
 import json
@@ -25,7 +28,7 @@ HERE = Path(__file__).resolve().parent
 OUT = HERE / "plots"
 plt.style.use(HERE / "quail.mplstyle")
 sys.path.insert(0, str(HERE))
-from plot_colors import BLUE, GRAY  # noqa: E402
+from plot_colors import BLUE, DARK, GRAY  # noqa: E402
 
 QUERIES = ("FEV-5", "FEV-10", "FEV-9")
 FIELDS = (("seconds", "seconds", "Query time, excluding startup", "{:.2f}"),
@@ -38,6 +41,8 @@ def load(workdir):
     record = json.loads((workdir / "quail" / "fever" / "run.json").read_text())
     rows = {}
     for item in record["queries"]:
+        if item["id"] not in QUERIES:
+            continue    # FEV-1 only absorbs the cold boot
         metrics = item["metrics"]
         measurements = item["measurements"]
         rows[item["id"]] = dict(
@@ -52,8 +57,21 @@ def load(workdir):
     return rows
 
 
-def main(workdir):
+def load_sol(path):
+    """Per query, the SoL seconds, pairs, and tokens on Qwen3 4B fp8."""
+    record = json.loads(Path(path).read_text())
+    out = {}
+    for query, entry in record["queries"].items():
+        estimate = entry["models"]["qwen3-4b-fp8"]
+        out[query] = dict(seconds=estimate["sol_s"],
+                          pairs=estimate["join_pair_evaluations"] / 1e3,
+                          fresh=estimate["tokens"] / 1e6)
+    return out
+
+
+def main(workdir, sol_path=None):
     rows = load(Path(workdir))
+    sol = load_sol(sol_path) if sol_path else {}
     fig, axes = plt.subplots(1, 3, figsize=(13, 4.2))
     x = np.arange(len(QUERIES))
     for axis, (field, unit, title, fmt) in zip(axes, FIELDS):
@@ -65,6 +83,16 @@ def main(workdir):
                           (bar.get_x() + bar.get_width() / 2, value),
                           ha="center", va="bottom", xytext=(0, 3),
                           textcoords="offset points", fontsize=9)
+        for bar, query in zip(bars, QUERIES):
+            if query not in sol:
+                continue
+            estimate = sol[query][field]
+            axis.hlines(estimate, bar.get_x() - 0.08,
+                        bar.get_x() + bar.get_width() + 0.08,
+                        color=DARK, linewidth=1.2)
+            axis.annotate(f"SoL {fmt.format(estimate)}",
+                          (bar.get_x() + bar.get_width() + 0.1, estimate),
+                          ha="left", va="center", fontsize=8, color=DARK)
         cross, paired = rows["FEV-5"][field], rows["FEV-10"][field]
         if cross:
             axis.annotate(f"FEV-10 is {100 * (1 - paired / cross):.1f}% below "
@@ -85,4 +113,4 @@ def main(workdir):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1])
+    main(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else None)
