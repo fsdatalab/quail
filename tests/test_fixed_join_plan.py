@@ -217,18 +217,18 @@ def test_retention_search_matches_enumeration():
              for index, (aliases, selectivity) in enumerate([
                  (("a", "b"), 0.01), (("b", "c"), 0.1),
              ])]
-    lengths = {alias: summarize_alias(tokens).with_resident_fraction(fraction)
-               for alias, tokens, fraction in [
-                   ("a", [800] * 20, 0.4), ("b", [100] * 30, 1.0),
-                   ("c", [400] * 10, 0.7),
-               ]}
+    lengths = {alias: summarize_alias(tokens) for alias, tokens in [
+        ("a", [800] * 20), ("b", [100] * 30), ("c", [400] * 10),
+    ]}
+    filtered = {"a", "c"}
     live = {"a": 10.0, "b": 6.0, "c": 8.0}
-    result = search_joins(specs, live, lengths, {}, 5, 8192, QWEN3_4B_FP8, H100_SXM)
+    result = search_joins(specs, live, lengths, filtered, 5, 8192,
+                          QWEN3_4B_FP8, H100_SXM)
     costs = []
     for order in itertools.permutations(specs):
         for anchors in itertools.product(*(spec["aliases"] for spec in order)):
-            work, records = walk(list(zip(order, anchors)), live, lengths, {},
-                                 5, QWEN3_4B_FP8, H100_SXM)
+            work, records = walk(list(zip(order, anchors)), live, lengths,
+                                 filtered, 5, QWEN3_4B_FP8, H100_SXM)
             seen = set()
             for record in records:
                 if record["anchor"] in seen:

@@ -350,43 +350,46 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
 
     cap_pages = retention_pages(admission, chunk, budgets.PAGE_TOKENS)
     costs = retention.coefficients(model, device)
-    possible = possible_anchor_aliases(specs)
-    search_lengths, _ = retention.allocate(
-        length_stats, live0, filters, {alias: [1.0, 0] for alias in possible},
-        pre, cap_pages * workers, budgets.PAGE_TOKENS, costs)
+    # KV reuse is priced as unlimited: a filtered alias pays no prefix
+    # at its first anchor use, and no alias pays one at a later use
+    filtered = set(filters)
 
     def run_search(honor_forced=True):
         found = joinsearch.search_joins(
-            specs, live0, search_lengths, {}, pre,
+            specs, live0, length_stats, filtered, pre,
             chunk, model, device, base_work=base_work,
             fixed_order=fixed, honor_forced=honor_forced)
         if found is None:
             found = joinsearch.search_joins(
-                specs, live0, search_lengths, {}, pre, chunk, model, device,
-                base_work=base_work, fixed_order=True, honor_forced=honor_forced)
+                specs, live0, length_stats, filtered, pre, chunk, model,
+                device, base_work=base_work, fixed_order=True,
+                honor_forced=honor_forced)
         return found
 
     found = run_search()
     seq = [(specs[position], anchor) for position, anchor in found["seq"]]
-    first_anchor = seq[0][1] if seq else None
     retention_plan = retention.schedule(seq, live0)
-    # a filtered first anchor streams out of its chain with its KV
-    # pinned, so its survivors never enter the retention pool and the
-    # pool serves the other aliases; every streamed anchor is resident
-    streamed = first_anchor if first_anchor in filters else None
-    if streamed is not None:
-        retention_plan["initial"] = {
-            alias: use for alias, use in retention_plan["initial"].items()
-            if alias != streamed
-        }
-    credited, keep_plan = retention.allocate(
-        length_stats, live0, filters, retention_plan["initial"], pre,
-        cap_pages * workers, budgets.PAGE_TOKENS, costs)
-    if streamed is not None:
-        credited[streamed] = credited[streamed].with_resident_fraction(1.0)
-    found["work"], found["records"] = joinsearch.walk(
-        seq, live0, credited, {}, pre, model, device)
-    retention_plan.update(**costs, cap_pages=cap_pages, expected=keep_plan)
+    # a filtered alias whose first use is as an anchor has its chain run
+    # right before that group and stream into it with KV pinned; its
+    # survivors never enter the retention pool. An alias that was a
+    # partner first must finish its chain before that earlier group, so
+    # its survivors wait in the pool.
+    streamed = {}
+    partner_before = set()
+    for index, group in enumerate(retention.group_sequence(seq)):
+        anchor = group[0][1]
+        if anchor in filters and anchor not in streamed \
+                and anchor not in partner_before:
+            streamed[anchor] = index
+        for spec, _ in group:
+            for alias in spec["aliases"]:
+                if alias != anchor and alias not in streamed:
+                    partner_before.add(alias)
+    retention_plan["initial"] = {
+        alias: use for alias, use in retention_plan["initial"].items()
+        if alias not in streamed
+    }
+    retention_plan.update(**costs, cap_pages=cap_pages)
     forced = sorted({s["anchor"] for s in specs
                      if s["semantics"] == "full"
                      and not s["anchor_free"]})
@@ -402,12 +405,6 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                 f"lower ({free_s:.3f} vs {honored_s:.3f} predicted "
                 f"seconds)")
     stage_records = found["records"]
-
-    for alias, credit in sorted(keep_plan.items()):
-        remarks.append(
-            f"shared KV on {alias!r}: {credit['documents']:.1f} expected "
-            f"documents, {credit['pages'] / workers:.1f} expected pages per "
-            f"worker of the {cap_pages}-page retention budget")
 
     # ---- refusal checks on the predicted plan
     anchors = {wp: a for wp, a in found["seq"]}
@@ -448,7 +445,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     # current producer node
     nodes = []
     ids_src = {}
-    for s in sorted(scans, key=lambda scan: scan.alias == first_anchor):
+    for s in scans:
         shard_ranges, loads = contiguous_shards(
             doc_tokens[s.alias], workers
         )
@@ -461,44 +458,43 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
             shard_ranges=shard_ranges,
             shard_token_loads=tuple(loads)))
         ids_src[s.alias] = PortRef(sid, f"ids:{s.alias}")
-        if s.alias in filters:
-            order_idx = filter_orders[s.alias]
-            n = stats[s.alias].n_docs
-            stages, surv = [], 1.0
-            for i in order_idx:
-                p = filters[s.alias][i]
-                stages.append(FilterStage(
-                    written_pos=i,
-                    question_tokens=_question_tokens(p.prompt),
-                    preamble_tokens=p.prompt.preamble_tokens,
-                    selectivity=p.selectivity,
-                    expected_docs=round(n * surv, 1)))
-                surv *= p.selectivity if p.selectivity is not None else 1.0
-            keep = s.alias in retention_plan["initial"]
-            writes = len(stages) > 1 or keep or s.alias == streamed
-            credit = keep_plan.get(s.alias)
-            fid = f"filter:{s.alias}"
-            nodes.append(PackedFilter(
-                node_id=fid,
-                inputs=input_ports((ids_src[s.alias],)),
-                alias=s.alias, arena_writes=writes,
-                keep_kv=keep,
-                # the capacity-planned credit; the runtime offers
-                # every survivor to its capped retained pool
-                keep_min_doc_tokens=(1 if credit and credit["documents"] > 0 else 0),
-                keep_resident_fraction=(credit["documents"] / live0[s.alias]
-                                        if credit and live0[s.alias] else 0.0),
-                stages=tuple(stages)))
-            ids_src[s.alias] = PortRef(fid, f"ids:{s.alias}")
-            if s.alias == streamed:
-                remarks.append(
-                    f"filter on {s.alias!r} streams its survivors into "
-                    f"the join anchored on it; each one's KV stays "
-                    f"pinned until its tuples are answered")
-            elif not writes:
-                remarks.append(
-                    f"filter on {s.alias!r}: arena writes off (one "
-                    f"stage - nothing reads the KV again)")
+
+    def emit_filter(alias):
+        order_idx = filter_orders[alias]
+        n = stats[alias].n_docs
+        stages, surv = [], 1.0
+        for i in order_idx:
+            p = filters[alias][i]
+            stages.append(FilterStage(
+                written_pos=i,
+                question_tokens=_question_tokens(p.prompt),
+                preamble_tokens=p.prompt.preamble_tokens,
+                selectivity=p.selectivity,
+                expected_docs=round(n * surv, 1)))
+            surv *= p.selectivity if p.selectivity is not None else 1.0
+        keep = alias in retention_plan["initial"]
+        writes = len(stages) > 1 or keep or alias in streamed
+        fid = f"filter:{alias}"
+        nodes.append(PackedFilter(
+            node_id=fid,
+            inputs=input_ports((ids_src[alias],)),
+            alias=alias, arena_writes=writes,
+            keep_kv=keep,
+            stages=tuple(stages)))
+        ids_src[alias] = PortRef(fid, f"ids:{alias}")
+        if alias in streamed:
+            remarks.append(
+                f"filter on {alias!r} streams its survivors into "
+                f"the join anchored on it; each one's KV stays "
+                f"pinned until its tuples are answered")
+        elif not writes:
+            remarks.append(
+                f"filter on {alias!r}: arena writes off (one "
+                f"stage - nothing reads the KV again)")
+
+    for s in scans:
+        if s.alias in filters and s.alias not in streamed:
+            emit_filter(s.alias)
 
     # group consecutive full stages on the same anchor; gates run
     # alone; anchor switches become barriers
@@ -533,6 +529,8 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                 aliases=tuple(ahead)))
             for a in ahead:
                 ids_src[a] = PortRef(bid, f"ids:{a}")
+        if streamed.get(anchor) == g:
+            emit_filter(anchor)
         gid = f"group:{g}"
         stage_dicts = []
         in_aliases = [anchor]
@@ -565,7 +563,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
             anchor=anchor,
             anchor_resident=group["members"][0][1]["resident"],
             keep_anchor_kv=anchor in retention_plan["after"][gid],
-            stream_anchor=(g == 0 and anchor == streamed),
+            stream_anchor=streamed.get(anchor) == g,
             stages=tuple(stage_dicts)))
         ids_src[anchor] = PortRef(gid, f"ids:{anchor}")
 

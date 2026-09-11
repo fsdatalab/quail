@@ -180,9 +180,7 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None):
             if len(node.stages) > 1 and node.arena_writes:
                 kv.append("KV rewind=on")
             if node.keep_kv:
-                fraction = _selectivity(node.keep_resident_fraction)
-                kv.append("retain KV for joins "
-                          f"(estimated resident survivors={fraction})")
+                kv.append("retain KV for later joins")
             if node.node_id in streamed:
                 kv.append("survivors stream into the join with KV pinned")
             details.append(", ".join(kv) if kv else

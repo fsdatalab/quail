@@ -388,7 +388,9 @@ def test_selective_gates_and_later_kv_reuse(catalog):
     assert [group.anchor for group in groups] == ["r", "r"]
     assert groups[0].keep_anchor_kv is True
     assert groups[1].keep_anchor_kv is False
-    assert groups[1].anchor_resident == "none"
+    # the gate's anchor KV is kept for the second group: a repeat
+    # anchor use pays no prefix under unlimited KV pricing
+    assert groups[1].anchor_resident == "kept"
 
 
 def test_join_token_costs_and_retention(catalog):
@@ -431,8 +433,6 @@ def test_join_token_costs_and_retention(catalog):
     # KV pinned, so it retains nothing in the pool
     assert chain.arena_writes is True
     assert chain.keep_kv is False
-    assert chain.keep_min_doc_tokens == 0
-    assert chain.keep_resident_fraction == 0.0
     group = plan.graph.nodes_by_type(AnchoredJoin.type_name)[0]
     assert group.anchor == "r"
     assert group.anchor_resident == "filter"
@@ -464,10 +464,9 @@ def test_join_token_costs_and_retention(catalog):
     assert group.anchor_resident == "none"
     assert not any("keep KV" in r for r in plan.remarks)
 
-    # A filtered alias that anchors a later group keeps its survivors
-    # in the retention pool. The arena minus the loop's two-chunk
-    # working reservation credits a fraction of the expected survivors
-    # at every document length. The first anchor streams instead.
+    # A filtered alias whose first use is as the anchor of a later
+    # group has its chain emitted right before that group, after the
+    # barrier, and streams into it: the pool is never involved.
     logical = (docs(catalog, "reviews", tok).alias("r")
                .ai_filter(prompt("about food: {0}", col("r.review")),
                           selectivity=0.5)
@@ -486,17 +485,46 @@ def test_join_token_costs_and_retention(catalog):
             "t": [3000] * 40 + [1000] * 100}
     plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
                       doc_tokens=toks)
-    chain = filter_chain(plan, "t")
-    assert chain.keep_kv is True
-    assert chain.keep_min_doc_tokens == 1
-    assert 0 < chain.keep_resident_fraction < 1
-    assert any("expected pages per worker" in r for r in plan.remarks)
     groups = plan.graph.nodes_by_type(AnchoredJoin.type_name)
     assert [group.anchor for group in groups] == ["r", "t"]
     assert groups[0].stream_anchor is True
-    assert groups[1].stream_anchor is False
+    assert groups[1].stream_anchor is True
     assert groups[1].anchor_resident == "filter"
     assert filter_chain(plan, "r").keep_kv is False
+    assert filter_chain(plan, "t").keep_kv is False
+    order = [node.node_id for node in plan.nodes]
+    assert order.index("barrier:0") < order.index("filter:t") \
+        < order.index("group:1")
+    assert not any("shared KV" in r for r in plan.remarks)
+
+    # An alias that is a partner before it anchors must finish its
+    # chain before that earlier group, so its survivors go through the
+    # retention pool and its later anchor use is not streamed.
+    logical = (docs(catalog, "reviews", tok).alias("r")
+               .ai_filter(prompt("about food: {0}", col("r.review")),
+                          selectivity=0.5)
+               .ai_join(docs(catalog, "products", tok).alias("p"),
+                        prompt("m {0} {1}", col("r.review"),
+                               col("p.description")),
+                        selectivity=0.5, anchor="p")
+               .ai_join(docs(catalog, "threads", tok).alias("t"),
+                        prompt("m {0} {1}", col("r.review"),
+                               col("t.thread")),
+                        selectivity=0.5, anchor="r")
+               .select("r.id"))
+    toks = {"r": [300] * 50, "p": [500] * 20, "t": [5] * 20}
+    plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
+                      doc_tokens=toks, order="as_written")
+    groups = plan.graph.nodes_by_type(AnchoredJoin.type_name)
+    assert [group.anchor for group in groups] == ["p", "r"]
+    assert groups[0].stream_anchor is False
+    assert groups[1].stream_anchor is False
+    assert groups[1].anchor_resident == "filter"
+    chain = filter_chain(plan, "r")
+    assert chain.keep_kv is True
+    assert chain.arena_writes is True
+    order = [node.node_id for node in plan.nodes]
+    assert order.index("filter:r") < order.index("group:0")
 
 
 # ------------------------------------------------ KV keep (residency)
@@ -617,10 +645,15 @@ def test_join_search_residency_and_replanning():
                "c": [50] * 2}
 
     current = search_joins(
-        specs, live, lengths, {"a": {1, 2}}, 10, 100_000,
+        specs, live, lengths, {"a"}, 10, 100_000,
         QWEN3_4B_FP8, H100_SXM, fixed_order=True)
-    assert current["records"][0]["resident_docs"] == 2
-    assert current["records"][2]["resident_docs"] == 0
+    # a's filter computed its prefixes: its first anchor use pays no
+    # prefix, and neither does its later use (kept after group 0)
+    assert current["records"][0]["resident"] == "filter"
+    assert current["records"][0]["resident_docs"] == 3
+    assert current["records"][1]["resident"] == "none"
+    assert current["records"][2]["resident"] == "kept"
+    assert current["records"][2]["resident_docs"] == 3
 
     from quail.planner.joins import search_joins
 
@@ -650,9 +683,6 @@ def test_join_search_residency_and_replanning():
         total=100_000_000,
         squared=10_000_000_000,
         maximum=100,
-        resident_count=500_000,
-        resident_total=50_000_000,
-        resident_squared=5_000_000_000,
     )
     stats = {alias: million for alias in "abcd"}
     live = {alias: 1_000_000.0 for alias in "abcd"}
@@ -680,11 +710,11 @@ def test_aggregate_join_work_matches_per_document_sum():
     live = {"a": 2.25, "b": 3.5}
     raw = {"a": [90, 100, 110], "b": [30, 50, 70, 90]}
     stats = {
-        "a": summarize_alias(raw["a"], {1, 2}),
+        "a": summarize_alias(raw["a"]),
         "b": summarize_alias(raw["b"]),
     }
 
-    def per_document(same_group):
+    def per_document(resident):
         n = live["a"]
         tuples = live["a"] * live["b"]
         suffix = (spec["tail_tokens"] + spec["label_tokens"]["b"]
@@ -695,8 +725,7 @@ def test_aggregate_join_work_matches_per_document_sum():
         total = Work()
         for position, document in enumerate(raw["a"]):
             prefix = 10 + document
-            start = (ask(prefix, frame)
-                     if same_group or position in {1, 2}
+            start = (ask(prefix, frame) if resident
                      else scan(prefix, frame))
             stream = Work(
                 tokens=per_anchor * suffix,
@@ -708,11 +737,9 @@ def test_aggregate_join_work_matches_per_document_sum():
             total = total + (start + stream) * fraction
         return total
 
-    for same_group in (False, True):
-        actual = stage_work(
-            spec, "a", live, stats, 10, resident_at_start=True,
-            same_group=same_group)
-        expected = per_document(same_group)
+    for resident in (False, True):
+        actual = stage_work(spec, "a", live, stats, 10, resident=resident)
+        expected = per_document(resident)
         assert actual.tokens == pytest.approx(expected.tokens)
         assert actual.pairs == pytest.approx(expected.pairs)
         assert actual.kv_written == pytest.approx(expected.kv_written)

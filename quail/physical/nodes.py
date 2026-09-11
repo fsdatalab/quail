@@ -377,8 +377,6 @@ class PackedFilter(PhysicalNode):
     alias: str = ""
     arena_writes: bool = False
     keep_kv: bool = False
-    keep_min_doc_tokens: int = 0
-    keep_resident_fraction: float = 0.0
     stages: tuple[FilterStage, ...] = ()
     question_token_ids: tuple[tuple[Any, ...], ...] = ()
 
@@ -407,8 +405,6 @@ class PackedFilter(PhysicalNode):
             "alias": self.alias,
             "arena_writes": self.arena_writes,
             "keep_kv": self.keep_kv,
-            "keep_min_doc_tokens": self.keep_min_doc_tokens,
-            "keep_resident_fraction": self.keep_resident_fraction,
             "stages": [stage.to_dict() for stage in self.stages],
             "question_token_ids": [
                 list(question) for question in self.question_token_ids
@@ -428,8 +424,6 @@ class PackedFilter(PhysicalNode):
             alias=attributes["alias"],
             arena_writes=bool(attributes["arena_writes"]),
             keep_kv=bool(attributes["keep_kv"]),
-            keep_min_doc_tokens=int(attributes["keep_min_doc_tokens"]),
-            keep_resident_fraction=float(attributes["keep_resident_fraction"]),
             stages=tuple(
                 FilterStage.from_mapping(stage)
                 for stage in attributes["stages"]

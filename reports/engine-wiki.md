@@ -38,7 +38,7 @@ in the same process.
 | `planner/plan.py` | PhysicalPlan, Refusal, and EngineConfig | physical, specs |
 | `planner/__init__.py` | The public planning interface backends import: `collect_operators`, `plan_query`, `plan_quail`, `preamble_tokens`, `order_filters_indexed`, `join_specs`, `balanced_shards` | decide, plan |
 | `planner/decide.py` | All planner decisions (order, anchor, budgets, sharding) | logical, budgets, plan |
-| `planner/retention.py` | Expected length allocations and future anchor use probabilities | joins, qwen3_cost, executor/retention |
+| `planner/retention.py` | Retention priority costs and future anchor use probabilities for the executor | joins, qwen3_cost |
 | `executor/arena.py` | Paged KV arena (PageArena accounting + KVArena tensors) | nothing (torch lazy) |
 | `executor/attention.py` | Pipeline: forward pass, attention, Triton kernels | arena (torch, vLLM, triton lazy) |
 | `executor/pack.py` | Chunk admission (JoinAdmission, FilterAdmission) | nothing |
@@ -174,12 +174,14 @@ for sources and validation status. Memory budgets remain per GPU.
    Quail's chunk size, KV capacity, predicate order, and filter limit are not
    fields that another backend must supply.
 9. The planner chooses the complete join order and anchors from selectivity
-   estimates. It schedules the first anchor's filters last and shares retained
-   KV capacity across inputs with future anchor uses. When the first anchor
-   has a filter chain, that chain streams into its join (section 4.6): the
-   `AnchoredJoin` carries `stream_anchor`, the runner hands the chain to the
-   join instead of running it first, and each passing document's KV goes
-   straight from the chain to the join without the retention pool.
+   estimates, pricing KV reuse as unlimited: a document prefix computed once
+   is free at every later anchor use, the same assumption as the speed-of-light
+   estimate. A filtered alias whose first use is as an anchor has its chain
+   placed right before that group, after any barrier, and the chain streams
+   into the join (section 4.6): the `AnchoredJoin` carries `stream_anchor`,
+   the runner hands the chain to the join instead of running it first, and
+   each passing document's KV goes straight from the chain to the join
+   without the retention pool.
    `Exchange` nodes prune actual survivors
    between the planned join groups. Execution follows this graph without
    searching again.
@@ -570,10 +572,16 @@ predicates assemble into results correctly.
 **KV residency across operators** (`planner/retention.py`,
 `executor/retention.py`, and the arena in `executor/arena.py`):
 
-- All filtered inputs with a planned anchor use can retain document KV, except
-  the first anchor's own chain: it streams its survivors into the join with
-  their KV pinned (section 4.6), so the pool serves the other aliases. The first
-  anchor's filters still run last. Retention uses one shared pool per GPU.
+- The planner prices KV reuse as unlimited. A filtered alias's first anchor
+  use pays no prefix, and no alias pays a prefix at a later anchor use. The
+  search therefore chooses orders on tuple work alone, and the executor keeps
+  as much of that KV as the arena holds and recomputes the rest
+  (`regret_tokens` counts what it could not keep).
+- A filtered alias whose first use is as an anchor streams its survivors into
+  that join with their KV pinned (section 4.6), so nothing of it enters the
+  pool. Its chain is placed right before that group, after any barrier. An
+  alias that is a partner before it anchors must finish its chain before that
+  earlier group, so its survivors wait in one shared retention pool per GPU.
 - A prefix with `L` tokens occupies `ceil(L / 16)` pages. The priority is
   `q * C(L) / pages`, where `q` is its predicted probability of reaching its next
   anchor use and `C(L)` is the ideal prefix computation cost. The cost includes
@@ -590,16 +598,12 @@ predicates assemble into results correctly.
   At a boundary, the executor releases expired or known dead prefixes and
   updates retained priorities. Completed anchors with another planned use are
   offered using their next use's priority. Other sets' useful KV remains retained.
-- Planning scales each input length histogram by filter selectivity and fills
-  expected capacity in priority order. The last length group may receive a
-  fractional allocation. Expected pages per set are estimates, not partitions.
-- Selinger search includes the set of previously used anchors in its state.
-  Filter KV can be credited at a later anchor's first use. The search uses a
-  shared allocation across legal anchor aliases. The selected order then supplies
-  next-use probabilities and a refined allocation for its actual anchors.
-  Search and final allocation are approximate together; no global optimum is
-  claimed. Reuse after a nonconsecutive repeat of an anchor is conservatively
-  priced as recomputation, even though execution may retain it.
+- Selinger search includes the set of previously used anchors in its state, so
+  it knows which stage is a first use ("filter" residency when the alias is
+  filtered, else "none") and which is a repeat ("kept"). The selected order
+  then supplies the next-use probabilities the executor's retention priorities
+  read. The search is exact for the unlimited-KV cost model; the pool cap is
+  an execution limit, not a planning input.
 - Both Quail execution paths follow the saved decisions. Child workers report
   all retained aliases after every round, so the coordinator can preserve the
   placement of useful KV when another input's filtering evicts prefixes.
@@ -704,7 +708,7 @@ single forward pass, sharing KV across them through a paged arena.
 | `order_filters_indexed` | `decide.py` | Price each possible first scan and sort later asks by time per rejected document |
 | `unrounded_seconds` | `sol.py` | Component limits without forward pass rounding |
 | `search_joins` | `joins.py` | Choose join order and anchors from estimated survivors, length summaries, and shared retention credit |
-| `allocate` / `schedule` | `retention.py` | Estimate retained length groups and record future anchor use probabilities |
+| `schedule` | `retention.py` | Record future anchor use probabilities for the executor's retention priorities |
 | `RetentionPolicy` | `executor/retention.py` | Rank document prefixes by expected computation saved per KV page |
 | `PageArena.pop_retained_victim` | `executor/arena.py` | Pops the retained document with the lowest future reuse priority |
 | `contiguous_shards` | `decide.py` | Split the initial scan into compact contiguous ranges with similar token counts |

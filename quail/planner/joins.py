@@ -1,4 +1,10 @@
-"""Choose join order and anchors from estimated survivors and retained KV."""
+"""Choose join order and anchors from estimated survivors.
+
+KV reuse is priced as unlimited, the speed-of-light assumption: a
+document prefix computed once, by a filter or by an earlier anchor
+use, is resident at every later anchor use. The executor keeps as much
+of that KV as the arena holds and recomputes the rest.
+"""
 
 import itertools
 from collections import Counter
@@ -6,8 +12,6 @@ from dataclasses import dataclass
 
 from quail.planner.sol import speed_of_light
 from quail.planner.work import Work, triangle
-
-DocumentKey = tuple[str, int]
 
 
 @dataclass(frozen=True)
@@ -28,79 +32,39 @@ class AliasStats:
     squared: int
     maximum: int
     histogram: tuple[tuple[int, int], ...] = ()
-    resident_count: float = 0
-    resident_total: float = 0
-    resident_squared: float = 0
 
     @property
     def mean(self) -> float:
         return self.total / self.count if self.count else 0.0
 
-    def with_resident_fraction(self, fraction: float) -> "AliasStats":
-        """Credit one length-independent fraction as resident."""
-        if fraction < 0 or fraction > 1:
-            raise ValueError("resident fraction must be between 0 and 1")
-        return AliasStats(
-            count=self.count,
-            total=self.total,
-            squared=self.squared,
-            maximum=self.maximum,
-            histogram=self.histogram,
-            resident_count=self.count * fraction,
-            resident_total=self.total * fraction,
-            resident_squared=self.squared * fraction,
-        )
 
-
-def summarize_alias(lengths, resident_positions=(), *,
-                    resident_flags=None) -> AliasStats:
-    """Summarize lengths and a resident position subset in one pass."""
-    resident = set(resident_positions) if resident_flags is None else None
+def summarize_alias(lengths) -> AliasStats:
+    """Summarize document lengths in one pass."""
     count = total = squared = maximum = 0
-    resident_count = resident_total = resident_squared = 0
     histogram = Counter()
-    rows = (enumerate(lengths) if resident_flags is None else
-            enumerate(zip(lengths, resident_flags, strict=True)))
-    for position, raw in rows:
-        if resident_flags is None:
-            is_resident = position in resident
-        else:
-            raw, is_resident = raw
+    for raw in lengths:
         length = int(raw)
         count += 1
         total += length
         squared += length * length
         maximum = max(maximum, length)
         histogram[length] += 1
-        if is_resident:
-            resident_count += 1
-            resident_total += length
-            resident_squared += length * length
     return AliasStats(
         count=count,
         total=total,
         squared=squared,
         maximum=maximum,
         histogram=tuple(sorted(histogram.items())),
-        resident_count=resident_count,
-        resident_total=resident_total,
-        resident_squared=resident_squared,
     )
 
 
-def _alias_stats(lengths: dict, resident: dict) -> dict[str, AliasStats]:
+def _alias_stats(lengths: dict) -> dict[str, AliasStats]:
     """Normalize raw length lists or accept summaries from a caller."""
-    out = {}
-    for alias, values in lengths.items():
-        if isinstance(values, AliasStats):
-            if resident.get(alias):
-                raise ValueError(
-                    "resident positions cannot be added to AliasStats")
-            out[alias] = values
-        else:
-            out[alias] = summarize_alias(
-                values, resident.get(alias, ()))
-    return out
+    return {
+        alias: (values if isinstance(values, AliasStats)
+                else summarize_alias(values))
+        for alias, values in lengths.items()
+    }
 
 
 def surviving_docs(n_docs: float, n_partners: float,
@@ -189,69 +153,30 @@ def _feasible_anchors(spec, honor_forced, lengths, pre, chunk) -> list:
     return fits or cands
 
 
-def _document_keys(resident: dict) -> frozenset[DocumentKey]:
-    return frozenset(
-        (alias, position)
-        for alias, positions in resident.items()
-        for position in positions
-    )
-
-
-def fit_resident_documents(resident: dict, lengths: dict, pre: int,
-                           arena_tokens: float | None,
-                           page_tokens: int = 16, policy=None) -> dict:
-    """Apply a retention priority to a complete prefix snapshot."""
-    keys = _document_keys(resident)
-    if arena_tokens is None:
-        kept = keys
-    else:
-        capacity_pages = max(0, int(arena_tokens) // page_tokens)
-        entries = []
-        total_pages = 0
-        for key in keys:
-            alias, position = key
-            tokens = pre + lengths[alias][position]
-            pages = -(-tokens // page_tokens)
-            priority = (policy.priority(key, tokens, pages) if policy
-                        else (tokens / pages,))
-            entries.append((priority, key, pages))
-            total_pages += pages
-        kept = set(keys)
-        for _, key, pages in sorted(entries):
-            if total_pages <= capacity_pages:
-                break
-            kept.remove(key)
-            total_pages -= pages
-    return {
-        alias: {position for key_alias, position in kept
-                if key_alias == alias}
-        for alias in lengths
-    }
-
-
-def residency(anchor: str, state: KVState, lengths: dict,
+def residency(anchor: str, state: KVState, resident_aliases,
               same_group: bool = False) -> str:
-    """Name the source of the KV credit recorded for one stage."""
-    if same_group:
+    """Name the source of the KV credit recorded for one stage.
+
+    A prefix computed once is resident at every later anchor use: by
+    its filter ("filter") or by an earlier anchor use ("kept").
+    """
+    if same_group or anchor in state.used_anchors:
         return "kept"
-    if anchor not in state.used_anchors and lengths[anchor].resident_count:
+    if anchor in resident_aliases:
         return "filter"
     return "none"
 
 
 def resident_count(anchor: str, state: KVState, lengths: dict,
-                   same_group: bool = False) -> int:
+                   resident_aliases, same_group: bool = False) -> int:
     """Number of documents credited as resident for one stage."""
-    if same_group:
-        return lengths[anchor].count
-    if anchor in state.used_anchors:
+    if residency(anchor, state, resident_aliases, same_group) == "none":
         return 0
-    return lengths[anchor].resident_count
+    return lengths[anchor].count
 
 
 def stage_work(spec: dict, anchor: str, live: dict, lengths: dict,
-               pre: int, *, resident_at_start: bool = False,
-               same_group: bool = False) -> Work:
+               pre: int, *, resident: bool = False) -> Work:
     """Expected Work of one stage at the current live counts.
 
     The length sums make the calculation constant time in the number
@@ -275,41 +200,22 @@ def stage_work(spec: dict, anchor: str, live: dict, lengths: dict,
     prefix_sum = stats.total + pre * count
     prefix_squared = (
         stats.squared + 2 * pre * stats.total + pre * pre * count)
-    if same_group:
-        resident_n = count
-        resident_prefix = prefix_sum
-        resident_prefix_squared = prefix_squared
-    elif resident_at_start:
-        resident_n = stats.resident_count
-        resident_prefix = stats.resident_total + pre * resident_n
-        resident_prefix_squared = (
-            stats.resident_squared
-            + 2 * pre * stats.resident_total
-            + pre * pre * resident_n)
+    if resident:
+        start = Work(
+            tokens=count * frame,
+            pairs=frame * prefix_sum + count * triangle(frame),
+            kv_written=count * frame,
+            kv_read=prefix_sum,
+        )
     else:
-        resident_n = 0
-        resident_prefix = 0
-        resident_prefix_squared = 0
-
-    resident_start = Work(
-        tokens=resident_n * frame,
-        pairs=frame * resident_prefix + resident_n * triangle(frame),
-        kv_written=resident_n * frame,
-        kv_read=resident_prefix,
-    )
-    missing_n = count - resident_n
-    missing_prefix = prefix_sum - resident_prefix
-    missing_prefix_squared = prefix_squared - resident_prefix_squared
-    scan_sum = missing_prefix + missing_n * frame
-    scan_squared = (
-        missing_prefix_squared
-        + 2 * frame * missing_prefix
-        + missing_n * frame * frame)
-    missing_start = Work(
-        tokens=scan_sum,
-        pairs=(scan_squared + scan_sum) / 2,
-        kv_written=scan_sum,
-    )
+        scan_sum = prefix_sum + count * frame
+        scan_squared = (
+            prefix_squared + 2 * frame * prefix_sum + count * frame * frame)
+        start = Work(
+            tokens=scan_sum,
+            pairs=(scan_squared + scan_sum) / 2,
+            kv_written=scan_sum,
+        )
     stream = Work(
         tokens=count * per_anchor * u,
         pairs=per_anchor * (
@@ -318,44 +224,51 @@ def stage_work(spec: dict, anchor: str, live: dict, lengths: dict,
         kv_written=count * per_anchor * u,
         kv_read=prefix_sum + count * frame,
     )
-    return (resident_start + missing_start + stream) * frac
+    return (start + stream) * frac
 
 
-def walk(seq, live0: dict, lengths: dict, resident: dict, pre: int,
+def walk(seq, live0: dict, lengths: dict, resident, pre: int,
          model, device):
     """Cost one [(spec, anchor)] sequence.
 
-    Returns (work, records): per stage, the written position, the
-    anchor, the residency its cost assumed, and expected tuples and
-    tokens.
+    resident names the aliases whose prefix KV a filter computes
+    before the joins. Returns (work, records): per stage, the written
+    position, the anchor, the residency its cost assumed, and expected
+    tuples and tokens.
     """
-    live = dict(live0)
-    lengths = _alias_stats(lengths, resident)
+    lengths = _alias_stats(lengths)
+    resident = set(resident or ())
     state = KVState()
     total = Work()
     records = []
+    applied = []
     for spec, anchor in seq:
+        # live counts thin by the applied stages in written order, the
+        # convention the search prices with, so a sequence costs the
+        # same here as in the search that chose it
+        live = dict(live0)
+        for done in sorted(applied, key=lambda s: s["written_pos"]):
+            thin(live, done)
         same_group = (state.group_open
                       and state.pending_anchor == anchor
                       and spec["semantics"] == "full")
-        kind = residency(anchor, state, lengths, same_group)
-        kept = resident_count(anchor, state, lengths, same_group)
-        w = stage_work(
-            spec, anchor, live, lengths, pre,
-            resident_at_start=anchor not in state.used_anchors, same_group=same_group)
+        kind = residency(anchor, state, resident, same_group)
+        kept = resident_count(anchor, state, lengths, resident, same_group)
+        w = stage_work(spec, anchor, live, lengths, pre,
+                       resident=kind != "none")
         records.append(dict(written_pos=spec["written_pos"],
                             anchor=anchor, resident=kind,
                             resident_docs=kept,
                             tuples=cross_tuples(spec, live),
                             tokens=w.tokens))
         total = total + w
-        thin(live, spec)
+        applied.append(spec)
         state = KVState(anchor, spec["semantics"] == "full",
                         state.used_anchors | {anchor})
     return total, records
 
 
-def search_joins(specs, live: dict, lengths: dict, resident: dict,
+def search_joins(specs, live: dict, lengths: dict, resident,
                  pre: int, chunk_tokens: int, model, device, *,
                  base_work: Work = Work(), fixed_order: bool = False,
                  honor_forced: bool = True,
@@ -370,8 +283,8 @@ def search_joins(specs, live: dict, lengths: dict, resident: dict,
         live: alias -> live document count (float; expected at plan
             time).
         lengths: alias -> live documents' token lengths or AliasStats.
-        resident: alias -> positions into lengths[alias] whose prefix
-            KV is resident.
+        resident: aliases whose prefix KV a filter computes before the
+            joins; their first anchor use pays no prefix.
         pre: Engine preamble token count in front of every prompt.
         chunk_tokens: Chunk token budget.
         model: Model spec, for the cost model.
@@ -393,8 +306,8 @@ def search_joins(specs, live: dict, lengths: dict, resident: dict,
         return dict(seq=[], records=[], work=Work(), states=0,
                     generated=0)
 
-    lengths = _alias_stats(lengths, resident)
-    resident = {}
+    lengths = _alias_stats(lengths)
+    resident = set(resident or ())
 
     def rank(work):
         seconds = speed_of_light(base_work + work, model, device,
@@ -495,14 +408,12 @@ def search_joins(specs, live: dict, lengths: dict, resident: dict,
                         state_now.group_open
                         and state_now.pending_anchor == anchor
                         and spec["semantics"] == "full")
-                    kind = residency(anchor, state_now, lengths,
+                    kind = residency(anchor, state_now, resident,
                                      same_group)
                     kept = resident_count(anchor, state_now, lengths,
-                                          same_group)
-                    work = stage_work(
-                        spec, anchor, live_now, lengths, pre,
-                        resident_at_start=anchor not in state_now.used_anchors,
-                        same_group=same_group)
+                                          resident, same_group)
+                    work = stage_work(spec, anchor, live_now, lengths, pre,
+                                      resident=kind != "none")
                     step = dict(
                         written_pos=spec["written_pos"], anchor=anchor,
                         resident=kind, resident_docs=kept,

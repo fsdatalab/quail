@@ -118,20 +118,6 @@ def test_filter_chains_share_retention_and_return_evicted_pages(monkeypatch):
 
 
 def test_retention_costs_and_future_use():
-    from quail.planner.joins import summarize_alias
-    from quail.planner.retention import allocate
-
-    lengths = {alias: summarize_alias([16, 160]) for alias in ('a', 'b')}
-    credited, budgets = allocate(
-        lengths, {'a': 1.0, 'b': 1.0}, lengths, {'a': (1, 0), 'b': (1, 1)},
-        0, 10, 16, {'linear_seconds': 1, 'pair_seconds': 0.01})
-    assert sum(row['pages'] for row in budgets.values()) == 10
-    for alias in lengths:
-        assert budgets[alias]['documents'] == 0.5
-        assert credited[alias].resident_count == 1
-        assert credited[alias].resident_total == 160
-        assert credited[alias].resident_squared == 160**2
-
     from quail.planner.retention import schedule
 
     def stage(position, aliases):

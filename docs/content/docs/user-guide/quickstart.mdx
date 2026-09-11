@@ -158,7 +158,7 @@ physical:
   order=as_written (default: at least one predicate has no selectivity)
   DocumentInput input:a alias=a input_id=a n_docs=12 total_tokens=27 shard_docs=[12]
   DocumentInput input:r alias=r input_id=r n_docs=8 total_tokens=693 shard_docs=[8]
-  PackedFilter filter:r alias=r arena_writes=False keep_kv=False keep_min_doc_tokens=0 keep_resident_fraction=0.0 <- input:r[ids:r]
+  PackedFilter filter:r alias=r arena_writes=False keep_kv=False <- input:r[ids:r]
     stage {'written_pos': 0, 'question_tokens': 51, 'preamble_tokens': 2, 'selectivity': None, 'expected_docs': 8.0}
   Project sink columns=['r.id'] <- filter:r[ids:r]
   remark: filter on 'r': arena writes off (one stage - nothing reads the KV again)
