@@ -273,11 +273,11 @@ export default function HomePage() {
           registers through the same registry an extension would use:
         </p>
         <ul className="list-disc pl-6 text-fd-muted-foreground space-y-1">
-          <li>table providers for your own storage, on the client or opened by the worker</li>
+          <li>table providers that read your storage in the query process</li>
           <li>logical nodes and optimizer rules</li>
           <li>physical nodes with codecs and runtimes, physical planners, and physical rules</li>
           <li>model backends that own their scheduler, KV layout, and model calls</li>
-          <li>compute providers that decide where a query runs</li>
+          <li>in-process queries, including inside Modal GPU functions</li>
           <li>execution observers that record per node metrics</li>
         </ul>
         <p className="text-fd-muted-foreground">

@@ -3,13 +3,11 @@ title: Results and explain
 description: Reading rows, counts, the execution report, and the plan.
 ---
 
-`Query.run()` returns a `QueryResult`. Under `ModalComputeProvider`
-the rows have already been materialized in the worker and returned as
-one Arrow table, so every accessor is cheap. Under the default
-in-process provider the result is lazy: each accessor runs the final
-Arrow projection over the session's memory mapped token files, so call
-`collect()` once and keep the table if you need the rows more than
-once.
+`Query.run()` returns a `QueryResult`. Each row accessor runs the final
+Arrow projection over the session's memory mapped token files. Call
+`collect()` while the session is open and keep the table if you need the
+rows again. A Modal function should collect the rows before returning,
+for example with `return result.collect(), result.report`.
 
 ```python
 result = query.run()
@@ -93,9 +91,9 @@ the keys every backend fills:
 | `cached_tokens` | Tokens served from KV already on the GPU. The request backends fill this; Quail reports KV reuse under `kv_manager`. |
 | `stages` | One entry per filter or join stage: documents or tuples evaluated, the selectivity you gave, and the selectivity observed. |
 | `node_metrics` | Per physical node metrics keyed by node id. |
-| `result_volume_path` | Where the worker saved the run record on the `quail-results` volume. |
+| `result_volume_path` | Optional path added by a Modal wrapper after explicitly saving the report. |
 | `remarks` | Planner and tokenizer notes. |
-| `worker_total_s` | Everything the worker did for this request, including tokenization and planning. |
+| `worker_total_s` | Total time in query execution, including tokenization and planning. Excludes wrapper report writes and volume commits. |
 
 The Quail backend adds `regret_tokens`, `kv_manager`, `peak_gib`,
 `order_rule`, `expected_join_plan`, and `executed_join_plan`. The saved

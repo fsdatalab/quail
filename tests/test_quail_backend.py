@@ -198,7 +198,7 @@ def attach_plan(payload, graph):
     return payload
 
 
-def test_distributed_filter_executes_typed_node():
+def test_filter_execution_and_retention_inputs(monkeypatch):
     scan = DocumentInput(
         node_id="input:d", alias="d", input_id="d"
     )
@@ -253,37 +253,36 @@ def test_distributed_filter_executes_typed_node():
     }
     assert result["fresh_tokens"] == 4
 
+    with monkeypatch.context() as patch:
+        received = {}
 
-def test_filter_without_retention_passes_an_empty_selection(monkeypatch):
-    received = {}
+        def fake_run_filter(*args, retain_survivors, **kwargs):
+            received["retain_survivors"] = retain_survivors
+            return {0: [True]}, [], 3
 
-    def fake_run_filter(*args, retain_survivors, **kwargs):
-        received["retain_survivors"] = retain_survivors
-        return {0: [True]}, [], 3
+        patch.setattr("quail.executor.loop.run_filter", fake_run_filter)
+        execution = QuailModelExecution(SimpleNamespace())
+        execution.bind_loaded_model(
+            model=object(), arena=FakeArena(), pipeline=SimpleNamespace()
+        )
+        execution.bind_query(
+            torch=fake_torch(), async_answers=object(), chunk_tokens=8192
+        )
+        node = PackedFilter(
+            node_id="filter:d",
+            alias="d",
+            stages=(FilterStage(0, 1, 1, None, 4),),
+            question_token_ids=((9,),),
+        )
 
-    monkeypatch.setattr("quail.executor.loop.run_filter", fake_run_filter)
-    execution = QuailModelExecution(SimpleNamespace())
-    execution.bind_loaded_model(
-        model=object(), arena=FakeArena(), pipeline=SimpleNamespace()
-    )
-    execution.bind_query(
-        torch=fake_torch(), async_answers=object(), chunk_tokens=8192
-    )
-    node = PackedFilter(
-        node_id="filter:d",
-        alias="d",
-        stages=(FilterStage(0, 1, 1, None, 4),),
-        question_token_ids=((9,),),
-    )
+        result = execution.execute(
+            node,
+            {
+                "documents": [[1]],
+                "document_ids": [10],
+                "retain_survivors": False,
+            },
+        )
 
-    result = execution.execute(
-        node,
-        {
-            "documents": [[1]],
-            "document_ids": [10],
-            "retain_survivors": False,
-        },
-    )
-
-    assert received["retain_survivors"] == ()
-    assert result.outputs["ids:d"] == [10]
+        assert received["retain_survivors"] == ()
+        assert result.outputs["ids:d"] == [10]

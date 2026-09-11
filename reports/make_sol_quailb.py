@@ -82,7 +82,6 @@ from quail_b.queries import (
     SELECTIVITY_ESTIMATE_CORPUS,
     SELECTIVITY_ESTIMATE_SCALE_FACTOR,
 )
-from quail_b.scoring import Evaluator
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("workdir")
@@ -167,8 +166,7 @@ if corpus["corpus_id"] != truth.corpus_id:
     raise SystemExit(
         f"the corpus in {W} is {corpus['corpus_id']}, but the labels are "
         f"for {truth.corpus_id}")
-evaluator = Evaluator(truth, corpus_rows)
-answer = answer_oracle(evaluator)
+answer = answer_oracle(truth, corpus_rows)
 
 # ================================================================
 # PART 2: the queries, on one session with the shared Qwen3 tokenizer

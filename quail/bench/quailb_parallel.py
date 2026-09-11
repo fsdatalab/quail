@@ -7,7 +7,6 @@ separate container because its package version conflicts with vLLM.
     run_log="results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-quailb-parallel.log"
     uv run modal run --detach -m quail.bench.quailb_parallel \
       --model qwen3-4b-fp8 --sf 0.1 \
-      --prediction "State the expected result before starting." \
       2>&1 | tee "$run_log"
 
 The local entrypoint starts one remote function. Detached mode keeps that
@@ -22,11 +21,29 @@ from pathlib import Path
 
 import modal
 
-from quail.runtime.worker import build_worker_image
+from quail.bench.results import write_json
 
-image = build_worker_image(local_python_sources=("quail_b",))
-sglang_image = build_worker_image(
-    local_python_sources=("quail_b",), runtime_package="sglang==0.5.18")
+base_image = (
+    modal.Image.from_registry(
+        "nvidia/cuda:13.0.1-devel-ubuntu24.04", add_python="3.12")
+    .entrypoint([])
+    .pip_install("huggingface_hub", "numpy", "pyarrow",
+                 "sqlglot>=27.0", "bpe-qwen>=0.1.5", "datasets>=5.0.1")
+    .env({
+        "QUAIL_CACHE_DIR": "/root/.cache/kernels",
+        "VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
+        "VLLM_LOGGING_LEVEL": "WARNING",
+        "VLLM_USE_FLASHINFER_SAMPLER": "0",
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
+        "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
+        "TRITON_CACHE_DIR": "/root/.cache/kernels/triton",
+        "TORCHINDUCTOR_CACHE_DIR": "/root/.cache/kernels/torchinductor",
+    })
+    .add_local_python_source("quail", "quail_b")
+)
+image = base_image.pip_install("vllm==0.26.0")
+sglang_image = base_image.pip_install("sglang==0.5.18")
 
 app = modal.App("quail-milestone1")
 hf_cache = modal.Volume.from_name("quail-hf-cache", create_if_missing=True)
@@ -44,11 +61,26 @@ DATA_DIR = "/results/quailb_data"
 
 
 @app.function(image=image, timeout=1200, volumes=VOLUMES)
-def ensure_data(sf: float, lf: int):
-    from quail_b.data import build_sets
+def ensure_data(sf: float, query_ids: list[str], collection_id: str):
+    import pyarrow.parquet as pq
 
-    build_sets(DATA_DIR, sf, lf)
+    import quail_b as benchmark
+
+    names = {
+        alias.table for query_id in query_ids
+        for alias in benchmark.get_query(query_id).aliases
+    }
+    directory = Path(DATA_DIR) / f"sf{sf}"
+    directory.mkdir(parents=True, exist_ok=True)
+    for name in sorted(names):
+        path = directory / f"{name}.parquet"
+        if not path.exists():
+            pq.write_table(benchmark.load_table(name, scale_factor=sf), path)
+    suite = benchmark.load_benchmark(
+        query_ids, scale_factor=sf, data_dir=directory,
+        collection_id=collection_id or None)
     results_vol.commit()
+    return suite.ground_truth.collection_id
 
 
 @app.function(
@@ -62,84 +94,79 @@ def ensure_data(sf: float, lf: int):
 def run_query_family(
     model: str,
     sf: float,
-    lf: int,
     query_ids_csv: str,
-    run_label: str,
-    prediction: str,
+    run_dir: str,
     ground_truth_collection: str,
     include_baselines: bool,
 ) -> str:
-    from quail.bench.process_isolation import (
-        run_backend_group_in_fresh_process,
-    )
-    from quail_b.queries import query_family_name
-
-    query_ids = tuple(
-        query_id.strip() for query_id in query_ids_csv.split(",")
-        if query_id.strip())
-    family = query_family_name(query_ids)
-    process_groups = [("quail",)]
-    if include_baselines:
-        process_groups.append(("stock_vllm", "pipelined_vllm"))
-
-    process_results = []
-    suites = {}
-    for methods in process_groups:
-        process_result = run_backend_group_in_fresh_process(
-            data_dir=DATA_DIR,
-            model=model,
-            sf=sf,
-            lf=lf,
-            query_ids=query_ids,
-            run_label=run_label,
-            prediction=prediction,
-            ground_truth_collection=ground_truth_collection,
-            methods=methods,
+    try:
+        from quail.bench.process_isolation import (
+            run_backend_group_in_fresh_process,
         )
-        process_results.append(process_result)
-        suites.update(process_result["suites"])
+        from quail_b.queries import query_family_name
 
-    gpu_uuids = {
-        gpu_uuid
-        for process_result in process_results
-        for gpu_uuid in process_result["gpu_uuids"]
-    }
-    if len(gpu_uuids) != 1:
-        raise RuntimeError(
-            "backend child processes did not see one physical GPU: "
-            f"{sorted(gpu_uuids)}"
-        )
+        query_ids = tuple(
+            query_id.strip() for query_id in query_ids_csv.split(",")
+            if query_id.strip())
+        family = query_family_name(query_ids)
+        process_groups = [("quail",)]
+        if include_baselines:
+            process_groups.append(("stock_vllm", "pipelined_vllm"))
 
-    family_result = {
-        "query_family": family,
-        "query_ids": list(query_ids),
-        "ground_truth_collection": suites["quail"]["ground_truth"][
-            "collection_id"
-        ],
-        "ground_truth_workload": None,
-        "gpu": "H100!",
-        "same_modal_container": True,
-        "same_physical_gpu": True,
-        "gpu_uuids": sorted(gpu_uuids),
-        "process_groups": [list(methods) for methods in process_groups],
-        "process_cleanup": [
-            {
-                "methods": process_result["methods"],
-                **process_result["process_cleanup"],
-            }
+        process_results = []
+        suites = {}
+        for methods in process_groups:
+            process_result = run_backend_group_in_fresh_process(
+                data_dir=DATA_DIR,
+                model=model,
+                sf=sf,
+                query_ids=query_ids,
+                run_dir=run_dir,
+                ground_truth_collection=ground_truth_collection,
+                methods=methods,
+            )
+            process_results.append(process_result)
+            suites.update(process_result["suites"])
+
+        gpu_uuids = {
+            gpu_uuid
             for process_result in process_results
-        ],
-        "engine_order": [
-            method for methods in process_groups for method in methods
-        ],
-        "suites": suites,
-    }
-    family_path = (
-        f"/results/benchmarks/quailb/families/{run_label}/"
-        f"{family}-same-gpu.json")
-    Path(family_path).write_text(json.dumps(family_result, indent=2))
-    results_vol.commit()
-    return json.dumps(family_result)
+            for gpu_uuid in process_result["gpu_uuids"]
+        }
+        if len(gpu_uuids) != 1:
+            raise RuntimeError(
+                "backend child processes did not see one physical GPU: "
+                f"{sorted(gpu_uuids)}"
+            )
+
+        family_result = {
+            "query_family": family,
+            "query_ids": list(query_ids),
+            "ground_truth_collection": suites["quail"]["collection_id"],
+            "gpu": "H100!",
+            "same_modal_container": True,
+            "same_physical_gpu": True,
+            "gpu_uuids": sorted(gpu_uuids),
+            "process_groups": [list(methods) for methods in process_groups],
+            "process_cleanup": [
+                {
+                    "methods": process_result["methods"],
+                    **process_result["process_cleanup"],
+                }
+                for process_result in process_results
+            ],
+            "engine_order": [
+                method for methods in process_groups for method in methods
+            ],
+            "suites": suites,
+        }
+        write_json(
+            Path(run_dir) / "families" / f"{family}.json",
+            {key: value for key, value in family_result.items() if key != "suites"})
+        return json.dumps(family_result)
+    finally:
+        results_vol.commit()
+        kernel_cache.commit()
 
 
 @app.function(
@@ -153,352 +180,260 @@ def run_query_family(
 def run_sglang_query_family(
     model: str,
     sf: float,
-    lf: int,
     query_ids_csv: str,
-    run_label: str,
-    prediction: str,
+    run_dir: str,
     ground_truth_collection: str,
 ) -> str:
     """Run one query family through the SGLang backend."""
-    from quail.bench.process_isolation import run_backend_group_in_fresh_process
+    try:
+        from quail.bench.process_isolation import run_backend_group_in_fresh_process
 
-    query_ids = tuple(
-        query_id.strip() for query_id in query_ids_csv.split(",")
-        if query_id.strip()
-    )
-    result = run_backend_group_in_fresh_process(
-        data_dir=DATA_DIR,
-        model=model,
-        sf=sf,
-        lf=lf,
-        query_ids=query_ids,
-        run_label=run_label,
-        prediction=prediction,
-        ground_truth_collection=ground_truth_collection,
-        methods=("pipelined_sglang",),
-    )
-    result_path = Path(
-        f"/results/benchmarks/quailb/families/{run_label}/"
-        f"{result['query_family']}-sglang-process.json"
-    )
-    result["result_volume_path"] = str(result_path)
-    result_path.write_text(json.dumps(result, indent=2))
-    results_vol.commit()
-    return json.dumps(result)
+        query_ids = tuple(
+            query_id.strip() for query_id in query_ids_csv.split(",")
+            if query_id.strip()
+        )
+        result = run_backend_group_in_fresh_process(
+            data_dir=DATA_DIR,
+            model=model,
+            sf=sf,
+            query_ids=query_ids,
+            run_dir=run_dir,
+            ground_truth_collection=ground_truth_collection,
+            methods=("pipelined_sglang",),
+        )
+        result["result_path"] = f"families/{result['query_family']}-sglang.json"
+        write_json(Path(run_dir) / result["result_path"], {
+            key: value for key, value in result.items() if key != "suites"})
+        return json.dumps(result)
+    finally:
+        results_vol.commit()
+        kernel_cache.commit()
 
 
-def _merge_suites(parts, query_ids, run_label, started, elapsed,
+def _merge_suites(parts, query_ids, run_id, started, elapsed,
                   function_call_ids, methods):
-    from quail_b.scoring import summarize_queries
-
     base = parts[0]
-    for part in parts[1:]:
-        for field in ("sf", "lf", "gpus", "model", "corpus_id"):
-            if part[field] != base[field]:
-                raise ValueError(f"query families disagree on {field}")
-
+    fields = ("scale_factor", "corpus_id", "collection_id", "metadata",
+              "gpu_count", "gpu_hourly_rate_usd")
     by_query = {}
     for part in parts:
-        for row in part["passes"]["single"]["queries"]:
-            if row["query"] in by_query:
-                raise ValueError(f"duplicate query {row['query']}")
-            by_query[row["query"]] = row
-    missing = [query_id for query_id in query_ids
-               if query_id not in by_query]
-    if missing:
-        raise ValueError(f"missing queries {missing}")
-    rows = [by_query[query_id] for query_id in query_ids]
-    scored = all(
-        "tokens_processed" in row
-        for row in rows if "error" not in row
-    )
-    if scored:
-        summary = summarize_queries(
-            rows,
-            base["pricing"]["h100_usd_per_hour"],
-            base["gpus"],
-        )
-    else:
-        good = [row for row in rows if "error" not in row]
-        wall_s = sum(float(row["wall_s"]) for row in good)
-        boot_s = sum(float(row.get("boot_s") or 0.0) for row in good)
-        summary = {
-            "queries_completed": len(good),
-            "queries_failed": len(rows) - len(good),
-            "query_runtime_s": round(wall_s, 2),
-            "boot_s": round(boot_s, 2),
-            "runtime_with_boot_s": round(wall_s + boot_s, 2),
-            "fresh_tokens": sum(
-                int(row.get("fresh_tokens") or 0) for row in good),
-            "accuracy_scored": False,
-        }
-
-    run_id = (
-        f"qb_{started.strftime('%Y%m%dT%H%M%SZ')}_"
-        f"{uuid.uuid4().hex[:8]}")
-    aggregate_path = f"benchmarks/quailb/runs/{run_id}/{run_label}.json"
+        if part["run_id"] != run_id:
+            raise ValueError("query families disagree on run_id")
+        for field in fields:
+            if part[field] != base[field]:
+                raise ValueError(f"query families disagree on {field}")
+        family = part["query_family"]["name"]
+        for item in part["queries"]:
+            if item["id"] in by_query:
+                raise ValueError(f"duplicate query {item['id']}")
+            by_query[item["id"]] = dict(item, directory=f"{family}/{item['id']}")
+    if set(by_query) != set(query_ids):
+        raise ValueError("completed queries do not match the requested queries")
     merged = dict(base)
+    merged.pop("query_family")
     merged.update(
-        run_id=run_id,
-        artifact_stem=run_label,
+        queries=[by_query[query_id] for query_id in query_ids],
         started_at=started.isoformat(),
         finished_at=datetime.now(timezone.utc).isoformat(),
-        raw_volume_path=f"/results/benchmarks/quailb/runs/{run_id}",
-        aggregate_volume_path=f"/results/{aggregate_path}",
-        ground_truth={
-            part["query_family"]["name"]: part["ground_truth"]
-            for part in parts
-        },
-        passes={
-            "single": {
-                "queries": rows,
-                "pass_wall_s": round(elapsed, 1),
-                "summary": summary,
-            }
-        },
         parallel={
+            "wall_s": round(elapsed, 1),
             "containers": len(parts),
-            "gpu_per_container": "H100!",
-            "model_copies": len(parts),
-            "container_strategy": "one per query family",
             "methods_per_container": list(methods),
-            "engine_order": list(methods),
-            "families": [part["query_family"] for part in parts],
             "function_call_ids": function_call_ids,
-            "part_run_ids": [part["run_id"] for part in parts],
-            "part_raw_volume_paths": [
-                part["raw_volume_path"] for part in parts],
-        },
-    )
-    merged["pricing"] = dict(
-        base["pricing"], concurrent_h100_containers=len(parts))
-    return merged, aggregate_path
+        })
+    return merged
 
 
 @app.function(image=image, timeout=43200, memory=4096, volumes=VOLUMES)
 def run_all(
+    run_dir: str,
     model: str = "qwen3-4b-fp8",
     sf: float = 0.1,
-    lf: int = 1,
     query: str = "",
-    prediction: str = "",
     ground_truth_collection: str = "",
     include_baselines: bool = True,
     include_sglang: bool = True,
 ):
-    from quail_b.queries import (
-        QUERY_ORDER,
-        query_family_name,
-        split_query_families,
-    )
+    from quail_b import select_queries
+    from quail_b.queries import query_family_name, split_query_families
 
-    if not prediction:
-        raise ValueError("pass --prediction before starting the benchmark")
-    query_ids = tuple(
-        item.strip() for item in query.split(",") if item.strip()
-    ) if query else QUERY_ORDER
-    unknown = sorted(set(query_ids) - set(QUERY_ORDER))
-    if unknown:
-        raise ValueError(f"unknown queries {unknown}")
-
+    only = [item.strip() for item in query.split(",")] if query else None
+    query_ids = tuple(spec.id for spec in select_queries(only, scale_factor=sf))
+    directory = Path(run_dir).resolve()
+    if not directory.is_relative_to("/results") or directory == Path("/results"):
+        raise ValueError("run directory must be inside the /results volume mount")
+    directory.mkdir(parents=True, exist_ok=False)
     started = datetime.now(timezone.utc)
-    run_label = (
-        f"{started.strftime('%Y%m%dT%H%M%SZ')}-quailb-sf{sf}-lf{lf}-"
-        f"{model}-"
-        f"{'families' if include_baselines else 'quail-only'}")
-
-    data_call = ensure_data.spawn(sf, lf)
-    print(f"function call id: {data_call.object_id} (data)", flush=True)
-    data_call.get()
-
-    families = split_query_families(query_ids)
-    family_calls = []
-    sglang_calls = []
-    call_ids = {}
-    t0 = time.time()
-    for family_ids in families:
-        family = query_family_name(family_ids)
-        family_call = run_query_family.spawn(
-            model=model,
-            sf=sf,
-            lf=lf,
-            query_ids_csv=",".join(family_ids),
-            run_label=run_label,
-            prediction=prediction,
-            ground_truth_collection=ground_truth_collection,
-            include_baselines=include_baselines,
-        )
-        family_calls.append((family, family_call))
-        call_ids[f"{family}:quail_vllm"] = family_call.object_id
-        print(
-            f"function call id: {family_call.object_id} "
-            f"({family}, Quail and vLLM, {','.join(family_ids)})",
-            flush=True,
-        )
-        if include_baselines and include_sglang:
-            sglang_call = run_sglang_query_family.spawn(
-                model=model,
-                sf=sf,
-                lf=lf,
-                query_ids_csv=",".join(family_ids),
-                run_label=run_label,
-                prediction=prediction,
-                ground_truth_collection=ground_truth_collection,
-            )
-            sglang_calls.append((family, sglang_call))
-            call_ids[f"{family}:sglang"] = sglang_call.object_id
-            print(
-                f"function call id: {sglang_call.object_id} "
-                f"({family}, SGLang, {','.join(family_ids)})",
-                flush=True,
-            )
-
-    family_parts = []
-    for family, call in family_calls:
-        print(f"waiting for {family} Quail and vLLM", flush=True)
-        family_parts.append(json.loads(call.get()))
-        print(f"{family} Quail and vLLM finished", flush=True)
-    sglang_parts = []
-    for family, call in sglang_calls:
-        print(f"waiting for {family} SGLang", flush=True)
-        sglang_parts.append(json.loads(call.get()))
-        print(f"{family} SGLang finished", flush=True)
-    elapsed = time.time() - t0
-
-    methods = (
-        (
-            "quail",
-            "stock_vllm",
-            "pipelined_vllm",
-            *(("pipelined_sglang",) if include_sglang else ()),
-        )
-        if include_baselines else ("quail",)
-    )
-    reports = {}
-    paths = {}
-    for method in methods:
-        if method == "pipelined_sglang":
-            method_parts = [
-                part["suites"][method] for part in sglang_parts
-            ]
-            container_methods = (method,)
-        else:
-            method_parts = [
-                part["suites"][method] for part in family_parts
-            ]
-            container_methods = tuple(
-                item
-                for group in family_parts[0]["process_groups"]
-                for item in group
-            )
-        report, path = _merge_suites(
-            method_parts,
-            query_ids,
-            f"{run_label}-{method}",
-            started,
-            elapsed,
-            call_ids,
-            container_methods,
-        )
-        reports[method] = report
-        paths[method] = path
-
-    family_metadata = {
-        "id": run_label,
-        "one_container_per_query_family": not sglang_calls,
-        "same_gpu_for_all_methods_in_family": not sglang_calls,
-        "same_gpu_for_quail_and_vllm": include_baselines,
-        "gpu": "H100!",
-        "methods": list(methods),
-        "engine_order": list(methods),
-        "baseline_order": list(methods[1:]),
-        "all_family_queries_finish_before_next_method": True,
-        "quail_and_vllm_share_a_container": include_baselines,
-        "quail_uses_a_fresh_process": True,
-        "vllm_backends_share_a_process": include_baselines,
-        "sglang_uses_a_separate_container": bool(sglang_calls),
-        "quail_kv_cleared_before_each_query": True,
-        "vllm_prefix_cache_reset_before_each_configuration": (
-            include_baselines
-        ),
-        "family_function_call_ids": call_ids,
-        "families": [
-            {
-                "query_family": part["query_family"],
-                "query_ids": part["query_ids"],
-                "ground_truth_collection":
-                    part["ground_truth_collection"],
-                "gpu_uuids": part["gpu_uuids"],
-                "process_groups": part["process_groups"],
-                "process_cleanup": part["process_cleanup"],
-            }
-            for part in family_parts
-        ],
-    }
-
-    for report in reports.values():
-        report["family_run"] = family_metadata
-
-    manifest_path = (
-        f"benchmarks/quailb/family-runs/{run_label}/manifest.json")
     manifest = {
-        "run_id": run_label,
+        "run_id": directory.name,
+        "status": "running",
         "started_at": started.isoformat(),
-        "finished_at": datetime.now(timezone.utc).isoformat(),
-        "parallel_wall_s": round(elapsed, 1),
+        "model": model,
+        "sf": sf,
         "query_ids": list(query_ids),
-        "family_run": family_metadata,
-        "result_volume_paths": {
-            method: f"/results/{path}" for method, path in paths.items()
-        },
-        "manifest_volume_path": f"/results/{manifest_path}",
+        "summaries": {},
+        "function_call_ids": {},
     }
-
-    payloads = {
-        **{method: (json.dumps(report, indent=2), paths[method])
-           for method, report in reports.items()},
-        "manifest": (json.dumps(manifest, indent=2), manifest_path),
-    }
-    saved = {}
-    for name, (payload, path) in payloads.items():
-        volume_file = Path("/results") / path
-        volume_file.parent.mkdir(parents=True, exist_ok=True)
-        volume_file.write_text(payload)
-        saved[name] = f"/results/{path}"
+    manifest_path = directory / "manifest.json"
+    write_json(manifest_path, manifest)
     results_vol.commit()
 
-    summary = reports["quail"]["passes"]["single"]["summary"]
-    final = {
-        "run_id": run_label,
-        "saved": saved,
-        "queries_completed": summary["queries_completed"],
-        "queries_failed": summary["queries_failed"],
-        "parallel_wall_s": round(elapsed, 1),
-        "function_call_ids": call_ids,
-    }
-    print(json.dumps(final, indent=2), flush=True)
-    return json.dumps(final)
+    try:
+        data_call = ensure_data.spawn(sf, query_ids, ground_truth_collection)
+        manifest["function_call_ids"]["data"] = data_call.object_id
+        print(f"function call id: {data_call.object_id} (data)", flush=True)
+        ground_truth_collection = data_call.get()
+        manifest["collection_id"] = ground_truth_collection
+
+        families = split_query_families(query_ids)
+        family_calls = []
+        sglang_calls = []
+        call_ids = manifest["function_call_ids"]
+        t0 = time.time()
+        for family_ids in families:
+            family = query_family_name(family_ids)
+            family_call = run_query_family.spawn(
+                model=model,
+                sf=sf,
+                query_ids_csv=",".join(family_ids),
+                run_dir=run_dir,
+                ground_truth_collection=ground_truth_collection,
+                include_baselines=include_baselines,
+            )
+            family_calls.append((family, family_call))
+            call_ids[f"{family}:quail_vllm"] = family_call.object_id
+            print(
+                f"function call id: {family_call.object_id} "
+                f"({family}, Quail and vLLM, {','.join(family_ids)})",
+                flush=True,
+            )
+            if include_baselines and include_sglang:
+                sglang_call = run_sglang_query_family.spawn(
+                    model=model,
+                    sf=sf,
+                    query_ids_csv=",".join(family_ids),
+                    run_dir=run_dir,
+                    ground_truth_collection=ground_truth_collection,
+                )
+                sglang_calls.append((family, sglang_call))
+                call_ids[f"{family}:sglang"] = sglang_call.object_id
+                print(
+                    f"function call id: {sglang_call.object_id} "
+                    f"({family}, SGLang, {','.join(family_ids)})",
+                    flush=True,
+                )
+
+        write_json(manifest_path, manifest)
+        results_vol.commit()
+
+        family_parts = []
+        for family, call in family_calls:
+            print(f"waiting for {family} Quail and vLLM", flush=True)
+            family_parts.append(json.loads(call.get()))
+            print(f"{family} Quail and vLLM finished", flush=True)
+        sglang_parts = []
+        for family, call in sglang_calls:
+            print(f"waiting for {family} SGLang", flush=True)
+            sglang_parts.append(json.loads(call.get()))
+            print(f"{family} SGLang finished", flush=True)
+        elapsed = time.time() - t0
+
+        methods = (
+            (
+                "quail",
+                "stock_vllm",
+                "pipelined_vllm",
+                *(("pipelined_sglang",) if include_sglang else ()),
+            )
+            if include_baselines else ("quail",)
+        )
+        reports = {}
+        paths = {}
+        for method in methods:
+            if method == "pipelined_sglang":
+                method_parts = [
+                    part["suites"][method] for part in sglang_parts
+                ]
+                container_methods = (method,)
+            else:
+                method_parts = [
+                    part["suites"][method] for part in family_parts
+                ]
+                container_methods = tuple(
+                    item
+                    for group in family_parts[0]["process_groups"]
+                    for item in group
+                )
+            report = _merge_suites(
+                method_parts,
+                query_ids,
+                directory.name,
+                started,
+                elapsed,
+                call_ids,
+                container_methods,
+            )
+            reports[method] = report
+            paths[method] = f"{method}/run.json"
+
+        from quail_b import report as write_report
+
+        for method, report in reports.items():
+            write_json(directory / paths[method], report)
+            write_report(directory / method, rescore=False)
+        manifest.update(
+            status="complete",
+            parallel_wall_s=round(elapsed, 1),
+            families={
+                **{part["query_family"]: f"families/{part['query_family']}.json"
+                   for part in family_parts},
+                **{f"{part['query_family']}-sglang": part["result_path"]
+                   for part in sglang_parts},
+            },
+            summaries=paths,
+        )
+        completed = reports["quail"]["queries"]
+        final = {
+            "run_id": directory.name,
+            "run_dir": str(directory),
+            "manifest": str(manifest_path),
+            "queries_completed": sum(
+                item["status"] == "complete" for item in completed),
+            "queries_failed": sum(item["status"] != "complete" for item in completed),
+            "parallel_wall_s": round(elapsed, 1),
+            "function_call_ids": call_ids,
+        }
+        print(json.dumps(final, indent=2), flush=True)
+        return json.dumps(final)
+    except Exception as error:
+        manifest.update(status="failed", error=f"{type(error).__name__}: {error}")
+        raise
+    finally:
+        manifest["finished_at"] = datetime.now(timezone.utc).isoformat()
+        write_json(manifest_path, manifest)
+        results_vol.commit()
 
 
 @app.local_entrypoint()
 def main(
+    output_dir: str = "/results/benchmarks/quailb",
     model: str = "qwen3-4b-fp8",
     sf: float = 0.1,
-    lf: int = 1,
     query: str = "",
-    prediction: str = "",
     ground_truth_collection: str = "",
     include_baselines: bool = True,
     include_sglang: bool = True,
 ):
-    if not prediction:
-        raise ValueError("pass --prediction before starting the benchmark")
+    run_id = (
+        f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-"
+        f"{uuid.uuid4().hex[:8]}")
+    run_dir = str(Path(output_dir) / run_id)
+    print(f"run directory: {run_dir}", flush=True)
     call = run_all.spawn(
+        run_dir=run_dir,
         model=model,
         sf=sf,
-        lf=lf,
         query=query,
-        prediction=prediction,
         ground_truth_collection=ground_truth_collection,
         include_baselines=include_baselines,
         include_sglang=include_sglang,

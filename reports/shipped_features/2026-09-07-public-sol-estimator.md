@@ -25,11 +25,9 @@ by the engine or exposed as public API.
   `regret_tokens`. `Query.finish()` computes them from the token stores
   it already holds (`quail/runtime/prefixes.py`). The benchmark copies
   the numbers; `add_prefix_metrics` is gone.
-- `BenchmarkEvaluator.evaluate()` scores the answer relations the engine
-  returned instead of walking plan nodes to find them. It no longer
-  imports `PackedFilter`, `RequestExecution`, or `expected_join_stages`.
-  `BenchmarkEvaluator.answer(prompt, assignment)` is public and is the
-  `answer` callable the estimator wants.
+- QUAIL-B scores the answer relations the engine returned.
+  Quail's `answer_oracle(truth, tables)` provides reference answers to
+  the estimator. Neither operation needs engine execution objects.
 - `H100_USD_PER_HOUR` and `H100_PRICE_SOURCE` live in `quail.specs`,
   next to the device they price. `DeviceSpec` has `usd_per_hour` and
   `price_source` fields.
@@ -53,7 +51,7 @@ function any other engine could replace with its own.
 
 | | Before | After |
 | --- | --- | --- |
-| Engine modules imported by `quail/bench/` beyond the public API | 12, including `physical`, `executor.loop`, `backends.quail`, `runtime.tokens` | 4: `planner` (`collect_operators`), `runtime.result`, `runtime.worker`, `specs` |
+| Engine modules imported by `quail/bench/` beyond the public API | 12, including `physical`, `executor.loop`, `backends.quail`, `runtime.tokens` | 3: `planner` (`collect_operators`), `runtime.result`, `specs` |
 | SoL search code | 1,155 line script | 566 line planner module, 449 line script |
 | CPU tests collected | 259 | 264 |
 

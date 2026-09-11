@@ -49,7 +49,7 @@ Stock vLLM and pipelined vLLM share one loaded vLLM model when they
 run in the same process. SGLang needs its own Modal image because
 vLLM 0.26.0 and SGLang 0.5.18 require different exact versions of
 `apache-tvm-ffi`; the backend's `runtime_package` attribute tells the
-compute provider which package to install.
+deployment code which package the backend requires.
 
 ## Same GPU comparisons
 

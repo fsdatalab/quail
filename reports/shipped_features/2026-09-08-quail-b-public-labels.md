@@ -45,7 +45,7 @@ one layout.
   The bucket holds only the current collection, its corpus, and the
   manifests of the collections it reuses labels from; the volume keeps
   the full history.
-  `quail_b.store.S3Files` reads it over plain HTTPS with no AWS SDK.
+  QUAIL-B's loaders read it anonymously through Arrow.
 - `build_sets` downloads the sf=0.1 corpus from the bucket, 13 MB in
   5 seconds, and checks that it hashes to the pinned corpus id. A new
   machine needs no Hugging Face downloads to get the documents.
@@ -64,13 +64,11 @@ one layout.
   ids; the published collection, judged by vLLM, stays the reference
   until a full Quail-judged pass replaces it. That pass has not been
   run.
-- `ModalVolumeFiles` moved to `quail.runtime.volumes` next to the
-  volume it reads.
-- The runner reads labels from the mounted volume inside a Modal
-  container and from the bucket anywhere else, and writes run records
-  to the volume on Modal or to `results/` locally. With main's
-  in-process compute provider, `python -m quail.bench.quailb` runs the
-  benchmark on a local GPU with no Modal account.
+- The runner defaults to public labels and saves records under `results/`.
+  The Modal benchmark scripts pass file stores for their mounted volume
+  explicitly. Ordinary sessions let
+  `python -m quail.bench.quailb` run the benchmark on a local GPU with no
+  Modal account.
 
 ## Why
 

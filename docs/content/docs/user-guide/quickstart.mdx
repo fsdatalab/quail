@@ -3,8 +3,13 @@ title: Quickstart
 description: Eight real IMDB reviews, a filter, a join, and what Quail prints for each.
 ---
 
-Every output on this page comes from one run of
-[`docs/examples/quickstart.py`](https://github.com/fsdatalab/quail-exploration/blob/extensible-engine/docs/examples/quickstart.py)
+All model execution requires a CUDA GPU. `demos/quickstart.py` runs QUAIL-B
+IMDB-1 on 100 published reviews on a GPU host. Its
+`quickstart_modal.py` wrapper runs the same code on Modal. See
+[Running on Modal](/docs/user-guide/compute).
+
+The saved outputs below are from the IMDB documentation example. Reproduce them with
+[`docs/examples/imdb_queries_modal.py`](https://github.com/fsdatalab/quail-exploration/blob/blogs/docs/examples/imdb_queries_modal.py)
 on an H100 through Modal, with Qwen3 4B fp8. The reviews are the first
 eight short reviews from the pinned `stanfordnlp/imdb` revision the
 QUAIL-B benchmark uses, and the questions are the benchmark's own
@@ -74,14 +79,14 @@ rv2: Protocol is an implausible movie whose only saving grace is that it
 ```python
 import quail
 
-session = quail.Session(compute_provider=quail.ModalComputeProvider())
+session = quail.Session()
 session.register("reviews", quail.DocumentProvider.from_table(reviews, id_col="id"))
 session.register("aspects", quail.DocumentProvider.from_table(aspects, id_col="id"))
 ```
 
-`Session()` selects the Quail backend, Qwen3 4B fp8, and one H100. By
-default it loads the model in the calling process; this page passes
-`ModalComputeProvider` so the run happens on Modal. `id_col` names the
+`Session()` selects the Quail backend, Qwen3 4B fp8, and one H100 for planning.
+The example runs these steps inside a Modal GPU function. See
+[Running on Modal](/docs/user-guide/compute) for submission code. `id_col` names the
 column that identifies a document. See [Configuration](/docs/user-guide/configuration) and
 [Data sources](/docs/user-guide/data-sources) for the other choices.
 
@@ -286,7 +291,7 @@ files.
 </Steps>
 
 <Callout title="Reproduce it">
-`uv run python docs/examples/quickstart.py 2>&1 | tee results/docs_quickstart.log`
+`uv run modal run docs/examples/imdb_queries_modal.py 2>&1 | tee results/docs_quickstart.log`
 prints everything above. The two run records are on the `quail-results`
 volume at `/results/runs/run_1788501944354367580.json` and
 `/results/runs/run_1788501955612819646.json`.

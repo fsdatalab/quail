@@ -8,12 +8,11 @@ from quail.planner import budgets
 from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8
 
 
-def test_head_residency_credit():
-    # 4B ties the head to the embedding: nothing moves off the GPU,
-    # and every 4B budget number stays exactly what it was
+def test_model_weights_and_kv_memory_budgets():
+    # Tied output weights must remain available for input embeddings.
     assert QWEN3_4B_FP8.head_mem_bytes == 0.0
     assert QWEN3_4B_FP8.W_resident == QWEN3_4B_FP8.W_mem
-    # 32B has a separate bf16 head; it moves to CPU memory at load
+    # Unused rows of the separate 32B output weights can be released.
     head = QWEN3_32B_FP8.head_mem_bytes
     assert head == 151_936 * 5_120 * 2
     assert QWEN3_32B_FP8.W_resident == QWEN3_32B_FP8.W_mem - head
@@ -28,8 +27,6 @@ def test_head_residency_credit():
     assert budgets.chunk_budget(QWEN3_32B_FP8, H100_SXM) == \
         budgets.chunk_budget(kept, H100_SXM)
 
-
-def test_arena_memory_tracks_kv_width():
     tokens = budgets.arena_tokens(QWEN3_4B_FP8, H100_SXM)
     assert tokens == 362_250
     assert tokens // 400 == 905

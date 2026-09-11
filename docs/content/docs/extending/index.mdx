@@ -4,8 +4,8 @@ description: Register engine extensions and configure their worker dependencies.
 ---
 
 Every session owns an `ExtensionRegistry`. It starts with Quail's own
-backends, models, devices, node codecs, node runtimes, and source
-readers. You add to it by registering objects, the way a DataFusion
+backends, models, devices, node codecs, and node runtimes. You add to it by
+registering objects, the way a DataFusion
 `SessionStateBuilder` takes rules and providers:
 
 ```python
@@ -18,18 +18,12 @@ registry = (
     .register_node(MyNode, runtime=MyNodeRuntime())
     .register_physical_rule(PreferAllDocuments())
 )
-session = quail.Session(
-    registry=registry,
-    compute_provider=quail.ModalComputeProvider(
-        local_python_sources=("my_package",),
-    ),
-)
+session = quail.Session(registry=registry)
 ```
 
 Names come from the objects. Rules, planners, observers, and backends have
 a `name`. Codecs use the node's `type_name`. Rules, planners, and observers
-accept `name=` to override the registration name. Runtimes accept `key=`;
-source readers accept `source_type=`.
+accept `name=` to override the registration name. Runtimes accept `key=`.
 
 A package that provides several things can also expose one entry
 point, `register_quail_extension(registry)`, and be loaded by module:
@@ -54,7 +48,6 @@ registry.load_extension(quail_extension)
 | `register_backend(backend)` | A model backend. | [Model backends](/docs/extending/model-backends) |
 | `register_model(spec)` | A `ModelSpec`. | [Adding a model](/docs/extending/models) |
 | `register_device(spec)` | A `DeviceSpec`. | same |
-| `register_source_reader(reader, source_type=...)` | A reader for a remote source type. | [Table providers](/docs/extending/table-providers) |
 | `register_observer(factory)` | An execution observer factory. | [Metrics and observers](/docs/extending/observers) |
 
 Every name is checked for duplicates. Registering the same name twice
@@ -71,51 +64,41 @@ A table provider is not registered here. It is passed straight to
 
 ## Running on Modal
 
-The query carries the registry as a Python object. Modal handles moving
-that object to the worker. Registration order and object configuration
-are preserved. `load_extension` runs when called; its registration
-function is not replayed on the worker.
+Create the registry and session inside the Modal GPU function. Register
+extensions there, including connections, locks, and other objects that must
+be created where the query runs.
 
-Set `local_python_sources=("my_package",)` on `ModalComputeProvider` to
-copy local extension code. Set `pip_packages=(...)` to install dependencies.
-Quail does not infer packages from registered objects. Every worker already
-contains the `quail` package.
-
-The Modal worker uses the same registry to open sources, plan the query,
-and execute the plan. It returns a materialized `QueryResult`, including
-the executed plan and node metrics, as a Python object.
-
-## Objects that must be created on the worker
-
-Use `initialize_worker` for registrations that create connections, locks,
-or other objects that cannot be sent from the client:
+Add extension sources and packages to the image you define in your Modal script:
 
 ```python
-def initialize_worker(registry):
-    from my_package import worker_extensions
-    registry.load_extension(worker_extensions)
-
-session = quail.Session(
-    registry=registry,
-    compute_provider=quail.ModalComputeProvider(
-        local_python_sources=("my_package",),
-        pip_packages=("some-dependency==1.2.3",),
-        initialize_worker=initialize_worker,
-    ),
-)
+image = image.pip_install("some-dependency==1.2.3")
+image = image.add_local_python_source("my_package")
 ```
 
-The function runs once per query inside the Modal process, before sources
-are opened. Its registrations are reused during planning and execution.
+Use this image in the function decorator. Inside the function, import the
+extension and register it normally:
+
+```python
+from my_package import quail_extension
+
+registry = quail.ExtensionRegistry.with_built_ins()
+registry.load_extension(quail_extension)
+with quail.Session(registry=registry) as session:
+    ...
+```
+
+The same registry is used for planning and execution. Registration functions
+run only when called. See [Running on Modal](/docs/user-guide/compute) for
+the complete submission pattern.
 
 ## The default registrations
 
 `with_built_ins()` adds Quail's included model specifications, the H100
 specification, and the available backends. It also adds the standard node
-implementations and source readers. Registering these objects does not
+implementations. Registering these objects does not
 load model weights or start processes.
 
-For one GPU, Quail executes in the Modal process. Its additional GPU child
+For one GPU, Quail executes in the session's process. Its additional GPU child
 processes are used only by the existing multi-GPU path. Each child receives
 the registry once per query and reuses it across execution stages.
 

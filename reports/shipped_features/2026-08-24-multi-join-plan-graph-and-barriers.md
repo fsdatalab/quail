@@ -26,8 +26,8 @@ the CPU suite plus one GPU smoke of the barrier path (below).
   `choose_shared_anchor`, and `order_joins`, and removes both
   NotImplementedError paths (no shared table; forced anchors that
   split the stages).
-- **Barriers execute** (`runtime/coordinator.py`,
-  `runtime/worker.py`). At a Barrier the live sets thin to the
+- **Barriers execute** (`backends/quail/coordinator.py`,
+  `backends/quail/distributed.py`). At a Barrier the live sets thin to the
   documents in some surviving pair of every finished full stage
   (`thin_survivors` - cost only; results are enforced at
   recombination). The multi-GPU coordinator runs one round per

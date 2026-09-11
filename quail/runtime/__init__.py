@@ -1,1 +1,1 @@
-"""Runtime: sessions, results, compute providers, and the worker."""
+"""Runtime: sessions, results, token storage, and in-process execution."""

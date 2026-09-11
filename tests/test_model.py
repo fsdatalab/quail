@@ -23,27 +23,26 @@ def _model(torch, tied=False):
     return model
 
 
-@pytest.mark.parametrize("tied", [False, True])
-def test_retains_exact_rows_and_preserves_input_embeddings(torch, tied):
-    model = _model(torch, tied)
-    embedding = model.model.embed_tokens.weight
-    reference = weakref.ref(model.lm_head.weight)
-    expected = model.lm_head.weight.detach()[[1, 3, 5]].clone()
-    retain_answer_head(torch, model, [5, 1, 3, 1])
-    gc.collect()
-    assert model.lm_head is None
-    assert (reference() is not None) == tied
-    assert model.model.embed_tokens.weight is embedding
-    assert model.quail_answer_token_ids == (1, 3, 5)
-    assert torch.equal(model.quail_answer_weights, expected)
-    assert model.quail_answer_weights.untyped_storage().nbytes() == expected.numel() * 2
-    assert model.quail_answer_weights.data_ptr() != embedding.data_ptr()
-    assert model.quail_answer_weights.device == embedding.device
-    assert not model.quail_answer_weights.requires_grad
-    assert model.model.embed_tokens(torch.tensor([0, 7])).shape == (2, 4)
+def test_retained_answer_weights_and_embedding_ownership(torch):
+    for tied in [False, True]:
+        model = _model(torch, tied)
+        embedding = model.model.embed_tokens.weight
+        reference = weakref.ref(model.lm_head.weight)
+        expected = model.lm_head.weight.detach()[[1, 3, 5]].clone()
+        retain_answer_head(torch, model, [5, 1, 3, 1])
+        gc.collect()
+        assert model.lm_head is None
+        assert (reference() is not None) == tied
+        assert model.model.embed_tokens.weight is embedding
+        assert model.quail_answer_token_ids == (1, 3, 5)
+        assert torch.equal(model.quail_answer_weights, expected)
+        assert (model.quail_answer_weights.untyped_storage().nbytes()
+                == expected.numel() * 2)
+        assert model.quail_answer_weights.data_ptr() != embedding.data_ptr()
+        assert model.quail_answer_weights.device == embedding.device
+        assert not model.quail_answer_weights.requires_grad
+        assert model.model.embed_tokens(torch.tensor([0, 7])).shape == (2, 4)
 
-
-def test_repeated_queries_reuse_weights_and_reject_different_ids(torch):
     model = _model(torch)
     retain_answer_head(torch, model, [1, 3, 5])
     weights = answer_weights(model, [1, 3, 5])
@@ -53,16 +52,12 @@ def test_repeated_queries_reuse_weights_and_reject_different_ids(torch):
         answer_weights(model, [1, 3, 6])
     assert answer_weights(model, [1, 3, 5]) is weights
 
-
-def test_empty_ids_do_not_discard_weights(torch):
     model = _model(torch)
     original = model.lm_head
     with pytest.raises(ValueError, match="empty"):
         retain_answer_head(torch, model, [])
     assert model.lm_head is original
 
-
-def test_separate_head_module_with_shared_weight_keeps_embeddings(torch):
     model = _model(torch)
     model.lm_head.weight = model.model.embed_tokens.weight
     embedding = model.model.embed_tokens.weight

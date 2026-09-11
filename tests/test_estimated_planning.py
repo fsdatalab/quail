@@ -6,7 +6,7 @@ import pyarrow as pa
 from test_session import make_executor
 
 import quail
-from quail.runtime import compute, local
+from quail.runtime import execute as execution
 
 DOCS = pa.table({
     "id": [f"d{i}" for i in range(6)],
@@ -23,7 +23,7 @@ def _session(tokenizer=str.split, **kwargs):
     return session
 
 
-def test_estimates_scale_byte_lengths_by_a_sample_ratio():
+def test_estimated_planning_token_reuse_and_concurrent_boot(monkeypatch):
     session = _session()
     estimates = session.estimate_lengths("docs", "body")
     # every document is n copies of "pad ", so tokens per byte is
@@ -32,60 +32,61 @@ def test_estimates_scale_byte_lengths_by_a_sample_ratio():
     assert session.estimate_lengths("docs", "body") is estimates
     session.close()
 
+    with monkeypatch.context() as patch:
+        patch.setattr(execution, "gpu_problem", lambda: None)
+        patch.setattr(execution, "_prepare_backend", lambda *args: None)
+        executor = make_executor(TRUTH)
+        patch.setattr(execution, "_execute_physical",
+                            lambda request, registry: executor(request))
+        session = _session()
+        query = session.sql(SQL)
+        text = query.explain()
+        assert "estimated from a" in text
+        assert query._estimated == ("d",)
 
-def test_plan_uses_estimates_and_run_uses_exact_tokens():
-    session = _session(
-        compute_provider=quail.InProcessComputeProvider(make_executor(TRUTH))
-    )
-    query = session.sql(SQL)
-    text = query.explain()
-    assert "estimated from a" in text
-    assert query._estimated == ("d",)
+        assert sorted(query.run().to_rows()) == [("d0",), ("d2",), ("d4",)]
+        assert query.token_wait_s >= 0.0
+        assert not query._token_futures
+        assert list(session.token_lengths("docs", "body")) == [
+            len(body.split()) for body in DOCS["body"].to_pylist()
+        ]
 
-    assert sorted(query.run().to_rows()) == [("d0",), ("d2",), ("d4",)]
-    assert query.token_wait_s >= 0.0
-    assert not query._token_futures
-    assert list(session.token_lengths("docs", "body")) == [
-        len(body.split()) for body in DOCS["body"].to_pylist()
-    ]
+        # a second query on the same session plans on the exact counts
+        again = session.sql(SQL)
+        assert "estimated from a" not in again.explain()
+        assert again._estimated == ()
+        session.close()
 
-    # a second query on the same session plans on the exact counts
-    again = session.sql(SQL)
-    assert "estimated from a" not in again.explain()
-    assert again._estimated == ()
-    session.close()
+    with monkeypatch.context() as patch:
+        booted = threading.Event()
+        order = []
 
+        def waiting_tokenizer(text):
+            # the token file cannot finish until the backend has booted; the
+            # sample tokenized for the estimate runs on the main thread
+            in_background = threading.current_thread().name.startswith(
+                "quail-tokenize")
+            if in_background and not booted.wait(timeout=10):
+                raise AssertionError("boot did not start before tokenizing")
+            return text.split()
 
-def test_backend_boots_before_tokens_are_ready(monkeypatch):
-    booted = threading.Event()
-    order = []
+        def prepare(plan, registry):
+            order.append("prepare")
+            booted.set()
 
-    def waiting_tokenizer(text):
-        # the token file cannot finish until the backend has booted; the
-        # sample tokenized for the estimate runs on the main thread
-        in_background = threading.current_thread().name.startswith(
-            "quail-tokenize")
-        if in_background and not booted.wait(timeout=10):
-            raise AssertionError("boot did not start before tokenizing")
-        return text.split()
+        executor = make_executor(TRUTH)
 
-    def prepare(plan, registry):
-        order.append("prepare")
-        booted.set()
+        def execute(request, registry):
+            order.append("execute")
+            return executor(request)
 
-    executor = make_executor(TRUTH)
+        patch.setattr(execution, "gpu_problem", lambda: None)
+        patch.setattr(execution, "_prepare_backend", prepare)
+        patch.setattr(execution, "_execute_physical", execute)
 
-    def execute(request, registry):
-        order.append("execute")
-        return executor(request)
-
-    monkeypatch.setattr(compute, "local_gpu_problem", lambda: None)
-    monkeypatch.setattr(local, "_prepare_backend", prepare)
-    monkeypatch.setattr(local, "_execute_physical", execute)
-
-    session = _session(tokenizer=waiting_tokenizer)
-    query = session.sql(SQL)
-    assert sorted(query.run().to_rows()) == [("d0",), ("d2",), ("d4",)]
-    assert order == ["prepare", "execute"]
-    assert query.token_wait_s > 0.0
-    session.close()
+        session = _session(tokenizer=waiting_tokenizer)
+        query = session.sql(SQL)
+        assert sorted(query.run().to_rows()) == [("d0",), ("d2",), ("d4",)]
+        assert order == ["prepare", "execute"]
+        assert query.token_wait_s > 0.0
+        session.close()

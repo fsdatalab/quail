@@ -1,4 +1,4 @@
-"""Register documents, plan queries, and run them through a compute provider."""
+"""Register documents, plan queries, and run them in the current process."""
 
 import os
 import threading
@@ -23,7 +23,6 @@ from quail.physical import DocumentInput, PortRef, Project, ValueType, encode_gr
 from quail.planner import collect_operators, explain, plan_query
 from quail.planner.plan import EngineConfig, Refusal, resolve_model
 from quail.progress import Progress, say
-from quail.runtime.compute import InProcessComputeProvider, QueryRequest
 from quail.runtime.prefixes import prefix_metrics
 from quail.runtime.result import IndexRelation, QueryResult, true_answer_rows
 from quail.runtime.runner import (
@@ -66,7 +65,6 @@ def pick_corpus_tokenizer(primary, fast, texts, sample=25):
     return fast, "tokenizer: bpe-qwen (parity-checked on sample)"
 
 
-# rows per progress check; per slice overhead stays under one percent
 TOKENIZE_ROWS = 2048
 
 # documents tokenized to measure tokens per byte for a length estimate
@@ -76,8 +74,7 @@ ESTIMATE_SAMPLE = 1024
 class Session:
     def __init__(self, config: EngineConfig = EngineConfig(), *,
                  tokenizer=None,
-                 registry: ExtensionRegistry | None = None,
-                 compute_provider=None):
+                 registry: ExtensionRegistry | None = None):
         self.registry = registry or built_in_registry()
         model = resolve_model(config.model, self.registry.models)
         if isinstance(model, Refusal):
@@ -119,26 +116,20 @@ class Session:
         self._length_estimates = {}
         self._lock = threading.RLock()
         self._background = None
-        if compute_provider is None:
-            compute_provider = InProcessComputeProvider()
-        self.compute_provider = compute_provider
 
     def close(self):
-        """Close compute and temporary token storage."""
-        try:
-            self.compute_provider.close()
-        finally:
-            if self._background is not None:
-                self._background.shutdown(cancel_futures=True)
-            for store in self._token_stores.values():
-                store.close()
-            self._token_stores.clear()
-            for store in self._column_stores.values():
-                store.close()
-            self._column_stores.clear()
-            if self._token_directory is not None:
-                self._token_directory.cleanup()
-                self._token_directory = None
+        """Wait for background tokenization and remove temporary token files."""
+        if self._background is not None:
+            self._background.shutdown(cancel_futures=True)
+        for store in self._token_stores.values():
+            store.close()
+        self._token_stores.clear()
+        for store in self._column_stores.values():
+            store.close()
+        self._column_stores.clear()
+        if self._token_directory is not None:
+            self._token_directory.cleanup()
+            self._token_directory = None
 
     def __enter__(self):
         return self
@@ -148,8 +139,6 @@ class Session:
 
     def register(self, name: str, provider: TableProvider) -> None:
         self.catalog.register(name, provider)
-
-    # ---- the two entry points ---------------------------------------
 
     def sql(self, text: str, order: str | None = None,
             dialect: SQLDialect | str = SQLDialect.SNOWFLAKE) -> "Query":
@@ -162,8 +151,6 @@ class Session:
         return BoundBuilder(self,
                             BuilderQuery(self.catalog, name,
                                          self.tokenizer))
-
-    # ---- shared machinery --------------------------------------------
 
     @property
     def tokenizer(self):
@@ -242,7 +229,7 @@ class Session:
         return None if store is None else store.lengths
 
     def estimate_lengths(self, provider_name: str, column: str) -> list[int]:
-        """Estimate every document's token count without tokenizing.
+        """Estimate document token counts from a tokenized sample.
 
         Reads the column's byte lengths and scales them by the tokens
         per byte measured on the first ESTIMATE_SAMPLE documents.
@@ -265,8 +252,7 @@ class Session:
                     )
         finally:
             reader.close()
-        # the primary tokenizer loads in about a second; the fast one
-        # builds its tables for longer and is picked on the background pass
+        # Defer fast-tokenizer initialization to the background tokenization pass.
         tok = self.tokenizer
         sample_tokens = sum(len(tok(text)) for text in sample)
         sample_bytes = sum(len(text.encode("utf-8")) for text in sample)
@@ -467,8 +453,6 @@ class Query:
         self._estimated = ()
         self.token_wait_s = 0.0
 
-    # ---- planning (the optimization) ---------------------------------
-
     def token_inputs(self) -> dict:
         """Return the token store of every scanned alias.
 
@@ -492,8 +476,6 @@ class Query:
             self._doc_tokens = {}
             self._token_inputs = {}
             estimated = []
-            # each Scan lists the columns it must load; the projection
-            # pushdown rule filled that in above
             for s in scans:
                 exact = self.session.token_lengths(s.provider, s.column)
                 if exact is not None:
@@ -502,7 +484,6 @@ class Query:
                     self._token_inputs[s.alias] = store
                     self._doc_tokens[s.alias] = store.lengths
                     continue
-                # plan on estimates while the token file is written
                 self._doc_tokens[s.alias] = self.session.estimate_lengths(
                     s.provider, s.column)
                 self._token_futures[s.alias] = self.session.tokenize_async(
@@ -542,14 +523,11 @@ class Query:
             del self._token_futures[alias]
         self.token_wait_s += time.perf_counter() - started
 
-    # ---- execution -----------------------------------------------------
-
     def run(self) -> QueryResult:
-        """Execute the query through the session compute provider."""
-        result = self.session.compute_provider.execute(self._request())
-        if not isinstance(result, QueryResult):
-            raise TypeError("a compute provider must return QueryResult")
-        return result
+        """Execute the query in the current process."""
+        from quail.runtime.execute import execute_query
+
+        return execute_query(self)
 
     def execute_stream(self, batch_rows: int = 65_536,
                        limit: int | None = None) -> pa.RecordBatchReader:
@@ -564,7 +542,7 @@ class Query:
             limit=limit, batch_rows=batch_rows)
 
     def _prepare_physical(self):
-        """Build the physical request used inside a compute worker."""
+        """Bind the query's tokenized inputs to its physical plan."""
         plan = self.plan()
         if isinstance(plan, Refusal):
             raise RefusalError(plan)
@@ -578,21 +556,6 @@ class Query:
             )
         envelope = plan.to_envelope(self.session.registry.codecs)
         return PhysicalRequest(envelope, inputs)
-
-    def _request(self):
-        """Build the logical request sent to a compute provider."""
-        scans, _, _ = collect_operators(self.logical)
-        return QueryRequest(
-            logical_plan=self.logical,
-            providers={
-                scan.provider: self.session.catalog.get(scan.provider)
-                for scan in scans
-            },
-            config=self.session.config,
-            order=self.order,
-            registry=self.session.registry,
-            planned_query=self,
-        )
 
     def finish(self, response, coordinator_wall: float = 0.0) -> QueryResult:
         """Finish the physical graph and attach execution details."""
@@ -625,7 +588,6 @@ class Query:
             kv_manager=out.get("kv_manager"),
             node_metrics=out.get("node_metrics", {}),
             backend_metrics=out.get("backend_metrics"),
-            result_volume_path=out.get("result_volume_path"),
             remarks=list(plan.remarks) + list(self.session.notes))
 
         scans, logical_filters, logical_joins = collect_operators(self.logical)
@@ -635,7 +597,6 @@ class Query:
             if not isinstance(node, Project):
                 raise TypeError(type(node).__name__)
             if node.inputs[0].value_type is ValueType.JOIN_ANSWERS:
-                # a join answers table read directly: keep the true pairs
                 value = true_answer_rows(value)
             relation = (
                 IndexRelation.from_table(value)

@@ -33,7 +33,7 @@ def filter_node():
     )
 
 
-def test_filter_round_split():
+def test_filter_round_split_merge_and_limit():
     p = payload()
     subs = filter_node_payloads(
         p, filter_node(), p["shards"], 2, has_joins=True
@@ -53,8 +53,6 @@ def test_filter_round_split():
     assert "filter_arena_writes" not in subs[0]
     assert "retain_aliases" not in subs[0]
 
-
-def test_merge_filter_round():
     outs = [
         dict(filters={"r": {0: [1], 2: [0], 4: [1]}},
              survivors={"r": [0, 4]},
@@ -73,8 +71,21 @@ def test_merge_filter_round():
     limited = merge_filter_round(outs, limit=3)
     assert limited["survivors"]["r"] == [0, 1, 3]
 
+    # LIMIT counts output rows. Filter-only: one survivor is one row,
+    # so the filter round may stop early. With joins, cutting
+    # survivor lists drops output rows (#39), so the round gets None.
+    p = payload()
+    p["filter_limit"] = 3
+    assert all(s["filter_limit"] is None for s in filter_node_payloads(
+        p, filter_node(), p["shards"], 2, has_joins=True))
+    assert all(s["filter_limit"] == 3 for s in filter_node_payloads(
+        p, filter_node(), p["shards"], 2, has_joins=False))
+    p["filter_limit"] = None
+    assert all(s["filter_limit"] is None for s in filter_node_payloads(
+        p, filter_node(), p["shards"], 2, has_joins=False))
 
-def test_join_group_reshards_an_anchor_without_filter_shards():
+
+def test_join_distribution_and_kv_placement():
     # a hand-built payload with no shard entry at all for the anchor:
     # shards balance fresh over the live documents. Only token ids
     # move; KV is computed on the new GPU.
@@ -86,8 +97,6 @@ def test_join_group_reshards_an_anchor_without_filter_shards():
     assert covered == [0, 1, 3, 5]
     assert all(s["anchor_index"] for s in subs)
 
-
-def test_join_group_reshards_an_unfiltered_anchor_over_its_live_set():
     # engine payloads ship a scan shard for EVERY alias, but an
     # anchor that ran no filter round (it was a partner before the
     # barrier) has no KV on any GPU to stay near: its scan shard is
@@ -102,8 +111,6 @@ def test_join_group_reshards_an_unfiltered_anchor_over_its_live_set():
     subs = join_group_payloads(p, 2, survivors, group)
     assert [s["anchor_index"] for s in subs] == [[0], [1]]
 
-
-def test_join_group_ships_every_partner_of_a_multi_table_join():
     # a 3-way join: both partner tables replicate to every worker
     p = payload()
     p["docs"]["m"] = [[9] * 3 for _ in range(3)]
@@ -116,8 +123,6 @@ def test_join_group_ships_every_partner_of_a_multi_table_join():
         assert sorted(s["partners"]) == ["m", "p"]
         assert s["partners"]["m"]["index"] == [0, 1, 2]
 
-
-def test_join_group_two_same_anchor_stages():
     # two full stages sharing one anchor: one round; every worker
     # gets both stages and every partner table of either stage
     p = payload()
@@ -134,8 +139,36 @@ def test_join_group_two_same_anchor_stages():
     assert subs[0]["anchor_index"] == [0, 4]
     assert subs[1]["anchor_index"] == [1, 3]
 
+    # an anchor kept by an earlier group stays on the workers that
+    # hold its KV, thinned to the live set, instead of re-sharding
+    p = payload()
+    survivors = {"r": [0, 3, 4], "p": [0, 1, 2, 3]}
+    prior = {"r": [[0, 4, 5], [1, 2, 3]]}
+    subs = join_group_payloads(p, 2, survivors, p["joins"],
+                               prior_shards=prior)
+    assert subs[0]["anchor_index"] == [0, 4]
+    assert subs[1]["anchor_index"] == [3]
+    # without prior shards the anchor follows its filter shards
+    subs = join_group_payloads(p, 2, survivors, p["joins"])
+    assert subs[0]["anchor_index"] == [0, 4]
+    assert subs[1]["anchor_index"] == [3]
 
-def test_gate_group_full_exists_anti():
+    p = payload()
+    survivors = {"r": [0, 1, 3, 4], "p": [0, 1, 2, 3]}
+    prior = {"r": [[0], [3]]}
+
+    subs = join_group_payloads(p, 2, survivors, p["joins"],
+                               prior_shards=prior)
+
+    assert 0 in subs[0]["anchor_index"]
+    assert 3 in subs[1]["anchor_index"]
+    assigned = [document for sub in subs
+                for document in sub["anchor_index"]]
+    assert sorted(assigned) == survivors["r"]
+    assert len(assigned) == len(set(assigned))
+
+
+def test_join_merge_gates_and_live_rows():
     out = dict(rows={0: [1, 0], 1: [0, 0], 2: [0, 1]},
                anchor_index=[5, 7, 9])
     assert gate_group(out, "full") == [5, 9]
@@ -145,8 +178,6 @@ def test_gate_group_full_exists_anti():
     partial = dict(rows={0: [1]}, anchor_index=[5, 7])
     assert gate_group(partial, "full") == [5]
 
-
-def test_thin_survivors_keeps_only_surviving_pair_members():
     # stage anchored on r over partner p. r0 matched p1; r2 answered
     # all NO; r4 matched p2 but was gated later (not in survivors),
     # so its pair keeps nothing alive.
@@ -159,8 +190,6 @@ def test_thin_survivors_keeps_only_surviving_pair_members():
     assert survivors["r"] == [0]
     assert survivors["p"] == [1]
 
-
-def test_thin_survivors_intersects_across_stages():
     # two finished stages touching p: a p document must appear in a
     # surviving pair of BOTH to stay live
     s1 = dict(anchor="r", partners=["p"],
@@ -173,23 +202,6 @@ def test_thin_survivors_intersects_across_stages():
     thin_survivors([s1, s2], survivors)
     assert survivors["p"] == [1]
 
-
-def test_filter_round_limit_rule():
-    # LIMIT counts output rows. Filter-only: one survivor is one row,
-    # so the filter round may stop early. With joins, cutting
-    # survivor lists drops output rows (#39), so the round gets None.
-    p = payload()
-    p["filter_limit"] = 3
-    assert all(s["filter_limit"] is None for s in filter_node_payloads(
-        p, filter_node(), p["shards"], 2, has_joins=True))
-    assert all(s["filter_limit"] == 3 for s in filter_node_payloads(
-        p, filter_node(), p["shards"], 2, has_joins=False))
-    p["filter_limit"] = None
-    assert all(s["filter_limit"] is None for s in filter_node_payloads(
-        p, filter_node(), p["shards"], 2, has_joins=False))
-
-
-def test_merge_join_round_two_stages():
     # stage 2 rows exist only for anchors the stage-1 gate kept; the
     # merge keeps the stages aligned and the anchors disjoint
     outs = [
@@ -215,35 +227,3 @@ def test_merge_join_round_two_stages():
     assert merged[1]["anchor_index"] == [0, 4, 3]
     assert merged[1]["rows"] == {0: [0, 1, 1], 2: [1, 0, 0]}
     assert merged[1]["partner_index"] == [[0], [1], [2]]
-
-
-def test_join_group_prior_shards_align_kept_anchors():
-    # an anchor kept by an earlier group stays on the workers that
-    # hold its KV, thinned to the live set, instead of re-sharding
-    p = payload()
-    survivors = {"r": [0, 3, 4], "p": [0, 1, 2, 3]}
-    prior = {"r": [[0, 4, 5], [1, 2, 3]]}
-    subs = join_group_payloads(p, 2, survivors, p["joins"],
-                               prior_shards=prior)
-    assert subs[0]["anchor_index"] == [0, 4]
-    assert subs[1]["anchor_index"] == [3]
-    # without prior shards the anchor follows its filter shards
-    subs = join_group_payloads(p, 2, survivors, p["joins"])
-    assert subs[0]["anchor_index"] == [0, 4]
-    assert subs[1]["anchor_index"] == [3]
-
-
-def test_join_group_prior_shards_add_documents_missing_from_kv():
-    p = payload()
-    survivors = {"r": [0, 1, 3, 4], "p": [0, 1, 2, 3]}
-    prior = {"r": [[0], [3]]}
-
-    subs = join_group_payloads(p, 2, survivors, p["joins"],
-                               prior_shards=prior)
-
-    assert 0 in subs[0]["anchor_index"]
-    assert 3 in subs[1]["anchor_index"]
-    assigned = [document for sub in subs
-                for document in sub["anchor_index"]]
-    assert sorted(assigned) == survivors["r"]
-    assert len(assigned) == len(set(assigned))

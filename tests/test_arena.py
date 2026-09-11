@@ -7,7 +7,7 @@ import pytest
 from quail.executor.arena import PageArena
 
 
-def test_alloc_free_capacity_and_errors():
+def test_allocation_preserves_page_ownership():
     a = PageArena(n_pages=10, page_tokens=16)
     pages = a.alloc("d0", 40)      # 3 pages
     assert len(pages) == 3
@@ -24,8 +24,6 @@ def test_alloc_free_capacity_and_errors():
     with pytest.raises(KeyError):
         a.alloc("d", 5)
 
-
-def test_row_indices_follow_pages():
     a = PageArena(n_pages=4, page_tokens=4)
     pages = a.alloc("d", 10)       # 3 pages, last partially filled
     rows = a.row_indices("d")
@@ -38,8 +36,6 @@ def test_row_indices_follow_pages():
         left -= take
     assert rows == expect
 
-
-def test_no_page_shared_between_documents():
     rng = random.Random(5)
     a = PageArena(n_pages=64, page_tokens=16)
     live = {}
@@ -57,8 +53,13 @@ def test_no_page_shared_between_documents():
         assert len(held) == len(set(held)), "page double-owned"
         assert len(held) + a.free_pages == 64, "pages leaked"
 
+    a = PageArena(n_pages=3, page_tokens=4)
+    a.alloc("doc", 4)
+    assert a.grow("doc", 12) == 2
+    assert a.grow("doc", 16) is None
 
-def test_pin_retain_rewind_and_free():
+
+def test_retention_rewind_and_pinning():
     a = PageArena(n_pages=10, page_tokens=4)
     a.alloc("doc", 7, capacity_tokens=11)
     assert len(a.owned["doc"]) == 3
@@ -77,15 +78,6 @@ def test_pin_retain_rewind_and_free():
     assert not a.pinned
     assert not a.retained
 
-
-def test_grow_uses_only_free_pages():
-    a = PageArena(n_pages=3, page_tokens=4)
-    a.alloc("doc", 4)
-    assert a.grow("doc", 12) == 2
-    assert a.grow("doc", 16) is None
-
-
-def test_retained_victim_uses_prefix_tokens_per_page():
     a = PageArena(n_pages=4, page_tokens=16)
     a.alloc("one-page", 16)
     a.alloc("two-pages", 17)
@@ -94,8 +86,6 @@ def test_retained_victim_uses_prefix_tokens_per_page():
 
     assert a.pop_retained_victim() == ("two-pages", 2, 17)
 
-
-def test_pinned_stale_heap_entry_is_not_a_victim():
     a = PageArena(n_pages=2, page_tokens=16)
     a.alloc("doc", 16)
     a.retain("doc")

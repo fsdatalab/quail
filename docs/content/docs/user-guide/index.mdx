@@ -3,9 +3,10 @@ title: Installation
 description: Setting up the Python package, with or without a local GPU.
 ---
 
-Quail is a Python package managed with `uv`. It needs Python 3.12. A
-query runs the model in your Python process by default, so that
-process needs a CUDA GPU. Without one, the same query runs on Modal.
+Quail is a Python package managed with `uv`. It needs Python 3.12.
+All model execution requires a CUDA GPU, whether on your machine or on Modal.
+A query runs the model in the process that creates the session.
+To use Modal, create the session inside a Modal GPU function.
 
 ```bash
 git clone https://github.com/fsdatalab/quail-exploration
@@ -16,17 +17,19 @@ uv sync
 `uv sync` installs the package and its dependencies: `sqlglot` for SQL
 parsing, `pyarrow` for tables and results, `transformers` and
 `bpe-qwen` for tokenization, `datasets` and `huggingface-hub` for
-Hugging Face sources, the `modal` client, and on Linux the `vllm`
-runtime that loads the model. vLLM publishes Linux wheels only, so on
-macOS and Windows the package installs without it and queries run on
-Modal.
+Hugging Face sources, and on Linux the `vllm` runtime that loads the model.
+The default development dependencies include the `modal` client for demos
+and experiments. The engine package does not depend on Modal.
+vLLM publishes Linux wheels only, so on
+macOS and Windows the package installs without it. Submit a GPU function
+to Modal to run queries from those machines.
 
 ## Local GPU
 
-`quail.Session()` uses `InProcessComputeProvider`. The first `run()`
-loads the model onto the GPU visible to the process and keeps it
-loaded until `Session.close()`. If the process has no CUDA GPU, `run()`
-raises a `RuntimeError` that says so and names the Modal provider.
+`quail.Session()` runs queries in the current process. The first `run()`
+loads the model onto the visible GPU. The backend keeps the model in process
+state for later queries. `Session.close()` releases token files and background
+work. Without a CUDA GPU, `run()` raises a `RuntimeError`.
 
 The machine needs an NVIDIA driver that supports CUDA 13 (version 580
 or newer) and a C compiler. Triton, which vLLM uses for GPU kernels,
@@ -36,26 +39,28 @@ build-essential` adds it. `uv sync` downloads its own Python build,
 which carries the C headers that helper needs, so the system Python
 and its header packages are not used.
 
-The first run on a machine compiles the Quail backend's kernels, which
-takes about three minutes on an H100. The compiled kernels and the
-marker that records the compile go under `~/.cache/quail/kernels`, the
-same layout the Modal image keeps on its kernel-cache volume, so later
-runs skip the compile. Set `DG_CACHE_DIR`, `TRITON_CACHE_DIR`,
-`VLLM_CACHE_ROOT`, or `TORCHINDUCTOR_CACHE_DIR` before the first query
-to put them elsewhere. Model weights go to the Hugging Face cache,
-`~/.cache/huggingface` by default.
+The first run compiles the Quail backend's kernels. Each library uses its
+own cache defaults. Set `HF_HOME`, `DG_CACHE_DIR`, `TRITON_CACHE_DIR`,
+`VLLM_CACHE_ROOT`, or `TORCHINDUCTOR_CACHE_DIR` before the first query to
+choose other locations. Quail does not change those settings.
 
-`demos/local_gpu_smoke.py` runs one filter query in process and
-prints the rows and timing, for checking a new machine.
+Quail's warmup marker files record completed compilation passes. They go
+under `~/.cache/quail/kernels` by default. Set `QUAIL_CACHE_DIR` to put them
+elsewhere. On Modal, configure environment settings and mounts in your script.
+
+`demos/quickstart.py` runs one filter query in process and prints the rows
+and report. Run it on a CUDA GPU host with `uv run python demos/quickstart.py`.
 
 ## Modal
 
-Pass `ModalComputeProvider` to run the compute side as Modal Functions
-in the existing `quail-engine` app:
+Create a normal session inside a Modal GPU function. The supplied example
+uses the existing `quail-engine` app:
 
-```python
-session = quail.Session(compute_provider=quail.ModalComputeProvider())
+```bash
+uv run modal run demos/quickstart_modal.py 2>&1 | tee results/quickstart_modal.log
 ```
+
+See [Running on Modal](/docs/user-guide/compute) for the function and submission code.
 
 You need a Modal account and a token on the client:
 

@@ -4,7 +4,7 @@ Date: 2026-08-30
 
 ## What changed
 
-- The engine worker (`quail/runtime/worker.py`) now counts KV regret
+- The engine worker (`quail/backends/quail/worker.py`) now counts KV regret
   for every query and returns `regret_tokens` next to `fresh_tokens`.
   KV regret is the fresh tokens spent recomputing a document prefix
   whose KV the same query already computed once; with unlimited KV

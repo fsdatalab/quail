@@ -5,8 +5,8 @@
     uv run python reports/score_shared_kv_retention.py \
       /tmp/shared-kv-retention-20260906T054932Z
 
-Reference labels and corpus rows are read from quail-results. The derived
-accuracy.json is saved beside the original results on the volume.
+Reference labels come from QUAIL-B's public bucket. Corpus rows come from
+quail-results. The derived accuracy.json is saved beside the original results.
 """
 
 import io
@@ -14,14 +14,14 @@ import json
 import sys
 from pathlib import Path
 
+import modal
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from quail.runtime.volumes import ModalVolumeFiles
 from quail_b.data import CORPUS_COLUMNS, _ids, corpus_identity
 from quail_b.labels import _load_ground_truth_collection
 from quail_b.queries import queries
-from quail_b.scoring import Evaluator, RunOutput, rows_from_answers
+from quail_b.scoring import RunOutput, evaluate, rows_from_answers
 
 COLLECTION = "gt_77bb8b128743a79aedddaa24c808c3f8"
 ROOT = "ground_truth/quailb/schema_v1"
@@ -46,25 +46,25 @@ def main(workdir):
     """Validate corpus identity and score the two saved configurations."""
     root = Path(workdir)
     compare_answers(root)
-    files = ModalVolumeFiles()
-    collection = json.loads(files.read_bytes(
-        f"{ROOT}/collections/{COLLECTION}/manifest.json"))
+    volume = modal.Volume.from_name("quail-results")
+    collection = json.loads(b"".join(volume.read_file(
+        f"{ROOT}/collections/{COLLECTION}/manifest.json")))
     collection["label_sets"] = {
         key: value for key, value in collection["label_sets"].items()
         if key.startswith("quailb.fever.") and not key.endswith("contains_date")
     }
-    truth = _load_ground_truth_collection(files, collection)
+    truth = _load_ground_truth_collection(None, collection)
     corpus = {
         name: pq.read_table(
-            io.BytesIO(files.read_bytes(f"quailb_data/sf0.1/{name}.parquet")),
+            io.BytesIO(b"".join(volume.read_file(
+                f"quailb_data/sf0.1/{name}.parquet"))),
             columns=list(CORPUS_COLUMNS[name]))
         for name in ("claims", "evidence")
     }
-    manifest = json.loads(files.read_bytes(
-        f"{ROOT}/corpora/{truth.corpus_id}/manifest.json"))
+    manifest = json.loads(b"".join(volume.read_file(
+        f"{ROOT}/corpora/{truth.corpus_id}/manifest.json")))
     actual = corpus_identity(corpus, 0.1, 0, {})["tables"]
     assert actual == {name: manifest["tables"][name] for name in corpus}
-    evaluator = Evaluator(truth, corpus)
     spec = queries()["FEV-9"]
     ids = {alias.alias: _ids(corpus[alias.table]) for alias in spec.aliases}
 
@@ -95,17 +95,19 @@ def main(workdir):
         # the saved run kept its answers, not its rows
         rows = rows_from_answers(spec, filters, joins)
         assert rows.num_rows == summary["rows"], (rows.num_rows, summary)
-        scores[label] = evaluator.evaluate(
-            spec, RunOutput(filters, joins, rows))
+        scores[label] = evaluate(
+            spec, RunOutput(filters, joins, rows), truth, corpus)
         print(label, json.dumps(scores[label], indent=2), flush=True)
     assert scores["first_anchor"] == scores["shared"]
     destination = f"ablations/{root.name}/accuracy.json"
-    files.write_json(destination, {
+    payload = {
         "query": "FEV-9", "configurations": scores,
         "source_volume_path": f"/results/ablations/{root.name}",
         "collection_id": COLLECTION, "corpus_tables": actual,
         "inference_rerun": False,
-    })
+    }
+    with volume.batch_upload(force=True) as batch:
+        batch.put_file(io.BytesIO(json.dumps(payload, indent=2).encode()), destination)
     print(f"Saved /results/{destination}")
 
 

@@ -11,7 +11,6 @@ from quail.physical import NodeCodec, PhysicalNode
 
 if TYPE_CHECKING:
     from quail.backends.base import ModelBackend
-    from quail.catalog import TableProvider
     from quail.logical_optimizer import LogicalOptimizerRule
     from quail.planning import PhysicalOptimizerRule, PhysicalPlanner
     from quail.runtime.runner import ExecutionObserver, NodeRuntime
@@ -20,7 +19,7 @@ if TYPE_CHECKING:
 
 _KINDS = {
     "logical_rule", "physical_planner", "physical_rule", "backend",
-    "model", "device", "codec", "runtime", "observer", "source_reader",
+    "model", "device", "codec", "runtime", "observer",
 }
 
 
@@ -81,12 +80,6 @@ class ExtensionRegistry:
     @property
     def observer_factories(self) -> Mapping[str, Callable[[], ExecutionObserver]]:
         return self._values("observer")
-
-    @property
-    def source_readers(
-        self,
-    ) -> Mapping[str, Callable[[Mapping[str, Any]], TableProvider]]:
-        return self._values("source_reader")
 
     def _check_name(self, kind: str, name: str) -> None:
         if kind not in _KINDS:
@@ -161,18 +154,6 @@ class ExtensionRegistry:
     ) -> ExtensionRegistry:
         return self._add("logical_rule", rule.name if name is None else name, rule)
 
-    def register_source_reader(
-        self, reader: Callable[[Mapping[str, Any]], TableProvider], *,
-        source_type: str | None = None,
-    ) -> ExtensionRegistry:
-        """Register a reader for one remote table source type."""
-        return self._add(
-            "source_reader",
-            (getattr(reader, "source_type", None)
-             if source_type is None else source_type),
-            reader,
-        )
-
     def register_physical_planner(
         self, planner: PhysicalPlanner, *, name: str | None = None,
     ) -> ExtensionRegistry:
@@ -219,18 +200,6 @@ class ExtensionRegistry:
     def extension_modules(self) -> tuple[str, ...]:
         """Return loaded module names in registration order."""
         return tuple(self._modules)
-
-    def open_source(self, value: Mapping[str, Any]) -> TableProvider:
-        """Open a registered remote table source."""
-        source_type = value.get("type")
-        try:
-            reader = self.source_readers[source_type]
-        except KeyError as error:
-            raise ValueError(
-                f"unknown remote source type {source_type!r}; known "
-                f"source types are {sorted(self.source_readers)}"
-            ) from error
-        return reader(value)
 
     def backend(self, name: str) -> ModelBackend:
         try:

@@ -38,7 +38,7 @@ def _answer(prompt, assignment):
     return (assignment["r"], assignment["a"]) == (0, 0)
 
 
-def test_filter_estimate_counts_each_distinct_prefix_once(tmp_path):
+def test_distinct_prefix_estimates_for_filters_and_joins(tmp_path):
     sess = _session(tmp_path)
     try:
         query = (sess.docs("reviews").alias("r")
@@ -67,8 +67,6 @@ def test_filter_estimate_counts_each_distinct_prefix_once(tmp_path):
     assert distinct.model == "qwen3-4b-fp8"
     assert distinct.device == "h100-sxm"
 
-
-def test_join_estimate_searches_anchor_choices_with_exact_survivors(tmp_path):
     sess = _session(tmp_path)
     try:
         query = (sess.docs("reviews").alias("r")

@@ -49,8 +49,8 @@ are the next step and are not built yet.
 - Models: Qwen3 4B fp8 and Qwen3 32B fp8.
 - Hardware: one H100 per model copy, 1, 2, 4, or 8 H100s in one Modal
   container. Quail does not split one model across GPUs.
-- A query runs on the GPU in the calling process by default, or on
-  Modal through `ModalComputeProvider`.
+- A query runs on the GPU in the calling process. On Modal, the GPU
+  function creates a normal session and runs the whole query there.
 - Stock vLLM, pipelined vLLM, and pipelined SGLang run the same
   queries behind the same backend interface, for comparison.
 
@@ -72,7 +72,7 @@ are the next step and are not built yet.
 - **User guide**: installing, writing queries, reading results, and
   running on Modal.
 - **Architecture**: the logical and physical plans, the Quail backend,
-  the request backends, and the compute worker.
+  the request backends, and query execution.
 - **Extending Quail**: the registry and each extension interface, with
   working code from the test suite.
 - **Contributing**: repository layout, tests, experiment rules, and

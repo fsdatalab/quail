@@ -6,7 +6,7 @@ from experiments.agent_query_sample import (
 )
 
 
-def test_stable_sample_rows_does_not_depend_on_input_order():
+def test_sample_and_reference_comparison():
     rows = [{"id": f"d{index}"} for index in range(20)]
 
     forward = stable_sample_rows(rows, 5)
@@ -15,8 +15,6 @@ def test_stable_sample_rows_does_not_depend_on_input_order():
     assert forward == reverse
     assert len(forward) == 5
 
-
-def test_comparison_treats_32b_as_reference():
     reference = {
         "selectivity": 0.5,
         "answers": [
