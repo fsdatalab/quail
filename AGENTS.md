@@ -26,9 +26,14 @@ engineers talking to each other at a whiteboard. No jargon.
 - Never say "arm" or "arms" for the runs of an experiment. Say
   "run", "configuration", or name the method being run.
 
-For Claude Code users: install the `plain-writing` skill from
-`docwriter-org/plain-writing-skill` for automated enforcement of
-these rules.
+The `plain-writing` skill (from `docwriter-org/plain-writing-skill`)
+and the `ponytail` and `ponytail-review` skills (from
+`DietrichGebert/ponytail`) are checked in under `.claude/skills/`, each
+with its MIT license. Claude Code loads them in every session of this
+repository: `plain-writing` enforces these writing rules, and `ponytail`
+asks, before any code is written, whether it needs to exist, whether the
+codebase or the standard library already does it, and whether it can be
+one line.
 
 # Style checks
 
