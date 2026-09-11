@@ -168,7 +168,7 @@ Figure: plots/streamed_filter_join.png
 - Same setup as the first run: one H100, Qwen3 4B fp8, sf=0.1, the same
   `8338d92` baseline in the same container, one warmup and one measured
   run per query. Modal function call `fc-01M27NHND7E2RVB4VKD4XZ1JQ0`, data at
-  `/results/ablations/DIR2_PLACEHOLDER/`.
+  `/results/ablations/streamed-filter-join-20260911T072243Z/`.
 - Prediction, stated before the run: IMDB-10 loses all 1,217,171
   recomputed tokens, fresh tokens fall by exactly that count, and query
   time drops about 10.7 seconds to near 48 from 59.0, with the same
@@ -176,4 +176,45 @@ Figure: plots/streamed_filter_join.png
   to 0 and its time stays within noise of 41 seconds. Answer tables
   identical on both.
 
-RESULTS2_PLACEHOLDER
+| Query | Configuration | Query time, seconds | Document pairs/second | $/query |
+|---|---|---:|---:|---:|
+| IMDB-10 | Materialized survivors | 57.03 | 2,531.1 | 0.06256 |
+| IMDB-10 | Streamed survivors | 47.16 | 3,060.8 | 0.05173 |
+| FEV-9 | Materialized survivors | 38.11 | 4,778.7 | 0.04181 |
+| FEV-9 | Streamed survivors | 37.83 | 4,814.0 | 0.04150 |
+
+| Query | Recomputed KV tokens, before | After | Fresh tokens, before | After | Anchor KV hits and misses, before | After | Time saved, seconds | Predicted, seconds |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| IMDB-10 | 1,217,171 | 0 | 6,696,942 | 5,479,771 | 124 and 9,256 | 4,380 and 5,000 | 9.87 (-17.3%) | 10.7 |
+| FEV-9 | 7,309 | 0 | 4,314,219 | 4,306,910 | 287 and 55 | 342 and 0 | 0.28 (-0.7%) | 0.1 |
+
+[![Query time, recomputed KV tokens, and fresh tokens on IMDB-10 and FEV-9 after the planner change](plots/streamed_filter_join_planner.png)](plots/streamed_filter_join_planner.png)
+
+Figure: plots/streamed_filter_join_planner.png
+
+- IMDB-10 fell from 57.03 to 47.16 seconds, 17.3% less, and its
+  recomputed KV tokens went from 1,217,171 to 0. Fresh tokens fell by
+  exactly that count. The saving of 9.87 seconds is close to the 10.7
+  predicted. The 5,000 remaining anchor KV misses are `r2`'s documents,
+  which have no filter and are computed once; they are first
+  computations, not recomputes, and are the same in both runs.
+- FEV-9 went from 7,309 recomputed tokens to 0 and from 38.11 to 37.83
+  seconds, within noise as predicted: its recompute was already small
+  because the retention pool held 287 of 342 anchors. Both anchor chains
+  now stream; the two claim chains still run up front because claims are
+  partners in the first group.
+- All 4 IMDB-10 and all 7 FEV-9 answer tables are identical between the
+  two implementations, and so are pairs and rows.
+- This run used a different H100 than the first (GPU
+  `GPU-e9a8e6a3-9557-74ce-69a9-6cdc40b795ae` against
+  `GPU-1772f412-482a-b537-c6ef-987661008eee`). The baseline itself moved
+  from 59.00 to 57.03 seconds on IMDB-10 between the two cards, so each
+  run is compared against its own baseline in the same container.
+- Where the time went on IMDB-10: the baseline spent 14.35 seconds in
+  `r1`'s chain plus 17.33 in its join; the streamed run spent 21.81 in the
+  join node that now contains both. The `r2` group took 25.3 seconds in
+  both.
+- Recomputed KV tokens are now zero on every query in this report. On the
+  benchmark, recompute remains possible only for an alias that is a
+  partner before it anchors, whose chain has to finish first, and whose
+  survivors then wait in the retention pool.

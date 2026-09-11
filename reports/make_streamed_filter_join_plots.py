@@ -8,12 +8,13 @@ report), then run this script on it:
       ablations/streamed-filter-join-<stamp> "$W" --force
     uv run --with matplotlib python \
       reports/make_streamed_filter_join_plots.py \
-      "$W/streamed-filter-join-<stamp>"
+      "$W/streamed-filter-join-<stamp>" [NAME]
 
-Writes plots/streamed_filter_join.png: query seconds per query and
-configuration on the left, recomputed KV tokens in the middle, and
-fresh input tokens on the right. Percentages are derived here from the
-saved summaries.
+Writes plots/NAME.png (default streamed_filter_join): query seconds per
+query and configuration on the left, recomputed KV tokens in the
+middle, and fresh input tokens on the right. The report's second run,
+after the planner change, is plotted with NAME=streamed_filter_join_planner.
+Percentages are derived here from the saved summaries.
 """
 
 import json
@@ -83,9 +84,10 @@ def bars(ax, queries, rows, field, unit, title, fmt):
 
 
 def main():
-    if len(sys.argv) != 2:
-        raise SystemExit(f"usage: {Path(sys.argv[0]).name} WORKDIR")
+    if len(sys.argv) not in (2, 3):
+        raise SystemExit(f"usage: {Path(sys.argv[0]).name} WORKDIR [NAME]")
     workdir = Path(sys.argv[1])
+    name = sys.argv[2] if len(sys.argv) == 3 else "streamed_filter_join"
     queries, rows = load(workdir)
     print("| Query | Configuration | Query seconds | Recomputed KV tokens | "
           "Fresh tokens | Anchor KV hits | Anchor KV misses | Pairs | Rows |")
@@ -105,8 +107,8 @@ def main():
                  "Qwen3 4B fp8, sf=0.1", fontsize=11, y=1.02)
     fig.subplots_adjust(wspace=0.3)
     OUT.mkdir(exist_ok=True)
-    fig.savefig(OUT / "streamed_filter_join.png", dpi=300)
-    print(f"wrote {OUT / 'streamed_filter_join.png'}")
+    fig.savefig(OUT / f"{name}.png", dpi=300)
+    print(f"wrote {OUT / f'{name}.png'}")
 
 
 if __name__ == "__main__":
