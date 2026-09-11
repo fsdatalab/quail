@@ -67,13 +67,7 @@ emission places a filtered alias's chain right before the first group
 anchored on it, after any barrier, when no earlier group uses the
 alias as a partner, and streams it into that group. The executor is
 unchanged: it keeps as much KV as the arena holds and `regret_tokens`
-reports what it could not keep. One shape is priced by the pool
-instead: a filtered alias that is a partner before its first anchor
-use. Its chain has to finish up front, so the search credits only the
-survivors the retention pool holds and charges a prefix scan for the
-rest, which makes it put that alias's anchor group first when that is
-cheaper. No benchmark query has the shape; `explain()` shows it as
-"anchor=from the retention pool".
+reports what it could not keep.
 
 Why: the old credit priced about 11.6% of IMDB-10's filtered reviews as
 resident wherever their join sat, so the search picked an order that

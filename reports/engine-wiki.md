@@ -601,16 +601,11 @@ predicates assemble into results correctly.
 **KV residency across operators** (`planner/retention.py`,
 `executor/retention.py`, and the arena in `executor/arena.py`):
 
-- The planner prices KV reuse as unlimited where the executor can pin it. A
-  filtered alias's first anchor use pays no prefix, and no alias pays a
-  prefix at a later anchor use. The one exception is a filtered alias that
-  was a partner before its first anchor use: its chain had to finish up
-  front, so the search credits only the survivors the retention pool holds
-  (`residency` returns "pool" and `pool_fraction` gives the share) and
-  charges a prefix scan for the rest. That is what makes the search put a
-  filtered alias's anchor group before the groups it is a partner in when
-  that is cheaper. The executor keeps as much KV as the arena holds and
-  recomputes the rest (`regret_tokens` counts what it could not keep).
+- The planner prices KV reuse as unlimited. A filtered alias's first anchor
+  use pays no prefix, and no alias pays a prefix at a later anchor use. The
+  search therefore chooses orders on tuple work alone, and the executor keeps
+  as much of that KV as the arena holds and recomputes the rest
+  (`regret_tokens` counts what it could not keep).
 - A filtered alias whose first use is as an anchor streams its survivors into
   that join with their KV pinned (section 4.6), so nothing of it enters the
   pool. Its chain is placed right before that group, after any barrier. An

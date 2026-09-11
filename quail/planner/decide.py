@@ -460,23 +460,20 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
 
     cap_pages = retention_pages(admission, chunk, budgets.PAGE_TOKENS)
     costs = retention.coefficients(model, device)
-    # KV reuse is priced as unlimited where the executor can pin it: a
-    # filtered alias pays no prefix at its first anchor use, and no
-    # alias pays one at a later use. A filtered alias that was a
-    # partner first keeps only what the retention pool holds.
+    # KV reuse is priced as unlimited: a filtered alias pays no prefix
+    # at its first anchor use, and no alias pays one at a later use
     filtered = set(filters)
 
     def run_search(honor_forced=True):
         found = joinsearch.search_joins(
             specs, live0, length_stats, filtered, pre,
             chunk, model, device, base_work=base_work,
-            fixed_order=fixed, honor_forced=honor_forced,
-            pool_pages=cap_pages)
+            fixed_order=fixed, honor_forced=honor_forced)
         if found is None:
             found = joinsearch.search_joins(
                 specs, live0, length_stats, filtered, pre, chunk, model,
                 device, base_work=base_work, fixed_order=True,
-                honor_forced=honor_forced, pool_pages=cap_pages)
+                honor_forced=honor_forced)
         return found
 
     found = run_search()

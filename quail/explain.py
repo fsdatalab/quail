@@ -207,7 +207,6 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
         elif isinstance(node, AiJoin):
             title += f": anchor={node.anchor}"
             source = {"none": "not resident", "filter": "from filters",
-                      "pool": "from the retention pool",
                       "kept": "from an earlier join"}.get(
                           node.anchor_resident, node.anchor_resident)
             anchor_port = next(
