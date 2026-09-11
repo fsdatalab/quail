@@ -40,10 +40,12 @@ base_image = (
         "TRITON_CACHE_DIR": "/root/.cache/kernels/triton",
         "TORCHINDUCTOR_CACHE_DIR": "/root/.cache/kernels/torchinductor",
     })
-    .add_local_python_source("quail", "quail_b")
 )
-image = base_image.pip_install("vllm==0.26.0")
-sglang_image = base_image.pip_install("sglang==0.5.18")
+# local sources go last: Modal refuses a build step after them
+image = base_image.pip_install("vllm==0.26.0").add_local_python_source(
+    "quail", "quail_b")
+sglang_image = base_image.pip_install(
+    "sglang==0.5.18").add_local_python_source("quail", "quail_b")
 
 app = modal.App("quail-milestone1")
 hf_cache = modal.Volume.from_name("quail-hf-cache", create_if_missing=True)

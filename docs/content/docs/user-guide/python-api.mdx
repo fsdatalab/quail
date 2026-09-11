@@ -37,6 +37,7 @@ This is QUAIL-B's IMDB-6 with a limit.
 | `.alias(a)` | `FROM provider a`. Must come right after `docs()`. |
 | `.ai_filter(prompt, selectivity=None)` | A `WHERE AI_FILTER(...)` term over one table. |
 | `.ai_join(others, prompt, selectivity=None, anchor=None, semantics="full")` | `JOIN ... ON AI_FILTER(...)`, or `EXISTS` / `NOT EXISTS`. |
+| `.join(other, on=None)` | `JOIN ... ON col = col`. The next `.ai_filter()` over both tables is the AI predicate asked of those pairs. |
 | `.limit(n)` | `LIMIT n` |
 | `.select(*cols, order="as_written")` | The `SELECT` list. Returns the `Query`. |
 
@@ -96,6 +97,33 @@ no_aspect = (session.docs("reviews").alias("r")
                       semantics="anti")
              .select("r.id"))
 ```
+
+## Joins over pairs
+
+When an ordinary column relates the two tables, `join(other, on=...)`
+takes `col(...) == col(...)` conditions (one or a list) and the next
+`ai_filter` over both tables is the question asked of the pairs the
+conditions allow. Every other pair is never built, and the planner
+prices the join by the number of equal pairs. This is QUAIL-B's
+FEV-10: a claim names its Wikipedia page, and an evidence row's id is
+its page name.
+
+```python
+SUPPORT = ("Does the passage in DOCUMENT {1} support the claim in "
+           "DOCUMENT {0}?")
+
+same_page = (session.docs("claims").alias("c")
+             .ai_filter(prompt(F11, col("c.claim")))
+             .join(session.docs("evidence").alias("e"),
+                   on=col("c.evidence_wiki_url") == col("e.id"))
+             .ai_filter(prompt(SUPPORT, col("c.claim"), col("e.text")))
+             .select("c.id", "e.id"))
+```
+
+`ai_join(other, prompt)` is the shorthand for `join(other)` followed
+by `ai_filter(prompt)` when every pair is a candidate. A `join()` with
+no `ai_filter` over its pairs is refused at `select()`: a plain join
+belongs in the source database.
 
 ## Filter order
 

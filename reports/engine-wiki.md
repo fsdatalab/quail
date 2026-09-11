@@ -134,8 +134,8 @@ for sources and validation status. Memory budgets remain per GPU.
 2. The user writes a query, either as AI SQL or through the builder
    API.
 3. Both front ends use `LogicalPlanBuilder` to create a tree of
-   `Scan`, `SemanticFilter`, `SemanticJoin`, and logical `Project`
-   nodes. Every logical node implements the same traversal, rewrite,
+   `Scan`, `SemanticFilter`, `Join`, `SemanticJoin`, and logical
+   `Project` nodes. Every logical node implements the same traversal, rewrite,
    validation, schema, and explain interface.
 4. The session keeps the query, table providers, model settings, and registry.
 5. `Query.run()` calls `execute_query` with that existing query.
@@ -222,7 +222,7 @@ logical node does not require another tree traversal function.
 
 ### The logical operators
 
-There are four operators, defined in `logical.py`:
+There are five operators, defined in `logical.py`:
 
 - **Scan**: reads one column of one registered provider (e.g.,
   `reviews.body`). That column is tokenized for the model. The Scan
@@ -237,10 +237,19 @@ There are four operators, defined in `logical.py`:
   single scanned column. Each predicate has a prompt template, column
   references, and an optional selectivity (the fraction of documents
   expected to pass).
+- **Join**: one binary relational join with ordinary column
+  equalities (`on`); an empty `on` is a cross join. Its pairs are what
+  the SemanticJoin above it asks the model about. The session builds
+  the pair table with an Arrow hash join over the key columns and
+  ships it with the request, so a pair the equality rules out is
+  never built, packed, or priced. The projection pushdown loads the
+  key columns as values like any returned column.
 - **SemanticJoin**: one true/false predicate over a whole tuple of
-  documents, one per table - the cross product of its tables
-  filtered by a single prompt that holds every document at once
-  (the BigQuery/Snowflake AI-join shape). A query may hold several
+  documents, one per table - the pairs of the Join beneath it, or the
+  cross product of its tables, filtered by a single prompt that holds
+  every document at once (the BigQuery/Snowflake AI-join shape). Both
+  front ends build `SemanticJoin(inputs=(Join(...),))`; the older
+  several-input form still means the cross product. A query may hold several
   `full` joins - each its own predicate and stage, composed by id
   matching at assembly (issue #38); stages may anchor on different
   tables and run as separate anchored joins - plus any number of gates:
@@ -316,7 +325,11 @@ conjuncts. Join predicates appear in `JOIN ... ON` clauses. `EXISTS` and
 `NOT EXISTS` subqueries map to exists and anti semantics.
 
 Each multi-table `AI_FILTER(PROMPT(...))` - on a JOIN's ON or as a
-WHERE term - is one join predicate; a query may have several.
+WHERE term - is one join predicate; a query may have several. An ON
+clause may also hold `column = column` conjuncts; they become the
+`Join`'s conditions, and the AI predicate that carries that JOIN's
+table is asked of those pairs only. A JOIN whose ON has an equality
+but no AI predicate anywhere is refused.
 Coverage rule: every JOINed table must appear in at least one join
 predicate, and the predicates' tables must form one connected graph
 with the FROM table.
@@ -338,7 +351,9 @@ enter silently.
 ### Builder API
 
 The builder (`builder.py`) mirrors the SQL constructs: `docs()`,
-`.alias()`, `.ai_filter()`, `.ai_join()`, `.limit()`, `.select()`. Its default
+`.alias()`, `.ai_filter()`, `.join(other, on=col(...) == col(...))`
+followed by `.ai_filter()` over both tables, `.ai_join()` as the
+shorthand for a join over every pair, `.limit()`, `.select()`. Its default
 is `as_written`, so the chain order is the execution order. A caller can pass
 `.select(..., order="by_cost")` to use the planner's cost order. Both entry
 points finish through the same `LogicalPlanBuilder`, so the plans are
@@ -810,10 +825,13 @@ while not done:
     room = chunk_budget
     groups = []
 
+    # every anchor streams its own partner list at each stage: the
+    # whole stage list, or the members its join's equality allows
+    # (an anchor with no member at a stage settles without a chunk)
     # priority 1 and 2: placed anchors - cut streams at the front of
     # the ready queue, then anchors starting their next stage
     for each anchor a in the ready queue (oldest first):
-        j, i = a's stage, a's next partner
+        j, i = a's stage, a's next partner in its own list
         cost = suffix[j][i] (+ frame[j] when i == 0)
         if cost > room: break
         end = the longest partner run from i that fits room
@@ -1325,7 +1343,12 @@ every pair, and pays per-request scheduling overhead.
 The packing works through `JoinAdmission` (`pack.py`): anchors admit
 continuously and stream their partner lists; an anchor whose stream
 is cut mid-chunk continues at the front of the next chunk, reading
-its KV from the arena instead of recomputing it.
+its KV from the arena instead of recomputing it. Each anchor has its
+own partner list per stage: every partner when the join is a cross
+product, or the members its equality conditions allow when the join
+runs over pairs (`anchor_partners`). The answer rows follow the
+anchor's list, and the join output carries `anchor_partners` so the
+answer tables name the right partner for each bit.
 
 ### Anchor KV sharing
 
@@ -1495,7 +1518,7 @@ GPUs and use the matching `EngineConfig`. Each GPU runs one model copy.
 
 ## 7. The benchmark (QUAIL-B)
 
-QUAIL-B (`quail_b`) has 32 queries over five document sets
+QUAIL-B (`quail_b`) has 33 queries over five document sets
 (IMDB, BioDEX, FEVER, LePaRD, and SWE-Next), plus 2 optional PrivacyPolicies
 queries. Qwen3 32B answers the filter predicates during the judge pass.
 The FEVER annotations and sampled LePaRD citation edges provide source labels
@@ -1558,7 +1581,7 @@ graph LR
     policies -. "SCENARIO_MATCH" .-> scenarios
 ```
 
-### The 32 queries
+### The 33 queries
 
 **IMDB** (10 queries): reviews x aspects
 
@@ -1583,7 +1606,7 @@ graph LR
 | BIO-2 | 1J | reports x terms (REACTION) |
 | BIO-3 | 1F + 1J | F7 then join |
 
-**FEVER** (9 queries): claims x evidence
+**FEVER** (10 queries): claims x evidence
 
 | Query | Shape | Description |
 |---|---|---|
@@ -1596,6 +1619,7 @@ graph LR
 | FEV-7 | 2J star | SUPPORT + REFUTE, same anchor |
 | FEV-8 | 3J chain | c1-e1-c2-e2 |
 | FEV-9 | 4 filters + 3 joins | F11 on c1 and c2, F13 on e1 and e2, then c1-e1-c2-e2 |
+| FEV-10 | 2F + 1J over pairs | FEV-5 with `ON c.evidence_wiki_url = e.id`: SUPPORT asked only of a claim and its own page |
 
 **LePaRD** (8 queries): citation contexts joined with citation passages
 

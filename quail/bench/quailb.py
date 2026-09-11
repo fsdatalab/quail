@@ -63,10 +63,19 @@ def build_query(sess, spec: QuerySpec):
             quail.col(f"{alias}.{spec.alias(alias).column}")
             for alias in join.aliases
         ]
-        query = query.ai_join(
-            partner_query,
-            quail.prompt(join.template, *columns),
-            selectivity=spec.join_selectivity(join.template))
+        predicate = quail.prompt(join.template, *columns)
+        selectivity = spec.join_selectivity(join.template)
+        if join.on:
+            # the equality picks the pairs; the model sees those only
+            left, right = join.aliases
+            query = query.join(partner_query, on=[
+                quail.col(f"{left}.{left_column}")
+                == quail.col(f"{right}.{right_column}")
+                for left_column, right_column in join.on
+            ]).ai_filter(predicate, selectivity=selectivity)
+        else:
+            query = query.ai_join(partner_query, predicate,
+                                  selectivity=selectivity)
     return query.select(*spec.select, order=spec.order)
 
 

@@ -21,10 +21,16 @@ def register_fever(session):
     for name, column, prefix, length in (
         ("claims", "claim", "c", 20), ("evidence", "text", "e", 300),
     ):
-        session.register(name, quail.DocumentProvider.from_table(pa.table({
+        table = pa.table({
             "id": [f"{prefix}{index}" for index in range(3)],
             column: [f"{index} " + "word " * length for index in range(3)],
-        }), id_col="id"))
+        })
+        if name == "claims":
+            # c0 and c1 name page e0, c2 names e2 (an evidence id)
+            table = table.append_column(
+                "evidence_wiki_url", pa.array(["e0", "e0", "e2"]))
+        session.register(name, quail.DocumentProvider.from_table(
+            table, id_col="id"))
 
 
 class FixedFeverAnswers:
@@ -81,25 +87,34 @@ class FixedFeverAnswers:
                 inputs["prefixes"].append([])
         live = set(range(len(anchor_ids)))
         all_answers = []
-        for stage in node.stages:
+        lists_for = inputs.get("anchor_partners")
+        for stage_index, stage in enumerate(node.stages):
             aliases = (stage.anchor, *stage.partners)
             claim = next(alias for alias in aliases if alias.startswith("c"))
             evidence = next(alias for alias in aliases if alias.startswith("e"))
             passing = ({(1, 0), (2, 0), (0, 2)} if stage.written_pos == 1
                        else {(0, 0), (1, 1), (2, 0), (1, 2)})
             partners = inputs["partner_indices"][stage.written_pos]
+            # a stage over pairs asks each anchor about its own members
+            members = {} if lists_for and stage.equalities else None
             rows = {}
             for local in sorted(live):
+                mine = (range(len(partners)) if members is None
+                        else lists_for(anchor_ids[local])[stage_index])
+                if members is not None:
+                    members[local] = list(mine)
                 rows[local] = []
-                for partner in partners:
-                    assignment = dict(zip(aliases, (anchor_ids[local], *partner)))
+                for member in mine:
+                    assignment = dict(zip(
+                        aliases, (anchor_ids[local], *partners[member])))
                     rows[local].append((assignment[claim], assignment[evidence])
                                        in passing)
             live = {local for local, row in rows.items() if any(row)}
             all_answers.append(rows)
             outputs[f"join_answers:{stage.written_pos}"] = {
                 "rows": rows, "anchor_index": anchor_ids,
-                "partner_index": partners, "anchor": stage.anchor,
+                "partner_index": partners, "anchor_partners": members,
+                "anchor": stage.anchor,
                 "partners": list(stage.partners), "semantics": stage.semantics,
                 "selectivity": stage.selectivity, "written_pos": stage.written_pos,
             }
@@ -231,6 +246,83 @@ def test_distributed_fev9_executes_bound_join_nodes(monkeypatch):
         assert result.to_pylist() == [{
             "c1.id": "c0", "e1.id": "e0", "c2.id": "c1", "e2.id": "e1",
         }]
+
+
+def _fever_children(session, docs, count):
+    from quail.runtime.runner import ExecutionContext
+
+    children = []
+    for _ in range(count):
+        state = graph_state(None, docs)
+        model = FixedFeverAnswers(state, capacity=1, empty=False)
+        state.update(
+            model_execution=model, registry=session.registry,
+            boot={"boot_s": 0, "kind": "warm"}, seen=set(),
+            runtime_context=ExecutionContext(
+                runtimes=session.registry.runtimes, model_execution=model,
+            ),
+        )
+        children.append(state)
+    return children
+
+
+def test_fev10_asks_the_model_about_same_page_pairs_only(monkeypatch):
+    """FEV-10 on one GPU and on two: the join runs over the pair table."""
+    from quail.backends.quail import worker
+    from quail.backends.quail.distributed import execute_distributed_graph
+    from quail.specs import H100_SXM, QWEN3_4B_FP8
+
+    for gpus in (1, 2):
+        with quail.Session(EngineConfig(gpus=gpus),
+                           tokenizer=lambda text: list(text.encode())) as session:
+            register_fever(session)
+            query = quailb.queries(session)["FEV-10"][1]()
+            (stage,) = query.plan().graph.nodes_by_type(AiJoin.type_name)[0].stages
+            assert stage.equalities == (("c", "evidence_wiki_url", "e", "id"),)
+            assert stage.pair_fraction == 3 / 9
+
+            def execute(request):
+                graph = decode_graph(request.plan["graph"], session.registry.codecs)
+                docs = {node.alias: request.inputs[node.input_id].documents
+                        for node in graph.nodes if isinstance(node, Scan)}
+                pairs = request.pair_tables()
+                assert pairs[0].to_pydict() == {"c": [0, 1, 2], "e": [0, 0, 2]}
+                if gpus == 1:
+                    state = graph_state(None, docs)
+                    state["model_execution"] = FixedFeverAnswers(state, 1, False)
+                    state["pairs"] = pairs
+                    report = execute_single_graph(
+                        state, request.plan["settings"], graph)
+                    assert not state["arena"].accounting.owned
+                    return PhysicalResponse(report.pop("_outputs"), report)
+                children = _fever_children(session, docs, 2)
+
+                def round_fn(kind, subs):
+                    function = (worker._child_filters if kind == "filters"
+                                else worker._child_joins)
+                    return [function(state, sub)
+                            for state, sub in zip(children, subs)]
+
+                monkeypatch.setattr(worker, "_child_boot", lambda state, sub: None)
+                report = execute_distributed_graph(
+                    {**request.plan["settings"], "model": "qwen3-4b-fp8",
+                     "docs": docs, "pairs": pairs, "physical_plan": request.plan},
+                    graph, 2, round_fn, QWEN3_4B_FP8, H100_SXM,
+                    session.registry.runtimes, session.registry,
+                )
+                assert all(not child["arena"].accounting.owned
+                           for child in children)
+                return PhysicalResponse(report.pop("_outputs"), report)
+
+            result = execute_query(query, physical_executor=execute)
+            # the filters keep c0, c1, e0, e1; the pairs on those are
+            # (c0, e0) and (c1, e0); only c0 is supported by e0. The
+            # cross join would also have asked about (c0, e1) and
+            # (c1, e1) and returned (c1, e1)
+            answers = result.answer_tables["joins"][0]
+            assert sorted(zip(answers.column("c").to_pylist(),
+                              answers.column("e").to_pylist())) == [(0, 0), (1, 0)]
+            assert result.collect().to_pylist() == [{"c.id": "c0", "e.id": "e0"}]
 
 
 def test_retention_search_matches_enumeration():

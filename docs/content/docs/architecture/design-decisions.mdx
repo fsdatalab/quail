@@ -105,8 +105,8 @@ Each logical node supplies:
 - Methods that replace children or expressions.
 - Fields for `explain()`.
 
-The built in nodes are `Scan`, `SemanticFilter`, `SemanticJoin`, and
-logical `Project`.
+The built in nodes are `Scan`, `SemanticFilter`, `Join`,
+`SemanticJoin`, and logical `Project`.
 
 The session keeps the logical plan in process. The extension module that
 defines a custom logical node must be installed in the worker image.
