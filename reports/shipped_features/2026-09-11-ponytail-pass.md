@@ -1,6 +1,6 @@
 # 2026-09-11: a ponytail pass over the pair-join, Foreign, and plan-edit code
 
-The `ponytail-review` skill now checked in under `.claude/skills/` asks
+The `ponytail-review` checklist from `DietrichGebert/ponytail` asks
 one question of each piece of code: does it need to exist, and if so,
 can it be shorter. This pass ran it over every line the branch added
 under `quail/` for joins over pairs, the Foreign operator, and plan
