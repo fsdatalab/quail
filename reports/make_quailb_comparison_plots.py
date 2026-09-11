@@ -506,7 +506,8 @@ def main(workdir, fev9_dir=None, fev10_dir=None):
         f"{fev10['quail']['fresh']:,}, {fev10['stock_vllm']['fresh']:,}, "
         f"{fev10['pipelined_vllm']['fresh']:,}, and",
         f"  {fev10['pipelined_sglang']['fresh']:,} fresh tokens. The "
-        "[pair-join report](2026-09-11-pair-join.md)",
+        "[feature note](shipped_features/"
+        "2026-09-11-streamed-edges-pair-joins-plan-edits.md)",
         "  records the Quail run and the prediction for the baselines.",
         f"- FEV-9 SoL is {sol['FEV-9']['sol_s']:.3f} seconds with shared-prefix reuse,",
         f"  compared with {sol['FEV-9']['per_document']['sol_s']:.3f} seconds "

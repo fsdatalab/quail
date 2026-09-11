@@ -126,20 +126,16 @@ change needs one of them, say so instead of quietly adding it back.
 
 All experiment and feature reports live under `reports/`.
 
-- Every PR that includes an experiment must produce a report in
-  `reports/`. Name the file `YYYY-MM-DD-<short-slug>.md`.
-  The report states the setup, the prediction, the measured result,
-  and what the numbers mean. Cite the data by its `quail-results`
-  volume path.
-- When a report is superseded or its numbers are no longer current,
-  delete the report, its plot script, and its PNGs from
-  `reports/plots/`. Before starting a new task, scan `reports/`
-  for outdated reports, orphaned plot scripts, and PNGs not
-  referenced by any current report, and delete them all.
-- When a PR ships a new feature (a code change that lands on main),
-  add a short description in `reports/shipped_features/`.
-  Name the file `YYYY-MM-DD-<short-slug>.md`. It should say what
-  changed, why, and the before/after numbers if applicable.
+- Every PR adds one file, and only one, to `reports/shipped_features/`,
+  named `YYYY-MM-DD-<short-slug>.md`. It says what changed, why, the
+  prediction stated before each run, the measured numbers against it,
+  and the `quail-results` volume path and Modal function call id of
+  each run. A PR with several features gets one file with a section
+  per feature. Do not add a separate report under `reports/`.
+- When a note's numbers are no longer current, delete it and any plot
+  script and PNGs only it referenced. Before starting a new task, scan
+  `reports/` for orphaned plot scripts and PNGs not referenced by any
+  current note, and delete them all.
 - `reports/engine-wiki.md` is a living reference doc, not a
   per-PR report. Update it in place when the engine's design changes.
 
@@ -157,7 +153,9 @@ Include a figure whenever one carries the point better than text:
 
 # Plots
 
-Every report with measured results should include at least one plot.
+Add a plot only when it carries the point better than a table. A plot
+lives under `reports/plots/` with its `make_<slug>_plots.py` in
+`reports/`, and the note links it.
 
 ## QUAIL-B plot standard
 

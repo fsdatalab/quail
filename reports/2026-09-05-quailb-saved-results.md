@@ -53,7 +53,7 @@
   32.66, 31.73, and 43.43. Measured: Quail 1.68 seconds,
   stock vLLM 2.97, pipelined vLLM 2.91, and pipelined SGLang
   3.32, with 187,567, 270,220, 270,220, and
-  267,414 fresh tokens. The [pair-join report](2026-09-11-pair-join.md)
+  267,414 fresh tokens. The [feature note](shipped_features/2026-09-11-streamed-edges-pair-joins-plan-edits.md)
   records the Quail run and the prediction for the baselines.
 - FEV-9 SoL is 5.821 seconds with shared-prefix reuse,
   compared with 6.337 seconds with reuse only
