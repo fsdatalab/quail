@@ -258,6 +258,13 @@ There are five operators, defined in `logical.py`:
     document (a semi-join; two tables).
   - `anti`: keep outer documents that match no inner document (an
     anti-join; two tables).
+- **Apply**: a user function between two operators (`apply()` and
+  `apply_table()` in the builder; no SQL form). It names a function
+  registered on the session, the columns it reads, how it runs
+  (`per_batch` on each batch a streaming operator hands over, or
+  `barrier` once over every survivor), and what it returns (`preserve`
+  every id, `drop` a subset, or `pairs` for the join above it). A
+  function never invents an id.
 - **Project**: column selection at the root. No computed columns.
 
 ### Prompt layout
@@ -353,7 +360,9 @@ enter silently.
 The builder (`builder.py`) mirrors the SQL constructs: `docs()`,
 `.alias()`, `.ai_filter()`, `.join(other, on=col(...) == col(...))`
 followed by `.ai_filter()` over both tables, `.ai_join()` as the
-shorthand for a join over every pair, `.limit()`, `.select()`. Its default
+shorthand for a join over every pair, `.apply(fn, columns)` and
+`.apply_table(fn, columns)` for a Python function between two
+operators, `.limit()`, `.select()`. Its default
 is `as_written`, so the chain order is the execution order. A caller can pass
 `.select(..., order="by_cost")` to use the planner's cost order. Both entry
 points finish through the same `LogicalPlanBuilder`, so the plans are
@@ -864,6 +873,37 @@ if j is the last stage and the row is complete:
     finish a: anchor_done decides retain or free
 ```
 ```
+
+### The Foreign node
+
+A logical `Apply` becomes a physical `Foreign` node (`apply:<name>`).
+It sits right after its alias's filter chain, or between a join's
+inputs and the `AiJoin` when it returns pairs (its `pairs:<written
+position>` port is an extra input of the join). The runtime
+(`ForeignRuntime` in `runtime/runner.py`) builds one Arrow table per
+alias from the ids and the value columns the request shipped
+(`columns:<alias>` relations), calls the function, and checks what
+comes back against the ids it gave.
+
+- `per_batch` on a survivor stream: the node returns the stream with
+  the function appended to its `transforms` (or a `StreamedPairs`
+  object for a pairs function). The consuming join runs the transforms
+  on each batch the chain hands over, before admission; a survivor the
+  function drops has its KV freed and is never admitted. The chain
+  keeps streaming and nothing is recomputed. The node's result is
+  final once the graph has run.
+- `barrier`: the planner does not pin the chain (the alias joins
+  `barrier_aliases` in `decide.py`), the survivors go through the
+  retention pool as before streaming existed, and the function runs
+  once over the materialized ids.
+- `validate_streams` (`physical/nodes.py`) checks every pinned stream
+  reaches the join anchored on its alias through per-batch `Foreign`
+  nodes only; it runs on every `PhysicalPlan` and every request.
+- Several GPUs: a per-batch function would have to run inside each
+  GPU's join round, where the session's functions are not present, so
+  the planner refuses it (`per_batch_apply_needs_one_gpu`); a barrier
+  function runs on the coordinator. The request backends refuse
+  `apply` altogether.
 
 ### 4.2 The paged KV arena
 

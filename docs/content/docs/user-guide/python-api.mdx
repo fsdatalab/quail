@@ -38,6 +38,8 @@ This is QUAIL-B's IMDB-6 with a limit.
 | `.ai_filter(prompt, selectivity=None)` | A `WHERE AI_FILTER(...)` term over one table. |
 | `.ai_join(others, prompt, selectivity=None, anchor=None, semantics="full")` | `JOIN ... ON AI_FILTER(...)`, or `EXISTS` / `NOT EXISTS`. |
 | `.join(other, on=None)` | `JOIN ... ON col = col`. The next `.ai_filter()` over both tables is the AI predicate asked of those pairs. |
+| `.apply(fn, columns=[...], name=None, ids=None, kind="per_batch")` | No SQL form. A Python function between two operators; see below. |
+| `.apply_table(fn, columns=[...], name=None, ids=None)` | `.apply(..., kind="barrier")`: the function runs once over every survivor. |
 | `.limit(n)` | `LIMIT n` |
 | `.select(*cols, order="as_written")` | The `SELECT` list. Returns the `Query`. |
 
@@ -124,6 +126,48 @@ same_page = (session.docs("claims").alias("c")
 by `ai_filter(prompt)` when every pair is a candidate. A `join()` with
 no `ai_filter` over its pairs is refused at `select()`: a plain join
 belongs in the source database.
+
+## A function between two operators
+
+`apply(fn, columns=[...])` puts a Python function in the plan. The
+function receives a dict of Arrow tables keyed by alias. Each table
+holds that alias's row indices under the alias name plus the listed
+columns. What it returns depends on where it sits:
+
+- After a filter (or a scan): the ids to keep, as a list, an Arrow
+  array, or a one-column table. `ids="drop"` (the default) lets it
+  leave ids out; `ids="preserve"` says it returns every id.
+- After `join(other)`: the pairs the next `ai_filter` is asked about,
+  as a table with both alias columns. This is the built-in equality
+  written by hand: FEV-10 again, with the pairing in Python.
+
+A function never invents an id. One that returns an id it was not
+given, or drops an id under `ids="preserve"`, fails the query.
+
+```python
+def same_page(tables):
+    claims, evidence = tables["c"], tables["e"]
+    return claims.join(evidence, keys=["evidence_wiki_url"],
+                       right_keys=["id"]).select(["c", "e"])
+
+same_page_pairs = (session.docs("claims").alias("c")
+                   .ai_filter(prompt(F11, col("c.claim")))
+                   .join(session.docs("evidence").alias("e"))
+                   .apply(same_page, columns=[col("c.evidence_wiki_url"),
+                                              col("e.id")])
+                   .ai_filter(prompt(SUPPORT, col("c.claim"), col("e.text")))
+                   .select("c.id", "e.id"))
+```
+
+`kind` says how the function runs. `per_batch`, the default, runs it
+on each batch of survivors a filter chain hands its join, so the
+chain keeps streaming and its survivors' KV stays pinned. `barrier`
+(`apply_table`) runs it once over every survivor; the planner then
+finishes the chain before the function, and the join starts after
+it. The function is registered on the session under `name` (its own
+name by default); a session refuses two different functions under one
+name. Today per-batch functions run on one GPU, and `apply` is
+accepted by the Quail backend only; the planner refuses it otherwise.
 
 ## Filter order
 

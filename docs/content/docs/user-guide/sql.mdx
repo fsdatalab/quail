@@ -151,7 +151,8 @@ stage. Several equalities may be combined with `AND`; each must
 relate the joined table to a table already in the query, and the AI
 predicate must name the same two tables. A `JOIN` whose `ON` has an
 equality but no AI predicate is refused: a plain join belongs in the
-source database.
+source database. A Python function between two operators has no SQL
+form; see `apply()` in the Python API.
 
 Join options:
 
