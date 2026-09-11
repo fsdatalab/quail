@@ -20,10 +20,15 @@ from quail.extensions import ExtensionRegistry
 from quail.logical import CompileError, LogicalPlan, join_conditions
 from quail.logical_optimizer import LogicalPlanningContext, apply_logical_rules
 from quail.physical import PortRef, Project, Scan, ValueType, encode_graph
-from quail.planner import collect_operators, explain, plan_query
+from quail.planner import collect_applies, collect_operators, explain, plan_query
 from quail.planner.plan import EngineConfig, Refusal, resolve_model
 from quail.progress import Progress, say
-from quail.runtime.pairs import pair_fraction, pair_table, pairs_key
+from quail.runtime.pairs import (
+    columns_key,
+    pair_fraction,
+    pair_table,
+    pairs_key,
+)
 from quail.runtime.prefixes import prefix_metrics
 from quail.runtime.result import IndexRelation, QueryResult, true_answer_rows
 from quail.runtime.runner import (
@@ -222,6 +227,18 @@ class Session:
                 max_workers=1, thread_name_prefix="quail-tokenize")
         return self._background.submit(
             self.tokenize, provider_name, column, projected_columns)
+
+    def register_functions(self, functions: dict) -> None:
+        """Register a query's apply() functions once each, by name."""
+        for name, function in functions.items():
+            known = self.registry.functions.get(name)
+            if known is function:
+                continue
+            if known is not None:
+                raise ValueError(
+                    f"apply name {name!r} is registered for another "
+                    f"function on this session")
+            self.registry.register_function(function, name=name)
 
     def column_values(self, provider_name: str, column: str) -> pa.ChunkedArray:
         """Return one source column in scan order.
@@ -447,6 +464,16 @@ class BoundBuilder:
         self._inner.join(inner, on=on)
         return self
 
+    def apply(self, fn, columns=(), **options):
+        self._inner.apply(fn, columns, **options)
+        self._session.register_functions(self._inner.functions)
+        return self
+
+    def apply_table(self, fn, columns=(), **options):
+        self._inner.apply_table(fn, columns, **options)
+        self._session.register_functions(self._inner.functions)
+        return self
+
     def ai_join(self, others, p, selectivity=None, anchor=None,
                 semantics="full"):
         if not isinstance(others, (list, tuple)):
@@ -614,7 +641,23 @@ class Query:
         envelope = plan.to_envelope(self.session.registry.codecs)
         relations = {pairs_key(position): table
                      for position, table in self._pairs.items()}
+        relations.update(self._column_tables())
         return PhysicalRequest(envelope, inputs, relations)
+
+    def _column_tables(self) -> dict:
+        """One value table per alias an apply() function reads."""
+        needed = {}
+        for apply in collect_applies(self.logical):
+            for ref in apply.columns:
+                needed.setdefault(ref.alias, {})[ref.column] = None
+        tables = {}
+        for alias, columns in needed.items():
+            store = self._token_inputs[alias]
+            arrays = {alias: pa.array(range(len(store.lengths)), pa.int32())}
+            for name in columns:
+                arrays[name] = store.column(name)
+            tables[columns_key(alias)] = pa.table(arrays)
+        return tables
 
     def finish(self, response, coordinator_wall: float = 0.0) -> QueryResult:
         """Finish the physical graph and attach execution details."""

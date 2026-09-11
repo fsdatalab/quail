@@ -12,11 +12,17 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 PAIRS_PREFIX = "pairs:"
+COLUMNS_PREFIX = "columns:"
 
 
 def pairs_key(written_pos: int) -> str:
     """The request relation key of one join's pair table."""
     return f"{PAIRS_PREFIX}{written_pos}"
+
+
+def columns_key(alias: str) -> str:
+    """The request relation key of one alias's value table."""
+    return f"{COLUMNS_PREFIX}{alias}"
 
 
 def pair_table(left_alias: str, left_keys, right_alias: str,

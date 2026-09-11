@@ -3,7 +3,7 @@
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
-from quail.physical import PhysicalGraph, PhysicalNode, PortRef
+from quail.physical import PhysicalGraph, PhysicalNode, PortRef, validate_streams
 from quail.physical.codec import plan_envelope
 from quail.specs import MODELS
 
@@ -52,6 +52,7 @@ class PhysicalPlan:
         )
         graph = PhysicalGraph(tuple(self.nodes), root)
         graph.validate()
+        validate_streams(graph)
         object.__setattr__(self, "nodes", graph.nodes)
         object.__setattr__(self, "root", graph.root)
         object.__setattr__(self, "graph", graph)

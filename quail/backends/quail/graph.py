@@ -13,13 +13,14 @@ from quail.physical import (
     AiJoin,
     PhysicalGraph,
 )
-from quail.runtime.pairs import partner_map
+from quail.runtime.pairs import columns_key, partner_map
 from quail.runtime.runner import (
     ExecutionContext,
     GenericRunner,
     ModelNodeRuntime,
     NodeMetrics,
     NodeResult,
+    StreamedPairs,
     SurvivorStream,
     compute_subgraph,
     scalar_node_metrics,
@@ -60,31 +61,43 @@ def _tuple_suffix(join, docs, member):
     return chain_tokens(*parts)
 
 
-def equality_partner(join: dict) -> str:
-    """The partner alias a stage's equality conditions pair with its anchor."""
-    partners = {alias for condition in join["equalities"]
-                for alias in (condition[0], condition[2])
-                if alias != join["anchor"]}
+def runs_over_pairs(join: dict) -> bool:
+    """Whether a stage streams each anchor's own pairs."""
+    return bool(join.get("equalities") or join.get("pairs_from"))
+
+
+def pair_partner(join: dict) -> str:
+    """The partner alias a pair stage pairs with its anchor."""
+    if join["equalities"]:
+        partners = {alias for condition in join["equalities"]
+                    for alias in (condition[0], condition[2])
+                    if alias != join["anchor"]}
+    else:
+        partners = set(join["partners"])
     if len(partners) != 1 or not partners <= set(join["partners"]):
         raise ValueError(
-            f"join conditions {join['equalities']} must relate the anchor "
-            f"{join['anchor']!r} to one partner of {join['partners']}")
+            f"a join over pairs relates the anchor {join['anchor']!r} to "
+            f"one partner of {join['partners']}")
     return partners.pop()
 
 
-def partner_maps(group, pair_tables) -> dict:
-    """Written position -> anchor row -> partner rows, per pair stage."""
+def partner_maps(group, pair_tables, streamed=()) -> dict:
+    """Written position -> anchor row -> partner rows, per pair stage.
+
+    streamed names the written positions whose pairs arrive per batch
+    and need no table here.
+    """
     maps = {}
     for join in group:
-        if not join["equalities"]:
+        if not runs_over_pairs(join) or join["written_pos"] in streamed:
             continue
         table = pair_tables.get(join["written_pos"])
         if table is None:
             raise ValueError(
-                f"join {join['written_pos']} has equality conditions but "
-                f"the request carries no pair table for it")
+                f"join {join['written_pos']} runs over pairs but no pair "
+                f"table reached it")
         maps[join["written_pos"]] = partner_map(
-            table, join["anchor"], equality_partner(join))
+            table, join["anchor"], pair_partner(join))
     return maps
 
 
@@ -104,10 +117,10 @@ def partner_list_builder(group, tuples_by_stage, maps):
     """
     stage_maps = []
     for join, tuples in zip(group, tuples_by_stage):
-        if not join["equalities"]:
+        if not runs_over_pairs(join):
             stage_maps.append(None)
             continue
-        position = join["partners"].index(equality_partner(join))
+        position = join["partners"].index(pair_partner(join))
         members = {}
         for index, member in enumerate(tuples):
             members.setdefault(int(member[position]), []).append(index)
@@ -134,7 +147,7 @@ def stage_partner_lists(group, lists_for, anchor_ids) -> list:
     """Per stage, anchor local index -> member indices, or None."""
     out = []
     for index, join in enumerate(group):
-        if lists_for is None or not join["equalities"]:
+        if lists_for is None or not runs_over_pairs(join):
             out.append(None)
             continue
         out.append({local: lists_for(anchor)[index]
@@ -191,11 +204,21 @@ def prepare_model_inputs(node, inputs, context: ExecutionContext):
     state["pipeline"].attention_mode = JOIN_ATTENTION
     stream = None
     by_alias = {}
+    port_pairs = {}        # written position -> pair table from a port
+    streamed_pairs = {}    # written position -> StreamedPairs
     for input_port in node.inputs:
-        if not input_port.source.port.startswith("ids:"):
-            continue
-        alias = input_port.source.port.split(":", 1)[1]
+        port = input_port.source.port
         value = inputs[input_port.name]
+        if port.startswith("pairs:"):
+            position = int(port.split(":", 1)[1])
+            if isinstance(value, StreamedPairs):
+                streamed_pairs[position] = value
+            else:
+                port_pairs[position] = value
+            continue
+        if not port.startswith("ids:"):
+            continue
+        alias = port.split(":", 1)[1]
         if isinstance(value, SurvivorStream):
             if alias != node.anchor or not isinstance(value.node, AiFilter):
                 raise TypeError(
@@ -230,11 +253,27 @@ def prepare_model_inputs(node, inputs, context: ExecutionContext):
             _tuple_suffix(join, state["docs"], member)
             for member in tuples
         ])
-    # a stage with equality conditions streams each anchor against
-    # its own pairs; the pair tables came with the request
+    # a stage over pairs streams each anchor against its own pairs:
+    # from the request's pair tables, a Foreign node's table, or the
+    # rows a per-batch Foreign node fills in as the chain hands
+    # anchors over
+    maps = partner_maps(group, {**state.get("pairs", {}), **port_pairs},
+                        streamed=set(streamed_pairs))
+    for position, pairs in streamed_pairs.items():
+        maps[position] = pairs.rows
     lists_for = partner_list_builder(
         group, [tuple_indices[stage.written_pos] for stage in node.stages],
-        partner_maps(group, state.get("pairs", {})))
+        maps)
+    anchor_batch = None
+    if stream is not None and (stream.transforms or streamed_pairs):
+        def anchor_batch(keys, stream=stream):
+            ids = [key[1] for key in keys]
+            for transform in stream.transforms:
+                ids = list(transform(ids))
+            for pairs in streamed_pairs.values():
+                pairs.rows.update(pairs.batch(ids))
+            kept = set(ids)
+            return [key for key in keys if key[1] in kept]
     if stream is None:
         anchor_ids = by_alias[node.anchor]
         prefixes = [
@@ -297,6 +336,7 @@ def prepare_model_inputs(node, inputs, context: ExecutionContext):
         "anchor_ids": anchor_ids,
         "partner_indices": tuple_indices,
         "anchor_partners": lists_for,
+        "anchor_batch": anchor_batch,
         "group": group,
     }
 
@@ -345,6 +385,8 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
         alias: range(len(documents))
         for alias, documents in docs.items()
     }
+    for alias, table in state.get("columns", {}).items():
+        sources[columns_key(alias)] = table
     runtime_state = {
         **state,
         "pre": payload.get("pre_ids") or [],
@@ -372,6 +414,7 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
         model_inputs=prepare_model_inputs,
         model_result=record_model_result,
         state=runtime_state,
+        functions=state.get("functions", {}),
     )
     started = time.perf_counter()
     with torch.inference_mode():

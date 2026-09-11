@@ -21,6 +21,7 @@ class ValueType(str, Enum):
     DOCUMENT_IDS = "document_ids"
     FILTER_ANSWERS = "filter_answers"
     JOIN_ANSWERS = "join_answers"
+    PAIRS = "pairs"
     ROWS = "rows"
     ANY = "any"
 
@@ -60,6 +61,8 @@ def value_type_for_port(name: str) -> ValueType:
         return ValueType.FILTER_ANSWERS
     if name.startswith("join_answers:"):
         return ValueType.JOIN_ANSWERS
+    if name.startswith("pairs:"):
+        return ValueType.PAIRS
     if name in {"tuples", "rows"}:
         return ValueType.ROWS
     return ValueType.ANY

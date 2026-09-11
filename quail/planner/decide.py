@@ -4,6 +4,8 @@ from dataclasses import replace
 
 from quail.executor.retention import retention_pages
 from quail.logical import (
+    Apply,
+    CompileError,
     Join,
     LogicalPlan,
     Project,
@@ -18,6 +20,7 @@ from quail.physical import (
     Barrier,
     Exchange,
     FilterStage,
+    Foreign,
     JoinStage,
     Limit,
     PortRef,
@@ -54,6 +57,8 @@ def collect_operators(plan: LogicalPlan):
         elif isinstance(node, Join):
             walk(node.left)
             walk(node.right)
+        elif isinstance(node, Apply):
+            walk(node.input)
         elif isinstance(node, SemanticFilter):
             walk(node.input)
             filters[node.input.alias] = list(node.predicates)
@@ -65,6 +70,11 @@ def collect_operators(plan: LogicalPlan):
 
     walk(plan.root)
     return scans, filters, joins
+
+
+def collect_applies(plan: LogicalPlan) -> list:
+    """Return the Apply nodes of a plan, children before parents."""
+    return [node for node in plan.walk() if isinstance(node, Apply)]
 
 
 def _question_tokens(prompt) -> int:
@@ -318,6 +328,26 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
             cross product its equality conditions keep.
     """
     scans, filters, joins = collect_operators(plan)
+    applies = collect_applies(plan)
+    alias_applies = {}
+    join_applies = {}
+    for apply in applies:
+        if apply.ids == "pairs":
+            join_applies.setdefault(apply.written_pos, []).append(apply)
+        else:
+            alias_applies.setdefault(apply.aliases[0], []).append(apply)
+    names = [apply.function for apply in applies]
+    if len(set(names)) != len(names):
+        raise CompileError(
+            f"each apply() needs its own name; {names} repeat one")
+    if any(len(group) > 1 for group in join_applies.values()):
+        raise CompileError("a join takes one apply() returning pairs")
+    if gpus > 1 and any(apply.kind == "per_batch" for apply in applies):
+        return Refusal(
+            reasons=("per-batch apply() functions run on one GPU today; "
+                     "use apply_table() or one GPU",),
+            constraint="per_batch_apply_needs_one_gpu",
+            needed=1, available=gpus, unit="gpus")
     length_stats = {a: joinsearch.summarize_alias(t)
                     for a, t in doc_tokens.items()}
     stats = {
@@ -395,13 +425,25 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     # survivors never enter the retention pool. An alias that was a
     # partner first must finish its chain before that earlier group, so
     # its survivors wait in the pool.
+    # a barrier apply needs every survivor at once, so its alias's
+    # chain cannot stream; the same for the anchor of a join whose
+    # pairs a barrier apply returns
+    sequence_groups = retention.group_sequence(seq)
+    barrier_aliases = {alias for alias, group in alias_applies.items()
+                       if any(apply.kind == "barrier" for apply in group)}
+    for group in sequence_groups:
+        anchor = group[0][1]
+        for spec, _ in group:
+            if any(apply.kind == "barrier"
+                   for apply in join_applies.get(spec["written_pos"], ())):
+                barrier_aliases.add(anchor)
     streamed = {}
     partner_before = set()
-    sequence_groups = retention.group_sequence(seq)
     for index, group in enumerate(sequence_groups):
         anchor = group[0][1]
         if anchor in filters and anchor not in streamed \
-                and anchor not in partner_before:
+                and anchor not in partner_before \
+                and anchor not in barrier_aliases:
             streamed[anchor] = index
         for spec, _ in group:
             for alias in spec["aliases"]:
@@ -519,10 +561,27 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
             remarks.append(
                 f"filter on {alias!r}: arena writes off (one "
                 f"stage - nothing reads the KV again)")
+        emit_applies(alias)
+
+    def emit_applies(alias):
+        # a user function on one table sits right after its filter
+        # chain (or its scan) and hands the chain's output on
+        for apply in alias_applies.get(alias, ()):
+            aid = f"apply:{apply.function}"
+            nodes.append(Foreign(
+                node_id=aid,
+                inputs=input_ports((ids_src[alias],)),
+                function=apply.function, kind=apply.kind, ids=apply.ids,
+                columns=tuple((ref.alias, ref.column)
+                              for ref in apply.columns),
+                aliases=(alias,)))
+            ids_src[alias] = PortRef(aid, f"ids:{alias}")
 
     for s in scans:
         if s.alias in filters and s.alias not in streamed:
             emit_filter(s.alias)
+        elif s.alias not in filters:
+            emit_applies(s.alias)
 
     # group consecutive full stages on the same anchor; gates run
     # alone; anchor switches become barriers
@@ -571,8 +630,24 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
         gid = f"group:{g}"
         stage_dicts = []
         in_aliases = [anchor]
+        pair_inputs = []
         for spec, record in group["members"]:
             partners = [a for a in spec["aliases"] if a != anchor]
+            pairs_from = ""
+            for apply in join_applies.get(spec["written_pos"], ()):
+                # the function's pairs reach the join on their own port
+                aid = f"apply:{apply.function}"
+                nodes.append(Foreign(
+                    node_id=aid,
+                    inputs=input_ports(tuple(
+                        ids_src[a] for a in apply.aliases)),
+                    function=apply.function, kind=apply.kind, ids="pairs",
+                    columns=tuple((ref.alias, ref.column)
+                                  for ref in apply.columns),
+                    aliases=tuple(apply.aliases),
+                    written_pos=spec["written_pos"]))
+                pair_inputs.append(PortRef(aid, f"pairs:{spec['written_pos']}"))
+                pairs_from = apply.function
             stage_dicts.append(JoinStage(
                 written_pos=spec["written_pos"], exec_idx=exec_idx,
                 anchor=anchor, partners=tuple(partners),
@@ -584,7 +659,8 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                 anchor_resident=record["resident"],
                 tuple_tokens=round(record["tokens"], 1),
                 equalities=tuple(tuple(c) for c in spec["on"]),
-                pair_fraction=spec["pair_fraction"]))
+                pair_fraction=spec["pair_fraction"],
+                pairs_from=pairs_from))
             exec_idx += 1
             for a in partners:
                 if a not in in_aliases:
@@ -598,7 +674,8 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                         out_aliases.append(a)
         nodes.append(AiJoin(
             node_id=gid,
-            inputs=input_ports(tuple(ids_src[a] for a in in_aliases)),
+            inputs=input_ports(tuple(ids_src[a] for a in in_aliases)
+                               + tuple(pair_inputs)),
             anchor=anchor,
             anchor_resident=group["members"][0][1]["resident"],
             keep_anchor_kv=anchor in retention_plan["after"][gid],

@@ -4,7 +4,12 @@ import time
 
 from quail.backends import BackendExecutionContext
 from quail.execution import PhysicalRequest, PhysicalResponse
-from quail.physical import Scan, check_plan_envelope, decode_graph
+from quail.physical import (
+    Scan,
+    check_plan_envelope,
+    decode_graph,
+    validate_streams,
+)
 from quail.planner.plan import Refusal
 from quail.runtime.session import RefusalError
 
@@ -32,6 +37,7 @@ def _validate_physical_request(request, registry):
     graph = decode_graph(envelope["graph"], registry.codecs)
     graph.validate(runtime_keys=set(registry.runtimes))
     graph.validate_backend(envelope["backend"])
+    validate_streams(graph)
     needed_inputs = {
         node.input_id for node in graph.nodes
         if isinstance(node, Scan)

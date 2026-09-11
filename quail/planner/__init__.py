@@ -7,6 +7,7 @@ The names below are the planning interface a model backend uses.
 
 from .decide import (
     balanced_shards,
+    collect_applies,
     collect_operators,
     default_order_rule,
     explain,
@@ -24,6 +25,7 @@ __all__ = [
     "PhysicalPlan",
     "Refusal",
     "balanced_shards",
+    "collect_applies",
     "collect_operators",
     "default_order_rule",
     "explain",

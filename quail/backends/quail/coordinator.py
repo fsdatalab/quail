@@ -4,7 +4,7 @@ Pure dict-and-list logic (no torch). Called by the worker's parent
 process between child GPUs.
 """
 
-from quail.backends.quail.graph import equality_partner
+from quail.backends.quail.graph import pair_partner, runs_over_pairs
 from quail.execution import join_answer_cells
 from quail.planner import balanced_shards
 from quail.runtime.pairs import partner_map
@@ -123,7 +123,8 @@ def thin_survivors(full_stage_outs: list, survivors: dict) -> dict:
 def join_group_payloads(payload: dict, k: int, survivors: dict,
                         group: list, prior_shards: dict | None = None,
                         *, filtered_aliases: set[str] | None = None,
-                        shards: dict | None = None) -> list:
+                        shards: dict | None = None,
+                        pair_tables: dict | None = None) -> list:
     """Build per-worker sub-payloads for one anchor group's join round.
 
     Anchors follow the shards their KV already sits on - the shards of
@@ -175,13 +176,14 @@ def join_group_payloads(payload: dict, k: int, survivors: dict,
             "docs": select_documents(payload["docs"][alias], indices),
         }
     # a pair stage ships each worker its anchors' live partner rows
+    tables = {**payload.get("pairs", {}), **(pair_tables or {})}
     pair_rows = {}
     for j in group:
-        if not j.get("equalities"):
+        if not runs_over_pairs(j):
             continue
-        partner_alias = equality_partner(j)
+        partner_alias = pair_partner(j)
         live_partners = set(partners[partner_alias]["index"])
-        rows = partner_map(payload["pairs"][j["written_pos"]],
+        rows = partner_map(tables[j["written_pos"]],
                            anchor_alias, partner_alias)
         pair_rows[j["written_pos"]] = {
             anchor: [p for p in matched if p in live_partners]

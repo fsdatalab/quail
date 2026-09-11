@@ -10,6 +10,8 @@ from quail.physical import (
     Barrier,
     Exchange,
     ExecutionLocation,
+    Foreign,
+    GraphValidationError,
     Limit,
     PhysicalGraph,
     PhysicalNode,
@@ -19,6 +21,7 @@ from quail.physical import (
     Scan,
     ValueType,
 )
+from quail.runtime.pairs import columns_key
 from quail.runtime.result import (
     IndexRelation,
     QueryResult,
@@ -107,11 +110,32 @@ class SurvivorStream:
 
     The consumer drives the producer's chain and writes what it
     learned into holder; the producer's finalize reads it back.
+    transforms are per-batch functions (ids -> kept ids) that
+    per-batch Foreign nodes between the producer and the consumer
+    added; the consumer runs them on each batch before admission.
     """
 
     node: PhysicalNode
     document_ids: Any
     holder: dict = field(default_factory=dict)
+    transforms: tuple = ()
+
+
+@dataclass
+class StreamedPairs:
+    """Pairs a per-batch Foreign node returns for a survivor stream.
+
+    The consuming join calls batch(ids) on each batch the stream
+    hands over, after the stream's own transforms, and reads the
+    anchor -> partner rows it fills into rows.
+    """
+
+    stream: SurvivorStream
+    anchor: str
+    partner: str
+    written_pos: int
+    batch: Callable[[list], dict]
+    rows: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -162,6 +186,7 @@ class ExecutionContext:
     ] | None = None
     state: dict[str, Any] = field(default_factory=dict)
     observers: tuple[ExecutionObserver, ...] = ()
+    functions: Mapping[str, Callable[..., Any]] = field(default_factory=dict)
 
     def execute_graph(self, graph: PhysicalGraph) -> RunResult:
         """Execute a child graph with the same model state."""
@@ -367,6 +392,192 @@ class BarrierRuntime:
         })
 
 
+def _ids_of(value) -> list:
+    """Ids from a list, an Arrow array, or a one-column Arrow table."""
+    import pyarrow as pa
+
+    if isinstance(value, pa.Table):
+        if value.num_columns != 1:
+            raise ValueError("an apply() returning ids must return one "
+                             "column, an array, or a list of ids")
+        value = value.column(0)
+    if isinstance(value, (pa.Array, pa.ChunkedArray)):
+        value = value.to_pylist()
+    return [int(document) for document in value]
+
+
+def _pairs_of(value, left: str, right: str) -> list:
+    """(left, right) id pairs from an Arrow table with both alias columns."""
+    import pyarrow as pa
+
+    if not isinstance(value, pa.Table) or not {left, right} <= set(
+            value.column_names):
+        raise ValueError(
+            f"an apply() returning pairs must return an Arrow table with "
+            f"columns {left!r} and {right!r}")
+    return list(zip(_ids_of(value.column(left)), _ids_of(value.column(right))))
+
+
+def alias_table(alias: str, ids, columns, names):
+    """The Arrow table an apply() function sees for one alias.
+
+    Its first column is the alias's row indices under the alias
+    name; the rest are the requested value columns for those rows.
+    """
+    import pyarrow as pa
+
+    ids = [int(document) for document in ids]
+    arrays = {alias: pa.array(ids, type=pa.int32())}
+    for name in names:
+        if columns is None or name not in columns.column_names:
+            raise KeyError(
+                f"apply() needs column {alias}.{name}, which the request "
+                f"did not carry")
+        arrays[name] = columns.column(name).take(pa.array(ids, pa.int64()))
+    return pa.table(arrays)
+
+
+class ForeignRuntime:
+    """Call a user function on ids and values, once or per batch."""
+
+    def execute(self, node, inputs, context) -> NodeResult:
+        import pyarrow as pa
+
+        if not isinstance(node, Foreign):
+            raise TypeError(type(node).__name__)
+        function = context.functions.get(node.function)
+        if function is None:
+            raise KeyError(
+                f"apply() function {node.function!r} is not registered on "
+                f"this session")
+        values = {}
+        for port in node.inputs:
+            if port.source.port.startswith("ids:"):
+                values[port.source.port.split(":", 1)[1]] = inputs[port.name]
+        missing = [alias for alias in node.aliases if alias not in values]
+        if missing:
+            raise GraphValidationError(
+                f"{node.node_id!r} has no id input for {missing}")
+        columns = {alias: context.sources.get(columns_key(alias))
+                   for alias in node.aliases}
+        names = {alias: [column for owner, column in node.columns
+                         if owner == alias] for alias in node.aliases}
+        counters = dict(calls=0, input_rows=0, output_rows=0)
+
+        def call(ids_by_alias):
+            tables = {alias: alias_table(alias, ids, columns[alias],
+                                         names[alias])
+                      for alias, ids in ids_by_alias.items()}
+            counters["calls"] += 1
+            counters["input_rows"] += sum(
+                len(ids) for ids in ids_by_alias.values())
+            result = function(tables)
+            if node.ids == "pairs":
+                left, right = node.aliases
+                pairs = _pairs_of(result, left, right)
+                allowed = {alias: set(ids) for alias, ids in ids_by_alias.items()}
+                for a, b in pairs:
+                    if a not in allowed[left] or b not in allowed[right]:
+                        raise ValueError(
+                            f"apply() {node.function!r} returned pair "
+                            f"({a}, {b}) outside its input ids")
+                counters["output_rows"] += len(pairs)
+                return pairs
+            (alias,) = node.aliases
+            kept = _ids_of(result)
+            given = set(ids_by_alias[alias])
+            if not set(kept) <= given:
+                raise ValueError(
+                    f"apply() {node.function!r} returned ids it was not "
+                    f"given; a function never invents an id")
+            if node.ids == "preserve" and set(kept) != given:
+                raise ValueError(
+                    f"apply() {node.function!r} preserves ids but dropped "
+                    f"{len(given) - len(set(kept))}")
+            counters["output_rows"] += len(kept)
+            return kept
+
+        def metrics():
+            return NodeMetrics(
+                input_rows=counters["input_rows"],
+                output_rows=counters["output_rows"],
+                extension={"calls": counters["calls"]})
+
+        def pair_table(pairs):
+            left, right = node.aliases
+            return pa.table({
+                left: pa.array([a for a, _ in pairs], type=pa.int32()),
+                right: pa.array([b for _, b in pairs], type=pa.int32()),
+            })
+
+        streams = {alias: value for alias, value in values.items()
+                   if isinstance(value, SurvivorStream)}
+        if node.kind == "barrier" and streams:
+            raise GraphValidationError(
+                f"{node.node_id!r} is a barrier but reads a survivor "
+                f"stream; the planner should have materialized it")
+        if len(streams) > 1:
+            raise GraphValidationError(
+                f"{node.node_id!r} reads two survivor streams")
+
+        if not streams:
+            ids_by_alias = {}
+            for alias in node.aliases:
+                value = values[alias]
+                if isinstance(value, pa.Table):
+                    value = value.column(alias).to_pylist()
+                ids_by_alias[alias] = list(value)
+            result = call(ids_by_alias)
+            if node.ids == "pairs":
+                outputs = {f"pairs:{node.written_pos}": pair_table(result)}
+            else:
+                outputs = {f"ids:{node.aliases[0]}": result}
+            return NodeResult(outputs, metrics())
+
+        # per batch on a stream: the consuming join runs the batch
+        # function on each batch the chain hands over
+        (stream_alias, stream), = streams.items()
+        produced = []
+        if node.ids == "pairs":
+            partner = next(alias for alias in node.aliases
+                           if alias != stream_alias)
+            partner_ids = list(values[partner])
+
+            def batch(ids):
+                pairs = call({stream_alias: ids, partner: partner_ids})
+                produced.extend(pairs)
+                rows = {}
+                for a, b in pairs:
+                    anchor, other = (a, b) if stream_alias == node.aliases[0] \
+                        else (b, a)
+                    rows.setdefault(anchor, []).append(other)
+                return rows
+
+            port = f"pairs:{node.written_pos}"
+            outputs = {port: StreamedPairs(
+                stream, stream_alias, partner, node.written_pos, batch)}
+
+            def finalize():
+                ordered = produced if stream_alias == node.aliases[0] \
+                    else [(b, a) for a, b in produced]
+                return NodeResult({port: pair_table(ordered)}, metrics())
+        else:
+            def batch(ids):
+                kept = call({stream_alias: ids})
+                produced.extend(kept)
+                return kept
+
+            port = f"ids:{stream_alias}"
+            outputs = {port: SurvivorStream(
+                stream.node, stream.document_ids, stream.holder,
+                stream.transforms + (batch,))}
+
+            def finalize():
+                return NodeResult({port: sorted(produced)}, metrics())
+
+        return NodeResult(outputs, finalize=finalize)
+
+
 class RecombineRuntime:
     """Run the configured exact answer relation join."""
 
@@ -464,6 +675,7 @@ def built_in_runtimes() -> dict[str, NodeRuntime]:
         Scan.runtime_key: ScanRuntime(),
         Barrier.runtime_key: BarrierRuntime(),
         Exchange.runtime_key: ExchangeRuntime(),
+        Foreign.runtime_key: ForeignRuntime(),
         Recombine.runtime_key: RecombineRuntime(),
         Project.runtime_key: ProjectRuntime(),
         Limit.runtime_key: LimitRuntime(),

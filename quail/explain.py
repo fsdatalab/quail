@@ -9,6 +9,7 @@ from quail.physical import (
     AiJoin,
     Barrier,
     Exchange,
+    Foreign,
     Limit,
     PortRef,
     Project,
@@ -81,6 +82,10 @@ def logical_tree(logical):
             title = "Join"
             details = ([f"on {condition}" for condition in node.on]
                        or ["cross"])
+        elif isinstance(node, logical_nodes.Apply):
+            title = f"Apply {node.function} ({node.kind}, {node.ids})"
+            details = ["columns: " + ", ".join(
+                f"{ref.alias}.{ref.column}" for ref in node.columns)]
         else:
             title = node.type_name
             details = _fields(node.explain_fields(), 0)
@@ -133,6 +138,8 @@ def _estimated_rows(graph):
             value = inputs[0]
             if isinstance(node, Limit) and value is not None:
                 value = min(value, node.count)
+        elif isinstance(node, Foreign) and node.ids == "preserve":
+            value = inputs[0] if inputs else None
         # Join nodes expose both document ids and predicate answers.
         # Their evaluated tuple counts are not output row estimates.
         for output in node.outputs:
@@ -217,11 +224,19 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None):
                     f"{right_alias}.{right_column}"
                     for left_alias, left_column, right_alias, right_column
                     in stage.equalities)
+                if stage.pairs_from:
+                    pairs += f" over pairs from {stage.pairs_from}"
                 details.append(
                     f"{index}. {stage.semantics} ({stage.anchor}, "
                     f"{', '.join(stage.partners)}){pairs}: {predicate} "
                     f"(selectivity={_selectivity(stage.selectivity)}, "
                     f"estimated_evaluations={_number(stage.expected_tuples)})")
+        elif isinstance(node, Foreign):
+            title += (f": {node.function} ({node.kind}, {node.ids}) on "
+                      f"{', '.join(node.aliases)}")
+            if node.columns:
+                details.append("columns: " + ", ".join(
+                    f"{alias}.{column}" for alias, column in node.columns))
         elif isinstance(node, Exchange):
             title += f": {node.anchor} to the GPU holding its KV"
         elif isinstance(node, Barrier):

@@ -374,7 +374,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
 def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
              stage_suffixes, budget, stage_frames=None,
              anchor_keys=None, anchor_done=None, anchor_source=None,
-             attention_mode=None, anchor_partners=None):
+             attention_mode=None, anchor_partners=None, anchor_batch=None):
     """The join driver: stream partner lists against anchors.
 
     Survivors are gated between stages.
@@ -410,6 +410,9 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
             the indices into that stage's partner list the anchor
             streams, or None for the whole list. Omitted means every
             anchor streams every partner.
+        anchor_batch: Optional callable(keys) -> the keys to admit, run
+            on each batch the source hands over before admission. A
+            key it leaves out is freed, never admitted.
 
     Returns:
         (ans, spans, tokens): ans[j][a] = 0/1 row over the stage-j
@@ -476,6 +479,12 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     finished = [0]
 
     def admit(items):
+        if anchor_batch is not None and items:
+            kept = set(anchor_batch([key for key, _ in items]))
+            for key, _ in items:
+                if key not in kept and key in owned:
+                    arena.free_key(key)
+            items = [(key, prefix) for key, prefix in items if key in kept]
         for key, prefix in items:
             if key not in owned:
                 raise ValueError(

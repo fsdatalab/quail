@@ -167,6 +167,7 @@ def quail_runtime_payload(request, graph) -> dict:
         "workers": envelope["workers"],
         "docs": docs,
         "pairs": request.pair_tables(),
+        "columns": request.column_tables(),
         **dict(envelope["settings"]),
     }
 
@@ -311,6 +312,8 @@ def execute_single(state, payload: dict, registry, graph) -> dict:
         **state,
         "docs": decode_payload_documents(payload["docs"]),
         "pairs": payload.get("pairs", {}),
+        "columns": payload.get("columns", {}),
+        "functions": registry.functions,
         "runtimes": registry.runtimes,
         "model_spec": state.get("spec") or state.get("model_spec"),
         "device": registry.device(payload["physical_plan"]["device"]),
@@ -558,6 +561,7 @@ def _child_joins(state, sub):
                     for stage, tuples in zip(node.stages, tuple_globs)
                 },
                 "anchor_partners": lists_for,
+                "anchor_batch": None,
                 "group": group,
             },
             runtime_context,

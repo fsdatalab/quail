@@ -7,6 +7,7 @@ from typing import Any, ClassVar, Mapping
 
 from .base import (
     ExecutionLocation,
+    GraphValidationError,
     OutputPort,
     PhysicalNode,
     ValueType,
@@ -62,6 +63,8 @@ class JoinStage:
     # right column); the stage streams only the pairs they allow
     equalities: tuple[tuple[str, str, str, str], ...] = ()
     pair_fraction: float = 1.0
+    # the apply() function whose pairs the stage streams, if any
+    pairs_from: str = ""
     frame_token_ids: tuple[int, ...] = ()
     label_token_ids: tuple[tuple[str, tuple[int, ...]], ...] = ()
     tail_token_ids: tuple[int, ...] = ()
@@ -85,6 +88,7 @@ class JoinStage:
                 for condition in value.get("equalities", ())
             ),
             pair_fraction=float(value.get("pair_fraction", 1.0)),
+            pairs_from=str(value.get("pairs_from", "")),
             frame_token_ids=tuple(value.get("frame_token_ids", ())),
             label_token_ids=tuple(
                 (alias, tuple(tokens))
@@ -108,6 +112,7 @@ class JoinStage:
             "tuple_tokens": self.tuple_tokens,
             "equalities": [list(condition) for condition in self.equalities],
             "pair_fraction": self.pair_fraction,
+            "pairs_from": self.pairs_from,
         }
 
     def to_dict(self) -> dict:
@@ -128,6 +133,7 @@ class JoinStage:
             "selectivity": self.selectivity,
             "written_pos": self.written_pos,
             "equalities": [list(condition) for condition in self.equalities],
+            "pairs_from": self.pairs_from,
             "frame": self.frame_token_ids,
             "labels": dict(self.label_token_ids),
             "tail": self.tail_token_ids,
@@ -550,6 +556,66 @@ class AiJoin(PhysicalNode):
 
 
 @dataclass(frozen=True)
+class Foreign(PhysicalNode):
+    """Call a user function between two operators.
+
+    ``kind`` is ``per_batch`` (called on each batch a survivor stream
+    hands over, or once over a materialized input) or ``barrier``
+    (called once over every survivor; never on a stream). ``ids`` is
+    ``preserve``, ``drop``, or ``pairs``; the function never invents an
+    id. ``columns`` are (alias, column) pairs read as values.
+    """
+
+    function: str = ""
+    kind: str = "per_batch"
+    ids: str = "drop"
+    columns: tuple[tuple[str, str], ...] = ()
+    aliases: tuple[str, ...] = ()
+    written_pos: int = -1
+
+    type_name: ClassVar[str] = "quail.foreign"
+    runtime_key: ClassVar[str] = type_name
+    location: ClassVar[ExecutionLocation] = ExecutionLocation.GPU_EXECUTOR
+
+    @property
+    def outputs(self) -> tuple[OutputPort, ...]:
+        if self.ids == "pairs":
+            return (OutputPort(
+                f"pairs:{self.written_pos}", ValueType.PAIRS,
+                schema=tuple(self.aliases)),)
+        return tuple(
+            OutputPort(f"ids:{alias}", ValueType.DOCUMENT_IDS, schema=(alias,))
+            for alias in self.aliases
+        )
+
+    def attributes(self) -> dict:
+        return {
+            "function": self.function,
+            "kind": self.kind,
+            "ids": self.ids,
+            "columns": [list(column) for column in self.columns],
+            "aliases": list(self.aliases),
+            "written_pos": self.written_pos,
+        }
+
+    @classmethod
+    def from_attributes(cls, node_id, inputs, attributes):
+        return cls(
+            node_id=node_id,
+            inputs=inputs,
+            function=str(attributes["function"]),
+            kind=str(attributes["kind"]),
+            ids=str(attributes["ids"]),
+            columns=tuple(
+                (str(alias), str(column))
+                for alias, column in attributes["columns"]
+            ),
+            aliases=tuple(attributes["aliases"]),
+            written_pos=int(attributes["written_pos"]),
+        )
+
+
+@dataclass(frozen=True)
 class Exchange(PhysicalNode):
     """Route one alias's documents to the GPU that holds their KV.
 
@@ -659,3 +725,45 @@ class Limit(PhysicalNode):
     @classmethod
     def from_attributes(cls, node_id, inputs, attributes):
         return cls(node_id=node_id, inputs=inputs, count=int(attributes["count"]))
+
+
+def validate_streams(graph) -> None:
+    """Check that pinned survivor streams reach their joins as streams.
+
+    A filter that pins its survivors streams them into the join
+    anchored on its alias. On that path only per-batch Foreign nodes
+    may sit; a Barrier, a barrier Foreign, or any other consumer would
+    need the whole set at once, which a stream never has.
+    """
+    consumers: dict[tuple[str, str], list] = {}
+    for node in graph.nodes:
+        for port in node.inputs:
+            consumers.setdefault(
+                (port.source.node_id, port.source.port), []).append(node)
+    for node in graph.nodes:
+        if not isinstance(node, AiFilter) or not node.pin_survivors:
+            continue
+        alias = node.alias
+        reached = []
+
+        def follow(port, alias=alias, node=node, reached=reached):
+            for consumer in consumers.get(port, ()):
+                if isinstance(consumer, AiJoin) and consumer.anchor == alias:
+                    reached.append(consumer)
+                    continue
+                if isinstance(consumer, Foreign) \
+                        and consumer.kind == "per_batch":
+                    out = (f"pairs:{consumer.written_pos}"
+                           if consumer.ids == "pairs" else f"ids:{alias}")
+                    follow((consumer.node_id, out))
+                    continue
+                raise GraphValidationError(
+                    f"{consumer.node_id!r} reads the pinned survivors of "
+                    f"{node.node_id!r}; only a per-batch apply or the join "
+                    f"anchored on {alias!r} can consume a survivor stream")
+
+        follow((node.node_id, f"ids:{alias}"))
+        if not reached:
+            raise GraphValidationError(
+                f"{node.node_id!r} pins its survivors but no join anchored "
+                f"on {alias!r} consumes them")

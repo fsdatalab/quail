@@ -82,8 +82,14 @@ class FixedFeverAnswers:
             # key and prefix
             answers, anchor_ids = self._answers(list(stream["document_ids"]))
             stream["holder"].update(answers=answers, tokens=0)
-            for document in anchor_ids:
-                inputs["anchor_keys"].append((node.anchor, document))
+            keys = [(node.anchor, document) for document in anchor_ids]
+            if inputs.get("anchor_batch") is not None:
+                # like the real driver: per-batch functions run on each
+                # batch before admission and may drop survivors
+                keys = inputs["anchor_batch"](keys)
+            anchor_ids = [key[1] for key in keys]
+            for key in keys:
+                inputs["anchor_keys"].append(key)
                 inputs["prefixes"].append([])
         live = set(range(len(anchor_ids)))
         all_answers = []
@@ -96,7 +102,8 @@ class FixedFeverAnswers:
                        else {(0, 0), (1, 1), (2, 0), (1, 2)})
             partners = inputs["partner_indices"][stage.written_pos]
             # a stage over pairs asks each anchor about its own members
-            members = {} if lists_for and stage.equalities else None
+            members = ({} if lists_for and (stage.equalities or stage.pairs_from)
+                       else None)
             rows = {}
             for local in sorted(live):
                 mine = (range(len(partners)) if members is None

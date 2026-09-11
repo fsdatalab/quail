@@ -14,6 +14,7 @@ from quail.physical import (
     Scan,
 )
 from quail.planner import balanced_shards
+from quail.runtime.pairs import columns_key
 from quail.runtime.runner import (
     ExecutionContext,
     GenericRunner,
@@ -209,6 +210,7 @@ class DistributedQuailExecution:
             prior_shards=self.prior_shards,
             filtered_aliases=filtered_aliases,
             shards=self.shards,
+            pair_tables=inputs.get("pairs"),
         )
         encoded_node = self.registry.codecs[node.type_name].encode(node)
         encoded_filter = (
@@ -337,13 +339,25 @@ def prepare_distributed_inputs(node, inputs, context):
     if isinstance(node, AiJoin):
         survivors = {}
         stream = None
+        pairs = {}
         for port in node.inputs:
             value = inputs[port.name]
+            if port.source.port.startswith("pairs:"):
+                if not hasattr(value, "num_rows"):
+                    raise TypeError(
+                        "per-batch apply() functions run on one GPU; the "
+                        "planner refuses them for several")
+                pairs[int(port.source.port.split(":", 1)[1])] = value
+                continue
             alias = port.source.port.split(":", 1)[1]
             if isinstance(value, SurvivorStream):
                 if alias != node.anchor:
                     raise TypeError(
                         "only the anchor's filter chain streams into a join")
+                if value.transforms:
+                    raise TypeError(
+                        "per-batch apply() functions run on one GPU; the "
+                        "planner refuses them for several")
                 stream = value
             else:
                 survivors[alias] = list(value)
@@ -351,6 +365,7 @@ def prepare_distributed_inputs(node, inputs, context):
             "survivors": survivors,
             "group": [stage.runtime_spec() for stage in node.stages],
             "anchor_stream": stream,
+            "pairs": pairs,
         }
     return inputs
 
@@ -366,12 +381,15 @@ def execute_distributed_graph(payload, graph: PhysicalGraph, gpu_count: int,
         alias: range(len(documents))
         for alias, documents in payload["docs"].items()
     }
+    for alias, table in payload.get("columns", {}).items():
+        sources[columns_key(alias)] = table
     context = ExecutionContext(
         runtimes=runtimes,
         model_execution=execution,
         sources=sources,
         model_inputs=prepare_distributed_inputs,
         state={"distributed_execution": execution},
+        functions=registry.functions,
     )
     started = time.perf_counter()
     if not any(isinstance(node, AiFilter) for node in graph.nodes):

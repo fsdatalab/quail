@@ -66,8 +66,11 @@ class Query:
         self._doc_columns = {}
         self._filters = {}
         self._joins = []
-        self._pending_join = None    # (new aliases, conditions) awaiting
-        #                              the AI predicate over its pairs
+        self._pending_join = None    # (new aliases, conditions, applies)
+        #                              awaiting the AI predicate over
+        #                              its pairs
+        self._applies = {}           # alias -> [(name, kind, ids, refs)]
+        self._functions = {}         # name -> the Python function
         self._limit = None
 
     # ---- scope -------------------------------------------------------
@@ -180,23 +183,105 @@ class Query:
                     f"joined table {new_aliases[0]!r} to a table already "
                     f"in the query")
             resolved.append(Equality(left, right))
-        self._pending_join = (new_aliases, tuple(resolved))
+        self._pending_join = (new_aliases, tuple(resolved), [])
         return self
 
     def _ai_join_pairs(self, p: PromptSpec, selectivity):
-        new_aliases, conditions = self._pending_join
+        new_aliases, conditions, applies = self._pending_join
         bound, aliases = self._bind(p, join=True)
         if len(aliases) != 2 or new_aliases[0] not in aliases:
             raise CompileError(
                 f"the predicate after join() must name the joined "
                 f"table {new_aliases[0]!r} and one other table, got "
                 f"{aliases}")
+        for name, _kind, refs in applies:
+            outside = sorted({ref.alias for ref in refs} - set(aliases))
+            if outside:
+                raise CompileError(
+                    f"apply {name!r} reads tables {outside} that the join "
+                    f"predicate over {aliases} does not join")
         self._pending_join = None
         self._joins.append(JoinSpec(aliases=tuple(new_aliases),
                                     prompt=bound, semantics="full",
                                     selectivity=selectivity,
-                                    anchor=None, on=conditions))
+                                    anchor=None, on=conditions,
+                                    applies=tuple(applies)))
         return self
+
+    def apply(self, fn, columns=(), *, name=None, ids=None,
+              kind="per_batch", alias=None) -> "Query":
+        """Call a Python function between two operators.
+
+        The function receives a dict of Arrow tables keyed by alias:
+        each table holds the alias's row indices under the alias name
+        plus the listed columns. After ``join()`` it returns the pairs
+        the next AI predicate is asked about, as a table with both
+        alias columns. Otherwise it works on one table and returns the
+        ids to keep. A function never invents an id.
+
+        Args:
+            fn: The function. Registered on the session under name.
+            columns: ``col(...)`` references the function reads.
+            name: Registered name; the function's name by default.
+            ids: "drop" (default, may leave ids out), "preserve"
+                (returns every id), or "pairs" (after join()).
+            kind: "per_batch" runs on each batch a streaming operator
+                hands over; "barrier" runs once over every survivor.
+            alias: The table, when no column says which.
+        """
+        if not callable(fn):
+            raise CompileError("apply() needs a callable")
+        name = name or getattr(fn, "__name__", None)
+        if not name or name == "<lambda>":
+            raise CompileError("apply() needs a name for a lambda")
+        if kind not in ("per_batch", "barrier"):
+            raise CompileError(
+                f"apply kind must be per_batch or barrier, got {kind!r}")
+        known = self._functions.get(name)
+        if known is not None and known is not fn:
+            raise CompileError(
+                f"apply name {name!r} is already used by another function")
+        columns = [columns] if isinstance(columns, ColSpec) else list(columns)
+        refs = tuple(self._resolve(spec) for spec in columns)
+        if self._pending_join is not None:
+            if ids not in (None, "pairs"):
+                raise CompileError(
+                    "an apply() after join() returns the pairs to ask "
+                    "about; ids must be 'pairs'")
+            self._pending_join[2].append((name, kind, refs))
+            self._functions[name] = fn
+            return self
+        if ids == "pairs":
+            raise CompileError(
+                "an apply() returning pairs follows join()")
+        ids = ids or "drop"
+        if ids not in ("preserve", "drop"):
+            raise CompileError(
+                f"apply ids must be preserve, drop, or pairs, got {ids!r}")
+        owners = {ref.alias for ref in refs}
+        if alias is not None:
+            if alias not in self._scope():
+                raise CompileError(f"unknown table alias {alias!r}")
+            owners.add(alias)
+        if len(owners) != 1:
+            raise CompileError(
+                f"apply {name!r} must work on one table; its columns "
+                f"name {sorted(owners) or 'none'} (pass alias=...)")
+        (alias,) = owners
+        self._applies.setdefault(alias, []).append((name, kind, ids, refs))
+        self._functions[name] = fn
+        return self
+
+    def apply_table(self, fn, columns=(), *, name=None, ids=None,
+                    alias=None) -> "Query":
+        """Call a function once over every survivor: apply() as a barrier."""
+        return self.apply(fn, columns, name=name, ids=ids, kind="barrier",
+                          alias=alias)
+
+    @property
+    def functions(self) -> dict:
+        """The Python functions apply() calls, by registered name."""
+        return dict(self._functions)
 
     def _absorb(self, others) -> list:
         """Bring other single-table queries into scope; returns aliases."""
@@ -214,6 +299,13 @@ class Query:
             self._tables.append((alias, provider))
             for a, preds in other._filters.items():
                 self._filters.setdefault(a, []).extend(preds)
+            for a, applies in other._applies.items():
+                self._applies.setdefault(a, []).extend(applies)
+            for name, fn in other._functions.items():
+                if self._functions.get(name, fn) is not fn:
+                    raise CompileError(
+                        f"apply name {name!r} is used by two functions")
+                self._functions[name] = fn
             for a, c in other._doc_columns.items():
                 self._note_doc_column(
                     ColumnRef(alias=a, provider=self._scope()[a],
@@ -325,6 +417,7 @@ class Query:
                 provider,
                 self._doc_columns.get(alias, ""),
                 tuple(self._filters.get(alias, ())),
+                tuple(self._applies.get(alias, ())),
             )
         for join in self._joins:
             logical.add_join(join)

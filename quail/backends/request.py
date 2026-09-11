@@ -18,7 +18,7 @@ from quail.backends.request_scheduling import (
     true_bit,
 )
 from quail.execution import PhysicalResponse, export_physical_outputs
-from quail.logical import SHARED_PRE, join_outer_input
+from quail.logical import SHARED_PRE, Apply, join_outer_input
 from quail.physical import (
     Limit,
     PhysicalNode,
@@ -42,7 +42,7 @@ from quail.planner import (
     join_specs as logical_join_specs,
 )
 from quail.planner.joins import search_joins, summarize_alias
-from quail.planner.plan import CorpusStats, PhysicalPlan
+from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
 from quail.planning import PhysicalCandidate, SupportResult
 from quail.runtime.pairs import partner_map
 from quail.runtime.result import answer_table
@@ -80,6 +80,15 @@ def plan_request_backend(
     join_submission: str,
 ) -> tuple[PhysicalCandidate, ...]:
     """Build one physical request plan for a request engine."""
+    if any(isinstance(node, Apply) for node in region.logical_plan.walk()):
+        return (PhysicalCandidate(
+            graph=None,
+            plan=Refusal(
+                reasons=("apply() functions run on the Quail backend only",),
+                constraint="apply_needs_quail_backend",
+                needed=1, available=0, unit="backends"),
+            estimated_seconds=float("inf"),
+        ),)
     scans, filters, joins = collect_operators(region.logical_plan)
     stats = {
         alias: CorpusStats(
@@ -846,6 +855,7 @@ def execute_request_graph(context, backend, engine_state, boot):
                 alias: range(len(value))
                 for alias, value in documents.items()
             },
+            functions=context.registry.functions,
         ),
     )
     metrics = run.metrics

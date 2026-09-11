@@ -170,9 +170,13 @@ class QuailModelExecution:
             attention_mode=JOIN_ATTENTION if source is not None else None,
             anchor_partners=(
                 None if lists_for is None else lambda key: lists_for(key[1])),
+            anchor_batch=inputs.get("anchor_batch"),
         )
         if source is not None:
-            anchor_ids = [filter_ids[document] for document in source.held]
+            # the anchors are the keys the join admitted, in admission
+            # order; a per-batch function may have dropped some held
+            # survivors before admission
+            anchor_ids = [key[1] for key in inputs["anchor_keys"]]
             kv_round = {"hits": len(anchor_ids), "misses": 0,
                         "regret_tokens": 0}
             stream["holder"].update(

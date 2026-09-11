@@ -24,6 +24,7 @@ from .nodes import (
     Barrier,
     Exchange,
     FilterStage,
+    Foreign,
     JoinStage,
     Limit,
     Project,
@@ -32,6 +33,7 @@ from .nodes import (
     RequestFilterSpec,
     RequestJoinSpec,
     Scan,
+    validate_streams,
 )
 
 __all__ = [
@@ -41,6 +43,7 @@ __all__ = [
     "Exchange",
     "ExecutionLocation",
     "FilterStage",
+    "Foreign",
     "GraphValidationError",
     "Recombine",
     "InputPort",
@@ -62,4 +65,5 @@ __all__ = [
     "decode_graph",
     "encode_graph",
     "plan_envelope",
+    "validate_streams",
 ]
