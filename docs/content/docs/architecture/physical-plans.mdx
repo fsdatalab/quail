@@ -47,8 +47,9 @@ Generic nodes any backend can use:
 
 | Node | Location | Job |
 | --- | --- | --- |
-| `DocumentInput` | coordinator | Names one tokenized input by alias and input id, with the document count and optional shard ranges. |
-| `Exchange` | coordinator | Passes survivor ids between rounds when the anchor changes. |
+| `Scan` | coordinator | Names one tokenized input by alias and input id, with the document count and optional shard ranges. |
+| `Barrier` | coordinator | Materializes survivor ids when the anchor changes and prunes them with the finished join answers. |
+| `Exchange` | coordinator | Only with several GPUs: routes one alias's documents to the GPU holding their KV. On one GPU it passes ids through. |
 | `Recombine` | coordinator | Joins TRUE answer relations on shared alias columns with Arrow Acero. Planned only when a query has several full joins or a gate; a lone full join feeds its true pairs straight to `Project`. |
 | `Project` | coordinator | Reads the selected columns for the surviving positions. |
 | `Limit` | coordinator | Cuts the result stream. |
@@ -57,8 +58,8 @@ Quail backend nodes:
 
 | Node | Job |
 | --- | --- |
-| `PackedFilter` | One table's filter stages, with question token ids, arena write flag, and keep-KV flag. |
-| `AnchoredJoin` | One join group with a fixed anchor alias and bound prompt tokens. |
+| `AiFilter` | One table's filter stages, with question token ids, arena write flag, and keep-KV flag. With `pin_survivors` it returns its survivors as a stream that the consuming join drives, each with its KV pinned. |
+| `AiJoin` | One join group with a fixed anchor alias and bound prompt tokens. Its anchor input is a finished list or a survivor stream. |
 
 Request backend node:
 
@@ -118,7 +119,7 @@ Join order and anchors are chosen before inference. The first anchor's filter
 chain runs last. Every filtered set with a future anchor use can retain passing
 document KV in one shared pool. Sets with no future anchor use release their KV.
 
-The executable graph contains the bound `AnchoredJoin` stages and `Exchange`
+The executable graph contains the bound `AiJoin` stages and `Barrier`
 nodes that prune actual survivors. `explain()` shows this saved order.
 Older serialized plans containing `quail.adaptive_join_plan` must be regenerated
 from their logical queries. The public query API is unchanged.

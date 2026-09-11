@@ -26,8 +26,8 @@ with its fields and nonzero metrics:
 <type_name> <node_id> [<explain fields>]  wall_s=<s> rows=<in>-><out> <nonzero metrics>
 ```
 
-For a one-filter query that is a `quail.document_input` line, a
-`quail.packed_filter` line with `evaluated_documents` and
+For a one-filter query that is a `quail.scan` line, a
+`quail.ai_filter` line with `evaluated_documents` and
 `fresh_tokens`, and a `quail.project` line with the row counts.
 
 `NodeMetrics` has `wall_s`, `input_rows`, `output_rows`,

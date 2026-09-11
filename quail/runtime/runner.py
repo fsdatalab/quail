@@ -7,7 +7,7 @@ from dataclasses import dataclass, field, fields, replace
 from typing import Any, Callable, Mapping, Protocol
 
 from quail.physical import (
-    DocumentInput,
+    Barrier,
     Exchange,
     ExecutionLocation,
     Limit,
@@ -16,6 +16,7 @@ from quail.physical import (
     PortRef,
     Project,
     Recombine,
+    Scan,
     ValueType,
 )
 from quail.runtime.result import (
@@ -90,42 +91,27 @@ def scalar_node_metrics(nodes: Mapping[str, "NodeResult"]) -> dict:
 class NodeResult:
     """Outputs and metrics produced by one physical node.
 
-    produced holds the results of streamed producers this node's
-    runtime ran itself, keyed by node id.
+    A node that streams its output returns a provisional result and a
+    finalize callable; the runner calls it after the whole graph has
+    run and stores what it returns as the node's result.
     """
 
     outputs: Mapping[str, Any]
     metrics: NodeMetrics = NodeMetrics()
-    produced: Mapping[str, "NodeResult"] = field(default_factory=dict)
+    finalize: Callable[[], "NodeResult"] | None = None
 
 
-@dataclass(frozen=True)
-class StreamedInput:
-    """A producer node the consumer's runtime runs, with its inputs."""
+@dataclass
+class SurvivorStream:
+    """Survivor ids a GPU operator hands its consumer as it produces them.
+
+    The consumer drives the producer's chain and writes what it
+    learned into holder; the producer's finalize reads it back.
+    """
 
     node: PhysicalNode
-    inputs: Mapping[str, Any]
-
-
-def streamed_producers(graph: PhysicalGraph) -> dict[str, str]:
-    """Map each streamed producer node id to the consumer that runs it."""
-    deferred: dict[str, str] = {}
-    for node in graph.nodes:
-        ports = {input_port.name: input_port for input_port in node.inputs}
-        for name in node.streamed_inputs():
-            producer = ports[name].source.node_id
-            if producer in deferred:
-                raise ValueError(
-                    f"{producer!r} streams into two consumers")
-            deferred[producer] = node.node_id
-    for node in graph.nodes:
-        for input_port in node.inputs:
-            producer = input_port.source.node_id
-            if producer in deferred and deferred[producer] != node.node_id:
-                raise ValueError(
-                    f"{node.node_id!r} reads {producer!r}, which streams "
-                    f"into {deferred[producer]!r}")
-    return deferred
+    document_ids: Any
+    holder: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -182,12 +168,23 @@ class ExecutionContext:
         return GenericRunner().run(graph, self)
 
 
+def _check_ports(node, result) -> None:
+    expected = {output.name for output in node.outputs}
+    missing = expected - set(result.outputs)
+    extra = set(result.outputs) - expected
+    if missing or extra:
+        raise ValueError(
+            f"runtime {node.runtime_key!r} returned wrong ports "
+            f"for {node.node_id!r}; "
+            f"missing={sorted(missing)}, extra={sorted(extra)}")
+
+
 class GenericRunner:
     """Execute nodes after all their inputs are available.
 
-    A node whose output is streamed is not executed on its own: its
-    consumer receives it as a StreamedInput, runs it, and returns its
-    result under NodeResult.produced.
+    A node may return a SurvivorStream on an output port; its consumer
+    drives it. Such a node's result is provisional until the whole
+    graph has run, when the runner calls its finalize.
     """
 
     def run(
@@ -198,32 +195,11 @@ class GenericRunner:
         initial_metrics: Mapping[str, NodeMetrics] | None = None,
     ) -> RunResult:
         graph.validate(runtime_keys=set(context.runtimes))
-        by_id = {node.node_id: node for node in graph.nodes}
-        deferred = streamed_producers(graph)
         values: dict[tuple[str, str], Any] = {
             (ref.node_id, ref.port): value
             for ref, value in (initial_outputs or {}).items()
         }
         node_results: dict[str, NodeResult] = {}
-        producer_inputs: dict[str, Mapping[str, Any]] = {}
-        metrics = NodeMetrics()
-
-        def record(node, result):
-            nonlocal metrics
-            expected = {output.name for output in node.outputs}
-            missing = expected - set(result.outputs)
-            extra = set(result.outputs) - expected
-            if missing or extra:
-                raise ValueError(
-                    f"runtime {node.runtime_key!r} returned wrong ports "
-                    f"for {node.node_id!r}; "
-                    f"missing={sorted(missing)}, extra={sorted(extra)}")
-            for port, value in result.outputs.items():
-                values[(node.node_id, port)] = value
-            node_results[node.node_id] = result
-            metrics = metrics + result.metrics
-            for observer in context.observers:
-                observer.after_node(node, result)
 
         for node in graph.topological_nodes():
             supplied = {
@@ -241,47 +217,49 @@ class GenericRunner:
                     supplied,
                     (initial_metrics or {}).get(node.node_id, NodeMetrics()),
                 )
-                record(node, result)
-                continue
-            inputs = {}
-            for input_port in node.inputs:
-                source = input_port.source.node_id
-                if source in producer_inputs:
-                    inputs[input_port.name] = StreamedInput(
-                        by_id[source], producer_inputs[source])
-                else:
-                    inputs[input_port.name] = values[
-                        (source, input_port.source.port)
+            else:
+                inputs = {
+                    input_port.name: values[
+                        (input_port.source.node_id, input_port.source.port)
                     ]
-            if node.node_id in deferred:
-                producer_inputs[node.node_id] = inputs
-                continue
-            started = time.perf_counter()
-            result = context.runtimes[node.runtime_key].execute(
-                node, inputs, context
-            )
-            if result.metrics.wall_s == 0.0:
-                # a runtime that does not time itself is timed here, so
-                # every executed node carries its wall seconds
-                result = replace(result, metrics=replace(
-                    result.metrics,
-                    wall_s=time.perf_counter() - started,
-                ))
-            expected_produced = {
-                producer for producer, consumer in deferred.items()
-                if consumer == node.node_id and producer in producer_inputs
-            }
-            if set(result.produced) != expected_produced:
-                raise ValueError(
-                    f"runtime {node.runtime_key!r} produced "
-                    f"{sorted(result.produced)}; expected "
-                    f"{sorted(expected_produced)}")
-            for producer_id, produced in result.produced.items():
-                record(by_id[producer_id], produced)
-                del producer_inputs[producer_id]
-            record(node, result)
+                    for input_port in node.inputs
+                }
+                started = time.perf_counter()
+                result = context.runtimes[node.runtime_key].execute(
+                    node, inputs, context
+                )
+                if result.metrics.wall_s == 0.0 and result.finalize is None:
+                    # a runtime that does not time itself is timed here,
+                    # so every executed node carries its wall seconds
+                    result = replace(result, metrics=replace(
+                        result.metrics,
+                        wall_s=time.perf_counter() - started,
+                    ))
+            _check_ports(node, result)
+            for port, value in result.outputs.items():
+                values[(node.node_id, port)] = value
+            node_results[node.node_id] = result
+            if result.finalize is None:
+                for observer in context.observers:
+                    observer.after_node(node, result)
 
         root = (graph.root.node_id, graph.root.port)
+        if isinstance(values[root], SurvivorStream):
+            raise ValueError(
+                f"root output {root[0]!r}.{root[1]!r} is a survivor "
+                "stream that no operator consumed")
+        metrics = NodeMetrics()
+        for node in graph.topological_nodes():
+            result = node_results[node.node_id]
+            if result.finalize is not None:
+                result = result.finalize()
+                _check_ports(node, result)
+                for port, value in result.outputs.items():
+                    values[(node.node_id, port)] = value
+                node_results[node.node_id] = result
+                for observer in context.observers:
+                    observer.after_node(node, result)
+            metrics = metrics + result.metrics
         return RunResult(values[root], node_results, metrics)
 
 
@@ -316,11 +294,11 @@ def compute_subgraph(graph: PhysicalGraph) -> PhysicalGraph:
     )
 
 
-class DocumentInputRuntime:
+class ScanRuntime:
     """Read a prepared source registered by document alias."""
 
     def execute(self, node, inputs, context) -> NodeResult:
-        if not isinstance(node, DocumentInput):
+        if not isinstance(node, Scan):
             raise TypeError(type(node).__name__)
         if node.input_id not in context.sources:
             raise KeyError(
@@ -331,10 +309,21 @@ class DocumentInputRuntime:
 
 
 class ExchangeRuntime:
-    """Prune survivor IDs using completed join answers."""
+    """Pass anchor ids through; several GPUs route them to their KV."""
 
     def execute(self, node, inputs, context) -> NodeResult:
         if not isinstance(node, Exchange):
+            raise TypeError(type(node).__name__)
+        if len(inputs) != 1:
+            raise ValueError("Exchange takes one survivor input")
+        return NodeResult({f"ids:{node.anchor}": next(iter(inputs.values()))})
+
+
+class BarrierRuntime:
+    """Prune survivor IDs using completed join answers."""
+
+    def execute(self, node, inputs, context) -> NodeResult:
+        if not isinstance(node, Barrier):
             raise TypeError(type(node).__name__)
         import pyarrow as pa
         import pyarrow.compute as pc
@@ -465,12 +454,6 @@ class ModelNodeRuntime:
         if not isinstance(result, NodeResult):
             raise TypeError("model execution must return NodeResult")
         if context.model_result is not None:
-            for value in inputs.values():
-                if isinstance(value, StreamedInput) \
-                        and value.node.node_id in result.produced:
-                    context.model_result(
-                        value.node, result.produced[value.node.node_id],
-                        context)
             context.model_result(node, result, context)
         return result
 
@@ -478,7 +461,8 @@ class ModelNodeRuntime:
 def built_in_runtimes() -> dict[str, NodeRuntime]:
     """Return runtimes for the backend independent physical nodes."""
     return {
-        DocumentInput.runtime_key: DocumentInputRuntime(),
+        Scan.runtime_key: ScanRuntime(),
+        Barrier.runtime_key: BarrierRuntime(),
         Exchange.runtime_key: ExchangeRuntime(),
         Recombine.runtime_key: RecombineRuntime(),
         Project.runtime_key: ProjectRuntime(),

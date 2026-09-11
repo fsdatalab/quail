@@ -252,13 +252,13 @@ def test_streamed_edge_runs_through_the_quail_graph(monkeypatch):
     from quail.backends.quail.graph import execute_single_graph
     from quail.builtins import built_in_registry
     from quail.physical import (
-        AnchoredJoin,
-        DocumentInput,
+        AiFilter,
+        AiJoin,
         FilterStage,
         JoinStage,
-        PackedFilter,
         PhysicalGraph,
         PortRef,
+        Scan,
     )
     from quail.physical.base import input_ports
     from quail.specs import DEVICES, MODELS
@@ -299,18 +299,17 @@ def test_streamed_edge_runs_through_the_quail_graph(monkeypatch):
         "model_spec": MODELS["qwen3-4b-fp8"], "device": DEVICES["h100-sxm"],
         "chunk_tokens": 120, "docs": docs,
     }
-    scan_r = DocumentInput(node_id="input:r", alias="r", input_id="r")
-    scan_p = DocumentInput(node_id="input:p", alias="p", input_id="p")
-    chain = PackedFilter(
+    scan_r = Scan(node_id="input:r", alias="r", input_id="r")
+    scan_p = Scan(node_id="input:p", alias="p", input_id="p")
+    chain = AiFilter(
         node_id="filter:r",
         inputs=input_ports((PortRef("input:r", "ids:r"),)),
-        alias="r", arena_writes=True,
+        alias="r", arena_writes=True, pin_survivors=True, hold_tokens=1,
         stages=(FilterStage(0, 1, 0, 0.8, n_docs),
                 FilterStage(1, 1, 0, 0.7, n_docs * 0.8)),
         question_token_ids=((QUESTION,), (QUESTION + 1,)))
-    join = AnchoredJoin(
+    join = AiJoin(
         node_id="group:0", anchor="r", anchor_resident="filter",
-        stream_anchor=True,
         inputs=input_ports((PortRef("filter:r", "ids:r"),
                             PortRef("input:p", "ids:p"))),
         stages=(JoinStage(
@@ -322,7 +321,6 @@ def test_streamed_edge_runs_through_the_quail_graph(monkeypatch):
             tail_token_ids=()),))
     graph = PhysicalGraph((scan_r, chain, scan_p, join),
                           PortRef("group:0", "ids:r"))
-    assert join.streamed_inputs() == ("input:0",)
 
     result = execute_single_graph(
         state, {"filter_limit": None, "pre_ids": [], "retention": {}}, graph)

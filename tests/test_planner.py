@@ -10,10 +10,10 @@ from quail.backends.quail import expected_join_stages
 from quail.builder import col, docs, prompt
 from quail.catalog import Catalog, DocumentProvider
 from quail.physical import (
-    AnchoredJoin,
-    DocumentInput,
-    Exchange,
-    PackedFilter,
+    AiFilter,
+    AiJoin,
+    Barrier,
+    Scan,
 )
 from quail.planner.decide import explain, filter_cost, order_filters, plan_query
 from quail.planner.plan import Refusal
@@ -23,7 +23,7 @@ from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8
 
 
 def filter_chain(plan, alias=None):
-    return next(n for n in plan.nodes if isinstance(n, PackedFilter)
+    return next(n for n in plan.nodes if isinstance(n, AiFilter)
                 and (alias is None or n.alias == alias))
 
 
@@ -82,7 +82,7 @@ def test_gpu_copies_and_memory_refusals(catalog):
             assert plan.workers == gpus
             scan_node = next(
                 node for node in plan.nodes
-                if isinstance(node, DocumentInput)
+                if isinstance(node, Scan)
             )
             assert len(scan_node.shards) == gpus
 
@@ -289,13 +289,13 @@ def test_join_anchors_groups_and_forced_order(catalog):
     # the second stage sees the gate-thinned live counts
     assert stages[1]["expected_tuples"] < 8 * 6
     kinds = node_kinds(plan)
-    assert kinds.count("AnchoredJoin") == 2
-    assert kinds.count("Exchange") == 1
-    barrier = plan.graph.nodes_by_type(Exchange.type_name)[0]
+    assert kinds.count("AiJoin") == 2
+    assert kinds.count("Barrier") == 1
+    barrier = plan.graph.nodes_by_type(Barrier.type_name)[0]
     assert barrier.next_anchor == "p"
     assert set(barrier.aliases) == {"r", "t", "p"}
     # the barrier's outputs feed the second group's inputs
-    group2 = plan.graph.nodes_by_type(AnchoredJoin.type_name)[1]
+    group2 = plan.graph.nodes_by_type(AiJoin.type_name)[1]
     assert all(input_port.source.node_id == barrier.node_id
                for input_port in group2.inputs)
 
@@ -309,8 +309,8 @@ def test_join_anchors_groups_and_forced_order(catalog):
     stages = join_stages(plan)
     assert [s["anchor"] for s in stages] == ["t", "t"]
     kinds = node_kinds(plan)
-    assert kinds.count("AnchoredJoin") == 1
-    assert kinds.count("Exchange") == 0
+    assert kinds.count("AiJoin") == 1
+    assert kinds.count("Barrier") == 0
 
     # stage 1 forced onto t (the short side) is honored; stage 2 is
     # free and switches to p. The remark names the cheaper free plan.
@@ -383,7 +383,7 @@ def test_selective_gates_and_later_kv_reuse(catalog):
     toks = {"r": [400] * 100, "p": [100] * 100, "t": [100] * 100}
     plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
                       doc_tokens=toks)
-    groups = plan.graph.nodes_by_type(AnchoredJoin.type_name)
+    groups = plan.graph.nodes_by_type(AiJoin.type_name)
     assert len(groups) == 2
     assert [group.anchor for group in groups] == ["r", "r"]
     assert groups[0].keep_anchor_kv is True
@@ -433,10 +433,11 @@ def test_join_token_costs_and_retention(catalog):
     # KV pinned, so it retains nothing in the pool
     assert chain.arena_writes is True
     assert chain.keep_kv is False
-    group = plan.graph.nodes_by_type(AnchoredJoin.type_name)[0]
+    assert chain.pin_survivors is True
+    assert chain.hold_tokens > 0
+    group = plan.graph.nodes_by_type(AiJoin.type_name)[0]
     assert group.anchor == "r"
     assert group.anchor_resident == "filter"
-    assert group.stream_anchor is True
     assert group.keep_anchor_kv is False    # nothing consumes r later
 
     # resident anchors pay the frame only - no preamble, no document
@@ -460,7 +461,7 @@ def test_join_token_costs_and_retention(catalog):
                .select("r.id"))
     plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
                       doc_tokens={"r": [300] * 50, "p": [5] * 20})
-    group = plan.graph.nodes_by_type(AnchoredJoin.type_name)[0]
+    group = plan.graph.nodes_by_type(AiJoin.type_name)[0]
     assert group.anchor_resident == "none"
     assert not any("keep KV" in r for r in plan.remarks)
 
@@ -485,13 +486,12 @@ def test_join_token_costs_and_retention(catalog):
             "t": [3000] * 40 + [1000] * 100}
     plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
                       doc_tokens=toks)
-    groups = plan.graph.nodes_by_type(AnchoredJoin.type_name)
+    groups = plan.graph.nodes_by_type(AiJoin.type_name)
     assert [group.anchor for group in groups] == ["r", "t"]
-    assert groups[0].stream_anchor is True
-    assert groups[1].stream_anchor is True
     assert groups[1].anchor_resident == "filter"
-    assert filter_chain(plan, "r").keep_kv is False
-    assert filter_chain(plan, "t").keep_kv is False
+    for alias in ("r", "t"):
+        assert filter_chain(plan, alias).keep_kv is False
+        assert filter_chain(plan, alias).pin_survivors is True
     order = [node.node_id for node in plan.nodes]
     assert order.index("barrier:0") < order.index("filter:t") \
         < order.index("group:1")
@@ -515,13 +515,12 @@ def test_join_token_costs_and_retention(catalog):
     toks = {"r": [300] * 50, "p": [500] * 20, "t": [5] * 20}
     plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
                       doc_tokens=toks, order="as_written")
-    groups = plan.graph.nodes_by_type(AnchoredJoin.type_name)
+    groups = plan.graph.nodes_by_type(AiJoin.type_name)
     assert [group.anchor for group in groups] == ["p", "r"]
-    assert groups[0].stream_anchor is False
-    assert groups[1].stream_anchor is False
     assert groups[1].anchor_resident == "filter"
     chain = filter_chain(plan, "r")
     assert chain.keep_kv is True
+    assert chain.pin_survivors is False
     assert chain.arena_writes is True
     order = [node.node_id for node in plan.nodes]
     assert order.index("filter:r") < order.index("group:0")
@@ -757,7 +756,7 @@ def test_explain_estimates_and_limits(catalog):
         text = explain(logical, plan)
         physical = text.split("physical:", 1)[1]
         assert f"Project: r.id (estimated_rows={expected})" in physical
-        assert f"PackedFilter: r (estimated_rows={expected})" in physical
+        assert f"AiFilter: r (estimated_rows={expected})" in physical
         assert "Scan reviews as r (estimated_rows=100)" in physical
         assert "tokens=40,000" in physical
         assert "node_id=" not in text
@@ -789,7 +788,7 @@ def test_explain_estimates_and_limits(catalog):
     plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
                       doc_tokens={"r": [400] * 100, "p": [40] * 10})
     physical = explain(logical, plan).split("physical:", 1)[1]
-    assert "AnchoredJoin: anchor=" in physical
+    assert "AiJoin: anchor=" in physical
     assert "KV: anchor=" in physical
     assert "estimated_evaluations=" in physical
     assert "(estimated_rows=unknown)" in physical
@@ -797,7 +796,7 @@ def test_explain_estimates_and_limits(catalog):
     assert "survivors stream into the join with KV pinned" in physical
     assert "KV: anchor=streamed from its filter" in physical
     for node in plan.nodes:
-        if isinstance(node, AnchoredJoin):
+        if isinstance(node, AiJoin):
             assert f"anchor={node.anchor}" in physical
             for stage in node.stages:
                 assert f"{stage.semantics} ({stage.anchor}, " in physical

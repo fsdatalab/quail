@@ -8,13 +8,13 @@ from quail.backends.quail.distributed import execute_distributed_graph
 from quail.backends.quail.graph import execute_single_graph
 from quail.builtins import built_in_registry
 from quail.physical import (
-    AnchoredJoin,
-    DocumentInput,
+    AiFilter,
+    AiJoin,
     FilterStage,
     JoinStage,
-    PackedFilter,
     PhysicalGraph,
     PortRef,
+    Scan,
 )
 from quail.physical.base import input_ports
 from quail.runtime.runner import NodeMetrics, NodeResult
@@ -97,13 +97,13 @@ def test_fixed_join_executes_without_optimizer(monkeypatch):
         raise AssertionError("execution called the join optimizer")
 
     monkeypatch.setattr("quail.planner.joins.search_joins", unexpected_search)
-    scan_r = DocumentInput(
+    scan_r = Scan(
         node_id="input:r", alias="r", input_id="r"
     )
-    scan_p = DocumentInput(
+    scan_p = Scan(
         node_id="input:p", alias="p", input_id="p"
     )
-    join = AnchoredJoin(
+    join = AiJoin(
         node_id="join", anchor="r",
         inputs=input_ports((PortRef("input:r", "ids:r"),
                             PortRef("input:p", "ids:p"))),
@@ -122,7 +122,7 @@ def test_fixed_join_executes_without_optimizer(monkeypatch):
 
     class FixedJoinExecution:
         def execute(self, node, inputs):
-            assert isinstance(node, AnchoredJoin)
+            assert isinstance(node, AiJoin)
             answers = [{0: [True, False], 1: [False, True]}]
             return NodeResult(
                 {
@@ -157,7 +157,7 @@ def test_fixed_join_executes_without_optimizer(monkeypatch):
     assert result["fresh_tokens"] == 20
     assert result["joins"][0]["written_pos"] == 0
     assert result["executed_join_plan"][0]["type"] == \
-        AnchoredJoin.type_name
+        AiJoin.type_name
 
 
 def distributed_payload(docs, joins=None):
@@ -199,10 +199,10 @@ def attach_plan(payload, graph):
 
 
 def test_filter_execution_and_retention_inputs(monkeypatch):
-    scan = DocumentInput(
+    scan = Scan(
         node_id="input:d", alias="d", input_id="d"
     )
-    filtered = PackedFilter(
+    filtered = AiFilter(
         node_id="filter:d",
         inputs=input_ports((PortRef("input:d", "ids:d"),)),
         alias="d",
@@ -268,7 +268,7 @@ def test_filter_execution_and_retention_inputs(monkeypatch):
         execution.bind_query(
             torch=fake_torch(), async_answers=object(), chunk_tokens=8192
         )
-        node = PackedFilter(
+        node = AiFilter(
             node_id="filter:d",
             alias="d",
             stages=(FilterStage(0, 1, 1, None, 4),),

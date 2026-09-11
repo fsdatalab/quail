@@ -8,7 +8,7 @@ from quail.backends.quail.coordinator import (
     merge_join_round,
     thin_survivors,
 )
-from quail.physical import PackedFilter
+from quail.physical import AiFilter
 
 
 def payload():
@@ -27,7 +27,7 @@ def payload():
 
 
 def filter_node():
-    return PackedFilter(
+    return AiFilter(
         node_id="filter:r", alias="r", arena_writes=True,
         keep_kv=True, question_token_ids=((7, 7),),
     )

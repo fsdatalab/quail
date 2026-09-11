@@ -14,6 +14,7 @@ from quail.backends.quail.graph import (
     _join_round_kv,
     _tuple_suffix,
     execute_single_graph,
+    filter_result,
 )
 from quail.backends.quail.retention import apply_retention, retain_after_join
 from quail.execution import PhysicalResponse
@@ -22,9 +23,9 @@ from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION, Pipeline
 from quail.executor.loop import AsyncAnswers, warm_kernels
 from quail.executor.model import answer_weights, load_model, resolve_model_path
 from quail.physical import (
-    AnchoredJoin,
-    DocumentInput,
-    PackedFilter,
+    AiFilter,
+    AiJoin,
+    Scan,
     decode_graph,
 )
 from quail.planner import budgets
@@ -155,7 +156,7 @@ def quail_runtime_payload(request, graph) -> dict:
     envelope = request.plan
     docs = {}
     for node in graph.nodes:
-        if not isinstance(node, DocumentInput):
+        if not isinstance(node, Scan):
             continue
         docs[node.alias] = request.inputs[node.input_id].documents
     return {
@@ -399,7 +400,7 @@ def _child_filters(state, sub):
                 state["registry"].codecs,
             )
             node = graph.node(node_id)
-            if not isinstance(node, PackedFilter):
+            if not isinstance(node, AiFilter):
                 raise TypeError(
                     f"child filter received {node.type_name!r}")
             alias = node.alias
@@ -454,7 +455,7 @@ def _child_joins(state, sub):
     registry = state["registry"]
     encoded_node = sub["physical_node"]
     node = registry.codecs[encoded_node["type"]].decode(encoded_node)
-    if not isinstance(node, AnchoredJoin):
+    if not isinstance(node, AiJoin):
         raise TypeError(f"child join received {node.type_name!r}")
     group = [stage.runtime_spec() for stage in node.stages]
     anchor_alias = node.anchor
@@ -471,7 +472,7 @@ def _child_joins(state, sub):
     if encoded_filter is not None:
         filter_node = registry.codecs[encoded_filter["type"]].decode(
             encoded_filter)
-        if not isinstance(filter_node, PackedFilter) \
+        if not isinstance(filter_node, AiFilter) \
                 or filter_node.alias != anchor_alias:
             raise TypeError("the streamed chain must filter the anchor")
     seen = state.setdefault("seen", set())
@@ -514,6 +515,7 @@ def _child_joins(state, sub):
                 "document_ids": anchors_glob,
                 "limit": None,
                 "retain_survivors": (),
+                "holder": {},
             }
 
         def anchor_done(a, row):
@@ -554,15 +556,18 @@ def _child_joins(state, sub):
             anchors_glob = [key[1] for key in anchor_keys]
             round_kv = dict(hits=len(anchor_keys), misses=0,
                             regret_tokens=0)
-            produced = result.produced[filter_node.node_id]
-            answers = produced.outputs[f"filter_answers:{anchor_alias}"]
+            holder = anchor_stream["holder"]
+            chain = filter_result(
+                filter_node, holder["answers"], holder["tokens"],
+                anchor_stream["document_ids"])
+            answers = chain.outputs[f"filter_answers:{anchor_alias}"]
             filter_out = dict(
                 filters={anchor_alias: {
                     int(document): row for document, row in answers.items()
                 }},
                 survivors={anchor_alias: list(
-                    produced.outputs[f"ids:{anchor_alias}"])},
-                filter_fresh_tokens=produced.metrics.fresh_tokens,
+                    chain.outputs[f"ids:{anchor_alias}"])},
+                filter_fresh_tokens=chain.metrics.fresh_tokens,
             )
             seen.update((anchor_alias, document) for document in answers)
         seen.update(anchor_keys)

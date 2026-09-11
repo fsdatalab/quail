@@ -11,7 +11,6 @@ import quail
 from quail.builtins import built_in_registry
 from quail.catalog import DocumentProvider
 from quail.physical import (
-    DocumentInput,
     ExecutionLocation,
     InputPort,
     OutputPort,
@@ -19,6 +18,7 @@ from quail.physical import (
     PhysicalNode,
     PortRef,
     Project,
+    Scan,
     ValueType,
     decode_graph,
 )
@@ -66,7 +66,7 @@ class FirstDocumentsRuntime:
 
 
 def local_plan(context, *, count, estimate, source):
-    scan = DocumentInput(
+    scan = Scan(
         node_id="input:d",
         alias="d",
         input_id="d",
@@ -187,7 +187,7 @@ def test_physical_extensions_plan_validate_and_execute(monkeypatch):
     assert decode_graph(envelope["graph"], registry.codecs) == plan.graph
 
     registry = built_in_registry()
-    scan = DocumentInput(
+    scan = Scan(
         node_id="input:d",
         alias="d",
         input_id="d",
@@ -236,7 +236,7 @@ def test_physical_extensions_plan_validate_and_execute(monkeypatch):
         module.register_quail_extension = register
         patch.setitem(sys.modules, module_name, module)
         registry = built_in_registry()
-        scan = DocumentInput(
+        scan = Scan(
             node_id="input:d",
             alias="d",
             input_id="d",
@@ -271,7 +271,7 @@ def test_physical_extensions_plan_validate_and_execute(monkeypatch):
 def test_physical_explain_shows_shared_inputs_and_metrics():
     from quail.physical.base import input_ports
 
-    source = DocumentInput(node_id="input:d", alias="d", n_docs=100)
+    source = Scan(node_id="input:d", alias="d", n_docs=100)
     first = FirstDocuments(
         node_id="first", alias="d", count=5,
         inputs=input_ports((PortRef(source.node_id, "ids:d"),)))
@@ -286,7 +286,7 @@ def test_physical_explain_shows_shared_inputs_and_metrics():
                           PortRef(project.node_id, "rows"))
     text = graph.explain()
     assert text.startswith("Project: d.id")
-    assert text.count("DocumentInput: d [1]") == 1
+    assert text.count("Scan: d [1]") == 1
     assert text.count("Reuse [1]") == 1
     assert "count=5" in text and "count=10" in text
     assert "test.first_documents" in text
@@ -296,7 +296,7 @@ def test_physical_explain_shows_shared_inputs_and_metrics():
     from quail.explain import physical_tree
     from quail.runtime.runner import NodeMetrics
 
-    node = DocumentInput(node_id="input:d", alias="d", n_docs=100)
+    node = Scan(node_id="input:d", alias="d", n_docs=100)
     graph = PhysicalGraph((node,), PortRef(node.node_id, "ids:d"))
     assert "metrics unavailable" in physical_tree(graph, metrics={})
     measured = {node.node_id: NodeMetrics(output_rows=42, wall_s=1.25,

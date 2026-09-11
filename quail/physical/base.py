@@ -115,14 +115,6 @@ class PhysicalNode:
         """Return physical nodes stored inside this planning node."""
         return ()
 
-    def streamed_inputs(self) -> tuple[str, ...]:
-        """Return input port names read as a stream from their producer.
-
-        The runner does not execute a streamed port's producer on its
-        own. The consumer's runtime runs it and returns its results.
-        """
-        return ()
-
     def explain_fields(self) -> Mapping[str, Any]:
         """Return fields shown on one explain line."""
         return self.attributes()

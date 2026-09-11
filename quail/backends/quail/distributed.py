@@ -8,10 +8,10 @@ from quail.backends.quail import coordinator
 from quail.backends.quail.graph import executed_join_plan, model_answers
 from quail.execution import export_physical_outputs
 from quail.physical import (
-    AnchoredJoin,
-    DocumentInput,
-    PackedFilter,
+    AiFilter,
+    AiJoin,
     PhysicalGraph,
+    Scan,
 )
 from quail.planner import balanced_shards
 from quail.runtime.runner import (
@@ -19,7 +19,7 @@ from quail.runtime.runner import (
     GenericRunner,
     NodeMetrics,
     NodeResult,
-    StreamedInput,
+    SurvivorStream,
     compute_subgraph,
     scalar_node_metrics,
 )
@@ -42,12 +42,12 @@ class DistributedQuailExecution:
         self.shards = {
             node.alias: node.shards
             for node in graph.nodes
-            if isinstance(node, DocumentInput)
+            if isinstance(node, Scan)
             and len(node.shards) == gpu_count
         }
         self.filter_aliases = {
             node.alias
-            for node in graph.nodes if isinstance(node, PackedFilter)
+            for node in graph.nodes if isinstance(node, AiFilter)
         }
         if self.filter_aliases - set(self.shards):
             for alias in self.filter_aliases - set(self.shards):
@@ -57,7 +57,7 @@ class DistributedQuailExecution:
                 )
                 self.shards[alias] = shards
         self.joins = tuple(stage for node in graph.nodes
-                           if isinstance(node, AnchoredJoin) for stage in node.stages)
+                           if isinstance(node, AiJoin) for stage in node.stages)
         self.pre = payload.get("pre_ids") or []
         self.joins_started = False
         self.retained: dict[str, set[int]] = {}
@@ -77,9 +77,9 @@ class DistributedQuailExecution:
         return dict(self.payload)
 
     def execute(self, node, inputs):
-        if isinstance(node, PackedFilter):
+        if isinstance(node, AiFilter):
             return self._execute_filter(node, inputs)
-        if isinstance(node, AnchoredJoin):
+        if isinstance(node, AiJoin):
             return self._execute_join(node, inputs)
         raise TypeError(
             f"distributed Quail cannot execute {node.type_name!r}")
@@ -101,6 +101,36 @@ class DistributedQuailExecution:
     def _execute_filter(self, node, inputs):
 
         document_ids = next(iter(inputs.values()))
+        if node.pin_survivors:
+            # the join round that consumes this chain runs it on every
+            # GPU and fills the holder with the merged answers
+            stream = SurvivorStream(node, list(document_ids))
+
+            def finalize(node=node, stream=stream):
+                if "answers" not in stream.holder:
+                    raise RuntimeError(
+                        f"{node.node_id!r} pins its survivors but no "
+                        "join consumed its stream")
+                answers = stream.holder["answers"]
+                survivors = stream.holder["survivors"]
+                return NodeResult(
+                    {
+                        f"ids:{node.alias}": survivors,
+                        f"filter_answers:{node.alias}": answers,
+                    },
+                    NodeMetrics(
+                        input_rows=len(stream.document_ids),
+                        output_rows=len(survivors),
+                        evaluated_documents=len(answers),
+                        fresh_tokens=stream.holder["fresh_tokens"],
+                    ),
+                )
+
+            return NodeResult(
+                {f"ids:{node.alias}": stream,
+                 f"filter_answers:{node.alias}": {}},
+                finalize=finalize,
+            )
         shards = self.shards
         complete = (
             isinstance(document_ids, range)
@@ -165,7 +195,7 @@ class DistributedQuailExecution:
         if stream is not None:
             # the anchor's chain runs inside this round on each GPU,
             # over that GPU's filter shard of every anchor document
-            filter_ids = list(next(iter(stream.inputs.values())))
+            filter_ids = list(stream.document_ids)
             survivors[node.anchor] = filter_ids
             filtered_aliases.add(node.anchor)
         if not self.joins_started:
@@ -191,7 +221,7 @@ class DistributedQuailExecution:
             sub.update(
                 retain_anchor=node.keep_anchor_kv,
                 final_group=node.node_id == self.graph.nodes_by_type(
-                    AnchoredJoin.type_name)[-1].node_id,
+                    AiJoin.type_name)[-1].node_id,
                 start_query=not self.started,
                 physical_node=encoded_node,
                 stream_filter_node=encoded_filter,
@@ -200,7 +230,6 @@ class DistributedQuailExecution:
         outputs = self.round_fn("joins", subs)
         wall = time.perf_counter() - started
         self.started = True
-        produced = {}
         if stream is not None:
             merged = coordinator.merge_filter_round([
                 {
@@ -210,19 +239,10 @@ class DistributedQuailExecution:
                 }
                 for output in outputs
             ])
-            filter_answers = merged["filters"].get(node.anchor, {})
-            filter_survivors = merged["survivors"].get(node.anchor, [])
-            produced[stream.node.node_id] = NodeResult(
-                {
-                    f"ids:{node.anchor}": filter_survivors,
-                    f"filter_answers:{node.anchor}": filter_answers,
-                },
-                NodeMetrics(
-                    input_rows=len(filter_ids),
-                    output_rows=len(filter_survivors),
-                    evaluated_documents=len(filter_answers),
-                    fresh_tokens=merged["fresh_tokens"],
-                ),
+            stream.holder.update(
+                answers=merged["filters"].get(node.anchor, {}),
+                survivors=merged["survivors"].get(node.anchor, []),
+                fresh_tokens=merged["fresh_tokens"],
             )
         stage_outputs = coordinator.merge_join_round(outputs)
         regret = 0
@@ -275,7 +295,6 @@ class DistributedQuailExecution:
                 regret_tokens=regret,
                 extension={"joins": enriched},
             ),
-            produced=produced,
         )
 
     def _retained_placement(self, outputs):
@@ -315,13 +334,13 @@ class DistributedQuailExecution:
 
 
 def prepare_distributed_inputs(node, inputs, context):
-    if isinstance(node, AnchoredJoin):
+    if isinstance(node, AiJoin):
         survivors = {}
         stream = None
         for port in node.inputs:
             value = inputs[port.name]
             alias = port.source.port.split(":", 1)[1]
-            if isinstance(value, StreamedInput):
+            if isinstance(value, SurvivorStream):
                 if alias != node.anchor:
                     raise TypeError(
                         "only the anchor's filter chain streams into a join")
@@ -355,7 +374,7 @@ def execute_distributed_graph(payload, graph: PhysicalGraph, gpu_count: int,
         state={"distributed_execution": execution},
     )
     started = time.perf_counter()
-    if not any(isinstance(node, PackedFilter) for node in graph.nodes):
+    if not any(isinstance(node, AiFilter) for node in graph.nodes):
         execution.begin()
     result = GenericRunner().run(compute_subgraph(graph), context)
     elapsed = time.perf_counter() - started

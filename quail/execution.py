@@ -9,8 +9,8 @@ from typing import Any
 import pyarrow as pa
 
 from quail.physical import (
+    AiFilter,
     OutputPort,
-    PackedFilter,
     PhysicalGraph,
     PortRef,
     ValueType,
@@ -100,7 +100,7 @@ def _document_ids_table(port: OutputPort, value: Any) -> pa.Table:
     )
 
 
-def _filter_answers_table(node: PackedFilter, value: Mapping) -> pa.Table:
+def _filter_answers_table(node: AiFilter, value: Mapping) -> pa.Table:
     documents = []
     positions = []
     answers = []
@@ -175,8 +175,8 @@ def _output_table(node, port: OutputPort, value: Any) -> pa.Table:
     if port.value_type is ValueType.DOCUMENT_IDS:
         return _document_ids_table(port, value)
     if port.value_type is ValueType.FILTER_ANSWERS:
-        if not isinstance(node, PackedFilter):
-            raise TypeError("filter answer output needs a PackedFilter node")
+        if not isinstance(node, AiFilter):
+            raise TypeError("filter answer output needs a AiFilter node")
         return _filter_answers_table(node, value)
     if port.value_type is ValueType.JOIN_ANSWERS:
         return _join_answers_table(value)

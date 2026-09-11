@@ -6,13 +6,13 @@ import pyarrow as pa
 from test_quail_backend import graph_state
 
 import quail
-from quail.backends.quail.graph import execute_single_graph
+from quail.backends.quail.graph import execute_single_graph, filter_result
 from quail.bench import quailb
 from quail.execution import PhysicalResponse
-from quail.physical import AnchoredJoin, DocumentInput, PackedFilter, decode_graph
+from quail.physical import AiFilter, AiJoin, Scan, decode_graph
 from quail.planner.plan import EngineConfig
 from quail.runtime.execute import execute_query
-from quail.runtime.runner import NodeMetrics, NodeResult
+from quail.runtime.runner import NodeMetrics, NodeResult, SurvivorStream
 from quail_b import prompts
 from quail_b.queries import FILTER_SELECTIVITY_ESTIMATES
 
@@ -34,29 +34,48 @@ class FixedFeverAnswers:
         self.empty = empty
         self.filters = []
 
+    def _answers(self, document_ids):
+        """Answers keyed by local position, and the passing global ids."""
+        answers = {local: [document < 2 and not self.empty]
+                   for local, document in enumerate(document_ids)}
+        live = [document for local, document in enumerate(document_ids)
+                if all(answers[local])]
+        return answers, live
+
     def execute(self, node, inputs):
-        if isinstance(node, PackedFilter):
+        if isinstance(node, AiFilter):
             self.filters.append((node.alias, inputs["retain_survivors"]))
-            answers = {document: [document < 2 and not self.empty]
-                       for document in inputs["document_ids"]}
-            live = [document for document, row in answers.items() if all(row)]
+            if node.pin_survivors:
+                # the consuming join runs the chain and fills the holder
+                stream = SurvivorStream(node, inputs["document_ids"])
+                return NodeResult(
+                    {f"ids:{node.alias}": stream,
+                     f"filter_answers:{node.alias}": {}},
+                    finalize=lambda: filter_result(
+                        node, stream.holder["answers"],
+                        stream.holder["tokens"], stream.document_ids))
+            document_ids = list(inputs["document_ids"])
+            answers, live = self._answers(document_ids)
             if inputs["retain_survivors"]:
                 for document in live[:self.capacity]:
                     self.state["arena"].retain((node.alias, document), 16)
-            return NodeResult({f"ids:{node.alias}": live,
-                               f"filter_answers:{node.alias}": answers})
+            return NodeResult({
+                f"ids:{node.alias}": live,
+                f"filter_answers:{node.alias}": {
+                    document_ids[local]: row for local, row in answers.items()
+                },
+            })
 
         outputs = {}
-        produced = {}
         stream = inputs.get("anchor_stream")
         if stream is None:
             anchor_ids = inputs["anchor_ids"]
         else:
             # the anchor's chain runs inside the join; like the real
-            # driver, append each streamed anchor's key and prefix
-            filter_result = self.execute(stream["node"], stream)
-            anchor_ids = filter_result.outputs[f"ids:{node.anchor}"]
-            produced[stream["node"].node_id] = filter_result
+            # driver, fill the holder and append each streamed anchor's
+            # key and prefix
+            answers, anchor_ids = self._answers(list(stream["document_ids"]))
+            stream["holder"].update(answers=answers, tokens=0)
             for document in anchor_ids:
                 inputs["anchor_keys"].append((node.anchor, document))
                 inputs["prefixes"].append([])
@@ -85,8 +104,7 @@ class FixedFeverAnswers:
                 "selectivity": stage.selectivity, "written_pos": stage.written_pos,
             }
         outputs[f"ids:{node.anchor}"] = [anchor_ids[local] for local in sorted(live)]
-        return NodeResult(outputs, NodeMetrics(extension={"answers": all_answers}),
-                          produced=produced)
+        return NodeResult(outputs, NodeMetrics(extension={"answers": all_answers}))
 
 
 def test_fixed_order_execution_and_backend_planning(monkeypatch):
@@ -103,10 +121,10 @@ def test_fixed_order_execution_and_backend_planning(monkeypatch):
 
                 def execute(request):
                     graph = decode_graph(request.plan["graph"], session.registry.codecs)
-                    groups = graph.nodes_by_type(AnchoredJoin.type_name)
+                    groups = graph.nodes_by_type(AiJoin.type_name)
                     assert sum(len(group.stages) for group in groups) == 3
                     docs = {node.alias: request.inputs[node.input_id].documents
-                            for node in graph.nodes if isinstance(node, DocumentInput)}
+                            for node in graph.nodes if isinstance(node, Scan)}
                     state = graph_state(None, docs)
                     model = FixedFeverAnswers(state, capacity, empty)
                     state["model_execution"] = model
@@ -119,19 +137,30 @@ def test_fixed_order_execution_and_backend_planning(monkeypatch):
                             "quail.planner.joins.search_joins", unexpected_search)
                         report = execute_single_graph(
                             state, request.plan["settings"], graph)
-                    # the first anchor's chain streams into its join and
-                    # runs last, retaining nothing; the other anchor's
-                    # chain retains survivors for its later group
-                    assert groups[0].stream_anchor is True
-                    assert model.filters[-1] == (groups[0].anchor, False)
-                    anchors = {group.anchor for group in groups}
+                    # an anchor's chain streams into its join unless the
+                    # alias was a partner in an earlier group; then it
+                    # finishes first and retains survivors in the pool
+                    chains = {node.alias: node for node in graph.nodes
+                              if isinstance(node, AiFilter)}
+                    partners_before = set()
+                    pooled = 0
+                    for group in groups:
+                        chain = chains[group.anchor]
+                        pinned = group.anchor not in partners_before
+                        assert chain.pin_survivors is pinned
+                        assert chain.keep_kv is not pinned
+                        pooled += not pinned
+                        partners_before.update(
+                            alias for stage in group.stages
+                            for alias in stage.partners)
                     assert {alias for alias, keep in model.filters if keep} \
-                        == anchors - {groups[0].anchor}
+                        == {group.anchor for group in groups
+                            if chains[group.anchor].keep_kv}
                     assert not state["arena"].accounting.owned
                     assert report["kv_manager"]["retained_after_filters"] == (
-                        0 if empty else min(capacity, 2) * (len(anchors) - 1))
+                        0 if empty else min(capacity, 2) * pooled)
                     assert [step["id"] for step in report["executed_join_plan"]
-                            if step["type"] == AnchoredJoin.type_name] == [
+                            if step["type"] == AiJoin.type_name] == [
                                 g.node_id for g in groups]
                     return PhysicalResponse(report.pop("_outputs"), report)
 
@@ -163,7 +192,7 @@ def test_distributed_fev9_executes_bound_join_nodes(monkeypatch):
         def execute(request):
             graph = decode_graph(request.plan["graph"], session.registry.codecs)
             docs = {node.alias: request.inputs[node.input_id].documents
-                    for node in graph.nodes if isinstance(node, DocumentInput)}
+                    for node in graph.nodes if isinstance(node, Scan)}
             children = []
             for _ in range(2):
                 state = graph_state(None, docs)

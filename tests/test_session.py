@@ -29,9 +29,9 @@ def _run(query, execute):
 def runtime_plan(request):
     from quail.builtins import built_in_registry
     from quail.physical import (
-        AnchoredJoin,
-        DocumentInput,
-        PackedFilter,
+        AiFilter,
+        AiJoin,
+        Scan,
         decode_graph,
     )
 
@@ -40,7 +40,7 @@ def runtime_plan(request):
     )
     filter_nodes = {
         node.alias: node for node in graph.nodes
-        if isinstance(node, PackedFilter)
+        if isinstance(node, AiFilter)
     }
     return {
         "graph": graph,
@@ -51,10 +51,10 @@ def runtime_plan(request):
             for alias, node in filter_nodes.items()
         },
         "joins": [stage.runtime_spec() for node in graph.nodes
-                  if isinstance(node, AnchoredJoin) for stage in node.stages],
+                  if isinstance(node, AiJoin) for stage in node.stages],
         "shards": {
             node.alias: node.shards for node in graph.nodes
-            if isinstance(node, DocumentInput)
+            if isinstance(node, Scan)
         },
     }
 
@@ -91,7 +91,7 @@ def make_executor(filter_truth, join_truth=None, seen=None):
 
         from quail.backends.quail.graph import execute_single_graph
         from quail.execution import PhysicalResponse
-        from quail.physical import DocumentInput, PackedFilter
+        from quail.physical import AiFilter, Scan
         from quail.runtime.runner import NodeResult
 
         runtime = runtime_plan(request)
@@ -101,12 +101,12 @@ def make_executor(filter_truth, join_truth=None, seen=None):
         graph = runtime["graph"]
         docs = {
             node.alias: request.inputs[node.input_id].documents
-            for node in graph.nodes if isinstance(node, DocumentInput)
+            for node in graph.nodes if isinstance(node, Scan)
         }
 
         class FixedAnswers:
             def execute(self, node, inputs):
-                if isinstance(node, PackedFilter):
+                if isinstance(node, AiFilter):
                     rows = {}
                     for document in inputs["document_ids"]:
                         row = []
@@ -187,8 +187,8 @@ def test_query_rows_observers_and_saved_reports(sess, tmp_path):
     result = _observed_result(tmp_path, registry)
 
     assert result.observer(NodeTypes)["types"] == [
-        "quail.document_input",
-        "quail.packed_filter",
+        "quail.scan",
+        "quail.ai_filter",
         "quail.project",
         "quail.limit",
     ]

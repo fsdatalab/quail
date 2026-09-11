@@ -83,8 +83,8 @@ every later anchor use, the same assumption as the speed-of-light estimate.
   during execution.
 - Two execution chunks are reserved before allocating retained pages. Active KV
   cannot be evicted. Prefixes are released when they have no further planned use.
-- Planned `AnchoredJoin` nodes reuse available KV. Missing KV is recomputed.
-- Planned `Exchange` nodes prune actual survivors before the next join group.
+- Planned `AiJoin` nodes reuse available KV. Missing KV is recomputed.
+- Planned `Barrier` nodes prune actual survivors before the next join group.
 - Execution keeps the planned order even when actual selectivity differs.
 
 ## The executor
@@ -114,9 +114,9 @@ sends payloads over pipes.
 - The filter round: each child filters its contiguous shard of every
   table, reading token values straight from the shared memory mapped
   file. The parent merges survivors.
-- One join round per `AnchoredJoin`: anchors follow their filter
+- One join round per `AiJoin`: anchors follow their filter
   shard; every child receives every surviving partner.
-- An `Exchange` between anchors: the parent thins each table to
+- An `Barrier` between anchors: the parent thins each table to
   documents still in a passing pair and re-partitions the new anchor.
 
 Filters split documents. Joins split anchors. Every pair belongs to

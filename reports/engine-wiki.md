@@ -164,9 +164,10 @@ for sources and validation status. Memory budgets remain per GPU.
    memory mapped length column. The selected model backend produces physical
    candidates. The
    planner selects one typed `PhysicalGraph`. Quail uses
-   `DocumentInput`, `PackedFilter`, `AnchoredJoin`,
-   `Exchange`, `Recombine`, physical `Project`, and `Limit`.
-   The vLLM and SGLang backends use `DocumentInput`, `RequestExecution`,
+   `Scan`, `AiFilter`, `AiJoin`,
+   `Barrier`, `Recombine`, physical `Project`, and `Limit`, plus an
+   `Exchange` before each join group when there are several GPUs.
+   The vLLM and SGLang backends use `Scan`, `RequestExecution`,
    `Recombine`, physical `Project`, and `Limit`. `RequestExecution` stores the
    tokenized filter and join prompt parts. It does not contain a Quail
    scheduler.
@@ -178,11 +179,11 @@ for sources and validation status. Memory budgets remain per GPU.
    is free at every later anchor use, the same assumption as the speed-of-light
    estimate. A filtered alias whose first use is as an anchor has its chain
    placed right before that group, after any barrier, and the chain streams
-   into the join (section 4.6): the `AnchoredJoin` carries `stream_anchor`,
-   the runner hands the chain to the join instead of running it first, and
-   each passing document's KV goes straight from the chain to the join
-   without the retention pool.
-   `Exchange` nodes prune actual survivors
+   into the join (section 4.6): the `AiFilter` carries `pin_survivors`,
+   returns its survivors as a stream the join drives, and each passing
+   document's KV goes straight from the chain to the join without the
+   retention pool.
+   `Barrier` nodes prune actual survivors
    between the planned join groups. Execution follows this graph without
    searching again.
 10. The worker creates an internal physical request. It uses the query's
@@ -329,7 +330,7 @@ are found (early termination); for a join query the filter round
 gets no limit - one document can appear in zero or many output rows
 (#39) - and the Arrow result stream applies the final limit instead.
 The typed filter runtime receives no early limit when the graph contains
-`AnchoredJoin`. The
+`AiJoin`. The
 builder equivalent is `.limit(n)` before `.select()`. The rejection
 list is explicit (`compile.py:22-33`), so new SQL surface cannot
 enter silently.
@@ -1126,7 +1127,7 @@ that runs until `FilterAdmission.done()`:
 Single-stage queries (one question) skip the arena entirely: no
 later stage reads any document's KV, so the alloc, the per-layer KV
 scatter, and the paged attention read serve no one. The planner
-makes the call. The `PackedFilter` node carries an `arena_writes`
+makes the call. The `AiFilter` node carries an `arena_writes`
 field, which is false exactly when one stage runs. The field appears
 in `explain()`, and the payload forwards it to
 `run_filter`. `run_filter` requires the argument and never derives
@@ -1191,12 +1192,16 @@ KV page. The worker frees every kept key the moment its last consumer
 join is behind, and sweeps kept keys at query start and end - the
 arena outlives a query, kept KV must not.
 
-**The streamed filter-to-join edge.** When the first join group's
-anchor alias has a filter chain, the chain does not finish before the
-join starts. The plan marks the edge (`AnchoredJoin.stream_anchor`),
-the generic runner hands the chain to the join as a `StreamedInput`,
-and the join's runtime returns both nodes' results
-(`NodeResult.produced`). On the GPU the join drives:
+**The streamed filter-to-join edge.** When a join group's anchor
+alias has a filter chain that no earlier group needed, the chain does
+not finish before the join starts. The planner places the chain right
+before the group and sets `AiFilter.pin_survivors`. Its runtime then
+returns the survivor port as a `SurvivorStream` with a `finalize`
+callable instead of running; the `AiJoin` that reads the port drives
+the chain and writes its answers into the stream's holder; the generic
+runner calls `finalize` after the whole graph has run and stores the
+chain's answers and metrics as its own result. Every other edge is a
+finished list. On the GPU the join drives:
 
 - `FilterStream` is `run_filter` cut into one chunk per `next()`
   call, with `hold_survivors`: a document that passes its last stage
@@ -1416,18 +1421,22 @@ Each child opens the same temporary token file and reads its range. Token values
 do not pass through the parent process pipe. After this round, the parent
 merges survivors.
 
-**One join round per selected `AnchoredJoin`**: anchors follow the
-alias's filter shard when it holds retained KV. When the anchor's chain
+**One join round per selected `AiJoin`**: anchors follow the
+alias's filter shard when it holds retained KV. The plan shows this as
+an `Exchange` node before each group, present only with several GPUs; the
+routing itself happens when the coordinator builds the round's
+payloads. When the anchor's chain
 streams into the join, the chain runs inside the join round on each GPU,
 over that GPU's filter shard of every anchor document, and the parent
-merges the chain's answers and survivors from the same round. An anchor that was a partner in
+fills the chain's survivor stream with the merged answers from the same
+round. An anchor that was a partner in
 an earlier round gets new balanced shards over its live documents.
 The parent sends file references and survivor positions, and each GPU reads
 the needed token values before it computes KV for its new anchor slice. Every
 GPU receives every surviving partner, so every
 GPU uses the same partner index space.
 
-**An `Exchange` between join groups** prunes each input to documents that
+**An `Barrier` between join groups** prunes each input to documents that
 remain in passing pairs. All completed full-join answers and current survivor
 IDs are explicit inputs. When the anchor changes, the next join round assigns
 its live documents to workers. No join search runs during these rounds.
@@ -1452,9 +1461,9 @@ merge: union the per-alias answer dicts and survivor lists
 
 # execute the saved join and exchange nodes
 for node in the planned graph:
-    if node is Exchange:
+    if node is Barrier:
         prune survivor IDs using completed join answers
-    if node is AnchoredJoin:
+    if node is AiJoin:
         for each worker w:
             anchors = live anchor documents assigned to w
             partners = all live partner documents
@@ -1468,11 +1477,11 @@ for node in the planned graph:
 | Function | File | What it does |
 |---|---|---|
 | `begin_query_payloads` | `coordinator.py` | Start a query on every GPU executor when no filter runs first |
-| `filter_node_payloads` | `coordinator.py` | Split one typed `PackedFilter` across GPU executors |
+| `filter_node_payloads` | `coordinator.py` | Split one typed `AiFilter` across GPU executors |
 | `merge_filter_round` | `coordinator.py` | Merge workers' filter answers |
 | `join_group_payloads` | `coordinator.py` | Build per-worker sub-payloads for one anchor group's round (re-shards an anchor with no filter shard) |
 | `merge_join_round` | `coordinator.py` | Concatenate workers' join answer rows |
-| `ExchangeRuntime.execute` | `runtime/runner.py` | Prune actual survivor IDs using completed full-join answer relations |
+| `BarrierRuntime.execute` | `runtime/runner.py` | Prune actual survivor IDs using completed full-join answer relations |
 | `gate_group` | `coordinator.py` | Anchor survivors after one group (full/exists/anti keep rules) |
 | `execute_query` | `runtime/execute.py` | Plan and execute one already built query in the current process |
 | `_execute_physical` | `runtime/execute.py` | Validate and run one typed physical request |

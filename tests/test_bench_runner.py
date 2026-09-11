@@ -157,25 +157,25 @@ def _run(query, join_answers):
         from quail.builtins import built_in_registry
         from quail.execution import PhysicalResponse, export_physical_outputs
         from quail.physical import (
-            AnchoredJoin,
-            DocumentInput,
-            PackedFilter,
+            AiFilter,
+            AiJoin,
+            Scan,
             decode_graph,
         )
         from quail.runtime.runner import NodeMetrics, NodeResult, RunResult
 
         graph = decode_graph(request.plan["graph"], built_in_registry().codecs)
         filtered = next(
-            node for node in graph.nodes if isinstance(node, PackedFilter)
+            node for node in graph.nodes if isinstance(node, AiFilter)
         )
         anchored = next(
-            node for node in graph.nodes if isinstance(node, AnchoredJoin)
+            node for node in graph.nodes if isinstance(node, AiJoin)
         )
         join = anchored.stages[0].runtime_spec()
         nodes = {
             **{node.node_id: NodeResult({f"ids:{node.alias}": range(
                 len(request.inputs[node.input_id].documents))})
-               for node in graph.nodes if isinstance(node, DocumentInput)},
+               for node in graph.nodes if isinstance(node, Scan)},
             filtered.node_id: NodeResult({
                 "ids:r": [0],
                 "filter_answers:r": {0: [1], 1: [0]},

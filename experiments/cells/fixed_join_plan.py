@@ -60,7 +60,7 @@ def _run(label, output_dir):
     import quail
     from quail.backends.quail import expected_join_nodes
     from quail.bench.quailb import queries, register_sets
-    from quail.physical import AnchoredJoin, PackedFilter
+    from quail.physical import AiFilter, AiJoin
     from quail.planner.plan import EngineConfig
     from quail.specs import H100_USD_PER_HOUR
     from quail_b.data import build_sets
@@ -80,14 +80,14 @@ def _run(label, output_dir):
         estimates = {
             "seconds": plan.estimated_seconds,
             "filter_order": [node.alias for node in plan.nodes
-                             if isinstance(node, PackedFilter)],
+                             if isinstance(node, AiFilter)],
             "retained_filter_aliases": [node.alias for node in plan.nodes
-                                        if isinstance(node, PackedFilter)
+                                        if isinstance(node, AiFilter)
                                         and node.keep_kv],
             "joins": [{"anchor": node.anchor,
                        "predicates": [stage.written_pos for stage in node.stages]}
                       for node in expected_join_nodes(plan)
-                      if isinstance(node, AnchoredJoin)],
+                      if isinstance(node, AiJoin)],
         }
         print(f"[{label}] estimates before inference: {json.dumps(estimates)}",
               flush=True)

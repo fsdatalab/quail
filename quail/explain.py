@@ -5,15 +5,16 @@ from collections.abc import Mapping
 
 from quail import logical as logical_nodes
 from quail.physical import (
-    AnchoredJoin,
-    DocumentInput,
+    AiFilter,
+    AiJoin,
+    Barrier,
     Exchange,
     Limit,
-    PackedFilter,
     PortRef,
     Project,
     Recombine,
     RequestExecution,
+    Scan,
 )
 
 
@@ -113,9 +114,9 @@ def _estimated_rows(graph):
     for node in graph.topological_nodes():
         inputs = [rows.get(port.source) for port in node.inputs]
         value = None
-        if isinstance(node, DocumentInput):
+        if isinstance(node, Scan):
             value = node.n_docs
-        elif isinstance(node, PackedFilter):
+        elif isinstance(node, AiFilter):
             value = inputs[0] if inputs else None
             for stage in node.stages:
                 if value == 0 or stage.selectivity == 0:
@@ -124,7 +125,7 @@ def _estimated_rows(graph):
                     value = None
                 else:
                     value *= stage.selectivity
-        elif isinstance(node, (Project, Limit)) and len(inputs) == 1:
+        elif isinstance(node, (Project, Limit, Exchange)) and len(inputs) == 1:
             value = inputs[0]
             if isinstance(node, Limit) and value is not None:
                 value = min(value, node.count)
@@ -154,19 +155,15 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None):
         (node for node in graph.topological_nodes() if uses[node.node_id] > 1), 1)}
     visited = set()
     lines = []
-    streamed = {}
-    for node in graph.nodes:
-        ports = {port.name: port for port in node.inputs}
-        for name in node.streamed_inputs():
-            streamed[ports[name].source.node_id] = node.node_id
+    by_id = {node.node_id: node for node in graph.nodes}
 
     def describe(node):
         details = []
         title = type(node).__name__
-        if isinstance(node, DocumentInput):
+        if isinstance(node, Scan):
             source = scans.get(node.alias)
             title = (f"Scan {source.provider} as {node.alias}" if source else
-                     f"DocumentInput: {node.alias}")
+                     f"Scan: {node.alias}")
             mean = node.total_tokens / node.n_docs if node.n_docs else 0
             details.append(f"tokens={node.total_tokens:,}, "
                            f"mean_doc_tokens={_number(mean)}")
@@ -174,14 +171,14 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None):
             title += ": " + ", ".join(node.columns)
         elif isinstance(node, Limit):
             title += f": {node.count:,}"
-        elif isinstance(node, PackedFilter):
+        elif isinstance(node, AiFilter):
             title += f": {node.alias}"
             kv = []
             if len(node.stages) > 1 and node.arena_writes:
                 kv.append("KV rewind=on")
             if node.keep_kv:
                 kv.append("retain KV for later joins")
-            if node.node_id in streamed:
+            if node.pin_survivors:
                 kv.append("survivors stream into the join with KV pinned")
             details.append(", ".join(kv) if kv else
                            "KV: stored" if node.arena_writes else "KV: not stored")
@@ -193,12 +190,17 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None):
                 details.append(f"{index}. {predicate} "
                                f"(selectivity={_selectivity(stage.selectivity)}, "
                                f"question_tokens={stage.question_tokens:,})")
-        elif isinstance(node, AnchoredJoin):
+        elif isinstance(node, AiJoin):
             title += f": anchor={node.anchor}"
             source = {"none": "not resident", "filter": "from filters",
                       "kept": "from an earlier join"}.get(
                           node.anchor_resident, node.anchor_resident)
-            if node.stream_anchor:
+            anchor_port = next(
+                (port for port in node.inputs
+                 if port.source.port == f"ids:{node.anchor}"), None)
+            producer = (by_id.get(anchor_port.source.node_id)
+                        if anchor_port else None)
+            if isinstance(producer, AiFilter) and producer.pin_survivors:
                 source = "streamed from its filter"
             keep = "yes" if node.keep_anchor_kv else "no"
             details.append(f"KV: anchor={source}, retain after join={keep}")
@@ -212,6 +214,8 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None):
                     f"(selectivity={_selectivity(stage.selectivity)}, "
                     f"estimated_evaluations={_number(stage.expected_tuples)})")
         elif isinstance(node, Exchange):
+            title += f": {node.anchor} to the GPU holding its KV"
+        elif isinstance(node, Barrier):
             title += f": next_anchor={node.next_anchor}"
         elif isinstance(node, Recombine):
             title += ": " + ", ".join(node.alias_order)

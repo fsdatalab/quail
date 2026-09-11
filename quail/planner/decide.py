@@ -11,18 +11,21 @@ from quail.logical import (
     SemanticJoin,
 )
 from quail.physical import (
-    AnchoredJoin,
-    DocumentInput,
+    AiFilter,
+    AiJoin,
+    Barrier,
     Exchange,
     FilterStage,
     JoinStage,
     Limit,
-    PackedFilter,
     PortRef,
     Recombine,
 )
 from quail.physical import (
     Project as PhysicalProject,
+)
+from quail.physical import (
+    Scan as PhysicalScan,
 )
 from quail.physical.base import input_ports
 from quail.planner import budgets, retention
@@ -376,7 +379,8 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     # its survivors wait in the pool.
     streamed = {}
     partner_before = set()
-    for index, group in enumerate(retention.group_sequence(seq)):
+    sequence_groups = retention.group_sequence(seq)
+    for index, group in enumerate(sequence_groups):
         anchor = group[0][1]
         if anchor in filters and anchor not in streamed \
                 and anchor not in partner_before:
@@ -450,7 +454,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
             doc_tokens[s.alias], workers
         )
         sid = f"input:{s.alias}"
-        nodes.append(DocumentInput(
+        nodes.append(PhysicalScan(
             node_id=sid,
             alias=s.alias, input_id=s.alias,
             n_docs=stats[s.alias].n_docs,
@@ -473,13 +477,19 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                 expected_docs=round(n * surv, 1)))
             surv *= p.selectivity if p.selectivity is not None else 1.0
         keep = alias in retention_plan["initial"]
-        writes = len(stages) > 1 or keep or alias in streamed
+        pinned = alias in streamed
+        writes = len(stages) > 1 or keep or pinned
+        # a pinned survivor's pages also cover the consuming join's
+        # largest frame, so the join never claims a page for it
+        hold = max((spec["frame_tokens"][alias]
+                    for spec, _ in sequence_groups[streamed[alias]])
+                   if pinned else (0,))
         fid = f"filter:{alias}"
-        nodes.append(PackedFilter(
+        nodes.append(AiFilter(
             node_id=fid,
             inputs=input_ports((ids_src[alias],)),
             alias=alias, arena_writes=writes,
-            keep_kv=keep,
+            keep_kv=keep, pin_survivors=pinned, hold_tokens=hold,
             stages=tuple(stages)))
         ids_src[alias] = PortRef(fid, f"ids:{alias}")
         if alias in streamed:
@@ -522,13 +532,22 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
             exchange_inputs = tuple(pairs_edges) + tuple(
                 ids_src[a] for a in ahead
             )
-            nodes.append(Exchange(
+            nodes.append(Barrier(
                 node_id=bid,
                 inputs=input_ports(exchange_inputs),
                 next_anchor=anchor,
                 aliases=tuple(ahead)))
             for a in ahead:
                 ids_src[a] = PortRef(bid, f"ids:{a}")
+        if workers > 1:
+            # anchors go to the GPU that holds their KV, or balance
+            # across GPUs when none does; one GPU passes them through
+            xid = f"exchange:{g}"
+            nodes.append(Exchange(
+                node_id=xid,
+                inputs=input_ports((ids_src[anchor],)),
+                anchor=anchor))
+            ids_src[anchor] = PortRef(xid, f"ids:{anchor}")
         if streamed.get(anchor) == g:
             emit_filter(anchor)
         gid = f"group:{g}"
@@ -557,13 +576,12 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                 for a in [anchor] + partners:
                     if a not in out_aliases:
                         out_aliases.append(a)
-        nodes.append(AnchoredJoin(
+        nodes.append(AiJoin(
             node_id=gid,
             inputs=input_ports(tuple(ids_src[a] for a in in_aliases)),
             anchor=anchor,
             anchor_resident=group["members"][0][1]["resident"],
             keep_anchor_kv=anchor in retention_plan["after"][gid],
-            stream_anchor=streamed.get(anchor) == g,
             stages=tuple(stage_dicts)))
         ids_src[anchor] = PortRef(gid, f"ids:{anchor}")
 

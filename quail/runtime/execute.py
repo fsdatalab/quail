@@ -4,7 +4,7 @@ import time
 
 from quail.backends import BackendExecutionContext
 from quail.execution import PhysicalRequest, PhysicalResponse
-from quail.physical import DocumentInput, check_plan_envelope, decode_graph
+from quail.physical import Scan, check_plan_envelope, decode_graph
 from quail.planner.plan import Refusal
 from quail.runtime.session import RefusalError
 
@@ -34,7 +34,7 @@ def _validate_physical_request(request, registry):
     graph.validate_backend(envelope["backend"])
     needed_inputs = {
         node.input_id for node in graph.nodes
-        if isinstance(node, DocumentInput)
+        if isinstance(node, Scan)
     }
     missing = needed_inputs - set(request.inputs)
     extra = set(request.inputs) - needed_inputs

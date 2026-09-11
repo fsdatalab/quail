@@ -19,7 +19,7 @@ from quail.execution import PhysicalRequest, document_input
 from quail.extensions import ExtensionRegistry
 from quail.logical import CompileError, LogicalPlan
 from quail.logical_optimizer import LogicalPlanningContext, apply_logical_rules
-from quail.physical import DocumentInput, PortRef, Project, ValueType, encode_graph
+from quail.physical import PortRef, Project, Scan, ValueType, encode_graph
 from quail.planner import collect_operators, explain, plan_query
 from quail.planner.plan import EngineConfig, Refusal, resolve_model
 from quail.progress import Progress, say
@@ -549,7 +549,7 @@ class Query:
         self.wait_for_tokens()
         inputs = {}
         for node in plan.nodes:
-            if not isinstance(node, DocumentInput):
+            if not isinstance(node, Scan):
                 continue
             inputs[node.input_id] = document_input(
                 self._token_inputs[node.alias].tokens
@@ -561,10 +561,10 @@ class Query:
         """Finish the physical graph and attach execution details."""
         plan = self.plan()
         out = response.metrics
-        from quail.physical import AnchoredJoin, Exchange
+        from quail.physical import AiJoin, Barrier
 
         expected_nodes = tuple(node for node in plan.nodes
-                               if isinstance(node, (AnchoredJoin, Exchange)))
+                               if isinstance(node, (AiJoin, Barrier)))
         report = dict(
             backend=out.get("backend", plan.backend),
             wall_s=out["wall_s"], boot_s=out.get("boot_s"),
@@ -651,7 +651,7 @@ class Query:
         sources = {
             node.input_id: range(node.n_docs)
             for node in plan.nodes
-            if isinstance(node, DocumentInput)
+            if isinstance(node, Scan)
         }
         observers = self.session.registry.new_observers()
         run = GenericRunner().run(

@@ -9,16 +9,17 @@ from quail.backends.quail.retention import apply_retention, retain_after_join
 from quail.execution import export_physical_outputs
 from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
 from quail.physical import (
-    AnchoredJoin,
-    PackedFilter,
+    AiFilter,
+    AiJoin,
     PhysicalGraph,
 )
 from quail.runtime.runner import (
     ExecutionContext,
     GenericRunner,
     ModelNodeRuntime,
+    NodeMetrics,
     NodeResult,
-    StreamedInput,
+    SurvivorStream,
     compute_subgraph,
     scalar_node_metrics,
 )
@@ -29,8 +30,8 @@ def quail_runtimes() -> dict:
     """Return runtimes for the Quail backend's physical nodes."""
     model_runtime = ModelNodeRuntime()
     return {
-        PackedFilter.runtime_key: model_runtime,
-        AnchoredJoin.runtime_key: model_runtime,
+        AiFilter.runtime_key: model_runtime,
+        AiJoin.runtime_key: model_runtime,
     }
 
 
@@ -58,6 +59,31 @@ def _tuple_suffix(join, docs, member):
     return chain_tokens(*parts)
 
 
+def filter_result(node, answers, tokens, document_ids) -> NodeResult:
+    """Build one filter chain's node result from its local answers."""
+    global_answers = {
+        document_ids[int(local)]: row
+        for local, row in answers.items()
+    }
+    survivors = sorted(
+        document
+        for document, row in global_answers.items()
+        if len(row) == len(node.question_token_ids) and all(row)
+    )
+    return NodeResult(
+        outputs={
+            f"ids:{node.alias}": survivors,
+            f"filter_answers:{node.alias}": global_answers,
+        },
+        metrics=NodeMetrics(
+            input_rows=len(document_ids),
+            output_rows=len(survivors),
+            evaluated_documents=len(global_answers),
+            fresh_tokens=tokens,
+        ),
+    )
+
+
 def filter_inputs(state, node, document_ids) -> dict:
     """Scheduler inputs for one filter chain over the given documents."""
     return {
@@ -73,10 +99,10 @@ def filter_inputs(state, node, document_ids) -> dict:
 def prepare_model_inputs(node, inputs, context: ExecutionContext):
     """Prepare Quail scheduler inputs from typed port values."""
     state = context.state
-    if isinstance(node, PackedFilter):
+    if isinstance(node, AiFilter):
         state["pipeline"].attention_mode = FILTER_ATTENTION
         return filter_inputs(state, node, next(iter(inputs.values())))
-    if not isinstance(node, AnchoredJoin):
+    if not isinstance(node, AiJoin):
         return inputs
 
     state["pipeline"].attention_mode = JOIN_ATTENTION
@@ -87,8 +113,8 @@ def prepare_model_inputs(node, inputs, context: ExecutionContext):
             continue
         alias = input_port.source.port.split(":", 1)[1]
         value = inputs[input_port.name]
-        if isinstance(value, StreamedInput):
-            if alias != node.anchor or not isinstance(value.node, PackedFilter):
+        if isinstance(value, SurvivorStream):
+            if alias != node.anchor or not isinstance(value.node, AiFilter):
                 raise TypeError(
                     "only the anchor's filter chain streams into a join")
             stream = value
@@ -147,8 +173,8 @@ def prepare_model_inputs(node, inputs, context: ExecutionContext):
         round_kv = None
         anchor_stream = {
             "node": stream.node,
-            **filter_inputs(state, stream.node,
-                            next(iter(stream.inputs.values()))),
+            **filter_inputs(state, stream.node, stream.document_ids),
+            "holder": stream.holder,
         }
 
     def anchor_done(local_index, row):
@@ -190,11 +216,11 @@ def record_model_result(node, result: NodeResult,
                         context: ExecutionContext) -> None:
     """Record keys computed by the current query."""
     state = context.state
-    if isinstance(node, PackedFilter):
+    if isinstance(node, AiFilter):
         answers = result.outputs[f"filter_answers:{node.alias}"]
         state["seen"].update((node.alias, document)
                              for document in answers)
-    elif isinstance(node, AnchoredJoin):
+    elif isinstance(node, AiJoin):
         prepared = state["prepared_join"]
         keys = prepared["anchor_keys"]
         if prepared["streamed"]:
@@ -235,7 +261,7 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
         "pre": payload.get("pre_ids") or [],
         "retention": retention,
         "filter_limit": (
-            None if any(isinstance(node, AnchoredJoin)
+            None if any(isinstance(node, AiJoin)
                         for node in graph.nodes)
             else payload.get("filter_limit")
         ),
@@ -293,11 +319,11 @@ def model_answers(graph, result) -> tuple[dict, list]:
     """Collect filter and join answers from executed model nodes."""
     filters, joins = {}, []
     for node in graph.topological_nodes():
-        if isinstance(node, PackedFilter):
+        if isinstance(node, AiFilter):
             filters[node.alias] = result.nodes[node.node_id].outputs[
                 f"filter_answers:{node.alias}"
             ]
-        elif isinstance(node, AnchoredJoin):
+        elif isinstance(node, AiJoin):
             joins.extend(result.nodes[node.node_id].outputs[
                 f"join_answers:{stage.written_pos}"
             ] for stage in node.stages)
@@ -306,11 +332,11 @@ def model_answers(graph, result) -> tuple[dict, list]:
 
 def executed_join_plan(graph) -> list[dict]:
     """Describe the join nodes executed from the saved graph."""
-    from quail.physical import Exchange
+    from quail.physical import Barrier
 
     return [
         {"type": node.type_name, "id": node.node_id,
          **node.explain_fields()}
         for node in graph.topological_nodes()
-        if isinstance(node, (AnchoredJoin, Exchange))
+        if isinstance(node, (AiJoin, Barrier))
     ]

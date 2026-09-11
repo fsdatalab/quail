@@ -20,7 +20,6 @@ from quail.backends.request_scheduling import (
 from quail.execution import PhysicalResponse, export_physical_outputs
 from quail.logical import SHARED_PRE
 from quail.physical import (
-    DocumentInput,
     Limit,
     PhysicalNode,
     PortRef,
@@ -29,6 +28,7 @@ from quail.physical import (
     RequestExecution,
     RequestFilterSpec,
     RequestJoinSpec,
+    Scan,
 )
 from quail.physical.base import input_ports
 from quail.planner import (
@@ -95,7 +95,7 @@ def plan_request_backend(
         if scan.alias not in stats:
             raise ValueError(f"no document tokens for alias {scan.alias!r}")
         summary = stats[scan.alias]
-        node = DocumentInput(
+        node = Scan(
             node_id=f"input:{scan.alias}",
             alias=scan.alias,
             input_id=scan.alias,
@@ -775,7 +775,7 @@ def execute_request_graph(context, backend, engine_state, boot):
     documents = {
         node.alias: context.request.inputs[node.input_id].documents
         for node in context.graph.nodes
-        if isinstance(node, DocumentInput)
+        if isinstance(node, Scan)
     }
     settings = dict(envelope["settings"])
     model_execution = backend.start(GpuContext(
