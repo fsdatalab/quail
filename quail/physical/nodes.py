@@ -583,10 +583,9 @@ class Foreign(PhysicalNode):
             return (OutputPort(
                 f"pairs:{self.written_pos}", ValueType.PAIRS,
                 schema=tuple(self.aliases)),)
-        return tuple(
-            OutputPort(f"ids:{alias}", ValueType.DOCUMENT_IDS, schema=(alias,))
-            for alias in self.aliases
-        )
+        (alias,) = self.aliases
+        return (OutputPort(f"ids:{alias}", ValueType.DOCUMENT_IDS,
+                           schema=(alias,)),)
 
     def attributes(self) -> dict:
         return {
@@ -746,7 +745,7 @@ def validate_streams(graph) -> None:
         alias = node.alias
         reached = []
 
-        def follow(port, alias=alias, node=node, reached=reached):
+        def follow(port):
             for consumer in consumers.get(port, ()):
                 if isinstance(consumer, AiJoin) and consumer.anchor == alias:
                     reached.append(consumer)

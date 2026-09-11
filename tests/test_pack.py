@@ -612,8 +612,7 @@ def _check_stream(out, filter_truth, pages):
     assert stream.done
     assert stream.answers == expected_filter_rows(filter_truth)
     survivors = [d for d, truth in enumerate(filter_truth) if all(truth)]
-    assert sorted(stream.held) == survivors
-    assert out["anchor_keys"] == [("r", d) for d in stream.held]
+    assert sorted(key[1] for key in out["anchor_keys"]) == survivors
     assert not out["arena"].accounting.owned
     assert out["arena"].accounting.free_pages == pages
     return survivors

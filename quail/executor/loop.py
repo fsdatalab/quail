@@ -425,9 +425,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         if anchor_prefixes or anchor_keys:
             raise ValueError(
                 "anchor_source fills anchor_prefixes and anchor_keys")
-        prefixes = anchor_prefixes if isinstance(anchor_prefixes, list) \
-            else []
-        keys = anchor_keys if isinstance(anchor_keys, list) else []
+        prefixes, keys = anchor_prefixes, anchor_keys
     else:
         prefixes = list(anchor_prefixes)
         keys = (list(range(len(prefixes))) if anchor_keys is None
@@ -437,22 +435,8 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     frames = stage_frames or [[] for _ in range(k)]
     owned = arena.accounting.owned
 
-    if k == 0 or not stage_suffixes[0] \
-            or (anchor_source is None and not prefixes):
-        # no tuple to evaluate. A streamed source still runs its
-        # chain to the end, and every anchor it hands over settles
-        # with an empty row at once.
-        if anchor_source is not None:
-            while not anchor_source.done:
-                items, _ = anchor_source.next(evict_retained=True)
-                for key, prefix in items:
-                    keys.append(key)
-                    prefixes.append(prefix)
-                    if anchor_done is None:
-                        arena.free_key(key)
-                    else:
-                        anchor_done(len(keys) - 1, [])
-        return [dict() for _ in range(k)], [], 0
+    if k == 0:
+        return [], [], 0
     frame_max = max(len(f) for f in frames)
     resident = {a: len(owned[keys[a]]) for a in range(len(keys))
                 if keys[a] in owned}
@@ -932,13 +916,11 @@ class FilterStream:
         self.hold = hold_survivors
         self.preamble = p
         self.capacity_extra = capacity_extra
-        self.stage_tokens = stage_tokens
         self.tails = tails
         self.spans = []
         self.tokens = 0
         self.chunks = 0
         self.done = False
-        self.held = []          # positions handed over, in order
         self.outstanding = []   # (groups, handle) in launch order
         self.progress = Progress(
             f"filter ({len(question_ids)} stages)", total=len(doc_ids))
@@ -964,7 +946,7 @@ class FilterStream:
         groups, handle = entry
         bits = self.async_ans.result(handle)
         t = _tick(timing, "report_wait", t)
-        last_stage = len(self.stage_tokens) - 1
+        last_stage = len(self.tails) - 1
         for (doc, stage, _fresh), bit in zip(groups, bits):
             passed = bool(bit)
             last = stage == last_stage
@@ -979,7 +961,6 @@ class FilterStream:
                                           len(self.doc_ids[doc]))
                 self.sched.add_free_pages(freed)
             if hold:
-                self.held.append(doc)
                 items.append((self.keys[doc], self.doc_ids[doc]))
             if not passed or last:
                 self._finished += 1

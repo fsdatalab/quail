@@ -241,7 +241,7 @@ def _filter_alias_work(preds, stats, order, pre: int) -> Work:
 
 
 def node_estimates(graph, *, filter_works, stage_works, live, stats, pre,
-                   cap_pages, page_tokens, model, device, chunk) -> dict:
+                   cap_pages, model, device, chunk) -> dict:
     """Price each node's own work, and each chain's recompute if released.
 
     Returns node id -> {"seconds", and for a filter chain a later join
@@ -262,7 +262,7 @@ def node_estimates(graph, *, filter_works, stage_works, live, stats, pre,
             if node.alias in anchored:
                 mean = stats[node.alias].mean_doc_tokens
                 prefix = pre + mean
-                pages = -(-(prefix + node.hold_tokens) // page_tokens)
+                pages = -(-(prefix + node.hold_tokens) // budgets.PAGE_TOKENS)
                 fits = cap_pages // max(1, pages)
                 excess = max(0.0, live.get(node.alias, 0.0) - fits)
                 entry["release_recompute_tokens"] = round(excess * prefix)
@@ -591,7 +591,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
             keep_kv=keep, pin_survivors=pinned, hold_tokens=hold,
             stages=tuple(stages)))
         ids_src[alias] = PortRef(fid, f"ids:{alias}")
-        if alias in streamed:
+        if pinned:
             remarks.append(
                 f"filter on {alias!r} streams its survivors into "
                 f"the join anchored on it; each one's KV stays "
@@ -625,15 +625,13 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     # group consecutive full stages on the same anchor; gates run
     # alone; anchor switches become barriers
     records = iter(stage_records)
-    groups = [dict(anchor=group[0][1],
-                   full=group[0][0]["semantics"] == "full",
-                   members=[(spec, next(records)) for spec, _ in group])
+    groups = [[(spec, next(records)) for spec, _ in group]
               for group in sequence_groups]
     exec_idx = 0
     pairs_edges = []     # every full stage's passing-pairs edge
     out_aliases = []     # recombination's output order
     for g, group in enumerate(groups):
-        anchor = group["anchor"]
+        anchor = sequence_groups[g][0][1]
         if g > 0:
             ahead = [scan.alias for scan in scans]
             bid = unique_id("barrier", anchor)
@@ -662,7 +660,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
         stage_dicts = []
         in_aliases = [anchor]
         pair_inputs = []
-        for spec, record in group["members"]:
+        for spec, record in group:
             partners = [a for a in spec["aliases"] if a != anchor]
             pairs_from = ""
             for apply in join_applies.get(spec["written_pos"], ()):
@@ -708,7 +706,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
             inputs=input_ports(tuple(ids_src[a] for a in in_aliases)
                                + tuple(pair_inputs)),
             anchor=anchor,
-            anchor_resident=group["members"][0][1]["resident"],
+            anchor_resident=group[0][1]["resident"],
             keep_anchor_kv=anchor in retention_plan["after"][gid],
             stages=tuple(stage_dicts)))
         ids_src[anchor] = PortRef(gid, f"ids:{anchor}")
@@ -749,8 +747,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
         return node_estimates(
             graph, filter_works=filter_works, stage_works=stage_works,
             live=live0, stats=stats, pre=pre, cap_pages=cap_pages,
-            page_tokens=budgets.PAGE_TOKENS, model=model, device=device,
-            chunk=chunk)
+            model=model, device=device, chunk=chunk)
 
     return PhysicalPlan(
         model=model.name, device=device.name, workers=workers,

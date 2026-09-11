@@ -13,7 +13,13 @@ from quail.physical import (
     AiJoin,
     PhysicalGraph,
 )
-from quail.runtime.pairs import columns_key, pair_partner, partner_map
+from quail.runtime.pairs import (
+    allowed_members,
+    columns_key,
+    members_by_partner,
+    pair_partner,
+    partner_map,
+)
 from quail.runtime.runner import (
     ExecutionContext,
     GenericRunner,
@@ -109,10 +115,8 @@ def partner_list_builder(group, tuples_by_stage, maps):
             continue
         position = join["partners"].index(pair_partner(
             join.get("equalities"), join["anchor"], join["partners"]))
-        members = {}
-        for index, member in enumerate(tuples):
-            members.setdefault(int(member[position]), []).append(index)
-        stage_maps.append((maps[join["written_pos"]], members))
+        stage_maps.append((maps[join["written_pos"]],
+                           members_by_partner(tuples, position)))
     if all(entry is None for entry in stage_maps):
         return None
 
@@ -122,10 +126,7 @@ def partner_list_builder(group, tuples_by_stage, maps):
             if entry is None:
                 out.append(None)
                 continue
-            rows, members = entry
-            out.append(sorted(
-                index for partner in rows.get(int(anchor), ())
-                for index in members.get(int(partner), ())))
+            out.append(allowed_members(*entry, anchor))
         return out
 
     return lists_for
@@ -307,7 +308,6 @@ def prepare_model_inputs(node, inputs, context: ExecutionContext):
     state["prepared_join"] = {
         "node": node,
         "group": group,
-        "anchor_ids": anchor_ids,
         "anchor_keys": anchor_keys,
         "prefixes": prefixes,
         "tuple_indices": tuple_indices,
@@ -343,15 +343,11 @@ def record_model_result(node, result: NodeResult,
         if prepared["streamed"]:
             # every streamed anchor read its KV from the chain: a hit
             state["kv_stats"]["join_anchor_hits"] += len(keys)
-            anchor_ids = [key[1] for key in keys]
-        else:
-            anchor_ids = prepared["anchor_ids"]
         state["seen"].update(keys)
         live = set(result.outputs[f"ids:{node.anchor}"])
-        for document, key, prefix in zip(
-                anchor_ids, keys, prepared["prefixes"]):
+        for key, prefix in zip(keys, prepared["prefixes"]):
             if key in state["arena"].accounting.owned:
-                if node.keep_anchor_kv and document in live:
+                if node.keep_anchor_kv and key[1] in live:
                     config = state["retention"]
                     retain_after_join(state["arena"], key, len(prefix), config,
                                       config.get("after", {}).get(node.node_id, {}))

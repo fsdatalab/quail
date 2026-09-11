@@ -146,7 +146,7 @@ class ExtensionRegistry:
         )
 
     def register_function(
-        self, function: Callable[..., Any], *, name: str | None = None,
+        self, function: Callable[..., Any], *, name: str,
     ) -> ExtensionRegistry:
         """Register a Python function for a query's apply() nodes.
 
@@ -155,9 +155,7 @@ class ExtensionRegistry:
         """
         if not callable(function):
             raise TypeError("register_function needs a callable")
-        return self._add(
-            "function", getattr(function, "__name__", None)
-            if name is None else name, function)
+        return self._add("function", name, function)
 
     def register_observer(
         self, factory: Callable[[], ExecutionObserver], *, name: str | None = None,

@@ -44,7 +44,12 @@ from quail.planner import (
 from quail.planner.joins import search_joins, summarize_alias
 from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
 from quail.planning import PhysicalCandidate, SupportResult
-from quail.runtime.pairs import pair_partner, partner_map
+from quail.runtime.pairs import (
+    allowed_members,
+    members_by_partner,
+    pair_partner,
+    partner_map,
+)
 from quail.runtime.result import answer_table
 from quail.runtime.runner import (
     ExecutionContext,
@@ -336,15 +341,10 @@ def _allowed_members(spec, anchor, partners, anchor_ids, members,
     """Per anchor, the member indices its equality conditions allow."""
     position = partners.index(
         pair_partner(spec.equalities, anchor, partners))
-    by_partner = {}
-    for index, member in enumerate(members):
-        by_partner.setdefault(int(member[position]), []).append(index)
+    by_partner = members_by_partner(members, position)
     rows = partner_map(pairs, anchor, partners[position])
-    return [
-        sorted(index for partner in rows.get(int(anchor_id), ())
-               for index in by_partner.get(int(partner), ()))
-        for anchor_id in anchor_ids
-    ]
+    return [allowed_members(rows, by_partner, anchor_id)
+            for anchor_id in anchor_ids]
 
 
 def _join_answer_table(spec, rows, answers, anchor, partners) -> pa.Table:

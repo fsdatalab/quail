@@ -89,12 +89,7 @@ class QuailModelExecution:
                 # the holder; the result is complete once it has
                 stream = SurvivorStream(node, document_ids)
 
-                def finalize(node=node, stream=stream,
-                             document_ids=document_ids):
-                    if "answers" not in stream.holder:
-                        raise RuntimeError(
-                            f"{node.node_id!r} pins its survivors but no "
-                            "join consumed its stream")
+                def finalize():
                     return filter_result(
                         node, stream.holder["answers"],
                         stream.holder["tokens"], document_ids)
@@ -129,11 +124,6 @@ class QuailModelExecution:
         source = None
         if stream is not None:
             filter_node = stream["node"]
-            if not filter_node.arena_writes or not filter_node.pin_survivors:
-                raise ValueError(
-                    "a filter chain that streams into a join must write "
-                    "its KV to the arena and pin its survivors")
-            filter_ids = stream["document_ids"]
             # the chain hands each passing document over with its KV
             # pinned; pages cover the join's largest frame so the join
             # never claims a page of its own for a streamed anchor
@@ -147,11 +137,10 @@ class QuailModelExecution:
                  for question in filter_node.question_token_ids],
                 chunk_tokens,
                 arena_writes=True,
-                arena_keys=DocumentKeys(filter_node.alias, filter_ids),
+                arena_keys=DocumentKeys(filter_node.alias,
+                                        stream["document_ids"]),
                 hold_survivors=True,
-                hold_extra_tokens=max(
-                    filter_node.hold_tokens,
-                    *(len(frame) for frame in stage_frames)),
+                hold_extra_tokens=filter_node.hold_tokens,
                 attention_mode=FILTER_ATTENTION,
             )
         lists_for = inputs.get("anchor_partners")

@@ -638,28 +638,23 @@ class LogicalPlanBuilder:
     def add_join(self, join: JoinSpec) -> None:
         """Join each new table onto the tree, then ask the prompt.
 
-        Each Equality goes on the innermost Join whose output holds
-        both of its tables, so a condition prunes pairs as early as
-        the tree allows.
+        The equalities go on the Join that brings the last table in;
+        both front ends only produce conditions over that table.
         """
         if self._root is None:
             raise CompileError("a logical join needs an input table")
         root = self._root
-        pending = list(join.on)
         for alias in join.aliases:
             root = Join(root, self._nodes[alias])
-            present = {field.alias for field in root.output_schema()}
-            placed = tuple(condition for condition in pending
-                           if set(condition.aliases()) <= present)
-            if placed:
-                root = replace(root, on=placed)
-                pending = [condition for condition in pending
-                           if condition not in placed]
-        if pending:
-            raise CompileError(
-                f"join condition {pending[0]} names a table this join "
-                f"does not bring in ({list(join.aliases)}); put it on "
-                f"the JOIN that introduces the table")
+        present = {field.alias for field in root.output_schema()}
+        for condition in join.on:
+            if not set(condition.aliases()) <= present:
+                raise CompileError(
+                    f"join condition {condition} names a table this join "
+                    f"does not bring in ({list(join.aliases)}); put it on "
+                    f"the JOIN that introduces the table")
+        if join.on:
+            root = replace(root, on=tuple(join.on))
         written_pos = self._joins
         self._joins += 1
         for function, kind, columns in join.applies:

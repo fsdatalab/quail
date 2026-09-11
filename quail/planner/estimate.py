@@ -32,7 +32,7 @@ from quail.planner.decide import (
 from quail.planner.leftdeep import Extension, optimize_left_deep
 from quail.planner.live_rows import PairRelation, exact_live_rows
 from quail.planner.sol import SpeedOfLight, speed_of_light
-from quail.planner.work import Work, ask, scan
+from quail.planner.work import Work, ask, scan, triangle
 from quail.runtime.pairs import pair_table
 from quail.runtime.prefixes import prefix_credits
 from quail.specs import DeviceSpec, ModelSpec
@@ -266,8 +266,7 @@ class _Search:
             for partner_row in partner_rows
         ]
         all_tokens = sum(suffixes)
-        all_triangles = sum(suffix * (suffix + 1) / 2
-                            for suffix in suffixes)
+        all_triangles = sum(triangle(suffix) for suffix in suffixes)
         frame = labels_by_alias[anchor]["frame"]
         resident_rows = set(resident_rows)
         if self.credit_shared:
@@ -282,8 +281,7 @@ class _Search:
                             in zip(suffixes, partner_rows)
                             if partner_row[0] in mine]
                 suffix_tokens = sum(streamed)
-                suffix_triangles = sum(suffix * (suffix + 1) / 2
-                                       for suffix in streamed)
+                suffix_triangles = sum(triangle(suffix) for suffix in streamed)
             prefix = self.pre + self.aliases[anchor].tokens[row]
             work = work + (ask(prefix, frame) if row in resident_rows
                            else self.first_use(anchor, row, frame))

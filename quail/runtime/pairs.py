@@ -86,3 +86,17 @@ def partner_map(pairs: pa.Table, anchor_alias: str,
                                pairs.column(partner_alias).to_pylist()):
         out.setdefault(int(anchor), []).append(int(partner))
     return out
+
+
+def members_by_partner(members, position: int) -> dict:
+    """Partner row -> indices of the member tuples that hold it."""
+    by_partner = {}
+    for index, member in enumerate(members):
+        by_partner.setdefault(int(member[position]), []).append(index)
+    return by_partner
+
+
+def allowed_members(rows: dict, by_partner: dict, anchor) -> list:
+    """The sorted member indices one anchor's pair rows allow."""
+    return sorted(index for partner in rows.get(int(anchor), ())
+                  for index in by_partner.get(int(partner), ()))

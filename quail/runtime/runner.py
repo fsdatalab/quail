@@ -265,10 +265,6 @@ class GenericRunner:
                     observer.after_node(node, result)
 
         root = (graph.root.node_id, graph.root.port)
-        if isinstance(values[root], SurvivorStream):
-            raise ValueError(
-                f"root output {root[0]!r}.{root[1]!r} is a survivor "
-                "stream that no operator consumed")
         metrics = NodeMetrics()
         for node in graph.topological_nodes():
             result = node_results[node.node_id]

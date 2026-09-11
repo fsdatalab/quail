@@ -287,7 +287,7 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                 title += f", estimated_seconds={estimate['seconds']:.3f}"
             title += ")"
             if "release_recompute_tokens" in estimate:
-                pinned = isinstance(node, AiFilter) and node.pin_survivors
+                pinned = node.pin_survivors
                 details.append(
                     ("if the KV were released here instead of pinned: "
                      if pinned else "expected recompute at the join: ")

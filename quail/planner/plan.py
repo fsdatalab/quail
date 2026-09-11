@@ -201,8 +201,6 @@ class PhysicalPlan:
                     replace(port, source=upstream) if port.source == gone
                     else port for port in existing.inputs))
             nodes.append(existing)
-        if self.root.node_id == node_id:
-            raise PlanEditError(f"{node_id!r} is the plan's root")
         return self._rebuild(nodes)
 
     def move(self, node_id: str, *, between: tuple) -> "PhysicalPlan":

@@ -13,18 +13,17 @@ ids, estimates, edits, and reports have the same shape as on a GPU.
 import sys
 from pathlib import Path
 
-import pyarrow as pa
-
 # The fake model and arena live with the tests, and the package is not
 # installed in the virtual environment.
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "tests")]
 
-from test_fixed_join_plan import FixedFeverAnswers  # noqa: E402
+from fakes import same_page  # noqa: E402
+from test_fixed_join_plan import FixedFeverAnswers, register_fever  # noqa: E402
 from test_quail_backend import graph_state  # noqa: E402
 
 import quail  # noqa: E402
-from quail import DocumentProvider, EngineConfig, col, prompt  # noqa: E402
+from quail import EngineConfig, col, prompt  # noqa: E402
 from quail.backends.quail.graph import execute_single_graph  # noqa: E402
 from quail.execution import PhysicalResponse  # noqa: E402
 from quail.physical import Barrier, Scan, decode_graph  # noqa: E402
@@ -46,20 +45,6 @@ WHERE AI_FILTER(PROMPT('{PERSON}', c.claim))
 """
 
 
-def tables():
-    """Three claims, two of them on page e0, and three evidence passages."""
-    claims = pa.table({
-        "id": ["c0", "c1", "c2"],
-        "claim": [f"{i} " + "word " * 20 for i in range(3)],
-        "evidence_wiki_url": ["e0", "e0", "e2"],
-    })
-    evidence = pa.table({
-        "id": ["e0", "e1", "e2"],
-        "text": [f"{i} " + "word " * 300 for i in range(3)],
-    })
-    return claims, evidence
-
-
 def fake_executor(session, seen):
     """A physical executor that answers from the FEVER test fake."""
 
@@ -79,22 +64,12 @@ def fake_executor(session, seen):
     return execute
 
 
-def same_page(tables):
-    """Pair each claim with the evidence row its wiki url names."""
-    claims, evidence = tables["c"], tables["e"]
-    return claims.join(evidence, keys=["evidence_wiki_url"],
-                       right_keys=["id"], join_type="inner").select(["c", "e"])
-
-
 def main():
     """Print the plans, edit one, and run all of them under the fakes."""
-    claims, evidence = tables()
     with quail.Session(EngineConfig(),
                        tokenizer=lambda text: list(text.encode())) as session:
-        session.register("claims",
-                         DocumentProvider.from_table(claims, id_col="id"))
-        session.register("evidence",
-                         DocumentProvider.from_table(evidence, id_col="id"))
+        # three claims, two of them on page e0, and three passages
+        register_fever(session)
 
         print("=== SQL ===" + SQL)
         query = session.sql(SQL)

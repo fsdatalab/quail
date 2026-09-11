@@ -107,11 +107,7 @@ class DistributedQuailExecution:
             # GPU and fills the holder with the merged answers
             stream = SurvivorStream(node, list(document_ids))
 
-            def finalize(node=node, stream=stream):
-                if "answers" not in stream.holder:
-                    raise RuntimeError(
-                        f"{node.node_id!r} pins its survivors but no "
-                        "join consumed its stream")
+            def finalize():
                 answers = stream.holder["answers"]
                 survivors = stream.holder["survivors"]
                 return NodeResult(
@@ -196,8 +192,7 @@ class DistributedQuailExecution:
         if stream is not None:
             # the anchor's chain runs inside this round on each GPU,
             # over that GPU's filter shard of every anchor document
-            filter_ids = list(stream.document_ids)
-            survivors[node.anchor] = filter_ids
+            survivors[node.anchor] = list(stream.document_ids)
             filtered_aliases.add(node.anchor)
         if not self.joins_started:
             self.snapshot_after_filters()
@@ -284,8 +279,7 @@ class DistributedQuailExecution:
             },
             NodeMetrics(
                 wall_s=wall,
-                input_rows=len(enriched[-1]["anchor_index"]) if enriched
-                else len(survivors[node.anchor]),
+                input_rows=len(enriched[-1]["anchor_index"]),
                 output_rows=len(anchor_survivors),
                 evaluated_document_pairs=sum(
                     sum(len(row) for row in stage["rows"].values())

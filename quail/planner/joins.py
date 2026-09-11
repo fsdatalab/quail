@@ -167,14 +167,6 @@ def residency(anchor: str, state: KVState, resident_aliases,
     return "none"
 
 
-def resident_count(anchor: str, state: KVState, lengths: dict,
-                   resident_aliases, same_group: bool = False) -> int:
-    """Number of documents credited as resident for one stage."""
-    if residency(anchor, state, resident_aliases, same_group) == "none":
-        return 0
-    return lengths[anchor].count
-
-
 def stage_work(spec: dict, anchor: str, live: dict, lengths: dict,
                pre: int, *, resident: bool = False) -> Work:
     """Expected Work of one stage at the current live counts.
@@ -253,7 +245,7 @@ def walk(seq, live0: dict, lengths: dict, resident, pre: int,
                       and state.pending_anchor == anchor
                       and spec["semantics"] == "full")
         kind = residency(anchor, state, resident, same_group)
-        kept = resident_count(anchor, state, lengths, resident, same_group)
+        kept = lengths[anchor].count if kind != "none" else 0
         w = stage_work(spec, anchor, live, lengths, pre,
                        resident=kind != "none")
         records.append(dict(written_pos=spec["written_pos"],
@@ -410,8 +402,7 @@ def search_joins(specs, live: dict, lengths: dict, resident,
                         and spec["semantics"] == "full")
                     kind = residency(anchor, state_now, resident,
                                      same_group)
-                    kept = resident_count(anchor, state_now, lengths,
-                                          resident, same_group)
+                    kept = lengths[anchor].count if kind != "none" else 0
                     work = stage_work(spec, anchor, live_now, lengths, pre,
                                       resident=kind != "none")
                     step = dict(

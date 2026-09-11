@@ -1,18 +1,30 @@
-r"""Compare pre-planned and continuous join batching on one Modal H100.
+r"""Compare a baseline checkout with this checkout on one Modal H100.
 
-The baseline checkout is main before JoinAdmission (d7a96e0). Both
-implementations run IMDB-8, FEV-7, and FEV-9 in the same container on
-the same GPU, one warmup and one measured run each.
+Both run the same queries in the same container on the same GPU, one
+warmup and one measured run each. The baseline is a git worktree of an
+older commit, mounted beside this checkout.
 
-Prepare the baseline checkout and tee the invocation:
+The join batching comparison (main before JoinAdmission, d7a96e0):
 
-    git worktree add --detach /tmp/quail-preplanned-baseline-d7a96e0 d7a96e0
+    git worktree add --detach /tmp/quail-baseline-d7a96e0 d7a96e0
     uv run modal run experiments/cells/join_continuous_batching.py \
       --prediction "State the prediction before running." \
       2>&1 | tee /tmp/quail-join-continuous-batching.log
 
+The streamed filter-to-join comparison (main before the streamed edge,
+8338d92, against this branch):
+
+    git worktree add --detach /tmp/quail-baseline-8338d92 8338d92
+    QUAIL_BASELINE_COMMIT=8338d92 \
+    uv run modal run experiments/cells/join_continuous_batching.py \
+      --prediction "State the prediction before running." \
+      --queries IMDB-3,IMDB-4,IMDB-5,IMDB-10,BIO-3 \
+      --labels materialized,streamed --slug streamed-filter-join \
+      2>&1 | tee /tmp/quail-streamed-filter-join.log
+
 Set QUAIL_BASELINE_DIR to use another location for the baseline checkout.
-Results and answer tables are saved on the quail-results volume.
+Results and answer tables are saved on the quail-results volume under
+/results/ablations/<slug>-<stamp>/.
 """
 
 import inspect
@@ -22,10 +34,10 @@ from pathlib import Path
 import modal
 
 QUERIES = ("IMDB-8", "FEV-7", "FEV-9")
-BASELINE_COMMIT = "d7a96e0"
+BASELINE_COMMIT = os.environ.get("QUAIL_BASELINE_COMMIT", "d7a96e0")
 
 baseline = Path(os.environ.get(
-    "QUAIL_BASELINE_DIR", f"/tmp/quail-preplanned-baseline-{BASELINE_COMMIT}"))
+    "QUAIL_BASELINE_DIR", f"/tmp/quail-baseline-{BASELINE_COMMIT}"))
 image = (
     modal.Image.from_registry(
         "nvidia/cuda:13.0.1-devel-ubuntu24.04", add_python="3.12")
@@ -126,14 +138,14 @@ def _run(label, output_dir, query_ids):
 
 @app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
               volumes=volumes)
-def compare(prediction: str, query_ids: str) -> str:
+def compare(prediction: str, query_ids: str, labels: str, slug: str) -> str:
     import json
     import subprocess
     import sys
     from datetime import datetime, timezone
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    output = Path(f"/results/ablations/join-continuous-batching-{stamp}")
+    output = Path(f"/results/ablations/{slug}-{stamp}")
     output.mkdir(parents=True, exist_ok=True)
     gpu = subprocess.check_output([
         "nvidia-smi", "--query-gpu=uuid", "--format=csv,noheader",
@@ -141,11 +153,11 @@ def compare(prediction: str, query_ids: str) -> str:
     (output / "setup.json").write_text(json.dumps({
         "prediction": prediction, "baseline_commit": BASELINE_COMMIT,
         "queries": query_ids.split(","),
-        "gpu_uuid": gpu, "order": ["preplanned", "continuous"],
+        "gpu_uuid": gpu, "order": labels.split(","),
         "warmup": "One unmeasured run per query per implementation",
     }, indent=2))
-    for label, python_path in (("preplanned", "/opt/quail-baseline:/root"),
-                               ("continuous", "/root")):
+    for label, python_path in zip(labels.split(","),
+                                  ("/opt/quail-baseline:/root", "/root")):
         environment = {**os.environ, "PYTHONPATH": os.pathsep.join(
             [python_path, *(path for path in sys.path if path)]
         )}
@@ -162,9 +174,11 @@ def compare(prediction: str, query_ids: str) -> str:
 
 
 @app.local_entrypoint()
-def main(prediction: str, queries: str = ",".join(QUERIES)):
+def main(prediction: str, queries: str = ",".join(QUERIES),
+         labels: str = "preplanned,continuous",
+         slug: str = "join-continuous-batching"):
     if not prediction:
         raise ValueError("state the prediction before running")
-    call = compare.spawn(prediction, queries)
+    call = compare.spawn(prediction, queries, labels, slug)
     print(f"function call id: {call.object_id}", flush=True)
     print(f"result volume path: {call.get()}", flush=True)

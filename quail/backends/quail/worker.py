@@ -527,8 +527,6 @@ def _child_joins(state, sub):
                 "documents": DocumentPrefixes(
                     pre, anchor_docs, range(len(anchor_docs))),
                 "document_ids": anchors_glob,
-                "limit": None,
-                "retain_survivors": (),
                 "holder": {},
             }
 
@@ -569,8 +567,9 @@ def _child_joins(state, sub):
         filter_out = {}
         if filter_node is not None:
             anchors_glob = [key[1] for key in anchor_keys]
-            round_kv = dict(hits=len(anchor_keys), misses=0,
-                            regret_tokens=0)
+            round_kv = dict(hits=result.metrics.kv_hits,
+                            misses=result.metrics.kv_misses,
+                            regret_tokens=result.metrics.regret_tokens)
             holder = anchor_stream["holder"]
             chain = filter_result(
                 filter_node, holder["answers"], holder["tokens"],

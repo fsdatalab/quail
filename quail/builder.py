@@ -207,7 +207,7 @@ class Query:
         return self
 
     def apply(self, fn, columns=(), *, name=None, ids=None,
-              kind="per_batch", alias=None) -> "Query":
+              kind="per_batch") -> "Query":
         """Call a Python function between two operators.
 
         The function receives a dict of Arrow tables keyed by alias:
@@ -225,7 +225,6 @@ class Query:
                 (returns every id), or "pairs" (after join()).
             kind: "per_batch" runs on each batch a streaming operator
                 hands over; "barrier" runs once over every survivor.
-            alias: The table, when no column says which.
         """
         if not callable(fn):
             raise CompileError("apply() needs a callable")
@@ -257,24 +256,18 @@ class Query:
             raise CompileError(
                 f"apply ids must be preserve, drop, or pairs, got {ids!r}")
         owners = {ref.alias for ref in refs}
-        if alias is not None:
-            if alias not in self._scope():
-                raise CompileError(f"unknown table alias {alias!r}")
-            owners.add(alias)
         if len(owners) != 1:
             raise CompileError(
                 f"apply {name!r} must work on one table; its columns "
-                f"name {sorted(owners) or 'none'} (pass alias=...)")
+                f"name {sorted(owners) or 'none'}")
         (alias,) = owners
         self._applies.setdefault(alias, []).append((name, kind, ids, refs))
         self._functions[name] = fn
         return self
 
-    def apply_table(self, fn, columns=(), *, name=None, ids=None,
-                    alias=None) -> "Query":
+    def apply_table(self, fn, columns=(), *, name=None, ids=None) -> "Query":
         """Call a function once over every survivor: apply() as a barrier."""
-        return self.apply(fn, columns, name=name, ids=ids, kind="barrier",
-                          alias=alias)
+        return self.apply(fn, columns, name=name, ids=ids, kind="barrier")
 
     @property
     def functions(self) -> dict:

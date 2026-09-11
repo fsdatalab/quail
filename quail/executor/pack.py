@@ -431,13 +431,11 @@ class JoinAdmission:
                 self._next[a] = 0
                 if self._count(a, j + 1):
                     self.ready.append(a)
-                elif j + 1 == k - 1:
-                    # no partner at the last stage: an empty row
-                    self._stage[a] = _DONE
-                    events.append(("finished", a))
                 else:
+                    # no partner at the next stage: an empty row when
+                    # it was the last, dropped otherwise
                     self._stage[a] = _DONE
-                    events.append(("dropped", a))
+                    events.append(("finished" if j + 2 == k else "dropped", a))
             elif complete and not self._true[a][j]:
                 self._stage[a] = _DONE
                 events.append(("dropped", a))
