@@ -35,6 +35,7 @@ from quail.planner import (
     budgets,
     collect_operators,
     default_order_rule,
+    hash_join_nodes,
     order_filters_indexed,
     preamble_tokens,
 )
@@ -121,6 +122,10 @@ def plan_request_backend(
         )
         nodes.append(node)
         input_refs.append(PortRef(node.node_id, f"ids:{scan.alias}"))
+
+    for node in hash_join_nodes(joins, context.pair_fractions, input_refs):
+        nodes.append(node)
+        input_refs.append(PortRef(node.node_id, f"pairs:{node.written_pos}"))
 
     rule = context.order or default_order_rule(filters, joins)[0]
     chunk_tokens = budgets.chunk_budget(context.model, context.device)
@@ -219,7 +224,7 @@ def plan_request_backend(
             label_token_ids=labels,
             frame_token_ids=frames,
             tail_token_ids=tuple(prompt.tail_token_ids),
-            equalities=tuple(search_specs[written_pos]["on"]),
+            over_pairs=bool(search_specs[written_pos]["on"]),
         ))
 
     preambles = {
@@ -339,8 +344,7 @@ def _filter_answer_table(alias, written_positions, answers) -> pa.Table:
 def _allowed_members(spec, anchor, partners, anchor_ids, members,
                      pairs) -> list:
     """Per anchor, the member indices its equality conditions allow."""
-    position = partners.index(
-        pair_partner(spec.equalities, anchor, partners))
+    position = partners.index(pair_partner(anchor, partners))
     by_partner = members_by_partner(members, position)
     rows = partner_map(pairs, anchor, partners[position])
     return [allowed_members(rows, by_partner, anchor_id)
@@ -522,7 +526,7 @@ class RequestModelExecution:
         self.client = settings["client"]
         self.sampling_params = settings["sampling_params"]
         self.documents = settings["documents"]
-        self.pairs = settings.get("pairs", {})
+        self.pairs = {}         # written position -> pair table, from ports
         self.true_ids = set(settings["true_ids"])
         self.capacity = settings["capacity"]
         self.filter_submission = settings["filter_submission"]
@@ -537,7 +541,10 @@ class RequestModelExecution:
             raise TypeError(
                 f"request backend cannot execute {node.type_name!r}"
             )
-        del inputs
+        for port in node.inputs:
+            if port.source.port.startswith("pairs:"):
+                position = int(port.source.port.split(":", 1)[1])
+                self.pairs[position] = inputs[port.name]
         started = time.perf_counter()
         survivors = {
             alias: list(range(len(self.documents[alias])))
@@ -669,7 +676,7 @@ class RequestModelExecution:
             # a join over pairs asks each anchor about its own members
             allowed = None
             request_pairs = None
-            if spec.equalities:
+            if spec.over_pairs:
                 allowed = _allowed_members(
                     spec, anchor, partners, anchor_ids, members,
                     self.pairs[spec.written_pos])
@@ -831,7 +838,6 @@ def execute_request_graph(context, backend, engine_state, boot):
             **settings,
             **engine_state,
             "documents": documents,
-            "pairs": context.request.pair_tables(),
         },
     ))
     if engine_state["client"].reset_prefix_cache() is False:

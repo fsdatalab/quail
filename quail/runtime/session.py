@@ -27,7 +27,6 @@ from quail.runtime.pairs import (
     columns_key,
     pair_fraction,
     pair_table,
-    pairs_key,
 )
 from quail.runtime.prefixes import prefix_metrics
 from quail.runtime.result import IndexRelation, QueryResult, true_answer_rows
@@ -502,7 +501,6 @@ class Query:
         self._token_inputs = None
         self._token_futures = {}
         self._estimated = ()
-        self._pairs = {}          # join written position -> pair table
         self.token_wait_s = 0.0
 
     def token_inputs(self) -> dict:
@@ -543,13 +541,7 @@ class Query:
                 estimated.append(s.alias)
             self._estimated = tuple(estimated)
             started = time.perf_counter()
-            self._pairs = self._pair_tables(scans, joins)
-            pair_fractions = {
-                position: pair_fraction(
-                    table, len(self._doc_tokens[table.column_names[0]]),
-                    len(self._doc_tokens[table.column_names[1]]))
-                for position, table in self._pairs.items()
-            }
+            pair_fractions = self._pair_fractions(scans, joins)
             self._plan = plan_query(
                 self.logical, model=self.session.model,
                 device=self.session.device,
@@ -563,10 +555,10 @@ class Query:
             say(f"plan ready in {time.perf_counter() - started:.2f} s")
         return self._plan
 
-    def _pair_tables(self, scans, joins) -> dict:
-        """Build the pair table of every join with equality conditions."""
+    def _pair_fractions(self, scans, joins) -> dict:
+        """Pairs kept over the cross product, per join with conditions."""
         providers = {scan.alias: scan.provider for scan in scans}
-        tables = {}
+        fractions = {}
         for position, join in enumerate(joins):
             conditions = join_conditions(join)
             if not conditions:
@@ -581,9 +573,11 @@ class Query:
                     providers[left.alias], left.column))
                 right_keys.append(self.session.column_values(
                     providers[right.alias], right.column))
-            tables[position] = pair_table(
-                left_alias, left_keys, right_alias, right_keys)
-        return tables
+            fractions[position] = pair_fraction(
+                pair_table(left_alias, left_keys, right_alias, right_keys),
+                len(self._doc_tokens[left_alias]),
+                len(self._doc_tokens[right_alias]))
+        return fractions
 
     def explain(self, *, verbose: bool = False) -> str:
         """Return the optimized plan, optionally including runtime settings."""
@@ -643,14 +637,15 @@ class Query:
                 self._token_inputs[node.alias].tokens
             )
         envelope = plan.to_envelope(self.session.registry.codecs)
-        relations = {pairs_key(position): table
-                     for position, table in self._pairs.items()}
-        relations.update(self._column_tables())
-        return PhysicalRequest(envelope, inputs, relations)
+        return PhysicalRequest(envelope, inputs, self._column_tables())
 
     def _column_tables(self) -> dict:
-        """One value table per alias an apply() function reads."""
+        """One value table per alias a HashJoin or an apply() reads."""
         needed = {}
+        for join in collect_operators(self.logical)[2]:
+            for condition in join_conditions(join):
+                for ref in (condition.left, condition.right):
+                    needed.setdefault(ref.alias, {})[ref.column] = None
         for apply in collect_applies(self.logical):
             for ref in apply.columns:
                 needed.setdefault(ref.alias, {})[ref.column] = None

@@ -15,7 +15,7 @@ from quail.physical import (
     PortRef,
     ValueType,
 )
-from quail.runtime.pairs import COLUMNS_PREFIX, PAIRS_PREFIX
+from quail.runtime.pairs import COLUMNS_PREFIX
 from quail.runtime.tokens import decode_token_documents
 
 
@@ -45,10 +45,8 @@ def document_input(tokens) -> TokenizedInput:
 class PhysicalRequest:
     """A physical plan, its token input bindings, and its relations.
 
-    relations holds one pair table per join with equality conditions,
-    keyed ``pairs:<written position>``, and one value table per alias
-    an apply() function reads, keyed ``columns:<alias>``; see
-    quail.runtime.pairs.
+    relations holds one value table per alias a HashJoin or an apply()
+    function reads, keyed ``columns:<alias>``; see quail.runtime.pairs.
     """
 
     plan: Mapping[str, Any]
@@ -64,18 +62,12 @@ class PhysicalRequest:
                     "physical execution inputs must be TokenizedInput values"
                 )
         for key, value in self.relations.items():
-            if not key.startswith((PAIRS_PREFIX, COLUMNS_PREFIX)):
+            if not key.startswith(COLUMNS_PREFIX):
                 raise ValueError(
-                    f"execution relations are keyed {PAIRS_PREFIX}<written "
-                    f"position> or {COLUMNS_PREFIX}<alias>, got {key!r}")
+                    f"execution relations are keyed {COLUMNS_PREFIX}<alias>, "
+                    f"got {key!r}")
             if not isinstance(value, pa.Table):
                 raise TypeError("execution relations must be Arrow tables")
-
-    def pair_tables(self) -> dict[int, pa.Table]:
-        """Return the pair tables keyed by join written position."""
-        return {int(key[len(PAIRS_PREFIX):]): table
-                for key, table in self.relations.items()
-                if key.startswith(PAIRS_PREFIX)}
 
     def column_tables(self) -> dict[str, pa.Table]:
         """Return the value tables apply() functions read, by alias."""

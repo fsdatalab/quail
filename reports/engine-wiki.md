@@ -239,11 +239,14 @@ There are five operators, defined in `logical.py`:
   expected to pass).
 - **Join**: one binary relational join with ordinary column
   equalities (`on`); an empty `on` is a cross join. Its pairs are what
-  the SemanticJoin above it asks the model about. The session builds
-  the pair table with an Arrow hash join over the key columns and
-  ships it with the request, so a pair the equality rules out is
-  never built, packed, or priced. The projection pushdown loads the
-  key columns as values like any returned column.
+  the SemanticJoin above it asks the model about. It becomes a
+  physical `HashJoin` node (`hash_join:<left>-<right>`) that reads the
+  two scans and the key columns the request carries, pairs the rows
+  whose keys are equal with an Arrow hash join, and feeds the pairs
+  to the `AiJoin` on its `pairs:<written position>` port, the same
+  port a pairs-returning `Foreign` uses. A pair the equality rules
+  out is never built, packed, or priced. The projection pushdown
+  loads the key columns as values like any returned column.
 - **SemanticJoin**: one true/false predicate over a whole tuple of
   documents, one per table - the pairs of the Join beneath it, or the
   cross product of its tables, filtered by a single prompt that holds

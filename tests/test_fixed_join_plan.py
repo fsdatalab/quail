@@ -106,8 +106,7 @@ class FixedFeverAnswers:
                        else {(0, 0), (1, 1), (2, 0), (1, 2)})
             partners = inputs["partner_indices"][stage.written_pos]
             # a stage over pairs asks each anchor about its own members
-            members = ({} if lists_for and (stage.equalities or stage.pairs_from)
-                       else None)
+            members = {} if lists_for and stage.pairs_from else None
             rows = {}
             for local in sorted(live):
                 mine = (range(len(partners)) if members is None
@@ -327,18 +326,22 @@ def fever_executor(session, monkeypatch, gpus, check=None, capacity=1):
 def test_fev10_asks_the_model_about_same_page_pairs_only(monkeypatch):
     """FEV-10 on one GPU and on two: the join runs over the pair table."""
     def check(request, graph):
-        pairs = request.pair_tables()
-        assert pairs[0].to_pydict() == {"c": [0, 1, 2], "e": [0, 0, 2]}
-        return {"pairs": pairs}
+        columns = request.column_tables()
+        assert columns["c"].column("evidence_wiki_url").to_pylist() == [
+            "e0", "e0", "e2"]
+        return {"columns": columns}
 
     for gpus in (1, 2):
         with quail.Session(EngineConfig(gpus=gpus),
                            tokenizer=lambda text: list(text.encode())) as session:
             register_fever(session)
             query = quailb.queries(session)["FEV-10"][1]()
-            (stage,) = query.plan().graph.nodes_by_type(AiJoin.type_name)[0].stages
-            assert stage.equalities == (("c", "evidence_wiki_url", "e", "id"),)
-            assert stage.pair_fraction == 3 / 9
+            plan = query.plan()
+            (stage,) = plan.graph.nodes_by_type(AiJoin.type_name)[0].stages
+            hash_join = plan.graph.node("hash_join:c-e")
+            assert hash_join.on == (("evidence_wiki_url", "id"),)
+            assert hash_join.pair_fraction == 3 / 9
+            assert stage.pairs_from == "hash_join:c-e"
             result = execute_query(
                 query, physical_executor=fever_executor(session, monkeypatch, gpus,
                                                         check))
@@ -369,7 +372,6 @@ def _fev10_by_apply(session, kind):
 
 def test_fev10_written_with_apply_matches_the_equality(monkeypatch):
     def check(request, graph):
-        assert request.pair_tables() == {}
         columns = request.column_tables()
         assert columns["c"].column("evidence_wiki_url").to_pylist() == [
             "e0", "e0", "e2"]
@@ -383,7 +385,7 @@ def test_fev10_written_with_apply_matches_the_equality(monkeypatch):
             plan = query.plan()
             (join,) = plan.graph.nodes_by_type(AiJoin.type_name)
             (stage,) = join.stages
-            assert stage.pairs_from == "same_page" and not stage.equalities
+            assert stage.pairs_from == "apply:same_page"
             # the anchor's chain streams only when the function runs per
             # batch; a barrier needs every survivor first
             chain = next(node for node in plan.nodes

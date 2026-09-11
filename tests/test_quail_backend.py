@@ -27,7 +27,6 @@ from quail.physical import (
     Scan,
 )
 from quail.physical.base import input_ports
-from quail.runtime.pairs import partner_map
 from quail.runtime.runner import NodeMetrics, NodeResult
 from quail.specs import DEVICES, MODELS
 
@@ -316,24 +315,26 @@ def test_streamed_edge_runs_through_the_quail_graph(monkeypatch):
     assert kinds.index("join") < len(kinds) - 1 - kinds[::-1].index("filter")
 
 
-def _pair_graph_run(monkeypatch, pin_survivors, pairs):
-    equalities = () if pairs is None else (("r", "key", "p", "key"),)
-    return run_graph_on_arena(
-        monkeypatch, two_alias_graph(pin_survivors, equalities=equalities),
-        pairs={} if pairs is None else {0: pairs})
+def _key_columns(r_keys, p_keys):
+    return {
+        "r": pa.table({"r": pa.array(range(len(r_keys)), pa.int32()),
+                       "key": pa.array(r_keys)}),
+        "p": pa.table({"p": pa.array(range(len(p_keys)), pa.int32()),
+                       "key": pa.array(p_keys)}),
+    }
 
 
 def test_pair_join_runs_through_the_quail_graph(monkeypatch):
-    # document d pairs with partner d % 4 and, for even d, with 3 too
-    rows = [(d, d % 4) for d in range(14)] + [(d, 3) for d in range(0, 14, 2)
-                                              if d % 4 != 3]
-    pairs = pa.table({"r": pa.array([r for r, _ in rows], pa.int32()),
-                      "p": pa.array([p for _, p in rows], pa.int32())})
-    allowed = partner_map(pairs, "r", "p")
+    # document d has key d % 4; partners 0 and 3 share key 0, so a
+    # document with key 0 pairs with both and one with key 3 with none
+    columns = _key_columns([d % 4 for d in range(14)], [0, 1, 2, 0])
+    allowed = {d: [i for i in range(4) if d % 4 == i % 3] for d in range(14)}
     for pin_survivors in (True, False):
-        result, _, filter_truth, join_truth = _pair_graph_run(
-            monkeypatch, pin_survivors, pairs)
-        cross, _, _, _ = _pair_graph_run(monkeypatch, pin_survivors, None)
+        result, _, filter_truth, join_truth = run_graph_on_arena(
+            monkeypatch, two_alias_graph(pin_survivors, hash_join=True),
+            columns=columns)
+        cross, _, _, _ = run_graph_on_arena(
+            monkeypatch, two_alias_graph(pin_survivors))
         survivors = [d for d, truth in enumerate(filter_truth) if all(truth)]
         stage = result["joins"][0]
         assert sorted(stage["anchor_index"]) == survivors
@@ -341,8 +342,9 @@ def test_pair_join_runs_through_the_quail_graph(monkeypatch):
         for local, document in enumerate(stage["anchor_index"]):
             mine = sorted(allowed[document])
             assert members[local] == mine
-            assert stage["rows"][local] == [join_truth[("r", document)][i]
-                                            for i in mine]
+            # an anchor with no pair settles without a row
+            assert stage["rows"].get(local, []) == [
+                join_truth[("r", document)][i] for i in mine]
         # the exported answer table holds exactly the evaluated pairs
         table = result["_outputs"][PortRef("group:0", "join_answers:0")]
         assert sorted(zip(table.column("r").to_pylist(),
@@ -359,6 +361,8 @@ def test_pair_join_runs_through_the_quail_graph(monkeypatch):
         assert metrics["fresh_tokens"] < (
             cross["node_metrics"]["group:0"]["fresh_tokens"])
         assert result["regret_tokens"] == 0
+        assert result["node_metrics"]["hash_join:r-p"]["output_rows"] == sum(
+            len(mine) for mine in allowed.values())
         # anchors whose pairs all answered FALSE are gone; the rest
         # survive with the same rule as a cross join
         kept = [d for d in survivors
@@ -369,14 +373,9 @@ def test_pair_join_runs_through_the_quail_graph(monkeypatch):
 
 def _foreign_run(monkeypatch, graph, functions):
     # document d has key d % 4; partner i has key i
-    columns = {
-        "r": pa.table({"r": pa.array(range(14), pa.int32()),
-                       "key": pa.array([d % 4 for d in range(14)])}),
-        "p": pa.table({"p": pa.array(range(4), pa.int32()),
-                       "key": pa.array(list(range(4)))}),
-    }
     result, _, filter_truth, join_truth = run_graph_on_arena(
-        monkeypatch, graph, seed=9, columns=columns, functions=functions)
+        monkeypatch, graph, seed=9, functions=functions,
+        columns=_key_columns([d % 4 for d in range(14)], list(range(4))))
     survivors = [d for d, truth in enumerate(filter_truth) if all(truth)]
     return result, survivors, join_truth
 

@@ -59,11 +59,8 @@ class JoinStage:
     pair_tail_tokens: int
     anchor_resident: str
     tuple_tokens: float
-    # ordinary join conditions (left alias, left column, right alias,
-    # right column); the stage streams only the pairs they allow
-    equalities: tuple[tuple[str, str, str, str], ...] = ()
-    pair_fraction: float = 1.0
-    # the apply() function whose pairs the stage streams, if any
+    # the node (a HashJoin or a Foreign) whose pairs the stage streams
+    # each anchor against, if any; empty for a cross join
     pairs_from: str = ""
     frame_token_ids: tuple[int, ...] = ()
     label_token_ids: tuple[tuple[str, tuple[int, ...]], ...] = ()
@@ -83,11 +80,6 @@ class JoinStage:
             pair_tail_tokens=int(value["pair_tail_tokens"]),
             anchor_resident=str(value["anchor_resident"]),
             tuple_tokens=float(value["tuple_tokens"]),
-            equalities=tuple(
-                tuple(str(part) for part in condition)
-                for condition in value.get("equalities", ())
-            ),
-            pair_fraction=float(value.get("pair_fraction", 1.0)),
             pairs_from=str(value.get("pairs_from", "")),
             frame_token_ids=tuple(value.get("frame_token_ids", ())),
             label_token_ids=tuple(
@@ -110,8 +102,6 @@ class JoinStage:
             "pair_tail_tokens": self.pair_tail_tokens,
             "anchor_resident": self.anchor_resident,
             "tuple_tokens": self.tuple_tokens,
-            "equalities": [list(condition) for condition in self.equalities],
-            "pair_fraction": self.pair_fraction,
             "pairs_from": self.pairs_from,
         }
 
@@ -132,7 +122,6 @@ class JoinStage:
             "semantics": self.semantics,
             "selectivity": self.selectivity,
             "written_pos": self.written_pos,
-            "equalities": [list(condition) for condition in self.equalities],
             "pairs_from": self.pairs_from,
             "frame": self.frame_token_ids,
             "labels": dict(self.label_token_ids),
@@ -183,7 +172,7 @@ class RequestJoinSpec:
     label_token_ids: tuple[tuple[str, tuple[Any, ...]], ...]
     frame_token_ids: tuple[tuple[str, tuple[Any, ...]], ...]
     tail_token_ids: tuple[Any, ...]
-    equalities: tuple[tuple[str, str, str, str], ...] = ()
+    over_pairs: bool = False    # a HashJoin feeds this join its pairs
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "RequestJoinSpec":
@@ -194,10 +183,7 @@ class RequestJoinSpec:
             anchor=value["anchor"],
             semantics=str(value["semantics"]),
             selectivity=value["selectivity"],
-            equalities=tuple(
-                tuple(str(part) for part in condition)
-                for condition in value.get("equalities", ())
-            ),
+            over_pairs=bool(value.get("over_pairs", False)),
             label_token_ids=tuple(
                 (str(alias), tuple(tokens))
                 for alias, tokens in value["label_token_ids"]
@@ -224,7 +210,7 @@ class RequestJoinSpec:
                 [alias, list(tokens)] for alias, tokens in self.frame_token_ids
             ],
             "tail_token_ids": list(self.tail_token_ids),
-            "equalities": [list(condition) for condition in self.equalities],
+            "over_pairs": self.over_pairs,
         }
 
 
@@ -611,6 +597,55 @@ class Foreign(PhysicalNode):
             ),
             aliases=tuple(attributes["aliases"]),
             written_pos=int(attributes["written_pos"]),
+        )
+
+
+@dataclass(frozen=True)
+class HashJoin(PhysicalNode):
+    """Pair the rows of two tables whose key columns are equal.
+
+    ``on`` lists (left column, right column) pairs; a row pair is kept
+    when every listed pair of values is equal. The node reads the key
+    columns as values and writes the pairs the join at ``written_pos``
+    asks the model about. ``pair_fraction`` is the planner's estimate
+    of the pairs kept over the cross product.
+    """
+
+    left: str = ""
+    right: str = ""
+    on: tuple[tuple[str, str], ...] = ()
+    written_pos: int = -1
+    pair_fraction: float = 1.0
+
+    type_name: ClassVar[str] = "quail.hash_join"
+    runtime_key: ClassVar[str] = type_name
+    location: ClassVar[ExecutionLocation] = ExecutionLocation.GPU_EXECUTOR
+
+    @property
+    def outputs(self) -> tuple[OutputPort, ...]:
+        return (OutputPort(f"pairs:{self.written_pos}", ValueType.PAIRS,
+                           schema=(self.left, self.right)),)
+
+    def attributes(self) -> dict:
+        return {
+            "left": self.left,
+            "right": self.right,
+            "on": [list(condition) for condition in self.on],
+            "written_pos": self.written_pos,
+            "pair_fraction": self.pair_fraction,
+        }
+
+    @classmethod
+    def from_attributes(cls, node_id, inputs, attributes):
+        return cls(
+            node_id=node_id,
+            inputs=inputs,
+            left=str(attributes["left"]),
+            right=str(attributes["right"]),
+            on=tuple((str(left), str(right))
+                     for left, right in attributes["on"]),
+            written_pos=int(attributes["written_pos"]),
+            pair_fraction=float(attributes.get("pair_fraction", 1.0)),
         )
 
 

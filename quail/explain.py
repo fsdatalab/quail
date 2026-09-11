@@ -10,6 +10,7 @@ from quail.physical import (
     Barrier,
     Exchange,
     Foreign,
+    HashJoin,
     Limit,
     PortRef,
     Project,
@@ -221,18 +222,19 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                 predicate = (_prompt(joins[stage.written_pos].predicate)
                              if stage.written_pos < len(joins)
                              else f"predicate {stage.written_pos + 1}")
-                pairs = "".join(
-                    f" on {left_alias}.{left_column} = "
-                    f"{right_alias}.{right_column}"
-                    for left_alias, left_column, right_alias, right_column
-                    in stage.equalities)
-                if stage.pairs_from:
-                    pairs += f" over pairs from {stage.pairs_from}"
+                pairs = (f" over pairs from {stage.pairs_from}"
+                         if stage.pairs_from else "")
                 details.append(
                     f"{index}. {stage.semantics} ({stage.anchor}, "
                     f"{', '.join(stage.partners)}){pairs}: {predicate} "
                     f"(selectivity={_selectivity(stage.selectivity)}, "
                     f"estimated_evaluations={_number(stage.expected_tuples)})")
+        elif isinstance(node, HashJoin):
+            title += ": " + " and ".join(
+                f"{node.left}.{left} = {node.right}.{right}"
+                for left, right in node.on)
+            details.append(
+                f"pairs kept: {node.pair_fraction:.4g} of the cross product")
         elif isinstance(node, Foreign):
             title += (f": {node.function} ({node.kind}, {node.ids}) on "
                       f"{', '.join(node.aliases)}")

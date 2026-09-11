@@ -21,6 +21,7 @@ from quail.physical import (
     Exchange,
     FilterStage,
     Foreign,
+    HashJoin,
     JoinStage,
     Limit,
     PortRef,
@@ -224,6 +225,40 @@ def join_specs(joins, pair_fractions=None) -> list:
             pair_fraction=(pair_fractions.get(i, 1.0) if conditions
                            else 1.0)))
     return out
+
+
+def hash_join_nodes(joins, pair_fractions, scan_ports) -> list:
+    """One HashJoin per join with equality conditions, over the scans.
+
+    Args:
+        joins: The logical joins in written order.
+        pair_fractions: written position -> pairs kept over the cross
+            product, as the session measured them.
+        scan_ports: The scans' id ports, one per alias, in any order.
+
+    Returns:
+        HashJoin nodes with ids ``hash_join:<left>-<right>``.
+    """
+    pair_fractions = pair_fractions or {}
+    by_alias = {port.port.split(":", 1)[1]: port for port in scan_ports}
+    nodes = []
+    for position, join in enumerate(joins):
+        conditions = join_conditions(join)
+        if not conditions:
+            continue
+        left, right = conditions[0].aliases()
+        on = []
+        for condition in conditions:
+            first, second = condition.left, condition.right
+            if first.alias != left:
+                first, second = second, first
+            on.append((first.column, second.column))
+        nodes.append(HashJoin(
+            node_id=f"hash_join:{left}-{right}",
+            inputs=input_ports((by_alias[left], by_alias[right])),
+            left=left, right=right, on=tuple(on), written_pos=position,
+            pair_fraction=pair_fractions.get(position, 1.0)))
+    return nodes
 
 
 def _filter_alias_work(preds, stats, order, pre: int) -> Work:
@@ -561,6 +596,12 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
             shard_ranges=shard_ranges,
             shard_token_loads=tuple(loads)))
         ids_src[s.alias] = PortRef(sid, f"ids:{s.alias}")
+    # an equality pairs whole tables, so its hash join reads the scans
+    # and the AI join keeps the pairs both sides' survivors allow
+    pairs_src = {}
+    for node in hash_join_nodes(joins, pair_fractions, ids_src.values()):
+        nodes.append(node)
+        pairs_src[node.written_pos] = node
 
     def emit_filter(alias):
         order_idx = filter_orders[alias]
@@ -663,6 +704,11 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
         for spec, record in group:
             partners = [a for a in spec["aliases"] if a != anchor]
             pairs_from = ""
+            if spec["written_pos"] in pairs_src:
+                producer = pairs_src[spec["written_pos"]]
+                pair_inputs.append(
+                    PortRef(producer.node_id, f"pairs:{spec['written_pos']}"))
+                pairs_from = producer.node_id
             for apply in join_applies.get(spec["written_pos"], ()):
                 # the function's pairs reach the join on their own port
                 aid = f"apply:{apply.function}"
@@ -676,7 +722,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                     aliases=tuple(apply.aliases),
                     written_pos=spec["written_pos"]))
                 pair_inputs.append(PortRef(aid, f"pairs:{spec['written_pos']}"))
-                pairs_from = apply.function
+                pairs_from = aid
             stage_dicts.append(JoinStage(
                 written_pos=spec["written_pos"], exec_idx=exec_idx,
                 anchor=anchor, partners=tuple(partners),
@@ -687,8 +733,6 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                 pair_tail_tokens=spec["tail_tokens"],
                 anchor_resident=record["resident"],
                 tuple_tokens=round(record["tokens"], 1),
-                equalities=tuple(tuple(c) for c in spec["on"]),
-                pair_fraction=spec["pair_fraction"],
                 pairs_from=pairs_from))
             exec_idx += 1
             for a in partners:

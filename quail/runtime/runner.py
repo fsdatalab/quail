@@ -12,6 +12,7 @@ from quail.physical import (
     ExecutionLocation,
     Foreign,
     GraphValidationError,
+    HashJoin,
     Limit,
     PhysicalGraph,
     PhysicalNode,
@@ -21,7 +22,7 @@ from quail.physical import (
     Scan,
     ValueType,
 )
-from quail.runtime.pairs import columns_key
+from quail.runtime.pairs import columns_key, pair_table
 from quail.runtime.result import (
     IndexRelation,
     QueryResult,
@@ -663,6 +664,40 @@ class ModelNodeRuntime:
         return result
 
 
+class HashJoinRuntime:
+    """Pair the rows of two tables whose key columns are equal."""
+
+    def execute(self, node, inputs, context) -> NodeResult:
+        import pyarrow as pa
+        import pyarrow.compute as pc
+
+        if not isinstance(node, HashJoin):
+            raise TypeError(type(node).__name__)
+        sides = {}
+        for alias, names in ((node.left, [left for left, _ in node.on]),
+                             (node.right, [right for _, right in node.on])):
+            port = next(port for port in node.inputs
+                        if port.source.port == f"ids:{alias}")
+            ids = inputs[port.name]
+            if isinstance(ids, pa.Table):
+                ids = ids.column(alias).to_pylist()
+            table = alias_table(alias, ids, context.sources.get(columns_key(alias)),
+                                names)
+            sides[alias] = (table.column(alias),
+                            [table.column(name) for name in names])
+        positions = pair_table(node.left, sides[node.left][1],
+                               node.right, sides[node.right][1])
+        # pair_table pairs row positions; map them back to the ids read
+        pairs = pa.table({
+            alias: pc.take(sides[alias][0], positions.column(alias))
+            for alias in (node.left, node.right)})
+        return NodeResult(
+            {f"pairs:{node.written_pos}": pairs},
+            NodeMetrics(
+                input_rows=sum(len(ids) for ids, _ in sides.values()),
+                output_rows=pairs.num_rows))
+
+
 def built_in_runtimes() -> dict[str, NodeRuntime]:
     """Return runtimes for the backend independent physical nodes."""
     return {
@@ -670,6 +705,7 @@ def built_in_runtimes() -> dict[str, NodeRuntime]:
         Barrier.runtime_key: BarrierRuntime(),
         Exchange.runtime_key: ExchangeRuntime(),
         Foreign.runtime_key: ForeignRuntime(),
+        HashJoin.runtime_key: HashJoinRuntime(),
         Recombine.runtime_key: RecombineRuntime(),
         Project.runtime_key: ProjectRuntime(),
         Limit.runtime_key: LimitRuntime(),

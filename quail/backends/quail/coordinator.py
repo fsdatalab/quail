@@ -176,14 +176,13 @@ def join_group_payloads(payload: dict, k: int, survivors: dict,
             "docs": select_documents(payload["docs"][alias], indices),
         }
     # a pair stage ships each worker its anchors' live partner rows
-    maps = partner_maps(group, {**payload.get("pairs", {}),
-                                **(pair_tables or {})})
+    maps = partner_maps(group, pair_tables or {})
     pair_rows = {}
     for j in group:
         if not runs_over_pairs(j):
             continue
         live_partners = set(partners[pair_partner(
-            j.get("equalities"), anchor_alias, j["partners"])]["index"])
+            anchor_alias, j["partners"])]["index"])
         pair_rows[j["written_pos"]] = {
             anchor: [p for p in matched if p in live_partners]
             for anchor, matched in maps[j["written_pos"]].items()}

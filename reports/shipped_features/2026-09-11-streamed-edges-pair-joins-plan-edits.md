@@ -122,12 +122,15 @@ equalities under the `SemanticJoin`; the AI predicate is asked only of
 the pairs the equalities allow. Builder:
 `.join(other, on=col("c.url") == col("e.id"))` then `.ai_filter(...)`
 over both tables. SQL: `JOIN evidence e ON c.evidence_wiki_url = e.id
-AND AI_FILTER(...)`. The session builds the pair table with an Arrow
-hash join over the key columns (`quail/runtime/pairs.py`) and ships it
-with the request; the planner prices the join by its pair count;
-`JoinAdmission` streams a partner list per anchor per stage so an
-anchor packs only its own pairs; the request backends submit only the
-listed pairs. QUAIL-B gains FEV-10: FEV-5 with
+AND AI_FILTER(...)`. In the physical plan the equality is a `HashJoin`
+node (`hash_join:c-e`) that reads the two scans and the key columns
+the request carries, pairs the rows whose keys are equal with an Arrow
+hash join (`quail/runtime/pairs.py`), and feeds the pairs to the
+`AiJoin` on its `pairs:<written position>` port, the same port a
+pairs-returning `Foreign` uses. The planner prices the join by its pair
+count; `JoinAdmission` streams a partner list per anchor per stage so
+an anchor packs only its own pairs; the request backends submit only
+the listed pairs. QUAIL-B gains FEV-10: FEV-5 with
 `ON c.evidence_wiki_url = e.id` (evidence ids are FEVER page names),
 merged in `fsdatalab/quail-bench` as commit `ec4682f2`; no labeling run
 was needed at any scale factor.

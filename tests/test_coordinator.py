@@ -264,13 +264,13 @@ def test_coordinator_ships_and_merges_per_anchor_partner_lists():
         false_ids=[2], pre_ids=[9], filter_limit=None,
         docs={"r": [[i] * (10 + i) for i in range(6)],
               "p": [[i] * 5 for i in range(4)]},
-        filters={"r": [[7, 7]]}, physical_plan={}, pairs={0: pairs},
+        filters={"r": [[7, 7]]}, physical_plan={},
         shards={"r": ((0, 2, 4), (1, 3, 5))})
     group = [dict(anchor="r", partners=["p"], semantics="full",
-                  written_pos=0, equalities=[["r", "k", "p", "k"]],
+                  written_pos=0, pairs_from="hash_join:r-p",
                   labels={"p": [2]}, frame=[8], tail=[3])]
     subs = join_group_payloads(payload, 2, {"r": [0, 2, 3, 5], "p": [1, 3]},
-                               group)
+                               group, pair_tables={0: pairs})
     assert [sub["anchor_index"] for sub in subs] == [[0, 2], [3, 5]]
     assert [sub["pairs"] for sub in subs] == [
         {0: {0: [3], 2: [1]}}, {0: {3: [], 5: [3]}}]

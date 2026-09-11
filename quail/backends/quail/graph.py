@@ -69,7 +69,7 @@ def _tuple_suffix(join, docs, member):
 
 def runs_over_pairs(join: dict) -> bool:
     """Whether a stage streams each anchor's own pairs."""
-    return bool(join.get("equalities") or join.get("pairs_from"))
+    return bool(join.get("pairs_from"))
 
 
 def partner_maps(group, pair_tables, streamed=()) -> dict:
@@ -89,8 +89,7 @@ def partner_maps(group, pair_tables, streamed=()) -> dict:
                 f"table reached it")
         maps[join["written_pos"]] = partner_map(
             table, join["anchor"],
-            pair_partner(join.get("equalities"), join["anchor"],
-                         join["partners"]))
+            pair_partner(join["anchor"], join["partners"]))
     return maps
 
 
@@ -113,8 +112,8 @@ def partner_list_builder(group, tuples_by_stage, maps):
         if not runs_over_pairs(join):
             stage_maps.append(None)
             continue
-        position = join["partners"].index(pair_partner(
-            join.get("equalities"), join["anchor"], join["partners"]))
+        position = join["partners"].index(
+            pair_partner(join["anchor"], join["partners"]))
         stage_maps.append((maps[join["written_pos"]],
                            members_by_partner(tuples, position)))
     if all(entry is None for entry in stage_maps):
@@ -246,8 +245,7 @@ def prepare_model_inputs(node, inputs, context: ExecutionContext):
     # from the request's pair tables, a Foreign node's table, or the
     # rows a per-batch Foreign node fills in as the chain hands
     # anchors over
-    maps = partner_maps(group, {**state.get("pairs", {}), **port_pairs},
-                        streamed=set(streamed_pairs))
+    maps = partner_maps(group, port_pairs, streamed=set(streamed_pairs))
     for position, pairs in streamed_pairs.items():
         maps[position] = pairs.rows
     lists_for = partner_list_builder(

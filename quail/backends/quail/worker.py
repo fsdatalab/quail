@@ -166,7 +166,6 @@ def quail_runtime_payload(request, graph) -> dict:
         "model": envelope["model"],
         "workers": envelope["workers"],
         "docs": docs,
-        "pairs": request.pair_tables(),
         "columns": request.column_tables(),
         **dict(envelope["settings"]),
     }
@@ -311,7 +310,6 @@ def execute_single(state, payload: dict, registry, graph) -> dict:
     runtime_state = {
         **state,
         "docs": decode_payload_documents(payload["docs"]),
-        "pairs": payload.get("pairs", {}),
         "columns": payload.get("columns", {}),
         "functions": registry.functions,
         "runtimes": registry.runtimes,

@@ -289,16 +289,23 @@ def test_session_plans_prices_and_ships_the_pair_table():
         cross_stage = cross_plan.graph.nodes_by_type(
             AiJoin.type_name)[0].stages[0]
         # c1 and c2 pair with e0 and e2, c0 with e1: 5 of 12 pairs
-        assert paired_stage.equalities == (("c", "url", "e", "url"),)
-        assert paired_stage.pair_fraction == 5 / 12
-        assert cross_stage.pair_fraction == 1.0
+        hash_join = paired_plan.graph.node("hash_join:c-e")
+        assert (hash_join.left, hash_join.right, hash_join.on) == (
+            "c", "e", (("url", "url"),))
+        assert hash_join.pair_fraction == 5 / 12
+        assert [port.source.node_id for port in hash_join.inputs] == [
+            "scan:c", "scan:e"]
+        assert paired_stage.pairs_from == "hash_join:c-e"
+        assert not cross_stage.pairs_from
+        assert "hash_join:c-e" not in {node.node_id for node in cross_plan.nodes}
         assert paired_stage.expected_tuples == round(
             cross_stage.expected_tuples * 5 / 12, 1)
         assert paired_plan.estimated_seconds < cross_plan.estimated_seconds
-        assert "on c.url = e.url" in paired.explain()
+        assert "HashJoin" in paired.explain() and "c.url = e.url" in paired.explain()
+        # the request carries the key columns, not the pairs
         request = paired._prepare_physical()
-        assert request.pair_tables()[0].to_pydict() == {
-            "c": [0, 1, 1, 2, 2], "e": [1, 0, 2, 0, 2]}
+        assert request.column_tables()["c"].column("url").to_pylist() == [
+            "u0", "u1", "u1", "u9"]
         assert cross._prepare_physical().relations == {}
 
         def answer(prompt, assignment):

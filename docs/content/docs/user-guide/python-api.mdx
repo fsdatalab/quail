@@ -141,8 +141,9 @@ columns. What it returns depends on where it sits:
   array, or a one-column table. `ids="drop"` (the default) lets it
   leave ids out; `ids="preserve"` says it returns every id.
 - After `join(other)`: the pairs the next `ai_filter` is asked about,
-  as a table with both alias columns. This is the built-in equality
-  written by hand: FEV-10 again, with the pairing in Python.
+  as a table with both alias columns. This is the `HashJoin` node an
+  equality becomes, written by hand: FEV-10 again, with the pairing
+  in Python.
 
 A function never invents an id. One that returns an id it was not
 given, or drops an id under `ids="preserve"`, fails the query.

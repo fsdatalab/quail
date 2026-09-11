@@ -3,7 +3,8 @@
 A pair table has one int32 column per joined alias holding row indices
 into that alias's document store. It lists exactly the (left, right)
 rows whose key columns are equal, so the model is asked about those
-pairs and no others.
+pairs and no others. The HashJoin node builds it at run time from the
+key columns the request carries as ``columns:<alias>`` relations.
 """
 
 from __future__ import annotations
@@ -11,13 +12,7 @@ from __future__ import annotations
 import pyarrow as pa
 import pyarrow.compute as pc
 
-PAIRS_PREFIX = "pairs:"
 COLUMNS_PREFIX = "columns:"
-
-
-def pairs_key(written_pos: int) -> str:
-    """The request relation key of one join's pair table."""
-    return f"{PAIRS_PREFIX}{written_pos}"
 
 
 def columns_key(alias: str) -> str:
@@ -57,19 +52,13 @@ def pair_table(left_alias: str, left_keys, right_alias: str,
         [(left_alias, "ascending"), (right_alias, "ascending")])
 
 
-def pair_partner(equalities, anchor: str, partners) -> str:
+def pair_partner(anchor: str, partners) -> str:
     """The partner alias a pair stage pairs with its anchor."""
-    if equalities:
-        found = {alias for condition in equalities
-                 for alias in (condition[0], condition[2])
-                 if alias != anchor}
-    else:
-        found = set(partners)
-    if len(found) != 1 or not found <= set(partners):
+    if len(partners) != 1:
         raise ValueError(
             f"a join over pairs relates the anchor {anchor!r} to one "
-            f"partner of {partners}")
-    return found.pop()
+            f"partner, not {list(partners)}")
+    return partners[0]
 
 
 def pair_fraction(pairs: pa.Table, n_left: int, n_right: int) -> float:

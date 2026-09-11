@@ -24,6 +24,7 @@ from quail.physical import (
     AiJoin,
     FilterStage,
     Foreign,
+    HashJoin,
     JoinStage,
     PhysicalGraph,
     PortRef,
@@ -160,13 +161,14 @@ def run_streamed(monkeypatch, *, doc_lengths, filter_truth, partner_lengths,
                 blocked=blocked_seen)
 
 
-def two_alias_graph(pin_survivors, *, stages=1, equalities=(), foreign=None):
+def two_alias_graph(pin_survivors, *, stages=1, hash_join=False, foreign=None):
     """R's filter chain into a join with p.
 
     Args:
         pin_survivors: Whether the chain streams into the join.
         stages: Filter stages on r.
-        equalities: Pair conditions on the join stage.
+        hash_join: Pair r and p on their "key" columns with a HashJoin
+            over the scans that feeds the join its pairs port.
         foreign: (kind, ids) of a Foreign node between the chain and
             the join; ids "pairs" feeds the join its pairs port.
     """
@@ -183,6 +185,14 @@ def two_alias_graph(pin_survivors, *, stages=1, equalities=(), foreign=None):
     anchor_src = PortRef("filter:r", "ids:r")
     join_inputs = []
     pairs_from = ""
+    if hash_join:
+        nodes.append(HashJoin(
+            node_id="hash_join:r-p",
+            inputs=input_ports((PortRef("input:r", "ids:r"),
+                                PortRef("input:p", "ids:p"))),
+            left="r", right="p", on=(("key", "key"),), written_pos=0))
+        join_inputs.append(PortRef("hash_join:r-p", "pairs:0"))
+        pairs_from = "hash_join:r-p"
     if foreign and foreign[1] == "pairs":
         nodes.append(Foreign(
             node_id="apply:same_key",
@@ -191,7 +201,7 @@ def two_alias_graph(pin_survivors, *, stages=1, equalities=(), foreign=None):
             columns=(("r", "key"), ("p", "key")), aliases=("r", "p"),
             written_pos=0))
         join_inputs.append(PortRef("apply:same_key", "pairs:0"))
-        pairs_from = "same_key"
+        pairs_from = "apply:same_key"
     elif foreign:
         nodes.append(Foreign(
             node_id="apply:keep_even",
@@ -209,7 +219,7 @@ def two_alias_graph(pin_survivors, *, stages=1, equalities=(), foreign=None):
             semantics="full", selectivity=0.5, expected_tuples=1,
             anchor_frame_tokens=1, pair_tail_tokens=0,
             anchor_resident=resident, tuple_tokens=0,
-            equalities=equalities, pairs_from=pairs_from,
+            pairs_from=pairs_from,
             frame_token_ids=(FRAME,), label_token_ids=(("p", ()),),
             tail_token_ids=()),)))
     return PhysicalGraph(tuple(nodes), PortRef("group:0", "ids:r"))

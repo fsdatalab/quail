@@ -145,9 +145,12 @@ JOIN evidence e
 WHERE AI_FILTER(PROMPT('Is the claim in DOCUMENT {0} about a person?', c.claim))
 ```
 
-The planner prices the join by the number of equal pairs instead of
-the cross product, and `explain()` shows the condition on the join
-stage. Several equalities may be combined with `AND`; each must
+The equality becomes a `HashJoin` node in the physical plan. It reads
+the two key columns, pairs the rows whose values are equal, and feeds
+those pairs to the AI join, which asks the model about the pairs both
+sides' survivors allow. The planner prices the join by the number of
+equal pairs instead of the cross product, and `explain()` shows the
+node with the fraction of pairs it keeps. Several equalities may be combined with `AND`; each must
 relate the joined table to a table already in the query, and the AI
 predicate must name the same two tables. A `JOIN` whose `ON` has an
 equality but no AI predicate is refused: a plain join belongs in the

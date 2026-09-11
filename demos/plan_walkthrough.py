@@ -55,7 +55,6 @@ def fake_executor(session, seen):
                 for node in graph.nodes if isinstance(node, Scan)}
         state = graph_state(None, docs)
         state["model_execution"] = FixedFeverAnswers(state, 10, False)
-        state["pairs"] = request.pair_tables()
         state["columns"] = request.column_tables()
         state["functions"] = session.registry.functions
         report = execute_single_graph(state, request.plan["settings"], graph)
