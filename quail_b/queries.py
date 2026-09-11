@@ -83,10 +83,16 @@ class AliasSpec:
 
 @dataclass(frozen=True)
 class JoinSpec:
-    """One binary AI join; aliases in placeholder order."""
+    """One binary AI join; aliases in placeholder order.
+
+    `on` lists ordinary equality conditions as (left column, right
+    column) pairs over the two aliases. The AI predicate is asked only
+    of the pairs whose columns are equal; empty means every pair.
+    """
 
     template: str
     aliases: tuple[str, str]
+    on: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -299,6 +305,18 @@ QUERIES = (
          JoinSpec(REFUTE, ("c2", "e1")),
          JoinSpec(SUPPORT, ("c2", "e2"))),
         ("c1.id", "e1.id", "c2.id", "e2.id"),
+    ),
+    # FEV-10: FEV-5 over pairs. A claim names its Wikipedia page and an
+    # evidence row's id is its page name, so SUPPORT is asked only of a
+    # claim and its own page: ON c.evidence_wiki_url = e.id AND AI.IF.
+    QuerySpec(
+        "FEV-10",
+        "2F + 1J over pairs: F11 on claims, F13 on evidence, SUPPORT "
+        "asked only of a claim and its own Wikipedia page",
+        (AliasSpec("c", "claims", "claim", (F11,)),
+         AliasSpec("e", "evidence", "text", (F13,))),
+        (JoinSpec(SUPPORT, ("c", "e"), on=(("evidence_wiki_url", "id"),)),),
+        ("c.id", "e.id"),
     ),
 
     # LePaRD uses two deduplicated projections of sampled citation pairs.

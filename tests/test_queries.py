@@ -17,12 +17,12 @@ from quail_b.queries import (
 )
 
 
-def test_catalog_has_the_32_default_queries_and_two_privacy_queries():
-    assert len(QUERIES) == 32
+def test_catalog_has_the_33_default_queries_and_two_privacy_queries():
+    assert len(QUERIES) == 33
     assert QUERY_ORDER == (
         *(f"IMDB-{i}" for i in range(1, 11)),
         *(f"BIO-{i}" for i in range(1, 4)),
-        *(f"FEV-{i}" for i in range(1, 10)),
+        *(f"FEV-{i}" for i in range(1, 11)),
         *(f"LEP-{i}" for i in range(1, 9)),
         "AGENT-1", "AGENT-2",
     )
@@ -44,10 +44,10 @@ def test_spec_rejects_a_join_that_does_not_add_its_alias():
 
 def test_parallel_query_split_matches_stock_vllm():
     assert split_query_ids(QUERY_ORDER, 4) == (
-        QUERY_ORDER[0:8],
-        QUERY_ORDER[8:16],
-        QUERY_ORDER[16:24],
-        QUERY_ORDER[24:32],
+        QUERY_ORDER[0:9],
+        QUERY_ORDER[9:17],
+        QUERY_ORDER[17:25],
+        QUERY_ORDER[25:33],
     )
 
 
@@ -62,9 +62,9 @@ def test_query_family_split_matches_benchmark_catalog():
     assert split_query_families(QUERY_ORDER) == (
         QUERY_ORDER[0:10],
         QUERY_ORDER[10:13],
-        QUERY_ORDER[13:22],
-        QUERY_ORDER[22:30],
-        QUERY_ORDER[30:32],
+        QUERY_ORDER[13:23],
+        QUERY_ORDER[23:31],
+        QUERY_ORDER[31:33],
     )
     assert query_family_name(QUERY_ORDER[0:10]) == "imdb"
 

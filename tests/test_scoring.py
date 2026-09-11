@@ -4,6 +4,7 @@ import json
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 
 from quail_b.data import GROUND_TRUTH_ROOT
 from quail_b.labels import (
@@ -138,9 +139,12 @@ def fever_truth():
     from quail_b.predicates import PREDICATES, predicate_payload
     from quail_b.prompts import F11, F13, REFUTE, SUPPORT
 
+    # a claim's evidence_wiki_url names its page, which is an evidence
+    # row's id; c1 names e0, so its label pair with e1 is off-page
     corpus = {
         "claims": pa.table({"id": ["c0", "c1", "c2"],
-                            "claim": ["person one", "person two", "a place"]}),
+                            "claim": ["person one", "person two", "a place"],
+                            "evidence_wiki_url": ["e0", "e0", "e2"]}),
         "evidence": pa.table({"id": ["e0", "e1", "e2"],
                               "text": ["person one", "person two", "a place"]}),
     }
@@ -184,6 +188,39 @@ def test_fev9_expected_rows_follow_the_join_chain_and_every_filter():
     # different supporting evidence
     assert rows.to_pydict() == {
         "c1": ["c0"], "c2": ["c1"], "e1": ["e0"], "e2": ["e1"]}
+
+
+def test_fev10_rows_keep_only_pairs_on_the_claims_own_page():
+    corpus, truth = fever_truth()
+    spec = queries()["FEV-10"]
+    cross = queries()["FEV-5"]
+    assert spec.joins[0].on == (("evidence_wiki_url", "id"),)
+    assert spec.aliases == cross.aliases and not cross.joins[0].on
+
+    # FEV-5 keeps every supported pair of surviving documents; FEV-10
+    # drops (c1, e1) because c1's page is e0
+    assert expected_rows(cross, truth, corpus).to_pydict() == {
+        "c": ["c0", "c1"], "e": ["e0", "e1"]}
+    assert expected_rows(spec, truth, corpus).to_pydict() == {
+        "c": ["c0"], "e": ["e0"]}
+
+    # an engine's answers over every pair are held to the same equality
+    filter_answers = {
+        ("c", 0): pa.table({"c": ["c0", "c1", "c2"],
+                            "answer": [True, True, False]}),
+        ("e", 0): pa.table({"e": ["e0", "e1", "e2"],
+                            "answer": [True, True, False]}),
+    }
+    join_answers = {0: pa.table({
+        "c": ["c0", "c1", "c1"], "e": ["e0", "e1", "e0"],
+        "answer": [True, True, False]})}
+    assert rows_from_answers(spec, filter_answers, join_answers,
+                             corpus).to_pydict() == {"c": ["c0"], "e": ["e0"]}
+    assert rows_from_answers(cross, filter_answers, join_answers
+                             ).to_pydict() == {"c": ["c0", "c1"],
+                                               "e": ["e0", "e1"]}
+    with pytest.raises(ValueError, match="needs the corpus rows"):
+        rows_from_answers(spec, filter_answers, join_answers)
 
 
 def test_load_benchmark_with_local_reference_labels(tmp_path):
@@ -287,7 +324,6 @@ def test_load_benchmark_with_local_reference_labels(tmp_path):
     assert benchmark.report(output_dir, root=tmp_path) == output_dir / "report.md"
     assert (output_dir / "report.md").read_text() == before
     assert calls == ["IMDB-1"]
-    import pytest
     with pytest.raises(FileExistsError):
         benchmark.run(run_query, queries=["IMDB-1"],
                       output_dir=output_dir, root=tmp_path)
