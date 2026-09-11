@@ -403,7 +403,14 @@ def _ids_of(value) -> list:
         value = value.column(0)
     if isinstance(value, (pa.Array, pa.ChunkedArray)):
         value = value.to_pylist()
-    return [int(document) for document in value]
+    ids = []
+    for document in value:
+        if document is None:
+            raise ValueError(
+                "an apply() function returned a null id; an outer join "
+                "leaves nulls, use join_type='inner'")
+        ids.append(int(document))
+    return ids
 
 
 def _pairs_of(value, left: str, right: str) -> list:

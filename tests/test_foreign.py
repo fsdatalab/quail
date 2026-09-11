@@ -72,7 +72,7 @@ def keep_even(tables):
 
 def same_key(tables):
     left, right = tables["r"], tables["p"]
-    return left.join(right, keys=["key"]).select(["r", "p"])
+    return left.join(right, keys=["key"], join_type="inner").select(["r", "p"])
 
 
 def test_builder_places_apply_nodes_in_the_logical_tree():
@@ -340,12 +340,19 @@ def test_foreign_runs_per_batch_on_the_stream_and_once_as_a_barrier(monkeypatch)
         (alias,) = tables
         return tables[alias].column(alias).to_pylist()[1:]
 
+    def outer(tables):
+        (alias,) = tables
+        return [None] + tables[alias].column(alias).to_pylist()[1:]
+
     with pytest.raises(ValueError, match="never invents an id"):
         _run(monkeypatch, _graph("per_batch", "drop", True),
              {"keep_even": invent})
     with pytest.raises(ValueError, match="preserves ids but dropped"):
         _run(monkeypatch, _graph("barrier", "preserve", False),
              {"keep_even": lose_one})
+    with pytest.raises(ValueError, match="returned a null id"):
+        _run(monkeypatch, _graph("barrier", "drop", False),
+             {"keep_even": outer})
 
 
 def test_stream_validator_refuses_a_barrier_on_a_pinned_edge():
@@ -369,7 +376,7 @@ def test_stream_validator_refuses_a_barrier_on_a_pinned_edge():
 def same_page(tables):
     claims, evidence = tables["c"], tables["e"]
     return claims.join(evidence, keys=["evidence_wiki_url"],
-                       right_keys=["id"]).select(["c", "e"])
+                       right_keys=["id"], join_type="inner").select(["c", "e"])
 
 
 def _fev10_by_apply(session, kind):

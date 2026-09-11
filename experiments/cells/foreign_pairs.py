@@ -56,7 +56,7 @@ def same_page(tables):
     """Pair each claim with the evidence row whose id is its page."""
     claims, evidence = tables["c"], tables["e"]
     return claims.join(evidence, keys=["evidence_wiki_url"],
-                       right_keys=["id"]).select(["c", "e"])
+                       right_keys=["id"], join_type="inner").select(["c", "e"])
 
 
 def build(session, variant):

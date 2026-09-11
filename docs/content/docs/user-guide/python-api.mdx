@@ -148,7 +148,7 @@ given, or drops an id under `ids="preserve"`, fails the query.
 def same_page(tables):
     claims, evidence = tables["c"], tables["e"]
     return claims.join(evidence, keys=["evidence_wiki_url"],
-                       right_keys=["id"]).select(["c", "e"])
+                       right_keys=["id"], join_type="inner").select(["c", "e"])
 
 same_page_pairs = (session.docs("claims").alias("c")
                    .ai_filter(prompt(F11, col("c.claim")))
