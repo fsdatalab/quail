@@ -924,7 +924,6 @@ class FilterStream:
         self.async_ans = async_ans
         self.doc_ids = doc_ids
         self.keys = keys
-        self.budget = budget
         self.timing = timing
         self.pinned = pinned
         self.arena_writes = arena_writes
@@ -1018,7 +1017,9 @@ class FilterStream:
                 self._finish(items)
                 return items, False
             if self.hold:
-                sched.sync_free_pages(arena.accounting.free_pages)
+                # the consumer frees and claims pages between chunks,
+                # so the chain's own arithmetic cannot track them
+                sched.free_pages = arena.accounting.free_pages
             t = time.perf_counter() if timing is not None else 0.0
             groups = sched.next_chunk()
             t = _tick(timing, "next_chunk", t)

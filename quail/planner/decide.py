@@ -240,15 +240,6 @@ def _filter_alias_work(preds, stats, order, pre: int) -> Work:
     return total
 
 
-def _filter_work(filters, stats, filter_orders: dict, pre: int) -> Work:
-    """Expected Work of every filter chain."""
-    total = Work()
-    for alias, preds in filters.items():
-        total = total + _filter_alias_work(
-            preds, stats[alias], filter_orders[alias], pre)
-    return total
-
-
 def node_estimates(graph, *, filter_works, stage_works, live, stats, pre,
                    cap_pages, page_tokens, model, device, chunk) -> dict:
     """Price each node's own work, and each chain's recompute if released.
@@ -288,20 +279,6 @@ def node_estimates(graph, *, filter_works, stage_works, live, stats, pre,
 
 
 # ----------------------------------------------- KV keep (residency)
-
-def _length_stats(doc_tokens) -> joinsearch.AliasStats:
-    if isinstance(doc_tokens, joinsearch.AliasStats):
-        return doc_tokens
-    return joinsearch.summarize_alias(doc_tokens)
-
-
-def possible_anchor_aliases(specs) -> set:
-    """Return every legal anchor considered during planning."""
-    out = set()
-    for spec in specs:
-        out.update(joinsearch.anchor_candidates(spec))
-    return out
-
 
 def balanced_shards(doc_tokens, workers: int):
     """Greedily partition documents into shards balanced by token count."""
@@ -439,7 +416,12 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
         for p in fs:
             surv *= p.selectivity if p.selectivity is not None else 1.0
         live0[_filter_alias(fs[0])] *= surv
-    base_work = _filter_work(filters, stats, filter_orders, pre)
+    filter_works = {
+        alias: _filter_alias_work(preds, stats[alias], filter_orders[alias],
+                                  pre)
+        for alias, preds in filters.items()
+    }
+    base_work = sum(filter_works.values(), Work())
 
     cap_pages = retention_pages(admission, chunk, budgets.PAGE_TOKENS)
     costs = retention.coefficients(model, device)
@@ -463,9 +445,10 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     seq = [(specs[position], anchor) for position, anchor in found["seq"]]
     # join node ids name the anchor; a second group on the same anchor
     # gets :2, a third :3
+    sequence_groups = retention.group_sequence(seq)
     group_ids = []
     seen_ids = {}
-    for group in retention.group_sequence(seq):
+    for group in sequence_groups:
         anchor = group[0][1]
         seen_ids[anchor] = seen_ids.get(anchor, 0) + 1
         group_ids.append(f"ai_join:{anchor}" if seen_ids[anchor] == 1
@@ -485,7 +468,6 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     # a barrier apply needs every survivor at once, so its alias's
     # chain cannot stream; the same for the anchor of a join whose
     # pairs a barrier apply returns
-    sequence_groups = retention.group_sequence(seq)
     barrier_aliases = {alias for alias, group in alias_applies.items()
                        if any(apply.kind == "barrier" for apply in group)}
     for group in sequence_groups:
@@ -642,17 +624,11 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
 
     # group consecutive full stages on the same anchor; gates run
     # alone; anchor switches become barriers
-    groups = []
-    for (spec, anchor), record in zip(seq, stage_records):
-        merge = (groups and spec["semantics"] == "full"
-                 and groups[-1]["full"]
-                 and groups[-1]["anchor"] == anchor)
-        if merge:
-            groups[-1]["members"].append((spec, record))
-        else:
-            groups.append(dict(anchor=anchor,
-                               full=(spec["semantics"] == "full"),
-                               members=[(spec, record)]))
+    records = iter(stage_records)
+    groups = [dict(anchor=group[0][1],
+                   full=group[0][0]["semantics"] == "full",
+                   members=[(spec, next(records)) for spec, _ in group])
+              for group in sequence_groups]
     exec_idx = 0
     pairs_edges = []     # every full stage's passing-pairs edge
     out_aliases = []     # recombination's output order
@@ -766,16 +742,8 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     estimate = speed_of_light(
         base_work + found["work"], model, device, chunk
     ).seconds
-    filter_works = {
-        alias: _filter_alias_work(preds, stats[alias], filter_orders[alias],
-                                  pre)
-        for alias, preds in filters.items()
-    }
-    # every search path prices the chosen sequence the same way; walk
-    # it once more so each stage's own work is on record
-    _, walked = joinsearch.walk(seq, live0, length_stats, filtered, pre,
-                                model, device)
-    stage_works = {record["written_pos"]: record["work"] for record in walked}
+    stage_works = {record["written_pos"]: record["work"]
+                   for record in found["records"]}
 
     def estimator(graph):
         return node_estimates(

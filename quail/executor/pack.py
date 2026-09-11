@@ -477,7 +477,6 @@ class FilterAdmission:
         self.doc_tokens = doc_tokens
         self.stage_tokens = list(stage_tokens)
         self.chunk_budget = chunk_budget
-        self.arena_pages = arena_pages
         self.page_tokens = page_tokens
         # None: no page bin - nothing is ever written to the arena,
         # so there is nothing to account
@@ -597,18 +596,6 @@ class FilterAdmission:
         if pages < 0 or self.free_pages is None:
             raise ValueError("invalid external page release")
         self.free_pages += pages
-
-    def sync_free_pages(self, pages):
-        """Take the arena's free page count before building a chunk.
-
-        Used when another operator frees and claims pages between this
-        chain's chunks, so the chain's own arithmetic cannot track them.
-        """
-        if self.free_pages is None:
-            raise ValueError("this chain has no page bin to sync")
-        if not 0 <= pages <= self.arena_pages:
-            raise ValueError("free pages must fit inside the arena")
-        self.free_pages = pages
 
     # ---- progress ------------------------------------------------------
 

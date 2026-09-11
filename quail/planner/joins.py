@@ -7,7 +7,6 @@ of that KV as the arena holds and recomputes the rest.
 """
 
 import itertools
-from collections import Counter
 from dataclasses import dataclass
 
 from quail.planner.sol import speed_of_light
@@ -31,7 +30,6 @@ class AliasStats:
     total: int
     squared: int
     maximum: int
-    histogram: tuple[tuple[int, int], ...] = ()
 
     @property
     def mean(self) -> float:
@@ -41,20 +39,17 @@ class AliasStats:
 def summarize_alias(lengths) -> AliasStats:
     """Summarize document lengths in one pass."""
     count = total = squared = maximum = 0
-    histogram = Counter()
     for raw in lengths:
         length = int(raw)
         count += 1
         total += length
         squared += length * length
         maximum = max(maximum, length)
-        histogram[length] += 1
     return AliasStats(
         count=count,
         total=total,
         squared=squared,
         maximum=maximum,
-        histogram=tuple(sorted(histogram.items())),
     )
 
 
@@ -423,7 +418,7 @@ def search_joins(specs, live: dict, lengths: dict, resident,
                         written_pos=spec["written_pos"], anchor=anchor,
                         resident=kind, resident_docs=kept,
                         tuples=cross_tuples(spec, live_now),
-                        tokens=work.tokens)
+                        tokens=work.tokens, work=work)
                     next_state = KVState(
                         anchor, spec["semantics"] == "full",
                         state_now.used_anchors | {anchor})

@@ -470,9 +470,7 @@ class BoundBuilder:
         return self
 
     def apply_table(self, fn, columns=(), **options):
-        self._inner.apply_table(fn, columns, **options)
-        self._session.register_functions(self._inner.functions)
-        return self
+        return self.apply(fn, columns, kind="barrier", **options)
 
     def ai_join(self, others, p, selectivity=None, anchor=None,
                 semantics="full"):

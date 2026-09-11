@@ -561,7 +561,6 @@ def _child_joins(state, sub):
                     for stage, tuples in zip(node.stages, tuple_globs)
                 },
                 "anchor_partners": lists_for,
-                "anchor_batch": None,
                 "group": group,
             },
             runtime_context,

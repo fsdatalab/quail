@@ -130,10 +130,6 @@ class StreamedPairs:
     anchor -> partner rows it fills into rows.
     """
 
-    stream: SurvivorStream
-    anchor: str
-    partner: str
-    written_pos: int
     batch: Callable[[list], dict]
     rows: dict = field(default_factory=dict)
 
@@ -519,10 +515,6 @@ class ForeignRuntime:
 
         streams = {alias: value for alias, value in values.items()
                    if isinstance(value, SurvivorStream)}
-        if node.kind == "barrier" and streams:
-            raise GraphValidationError(
-                f"{node.node_id!r} is a barrier but reads a survivor "
-                f"stream; the planner should have materialized it")
         if len(streams) > 1:
             raise GraphValidationError(
                 f"{node.node_id!r} reads two survivor streams")
@@ -561,8 +553,7 @@ class ForeignRuntime:
                 return rows
 
             port = f"pairs:{node.written_pos}"
-            outputs = {port: StreamedPairs(
-                stream, stream_alias, partner, node.written_pos, batch)}
+            outputs = {port: StreamedPairs(batch)}
 
             def finalize():
                 ordered = produced if stream_alias == node.aliases[0] \

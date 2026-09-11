@@ -13,7 +13,7 @@ from quail.physical import (
     AiJoin,
     PhysicalGraph,
 )
-from quail.runtime.pairs import columns_key, partner_map
+from quail.runtime.pairs import columns_key, pair_partner, partner_map
 from quail.runtime.runner import (
     ExecutionContext,
     GenericRunner,
@@ -66,21 +66,6 @@ def runs_over_pairs(join: dict) -> bool:
     return bool(join.get("equalities") or join.get("pairs_from"))
 
 
-def pair_partner(join: dict) -> str:
-    """The partner alias a pair stage pairs with its anchor."""
-    if join["equalities"]:
-        partners = {alias for condition in join["equalities"]
-                    for alias in (condition[0], condition[2])
-                    if alias != join["anchor"]}
-    else:
-        partners = set(join["partners"])
-    if len(partners) != 1 or not partners <= set(join["partners"]):
-        raise ValueError(
-            f"a join over pairs relates the anchor {join['anchor']!r} to "
-            f"one partner of {join['partners']}")
-    return partners.pop()
-
-
 def partner_maps(group, pair_tables, streamed=()) -> dict:
     """Written position -> anchor row -> partner rows, per pair stage.
 
@@ -97,7 +82,9 @@ def partner_maps(group, pair_tables, streamed=()) -> dict:
                 f"join {join['written_pos']} runs over pairs but no pair "
                 f"table reached it")
         maps[join["written_pos"]] = partner_map(
-            table, join["anchor"], pair_partner(join))
+            table, join["anchor"],
+            pair_partner(join.get("equalities"), join["anchor"],
+                         join["partners"]))
     return maps
 
 
@@ -120,7 +107,8 @@ def partner_list_builder(group, tuples_by_stage, maps):
         if not runs_over_pairs(join):
             stage_maps.append(None)
             continue
-        position = join["partners"].index(pair_partner(join))
+        position = join["partners"].index(pair_partner(
+            join.get("equalities"), join["anchor"], join["partners"]))
         members = {}
         for index, member in enumerate(tuples):
             members.setdefault(int(member[position]), []).append(index)

@@ -45,10 +45,6 @@ class PlanEditError(ValueError):
     """Raised by insert, remove, and move when an edit breaks a rule."""
 
 
-# nodes an edit may remove: one input and one output of one value type
-_REMOVABLE = (Foreign, Barrier, Exchange)
-
-
 @dataclass(frozen=True)
 class PhysicalPlan:
     """A typed physical graph with its settings and estimates.
@@ -183,7 +179,7 @@ class PhysicalPlan:
             node = self.graph.node(node_id)
         except KeyError as error:
             raise PlanEditError(f"no node {node_id!r} in the plan") from error
-        if not isinstance(node, _REMOVABLE):
+        if not isinstance(node, (Foreign, Barrier, Exchange)):
             raise PlanEditError(
                 f"{node_id!r} is a {type(node).__name__}; removing it would "
                 f"change what the query means (only Foreign, Barrier, and "
@@ -248,7 +244,7 @@ def _rederive_pins(nodes: tuple) -> tuple:
         out.append(replace(
             node,
             pin_survivors=pinnable,
-            keep_kv=False if pinnable else True,
+            keep_kv=not pinnable,
             hold_tokens=hold if pinnable else 0,
             arena_writes=True))
     return tuple(out)

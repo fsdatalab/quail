@@ -202,10 +202,8 @@ class Query:
                     f"predicate over {aliases} does not join")
         self._pending_join = None
         self._joins.append(JoinSpec(aliases=tuple(new_aliases),
-                                    prompt=bound, semantics="full",
-                                    selectivity=selectivity,
-                                    anchor=None, on=conditions,
-                                    applies=tuple(applies)))
+                                    prompt=bound, selectivity=selectivity,
+                                    on=conditions, applies=tuple(applies)))
         return self
 
     def apply(self, fn, columns=(), *, name=None, ids=None,

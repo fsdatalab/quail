@@ -169,7 +169,6 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
         (node for node in graph.topological_nodes() if uses[node.node_id] > 1), 1)}
     visited = set()
     lines = []
-    by_id = {node.node_id: node for node in graph.nodes}
 
     def describe(node):
         details = []
@@ -212,7 +211,7 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
             anchor_port = next(
                 (port for port in node.inputs
                  if port.source.port == f"ids:{node.anchor}"), None)
-            producer = (by_id.get(anchor_port.source.node_id)
+            producer = (graph.node(anchor_port.source.node_id)
                         if anchor_port else None)
             if isinstance(producer, AiFilter) and producer.pin_survivors:
                 source = "streamed from its filter"

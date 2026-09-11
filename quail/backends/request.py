@@ -44,7 +44,7 @@ from quail.planner import (
 from quail.planner.joins import search_joins, summarize_alias
 from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
 from quail.planning import PhysicalCandidate, SupportResult
-from quail.runtime.pairs import partner_map
+from quail.runtime.pairs import pair_partner, partner_map
 from quail.runtime.result import answer_table
 from quail.runtime.runner import (
     ExecutionContext,
@@ -334,15 +334,8 @@ def _filter_answer_table(alias, written_positions, answers) -> pa.Table:
 def _allowed_members(spec, anchor, partners, anchor_ids, members,
                      pairs) -> list:
     """Per anchor, the member indices its equality conditions allow."""
-    partner_aliases = {
-        alias for condition in spec.equalities
-        for alias in (condition[0], condition[2]) if alias != anchor
-    }
-    if len(partner_aliases) != 1 or not partner_aliases <= set(partners):
-        raise ValueError(
-            f"join conditions {spec.equalities} must relate the anchor "
-            f"{anchor!r} to one partner of {partners}")
-    position = partners.index(partner_aliases.pop())
+    position = partners.index(
+        pair_partner(spec.equalities, anchor, partners))
     by_partner = {}
     for index, member in enumerate(members):
         by_partner.setdefault(int(member[position]), []).append(index)

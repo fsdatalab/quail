@@ -334,6 +334,9 @@ class DistributedQuailExecution:
             "peak_gib": self.peak_gib,
         }
 
+_ONE_GPU_APPLY = ("per-batch apply() functions run on one GPU; the "
+                  "planner refuses them for several")
+
 
 def prepare_distributed_inputs(node, inputs, context):
     if isinstance(node, AiJoin):
@@ -344,9 +347,7 @@ def prepare_distributed_inputs(node, inputs, context):
             value = inputs[port.name]
             if port.source.port.startswith("pairs:"):
                 if not hasattr(value, "num_rows"):
-                    raise TypeError(
-                        "per-batch apply() functions run on one GPU; the "
-                        "planner refuses them for several")
+                    raise TypeError(_ONE_GPU_APPLY)
                 pairs[int(port.source.port.split(":", 1)[1])] = value
                 continue
             alias = port.source.port.split(":", 1)[1]
@@ -355,9 +356,7 @@ def prepare_distributed_inputs(node, inputs, context):
                     raise TypeError(
                         "only the anchor's filter chain streams into a join")
                 if value.transforms:
-                    raise TypeError(
-                        "per-batch apply() functions run on one GPU; the "
-                        "planner refuses them for several")
+                    raise TypeError(_ONE_GPU_APPLY)
                 stream = value
             else:
                 survivors[alias] = list(value)

@@ -240,13 +240,6 @@ def _from_clause(select):
     return select.args.get("from_")
 
 
-def _where_terms(where) -> list:
-    """Flatten the WHERE conjunction into a list of terms."""
-    if where is None:
-        return []
-    return _conjuncts(where.this)
-
-
 def _conjuncts(node) -> list:
     """Flatten one AND tree into its terms, in written order."""
     terms, stack = [], [node]
@@ -383,7 +376,8 @@ def compile_sql(sql: str, catalog: Catalog,
     for pred in on_preds:
         add_join_spec(*pred)
 
-    for term in _where_terms(tree.args.get("where")):
+    where = tree.args.get("where")
+    for term in _conjuncts(where.this) if where else []:
         anti = False
         node = term
         if isinstance(node, exp.Not):
@@ -486,7 +480,8 @@ def _compile_exists(b: _Binder, node: exp.Exists, anti: bool) -> None:
         raise CompileError("the EXISTS subquery must be exactly "
                            "SELECT 1 FROM provider WHERE AI_FILTER(...)")
     alias = b.add_table(inner_from.this)
-    terms = _where_terms(inner.args.get("where"))
+    where = inner.args.get("where")
+    terms = _conjuncts(where.this) if where else []
     if len(terms) != 1:
         raise CompileError("the EXISTS subquery takes exactly one "
                            "AI_FILTER predicate")

@@ -47,10 +47,6 @@ def pair_table(left_alias: str, left_keys, right_alias: str,
     left_columns = {left_alias: pa.array(range(n_left), type=pa.int32())}
     right_columns = {right_alias: pa.array(range(n_right), type=pa.int32())}
     for name, left, right in zip(names, left_keys, right_keys):
-        left = pa.chunked_array([left]) if isinstance(left, pa.Array) \
-            else left
-        right = pa.chunked_array([right]) if isinstance(right, pa.Array) \
-            else right
         if right.type != left.type:
             right = pc.cast(right, left.type)
         left_columns[name] = left
@@ -59,6 +55,21 @@ def pair_table(left_alias: str, left_keys, right_alias: str,
         pa.table(right_columns), keys=names, join_type="inner")
     return joined.select([left_alias, right_alias]).sort_by(
         [(left_alias, "ascending"), (right_alias, "ascending")])
+
+
+def pair_partner(equalities, anchor: str, partners) -> str:
+    """The partner alias a pair stage pairs with its anchor."""
+    if equalities:
+        found = {alias for condition in equalities
+                 for alias in (condition[0], condition[2])
+                 if alias != anchor}
+    else:
+        found = set(partners)
+    if len(found) != 1 or not found <= set(partners):
+        raise ValueError(
+            f"a join over pairs relates the anchor {anchor!r} to one "
+            f"partner of {partners}")
+    return found.pop()
 
 
 def pair_fraction(pairs: pa.Table, n_left: int, n_right: int) -> float:

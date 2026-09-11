@@ -4,10 +4,10 @@ Pure dict-and-list logic (no torch). Called by the worker's parent
 process between child GPUs.
 """
 
-from quail.backends.quail.graph import pair_partner, runs_over_pairs
+from quail.backends.quail.graph import partner_maps, runs_over_pairs
 from quail.execution import join_answer_cells
 from quail.planner import balanced_shards
-from quail.runtime.pairs import partner_map
+from quail.runtime.pairs import pair_partner
 from quail.runtime.tokens import select_documents
 
 
@@ -176,18 +176,17 @@ def join_group_payloads(payload: dict, k: int, survivors: dict,
             "docs": select_documents(payload["docs"][alias], indices),
         }
     # a pair stage ships each worker its anchors' live partner rows
-    tables = {**payload.get("pairs", {}), **(pair_tables or {})}
+    maps = partner_maps(group, {**payload.get("pairs", {}),
+                                **(pair_tables or {})})
     pair_rows = {}
     for j in group:
         if not runs_over_pairs(j):
             continue
-        partner_alias = pair_partner(j)
-        live_partners = set(partners[partner_alias]["index"])
-        rows = partner_map(tables[j["written_pos"]],
-                           anchor_alias, partner_alias)
+        live_partners = set(partners[pair_partner(
+            j.get("equalities"), anchor_alias, j["partners"])]["index"])
         pair_rows[j["written_pos"]] = {
             anchor: [p for p in matched if p in live_partners]
-            for anchor, matched in rows.items()}
+            for anchor, matched in maps[j["written_pos"]].items()}
     subs = []
     for w in range(k):
         sub = _common_payload(payload)

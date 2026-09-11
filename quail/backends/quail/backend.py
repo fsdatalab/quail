@@ -180,8 +180,7 @@ class QuailModelExecution:
             kv_round = {"hits": len(anchor_ids), "misses": 0,
                         "regret_tokens": 0}
             stream["holder"].update(
-                answers=source.answers, tokens=source.tokens,
-                held=list(source.held))
+                answers=source.answers, tokens=source.tokens)
         else:
             anchor_ids = list(inputs["anchor_ids"])
             kv_round = inputs.get("kv_round") or {}
