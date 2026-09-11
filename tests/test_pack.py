@@ -35,9 +35,12 @@ def _drive_join(sched, truth, arena_pages, resident=None,
 
     def settle(a):
         nonlocal free
-        free += held.pop(a)
+        free += held.pop(a, 0)
 
     while not sched.done():
+        for kind, anchor in sched.take_settled():
+            events.append((kind, anchor))
+            settle(anchor)
         groups = sched.next_chunk(free)
         if groups:
             for a, j, start, end, carried in groups:
@@ -65,17 +68,25 @@ def _drive_join(sched, truth, arena_pages, resident=None,
                 for kind, anchor in sched.report(a, j, start, end, bits):
                     events.append((kind, anchor))
                     settle(anchor)
-    stranded = {a for a, st in enumerate(sched._stage) if st == -3}
-    assert free == arena_pages - sum(held[a] for a in stranded) \
-        - sum(held[a] for a in held if a not in stranded
-              and a in resident and sched._stage[a] == -1)
+    assert free == arena_pages, "pages leaked or freed twice"
     return chunks, events
 
 
 def _check_join_invariants(sched, chunks, events, truth, prefix,
-                           stages, frames, budget, resident=None):
+                           stages, frames, budget, resident=None,
+                           lists=None):
+    """Check chunks, coverage, answers, and events against the truth.
+
+    lists[a][j] is the anchor's partner index list at stage j, or
+    None for the whole stage list; truth[a][j] runs over that list.
+    """
     resident = resident or {}
     n, k = len(prefix), len(stages)
+
+    def indices(a, j):
+        lst = None if lists is None else lists[a][j]
+        return list(range(len(stages[j]))) if lst is None else list(lst)
+
     covered = {(a, j): [] for a in range(n) for j in range(k)}
     carried_count = [0] * n
     for groups in chunks:
@@ -85,41 +96,55 @@ def _check_join_invariants(sched, chunks, events, truth, prefix,
             assert a not in seen, "one anchor twice in a chunk"
             seen.add(a)
             assert end > start
+            partners = sched.partner_indices(a, j, start, end)
+            assert partners == indices(a, j)[start:end]
             tokens += (prefix[a] if carried else 0) \
                 + (frames[j] if start == 0 else 0) \
-                + sum(stages[j][start:end])
+                + sum(stages[j][i] for i in partners)
             covered[(a, j)].extend(range(start, end))
             carried_count[a] += carried
         assert tokens <= budget, "over-budget chunk"
-    # which stages each anchor should reach, from the planted truth
+    # which stages each anchor runs, from the planted truth: a stage
+    # with no partner or no TRUE ends the anchor there
     for a in range(n):
-        reach = 0
+        ran = 0
+        expected = ["finished"]
         for j in range(k):
-            if not stages[j]:
+            if not indices(a, j):
+                expected = ["finished"] if j == k - 1 else ["dropped"]
                 break
-            reach = j + 1
+            ran = j + 1
             if not any(truth[a][j]):
+                expected = ["finished"] if j == k - 1 else ["dropped"]
                 break
         for j in range(k):
-            if j < reach:
-                assert covered[(a, j)] == list(range(len(stages[j]))), \
+            if j < ran:
+                assert covered[(a, j)] == list(range(len(indices(a, j)))), \
                     f"anchor {a} stage {j} partners not streamed once"
                 assert sched.answers[j][a] == truth[a][j]
             else:
                 assert covered[(a, j)] == []
                 assert a not in sched.answers[j]
-        # the prefix is computed at most once, never when resident
-        assert carried_count[a] == (0 if a in resident else 1)
-        finished = reach == k
-        dropped = reach < k and stages[reach - 1] and \
-            not any(truth[a][reach - 1]) if reach else False
+        # the prefix is computed at most once, never when resident,
+        # and never for an anchor that ran no chunk
+        assert carried_count[a] == (0 if a in resident or not ran else 1)
         kinds = [kind for kind, anchor in events if anchor == a]
-        if finished:
-            assert kinds == ["finished"]
-        elif dropped:
-            assert kinds == ["dropped"]
+        assert kinds == expected, f"anchor {a}: {kinds} != {expected}"
+
+
+def _random_partner_lists(rng, stages):
+    """Per stage, a random index list into the stage, or None."""
+    lists = []
+    for lens in stages:
+        roll = rng.random()
+        if roll < 0.4:
+            lists.append(None)
+        elif roll < 0.5:
+            lists.append([])
         else:
-            assert kinds == []
+            count = rng.randrange(1, len(lens) + 1)
+            lists.append(sorted(rng.sample(range(len(lens)), count)))
+    return lists
 
 
 def _random_join(rng, n_anchors=None):
@@ -135,15 +160,24 @@ def _random_join(rng, n_anchors=None):
     top = budget - max(frames) - max(max(s) for s in stages if s)
     n = n_anchors or rng.randrange(1, 40)
     prefix = [rng.randrange(20, max(21, top)) for _ in range(n)]
-    truth = [[[1 if rng.random() < 0.5 else 0 for _ in stages[j]]
-              for j in range(k)] for _ in range(n)]
-    return prefix, stages, frames, budget, page_tokens, truth
+    # some anchors stream their own partner subsets (a join over pairs)
+    lists = [_random_partner_lists(rng, stages) if rng.random() < 0.5
+             else [None] * k for _ in range(n)]
+    truth = []
+    for a in range(n):
+        rows = []
+        for j in range(k):
+            count = len(stages[j]) if lists[a][j] is None else len(lists[a][j])
+            rows.append([1 if rng.random() < 0.5 else 0
+                         for _ in range(count)])
+        truth.append(rows)
+    return prefix, stages, frames, budget, page_tokens, truth, lists
 
 
 def test_admission_invariants_over_random_shapes():
     rng = random.Random(17)
-    for _ in range(60):
-        prefix, stages, frames, budget, page_tokens, truth = \
+    for _ in range(80):
+        prefix, stages, frames, budget, page_tokens, truth, lists = \
             _random_join(rng)
         need = [pages_for(p + max(frames), page_tokens) for p in prefix]
         arena_pages = max(max(need), rng.randrange(4, 400))
@@ -157,11 +191,15 @@ def test_admission_invariants_over_random_shapes():
             resident.popitem()
         sched = JoinAdmission(prefix, stages, budget, arena_pages,
                               page_tokens, frame_tokens=frames,
-                              resident=resident)
+                              resident=resident,
+                              anchor_partners={
+                                  a: lists[a] for a in range(len(prefix))
+                                  if any(lst is not None for lst in lists[a])
+                              })
         chunks, events = _drive_join(sched, truth, arena_pages,
                                      resident, deliver_lag=1, rng=rng)
         _check_join_invariants(sched, chunks, events, truth, prefix,
-                               stages, frames, budget, resident)
+                               stages, frames, budget, resident, lists)
 
     rng = random.Random(23)
     for trial in range(20):
@@ -240,14 +278,38 @@ def test_join_token_admission_and_stage_progress():
     assert sched.next_chunk(100) == [(0, 0, 0, 1, True)]
     assert sched.next_chunk(100) == [(0, 0, 1, 3, False)]
 
-    # stage 1 has no partners: a stage-0 survivor stays resident with
-    # no event, and the run still finishes
+    # stage 1 has no partners: a stage-0 survivor finishes with an
+    # empty last row, so the caller settles its KV
     sched = JoinAdmission([100], [[10], []], 400,
                           arena_pages=100, page_tokens=16)
     sched.next_chunk(100)
-    assert sched.report(0, 0, 0, 1, [1]) == []
+    assert sched.report(0, 0, 0, 1, [1]) == [("finished", 0)]
     assert sched.done()
     assert sched.answers == [{0: [1]}, {}]
+
+    # a join over pairs: anchor 0 streams partners 2 and 0 of stage 0
+    # and everything at stage 1; anchor 1 has no stage-0 partner and
+    # is dropped before any chunk; anchor 2 has none at stage 1
+    sched = JoinAdmission(
+        [100, 100, 100], [[10, 20, 30], [40]], 400,
+        arena_pages=100, page_tokens=16,
+        anchor_partners={0: [[2, 0], None], 1: [[], None], 2: [None, []]})
+    assert sched.take_settled() == [("dropped", 1)]
+    assert not sched.done()
+    assert sched.next_chunk(100) == [(0, 0, 0, 2, True), (2, 0, 0, 3, True)]
+    assert sched.partner_indices(0, 0, 0, 2) == [2, 0]
+    assert sched.partner_indices(2, 0, 1, 3) == [1, 2]
+    assert sched.report(0, 0, 0, 2, [0, 1]) == []
+    assert sched.report(2, 0, 0, 3, [1, 0, 0]) == [("finished", 2)]
+    assert sched.next_chunk(100) == [(0, 1, 0, 1, False)]
+    assert sched.report(0, 1, 0, 1, [1]) == [("finished", 0)]
+    assert sched.done()
+    assert sched.answers == [{0: [0, 1], 2: [1, 0, 0]}, {0: [1]}]
+    # a stage 0 with no partner at all settles every anchor at once
+    sched = JoinAdmission([100, 50], [[]], 400, arena_pages=100,
+                          page_tokens=16)
+    assert sched.take_settled() == [("finished", 0), ("finished", 1)]
+    assert sched.done()
 
 
 def test_join_page_capacity_and_resident_anchors():
@@ -280,8 +342,14 @@ def test_join_page_capacity_and_resident_anchors():
     assert sched.blocked_pages == 1
     assert sched.next_chunk(2) == [(0, 0, 0, 1, False)]
 
-    with pytest.raises(ValueError, match="first stage"):
-        JoinAdmission([100], [[]], 400, 100, 16)
+    with pytest.raises(ValueError, match="at least one stage"):
+        JoinAdmission([100], [], 400, 100, 16)
+    with pytest.raises(ValueError, match="out of range"):
+        JoinAdmission([100], [[10]], 400, 100, 16,
+                      anchor_partners={0: [[1]]})
+    with pytest.raises(ValueError, match="partner lists for 2 stages"):
+        JoinAdmission([100], [[10]], 400, 100, 16,
+                      anchor_partners={0: [[0], None]})
     with pytest.raises(ValueError, match="suffixes are atomic"):
         JoinAdmission([100], [[1050]], 1000, 100, 16)
     with pytest.raises(ValueError, match="no room for a partner"):

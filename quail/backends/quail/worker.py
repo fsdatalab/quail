@@ -15,6 +15,8 @@ from quail.backends.quail.graph import (
     _tuple_suffix,
     execute_single_graph,
     filter_result,
+    partner_list_builder,
+    stage_partner_lists,
 )
 from quail.backends.quail.retention import apply_retention, retain_after_join
 from quail.execution import PhysicalResponse
@@ -164,6 +166,7 @@ def quail_runtime_payload(request, graph) -> dict:
         "model": envelope["model"],
         "workers": envelope["workers"],
         "docs": docs,
+        "pairs": request.pair_tables(),
         **dict(envelope["settings"]),
     }
 
@@ -307,6 +310,7 @@ def execute_single(state, payload: dict, registry, graph) -> dict:
     runtime_state = {
         **state,
         "docs": decode_payload_documents(payload["docs"]),
+        "pairs": payload.get("pairs", {}),
         "runtimes": registry.runtimes,
         "model_spec": state.get("spec") or state.get("model_spec"),
         "device": registry.device(payload["physical_plan"]["device"]),
@@ -495,6 +499,13 @@ def _child_joins(state, sub):
             stage_suffixes.append(
                 [_tuple_suffix(j, part_docs, combo)
                  for combo in combos])
+        # the coordinator ships each pair stage's anchor -> partner
+        # rows for this GPU's anchors only
+        lists_for = partner_list_builder(
+            group, tuple_globs,
+            {int(position): {int(anchor): partners
+                             for anchor, partners in rows.items()}
+             for position, rows in sub.get("pairs", {}).items()})
         if filter_node is None:
             prefixes = [chain_tokens(pre, d) for d in anchor_docs]
             anchor_keys = [(anchor_alias, g) for g in anchors_glob]
@@ -546,6 +557,7 @@ def _child_joins(state, sub):
                     stage.written_pos: tuples
                     for stage, tuples in zip(node.stages, tuple_globs)
                 },
+                "anchor_partners": lists_for,
                 "group": group,
             },
             runtime_context,
@@ -584,11 +596,13 @@ def _child_joins(state, sub):
             else:
                 arena.free_key(key)
         tokens_total += result.metrics.fresh_tokens
+        partner_lists = stage_partner_lists(group, lists_for, anchors_glob)
         for si, j in enumerate(group):
             out_joins.append(dict(
                 rows={int(a): row for a, row in ans[si].items()},
                 anchor_index=anchors_glob,
-                partner_index=tuple_globs[si]))
+                partner_index=tuple_globs[si],
+                anchor_partners=partner_lists[si]))
     if sub.get("final_group"):
         for key in list(arena.accounting.owned):
             arena.free_key(key)

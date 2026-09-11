@@ -7,6 +7,7 @@ from quail.catalog import Catalog
 from quail.logical import (
     ColumnRef,
     CompileError,
+    Equality,
     FilterPredicate,
     JoinSpec,
     LogicalPlan,
@@ -16,10 +17,26 @@ from quail.logical import (
 )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class ColSpec:
     alias: Optional[str]
     column: str
+
+    def __eq__(self, other):
+        """``col("c.url") == col("e.url")`` is a join condition."""
+        if not isinstance(other, ColSpec):
+            return NotImplemented
+        return EqualsSpec(self, other)
+
+    def __hash__(self):
+        return hash((self.alias, self.column))
+
+
+@dataclass(frozen=True)
+class EqualsSpec:
+    """An unresolved ``col(...) == col(...)`` join condition."""
+    left: ColSpec
+    right: ColSpec
 
 
 @dataclass(frozen=True)
@@ -49,6 +66,8 @@ class Query:
         self._doc_columns = {}
         self._filters = {}
         self._joins = []
+        self._pending_join = None    # (new aliases, conditions) awaiting
+        #                              the AI predicate over its pairs
         self._limit = None
 
     # ---- scope -------------------------------------------------------
@@ -110,43 +129,85 @@ class Query:
 
     def ai_filter(self, p: PromptSpec,
                   selectivity: Optional[float] = None) -> "Query":
+        """Ask the prompt of every document, or of every joined pair.
+
+        A prompt over one table filters its documents. A prompt over
+        the tables of the preceding join() is the AI predicate asked
+        of that join's pairs.
+        """
+        if self._pending_join is not None:
+            return self._ai_join_pairs(p, selectivity)
         bound, aliases = self._bind(p)
         if len(aliases) != 1:
             raise CompileError(
                 f"ai_filter must reference exactly one provider, got "
-                f"{aliases}; a two-provider predicate is ai_join")
+                f"{aliases}; a two-provider predicate follows join() or "
+                f"is ai_join")
         self._filters.setdefault(aliases[0], []).append(
             FilterPredicate(prompt=bound, selectivity=selectivity))
         return self
 
-    def ai_join(self, others, p: PromptSpec,
-                selectivity: Optional[float] = None,
-                anchor: Optional[str] = None,
-                semantics: str = "full") -> "Query":
-        """Join one or more tables with a single prompt.
+    def join(self, other: "Query", on=None) -> "Query":
+        """Join one table on ordinary column equalities.
+
+        The next ai_filter() must name this table and one already in
+        the query; the model then sees only the pairs the equalities
+        allow. With on=None every pair is a candidate.
 
         Args:
-            others: One docs() query or a list of them.
-            p: Prompt with one placeholder per table it references.
-            selectivity: Fraction of tuples expected to pass.
-            anchor: Table alias whose KV is kept across tuples.
-            semantics: "full", "exists", or "anti".
+            other: One docs() query, optionally filtered.
+            on: ``col("c.url") == col("e.url")`` or a list of them.
         """
-        if semantics not in ("full", "exists", "anti"):
-            raise CompileError(f"semantics must be full, exists, or "
-                               f"anti, got {semantics!r}")
-        others = [others] if isinstance(others, Query) else list(others)
-        if semantics != "full" and len(others) != 1:
+        if self._pending_join is not None:
             raise CompileError(
-                "an exists/anti gate takes exactly one inner table; "
-                "use one ai_join call per gate")
+                "join() is waiting for the ai_filter over its pairs; "
+                "add that predicate before joining another table")
+        new_aliases = self._absorb([other])
+        conditions = [] if on is None else (
+            [on] if isinstance(on, EqualsSpec) else list(on))
+        resolved = []
+        for condition in conditions:
+            if not isinstance(condition, EqualsSpec):
+                raise CompileError(
+                    "join(on=...) takes col(...) == col(...) conditions")
+            left, right = (self._resolve(condition.left),
+                           self._resolve(condition.right))
+            sides = {left.alias, right.alias}
+            if new_aliases[0] not in sides or len(sides) != 2:
+                raise CompileError(
+                    f"join condition {left.alias}.{left.column} = "
+                    f"{right.alias}.{right.column} must relate the "
+                    f"joined table {new_aliases[0]!r} to a table already "
+                    f"in the query")
+            resolved.append(Equality(left, right))
+        self._pending_join = (new_aliases, tuple(resolved))
+        return self
+
+    def _ai_join_pairs(self, p: PromptSpec, selectivity):
+        new_aliases, conditions = self._pending_join
+        bound, aliases = self._bind(p, join=True)
+        if len(aliases) != 2 or new_aliases[0] not in aliases:
+            raise CompileError(
+                f"the predicate after join() must name the joined "
+                f"table {new_aliases[0]!r} and one other table, got "
+                f"{aliases}")
+        self._pending_join = None
+        self._joins.append(JoinSpec(aliases=tuple(new_aliases),
+                                    prompt=bound, semantics="full",
+                                    selectivity=selectivity,
+                                    anchor=None, on=conditions))
+        return self
+
+    def _absorb(self, others) -> list:
+        """Bring other single-table queries into scope; returns aliases."""
         new_aliases = []
         for other in others:
             if not isinstance(other, Query) or other._joins \
+                    or other._pending_join is not None \
                     or len(other._tables) != 1:
                 raise CompileError(
-                    "every joined side of ai_join must be a single "
-                    "(optionally filtered) docs(...) query")
+                    "every joined side must be a single (optionally "
+                    "filtered) docs(...) query")
             alias, provider = other._tables[0]
             if alias in self._scope():
                 raise CompileError(f"duplicate table alias {alias!r}")
@@ -158,6 +219,37 @@ class Query:
                     ColumnRef(alias=a, provider=self._scope()[a],
                               column=c))
             new_aliases.append(alias)
+        return new_aliases
+
+    def ai_join(self, others, p: PromptSpec,
+                selectivity: Optional[float] = None,
+                anchor: Optional[str] = None,
+                semantics: str = "full") -> "Query":
+        """Join one or more tables with a single prompt over every tuple.
+
+        Shorthand for join(other) followed by ai_filter(p) when every
+        pair is a candidate.
+
+        Args:
+            others: One docs() query or a list of them.
+            p: Prompt with one placeholder per table it references.
+            selectivity: Fraction of tuples expected to pass.
+            anchor: Table alias whose KV is kept across tuples.
+            semantics: "full", "exists", or "anti".
+        """
+        if self._pending_join is not None:
+            raise CompileError(
+                "join() is waiting for the ai_filter over its pairs; "
+                "add that predicate before ai_join")
+        if semantics not in ("full", "exists", "anti"):
+            raise CompileError(f"semantics must be full, exists, or "
+                               f"anti, got {semantics!r}")
+        others = [others] if isinstance(others, Query) else list(others)
+        if semantics != "full" and len(others) != 1:
+            raise CompileError(
+                "an exists/anti gate takes exactly one inner table; "
+                "use one ai_join call per gate")
+        new_aliases = self._absorb(others)
         bound, aliases = self._bind(p, join=True)
         if semantics == "full":
             # each call's prompt must cover the tables that call
@@ -206,6 +298,11 @@ class Query:
         return self
 
     def select(self, *cols) -> LogicalPlan:
+        if self._pending_join is not None:
+            raise CompileError(
+                f"join() of {self._pending_join[0]} has no AI predicate "
+                f"over its pairs; a plain join belongs in the database "
+                f"the ids came from")
         if not self._joins and not self._filters:
             raise CompileError("the query has no AI predicate; a plain "
                                "scan belongs in the database the ids "

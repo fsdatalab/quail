@@ -82,7 +82,8 @@ def fake_pack(torch, arena, specs, **kw):
 
 
 def run_streamed(monkeypatch, *, doc_lengths, filter_truth, partner_lengths,
-                 join_truth, budget, pages, frame_tokens=3, stages=2):
+                 join_truth, budget, pages, frame_tokens=3, stages=2,
+                 anchor_partners=None):
     monkeypatch.setattr(loop, "pack_chunk", fake_pack)
     model = FakeModel(filter_truth, join_truth)
     pipeline = SimpleNamespace(attention_mode=JOIN_ATTENTION,
@@ -117,7 +118,8 @@ def run_streamed(monkeypatch, *, doc_lengths, filter_truth, partner_lengths,
     join_answers, _, join_tokens = loop.run_join(
         fake_torch(), arena, pipeline, answers, anchor_prefixes,
         [suffixes], budget, stage_frames=[frame], anchor_keys=anchor_keys,
-        anchor_done=anchor_done, anchor_source=stream)
+        anchor_done=anchor_done, anchor_source=stream,
+        anchor_partners=anchor_partners)
     return dict(stream=stream, model=model, arena=arena,
                 join_answers=join_answers, join_tokens=join_tokens,
                 anchor_keys=anchor_keys, settled=settled,

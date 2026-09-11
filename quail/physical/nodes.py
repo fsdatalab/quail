@@ -58,6 +58,10 @@ class JoinStage:
     pair_tail_tokens: int
     anchor_resident: str
     tuple_tokens: float
+    # ordinary join conditions (left alias, left column, right alias,
+    # right column); the stage streams only the pairs they allow
+    equalities: tuple[tuple[str, str, str, str], ...] = ()
+    pair_fraction: float = 1.0
     frame_token_ids: tuple[int, ...] = ()
     label_token_ids: tuple[tuple[str, tuple[int, ...]], ...] = ()
     tail_token_ids: tuple[int, ...] = ()
@@ -76,6 +80,11 @@ class JoinStage:
             pair_tail_tokens=int(value["pair_tail_tokens"]),
             anchor_resident=str(value["anchor_resident"]),
             tuple_tokens=float(value["tuple_tokens"]),
+            equalities=tuple(
+                tuple(str(part) for part in condition)
+                for condition in value.get("equalities", ())
+            ),
+            pair_fraction=float(value.get("pair_fraction", 1.0)),
             frame_token_ids=tuple(value.get("frame_token_ids", ())),
             label_token_ids=tuple(
                 (alias, tuple(tokens))
@@ -97,6 +106,8 @@ class JoinStage:
             "pair_tail_tokens": self.pair_tail_tokens,
             "anchor_resident": self.anchor_resident,
             "tuple_tokens": self.tuple_tokens,
+            "equalities": [list(condition) for condition in self.equalities],
+            "pair_fraction": self.pair_fraction,
         }
 
     def to_dict(self) -> dict:
@@ -116,6 +127,7 @@ class JoinStage:
             "semantics": self.semantics,
             "selectivity": self.selectivity,
             "written_pos": self.written_pos,
+            "equalities": [list(condition) for condition in self.equalities],
             "frame": self.frame_token_ids,
             "labels": dict(self.label_token_ids),
             "tail": self.tail_token_ids,
@@ -165,6 +177,7 @@ class RequestJoinSpec:
     label_token_ids: tuple[tuple[str, tuple[Any, ...]], ...]
     frame_token_ids: tuple[tuple[str, tuple[Any, ...]], ...]
     tail_token_ids: tuple[Any, ...]
+    equalities: tuple[tuple[str, str, str, str], ...] = ()
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "RequestJoinSpec":
@@ -175,6 +188,10 @@ class RequestJoinSpec:
             anchor=value["anchor"],
             semantics=str(value["semantics"]),
             selectivity=value["selectivity"],
+            equalities=tuple(
+                tuple(str(part) for part in condition)
+                for condition in value.get("equalities", ())
+            ),
             label_token_ids=tuple(
                 (str(alias), tuple(tokens))
                 for alias, tokens in value["label_token_ids"]
@@ -201,6 +218,7 @@ class RequestJoinSpec:
                 [alias, list(tokens)] for alias, tokens in self.frame_token_ids
             ],
             "tail_token_ids": list(self.tail_token_ids),
+            "equalities": [list(condition) for condition in self.equalities],
         }
 
 

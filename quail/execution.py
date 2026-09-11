@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import pyarrow as pa
@@ -15,6 +15,7 @@ from quail.physical import (
     PortRef,
     ValueType,
 )
+from quail.runtime.pairs import PAIRS_PREFIX
 from quail.runtime.tokens import decode_token_documents
 
 
@@ -42,10 +43,15 @@ def document_input(tokens) -> TokenizedInput:
 
 @dataclass(frozen=True)
 class PhysicalRequest:
-    """A physical plan and its token input bindings."""
+    """A physical plan, its token input bindings, and its pair tables.
+
+    relations holds one pair table per join with equality conditions,
+    keyed ``pairs:<written position>``; see quail.runtime.pairs.
+    """
 
     plan: Mapping[str, Any]
     inputs: Mapping[str, TokenizedInput]
+    relations: Mapping[str, pa.Table] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         for input_id, value in self.inputs.items():
@@ -55,6 +61,18 @@ class PhysicalRequest:
                 raise TypeError(
                     "physical execution inputs must be TokenizedInput values"
                 )
+        for key, value in self.relations.items():
+            if not key.startswith(PAIRS_PREFIX):
+                raise ValueError(
+                    f"execution relations are pair tables keyed "
+                    f"{PAIRS_PREFIX}<written position>, got {key!r}")
+            if not isinstance(value, pa.Table):
+                raise TypeError("execution relations must be Arrow tables")
+
+    def pair_tables(self) -> dict[int, pa.Table]:
+        """Return the pair tables keyed by join written position."""
+        return {int(key[len(PAIRS_PREFIX):]): table
+                for key, table in self.relations.items()}
 
     @property
     def gpu_count(self) -> int:
@@ -130,6 +148,23 @@ def _filter_answers_table(node: AiFilter, value: Mapping) -> pa.Table:
     )
 
 
+def join_answer_cells(value: Mapping[str, Any]):
+    """Yield (anchor local index, partner member index, answer) triples.
+
+    rows[local] runs over the partner members the anchor streamed:
+    every member of partner_index, or the member indices listed in
+    anchor_partners[local] when the join ran over pairs.
+    """
+    members = value.get("anchor_partners") or {}
+    for raw_local, row in value["rows"].items():
+        local = int(raw_local)
+        streamed = members.get(local)
+        for position, answer in enumerate(row):
+            yield (local,
+                   position if streamed is None else int(streamed[position]),
+                   answer)
+
+
 def _join_answers_table(value: Mapping[str, Any]) -> pa.Table:
     anchor = str(value["anchor"])
     partners = tuple(value["partners"])
@@ -138,13 +173,11 @@ def _join_answers_table(value: Mapping[str, Any]) -> pa.Table:
     answers = []
     anchor_map = value["anchor_index"]
     partner_map = value["partner_index"]
-    for raw_local, row in value["rows"].items():
-        local = int(raw_local)
-        for member_index, answer in enumerate(row):
-            columns[anchor].append(int(anchor_map[local]))
-            for alias, document in zip(partners, partner_map[member_index]):
-                columns[alias].append(int(document))
-            answers.append(bool(answer))
+    for local, member_index, answer in join_answer_cells(value):
+        columns[anchor].append(int(anchor_map[local]))
+        for alias, document in zip(partners, partner_map[member_index]):
+            columns[alias].append(int(document))
+        answers.append(bool(answer))
     fields = []
     fields.extend(
         pa.field(alias, pa.int32(), nullable=False) for alias in aliases

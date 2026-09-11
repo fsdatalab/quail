@@ -7,7 +7,7 @@ from dataclasses import replace
 from typing import Any
 
 from quail.backends.base import GpuContext
-from quail.backends.quail.graph import filter_result
+from quail.backends.quail.graph import filter_result, stage_partner_lists
 from quail.backends.quail.worker import execute_quail_request, prepare_quail_request
 from quail.executor import loop
 from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
@@ -154,6 +154,7 @@ class QuailModelExecution:
                     *(len(frame) for frame in stage_frames)),
                 attention_mode=FILTER_ATTENTION,
             )
+        lists_for = inputs.get("anchor_partners")
         answers, _, tokens = loop.run_join(
             torch,
             arena,
@@ -167,6 +168,8 @@ class QuailModelExecution:
             anchor_done=inputs["anchor_done"],
             anchor_source=source,
             attention_mode=JOIN_ATTENTION if source is not None else None,
+            anchor_partners=(
+                None if lists_for is None else lambda key: lists_for(key[1])),
         )
         if source is not None:
             anchor_ids = [filter_ids[document] for document in source.held]
@@ -191,13 +194,16 @@ class QuailModelExecution:
             survivors = [document for document in anchor_ids
                          if document in matched]
         outputs = {f"ids:{node.anchor}": survivors}
-        for stage, stage_answers in zip(node.stages, answers):
+        partner_lists = stage_partner_lists(group, lists_for, anchor_ids)
+        for stage, stage_answers, members in zip(
+                node.stages, answers, partner_lists):
             outputs[f"join_answers:{stage.written_pos}"] = {
                 "rows": stage_answers,
                 "anchor_index": anchor_ids,
                 "partner_index": inputs["partner_indices"][
                     stage.written_pos
                 ],
+                "anchor_partners": members,
                 "anchor": node.anchor,
                 "partners": list(stage.partners),
                 "semantics": stage.semantics,
@@ -270,6 +276,7 @@ class QuailBackend:
             doc_tokens=context.document_tokens,
             gpus=context.gpu_count,
             order=context.order,
+            pair_fractions=context.pair_fractions,
         )
         if not hasattr(plan, "graph"):
             return (

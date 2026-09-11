@@ -264,17 +264,35 @@ def run_join_grouped(
     true_ids,
     *,
     submission="anchor-major",
+    pairs=None,
 ):
-    """Submit all pairs and return answers and KV counts in anchor-major order."""
+    """Submit the join's requests; answers come back in anchor-major order.
+
+    Args:
+        client: The engine client with generate().
+        sampling_params: Sampling settings for every request.
+        prefixes: Per-anchor prefix token lists.
+        suffixes: Per-partner suffix token lists.
+        true_ids: Token ids that mean TRUE.
+        submission: "anchor-major" or "suffix-major" request order.
+        pairs: (anchor index, suffix index) list to evaluate, in
+            anchor-major order; every anchor against every suffix when
+            omitted.
+    """
+    if pairs is None:
+        pairs = [(anchor, suffix) for anchor in range(len(prefixes))
+                 for suffix in range(len(suffixes))]
     if submission == "anchor-major":
-        pairs = ((prefix, suffix) for prefix in prefixes for suffix in suffixes)
+        order = list(range(len(pairs)))
     elif submission == "suffix-major":
-        pairs = ((prefix, suffix) for suffix in suffixes for prefix in prefixes)
+        order = sorted(range(len(pairs)),
+                       key=lambda index: (pairs[index][1], pairs[index][0]))
     else:
         raise ValueError(f"unknown join submission {submission!r}")
     prompts = [
-        {"prompt_token_ids": prefix + suffix}
-        for prefix, suffix in pairs
+        {"prompt_token_ids": prefixes[pairs[index][0]]
+         + suffixes[pairs[index][1]]}
+        for index in order
     ]
 
     started = time.perf_counter()
@@ -285,14 +303,12 @@ def run_join_grouped(
         int(getattr(output, "num_cached_tokens", 0) or 0)
         for output in outputs
     ]
-    if submission == "suffix-major":
-        order = [suffix * len(prefixes) + anchor
-                 for anchor in range(len(prefixes)) for suffix in range(len(suffixes))]
-        answers = [bits[index] for index in order]
-        cached_per_request = [cached_by_output[index] for index in order]
-    else:
-        answers = bits
-        cached_per_request = cached_by_output
+    submitted_at = [0] * len(pairs)
+    for position, index in enumerate(order):
+        submitted_at[index] = position
+    answers = [bits[position] for position in submitted_at]
+    cached_per_request = [cached_by_output[position]
+                          for position in submitted_at]
     prompt_tokens = sum(len(output.prompt_token_ids) for output in outputs)
     cached_tokens = sum(cached_per_request)
     return {
@@ -327,9 +343,9 @@ def join_cache_accounting(
 
     Args:
         prefixes: Per-anchor prefix token sequences.
-        suffix_count: Requests (suffixes) per anchor.
-        cached: Cached token count per request, indexed by
-            anchor_index * suffix_count + suffix_index.
+        suffix_count: Requests (suffixes) per anchor: one count for
+            every anchor, or a list with one count per anchor.
+        cached: Cached token count per request, in anchor-major order.
         seen_prefix_lengths: Per anchor, the prefix length an earlier
             request had already computed.
         block_size: KV block size in tokens; a hit rounds down to it.
@@ -344,18 +360,22 @@ def join_cache_accounting(
     cross_row = 0
     own_total = 0
     other_total = 0
+    counts = (
+        [suffix_count] * len(prefixes) if isinstance(suffix_count, int)
+        else list(suffix_count)
+    )
+    pair = 0
     for anchor_index, prefix in enumerate(prefixes):
         if document_spans is None:
             span = (0, len(prefix))
         else:
             span = document_spans[anchor_index]
-        for suffix_index in range(suffix_count):
+        for suffix_index in range(counts[anchor_index]):
             could_hit = (
                 seen_prefix_lengths[anchor_index]
                 if suffix_index == 0 else len(prefix)
             )
             could_hit = (could_hit // block_size) * block_size
-            pair = anchor_index * suffix_count + suffix_index
             regret += max(0, could_hit - int(cached[pair]))
             if suffix_index == 0:
                 own, shared, other = split_cached_tokens(
@@ -366,6 +386,7 @@ def join_cache_accounting(
             own_total += own
             cross_row += shared
             other_total += other
+            pair += 1
     return {
         "regret_tokens": regret,
         "cross_row_cached_tokens": cross_row,

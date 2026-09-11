@@ -8,12 +8,18 @@ from quail.builder import col, docs, prompt
 from quail.catalog import Catalog, DocumentProvider
 from quail.logical import (
     SHARED_PRE,
+    ColumnRef,
     CompileError,
+    Join,
     Project,
     Scan,
     SemanticFilter,
     SemanticJoin,
+    join_conditions,
+    join_outer_input,
 )
+from quail.logical_optimizer import LogicalPlanningContext, apply_logical_rules
+from quail.logical_rules import built_in_logical_rules
 from quail.sqlfront import SQLDialect, compile_sql
 
 
@@ -63,14 +69,18 @@ def test_sql_dialects_and_builder_produce_the_same_plan(catalog):
     assert join.semantics == "full"
     assert join.selectivity == 0.05
     assert join.anchor is None
-    filt = join.inputs[0]
+    # the prompt sits on a relational Join; no ON equality means
+    # every pair is a candidate
+    (pairs,) = join.inputs
+    assert isinstance(pairs, Join) and pairs.on == ()
+    filt = pairs.left
     assert isinstance(filt, SemanticFilter)
     assert filt.predicates[0].selectivity == 0.3
     assert isinstance(filt.input, Scan)
     assert (filt.input.provider, filt.input.column) == ("reviews",
                                                         "review")
-    assert isinstance(join.inputs[1], Scan)
-    assert (join.inputs[1].provider, join.inputs[1].column) == \
+    assert isinstance(pairs.right, Scan)
+    assert (pairs.right.provider, pairs.right.column) == \
         ("products", "description")
     # the join template is never canonicalized: it is the per-tuple
     # question, kept as written
@@ -119,8 +129,12 @@ def test_sql_dialects_and_builder_produce_the_same_plan(catalog):
     assert isinstance(join, SemanticJoin)
     assert join.anchor == "b"
     assert join.selectivity == 0.02
-    assert len(join.inputs) == 3
-    assert isinstance(join.inputs[0], Scan)   # no inner join anywhere
+    # both new tables are cross joined under one predicate
+    (outer_pairs,) = join.inputs
+    assert isinstance(outer_pairs, Join) and outer_pairs.on == ()
+    assert isinstance(outer_pairs.left, Join)
+    assert isinstance(outer_pairs.left.left, Scan)
+    assert isinstance(join_outer_input(join), Scan)
     assert [r.alias for r in join.predicate.args] == ["a", "b", "p"]
 
     # Snowflake style (bare JOINs, the predicate on the last ON),
@@ -218,7 +232,7 @@ def test_prompt_layout_and_predicate_order(catalog):
     assert split_frame("{0} then {1}")[0] == ""
 
     plan = compile_sql(FILTER_JOIN_SQL, catalog, tok)
-    pred = plan.root.input.inputs[0].predicates[0]
+    pred = join_outer_input(plan.root.input).predicates[0]
     # the preamble is always the engine's; the user's pre-document
     # text ("This review is negative:") moves into the tail
     assert pred.prompt.preamble == SHARED_PRE
@@ -255,7 +269,7 @@ def test_join_predicates_and_semantics(catalog):
     plan = compile_sql(TWO_ONS, catalog, tok)
     outer = plan.root.input
     assert isinstance(outer, SemanticJoin)
-    inner = outer.inputs[0]
+    inner = join_outer_input(outer)
     assert isinstance(inner, SemanticJoin)
     assert [r.alias for r in inner.predicate.args] == ["a", "b"]
     assert [r.alias for r in outer.predicate.args] == ["b", "p"]
@@ -316,12 +330,100 @@ def test_join_predicates_and_semantics(catalog):
     plan = compile_sql(sql, catalog, tok)
     outer = plan.root.input
     assert isinstance(outer, SemanticJoin)
-    assert len(outer.inputs) == 1              # p already in the tree
-    inner = outer.inputs[0]
+    inner = outer.inputs[0]                     # p already in the tree
     assert isinstance(inner, SemanticJoin)
-    assert len(inner.inputs) == 2
+    assert isinstance(inner.inputs[0], Join)
     assert [r.alias for r in inner.predicate.args] == ["r", "p"]
     assert [r.alias for r in outer.predicate.args] == ["r", "p"]
+
+
+PAIR_JOIN_SQL = """
+    SELECT r.id, p.asin
+    FROM reviews r
+    JOIN products p
+      ON r.id = p.asin
+     AND AI_FILTER(PROMPT('Review {0} discusses product {1}',
+                          r.review, p.description),
+                   {'selectivity': 0.05})
+    WHERE AI_FILTER(PROMPT('This review is negative: {0}', r.review))
+"""
+
+
+def test_join_on_equality_prunes_the_pairs(catalog):
+    # an ordinary equality in ON chooses the pairs; the AI predicate is
+    # asked of those pairs only
+    plan = compile_sql(PAIR_JOIN_SQL, catalog, tok)
+    join = plan.root.input
+    assert isinstance(join, SemanticJoin)
+    (pairs,) = join.inputs
+    assert isinstance(pairs, Join)
+    assert [str(condition) for condition in pairs.on] == ["r.id = p.asin"]
+    assert join_conditions(join) == pairs.on
+    assert pairs.on[0].left == ColumnRef("r", "reviews", "id")
+    assert pairs.on[0].right == ColumnRef("p", "products", "asin")
+    # the equality columns are loaded as values for the pair table
+    optimized, _ = apply_logical_rules(
+        plan, built_in_logical_rules(), LogicalPlanningContext(catalog, None))
+    scans = {node.alias: node for node in optimized.walk()
+             if isinstance(node, Scan)}
+    assert "id" in scans["r"].columns and "asin" in scans["p"].columns
+    # the builder spells it join(on=...) then ai_filter over both tables
+    built = (docs(catalog, "reviews", tok).alias("r")
+             .ai_filter(prompt("This review is negative: {0}",
+                               col("r.review")))
+             .join(docs(catalog, "products", tok).alias("p"),
+                   on=col("r.id") == col("p.asin"))
+             .ai_filter(prompt("Review {0} discusses product {1}",
+                               col("r.review"), col("p.description")),
+                        selectivity=0.05)
+             .select("r.id", "p.asin"))
+    assert built == plan
+    # BigQuery style: the equality in ON, the AI predicate in WHERE
+    where_plan = compile_sql("""
+        SELECT r.id, p.asin FROM reviews r
+        JOIN products p ON r.id = p.asin
+        WHERE AI_FILTER(PROMPT('Review {0} discusses product {1}',
+                               r.review, p.description),
+                        {'selectivity': 0.05})
+          AND AI_FILTER(PROMPT('This review is negative: {0}', r.review))
+    """, catalog, tok)
+    assert where_plan == plan
+
+    cases = [
+        ("SELECT r.id FROM reviews r JOIN products p ON r.id = p.asin",
+         "no AI predicate"),
+        ("SELECT r.id FROM reviews r JOIN products p ON r.id < p.asin "
+         "AND AI_FILTER(PROMPT('x {0} {1}', r.review, p.description))",
+         "column = column"),
+        ("SELECT r.id FROM reviews r JOIN products p ON r.id = r.review "
+         "AND AI_FILTER(PROMPT('x {0} {1}', r.review, p.description))",
+         "table already in the query"),
+        ("SELECT r.id FROM reviews r JOIN threads t ON t.id = r.id "
+         "JOIN products p ON AI_FILTER(PROMPT('x {0} {1}', r.review, "
+         "p.description)) WHERE AI_FILTER(PROMPT('y {0} {1}', "
+         "t.thread, p.description))", "names a table the AI predicate"),
+    ]
+    for sql, fragment in cases:
+        with pytest.raises(CompileError, match=fragment):
+            compile_sql(sql, catalog, tok)
+    base = docs(catalog, "reviews", tok).alias("r")
+    with pytest.raises(CompileError, match="no AI predicate"):
+        base.join(docs(catalog, "products", tok).alias("p"),
+                  on=col("r.id") == col("p.asin")).select("r.id")
+    with pytest.raises(CompileError, match="must name the joined table"):
+        (docs(catalog, "reviews", tok).alias("r")
+         .ai_join(docs(catalog, "threads", tok).alias("t"),
+                  prompt("x {0} {1}", col("r.review"), col("t.thread")))
+         .join(docs(catalog, "products", tok).alias("p"))
+         .ai_filter(prompt("x {0} {1}", col("r.review"), col("t.thread"))))
+    with pytest.raises(CompileError, match="waiting for the ai_filter"):
+        (docs(catalog, "reviews", tok).alias("r")
+         .join(docs(catalog, "products", tok).alias("p"))
+         .join(docs(catalog, "threads", tok).alias("t")))
+    with pytest.raises(CompileError, match="must relate the joined table"):
+        (docs(catalog, "reviews", tok).alias("r")
+         .join(docs(catalog, "products", tok).alias("p"),
+               on=col("r.id") == col("r.review")))
 
 
 def test_invalid_queries_and_limits(catalog):
@@ -413,7 +515,7 @@ REJECTED = [
     ("SELECT r.id FROM reviews r WHERE AI_CLASSIFY(PROMPT('x {0}', "
      "r.review))", "AI_CLASSIFY"),
     ("SELECT r.id FROM reviews r JOIN products p ON r.id = p.asin",
-     "AI_FILTER"),
+     "no AI predicate"),
     ("SELECT r.id FROM reviews r LEFT JOIN products p ON AI_FILTER("
      "PROMPT('x {0} {1}', r.review, p.description))", "plain JOIN"),
     ("SELECT r.id + 1 FROM reviews r WHERE AI_FILTER(PROMPT('x {0}', "

@@ -18,7 +18,7 @@ from quail.backends.request_scheduling import (
     true_bit,
 )
 from quail.execution import PhysicalResponse, export_physical_outputs
-from quail.logical import SHARED_PRE
+from quail.logical import SHARED_PRE, join_outer_input
 from quail.physical import (
     Limit,
     PhysicalNode,
@@ -44,6 +44,7 @@ from quail.planner import (
 from quail.planner.joins import search_joins, summarize_alias
 from quail.planner.plan import CorpusStats, PhysicalPlan
 from quail.planning import PhysicalCandidate, SupportResult
+from quail.runtime.pairs import partner_map
 from quail.runtime.result import answer_table
 from quail.runtime.runner import (
     ExecutionContext,
@@ -132,7 +133,7 @@ def plan_request_backend(
                 predicate.selectivity
                 if predicate.selectivity is not None else 1.0
             )
-    search_specs = logical_join_specs(joins)
+    search_specs = logical_join_specs(joins, context.pair_fractions)
     join_search = search_joins(
         search_specs,
         live,
@@ -192,7 +193,7 @@ def plan_request_backend(
         if len(labels) != len(aliases_in_prompt) or not prompt.tail_token_ids:
             raise ValueError("join prompts have no token ids")
         outer_aliases = tuple(dict.fromkeys(
-            field.alias for field in join.inputs[0].output_schema()
+            field.alias for field in join_outer_input(join).output_schema()
         ))
         join_specs.append(RequestJoinSpec(
             written_pos=written_pos,
@@ -204,6 +205,7 @@ def plan_request_backend(
             label_token_ids=labels,
             frame_token_ids=frames,
             tail_token_ids=tuple(prompt.tail_token_ids),
+            equalities=tuple(search_specs[written_pos]["on"]),
         ))
 
     preambles = {
@@ -318,6 +320,29 @@ def _filter_answer_table(alias, written_positions, answers) -> pa.Table:
         ],
         schema=schema,
     )
+
+
+def _allowed_members(spec, anchor, partners, anchor_ids, members,
+                     pairs) -> list:
+    """Per anchor, the member indices its equality conditions allow."""
+    partner_aliases = {
+        alias for condition in spec.equalities
+        for alias in (condition[0], condition[2]) if alias != anchor
+    }
+    if len(partner_aliases) != 1 or not partner_aliases <= set(partners):
+        raise ValueError(
+            f"join conditions {spec.equalities} must relate the anchor "
+            f"{anchor!r} to one partner of {partners}")
+    position = partners.index(partner_aliases.pop())
+    by_partner = {}
+    for index, member in enumerate(members):
+        by_partner.setdefault(int(member[position]), []).append(index)
+    rows = partner_map(pairs, anchor, partners[position])
+    return [
+        sorted(index for partner in rows.get(int(anchor_id), ())
+               for index in by_partner.get(int(partner), ()))
+        for anchor_id in anchor_ids
+    ]
 
 
 def _join_answer_table(spec, rows, answers, anchor, partners) -> pa.Table:
@@ -495,6 +520,7 @@ class RequestModelExecution:
         self.client = settings["client"]
         self.sampling_params = settings["sampling_params"]
         self.documents = settings["documents"]
+        self.pairs = settings.get("pairs", {})
         self.true_ids = set(settings["true_ids"])
         self.capacity = settings["capacity"]
         self.filter_submission = settings["filter_submission"]
@@ -638,8 +664,20 @@ class RequestModelExecution:
                     ))
                 suffix.extend(_token_list(spec.tail_token_ids))
                 suffixes.append(suffix)
+            # a join over pairs asks each anchor about its own members
+            allowed = None
+            request_pairs = None
+            if spec.equalities:
+                allowed = _allowed_members(
+                    spec, anchor, partners, anchor_ids, members,
+                    self.pairs[spec.written_pos])
+                request_pairs = [
+                    (anchor_index, member_index)
+                    for anchor_index, mine in enumerate(allowed)
+                    for member_index in mine
+                ]
 
-            if prefixes and suffixes:
+            if prefixes and suffixes and request_pairs != []:
                 result = run_join_grouped(
                     self.client,
                     self.sampling_params,
@@ -647,6 +685,7 @@ class RequestModelExecution:
                     suffixes,
                     self.true_ids,
                     submission=self.join_submission,
+                    pairs=request_pairs,
                 )
                 answers = [bool(answer) for answer in result["answers"]]
                 seen_lengths = [
@@ -661,7 +700,8 @@ class RequestModelExecution:
                 ]
                 accounting = join_cache_accounting(
                     prefixes,
-                    len(suffixes),
+                    (len(suffixes) if allowed is None
+                     else [len(mine) for mine in allowed]),
                     result["cached_per_request"],
                     seen_lengths,
                     block_size,
@@ -685,10 +725,12 @@ class RequestModelExecution:
                 cached_other = 0
 
             rows = []
-            for anchor_id in anchor_ids:
-                for member in members:
+            for anchor_index, anchor_id in enumerate(anchor_ids):
+                mine = (range(len(members)) if allowed is None
+                        else allowed[anchor_index])
+                for member_index in mine:
                     by_alias = {anchor: anchor_id}
-                    by_alias.update(zip(partners, member))
+                    by_alias.update(zip(partners, members[member_index]))
                     rows.append(tuple(by_alias[alias] for alias in spec.aliases))
             outputs[f"join_answers:{spec.written_pos}"] = _join_answer_table(
                 spec,
@@ -787,6 +829,7 @@ def execute_request_graph(context, backend, engine_state, boot):
             **settings,
             **engine_state,
             "documents": documents,
+            "pairs": context.request.pair_tables(),
         },
     ))
     if engine_state["client"].reset_prefix_cache() is False:

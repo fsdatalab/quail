@@ -13,6 +13,7 @@ from quail.physical import (
     AiJoin,
     PhysicalGraph,
 )
+from quail.runtime.pairs import partner_map
 from quail.runtime.runner import (
     ExecutionContext,
     GenericRunner,
@@ -57,6 +58,88 @@ def _tuple_suffix(join, docs, member):
         parts.extend((join["labels"][alias], docs[alias][document]))
     parts.append(join["tail"])
     return chain_tokens(*parts)
+
+
+def equality_partner(join: dict) -> str:
+    """The partner alias a stage's equality conditions pair with its anchor."""
+    partners = {alias for condition in join["equalities"]
+                for alias in (condition[0], condition[2])
+                if alias != join["anchor"]}
+    if len(partners) != 1 or not partners <= set(join["partners"]):
+        raise ValueError(
+            f"join conditions {join['equalities']} must relate the anchor "
+            f"{join['anchor']!r} to one partner of {join['partners']}")
+    return partners.pop()
+
+
+def partner_maps(group, pair_tables) -> dict:
+    """Written position -> anchor row -> partner rows, per pair stage."""
+    maps = {}
+    for join in group:
+        if not join["equalities"]:
+            continue
+        table = pair_tables.get(join["written_pos"])
+        if table is None:
+            raise ValueError(
+                f"join {join['written_pos']} has equality conditions but "
+                f"the request carries no pair table for it")
+        maps[join["written_pos"]] = partner_map(
+            table, join["anchor"], equality_partner(join))
+    return maps
+
+
+def partner_list_builder(group, tuples_by_stage, maps):
+    """Per-anchor partner member lists for the stages that run over pairs.
+
+    Args:
+        group: The stages' runtime specs.
+        tuples_by_stage: Per stage, its partner member tuples of global
+            document ids, in partner order.
+        maps: written position -> anchor row -> partner rows.
+
+    Returns:
+        callable(anchor global id) -> per stage, the sorted member
+        indices the anchor streams, or None for every member; or None
+        when no stage runs over pairs.
+    """
+    stage_maps = []
+    for join, tuples in zip(group, tuples_by_stage):
+        if not join["equalities"]:
+            stage_maps.append(None)
+            continue
+        position = join["partners"].index(equality_partner(join))
+        members = {}
+        for index, member in enumerate(tuples):
+            members.setdefault(int(member[position]), []).append(index)
+        stage_maps.append((maps[join["written_pos"]], members))
+    if all(entry is None for entry in stage_maps):
+        return None
+
+    def lists_for(anchor):
+        out = []
+        for entry in stage_maps:
+            if entry is None:
+                out.append(None)
+                continue
+            rows, members = entry
+            out.append(sorted(
+                index for partner in rows.get(int(anchor), ())
+                for index in members.get(int(partner), ())))
+        return out
+
+    return lists_for
+
+
+def stage_partner_lists(group, lists_for, anchor_ids) -> list:
+    """Per stage, anchor local index -> member indices, or None."""
+    out = []
+    for index, join in enumerate(group):
+        if lists_for is None or not join["equalities"]:
+            out.append(None)
+            continue
+        out.append({local: lists_for(anchor)[index]
+                    for local, anchor in enumerate(anchor_ids)})
+    return out
 
 
 def filter_result(node, answers, tokens, document_ids) -> NodeResult:
@@ -147,6 +230,11 @@ def prepare_model_inputs(node, inputs, context: ExecutionContext):
             _tuple_suffix(join, state["docs"], member)
             for member in tuples
         ])
+    # a stage with equality conditions streams each anchor against
+    # its own pairs; the pair tables came with the request
+    lists_for = partner_list_builder(
+        group, [tuple_indices[stage.written_pos] for stage in node.stages],
+        partner_maps(group, state.get("pairs", {})))
     if stream is None:
         anchor_ids = by_alias[node.anchor]
         prefixes = [
@@ -208,6 +296,7 @@ def prepare_model_inputs(node, inputs, context: ExecutionContext):
         "kv_round": round_kv,
         "anchor_ids": anchor_ids,
         "partner_indices": tuple_indices,
+        "anchor_partners": lists_for,
         "group": group,
     }
 

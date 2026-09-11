@@ -17,12 +17,13 @@ from quail.builtins import built_in_registry
 from quail.catalog import Catalog, ScanRequest, TableProvider
 from quail.execution import PhysicalRequest, document_input
 from quail.extensions import ExtensionRegistry
-from quail.logical import CompileError, LogicalPlan
+from quail.logical import CompileError, LogicalPlan, join_conditions
 from quail.logical_optimizer import LogicalPlanningContext, apply_logical_rules
 from quail.physical import PortRef, Project, Scan, ValueType, encode_graph
 from quail.planner import collect_operators, explain, plan_query
 from quail.planner.plan import EngineConfig, Refusal, resolve_model
 from quail.progress import Progress, say
+from quail.runtime.pairs import pair_fraction, pair_table, pairs_key
 from quail.runtime.prefixes import prefix_metrics
 from quail.runtime.result import IndexRelation, QueryResult, true_answer_rows
 from quail.runtime.runner import (
@@ -221,6 +222,26 @@ class Session:
                 max_workers=1, thread_name_prefix="quail-tokenize")
         return self._background.submit(
             self.tokenize, provider_name, column, projected_columns)
+
+    def column_values(self, provider_name: str, column: str) -> pa.ChunkedArray:
+        """Return one source column in scan order.
+
+        Reads the column store when the column is loaded, else scans
+        the provider for that one column.
+        """
+        provider = self.catalog.get(provider_name)
+        with self._lock:
+            store = self._column_stores.get(
+                (provider.content_identity(), column))
+        if store is not None:
+            return store.values
+        reader = provider.scan(ScanRequest(columns=(column,)))
+        try:
+            batches = [batch.column(0) for batch in reader]
+        finally:
+            reader.close()
+        return pa.chunked_array(
+            batches, type=provider.schema().field(column).type)
 
     def token_lengths(self, provider_name: str, column: str):
         """Return the exact token counts when the column is tokenized."""
@@ -421,6 +442,11 @@ class BoundBuilder:
         self._inner.ai_filter(p, selectivity=selectivity)
         return self
 
+    def join(self, other, on=None):
+        inner = other._inner if isinstance(other, BoundBuilder) else other
+        self._inner.join(inner, on=on)
+        return self
+
     def ai_join(self, others, p, selectivity=None, anchor=None,
                 semantics="full"):
         if not isinstance(others, (list, tuple)):
@@ -451,6 +477,7 @@ class Query:
         self._token_inputs = None
         self._token_futures = {}
         self._estimated = ()
+        self._pairs = {}          # join written position -> pair table
         self.token_wait_s = 0.0
 
     def token_inputs(self) -> dict:
@@ -472,7 +499,7 @@ class Query:
                     self.session.catalog, self.session.config
                 ),
             )
-            scans, _, _ = collect_operators(self.logical)
+            scans, _, joins = collect_operators(self.logical)
             self._doc_tokens = {}
             self._token_inputs = {}
             estimated = []
@@ -491,6 +518,13 @@ class Query:
                 estimated.append(s.alias)
             self._estimated = tuple(estimated)
             started = time.perf_counter()
+            self._pairs = self._pair_tables(scans, joins)
+            pair_fractions = {
+                position: pair_fraction(
+                    table, len(self._doc_tokens[table.column_names[0]]),
+                    len(self._doc_tokens[table.column_names[1]]))
+                for position, table in self._pairs.items()
+            }
             self._plan = plan_query(
                 self.logical, model=self.session.model,
                 device=self.session.device,
@@ -499,9 +533,32 @@ class Query:
                 order=self.order,
                 backend=self.session.config.backend,
                 registry=self.session.registry,
-                tokenizer=self.session.tokenizer)
+                tokenizer=self.session.tokenizer,
+                pair_fractions=pair_fractions)
             say(f"plan ready in {time.perf_counter() - started:.2f} s")
         return self._plan
+
+    def _pair_tables(self, scans, joins) -> dict:
+        """Build the pair table of every join with equality conditions."""
+        providers = {scan.alias: scan.provider for scan in scans}
+        tables = {}
+        for position, join in enumerate(joins):
+            conditions = join_conditions(join)
+            if not conditions:
+                continue
+            left_alias, right_alias = conditions[0].aliases()
+            left_keys, right_keys = [], []
+            for condition in conditions:
+                left, right = condition.left, condition.right
+                if left.alias != left_alias:
+                    left, right = right, left
+                left_keys.append(self.session.column_values(
+                    providers[left.alias], left.column))
+                right_keys.append(self.session.column_values(
+                    providers[right.alias], right.column))
+            tables[position] = pair_table(
+                left_alias, left_keys, right_alias, right_keys)
+        return tables
 
     def explain(self, *, verbose: bool = False) -> str:
         """Return the optimized plan, optionally including runtime settings."""
@@ -555,7 +612,9 @@ class Query:
                 self._token_inputs[node.alias].tokens
             )
         envelope = plan.to_envelope(self.session.registry.codecs)
-        return PhysicalRequest(envelope, inputs)
+        relations = {pairs_key(position): table
+                     for position, table in self._pairs.items()}
+        return PhysicalRequest(envelope, inputs, relations)
 
     def finish(self, response, coordinator_wall: float = 0.0) -> QueryResult:
         """Finish the physical graph and attach execution details."""

@@ -100,10 +100,15 @@ def thin(live: dict, spec: dict) -> None:
 
 
 def cross_tuples(spec: dict, live: dict) -> float:
+    """Expected tuples of one join.
+
+    The live cross product, or the fraction of it the join's equality
+    conditions keep.
+    """
     tuples = 1.0
     for a in spec["aliases"]:
         tuples *= live[a]
-    return tuples
+    return tuples * spec.get("pair_fraction", 1.0)
 
 
 def anchor_candidates(spec: dict, honor_forced: bool = True) -> list:

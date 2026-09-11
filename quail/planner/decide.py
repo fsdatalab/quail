@@ -4,11 +4,13 @@ from dataclasses import replace
 
 from quail.executor.retention import retention_pages
 from quail.logical import (
+    Join,
     LogicalPlan,
     Project,
     Scan,
     SemanticFilter,
     SemanticJoin,
+    join_conditions,
 )
 from quail.physical import (
     AiFilter,
@@ -49,6 +51,9 @@ def collect_operators(plan: LogicalPlan):
             for child in node.inputs:
                 walk(child)
             joins.append(node)
+        elif isinstance(node, Join):
+            walk(node.left)
+            walk(node.right)
         elif isinstance(node, SemanticFilter):
             walk(node.input)
             filters[node.input.alias] = list(node.predicates)
@@ -185,18 +190,29 @@ def _label_counts(join) -> dict:
     return out
 
 
-def join_specs(joins) -> list:
-    """The joins as the search's spec dicts, in written order."""
+def join_specs(joins, pair_fractions=None) -> list:
+    """The joins as the search's spec dicts, in written order.
+
+    pair_fractions maps a written position to the fraction of the
+    cross product its equality conditions keep; a join with
+    conditions but no entry is priced as the full cross product.
+    """
+    pair_fractions = pair_fractions or {}
     out = []
     for i, j in enumerate(joins):
         labels = _label_counts(j)
+        conditions = join_conditions(j)
         out.append(dict(
             written_pos=i, aliases=_join_aliases(j), anchor=j.anchor,
             anchor_free=(j.anchor is None and j.semantics == "full"),
             semantics=j.semantics, selectivity=j.selectivity,
             frame_tokens={a: nt for a, (lt, nt) in labels.items()},
             label_tokens={a: lt for a, (lt, nt) in labels.items()},
-            tail_tokens=_question_tokens(j.predicate)))
+            tail_tokens=_question_tokens(j.predicate),
+            on=[(c.left.alias, c.left.column, c.right.alias, c.right.column)
+                for c in conditions],
+            pair_fraction=(pair_fractions.get(i, 1.0) if conditions
+                           else 1.0)))
     return out
 
 
@@ -287,7 +303,7 @@ def contiguous_shards(doc_tokens, workers: int):
 
 def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                 device: DeviceSpec, doc_tokens: dict, gpus: int = 1,
-                order: str | None = None):
+                order: str | None = None, pair_fractions=None):
     """Compile a LogicalPlan into a PhysicalPlan or Refusal.
 
     Args:
@@ -298,6 +314,8 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
         gpus: GPU count; one model copy runs per GPU.
         order: Stage order rule, 'by_cost' or 'as_written'; None picks
             the default rule.
+        pair_fractions: join written position -> the fraction of the
+            cross product its equality conditions keep.
     """
     scans, filters, joins = collect_operators(plan)
     length_stats = {a: joinsearch.summarize_alias(t)
@@ -327,7 +345,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     chunk = budgets.chunk_budget(model, device)
     admission = budgets.arena_tokens(model, device, chunk)
     pre = preamble_tokens(filters, joins)
-    specs = join_specs(joins)
+    specs = join_specs(joins, pair_fractions)
 
     # ---- the order rule first: the search below needs it
     rule, source = (order, f"user: order={order!r}") if order else \
@@ -564,7 +582,9 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                 anchor_frame_tokens=spec["frame_tokens"][anchor],
                 pair_tail_tokens=spec["tail_tokens"],
                 anchor_resident=record["resident"],
-                tuple_tokens=round(record["tokens"], 1)))
+                tuple_tokens=round(record["tokens"], 1),
+                equalities=tuple(tuple(c) for c in spec["on"]),
+                pair_fraction=spec["pair_fraction"]))
             exec_idx += 1
             for a in partners:
                 if a not in in_aliases:
@@ -630,7 +650,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
 def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                device: DeviceSpec, doc_tokens: dict, gpus: int = 1,
                order: str | None = None, backend: str = "quail",
-               registry=None, tokenizer=None):
+               registry=None, tokenizer=None, pair_fractions=None):
     """Plan one query with the selected model backend.
 
     Args:
@@ -645,6 +665,8 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         registry: Optional session extension registry.
         tokenizer: Optional callable (text -> token list) handed to the
             planning context.
+        pair_fractions: join written position -> the fraction of the
+            cross product its equality conditions keep.
     """
     if registry is None:
         # the built in registry imports every backend, and backends
@@ -679,6 +701,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         backend=backend,
         order=order,
         tokenizer=tokenizer,
+        pair_fractions=dict(pair_fractions or {}),
     )
     region = ModelRegion(plan)
     candidates = tuple(selected.plan(region, context))

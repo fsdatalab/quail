@@ -77,6 +77,10 @@ def logical_tree(logical):
                        f"(selectivity={_selectivity(node.selectivity)})"]
             if node.anchor is not None:
                 title += f" anchor={node.anchor}"
+        elif isinstance(node, logical_nodes.Join):
+            title = "Join"
+            details = ([f"on {condition}" for condition in node.on]
+                       or ["cross"])
         else:
             title = node.type_name
             details = _fields(node.explain_fields(), 0)
@@ -208,9 +212,14 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None):
                 predicate = (_prompt(joins[stage.written_pos].predicate)
                              if stage.written_pos < len(joins)
                              else f"predicate {stage.written_pos + 1}")
+                pairs = "".join(
+                    f" on {left_alias}.{left_column} = "
+                    f"{right_alias}.{right_column}"
+                    for left_alias, left_column, right_alias, right_column
+                    in stage.equalities)
                 details.append(
                     f"{index}. {stage.semantics} ({stage.anchor}, "
-                    f"{', '.join(stage.partners)}): {predicate} "
+                    f"{', '.join(stage.partners)}){pairs}: {predicate} "
                     f"(selectivity={_selectivity(stage.selectivity)}, "
                     f"estimated_evaluations={_number(stage.expected_tuples)})")
         elif isinstance(node, Exchange):

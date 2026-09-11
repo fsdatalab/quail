@@ -113,7 +113,6 @@ def pages_for(tokens: int, page_tokens: int) -> int:
 # --------------------------------------------- join admission
 
 _DONE = -2      # the anchor's last stage answered, or it failed a gate
-_STRANDED = -3  # advanced into a stage with no partners: stays resident
 
 
 class JoinAdmission:
@@ -121,8 +120,8 @@ class JoinAdmission:
 
     Args:
         prefix_tokens: Per-anchor prefix token counts.
-        stage_suffixes: Per stage, the partner suffix token counts.
-            Every anchor streams the same partner list at a stage.
+        stage_suffixes: Per stage, the partner suffix token counts of
+            every partner tuple at that stage.
         chunk_budget: Tokens per forward pass.
         arena_pages: Pages in the KV arena.
         page_tokens: Tokens per arena page.
@@ -130,6 +129,10 @@ class JoinAdmission:
             the anchor's KV ahead of its first suffix.
         resident: anchor -> pages already held. A resident anchor's
             prefix KV is in the arena, so it packs no prefix tokens.
+        anchor_partners: anchor -> per stage, the indices into that
+            stage's partner list the anchor streams, or None for the
+            whole list. Omitted anchors stream the whole list at every
+            stage.
 
     Each chunk fills in priority order: partner streams cut by the
     previous chunk, then anchors starting their next stage, then
@@ -138,20 +141,22 @@ class JoinAdmission:
     next stage once its whole stream at the current stage is launched
     and one partner has answered TRUE; the remaining answers fill in
     while the next stage runs. It drops out when every partner
-    answered FALSE.
+    answered FALSE. An anchor with no partner at a stage settles
+    without a chunk: finished with an empty row at the last stage,
+    dropped at any earlier one.
     """
 
     def __init__(self, prefix_tokens, stage_suffixes, chunk_budget,
                  arena_pages, page_tokens, frame_tokens=None,
-                 resident=None):
+                 resident=None, anchor_partners=None):
         self.prefix = []
         self.stages = [list(s) for s in stage_suffixes]
         self.frames = (list(frame_tokens) if frame_tokens
                        else [0] * len(self.stages))
         if len(self.frames) != len(self.stages):
             raise ValueError("frame_tokens must match stage_suffixes")
-        if not self.stages or not self.stages[0]:
-            raise ValueError("the first stage needs partners")
+        if not self.stages:
+            raise ValueError("a join needs at least one stage")
         self.chunk_budget = chunk_budget
         self.arena_pages = arena_pages
         self.page_tokens = page_tokens
@@ -168,31 +173,74 @@ class JoinAdmission:
                     f"exceeds the {chunk_budget}-token chunk budget "
                     f"(suffixes are atomic)")
         self._extra = max(self.frames)
-        self._first = self.frames[0] + self.stages[0][0]
+        self._lists = []           # per anchor, per stage: indices or None
+        self._cums = []            # per anchor, per stage: cumulative sums
         self._page_cost = []
         self._carried = []
+        self._first = []           # per anchor: its first partner's cost
         self._min_fresh = float("inf")
         self._zero_cost = 0
         self.pending = deque()
         self.ready = deque()       # placed anchors with partners left
-        self._stage = []           # current stage, or _DONE/_STRANDED
+        self._stage = []           # current stage, or _DONE
         self._next = []            # next partner index at the stage
         self._true = []
+        self._settled = []         # events for anchors that never ran
         self.in_flight = 0         # launched groups not yet reported
         self.blocked_pages = 0
         self.answers = [dict() for _ in range(k)]
         resident = dict(resident or {})
+        anchor_partners = dict(anchor_partners or {})
         for a, prefix in enumerate(prefix_tokens):
-            self._register(prefix, resident.get(a))
+            self._register(prefix, resident.get(a), anchor_partners.get(a))
         # resident anchors first: they cost no prefix tokens and few
         # or no pages, so they never wait behind a page-blocked anchor
         n = len(self.prefix)
-        self.pending.extend(a for a in range(n) if a in resident)
-        self.pending.extend(a for a in range(n) if a not in resident)
+        self.pending.extend(a for a in range(n)
+                            if a in resident and self._stage[a] == -1)
+        self.pending.extend(a for a in range(n)
+                            if a not in resident and self._stage[a] == -1)
 
-    def _register(self, prefix, resident_pages):
+    # ---- per-anchor partner lists ------------------------------------
+
+    def _count(self, a, j):
+        lst = self._lists[a][j]
+        return len(self.stages[j]) if lst is None else len(lst)
+
+    def _cum_of(self, a, j):
+        return self._cum[j] if self._lists[a][j] is None else self._cums[a][j]
+
+    def partner_indices(self, a, j, start, end):
+        """Indices into stage j's partner list for one launched group."""
+        lst = self._lists[a][j]
+        return list(range(start, end)) if lst is None else list(lst[start:end])
+
+    def _register(self, prefix, resident_pages, partners):
         """Record one anchor's costs; returns its index."""
         a = len(self.prefix)
+        k = len(self.stages)
+        if partners is None:
+            lists = [None] * k
+            cums = [None] * k
+        else:
+            lists = [None if lst is None else list(lst) for lst in partners]
+            if len(lists) != k:
+                raise ValueError(
+                    f"anchor {a}: partner lists for {len(lists)} stages, "
+                    f"the join has {k}")
+            cums = []
+            for j, lst in enumerate(lists):
+                if lst is None:
+                    cums.append(None)
+                    continue
+                cum = [0]
+                for i in lst:
+                    if not 0 <= i < len(self.stages[j]):
+                        raise ValueError(
+                            f"anchor {a} stage {j}: partner {i} is out "
+                            f"of range")
+                    cum.append(cum[-1] + self.stages[j][i])
+                cums.append(cum)
         need = pages_for(prefix + self._extra, self.page_tokens)
         if resident_pages is not None:
             need = max(0, need - resident_pages)
@@ -200,32 +248,58 @@ class JoinAdmission:
             raise ValueError(
                 f"anchor {a} needs {need} KV pages; the arena "
                 f"holds {self.arena_pages}")
-        elif prefix + self._first > self.chunk_budget:
+        carried = 0 if resident_pages is not None else prefix
+        self.prefix.append(prefix)
+        self._lists.append(lists)
+        self._cums.append(cums)
+        self._page_cost.append(need)
+        self._carried.append(carried)
+        self._stage.append(-1)
+        self._next.append(0)
+        self._true.append([False] * k)
+        if self._count(a, 0) == 0:
+            # nothing to evaluate: the anchor settles without a chunk
+            self._first.append(0)
+            self._stage[a] = _DONE
+            self._settled.append(("finished" if k == 1 else "dropped", a))
+            return a
+        first = self.frames[0] + self._suffix(a, 0, 0)
+        if resident_pages is None and prefix + first > self.chunk_budget:
             raise ValueError(
                 f"anchor {a}: prefix {prefix} tokens leaves no "
                 f"room for a partner in a {self.chunk_budget}-token "
                 f"chunk")
-        carried = 0 if resident_pages is not None else prefix
-        self.prefix.append(prefix)
-        self._page_cost.append(need)
-        self._carried.append(carried)
-        self._min_fresh = min(self._min_fresh, carried + self._first)
+        self._first.append(first)
+        self._min_fresh = min(self._min_fresh, carried + first)
         if not need:
             self._zero_cost += 1
-        self._stage.append(-1)
-        self._next.append(0)
-        self._true.append([False] * len(self.stages))
         return a
 
-    def admit(self, prefix_tokens, resident_pages=None):
+    def _suffix(self, a, j, i):
+        lst = self._lists[a][j]
+        return self.stages[j][i if lst is None else lst[i]]
+
+    def admit(self, prefix_tokens, resident_pages=None, partners=None):
         """Queue one more anchor behind the pending ones; returns its index.
 
         resident_pages says the anchor's prefix KV is already in the
         arena on that many pages, so it packs no prefix tokens.
+        partners is the anchor's per-stage partner index lists, as in
+        anchor_partners.
         """
-        a = self._register(prefix_tokens, resident_pages)
-        self.pending.append(a)
+        a = self._register(prefix_tokens, resident_pages, partners)
+        if self._stage[a] == -1:
+            self.pending.append(a)
         return a
+
+    def take_settled(self):
+        """Events for anchors that settled without running a chunk.
+
+        Returns ("finished", a) or ("dropped", a) pairs, as report()
+        does, and clears them.
+        """
+        events, self._settled = self._settled, []
+        return events
 
     def buildable_tokens(self):
         """Tokens the next chunk could pack, capped at the chunk budget.
@@ -237,24 +311,24 @@ class JoinAdmission:
         total = 0
         for a in self.ready:
             j, i = self._stage[a], self._next[a]
-            total += (self.frames[j] if i == 0 else 0) \
-                + self._cum[j][-1] - self._cum[j][i]
+            cum = self._cum_of(a, j)
+            total += (self.frames[j] if i == 0 else 0) + cum[-1] - cum[i]
             if total >= self.chunk_budget:
                 return self.chunk_budget
         for a in self.pending:
-            total += self._carried[a] + self.frames[0] + self._cum[0][-1]
+            total += self._carried[a] + self.frames[0] + self._cum_of(a, 0)[-1]
             if total >= self.chunk_budget:
                 return self.chunk_budget
         return total
 
     # ---- chunk building ------------------------------------------------
 
-    def _first_cost(self, j, i):
-        return self.stages[j][i] + (self.frames[j] if i == 0 else 0)
+    def _first_cost(self, a, j, i):
+        return self._suffix(a, j, i) + (self.frames[j] if i == 0 else 0)
 
-    def _take(self, j, i, room):
+    def _take(self, a, j, i, room):
         """(end, tokens): the longest partner run from i that fits."""
-        cum = self._cum[j]
+        cum = self._cum_of(a, j)
         frame = self.frames[j] if i == 0 else 0
         end = bisect_right(cum, cum[i] + room - frame) - 1
         return end, frame + cum[end] - cum[i]
@@ -263,11 +337,13 @@ class JoinAdmission:
         """Record a launched group; True when the stream continues."""
         self._next[a] = end
         self.in_flight += 1
-        return end < len(self.stages[j])
+        return end < self._count(a, j)
 
     def next_chunk(self, free_pages):
         """Groups for the next chunk: [(anchor, stage, start, end, carried)].
 
+        start and end index the anchor's own partner list at the
+        stage; partner_indices() maps them to the stage's list.
         carried means the anchor's prefix tokens are packed and its KV
         written to its pages. free_pages is the arena's free list;
         fresh anchors admit against it. Returns [] when nothing is
@@ -281,10 +357,10 @@ class JoinAdmission:
         for _ in range(len(self.ready)):
             a = self.ready.popleft()
             j, i = self._stage[a], self._next[a]
-            if self._first_cost(j, i) > room:
+            if self._first_cost(a, j, i) > room:
                 self.ready.appendleft(a)    # FIFO; chunk nearly full
                 break
-            end, tokens = self._take(j, i, room)
+            end, tokens = self._take(a, j, i, room)
             groups.append((a, j, i, end, False))
             room -= tokens
             if self._launch(a, j, end):
@@ -308,10 +384,10 @@ class JoinAdmission:
                     break
                 continue
             carried = self._carried[a]
-            if carried + self._first_cost(0, 0) > room:
+            if carried + self._first[a] > room:
                 held.append(a)      # chunk room only; retry next chunk
                 continue
-            end, tokens = self._take(0, 0, room - carried)
+            end, tokens = self._take(a, 0, 0, room - carried)
             groups.append((a, 0, 0, end, carried > 0))
             room -= carried + tokens
             free_pages -= need
@@ -343,7 +419,7 @@ class JoinAdmission:
         if any(bits):
             self._true[a][j] = True
         k = len(self.stages)
-        n_j = len(self.stages[j])
+        n_j = self._count(a, j)
         complete = len(row) == n_j
         events = []
         if j == self._stage[a] and j + 1 < k:
@@ -353,10 +429,15 @@ class JoinAdmission:
                 # frame write cannot race a read of this stage's
                 self._stage[a] = j + 1
                 self._next[a] = 0
-                if self.stages[j + 1]:
+                if self._count(a, j + 1):
                     self.ready.append(a)
+                elif j + 1 == k - 1:
+                    # no partner at the last stage: an empty row
+                    self._stage[a] = _DONE
+                    events.append(("finished", a))
                 else:
-                    self._stage[a] = _STRANDED
+                    self._stage[a] = _DONE
+                    events.append(("dropped", a))
             elif complete and not self._true[a][j]:
                 self._stage[a] = _DONE
                 events.append(("dropped", a))
@@ -369,7 +450,7 @@ class JoinAdmission:
 
     def done(self):
         return not self.pending and not self.ready \
-            and not self.in_flight
+            and not self.in_flight and not self._settled
 
 
 class FilterAdmission:

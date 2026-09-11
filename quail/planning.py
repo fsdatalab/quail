@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Protocol
 
 from quail.physical import PhysicalGraph
@@ -43,6 +43,9 @@ class PlanningContext:
     backend: str
     order: str | None = None
     tokenizer: Callable[[str], Any] | None = None
+    # join written position -> its equality pairs as a fraction of
+    # the cross product; joins without conditions are absent
+    pair_fractions: Mapping[int, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

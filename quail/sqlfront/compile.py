@@ -9,6 +9,7 @@ from quail.catalog import Catalog
 from quail.logical import (
     ColumnRef,
     CompileError,
+    Equality,
     FilterPredicate,
     JoinSpec,
     LogicalPlan,
@@ -218,6 +219,23 @@ class _Binder:
         return prompt, options, aliases
 
 
+def _parse_equality(b, term, joined_alias: str) -> Equality:
+    """Parse one ordinary ON condition: two columns compared with =."""
+    if not isinstance(term, exp.EQ) or not isinstance(term.this, exp.Column) \
+            or not isinstance(term.expression, exp.Column):
+        raise CompileError(
+            f"ON supports column = column and AI_FILTER(...), got "
+            f"{term.sql()}")
+    left = b.resolve_column(term.this)
+    right = b.resolve_column(term.expression)
+    sides = {left.alias, right.alias}
+    if joined_alias not in sides or len(sides) != 2:
+        raise CompileError(
+            f"JOIN {joined_alias} ON {term.sql()} must relate "
+            f"{joined_alias!r} to a table already in the query")
+    return Equality(left, right)
+
+
 def _from_clause(select):
     return select.args.get("from_")
 
@@ -226,7 +244,12 @@ def _where_terms(where) -> list:
     """Flatten the WHERE conjunction into a list of terms."""
     if where is None:
         return []
-    terms, stack = [], [where.this]
+    return _conjuncts(where.this)
+
+
+def _conjuncts(node) -> list:
+    """Flatten one AND tree into its terms, in written order."""
+    terms, stack = [], [node]
     while stack:
         n = stack.pop()
         if isinstance(n, exp.And):
@@ -286,6 +309,7 @@ def compile_sql(sql: str, catalog: Catalog,
 
     joined_aliases = []       # tables brought in by JOIN clauses
     on_preds = []
+    conditions = {}           # joined alias -> its ON equalities
     for join in tree.args.get("joins") or []:
         if join.side or (join.kind
                          and join.kind.upper() not in ("INNER",
@@ -295,13 +319,29 @@ def compile_sql(sql: str, catalog: Catalog,
                 f"{join.side or ''} {join.kind or ''} JOIN".strip())
         if not isinstance(join.this, exp.Table):
             raise CompileError("JOIN must name one registered provider")
-        joined_aliases.append(b.add_table(join.this))
+        alias = b.add_table(join.this)
+        joined_aliases.append(alias)
         on = join.args.get("on")
         if on is None:
             continue    # a bare/cross-joined table: some join
             #             predicate must cover it (checked below)
-        on_preds.append(b.parse_ai_filter(on, JOIN_OPTION_KEYS,
-                                          join=True))
+        # ON holds ordinary equalities, which choose the pairs, and
+        # at most one AI predicate, which the model asks of them
+        equalities, predicates = [], []
+        for term in _conjuncts(on):
+            if _is_call(term, "AI_FILTER"):
+                predicates.append(term)
+            else:
+                equalities.append(_parse_equality(b, term, alias))
+        if len(predicates) > 1:
+            raise CompileError(
+                f"JOIN {alias} has {len(predicates)} AI predicates in "
+                f"ON; ask one question per JOIN")
+        if equalities:
+            conditions[alias] = equalities
+        for term in predicates:
+            on_preds.append(b.parse_ai_filter(term, JOIN_OPTION_KEYS,
+                                              join=True))
 
     claimed = set()           # joined tables already carried by a spec
 
@@ -324,10 +364,21 @@ def compile_sql(sql: str, catalog: Catalog,
         news = tuple(a for a in joined_aliases
                      if a in aliases and a not in claimed)
         claimed.update(news)
+        on = tuple(condition for a in news
+                   for condition in conditions.pop(a, ()))
+        if on and len(aliases) != 2:
+            raise CompileError(
+                f"join conditions are supported on two-table AI "
+                f"predicates; this one names {aliases}")
+        for condition in on:
+            if not set(condition.aliases()) <= set(aliases):
+                raise CompileError(
+                    f"join condition {condition} names a table the AI "
+                    f"predicate over {aliases} does not")
         b.joins.append(JoinSpec(aliases=news,
                                 prompt=prompt, semantics="full",
                                 selectivity=options.get("selectivity"),
-                                anchor=anchor))
+                                anchor=anchor, on=on))
 
     for pred in on_preds:
         add_join_spec(*pred)
@@ -358,6 +409,11 @@ def compile_sql(sql: str, catalog: Catalog,
         # BigQuery style: tables cross-joined in FROM, filtered here
         add_join_spec(prompt, options, aliases)
 
+    for alias, equalities in conditions.items():
+        raise CompileError(
+            f"JOIN {alias} ON {equalities[0]} has no AI predicate over "
+            f"its pairs; a plain join belongs in the database the ids "
+            f"came from")
     _check_join_coverage(b, joined_aliases)
 
     columns = _compile_projection(b, tree.expressions)

@@ -374,7 +374,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
 def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
              stage_suffixes, budget, stage_frames=None,
              anchor_keys=None, anchor_done=None, anchor_source=None,
-             attention_mode=None):
+             attention_mode=None, anchor_partners=None):
     """The join driver: stream partner lists against anchors.
 
     Survivors are gated between stages.
@@ -406,12 +406,16 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
             of arena pages until the join frees some.
         attention_mode: Attention path set on the pipeline before each
             join chunk; the pipeline's current mode when omitted.
+        anchor_partners: Optional callable(anchor key) -> per stage,
+            the indices into that stage's partner list the anchor
+            streams, or None for the whole list. Omitted means every
+            anchor streams every partner.
 
     Returns:
-        (ans, spans, tokens): ans[j][a] = 0/1 row over stage-j
-        partners, with a in admission order; spans = (stage,
-        start_event, end_event) per forward; tokens = fresh tokens
-        packed.
+        (ans, spans, tokens): ans[j][a] = 0/1 row over the stage-j
+        partners anchor a streams, with a in admission order; spans =
+        (stage, start_event, end_event) per forward; tokens = fresh
+        tokens packed.
     """
     k = len(stage_suffixes)
     if anchor_source is not None:
@@ -453,11 +457,15 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     # fresh admissions evict unrelated retained KV.
     for a in resident:
         arena.pin(keys[a])
+    def partners_of(key):
+        return None if anchor_partners is None else anchor_partners(key)
+
     sched = JoinAdmission(
         [len(p) for p in prefixes],
         [[len(s) for s in sufs] for sufs in stage_suffixes],
         budget, arena.accounting.n_pages, arena.accounting.page_tokens,
-        frame_tokens=[len(f) for f in frames], resident=resident)
+        frame_tokens=[len(f) for f in frames], resident=resident,
+        anchor_partners={a: partners_of(keys[a]) for a in range(len(keys))})
     spans = []
     tokens = 0
     outstanding = []     # (groups, handle) in launch order
@@ -475,7 +483,8 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
             arena.pin(key)
             keys.append(key)
             prefixes.append(prefix)
-            sched.admit(len(prefix), len(owned[key]))
+            sched.admit(len(prefix), len(owned[key]),
+                        partners=partners_of(key))
 
     def pull(evict_retained=False, force=False):
         """Run source chunks until a join chunk can fill or the source blocks.
@@ -505,7 +514,8 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
             got = arena.activate(key, f, capacity_tokens=f + frame_max)
             assert got is not None, \
                 "scheduler admitted an anchor the arena cannot hold"
-            sufs = stage_suffixes[j][start:end]
+            sufs = [stage_suffixes[j][i]
+                    for i in sched.partner_indices(a, j, start, end)]
             if frame and start == 0:
                 # frame entry: scatter the frame into KV after the
                 # document rows. The pair entry reads doc + frame.
@@ -534,6 +544,13 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         else:
             anchor_done(anchor, sched.answers[k - 1].get(anchor, []))
 
+    def event(kind, anchor):
+        if kind == "finished":
+            settle(anchor)
+            finished[0] += 1
+        elif keys[anchor] in owned:
+            arena.free_key(keys[anchor])
+
     def report(entry):
         groups, handle = entry
         bits = async_ans.result(handle)
@@ -544,17 +561,16 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
             cnt = end - start
             for kind, anchor in sched.report(
                     a, j, start, end, bits[pos:pos + cnt]):
-                if kind == "finished":
-                    settle(anchor)
-                    finished[0] += 1
-                elif keys[anchor] in owned:
-                    arena.free_key(keys[anchor])
+                event(kind, anchor)
             pos += cnt
         progress.update(finished[0])
 
     while True:
         if anchor_source is not None and not anchor_source.done:
             pull()
+        # anchors with no partner at their first stage never run
+        for kind, anchor in sched.take_settled():
+            event(kind, anchor)
         if sched.done() and (anchor_source is None
                              or anchor_source.done):
             break
