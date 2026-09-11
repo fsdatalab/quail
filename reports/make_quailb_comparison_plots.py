@@ -32,12 +32,21 @@ Pull the original suite manifest and its four result files:
     uv run modal volume get quail-results \
       "$FAMILIES/20260906T222629Z-sglang-suffix-major/fever-sglang-process.json" \
       "$W/fev9/sglang_update.json"
+    mkdir -p "$W/fev10"
     uv run modal volume get quail-results \
-      /sol/2026-09-06-quailb-prefix-reuse.json "$W/sol.json"
+      "$RUNS/20260911T200620Z-83b7c8a6/manifest.json" "$W/fev10/manifest.json"
+    for method in quail stock_vllm pipelined_vllm pipelined_sglang; do
+      source_path=$(result_path "$W/fev10/manifest.json" "$method")
+      uv run modal volume get quail-results "$source_path" "$W/fev10/$method.json"
+    done
+    uv run modal volume get quail-results \
+      /sol/2026-09-11-quailb-prefix-reuse.json "$W/sol.json"
     uv run --with matplotlib python reports/make_quailb_comparison_plots.py "$W"
 
-Use --fev9-dir to point to an already pulled FEV-9 comparison.
+Use --fev9-dir and --fev10-dir to point to already pulled runs.
 All four current FEV-9 measurements replace the old query definition.
+FEV-10 joined the benchmark after the suite run, so its four
+measurements come from its own run.
 """
 
 import argparse
@@ -291,11 +300,13 @@ def plot_comparison(title, queries, rows, relations, sol, name, overview=False):
     return destination.name
 
 
-def load_rows(root, fev9_root):
-    """Combine the saved suite with four current FEV-9 measurements."""
+def load_rows(root, fev9_root, fev10_root):
+    """Combine the saved suite with the current FEV-9 and FEV-10 runs."""
     manifest = json.loads((root / "manifest.json").read_text())
     corpus = json.loads((root / "corpus.json").read_text())
     fev9_manifest = json.loads((fev9_root / "manifest.json").read_text())
+    fev10_manifest = json.loads((fev10_root / "manifest.json").read_text())
+    assert fev10_manifest["query_ids"] == ["FEV-10"]
     sglang_update = json.loads((fev9_root / "sglang_update.json").read_text())
     assert sglang_update["methods"] == ["pipelined_sglang"]
     cleanup = sglang_update["process_cleanup"]
@@ -337,17 +348,41 @@ def load_rows(root, fev9_root):
         rows[key] = {row["query"]: row for row in suite["passes"]["single"]["queries"]
                      if row["query"] != "FEV-9"}
         rows[key]["FEV-9"] = row
-    return manifest, rows, fev9_manifest, sglang_update["result_volume_path"]
+        added = json.loads((fev10_root / f"{key}.json").read_text())
+        assert (added["model"], added["sf"], added["lf"], added["gpus"]) == (
+            "qwen3-4b-fp8", 0.1, 1, 1)
+        assert added["corpus_id"] == corpus["corpus_id"]
+        assert added["backend"] == key
+        assert added["ground_truth"]["fever"] == suite["ground_truth"]["fever"]
+        assert (added["aggregate_volume_path"]
+                == fev10_manifest["result_volume_paths"][key])
+        (added_row,) = added["passes"]["single"]["queries"]
+        assert added_row["query"] == "FEV-10"
+        assert "error" not in added_row, added_row
+        if key == "pipelined_sglang":
+            assert all(step["submission"] == "suffix-major" for step in
+                       added_row["backend_metrics"]["steps"]
+                       if step["kind"] == "join")
+        stages = added_row["stages"]
+        assert {(s["op"], s["alias"]) for s in stages if s["op"] == "filter"} \
+            == {("filter", "c"), ("filter", "e")}
+        assert len([s for s in stages if s["op"] == "join"]) == 1
+        rows[key]["FEV-10"] = added_row
+    return (manifest, rows, fev9_manifest, fev10_manifest,
+            sglang_update["result_volume_path"])
 
 
-def main(workdir, fev9_dir=None):
-    """Regenerate figures from the saved suite and current FEV-9 runs."""
+def main(workdir, fev9_dir=None, fev10_dir=None):
+    """Regenerate figures from the saved suite and the current FEV runs."""
     root = Path(workdir)
     fev9_root = Path(fev9_dir) if fev9_dir else root / "fev9"
-    manifest, rows, fev9_manifest, sglang_source = load_rows(root, fev9_root)
-    queries = manifest["query_ids"]
+    fev10_root = Path(fev10_dir) if fev10_dir else root / "fev10"
+    manifest, rows, fev9_manifest, fev10_manifest, sglang_source = load_rows(
+        root, fev9_root, fev10_root)
+    queries = list(manifest["query_ids"])
+    queries.insert(queries.index("FEV-9") + 1, "FEV-10")
     comparable = [query for query in queries if all(query in rows[key] for key in rows)]
-    assert len(queries) == 32 and len(comparable) == 32
+    assert len(queries) == 33 and len(comparable) == 33
     assert all("error" not in row
                for method in rows.values() for row in method.values())
     faster = sum(rows["quail"][query]["wall_s"] < rows["stock_vllm"][query]["wall_s"]
@@ -373,9 +408,11 @@ def main(workdir, fev9_dir=None):
         (fev9_root / "sglang_anchor_major.json").read_text()
     )["suites"]["pipelined_sglang"]["passes"]["single"]["queries"][0])
     output = rows["quail"]["FEV-9"]["accuracy"]["output_accuracy"]
+    fev10 = {key: row_metrics(rows[key]["FEV-10"]) for key, _, _ in METHODS}
+    fev5 = {key: row_metrics(rows[key]["FEV-5"]) for key, _, _ in METHODS}
     lines = [
         "# QUAIL-B comparison from saved results", "",
-        "- The main PDF covers all 32 queries with grouped bars and one metric "
+        "- The main PDF covers all 33 queries with grouped bars and one metric "
         "per page.",
         "  Its final page lists input document counts. Each dataset PDF has a page",
         "  of four bar charts and a separate input-count page. Text and marks remain",
@@ -383,9 +420,10 @@ def main(workdir, fev9_dir=None):
         "- The five dataset plots use the same",
         "  method colors and definitions for latency, recomputed KV tokens, fresh",
         "  input tokens, accuracy, and input document counts for every relation alias.",
-        "- The other 31 queries reuse the original measurements from "
-        "September 5, 2026.",
-        "  Only FEV-9 was rerun on September 6, 2026, with all four methods.",
+        "- 31 queries reuse the original measurements from September 5, 2026.",
+        "  FEV-9 was rerun on September 6, 2026, with all four methods. FEV-10",
+        "  joined the benchmark on September 11, 2026, and was measured that day",
+        "  with all four methods.",
         "  FEV-9 uses SGLang with all anchors submitted per partner, without "
         "client tiles or request slices.",
         "  Other queries retain historical SGLang measurements with the earlier "
@@ -429,9 +467,28 @@ def main(workdir, fev9_dir=None):
         "  No accuracy is assigned to SoL because it is not a measured model run.",
         "  Matching document prefixes are reusable; a partner suffix after a different",
         "  anchor context is not an identical prefix and is still computed.",
-        "- The earlier SoL file used the old FEV-9 definition. We recalculated only",
-        "  FEV-9 on the CPU from saved labels and corpus rows. The other 31 estimates",
-        "  are unchanged. Calculating SoL required no GPU inference.",
+        "- SoL was recalculated for all 33 queries on the CPU on September 11, "
+        "2026,",
+        "  from saved labels and corpus rows. The 32 earlier estimates are "
+        "unchanged",
+        "  to the printed precision. Calculating SoL required no GPU inference.",
+        "- FEV-10 is FEV-5 with one ordinary equality in the join: SUPPORT is "
+        "asked",
+        "  only of a claim and its own Wikipedia page. It is the only query whose",
+        "  join has an equality. Predicted before its run: 3 to 5 seconds on stock",
+        "  and pipelined vLLM and 4 to 7 on pipelined SGLang, against FEV-5's",
+        f"  {fev5['stock_vllm']['seconds']:.2f}, "
+        f"{fev5['pipelined_vllm']['seconds']:.2f}, and "
+        f"{fev5['pipelined_sglang']['seconds']:.2f}. Measured: Quail "
+        f"{fev10['quail']['seconds']:.2f} seconds,",
+        f"  stock vLLM {fev10['stock_vllm']['seconds']:.2f}, pipelined vLLM "
+        f"{fev10['pipelined_vllm']['seconds']:.2f}, and pipelined SGLang",
+        f"  {fev10['pipelined_sglang']['seconds']:.2f}, with "
+        f"{fev10['quail']['fresh']:,}, {fev10['stock_vllm']['fresh']:,}, "
+        f"{fev10['pipelined_vllm']['fresh']:,}, and",
+        f"  {fev10['pipelined_sglang']['fresh']:,} fresh tokens. The "
+        "[pair-join report](2026-09-11-pair-join.md)",
+        "  records the Quail run and the prediction for the baselines.",
         f"- FEV-9 SoL is {sol['FEV-9']['sol_s']:.3f} seconds with shared-prefix reuse,",
         f"  compared with {sol['FEV-9']['per_document']['sol_s']:.3f} seconds "
         "with reuse only",
@@ -473,9 +530,12 @@ def main(workdir, fev9_dir=None):
         "FEV-9 Quail and vLLM manifest on `quail-results`: "
         f"`{fev9_manifest['manifest_volume_path']}`.", "",
         f"Current FEV-9 SGLang result on `quail-results`: `{sglang_source}`.", "",
+        "FEV-10 manifest on `quail-results`: "
+        f"`{fev10_manifest['manifest_volume_path']}`.", "",
         "SoL estimates on `quail-results`: "
-        "`/results/sol/2026-09-06-quailb-prefix-reuse.json`.", "",
-        "The FEV-9 recalculation is also saved separately at "
+        "`/results/sol/2026-09-11-quailb-prefix-reuse.json`.", "",
+        "The FEV-10 estimate is also saved separately at "
+        "`/results/sol/2026-09-11-fev10-prefix-reuse.json`, and the FEV-9 one at "
         "`/results/sol/2026-09-06-fev9-prefix-reuse.json`.", "",
         "Corpus counts on `quail-results`: `/results/ground_truth/quailb/"
         f"schema_v1/corpora/{corpus['corpus_id']}/manifest.json`.", "",
@@ -529,12 +589,13 @@ def main(workdir, fev9_dir=None):
     report = HERE / "2026-09-05-quailb-saved-results.md"
     report.write_text("\n".join(lines))
     print(f"Updated {report}, the main figure, and five dataset figures "
-          "from 128 saved configurations.")
+          "from 132 saved configurations.")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("workdir")
     parser.add_argument("--fev9-dir")
+    parser.add_argument("--fev10-dir")
     args = parser.parse_args()
-    main(args.workdir, args.fev9_dir)
+    main(args.workdir, args.fev9_dir, args.fev10_dir)
