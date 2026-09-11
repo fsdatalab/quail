@@ -44,4 +44,13 @@ Date: 2026-09-11
 
 - No execution change: the chain and join drivers are the ones measured
   in [the streamed filter-join report](../2026-09-11-streamed-filter-join.md).
-  CONFIRM_PLACEHOLDER
+- Confirmed after the refactor on one H100 against the same `8338d92`
+  baseline in the same container (Modal call `fc-01M27PPPG5PSWTMR1H3WX549BM`,
+  data at `/results/ablations/streamed-filter-join-20260911T074256Z/`).
+  Prediction, stated first: IMDB-3 and FEV-9 reproduce the earlier
+  streamed runs within noise with zero recomputed KV tokens and identical
+  answer tables. Measured: IMDB-3 22.66 seconds against the baseline's
+  32.88 (22.47 before the refactor), FEV-9 39.21 against 39.48 (37.83
+  before, on a different card). Recomputed KV tokens 0 on both, fresh
+  tokens 2,560,772 and 4,306,910 exactly as before, and all 9 answer
+  tables identical.
