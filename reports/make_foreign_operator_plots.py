@@ -27,9 +27,9 @@ plt.style.use(HERE / "quail.mplstyle")
 sys.path.insert(0, str(HERE))
 from plot_colors import BLUE, GRAY, ORANGE  # noqa: E402
 
-VARIANTS = (("equality", "ON c.evidence_wiki_url = e.id", GRAY),
-            ("per_batch", "apply(same_page)", BLUE),
-            ("barrier", "apply_table(same_page)", ORANGE))
+VARIANTS = (("equality", "equality\njoin(on=...)", GRAY),
+            ("per_batch", "per batch\napply(fn)", BLUE),
+            ("barrier", "barrier\napply_table(fn)", ORANGE))
 FIELDS = (("seconds", "seconds", "Query time, excluding startup", "{:.2f}"),
           ("regret", "thousands of tokens", "Recomputed KV tokens", "{:.1f}"),
           ("fresh", "thousands of tokens", "Fresh input tokens", "{:.1f}"))
@@ -77,7 +77,8 @@ def main(workdir):
                              fontsize=8)
         axis.set_ylabel(unit)
         axis.set_title(title)
-        axis.set_ylim(0, max(max(values), 1e-9) * 1.3)
+        # an all-zero panel still gets a readable axis
+        axis.set_ylim(0, max(max(values), 1.0) * 1.3)
     fig.suptitle("FEV-10: the same-page pairing by the built-in equality, "
                  "by a per-batch apply(), and by a barrier apply_table()")
     fig.tight_layout()
