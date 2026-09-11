@@ -1,10 +1,13 @@
 r"""Measure FEV-10, a join over pairs, against FEV-5 and FEV-9 on one H100.
 
 FEV-10 is FEV-5 with an ordinary equality in the join: SUPPORT is asked
-only of a claim and its own Wikipedia page. The three queries run
-through the standard family runner in one container on one GPU, scored
-against the reference labels, with FEV-5 as the cross join twin and
-FEV-9 as the check that joins without conditions are unchanged.
+only of a claim and its own Wikipedia page. The queries run through the
+standard family runner in one container on one GPU, scored against the
+reference labels, with FEV-5 as the cross join twin and FEV-9 as the
+check that joins without conditions are unchanged. FEV-1 runs first,
+as in the saved suite, so the first query after the cold boot is not
+one being compared: in a first attempt FEV-5 ran first and its filter
+took 8.8 seconds instead of 0.3.
 
     uv run modal run --detach experiments/cells/pair_join.py \
       2>&1 | tee /tmp/quail-pair-join.log
@@ -18,7 +21,7 @@ from datetime import datetime, timezone
 
 from quail.bench.quailb_parallel import app, ensure_data, run_query_family
 
-QUERY_IDS = ("FEV-5", "FEV-10", "FEV-9")
+QUERY_IDS = ("FEV-1", "FEV-5", "FEV-10", "FEV-9")
 GROUND_TRUTH = "gt_77bb8b128743a79aedddaa24c808c3f8"
 PREDICTION_TEXT = (
     "FEV-5 evaluated about 61,700 pairs in 13.35 seconds with 1,515,283 "
