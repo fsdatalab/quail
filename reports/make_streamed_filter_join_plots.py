@@ -32,8 +32,9 @@ from plot_colors import BLUE, GRAY  # noqa: E402
 CONFIGS = (("Materialized survivors", "materialized", GRAY),
            ("Streamed survivors", "streamed", BLUE))
 FIELDS = (("seconds", "seconds", "Query time, excluding startup", "{:.1f}"),
-          ("regret", "tokens", "Recomputed KV tokens", "{:,.0f}"),
-          ("fresh_tokens", "tokens", "Fresh input tokens", "{:,.0f}"))
+          ("regret", "millions of tokens", "Recomputed KV tokens", "{:.2f}"),
+          ("fresh_tokens", "millions of tokens", "Fresh input tokens",
+           "{:.2f}"))
 
 
 def load(workdir):
@@ -46,8 +47,8 @@ def load(workdir):
             report = summary["report"]
             rows[(key, qid)] = dict(
                 seconds=summary["query_seconds"],
-                regret=report["regret_tokens"],
-                fresh_tokens=report["fresh_tokens"],
+                regret=report["regret_tokens"] / 1e6,
+                fresh_tokens=report["fresh_tokens"] / 1e6,
                 pairs=summary["evaluated_document_pairs"],
                 hits=report["kv_manager"]["join_anchor_hits"],
                 misses=report["kv_manager"]["join_anchor_misses"],
@@ -92,9 +93,10 @@ def main():
     for q in queries:
         for label, key, _color in CONFIGS:
             r = rows[(key, q)]
-            print(f"| {q} | {label} | {r['seconds']:.2f} | {r['regret']:,} | "
-                  f"{r['fresh_tokens']:,} | {r['hits']:,} | {r['misses']:,} | "
-                  f"{r['pairs']:,} | {r['rows']:,} |")
+            print(f"| {q} | {label} | {r['seconds']:.2f} | "
+                  f"{round(r['regret'] * 1e6):,} | "
+                  f"{round(r['fresh_tokens'] * 1e6):,} | {r['hits']:,} | "
+                  f"{r['misses']:,} | {r['pairs']:,} | {r['rows']:,} |")
     fig, axes = plt.subplots(1, 3, figsize=(15, 4.4))
     for ax, (field, unit, title, fmt) in zip(axes, FIELDS):
         bars(ax, queries, rows, field, unit, title, fmt)
