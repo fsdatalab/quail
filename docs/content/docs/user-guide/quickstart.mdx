@@ -156,11 +156,11 @@ physical:
   prompt layout: engine preamble + document + suffix (preamble_tokens per stage below count the shared preamble)
   joins follow the saved order and anchors
   order=as_written (default: at least one predicate has no selectivity)
-  Scan input:a alias=a input_id=a n_docs=12 total_tokens=27 shard_docs=[12]
-  Scan input:r alias=r input_id=r n_docs=8 total_tokens=693 shard_docs=[8]
-  AiFilter filter:r alias=r arena_writes=False keep_kv=False <- input:r[ids:r]
+  Scan scan:a alias=a input_id=a n_docs=12 total_tokens=27 shard_docs=[12]
+  Scan scan:r alias=r input_id=r n_docs=8 total_tokens=693 shard_docs=[8]
+  AiFilter ai_filter:r alias=r arena_writes=False keep_kv=False <- scan:r[ids:r]
     stage {'written_pos': 0, 'question_tokens': 51, 'preamble_tokens': 2, 'selectivity': None, 'expected_docs': 8.0}
-  Project sink columns=['r.id'] <- filter:r[ids:r]
+  Project project columns=['r.id'] <- ai_filter:r[ids:r]
   remark: filter on 'r': arena writes off (one stage - nothing reads the KV again)
 ```
 
@@ -253,10 +253,10 @@ with its KV still in the arena, so the join packs no document tokens
 again:
 
 ```text
-  AiFilter filter:r alias=r arena_writes=True keep_kv=False ... <- input:r[ids:r]
-  AiJoin group:0 anchor=r anchor_resident=filter keep_anchor_kv=False <- filter:r[ids:r], input:a[ids:a]
+  AiFilter ai_filter:r alias=r arena_writes=True keep_kv=False ... <- scan:r[ids:r]
+  AiJoin ai_join:r anchor=r anchor_resident=filter keep_anchor_kv=False <- ai_filter:r[ids:r], scan:a[ids:a]
     stage {'written_pos': 0, 'anchor': 'r', 'partners': ['a'], 'semantics': 'full', 'selectivity': 0.15, 'expected_tuples': 57.6, ...}
-  Project sink columns=['r.id', 'a.aspect'] <- group:0[join_answers:0]
+  Project project columns=['r.id', 'a.aspect'] <- ai_join:r[join_answers:0]
   remark: filter on 'r' streams its survivors into the join anchored on it; each one's KV stays pinned until its tuples are answered
 ```
 

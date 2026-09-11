@@ -607,11 +607,17 @@ class Query:
             del self._token_futures[alias]
         self.token_wait_s += time.perf_counter() - started
 
-    def run(self) -> QueryResult:
-        """Execute the query in the current process."""
+    def run(self, plan=None) -> QueryResult:
+        """Execute the query in the current process.
+
+        Args:
+            plan: An edited PhysicalPlan from plan().insert(),
+                remove(), or move(); the planner's own plan when
+                omitted.
+        """
         from quail.runtime.execute import execute_query
 
-        return execute_query(self)
+        return execute_query(self, plan=plan)
 
     def execute_stream(self, batch_rows: int = 65_536,
                        limit: int | None = None) -> pa.RecordBatchReader:

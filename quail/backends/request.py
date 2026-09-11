@@ -106,7 +106,7 @@ def plan_request_backend(
             raise ValueError(f"no document tokens for alias {scan.alias!r}")
         summary = stats[scan.alias]
         node = Scan(
-            node_id=f"input:{scan.alias}",
+            node_id=f"scan:{scan.alias}",
             alias=scan.alias,
             input_id=scan.alias,
             n_docs=summary.n_docs,
@@ -265,7 +265,7 @@ def plan_request_backend(
         sink_input = PortRef(request_node.node_id, f"ids:{aliases[0]}")
 
     nodes.append(Project(
-        node_id="sink",
+        node_id="project",
         inputs=input_ports((sink_input,)),
         columns=tuple(
             f"{column.alias}.{column.column}"
@@ -275,7 +275,7 @@ def plan_request_backend(
     if region.logical_plan.root.limit is not None:
         nodes.append(Limit(
             node_id="limit",
-            inputs=input_ports((PortRef("sink", "rows"),)),
+            inputs=input_ports((PortRef("project", "rows"),)),
             count=region.logical_plan.root.limit,
         ))
 

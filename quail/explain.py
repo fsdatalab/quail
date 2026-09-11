@@ -149,7 +149,8 @@ def _estimated_rows(graph):
     return rows
 
 
-def physical_tree(graph, *, logical=None, verbose=False, metrics=None):
+def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
+                  estimates=None):
     """Return a physical tree, with references for shared inputs.
 
     Args:
@@ -157,7 +158,9 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None):
         logical: Optional logical plan supplying source names and predicates.
         verbose: Include node ids, ports, settings, and stage details.
         metrics: Optional measured metrics indexed by node id.
+        estimates: Optional per node estimates (PhysicalPlan.estimates).
     """
+    estimates_by_node = estimates or {}
     scans, filters, joins = _logical_context(logical)
     estimates = _estimated_rows(graph)
     uses = Counter(child for node in graph.nodes
@@ -279,7 +282,18 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None):
                       if not output.name.startswith("filter_answers:")]
             value = values[0] if len(values) == 1 else None
             count = _number(value) if value is not None else "unknown"
-            title += f" (estimated_rows={count})"
+            title += f" (estimated_rows={count}"
+            estimate = estimates_by_node.get(node.node_id, {})
+            if "seconds" in estimate:
+                title += f", estimated_seconds={estimate['seconds']:.3f}"
+            title += ")"
+            if "release_recompute_tokens" in estimate:
+                pinned = isinstance(node, AiFilter) and node.pin_survivors
+                details.append(
+                    ("if the KV were released here instead of pinned: "
+                     if pinned else "expected recompute at the join: ")
+                    + f"{estimate['release_recompute_tokens']:,} tokens, "
+                    f"{estimate['release_recompute_seconds']:.3f} s")
         elif node.node_id in metrics:
             measured = metrics[node.node_id]
             title += (f" (actual_rows={measured.output_rows:,}, "

@@ -265,7 +265,7 @@ def walk(seq, live0: dict, lengths: dict, resident, pre: int,
                             anchor=anchor, resident=kind,
                             resident_docs=kept,
                             tuples=cross_tuples(spec, live),
-                            tokens=w.tokens))
+                            tokens=w.tokens, work=w))
         total = total + w
         applied.append(spec)
         state = KVState(anchor, spec["semantics"] == "full",

@@ -493,8 +493,8 @@ def test_join_token_costs_and_retention(catalog):
         assert filter_chain(plan, alias).keep_kv is False
         assert filter_chain(plan, alias).pin_survivors is True
     order = [node.node_id for node in plan.nodes]
-    assert order.index("barrier:0") < order.index("filter:t") \
-        < order.index("group:1")
+    assert order.index("barrier:t") < order.index("ai_filter:t") \
+        < order.index("ai_join:t")
     assert not any("shared KV" in r for r in plan.remarks)
 
     # An alias that is a partner before it anchors must finish its
@@ -523,7 +523,7 @@ def test_join_token_costs_and_retention(catalog):
     assert chain.pin_survivors is False
     assert chain.arena_writes is True
     order = [node.node_id for node in plan.nodes]
-    assert order.index("filter:r") < order.index("group:0")
+    assert order.index("ai_filter:r") < order.index("ai_join:r")
 
 
 # ------------------------------------------------ KV keep (residency)
@@ -756,7 +756,8 @@ def test_explain_estimates_and_limits(catalog):
         text = explain(logical, plan)
         physical = text.split("physical:", 1)[1]
         assert f"Project: r.id (estimated_rows={expected})" in physical
-        assert f"AiFilter: r (estimated_rows={expected})" in physical
+        assert f"AiFilter: r (estimated_rows={expected}, estimated_seconds=" \
+            in physical
         assert "Scan reviews as r (estimated_rows=100)" in physical
         assert "tokens=40,000" in physical
         assert "node_id=" not in text
@@ -771,7 +772,7 @@ def test_explain_estimates_and_limits(catalog):
             template = logical.root.input.predicates[stage.written_pos].prompt.template
             assert f"{index}. PROMPT({template!r}, r.review)" in physical
         verbose = explain(logical, plan, verbose=True)
-        assert "node_id=filter:r" in verbose
+        assert "node_id=ai_filter:r" in verbose
         assert "admission_tokens=" in verbose
         assert "expected_docs=" in verbose
 

@@ -67,9 +67,21 @@ def _execute_physical(request, registry):
     return response
 
 
-def execute_query(query, physical_executor=None):
-    """Execute one query in its session's process."""
+def execute_query(query, physical_executor=None, plan=None):
+    """Execute one query in its session's process.
+
+    Args:
+        query: The Query to run.
+        physical_executor: Optional callable(PhysicalRequest) that
+            returns the PhysicalResponse, for tests without a GPU.
+        plan: An edited PhysicalPlan to run instead of the planner's.
+    """
     total_started = time.perf_counter()
+    if plan is not None:
+        if isinstance(plan, Refusal) or not hasattr(plan, "graph"):
+            raise TypeError("plan must be a PhysicalPlan")
+        query.plan()            # tokenization and pair tables first
+        query._plan = plan
     if physical_executor is None:
         problem = gpu_problem()
         if problem is not None:

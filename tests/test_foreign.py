@@ -147,12 +147,12 @@ def test_planner_places_foreign_nodes_and_keeps_or_drops_the_stream():
                        tokenizer=lambda text: list(text.encode())) as session:
         _register(session)
         per_batch = _query(session, "per_batch").plan()
-        chain = per_batch.graph.node("filter:c")
+        chain = per_batch.graph.node("ai_filter:c")
         foreign = per_batch.graph.node("apply:keep_even")
         join = per_batch.graph.nodes_by_type(AiJoin.type_name)[0]
         assert chain.pin_survivors
         assert isinstance(foreign, Foreign) and foreign.kind == "per_batch"
-        assert foreign.inputs[0].source == PortRef("filter:c", "ids:c")
+        assert foreign.inputs[0].source == PortRef("ai_filter:c", "ids:c")
         assert PortRef("apply:keep_even", "ids:c") in {
             port.source for port in join.inputs}
         assert "apply:keep_even" in session.registry.functions or \
@@ -161,7 +161,7 @@ def test_planner_places_foreign_nodes_and_keeps_or_drops_the_stream():
         assert "Foreign: keep_even (per_batch, drop) on c" in text
         # a barrier needs every survivor at once: the chain materializes
         barrier = _query(session, "barrier").plan()
-        assert not barrier.graph.node("filter:c").pin_survivors
+        assert not barrier.graph.node("ai_filter:c").pin_survivors
         assert barrier.graph.node("apply:keep_even").kind == "barrier"
         request = _query(session, "barrier")._prepare_physical()
         assert request.column_tables()["c"].column_names == ["c", "url"]

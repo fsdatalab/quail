@@ -226,23 +226,65 @@ def join_specs(joins, pair_fractions=None) -> list:
     return out
 
 
-def _filter_work(filters, stats, filter_orders: dict, pre: int) -> Work:
-    """Expected Work of every filter chain.
+def _filter_alias_work(preds, stats, order, pre: int) -> Work:
+    """Expected Work of one filter chain: a scan, then asks over KV."""
+    total = Work()
+    mean = stats.mean_doc_tokens
+    n = float(stats.n_docs)
+    for si, predicate_index in enumerate(order):
+        p = preds[predicate_index]
+        q = _question_tokens(p.prompt)
+        op = scan if si == 0 else ask
+        total = total + op(pre + mean, q) * n
+        n *= p.selectivity if p.selectivity is not None else 1.0
+    return total
 
-    The first stage scans each document, later stages ask over
-    resident KV.
-    """
+
+def _filter_work(filters, stats, filter_orders: dict, pre: int) -> Work:
+    """Expected Work of every filter chain."""
     total = Work()
     for alias, preds in filters.items():
-        mean = stats[alias].mean_doc_tokens
-        n = float(stats[alias].n_docs)
-        for si, predicate_index in enumerate(filter_orders[alias]):
-            p = preds[predicate_index]
-            q = _question_tokens(p.prompt)
-            op = scan if si == 0 else ask
-            total = total + op(pre + mean, q) * n
-            n *= p.selectivity if p.selectivity is not None else 1.0
+        total = total + _filter_alias_work(
+            preds, stats[alias], filter_orders[alias], pre)
     return total
+
+
+def node_estimates(graph, *, filter_works, stage_works, live, stats, pre,
+                   cap_pages, page_tokens, model, device, chunk) -> dict:
+    """Price each node's own work, and each chain's recompute if released.
+
+    Returns node id -> {"seconds", and for a filter chain a later join
+    anchors on, "release_recompute_tokens" and
+    "release_recompute_seconds"}. A node's seconds price its work
+    alone; nodes do not add up to the plan's estimate because chunk
+    packing shares forward passes across them. The recompute figure
+    is the expected survivors past the retention pool cap times their
+    prefix cost: what the join pays if the chain's KV is not pinned.
+    """
+    anchored = {node.anchor for node in graph.nodes if isinstance(node, AiJoin)}
+    out = {}
+    for node in graph.nodes:
+        entry = {}
+        if isinstance(node, AiFilter) and node.alias in filter_works:
+            entry["seconds"] = speed_of_light(
+                filter_works[node.alias], model, device, chunk).seconds
+            if node.alias in anchored:
+                mean = stats[node.alias].mean_doc_tokens
+                prefix = pre + mean
+                pages = -(-(prefix + node.hold_tokens) // page_tokens)
+                fits = cap_pages // max(1, pages)
+                excess = max(0.0, live.get(node.alias, 0.0) - fits)
+                entry["release_recompute_tokens"] = round(excess * prefix)
+                entry["release_recompute_seconds"] = speed_of_light(
+                    scan(prefix, 0) * excess, model, device, chunk).seconds
+        elif isinstance(node, AiJoin):
+            work = Work()
+            for stage in node.stages:
+                work = work + stage_works.get(stage.written_pos, Work())
+            entry["seconds"] = speed_of_light(work, model, device, chunk).seconds
+        # other nodes do no model work and get no seconds
+        out[node.node_id] = entry
+    return out
 
 
 # ----------------------------------------------- KV keep (residency)
@@ -419,7 +461,22 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
 
     found = run_search()
     seq = [(specs[position], anchor) for position, anchor in found["seq"]]
-    retention_plan = retention.schedule(seq, live0)
+    # join node ids name the anchor; a second group on the same anchor
+    # gets :2, a third :3
+    group_ids = []
+    seen_ids = {}
+    for group in retention.group_sequence(seq):
+        anchor = group[0][1]
+        seen_ids[anchor] = seen_ids.get(anchor, 0) + 1
+        group_ids.append(f"ai_join:{anchor}" if seen_ids[anchor] == 1
+                         else f"ai_join:{anchor}:{seen_ids[anchor]}")
+
+    def unique_id(prefix, name):
+        key = f"{prefix}:{name}"
+        seen_ids[key] = seen_ids.get(key, 0) + 1
+        return key if seen_ids[key] == 1 else f"{key}:{seen_ids[key]}"
+
+    retention_plan = retention.schedule(seq, live0, group_ids)
     # a filtered alias whose first use is as an anchor has its chain run
     # right before that group and stream into it with KV pinned; its
     # survivors never enter the retention pool. An alias that was a
@@ -513,7 +570,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
         shard_ranges, loads = contiguous_shards(
             doc_tokens[s.alias], workers
         )
-        sid = f"input:{s.alias}"
+        sid = f"scan:{s.alias}"
         nodes.append(PhysicalScan(
             node_id=sid,
             alias=s.alias, input_id=s.alias,
@@ -544,7 +601,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
         hold = max((spec["frame_tokens"][alias]
                     for spec, _ in sequence_groups[streamed[alias]])
                    if pinned else (0,))
-        fid = f"filter:{alias}"
+        fid = f"ai_filter:{alias}"
         nodes.append(AiFilter(
             node_id=fid,
             inputs=input_ports((ids_src[alias],)),
@@ -597,15 +654,13 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                                full=(spec["semantics"] == "full"),
                                members=[(spec, record)]))
     exec_idx = 0
-    barrier_n = 0
     pairs_edges = []     # every full stage's passing-pairs edge
     out_aliases = []     # recombination's output order
     for g, group in enumerate(groups):
         anchor = group["anchor"]
         if g > 0:
             ahead = [scan.alias for scan in scans]
-            bid = f"barrier:{barrier_n}"
-            barrier_n += 1
+            bid = unique_id("barrier", anchor)
             exchange_inputs = tuple(pairs_edges) + tuple(
                 ids_src[a] for a in ahead
             )
@@ -619,7 +674,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
         if workers > 1:
             # anchors go to the GPU that holds their KV, or balance
             # across GPUs when none does; one GPU passes them through
-            xid = f"exchange:{g}"
+            xid = unique_id("exchange", anchor)
             nodes.append(Exchange(
                 node_id=xid,
                 inputs=input_ports((ids_src[anchor],)),
@@ -627,7 +682,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
             ids_src[anchor] = PortRef(xid, f"ids:{anchor}")
         if streamed.get(anchor) == g:
             emit_filter(anchor)
-        gid = f"group:{g}"
+        gid = group_ids[g]
         stage_dicts = []
         in_aliases = [anchor]
         pair_inputs = []
@@ -698,19 +753,37 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     else:
         sink_inputs = (ids_src[scans[0].alias],)
     nodes.append(PhysicalProject(
-        node_id="sink",
+        node_id="project",
         inputs=input_ports(tuple(sink_inputs)),
         columns=tuple(f"{c.alias}.{c.column}" for c in plan.root.columns)))
     if plan.root.limit is not None:
         nodes.append(Limit(
             node_id="limit",
-            inputs=input_ports((PortRef("sink", "rows"),)),
+            inputs=input_ports((PortRef("project", "rows"),)),
             count=plan.root.limit,
         ))
 
     estimate = speed_of_light(
         base_work + found["work"], model, device, chunk
     ).seconds
+    filter_works = {
+        alias: _filter_alias_work(preds, stats[alias], filter_orders[alias],
+                                  pre)
+        for alias, preds in filters.items()
+    }
+    # every search path prices the chosen sequence the same way; walk
+    # it once more so each stage's own work is on record
+    _, walked = joinsearch.walk(seq, live0, length_stats, filtered, pre,
+                                model, device)
+    stage_works = {record["written_pos"]: record["work"] for record in walked}
+
+    def estimator(graph):
+        return node_estimates(
+            graph, filter_works=filter_works, stage_works=stage_works,
+            live=live0, stats=stats, pre=pre, cap_pages=cap_pages,
+            page_tokens=budgets.PAGE_TOKENS, model=model, device=device,
+            chunk=chunk)
+
     return PhysicalPlan(
         model=model.name, device=device.name, workers=workers,
         backend="quail", estimated_seconds=estimate,
@@ -721,7 +794,8 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
             "retention": retention_plan,
             "order_rule": rule,
             "order_source": source,
-        })
+        },
+        estimator=estimator)
 
 
 def plan_query(plan: LogicalPlan, *, model: ModelSpec,
@@ -858,8 +932,13 @@ def explain(logical: LogicalPlan, physical, *, verbose: bool = False) -> str:
         if admission is not None:
             budgets.append(f"admission budget={admission:,} tokens")
         lines.append("  " + ", ".join(budgets))
+    if getattr(physical, "estimates", None):
+        lines.append("  node seconds price each node's work alone; they "
+                     "do not add up to the plan estimate because chunk "
+                     "packing shares forward passes across nodes")
     lines.extend("  " + line for line in physical_tree(
-        physical.graph, logical=logical, verbose=verbose).splitlines())
+        physical.graph, logical=logical, verbose=verbose,
+        estimates=getattr(physical, "estimates", None)).splitlines())
     if verbose:
         lines.append("")
         lines.append("settings:")

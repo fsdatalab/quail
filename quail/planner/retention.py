@@ -27,9 +27,15 @@ def group_sequence(seq):
     return groups
 
 
-def schedule(seq, live):
-    """Record the next anchor use and conditional survival at each boundary."""
+def schedule(seq, live, group_ids=None):
+    """Record the next anchor use and conditional survival at each boundary.
+
+    group_ids names the join node of each group; ``group:<index>``
+    when omitted.
+    """
     groups = group_sequence(seq)
+    group_ids = (list(group_ids) if group_ids is not None
+                 else [f"group:{i}" for i in range(len(groups))])
     counts = [dict(live)]
     for group in groups:
         after = dict(counts[-1])
@@ -49,6 +55,6 @@ def schedule(seq, live):
         uses.append(upcoming)
     return {
         "initial": uses[0],
-        "before": {f"group:{i}": uses[i] for i in range(len(groups))},
-        "after": {f"group:{i}": uses[i + 1] for i in range(len(groups))},
+        "before": {group_ids[i]: uses[i] for i in range(len(groups))},
+        "after": {group_ids[i]: uses[i + 1] for i in range(len(groups))},
     }
