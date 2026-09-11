@@ -1,6 +1,6 @@
 # QUAIL-B
 
-QUAIL-B contains 32 AI filter and join queries over movie reviews, medical
+QUAIL-B contains 33 AI filter and join queries over movie reviews, medical
 reports, factual claims, legal citations, and agent conversations.
 
 Your engine runs the queries. QUAIL-B loads the inputs and reference labels,
