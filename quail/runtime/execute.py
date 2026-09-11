@@ -1,5 +1,6 @@
 """Run a query in the current process."""
 
+import os
 import time
 
 from quail.backends import BackendExecutionContext
@@ -22,6 +23,10 @@ def gpu_problem() -> str | None:
         import torch
     except ImportError:
         return "torch is not installed"
+    # the default check initializes the CUDA runtime and marks every
+    # later fork bad, which breaks vLLM's forked engine process; the
+    # NVML based check does not touch the runtime
+    os.environ.setdefault("PYTORCH_NVML_BASED_CUDA_CHECK", "1")
     if not torch.cuda.is_available():
         return "no CUDA GPU is visible to this process"
     return None
