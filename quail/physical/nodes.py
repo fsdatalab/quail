@@ -483,6 +483,7 @@ class AnchoredJoin(PhysicalNode):
     anchor: str = ""
     anchor_resident: str = "none"
     keep_anchor_kv: bool = False
+    stream_anchor: bool = False
     stages: tuple[JoinStage, ...] = ()
 
     type_name: ClassVar[str] = "quail.anchored_join"
@@ -509,8 +510,18 @@ class AnchoredJoin(PhysicalNode):
             "anchor": self.anchor,
             "anchor_resident": self.anchor_resident,
             "keep_anchor_kv": self.keep_anchor_kv,
+            "stream_anchor": self.stream_anchor,
             "stages": [stage.to_dict() for stage in self.stages],
         }
+
+    def streamed_inputs(self) -> tuple[str, ...]:
+        """The anchor survivor port, when its filter streams into this join."""
+        if not self.stream_anchor:
+            return ()
+        return tuple(
+            input_port.name for input_port in self.inputs
+            if input_port.source.port == f"ids:{self.anchor}"
+        )
 
     def explain_fields(self) -> dict:
         return {**self.attributes(),
@@ -524,6 +535,7 @@ class AnchoredJoin(PhysicalNode):
             anchor=attributes["anchor"],
             anchor_resident=attributes["anchor_resident"],
             keep_anchor_kv=bool(attributes["keep_anchor_kv"]),
+            stream_anchor=bool(attributes["stream_anchor"]),
             stages=tuple(
                 JoinStage.from_mapping(stage)
                 for stage in attributes["stages"]

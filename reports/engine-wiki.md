@@ -42,7 +42,7 @@ in the same process.
 | `executor/arena.py` | Paged KV arena (PageArena accounting + KVArena tensors) | nothing (torch lazy) |
 | `executor/attention.py` | Pipeline: forward pass, attention, Triton kernels | arena (torch, vLLM, triton lazy) |
 | `executor/pack.py` | Chunk admission (JoinAdmission, FilterAdmission) | nothing |
-| `executor/loop.py` | Execution loops (run_filter, run_join, warm_kernels) | arena, attention, pack |
+| `executor/loop.py` | Execution loops (FilterStream, run_filter, run_join, warm_kernels) | arena, attention, pack |
 | `executor/model.py` | Weight loading through vLLM | nothing (vLLM lazy) |
 | `runtime/session.py` | Session, Query, tokenization, input binding, and result assembly | catalog, logical, planner, sqlfront, builder |
 | `runtime/tokens.py` | Memory mapped token files and random document views | Arrow |
@@ -175,7 +175,12 @@ for sources and validation status. Memory budgets remain per GPU.
    fields that another backend must supply.
 9. The planner chooses the complete join order and anchors from selectivity
    estimates. It schedules the first anchor's filters last and shares retained
-   KV capacity across inputs with future anchor uses. `Exchange` nodes prune actual survivors
+   KV capacity across inputs with future anchor uses. When the first anchor
+   has a filter chain, that chain streams into its join (section 4.6): the
+   `AnchoredJoin` carries `stream_anchor`, the runner hands the chain to the
+   join instead of running it first, and each passing document's KV goes
+   straight from the chain to the join without the retention pool.
+   `Exchange` nodes prune actual survivors
    between the planned join groups. Execution follows this graph without
    searching again.
 10. The worker creates an internal physical request. It uses the query's
@@ -565,7 +570,9 @@ predicates assemble into results correctly.
 **KV residency across operators** (`planner/retention.py`,
 `executor/retention.py`, and the arena in `executor/arena.py`):
 
-- All filtered inputs with a planned anchor use can retain document KV. The first
+- All filtered inputs with a planned anchor use can retain document KV, except
+  the first anchor's own chain: it streams its survivors into the join with
+  their KV pinned (section 4.6), so the pool serves the other aliases. The first
   anchor's filters still run last. Retention uses one shared pool per GPU.
 - A prefix with `L` tokens occupies `ceil(L / 16)` pages. The priority is
   `q * C(L) / pages`, where `q` is its predicted probability of reaching its next
@@ -1079,8 +1086,9 @@ answers. This overlaps GPU compute with answer readback.
 | `pack_chunk` | `loop.py:125` | Build GPU tensors for one chunk from group specs. Document tokens stay as Arrow slices until the selected parts are copied once into a pinned CPU tensor, then uploaded to the GPU in one transfer. |
 | `JoinAdmission` | `pack.py` | Continuous anchor admission scheduler (join path) |
 | `FilterAdmission` | `pack.py:184` | Continuous admission scheduler (filter path) |
-| `run_filter` | `loop.py:462` | The filter chain execution loop |
-| `run_join` | `loop.py` | The join execution loop: JoinAdmission chunks, stages mixed, anchors gated as their answers return |
+| `FilterStream` | `loop.py` | The filter chain, one chunk per `next()`; with `hold_survivors` it hands passing documents to a join with their KV pinned |
+| `run_filter` | `loop.py` | The filter chain run to the end (a loop over `FilterStream.next`) |
+| `run_join` | `loop.py` | The join execution loop: JoinAdmission chunks, stages mixed, anchors gated as their answers return; with `anchor_source` it pulls anchors from a `FilterStream` |
 | `warm_kernels` | `loop.py` | Boot warmup policy: compile pass once ever (marker on the kernel-cache volume), touch pass per container |
 | `Answerer` | `loop.py:60` | TRUE/FALSE scoring from final hidden states |
 | `AsyncAnswers` | `loop.py:92` | Non-blocking answer readout with pinned-memory copy |
@@ -1177,6 +1185,54 @@ frees retained prefixes in increasing expected computation saved per
 KV page. The worker frees every kept key the moment its last consumer
 join is behind, and sweeps kept keys at query start and end - the
 arena outlives a query, kept KV must not.
+
+**The streamed filter-to-join edge.** When the first join group's
+anchor alias has a filter chain, the chain does not finish before the
+join starts. The plan marks the edge (`AnchoredJoin.stream_anchor`),
+the generic runner hands the chain to the join as a `StreamedInput`,
+and the join's runtime returns both nodes' results
+(`NodeResult.produced`). On the GPU the join drives:
+
+- `FilterStream` is `run_filter` cut into one chunk per `next()`
+  call, with `hold_survivors`: a document that passes its last stage
+  keeps its pages pinned and comes back as a (key, prefix) pair
+  instead of being freed or retained.
+- `run_join` pulls from the stream until its own chunk can fill
+  (`JoinAdmission.buildable_tokens`), runs one join chunk, and pulls
+  again. Streamed anchors are admitted incrementally
+  (`JoinAdmission.admit`) as resident, so they pack the frame and
+  their partner suffixes only.
+- Backpressure is the arena. The stream reports when fresh admission
+  is short of pages; the join then runs what it holds, and the pages
+  of answered anchors come back. The chain re-reads the arena's free
+  page count before every chunk, since the join frees and claims
+  pages between chunks. A held document's pages cover the join's
+  largest frame, so the join never claims a page for a streamed
+  anchor and the two operators cannot deadlock on pages.
+- Both run on one CUDA stream, so chunk order is launch order, and
+  each operator reads its previous chunk's answers after launching
+  the next, which keeps CPU packing overlapped with GPU compute. Each
+  operator sets its own attention path before its chunk (`unified`
+  for the chain, `merge_quant` for the join).
+- The pinned set is bounded by what the join has not answered yet, so
+  a survivor's KV is read once and freed. Under operator-at-a-time
+  execution every survivor had to be held for the rest of the filter
+  phase, and whatever did not fit the retention pool was recomputed
+  at the join (`regret_tokens`).
+
+```
+join:
+    while True:
+        while filter not done and join.buildable_tokens() < budget:
+            held, blocked = filter.next()     # runs one filter chunk
+            admit held anchors (resident, pinned)
+            if blocked: break                 # filter is out of pages
+        if join idle and filter done: break
+        groups = join.next_chunk()
+        if groups: launch; report the previous join chunk; continue
+        if a join chunk is in flight: report it; continue
+        filter.next(evict_retained=True)      # nothing here can move
+```
 
 ### 4.7 KV rewind (chain mode)
 
@@ -1301,8 +1357,12 @@ stage boundary. `JoinAdmission`'s `resident` argument names the
 anchors whose KV is already in the arena, so their groups pack no
 prefix tokens.
 
-The same mechanism crosses operator boundaries through retention.
-A filter chain with `keep_kv` keeps survivors' KV up to the
+The same mechanism crosses operator boundaries in two ways. The
+first join group's anchor chain streams into the join (section 4.6):
+every passing document arrives with its KV pinned, is answered, and
+is freed, so no prefix is packed and nothing waits in a pool. Every
+other filtered alias with a later anchor use goes through retention:
+a filter chain with `keep_kv` keeps survivors' KV up to the
 retained pool's capacity (the arena minus the scan ring); the join
 group anchored on that table finds the kept keys resident,
 `activate` grows their pages for the frame, and no kept document's
@@ -1352,7 +1412,10 @@ do not pass through the parent process pipe. After this round, the parent
 merges survivors.
 
 **One join round per selected `AnchoredJoin`**: anchors follow the
-alias's filter shard when it holds retained KV. An anchor that was a partner in
+alias's filter shard when it holds retained KV. When the anchor's chain
+streams into the join, the chain runs inside the join round on each GPU,
+over that GPU's filter shard of every anchor document, and the parent
+merges the chain's answers and survivors from the same round. An anchor that was a partner in
 an earlier round gets new balanced shards over its live documents.
 The parent sends file references and survivor positions, and each GPU reads
 the needed token values before it computes KV for its new anchor slice. Every

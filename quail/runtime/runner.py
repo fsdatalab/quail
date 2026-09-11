@@ -88,10 +88,44 @@ def scalar_node_metrics(nodes: Mapping[str, "NodeResult"]) -> dict:
 
 @dataclass(frozen=True)
 class NodeResult:
-    """Outputs and metrics produced by one physical node."""
+    """Outputs and metrics produced by one physical node.
+
+    produced holds the results of streamed producers this node's
+    runtime ran itself, keyed by node id.
+    """
 
     outputs: Mapping[str, Any]
     metrics: NodeMetrics = NodeMetrics()
+    produced: Mapping[str, "NodeResult"] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class StreamedInput:
+    """A producer node the consumer's runtime runs, with its inputs."""
+
+    node: PhysicalNode
+    inputs: Mapping[str, Any]
+
+
+def streamed_producers(graph: PhysicalGraph) -> dict[str, str]:
+    """Map each streamed producer node id to the consumer that runs it."""
+    deferred: dict[str, str] = {}
+    for node in graph.nodes:
+        ports = {input_port.name: input_port for input_port in node.inputs}
+        for name in node.streamed_inputs():
+            producer = ports[name].source.node_id
+            if producer in deferred:
+                raise ValueError(
+                    f"{producer!r} streams into two consumers")
+            deferred[producer] = node.node_id
+    for node in graph.nodes:
+        for input_port in node.inputs:
+            producer = input_port.source.node_id
+            if producer in deferred and deferred[producer] != node.node_id:
+                raise ValueError(
+                    f"{node.node_id!r} reads {producer!r}, which streams "
+                    f"into {deferred[producer]!r}")
+    return deferred
 
 
 @dataclass(frozen=True)
@@ -149,7 +183,12 @@ class ExecutionContext:
 
 
 class GenericRunner:
-    """Execute nodes after all their inputs are available."""
+    """Execute nodes after all their inputs are available.
+
+    A node whose output is streamed is not executed on its own: its
+    consumer receives it as a StreamedInput, runs it, and returns its
+    result under NodeResult.produced.
+    """
 
     def run(
         self,
@@ -159,12 +198,32 @@ class GenericRunner:
         initial_metrics: Mapping[str, NodeMetrics] | None = None,
     ) -> RunResult:
         graph.validate(runtime_keys=set(context.runtimes))
+        by_id = {node.node_id: node for node in graph.nodes}
+        deferred = streamed_producers(graph)
         values: dict[tuple[str, str], Any] = {
             (ref.node_id, ref.port): value
             for ref, value in (initial_outputs or {}).items()
         }
         node_results: dict[str, NodeResult] = {}
+        producer_inputs: dict[str, Mapping[str, Any]] = {}
         metrics = NodeMetrics()
+
+        def record(node, result):
+            nonlocal metrics
+            expected = {output.name for output in node.outputs}
+            missing = expected - set(result.outputs)
+            extra = set(result.outputs) - expected
+            if missing or extra:
+                raise ValueError(
+                    f"runtime {node.runtime_key!r} returned wrong ports "
+                    f"for {node.node_id!r}; "
+                    f"missing={sorted(missing)}, extra={sorted(extra)}")
+            for port, value in result.outputs.items():
+                values[(node.node_id, port)] = value
+            node_results[node.node_id] = result
+            metrics = metrics + result.metrics
+            for observer in context.observers:
+                observer.after_node(node, result)
 
         for node in graph.topological_nodes():
             supplied = {
@@ -182,17 +241,21 @@ class GenericRunner:
                     supplied,
                     (initial_metrics or {}).get(node.node_id, NodeMetrics()),
                 )
-                node_results[node.node_id] = result
-                metrics = metrics + result.metrics
-                for observer in context.observers:
-                    observer.after_node(node, result)
+                record(node, result)
                 continue
-            inputs = {
-                input_port.name: values[
-                    (input_port.source.node_id, input_port.source.port)
-                ]
-                for input_port in node.inputs
-            }
+            inputs = {}
+            for input_port in node.inputs:
+                source = input_port.source.node_id
+                if source in producer_inputs:
+                    inputs[input_port.name] = StreamedInput(
+                        by_id[source], producer_inputs[source])
+                else:
+                    inputs[input_port.name] = values[
+                        (source, input_port.source.port)
+                    ]
+            if node.node_id in deferred:
+                producer_inputs[node.node_id] = inputs
+                continue
             started = time.perf_counter()
             result = context.runtimes[node.runtime_key].execute(
                 node, inputs, context
@@ -204,19 +267,19 @@ class GenericRunner:
                     result.metrics,
                     wall_s=time.perf_counter() - started,
                 ))
-            expected = {output.name for output in node.outputs}
-            missing = expected - set(result.outputs)
-            extra = set(result.outputs) - expected
-            if missing or extra:
+            expected_produced = {
+                producer for producer, consumer in deferred.items()
+                if consumer == node.node_id and producer in producer_inputs
+            }
+            if set(result.produced) != expected_produced:
                 raise ValueError(
-                    f"runtime {node.runtime_key!r} returned wrong ports; "
-                    f"missing={sorted(missing)}, extra={sorted(extra)}")
-            for port, value in result.outputs.items():
-                values[(node.node_id, port)] = value
-            node_results[node.node_id] = result
-            metrics = metrics + result.metrics
-            for observer in context.observers:
-                observer.after_node(node, result)
+                    f"runtime {node.runtime_key!r} produced "
+                    f"{sorted(result.produced)}; expected "
+                    f"{sorted(expected_produced)}")
+            for producer_id, produced in result.produced.items():
+                record(by_id[producer_id], produced)
+                del producer_inputs[producer_id]
+            record(node, result)
 
         root = (graph.root.node_id, graph.root.port)
         return RunResult(values[root], node_results, metrics)
@@ -402,6 +465,12 @@ class ModelNodeRuntime:
         if not isinstance(result, NodeResult):
             raise TypeError("model execution must return NodeResult")
         if context.model_result is not None:
+            for value in inputs.values():
+                if isinstance(value, StreamedInput) \
+                        and value.node.node_id in result.produced:
+                    context.model_result(
+                        value.node, result.produced[value.node.node_id],
+                        context)
             context.model_result(node, result, context)
         return result
 

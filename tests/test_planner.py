@@ -426,15 +426,17 @@ def test_join_token_costs_and_retention(catalog):
     plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
                       doc_tokens={"r": [300] * 50, "p": [5] * 20})
     chain = filter_chain(plan)
-    # one stage would normally turn arena writes off; the keep needs
-    # them
+    # one stage would normally turn arena writes off; the join reads
+    # the KV. The chain streams its survivors into the join with their
+    # KV pinned, so it retains nothing in the pool
     assert chain.arena_writes is True
-    assert chain.keep_kv is True
-    assert chain.keep_min_doc_tokens == 1
-    assert chain.keep_resident_fraction == 1.0
+    assert chain.keep_kv is False
+    assert chain.keep_min_doc_tokens == 0
+    assert chain.keep_resident_fraction == 0.0
     group = plan.graph.nodes_by_type(AnchoredJoin.type_name)[0]
     assert group.anchor == "r"
     assert group.anchor_resident == "filter"
+    assert group.stream_anchor is True
     assert group.keep_anchor_kv is False    # nothing consumes r later
 
     # resident anchors pay the frame only - no preamble, no document
@@ -447,7 +449,8 @@ def test_join_token_costs_and_retention(catalog):
     stage = group.stages[0]
     assert stage.anchor_resident == "filter"
     assert stage.tuple_tokens == pytest.approx(expect)
-    assert any("shared KV on 'r'" in r for r in plan.remarks)
+    assert any("streams its survivors" in r for r in plan.remarks)
+    assert not any("shared KV on 'r'" in r for r in plan.remarks)
 
     logical = (docs(catalog, "reviews", tok).alias("r")
                .ai_join(docs(catalog, "products", tok).alias("p"),
@@ -461,19 +464,39 @@ def test_join_token_costs_and_retention(catalog):
     assert group.anchor_resident == "none"
     assert not any("keep KV" in r for r in plan.remarks)
 
-    # The arena minus the loop's two-chunk working reservation credits
-    # a fraction of the expected survivors at every document length.
-    toks = {"r": [3000] * 40 + [1000] * 100, "p": [5] * 20}
-    plan = plan_query(_filtered_join(catalog, doc_sel=1.0),
-                      model=QWEN3_4B_FP8, device=H100_SXM,
+    # A filtered alias that anchors a later group keeps its survivors
+    # in the retention pool. The arena minus the loop's two-chunk
+    # working reservation credits a fraction of the expected survivors
+    # at every document length. The first anchor streams instead.
+    logical = (docs(catalog, "reviews", tok).alias("r")
+               .ai_filter(prompt("about food: {0}", col("r.review")),
+                          selectivity=0.5)
+               .ai_join(docs(catalog, "products", tok).alias("p"),
+                        prompt("m {0} {1}", col("r.review"),
+                               col("p.description")),
+                        selectivity=0.5)
+               .ai_join(docs(catalog, "threads", tok).alias("t")
+                        .ai_filter(prompt("g {0}", col("t.thread")),
+                                   selectivity=1.0),
+                        prompt("m {0} {1}", col("p.description"),
+                               col("t.thread")),
+                        selectivity=0.5)
+               .select("r.id"))
+    toks = {"r": [300] * 50, "p": [5] * 20,
+            "t": [3000] * 40 + [1000] * 100}
+    plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
                       doc_tokens=toks)
-    chain = filter_chain(plan)
+    chain = filter_chain(plan, "t")
     assert chain.keep_kv is True
     assert chain.keep_min_doc_tokens == 1
     assert 0 < chain.keep_resident_fraction < 1
     assert any("expected pages per worker" in r for r in plan.remarks)
-    group = plan.graph.nodes_by_type(AnchoredJoin.type_name)[0]
-    assert group.anchor_resident == "filter"
+    groups = plan.graph.nodes_by_type(AnchoredJoin.type_name)
+    assert [group.anchor for group in groups] == ["r", "t"]
+    assert groups[0].stream_anchor is True
+    assert groups[1].stream_anchor is False
+    assert groups[1].anchor_resident == "filter"
+    assert filter_chain(plan, "r").keep_kv is False
 
 
 # ------------------------------------------------ KV keep (residency)
@@ -744,7 +767,8 @@ def test_explain_estimates_and_limits(catalog):
     assert "estimated_evaluations=" in physical
     assert "(estimated_rows=unknown)" in physical
     assert "expected_tuples=" not in physical
-    assert "retain KV for joins (estimated resident survivors=" in physical
+    assert "survivors stream into the join with KV pinned" in physical
+    assert "KV: anchor=streamed from its filter" in physical
     for node in plan.nodes:
         if isinstance(node, AnchoredJoin):
             assert f"anchor={node.anchor}" in physical

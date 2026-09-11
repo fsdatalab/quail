@@ -370,9 +370,20 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     seq = [(specs[position], anchor) for position, anchor in found["seq"]]
     first_anchor = seq[0][1] if seq else None
     retention_plan = retention.schedule(seq, live0)
+    # a filtered first anchor streams out of its chain with its KV
+    # pinned, so its survivors never enter the retention pool and the
+    # pool serves the other aliases; every streamed anchor is resident
+    streamed = first_anchor if first_anchor in filters else None
+    if streamed is not None:
+        retention_plan["initial"] = {
+            alias: use for alias, use in retention_plan["initial"].items()
+            if alias != streamed
+        }
     credited, keep_plan = retention.allocate(
         length_stats, live0, filters, retention_plan["initial"], pre,
         cap_pages * workers, budgets.PAGE_TOKENS, costs)
+    if streamed is not None:
+        credited[streamed] = credited[streamed].with_resident_fraction(1.0)
     found["work"], found["records"] = joinsearch.walk(
         seq, live0, credited, {}, pre, model, device)
     retention_plan.update(**costs, cap_pages=cap_pages, expected=keep_plan)
@@ -464,7 +475,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                     expected_docs=round(n * surv, 1)))
                 surv *= p.selectivity if p.selectivity is not None else 1.0
             keep = s.alias in retention_plan["initial"]
-            writes = len(stages) > 1 or keep
+            writes = len(stages) > 1 or keep or s.alias == streamed
             credit = keep_plan.get(s.alias)
             fid = f"filter:{s.alias}"
             nodes.append(PackedFilter(
@@ -479,7 +490,12 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                                         if credit and live0[s.alias] else 0.0),
                 stages=tuple(stages)))
             ids_src[s.alias] = PortRef(fid, f"ids:{s.alias}")
-            if not writes:
+            if s.alias == streamed:
+                remarks.append(
+                    f"filter on {s.alias!r} streams its survivors into "
+                    f"the join anchored on it; each one's KV stays "
+                    f"pinned until its tuples are answered")
+            elif not writes:
                 remarks.append(
                     f"filter on {s.alias!r}: arena writes off (one "
                     f"stage - nothing reads the KV again)")
@@ -549,6 +565,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
             anchor=anchor,
             anchor_resident=group["members"][0][1]["resident"],
             keep_anchor_kv=anchor in retention_plan["after"][gid],
+            stream_anchor=(g == 0 and anchor == streamed),
             stages=tuple(stage_dicts)))
         ids_src[anchor] = PortRef(gid, f"ids:{anchor}")
 

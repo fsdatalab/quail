@@ -9,6 +9,7 @@ from typing import Any
 from quail.backends.base import GpuContext
 from quail.backends.quail.worker import execute_quail_request, prepare_quail_request
 from quail.executor import loop
+from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
 from quail.logical import SHARED_PRE
 from quail.physical import (
     AnchoredJoin,
@@ -81,7 +82,6 @@ class QuailModelExecution:
         chunk_tokens = self._state["chunk_tokens"]
 
         if isinstance(node, PackedFilter):
-
             document_ids = inputs["document_ids"]
             retain_survivors = inputs.get("retain_survivors", ())
             if retain_survivors is False:
@@ -99,28 +99,37 @@ class QuailModelExecution:
                 arena_keys=DocumentKeys(node.alias, document_ids),
                 retain_survivors=retain_survivors,
             )
-            global_answers = {
-                document_ids[int(local)]: row
-                for local, row in answers.items()
-            }
-            survivors = sorted(
-                document
-                for document, row in global_answers.items()
-                if len(row) == len(node.question_token_ids) and all(row)
-            )
-            return NodeResult(
-                outputs={
-                    f"ids:{node.alias}": survivors,
-                    f"filter_answers:{node.alias}": global_answers,
-                },
-                metrics=NodeMetrics(
-                    input_rows=len(document_ids),
-                    output_rows=len(survivors),
-                    evaluated_documents=len(global_answers),
-                    fresh_tokens=tokens,
-                ),
-            )
+            return _filter_result(node, answers, tokens, document_ids)
 
+        stage_frames = inputs["stage_frames"]
+        stream = inputs.get("anchor_stream")
+        source = None
+        if stream is not None:
+            filter_node = stream["node"]
+            if not filter_node.arena_writes:
+                raise ValueError(
+                    "a filter chain that streams into a join must write "
+                    "its KV to the arena")
+            filter_ids = stream["document_ids"]
+            # the chain hands each passing document over with its KV
+            # pinned; pages cover the join's largest frame so the join
+            # never claims a page of its own for a streamed anchor
+            source = loop.FilterStream(
+                torch,
+                arena,
+                pipeline,
+                async_answers,
+                stream["documents"],
+                [list(question)
+                 for question in filter_node.question_token_ids],
+                chunk_tokens,
+                arena_writes=True,
+                arena_keys=DocumentKeys(filter_node.alias, filter_ids),
+                hold_survivors=True,
+                hold_extra_tokens=max(
+                    (len(frame) for frame in stage_frames), default=0),
+                attention_mode=FILTER_ATTENTION,
+            )
         answers, _, tokens = loop.run_join(
             torch,
             arena,
@@ -129,11 +138,22 @@ class QuailModelExecution:
             inputs["prefixes"],
             inputs["stage_suffixes"],
             chunk_tokens,
-            stage_frames=inputs["stage_frames"],
+            stage_frames=stage_frames,
             anchor_keys=inputs["anchor_keys"],
             anchor_done=inputs["anchor_done"],
+            anchor_source=source,
+            attention_mode=JOIN_ATTENTION if source is not None else None,
         )
-        anchor_ids = list(inputs["anchor_ids"])
+        produced = {}
+        if source is not None:
+            anchor_ids = [filter_ids[document] for document in source.held]
+            kv_round = {"hits": len(anchor_ids), "misses": 0,
+                        "regret_tokens": 0}
+            produced[filter_node.node_id] = _filter_result(
+                filter_node, source.answers, source.tokens, filter_ids)
+        else:
+            anchor_ids = list(inputs["anchor_ids"])
+            kv_round = inputs.get("kv_round") or {}
         group = inputs["group"]
         last = answers[-1] if answers else {}
         matched = {
@@ -169,13 +189,39 @@ class QuailModelExecution:
                     sum(len(row) for row in stage.values())
                     for stage in answers
                 ),
-                kv_hits=inputs.get("kv_round", {}).get("hits", 0),
-                kv_misses=inputs.get("kv_round", {}).get("misses", 0),
-                regret_tokens=inputs.get("kv_round", {}).get("regret_tokens", 0),
+                kv_hits=kv_round.get("hits", 0),
+                kv_misses=kv_round.get("misses", 0),
+                regret_tokens=kv_round.get("regret_tokens", 0),
                 fresh_tokens=tokens,
                 extension={"answers": answers},
             ),
+            produced=produced,
         )
+
+
+def _filter_result(node, answers, tokens, document_ids) -> NodeResult:
+    """Build one filter chain's node result from its local answers."""
+    global_answers = {
+        document_ids[int(local)]: row
+        for local, row in answers.items()
+    }
+    survivors = sorted(
+        document
+        for document, row in global_answers.items()
+        if len(row) == len(node.question_token_ids) and all(row)
+    )
+    return NodeResult(
+        outputs={
+            f"ids:{node.alias}": survivors,
+            f"filter_answers:{node.alias}": global_answers,
+        },
+        metrics=NodeMetrics(
+            input_rows=len(document_ids),
+            output_rows=len(survivors),
+            evaluated_documents=len(global_answers),
+            fresh_tokens=tokens,
+        ),
+    )
 
 
 def expected_join_nodes(plan) -> tuple[PhysicalNode, ...]:

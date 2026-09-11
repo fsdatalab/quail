@@ -47,7 +47,19 @@ class FixedFeverAnswers:
                                f"filter_answers:{node.alias}": answers})
 
         outputs = {}
-        anchor_ids = inputs["anchor_ids"]
+        produced = {}
+        stream = inputs.get("anchor_stream")
+        if stream is None:
+            anchor_ids = inputs["anchor_ids"]
+        else:
+            # the anchor's chain runs inside the join; like the real
+            # driver, append each streamed anchor's key and prefix
+            filter_result = self.execute(stream["node"], stream)
+            anchor_ids = filter_result.outputs[f"ids:{node.anchor}"]
+            produced[stream["node"].node_id] = filter_result
+            for document in anchor_ids:
+                inputs["anchor_keys"].append((node.anchor, document))
+                inputs["prefixes"].append([])
         live = set(range(len(anchor_ids)))
         all_answers = []
         for stage in node.stages:
@@ -73,7 +85,8 @@ class FixedFeverAnswers:
                 "selectivity": stage.selectivity, "written_pos": stage.written_pos,
             }
         outputs[f"ids:{node.anchor}"] = [anchor_ids[local] for local in sorted(live)]
-        return NodeResult(outputs, NodeMetrics(extension={"answers": all_answers}))
+        return NodeResult(outputs, NodeMetrics(extension={"answers": all_answers}),
+                          produced=produced)
 
 
 def test_fixed_order_execution_and_backend_planning(monkeypatch):
@@ -106,12 +119,17 @@ def test_fixed_order_execution_and_backend_planning(monkeypatch):
                             "quail.planner.joins.search_joins", unexpected_search)
                         report = execute_single_graph(
                             state, request.plan["settings"], graph)
-                    assert model.filters[-1] == (groups[0].anchor, True)
+                    # the first anchor's chain streams into its join and
+                    # runs last, retaining nothing; the other anchor's
+                    # chain retains survivors for its later group
+                    assert groups[0].stream_anchor is True
+                    assert model.filters[-1] == (groups[0].anchor, False)
                     anchors = {group.anchor for group in groups}
-                    assert {alias for alias, keep in model.filters if keep} == anchors
+                    assert {alias for alias, keep in model.filters if keep} \
+                        == anchors - {groups[0].anchor}
                     assert not state["arena"].accounting.owned
                     assert report["kv_manager"]["retained_after_filters"] == (
-                        0 if empty else min(capacity, 2) * len(anchors))
+                        0 if empty else min(capacity, 2) * (len(anchors) - 1))
                     assert [step["id"] for step in report["executed_join_plan"]
                             if step["type"] == AnchoredJoin.type_name] == [
                                 g.node_id for g in groups]

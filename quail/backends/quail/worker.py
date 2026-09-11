@@ -466,6 +466,14 @@ def _child_joins(state, sub):
     apply_retention(arena, config,
                     config.get("before", {}).get(node.node_id, {}), live)
     retain_anchor = bool(sub.get("retain_anchor"))
+    encoded_filter = sub.get("stream_filter_node")
+    filter_node = None
+    if encoded_filter is not None:
+        filter_node = registry.codecs[encoded_filter["type"]].decode(
+            encoded_filter)
+        if not isinstance(filter_node, PackedFilter) \
+                or filter_node.alias != anchor_alias:
+            raise TypeError("the streamed chain must filter the anchor")
     seen = state.setdefault("seen", set())
     out_joins, tokens_total = [], 0
     t0 = time.perf_counter()
@@ -486,11 +494,27 @@ def _child_joins(state, sub):
             stage_suffixes.append(
                 [_tuple_suffix(j, part_docs, combo)
                  for combo in combos])
-        prefixes = [chain_tokens(pre, d) for d in anchor_docs]
-        anchor_keys = [(anchor_alias, g) for g in anchors_glob]
-        round_kv = _join_round_kv(
-            anchor_keys, [len(p) for p in prefixes],
-            arena.accounting.owned, seen)
+        if filter_node is None:
+            prefixes = [chain_tokens(pre, d) for d in anchor_docs]
+            anchor_keys = [(anchor_alias, g) for g in anchors_glob]
+            round_kv = _join_round_kv(
+                anchor_keys, [len(p) for p in prefixes],
+                arena.accounting.owned, seen)
+            anchor_stream = None
+        else:
+            # this GPU's shard of the anchor documents runs through the
+            # chain here; the driver appends each streamed anchor's key
+            # and prefix to these lists
+            prefixes, anchor_keys = [], []
+            round_kv = None
+            anchor_stream = {
+                "node": filter_node,
+                "documents": DocumentPrefixes(
+                    pre, anchor_docs, range(len(anchor_docs))),
+                "document_ids": anchors_glob,
+                "limit": None,
+                "retain_survivors": (),
+            }
 
         def anchor_done(a, row):
             matched = any(row)
@@ -513,7 +537,9 @@ def _child_joins(state, sub):
                 ],
                 "anchor_keys": anchor_keys,
                 "anchor_done": anchor_done,
-                "anchor_ids": anchors_glob,
+                "anchor_stream": anchor_stream,
+                "kv_round": round_kv,
+                "anchor_ids": None if filter_node else anchors_glob,
                 "partner_indices": {
                     stage.written_pos: tuples
                     for stage, tuples in zip(node.stages, tuple_globs)
@@ -523,6 +549,22 @@ def _child_joins(state, sub):
             runtime_context,
         )
         ans = result.metrics.extension["answers"]
+        filter_out = {}
+        if filter_node is not None:
+            anchors_glob = [key[1] for key in anchor_keys]
+            round_kv = dict(hits=len(anchor_keys), misses=0,
+                            regret_tokens=0)
+            produced = result.produced[filter_node.node_id]
+            answers = produced.outputs[f"filter_answers:{anchor_alias}"]
+            filter_out = dict(
+                filters={anchor_alias: {
+                    int(document): row for document, row in answers.items()
+                }},
+                survivors={anchor_alias: list(
+                    produced.outputs[f"ids:{anchor_alias}"])},
+                filter_fresh_tokens=produced.metrics.fresh_tokens,
+            )
+            seen.update((anchor_alias, document) for document in answers)
         seen.update(anchor_keys)
         last = ans[-1] if ans else {}
         for a, key in enumerate(anchor_keys):
@@ -553,6 +595,7 @@ def _child_joins(state, sub):
                 retained={alias: sorted(documents)
                           for alias, documents in retained.items()},
                 kv_round=round_kv,
+                **filter_out,
                 kv_totals=dict(
                     evicted_keys=arena.evicted_keys,
                     evicted_pages=arena.evicted_pages,

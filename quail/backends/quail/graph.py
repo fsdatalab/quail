@@ -18,6 +18,7 @@ from quail.runtime.runner import (
     GenericRunner,
     ModelNodeRuntime,
     NodeResult,
+    StreamedInput,
     compute_subgraph,
     scalar_node_metrics,
 )
@@ -57,32 +58,42 @@ def _tuple_suffix(join, docs, member):
     return chain_tokens(*parts)
 
 
+def filter_inputs(state, node, document_ids) -> dict:
+    """Scheduler inputs for one filter chain over the given documents."""
+    return {
+        "documents": DocumentPrefixes(
+            state["pre"], state["docs"][node.alias], document_ids
+        ),
+        "document_ids": document_ids,
+        "limit": state["filter_limit"],
+        "retain_survivors": node.keep_kv,
+    }
+
+
 def prepare_model_inputs(node, inputs, context: ExecutionContext):
     """Prepare Quail scheduler inputs from typed port values."""
     state = context.state
     if isinstance(node, PackedFilter):
         state["pipeline"].attention_mode = FILTER_ATTENTION
-        document_ids = next(iter(inputs.values()))
-        return {
-            "documents": DocumentPrefixes(
-                state["pre"], state["docs"][node.alias], document_ids
-            ),
-            "document_ids": document_ids,
-            "limit": state["filter_limit"],
-            "retain_survivors": node.keep_kv,
-        }
+        return filter_inputs(state, node, next(iter(inputs.values())))
     if not isinstance(node, AnchoredJoin):
         return inputs
 
     state["pipeline"].attention_mode = JOIN_ATTENTION
-    by_alias = {
-        input_port.source.port.split(":", 1)[1]: list(
-            inputs[input_port.name]
-        )
-        for input_port in node.inputs
-        if input_port.source.port.startswith("ids:")
-    }
-    anchor_ids = by_alias[node.anchor]
+    stream = None
+    by_alias = {}
+    for input_port in node.inputs:
+        if not input_port.source.port.startswith("ids:"):
+            continue
+        alias = input_port.source.port.split(":", 1)[1]
+        value = inputs[input_port.name]
+        if isinstance(value, StreamedInput):
+            if alias != node.anchor or not isinstance(value.node, PackedFilter):
+                raise TypeError(
+                    "only the anchor's filter chain streams into a join")
+            stream = value
+        else:
+            by_alias[alias] = list(value)
     if not state["joins_started"]:
         state["joins_started"] = True
         accounting = state["arena"].accounting
@@ -110,20 +121,35 @@ def prepare_model_inputs(node, inputs, context: ExecutionContext):
             _tuple_suffix(join, state["docs"], member)
             for member in tuples
         ])
-    prefixes = [
-        chain_tokens(state["pre"], state["docs"][node.anchor][document])
-        for document in anchor_ids
-    ]
-    anchor_keys = [(node.anchor, document) for document in anchor_ids]
-    round_kv = _join_round_kv(
-        anchor_keys,
-        [len(prefix) for prefix in prefixes],
-        state["arena"].accounting.owned,
-        state["seen"],
-    )
-    state["kv_stats"]["join_anchor_hits"] += round_kv["hits"]
-    state["kv_stats"]["join_anchor_misses"] += round_kv["misses"]
-    state["regret_tokens"] += round_kv["regret_tokens"]
+    if stream is None:
+        anchor_ids = by_alias[node.anchor]
+        prefixes = [
+            chain_tokens(state["pre"], state["docs"][node.anchor][document])
+            for document in anchor_ids
+        ]
+        anchor_keys = [(node.anchor, document) for document in anchor_ids]
+        round_kv = _join_round_kv(
+            anchor_keys,
+            [len(prefix) for prefix in prefixes],
+            state["arena"].accounting.owned,
+            state["seen"],
+        )
+        state["kv_stats"]["join_anchor_hits"] += round_kv["hits"]
+        state["kv_stats"]["join_anchor_misses"] += round_kv["misses"]
+        state["regret_tokens"] += round_kv["regret_tokens"]
+        anchor_stream = None
+    else:
+        # the join admits anchors as the chain hands them over; the
+        # driver appends each one's key and prefix to these lists
+        anchor_ids = None
+        prefixes = []
+        anchor_keys = []
+        round_kv = None
+        anchor_stream = {
+            "node": stream.node,
+            **filter_inputs(state, stream.node,
+                            next(iter(stream.inputs.values()))),
+        }
 
     def anchor_done(local_index, row):
         key = anchor_keys[local_index]
@@ -144,6 +170,7 @@ def prepare_model_inputs(node, inputs, context: ExecutionContext):
         "anchor_keys": anchor_keys,
         "prefixes": prefixes,
         "tuple_indices": tuple_indices,
+        "streamed": stream is not None,
     }
     return {
         "prefixes": prefixes,
@@ -151,6 +178,7 @@ def prepare_model_inputs(node, inputs, context: ExecutionContext):
         "stage_frames": [join.get("frame") or [] for join in group],
         "anchor_keys": anchor_keys,
         "anchor_done": anchor_done,
+        "anchor_stream": anchor_stream,
         "kv_round": round_kv,
         "anchor_ids": anchor_ids,
         "partner_indices": tuple_indices,
@@ -168,11 +196,17 @@ def record_model_result(node, result: NodeResult,
                              for document in answers)
     elif isinstance(node, AnchoredJoin):
         prepared = state["prepared_join"]
-        state["seen"].update(prepared["anchor_keys"])
+        keys = prepared["anchor_keys"]
+        if prepared["streamed"]:
+            # every streamed anchor read its KV from the chain: a hit
+            state["kv_stats"]["join_anchor_hits"] += len(keys)
+            anchor_ids = [key[1] for key in keys]
+        else:
+            anchor_ids = prepared["anchor_ids"]
+        state["seen"].update(keys)
         live = set(result.outputs[f"ids:{node.anchor}"])
         for document, key, prefix in zip(
-                prepared["anchor_ids"], prepared["anchor_keys"],
-                prepared["prefixes"]):
+                anchor_ids, keys, prepared["prefixes"]):
             if key in state["arena"].accounting.owned:
                 if node.keep_anchor_kv and document in live:
                     config = state["retention"]

@@ -19,6 +19,7 @@ from quail.runtime.runner import (
     GenericRunner,
     NodeMetrics,
     NodeResult,
+    StreamedInput,
     compute_subgraph,
     scalar_node_metrics,
 )
@@ -157,8 +158,16 @@ class DistributedQuailExecution:
 
     def _execute_join(self, node, inputs):
 
-        survivors = inputs["survivors"]
+        survivors = dict(inputs["survivors"])
         group = inputs["group"]
+        stream = inputs.get("anchor_stream")
+        filtered_aliases = set(self.retained)
+        if stream is not None:
+            # the anchor's chain runs inside this round on each GPU,
+            # over that GPU's filter shard of every anchor document
+            filter_ids = list(next(iter(stream.inputs.values())))
+            survivors[node.anchor] = filter_ids
+            filtered_aliases.add(node.anchor)
         if not self.joins_started:
             self.snapshot_after_filters()
             self.joins_started = True
@@ -168,10 +177,15 @@ class DistributedQuailExecution:
             survivors,
             group,
             prior_shards=self.prior_shards,
-            filtered_aliases=set(self.retained),
+            filtered_aliases=filtered_aliases,
             shards=self.shards,
         )
         encoded_node = self.registry.codecs[node.type_name].encode(node)
+        encoded_filter = (
+            None if stream is None
+            else self.registry.codecs[stream.node.type_name].encode(
+                stream.node)
+        )
         for sub in subs:
             sub.pop("joins", None)
             sub.update(
@@ -180,11 +194,36 @@ class DistributedQuailExecution:
                     AnchoredJoin.type_name)[-1].node_id,
                 start_query=not self.started,
                 physical_node=encoded_node,
+                stream_filter_node=encoded_filter,
             )
         started = time.perf_counter()
         outputs = self.round_fn("joins", subs)
         wall = time.perf_counter() - started
         self.started = True
+        produced = {}
+        if stream is not None:
+            merged = coordinator.merge_filter_round([
+                {
+                    "filters": output["filters"],
+                    "survivors": output["survivors"],
+                    "fresh_tokens": output["filter_fresh_tokens"],
+                }
+                for output in outputs
+            ])
+            filter_answers = merged["filters"].get(node.anchor, {})
+            filter_survivors = merged["survivors"].get(node.anchor, [])
+            produced[stream.node.node_id] = NodeResult(
+                {
+                    f"ids:{node.anchor}": filter_survivors,
+                    f"filter_answers:{node.anchor}": filter_answers,
+                },
+                NodeMetrics(
+                    input_rows=len(filter_ids),
+                    output_rows=len(filter_survivors),
+                    evaluated_documents=len(filter_answers),
+                    fresh_tokens=merged["fresh_tokens"],
+                ),
+            )
         stage_outputs = coordinator.merge_join_round(outputs)
         regret = 0
         hits = 0
@@ -223,7 +262,8 @@ class DistributedQuailExecution:
             },
             NodeMetrics(
                 wall_s=wall,
-                input_rows=len(inputs["survivors"][node.anchor]),
+                input_rows=len(enriched[-1]["anchor_index"]) if enriched
+                else len(survivors[node.anchor]),
                 output_rows=len(anchor_survivors),
                 evaluated_document_pairs=sum(
                     sum(len(row) for row in stage["rows"].values())
@@ -235,6 +275,7 @@ class DistributedQuailExecution:
                 regret_tokens=regret,
                 extension={"joins": enriched},
             ),
+            produced=produced,
         )
 
     def _retained_placement(self, outputs):
@@ -275,12 +316,22 @@ class DistributedQuailExecution:
 
 def prepare_distributed_inputs(node, inputs, context):
     if isinstance(node, AnchoredJoin):
+        survivors = {}
+        stream = None
+        for port in node.inputs:
+            value = inputs[port.name]
+            alias = port.source.port.split(":", 1)[1]
+            if isinstance(value, StreamedInput):
+                if alias != node.anchor:
+                    raise TypeError(
+                        "only the anchor's filter chain streams into a join")
+                stream = value
+            else:
+                survivors[alias] = list(value)
         return {
-            "survivors": {
-                port.source.port.split(":", 1)[1]: list(inputs[port.name])
-                for port in node.inputs
-            },
+            "survivors": survivors,
             "group": [stage.runtime_spec() for stage in node.stages],
+            "anchor_stream": stream,
         }
     return inputs
 

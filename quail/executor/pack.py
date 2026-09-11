@@ -144,7 +144,7 @@ class JoinAdmission:
     def __init__(self, prefix_tokens, stage_suffixes, chunk_budget,
                  arena_pages, page_tokens, frame_tokens=None,
                  resident=None):
-        self.prefix = list(prefix_tokens)
+        self.prefix = []
         self.stages = [list(s) for s in stage_suffixes]
         self.frames = (list(frame_tokens) if frame_tokens
                        else [0] * len(self.stages))
@@ -153,10 +153,9 @@ class JoinAdmission:
         if not self.stages or not self.stages[0]:
             raise ValueError("the first stage needs partners")
         self.chunk_budget = chunk_budget
+        self.arena_pages = arena_pages
         self.page_tokens = page_tokens
-        resident = dict(resident or {})
         k = len(self.stages)
-        n = len(self.prefix)
         self._cum = []
         for j, (lens, frame) in enumerate(zip(self.stages, self.frames)):
             cum = [0]
@@ -168,40 +167,85 @@ class JoinAdmission:
                     f"stage {j}: a {frame + max(lens)}-token partner "
                     f"exceeds the {chunk_budget}-token chunk budget "
                     f"(suffixes are atomic)")
-        extra = max(self.frames)
+        self._extra = max(self.frames)
+        self._first = self.frames[0] + self.stages[0][0]
         self._page_cost = []
-        first = self.frames[0] + self.stages[0][0]
-        for a, prefix in enumerate(self.prefix):
-            need = pages_for(prefix + extra, page_tokens)
-            if a in resident:
-                need = max(0, need - resident[a])
-            elif need > arena_pages:
-                raise ValueError(
-                    f"anchor {a} needs {need} KV pages; the arena "
-                    f"holds {arena_pages}")
-            elif prefix + first > chunk_budget:
-                raise ValueError(
-                    f"anchor {a}: prefix {prefix} tokens leaves no "
-                    f"room for a partner in a {chunk_budget}-token "
-                    f"chunk")
-            self._page_cost.append(need)
-        self._carried = [0 if a in resident else p
-                         for a, p in enumerate(self.prefix)]
-        self._min_fresh = min(
-            (c + first for c in self._carried), default=0)
-        # resident anchors first: they cost no prefix tokens and few
-        # or no pages, so they never wait behind a page-blocked anchor
-        order = [a for a in range(n) if a in resident] \
-            + [a for a in range(n) if a not in resident]
-        self.pending = deque(order)
-        self._zero_cost = sum(1 for a in order if not self._page_cost[a])
+        self._carried = []
+        self._min_fresh = float("inf")
+        self._zero_cost = 0
+        self.pending = deque()
         self.ready = deque()       # placed anchors with partners left
-        self._stage = [-1] * n     # current stage, or _DONE/_STRANDED
-        self._next = [0] * n       # next partner index at the stage
-        self._true = [[False] * k for _ in range(n)]
+        self._stage = []           # current stage, or _DONE/_STRANDED
+        self._next = []            # next partner index at the stage
+        self._true = []
         self.in_flight = 0         # launched groups not yet reported
         self.blocked_pages = 0
         self.answers = [dict() for _ in range(k)]
+        resident = dict(resident or {})
+        for a, prefix in enumerate(prefix_tokens):
+            self._register(prefix, resident.get(a))
+        # resident anchors first: they cost no prefix tokens and few
+        # or no pages, so they never wait behind a page-blocked anchor
+        n = len(self.prefix)
+        self.pending.extend(a for a in range(n) if a in resident)
+        self.pending.extend(a for a in range(n) if a not in resident)
+
+    def _register(self, prefix, resident_pages):
+        """Record one anchor's costs; returns its index."""
+        a = len(self.prefix)
+        need = pages_for(prefix + self._extra, self.page_tokens)
+        if resident_pages is not None:
+            need = max(0, need - resident_pages)
+        elif need > self.arena_pages:
+            raise ValueError(
+                f"anchor {a} needs {need} KV pages; the arena "
+                f"holds {self.arena_pages}")
+        elif prefix + self._first > self.chunk_budget:
+            raise ValueError(
+                f"anchor {a}: prefix {prefix} tokens leaves no "
+                f"room for a partner in a {self.chunk_budget}-token "
+                f"chunk")
+        carried = 0 if resident_pages is not None else prefix
+        self.prefix.append(prefix)
+        self._page_cost.append(need)
+        self._carried.append(carried)
+        self._min_fresh = min(self._min_fresh, carried + self._first)
+        if not need:
+            self._zero_cost += 1
+        self._stage.append(-1)
+        self._next.append(0)
+        self._true.append([False] * len(self.stages))
+        return a
+
+    def admit(self, prefix_tokens, resident_pages=None):
+        """Queue one more anchor behind the pending ones; returns its index.
+
+        resident_pages says the anchor's prefix KV is already in the
+        arena on that many pages, so it packs no prefix tokens.
+        """
+        a = self._register(prefix_tokens, resident_pages)
+        self.pending.append(a)
+        return a
+
+    def buildable_tokens(self):
+        """Tokens the next chunk could pack, capped at the chunk budget.
+
+        Counts every placed anchor's remaining stream and every pending
+        anchor's first chunk. Chunk room, not pages: a page-blocked
+        anchor still counts.
+        """
+        total = 0
+        for a in self.ready:
+            j, i = self._stage[a], self._next[a]
+            total += (self.frames[j] if i == 0 else 0) \
+                + self._cum[j][-1] - self._cum[j][i]
+            if total >= self.chunk_budget:
+                return self.chunk_budget
+        for a in self.pending:
+            total += self._carried[a] + self.frames[0] + self._cum[0][-1]
+            if total >= self.chunk_budget:
+                return self.chunk_budget
+        return total
 
     # ---- chunk building ------------------------------------------------
 
@@ -352,6 +396,7 @@ class FilterAdmission:
         self.doc_tokens = doc_tokens
         self.stage_tokens = list(stage_tokens)
         self.chunk_budget = chunk_budget
+        self.arena_pages = arena_pages
         self.page_tokens = page_tokens
         # None: no page bin - nothing is ever written to the arena,
         # so there is nothing to account
@@ -471,6 +516,18 @@ class FilterAdmission:
         if pages < 0 or self.free_pages is None:
             raise ValueError("invalid external page release")
         self.free_pages += pages
+
+    def sync_free_pages(self, pages):
+        """Take the arena's free page count before building a chunk.
+
+        Used when another operator frees and claims pages between this
+        chain's chunks, so the chain's own arithmetic cannot track them.
+        """
+        if self.free_pages is None:
+            raise ValueError("this chain has no page bin to sync")
+        if not 0 <= pages <= self.arena_pages:
+            raise ValueError("free pages must fit inside the arena")
+        self.free_pages = pages
 
     # ---- progress ------------------------------------------------------
 

@@ -154,6 +154,11 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None):
         (node for node in graph.topological_nodes() if uses[node.node_id] > 1), 1)}
     visited = set()
     lines = []
+    streamed = {}
+    for node in graph.nodes:
+        ports = {port.name: port for port in node.inputs}
+        for name in node.streamed_inputs():
+            streamed[ports[name].source.node_id] = node.node_id
 
     def describe(node):
         details = []
@@ -178,6 +183,8 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None):
                 fraction = _selectivity(node.keep_resident_fraction)
                 kv.append("retain KV for joins "
                           f"(estimated resident survivors={fraction})")
+            if node.node_id in streamed:
+                kv.append("survivors stream into the join with KV pinned")
             details.append(", ".join(kv) if kv else
                            "KV: stored" if node.arena_writes else "KV: not stored")
             predicates = filters.get(node.alias, ())
@@ -193,6 +200,8 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None):
             source = {"none": "not resident", "filter": "from filters",
                       "kept": "from an earlier join"}.get(
                           node.anchor_resident, node.anchor_resident)
+            if node.stream_anchor:
+                source = "streamed from its filter"
             keep = "yes" if node.keep_anchor_kv else "no"
             details.append(f"KV: anchor={source}, retain after join={keep}")
             for index, stage in enumerate(node.stages, 1):
