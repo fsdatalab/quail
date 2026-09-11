@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 import pyarrow as pa
 
 from quail_b.data import _ids
-from quail_b.queries import QuerySpec
+from quail_b.queries import JoinSpec, QuerySpec
 
 
 @dataclass
@@ -160,13 +160,56 @@ def _join_all(tables: list[pa.Table]) -> pa.Table:
     return joined
 
 
-def rows_from_answers(spec: QuerySpec, filter_answers, join_answers
-                      ) -> pa.Table:
+def _values_by_id(rows, column: str) -> dict[str, object]:
+    """Map each document id to its value in one corpus column."""
+    if isinstance(rows, pa.Table):
+        values = rows.column(column).to_pylist()
+    else:
+        values = [row[column] for row in rows]
+    return {str(row_id): value for row_id, value in zip(_ids(rows), values)}
+
+
+def _allowed_pairs(join: JoinSpec, spec: QuerySpec, corpus_rows):
+    """Return pair -> allowed for a join's equality conditions, or None."""
+    if not join.on:
+        return None
+    if corpus_rows is None:
+        raise ValueError(
+            f"{spec.id}: the join on {join.on} needs the corpus rows to "
+            f"apply its equality conditions")
+    left, right = join.aliases
+    left_rows = corpus_rows[spec.alias(left).table]
+    right_rows = corpus_rows[spec.alias(right).table]
+    columns = [(_values_by_id(left_rows, left_column),
+                _values_by_id(right_rows, right_column))
+               for left_column, right_column in join.on]
+
+    def allowed(left_id: str, right_id: str) -> bool:
+        return all(
+            left_values.get(left_id) is not None
+            and left_values.get(left_id) == right_values.get(right_id)
+            for left_values, right_values in columns)
+
+    return allowed
+
+
+def _apply_conditions(table: pa.Table, join: JoinSpec, allowed) -> pa.Table:
+    if allowed is None:
+        return table
+    left, right = join.aliases
+    mask = [allowed(left_id, right_id) for left_id, right_id in zip(
+        table.column(left).to_pylist(), table.column(right).to_pylist())]
+    return table.filter(pa.array(mask, type=pa.bool_()))
+
+
+def rows_from_answers(spec: QuerySpec, filter_answers, join_answers,
+                      corpus_rows=None) -> pa.Table:
     """Return the final rows an engine's own answers imply.
 
     For a run that saved its predicate answers but not its rows: a row
-    survives when every filter on its alias answered TRUE and every
-    join it takes part in answered TRUE.
+    survives when every filter on its alias answered TRUE, every join
+    it takes part in answered TRUE, and every join equality holds.
+    corpus_rows is needed only when a join has equality conditions.
     """
     survivors = {}
     for alias_spec in spec.aliases:
@@ -186,8 +229,9 @@ def rows_from_answers(spec: QuerySpec, filter_answers, join_answers
     for written_pos, join in enumerate(spec.joins):
         table = join_answers[written_pos]
         mask = table.column("answer")
-        relations.append(_as_string_ids(
-            table.filter(mask), list(join.aliases)))
+        true_pairs = _as_string_ids(table.filter(mask), list(join.aliases))
+        relations.append(_apply_conditions(
+            true_pairs, join, _allowed_pairs(join, spec, corpus_rows)))
     if relations:
         rows = _join_all(relations)
     else:
@@ -233,9 +277,10 @@ def expected_rows(spec: QuerySpec, ground_truth, corpus_rows) -> pa.Table:
         key = ground_truth.key_for_template(join.template)
         labels = ground_truth.predicates[key]
         left, right = join.aliases
+        allowed = _allowed_pairs(join, spec, corpus_rows)
         columns = {left: [], right: []}
         for (left_id, right_id), answer in labels.answers.items():
-            if answer:
+            if answer and (allowed is None or allowed(left_id, right_id)):
                 columns[left].append(left_id)
                 columns[right].append(right_id)
         relations.append(_id_table(columns))
