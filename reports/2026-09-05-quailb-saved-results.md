@@ -1,15 +1,17 @@
 # QUAIL-B comparison from saved results
 
-- The main PDF covers all 32 queries with grouped bars and one metric per page.
+- The main PDF covers all 33 queries with grouped bars and one metric per page.
   Its final page lists input document counts. Each dataset PDF has a page
   of four bar charts and a separate input-count page. Text and marks remain
   vector content when zoomed. The PNGs below are first-page previews.
 - The five dataset plots use the same
   method colors and definitions for latency, recomputed KV tokens, fresh
   input tokens, accuracy, and input document counts for every relation alias.
-- The other 31 queries reuse the original measurements from September 5, 2026.
-  Only FEV-9 was rerun on September 6, 2026, with all four methods.
-  FEV-9 uses SGLang with all anchors submitted per partner, without client tiles or request slices.
+- 31 queries reuse the original measurements from September 5, 2026.
+  FEV-9 was rerun on September 6, 2026, with all four methods. FEV-10
+  joined the benchmark on September 11, 2026, and was measured that day
+  with all four methods.
+  FEV-9 and FEV-10 use SGLang with all anchors submitted per partner, without client tiles or request slices.
   Other queries retain historical SGLang measurements with the earlier adapter.
   The other queries are not new measurements of shared retention.
 - The setup was Qwen3 4B FP8, sf=0.1, lf=1, and one H100 per configuration.
@@ -28,8 +30,8 @@
 - We predicted Quail would remain near 39 seconds and beat the baselines.
   It took 41.14 seconds in the new run. We reused all 124 saved
   configurations for the other 31 queries.
-- In these saved measurements, Quail was faster than stock vLLM on 30
-  of 32 comparable queries.
+- In these saved measurements, Quail was faster than stock vLLM on 31
+  of 33 comparable queries.
 - A horizontal line across each query's bar group shows its SoL estimate.
   SoL models ideal computation and memory traffic with unlimited prefix KV.
   It credits matching token prefixes across requests, documents, and aliases.
@@ -41,9 +43,18 @@
   No accuracy is assigned to SoL because it is not a measured model run.
   Matching document prefixes are reusable; a partner suffix after a different
   anchor context is not an identical prefix and is still computed.
-- The earlier SoL file used the old FEV-9 definition. We recalculated only
-  FEV-9 on the CPU from saved labels and corpus rows. The other 31 estimates
-  are unchanged. Calculating SoL required no GPU inference.
+- SoL was recalculated for all 33 queries on the CPU on September 11, 2026,
+  from saved labels and corpus rows. The 32 earlier estimates are unchanged
+  to the printed precision. Calculating SoL required no GPU inference.
+- FEV-10 is FEV-5 with one ordinary equality in the join: SUPPORT is asked
+  only of a claim and its own Wikipedia page. It is the only query whose
+  join has an equality. Predicted before its run: 3 to 5 seconds on stock
+  and pipelined vLLM and 4 to 7 on pipelined SGLang, against FEV-5's
+  32.66, 31.73, and 43.43. Measured: Quail 1.68 seconds,
+  stock vLLM 2.97, pipelined vLLM 2.91, and pipelined SGLang
+  3.32, with 187,567, 270,220, 270,220, and
+  267,414 fresh tokens. The [pair-join report](2026-09-11-pair-join.md)
+  records the Quail run and the prediction for the baselines.
 - FEV-9 SoL is 5.821 seconds with shared-prefix reuse,
   compared with 6.337 seconds with reuse only
   within each document. These estimates use reference-label survivors.
@@ -86,9 +97,11 @@ FEV-9 Quail and vLLM manifest on `quail-results`: `/results/benchmarks/quailb/fa
 
 Current FEV-9 SGLang result on `quail-results`: `/results/benchmarks/quailb/families/20260906T222629Z-sglang-suffix-major/fever-sglang-process.json`.
 
-SoL estimates on `quail-results`: `/results/sol/2026-09-06-quailb-prefix-reuse.json`.
+FEV-10 run on `quail-results`: `/results/benchmarks/quailb/family-runs/20260911T201441Z-d16f87d8/` (function call `fc-01M291TJ6YBBJZJVDCVKK0VYP8` for Quail and vLLM, `fc-01M291TJ8RBPP4RP4HW9XQAQ0G` for SGLang).
 
-The FEV-9 recalculation is also saved separately at `/results/sol/2026-09-06-fev9-prefix-reuse.json`.
+SoL estimates on `quail-results`: `/results/sol/2026-09-11-quailb-prefix-reuse.json`.
+
+The FEV-10 estimate is also saved separately at `/results/sol/2026-09-11-fev10-prefix-reuse.json`, and the FEV-9 one at `/results/sol/2026-09-06-fev9-prefix-reuse.json`.
 
 Corpus counts on `quail-results`: `/results/ground_truth/quailb/schema_v1/corpora/c_1aa2c4f0d0b6c816fd37aa5748c33341/manifest.json`.
 
@@ -220,6 +233,7 @@ Figure: plots/quailb_fev.png
 | FEV-7 | c (claims) = 500, e (evidence) = 287, e2 (evidence) = 287 |
 | FEV-8 | c1 (claims) = 500, e1 (evidence) = 287, c2 (claims) = 500, e2 (evidence) = 287 |
 | FEV-9 | c1 (claims) = 500, e1 (evidence) = 287, c2 (claims) = 500, e2 (evidence) = 287 |
+| FEV-10 | c (claims) = 500, e (evidence) = 287 |
 
 | Query | Method | Seconds | Recomputed KV tokens | Fresh input tokens | Throughput | Unit | $/query | Answer agreement (%) | Output precision (%) | Output recall (%) |
 |---|---|---:|---:|---:|---:|---|---:|---:|---:|---:|
@@ -268,6 +282,11 @@ Figure: plots/quailb_fev.png
 | FEV-9 | Pipelined vLLM | 89.80 | 193,312 | 4,593,156 | 2,114.57 | pairs/s | 0.09851 | 67.05 | 2.9055e-06 | 45.455 |
 | FEV-9 | Pipelined SGLang | 135.74 | 33,904 | 4,095,266 | 1,261.21 | pairs/s | 0.14891 | 69.08 | 4.2171e-06 | 45.455 |
 | FEV-9 | SoL estimate | 5.821 | 0 (assumed) | 1,474,838 | 9,857.99 | pairs/s | 0.00639 | Not measured | Not measured | Not measured |
+| FEV-10 | Quail | 1.68 | 0 | 187,567 | 110.12 | pairs/s | 0.00184 | 89.09 | 82.759 | 96.774 |
+| FEV-10 | Stock vLLM | 2.97 | 0 | 270,220 | 63.30 | pairs/s | 0.00326 | 86.67 | 73.78 | 97.581 |
+| FEV-10 | Pipelined vLLM | 2.91 | 0 | 270,220 | 64.60 | pairs/s | 0.00319 | 86.67 | 73.78 | 97.581 |
+| FEV-10 | Pipelined SGLang | 3.32 | 0 | 267,414 | 54.22 | pairs/s | 0.00364 | 89.56 | 75.625 | 97.581 |
+| FEV-10 | SoL estimate | 0.712 | 0 (assumed) | 185,703 | 235.79 | pairs/s | 0.00078 | Not measured | Not measured | Not measured |
 
 ## LEP
 

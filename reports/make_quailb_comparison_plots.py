@@ -33,11 +33,12 @@ Pull the original suite manifest and its four result files:
       "$FAMILIES/20260906T222629Z-sglang-suffix-major/fever-sglang-process.json" \
       "$W/fev9/sglang_update.json"
     mkdir -p "$W/fev10"
+    FEV10=$RUNS/20260911T201441Z-d16f87d8
     uv run modal volume get quail-results \
-      "$RUNS/20260911T200620Z-83b7c8a6/manifest.json" "$W/fev10/manifest.json"
+      "$FEV10/manifest.json" "$W/fev10/manifest.json"
     for method in quail stock_vllm pipelined_vllm pipelined_sglang; do
-      source_path=$(result_path "$W/fev10/manifest.json" "$method")
-      uv run modal volume get quail-results "$source_path" "$W/fev10/$method.json"
+      uv run modal volume get quail-results \
+        "$FEV10/$method/run.json" "$W/fev10/$method.json"
     done
     uv run modal volume get quail-results \
       /sol/2026-09-11-quailb-prefix-reuse.json "$W/sol.json"
@@ -282,7 +283,8 @@ def plot_comparison(title, queries, rows, relations, sol, name, overview=False):
                 "Fresh tokens include recomputed KV. A dash marks zero. "
                 "Stock vLLM uses operator-at-a-time submission.")
             footer_text += (
-                "\nFEV-9 uses the revised SGLang adapter; other SGLang results use "
+                "\nFEV-9 and FEV-10 use the revised SGLang adapter; other SGLang "
+                "results use "
                 "the earlier adapter."
                 if "FEV-9" in queries
                 else "\nSGLang measurements use the earlier adapter.")
@@ -298,6 +300,22 @@ def plot_comparison(title, queries, rows, relations, sol, name, overview=False):
         pdf.savefig(figure, bbox_inches=None)
         plt.close(figure)
     return destination.name
+
+
+def current_row(record):
+    """The one query of a benchmark run.json, shaped like a saved-suite row."""
+    (query,) = record["queries"]
+    measured = query["measurements"]
+    return {
+        "query": query["id"],
+        "wall_s": measured["wall_s"],
+        "fresh_tokens": measured["fresh_tokens"],
+        "regret_tokens": measured["regret_tokens"],
+        "stages": measured["stages"],
+        "backend_metrics": measured["backend_metrics"],
+        "accuracy": query["metrics"]["accuracy"],
+        "input_document_rows": query["metrics"]["accuracy"]["input_document_rows"],
+    }
 
 
 def load_rows(root, fev9_root, fev10_root):
@@ -349,16 +367,17 @@ def load_rows(root, fev9_root, fev10_root):
                      if row["query"] != "FEV-9"}
         rows[key]["FEV-9"] = row
         added = json.loads((fev10_root / f"{key}.json").read_text())
-        assert (added["model"], added["sf"], added["lf"], added["gpus"]) == (
-            "qwen3-4b-fp8", 0.1, 1, 1)
+        configuration = added["metadata"]["configuration"]
+        assert (configuration["model"], added["scale_factor"],
+                configuration["gpus"]) == ("qwen3-4b-fp8", 0.1, 1)
+        assert configuration["backend"] == key
         assert added["corpus_id"] == corpus["corpus_id"]
-        assert added["backend"] == key
-        assert added["ground_truth"]["fever"] == suite["ground_truth"]["fever"]
-        assert (added["aggregate_volume_path"]
-                == fev10_manifest["result_volume_paths"][key])
-        (added_row,) = added["passes"]["single"]["queries"]
+        assert (added["collection_id"]
+                == suite["ground_truth"]["fever"]["collection_id"])
+        assert added["run_id"] == fev10_manifest["run_id"]
+        assert added["queries"][0]["status"] == "complete", added["queries"][0]
+        added_row = current_row(added)
         assert added_row["query"] == "FEV-10"
-        assert "error" not in added_row, added_row
         if key == "pipelined_sglang":
             assert all(step["submission"] == "suffix-major" for step in
                        added_row["backend_metrics"]["steps"]
@@ -424,8 +443,8 @@ def main(workdir, fev9_dir=None, fev10_dir=None):
         "  FEV-9 was rerun on September 6, 2026, with all four methods. FEV-10",
         "  joined the benchmark on September 11, 2026, and was measured that day",
         "  with all four methods.",
-        "  FEV-9 uses SGLang with all anchors submitted per partner, without "
-        "client tiles or request slices.",
+        "  FEV-9 and FEV-10 use SGLang with all anchors submitted per partner, "
+        "without client tiles or request slices.",
         "  Other queries retain historical SGLang measurements with the earlier "
         "adapter.",
         "  The other queries are not new measurements of shared retention.",
@@ -530,8 +549,11 @@ def main(workdir, fev9_dir=None, fev10_dir=None):
         "FEV-9 Quail and vLLM manifest on `quail-results`: "
         f"`{fev9_manifest['manifest_volume_path']}`.", "",
         f"Current FEV-9 SGLang result on `quail-results`: `{sglang_source}`.", "",
-        "FEV-10 manifest on `quail-results`: "
-        f"`{fev10_manifest['manifest_volume_path']}`.", "",
+        "FEV-10 run on `quail-results`: "
+        f"`/results/benchmarks/quailb/family-runs/{fev10_manifest['run_id']}/` "
+        f"(function call `{fev10_manifest['function_call_ids']['fever:quail_vllm']}` "
+        "for Quail and vLLM, "
+        f"`{fev10_manifest['function_call_ids']['fever:sglang']}` for SGLang).", "",
         "SoL estimates on `quail-results`: "
         "`/results/sol/2026-09-11-quailb-prefix-reuse.json`.", "",
         "The FEV-10 estimate is also saved separately at "
