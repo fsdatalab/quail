@@ -33,7 +33,7 @@
     group anchors on the filtered reviews.
   - BIO-3: one filter, then a join with longer documents.
 - Cell: `experiments/cells/streamed_filter_join.py`. Modal function call
-  `FC_PLACEHOLDER`. Results, answer tables, and the prediction as stated
+  `fc-01M27GHD7K71XA6RNX9XEY6XP8`. Results, answer tables, and the prediction as stated
   before the run are on `quail-results` at `/results/ablations/DIR_PLACEHOLDER/`.
 
 ## Prediction
