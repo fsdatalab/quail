@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from quail.backends.request_scheduling import (
+    join_cache_accounting,
     join_regret_tokens,
     run_filter_chain,
     run_filter_chain_async,
@@ -190,3 +191,27 @@ class _ParityClient:
                 prompt_token_ids=ids,
                 num_cached_tokens=ids[0] % 7))
         return outs
+
+
+def test_request_backend_evaluates_listed_pairs_only():
+    prefixes = [[100 + i] * (4 + i) for i in range(3)]
+    suffixes = [[200 + j] * 3 for j in range(4)]
+    pairs = [(0, 1), (0, 3), (2, 0), (2, 2), (2, 3)]
+    for submission in ("anchor-major", "suffix-major"):
+        client = _ParityClient()
+        result = run_join_grouped(client, object(), prefixes, suffixes, {1},
+                                  submission=submission, pairs=pairs)
+        heads = [(p["prompt_token_ids"][0] - 100, p["prompt_token_ids"][-1] - 200)
+                 for p in client.calls[0]]
+        assert sorted(heads) == pairs
+        if submission == "suffix-major":
+            assert heads == sorted(pairs, key=lambda pair: pair[::-1])
+        # answers and cache counts come back in the listed order
+        assert result["answers"] == [
+            1 if (100 + a + 200 + s) % 2 == 0 else 0 for a, s in pairs]
+        assert result["cached_per_request"] == [(100 + a) % 7 for a, _ in pairs]
+    # cache accounting takes one request count per anchor
+    accounting = join_cache_accounting(
+        [[7] * 40, [8] * 40, [9] * 40], [2, 0, 3], [0, 32, 16, 16, 40],
+        [40, 0, 40], 16)
+    assert accounting["regret_tokens"] == (32 - 0) + (32 - 16) + (32 - 16)

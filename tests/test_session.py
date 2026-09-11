@@ -6,9 +6,12 @@ Covers gating, tuple assembly, projection, and the report.
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from fakes import register_claims_evidence
 
 import quail
+from quail.physical import AiJoin
 from quail.planner.plan import EngineConfig
+from quail.runtime.pairs import pair_fraction, pair_table, partner_map
 
 
 def _parquet(path, table):
@@ -244,3 +247,65 @@ def _observed_result(tmp_path, registry):
         "SELECT r.id FROM reviews r WHERE "
         "AI_FILTER(PROMPT('q: {0}', r.review)) LIMIT 1"
     ), make_executor(truth))
+
+
+def test_pair_table_lists_equal_keys_once_each():
+    pairs = pair_table(
+        "c", [pa.array(["u1", "u2", None, "u1"])],
+        "e", [pa.array(["u2", "u1", "u1"])])
+    assert pairs.to_pydict() == {"c": [0, 0, 1, 3, 3], "e": [1, 2, 0, 1, 2]}
+    assert pair_fraction(pairs, 4, 3) == 5 / 12
+    assert partner_map(pairs, "e", "c") == {0: [1], 1: [0, 3], 2: [0, 3]}
+    # two equalities: both key columns must match; integer keys on one
+    # side are cast to the other side's type
+    pairs = pair_table(
+        "c", [pa.array(["u1", "u1"]), pa.array([1, 2])],
+        "e", [pa.array(["u1", "u1"]), pa.array([2, 2], type=pa.int8())])
+    assert pairs.to_pydict() == {"c": [1, 1], "e": [0, 1]}
+
+
+def _pair_query(session, on):
+    query = session.docs("claims").alias("c")
+    partner = session.docs("evidence").alias("e")
+    if on:
+        query = query.join(partner, on=quail.col("c.url") == quail.col("e.url"))
+    else:
+        query = query.join(partner)
+    return query.ai_filter(
+        quail.prompt("Does {1} support {0}?", quail.col("c.claim"),
+                     quail.col("e.text")),
+        selectivity=0.5).select("c.id", "e.id")
+
+
+def test_session_plans_prices_and_ships_the_pair_table():
+    with quail.Session(EngineConfig(),
+                       tokenizer=lambda text: list(text.encode())) as session:
+        register_claims_evidence(session)
+        paired = _pair_query(session, on=True)
+        cross = _pair_query(session, on=False)
+        paired_plan, cross_plan = paired.plan(), cross.plan()
+        paired_stage = paired_plan.graph.nodes_by_type(
+            AiJoin.type_name)[0].stages[0]
+        cross_stage = cross_plan.graph.nodes_by_type(
+            AiJoin.type_name)[0].stages[0]
+        # c1 and c2 pair with e0 and e2, c0 with e1: 5 of 12 pairs
+        assert paired_stage.equalities == (("c", "url", "e", "url"),)
+        assert paired_stage.pair_fraction == 5 / 12
+        assert cross_stage.pair_fraction == 1.0
+        assert paired_stage.expected_tuples == round(
+            cross_stage.expected_tuples * 5 / 12, 1)
+        assert paired_plan.estimated_seconds < cross_plan.estimated_seconds
+        assert "on c.url = e.url" in paired.explain()
+        request = paired._prepare_physical()
+        assert request.pair_tables()[0].to_pydict() == {
+            "c": [0, 1, 1, 2, 2], "e": [1, 0, 2, 0, 2]}
+        assert cross._prepare_physical().relations == {}
+
+        def answer(prompt, assignment):
+            return (assignment["c"] + assignment["e"]) % 2 == 0
+
+        estimate = quail.speed_of_light_estimate(paired, answer)
+        assert estimate.join_pair_evaluations == 5
+        assert estimate.join_stages[0]["passing_pairs"] == 2
+        assert quail.speed_of_light_estimate(
+            cross, answer).join_pair_evaluations == 12

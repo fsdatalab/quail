@@ -5,7 +5,9 @@ from dataclasses import replace
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from fakes import keep_even, register_claims_evidence, two_alias_graph
 
+import quail
 from quail.backends.quail import expected_join_stages
 from quail.builder import col, docs, prompt
 from quail.catalog import Catalog, DocumentProvider
@@ -13,10 +15,16 @@ from quail.physical import (
     AiFilter,
     AiJoin,
     Barrier,
+    Foreign,
+    GraphValidationError,
+    PhysicalGraph,
+    PortRef,
     Scan,
+    validate_streams,
 )
+from quail.physical.base import input_ports
 from quail.planner.decide import explain, filter_cost, order_filters, plan_query
-from quail.planner.plan import Refusal
+from quail.planner.plan import EngineConfig, PlanEditError, Refusal
 from quail.planner.sol import speed_of_light
 from quail.planner.work import Work, ask, scan, triangle
 from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8
@@ -801,3 +809,193 @@ def test_explain_estimates_and_limits(catalog):
             assert f"anchor={node.anchor}" in physical
             for stage in node.stages:
                 assert f"{stage.semantics} ({stage.anchor}, " in physical
+
+
+# ------------------------------------------------ Foreign nodes and streams
+
+
+def _apply_query(session, kind):
+    claims = (session.docs("claims").alias("c")
+              .ai_filter(prompt("about a person: {0}", col("c.claim")),
+                         selectivity=0.5)
+              .apply(keep_even, columns=[col("c.url")], kind=kind))
+    return (claims.join(session.docs("evidence").alias("e"))
+            .ai_filter(prompt("{1} supports {0}", col("c.claim"),
+                              col("e.text")), selectivity=0.5)
+            .select("c.id", "e.id"))
+
+
+def test_planner_places_foreign_nodes_and_keeps_or_drops_the_stream():
+    with quail.Session(EngineConfig(),
+                       tokenizer=lambda text: list(text.encode())) as session:
+        # claims are the long side, so the planner anchors on them
+        register_claims_evidence(session, claim_words=200, text_words=10)
+        per_batch = _apply_query(session, "per_batch").plan()
+        chain = per_batch.graph.node("ai_filter:c")
+        foreign = per_batch.graph.node("apply:keep_even")
+        join = per_batch.graph.nodes_by_type(AiJoin.type_name)[0]
+        assert chain.pin_survivors
+        assert isinstance(foreign, Foreign) and foreign.kind == "per_batch"
+        assert foreign.inputs[0].source == PortRef("ai_filter:c", "ids:c")
+        assert PortRef("apply:keep_even", "ids:c") in {
+            port.source for port in join.inputs}
+        assert "keep_even" in session.registry.functions
+        text = per_batch.graph.explain()
+        assert "Foreign: keep_even (per_batch, drop) on c" in text
+        # a barrier needs every survivor at once: the chain materializes
+        barrier = _apply_query(session, "barrier").plan()
+        assert not barrier.graph.node("ai_filter:c").pin_survivors
+        assert barrier.graph.node("apply:keep_even").kind == "barrier"
+        request = _apply_query(session, "barrier")._prepare_physical()
+        assert request.column_tables()["c"].column_names == ["c", "url"]
+        assert request.column_tables()["c"].column("url").to_pylist()[:2] == [
+            "u0", "u1"]
+
+    with quail.Session(EngineConfig(gpus=2),
+                       tokenizer=lambda text: list(text.encode())) as session:
+        register_claims_evidence(session, claim_words=200, text_words=10)
+        plan = _apply_query(session, "per_batch").plan()
+        assert isinstance(plan, Refusal)
+        assert plan.constraint == "per_batch_apply_needs_one_gpu"
+        assert not isinstance(_apply_query(session, "barrier").plan(), Refusal)
+    with quail.Session(EngineConfig(backend="stock_vllm"),
+                       tokenizer=lambda text: list(text.encode())) as session:
+        register_claims_evidence(session, claim_words=200, text_words=10)
+        plan = _apply_query(session, "barrier").plan()
+        assert isinstance(plan, Refusal)
+        assert plan.constraint == "apply_needs_quail_backend"
+
+
+def test_stream_validator_refuses_a_barrier_on_a_pinned_edge():
+    validate_streams(two_alias_graph(True, foreign=("per_batch", "drop")))
+    validate_streams(two_alias_graph(True, foreign=("per_batch", "pairs")))
+    with pytest.raises(GraphValidationError, match="per-batch apply"):
+        validate_streams(two_alias_graph(True, foreign=("barrier", "drop")))
+    with pytest.raises(GraphValidationError, match="per-batch apply"):
+        validate_streams(two_alias_graph(True, foreign=("barrier", "pairs")))
+    # a pinned chain that no join consumes is refused too
+    graph = two_alias_graph(True)
+    orphan = PhysicalGraph(
+        tuple(node for node in graph.nodes if node.node_id != "group:0")
+        + (graph.node("group:0").with_inputs(input_ports(
+            (PortRef("input:r", "ids:r"), PortRef("input:p", "ids:p")))),),
+        graph.root)
+    with pytest.raises(GraphValidationError, match="no join anchored"):
+        validate_streams(orphan)
+
+
+# ------------------------------------------------ per-node estimates and plan edits
+
+
+def _big_plan(catalog):
+    logical = (docs(catalog, "reviews", tok).alias("r")
+               .ai_filter(prompt("negative: {0}", col("r.review")),
+                          selectivity=0.5)
+               .ai_join(docs(catalog, "products", tok).alias("p"),
+                        prompt("about {0} {1}", col("r.review"),
+                               col("p.description")), selectivity=0.1)
+               .select("r.id", "p.asin"))
+    return logical, plan_query(
+        logical, model=QWEN3_4B_FP8, device=H100_SXM,
+        doc_tokens={"r": [400] * 20000, "p": [20] * 10})
+
+
+def test_node_ids_estimates_and_the_recompute_column(catalog):
+    logical, plan = _big_plan(catalog)
+    assert [node.node_id for node in plan.nodes] == [
+        "scan:r", "scan:p", "ai_filter:r", "ai_join:r", "project"]
+    chain = plan.graph.node("ai_filter:r")
+    assert chain.pin_survivors
+    seconds = {node_id: entry["seconds"]
+               for node_id, entry in plan.estimates.items()
+               if "seconds" in entry}
+    assert set(seconds) == {"ai_filter:r", "ai_join:r"}
+    # each node priced alone: the parts add up to at least the packed
+    # whole, and to no more than three times it
+    assert plan.estimated_seconds <= sum(seconds.values()) \
+        <= 3 * plan.estimated_seconds
+    # 10,000 expected survivors of 400 tokens do not fit the retention
+    # pool, so releasing the chain's KV would recompute most of them
+    recompute = plan.estimates["ai_filter:r"]
+    assert recompute["release_recompute_tokens"] > 0.9 * 10000 * 401
+    assert recompute["release_recompute_seconds"] > 0
+    text = explain(logical, plan)
+    assert "estimated_seconds=" in text
+    assert "if the KV were released here instead of pinned" in text
+    assert "do not add up to the plan estimate" in text
+
+    # a Barrier on the pinned edge turns the pin off; the chain keeps
+    # its survivors in the pool and the recompute becomes expected
+    edited = plan.insert(
+        Barrier(node_id="barrier:r", next_anchor="r", aliases=("r",)),
+        between=("ai_filter:r", "ai_join:r"))
+    assert [node.node_id for node in edited.nodes] == [
+        "scan:r", "scan:p", "ai_filter:r", "barrier:r", "ai_join:r", "project"]
+    new_chain = edited.graph.node("ai_filter:r")
+    assert not new_chain.pin_survivors and new_chain.keep_kv
+    assert new_chain.hold_tokens == 0
+    assert edited.graph.node("barrier:r").inputs[0].source.node_id == "ai_filter:r"
+    assert [port.source.node_id for port in edited.graph.node("ai_join:r").inputs] == [
+        "barrier:r", "scan:p"]
+    # unpinned, a survivor holds no frame room, so a few more fit
+    assert edited.estimates["ai_filter:r"]["release_recompute_tokens"] == \
+        pytest.approx(recompute["release_recompute_tokens"], rel=0.01)
+    assert "expected recompute at the join" in explain(logical, edited)
+    # the edited plan's total carries the recompute the edit causes
+    assert edited.estimated_seconds == pytest.approx(
+        plan.estimated_seconds
+        + edited.estimates["ai_filter:r"]["release_recompute_seconds"])
+    # the input plan is untouched, and remove gives the plan back
+    assert plan.graph.node("ai_filter:r").pin_survivors
+    assert edited.remove("barrier:r") == plan
+    moved = edited.move("barrier:r", between=("scan:r", "ai_filter:r"))
+    assert [node.node_id for node in moved.nodes][:4] == [
+        "scan:r", "scan:p", "barrier:r", "ai_filter:r"]
+    assert moved.graph.node("ai_filter:r").pin_survivors
+
+
+def test_refused_edits_name_their_rule(catalog):
+    _, plan = _big_plan(catalog)
+    barrier = Barrier(node_id="barrier:r", next_anchor="r", aliases=("r",))
+    with pytest.raises(PlanEditError, match="exactly one edge"):
+        plan.insert(barrier, between=("scan:p", "ai_filter:r"))
+    with pytest.raises(PlanEditError, match="no node 'nowhere'"):
+        plan.insert(barrier, between=("nowhere", "ai_join:r"))
+    with pytest.raises(PlanEditError, match="exactly one output of type"):
+        plan.insert(Barrier(node_id="barrier:rp", next_anchor="r",
+                            aliases=("r", "p")),
+                    between=("ai_filter:r", "ai_join:r"))
+    with pytest.raises(PlanEditError, match="already has a node"):
+        plan.insert(Barrier(node_id="ai_join:r", next_anchor="r",
+                            aliases=("r",)),
+                    between=("ai_filter:r", "ai_join:r"))
+    with pytest.raises(PlanEditError, match="would change what the query"):
+        plan.remove("ai_filter:r")
+    with pytest.raises(PlanEditError, match="no node 'barrier:r'"):
+        plan.remove("barrier:r")
+    # a per-batch Foreign keeps the pin; a barrier Foreign drops it
+    per_batch = Foreign(node_id="apply:keep", function="keep", kind="per_batch",
+                        ids="drop", aliases=("r",))
+    kept = plan.insert(per_batch, between=("ai_filter:r", "ai_join:r"))
+    assert kept.graph.node("ai_filter:r").pin_survivors
+    dropped = plan.insert(
+        Foreign(node_id="apply:keep", function="keep", kind="barrier",
+                ids="drop", aliases=("r",)),
+        between=("ai_filter:r", "ai_join:r"))
+    assert not dropped.graph.node("ai_filter:r").pin_survivors
+    assert kept.remove("apply:keep") == plan
+
+
+def test_plan_walkthrough_demo_prints_the_same_row_from_every_plan():
+    import io
+    from contextlib import redirect_stdout
+
+    from demos import plan_walkthrough
+
+    out = io.StringIO()
+    with redirect_stdout(out):
+        plan_walkthrough.main()
+    text = out.getvalue()
+    assert text.count("[{'c.id': 'c0', 'e.id': 'e0'}]") == 3
+    assert "'ai_filter:c', 'barrier:c', 'ai_join:c'" in text
+    assert "PlanEditError" in text

@@ -3,6 +3,7 @@
 import random
 
 import pytest
+from fakes import expected_filter_rows, run_streamed
 
 from quail.executor.pack import (
     FilterAdmission,
@@ -601,3 +602,140 @@ def test_filter_admission_without_stored_kv():
     assert len(sched.survivors()) >= limit
     assert admitted < n_docs
     assert sched.free_pages is None and not sched.resident
+
+
+# ------------------------------------------------ the chain streamed into the join
+
+
+def _check_stream(out, filter_truth, pages):
+    stream = out["stream"]
+    assert stream.done
+    assert stream.answers == expected_filter_rows(filter_truth)
+    survivors = [d for d, truth in enumerate(filter_truth) if all(truth)]
+    assert sorted(stream.held) == survivors
+    assert out["anchor_keys"] == [("r", d) for d in stream.held]
+    assert not out["arena"].accounting.owned
+    assert out["arena"].accounting.free_pages == pages
+    return survivors
+
+
+def test_streamed_filter_feeds_the_join_and_frees_everything(monkeypatch):
+    rng = random.Random(7)
+    n_docs, n_partners = 60, 5
+    doc_lengths = [rng.randrange(20, 90) for _ in range(n_docs)]
+    filter_truth = [[1 if rng.random() < 0.8 else 0, 1 if rng.random() < 0.7 else 0]
+                    for _ in range(n_docs)]
+    partner_lengths = [rng.randrange(5, 20) for _ in range(n_partners)]
+    join_truth = {("r", d): [1 if rng.random() < 0.5 else 0
+                             for _ in range(n_partners)]
+                  for d in range(n_docs)}
+    # the arena holds about a dozen documents: the filter blocks on
+    # pages before the corpus is through, and the join has to drain
+    out = run_streamed(
+        monkeypatch, doc_lengths=doc_lengths, filter_truth=filter_truth,
+        partner_lengths=partner_lengths, join_truth=join_truth,
+        budget=400, pages=80)
+    survivors = _check_stream(out, filter_truth, 80)
+    # every survivor's row answered from the planted truth, in
+    # admission order
+    rows = out["join_answers"][0]
+    assert sorted(rows) == list(range(len(survivors)))
+    for local, key in enumerate(out["anchor_keys"]):
+        assert rows[local] == join_truth[key]
+        assert out["settled"][key] == join_truth[key]
+    # join chunks ran before the chain finished, and the chain reported
+    # a page shortfall at least once
+    kinds = [kind for kind, _ in out["model"].launched]
+    assert "join" in kinds[:-1] and kinds[-1] == "join"
+    assert kinds.index("join") < len(kinds) - 1 - kinds[::-1].index("filter")
+    assert any(out["blocked"])
+    # streamed anchors pack the frame and partner suffixes only
+    assert out["join_tokens"] == sum(
+        3 + sum(partner_lengths) for _ in survivors)
+
+
+def test_streamed_loop_random_shapes(monkeypatch):
+    rng = random.Random(11)
+    for _ in range(25):
+        n_docs = rng.randrange(1, 40)
+        n_partners = rng.randrange(0, 6)
+        stages = rng.randrange(1, 4)
+        doc_lengths = [rng.randrange(8, 120) for _ in range(n_docs)]
+        filter_truth = [[1 if rng.random() < 0.7 else 0
+                         for _ in range(stages)] for _ in range(n_docs)]
+        partner_lengths = [rng.randrange(4, 30) for _ in range(n_partners)]
+        join_truth = {("r", d): [1 if rng.random() < 0.5 else 0
+                                 for _ in range(n_partners)]
+                      for d in range(n_docs)}
+        frame_tokens = rng.randrange(0, 20)
+        budget = max(doc_lengths) + 1 + rng.randrange(0, 400)
+        budget = max(budget, frame_tokens + max(partner_lengths, default=0))
+        pages = max(-(-(max(doc_lengths) + max(1, frame_tokens)) // 16),
+                    rng.randrange(6, 40))
+        out = run_streamed(
+            monkeypatch, doc_lengths=doc_lengths, filter_truth=filter_truth,
+            partner_lengths=partner_lengths, join_truth=join_truth,
+            budget=budget, pages=pages, frame_tokens=frame_tokens,
+            stages=stages)
+        survivors = _check_stream(out, filter_truth, pages)
+        if n_partners:
+            rows = out["join_answers"][0]
+            assert sorted(rows) == list(range(len(survivors)))
+            for local, key in enumerate(out["anchor_keys"]):
+                assert rows[local] == join_truth[key]
+        else:
+            assert out["join_answers"] == [{}]
+            assert set(out["settled"]) == set(out["anchor_keys"])
+
+
+def test_streamed_join_over_pairs_packs_only_allowed_partners(monkeypatch):
+    rng = random.Random(11)
+    n_docs, n_partners = 30, 6
+    doc_lengths = [rng.randrange(8, 30) for _ in range(n_docs)]
+    filter_truth = [[1 if rng.random() < 0.8 else 0,
+                     1 if rng.random() < 0.7 else 0] for _ in range(n_docs)]
+    partner_lengths = [rng.randrange(5, 20) for _ in range(n_partners)]
+    join_truth = {("r", d): [1 if rng.random() < 0.5 else 0
+                             for _ in range(n_partners)] for d in range(n_docs)}
+    # document d pairs with the partners i where d + i is a multiple
+    # of 4; every seventh document pairs with none
+    allowed = {d: [i for i in range(n_partners)
+                   if (d + i) % 4 == 0 and d % 7 != 3]
+               for d in range(n_docs)}
+    run = run_streamed(
+        monkeypatch, doc_lengths=doc_lengths, filter_truth=filter_truth,
+        partner_lengths=partner_lengths, join_truth=join_truth,
+        budget=400, pages=40,
+        anchor_partners=lambda key: [allowed[key[1]]])
+    survivors = _check_stream(run, filter_truth, 40)
+    for local, key in enumerate(run["anchor_keys"]):
+        expected = [join_truth[key][i] for i in allowed[key[1]]]
+        assert run["settled"][key] == expected
+        assert run["join_answers"][0].get(local, []) == expected
+    # every streamed anchor packs the frame plus its own partners only;
+    # an anchor with no partner packs nothing and is settled at once
+    assert run["join_tokens"] == sum(
+        3 + sum(partner_lengths[i] for i in allowed[d])
+        for d in survivors if allowed[d])
+    assert any(not allowed[d] for d in survivors)
+
+
+def test_join_admission_admits_incrementally_and_prices_room():
+    sched = JoinAdmission([], [[10, 10, 10]], 100, 50, 16,
+                          frame_tokens=[5])
+    assert sched.done()
+    assert sched.buildable_tokens() == 0
+    first = sched.admit(40, resident_pages=3)
+    assert first == 0
+    assert sched.buildable_tokens() == 5 + 30
+    second = sched.admit(80)
+    assert second == 1
+    assert sched.buildable_tokens() == 100
+    groups = sched.next_chunk(free_pages=50)
+    assert groups[0] == (0, 0, 0, 3, False)
+    assert sched.report(0, 0, 0, 3, [0, 1, 0]) == [("finished", 0)]
+    # the resident anchor packed no prefix; the fresh one still waits
+    # for chunk room and counts its prefix as buildable work
+    assert sched.buildable_tokens() == 100
+    with pytest.raises(ValueError):
+        sched.admit(5000)

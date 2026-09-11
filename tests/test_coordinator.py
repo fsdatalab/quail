@@ -1,5 +1,7 @@
 """Tests for the coordinator's round splitting, merging, gating, and thinning."""
 
+import pyarrow as pa
+
 from quail.backends.quail.coordinator import (
     filter_node_payloads,
     gate_group,
@@ -8,6 +10,7 @@ from quail.backends.quail.coordinator import (
     merge_join_round,
     thin_survivors,
 )
+from quail.execution import join_answer_cells
 from quail.physical import AiFilter
 
 
@@ -227,3 +230,47 @@ def test_join_merge_gates_and_live_rows():
     assert merged[1]["anchor_index"] == [0, 4, 3]
     assert merged[1]["rows"] == {0: [0, 1, 1], 2: [1, 0, 0]}
     assert merged[1]["partner_index"] == [[0], [1], [2]]
+
+
+def test_coordinator_ships_and_merges_per_anchor_partner_lists():
+    # merged rows keep each anchor's own member list
+    outs = [
+        dict(joins=[dict(rows={0: [1], 1: [0, 1]}, anchor_index=[0, 4],
+                         partner_index=[[1], [2], [3]],
+                         anchor_partners={0: [2], 1: [0, 1]})],
+             fresh_tokens=1, wall_s=1.0),
+        dict(joins=[dict(rows={0: [1, 0]}, anchor_index=[3],
+                         partner_index=[[1], [2], [3]],
+                         anchor_partners={0: [1, 2]})],
+             fresh_tokens=1, wall_s=1.0),
+    ]
+    merged = merge_join_round(outs)[0]
+    assert merged["anchor_partners"] == {0: [2], 1: [0, 1], 2: [1, 2]}
+    assert list(join_answer_cells(merged)) == [
+        (0, 2, 1), (1, 0, 0), (1, 1, 1), (2, 1, 1), (2, 2, 0)]
+    # thinning reads the member list: anchor 0 matched partner 3
+    # (member 2), anchor 4 matched partner 2, anchor 3 matched partner 2
+    merged.update(anchor="r", partners=["p"])
+    survivors = {"r": [0, 3, 4], "p": [1, 2, 3]}
+    thin_survivors([merged], survivors)
+    assert survivors == {"r": [0, 3, 4], "p": [2, 3]}
+
+    # the payload of a pair stage carries each worker's anchors with
+    # their live partner rows only
+    pairs = pa.table({"r": pa.array([0, 0, 2, 3, 5], pa.int32()),
+                      "p": pa.array([0, 3, 1, 2, 3], pa.int32())})
+    payload = dict(
+        model="qwen3-4b-fp8", chunk_tokens=1000, true_ids=[1],
+        false_ids=[2], pre_ids=[9], filter_limit=None,
+        docs={"r": [[i] * (10 + i) for i in range(6)],
+              "p": [[i] * 5 for i in range(4)]},
+        filters={"r": [[7, 7]]}, physical_plan={}, pairs={0: pairs},
+        shards={"r": ((0, 2, 4), (1, 3, 5))})
+    group = [dict(anchor="r", partners=["p"], semantics="full",
+                  written_pos=0, equalities=[["r", "k", "p", "k"]],
+                  labels={"p": [2]}, frame=[8], tail=[3])]
+    subs = join_group_payloads(payload, 2, {"r": [0, 2, 3, 5], "p": [1, 3]},
+                               group)
+    assert [sub["anchor_index"] for sub in subs] == [[0, 2], [3, 5]]
+    assert [sub["pairs"] for sub in subs] == [
+        {0: {0: [3], 2: [1]}}, {0: {3: [], 5: [3]}}]

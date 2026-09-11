@@ -3,16 +3,20 @@
 import itertools
 
 import pyarrow as pa
+import pytest
+from fakes import same_page
 from test_quail_backend import graph_state
 
 import quail
 from quail.backends.quail.graph import execute_single_graph, filter_result
 from quail.bench import quailb
+from quail.builder import col, prompt
 from quail.execution import PhysicalResponse
-from quail.physical import AiFilter, AiJoin, Scan, decode_graph
+from quail.physical import AiFilter, AiJoin, Barrier, Scan, decode_graph
 from quail.planner.plan import EngineConfig
 from quail.runtime.execute import execute_query
 from quail.runtime.runner import NodeMetrics, NodeResult, SurvivorStream
+from quail.runtime.session import RefusalError
 from quail_b import prompts
 from quail_b.queries import FILTER_SELECTIVITY_ESTIMATES
 
@@ -273,11 +277,59 @@ def _fever_children(session, docs, count):
     return children
 
 
-def test_fev10_asks_the_model_about_same_page_pairs_only(monkeypatch):
-    """FEV-10 on one GPU and on two: the join runs over the pair table."""
+def fever_executor(session, monkeypatch, gpus, check=None, capacity=1):
+    """A physical executor over the FEVER fakes.
+
+    Args:
+        session: Its registry decodes the plan and holds the functions.
+        monkeypatch: Turns the child boot off on two GPUs.
+        gpus: One runs the graph in process; two runs the coordinator.
+        check: Called with the request and its decoded graph before the
+            run; returns extra state entries (a pair table, columns).
+        capacity: Documents the fake model keeps resident.
+    """
     from quail.backends.quail import worker
     from quail.backends.quail.distributed import execute_distributed_graph
     from quail.specs import H100_SXM, QWEN3_4B_FP8
+
+    def execute(request):
+        graph = decode_graph(request.plan["graph"], session.registry.codecs)
+        docs = {node.alias: request.inputs[node.input_id].documents
+                for node in graph.nodes if isinstance(node, Scan)}
+        extra = check(request, graph) if check else {}
+        if gpus == 1:
+            state = graph_state(None, docs)
+            state["model_execution"] = FixedFeverAnswers(state, capacity, False)
+            state.update(extra, functions=session.registry.functions)
+            report = execute_single_graph(state, request.plan["settings"], graph)
+            assert not state["arena"].accounting.owned
+            return PhysicalResponse(report.pop("_outputs"), report)
+        children = _fever_children(session, docs, 2)
+
+        def round_fn(kind, subs):
+            function = (worker._child_filters if kind == "filters"
+                        else worker._child_joins)
+            return [function(state, sub) for state, sub in zip(children, subs)]
+
+        monkeypatch.setattr(worker, "_child_boot", lambda state, sub: None)
+        report = execute_distributed_graph(
+            {**request.plan["settings"], "model": "qwen3-4b-fp8",
+             "docs": docs, **extra, "physical_plan": request.plan},
+            graph, 2, round_fn, QWEN3_4B_FP8, H100_SXM,
+            session.registry.runtimes, session.registry,
+        )
+        assert all(not child["arena"].accounting.owned for child in children)
+        return PhysicalResponse(report.pop("_outputs"), report)
+
+    return execute
+
+
+def test_fev10_asks_the_model_about_same_page_pairs_only(monkeypatch):
+    """FEV-10 on one GPU and on two: the join runs over the pair table."""
+    def check(request, graph):
+        pairs = request.pair_tables()
+        assert pairs[0].to_pydict() == {"c": [0, 1, 2], "e": [0, 0, 2]}
+        return {"pairs": pairs}
 
     for gpus in (1, 2):
         with quail.Session(EngineConfig(gpus=gpus),
@@ -287,41 +339,9 @@ def test_fev10_asks_the_model_about_same_page_pairs_only(monkeypatch):
             (stage,) = query.plan().graph.nodes_by_type(AiJoin.type_name)[0].stages
             assert stage.equalities == (("c", "evidence_wiki_url", "e", "id"),)
             assert stage.pair_fraction == 3 / 9
-
-            def execute(request):
-                graph = decode_graph(request.plan["graph"], session.registry.codecs)
-                docs = {node.alias: request.inputs[node.input_id].documents
-                        for node in graph.nodes if isinstance(node, Scan)}
-                pairs = request.pair_tables()
-                assert pairs[0].to_pydict() == {"c": [0, 1, 2], "e": [0, 0, 2]}
-                if gpus == 1:
-                    state = graph_state(None, docs)
-                    state["model_execution"] = FixedFeverAnswers(state, 1, False)
-                    state["pairs"] = pairs
-                    report = execute_single_graph(
-                        state, request.plan["settings"], graph)
-                    assert not state["arena"].accounting.owned
-                    return PhysicalResponse(report.pop("_outputs"), report)
-                children = _fever_children(session, docs, 2)
-
-                def round_fn(kind, subs):
-                    function = (worker._child_filters if kind == "filters"
-                                else worker._child_joins)
-                    return [function(state, sub)
-                            for state, sub in zip(children, subs)]
-
-                monkeypatch.setattr(worker, "_child_boot", lambda state, sub: None)
-                report = execute_distributed_graph(
-                    {**request.plan["settings"], "model": "qwen3-4b-fp8",
-                     "docs": docs, "pairs": pairs, "physical_plan": request.plan},
-                    graph, 2, round_fn, QWEN3_4B_FP8, H100_SXM,
-                    session.registry.runtimes, session.registry,
-                )
-                assert all(not child["arena"].accounting.owned
-                           for child in children)
-                return PhysicalResponse(report.pop("_outputs"), report)
-
-            result = execute_query(query, physical_executor=execute)
+            result = execute_query(
+                query, physical_executor=fever_executor(session, monkeypatch, gpus,
+                                                        check))
             # the filters keep c0, c1, e0, e1; the pairs on those are
             # (c0, e0) and (c1, e0); only c0 is supported by e0. The
             # cross join would also have asked about (c0, e1) and
@@ -330,6 +350,94 @@ def test_fev10_asks_the_model_about_same_page_pairs_only(monkeypatch):
             assert sorted(zip(answers.column("c").to_pylist(),
                               answers.column("e").to_pylist())) == [(0, 0), (1, 0)]
             assert result.collect().to_pylist() == [{"c.id": "c0", "e.id": "e0"}]
+
+
+def _fev10_by_apply(session, kind):
+    claims = (session.docs("claims").alias("c")
+              .ai_filter(prompt(prompts.F11, col("c.claim")),
+                         selectivity=0.5))
+    evidence = (session.docs("evidence").alias("e")
+                .ai_filter(prompt(prompts.F13, col("e.text")),
+                           selectivity=0.5))
+    return (claims.join(evidence)
+            .apply(same_page, columns=[col("c.evidence_wiki_url"),
+                                       col("e.id")], kind=kind)
+            .ai_filter(prompt(prompts.SUPPORT, col("c.claim"), col("e.text")),
+                       selectivity=0.5)
+            .select("c.id", "e.id"))
+
+
+def test_fev10_written_with_apply_matches_the_equality(monkeypatch):
+    def check(request, graph):
+        assert request.pair_tables() == {}
+        columns = request.column_tables()
+        assert columns["c"].column("evidence_wiki_url").to_pylist() == [
+            "e0", "e0", "e2"]
+        return {"columns": columns}
+
+    for gpus, kind in ((1, "per_batch"), (1, "barrier"), (2, "barrier")):
+        with quail.Session(EngineConfig(gpus=gpus),
+                           tokenizer=lambda text: list(text.encode())) as session:
+            register_fever(session)
+            query = _fev10_by_apply(session, kind)
+            plan = query.plan()
+            (join,) = plan.graph.nodes_by_type(AiJoin.type_name)
+            (stage,) = join.stages
+            assert stage.pairs_from == "same_page" and not stage.equalities
+            # the anchor's chain streams only when the function runs per
+            # batch; a barrier needs every survivor first
+            chain = next(node for node in plan.nodes
+                         if isinstance(node, AiFilter)
+                         and node.alias == join.anchor)
+            assert chain.pin_survivors is (kind == "per_batch")
+            result = execute_query(
+                query, physical_executor=fever_executor(session, monkeypatch, gpus,
+                                                        check))
+            answers = result.answer_tables["joins"][0]
+            assert sorted(zip(answers.column("c").to_pylist(),
+                              answers.column("e").to_pylist())) == [(0, 0), (1, 0)]
+            assert result.collect().to_pylist() == [{"c.id": "c0", "e.id": "e0"}]
+
+    with quail.Session(EngineConfig(gpus=2),
+                       tokenizer=lambda text: list(text.encode())) as session:
+        register_fever(session)
+        with pytest.raises(RefusalError):
+            execute_query(_fev10_by_apply(session, "per_batch"),
+                          physical_executor=lambda request: None)
+
+
+def test_an_edited_fev9_plan_executes(monkeypatch):
+    with quail.Session(EngineConfig(),
+                       tokenizer=lambda text: list(text.encode())) as session:
+        register_fever(session)
+        query = quailb.queries(session)["FEV-9"][1]()
+        plan = query.plan()
+        chain = next(node for node in plan.nodes
+                     if isinstance(node, AiFilter) and node.pin_survivors)
+        join = next(node for node in plan.nodes
+                    if isinstance(node, AiJoin) and node.anchor == chain.alias)
+        edited = plan.insert(
+            Barrier(node_id=f"barrier:{chain.alias}", next_anchor=chain.alias,
+                    aliases=(chain.alias,)),
+            between=(chain.node_id, join.node_id))
+        assert not edited.graph.node(chain.node_id).pin_survivors
+        assert edited != plan
+
+        seen = []
+
+        def check(request, graph):
+            seen.append([node.node_id for node in graph.nodes])
+            return {}
+
+        execute = fever_executor(session, monkeypatch, 1, check, capacity=10)
+        rows = execute_query(query, physical_executor=execute).collect()
+        edited_result = execute_query(
+            quailb.queries(session)["FEV-9"][1](), physical_executor=execute,
+            plan=edited)
+        assert f"barrier:{chain.alias}" in seen[1]
+        assert f"barrier:{chain.alias}" not in seen[0]
+        assert edited_result.collect().to_pylist() == rows.to_pylist() == [{
+            "c1.id": "c0", "e1.id": "e0", "c2.id": "c1", "e2.id": "e1"}]
 
 
 def test_retention_search_matches_enumeration():

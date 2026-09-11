@@ -3,11 +3,13 @@
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from fakes import keep_even, same_key
 
 from quail.builder import col, docs, prompt
 from quail.catalog import Catalog, DocumentProvider
 from quail.logical import (
     SHARED_PRE,
+    Apply,
     ColumnRef,
     CompileError,
     Join,
@@ -15,6 +17,7 @@ from quail.logical import (
     Scan,
     SemanticFilter,
     SemanticJoin,
+    join_applies,
     join_conditions,
     join_outer_input,
 )
@@ -390,8 +393,6 @@ def test_join_on_equality_prunes_the_pairs(catalog):
     assert where_plan == plan
 
     cases = [
-        ("SELECT r.id FROM reviews r JOIN products p ON r.id = p.asin",
-         "no AI predicate"),
         ("SELECT r.id FROM reviews r JOIN products p ON r.id < p.asin "
          "AND AI_FILTER(PROMPT('x {0} {1}', r.review, p.description))",
          "column = column"),
@@ -537,3 +538,49 @@ REJECTED = [
     ("SELECT r.id FROM reviews r WHERE r.id IN (SELECT p.asin FROM "
      "products p)", "subquer"),
 ]
+
+
+def test_builder_places_apply_nodes_in_the_logical_tree():
+    cat = Catalog()
+    cat.register("claims", DocumentProvider.from_table(pa.table({
+        "id": ["c0", "c1"], "claim": ["a b", "c d"], "url": ["u", "v"]}),
+        id_col="id"))
+    cat.register("evidence", DocumentProvider.from_table(pa.table({
+        "id": ["u", "v"], "text": ["e f", "g h"]}), id_col="id"))
+    plan = (docs(cat, "claims", tok).alias("c")
+            .ai_filter(prompt("about a person: {0}", col("c.claim")))
+            .apply(keep_even, columns=[col("c.url")])
+            .join(docs(cat, "evidence", tok).alias("e"))
+            .apply(same_key, columns=[col("c.url"), col("e.id")],
+                   kind="barrier")
+            .ai_filter(prompt("{1} supports {0}", col("c.claim"),
+                              col("e.text")))
+            .select("c.id", "e.id"))
+    join = plan.root.input
+    assert isinstance(join, SemanticJoin)
+    (pairs,) = join_applies(join)
+    assert (pairs.function, pairs.kind, pairs.ids, pairs.written_pos) == (
+        "same_key", "barrier", "pairs", 0)
+    assert pairs.aliases == ("c", "e")
+    assert isinstance(pairs.input, Join)
+    chain = pairs.input.left
+    assert isinstance(chain, Apply)
+    assert (chain.function, chain.kind, chain.ids, chain.aliases) == (
+        "keep_even", "per_batch", "drop", ("c",))
+    assert isinstance(chain.input, SemanticFilter)
+    assert [str(ref.column) for ref in chain.columns] == ["url"]
+
+    base = docs(cat, "claims", tok).alias("c")
+    with pytest.raises(CompileError, match="must work on one table"):
+        base.apply(keep_even)
+    with pytest.raises(CompileError, match="needs a name for a lambda"):
+        base.apply(lambda tables: [], columns=[col("c.url")])
+    with pytest.raises(CompileError, match="returning pairs follows join"):
+        base.apply(keep_even, columns=[col("c.url")], ids="pairs")
+    with pytest.raises(CompileError, match="already used by another"):
+        (base.apply(keep_even, columns=[col("c.url")])
+         .apply(same_key, columns=[col("c.url")], name="keep_even"))
+    with pytest.raises(CompileError, match="ids must be 'pairs'"):
+        (docs(cat, "claims", tok).alias("c")
+         .join(docs(cat, "evidence", tok).alias("e"))
+         .apply(same_key, columns=[col("c.url")], ids="preserve"))
