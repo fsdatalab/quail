@@ -346,6 +346,14 @@ def test_load_benchmark_with_local_reference_labels(tmp_path):
         benchmark.run(
             wrong_id, queries=["IMDB-1"], output_dir=tmp_path / "bad",
             root=tmp_path, collection_id=collection_id)
+
+    def repeated_row(query, tables):
+        return RunOutput(None, None, pa.table({"r": ["r0", "r0"]}), runtime_s=2.0)
+
+    with pytest.raises(ValueError, match="duplicate document IDs"):
+        benchmark.run(
+            repeated_row, queries=["IMDB-1"], output_dir=tmp_path / "repeated",
+            root=tmp_path, collection_id=collection_id)
     failed = json.loads((tmp_path / "bad/run.json").read_text())
     assert failed["queries"][0]["status"] == "scoring_failed"
     assert (tmp_path / "bad/IMDB-1/rows.parquet").exists()
