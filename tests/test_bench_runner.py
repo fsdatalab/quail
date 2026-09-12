@@ -315,9 +315,6 @@ def test_benchmark_results_and_scoring(tmp_path):
         "filter", "join"
     ]
     assert output.rows.num_rows == 0
-    # the pieces name the session's tokenizer and every stage; QUAIL-B
-    # sets the fake run's 1,000 fresh tokens against the minimum its
-    # requests needed, derived from the answer tables
     from quail_b.minimum import DocumentTokens, token_metrics
 
     pieces = output.prompt_pieces

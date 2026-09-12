@@ -130,8 +130,6 @@ def test_request_backends_plan_validate_and_execute(monkeypatch):
         assert result.count() == 0
         session.close()
 
-        # an equality join: the request carries the key columns, and
-        # the model sees only the pairs whose keys are equal
         session = quail.Session(
             EngineConfig(backend="stock_vllm"), tokenizer=_tokens)
         session.register("docs", quail.DocumentProvider.from_table(pa.table({
