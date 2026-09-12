@@ -186,11 +186,12 @@ lives under `reports/plots/` with its `make_<slug>_plots.py` in
     needed with unlimited KV, where every distinct prefix across the
     requests is computed once: each document once, each question tail
     and anchor frame once per document, and each pair's partner suffix
-    after its anchor. `quail.runtime.minimum` derives it from the saved
-    answer tables on the CPU after the run; the benchmark runner records
-    it and `quail.bench.restate` recomputes it for saved runs. Track
-    nothing in the engine loop. A run saved without a minimum shows as
-    not measured, never as zero.
+    after its anchor. quail-bench derives it (`quail_b.minimum`) from
+    the saved answer tables on the CPU after the run, from the prompt
+    token pieces Quail's runner reports with each result; `quail-b
+    report` recomputes it for saved runs. Track nothing in the engine
+    loop. A run saved without a minimum shows as not measured, never as
+    zero.
   - Total fresh input tokens computed across the query (`fresh_tokens`).
     A fresh token is an input token position processed by a model forward
     pass instead of read from existing KV. Count repeated computation again.

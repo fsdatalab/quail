@@ -94,10 +94,10 @@ def recomputed_kv(row):
 
     Regret is fresh tokens minus the fewest the run's requests needed
     with unlimited KV, derived from the saved answer tables by
-    `quail.bench.restate`. A run saved without that minimum has no
+    quail-bench's scoring. A run saved without that minimum has no
     figure.
     """
-    return row["regret_tokens"] if "minimum_tokens" in row else None
+    return row.get("regret_tokens")
 
 
 def token_cell(value):
@@ -349,8 +349,8 @@ def current_row(query):
         "query": query["id"],
         "wall_s": measured["wall_s"],
         "fresh_tokens": measured["fresh_tokens"],
-        **{key: measured[key] for key in ("minimum_tokens", "regret_tokens")
-           if key in measured},
+        **{key: query["metrics"][key] for key in ("minimum_tokens", "regret_tokens")
+           if query["metrics"].get(key) is not None},
         "stages": measured["stages"],
         "backend_metrics": measured["backend_metrics"],
         "accuracy": query["metrics"]["accuracy"],
@@ -627,9 +627,9 @@ def main(workdir, fev9_dir=None, fev10_dir=None, quail_dirs=()):
         "- Recomputed KV is `regret_tokens`: fresh tokens minus the fewest input",
         "  tokens the run's requests needed with unlimited KV, where every",
         "  distinct prefix across the requests is computed once. It is derived",
-        "  on the CPU after the run from the saved answer tables",
-        "  (`quail.runtime.minimum`, run by `quail.bench.restate`); the engine",
-        "  tracks nothing. A run saved without that minimum is not measured.",
+        "  on the CPU after the run from the saved answer tables by quail-bench's",
+        "  scoring (`quail_b.minimum`); the engine tracks nothing. A run saved",
+        "  without that minimum is not measured.",
         "  Token and latency plots use a log scale when positive values span more",
         "  than one order of magnitude. Recomputed KV retains a linear region to",
         "  include zero. A dash marks zero.",

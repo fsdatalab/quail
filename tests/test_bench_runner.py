@@ -10,8 +10,9 @@ import quail
 from quail.bench.quailb import (
     answer_oracle,
     build_query,
+    join_anchors,
+    prompt_pieces,
     queries,
-    regret_measurements,
     run_output,
 )
 from quail.catalog import DocumentProvider
@@ -121,6 +122,10 @@ def fever_truth():
     return corpus, truth
 
 
+def _token_ids(text):
+    return [byte + 1 for byte in text.encode("utf-8")]
+
+
 def _session(tmp_path, backend="quail"):
     pq.write_table(pa.table({
         "id": ["r0", "r1"],
@@ -131,10 +136,7 @@ def _session(tmp_path, backend="quail"):
         "aspect": ["acting", "ending"],
     }), tmp_path / "aspects.parquet")
 
-    def token_ids(text):
-        return [byte + 1 for byte in text.encode("utf-8")]
-
-    tokenizer = str.split if backend == "quail" else token_ids
+    tokenizer = str.split if backend == "quail" else _token_ids
     sess = quail.Session(
         EngineConfig(gpus=1, backend=backend), tokenizer=tokenizer
     )
@@ -301,7 +303,8 @@ def test_benchmark_results_and_scoring(tmp_path):
         query = _query(sess)
         result = _run_request_backend(query, [0, 0])
         output = run_output(result, SPEC, CORPUS)
-        measured = regret_measurements(query, result)
+        output.prompt_pieces = prompt_pieces(query, join_anchors(result))
+        tokenizer_name = sess.model.hf_name
     finally:
         sess.close()
 
@@ -312,8 +315,21 @@ def test_benchmark_results_and_scoring(tmp_path):
         "filter", "join"
     ]
     assert output.rows.num_rows == 0
-    # the fake run reports 100 fresh tokens against the minimum its
+    # the pieces name the session's tokenizer and every stage; QUAIL-B
+    # sets the fake run's 100 fresh tokens against the minimum its
     # requests needed, derived from the answer tables
+    from quail_b.minimum import DocumentTokens, regret_metrics
+
+    pieces = output.prompt_pieces
+    assert pieces["tokenizer"] == tokenizer_name
+    assert pieces["preamble"] == _token_ids(quail.SHARED_PRE)
+    assert [(item["alias"], item["position"]) for item in pieces["filters"]] == [
+        ("r", 0)]
+    assert [(item["position"], item["anchor"]) for item in pieces["joins"]] == [
+        (0, "r")]
+    stores = {tokenizer_name: DocumentTokens(
+        CORPUS, lambda texts: [_token_ids(text) for text in texts])}
+    measured = regret_metrics(SPEC, output, CORPUS, stores)
     assert measured["minimum_tokens"] > 0
     assert measured["regret_tokens"] == 100 - measured["minimum_tokens"]
 

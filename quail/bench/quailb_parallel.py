@@ -21,7 +21,7 @@ from pathlib import Path
 
 import modal
 
-from quail.bench.results import measurement_rows, write_json, write_measurements
+from quail.bench.results import combine_measurements, write_json
 
 base_image = (
     modal.Image.from_registry(
@@ -385,10 +385,7 @@ def run_all(
         for method, report in reports.items():
             write_json(directory / paths[method], report)
             write_report(directory / method, rescore=False)
-        write_measurements(
-            directory / "measurements.parquet",
-            [row for method, report in reports.items()
-             for row in measurement_rows(method, report)])
+        combine_measurements(directory, list(reports))
         manifest.update(
             status="complete",
             parallel_wall_s=round(elapsed, 1),
