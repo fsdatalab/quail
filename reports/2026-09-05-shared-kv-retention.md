@@ -80,7 +80,7 @@ Figure: plots/quailb_fev.png
   The retention change preserves answers but does not improve model accuracy.
 - The saved evaluator rounds output precision and F1 to zero at six decimal
   places. The precision above is calculated from the saved integer counts.
-- [The full comparison plots](2026-09-05-quailb-saved-results.md) reuse all 124
+- [The full comparison plots](quailb-comparison.md) reuse all 124
   saved configurations for the other 31 queries. FEV-9 uses new measurements
   of all four methods on the four-filter query.
 

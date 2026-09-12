@@ -4,7 +4,9 @@
 
 <run_dir> is a family run directory as the family runner writes it:
 <method>/run.json listing every query beside <method>/<family>/run.json.
-A query saved before Quail reported its prompt pieces gets its
+A method without its run.json (a family failed, so the runner never
+merged) gets one built from the family files it has. A query saved
+before Quail reported its prompt pieces gets its
 prompt_pieces.json, built from the query and the anchor its run chose.
 QUAIL-B then computes minimum_tokens and regret_tokens from the saved
 answer tables, and every report and measurements table is rewritten.
@@ -81,8 +83,38 @@ def restate_query(session, tables, stores, directory: Path, record: dict):
         record["measurements"].pop(key, None)
 
 
+def merge_families(method_dir: Path) -> Path:
+    """Write <method>/run.json from the family run.json files under it.
+
+    The family runner writes it only when every family finished; a run
+    with a failed family still has the other families' records, and
+    every completed query keeps its answers. Records point at their
+    family's query directory.
+    """
+    parts = sorted(method_dir.glob("*/run.json"))
+    if not parts:
+        raise FileNotFoundError(f"no <family>/run.json under {method_dir}")
+    merged = None
+    for path in parts:
+        part = _load(path)
+        if merged is None:
+            merged = {key: value for key, value in part.items() if key != "queries"}
+            merged["queries"] = []
+        for record in part["queries"]:
+            merged["queries"].append(
+                dict(record, directory=f"{path.parent.name}/{record['id']}"))
+    merged["status"] = ("complete" if all(
+        record["status"] == "complete" for record in merged["queries"]) else "failed")
+    write_json(method_dir / "run.json", merged)
+    return method_dir / "run.json"
+
+
 def restate_run(run_dir: Path, sf: float, data_dir: str | None) -> pa.Table:
     """Restate every run.json under a run directory and write the tables."""
+    for method_dir in sorted(run_dir.iterdir()):
+        if (method_dir.is_dir() and not (method_dir / "run.json").exists()
+                and any(method_dir.glob("*/run.json"))):
+            merge_families(method_dir)
     reports = sorted(run_dir.glob("*/run.json")) + sorted(run_dir.glob("*/*/run.json"))
     if not reports:
         raise FileNotFoundError(f"no <method>/run.json under {run_dir}")

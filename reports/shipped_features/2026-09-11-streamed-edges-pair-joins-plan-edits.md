@@ -305,7 +305,7 @@ call.
 ## 9. Quail-only rerun of all 33 queries against the saved Quail rows
 
 The whole benchmark was rerun with this branch's engine, Quail only,
-to check the saved Quail rows in `reports/2026-09-05-quailb-saved-results.md`
+to check the saved Quail rows in `reports/quailb-comparison.md`
 and the figures under `reports/plots/`. Two run directories, because
 the FEVER family of the first was cancelled while scoring FEV-8 with
 the id-code scorer (quail-bench PR #3) and rerun once quail-bench
