@@ -50,7 +50,7 @@ Pull the original suite manifest and its four result files:
       uv run modal volume get quail-results \
         "$QUAIL3/quail/$family/run.json" "$W/quail3/$family.json"
     done
-    QUAIL4=$RUNS/<the FEVER-only rerun's run id>
+    QUAIL4=$RUNS/20260912T032335Z-609d6410
     uv run modal volume get quail-results \
       "$QUAIL4/manifest.json" "$W/quail4/manifest.json"
     uv run modal volume get quail-results \

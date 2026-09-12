@@ -291,3 +291,79 @@ call.
   `Apply.validate` (their messages are the ones a user sees first),
   `FilterStream.chunks` and `attention_mode`, `plan.move` (documented
   API), the int-or-list `suffix_count` in the request scheduler.
+
+## 9. Quail-only rerun of all 33 queries against the saved Quail rows
+
+The whole benchmark was rerun with this branch's engine, Quail only,
+to check the saved Quail rows in `reports/2026-09-05-quailb-saved-results.md`
+and the figures under `reports/plots/`. Two run directories, because
+the FEVER family of the first was cancelled while scoring FEV-8 with
+the id-code scorer (quail-bench PR #3) and rerun once quail-bench
+scored a traced run from its answers (PR #4) and sampled its rows
+chunk by chunk (PR #5):
+
+- IMDB, BIO, LEP, AGENT:
+  `/results/benchmarks/quailb/family-runs/20260912T023323Z-e689d27e/`,
+  function calls `fc-01M29QF6N38ZTPKESAJSA53EP4` (imdb),
+  `fc-01M29QF6Q0WM29JPQHA1XY98T4` (biodex),
+  `fc-01M29QF6VJ1SW7YAMM1SHQ93FN` (lepard),
+  `fc-01M29QF6XNTEG0ZBTYWVRXPBD9` (agent).
+- FEV: `/results/benchmarks/quailb/family-runs/20260912T032335Z-609d6410/`,
+  function call `fc-01M29TCRAG0JW20ME880WJXXTS`.
+
+The saved-results report now carries a "Quail rerun against the saved
+Quail rows" table with every query, and the Quail bars in the main and
+dataset figures come from these runs. The baseline rows and bars are
+unchanged.
+
+Prediction, stated before the runs: the five queries whose filtered
+alias anchors a join (IMDB-3, IMDB-4, IMDB-5, IMDB-10, BIO-3) drop to
+0 recomputed KV tokens and lose 10 to 30 percent of their time; FEV-9
+drops from 7,309 recomputed tokens to 0 and from 41.14 s to 38 or 39;
+FEV-10 stays near 1.7 s; every other query stays within a few percent
+with the same fresh tokens; answers and rows are identical everywhere.
+
+| Query | Saved time, s | Rerun time, s | Change | Saved recomputed KV | Rerun recomputed KV | Agreement saved / rerun, % |
+|---|---:|---:|---:|---:|---:|---:|
+| IMDB-3 | 32.35 | 22.20 | -31.4% | 1,217,732 | 0 | 79.16 / 79.16 |
+| IMDB-4 | 19.99 | 17.34 | -13.3% | 361,440 | 0 | 77.76 / 77.76 |
+| IMDB-5 | 17.76 | 16.52 | -7.0% | 188,587 | 0 | 80.17 / 80.17 |
+| IMDB-10 | 59.71 | 47.65 | -20.2% | 1,217,732 | 0 | 73.93 / 72.59 |
+| BIO-3 | 89.92 | 79.31 | -11.8% | 919,409 | 0 | 82.54 / 82.54 |
+| FEV-9 | 41.14 | 39.59 | -3.8% | 7,309 | 0 | 67.77 / 67.77 |
+| FEV-10 | 1.68 | 1.69 | +0.6% | 0 | 0 | 89.09 / 89.09 |
+
+What happened against the prediction:
+
+- The six queries with recomputed KV all went to 0, and the five with
+  a filtered anchor lost 7.0 to 31.4 percent of their time. IMDB-5's
+  7.0 percent is at the low end of the predicted range because its
+  recomputed share was the smallest (188,587 of 2,118,230 fresh
+  tokens).
+- FEV-9 came in at 39.59 s, just above the predicted 38 to 39, with
+  0 recomputed tokens as predicted.
+- The 26 queries with no recomputed KV have the same fresh tokens and
+  the same rows as before. Their times moved between -3.4 and +11.5
+  percent. The FEVER family ran 2.5 to 7.1 percent slower across all
+  eight of its unchanged queries, and LEP-6 11.5 percent slower, which
+  is more than the few percent predicted; the fresh-token counts are
+  identical, so the difference is GPU-side timing between containers
+  rather than the engine doing different work.
+- Output rows are identical on all 33 queries. Agreement is identical
+  on 32; IMDB-10 moved from 73.93 to 72.59 percent while its output
+  rows did not change (64,840,220). The likely cause is that its join
+  prompts now sit on the streamed survivor's KV instead of a
+  recomputed copy, and with fp8 numerics the same prompt can decode
+  differently when its prefix was computed in a different batch. That
+  is not verified. Comparing the per-pair answers of the two runs on
+  the volume would settle it.
+
+Command, teed to `results/benchmark/20260912T023319Z-quail-only-sf0.1.log`
+and `results/benchmark/20260912T032332Z-quail-only-fever-sf0.1.log`
+(the FEVER run passed `--query FEV-1,...,FEV-10`):
+
+    modal run --detach -m quail.bench.quailb_parallel \
+      --output-dir /results/benchmarks/quailb/family-runs \
+      --model qwen3-4b-fp8 --sf 0.1 \
+      --ground-truth-collection gt_77bb8b128743a79aedddaa24c808c3f8 \
+      --no-include-baselines --no-include-sglang
