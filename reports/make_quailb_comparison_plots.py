@@ -42,19 +42,30 @@ Pull the original suite manifest and its four result files:
     done
     uv run modal volume get quail-results \
       /sol/2026-09-11-quailb-prefix-reuse.json "$W/sol.json"
-    mkdir -p "$W/quail"
-    QUAIL=$RUNS/<the Quail-only rerun's run id>
+    mkdir -p "$W/quail3" "$W/quail4"
+    QUAIL3=$RUNS/20260912T023323Z-e689d27e
     uv run modal volume get quail-results \
-      "$QUAIL/manifest.json" "$W/quail/manifest.json"
+      "$QUAIL3/manifest.json" "$W/quail3/manifest.json"
+    for family in imdb biodex lepard agent; do
+      uv run modal volume get quail-results \
+        "$QUAIL3/quail/$family/run.json" "$W/quail3/$family.json"
+    done
+    QUAIL4=$RUNS/<the FEVER-only rerun's run id>
     uv run modal volume get quail-results \
-      "$QUAIL/quail/run.json" "$W/quail/quail.json"
-    uv run --with matplotlib python reports/make_quailb_comparison_plots.py "$W"
+      "$QUAIL4/manifest.json" "$W/quail4/manifest.json"
+    uv run modal volume get quail-results \
+      "$QUAIL4/quail/fever/run.json" "$W/quail4/fever.json"
+    uv run --with matplotlib python reports/make_quailb_comparison_plots.py "$W" \
+      --quail-dir "$W/quail3" --quail-dir "$W/quail4"
 
-Use --fev9-dir, --fev10-dir, and --quail-dir to point to already pulled
-runs. All four current FEV-9 measurements replace the old query
-definition. FEV-10 joined the benchmark after the suite run, so its four
-measurements come from its own run. The Quail-only rerun replaces every
-Quail row, and the report compares it with the saved Quail rows.
+Use --fev9-dir and --fev10-dir to point to already pulled runs, and
+--quail-dir (repeatable) to Quail-only reruns: each directory holds a
+run's manifest.json and any of its report files (a run's quail/run.json
+or a family's quail/<family>/run.json). All four current FEV-9
+measurements replace the old query definition. FEV-10 joined the
+benchmark after the suite run, so its four measurements come from its
+own run. The Quail-only reruns replace every Quail row they cover, and
+the report compares them with the saved Quail rows.
 """
 
 import argparse
@@ -338,12 +349,13 @@ def check_run(record, key, corpus, suite, manifest):
     assert record["corpus_id"] == corpus["corpus_id"]
     assert (record["collection_id"]
             == suite["ground_truth"]["fever"]["collection_id"])
-    assert record["run_id"] == manifest["run_id"]
+    # a family's own report carries no run id; the run's report does
+    assert record.get("run_id") in (None, manifest["run_id"])
     for query in record["queries"]:
         assert query["status"] == "complete", query
 
 
-def load_rows(root, fev9_root, fev10_root, quail_root=None):
+def load_rows(root, fev9_root, fev10_root, quail_roots=()):
     """Combine the saved suite with the current FEV-9, FEV-10, and Quail runs."""
     manifest = json.loads((root / "manifest.json").read_text())
     corpus = json.loads((root / "corpus.json").read_text())
@@ -404,39 +416,46 @@ def load_rows(root, fev9_root, fev10_root, quail_root=None):
             == {("filter", "c"), ("filter", "e")}
         assert len([s for s in stages if s["op"] == "join"]) == 1
         rows[key]["FEV-10"] = added_row
-    saved_quail, rerun_manifest = {}, None
-    if quail_root is not None and (quail_root / "manifest.json").exists():
+    saved_quail, rerun_manifests = {}, []
+    suite = json.loads((root / "quail.json").read_text())
+    for quail_root in quail_roots:
         rerun_manifest = json.loads((quail_root / "manifest.json").read_text())
-        rerun = json.loads((quail_root / "quail.json").read_text())
-        suite = json.loads((root / "quail.json").read_text())
-        check_run(rerun, "quail", corpus, suite, rerun_manifest)
-        for query, row in current_rows(rerun).items():
-            saved_quail[query] = rows["quail"][query]
-            rows["quail"][query] = row
+        rerun_manifests.append(rerun_manifest)
+        for path in sorted(quail_root.glob("*.json")):
+            if path.name == "manifest.json":
+                continue
+            rerun = json.loads(path.read_text())
+            check_run(rerun, "quail", corpus, suite, rerun_manifest)
+            for query, row in current_rows(rerun).items():
+                saved_quail.setdefault(query, rows["quail"][query])
+                rows["quail"][query] = row
     return (manifest, rows, fev9_manifest, fev10_manifest,
-            sglang_update["result_volume_path"], saved_quail, rerun_manifest)
+            sglang_update["result_volume_path"], saved_quail, rerun_manifests)
 
 
-def rerun_lines(saved, rows, manifest):
-    """The report section comparing the Quail rerun with the saved rows."""
+def rerun_lines(saved, rows, manifests, queries):
+    """The report section comparing the Quail reruns with the saved rows."""
     if not saved:
         return []
-    calls = ", ".join(f"`{call}`" for call in manifest["function_call_ids"].values())
+    runs = "; ".join(
+        f"`/results/benchmarks/quailb/family-runs/{manifest['run_id']}/` "
+        "(function calls "
+        + ", ".join(f"`{call}`" for call in manifest["function_call_ids"].values())
+        + ")" for manifest in manifests)
     lines = [
         "## Quail rerun against the saved Quail rows", "",
-        f"Quail only, all {len(saved)} queries, run "
-        f"`/results/benchmarks/quailb/family-runs/{manifest['run_id']}/` "
-        f"(function calls {calls}). The Quail bars and the Quail rows above "
-        "come from this run; the baseline rows are the saved runs.", "",
+        f"Quail only, {len(saved)} queries, from {runs}. The Quail bars and "
+        "the Quail rows above come from these runs; the baseline rows are "
+        "the saved runs.", "",
         "| Query | Saved seconds | Rerun seconds | Change | Saved recomputed KV "
         "| Rerun recomputed KV | Saved fresh tokens | Rerun fresh tokens "
         "| Agreement saved / rerun, % | Rows saved / rerun |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
-    for query, old in saved.items():
-        before, after = row_metrics(old), row_metrics(rows["quail"][query])
+    for query in (query for query in queries if query in saved):
+        before, after = row_metrics(saved[query]), row_metrics(rows["quail"][query])
         change = 100 * (after["seconds"] - before["seconds"]) / before["seconds"]
-        old_rows = old["accuracy"]["output_accuracy"]["predicted_rows"]
+        old_rows = saved[query]["accuracy"]["output_accuracy"]["predicted_rows"]
         new_rows = rows["quail"][query]["accuracy"]["output_accuracy"]["predicted_rows"]
         lines.append(
             f"| {query} | {before['seconds']:.2f} | {after['seconds']:.2f} "
@@ -447,15 +466,16 @@ def rerun_lines(saved, rows, manifest):
     return lines + [""]
 
 
-def main(workdir, fev9_dir=None, fev10_dir=None, quail_dir=None):
+def main(workdir, fev9_dir=None, fev10_dir=None, quail_dirs=()):
     """Regenerate figures from the saved suite and the current runs."""
     root = Path(workdir)
     fev9_root = Path(fev9_dir) if fev9_dir else root / "fev9"
     fev10_root = Path(fev10_dir) if fev10_dir else root / "fev10"
-    quail_root = Path(quail_dir) if quail_dir else root / "quail"
+    quail_roots = [Path(path) for path in (quail_dirs or [])
+                   if (Path(path) / "manifest.json").exists()]
     (manifest, rows, fev9_manifest, fev10_manifest, sglang_source,
-     saved_quail, rerun_manifest) = load_rows(
-        root, fev9_root, fev10_root, quail_root)
+     saved_quail, rerun_manifests) = load_rows(
+        root, fev9_root, fev10_root, quail_roots)
     queries = list(manifest["query_ids"])
     queries.insert(queries.index("FEV-9") + 1, "FEV-10")
     comparable = [query for query in queries if all(query in rows[key] for key in rows)]
@@ -667,7 +687,7 @@ def main(workdir, fev9_dir=None, fev10_dir=None, quail_dir=None):
                 f"| {estimate['cost_usd_per_query_at_sol']:.5f} "
                 "| Not measured | Not measured | Not measured |")
         lines.append("")
-    lines.extend(rerun_lines(saved_quail, rows, rerun_manifest))
+    lines.extend(rerun_lines(saved_quail, rows, rerun_manifests, queries))
     report = HERE / "2026-09-05-quailb-saved-results.md"
     report.write_text("\n".join(lines))
     print(f"Updated {report}, the main figure, and five dataset figures "
@@ -679,6 +699,6 @@ if __name__ == "__main__":
     parser.add_argument("workdir")
     parser.add_argument("--fev9-dir")
     parser.add_argument("--fev10-dir")
-    parser.add_argument("--quail-dir")
+    parser.add_argument("--quail-dir", action="append")
     args = parser.parse_args()
     main(args.workdir, args.fev9_dir, args.fev10_dir, args.quail_dir)
