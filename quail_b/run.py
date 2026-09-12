@@ -7,11 +7,21 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from quail_b._files import download_cache
 from quail_b.benchmark import load_benchmark
-from quail_b.scoring import RunOutput, corpus_ids, encode_ids, evaluate
+from quail_b.scoring import (
+    RunOutput,
+    corpus_ids,
+    encode_ids,
+    evaluate,
+    implied_row_count,
+    implied_rows_mask,
+    scores_from_answers,
+)
 
 
 def _write_json(path, value):
@@ -60,6 +70,17 @@ def _read_output(directory, record):
         table(paths["rows"]), record.get("runtime_s"), record.get("measurements", {}))
 
 
+ROW_SAMPLE = 100_000    # rows of a traced result checked one by one
+
+
+def _sample_rows(table, count):
+    """Up to count rows of a table, evenly spaced."""
+    if table.num_rows <= count:
+        return table
+    step = table.num_rows // count
+    return table.take(pa.array(range(0, step * count, step), pa.int64()))
+
+
 def _validate_output(spec, output, tables):
     if (isinstance(output.runtime_s, bool)
             or not isinstance(output.runtime_s, (int, float))
@@ -84,7 +105,27 @@ def _validate_output(spec, output, tables):
     selected = [name.split(".")[0] for name in spec.select]
     if set(output.rows.column_names) != set(selected):
         raise ValueError("output columns must match the query's selected aliases")
-    validate_ids(output.rows, selected)
+    answers = scores_from_answers(spec, output, tables)
+    if answers is None:
+        validate_ids(output.rows, selected)
+    else:
+        # a traced run's rows are implied by its answers: the count must
+        # agree, and a sample of the rows must all be implied; the
+        # answer tables below get the full checks
+        survivors, relations = answers
+        implied = implied_row_count(spec, survivors, relations)
+        if output.rows.num_rows != implied:
+            raise ValueError(
+                f"the engine returned {output.rows.num_rows:,} rows but its "
+                f"answers imply {implied:,}")
+        sample = _sample_rows(output.rows, ROW_SAMPLE)
+        validate_ids(sample, selected)
+        mask = implied_rows_mask(
+            pa.table({alias: sample[alias].cast(pa.string())
+                      for alias in selected}),
+            survivors, relations, spec)
+        if not (pc.all(mask).as_py() if sample.num_rows else True):
+            raise ValueError("a returned row is not implied by the answers")
     for (alias, position), table in (output.filter_answers or {}).items():
         if position < 0 or position >= len(spec.alias(alias).filters):
             raise ValueError("unknown filter position")
