@@ -429,8 +429,7 @@ def alias_table(alias: str, ids, columns, names):
     for name in names:
         if columns is None or name not in columns.column_names:
             raise KeyError(
-                f"apply() needs column {alias}.{name}, which the request "
-                f"did not carry")
+                f"column {alias}.{name} is not among the request's relations")
         arrays[name] = columns.column(name).take(pa.array(ids, pa.int64()))
     return pa.table(arrays)
 

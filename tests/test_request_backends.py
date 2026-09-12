@@ -130,6 +130,37 @@ def test_request_backends_plan_validate_and_execute(monkeypatch):
         assert result.count() == 0
         session.close()
 
+        # an equality join: the request carries the key columns, and
+        # the model sees only the pairs whose keys are equal
+        session = quail.Session(
+            EngineConfig(backend="stock_vllm"), tokenizer=_tokens)
+        session.register("docs", quail.DocumentProvider.from_table(pa.table({
+            "id": ["a", "b"], "body": ["one", "two"], "key": ["k1", "k2"],
+        }), id_col="id"))
+        session.register("notes", quail.DocumentProvider.from_table(pa.table({
+            "id": ["x", "y", "z"], "text": ["p", "q", "r"],
+            "key": ["k2", "k1", "k3"],
+        }), id_col="id"))
+        query = (
+            session.docs("docs").alias("d")
+            .join(session.docs("notes").alias("n"),
+                  on=[quail.col("d.key") == quail.col("n.key")])
+            .ai_filter(quail.prompt("{0} matches {1}", quail.col("d.body"),
+                                    quail.col("n.text")))
+            .select("d.id", "n.id")
+        )
+        plan = query.plan()
+        request = query._prepare_physical()
+        backend = session.registry.backend("stock_vllm")
+        response = backend.execute_request(BackendExecutionContext(
+            request=request, graph=plan.graph, registry=session.registry,
+            gpu_count=1, runtime_state={}))
+        result = query.finish(response)
+        assert result.report["backend_metrics"]["requests"] == 2
+        assert sorted(zip(*result.answer_tables["joins"][0].to_pydict().values())
+                      ) == [(0, 1, False), (1, 0, False)]
+        session.close()
+
 
 class _Output:
     def __init__(self, prompt, answer, cached=0):

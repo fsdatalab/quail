@@ -744,8 +744,9 @@ def execute_request_graph(context, backend, engine_state, boot):
             runtimes=context.registry.runtimes,
             model_execution=model_execution,
             sources={
-                alias: range(len(value))
-                for alias, value in documents.items()
+                **{alias: range(len(value))
+                   for alias, value in documents.items()},
+                **context.request.relations,
             },
             functions=context.registry.functions,
         ),
