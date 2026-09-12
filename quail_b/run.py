@@ -13,6 +13,7 @@ import pyarrow.parquet as pq
 
 from quail_b._files import download_cache
 from quail_b.benchmark import load_benchmark
+from quail_b.minimum import regret_metrics
 from quail_b.scoring import (
     RunOutput,
     corpus_ids,
@@ -49,25 +50,31 @@ def _save_output(directory, output):
             name = f"{kind}-{index}.parquet"
             pq.write_table(table, directory / name, compression="zstd")
             paths[kind].append({"key": key, "path": name})
+    if output.prompt_pieces is not None:
+        _write_json(directory / "prompt_pieces.json", output.prompt_pieces)
+        paths["prompt_pieces"] = "prompt_pieces.json"
     return paths
 
 
 def _read_output(directory, record):
-    def table(name):
+    def file(name):
         path = (directory / name).resolve()
         if not path.is_relative_to(directory.resolve()):
             raise ValueError("answer file is outside the query directory")
-        return pq.read_table(path)
+        return path
 
     paths = record["files"]
     filters = paths["filters"]
     joins = paths["joins"]
+    pieces = paths.get("prompt_pieces")
     return RunOutput(
         None if filters is None else {
-            tuple(item["key"]): table(item["path"]) for item in filters},
+            tuple(item["key"]): pq.read_table(file(item["path"])) for item in filters},
         None if joins is None else {
-            item["key"]: table(item["path"]) for item in joins},
-        table(paths["rows"]), record.get("runtime_s"), record.get("measurements", {}))
+            item["key"]: pq.read_table(file(item["path"])) for item in joins},
+        pq.read_table(file(paths["rows"])), record.get("runtime_s"),
+        record.get("measurements", {}),
+        None if pieces is None else json.loads(file(pieces).read_text()))
 
 
 ROW_SAMPLE = 100_000    # rows of a traced result checked one by one
@@ -156,7 +163,8 @@ def _validate_output(spec, output, tables):
             raise ValueError("predicate answers must be non-null booleans")
 
 
-def _score(spec, output, suite, gpu_count, gpu_hourly_rate_usd):
+def _score(spec, output, suite, gpu_count, gpu_hourly_rate_usd, tokens=None):
+    """Score one query; `tokens` keeps document tokens across a run's queries."""
     _validate_output(spec, output, suite.tables)
     accuracy = evaluate(spec, output, suite.ground_truth, suite.tables)
     seconds = output.runtime_s
@@ -164,6 +172,7 @@ def _score(spec, output, suite, gpu_count, gpu_hourly_rate_usd):
     metrics = {
         "runtime_s": seconds, "input_rows": inputs,
         "accuracy": accuracy, "cost_usd": None,
+        **regret_metrics(spec, output, suite.tables, tokens),
     }
     if gpu_hourly_rate_usd is not None:
         metrics["cost_usd"] = seconds / 3600 * gpu_count * gpu_hourly_rate_usd
@@ -237,6 +246,7 @@ def run(run_query, *, queries=None, scale_factor=0.1, output_dir,
     directory.mkdir(parents=True, exist_ok=False)
     path = directory / "run.json"
     _write_json(path, record)
+    tokens = {}
     try:
         for spec, item in zip(suite.queries, record["queries"]):
             item["status"] = "running"
@@ -255,7 +265,7 @@ def run(run_query, *, queries=None, scale_factor=0.1, output_dir,
                             measurements=output.measurements)
                 _write_json(path, record)
                 item["metrics"] = _score(
-                    spec, output, suite, gpu_count, gpu_hourly_rate_usd)
+                    spec, output, suite, gpu_count, gpu_hourly_rate_usd, tokens)
                 item["status"] = "complete"
             except Exception as error:
                 item.update(

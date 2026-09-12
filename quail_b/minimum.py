@@ -1,0 +1,270 @@
+"""The fewest input tokens a run's requests need with unlimited KV.
+
+Every request an engine made is a token sequence: a document prefix
+followed by a filter question, or an anchor prefix and its frame
+followed by a partner label, the partner document, and the answer cue.
+With unlimited KV every distinct prefix across those sequences is
+computed once, so the run needs one forward pass position per node of
+their prefix trie. What an engine computed beyond that is its regret,
+whatever the cause: an evicted anchor computed again, a set scanned
+twice under two aliases, or a prompt prefix the documents share
+computed once per document.
+
+The engine reports the prompt pieces it used as token ids (see
+`validate_prompt_pieces`); the documents are tokenized here with the
+tokenizer the pieces name, after the run, so nothing is tracked while
+the query runs.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from functools import lru_cache
+
+import numpy as np
+
+from quail_b.data import _ids
+
+
+@dataclass
+class _Document:
+    alias: str
+    row_id: str
+    suffixes: set = field(default_factory=set)
+    groups: dict = field(default_factory=dict)
+
+
+def _tokens(sequence) -> np.ndarray:
+    return np.asarray(sequence, dtype=np.uint32)
+
+
+def prefix_trie_size(sequences) -> int:
+    """Return the distinct prefix positions across token sequences.
+
+    Sorted, each sequence sits next to the one it shares the longest
+    prefix with, so the trie holds the total length minus the shared
+    prefix of every neighbouring pair. Sequences compare as big endian
+    bytes, whose order is the token order.
+    """
+    keys = sorted(_tokens(sequence).astype(">u4").tobytes()
+                  for sequence in sequences)
+    total = sum(len(key) for key in keys) // 4
+    shared = 0
+    for earlier, later in zip(keys, keys[1:]):
+        length = min(len(earlier), len(later))
+        differs = (np.frombuffer(earlier, np.uint8, length)
+                   != np.frombuffer(later, np.uint8, length))
+        first = int(differs.argmax()) if differs.any() else length
+        shared += first // 4
+    return total - shared
+
+
+def _token_list(value, name):
+    if not isinstance(value, (list, tuple)) or any(
+            isinstance(item, bool) or not isinstance(item, int) or item < 0
+            for item in value):
+        raise ValueError(f"prompt pieces: {name} must be a list of token ids")
+    return [int(item) for item in value]
+
+
+def validate_prompt_pieces(spec, pieces) -> dict:
+    """Check and normalize the prompt pieces an engine reports.
+
+    Args:
+        spec: The query.
+        pieces: A dict with `tokenizer` (a HuggingFace tokenizer name,
+            the one that tokenized the documents), `preamble` (token
+            ids before every document), `filters` (a list of
+            `{"alias", "position", "tail"}`: the ids after the
+            document of that filter stage) and `joins` (a list of
+            `{"position", "anchor", "frame", "label", "tail"}`: the
+            anchor alias, the ids after the anchor document, the ids
+            before the partner document, and the ids after it).
+
+    Returns:
+        The pieces as plain lists, with every stage of the query named.
+    """
+    if not isinstance(pieces, dict) or not isinstance(
+            pieces.get("tokenizer"), str) or not pieces["tokenizer"]:
+        raise ValueError("prompt pieces need a tokenizer name")
+    checked = {"tokenizer": pieces["tokenizer"],
+               "preamble": _token_list(pieces.get("preamble", ()), "preamble"),
+               "filters": [], "joins": []}
+    stages = {(alias.alias, position)
+              for alias in spec.aliases for position in range(len(alias.filters))}
+    for item in pieces.get("filters", ()):
+        key = (item.get("alias"), item.get("position"))
+        if key not in stages:
+            raise ValueError(f"prompt pieces: unknown filter stage {key}")
+        stages.remove(key)
+        checked["filters"].append({
+            "alias": key[0], "position": int(key[1]),
+            "tail": _token_list(item.get("tail", ()), "filter tail")})
+    if stages:
+        raise ValueError(f"prompt pieces: missing filter stages {sorted(stages)}")
+    positions = set(range(len(spec.joins)))
+    for item in pieces.get("joins", ()):
+        position = item.get("position")
+        if position not in positions:
+            raise ValueError(f"prompt pieces: unknown join position {position}")
+        positions.remove(position)
+        if item.get("anchor") not in spec.joins[position].aliases:
+            raise ValueError(
+                f"prompt pieces: join {position} anchors on an alias it "
+                f"does not join: {item.get('anchor')!r}")
+        checked["joins"].append({
+            "position": int(position), "anchor": item["anchor"],
+            **{name: _token_list(item.get(name, ()), f"join {name}")
+               for name in ("frame", "label", "tail")}})
+    if positions:
+        raise ValueError(f"prompt pieces: missing joins {sorted(positions)}")
+    return checked
+
+
+@lru_cache(maxsize=4)
+def load_tokenizer(name: str):
+    """Return a callable tokenizing a list of texts, from HuggingFace."""
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(name)
+
+    def encode(texts):
+        return tokenizer(list(texts), add_special_tokens=False)["input_ids"]
+
+    return encode
+
+
+class DocumentTokens:
+    """Token ids of documents, tokenized on first use and kept.
+
+    Args:
+        corpus_rows: Table name to its rows.
+        tokenizer: Callable(list of texts) -> list of token id lists.
+    """
+
+    def __init__(self, corpus_rows, tokenizer):
+        self.corpus_rows = corpus_rows
+        self.tokenizer = tokenizer
+        self._texts = {}
+        self._tokens = {}
+
+    def _text(self, table, column, row_id):
+        key = (table, column)
+        if key not in self._texts:
+            rows = self.corpus_rows[table]
+            values = (rows.column(column).to_pylist()
+                      if hasattr(rows, "column") else [row[column] for row in rows])
+            self._texts[key] = dict(zip(map(str, _ids(rows)), values))
+        return self._texts[key][row_id]
+
+    def fetch(self, documents) -> None:
+        """Tokenize the (table, column, id) documents not seen yet."""
+        missing = [document for document in dict.fromkeys(documents)
+                   if document not in self._tokens]
+        if not missing:
+            return
+        encoded = self.tokenizer([self._text(*document) for document in missing])
+        for document, ids in zip(missing, encoded):
+            self._tokens[document] = _tokens(ids)
+
+    def __getitem__(self, document) -> np.ndarray:
+        return self._tokens[document]
+
+
+def minimum_input_tokens(spec, pieces, filter_answers, join_answers,
+                         documents: DocumentTokens) -> int:
+    """Return the fewest input tokens the run's requests need.
+
+    Args:
+        spec: The query.
+        pieces: Validated prompt pieces (`validate_prompt_pieces`).
+        filter_answers: (alias, written position) -> table with the
+            alias's ids and answers, one row per document asked.
+        join_answers: Written position -> table with one id column per
+            alias and answers, one row per evaluated pair.
+        documents: The document tokens.
+    """
+    sets = {alias.alias: (alias.table, alias.column) for alias in spec.aliases}
+    pre = _tokens(pieces["preamble"])
+    records: dict = {}
+
+    def record(alias, row_id) -> _Document:
+        key = (sets[alias], str(row_id))
+        if key not in records:
+            records[key] = _Document(alias=alias, row_id=str(row_id))
+        return records[key]
+
+    tails = {(item["alias"], item["position"]): tuple(item["tail"])
+             for item in pieces["filters"]}
+    for (alias, written_pos), table in filter_answers.items():
+        question = tails[(alias, written_pos)]
+        for row_id in table.column(alias).to_pylist():
+            record(alias, row_id).suffixes.add(question)
+    joins = {item["position"]: item for item in pieces["joins"]}
+    for written_pos, table in join_answers.items():
+        piece = joins[written_pos]
+        anchor = piece["anchor"]
+        (partner,) = [alias for alias in spec.joins[written_pos].aliases
+                      if alias != anchor]
+        group = (tuple(piece["frame"]), tuple(piece["label"]), tuple(piece["tail"]))
+        partner_set = sets[partner]
+        for anchor_id, partner_id in zip(table.column(anchor).to_pylist(),
+                                         table.column(partner).to_pylist()):
+            document = record(anchor, anchor_id)
+            document.suffixes.add(group[0])
+            document.groups.setdefault(group, set()).add(
+                (partner_set, str(partner_id)))
+
+    documents.fetch([(*table_set, row_id) for table_set, row_id in records]
+                    + [(*member_set, row_id)
+                       for document in records.values()
+                       for members in document.groups.values()
+                       for member_set, row_id in members])
+    total = prefix_trie_size(
+        np.concatenate((pre, documents[(*table_set, row_id)]))
+        for table_set, row_id in records)
+    suffix_sizes: dict = {}
+    partner_sizes: dict = {}
+    for document in records.values():
+        suffixes = frozenset(document.suffixes)
+        if suffixes not in suffix_sizes:
+            suffix_sizes[suffixes] = prefix_trie_size(suffixes)
+        total += suffix_sizes[suffixes]
+        for (_, label, tail), partners in document.groups.items():
+            members = frozenset(partners)
+            if members not in partner_sizes:
+                partner_sizes[members] = prefix_trie_size(
+                    documents[(*member_set, row_id)]
+                    for member_set, row_id in members)
+            total += (len(label) + partner_sizes[members]
+                      + len(tail) * len(members))
+    return total
+
+
+def regret_metrics(spec, output, corpus_rows, stores=None) -> dict:
+    """Return `minimum_tokens` and `regret_tokens` of one run output.
+
+    Both are None when the run saved no prompt pieces, no answers, or
+    no `fresh_tokens` measurement.
+
+    Args:
+        spec: The query.
+        output: The run output.
+        corpus_rows: Table name to its rows.
+        stores: Tokenizer name -> DocumentTokens, kept across the
+            queries of one run so each document is tokenized once.
+    """
+    if (output.prompt_pieces is None or output.filter_answers is None
+            or output.join_answers is None):
+        return {"minimum_tokens": None, "regret_tokens": None}
+    fresh = output.measurements.get("fresh_tokens")
+    if isinstance(fresh, bool) or not isinstance(fresh, int) or fresh < 0:
+        return {"minimum_tokens": None, "regret_tokens": None}
+    pieces = validate_prompt_pieces(spec, output.prompt_pieces)
+    stores = {} if stores is None else stores
+    name = pieces["tokenizer"]
+    if name not in stores:
+        stores[name] = DocumentTokens(corpus_rows, load_tokenizer(name))
+    minimum = minimum_input_tokens(
+        spec, pieces, output.filter_answers, output.join_answers, stores[name])
+    return {"minimum_tokens": minimum, "regret_tokens": fresh - minimum}

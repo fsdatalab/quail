@@ -1,12 +1,73 @@
-"""Score saved benchmark answers and write a Markdown report."""
+"""Score saved benchmark answers and write a report and a measurements table.
+
+`report.md` is the readable summary. `measurements.parquet` holds one
+row per completed query with its runtime, token counts, accuracy
+counts, and cost, for plots and comparisons across runs.
+"""
 
 import argparse
 import json
 from pathlib import Path
 
+import pyarrow as pa
+import pyarrow.parquet as pq
+
 from quail_b._files import download_cache
 from quail_b.benchmark import load_benchmark
 from quail_b.run import _query_hash, _read_output, _score, _write_json
+
+MEASUREMENT_SCHEMA = pa.schema([
+    ("query", pa.string()),
+    ("runtime_s", pa.float64()),
+    ("fresh_tokens", pa.int64()),
+    ("minimum_tokens", pa.int64()),
+    ("regret_tokens", pa.int64()),
+    ("evaluated_document_pairs", pa.int64()),
+    ("input_rows", pa.int64()),
+    ("answers_evaluated", pa.int64()),
+    ("answers_correct", pa.int64()),
+    ("predicted_rows", pa.int64()),
+    ("expected_rows", pa.int64()),
+    ("matching_rows", pa.int64()),
+    ("cost_usd", pa.float64()),
+])
+
+
+def _count(value):
+    return None if isinstance(value, bool) or not isinstance(value, int) else value
+
+
+def measurement_rows(record) -> list[dict]:
+    """Return one flat row per completed query of a run record."""
+    rows = []
+    for item in record["queries"]:
+        if item.get("status") != "complete":
+            continue
+        metrics = item["metrics"]
+        answers = metrics["accuracy"]["answer_accuracy"] or {}
+        output = metrics["accuracy"]["output_accuracy"]
+        rows.append({
+            "query": item["id"],
+            "runtime_s": item["runtime_s"],
+            "fresh_tokens": _count(item.get("measurements", {}).get("fresh_tokens")),
+            "minimum_tokens": metrics.get("minimum_tokens"),
+            "regret_tokens": metrics.get("regret_tokens"),
+            "evaluated_document_pairs": metrics.get("evaluated_document_pairs"),
+            "input_rows": sum(metrics["input_rows"].values()),
+            "answers_evaluated": answers.get("evaluated"),
+            "answers_correct": answers.get("correct"),
+            "predicted_rows": output["predicted_rows"],
+            "expected_rows": output["expected_rows"],
+            "matching_rows": output["matching_rows"],
+            "cost_usd": metrics.get("cost_usd"),
+        })
+    return rows
+
+
+def _write_measurements(directory, record):
+    """Write the completed queries' numbers as one flat Parquet table."""
+    table = pa.Table.from_pylist(measurement_rows(record), schema=MEASUREMENT_SCHEMA)
+    pq.write_table(table, directory / "measurements.parquet", compression="zstd")
 
 
 def _number(value):
@@ -57,17 +118,20 @@ def _write_report(directory, record):
             f"{_number(output.get('precision'))} | {_number(output.get('recall'))} |")
     lines.extend([
         "", "## Input rows and token counts", "",
-        "| Query | Input rows by alias | Fresh tokens | Recomputed KV tokens |",
-        "| --- | --- | ---: | ---: |",
+        "| Query | Input rows by alias | Fresh tokens | Minimum tokens | "
+        "Recomputed KV tokens |",
+        "| --- | --- | ---: | ---: | ---: |",
     ])
     for item in record["queries"]:
-        inputs = item.get("metrics", {}).get("input_rows", {})
+        metrics = item.get("metrics", {})
+        inputs = metrics.get("input_rows", {})
         counts = ", ".join(f"{alias}: {count}" for alias, count in inputs.items())
         measurements = item.get("measurements", {})
         lines.append(
             f"| {item['id']} | {counts or 'unavailable'} | "
             f"{_number(measurements.get('fresh_tokens'))} | "
-            f"{_number(measurements.get('regret_tokens'))} |")
+            f"{_number(metrics.get('minimum_tokens'))} | "
+            f"{_number(metrics.get('regret_tokens'))} |")
     lines.extend(["", "## Configuration", "", "```json",
                   json.dumps(record["metadata"], indent=2), "```", ""])
     failures = [item for item in record["queries"] if "error" in item]
@@ -79,6 +143,7 @@ def _write_report(directory, record):
     temporary = path.with_suffix(".md.tmp")
     temporary.write_text("\n".join(lines))
     temporary.replace(path)
+    _write_measurements(directory, record)
     return path
 
 
@@ -108,6 +173,7 @@ def report(run_dir, *, rescore=True, cache_dir=None, root=None):
     for spec, item in zip(suite.queries, record["queries"]):
         if _query_hash(spec) != item["definition_hash"]:
             raise ValueError(f"query definition changed: {spec.id}")
+    tokens = {}
     for spec, item in zip(suite.queries, record["queries"]):
         if "files" not in item:
             continue
@@ -115,7 +181,7 @@ def report(run_dir, *, rescore=True, cache_dir=None, root=None):
             output = _read_output(_query_directory(directory, item), item)
             item["metrics"] = _score(
                 spec, output, suite, record["gpu_count"],
-                record["gpu_hourly_rate_usd"])
+                record["gpu_hourly_rate_usd"], tokens)
             item["status"] = "complete"
             item.pop("error", None)
         except Exception as error:

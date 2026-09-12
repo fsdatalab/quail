@@ -105,6 +105,75 @@ def test_join_runs_at_all_scales_and_report_cli(tmp_path):
     assert calls == ["IMDB-4"] * 3
 
 
+def test_prompt_pieces_give_the_minimum_and_the_regret(tmp_path, monkeypatch):
+    import quail_b.minimum
+
+    def encode(texts):
+        return [[byte + 1 for byte in text.encode("utf-8")] for text in texts]
+
+    loaded = []
+    monkeypatch.setattr(quail_b.minimum, "load_tokenizer",
+                        lambda name: loaded.append(name) or encode)
+    _inputs(tmp_path, 0.1)
+    spec = quail_b.get_query("IMDB-4")
+    pieces = {
+        "tokenizer": "test-tokenizer", "preamble": [1, 2],
+        "filters": [{"alias": "r", "position": index, "tail": [10 + index, 20]}
+                    for index in range(len(spec.aliases[0].filters))],
+        "joins": [{"position": 0, "anchor": "r", "frame": [30, 31],
+                   "label": [40], "tail": [50, 51, 52]}],
+    }
+
+    def execute(spec, tables):
+        return quail_b.RunOutput(
+            {("r", index): pa.table({"r": ["r0", "r1"], "answer": [True, True]})
+             for index in range(len(spec.aliases[0].filters))},
+            {0: pa.table({
+                "r": ["r0", "r1"], "a": ["a0", "a0"], "answer": [True, True]})},
+            pa.table({"r": ["r0", "r1"], "a": ["a0", "a0"]}),
+            runtime_s=2.0, measurements={"fresh_tokens": 1000},
+            prompt_pieces=pieces)
+
+    destination = tmp_path / "run"
+    record = quail_b.run(execute, queries=["IMDB-4"], output_dir=destination,
+                         root=tmp_path)
+    metrics = record["queries"][0]["metrics"]
+    # the preamble once, then "good" and "bad" (4 and 3 tokens, sharing
+    # nothing); per review the two filter tails and the frame, which
+    # share nothing; per anchor the label, "acting", and the tail
+    stages = len(spec.aliases[0].filters)
+    assert stages == 2
+    minimum = (2 + 4 + 3) + 2 * (2 * 2 + 2) + 2 * (1 + 6 + 3)
+    assert metrics["minimum_tokens"] == minimum
+    assert metrics["regret_tokens"] == 1000 - minimum
+    assert loaded == ["test-tokenizer"]
+    saved = json.loads((destination / "IMDB-4/prompt_pieces.json").read_text())
+    assert saved == pieces
+
+    quail_b.report(destination, root=tmp_path)
+    rescored = json.loads((destination / "run.json").read_text())
+    assert rescored["queries"][0]["metrics"] == metrics
+    table = pq.read_table(destination / "measurements.parquet")
+    assert table.to_pylist()[0] == {
+        "query": "IMDB-4", "runtime_s": 2.0, "fresh_tokens": 1000,
+        "minimum_tokens": minimum, "regret_tokens": 1000 - minimum,
+        "evaluated_document_pairs": 2, "input_rows": 3,
+        "answers_evaluated": 2 * stages + 2, "answers_correct": 2 * stages + 2,
+        "predicted_rows": 2, "expected_rows": 2, "matching_rows": 2,
+        "cost_usd": None,
+    }
+    assert "| IMDB-4 | r: 2, a: 1 | 1000 |" in (destination / "report.md").read_text()
+
+    def broken(spec, tables):
+        output = execute(spec, tables)
+        output.prompt_pieces = {"tokenizer": "test-tokenizer", "joins": []}
+        return output
+
+    with pytest.raises(ValueError, match="missing filter stages"):
+        quail_b.run(broken, queries=["IMDB-4"], output_dir=tmp_path / "broken",
+                    root=tmp_path)
+
+
 def test_saved_answers_survive_scoring_failure_and_can_move(tmp_path):
     import shutil
 

@@ -31,6 +31,10 @@ class RunOutput:
         rows: The final rows, one ID column per selected alias.
         runtime_s: Completed query execution time, excluding result collection.
         measurements: Additional engine measurements, including startup and tokens.
+        prompt_pieces: The prompt token ids around each document, as
+            `quail_b.minimum.validate_prompt_pieces` describes, or None.
+            With the answers and `fresh_tokens`, they give the run's
+            minimum input tokens and its regret.
     """
 
     filter_answers: dict[tuple[str, int], pa.Table] | None
@@ -38,6 +42,7 @@ class RunOutput:
     rows: pa.Table
     runtime_s: float | None = None
     measurements: dict = field(default_factory=dict)
+    prompt_pieces: dict | None = None
 
 
 @dataclass

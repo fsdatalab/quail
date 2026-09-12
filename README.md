@@ -52,16 +52,33 @@ startup, engine configuration, hardware, and any Modal resources.
   scoring, and saving. Report those other durations in `measurements`.
 - `filter_answers`: tables keyed by `(alias, predicate_position)`.
 - `join_answers`: tables keyed by join position.
-- `measurements`: optional values such as `fresh_tokens`, `regret_tokens`,
-  and `evaluated_document_pairs`.
+- `measurements`: optional values such as `fresh_tokens` and
+  `evaluated_document_pairs`. A fresh token is an input token position a
+  model forward pass processed instead of reading it from existing KV.
+- `prompt_pieces`: optional. The token ids the engine put around each
+  document: `tokenizer` (the HuggingFace tokenizer name), `preamble`,
+  one `{"alias", "position", "tail"}` per filter stage, and one
+  `{"position", "anchor", "frame", "label", "tail"}` per join, where a
+  join request is preamble, anchor document, frame, label, partner
+  document, tail. See `quail_b.minimum.validate_prompt_pieces`.
 
 Answer tables contain alias ID columns and a non-null boolean `answer` column.
 Use `None` for unavailable predicate answers. QUAIL-B still scores final-output
 precision and recall. Missing measurements are reported as unavailable.
 
+With the answers, `fresh_tokens`, and `prompt_pieces`, scoring computes
+`minimum_tokens`: the fewest input tokens the run's requests needed with
+unlimited KV, where every distinct token prefix across the requests is
+computed once. `regret_tokens` is `fresh_tokens` minus that minimum: the
+KV the engine recomputed. Both are computed after the run, on the CPU,
+from the saved answer tables and the corpus tokenized with the named
+tokenizer, so they never count toward `runtime_s`.
+
 ## Report
 
-A run saves `run.json`, per-query Parquet answers, and `report.md`.
+A run saves `run.json`, per-query Parquet answers, `report.md`, and
+`measurements.parquet`, one row per completed query with its runtime,
+token counts, accuracy counts, and cost.
 Completed answers are saved before scoring. Errors remain recorded in the run.
 
 Regenerate the report from saved answers without executing queries:
