@@ -235,9 +235,7 @@ def walk(seq, live0: dict, lengths: dict, resident, pre: int,
     records = []
     applied = []
     for spec, anchor in seq:
-        # live counts thin by the applied stages in written order, the
-        # convention the search prices with, so a sequence costs the
-        # same here as in the search that chose it
+        # thin in written order, as the search priced it
         live = dict(live0)
         for done in sorted(applied, key=lambda s: s["written_pos"]):
             thin(live, done)

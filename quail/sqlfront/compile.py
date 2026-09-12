@@ -318,8 +318,7 @@ def compile_sql(sql: str, catalog: Catalog,
         if on is None:
             continue    # a bare/cross-joined table: some join
             #             predicate must cover it (checked below)
-        # ON holds ordinary equalities, which choose the pairs, and
-        # at most one AI predicate, which the model asks of them
+        # ON: equalities choose the pairs; at most one AI predicate
         equalities, predicates = [], []
         for term in _conjuncts(on):
             if _is_call(term, "AI_FILTER"):

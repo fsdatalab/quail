@@ -85,8 +85,7 @@ class QuailModelExecution:
         if isinstance(node, AiFilter):
             document_ids = inputs["document_ids"]
             if node.pin_survivors:
-                # the join that consumes this chain drives it and fills
-                # the holder; the result is complete once it has
+                # filled by the join that consumes this chain
                 stream = SurvivorStream(node, document_ids)
 
                 def finalize():
@@ -124,9 +123,7 @@ class QuailModelExecution:
         source = None
         if stream is not None:
             filter_node = stream["node"]
-            # the chain hands each passing document over with its KV
-            # pinned; pages cover the join's largest frame so the join
-            # never claims a page of its own for a streamed anchor
+            # a pinned survivor's pages must cover the join's largest frame
             source = loop.FilterStream(
                 torch,
                 arena,
@@ -162,9 +159,7 @@ class QuailModelExecution:
             anchor_batch=inputs.get("anchor_batch"),
         )
         if source is not None:
-            # the anchors are the keys the join admitted, in admission
-            # order; a per-batch function may have dropped some held
-            # survivors before admission
+            # admission order; a per-batch function may have dropped some
             anchor_ids = [key[1] for key in inputs["anchor_keys"]]
             kv_round = {"hits": len(anchor_ids), "misses": 0}
             stream["holder"].update(

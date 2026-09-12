@@ -86,7 +86,6 @@ class PhysicalPlan:
         if self.estimator is not None and not self.estimates:
             object.__setattr__(self, "estimates", self.estimator(graph))
 
-    # ---- editing the DAG --------------------------------------------
 
     def _edge(self, producer: str, consumer: str) -> tuple:
         """The one input port of consumer that reads producer."""
@@ -250,8 +249,7 @@ def _rederive_pins(nodes: tuple) -> tuple:
 
 def _stream_reaches_join(graph, chain) -> bool:
     """Whether a chain's survivors reach its join through per-batch nodes."""
-    # only this chain is pinned in the trial, so another chain's old
-    # pin cannot decide this one's
+    # only this chain is pinned in the trial
     trial = PhysicalGraph(tuple(
         replace(node, pin_survivors=node.node_id == chain.node_id)
         if isinstance(node, AiFilter) else node

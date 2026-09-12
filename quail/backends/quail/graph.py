@@ -231,10 +231,7 @@ def prepare_model_inputs(node, inputs, context: ExecutionContext):
             _tuple_suffix(join, state["docs"], member)
             for member in tuples
         ])
-    # a stage over pairs streams each anchor against its own pairs:
-    # from the request's pair tables, a Foreign node's table, or the
-    # rows a per-batch Foreign node fills in as the chain hands
-    # anchors over
+    # pairs come from the request, a Foreign table, or a per-batch Foreign
     maps = partner_maps(group, port_pairs, streamed=set(streamed_pairs))
     for position, pairs in streamed_pairs.items():
         maps[position] = pairs.rows
@@ -263,8 +260,7 @@ def prepare_model_inputs(node, inputs, context: ExecutionContext):
         state["kv_stats"]["join_anchor_misses"] += round_kv["misses"]
         anchor_stream = None
     else:
-        # the join admits anchors as the chain hands them over; the
-        # driver appends each one's key and prefix to these lists
+        # filled by the driver as the chain hands anchors over
         anchor_ids = None
         prefixes = []
         anchor_keys = []

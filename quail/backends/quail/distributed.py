@@ -103,8 +103,7 @@ class DistributedQuailExecution:
 
         document_ids = next(iter(inputs.values()))
         if node.pin_survivors:
-            # the join round that consumes this chain runs it on every
-            # GPU and fills the holder with the merged answers
+            # filled by the join round that consumes this chain
             stream = SurvivorStream(node, list(document_ids))
 
             def finalize():
@@ -190,8 +189,7 @@ class DistributedQuailExecution:
         stream = inputs.get("anchor_stream")
         filtered_aliases = set(self.retained)
         if stream is not None:
-            # the anchor's chain runs inside this round on each GPU,
-            # over that GPU's filter shard of every anchor document
+            # the anchor's chain runs inside this round, over this GPU's shard
             survivors[node.anchor] = list(stream.document_ids)
             filtered_aliases.add(node.anchor)
         if not self.joins_started:

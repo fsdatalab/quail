@@ -249,8 +249,7 @@ class GenericRunner:
                     node, inputs, context
                 )
                 if result.metrics.wall_s == 0.0 and result.finalize is None:
-                    # a runtime that does not time itself is timed here,
-                    # so every executed node carries its wall seconds
+                    # runtimes that do not time themselves are timed here
                     result = replace(result, metrics=replace(
                         result.metrics,
                         wall_s=time.perf_counter() - started,
@@ -527,8 +526,7 @@ class ForeignRuntime:
                 outputs = {f"ids:{node.aliases[0]}": result}
             return NodeResult(outputs, metrics())
 
-        # per batch on a stream: the consuming join runs the batch
-        # function on each batch the chain hands over
+        # per batch: the consuming join runs it on each batch
         (stream_alias, stream), = streams.items()
         produced = []
         if node.ids == "pairs":

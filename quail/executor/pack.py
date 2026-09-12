@@ -201,7 +201,6 @@ class JoinAdmission:
         self.pending.extend(a for a in range(n)
                             if a not in resident and self._stage[a] == -1)
 
-    # ---- per-anchor partner lists ------------------------------------
 
     def _count(self, a, j):
         lst = self._lists[a][j]
@@ -432,8 +431,7 @@ class JoinAdmission:
                 if self._count(a, j + 1):
                     self.ready.append(a)
                 else:
-                    # no partner at the next stage: an empty row when
-                    # it was the last, dropped otherwise
+                    # an empty row at the last stage, dropped otherwise
                     self._stage[a] = _DONE
                     events.append(("finished" if j + 2 == k else "dropped", a))
             elif complete and not self._true[a][j]:

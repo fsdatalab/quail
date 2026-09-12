@@ -460,8 +460,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
 
     cap_pages = retention_pages(admission, chunk, budgets.PAGE_TOKENS)
     costs = retention.coefficients(model, device)
-    # KV reuse is priced as unlimited: a filtered alias pays no prefix
-    # at its first anchor use, and no alias pays one at a later use
+    # KV reuse is priced as unlimited
     filtered = set(filters)
 
     def run_search(honor_forced=True):
@@ -478,8 +477,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
 
     found = run_search()
     seq = [(specs[position], anchor) for position, anchor in found["seq"]]
-    # join node ids name the anchor; a second group on the same anchor
-    # gets :2, a third :3
+    # a second group on the same anchor gets :2, a third :3
     sequence_groups = retention.group_sequence(seq)
     group_ids = []
     seen_ids = {}
@@ -495,14 +493,8 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
         return key if seen_ids[key] == 1 else f"{key}:{seen_ids[key]}"
 
     retention_plan = retention.schedule(seq, live0, group_ids)
-    # a filtered alias whose first use is as an anchor has its chain run
-    # right before that group and stream into it with KV pinned; its
-    # survivors never enter the retention pool. An alias that was a
-    # partner first must finish its chain before that earlier group, so
-    # its survivors wait in the pool.
-    # a barrier apply needs every survivor at once, so its alias's
-    # chain cannot stream; the same for the anchor of a join whose
-    # pairs a barrier apply returns
+    # a chain streams only into its alias's first use, and never through
+    # a barrier apply
     barrier_aliases = {alias for alias, group in alias_applies.items()
                        if any(apply.kind == "barrier" for apply in group)}
     for group in sequence_groups:
@@ -596,8 +588,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
             shard_ranges=shard_ranges,
             shard_token_loads=tuple(loads)))
         ids_src[s.alias] = PortRef(sid, f"ids:{s.alias}")
-    # an equality pairs whole tables, so its hash join reads the scans
-    # and the AI join keeps the pairs both sides' survivors allow
+    # the hash join reads the scans; survivors thin its pairs at the AI join
     pairs_src = {}
     for node in hash_join_nodes(joins, pair_fractions, ids_src.values()):
         nodes.append(node)
@@ -619,8 +610,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
         keep = alias in retention_plan["initial"]
         pinned = alias in streamed
         writes = len(stages) > 1 or keep or pinned
-        # a pinned survivor's pages also cover the consuming join's
-        # largest frame, so the join never claims a page for it
+        # pinned pages also cover the consuming join's largest frame
         hold = max((spec["frame_tokens"][alias]
                     for spec, _ in sequence_groups[streamed[alias]])
                    if pinned else (0,))
@@ -644,8 +634,6 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
         emit_applies(alias)
 
     def emit_applies(alias):
-        # a user function on one table sits right after its filter
-        # chain (or its scan) and hands the chain's output on
         for apply in alias_applies.get(alias, ()):
             aid = f"apply:{apply.function}"
             nodes.append(Foreign(
@@ -687,8 +675,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
             for a in ahead:
                 ids_src[a] = PortRef(bid, f"ids:{a}")
         if workers > 1:
-            # anchors go to the GPU that holds their KV, or balance
-            # across GPUs when none does; one GPU passes them through
+            # anchors go to the GPU holding their KV, else balanced
             xid = unique_id("exchange", anchor)
             nodes.append(Exchange(
                 node_id=xid,

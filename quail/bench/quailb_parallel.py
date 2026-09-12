@@ -261,8 +261,7 @@ def run_all(
 
     only = [item.strip() for item in query.split(",")] if query else None
     query_ids = tuple(spec.id for spec in select_queries(only, scale_factor=sf))
-    # not resolve(): inside the container /results is a mount whose real
-    # path lies elsewhere
+    # not resolve(): /results is a mount inside the container
     directory = Path(run_dir)
     if not directory.is_relative_to("/results") or directory == Path("/results"):
         raise ValueError("run directory must be inside the /results volume mount")

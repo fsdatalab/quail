@@ -497,8 +497,7 @@ def _child_joins(state, sub):
             stage_suffixes.append(
                 [_tuple_suffix(j, part_docs, combo)
                  for combo in combos])
-        # the coordinator ships each pair stage's anchor -> partner
-        # rows for this GPU's anchors only
+        # this GPU's anchors only
         lists_for = partner_list_builder(
             group, tuple_globs,
             {int(position): {int(anchor): partners
@@ -510,9 +509,7 @@ def _child_joins(state, sub):
             round_kv = _join_round_kv(anchor_keys, arena.accounting.owned)
             anchor_stream = None
         else:
-            # this GPU's shard of the anchor documents runs through the
-            # chain here; the driver appends each streamed anchor's key
-            # and prefix to these lists
+            # filled by the driver as this GPU's shard streams through
             prefixes, anchor_keys = [], []
             round_kv = None
             anchor_stream = {

@@ -59,8 +59,7 @@ class JoinStage:
     pair_tail_tokens: int
     anchor_resident: str
     tuple_tokens: float
-    # the node (a HashJoin or a Foreign) whose pairs the stage streams
-    # each anchor against, if any; empty for a cross join
+    # empty for a cross join
     pairs_from: str = ""
     frame_token_ids: tuple[int, ...] = ()
     label_token_ids: tuple[tuple[str, tuple[int, ...]], ...] = ()

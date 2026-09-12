@@ -202,9 +202,7 @@ class _Search:
         # column -> rows every filtered alias of that column computed
         # as prefixes; another alias of the column may reuse them
         self.computed_rows_by_column: dict[str, set[int]] = {}
-        # join written position -> alias -> row -> the other alias's
-        # rows its equality conditions allow; joins without
-        # conditions are absent and evaluate every pair
+        # joins without conditions are absent: every pair
         self.allowed_pairs: dict[int, dict[str, dict[int, set[int]]]] = {}
         for position, join in enumerate(self.joins):
             conditions = join_conditions(join)

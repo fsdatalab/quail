@@ -577,8 +577,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
                 report(outstanding.pop(0))
                 continue
             if anchor_source is not None and not anchor_source.done:
-                # nothing to run here: the source has to move, and it
-                # may evict retained KV to admit again
+                # the source has to move; it may evict retained KV to admit
                 if pull(evict_retained=True, force=True):
                     continue
             raise AssertionError("nothing buildable and nothing in flight")
@@ -882,9 +881,7 @@ class FilterStream:
             raise ValueError("arena_writes=False needs a single stage")
         self.attention_mode = attention_mode or pipeline.attention_mode
         unified = self.attention_mode == "unified"
-        # unified scatters each stage's question tail (the tokens past
-        # the kept preamble) into the doc's pages; capacity must cover
-        # the longest tail, or zero when every question is pure preamble
+        # capacity must cover the longest tail past the kept preamble
         temp_tail = max(0, *(len(q) - p for q in question_ids)) \
             if unified and arena_writes else 0
         capacity_extra = p + temp_tail
@@ -998,8 +995,7 @@ class FilterStream:
                 self._finish(items)
                 return items, False
             if self.hold:
-                # the consumer frees and claims pages between chunks,
-                # so the chain's own arithmetic cannot track them
+                # the consumer frees and claims pages between chunks
                 sched.free_pages = arena.accounting.free_pages
             t = time.perf_counter() if timing is not None else 0.0
             groups = sched.next_chunk()
