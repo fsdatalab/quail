@@ -315,6 +315,10 @@ def test_load_benchmark_with_local_reference_labels(tmp_path):
     assert row["accuracy"]["answer_accuracy"]["accuracy"] == 1.0
     assert row["documents_per_second"] == 1.0
     assert row["cost_usd"] == 0.002
+    assert row["fresh_tokens"] == 100
+    assert row["minimum_tokens"] is None
+    assert row["regret_tokens"] is None
+    assert row["evaluated_document_pairs"] is None
     assert "document_pairs_per_second" not in row
     assert record["collection_id"] == collection_id
     assert pq.read_table(output_dir / "IMDB-1/rows.parquet").to_pydict() == {

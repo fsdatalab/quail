@@ -30,7 +30,15 @@ class RunOutput:
             evaluated tuple.
         rows: The final rows, one ID column per selected alias.
         runtime_s: Completed query execution time, excluding result collection.
-        measurements: Additional engine measurements, including startup and tokens.
+        measurements: Engine-reported numbers. `fresh_tokens` is the
+            count of input token positions a model forward pass processed
+            instead of reading from existing KV; it is required when
+            `prompt_pieces` is set. Other values such as startup duration
+            stay optional.
+        prompt_pieces: The prompt token ids around each document, as
+            `quail_b.minimum.validate_prompt_pieces` describes, or None.
+            With the answers and `fresh_tokens`, scoring fills
+            `minimum_tokens` and `regret_tokens`.
     """
 
     filter_answers: dict[tuple[str, int], pa.Table] | None
@@ -38,6 +46,7 @@ class RunOutput:
     rows: pa.Table
     runtime_s: float | None = None
     measurements: dict = field(default_factory=dict)
+    prompt_pieces: dict | None = None
 
 
 @dataclass
