@@ -7,6 +7,8 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from quail_b._files import download_cache
@@ -65,17 +67,23 @@ def _validate_output(spec, output, tables):
             or not isinstance(output.runtime_s, (int, float))
             or not math.isfinite(output.runtime_s) or output.runtime_s < 0):
         raise ValueError("runtime_s must be a finite nonnegative number")
-    known = {alias.alias: set(map(str, tables[alias.table]["id"].to_pylist()))
-             for alias in spec.aliases}
+    known = {alias.alias: tables[alias.table]["id"] for alias in spec.aliases}
 
     def validate_ids(table, aliases):
-        if any(table[alias].null_count for alias in aliases):
-            raise ValueError("document IDs cannot be null")
-        columns = [list(map(str, table[alias].to_pylist())) for alias in aliases]
-        for alias, ids in zip(aliases, columns):
-            if set(ids) - known[alias]:
+        # Arrow throughout: a join can return hundreds of millions of rows
+        for alias in aliases:
+            ids, reference = table[alias], known[alias]
+            if ids.null_count:
+                raise ValueError("document IDs cannot be null")
+            if ids.type != reference.type:
+                ids = ids.cast(pa.string())
+                reference = reference.cast(pa.string())
+            unknown = pc.invert(pc.is_in(ids, value_set=pc.unique(reference)))
+            if pc.sum(unknown).as_py():
                 raise ValueError(f"unknown document ID for alias {alias}")
-        if len(set(zip(*columns))) != len(table):
+        if table.num_rows and (
+                table.select(aliases).group_by(aliases).aggregate([]).num_rows
+                != table.num_rows):
             raise ValueError("duplicate document IDs in an answer table")
 
     selected = [name.split(".")[0] for name in spec.select]
