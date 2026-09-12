@@ -5,7 +5,11 @@ run is on the `quail-results` volume at the path given with it, with
 its Modal function call id. All GPU runs: one H100, Qwen3 4B fp8,
 sf=0.1, model startup excluded from query time. Query time, document
 pairs per second, and $/query follow the definitions in CLAUDE.md;
-$/query uses $3.9492 per H100 hour.
+$/query uses $3.9492 per H100 hour. The recomputed KV columns in
+sections 1 to 5 are the engine's per-document `regret_tokens`, a
+document's own prefix computed again. Section 9 and the benchmark
+report use `regret_distinct_tokens`, which also counts the prompt
+prefix the documents share; section 10 says why.
 
 ## 1. Filter survivors stream into the join anchored on them
 
@@ -38,7 +42,7 @@ same container, one warmup and one measured run per query. Function
 call `fc-01M27GHD7K71XA6RNX9XEY6XP8`, data at
 `/results/ablations/streamed-filter-join-20260911T055517Z/`.
 
-| Query | Configuration | Query time, s | Document pairs/s | $/query | Fresh tokens | Recomputed KV tokens | Saved, s (predicted) |
+| Query | Configuration | Query time, s | Document pairs/s | $/query | Fresh tokens | Per-document recomputed KV | Saved, s (predicted) |
 |---|---|---:|---:|---:|---:|---:|---:|
 | IMDB-3 | Materialized | 32.58 | 1,613.3 | 0.03574 | 3,777,943 | 1,217,171 | |
 | IMDB-3 | Streamed | 22.47 | 2,339.1 | 0.02465 | 2,560,772 | 0 | 10.11 (10.4) |
@@ -82,7 +86,7 @@ Run: same cell and baseline, function call
 `fc-01M27NHND7E2RVB4VKD4XZ1JQ0`, data at
 `/results/ablations/streamed-filter-join-20260911T072243Z/`.
 
-| Query | Configuration | Query time, s | Document pairs/s | $/query | Fresh tokens | Recomputed KV tokens | Saved, s (predicted) |
+| Query | Configuration | Query time, s | Document pairs/s | $/query | Fresh tokens | Per-document recomputed KV | Saved, s (predicted) |
 |---|---|---:|---:|---:|---:|---:|---:|
 | IMDB-10 | Materialized | 57.03 | 2,531.1 | 0.06256 | 6,696,942 | 1,217,171 | |
 | IMDB-10 | Streamed | 47.16 | 3,060.8 | 0.05173 | 5,479,771 | 0 | 9.87 (10.7) |
@@ -148,7 +152,7 @@ cold boot and measured it at 24.0 seconds; its FEV-10 and FEV-9 agree
 with the second run). SoL estimates for the three queries are at
 `/results/sol/2026-09-11-fev10-prefix-reuse.json`.
 
-| Query | Query time, s | Document pairs/s | $/query | Fresh tokens | Recomputed KV tokens | Evaluated pairs | Answer agreement, % | Output precision, % | Output recall, % | Rows (expected) |
+| Query | Query time, s | Document pairs/s | $/query | Fresh tokens | Per-document recomputed KV | Evaluated pairs | Answer agreement, % | Output precision, % | Output recall, % | Rows (expected) |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | FEV-5 | 13.47 | 4,582.9 | 0.01478 | 1,515,283 | 0 | 61,731 | 79.57 | 1.05 | 96.43 | 12,830 (140) |
 | FEV-10 | 1.66 | 111.4 | 0.00182 | 187,567 | 0 | 185 | 89.09 | 82.76 | 96.77 | 145 (124) |
@@ -184,7 +188,7 @@ Run: `experiments/cells/foreign_pairs.py`, function call
 a left outer join and returned null ids; the runtime now refuses a
 null id and the function uses an inner join).
 
-| Variant | Query time, s | Document pairs/s | $/query | Fresh tokens | Recomputed KV tokens | Pairs | Rows | Evidence chain pinned | Function calls |
+| Variant | Query time, s | Document pairs/s | $/query | Fresh tokens | Per-document recomputed KV | Pairs | Rows | Evidence chain pinned | Function calls |
 |---|---:|---:|---:|---:|---:|---:|---:|---|---:|
 | equality (`on=`) | 1.69 | 109.5 | 0.00185 | 187,567 | 0 | 185 | 145 | yes | 0 |
 | per_batch (`apply`) | 1.69 | 109.5 | 0.00185 | 187,567 | 0 | 185 | 145 | yes | 2 |
@@ -331,24 +335,37 @@ with the same fresh tokens; answers and rows are identical everywhere.
 
 | Query | Saved time, s | Rerun time, s | Change | Saved recomputed KV | Rerun recomputed KV | Agreement saved / rerun, % |
 |---|---:|---:|---:|---:|---:|---:|
-| IMDB-3 | 32.35 | 22.20 | -31.4% | 1,217,732 | 0 | 79.16 / 79.16 |
-| IMDB-4 | 19.99 | 17.34 | -13.3% | 361,440 | 0 | 77.76 / 77.76 |
-| IMDB-5 | 17.76 | 16.52 | -7.0% | 188,587 | 0 | 80.17 / 80.17 |
-| IMDB-10 | 59.71 | 47.65 | -20.2% | 1,217,732 | 0 | 73.93 / 72.59 |
-| BIO-3 | 89.92 | 79.31 | -11.8% | 919,409 | 0 | 82.54 / 82.54 |
-| FEV-9 | 41.14 | 39.59 | -3.8% | 7,309 | 0 | 67.77 / 67.77 |
-| FEV-10 | 1.68 | 1.69 | +0.6% | 0 | 0 | 89.09 / 89.09 |
+| IMDB-3 | 32.35 | 22.20 | -31.4% | 1,228,087 | 10,355 | 79.16 / 79.16 |
+| IMDB-4 | 19.99 | 17.34 | -13.3% | 371,795 | 10,355 | 77.76 / 77.76 |
+| IMDB-5 | 17.76 | 16.52 | -7.0% | 198,942 | 10,355 | 80.17 / 80.17 |
+| IMDB-10 | 59.71 | 47.65 | -20.2% | 1,238,442 | 1,504,587 | 73.93 / 72.59 |
+| BIO-3 | 89.92 | 79.31 | -11.8% | 920,895 | 1,486 | 82.54 / 82.54 |
+| FEV-9 | 41.14 | 39.59 | -3.8% | 139,458 | 132,149 | 67.77 / 67.77 |
+| FEV-10 | 1.68 | 1.69 | +0.6% | 467 | 467 | 89.09 / 89.09 |
+
+Recomputed KV here is `regret_distinct_tokens` (section 10). The
+per-document `regret_tokens` the prediction was stated in went from
+1,217,732, 361,440, 188,587, 1,217,732, 919,409, and 7,309 to 0 on the
+six queries. What remains is the prompt prefix the documents share:
+10,355 tokens across the reviews, 1,486 across the reports, and on
+FEV-9 132,149 across its two claim and two evidence aliases. IMDB-10's
+rerun figure also holds the 1,494,232-token second copy of the reviews
+that its `r2` anchor computes; both runs computed it (identical fresh
+tokens), but the saved suite's build credited only each alias's
+within-set prefix (2 x 10,355), while the current accounting credits a
+second alias's full copy.
 
 What happened against the prediction:
 
-- The six queries with recomputed KV all went to 0, and the five with
-  a filtered anchor lost 7.0 to 31.4 percent of their time. IMDB-5's
-  7.0 percent is at the low end of the predicted range because its
-  recomputed share was the smallest (188,587 of 2,118,230 fresh
-  tokens).
+- The six queries with per-document recomputed KV all went to 0 on
+  that count, and the five with a filtered anchor lost 7.0 to 31.4
+  percent of their time. IMDB-5's 7.0 percent is at the low end of the
+  predicted range because its recomputed share was the smallest
+  (188,587 of 2,118,230 fresh tokens).
 - FEV-9 came in at 39.59 s, just above the predicted 38 to 39, with
-  0 recomputed tokens as predicted.
-- The 26 queries with no recomputed KV have the same fresh tokens and
+  0 per-document recomputed tokens as predicted.
+- The 26 queries with no per-document recomputed KV have the same fresh
+  tokens and
   the same rows as before. Their times moved between -3.4 and +11.5
   percent. The FEVER family ran 2.5 to 7.1 percent slower across all
   eight of its unchanged queries, and LEP-6 11.5 percent slower, which
@@ -373,3 +390,34 @@ and `results/benchmark/20260912T032332Z-quail-only-fever-sf0.1.log`
       --model qwen3-4b-fp8 --sf 0.1 \
       --ground-truth-collection gt_77bb8b128743a79aedddaa24c808c3f8 \
       --no-include-baselines --no-include-sglang
+
+## 10. Recomputed KV counts the shared prompt prefix
+
+The benchmark report and its figures showed the engine's per-document
+`regret_tokens`, which is 0 on both AGENT queries although Quail
+computes the 11,882,610 tokens the 1,772 agent traces share as a
+prefix once per document. They now show `regret_distinct_tokens`: the
+per-document count plus the prefix tokens the scanned documents share
+(a set scanned under two aliases counts its second copy in full) minus
+the cross-row cache hits the engine reported. `quail/runtime/prefixes.py`
+derives it on the CPU after the run from the saved counts and the
+corpus tokens; every saved row on the volume already carries it, and
+nothing is tracked in the engine loop. The rule in CLAUDE.md names
+this figure now.
+
+AGENT-1 under the new figure, all from the saved rows:
+
+| Configuration | Query time, s | Fresh tokens | Recomputed KV tokens |
+|---|---:|---:|---:|
+| Quail | 234.86 | 17,389,113 | 11,882,610 |
+| Stock vLLM (operator-at-a-time) | 102.35 | 5,526,889 | 20,386 |
+| Pipelined vLLM | 99.15 | 5,526,889 | 20,386 |
+| Pipelined SGLang | 218.13 | 13,068,441 | 7,561,938 |
+
+vLLM's prefix cache reuses the shared prompt across documents and
+Quail's arena does not, which is the whole gap between them on AGENT.
+Two saved rows have no figure: the earlier SGLang adapter's cross-row
+count on FEV-7 and FEV-8 is 125,851 tokens, the whole evidence set,
+more than any prefix the trie credits, so the derived value is
+negative and the report marks it not measured rather than zero.
+

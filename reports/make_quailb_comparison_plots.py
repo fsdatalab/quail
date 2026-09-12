@@ -89,6 +89,22 @@ METHODS = [
 ]
 
 
+def recomputed_kv(row):
+    """Return a saved row's recomputed KV tokens, or None when not measured.
+
+    The value is the saved `regret_distinct_tokens`. A row whose engine
+    reported more cross-row cache hits than any prefix the trie credits
+    derives to a negative number and has no measured figure.
+    """
+    value = row["regret_distinct_tokens"]
+    return None if value is None or value < 0 else value
+
+
+def token_cell(value):
+    """Format a token count for a report table cell."""
+    return "Not measured" if value is None else f"{value:,}"
+
+
 def row_metrics(row):
     """Derive throughput, GPU cost, and accuracy from saved counts."""
     joins = [stage for stage in row["stages"] if stage["op"] == "join"]
@@ -101,7 +117,7 @@ def row_metrics(row):
     expected = output["expected_rows"]
     return {
         "seconds": row["wall_s"],
-        "recomputed": row["regret_tokens"],
+        "recomputed": recomputed_kv(row),
         "fresh": row["fresh_tokens"],
         "throughput": count / row["wall_s"],
         "unit": "pairs/s" if joins else "docs/s",
@@ -298,7 +314,8 @@ def plot_comparison(title, queries, rows, relations, sol, name, overview=False):
                 "SoL estimates ideal work with unlimited prefix KV reuse across "
                 "requests and reference-label survivors. "
                 "It has no measured accuracy.\n"
-                "Fresh tokens include recomputed KV. A dash marks zero. "
+                "Fresh tokens include recomputed KV. A dash marks zero, "
+                "a cross a value that was not measured. "
                 "Stock vLLM uses operator-at-a-time submission.")
             footer_text += (
                 "\nFEV-9 and FEV-10 use the revised SGLang adapter; other SGLang "
@@ -332,7 +349,7 @@ def current_row(query):
         "query": query["id"],
         "wall_s": measured["wall_s"],
         "fresh_tokens": measured["fresh_tokens"],
-        "regret_tokens": measured["regret_tokens"],
+        "regret_distinct_tokens": measured["regret_distinct_tokens"],
         "stages": measured["stages"],
         "backend_metrics": measured["backend_metrics"],
         "accuracy": query["metrics"]["accuracy"],
@@ -446,7 +463,11 @@ def rerun_lines(saved, rows, manifests, queries):
         "## Quail rerun against the saved Quail rows", "",
         f"Quail only, {len(saved)} queries, from {runs}. The Quail bars and "
         "the Quail rows above come from these runs; the baseline rows are "
-        "the saved runs.", "",
+        "the saved runs. Where a set is scanned under two aliases (IMDB-9,",
+        "IMDB-10, FEV-7, FEV-8), the saved row credits each alias's within-set",
+        "prefix only, while the rerun row also credits the second alias's full",
+        "copy (1,494,232 review tokens, 125,851 evidence tokens); fresh tokens",
+        "are identical, so the engine did the same work in both runs.", "",
         "| Query | Saved seconds | Rerun seconds | Change | Saved recomputed KV "
         "| Rerun recomputed KV | Saved fresh tokens | Rerun fresh tokens "
         "| Agreement saved / rerun, % | Rows saved / rerun |",
@@ -459,7 +480,8 @@ def rerun_lines(saved, rows, manifests, queries):
         new_rows = rows["quail"][query]["accuracy"]["output_accuracy"]["predicted_rows"]
         lines.append(
             f"| {query} | {before['seconds']:.2f} | {after['seconds']:.2f} "
-            f"| {change:+.1f}% | {before['recomputed']:,} | {after['recomputed']:,} "
+            f"| {change:+.1f}% | {token_cell(before['recomputed'])} "
+            f"| {token_cell(after['recomputed'])} "
             f"| {before['fresh']:,} | {after['fresh']:,} "
             f"| {before['agreement']:.2f} / {after['agreement']:.2f} "
             f"| {old_rows:,} / {new_rows:,} |")
@@ -603,9 +625,16 @@ def main(workdir, fev9_dir=None, fev10_dir=None, quail_dirs=()):
         "  suffix tokens, and any repeated computation after KV becomes unavailable.",
         "  A repeated token counts again. This is not a count of unique text or",
         "  generated answers. Recomputed KV tokens are part of the fresh-token total.",
-        "- Recomputed KV is the saved `regret_tokens` total for reusable prefixes",
-        "  of documents or anchors already computed earlier in the query. This uses",
-        "  per-document accounting, not the separate distinct-prefix metric.",
+        "- Recomputed KV is the saved `regret_distinct_tokens`: input tokens a",
+        "  forward pass computed although the same prefix had already been",
+        "  computed in this query, either a document's own prefix at a later",
+        "  stage or anchor use, or the prompt prefix the documents share. It is",
+        "  derived on the CPU after the run (`quail/runtime/prefixes.py`) from",
+        "  the per-document `regret_tokens`, the corpus's shared prefix tokens,",
+        "  and the cross-row cache hits the engine reported; the engine tracks",
+        "  nothing extra. The earlier SGLang adapter's cross-row count for FEV-7",
+        "  and FEV-8 equals the whole evidence set (125,851 tokens), more than",
+        "  any prefix the trie credits, so their recomputed KV is not measured.",
         "  Token and latency plots use a log scale when positive values span more",
         "  than one order of magnitude. Recomputed KV retains a linear region to",
         "  include zero. A dash marks zero.",
@@ -670,7 +699,8 @@ def main(workdir, fev9_dir=None, fev10_dir=None, quail_dirs=()):
                     continue
                 m = row_metrics(rows[key][query])
                 lines.append(
-                    f"| {query} | {label} | {m['seconds']:.2f} | {m['recomputed']:,} "
+                    f"| {query} | {label} | {m['seconds']:.2f} "
+                    f"| {token_cell(m['recomputed'])} "
                     f"| {m['fresh']:,} | {m['throughput']:,.2f} "
                     f"| {m['unit']} | {m['cost']:.5f} | {m['agreement']:.2f} "
                     f"| {m['precision']:.5g} | {m['recall']:.5g} |")
