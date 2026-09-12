@@ -78,6 +78,7 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 from plot_colors import BLUE, DARK, GRAY, GREEN, ORANGE
 
+from quail.runtime.prefixes import scanned_aliases
 from quail.specs import H100_USD_PER_HOUR
 
 HERE = Path(__file__).resolve().parent
@@ -98,6 +99,19 @@ def recomputed_kv(row):
     """
     value = row["regret_distinct_tokens"]
     return None if value is None or value < 0 else value
+
+
+def restated_saved_row(saved, rerun):
+    """The saved row with recomputed KV restated under the current credit.
+
+    The saved suite credited each alias only its within-set prefix; the
+    current rule also credits a set's second copy. The rerun scanned the
+    same aliases, so its shared prefix credit applies to the saved row.
+    """
+    assert scanned_aliases(saved["stages"]) == scanned_aliases(rerun["stages"])
+    restated = (saved["regret_tokens"] + rerun["shared_prefix_tokens"]
+                - saved["cross_row_cached_tokens"])
+    return {**saved, "regret_distinct_tokens": restated}
 
 
 def token_cell(value):
@@ -349,7 +363,10 @@ def current_row(query):
         "query": query["id"],
         "wall_s": measured["wall_s"],
         "fresh_tokens": measured["fresh_tokens"],
+        "regret_tokens": measured["regret_tokens"],
+        "cross_row_cached_tokens": measured["cross_row_cached_tokens"],
         "regret_distinct_tokens": measured["regret_distinct_tokens"],
+        "shared_prefix_tokens": measured["shared_prefix_tokens"],
         "stages": measured["stages"],
         "backend_metrics": measured["backend_metrics"],
         "accuracy": query["metrics"]["accuracy"],
@@ -444,7 +461,8 @@ def load_rows(root, fev9_root, fev10_root, quail_roots=()):
             rerun = json.loads(path.read_text())
             check_run(rerun, "quail", corpus, suite, rerun_manifest)
             for query, row in current_rows(rerun).items():
-                saved_quail.setdefault(query, rows["quail"][query])
+                saved_quail.setdefault(
+                    query, restated_saved_row(rows["quail"][query], row))
                 rows["quail"][query] = row
     return (manifest, rows, fev9_manifest, fev10_manifest,
             sglang_update["result_volume_path"], saved_quail, rerun_manifests)
@@ -463,11 +481,12 @@ def rerun_lines(saved, rows, manifests, queries):
         "## Quail rerun against the saved Quail rows", "",
         f"Quail only, {len(saved)} queries, from {runs}. The Quail bars and "
         "the Quail rows above come from these runs; the baseline rows are "
-        "the saved runs. Where a set is scanned under two aliases (IMDB-9,",
-        "IMDB-10, FEV-7, FEV-8), the saved row credits each alias's within-set",
-        "prefix only, while the rerun row also credits the second alias's full",
-        "copy (1,494,232 review tokens, 125,851 evidence tokens); fresh tokens",
-        "are identical, so the engine did the same work in both runs.", "",
+        "the saved runs. The saved recomputed KV is restated under the current",
+        "credit rule, where a set scanned under two aliases counts its second",
+        "copy in full: each saved row's per-document `regret_tokens` plus the",
+        "shared prefix credit of its rerun, which scanned the same aliases. The",
+        "saved suite's build had credited each alias only its within-set",
+        "prefix, which understated IMDB-9, IMDB-10, FEV-7, and FEV-8.", "",
         "| Query | Saved seconds | Rerun seconds | Change | Saved recomputed KV "
         "| Rerun recomputed KV | Saved fresh tokens | Rerun fresh tokens "
         "| Agreement saved / rerun, % | Rows saved / rerun |",

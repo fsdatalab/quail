@@ -385,11 +385,12 @@ Figure: plots/quailb_agent.png
 
 ## Quail rerun against the saved Quail rows
 
-Quail only, 33 queries, from `/results/benchmarks/quailb/family-runs/20260912T023323Z-e689d27e/` (function calls `fc-01M29QCYQ5JZWW0DBM2330Z2CB`, `fc-01M29QF6N38ZTPKESAJSA53EP4`, `fc-01M29QF6Q0WM29JPQHA1XY98T4`, `fc-01M29QF6S4WVJV5Y3K53F4XF87`, `fc-01M29QF6VJ1SW7YAMM1SHQ93FN`, `fc-01M29QF6XNTEG0ZBTYWVRXPBD9`); `/results/benchmarks/quailb/family-runs/20260912T032335Z-609d6410/` (function calls `fc-01M29T8YFV2DACQ0TANP901Z6W`, `fc-01M29TCRAG0JW20ME880WJXXTS`). The Quail bars and the Quail rows above come from these runs; the baseline rows are the saved runs. Where a set is scanned under two aliases (IMDB-9,
-IMDB-10, FEV-7, FEV-8), the saved row credits each alias's within-set
-prefix only, while the rerun row also credits the second alias's full
-copy (1,494,232 review tokens, 125,851 evidence tokens); fresh tokens
-are identical, so the engine did the same work in both runs.
+Quail only, 33 queries, from `/results/benchmarks/quailb/family-runs/20260912T023323Z-e689d27e/` (function calls `fc-01M29QCYQ5JZWW0DBM2330Z2CB`, `fc-01M29QF6N38ZTPKESAJSA53EP4`, `fc-01M29QF6Q0WM29JPQHA1XY98T4`, `fc-01M29QF6S4WVJV5Y3K53F4XF87`, `fc-01M29QF6VJ1SW7YAMM1SHQ93FN`, `fc-01M29QF6XNTEG0ZBTYWVRXPBD9`); `/results/benchmarks/quailb/family-runs/20260912T032335Z-609d6410/` (function calls `fc-01M29T8YFV2DACQ0TANP901Z6W`, `fc-01M29TCRAG0JW20ME880WJXXTS`). The Quail bars and the Quail rows above come from these runs; the baseline rows are the saved runs. The saved recomputed KV is restated under the current
+credit rule, where a set scanned under two aliases counts its second
+copy in full: each saved row's per-document `regret_tokens` plus the
+shared prefix credit of its rerun, which scanned the same aliases. The
+saved suite's build had credited each alias only its within-set
+prefix, which understated IMDB-9, IMDB-10, FEV-7, and FEV-8.
 
 | Query | Saved seconds | Rerun seconds | Change | Saved recomputed KV | Rerun recomputed KV | Saved fresh tokens | Rerun fresh tokens | Agreement saved / rerun, % | Rows saved / rerun |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -401,8 +402,8 @@ are identical, so the engine did the same work in both runs.
 | IMDB-6 | 14.62 | 14.70 | +0.5% | 10,355 | 10,355 | 1,774,145 | 1,774,145 | 92.03 / 92.03 | 1,257 / 1,257 |
 | IMDB-7 | 14.81 | 15.18 | +2.5% | 10,355 | 10,355 | 1,796,602 | 1,796,602 | 92.13 / 92.13 | 727 / 727 |
 | IMDB-8 | 26.54 | 25.63 | -3.4% | 10,355 | 10,355 | 2,918,999 | 2,918,999 | 68.47 / 68.47 | 62,777 / 62,777 |
-| IMDB-9 | 47.61 | 46.97 | -1.3% | 20,710 | 1,504,587 | 5,338,231 | 5,338,231 | 72.43 / 72.43 | 71,374,780 / 71,374,780 |
-| IMDB-10 | 59.71 | 47.65 | -20.2% | 1,238,442 | 1,504,587 | 6,787,356 | 5,479,771 | 73.93 / 72.59 | 64,840,220 / 64,840,220 |
+| IMDB-9 | 47.61 | 46.97 | -1.3% | 1,504,587 | 1,504,587 | 5,338,231 | 5,338,231 | 72.43 / 72.43 | 71,374,780 / 71,374,780 |
+| IMDB-10 | 59.71 | 47.65 | -20.2% | 2,722,319 | 1,504,587 | 6,787,356 | 5,479,771 | 73.93 / 72.59 | 64,840,220 / 64,840,220 |
 | BIO-1 | 21.64 | 21.36 | -1.3% | 1,486 | 1,486 | 2,057,345 | 2,057,345 | 93.60 / 93.60 | 274 / 274 |
 | BIO-2 | 129.38 | 127.18 | -1.7% | 1,486 | 1,486 | 10,374,345 | 10,374,345 | 81.83 / 81.83 | 116,156 / 116,156 |
 | BIO-3 | 89.92 | 79.31 | -11.8% | 920,895 | 1,486 | 7,547,348 | 6,627,939 | 82.54 / 82.54 | 61,447 / 61,447 |
@@ -412,8 +413,8 @@ are identical, so the engine did the same work in both runs.
 | FEV-4 | 4.66 | 4.91 | +5.4% | 467 | 467 | 531,453 | 531,453 | 89.31 / 89.31 | 1,493 / 1,493 |
 | FEV-5 | 13.35 | 13.98 | +4.7% | 467 | 467 | 1,515,283 | 1,515,283 | 79.57 / 79.57 | 12,830 / 12,830 |
 | FEV-6 | 3.56 | 3.65 | +2.5% | 467 | 467 | 398,331 | 398,331 | 88.44 / 88.44 | 1,002 / 1,002 |
-| FEV-7 | 53.46 | 56.45 | +5.6% | 212 | 125,957 | 6,103,058 | 6,103,058 | 64.66 / 64.66 | 6,197,246 / 6,197,246 |
-| FEV-8 | 83.11 | 87.70 | +5.5% | 212 | 125,957 | 9,476,743 | 9,476,743 | 71.36 / 71.36 | 565,523,363 / 565,523,363 |
+| FEV-7 | 53.46 | 56.45 | +5.6% | 125,957 | 125,957 | 6,103,058 | 6,103,058 | 64.66 / 64.66 | 6,197,246 / 6,197,246 |
+| FEV-8 | 83.11 | 87.70 | +5.5% | 125,957 | 125,957 | 9,476,743 | 9,476,743 | 71.36 / 71.36 | 565,523,363 / 565,523,363 |
 | FEV-9 | 41.14 | 39.59 | -3.8% | 139,458 | 132,149 | 4,314,219 | 4,306,910 | 67.77 / 67.77 | 149,783,486 / 149,783,486 |
 | FEV-10 | 1.68 | 1.69 | +0.6% | 467 | 467 | 187,567 | 187,567 | 89.09 / 89.09 | 145 / 145 |
 | LEP-1 | 1.08 | 1.10 | +1.9% | 704 | 704 | 131,947 | 131,947 | 31.20 / 31.20 | 356 / 356 |

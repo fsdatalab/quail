@@ -338,7 +338,7 @@ with the same fresh tokens; answers and rows are identical everywhere.
 | IMDB-3 | 32.35 | 22.20 | -31.4% | 1,228,087 | 10,355 | 79.16 / 79.16 |
 | IMDB-4 | 19.99 | 17.34 | -13.3% | 371,795 | 10,355 | 77.76 / 77.76 |
 | IMDB-5 | 17.76 | 16.52 | -7.0% | 198,942 | 10,355 | 80.17 / 80.17 |
-| IMDB-10 | 59.71 | 47.65 | -20.2% | 1,238,442 | 1,504,587 | 73.93 / 72.59 |
+| IMDB-10 | 59.71 | 47.65 | -20.2% | 2,722,319 | 1,504,587 | 73.93 / 72.59 |
 | BIO-3 | 89.92 | 79.31 | -11.8% | 920,895 | 1,486 | 82.54 / 82.54 |
 | FEV-9 | 41.14 | 39.59 | -3.8% | 139,458 | 132,149 | 67.77 / 67.77 |
 | FEV-10 | 1.68 | 1.69 | +0.6% | 467 | 467 | 89.09 / 89.09 |
@@ -349,11 +349,12 @@ per-document `regret_tokens` the prediction was stated in went from
 six queries. What remains is the prompt prefix the documents share:
 10,355 tokens across the reviews, 1,486 across the reports, and on
 FEV-9 132,149 across its two claim and two evidence aliases. IMDB-10's
-rerun figure also holds the 1,494,232-token second copy of the reviews
-that its `r2` anchor computes; both runs computed it (identical fresh
-tokens), but the saved suite's build credited only each alias's
-within-set prefix (2 x 10,355), while the current accounting credits a
-second alias's full copy.
+figures also hold the 1,494,232-token second copy of the reviews that
+its `r2` anchor computes in both runs (identical fresh tokens). The
+saved suite's build credited each alias only its within-set prefix, so
+the saved column is restated under the current rule: the saved
+per-document count plus the rerun's shared prefix credit, which
+scanned the same aliases.
 
 What happened against the prediction:
 
