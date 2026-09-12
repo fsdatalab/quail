@@ -74,11 +74,27 @@ ROW_SAMPLE = 100_000    # rows of a traced result checked one by one
 
 
 def _sample_rows(table, count):
-    """Up to count rows of a table, evenly spaced."""
+    """Up to count rows of a table, evenly spaced.
+
+    Taken chunk by chunk: a take over the whole table concatenates each
+    column first, and a string column of hundreds of millions of rows
+    overflows Arrow's 32-bit string offsets.
+    """
     if table.num_rows <= count:
         return table
     step = table.num_rows // count
-    return table.take(pa.array(range(0, step * count, step), pa.int64()))
+    last = step * count
+    pieces = []
+    start = 0
+    for batch in table.to_batches():
+        end = start + batch.num_rows
+        first = -(-start // step) * step
+        indices = range(first, min(end, last), step)
+        if indices:
+            pieces.append(batch.take(pa.array(
+                [index - start for index in indices], pa.int64())))
+        start = end
+    return pa.Table.from_batches(pieces, schema=table.schema)
 
 
 def _validate_output(spec, output, tables):
