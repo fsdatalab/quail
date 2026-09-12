@@ -91,6 +91,10 @@ def test_join_runs_at_all_scales_and_report_cli(tmp_path):
             gpu_hourly_rate_usd=3.6)
         metrics = record["queries"][0]["metrics"]
         assert metrics["input_rows"] == {"r": 2, "a": 1}
+        assert metrics["fresh_tokens"] is None
+        assert metrics["minimum_tokens"] is None
+        assert metrics["regret_tokens"] is None
+        assert metrics["evaluated_document_pairs"] == 2
         assert metrics["document_pairs_per_second"] == 1.0
         assert metrics["cost_usd"] == 0.004
         assert metrics["accuracy"]["output_accuracy"]["exact_match"]
@@ -172,6 +176,24 @@ def test_prompt_pieces_give_the_minimum_and_the_regret(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="missing filter stages"):
         quail_b.run(broken, queries=["IMDB-4"], output_dir=tmp_path / "broken",
                     root=tmp_path)
+
+    def without_fresh(spec, tables):
+        output = execute(spec, tables)
+        output.measurements = {}
+        return output
+
+    with pytest.raises(ValueError, match="fresh_tokens"):
+        quail_b.run(without_fresh, queries=["IMDB-4"],
+                    output_dir=tmp_path / "no-fresh", root=tmp_path)
+
+    def too_few(spec, tables):
+        output = execute(spec, tables)
+        output.measurements = {"fresh_tokens": 1}
+        return output
+
+    with pytest.raises(ValueError, match="below the minimum"):
+        quail_b.run(too_few, queries=["IMDB-4"],
+                    output_dir=tmp_path / "too-few", root=tmp_path)
 
 
 def test_saved_answers_survive_scoring_failure_and_can_move(tmp_path):

@@ -241,11 +241,21 @@ def minimum_input_tokens(spec, pieces, filter_answers, join_answers,
     return total
 
 
-def regret_metrics(spec, output, corpus_rows, stores=None) -> dict:
-    """Return `minimum_tokens` and `regret_tokens` of one run output.
+def _fresh_tokens(measurements) -> int | None:
+    if "fresh_tokens" not in measurements:
+        return None
+    fresh = measurements["fresh_tokens"]
+    if isinstance(fresh, bool) or not isinstance(fresh, int) or fresh < 0:
+        raise ValueError("fresh_tokens must be a nonnegative integer")
+    return fresh
 
-    Both are None when the run saved no prompt pieces, no answers, or
-    no `fresh_tokens` measurement.
+
+def token_metrics(spec, output, corpus_rows, stores=None) -> dict:
+    """Return the run's fresh, minimum, and regret token counts.
+
+    `fresh_tokens` is engine-reported and is required when the output
+    includes `prompt_pieces`. `minimum_tokens` and `regret_tokens` are
+    None when there are no prompt pieces; they are never omitted.
 
     Args:
         spec: The query.
@@ -254,12 +264,13 @@ def regret_metrics(spec, output, corpus_rows, stores=None) -> dict:
         stores: Tokenizer name -> DocumentTokens, kept across the
             queries of one run so each document is tokenized once.
     """
-    if (output.prompt_pieces is None or output.filter_answers is None
-            or output.join_answers is None):
-        return {"minimum_tokens": None, "regret_tokens": None}
-    fresh = output.measurements.get("fresh_tokens")
-    if isinstance(fresh, bool) or not isinstance(fresh, int) or fresh < 0:
-        return {"minimum_tokens": None, "regret_tokens": None}
+    fresh = _fresh_tokens(output.measurements)
+    if output.prompt_pieces is None:
+        return {"fresh_tokens": fresh, "minimum_tokens": None, "regret_tokens": None}
+    if fresh is None:
+        raise ValueError("prompt pieces need a fresh_tokens measurement")
+    if output.filter_answers is None or output.join_answers is None:
+        raise ValueError("prompt pieces need filter and join answers")
     pieces = validate_prompt_pieces(spec, output.prompt_pieces)
     stores = {} if stores is None else stores
     name = pieces["tokenizer"]
@@ -267,4 +278,11 @@ def regret_metrics(spec, output, corpus_rows, stores=None) -> dict:
         stores[name] = DocumentTokens(corpus_rows, load_tokenizer(name))
     minimum = minimum_input_tokens(
         spec, pieces, output.filter_answers, output.join_answers, stores[name])
-    return {"minimum_tokens": minimum, "regret_tokens": fresh - minimum}
+    if fresh < minimum:
+        raise ValueError(
+            f"fresh_tokens ({fresh}) is below the minimum the requests need "
+            f"({minimum})")
+    return {
+        "fresh_tokens": fresh, "minimum_tokens": minimum,
+        "regret_tokens": fresh - minimum,
+    }

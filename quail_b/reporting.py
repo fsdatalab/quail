@@ -1,8 +1,7 @@
 """Score saved benchmark answers and write a report and a measurements table.
 
 `report.md` is the readable summary. `measurements.parquet` holds one
-row per completed query with its runtime, token counts, accuracy
-counts, and cost, for plots and comparisons across runs.
+row per completed query. `measurement_rows` names every column.
 """
 
 import argparse
@@ -33,12 +32,33 @@ MEASUREMENT_SCHEMA = pa.schema([
 ])
 
 
-def _count(value):
-    return None if isinstance(value, bool) or not isinstance(value, int) else value
-
-
 def measurement_rows(record) -> list[dict]:
-    """Return one flat row per completed query of a run record."""
+    """Return one flat row per completed query of a run record.
+
+    Every token count comes from scoring (`metrics`), not from the
+    engine's free-form `measurements` dict. Columns:
+
+        query: Query id.
+        runtime_s: Query time in seconds, excluding startup and collection.
+        fresh_tokens: Input token positions a model forward pass processed
+            instead of reading from existing KV. Engine-reported. Null
+            when the engine did not report it.
+        minimum_tokens: Distinct prefix positions those requests need with
+            unlimited KV. Null without prompt pieces and answers.
+        regret_tokens: `fresh_tokens` minus `minimum_tokens`. The KV the
+            engine computed again. Null when either side is null.
+        evaluated_document_pairs: Join pairs the engine asked, summed
+            across stages. Null on a filter-only query.
+        input_rows: Input documents across aliases, counting a repeated
+            table once per alias.
+        answers_evaluated: Predicate answers compared to the labels.
+            Null when the engine saved no answers.
+        answers_correct: Those answers that matched the labels.
+        predicted_rows: Distinct result rows the engine produced.
+        expected_rows: Distinct result rows the labels require.
+        matching_rows: Expected rows the engine also produced.
+        cost_usd: GPU cost of `runtime_s`, or null when no rate was given.
+    """
     rows = []
     for item in record["queries"]:
         if item.get("status") != "complete":
@@ -49,17 +69,17 @@ def measurement_rows(record) -> list[dict]:
         rows.append({
             "query": item["id"],
             "runtime_s": item["runtime_s"],
-            "fresh_tokens": _count(item.get("measurements", {}).get("fresh_tokens")),
-            "minimum_tokens": metrics.get("minimum_tokens"),
-            "regret_tokens": metrics.get("regret_tokens"),
-            "evaluated_document_pairs": metrics.get("evaluated_document_pairs"),
+            "fresh_tokens": metrics["fresh_tokens"],
+            "minimum_tokens": metrics["minimum_tokens"],
+            "regret_tokens": metrics["regret_tokens"],
+            "evaluated_document_pairs": metrics["evaluated_document_pairs"],
             "input_rows": sum(metrics["input_rows"].values()),
             "answers_evaluated": answers.get("evaluated"),
             "answers_correct": answers.get("correct"),
             "predicted_rows": output["predicted_rows"],
             "expected_rows": output["expected_rows"],
             "matching_rows": output["matching_rows"],
-            "cost_usd": metrics.get("cost_usd"),
+            "cost_usd": metrics["cost_usd"],
         })
     return rows
 
@@ -126,10 +146,9 @@ def _write_report(directory, record):
         metrics = item.get("metrics", {})
         inputs = metrics.get("input_rows", {})
         counts = ", ".join(f"{alias}: {count}" for alias, count in inputs.items())
-        measurements = item.get("measurements", {})
         lines.append(
             f"| {item['id']} | {counts or 'unavailable'} | "
-            f"{_number(measurements.get('fresh_tokens'))} | "
+            f"{_number(metrics.get('fresh_tokens'))} | "
             f"{_number(metrics.get('minimum_tokens'))} | "
             f"{_number(metrics.get('regret_tokens'))} |")
     lines.extend(["", "## Configuration", "", "```json",

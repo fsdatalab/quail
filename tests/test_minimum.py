@@ -1,14 +1,17 @@
 """CPU checks for the prefix trie and the minimum input tokens of a run."""
 
 import pyarrow as pa
+import pytest
 
 from quail_b.minimum import (
     DocumentTokens,
     minimum_input_tokens,
     prefix_trie_size,
+    token_metrics,
     validate_prompt_pieces,
 )
 from quail_b.queries import AliasSpec, JoinSpec, QuerySpec
+from quail_b.scoring import RunOutput
 
 
 def _encode(texts):
@@ -113,3 +116,58 @@ def test_minimum_input_tokens_counts_a_document_once_across_uses():
     beta = len(first) + len(FRAME) - _lcp(first, FRAME)
     pairs = len(LABEL) + 9 + 2 * len(TAIL)
     assert minimum == documents + alpha + beta + 2 * pairs
+
+
+def _filter_spec():
+    return QuerySpec(
+        "TEST-0", "one filter",
+        (AliasSpec("d", "docs", "body", ("useful {0}",)),),
+        (), ("d.id",))
+
+
+def _filter_output(**kwargs):
+    return RunOutput(
+        {("d", 0): pa.table({"d": ["a"], "answer": [True]})},
+        {}, pa.table({"d": ["a"]}), runtime_s=1.0, **kwargs)
+
+
+def test_token_metrics_record_fresh_tokens_without_prompt_pieces():
+    spec = _filter_spec()
+    output = _filter_output(measurements={"fresh_tokens": 40})
+    assert token_metrics(spec, output, {}) == {
+        "fresh_tokens": 40, "minimum_tokens": None, "regret_tokens": None,
+    }
+    assert token_metrics(spec, _filter_output(), {}) == {
+        "fresh_tokens": None, "minimum_tokens": None, "regret_tokens": None,
+    }
+
+
+def test_token_metrics_require_fresh_tokens_with_prompt_pieces():
+    spec = _filter_spec()
+    pieces = {
+        "tokenizer": "test", "preamble": PRE,
+        "filters": [{"alias": "d", "position": 0, "tail": QUESTION}],
+    }
+    output = _filter_output(prompt_pieces=pieces)
+    with pytest.raises(ValueError, match="fresh_tokens"):
+        token_metrics(spec, output, {})
+    output.measurements = {"fresh_tokens": True}
+    with pytest.raises(ValueError, match="nonnegative"):
+        token_metrics(spec, output, {})
+    output.prompt_pieces = None
+    output.measurements = {"fresh_tokens": -1}
+    with pytest.raises(ValueError, match="nonnegative"):
+        token_metrics(spec, output, {})
+
+
+def test_token_metrics_need_answers_with_prompt_pieces():
+    spec = _filter_spec()
+    pieces = {
+        "tokenizer": "test", "preamble": PRE,
+        "filters": [{"alias": "d", "position": 0, "tail": QUESTION}],
+    }
+    output = RunOutput(
+        None, None, pa.table({"d": ["a"]}), runtime_s=1.0,
+        measurements={"fresh_tokens": 10}, prompt_pieces=pieces)
+    with pytest.raises(ValueError, match="filter and join answers"):
+        token_metrics(spec, output, {})

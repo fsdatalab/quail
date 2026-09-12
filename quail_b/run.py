@@ -13,7 +13,7 @@ import pyarrow.parquet as pq
 
 from quail_b._files import download_cache
 from quail_b.benchmark import load_benchmark
-from quail_b.minimum import regret_metrics
+from quail_b.minimum import token_metrics
 from quail_b.scoring import (
     RunOutput,
     corpus_ids,
@@ -172,7 +172,8 @@ def _score(spec, output, suite, gpu_count, gpu_hourly_rate_usd, tokens=None):
     metrics = {
         "runtime_s": seconds, "input_rows": inputs,
         "accuracy": accuracy, "cost_usd": None,
-        **regret_metrics(spec, output, suite.tables, tokens),
+        **token_metrics(spec, output, suite.tables, tokens),
+        "evaluated_document_pairs": None,
     }
     if gpu_hourly_rate_usd is not None:
         metrics["cost_usd"] = seconds / 3600 * gpu_count * gpu_hourly_rate_usd
