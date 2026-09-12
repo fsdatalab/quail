@@ -172,7 +172,6 @@ class RequestJoinSpec:
     label_token_ids: tuple[tuple[str, tuple[Any, ...]], ...]
     frame_token_ids: tuple[tuple[str, tuple[Any, ...]], ...]
     tail_token_ids: tuple[Any, ...]
-    over_pairs: bool = False    # a HashJoin feeds this join its pairs
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "RequestJoinSpec":
@@ -183,7 +182,6 @@ class RequestJoinSpec:
             anchor=value["anchor"],
             semantics=str(value["semantics"]),
             selectivity=value["selectivity"],
-            over_pairs=bool(value.get("over_pairs", False)),
             label_token_ids=tuple(
                 (str(alias), tuple(tokens))
                 for alias, tokens in value["label_token_ids"]
@@ -210,7 +208,6 @@ class RequestJoinSpec:
                 [alias, list(tokens)] for alias, tokens in self.frame_token_ids
             ],
             "tail_token_ids": list(self.tail_token_ids),
-            "over_pairs": self.over_pairs,
         }
 
 

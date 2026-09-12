@@ -678,11 +678,8 @@ class HashJoinRuntime:
                              (node.right, [right for _, right in node.on])):
             port = next(port for port in node.inputs
                         if port.source.port == f"ids:{alias}")
-            ids = inputs[port.name]
-            if isinstance(ids, pa.Table):
-                ids = ids.column(alias).to_pylist()
-            table = alias_table(alias, ids, context.sources.get(columns_key(alias)),
-                                names)
+            table = alias_table(alias, inputs[port.name],
+                                context.sources.get(columns_key(alias)), names)
             sides[alias] = (table.column(alias),
                             [table.column(name) for name in names])
         positions = pair_table(node.left, sides[node.left][1],

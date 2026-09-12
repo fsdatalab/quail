@@ -224,7 +224,6 @@ def plan_request_backend(
             label_token_ids=labels,
             frame_token_ids=frames,
             tail_token_ids=tuple(prompt.tail_token_ids),
-            over_pairs=bool(search_specs[written_pos]["on"]),
         ))
 
     preambles = {
@@ -676,7 +675,7 @@ class RequestModelExecution:
             # a join over pairs asks each anchor about its own members
             allowed = None
             request_pairs = None
-            if spec.over_pairs:
+            if spec.written_pos in self.pairs:
                 allowed = _allowed_members(
                     spec, anchor, partners, anchor_ids, members,
                     self.pairs[spec.written_pos])

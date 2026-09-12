@@ -471,8 +471,7 @@ def main(workdir, fev9_dir=None, fev10_dir=None, quail_dirs=()):
     root = Path(workdir)
     fev9_root = Path(fev9_dir) if fev9_dir else root / "fev9"
     fev10_root = Path(fev10_dir) if fev10_dir else root / "fev10"
-    quail_roots = [Path(path) for path in (quail_dirs or [])
-                   if (Path(path) / "manifest.json").exists()]
+    quail_roots = [Path(path) for path in quail_dirs or []]
     (manifest, rows, fev9_manifest, fev10_manifest, sglang_source,
      saved_quail, rerun_manifests) = load_rows(
         root, fev9_root, fev10_root, quail_roots)

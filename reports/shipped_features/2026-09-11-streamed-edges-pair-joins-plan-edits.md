@@ -291,6 +291,12 @@ call.
   `Apply.validate` (their messages are the ones a user sees first),
   `FilterStream.chunks` and `attention_mode`, `plan.move` (documented
   API), the int-or-list `suffix_count` in the request scheduler.
+- A third pass over the HashJoin commit and the plot script: the
+  request backend's `over_pairs` wire field went (a stage runs over
+  pairs when a pair table reached it on a port), the hash join
+  runtime's unreachable table-or-list branch went, and the plot
+  script fails on a rerun directory without a manifest instead of
+  skipping it.
 
 ## 9. Quail-only rerun of all 33 queries against the saved Quail rows
 
