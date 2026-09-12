@@ -29,7 +29,7 @@ import quail
 import quail_b as benchmark
 from quail.bench.quailb import build_query, prompt_pieces
 from quail.bench.results import combine_measurements, write_json
-from quail_b.minimum import regret_metrics
+from quail_b.minimum import token_metrics
 from quail_b.queries import get_query
 from quail_b.scoring import RunOutput
 
@@ -78,7 +78,7 @@ def restate_query(session, tables, stores, directory: Path, record: dict):
         _answer_files(directory, record, "joins"),
         pa.table({}), record["runtime_s"], record["measurements"],
         _load(directory / record["files"]["prompt_pieces"]))
-    record["metrics"].update(regret_metrics(spec, output, tables, stores))
+    record["metrics"].update(token_metrics(spec, output, tables, stores))
     for key in ("minimum_tokens", "regret_tokens"):
         record["measurements"].pop(key, None)
 

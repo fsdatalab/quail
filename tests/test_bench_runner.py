@@ -210,7 +210,7 @@ def _run(query, join_answers):
             "boot_s": 3.0,
             "boot_kind": "cold",
             "boot": {},
-            "fresh_tokens": 100,
+            "fresh_tokens": 1000,
             "store": None,
             "peak_gib": 1.0,
         })
@@ -271,7 +271,7 @@ def _run_request_backend(query, join_answers):
             "boot_s": 3.0,
             "boot_kind": "cold",
             "boot": {},
-            "fresh_tokens": 100,
+            "fresh_tokens": 1000,
             "cached_tokens": 0,
             "peak_gib": 1.0,
         })
@@ -316,9 +316,9 @@ def test_benchmark_results_and_scoring(tmp_path):
     ]
     assert output.rows.num_rows == 0
     # the pieces name the session's tokenizer and every stage; QUAIL-B
-    # sets the fake run's 100 fresh tokens against the minimum its
+    # sets the fake run's 1,000 fresh tokens against the minimum its
     # requests needed, derived from the answer tables
-    from quail_b.minimum import DocumentTokens, regret_metrics
+    from quail_b.minimum import DocumentTokens, token_metrics
 
     pieces = output.prompt_pieces
     assert pieces["tokenizer"] == tokenizer_name
@@ -329,9 +329,9 @@ def test_benchmark_results_and_scoring(tmp_path):
         (0, "r")]
     stores = {tokenizer_name: DocumentTokens(
         CORPUS, lambda texts: [_token_ids(text) for text in texts])}
-    measured = regret_metrics(SPEC, output, CORPUS, stores)
+    measured = token_metrics(SPEC, output, CORPUS, stores)
     assert measured["minimum_tokens"] > 0
-    assert measured["regret_tokens"] == 100 - measured["minimum_tokens"]
+    assert measured["regret_tokens"] == 1000 - measured["minimum_tokens"]
 
     spec = QuerySpec(
         "TEST-2", "selects a text column",
