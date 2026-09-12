@@ -2544,7 +2544,7 @@ dev = [
     { name = "matplotlib", specifier = ">=3.9" },
     { name = "modal", extras = ["api-proxy-support"], specifier = ">=1.5.1" },
     { name = "pytest", specifier = ">=8.0" },
-    { name = "quail-b", git = "https://github.com/fsdatalab/quail-bench.git?rev=96ad325f8be97bd248f3e092484496c0fb9366d6" },
+    { name = "quail-b", git = "https://github.com/fsdatalab/quail-bench.git?rev=292e6bd1bb1e556e75cadc4fbc41f6f62c40d972" },
     { name = "ruff", specifier = "==0.12.9" },
     { name = "vulture", specifier = ">=2.16,<3" },
 ]
@@ -2552,7 +2552,7 @@ dev = [
 [[package]]
 name = "quail-b"
 version = "0.2.0"
-source = { git = "https://github.com/fsdatalab/quail-bench.git?rev=96ad325f8be97bd248f3e092484496c0fb9366d6#96ad325f8be97bd248f3e092484496c0fb9366d6" }
+source = { git = "https://github.com/fsdatalab/quail-bench.git?rev=292e6bd1bb1e556e75cadc4fbc41f6f62c40d972#292e6bd1bb1e556e75cadc4fbc41f6f62c40d972" }
 dependencies = [
     { name = "datasets" },
     { name = "huggingface-hub" },
