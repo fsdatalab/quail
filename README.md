@@ -15,6 +15,9 @@ specifications, Arrow input tables, and reference answers. Your adapter
 executes each specification with your engine and returns the result.
 QUAIL-B then validates, scores, and saves the run.
 
+For each query, the benchmark reports accuracy, query time, throughput,
+GPU cost, and token work.
+
 ## Install
 
 Python 3.12.
@@ -22,6 +25,56 @@ Python 3.12.
 ```sh
 uv add "quail-b @ git+https://github.com/fsdatalab/quail-bench.git"
 ```
+
+## What QUAIL-B measures
+
+- **Accuracy:** agreement with saved predicate answers, plus precision and
+  recall of the final rows.
+- **Query performance:** query time, documents or pairs per second, and GPU
+  cost when a price is supplied.
+- **Token work:** how many input token positions the model computed, the
+  minimum those requests required, and how many KV tokens were recomputed.
+
+The three token counts are:
+
+- `fresh_tokens`: all input token positions processed by model forward
+  passes. Repeated computation is counted again. Your engine reports this.
+- `minimum_tokens`: the fewest input token positions the same requests need
+  if every shared prefix stays in KV. QUAIL-B computes this.
+- `regret_tokens`: `fresh_tokens - minimum_tokens`. This is the reusable
+  document or anchor KV that the engine computed again. QUAIL-B computes it.
+
+To compute the last two counts, QUAIL-B needs the exact request prefixes.
+Your adapter returns `fresh_tokens` and `prompt_pieces`. `prompt_pieces`
+contains the tokenizer name and the token IDs placed around each document:
+
+```python
+prompt_pieces = {
+    "tokenizer": "Qwen/Qwen3-4B-FP8",
+    "preamble": [...],
+    "filters": [
+        {"alias": "r", "position": 0, "tail": [...]},
+        {"alias": "r", "position": 1, "tail": [...]},
+    ],
+    "joins": [
+        {
+            "position": 0,
+            "anchor": "r",
+            "frame": [...],
+            "label": [...],
+            "tail": [...],
+        },
+    ],
+}
+```
+
+All values represented by `[...]` are lists of token IDs. For a filter
+request, the order is `preamble`, document, `tail`. For a join request,
+the order is `preamble`, anchor document, `frame`, `label`, partner
+document, `tail`. See `quail_b.minimum.validate_prompt_pieces`.
+
+If an engine does not provide these values, accuracy and query performance
+still score, but its token counts are unavailable.
 
 ## What your adapter receives
 
@@ -98,6 +151,8 @@ def run_query(query, tables):
             "a": result.output_aspect_ids,
         }),
         runtime_s=result.query_seconds,
+        measurements={"fresh_tokens": result.fresh_tokens},
+        prompt_pieces=result.prompt_pieces,
     )
 ```
 
@@ -115,6 +170,8 @@ The returned fields mean:
   `query.select`.
 - `runtime_s` is query execution time. It excludes model startup,
   result collection, scoring, and saving.
+- `measurements["fresh_tokens"]` is the input work measured by the engine.
+- `prompt_pieces` lets QUAIL-B compute the minimum and recomputed KV tokens.
 
 Filter and join indices start at 0. Pass `None` for the answer dictionaries
 if your engine did not record individual predicate answers. QUAIL-B can
@@ -186,14 +243,6 @@ Rebuild the report from saved answers:
 ```sh
 quail-b report results/my-run
 ```
-
-## Add token metrics (optional)
-
-To score KV reuse, also pass `prompt_pieces` (tokenizer name and the token
-ids around each document; see `quail_b.minimum.validate_prompt_pieces`)
-and `measurements={"fresh_tokens": ...}` (input token positions the model
-computed rather than read from existing KV). Scoring fills
-`minimum_tokens` and `regret_tokens`. Do not report those two.
 
 Query definitions: [`quail_b/queries.py`](quail_b/queries.py).
 Tables: [`quail_b/data.py`](quail_b/data.py).
