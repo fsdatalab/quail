@@ -7,13 +7,11 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-import pyarrow as pa
-import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from quail_b._files import download_cache
 from quail_b.benchmark import load_benchmark
-from quail_b.scoring import RunOutput, evaluate
+from quail_b.scoring import RunOutput, corpus_ids, encode_ids, evaluate
 
 
 def _write_json(path, value):
@@ -67,23 +65,20 @@ def _validate_output(spec, output, tables):
             or not isinstance(output.runtime_s, (int, float))
             or not math.isfinite(output.runtime_s) or output.runtime_s < 0):
         raise ValueError("runtime_s must be a finite nonnegative number")
-    known = {alias.alias: tables[alias.table]["id"] for alias in spec.aliases}
+    references = corpus_ids(spec, tables)
 
     def validate_ids(table, aliases):
-        # Arrow throughout: a join can return hundreds of millions of rows
+        # a join can return hundreds of millions of rows: one Arrow pass
+        # maps each id to its corpus position, and the checks run on
+        # those small integers
+        if any(table[alias].null_count for alias in aliases):
+            raise ValueError("document IDs cannot be null")
+        codes = encode_ids(table, aliases, references)
         for alias in aliases:
-            ids, reference = table[alias], known[alias]
-            if ids.null_count:
-                raise ValueError("document IDs cannot be null")
-            if ids.type != reference.type:
-                ids = ids.cast(pa.string())
-                reference = reference.cast(pa.string())
-            unknown = pc.invert(pc.is_in(ids, value_set=pc.unique(reference)))
-            if pc.sum(unknown).as_py():
+            if codes[alias].null_count:
                 raise ValueError(f"unknown document ID for alias {alias}")
-        if table.num_rows and (
-                table.select(aliases).group_by(aliases).aggregate([]).num_rows
-                != table.num_rows):
+        if codes.num_rows and (
+                codes.group_by(aliases).aggregate([]).num_rows != codes.num_rows):
             raise ValueError("duplicate document IDs in an answer table")
 
     selected = [name.split(".")[0] for name in spec.select]

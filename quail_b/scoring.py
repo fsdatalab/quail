@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import pyarrow as pa
+import pyarrow.compute as pc
 
 from quail_b.data import _ids
 from quail_b.queries import JoinSpec, QuerySpec
@@ -142,6 +143,35 @@ def _as_string_ids(table: pa.Table, aliases) -> pa.Table:
     return _distinct(pa.table({
         alias: table.column(alias).cast(pa.string()) for alias in aliases
     }))
+
+
+def corpus_ids(spec: QuerySpec, corpus_rows) -> dict:
+    """Per alias, the distinct corpus ids as strings, in one fixed order."""
+    return {alias_spec.alias: pc.unique(pa.array(
+        [str(row_id) for row_id in _ids(corpus_rows[alias_spec.table])],
+        type=pa.string()))
+        for alias_spec in spec.aliases}
+
+
+def encode_ids(table: pa.Table, aliases, references: dict) -> pa.Table:
+    """Replace each id column by its position in the alias's corpus ids.
+
+    An id not in the corpus becomes null. The corpus ids are cast to
+    the column's type when that works (integer ids stored as integers),
+    so a result of hundreds of millions of rows is never cast to
+    strings; only the small corpus side is.
+    """
+    columns = {}
+    for alias in aliases:
+        column = table.column(alias)
+        reference = references[alias]
+        if column.type != reference.type:
+            try:
+                reference = reference.cast(column.type)
+            except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
+                column = column.cast(pa.string())
+        columns[alias] = pc.index_in(column, value_set=reference)
+    return pa.table(columns)
 
 
 def _join_all(tables: list[pa.Table]) -> pa.Table:
@@ -327,8 +357,12 @@ def evaluate(spec: QuerySpec, output: RunOutput, ground_truth, corpus_rows) -> d
     expected = expected_rows(spec, ground_truth, corpus_rows)
     aliases = [name.split(".")[0] for name in spec.select]
     expected = _distinct(expected.select(aliases))
-    predicted = _as_string_ids(output.rows, aliases)
-    matched = predicted.join(expected, keys=aliases, join_type="inner")
+    # both sides as small integer codes: the result can hold hundreds
+    # of millions of rows, and hashing them as strings is what costs
+    references = corpus_ids(spec, corpus_rows)
+    predicted = _distinct(encode_ids(output.rows, aliases, references))
+    matched = predicted.join(encode_ids(expected, aliases, references),
+                             keys=aliases, join_type="inner")
     input_document_rows = sum(
         len(corpus_rows[alias_spec.table])
         for alias_spec in spec.aliases)
