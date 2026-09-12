@@ -232,21 +232,27 @@ def _apply_conditions(table: pa.Table, join: JoinSpec, allowed) -> pa.Table:
     return table.filter(pa.array(mask, type=pa.bool_()))
 
 
-def rows_from_answers(spec: QuerySpec, filter_answers, join_answers,
-                      corpus_rows=None) -> pa.Table:
-    """Return the final rows an engine's own answers imply.
+def answer_relations(spec: QuerySpec, filter_answers, join_answers,
+                     corpus_rows=None):
+    """Return (survivors, relations) an engine's own answers imply.
 
-    For a run that saved its predicate answers but not its rows: a row
-    survives when every filter on its alias answered TRUE, every join
-    it takes part in answered TRUE, and every join equality holds.
+    survivors maps each alias to the string ids that passed every filter
+    on it, or None when it has no filter. relations holds one table per
+    join, in written order, with the pairs that answered TRUE, satisfy
+    the join's equality conditions, and survived every filter.
     corpus_rows is needed only when a join has equality conditions.
+    Returns None when the answers are missing.
     """
+    if join_answers is None or filter_answers is None:
+        return None
     survivors = {}
     for alias_spec in spec.aliases:
         alias = alias_spec.alias
         kept = None
         for written_pos in range(len(alias_spec.filters)):
-            table = filter_answers[(alias, written_pos)]
+            table = filter_answers.get((alias, written_pos))
+            if table is None:
+                return None
             passed = {
                 str(row_id)
                 for row_id, answer in zip(table.column(alias).to_pylist(),
@@ -257,21 +263,112 @@ def rows_from_answers(spec: QuerySpec, filter_answers, join_answers,
         survivors[alias] = kept
     relations = []
     for written_pos, join in enumerate(spec.joins):
-        table = join_answers[written_pos]
+        table = join_answers.get(written_pos)
+        if table is None:
+            return None
         mask = table.column("answer")
         true_pairs = _as_string_ids(table.filter(mask), list(join.aliases))
-        relations.append(_apply_conditions(
-            true_pairs, join, _allowed_pairs(join, spec, corpus_rows)))
+        true_pairs = _apply_conditions(
+            true_pairs, join, _allowed_pairs(join, spec, corpus_rows))
+        for alias in join.aliases:
+            if survivors[alias] is not None:
+                true_pairs = true_pairs.filter(pc.is_in(
+                    true_pairs.column(alias),
+                    value_set=pa.array(sorted(survivors[alias]), pa.string())))
+        relations.append(true_pairs)
+    return survivors, relations
+
+
+def rows_from_answers(spec: QuerySpec, filter_answers, join_answers,
+                      corpus_rows=None) -> pa.Table:
+    """Return the final rows an engine's own answers imply.
+
+    For a run that saved its predicate answers but not its rows: a row
+    survives when every filter on its alias answered TRUE, every join
+    it takes part in answered TRUE, and every join equality holds.
+    corpus_rows is needed only when a join has equality conditions.
+    """
+    survivors, relations = answer_relations(
+        spec, filter_answers, join_answers, corpus_rows)
     if relations:
         rows = _join_all(relations)
     else:
         rows = _id_table({spec.base_alias: sorted(survivors[spec.base_alias])})
-    for alias in rows.column_names:
-        if survivors[alias] is not None:
-            rows = rows.join(
-                _id_table({alias: sorted(survivors[alias])}),
-                keys=[alias], join_type="inner")
     return _distinct(rows.select(sorted(rows.column_names)))
+
+
+def implied_row_count(spec: QuerySpec, survivors: dict, relations: list) -> int:
+    """Count the rows the answers imply without building them.
+
+    The relations are joined in the order _join_all uses, but each step
+    keeps only the aliases a later relation still needs, with a weight
+    per row that sums the rows it stands for. Every joined alias is a
+    selected column, so the join's size is the distinct row count.
+    """
+    if not relations:
+        return len(survivors[spec.base_alias])
+    pending = list(relations)
+    current = pending.pop(0)
+    current = current.append_column(
+        "weight", pa.array([1] * current.num_rows, pa.int64()))
+    while pending:
+        for index, table in enumerate(pending):
+            shared = sorted((set(current.column_names) - {"weight"})
+                            & set(table.column_names))
+            if shared:
+                pending.pop(index)
+                break
+        else:
+            raise ValueError("AI join relations form a disconnected graph")
+        joined = current.join(table, keys=shared, join_type="inner")
+        needed = {alias for later in pending for alias in later.column_names}
+        keep = sorted((set(joined.column_names) - {"weight"}) & needed)
+        if keep:
+            current = joined.group_by(keep).aggregate([("weight", "sum")])
+            current = current.rename_columns(keep + ["weight"])
+        else:
+            current = joined
+    return pc.sum(current.column("weight")).as_py() or 0
+
+
+def implied_rows_mask(rows: pa.Table, survivors: dict, relations: list,
+                      spec: QuerySpec) -> pa.ChunkedArray:
+    """Per row of string ids, whether the answers imply it."""
+    mask = pa.array([True] * rows.num_rows, pa.bool_())
+    for alias in rows.column_names:
+        if survivors.get(alias) is not None:
+            mask = pc.and_(mask, pc.is_in(
+                rows.column(alias),
+                value_set=pa.array(sorted(survivors[alias]), pa.string())))
+    for join, relation in zip(spec.joins, relations):
+        left, right = join.aliases
+        pairs = pc.binary_join_element_wise(
+            rows.column(left), rows.column(right), "\x1f")
+        known = pc.binary_join_element_wise(
+            relation.column(left), relation.column(right), "\x1f")
+        mask = pc.and_(mask, pc.is_in(pairs, value_set=pc.unique(known)))
+    if not relations:
+        base = pa.array(sorted(survivors[spec.base_alias]), pa.string())
+        mask = pc.and_(mask, pc.is_in(rows.column(spec.base_alias),
+                                      value_set=base))
+    return mask
+
+
+def scores_from_answers(spec: QuerySpec, output: RunOutput, corpus_rows):
+    """Return (survivors, relations) when the answers can score the rows.
+
+    That needs every answer the query produces, and the selected columns
+    must hold every joined alias, so that a row is a join tuple.
+    """
+    answers = answer_relations(
+        spec, output.filter_answers, output.join_answers, corpus_rows)
+    if answers is None:
+        return None
+    selected = {name.split(".")[0] for name in spec.select}
+    joined = {alias for join in spec.joins for alias in join.aliases}
+    if not joined <= selected or spec.base_alias not in selected:
+        return None
+    return answers
 
 
 def reference_answer(ground_truth, template: str, ids: tuple[str, ...]) -> bool:
@@ -357,12 +454,23 @@ def evaluate(spec: QuerySpec, output: RunOutput, ground_truth, corpus_rows) -> d
     expected = expected_rows(spec, ground_truth, corpus_rows)
     aliases = [name.split(".")[0] for name in spec.select]
     expected = _distinct(expected.select(aliases))
-    # both sides as small integer codes: the result can hold hundreds
-    # of millions of rows, and hashing them as strings is what costs
-    references = corpus_ids(spec, corpus_rows)
-    predicted = _distinct(encode_ids(output.rows, aliases, references))
-    matched = predicted.join(encode_ids(expected, aliases, references),
-                             keys=aliases, join_type="inner")
+    answers = scores_from_answers(spec, output, corpus_rows)
+    if answers is not None:
+        # the rows are implied by the answers, which are small: count
+        # them and check the expected rows there instead of touching a
+        # result that can hold hundreds of millions of rows
+        survivors, relations = answers
+        predicted_count = implied_row_count(spec, survivors, relations)
+        matched_count = pc.sum(implied_rows_mask(
+            expected, survivors, relations, spec)).as_py() or 0
+    else:
+        # an untraced run: score the rows themselves, as small integer
+        # codes so that the hashing does not run over strings
+        references = corpus_ids(spec, corpus_rows)
+        predicted = _distinct(encode_ids(output.rows, aliases, references))
+        matched = predicted.join(encode_ids(expected, aliases, references),
+                                 keys=aliases, join_type="inner")
+        predicted_count, matched_count = predicted.num_rows, matched.num_rows
     input_document_rows = sum(
         len(corpus_rows[alias_spec.table])
         for alias_spec in spec.aliases)
@@ -376,7 +484,7 @@ def evaluate(spec: QuerySpec, output: RunOutput, ground_truth, corpus_rows) -> d
         "ground_truth_reference_model": ground_truth.reference_model,
         "answer_accuracy": (total.as_dict() if total.evaluated else None),
         "output_accuracy": _row_metrics(
-            predicted.num_rows, expected.num_rows, matched.num_rows),
+            predicted_count, expected.num_rows, matched_count),
         "per_predicate": per_predicate,
         "input_document_rows": input_document_rows,
         "unique_input_documents": len(unique_documents),

@@ -3,6 +3,7 @@
 import json
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import pytest
 
@@ -466,3 +467,89 @@ def test_reused_label_set_rejects_changed_table_manifest(tmp_path):
         assert "table reviews changed" in str(exc)
     else:
         raise AssertionError("changed table manifest was accepted")
+
+
+def _chain_spec():
+    # FEV-8's shape: filters on the claims, three joins in a chain, every
+    # alias selected
+    return QuerySpec(
+        "CHAIN", "three joins", (
+            AliasSpec("c1", "claims", "claim", (FILTER,)),
+            AliasSpec("e1", "evidence", "text"),
+            AliasSpec("c2", "claims", "claim", (FILTER,)),
+            AliasSpec("e2", "evidence", "text")),
+        (JoinSpec(JOIN, ("c1", "e1")), JoinSpec(JOIN, ("e1", "c2")),
+         JoinSpec(JOIN, ("c2", "e2"))),
+        ("c1.id", "e1.id", "c2.id", "e2.id"))
+
+
+def _random_output(spec, rng, claims=12, evidence=8):
+    filters = {}
+    for alias in ("c1", "c2"):
+        filters[(alias, 0)] = pa.table({
+            alias: [f"c{i}" for i in range(claims)],
+            "answer": [rng.random() < 0.7 for _ in range(claims)]})
+    joins = {}
+    for position, join in enumerate(spec.joins):
+        left, right = join.aliases
+        sizes = {"c": claims, "e": evidence}
+        pairs = [(f"{left[0]}{i}", f"{right[0]}{j}")
+                 for i in range(sizes[left[0]]) for j in range(sizes[right[0]])]
+        joins[position] = pa.table({
+            left: [a for a, _ in pairs], right: [b for _, b in pairs],
+            "answer": [rng.random() < 0.4 for _ in pairs]})
+    return RunOutput(filters, joins, None)
+
+
+def test_answers_count_and_check_rows_without_building_them():
+    import random
+
+    from quail_b.scoring import (
+        implied_row_count,
+        implied_rows_mask,
+        scores_from_answers,
+    )
+
+    spec = _chain_spec()
+    for seed in range(6):
+        rng = random.Random(seed)
+        output = _random_output(spec, rng)
+        built = rows_from_answers(spec, output.filter_answers, output.join_answers)
+        survivors, relations = scores_from_answers(spec, output, None)
+        assert implied_row_count(spec, survivors, relations) == built.num_rows
+        # every built row is implied; a row with one id changed is not
+        columns = built.column_names
+        mask = implied_rows_mask(built, survivors, relations, spec)
+        assert built.num_rows == 0 or pc.all(mask).as_py()
+        if built.num_rows:
+            broken = built.set_column(
+                columns.index("e1"), "e1",
+                pa.array(["e99"] * built.num_rows, pa.string()))
+            assert not pc.any(implied_rows_mask(
+                broken, survivors, relations, spec)).as_py()
+
+
+def test_traced_rows_must_agree_with_the_answers():
+    import random
+
+    from quail_b.run import _validate_output
+
+    spec = _chain_spec()
+    output = _random_output(spec, random.Random(1))
+    rows = rows_from_answers(spec, output.filter_answers, output.join_answers)
+    assert rows.num_rows > 1
+    tables = {"claims": pa.table({"id": [f"c{i}" for i in range(12)]}),
+              "evidence": pa.table({"id": [f"e{i}" for i in range(8)]})}
+    output.rows = rows
+    output.runtime_s = 1.0
+    _validate_output(spec, output, tables)
+    output.rows = rows.slice(1)
+    with pytest.raises(ValueError, match="answers imply"):
+        _validate_output(spec, output, tables)
+    swapped = rows.set_column(
+        rows.column_names.index("e2"), "e2",
+        pa.array(["e0"] + rows.column("e2").to_pylist()[1:], pa.string()))
+    if swapped.to_pylist() != rows.to_pylist():
+        output.rows = swapped
+        with pytest.raises(ValueError, match="not implied|duplicate"):
+            _validate_output(spec, output, tables)
