@@ -558,11 +558,13 @@ def test_traced_rows_must_agree_with_the_answers():
 def test_row_sample_is_taken_chunk_by_chunk():
     from quail_b.run import _sample_rows
 
-    # 23 chunks of uneven size; the sample must be the evenly spaced
+    # 24 chunks of uneven size; the sample must be the evenly spaced
     # rows of the whole table, never a take over a concatenated column
+    bounds = [0, *range(7, 230, 10), 233]
     chunks = [pa.record_batch({"r": [f"r{i}" for i in range(lo, hi)]})
-              for lo, hi in zip(range(0, 230, 10), range(7, 237, 10))]
+              for lo, hi in zip(bounds, bounds[1:])]
     table = pa.Table.from_batches(chunks)
+    assert len(chunks) == 24 and table.num_rows == 233
     sample = _sample_rows(table, 50)
     step = table.num_rows // 50
     assert sample.column("r").to_pylist() == [
