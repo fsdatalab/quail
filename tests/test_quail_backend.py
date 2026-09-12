@@ -307,7 +307,6 @@ def test_streamed_edge_runs_through_the_quail_graph(monkeypatch):
     assert metrics["filter:r"]["fresh_tokens"] > 0
     assert metrics["group:0"]["kv_hits"] == len(survivors)
     assert metrics["group:0"]["kv_misses"] == 0
-    assert result["regret_tokens"] == 0
     assert result["fresh_tokens"] == (
         metrics["filter:r"]["fresh_tokens"] + metrics["group:0"]["fresh_tokens"])
     assert result["kv_manager"]["join_anchor_hits"] == len(survivors)
@@ -360,7 +359,6 @@ def test_pair_join_runs_through_the_quail_graph(monkeypatch):
             len(allowed[d]) for d in survivors)
         assert metrics["fresh_tokens"] < (
             cross["node_metrics"]["group:0"]["fresh_tokens"])
-        assert result["regret_tokens"] == 0
         assert result["node_metrics"]["hash_join:r-p"]["output_rows"] == sum(
             len(mine) for mine in allowed.values())
         # anchors whose pairs all answered FALSE are gone; the rest

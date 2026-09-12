@@ -181,17 +181,16 @@ lives under `reports/plots/` with its `make_<slug>_plots.py` in
   Recalculate stale estimates on the CPU from saved inputs without inference.
 - Show these metrics for each query and configuration:
   - Latency in seconds, excluding model startup and result collection.
-  - Total recomputed KV tokens across the query (`regret_distinct_tokens`).
-    These count input tokens a forward pass computed although the same
-    prefix had already been computed in this query: a document's own
-    prefix at a later stage or anchor use, and the prompt prefix the
-    documents share (agent traces share about 11.9 million tokens).
-    The number is derived on the CPU after the run in
-    `quail/runtime/prefixes.py` from the per-document `regret_tokens`,
-    the corpus's shared prefix tokens, and the cross-row cache hits the
-    engine reported. Track nothing extra in the engine loop. Show a run
-    whose derived value is missing or negative as not measured, never
-    as zero, and say why.
+  - Total recomputed KV tokens across the query (`regret_tokens`). This
+    is fresh tokens minus the fewest input tokens the run's requests
+    needed with unlimited KV, where every distinct prefix across the
+    requests is computed once: each document once, each question tail
+    and anchor frame once per document, and each pair's partner suffix
+    after its anchor. `quail.runtime.minimum` derives it from the saved
+    answer tables on the CPU after the run; the benchmark runner records
+    it and `quail.bench.restate` recomputes it for saved runs. Track
+    nothing in the engine loop. A run saved without a minimum shows as
+    not measured, never as zero.
   - Total fresh input tokens computed across the query (`fresh_tokens`).
     A fresh token is an input token position processed by a model forward
     pass instead of read from existing KV. Count repeated computation again.

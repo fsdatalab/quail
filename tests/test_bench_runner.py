@@ -7,7 +7,13 @@ import pyarrow.parquet as pq
 import pytest
 
 import quail
-from quail.bench.quailb import answer_oracle, build_query, queries, run_output
+from quail.bench.quailb import (
+    answer_oracle,
+    build_query,
+    queries,
+    regret_measurements,
+    run_output,
+)
 from quail.catalog import DocumentProvider
 from quail.planner import collect_operators
 from quail.planner.plan import EngineConfig, Refusal
@@ -265,7 +271,6 @@ def _run_request_backend(query, join_answers):
             "boot": {},
             "fresh_tokens": 100,
             "cached_tokens": 0,
-            "regret_tokens": 0,
             "peak_gib": 1.0,
         })
 
@@ -290,14 +295,13 @@ def test_benchmark_results_and_scoring(tmp_path):
     evaluation = evaluate(SPEC, output, _truth(), CORPUS)
     assert evaluation["answer_accuracy"]["accuracy"] == 1.0
     assert evaluation["output_accuracy"]["exact_match"] is True
-    assert result.report["shared_prefix_tokens"] == 0
-    assert result.report["cross_row_cached_tokens"] == 0
-    assert result.report["regret_distinct_tokens"] is None
 
     sess = _session(tmp_path, backend="stock_vllm")
     try:
-        result = _run_request_backend(_query(sess), [0, 0])
+        query = _query(sess)
+        result = _run_request_backend(query, [0, 0])
         output = run_output(result, SPEC, CORPUS)
+        measured = regret_measurements(query, result)
     finally:
         sess.close()
 
@@ -308,10 +312,10 @@ def test_benchmark_results_and_scoring(tmp_path):
         "filter", "join"
     ]
     assert output.rows.num_rows == 0
-    assert result.report["shared_prefix_tokens"] == 0
-    # the fake stock vLLM run reports no cross row cache hits, so the
-    # distinct prefix regret is unknown
-    assert result.report["regret_distinct_tokens"] is None
+    # the fake run reports 100 fresh tokens against the minimum its
+    # requests needed, derived from the answer tables
+    assert measured["minimum_tokens"] > 0
+    assert measured["regret_tokens"] == 100 - measured["minimum_tokens"]
 
     spec = QuerySpec(
         "TEST-2", "selects a text column",

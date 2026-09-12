@@ -78,7 +78,6 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 from plot_colors import BLUE, DARK, GRAY, GREEN, ORANGE
 
-from quail.runtime.prefixes import scanned_aliases
 from quail.specs import H100_USD_PER_HOUR
 
 HERE = Path(__file__).resolve().parent
@@ -91,27 +90,14 @@ METHODS = [
 
 
 def recomputed_kv(row):
-    """Return a saved row's recomputed KV tokens, or None when not measured.
+    """Return a row's regret tokens, or None for a run saved without them.
 
-    The value is the saved `regret_distinct_tokens`. A row whose engine
-    reported more cross-row cache hits than any prefix the trie credits
-    derives to a negative number and has no measured figure.
+    Regret is fresh tokens minus the fewest the run's requests needed
+    with unlimited KV, derived from the saved answer tables by
+    `quail.bench.restate`. A run saved without that minimum has no
+    figure.
     """
-    value = row["regret_distinct_tokens"]
-    return None if value is None or value < 0 else value
-
-
-def restated_saved_row(saved, rerun):
-    """The saved row with recomputed KV restated under the current credit.
-
-    The saved suite credited each alias only its within-set prefix; the
-    current rule also credits a set's second copy. The rerun scanned the
-    same aliases, so its shared prefix credit applies to the saved row.
-    """
-    assert scanned_aliases(saved["stages"]) == scanned_aliases(rerun["stages"])
-    restated = (saved["regret_tokens"] + rerun["shared_prefix_tokens"]
-                - saved["cross_row_cached_tokens"])
-    return {**saved, "regret_distinct_tokens": restated}
+    return row["regret_tokens"] if "minimum_tokens" in row else None
 
 
 def token_cell(value):
@@ -363,10 +349,8 @@ def current_row(query):
         "query": query["id"],
         "wall_s": measured["wall_s"],
         "fresh_tokens": measured["fresh_tokens"],
-        "regret_tokens": measured["regret_tokens"],
-        "cross_row_cached_tokens": measured["cross_row_cached_tokens"],
-        "regret_distinct_tokens": measured["regret_distinct_tokens"],
-        "shared_prefix_tokens": measured["shared_prefix_tokens"],
+        **{key: measured[key] for key in ("minimum_tokens", "regret_tokens")
+           if key in measured},
         "stages": measured["stages"],
         "backend_metrics": measured["backend_metrics"],
         "accuracy": query["metrics"]["accuracy"],
@@ -461,8 +445,7 @@ def load_rows(root, fev9_root, fev10_root, quail_roots=()):
             rerun = json.loads(path.read_text())
             check_run(rerun, "quail", corpus, suite, rerun_manifest)
             for query, row in current_rows(rerun).items():
-                saved_quail.setdefault(
-                    query, restated_saved_row(rows["quail"][query], row))
+                saved_quail.setdefault(query, rows["quail"][query])
                 rows["quail"][query] = row
     return (manifest, rows, fev9_manifest, fev10_manifest,
             sglang_update["result_volume_path"], saved_quail, rerun_manifests)
@@ -481,12 +464,9 @@ def rerun_lines(saved, rows, manifests, queries):
         "## Quail rerun against the saved Quail rows", "",
         f"Quail only, {len(saved)} queries, from {runs}. The Quail bars and "
         "the Quail rows above come from these runs; the baseline rows are "
-        "the saved runs. The saved recomputed KV is restated under the current",
-        "credit rule, where a set scanned under two aliases counts its second",
-        "copy in full: each saved row's per-document `regret_tokens` plus the",
-        "shared prefix credit of its rerun, which scanned the same aliases. The",
-        "saved suite's build had credited each alias only its within-set",
-        "prefix, which understated IMDB-9, IMDB-10, FEV-7, and FEV-8.", "",
+        "the saved runs. Recomputed KV is fresh tokens minus the fewest tokens",
+        "the run's requests needed, derived from its saved answer tables; a",
+        "run saved without them shows as not measured.", "",
         "| Query | Saved seconds | Rerun seconds | Change | Saved recomputed KV "
         "| Rerun recomputed KV | Saved fresh tokens | Rerun fresh tokens "
         "| Agreement saved / rerun, % | Rows saved / rerun |",
@@ -644,16 +624,12 @@ def main(workdir, fev9_dir=None, fev10_dir=None, quail_dirs=()):
         "  suffix tokens, and any repeated computation after KV becomes unavailable.",
         "  A repeated token counts again. This is not a count of unique text or",
         "  generated answers. Recomputed KV tokens are part of the fresh-token total.",
-        "- Recomputed KV is the saved `regret_distinct_tokens`: input tokens a",
-        "  forward pass computed although the same prefix had already been",
-        "  computed in this query, either a document's own prefix at a later",
-        "  stage or anchor use, or the prompt prefix the documents share. It is",
-        "  derived on the CPU after the run (`quail/runtime/prefixes.py`) from",
-        "  the per-document `regret_tokens`, the corpus's shared prefix tokens,",
-        "  and the cross-row cache hits the engine reported; the engine tracks",
-        "  nothing extra. The earlier SGLang adapter's cross-row count for FEV-7",
-        "  and FEV-8 equals the whole evidence set (125,851 tokens), more than",
-        "  any prefix the trie credits, so their recomputed KV is not measured.",
+        "- Recomputed KV is `regret_tokens`: fresh tokens minus the fewest input",
+        "  tokens the run's requests needed with unlimited KV, where every",
+        "  distinct prefix across the requests is computed once. It is derived",
+        "  on the CPU after the run from the saved answer tables",
+        "  (`quail.runtime.minimum`, run by `quail.bench.restate`); the engine",
+        "  tracks nothing. A run saved without that minimum is not measured.",
         "  Token and latency plots use a log scale when positive values span more",
         "  than one order of magnitude. Recomputed KV retains a linear region to",
         "  include zero. A dash marks zero.",

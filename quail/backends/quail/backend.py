@@ -166,8 +166,7 @@ class QuailModelExecution:
             # order; a per-batch function may have dropped some held
             # survivors before admission
             anchor_ids = [key[1] for key in inputs["anchor_keys"]]
-            kv_round = {"hits": len(anchor_ids), "misses": 0,
-                        "regret_tokens": 0}
+            kv_round = {"hits": len(anchor_ids), "misses": 0}
             stream["holder"].update(
                 answers=source.answers, tokens=source.tokens)
         else:
@@ -213,7 +212,6 @@ class QuailModelExecution:
                 ),
                 kv_hits=kv_round.get("hits", 0),
                 kv_misses=kv_round.get("misses", 0),
-                regret_tokens=kv_round.get("regret_tokens", 0),
                 fresh_tokens=tokens,
                 extension={"answers": answers},
             ),

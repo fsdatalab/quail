@@ -43,19 +43,9 @@ def quail_runtimes() -> dict:
     }
 
 
-def _join_round_kv(anchor_keys, prefix_lens, owned, seen) -> dict:
-    hits = 0
-    regret = 0
-    for key, n_tokens in zip(anchor_keys, prefix_lens):
-        if key in owned:
-            hits += 1
-        elif key in seen:
-            regret += n_tokens
-    return {
-        "hits": hits,
-        "misses": len(anchor_keys) - hits,
-        "regret_tokens": regret,
-    }
+def _join_round_kv(anchor_keys, owned) -> dict:
+    hits = sum(key in owned for key in anchor_keys)
+    return {"hits": hits, "misses": len(anchor_keys) - hits}
 
 
 def _tuple_suffix(join, docs, member):
@@ -268,15 +258,9 @@ def prepare_model_inputs(node, inputs, context: ExecutionContext):
             for document in anchor_ids
         ]
         anchor_keys = [(node.anchor, document) for document in anchor_ids]
-        round_kv = _join_round_kv(
-            anchor_keys,
-            [len(prefix) for prefix in prefixes],
-            state["arena"].accounting.owned,
-            state["seen"],
-        )
+        round_kv = _join_round_kv(anchor_keys, state["arena"].accounting.owned)
         state["kv_stats"]["join_anchor_hits"] += round_kv["hits"]
         state["kv_stats"]["join_anchor_misses"] += round_kv["misses"]
-        state["regret_tokens"] += round_kv["regret_tokens"]
         anchor_stream = None
     else:
         # the join admits anchors as the chain hands them over; the
@@ -329,19 +313,14 @@ def prepare_model_inputs(node, inputs, context: ExecutionContext):
 
 def record_model_result(node, result: NodeResult,
                         context: ExecutionContext) -> None:
-    """Record keys computed by the current query."""
+    """Release or retain each join anchor's KV once its group has run."""
     state = context.state
-    if isinstance(node, AiFilter):
-        answers = result.outputs[f"filter_answers:{node.alias}"]
-        state["seen"].update((node.alias, document)
-                             for document in answers)
-    elif isinstance(node, AiJoin):
+    if isinstance(node, AiJoin):
         prepared = state["prepared_join"]
         keys = prepared["anchor_keys"]
         if prepared["streamed"]:
             # every streamed anchor read its KV from the chain: a hit
             state["kv_stats"]["join_anchor_hits"] += len(keys)
-        state["seen"].update(keys)
         live = set(result.outputs[f"ids:{node.anchor}"])
         for key, prefix in zip(keys, prepared["prefixes"]):
             if key in state["arena"].accounting.owned:
@@ -379,8 +358,6 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
             else payload.get("filter_limit")
         ),
         "joins_started": False,
-        "seen": set(),
-        "regret_tokens": 0,
         "kv_stats": {
             "retained_after_filters": 0,
             "retained_pages_after_filters": 0,
@@ -421,7 +398,6 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
         "_outputs": export_physical_outputs(compute_subgraph(graph), result),
         "wall_s": round(wall, 2),
         "fresh_tokens": result.metrics.fresh_tokens,
-        "regret_tokens": runtime_state["regret_tokens"],
         "node_metrics": scalar_node_metrics(result.nodes),
         "executed_join_plan": executed_join_plan(graph),
         "kv_manager": kv_manager,

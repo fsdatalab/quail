@@ -6,26 +6,13 @@ from types import SimpleNamespace
 import pytest
 
 from quail.backends.request_scheduling import (
-    join_cache_accounting,
-    join_regret_tokens,
     run_filter_chain,
     run_filter_chain_async,
     run_join_grouped,
 )
 
 
-def test_join_submission_order_empty_inputs_and_regret():
-    # Two anchors, two suffixes each, 16-token blocks. Anchor 0 was
-    # computed before (40 seen tokens): pair 0 misses everything
-    # (regret 32, the block floor of 40) and pair 1 hits fully.
-    # Anchor 1 is new: pair 0 owes nothing even though the engine
-    # served 16 tokens, and pair 1 recomputes half its 40-token prefix
-    # (regret 32 - 16 = 16).
-    prefixes = [[7] * 40, [9] * 40]
-    cached = [0, 32, 16, 16]
-
-    assert join_regret_tokens(prefixes, 2, cached, [40, 0], 16) == 48
-
+def test_join_submission_order_and_empty_inputs():
     for submission in ["anchor-major", "suffix-major"]:
         prefixes = [[100 + i] * (4 + i) for i in range(5)]
         suffixes = [[200 + j] * 3 for j in range(4)]
@@ -210,8 +197,3 @@ def test_request_backend_evaluates_listed_pairs_only():
         assert result["answers"] == [
             1 if (100 + a + 200 + s) % 2 == 0 else 0 for a, s in pairs]
         assert result["cached_per_request"] == [(100 + a) % 7 for a, _ in pairs]
-    # cache accounting takes one request count per anchor
-    accounting = join_cache_accounting(
-        [[7] * 40, [8] * 40, [9] * 40], [2, 0, 3], [0, 32, 16, 16, 40],
-        [40, 0, 40], 16)
-    assert accounting["regret_tokens"] == (32 - 0) + (32 - 16) + (32 - 16)

@@ -10,6 +10,7 @@ import pyarrow as pa
 
 import quail
 import quail_b as benchmark
+from quail.runtime.minimum import minimum_input_tokens
 from quail.specs import H100_USD_PER_HOUR
 from quail_b.queries import (
     SELECTIVITY_ESTIMATE_COLLECTION,
@@ -168,14 +169,30 @@ def run_output(result, spec: QuerySpec, corpus_rows) -> RunOutput:
         dict(result.report, collection_s=collection_s))
 
 
+def regret_measurements(query, result) -> dict:
+    """Return the run's fewest needed input tokens and its regret.
+
+    Derived on the CPU after the run from the answer tables; nothing
+    is tracked while the query runs.
+    """
+    minimum = minimum_input_tokens(
+        query.logical, query.token_inputs(),
+        result.answer_tables["filters"], result.answer_tables["joins"])
+    return {"minimum_tokens": minimum,
+            "regret_tokens": result.report["fresh_tokens"] - minimum}
+
+
 def run_query(session, spec, tables):
     """Execute one query and return benchmark IDs, answers, and measurements."""
     for name, table in tables.items():
         if name not in session.catalog:
             session.register(
                 name, quail.DocumentProvider.from_table(table, id_col="id"))
-    result = build_query(session, spec).run()
-    return run_output(result, spec, tables)
+    query = build_query(session, spec)
+    result = query.run()
+    output = run_output(result, spec, tables)
+    output.measurements.update(regret_measurements(query, result))
+    return output
 
 
 def run_suite(only=None, *, sf=0.1, config=None, data_dir=None,

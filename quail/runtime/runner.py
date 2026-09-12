@@ -46,7 +46,6 @@ class NodeMetrics:
     kv_misses: int = 0
     kv_removals: int = 0
     kv_recomputations: int = 0
-    regret_tokens: int = 0
     peak_gpu_bytes: int = 0
     extension: Mapping[str, Any] = field(default_factory=dict)
 
@@ -70,7 +69,6 @@ class NodeMetrics:
             kv_recomputations=(
                 self.kv_recomputations + other.kv_recomputations
             ),
-            regret_tokens=self.regret_tokens + other.regret_tokens,
             peak_gpu_bytes=max(self.peak_gpu_bytes, other.peak_gpu_bytes),
             extension={**self.extension, **other.extension},
         )

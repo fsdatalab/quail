@@ -242,7 +242,6 @@ class DistributedQuailExecution:
                 fresh_tokens=merged["fresh_tokens"],
             )
         stage_outputs = coordinator.merge_join_round(outputs)
-        regret = 0
         hits = 0
         misses = 0
         fresh_tokens = 0
@@ -250,7 +249,6 @@ class DistributedQuailExecution:
             fresh_tokens += output["fresh_tokens"]
             hits += output["kv_round"]["hits"]
             misses += output["kv_round"]["misses"]
-            regret += output["kv_round"]["regret_tokens"]
             self.child_totals[index] = output["kv_totals"]
         self.kv_stats["join_anchor_hits"] += hits
         self.kv_stats["join_anchor_misses"] += misses
@@ -288,7 +286,6 @@ class DistributedQuailExecution:
                 fresh_tokens=fresh_tokens,
                 kv_hits=hits,
                 kv_misses=misses,
-                regret_tokens=regret,
                 extension={"joins": enriched},
             ),
         )
@@ -398,7 +395,6 @@ def execute_distributed_graph(payload, graph: PhysicalGraph, gpu_count: int,
         _outputs=export_physical_outputs(compute_subgraph(graph), result),
         wall_s=round(elapsed, 2),
         fresh_tokens=result.metrics.fresh_tokens,
-        regret_tokens=result.metrics.regret_tokens,
         executed_join_plan=executed_join_plan(graph),
         node_metrics=scalar_node_metrics(result.nodes),
     )

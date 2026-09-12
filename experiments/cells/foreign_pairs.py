@@ -151,8 +151,7 @@ def compare(prediction: str) -> str:
             (vdir / "summary.json").write_text(json.dumps(record, indent=2))
             print(f"[{variant}] {seconds} seconds, {pairs} pairs, "
                   f"{row_count} rows, {result.report['fresh_tokens']} "
-                  f"fresh tokens, {result.report['regret_tokens']} "
-                  f"recomputed", flush=True)
+                  f"fresh tokens", flush=True)
             results.commit()
     return str(output)
 

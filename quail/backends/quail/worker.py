@@ -431,8 +431,6 @@ def _child_filters(state, sub):
                     key[1] for key in arena.accounting.retained
                     if key[0] == alias)
             out["fresh_tokens"] += result.metrics.fresh_tokens
-            state["seen"].update((alias, document)
-                                 for document in answers)
             out["filters"][alias] = {
                 int(document): row for document, row in answers.items()
             }
@@ -480,7 +478,6 @@ def _child_joins(state, sub):
         if not isinstance(filter_node, AiFilter) \
                 or filter_node.alias != anchor_alias:
             raise TypeError("the streamed chain must filter the anchor")
-    seen = state.setdefault("seen", set())
     out_joins, tokens_total = [], 0
     t0 = time.perf_counter()
     with torch.inference_mode():
@@ -510,9 +507,7 @@ def _child_joins(state, sub):
         if filter_node is None:
             prefixes = [chain_tokens(pre, d) for d in anchor_docs]
             anchor_keys = [(anchor_alias, g) for g in anchors_glob]
-            round_kv = _join_round_kv(
-                anchor_keys, [len(p) for p in prefixes],
-                arena.accounting.owned, seen)
+            round_kv = _join_round_kv(anchor_keys, arena.accounting.owned)
             anchor_stream = None
         else:
             # this GPU's shard of the anchor documents runs through the
@@ -566,8 +561,7 @@ def _child_joins(state, sub):
         if filter_node is not None:
             anchors_glob = [key[1] for key in anchor_keys]
             round_kv = dict(hits=result.metrics.kv_hits,
-                            misses=result.metrics.kv_misses,
-                            regret_tokens=result.metrics.regret_tokens)
+                            misses=result.metrics.kv_misses)
             holder = anchor_stream["holder"]
             chain = filter_result(
                 filter_node, holder["answers"], holder["tokens"],
@@ -581,8 +575,6 @@ def _child_joins(state, sub):
                     chain.outputs[f"ids:{anchor_alias}"])},
                 filter_fresh_tokens=chain.metrics.fresh_tokens,
             )
-            seen.update((anchor_alias, document) for document in answers)
-        seen.update(anchor_keys)
         last = ans[-1] if ans else {}
         for a, key in enumerate(anchor_keys):
             if key not in arena.accounting.owned:
@@ -629,7 +621,6 @@ def _reset_child_query(state):
     for key in list(arena.accounting.owned):
         arena.free_key(key)
     arena.reset_stats()
-    state["seen"] = set()
 
 
 def _ensure_children(k):

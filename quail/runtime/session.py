@@ -28,7 +28,6 @@ from quail.runtime.pairs import (
     pair_fraction,
     pair_table,
 )
-from quail.runtime.prefixes import prefix_metrics
 from quail.runtime.result import IndexRelation, QueryResult, true_answer_rows
 from quail.runtime.runner import (
     ExecutionContext,
@@ -674,7 +673,7 @@ class Query:
             coordinator_wall_s=round(coordinator_wall, 2),
             fresh_tokens=out["fresh_tokens"],
             cached_tokens=out.get("cached_tokens"),
-            regret_tokens=out.get("regret_tokens"), stages=[],
+            stages=[],
             peak_gib=out.get("peak_gib"),
             order_rule=plan.settings.get("order_rule"),
             expected_join_plan=[
@@ -941,7 +940,6 @@ class Query:
             ))
             if semantics == "full":
                 true_join_tables[written_pos] = true_answer_rows(table)
-        report.update(prefix_metrics(report, scans, self._token_inputs))
         survivor_arrays = {
             alias: pa.array(indices, type=pa.int32())
             for alias, indices in survivors.items()

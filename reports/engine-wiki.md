@@ -605,10 +605,9 @@ predicates assemble into results correctly.
   use pays no prefix, and no alias pays a prefix at a later anchor use. The
   search therefore chooses orders on tuple work alone, and the executor keeps
   as much of that KV as the arena holds and recomputes the rest
-  (`regret_tokens` counts what it could not keep; the reports' recomputed
-  KV figure is `regret_distinct_tokens`, which adds the shared prompt
-  prefix every document recomputes, derived after the run in
-  `runtime/prefixes.py`).
+  (the reports' recomputed KV figure, fresh tokens minus the fewest
+  tokens the run's requests needed, is derived after the run by
+  `runtime/minimum.py` from the answer tables).
 - A filtered alias whose first use is as an anchor streams its survivors into
   that join with their KV pinned (section 4.6), so nothing of it enters the
   pool. Its chain is placed right before that group, after any barrier. An

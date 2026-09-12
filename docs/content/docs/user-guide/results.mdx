@@ -95,7 +95,7 @@ the keys every backend fills:
 | `remarks` | Planner and tokenizer notes. |
 | `worker_total_s` | Total time in query execution, including tokenization and planning. Excludes wrapper report writes and volume commits. |
 
-The Quail backend adds `regret_tokens`, `kv_manager`, `peak_gib`,
+The Quail backend adds `kv_manager`, `peak_gib`,
 `order_rule`, `expected_join_plan`, and `executed_join_plan`. The saved
 join order is the executed order. Actual row counts and KV hits can differ
 from the estimates. The join query in the quickstart shows them:
