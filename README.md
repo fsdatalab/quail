@@ -45,64 +45,43 @@ startup, engine configuration, hardware, and any Modal resources.
 
 ## Return results
 
-`RunOutput` contains:
+`run_query` returns a `RunOutput`:
 
-- `rows`: an Arrow table of final document IDs, with columns named for selected aliases.
-- `runtime_s`: completed query time, excluding startup, result collection,
-  scoring, and saving. Report those other durations in `measurements`.
+- `rows`: final document IDs. Column names are the selected aliases.
+- `runtime_s`: query time, excluding startup, result collection, scoring,
+  and saving. Put those other durations in `measurements` if you have them.
 - `filter_answers`: tables keyed by `(alias, predicate_position)`.
 - `join_answers`: tables keyed by join position.
-- `measurements`: engine-reported numbers. `fresh_tokens` is the count of
-  input token positions a model forward pass processed instead of reading
-  from existing KV. It is required when `prompt_pieces` is set. Other
-  values such as `evaluated_document_pairs` stay optional. Report startup
-  and collection durations here too.
-- `prompt_pieces`: the token ids the engine put around each document:
-  `tokenizer` (the HuggingFace tokenizer name), `preamble`, one
-  `{"alias", "position", "tail"}` per filter stage, and one
-  `{"position", "anchor", "frame", "label", "tail"}` per join, where a
-  join request is preamble, anchor document, frame, label, partner
-  document, tail. See `quail_b.minimum.validate_prompt_pieces`.
+- `measurements`: optional extra numbers, such as `evaluated_document_pairs`.
 
-Answer tables contain alias ID columns and a non-null boolean `answer` column.
-Use `None` for unavailable predicate answers. QUAIL-B still scores final-output
-precision and recall.
+Answer tables have alias ID columns and a non-null boolean `answer` column.
+Pass `None` for predicates you did not evaluate. Final-output precision and
+recall still score.
 
-Do not report `minimum_tokens` or `regret_tokens`. Scoring computes them
-after the run, on the CPU, from the saved answers, `fresh_tokens`, and
-`prompt_pieces`. They never count toward `runtime_s`.
-
-- `minimum_tokens`: the fewest input tokens the run's requests needed
-  with unlimited KV. Every distinct token prefix is computed once.
-- `regret_tokens`: `fresh_tokens` minus `minimum_tokens`. The KV the
-  engine computed again.
-
-A run without `prompt_pieces` may omit `fresh_tokens`; `minimum_tokens`
-and `regret_tokens` are then null. Invalid `fresh_tokens` (or
-`prompt_pieces` without it) is an error, not an unavailable value.
+Token counts are optional. To include them, also return `prompt_pieces`
+(tokenizer name and the token ids around each document; see
+`quail_b.minimum.validate_prompt_pieces`) and set `measurements["fresh_tokens"]`
+to the number of input token positions the model computed rather than read
+from existing KV. Scoring then fills `minimum_tokens` and `regret_tokens`.
+Do not report those two yourself.
 
 ## Report
 
-A run saves `run.json`, per-query Parquet answers, `report.md`, and
-`measurements.parquet`. The Parquet file has one row per completed query.
-Columns: `runtime_s`; `fresh_tokens`, `minimum_tokens`, `regret_tokens`;
-`evaluated_document_pairs`; `input_rows` (documents across aliases,
-counting a repeated table once per alias); `answers_evaluated` and
-`answers_correct` (predicate answers vs the labels); `predicted_rows`,
-`expected_rows`, and `matching_rows` (the engine's result set, the
-labeled result set, and their overlap); `cost_usd`.
-Completed answers are saved before scoring. Errors remain recorded in the run.
+A run writes `run.json`, per-query answer Parquet, `report.md`, and
+`measurements.parquet`. Answers are saved before scoring. Failures stay
+in the run record.
 
-Regenerate the report from saved answers without executing queries:
+Regenerate from saved answers:
 
 ```sh
 quail-b report results/my-run
 ```
 
-The report includes query time, throughput, GPU cost when supplied, and accuracy.
-Filter throughput counts input documents; join throughput counts evaluated pairs
-across all stages. Predicate accuracy is agreement on evaluated answers, whose
-count can differ between engines. Model-generated reference labels use Qwen3 32B
-fp8; FEVER and LePaRD also use source labels.
+The report has query time, throughput, GPU cost when supplied, and accuracy.
+Filter throughput is input documents per second. Join throughput is
+evaluated pairs per second across all stages. Token counts appear when you
+returned `prompt_pieces` and `fresh_tokens`. Predicate accuracy is agreement
+on evaluated answers; that count can differ between engines. Model-generated
+labels use Qwen3 32B fp8; FEVER and LePaRD also use source labels.
 
 See the [query definitions](quail_b/queries.py) and [data sources](quail_b/data.py).
