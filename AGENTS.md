@@ -72,11 +72,11 @@ CI runs these on every pull request. Run them before pushing:
 
 # Scope
 
-Filter queries only, Qwen3 4B fp8 or Qwen3 32B fp8, one H100 per model
-(one model copy per GPU - no tensor-parallel weight sharding across
-GPUs). Open-ended maps, classification, speculation, and forking were
-removed on purpose. Do not reintroduce them without being asked; if a
-change needs one of them, say so instead of quietly adding it back.
+The current runtime supports filter queries only, Qwen3 4B fp8 or
+Qwen3 32B fp8, and one H100 per model copy. It does not use
+tensor-parallel weight sharding. `AI.CLASSIFY`, `AI.EXTRACT`, and
+`AI.MAP` are on the roadmap. Open-ended generation, speculation, and
+forking are not part of the current runtime.
 
 # Experiments
 
@@ -124,7 +124,8 @@ change needs one of them, say so instead of quietly adding it back.
 
 # Reports
 
-All experiment and feature reports live under `reports/`.
+This is the dedicated report branch. Experiment reports, plot code,
+figures, and `engine-wiki.md` live here instead of on `main`.
 
 - Every PR adds one file, and only one, to `reports/shipped_features/`,
   named `YYYY-MM-DD-<short-slug>.md`. It says what changed, why, the
