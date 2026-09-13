@@ -189,3 +189,38 @@ and recall against the toxicity labels, so filter errors and join
 errors can be told apart. Prediction for the next run: the join passes
 3 to 10 percent of pairs and output recall rises above 0.2; the filter
 is unchanged at about 27 percent.
+
+## Fourth GPU run, 2,000 comments, local H100
+
+Join sentence removed, `--limit 2000`. Predicted: filter unchanged at
+about 27 percent, join passes 3 to 10 percent, output recall above 0.2.
+
+| Quantity | Predicted | Measured |
+|---|---:|---:|
+| Filter pass rate | about 27 percent | 83.7 percent |
+| Filter precision against the toxicity labels | 0.3 to 0.45 | 0.124 |
+| Filter recall against the toxicity labels | | 0.954 |
+| Join pairs evaluated | | 51,894 |
+| Join pass rate | 3 to 10 percent | 13.7 percent |
+| Query time, s | | 13.1 |
+| Document pairs/s | | 3,961 |
+| Output precision against the labels | | 0.054 |
+| Output recall against the labels | 0.2 or more | 0.861 |
+
+The filter prompt was identical in the third and fourth runs, and the
+plans are identical in shape (checked on the CPU: both stream the
+filter's survivors into the join with the same estimates). Yet the
+filter passed 27.1 percent in the third run and 83.7 percent in the
+fourth. The only thing that changed on the filter's side is the number
+of extra KV rows a held survivor reserves for the join's frame, which
+changes how documents are grouped into chunks, not what the model
+reads. Either the third run used a different command, or the streamed
+path's filter answers depend on chunk composition, which would be an
+engine bug. `--filter-only` runs the same filter prompt through the
+plain filter path with no join, so the two paths can be compared on
+the same 2,000 comments. Prediction: if the engine is sound, the
+filter-only pass rate equals the streamed run's 83.7 percent to within
+one percentage point.
+
+`gpu_s` did not appear in the fourth run's output because the session
+dropped it when assembling the report; that is fixed in this commit.

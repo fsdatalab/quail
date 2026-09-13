@@ -99,14 +99,15 @@ JOIN_PROMPT = ("Judge strictly whether the description in DOCUMENT {1} "
                "applies to the comment in DOCUMENT {0}.")
 
 
-def build_sql(criterion: str = TOXIC) -> str:
+def build_sql(criterion: str = TOXIC, filter_only: bool = False) -> str:
     """Return the query; criterion completes "whether the comment ..."."""
-    return f"""
-    SELECT c.comment_id, f.field
-    FROM comments c
+    join = "" if filter_only else f"""
     JOIN fields f
       ON AI_FILTER(PROMPT('{JOIN_PROMPT}', c.text, f.statement),
-                   {{'selectivity': 0.067}})
+                   {{'selectivity': 0.067}})"""
+    return f"""
+    SELECT c.comment_id{"" if filter_only else ", f.field"}
+    FROM comments c{join}
     WHERE AI_FILTER(
             PROMPT('Judge strictly from the comment above whether it {criterion}.
 
@@ -154,6 +155,8 @@ def main() -> None:
     parser.add_argument("--limit", type=int, help="random sample of N comments")
     parser.add_argument("--criterion", default=TOXIC,
                         help="filter wording; completes 'whether the comment'")
+    parser.add_argument("--filter-only", action="store_true",
+                        help="run the toxicity filter alone, without the join")
     parser.add_argument("--device", choices=sorted(DEVICES), default="h100-sxm")
     parser.add_argument("--gpus", type=int, choices=(1, 2, 4, 8), default=1)
     parser.add_argument("--gpu-usd-per-hour", type=float,
@@ -184,7 +187,7 @@ def main() -> None:
             pa.table({"field": list(FIELDS),
                       "statement": [f"The comment {s}." for s in FIELDS.values()]}),
             id_col="field"))
-        query = session.sql(build_sql(args.criterion))
+        query = session.sql(build_sql(args.criterion, args.filter_only))
         print(query.explain(), flush=True)
 
         result = query.run()
@@ -192,7 +195,8 @@ def main() -> None:
         report = result.report
         wall_s = report["wall_s"]
         boot_s = report.get("boot_s", 0.0)
-        found = {(row["c.comment_id"], row["f.field"]) for row in table.to_pylist()}
+        found = set() if args.filter_only else {
+            (row["c.comment_id"], row["f.field"]) for row in table.to_pylist()}
         ids = comments["comment_id"].to_pylist()
         answers = result.answer_tables["filters"][("c", 0)]
         toxic_found = {ids[i] for i, yes in zip(answers["c"].to_pylist(),
@@ -206,11 +210,13 @@ def main() -> None:
               f"{toxic_hits / max(1, len(toxic_found)):.3f}")
         print(f"filter recall against the toxicity labels: "
               f"{toxic_hits / max(1, len(toxic_labeled)):.3f}")
-        print(f"(comment, field) pairs found: {len(found)}")
-        print(table.to_pandas()["f.field"].value_counts().to_string())
-        hits = len(found & labeled)
-        print(f"precision against the labels: {hits / max(1, len(found)):.3f}")
-        print(f"recall against the labels: {hits / max(1, len(labeled)):.3f}")
+        if not args.filter_only:
+            print(f"(comment, field) pairs found: {len(found)}")
+            print(table.to_pandas()["f.field"].value_counts().to_string())
+            hits = len(found & labeled)
+            print(f"precision against the labels: "
+                  f"{hits / max(1, len(found)):.3f}")
+            print(f"recall against the labels: {hits / max(1, len(labeled)):.3f}")
         pairs = 0
         for stage in report.get("stages", ()):
             if stage.get("op") == "filter":
@@ -228,7 +234,10 @@ def main() -> None:
                   f"({100 * idle / wall_s:.1f}% of wall_s)")
         print(f"total_s: {wall_s + boot_s:.2f} (boot + query)")
         print(f"fresh_tokens: {report.get('fresh_tokens')}")
-        print(f"document pairs/second: {pairs / wall_s:.1f}")
+        if pairs:
+            print(f"document pairs/second: {pairs / wall_s:.1f}")
+        else:
+            print(f"documents/second: {n_docs / wall_s:.1f}")
         cost_per_second = args.gpus * hourly_price / 3600
         print(f"GPU price: ${hourly_price:.4f}/GPU-hour ({price_source})")
         print(f"GPU cost/query: ${wall_s * cost_per_second:.4f}")
