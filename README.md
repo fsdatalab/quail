@@ -243,31 +243,28 @@ results/my-run/report.md
 results/my-run/measurements.parquet
 ```
 
-`report.md` has three tables. Numbers below are from a two-review fixture,
-not a published corpus.
+`report.md` includes query time, throughput, GPU cost, predicate accuracy,
+final-output precision and recall, input rows, and token work.
 
-Query time, cost, throughput:
+These are representative measured rows from
+[Quail PR 91](https://github.com/fsdatalab/quail-exploration/pull/91):
+Quail after its streamed-edge change, one H100, Qwen3 4B fp8, scale 0.1,
+September 12, 2026.
 
-| Query | Status | Seconds | $/query | Throughput | Unit |
-| --- | --- | ---: | ---: | ---: | --- |
-| IMDB-4 | complete | 2 | 0.004 | 1 | document pairs/second |
+| Dataset | Query | Query time, seconds | Recomputed KV tokens |
+| --- | --- | ---: | ---: |
+| IMDB | IMDB-4 | 17.38 | 118,395 |
+| BioDEX | BIO-3 | 79.96 | 2,275,033 |
+| FEVER | FEV-10 | 1.65 | 2,927 |
+| LePaRD | LEP-6 | 9.39 | 95,362 |
+| SWE-Next | AGENT-1 | 237.65 | 11,886,152 |
 
-Accuracy against the labels:
-
-| Query | Predicate accuracy | Evaluated answers | Output precision | Output recall |
-| --- | ---: | ---: | ---: | ---: |
-| IMDB-4 | 1 | 6 | 1 | 1 |
-
-Input size and token counts (`unavailable` until you send token data):
-
-| Query | Input rows by alias | Fresh tokens | Minimum tokens | Recomputed KV tokens |
-| --- | --- | ---: | ---: | ---: |
-| IMDB-4 | r: 2, a: 1 | unavailable | unavailable | unavailable |
-
-Filter throughput is input documents per second. Join throughput is
-evaluated pairs per second across all stages. Predicate accuracy is
-agreement on evaluated answers; that count can differ between engines.
-Labels are Qwen3 32B fp8; FEVER and LePaRD also use source labels.
+The linked comparison covers all 33 queries and records the source for
+each configuration. Filter throughput is input documents per second.
+Join throughput is evaluated pairs per second across all stages.
+Predicate accuracy is agreement on evaluated answers; that count can
+differ between engines. Labels are Qwen3 32B fp8; FEVER and LePaRD also
+use source labels.
 
 Rebuild the report from saved answers:
 
