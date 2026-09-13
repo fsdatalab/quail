@@ -1,231 +1,84 @@
 ---
-title: Results and explain
-description: Reading rows, counts, the execution report, and the plan.
+title: Explain plans and runs
 ---
 
-`Query.run()` returns a `QueryResult`. Each row accessor runs the final
-Arrow projection over the session's memory mapped token files. Call
-`collect()` while the session is open and keep the table if you need the
-rows again. A Modal function should collect the rows before returning,
-for example with `return result.collect(), result.report`.
+## Preview the plan
+
+Call `explain()` to see the query plan without running it:
 
 ```python
-result = query.run()
-
-result.collect()            # pyarrow.Table of the projected columns
-result.to_rows()            # list of tuples
-result.count()              # row count; len(result) is the same
-result.execute_stream()     # pyarrow.RecordBatchReader
-result.schema               # pyarrow.Schema
-result.report               # dict, see below
+query = session.sql("...", dialect="snowflake")
+print(query.explain())
 ```
 
-`collect`, `to_rows`, and `execute_stream` accept `limit=` to stop
-early. `execute_stream` also accepts `batch_rows=`.
+No model execution happens. Quail tokenizes a sample of each document
+column to estimate token lengths, but does not load the model.
 
-The two shortcuts on `Query` do the same without keeping the result:
-
-```python
-query.collect()             # run and return one Arrow table
-query.execute_stream()      # run and return a record batch reader
-```
-
-## The execution report
-
-`result.report` is a plain dictionary. This is the report from the
-[quickstart](/docs/user-guide/quickstart)'s filter query, trimmed to
-the keys every backend fills:
-
-<QueryOutput
-  title="Positive-aspect filter"
-  subtitle="September 13, 2026 · Qwen3 4B fp8 · 1 H100 · Quail backend"
-  metrics={[
-    { label: 'Rows returned', value: '4 / 8', detail: '50% selectivity' },
-    { label: 'Query time', value: '0.75 s', detail: 'startup excluded' },
-    { label: 'Model startup', value: '40.27 s', detail: 'cold process' },
-    { label: 'Fresh tokens', value: '1,117', detail: '8 documents' },
-  ]}
-/>
-
-```json
-{
-  "backend": "quail",
-  "wall_s": 0.75,
-  "boot_s": 40.27,
-  "boot_kind": "cold",
-  "boot": {
-    "kind": "cold",
-    "load_model_s": 24.5,
-    "arena_s": 0.89,
-    "pipeline_s": 0.0,
-    "warm_kernels_s": 8.98,
-    "boot_s": 40.27,
-    "warm_tier": "touch"
-  },
-  "coordinator_wall_s": 0.75,
-  "fresh_tokens": 1117,
-  "cached_tokens": null,
-  "stages": [
-    {
-      "op": "filter",
-      "alias": "r",
-      "stage": 0,
-      "provided_selectivity": null,
-      "observed_selectivity": 0.5,
-      "evaluated": 8
-    }
-  ],
-  "node_metrics": {
-    "ai_filter:r": {
-      "input_rows": 8,
-      "output_rows": 4,
-      "evaluated_documents": 8,
-      "fresh_tokens": 1117
-    }
-  },
-  "result_volume_path": "/results/docs-quickstart/f7dcd33796934181b89d3d6b740d5e82/filter.json",
-  "remarks": [
-    "filter on 'r': arena writes off (one stage - nothing reads the KV again)",
-    "reviews.body: tokenizer: bpe-qwen (parity-checked on sample)"
-  ],
-  "worker_total_s": 41.057
-}
-```
-
-This result came from Modal function call
-`fc-01M2CHCF0PZXTGTYV8N21BQ6CJ`.
-
-| Key | Meaning |
-| --- | --- |
-| `backend` | The backend that ran the query. |
-| `wall_s` | Query time in seconds, excluding model startup. |
-| `boot_s`, `boot_kind`, `boot` | Model startup time, whether it was cold or warm, and the phases of a cold start. |
-| `coordinator_wall_s` | Time inside the worker from request to response, including boot. |
-| `fresh_tokens` | Tokens the model computed for this query. |
-| `cached_tokens` | Tokens served from KV already on the GPU. The request backends fill this; Quail reports KV reuse under `kv_manager`. |
-| `stages` | One entry per filter or join stage: documents or tuples evaluated, the selectivity you gave, and the selectivity observed. |
-| `node_metrics` | Per physical node metrics keyed by node id. |
-| `result_volume_path` | Optional path added by a Modal wrapper after explicitly saving the report. |
-| `remarks` | Planner and tokenizer notes. |
-| `worker_total_s` | Total time in query execution, including tokenization and planning. Excludes wrapper report writes and volume commits. |
-
-The Quail backend adds `kv_manager`, `peak_gib`,
-`order_rule`, `expected_join_plan`, and `executed_join_plan`. The saved
-join order is the executed order. Actual row counts and KV hits can differ
-from the estimates. The companion `docs/examples/imdb_queries_modal.py`
-join query shows them:
-
-<QueryOutput
-  title="Positive reviews joined with movie aspects"
-  subtitle="Same process and data · warm model"
-  metrics={[
-    { label: 'Pairs returned', value: '10', detail: 'from 48 evaluated' },
-    { label: 'Query time', value: '0.46 s', detail: 'startup excluded' },
-    { label: 'Model startup', value: '0.00 s', detail: 'warm process' },
-    { label: 'Fresh tokens', value: '1,849', detail: 'filter and join' },
-  ]}
->
-
-```text
-rv0  the acting
-rv0  the plot
-rv0  the pacing
-rv0  the dialogue
-rv0  the screenplay
-rv2  the acting
-rv2  the plot
-rv2  the directing
-rv2  the pacing
-rv2  the editing
-```
-
-</QueryOutput>
-
-The join report is saved at
-`/results/docs-quickstart/f7dcd33796934181b89d3d6b740d5e82/join.json`.
-
-```json
-{
-  "order_rule": "by_cost",
-  "executed_join_plan": [
-    {"type": "quail.ai_join", "id": "ai_join:r", "anchor": "r"}
-  ],
-  "kv_manager": {
-    "retained_after_filters": 0,
-    "retained_pages_after_filters": 0,
-    "retained_prefix_tokens_after_filters": 0,
-    "join_anchor_hits": 4,
-    "join_anchor_misses": 0,
-    "evicted_keys": 0,
-    "evicted_pages": 0,
-    "evicted_prefix_tokens": 0
-  }
-}
-```
-
-Registered execution observers add an `observers` mapping keyed by
-observer name.
-
-## Explain
-
-`Query.explain()` plans the query without running it and returns the
-logical and physical plan as text. The first time a document column is
-seen, the token counts in the plan are estimates: the session reads the
-column's byte lengths and scales them by the tokens per byte of the
-first 1,024 documents, and a `note:` line says so. Tokenizing starts in
-the background at the same time, so `run()` does not repeat it. Later
-queries over the same column plan on the exact counts.
-
-```python
-print(session.sql(text).explain())
-```
+The output has two parts:
 
 ```text
 logical:
   Project: r.id, a.aspect
     SemanticJoin (full)
-      PROMPT('Does the review in DOCUMENT {0} discuss the movie aspect in DOCUMENT {1}?', r.body, a.aspect) (selectivity=15%)
+      PROMPT('...', r.body, a.aspect) (selectivity=15%)
       Join
         cross
         SemanticFilter
-          PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the review above ...', r.body) (selectivity=60%)
+          PROMPT('...', r.body) (selectivity=60%)
           Scan reviews as r [body, id]
         Scan aspects as a [aspect]
 
 physical: (backend=quail, model=qwen3-4b-fp8, workers=1)
-  KV=bf16, chunk budget=110,376 tokens, admission budget=362,250 tokens
-  node seconds price each node's work alone; they do not add up to the plan estimate because chunk packing shares forward passes across nodes
-  Project: r.id, a.aspect (estimated_rows=unknown)
-    AiJoin: anchor=r (estimated_rows=unknown, estimated_seconds=0.003)
-      KV: anchor=streamed from its filter, retain after join=no
-      1. full (r, a): PROMPT('Does the review in DOCUMENT {0} discuss the movie aspect in DOCUMENT {1}?', r.body, a.aspect) (selectivity=15%, estimated_evaluations=57.6)
+  KV=bf16, chunk budget=110,376 tokens
+  Project: r.id, a.aspect
+    AiJoin: anchor=r (estimated_seconds=0.003)
       AiFilter: r (estimated_rows=4.8, estimated_seconds=0.004)
-        survivors stream into the join with KV pinned
-        1. PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the review above ...', r.body) (selectivity=60%, question_tokens=51)
-        if the KV were released here instead of pinned: 0 tokens, 0.000 s
         Scan reviews as r (estimated_rows=8)
-          tokens=693, mean_doc_tokens=86.6
       Scan aspects as a (estimated_rows=12)
-        tokens=27, mean_doc_tokens=2.2
 ```
 
-The logical part is the `Project`, `SemanticJoin`, `Join`,
-`SemanticFilter`, and `Scan` tree, each predicate under the operator
-that evaluates it. The physical part is the same tree in physical
-nodes, each with its estimated rows, and each model node with
-`estimated_seconds`, its own work priced alone. A filter chain a join
-anchors on shows the recompute it would pay if its KV were released
-instead of pinned. `explain(verbose=True)` adds node ids, the port
-each node reads, the runtime settings, and the planner's remarks. See
-[physical plans](../architecture/physical-plans) for what the numbers
-mean and how to edit the plan, and `demos/plan_walkthrough.py` for a
-script that prints and edits a plan on the CPU.
+**Logical plan.** The top section shows the query structure. Read it
+bottom-up: scans are at the leaves, the projection is at the root.
+Each predicate appears under the operator that evaluates it.
 
-If the planner refuses the query, `explain()` prints the refusal
-instead. A refusal names the constraint and the numbers behind it, for
-example a document whose tokens do not fit one chunk. `run()` raises
-`quail.RefusalError` for the same case.
+**Physical plan.** The bottom section shows what the execution engine
+will do:
 
-Planning tokenizes the document columns, so the first `explain()` or
-`run()` on a session pays for tokenization. Later queries over the same
-column reuse the token store.
+- **backend and model**: which engine and model run the query.
+- **chunk budget**: maximum tokens per model forward pass.
+- **estimated_rows**: how many documents or pairs the planner expects
+  at each node, based on selectivities you provided.
+- **estimated_seconds**: the planner's time estimate for each node's
+  model work.
+- **anchor**: for a join, which table's documents stay in GPU memory.
+
+`explain(verbose=True)` adds node ids, port connections, KV retention
+decisions, and planner remarks.
+
+## Refusals
+
+If the planner refuses the query (for example, a document too long
+for one forward pass), `explain()` prints the reason instead of a
+plan. `run()` raises `quail.RefusalError` for the same case.
+
+## Running a query
+
+`run()` executes the query and returns a `QueryResult`:
+
+```python
+result = query.run()
+
+table = result.collect()          # pyarrow.Table
+rows = result.to_rows()           # list of tuples
+n = result.count()                # row count (len(result) works too)
+stream = result.execute_stream()  # pyarrow.RecordBatchReader
+report = result.report            # execution metrics (see Metrics page)
+```
+
+All row accessors accept `limit=`. If you are on Modal, collect the
+rows before returning from the function.
+
+`query.collect()` is a shortcut that calls `run().collect()`.
+
+See [Metrics](/docs/user-guide/metrics) for every field in
+`result.report`.
