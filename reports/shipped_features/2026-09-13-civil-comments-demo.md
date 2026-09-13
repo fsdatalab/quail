@@ -78,3 +78,39 @@ minutes for the full Kaggle file on one H100. I do not know of a
 16-million-comment release of Civil Comments; if one exists with the
 same columns, `--parquet` runs it and the estimate scales to about 3.3
 hours on one H100.
+
+## First GPU run, 20,000 comments, local H100
+
+Run by hand on one H100 with `--limit 20000`; no Modal function call id.
+Predicted from the plan: 8.99 seconds of filter and 5.89 seconds of
+join, 70,060 join pairs, about 4,700 output pairs.
+
+| Quantity | Predicted | Measured |
+|---|---:|---:|
+| Filter pass rate | 11.3 percent | 96.6 percent |
+| Join pairs evaluated | 70,060 | 599,168 |
+| Join pass rate | 6.7 percent | 65.4 percent |
+| Query time, s | under 14.9 | 135.65 |
+| Document pairs/s | | 4,417 |
+| Fresh tokens | | 15,716,441 |
+| $/query | | 0.1488 |
+| Model startup, s (cold) | | 58.86 |
+| Output precision against the labels | | 0.012 |
+| Output recall against the labels | | 0.990 |
+
+The throughput was normal: 4,417 pairs per second, compared with 4,814
+for FEV-9 and 2,339 for IMDB-3 in the 2026-09-11 report. The time was
+off because the model answered TRUE to almost every question, so the
+join evaluated 8.5 times the planned pairs, and 8.5 times the planned
+time is 128 seconds, close to the 136 measured.
+
+The prompts were the cause. The filter prompt had only the trailing
+instruction; every QUAIL-B filter prompt states the criterion before
+the document ("Judge strictly from the review above whether it ...")
+and repeats it in the instruction. The join asked a generic "is the
+statement true of the document" question. Both now follow the QUAIL-B
+pattern. Prediction for the rerun with `--limit 20000`: the filter
+passes 10 to 20 percent, the join evaluates 60,000 to 130,000 pairs,
+and the query takes 15 to 30 seconds. Recall should drop from 0.99 and
+precision should rise well above 0.012; the exact values are unknown
+until the run.

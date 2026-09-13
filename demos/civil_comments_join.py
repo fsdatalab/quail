@@ -86,17 +86,21 @@ FIELDS = {
 }
 
 # Measured on the full table: 11.3% of comments are toxic, and among
-# those a joined field is true 6.7% of the time on average.
+# those a joined field is true 6.7% of the time on average. The prompts
+# follow the QUAIL-B pattern: the criterion before the document, then
+# the instruction after it.
 SQL = f"""
     SELECT c.comment_id, f.field
     FROM comments c
     JOIN fields f
       ON AI_FILTER(
-           PROMPT('Is the statement in DOCUMENT {{1}} true of DOCUMENT {{0}}?',
-                  c.text, f.statement),
+           PROMPT('Judge strictly whether the description in DOCUMENT {{1}}
+applies to the comment in DOCUMENT {{0}}.', c.text, f.statement),
            {{'selectivity': 0.067}})
     WHERE AI_FILTER(
-            PROMPT('{{0}}
+            PROMPT('Judge strictly from the comment above whether it {TOXIC}.
+
+{{0}}
 
 Instruction: answer TRUE if the comment {TOXIC}, FALSE otherwise.', c.text),
             {{'selectivity': 0.113}})
