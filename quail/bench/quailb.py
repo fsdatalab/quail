@@ -12,6 +12,7 @@ from functools import partial
 from pathlib import Path
 
 import pyarrow as pa
+import pyarrow.compute as pc
 
 import quail
 import quail_b as benchmark
@@ -107,24 +108,23 @@ def answer_oracle(ground_truth, tables):
 
 def run_output(result, plan: QueryPlan, tables) -> RunOutput:
     """Translate a Quail result's row indices into benchmark ids by operator."""
-    ids = {relation.alias: _ids(tables[relation.table])
+    ids = {relation.alias: pa.array(_ids(tables[relation.table]), pa.string())
            for relation in plan.relations}
 
     def id_column(alias, indices):
-        return pa.array(
-            [ids[alias][int(index)] for index in indices], type=pa.string())
+        return pc.take(ids[alias], indices)
 
     filter_answers = {}
     for (alias, position), table in result.answer_tables["filters"].items():
         filter_answers[plan.filter_id(alias, position)] = pa.table({
-            alias: id_column(alias, table.column(alias).to_pylist()),
+            alias: id_column(alias, table.column(alias)),
             "answer": table.column("answer"),
         })
     join_answers = {}
     for position, table in result.answer_tables["joins"].items():
         join = plan.joins[position]
         join_answers[join.id] = pa.table({
-            **{alias: id_column(alias, table.column(alias).to_pylist())
+            **{alias: id_column(alias, table.column(alias))
                for alias in join.aliases},
             "answer": table.column("answer"),
         })
