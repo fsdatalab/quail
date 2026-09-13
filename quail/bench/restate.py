@@ -79,6 +79,8 @@ def restate_query(session, tables, stores, directory: Path, record: dict):
         pa.table({}), record["runtime_s"], record["measurements"],
         _load(directory / record["files"]["prompt_pieces"]))
     record["metrics"].update(token_metrics(spec, output, tables, stores))
+    # a record scored before quail-bench 0.3.0 lacks the key on filter-only queries
+    record["metrics"].setdefault("evaluated_document_pairs", None)
     for key in ("minimum_tokens", "regret_tokens"):
         record["measurements"].pop(key, None)
 

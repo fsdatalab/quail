@@ -23,9 +23,11 @@ Pull the measured runs, the corpus manifest, and the SoL estimates:
     uv run modal volume get quail-results \
       "$RUNS/20260906T211500Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/manifest.json" \
       "$W/saved/fev9_manifest.json"
-    for method in quail pipelined_vllm; do
+    for method in quail pipelined_vllm pipelined_sglang; do
       uv run modal volume get quail-results \
         "$(result_path "$W/saved/manifest.json" $method)" "$W/saved/$method.json"
+    done
+    for method in quail pipelined_vllm; do
       uv run modal volume get quail-results \
         "$(result_path "$W/saved/fev9_manifest.json" $method)" \
         "$W/saved/fev9_$method.json"
@@ -329,11 +331,13 @@ def suite_row(row):
 
 
 def suite_rows(root, method, corpus):
-    """The saved suite's rows of one method, FEV-9 from its rerun."""
-    suite = json.loads((root / "saved" / f"{method}.json").read_text())
-    rerun = json.loads((root / "saved" / f"fev9_{method}.json").read_text())
+    """The saved suite's rows of one method, FEV-9 from its rerun if pulled."""
+    sources = [json.loads((root / "saved" / f"{method}.json").read_text())]
+    rerun = root / "saved" / f"fev9_{method}.json"
+    if rerun.exists():
+        sources.append(json.loads(rerun.read_text()))
     rows = {}
-    for source in (suite, rerun):
+    for source in sources:
         assert (source["model"], source["sf"], source["lf"], source["gpus"]) == (
             "qwen3-4b-fp8", 0.1, 1, 1)
         assert source["corpus_id"] == corpus["corpus_id"]
@@ -357,9 +361,9 @@ def load_rows(root, corpus):
     """Return {method: {query: row}} and the source of every cell.
 
     The September 12 run supplies every cell it has. The FEV-10 run
-    fills the three baselines' FEV-10, and the saved suite fills
-    pipelined vLLM FEV-1 to FEV-9, with no recomputed KV figure since
-    the suite saved no answer tables.
+    fills the three baselines' FEV-10, and the saved suite fills any
+    other cell that run did not produce, with no recomputed KV figure
+    since the suite saved no answer tables.
     """
     manifest = json.loads((root / "run" / "manifest.json").read_text())
     fev10_manifest = json.loads((root / "fev10" / "manifest.json").read_text())
@@ -369,7 +373,7 @@ def load_rows(root, corpus):
     rows = measurement_rows(root / "run" / "measurements.parquet")
     sources = {(method, query): "run" for method in rows for query in rows[method]}
     fev10 = measurement_rows(root / "fev10" / "measurements.parquet")
-    saved = suite_rows(root, "pipelined_vllm", corpus)
+    saved = {}
     for key, _, _ in METHODS:
         for query in QUERY_ORDER:
             if query in rows.setdefault(key, {}):
@@ -377,8 +381,10 @@ def load_rows(root, corpus):
             if query == "FEV-10" and query in fev10.get(key, {}):
                 rows[key][query] = fev10[key][query]
                 sources[(key, query)] = "fev10"
-            elif key == "pipelined_vllm" and query.startswith("FEV-"):
-                rows[key][query] = saved[query]
+            elif (root / "saved" / f"{key}.json").exists():
+                if key not in saved:
+                    saved[key] = suite_rows(root, key, corpus)
+                rows[key][query] = saved[key][query]
                 sources[(key, query)] = "saved"
     return rows, sources, manifest, fev10_manifest
 
