@@ -37,8 +37,9 @@ DATASET_REVISION = "c227534cc0a34cf21db6a0bf0edd0f9050c8b305"
 DATASET_FILE = "raw/train-00000-of-00001.parquet"
 
 # Score column -> the statement the model judges. Toxicity is the filter.
-TOXIC = ("is rude, disrespectful, or unreasonable enough to make someone "
-         "leave the discussion")
+TOXIC = ("is toxic, meaning rude, disrespectful, or unreasonable enough "
+         "that most readers would leave the discussion; disagreement, "
+         "criticism, sarcasm, or a strong opinion alone is not toxic")
 FIELDS = {
     "severe_toxicity": "is very hateful, aggressive, or disrespectful, far "
                        "beyond ordinary rudeness",
@@ -51,60 +52,73 @@ FIELDS = {
                        "their identity",
     "sexual_explicit": "refers to sexual acts, body parts, or other lewd "
                        "content",
-    "male": "mentions or refers to men or boys",
-    "female": "mentions or refers to women or girls",
-    "transgender": "mentions or refers to transgender people",
-    "other_gender": "mentions or refers to people of another gender identity",
-    "heterosexual": "mentions or refers to heterosexual people",
-    "homosexual_gay_or_lesbian": "mentions or refers to gay or lesbian people",
-    "bisexual": "mentions or refers to bisexual people",
-    "other_sexual_orientation": "mentions or refers to people of another "
-                                "sexual orientation",
-    "christian": "mentions or refers to Christians",
-    "jewish": "mentions or refers to Jewish people",
-    "muslim": "mentions or refers to Muslims",
-    "hindu": "mentions or refers to Hindus",
-    "buddhist": "mentions or refers to Buddhists",
-    "atheist": "mentions or refers to atheists",
-    "other_religion": "mentions or refers to people of another religion",
-    "black": "mentions or refers to Black people",
-    "white": "mentions or refers to white people",
-    "asian": "mentions or refers to Asian people",
-    "latino": "mentions or refers to Latino people",
-    "other_race_or_ethnicity": "mentions or refers to people of another "
-                               "race or ethnicity",
-    "physical_disability": "mentions or refers to people with a physical "
+    "male": "explicitly mentions men or boys",
+    "female": "explicitly mentions women or girls",
+    "transgender": "explicitly mentions transgender people",
+    "other_gender": "explicitly mentions a gender identity other than male, "
+                    "female, or transgender",
+    "heterosexual": "explicitly mentions heterosexual people",
+    "homosexual_gay_or_lesbian": "explicitly mentions gay or lesbian people",
+    "bisexual": "explicitly mentions bisexual people",
+    "other_sexual_orientation": "explicitly mentions a sexual orientation "
+                                "other than heterosexual, gay, lesbian, or "
+                                "bisexual",
+    "christian": "explicitly mentions Christians",
+    "jewish": "explicitly mentions Jewish people",
+    "muslim": "explicitly mentions Muslims",
+    "hindu": "explicitly mentions Hindus",
+    "buddhist": "explicitly mentions Buddhists",
+    "atheist": "explicitly mentions atheists",
+    "other_religion": "explicitly mentions a religion other than "
+                      "Christianity, Judaism, Islam, Hinduism, Buddhism, "
+                      "or atheism",
+    "black": "explicitly mentions Black people",
+    "white": "explicitly mentions white people",
+    "asian": "explicitly mentions Asian people",
+    "latino": "explicitly mentions Latino people",
+    "other_race_or_ethnicity": "explicitly mentions a race or ethnicity "
+                               "other than Black, white, Asian, or Latino",
+    "physical_disability": "explicitly mentions people with a physical "
                            "disability",
-    "intellectual_or_learning_disability": "mentions or refers to people "
+    "intellectual_or_learning_disability": "explicitly mentions people "
                                            "with an intellectual or "
                                            "learning disability",
-    "psychiatric_or_mental_illness": "mentions or refers to people with a "
+    "psychiatric_or_mental_illness": "explicitly mentions people with a "
                                      "psychiatric or mental illness",
-    "other_disability": "mentions or refers to people with another "
-                        "disability",
-    "rejected": "would be rejected by the news site moderators",
+    "other_disability": "explicitly mentions a disability that is not "
+                        "physical, intellectual, or psychiatric",
+    "rejected": "breaks a news site comment policy badly enough that a "
+                "moderator would remove it",
 }
 
 # Measured on the full table: 11.3% of comments are toxic, and among
 # those a joined field is true 6.7% of the time on average. The prompts
 # follow the QUAIL-B pattern: the criterion before the document, then
 # the instruction after it.
-SQL = f"""
+JOIN_PROMPT = ("Judge strictly whether the description in DOCUMENT {1} "
+               "applies to the comment in DOCUMENT {0}. Answer FALSE unless "
+               "the comment clearly matches the description.")
+
+
+def build_sql(criterion: str = TOXIC) -> str:
+    """Return the query; criterion completes "whether the comment ..."."""
+    return f"""
     SELECT c.comment_id, f.field
     FROM comments c
     JOIN fields f
-      ON AI_FILTER(
-           PROMPT('Judge strictly whether the description in DOCUMENT {{1}}
-applies to the comment in DOCUMENT {{0}}.', c.text, f.statement),
-           {{'selectivity': 0.067}})
+      ON AI_FILTER(PROMPT('{JOIN_PROMPT}', c.text, f.statement),
+                   {{'selectivity': 0.067}})
     WHERE AI_FILTER(
-            PROMPT('Judge strictly from the comment above whether it {TOXIC}.
+            PROMPT('Judge strictly from the comment above whether it {criterion}.
 
 {{0}}
 
-Instruction: answer TRUE if the comment {TOXIC}, FALSE otherwise.', c.text),
+Instruction: answer TRUE if the comment {criterion}, FALSE otherwise.', c.text),
             {{'selectivity': 0.113}})
 """
+
+
+SQL = build_sql()
 
 
 def load_comments(parquet: str | None, limit: int | None) -> pa.Table:
@@ -139,6 +153,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--parquet", help="a file with the Kaggle columns")
     parser.add_argument("--limit", type=int, help="random sample of N comments")
+    parser.add_argument("--criterion", default=TOXIC,
+                        help="filter wording; completes 'whether the comment'")
     parser.add_argument("--device", choices=sorted(DEVICES), default="h100-sxm")
     parser.add_argument("--gpus", type=int, choices=(1, 2, 4, 8), default=1)
     parser.add_argument("--gpu-usd-per-hour", type=float,
@@ -166,7 +182,7 @@ def main() -> None:
             pa.table({"field": list(FIELDS),
                       "statement": [f"The comment {s}." for s in FIELDS.values()]}),
             id_col="field"))
-        query = session.sql(SQL)
+        query = session.sql(build_sql(args.criterion))
         print(query.explain(), flush=True)
 
         result = query.run()

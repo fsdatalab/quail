@@ -114,3 +114,36 @@ passes 10 to 20 percent, the join evaluates 60,000 to 130,000 pairs,
 and the query takes 15 to 30 seconds. Recall should drop from 0.99 and
 precision should rise well above 0.012; the exact values are unknown
 until the run.
+
+## Second GPU run, 2,000 comments, local H100
+
+Same machine, prompts in the QUAIL-B pattern, `--limit 2000`.
+Predicted: filter passes 10 to 20 percent, 6,000 to 13,000 join pairs,
+under 5 seconds of query time.
+
+| Quantity | Predicted | Measured |
+|---|---:|---:|
+| Filter pass rate | 10 to 20 percent | 91.0 percent |
+| Join pairs evaluated | 6,000 to 13,000 | 56,420 |
+| Join pass rate | 6.7 percent | 28.4 percent |
+| Query time, s | under 5 | 13.34 |
+| Document pairs/s | | 4,229 |
+| Output precision against the labels | | 0.026 |
+| Output recall against the labels | | 0.924 |
+
+The join improved (65 to 28 percent passing) but the filter did not.
+The per-field counts say the model reads the statements loosely
+rather than answering TRUE at random: "heterosexual" and every
+"other ..." group were near the top, which a comment satisfies if it
+mentions any people at all, and "rejected" was true of 98 percent.
+So the wording is still too loose for Qwen3 4B on news comments. This
+commit makes the identity statements require an explicit mention,
+defines the "other" groups by exclusion, defines toxic against
+ordinary disagreement, and tells the join to answer FALSE unless the
+comment clearly matches. `--criterion` overrides the filter wording
+from the command line so a control can be run: a criterion that is
+never true of these comments ("is written entirely in French") should
+pass close to 0 percent; if it passes most comments, the answer
+reading is at fault, not the wording. Prediction for the next
+`--limit 2000` run: the control passes under 2 percent; the toxicity
+filter passes 10 to 30 percent.
