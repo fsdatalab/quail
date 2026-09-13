@@ -65,20 +65,17 @@ export default function HomePage() {
         <div className="pointer-events-none absolute inset-y-0 right-0 hidden w-2/5 border-l border-fd-border bg-[linear-gradient(to_right,var(--color-fd-border)_1px,transparent_1px),linear-gradient(to_bottom,var(--color-fd-border)_1px,transparent_1px)] bg-[size:32px_32px] opacity-35 md:block" />
         <div className="relative max-w-3xl">
           <p className="mb-5 font-mono text-xs font-medium uppercase tracking-[0.2em] text-fd-muted-foreground">
-            Query-aware inference
+            Declarative AI SQL
           </p>
           <h1 className="text-5xl font-semibold tracking-[-0.04em] md:text-7xl">
-            Run one model query.
+            Query unstructured data
             <span className="block text-fd-muted-foreground">
-              Not thousands of disconnected requests.
+              with LLM-powered operators.
             </span>
           </h1>
           <p className="mt-7 max-w-2xl text-lg leading-8 text-fd-muted-foreground">
-            Quail runs language-model filters and joins over document
-            collections. It sees the complete query before inference begins,
-            then schedules the model work so repeated document prefixes can
-            share KV and each forward pass can use more of the available
-            token budget.
+            Quail is a declarative, extensible query engine. Write filters
+            and joins in SQL or Python, then get an Arrow table back.
           </p>
           <div className="mt-8 flex flex-wrap gap-3">
             <Link
@@ -97,7 +94,7 @@ export default function HomePage() {
         </div>
       </header>
 
-      <Section eyebrow="01 / Problem" title="The same document, read again">
+      <Section eyebrow="01 / Analysis" title="Describe the query">
         <div className="min-w-0 space-y-4">
           <p className="max-w-3xl leading-7 text-fd-muted-foreground">
             Consider the 448,000 comments in the Jigsaw Civil Comments
@@ -106,23 +103,20 @@ export default function HomePage() {
             identity references, and moderator decisions.
           </p>
           <p className="max-w-3xl leading-7 text-fd-muted-foreground">
-            A request-at-a-time system handles every question separately. It
-            processes the same comment tokens again, waits for the complete
-            filter before starting the join, and batches short and long
-            comments by request count.
+            In Quail, the model predicates are operators in one relational
+            query. You do not write request loops, parse model responses, or
+            connect intermediate ids by hand.
           </p>
         </div>
       </Section>
 
-      <Section eyebrow="02 / Query" title="Tell Quail the complete analysis">
+      <Section eyebrow="02 / AI SQL" title="Write the filter and join">
         <div className="min-w-0 space-y-4">
           <DynamicCodeBlock lang="sql" code={example} />
           <p className="max-w-3xl leading-7 text-fd-muted-foreground">
-            Quail sees the filter, the user&apos;s selectivity estimates, the
-            join against 31 field descriptions, each document&apos;s token
-            count, and the available GPU memory before execution starts. The
-            model answers each predicate with one constrained token:{' '}
-            <code>TRUE</code> or <code>FALSE</code>.
+            The model answers each predicate with one constrained token:{' '}
+            <code>TRUE</code> or <code>FALSE</code>. Quail returns the matching
+            comment and field pairs as an Arrow table.
           </p>
           <p className="max-w-3xl text-sm leading-6 text-fd-muted-foreground">
             The complete query is in{' '}
@@ -186,10 +180,10 @@ export default function HomePage() {
         </div>
       </Section>
 
-      <Section eyebrow="05 / Direction" title="What Quail runs">
+      <Section eyebrow="05 / Operators" title="LLM-powered operators">
         <div className="grid gap-px overflow-hidden rounded-lg border border-fd-border bg-fd-border sm:grid-cols-2">
           <div className="bg-fd-background p-5">
-            <h3 className="font-medium">Available today</h3>
+            <h3 className="font-medium">Filters and joins</h3>
             <p className="mt-2 text-sm leading-6 text-fd-muted-foreground">
               True-or-false filters, AI joins, <code>EXISTS</code>, and{' '}
               <code>NOT EXISTS</code>, through Snowflake-style SQL,
@@ -197,7 +191,7 @@ export default function HomePage() {
             </p>
           </div>
           <div className="bg-fd-background p-5">
-            <h3 className="font-medium">On the roadmap</h3>
+            <h3 className="font-medium">Structured outputs</h3>
             <p className="mt-2 text-sm leading-6 text-fd-muted-foreground">
               <code>AI.CLASSIFY</code>, <code>AI.EXTRACT</code>, and{' '}
               <code>AI.MAP</code> will add labels, typed fields, and typed

@@ -1,15 +1,7 @@
 # Quail
 
-Quail is a query engine for running language-model operations over document
-collections. You write the analysis in SQL or Python. Quail plans the complete
-query before it starts inference, then schedules the model work so repeated
-document prefixes can share KV and each forward pass can use more of the
-available token budget.
-
-**Today:** `AI_FILTER`, AI joins, `EXISTS`, and `NOT EXISTS` with Qwen3 4B fp8
-or Qwen3 32B fp8 on H100s.
-
-**On the roadmap:** `AI.CLASSIFY`, `AI.EXTRACT`, and `AI.MAP`.
+Quail is a declarative, extensible query engine for AI SQL and LLM-powered
+operators over unstructured data.
 
 [Quickstart](docs/content/docs/user-guide/quickstart.mdx) ·
 [SQL](docs/content/docs/user-guide/sql.mdx) ·
@@ -17,21 +9,25 @@ or Qwen3 32B fp8 on H100s.
 [Architecture](docs/content/docs/architecture/index.mdx) ·
 [QUAIL-B](https://github.com/fsdatalab/quail-bench)
 
-## Why Quail?
+## What is Quail?
 
-Suppose we want to analyze the 448,000 comments in the Jigsaw Civil Comments
-dataset. First, we ask a model which comments are toxic. For each comment that
-passes, we ask 31 more questions about toxicity type, identity references, and
-moderator decisions.
+Quail lets you use natural-language predicates inside relational queries. You
+can filter one document collection, join several collections, and compose
+LLM-powered operators with ordinary SQL or the Python API.
 
-A request-at-a-time system treats every question as separate work. It
-processes the same comment tokens again for later questions, waits for the
-whole filter to finish before starting the join, and groups requests by count
-even when their documents have very different lengths.
+- Write AI SQL with Snowflake-style `AI_FILTER` or BigQuery-style `AI.IF`.
+- Build the same queries with a declarative Python API.
+- Add models, backends, planning rules, physical operators, and observers
+  through the extension registry.
+- Receive Arrow tables with rows, query metrics, and execution details.
 
-Quail treats the analysis as one query. The planner sees the filter, the
-user's selectivity estimates, the join against 31 field descriptions, each
-document's token count, and the available GPU memory before execution begins.
+Without Quail, you submit each LLM call yourself and write the code that
+connects model responses back to relational data.
+
+## Example
+
+This query filters toxic comments, then joins each matching comment with the
+toxicity fields that apply to it:
 
 ```sql
 SELECT c.comment_id, f.field

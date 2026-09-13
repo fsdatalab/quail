@@ -1,31 +1,23 @@
 ---
 title: Introduction
-description: What Quail runs, how it saves model work, and where to start.
+description: A declarative, extensible query engine for AI SQL.
 ---
 
-Quail is a query engine for running language-model operations over document
-collections. You write the analysis in SQL or Python. Quail plans the
-complete query before it starts inference, then schedules the model work so
-repeated document prefixes can share KV and each forward pass can use more of
-the available token budget.
+Quail is a declarative, extensible query engine for AI SQL and LLM-powered
+operators over unstructured data.
 
-KV is the attention key and value tensors the model keeps for tokens
-it has already processed.
+Use natural-language predicates to filter document collections, join them,
+and compose the results with relational operators. Write the query in SQL or
+Python. Quail returns an Arrow table.
 
-## The problem with one request per row
+## AI SQL
 
-Suppose an analysis first filters a collection of long documents, then asks
-several more questions about every document that passes. A request-at-a-time
-system handles each question separately. It processes the same document
-prefix again, waits for the complete filter before starting the next stage,
-and groups requests by count even when their documents have very different
-lengths.
+Model predicates are operators inside the query. You do not write request
+loops, parse model responses, or connect intermediate ids by hand. Quail
+accepts Snowflake-style `AI_FILTER`, BigQuery-style `AI.IF`, and the Python
+builder.
 
-Quail sees the filter, user-provided selectivity estimates, every later
-question, the document lengths, and the available GPU memory before execution
-begins. This lets one query share work across rows and stages.
-
-## What Quail does differently
+## Execution
 
 1. **Pipelining.** A document starts its next predicate as soon as it passes
    the current one.
@@ -39,6 +31,15 @@ begins. This lets one query share work across rows and stages.
 Pipelining and token-based admission reduce waiting and unused batch
 capacity. KV rewind and packed joins reduce fresh input-token computation
 when the needed KV remains available.
+
+KV is the attention key and value tensors the model keeps for tokens it has
+already processed.
+
+## Extensibility
+
+The extension registry accepts models, devices, model backends, logical and
+physical planning rules, physical operators, codecs, runtimes, and execution
+observers. See [Extending Quail](/docs/extending).
 
 ## Current scope
 
