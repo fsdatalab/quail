@@ -167,8 +167,8 @@ lives under `reports/plots/` with its `make_<slug>_plots.py` in
   `quailb_<dataset>.pdf`. Use grouped bars for the main comparison.
   Use readable page sizes and split metrics across pages instead of
   shrinking all metrics into one wide figure. Keep text as embedded fonts
-  and marks as vectors. PNGs may be first-page previews for Markdown;
-  link the PDF as the primary artifact and never embed a PNG inside it.
+  and marks as vectors. Commit the PDFs only, no PNG previews; link the
+  PDF from the report and never embed a PNG inside it.
   Keep method order, colors, and metric definitions consistent across them.
 - Show the SoL estimate as a horizontal line across each query's bar group
   in latency and token plots. Reserve bars for measured configurations.
@@ -271,7 +271,7 @@ effectiveness research:
   categories need two colors, not five.
 - Use a log scale only when the data spans more than one order of
   magnitude. Say so in the axis label.
-- Use vector PDFs for QUAIL-B, with 300 DPI PNG previews. Other report
+- Use vector PDFs for QUAIL-B, with no PNG previews. Other report
   figures use 300 DPI PNG files. No SVG.
 - Make the canvas large enough that text and data marks remain sharp when
   viewed on GitHub.

@@ -11,9 +11,9 @@
 
 [Open the FEVER vector PDF](plots/quailb_fev.pdf)
 
-[![FEVER latency, recomputed KV, fresh input tokens, accuracy, and input counts](plots/quailb_fev.png)](plots/quailb_fev.pdf)
+[Open the FEVER vector PDF](plots/quailb_fev.pdf)
 
-Figure: plots/quailb_fev.png
+Figure: plots/quailb_fev.pdf
 
 - FEV-9 appears with the other FEVER queries in the standard dataset plot.
   The plot uses the September 6 run of all four methods, documented in

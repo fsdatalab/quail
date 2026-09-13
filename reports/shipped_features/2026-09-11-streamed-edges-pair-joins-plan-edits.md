@@ -145,6 +145,6 @@ two are pipelined SGLang BIO-2 and BIO-3, and three are the FEV-10 baselines.
 
 [Open the complete 33-query tables and vector plots](../quailb-comparison.md).
 
-[![QUAIL-B latency](../plots/quailb_main.png)](../plots/quailb_main.pdf)
+[Open the main vector PDF](../plots/quailb_main.pdf)
 
-Figure: ../plots/quailb_main.png
+Figure: ../plots/quailb_main.pdf

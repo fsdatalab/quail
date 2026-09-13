@@ -20,9 +20,9 @@
 
 [Open the FEVER vector PDF](plots/quailb_fev.pdf)
 
-[![FEVER comparison](plots/quailb_fev.png)](plots/quailb_fev.pdf)
+[Open the FEVER vector PDF](plots/quailb_fev.pdf)
 
-Figure: plots/quailb_fev.png
+Figure: plots/quailb_fev.pdf
 
 ## Setup and prediction
 

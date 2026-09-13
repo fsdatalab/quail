@@ -3,7 +3,7 @@
 - The main PDF covers all 33 queries with grouped bars and one metric per page.
   Its final page lists input document counts. Each dataset PDF has a page
   of four bar charts and a separate input-count page. Text and marks remain
-  vector content when zoomed. The PNGs below are first-page previews.
+  vector content when zoomed.
 - The setup was Qwen3 4B FP8, sf=0.1, lf=1, and one H100 per configuration.
   Quail and the vLLM configurations shared a physical GPU within each
   family. SGLang used a separate GPU. Stock vLLM used operator-at-a-time
@@ -62,9 +62,7 @@
 
 [Open the main vector PDF](plots/quailb_main.pdf)
 
-[![QUAIL-B latency preview](plots/quailb_main.png)](plots/quailb_main.pdf)
-
-Figure: plots/quailb_main.png
+Figure: plots/quailb_main.pdf
 
 SoL estimates on `quail-results`: `/results/sol/2026-09-11-quailb-prefix-reuse.json`.
 
@@ -76,9 +74,7 @@ The download commands are in `reports/make_quailb_comparison_plots.py`.
 
 [Open the IMDB vector PDF](plots/quailb_imdb.pdf)
 
-[![IMDB preview](plots/quailb_imdb.png)](plots/quailb_imdb.pdf)
-
-Figure: plots/quailb_imdb.png
+Figure: plots/quailb_imdb.pdf
 
 | Query | Input documents by alias and set |
 |---|---|
@@ -150,9 +146,7 @@ Figure: plots/quailb_imdb.png
 
 [Open the BIO vector PDF](plots/quailb_bio.pdf)
 
-[![BIO preview](plots/quailb_bio.png)](plots/quailb_bio.pdf)
-
-Figure: plots/quailb_bio.png
+Figure: plots/quailb_bio.pdf
 
 | Query | Input documents by alias and set |
 |---|---|
@@ -182,9 +176,7 @@ Figure: plots/quailb_bio.png
 
 [Open the FEV vector PDF](plots/quailb_fev.pdf)
 
-[![FEV preview](plots/quailb_fev.png)](plots/quailb_fev.pdf)
-
-Figure: plots/quailb_fev.png
+Figure: plots/quailb_fev.pdf
 
 | Query | Input documents by alias and set |
 |---|---|
@@ -256,9 +248,7 @@ Figure: plots/quailb_fev.png
 
 [Open the LEP vector PDF](plots/quailb_lep.pdf)
 
-[![LEP preview](plots/quailb_lep.png)](plots/quailb_lep.pdf)
-
-Figure: plots/quailb_lep.png
+Figure: plots/quailb_lep.pdf
 
 | Query | Input documents by alias and set |
 |---|---|
@@ -318,9 +308,7 @@ Figure: plots/quailb_lep.png
 
 [Open the AGENT vector PDF](plots/quailb_agent.pdf)
 
-[![AGENT preview](plots/quailb_agent.png)](plots/quailb_agent.pdf)
-
-Figure: plots/quailb_agent.png
+Figure: plots/quailb_agent.pdf
 
 | Query | Input documents by alias and set |
 |---|---|

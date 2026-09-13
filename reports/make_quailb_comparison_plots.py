@@ -257,12 +257,12 @@ def document_page(title, queries, relations):
 
 
 def plot_comparison(title, queries, rows, relations, sol, name, overview=False):
-    """Export vector PDF pages and a first-page PNG preview."""
+    """Export the vector PDF: one metric per page, then the input counts."""
     destination = HERE / "plots" / name
     groups = [[metric] for metric, _, _ in METRICS] if overview else [
         ["seconds", "fresh", "recomputed", "agreement"]]
     with PdfPages(destination.with_suffix(".pdf")) as pdf:
-        for page, metrics in enumerate(groups):
+        for metrics in groups:
             figure, axes = (plt.subplots(1, 1, figsize=(14, 8.5)) if overview
                             else plt.subplots(2, 2, figsize=(14, 10)))
             axes = [axes] if overview else list(axes.flat)
@@ -282,13 +282,11 @@ def plot_comparison(title, queries, rows, relations, sol, name, overview=False):
                                    bottom=0.14 if overview else 0.10, hspace=0.60,
                                    wspace=0.28)
             pdf.savefig(figure, bbox_inches=None)
-            if page == 0:
-                figure.savefig(destination, dpi=300, bbox_inches=None)
             plt.close(figure)
         figure = document_page(title, queries, relations)
         pdf.savefig(figure, bbox_inches=None)
         plt.close(figure)
-    return destination.name
+    return destination.with_suffix(".pdf").name
 
 
 def measurement_rows(path):
@@ -444,7 +442,7 @@ def main(workdir):
                     == row["input_rows"])
     sol = load_sol(root, queries, rows, corpus)
     overview = plot_comparison("QUAIL-B", queries, rows, relations, sol,
-                               "quailb_main.png", overview=True)
+                               "quailb_main.pdf", overview=True)
     fev = row_metrics(rows["quail"]["FEV-9"])
     output = rows["quail"]["FEV-9"]
     calls = manifest["function_call_ids"]
@@ -467,7 +465,7 @@ def main(workdir):
         "per page.",
         "  Its final page lists input document counts. Each dataset PDF has a page",
         "  of four bar charts and a separate input-count page. Text and marks remain",
-        "  vector content when zoomed. The PNGs below are first-page previews.",
+        "  vector content when zoomed.",
         "- The setup was Qwen3 4B FP8, sf=0.1, lf=1, and one H100 per configuration.",
         "  Quail and the vLLM configurations shared a physical GPU within each",
         "  family. SGLang used a separate GPU. Stock vLLM used operator-at-a-time",
@@ -527,8 +525,7 @@ def main(workdir):
         f"  The reference has {output['expected_rows']:,} rows, so output "
         f"precision is approximately {fev['precision']:.8f}%",
         f"  and recall is {fev['recall']:.2f}%.", "",
-        "[Open the main vector PDF](plots/quailb_main.pdf)", "",
-        f"[![QUAIL-B latency preview](plots/{overview})](plots/quailb_main.pdf)", "",
+        f"[Open the main vector PDF](plots/{overview})", "",
         f"Figure: plots/{overview}", "",
         "SoL estimates on `quail-results`: "
         "`/results/sol/2026-09-11-quailb-prefix-reuse.json`.", "",
@@ -540,11 +537,9 @@ def main(workdir):
     for family in ("IMDB", "BIO", "FEV", "LEP", "AGENT"):
         selected = [query for query in queries if query.startswith(family + "-")]
         name = plot_comparison(f"QUAIL-B {family}", selected, rows, relations,
-                               sol, f"quailb_{family.lower()}.png")
-        pdf_name = Path(name).with_suffix(".pdf").name
+                               sol, f"quailb_{family.lower()}.pdf")
         lines.extend([f"## {family}", "",
-                      f"[Open the {family} vector PDF](plots/{pdf_name})", "",
-                      f"[![{family} preview](plots/{name})](plots/{pdf_name})", "",
+                      f"[Open the {family} vector PDF](plots/{name})", "",
                       f"Figure: plots/{name}", "",
                       "| Query | Input documents by alias and set |", "|---|---|"])
         for query in selected:
