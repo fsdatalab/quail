@@ -18,7 +18,16 @@ Prediction before validation: `uv` will accept the lock without changing its
 resolved packages, the CPU checks will pass, and the built wheel will list
 only exact direct requirements.
 
-Validation results are pending.
+The lock check resolved 234 packages without changing the lock. Ruff, the
+long-string check, and Vulture passed. `uv build` produced the sdist and wheel,
+and Twine accepted both. The wheel contains 75 files and lists all nine
+platform-specific direct requirements with exact versions.
+
+The CPU tests could not start in this environment. Dependency setup could not
+read the private `fsdatalab/quail-bench` repository. CI has the separate
+`QUAILB_TOKEN` needed to run them. This is an authentication limit of this
+agent, not a test failure, but the prediction that all CPU tests pass remains
+unconfirmed until CI finishes.
 
 No model run was needed because this change does not alter query execution.
 There is therefore no Modal function call id or `quail-results` volume path.

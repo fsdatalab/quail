@@ -1,5 +1,6 @@
 """Whole-query Modal function execution with a fake model."""
 
+import ast
 import json
 import tomllib
 from pathlib import Path
@@ -33,6 +34,25 @@ def test_release_dependencies_are_exact_and_match_modal_demo():
     quail_b_source = project["tool"]["uv"]["sources"]["quail-b"]
     assert len(quail_b_source["rev"]) == 40
     assert project["build-system"]["requires"] == ["hatchling==1.32.0"]
+
+    docs_example = ast.parse(
+        Path("docs/examples/imdb_queries_modal.py").read_text()
+    )
+    docs_requirements = next(
+        ast.literal_eval(node.value)
+        for node in docs_example.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "IMAGE_REQUIREMENTS"
+            for target in node.targets
+        )
+    )
+    assert docs_requirements == runtime
+
+    compute_guide = Path(
+        "docs/content/docs/user-guide/compute.mdx"
+    ).read_text()
+    assert all(f'"{requirement}"' in compute_guide for requirement in runtime)
 
 
 def test_quickstarts_return_collected_rows_after_session_closes(monkeypatch, tmp_path):
