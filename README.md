@@ -20,14 +20,10 @@ GPU cost, and token work.
 
 ## Query plans
 
-This diagram shows all 33 queries, grouped by dataset. Each small tree is
-one query. Gray nodes are table scans, blue nodes are AI FILTER, and
-orange nodes are AI JOIN. Percentages are the fixed planning selectivity
-estimates from the 0.1-scale reference labels.
-
-![All QUAIL-B query plans](figures/quailb_anatomy.png)
-
-[Open the vector PDF.](figures/quailb_anatomy.pdf)
+See the [PDF of all 33 query plans](figures/quailb_anatomy.pdf). It groups
+queries by dataset. Gray nodes are table scans, blue nodes are AI FILTER,
+and orange nodes are AI JOIN. Percentages are the fixed planning
+selectivity estimates from the 0.1-scale reference labels.
 
 ## Install
 
