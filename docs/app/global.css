@@ -1,6 +1,47 @@
 @import 'tailwindcss';
-@import 'fumadocs-ui/css/ocean.css';
+@import 'fumadocs-ui/css/neutral.css';
 @import 'fumadocs-ui/css/preset.css';
+
+@theme {
+  --color-cmu-red: #c41230;
+  --color-cmu-iron: #6d6e71;
+  --color-cmu-steel: #e0e0e0;
+  --color-fd-background: #ffffff;
+  --color-fd-foreground: #111111;
+  --color-fd-muted: #f5f5f5;
+  --color-fd-muted-foreground: #5f6063;
+  --color-fd-popover: #ffffff;
+  --color-fd-popover-foreground: #111111;
+  --color-fd-card: #fafafa;
+  --color-fd-card-foreground: #111111;
+  --color-fd-border: #e0e0e0;
+  --color-fd-primary: #c41230;
+  --color-fd-primary-foreground: #ffffff;
+  --color-fd-secondary: #f1f1f1;
+  --color-fd-secondary-foreground: #111111;
+  --color-fd-accent: #f8e7ea;
+  --color-fd-accent-foreground: #7f0c20;
+  --color-fd-ring: #c41230;
+}
+
+.dark {
+  --color-fd-background: #0b0b0c;
+  --color-fd-foreground: #f7f7f7;
+  --color-fd-muted: #18181a;
+  --color-fd-muted-foreground: #b6b6b8;
+  --color-fd-popover: #151516;
+  --color-fd-popover-foreground: #f7f7f7;
+  --color-fd-card: #121213;
+  --color-fd-card-foreground: #f7f7f7;
+  --color-fd-border: #343436;
+  --color-fd-primary: #ff8294;
+  --color-fd-primary-foreground: #160207;
+  --color-fd-secondary: #202022;
+  --color-fd-secondary-foreground: #f7f7f7;
+  --color-fd-accent: #3a1119;
+  --color-fd-accent-foreground: #ffdce1;
+  --color-fd-ring: #ff8294;
+}
 
 html {
   scrollbar-gutter: stable;
@@ -8,12 +49,18 @@ html {
 
 body {
   font-family: var(--font-quail-sans), sans-serif;
+  border-top: 4px solid #c41230;
 }
 
 code,
 pre,
 .font-mono {
   font-family: var(--font-quail-mono), monospace;
+}
+
+::selection {
+  color: #ffffff;
+  background: #c41230;
 }
 
 html > body[data-scroll-locked] {
