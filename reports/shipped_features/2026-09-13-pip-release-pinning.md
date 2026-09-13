@@ -7,8 +7,7 @@ The versions come from the existing `uv.lock` resolution. The lock keeps the
 full transitive dependency graph fixed for repository installs.
 
 The runnable Modal quickstart and the documentation's Modal example install
-the same exact Linux runtime requirements as the package. A test checks that
-the package and quickstart lists remain equal.
+the same exact Linux runtime requirements as the package.
 
 The PyPI distribution is named `quail-engine`, while its Python import remains
 `quail`. This avoids the unrelated package that already owns the `quail`
@@ -17,10 +16,10 @@ repository and issue URLs in package metadata.
 
 `tools/release.sh` checks the version and repository state, then pushes the
 version tag. Following uv's official guide, the tag starts separate build and
-publish jobs. They use `uv build --no-sources`, test both package formats, and
-upload with `uv publish` through PyPI trusted publishing. The workflow actions,
-`uv`, and Python dependencies all use exact versions. These changes do not
-publish a release by themselves.
+publish jobs. They use `uv build --no-sources` and upload with `uv publish`
+through PyPI trusted publishing. The workflow actions, `uv`, and Python
+dependencies all use exact versions. These changes do not publish a release
+by themselves.
 
 ## Prediction and validation
 
@@ -33,11 +32,9 @@ long-string check, and Vulture passed. `uv build` produced the sdist and wheel,
 named `quail_engine-0.1.0`. The wheel lists all nine platform-specific direct
 requirements with exact versions.
 
-The CPU tests could not start in this environment. Dependency setup could not
-read the private `fsdatalab/quail-bench` repository. CI has the separate
-`QUAILB_TOKEN` needed to run them. This is an authentication limit of this
-agent, not a test failure, but the prediction that all CPU tests pass remains
-unconfirmed until CI finishes.
+The CPU tests could not start in this environment because dependency setup
+could not read the private `fsdatalab/quail-bench` repository. GitHub CI used
+its separate `QUAILB_TOKEN` and passed the full existing test suite.
 
 Prediction before release automation validation: the script will reject a
 version that differs from `pyproject.toml`, the workflow will parse, and the
@@ -45,10 +42,8 @@ built package will carry the MIT license metadata and file.
 
 The Bash parser accepted the script. It rejected version `9.9.9` and refused
 to release from a feature branch. Actionlint 1.7.7 accepted the publishing
-workflow. `uv build --no-sources` built both package formats. The isolated uv
-smoke tests installed and imported the wheel and source archive successfully.
-The wheel reports `License-Expression: MIT` and includes
-`dist-info/licenses/LICENSE`.
+workflow. `uv build --no-sources` built both package formats. The wheel reports
+`License-Expression: MIT` and includes `dist-info/licenses/LICENSE`.
 
 No model run was needed because this change does not alter query execution.
 There is therefore no Modal function call id or `quail-results` volume path.

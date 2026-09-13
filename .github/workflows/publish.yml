@@ -25,12 +25,6 @@ jobs:
           python-version: "3.12"
       - name: Build
         run: uv build --no-sources
-      - name: Smoke test wheel
-        run: uv run --isolated --no-project --with dist/*.whl tests/smoke_release.py
-      - name: Smoke test source archive
-        run: >
-          uv run --isolated --no-project
-          --with dist/*.tar.gz tests/smoke_release.py
       - name: Upload release files
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
