@@ -6,6 +6,12 @@ Write queries in SQL or Python. Quail plans and executes their model calls toget
 Model execution requires a CUDA GPU. The supported models are Qwen3 4B fp8
 and Qwen3 32B fp8, with one model copy per GPU.
 
+Once published, install the distribution and import the `quail` package:
+
+```bash
+pip install quail-engine
+```
+
 ## Quickstart
 
 From this repository, install the dependencies with Python 3.12 and uv:

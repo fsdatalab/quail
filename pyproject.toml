@@ -1,5 +1,5 @@
 [project]
-name = "quail"
+name = "quail-engine"
 version = "0.1.0"
 description = "Quail: a declarative query engine for AI_FILTER and AI_JOIN"
 readme = "README.md"
