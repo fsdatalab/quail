@@ -3,12 +3,12 @@
 import pytest
 
 from quail_b.queries import (
-    FilterSpec,
-    JoinSpec,
     PRIVACY_QUERIES,
     QUERIES,
     QUERY_FAMILY_WORKLOADS,
     QUERY_ORDER,
+    FilterSpec,
+    JoinSpec,
     QuerySpec,
     RelationSpec,
     queries,
@@ -44,8 +44,12 @@ def test_spec_rejects_a_join_that_does_not_add_a_relation():
             (
                 RelationSpec("r", "reviews", "body"),
                 RelationSpec("a", "aspects", "aspect"),
+                RelationSpec("b", "aspects", "aspect"),
             ),
-            (JoinSpec("join-1", ("r", "r"), "{0} {1}"),),
+            (
+                JoinSpec("join-1", ("r", "a"), "{0} {1}"),
+                JoinSpec("join-2", ("r", "a"), "{0} {1}"),
+            ),
             ("r.id",),
         )
 
