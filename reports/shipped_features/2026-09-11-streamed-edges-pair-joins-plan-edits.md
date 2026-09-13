@@ -145,6 +145,28 @@ two are pipelined SGLang BIO-2 and BIO-3, and three are the FEV-10 baselines.
 
 [Open the complete 33-query tables and vector plots](../quailb-comparison.md).
 
+## Confirming run on the merge head
+
+The full run measured commit `c45e378`; the engine changed after it
+(`2863aef` consolidated the streamed and pair execution contracts, and
+the request backends gained the equality join's key columns). The
+seven queries the branch changes were rerun with Quail on head
+`82bcb83`: `/results/benchmarks/quailb/family-runs/20260913T005721Z-a7356962/`,
+function calls `fc-01M2C49M1MPKYN0JKYNK6ZVHE8` (parent),
+`fc-01M2C4E3MQP0R85S98PNZGKG0K` (imdb), `fc-01M2C4E3QCBKM6ND0Y114TJX8Q`
+(biodex), `fc-01M2C4E3TFDSXA12PCZ31RKTVX` (fever); log
+`results/benchmark/20260913T005716Z-quail-head-seven-sf0.1.log`.
+
+Prediction, stated before the run: times and recomputed KV within
+noise of the September 12 run, rows identical.
+
+Measured: fresh tokens, recomputed KV, output rows, and agreement are
+identical to the September 12 run on all seven queries; times are
+within 0.6 s (IMDB-3 22.29 s against 22.64, IMDB-4 17.29 against
+17.38, IMDB-5 16.59 against 16.64, IMDB-10 48.74 against 48.58, BIO-3
+79.37 against 79.96, FEV-9 38.29 against 38.23, FEV-10 1.68 against
+1.65). The report keeps the September 12 rows.
+
 [Open the main vector PDF](../plots/quailb_main.pdf)
 
 Figure: ../plots/quailb_main.pdf
