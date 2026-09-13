@@ -43,10 +43,12 @@ Prediction before release automation validation: the script will reject a
 version that differs from `pyproject.toml`, the workflow will parse, and the
 built package will carry the MIT license metadata and file.
 
-The Bash parser accepted the script, and the script rejected version `9.9.9`
-before doing release work. Actionlint 1.7.7 accepted the publishing workflow.
-The rebuilt wheel reports `License-Expression: MIT`, includes
-`dist-info/licenses/LICENSE`, and exposes the `quail` package.
+The Bash parser accepted the script. It rejected version `9.9.9` and refused
+to release from a feature branch. Actionlint 1.7.7 accepted the publishing
+workflow. `uv build --no-sources` built both package formats. The isolated uv
+smoke tests installed and imported the wheel and source archive successfully.
+The wheel reports `License-Expression: MIT` and includes
+`dist-info/licenses/LICENSE`.
 
 No model run was needed because this change does not alter query execution.
 There is therefore no Modal function call id or `quail-results` volume path.
