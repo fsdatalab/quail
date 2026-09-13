@@ -191,10 +191,34 @@ quail_b.run(
 )
 ```
 
+### Data download and host memory
+
+By default, `quail_b.run` reads the corpus and reference labels anonymously
+from the public `s3://quail-bench` bucket. The first run downloads immutable
+Parquet and manifest files to `~/.cache/quail-b`, or
+`$XDG_CACHE_HOME/quail-b`. Later runs reuse those files. The small pointer
+to the active reference collection is refreshed from S3.
+
+Before it calls your adapter, the current loader puts the selected Arrow
+input tables and the full reference-label collection in host memory. The
+full label collection is loaded even when `queries` selects one query.
+Budget:
+
+| Scale factor | Reference answers | Loader peak RAM | Host RAM to use |
+| ---: | ---: | ---: | ---: |
+| 0.1 | 1.21 million | 0.84 GiB measured | 2 GiB or more |
+| 0.5 | 17.62 million | 10–12 GiB estimated | 16 GiB or more |
+| 1.0 | 51.80 million | 30–35 GiB estimated | 48 GiB or more |
+
+The 0.5 and 1.0 estimates scale the measured 0.1 label-memory cost by the
+published answer counts. They are planning values, not measured peaks.
+They exclude your engine, model, and returned result tables. Use 64 GiB
+for a full-scale run when the engine shares the same host.
+
 - Scale factors `0.1`, `0.5`, and `1.0` are supported.
-- Inputs and labels come from public S3. No AWS account is needed.
-- Downloads use `~/.cache/quail-b`, or `$XDG_CACHE_HOME/quail-b`.
-  Override with `cache_dir=` or `QUAIL_B_CACHE_DIR`.
+- Override the download cache with `cache_dir=` or `QUAIL_B_CACHE_DIR`.
+- Pass `data_dir=` to use local input Parquet files. Reference labels still
+  come from S3 unless you pass a local published-data mirror as `root=`.
 - `gpu_count=` and `gpu_hourly_rate_usd=` add GPU cost.
 - An existing `output_dir` is never overwritten.
 
