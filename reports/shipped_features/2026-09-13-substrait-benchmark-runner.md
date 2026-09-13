@@ -9,7 +9,7 @@ plans. The alias-based `QuerySpec` fields Quail's runner read
 are gone, and the answers an adapter returns are keyed by the plan's
 operator ids (`filter-1`, `join-1`) instead of by alias and written
 position. The pin in `pyproject.toml` moves from `63ff9b9` to
-`4c356d8`, and `quail/bench/` is rewritten as the adapter that
+`5f7ce82`, and `quail/bench/` is rewritten as the adapter that
 contract asks for.
 
 ## What changed
@@ -73,9 +73,17 @@ contract asks for.
   numpy. Timed on a synthetic 2,000,000-pair join: 0.7 s to 0.1 s and
   0.9 s to 0.1 s. The September 12 run evaluated 3.15 million pairs
   in total at scale 0.1, so this matters at scale 1.0, where one join
-  has 20.7 million pairs. The remaining per-pair loops (answer
-  agreement, the KV minimum) and the label dictionaries are in
-  quail-bench.
+  has 20.7 million pairs.
+- The quail-bench side of the same problem is quail-bench pull request
+  15, merged as `5f7ce82` (version 0.5.0), and the pin moves there.
+  Labels are Arrow tables and only the selected queries' label sets
+  load: all 21 label sets at scale 0.1 load in 1.9 s instead of 5.3 s
+  with a peak of 633 MiB instead of 1153 MiB, and one query's label
+  sets in 0.9 s instead of 4.2 s. Answer agreement is one join with
+  the label table and the KV minimum groups pairs in numpy: scoring
+  2,000,000 synthetic pairs takes 2.0 s instead of 5.5 s and their
+  minimum 0.6 s instead of 4.3 s. Quail's tests pass against it
+  unchanged.
 - The SoL script and the comparison plot script read query structure
   from `read_plan`. Experiments call `register_tables`.
 
