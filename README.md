@@ -99,7 +99,9 @@ token. Before the first release:
    - GitHub repository: `quail-exploration`
    - Workflow: `publish.yml`
    - Environment: `pypi`
-3. Give the `pypi` environment access to the existing `QUAILB_TOKEN` secret.
+
+The workflow uses the repository's existing `QUAILB_TOKEN` secret to install
+the pinned QUAIL-B development dependency during its checks.
 
 Set the version in `pyproject.toml` and refresh `uv.lock`. From a clean `main`
 branch matching `origin/main`, run:
