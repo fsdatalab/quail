@@ -6,7 +6,6 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import pytest
-from substrait_helpers import filter_rel, join_rel, project_plan, read_rel
 
 from quail_b.data import GROUND_TRUTH_ROOT
 from quail_b.labels import (
@@ -22,34 +21,24 @@ from quail_b.scoring import (
     expected_rows,
     rows_from_answers,
 )
+from tools.make_substrait_plans import Filter, Join, Scan, build_plan
 
 
-def _spec(query_id, description, node, select):
-    return QuerySpec.from_plan(
-        query_id,
-        description,
-        project_plan(node, select),
-    )
+def _spec(query_id, description, tree):
+    return QuerySpec.from_plan(query_id, description, build_plan(tree))
+
 
 FILTER = "Judge the review.\n\n{0}\nAnswer TRUE or FALSE."
 JOIN = "Judge the pair.\n\n{0}\nAspect: {1}\nAnswer TRUE or FALSE."
-_REVIEWS = filter_rel(
-    read_rel("reviews", "r", "body"),
-    "filter-1",
-    FILTER,
-    "r.body",
-)
 SPEC = _spec(
     "TEST-1",
     "one filter then one join",
-    join_rel(
-        _REVIEWS,
-        read_rel("aspects", "a", "aspect"),
-        "join-1",
+    Join(
+        Filter(Scan("reviews", "r", "body"), FILTER),
+        Scan("aspects", "a", "aspect"),
+        ("r", "a"),
         JOIN,
-        ("r.body", "a.aspect"),
     ),
-    ("r.id", "a.id"),
 )
 CORPUS = {
     "reviews": [{"id": "r0", "body": "good film"},
@@ -501,43 +490,14 @@ def test_reused_label_set_rejects_changed_table_manifest(tmp_path):
 def _chain_spec():
     # FEV-8's shape: filters on the claims, three joins in a chain, every
     # alias selected
-    c1 = filter_rel(
-        read_rel("claims", "c1", "claim"),
-        "filter-1",
-        FILTER,
-        "c1.claim",
-    )
-    first = join_rel(
-        c1,
-        read_rel("evidence", "e1", "text"),
-        "join-1",
-        JOIN,
-        ("c1.claim", "e1.text"),
-    )
-    c2 = filter_rel(
-        read_rel("claims", "c2", "claim"),
-        "filter-2",
-        FILTER,
-        "c2.claim",
-    )
-    second = join_rel(
-        first,
-        c2,
-        "join-2",
-        JOIN,
-        ("e1.text", "c2.claim"),
-    )
+    c1 = Filter(Scan("claims", "c1", "claim"), FILTER)
+    first = Join(c1, Scan("evidence", "e1", "text"), ("c1", "e1"), JOIN)
+    c2 = Filter(Scan("claims", "c2", "claim"), FILTER)
+    second = Join(first, c2, ("e1", "c2"), JOIN)
     return _spec(
         "CHAIN",
         "three joins",
-        join_rel(
-            second,
-            read_rel("evidence", "e2", "text"),
-            "join-3",
-            JOIN,
-            ("c2.claim", "e2.text"),
-        ),
-        ("c1.id", "e1.id", "c2.id", "e2.id"),
+        Join(second, Scan("evidence", "e2", "text"), ("c2", "e2"), JOIN),
     )
 
 

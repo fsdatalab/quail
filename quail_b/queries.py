@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from functools import cached_property
+from functools import cache, cached_property
 from importlib.resources import files
 
 from google.protobuf import json_format
@@ -115,6 +115,7 @@ class QuerySpec:
         return _inspect_plan(self.plan)
 
 
+@cache
 def _load_queries() -> tuple[tuple[QuerySpec, ...], tuple[QuerySpec, ...]]:
     root = files("quail_b").joinpath("plans")
     catalog = json.loads(root.joinpath("catalog.json").read_text())
@@ -135,8 +136,19 @@ def _load_queries() -> tuple[tuple[QuerySpec, ...], tuple[QuerySpec, ...]]:
     return tuple(regular), tuple(privacy)
 
 
-QUERIES, PRIVACY_QUERIES = _load_queries()
-QUERY_ORDER = tuple(spec.id for spec in QUERIES)
+def __getattr__(name: str):
+    # QUERIES, PRIVACY_QUERIES, and QUERY_ORDER are read from the plan
+    # files on first use, so importing the package does not parse them.
+    if name not in ("QUERIES", "PRIVACY_QUERIES", "QUERY_ORDER"):
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    regular, privacy = _load_queries()
+    globals().update(
+        QUERIES=regular,
+        PRIVACY_QUERIES=privacy,
+        QUERY_ORDER=tuple(spec.id for spec in regular),
+    )
+    return globals()[name]
+
 
 QUERY_FAMILY_WORKLOADS = {
     "IMDB": "imdb",
@@ -149,7 +161,8 @@ QUERY_FAMILY_WORKLOADS = {
 
 def queries(include_privacy: bool = False) -> dict[str, QuerySpec]:
     """Return the benchmark queries by id, in benchmark order."""
-    specs = QUERIES + (PRIVACY_QUERIES if include_privacy else ())
+    regular, privacy = _load_queries()
+    specs = regular + (privacy if include_privacy else ())
     return {spec.id: spec for spec in specs}
 
 

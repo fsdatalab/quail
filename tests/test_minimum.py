@@ -2,7 +2,6 @@
 
 import pyarrow as pa
 import pytest
-from substrait_helpers import filter_rel, join_rel, project_plan, read_rel
 
 from quail_b.minimum import (
     DocumentTokens,
@@ -13,14 +12,11 @@ from quail_b.minimum import (
 )
 from quail_b.queries import QuerySpec
 from quail_b.scoring import RunOutput
+from tools.make_substrait_plans import Filter, Join, Scan, build_plan
 
 
-def _spec(query_id, description, node, select):
-    return QuerySpec.from_plan(
-        query_id,
-        description,
-        project_plan(node, select),
-    )
+def _spec(query_id, description, tree):
+    return QuerySpec.from_plan(query_id, description, build_plan(tree))
 
 
 def _encode(texts):
@@ -53,23 +49,15 @@ def test_prefix_trie_size_counts_shared_prefixes_once():
 
 
 def test_minimum_input_tokens_counts_each_distinct_prefix_once():
-    documents = filter_rel(
-        read_rel("docs", "d", "body"),
-        "filter-1",
-        "useful {0}",
-        "d.body",
-    )
     spec = _spec(
         "TEST-1",
         "one filter then one join",
-        join_rel(
-            documents,
-            read_rel("aspects", "a", "name"),
-            "join-1",
+        Join(
+            Filter(Scan("docs", "d", "body"), "useful {0}"),
+            Scan("aspects", "a", "name"),
+            ("d", "a"),
             "{0} mentions {1}",
-            ("d.body", "a.name"),
         ),
-        ("d.id", "a.id"),
     )
     corpus = {
         "docs": pa.table({"id": ["a", "b", "c"],
@@ -103,29 +91,12 @@ def test_minimum_input_tokens_counts_each_distinct_prefix_once():
 
 
 def test_minimum_input_tokens_counts_a_document_once_across_uses():
-    second = filter_rel(
-        read_rel("docs", "d2", "body"),
-        "filter-1",
-        "short {0}",
-        "d2.body",
-    )
-    second = filter_rel(
-        second,
-        "filter-2",
-        "clear {0}",
-        "d2.body",
-    )
+    second = Filter(Scan("docs", "d2", "body"), "short {0}")
+    second = Filter(second, "clear {0}")
     spec = _spec(
         "TEST-2",
         "a self join with two filter stages on one side",
-        join_rel(
-            read_rel("docs", "d1", "body"),
-            second,
-            "join-1",
-            "{0} before {1}",
-            ("d1.body", "d2.body"),
-        ),
-        ("d1.id", "d2.id"),
+        Join(Scan("docs", "d1", "body"), second, ("d1", "d2"), "{0} before {1}"),
     )
     corpus = {"docs": pa.table({"id": ["a", "b"], "body": ["alpha", "beta"]})}
     first, second = _ids("\n\nshort?\nANSWER:"), _ids("\n\nclear?\nANSWER:")
@@ -158,17 +129,10 @@ def test_minimum_input_tokens_counts_a_document_once_across_uses():
 
 
 def _filter_spec():
-    node = filter_rel(
-        read_rel("docs", "d", "body"),
-        "filter-1",
-        "useful {0}",
-        "d.body",
-    )
     return _spec(
         "TEST-0",
         "one filter",
-        node,
-        ("d.id",),
+        Filter(Scan("docs", "d", "body"), "useful {0}"),
     )
 
 

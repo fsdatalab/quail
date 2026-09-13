@@ -26,10 +26,7 @@ from quail_b.substrait import (
     EQUAL_NAME,
     _inspect_plan,
 )
-from quail_b.substrait_metadata_pb2 import (
-    OperatorMetadata,
-    RelationMetadata,
-)
+from tools.make_substrait_plans import write_plans
 
 
 def test_catalog_has_the_33_default_queries_and_two_privacy_queries():
@@ -75,14 +72,6 @@ def test_filters_are_substrait_relations_over_their_input():
 
     plan = spec.plan
     assert isinstance(plan, plan_pb2.Plan)
-    assert set(plan.expected_type_urls) == {
-        f"type.googleapis.com/{RelationMetadata.DESCRIPTOR.full_name}",
-        f"type.googleapis.com/{OperatorMetadata.DESCRIPTOR.full_name}",
-    }
-    assert (
-        plan.execution_behavior.variable_eval_mode
-        == plan_pb2.ExecutionBehavior.VARIABLE_EVALUATION_MODE_PER_PLAN
-    )
     info = _inspect_plan(plan)
     assert [
         (relation.alias, relation.table, relation.text_column)
@@ -101,8 +90,12 @@ def test_filters_are_substrait_relations_over_their_input():
 
     project = plan.relations[0].root.input.project
     join = project.input.join
-    assert join.left.filter.input.filter.input.HasField("read")
-    assert join.right.HasField("read")
+    assert join.common.hint.alias == "join-1"
+    assert join.left.filter.common.hint.alias == "filter-2"
+    assert join.left.filter.input.filter.common.hint.alias == "filter-1"
+    assert join.left.filter.input.filter.input.read.common.hint.alias == "r"
+    assert join.right.read.common.hint.alias == "a"
+    assert not plan.expected_type_urls
 
 
 def test_fev_10_combines_ai_and_ordinary_join_conditions():
@@ -199,7 +192,7 @@ def test_ai_extension_definition_is_packaged():
     assert "name: ai_join" in extension
 
 
-def test_substrait_plans_and_metadata_schema_are_packaged():
+def test_substrait_plans_are_packaged():
     package = files("quail_b")
     catalog = package.joinpath("plans", "catalog.json")
     entries = json.loads(catalog.read_text())
@@ -209,7 +202,18 @@ def test_substrait_plans_and_metadata_schema_are_packaged():
         package.joinpath("plans", f"{entry['id']}.json").is_file()
         for entry in entries
     )
-    assert package.joinpath("substrait_metadata.proto").is_file()
+
+
+def test_checked_in_plans_equal_the_generator_output(tmp_path):
+    write_plans(tmp_path)
+    package = files("quail_b").joinpath("plans")
+
+    generated = sorted(path.name for path in tmp_path.iterdir())
+    assert generated == sorted(path.name for path in package.iterdir())
+    for name in generated:
+        assert (tmp_path / name).read_text() == package.joinpath(name).read_text(), (
+            f"{name} differs; run tools/make_substrait_plans.py"
+        )
 
 
 def test_parallel_query_split_matches_stock_vllm():

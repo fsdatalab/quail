@@ -1,11 +1,4 @@
 {
-  "execution_behavior": {
-    "variable_eval_mode": "VARIABLE_EVALUATION_MODE_PER_PLAN"
-  },
-  "expected_type_urls": [
-    "type.googleapis.com/org.fsdatalab.quail_b.substrait.v1.RelationMetadata",
-    "type.googleapis.com/org.fsdatalab.quail_b.substrait.v1.OperatorMetadata"
-  ],
   "extension_urns": [
     {
       "extension_urn_anchor": 1,
@@ -78,17 +71,11 @@
             ],
             "input": {
               "join": {
-                "advanced_extension": {
-                  "optimization": [
-                    {
-                      "@type": "type.googleapis.com/org.fsdatalab.quail_b.substrait.v1.OperatorMetadata",
-                      "operator_id": "join-3",
-                      "schema_version": 1
-                    }
-                  ]
-                },
                 "common": {
-                  "direct": {}
+                  "direct": {},
+                  "hint": {
+                    "alias": "join-3"
+                  }
                 },
                 "expression": {
                   "scalar_function": {
@@ -135,17 +122,11 @@
                 },
                 "left": {
                   "join": {
-                    "advanced_extension": {
-                      "optimization": [
-                        {
-                          "@type": "type.googleapis.com/org.fsdatalab.quail_b.substrait.v1.OperatorMetadata",
-                          "operator_id": "join-2",
-                          "schema_version": 1
-                        }
-                      ]
-                    },
                     "common": {
-                      "direct": {}
+                      "direct": {},
+                      "hint": {
+                        "alias": "join-2"
+                      }
                     },
                     "expression": {
                       "scalar_function": {
@@ -192,17 +173,11 @@
                     },
                     "left": {
                       "join": {
-                        "advanced_extension": {
-                          "optimization": [
-                            {
-                              "@type": "type.googleapis.com/org.fsdatalab.quail_b.substrait.v1.OperatorMetadata",
-                              "operator_id": "join-1",
-                              "schema_version": 1
-                            }
-                          ]
-                        },
                         "common": {
-                          "direct": {}
+                          "direct": {},
+                          "hint": {
+                            "alias": "join-1"
+                          }
                         },
                         "expression": {
                           "scalar_function": {
@@ -249,16 +224,6 @@
                         },
                         "left": {
                           "read": {
-                            "advanced_extension": {
-                              "optimization": [
-                                {
-                                  "@type": "type.googleapis.com/org.fsdatalab.quail_b.substrait.v1.RelationMetadata",
-                                  "alias": "r1",
-                                  "schema_version": 1,
-                                  "text_column": "body"
-                                }
-                              ]
-                            },
                             "base_schema": {
                               "names": [
                                 "id",
@@ -281,7 +246,10 @@
                               }
                             },
                             "common": {
-                              "direct": {}
+                              "direct": {},
+                              "hint": {
+                                "alias": "r1"
+                              }
                             },
                             "named_table": {
                               "names": [
@@ -292,16 +260,6 @@
                         },
                         "right": {
                           "read": {
-                            "advanced_extension": {
-                              "optimization": [
-                                {
-                                  "@type": "type.googleapis.com/org.fsdatalab.quail_b.substrait.v1.RelationMetadata",
-                                  "alias": "a1",
-                                  "schema_version": 1,
-                                  "text_column": "aspect"
-                                }
-                              ]
-                            },
                             "base_schema": {
                               "names": [
                                 "id",
@@ -324,7 +282,10 @@
                               }
                             },
                             "common": {
-                              "direct": {}
+                              "direct": {},
+                              "hint": {
+                                "alias": "a1"
+                              }
                             },
                             "named_table": {
                               "names": [
@@ -338,16 +299,6 @@
                     },
                     "right": {
                       "read": {
-                        "advanced_extension": {
-                          "optimization": [
-                            {
-                              "@type": "type.googleapis.com/org.fsdatalab.quail_b.substrait.v1.RelationMetadata",
-                              "alias": "r2",
-                              "schema_version": 1,
-                              "text_column": "body"
-                            }
-                          ]
-                        },
                         "base_schema": {
                           "names": [
                             "id",
@@ -370,7 +321,10 @@
                           }
                         },
                         "common": {
-                          "direct": {}
+                          "direct": {},
+                          "hint": {
+                            "alias": "r2"
+                          }
                         },
                         "named_table": {
                           "names": [
@@ -384,16 +338,6 @@
                 },
                 "right": {
                   "read": {
-                    "advanced_extension": {
-                      "optimization": [
-                        {
-                          "@type": "type.googleapis.com/org.fsdatalab.quail_b.substrait.v1.RelationMetadata",
-                          "alias": "a2",
-                          "schema_version": 1,
-                          "text_column": "aspect"
-                        }
-                      ]
-                    },
                     "base_schema": {
                       "names": [
                         "id",
@@ -416,7 +360,10 @@
                       }
                     },
                     "common": {
-                      "direct": {}
+                      "direct": {},
+                      "hint": {
+                        "alias": "a2"
+                      }
                     },
                     "named_table": {
                       "names": [

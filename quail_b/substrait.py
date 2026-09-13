@@ -6,11 +6,6 @@ from dataclasses import dataclass
 
 from substrait import algebra_pb2, plan_pb2
 
-from quail_b.substrait_metadata_pb2 import (
-    OperatorMetadata,
-    RelationMetadata,
-)
-
 SUBSTRAIT_VERSION = (0, 103, 0)
 AI_EXTENSION_URN = "extension:org.fsdatalab.quail_b:functions_ai"
 COMPARISON_EXTENSION_URN = "extension:io.substrait:functions_comparison"
@@ -27,13 +22,6 @@ _FUNCTION_URNS = {
     EQUAL_NAME: COMPARISON_EXTENSION_URN,
     AND_NAME: BOOLEAN_EXTENSION_URN,
 }
-_METADATA_VERSION = 1
-_RELATION_TYPE_URL = (
-    f"type.googleapis.com/{RelationMetadata.DESCRIPTOR.full_name}"
-)
-_OPERATOR_TYPE_URL = (
-    f"type.googleapis.com/{OperatorMetadata.DESCRIPTOR.full_name}"
-)
 
 
 @dataclass(frozen=True)
@@ -96,23 +84,23 @@ class _PlanInfo:
 @dataclass(frozen=True)
 class _Decoded:
     fields: tuple[tuple[str, str], ...]
-    relations: tuple[_Relation, ...]
+    tables: tuple[tuple[str, str], ...]
+    text_columns: tuple[tuple[str, str], ...]
     operators: tuple[_Operator, ...]
 
 
-def _unpack(extension, message_type, label):
-    matches = [
-        packed
-        for packed in extension.optimization
-        if packed.Is(message_type.DESCRIPTOR)
-    ]
-    if len(matches) != 1:
-        raise ValueError(f"Substrait {label} needs one metadata message")
-    message = message_type()
-    matches[0].Unpack(message)
-    if message.schema_version != _METADATA_VERSION:
-        raise ValueError(f"unsupported Substrait {label} metadata version")
-    return message
+def _with_text_column(
+    text_columns: tuple[tuple[str, str], ...],
+    field: tuple[str, str],
+) -> tuple[tuple[str, str], ...]:
+    """Record the column an AI function reads from one relation."""
+    alias, column = field
+    known = dict(text_columns)
+    if known.get(alias, column) != column:
+        raise ValueError(f"relation {alias!r} is used with two text columns")
+    if alias in known:
+        return text_columns
+    return (*text_columns, (alias, column))
 
 
 def _function_names(plan: plan_pb2.Plan) -> dict[int, str]:
@@ -209,27 +197,17 @@ def _decode(
     kind = rel.WhichOneof("rel_type")
     if kind == "read":
         read = rel.read
-        metadata = _unpack(
-            read.advanced_extension,
-            RelationMetadata,
-            "relation",
-        )
+        alias = read.common.hint.alias
+        if not alias:
+            raise ValueError("QUAIL-B reads need a relation alias in hint.alias")
         if not read.HasField("named_table") or not read.named_table.names:
             raise ValueError("QUAIL-B reads need a named table")
         if len(read.base_schema.names) != len(read.base_schema.struct.types):
             raise ValueError("Substrait read schema names and types do not match")
-        relation = _Relation(
-            metadata.alias,
-            read.named_table.names[-1],
-            metadata.text_column,
-        )
-        fields = tuple(
-            (relation.alias, name) for name in read.base_schema.names
-        )
-        required = {(relation.alias, "id"), (relation.alias, relation.text_column)}
-        if not required <= set(fields):
-            raise ValueError("QUAIL-B reads need id and text columns")
-        return _Decoded(fields, (relation,), ())
+        fields = tuple((alias, name) for name in read.base_schema.names)
+        if (alias, "id") not in fields:
+            raise ValueError("QUAIL-B reads need an id column")
+        return _Decoded(fields, ((alias, read.named_table.names[-1]),), (), ())
 
     if kind == "filter":
         child = _decode(rel.filter.input, functions)
@@ -242,22 +220,11 @@ def _decode(
             raise ValueError("ai_filter needs a prompt and document")
         prompt = _literal_string(arguments[0])
         field = _selected(child.fields, arguments[1])
-        relation = next(
-            relation
-            for relation in child.relations
-            if relation.alias == field[0]
-        )
-        if field[1] != relation.text_column:
-            raise ValueError("ai_filter must receive the relation text column")
-        metadata = _unpack(
-            rel.filter.advanced_extension,
-            OperatorMetadata,
-            "operator",
-        )
-        operator = _Filter(metadata.operator_id, field[0], prompt)
+        operator = _Filter(rel.filter.common.hint.alias, field[0], prompt)
         return _Decoded(
             child.fields,
-            child.relations,
+            child.tables,
+            _with_text_column(child.text_columns, field),
             (*child.operators, operator),
         )
 
@@ -287,13 +254,9 @@ def _decode(
             _selected(fields, arguments[2]),
         )
         relation_aliases = tuple(field[0] for field in document_fields)
-        relation_by_alias = {
-            relation.alias: relation
-            for relation in (*left.relations, *right.relations)
-        }
+        text_columns = (*left.text_columns, *right.text_columns)
         for field in document_fields:
-            if field[1] != relation_by_alias[field[0]].text_column:
-                raise ValueError("ai_join must receive relation text columns")
+            text_columns = _with_text_column(text_columns, field)
         on = []
         for condition in conditions:
             function = condition.scalar_function
@@ -314,20 +277,16 @@ def _decode(
                 on.append((second[1], first[1]))
             else:
                 raise ValueError("join equality uses unrelated relations")
-        metadata = _unpack(
-            rel.join.advanced_extension,
-            OperatorMetadata,
-            "operator",
-        )
         operator = _Join(
-            metadata.operator_id,
+            rel.join.common.hint.alias,
             relation_aliases,
             prompt,
             tuple(on),
         )
         return _Decoded(
             fields,
-            (*left.relations, *right.relations),
+            (*left.tables, *right.tables),
+            text_columns,
             (*left.operators, *right.operators, operator),
         )
 
@@ -387,14 +346,6 @@ def _inspect_plan(plan: plan_pb2.Plan) -> _PlanInfo:
         raise ValueError(
             f"QUAIL-B requires Substrait {'.'.join(map(str, SUBSTRAIT_VERSION))}"
         )
-    expected_urls = {_RELATION_TYPE_URL, _OPERATOR_TYPE_URL}
-    if not expected_urls <= set(plan.expected_type_urls):
-        raise ValueError("Substrait plan must declare QUAIL-B metadata")
-    if (
-        plan.execution_behavior.variable_eval_mode
-        != plan_pb2.ExecutionBehavior.VARIABLE_EVALUATION_MODE_PER_PLAN
-    ):
-        raise ValueError("QUAIL-B requires per-plan variable evaluation")
     if len(plan.relations) != 1 or not plan.relations[0].HasField("root"):
         raise ValueError("QUAIL-B needs one Substrait root relation")
     root = plan.relations[0].root
@@ -415,6 +366,12 @@ def _inspect_plan(plan: plan_pb2.Plan) -> _PlanInfo:
     expected_names = tuple(name.split(".", 1)[0] for name in select)
     if tuple(root.names) != expected_names:
         raise ValueError("QUAIL-B root names do not match selected relations")
-    info = _PlanInfo(decoded.relations, decoded.operators, select)
+    text_columns = dict(decoded.text_columns)
+    relations = []
+    for alias, table in decoded.tables:
+        if alias not in text_columns:
+            raise ValueError(f"relation {alias!r} is not read by an AI function")
+        relations.append(_Relation(alias, table, text_columns[alias]))
+    info = _PlanInfo(tuple(relations), decoded.operators, select)
     _validate_info(info)
     return info

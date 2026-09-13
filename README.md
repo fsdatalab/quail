@@ -45,8 +45,11 @@ parsed plan. `query.plan_bytes` contains the deterministic binary serialization
 produced by the pinned Substrait 0.103 bindings.
 
 The query definitions are standard Substrait ProtoJSON files under
-[`quail_b/plans/`](quail_b/plans/). They are the source query plans, not
-generated views of another QUAIL-B query model.
+[`quail_b/plans/`](quail_b/plans/). The benchmark reads these files; it has
+no other query model. Because one prompt appears in several plans, the files
+are written by [`tools/make_substrait_plans.py`](tools/make_substrait_plans.py)
+from the query shapes and the prompt strings in `quail_b/prompts.py`, and a
+test checks that the checked-in files equal the script's output.
 
 Protobuf does not define a canonical byte format across runtime versions.
 The saved `definition_hash` therefore resolves function anchors and hashes the
@@ -199,36 +202,26 @@ The IMDB-4 Substrait relation tree is:
 ```text
 RelRoot [r, a]
 └── ProjectRel [r.id, a.id]
-    └── JoinRel INNER [ai_join(J1, r.body, a.aspect)]
-        ├── FilterRel [ai_filter(F4, r.body)] id=filter-2
-        │   └── FilterRel [ai_filter(F1, r.body)] id=filter-1
-        │       └── ReadRel reviews [id, body] alias=r
-        └── ReadRel aspects [id, aspect] alias=a
+    └── JoinRel INNER [ai_join(J1, r.body, a.aspect)]  hint.alias=join-1
+        ├── FilterRel [ai_filter(F4, r.body)]           hint.alias=filter-2
+        │   └── FilterRel [ai_filter(F1, r.body)]       hint.alias=filter-1
+        │       └── ReadRel reviews [id, body]          hint.alias=r
+        └── ReadRel aspects [id, aspect]                hint.alias=a
 ```
 
 `F1`, `F4`, and `J1` stand for the full prompt string literals in the
 plan. The exact strings are also defined in `quail_b/prompts.py`.
 
 Substrait field references are numeric positions. The `ReadRel` schemas
-define those positions. Relation aliases and stable operator IDs are
-non-semantic benchmark metadata stored in versioned protobuf messages under
-each relation's `AdvancedExtension.optimization` field. Their definitions are
-in [`quail_b/substrait_metadata.proto`](quail_b/substrait_metadata.proto):
+define those positions. Every table has an `id` column. The column an AI
+function reads is the one its field reference points at.
 
-```protobuf
-RelationMetadata {
-  schema_version: 1
-  alias: "r"
-  text_column: "body"
-}
-OperatorMetadata {
-  schema_version: 1
-  operator_id: "filter-1"
-}
-```
-
-The plan lists both message types in `expected_type_urls` and sets variable
-evaluation to `VARIABLE_EVALUATION_MODE_PER_PLAN`.
+Relation aliases and operator IDs use the standard Substrait
+`RelCommon.hint.alias` field: `r` on a `ReadRel`, `filter-1` on a
+`FilterRel`, `join-1` on a `JoinRel`. The plans carry no other metadata.
+Operator IDs number filters and joins in post-order (inputs before the
+operator, left before right). They are the keys of the answer tables an
+adapter returns.
 
 An adapter reads the relation tree, resolves function anchors through the
 plan's extension declarations, and translates the result to its engine.
@@ -389,6 +382,7 @@ quail-b report results/my-run
 ## Source definitions
 
 Query plans: [`quail_b/plans/`](quail_b/plans/).
+Plan generator: [`tools/make_substrait_plans.py`](tools/make_substrait_plans.py).
 Catalog loader: [`quail_b/queries.py`](quail_b/queries.py).
 Substrait extension: [`quail_b/substrait_extensions.yaml`](quail_b/substrait_extensions.yaml).
 Tables: [`quail_b/data.py`](quail_b/data.py).

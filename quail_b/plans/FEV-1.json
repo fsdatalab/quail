@@ -1,11 +1,4 @@
 {
-  "execution_behavior": {
-    "variable_eval_mode": "VARIABLE_EVALUATION_MODE_PER_PLAN"
-  },
-  "expected_type_urls": [
-    "type.googleapis.com/org.fsdatalab.quail_b.substrait.v1.RelationMetadata",
-    "type.googleapis.com/org.fsdatalab.quail_b.substrait.v1.OperatorMetadata"
-  ],
   "extension_urns": [
     {
       "extension_urn_anchor": 1,
@@ -45,17 +38,11 @@
             ],
             "input": {
               "filter": {
-                "advanced_extension": {
-                  "optimization": [
-                    {
-                      "@type": "type.googleapis.com/org.fsdatalab.quail_b.substrait.v1.OperatorMetadata",
-                      "operator_id": "filter-1",
-                      "schema_version": 1
-                    }
-                  ]
-                },
                 "common": {
-                  "direct": {}
+                  "direct": {},
+                  "hint": {
+                    "alias": "filter-1"
+                  }
                 },
                 "condition": {
                   "scalar_function": {
@@ -90,16 +77,6 @@
                 },
                 "input": {
                   "read": {
-                    "advanced_extension": {
-                      "optimization": [
-                        {
-                          "@type": "type.googleapis.com/org.fsdatalab.quail_b.substrait.v1.RelationMetadata",
-                          "alias": "c",
-                          "schema_version": 1,
-                          "text_column": "claim"
-                        }
-                      ]
-                    },
                     "base_schema": {
                       "names": [
                         "id",
@@ -122,7 +99,10 @@
                       }
                     },
                     "common": {
-                      "direct": {}
+                      "direct": {},
+                      "hint": {
+                        "alias": "c"
+                      }
                     },
                     "named_table": {
                       "names": [
