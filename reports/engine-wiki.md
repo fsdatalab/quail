@@ -52,7 +52,8 @@ in the same process.
 | `backends/quail/distributed.py` | Several GPU Quail node dispatch and result merging | runner, coordinator |
 | `backends/quail/worker.py` | Quail model boot, single GPU execution, and the GPU child protocol | executor, graph, distributed |
 | `runtime/execute.py` | Run the existing query in the current process: validation, backend dispatch, and result assembly | session |
-| `bench/quailb.py` | QUAIL-B benchmark (data, queries, driver) | runtime |
+| `bench/substrait.py` | Read a QUAIL-B Substrait plan and build it as a Quail query | builder |
+| `bench/quailb.py` | QUAIL-B runner: the adapter `quail_b.run` calls | runtime, substrait |
 
 ### Data flow
 
@@ -1725,8 +1726,8 @@ graph LR
 | PRIV-1 | 2F | P_MSG + P_LOC |
 | PRIV-2 | 2F + 1J | P_MSG + P_LOC then SCENARIO_MATCH |
 
-PRIV-1 and PRIV-2 run only when `register_privacy_sets()` has been
-called. They have no ground truth and are not part of the default
+PRIV-1 and PRIV-2 run only when the `policies` and `scenarios` tables
+are registered. They have no ground truth and are not part of the default
 benchmark runner or judge pass.
 
 ### Scale factors and derived collections
@@ -1750,9 +1751,10 @@ come from the fixed sf0.1 Qwen3 32B fp8 collection
 truth labels.
 
 The source collection is
-`s3://quail-bench/ground_truth/quailb/schema_v1/collections/gt_77bb8b128743a79aedddaa24c808c3f8/manifest.json`. Each builder query ends with
-`.select(..., order="by_cost")`, so the benchmark exercises the planner's
-filter and join ordering. The collection contains 21 predicates. It reuses
+`s3://quail-bench/ground_truth/quailb/schema_v1/collections/gt_77bb8b128743a79aedddaa24c808c3f8/manifest.json`. The runner
+gives every predicate its estimate by prompt and ends a query that has
+an estimate for every predicate with `.select(..., order="by_cost")`, so
+the benchmark exercises the planner's filter and join ordering. The collection contains 21 predicates. It reuses
 the 19 IMDB, BioDEX, FEVER, and LePaRD label sets whose tables did not change.
 The two SWE-Next label sets belong directly to the current corpus. The
 collection manifest records the original corpus and table manifest for every
@@ -1766,10 +1768,17 @@ key. The old short predicate codes are not part of the active benchmark code.
 
 ### Protocol and reported values
 
-Quail's callback in `quail/bench/quailb.py` translates and executes queries.
-It returns document IDs, predicate answers, and timings to `quail_b.run()`.
-QUAIL-B loads and validates inputs and reference labels from public S3.
-It saves answers before scoring and writes `run.json` and `report.md`.
+A QUAIL-B query is a Substrait plan (a protocol buffer that describes a
+relational query): table scans, `FilterRel` calls to `ai_filter`, inner
+`JoinRel` calls to `ai_join`, and a projection of id columns. Each
+relation's alias and each operator's id (`filter-1`, `join-1`, numbered
+in post-order) are the `hint.alias` of its node. `quail/bench/substrait.py`
+reads that plan into relations, filters, and joins and builds the Quail
+query with the builder. Quail's callback in `quail/bench/quailb.py` runs
+it and returns document IDs, predicate answers keyed by operator id,
+timings, and the prompt token pieces to `quail_b.run()`. QUAIL-B loads
+and validates inputs and reference labels from public S3. It saves
+answers before scoring and writes `run.json` and `report.md`.
 
 The caller chooses engine settings, resources, output directories, and caches.
 The Modal wrapper resolves one label collection for all query families before

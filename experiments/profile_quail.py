@@ -185,14 +185,14 @@ def _boot_state(model):
 def _quailb_session(model, sf, gpus=1):
     """Build the QUAIL-B tables and a registered session."""
     import quail
-    from quail.bench.quailb import queries, register_sets
+    from quail.bench.quailb import queries, register_tables
     from quail.planner.plan import EngineConfig
     from quail_b.data import build_sets
 
     d = build_sets(DATA_DIR, sf)
     results_vol.commit()
     sess = quail.Session(EngineConfig(gpus=gpus, model=model))
-    register_sets(sess, d)
+    register_tables(sess, d)
     return sess, queries(sess)
 
 

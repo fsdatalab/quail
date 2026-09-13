@@ -2544,22 +2544,24 @@ dev = [
     { name = "matplotlib", specifier = ">=3.9" },
     { name = "modal", extras = ["api-proxy-support"], specifier = ">=1.5.1" },
     { name = "pytest", specifier = ">=8.0" },
-    { name = "quail-b", git = "https://github.com/fsdatalab/quail-bench.git?rev=63ff9b9d167b02f1f0713aa8c5c2a7ee45739b8b" },
+    { name = "quail-b", git = "https://github.com/fsdatalab/quail-bench.git?rev=5f7ce82663de1535dccdab3d0249225f34323713" },
     { name = "ruff", specifier = "==0.12.9" },
     { name = "vulture", specifier = ">=2.16,<3" },
 ]
 
 [[package]]
 name = "quail-b"
-version = "0.3.0"
-source = { git = "https://github.com/fsdatalab/quail-bench.git?rev=63ff9b9d167b02f1f0713aa8c5c2a7ee45739b8b#63ff9b9d167b02f1f0713aa8c5c2a7ee45739b8b" }
+version = "0.5.0"
+source = { git = "https://github.com/fsdatalab/quail-bench.git?rev=5f7ce82663de1535dccdab3d0249225f34323713#5f7ce82663de1535dccdab3d0249225f34323713" }
 dependencies = [
     { name = "datasets" },
     { name = "huggingface-hub" },
     { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
     { name = "numpy", version = "2.5.2", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'emscripten' or sys_platform == 'win32'" },
     { name = "pandas" },
+    { name = "protobuf" },
     { name = "pyarrow" },
+    { name = "substrait-protobuf" },
     { name = "transformers" },
 ]
 
@@ -2848,6 +2850,18 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/b5/b4/205b0d5241d934e8add0c38aa924c4f9fb7330834ff11e5444db964ec3f9/starlette-1.6.0.tar.gz", hash = "sha256:d4e3ac5e546444960c710297a3c9fc3f7ebae1b7e963f3d36173b49da535be9b", size = 2716969, upload-time = "2026-08-08T18:27:57.512Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c8/cb/6a6a47d5b464bd08695d254f3da6e7986cc70c9fa5d778eda57538edfe56/starlette-1.6.0-py3-none-any.whl", hash = "sha256:a86dd39d14bb45f85a3d18525215a9ef0cfd1f192ac793220e72598c90335f0c", size = 75969, upload-time = "2026-08-08T18:27:56.196Z" },
+]
+
+[[package]]
+name = "substrait-protobuf"
+version = "0.103.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "protobuf" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/cc/5b/68d041a71bf9f1cb81b6b54eb9ad1b09c9ccae69f67737f16282a9c07037/substrait_protobuf-0.103.0.tar.gz", hash = "sha256:cc0fc91fe59245894c8315f901343be0da43daeb5f8a527ca43a2be394a466a9", size = 66365, upload-time = "2026-08-30T07:46:58.123Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/89/11/719554af2bf75ecd0d83369c1796b6df585b9965de9925e1cfb8c21f42ff/substrait_protobuf-0.103.0-py3-none-any.whl", hash = "sha256:77cc8315cbc1c209f5771b25f2edb854cb50e98cafa8a4ef00d451f978d31020", size = 72236, upload-time = "2026-08-30T07:46:57.134Z" },
 ]
 
 [[package]]
