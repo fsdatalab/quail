@@ -2,16 +2,21 @@
 title: Introduction
 ---
 
-Quail is a query engine for
-[AI-SQL](/docs/user-guide/sql#what-is-ai-sql). You write a SQL query
-with AI-powered filters and joins, register your document tables,
-and Quail runs the whole query on one or more GPUs.
+Quail (QUery Aware Inference Layer) is an open-source, extensible
+execution engine for AI-SQL.
+
+AI-SQL is a variant of SQL with operators that let you write logic
+in natural language for an LLM to evaluate on every row:
 
 ```sql
 SELECT r.id
 FROM reviews r
 WHERE AI.IF(PROMPT('Does this review discuss the ending?\n\n{0}', r.body))
 ```
+
+Quail currently supports AI-powered filters, joins, and
+`EXISTS` / `NOT EXISTS`. We are actively extending Quail with
+[more operators](/docs/user-guide/sql#ai-operators).
 
 Quail supports two AI-SQL dialects
 ([Snowflake](https://docs.snowflake.com/en/user-guide/snowflake-cortex/aisql)
