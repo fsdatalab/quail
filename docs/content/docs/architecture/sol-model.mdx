@@ -2,344 +2,334 @@
 title: The speed of light model
 ---
 
-The speed of light (SoL) estimate is the ideal time for a query on
-one GPU, assuming peak hardware throughput, unlimited KV for document
-prefixes, and no host overhead. It is a lower bound for comparison,
-not an achievable target.
+The speed of light (SoL) estimate is the ideal execution time for a
+query on one GPU. It assumes peak hardware throughput, unlimited KV
+capacity for document prefixes, and zero host overhead. No
+implementation can reach it because those assumptions cannot all hold
+simultaneously.
 
-The estimate uses datasheet numbers (peak FLOP/s, HBM bandwidth),
-model dimensions, and a count of the query's work. It has no fitted
-parameters and does not use any measured Quail runtime.
+The estimate uses datasheet peak rates, model dimensions, and a
+count of the query's work. It has no fitted parameters and does not
+use any measured Quail runtime.
 
-See `quail/planner/sol.py` for the implementation.
+Implementation:
+[quail/planner/sol.py](https://github.com/fsdatalab/quail/blob/main/quail/planner/sol.py).
 
-## 1. Notation
+## Notation
 
-| symbol | meaning | Qwen3-4B-fp8 | Qwen3-32B-fp8 |
+| Symbol | Meaning | Qwen3 4B fp8 | Qwen3 32B fp8 |
 |---|---|---|---|
-| `p` | shared preamble tokens, on every document | 2 | 2 |
-| `d_i` | tokens in document `i` | from the corpus | from the corpus |
-| `q_s` | tokens in filter stage `s`'s question | 41 to 62 | 41 to 62 |
-| `f_a` | join frame tokens after anchor `a` | 36 to 42 | 36 to 42 |
-| `u_b` | one join tuple suffix for partner `b` | from the prompt and corpus | from the prompt and corpus |
-| `A_s` | documents alive entering stage `s` | `A_1` is all | `A_1` is all |
-| `T(n)` | `n(n+1)/2`, a causal sequence attending to itself | | |
-| `P_A` | attention projection parameters | 943,718,400 | 6,039,797,760 |
-| `P_M` | MLP parameters | 2,689,597,440 | 25,165,824,000 |
-| `L` | layers | 36 | 64 |
-| `n_q`, `d_head` | query heads, head dimension | 32, 128 | 64, 128 |
-| `kappa` | KV bytes per token, `2 L n_kv d_head 2` | 147,456 | 262,144 |
-| `b_w` | bytes per modeled weight | 1 | 1 |
-| `R_dense` | fp8 dense peak, FLOP/s | 1.979e15 | 1.979e15 |
-| `R_attn` | bf16 dense peak, FLOP/s | 0.9895e15 | 0.9895e15 |
-| `BW` | HBM bandwidth, bytes/s | 3.35e12 | 3.35e12 |
-| `C` | tokens per forward pass | 110,376 | 41,943 |
+| `p` | Shared preamble tokens (on every document) | 2 | 2 |
+| `d_i` | Tokens in document `i` | corpus | corpus |
+| `q_s` | Tokens in filter stage `s`'s question | 41–62 | 41–62 |
+| `f_a` | Join frame tokens after anchor `a` | 36–42 | 36–42 |
+| `u_b` | One join tuple suffix for partner `b` | corpus | corpus |
+| `A_s` | Documents entering stage `s` | `A_1` = all | `A_1` = all |
+| `T(n)` | `\frac{n(n+1)}{2}`, causal self-attention pairs | | |
+| `P_A` | Attention projection parameters (Q, K, V, output) | 943,718,400 | 6,039,797,760 |
+| `P_M` | MLP parameters (gate, up, down) | 2,689,597,440 | 25,165,824,000 |
+| `L` | Layers | 36 | 64 |
+| `n_q, d_\mathrm{head}` | Query heads, head dimension | 32, 128 | 64, 128 |
+| `\kappa` | KV bytes per token: `2 \cdot L \cdot n_{kv} \cdot d_\mathrm{head} \cdot 2` | 147,456 | 262,144 |
+| `b_w` | Bytes per weight | 1 | 1 |
+| `R_\mathrm{dense}` | FP8 dense peak FLOP/s | `1.979 \times 10^{15}` | `1.979 \times 10^{15}` |
+| `R_\mathrm{attn}` | BF16 dense peak FLOP/s | `0.9895 \times 10^{15}` | `0.9895 \times 10^{15}` |
+| `\mathrm{BW}` | HBM bandwidth (bytes/s) | `3.35 \times 10^{12}` | `3.35 \times 10^{12}` |
+| `C` | Tokens per forward pass | 110,376 | 41,943 |
 
-`p`, `d_i` and `q_s` are the same for both models because every
-Qwen3 model shares one tokenizer. The hardware rows are the same
-because it is the same H100! request. Everything else differs.
+`p`, `d_i`, and `q_s` are the same for both models because all Qwen3
+models share one tokenizer. The hardware rows are the same because
+both run on an H100 SXM.
 
-`C` is a batch size the planner picks, not a property of the
-hardware, so it is an input to the bound with no default. Both
-values above are the fused kernels' 32-bit offset limit,
-`(2^31 - 1)` over the widest projection: 19,456 columns at 4B and
-51,200 at 32B. The 32B batch is a quarter of the 4B one, which is
-why the same query takes more forward passes and re-reads a
-7.6x larger weight set more often.
+`C` is the maximum tokens per forward pass, set by the fused kernels'
+32-bit index limit: `(2^{31} - 1)` divided by the widest projection
+(19,456 columns at 4B, 51,200 at 32B). The 32B budget is about a
+quarter of the 4B budget, so the same query needs more forward passes
+and re-reads a 7.6`\times` larger weight set more often.
 
-`P_A` and `P_M` are counted from the model dimensions rather than quoted.
-The calculation includes the Q, K, V, output, gate, up, and down
-projections. It omits embeddings, the output head, norms, and activation
-functions. `R_dense` and `R_attn` are the H100 datasheet
-figures halved, because the datasheet quotes them with 2:1 sparsity
-and we run dense. The projections are fp8 and attention is bf16
-(FlashAttention-3 over bf16 KV), which is why there are two peaks.
+`P_A` sums the Q, K, V, and output projection parameters. `P_M` sums
+the gate, up, and down projection parameters. Embeddings, the output
+head, norms, and activation functions are omitted.
 
-## 2. The modeled KV rule
+`R_\mathrm{dense}` and `R_\mathrm{attn}` are the H100 datasheet peaks
+divided by 2, because the datasheet quotes 2:1 structured sparsity
+and we run dense. Projections use FP8; attention uses BF16
+(FlashAttention-3 over BF16 KV). The two precisions have different
+peak rates.
 
-Every document has a **prefix**, `p + d_i`: the shared preamble plus the
-document text. In this model, its KV is computed once and stays resident. A
-filter appends its question and removes the question KV after the answer. A
-join appends an anchor frame, which contains the anchor label and complete
-question. The frame stays in the active anchor context during that join stage.
-Each join tuple then appends the partner label, partner document, and answer
-cue. The tuple suffix KV is used for one answer and removed. The code in
-`executor/pack.py` never retains tuple suffix KV.
+## KV reuse rule
 
-The model therefore computes a document prefix once however many questions get
-asked about it. Each later suffix still reads that prefix from KV. Production
-execution can remove the KV when capacity is needed and recompute it later. In
-the equations below reuse shows up in whether `d_i` appears in the fresh token
-count, or only in the attention pairs and KV reads.
+Every document has a **prefix**: the shared preamble `p` plus the
+document text `d_i`. In this model, a document's prefix KV is
+computed once and stays resident for the rest of the query.
 
-## 3. Counting the work
+A filter appends its question tokens and removes the question KV
+after reading the answer. A join appends an anchor frame `f_a`
+(containing the anchor label and complete question). The frame stays
+resident during the join stage. Each join tuple then appends a
+partner suffix `u_b` (partner label, partner document, answer cue).
+The suffix KV is used once and removed. See
+[executor/pack.py](https://github.com/fsdatalab/quail/blob/main/quail/executor/pack.py).
 
-Four counts per query: tokens through the forward pass, scored
-(query, key) pairs per layer, KV rows written, KV rows read back.
+In the equations below, KV reuse appears as the difference between
+the stage 1 token count (which includes `d_i`) and the stage `s > 1`
+token count (which does not).
 
-### A filter chain
+## Counting the work
+
+The estimate tracks four quantities across the whole query: fresh
+tokens through the forward pass, scored (query, key) attention pairs
+per layer, KV rows written, and KV rows read.
+
+### Filter chains
+
+**Stage 1** processes every document from scratch:
+
 
 ```
-STAGE 1 - every document scanned from nothing
-
-  tokens   = sum over i in A_1 of (p + d_i + q_1)
-  pairs    = sum over i in A_1 of T(p + d_i + q_1)
-  kv write = tokens
-  kv read  = 0
-
-
-STAGE s > 1 - the document is already in the arena
-
-  tokens   = |A_s| * q_s
-  pairs    = sum over i in A_s of [ q_s * (p + d_i) + T(q_s) ]
-  kv write = tokens
-  kv read  = sum over i in A_s of (p + d_i)
+\mathrm{tokens} = \sum_{i \in A_1} (p + d_i + q_1)
 ```
 
-**That is the whole of KV reuse.** Compare the two `tokens` lines:
-`d_i` is in stage 1 and gone from stage `s > 1`. In the pairs line
-it survives only as the width of a rectangle - the `q_s` new tokens
-attending over the resident prefix - never as a triangle over
-itself. Without reuse, stage `s > 1` would be another stage 1:
-`p + d_i + q_s` tokens and `T(p + d_i + q_s)` pairs.
 
-Over 5,000 IMDB reviews, F4 followed by F1 is 1,791,351 tokens. The F4
-scan is 1,729,233 tokens. F4 leaves 1,218 documents, so F1 adds
-`1,218 * 51 = 62,118` fresh tokens. Rescanning those documents would
-also add their document and preamble tokens.
-
-The fixed marginal selectivity estimates choose the filter order. The active
-ground truth labels then determine the exact document IDs in `A_s`. The SoL
-calculation does not estimate `A_s` from selectivity, because the surviving
-document lengths affect the attention count.
-
-When `by_cost` selects the filter order, it prices each model component
-with separate compute and memory limits. The filter time is the sum of
-the component times. For predicates after the first one, the sort divides
-the time of `ask(mean prefix, q_s)` by
-`1 - selectivity_s`.
-
-The first predicate uses `scan`. The planner sorts all predicates by ask score
-once. Prefix survivor products and expected costs then let it price every
-possible first predicate in constant time. A chain of `n` filters therefore
-takes `O(n log n)` planning work. Forward pass rounding is omitted from this
-comparison. Weight movement is spread over the token capacity `C`.
-
-The calculation runs separately for 4B and 32B because their model
-dimensions differ. After the sort, the active ground truth labels
-determine every `A_s` used in the work count.
-
-### A join
-
-One side **anchors**. Its prefixes are held and every tuple attends
-to them. The other side **streams**. A copy of each partner document
-appears in its tuple suffix. Write `f_a` for the anchor frame, which
-contains the anchor note and complete question. Write
-`u_b = label + d_b + answer cue` for one tuple suffix.
 
 ```
-JOIN - anchors a, partners b, every a against every b
-
-  per anchor, opening it when no filter ran on that side:
-    tokens += p + d_a + f_a
-    pairs  += T(p + d_a + f_a)
-
-  per anchor, already resident when a filter ran on that side:
-    tokens += f_a
-    pairs  += f_a * (p + d_a) + T(f_a)
-    kv read += p + d_a
-
-  per anchor, then per partner:
-    tokens += u_b
-    pairs  += u_b * (p + d_a + f_a) + T(u_b)
-
-  kv write = every fresh token above
-
-  per anchor, before its partner stream:
-    kv read += p + d_a + f_a
+\mathrm{pairs} = \sum_{i \in A_1} T(p + d_i + q_1)
 ```
 
-The tuple lines are the `stage s > 1` shape again: a rectangle over
-the resident context plus a triangle over the new tokens. Suffixes
-are atomic and never attend to each other (`executor/pack.py`), so
-it is one rectangle and one triangle per tuple rather than one big
-triangle over the whole stream.
 
-An anchor that came from a filter pays one prefix KV read to append its frame.
-Every anchor then pays one framed-context KV read for its whole partner stream.
-This second count is idealized. The production executor reads the framed
-anchor again when its tuples span another chunk, but SoL does not count those
-repeated reads.
-
-**Which side anchors.** Anchoring the long side costs one prefix per
-document. Anchoring the short side puts a full copy of every long
-document into every tuple. The calculation checks both feasible choices
-and checks each one against the model's chunk limit. The search runs
-separately for 4B and 32B. The join token counts differ by 14.9 times on
-FEV-2 and 193.7 times on BIO-2.
-
-### Several joins
-
-All filters run before joins. A filtered alias has reusable document prefix
-KV when the join search starts. An unfiltered alias gets reusable document
-prefix KV the first time it is an anchor. The model assumes unlimited KV
-capacity, so reusable prefixes are never removed. Partner suffix KV is never
-reusable.
-
-A column scanned under two aliases, as in a self join, is one set of
-documents. In the distinct prefix estimate, an anchor row whose column another
-alias filtered, or whose row is live under another alias that already holds
-its prefixes, pays only the frame. The per document estimate treats each alias
-separately, which pairs with the per document KV regret: both key reuse by
-alias and row.
-
-The calculation checks every supported eager left deep plan. A left deep plan
-starts with one alias and adds one alias at each step. The current search
-supports binary full joins only. When a new alias is added, it immediately
-applies every join predicate that now crosses into the joined alias set. It
-checks every order for those predicates and both aliases of each predicate as
-the anchor. It does not check bushy plans or plans that delay an available
-crossing predicate.
-
-The subset DP state is `(S, K)`. `S` is the set of aliases already joined.
-`K` is the set of aliases whose document prefix KV is available. Several work
-records can reach the same state. A record is removed only if another record
-is no larger in tokens, attention pairs, KV writes, and KV reads.
-
-The active ground truth labels give the exact logical rows for each
-intermediate. Join graphs without cycles use repeated filtering over their
-edges. Join graphs with cycles use exact assignment checks. The query work is
-the sum of all filter work and every join stage's work.
-
-A unit test compares the DP with complete enumeration on a small controlled
-query. The QUAIL-B calculation runs only the DP.
-
-## 4. Speed of light
 
 ```
-passes = ceil(tokens / C)
-
-T_A_compute = 2 * P_A * tokens / R_dense
-T_A_memory  = P_A * b_w * passes / BW
-T_A         = max(T_A_compute, T_A_memory)
-
-T_M_compute = 2 * P_M * tokens / R_dense
-T_M_memory  = P_M * b_w * passes / BW
-T_M         = max(T_M_compute, T_M_memory)
-
-T_attn_compute = 4 * n_q * d_head * L * pairs / R_attn
-T_attn_memory  = kappa * (kv write + kv read) / BW
-T_attention    = max(T_attn_compute, T_attn_memory)
-
-SoL = T_A + T_M + T_attention
+\mathrm{kvw} = \mathrm{tokens}, \quad \mathrm{kvr} = 0
 ```
 
-`2` FLOPs per projection parameter per token means one multiply and one add.
-`4 * n_q * d_head` per pair per layer: the QK dot product runs over
-`d_head` dimensions for `2 * d_head` FLOPs, the weight into V costs
-another `2 * d_head`, times `n_q` heads. At 4B that is 16,384.
 
-All query work is added before the number of ideal forward passes is rounded.
-This means filter and join barriers do not start separate passes in SoL. Each
-modeled component reads its weights once per ideal forward pass. The
-resident model footprint remains part of the GPU capacity calculation, but
-it is not used as component memory traffic.
+**Stage `s > 1`** reuses the document prefix KV:
 
-Each `max` allows compute and memory movement to overlap within one
-component. Component times are added because the components run in sequence.
-The attention projection and MLP components count weight bytes. The attention
-component counts KV bytes.
-
-The reported cost and throughput metrics are derived from SoL:
 
 ```
-cost per query at SoL = SoL / 3600 * H100! price in dollars per hour
-
-filter only documents per second at SoL = input document rows / SoL
-
-join document pairs per second at SoL = sum of evaluated pairs across all
-                                        join stages / SoL
+\mathrm{tokens} = |A_s| \cdot q_s
 ```
 
-The cost uses the benchmark's H100! price of $3.9492 per hour. The
-throughput denominator is the complete SoL time, including any filter stages
-before a join. The calculated values are metrics at SoL. They are not measured
+
+
+```
+\mathrm{pairs} = \sum_{i \in A_s} \bigl[ q_s \cdot (p + d_i) + T(q_s) \bigr]
+```
+
+
+
+```
+\mathrm{kvw} = \mathrm{tokens}, \quad \mathrm{kvr} = \sum_{i \in A_s} (p + d_i)
+```
+
+
+This is KV reuse. In stage 1, the token count includes `d_i`. In
+stage `s > 1`, it does not — only the question tokens `q_s` are
+fresh. In the pairs count, `d_i` appears only as the width of a
+rectangle (`q_s` new tokens attending over the resident prefix).
+Without reuse, stage `s > 1` would repeat the full scan: `p + d_i +
+q_s` tokens and `T(p + d_i + q_s)` pairs.
+
+**Example.** Over 5,000 IMDB reviews, F4 followed by F1 totals
+1,791,351 tokens. The F4 scan accounts for 1,729,233 tokens. F4
+leaves 1,218 documents, so F1 adds `1{,}218 \times 51 = 62{,}118`
+fresh tokens. Rescanning those documents would also recompute their
+prefix tokens.
+
+The SoL calculation uses ground-truth labels to determine the exact
+set `A_s` at each stage, because the surviving document lengths
+affect the attention pair count.
+
+### Joins
+
+One side is the **anchor**. Its prefix KV stays resident while every
+partner's suffix is evaluated against it. The anchor frame is `f_a`
+tokens (anchor label + question). Each tuple suffix is `u_b` tokens
+(partner label + partner document + answer cue).
+
+**Per anchor, when no filter ran on that side** (prefix computed
+here):
+
+
+```
+\mathrm{tokens} \mathrel{+}= p + d_a + f_a, \quad
+\mathrm{pairs} \mathrel{+}= T(p + d_a + f_a)
+```
+
+
+**Per anchor, when a filter already computed the prefix** (only the
+frame is new):
+
+
+```
+\mathrm{tokens} \mathrel{+}= f_a, \quad
+\mathrm{pairs} \mathrel{+}= f_a \cdot (p + d_a) + T(f_a), \quad
+\mathrm{kvr} \mathrel{+}= p + d_a
+```
+
+
+**Per (anchor, partner) tuple:**
+
+
+```
+\mathrm{tokens} \mathrel{+}= u_b, \quad
+\mathrm{pairs} \mathrel{+}= u_b \cdot (p + d_a + f_a) + T(u_b)
+```
+
+
+**KV write** equals all fresh tokens above. **KV read** per anchor
+(before its partner stream) adds `p + d_a + f_a`.
+
+Each tuple follows the same pattern as filter stage `s > 1`: a
+rectangle over the resident context plus a triangle over the new
+tokens. Suffixes never attend to each other
+([executor/pack.py](https://github.com/fsdatalab/quail/blob/main/quail/executor/pack.py)),
+so each tuple contributes one rectangle and one triangle.
+
+The anchor choice matters. Anchoring the side with longer documents
+computes each long prefix once. Anchoring the short side puts a full
+copy of every long document into every tuple suffix. The estimate
+checks both feasible anchor choices for each join.
+
+### Multiple joins
+
+All filters run before joins. A filtered alias has reusable prefix
+KV when the join search starts. An unfiltered alias gains reusable
+prefix KV the first time it serves as an anchor. The model assumes
+unlimited KV capacity, so reusable prefixes are never evicted.
+
+The calculation searches every left-deep join plan. A left-deep plan
+starts with one alias and adds one alias at each step. The search
+supports binary full joins only. It checks both anchor choices for
+each join predicate.
+
+The DP state is `(S, K)`: `S` is the set of aliases already joined,
+`K` is the set of aliases whose prefix KV is available. A state is
+pruned only if another state dominates it in all four work
+quantities (tokens, pairs, KV writes, KV reads).
+
+## Computing SoL
+
+The forward pass count is:
+
+
+```
+\mathrm{passes} = \left\lceil \frac{\mathrm{tokens}}{C} \right\rceil
+```
+
+
+Each model component contributes the larger of its compute time and
+its memory time:
+
+
+```
+T_A = \max\!\left(\frac{2 \, P_A \cdot \mathrm{tokens}}{R_\mathrm{dense}},\;
+\frac{P_A \cdot b_w \cdot \mathrm{passes}}{\mathrm{BW}}\right)
+```
+
+
+
+```
+T_M = \max\!\left(\frac{2 \, P_M \cdot \mathrm{tokens}}{R_\mathrm{dense}},\;
+\frac{P_M \cdot b_w \cdot \mathrm{passes}}{\mathrm{BW}}\right)
+```
+
+
+
+```
+T_\mathrm{attn} = \max\!\left(
+\frac{4 \, n_q \cdot d_\mathrm{head} \cdot L \cdot \mathrm{pairs}}{R_\mathrm{attn}},\;
+\frac{\kappa \cdot (\mathrm{kvw} + \mathrm{kvr})}{\mathrm{BW}}\right)
+```
+
+
+
+```
+\mathrm{SoL} = T_A + T_M + T_\mathrm{attn}
+```
+
+
+The factor of 2 in the projection terms counts one multiply and one
+add per parameter per token. The factor `4 \, n_q \cdot d_\mathrm{head}`
+per attention pair per layer accounts for the QK dot product
+(`2 \, d_\mathrm{head}` FLOPs) and the value weighting
+(`2 \, d_\mathrm{head}` FLOPs), times `n_q` heads. At 4B that is
+16,384 FLOPs per pair per layer.
+
+The `\max` within each component allows compute and memory to
+overlap. The components are summed because they run in sequence.
+
+All query work is aggregated before computing the forward pass count.
+Filter and join boundaries do not start separate passes in SoL.
+Each component reads its weights once per ideal forward pass.
+
+### Derived metrics
+
+
+```
+\mathrm{GPU cost} = \frac{\mathrm{SoL}}{3600} \times \mathrm{H100 price per hour}
+```
+
+
+
+```
+\mathrm{filter throughput} = \frac{\mathrm{input documents}}{\mathrm{SoL}}
+```
+
+
+
+```
+\mathrm{join throughput} = \frac{\sum \mathrm{evaluated pairs across join stages}}{\mathrm{SoL}}
+```
+
+
+These are the SoL values of these metrics. They are not measured
 Quail metrics.
 
-## 5. The code
+## Implementation
 
-The implementation is split into five planner modules:
-
-| module | responsibility |
+| Module | What it does |
 |---|---|
-| `quail/planner/work.py` | Count tokens, attention pairs, and KV movement |
-| `quail/planner/qwen3_cost.py` | Build Qwen3 attention projection, MLP, and attention components |
-| `quail/planner/roofline.py` | Price one component from FLOPs, bytes, precision, and hardware limits |
-| `quail/planner/sol.py` | Apply ideal query-wide packing and add component times |
-| `quail/planner/estimate.py` | Run filters and the exact left deep join search for one query |
+| [work.py](https://github.com/fsdatalab/quail/blob/main/quail/planner/work.py) | Count tokens, attention pairs, and KV traffic |
+| [qwen3_cost.py](https://github.com/fsdatalab/quail/blob/main/quail/planner/qwen3_cost.py) | Build the three model components for Qwen3 |
+| [roofline.py](https://github.com/fsdatalab/quail/blob/main/quail/planner/roofline.py) | Price one component from FLOPs, bytes, and hardware limits |
+| [sol.py](https://github.com/fsdatalab/quail/blob/main/quail/planner/sol.py) | Apply ideal packing and sum component times |
+| [estimate.py](https://github.com/fsdatalab/quail/blob/main/quail/planner/estimate.py) | Run the filter and join search for one query |
 
-Three functions in `work.py` carry section 3:
+Three functions in
+[work.py](https://github.com/fsdatalab/quail/blob/main/quail/planner/work.py)
+implement the work counts:
 
-| function | equation |
+| Function | What it computes |
 |---|---|
-| `scan(prefix, suffix)` | stage 1: `prefix + suffix` tokens, `T(prefix + suffix)` pairs |
-| `ask(prefix, suffix)` | stage `s > 1`: `suffix` tokens, `suffix * prefix + T(suffix)` pairs |
-| `stream(prefix, suffixes)` | a join's tuples: `ask` per suffix, one prefix read |
+| `scan(prefix, suffix)` | Stage 1: `(\mathrm{prefix} + \mathrm{suffix})` tokens, `T(\mathrm{prefix} + \mathrm{suffix})` pairs |
+| `ask(prefix, suffix)` | Stage `s > 1`: `\mathrm{suffix}` tokens, `\mathrm{suffix} \cdot \mathrm{prefix} + T(\mathrm{suffix})` pairs |
+| `stream(prefix, suffixes)` | A join's tuples: `ask` per suffix, one prefix read |
 
-`quail.speed_of_light_estimate(query, answer)` is the public entry point.
-It takes a query built through a session and an `answer(prompt,
-assignment)` callable that returns the exact TRUE or FALSE answer of one
-prompt for one row assignment. The session tokenizes the scanned columns.
-The estimator runs the filters in the planner's order, builds the exact
-join relations from the answers, counts one stage for each anchor choice,
-and searches relation subsets and KV availability with
-`optimize_left_deep()` (`quail/planner/leftdeep.py`). The exact survivors
-of every join subset come from `quail/planner/live_rows.py`. A unit test
-compares the search with complete enumeration on a small query.
+The public entry point is
+[`quail.speed_of_light_estimate(query, answer)`](https://github.com/fsdatalab/quail/blob/main/quail/planner/estimate.py).
+It takes a query and an `answer(prompt, assignment)` callable that
+returns the TRUE or FALSE label for one (prompt, row) pair. The
+estimator runs filters in the planner's order, builds exact join
+relations from the labels, and searches join plans with
+[`optimize_left_deep()`](https://github.com/fsdatalab/quail/blob/main/quail/planner/leftdeep.py).
 
-The estimator does not call or simulate the production planner. It runs
-the search separately for each model and uses that model's chunk budget.
-`speed_of_light()` is section 4. The production planner imports the same
-work and component equations to rank its candidates. Its search and
-finite KV policy are separate from this exact analysis.
+The estimator does not call or simulate the production planner. The
+production planner imports the same work and component equations to
+rank its candidates, but its search and finite-KV policy are
+separate.
 
-## 6. What the estimate assumes
+## Assumptions
 
-- **A reused anchor prefix is read once to append its frame.** The resulting
-  framed context is then read once for the whole partner stream. Production
-  execution can read that framed context once per chunk. SoL does not count
-  those repeated chunk reads.
-- **KV capacity is unlimited.** Every document prefix computed by a filter
-  or anchor remains available for later stages.
-- **Compute and memory overlap perfectly within each kernel**, per the
-  component `max` terms above.
-- **Forward passes are packed across aggregate query work.** Logical operator
-  boundaries do not add more weight reads or separate component limits. The
-  production executor cannot pack work across every barrier this way.
-- **Join plans are eager, binary, full, and left deep.** Bushy plans, nonbinary
-  predicates, exists joins, anti joins, and delayed crossing predicates are
-  outside this search.
-- **Nothing is charged** for the tokenizer, the host, scheduling,
-  kernel efficiency, or launch gaps.
-
-## 7. Every QUAIL-B query
-
-The
-[QUAIL-B SoL script](https://github.com/fsdatalab/quail/blob/cursor/reports-dev-f955/reports/make_sol_quailb.py)
-on the report branch calls the estimator for the 33 default queries at
-sf=0.1 on Qwen3 4B fp8 and Qwen3 32B fp8. The script supplies only what
-the benchmark has: the corpora, the queries, and the saved labels,
-wrapped as the `answer` callable. Document lengths and prompt lengths
-come from the session's tokenizer.
-
-The saved estimates are at `/results/sol/sol_quailb_sf0.1.json` on the
-`quail-results` volume, regenerated on 2026-09-07 with the four-filter
-FEV-9 definition; a dated copy is at
-`/results/sol/2026-09-07-sol_quailb_sf0.1.json`. They equal the earlier
-plot inputs at `/results/sol/2026-09-06-quailb-prefix-reuse.json` on
-every query and both models. The file holds the estimate with prefix
-reuse across requests, documents, and repeated aliases, and the per
-document estimate beside it. For FEV-9 on 4B, it is 5.821 seconds,
-compared with 6.337 seconds when reuse is limited to each document's own
-requests. The estimates use reference-label survivors and unlimited prefix
-retention. They do not predict the accuracy of a measured model run.
+- A reused anchor prefix is read once to append its frame. The framed
+  context is then read once for the entire partner stream. The
+  production executor may re-read when tuples span multiple chunks.
+  SoL does not count those extra reads.
+- KV capacity is unlimited. Every document prefix stays available.
+- Compute and memory overlap perfectly within each component (the
+  `\max` terms).
+- Forward passes are packed across the entire query. Operator
+  boundaries do not add weight re-reads.
+- The join search covers eager binary full left-deep plans only.
+- Tokenizer time, host overhead, scheduling, kernel efficiency, and
+  launch gaps are all zero.
