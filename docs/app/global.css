@@ -60,6 +60,24 @@ pre,
   font-family: var(--font-quail-mono), monospace;
 }
 
+details {
+  margin: 1rem 0;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--color-fd-border);
+  border-radius: 0.5rem;
+  background: var(--color-fd-card);
+}
+
+details > summary {
+  cursor: pointer;
+  font-weight: 500;
+  font-size: 0.9rem;
+}
+
+details[open] > summary {
+  margin-bottom: 0.5rem;
+}
+
 html > body[data-scroll-locked] {
   margin-right: 0px !important;
   --removed-body-scroll-bar-size: 0px !important;

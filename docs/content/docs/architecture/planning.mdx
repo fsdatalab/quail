@@ -30,18 +30,21 @@ Implementation:
 ## Cost estimation
 
 To compare candidate plans, the planner needs a cost estimate for
-each one. Quail estimates cost using a roofline model: for each
+each one. Quail uses a **roofline (speed-of-light) model**: for each
 candidate plan, it counts the arithmetic work and HBM traffic the
 model would perform, then takes the larger of the compute time and
 memory time for each model component.
 
-The inputs to the cost model are:
+The SoL estimate answers: how fast could this query run if the GPU
+ran at peak throughput, all reusable KV fit in memory, and the CPU
+added no overhead? We use it both to choose between candidate plans
+and as a lower bound when evaluating measured runs.
+
+The inputs are:
 
 - The **model dimensions**: layers, hidden width, heads, weight
-  precision. These determine the FLOP count per token and the weight
-  bytes per forward pass.
-- The **device specs**: peak FLOP/s and HBM bandwidth. These
-  determine how fast the GPU can do the work.
+  precision.
+- The **device specs**: peak FLOP/s and HBM bandwidth.
 - The **query's token counts**: how many documents, how long each
   one is, how many predicates, and the estimated selectivities.
 
@@ -49,19 +52,10 @@ The cost model uses no fitted parameters and no measurements from
 previous Quail runs. It computes directly from the hardware
 datasheet and the model architecture.
 
-## Speed of light estimate
-
-The speed of light (SoL) is the cost estimate applied to an ideal
-plan: one that assumes peak hardware throughput, unlimited KV
-capacity, and zero host overhead. No real execution reaches it
-because those assumptions cannot all hold simultaneously. It is
-useful as a lower bound when evaluating how close a measured run
-gets to the hardware limit.
-
 Implementation:
 [quail/planner/sol.py](https://github.com/fsdatalab/quail/blob/main/quail/planner/sol.py).
 
-## Notation
+### Notation
 
 | Symbol | Meaning | Qwen3 4B fp8 | Qwen3 32B fp8 |
 |---|---|---|---|
@@ -103,7 +97,7 @@ and we run dense. Projections use FP8; attention uses BF16
 (FlashAttention-3 over BF16 KV). The two precisions have different
 peak rates.
 
-## KV reuse rule
+### KV reuse rule
 
 Every document has a **prefix**: the shared preamble `p` plus the
 document text $d_i$. In this model, a document's prefix KV is
@@ -121,13 +115,18 @@ In the equations below, KV reuse appears as the difference between
 the stage 1 token count (which includes $d_i$) and the stage `s > 1`
 token count (which does not).
 
-## Counting the work
+### Counting the work
 
-The estimate tracks four quantities across the whole query: fresh
-tokens through the forward pass, scored (query, key) attention pairs
-per layer, KV rows written, and KV rows read.
+For each candidate plan, the model counts four quantities:
 
-### Filter chains
+| Quantity | What it counts |
+| --- | --- |
+| Fresh tokens | Input token positions processed by the model (not read from KV). |
+| Attention pairs | (query, key) dot products per layer. |
+| KV written | Token positions whose KV is stored. |
+| KV read | Token positions whose KV is read back from memory. |
+
+#### Filter chains
 
 **Stage 1** processes every document from scratch:
 
@@ -186,7 +185,7 @@ The SoL calculation uses ground-truth labels to determine the exact
 set $A_s$ at each stage, because the surviving document lengths
 affect the attention pair count.
 
-### Joins
+#### Joins
 
 One side is the **anchor**. Its prefix KV stays resident while every
 partner's suffix is evaluated against it. The anchor frame is $f_a$
@@ -237,7 +236,7 @@ computes each long prefix once. Anchoring the short side puts a full
 copy of every long document into every tuple suffix. The estimate
 checks both feasible anchor choices for each join.
 
-### Multiple joins
+#### Multiple joins
 
 All filters run before joins. A filtered alias has reusable prefix
 KV when the join search starts. An unfiltered alias gains reusable
@@ -254,7 +253,7 @@ The DP state is `(S, K)`: `S` is the set of aliases already joined,
 pruned only if another state dominates it in all four work
 quantities (tokens, pairs, KV writes, KV reads).
 
-## Computing SoL
+### Computing the estimate
 
 The forward pass count is:
 
@@ -309,30 +308,16 @@ All query work is aggregated before computing the forward pass count.
 Filter and join boundaries do not start separate passes in SoL.
 Each component reads its weights once per ideal forward pass.
 
-### Derived metrics
+#### Derived metrics
 
+- **GPU cost** = (SoL / 3600) × H100 price per hour
+- **Filter throughput** = input documents / SoL
+- **Join throughput** = total evaluated pairs across join stages / SoL
 
-$$
-\mathrm{GPU cost} = \frac{\mathrm{SoL}}{3600} \times \mathrm{H100 price per hour}
-$$
+These are values at the speed of light. They are not measured Quail
+metrics.
 
-
-
-$$
-\mathrm{filter throughput} = \frac{\mathrm{input documents}}{\mathrm{SoL}}
-$$
-
-
-
-$$
-\mathrm{join throughput} = \frac{\sum \mathrm{evaluated pairs across join stages}}{\mathrm{SoL}}
-$$
-
-
-These are the SoL values of these metrics. They are not measured
-Quail metrics.
-
-## Implementation
+### Implementation
 
 | Module | What it does |
 |---|---|
@@ -353,29 +338,21 @@ implement the work counts:
 | `stream(prefix, suffixes)` | A join's tuples: `ask` per suffix, one prefix read |
 
 The public entry point is
-[$quail.speed_of_light_estimate(query, answer)$](https://github.com/fsdatalab/quail/blob/main/quail/planner/estimate.py).
+[`quail.speed_of_light_estimate(query, answer)`](https://github.com/fsdatalab/quail/blob/main/quail/planner/estimate.py).
 It takes a query and an `answer(prompt, assignment)` callable that
 returns the TRUE or FALSE label for one (prompt, row) pair. The
 estimator runs filters in the planner's order, builds exact join
 relations from the labels, and searches join plans with
-[$optimize_left_deep()$](https://github.com/fsdatalab/quail/blob/main/quail/planner/leftdeep.py).
+[`optimize_left_deep()`](https://github.com/fsdatalab/quail/blob/main/quail/planner/leftdeep.py).
 
 The estimator does not call or simulate the production planner. The
 production planner imports the same work and component equations to
 rank its candidates, but its search and finite-KV policy are
 separate.
 
-## Assumptions
+### Assumptions
 
-- A reused anchor prefix is read once to append its frame. The framed
-  context is then read once for the entire partner stream. The
-  production executor may re-read when tuples span multiple chunks.
-  SoL does not count those extra reads.
-- KV capacity is unlimited. Every document prefix stays available.
-- Compute and memory overlap perfectly within each component (the
-  $\max$ terms).
-- Forward passes are packed across the entire query. Operator
-  boundaries do not add weight re-reads.
-- The join search covers eager binary full left-deep plans only.
-- Tokenizer time, host overhead, scheduling, kernel efficiency, and
-  launch gaps are all zero.
+- Unlimited KV capacity: every document prefix stays available.
+- Peak GPU throughput on every operation.
+- Zero host overhead, scheduling cost, and kernel launch gaps.
+- Left-deep binary full joins only (no bushy plans).

@@ -62,13 +62,15 @@ that rearranges the template into a fixed layout.
 <details>
 <summary>Example: filter prompt layout</summary>
 
-`PROMPT('Does this review mention a positive aspect?\n\n{0}', r.body)`
-
 ```text
+PROMPT('Does this review mention a positive aspect?\n\n{0}', r.body)
+
+Sent to the model as:
+
 DOCUMENT:
 A beautiful film with outstanding performances...
-
-Evaluate TRUE or FALSE for the following question:  Does this review mention a positive aspect?
+Evaluate TRUE or FALSE for the following question:
+Does this review mention a positive aspect?
 ANSWER:
 ```
 
@@ -91,27 +93,28 @@ cue are new.
 <details>
 <summary>Example: join prompt layout</summary>
 
-`PROMPT('Does the review discuss this aspect?\n\nReview: {0}\nAspect: {1}', r.body, a.aspect)` with anchor `r`
-
 ```text
-DOCUMENT {0}:
+PROMPT('Does the review discuss this aspect?\n\n{0}\n\n{1}', r.body, a.aspect)
+anchor: r
+
+Sent to the model as:
+
+DOCUMENT {0}:                                      ← anchor (r.body)
 A beautiful film with outstanding performances...
-
+                                                    ← anchor frame (computed once)
 (The document above is DOCUMENT {0}.)
-
-Evaluate TRUE or FALSE for the following question: Does the review discuss this aspect?
-
+Evaluate TRUE or FALSE for the following question:
+Does the review discuss this aspect?
 Review: {0}
 Aspect: {1}
 
-DOCUMENT {1}:
+DOCUMENT {1}:                                      ← partner (a.aspect)
 the acting
 ANSWER:
 ```
 
-Everything above `DOCUMENT {1}:` is the anchor's KV. It is computed
-once per anchor document. Each partner adds only the lines from
-`DOCUMENT {1}:` onward.
+Everything above `DOCUMENT {1}:` is the anchor's KV, computed once.
+Each partner adds only `DOCUMENT {1}:` onward.
 
 </details>
 
@@ -137,7 +140,25 @@ class LogicalOptimizerRule(Protocol):
     def rewrite(self, node, context) -> LogicalNode | None: ...
 ```
 
-`apply_logical_rules` walks the plan bottom-up and offers every
-node to every registered rule. A rule returns a replacement node or
-`None` to leave it unchanged. Quail has no built-in logical rules
-today. The mechanism exists for extensions.
+`apply_logical_rules` rewrites the plan recursively: it rewrites
+all children first, then offers the current node to every registered
+rule. All rules are applied to every node. A rule returns a
+replacement node or `None` to leave it unchanged.
+
+Quail includes one built-in logical rule:
+
+- **[Projection pushdown](https://github.com/fsdatalab/quail/blob/main/quail/logical_rules.py)**
+  (`ProjectionPushdown`): rewrites each `Scan` to load only the
+  columns the query actually uses.
+
+Other optimizations like filter ordering and join ordering currently
+happen in the [planner](/docs/architecture/planning), because they
+depend on cost estimates from the model and device specs. They could
+also be expressed as logical rules.
+
+Filter placement (filters above their scans, before joins) is
+handled during plan construction in
+[`LogicalPlanBuilder`](https://github.com/fsdatalab/quail/blob/main/quail/logical.py).
+
+Extensions can register additional rules through
+`registry.register_logical_rule(...)`.

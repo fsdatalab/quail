@@ -2,10 +2,10 @@
 title: Physical plans
 ---
 
-A physical plan is a directed acyclic graph of typed nodes. The
-planner produces it from the logical plan, and the runner executes
-it. You can inspect, edit, and re-run the plan before or after
-execution.
+The planner converts the logical plan into a physical plan: a
+graph of typed nodes that specifies exactly what the GPU and CPU
+execute. Each node has typed input and output ports, so the graph
+can be validated, serialized, and edited before execution.
 
 ## Structure
 
@@ -29,23 +29,26 @@ class PhysicalNode:
 
 ### Node types
 
+All node types are defined in
+[physical/nodes.py](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py).
+
 **Generic nodes** (used by all backends):
 
 | Node | What it does |
 | --- | --- |
-| `Scan` | Names one tokenized input by alias. |
-| `Barrier` | Materializes survivor ids between join steps. |
-| `Exchange` | Routes documents across GPUs. |
-| `Recombine` | Joins TRUE answer tables using Arrow. |
-| `Project` | Reads the selected columns for surviving rows. |
-| `Limit` | Truncates the result. |
+| [`Scan`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Names one tokenized input by alias. |
+| [`Barrier`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Materializes survivor ids between join steps. |
+| [`Exchange`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Routes documents across GPUs. |
+| [`Recombine`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Joins TRUE answer tables using Arrow. |
+| [`Project`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Reads the selected columns for surviving rows. |
+| [`Limit`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Truncates the result. |
 
 **Quail backend nodes**:
 
 | Node | What it does |
 | --- | --- |
-| `AiFilter` | Runs filter stages on the GPU. |
-| `AiJoin` | Runs join stages on the GPU. |
+| [`AiFilter`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Runs filter stages on the GPU. |
+| [`AiJoin`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Runs join stages on the GPU. |
 
 ### Node ids
 
