@@ -67,11 +67,12 @@ contract asks for.
   `plots/quailb_fev.pdf` are regenerated from the same volume files;
   the other dataset figures do not change.
 - Two per-pair Python loops on Quail's side of scoring are now Arrow
-  and numpy work: the runner's row-index-to-id mapping (`pc.take`) and
-  the Quail backend's join answer table assembly in
-  `quail/execution.py`, which now visits anchors in Python and pairs in
-  numpy. Timed on a synthetic 2,000,000-pair join: 0.7 s to 0.1 s and
-  0.9 s to 0.1 s. The September 12 run evaluated 3.15 million pairs
+  work: the runner's row-index-to-id mapping (`pc.take`) and the Quail
+  backend's join answer table assembly in `quail/execution.py`, which
+  visits anchors in Python and hands the pairs to Arrow through
+  `itertools.chain`, `pa.array`, and one `pc.take` for the partner ids.
+  Timed on a synthetic 2,000,000-pair join: 0.7 s to 0.1 s and 0.9 s to
+  0.2 s. The September 12 run evaluated 3.15 million pairs
   in total at scale 0.1, so this matters at scale 1.0, where one join
   has 20.7 million pairs.
 - The quail-bench side of the same problem is quail-bench pull request
