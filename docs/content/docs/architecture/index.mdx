@@ -47,7 +47,24 @@ who want to understand what happens between `session.sql(...)` and
 - [Execution](/docs/architecture/execution): pipelining,
   token-based admission, KV rewind, packed joins, multi-GPU, and
   session lifetime.
-- [Design decisions](/docs/architecture/design-decisions): why the
-  engine is structured the way it is.
 - [The speed of light model](/docs/architecture/sol-model): how the
   ideal-work estimate is computed.
+
+## Design decisions
+
+- **No public KV interface.** A model backend owns its scheduler, KV
+  layout, allocation, retention, and eviction. These depend on each
+  other and should change together.
+- **One model copy per GPU.** Quail does not split a model across
+  GPUs. This keeps per-GPU execution self-contained.
+- **Fixed join order.** Join order and anchors are decided before
+  inference, not adapted during execution. This makes plans
+  predictable and readable.
+- **Operator-at-a-time with streaming inside operators.** Quail
+  finishes each physical operator before starting the next, but
+  within a filter or join, documents stream through their predicates
+  without waiting.
+- **Built-in code uses the same interfaces as extensions.** There is
+  no privileged internal API.
+- **No Modal integration.** Quail runs inside a Modal function like
+  any other Python library. It does not depend on Modal.
