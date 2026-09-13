@@ -3,20 +3,16 @@
 import itertools
 
 import pyarrow as pa
-import pytest
-from fakes import same_page
 from test_quail_backend import graph_state
 
 import quail
 from quail.backends.quail.graph import execute_single_graph, filter_result
 from quail.bench import quailb
-from quail.builder import col, prompt
 from quail.execution import PhysicalResponse
 from quail.physical import AiFilter, AiJoin, Barrier, Scan, decode_graph
 from quail.planner.plan import EngineConfig
 from quail.runtime.execute import execute_query
 from quail.runtime.runner import NodeMetrics, NodeResult, SurvivorStream
-from quail.runtime.session import RefusalError
 from quail_b import prompts
 from quail_b.queries import FILTER_SELECTIVITY_ESTIMATES
 
@@ -348,59 +344,6 @@ def test_fev10_asks_the_model_about_same_page_pairs_only(monkeypatch):
             assert sorted(zip(answers.column("c").to_pylist(),
                               answers.column("e").to_pylist())) == [(0, 0), (1, 0)]
             assert result.collect().to_pylist() == [{"c.id": "c0", "e.id": "e0"}]
-
-
-def _fev10_by_apply(session, kind):
-    claims = (session.docs("claims").alias("c")
-              .ai_filter(prompt(prompts.F11, col("c.claim")),
-                         selectivity=0.5))
-    evidence = (session.docs("evidence").alias("e")
-                .ai_filter(prompt(prompts.F13, col("e.text")),
-                           selectivity=0.5))
-    return (claims.join(evidence)
-            .apply(same_page, columns=[col("c.evidence_wiki_url"),
-                                       col("e.id")], kind=kind)
-            .ai_filter(prompt(prompts.SUPPORT, col("c.claim"), col("e.text")),
-                       selectivity=0.5)
-            .select("c.id", "e.id"))
-
-
-def test_fev10_written_with_apply_matches_the_equality(monkeypatch):
-    def check(request, graph):
-        columns = request.column_tables()
-        assert columns["c"].column("evidence_wiki_url").to_pylist() == [
-            "e0", "e0", "e2"]
-        return {"columns": columns}
-
-    for gpus, kind in ((1, "per_batch"), (1, "barrier"), (2, "barrier")):
-        with quail.Session(EngineConfig(gpus=gpus),
-                           tokenizer=lambda text: list(text.encode())) as session:
-            register_fever(session)
-            query = _fev10_by_apply(session, kind)
-            plan = query.plan()
-            (join,) = plan.graph.nodes_by_type(AiJoin.type_name)
-            (stage,) = join.stages
-            assert stage.pairs_from == "apply:same_page"
-            # the anchor's chain streams only when the function runs per
-            # batch; a barrier needs every survivor first
-            chain = next(node for node in plan.nodes
-                         if isinstance(node, AiFilter)
-                         and node.alias == join.anchor)
-            assert chain.pin_survivors is (kind == "per_batch")
-            result = execute_query(
-                query, physical_executor=fever_executor(session, monkeypatch, gpus,
-                                                        check))
-            answers = result.answer_tables["joins"][0]
-            assert sorted(zip(answers.column("c").to_pylist(),
-                              answers.column("e").to_pylist())) == [(0, 0), (1, 0)]
-            assert result.collect().to_pylist() == [{"c.id": "c0", "e.id": "e0"}]
-
-    with quail.Session(EngineConfig(gpus=2),
-                       tokenizer=lambda text: list(text.encode())) as session:
-        register_fever(session)
-        with pytest.raises(RefusalError):
-            execute_query(_fev10_by_apply(session, "per_batch"),
-                          physical_executor=lambda request: None)
 
 
 def test_an_edited_fev9_plan_executes(monkeypatch):

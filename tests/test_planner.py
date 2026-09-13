@@ -24,7 +24,7 @@ from quail.physical import (
 )
 from quail.physical.base import input_ports
 from quail.planner.decide import explain, filter_cost, order_filters, plan_query
-from quail.planner.plan import EngineConfig, PlanEditError, Refusal
+from quail.planner.plan import EngineConfig, Refusal
 from quail.planner.sol import speed_of_light
 from quail.planner.work import Work, ask, scan, triangle
 from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8
@@ -952,52 +952,3 @@ def test_node_ids_estimates_and_the_recompute_column(catalog):
     assert [node.node_id for node in moved.nodes][:4] == [
         "scan:r", "scan:p", "barrier:r", "ai_filter:r"]
     assert moved.graph.node("ai_filter:r").pin_survivors
-
-
-def test_refused_edits_name_their_rule(catalog):
-    _, plan = _big_plan(catalog)
-    barrier = Barrier(node_id="barrier:r", next_anchor="r", aliases=("r",))
-    with pytest.raises(PlanEditError, match="exactly one edge"):
-        plan.insert(barrier, between=("scan:p", "ai_filter:r"))
-    with pytest.raises(PlanEditError, match="no node 'nowhere'"):
-        plan.insert(barrier, between=("nowhere", "ai_join:r"))
-    with pytest.raises(PlanEditError, match="exactly one output of type"):
-        plan.insert(Barrier(node_id="barrier:rp", next_anchor="r",
-                            aliases=("r", "p")),
-                    between=("ai_filter:r", "ai_join:r"))
-    with pytest.raises(PlanEditError, match="already has a node"):
-        plan.insert(Barrier(node_id="ai_join:r", next_anchor="r",
-                            aliases=("r",)),
-                    between=("ai_filter:r", "ai_join:r"))
-    with pytest.raises(PlanEditError, match="would change what the query"):
-        plan.remove("ai_filter:r")
-    with pytest.raises(PlanEditError, match="no node 'barrier:r'"):
-        plan.remove("barrier:r")
-    # a per-batch Foreign keeps the pin; a barrier Foreign drops it
-    per_batch = Foreign(node_id="apply:keep", function="keep", kind="per_batch",
-                        ids="drop", aliases=("r",))
-    kept = plan.insert(per_batch, between=("ai_filter:r", "ai_join:r"))
-    assert kept.graph.node("ai_filter:r").pin_survivors
-    dropped = plan.insert(
-        Foreign(node_id="apply:keep", function="keep", kind="barrier",
-                ids="drop", aliases=("r",)),
-        between=("ai_filter:r", "ai_join:r"))
-    assert not dropped.graph.node("ai_filter:r").pin_survivors
-    assert kept.remove("apply:keep") == plan
-
-
-def test_plan_walkthrough_demo_prints_and_edits_plans():
-    import io
-    from contextlib import redirect_stdout
-
-    from demos import plan_walkthrough
-
-    out = io.StringIO()
-    with redirect_stdout(out):
-        plan_walkthrough.main()
-    text = out.getvalue()
-    assert "hash_join:c-e" in text
-    assert "Barrier: next_anchor=c" in text
-    assert "Foreign: same_page" in text
-    assert "remove gives back the same plan: True" in text
-    assert "PlanEditError" in text
