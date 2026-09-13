@@ -59,29 +59,29 @@ Implementation:
 
 | Symbol | Meaning | Qwen3 4B fp8 | Qwen3 32B fp8 |
 |---|---|---|---|
-| `p` | Shared preamble tokens (on every document) | 2 | 2 |
+| $p$ | Shared preamble tokens (on every document) | 2 | 2 |
 | $d_i$ | Tokens in document `i` | corpus | corpus |
 | $q_s$ | Tokens in filter stage `s`'s question | 41–62 | 41–62 |
 | $f_a$ | Join frame tokens after anchor `a` | 36–42 | 36–42 |
 | $u_b$ | One join tuple suffix for partner `b` | corpus | corpus |
 | $A_s$ | Documents entering stage `s` | $A_1$ = all | $A_1$ = all |
-| `T(n)` | $\frac{n(n+1)}{2}$, causal self-attention pairs | | |
+| $T(n)$ | $\frac{n(n+1)}{2}$, causal self-attention pairs | | |
 | $P_A$ | Attention projection parameters (Q, K, V, output) | 943,718,400 | 6,039,797,760 |
 | $P_M$ | MLP parameters (gate, up, down) | 2,689,597,440 | 25,165,824,000 |
-| `L` | Layers | 36 | 64 |
+| $L$ | Layers | 36 | 64 |
 | $n_q, d_\mathrm{head}$ | Query heads, head dimension | 32, 128 | 64, 128 |
 | $\kappa$ | KV bytes per token: $2 \cdot L \cdot n_{kv} \cdot d_\mathrm{head} \cdot 2$ | 147,456 | 262,144 |
 | $b_w$ | Bytes per weight | 1 | 1 |
 | $R_\mathrm{dense}$ | FP8 dense peak FLOP/s | $1.979 \times 10^{15}$ | $1.979 \times 10^{15}$ |
 | $R_\mathrm{attn}$ | BF16 dense peak FLOP/s | $0.9895 \times 10^{15}$ | $0.9895 \times 10^{15}$ |
 | $\mathrm{BW}$ | HBM bandwidth (bytes/s) | $3.35 \times 10^{12}$ | $3.35 \times 10^{12}$ |
-| `C` | Tokens per forward pass | 110,376 | 41,943 |
+| $C$ | Tokens per forward pass | 110,376 | 41,943 |
 
-`p`, $d_i$, and $q_s$ are the same for both models because all Qwen3
+$p$, $d_i$, and $q_s$ are the same for both models because all Qwen3
 models share one tokenizer. The hardware rows are the same because
 both run on an H100 SXM.
 
-`C` is the maximum tokens per forward pass, set by the fused kernels'
+$C$ is the maximum tokens per forward pass, set by the fused kernels'
 32-bit index limit: $(2^{31} - 1)$ divided by the widest projection
 (19,456 columns at 4B, 51,200 at 32B). The 32B budget is about a
 quarter of the 4B budget, so the same query needs more forward passes
@@ -99,7 +99,7 @@ peak rates.
 
 ### KV reuse rule
 
-Every document has a **prefix**: the shared preamble `p` plus the
+Every document has a **prefix**: the shared preamble $p$ plus the
 document text $d_i$. In this model, a document's prefix KV is
 computed once and stays resident for the rest of the query.
 
@@ -112,7 +112,7 @@ The suffix KV is used once and removed. See
 [executor/pack.py](https://github.com/fsdatalab/quail/blob/main/quail/executor/pack.py).
 
 In the equations below, KV reuse appears as the difference between
-the stage 1 token count (which includes $d_i$) and the stage `s > 1`
+the stage 1 token count (which includes $d_i$) and the stage $s > 1$
 token count (which does not).
 
 ### Counting the work
@@ -148,7 +148,7 @@ $$
 $$
 
 
-**Stage `s > 1`** reuses the document prefix KV:
+**Stage $s > 1$** reuses the document prefix KV:
 
 
 $$
@@ -169,11 +169,11 @@ $$
 
 
 The difference between the two stages is KV reuse. In stage 1, the
-token count includes $d_i$. In stage `s > 1`, it does not — only
+token count includes $d_i$. In stage $s > 1$, it does not — only
 the question tokens $q_s$ are fresh. In the pairs count, $d_i$ appears only as the width of a
 rectangle ($q_s$ new tokens attending over the resident prefix).
-Without reuse, stage `s > 1` would repeat the full scan: `p + d_i +
-q_s` tokens and `T(p + d_i + q_s)` pairs.
+Without reuse, stage $s > 1$ would repeat the full scan: $p + d_i +
+q_s$ tokens and $T(p + d_i + q_s)$ pairs.
 
 <Callout type="info">
 **Example.** A query has two filters over 5,000 IMDB reviews. The
@@ -229,7 +229,7 @@ $$
 **KV write** equals all fresh tokens above. **KV read** per anchor
 (before its partner stream) adds $p + d_a + f_a$.
 
-Each tuple follows the same pattern as filter stage `s > 1`: a
+Each tuple follows the same pattern as filter stage $s > 1$: a
 rectangle over the resident context plus a triangle over the new
 tokens. Suffixes never attend to each other
 ([executor/pack.py](https://github.com/fsdatalab/quail/blob/main/quail/executor/pack.py)),
@@ -338,7 +338,7 @@ implement the work counts:
 | Function | What it computes |
 |---|---|
 | `scan(prefix, suffix)` | Stage 1: $(\mathrm{prefix} + \mathrm{suffix})$ tokens, $T(\mathrm{prefix} + \mathrm{suffix})$ pairs |
-| `ask(prefix, suffix)` | Stage `s > 1`: $\mathrm{suffix}$ tokens, $\mathrm{suffix} \cdot \mathrm{prefix} + T(\mathrm{suffix})$ pairs |
+| `ask(prefix, suffix)` | Stage $s > 1$: $\mathrm{suffix}$ tokens, $\mathrm{suffix} \cdot \mathrm{prefix} + T(\mathrm{suffix})$ pairs |
 | `stream(prefix, suffixes)` | A join's tuples: `ask` per suffix, one prefix read |
 
 The public entry point is
