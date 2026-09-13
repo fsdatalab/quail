@@ -1,79 +1,66 @@
 ---
 title: Introduction
-description: A query engine for AI functions in SQL.
+description: What Quail runs, how it saves model work, and where to start.
 ---
 
-Quail is a query engine for AI functions in SQL. Cloud warehouses now
-let a query call a language model per row: Snowflake's `AI_FILTER`,
-BigQuery's `AI.IF`, and their classify, extract, and aggregate
-relatives. Each call is scheduled and billed as an independent
-request. Quail treats those functions as query operators. It plans the
-whole query first, then schedules the model work so that documents
-share KV, forward passes stay full, and no row waits on a stage
-boundary.
+Quail runs language-model filters and joins over document collections.
+Write the query in Snowflake-style SQL, BigQuery-style SQL, or Python.
+Quail plans its model calls as one job instead of sending one independent
+request for each row.
 
 KV is the attention key and value tensors the model keeps for tokens
 it has already processed.
 
-## What Quail runs today
+## Supported queries
 
-- `AI_FILTER(PROMPT(...))` over one table: does this document satisfy
-  a true or false question?
-- `AI_FILTER(PROMPT(...))` across two or more tables: does this tuple
-  of documents, all in one prompt, satisfy a true or false question?
-  This is an AI join, including `EXISTS` and `NOT EXISTS` forms.
-- The same two shapes spelled as BigQuery's `AI.IF`.
+- Filters over one table with `AI_FILTER(PROMPT(...))`.
+- AI joins across two or more tables.
+- `EXISTS` and `NOT EXISTS` filters over an AI join.
+- The same query shapes with BigQuery's `AI.IF` or the Python builder.
 
 The model answers each question with a single token, TRUE or FALSE.
-Quail constrains the decode step to those two tokens, so no open-ended
-generation runs. Operators that return a label, a number, an extracted
-field, or a summary, such as classify, score, extract, and summarize,
-are the next step and are not built yet.
+Quail does not run open-ended generation, classification, extraction,
+or summarization.
 
-## What makes it a query engine
+## How Quail saves work
 
-- **Pipelining.** A document moves to the next filter question as soon
-  as it passes the current one, instead of waiting for a whole stage
-  to finish.
+- **Pipelining.** A document starts its next predicate as soon as it
+  passes the current one.
 - **Token-based admission.** The scheduler fills each forward pass by
-  token count and KV pages, not by request count, so every pass is
-  full.
-- **KV rewind.** A document's KV is computed once and stays on the GPU
-  while every later question about that document runs. Only the
-  question tokens are new work.
+  token count and available KV, rather than by request count.
+- **KV rewind.** A document's KV stays on the GPU for its later
+  predicates, so Quail does not compute the document prefix again.
 - **Packed joins.** One anchor document's KV is shared by every
-  partner in a forward pass, with gating and dedup between stages.
+  join partner in the same forward pass.
 
-## Scope
+## Runtime requirements
 
-- Models: Qwen3 4B fp8 and Qwen3 32B fp8.
-- Hardware: one H100 per model copy, 1, 2, 4, or 8 H100s in one Modal
-  container. Quail does not split one model across GPUs.
-- A query runs on the GPU in the calling process. On Modal, the GPU
-  function creates a normal session and runs the whole query there.
-- Stock vLLM, pipelined vLLM, and pipelined SGLang run the same
-  queries behind the same backend interface, for comparison.
+- Python 3.12.
+- Qwen3 4B fp8 or Qwen3 32B fp8.
+- A CUDA GPU in the process that runs the query.
+- One model copy per GPU. Quail does not split one model across GPUs.
+- A local GPU, or 1, 2, 4, or 8 H100s in one Modal container.
 
 ## Where to go next
 
 <Cards>
   <Card title="Quickstart" href="/docs/user-guide/quickstart"
-        description="Eight real IMDB reviews, a filter, a join, and the plans and reports they produce." />
+        description="Install Quail, run one filter, and inspect the result." />
   <Card title="SQL reference" href="/docs/user-guide/sql"
-        description="The AI SQL subset Quail accepts, with the benchmark's own predicates as examples." />
+        description="Every accepted filter, join, and prompt form." />
+  <Card title="Python API" href="/docs/user-guide/python-api"
+        description="Build the same queries without SQL." />
+  <Card title="Running on Modal" href="/docs/user-guide/compute"
+        description="Run the quickstart on an H100." />
   <Card title="Architecture" href="/docs/architecture"
-        description="How a query moves from SQL to a GPU and back." />
-  <Card title="Extending Quail" href="/docs/extending"
-        description="Table providers, backends, physical nodes, observers, each with working code." />
+        description="Follow a query from parsing to GPU execution." />
+  <Card title="QUAIL-B" href="/docs/user-guide/benchmark"
+        description="Compare Quail with stock and pipelined vLLM." />
 </Cards>
 
 ## How the documentation is organized
 
-- **User guide**: installing, writing queries, reading results, and
-  running on Modal.
-- **Architecture**: the logical and physical plans, the Quail backend,
-  the request backends, and query execution.
-- **Extending Quail**: the registry and each extension interface, with
-  working code from the test suite.
-- **Contributing**: repository layout, tests, experiment rules, and
-  writing rules.
+- **User guide:** installation, queries, data, results, and benchmarks.
+- **Architecture:** plans, backends, execution, and design decisions.
+- **Extending Quail:** providers, rules, physical nodes, and observers.
+- **Contributing:** repository layout, tests, experiments, and reports.

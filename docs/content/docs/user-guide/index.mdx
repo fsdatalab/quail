@@ -1,28 +1,26 @@
 ---
-title: Installation
-description: Setting up the Python package, with or without a local GPU.
+title: Install
+description: Install Quail and choose where its GPU process will run.
 ---
 
-Quail is a Python package managed with `uv`. It needs Python 3.12.
-All model execution requires a CUDA GPU, whether on your machine or on Modal.
-A query runs the model in the process that creates the session.
-To use Modal, create the session inside a Modal GPU function.
+Quail requires Python 3.12 and currently installs from this repository.
 
 ```bash
-git clone https://github.com/fsdatalab/quail-exploration
+git clone https://github.com/fsdatalab/quail-exploration.git
 cd quail-exploration
 uv sync
 ```
 
-`uv sync` installs the package and its dependencies: `sqlglot` for SQL
-parsing, `pyarrow` for tables and results, `transformers` and
-`bpe-qwen` for tokenization, `datasets` and `huggingface-hub` for
-Hugging Face sources, and on Linux the `vllm` runtime that loads the model.
-The default development dependencies include the `modal` client for demos
-and experiments. The engine package does not depend on Modal.
-vLLM publishes Linux wheels only, so on
-macOS and Windows the package installs without it. Submit a GPU function
-to Modal to run queries from those machines.
+All model execution requires a CUDA GPU. A query runs the model in the
+process that creates its `Session`.
+
+- On a GPU machine, create the session in your normal Python process.
+- On Modal, create the session inside a Modal GPU function.
+- On macOS or Windows, install the client dependencies locally and submit
+  the query to Modal. vLLM publishes Linux wheels only.
+
+The engine does not depend on Modal. The repository's development
+dependencies include the Modal client for the supplied examples.
 
 ## Local GPU
 

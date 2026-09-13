@@ -1,315 +1,152 @@
 ---
 title: Quickstart
-description: Eight real IMDB reviews, a filter, a join, and what Quail prints for each.
+description: Install Quail, run one filter, and inspect its result.
 ---
 
-All model execution requires a CUDA GPU. `demos/quickstart.py` runs QUAIL-B
-IMDB-1 on 100 published reviews on a GPU host. Its
-`quickstart_modal.py` wrapper runs the same code on Modal. See
-[Running on Modal](/docs/user-guide/compute).
+This quickstart runs QUAIL-B's IMDB-1 query over 100 published movie
+reviews. The query keeps reviews that mention at least one positive aspect
+of the movie.
 
-The saved outputs below are from the IMDB documentation example. Reproduce them with
-[`docs/examples/imdb_queries_modal.py`](https://github.com/fsdatalab/quail-exploration/blob/blogs/docs/examples/imdb_queries_modal.py)
-on an H100 through Modal, with Qwen3 4B fp8. The reviews are the first
-eight short reviews from the pinned `stanfordnlp/imdb` revision the
-QUAIL-B benchmark uses, and the questions are the benchmark's own
-predicates.
+Model execution requires a CUDA GPU. You can use a local GPU or submit the
+same code to a Modal H100.
 
-<Steps>
-<Step>
+## 1. Install
 
-## Load real documents
+Quail requires Python 3.12 and currently installs from this repository.
 
-```python
-import pyarrow as pa
-import pyarrow.parquet as pq
-from huggingface_hub import hf_hub_download
-
-path = hf_hub_download(
-    "stanfordnlp/imdb",
-    "plain_text/train-00000-of-00001.parquet",
-    repo_type="dataset",
-    revision="e6281661ce1c48d982bc483cf8a173c1bbeb5d31",
-)
-texts = pq.read_table(path, columns=["text"]).column("text").to_pylist()
-picked = [t for t in texts if 250 < len(t) < 600 and "<br" not in t][:8]
-
-reviews = pa.table({"id": [f"rv{i}" for i in range(8)], "body": picked})
-aspects = pa.table({
-    "id": [f"as{i}" for i in range(12)],
-    "aspect": ["the acting", "the plot", "the directing",
-               "the cinematography", "the soundtrack", "the pacing",
-               "the ending", "the dialogue", "the special effects",
-               "the character development", "the screenplay",
-               "the editing"],
-})
+```bash
+git clone https://github.com/fsdatalab/quail-exploration.git
+cd quail-exploration
+uv sync
 ```
 
-Three of the eight reviews, as the model sees them:
+## 2. Run the example
 
-```text
-rv0: My interest in Dorothy Stratten caused me to purchase this video.
-     Although it had great actors/actresses, there were just too many
-     subplots going on to retain interest. Plus it just wasn't that
-     interesting. Dialogue was stiff and confusing and the story just
-     flipped around too much to be believable. I was pretty disappointed
-     in what I believe was one of Audrey Hepburn's last movies. I'll
-     always love John Ritter best in slapstick. He was just too pathetic
-     here.
-rv1: I think I will make a movie next weekend. Oh wait, I'm working..oh
-     I'm sure I can fit it in. It looks like whoever made this film fit
-     it in. I hope the makers of this crap have day jobs because this
-     film sucked!!! It looks like someones home movie and I don't think
-     more than $100 was spent making it!!! Total crap!!! Who let's this
-     stuff be released?!?!?!
-rv2: Protocol is an implausible movie whose only saving grace is that it
-     stars Goldie Hawn along with a good cast of supporting actors. The
-     story revolves around a ditzy cocktail waitress who becomes famous
-     after inadvertently saving the life of an Arab dignitary. The story
-     goes downhill halfway through the movie and Goldie's charm just
-     doesn't save this movie. Unless you are a Goldie Hawn fan don't go
-     out of your way to see this film.
-```
+<Tabs items={['Local GPU', 'Modal H100']}>
+<Tab value="Local GPU">
 
-</Step>
-<Step>
-
-## Open a session and register the tables
-
-```python
-import quail
-
-session = quail.Session()
-session.register("reviews", quail.DocumentProvider.from_table(reviews, id_col="id"))
-session.register("aspects", quail.DocumentProvider.from_table(aspects, id_col="id"))
-```
-
-`Session()` selects the Quail backend, Qwen3 4B fp8, and one H100 for planning.
-The example runs these steps inside a Modal GPU function. See
-[Running on Modal](/docs/user-guide/compute) for submission code. `id_col` names the
-column that identifies a document. See [Configuration](/docs/user-guide/configuration) and
-[Data sources](/docs/user-guide/data-sources) for the other choices.
-
-</Step>
-<Step>
-
-## Write a filter
-
-The question is QUAIL-B's predicate F1. In SQL or with the builder:
-
-<Tabs items={['SQL', 'Python']}>
-<Tab value="SQL">
-
-```python
-query = session.sql("""
-    SELECT r.id
-    FROM reviews r
-    WHERE AI_FILTER(PROMPT('Judge strictly from the review above whether it mentions at least one positive aspect of the movie.
-
-{0}
-
-Instruction: answer TRUE if the review mentions at least one positive aspect of the movie, FALSE otherwise.', r.body))
-""")
+```bash
+uv run python demos/quickstart.py
 ```
 
 </Tab>
-<Tab value="Python">
+<Tab value="Modal H100">
 
-```python
-from quail import col, prompt
+Set up the Modal client once:
 
-F1 = ("Judge strictly from the review above whether it mentions at "
-      "least one positive aspect of the movie.\n\n{0}\n\nInstruction: "
-      "answer TRUE if the review mentions at least one positive aspect "
-      "of the movie, FALSE otherwise.")
-
-query = (session.docs("reviews").alias("r")
-         .ai_filter(prompt(F1, col("r.body")))
-         .select("r.id"))
+```bash
+uv run modal setup
 ```
+
+Then submit the example and keep its full log:
+
+```bash
+mkdir -p results
+uv run modal run demos/quickstart_modal.py \
+  2>&1 | tee results/quickstart.log
+```
+
+The command prints a Modal function call id before waiting for the result.
+Keep that id in the log so you can retrieve the call after a disconnect.
 
 </Tab>
 </Tabs>
 
-Both build the same logical plan. The text before `{0}` becomes the
-question suffix after the document, so the document's tokens do not
-depend on the question.
+The example prints the matching review ids and an execution report. On a
+first run, model startup is reported separately from query time.
 
-</Step>
-<Step>
+## 3. Read the query
 
-## Look at the plan
+[`demos/quickstart.py`](https://github.com/fsdatalab/quail-exploration/blob/main/demos/quickstart.py)
+does four things:
+
+```python
+import quail
+import quail_b as benchmark
+from quail.bench.quailb import build_query
+
+reviews = benchmark.load_table("reviews", limit=100)
+spec = benchmark.get_query("IMDB-1")
+
+with quail.Session() as session:
+    session.register(
+        "reviews",
+        quail.DocumentProvider.from_table(reviews, id_col="id"),
+    )
+    query = build_query(session, spec)
+    result = query.run()
+    rows = result.collect()
+    report = result.report
+```
+
+1. QUAIL-B downloads the public IMDB table and selects 100 reviews.
+2. `Session.register()` gives the Arrow table the SQL name `reviews`.
+3. `build_query()` reads IMDB-1's saved Substrait plan into Quail.
+4. `run()` executes the filter. `collect()` returns an Arrow table.
+
+The equivalent SQL has this shape:
+
+```sql
+SELECT r.id
+FROM reviews r
+WHERE AI_FILTER(PROMPT(
+  'Does the review in DOCUMENT {0} mention a positive aspect of the movie?',
+  r.body
+))
+```
+
+The benchmark uses a longer, fixed prompt for scoring. Both versions ask one
+true-or-false question about each review.
+
+## 4. Inspect the result
+
+`Query.run()` returns a `QueryResult`:
+
+```python
+rows = result.collect()     # pyarrow.Table
+count = result.count()      # number of matching rows
+metrics = result.report     # query time, token counts, and stage metrics
+```
+
+Start with these report fields:
+
+| Field | Meaning |
+| --- | --- |
+| `wall_s` | Query time in seconds, excluding model startup. |
+| `boot_s` | Model startup time. |
+| `fresh_tokens` | Input tokens computed in model forward passes. |
+| `stages` | Rows or pairs evaluated and kept at each filter or join. |
+| `node_metrics` | Metrics for each physical plan node. |
+
+See [Results and explain](/docs/user-guide/results) for every result method
+and report field.
+
+## 5. Inspect the plan without a GPU run
+
+Call `explain()` before `run()`:
 
 ```python
 print(query.explain())
 ```
 
-```text
-logical:
-  Project: r.id
-    SemanticFilter
-      PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the review above ...', r.body) (selectivity=unknown)
-      Scan reviews as r [body, id]
+The output has two parts:
 
-physical: (backend=quail, model=qwen3-4b-fp8, workers=1)
-  KV=bf16, chunk budget=110,376 tokens, admission budget=362,250 tokens
-  node seconds price each node's work alone; they do not add up to the plan estimate because chunk packing shares forward passes across nodes
-  Project: r.id (estimated_rows=unknown)
-    AiFilter: r (estimated_rows=unknown, estimated_seconds=0.004)
-      KV: not stored
-      1. PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the review above ...', r.body) (selectivity=unknown, question_tokens=51)
-      Scan reviews as r (estimated_rows=8)
-        tokens=693, mean_doc_tokens=86.6
+- The logical plan shows the query's filters, joins, scans, and projection.
+- The physical plan shows the chosen backend, token budgets, expected row
+  counts, KV reuse, and estimated model time.
 
-  note: token counts for 'r' are estimated from a 1024 document sample
-```
+Planning tokenizes a sample of each document column, but it does not execute
+the model.
 
-This ran on the client with no GPU. It planned one `AiFilter` node
-with a 51-token question over the eight reviews (693 tokens), priced
-it at 4 milliseconds of model time, and noted that with a single stage
-nothing reads the KV again, so the KV is not stored. The prompt text
-is shortened here with `...`; `explain()` prints all of it. The first
-`explain()` on a column estimates its token count from a sample and
-says so on the last line; with eight reviews the sample is the whole
-table, so 693 is exact.
+## Next steps
 
-</Step>
-<Step>
-
-## Run it
-
-```python
-result = query.run()
-print(result.to_rows())
-```
-
-```text
-function call id: fc-01M1NGA090GPB4Y80XPG2P6H9G
-[('rv0',), ('rv2',), ('rv3',), ('rv5',)]
-```
-
-Four of the eight reviews mention at least one positive aspect. rv0
-praises the actors and John Ritter, rv2 calls Goldie Hawn the film's
-saving grace. The function call id is Modal's handle on this run; keep
-it in your log.
-
-The report says what the run cost:
-
-```python
-report = result.report
-print(report["wall_s"], report["boot_s"], report["boot_kind"], report["fresh_tokens"])
-print(report["stages"])
-```
-
-```text
-1.3 19.25 cold 1117
-[{'op': 'filter', 'alias': 'r', 'stage': 0, 'provided_selectivity': None,
-  'observed_selectivity': 0.5, 'evaluated': 8}]
-```
-
-The query took 1.3 seconds once the model was loaded. The cold load
-took 19.25 seconds and is reported separately. The model computed
-1,117 fresh tokens: 693 for the documents plus the question suffix for
-each. [Results and explain](/docs/user-guide/results) lists every key.
-
-</Step>
-<Step>
-
-## Join reviews to aspects
-
-The join asks, for each surviving review and each of the twelve
-aspects, whether the review discusses that aspect. It is QUAIL-B's
-IMDB-3 shape: filter F1, then the `DISCUSS_ASPECT` join.
-
-```python
-pairs = session.sql("""
-    SELECT r.id, a.aspect
-    FROM reviews r
-    JOIN aspects a
-      ON AI_FILTER(PROMPT('Does the review in DOCUMENT {0} discuss the movie aspect in DOCUMENT {1}?', r.body, a.aspect),
-                   {'selectivity': 0.15})
-    WHERE AI_FILTER(PROMPT('Judge strictly from the review above whether it mentions at least one positive aspect of the movie.
-
-{0}
-
-Instruction: answer TRUE if the review mentions at least one positive aspect of the movie, FALSE otherwise.', r.body), {'selectivity': 0.6})
-""").run()
-print(pairs.collect().to_pandas().to_string(index=False))
-```
-
-```text
-function call id: fc-01M1NGBWM5Q78NEHG251JZ58D6
-r.id       a.aspect
- rv0     the acting
- rv0       the plot
- rv0     the pacing
- rv0   the dialogue
- rv0 the screenplay
- rv2     the acting
- rv2       the plot
- rv2  the directing
- rv2     the pacing
- rv2    the editing
-```
-
-The plan for this query streams each filter survivor into the join
-with its KV still in the arena, so the join packs no document tokens
-again:
-
-```text
-  Project: r.id, a.aspect (estimated_rows=unknown)
-    AiJoin: anchor=r (estimated_rows=unknown, estimated_seconds=0.003)
-      KV: anchor=streamed from its filter, retain after join=no
-      1. full (r, a): PROMPT('Does the review in DOCUMENT {0} discuss the movie aspect in DOCUMENT {1}?', r.body, a.aspect) (selectivity=15%, estimated_evaluations=57.6)
-      AiFilter: r (estimated_rows=4.8, estimated_seconds=0.004)
-        survivors stream into the join with KV pinned
-        1. PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the review above ...', r.body) (selectivity=60%, question_tokens=51)
-        if the KV were released here instead of pinned: 0 tokens, 0.000 s
-        Scan reviews as r (estimated_rows=8)
-          tokens=693, mean_doc_tokens=86.6
-      Scan aspects as a (estimated_rows=12)
-        tokens=27, mean_doc_tokens=2.2
-```
-
-The line under the filter says what pinning saves: releasing the KV
-here would cost nothing on eight reviews, because every survivor fits
-the retention pool. On a large table that number grows, and
-[physical plans](../architecture/physical-plans) shows how to read it.
-
-And the report confirms it happened:
-
-```text
-wall_s: 1.53   boot_kind: warm   fresh_tokens: 1849
-stages:
-  filter r   evaluated 8   observed_selectivity 0.5
-  join r x a evaluated 48 tuples   observed_selectivity 0.2083
-kv_manager:
-  retained_after_filters 4   join_anchor_hits 4   join_anchor_misses 0
-```
-
-The second query found a warm container, so `boot_s` is 0. The join
-evaluated 48 tuples (4 surviving reviews times 12 aspects) and every
-anchor hit KV left by the filter. 10 pairs passed.
-
-</Step>
-<Step>
-
-## Close the session
-
-```python
-session.close()
-```
-
-Or run everything under `with quail.Session(...) as session:`. Closing
-lets the Modal function scale to zero and removes the temporary token
-files.
-
-</Step>
-</Steps>
-
-<Callout title="Reproduce it">
-`uv run modal run docs/examples/imdb_queries_modal.py 2>&1 | tee results/docs_quickstart.log`
-prints everything above. The two run records are on the `quail-results`
-volume at `/results/runs/run_1788501944354367580.json` and
-`/results/runs/run_1788501955612819646.json`.
-</Callout>
+<Cards>
+  <Card title="Write SQL" href="/docs/user-guide/sql"
+        description="Filters, joins, prompts, EXISTS, and refused syntax." />
+  <Card title="Use Python" href="/docs/user-guide/python-api"
+        description="Build the same logical plans without SQL." />
+  <Card title="Load your data" href="/docs/user-guide/data-sources"
+        description="Register Arrow, Parquet, and Hugging Face tables." />
+  <Card title="Run on Modal" href="/docs/user-guide/compute"
+        description="Configure the GPU function, caches, and result storage." />
+</Cards>

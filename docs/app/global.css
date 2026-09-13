@@ -6,6 +6,16 @@ html {
   scrollbar-gutter: stable;
 }
 
+body {
+  font-family: var(--font-quail-sans), sans-serif;
+}
+
+code,
+pre,
+.font-mono {
+  font-family: var(--font-quail-mono), monospace;
+}
+
 html > body[data-scroll-locked] {
   margin-right: 0px !important;
   --removed-body-scroll-bar-size: 0px !important;
