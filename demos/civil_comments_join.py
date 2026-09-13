@@ -36,8 +36,15 @@ DATASET = "pietrolesci/civilcomments-wilds"
 DATASET_REVISION = "c227534cc0a34cf21db6a0bf0edd0f9050c8b305"
 DATASET_FILE = "raw/train-00000-of-00001.parquet"
 
-# Score column -> the statement the model judges. Toxicity is the filter.
-TOXIC = "is toxic"
+# The filter question. Text before {0} is the criterion; it is moved after
+# the comment by Quail so the comment's KV does not depend on the question.
+FILTER_PROMPT = """Judge strictly from the comment above whether it is among the most toxic comments on a news site: hateful, threatening, or abusive, not merely rude or opinionated.
+
+{0}
+
+Instruction: answer TRUE if the comment is among the most toxic, FALSE otherwise."""
+
+# Score column -> the statement the model judges for each toxic comment.
 FIELDS = {
     "severe_toxicity": "is very hateful, aggressive, or disrespectful, far "
                        "beyond ordinary rudeness",
@@ -97,8 +104,8 @@ JOIN_PROMPT = ("Judge strictly whether the description in DOCUMENT {1} "
                "applies to the comment in DOCUMENT {0}.")
 
 
-def build_sql(criterion: str = TOXIC, filter_only: bool = False) -> str:
-    """Return the query; criterion completes "whether the comment ..."."""
+def build_sql(filter_only: bool = False) -> str:
+    """Return the query, or the toxicity filter alone."""
     join = "" if filter_only else f"""
     JOIN fields f
       ON AI_FILTER(PROMPT('{JOIN_PROMPT}', c.text, f.statement),
@@ -106,13 +113,7 @@ def build_sql(criterion: str = TOXIC, filter_only: bool = False) -> str:
     return f"""
     SELECT c.comment_id{"" if filter_only else ", f.field"}
     FROM comments c{join}
-    WHERE AI_FILTER(
-            PROMPT('Judge strictly from the comment above whether it {criterion}.
-
-{{0}}
-
-Instruction: answer TRUE if the comment {criterion}, FALSE otherwise.', c.text),
-            {{'selectivity': 0.113}})
+    WHERE AI_FILTER(PROMPT('{FILTER_PROMPT}', c.text), {{'selectivity': 0.113}})
 """
 
 
@@ -172,8 +173,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--parquet", help="a file with the Kaggle columns")
     parser.add_argument("--limit", type=int, help="random sample of N comments")
-    parser.add_argument("--criterion", default=TOXIC,
-                        help="filter wording; completes 'whether the comment'")
     parser.add_argument("--filter-only", action="store_true",
                         help="run the toxicity filter alone, without the join")
     parser.add_argument("--device", choices=sorted(DEVICES), default="h100-sxm")
@@ -206,7 +205,7 @@ def main() -> None:
             pa.table({"field": list(FIELDS),
                       "statement": [f"The comment {s}." for s in FIELDS.values()]}),
             id_col="field"))
-        query = session.sql(build_sql(args.criterion, args.filter_only))
+        query = session.sql(build_sql(args.filter_only))
         print(query.explain(), flush=True)
 
         result = query.run()

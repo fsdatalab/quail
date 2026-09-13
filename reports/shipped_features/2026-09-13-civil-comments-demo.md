@@ -278,3 +278,36 @@ ideal is the saturation number: 1.0 would mean the hardware was fully
 used on unavoidable work. Prediction for the 10,000-comment run: mean
 chunk above 90 percent of the 110,376-token budget, and measured wall
 between 1.3 and 2.0 times the speed of light.
+
+## Seventh GPU run, 10,000 comments, local H100
+
+Criterion "is toxic", `--limit 10000 --gpu-timing`. Predicted: filter
+passes 15 to 40 percent, chunks above 90 percent full, wall 1.3 to 2.0
+times the speed of light.
+
+| Quantity | Predicted | Measured |
+|---|---:|---:|
+| Filter pass rate | 15 to 40 percent | 92.7 percent |
+| Join pairs evaluated | | 287,308 |
+| Join pass rate | | 13.5 percent |
+| Query time, s | | 66.06 |
+| GPU idle | | 0.65 s, 1.0 percent |
+| Forward passes | | 70 |
+| Mean fresh tokens per pass | above 99,000 | 108,995 of 110,376 |
+| Speed of light for the run's answers, s | | 28.44 |
+| Wall over speed of light | 1.3 to 2.0 | 2.32 |
+| Fresh tokens, measured and ideal | | 7,629,618 and 7,597,960 |
+| Output recall against the labels | | 0.889 |
+
+Batches are 98.7 percent full, the scheduler idles 1 percent, and the
+engine computes 0.4 percent more tokens than the ideal. The 2.32 is
+entirely inside the forward passes: 117,000 fresh tokens per second
+measured against 267,000 at the roofline. The event timers cannot
+split that between kernels below the roofline and launch gaps between
+kernels; the kernel-level profiler in `experiments/profile_quail.py`
+can, and is the next tool.
+
+"is toxic" made the filter looser still. The prompt is now a plain
+`FILTER_PROMPT` constant asking whether the comment is among the most
+toxic on a news site (hateful, threatening, or abusive, not merely
+rude or opinionated). Prediction: the filter passes 10 to 35 percent.
