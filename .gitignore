@@ -28,6 +28,3 @@ results/torchprof_*.json.gz
 
 # subagent git worktrees, created and removed per run
 .claude/worktrees/
-
-# generated blog HTML (rebuild with make in blogs/intro/)
-blogs/intro/blogpost.html
