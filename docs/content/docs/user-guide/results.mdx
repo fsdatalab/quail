@@ -70,22 +70,32 @@ Other common refusals:
 
 ## Running a query
 
-`run()` executes the query and returns a `QueryResult`:
+`run()` executes the query on the GPU and returns a `QueryResult`.
+`query.collect()` is a shortcut that calls `run().collect()`.
 
 ```python
 result = query.run()
-
-table = result.collect()          # pyarrow.Table
-rows = result.to_rows()           # list of tuples
-n = result.count()                # row count (len(result) works too)
-stream = result.execute_stream()  # pyarrow.RecordBatchReader
-report = result.report            # execution metrics (see Metrics page)
 ```
 
-All row accessors accept `limit=`. If you are on Modal, collect the
-rows before returning from the function.
+### QueryResult
 
-`query.collect()` is a shortcut that calls `run().collect()`.
+```python
+class QueryResult:
+    schema: pa.Schema              # output column schema
+    report: dict                   # execution metrics
+    plan: PhysicalPlan             # the executed physical plan
 
-See [Metrics](/docs/user-guide/metrics) for every field in
-`result.report`.
+    def collect(limit=None) -> pa.Table: ...
+    def to_rows(limit=None) -> list[tuple]: ...
+    def count() -> int: ...        # len(result) also works
+    def execute_stream() -> pa.RecordBatchReader: ...
+```
+
+If you are on Modal, collect the rows before returning from the
+function.
+
+### Execution report
+
+`result.report` is a dict with query time, token counts, and
+per-stage metrics. See [Metrics](/docs/user-guide/metrics) for
+every field.
