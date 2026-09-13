@@ -69,6 +69,9 @@ CI runs these on every pull request. Run them before pushing:
   strategy it used: operator-at-a-time execution or pipelining.
 - `de1|` in request ids is a wire-format version tag, not a product
   name. Leave it alone.
+- Every `Session` call passes an `EngineConfig` that names `gpus`, `model`,
+  `backend`, and `device`. Keep all four fields explicit in code and examples.
+  Do not restore execution defaults.
 
 # Scope
 
