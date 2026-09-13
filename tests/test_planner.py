@@ -986,7 +986,7 @@ def test_refused_edits_name_their_rule(catalog):
     assert kept.remove("apply:keep") == plan
 
 
-def test_plan_walkthrough_demo_prints_the_same_row_from_every_plan():
+def test_plan_walkthrough_demo_prints_and_edits_plans():
     import io
     from contextlib import redirect_stdout
 
@@ -996,6 +996,8 @@ def test_plan_walkthrough_demo_prints_the_same_row_from_every_plan():
     with redirect_stdout(out):
         plan_walkthrough.main()
     text = out.getvalue()
-    assert text.count("[{'c.id': 'c0', 'e.id': 'e0'}]") == 3
-    assert "'ai_filter:c', 'barrier:c', 'ai_join:c'" in text
+    assert "hash_join:c-e" in text
+    assert "Barrier: next_anchor=c" in text
+    assert "Foreign: same_page" in text
+    assert "remove gives back the same plan: True" in text
     assert "PlanEditError" in text
