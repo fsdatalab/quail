@@ -268,7 +268,7 @@ def resolve_model(name: str, models=None):
     if name in models:
         return models[name]
     return Refusal(
-        reasons=(f"{name!r} names no registered ModelSpec; known: "
+        reasons=(f"unknown model {name!r}; registered models: "
                  f"{sorted(models)}",),
         constraint="unknown_model", needed=1, available=0, unit="specs")
 

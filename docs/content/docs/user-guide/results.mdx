@@ -11,55 +11,62 @@ query = session.sql("...", dialect="snowflake")
 print(query.explain())
 ```
 
-No model execution happens. Quail tokenizes a sample of each document
-column to estimate token lengths, but does not load the model.
+Quail runs the query planner and produces the full execution plan,
+but does not load the model or run any GPU work.
 
-The output has two parts:
+The output has two parts.
+
+**Logical plan** shows the query structure. Read it bottom-up: scans
+are at the leaves, the projection is at the root. Each predicate
+appears under the operator that evaluates it.
 
 ```text
-logical:
-  Project: r.id, a.aspect
-    SemanticJoin (full)
-      PROMPT('...', r.body, a.aspect) (selectivity=15%)
-      Join
-        cross
-        SemanticFilter
-          PROMPT('...', r.body) (selectivity=60%)
-          Scan reviews as r [body, id]
-        Scan aspects as a [aspect]
-
-physical: (backend=quail, model=qwen3-4b-fp8, workers=1)
-  KV=bf16, chunk budget=110,376 tokens
-  Project: r.id, a.aspect
-    AiJoin: anchor=r (estimated_seconds=0.003)
-      AiFilter: r (estimated_rows=4.8, estimated_seconds=0.004)
-        Scan reviews as r (estimated_rows=8)
-      Scan aspects as a (estimated_rows=12)
+Project: r.id, a.aspect
+  SemanticJoin (full)
+    PROMPT('...', r.body, a.aspect) (selectivity=15%)
+    Join
+      cross
+      SemanticFilter
+        PROMPT('...', r.body) (selectivity=60%)
+        Scan reviews as r [body, id]
+      Scan aspects as a [aspect]
 ```
 
-**Logical plan.** The top section shows the query structure. Read it
-bottom-up: scans are at the leaves, the projection is at the root.
-Each predicate appears under the operator that evaluates it.
+**Physical plan** shows what the execution engine will do, including
+the model, token budgets, estimated row counts, and estimated time
+per node.
 
-**Physical plan.** The bottom section shows what the execution engine
-will do:
+```text
+backend=quail, model=qwen3-4b-fp8, workers=1
+KV=bf16, chunk budget=110,376 tokens
 
-- **backend and model**: which engine and model run the query.
-- **chunk budget**: maximum tokens per model forward pass.
-- **estimated_rows**: how many documents or pairs the planner expects
-  at each node, based on selectivities you provided.
-- **estimated_seconds**: the planner's time estimate for each node's
-  model work.
-- **anchor**: for a join, which table's documents stay in GPU memory.
+Project: r.id, a.aspect
+  AiJoin: anchor=r (estimated_seconds=0.003)
+    AiFilter: r (estimated_rows=4.8, estimated_seconds=0.004)
+      Scan reviews as r (estimated_rows=8)
+    Scan aspects as a (estimated_rows=12)
+```
 
 `explain(verbose=True)` adds node ids, port connections, KV retention
 decisions, and planner remarks.
 
 ## Refusals
 
-If the planner refuses the query (for example, a document too long
-for one forward pass), `explain()` prints the reason instead of a
-plan. `run()` raises `quail.RefusalError` for the same case.
+If the planner cannot execute the query, `explain()` prints the
+reason instead of a plan, and `run()` raises `quail.RefusalError`.
+
+For example, if a document is too long to fit in one forward pass:
+
+```text
+Refused: a document in 'r' needs 131,072 tokens with its prompt,
+but the forward pass budget is 110,376 tokens
+```
+
+Other common refusals:
+
+- `the model needs 4 GPUs of memory, but Quail loads one complete copy per GPU`
+- `per-batch apply() requires one GPU; use apply_table() or set gpus=1`
+- `one join pair anchored on 'r' needs 150,000 tokens, but the forward pass budget is 110,376 tokens`
 
 ## Running a query
 

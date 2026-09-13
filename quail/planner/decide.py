@@ -397,8 +397,8 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
         raise CompileError("a join takes one apply() returning pairs")
     if gpus > 1 and any(apply.kind == "per_batch" for apply in applies):
         return Refusal(
-            reasons=("per-batch apply() functions run on one GPU today; "
-                     "use apply_table() or one GPU",),
+            reasons=("per-batch apply() requires one GPU; "
+                     "use apply_table() or set gpus=1",),
             constraint="per_batch_apply_needs_one_gpu",
             needed=1, available=gpus, unit="gpus")
     length_stats = {a: joinsearch.summarize_alias(t)
@@ -418,8 +418,8 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     if weight_gpus > 1:
         return Refusal(
             reasons=(
-                f"one model copy needs the memory of {weight_gpus} GPUs, "
-                "but Quail does not split weights across GPUs",
+                f"the model needs {weight_gpus} GPUs of memory, "
+                f"but Quail loads one complete copy per GPU",
             ),
             constraint="weights_need_more_cards",
             needed=weight_gpus, available=1, unit="cards")
@@ -545,11 +545,9 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
         need = pre + stats[s.alias].max_doc_tokens + fq
         if need > chunk:
             return Refusal(
-                reasons=(f"a document of {s.alias!r} plus the engine "
-                         f"preamble and its question tail needs {need} "
-                         f"tokens; the chunk budget is {chunk} and "
-                         f"suffixes are atomic - no chunk can ever "
-                         f"hold it",),
+                reasons=(f"a document in {s.alias!r} needs {need} tokens "
+                         f"with its prompt, but the forward pass budget "
+                         f"is {chunk} tokens",),
                 constraint="suffix_over_chunk",
                 needed=need, available=chunk, unit="tokens")
     for spec in specs:
@@ -561,12 +559,9 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                 + spec["tail_tokens"])
         if need > chunk:
             return Refusal(
-                reasons=(f"the join anchored on {anchor!r} needs "
-                         f"{need} tokens per tuple (anchor document, "
-                         f"each partner document with its label, and "
-                         f"the question, in one prompt); that is over "
-                         f"the chunk budget of {chunk}, and suffixes "
-                         f"are atomic",),
+                reasons=(f"one join pair anchored on {anchor!r} needs "
+                         f"{need} tokens, but the forward pass budget "
+                         f"is {chunk} tokens",),
                 constraint="suffix_over_chunk",
                 needed=need, available=chunk, unit="tokens")
 
@@ -856,7 +851,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         candidates += tuple(physical_planner.plan(region, context))
     if not candidates:
         return Refusal(
-            reasons=(f"backend {backend!r} produced no physical plan",),
+            reasons=(f"backend {backend!r} could not produce a plan",),
             constraint="no_physical_plan",
             needed=1,
             available=0,
