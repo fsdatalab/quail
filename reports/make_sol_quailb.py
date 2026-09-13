@@ -69,7 +69,7 @@ from quail.bench.quailb import (
     answer_oracle,
     canonical_templates,
     queries,
-    register_sets,
+    register_tables,
 )
 from quail.planner import collect_operators
 from quail.planner.plan import EngineConfig
@@ -179,7 +179,7 @@ answer = answer_oracle(truth, corpus_rows)
 
 session = quail.Session(
     EngineConfig(gpus=1, model=QWEN3_4B_FP8.name), tokenizer=encode)
-register_sets(session, W / "data" / TAG)
+register_tables(session, W / "data" / TAG)
 query_defs = queries(session)
 query_ids = list(query_defs)
 if args.queries:

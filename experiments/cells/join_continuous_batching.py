@@ -78,7 +78,7 @@ def _run(label, output_dir, query_ids):
     import pyarrow.parquet as pq
 
     import quail
-    from quail.bench.quailb import queries, register_sets
+    from quail.bench.quailb import queries, register_tables
     from quail.planner.plan import EngineConfig
     from quail.specs import H100_USD_PER_HOUR
     from quail_b.data import build_sets
@@ -92,7 +92,7 @@ def _run(label, output_dir, query_ids):
         source_hash.update(path.read_bytes())
     with quail.Session(EngineConfig(model="qwen3-4b-fp8", gpus=1),
                        ) as session:
-        register_sets(session, build_sets("/results/quailb_data", 0.1, 1))
+        register_tables(session, build_sets("/results/quailb_data", 0.1, 1))
         defs = queries(session)
         for qid in query_ids.split(","):
             query = defs[qid][1]()

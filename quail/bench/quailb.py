@@ -1,4 +1,9 @@
-"""Build, run, and score QUAIL-B queries with Quail."""
+"""Run QUAIL-B queries with Quail: the adapter `quail_b.run` calls.
+
+`run_query(session, spec, tables)` builds one query's Substrait plan
+on the session, runs it, and returns the answers keyed by the plan's
+operator ids, as QUAIL-B scores them.
+"""
 
 import argparse
 import time
@@ -10,9 +15,13 @@ import pyarrow as pa
 
 import quail
 import quail_b as benchmark
+from quail.bench import substrait
+from quail.bench.substrait import QueryPlan, read_plan
 from quail.planner import collect_operators
 from quail.specs import H100_USD_PER_HOUR
 from quail_b.queries import (
+    FILTER_SELECTIVITY_ESTIMATES,
+    JOIN_SELECTIVITY_ESTIMATES,
     SELECTIVITY_ESTIMATE_COLLECTION,
     SELECTIVITY_ESTIMATE_CORPUS,
     SELECTIVITY_ESTIMATE_SCALE_FACTOR,
@@ -21,71 +30,42 @@ from quail_b.queries import (
 from quail_b.queries import queries as query_specs
 from quail_b.scoring import RunOutput, reference_answer
 
-DEFAULT_SETS = ("reviews", "aspects", "reports", "terms",
-                "claims", "evidence", "citation_contexts",
-                "citation_passages", "agent_traces")
+# the fixed planner inputs, by prompt; a query with an estimate for
+# every predicate is ordered by cost, any other in written order
+SELECTIVITY = {**FILTER_SELECTIVITY_ESTIMATES, **JOIN_SELECTIVITY_ESTIMATES}
 
 
-def register_sets(sess, data_dir):
-    """Register the default document sets from their Parquet files."""
-    for name in DEFAULT_SETS:
-        sess.register(name, quail.DocumentProvider.from_parquet(
-            str(Path(data_dir) / f"{name}.parquet"), id_col="id"))
+def register_tables(session, data_dir):
+    """Register every Parquet file of a directory as a document table."""
+    for path in sorted(Path(data_dir).glob("*.parquet")):
+        session.register(path.stem, quail.DocumentProvider.from_parquet(
+            str(path), id_col="id"))
 
 
-def register_privacy_sets(sess, data_dir):
-    """Register policies and scenarios tables for PRIV queries.
+def _build(session, plan: QueryPlan):
+    order = ("by_cost" if all(op.prompt in SELECTIVITY for op in plan.operators)
+             else "as_written")
+    return substrait.build_query(session, plan, SELECTIVITY, order=order)
 
-    Separate from register_sets so the privacy policy queries do not
-    run unless the corpus was built.
+
+def build_query(session, spec: QuerySpec):
+    """Build the Quail query of one benchmark query on a session."""
+    return _build(session, read_plan(spec.plan))
+
+
+def queries(session) -> dict:
+    """Id -> (description, callable() -> Query), for every registered table.
+
+    A query is listed when every table it reads is registered. Fresh
+    Query objects per call so each pass re-plans.
     """
-    for name in ("policies", "scenarios"):
-        sess.register(name, quail.DocumentProvider.from_parquet(
-            str(Path(data_dir) / f"{name}.parquet"), id_col="id"))
-
-
-def build_query(sess, spec: QuerySpec):
-    """Build the Quail query of one specification on one session."""
-
-    def with_filters(builder, alias_spec):
-        column = quail.col(f"{alias_spec.alias}.{alias_spec.column}")
-        for template in alias_spec.filters:
-            builder = builder.ai_filter(
-                quail.prompt(template, column),
-                selectivity=spec.filter_selectivity(template))
-        return builder
-
-    base = spec.aliases[0]
-    query = with_filters(sess.docs(base.table).alias(base.alias), base)
-    for join, partner in zip(spec.joins, spec.aliases[1:]):
-        partner_query = with_filters(
-            sess.docs(partner.table).alias(partner.alias), partner)
-        columns = [
-            quail.col(f"{alias}.{spec.alias(alias).column}")
-            for alias in join.aliases
-        ]
-        # an equality picks the pairs; the model sees those only
-        left, right = join.aliases
-        query = query.join(partner_query, on=[
-            quail.col(f"{left}.{left_column}")
-            == quail.col(f"{right}.{right_column}")
-            for left_column, right_column in join.on
-        ]).ai_filter(quail.prompt(join.template, *columns),
-                     selectivity=spec.join_selectivity(join.template))
-    return query.select(*spec.select, order=spec.order)
-
-
-def queries(sess):
-    """Id -> (description, callable() -> Query), for every registered set.
-
-    Fresh Query objects per call so each pass re-plans.
-    """
-    return {
-        spec.id: (spec.description,
-                  lambda spec=spec: build_query(sess, spec))
-        for spec in query_specs(
-            include_privacy="policies" in sess.catalog).values()
-    }
+    listed = {}
+    for spec in query_specs(include_privacy=True).values():
+        plan = read_plan(spec.plan)
+        if all(relation.table in session.catalog for relation in plan.relations):
+            listed[spec.id] = (
+                spec.description, lambda plan=plan: _build(session, plan))
+    return listed
 
 
 def canonical_templates(ground_truth) -> dict[str, str]:
@@ -106,23 +86,18 @@ def canonical_templates(ground_truth) -> dict[str, str]:
     return canonical
 
 
-def _document_ids(rows):
-    if isinstance(rows, pa.Table):
-        return rows.column("id").to_pylist()
-    return [row["id"] for row in rows]
+def _ids(table: pa.Table) -> list[str]:
+    return [str(row_id) for row_id in table.column("id").to_pylist()]
 
 
-def answer_oracle(ground_truth, corpus_rows):
+def answer_oracle(ground_truth, tables):
     """Return the `answer(prompt, assignment)` callable Quail's estimate takes."""
     templates = canonical_templates(ground_truth)
-    ids_by_provider = {
-        name: [str(row_id) for row_id in _document_ids(rows)]
-        for name, rows in corpus_rows.items()
-    }
+    ids_by_table = {name: _ids(table) for name, table in tables.items()}
 
     def answer(prompt, assignment):
         ids = tuple(
-            ids_by_provider[arg.provider][assignment[arg.alias]]
+            ids_by_table[arg.provider][assignment[arg.alias]]
             for arg in prompt.args
         )
         return reference_answer(ground_truth, templates[prompt.template], ids)
@@ -130,43 +105,42 @@ def answer_oracle(ground_truth, corpus_rows):
     return answer
 
 
-def run_output(result, spec: QuerySpec, corpus_rows) -> RunOutput:
-    """Translate a Quail result's row indices into benchmark ids."""
-    ids = {
-        alias_spec.alias: [
-            str(row_id) for row_id in _document_ids(corpus_rows[alias_spec.table])]
-        for alias_spec in spec.aliases
-    }
+def run_output(result, plan: QueryPlan, tables) -> RunOutput:
+    """Translate a Quail result's row indices into benchmark ids by operator."""
+    ids = {relation.alias: _ids(tables[relation.table])
+           for relation in plan.relations}
 
     def id_column(alias, indices):
         return pa.array(
             [ids[alias][int(index)] for index in indices], type=pa.string())
 
     filter_answers = {}
-    for (alias, written_pos), table in result.answer_tables["filters"].items():
-        filter_answers[(alias, written_pos)] = pa.table({
+    for (alias, position), table in result.answer_tables["filters"].items():
+        filter_answers[plan.filter_id(alias, position)] = pa.table({
             alias: id_column(alias, table.column(alias).to_pylist()),
             "answer": table.column("answer"),
         })
     join_answers = {}
-    for written_pos, table in result.answer_tables["joins"].items():
-        join = spec.joins[written_pos]
-        join_answers[written_pos] = pa.table({
+    for position, table in result.answer_tables["joins"].items():
+        join = plan.joins[position]
+        join_answers[join.id] = pa.table({
             **{alias: id_column(alias, table.column(alias).to_pylist())
                for alias in join.aliases},
             "answer": table.column("answer"),
         })
-    for name in spec.select:
-        if name.split(".", 1)[1] != "id":
+    aliases = []
+    for name in plan.select:
+        alias, column = name.split(".", 1)
+        if column != "id":
             raise NotImplementedError(
                 "QUAIL-B output accuracy needs id columns in the select list")
+        aliases.append(alias)
     started = time.perf_counter()
     rows = result.collect()
     collection_s = time.perf_counter() - started
-    rows = rows.rename_columns([name.split(".", 1)[0] for name in spec.select])
     return RunOutput(
-        filter_answers, join_answers, rows, result.report["wall_s"],
-        dict(result.report, collection_s=collection_s))
+        filter_answers, join_answers, rows.rename_columns(aliases),
+        result.report["wall_s"], dict(result.report, collection_s=collection_s))
 
 
 def join_anchors(result) -> dict:
@@ -177,7 +151,7 @@ def join_anchors(result) -> dict:
     }
 
 
-def prompt_pieces(query, anchors) -> dict:
+def prompt_pieces(query, plan: QueryPlan, anchors) -> dict:
     """Return the prompt token ids around each document, for QUAIL-B.
 
     QUAIL-B sizes the prefix trie of the run's requests from these
@@ -186,6 +160,7 @@ def prompt_pieces(query, anchors) -> dict:
 
     Args:
         query: The built query, with bound prompts.
+        plan: The query's plan, for the operator ids.
         anchors: Written join position -> the anchor alias.
     """
     _, filters, joins = collect_operators(query.logical)
@@ -199,7 +174,7 @@ def prompt_pieces(query, anchors) -> dict:
     for alias, predicates in filters.items():
         for position, predicate in enumerate(predicates):
             pieces["filters"].append({
-                "alias": alias, "position": position,
+                "id": plan.filter_id(alias, position),
                 "tail": list(predicate.prompt.tail_token_ids)})
     for position, join in enumerate(joins):
         anchor = anchors[position]
@@ -207,22 +182,23 @@ def prompt_pieces(query, anchors) -> dict:
                  for alias, label, frame in join.predicate.label_token_ids}
         (partner,) = [alias for alias in parts if alias != anchor]
         pieces["joins"].append({
-            "position": position, "anchor": anchor, "frame": parts[anchor][1],
-            "label": parts[partner][0],
+            "id": plan.join_id(position), "anchor": anchor,
+            "frame": parts[anchor][1], "label": parts[partner][0],
             "tail": list(join.predicate.tail_token_ids)})
     return pieces
 
 
-def run_query(session, spec, tables):
-    """Execute one query and return benchmark IDs, answers, and measurements."""
+def run_query(session, spec: QuerySpec, tables) -> RunOutput:
+    """Execute one query and return benchmark ids, answers, and measurements."""
     for name, table in tables.items():
         if name not in session.catalog:
             session.register(
                 name, quail.DocumentProvider.from_table(table, id_col="id"))
-    query = build_query(session, spec)
+    plan = read_plan(spec.plan)
+    query = _build(session, plan)
     result = query.run()
-    output = run_output(result, spec, tables)
-    output.prompt_pieces = prompt_pieces(query, join_anchors(result))
+    output = run_output(result, plan, tables)
+    output.prompt_pieces = prompt_pieces(query, plan, join_anchors(result))
     return output
 
 

@@ -109,22 +109,23 @@ METRICS = (
 
 def input_relations(queries, corpus):
     """Resolve each query alias to its saved input table count."""
-    from quail_b.queries import queries as query_specs
+    from quail.bench.substrait import read_plan
+    from quail_b.queries import get_query
 
-    specs = query_specs()
     return {
         query: [
-            (alias.alias, alias.table, corpus["tables"][alias.table]["rows"])
-            for alias in specs[query].aliases]
+            (relation.alias, relation.table,
+             corpus["tables"][relation.table]["rows"])
+            for relation in read_plan(get_query(query).plan).relations]
         for query in queries
     }
 
 
 def load_sol(root, queries, rows, corpus):
     """Load compatible estimates with prefix reuse across requests."""
-    from quail_b.queries import queries as query_specs
+    from quail.bench.substrait import read_plan
+    from quail_b.queries import get_query
 
-    specs = query_specs()
     source = json.loads((root / "sol.json").read_text())
     assert source["corpus_id"] == corpus["corpus_id"]
     assert source["scale_factor"] == 0.1
@@ -133,11 +134,10 @@ def load_sol(root, queries, rows, corpus):
     estimates = {}
     for query in queries:
         estimate = source["queries"][query]["models"]["qwen3-4b-fp8"]
-        spec = specs[query]
-        filters = sorted(alias.alias for alias in spec.aliases
-                         for _ in alias.filters)
+        plan = read_plan(get_query(query).plan)
+        filters = sorted(item.alias for item in plan.filters)
         assert sorted(s["alias"] for s in estimate["filter_stages"]) == filters
-        assert len(estimate["join_stages"]) == len(spec.joins), query
+        assert len(estimate["join_stages"]) == len(plan.joins), query
         assert estimate["input_document_rows"] == rows["quail"][query]["input_rows"]
         assert estimate["tokens"] <= estimate["per_document"]["tokens"], query
         estimates[query] = estimate

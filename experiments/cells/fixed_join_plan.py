@@ -59,7 +59,7 @@ def _run(label, output_dir):
 
     import quail
     from quail.backends.quail import expected_join_nodes
-    from quail.bench.quailb import queries, register_sets
+    from quail.bench.quailb import queries, register_tables
     from quail.physical import AiFilter, AiJoin
     from quail.planner.plan import EngineConfig
     from quail.specs import H100_USD_PER_HOUR
@@ -74,7 +74,7 @@ def _run(label, output_dir):
         source_hash.update(path.read_bytes())
     with quail.Session(EngineConfig(model="qwen3-4b-fp8", gpus=1),
                        ) as session:
-        register_sets(session, build_sets("/results/quailb_data", 0.1, 1))
+        register_tables(session, build_sets("/results/quailb_data", 0.1, 1))
         query = queries(session)["FEV-9"][1]()
         plan = query.plan()
         estimates = {

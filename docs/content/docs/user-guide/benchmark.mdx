@@ -58,8 +58,9 @@ with quail.Session() as session:
     )
 ```
 
-`run_query` translates and executes one query. It returns document IDs,
-predicate answers, and measured duration. QUAIL-B saves and scores the results.
+`run_query` reads the query's Substrait plan into Quail's query builder,
+executes it, and returns document IDs, predicate answers keyed by the plan's
+operator ids, and measured duration. QUAIL-B saves and scores the results.
 No evaluator or saving callback is needed.
 
 The `run_suite()` convenience function in the same module also records Quail's
