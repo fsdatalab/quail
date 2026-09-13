@@ -6,6 +6,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import pytest
+from substrait_helpers import filter_rel, join_rel, project_plan, read_rel
 
 from quail_b.data import GROUND_TRUTH_ROOT
 from quail_b.labels import (
@@ -21,7 +22,6 @@ from quail_b.scoring import (
     expected_rows,
     rows_from_answers,
 )
-from substrait_helpers import filter_rel, join_rel, project_plan, read_rel
 
 
 def _spec(query_id, description, node, select):

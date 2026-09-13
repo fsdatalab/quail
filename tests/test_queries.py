@@ -21,7 +21,6 @@ from quail_b.queries import (
 )
 from quail_b.run import _query_hash
 from quail_b.substrait import (
-    AI_FILTER_NAME,
     AI_JOIN_NAME,
     AND_NAME,
     EQUAL_NAME,

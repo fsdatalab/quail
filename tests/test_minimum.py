@@ -2,6 +2,7 @@
 
 import pyarrow as pa
 import pytest
+from substrait_helpers import filter_rel, join_rel, project_plan, read_rel
 
 from quail_b.minimum import (
     DocumentTokens,
@@ -12,7 +13,6 @@ from quail_b.minimum import (
 )
 from quail_b.queries import QuerySpec
 from quail_b.scoring import RunOutput
-from substrait_helpers import filter_rel, join_rel, project_plan, read_rel
 
 
 def _spec(query_id, description, node, select):
