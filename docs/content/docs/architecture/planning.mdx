@@ -260,9 +260,11 @@ The DP state is `(S, K)`: `S` is the set of aliases already joined,
 pruned only if another state dominates it in all four work
 quantities (tokens, pairs, KV writes, KV reads).
 
-### Computing the estimate
+### Computing the query estimate
 
-The forward pass count is:
+After counting the work across all filters and joins in the query,
+the total tokens, pairs, KV writes, and KV reads are combined into
+a single time estimate. The forward pass count is:
 
 
 $$
@@ -321,8 +323,7 @@ Each component reads its weights once per ideal forward pass.
 - **Filter throughput** = input documents / SoL
 - **Join throughput** = total evaluated pairs across join stages / SoL
 
-These are values at the speed of light. They are not measured Quail
-metrics.
+These are computed from the SoL estimate, not from a measured run.
 
 ### Implementation
 
