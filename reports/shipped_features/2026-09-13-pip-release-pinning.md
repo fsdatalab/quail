@@ -15,10 +15,12 @@ The PyPI distribution is named `quail-engine`, while its Python import remains
 distribution name. The project now uses the MIT license and publishes its
 repository and issue URLs in package metadata.
 
-`tools/release.sh` checks a clean release, builds the files, and can push the
-version tag. The tag starts a GitHub Actions workflow that uses PyPI trusted
-publishing. The workflow actions, `uv`, Twine, and Python dependencies all use
-exact versions. These changes do not publish a release by themselves.
+`tools/release.sh` checks the version and repository state, then pushes the
+version tag. Following uv's official guide, the tag starts separate build and
+publish jobs. They use `uv build --no-sources`, test both package formats, and
+upload with `uv publish` through PyPI trusted publishing. The workflow actions,
+`uv`, and Python dependencies all use exact versions. These changes do not
+publish a release by themselves.
 
 ## Prediction and validation
 
@@ -28,9 +30,8 @@ only exact direct requirements.
 
 The lock check resolved 234 packages without changing the lock. Ruff, the
 long-string check, and Vulture passed. `uv build` produced the sdist and wheel,
-named `quail_engine-0.1.0`, and Twine accepted both. The wheel contains 75
-files and lists all nine platform-specific direct requirements with exact
-versions.
+named `quail_engine-0.1.0`. The wheel lists all nine platform-specific direct
+requirements with exact versions.
 
 The CPU tests could not start in this environment. Dependency setup could not
 read the private `fsdatalab/quail-bench` repository. CI has the separate
@@ -45,7 +46,7 @@ built package will carry the MIT license metadata and file.
 The Bash parser accepted the script, and the script rejected version `9.9.9`
 before doing release work. Actionlint 1.7.7 accepted the publishing workflow.
 The rebuilt wheel reports `License-Expression: MIT`, includes
-`dist-info/licenses/LICENSE`, and passed Twine 7.0.0 validation.
+`dist-info/licenses/LICENSE`, and exposes the `quail` package.
 
 No model run was needed because this change does not alter query execution.
 There is therefore no Modal function call id or `quail-results` volume path.
@@ -58,5 +59,4 @@ There is therefore no Modal function call id or `quail-results` volume path.
    trusted publisher on PyPI.
 3. Add author metadata if the project wants a named person or organization
    on PyPI.
-4. Install the built wheel in a clean Python 3.12 environment.
-5. Merge this change, then run `PUBLISH=1 tools/release.sh 0.1.0` from `main`.
+4. Merge this change, then run `tools/release.sh 0.1.0` from `main`.

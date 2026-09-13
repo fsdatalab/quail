@@ -3,32 +3,60 @@ name: Publish to PyPI
 on:
   push:
     tags:
-      - "v*"
-
-permissions:
-  contents: read
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+rc[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+[ab][0-9]+"
 
 jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          version: "0.12.13"
+          enable-cache: false
+          python-version: "3.12"
+      - name: Build
+        run: uv build --no-sources
+      - name: Smoke test wheel
+        run: uv run --isolated --no-project --with dist/*.whl tests/smoke_release.py
+      - name: Smoke test source archive
+        run: >
+          uv run --isolated --no-project
+          --with dist/*.tar.gz tests/smoke_release.py
+      - name: Upload release files
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: dist
+          path: dist/
+
   publish:
+    needs: build
     runs-on: ubuntu-latest
     environment:
       name: pypi
       url: https://pypi.org/p/quail-engine
     permissions:
-      contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
         with:
-          python-version: "3.12"
+          enable-cache: false
           version: "0.12.13"
-      - name: Authorize the quail-bench repository
-        run: >
-          git config --global
-          url."https://x-access-token:${{ secrets.QUAILB_TOKEN }}@github.com/".insteadOf
-          "https://github.com/"
-      - name: Build and check the release
-        run: tools/release.sh "${GITHUB_REF_NAME#v}"
-      - name: Publish the release files
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33
+      - name: Download release files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: dist
+          path: dist/
+      - name: Generate attestations
+        uses: astral-sh/attest-action@f589a42a7efb6fe400b4f400de60b4bc90390027
+      - name: Publish
+        run: uv publish

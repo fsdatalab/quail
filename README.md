@@ -100,16 +100,14 @@ token. Before the first release:
    - Workflow: `publish.yml`
    - Environment: `pypi`
 
-The workflow uses the repository's existing `QUAILB_TOKEN` secret to install
-the pinned QUAIL-B development dependency during its checks.
-
-Set the version in `pyproject.toml` and refresh `uv.lock`. From a clean `main`
-branch matching `origin/main`, run:
+Set the version with `uv version` and commit that change. From a clean `main`
+branch matching `origin/main`, release it with one command:
 
 ```bash
-PUBLISH=1 tools/release.sh 0.1.0
+tools/release.sh 0.1.0
 ```
 
-The script checks the version and clean worktree, runs all required checks,
-builds and validates the wheel and source archive, then pushes the matching
-tag. The tag starts the trusted publishing workflow.
+The script checks the version and repository state, then pushes the matching
+tag. Following uv's official publishing guide, GitHub Actions builds with
+`uv build --no-sources`, smoke-tests the wheel and source archive in separate
+environments, and publishes them with `uv publish`.
