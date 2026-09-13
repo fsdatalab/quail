@@ -175,11 +175,13 @@ rectangle ($q_s$ new tokens attending over the resident prefix).
 Without reuse, stage `s > 1` would repeat the full scan: `p + d_i +
 q_s` tokens and `T(p + d_i + q_s)` pairs.
 
-**Example.** Over 5,000 IMDB reviews, F4 followed by F1 totals
-1,791,351 tokens. The F4 scan accounts for 1,729,233 tokens. F4
-leaves 1,218 documents, so F1 adds $1{,}218 \times 51 = 62{,}118$
-fresh tokens. Rescanning those documents would also recompute their
-prefix tokens.
+<Callout type="info">
+**Example: IMDB, 5,000 reviews, F4 then F1.** Total fresh tokens:
+1,791,351. The F4 scan accounts for 1,729,233. F4 leaves 1,218
+documents, so F1 adds $1{,}218 \times 51 = 62{,}118$ fresh tokens.
+Without KV reuse, F1 would also recompute every surviving
+document's prefix.
+</Callout>
 
 The SoL calculation uses ground-truth labels to determine the exact
 set $A_s$ at each stage, because the surviving document lengths
