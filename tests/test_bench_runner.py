@@ -7,7 +7,14 @@ import pyarrow.parquet as pq
 import pytest
 
 import quail
-from quail.bench.quailb import answer_oracle, build_query, queries, run_output
+from quail.bench.quailb import (
+    answer_oracle,
+    build_query,
+    join_anchors,
+    prompt_pieces,
+    queries,
+    run_output,
+)
 from quail.catalog import DocumentProvider
 from quail.planner import collect_operators
 from quail.planner.plan import EngineConfig, Refusal
@@ -115,6 +122,10 @@ def fever_truth():
     return corpus, truth
 
 
+def _token_ids(text):
+    return [byte + 1 for byte in text.encode("utf-8")]
+
+
 def _session(tmp_path, backend="quail"):
     pq.write_table(pa.table({
         "id": ["r0", "r1"],
@@ -125,10 +136,7 @@ def _session(tmp_path, backend="quail"):
         "aspect": ["acting", "ending"],
     }), tmp_path / "aspects.parquet")
 
-    def token_ids(text):
-        return [byte + 1 for byte in text.encode("utf-8")]
-
-    tokenizer = str.split if backend == "quail" else token_ids
+    tokenizer = str.split if backend == "quail" else _token_ids
     sess = quail.Session(
         EngineConfig(gpus=1, backend=backend), tokenizer=tokenizer
     )
@@ -157,25 +165,25 @@ def _run(query, join_answers):
         from quail.builtins import built_in_registry
         from quail.execution import PhysicalResponse, export_physical_outputs
         from quail.physical import (
-            AnchoredJoin,
-            DocumentInput,
-            PackedFilter,
+            AiFilter,
+            AiJoin,
+            Scan,
             decode_graph,
         )
         from quail.runtime.runner import NodeMetrics, NodeResult, RunResult
 
         graph = decode_graph(request.plan["graph"], built_in_registry().codecs)
         filtered = next(
-            node for node in graph.nodes if isinstance(node, PackedFilter)
+            node for node in graph.nodes if isinstance(node, AiFilter)
         )
         anchored = next(
-            node for node in graph.nodes if isinstance(node, AnchoredJoin)
+            node for node in graph.nodes if isinstance(node, AiJoin)
         )
         join = anchored.stages[0].runtime_spec()
         nodes = {
             **{node.node_id: NodeResult({f"ids:{node.alias}": range(
                 len(request.inputs[node.input_id].documents))})
-               for node in graph.nodes if isinstance(node, DocumentInput)},
+               for node in graph.nodes if isinstance(node, Scan)},
             filtered.node_id: NodeResult({
                 "ids:r": [0],
                 "filter_answers:r": {0: [1], 1: [0]},
@@ -202,7 +210,7 @@ def _run(query, join_answers):
             "boot_s": 3.0,
             "boot_kind": "cold",
             "boot": {},
-            "fresh_tokens": 100,
+            "fresh_tokens": 1000,
             "store": None,
             "peak_gib": 1.0,
         })
@@ -263,9 +271,8 @@ def _run_request_backend(query, join_answers):
             "boot_s": 3.0,
             "boot_kind": "cold",
             "boot": {},
-            "fresh_tokens": 100,
+            "fresh_tokens": 1000,
             "cached_tokens": 0,
-            "regret_tokens": 0,
             "peak_gib": 1.0,
         })
 
@@ -290,14 +297,14 @@ def test_benchmark_results_and_scoring(tmp_path):
     evaluation = evaluate(SPEC, output, _truth(), CORPUS)
     assert evaluation["answer_accuracy"]["accuracy"] == 1.0
     assert evaluation["output_accuracy"]["exact_match"] is True
-    assert result.report["shared_prefix_tokens"] == 0
-    assert result.report["cross_row_cached_tokens"] == 0
-    assert result.report["regret_distinct_tokens"] is None
 
     sess = _session(tmp_path, backend="stock_vllm")
     try:
-        result = _run_request_backend(_query(sess), [0, 0])
+        query = _query(sess)
+        result = _run_request_backend(query, [0, 0])
         output = run_output(result, SPEC, CORPUS)
+        output.prompt_pieces = prompt_pieces(query, join_anchors(result))
+        tokenizer_name = sess.model.hf_name
     finally:
         sess.close()
 
@@ -308,10 +315,20 @@ def test_benchmark_results_and_scoring(tmp_path):
         "filter", "join"
     ]
     assert output.rows.num_rows == 0
-    assert result.report["shared_prefix_tokens"] == 0
-    # the fake stock vLLM run reports no cross row cache hits, so the
-    # distinct prefix regret is unknown
-    assert result.report["regret_distinct_tokens"] is None
+    from quail_b.minimum import DocumentTokens, token_metrics
+
+    pieces = output.prompt_pieces
+    assert pieces["tokenizer"] == tokenizer_name
+    assert pieces["preamble"] == _token_ids(quail.SHARED_PRE)
+    assert [(item["alias"], item["position"]) for item in pieces["filters"]] == [
+        ("r", 0)]
+    assert [(item["position"], item["anchor"]) for item in pieces["joins"]] == [
+        (0, "r")]
+    stores = {tokenizer_name: DocumentTokens(
+        CORPUS, lambda texts: [_token_ids(text) for text in texts])}
+    measured = token_metrics(SPEC, output, CORPUS, stores)
+    assert measured["minimum_tokens"] > 0
+    assert measured["regret_tokens"] == 1000 - measured["minimum_tokens"]
 
     spec = QuerySpec(
         "TEST-2", "selects a text column",

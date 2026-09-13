@@ -25,7 +25,7 @@ The examples below use the QUAIL-B benchmark's predicates over its
 ```sql
 SELECT <columns>
 FROM <provider> [<alias>]
-[JOIN <provider> [<alias>] ON AI_FILTER(PROMPT(...), {...})]...
+[JOIN <provider> [<alias>] ON [<col> = <col> AND]... AI_FILTER(PROMPT(...), {...})]...
 [WHERE <term> [AND <term>]...]
 [LIMIT <n>]
 ```
@@ -35,7 +35,9 @@ FROM <provider> [<alias>]
 - `FROM` names one registered provider. The alias is optional and
   defaults to the provider name.
 - `JOIN` adds a table. Only plain `JOIN` and `CROSS JOIN` are allowed.
-  `LEFT`, `RIGHT`, `FULL`, and `OUTER` are refused.
+  `LEFT`, `RIGHT`, `FULL`, and `OUTER` are refused. `ON` holds the AI
+  predicate and, optionally, ordinary `column = column` conditions
+  that choose which pairs the model sees.
 - `WHERE` is a conjunction. Each term is an `AI_FILTER` call, an
   `EXISTS` subquery, or a `NOT EXISTS` subquery.
 - `LIMIT` takes a positive integer literal.
@@ -124,6 +126,37 @@ predicate, and the join predicates must connect every table to the
 `FROM` table. QUAIL-B's IMDB-9 chains two reviews and two aspects that
 way.
 
+### Joins over pairs
+
+When an ordinary column relates the two tables, put the equality in
+`ON` next to the AI predicate. The model is then asked only about the
+pairs whose columns are equal; every other pair is never built. In
+QUAIL-B's FEV-10 a claim names its Wikipedia page and an evidence
+row's id is its page name, so the join asks whether a page supports a
+claim only for the claim's own page:
+
+```sql
+SELECT c.id, e.id
+FROM claims c
+JOIN evidence e
+  ON c.evidence_wiki_url = e.id
+ AND AI_FILTER(PROMPT('Does the passage in DOCUMENT {1} support the claim in DOCUMENT {0}?',
+                      c.claim, e.text))
+WHERE AI_FILTER(PROMPT('Is the claim in DOCUMENT {0} about a person?', c.claim))
+```
+
+The equality becomes a `HashJoin` node in the physical plan. It reads
+the two key columns, pairs the rows whose values are equal, and feeds
+those pairs to the AI join, which asks the model about the pairs both
+sides' survivors allow. The planner prices the join by the number of
+equal pairs instead of the cross product, and `explain()` shows the
+node with the fraction of pairs it keeps. Several equalities may be combined with `AND`; each must
+relate the joined table to a table already in the query, and the AI
+predicate must name the same two tables. A `JOIN` whose `ON` has an
+equality but no AI predicate is refused: a plain join belongs in the
+source database. A Python function between two operators has no SQL
+form; see `apply()` in the Python API.
+
 Join options:
 
 - `selectivity`: the fraction of tuples you expect to pass.
@@ -163,6 +196,7 @@ The compiler refuses these with a message that says why:
 | Any `AI_` function other than `AI_FILTER` | Only filters and joins are supported today. |
 | Subqueries other than `[NOT] EXISTS (SELECT 1 ...)` | Same. |
 | A query with no AI predicate | A plain scan belongs in the source database. |
+| A `JOIN` with an equality but no AI predicate | A plain join belongs in the source database. |
 | Outer joins | Only inner and cross joins. |
 
 Errors are raised as `quail.logical.CompileError` when the query is

@@ -4,25 +4,35 @@ from dataclasses import replace
 
 from quail.executor.retention import retention_pages
 from quail.logical import (
+    Apply,
+    CompileError,
+    Join,
     LogicalPlan,
     Project,
     Scan,
     SemanticFilter,
     SemanticJoin,
+    join_conditions,
+    oriented_join_conditions,
 )
 from quail.physical import (
-    AnchoredJoin,
-    DocumentInput,
+    AiFilter,
+    AiJoin,
+    Barrier,
     Exchange,
     FilterStage,
+    Foreign,
+    HashJoin,
     JoinStage,
     Limit,
-    PackedFilter,
     PortRef,
     Recombine,
 )
 from quail.physical import (
     Project as PhysicalProject,
+)
+from quail.physical import (
+    Scan as PhysicalScan,
 )
 from quail.physical.base import input_ports
 from quail.planner import budgets, retention
@@ -46,6 +56,11 @@ def collect_operators(plan: LogicalPlan):
             for child in node.inputs:
                 walk(child)
             joins.append(node)
+        elif isinstance(node, Join):
+            walk(node.left)
+            walk(node.right)
+        elif isinstance(node, Apply):
+            walk(node.input)
         elif isinstance(node, SemanticFilter):
             walk(node.input)
             filters[node.input.alias] = list(node.predicates)
@@ -57,6 +72,11 @@ def collect_operators(plan: LogicalPlan):
 
     walk(plan.root)
     return scans, filters, joins
+
+
+def collect_applies(plan: LogicalPlan) -> list:
+    """Return the Apply nodes of a plan, children before parents."""
+    return [node for node in plan.walk() if isinstance(node, Apply)]
 
 
 def _question_tokens(prompt) -> int:
@@ -182,55 +202,117 @@ def _label_counts(join) -> dict:
     return out
 
 
-def join_specs(joins) -> list:
-    """The joins as the search's spec dicts, in written order."""
+def join_specs(joins, pair_fractions=None) -> list:
+    """The joins as the search's spec dicts, in written order.
+
+    pair_fractions maps a written position to the fraction of the
+    cross product its equality conditions keep; a join with
+    conditions but no entry is priced as the full cross product.
+    """
+    pair_fractions = pair_fractions or {}
     out = []
     for i, j in enumerate(joins):
         labels = _label_counts(j)
+        conditions = join_conditions(j)
         out.append(dict(
             written_pos=i, aliases=_join_aliases(j), anchor=j.anchor,
             anchor_free=(j.anchor is None and j.semantics == "full"),
             semantics=j.semantics, selectivity=j.selectivity,
             frame_tokens={a: nt for a, (lt, nt) in labels.items()},
             label_tokens={a: lt for a, (lt, nt) in labels.items()},
-            tail_tokens=_question_tokens(j.predicate)))
+            tail_tokens=_question_tokens(j.predicate),
+            on=[(c.left.alias, c.left.column, c.right.alias, c.right.column)
+                for c in conditions],
+            pair_fraction=(pair_fractions.get(i, 1.0) if conditions
+                           else 1.0)))
     return out
 
 
-def _filter_work(filters, stats, filter_orders: dict, pre: int) -> Work:
-    """Expected Work of every filter chain.
+def hash_join_nodes(joins, pair_fractions, scan_ports) -> list:
+    """One HashJoin per join with equality conditions, over the scans.
 
-    The first stage scans each document, later stages ask over
-    resident KV.
+    Args:
+        joins: The logical joins in written order.
+        pair_fractions: written position -> pairs kept over the cross
+            product, as the session measured them.
+        scan_ports: The scans' id ports, one per alias, in any order.
+
+    Returns:
+        HashJoin nodes with ids ``hash_join:<left>-<right>``.
     """
+    pair_fractions = pair_fractions or {}
+    by_alias = {port.port.split(":", 1)[1]: port for port in scan_ports}
+    nodes = []
+    for position, join in enumerate(joins):
+        oriented = oriented_join_conditions(join)
+        if oriented is None:
+            continue
+        left, right, conditions = oriented
+        on = tuple(
+            (left_ref.column, right_ref.column)
+            for left_ref, right_ref in conditions
+        )
+        nodes.append(HashJoin(
+            node_id=f"hash_join:{left}-{right}",
+            inputs=input_ports((by_alias[left], by_alias[right])),
+            left=left, right=right, on=on, written_pos=position,
+            pair_fraction=pair_fractions.get(position, 1.0)))
+    return nodes
+
+
+def _filter_alias_work(preds, stats, order, pre: int) -> Work:
+    """Expected Work of one filter chain: a scan, then asks over KV."""
     total = Work()
-    for alias, preds in filters.items():
-        mean = stats[alias].mean_doc_tokens
-        n = float(stats[alias].n_docs)
-        for si, predicate_index in enumerate(filter_orders[alias]):
-            p = preds[predicate_index]
-            q = _question_tokens(p.prompt)
-            op = scan if si == 0 else ask
-            total = total + op(pre + mean, q) * n
-            n *= p.selectivity if p.selectivity is not None else 1.0
+    mean = stats.mean_doc_tokens
+    n = float(stats.n_docs)
+    for si, predicate_index in enumerate(order):
+        p = preds[predicate_index]
+        q = _question_tokens(p.prompt)
+        op = scan if si == 0 else ask
+        total = total + op(pre + mean, q) * n
+        n *= p.selectivity if p.selectivity is not None else 1.0
     return total
 
 
-# ----------------------------------------------- KV keep (residency)
+def node_estimates(graph, *, filter_works, stage_works, live, stats, pre,
+                   cap_pages, model, device, chunk) -> dict:
+    """Price each node's own work, and each chain's recompute if released.
 
-def _length_stats(doc_tokens) -> joinsearch.AliasStats:
-    if isinstance(doc_tokens, joinsearch.AliasStats):
-        return doc_tokens
-    return joinsearch.summarize_alias(doc_tokens)
-
-
-def possible_anchor_aliases(specs) -> set:
-    """Return every legal anchor considered during planning."""
-    out = set()
-    for spec in specs:
-        out.update(joinsearch.anchor_candidates(spec))
+    Returns node id -> {"seconds", and for a filter chain a later join
+    anchors on, "release_recompute_tokens" and
+    "release_recompute_seconds"}. A node's seconds price its work
+    alone; nodes do not add up to the plan's estimate because chunk
+    packing shares forward passes across them. The recompute figure
+    is the expected survivors past the retention pool cap times their
+    prefix cost: what the join pays if the chain's KV is not pinned.
+    """
+    anchored = {node.anchor for node in graph.nodes if isinstance(node, AiJoin)}
+    out = {}
+    for node in graph.nodes:
+        entry = {}
+        if isinstance(node, AiFilter) and node.alias in filter_works:
+            entry["seconds"] = speed_of_light(
+                filter_works[node.alias], model, device, chunk).seconds
+            if node.alias in anchored:
+                mean = stats[node.alias].mean_doc_tokens
+                prefix = pre + mean
+                pages = -(-(prefix + node.hold_tokens) // budgets.PAGE_TOKENS)
+                fits = cap_pages // max(1, pages)
+                excess = max(0.0, live.get(node.alias, 0.0) - fits)
+                entry["release_recompute_tokens"] = round(excess * prefix)
+                entry["release_recompute_seconds"] = speed_of_light(
+                    scan(prefix, 0) * excess, model, device, chunk).seconds
+        elif isinstance(node, AiJoin):
+            work = Work()
+            for stage in node.stages:
+                work = work + stage_works.get(stage.written_pos, Work())
+            entry["seconds"] = speed_of_light(work, model, device, chunk).seconds
+        # other nodes do no model work and get no seconds
+        out[node.node_id] = entry
     return out
 
+
+# ----------------------------------------------- KV keep (residency)
 
 def balanced_shards(doc_tokens, workers: int):
     """Greedily partition documents into shards balanced by token count."""
@@ -284,7 +366,7 @@ def contiguous_shards(doc_tokens, workers: int):
 
 def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                 device: DeviceSpec, doc_tokens: dict, gpus: int = 1,
-                order: str | None = None):
+                order: str | None = None, pair_fractions=None):
     """Compile a LogicalPlan into a PhysicalPlan or Refusal.
 
     Args:
@@ -295,8 +377,30 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
         gpus: GPU count; one model copy runs per GPU.
         order: Stage order rule, 'by_cost' or 'as_written'; None picks
             the default rule.
+        pair_fractions: join written position -> the fraction of the
+            cross product its equality conditions keep.
     """
     scans, filters, joins = collect_operators(plan)
+    applies = collect_applies(plan)
+    alias_applies = {}
+    join_applies = {}
+    for apply in applies:
+        if apply.ids == "pairs":
+            join_applies.setdefault(apply.written_pos, []).append(apply)
+        else:
+            alias_applies.setdefault(apply.aliases[0], []).append(apply)
+    names = [apply.function for apply in applies]
+    if len(set(names)) != len(names):
+        raise CompileError(
+            f"each apply() needs its own name; {names} repeat one")
+    if any(len(group) > 1 for group in join_applies.values()):
+        raise CompileError("a join takes one apply() returning pairs")
+    if gpus > 1 and any(apply.kind == "per_batch" for apply in applies):
+        return Refusal(
+            reasons=("per-batch apply() functions run on one GPU today; "
+                     "use apply_table() or one GPU",),
+            constraint="per_batch_apply_needs_one_gpu",
+            needed=1, available=gpus, unit="gpus")
     length_stats = {a: joinsearch.summarize_alias(t)
                     for a, t in doc_tokens.items()}
     stats = {
@@ -324,7 +428,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     chunk = budgets.chunk_budget(model, device)
     admission = budgets.arena_tokens(model, device, chunk)
     pre = preamble_tokens(filters, joins)
-    specs = join_specs(joins)
+    specs = join_specs(joins, pair_fractions)
 
     # ---- the order rule first: the search below needs it
     rule, source = (order, f"user: order={order!r}") if order else \
@@ -346,36 +450,75 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
         for p in fs:
             surv *= p.selectivity if p.selectivity is not None else 1.0
         live0[_filter_alias(fs[0])] *= surv
-    base_work = _filter_work(filters, stats, filter_orders, pre)
+    filter_works = {
+        alias: _filter_alias_work(preds, stats[alias], filter_orders[alias],
+                                  pre)
+        for alias, preds in filters.items()
+    }
+    base_work = sum(filter_works.values(), Work())
 
     cap_pages = retention_pages(admission, chunk, budgets.PAGE_TOKENS)
     costs = retention.coefficients(model, device)
-    possible = possible_anchor_aliases(specs)
-    search_lengths, _ = retention.allocate(
-        length_stats, live0, filters, {alias: [1.0, 0] for alias in possible},
-        pre, cap_pages * workers, budgets.PAGE_TOKENS, costs)
+    # KV reuse is priced as unlimited
+    filtered = set(filters)
 
     def run_search(honor_forced=True):
         found = joinsearch.search_joins(
-            specs, live0, search_lengths, {}, pre,
+            specs, live0, length_stats, filtered, pre,
             chunk, model, device, base_work=base_work,
             fixed_order=fixed, honor_forced=honor_forced)
         if found is None:
             found = joinsearch.search_joins(
-                specs, live0, search_lengths, {}, pre, chunk, model, device,
-                base_work=base_work, fixed_order=True, honor_forced=honor_forced)
+                specs, live0, length_stats, filtered, pre, chunk, model,
+                device, base_work=base_work, fixed_order=True,
+                honor_forced=honor_forced)
         return found
 
     found = run_search()
     seq = [(specs[position], anchor) for position, anchor in found["seq"]]
-    first_anchor = seq[0][1] if seq else None
-    retention_plan = retention.schedule(seq, live0)
-    credited, keep_plan = retention.allocate(
-        length_stats, live0, filters, retention_plan["initial"], pre,
-        cap_pages * workers, budgets.PAGE_TOKENS, costs)
-    found["work"], found["records"] = joinsearch.walk(
-        seq, live0, credited, {}, pre, model, device)
-    retention_plan.update(**costs, cap_pages=cap_pages, expected=keep_plan)
+    # a second group on the same anchor gets :2, a third :3
+    sequence_groups = retention.group_sequence(seq)
+    group_ids = []
+    seen_ids = {}
+    for group in sequence_groups:
+        anchor = group[0][1]
+        seen_ids[anchor] = seen_ids.get(anchor, 0) + 1
+        group_ids.append(f"ai_join:{anchor}" if seen_ids[anchor] == 1
+                         else f"ai_join:{anchor}:{seen_ids[anchor]}")
+
+    def unique_id(prefix, name):
+        key = f"{prefix}:{name}"
+        seen_ids[key] = seen_ids.get(key, 0) + 1
+        return key if seen_ids[key] == 1 else f"{key}:{seen_ids[key]}"
+
+    retention_plan = retention.schedule(seq, live0, group_ids)
+    # a chain streams only into its alias's first use, and never through
+    # a barrier apply
+    barrier_aliases = {alias for alias, group in alias_applies.items()
+                       if any(apply.kind == "barrier" for apply in group)}
+    for group in sequence_groups:
+        anchor = group[0][1]
+        for spec, _ in group:
+            if any(apply.kind == "barrier"
+                   for apply in join_applies.get(spec["written_pos"], ())):
+                barrier_aliases.add(anchor)
+    streamed = {}
+    partner_before = set()
+    for index, group in enumerate(sequence_groups):
+        anchor = group[0][1]
+        if anchor in filters and anchor not in streamed \
+                and anchor not in partner_before \
+                and anchor not in barrier_aliases:
+            streamed[anchor] = index
+        for spec, _ in group:
+            for alias in spec["aliases"]:
+                if alias != anchor and alias not in streamed:
+                    partner_before.add(alias)
+    retention_plan["initial"] = {
+        alias: use for alias, use in retention_plan["initial"].items()
+        if alias not in streamed
+    }
+    retention_plan.update(**costs, cap_pages=cap_pages)
     forced = sorted({s["anchor"] for s in specs
                      if s["semantics"] == "full"
                      and not s["anchor_free"]})
@@ -391,12 +534,6 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                 f"lower ({free_s:.3f} vs {honored_s:.3f} predicted "
                 f"seconds)")
     stage_records = found["records"]
-
-    for alias, credit in sorted(keep_plan.items()):
-        remarks.append(
-            f"shared KV on {alias!r}: {credit['documents']:.1f} expected "
-            f"documents, {credit['pages'] / workers:.1f} expected pages per "
-            f"worker of the {cap_pages}-page retention budget")
 
     # ---- refusal checks on the predicted plan
     anchors = {wp: a for wp, a in found["seq"]}
@@ -437,12 +574,12 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     # current producer node
     nodes = []
     ids_src = {}
-    for s in sorted(scans, key=lambda scan: scan.alias == first_anchor):
+    for s in scans:
         shard_ranges, loads = contiguous_shards(
             doc_tokens[s.alias], workers
         )
-        sid = f"input:{s.alias}"
-        nodes.append(DocumentInput(
+        sid = f"scan:{s.alias}"
+        nodes.append(PhysicalScan(
             node_id=sid,
             alias=s.alias, input_id=s.alias,
             n_docs=stats[s.alias].n_docs,
@@ -450,78 +587,128 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
             shard_ranges=shard_ranges,
             shard_token_loads=tuple(loads)))
         ids_src[s.alias] = PortRef(sid, f"ids:{s.alias}")
-        if s.alias in filters:
-            order_idx = filter_orders[s.alias]
-            n = stats[s.alias].n_docs
-            stages, surv = [], 1.0
-            for i in order_idx:
-                p = filters[s.alias][i]
-                stages.append(FilterStage(
-                    written_pos=i,
-                    question_tokens=_question_tokens(p.prompt),
-                    preamble_tokens=p.prompt.preamble_tokens,
-                    selectivity=p.selectivity,
-                    expected_docs=round(n * surv, 1)))
-                surv *= p.selectivity if p.selectivity is not None else 1.0
-            keep = s.alias in retention_plan["initial"]
-            writes = len(stages) > 1 or keep
-            credit = keep_plan.get(s.alias)
-            fid = f"filter:{s.alias}"
-            nodes.append(PackedFilter(
-                node_id=fid,
-                inputs=input_ports((ids_src[s.alias],)),
-                alias=s.alias, arena_writes=writes,
-                keep_kv=keep,
-                # the capacity-planned credit; the runtime offers
-                # every survivor to its capped retained pool
-                keep_min_doc_tokens=(1 if credit and credit["documents"] > 0 else 0),
-                keep_resident_fraction=(credit["documents"] / live0[s.alias]
-                                        if credit and live0[s.alias] else 0.0),
-                stages=tuple(stages)))
-            ids_src[s.alias] = PortRef(fid, f"ids:{s.alias}")
-            if not writes:
-                remarks.append(
-                    f"filter on {s.alias!r}: arena writes off (one "
-                    f"stage - nothing reads the KV again)")
+    # the hash join reads the scans; survivors thin its pairs at the AI join
+    pairs_src = {}
+    for node in hash_join_nodes(joins, pair_fractions, ids_src.values()):
+        nodes.append(node)
+        pairs_src[node.written_pos] = node
+
+    def emit_filter(alias):
+        order_idx = filter_orders[alias]
+        n = stats[alias].n_docs
+        stages, surv = [], 1.0
+        for i in order_idx:
+            p = filters[alias][i]
+            stages.append(FilterStage(
+                written_pos=i,
+                question_tokens=_question_tokens(p.prompt),
+                preamble_tokens=p.prompt.preamble_tokens,
+                selectivity=p.selectivity,
+                expected_docs=round(n * surv, 1)))
+            surv *= p.selectivity if p.selectivity is not None else 1.0
+        keep = alias in retention_plan["initial"]
+        pinned = alias in streamed
+        writes = len(stages) > 1 or keep or pinned
+        # pinned pages also cover the consuming join's largest frame
+        hold = max((spec["frame_tokens"][alias]
+                    for spec, _ in sequence_groups[streamed[alias]])
+                   if pinned else (0,))
+        fid = f"ai_filter:{alias}"
+        nodes.append(AiFilter(
+            node_id=fid,
+            inputs=input_ports((ids_src[alias],)),
+            alias=alias, arena_writes=writes,
+            keep_kv=keep, pin_survivors=pinned, hold_tokens=hold,
+            stages=tuple(stages)))
+        ids_src[alias] = PortRef(fid, f"ids:{alias}")
+        if pinned:
+            remarks.append(
+                f"filter on {alias!r} streams its survivors into "
+                f"the join anchored on it; each one's KV stays "
+                f"pinned until its tuples are answered")
+        elif not writes:
+            remarks.append(
+                f"filter on {alias!r}: arena writes off (one "
+                f"stage - nothing reads the KV again)")
+        emit_applies(alias)
+
+    def emit_applies(alias):
+        for apply in alias_applies.get(alias, ()):
+            aid = f"apply:{apply.function}"
+            nodes.append(Foreign(
+                node_id=aid,
+                inputs=input_ports((ids_src[alias],)),
+                function=apply.function, kind=apply.kind, ids=apply.ids,
+                columns=tuple((ref.alias, ref.column)
+                              for ref in apply.columns),
+                aliases=(alias,)))
+            ids_src[alias] = PortRef(aid, f"ids:{alias}")
+
+    for s in scans:
+        if s.alias in filters and s.alias not in streamed:
+            emit_filter(s.alias)
+        elif s.alias not in filters:
+            emit_applies(s.alias)
 
     # group consecutive full stages on the same anchor; gates run
     # alone; anchor switches become barriers
-    groups = []
-    for (spec, anchor), record in zip(seq, stage_records):
-        merge = (groups and spec["semantics"] == "full"
-                 and groups[-1]["full"]
-                 and groups[-1]["anchor"] == anchor)
-        if merge:
-            groups[-1]["members"].append((spec, record))
-        else:
-            groups.append(dict(anchor=anchor,
-                               full=(spec["semantics"] == "full"),
-                               members=[(spec, record)]))
+    records = iter(stage_records)
+    groups = [[(spec, next(records)) for spec, _ in group]
+              for group in sequence_groups]
     exec_idx = 0
-    barrier_n = 0
     pairs_edges = []     # every full stage's passing-pairs edge
     out_aliases = []     # recombination's output order
     for g, group in enumerate(groups):
-        anchor = group["anchor"]
+        anchor = sequence_groups[g][0][1]
         if g > 0:
             ahead = [scan.alias for scan in scans]
-            bid = f"barrier:{barrier_n}"
-            barrier_n += 1
+            bid = unique_id("barrier", anchor)
             exchange_inputs = tuple(pairs_edges) + tuple(
                 ids_src[a] for a in ahead
             )
-            nodes.append(Exchange(
+            nodes.append(Barrier(
                 node_id=bid,
                 inputs=input_ports(exchange_inputs),
                 next_anchor=anchor,
                 aliases=tuple(ahead)))
             for a in ahead:
                 ids_src[a] = PortRef(bid, f"ids:{a}")
-        gid = f"group:{g}"
+        if workers > 1:
+            # anchors go to the GPU holding their KV, else balanced
+            xid = unique_id("exchange", anchor)
+            nodes.append(Exchange(
+                node_id=xid,
+                inputs=input_ports((ids_src[anchor],)),
+                anchor=anchor))
+            ids_src[anchor] = PortRef(xid, f"ids:{anchor}")
+        if streamed.get(anchor) == g:
+            emit_filter(anchor)
+        gid = group_ids[g]
         stage_dicts = []
         in_aliases = [anchor]
-        for spec, record in group["members"]:
+        pair_inputs = []
+        for spec, record in group:
             partners = [a for a in spec["aliases"] if a != anchor]
+            pairs_from = ""
+            if spec["written_pos"] in pairs_src:
+                producer = pairs_src[spec["written_pos"]]
+                pair_inputs.append(
+                    PortRef(producer.node_id, f"pairs:{spec['written_pos']}"))
+                pairs_from = producer.node_id
+            for apply in join_applies.get(spec["written_pos"], ()):
+                # the function's pairs reach the join on their own port
+                aid = f"apply:{apply.function}"
+                nodes.append(Foreign(
+                    node_id=aid,
+                    inputs=input_ports(tuple(
+                        ids_src[a] for a in apply.aliases)),
+                    function=apply.function, kind=apply.kind, ids="pairs",
+                    columns=tuple((ref.alias, ref.column)
+                                  for ref in apply.columns),
+                    aliases=tuple(apply.aliases),
+                    written_pos=spec["written_pos"]))
+                pair_inputs.append(PortRef(aid, f"pairs:{spec['written_pos']}"))
+                pairs_from = aid
             stage_dicts.append(JoinStage(
                 written_pos=spec["written_pos"], exec_idx=exec_idx,
                 anchor=anchor, partners=tuple(partners),
@@ -531,7 +718,8 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                 anchor_frame_tokens=spec["frame_tokens"][anchor],
                 pair_tail_tokens=spec["tail_tokens"],
                 anchor_resident=record["resident"],
-                tuple_tokens=round(record["tokens"], 1)))
+                tuple_tokens=round(record["tokens"], 1),
+                pairs_from=pairs_from))
             exec_idx += 1
             for a in partners:
                 if a not in in_aliases:
@@ -543,11 +731,12 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                 for a in [anchor] + partners:
                     if a not in out_aliases:
                         out_aliases.append(a)
-        nodes.append(AnchoredJoin(
+        nodes.append(AiJoin(
             node_id=gid,
-            inputs=input_ports(tuple(ids_src[a] for a in in_aliases)),
+            inputs=input_ports(tuple(ids_src[a] for a in in_aliases)
+                               + tuple(pair_inputs)),
             anchor=anchor,
-            anchor_resident=group["members"][0][1]["resident"],
+            anchor_resident=group[0][1]["resident"],
             keep_anchor_kv=anchor in retention_plan["after"][gid],
             stages=tuple(stage_dicts)))
         ids_src[anchor] = PortRef(gid, f"ids:{anchor}")
@@ -568,19 +757,28 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     else:
         sink_inputs = (ids_src[scans[0].alias],)
     nodes.append(PhysicalProject(
-        node_id="sink",
+        node_id="project",
         inputs=input_ports(tuple(sink_inputs)),
         columns=tuple(f"{c.alias}.{c.column}" for c in plan.root.columns)))
     if plan.root.limit is not None:
         nodes.append(Limit(
             node_id="limit",
-            inputs=input_ports((PortRef("sink", "rows"),)),
+            inputs=input_ports((PortRef("project", "rows"),)),
             count=plan.root.limit,
         ))
 
     estimate = speed_of_light(
         base_work + found["work"], model, device, chunk
     ).seconds
+    stage_works = {record["written_pos"]: record["work"]
+                   for record in found["records"]}
+
+    def estimator(graph):
+        return node_estimates(
+            graph, filter_works=filter_works, stage_works=stage_works,
+            live=live0, stats=stats, pre=pre, cap_pages=cap_pages,
+            model=model, device=device, chunk=chunk)
+
     return PhysicalPlan(
         model=model.name, device=device.name, workers=workers,
         backend="quail", estimated_seconds=estimate,
@@ -591,13 +789,15 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
             "retention": retention_plan,
             "order_rule": rule,
             "order_source": source,
-        })
+            "search_seconds": estimate,
+        },
+        estimator=estimator)
 
 
 def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                device: DeviceSpec, doc_tokens: dict, gpus: int = 1,
                order: str | None = None, backend: str = "quail",
-               registry=None, tokenizer=None):
+               registry=None, tokenizer=None, pair_fractions=None):
     """Plan one query with the selected model backend.
 
     Args:
@@ -612,6 +812,8 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         registry: Optional session extension registry.
         tokenizer: Optional callable (text -> token list) handed to the
             planning context.
+        pair_fractions: join written position -> the fraction of the
+            cross product its equality conditions keep.
     """
     if registry is None:
         # the built in registry imports every backend, and backends
@@ -646,6 +848,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         backend=backend,
         order=order,
         tokenizer=tokenizer,
+        pair_fractions=dict(pair_fractions or {}),
     )
     region = ModelRegion(plan)
     candidates = tuple(selected.plan(region, context))
@@ -725,8 +928,13 @@ def explain(logical: LogicalPlan, physical, *, verbose: bool = False) -> str:
         if admission is not None:
             budgets.append(f"admission budget={admission:,} tokens")
         lines.append("  " + ", ".join(budgets))
+    if getattr(physical, "estimates", None):
+        lines.append("  node seconds price each node's work alone; they "
+                     "do not add up to the plan estimate because chunk "
+                     "packing shares forward passes across nodes")
     lines.extend("  " + line for line in physical_tree(
-        physical.graph, logical=logical, verbose=verbose).splitlines())
+        physical.graph, logical=logical, verbose=verbose,
+        estimates=getattr(physical, "estimates", None)).splitlines())
     if verbose:
         lines.append("")
         lines.append("settings:")

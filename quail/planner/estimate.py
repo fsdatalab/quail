@@ -21,6 +21,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Callable, Mapping
 
+from quail.logical import oriented_join_conditions
 from quail.planner import budgets
 from quail.planner.decide import (
     collect_operators,
@@ -31,7 +32,8 @@ from quail.planner.decide import (
 from quail.planner.leftdeep import Extension, optimize_left_deep
 from quail.planner.live_rows import PairRelation, exact_live_rows
 from quail.planner.sol import SpeedOfLight, speed_of_light
-from quail.planner.work import Work, ask, scan
+from quail.planner.work import Work, ask, scan, triangle
+from quail.runtime.pairs import pair_table
 from quail.runtime.prefixes import prefix_credits
 from quail.specs import DeviceSpec, ModelSpec
 
@@ -200,6 +202,29 @@ class _Search:
         # column -> rows every filtered alias of that column computed
         # as prefixes; another alias of the column may reuse them
         self.computed_rows_by_column: dict[str, set[int]] = {}
+        # joins without conditions are absent: every pair
+        self.allowed_pairs: dict[int, dict[str, dict[int, set[int]]]] = {}
+        for position, join in enumerate(self.joins):
+            oriented = oriented_join_conditions(join)
+            if oriented is None:
+                continue
+            left_alias, right_alias, conditions = oriented
+            left_keys = [
+                stores[left.alias].column(left.column)
+                for left, _ in conditions
+            ]
+            right_keys = [
+                stores[right.alias].column(right.column)
+                for _, right in conditions
+            ]
+            pairs = pair_table(left_alias, left_keys, right_alias, right_keys)
+            by_side = {left_alias: {}, right_alias: {}}
+            for left_row, right_row in zip(
+                    pairs.column(left_alias).to_pylist(),
+                    pairs.column(right_alias).to_pylist()):
+                by_side[left_alias].setdefault(left_row, set()).add(right_row)
+                by_side[right_alias].setdefault(right_row, set()).add(left_row)
+            self.allowed_pairs[position] = by_side
 
     # ---- work counting --------------------------------------------
 
@@ -219,14 +244,16 @@ class _Search:
         return ask(resident, prefix - resident + suffix)
 
     def join_stage_work(self, anchor, partners, survivors, prompt,
-                        resident_rows, cross_resident_rows=()) -> Work:
+                        resident_rows, cross_resident_rows=(),
+                        allowed=None) -> Work:
         """Return one join stage's work.
 
         Anchor rows in resident_rows have their prefix KV in the arena
         and pay the frame only; the rest scan. cross_resident_rows are
         anchor rows whose document prefix another alias of the same
         column computed; with the shared prefix credit on they pay the
-        frame only too.
+        frame only too. allowed maps an anchor row to the partner rows
+        its equality conditions keep; None streams every partner.
         """
         labels_by_alias, tail = _prompt_token_counts(prompt)
         partner_rows = list(itertools.product(
@@ -237,15 +264,23 @@ class _Search:
                        for alias, row in zip(partners, partner_row))
             for partner_row in partner_rows
         ]
-        suffix_tokens = sum(suffixes)
-        suffix_triangles = sum(suffix * (suffix + 1) / 2
-                               for suffix in suffixes)
+        all_tokens = sum(suffixes)
+        all_triangles = sum(triangle(suffix) for suffix in suffixes)
         frame = labels_by_alias[anchor]["frame"]
         resident_rows = set(resident_rows)
         if self.credit_shared:
             resident_rows |= set(cross_resident_rows)
         work = Work()
         for row in survivors[anchor]:
+            if allowed is None:
+                suffix_tokens, suffix_triangles = all_tokens, all_triangles
+            else:
+                mine = allowed.get(row, ())
+                streamed = [suffix for suffix, partner_row
+                            in zip(suffixes, partner_rows)
+                            if partner_row[0] in mine]
+                suffix_tokens = sum(streamed)
+                suffix_triangles = sum(triangle(suffix) for suffix in streamed)
             prefix = self.pre + self.aliases[anchor].tokens[row]
             work = work + (ask(prefix, frame) if row in resident_rows
                            else self.first_use(anchor, row, frame))
@@ -376,11 +411,14 @@ class _Search:
                 raise NotImplementedError(
                     "the speed of light search needs binary join predicates")
             left, right = stage_aliases
+            allowed = self.allowed_pairs.get(len(edge_relations), {}).get(
+                left)
             passing = frozenset(
                 (left_row, right_row)
                 for left_row in base_rows[left]
                 for right_row in base_rows[right]
-                if self.answer(
+                if (allowed is None or right_row in allowed.get(left_row, ()))
+                and self.answer(
                     join.predicate, {left: left_row, right: right_row})
             )
             edge_relations.append(PairRelation(left, right, passing))
@@ -437,10 +475,13 @@ class _Search:
                         continue
                     partners = [alias for alias in stage_aliases
                                 if alias != anchor]
+                    allowed = self.allowed_pairs.get(edge_index, {}).get(
+                        anchor)
                     stage_work = self.join_stage_work(
                         anchor, partners, live, join.predicate,
                         live[anchor] if anchor in cached_now else (),
                         self.cross_resident(anchor, live, cached_now),
+                        allowed=allowed,
                     )
                     next_edges = active_edges | {edge_index}
                     next_cache = cached_now | {anchor}
@@ -457,8 +498,13 @@ class _Search:
                         "aliases": list(stage_aliases),
                         "anchor": anchor,
                         "partners": partners,
-                        "evaluated_pairs": math.prod(
-                            len(live[alias]) for alias in stage_aliases),
+                        "evaluated_pairs": (
+                            math.prod(len(live[alias])
+                                      for alias in stage_aliases)
+                            if allowed is None else sum(
+                                sum(1 for partner_row in live[partners[0]]
+                                    if partner_row in allowed.get(row, ()))
+                                for row in live[anchor])),
                         "passing_pairs": passing,
                         "fresh_tokens": stage_work.tokens,
                         "cached_prefixes_after": sorted(next_cache),

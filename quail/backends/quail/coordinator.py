@@ -4,7 +4,10 @@ Pure dict-and-list logic (no torch). Called by the worker's parent
 process between child GPUs.
 """
 
+from quail.backends.quail.graph import partner_maps, runs_over_pairs
+from quail.execution import join_answer_cells
 from quail.planner import balanced_shards
+from quail.runtime.pairs import pair_partner
 from quail.runtime.tokens import select_documents
 
 
@@ -102,19 +105,13 @@ def thin_survivors(full_stage_outs: list, survivors: dict) -> dict:
         anchor, partners = out["anchor"], out["partners"]
         alive = set(survivors.get(anchor, out["anchor_index"]))
         seen = {al: set() for al in (anchor, *partners)}
-        for la, row in out["rows"].items():
+        for la, ti, bit in join_answer_cells(out):
             ga = out["anchor_index"][la]
-            if ga not in alive:
+            if ga not in alive or not bit:
                 continue
-            hit = False
-            for ti, bit in enumerate(row):
-                if bit:
-                    hit = True
-                    for al, gp in zip(partners,
-                                      out["partner_index"][ti]):
-                        seen[al].add(gp)
-            if hit:
-                seen[anchor].add(ga)
+            seen[anchor].add(ga)
+            for al, gp in zip(partners, out["partner_index"][ti]):
+                seen[al].add(gp)
         for al, ids in seen.items():
             if al in survivors:
                 survivors[al] = [g for g in survivors[al] if g in ids]
@@ -126,7 +123,8 @@ def thin_survivors(full_stage_outs: list, survivors: dict) -> dict:
 def join_group_payloads(payload: dict, k: int, survivors: dict,
                         group: list, prior_shards: dict | None = None,
                         *, filtered_aliases: set[str] | None = None,
-                        shards: dict | None = None) -> list:
+                        shards: dict | None = None,
+                        pair_tables: dict | None = None) -> list:
     """Build per-worker sub-payloads for one anchor group's join round.
 
     Anchors follow the shards their KV already sits on - the shards of
@@ -177,6 +175,17 @@ def join_group_payloads(payload: dict, k: int, survivors: dict,
             "index": indices,
             "docs": select_documents(payload["docs"][alias], indices),
         }
+    # a pair stage ships each worker its anchors' live partner rows
+    maps = partner_maps(group, pair_tables or {})
+    pair_rows = {}
+    for j in group:
+        if not runs_over_pairs(j):
+            continue
+        live_partners = set(partners[pair_partner(
+            anchor_alias, j["partners"])]["index"])
+        pair_rows[j["written_pos"]] = {
+            anchor: [p for p in matched if p in live_partners]
+            for anchor, matched in maps[j["written_pos"]].items()}
     subs = []
     for w in range(k):
         sub = _common_payload(payload)
@@ -188,6 +197,9 @@ def join_group_payloads(payload: dict, k: int, survivors: dict,
                        payload["docs"][anchor_alias], anchor_shards[w]
                    ),
                    partners=partners,
+                   pairs={position: {anchor: rows.get(anchor, [])
+                                     for anchor in anchor_shards[w]}
+                          for position, rows in pair_rows.items()},
                    worker=w, workers=k)
         subs.append(sub)
     return subs
@@ -201,6 +213,7 @@ def merge_join_round(outs: list) -> list:
     merged = []
     for s in range(n_stages):
         rows, anchor_index = {}, []
+        members = None
         partner_index = outs[0]["joins"][s]["partner_index"]
         for out in outs:
             stage = out["joins"][s]
@@ -208,6 +221,11 @@ def merge_join_round(outs: list) -> list:
             anchor_index.extend(stage["anchor_index"])
             for local, row in stage["rows"].items():
                 rows[base + int(local)] = row
+            if stage.get("anchor_partners") is not None:
+                members = members or {}
+                for local, streamed in stage["anchor_partners"].items():
+                    members[base + int(local)] = streamed
         merged.append(dict(rows=rows, anchor_index=anchor_index,
-                           partner_index=partner_index))
+                           partner_index=partner_index,
+                           anchor_partners=members))
     return merged

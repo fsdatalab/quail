@@ -18,7 +18,7 @@ def test_query_scans_provider_and_preserves_extension_objects(
     tmp_path, monkeypatch
 ):
     from quail.execution import export_physical_outputs
-    from quail.physical import DocumentInput, PackedFilter, decode_graph
+    from quail.physical import AiFilter, Scan, decode_graph
     from quail.runtime import execute as runtime
     from quail.runtime.runner import NodeMetrics, NodeResult, RunResult
     from quail.runtime.session import Session
@@ -60,7 +60,7 @@ def test_query_scans_provider_and_preserves_extension_objects(
             physical.plan["graph"], registry.codecs
         )
         source = next(
-            node for node in graph.nodes if isinstance(node, DocumentInput)
+            node for node in graph.nodes if isinstance(node, Scan)
         )
         documents = physical.inputs[source.input_id].documents
         assert [list(document) for document in documents] == [
@@ -68,7 +68,7 @@ def test_query_scans_provider_and_preserves_extension_objects(
             ["second", "document"],
         ]
         filter_node = next(
-            node for node in graph.nodes if isinstance(node, PackedFilter)
+            node for node in graph.nodes if isinstance(node, AiFilter)
         )
         run = RunResult(
             None,

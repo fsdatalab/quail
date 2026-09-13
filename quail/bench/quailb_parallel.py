@@ -21,7 +21,7 @@ from pathlib import Path
 
 import modal
 
-from quail.bench.results import write_json
+from quail.bench.results import combine_measurements, write_json
 
 base_image = (
     modal.Image.from_registry(
@@ -40,10 +40,12 @@ base_image = (
         "TRITON_CACHE_DIR": "/root/.cache/kernels/triton",
         "TORCHINDUCTOR_CACHE_DIR": "/root/.cache/kernels/torchinductor",
     })
-    .add_local_python_source("quail", "quail_b")
 )
-image = base_image.pip_install("vllm==0.26.0")
-sglang_image = base_image.pip_install("sglang==0.5.18")
+# local sources go last: Modal refuses a build step after them
+image = base_image.pip_install("vllm==0.26.0").add_local_python_source(
+    "quail", "quail_b")
+sglang_image = base_image.pip_install(
+    "sglang==0.5.18").add_local_python_source("quail", "quail_b")
 
 app = modal.App("quail-milestone1")
 hf_cache = modal.Volume.from_name("quail-hf-cache", create_if_missing=True)
@@ -98,6 +100,7 @@ def run_query_family(
     run_dir: str,
     ground_truth_collection: str,
     include_baselines: bool,
+    include_quail: bool = True,
 ) -> str:
     try:
         from quail.bench.process_isolation import (
@@ -109,7 +112,7 @@ def run_query_family(
             query_id.strip() for query_id in query_ids_csv.split(",")
             if query_id.strip())
         family = query_family_name(query_ids)
-        process_groups = [("quail",)]
+        process_groups = [("quail",)] if include_quail else []
         if include_baselines:
             process_groups.append(("stock_vllm", "pipelined_vllm"))
 
@@ -253,13 +256,15 @@ def run_all(
     ground_truth_collection: str = "",
     include_baselines: bool = True,
     include_sglang: bool = True,
+    include_quail: bool = True,
 ):
     from quail_b import select_queries
     from quail_b.queries import query_family_name, split_query_families
 
     only = [item.strip() for item in query.split(",")] if query else None
     query_ids = tuple(spec.id for spec in select_queries(only, scale_factor=sf))
-    directory = Path(run_dir).resolve()
+    # not resolve(): /results is a mount inside the container
+    directory = Path(run_dir)
     if not directory.is_relative_to("/results") or directory == Path("/results"):
         raise ValueError("run directory must be inside the /results volume mount")
     directory.mkdir(parents=True, exist_ok=False)
@@ -292,22 +297,24 @@ def run_all(
         t0 = time.time()
         for family_ids in families:
             family = query_family_name(family_ids)
-            family_call = run_query_family.spawn(
-                model=model,
-                sf=sf,
-                query_ids_csv=",".join(family_ids),
-                run_dir=run_dir,
-                ground_truth_collection=ground_truth_collection,
-                include_baselines=include_baselines,
-            )
-            family_calls.append((family, family_call))
-            call_ids[f"{family}:quail_vllm"] = family_call.object_id
-            print(
-                f"function call id: {family_call.object_id} "
-                f"({family}, Quail and vLLM, {','.join(family_ids)})",
-                flush=True,
-            )
-            if include_baselines and include_sglang:
+            if include_quail or include_baselines:
+                family_call = run_query_family.spawn(
+                    model=model,
+                    sf=sf,
+                    query_ids_csv=",".join(family_ids),
+                    run_dir=run_dir,
+                    ground_truth_collection=ground_truth_collection,
+                    include_baselines=include_baselines,
+                    include_quail=include_quail,
+                )
+                family_calls.append((family, family_call))
+                call_ids[f"{family}:quail_vllm"] = family_call.object_id
+                print(
+                    f"function call id: {family_call.object_id} "
+                    f"({family}, Quail and vLLM, {','.join(family_ids)})",
+                    flush=True,
+                )
+            if include_sglang:
                 sglang_call = run_sglang_query_family.spawn(
                     model=model,
                     sf=sf,
@@ -339,14 +346,9 @@ def run_all(
         elapsed = time.time() - t0
 
         methods = (
-            (
-                "quail",
-                "stock_vllm",
-                "pipelined_vllm",
-                *(("pipelined_sglang",) if include_sglang else ()),
-            )
-            if include_baselines else ("quail",)
-        )
+            (("quail",) if include_quail else ())
+            + (("stock_vllm", "pipelined_vllm") if include_baselines else ())
+            + (("pipelined_sglang",) if include_sglang else ()))
         reports = {}
         paths = {}
         for method in methods:
@@ -381,6 +383,7 @@ def run_all(
         for method, report in reports.items():
             write_json(directory / paths[method], report)
             write_report(directory / method, rescore=False)
+        combine_measurements(directory, list(reports))
         manifest.update(
             status="complete",
             parallel_wall_s=round(elapsed, 1),
@@ -423,6 +426,7 @@ def main(
     ground_truth_collection: str = "",
     include_baselines: bool = True,
     include_sglang: bool = True,
+    include_quail: bool = True,
 ):
     run_id = (
         f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-"
@@ -437,6 +441,7 @@ def main(
         ground_truth_collection=ground_truth_collection,
         include_baselines=include_baselines,
         include_sglang=include_sglang,
+        include_quail=include_quail,
     )
     print(f"function call id: {call.object_id} (all families)", flush=True)
     print(call.get(), flush=True)

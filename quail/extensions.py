@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
 _KINDS = {
     "logical_rule", "physical_planner", "physical_rule", "backend",
-    "model", "device", "codec", "runtime", "observer",
+    "model", "device", "codec", "runtime", "observer", "function",
 }
 
 
@@ -81,6 +81,11 @@ class ExtensionRegistry:
     def observer_factories(self) -> Mapping[str, Callable[[], ExecutionObserver]]:
         return self._values("observer")
 
+    @property
+    def functions(self) -> Mapping[str, Callable[..., Any]]:
+        """User functions a query's Apply nodes call, by name."""
+        return self._values("function")
+
     def _check_name(self, kind: str, name: str) -> None:
         if kind not in _KINDS:
             raise ValueError(f"unknown extension kind {kind!r}")
@@ -139,6 +144,18 @@ class ExtensionRegistry:
             "runtime", getattr(runtime, "runtime_key", None) if key is None else key,
             runtime,
         )
+
+    def register_function(
+        self, function: Callable[..., Any], *, name: str,
+    ) -> ExtensionRegistry:
+        """Register a Python function for a query's apply() nodes.
+
+        The function takes a dict of Arrow tables keyed by alias and
+        returns ids or pairs; see quail.logical.Apply.
+        """
+        if not callable(function):
+            raise TypeError("register_function needs a callable")
+        return self._add("function", name, function)
 
     def register_observer(
         self, factory: Callable[[], ExecutionObserver], *, name: str | None = None,

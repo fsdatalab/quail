@@ -59,23 +59,32 @@ forward pass.
   arena.
 - **Dedup.** In a chain join, an anchor that matched several partners
   still appears once in the next stage.
-- **Retention.** Join groups reuse retained filter KV for their anchors.
-  Evicted documents are processed again.
+- **Streaming.** The first join group's anchor filter does not finish
+  before the join starts. Each document that passes its last filter
+  stage keeps its KV in the arena and goes straight into the join,
+  which pulls one filter chunk at a time until its own chunk can fill.
+  The join frees the KV once the anchor's tuples are answered, so no
+  anchor prefix is computed twice.
+- **Retention.** Later join groups reuse retained filter KV for their
+  anchors. Evicted documents are processed again.
 
 The planner uses Selinger-style dynamic programming to choose join order and
-anchors before inference. Filter survival is estimated from selectivities,
-with the input document length distribution used for the survivors.
+anchors before inference. Filter survival is estimated from selectivities.
+KV reuse is priced as unlimited: a document prefix computed once is free at
+every later anchor use, the same assumption as the speed-of-light estimate.
 
-- The first anchor's filter chain runs last. Every input used as a later anchor
-  can retain its passing document KV in one shared pool.
+- A filtered alias whose first use is as an anchor has its chain run right
+  before that group and stream into it. An alias that is a partner first
+  finishes its chain before that group, and its passing document KV waits in
+  one shared pool per GPU.
 - Runtime retention prefers expected prefix computation saved per KV page.
   Document lengths determine computation and page counts. The saved plan supplies
   the probability and position of the next use. Exact survivors are known only
   during execution.
 - Two execution chunks are reserved before allocating retained pages. Active KV
   cannot be evicted. Prefixes are released when they have no further planned use.
-- Planned `AnchoredJoin` nodes reuse available KV. Missing KV is recomputed.
-- Planned `Exchange` nodes prune actual survivors before the next join group.
+- Planned `AiJoin` nodes reuse available KV. Missing KV is recomputed.
+- Planned `Barrier` nodes prune actual survivors before the next join group.
 - Execution keeps the planned order even when actual selectivity differs.
 
 ## The executor
@@ -105,9 +114,9 @@ sends payloads over pipes.
 - The filter round: each child filters its contiguous shard of every
   table, reading token values straight from the shared memory mapped
   file. The parent merges survivors.
-- One join round per `AnchoredJoin`: anchors follow their filter
+- One join round per `AiJoin`: anchors follow their filter
   shard; every child receives every surviving partner.
-- An `Exchange` between anchors: the parent thins each table to
+- An `Barrier` between anchors: the parent thins each table to
   documents still in a passing pair and re-partitions the new anchor.
 
 Filters split documents. Joins split anchors. Every pair belongs to

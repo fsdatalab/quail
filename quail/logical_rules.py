@@ -6,6 +6,7 @@ from dataclasses import replace
 
 from quail.logical import (
     ColumnRef,
+    Equality,
     FilterPredicate,
     LogicalNode,
     Project,
@@ -22,14 +23,17 @@ def _column_refs(expression) -> tuple[ColumnRef, ...]:
         return tuple(expression.prompt.args)
     if isinstance(expression, Prompt):
         return tuple(expression.args)
+    if isinstance(expression, Equality):
+        return (expression.left, expression.right)
     return ()
 
 
 def required_columns(root: LogicalNode) -> dict[str, tuple[str, ...]]:
     """Return the source columns each alias reads, in first use order.
 
-    A column is read when the root projection returns it or when a
-    filter or join prompt names it.
+    A column is read when the root projection returns it, when a
+    filter or join prompt names it, or when a join condition compares
+    it.
     """
     needed: dict[str, dict[str, None]] = {}
 

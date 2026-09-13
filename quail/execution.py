@@ -3,18 +3,19 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import pyarrow as pa
 
 from quail.physical import (
+    AiFilter,
     OutputPort,
-    PackedFilter,
     PhysicalGraph,
     PortRef,
     ValueType,
 )
+from quail.runtime.pairs import COLUMNS_PREFIX
 from quail.runtime.tokens import decode_token_documents
 
 
@@ -42,10 +43,15 @@ def document_input(tokens) -> TokenizedInput:
 
 @dataclass(frozen=True)
 class PhysicalRequest:
-    """A physical plan and its token input bindings."""
+    """A physical plan, its token input bindings, and its relations.
+
+    relations holds one value table per alias a HashJoin or an apply()
+    function reads, keyed ``columns:<alias>``; see quail.runtime.pairs.
+    """
 
     plan: Mapping[str, Any]
     inputs: Mapping[str, TokenizedInput]
+    relations: Mapping[str, pa.Table] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         for input_id, value in self.inputs.items():
@@ -55,6 +61,19 @@ class PhysicalRequest:
                 raise TypeError(
                     "physical execution inputs must be TokenizedInput values"
                 )
+        for key, value in self.relations.items():
+            if not key.startswith(COLUMNS_PREFIX):
+                raise ValueError(
+                    f"execution relations are keyed {COLUMNS_PREFIX}<alias>, "
+                    f"got {key!r}")
+            if not isinstance(value, pa.Table):
+                raise TypeError("execution relations must be Arrow tables")
+
+    def column_tables(self) -> dict[str, pa.Table]:
+        """Return the value tables apply() functions read, by alias."""
+        return {key[len(COLUMNS_PREFIX):]: table
+                for key, table in self.relations.items()
+                if key.startswith(COLUMNS_PREFIX)}
 
     @property
     def gpu_count(self) -> int:
@@ -100,7 +119,7 @@ def _document_ids_table(port: OutputPort, value: Any) -> pa.Table:
     )
 
 
-def _filter_answers_table(node: PackedFilter, value: Mapping) -> pa.Table:
+def _filter_answers_table(node: AiFilter, value: Mapping) -> pa.Table:
     documents = []
     positions = []
     answers = []
@@ -130,6 +149,23 @@ def _filter_answers_table(node: PackedFilter, value: Mapping) -> pa.Table:
     )
 
 
+def join_answer_cells(value: Mapping[str, Any]):
+    """Yield (anchor local index, partner member index, answer) triples.
+
+    rows[local] runs over the partner members the anchor streamed:
+    every member of partner_index, or the member indices listed in
+    anchor_partners[local] when the join ran over pairs.
+    """
+    members = value.get("anchor_partners") or {}
+    for raw_local, row in value["rows"].items():
+        local = int(raw_local)
+        streamed = members.get(local)
+        for position, answer in enumerate(row):
+            yield (local,
+                   position if streamed is None else int(streamed[position]),
+                   answer)
+
+
 def _join_answers_table(value: Mapping[str, Any]) -> pa.Table:
     anchor = str(value["anchor"])
     partners = tuple(value["partners"])
@@ -138,13 +174,11 @@ def _join_answers_table(value: Mapping[str, Any]) -> pa.Table:
     answers = []
     anchor_map = value["anchor_index"]
     partner_map = value["partner_index"]
-    for raw_local, row in value["rows"].items():
-        local = int(raw_local)
-        for member_index, answer in enumerate(row):
-            columns[anchor].append(int(anchor_map[local]))
-            for alias, document in zip(partners, partner_map[member_index]):
-                columns[alias].append(int(document))
-            answers.append(bool(answer))
+    for local, member_index, answer in join_answer_cells(value):
+        columns[anchor].append(int(anchor_map[local]))
+        for alias, document in zip(partners, partner_map[member_index]):
+            columns[alias].append(int(document))
+        answers.append(bool(answer))
     fields = []
     fields.extend(
         pa.field(alias, pa.int32(), nullable=False) for alias in aliases
@@ -175,8 +209,8 @@ def _output_table(node, port: OutputPort, value: Any) -> pa.Table:
     if port.value_type is ValueType.DOCUMENT_IDS:
         return _document_ids_table(port, value)
     if port.value_type is ValueType.FILTER_ANSWERS:
-        if not isinstance(node, PackedFilter):
-            raise TypeError("filter answer output needs a PackedFilter node")
+        if not isinstance(node, AiFilter):
+            raise TypeError("filter answer output needs a AiFilter node")
         return _filter_answers_table(node, value)
     if port.value_type is ValueType.JOIN_ANSWERS:
         return _join_answers_table(value)

@@ -65,7 +65,7 @@ the keys every backend fills:
     }
   ],
   "node_metrics": {
-    "filter:r": {
+    "ai_filter:r": {
       "input_rows": 8,
       "output_rows": 4,
       "evaluated_documents": 8,
@@ -95,7 +95,7 @@ the keys every backend fills:
 | `remarks` | Planner and tokenizer notes. |
 | `worker_total_s` | Total time in query execution, including tokenization and planning. Excludes wrapper report writes and volume commits. |
 
-The Quail backend adds `regret_tokens`, `kv_manager`, `peak_gib`,
+The Quail backend adds `kv_manager`, `peak_gib`,
 `order_rule`, `expected_join_plan`, and `executed_join_plan`. The saved
 join order is the executed order. Actual row counts and KV hits can differ
 from the estimates. The join query in the quickstart shows them:
@@ -104,7 +104,7 @@ from the estimates. The join query in the quickstart shows them:
 {
   "order_rule": "by_cost",
   "executed_join_plan": [
-    {"type": "quail.anchored_join", "id": "group:0", "anchor": "r"}
+    {"type": "quail.ai_join", "id": "ai_join:r", "anchor": "r"}
   ],
   "kv_manager": {
     "retained_after_filters": 4,
@@ -138,29 +138,44 @@ print(session.sql(text).explain())
 
 ```text
 logical:
-  Project [r.id, a.aspect]
-    SemanticJoin (full, x2 inputs, sel=0.15, anchor=None)
-      SemanticFilter (x1, sels=[0.6])
-        Scan reviews as r [body]
-      Scan aspects as a [aspect]
-physical:
-  workers=1 model_copies=1
-  KV dtype=bf16
-  chunk_tokens=110376 admission_tokens=362250
-  order=by_cost (default: every gated predicate has a selectivity)
-  DocumentInput input:a alias=a input_id=a n_docs=12 total_tokens=27 shard_docs=[12]
-  DocumentInput input:r alias=r input_id=r n_docs=8 total_tokens=693 shard_docs=[8]
-  PackedFilter filter:r alias=r arena_writes=True keep_kv=True keep_min_doc_tokens=1 keep_resident_fraction=1.0 <- input:r[ids:r]
-    stage {'written_pos': 0, 'question_tokens': 51, 'preamble_tokens': 2, 'selectivity': 0.6, 'expected_docs': 8.0}
-  AnchoredJoin group:0 anchor=r anchor_resident=filter keep_anchor_kv=False <- filter:r[ids:r], input:a[ids:a]
-    stage {'written_pos': 0, 'exec_idx': 0, 'anchor': 'r', 'partners': ['a'], 'semantics': 'full', 'selectivity': 0.15, 'expected_tuples': 57.6, 'anchor_frame_tokens': 36, 'pair_tail_tokens': 4, 'anchor_resident': 'filter', 'tuple_tokens': 878.4}
-  Project sink columns=['r.id', 'a.aspect'] <- group:0[join_answers:0]
+  Project: r.id, a.aspect
+    SemanticJoin (full)
+      PROMPT('Does the review in DOCUMENT {0} discuss the movie aspect in DOCUMENT {1}?', r.body, a.aspect) (selectivity=15%)
+      Join
+        cross
+        SemanticFilter
+          PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the review above ...', r.body) (selectivity=60%)
+          Scan reviews as r [body, id]
+        Scan aspects as a [aspect]
+
+physical: (backend=quail, model=qwen3-4b-fp8, workers=1)
+  KV=bf16, chunk budget=110,376 tokens, admission budget=362,250 tokens
+  node seconds price each node's work alone; they do not add up to the plan estimate because chunk packing shares forward passes across nodes
+  Project: r.id, a.aspect (estimated_rows=unknown)
+    AiJoin: anchor=r (estimated_rows=unknown, estimated_seconds=0.003)
+      KV: anchor=streamed from its filter, retain after join=no
+      1. full (r, a): PROMPT('Does the review in DOCUMENT {0} discuss the movie aspect in DOCUMENT {1}?', r.body, a.aspect) (selectivity=15%, estimated_evaluations=57.6)
+      AiFilter: r (estimated_rows=4.8, estimated_seconds=0.004)
+        survivors stream into the join with KV pinned
+        1. PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the review above ...', r.body) (selectivity=60%, question_tokens=51)
+        if the KV were released here instead of pinned: 0 tokens, 0.000 s
+        Scan reviews as r (estimated_rows=8)
+          tokens=693, mean_doc_tokens=86.6
+      Scan aspects as a (estimated_rows=12)
+        tokens=27, mean_doc_tokens=2.2
 ```
 
-The logical part is the `Scan`, `SemanticFilter`, `SemanticJoin`, and
-`Project` tree. The physical part lists every node of the typed graph
-in execution order with its explain fields, then the planner's
-remarks. Each `<-` names the ports a node reads.
+The logical part is the `Project`, `SemanticJoin`, `Join`,
+`SemanticFilter`, and `Scan` tree, each predicate under the operator
+that evaluates it. The physical part is the same tree in physical
+nodes, each with its estimated rows, and each model node with
+`estimated_seconds`, its own work priced alone. A filter chain a join
+anchors on shows the recompute it would pay if its KV were released
+instead of pinned. `explain(verbose=True)` adds node ids, the port
+each node reads, the runtime settings, and the planner's remarks. See
+[physical plans](../architecture/physical-plans) for what the numbers
+mean and how to edit the plan, and `demos/plan_walkthrough.py` for a
+script that prints and edits a plan on the CPU.
 
 If the planner refuses the query, `explain()` prints the refusal
 instead. A refusal names the constraint and the numbers behind it, for

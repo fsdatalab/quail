@@ -14,6 +14,8 @@ from quail.backends.quail.graph import (
     _join_round_kv,
     _tuple_suffix,
     execute_single_graph,
+    partner_list_builder,
+    stage_partner_lists,
 )
 from quail.backends.quail.retention import apply_retention, retain_after_join
 from quail.execution import PhysicalResponse
@@ -22,14 +24,14 @@ from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION, Pipeline
 from quail.executor.loop import AsyncAnswers, warm_kernels
 from quail.executor.model import answer_weights, load_model, resolve_model_path
 from quail.physical import (
-    AnchoredJoin,
-    DocumentInput,
-    PackedFilter,
+    AiFilter,
+    AiJoin,
+    Scan,
     decode_graph,
 )
 from quail.planner import budgets
 from quail.progress import say, set_gpu_index
-from quail.runtime.runner import ExecutionContext
+from quail.runtime.runner import ExecutionContext, SurvivorStream
 from quail.runtime.tokens import (
     DocumentPrefixes,
     chain_tokens,
@@ -155,7 +157,7 @@ def quail_runtime_payload(request, graph) -> dict:
     envelope = request.plan
     docs = {}
     for node in graph.nodes:
-        if not isinstance(node, DocumentInput):
+        if not isinstance(node, Scan):
             continue
         docs[node.alias] = request.inputs[node.input_id].documents
     return {
@@ -163,6 +165,7 @@ def quail_runtime_payload(request, graph) -> dict:
         "model": envelope["model"],
         "workers": envelope["workers"],
         "docs": docs,
+        "columns": request.column_tables(),
         **dict(envelope["settings"]),
     }
 
@@ -306,6 +309,8 @@ def execute_single(state, payload: dict, registry, graph) -> dict:
     runtime_state = {
         **state,
         "docs": decode_payload_documents(payload["docs"]),
+        "columns": payload.get("columns", {}),
+        "functions": registry.functions,
         "runtimes": registry.runtimes,
         "model_spec": state.get("spec") or state.get("model_spec"),
         "device": registry.device(payload["physical_plan"]["device"]),
@@ -399,7 +404,7 @@ def _child_filters(state, sub):
                 state["registry"].codecs,
             )
             node = graph.node(node_id)
-            if not isinstance(node, PackedFilter):
+            if not isinstance(node, AiFilter):
                 raise TypeError(
                     f"child filter received {node.type_name!r}")
             alias = node.alias
@@ -425,8 +430,6 @@ def _child_filters(state, sub):
                     key[1] for key in arena.accounting.retained
                     if key[0] == alias)
             out["fresh_tokens"] += result.metrics.fresh_tokens
-            state["seen"].update((alias, document)
-                                 for document in answers)
             out["filters"][alias] = {
                 int(document): row for document, row in answers.items()
             }
@@ -454,7 +457,7 @@ def _child_joins(state, sub):
     registry = state["registry"]
     encoded_node = sub["physical_node"]
     node = registry.codecs[encoded_node["type"]].decode(encoded_node)
-    if not isinstance(node, AnchoredJoin):
+    if not isinstance(node, AiJoin):
         raise TypeError(f"child join received {node.type_name!r}")
     group = [stage.runtime_spec() for stage in node.stages]
     anchor_alias = node.anchor
@@ -466,7 +469,14 @@ def _child_joins(state, sub):
     apply_retention(arena, config,
                     config.get("before", {}).get(node.node_id, {}), live)
     retain_anchor = bool(sub.get("retain_anchor"))
-    seen = state.setdefault("seen", set())
+    encoded_filter = sub.get("stream_filter_node")
+    filter_node = None
+    if encoded_filter is not None:
+        filter_node = registry.codecs[encoded_filter["type"]].decode(
+            encoded_filter)
+        if not isinstance(filter_node, AiFilter) \
+                or filter_node.alias != anchor_alias:
+            raise TypeError("the streamed chain must filter the anchor")
     out_joins, tokens_total = [], 0
     t0 = time.perf_counter()
     with torch.inference_mode():
@@ -486,11 +496,28 @@ def _child_joins(state, sub):
             stage_suffixes.append(
                 [_tuple_suffix(j, part_docs, combo)
                  for combo in combos])
-        prefixes = [chain_tokens(pre, d) for d in anchor_docs]
-        anchor_keys = [(anchor_alias, g) for g in anchors_glob]
-        round_kv = _join_round_kv(
-            anchor_keys, [len(p) for p in prefixes],
-            arena.accounting.owned, seen)
+        # this GPU's anchors only
+        lists_for = partner_list_builder(
+            group, tuple_globs,
+            {int(position): {int(anchor): partners
+                             for anchor, partners in rows.items()}
+             for position, rows in sub.get("pairs", {}).items()})
+        if filter_node is None:
+            prefixes = [chain_tokens(pre, d) for d in anchor_docs]
+            anchor_keys = [(anchor_alias, g) for g in anchors_glob]
+            round_kv = _join_round_kv(anchor_keys, arena.accounting.owned)
+            anchor_stream = None
+        else:
+            # filled by the driver as this GPU's shard streams through
+            prefixes, anchor_keys = [], []
+            round_kv = None
+            anchor_stream = {
+                "node": filter_node,
+                "documents": DocumentPrefixes(
+                    pre, anchor_docs, range(len(anchor_docs))),
+                "document_ids": anchors_glob,
+                "stream": SurvivorStream(filter_node, anchors_glob),
+            }
 
         def anchor_done(a, row):
             matched = any(row)
@@ -513,17 +540,34 @@ def _child_joins(state, sub):
                 ],
                 "anchor_keys": anchor_keys,
                 "anchor_done": anchor_done,
-                "anchor_ids": anchors_glob,
+                "anchor_stream": anchor_stream,
+                "kv_round": round_kv,
+                "anchor_ids": None if filter_node else anchors_glob,
                 "partner_indices": {
                     stage.written_pos: tuples
                     for stage, tuples in zip(node.stages, tuple_globs)
                 },
+                "anchor_partners": lists_for,
                 "group": group,
             },
             runtime_context,
         )
         ans = result.metrics.extension["answers"]
-        seen.update(anchor_keys)
+        filter_out = {}
+        if filter_node is not None:
+            anchors_glob = [key[1] for key in anchor_keys]
+            round_kv = dict(hits=result.metrics.kv_hits,
+                            misses=result.metrics.kv_misses)
+            chain = anchor_stream["stream"].finalized_result()
+            answers = chain.outputs[f"filter_answers:{anchor_alias}"]
+            filter_out = dict(
+                filters={anchor_alias: {
+                    int(document): row for document, row in answers.items()
+                }},
+                survivors={anchor_alias: list(
+                    chain.outputs[f"ids:{anchor_alias}"])},
+                filter_fresh_tokens=chain.metrics.fresh_tokens,
+            )
         last = ans[-1] if ans else {}
         for a, key in enumerate(anchor_keys):
             if key not in arena.accounting.owned:
@@ -537,11 +581,13 @@ def _child_joins(state, sub):
             else:
                 arena.free_key(key)
         tokens_total += result.metrics.fresh_tokens
+        partner_lists = stage_partner_lists(group, lists_for, anchors_glob)
         for si, j in enumerate(group):
             out_joins.append(dict(
                 rows={int(a): row for a, row in ans[si].items()},
                 anchor_index=anchors_glob,
-                partner_index=tuple_globs[si]))
+                partner_index=tuple_globs[si],
+                anchor_partners=partner_lists[si]))
     if sub.get("final_group"):
         for key in list(arena.accounting.owned):
             arena.free_key(key)
@@ -553,6 +599,7 @@ def _child_joins(state, sub):
                 retained={alias: sorted(documents)
                           for alias, documents in retained.items()},
                 kv_round=round_kv,
+                **filter_out,
                 kv_totals=dict(
                     evicted_keys=arena.evicted_keys,
                     evicted_pages=arena.evicted_pages,
@@ -567,7 +614,6 @@ def _reset_child_query(state):
     for key in list(arena.accounting.owned):
         arena.free_key(key)
     arena.reset_stats()
-    state["seen"] = set()
 
 
 def _ensure_children(k):

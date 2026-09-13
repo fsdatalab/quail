@@ -7,9 +7,11 @@ The names below are the planning interface a model backend uses.
 
 from .decide import (
     balanced_shards,
+    collect_applies,
     collect_operators,
     default_order_rule,
     explain,
+    hash_join_nodes,
     join_specs,
     order_filters_indexed,
     plan_quail,
@@ -24,8 +26,10 @@ __all__ = [
     "PhysicalPlan",
     "Refusal",
     "balanced_shards",
+    "collect_applies",
     "collect_operators",
     "default_order_rule",
+    "hash_join_nodes",
     "explain",
     "join_specs",
     "order_filters_indexed",

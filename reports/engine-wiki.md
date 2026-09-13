@@ -38,11 +38,11 @@ in the same process.
 | `planner/plan.py` | PhysicalPlan, Refusal, and EngineConfig | physical, specs |
 | `planner/__init__.py` | The public planning interface backends import: `collect_operators`, `plan_query`, `plan_quail`, `preamble_tokens`, `order_filters_indexed`, `join_specs`, `balanced_shards` | decide, plan |
 | `planner/decide.py` | All planner decisions (order, anchor, budgets, sharding) | logical, budgets, plan |
-| `planner/retention.py` | Expected length allocations and future anchor use probabilities | joins, qwen3_cost, executor/retention |
+| `planner/retention.py` | Retention priority costs and future anchor use probabilities for the executor | joins, qwen3_cost |
 | `executor/arena.py` | Paged KV arena (PageArena accounting + KVArena tensors) | nothing (torch lazy) |
 | `executor/attention.py` | Pipeline: forward pass, attention, Triton kernels | arena (torch, vLLM, triton lazy) |
 | `executor/pack.py` | Chunk admission (JoinAdmission, FilterAdmission) | nothing |
-| `executor/loop.py` | Execution loops (run_filter, run_join, warm_kernels) | arena, attention, pack |
+| `executor/loop.py` | Execution loops (FilterStream, run_filter, run_join, warm_kernels) | arena, attention, pack |
 | `executor/model.py` | Weight loading through vLLM | nothing (vLLM lazy) |
 | `runtime/session.py` | Session, Query, tokenization, input binding, and result assembly | catalog, logical, planner, sqlfront, builder |
 | `runtime/tokens.py` | Memory mapped token files and random document views | Arrow |
@@ -134,8 +134,8 @@ for sources and validation status. Memory budgets remain per GPU.
 2. The user writes a query, either as AI SQL or through the builder
    API.
 3. Both front ends use `LogicalPlanBuilder` to create a tree of
-   `Scan`, `SemanticFilter`, `SemanticJoin`, and logical `Project`
-   nodes. Every logical node implements the same traversal, rewrite,
+   `Scan`, `SemanticFilter`, `Join`, `SemanticJoin`, and logical
+   `Project` nodes. Every logical node implements the same traversal, rewrite,
    validation, schema, and explain interface.
 4. The session keeps the query, table providers, model settings, and registry.
 5. `Query.run()` calls `execute_query` with that existing query.
@@ -164,9 +164,10 @@ for sources and validation status. Memory budgets remain per GPU.
    memory mapped length column. The selected model backend produces physical
    candidates. The
    planner selects one typed `PhysicalGraph`. Quail uses
-   `DocumentInput`, `PackedFilter`, `AnchoredJoin`,
-   `Exchange`, `Recombine`, physical `Project`, and `Limit`.
-   The vLLM and SGLang backends use `DocumentInput`, `RequestExecution`,
+   `Scan`, `AiFilter`, `AiJoin`,
+   `Barrier`, `Recombine`, physical `Project`, and `Limit`, plus an
+   `Exchange` before each join group when there are several GPUs.
+   The vLLM and SGLang backends use `Scan`, `RequestExecution`,
    `Recombine`, physical `Project`, and `Limit`. `RequestExecution` stores the
    tokenized filter and join prompt parts. It does not contain a Quail
    scheduler.
@@ -174,8 +175,15 @@ for sources and validation status. Memory budgets remain per GPU.
    Quail's chunk size, KV capacity, predicate order, and filter limit are not
    fields that another backend must supply.
 9. The planner chooses the complete join order and anchors from selectivity
-   estimates. It schedules the first anchor's filters last and shares retained
-   KV capacity across inputs with future anchor uses. `Exchange` nodes prune actual survivors
+   estimates, pricing KV reuse as unlimited: a document prefix computed once
+   is free at every later anchor use, the same assumption as the speed-of-light
+   estimate. A filtered alias whose first use is as an anchor has its chain
+   placed right before that group, after any barrier, and the chain streams
+   into the join (section 4.6): the `AiFilter` carries `pin_survivors`,
+   returns its survivors as a stream the join drives, and each passing
+   document's KV goes straight from the chain to the join without the
+   retention pool.
+   `Barrier` nodes prune actual survivors
    between the planned join groups. Execution follows this graph without
    searching again.
 10. The worker creates an internal physical request. It uses the query's
@@ -214,7 +222,7 @@ logical node does not require another tree traversal function.
 
 ### The logical operators
 
-There are four operators, defined in `logical.py`:
+There are five operators, defined in `logical.py`:
 
 - **Scan**: reads one column of one registered provider (e.g.,
   `reviews.body`). That column is tokenized for the model. The Scan
@@ -229,10 +237,22 @@ There are four operators, defined in `logical.py`:
   single scanned column. Each predicate has a prompt template, column
   references, and an optional selectivity (the fraction of documents
   expected to pass).
+- **Join**: one binary relational join with ordinary column
+  equalities (`on`); an empty `on` is a cross join. Its pairs are what
+  the SemanticJoin above it asks the model about. It becomes a
+  physical `HashJoin` node (`hash_join:<left>-<right>`) that reads the
+  two scans and the key columns the request carries, pairs the rows
+  whose keys are equal with an Arrow hash join, and feeds the pairs
+  to the `AiJoin` on its `pairs:<written position>` port, the same
+  port a pairs-returning `Foreign` uses. A pair the equality rules
+  out is never built, packed, or priced. The projection pushdown
+  loads the key columns as values like any returned column.
 - **SemanticJoin**: one true/false predicate over a whole tuple of
-  documents, one per table - the cross product of its tables
-  filtered by a single prompt that holds every document at once
-  (the BigQuery/Snowflake AI-join shape). A query may hold several
+  documents, one per table - the pairs of the Join beneath it, or the
+  cross product of its tables, filtered by a single prompt that holds
+  every document at once (the BigQuery/Snowflake AI-join shape). Both
+  front ends build `SemanticJoin(inputs=(Join(...),))`; the older
+  several-input form still means the cross product. A query may hold several
   `full` joins - each its own predicate and stage, composed by id
   matching at assembly (issue #38); stages may anchor on different
   tables and run as separate anchored joins - plus any number of gates:
@@ -241,6 +261,13 @@ There are four operators, defined in `logical.py`:
     document (a semi-join; two tables).
   - `anti`: keep outer documents that match no inner document (an
     anti-join; two tables).
+- **Apply**: a user function between two operators (`apply()` and
+  `apply_table()` in the builder; no SQL form). It names a function
+  registered on the session, the columns it reads, how it runs
+  (`per_batch` on each batch a streaming operator hands over, or
+  `barrier` once over every survivor), and what it returns (`preserve`
+  every id, `drop` a subset, or `pairs` for the join above it). A
+  function never invents an id.
 - **Project**: column selection at the root. No computed columns.
 
 ### Prompt layout
@@ -308,7 +335,11 @@ conjuncts. Join predicates appear in `JOIN ... ON` clauses. `EXISTS` and
 `NOT EXISTS` subqueries map to exists and anti semantics.
 
 Each multi-table `AI_FILTER(PROMPT(...))` - on a JOIN's ON or as a
-WHERE term - is one join predicate; a query may have several.
+WHERE term - is one join predicate; a query may have several. An ON
+clause may also hold `column = column` conjuncts; they become the
+`Join`'s conditions, and the AI predicate that carries that JOIN's
+table is asked of those pairs only. A JOIN whose ON has an equality
+but no AI predicate anywhere is refused.
 Coverage rule: every JOINed table must appear in at least one join
 predicate, and the predicates' tables must form one connected graph
 with the FROM table.
@@ -322,7 +353,7 @@ are found (early termination); for a join query the filter round
 gets no limit - one document can appear in zero or many output rows
 (#39) - and the Arrow result stream applies the final limit instead.
 The typed filter runtime receives no early limit when the graph contains
-`AnchoredJoin`. The
+`AiJoin`. The
 builder equivalent is `.limit(n)` before `.select()`. The rejection
 list is explicit (`compile.py:22-33`), so new SQL surface cannot
 enter silently.
@@ -330,7 +361,11 @@ enter silently.
 ### Builder API
 
 The builder (`builder.py`) mirrors the SQL constructs: `docs()`,
-`.alias()`, `.ai_filter()`, `.ai_join()`, `.limit()`, `.select()`. Its default
+`.alias()`, `.ai_filter()`, `.join(other, on=col(...) == col(...))`
+followed by `.ai_filter()` over both tables, `.ai_join()` as the
+shorthand for a join over every pair, `.apply(fn, columns)` and
+`.apply_table(fn, columns)` for a Python function between two
+operators, `.limit()`, `.select()`. Its default
 is `as_written`, so the chain order is the execution order. A caller can pass
 `.select(..., order="by_cost")` to use the planner's cost order. Both entry
 points finish through the same `LogicalPlanBuilder`, so the plans are
@@ -535,8 +570,9 @@ honored, with a remark at plan time when a free choice prices lower.
 
 The search runs during planning with estimated survivor counts and document
 length summaries. Filter survival is assumed independent of document length.
-Multiple filter selectivities are multiplied. Candidates share a bounded filter KV allocation across legal anchors.
-The first use of each anchor can receive retention credit.
+Multiple filter selectivities are multiplied. KV reuse is priced as unlimited:
+a filtered alias pays no prefix at its first anchor use, and no alias pays
+one at a later anchor use.
 The selected order determines filter scheduling and the executable graph.
 Actual rows and available KV determine the work performed during execution,
 without changing the selected joins or anchors.
@@ -565,8 +601,18 @@ predicates assemble into results correctly.
 **KV residency across operators** (`planner/retention.py`,
 `executor/retention.py`, and the arena in `executor/arena.py`):
 
-- All filtered inputs with a planned anchor use can retain document KV. The first
-  anchor's filters still run last. Retention uses one shared pool per GPU.
+- The planner prices KV reuse as unlimited. A filtered alias's first anchor
+  use pays no prefix, and no alias pays a prefix at a later anchor use. The
+  search therefore chooses orders on tuple work alone, and the executor keeps
+  as much of that KV as the arena holds and recomputes the rest
+  (the reports' recomputed KV figure, fresh tokens minus the fewest
+  tokens the run's requests needed, is derived after the run by
+  `runtime/minimum.py` from the answer tables).
+- A filtered alias whose first use is as an anchor streams its survivors into
+  that join with their KV pinned (section 4.6), so nothing of it enters the
+  pool. Its chain is placed right before that group, after any barrier. An
+  alias that is a partner before it anchors must finish its chain before that
+  earlier group, so its survivors wait in one shared retention pool per GPU.
 - A prefix with `L` tokens occupies `ceil(L / 16)` pages. The priority is
   `q * C(L) / pages`, where `q` is its predicted probability of reaching its next
   anchor use and `C(L)` is the ideal prefix computation cost. The cost includes
@@ -583,16 +629,12 @@ predicates assemble into results correctly.
   At a boundary, the executor releases expired or known dead prefixes and
   updates retained priorities. Completed anchors with another planned use are
   offered using their next use's priority. Other sets' useful KV remains retained.
-- Planning scales each input length histogram by filter selectivity and fills
-  expected capacity in priority order. The last length group may receive a
-  fractional allocation. Expected pages per set are estimates, not partitions.
-- Selinger search includes the set of previously used anchors in its state.
-  Filter KV can be credited at a later anchor's first use. The search uses a
-  shared allocation across legal anchor aliases. The selected order then supplies
-  next-use probabilities and a refined allocation for its actual anchors.
-  Search and final allocation are approximate together; no global optimum is
-  claimed. Reuse after a nonconsecutive repeat of an anchor is conservatively
-  priced as recomputation, even though execution may retain it.
+- Selinger search includes the set of previously used anchors in its state, so
+  it knows which stage is a first use ("filter" residency when the alias is
+  filtered, else "none") and which is a repeat ("kept"). The selected order
+  then supplies the next-use probabilities the executor's retention priorities
+  read. The search is exact for the unlimited-KV cost model; the pool cap is
+  an execution limit, not a planning input.
 - Both Quail execution paths follow the saved decisions. Child workers report
   all retained aliases after every round, so the coordinator can preserve the
   placement of useful KV when another input's filtering evicts prefixes.
@@ -682,6 +724,38 @@ attention term dominates.
 KV is always bf16. The planner does not choose a KV dtype and does
 not model a conversion tax.
 
+### Node ids, per-node estimates, and edits
+
+Node ids name the operator and what it works on: `scan:c1`,
+`ai_filter:c1`, `ai_join:e1` (`ai_join:e1:2` when the alias anchors a
+second group), `barrier:e2` (the next anchor), `exchange:e1`,
+`apply:same_page`, `recombine`, `project`, `limit`. The retention
+settings (`before`, `after`) are keyed by the join node ids.
+
+`PhysicalPlan.estimates` (from `node_estimates` in `decide.py`) prices
+each model node's own work through `speed_of_light`: a filter chain's
+scan and asks, a join group's stages as the search's `walk` records
+them. The parts do not add up to the plan's estimate, which prices the
+packed whole. A chain that a later join anchors on also carries the
+recompute it would pay if its KV were released instead of pinned:
+expected survivors minus what fits the retention pool cap, times the
+prefix tokens, priced as scans. `explain()` shows both. The join
+search never reads the recompute figure.
+
+`PhysicalPlan.insert(node, between=(producer, consumer))`,
+`remove(node_id)`, and `move(node_id, between=...)` (`planner/plan.py`)
+edit one edge at a time and return a new plan. An illegal edit raises
+`PlanEditError` at the call with the rule it broke: no such edge, a
+node with the wrong port type, a removal that would change the query
+(`Scan`, `AiFilter`, `AiJoin`, `Recombine`, `Project`, `Limit`), or a
+graph that fails validation. After an edit `_rederive_pins` sets
+`pin_survivors` true only where the chain's stream still reaches the
+join anchored on its alias through per-batch nodes (a `Barrier` on the
+edge turns it off, and turns `keep_kv` on so the survivors go through
+the pool), `hold_tokens` to the join's largest frame when pinned, and
+the plan's `estimator` reprices every node. `Query.run(plan=...)`
+executes the edited plan.
+
 ## 4. The packed executor
 
 The packed executor is Quail's core contribution. Instead of sending
@@ -696,8 +770,8 @@ single forward pass, sharing KV across them through a paged arena.
 | `plan_query` | `decide.py` | Top-level: logical plan + token counts -> physical plan or refusal |
 | `order_filters_indexed` | `decide.py` | Price each possible first scan and sort later asks by time per rejected document |
 | `unrounded_seconds` | `sol.py` | Component limits without forward pass rounding |
-| `search_joins` | `joins.py` | Choose join order and anchors from estimated survivors, length summaries, and shared retention credit |
-| `allocate` / `schedule` | `retention.py` | Estimate retained length groups and record future anchor use probabilities |
+| `search_joins` | `joins.py` | Choose join order and anchors from estimated survivors and length summaries, pricing KV reuse as unlimited |
+| `schedule` | `retention.py` | Record future anchor use probabilities for the executor's retention priorities |
 | `RetentionPolicy` | `executor/retention.py` | Rank document prefixes by expected computation saved per KV page |
 | `PageArena.pop_retained_victim` | `executor/arena.py` | Pops the retained document with the lowest future reuse priority |
 | `contiguous_shards` | `decide.py` | Split the initial scan into compact contiguous ranges with similar token counts |
@@ -797,10 +871,13 @@ while not done:
     room = chunk_budget
     groups = []
 
+    # every anchor streams its own partner list at each stage: the
+    # whole stage list, or the members its join's equality allows
+    # (an anchor with no member at a stage settles without a chunk)
     # priority 1 and 2: placed anchors - cut streams at the front of
     # the ready queue, then anchors starting their next stage
     for each anchor a in the ready queue (oldest first):
-        j, i = a's stage, a's next partner
+        j, i = a's stage, a's next partner in its own list
         cost = suffix[j][i] (+ frame[j] when i == 0)
         if cost > room: break
         end = the longest partner run from i that fits room
@@ -833,6 +910,37 @@ if j is the last stage and the row is complete:
     finish a: anchor_done decides retain or free
 ```
 ```
+
+### The Foreign node
+
+A logical `Apply` becomes a physical `Foreign` node (`apply:<name>`).
+It sits right after its alias's filter chain, or between a join's
+inputs and the `AiJoin` when it returns pairs (its `pairs:<written
+position>` port is an extra input of the join). The runtime
+(`ForeignRuntime` in `runtime/runner.py`) builds one Arrow table per
+alias from the ids and the value columns the request shipped
+(`columns:<alias>` relations), calls the function, and checks what
+comes back against the ids it gave.
+
+- `per_batch` on a survivor stream: the node returns the stream with
+  the function appended to its `transforms` (or a `StreamedPairs`
+  object for a pairs function). The consuming join runs the transforms
+  on each batch the chain hands over, before admission; a survivor the
+  function drops has its KV freed and is never admitted. The chain
+  keeps streaming and nothing is recomputed. The node's result is
+  final once the graph has run.
+- `barrier`: the planner does not pin the chain (the alias joins
+  `barrier_aliases` in `decide.py`), the survivors go through the
+  retention pool as before streaming existed, and the function runs
+  once over the materialized ids.
+- `validate_streams` (`physical/nodes.py`) checks every pinned stream
+  reaches the join anchored on its alias through per-batch `Foreign`
+  nodes only; it runs on every `PhysicalPlan` and every request.
+- Several GPUs: a per-batch function would have to run inside each
+  GPU's join round, where the session's functions are not present, so
+  the planner refuses it (`per_batch_apply_needs_one_gpu`); a barrier
+  function runs on the coordinator. The request backends refuse
+  `apply` altogether.
 
 ### 4.2 The paged KV arena
 
@@ -1079,8 +1187,9 @@ answers. This overlaps GPU compute with answer readback.
 | `pack_chunk` | `loop.py:125` | Build GPU tensors for one chunk from group specs. Document tokens stay as Arrow slices until the selected parts are copied once into a pinned CPU tensor, then uploaded to the GPU in one transfer. |
 | `JoinAdmission` | `pack.py` | Continuous anchor admission scheduler (join path) |
 | `FilterAdmission` | `pack.py:184` | Continuous admission scheduler (filter path) |
-| `run_filter` | `loop.py:462` | The filter chain execution loop |
-| `run_join` | `loop.py` | The join execution loop: JoinAdmission chunks, stages mixed, anchors gated as their answers return |
+| `FilterStream` | `loop.py` | The filter chain, one chunk per `next()`; with `hold_survivors` it hands passing documents to a join with their KV pinned |
+| `run_filter` | `loop.py` | The filter chain run to the end (a loop over `FilterStream.next`) |
+| `run_join` | `loop.py` | The join execution loop: JoinAdmission chunks, stages mixed, anchors gated as their answers return; with `anchor_source` it pulls anchors from a `FilterStream` |
 | `warm_kernels` | `loop.py` | Boot warmup policy: compile pass once ever (marker on the kernel-cache volume), touch pass per container |
 | `Answerer` | `loop.py:60` | TRUE/FALSE scoring from final hidden states |
 | `AsyncAnswers` | `loop.py:92` | Non-blocking answer readout with pinned-memory copy |
@@ -1113,7 +1222,7 @@ that runs until `FilterAdmission.done()`:
 Single-stage queries (one question) skip the arena entirely: no
 later stage reads any document's KV, so the alloc, the per-layer KV
 scatter, and the paged attention read serve no one. The planner
-makes the call. The `PackedFilter` node carries an `arena_writes`
+makes the call. The `AiFilter` node carries an `arena_writes`
 field, which is false exactly when one stage runs. The field appears
 in `explain()`, and the payload forwards it to
 `run_filter`. `run_filter` requires the argument and never derives
@@ -1177,6 +1286,58 @@ frees retained prefixes in increasing expected computation saved per
 KV page. The worker frees every kept key the moment its last consumer
 join is behind, and sweeps kept keys at query start and end - the
 arena outlives a query, kept KV must not.
+
+**The streamed filter-to-join edge.** When a join group's anchor
+alias has a filter chain that no earlier group needed, the chain does
+not finish before the join starts. The planner places the chain right
+before the group and sets `AiFilter.pin_survivors`. Its runtime then
+returns the survivor port as a `SurvivorStream` with a `finalize`
+callable instead of running; the `AiJoin` that reads the port drives
+the chain and writes its answers into the stream's holder; the generic
+runner calls `finalize` after the whole graph has run and stores the
+chain's answers and metrics as its own result. Every other edge is a
+finished list. On the GPU the join drives:
+
+- `FilterStream` is `run_filter` cut into one chunk per `next()`
+  call, with `hold_survivors`: a document that passes its last stage
+  keeps its pages pinned and comes back as a (key, prefix) pair
+  instead of being freed or retained.
+- `run_join` pulls from the stream until its own chunk can fill
+  (`JoinAdmission.buildable_tokens`), runs one join chunk, and pulls
+  again. Streamed anchors are admitted incrementally
+  (`JoinAdmission.admit`) as resident, so they pack the frame and
+  their partner suffixes only.
+- Backpressure is the arena. The stream reports when fresh admission
+  is short of pages; the join then runs what it holds, and the pages
+  of answered anchors come back. The chain re-reads the arena's free
+  page count before every chunk, since the join frees and claims
+  pages between chunks. A held document's pages cover the join's
+  largest frame, so the join never claims a page for a streamed
+  anchor and the two operators cannot deadlock on pages.
+- Both run on one CUDA stream, so chunk order is launch order, and
+  each operator reads its previous chunk's answers after launching
+  the next, which keeps CPU packing overlapped with GPU compute. Each
+  operator sets its own attention path before its chunk (`unified`
+  for the chain, `merge_quant` for the join).
+- The pinned set is bounded by what the join has not answered yet, so
+  a survivor's KV is read once and freed. Under operator-at-a-time
+  execution every survivor had to be held for the rest of the filter
+  phase, and whatever did not fit the retention pool was recomputed
+  at the join (`regret_tokens`).
+
+```
+join:
+    while True:
+        while filter not done and join.buildable_tokens() < budget:
+            held, blocked = filter.next()     # runs one filter chunk
+            admit held anchors (resident, pinned)
+            if blocked: break                 # filter is out of pages
+        if join idle and filter done: break
+        groups = join.next_chunk()
+        if groups: launch; report the previous join chunk; continue
+        if a join chunk is in flight: report it; continue
+        filter.next(evict_retained=True)      # nothing here can move
+```
 
 ### 4.7 KV rewind (chain mode)
 
@@ -1259,7 +1420,12 @@ every pair, and pays per-request scheduling overhead.
 The packing works through `JoinAdmission` (`pack.py`): anchors admit
 continuously and stream their partner lists; an anchor whose stream
 is cut mid-chunk continues at the front of the next chunk, reading
-its KV from the arena instead of recomputing it.
+its KV from the arena instead of recomputing it. Each anchor has its
+own partner list per stage: every partner when the join is a cross
+product, or the members its equality conditions allow when the join
+runs over pairs (`anchor_partners`). The answer rows follow the
+anchor's list, and the join output carries `anchor_partners` so the
+answer tables name the right partner for each bit.
 
 ### Anchor KV sharing
 
@@ -1301,8 +1467,12 @@ stage boundary. `JoinAdmission`'s `resident` argument names the
 anchors whose KV is already in the arena, so their groups pack no
 prefix tokens.
 
-The same mechanism crosses operator boundaries through retention.
-A filter chain with `keep_kv` keeps survivors' KV up to the
+The same mechanism crosses operator boundaries in two ways. The
+first join group's anchor chain streams into the join (section 4.6):
+every passing document arrives with its KV pinned, is answered, and
+is freed, so no prefix is packed and nothing waits in a pool. Every
+other filtered alias with a later anchor use goes through retention:
+a filter chain with `keep_kv` keeps survivors' KV up to the
 retained pool's capacity (the arena minus the scan ring); the join
 group anchored on that table finds the kept keys resident,
 `activate` grows their pages for the frame, and no kept document's
@@ -1351,15 +1521,22 @@ Each child opens the same temporary token file and reads its range. Token values
 do not pass through the parent process pipe. After this round, the parent
 merges survivors.
 
-**One join round per selected `AnchoredJoin`**: anchors follow the
-alias's filter shard when it holds retained KV. An anchor that was a partner in
+**One join round per selected `AiJoin`**: anchors follow the
+alias's filter shard when it holds retained KV. The plan shows this as
+an `Exchange` node before each group, present only with several GPUs; the
+routing itself happens when the coordinator builds the round's
+payloads. When the anchor's chain
+streams into the join, the chain runs inside the join round on each GPU,
+over that GPU's filter shard of every anchor document, and the parent
+fills the chain's survivor stream with the merged answers from the same
+round. An anchor that was a partner in
 an earlier round gets new balanced shards over its live documents.
 The parent sends file references and survivor positions, and each GPU reads
 the needed token values before it computes KV for its new anchor slice. Every
 GPU receives every surviving partner, so every
 GPU uses the same partner index space.
 
-**An `Exchange` between join groups** prunes each input to documents that
+**An `Barrier` between join groups** prunes each input to documents that
 remain in passing pairs. All completed full-join answers and current survivor
 IDs are explicit inputs. When the anchor changes, the next join round assigns
 its live documents to workers. No join search runs during these rounds.
@@ -1384,9 +1561,9 @@ merge: union the per-alias answer dicts and survivor lists
 
 # execute the saved join and exchange nodes
 for node in the planned graph:
-    if node is Exchange:
+    if node is Barrier:
         prune survivor IDs using completed join answers
-    if node is AnchoredJoin:
+    if node is AiJoin:
         for each worker w:
             anchors = live anchor documents assigned to w
             partners = all live partner documents
@@ -1400,11 +1577,11 @@ for node in the planned graph:
 | Function | File | What it does |
 |---|---|---|
 | `begin_query_payloads` | `coordinator.py` | Start a query on every GPU executor when no filter runs first |
-| `filter_node_payloads` | `coordinator.py` | Split one typed `PackedFilter` across GPU executors |
+| `filter_node_payloads` | `coordinator.py` | Split one typed `AiFilter` across GPU executors |
 | `merge_filter_round` | `coordinator.py` | Merge workers' filter answers |
 | `join_group_payloads` | `coordinator.py` | Build per-worker sub-payloads for one anchor group's round (re-shards an anchor with no filter shard) |
 | `merge_join_round` | `coordinator.py` | Concatenate workers' join answer rows |
-| `ExchangeRuntime.execute` | `runtime/runner.py` | Prune actual survivor IDs using completed full-join answer relations |
+| `BarrierRuntime.execute` | `runtime/runner.py` | Prune actual survivor IDs using completed full-join answer relations |
 | `gate_group` | `coordinator.py` | Anchor survivors after one group (full/exists/anti keep rules) |
 | `execute_query` | `runtime/execute.py` | Plan and execute one already built query in the current process |
 | `_execute_physical` | `runtime/execute.py` | Validate and run one typed physical request |
@@ -1418,7 +1595,7 @@ GPUs and use the matching `EngineConfig`. Each GPU runs one model copy.
 
 ## 7. The benchmark (QUAIL-B)
 
-QUAIL-B (`quail_b`) has 32 queries over five document sets
+QUAIL-B (`quail_b`) has 33 queries over five document sets
 (IMDB, BioDEX, FEVER, LePaRD, and SWE-Next), plus 2 optional PrivacyPolicies
 queries. Qwen3 32B answers the filter predicates during the judge pass.
 The FEVER annotations and sampled LePaRD citation edges provide source labels
@@ -1481,7 +1658,7 @@ graph LR
     policies -. "SCENARIO_MATCH" .-> scenarios
 ```
 
-### The 32 queries
+### The 33 queries
 
 **IMDB** (10 queries): reviews x aspects
 
@@ -1506,7 +1683,7 @@ graph LR
 | BIO-2 | 1J | reports x terms (REACTION) |
 | BIO-3 | 1F + 1J | F7 then join |
 
-**FEVER** (9 queries): claims x evidence
+**FEVER** (10 queries): claims x evidence
 
 | Query | Shape | Description |
 |---|---|---|
@@ -1519,6 +1696,7 @@ graph LR
 | FEV-7 | 2J star | SUPPORT + REFUTE, same anchor |
 | FEV-8 | 3J chain | c1-e1-c2-e2 |
 | FEV-9 | 4 filters + 3 joins | F11 on c1 and c2, F13 on e1 and e2, then c1-e1-c2-e2 |
+| FEV-10 | 2F + 1J over pairs | FEV-5 with `ON c.evidence_wiki_url = e.id`: SUPPORT asked only of a claim and its own page |
 
 **LePaRD** (8 queries): citation contexts joined with citation passages
 

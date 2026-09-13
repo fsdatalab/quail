@@ -10,6 +10,7 @@ import pyarrow as pa
 
 import quail
 import quail_b as benchmark
+from quail.planner import collect_operators
 from quail.specs import H100_USD_PER_HOUR
 from quail_b.queries import (
     SELECTIVITY_ESTIMATE_COLLECTION,
@@ -63,10 +64,14 @@ def build_query(sess, spec: QuerySpec):
             quail.col(f"{alias}.{spec.alias(alias).column}")
             for alias in join.aliases
         ]
-        query = query.ai_join(
-            partner_query,
-            quail.prompt(join.template, *columns),
-            selectivity=spec.join_selectivity(join.template))
+        # an equality picks the pairs; the model sees those only
+        left, right = join.aliases
+        query = query.join(partner_query, on=[
+            quail.col(f"{left}.{left_column}")
+            == quail.col(f"{right}.{right_column}")
+            for left_column, right_column in join.on
+        ]).ai_filter(quail.prompt(join.template, *columns),
+                     selectivity=spec.join_selectivity(join.template))
     return query.select(*spec.select, order=spec.order)
 
 
@@ -164,14 +169,61 @@ def run_output(result, spec: QuerySpec, corpus_rows) -> RunOutput:
         dict(result.report, collection_s=collection_s))
 
 
+def join_anchors(result) -> dict:
+    """Return written position -> the anchor alias the engine chose."""
+    return {
+        position: table.schema.metadata[b"quail.anchor"].decode("utf-8")
+        for position, table in result.answer_tables["joins"].items()
+    }
+
+
+def prompt_pieces(query, anchors) -> dict:
+    """Return the prompt token ids around each document, for QUAIL-B.
+
+    QUAIL-B sizes the prefix trie of the run's requests from these
+    pieces and the saved answer tables, after the run; nothing is
+    tracked while the query runs.
+
+    Args:
+        query: The built query, with bound prompts.
+        anchors: Written join position -> the anchor alias.
+    """
+    _, filters, joins = collect_operators(query.logical)
+    prompts = [predicate.prompt for predicates in filters.values()
+               for predicate in predicates]
+    prompts += [join.predicate for join in joins]
+    preamble = next((list(prompt.preamble_token_ids) for prompt in prompts
+                     if prompt.preamble_token_ids), [])
+    pieces = {"tokenizer": query.session.model.hf_name, "preamble": preamble,
+              "filters": [], "joins": []}
+    for alias, predicates in filters.items():
+        for position, predicate in enumerate(predicates):
+            pieces["filters"].append({
+                "alias": alias, "position": position,
+                "tail": list(predicate.prompt.tail_token_ids)})
+    for position, join in enumerate(joins):
+        anchor = anchors[position]
+        parts = {alias: (list(label), list(frame))
+                 for alias, label, frame in join.predicate.label_token_ids}
+        (partner,) = [alias for alias in parts if alias != anchor]
+        pieces["joins"].append({
+            "position": position, "anchor": anchor, "frame": parts[anchor][1],
+            "label": parts[partner][0],
+            "tail": list(join.predicate.tail_token_ids)})
+    return pieces
+
+
 def run_query(session, spec, tables):
     """Execute one query and return benchmark IDs, answers, and measurements."""
     for name, table in tables.items():
         if name not in session.catalog:
             session.register(
                 name, quail.DocumentProvider.from_table(table, id_col="id"))
-    result = build_query(session, spec).run()
-    return run_output(result, spec, tables)
+    query = build_query(session, spec)
+    result = query.run()
+    output = run_output(result, spec, tables)
+    output.prompt_pieces = prompt_pieces(query, join_anchors(result))
+    return output
 
 
 def run_suite(only=None, *, sf=0.1, config=None, data_dir=None,

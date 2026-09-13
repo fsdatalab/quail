@@ -10,17 +10,10 @@ from typing import Any, Mapping
 import pyarrow as pa
 
 from quail.backends.base import GpuContext
-from quail.backends.request_scheduling import (
-    join_cache_accounting,
-    longest_common_prefix,
-    run_join_grouped,
-    split_cached_tokens,
-    true_bit,
-)
+from quail.backends.request_scheduling import run_join_grouped, true_bit
 from quail.execution import PhysicalResponse, export_physical_outputs
-from quail.logical import SHARED_PRE
+from quail.logical import SHARED_PRE, Apply, join_outer_input
 from quail.physical import (
-    DocumentInput,
     Limit,
     PhysicalNode,
     PortRef,
@@ -29,12 +22,14 @@ from quail.physical import (
     RequestExecution,
     RequestFilterSpec,
     RequestJoinSpec,
+    Scan,
 )
 from quail.physical.base import input_ports
 from quail.planner import (
     budgets,
     collect_operators,
     default_order_rule,
+    hash_join_nodes,
     order_filters_indexed,
     preamble_tokens,
 )
@@ -42,8 +37,14 @@ from quail.planner import (
     join_specs as logical_join_specs,
 )
 from quail.planner.joins import search_joins, summarize_alias
-from quail.planner.plan import CorpusStats, PhysicalPlan
+from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
 from quail.planning import PhysicalCandidate, SupportResult
+from quail.runtime.pairs import (
+    allowed_members,
+    members_by_partner,
+    pair_partner,
+    partner_map,
+)
 from quail.runtime.result import answer_table
 from quail.runtime.runner import (
     ExecutionContext,
@@ -79,6 +80,15 @@ def plan_request_backend(
     join_submission: str,
 ) -> tuple[PhysicalCandidate, ...]:
     """Build one physical request plan for a request engine."""
+    if any(isinstance(node, Apply) for node in region.logical_plan.walk()):
+        return (PhysicalCandidate(
+            graph=None,
+            plan=Refusal(
+                reasons=("apply() functions run on the Quail backend only",),
+                constraint="apply_needs_quail_backend",
+                needed=1, available=0, unit="backends"),
+            estimated_seconds=float("inf"),
+        ),)
     scans, filters, joins = collect_operators(region.logical_plan)
     stats = {
         alias: CorpusStats(
@@ -95,8 +105,8 @@ def plan_request_backend(
         if scan.alias not in stats:
             raise ValueError(f"no document tokens for alias {scan.alias!r}")
         summary = stats[scan.alias]
-        node = DocumentInput(
-            node_id=f"input:{scan.alias}",
+        node = Scan(
+            node_id=f"scan:{scan.alias}",
             alias=scan.alias,
             input_id=scan.alias,
             n_docs=summary.n_docs,
@@ -106,6 +116,10 @@ def plan_request_backend(
         )
         nodes.append(node)
         input_refs.append(PortRef(node.node_id, f"ids:{scan.alias}"))
+
+    for node in hash_join_nodes(joins, context.pair_fractions, input_refs):
+        nodes.append(node)
+        input_refs.append(PortRef(node.node_id, f"pairs:{node.written_pos}"))
 
     rule = context.order or default_order_rule(filters, joins)[0]
     chunk_tokens = budgets.chunk_budget(context.model, context.device)
@@ -132,7 +146,7 @@ def plan_request_backend(
                 predicate.selectivity
                 if predicate.selectivity is not None else 1.0
             )
-    search_specs = logical_join_specs(joins)
+    search_specs = logical_join_specs(joins, context.pair_fractions)
     join_search = search_joins(
         search_specs,
         live,
@@ -192,7 +206,7 @@ def plan_request_backend(
         if len(labels) != len(aliases_in_prompt) or not prompt.tail_token_ids:
             raise ValueError("join prompts have no token ids")
         outer_aliases = tuple(dict.fromkeys(
-            field.alias for field in join.inputs[0].output_schema()
+            field.alias for field in join_outer_input(join).output_schema()
         ))
         join_specs.append(RequestJoinSpec(
             written_pos=written_pos,
@@ -254,7 +268,7 @@ def plan_request_backend(
         sink_input = PortRef(request_node.node_id, f"ids:{aliases[0]}")
 
     nodes.append(Project(
-        node_id="sink",
+        node_id="project",
         inputs=input_ports((sink_input,)),
         columns=tuple(
             f"{column.alias}.{column.column}"
@@ -264,7 +278,7 @@ def plan_request_backend(
     if region.logical_plan.root.limit is not None:
         nodes.append(Limit(
             node_id="limit",
-            inputs=input_ports((PortRef("sink", "rows"),)),
+            inputs=input_ports((PortRef("project", "rows"),)),
             count=region.logical_plan.root.limit,
         ))
 
@@ -320,6 +334,15 @@ def _filter_answer_table(alias, written_positions, answers) -> pa.Table:
     )
 
 
+def _allowed_members(anchor, partners, anchor_ids, members, pairs) -> list:
+    """Per anchor, the member indices its equality conditions allow."""
+    position = partners.index(pair_partner(anchor, partners))
+    by_partner = members_by_partner(members, position)
+    rows = partner_map(pairs, anchor, partners[position])
+    return [allowed_members(rows, by_partner, anchor_id)
+            for anchor_id in anchor_ids]
+
+
 def _join_answer_table(spec, rows, answers, anchor, partners) -> pa.Table:
     columns = {
         alias: [int(row[index]) for row in rows]
@@ -346,14 +369,13 @@ def _token_list(values) -> list[int]:
     return [int(token) for token in values]
 
 
+
+
 def _operator_at_a_time_filter(client, sampling_params, bodies, questions,
-                               true_ids, block_size):
+                               true_ids):
     active = list(range(len(bodies)))
     answers = {}
-    prior = {}
     requests = prompt_tokens = cached_tokens = 0
-    regret_tokens = cross_row_cached = 0
-    cached_own = cached_other = 0
     started = time.perf_counter()
     stages = []
     for stage_index, question in enumerate(questions):
@@ -367,33 +389,14 @@ def _operator_at_a_time_filter(client, sampling_params, bodies, questions,
             if prompts else []
         )
         next_active = []
-        for document, prompt, output in zip(evaluated, prompts, outputs):
+        for document, output in zip(evaluated, outputs):
             answer = bool(true_bit(output, true_ids))
             answers[(document, stage_index)] = answer
             requests += 1
             prompt_tokens += len(output.prompt_token_ids)
-            cached = int(getattr(output, "num_cached_tokens", 0) or 0)
-            cached_tokens += cached
-            # the document's own earlier requests computed a prefix this
-            # one could hit; cached tokens beyond it but inside the body
-            # came from another document sharing a prefix
-            could_hit = max(
-                (
-                    longest_common_prefix(prompt["prompt_token_ids"], earlier)
-                    for earlier in prior.get(document, ())
-                ),
-                default=0,
-            )
-            could_hit = (could_hit // block_size) * block_size
-            regret_tokens += max(0, could_hit - cached)
-            own, shared, other = split_cached_tokens(
-                cached, could_hit, 0, len(bodies[document]))
-            cached_own += own
-            cross_row_cached += shared
-            cached_other += other
+            cached_tokens += int(getattr(output, "num_cached_tokens", 0) or 0)
             if answer:
                 next_active.append(document)
-                prior.setdefault(document, []).append(prompt["prompt_token_ids"])
         active = next_active
         stages.append({
             "stage": stage_index,
@@ -404,15 +407,10 @@ def _operator_at_a_time_filter(client, sampling_params, bodies, questions,
         "wall_s": time.perf_counter() - started,
         "survivors": active,
         "answers": answers,
-        "prior": prior,
         "requests": requests,
         "prompt_tokens": prompt_tokens,
         "cached_tokens": cached_tokens,
         "fresh_tokens": prompt_tokens - cached_tokens,
-        "regret_tokens": regret_tokens,
-        "cross_row_cached_tokens": cross_row_cached,
-        "cached_own_tokens": cached_own,
-        "cached_other_tokens": cached_other,
         "stages": stages,
         "doc_cap": None,
     }
@@ -425,15 +423,10 @@ def _pipelined_filter(client, sampling_params, bodies, questions, true_ids,
             "wall_s": 0.0,
             "survivors": [],
             "answers": {},
-            "prior": {},
             "requests": 0,
             "prompt_tokens": 0,
             "cached_tokens": 0,
             "fresh_tokens": 0,
-            "regret_tokens": 0,
-            "cross_row_cached_tokens": 0,
-            "cached_own_tokens": 0,
-            "cached_other_tokens": 0,
             "stages": [],
             "doc_cap": 0,
         }
@@ -444,12 +437,6 @@ def _pipelined_filter(client, sampling_params, bodies, questions, true_ids,
         true_ids,
         tag=tag,
     )
-    prior = {}
-    for (document, stage), answer in result["answers"].items():
-        if answer:
-            prior.setdefault(document, []).append(
-                bodies[document] + list(questions[stage - 1])
-            )
     stages = []
     for stage in range(1, len(questions) + 1):
         evaluated = [
@@ -471,17 +458,10 @@ def _pipelined_filter(client, sampling_params, bodies, questions, true_ids,
             (document, stage - 1): bool(answer)
             for (document, stage), answer in result["answers"].items()
         },
-        "prior": prior,
         "requests": result["requests"],
         "prompt_tokens": result["prompt_tokens"],
         "cached_tokens": result["cached_tokens"],
         "fresh_tokens": result["prompt_tokens"] - result["cached_tokens"],
-        "regret_tokens": int(result.get("regret_tokens") or 0),
-        "cross_row_cached_tokens": int(
-            result.get("cross_row_cached_tokens") or 0
-        ),
-        "cached_own_tokens": int(result.get("cached_own_tokens") or 0),
-        "cached_other_tokens": int(result.get("cached_other_tokens") or 0),
         "stages": stages,
         "doc_cap": result["doc_cap"],
     }
@@ -495,10 +475,25 @@ class RequestModelExecution:
         self.client = settings["client"]
         self.sampling_params = settings["sampling_params"]
         self.documents = settings["documents"]
+        self.pairs = {}         # written position -> pair table, from ports
         self.true_ids = set(settings["true_ids"])
         self.capacity = settings["capacity"]
         self.filter_submission = settings["filter_submission"]
         self.join_submission = settings["join_submission"]
+
+    def _join_submission(self, prefixes) -> str:
+        """Suffix-major only when every anchor prefix fits in KV at once.
+
+        Suffix-major sends every anchor for one partner before the next
+        partner, so anchors that do not all fit are recomputed once per
+        partner; anchor-major keeps each anchor's prefix hot instead.
+        """
+        if self.join_submission != "suffix-major":
+            return self.join_submission
+        held = sum(len(prefix) for prefix in prefixes)
+        if held > self.capacity["kv_cache_size_tokens"]:
+            return "anchor-major"
+        return "suffix-major"
 
     def execute(
         self,
@@ -509,19 +504,19 @@ class RequestModelExecution:
             raise TypeError(
                 f"request backend cannot execute {node.type_name!r}"
             )
-        del inputs
+        for port in node.inputs:
+            if port.source.port.startswith("pairs:"):
+                position = int(port.source.port.split(":", 1)[1])
+                self.pairs[position] = inputs[port.name]
         started = time.perf_counter()
         survivors = {
             alias: list(range(len(self.documents[alias])))
             for alias in node.aliases
         }
-        prior = {}
         outputs = {}
         steps = []
         fresh_tokens = cached_tokens = requests = 0
-        evaluated_documents = evaluated_pairs = regret_tokens = 0
-        cross_row_cached = 0
-        block_size = int(self.capacity["block_size"])
+        evaluated_documents = evaluated_pairs = 0
 
         for filter_index, spec in enumerate(node.filters):
             document_ids = list(survivors[spec.alias])
@@ -537,7 +532,6 @@ class RequestModelExecution:
                     bodies,
                     spec.question_token_ids,
                     self.true_ids,
-                    block_size,
                 )
             elif self.filter_submission == "pipelined":
                 result = _pipelined_filter(
@@ -564,10 +558,6 @@ class RequestModelExecution:
             survivors[spec.alias] = [
                 document_ids[local] for local in result["survivors"]
             ]
-            for local, prompts in result["prior"].items():
-                prior.setdefault(
-                    (spec.alias, document_ids[local]), []
-                ).extend(prompts)
             steps.append({
                 "kind": "filter",
                 "alias": spec.alias,
@@ -578,17 +568,11 @@ class RequestModelExecution:
                 "requests": result["requests"],
                 "fresh_tokens": result["fresh_tokens"],
                 "cached_tokens": result["cached_tokens"],
-                "regret_tokens": result["regret_tokens"],
-                "cross_row_cached_tokens": result["cross_row_cached_tokens"],
-                "cached_own_tokens": result["cached_own_tokens"],
-                "cached_other_tokens": result["cached_other_tokens"],
                 "doc_cap": result["doc_cap"],
             })
             requests += result["requests"]
             fresh_tokens += result["fresh_tokens"]
             cached_tokens += result["cached_tokens"]
-            regret_tokens += result["regret_tokens"]
-            cross_row_cached += result["cross_row_cached_tokens"]
             evaluated_documents += result["requests"]
 
         for spec in node.joins:
@@ -620,11 +604,6 @@ class RequestModelExecution:
                 + _token_list(frames[anchor])
                 for document in anchor_ids
             ]
-            document_spans = [
-                (len(preamble),
-                 len(preamble) + len(self.documents[anchor][document]))
-                for document in anchor_ids
-            ]
             members = list(itertools.product(
                 *(alias_documents[alias] for alias in partners)
             ))
@@ -638,39 +617,31 @@ class RequestModelExecution:
                     ))
                 suffix.extend(_token_list(spec.tail_token_ids))
                 suffixes.append(suffix)
+            # a join over pairs asks each anchor about its own members
+            allowed = None
+            request_pairs = None
+            if spec.written_pos in self.pairs:
+                allowed = _allowed_members(
+                    anchor, partners, anchor_ids, members,
+                    self.pairs[spec.written_pos])
+                request_pairs = [
+                    (anchor_index, member_index)
+                    for anchor_index, mine in enumerate(allowed)
+                    for member_index in mine
+                ]
 
-            if prefixes and suffixes:
+            submission = self._join_submission(prefixes)
+            if prefixes and suffixes and request_pairs != []:
                 result = run_join_grouped(
                     self.client,
                     self.sampling_params,
                     prefixes,
                     suffixes,
                     self.true_ids,
-                    submission=self.join_submission,
+                    submission=submission,
+                    pairs=request_pairs,
                 )
                 answers = [bool(answer) for answer in result["answers"]]
-                seen_lengths = [
-                    max(
-                        (
-                            longest_common_prefix(prefix, earlier)
-                            for earlier in prior.get((anchor, document), ())
-                        ),
-                        default=0,
-                    )
-                    for document, prefix in zip(anchor_ids, prefixes)
-                ]
-                accounting = join_cache_accounting(
-                    prefixes,
-                    len(suffixes),
-                    result["cached_per_request"],
-                    seen_lengths,
-                    block_size,
-                    document_spans,
-                )
-                regret = accounting["regret_tokens"]
-                cross_row = accounting["cross_row_cached_tokens"]
-                cached_own = accounting["cached_own_tokens"]
-                cached_other = accounting["cached_other_tokens"]
             else:
                 result = {
                     "wall": 0.0,
@@ -679,16 +650,14 @@ class RequestModelExecution:
                     "prompt_tokens": 0,
                 }
                 answers = []
-                regret = 0
-                cross_row = 0
-                cached_own = 0
-                cached_other = 0
 
             rows = []
-            for anchor_id in anchor_ids:
-                for member in members:
+            for anchor_index, anchor_id in enumerate(anchor_ids):
+                mine = (range(len(members)) if allowed is None
+                        else allowed[anchor_index])
+                for member_index in mine:
                     by_alias = {anchor: anchor_id}
-                    by_alias.update(zip(partners, member))
+                    by_alias.update(zip(partners, members[member_index]))
                     rows.append(tuple(by_alias[alias] for alias in spec.aliases))
             outputs[f"join_answers:{spec.written_pos}"] = _join_answer_table(
                 spec,
@@ -713,31 +682,22 @@ class RequestModelExecution:
                     ]
                 else:
                     survivors[anchor] = sorted(matched)
-            for document, prefix in zip(anchor_ids, prefixes):
-                if document in survivors[anchor]:
-                    prior.setdefault((anchor, document), []).append(prefix)
             steps.append({
                 "kind": "join",
                 "written_pos": spec.written_pos,
                 "anchor": anchor,
                 "partners": list(partners),
-                "submission": self.join_submission,
+                "submission": submission,
                 "pairs": len(rows),
                 "true_pairs": len(true_rows),
                 "wall_s": result["wall"],
                 "fresh_tokens": result["fresh_tokens"],
                 "cached_tokens": result["cached_tokens"],
-                "regret_tokens": regret,
-                "cross_row_cached_tokens": cross_row,
-                "cached_own_tokens": cached_own,
-                "cached_other_tokens": cached_other,
             })
             requests += len(rows)
             evaluated_pairs += len(rows)
             fresh_tokens += result["fresh_tokens"]
             cached_tokens += result["cached_tokens"]
-            regret_tokens += regret
-            cross_row_cached += cross_row
 
         for alias in node.aliases:
             outputs[f"ids:{alias}"] = survivors[alias]
@@ -752,11 +712,9 @@ class RequestModelExecution:
                 evaluated_document_pairs=evaluated_pairs,
                 fresh_tokens=fresh_tokens,
                 cached_tokens=cached_tokens,
-                regret_tokens=regret_tokens,
                 extension={
                     "steps": steps,
                     "requests": requests,
-                    "cross_row_cached_tokens": cross_row_cached,
                     "capacity": dict(self.capacity),
                 },
             ),
@@ -775,7 +733,7 @@ def execute_request_graph(context, backend, engine_state, boot):
     documents = {
         node.alias: context.request.inputs[node.input_id].documents
         for node in context.graph.nodes
-        if isinstance(node, DocumentInput)
+        if isinstance(node, Scan)
     }
     settings = dict(envelope["settings"])
     model_execution = backend.start(GpuContext(
@@ -800,9 +758,11 @@ def execute_request_graph(context, backend, engine_state, boot):
             runtimes=context.registry.runtimes,
             model_execution=model_execution,
             sources={
-                alias: range(len(value))
-                for alias, value in documents.items()
+                **{alias: range(len(value))
+                   for alias, value in documents.items()},
+                **context.request.relations,
             },
+            functions=context.registry.functions,
         ),
     )
     metrics = run.metrics
@@ -819,7 +779,6 @@ def execute_request_graph(context, backend, engine_state, boot):
         "boot": boot,
         "fresh_tokens": metrics.fresh_tokens,
         "cached_tokens": metrics.cached_tokens,
-        "regret_tokens": metrics.regret_tokens,
         "peak_gib": round(peak_bytes / 2**30, 2),
         "node_metrics": scalar_node_metrics(run.nodes),
         "backend_metrics": dict(request_result.metrics.extension),

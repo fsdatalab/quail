@@ -118,7 +118,6 @@ def _query_record(query_id, query, gpu_count):
         "evaluated_documents": documents,
         "evaluated_document_pairs": pairs,
         "fresh_tokens": report["fresh_tokens"],
-        "regret_tokens": report.get("regret_tokens"),
         "kv_manager": report.get("kv_manager"),
         "expected_join_plan": report.get("expected_join_plan"),
         "executed_join_plan": report.get("executed_join_plan"),
