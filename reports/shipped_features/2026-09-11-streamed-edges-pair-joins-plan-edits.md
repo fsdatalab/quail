@@ -108,7 +108,7 @@ This replaces the old per-document regret, cache-hit adjustments, and
 
 ## Full QUAIL-B result
 
-The final run covered all 33 queries and four methods. The prediction was that
+The final run covered all 33 queries on Quail and both vLLM configurations. The prediction was that
 the six affected Quail queries would reduce recomputed KV while unchanged
 queries kept the same work and rows. It also predicted similar fresh-token
 counts for Quail and the vLLM configurations on filters, and lower counts for
@@ -120,9 +120,9 @@ Parent function call: `fc-01M2BX28NBM9T7W4HDJTCBM3XQ`. The 11 family and
 method function calls are listed in
 [`reports/quailb-comparison.md`](../quailb-comparison.md).
 
-Fourteen of the 132 method-query cells use earlier compatible runs. Each is
-marked in the comparison report. Nine are pipelined vLLM FEV-1 through FEV-9,
-two are pipelined SGLang BIO-2 and BIO-3, and three are the FEV-10 baselines.
+Eleven of the 99 method-query cells use earlier compatible runs. Each is
+marked in the comparison report. Nine are pipelined vLLM FEV-1 through FEV-9
+and two are the vLLM FEV-10 baselines. SGLang is no longer reported.
 
 | Query | Time before, s | Time after, s | Change | Recomputed KV before | Recomputed KV after |
 |---|---:|---:|---:|---:|---:|

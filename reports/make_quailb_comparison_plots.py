@@ -23,11 +23,9 @@ Pull the measured runs, the corpus manifest, and the SoL estimates:
     uv run modal volume get quail-results \
       "$RUNS/20260906T211500Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/manifest.json" \
       "$W/saved/fev9_manifest.json"
-    for method in quail pipelined_vllm pipelined_sglang; do
+    for method in quail pipelined_vllm; do
       uv run modal volume get quail-results \
         "$(result_path "$W/saved/manifest.json" $method)" "$W/saved/$method.json"
-    done
-    for method in quail pipelined_vllm; do
       uv run modal volume get quail-results \
         "$(result_path "$W/saved/fev9_manifest.json" $method)" \
         "$W/saved/fev9_$method.json"
@@ -40,13 +38,14 @@ Pull the measured runs, the corpus manifest, and the SoL estimates:
       sol/2026-09-11-quailb-prefix-reuse.json "$W/sol.json"
     uv run --with matplotlib python reports/make_quailb_comparison_plots.py "$W"
 
-Every method and query comes from the September 12 run of all four
-methods, with three exceptions that run's FEVER container did not
-produce (it failed on FEV-10 in the request backends, fixed since, and
-was not rerun): pipelined vLLM FEV-1 to FEV-9 come from the saved
-September 5 suite (FEV-9 from its September 6 rerun), and the three
-baselines' FEV-10 from the September 11 FEV-10 run. The saved Quail
-suite and the ablation file feed the before-and-after section.
+Every method and query comes from the September 12 run, with the
+cells its FEVER container did not produce (it failed on FEV-10 in the
+request backends, fixed since, and was not rerun) filled from earlier
+runs: pipelined vLLM FEV-1 to FEV-9 from the saved September 5 suite
+(FEV-9 from its September 6 rerun), and both vLLM configurations'
+FEV-10 from the September 11 FEV-10 run. SGLang is not reported. The
+saved Quail suite and the ablation file feed the before-and-after
+section.
 """
 
 import argparse
@@ -58,7 +57,7 @@ import pyarrow.parquet as pq
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
-from plot_colors import BLUE, DARK, GRAY, GREEN, ORANGE
+from plot_colors import BLUE, DARK, GRAY, ORANGE
 
 from quail.specs import H100_USD_PER_HOUR
 
@@ -67,7 +66,6 @@ METHODS = [
     ("quail", "Quail", BLUE),
     ("stock_vllm", "Stock vLLM", GRAY),
     ("pipelined_vllm", "Pipelined vLLM", ORANGE),
-    ("pipelined_sglang", "Pipelined SGLang", GREEN),
 ]
 QUERY_ORDER = (
     [f"IMDB-{n}" for n in range(1, 11)] + [f"BIO-{n}" for n in range(1, 4)]
@@ -445,7 +443,8 @@ def main(workdir):
                                "quailb_main.pdf", overview=True)
     fev = row_metrics(rows["quail"]["FEV-9"])
     output = rows["quail"]["FEV-9"]
-    calls = manifest["function_call_ids"]
+    calls = {key: call for key, call in manifest["function_call_ids"].items()
+             if not key.endswith(":sglang")}
     borrowed = sorted(key for key, source in sources.items() if source != "run")
     labels = {key: label for key, label, _ in METHODS}
 
@@ -468,16 +467,15 @@ def main(workdir):
         "  vector content when zoomed.",
         "- The setup was Qwen3 4B FP8, sf=0.1, lf=1, and one H100 per configuration.",
         "  Quail and the vLLM configurations shared a physical GPU within each",
-        "  family. SGLang used a separate GPU. Stock vLLM used operator-at-a-time",
-        "  submission; the other three pipeline their requests.",
-        "- All four methods were run on September 12, 2026: "
+        "  family. Stock vLLM used operator-at-a-time submission; the other two",
+        "  pipeline their requests.",
+        "- Quail, stock vLLM, and pipelined vLLM were run on September 12, 2026: "
         f"`/results/benchmarks/quailb/family-runs/{manifest['run_id']}/`,",
         "  function calls " + ", ".join(f"`{call}`" for call in calls.values()) + ".",
-        f"  {len(borrowed)} of the 132 cells come from earlier runs, because that",
+        f"  {len(borrowed)} of the 99 cells come from earlier runs, because that",
         "  run's FEVER container failed on FEV-10 in the request backends (an",
         "  equality join's key columns were not passed to them; fixed on this",
-        "  branch) and its SGLang BIODEX container had not finished; neither",
-        "  was rerun. From the saved September 5 suite (FEV-9 from its",
+        "  branch) and was not rerun. From the saved September 5 suite (FEV-9 from its",
         "  September 6 rerun), with no answer tables and so no recomputed KV",
         f"  figure: {borrowed_text('saved')}. From the September 11 FEV-10 run",
         f"  (`/results/benchmarks/quailb/family-runs/{fev10_manifest['run_id']}/`),",

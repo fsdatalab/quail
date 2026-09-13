@@ -6,19 +6,18 @@
   vector content when zoomed.
 - The setup was Qwen3 4B FP8, sf=0.1, lf=1, and one H100 per configuration.
   Quail and the vLLM configurations shared a physical GPU within each
-  family. SGLang used a separate GPU. Stock vLLM used operator-at-a-time
-  submission; the other three pipeline their requests.
-- All four methods were run on September 12, 2026: `/results/benchmarks/quailb/family-runs/20260912T225100Z-902686c5/`,
-  function calls `fc-01M2BX2FQ0S11V5Q5WDBGC865R`, `fc-01M2BX3KM90P4D4ME4SFDXB88Z`, `fc-01M2BX3KP8X6932572C5B57M43`, `fc-01M2BX3KR9EZXZ3HW43XWNJT7N`, `fc-01M2BX3KTP1KY67NH078BX89BC`, `fc-01M2BX3KX1ENZPPV61RRCMN7TG`, `fc-01M2BX3M0HAMSSFT6J5RHC8095`, `fc-01M2BX3M38FRY6FE2PAGGS2WD2`, `fc-01M2BX3M5F384ERRZ75B56V9M5`, `fc-01M2BX3M80WJDF3HDE9PYB903D`, `fc-01M2BX3MA3R9ECMNQCGJ91M6TM`.
-  14 of the 132 cells come from earlier runs, because that
+  family. Stock vLLM used operator-at-a-time submission; the other two
+  pipeline their requests.
+- Quail, stock vLLM, and pipelined vLLM were run on September 12, 2026: `/results/benchmarks/quailb/family-runs/20260912T225100Z-902686c5/`,
+  function calls `fc-01M2BX2FQ0S11V5Q5WDBGC865R`, `fc-01M2BX3KM90P4D4ME4SFDXB88Z`, `fc-01M2BX3KR9EZXZ3HW43XWNJT7N`, `fc-01M2BX3KX1ENZPPV61RRCMN7TG`, `fc-01M2BX3M38FRY6FE2PAGGS2WD2`, `fc-01M2BX3M80WJDF3HDE9PYB903D`.
+  11 of the 99 cells come from earlier runs, because that
   run's FEVER container failed on FEV-10 in the request backends (an
   equality join's key columns were not passed to them; fixed on this
-  branch) and its SGLang BIODEX container had not finished; neither
-  was rerun. From the saved September 5 suite (FEV-9 from its
+  branch) and was not rerun. From the saved September 5 suite (FEV-9 from its
   September 6 rerun), with no answer tables and so no recomputed KV
-  figure: Pipelined vLLM FEV-1, FEV-2, FEV-3, FEV-4, FEV-5, FEV-6, FEV-7, FEV-8, FEV-9; Pipelined SGLang BIO-2, BIO-3. From the September 11 FEV-10 run
+  figure: Pipelined vLLM FEV-1, FEV-2, FEV-3, FEV-4, FEV-5, FEV-6, FEV-7, FEV-8, FEV-9. From the September 11 FEV-10 run
   (`/results/benchmarks/quailb/family-runs/20260911T201441Z-d16f87d8/`),
-  with recomputed KV: Stock vLLM FEV-10; Pipelined vLLM FEV-10; Pipelined SGLang FEV-10.
+  with recomputed KV: Stock vLLM FEV-10; Pipelined vLLM FEV-10.
 - Quail was faster than stock vLLM on 31 of 33 queries.
 - A horizontal line across each query's bar group shows its SoL estimate.
   SoL models ideal computation and memory traffic with unlimited prefix KV.
@@ -94,52 +93,42 @@ Figure: plots/quailb_imdb.pdf
 | IMDB-1 | Quail | 14.43 | 20,349 | 1,759,232 | 346.50 | docs/s | 0.01583 | 89.68 | 89.817 | 98.252 | September 12 |
 | IMDB-1 | Stock vLLM | 17.52 | 20,061 | 1,758,944 | 285.39 | docs/s | 0.01922 | 89.52 | 89.781 | 98.077 | September 12 |
 | IMDB-1 | Pipelined vLLM | 17.31 | 20,061 | 1,758,944 | 288.85 | docs/s | 0.01899 | 89.52 | 89.781 | 98.077 | September 12 |
-| IMDB-1 | Pipelined SGLang | 20.08 | 20,061 | 1,758,944 | 249.00 | docs/s | 0.02203 | 91.08 | 92.057 | 97.253 | September 12 |
 | IMDB-1 | SoL estimate | 6.653 | 0 (assumed) | 1,740,485 | 751.59 | docs/s | 0.00730 | Not measured | Not measured | Not measured | estimate |
 | IMDB-2 | Quail | 21.25 | 405,349 | 2,419,232 | 2,823.53 | pairs/s | 0.02331 | 78.50 | 72.543 | 43.494 | September 12 |
 | IMDB-2 | Stock vLLM | 27.87 | 425,741 | 2,439,624 | 2,152.85 | pairs/s | 0.03057 | 78.30 | 69.563 | 46.864 | September 12 |
 | IMDB-2 | Pipelined vLLM | 28.40 | 425,741 | 2,439,624 | 2,112.68 | pairs/s | 0.03115 | 78.30 | 69.563 | 46.864 | September 12 |
-| IMDB-2 | Pipelined SGLang | 234.71 | 18,929,885 | 20,943,768 | 255.63 | pairs/s | 0.25748 | 79.23 | 70.467 | 50.857 | September 12 |
 | IMDB-2 | SoL estimate | 9.211 | 0 (assumed) | 2,400,485 | 6,513.89 | pairs/s | 0.01010 | Not measured | Not measured | Not measured | estimate |
 | IMDB-3 | Quail | 22.64 | 361,989 | 2,560,772 | 2,321.55 | pairs/s | 0.02484 | 79.16 | 66.549 | 44.329 | September 12 |
 | IMDB-3 | Stock vLLM | 41.23 | 1,735,645 | 3,933,798 | 1,273.05 | pairs/s | 0.04523 | 78.96 | 63.436 | 47.125 | September 12 |
 | IMDB-3 | Pipelined vLLM | 42.10 | 1,735,645 | 3,933,798 | 1,246.75 | pairs/s | 0.04618 | 78.96 | 63.436 | 47.125 | September 12 |
-| IMDB-3 | Pipelined SGLang | 214.06 | 17,767,533 | 19,950,566 | 237.13 | pairs/s | 0.23482 | 79.94 | 65.386 | 51.218 | September 12 |
 | IMDB-3 | SoL estimate | 9.495 | 0 (assumed) | 2,473,217 | 5,060.17 | pairs/s | 0.01042 | Not measured | Not measured | Not measured | estimate |
 | IMDB-4 | Quail | 17.38 | 118,395 | 2,004,176 | 867.89 | pairs/s | 0.01907 | 77.76 | 59.54 | 37.707 | September 12 |
 | IMDB-4 | Stock vLLM | 31.48 | 1,203,527 | 3,091,846 | 485.26 | pairs/s | 0.03453 | 77.90 | 57.771 | 41.655 | September 12 |
 | IMDB-4 | Pipelined vLLM | 27.46 | 675,175 | 2,563,494 | 556.30 | pairs/s | 0.03012 | 77.90 | 57.771 | 41.655 | September 12 |
-| IMDB-4 | Pipelined SGLang | 82.00 | 6,147,172 | 8,018,901 | 168.00 | pairs/s | 0.08995 | 79.60 | 62.222 | 44.108 | September 12 |
 | IMDB-4 | SoL estimate | 7.519 | 0 (assumed) | 1,960,727 | 1,640.73 | pairs/s | 0.00825 | Not measured | Not measured | Not measured | estimate |
 | IMDB-5 | Quail | 16.64 | 77,818 | 1,929,643 | 524.28 | pairs/s | 0.01825 | 80.17 | 60.501 | 35.794 | September 12 |
 | IMDB-5 | Stock vLLM | 29.92 | 861,391 | 2,716,776 | 298.80 | pairs/s | 0.03282 | 80.33 | 58.53 | 40.382 | September 12 |
 | IMDB-5 | Pipelined vLLM | 26.36 | 590,991 | 2,446,376 | 339.15 | pairs/s | 0.02892 | 80.33 | 58.522 | 40.41 | September 12 |
-| IMDB-5 | Pipelined SGLang | 34.14 | 555,136 | 2,392,817 | 224.96 | pairs/s | 0.03745 | 81.92 | 62.467 | 40.98 | September 12 |
 | IMDB-5 | SoL estimate | 7.405 | 0 (assumed) | 1,930,916 | 1,082.48 | pairs/s | 0.00812 | Not measured | Not measured | Not measured | estimate |
 | IMDB-6 | Quail | 14.96 | 20,349 | 1,774,145 | 334.22 | docs/s | 0.01641 | 92.03 | 73.27 | 89.591 | September 12 |
 | IMDB-6 | Stock vLLM | 23.33 | 591,825 | 2,346,479 | 214.32 | docs/s | 0.02559 | 91.98 | 72.506 | 89.786 | September 12 |
 | IMDB-6 | Pipelined vLLM | 18.29 | 63,473 | 1,818,127 | 273.37 | docs/s | 0.02006 | 91.98 | 72.506 | 89.786 | September 12 |
-| IMDB-6 | Pipelined SGLang | 18.53 | 96,808 | 1,847,997 | 269.83 | docs/s | 0.02033 | 92.73 | 77.787 | 86.868 | September 12 |
 | IMDB-6 | SoL estimate | 6.780 | 0 (assumed) | 1,772,603 | 737.51 | docs/s | 0.00744 | Not measured | Not measured | Not measured | estimate |
 | IMDB-7 | Quail | 15.23 | 21,112 | 1,796,602 | 328.30 | docs/s | 0.01671 | 92.13 | 72.352 | 78.743 | September 12 |
 | IMDB-7 | Stock vLLM | 26.11 | 797,129 | 2,574,289 | 191.50 | docs/s | 0.02864 | 92.18 | 71.812 | 80.09 | September 12 |
 | IMDB-7 | Pipelined vLLM | 21.24 | 337,625 | 2,114,785 | 235.40 | docs/s | 0.02330 | 92.18 | 71.812 | 80.09 | September 12 |
-| IMDB-7 | Pipelined SGLang | 20.45 | 309,868 | 2,080,349 | 244.50 | docs/s | 0.02243 | 92.13 | 76.719 | 73.503 | September 12 |
 | IMDB-7 | SoL estimate | 6.922 | 0 (assumed) | 1,808,672 | 722.34 | docs/s | 0.00759 | Not measured | Not measured | Not measured | estimate |
 | IMDB-8 | Quail | 26.09 | 680,845 | 2,918,999 | 3,518.13 | pairs/s | 0.02862 | 68.47 | 20.407 | 27.098 | September 12 |
 | IMDB-8 | Stock vLLM | 41.34 | 1,533,057 | 3,773,186 | 2,227.58 | pairs/s | 0.04535 | 67.83 | 19.224 | 28.623 | September 12 |
 | IMDB-8 | Pipelined vLLM | 43.62 | 1,533,057 | 3,773,186 | 2,111.14 | pairs/s | 0.04785 | 67.83 | 19.224 | 28.623 | September 12 |
-| IMDB-8 | Pipelined SGLang | 350.26 | 29,906,485 | 32,142,111 | 260.96 | pairs/s | 0.38424 | 68.00 | 19.894 | 31.515 | September 12 |
 | IMDB-8 | SoL estimate | 11.903 | 0 (assumed) | 3,092,768 | 8,772.07 | pairs/s | 0.01306 | Not measured | Not measured | Not measured | estimate |
 | IMDB-9 | Quail | 47.45 | 2,914,348 | 5,338,231 | 3,198.90 | pairs/s | 0.05205 | 72.43 | 17.624 | 13.171 | September 12 |
 | IMDB-9 | Stock vLLM | 70.09 | 3,788,927 | 6,212,810 | 2,169.90 | pairs/s | 0.07689 | 71.96 | 16.224 | 14.712 | September 12 |
 | IMDB-9 | Pipelined vLLM | 69.74 | 3,788,927 | 6,212,810 | 2,180.79 | pairs/s | 0.07650 | 71.96 | 16.224 | 14.712 | September 12 |
-| IMDB-9 | Pipelined SGLang | 577.37 | 50,661,996 | 53,085,879 | 262.23 | pairs/s | 0.63337 | 72.46 | 16.636 | 17.024 | September 12 |
 | IMDB-9 | SoL estimate | 16.376 | 0 (assumed) | 4,250,762 | 10,700.37 | pairs/s | 0.01796 | Not measured | Not measured | Not measured | estimate |
 | IMDB-10 | Quail | 48.58 | 2,854,868 | 5,479,771 | 2,971.35 | pairs/s | 0.05329 | 72.59 | 16.265 | 13.507 | September 12 |
 | IMDB-10 | Stock vLLM | 85.89 | 5,082,555 | 7,706,984 | 1,683.27 | pairs/s | 0.09422 | 72.11 | 14.876 | 14.885 | September 12 |
 | IMDB-10 | Pipelined vLLM | 84.18 | 5,082,555 | 7,706,984 | 1,717.46 | pairs/s | 0.09235 | 72.11 | 14.876 | 14.885 | September 12 |
-| IMDB-10 | Pipelined SGLang | 564.99 | 49,479,624 | 52,092,677 | 251.62 | pairs/s | 0.61979 | 72.53 | 15.515 | 17.219 | September 12 |
 | IMDB-10 | SoL estimate | 15.732 | 0 (assumed) | 4,080,500 | 9,691.37 | pairs/s | 0.01726 | Not measured | Not measured | Not measured | estimate |
 
 ## BIO
@@ -159,17 +148,14 @@ Figure: plots/quailb_bio.pdf
 | BIO-1 | Quail | 21.52 | 2,477 | 2,057,345 | 23.23 | docs/s | 0.02361 | 93.60 | 100 | 89.542 | September 12 |
 | BIO-1 | Stock vLLM | 25.75 | 2,461 | 2,057,329 | 19.42 | docs/s | 0.02825 | 94.00 | 100 | 90.196 | September 12 |
 | BIO-1 | Pipelined vLLM | 25.50 | 2,461 | 2,057,329 | 19.61 | docs/s | 0.02797 | 94.00 | 100 | 90.196 | September 12 |
-| BIO-1 | Pipelined SGLang | 28.69 | 2,461 | 2,057,329 | 17.43 | docs/s | 0.03147 | 94.20 | 100 | 90.523 | September 12 |
 | BIO-1 | SoL estimate | 11.049 | 0 (assumed) | 2,054,868 | 45.25 | docs/s | 0.01212 | Not measured | Not measured | Not measured | estimate |
 | BIO-2 | Quail | 127.75 | 4,148,977 | 10,374,345 | 4,410.96 | pairs/s | 0.14014 | 81.83 | 14.167 | 85.959 | September 12 |
 | BIO-2 | Stock vLLM | 1074.34 | 4,301,247 | 10,526,615 | 524.51 | pairs/s | 1.17855 | 80.95 | 13.625 | 86.283 | September 12 |
 | BIO-2 | Pipelined vLLM | 1069.16 | 4,301,247 | 10,526,615 | 527.05 | pairs/s | 1.17287 | 80.95 | 13.624 | 86.283 | September 12 |
-| BIO-2 | Pipelined SGLang | 1028.46 | Not measured | 11,241,655 | 547.91 | pairs/s | 1.12822 | 82.04 | 14.271 | 85.578 | saved suite |
 | BIO-2 | SoL estimate | 62.002 | 0 (assumed) | 10,371,868 | 9,088.45 | pairs/s | 0.06802 | Not measured | Not measured | Not measured | estimate |
 | BIO-3 | Quail | 79.96 | 2,275,033 | 6,627,939 | 3,861.91 | pairs/s | 0.08772 | 82.54 | 14.733 | 79.917 | September 12 |
 | BIO-3 | Stock vLLM | 590.22 | 3,506,014 | 7,875,694 | 527.01 | pairs/s | 0.64747 | 81.23 | 13.912 | 81.171 | September 12 |
 | BIO-3 | Pipelined vLLM | 585.63 | 3,506,014 | 7,875,694 | 531.14 | pairs/s | 0.64244 | 81.23 | 13.912 | 81.171 | September 12 |
-| BIO-3 | Pipelined SGLang | 493.74 | Not measured | 8,273,023 | 632.27 | pairs/s | 0.54163 | 82.22 | 14.536 | 81.012 | saved suite |
 | BIO-3 | SoL estimate | 43.087 | 0 (assumed) | 7,159,254 | 8,003.77 | pairs/s | 0.04727 | Not measured | Not measured | Not measured | estimate |
 
 ## FEV
@@ -196,52 +182,42 @@ Figure: plots/quailb_fev.pdf
 | FEV-1 | Quail | 0.30 | 1,359 | 33,331 | 1,666.67 | docs/s | 0.00033 | 85.00 | 80.609 | 98.311 | September 12 |
 | FEV-1 | Stock vLLM | 0.48 | 1,359 | 33,331 | 1,041.67 | docs/s | 0.00053 | 84.00 | 78.877 | 99.662 | September 12 |
 | FEV-1 | Pipelined vLLM | 0.41 | Not measured | 33,331 | 1,219.51 | docs/s | 0.00045 | 84.00 | 78.877 | 99.662 | saved suite |
-| FEV-1 | Pipelined SGLang | 3.51 | 1,359 | 33,331 | 142.45 | docs/s | 0.00385 | 89.20 | 85.174 | 98.986 | September 12 |
 | FEV-1 | SoL estimate | 0.121 | 0 (assumed) | 32,498 | 4,139.22 | docs/s | 0.00013 | Not measured | Not measured | Not measured | estimate |
 | FEV-2 | Quail | 28.87 | 963,563 | 3,245,254 | 4,970.56 | pairs/s | 0.03167 | 82.58 | 1.1787 | 95.82 | September 12 |
 | FEV-2 | Stock vLLM | 66.26 | 1,068,922 | 3,350,613 | 2,165.71 | pairs/s | 0.07269 | 82.31 | 1.1645 | 96.141 | September 12 |
 | FEV-2 | Pipelined vLLM | 70.02 | Not measured | 3,350,613 | 2,049.41 | pairs/s | 0.07681 | 82.31 | 1.1645 | 96.141 | saved suite |
-| FEV-2 | Pipelined SGLang | 155.89 | 1,156,266 | 3,437,957 | 920.52 | pairs/s | 0.17101 | 84.58 | 1.3339 | 96.141 | September 12 |
 | FEV-2 | SoL estimate | 12.845 | 0 (assumed) | 3,244,940 | 11,171.71 | pairs/s | 0.01409 | Not measured | Not measured | Not measured | estimate |
 | FEV-3 | Quail | 21.40 | 689,396 | 2,404,957 | 4,841.45 | pairs/s | 0.02348 | 81.20 | 0.89349 | 95.135 | September 12 |
 | FEV-3 | Stock vLLM | 45.44 | 801,721 | 2,562,915 | 2,362.19 | pairs/s | 0.04985 | 80.63 | 0.85189 | 96.757 | September 12 |
 | FEV-3 | Pipelined vLLM | 55.74 | Not measured | 2,562,915 | 1,925.69 | pairs/s | 0.06115 | 80.63 | 0.85189 | 96.757 | saved suite |
-| FEV-3 | Pipelined SGLang | 90.18 | 794,974 | 2,435,628 | 1,094.79 | pairs/s | 0.09893 | 82.93 | 1.0309 | 95.135 | September 12 |
 | FEV-3 | SoL estimate | 7.943 | 0 (assumed) | 2,010,333 | 10,694.58 | pairs/s | 0.00871 | Not measured | Not measured | Not measured | estimate |
 | FEV-4 | Quail | 4.72 | 82,965 | 531,453 | 2,857.84 | pairs/s | 0.00518 | 89.31 | 0.73677 | 78.571 | September 12 |
 | FEV-4 | Stock vLLM | 6.43 | 110,913 | 575,830 | 2,276.36 | pairs/s | 0.00705 | 90.50 | 0.76655 | 78.571 | September 12 |
 | FEV-4 | Pipelined vLLM | 8.03 | Not measured | 575,830 | 1,822.79 | pairs/s | 0.00881 | 90.50 | 0.76655 | 78.571 | saved suite |
-| FEV-4 | Pipelined SGLang | 12.22 | 111,296 | 538,441 | 1,009.90 | pairs/s | 0.01341 | 92.70 | 1.174 | 78.571 | September 12 |
 | FEV-4 | SoL estimate | 1.868 | 0 (assumed) | 477,123 | 5,991.95 | pairs/s | 0.00205 | Not measured | Not measured | Not measured | estimate |
 | FEV-5 | Quail | 13.43 | 411,979 | 1,515,283 | 4,596.50 | pairs/s | 0.01473 | 79.57 | 1.0522 | 96.429 | September 12 |
 | FEV-5 | Stock vLLM | 28.35 | 521,243 | 1,657,324 | 2,269.07 | pairs/s | 0.03110 | 79.01 | 0.99111 | 97.143 | September 12 |
 | FEV-5 | Pipelined vLLM | 31.73 | Not measured | 1,657,324 | 2,027.36 | pairs/s | 0.03481 | 79.01 | 0.99111 | 97.143 | saved suite |
-| FEV-5 | Pipelined SGLang | 52.47 | 471,132 | 1,519,469 | 1,107.99 | pairs/s | 0.05756 | 80.73 | 1.1812 | 96.429 | September 12 |
 | FEV-5 | SoL estimate | 4.743 | 0 (assumed) | 1,202,271 | 9,923.87 | pairs/s | 0.00520 | Not measured | Not measured | Not measured | estimate |
 | FEV-6 | Quail | 3.53 | 50,656 | 398,331 | 2,276.77 | pairs/s | 0.00387 | 88.44 | 0.998 | 76.923 | September 12 |
 | FEV-6 | Stock vLLM | 5.74 | 68,025 | 426,594 | 1,528.22 | pairs/s | 0.00630 | 89.54 | 1.0215 | 76.923 | September 12 |
 | FEV-6 | Pipelined vLLM | 6.27 | Not measured | 426,594 | 1,399.04 | pairs/s | 0.00688 | 89.54 | 1.0215 | 76.923 | saved suite |
-| FEV-6 | Pipelined SGLang | 8.69 | 74,774 | 407,798 | 836.25 | pairs/s | 0.00953 | 91.68 | 1.5267 | 76.923 | September 12 |
 | FEV-6 | SoL estimate | 1.375 | 0 (assumed) | 352,709 | 4,510.24 | pairs/s | 0.00151 | Not measured | Not measured | Not measured | estimate |
 | FEV-7 | Quail | 54.39 | 1,935,777 | 6,103,058 | 4,944.27 | pairs/s | 0.05967 | 64.66 | 0.00029045 | 15.652 | September 12 |
 | FEV-7 | Stock vLLM | 113.21 | 2,095,237 | 6,255,630 | 2,372.86 | pairs/s | 0.12419 | 63.95 | 0.0003172 | 17.391 | September 12 |
 | FEV-7 | Pipelined vLLM | 135.77 | Not measured | 6,255,630 | 1,978.58 | pairs/s | 0.14894 | 63.95 | 0.0003172 | 17.391 | saved suite |
-| FEV-7 | Pipelined SGLang | 262.63 | 2,078,145 | 6,165,066 | 1,005.37 | pairs/s | 0.28811 | 68.06 | 0.00033273 | 15.652 | September 12 |
 | FEV-7 | SoL estimate | 15.072 | 0 (assumed) | 3,807,384 | 11,082.38 | pairs/s | 0.01653 | Not measured | Not measured | Not measured | estimate |
 | FEV-8 | Quail | 84.49 | 5,046,570 | 9,476,743 | 5,017.15 | pairs/s | 0.09269 | 71.36 | 3.5365e-06 | 13.986 | September 12 |
 | FEV-8 | Stock vLLM | 181.54 | 5,450,894 | 9,881,067 | 2,338.18 | pairs/s | 0.19915 | 70.80 | 4.6155e-06 | 18.881 | September 12 |
 | FEV-8 | Pipelined vLLM | 201.38 | Not measured | 9,881,067 | 2,107.82 | pairs/s | 0.22091 | 70.80 | 4.6155e-06 | 18.881 | saved suite |
-| FEV-8 | Pipelined SGLang | 417.42 | 5,370,675 | 9,800,848 | 1,010.71 | pairs/s | 0.45791 | 74.28 | 5.0116e-06 | 15.385 | September 12 |
 | FEV-8 | SoL estimate | 19.139 | 0 (assumed) | 4,818,015 | 11,157.11 | pairs/s | 0.02100 | Not measured | Not measured | Not measured | estimate |
 | FEV-9 | Quail | 38.23 | 2,279,522 | 4,306,910 | 4,763.67 | pairs/s | 0.04194 | 67.77 | 3.3382e-06 | 45.455 | September 12 |
 | FEV-9 | Stock vLLM | 82.41 | 2,499,983 | 4,592,900 | 2,304.19 | pairs/s | 0.09040 | 67.05 | 2.9055e-06 | 45.455 | September 12 |
 | FEV-9 | Pipelined vLLM | 89.80 | Not measured | 4,593,156 | 2,114.57 | pairs/s | 0.09851 | 67.05 | 2.9055e-06 | 45.455 | saved suite |
-| FEV-9 | Pipelined SGLang | 156.63 | 2,177,762 | 4,095,266 | 1,093.00 | pairs/s | 0.17182 | 69.08 | 4.2171e-06 | 45.455 | September 12 |
 | FEV-9 | SoL estimate | 5.821 | 0 (assumed) | 1,474,838 | 9,857.99 | pairs/s | 0.00639 | Not measured | Not measured | Not measured | estimate |
 | FEV-10 | Quail | 1.65 | 2,927 | 187,567 | 112.12 | pairs/s | 0.00181 | 89.09 | 82.759 | 96.774 | September 12 |
 | FEV-10 | Stock vLLM | 2.97 | 4,308 | 270,220 | 63.30 | pairs/s | 0.00326 | 86.67 | 73.78 | 97.581 | FEV-10 run |
 | FEV-10 | Pipelined vLLM | 2.91 | 4,308 | 270,220 | 64.60 | pairs/s | 0.00319 | 86.67 | 73.78 | 97.581 | FEV-10 run |
-| FEV-10 | Pipelined SGLang | 3.32 | 4,217 | 267,414 | 54.22 | pairs/s | 0.00364 | 89.56 | 75.625 | 97.581 | FEV-10 run |
 | FEV-10 | SoL estimate | 0.712 | 0 (assumed) | 185,703 | 235.79 | pairs/s | 0.00078 | Not measured | Not measured | Not measured | estimate |
 
 ## LEP
@@ -266,42 +242,34 @@ Figure: plots/quailb_lep.pdf
 | LEP-1 | Quail | 1.10 | 1,702 | 131,947 | 454.55 | docs/s | 0.00121 | 31.20 | 3.6517 | 92.857 | September 12 |
 | LEP-1 | Stock vLLM | 1.43 | 1,622 | 131,867 | 349.65 | docs/s | 0.00157 | 27.40 | 3.7135 | 100 | September 12 |
 | LEP-1 | Pipelined vLLM | 1.40 | 1,622 | 131,867 | 357.14 | docs/s | 0.00154 | 27.40 | 3.7135 | 100 | September 12 |
-| LEP-1 | Pipelined SGLang | 3.50 | 1,654 | 131,899 | 142.86 | docs/s | 0.00384 | 44.00 | 4.4521 | 92.857 | September 12 |
 | LEP-1 | SoL estimate | 0.494 | 0 (assumed) | 130,583 | 1,012.61 | docs/s | 0.00054 | Not measured | Not measured | Not measured | estimate |
 | LEP-2 | Quail | 130.39 | 1,562,202 | 15,098,947 | 1,660.40 | pairs/s | 0.14304 | 46.08 | 0.41551 | 97.4 | September 12 |
 | LEP-2 | Stock vLLM | 157.27 | 1,647,930 | 15,184,675 | 1,376.61 | pairs/s | 0.17253 | 44.41 | 0.40554 | 98 | September 12 |
 | LEP-2 | Pipelined vLLM | 157.01 | 1,647,930 | 15,184,675 | 1,378.89 | pairs/s | 0.17224 | 44.41 | 0.40554 | 98 | September 12 |
-| LEP-2 | Pipelined SGLang | 339.23 | 1,883,162 | 15,419,907 | 638.21 | pairs/s | 0.37214 | 52.75 | 0.47102 | 96.8 | September 12 |
 | LEP-2 | SoL estimate | 58.086 | 0 (assumed) | 15,097,583 | 3,727.22 | pairs/s | 0.06372 | Not measured | Not measured | Not measured | estimate |
 | LEP-3 | Quail | 93.40 | 1,113,134 | 10,807,675 | 1,650.41 | pairs/s | 0.10246 | 44.23 | 0.015075 | 92.857 | September 12 |
 | LEP-3 | Stock vLLM | 119.10 | 1,341,930 | 11,600,657 | 1,370.62 | pairs/s | 0.13065 | 42.91 | 0.014976 | 100 | September 12 |
 | LEP-3 | Pipelined vLLM | 118.73 | 1,341,930 | 11,600,657 | 1,374.89 | pairs/s | 0.13025 | 42.91 | 0.014976 | 100 | September 12 |
-| LEP-3 | Pipelined SGLang | 165.65 | 1,096,474 | 9,071,591 | 763.27 | pairs/s | 0.18172 | 50.71 | 0.020779 | 92.857 | September 12 |
 | LEP-3 | SoL estimate | 2.146 | 0 (assumed) | 550,415 | 2,825.44 | pairs/s | 0.00235 | Not measured | Not measured | Not measured | estimate |
 | LEP-4 | Quail | 39.92 | 470,002 | 4,640,471 | 1,627.00 | pairs/s | 0.04379 | 34.05 | 0.011608 | 100 | September 12 |
 | LEP-4 | Stock vLLM | 47.42 | 523,932 | 4,748,742 | 1,387.94 | pairs/s | 0.05202 | 32.69 | 0.011225 | 100 | September 12 |
 | LEP-4 | Pipelined vLLM | 47.45 | 523,932 | 4,748,742 | 1,387.06 | pairs/s | 0.05205 | 32.69 | 0.011225 | 100 | September 12 |
-| LEP-4 | Pipelined SGLang | 53.89 | 367,448 | 3,246,493 | 819.56 | pairs/s | 0.05912 | 37.47 | 0.017967 | 100 | September 12 |
 | LEP-4 | SoL estimate | 1.087 | 0 (assumed) | 281,181 | 1,992.45 | pairs/s | 0.00119 | Not measured | Not measured | Not measured | estimate |
 | LEP-5 | Quail | 25.76 | 288,926 | 2,904,378 | 1,546.43 | pairs/s | 0.02826 | 32.39 | 0 | 0 | September 12 |
 | LEP-5 | Stock vLLM | 34.87 | 378,637 | 3,478,978 | 1,365.93 | pairs/s | 0.03825 | 32.33 | 0 | 0 | September 12 |
 | LEP-5 | Pipelined vLLM | 34.69 | 378,637 | 3,478,978 | 1,373.02 | pairs/s | 0.03805 | 32.33 | 0 | 0 | September 12 |
-| LEP-5 | Pipelined SGLang | 32.68 | 230,457 | 2,038,604 | 821.48 | pairs/s | 0.03585 | 37.55 | 0 | 0 | September 12 |
 | LEP-5 | SoL estimate | 0.491 | 0 (assumed) | 129,884 | 0.00 | pairs/s | 0.00054 | Not measured | Not measured | Not measured | estimate |
 | LEP-6 | Quail | 9.39 | 95,362 | 1,048,442 | 1,383.39 | pairs/s | 0.01030 | 26.02 | 0 | 0 | September 12 |
 | LEP-6 | Stock vLLM | 14.38 | 138,719 | 1,389,283 | 1,234.56 | pairs/s | 0.01577 | 23.60 | 0 | 0 | September 12 |
 | LEP-6 | Pipelined vLLM | 14.00 | 133,145 | 1,356,814 | 1,237.14 | pairs/s | 0.01536 | 23.33 | 0 | 0 | September 12 |
-| LEP-6 | Pipelined SGLang | 8.22 | 66,642 | 558,148 | 684.79 | pairs/s | 0.00902 | 18.87 | 0 | 0 | September 12 |
 | LEP-6 | SoL estimate | 0.483 | 0 (assumed) | 127,849 | 0.00 | pairs/s | 0.00053 | Not measured | Not measured | Not measured | estimate |
 | LEP-7 | Quail | 39.14 | 456,870 | 4,556,127 | 1,609.61 | pairs/s | 0.04294 | 33.73 | 0.0071088 | 100 | September 12 |
 | LEP-7 | Stock vLLM | 47.21 | 511,564 | 4,684,760 | 1,355.48 | pairs/s | 0.05179 | 32.40 | 0.0068622 | 100 | September 12 |
 | LEP-7 | Pipelined vLLM | 46.62 | 511,564 | 4,684,760 | 1,372.63 | pairs/s | 0.05114 | 32.40 | 0.0068622 | 100 | September 12 |
-| LEP-7 | Pipelined SGLang | 51.48 | 346,364 | 3,131,451 | 802.45 | pairs/s | 0.05647 | 36.87 | 0.011324 | 100 | September 12 |
 | LEP-7 | SoL estimate | 1.129 | 0 (assumed) | 294,562 | 1,554.45 | pairs/s | 0.00124 | Not measured | Not measured | Not measured | estimate |
 | LEP-8 | Quail | 1.34 | 1,702 | 148,802 | 373.13 | docs/s | 0.00147 | 48.26 | 0 | 0 | September 12 |
 | LEP-8 | Stock vLLM | 2.09 | 6,065 | 155,123 | 239.23 | docs/s | 0.00229 | 45.56 | 0 | 0 | September 12 |
 | LEP-8 | Pipelined vLLM | 2.29 | 6,065 | 155,123 | 218.34 | docs/s | 0.00251 | 45.56 | 0 | 0 | September 12 |
-| LEP-8 | Pipelined SGLang | 1.96 | 4,883 | 147,131 | 255.10 | docs/s | 0.00215 | 56.35 | 0 | 0 | September 12 |
 | LEP-8 | SoL estimate | 0.483 | 0 (assumed) | 127,849 | 1,034.40 | docs/s | 0.00053 | Not measured | Not measured | Not measured | estimate |
 
 ## AGENT
@@ -320,12 +288,10 @@ Figure: plots/quailb_agent.pdf
 | AGENT-1 | Quail | 237.65 | 11,886,152 | 17,389,113 | 7.46 | docs/s | 0.26070 | 75.00 | 68.605 | 41.331 | September 12 |
 | AGENT-1 | Stock vLLM | 104.00 | 23,928 | 5,526,889 | 17.04 | docs/s | 0.11409 | 74.15 | 65.915 | 40.981 | September 12 |
 | AGENT-1 | Pipelined vLLM | 99.29 | 23,928 | 5,526,889 | 17.85 | docs/s | 0.10892 | 74.15 | 65.915 | 40.981 | September 12 |
-| AGENT-1 | Pipelined SGLang | 222.96 | 7,990,488 | 13,493,449 | 7.95 | docs/s | 0.24459 | 73.93 | 67.085 | 37.478 | September 12 |
 | AGENT-1 | SoL estimate | 47.465 | 0 (assumed) | 5,502,961 | 37.33 | docs/s | 0.05207 | Not measured | Not measured | Not measured | estimate |
 | AGENT-2 | Quail | 239.15 | 11,886,152 | 17,431,641 | 7.41 | docs/s | 0.26235 | 93.68 | 83.465 | 98.696 | September 12 |
 | AGENT-2 | Stock vLLM | 103.35 | 23,928 | 5,569,417 | 17.15 | docs/s | 0.11337 | 93.57 | 83.099 | 98.883 | September 12 |
 | AGENT-2 | Pipelined vLLM | 100.05 | 23,928 | 5,569,417 | 17.71 | docs/s | 0.10975 | 93.57 | 83.099 | 98.883 | September 12 |
-| AGENT-2 | Pipelined SGLang | 217.69 | 7,657,480 | 13,202,969 | 8.14 | docs/s | 0.23881 | 94.07 | 84.951 | 97.765 | September 12 |
 | AGENT-2 | SoL estimate | 47.870 | 0 (assumed) | 5,545,489 | 37.02 | docs/s | 0.05251 | Not measured | Not measured | Not measured | estimate |
 
 ## Quail before and after this branch
