@@ -242,6 +242,39 @@ svg {
   margin: 0.75rem auto 0;
 }
 
+nav#TOC {
+  margin: 0 0 2.5rem;
+  padding: 1.25rem 1.5rem;
+  border: 1px solid #e5e7eb;
+  border-radius: 0.5rem;
+  background: #f8fafc;
+}
+
+nav#TOC > ul {
+  margin: 0;
+  padding-left: 1.25rem;
+  list-style: none;
+}
+
+nav#TOC ul ul {
+  padding-left: 1.25rem;
+  list-style: none;
+}
+
+nav#TOC li {
+  margin: 0.3rem 0;
+  font-size: 0.92rem;
+  line-height: 1.45;
+}
+
+nav#TOC a {
+  text-decoration: none;
+}
+
+nav#TOC a:hover {
+  text-decoration: underline;
+}
+
 @media (max-width: 600px) {
   body {
     padding: 1.5rem 1rem 4rem;

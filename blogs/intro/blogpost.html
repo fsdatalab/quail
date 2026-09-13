@@ -101,6 +101,56 @@
 <header id="title-block-header">
 <h1 class="title">Quail, a Query Aware Inference Layer for AI-SQL</h1>
 </header>
+<nav id="TOC" role="doc-toc">
+<ul>
+<li><a href="#a-new-class-of-inference-workloads-is-in-town"
+id="toc-a-new-class-of-inference-workloads-is-in-town">1. A new class of
+inference workloads is in town</a></li>
+<li><a href="#challenges-of-executing-ai-sql-queries"
+id="toc-challenges-of-executing-ai-sql-queries">2. Challenges of
+executing AI-SQL queries</a>
+<ul>
+<li><a href="#issue-1-kv-regret" id="toc-issue-1-kv-regret">Issue #1: KV
+Regret</a></li>
+<li><a href="#issue-2-high-host-overhead"
+id="toc-issue-2-high-host-overhead">Issue #2: High Host
+Overhead</a></li>
+</ul></li>
+<li><a href="#introducing-quail" id="toc-introducing-quail">3.
+Introducing Quail</a>
+<ul>
+<li><a href="#query-frontend" id="toc-query-frontend">Query
+frontend</a></li>
+<li><a href="#query-planner" id="toc-query-planner">Query
+planner</a></li>
+<li><a href="#execution-engine" id="toc-execution-engine">Execution
+engine</a></li>
+</ul></li>
+<li><a href="#evaluation" id="toc-evaluation">4. Evaluation</a>
+<ul>
+<li><a href="#performance-goals" id="toc-performance-goals">Performance
+goals</a></li>
+<li><a href="#experimental-setup"
+id="toc-experimental-setup">Experimental setup</a></li>
+<li><a href="#bio-3-where-quail-wins"
+id="toc-bio-3-where-quail-wins">BIO-3: Where Quail Wins</a></li>
+<li><a href="#agent-1-where-vllm-wins"
+id="toc-agent-1-where-vllm-wins">AGENT-1: Where vLLM wins</a></li>
+</ul></li>
+<li><a href="#getting-started" id="toc-getting-started">5. Getting
+started</a>
+<ul>
+<li><a href="#comparing-the-cost-with-gpt-5-nano"
+id="toc-comparing-the-cost-with-gpt-5-nano">Comparing the cost with
+GPT-5 nano</a></li>
+<li><a href="#running-from-a-local-python-process"
+id="toc-running-from-a-local-python-process">Running from a local Python
+process</a></li>
+</ul></li>
+<li><a href="#what-comes-next" id="toc-what-comes-next">6. What comes
+next</a></li>
+</ul>
+</nav>
 <h1 id="a-new-class-of-inference-workloads-is-in-town">1. A new class of
 inference workloads is in town</h1>
 <p>For decades, database users have struggled to analyze unstructured
@@ -811,10 +861,9 @@ uses the query plan to retain the KV that is expected to avoid the most
 future computation. The executor sends large chunks of tokens through
 the model, which reduces the CPU overhead of preparing and scheduling
 separate requests. For MFU, we use DeepGEMM for the main matrix
-multiplications, and FlashAttention 3 for attention. We leave further
-kernel optimization to the experts, in spirit to others working on batch
-inference optimization.<a href="#fn9" class="footnote-ref" id="fnref9"
-role="doc-noteref"><sup>9</sup></a></p>
+multiplications, and FlashAttention 3 for attention. We have not
+optimized the kernels themselves.<a href="#fn9" class="footnote-ref"
+id="fnref9" role="doc-noteref"><sup>9</sup></a></p>
 <h2 id="experimental-setup">Experimental setup</h2>
 <p><strong>QUAIL-B.</strong> We created <a
 href="https://github.com/fsdatalab/quail-bench">QUAIL-B</a>, a benchmark
@@ -1189,10 +1238,11 @@ class="sourceCode python"><code class="sourceCode python"><span id="cb8-1"><a hr
 <p>Modal allocates the H100 and transfers the function arguments and
 return value. Quail reads the documents, plans, and runs the query
 inside that function. For a large dataset, pass its path and open it
-there instead of sending an Arrow table. The script can mount volumes at any path
-and set library cache directories through environment variables. Quail does not
-configure Modal or choose result storage. The complete submission example
-is in <code>demos/quickstart_modal.py</code>.</p>
+there instead of sending an Arrow table. The script can mount volumes at
+any path and set library cache directories through environment
+variables. Quail does not configure Modal or choose result storage. The
+complete submission example is in
+<code>demos/quickstart_modal.py</code>.</p>
 <h1 id="what-comes-next">6. What comes next</h1>
 <p>We are actively working on Quail, and we are excited about many
 directions. Here are some of the ones we are thinking about now.</p>
@@ -1206,8 +1256,7 @@ strategies.</p>
 supports Qwen3 4B FP8 and Qwen3 32B FP8 on H100 GPUs. We want to add
 more models, including hybrid models such as Qwen3.5 and Liquid models.
 We also want to support more hardware, including Blackwell GPUs and
-Apple Silicon. We still need to determine how to serve mixture of
-experts models efficiently for AI-SQL.</p>
+Apple Silicon.</p>
 <p><strong>Improve KV and HBM management.</strong> We want to support
 automatic prefix caching across rows, and use host CPU DRAM for KV that
 does not fit in GPU HBM. We also want to improve KV management across
@@ -1216,10 +1265,10 @@ but filters can leave each GPU with a different number of surviving
 documents. As a result, one GPU may evict useful KV while another has
 unused HBM, and the GPUs may receive different amounts of downstream
 join work.</p>
-<p><strong>Improve model FLOPs utilization.</strong> Quail currently
+<p><strong>Improve model FLOP/S utilization.</strong> Quail currently
 relies on DeepGEMM and FlashAttention for its main GPU kernels. We have
-not optimized the kernels themselves, and we would love to work with
-inference experts who are interested in this workload.</p>
+not optimized the kernels themselves, and we are stoked to be working
+with Modal and Doubleword, inference experts, on this.</p>
 <p><strong>Train models for AI-SQL operators.</strong> We want to fine
 tune small models for specific predicates, which <a
 href="https://arxiv.org/abs/2603.15970">Google’s work on lightweight
@@ -1252,9 +1301,8 @@ class="footnote-back" role="doc-backlink">↩︎</a></p></li>
 <li id="fn4"><p><em>Model FLOPs utilization (MFU)</em> is the fraction
 of the GPU’s peak arithmetic throughput used during a model forward
 pass. Reaching the speed of light estimate would require 100 percent
-MFU. Quail does not optimize the GPU kernels themselves, so we leave
-that problem to the GPU kernel experts.<a href="#fnref4"
-class="footnote-back" role="doc-backlink">↩︎</a></p></li>
+MFU. Quail does not optimize the GPU kernels themselves.<a
+href="#fnref4" class="footnote-back" role="doc-backlink">↩︎</a></p></li>
 <li id="fn5"><p>Quail supports both Snowflake’s <code>AI_FILTER</code>
 syntax and BigQuery’s <code>AI.IF</code> syntax.<a href="#fnref5"
 class="footnote-back" role="doc-backlink">↩︎</a></p></li>
@@ -1270,11 +1318,11 @@ href="#fnref7" class="footnote-back" role="doc-backlink">↩︎</a></p></li>
 <code>bpe-qwen</code> was about seven times faster than the Hugging Face
 tokenizer.<a href="#fnref8" class="footnote-back"
 role="doc-backlink">↩︎</a></p></li>
-<li id="fn9"><p>In <a
+<li id="fn9"><p>Kernel optimization can substantially improve prefill
+MFU. In <a
 href="https://www.sailresearch.com/blog/tpu-v6e-gemma">“Chasing Speed of
-Light on TPU v6e”</a>, Sail Research describes increasing Gemma 4 31B
-prefill MFU from about 32 percent to 63 percent through attention
-tuning, communication overlap, and custom kernel work.<a href="#fnref9"
+Light on TPU v6e”</a>, Sail Research reports increasing Gemma 4 31B
+prefill MFU from about 32 percent to 63 percent.<a href="#fnref9"
 class="footnote-back" role="doc-backlink">↩︎</a></p></li>
 <li id="fn10"><p>As of September 2026, <a
 href="https://developers.openai.com/api/docs/models/gpt-5-nano">OpenAI
