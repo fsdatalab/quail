@@ -4,6 +4,8 @@ description: Install Quail and choose where its GPU process will run.
 ---
 
 Quail requires Python 3.12 and currently installs from this repository.
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/) first,
+then run:
 
 ```bash
 git clone https://github.com/fsdatalab/quail.git
@@ -51,20 +53,21 @@ and report. Run it on an H100 host with `uv run python demos/quickstart.py`.
 
 ## Modal
 
-Create a normal session inside a Modal GPU function. The supplied example
-uses the existing `quail-engine` app:
+Set up the Modal client once:
 
 ```bash
+uv run modal setup
+```
+
+Then create a normal session inside a Modal GPU function. The supplied
+example uses the existing `quail-engine` app:
+
+```bash
+mkdir -p results
 uv run modal run demos/quickstart_modal.py 2>&1 | tee results/quickstart_modal.log
 ```
 
 See [Running on Modal](/docs/user-guide/compute) for the function and submission code.
-
-You need a Modal account and a token on the client:
-
-```bash
-uv run modal token new
-```
 
 The first query in a fresh Modal environment builds the worker image
 and downloads the model weights into the `quail-hf-cache` volume.

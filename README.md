@@ -3,7 +3,8 @@
 Quail is a query engine for running language-model operations over document
 collections. You write the analysis in SQL or Python. Quail plans the complete
 query before it starts inference, then schedules the model work so repeated
-document prefixes can share KV and each forward pass stays full.
+document prefixes can share KV and each forward pass can use more of the
+available token budget.
 
 **Today:** `AI_FILTER`, AI joins, `EXISTS`, and `NOT EXISTS` with Qwen3 4B fp8
 or Qwen3 32B fp8 on H100s.
@@ -28,9 +29,9 @@ processes the same comment tokens again for later questions, waits for the
 whole filter to finish before starting the join, and groups requests by count
 even when their documents have very different lengths.
 
-Quail treats the analysis as one query. The planner sees the filter, its
-expected survivors, the 31-way join, each document's token count, and the
-available GPU memory before execution begins.
+Quail treats the analysis as one query. The planner sees the filter, the
+user's selectivity estimates, the join against 31 field descriptions, each
+document's token count, and the available GPU memory before execution begins.
 
 ```sql
 SELECT c.comment_id, f.field
@@ -63,10 +64,15 @@ Quail combines four execution techniques:
    immediately. It does not wait for every other comment to finish the filter.
 2. **Token-based admission.** Quail fills each forward pass by token count and
    available KV, rather than by request count.
-3. **KV rewind.** The comment prefix stays on the GPU while Quail asks its
-   later questions. Only the new question tokens need fresh computation.
+3. **KV rewind.** When KV capacity allows, the comment prefix stays on the GPU
+   while Quail asks its later questions. Quail can then compute only the new
+   question tokens.
 4. **Packed joins.** One anchor document shares its KV across many join
    partners in the same forward pass.
+
+Pipelining and token-based admission reduce waiting and unused batch
+capacity. KV rewind and packed joins reduce fresh input-token computation
+when the needed KV remains available.
 
 KV is the attention key and value tensors stored for tokens the model has
 already processed.
@@ -76,6 +82,9 @@ already processed.
 Quail requires Python 3.12. The package distribution is named
 `quail-engine`, and the Python package is `quail`. Until the first package
 release, install from the repository:
+
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/) first,
+then run:
 
 ```bash
 git clone https://github.com/fsdatalab/quail.git
@@ -128,6 +137,12 @@ speculation, and request forking are not part of the current runtime.
 join queries, their datasets, reference labels, and scoring. The runner
 compares Quail with stock vLLM using operator-at-a-time execution and with
 pipelined vLLM on the same query definitions.
+
+In the September 12, 2026 sf=0.1 run with Qwen3 4B fp8 and one H100 per
+configuration, Quail had lower query time than stock vLLM on 31 of the 33
+queries. Query time excludes model startup. QUAIL-B stores the full result
+tables and computes accuracy, output precision and recall, fresh input
+tokens, throughput, and GPU cost.
 
 ```bash
 uv run modal run --detach -m quail.bench.quailb_parallel \

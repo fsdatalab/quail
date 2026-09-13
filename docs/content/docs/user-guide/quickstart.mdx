@@ -13,6 +13,8 @@ code to a Modal H100.
 ## 1. Install
 
 Quail requires Python 3.12 and currently installs from this repository.
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/) first,
+then run:
 
 ```bash
 git clone https://github.com/fsdatalab/quail.git
@@ -84,19 +86,27 @@ with quail.Session() as session:
 3. `build_query()` reads IMDB-1's saved Substrait plan into Quail.
 4. `run()` executes the filter. `collect()` returns an Arrow table.
 
-The equivalent SQL has this shape:
+The benchmark plan is equivalent to this SQL, including the complete
+predicate text:
 
 ```sql
 SELECT r.id
 FROM reviews r
 WHERE AI_FILTER(PROMPT(
-  'Does the review in DOCUMENT {0} mention a positive aspect of the movie?',
+  'Judge strictly from the review above whether it mentions at least one
+   positive aspect of the movie.
+
+   {0}
+
+   Instruction: answer TRUE if the review mentions at least one positive
+   aspect of the movie, FALSE otherwise.',
   r.body
 ))
 ```
 
-The benchmark uses a longer, fixed prompt for scoring. Both versions ask one
-true-or-false question about each review.
+`build_query()` reads this predicate and the table references from
+QUAIL-B's saved Substrait plan. Both the SQL and Python front ends compile to
+the same Quail logical plan.
 
 ## 4. Inspect the result
 

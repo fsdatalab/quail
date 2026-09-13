@@ -77,7 +77,8 @@ export default function HomePage() {
             Quail runs language-model filters and joins over document
             collections. It sees the complete query before inference begins,
             then schedules the model work so repeated document prefixes can
-            share KV and each forward pass stays full.
+            share KV and each forward pass can use more of the available
+            token budget.
           </p>
           <div className="mt-8 flex flex-wrap gap-3">
             <Link
@@ -117,20 +118,15 @@ export default function HomePage() {
         <div className="min-w-0 space-y-4">
           <DynamicCodeBlock lang="sql" code={example} />
           <p className="max-w-3xl leading-7 text-fd-muted-foreground">
-            Quail sees the filter, its expected survivors, the 31-way join,
-            each document&apos;s token count, and the available GPU memory
-            before execution starts. The model answers each predicate with
-            one constrained token: <code>TRUE</code> or <code>FALSE</code>.
+            Quail sees the filter, the user&apos;s selectivity estimates, the
+            join against 31 field descriptions, each document&apos;s token
+            count, and the available GPU memory before execution starts. The
+            model answers each predicate with one constrained token:{' '}
+            <code>TRUE</code> or <code>FALSE</code>.
           </p>
           <p className="max-w-3xl text-sm leading-6 text-fd-muted-foreground">
             The complete query is in{' '}
-            <a
-              href="https://github.com/fsdatalab/quail/blob/main/demos/civil_comments_join.py"
-              className="underline"
-            >
-              demos/civil_comments_join.py
-            </a>
-            .
+            <code>demos/civil_comments_join.py</code>.
           </p>
         </div>
       </Section>
@@ -146,17 +142,41 @@ export default function HomePage() {
             available KV, rather than by request count.
           </Mechanism>
           <Mechanism number="03" title="KV rewind">
-            A document&apos;s KV stays on the GPU for its later predicates.
-            Quail computes the document prefix once.
+            When capacity allows, a document&apos;s KV stays on the GPU for
+            its later predicates. Quail can then avoid computing the prefix
+            again.
           </Mechanism>
           <Mechanism number="04" title="Packed joins">
             One anchor document shares its KV across many join partners in
             the same forward pass.
           </Mechanism>
+          <p className="border-t border-fd-border pt-5 text-sm leading-6 text-fd-muted-foreground">
+            Pipelining and admission reduce waiting and unused batch
+            capacity. KV rewind and packed joins reduce fresh input-token
+            computation when the needed KV remains available.
+          </p>
         </div>
       </Section>
 
-      <Section eyebrow="04 / Direction" title="What Quail runs">
+      <Section eyebrow="04 / Evaluation" title="Measured on 33 queries">
+        <div className="space-y-4">
+          <p className="max-w-3xl leading-7 text-fd-muted-foreground">
+            In the September 12, 2026 QUAIL-B sf=0.1 run with Qwen3 4B
+            fp8 and one H100 per configuration, Quail had lower query time
+            than stock vLLM on 31 of 33 queries. Stock vLLM used
+            operator-at-a-time execution. Query time excludes model startup.
+          </p>
+          <p className="max-w-3xl text-sm leading-6 text-fd-muted-foreground">
+            <Link href="/docs/user-guide/benchmark" className="underline">
+              Run QUAIL-B
+            </Link>{' '}
+            to measure accuracy, output precision and recall, fresh input
+            tokens, throughput, and GPU cost.
+          </p>
+        </div>
+      </Section>
+
+      <Section eyebrow="05 / Direction" title="What Quail runs">
         <div className="grid gap-px overflow-hidden rounded-lg border border-fd-border bg-fd-border sm:grid-cols-2">
           <div className="bg-fd-background p-5">
             <h3 className="font-medium">Available today</h3>
@@ -191,7 +211,7 @@ export default function HomePage() {
         </div>
       </Section>
 
-      <Section eyebrow="05 / Next" title="Start with a real query">
+      <Section eyebrow="06 / Next" title="Start with a real query">
         <div className="grid gap-4 sm:grid-cols-2">
           {[
             {
