@@ -168,19 +168,21 @@ $$
 $$
 
 
-This is KV reuse. In stage 1, the token count includes $d_i$. In
-stage `s > 1`, it does not — only the question tokens $q_s$ are
-fresh. In the pairs count, $d_i$ appears only as the width of a
+The difference between the two stages is KV reuse. In stage 1, the
+token count includes $d_i$. In stage `s > 1`, it does not — only
+the question tokens $q_s$ are fresh. In the pairs count, $d_i$ appears only as the width of a
 rectangle ($q_s$ new tokens attending over the resident prefix).
 Without reuse, stage `s > 1` would repeat the full scan: `p + d_i +
 q_s` tokens and `T(p + d_i + q_s)` pairs.
 
 <Callout type="info">
-**Example: IMDB, 5,000 reviews, F4 then F1.** Total fresh tokens:
-1,791,351. The F4 scan accounts for 1,729,233. F4 leaves 1,218
-documents, so F1 adds $1{,}218 \times 51 = 62{,}118$ fresh tokens.
-Without KV reuse, F1 would also recompute every surviving
-document's prefix.
+**Example.** A query has two filters over 5,000 IMDB reviews. The
+first filter (51 question tokens) scans all 5,000 documents:
+1,729,233 fresh tokens. It passes 1,218 documents. The second filter
+(also 51 question tokens) processes only the question for each
+survivor: $1{,}218 \times 51 = 62{,}118$ fresh tokens. Total:
+1,791,351. Without KV reuse, the second filter would also reprocess
+every surviving document's prefix.
 </Callout>
 
 The SoL calculation uses ground-truth labels to determine the exact
