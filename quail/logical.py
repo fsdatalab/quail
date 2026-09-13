@@ -291,10 +291,79 @@ class SemanticFilter:
 
 
 @dataclass(frozen=True)
+class Equality:
+    """One ordinary join condition: two columns of two tables are equal."""
+    left: ColumnRef
+    right: ColumnRef
+
+    type_name: ClassVar[str] = "quail.equality"
+
+    def aliases(self) -> tuple[str, str]:
+        return self.left.alias, self.right.alias
+
+    def __str__(self) -> str:
+        return (f"{self.left.alias}.{self.left.column} = "
+                f"{self.right.alias}.{self.right.column}")
+
+
+@dataclass(frozen=True)
+class Join:
+    """One binary relational join; ``on`` empty means a cross join.
+
+    The pairs it produces are the tuples a SemanticJoin above it asks
+    the model about. Every Equality names one column on each side.
+    """
+    left: LogicalNode
+    right: LogicalNode
+    on: tuple = ()    # tuple[Equality, ...]
+
+    type_name: ClassVar[str] = "quail.join"
+
+    def children(self) -> tuple[LogicalNode, ...]:
+        return (self.left, self.right)
+
+    def expressions(self) -> tuple:
+        return self.on
+
+    def output_schema(self) -> tuple[ColumnRef, ...]:
+        fields = list(self.left.output_schema())
+        fields.extend(field for field in self.right.output_schema()
+                      if field not in fields)
+        return tuple(fields)
+
+    def validate(self) -> None:
+        left = {field.alias for field in self.left.output_schema()}
+        right = {field.alias for field in self.right.output_schema()}
+        for condition in self.on:
+            sides = set(condition.aliases())
+            if not (sides & left and sides & right) or len(sides) != 2:
+                raise CompileError(
+                    f"join condition {condition} must name one table "
+                    f"on each side of the join ({sorted(left)} and "
+                    f"{sorted(right)})")
+
+    def with_children(self, children: tuple[LogicalNode, ...]):
+        if len(children) != 2:
+            raise CompileError("Join needs two children")
+        return replace(self, left=children[0], right=children[1])
+
+    def with_expressions(self, expressions: tuple):
+        return replace(self, on=tuple(expressions))
+
+    def explain_fields(self) -> dict:
+        return {"on": [str(condition) for condition in self.on]
+                or "cross"}
+
+
+@dataclass(frozen=True)
 class SemanticJoin:
-    """One n-way join: cross product filtered by a single prompt."""
-    inputs: tuple    # tuple[LogicalNode]: accumulated tree first, then
-    #                  one scan per newly joined table
+    """One n-way join predicate: a prompt asked of every input tuple.
+
+    The input is normally one Join, whose pairs the prompt evaluates.
+    Several inputs mean their cross product (the older shorthand).
+    """
+    inputs: tuple    # tuple[LogicalNode]: one Join, or the accumulated
+    #                  tree and then one scan per newly joined table
     predicate: Prompt
     semantics: str = "full"            # full | exists | anti
     selectivity: Optional[float] = None    # fraction of tuples that pass
@@ -339,6 +408,83 @@ class SemanticJoin:
             "semantics": self.semantics,
             "selectivity": self.selectivity,
             "anchor": self.anchor,
+        }
+
+
+APPLY_KINDS = ("per_batch", "barrier")
+APPLY_IDS = ("preserve", "drop", "pairs")
+
+
+@dataclass(frozen=True)
+class Apply:
+    """A user function between two operators.
+
+    The function is registered on the session under ``function`` and
+    receives an Arrow table per alias: the alias's row indices under
+    the alias name plus the listed columns. ``kind`` says how it runs:
+    ``per_batch`` on each batch of survivors a streaming operator hands
+    over, ``barrier`` once over every survivor. ``ids`` says what it
+    returns: ``preserve`` every input id, ``drop`` a subset of them,
+    ``pairs`` a relation of (left alias, right alias) rows for the join
+    at ``written_pos``. A function never invents an id.
+    """
+    input: LogicalNode
+    function: str
+    kind: str
+    ids: str
+    columns: tuple            # tuple[ColumnRef, ...]
+    aliases: tuple            # the alias, or the join's two aliases
+    written_pos: Optional[int] = None
+
+    type_name: ClassVar[str] = "quail.apply"
+
+    def children(self) -> tuple[LogicalNode, ...]:
+        return (self.input,)
+
+    def expressions(self) -> tuple:
+        return self.columns
+
+    def output_schema(self) -> tuple[ColumnRef, ...]:
+        return self.input.output_schema()
+
+    def validate(self) -> None:
+        if self.kind not in APPLY_KINDS:
+            raise CompileError(
+                f"apply kind must be one of {APPLY_KINDS}, got {self.kind!r}")
+        if self.ids not in APPLY_IDS:
+            raise CompileError(
+                f"apply ids must be one of {APPLY_IDS}, got {self.ids!r}")
+        if not self.function:
+            raise CompileError("apply needs a registered function name")
+        present = {field.alias for field in self.input.output_schema()}
+        if not set(self.aliases) <= present:
+            raise CompileError(
+                f"apply {self.function!r} names tables {self.aliases} "
+                f"outside its input ({sorted(present)})")
+        for ref in self.columns:
+            if ref.alias not in self.aliases:
+                raise CompileError(
+                    f"apply {self.function!r} reads {ref.alias}.{ref.column} "
+                    f"but works on {self.aliases}")
+        if (self.ids == "pairs") != (len(self.aliases) == 2):
+            raise CompileError(
+                "an apply returning pairs works on exactly two tables; "
+                "one returning ids works on one")
+
+    def with_children(self, children: tuple[LogicalNode, ...]):
+        if len(children) != 1:
+            raise CompileError("Apply needs one child")
+        return replace(self, input=children[0])
+
+    def with_expressions(self, expressions: tuple):
+        return replace(self, columns=tuple(expressions))
+
+    def explain_fields(self) -> dict:
+        return {
+            "function": self.function,
+            "kind": self.kind,
+            "ids": self.ids,
+            "columns": [f"{ref.alias}.{ref.column}" for ref in self.columns],
         }
 
 
@@ -411,6 +557,56 @@ class LogicalPlan:
             node.validate()
 
 
+def join_outer_input(join: "SemanticJoin") -> "LogicalNode":
+    """The tree the join extends: everything before its new tables."""
+    node = join.inputs[0]
+    if len(join.inputs) == 1:
+        while isinstance(node, (Join, Apply)):
+            node = node.left if isinstance(node, Join) else node.input
+    return node
+
+
+def join_conditions(join: "SemanticJoin") -> tuple:
+    """The Equality conditions under one SemanticJoin, in written order."""
+    conditions = []
+
+    def visit(node):
+        if isinstance(node, Apply):
+            visit(node.input)
+        elif isinstance(node, Join):
+            visit(node.left)
+            conditions.extend(node.on)
+
+    if len(join.inputs) == 1:
+        visit(join.inputs[0])
+    return tuple(conditions)
+
+
+def oriented_join_conditions(join: "SemanticJoin") -> tuple | None:
+    """Return one alias order and every equality oriented to that order."""
+    conditions = join_conditions(join)
+    if not conditions:
+        return None
+    left_alias, right_alias = conditions[0].aliases()
+    oriented = []
+    for condition in conditions:
+        left, right = condition.left, condition.right
+        if left.alias != left_alias:
+            left, right = right, left
+        oriented.append((left, right))
+    return left_alias, right_alias, tuple(oriented)
+
+
+def join_applies(join: "SemanticJoin") -> tuple:
+    """The Apply nodes that return pairs for one SemanticJoin."""
+    applies = []
+    node = join.inputs[0] if len(join.inputs) == 1 else None
+    while isinstance(node, Apply):
+        applies.append(node)
+        node = node.input
+    return tuple(reversed(applies))
+
+
 @dataclass(frozen=True)
 class JoinSpec:
     """The join predicate (or one EXISTS/anti term), pre-assembly."""
@@ -419,6 +615,8 @@ class JoinSpec:
     semantics: str = "full"
     selectivity: Optional[float] = None
     anchor: Optional[str] = None
+    on: tuple = ()             # tuple[Equality, ...] over the tables
+    applies: tuple = ()        # (function, kind, columns) returning pairs
 
 
 class LogicalPlanBuilder:
@@ -428,6 +626,7 @@ class LogicalPlanBuilder:
         self._tables = []
         self._nodes = {}
         self._root = None
+        self._joins = 0
 
     def add_scan(
         self,
@@ -435,24 +634,51 @@ class LogicalPlanBuilder:
         provider: str,
         column: str,
         predicates: tuple[FilterPredicate, ...] = (),
+        applies: tuple = (),
     ) -> None:
+        """Add one table; applies are (function, kind, ids, columns)."""
         if alias in self._nodes:
             raise CompileError(f"duplicate table alias {alias!r}")
         node = Scan(provider=provider, alias=alias, column=column)
         if predicates:
             node = SemanticFilter(node, tuple(predicates))
+        for function, kind, ids, columns in applies:
+            node = Apply(node, function=function, kind=kind, ids=ids,
+                         columns=tuple(columns), aliases=(alias,))
         self._tables.append(alias)
         self._nodes[alias] = node
         if self._root is None:
             self._root = node
 
     def add_join(self, join: JoinSpec) -> None:
+        """Join each new table onto the tree, then ask the prompt.
+
+        The equalities go on the Join that brings the last table in;
+        both front ends only produce conditions over that table.
+        """
         if self._root is None:
             raise CompileError("a logical join needs an input table")
+        root = self._root
+        for alias in join.aliases:
+            root = Join(root, self._nodes[alias])
+        present = {field.alias for field in root.output_schema()}
+        for condition in join.on:
+            if not set(condition.aliases()) <= present:
+                raise CompileError(
+                    f"join condition {condition} names a table this join "
+                    f"does not bring in ({list(join.aliases)}); put it on "
+                    f"the JOIN that introduces the table")
+        if join.on:
+            root = replace(root, on=tuple(join.on))
+        written_pos = self._joins
+        self._joins += 1
+        for function, kind, columns in join.applies:
+            aliases = tuple(dict.fromkeys(ref.alias for ref in join.prompt.args))
+            root = Apply(root, function=function, kind=kind, ids="pairs",
+                         columns=tuple(columns), aliases=aliases,
+                         written_pos=written_pos)
         self._root = SemanticJoin(
-            inputs=(self._root,) + tuple(
-                self._nodes[alias] for alias in join.aliases
-            ),
+            inputs=(root,),
             predicate=join.prompt,
             semantics=join.semantics,
             selectivity=join.selectivity,

@@ -5,25 +5,33 @@ from dataclasses import replace
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from fakes import keep_even, register_claims_evidence, two_alias_graph
 
+import quail
 from quail.backends.quail import expected_join_stages
 from quail.builder import col, docs, prompt
 from quail.catalog import Catalog, DocumentProvider
 from quail.physical import (
-    AnchoredJoin,
-    DocumentInput,
-    Exchange,
-    PackedFilter,
+    AiFilter,
+    AiJoin,
+    Barrier,
+    Foreign,
+    GraphValidationError,
+    PhysicalGraph,
+    PortRef,
+    Scan,
+    validate_streams,
 )
+from quail.physical.base import input_ports
 from quail.planner.decide import explain, filter_cost, order_filters, plan_query
-from quail.planner.plan import Refusal
+from quail.planner.plan import EngineConfig, Refusal
 from quail.planner.sol import speed_of_light
 from quail.planner.work import Work, ask, scan, triangle
 from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8
 
 
 def filter_chain(plan, alias=None):
-    return next(n for n in plan.nodes if isinstance(n, PackedFilter)
+    return next(n for n in plan.nodes if isinstance(n, AiFilter)
                 and (alias is None or n.alias == alias))
 
 
@@ -82,7 +90,7 @@ def test_gpu_copies_and_memory_refusals(catalog):
             assert plan.workers == gpus
             scan_node = next(
                 node for node in plan.nodes
-                if isinstance(node, DocumentInput)
+                if isinstance(node, Scan)
             )
             assert len(scan_node.shards) == gpus
 
@@ -289,13 +297,13 @@ def test_join_anchors_groups_and_forced_order(catalog):
     # the second stage sees the gate-thinned live counts
     assert stages[1]["expected_tuples"] < 8 * 6
     kinds = node_kinds(plan)
-    assert kinds.count("AnchoredJoin") == 2
-    assert kinds.count("Exchange") == 1
-    barrier = plan.graph.nodes_by_type(Exchange.type_name)[0]
+    assert kinds.count("AiJoin") == 2
+    assert kinds.count("Barrier") == 1
+    barrier = plan.graph.nodes_by_type(Barrier.type_name)[0]
     assert barrier.next_anchor == "p"
     assert set(barrier.aliases) == {"r", "t", "p"}
     # the barrier's outputs feed the second group's inputs
-    group2 = plan.graph.nodes_by_type(AnchoredJoin.type_name)[1]
+    group2 = plan.graph.nodes_by_type(AiJoin.type_name)[1]
     assert all(input_port.source.node_id == barrier.node_id
                for input_port in group2.inputs)
 
@@ -309,8 +317,8 @@ def test_join_anchors_groups_and_forced_order(catalog):
     stages = join_stages(plan)
     assert [s["anchor"] for s in stages] == ["t", "t"]
     kinds = node_kinds(plan)
-    assert kinds.count("AnchoredJoin") == 1
-    assert kinds.count("Exchange") == 0
+    assert kinds.count("AiJoin") == 1
+    assert kinds.count("Barrier") == 0
 
     # stage 1 forced onto t (the short side) is honored; stage 2 is
     # free and switches to p. The remark names the cheaper free plan.
@@ -383,12 +391,14 @@ def test_selective_gates_and_later_kv_reuse(catalog):
     toks = {"r": [400] * 100, "p": [100] * 100, "t": [100] * 100}
     plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
                       doc_tokens=toks)
-    groups = plan.graph.nodes_by_type(AnchoredJoin.type_name)
+    groups = plan.graph.nodes_by_type(AiJoin.type_name)
     assert len(groups) == 2
     assert [group.anchor for group in groups] == ["r", "r"]
     assert groups[0].keep_anchor_kv is True
     assert groups[1].keep_anchor_kv is False
-    assert groups[1].anchor_resident == "none"
+    # the gate's anchor KV is kept for the second group: a repeat
+    # anchor use pays no prefix under unlimited KV pricing
+    assert groups[1].anchor_resident == "kept"
 
 
 def test_join_token_costs_and_retention(catalog):
@@ -426,13 +436,14 @@ def test_join_token_costs_and_retention(catalog):
     plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
                       doc_tokens={"r": [300] * 50, "p": [5] * 20})
     chain = filter_chain(plan)
-    # one stage would normally turn arena writes off; the keep needs
-    # them
+    # one stage would normally turn arena writes off; the join reads
+    # the KV. The chain streams its survivors into the join with their
+    # KV pinned, so it retains nothing in the pool
     assert chain.arena_writes is True
-    assert chain.keep_kv is True
-    assert chain.keep_min_doc_tokens == 1
-    assert chain.keep_resident_fraction == 1.0
-    group = plan.graph.nodes_by_type(AnchoredJoin.type_name)[0]
+    assert chain.keep_kv is False
+    assert chain.pin_survivors is True
+    assert chain.hold_tokens > 0
+    group = plan.graph.nodes_by_type(AiJoin.type_name)[0]
     assert group.anchor == "r"
     assert group.anchor_resident == "filter"
     assert group.keep_anchor_kv is False    # nothing consumes r later
@@ -447,7 +458,8 @@ def test_join_token_costs_and_retention(catalog):
     stage = group.stages[0]
     assert stage.anchor_resident == "filter"
     assert stage.tuple_tokens == pytest.approx(expect)
-    assert any("shared KV on 'r'" in r for r in plan.remarks)
+    assert any("streams its survivors" in r for r in plan.remarks)
+    assert not any("shared KV on 'r'" in r for r in plan.remarks)
 
     logical = (docs(catalog, "reviews", tok).alias("r")
                .ai_join(docs(catalog, "products", tok).alias("p"),
@@ -457,23 +469,69 @@ def test_join_token_costs_and_retention(catalog):
                .select("r.id"))
     plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
                       doc_tokens={"r": [300] * 50, "p": [5] * 20})
-    group = plan.graph.nodes_by_type(AnchoredJoin.type_name)[0]
+    group = plan.graph.nodes_by_type(AiJoin.type_name)[0]
     assert group.anchor_resident == "none"
     assert not any("keep KV" in r for r in plan.remarks)
 
-    # The arena minus the loop's two-chunk working reservation credits
-    # a fraction of the expected survivors at every document length.
-    toks = {"r": [3000] * 40 + [1000] * 100, "p": [5] * 20}
-    plan = plan_query(_filtered_join(catalog, doc_sel=1.0),
-                      model=QWEN3_4B_FP8, device=H100_SXM,
+    # A filtered alias whose first use is as the anchor of a later
+    # group has its chain emitted right before that group, after the
+    # barrier, and streams into it: the pool is never involved.
+    logical = (docs(catalog, "reviews", tok).alias("r")
+               .ai_filter(prompt("about food: {0}", col("r.review")),
+                          selectivity=0.5)
+               .ai_join(docs(catalog, "products", tok).alias("p"),
+                        prompt("m {0} {1}", col("r.review"),
+                               col("p.description")),
+                        selectivity=0.5)
+               .ai_join(docs(catalog, "threads", tok).alias("t")
+                        .ai_filter(prompt("g {0}", col("t.thread")),
+                                   selectivity=1.0),
+                        prompt("m {0} {1}", col("p.description"),
+                               col("t.thread")),
+                        selectivity=0.5)
+               .select("r.id"))
+    toks = {"r": [300] * 50, "p": [5] * 20,
+            "t": [3000] * 40 + [1000] * 100}
+    plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
                       doc_tokens=toks)
-    chain = filter_chain(plan)
+    groups = plan.graph.nodes_by_type(AiJoin.type_name)
+    assert [group.anchor for group in groups] == ["r", "t"]
+    assert groups[1].anchor_resident == "filter"
+    for alias in ("r", "t"):
+        assert filter_chain(plan, alias).keep_kv is False
+        assert filter_chain(plan, alias).pin_survivors is True
+    order = [node.node_id for node in plan.nodes]
+    assert order.index("barrier:t") < order.index("ai_filter:t") \
+        < order.index("ai_join:t")
+    assert not any("shared KV" in r for r in plan.remarks)
+
+    # An alias that is a partner before it anchors must finish its
+    # chain before that earlier group, so its survivors go through the
+    # retention pool and its later anchor use is not streamed.
+    logical = (docs(catalog, "reviews", tok).alias("r")
+               .ai_filter(prompt("about food: {0}", col("r.review")),
+                          selectivity=0.5)
+               .ai_join(docs(catalog, "products", tok).alias("p"),
+                        prompt("m {0} {1}", col("r.review"),
+                               col("p.description")),
+                        selectivity=0.5, anchor="p")
+               .ai_join(docs(catalog, "threads", tok).alias("t"),
+                        prompt("m {0} {1}", col("r.review"),
+                               col("t.thread")),
+                        selectivity=0.5, anchor="r")
+               .select("r.id"))
+    toks = {"r": [300] * 50, "p": [500] * 20, "t": [5] * 20}
+    plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
+                      doc_tokens=toks, order="as_written")
+    groups = plan.graph.nodes_by_type(AiJoin.type_name)
+    assert [group.anchor for group in groups] == ["p", "r"]
+    assert groups[1].anchor_resident == "filter"
+    chain = filter_chain(plan, "r")
     assert chain.keep_kv is True
-    assert chain.keep_min_doc_tokens == 1
-    assert 0 < chain.keep_resident_fraction < 1
-    assert any("expected pages per worker" in r for r in plan.remarks)
-    group = plan.graph.nodes_by_type(AnchoredJoin.type_name)[0]
-    assert group.anchor_resident == "filter"
+    assert chain.pin_survivors is False
+    assert chain.arena_writes is True
+    order = [node.node_id for node in plan.nodes]
+    assert order.index("ai_filter:r") < order.index("ai_join:r")
 
 
 # ------------------------------------------------ KV keep (residency)
@@ -594,10 +652,15 @@ def test_join_search_residency_and_replanning():
                "c": [50] * 2}
 
     current = search_joins(
-        specs, live, lengths, {"a": {1, 2}}, 10, 100_000,
+        specs, live, lengths, {"a"}, 10, 100_000,
         QWEN3_4B_FP8, H100_SXM, fixed_order=True)
-    assert current["records"][0]["resident_docs"] == 2
-    assert current["records"][2]["resident_docs"] == 0
+    # a's filter computed its prefixes: its first anchor use pays no
+    # prefix, and neither does its later use (kept after group 0)
+    assert current["records"][0]["resident"] == "filter"
+    assert current["records"][0]["resident_docs"] == 3
+    assert current["records"][1]["resident"] == "none"
+    assert current["records"][2]["resident"] == "kept"
+    assert current["records"][2]["resident_docs"] == 3
 
     from quail.planner.joins import search_joins
 
@@ -627,9 +690,6 @@ def test_join_search_residency_and_replanning():
         total=100_000_000,
         squared=10_000_000_000,
         maximum=100,
-        resident_count=500_000,
-        resident_total=50_000_000,
-        resident_squared=5_000_000_000,
     )
     stats = {alias: million for alias in "abcd"}
     live = {alias: 1_000_000.0 for alias in "abcd"}
@@ -657,11 +717,11 @@ def test_aggregate_join_work_matches_per_document_sum():
     live = {"a": 2.25, "b": 3.5}
     raw = {"a": [90, 100, 110], "b": [30, 50, 70, 90]}
     stats = {
-        "a": summarize_alias(raw["a"], {1, 2}),
+        "a": summarize_alias(raw["a"]),
         "b": summarize_alias(raw["b"]),
     }
 
-    def per_document(same_group):
+    def per_document(resident):
         n = live["a"]
         tuples = live["a"] * live["b"]
         suffix = (spec["tail_tokens"] + spec["label_tokens"]["b"]
@@ -672,8 +732,7 @@ def test_aggregate_join_work_matches_per_document_sum():
         total = Work()
         for position, document in enumerate(raw["a"]):
             prefix = 10 + document
-            start = (ask(prefix, frame)
-                     if same_group or position in {1, 2}
+            start = (ask(prefix, frame) if resident
                      else scan(prefix, frame))
             stream = Work(
                 tokens=per_anchor * suffix,
@@ -685,11 +744,9 @@ def test_aggregate_join_work_matches_per_document_sum():
             total = total + (start + stream) * fraction
         return total
 
-    for same_group in (False, True):
-        actual = stage_work(
-            spec, "a", live, stats, 10, resident_at_start=True,
-            same_group=same_group)
-        expected = per_document(same_group)
+    for resident in (False, True):
+        actual = stage_work(spec, "a", live, stats, 10, resident=resident)
+        expected = per_document(resident)
         assert actual.tokens == pytest.approx(expected.tokens)
         assert actual.pairs == pytest.approx(expected.pairs)
         assert actual.kv_written == pytest.approx(expected.kv_written)
@@ -707,7 +764,8 @@ def test_explain_estimates_and_limits(catalog):
         text = explain(logical, plan)
         physical = text.split("physical:", 1)[1]
         assert f"Project: r.id (estimated_rows={expected})" in physical
-        assert f"PackedFilter: r (estimated_rows={expected})" in physical
+        assert f"AiFilter: r (estimated_rows={expected}, estimated_seconds=" \
+            in physical
         assert "Scan reviews as r (estimated_rows=100)" in physical
         assert "tokens=40,000" in physical
         assert "node_id=" not in text
@@ -722,7 +780,7 @@ def test_explain_estimates_and_limits(catalog):
             template = logical.root.input.predicates[stage.written_pos].prompt.template
             assert f"{index}. PROMPT({template!r}, r.review)" in physical
         verbose = explain(logical, plan, verbose=True)
-        assert "node_id=filter:r" in verbose
+        assert "node_id=ai_filter:r" in verbose
         assert "admission_tokens=" in verbose
         assert "expected_docs=" in verbose
 
@@ -739,14 +797,158 @@ def test_explain_estimates_and_limits(catalog):
     plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
                       doc_tokens={"r": [400] * 100, "p": [40] * 10})
     physical = explain(logical, plan).split("physical:", 1)[1]
-    assert "AnchoredJoin: anchor=" in physical
+    assert "AiJoin: anchor=" in physical
     assert "KV: anchor=" in physical
     assert "estimated_evaluations=" in physical
     assert "(estimated_rows=unknown)" in physical
     assert "expected_tuples=" not in physical
-    assert "retain KV for joins (estimated resident survivors=" in physical
+    assert "survivors stream into the join with KV pinned" in physical
+    assert "KV: anchor=streamed from its filter" in physical
     for node in plan.nodes:
-        if isinstance(node, AnchoredJoin):
+        if isinstance(node, AiJoin):
             assert f"anchor={node.anchor}" in physical
             for stage in node.stages:
                 assert f"{stage.semantics} ({stage.anchor}, " in physical
+
+
+# ------------------------------------------------ Foreign nodes and streams
+
+
+def _apply_query(session, kind):
+    claims = (session.docs("claims").alias("c")
+              .ai_filter(prompt("about a person: {0}", col("c.claim")),
+                         selectivity=0.5)
+              .apply(keep_even, columns=[col("c.url")], kind=kind))
+    return (claims.join(session.docs("evidence").alias("e"))
+            .ai_filter(prompt("{1} supports {0}", col("c.claim"),
+                              col("e.text")), selectivity=0.5)
+            .select("c.id", "e.id"))
+
+
+def test_planner_places_foreign_nodes_and_keeps_or_drops_the_stream():
+    with quail.Session(EngineConfig(),
+                       tokenizer=lambda text: list(text.encode())) as session:
+        # claims are the long side, so the planner anchors on them
+        register_claims_evidence(session, claim_words=200, text_words=10)
+        per_batch = _apply_query(session, "per_batch").plan()
+        chain = per_batch.graph.node("ai_filter:c")
+        foreign = per_batch.graph.node("apply:keep_even")
+        join = per_batch.graph.nodes_by_type(AiJoin.type_name)[0]
+        assert chain.pin_survivors
+        assert isinstance(foreign, Foreign) and foreign.kind == "per_batch"
+        assert foreign.inputs[0].source == PortRef("ai_filter:c", "ids:c")
+        assert PortRef("apply:keep_even", "ids:c") in {
+            port.source for port in join.inputs}
+        assert "keep_even" in session.registry.functions
+        text = per_batch.graph.explain()
+        assert "Foreign: keep_even (per_batch, drop) on c" in text
+        # a barrier needs every survivor at once: the chain materializes
+        barrier = _apply_query(session, "barrier").plan()
+        assert not barrier.graph.node("ai_filter:c").pin_survivors
+        assert barrier.graph.node("apply:keep_even").kind == "barrier"
+        request = _apply_query(session, "barrier")._prepare_physical()
+        assert request.column_tables()["c"].column_names == ["c", "url"]
+        assert request.column_tables()["c"].column("url").to_pylist()[:2] == [
+            "u0", "u1"]
+
+    with quail.Session(EngineConfig(gpus=2),
+                       tokenizer=lambda text: list(text.encode())) as session:
+        register_claims_evidence(session, claim_words=200, text_words=10)
+        plan = _apply_query(session, "per_batch").plan()
+        assert isinstance(plan, Refusal)
+        assert plan.constraint == "per_batch_apply_needs_one_gpu"
+        assert not isinstance(_apply_query(session, "barrier").plan(), Refusal)
+    with quail.Session(EngineConfig(backend="stock_vllm"),
+                       tokenizer=lambda text: list(text.encode())) as session:
+        register_claims_evidence(session, claim_words=200, text_words=10)
+        plan = _apply_query(session, "barrier").plan()
+        assert isinstance(plan, Refusal)
+        assert plan.constraint == "apply_needs_quail_backend"
+
+
+def test_stream_validator_refuses_a_barrier_on_a_pinned_edge():
+    validate_streams(two_alias_graph(True, foreign=("per_batch", "drop")))
+    validate_streams(two_alias_graph(True, foreign=("per_batch", "pairs")))
+    with pytest.raises(GraphValidationError, match="per-batch apply"):
+        validate_streams(two_alias_graph(True, foreign=("barrier", "drop")))
+    with pytest.raises(GraphValidationError, match="per-batch apply"):
+        validate_streams(two_alias_graph(True, foreign=("barrier", "pairs")))
+    # a pinned chain that no join consumes is refused too
+    graph = two_alias_graph(True)
+    orphan = PhysicalGraph(
+        tuple(node for node in graph.nodes if node.node_id != "group:0")
+        + (graph.node("group:0").with_inputs(input_ports(
+            (PortRef("input:r", "ids:r"), PortRef("input:p", "ids:p")))),),
+        graph.root)
+    with pytest.raises(GraphValidationError, match="no join anchored"):
+        validate_streams(orphan)
+
+
+# ------------------------------------------------ per-node estimates and plan edits
+
+
+def _big_plan(catalog):
+    logical = (docs(catalog, "reviews", tok).alias("r")
+               .ai_filter(prompt("negative: {0}", col("r.review")),
+                          selectivity=0.5)
+               .ai_join(docs(catalog, "products", tok).alias("p"),
+                        prompt("about {0} {1}", col("r.review"),
+                               col("p.description")), selectivity=0.1)
+               .select("r.id", "p.asin"))
+    return logical, plan_query(
+        logical, model=QWEN3_4B_FP8, device=H100_SXM,
+        doc_tokens={"r": [400] * 20000, "p": [20] * 10})
+
+
+def test_node_ids_estimates_and_the_recompute_column(catalog):
+    logical, plan = _big_plan(catalog)
+    assert [node.node_id for node in plan.nodes] == [
+        "scan:r", "scan:p", "ai_filter:r", "ai_join:r", "project"]
+    chain = plan.graph.node("ai_filter:r")
+    assert chain.pin_survivors
+    seconds = {node_id: entry["seconds"]
+               for node_id, entry in plan.estimates.items()
+               if "seconds" in entry}
+    assert set(seconds) == {"ai_filter:r", "ai_join:r"}
+    # each node priced alone: the parts add up to at least the packed
+    # whole, and to no more than three times it
+    assert plan.estimated_seconds <= sum(seconds.values()) \
+        <= 3 * plan.estimated_seconds
+    # 10,000 expected survivors of 400 tokens do not fit the retention
+    # pool, so releasing the chain's KV would recompute most of them
+    recompute = plan.estimates["ai_filter:r"]
+    assert recompute["release_recompute_tokens"] > 0.9 * 10000 * 401
+    assert recompute["release_recompute_seconds"] > 0
+    text = explain(logical, plan)
+    assert "estimated_seconds=" in text
+    assert "if the KV were released here instead of pinned" in text
+    assert "do not add up to the plan estimate" in text
+
+    # a Barrier on the pinned edge turns the pin off; the chain keeps
+    # its survivors in the pool and the recompute becomes expected
+    edited = plan.insert(
+        Barrier(node_id="barrier:r", next_anchor="r", aliases=("r",)),
+        between=("ai_filter:r", "ai_join:r"))
+    assert [node.node_id for node in edited.nodes] == [
+        "scan:r", "scan:p", "ai_filter:r", "barrier:r", "ai_join:r", "project"]
+    new_chain = edited.graph.node("ai_filter:r")
+    assert not new_chain.pin_survivors and new_chain.keep_kv
+    assert new_chain.hold_tokens == 0
+    assert edited.graph.node("barrier:r").inputs[0].source.node_id == "ai_filter:r"
+    assert [port.source.node_id for port in edited.graph.node("ai_join:r").inputs] == [
+        "barrier:r", "scan:p"]
+    # unpinned, a survivor holds no frame room, so a few more fit
+    assert edited.estimates["ai_filter:r"]["release_recompute_tokens"] == \
+        pytest.approx(recompute["release_recompute_tokens"], rel=0.01)
+    assert "expected recompute at the join" in explain(logical, edited)
+    # the edited plan's total carries the recompute the edit causes
+    assert edited.estimated_seconds == pytest.approx(
+        plan.estimated_seconds
+        + edited.estimates["ai_filter:r"]["release_recompute_seconds"])
+    # the input plan is untouched, and remove gives the plan back
+    assert plan.graph.node("ai_filter:r").pin_survivors
+    assert edited.remove("barrier:r") == plan
+    moved = edited.move("barrier:r", between=("scan:r", "ai_filter:r"))
+    assert [node.node_id for node in moved.nodes][:4] == [
+        "scan:r", "scan:p", "barrier:r", "ai_filter:r"]
+    assert moved.graph.node("ai_filter:r").pin_survivors

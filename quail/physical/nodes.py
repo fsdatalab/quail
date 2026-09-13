@@ -7,6 +7,7 @@ from typing import Any, ClassVar, Mapping
 
 from .base import (
     ExecutionLocation,
+    GraphValidationError,
     OutputPort,
     PhysicalNode,
     ValueType,
@@ -58,6 +59,8 @@ class JoinStage:
     pair_tail_tokens: int
     anchor_resident: str
     tuple_tokens: float
+    # empty for a cross join
+    pairs_from: str = ""
     frame_token_ids: tuple[int, ...] = ()
     label_token_ids: tuple[tuple[str, tuple[int, ...]], ...] = ()
     tail_token_ids: tuple[int, ...] = ()
@@ -76,6 +79,7 @@ class JoinStage:
             pair_tail_tokens=int(value["pair_tail_tokens"]),
             anchor_resident=str(value["anchor_resident"]),
             tuple_tokens=float(value["tuple_tokens"]),
+            pairs_from=str(value.get("pairs_from", "")),
             frame_token_ids=tuple(value.get("frame_token_ids", ())),
             label_token_ids=tuple(
                 (alias, tuple(tokens))
@@ -97,6 +101,7 @@ class JoinStage:
             "pair_tail_tokens": self.pair_tail_tokens,
             "anchor_resident": self.anchor_resident,
             "tuple_tokens": self.tuple_tokens,
+            "pairs_from": self.pairs_from,
         }
 
     def to_dict(self) -> dict:
@@ -116,6 +121,7 @@ class JoinStage:
             "semantics": self.semantics,
             "selectivity": self.selectivity,
             "written_pos": self.written_pos,
+            "pairs_from": self.pairs_from,
             "frame": self.frame_token_ids,
             "labels": dict(self.label_token_ids),
             "tail": self.tail_token_ids,
@@ -205,7 +211,7 @@ class RequestJoinSpec:
 
 
 @dataclass(frozen=True)
-class DocumentInput(PhysicalNode):
+class Scan(PhysicalNode):
     """Read one tokenized document input supplied by the coordinator."""
 
     alias: str = ""
@@ -215,7 +221,7 @@ class DocumentInput(PhysicalNode):
     shard_ranges: tuple[tuple[int, int], ...] = ()
     shard_token_loads: tuple[int, ...] = ()
 
-    type_name: ClassVar[str] = "quail.document_input"
+    type_name: ClassVar[str] = "quail.scan"
     runtime_key: ClassVar[str] = type_name
     location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
 
@@ -371,18 +377,18 @@ class RequestExecution(PhysicalNode):
 
 
 @dataclass(frozen=True)
-class PackedFilter(PhysicalNode):
+class AiFilter(PhysicalNode):
     """Evaluate ordered predicates on one document input."""
 
     alias: str = ""
     arena_writes: bool = False
     keep_kv: bool = False
-    keep_min_doc_tokens: int = 0
-    keep_resident_fraction: float = 0.0
+    pin_survivors: bool = False
+    hold_tokens: int = 0
     stages: tuple[FilterStage, ...] = ()
     question_token_ids: tuple[tuple[Any, ...], ...] = ()
 
-    type_name: ClassVar[str] = "quail.packed_filter"
+    type_name: ClassVar[str] = "quail.ai_filter"
     runtime_key: ClassVar[str] = type_name
     location: ClassVar[ExecutionLocation] = ExecutionLocation.GPU_EXECUTOR
     backend: ClassVar[str] = "quail"
@@ -407,8 +413,8 @@ class PackedFilter(PhysicalNode):
             "alias": self.alias,
             "arena_writes": self.arena_writes,
             "keep_kv": self.keep_kv,
-            "keep_min_doc_tokens": self.keep_min_doc_tokens,
-            "keep_resident_fraction": self.keep_resident_fraction,
+            "pin_survivors": self.pin_survivors,
+            "hold_tokens": self.hold_tokens,
             "stages": [stage.to_dict() for stage in self.stages],
             "question_token_ids": [
                 list(question) for question in self.question_token_ids
@@ -428,8 +434,8 @@ class PackedFilter(PhysicalNode):
             alias=attributes["alias"],
             arena_writes=bool(attributes["arena_writes"]),
             keep_kv=bool(attributes["keep_kv"]),
-            keep_min_doc_tokens=int(attributes["keep_min_doc_tokens"]),
-            keep_resident_fraction=float(attributes["keep_resident_fraction"]),
+            pin_survivors=bool(attributes["pin_survivors"]),
+            hold_tokens=int(attributes["hold_tokens"]),
             stages=tuple(
                 FilterStage.from_mapping(stage)
                 for stage in attributes["stages"]
@@ -442,13 +448,13 @@ class PackedFilter(PhysicalNode):
 
 
 @dataclass(frozen=True)
-class Exchange(PhysicalNode):
+class Barrier(PhysicalNode):
     """Move or repartition survivor ids between join steps."""
 
     next_anchor: str = ""
     aliases: tuple[str, ...] = ()
 
-    type_name: ClassVar[str] = "quail.exchange"
+    type_name: ClassVar[str] = "quail.barrier"
     runtime_key: ClassVar[str] = type_name
     location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
 
@@ -477,7 +483,7 @@ class Exchange(PhysicalNode):
 
 
 @dataclass(frozen=True)
-class AnchoredJoin(PhysicalNode):
+class AiJoin(PhysicalNode):
     """Evaluate join predicates that use one anchor alias."""
 
     anchor: str = ""
@@ -485,7 +491,7 @@ class AnchoredJoin(PhysicalNode):
     keep_anchor_kv: bool = False
     stages: tuple[JoinStage, ...] = ()
 
-    type_name: ClassVar[str] = "quail.anchored_join"
+    type_name: ClassVar[str] = "quail.ai_join"
     runtime_key: ClassVar[str] = type_name
     location: ClassVar[ExecutionLocation] = ExecutionLocation.GPU_EXECUTOR
     backend: ClassVar[str] = "quail"
@@ -529,6 +535,144 @@ class AnchoredJoin(PhysicalNode):
                 for stage in attributes["stages"]
             ),
         )
+
+
+@dataclass(frozen=True)
+class Foreign(PhysicalNode):
+    """Call a user function between two operators.
+
+    ``kind`` is ``per_batch`` (called on each batch a survivor stream
+    hands over, or once over a materialized input) or ``barrier``
+    (called once over every survivor; never on a stream). ``ids`` is
+    ``preserve``, ``drop``, or ``pairs``; the function never invents an
+    id. ``columns`` are (alias, column) pairs read as values.
+    """
+
+    function: str = ""
+    kind: str = "per_batch"
+    ids: str = "drop"
+    columns: tuple[tuple[str, str], ...] = ()
+    aliases: tuple[str, ...] = ()
+    written_pos: int = -1
+
+    type_name: ClassVar[str] = "quail.foreign"
+    runtime_key: ClassVar[str] = type_name
+    location: ClassVar[ExecutionLocation] = ExecutionLocation.GPU_EXECUTOR
+
+    @property
+    def outputs(self) -> tuple[OutputPort, ...]:
+        if self.ids == "pairs":
+            return (OutputPort(
+                f"pairs:{self.written_pos}", ValueType.PAIRS,
+                schema=tuple(self.aliases)),)
+        (alias,) = self.aliases
+        return (OutputPort(f"ids:{alias}", ValueType.DOCUMENT_IDS,
+                           schema=(alias,)),)
+
+    def attributes(self) -> dict:
+        return {
+            "function": self.function,
+            "kind": self.kind,
+            "ids": self.ids,
+            "columns": [list(column) for column in self.columns],
+            "aliases": list(self.aliases),
+            "written_pos": self.written_pos,
+        }
+
+    @classmethod
+    def from_attributes(cls, node_id, inputs, attributes):
+        return cls(
+            node_id=node_id,
+            inputs=inputs,
+            function=str(attributes["function"]),
+            kind=str(attributes["kind"]),
+            ids=str(attributes["ids"]),
+            columns=tuple(
+                (str(alias), str(column))
+                for alias, column in attributes["columns"]
+            ),
+            aliases=tuple(attributes["aliases"]),
+            written_pos=int(attributes["written_pos"]),
+        )
+
+
+@dataclass(frozen=True)
+class HashJoin(PhysicalNode):
+    """Pair the rows of two tables whose key columns are equal.
+
+    ``on`` lists (left column, right column) pairs; a row pair is kept
+    when every listed pair of values is equal. The node reads the key
+    columns as values and writes the pairs the join at ``written_pos``
+    asks the model about. ``pair_fraction`` is the planner's estimate
+    of the pairs kept over the cross product.
+    """
+
+    left: str = ""
+    right: str = ""
+    on: tuple[tuple[str, str], ...] = ()
+    written_pos: int = -1
+    pair_fraction: float = 1.0
+
+    type_name: ClassVar[str] = "quail.hash_join"
+    runtime_key: ClassVar[str] = type_name
+    location: ClassVar[ExecutionLocation] = ExecutionLocation.GPU_EXECUTOR
+
+    @property
+    def outputs(self) -> tuple[OutputPort, ...]:
+        return (OutputPort(f"pairs:{self.written_pos}", ValueType.PAIRS,
+                           schema=(self.left, self.right)),)
+
+    def attributes(self) -> dict:
+        return {
+            "left": self.left,
+            "right": self.right,
+            "on": [list(condition) for condition in self.on],
+            "written_pos": self.written_pos,
+            "pair_fraction": self.pair_fraction,
+        }
+
+    @classmethod
+    def from_attributes(cls, node_id, inputs, attributes):
+        return cls(
+            node_id=node_id,
+            inputs=inputs,
+            left=str(attributes["left"]),
+            right=str(attributes["right"]),
+            on=tuple((str(left), str(right))
+                     for left, right in attributes["on"]),
+            written_pos=int(attributes["written_pos"]),
+            pair_fraction=float(attributes.get("pair_fraction", 1.0)),
+        )
+
+
+@dataclass(frozen=True)
+class Exchange(PhysicalNode):
+    """Route one alias's documents to the GPU that holds their KV.
+
+    Present only in plans for several GPUs. On one GPU it passes the
+    ids through.
+    """
+
+    anchor: str = ""
+
+    type_name: ClassVar[str] = "quail.exchange"
+    runtime_key: ClassVar[str] = type_name
+    location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
+
+    @property
+    def outputs(self) -> tuple[OutputPort, ...]:
+        return (OutputPort(
+            f"ids:{self.anchor}",
+            ValueType.DOCUMENT_IDS,
+            schema=(self.anchor,),
+        ),)
+
+    def attributes(self) -> dict:
+        return {"anchor": self.anchor}
+
+    @classmethod
+    def from_attributes(cls, node_id, inputs, attributes):
+        return cls(node_id=node_id, inputs=inputs, anchor=attributes["anchor"])
 
 
 @dataclass(frozen=True)
@@ -611,3 +755,45 @@ class Limit(PhysicalNode):
     @classmethod
     def from_attributes(cls, node_id, inputs, attributes):
         return cls(node_id=node_id, inputs=inputs, count=int(attributes["count"]))
+
+
+def validate_streams(graph) -> None:
+    """Check that pinned survivor streams reach their joins as streams.
+
+    A filter that pins its survivors streams them into the join
+    anchored on its alias. On that path only per-batch Foreign nodes
+    may sit; a Barrier, a barrier Foreign, or any other consumer would
+    need the whole set at once, which a stream never has.
+    """
+    consumers: dict[tuple[str, str], list] = {}
+    for node in graph.nodes:
+        for port in node.inputs:
+            consumers.setdefault(
+                (port.source.node_id, port.source.port), []).append(node)
+    for node in graph.nodes:
+        if not isinstance(node, AiFilter) or not node.pin_survivors:
+            continue
+        alias = node.alias
+        reached = []
+
+        def follow(port):
+            for consumer in consumers.get(port, ()):
+                if isinstance(consumer, AiJoin) and consumer.anchor == alias:
+                    reached.append(consumer)
+                    continue
+                if isinstance(consumer, Foreign) \
+                        and consumer.kind == "per_batch":
+                    out = (f"pairs:{consumer.written_pos}"
+                           if consumer.ids == "pairs" else f"ids:{alias}")
+                    follow((consumer.node_id, out))
+                    continue
+                raise GraphValidationError(
+                    f"{consumer.node_id!r} reads the pinned survivors of "
+                    f"{node.node_id!r}; only a per-batch apply or the join "
+                    f"anchored on {alias!r} can consume a survivor stream")
+
+        follow((node.node_id, f"ids:{alias}"))
+        if not reached:
+            raise GraphValidationError(
+                f"{node.node_id!r} pins its survivors but no join anchored "
+                f"on {alias!r} consumes them")

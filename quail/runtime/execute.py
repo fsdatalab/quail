@@ -1,10 +1,16 @@
 """Run a query in the current process."""
 
+import os
 import time
 
 from quail.backends import BackendExecutionContext
 from quail.execution import PhysicalRequest, PhysicalResponse
-from quail.physical import DocumentInput, check_plan_envelope, decode_graph
+from quail.physical import (
+    Scan,
+    check_plan_envelope,
+    decode_graph,
+    validate_streams,
+)
 from quail.planner.plan import Refusal
 from quail.runtime.session import RefusalError
 
@@ -17,6 +23,8 @@ def gpu_problem() -> str | None:
         import torch
     except ImportError:
         return "torch is not installed"
+    # the default check initializes CUDA, which breaks vLLM's forked engine
+    os.environ.setdefault("PYTORCH_NVML_BASED_CUDA_CHECK", "1")
     if not torch.cuda.is_available():
         return "no CUDA GPU is visible to this process"
     return None
@@ -32,9 +40,10 @@ def _validate_physical_request(request, registry):
     graph = decode_graph(envelope["graph"], registry.codecs)
     graph.validate(runtime_keys=set(registry.runtimes))
     graph.validate_backend(envelope["backend"])
+    validate_streams(graph)
     needed_inputs = {
         node.input_id for node in graph.nodes
-        if isinstance(node, DocumentInput)
+        if isinstance(node, Scan)
     }
     missing = needed_inputs - set(request.inputs)
     extra = set(request.inputs) - needed_inputs
@@ -61,9 +70,21 @@ def _execute_physical(request, registry):
     return response
 
 
-def execute_query(query, physical_executor=None):
-    """Execute one query in its session's process."""
+def execute_query(query, physical_executor=None, plan=None):
+    """Execute one query in its session's process.
+
+    Args:
+        query: The Query to run.
+        physical_executor: Optional callable(PhysicalRequest) that
+            returns the PhysicalResponse, for tests without a GPU.
+        plan: An edited PhysicalPlan to run instead of the planner's.
+    """
     total_started = time.perf_counter()
+    if plan is not None:
+        if isinstance(plan, Refusal) or not hasattr(plan, "graph"):
+            raise TypeError("plan must be a PhysicalPlan")
+        query.plan()            # tokenization and pair tables first
+        query._plan = plan
     if physical_executor is None:
         problem = gpu_problem()
         if problem is not None:

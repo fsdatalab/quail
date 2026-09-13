@@ -146,28 +146,32 @@ print(query.explain())
 
 ```text
 logical:
-  Project [r.id]
-    SemanticFilter (x1, sels=[None])
-      Scan reviews as r [body]
-physical:
-  workers=1 model_copies=1
-  KV dtype=bf16
-  chunk_tokens=110376 admission_tokens=362250
-  prompt layout: engine preamble + document + suffix (preamble_tokens per stage below count the shared preamble)
-  joins follow the saved order and anchors
-  order=as_written (default: at least one predicate has no selectivity)
-  DocumentInput input:a alias=a input_id=a n_docs=12 total_tokens=27 shard_docs=[12]
-  DocumentInput input:r alias=r input_id=r n_docs=8 total_tokens=693 shard_docs=[8]
-  PackedFilter filter:r alias=r arena_writes=False keep_kv=False keep_min_doc_tokens=0 keep_resident_fraction=0.0 <- input:r[ids:r]
-    stage {'written_pos': 0, 'question_tokens': 51, 'preamble_tokens': 2, 'selectivity': None, 'expected_docs': 8.0}
-  Project sink columns=['r.id'] <- filter:r[ids:r]
-  remark: filter on 'r': arena writes off (one stage - nothing reads the KV again)
+  Project: r.id
+    SemanticFilter
+      PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the review above ...', r.body) (selectivity=unknown)
+      Scan reviews as r [body, id]
+
+physical: (backend=quail, model=qwen3-4b-fp8, workers=1)
+  KV=bf16, chunk budget=110,376 tokens, admission budget=362,250 tokens
+  node seconds price each node's work alone; they do not add up to the plan estimate because chunk packing shares forward passes across nodes
+  Project: r.id (estimated_rows=unknown)
+    AiFilter: r (estimated_rows=unknown, estimated_seconds=0.004)
+      KV: not stored
+      1. PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the review above ...', r.body) (selectivity=unknown, question_tokens=51)
+      Scan reviews as r (estimated_rows=8)
+        tokens=693, mean_doc_tokens=86.6
+
+  note: token counts for 'r' are estimated from a 1024 document sample
 ```
 
-This ran on the client with no GPU. It tokenized the eight reviews
-(693 tokens), planned one `PackedFilter` node with a 51-token
-question, and noted that with a single stage nothing reads the KV
-again, so the arena is not written.
+This ran on the client with no GPU. It planned one `AiFilter` node
+with a 51-token question over the eight reviews (693 tokens), priced
+it at 4 milliseconds of model time, and noted that with a single stage
+nothing reads the KV again, so the KV is not stored. The prompt text
+is shortened here with `...`; `explain()` prints all of it. The first
+`explain()` on a column estimates its token count from a sample and
+says so on the last line; with eight reviews the sample is the whole
+table, so 693 is exact.
 
 </Step>
 <Step>
@@ -248,16 +252,29 @@ r.id       a.aspect
  rv2    the editing
 ```
 
-The plan for this query keeps the filter survivors' KV resident so
-the join packs no document tokens again:
+The plan for this query streams each filter survivor into the join
+with its KV still in the arena, so the join packs no document tokens
+again:
 
 ```text
-  PackedFilter filter:r alias=r arena_writes=True keep_kv=True ... <- input:r[ids:r]
-  AnchoredJoin group:0 anchor=r anchor_resident=filter keep_anchor_kv=False <- filter:r[ids:r], input:a[ids:a]
-    stage {'written_pos': 0, 'anchor': 'r', 'partners': ['a'], 'semantics': 'full', 'selectivity': 0.15, 'expected_tuples': 57.6, ...}
-  Project sink columns=['r.id', 'a.aspect'] <- group:0[join_answers:0]
-  remark: keep KV on 'r': all survivors priced as resident for the join, 451 expected tokens per worker of the 362,250-token arena
+  Project: r.id, a.aspect (estimated_rows=unknown)
+    AiJoin: anchor=r (estimated_rows=unknown, estimated_seconds=0.003)
+      KV: anchor=streamed from its filter, retain after join=no
+      1. full (r, a): PROMPT('Does the review in DOCUMENT {0} discuss the movie aspect in DOCUMENT {1}?', r.body, a.aspect) (selectivity=15%, estimated_evaluations=57.6)
+      AiFilter: r (estimated_rows=4.8, estimated_seconds=0.004)
+        survivors stream into the join with KV pinned
+        1. PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the review above ...', r.body) (selectivity=60%, question_tokens=51)
+        if the KV were released here instead of pinned: 0 tokens, 0.000 s
+        Scan reviews as r (estimated_rows=8)
+          tokens=693, mean_doc_tokens=86.6
+      Scan aspects as a (estimated_rows=12)
+        tokens=27, mean_doc_tokens=2.2
 ```
+
+The line under the filter says what pinning saves: releasing the KV
+here would cost nothing on eight reviews, because every survivor fits
+the retention pool. On a large table that number grows, and
+[physical plans](../architecture/physical-plans) shows how to read it.
 
 And the report confirms it happened:
 

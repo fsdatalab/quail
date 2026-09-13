@@ -7,14 +7,17 @@ from typing import Any, Mapping
 
 from .base import InputPort, PhysicalGraph, PhysicalNode, PortRef, ValueType
 from .nodes import (
-    AnchoredJoin,
-    DocumentInput,
+    AiFilter,
+    AiJoin,
+    Barrier,
     Exchange,
+    Foreign,
+    HashJoin,
     Limit,
-    PackedFilter,
     Project,
     Recombine,
     RequestExecution,
+    Scan,
 )
 
 
@@ -129,11 +132,14 @@ def _require_fields(
 def built_in_codecs() -> tuple[NodeCodec, ...]:
     """Return codecs for every built in physical node."""
     return tuple(NodeCodec(node_type) for node_type in (
-        DocumentInput,
-        PackedFilter,
+        Scan,
+        AiFilter,
         RequestExecution,
+        Barrier,
         Exchange,
-        AnchoredJoin,
+        Foreign,
+        HashJoin,
+        AiJoin,
         Recombine,
         Project,
         Limit,

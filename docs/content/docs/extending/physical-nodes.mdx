@@ -86,7 +86,7 @@ candidates. The cheapest candidate across the backend and all
 registered planners wins.
 
 ```python
-from quail.physical import DocumentInput, InputPort, PortRef, Project
+from quail.physical import Scan, InputPort, PortRef, Project
 from quail.planner.plan import PhysicalPlan
 from quail.planning import PhysicalCandidate
 
@@ -96,7 +96,7 @@ class PreferredPlanner:
 
     def plan(self, region, context):
         n_docs = len(context.document_tokens["d"])
-        scan = DocumentInput(node_id="input:d", alias="d",
+        scan = Scan(node_id="input:d", alias="d",
                              input_id="d", n_docs=n_docs)
         first = FirstDocuments(
             node_id="filter:d",

@@ -98,8 +98,8 @@ def run_one(gpus, flags, truth1, truth2, tmp):
 
     kinds = [type(n).__name__ for n in expected_join_nodes(plan)]
     print(f"[{gpus} gpu] plan nodes: {kinds}", flush=True)
-    assert kinds.count("AnchoredJoin") == 2, kinds
-    assert kinds.count("Exchange") == 1, kinds
+    assert kinds.count("AiJoin") == 2, kinds
+    assert kinds.count("Barrier") == 1, kinds
     print(q.explain(), flush=True)
 
     res = q.run()

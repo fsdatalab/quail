@@ -105,8 +105,8 @@ Each logical node supplies:
 - Methods that replace children or expressions.
 - Fields for `explain()`.
 
-The built in nodes are `Scan`, `SemanticFilter`, `SemanticJoin`, and
-logical `Project`.
+The built in nodes are `Scan`, `SemanticFilter`, `Join`,
+`SemanticJoin`, `Apply`, and logical `Project`.
 
 The session keeps the logical plan in process. The extension module that
 defines a custom logical node must be installed in the worker image.
@@ -137,24 +137,27 @@ lists.
 
 The built in generic nodes are:
 
-- `DocumentInput`
-- `Exchange`
+- `Scan`
+- `Barrier`
+- `Exchange` (several GPUs only)
 - `Recombine`
 - `Project`
 - `Limit`
 
 The Quail backend adds:
 
-- `PackedFilter`
-- `AnchoredJoin`
+- `AiFilter`
+- `AiJoin`
 
 The planner chooses join order and anchors using estimated survivor counts.
-It emits the filter chains, `AnchoredJoin` groups, and `Exchange` nodes in
-execution order. The first anchor's filters run last. Passing document KV from
-all planned anchor inputs competes in one shared pool, within the available
+It emits the filter chains, `AiJoin` groups, and `Barrier` nodes in
+execution order. A chain whose alias first appears as an anchor sits right
+before that group and streams into it with survivors' KV pinned. A chain
+whose alias is a partner first runs before that earlier group, and its
+passing document KV waits in one shared pool per GPU, within the available
 capacity. The plan supplies future reuse probabilities and release points.
 
-`Exchange` prunes survivor IDs using completed join answers. Each model node
+`Barrier` prunes survivor IDs using completed join answers. Each model node
 uses the same model execution object and KV. Execution follows the saved graph
 without running the join optimizer again.
 

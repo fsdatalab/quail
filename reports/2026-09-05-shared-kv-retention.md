@@ -11,9 +11,9 @@
 
 [Open the FEVER vector PDF](plots/quailb_fev.pdf)
 
-[![FEVER latency, recomputed KV, fresh input tokens, accuracy, and input counts](plots/quailb_fev.png)](plots/quailb_fev.pdf)
+[Open the FEVER vector PDF](plots/quailb_fev.pdf)
 
-Figure: plots/quailb_fev.png
+Figure: plots/quailb_fev.pdf
 
 - FEV-9 appears with the other FEVER queries in the standard dataset plot.
   The plot uses the September 6 run of all four methods, documented in
@@ -80,7 +80,7 @@ Figure: plots/quailb_fev.png
   The retention change preserves answers but does not improve model accuracy.
 - The saved evaluator rounds output precision and F1 to zero at six decimal
   places. The precision above is calculated from the saved integer counts.
-- [The full comparison plots](2026-09-05-quailb-saved-results.md) reuse all 124
+- [The full comparison plots](quailb-comparison.md) reuse all 124
   saved configurations for the other 31 queries. FEV-9 uses new measurements
   of all four methods on the four-filter query.
 
@@ -115,12 +115,13 @@ Figure: plots/quailb_fev.png
   Each configuration has `summary.json` with source hashes, settings, and
   measurements, plus seven Parquet answer tables. `accuracy.json` contains the
   subsequent scoring of both configurations against saved reference labels.
-- `reports/score_shared_kv_retention.py` reproduces accuracy from the saved
-  answers and writes the derived result to the volume. Its docstring contains
-  the download and scoring commands. It never runs inference.
-- `reports/make_quailb_comparison_plots.py` contains the exact volume download
-  commands and regenerates the main QUAIL-B plot and every dataset plot.
-  `reports/score_shared_kv_retention.py` checks all seven answer tables for equality.
+- `accuracy.json` was produced by a scorer that read the saved answers
+  without inference and checked all seven answer tables for equality
+  between the two configurations. The cell and the scorer were removed on
+  September 13, 2026, together with the alias-and-position answer format
+  they wrote and read; both are in the history at commit `5c78938`
+  (`experiments/cells/shared_kv_retention.py`,
+  `reports/score_shared_kv_retention.py`).
 - All 231 CPU tests pass. Coverage includes replacement across filter inputs,
   returned admission pages, protected active KV, expired and dead prefixes,
   incorrect estimates, zero capacity, both Quail execution paths, and execution

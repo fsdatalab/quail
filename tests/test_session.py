@@ -6,9 +6,12 @@ Covers gating, tuple assembly, projection, and the report.
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from fakes import register_claims_evidence
 
 import quail
+from quail.physical import AiJoin
 from quail.planner.plan import EngineConfig
+from quail.runtime.pairs import pair_fraction, pair_table, partner_map
 
 
 def _parquet(path, table):
@@ -29,9 +32,9 @@ def _run(query, execute):
 def runtime_plan(request):
     from quail.builtins import built_in_registry
     from quail.physical import (
-        AnchoredJoin,
-        DocumentInput,
-        PackedFilter,
+        AiFilter,
+        AiJoin,
+        Scan,
         decode_graph,
     )
 
@@ -40,7 +43,7 @@ def runtime_plan(request):
     )
     filter_nodes = {
         node.alias: node for node in graph.nodes
-        if isinstance(node, PackedFilter)
+        if isinstance(node, AiFilter)
     }
     return {
         "graph": graph,
@@ -51,10 +54,10 @@ def runtime_plan(request):
             for alias, node in filter_nodes.items()
         },
         "joins": [stage.runtime_spec() for node in graph.nodes
-                  if isinstance(node, AnchoredJoin) for stage in node.stages],
+                  if isinstance(node, AiJoin) for stage in node.stages],
         "shards": {
             node.alias: node.shards for node in graph.nodes
-            if isinstance(node, DocumentInput)
+            if isinstance(node, Scan)
         },
     }
 
@@ -91,7 +94,7 @@ def make_executor(filter_truth, join_truth=None, seen=None):
 
         from quail.backends.quail.graph import execute_single_graph
         from quail.execution import PhysicalResponse
-        from quail.physical import DocumentInput, PackedFilter
+        from quail.physical import AiFilter, Scan
         from quail.runtime.runner import NodeResult
 
         runtime = runtime_plan(request)
@@ -101,12 +104,12 @@ def make_executor(filter_truth, join_truth=None, seen=None):
         graph = runtime["graph"]
         docs = {
             node.alias: request.inputs[node.input_id].documents
-            for node in graph.nodes if isinstance(node, DocumentInput)
+            for node in graph.nodes if isinstance(node, Scan)
         }
 
         class FixedAnswers:
             def execute(self, node, inputs):
-                if isinstance(node, PackedFilter):
+                if isinstance(node, AiFilter):
                     rows = {}
                     for document in inputs["document_ids"]:
                         row = []
@@ -187,8 +190,8 @@ def test_query_rows_observers_and_saved_reports(sess, tmp_path):
     result = _observed_result(tmp_path, registry)
 
     assert result.observer(NodeTypes)["types"] == [
-        "quail.document_input",
-        "quail.packed_filter",
+        "quail.scan",
+        "quail.ai_filter",
         "quail.project",
         "quail.limit",
     ]
@@ -244,3 +247,85 @@ def _observed_result(tmp_path, registry):
         "SELECT r.id FROM reviews r WHERE "
         "AI_FILTER(PROMPT('q: {0}', r.review)) LIMIT 1"
     ), make_executor(truth))
+
+
+def test_pair_table_lists_equal_keys_once_each():
+    pairs = pair_table(
+        "c", [pa.array(["u1", "u2", None, "u1"])],
+        "e", [pa.array(["u2", "u1", "u1"])])
+    assert pairs.to_pydict() == {"c": [0, 0, 1, 3, 3], "e": [1, 2, 0, 1, 2]}
+    assert pair_fraction(pairs, 4, 3) == 5 / 12
+    assert partner_map(pairs, "e", "c") == {0: [1], 1: [0, 3], 2: [0, 3]}
+    # two equalities: both key columns must match; integer keys on one
+    # side are cast to the other side's type
+    pairs = pair_table(
+        "c", [pa.array(["u1", "u1"]), pa.array([1, 2])],
+        "e", [pa.array(["u1", "u1"]), pa.array([2, 2], type=pa.int8())])
+    assert pairs.to_pydict() == {"c": [1, 1], "e": [0, 1]}
+
+
+def _pair_query(session, on):
+    query = session.docs("claims").alias("c")
+    partner = session.docs("evidence").alias("e")
+    if on:
+        query = query.join(partner, on=quail.col("c.url") == quail.col("e.url"))
+    else:
+        query = query.join(partner)
+    return query.ai_filter(
+        quail.prompt("Does {1} support {0}?", quail.col("c.claim"),
+                     quail.col("e.text")),
+        selectivity=0.5).select("c.id", "e.id")
+
+
+def test_session_plans_prices_and_ships_the_pair_table():
+    with quail.Session(EngineConfig(),
+                       tokenizer=lambda text: list(text.encode())) as session:
+        register_claims_evidence(session)
+        paired = _pair_query(session, on=True)
+        cross = _pair_query(session, on=False)
+        paired_plan, cross_plan = paired.plan(), cross.plan()
+        paired_stage = paired_plan.graph.nodes_by_type(
+            AiJoin.type_name)[0].stages[0]
+        cross_stage = cross_plan.graph.nodes_by_type(
+            AiJoin.type_name)[0].stages[0]
+        # c1 and c2 pair with e0 and e2, c0 with e1: 5 of 12 pairs
+        hash_join = paired_plan.graph.node("hash_join:c-e")
+        assert (hash_join.left, hash_join.right, hash_join.on) == (
+            "c", "e", (("url", "url"),))
+        assert hash_join.pair_fraction == 5 / 12
+        assert [port.source.node_id for port in hash_join.inputs] == [
+            "scan:c", "scan:e"]
+        assert paired_stage.pairs_from == "hash_join:c-e"
+        assert not cross_stage.pairs_from
+        assert "hash_join:c-e" not in {node.node_id for node in cross_plan.nodes}
+        assert paired_stage.expected_tuples == round(
+            cross_stage.expected_tuples * 5 / 12, 1)
+        assert paired_plan.estimated_seconds < cross_plan.estimated_seconds
+        assert "HashJoin" in paired.explain() and "c.url = e.url" in paired.explain()
+        # the request carries the key columns, not the pairs
+        request = paired._prepare_physical()
+        assert request.column_tables()["c"].column("url").to_pylist() == [
+            "u0", "u1", "u1", "u9"]
+        assert cross._prepare_physical().relations == {}
+
+        def answer(prompt, assignment):
+            return (assignment["c"] + assignment["e"]) % 2 == 0
+
+        estimate = quail.speed_of_light_estimate(paired, answer)
+        assert estimate.join_pair_evaluations == 5
+        assert estimate.join_stages[0]["passing_pairs"] == 2
+        assert quail.speed_of_light_estimate(
+            cross, answer).join_pair_evaluations == 12
+
+
+def test_gpu_seconds_reach_the_result_report(sess):
+    truth = {"r": {"q1:": [1, 0, 1, 0, 1, 0], "q2:": [1, 1, 1, 1, 1, 1]}}
+    executor = make_executor(truth)
+
+    def timed(request):
+        response = executor(request)
+        response.metrics["gpu_s"] = 0.75
+        return response
+
+    assert "gpu_s" not in _run(sess.sql(FILTER_SQL), executor).report
+    assert _run(sess.sql(FILTER_SQL), timed).report["gpu_s"] == 0.75

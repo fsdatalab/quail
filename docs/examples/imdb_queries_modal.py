@@ -23,6 +23,16 @@ from quail_b.data import ASPECTS, SOURCE_REVISIONS
 from quail_b.prompts import DISCUSS_ASPECT, F1
 
 app = modal.App("quail-engine")
+IMAGE_REQUIREMENTS = (
+    "sqlglot==30.17.0",
+    "transformers==5.15.0",
+    "huggingface-hub==1.27.0",
+    "pyarrow==25.0.1",
+    "numpy==2.3.5",
+    "bpe-qwen==0.1.5",
+    "datasets==5.0.1",
+    "vllm==0.26.0",
+)
 
 
 def load_reviews(count: int = 8) -> pa.Table:
@@ -50,8 +60,7 @@ image = (
     modal.Image.from_registry(
         "nvidia/cuda:13.0.1-devel-ubuntu24.04", add_python="3.12")
     .entrypoint([])
-    .pip_install("vllm==0.26.0", "huggingface_hub", "numpy", "pyarrow",
-                 "sqlglot>=27.0", "bpe-qwen>=0.1.5", "datasets>=5.0.1")
+    .pip_install(*IMAGE_REQUIREMENTS)
     .env({
         "QUAIL_CACHE_DIR": "/root/.cache/kernels",
         "VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",

@@ -373,7 +373,8 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
 
 def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
              stage_suffixes, budget, stage_frames=None,
-             anchor_keys=None, anchor_done=None):
+             anchor_keys=None, anchor_done=None, anchor_source=None,
+             attention_mode=None, anchor_partners=None, anchor_batch=None):
     """The join driver: stream partner lists against anchors.
 
     Survivors are gated between stages.
@@ -384,64 +385,137 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         pipeline: Pipeline that runs each packed forward chunk.
         async_ans: AsyncAnswers that reads TRUE/FALSE off the GPU.
         anchor_prefixes: Anchor id (list index) -> prefix token list.
+            With anchor_source it must be an empty list; the join
+            appends each streamed anchor's prefix to it.
         stage_suffixes: Per stage, the partner suffix token lists.
         budget: Chunk token budget.
         stage_frames: Per stage, task framing token list written into
             each anchor's kept KV after the document rows.
         anchor_keys: Stable arena key for each anchor. List positions are
-            used when omitted.
+            used when omitted. With anchor_source it must be an empty
+            list; the join appends each streamed anchor's key to it.
         anchor_done: Optional callback(anchor position, final answer row).
             It owns the anchor's final retain or free decision.
+        anchor_source: Optional stream that admits anchors while the
+            join runs: next() runs one chunk of its own and returns
+            ((key, prefix) pairs, blocked); done is True once nothing
+            is left; chunks counts its launched chunks. Every key it
+            hands over is resident in the arena, so the join packs no
+            prefix tokens for it. The join pulls until it can fill a
+            chunk and then runs one. blocked means the source is out
+            of arena pages until the join frees some.
+        attention_mode: Attention path set on the pipeline before each
+            join chunk; the pipeline's current mode when omitted.
+        anchor_partners: Optional callable(anchor key) -> per stage,
+            the indices into that stage's partner list the anchor
+            streams, or None for the whole list. Omitted means every
+            anchor streams every partner.
+        anchor_batch: Optional callable(keys) -> the keys to admit, run
+            on each batch the source hands over before admission. A
+            key it leaves out is freed, never admitted.
 
     Returns:
-        (ans, spans, tokens): ans[j][a] = 0/1 row over stage-j
-        partners; spans = (stage, start_event, end_event) per forward;
-        tokens = fresh tokens packed.
+        (ans, spans, tokens): ans[j][a] = 0/1 row over the stage-j
+        partners anchor a streams, with a in admission order; spans =
+        (stage, start_event, end_event) per forward; tokens = fresh
+        tokens packed.
     """
     k = len(stage_suffixes)
-    n = len(anchor_prefixes)
-    if n == 0 or k == 0 or not stage_suffixes[0]:
-        return [dict() for _ in range(k)], [], 0
-    frames = stage_frames or [[] for _ in range(k)]
-    keys = list(range(n)) if anchor_keys is None else list(anchor_keys)
-    if len(keys) != n:
+    if anchor_source is not None:
+        if anchor_prefixes or anchor_keys:
+            raise ValueError(
+                "anchor_source fills anchor_prefixes and anchor_keys")
+        prefixes, keys = anchor_prefixes, anchor_keys
+    else:
+        prefixes = list(anchor_prefixes)
+        keys = (list(range(len(prefixes))) if anchor_keys is None
+                else list(anchor_keys))
+    if len(keys) != len(prefixes):
         raise ValueError("anchor_keys must match anchor_prefixes")
-    frame_max = max(len(f) for f in frames)
+    frames = stage_frames or [[] for _ in range(k)]
     owned = arena.accounting.owned
-    resident = {a: len(owned[keys[a]]) for a in range(n)
+
+    if k == 0:
+        return [], [], 0
+    frame_max = max(len(f) for f in frames)
+    resident = {a: len(owned[keys[a]]) for a in range(len(keys))
                 if keys[a] in owned}
     # Every resident anchor stays available for the whole join while
     # fresh admissions evict unrelated retained KV.
     for a in resident:
         arena.pin(keys[a])
+    def partners_of(key):
+        return None if anchor_partners is None else anchor_partners(key)
+
     sched = JoinAdmission(
-        [len(p) for p in anchor_prefixes],
+        [len(p) for p in prefixes],
         [[len(s) for s in sufs] for sufs in stage_suffixes],
         budget, arena.accounting.n_pages, arena.accounting.page_tokens,
-        frame_tokens=[len(f) for f in frames], resident=resident)
+        frame_tokens=[len(f) for f in frames], resident=resident,
+        anchor_partners={a: partners_of(keys[a]) for a in range(len(keys))})
     spans = []
     tokens = 0
     outstanding = []     # (groups, handle) in launch order
-    progress = Progress(f"join ({k} stages)", total=n, unit="anchors")
+    progress = Progress(
+        f"join ({k} stages)",
+        total=None if anchor_source is not None else len(prefixes),
+        unit="anchors")
     finished = [0]
+
+    def admit(items):
+        if anchor_batch is not None and items:
+            kept = set(anchor_batch([key for key, _ in items]))
+            for key, _ in items:
+                if key not in kept and key in owned:
+                    arena.free_key(key)
+            items = [(key, prefix) for key, prefix in items if key in kept]
+        for key, prefix in items:
+            if key not in owned:
+                raise ValueError(
+                    f"streamed anchor {key!r} has no KV in the arena")
+            arena.pin(key)
+            keys.append(key)
+            prefixes.append(prefix)
+            sched.admit(len(prefix), len(owned[key]),
+                        partners=partners_of(key))
+
+    def pull(evict_retained=False, force=False):
+        """Run source chunks until a join chunk can fill or the source blocks.
+
+        Returns whether the source launched a chunk or handed over an
+        anchor.
+        """
+        moved = False
+        while not anchor_source.done and (
+                force or sched.buildable_tokens() < budget):
+            force = False
+            before = anchor_source.chunks
+            items, blocked = anchor_source.next(
+                evict_retained=evict_retained)
+            admit(items)
+            moved = moved or bool(items) or anchor_source.chunks > before
+            if blocked:
+                break
+        return moved
 
     def build(chunk_groups):
         specs = []
         for a, j, start, end, carried in chunk_groups:
             key = keys[a]
-            f = len(anchor_prefixes[a])
+            f = len(prefixes[a])
             frame = frames[j]
             got = arena.activate(key, f, capacity_tokens=f + frame_max)
             assert got is not None, \
                 "scheduler admitted an anchor the arena cannot hold"
-            sufs = stage_suffixes[j][start:end]
+            sufs = [stage_suffixes[j][i]
+                    for i in sched.partner_indices(a, j, start, end)]
             if frame and start == 0:
                 # frame entry: scatter the frame into KV after the
                 # document rows. The pair entry reads doc + frame.
                 # The frame entry's answer bit is skipped by report().
                 specs.append(dict(
                     key=key,
-                    prefix=anchor_prefixes[a] if carried else None,
+                    prefix=prefixes[a] if carried else None,
                     f=f, suffixes=[frame],
                     write_suffix_tokens=len(frame)))
                 specs.append(dict(
@@ -450,7 +524,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
             else:
                 specs.append(dict(
                     key=key,
-                    prefix=anchor_prefixes[a] if carried else None,
+                    prefix=prefixes[a] if carried else None,
                     f=f + len(frame),
                     suffixes=sufs))
         return pack_chunk(torch, arena, specs,
@@ -463,6 +537,13 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         else:
             anchor_done(anchor, sched.answers[k - 1].get(anchor, []))
 
+    def event(kind, anchor):
+        if kind == "finished":
+            settle(anchor)
+            finished[0] += 1
+        elif keys[anchor] in owned:
+            arena.free_key(keys[anchor])
+
     def report(entry):
         groups, handle = entry
         bits = async_ans.result(handle)
@@ -473,15 +554,19 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
             cnt = end - start
             for kind, anchor in sched.report(
                     a, j, start, end, bits[pos:pos + cnt]):
-                if kind == "finished":
-                    settle(anchor)
-                    finished[0] += 1
-                elif keys[anchor] in owned:
-                    arena.free_key(keys[anchor])
+                event(kind, anchor)
             pos += cnt
         progress.update(finished[0])
 
-    while not sched.done():
+    while True:
+        if anchor_source is not None and not anchor_source.done:
+            pull()
+        # anchors with no partner at their first stage never run
+        for kind, anchor in sched.take_settled():
+            event(kind, anchor)
+        if sched.done() and (anchor_source is None
+                             or anchor_source.done):
+            break
         if sched.blocked_pages:
             # the free list is short for the next fresh anchor:
             # retained KV nothing here reads makes room
@@ -491,7 +576,13 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
             if outstanding:
                 report(outstanding.pop(0))
                 continue
+            if anchor_source is not None and not anchor_source.done:
+                # the source has to move; it may evict retained KV to admit
+                if pull(evict_retained=True, force=True):
+                    continue
             raise AssertionError("nothing buildable and nothing in flight")
+        if attention_mode is not None:
+            pipeline.attention_mode = attention_mode
         chunk = build(groups)
         tokens += chunk["tokens"]
         e0 = torch.cuda.Event(enable_timing=True)
@@ -723,13 +814,14 @@ def _shared_preamble_tokens(question_ids):
     return p
 
 
-def run_filter(torch, arena, pipeline, async_ans, doc_ids,
-               question_ids, budget, timing=None,
-               pinned=True, limit=None, *, arena_writes,
-               arena_keys=None, retain_survivors=()):
-    """The filter chain: continuous admission with survivor priority.
+class FilterStream:
+    """The filter chain, one chunk per next() call.
 
-    Pages are freed on FALSE or after the last stage.
+    Continuous admission with survivor priority. Pages are freed on
+    FALSE or after the last stage. With hold_survivors, a document
+    that passes its last stage keeps its pages pinned instead, and
+    next() hands it over as a (key, prefix) pair for a join that reads
+    its KV; that join frees or retains the key.
 
     Args:
         torch: The torch module, imported by the caller.
@@ -745,136 +837,236 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
             None runs every document.
         arena_writes: Whether document KV is written to the arena.
             Must be True with multiple stages.
-        arena_keys: Stable arena key for each document. List positions are
-            used when omitted.
+        arena_keys: Stable arena key for each document. List positions
+            are used when omitted.
         retain_survivors: Passing document positions to keep for
-            joins, through the shared arena retention pool capped at the arena minus
-            the scan ring.
+            joins, through the shared arena retention pool capped at
+            the arena minus the scan ring.
+        hold_survivors: Hand passing documents over with their KV
+            pinned instead of freeing or retaining them.
+        hold_extra_tokens: Rows past the prefix a held document's
+            pages must cover (the consumer's largest frame), so the
+            consumer never needs a page this chain did not claim.
+        attention_mode: Attention path set on the pipeline before each
+            chunk; the pipeline's current mode when omitted. A chain
+            interleaved with a join on one pipeline states its own.
+    """
+
+    def __init__(self, torch, arena, pipeline, async_ans, doc_ids,
+                 question_ids, budget, timing=None, pinned=True,
+                 limit=None, *, arena_writes, arena_keys=None,
+                 retain_survivors=(), hold_survivors=False,
+                 hold_extra_tokens=0, attention_mode=None):
+        p = _shared_preamble_tokens(question_ids)
+        keys = range(len(doc_ids)) if arena_keys is None else arena_keys
+        if len(keys) != len(doc_ids):
+            raise ValueError("arena_keys must match doc_ids")
+        retain_all = retain_survivors is True
+        retain = set() if retain_all else set(retain_survivors)
+        if hold_survivors and (retain_all or retain):
+            raise ValueError("held survivors are pinned, not retained")
+        stage_tokens = [len(question_ids[0])] \
+            + [len(q) - p for q in question_ids[1:]]
+        tails = [question_ids[0]] + [q[p:] for q in question_ids[1:]]
+        for i, t in enumerate(tails):
+            if not t:
+                raise ValueError(
+                    f"stage {i} question has no tokens beyond the shared "
+                    f"preamble ({p} tokens)")
+        if not arena_writes and (
+            len(question_ids) > 1 or retain_all or retain or hold_survivors
+        ):
+            # a later stage re-reads the KV, which needs the pages this
+            # switch skips
+            raise ValueError("arena_writes=False needs a single stage")
+        self.attention_mode = attention_mode or pipeline.attention_mode
+        unified = self.attention_mode == "unified"
+        # capacity must cover the longest tail past the kept preamble
+        temp_tail = max(0, *(len(q) - p for q in question_ids)) \
+            if unified and arena_writes else 0
+        capacity_extra = p + temp_tail
+        if hold_survivors:
+            capacity_extra = max(capacity_extra, hold_extra_tokens)
+        if arena.accounting.retention_cap_pages is None:
+            arena.accounting.retention_cap_pages = max(
+                0, arena.accounting.n_pages
+                - arena.accounting.pages_needed(2 * budget))
+        self.sched = FilterAdmission(
+            [len(d) for d in doc_ids], stage_tokens, budget,
+            arena_pages=(arena.accounting.n_pages if arena_writes
+                         else None),
+            page_tokens=arena.accounting.page_tokens,
+            kept_extra_tokens=capacity_extra, limit=limit,
+            available_pages=(arena.accounting.free_pages
+                             if arena_writes else None))
+        self.torch = torch
+        self.arena = arena
+        self.pipeline = pipeline
+        self.async_ans = async_ans
+        self.doc_ids = doc_ids
+        self.keys = keys
+        self.timing = timing
+        self.pinned = pinned
+        self.arena_writes = arena_writes
+        self.retain_all = retain_all
+        self.retain = retain
+        self.hold = hold_survivors
+        self.preamble = p
+        self.capacity_extra = capacity_extra
+        self.tails = tails
+        self.spans = []
+        self.tokens = 0
+        self.chunks = 0
+        self.done = False
+        self.outstanding = []   # (groups, handle) in launch order
+        self.progress = Progress(
+            f"filter ({len(question_ids)} stages)", total=len(doc_ids))
+        self._finished = 0
+
+    @property
+    def answers(self):
+        """Per document, its 0/1 answers up to the first FALSE."""
+        return self.sched.answers
+
+    def _spec(self, doc, stage, fresh):
+        if fresh:
+            return dict(key=self.keys[doc], prefix=self.doc_ids[doc],
+                        f=len(self.doc_ids[doc]), suffixes=[self.tails[0]],
+                        write_suffix_tokens=self.preamble)
+        return dict(key=self.keys[doc], prefix=None,
+                    f=len(self.doc_ids[doc]) + self.preamble,
+                    suffixes=[self.tails[stage]])
+
+    def _report(self, entry, items):
+        timing = self.timing
+        t = time.perf_counter() if timing is not None else 0.0
+        groups, handle = entry
+        bits = self.async_ans.result(handle)
+        t = _tick(timing, "report_wait", t)
+        last_stage = len(self.tails) - 1
+        for (doc, stage, _fresh), bit in zip(groups, bits):
+            passed = bool(bit)
+            last = stage == last_stage
+            keep = passed and last and (self.retain_all
+                                        or doc in self.retain)
+            hold = passed and last and self.hold
+            for d in self.sched.report(doc, stage, passed,
+                                       release=not (keep or hold)):
+                self.arena.free_key(self.keys[d])
+            if keep:
+                freed = self.arena.retain(self.keys[doc],
+                                          len(self.doc_ids[doc]))
+                self.sched.add_free_pages(freed)
+            if hold:
+                items.append((self.keys[doc], self.doc_ids[doc]))
+            if not passed or last:
+                self._finished += 1
+        self.progress.update(self._finished)
+        _tick(timing, "report_rest", t)
+
+    def _finish(self, items):
+        while self.outstanding:
+            self._report(self.outstanding.pop(0), items)
+        for doc in self.sched.drain_ready():
+            self.arena.free_key(self.keys[doc])
+        self.progress.finish(
+            f"filter ({len(self.tails)} stages) done",
+            f"{self.tokens:,} fresh tokens")
+        self.done = True
+
+    def next(self, evict_retained=False):
+        """Run one chunk. Returns (held (key, prefix) pairs, blocked).
+
+        Reads the previous chunk's answers while the new one runs.
+        blocked means fresh admission is short of arena pages; with
+        held survivors the consumer has to free some before the chain
+        can admit again. evict_retained lets the chain evict retained
+        KV of earlier operators for the shortfall instead of returning
+        blocked, which a chain without held survivors always does.
+        """
+        items = []
+        if self.done:
+            return items, False
+        sched = self.sched
+        arena = self.arena
+        timing = self.timing
+        while True:
+            if sched.done():
+                self._finish(items)
+                return items, False
+            if self.hold:
+                # the consumer frees and claims pages between chunks
+                sched.free_pages = arena.accounting.free_pages
+            t = time.perf_counter() if timing is not None else 0.0
+            groups = sched.next_chunk()
+            t = _tick(timing, "next_chunk", t)
+            if groups:
+                break
+            if self.outstanding:
+                self._report(self.outstanding.pop(0), items)
+                continue
+            if sched.blocked_pages and (evict_retained or not self.hold):
+                before = arena.accounting.free_pages
+                arena.evict_retained(sched.blocked_pages)
+                freed = arena.accounting.free_pages - before
+                if freed:
+                    if not self.hold:
+                        sched.add_free_pages(freed)
+                    continue
+            if self.hold and sched.blocked_pages:
+                return items, True
+            raise AssertionError("nothing buildable and nothing in flight")
+        for doc, stage, fresh in groups:
+            if fresh and self.arena_writes:
+                logical = len(self.doc_ids[doc]) + self.preamble
+                got = arena.activate(
+                    self.keys[doc], logical,
+                    capacity_tokens=len(self.doc_ids[doc])
+                    + self.capacity_extra)
+                assert got is not None, \
+                    "scheduler admitted a doc the arena cannot hold"
+        t = _tick(timing, "alloc", t)
+        self.pipeline.attention_mode = self.attention_mode
+        chunk = pack_chunk(self.torch, arena,
+                           [self._spec(*g) for g in groups],
+                           timing=timing, pinned=self.pinned,
+                           attention_mode=self.attention_mode)
+        t = _tick(timing, "pack", t)
+        self.tokens += chunk["tokens"]
+        torch = self.torch
+        e0 = torch.cuda.Event(enable_timing=True)
+        e1 = torch.cuda.Event(enable_timing=True)
+        e0.record()
+        normed = self.pipeline.forward_chunk(chunk)
+        e1.record()
+        t = _tick(timing, "forward_launch", t)
+        self.spans.append((0, e0, e1))
+        self.outstanding.append((groups, self.async_ans.submit(normed)))
+        self.chunks += 1
+        t = _tick(timing, "submit", t)
+        if timing is not None:
+            timing["n_chunks"] = timing.get("n_chunks", 0) + 1
+        # read the previous chunk's answers while this one runs
+        while len(self.outstanding) > 1:
+            self._report(self.outstanding.pop(0), items)
+        return items, bool(self.hold and sched.blocked_pages)
+
+
+def run_filter(torch, arena, pipeline, async_ans, doc_ids,
+               question_ids, budget, timing=None,
+               pinned=True, limit=None, *, arena_writes,
+               arena_keys=None, retain_survivors=()):
+    """The filter chain run to the end; see FilterStream for the arguments.
 
     Returns:
         (answers, spans, tokens): answers[d] = 0/1 list up to the
         first FALSE; spans and tokens as in run_join.
     """
-    p = _shared_preamble_tokens(question_ids)
-    keys = range(len(doc_ids)) if arena_keys is None else arena_keys
-    if len(keys) != len(doc_ids):
-        raise ValueError("arena_keys must match doc_ids")
-    retain_all = retain_survivors is True
-    retain = set() if retain_all else set(retain_survivors)
-    stage_tokens = [len(question_ids[0])] \
-        + [len(q) - p for q in question_ids[1:]]
-    tails = [question_ids[0]] + [q[p:] for q in question_ids[1:]]
-    for i, t in enumerate(tails):
-        if not t:
-            raise ValueError(
-                f"stage {i} question has no tokens beyond the shared "
-                f"preamble ({p} tokens)")
-    if not arena_writes and (
-        len(question_ids) > 1 or retain_all or retain
-    ):
-        # a later stage re-reads the KV, which needs the pages this
-        # switch skips
-        raise ValueError("arena_writes=False needs a single stage")
-    unified = pipeline.attention_mode == "unified"
-    # unified scatters each stage's question tail (the tokens past the
-    # kept preamble) into the doc's pages; capacity must cover the
-    # longest tail, or zero when every question is pure preamble
-    temp_tail = max(0, *(len(q) - p for q in question_ids)) \
-        if unified and arena_writes else 0
-    if arena.accounting.retention_cap_pages is None:
-        arena.accounting.retention_cap_pages = max(
-            0, arena.accounting.n_pages - arena.accounting.pages_needed(2 * budget))
-    sched = FilterAdmission(
-        [len(d) for d in doc_ids], stage_tokens, budget,
-        arena_pages=(arena.accounting.n_pages if arena_writes
-                     else None),
-        page_tokens=arena.accounting.page_tokens,
-        kept_extra_tokens=p + temp_tail, limit=limit,
-        available_pages=(arena.accounting.free_pages
-                         if arena_writes else None))
-    spans, tokens = [], 0
-    outstanding = []     # (groups, handle) in launch order
-
-    def to_spec(doc, stage, fresh):
-        if fresh:
-            return dict(key=keys[doc], prefix=doc_ids[doc],
-                        f=len(doc_ids[doc]), suffixes=[tails[0]],
-                        write_suffix_tokens=p)
-        return dict(key=keys[doc], prefix=None, f=len(doc_ids[doc]) + p,
-                    suffixes=[tails[stage]])
-
-    progress = Progress(f"filter ({len(question_ids)} stages)",
-                        total=len(doc_ids))
-    finished = [0]
-
-    def report(entry):
-        t = time.perf_counter() if timing is not None else 0.0
-        groups, handle = entry
-        bits = async_ans.result(handle)
-        t = _tick(timing, "report_wait", t)
-        for (doc, stage, _fresh), bit in zip(groups, bits):
-            passed = bool(bit)
-            last = stage == len(stage_tokens) - 1
-            keep = passed and last and (retain_all or doc in retain)
-            for d in sched.report(doc, stage, passed,
-                                  release=not keep):
-                arena.free_key(keys[d])
-            if keep:
-                freed = arena.retain(keys[doc], len(doc_ids[doc]))
-                sched.add_free_pages(freed)
-            if not passed or last:
-                finished[0] += 1
-        progress.update(finished[0])
-        _tick(timing, "report_rest", t)
-
-    while not sched.done():
-        t = time.perf_counter() if timing is not None else 0.0
-        groups = sched.next_chunk()
-        t = _tick(timing, "next_chunk", t)
-        if not groups:
-            if outstanding:
-                report(outstanding.pop(0))
-                continue
-            if sched.blocked_pages:
-                before = arena.accounting.free_pages
-                arena.evict_retained(sched.blocked_pages)
-                freed = arena.accounting.free_pages - before
-                if freed:
-                    sched.add_free_pages(freed)
-                    continue
-            raise AssertionError("nothing buildable and nothing in flight")
-        for doc, stage, fresh in groups:
-            if fresh and arena_writes:
-                logical = len(doc_ids[doc]) + p
-                got = arena.activate(
-                    keys[doc], logical,
-                    capacity_tokens=logical + temp_tail)
-                assert got is not None, \
-                    "scheduler admitted a doc the arena cannot hold"
-        t = _tick(timing, "alloc", t)
-        chunk = pack_chunk(torch, arena, [to_spec(*g) for g in groups],
-                           timing=timing, pinned=pinned,
-                           attention_mode=pipeline.attention_mode)
-        t = _tick(timing, "pack", t)
-        tokens += chunk["tokens"]
-        e0 = torch.cuda.Event(enable_timing=True)
-        e1 = torch.cuda.Event(enable_timing=True)
-        e0.record()
-        normed = pipeline.forward_chunk(chunk)
-        e1.record()
-        t = _tick(timing, "forward_launch", t)
-        spans.append((0, e0, e1))
-        outstanding.append((groups, async_ans.submit(normed)))
-        t = _tick(timing, "submit", t)
-        if timing is not None:
-            timing["n_chunks"] = timing.get("n_chunks", 0) + 1
-        # read the previous chunk's answers while this one runs
-        while len(outstanding) > 1:
-            report(outstanding.pop(0))
-    while outstanding:
-        report(outstanding.pop(0))
-    for doc in sched.drain_ready():
-        arena.free_key(keys[doc])
-    progress.finish(f"filter ({len(question_ids)} stages) done",
-                    f"{tokens:,} fresh tokens")
-    return sched.answers, spans, tokens
+    stream = FilterStream(
+        torch, arena, pipeline, async_ans, doc_ids, question_ids, budget,
+        timing=timing, pinned=pinned, limit=limit,
+        arena_writes=arena_writes, arena_keys=arena_keys,
+        retain_survivors=retain_survivors)
+    while not stream.done:
+        stream.next()
+    return stream.answers, stream.spans, stream.tokens

@@ -4,6 +4,7 @@ import os
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import replace
 from itertools import chain
 from numbers import Integral
 from pathlib import Path
@@ -17,13 +18,22 @@ from quail.builtins import built_in_registry
 from quail.catalog import Catalog, ScanRequest, TableProvider
 from quail.execution import PhysicalRequest, document_input
 from quail.extensions import ExtensionRegistry
-from quail.logical import CompileError, LogicalPlan
+from quail.logical import (
+    CompileError,
+    LogicalPlan,
+    join_conditions,
+    oriented_join_conditions,
+)
 from quail.logical_optimizer import LogicalPlanningContext, apply_logical_rules
-from quail.physical import DocumentInput, PortRef, Project, ValueType, encode_graph
-from quail.planner import collect_operators, explain, plan_query
+from quail.physical import PortRef, Project, Scan, ValueType, encode_graph
+from quail.planner import collect_applies, collect_operators, explain, plan_query
 from quail.planner.plan import EngineConfig, Refusal, resolve_model
 from quail.progress import Progress, say
-from quail.runtime.prefixes import prefix_metrics
+from quail.runtime.pairs import (
+    columns_key,
+    pair_fraction,
+    pair_table,
+)
 from quail.runtime.result import IndexRelation, QueryResult, true_answer_rows
 from quail.runtime.runner import (
     ExecutionContext,
@@ -221,6 +231,38 @@ class Session:
                 max_workers=1, thread_name_prefix="quail-tokenize")
         return self._background.submit(
             self.tokenize, provider_name, column, projected_columns)
+
+    def register_functions(self, functions: dict) -> None:
+        """Register a query's apply() functions once each, by name."""
+        for name, function in functions.items():
+            known = self.registry.functions.get(name)
+            if known is function:
+                continue
+            if known is not None:
+                raise ValueError(
+                    f"apply name {name!r} is registered for another "
+                    f"function on this session")
+            self.registry.register_function(function, name=name)
+
+    def column_values(self, provider_name: str, column: str) -> pa.ChunkedArray:
+        """Return one source column in scan order.
+
+        Reads the column store when the column is loaded, else scans
+        the provider for that one column.
+        """
+        provider = self.catalog.get(provider_name)
+        with self._lock:
+            store = self._column_stores.get(
+                (provider.content_identity(), column))
+        if store is not None:
+            return store.values
+        reader = provider.scan(ScanRequest(columns=(column,)))
+        try:
+            batches = [batch.column(0) for batch in reader]
+        finally:
+            reader.close()
+        return pa.chunked_array(
+            batches, type=provider.schema().field(column).type)
 
     def token_lengths(self, provider_name: str, column: str):
         """Return the exact token counts when the column is tokenized."""
@@ -421,6 +463,19 @@ class BoundBuilder:
         self._inner.ai_filter(p, selectivity=selectivity)
         return self
 
+    def join(self, other, on=None):
+        inner = other._inner if isinstance(other, BoundBuilder) else other
+        self._inner.join(inner, on=on)
+        return self
+
+    def apply(self, fn, columns=(), **options):
+        self._inner.apply(fn, columns, **options)
+        self._session.register_functions(self._inner.functions)
+        return self
+
+    def apply_table(self, fn, columns=(), **options):
+        return self.apply(fn, columns, kind="barrier", **options)
+
     def ai_join(self, others, p, selectivity=None, anchor=None,
                 semantics="full"):
         if not isinstance(others, (list, tuple)):
@@ -472,7 +527,7 @@ class Query:
                     self.session.catalog, self.session.config
                 ),
             )
-            scans, _, _ = collect_operators(self.logical)
+            scans, _, joins = collect_operators(self.logical)
             self._doc_tokens = {}
             self._token_inputs = {}
             estimated = []
@@ -491,6 +546,7 @@ class Query:
                 estimated.append(s.alias)
             self._estimated = tuple(estimated)
             started = time.perf_counter()
+            pair_fractions = self._pair_fractions(scans, joins)
             self._plan = plan_query(
                 self.logical, model=self.session.model,
                 device=self.session.device,
@@ -499,9 +555,38 @@ class Query:
                 order=self.order,
                 backend=self.session.config.backend,
                 registry=self.session.registry,
-                tokenizer=self.session.tokenizer)
+                tokenizer=self.session.tokenizer,
+                pair_fractions=pair_fractions)
+            if self.session.config.gpu_timing:
+                self._plan = replace(self._plan, settings={
+                    **self._plan.settings, "gpu_timing": True})
             say(f"plan ready in {time.perf_counter() - started:.2f} s")
         return self._plan
+
+    def _pair_fractions(self, scans, joins) -> dict:
+        """Pairs kept over the cross product, per join with conditions."""
+        providers = {scan.alias: scan.provider for scan in scans}
+        fractions = {}
+        for position, join in enumerate(joins):
+            oriented = oriented_join_conditions(join)
+            if oriented is None:
+                continue
+            left_alias, right_alias, conditions = oriented
+            left_keys = [
+                self.session.column_values(
+                    providers[left.alias], left.column)
+                for left, _ in conditions
+            ]
+            right_keys = [
+                self.session.column_values(
+                    providers[right.alias], right.column)
+                for _, right in conditions
+            ]
+            fractions[position] = pair_fraction(
+                pair_table(left_alias, left_keys, right_alias, right_keys),
+                len(self._doc_tokens[left_alias]),
+                len(self._doc_tokens[right_alias]))
+        return fractions
 
     def explain(self, *, verbose: bool = False) -> str:
         """Return the optimized plan, optionally including runtime settings."""
@@ -523,11 +608,17 @@ class Query:
             del self._token_futures[alias]
         self.token_wait_s += time.perf_counter() - started
 
-    def run(self) -> QueryResult:
-        """Execute the query in the current process."""
+    def run(self, plan=None) -> QueryResult:
+        """Execute the query in the current process.
+
+        Args:
+            plan: An edited PhysicalPlan from plan().insert(),
+                remove(), or move(); the planner's own plan when
+                omitted.
+        """
         from quail.runtime.execute import execute_query
 
-        return execute_query(self)
+        return execute_query(self, plan=plan)
 
     def execute_stream(self, batch_rows: int = 65_536,
                        limit: int | None = None) -> pa.RecordBatchReader:
@@ -549,22 +640,41 @@ class Query:
         self.wait_for_tokens()
         inputs = {}
         for node in plan.nodes:
-            if not isinstance(node, DocumentInput):
+            if not isinstance(node, Scan):
                 continue
             inputs[node.input_id] = document_input(
                 self._token_inputs[node.alias].tokens
             )
         envelope = plan.to_envelope(self.session.registry.codecs)
-        return PhysicalRequest(envelope, inputs)
+        return PhysicalRequest(envelope, inputs, self._column_tables())
+
+    def _column_tables(self) -> dict:
+        """One value table per alias a HashJoin or an apply() reads."""
+        needed = {}
+        for join in collect_operators(self.logical)[2]:
+            for condition in join_conditions(join):
+                for ref in (condition.left, condition.right):
+                    needed.setdefault(ref.alias, {})[ref.column] = None
+        for apply in collect_applies(self.logical):
+            for ref in apply.columns:
+                needed.setdefault(ref.alias, {})[ref.column] = None
+        tables = {}
+        for alias, columns in needed.items():
+            store = self._token_inputs[alias]
+            arrays = {alias: pa.array(range(len(store.lengths)), pa.int32())}
+            for name in columns:
+                arrays[name] = store.column(name)
+            tables[columns_key(alias)] = pa.table(arrays)
+        return tables
 
     def finish(self, response, coordinator_wall: float = 0.0) -> QueryResult:
         """Finish the physical graph and attach execution details."""
         plan = self.plan()
         out = response.metrics
-        from quail.physical import AnchoredJoin, Exchange
+        from quail.physical import AiJoin, Barrier
 
         expected_nodes = tuple(node for node in plan.nodes
-                               if isinstance(node, (AnchoredJoin, Exchange)))
+                               if isinstance(node, (AiJoin, Barrier)))
         report = dict(
             backend=out.get("backend", plan.backend),
             wall_s=out["wall_s"], boot_s=out.get("boot_s"),
@@ -573,7 +683,7 @@ class Query:
             coordinator_wall_s=round(coordinator_wall, 2),
             fresh_tokens=out["fresh_tokens"],
             cached_tokens=out.get("cached_tokens"),
-            regret_tokens=out.get("regret_tokens"), stages=[],
+            stages=[],
             peak_gib=out.get("peak_gib"),
             order_rule=plan.settings.get("order_rule"),
             expected_join_plan=[
@@ -589,6 +699,9 @@ class Query:
             node_metrics=out.get("node_metrics", {}),
             backend_metrics=out.get("backend_metrics"),
             remarks=list(plan.remarks) + list(self.session.notes))
+        for key in ("gpu_s", "chunks"):
+            if key in out:
+                report[key] = out[key]
 
         scans, logical_filters, logical_joins = collect_operators(self.logical)
         scans_by_alias = {scan.alias: scan for scan in scans}
@@ -651,7 +764,7 @@ class Query:
         sources = {
             node.input_id: range(node.n_docs)
             for node in plan.nodes
-            if isinstance(node, DocumentInput)
+            if isinstance(node, Scan)
         }
         observers = self.session.registry.new_observers()
         run = GenericRunner().run(
@@ -825,7 +938,7 @@ class Query:
                     "a join answer relation is missing alias columns "
                     f"{sorted(missing_columns)}"
                 )
-            answers = table.column("answer").to_pylist()
+            answers = table.column("answer")
             answer_tables["joins"][written_pos] = table
             report["stages"].append(dict(
                 op="join", anchor=anchor,
@@ -833,14 +946,12 @@ class Query:
                 semantics=semantics,
                 provided_selectivity=logical_join.selectivity,
                 observed_selectivity=round(
-                    sum(bool(answer) for answer in answers)
-                    / max(1, len(answers)), 4
+                    (pc.sum(answers).as_py() or 0) / max(1, len(answers)), 4
                 ),
                 tuples=len(answers),
             ))
             if semantics == "full":
                 true_join_tables[written_pos] = true_answer_rows(table)
-        report.update(prefix_metrics(report, scans, self._token_inputs))
         survivor_arrays = {
             alias: pa.array(indices, type=pa.int32())
             for alias, indices in survivors.items()

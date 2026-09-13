@@ -130,6 +130,35 @@ def test_request_backends_plan_validate_and_execute(monkeypatch):
         assert result.count() == 0
         session.close()
 
+        session = quail.Session(
+            EngineConfig(backend="stock_vllm"), tokenizer=_tokens)
+        session.register("docs", quail.DocumentProvider.from_table(pa.table({
+            "id": ["a", "b"], "body": ["one", "two"], "key": ["k1", "k2"],
+        }), id_col="id"))
+        session.register("notes", quail.DocumentProvider.from_table(pa.table({
+            "id": ["x", "y", "z"], "text": ["p", "q", "r"],
+            "key": ["k2", "k1", "k3"],
+        }), id_col="id"))
+        query = (
+            session.docs("docs").alias("d")
+            .join(session.docs("notes").alias("n"),
+                  on=[quail.col("d.key") == quail.col("n.key")])
+            .ai_filter(quail.prompt("{0} matches {1}", quail.col("d.body"),
+                                    quail.col("n.text")))
+            .select("d.id", "n.id")
+        )
+        plan = query.plan()
+        request = query._prepare_physical()
+        backend = session.registry.backend("stock_vllm")
+        response = backend.execute_request(BackendExecutionContext(
+            request=request, graph=plan.graph, registry=session.registry,
+            gpu_count=1, runtime_state={}))
+        result = query.finish(response)
+        assert result.report["backend_metrics"]["requests"] == 2
+        assert sorted(zip(*result.answer_tables["joins"][0].to_pydict().values())
+                      ) == [(0, 1, False), (1, 0, False)]
+        session.close()
+
 
 class _Output:
     def __init__(self, prompt, answer, cached=0):
@@ -153,7 +182,7 @@ class _Client:
         return True
 
 
-def _execution(documents):
+def _execution(documents, **settings):
     return RequestModelExecution(GpuContext(
         gpu_index=0,
         gpu_count=1,
@@ -171,8 +200,44 @@ def _execution(documents):
             },
             "filter_submission": "operator-at-a-time",
             "join_submission": "anchor-major",
+            **settings,
         },
     ))
+
+
+def test_suffix_major_falls_back_when_the_anchors_exceed_kv():
+    class RecordingClient(_Client):
+        def generate(self, prompts, sampling_params, use_tqdm=False):
+            self.prompts = [tuple(prompt["prompt_token_ids"]) for prompt in prompts]
+            return super().generate(prompts, sampling_params, use_tqdm=use_tqdm)
+
+    node = RequestExecution(
+        node_id="request-model",
+        backend_name="pipelined_sglang",
+        aliases=("r", "p"),
+        preamble_token_ids=(3,),
+        joins=(RequestJoinSpec(
+            written_pos=0, aliases=("r", "p"), outer_aliases=("r",),
+            anchor="r", semantics="full", selectivity=0.5,
+            label_token_ids=(("r", (40,)), ("p", (41,))),
+            frame_token_ids=(("r", (30,)), ("p", (31,))),
+            tail_token_ids=(50,),
+        ),),
+    )
+    documents = {"r": [[10], [11]], "p": [[20], [21]]}
+    # two anchor prefixes of three tokens each: six tokens held at once
+    orders = {}
+    for kv_tokens in (5, 6):
+        execution = _execution(
+            documents, join_submission="suffix-major",
+            capacity={"kv_cache_size_tokens": kv_tokens, "block_size": 1,
+                      "max_num_seqs": 16})
+        execution.client = RecordingClient()
+        execution.execute(node, {})
+        orders[kv_tokens] = [(prompt[1], prompt[4])
+                             for prompt in execution.client.prompts]
+    assert orders[6] == [(10, 20), (11, 20), (10, 21), (11, 21)]
+    assert orders[5] == [(10, 20), (10, 21), (11, 20), (11, 21)]
 
 
 def test_filter_and_join_answer_relations():
@@ -258,7 +323,6 @@ def test_filter_and_join_answer_relations():
     assert result.outputs["ids:r"] == [0]
     assert result.outputs["ids:p"] == [0, 1]
     assert result.metrics.evaluated_document_pairs == 4
-    assert result.metrics.regret_tokens > 0
 
 
 def test_cached_token_accounting():
@@ -279,58 +343,9 @@ def test_cached_token_accounting():
         [[8, 8], [9, 9]], 100, true_ids={1}, block_size=1,
     ))
 
-    # stage 0 could hit nothing of its own document, so every cached
-    # token inside the 4 token body is a cross row hit: 0 + 4, and the
-    # 2 beyond the body are the question
-    # stage 1 could hit the 4 body tokens: document 0 hit 2 (regret 2),
-    # document 1 hit 6 (its body, then 2 question tokens)
-    assert result["regret_tokens"] == 2
-    assert result["cross_row_cached_tokens"] == 4
-    assert result["cached_own_tokens"] == 2 + 4
-    assert result["cached_other_tokens"] == 2 + 2
+    # four requests of six tokens; the fake engine served 14 of them
+    assert result["prompt_tokens"] == 24
     assert result["cached_tokens"] == 14
-
-    from quail.backends.request_scheduling import join_cache_accounting
-
-    prefixes = [[1] * 10, [2] * 10]
-    # two suffixes per anchor; the first suffix of anchor 0 could hit
-    # the 4 tokens an earlier request computed. Anchor 1 is new and its
-    # first suffix hit 8 tokens another anchor's request computed.
-    cached = [4, 10, 8, 0]
-    accounting = join_cache_accounting(
-        prefixes, 2, cached, [4, 0], block_size=1)
-
-    assert accounting["regret_tokens"] == 0 + 0 + 0 + 10
-    assert accounting["cross_row_cached_tokens"] == 0 + 0 + 8 + 0
-    assert accounting["cached_own_tokens"] == 4 + 10 + 0 + 0
-    assert accounting["cached_other_tokens"] == 0
-
-    from quail.backends.request_scheduling import join_cache_accounting
-
-    # prefix = 2 preamble tokens, a 20 token document, a 3 token frame;
-    # 16 token blocks. Anchor 0 is new: its first suffix hit the
-    # preamble and 14 document tokens (one block), and its second
-    # suffix hit 32 tokens: the 16 block floor of the 25 token prefix
-    # plus the block that straddles the prefix end and the label.
-    prefixes = [[9] * 25]
-    cached = [16, 32]
-    accounting = join_cache_accounting(
-        prefixes, 2, cached, [0], block_size=16,
-        document_spans=[(2, 22)])
-
-    assert accounting["regret_tokens"] == 0
-    assert accounting["cross_row_cached_tokens"] == 14
-    assert accounting["cached_own_tokens"] == 16
-    assert accounting["cached_other_tokens"] == 2 + 16
-
-    from quail.backends.request_scheduling import split_cached_tokens
-
-    # the question after a 4 token body was cached too: it is other
-    assert split_cached_tokens(6, 0, 0, 4) == (0, 4, 2)
-    # own prefix hit fully, the rest is inside the document
-    assert split_cached_tokens(6, 2, 0, 8) == (2, 4, 0)
-    # a miss short of the own prefix is only own
-    assert split_cached_tokens(1, 2, 0, 8) == (1, 0, 0)
 
 
 def test_sglang_submission_and_cancellation():

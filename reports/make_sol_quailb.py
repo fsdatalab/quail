@@ -65,7 +65,12 @@ import pyarrow.parquet as pq
 from transformers import AutoTokenizer
 
 import quail
-from quail.bench.quailb import answer_oracle, queries, register_sets
+from quail.bench.quailb import (
+    answer_oracle,
+    canonical_templates,
+    queries,
+    register_tables,
+)
 from quail.planner import collect_operators
 from quail.planner.plan import EngineConfig
 from quail.runtime.prefixes import shared_prefix_tokens
@@ -174,7 +179,7 @@ answer = answer_oracle(truth, corpus_rows)
 
 session = quail.Session(
     EngineConfig(gpus=1, model=QWEN3_4B_FP8.name), tokenizer=encode)
-register_sets(session, W / "data" / TAG)
+register_tables(session, W / "data" / TAG)
 query_defs = queries(session)
 query_ids = list(query_defs)
 if args.queries:
@@ -216,9 +221,15 @@ stores = {}     # "table.column" -> the session's token store
 
 
 def with_codes(stages, truth: GroundTruthCollection) -> list[dict]:
-    """Name each stage's predicate by its ground truth key."""
+    """Name each stage's predicate by its ground truth key.
+
+    A stage records the template as Quail binds it; the labels are
+    keyed by the template as written.
+    """
+    written = canonical_templates(truth)
     return [
-        {**stage, "code": truth.key_for_template(stage["template"])}
+        {**stage, "code": truth.key_for_template(
+            written.get(stage["template"], stage["template"]))}
         for stage in stages
     ]
 

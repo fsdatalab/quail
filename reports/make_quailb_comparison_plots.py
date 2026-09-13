@@ -1,43 +1,30 @@
 """Generate the QUAIL-B overview and dataset plots without inference.
 
-Pull the original suite manifest and its four result files:
+Pull the measured runs, the corpus manifest, and the SoL estimates:
 
-    W=/tmp/quail-shared-comparison; mkdir -p "$W"
-    result_path() {
-      python3 -c "import json, sys; m = json.load(open(sys.argv[1])); \
-        print(m['result_volume_paths'][sys.argv[2]].removeprefix('/results/'))" "$@"
-    }
+    W=/tmp/quail-comparison; mkdir -p "$W/run" "$W/fev10"
     RUNS=benchmarks/quailb/family-runs
-    FAMILIES=benchmarks/quailb/families
+    RUN=$RUNS/20260912T225100Z-902686c5
+    uv run modal volume get quail-results "$RUN/manifest.json" "$W/run/manifest.json"
+    uv run modal volume get quail-results "$RUN/measurements.parquet" \
+      "$W/run/measurements.parquet"
+    FEV10=$RUNS/20260911T201441Z-d16f87d8
+    uv run modal volume get quail-results "$FEV10/manifest.json" \
+      "$W/fev10/manifest.json"
+    uv run modal volume get quail-results "$FEV10/measurements.parquet" \
+      "$W/fev10/measurements.parquet"
     CORPUS=ground_truth/quailb/schema_v1/corpora/c_1aa2c4f0d0b6c816fd37aa5748c33341
-    uv run modal volume get quail-results \
-      "$RUNS/20260905T021527Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/manifest.json" \
-      "$W/manifest.json"
-    for method in quail stock_vllm pipelined_vllm pipelined_sglang; do
-      source_path=$(result_path "$W/manifest.json" "$method")
-      uv run modal volume get quail-results "$source_path" "$W/$method.json"
-    done
     uv run modal volume get quail-results "$CORPUS/manifest.json" "$W/corpus.json"
-    mkdir -p "$W/fev9"
     uv run modal volume get quail-results \
-      "$RUNS/20260906T211500Z-quailb-sf0.1-lf1-qwen3-4b-fp8-families/manifest.json" \
-      "$W/fev9/manifest.json"
-    for method in quail stock_vllm pipelined_vllm pipelined_sglang; do
-      source_path=$(result_path "$W/fev9/manifest.json" "$method")
-      uv run modal volume get quail-results "$source_path" "$W/fev9/$method.json"
-    done
-    uv run modal volume get quail-results \
-      "$FAMILIES/20260906T220559Z-sglang-baseline-redesign/fever-sglang-process.json" \
-      "$W/fev9/sglang_anchor_major.json"
-    uv run modal volume get quail-results \
-      "$FAMILIES/20260906T222629Z-sglang-suffix-major/fever-sglang-process.json" \
-      "$W/fev9/sglang_update.json"
-    uv run modal volume get quail-results \
-      /sol/2026-09-06-quailb-prefix-reuse.json "$W/sol.json"
+      sol/2026-09-11-quailb-prefix-reuse.json "$W/sol.json"
     uv run --with matplotlib python reports/make_quailb_comparison_plots.py "$W"
 
-Use --fev9-dir to point to an already pulled FEV-9 comparison.
-All four current FEV-9 measurements replace the old query definition.
+Every method and query comes from the September 12 run, except the
+two vLLM configurations' FEV-10, which come from the September 11
+FEV-10 run. The September 12 FEVER container failed on FEV-10 in the
+request backends (fixed since) and was not rerun, so pipelined vLLM
+has no FEV-1 to FEV-9 measurement: those cells are marked missing,
+not filled from older runs. SGLang is not reported.
 """
 
 import argparse
@@ -45,10 +32,11 @@ import json
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import pyarrow.parquet as pq
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
-from plot_colors import BLUE, DARK, GRAY, GREEN, ORANGE
+from plot_colors import BLUE, DARK, GRAY, ORANGE
 
 from quail.specs import H100_USD_PER_HOUR
 
@@ -57,28 +45,33 @@ METHODS = [
     ("quail", "Quail", BLUE),
     ("stock_vllm", "Stock vLLM", GRAY),
     ("pipelined_vllm", "Pipelined vLLM", ORANGE),
-    ("pipelined_sglang", "Pipelined SGLang", GREEN),
 ]
+QUERY_ORDER = (
+    [f"IMDB-{n}" for n in range(1, 11)] + [f"BIO-{n}" for n in range(1, 4)]
+    + [f"FEV-{n}" for n in range(1, 11)] + [f"LEP-{n}" for n in range(1, 9)]
+    + ["AGENT-1", "AGENT-2"])
+
+
+def token_cell(value):
+    """Format a token count for a report table cell."""
+    return "Not measured" if value is None else f"{value:,}"
 
 
 def row_metrics(row):
-    """Derive throughput, GPU cost, and accuracy from saved counts."""
-    joins = [stage for stage in row["stages"] if stage["op"] == "join"]
-    count = (sum(stage["tuples"] for stage in joins) if joins
-             else row["input_document_rows"])
-    answers = row["accuracy"]["answer_accuracy"]
-    output = row["accuracy"]["output_accuracy"]
-    matched = output["matching_rows"]
-    predicted = output["predicted_rows"]
-    expected = output["expected_rows"]
+    """Derive throughput, GPU cost, and accuracy from one measurement row."""
+    pairs = row["evaluated_document_pairs"]
+    count = row["input_rows"] if pairs is None else pairs
+    matched = row["matching_rows"]
+    predicted = row["predicted_rows"]
+    expected = row["expected_rows"]
     return {
-        "seconds": row["wall_s"],
+        "seconds": row["runtime_s"],
         "recomputed": row["regret_tokens"],
         "fresh": row["fresh_tokens"],
-        "throughput": count / row["wall_s"],
-        "unit": "pairs/s" if joins else "docs/s",
-        "cost": row["wall_s"] / 3600 * H100_USD_PER_HOUR,
-        "agreement": 100 * answers["correct"] / answers["evaluated"],
+        "throughput": count / row["runtime_s"],
+        "unit": "docs/s" if pairs is None else "pairs/s",
+        "cost": row["runtime_s"] / 3600 * H100_USD_PER_HOUR,
+        "agreement": 100 * row["answers_correct"] / row["answers_evaluated"],
         "precision": (100 * matched / predicted if predicted
                       else (0 if expected else 100)),
         "recall": 100 * matched / expected if expected else (0 if predicted else 100),
@@ -95,19 +88,23 @@ METRICS = (
 
 def input_relations(queries, corpus):
     """Resolve each query alias to its saved input table count."""
-    from quail_b.queries import queries as query_specs
+    from quail.bench.substrait import read_plan
+    from quail_b.queries import get_query
 
-    specs = query_specs()
     return {
         query: [
-            (alias.alias, alias.table, corpus["tables"][alias.table]["rows"])
-            for alias in specs[query].aliases]
+            (relation.alias, relation.table,
+             corpus["tables"][relation.table]["rows"])
+            for relation in read_plan(get_query(query).plan).relations]
         for query in queries
     }
 
 
 def load_sol(root, queries, rows, corpus):
     """Load compatible estimates with prefix reuse across requests."""
+    from quail.bench.substrait import read_plan
+    from quail_b.queries import get_query
+
     source = json.loads((root / "sol.json").read_text())
     assert source["corpus_id"] == corpus["corpus_id"]
     assert source["scale_factor"] == 0.1
@@ -116,19 +113,11 @@ def load_sol(root, queries, rows, corpus):
     estimates = {}
     for query in queries:
         estimate = source["queries"][query]["models"]["qwen3-4b-fp8"]
-        measured = rows["quail"][query]
-        predicates = measured["accuracy"]["per_predicate"]
-        expected_filters = [(p["alias"], p["predicate_key"])
-                            for p in predicates if p["op"] == "filter"]
-        expected_joins = [p["predicate_key"] for p in predicates
-                          if p["op"] == "join"]
-        filter_stages = sorted((s["alias"], s["code"])
-                               for s in estimate["filter_stages"])
-        assert filter_stages == sorted(expected_filters), query
-        join_stages = sorted(s["code"] for s in estimate["join_stages"])
-        assert join_stages == sorted(expected_joins), query
-        assert (estimate["input_document_rows"]
-                == measured["input_document_rows"]), query
+        plan = read_plan(get_query(query).plan)
+        filters = sorted(item.alias for item in plan.filters)
+        assert sorted(s["alias"] for s in estimate["filter_stages"]) == filters
+        assert len(estimate["join_stages"]) == len(plan.joins), query
+        assert estimate["input_document_rows"] == rows["quail"][query]["input_rows"]
         assert estimate["tokens"] <= estimate["per_document"]["tokens"], query
         estimates[query] = estimate
     return estimates
@@ -245,12 +234,12 @@ def document_page(title, queries, relations):
 
 
 def plot_comparison(title, queries, rows, relations, sol, name, overview=False):
-    """Export vector PDF pages and a first-page PNG preview."""
+    """Export the vector PDF: one metric per page, then the input counts."""
     destination = HERE / "plots" / name
     groups = [[metric] for metric, _, _ in METRICS] if overview else [
         ["seconds", "fresh", "recomputed", "agreement"]]
     with PdfPages(destination.with_suffix(".pdf")) as pdf:
-        for page, metrics in enumerate(groups):
+        for metrics in groups:
             figure, axes = (plt.subplots(1, 1, figsize=(14, 8.5)) if overview
                             else plt.subplots(2, 2, figsize=(14, 10)))
             axes = [axes] if overview else list(axes.flat)
@@ -266,176 +255,129 @@ def plot_comparison(title, queries, rows, relations, sol, name, overview=False):
             figure.legend(handles=handles, loc="upper center",
                           bbox_to_anchor=(0.5, 0.925), ncol=5, fontsize=11,
                           frameon=False)
-            footer_text = (
-                "SoL estimates ideal work with unlimited prefix KV reuse across "
-                "requests and reference-label survivors. "
-                "It has no measured accuracy.\n"
-                "Fresh tokens include recomputed KV. A dash marks zero. "
-                "Stock vLLM uses operator-at-a-time submission.")
-            footer_text += (
-                "\nFEV-9 uses the revised SGLang adapter; other SGLang results use "
-                "the earlier adapter."
-                if "FEV-9" in queries
-                else "\nSGLang measurements use the earlier adapter.")
-            figure.text(0.055, 0.035, footer_text, fontsize=10, linespacing=1.5)
             figure.subplots_adjust(left=0.075, right=0.97, top=0.83,
-                                   bottom=0.24 if overview else 0.20, hspace=0.60,
+                                   bottom=0.14 if overview else 0.10, hspace=0.60,
                                    wspace=0.28)
             pdf.savefig(figure, bbox_inches=None)
-            if page == 0:
-                figure.savefig(destination, dpi=300, bbox_inches=None)
             plt.close(figure)
         figure = document_page(title, queries, relations)
         pdf.savefig(figure, bbox_inches=None)
         plt.close(figure)
-    return destination.name
+    return destination.with_suffix(".pdf").name
 
 
-def load_rows(root, fev9_root):
-    """Combine the saved suite with four current FEV-9 measurements."""
-    manifest = json.loads((root / "manifest.json").read_text())
-    corpus = json.loads((root / "corpus.json").read_text())
-    fev9_manifest = json.loads((fev9_root / "manifest.json").read_text())
-    sglang_update = json.loads((fev9_root / "sglang_update.json").read_text())
-    assert sglang_update["methods"] == ["pipelined_sglang"]
-    cleanup = sglang_update["process_cleanup"]
-    assert all(value < 1024 for value in cleanup["gpu_memory_used_mib_after_exit"])
-    assert fev9_manifest["query_ids"] == ["FEV-9"]
+def measurement_rows(path):
+    """Read a run's measurements.parquet as {method: {query: row}}."""
     rows = {}
-    predicates = None
+    for row in pq.read_table(path).to_pylist():
+        rows.setdefault(row["method"], {})[row["query"]] = row
+    return rows
+
+
+def check_manifest(manifest):
+    """Assert a family run's manifest is the expected configuration."""
+    from quail_b.queries import SELECTIVITY_ESTIMATE_COLLECTION
+
+    assert manifest["model"] == "qwen3-4b-fp8"
+    assert manifest["sf"] == 0.1
+    assert manifest["collection_id"] == SELECTIVITY_ESTIMATE_COLLECTION
+
+
+def load_rows(root, corpus):
+    """Return {method: {query: row}} and the source of every cell.
+
+    The September 12 run supplies every cell it has and the FEV-10 run
+    fills the baselines' FEV-10. A cell neither run produced is absent.
+    """
+    manifest = json.loads((root / "run" / "manifest.json").read_text())
+    fev10_manifest = json.loads((root / "fev10" / "manifest.json").read_text())
+    check_manifest(manifest)
+    check_manifest(fev10_manifest)
+    assert fev10_manifest["query_ids"] == ["FEV-10"]
+    rows = measurement_rows(root / "run" / "measurements.parquet")
+    sources = {(method, query): "run" for method in rows for query in rows[method]}
+    fev10 = measurement_rows(root / "fev10" / "measurements.parquet")
     for key, _, _ in METHODS:
-        suite = json.loads((root / f"{key}.json").read_text())
-        current = (sglang_update["suites"][key] if key == "pipelined_sglang" else
-                   json.loads((fev9_root / f"{key}.json").read_text()))
-        for source in (suite, current):
-            assert (source["model"], source["sf"], source["lf"], source["gpus"]) == (
-                "qwen3-4b-fp8", 0.1, 1, 1)
-            assert source["corpus_id"] == corpus["corpus_id"]
-            assert source["backend"] == key
-        if key == "pipelined_sglang":
-            assert current["ground_truth"] == suite["ground_truth"]["fever"]
-        else:
-            assert (current["aggregate_volume_path"]
-                    == fev9_manifest["result_volume_paths"][key])
-            assert current["ground_truth"]["fever"] == suite["ground_truth"]["fever"]
-        measured = current["passes"]["single"]["queries"]
-        assert len(measured) == 1 and measured[0]["query"] == "FEV-9"
-        row = measured[0]
-        assert "error" not in row, row
-        if key == "pipelined_sglang":
-            assert all(step["submission"] == "suffix-major" for step in
-                       row["backend_metrics"]["steps"] if step["kind"] == "join")
-        filters = [stage for stage in row["stages"] if stage["op"] == "filter"]
-        assert len(filters) == 4
-        assert {stage["alias"] for stage in filters} == {"c1", "c2", "e1", "e2"}
-        assert len([stage for stage in row["stages"] if stage["op"] == "join"]) == 3
-        signature = sorted((p["op"], p.get("alias", ""), p["predicate_key"])
-                           for p in row["accuracy"]["per_predicate"])
-        if predicates is None:
-            predicates = signature
-        assert signature == predicates
-        rows[key] = {row["query"]: row for row in suite["passes"]["single"]["queries"]
-                     if row["query"] != "FEV-9"}
-        rows[key]["FEV-9"] = row
-    return manifest, rows, fev9_manifest, sglang_update["result_volume_path"]
+        if "FEV-10" not in rows.setdefault(key, {}) and "FEV-10" in fev10.get(key, {}):
+            rows[key]["FEV-10"] = fev10[key]["FEV-10"]
+            sources[(key, "FEV-10")] = "fev10"
+    return rows, sources, manifest, fev10_manifest
 
 
-def main(workdir, fev9_dir=None):
-    """Regenerate figures from the saved suite and current FEV-9 runs."""
+def main(workdir):
+    """Regenerate the figures and the report from the pulled files."""
     root = Path(workdir)
-    fev9_root = Path(fev9_dir) if fev9_dir else root / "fev9"
-    manifest, rows, fev9_manifest, sglang_source = load_rows(root, fev9_root)
-    queries = manifest["query_ids"]
-    comparable = [query for query in queries if all(query in rows[key] for key in rows)]
-    assert len(queries) == 32 and len(comparable) == 32
-    assert all("error" not in row
-               for method in rows.values() for row in method.values())
-    faster = sum(rows["quail"][query]["wall_s"] < rows["stock_vllm"][query]["wall_s"]
-                 for query in comparable)
+    corpus = json.loads((root / "corpus.json").read_text())
+    rows, sources, manifest, fev10_manifest = load_rows(root, corpus)
+    queries = list(QUERY_ORDER)
+    assert all(query in rows["quail"] for query in queries)
+    compared = [query for query in queries if query in rows["stock_vllm"]]
+    faster = sum(rows["quail"][query]["runtime_s"]
+                 < rows["stock_vllm"][query]["runtime_s"] for query in compared)
     plt.style.use(HERE / "quail.mplstyle")
     plt.rcParams.update({"pdf.fonttype": 42, "figure.autolayout": False,
                          "savefig.bbox": None})
-    corpus = json.loads((root / "corpus.json").read_text())
     relations = input_relations(queries, corpus)
     for method in rows.values():
         for query, row in method.items():
             assert (sum(count for _, _, count in relations[query])
-                    == row["input_document_rows"])
+                    == row["input_rows"])
     sol = load_sol(root, queries, rows, corpus)
     overview = plot_comparison("QUAIL-B", queries, rows, relations, sol,
-                               "quailb_main.png", overview=True)
+                               "quailb_main.pdf", overview=True)
     fev = row_metrics(rows["quail"]["FEV-9"])
-    sglang = row_metrics(rows["pipelined_sglang"]["FEV-9"])
-    previous_sglang = row_metrics(json.loads(
-        (fev9_root / "pipelined_sglang.json").read_text()
-    )["passes"]["single"]["queries"][0])
-    anchor_major_sglang = row_metrics(json.loads(
-        (fev9_root / "sglang_anchor_major.json").read_text()
-    )["suites"]["pipelined_sglang"]["passes"]["single"]["queries"][0])
-    output = rows["quail"]["FEV-9"]["accuracy"]["output_accuracy"]
+    output = rows["quail"]["FEV-9"]
+    calls = {key: call for key, call in manifest["function_call_ids"].items()
+             if not key.endswith(":sglang")}
+    labels = {key: label for key, label, _ in METHODS}
+
+    def cells_text(cells):
+        by_method = {}
+        for method, query in sorted(cells):
+            by_method.setdefault(method, []).append(query)
+        return "; ".join(
+            f"{labels[method]} " + ", ".join(
+                query for query in QUERY_ORDER if query in queries_of)
+            for method, queries_of in by_method.items())
+
+    borrowed = [key for key, source in sources.items() if source == "fev10"]
+    missing = [(key, query) for key, _, _ in METHODS for query in queries
+               if query not in rows[key]]
+
     lines = [
-        "# QUAIL-B comparison from saved results", "",
-        "- The main PDF covers all 32 queries with grouped bars and one metric "
+        "# QUAIL-B comparison", "",
+        "- The main PDF covers all 33 queries with grouped bars and one metric "
         "per page.",
         "  Its final page lists input document counts. Each dataset PDF has a page",
         "  of four bar charts and a separate input-count page. Text and marks remain",
-        "  vector content when zoomed. The PNGs below are first-page previews.",
-        "- The five dataset plots use the same",
-        "  method colors and definitions for latency, recomputed KV tokens, fresh",
-        "  input tokens, accuracy, and input document counts for every relation alias.",
-        "- The other 31 queries reuse the original measurements from "
-        "September 5, 2026.",
-        "  Only FEV-9 was rerun on September 6, 2026, with all four methods.",
-        "  FEV-9 uses SGLang with all anchors submitted per partner, without "
-        "client tiles or request slices.",
-        "  Other queries retain historical SGLang measurements with the earlier "
-        "adapter.",
-        "  The other queries are not new measurements of shared retention.",
+        "  vector content when zoomed.",
         "- The setup was Qwen3 4B FP8, sf=0.1, lf=1, and one H100 per configuration.",
-        "  Quail and the vLLM configurations shared a physical GPU within each family.",
-        "  SGLang used a separate GPU. Stock vLLM used operator-at-a-time submission.",
-        "- FEV-9 has four filters and three joins. All four methods now use that",
-        "  query definition in both the main plot and the FEVER plot.",
-        "  The [FEV-9 comparison](2026-09-06-sglang-baseline.md) records the new run.",
-        "  The [retention report](2026-09-05-shared-kv-retention.md) records the "
-        "earlier ablation.",
-        f"- The revised SGLang adapter took {sglang['seconds']:.2f} seconds "
-        "on FEV-9,",
-        f"  compared with {previous_sglang['seconds']:.2f} seconds using its "
-        "earlier submission policy.",
-        f"  Fresh computation was {sglang['fresh']:,} tokens, compared with "
-        f"{previous_sglang['fresh']:,} before.",
-        "  The intermediate run with vLLM's pair order took "
-        f"{anchor_major_sglang['seconds']:.2f} seconds",
-        f"  and computed {anchor_major_sglang['fresh']:,} fresh tokens. "
-        "The current SGLang order",
-        "  separates requests sharing an anchor so earlier requests can populate "
-        "reusable KV.",
-        "- We predicted Quail would remain near 39 seconds and beat the baselines.",
-        f"  It took {fev['seconds']:.2f} seconds in the new run. We reused all "
-        "124 saved",
-        "  configurations for the other 31 queries.",
-        f"- In these saved measurements, Quail was faster than stock vLLM on {faster}",
-        f"  of {len(comparable)} comparable queries.",
+        "  Quail and the vLLM configurations shared a physical GPU within each",
+        "  family. Stock vLLM used operator-at-a-time submission; the other two",
+        "  pipeline their requests.",
+        "- Quail, stock vLLM, and pipelined vLLM were run on September 12, 2026: "
+        f"`/results/benchmarks/quailb/family-runs/{manifest['run_id']}/`,",
+        "  function calls " + ", ".join(f"`{call}`" for call in calls.values()) + ".",
+        "  That run's FEVER container failed on FEV-10 in the request backends (an",
+        "  equality join's key columns were not passed to them; fixed since) and",
+        f"  was not rerun. {len(borrowed)} of the 99 cells come from the September 11",
+        f"  FEV-10 run (`/results/benchmarks/quailb/family-runs/"
+        f"{fev10_manifest['run_id']}/`): {cells_text(borrowed)}.",
+        f"  {len(missing)} cells have no measurement and are marked missing, in the",
+        "  plots by an x below the axis and in the tables by a row that says so:",
+        f"  {cells_text(missing)}.",
+        f"- Quail was faster than stock vLLM on {faster} of {len(compared)} queries",
+        "  where both were measured.",
         "- A horizontal line across each query's bar group shows its SoL estimate.",
         "  SoL models ideal computation and memory traffic with unlimited prefix KV.",
         "  It credits matching token prefixes across requests, documents, and aliases.",
         "  It uses exact reference-label survivors and searches supported left-deep",
         "  join plans. Different answers can change the work done by measured runs,",
-        "  so the gap from SoL is not purely execution overhead.",
-        "- SoL uses the distinct-prefix estimate, not the per-document-only estimate.",
-        "  Its latency, fresh-token count, and zero prefix recomputation are "
-        "estimates.",
-        "  No accuracy is assigned to SoL because it is not a measured model run.",
-        "  Matching document prefixes are reusable; a partner suffix after a different",
-        "  anchor context is not an identical prefix and is still computed.",
-        "- The earlier SoL file used the old FEV-9 definition. We recalculated only",
-        "  FEV-9 on the CPU from saved labels and corpus rows. The other 31 estimates",
-        "  are unchanged. Calculating SoL required no GPU inference.",
-        f"- FEV-9 SoL is {sol['FEV-9']['sol_s']:.3f} seconds with shared-prefix reuse,",
-        f"  compared with {sol['FEV-9']['per_document']['sol_s']:.3f} seconds "
-        "with reuse only",
-        "  within each document. These estimates use reference-label survivors.",
+        "  so the gap from SoL is not purely execution overhead. SoL uses the",
+        "  distinct-prefix estimate, not the per-document-only estimate. No",
+        "  accuracy is assigned to SoL because it is not a measured model run.",
+        "  SoL was recalculated for all 33 queries on the CPU on September 11,",
+        "  2026, from saved labels and corpus rows.",
         "- Answer agreement measures evaluated calls against saved Qwen3 32B labels.",
         "  Each method can evaluate different calls after its filters and joins.",
         "  Output precision is the fraction of returned rows matching the reference.",
@@ -449,9 +391,12 @@ def main(workdir, fev9_dir=None):
         "  suffix tokens, and any repeated computation after KV becomes unavailable.",
         "  A repeated token counts again. This is not a count of unique text or",
         "  generated answers. Recomputed KV tokens are part of the fresh-token total.",
-        "- Recomputed KV is the saved `regret_tokens` total for reusable prefixes",
-        "  of documents or anchors already computed earlier in the query. This uses",
-        "  per-document accounting, not the separate distinct-prefix metric.",
+        "- Recomputed KV is `regret_tokens`: fresh tokens minus the fewest input",
+        "  tokens the run's requests needed with unlimited KV, where every",
+        "  distinct prefix across the requests is computed once. quail-bench",
+        "  derives it on the CPU after the run from the saved answer tables and",
+        "  the prompt token pieces the runner reports (`quail_b.minimum`); the",
+        "  engine tracks nothing. A run saved without that minimum is not measured.",
         "  Token and latency plots use a log scale when positive values span more",
         "  than one order of magnitude. Recomputed KV retains a linear region to",
         "  include zero. A dash marks zero.",
@@ -465,31 +410,21 @@ def main(workdir, fev9_dir=None):
         f"  The reference has {output['expected_rows']:,} rows, so output "
         f"precision is approximately {fev['precision']:.8f}%",
         f"  and recall is {fev['recall']:.2f}%.", "",
-        "[Open the main vector PDF](plots/quailb_main.pdf)", "",
-        f"[![QUAIL-B latency preview](plots/{overview})](plots/quailb_main.pdf)", "",
+        f"[Open the main vector PDF](plots/{overview})", "",
         f"Figure: plots/{overview}", "",
-        "Source manifest on `quail-results`: "
-        f"`{manifest['manifest_volume_path']}`.", "",
-        "FEV-9 Quail and vLLM manifest on `quail-results`: "
-        f"`{fev9_manifest['manifest_volume_path']}`.", "",
-        f"Current FEV-9 SGLang result on `quail-results`: `{sglang_source}`.", "",
         "SoL estimates on `quail-results`: "
-        "`/results/sol/2026-09-06-quailb-prefix-reuse.json`.", "",
-        "The FEV-9 recalculation is also saved separately at "
-        "`/results/sol/2026-09-06-fev9-prefix-reuse.json`.", "",
+        "`/results/sol/2026-09-11-quailb-prefix-reuse.json`.", "",
         "Corpus counts on `quail-results`: `/results/ground_truth/quailb/"
         f"schema_v1/corpora/{corpus['corpus_id']}/manifest.json`.", "",
-        "The manifest lists all four source suite paths. The download commands are",
-        "in `reports/make_quailb_comparison_plots.py`.", "",
+        "The download commands are in `reports/make_quailb_comparison_plots.py`.",
+        "",
     ]
     for family in ("IMDB", "BIO", "FEV", "LEP", "AGENT"):
         selected = [query for query in queries if query.startswith(family + "-")]
         name = plot_comparison(f"QUAIL-B {family}", selected, rows, relations,
-                               sol, f"quailb_{family.lower()}.png")
-        pdf_name = Path(name).with_suffix(".pdf").name
+                               sol, f"quailb_{family.lower()}.pdf")
         lines.extend([f"## {family}", "",
-                      f"[Open the {family} vector PDF](plots/{pdf_name})", "",
-                      f"[![{family} preview](plots/{name})](plots/{pdf_name})", "",
+                      f"[Open the {family} vector PDF](plots/{name})", "",
                       f"Figure: plots/{name}", "",
                       "| Query | Input documents by alias and set |", "|---|---|"])
         for query in selected:
@@ -500,20 +435,23 @@ def main(workdir, fev9_dir=None):
                       "| Query | Method | Seconds | Recomputed KV tokens "
                       "| Fresh input tokens | Throughput | Unit | $/query "
                       "| Answer agreement (%) | Output precision (%) "
-                      "| Output recall (%) |",
-                      "|---|---|---:|---:|---:|---:|---|---:|---:|---:|---:|"])
+                      "| Output recall (%) | Source |",
+                      "|---|---|---:|---:|---:|---:|---|---:|---:|---:|---:|---|"])
         for query in selected:
             for key, label, _ in METHODS:
                 if query not in rows[key]:
-                    lines.append(f"| {query} | {label} | Not measured for this "
-                                 "query definition | | | | | | | | |")
+                    lines.append(f"| {query} | {label} | missing | | | | | | | | "
+                                 "| not run |")
                     continue
                 m = row_metrics(rows[key][query])
+                source = {"run": "September 12",
+                          "fev10": "FEV-10 run"}[sources[(key, query)]]
                 lines.append(
-                    f"| {query} | {label} | {m['seconds']:.2f} | {m['recomputed']:,} "
+                    f"| {query} | {label} | {m['seconds']:.2f} "
+                    f"| {token_cell(m['recomputed'])} "
                     f"| {m['fresh']:,} | {m['throughput']:,.2f} "
                     f"| {m['unit']} | {m['cost']:.5f} | {m['agreement']:.2f} "
-                    f"| {m['precision']:.5g} | {m['recall']:.5g} |")
+                    f"| {m['precision']:.5g} | {m['recall']:.5g} | {source} |")
             estimate = sol[query]
             throughput = estimate["document_pairs_per_second_at_sol"]
             unit = "pairs/s"
@@ -524,17 +462,14 @@ def main(workdir, fev9_dir=None):
                 f"| {query} | SoL estimate | {estimate['sol_s']:.3f} | 0 (assumed) "
                 f"| {estimate['tokens']:,.0f} | {throughput:,.2f} | {unit} "
                 f"| {estimate['cost_usd_per_query_at_sol']:.5f} "
-                "| Not measured | Not measured | Not measured |")
+                "| Not measured | Not measured | Not measured | estimate |")
         lines.append("")
-    report = HERE / "2026-09-05-quailb-saved-results.md"
+    report = HERE / "quailb-comparison.md"
     report.write_text("\n".join(lines))
-    print(f"Updated {report}, the main figure, and five dataset figures "
-          "from 128 saved configurations.")
+    print(f"Updated {report}, the main figure, and five dataset figures.")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("workdir")
-    parser.add_argument("--fev9-dir")
-    args = parser.parse_args()
-    main(args.workdir, args.fev9_dir)
+    main(parser.parse_args().workdir)

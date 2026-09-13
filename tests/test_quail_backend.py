@@ -1,20 +1,30 @@
 """Quail backend execution tests without a GPU."""
 
-from contextlib import nullcontext
 from types import SimpleNamespace
+
+import pyarrow as pa
+import pytest
+from fakes import (
+    expected_filter_rows,
+    fake_torch,
+    keep_even,
+    run_graph_on_arena,
+    same_key,
+    two_alias_graph,
+)
 
 from quail.backends.quail import QuailModelExecution
 from quail.backends.quail.distributed import execute_distributed_graph
 from quail.backends.quail.graph import execute_single_graph
 from quail.builtins import built_in_registry
 from quail.physical import (
-    AnchoredJoin,
-    DocumentInput,
+    AiFilter,
+    AiJoin,
     FilterStage,
     JoinStage,
-    PackedFilter,
     PhysicalGraph,
     PortRef,
+    Scan,
 )
 from quail.physical.base import input_ports
 from quail.runtime.runner import NodeMetrics, NodeResult
@@ -67,16 +77,6 @@ class FakeArena:
         pass
 
 
-def fake_torch():
-    return SimpleNamespace(
-        inference_mode=nullcontext,
-        cuda=SimpleNamespace(
-            synchronize=lambda: None,
-            max_memory_allocated=lambda: 0,
-        ),
-    )
-
-
 def graph_state(model_execution, docs):
     registry = built_in_registry()
     return {
@@ -97,13 +97,13 @@ def test_fixed_join_executes_without_optimizer(monkeypatch):
         raise AssertionError("execution called the join optimizer")
 
     monkeypatch.setattr("quail.planner.joins.search_joins", unexpected_search)
-    scan_r = DocumentInput(
+    scan_r = Scan(
         node_id="input:r", alias="r", input_id="r"
     )
-    scan_p = DocumentInput(
+    scan_p = Scan(
         node_id="input:p", alias="p", input_id="p"
     )
-    join = AnchoredJoin(
+    join = AiJoin(
         node_id="join", anchor="r",
         inputs=input_ports((PortRef("input:r", "ids:r"),
                             PortRef("input:p", "ids:p"))),
@@ -122,7 +122,7 @@ def test_fixed_join_executes_without_optimizer(monkeypatch):
 
     class FixedJoinExecution:
         def execute(self, node, inputs):
-            assert isinstance(node, AnchoredJoin)
+            assert isinstance(node, AiJoin)
             answers = [{0: [True, False], 1: [False, True]}]
             return NodeResult(
                 {
@@ -157,7 +157,7 @@ def test_fixed_join_executes_without_optimizer(monkeypatch):
     assert result["fresh_tokens"] == 20
     assert result["joins"][0]["written_pos"] == 0
     assert result["executed_join_plan"][0]["type"] == \
-        AnchoredJoin.type_name
+        AiJoin.type_name
 
 
 def distributed_payload(docs, joins=None):
@@ -199,10 +199,10 @@ def attach_plan(payload, graph):
 
 
 def test_filter_execution_and_retention_inputs(monkeypatch):
-    scan = DocumentInput(
+    scan = Scan(
         node_id="input:d", alias="d", input_id="d"
     )
-    filtered = PackedFilter(
+    filtered = AiFilter(
         node_id="filter:d",
         inputs=input_ports((PortRef("input:d", "ids:d"),)),
         alias="d",
@@ -268,7 +268,7 @@ def test_filter_execution_and_retention_inputs(monkeypatch):
         execution.bind_query(
             torch=fake_torch(), async_answers=object(), chunk_tokens=8192
         )
-        node = PackedFilter(
+        node = AiFilter(
             node_id="filter:d",
             alias="d",
             stages=(FilterStage(0, 1, 1, None, 4),),
@@ -286,3 +286,187 @@ def test_filter_execution_and_retention_inputs(monkeypatch):
 
         assert received["retain_survivors"] == ()
         assert result.outputs["ids:d"] == [10]
+
+
+# ------------------------------------------------ streamed edges on a page arena
+
+
+def test_streamed_edge_runs_through_the_quail_graph(monkeypatch):
+    """A filter and a join with a streamed edge, through the real graph runtime."""
+    result, model, filter_truth, join_truth = run_graph_on_arena(
+        monkeypatch, two_alias_graph(True, stages=2), n_partners=3, seed=3,
+        pages=48, stages=2, partner_tokens=35)
+    assert result["filters"]["r"] == expected_filter_rows(filter_truth)
+    survivors = [d for d, truth in enumerate(filter_truth) if all(truth)]
+    rows = result["joins"][0]
+    assert sorted(rows["anchor_index"]) == survivors
+    for local, document in enumerate(rows["anchor_index"]):
+        assert rows["rows"][local] == join_truth[("r", document)]
+    metrics = result["node_metrics"]
+    assert metrics["filter:r"]["evaluated_documents"] == 14
+    assert metrics["filter:r"]["fresh_tokens"] > 0
+    assert metrics["group:0"]["kv_hits"] == len(survivors)
+    assert metrics["group:0"]["kv_misses"] == 0
+    assert result["fresh_tokens"] == (
+        metrics["filter:r"]["fresh_tokens"] + metrics["group:0"]["fresh_tokens"])
+    assert result["kv_manager"]["join_anchor_hits"] == len(survivors)
+    kinds = [kind for kind, _ in model.launched]
+    assert kinds.index("join") < len(kinds) - 1 - kinds[::-1].index("filter")
+
+
+def _key_columns(r_keys, p_keys):
+    return {
+        "r": pa.table({"r": pa.array(range(len(r_keys)), pa.int32()),
+                       "key": pa.array(r_keys)}),
+        "p": pa.table({"p": pa.array(range(len(p_keys)), pa.int32()),
+                       "key": pa.array(p_keys)}),
+    }
+
+
+def test_pair_join_runs_through_the_quail_graph(monkeypatch):
+    # document d has key d % 4; partners 0 and 3 share key 0, so a
+    # document with key 0 pairs with both and one with key 3 with none
+    columns = _key_columns([d % 4 for d in range(14)], [0, 1, 2, 0])
+    allowed = {d: [i for i in range(4) if d % 4 == i % 3] for d in range(14)}
+    for pin_survivors in (True, False):
+        result, _, filter_truth, join_truth = run_graph_on_arena(
+            monkeypatch, two_alias_graph(pin_survivors, hash_join=True),
+            columns=columns)
+        cross, _, _, _ = run_graph_on_arena(
+            monkeypatch, two_alias_graph(pin_survivors))
+        survivors = [d for d, truth in enumerate(filter_truth) if all(truth)]
+        stage = result["joins"][0]
+        assert sorted(stage["anchor_index"]) == survivors
+        members = stage["anchor_partners"]
+        for local, document in enumerate(stage["anchor_index"]):
+            mine = sorted(allowed[document])
+            assert members[local] == mine
+            # an anchor with no pair settles without a row
+            assert stage["rows"].get(local, []) == [
+                join_truth[("r", document)][i] for i in mine]
+        # the exported answer table holds exactly the evaluated pairs
+        table = result["_outputs"][PortRef("group:0", "join_answers:0")]
+        assert sorted(zip(table.column("r").to_pylist(),
+                          table.column("p").to_pylist())) == sorted(
+            (d, i) for d in survivors for i in allowed[d])
+        assert table.column("answer").to_pylist() == [
+            bool(join_truth[("r", d)][i])
+            for d, i in zip(table.column("r").to_pylist(),
+                            table.column("p").to_pylist())]
+        # fewer pairs, fewer fresh tokens than the cross join
+        metrics = result["node_metrics"]["group:0"]
+        assert metrics["evaluated_document_pairs"] == sum(
+            len(allowed[d]) for d in survivors)
+        assert metrics["fresh_tokens"] < (
+            cross["node_metrics"]["group:0"]["fresh_tokens"])
+        assert result["node_metrics"]["hash_join:r-p"]["output_rows"] == sum(
+            len(mine) for mine in allowed.values())
+        # anchors whose pairs all answered FALSE are gone; the rest
+        # survive with the same rule as a cross join
+        kept = [d for d in survivors
+                if any(join_truth[("r", d)][i] for i in allowed[d])]
+        root = result["_outputs"][PortRef("group:0", "ids:r")]
+        assert sorted(root.column("r").to_pylist()) == kept
+
+
+def _foreign_run(monkeypatch, graph, functions):
+    # document d has key d % 4; partner i has key i
+    result, _, filter_truth, join_truth = run_graph_on_arena(
+        monkeypatch, graph, seed=9, functions=functions,
+        columns=_key_columns([d % 4 for d in range(14)], list(range(4))))
+    survivors = [d for d, truth in enumerate(filter_truth) if all(truth)]
+    return result, survivors, join_truth
+
+
+def test_foreign_runs_per_batch_on_the_stream_and_once_as_a_barrier(monkeypatch):
+    functions = {"keep_even": keep_even, "same_key": same_key}
+    # a per-batch drop on the pinned chain: only even survivors reach
+    # the join, the filter still reports every survivor, and the
+    # function ran once per chunk of survivors
+    result, survivors, join_truth = _foreign_run(
+        monkeypatch, two_alias_graph(True, foreign=("per_batch", "drop")),
+        functions)
+    assert sorted(result["filters"]["r"]) == list(range(14))
+    stage = result["joins"][0]
+    kept = [d for d in survivors if d % 2 == 0]
+    assert sorted(stage["anchor_index"]) == kept
+    foreign = result["node_metrics"]["apply:keep_even"]
+    assert foreign["input_rows"] == len(survivors)
+    assert foreign["output_rows"] == len(kept)
+    assert result["_outputs"][PortRef("apply:keep_even", "ids:r")].column(
+        "r").to_pylist() == kept
+    assert result["node_metrics"]["group:0"]["kv_hits"] == len(kept)
+
+    # the same function as a barrier over a materialized chain
+    result, survivors, _ = _foreign_run(
+        monkeypatch, two_alias_graph(False, foreign=("barrier", "drop")),
+        functions)
+    assert sorted(result["joins"][0]["anchor_index"]) == kept
+
+    # pairs from a per-batch function equal pairs from a barrier one,
+    # and both equal the key equality: document d pairs with partner
+    # d % 4 only
+    per_batch, survivors, join_truth = _foreign_run(
+        monkeypatch, two_alias_graph(True, foreign=("per_batch", "pairs")),
+        functions)
+    barrier, _, _ = _foreign_run(
+        monkeypatch, two_alias_graph(False, foreign=("barrier", "pairs")),
+        functions)
+    for result in (per_batch, barrier):
+        table = result["_outputs"][PortRef("group:0", "join_answers:0")]
+        assert sorted(zip(table.column("r").to_pylist(),
+                          table.column("p").to_pylist())) == [
+            (d, d % 4) for d in survivors]
+        assert {(r, p): a for r, p, a in zip(
+            table.column("r").to_pylist(), table.column("p").to_pylist(),
+            table.column("answer").to_pylist())} == {
+            (d, d % 4): bool(join_truth[("r", d)][d % 4]) for d in survivors}
+        pairs = result["_outputs"][PortRef("apply:same_key", "pairs:0")]
+        assert sorted(zip(pairs.column("r").to_pylist(),
+                          pairs.column("p").to_pylist())) == [
+            (d, d % 4) for d in survivors]
+        assert result["node_metrics"]["apply:same_key"]["output_rows"] == len(
+            survivors)
+
+    # a function never invents an id, and preserve means every id
+    def invent(tables):
+        return [99]
+
+    def lose_one(tables):
+        (alias,) = tables
+        return tables[alias].column(alias).to_pylist()[1:]
+
+    def outer(tables):
+        (alias,) = tables
+        return [None] + tables[alias].column(alias).to_pylist()[1:]
+
+    with pytest.raises(ValueError, match="never invents an id"):
+        _foreign_run(monkeypatch,
+                     two_alias_graph(True, foreign=("per_batch", "drop")),
+                     {"keep_even": invent})
+    with pytest.raises(ValueError, match="preserves ids but dropped"):
+        _foreign_run(monkeypatch,
+                     two_alias_graph(False, foreign=("barrier", "preserve")),
+                     {"keep_even": lose_one})
+    with pytest.raises(ValueError, match="returned a null id"):
+        _foreign_run(monkeypatch,
+                     two_alias_graph(False, foreign=("barrier", "drop")),
+                     {"keep_even": outer})
+
+
+def test_gpu_timing_sums_the_chunk_events_only_when_asked(monkeypatch):
+    """gpu_s is the sum of every chunk's CUDA event pair, opt in."""
+    off, _, _, _ = run_graph_on_arena(
+        monkeypatch, two_alias_graph(True), pages=48)
+    assert "gpu_s" not in off
+    assert all(metrics["gpu_s"] == 0.0
+               for metrics in off["node_metrics"].values())
+    on, _, _, _ = run_graph_on_arena(
+        monkeypatch, two_alias_graph(True), pages=48, gpu_timing=True)
+    # the fake torch reports 2 ms per event pair, one pair per chunk
+    per_node = [metrics["gpu_s"] for metrics in on["node_metrics"].values()]
+    assert on["gpu_s"] == pytest.approx(sum(per_node), abs=1e-3)
+    assert on["gpu_s"] > 0
+    assert on["chunks"] == round(on["gpu_s"] / 0.002)
+    assert all(chunks == round(chunks)
+               for chunks in (seconds / 0.002 for seconds in per_node))

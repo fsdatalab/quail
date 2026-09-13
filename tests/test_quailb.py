@@ -4,7 +4,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 import quail
-from quail.bench.quailb import queries, register_privacy_sets, register_sets
+from quail.bench.quailb import queries, register_tables
 from quail.planner.decide import collect_operators
 from quail.planner.plan import EngineConfig, Refusal
 from quail_b.data import ASPECTS, SCENARIOS
@@ -28,7 +28,8 @@ def _standin_sets(tmp_path):
         "claim": [f"claim {i}" for i in range(6)],
         "label": ["SUPPORTS" if i % 2 == 0 else "REFUTES"
                   for i in range(6)],
-        "evidence_wiki_url": [f"Page_{i}" for i in range(6)],
+        # a claim's page is an evidence id, as in the real corpus
+        "evidence_wiki_url": [f"evidence{i % 4}" for i in range(6)],
     }), tmp_path / "claims.parquet")
     write("evidence", "text", [f"Wikipedia passage {i}" for i in range(6)])
     pq.write_table(pa.table({
@@ -64,13 +65,12 @@ def test_all_queries_compile_and_plan(tmp_path):
         _standin_sets(tmp_path)
         sess = quail.Session(EngineConfig(gpus=1, backend=backend),
                              tokenizer=lambda text: list(text.encode()))
-        register_sets(sess, tmp_path)
-        register_privacy_sets(sess, tmp_path)
+        register_tables(sess, tmp_path)
         qdefs = queries(sess)
         expected = {
             *(f"IMDB-{i}" for i in range(1, 11)),
             *(f"BIO-{i}" for i in range(1, 4)),
-            *(f"FEV-{i}" for i in range(1, 10)),
+            *(f"FEV-{i}" for i in range(1, 11)),
             *(f"LEP-{i}" for i in range(1, 9)),
             "AGENT-1", "AGENT-2",
             "PRIV-1", "PRIV-2",

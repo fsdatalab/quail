@@ -126,20 +126,16 @@ change needs one of them, say so instead of quietly adding it back.
 
 All experiment and feature reports live under `reports/`.
 
-- Every PR that includes an experiment must produce a report in
-  `reports/`. Name the file `YYYY-MM-DD-<short-slug>.md`.
-  The report states the setup, the prediction, the measured result,
-  and what the numbers mean. Cite the data by its `quail-results`
-  volume path.
-- When a report is superseded or its numbers are no longer current,
-  delete the report, its plot script, and its PNGs from
-  `reports/plots/`. Before starting a new task, scan `reports/`
-  for outdated reports, orphaned plot scripts, and PNGs not
-  referenced by any current report, and delete them all.
-- When a PR ships a new feature (a code change that lands on main),
-  add a short description in `reports/shipped_features/`.
-  Name the file `YYYY-MM-DD-<short-slug>.md`. It should say what
-  changed, why, and the before/after numbers if applicable.
+- Every PR adds one file, and only one, to `reports/shipped_features/`,
+  named `YYYY-MM-DD-<short-slug>.md`. It says what changed, why, the
+  prediction stated before each run, the measured numbers against it,
+  and the `quail-results` volume path and Modal function call id of
+  each run. A PR with several features gets one file with a section
+  per feature. Do not add a separate report under `reports/`.
+- When a note's numbers are no longer current, delete it and any plot
+  script and PNGs only it referenced. Before starting a new task, scan
+  `reports/` for orphaned plot scripts and PNGs not referenced by any
+  current note, and delete them all.
 - `reports/engine-wiki.md` is a living reference doc, not a
   per-PR report. Update it in place when the engine's design changes.
 
@@ -157,7 +153,9 @@ Include a figure whenever one carries the point better than text:
 
 # Plots
 
-Every report with measured results should include at least one plot.
+Add a plot only when it carries the point better than a table. A plot
+lives under `reports/plots/` with its `make_<slug>_plots.py` in
+`reports/`, and the note links it.
 
 ## QUAIL-B plot standard
 
@@ -169,8 +167,8 @@ Every report with measured results should include at least one plot.
   `quailb_<dataset>.pdf`. Use grouped bars for the main comparison.
   Use readable page sizes and split metrics across pages instead of
   shrinking all metrics into one wide figure. Keep text as embedded fonts
-  and marks as vectors. PNGs may be first-page previews for Markdown;
-  link the PDF as the primary artifact and never embed a PNG inside it.
+  and marks as vectors. Commit the PDFs only, no PNG previews; link the
+  PDF from the report and never embed a PNG inside it.
   Keep method order, colors, and metric definitions consistent across them.
 - Show the SoL estimate as a horizontal line across each query's bar group
   in latency and token plots. Reserve bars for measured configurations.
@@ -183,10 +181,17 @@ Every report with measured results should include at least one plot.
   Recalculate stale estimates on the CPU from saved inputs without inference.
 - Show these metrics for each query and configuration:
   - Latency in seconds, excluding model startup and result collection.
-  - Total recomputed KV tokens across the query (`regret_tokens`). These
-    count reusable document or anchor prefix tokens computed again because
-    their KV was unavailable. Use the existing per-document accounting;
-    do not silently substitute the distinct-prefix metric.
+  - Total recomputed KV tokens across the query (`regret_tokens`). This
+    is fresh tokens minus the fewest input tokens the run's requests
+    needed with unlimited KV, where every distinct prefix across the
+    requests is computed once: each document once, each question tail
+    and anchor frame once per document, and each pair's partner suffix
+    after its anchor. quail-bench derives it (`quail_b.minimum`) from
+    the saved answer tables on the CPU after the run, from the prompt
+    token pieces Quail's runner reports with each result; `quail-b
+    report` recomputes it for saved runs. Track nothing in the engine
+    loop. A run saved without a minimum shows as not measured, never as
+    zero.
   - Total fresh input tokens computed across the query (`fresh_tokens`).
     A fresh token is an input token position processed by a model forward
     pass instead of read from existing KV. Count repeated computation again.
@@ -266,7 +271,7 @@ effectiveness research:
   categories need two colors, not five.
 - Use a log scale only when the data spans more than one order of
   magnitude. Say so in the axis label.
-- Use vector PDFs for QUAIL-B, with 300 DPI PNG previews. Other report
+- Use vector PDFs for QUAIL-B, with no PNG previews. Other report
   figures use 300 DPI PNG files. No SVG.
 - Make the canvas large enough that text and data marks remain sharp when
   viewed on GitHub.

@@ -7,13 +7,15 @@ from dataclasses import replace
 from typing import Any
 
 from quail.backends.base import GpuContext
+from quail.backends.quail.graph import filter_result, stage_partner_lists
 from quail.backends.quail.worker import execute_quail_request, prepare_quail_request
 from quail.executor import loop
+from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
 from quail.logical import SHARED_PRE
 from quail.physical import (
-    AnchoredJoin,
-    Exchange,
-    PackedFilter,
+    AiFilter,
+    AiJoin,
+    Barrier,
     PhysicalNode,
 )
 from quail.planner import collect_operators, plan_quail
@@ -23,7 +25,7 @@ from quail.planning import (
     PlanningContext,
     SupportResult,
 )
-from quail.runtime.runner import NodeMetrics, NodeResult
+from quail.runtime.runner import NodeMetrics, NodeResult, SurvivorStream
 from quail.runtime.tokens import DocumentKeys
 
 
@@ -56,14 +58,14 @@ class QuailModelExecution:
         node: PhysicalNode,
         inputs: Mapping[str, Any],
     ) -> Any:
-        if not isinstance(node, (PackedFilter, AnchoredJoin)):
+        if not isinstance(node, (AiFilter, AiJoin)):
             raise TypeError(
                 f"Quail cannot execute physical node {node.type_name!r}")
         return self._execute_quail_node(node, inputs)
 
     def _execute_quail_node(
         self,
-        node: PackedFilter | AnchoredJoin,
+        node: AiFilter | AiJoin,
         inputs: Mapping[str, Any],
     ) -> Any:
 
@@ -80,13 +82,22 @@ class QuailModelExecution:
         async_answers = self._state["async_answers"]
         chunk_tokens = self._state["chunk_tokens"]
 
-        if isinstance(node, PackedFilter):
-
+        if isinstance(node, AiFilter):
             document_ids = inputs["document_ids"]
+            if node.pin_survivors:
+                stream = SurvivorStream(node, document_ids)
+
+                return NodeResult(
+                    outputs={
+                        f"ids:{node.alias}": stream,
+                        f"filter_answers:{node.alias}": {},
+                    },
+                    finalize=stream.finalized_result,
+                )
             retain_survivors = inputs.get("retain_survivors", ())
             if retain_survivors is False:
                 retain_survivors = ()
-            answers, _, tokens = loop.run_filter(
+            answers, spans, tokens = loop.run_filter(
                 torch,
                 arena,
                 pipeline,
@@ -99,29 +110,35 @@ class QuailModelExecution:
                 arena_keys=DocumentKeys(node.alias, document_ids),
                 retain_survivors=retain_survivors,
             )
-            global_answers = {
-                document_ids[int(local)]: row
-                for local, row in answers.items()
-            }
-            survivors = sorted(
-                document
-                for document, row in global_answers.items()
-                if len(row) == len(node.question_token_ids) and all(row)
-            )
-            return NodeResult(
-                outputs={
-                    f"ids:{node.alias}": survivors,
-                    f"filter_answers:{node.alias}": global_answers,
-                },
-                metrics=NodeMetrics(
-                    input_rows=len(document_ids),
-                    output_rows=len(survivors),
-                    evaluated_documents=len(global_answers),
-                    fresh_tokens=tokens,
-                ),
-            )
+            return filter_result(
+                node, answers, tokens, document_ids,
+                gpu_s=_gpu_seconds(torch, spans, inputs),
+                chunks=_chunks(spans, inputs))
 
-        answers, _, tokens = loop.run_join(
+        stage_frames = inputs["stage_frames"]
+        stream = inputs.get("anchor_stream")
+        source = None
+        if stream is not None:
+            filter_node = stream["node"]
+            # a pinned survivor's pages must cover the join's largest frame
+            source = loop.FilterStream(
+                torch,
+                arena,
+                pipeline,
+                async_answers,
+                stream["documents"],
+                [list(question)
+                 for question in filter_node.question_token_ids],
+                chunk_tokens,
+                arena_writes=True,
+                arena_keys=DocumentKeys(filter_node.alias,
+                                        stream["document_ids"]),
+                hold_survivors=True,
+                hold_extra_tokens=filter_node.hold_tokens,
+                attention_mode=FILTER_ATTENTION,
+            )
+        lists_for = inputs.get("anchor_partners")
+        answers, spans, tokens = loop.run_join(
             torch,
             arena,
             pipeline,
@@ -129,11 +146,30 @@ class QuailModelExecution:
             inputs["prefixes"],
             inputs["stage_suffixes"],
             chunk_tokens,
-            stage_frames=inputs["stage_frames"],
+            stage_frames=stage_frames,
             anchor_keys=inputs["anchor_keys"],
             anchor_done=inputs["anchor_done"],
+            anchor_source=source,
+            attention_mode=JOIN_ATTENTION if source is not None else None,
+            anchor_partners=(
+                None if lists_for is None else lambda key: lists_for(key[1])),
+            anchor_batch=inputs.get("anchor_batch"),
         )
-        anchor_ids = list(inputs["anchor_ids"])
+        if source is not None:
+            # admission order; a per-batch function may have dropped some
+            anchor_ids = [key[1] for key in inputs["anchor_keys"]]
+            kv_round = {"hits": len(anchor_ids), "misses": 0}
+            stream["stream"].complete(filter_result(
+                filter_node,
+                source.answers,
+                source.tokens,
+                stream["document_ids"],
+                gpu_s=_gpu_seconds(torch, source.spans, inputs),
+                chunks=_chunks(source.spans, inputs),
+            ))
+        else:
+            anchor_ids = list(inputs["anchor_ids"])
+            kv_round = inputs.get("kv_round") or {}
         group = inputs["group"]
         last = answers[-1] if answers else {}
         matched = {
@@ -147,13 +183,16 @@ class QuailModelExecution:
             survivors = [document for document in anchor_ids
                          if document in matched]
         outputs = {f"ids:{node.anchor}": survivors}
-        for stage, stage_answers in zip(node.stages, answers):
+        partner_lists = stage_partner_lists(group, lists_for, anchor_ids)
+        for stage, stage_answers, members in zip(
+                node.stages, answers, partner_lists):
             outputs[f"join_answers:{stage.written_pos}"] = {
                 "rows": stage_answers,
                 "anchor_index": anchor_ids,
                 "partner_index": inputs["partner_indices"][
                     stage.written_pos
                 ],
+                "anchor_partners": members,
                 "anchor": node.anchor,
                 "partners": list(stage.partners),
                 "semantics": stage.semantics,
@@ -169,19 +208,34 @@ class QuailModelExecution:
                     sum(len(row) for row in stage.values())
                     for stage in answers
                 ),
-                kv_hits=inputs.get("kv_round", {}).get("hits", 0),
-                kv_misses=inputs.get("kv_round", {}).get("misses", 0),
-                regret_tokens=inputs.get("kv_round", {}).get("regret_tokens", 0),
+                kv_hits=kv_round.get("hits", 0),
+                kv_misses=kv_round.get("misses", 0),
                 fresh_tokens=tokens,
+                gpu_s=_gpu_seconds(torch, spans, inputs),
+                chunks=_chunks(spans, inputs),
                 extension={"answers": answers},
             ),
         )
 
 
+def _gpu_seconds(torch, spans, inputs) -> float:
+    """Seconds the loop's forward chunks ran on the GPU; 0.0 unless asked."""
+    if not inputs.get("gpu_timing"):
+        return 0.0
+    # every chunk's answers were read, so its end event has completed
+    torch.cuda.synchronize()
+    return sum(start.elapsed_time(end) for _, start, end in spans) / 1000.0
+
+
+def _chunks(spans, inputs) -> int:
+    """Forward chunks the loop launched; 0 unless timing was asked for."""
+    return len(spans) if inputs.get("gpu_timing") else 0
+
+
 def expected_join_nodes(plan) -> tuple[PhysicalNode, ...]:
     """Return the join nodes selected from Quail's planning estimates."""
     return tuple(
-        node for node in plan.nodes if isinstance(node, (AnchoredJoin, Exchange))
+        node for node in plan.nodes if isinstance(node, (AiJoin, Barrier))
     )
 
 
@@ -190,7 +244,7 @@ def expected_join_stages(plan) -> tuple:
     return tuple(
         stage
         for node in expected_join_nodes(plan)
-        if isinstance(node, AnchoredJoin)
+        if isinstance(node, AiJoin)
         for stage in node.stages
     )
 
@@ -226,6 +280,7 @@ class QuailBackend:
             doc_tokens=context.document_tokens,
             gpus=context.gpu_count,
             order=context.order,
+            pair_fractions=context.pair_fractions,
         )
         if not hasattr(plan, "graph"):
             return (
@@ -253,7 +308,7 @@ class QuailBackend:
         _, filters, joins = collect_operators(region.logical_plan)
         encoded_nodes = []
         for node in plan.nodes:
-            if isinstance(node, PackedFilter):
+            if isinstance(node, AiFilter):
                 predicates = filters[node.alias]
                 questions = tuple(
                     tuple(predicates[stage.written_pos].prompt.tail_token_ids)
@@ -262,7 +317,7 @@ class QuailBackend:
                 if any(not question for question in questions):
                     raise ValueError("filter prompts have no token ids")
                 node = replace(node, question_token_ids=questions)
-            elif isinstance(node, AnchoredJoin):
+            elif isinstance(node, AiJoin):
                 stages = []
                 for stage in node.stages:
                     prompt = joins[stage.written_pos].predicate
@@ -313,7 +368,7 @@ class QuailBackend:
                 "pre_ids": pre_ids,
                 "filter_limit": (
                     None if any(
-                        isinstance(node, AnchoredJoin)
+                        isinstance(node, AiJoin)
                         for node in encoded_nodes
                     ) else region.logical_plan.root.limit
                 ),
