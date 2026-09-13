@@ -1,124 +1,80 @@
 ---
 title: The Quail backend
-description: Pipelining, token-based admission, KV rewind, packed joins, and multi-GPU rounds.
 ---
 
 `QuailBackend` is the default model backend. It owns the scheduler,
-the paged KV arena, retention, KV rewind, and the model calls. This
-page is the short version. The
-[engine wiki](https://github.com/fsdatalab/quail/blob/cursor/reports-dev-f955/reports/engine-wiki.md)
-on the report branch has the long version with pseudocode.
+the paged KV arena, and the model calls.
 
 ## Planning
 
-`QuailBackend.plan` builds one `PhysicalCandidate` from counted
-constants: the model spec, the device spec, and the per document token
-counts. It decides
+The planner builds a physical plan from the model spec, device spec,
+and per-document token counts. It decides:
 
-- the filter order per table (`as_written`, or `by_cost` when every
-  predicate has a selectivity),
-- the anchor of each join by comparing token counts on each side,
-- the chunk token budget and the KV arena budget from the device
-  memory left after the weights,
-- which survivors' KV to keep across stage boundaries,
-- contiguous document shards per GPU when `gpus` is more than one.
+- The filter order per table.
+- The anchor of each join.
+- The forward pass token budget and KV arena budget, based on GPU
+  memory remaining after the model weights.
+- Which document KV to retain across operator boundaries.
+- Document shards per GPU when using multiple GPUs.
 
-A document that cannot fit an empty chunk is refused at plan time, so
-the executor never deadlocks.
+A document that cannot fit in one forward pass is refused at plan
+time.
 
 ## Filters
 
-The filter loop admits documents into each forward pass by two
-budgets, tokens and KV pages. Survivors of the previous stage pack
-first, so residency drains monotonically. Fresh documents fill the
-rest of the chunk in queue order.
+The filter loop fills each forward pass by two budgets: tokens and
+KV pages.
 
-- **Pipelining.** A document that passes stage 1 goes into the next
-  chunk with its stage 2 question. It does not wait for the rest of
-  stage 1.
-- **Token-based admission.** A chunk is full when its token budget or
-  the arena's free pages are used up, not when a request count is
-  reached.
-- **KV rewind.** The document's KV, computed at stage 1, stays in the
-  arena. A later stage adds only the question suffix tokens. The
-  shared question preamble is written next to the document's KV so
-  positions stay correct.
+- **Pipelining.** A document that passes one predicate enters the
+  next forward pass with its next predicate immediately.
+- **Token-based admission.** A forward pass is full when its token
+  budget or the arena's free pages are exhausted.
+- **KV rewind.** The document's KV from the first predicate stays
+  in the arena. Later predicates add only the question suffix tokens.
 
-Pages are freed the moment a document fails a stage or answers its
-last question.
+KV pages are freed when a document fails a predicate or finishes its
+last one.
 
 ## Joins
 
-A join stage packs one anchor's prefix once per chunk and streams its
-partner suffixes past it. All the suffixes in a chunk attend to the
-same anchor pages through a paged cross-attention call. On an H100
-with the 4B model, roughly 30 to 50 suffixes share one anchor per
-forward pass.
+A join packs one anchor document's prefix per forward pass and
+evaluates multiple partner documents against it. All partners in one
+forward pass share the anchor's KV through paged cross-attention.
 
-- **Gating.** Between stages, anchors with no passing pair are dropped
-  and their pages freed. Anchors are gated in groups sized to the
-  arena.
-- **Dedup.** In a chain join, an anchor that matched several partners
-  still appears once in the next stage.
+- **Gating.** Between join stages, anchors with no passing pair are
+  dropped and their pages freed.
 - **Streaming.** The first join group's anchor filter does not finish
   before the join starts. Each document that passes its last filter
-  stage keeps its KV in the arena and goes straight into the join,
-  which pulls one filter chunk at a time until its own chunk can fill.
-  The join frees the KV once the anchor's tuples are answered, so no
-  anchor prefix is computed twice.
-- **Retention.** Later join groups reuse retained filter KV for their
-  anchors. Evicted documents are processed again.
+  keeps its KV and enters the join immediately.
+- **Retention.** Later join groups reuse retained KV for their
+  anchors. If KV was evicted, the document is reprocessed.
 
-The planner uses Selinger-style dynamic programming to choose join order and
-anchors before inference. Filter survival is estimated from selectivities.
-KV reuse is priced as unlimited: a document prefix computed once is free at
-every later anchor use, the same assumption as the speed-of-light estimate.
-
-- A filtered alias whose first use is as an anchor has its chain run right
-  before that group and stream into it. An alias that is a partner first
-  finishes its chain before that group, and its passing document KV waits in
-  one shared pool per GPU.
-- Runtime retention prefers expected prefix computation saved per KV page.
-  Document lengths determine computation and page counts. The saved plan supplies
-  the probability and position of the next use. Exact survivors are known only
-  during execution.
-- Two execution chunks are reserved before allocating retained pages. Active KV
-  cannot be evicted. Prefixes are released when they have no further planned use.
-- Planned `AiJoin` nodes reuse available KV. Missing KV is recomputed.
-- Planned `Barrier` nodes prune actual survivors before the next join group.
-- Execution keeps the planned order even when actual selectivity differs.
+The planner uses dynamic programming (Selinger-style) to choose the
+join order and anchors before inference. Filter survival is estimated
+from the selectivities you provide.
 
 ## The executor
 
-`quail.executor` holds the GPU code and runs in the GPU process:
+`quail.executor` holds the GPU code:
 
-- `pack.py`: `JoinAdmission` for joins and `FilterAdmission` for filters.
-  Both admit work continuously: a chunk mixes stages, and a document
-  or anchor leaves the moment it fails a gate.
-- `arena.py`: the paged KV arena, page accounting plus the tensors.
-- `attention.py`: the forward pass with a two-call attention and a
-  log-sum-exp merge between fresh tokens and arena pages.
-- `loop.py`: `run_filter`, `run_join`, answer readout, and kernel
-  warmup.
-- `model.py`: weight loading through vLLM's loader, retaining only
-  TRUE/FALSE output rows. Shared input embeddings remain available.
+| File | What it does |
+| --- | --- |
+| `pack.py` | Admission logic for filters and joins. |
+| `arena.py` | The paged KV arena and page accounting. |
+| `attention.py` | The forward pass with two-call attention and log-sum-exp merge. |
+| `loop.py` | The overlapped filter and join execution loops. |
+| `model.py` | Weight loading through vLLM's loader. |
 
-The fused kernels assume the Qwen3 architecture: QK-norm before rope,
-gated SiLU MLP, fp8 block-quantized weights.
+The fused kernels assume the Qwen3 architecture: QK-norm before
+RoPE, gated SiLU MLP, FP8 block-quantized weights.
 
-## Several GPUs
+## Multiple GPUs
 
-One Modal container holds one coordinator process and one GPU child
-per H100. Children have their own CUDA context and arena. The parent
-sends payloads over pipes.
+With multiple GPUs, each GPU has its own CUDA context and KV arena.
+A coordinator process sends work over pipes.
 
-- The filter round: each child filters its contiguous shard of every
-  table, reading token values straight from the shared memory mapped
-  file. The parent merges survivors.
-- One join round per `AiJoin`: anchors follow their filter
-  shard; every child receives every surviving partner.
-- An `Barrier` between anchors: the parent thins each table to
-  documents still in a passing pair and re-partitions the new anchor.
-
-Filters split documents. Joins split anchors. Every pair belongs to
-one anchor, so gating stays local to the child that holds the anchor.
+- **Filters**: each GPU filters its own shard of documents.
+- **Joins**: anchors stay on the GPU that filtered them. Every GPU
+  receives every surviving partner document.
+- **Between join groups**: the coordinator prunes survivors and
+  re-partitions the next anchor's documents.

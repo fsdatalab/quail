@@ -1,12 +1,26 @@
 ---
 title: Logical plans
-description: The logical node protocol, the built in nodes, and prompt binding.
 ---
 
-A logical plan says what a query means. Both front ends build one
-through `LogicalPlanBuilder`, so SQL and Python cannot drift.
+A logical plan describes what a query does. Both front ends (SQL and
+the Python builder) produce one through `LogicalPlanBuilder`, so
+they always generate the same plan for the same query.
+
+## Node types
+
+| Node | What it represents |
+| --- | --- |
+| `Scan(provider, alias, column)` | Read one document column from a registered table. |
+| `SemanticFilter(input, predicates)` | One or more AI predicates over one table. |
+| `SemanticJoin(inputs, predicate, semantics, selectivity, anchor)` | An AI join across two or more tables. `semantics` is `full`, `exists`, or `anti`. |
+| `Project(input, columns, limit)` | Column projection and optional limit. Always the root. |
+
+Filters sit directly above their scans. A filter always runs before
+any join that uses its table.
 
 ## The node protocol
+
+All logical nodes implement this protocol:
 
 ```python
 class LogicalNode(Protocol):
@@ -21,58 +35,37 @@ class LogicalNode(Protocol):
     def explain_fields(self) -> dict[str, Any]: ...
 ```
 
-Nodes are frozen dataclasses. Rewrites return new nodes through
+Nodes are frozen dataclasses. Rewrites produce new nodes through
 `with_children` and `with_expressions`. `LogicalPlan.walk()` visits
-children before parents, and `LogicalPlan.validate()` calls every
-node's `validate`.
+children before parents.
 
-## The built in nodes
-
-| Node | Meaning |
-| --- | --- |
-| `Scan(provider, alias, column)` | Which column of which provider supplies the document text for one alias. |
-| `SemanticFilter(input, predicates)` | One or more `FilterPredicate` values over one table, in written order. |
-| `SemanticJoin(inputs, predicate, semantics, selectivity, anchor)` | One n-way join: the cross product of its inputs filtered by one prompt. `semantics` is `full`, `exists`, or `anti`. |
-| `Project(input, columns, limit)` | Column projection. Always the root. |
-
-Filters attach directly above their scans. A filter therefore always
-runs before the joins its table feeds. There is no cost-based pushdown
-decision and no runtime reordering of filters against joins.
-
-## Prompts
+## Prompt binding
 
 A `Prompt` is a bound `PROMPT(...)` call split into three parts:
 
-- `preamble`: the fixed text before the document, `DOCUMENT:` and a
-  newline.
-- `frame`: for joins, the anchor note and the question written once
+- **preamble**: fixed text before the document (`DOCUMENT:` and a
+  newline).
+- **frame**: for joins, the anchor label and question written once
   into the anchor's KV.
-- `tail`: the question and the answer cue.
+- **tail**: the question and the answer cue.
 
-`bind_prompt` handles filters and `bind_join_prompt` handles joins.
-Both move any user text written before the first placeholder to after
-it, so the document's tokens are the same for every question about
-it. That is the property KV rewind depends on. When a tokenizer is
-given, the token counts and token ids of each part are stored on the
-prompt so the planner and the executor never tokenize the same text
-twice.
+`bind_prompt` handles filters. `bind_join_prompt` handles joins.
+Both move any user text written before the first placeholder to
+after it, so the document tokens are the same regardless of the
+question. This is the property that makes KV rewind possible.
+
+When a tokenizer is provided, token counts and ids are stored on the
+prompt so the planner and executor do not re-tokenize.
 
 ## Logical rules
 
 ```python
 class LogicalOptimizerRule(Protocol):
     name: str
-    def rewrite(self, node, context: LogicalPlanningContext) -> LogicalNode | None: ...
+    def rewrite(self, node, context) -> LogicalNode | None: ...
 ```
 
-`apply_logical_rules` walks the plan from children to parent and
-offers every node to every rule. A rule returns a replacement node or
-`None`. The context carries the catalog and the engine config. Quail
-registers no built in logical rules today; the mechanism exists for
-extensions.
-
-## Explain
-
-`Query.explain()` renders the logical tree with the built in nodes
-named and any other node shown by its `type_name` and
-`explain_fields()`.
+`apply_logical_rules` walks the plan bottom-up and offers every
+node to every registered rule. A rule returns a replacement node or
+`None` to leave it unchanged. Quail has no built-in logical rules
+today. The mechanism exists for extensions.

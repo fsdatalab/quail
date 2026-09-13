@@ -1,24 +1,17 @@
 ---
 title: The speed of light model
-description: How the ideal work estimate counts tokens, attention pairs, and KV traffic.
 ---
 
-Speed of light (SoL) is the ideal time for the execution model in this
-document on one GPU. That model runs filters first, then eager binary full
-joins in a left deep order. It assumes unlimited document prefix KV and ideal
-packing across the whole query.
+The speed of light (SoL) estimate is the ideal time for a query on
+one GPU, assuming peak hardware throughput, unlimited KV for document
+prefixes, and no host overhead. It is a lower bound for comparison,
+not an achievable target.
 
-SoL counts modeled arithmetic and memory traffic and omits runtime overhead.
-Those omissions make the estimate optimistic for a chosen plan. The restricted
-join search can also exclude plans that another engine could execute. SoL is a
-comparison point for this execution model. It is not the exact minimum time for
-every possible execution of the query.
+The estimate uses datasheet numbers (peak FLOP/s, HBM bandwidth),
+model dimensions, and a count of the query's work. It has no fitted
+parameters and does not use any measured Quail runtime.
 
-Nothing in it is fitted or measured on a GPU. It uses the datasheet,
-the model dimensions, and a count of the query's work, and it
-borrows no cost model the engine already carries: no roofline out of
-`quail/planner/budgets.py`, no calibration constant, no efficiency factor.
-This keeps the estimate independent of measured Quail runtime.
+See `quail/planner/sol.py` for the implementation.
 
 ## 1. Notation
 

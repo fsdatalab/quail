@@ -1,71 +1,56 @@
 ---
 title: Overview
-description: The layers of the engine and the path one query takes.
 ---
 
-Quail is built like a small database engine. A query is compiled to a
-logical plan, planned into a physical graph, and executed by node
-runtimes. The model-specific parts use a backend interface. A session
-runs the whole query in its process, including inside a Modal GPU function.
+This section describes how Quail works internally. You do not need
+to read it to use Quail. It is here for contributors and for users
+who want to understand what happens between `session.sql(...)` and
+`result.collect()`.
 
-## The query path
+## How a query runs
 
-<Mermaid chart={`
-flowchart TD
-    A[SQL or Python builder] --> B[Logical plan]
-    B --> C[Logical optimizer rules]
-    C --> F[Session: read sources and tokenize into a memory mapped Arrow file]
-    F --> G[Model backend proposes physical candidates]
-    G --> H[Physical rules rewrite the chosen graph]
-    H --> I[Generic runner executes the graph]
-    I --> J[Model nodes run on the GPU executors]
-    I --> K[Recombine, Project, Limit run with Arrow]
-    K --> L[QueryResult: Arrow table + report]
-`} />
+1. The SQL front end or the Python builder produces a **logical plan**
+   of `Scan`, `SemanticFilter`, `SemanticJoin`, and `Project` nodes.
+2. Registered logical rules rewrite the plan (for example, pushing
+   filters below joins).
+3. The session reads Arrow batches from each registered table and
+   tokenizes the document columns into memory-mapped files.
+4. The model backend proposes one or more physical plans with time
+   estimates. The cheapest one is selected.
+5. The runner walks the physical graph in topological order. Model
+   nodes run on the GPU. Relational nodes (Project, Limit,
+   Recombine) run with Arrow.
+6. The result is a `QueryResult` with an Arrow table and an execution
+   report.
 
-1. The SQL front end or the builder produces a `LogicalPlan` of
-   `Scan`, `SemanticFilter`, `SemanticJoin`, and `Project` nodes.
-2. Registered logical rules rewrite the plan.
-3. `Query.run()` calls the in-process executor with the existing query.
-4. The session reads bounded Arrow batches from each registered source.
-5. It writes tokens, document lengths, and projected columns to temporary
-   memory mapped Arrow files.
-6. The selected model backend proposes one or more `PhysicalCandidate`
-   graphs with time estimates. Registered physical planners can add
-   more. The cheapest wins, then physical rules rewrite it.
-7. The generic runner walks the typed graph in topological order and
-   calls the runtime registered for each node type. Model nodes are
-   delegated to the backend's model execution object.
-8. Arrow Acero joins the TRUE answers, applies the projection and
-   limit. The query returns a `QueryResult` with its executed plan and
-   node metrics. Collect the rows before closing the session.
+## Packages
 
-## The layers
+| Package | What it does |
+| --- | --- |
+| `quail.sqlfront` | Parses SQL into a logical plan. |
+| `quail.builder` | Builds logical plans from Python method calls. |
+| `quail.logical` | Logical node types, prompt binding, and rewrite rules. |
+| `quail.physical` | Typed physical nodes with ports and graph validation. |
+| `quail.planner` | Cost model, join ordering, filter ordering, KV retention. |
+| `quail.backends` | The `ModelBackend` protocol and the Quail, vLLM, and SGLang implementations. |
+| `quail.runtime` | Session, query execution, the generic runner, token store, and results. |
+| `quail.executor` | GPU code: token packing, paged KV, attention, the overlapped execution loop. |
+| `quail.specs` | Model and device constants used by the planner. |
+| `quail.extensions` | The per-session extension registry. |
 
-| Layer | Package | Job |
-| --- | --- | --- |
-| Front ends | `quail.sqlfront`, `quail.builder` | Turn SQL or Python calls into one logical plan through the shared `LogicalPlanBuilder`. |
-| Logical plan | `quail.logical`, `quail.logical_optimizer` | Logical node protocol, the four built in nodes, prompt binding, and the rule runner. |
-| Physical plan | `quail.physical` | Typed nodes with ports, graph validation, and codecs for the process boundary. |
-| Planning | `quail.planning`, `quail.planner` | Backend planning inputs, candidates, physical rules, and the Quail cost model. |
-| Backends | `quail.backends` | The `ModelBackend` protocol and the Quail, vLLM, and SGLang implementations. |
-| Runtime | `quail.runtime` | Session, query execution, the generic runner, the token store, and results. |
-| Executor | `quail.executor` | Quail's GPU code: packing, the paged KV arena, attention, the overlapped loop, weight loading. |
-| Specs | `quail.specs` | Model and device constants every planner decision is computed from. |
-| Extensions | `quail.extensions` | The per session registry. |
+## What is in this section
 
-## Extension points
-
-Every built in piece registers through the same registry an extension
-would use. The interfaces are:
-
-- **Logical nodes and rules** describe what a query means and rewrite
-  it.
-- **Physical planners and rules** propose and rewrite typed graphs.
-- **Model backends** plan and run model work. They own their
-  scheduler, KV layout, and model calls. Quail has no public KV
-  interface on purpose.
-- **Table providers** supply schemas and bounded Arrow batches.
-- **Execution observers** record per node metrics.
-
-Each has its own page under [Extending Quail](/docs/extending).
+- [Logical plans](/docs/architecture/logical-plans): the node types
+  and how prompts are bound.
+- [Physical plans](/docs/architecture/physical-plans): typed nodes,
+  ports, and how to edit a plan.
+- [The Quail backend](/docs/architecture/quail-backend): pipelining,
+  token-based admission, KV rewind, and packed joins.
+- [The request backends](/docs/architecture/request-backends): vLLM
+  and SGLang behind the same interface.
+- [In-process execution](/docs/architecture/worker): how a query
+  runs inside its session.
+- [Design decisions](/docs/architecture/design-decisions): why the
+  engine is structured the way it is.
+- [The speed of light model](/docs/architecture/sol-model): how the
+  ideal-work estimate is computed.

@@ -1,64 +1,33 @@
 ---
 title: The request backends
-description: Stock vLLM, pipelined vLLM, and pipelined SGLang behind the same interface.
 ---
 
 Three comparison backends implement the same `ModelBackend` protocol
-as Quail. They accept the same queries and return the same Arrow
-answer relations, so a benchmark changes only `EngineConfig.backend`.
-None of them call Quail's executor.
+as the Quail backend. They exist for benchmarking. They accept the
+same queries and return the same result format, so switching between
+them is one line: `EngineConfig(backend="stock_vllm")`.
 
-| Backend | Filters | Joins |
+| Backend | How filters run | How joins run |
 | --- | --- | --- |
-| `stock_vllm` | Operator-at-a-time execution. Filter 2 starts when every filter 1 request has finished. | One request per tuple, anchor-major order. |
-| `pipelined_vllm` | The next stage's request is submitted as soon as one document passes. | Same as stock. |
-| `pipelined_sglang` | The next stage is submitted on each completion through SGLang's asynchronous API. | One request per tuple, suffix-major order. |
+| `stock_vllm` | One stage at a time. Stage 2 waits for all of stage 1. | One request per pair, anchor-major order. |
+| `pipelined_vllm` | Next stage submitted as soon as a document passes. | Same as stock. |
+| `pipelined_sglang` | Next stage submitted on each completion via SGLang's async API. | One request per pair, partner-major order. |
+
+None of them use Quail's executor or KV arena.
 
 ## Planning
 
-Each backend plans a single `RequestExecution` node. The node holds
-the tokenized prompt parts for every filter and join stage and
-declares the same output ports Quail's nodes declare. Filter order
-uses the same rule as Quail, so a comparison is fair on ordering.
+Each backend produces a single `RequestExecution` physical node
+containing the tokenized prompt parts for every filter and join
+stage. Filter ordering uses the same rule as the Quail backend.
 
 ## Execution
 
-All three are instances of one `RequestBackend` class. It is
-configured with an engine adapter and two submission strategies. The
-adapter (`VLLMEngine` or `SGLangEngine`) boots the engine once per
-container and returns a client with three operations: `generate`,
-`reset_prefix_cache`, and `run_filter_chain`. `RequestModelExecution`
-submits requests according to the strategy and turns the answers into
-the standard Arrow tables. The scheduling loops live in
-`quail.backends.request_scheduling`.
-Both pipelined backends use the same admission calculation with the engine's
-reported KV capacity, page size, and maximum active requests. Each join is
-submitted as one batch. vLLM submits all partners for one anchor before moving
-to the next anchor. SGLang submits all anchors for one partner before moving
-to the next partner. SGLang's order separates requests sharing an anchor so
-earlier requests can populate reusable KV. Answers and cached-token counts
-are returned in anchor-major order for both strategies.
-The engines manage KV allocation
-and request scheduling; the client does not reserve half the KV or wait for
-fixed request slices to finish.
-
-Metrics cover cached tokens, fresh tokens, request counts,
-query time, boot time, and KV capacity.
+All three are instances of one `RequestBackend` class, configured
+with an engine adapter (`VLLMEngine` or `SGLangEngine`) and
+submission strategies. The engine boots once per container and
+provides `generate`, `reset_prefix_cache`, and `run_filter_chain`.
 
 Stock vLLM and pipelined vLLM share one loaded vLLM model when they
-run in the same process. SGLang needs its own Modal image because
-vLLM 0.26.0 and SGLang 0.5.18 require different exact versions of
-`apache-tvm-ffi`; the backend's `runtime_package` attribute tells the
-deployment code which package the backend requires.
-
-## Same GPU comparisons
-
-The QUAIL-B runner runs Quail, stock vLLM, and pipelined vLLM on one
-physical H100 per query family. It runs Quail in one process group,
-stops the whole group, waits for GPU memory to fall under 1 GiB, and
-then runs both vLLM configurations in a second group. It records the
-GPU UUID each group saw and refuses the family if they differ.
-
-SGLang runs in a separate container with the same child-process isolation and
-cleanup checks. Its inference driver cannot block the parent process's Modal
-heartbeat messages.
+run in the same process. SGLang needs its own container because
+vLLM and SGLang require incompatible versions of `apache-tvm-ffi`.
