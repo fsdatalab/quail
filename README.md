@@ -37,11 +37,17 @@ GPU cost, and token work.
 
 ## Query plans
 
-Each `QuerySpec` contains a canonical
+Each `QuerySpec` uses a
 [`substrait.Plan`](https://substrait.io/serialization/binary_serialization/).
-Substrait is a standard protocol-buffer format for relational query plans.
-`query.plan` returns the parsed plan. `query.plan_bytes` contains its
-deterministic binary serialization.
+This plan is the authoritative query representation. Substrait is a standard
+protocol-buffer format for relational query plans. `query.plan` returns the
+parsed plan. `query.plan_bytes` contains the deterministic binary serialization
+produced by the pinned Substrait 0.103 bindings.
+
+Protobuf does not define a canonical byte format across runtime versions.
+The saved `definition_hash` therefore resolves function anchors and hashes the
+validated relations, operators, prompts, and projection. It does not hash the
+raw plan bytes.
 
 QUAIL-B uses standard Substrait relations:
 

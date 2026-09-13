@@ -367,7 +367,7 @@ def build_plan(
     operators: tuple[OperatorSpec, ...],
     select: tuple[str, ...],
 ) -> plan_pb2.Plan:
-    """Build the canonical Substrait plan for a benchmark query."""
+    """Build the Substrait plan for a benchmark query."""
     _validate_components(query_id, relations, operators, select)
     next_anchor = 1
     nodes = {}

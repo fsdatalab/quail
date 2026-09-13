@@ -145,14 +145,41 @@ def test_repeated_tables_and_join_order_round_trip_through_substrait():
     ]
 
 
-def test_query_plan_serialization_and_hash_are_deterministic():
+def test_definition_hash_uses_query_semantics_not_protobuf_bytes():
     original = queries()["IMDB-4"]
     copy = QuerySpec.from_plan(original.id, original.description, original.plan)
 
     assert copy.plan_bytes == original.plan_bytes
     assert _query_hash(copy) == _query_hash(original)
-    changed = QuerySpec.from_plan(original.id, "changed", original.plan)
-    assert _query_hash(changed) != _query_hash(original)
+    different_wire = original.plan
+    different_wire.version.producer = "another-producer"
+    same_query = QuerySpec.from_plan(
+        original.id,
+        original.description,
+        different_wire,
+    )
+    assert same_query.plan_bytes != original.plan_bytes
+    assert _query_hash(same_query) == _query_hash(original)
+    changed_description = QuerySpec.from_plan(
+        original.id,
+        "changed",
+        original.plan,
+    )
+    assert _query_hash(changed_description) == _query_hash(original)
+    changed_prompt = original.plan
+    first_filter = (
+        changed_prompt.relations[0]
+        .root.input.project.input.join.left.filter.input.filter
+    )
+    first_filter.condition.scalar_function.arguments[0].value.literal.string = (
+        "changed"
+    )
+    changed_query = QuerySpec.from_plan(
+        original.id,
+        original.description,
+        changed_prompt,
+    )
+    assert _query_hash(changed_query) != _query_hash(original)
 
 
 def test_ai_extension_definition_is_packaged():

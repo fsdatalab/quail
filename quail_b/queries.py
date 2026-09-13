@@ -1,6 +1,6 @@
 """The QUAIL-B queries as data, for any engine's runner to build.
 
-Each query's canonical representation is a serialized Substrait plan.
+Each query's authoritative representation is a serialized Substrait plan.
 The runner of one engine turns a `QuerySpec` into that engine's query;
 the scoring reads the same plan to know which label answers each
 predicate.
@@ -83,7 +83,7 @@ JOIN_SELECTIVITY_ESTIMATES = {
 
 @dataclass(frozen=True)
 class QuerySpec:
-    """One benchmark query identified by a canonical Substrait plan."""
+    """One benchmark query identified by a Substrait plan."""
 
     id: str
     description: str
@@ -98,8 +98,8 @@ class QuerySpec:
             plan.ParseFromString(self.plan_bytes)
         except DecodeError as error:
             raise ValueError(f"{self.id}: invalid Substrait plan bytes") from error
-        canonical = plan.SerializeToString(deterministic=True)
-        object.__setattr__(self, "plan_bytes", canonical)
+        serialized = plan.SerializeToString(deterministic=True)
+        object.__setattr__(self, "plan_bytes", serialized)
         object.__setattr__(self, "_details", plan_details(plan))
 
     @classmethod
@@ -118,7 +118,7 @@ class QuerySpec:
 
     @property
     def plan(self) -> plan_pb2.Plan:
-        """Return a parsed copy of the canonical Substrait plan."""
+        """Return a parsed copy of the Substrait plan."""
         plan = plan_pb2.Plan()
         plan.ParseFromString(self.plan_bytes)
         return plan

@@ -22,6 +22,7 @@ from quail_b.scoring import (
     implied_rows_mask,
     scores_from_answers,
 )
+from quail_b.substrait import FilterSpec
 
 RUN_SCHEMA_VERSION = 2
 
@@ -34,13 +35,65 @@ def _write_json(path, value):
 
 
 def _query_hash(spec):
-    value = hashlib.sha256()
-    value.update(spec.id.encode())
-    value.update(b"\0")
-    value.update(spec.description.encode())
-    value.update(b"\0")
-    value.update(spec.plan_bytes)
-    return value.hexdigest()
+    plan = spec.plan
+    urns = {
+        extension.extension_urn_anchor: extension.urn
+        for extension in plan.extension_urns
+    }
+    functions = []
+    for declaration in plan.extensions:
+        if not declaration.HasField("extension_function"):
+            continue
+        function = declaration.extension_function
+        functions.append(
+            (
+                urns[function.extension_urn_reference],
+                function.name,
+            )
+        )
+    functions.sort()
+    operators = []
+    for operator in spec.operators:
+        if isinstance(operator, FilterSpec):
+            operators.append({
+                "kind": "filter",
+                "id": operator.id,
+                "relation": operator.relation,
+                "prompt": operator.prompt,
+            })
+        else:
+            operators.append({
+                "kind": "join",
+                "id": operator.id,
+                "relations": operator.relations,
+                "prompt": operator.prompt,
+                "on": operator.on,
+            })
+    definition = {
+        "substrait_version": [
+            plan.version.major_number,
+            plan.version.minor_number,
+            plan.version.patch_number,
+        ],
+        "functions": functions,
+        "relations": [
+            {
+                "alias": relation.alias,
+                "table": relation.table,
+                "text_column": relation.text_column,
+            }
+            for relation in spec.relations
+        ],
+        "operators": operators,
+        "select": spec.select,
+    }
+    encoded = json.dumps(
+        definition,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _save_output(directory, output, spec):
