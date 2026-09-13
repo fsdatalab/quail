@@ -393,10 +393,10 @@ What happened against the prediction:
   predicted, but not on filter chains: stock vLLM recomputes 25 and
   31 percent on IMDB-6 and IMDB-7 (operator-at-a-time execution
   resubmits every survivor after its block cache has turned over),
-  pipelined vLLM 3.5 and 16. On joins stock vLLM recomputes 2 to 11
-  times what Quail does on IMDB-3 to IMDB-7 and is 1.2 to 1.8 times
-  slower there; on FEVER and LEP it is within 10 percent of Quail's
-  count and 1.2 to 2.3 times slower.
+  pipelined vLLM 3.5 and 16. On joins stock vLLM recomputes 5 to 11
+  times what Quail does on IMDB-3 to IMDB-5 and is 1.8 times slower
+  there; on FEVER and LEP it recomputes 10 to 50 percent more than
+  Quail and is 1.2 to 2.3 times slower.
 - SGLang: below Quail on FEV-9 (2,177,762 against 2,279,522; 4.1
   against 4.3 million fresh) and LEP-3 to LEP-7 as predicted, above
   it on FEV-2 and LEP-2. On the IMDB join queries it recomputed 77 to
