@@ -14,7 +14,6 @@ from quail.backends.quail.graph import (
     _join_round_kv,
     _tuple_suffix,
     execute_single_graph,
-    filter_result,
     partner_list_builder,
     stage_partner_lists,
 )
@@ -32,7 +31,7 @@ from quail.physical import (
 )
 from quail.planner import budgets
 from quail.progress import say, set_gpu_index
-from quail.runtime.runner import ExecutionContext
+from quail.runtime.runner import ExecutionContext, SurvivorStream
 from quail.runtime.tokens import (
     DocumentPrefixes,
     chain_tokens,
@@ -517,7 +516,7 @@ def _child_joins(state, sub):
                 "documents": DocumentPrefixes(
                     pre, anchor_docs, range(len(anchor_docs))),
                 "document_ids": anchors_glob,
-                "holder": {},
+                "stream": SurvivorStream(filter_node, anchors_glob),
             }
 
         def anchor_done(a, row):
@@ -559,10 +558,7 @@ def _child_joins(state, sub):
             anchors_glob = [key[1] for key in anchor_keys]
             round_kv = dict(hits=result.metrics.kv_hits,
                             misses=result.metrics.kv_misses)
-            holder = anchor_stream["holder"]
-            chain = filter_result(
-                filter_node, holder["answers"], holder["tokens"],
-                anchor_stream["document_ids"])
+            chain = anchor_stream["stream"].finalized_result()
             answers = chain.outputs[f"filter_answers:{anchor_alias}"]
             filter_out = dict(
                 filters={anchor_alias: {

@@ -334,8 +334,7 @@ def _filter_answer_table(alias, written_positions, answers) -> pa.Table:
     )
 
 
-def _allowed_members(spec, anchor, partners, anchor_ids, members,
-                     pairs) -> list:
+def _allowed_members(anchor, partners, anchor_ids, members, pairs) -> list:
     """Per anchor, the member indices its equality conditions allow."""
     position = partners.index(pair_partner(anchor, partners))
     by_partner = members_by_partner(members, position)
@@ -609,7 +608,7 @@ class RequestModelExecution:
             request_pairs = None
             if spec.written_pos in self.pairs:
                 allowed = _allowed_members(
-                    spec, anchor, partners, anchor_ids, members,
+                    anchor, partners, anchor_ids, members,
                     self.pairs[spec.written_pos])
                 request_pairs = [
                     (anchor_index, member_index)

@@ -22,7 +22,7 @@ from quail.physical import (
     Scan,
     ValueType,
 )
-from quail.runtime.pairs import columns_key, pair_table
+from quail.runtime.pairs import columns_key, pair_ids_table, pair_table
 from quail.runtime.result import (
     IndexRelation,
     QueryResult,
@@ -104,11 +104,16 @@ class NodeResult:
 
 
 @dataclass
+class _SurvivorCompletion:
+    result: NodeResult | None = None
+
+
+@dataclass
 class SurvivorStream:
     """Survivor ids a GPU operator hands its consumer as it produces them.
 
-    The consumer drives the producer's chain and writes what it
-    learned into holder; the producer's finalize reads it back.
+    The consumer drives the producer's chain and completes the stream
+    with the producer's final result.
     transforms are per-batch functions (ids -> kept ids) that
     per-batch Foreign nodes between the producer and the consumer
     added; the consumer runs them on each batch before admission.
@@ -116,8 +121,30 @@ class SurvivorStream:
 
     node: PhysicalNode
     document_ids: Any
-    holder: dict = field(default_factory=dict)
+    completion: _SurvivorCompletion = field(
+        default_factory=_SurvivorCompletion, repr=False)
     transforms: tuple = ()
+
+    def with_transform(self, transform) -> "SurvivorStream":
+        """Return this stream with one more per-batch transform."""
+        return SurvivorStream(
+            self.node,
+            self.document_ids,
+            completion=self.completion,
+            transforms=self.transforms + (transform,),
+        )
+
+    def complete(self, result: NodeResult) -> None:
+        """Store the producer result after the consumer finishes."""
+        if self.completion.result is not None:
+            raise RuntimeError("survivor stream was completed twice")
+        self.completion.result = result
+
+    def finalized_result(self) -> NodeResult:
+        """Return the completed producer result."""
+        if self.completion.result is None:
+            raise RuntimeError("survivor stream was not completed")
+        return self.completion.result
 
 
 @dataclass
@@ -499,13 +526,6 @@ class ForeignRuntime:
                 output_rows=counters["output_rows"],
                 extension={"calls": counters["calls"]})
 
-        def pair_table(pairs):
-            left, right = node.aliases
-            return pa.table({
-                left: pa.array([a for a, _ in pairs], type=pa.int32()),
-                right: pa.array([b for _, b in pairs], type=pa.int32()),
-            })
-
         streams = {alias: value for alias, value in values.items()
                    if isinstance(value, SurvivorStream)}
         if len(streams) > 1:
@@ -521,7 +541,10 @@ class ForeignRuntime:
                 ids_by_alias[alias] = list(value)
             result = call(ids_by_alias)
             if node.ids == "pairs":
-                outputs = {f"pairs:{node.written_pos}": pair_table(result)}
+                outputs = {
+                    f"pairs:{node.written_pos}":
+                        pair_ids_table(*node.aliases, result)
+                }
             else:
                 outputs = {f"ids:{node.aliases[0]}": result}
             return NodeResult(outputs, metrics())
@@ -550,7 +573,8 @@ class ForeignRuntime:
             def finalize():
                 ordered = produced if stream_alias == node.aliases[0] \
                     else [(b, a) for a, b in produced]
-                return NodeResult({port: pair_table(ordered)}, metrics())
+                return NodeResult(
+                    {port: pair_ids_table(*node.aliases, ordered)}, metrics())
         else:
             def batch(ids):
                 kept = call({stream_alias: ids})
@@ -558,9 +582,7 @@ class ForeignRuntime:
                 return kept
 
             port = f"ids:{stream_alias}"
-            outputs = {port: SurvivorStream(
-                stream.node, stream.document_ids, stream.holder,
-                stream.transforms + (batch,))}
+            outputs = {port: stream.with_transform(batch)}
 
             def finalize():
                 return NodeResult({port: sorted(produced)}, metrics())

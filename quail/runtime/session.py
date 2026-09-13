@@ -17,7 +17,12 @@ from quail.builtins import built_in_registry
 from quail.catalog import Catalog, ScanRequest, TableProvider
 from quail.execution import PhysicalRequest, document_input
 from quail.extensions import ExtensionRegistry
-from quail.logical import CompileError, LogicalPlan, join_conditions
+from quail.logical import (
+    CompileError,
+    LogicalPlan,
+    join_conditions,
+    oriented_join_conditions,
+)
 from quail.logical_optimizer import LogicalPlanningContext, apply_logical_rules
 from quail.physical import PortRef, Project, Scan, ValueType, encode_graph
 from quail.planner import collect_applies, collect_operators, explain, plan_query
@@ -559,19 +564,20 @@ class Query:
         providers = {scan.alias: scan.provider for scan in scans}
         fractions = {}
         for position, join in enumerate(joins):
-            conditions = join_conditions(join)
-            if not conditions:
+            oriented = oriented_join_conditions(join)
+            if oriented is None:
                 continue
-            left_alias, right_alias = conditions[0].aliases()
-            left_keys, right_keys = [], []
-            for condition in conditions:
-                left, right = condition.left, condition.right
-                if left.alias != left_alias:
-                    left, right = right, left
-                left_keys.append(self.session.column_values(
-                    providers[left.alias], left.column))
-                right_keys.append(self.session.column_values(
-                    providers[right.alias], right.column))
+            left_alias, right_alias, conditions = oriented
+            left_keys = [
+                self.session.column_values(
+                    providers[left.alias], left.column)
+                for left, _ in conditions
+            ]
+            right_keys = [
+                self.session.column_values(
+                    providers[right.alias], right.column)
+                for _, right in conditions
+            ]
             fractions[position] = pair_fraction(
                 pair_table(left_alias, left_keys, right_alias, right_keys),
                 len(self._doc_tokens[left_alias]),

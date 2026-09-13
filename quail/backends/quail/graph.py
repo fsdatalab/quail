@@ -268,7 +268,7 @@ def prepare_model_inputs(node, inputs, context: ExecutionContext):
         anchor_stream = {
             "node": stream.node,
             **filter_inputs(state, stream.node, stream.document_ids),
-            "holder": stream.holder,
+            "stream": stream,
         }
 
     def anchor_done(local_index, row):

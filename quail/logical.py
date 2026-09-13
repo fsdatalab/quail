@@ -582,6 +582,21 @@ def join_conditions(join: "SemanticJoin") -> tuple:
     return tuple(conditions)
 
 
+def oriented_join_conditions(join: "SemanticJoin") -> tuple | None:
+    """Return one alias order and every equality oriented to that order."""
+    conditions = join_conditions(join)
+    if not conditions:
+        return None
+    left_alias, right_alias = conditions[0].aliases()
+    oriented = []
+    for condition in conditions:
+        left, right = condition.left, condition.right
+        if left.alias != left_alias:
+            left, right = right, left
+        oriented.append((left, right))
+    return left_alias, right_alias, tuple(oriented)
+
+
 def join_applies(join: "SemanticJoin") -> tuple:
     """The Apply nodes that return pairs for one SemanticJoin."""
     applies = []

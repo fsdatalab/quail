@@ -56,14 +56,11 @@ class FixedFeverAnswers:
         if isinstance(node, AiFilter):
             self.filters.append((node.alias, inputs["retain_survivors"]))
             if node.pin_survivors:
-                # the consuming join runs the chain and fills the holder
                 stream = SurvivorStream(node, inputs["document_ids"])
                 return NodeResult(
                     {f"ids:{node.alias}": stream,
                      f"filter_answers:{node.alias}": {}},
-                    finalize=lambda: filter_result(
-                        node, stream.holder["answers"],
-                        stream.holder["tokens"], stream.document_ids))
+                    finalize=stream.finalized_result)
             document_ids = list(inputs["document_ids"])
             answers, live = self._answers(document_ids)
             if inputs["retain_survivors"]:
@@ -81,11 +78,9 @@ class FixedFeverAnswers:
         if stream is None:
             anchor_ids = inputs["anchor_ids"]
         else:
-            # the anchor's chain runs inside the join; like the real
-            # driver, fill the holder and append each streamed anchor's
-            # key and prefix
             answers, anchor_ids = self._answers(list(stream["document_ids"]))
-            stream["holder"].update(answers=answers, tokens=0)
+            stream["stream"].complete(filter_result(
+                stream["node"], answers, 0, stream["document_ids"]))
             keys = [(node.anchor, document) for document in anchor_ids]
             if inputs.get("anchor_batch") is not None:
                 # like the real driver: per-batch functions run on each

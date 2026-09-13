@@ -103,29 +103,12 @@ class DistributedQuailExecution:
 
         document_ids = next(iter(inputs.values()))
         if node.pin_survivors:
-            # filled by the join round that consumes this chain
             stream = SurvivorStream(node, list(document_ids))
-
-            def finalize():
-                answers = stream.holder["answers"]
-                survivors = stream.holder["survivors"]
-                return NodeResult(
-                    {
-                        f"ids:{node.alias}": survivors,
-                        f"filter_answers:{node.alias}": answers,
-                    },
-                    NodeMetrics(
-                        input_rows=len(stream.document_ids),
-                        output_rows=len(survivors),
-                        evaluated_documents=len(answers),
-                        fresh_tokens=stream.holder["fresh_tokens"],
-                    ),
-                )
 
             return NodeResult(
                 {f"ids:{node.alias}": stream,
                  f"filter_answers:{node.alias}": {}},
-                finalize=finalize,
+                finalize=stream.finalized_result,
             )
         shards = self.shards
         complete = (
@@ -234,11 +217,20 @@ class DistributedQuailExecution:
                 }
                 for output in outputs
             ])
-            stream.holder.update(
-                answers=merged["filters"].get(node.anchor, {}),
-                survivors=merged["survivors"].get(node.anchor, []),
-                fresh_tokens=merged["fresh_tokens"],
-            )
+            answers = merged["filters"].get(node.anchor, {})
+            survivors = merged["survivors"].get(node.anchor, [])
+            stream.complete(NodeResult(
+                {
+                    f"ids:{node.anchor}": survivors,
+                    f"filter_answers:{node.anchor}": answers,
+                },
+                NodeMetrics(
+                    input_rows=len(stream.document_ids),
+                    output_rows=len(survivors),
+                    evaluated_documents=len(answers),
+                    fresh_tokens=merged["fresh_tokens"],
+                ),
+            ))
         stage_outputs = coordinator.merge_join_round(outputs)
         hits = 0
         misses = 0

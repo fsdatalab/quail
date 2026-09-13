@@ -52,6 +52,15 @@ def pair_table(left_alias: str, left_keys, right_alias: str,
         [(left_alias, "ascending"), (right_alias, "ascending")])
 
 
+def pair_ids_table(left_alias: str, right_alias: str, pairs) -> pa.Table:
+    """Build an int32 pair table from row-id tuples."""
+    rows = list(pairs)
+    return pa.table({
+        left_alias: pa.array([left for left, _ in rows], type=pa.int32()),
+        right_alias: pa.array([right for _, right in rows], type=pa.int32()),
+    })
+
+
 def pair_partner(anchor: str, partners) -> str:
     """The partner alias a pair stage pairs with its anchor."""
     if len(partners) != 1:

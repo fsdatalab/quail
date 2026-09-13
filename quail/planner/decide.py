@@ -13,6 +13,7 @@ from quail.logical import (
     SemanticFilter,
     SemanticJoin,
     join_conditions,
+    oriented_join_conditions,
 )
 from quail.physical import (
     AiFilter,
@@ -243,20 +244,18 @@ def hash_join_nodes(joins, pair_fractions, scan_ports) -> list:
     by_alias = {port.port.split(":", 1)[1]: port for port in scan_ports}
     nodes = []
     for position, join in enumerate(joins):
-        conditions = join_conditions(join)
-        if not conditions:
+        oriented = oriented_join_conditions(join)
+        if oriented is None:
             continue
-        left, right = conditions[0].aliases()
-        on = []
-        for condition in conditions:
-            first, second = condition.left, condition.right
-            if first.alias != left:
-                first, second = second, first
-            on.append((first.column, second.column))
+        left, right, conditions = oriented
+        on = tuple(
+            (left_ref.column, right_ref.column)
+            for left_ref, right_ref in conditions
+        )
         nodes.append(HashJoin(
             node_id=f"hash_join:{left}-{right}",
             inputs=input_ports((by_alias[left], by_alias[right])),
-            left=left, right=right, on=tuple(on), written_pos=position,
+            left=left, right=right, on=on, written_pos=position,
             pair_fraction=pair_fractions.get(position, 1.0)))
     return nodes
 

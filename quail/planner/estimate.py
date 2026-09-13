@@ -21,7 +21,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Callable, Mapping
 
-from quail.logical import join_conditions
+from quail.logical import oriented_join_conditions
 from quail.planner import budgets
 from quail.planner.decide import (
     collect_operators,
@@ -205,17 +205,18 @@ class _Search:
         # joins without conditions are absent: every pair
         self.allowed_pairs: dict[int, dict[str, dict[int, set[int]]]] = {}
         for position, join in enumerate(self.joins):
-            conditions = join_conditions(join)
-            if not conditions:
+            oriented = oriented_join_conditions(join)
+            if oriented is None:
                 continue
-            left_alias, right_alias = conditions[0].aliases()
-            left_keys, right_keys = [], []
-            for condition in conditions:
-                left, right = condition.left, condition.right
-                if left.alias != left_alias:
-                    left, right = right, left
-                left_keys.append(stores[left.alias].column(left.column))
-                right_keys.append(stores[right.alias].column(right.column))
+            left_alias, right_alias, conditions = oriented
+            left_keys = [
+                stores[left.alias].column(left.column)
+                for left, _ in conditions
+            ]
+            right_keys = [
+                stores[right.alias].column(right.column)
+                for _, right in conditions
+            ]
             pairs = pair_table(left_alias, left_keys, right_alias, right_keys)
             by_side = {left_alias: {}, right_alias: {}}
             for left_row, right_row in zip(

@@ -85,20 +85,14 @@ class QuailModelExecution:
         if isinstance(node, AiFilter):
             document_ids = inputs["document_ids"]
             if node.pin_survivors:
-                # filled by the join that consumes this chain
                 stream = SurvivorStream(node, document_ids)
-
-                def finalize():
-                    return filter_result(
-                        node, stream.holder["answers"],
-                        stream.holder["tokens"], document_ids)
 
                 return NodeResult(
                     outputs={
                         f"ids:{node.alias}": stream,
                         f"filter_answers:{node.alias}": {},
                     },
-                    finalize=finalize,
+                    finalize=stream.finalized_result,
                 )
             retain_survivors = inputs.get("retain_survivors", ())
             if retain_survivors is False:
@@ -162,8 +156,12 @@ class QuailModelExecution:
             # admission order; a per-batch function may have dropped some
             anchor_ids = [key[1] for key in inputs["anchor_keys"]]
             kv_round = {"hits": len(anchor_ids), "misses": 0}
-            stream["holder"].update(
-                answers=source.answers, tokens=source.tokens)
+            stream["stream"].complete(filter_result(
+                filter_node,
+                source.answers,
+                source.tokens,
+                stream["document_ids"],
+            ))
         else:
             anchor_ids = list(inputs["anchor_ids"])
             kv_round = inputs.get("kv_round") or {}
