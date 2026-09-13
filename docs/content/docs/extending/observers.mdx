@@ -2,81 +2,64 @@
 title: Observers
 ---
 
-An observer runs after each physical node executes. Use observers
-for logging, progress reporting, or collecting custom metrics during
-query execution.
+Observers let you run code after each physical node executes. The
+runner calls every registered observer once per node, in execution
+order.
 
-## Reading metrics without an observer
+## When you need one
 
-Every finished query carries per-node metrics on the result:
+Most of the time, `result.report` and `result.node_metrics` have
+everything you need after a query finishes (see
+[Metrics](/docs/user-guide/metrics)). Use an observer when you need
+something to happen *during* execution, for example logging progress
+or streaming metrics to an external system.
 
-```python
-result = query.run()
-result.node_metrics         # node id -> NodeMetrics
-print(result.explain())     # prints the plan with measured metrics
-```
-
-`NodeMetrics` fields: `wall_s`, `input_rows`, `output_rows`,
-`evaluated_documents`, `evaluated_document_pairs`, `fresh_tokens`,
-`cached_tokens`, `kv_hits`, `kv_misses`, `kv_removals`,
-`kv_recomputations`, `peak_gpu_bytes`, and an `extension` dict.
-
-For most use cases, reading `result.node_metrics` after the query
-is sufficient. Observers are for when something needs to happen
-during execution.
-
-## The observer protocol
+## Protocol
 
 ```python
 class ExecutionObserver(Protocol):
     name: str
-    def after_node(self, node: PhysicalNode, result: NodeResult) -> None: ...
+    def after_node(self, node, result) -> None: ...
     def report(self) -> Mapping[str, Any]: ...
 ```
 
+- `after_node` receives the physical node and its output after
+  execution. It cannot modify values.
+- `report` returns a dict that is attached to
+  `result.report["observers"][name]` after the query finishes.
+
 Source:
-[quail/runtime/runner.py](https://github.com/fsdatalab/quail/blob/main/quail/runtime/runner.py).
+[`quail/runtime/runner.py`](https://github.com/fsdatalab/quail/blob/main/quail/runtime/runner.py).
 
-`after_node` is called once per physical node, in execution order,
-with the node's outputs and metrics. The observer cannot modify
-values. `report()` is called after execution and attached to
-`result.report["observers"]`.
-
-## Example: logging progress
+## Example
 
 ```python
 import logging
 
-
-class Progress:
-    name = "my.progress"
+class ProgressObserver:
+    name = "progress"
 
     def __init__(self):
-        self.seen = []
+        self.log = []
 
     def after_node(self, node, result):
-        self.seen.append(node.node_id)
-        logging.info("%s done in %.2fs", node.node_id,
-                     result.metrics.wall_s)
+        logging.info("%s: %.2fs", node.node_id, result.metrics.wall_s)
+        self.log.append(node.node_id)
 
     def report(self):
-        return {"nodes_executed": list(self.seen)}
+        return {"nodes": self.log}
 ```
 
 ## Registration
 
-Register the class (the runner creates a fresh instance per query):
+Register the class on the session's registry. The runner creates a
+fresh instance for each query.
 
 ```python
-registry = (
-    quail.ExtensionRegistry.with_built_ins()
-    .register_observer(Progress)
-)
-```
+registry = quail.ExtensionRegistry.with_built_ins()
+registry.register_observer(ProgressObserver)
 
-Read the report after execution:
-
-```python
-result = query.run()
-result.report["observers"]["my.progress"]["nodes_executed"]
+session = quail.Session(config=config, registry=registry)
+result = session.sql(..., dialect="snowflake").run()
+result.report["observers"]["progress"]  # {"nodes": ["ai_filter:r", ...]}
 ```

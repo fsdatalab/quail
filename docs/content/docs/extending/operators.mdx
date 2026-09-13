@@ -75,17 +75,27 @@ runtime, and planner.
 
 ## Planning
 
-The planner estimates the cost of each operator using the
-[roofline model](/docs/architecture/planning#the-roofline-speed-of-light-model).
-For `AI.CLASSIFY`, the cost model would need to account for decode
-steps (generating multiple tokens) in addition to the prefill step
-that `AI_FILTER` uses.
+Adding a new operator to the planner means teaching the existing
+Quail backend how to plan and cost the new node. Concretely:
 
-The existing planner for `AI_FILTER` is in
-[`quail/planner/decide.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/decide.py).
-A new operator would follow the same pattern: count the expected
-tokens, pairs, and KV traffic, and return a `PhysicalCandidate` with
-the estimated time.
+1. **Work counting.** Add a function that counts fresh tokens,
+   attention pairs, KV written, and KV read for the new operator.
+   For `AI.CLASSIFY`, the prefill work per document is the same as
+   `AI_FILTER`. The difference is decode: generating each label
+   token is an additional forward pass that attends to all previous
+   tokens. See
+   [`quail/planner/work.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/work.py).
+2. **Cost estimation.** Pass the work counts through the
+   [roofline model](/docs/architecture/planning#the-roofline-speed-of-light-model)
+   to get estimated seconds. See
+   [`quail/planner/sol.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/sol.py).
+3. **Graph construction.** Include the new physical node in the graph
+   the planner builds. The planner in
+   [`quail/planner/decide.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/decide.py)
+   constructs the full physical graph (scans, filters, joins,
+   barriers, projection) and returns a `PhysicalCandidate` with the
+   graph and estimated time. The new node would be placed in the
+   graph alongside the existing node types.
 
 ## Optional: logical and physical rules
 
