@@ -45,9 +45,7 @@ The recorded 2026-08-30 runs used prefixes "discrepancy" and
 "ringfix" through this cell's predecessor
 (experiments/discrepancy_timeline.py, which hardcoded the two queries
 and their windows). Their reports were removed on 2026-09-06; the data
-stays under /results/ablations/ on the quail-results volume, and the
-KV retention change they led to is described in
-reports/shipped_features/2026-08-30-scan-ring-retention.md.
+stays under /results/ablations/ on the quail-results volume.
 """
 
 import json

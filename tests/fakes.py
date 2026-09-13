@@ -93,7 +93,8 @@ def fake_torch():
     return SimpleNamespace(
         inference_mode=nullcontext,
         cuda=SimpleNamespace(
-            Event=lambda **kw: SimpleNamespace(record=lambda: None),
+            Event=lambda **kw: SimpleNamespace(
+                record=lambda: None, elapsed_time=lambda other: 2.0),
             synchronize=lambda: None,
             max_memory_allocated=lambda: 0))
 

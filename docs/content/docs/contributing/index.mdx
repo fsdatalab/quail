@@ -12,19 +12,19 @@ description: Where things live and how to check a change.
 | `quail_ext_examples/` | Example extensions. |
 | `tests/` | CPU tests. They fake the GPU and run in seconds. |
 | `experiments/` | Every Modal entry point that costs GPU time: ablation and profiling scripts, and the smokes, probes, and gates under `experiments/cells/`. |
-| `reports/` | Experiment reports, plot scripts, PNGs, `shipped_features/`, and `engine-wiki.md`. Experiment data lives on the `quail-results` volume, not in git. |
 | `docs/` | This documentation site, including the design decisions and the speed of light model. |
 
 ## Checks
 
 ```bash
-uv run pytest
-uv run ruff check quail tests experiments
+uv run ruff check quail tests experiments tools
+uv run python tools/check_long_strings.py
 uv run vulture
+uv run pytest -q
 ```
 
 `vulture` reports unused code in `quail/` at 70 percent confidence.
-Keep all three clean before pushing.
+Keep all four checks clean before pushing.
 
 ## Running a GPU cell
 
@@ -39,6 +39,10 @@ uv run modal run experiments/cells/session_smoke.py 2>&1 | tee results/session_s
 Print the function call id and keep it in the tee file. Pull a result
 later with `modal.FunctionCall.from_id(id).get()` rather than writing
 Modal return values to local JSON.
+
+Historical experiment reports and plots live on the
+`cursor/reports-dev-f955` branch. Feature branches that target `main`
+do not add a report.
 
 ## Adding a page here
 

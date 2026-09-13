@@ -41,7 +41,7 @@ docstrings, reports, PR bodies, and these docs.
 
 ## Scope
 
-Filter queries and joins only, Qwen3 4B fp8 or Qwen3 32B fp8, one
-H100 per model copy. Maps, classification, speculation, and forking
-were removed on purpose. Do not add them back without being asked. If
-a change needs one of them, say so instead.
+The current runtime supports filter queries and joins, Qwen3 4B fp8
+or Qwen3 32B fp8, and one H100 per model copy. `AI.CLASSIFY`,
+`AI.EXTRACT`, and `AI.MAP` are on the roadmap. Open-ended generation,
+speculation, and forking are not part of the current runtime.

@@ -1,0 +1,32 @@
+---
+title: Release
+description: Publish quail-engine to PyPI with trusted publishing.
+---
+
+The PyPI distribution is `quail-engine`. Users import it as `quail`.
+Releases use PyPI trusted publishing, so the repository does not store an
+API token.
+
+## First release
+
+Before the first release:
+
+1. Create a protected GitHub environment named `pypi`.
+2. Add a pending publisher in the
+   [PyPI publishing settings](https://pypi.org/manage/account/publishing/):
+   - PyPI project: `quail-engine`
+   - GitHub owner: `fsdatalab`
+   - GitHub repository: `quail`
+   - Workflow: `publish.yml`
+   - Environment: `pypi`
+
+## Publish a version
+
+Start from a clean `main` branch that matches `origin/main`:
+
+```bash
+tools/release.sh 0.1.0
+```
+
+The script sets and checks the version, then pushes the matching tag. GitHub
+Actions builds with `uv build --no-sources` and publishes with `uv publish`.

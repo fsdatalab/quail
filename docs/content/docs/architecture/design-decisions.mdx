@@ -13,8 +13,9 @@ Quail supports model filters and joins over document collections.
 The built in models are Qwen3 4B fp8 and Qwen3 32B fp8. Each GPU owns one model
 copy. Quail does not split one model across several GPUs.
 
-The redesign does not add maps, open ended generation, classification,
-speculation, or forking.
+The current runtime does not include `AI.CLASSIFY`, `AI.EXTRACT`, or
+`AI.MAP`; they are on the roadmap. Open-ended generation, speculation,
+and request forking are outside the current design.
 
 ## Main boundaries
 

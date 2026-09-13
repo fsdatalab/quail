@@ -316,3 +316,16 @@ def test_session_plans_prices_and_ships_the_pair_table():
         assert estimate.join_stages[0]["passing_pairs"] == 2
         assert quail.speed_of_light_estimate(
             cross, answer).join_pair_evaluations == 12
+
+
+def test_gpu_seconds_reach_the_result_report(sess):
+    truth = {"r": {"q1:": [1, 0, 1, 0, 1, 0], "q2:": [1, 1, 1, 1, 1, 1]}}
+    executor = make_executor(truth)
+
+    def timed(request):
+        response = executor(request)
+        response.metrics["gpu_s"] = 0.75
+        return response
+
+    assert "gpu_s" not in _run(sess.sql(FILTER_SQL), executor).report
+    assert _run(sess.sql(FILTER_SQL), timed).report["gpu_s"] == 0.75

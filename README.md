@@ -1,74 +1,100 @@
 # Quail
 
-Quail is a query engine for language-model filters and joins over documents.
-Write a query in SQL or Python. Quail plans all model calls together so they
-can share work on the GPU.
+Quail is a query engine for running language-model operations over document
+collections. You write the analysis in SQL or Python. Quail plans the complete
+query before it starts inference, then schedules the model work so repeated
+document prefixes can share KV and each forward pass stays full.
+
+**Today:** `AI_FILTER`, AI joins, `EXISTS`, and `NOT EXISTS` with Qwen3 4B fp8
+or Qwen3 32B fp8 on H100s.
+
+**On the roadmap:** `AI.CLASSIFY`, `AI.EXTRACT`, and `AI.MAP`.
 
 [Quickstart](docs/content/docs/user-guide/quickstart.mdx) ·
-[SQL reference](docs/content/docs/user-guide/sql.mdx) ·
-[Python API](docs/content/docs/user-guide/python-api.mdx) ·
+[SQL](docs/content/docs/user-guide/sql.mdx) ·
+[Python](docs/content/docs/user-guide/python-api.mdx) ·
 [Architecture](docs/content/docs/architecture/index.mdx) ·
 [QUAIL-B](https://github.com/fsdatalab/quail-bench)
 
-## What Quail does
+## Why Quail?
 
-AI functions in data warehouses usually send one model request for each row.
-That approach cannot share model work across predicates or query stages.
-Quail sees the complete query first and schedules its filters and joins as one
-job.
+Suppose we want to analyze the 448,000 comments in the Jigsaw Civil Comments
+dataset. First, we ask a model which comments are toxic. For each comment that
+passes, we ask 31 more questions about toxicity type, identity references, and
+moderator decisions.
 
-```python
-import quail
+A request-at-a-time system treats every question as separate work. It
+processes the same comment tokens again for later questions, waits for the
+whole filter to finish before starting the join, and groups requests by count
+even when their documents have very different lengths.
 
-with quail.Session() as session:
-    session.register(
-        "reviews",
-        quail.DocumentProvider.from_table(reviews, id_col="id"),
-    )
-    result = session.sql("""
-        SELECT r.id
-        FROM reviews r
-        WHERE AI_FILTER(PROMPT(
-            'Does the review in DOCUMENT {0} praise the movie?',
-            r.body
-        ))
-    """).run()
-    rows = result.collect()
+Quail treats the analysis as one query. The planner sees the filter, its
+expected survivors, the 31-way join, each document's token count, and the
+available GPU memory before execution begins.
+
+```sql
+SELECT c.comment_id, f.field
+FROM comments c
+JOIN fields f
+  ON AI_FILTER(PROMPT(
+       'Does the description in DOCUMENT {1} apply to '
+       'the comment in DOCUMENT {0}?',
+       c.text,
+       f.statement
+     ))
+WHERE AI_FILTER(PROMPT(
+  'Is the comment in DOCUMENT {0} hateful, threatening, or abusive?',
+  c.text
+))
 ```
 
-The model answers each predicate with one token: `TRUE` or `FALSE`. Quail
-supports filters over one table and AI joins across two or more tables. It
-does not run open-ended generation, classification, or extraction.
+The model answers each predicate with one constrained token: `TRUE` or
+`FALSE`. The query returns an Arrow table of matching comment and field pairs,
+along with query time, token counts, selectivity, KV use, and GPU cost.
 
-## Why plan the whole query?
+The complete example is in
+[`demos/civil_comments_join.py`](demos/civil_comments_join.py).
 
-- **Pipelining:** a document starts its next predicate as soon as it passes
-  the current one.
-- **Token-based admission:** each forward pass is filled by token count and
-  available KV, rather than by request count.
-- **KV rewind:** Quail keeps a document's KV on the GPU and reuses it for the
-  document's later predicates.
-- **Packed joins:** one anchor document shares its KV across many join
-  partners in the same forward pass.
+## How it works
+
+Quail combines four execution techniques:
+
+1. **Pipelining.** A comment that passes the toxicity filter can enter the join
+   immediately. It does not wait for every other comment to finish the filter.
+2. **Token-based admission.** Quail fills each forward pass by token count and
+   available KV, rather than by request count.
+3. **KV rewind.** The comment prefix stays on the GPU while Quail asks its
+   later questions. Only the new question tokens need fresh computation.
+4. **Packed joins.** One anchor document shares its KV across many join
+   partners in the same forward pass.
 
 KV is the attention key and value tensors stored for tokens the model has
 already processed.
 
-## Install and run
+## Install
 
-Quail currently installs from this repository. It requires Python 3.12.
-Model execution requires a CUDA GPU. The supported models are Qwen3 4B fp8
-and Qwen3 32B fp8, with one model copy per GPU.
+Quail requires Python 3.12. The package distribution is named
+`quail-engine`, and the Python package is `quail`. Until the first package
+release, install from the repository:
 
 ```bash
 git clone https://github.com/fsdatalab/quail.git
 cd quail
 uv sync
+```
+
+Model execution requires an H100. Each GPU holds one model copy; Quail does
+not split one model across several GPUs.
+
+## Run the quickstart
+
+On an H100 machine:
+
+```bash
 uv run python demos/quickstart.py
 ```
 
-The quickstart runs QUAIL-B's IMDB-1 query over 100 reviews. To use a Modal
-H100 instead of a local GPU:
+From any machine, submit the same query to a Modal H100:
 
 ```bash
 uv run modal setup
@@ -77,27 +103,31 @@ uv run modal run demos/quickstart_modal.py \
   2>&1 | tee results/quickstart.log
 ```
 
-See [Running on Modal](docs/content/docs/user-guide/compute.mdx) for the
-complete setup.
+The example runs QUAIL-B's IMDB-1 query over 100 published reviews. See the
+[quickstart](docs/content/docs/user-guide/quickstart.mdx) to inspect the query,
+result, plan, and execution report.
 
-## Documentation
+## Current scope and roadmap
 
-| Guide | Use it to |
-| --- | --- |
-| [Quickstart](docs/content/docs/user-guide/quickstart.mdx) | Run a filter and inspect its rows, plan, and execution report. |
-| [SQL reference](docs/content/docs/user-guide/sql.mdx) | See the supported `AI_FILTER`, join, and `EXISTS` syntax. |
-| [Python API](docs/content/docs/user-guide/python-api.mdx) | Build the same queries without SQL. |
-| [Data sources](docs/content/docs/user-guide/data-sources.mdx) | Register Arrow, Parquet, or Hugging Face tables. |
-| [Results and explain](docs/content/docs/user-guide/results.mdx) | Read output tables, metrics, and physical plans. |
-| [Architecture](docs/content/docs/architecture/index.mdx) | Follow a query from parsing through GPU execution. |
-| [Extending Quail](docs/content/docs/extending/index.mdx) | Add providers, plan rules, backends, or observers. |
+Quail currently runs true-or-false filters and joins through Snowflake-style
+`AI_FILTER`, BigQuery-style `AI.IF`, or the Python builder. It reads Arrow,
+Parquet, and Hugging Face tables and returns Arrow results.
 
-## Benchmark
+The next operators expand what a model call can return:
+
+- `AI.CLASSIFY` returns one label from a declared set.
+- `AI.EXTRACT` returns typed fields from a document.
+- `AI.MAP` returns a typed value for each input row.
+
+These operators are planned, not implemented. Open-ended generation,
+speculation, and request forking are not part of the current runtime.
+
+## Evaluation
 
 [QUAIL-B](https://github.com/fsdatalab/quail-bench) provides 33 filter and
-join queries, datasets, reference labels, and scoring. Quail's benchmark
-runner compares the same queries with stock vLLM using operator-at-a-time
-execution and with pipelined vLLM.
+join queries, their datasets, reference labels, and scoring. The runner
+compares Quail with stock vLLM using operator-at-a-time execution and with
+pipelined vLLM on the same query definitions.
 
 ```bash
 uv run modal run --detach -m quail.bench.quailb_parallel \
@@ -106,19 +136,32 @@ uv run modal run --detach -m quail.bench.quailb_parallel \
   2>&1 | tee results/quailb.log
 ```
 
-See [Running QUAIL-B](docs/content/docs/user-guide/benchmark.mdx) for saved
-results, report generation, and baseline options.
+See [Running QUAIL-B](docs/content/docs/user-guide/benchmark.mdx) for report
+generation, metric definitions, and baseline options.
+
+## Documentation
+
+| If you want to… | Start here |
+| --- | --- |
+| Run one query | [Quickstart](docs/content/docs/user-guide/quickstart.mdx) |
+| Write filters and joins in SQL | [SQL reference](docs/content/docs/user-guide/sql.mdx) |
+| Build queries in Python | [Python API](docs/content/docs/user-guide/python-api.mdx) |
+| Load your own tables | [Data sources](docs/content/docs/user-guide/data-sources.mdx) |
+| Understand plans and metrics | [Results and explain](docs/content/docs/user-guide/results.mdx) |
+| Run on Modal | [Running on Modal](docs/content/docs/user-guide/compute.mdx) |
+| Understand the engine | [Architecture](docs/content/docs/architecture/index.mdx) |
+| Add an extension | [Extending Quail](docs/content/docs/extending/index.mdx) |
 
 ## Development
 
-The test suite runs on the CPU with a fake model executor.
+The test suite uses a fake model executor and runs on the CPU.
 
 ```bash
-uv run ruff check quail tests experiments reports tools
+uv run ruff check quail tests experiments tools
 uv run python tools/check_long_strings.py
 uv run vulture
 uv run pytest -q
 ```
 
-Experiment code is under `experiments/`. Results and design notes are under
-`reports/`.
+See [Contributing](docs/content/docs/contributing/index.mdx) for repository
+layout, checks, and release instructions.

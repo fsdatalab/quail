@@ -3,7 +3,7 @@ title: Running on Modal
 description: Run an ordinary Quail query inside a Modal GPU function.
 ---
 
-All model execution requires a CUDA GPU. Modal supplies that GPU, but Quail
+All model execution requires an H100. Modal supplies that GPU, but Quail
 does not need a Modal integration. Your script defines the image, GPU,
 volumes, cache paths, credentials, and result storage.
 
@@ -31,12 +31,21 @@ import modal
 from demos import quickstart
 
 app = modal.App("quail-engine")
+IMAGE_REQUIREMENTS = (
+    "sqlglot==30.17.0",
+    "transformers==5.15.0",
+    "huggingface-hub==1.27.0",
+    "pyarrow==25.0.1",
+    "numpy==2.3.5",
+    "bpe-qwen==0.1.5",
+    "datasets==5.0.1",
+    "vllm==0.26.0",
+)
 image = (
     modal.Image.from_registry(
         "nvidia/cuda:13.0.1-devel-ubuntu24.04", add_python="3.12")
     .entrypoint([])
-    .pip_install("vllm==0.26.0", "pyarrow", "sqlglot>=27.0",
-                 "bpe-qwen>=0.1.5", "datasets>=5.0.1")
+    .pip_install(*IMAGE_REQUIREMENTS)
     .add_local_python_source("quail", "quail_b", "demos")
 )
 

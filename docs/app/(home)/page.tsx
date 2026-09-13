@@ -1,23 +1,18 @@
 import Link from 'next/link';
 import { DynamicCodeBlock } from 'fumadocs-ui/components/dynamic-codeblock';
 
-const example = `import quail
-
-with quail.Session() as session:
-    session.register(
-        "reviews",
-        quail.DocumentProvider.from_table(reviews, id_col="id"),
-    )
-    result = session.sql("""
-        SELECT r.id
-        FROM reviews r
-        WHERE AI_FILTER(PROMPT(
-            'Does the review in DOCUMENT {0} praise the movie?',
-            r.body
-        ))
-    """).run()
-    rows = result.collect()
-    metrics = result.report`;
+const example = `SELECT c.comment_id, f.field
+FROM comments c
+JOIN fields f
+  ON AI_FILTER(PROMPT(
+       'Does the description in DOCUMENT {1} apply to '
+       'the comment in DOCUMENT {0}?',
+       c.text, f.statement
+     ))
+WHERE AI_FILTER(PROMPT(
+  'Is the comment in DOCUMENT {0} hateful, threatening, or abusive?',
+  c.text
+))`;
 
 function Section({
   eyebrow,
@@ -73,15 +68,16 @@ export default function HomePage() {
             Query-aware inference
           </p>
           <h1 className="text-5xl font-semibold tracking-[-0.04em] md:text-7xl">
-            Ask models about data.
+            Run one model query.
             <span className="block text-fd-muted-foreground">
-              Plan the work first.
+              Not thousands of disconnected requests.
             </span>
           </h1>
           <p className="mt-7 max-w-2xl text-lg leading-8 text-fd-muted-foreground">
             Quail runs language-model filters and joins over document
-            collections. Write SQL or Python. Quail schedules the complete
-            query so model calls can share work on your GPUs.
+            collections. It sees the complete query before inference begins,
+            then schedules the model work so repeated document prefixes can
+            share KV and each forward pass stays full.
           </p>
           <div className="mt-8 flex flex-wrap gap-3">
             <Link
@@ -100,23 +96,50 @@ export default function HomePage() {
         </div>
       </header>
 
-      <Section eyebrow="01 / Query" title="One query, one planned job">
+      <Section eyebrow="01 / Problem" title="The same document, read again">
         <div className="min-w-0 space-y-4">
-          <DynamicCodeBlock lang="python" code={example} />
-          <p className="max-w-3xl text-sm leading-6 text-fd-muted-foreground">
-            Register an Arrow table, write an <code>AI_FILTER</code>, and
-            collect an Arrow result. The same query can be built with the
-            Python API. The model returns one constrained token for each
-            predicate: <code>TRUE</code> or <code>FALSE</code>.
+          <p className="max-w-3xl leading-7 text-fd-muted-foreground">
+            Consider the 448,000 comments in the Jigsaw Civil Comments
+            dataset. We first ask which comments are toxic. For each comment
+            that passes, we ask 31 more questions about toxicity type,
+            identity references, and moderator decisions.
+          </p>
+          <p className="max-w-3xl leading-7 text-fd-muted-foreground">
+            A request-at-a-time system handles every question separately. It
+            processes the same comment tokens again, waits for the complete
+            filter before starting the join, and batches short and long
+            comments by request count.
           </p>
         </div>
       </Section>
 
-      <Section eyebrow="02 / Execution" title="Share work across stages">
+      <Section eyebrow="02 / Query" title="Tell Quail the complete analysis">
+        <div className="min-w-0 space-y-4">
+          <DynamicCodeBlock lang="sql" code={example} />
+          <p className="max-w-3xl leading-7 text-fd-muted-foreground">
+            Quail sees the filter, its expected survivors, the 31-way join,
+            each document&apos;s token count, and the available GPU memory
+            before execution starts. The model answers each predicate with
+            one constrained token: <code>TRUE</code> or <code>FALSE</code>.
+          </p>
+          <p className="max-w-3xl text-sm leading-6 text-fd-muted-foreground">
+            The complete query is in{' '}
+            <a
+              href="https://github.com/fsdatalab/quail/blob/main/demos/civil_comments_join.py"
+              className="underline"
+            >
+              demos/civil_comments_join.py
+            </a>
+            .
+          </p>
+        </div>
+      </Section>
+
+      <Section eyebrow="03 / Execution" title="Share work across stages">
         <div>
           <Mechanism number="01" title="Pipelining">
-            A document starts its next predicate as soon as it passes the
-            current one. It does not wait for the rest of the stage.
+            A comment that passes the toxicity filter can enter the join
+            immediately. It does not wait for every other comment.
           </Mechanism>
           <Mechanism number="02" title="Token-based admission">
             The scheduler fills each forward pass by token count and
@@ -133,10 +156,10 @@ export default function HomePage() {
         </div>
       </Section>
 
-      <Section eyebrow="03 / Scope" title="Focused by design">
+      <Section eyebrow="04 / Direction" title="What Quail runs">
         <div className="grid gap-px overflow-hidden rounded-lg border border-fd-border bg-fd-border sm:grid-cols-2">
           <div className="bg-fd-background p-5">
-            <h3 className="font-medium">Queries</h3>
+            <h3 className="font-medium">Available today</h3>
             <p className="mt-2 text-sm leading-6 text-fd-muted-foreground">
               True-or-false filters, AI joins, <code>EXISTS</code>, and{' '}
               <code>NOT EXISTS</code>, through Snowflake-style SQL,
@@ -144,29 +167,31 @@ export default function HomePage() {
             </p>
           </div>
           <div className="bg-fd-background p-5">
-            <h3 className="font-medium">Data</h3>
+            <h3 className="font-medium">On the roadmap</h3>
             <p className="mt-2 text-sm leading-6 text-fd-muted-foreground">
-              Arrow tables, Parquet files, Arrow datasets, and Hugging Face
-              datasets in. Arrow tables out.
+              <code>AI.CLASSIFY</code>, <code>AI.EXTRACT</code>, and{' '}
+              <code>AI.MAP</code> will add labels, typed fields, and typed
+              values to the current true-or-false operators.
             </p>
           </div>
           <div className="bg-fd-background p-5">
-            <h3 className="font-medium">Models</h3>
+            <h3 className="font-medium">Models and data</h3>
             <p className="mt-2 text-sm leading-6 text-fd-muted-foreground">
-              Qwen3 4B fp8 or Qwen3 32B fp8. Each GPU holds one model copy.
+              Qwen3 4B fp8 or Qwen3 32B fp8 over Arrow, Parquet, and Hugging
+              Face tables. Results are Arrow tables.
             </p>
           </div>
           <div className="bg-fd-background p-5">
             <h3 className="font-medium">Hardware</h3>
             <p className="mt-2 text-sm leading-6 text-fd-muted-foreground">
-              A local CUDA GPU or 1, 2, 4, or 8 H100s in one Modal
-              container. Quail does not split one model across GPUs.
+              One H100 per model copy. A query can use 1, 2, 4, or 8 H100s
+              in one Modal container.
             </p>
           </div>
         </div>
       </Section>
 
-      <Section eyebrow="04 / Next" title="Start with a real query">
+      <Section eyebrow="05 / Next" title="Start with a real query">
         <div className="grid gap-4 sm:grid-cols-2">
           {[
             {

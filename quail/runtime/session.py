@@ -4,6 +4,7 @@ import os
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import replace
 from itertools import chain
 from numbers import Integral
 from pathlib import Path
@@ -556,6 +557,9 @@ class Query:
                 registry=self.session.registry,
                 tokenizer=self.session.tokenizer,
                 pair_fractions=pair_fractions)
+            if self.session.config.gpu_timing:
+                self._plan = replace(self._plan, settings={
+                    **self._plan.settings, "gpu_timing": True})
             say(f"plan ready in {time.perf_counter() - started:.2f} s")
         return self._plan
 
@@ -695,6 +699,9 @@ class Query:
             node_metrics=out.get("node_metrics", {}),
             backend_metrics=out.get("backend_metrics"),
             remarks=list(plan.remarks) + list(self.session.notes))
+        for key in ("gpu_s", "chunks"):
+            if key in out:
+                report[key] = out[key]
 
         scans, logical_filters, logical_joins = collect_operators(self.logical)
         scans_by_alias = {scan.alias: scan for scan in scans}

@@ -15,6 +15,7 @@ class EngineConfig:
     model: str = "qwen3-4b-fp8"
     backend: str = "quail"
     device: str = "h100-sxm"
+    gpu_timing: bool = False
 ```
 
 - `device`: the registered hardware specification used for planning. Built in:
@@ -28,6 +29,13 @@ class EngineConfig:
 - `backend`: a registered model backend. Built in: `quail`,
   `stock_vllm`, `pipelined_vllm`, `pipelined_sglang`. A normal user
   never sets this. The others exist for comparison runs.
+- `gpu_timing`: when true, the Quail backend adds `gpu_s` to the
+  result report: the seconds a forward chunk was running on the GPU,
+  summed from the CUDA events each chunk records. `wall_s` minus
+  `gpu_s` is the time the GPU sat idle during the query. `chunks`,
+  the number of forward passes, comes with it: `fresh_tokens` divided
+  by `chunks` is the mean forward pass size, to compare with the chunk
+  budget. Off by default.
 
 ```python
 session = quail.Session(quail.EngineConfig(

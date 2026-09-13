@@ -1,54 +1,36 @@
 ---
 title: Reports and plots
-description: What goes in reports/, and how plots are built.
+description: Where experiment history lives and how to change it.
 ---
 
-## Reports
+Experiment reports, plot code, figures, and the engine reference are kept
+off `main`. Their dedicated branch is `cursor/reports-dev-f955`.
 
-Every PR with an experiment adds a report under `reports/` named
-`YYYY-MM-DD-<slug>.md`. It states the setup, the prediction, the
-measured result, and what the numbers mean, and cites the data by its
-`quail-results` volume path.
+Feature branches that target `main` do not add a shipped-feature report.
+Code, tests, and user-facing documentation should explain the current
+behavior without requiring readers to search dated experiment notes.
 
-Every PR that ships a feature adds a short note under
-`reports/shipped_features/` with the same naming: what changed, why,
-and before and after numbers when they exist.
+## Work on a report
 
-`reports/engine-wiki.md` is the living reference for the engine's
-design. Update it in place when the design changes.
-
-When a report is superseded, delete it along with its plot script and
-its PNGs. Before starting new work, scan `reports/` for stale reports,
-orphaned scripts, and unreferenced PNGs, and delete them.
-
-## Plots
-
-One script per report, `reports/make_<slug>_plots.py`, run from the
-repository root with the directory of pulled volume files as its
-argument:
+Start a report change from the report branch:
 
 ```bash
-uv run --with matplotlib python reports/make_<slug>_plots.py $W
+git fetch origin cursor/reports-dev-f955
+git switch -c cursor/<report-name>-f955 \
+  origin/cursor/reports-dev-f955
 ```
 
-The `modal volume get` commands that fill that directory go in the
-script's docstring so the figure can be rebuilt from the report alone.
-Percentages and ratios are computed in the script, never stored.
+Commit the report, its plot script, and any generated figure to that branch.
+Target its pull request back to `cursor/reports-dev-f955`, not `main`.
 
-Output PNGs go to `reports/plots/` at 300 DPI and are committed. The
-report references them as `Figure: plots/<name>.png`. A PR body embeds
-the same file by raw GitHub URL pinned to a commit.
+Experiment data still lives on the `quail-results` Modal volume. Do not
+commit result JSON, Parquet answer tables, or Modal logs.
 
-Style rules, in short:
+## Link from main-line documentation
 
-- `plt.style.use(Path(__file__).parent / "quail.mplstyle")` and colors
-  from `reports/plot_colors.py`.
-- Every mark encodes data. No background fills, 3D, or decorative
-  gridlines.
-- Label data directly. Use a legend only when labels would overlap.
-- The axis label is the unit and nothing else. Context goes in the
-  title, which names the query, for example "IMDB-7".
-- Put compared things side by side on one axis and annotate the delta
-  next to the data.
-- Log scale only when the data spans more than one order of magnitude,
-  and say so on the axis.
+When current documentation needs measured evidence, link to the saved Modal
+run or to a file on the report branch. Pin a figure link to a commit so it
+does not change when the report branch moves.
+
+The detailed QUAIL-B plotting rules and historical engine wiki remain on the
+report branch with the files they govern.

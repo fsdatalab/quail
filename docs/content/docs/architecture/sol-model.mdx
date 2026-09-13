@@ -331,11 +331,13 @@ finite KV policy are separate from this exact analysis.
 
 ## 7. Every QUAIL-B query
 
-`reports/make_sol_quailb.py` calls the estimator for the 33 default
-queries at sf=0.1 on Qwen3 4B fp8 and Qwen3 32B fp8. The script supplies
-only what the benchmark has: the corpora, the queries, and the saved
-labels, wrapped as the `answer` callable. Document lengths and prompt
-lengths come from the session's tokenizer.
+The
+[QUAIL-B SoL script](https://github.com/fsdatalab/quail/blob/cursor/reports-dev-f955/reports/make_sol_quailb.py)
+on the report branch calls the estimator for the 33 default queries at
+sf=0.1 on Qwen3 4B fp8 and Qwen3 32B fp8. The script supplies only what
+the benchmark has: the corpora, the queries, and the saved labels,
+wrapped as the `answer` callable. Document lengths and prompt lengths
+come from the session's tokenizer.
 
 The saved estimates are at `/results/sol/sol_quailb_sf0.1.json` on the
 `quail-results` volume, regenerated on 2026-09-07 with the four-filter

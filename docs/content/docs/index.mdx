@@ -3,43 +3,59 @@ title: Introduction
 description: What Quail runs, how it saves model work, and where to start.
 ---
 
-Quail runs language-model filters and joins over document collections.
-Write the query in Snowflake-style SQL, BigQuery-style SQL, or Python.
-Quail plans its model calls as one job instead of sending one independent
-request for each row.
+Quail is a query engine for running language-model operations over document
+collections. You write the analysis in SQL or Python. Quail plans the
+complete query before it starts inference, then schedules the model work so
+repeated document prefixes can share KV and each forward pass stays full.
 
 KV is the attention key and value tensors the model keeps for tokens
 it has already processed.
 
-## Supported queries
+## The problem with one request per row
 
-- Filters over one table with `AI_FILTER(PROMPT(...))`.
-- AI joins across two or more tables.
-- `EXISTS` and `NOT EXISTS` filters over an AI join.
-- The same query shapes with BigQuery's `AI.IF` or the Python builder.
+Suppose an analysis first filters a collection of long documents, then asks
+several more questions about every document that passes. A request-at-a-time
+system handles each question separately. It processes the same document
+prefix again, waits for the complete filter before starting the next stage,
+and groups requests by count even when their documents have very different
+lengths.
 
-The model answers each question with a single token, TRUE or FALSE.
-Quail does not run open-ended generation, classification, extraction,
-or summarization.
+Quail sees the filter, its expected survivors, every later question, the
+document lengths, and the available GPU memory before execution begins. This
+lets one query share work across rows and stages.
 
-## How Quail saves work
+## What Quail does differently
 
-- **Pipelining.** A document starts its next predicate as soon as it
-  passes the current one.
-- **Token-based admission.** The scheduler fills each forward pass by
-  token count and available KV, rather than by request count.
-- **KV rewind.** A document's KV stays on the GPU for its later
-  predicates, so Quail does not compute the document prefix again.
-- **Packed joins.** One anchor document's KV is shared by every
-  join partner in the same forward pass.
+1. **Pipelining.** A document starts its next predicate as soon as it passes
+   the current one.
+2. **Token-based admission.** The scheduler fills each forward pass by token
+   count and available KV, rather than by request count.
+3. **KV rewind.** A document's KV stays on the GPU for its later predicates,
+   so Quail does not compute the document prefix again.
+4. **Packed joins.** One anchor document shares its KV across many join
+   partners in the same forward pass.
 
-## Runtime requirements
+## Current scope
 
-- Python 3.12.
-- Qwen3 4B fp8 or Qwen3 32B fp8.
-- A CUDA GPU in the process that runs the query.
-- One model copy per GPU. Quail does not split one model across GPUs.
-- A local GPU, or 1, 2, 4, or 8 H100s in one Modal container.
+Quail currently runs true-or-false filters over one table, AI joins across
+two or more tables, and `EXISTS` or `NOT EXISTS` filters over an AI join. The
+same queries can use Snowflake-style `AI_FILTER`, BigQuery-style `AI.IF`, or
+the Python builder.
+
+The model answers each predicate with one constrained token, `TRUE` or
+`FALSE`. Quail runs Qwen3 4B fp8 or Qwen3 32B fp8, with one model copy per
+H100. A query can use 1, 2, 4, or 8 H100s in one Modal container.
+
+## Roadmap
+
+The next operators expand what a model call can return:
+
+- `AI.CLASSIFY` returns one label from a declared set.
+- `AI.EXTRACT` returns typed fields from a document.
+- `AI.MAP` returns a typed value for each input row.
+
+These operators are planned, not implemented. Open-ended generation,
+speculation, and request forking are not part of the current runtime.
 
 ## Where to go next
 

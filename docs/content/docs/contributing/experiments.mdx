@@ -5,6 +5,10 @@ description: How an experiment is planned, run, and recorded.
 
 These rules keep numbers comparable across reports.
 
+They apply to project experiments and benchmark measurements. A user can
+run Quail on a supported local GPU. Project measurements use Modal so every
+run has the same saved configuration and result storage.
+
 ## Before the run
 
 - State the prediction first. Compute it from measured constants
@@ -16,7 +20,7 @@ These rules keep numbers comparable across reports.
 
 ## During the run
 
-- Every engine run goes through Modal. There is no local GPU.
+- Every project experiment goes through Modal.
 - Never create a new Modal app name. Attach to `quail-milestone1` for
   cells and `quail-engine` for the worker.
 - Tee every run to a file.
@@ -30,7 +34,7 @@ These rules keep numbers comparable across reports.
 
 - Experiment data lives on the `quail-results` volume, summaries and
   per-item records alike. It is not committed.
-- Reports cite data by volume path, for example
+- Saved analysis notes cite data by volume path, for example
   `/results/ablations/<file>.json`.
 
 ## What to report for a benchmark query
