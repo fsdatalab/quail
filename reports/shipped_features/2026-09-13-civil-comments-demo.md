@@ -311,3 +311,35 @@ can, and is the next tool.
 `FILTER_PROMPT` constant asking whether the comment is among the most
 toxic on a news site (hateful, threatening, or abusive, not merely
 rude or opinionated). Prediction: the filter passes 10 to 35 percent.
+
+## Eighth GPU run, 10,000 comments, local H100, and where this stops
+
+"Among the most toxic comments on a news site" wording,
+`--limit 10000 --gpu-timing`. Predicted: filter passes 10 to 35 percent.
+
+| Quantity | Predicted | Measured |
+|---|---:|---:|
+| Filter pass rate | 10 to 35 percent | 78.8 percent |
+| Join pairs evaluated | | 244,156 |
+| Join pass rate | | 14.7 percent |
+| Query time, s | | 59.65 |
+| GPU idle | | 0.54 s, 0.9 percent |
+| Forward passes | | 63 |
+| Mean fresh tokens per pass | | 109,673 of 110,376 |
+| Speed of light for the run's answers, s | | 25.73 |
+| Wall over speed of light | | 2.32 |
+| Output precision against the labels | | 0.059 |
+| Output recall against the labels | | 0.871 |
+
+Prompt work stops here. Five wordings of the toxicity filter passed
+between 27 and 97 percent of comments against the 11 percent the
+annotators' majority vote gives, and the one wording under 30 percent
+lost most of the join's recall. Qwen3 4B FP8 does not reproduce that
+vote from a filter prompt alone. The demo stays as a scale and
+engine-measurement example: with `--gpu-timing` it shows full batches
+(99 percent of the chunk budget), under 1 percent scheduler idle, no
+redundant computation (fresh tokens within 0.5 percent of the ideal),
+and wall time 2.32 times the speed of light, all of it inside the
+forward passes. Splitting that remainder between kernels below the
+roofline and launch gaps between kernels needs the kernel-level
+profiler.
