@@ -115,7 +115,7 @@ In the equations below, KV reuse appears as the difference between
 the stage 1 token count (which includes $d_i$) and the stage $s > 1$
 token count (which does not).
 
-### Counting the work
+### Counting work per operator
 
 For each candidate plan, the model counts four quantities:
 
@@ -245,20 +245,25 @@ choices for each join.
 
 #### Multiple joins
 
-All filters run before joins. A filtered alias has reusable prefix
-KV when the join search starts. An unfiltered alias gains reusable
-prefix KV the first time it serves as an anchor. The model assumes
-unlimited KV capacity, so reusable prefixes are never evicted.
+When a query has more than one join, the planner needs to choose the
+order in which joins execute and which side anchors each one.
+Different orders produce different total work because earlier joins
+reduce the number of documents that reach later joins.
 
-The calculation searches every left-deep join plan. A left-deep plan
-starts with one alias and adds one alias at each step. The search
-supports binary full joins only. It checks both anchor choices for
-each join predicate.
+The planner searches over **left-deep plans**: plans that start with
+one table and add one table at each join step (as opposed to bushy
+plans that join two intermediate results). For each step, it
+considers both possible anchor choices.
 
-The DP state is `(S, K)`: `S` is the set of aliases already joined,
-`K` is the set of aliases whose prefix KV is available. A state is
-pruned only if another state dominates it in all four work
-quantities (tokens, pairs, KV writes, KV reads).
+The search uses dynamic programming. The state tracks which tables
+have been joined so far and which tables have prefix KV available.
+A state is kept only if no other state with the same joined tables
+does less work in all four quantities (tokens, pairs, KV writes,
+KV reads).
+
+The cost model assumes unlimited KV capacity: once a document's
+prefix is computed (by a filter or as a join anchor), it stays
+available for all later joins.
 
 ### Computing the query estimate
 
