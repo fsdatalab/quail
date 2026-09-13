@@ -20,6 +20,7 @@ def _common_payload(payload: dict) -> dict:
         "pre_ids": payload["pre_ids"],
         "filter_limit": payload["filter_limit"],
         "retention": payload.get("retention", {}),
+        "gpu_timing": payload.get("gpu_timing", False),
     }
 
 

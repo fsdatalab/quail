@@ -159,6 +159,8 @@ def main() -> None:
     parser.add_argument("--gpus", type=int, choices=(1, 2, 4, 8), default=1)
     parser.add_argument("--gpu-usd-per-hour", type=float,
                         help="hourly price per GPU; defaults to Modal pricing")
+    parser.add_argument("--gpu-timing", action="store_true",
+                        help="report seconds the GPU was busy, from CUDA events")
     args = parser.parse_args()
     hourly_price = args.gpu_usd_per_hour
     price_source = "custom" if hourly_price is not None else "Modal"
@@ -174,7 +176,8 @@ def main() -> None:
     print(f"labeled (comment, field) pairs: {len(labeled)}")
 
     with quail.Session(
-        config=quail.EngineConfig(gpus=args.gpus, device=args.device),
+        config=quail.EngineConfig(gpus=args.gpus, device=args.device,
+                                  gpu_timing=args.gpu_timing),
     ) as session:
         session.register("comments", quail.DocumentProvider.from_table(
             comments, id_col="comment_id"))
@@ -207,6 +210,10 @@ def main() -> None:
                       f"{stage['observed_selectivity']:.3f} passed")
         print(f"boot_s: {boot_s} ({report.get('boot_kind')})")
         print(f"wall_s: {wall_s}")
+        if "gpu_s" in report:
+            idle = wall_s - report["gpu_s"]
+            print(f"gpu_s: {report['gpu_s']} busy, {idle:.2f} idle "
+                  f"({100 * idle / wall_s:.1f}% of wall_s)")
         print(f"total_s: {wall_s + boot_s:.2f} (boot + query)")
         print(f"fresh_tokens: {report.get('fresh_tokens')}")
         print(f"document pairs/second: {pairs / wall_s:.1f}")

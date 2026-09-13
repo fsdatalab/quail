@@ -147,3 +147,19 @@ pass close to 0 percent; if it passes most comments, the answer
 reading is at fault, not the wording. Prediction for the next
 `--limit 2000` run: the control passes under 2 percent; the toxicity
 filter passes 10 to 30 percent.
+
+## Opt-in GPU busy time
+
+`EngineConfig(gpu_timing=True)` makes the Quail backend sum the CUDA
+event pair each forward chunk already records into a `gpu_s` field of
+the result report, per model node and in total. `wall_s` minus `gpu_s`
+is the time the GPU sat idle during the query, which is the direct
+measure of scheduling gaps on the streamed filter-to-join path. It is
+off by default; the demo turns it on with `--gpu-timing`. The only
+measurement of idle time so far (2026-09-07 report) came from the
+Modal profiler and predates that path.
+
+Prediction for the 2,000-comment run with `--gpu-timing`: idle time
+under 10 percent of `wall_s`. The full filter and join chunks each run
+for about a second while the next chunk packs in under 0.1 seconds, so
+the gaps come only from partial chunks at the end of the query.

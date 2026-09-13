@@ -452,3 +452,20 @@ def test_foreign_runs_per_batch_on_the_stream_and_once_as_a_barrier(monkeypatch)
         _foreign_run(monkeypatch,
                      two_alias_graph(False, foreign=("barrier", "drop")),
                      {"keep_even": outer})
+
+
+def test_gpu_timing_sums_the_chunk_events_only_when_asked(monkeypatch):
+    """gpu_s is the sum of every chunk's CUDA event pair, opt in."""
+    off, _, _, _ = run_graph_on_arena(
+        monkeypatch, two_alias_graph(True), pages=48)
+    assert "gpu_s" not in off
+    assert all(metrics["gpu_s"] == 0.0
+               for metrics in off["node_metrics"].values())
+    on, _, _, _ = run_graph_on_arena(
+        monkeypatch, two_alias_graph(True), pages=48, gpu_timing=True)
+    # the fake torch reports 2 ms per event pair, one pair per chunk
+    per_node = [metrics["gpu_s"] for metrics in on["node_metrics"].values()]
+    assert on["gpu_s"] == pytest.approx(sum(per_node), abs=1e-3)
+    assert on["gpu_s"] > 0
+    assert all(chunks == round(chunks)
+               for chunks in (seconds / 0.002 for seconds in per_node))

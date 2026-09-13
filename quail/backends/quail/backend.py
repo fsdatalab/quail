@@ -97,7 +97,7 @@ class QuailModelExecution:
             retain_survivors = inputs.get("retain_survivors", ())
             if retain_survivors is False:
                 retain_survivors = ()
-            answers, _, tokens = loop.run_filter(
+            answers, spans, tokens = loop.run_filter(
                 torch,
                 arena,
                 pipeline,
@@ -110,7 +110,9 @@ class QuailModelExecution:
                 arena_keys=DocumentKeys(node.alias, document_ids),
                 retain_survivors=retain_survivors,
             )
-            return filter_result(node, answers, tokens, document_ids)
+            return filter_result(
+                node, answers, tokens, document_ids,
+                gpu_s=_gpu_seconds(torch, spans, inputs))
 
         stage_frames = inputs["stage_frames"]
         stream = inputs.get("anchor_stream")
@@ -135,7 +137,7 @@ class QuailModelExecution:
                 attention_mode=FILTER_ATTENTION,
             )
         lists_for = inputs.get("anchor_partners")
-        answers, _, tokens = loop.run_join(
+        answers, spans, tokens = loop.run_join(
             torch,
             arena,
             pipeline,
@@ -161,6 +163,7 @@ class QuailModelExecution:
                 source.answers,
                 source.tokens,
                 stream["document_ids"],
+                gpu_s=_gpu_seconds(torch, source.spans, inputs),
             ))
         else:
             anchor_ids = list(inputs["anchor_ids"])
@@ -206,9 +209,19 @@ class QuailModelExecution:
                 kv_hits=kv_round.get("hits", 0),
                 kv_misses=kv_round.get("misses", 0),
                 fresh_tokens=tokens,
+                gpu_s=_gpu_seconds(torch, spans, inputs),
                 extension={"answers": answers},
             ),
         )
+
+
+def _gpu_seconds(torch, spans, inputs) -> float:
+    """Seconds the loop's forward chunks ran on the GPU; 0.0 unless asked."""
+    if not inputs.get("gpu_timing"):
+        return 0.0
+    # every chunk's answers were read, so its end event has completed
+    torch.cuda.synchronize()
+    return sum(start.elapsed_time(end) for _, start, end in spans) / 1000.0
 
 
 def expected_join_nodes(plan) -> tuple[PhysicalNode, ...]:

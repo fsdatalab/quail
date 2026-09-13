@@ -133,7 +133,8 @@ def stage_partner_lists(group, lists_for, anchor_ids) -> list:
     return out
 
 
-def filter_result(node, answers, tokens, document_ids) -> NodeResult:
+def filter_result(node, answers, tokens, document_ids,
+                  gpu_s: float = 0.0) -> NodeResult:
     """Build one filter chain's node result from its local answers."""
     global_answers = {
         document_ids[int(local)]: row
@@ -154,6 +155,7 @@ def filter_result(node, answers, tokens, document_ids) -> NodeResult:
             output_rows=len(survivors),
             evaluated_documents=len(global_answers),
             fresh_tokens=tokens,
+            gpu_s=gpu_s,
         ),
     )
 
@@ -172,12 +174,19 @@ def filter_inputs(state, node, document_ids) -> dict:
 
 def prepare_model_inputs(node, inputs, context: ExecutionContext):
     """Prepare Quail scheduler inputs from typed port values."""
+    if not isinstance(node, (AiFilter, AiJoin)):
+        return inputs
+    return {
+        **_model_inputs(node, inputs, context),
+        "gpu_timing": context.state.get("gpu_timing", False),
+    }
+
+
+def _model_inputs(node, inputs, context: ExecutionContext) -> dict:
     state = context.state
     if isinstance(node, AiFilter):
         state["pipeline"].attention_mode = FILTER_ATTENTION
         return filter_inputs(state, node, next(iter(inputs.values())))
-    if not isinstance(node, AiJoin):
-        return inputs
 
     state["pipeline"].attention_mode = JOIN_ATTENTION
     stream = None
@@ -388,7 +397,7 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
         "evicted_prefix_tokens": arena.evicted_prefix_tokens,
     }
 
-    return {
+    report = {
         "filters": filters,
         "joins": joins,
         "_outputs": export_physical_outputs(compute_subgraph(graph), result),
@@ -399,6 +408,11 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
         "kv_manager": kv_manager,
         "peak_gib": round(torch.cuda.max_memory_allocated() / 2**30, 2),
     }
+    if state.get("gpu_timing"):
+        # seconds a forward chunk was running on the GPU, summed over
+        # the model nodes; wall_s minus this is time the GPU sat idle
+        report["gpu_s"] = round(result.metrics.gpu_s, 3)
+    return report
 
 
 def model_answers(graph, result) -> tuple[dict, list]:

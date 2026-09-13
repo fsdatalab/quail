@@ -280,3 +280,6 @@ class EngineConfig:
     model: str = "qwen3-4b-fp8"
     backend: str = "quail"
     device: str = "h100-sxm"
+    # sum the CUDA event pair each forward chunk records into gpu_s;
+    # off by default so a run never pays for a measurement it does not read
+    gpu_timing: bool = False
