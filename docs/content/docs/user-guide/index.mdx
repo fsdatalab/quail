@@ -10,7 +10,7 @@ then run:
 ```bash
 git clone https://github.com/fsdatalab/quail.git
 cd quail
-uv sync
+uv sync --no-dev
 ```
 
 All model execution requires an H100. A query runs the model in the
@@ -36,7 +36,7 @@ The machine needs an NVIDIA driver that supports CUDA 13 (version 580
 or newer) and a C compiler. Triton, which vLLM uses for GPU kernels,
 compiles a small C helper at startup with `gcc`. NVIDIA GPU images
 include `gcc`; on a plain Ubuntu install, `sudo apt-get install -y
-build-essential` adds it. `uv sync` downloads its own Python build,
+build-essential` adds it. `uv sync --no-dev` downloads its own Python build,
 which carries the C headers that helper needs, so the system Python
 and its header packages are not used.
 
@@ -57,7 +57,7 @@ and report. Run it on an H100 host with `uv run python demos/quickstart.py`.
 Set up the Modal client once:
 
 ```bash
-uv run modal setup
+uv run --no-sync --with 'modal[api-proxy-support]==1.5.4' modal setup
 ```
 
 Then create a normal session inside a Modal GPU function. The supplied
@@ -65,7 +65,9 @@ example uses the existing `quail-engine` app:
 
 ```bash
 mkdir -p results
-uv run modal run demos/quickstart_modal.py 2>&1 | tee results/quickstart_modal.log
+uv run --no-sync --with 'modal[api-proxy-support]==1.5.4' \
+  modal run demos/quickstart_modal.py \
+  2>&1 | tee results/quickstart_modal.log
 ```
 
 See [Running on Modal](/docs/user-guide/compute) for the function and submission code.

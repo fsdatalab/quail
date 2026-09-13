@@ -227,7 +227,7 @@ export default function HomePage() {
             {
               href: '/docs/user-guide/quickstart',
               title: 'Quickstart',
-              text: 'Run QUAIL-B IMDB-1 on 100 reviews and inspect the result.',
+              text: 'Run IMDB-1 on eight published reviews and inspect the result.',
             },
             {
               href: '/docs/user-guide/sql',

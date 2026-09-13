@@ -89,7 +89,7 @@ then run:
 ```bash
 git clone https://github.com/fsdatalab/quail.git
 cd quail
-uv sync
+uv sync --no-dev
 ```
 
 Model execution requires an H100. Each GPU holds one model copy; Quail does
@@ -106,15 +106,16 @@ uv run python demos/quickstart.py
 From any machine, submit the same query to a Modal H100:
 
 ```bash
-uv run modal setup
+uv run --no-sync --with 'modal[api-proxy-support]==1.5.4' modal setup
 mkdir -p results
-uv run modal run demos/quickstart_modal.py \
+uv run --no-sync --with 'modal[api-proxy-support]==1.5.4' \
+  modal run demos/quickstart_modal.py \
   2>&1 | tee results/quickstart.log
 ```
 
-The example runs QUAIL-B's IMDB-1 query over 100 published reviews. See the
-[quickstart](docs/content/docs/user-guide/quickstart.mdx) to inspect the query,
-result, plan, and execution report.
+The example runs QUAIL-B's IMDB-1 predicate over eight published reviews. See
+the [quickstart](docs/content/docs/user-guide/quickstart.mdx) to inspect the
+query, measured output, plan, and execution report.
 
 ## Current scope and roadmap
 

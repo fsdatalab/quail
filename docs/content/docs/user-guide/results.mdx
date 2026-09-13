@@ -36,22 +36,33 @@ query.execute_stream()      # run and return a record batch reader
 [quickstart](/docs/user-guide/quickstart)'s filter query, trimmed to
 the keys every backend fills:
 
+<QueryOutput
+  title="Positive-aspect filter"
+  subtitle="September 13, 2026 · Qwen3 4B fp8 · 1 H100 · Quail backend"
+  metrics={[
+    { label: 'Rows returned', value: '4 / 8', detail: '50% selectivity' },
+    { label: 'Query time', value: '0.75 s', detail: 'startup excluded' },
+    { label: 'Model startup', value: '40.27 s', detail: 'cold process' },
+    { label: 'Fresh tokens', value: '1,117', detail: '8 documents' },
+  ]}
+/>
+
 ```json
 {
   "backend": "quail",
-  "wall_s": 1.3,
-  "boot_s": 19.25,
+  "wall_s": 0.75,
+  "boot_s": 40.27,
   "boot_kind": "cold",
   "boot": {
     "kind": "cold",
-    "load_model_s": 13.93,
-    "arena_s": 0.36,
+    "load_model_s": 24.5,
+    "arena_s": 0.89,
     "pipeline_s": 0.0,
-    "warm_kernels_s": 4.91,
-    "warm_tier": "touch",
-    "boot_s": 19.25
+    "warm_kernels_s": 8.98,
+    "boot_s": 40.27,
+    "warm_tier": "touch"
   },
-  "coordinator_wall_s": 22.99,
+  "coordinator_wall_s": 0.75,
   "fresh_tokens": 1117,
   "cached_tokens": null,
   "stages": [
@@ -72,14 +83,17 @@ the keys every backend fills:
       "fresh_tokens": 1117
     }
   },
-  "result_volume_path": "/results/runs/run_1788501944354367580.json",
+  "result_volume_path": "/results/docs-quickstart/f7dcd33796934181b89d3d6b740d5e82/filter.json",
   "remarks": [
     "filter on 'r': arena writes off (one stage - nothing reads the KV again)",
     "reviews.body: tokenizer: bpe-qwen (parity-checked on sample)"
   ],
-  "worker_total_s": 36.0909
+  "worker_total_s": 41.057
 }
 ```
+
+This result came from Modal function call
+`fc-01M2CHCF0PZXTGTYV8N21BQ6CJ`.
 
 | Key | Meaning |
 | --- | --- |
@@ -98,7 +112,37 @@ the keys every backend fills:
 The Quail backend adds `kv_manager`, `peak_gib`,
 `order_rule`, `expected_join_plan`, and `executed_join_plan`. The saved
 join order is the executed order. Actual row counts and KV hits can differ
-from the estimates. The join query in the quickstart shows them:
+from the estimates. The companion `docs/examples/imdb_queries_modal.py`
+join query shows them:
+
+<QueryOutput
+  title="Positive reviews joined with movie aspects"
+  subtitle="Same process and data · warm model"
+  metrics={[
+    { label: 'Pairs returned', value: '10', detail: 'from 48 evaluated' },
+    { label: 'Query time', value: '0.46 s', detail: 'startup excluded' },
+    { label: 'Model startup', value: '0.00 s', detail: 'warm process' },
+    { label: 'Fresh tokens', value: '1,849', detail: 'filter and join' },
+  ]}
+>
+
+```text
+rv0  the acting
+rv0  the plot
+rv0  the pacing
+rv0  the dialogue
+rv0  the screenplay
+rv2  the acting
+rv2  the plot
+rv2  the directing
+rv2  the pacing
+rv2  the editing
+```
+
+</QueryOutput>
+
+The join report is saved at
+`/results/docs-quickstart/f7dcd33796934181b89d3d6b740d5e82/join.json`.
 
 ```json
 {
@@ -107,9 +151,9 @@ from the estimates. The join query in the quickstart shows them:
     {"type": "quail.ai_join", "id": "ai_join:r", "anchor": "r"}
   ],
   "kv_manager": {
-    "retained_after_filters": 4,
-    "retained_pages_after_filters": 21,
-    "retained_prefix_tokens_after_filters": 320,
+    "retained_after_filters": 0,
+    "retained_pages_after_filters": 0,
+    "retained_prefix_tokens_after_filters": 0,
     "join_anchor_hits": 4,
     "join_anchor_misses": 0,
     "evicted_keys": 0,
@@ -128,7 +172,7 @@ observer name.
 logical and physical plan as text. The first time a document column is
 seen, the token counts in the plan are estimates: the session reads the
 column's byte lengths and scales them by the tokens per byte of the
-first 256 documents, and a `note:` line says so. Tokenizing starts in
+first 1,024 documents, and a `note:` line says so. Tokenizing starts in
 the background at the same time, so `run()` does not repeat it. Later
 queries over the same column plan on the exact counts.
 

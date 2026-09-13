@@ -12,13 +12,14 @@ The runnable pair is
 and
 [`demos/quickstart_modal.py`](https://github.com/fsdatalab/quail/blob/main/demos/quickstart_modal.py).
 The Modal script calls the ordinary script's `run_query()` function.
-Both run QUAIL-B IMDB-1 on 100 published reviews, using the benchmark's
-query definition to find reviews that mention a positive aspect of a movie.
-The shared script calls `benchmark.load_table("reviews", limit=100)`;
-QUAIL-B handles the data download.
+Both run the IMDB-1 predicate on eight published reviews to find reviews that
+mention a positive aspect of a movie. The shared script downloads the public
+IMDB train split at a fixed revision.
 
 ```sh
-uv run modal run demos/quickstart_modal.py 2>&1 | tee results/quickstart_modal.log
+uv run --no-sync --with 'modal[api-proxy-support]==1.5.4' \
+  modal run demos/quickstart_modal.py \
+  2>&1 | tee results/quickstart_modal.log
 ```
 
 ## Define the function
@@ -46,7 +47,7 @@ image = (
         "nvidia/cuda:13.0.1-devel-ubuntu24.04", add_python="3.12")
     .entrypoint([])
     .pip_install(*IMAGE_REQUIREMENTS)
-    .add_local_python_source("quail", "quail_b", "demos")
+    .add_local_python_source("quail", "demos")
 )
 
 @app.function(image=image, gpu="H100!", memory=98304, timeout=1200)
