@@ -163,3 +163,29 @@ Prediction for the 2,000-comment run with `--gpu-timing`: idle time
 under 10 percent of `wall_s`. The full filter and join chunks each run
 for about a second while the next chunk packs in under 0.1 seconds, so
 the gaps come only from partial chunks at the end of the query.
+
+## Third GPU run, 2,000 comments, local H100
+
+Stricter wording, `--limit 2000`, without `--gpu-timing`. Predicted:
+filter passes 10 to 30 percent, join pass rate below 28 percent, query
+time under 5 seconds.
+
+| Quantity | Predicted | Measured |
+|---|---:|---:|
+| Filter pass rate | 10 to 30 percent | 27.1 percent |
+| Join pairs evaluated | | 16,771 |
+| Join pass rate | below 28 percent | 1.0 percent |
+| Query time, s | under 5 | 5.44 |
+| Document pairs/s | | 3,083 |
+| Output precision against the labels | | 0.129 |
+| Output recall against the labels | | 0.047 |
+
+The filter is now in range, though still above the 11.6 percent the
+labels give this sample. The join over-corrected: the labels give a
+toxic comment 2.1 true fields on average and the model found 0.3, so
+the sentence "Answer FALSE unless the comment clearly matches" is
+removed again. The demo now also prints the filter's own precision
+and recall against the toxicity labels, so filter errors and join
+errors can be told apart. Prediction for the next run: the join passes
+3 to 10 percent of pairs and output recall rises above 0.2; the filter
+is unchanged at about 27 percent.

@@ -96,8 +96,7 @@ FIELDS = {
 # follow the QUAIL-B pattern: the criterion before the document, then
 # the instruction after it.
 JOIN_PROMPT = ("Judge strictly whether the description in DOCUMENT {1} "
-               "applies to the comment in DOCUMENT {0}. Answer FALSE unless "
-               "the comment clearly matches the description.")
+               "applies to the comment in DOCUMENT {0}.")
 
 
 def build_sql(criterion: str = TOXIC) -> str:
@@ -194,6 +193,19 @@ def main() -> None:
         wall_s = report["wall_s"]
         boot_s = report.get("boot_s", 0.0)
         found = {(row["c.comment_id"], row["f.field"]) for row in table.to_pylist()}
+        ids = comments["comment_id"].to_pylist()
+        answers = result.answer_tables["filters"][("c", 0)]
+        toxic_found = {ids[i] for i, yes in zip(answers["c"].to_pylist(),
+                                                answers["answer"].to_pylist())
+                       if yes}
+        toxic_labeled = {pair[0] for pair in labeled} | {
+            ids[i] for i, score in enumerate(comments["toxicity"].to_pylist())
+            if score >= 0.5}
+        toxic_hits = len(toxic_found & toxic_labeled)
+        print(f"filter precision against the toxicity labels: "
+              f"{toxic_hits / max(1, len(toxic_found)):.3f}")
+        print(f"filter recall against the toxicity labels: "
+              f"{toxic_hits / max(1, len(toxic_labeled)):.3f}")
         print(f"(comment, field) pairs found: {len(found)}")
         print(table.to_pandas()["f.field"].value_counts().to_string())
         hits = len(found & labeled)
