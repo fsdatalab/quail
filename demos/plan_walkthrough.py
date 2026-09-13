@@ -1,35 +1,20 @@
-"""Plan, edit, and run a pair join on the CPU, with no GPU or Modal.
+"""Plan and edit a pair join on the CPU, with no GPU or Modal.
 
 Run from the repository root:
 
-    .venv/bin/python demos/plan_walkthrough.py
+    .venv/bin/python -m demos.plan_walkthrough
 
 Three claims and three evidence passages live in memory. The tokenizer
-is a stand-in that counts bytes, and the model answers come from the
-test fakes, so every second printed here is tiny. The plan text, node
-ids, estimates, edits, and reports have the same shape as on a GPU.
+is a stand-in that counts bytes. The script does not execute inference.
 """
 
-import sys
-from pathlib import Path
+import pyarrow as pa
 
-# The fake model and arena live with the tests, and the package is not
-# installed in the virtual environment.
-ROOT = Path(__file__).resolve().parents[1]
-sys.path[:0] = [str(ROOT), str(ROOT / "tests")]
-
-from fakes import same_page  # noqa: E402
-from test_fixed_join_plan import FixedFeverAnswers, register_fever  # noqa: E402
-from test_quail_backend import graph_state  # noqa: E402
-
-import quail  # noqa: E402
-from quail import EngineConfig, col, prompt  # noqa: E402
-from quail.backends.quail.graph import execute_single_graph  # noqa: E402
-from quail.execution import PhysicalResponse  # noqa: E402
-from quail.physical import Barrier, Scan, decode_graph  # noqa: E402
-from quail.planner.decide import explain  # noqa: E402
-from quail.planner.plan import PlanEditError  # noqa: E402
-from quail.runtime.execute import execute_query  # noqa: E402
+import quail
+from quail import EngineConfig, col, prompt
+from quail.physical import Barrier
+from quail.planner.decide import explain
+from quail.planner.plan import PlanEditError
 
 PERSON = "Is the claim in DOCUMENT {0} about a person?"
 SUPPORT = ("Does the passage in DOCUMENT {1} support the claim in "
@@ -45,30 +30,38 @@ WHERE AI_FILTER(PROMPT('{PERSON}', c.claim))
 """
 
 
-def fake_executor(session, seen):
-    """A physical executor that answers from the FEVER test fake."""
+def register_demo_data(session):
+    """Register the three claims and evidence passages used by the demo."""
+    for name, column, prefix, length in (
+        ("claims", "claim", "c", 20),
+        ("evidence", "text", "e", 300),
+    ):
+        table = pa.table({
+            "id": [f"{prefix}{index}" for index in range(3)],
+            column: [f"{index} " + "word " * length for index in range(3)],
+        })
+        if name == "claims":
+            table = table.append_column(
+                "evidence_wiki_url", pa.array(["e0", "e0", "e2"]))
+        session.register(
+            name, quail.DocumentProvider.from_table(table, id_col="id"))
 
-    def execute(request):
-        graph = decode_graph(request.plan["graph"], session.registry.codecs)
-        seen.append([node.node_id for node in graph.nodes])
-        docs = {node.alias: request.inputs[node.input_id].documents
-                for node in graph.nodes if isinstance(node, Scan)}
-        state = graph_state(None, docs)
-        state["model_execution"] = FixedFeverAnswers(state, 10, False)
-        state["columns"] = request.column_tables()
-        state["functions"] = session.registry.functions
-        report = execute_single_graph(state, request.plan["settings"], graph)
-        return PhysicalResponse(report.pop("_outputs"), report)
 
-    return execute
+def same_page(tables):
+    """Pair each claim with the evidence row its wiki URL names."""
+    return tables["c"].join(
+        tables["e"],
+        keys=["evidence_wiki_url"],
+        right_keys=["id"],
+        join_type="inner",
+    ).select(["c", "e"])
 
 
 def main():
-    """Print the plans, edit one, and run all of them under the fakes."""
+    """Print and edit equivalent SQL and builder plans."""
     with quail.Session(EngineConfig(),
                        tokenizer=lambda text: list(text.encode())) as session:
-        # three claims, two of them on page e0, and three passages
-        register_fever(session)
+        register_demo_data(session)
 
         print("=== SQL ===" + SQL)
         query = session.sql(SQL)
@@ -99,17 +92,6 @@ def main():
         except PlanEditError as error:
             print("PlanEditError:", error)
 
-        print("\n=== run the planner's plan and the edited plan ===")
-        seen = []
-        execute = fake_executor(session, seen)
-        rows = execute_query(query, physical_executor=execute).collect()
-        print("planner's plan rows:", rows.to_pylist())
-        edited_rows = execute_query(session.sql(SQL), physical_executor=execute,
-                                    plan=edited).collect()
-        print("edited plan rows:   ", edited_rows.to_pylist())
-        print("nodes executed:", seen[0])
-        print("nodes executed:", seen[1])
-
         print("\n=== the builder form: a Python function pairs the rows ===")
         paired = (session.docs("claims").alias("c")
                   .ai_filter(prompt(PERSON, col("c.claim")))
@@ -120,9 +102,6 @@ def main():
                   .select("c.id", "e.id"))
         print(paired.explain())
         print("node ids:", [node.node_id for node in paired.plan().nodes])
-        apply_rows = execute_query(paired, physical_executor=execute).collect()
-        print("apply rows:", apply_rows.to_pylist())
-        print("nodes executed:", seen[2])
 
 
 if __name__ == "__main__":
