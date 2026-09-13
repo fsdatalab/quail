@@ -65,17 +65,17 @@ export default function HomePage() {
         <div className="pointer-events-none absolute inset-y-0 right-0 hidden w-2/5 border-l border-fd-border bg-[linear-gradient(to_right,var(--color-fd-border)_1px,transparent_1px),linear-gradient(to_bottom,var(--color-fd-border)_1px,transparent_1px)] bg-[size:32px_32px] opacity-35 md:block" />
         <div className="relative max-w-3xl">
           <p className="mb-5 font-mono text-xs font-medium uppercase tracking-[0.2em] text-fd-muted-foreground">
-            Declarative AI SQL
+            Quail
           </p>
           <h1 className="text-5xl font-semibold tracking-[-0.04em] md:text-7xl">
-            Query unstructured data
+            A declarative, extensible
             <span className="block text-fd-muted-foreground">
-              with LLM-powered operators.
+              query engine for AI SQL.
             </span>
           </h1>
           <p className="mt-7 max-w-2xl text-lg leading-8 text-fd-muted-foreground">
-            Quail is a declarative, extensible query engine. Write filters
-            and joins in SQL or Python, then get an Arrow table back.
+            Use LLM-powered operators to filter documents, join collections,
+            and return structured results.
           </p>
           <div className="mt-8 flex flex-wrap gap-3">
             <Link
