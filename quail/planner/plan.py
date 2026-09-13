@@ -276,10 +276,10 @@ def resolve_model(name: str, models=None):
 @dataclass(frozen=True)
 class EngineConfig:
     """Top-level engine configuration."""
-    gpus: int = 1
-    model: str = "qwen3-4b-fp8"
-    backend: str = "quail"
-    device: str = "h100-sxm"
+    gpus: int
+    model: str
+    backend: str
+    device: str
     # sum the CUDA event pair each forward chunk records into gpu_s;
     # off by default so a run never pays for a measurement it does not read
     gpu_timing: bool = False

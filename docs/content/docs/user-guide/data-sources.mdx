@@ -10,7 +10,13 @@ in ones.
 ```python
 import quail
 
-session = quail.Session()
+config = quail.EngineConfig(
+    gpus=1,
+    model="qwen3-4b-fp8",
+    backend="quail",
+    device="h100-sxm",
+)
+session = quail.Session(config)
 session.register("reviews", quail.DocumentProvider.from_table(
     reviews,          # the IMDB table built in the quickstart
     id_col="id",

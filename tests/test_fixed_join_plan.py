@@ -17,6 +17,15 @@ from quail_b import prompts
 from quail_b.queries import FILTER_SELECTIVITY_ESTIMATES
 
 
+def _config(*, gpus, backend):
+    return EngineConfig(
+        gpus=gpus,
+        model="qwen3-4b-fp8",
+        backend=backend,
+        device="h100-sxm",
+    )
+
+
 def register_fever(session):
     for name, column, prefix, length in (
         ("claims", "claim", "c", 20), ("evidence", "text", "e", 300),
@@ -130,7 +139,7 @@ def test_fixed_order_execution_and_backend_planning(monkeypatch):
     ]:
             patch.setitem(FILTER_SELECTIVITY_ESTIMATES, prompts.F11, estimate)
             patch.setitem(FILTER_SELECTIVITY_ESTIMATES, prompts.F13, estimate)
-            with quail.Session(EngineConfig(),
+            with quail.Session(_config(gpus=1, backend="quail"),
                                tokenizer=lambda text: list(text.encode())) as session:
                 register_fever(session)
                 query = quailb.queries(session)["FEV-9"][1]()
@@ -186,7 +195,7 @@ def test_fixed_order_execution_and_backend_planning(monkeypatch):
                 }])
 
     for backend in ["stock_vllm", "pipelined_vllm", "pipelined_sglang"]:
-        with quail.Session(EngineConfig(backend=backend),
+        with quail.Session(_config(gpus=1, backend=backend),
                            tokenizer=lambda text: list(text.encode())) as session:
             register_fever(session)
             plan = quailb.queries(session)["FEV-9"][1]().plan()
@@ -200,7 +209,7 @@ def test_distributed_fev9_executes_bound_join_nodes(monkeypatch):
     from quail.runtime.runner import ExecutionContext
     from quail.specs import H100_SXM, QWEN3_4B_FP8
 
-    with quail.Session(EngineConfig(gpus=2),
+    with quail.Session(_config(gpus=2, backend="quail"),
                        tokenizer=lambda text: list(text.encode())) as session:
         register_fever(session)
         query = quailb.queries(session)["FEV-9"][1]()
@@ -323,7 +332,7 @@ def test_fev10_asks_the_model_about_same_page_pairs_only(monkeypatch):
         return {"columns": columns}
 
     for gpus in (1, 2):
-        with quail.Session(EngineConfig(gpus=gpus),
+        with quail.Session(_config(gpus=gpus, backend="quail"),
                            tokenizer=lambda text: list(text.encode())) as session:
             register_fever(session)
             query = quailb.queries(session)["FEV-10"][1]()
@@ -347,7 +356,7 @@ def test_fev10_asks_the_model_about_same_page_pairs_only(monkeypatch):
 
 
 def test_an_edited_fev9_plan_executes(monkeypatch):
-    with quail.Session(EngineConfig(),
+    with quail.Session(_config(gpus=1, backend="quail"),
                        tokenizer=lambda text: list(text.encode())) as session:
         register_fever(session)
         query = quailb.queries(session)["FEV-9"][1]()

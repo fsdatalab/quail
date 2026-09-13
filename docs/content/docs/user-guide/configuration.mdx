@@ -11,12 +11,16 @@ Configuration has two layers: `EngineConfig` says what to run, and the
 ```python
 @dataclass(frozen=True)
 class EngineConfig:
-    gpus: int = 1
-    model: str = "qwen3-4b-fp8"
-    backend: str = "quail"
-    device: str = "h100-sxm"
+    gpus: int
+    model: str
+    backend: str
+    device: str
     gpu_timing: bool = False
 ```
+
+The four execution fields have no defaults. Every session states which
+resources and implementation it will use. `gpu_timing` only controls optional
+measurement, so it remains off by default.
 
 - `device`: the registered hardware specification used for planning. Built in:
   `h100-sxm` and `rtx-pro-6000-blackwell-server`. This setting must match the
@@ -27,8 +31,8 @@ class EngineConfig:
 - `model`: a registered model name. Built in: `qwen3-4b-fp8` and
   `qwen3-32b-fp8`.
 - `backend`: a registered model backend. Built in: `quail`,
-  `stock_vllm`, `pipelined_vllm`, `pipelined_sglang`. A normal user
-  never sets this. The others exist for comparison runs.
+  `stock_vllm`, `pipelined_vllm`, `pipelined_sglang`. Use `quail` for
+  normal execution. The others exist for comparison runs.
 - `gpu_timing`: when true, the Quail backend adds `gpu_s` to the
   result report: the seconds a forward chunk was running on the GPU,
   summed from the CUDA events each chunk records. `wall_s` minus
@@ -39,7 +43,10 @@ class EngineConfig:
 
 ```python
 session = quail.Session(quail.EngineConfig(
-    model="qwen3-32b-fp8", gpus=2, device="h100-sxm",
+    gpus=2,
+    model="qwen3-32b-fp8",
+    backend="quail",
+    device="h100-sxm",
 ))
 ```
 
@@ -51,7 +58,10 @@ For an eight-GPU RTX PRO 6000 Blackwell Server Edition host:
 
 ```python
 session = quail.Session(quail.EngineConfig(
-    device="rtx-pro-6000-blackwell-server", gpus=8,
+    gpus=8,
+    model="qwen3-4b-fp8",
+    backend="quail",
+    device="rtx-pro-6000-blackwell-server",
 ))
 ```
 
@@ -64,7 +74,12 @@ through the function decorator.
 
 ```python
 quail.Session(
-    config=EngineConfig(),
+    config=EngineConfig(
+        gpus=1,
+        model="qwen3-4b-fp8",
+        backend="quail",
+        device="h100-sxm",
+    ),
     tokenizer=None,
     registry=None,
 )

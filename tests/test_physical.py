@@ -163,7 +163,12 @@ def test_physical_extensions_plan_validate_and_execute(monkeypatch):
     registry.register_physical_rule(KeepFirstDocument())
     registry.register_node(FirstDocuments, runtime=FirstDocumentsRuntime())
     session = quail.Session(
-        EngineConfig(backend="local_filter"),
+        EngineConfig(
+            gpus=1,
+            model="qwen3-4b-fp8",
+            backend="local_filter",
+            device="h100-sxm",
+        ),
         tokenizer=str.split,
         registry=registry,
     )

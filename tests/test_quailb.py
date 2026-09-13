@@ -63,8 +63,15 @@ def test_all_queries_compile_and_plan(tmp_path):
     "quail", "stock_vllm", "pipelined_vllm", "pipelined_sglang",
 ]:
         _standin_sets(tmp_path)
-        sess = quail.Session(EngineConfig(gpus=1, backend=backend),
-                             tokenizer=lambda text: list(text.encode()))
+        sess = quail.Session(
+            EngineConfig(
+                gpus=1,
+                model="qwen3-4b-fp8",
+                backend=backend,
+                device="h100-sxm",
+            ),
+            tokenizer=lambda text: list(text.encode()),
+        )
         register_tables(sess, tmp_path)
         qdefs = queries(sess)
         expected = {

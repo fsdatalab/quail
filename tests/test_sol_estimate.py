@@ -24,7 +24,15 @@ def _session(tmp_path):
         "id": ["a0", "a1"],
         "aspect": ["acting", "ending"],
     }), tmp_path / "aspects.parquet")
-    sess = quail.Session(EngineConfig(gpus=1), tokenizer=str.split)
+    sess = quail.Session(
+        EngineConfig(
+            gpus=1,
+            model="qwen3-4b-fp8",
+            backend="quail",
+            device="h100-sxm",
+        ),
+        tokenizer=str.split,
+    )
     sess.register("reviews", DocumentProvider.from_parquet(
         str(tmp_path / "reviews.parquet"), id_col="id"))
     sess.register("aspects", DocumentProvider.from_parquet(

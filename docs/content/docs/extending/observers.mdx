@@ -87,7 +87,13 @@ class Progress:
 
 
 registry = quail.ExtensionRegistry.with_built_ins().register_observer(Progress)
-session = quail.Session(registry=registry)
+config = quail.EngineConfig(
+    gpus=1,
+    model="qwen3-4b-fp8",
+    backend="quail",
+    device="h100-sxm",
+)
+session = quail.Session(config, registry=registry)
 ...
 result.observer(Progress)["nodes"]
 ```

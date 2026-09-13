@@ -82,7 +82,7 @@ ESTIMATE_SAMPLE = 1024
 
 
 class Session:
-    def __init__(self, config: EngineConfig = EngineConfig(), *,
+    def __init__(self, config: EngineConfig, *,
                  tokenizer=None,
                  registry: ExtensionRegistry | None = None):
         self.registry = registry or built_in_registry()

@@ -15,7 +15,12 @@ def test_rtx_plan_uses_its_memory_budget():
     for model_name, gpus in [("qwen3-4b-fp8", 1),
                                              ("qwen3-32b-fp8", 8)]:
         device = RTX_PRO_6000_BLACKWELL_SERVER
-        config = quail.EngineConfig(model=model_name, device=device.name, gpus=gpus)
+        config = quail.EngineConfig(
+            gpus=gpus,
+            model=model_name,
+            backend="quail",
+            device=device.name,
+        )
         def tokenizer(text):
             return list(text.encode())
         with quail.Session(config, tokenizer=tokenizer) as session:

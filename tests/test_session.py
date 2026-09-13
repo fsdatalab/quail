@@ -64,7 +64,13 @@ def runtime_plan(request):
 
 @pytest.fixture()
 def sess(tmp_path):
-    s = quail.Session(EngineConfig(gpus=1), tokenizer=fake_tok)
+    config = EngineConfig(
+        gpus=1,
+        model="qwen3-4b-fp8",
+        backend="quail",
+        device="h100-sxm",
+    )
+    s = quail.Session(config, tokenizer=fake_tok)
     # reviews: longer documents (they anchor); products: short
     s.register("reviews", quail.DocumentProvider.from_parquet(
         _parquet(tmp_path / "r.parquet", {
@@ -78,6 +84,13 @@ def sess(tmp_path):
         }), id_col="asin"))
     yield s
     s.close()
+
+
+def test_session_requires_complete_execution_config():
+    with pytest.raises(TypeError, match="required positional arguments"):
+        EngineConfig()
+    with pytest.raises(TypeError, match="required positional argument: 'config'"):
+        quail.Session()
 
 
 def make_executor(filter_truth, join_truth=None, seen=None):
@@ -231,7 +244,12 @@ class NodeTypes:
 
 def _observed_result(tmp_path, registry):
     session = quail.Session(
-        EngineConfig(gpus=1),
+        EngineConfig(
+            gpus=1,
+            model="qwen3-4b-fp8",
+            backend="quail",
+            device="h100-sxm",
+        ),
         tokenizer=fake_tok,
         registry=registry,
     )
@@ -278,8 +296,15 @@ def _pair_query(session, on):
 
 
 def test_session_plans_prices_and_ships_the_pair_table():
-    with quail.Session(EngineConfig(),
-                       tokenizer=lambda text: list(text.encode())) as session:
+    config = EngineConfig(
+        gpus=1,
+        model="qwen3-4b-fp8",
+        backend="quail",
+        device="h100-sxm",
+    )
+    with quail.Session(
+        config, tokenizer=lambda text: list(text.encode())
+    ) as session:
         register_claims_evidence(session)
         paired = _pair_query(session, on=True)
         cross = _pair_query(session, on=False)

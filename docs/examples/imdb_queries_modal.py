@@ -102,7 +102,13 @@ def run_queries() -> None:
     section("aspects")
     print(aspects.to_pydict())
 
-    with quail.Session() as session:
+    config = quail.EngineConfig(
+        gpus=1,
+        model="qwen3-4b-fp8",
+        backend="quail",
+        device="h100-sxm",
+    )
+    with quail.Session(config) as session:
         session.register("reviews", quail.DocumentProvider.from_table(
             reviews, id_col="id"))
         session.register("aspects", quail.DocumentProvider.from_table(

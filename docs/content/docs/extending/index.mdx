@@ -18,7 +18,13 @@ registry = (
     .register_node(MyNode, runtime=MyNodeRuntime())
     .register_physical_rule(PreferAllDocuments())
 )
-session = quail.Session(registry=registry)
+config = quail.EngineConfig(
+    gpus=1,
+    model="qwen3-4b-fp8",
+    backend="quail",
+    device="h100-sxm",
+)
+session = quail.Session(config, registry=registry)
 ```
 
 Names come from the objects. Rules, planners, observers, and backends have
@@ -83,7 +89,13 @@ from my_package import quail_extension
 
 registry = quail.ExtensionRegistry.with_built_ins()
 registry.load_extension(quail_extension)
-with quail.Session(registry=registry) as session:
+config = quail.EngineConfig(
+    gpus=1,
+    model="qwen3-4b-fp8",
+    backend="quail",
+    device="h100-sxm",
+)
+with quail.Session(config, registry=registry) as session:
     ...
 ```
 

@@ -13,7 +13,13 @@ def run_query():
     """Find reviews mentioning a positive aspect of the movie."""
     reviews = benchmark.load_table("reviews", limit=100)
     spec = benchmark.get_query("IMDB-1")
-    with quail.Session() as session:
+    config = quail.EngineConfig(
+        gpus=1,
+        model="qwen3-4b-fp8",
+        backend="quail",
+        device="h100-sxm",
+    )
+    with quail.Session(config) as session:
         session.register("reviews", quail.DocumentProvider.from_table(
             reviews, id_col="id"))
         query = build_query(session, spec)

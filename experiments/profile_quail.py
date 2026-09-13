@@ -189,7 +189,12 @@ def _quailb_session(model, sf, gpus=1):
 
     d = build_sets(DATA_DIR, sf)
     results_vol.commit()
-    sess = quail.Session(EngineConfig(gpus=gpus, model=model))
+    sess = quail.Session(EngineConfig(
+        gpus=gpus,
+        model=model,
+        backend="quail",
+        device="h100-sxm",
+    ))
     register_tables(sess, d)
     return sess, queries(sess)
 

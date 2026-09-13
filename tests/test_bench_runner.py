@@ -121,7 +121,13 @@ def _session(tmp_path, backend="quail"):
         pq.write_table(table, tmp_path / f"{name}.parquet")
     tokenizer = str.split if backend == "quail" else _token_ids
     sess = quail.Session(
-        EngineConfig(gpus=1, backend=backend), tokenizer=tokenizer
+        EngineConfig(
+            gpus=1,
+            model="qwen3-4b-fp8",
+            backend=backend,
+            device="h100-sxm",
+        ),
+        tokenizer=tokenizer,
     )
     for name in CORPUS:
         sess.register(name, DocumentProvider.from_parquet(
@@ -368,8 +374,15 @@ def test_benchmark_query_prompts_and_labels():
         plan = read_plan(spec.plan)
         answer = answer_oracle(truth, corpus)
 
-        with quail.Session(EngineConfig(backend=backend), tokenizer=lambda text: list(
-            text.encode("utf-8"))) as session:
+        config = EngineConfig(
+            gpus=1,
+            model="qwen3-4b-fp8",
+            backend=backend,
+            device="h100-sxm",
+        )
+        with quail.Session(
+            config, tokenizer=lambda text: list(text.encode("utf-8"))
+        ) as session:
             for name, table in corpus.items():
                 session.register(name, DocumentProvider.from_table(table, id_col="id"))
             query = build_query(session, spec)

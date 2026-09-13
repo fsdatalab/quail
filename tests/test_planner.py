@@ -826,7 +826,12 @@ def _apply_query(session, kind):
 
 
 def test_planner_places_foreign_nodes_and_keeps_or_drops_the_stream():
-    with quail.Session(EngineConfig(),
+    with quail.Session(EngineConfig(
+        gpus=1,
+        model="qwen3-4b-fp8",
+        backend="quail",
+        device="h100-sxm",
+    ),
                        tokenizer=lambda text: list(text.encode())) as session:
         # claims are the long side, so the planner anchors on them
         register_claims_evidence(session, claim_words=200, text_words=10)
@@ -851,14 +856,24 @@ def test_planner_places_foreign_nodes_and_keeps_or_drops_the_stream():
         assert request.column_tables()["c"].column("url").to_pylist()[:2] == [
             "u0", "u1"]
 
-    with quail.Session(EngineConfig(gpus=2),
+    with quail.Session(EngineConfig(
+        gpus=2,
+        model="qwen3-4b-fp8",
+        backend="quail",
+        device="h100-sxm",
+    ),
                        tokenizer=lambda text: list(text.encode())) as session:
         register_claims_evidence(session, claim_words=200, text_words=10)
         plan = _apply_query(session, "per_batch").plan()
         assert isinstance(plan, Refusal)
         assert plan.constraint == "per_batch_apply_needs_one_gpu"
         assert not isinstance(_apply_query(session, "barrier").plan(), Refusal)
-    with quail.Session(EngineConfig(backend="stock_vllm"),
+    with quail.Session(EngineConfig(
+        gpus=1,
+        model="qwen3-4b-fp8",
+        backend="stock_vllm",
+        device="h100-sxm",
+    ),
                        tokenizer=lambda text: list(text.encode())) as session:
         register_claims_evidence(session, claim_words=200, text_words=10)
         plan = _apply_query(session, "barrier").plan()

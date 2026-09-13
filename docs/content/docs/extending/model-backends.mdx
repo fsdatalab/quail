@@ -109,7 +109,16 @@ registry = quail.ExtensionRegistry.with_built_ins()
 registry.register_backend(MyBackend())
 ```
 
-Then select it with `EngineConfig(backend="my_backend")`.
+Then select it while naming every execution field:
+
+```python
+config = EngineConfig(
+    gpus=1,
+    model="qwen3-4b-fp8",
+    backend="my_backend",
+    device="h100-sxm",
+)
+```
 
 ## Extra safeguard in tests
 

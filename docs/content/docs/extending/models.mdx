@@ -46,7 +46,16 @@ registry = quail.ExtensionRegistry.with_built_ins()
 registry.register_model(MY_MODEL)
 ```
 
-Then `EngineConfig(model="my-model")` selects it.
+Then select it while naming every execution field:
+
+```python
+config = EngineConfig(
+    gpus=1,
+    model="my-model",
+    backend="quail",
+    device="h100-sxm",
+)
+```
 
 ## The kernel constraint
 
@@ -87,9 +96,9 @@ sparsity and halve them. The server page does not explicitly label sparsity;
 they are approximate planning assumptions, not published dense server specs. Quail does not use sparse weights. `hbm_bw` stores memory
 bandwidth for both HBM and GDDR devices.
 
-Register with `registry.register_device(spec)` and select with
-`Session(EngineConfig(device="name"))`. A backend must also accept the device,
-and its kernels must support that GPU. Quail selects FlashAttention-3 on H100
-and FlashAttention-2 on RTX PRO 6000 Blackwell. RTX execution still needs a
-GPU validation run. The supplied Modal examples request H100s. On an RTX
-host, use a normal session with the RTX device specification.
+Register with `registry.register_device(spec)` and use its name in the
+session's complete `EngineConfig`. A backend must also accept the device, and
+its kernels must support that GPU. Quail selects FlashAttention-3 on H100 and
+FlashAttention-2 on RTX PRO 6000 Blackwell. RTX execution still needs a GPU
+validation run. The supplied Modal examples request H100s. On an RTX host,
+use a normal session with the RTX device specification.

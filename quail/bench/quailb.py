@@ -202,11 +202,10 @@ def run_query(session, spec: QuerySpec, tables) -> RunOutput:
     return output
 
 
-def run_suite(only=None, *, sf=0.1, config=None, data_dir=None,
+def run_suite(only=None, *, sf=0.1, config, data_dir=None,
               ground_truth_collection=None, output_dir,
               h100_usd_per_hour=H100_USD_PER_HOUR):
     """Run Quail queries through QUAIL-B and save the benchmark report."""
-    config = config or quail.EngineConfig()
     with quail.Session(config) as session:
         return benchmark.run(
             partial(run_query, session), queries=only, scale_factor=sf,
@@ -230,9 +229,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sf", type=float, choices=(0.1, 0.5, 1.0), default=0.1)
     parser.add_argument("--only", help="comma-separated query IDs")
-    parser.add_argument("--model", default="qwen3-4b-fp8")
-    parser.add_argument("--backend", default="quail")
-    parser.add_argument("--gpus", type=int, default=1)
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--backend", required=True)
+    parser.add_argument("--device", required=True)
+    parser.add_argument("--gpus", type=int, required=True)
     parser.add_argument("--data-dir", help="directory containing input Parquet files")
     parser.add_argument("--ground-truth-collection")
     parser.add_argument("--output-dir", required=True, help="new run directory")
@@ -241,7 +241,11 @@ def main():
         [value.strip() for value in args.only.split(",")] if args.only else None,
         sf=args.sf,
         config=quail.EngineConfig(
-            model=args.model, backend=args.backend, gpus=args.gpus),
+            gpus=args.gpus,
+            model=args.model,
+            backend=args.backend,
+            device=args.device,
+        ),
         data_dir=args.data_dir,
         ground_truth_collection=args.ground_truth_collection,
         output_dir=args.output_dir)

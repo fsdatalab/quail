@@ -93,7 +93,15 @@ def test_projection_rule_preserves_schema_and_is_idempotent():
 
 
 def _session(tmp_path, tokenizer=fake_tok):
-    session = quail.Session(EngineConfig(gpus=1), tokenizer=tokenizer)
+    session = quail.Session(
+        EngineConfig(
+            gpus=1,
+            model="qwen3-4b-fp8",
+            backend="quail",
+            device="h100-sxm",
+        ),
+        tokenizer=tokenizer,
+    )
     path = tmp_path / "reviews.parquet"
     pq.write_table(pa.table({
         "id": ["r0", "r1", "r2"],
@@ -189,7 +197,15 @@ class _UnstableProvider:
 
 
 def test_failed_scans_and_tokenization_leave_no_partial_cache(tmp_path):
-    session = quail.Session(EngineConfig(gpus=1), tokenizer=fake_tok)
+    session = quail.Session(
+        EngineConfig(
+            gpus=1,
+            model="qwen3-4b-fp8",
+            backend="quail",
+            device="h100-sxm",
+        ),
+        tokenizer=fake_tok,
+    )
     provider = _UnstableProvider()
     session.register("docs", provider)
     session.tokenize("docs", "body", ("id",))

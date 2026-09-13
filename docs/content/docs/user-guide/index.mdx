@@ -26,7 +26,8 @@ dependencies include the Modal client for the supplied examples.
 
 ## Local GPU
 
-`quail.Session()` runs queries in the current process. The first `run()`
+`quail.Session(config)` runs queries in the current process. The required
+configuration names the backend, model, device, and GPU count. The first `run()`
 loads the model onto the visible GPU. The backend keeps the model in process
 state for later queries. `Session.close()` releases token files and background
 work. Without a supported GPU, `run()` raises a `RuntimeError`.

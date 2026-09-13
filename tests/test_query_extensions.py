@@ -29,7 +29,13 @@ def test_query_scans_provider_and_preserves_extension_objects(
         "body": ["first document", "second document"],
         "unused": [1, 2],
     }), path)
-    session = quail.Session(tokenizer=_tokens)
+    config = quail.EngineConfig(
+        gpus=1,
+        model="qwen3-4b-fp8",
+        backend="quail",
+        device="h100-sxm",
+    )
+    session = quail.Session(config, tokenizer=_tokens)
 
     monkeypatch.setattr(Session, "tokenizer", property(lambda self: _tokens))
     monkeypatch.setattr(Session, "_fast_tokenizer", lambda self: None)
