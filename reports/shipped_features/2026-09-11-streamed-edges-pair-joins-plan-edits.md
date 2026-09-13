@@ -6,10 +6,10 @@ its Modal function call id. All GPU runs: one H100, Qwen3 4B fp8,
 sf=0.1, model startup excluded from query time. Query time, document
 pairs per second, and $/query follow the definitions in CLAUDE.md;
 $/query uses $3.9492 per H100 hour. The recomputed KV columns in
-sections 1 to 5 are the engine's per-document `regret_tokens`, a
-document's own prefix computed again. Section 9 and the benchmark
-report use `regret_distinct_tokens`, which also counts the prompt
-prefix the documents share; section 10 says why.
+sections 1 to 5 are the engine's per-document `regret_tokens` of the
+time, a document's own prefix computed again; that accounting is gone.
+Section 9 defines the `regret_tokens` the benchmark reports now, and
+section 10 restates the six affected queries under it.
 
 ## 1. Filter survivors stream into the join anchored on them
 
@@ -302,123 +302,116 @@ call.
   script fails on a rerun directory without a manifest instead of
   skipping it.
 
-## 9. Quail-only rerun of all 33 queries against the saved Quail rows
+## 9. Recomputed KV is the distance to the requests' prefix trie
 
-The whole benchmark was rerun with this branch's engine, Quail only,
-to check the saved Quail rows in `reports/quailb-comparison.md`
-and the figures under `reports/plots/`. Two run directories, because
-the FEVER family of the first was cancelled while scoring FEV-8 with
-the id-code scorer (quail-bench PR #3) and rerun once quail-bench
-scored a traced run from its answers (PR #4) and sampled its rows
-chunk by chunk (PR #5):
+What changed: `regret_tokens` has one definition for every engine.
+Every request an engine made is a token sequence: preamble, document,
+question tail for a filter; preamble, anchor, frame, label, partner,
+answer cue for a join pair. With unlimited KV every distinct prefix
+across those sequences is computed once, so the query needs one
+forward pass position per node of their prefix trie. `minimum_tokens`
+is that count, `fresh_tokens` is what the engine computed, and
+`regret_tokens` is the difference. It is never negative, and it
+counts every cause alike: an evicted anchor computed again, a set
+scanned twice under two aliases, a prompt prefix the documents share
+computed once per document, the label before each pair's partner.
 
-- IMDB, BIO, LEP, AGENT:
-  `/results/benchmarks/quailb/family-runs/20260912T023323Z-e689d27e/`,
-  function calls `fc-01M29QF6N38ZTPKESAJSA53EP4` (imdb),
-  `fc-01M29QF6Q0WM29JPQHA1XY98T4` (biodex),
-  `fc-01M29QF6VJ1SW7YAMM1SHQ93FN` (lepard),
-  `fc-01M29QF6XNTEG0ZBTYWVRXPBD9` (agent).
-- FEV: `/results/benchmarks/quailb/family-runs/20260912T032335Z-609d6410/`,
-  function call `fc-01M29TCRAG0JW20ME880WJXXTS`.
+Where it is computed: in quail-bench, after the run, on the CPU
+(quail-bench PRs 6 and 7, pinned here as 0.3.0). Quail's runner
+reports only `fresh_tokens` and the prompt token ids it put around
+each document (`prompt_pieces`, saved beside the answer tables).
+quail-bench tokenizes the documents the answer tables name with the
+run's tokenizer, sizes the trie, and records both counts in each
+query's metrics and in a flat `measurements.parquet` per run;
+`quail-b report` recomputes them for a saved run, and
+`quail.bench.restate` adds the pieces to runs saved before the runner
+reported them. Nothing is tracked in the engine loop; the old run-time
+accounting (per-document regret, could-hit estimates, the cross-row
+cache split, and `regret_distinct_tokens`) is deleted.
 
-The saved-results report now carries a "Quail rerun against the saved
-Quail rows" table with every query, and the Quail bars in the main and
-dataset figures come from these runs. The baseline rows and bars are
-unchanged.
+Check: on the run below, the minimum quail-bench computed equals the
+one Quail's deleted code computed on every FEVER, LEP, and AGENT
+query, and differs by 4 tokens on the ten IMDB queries, where the
+engine's fast tokenizer and the HuggingFace tokenizer disagree by 4
+tokens across the 5,000 reviews.
 
-Prediction, stated before the runs: the five queries whose filtered
-alias anchors a join (IMDB-3, IMDB-4, IMDB-5, IMDB-10, BIO-3) drop to
-0 recomputed KV tokens and lose 10 to 30 percent of their time; FEV-9
-drops from 7,309 recomputed tokens to 0 and from 41.14 s to 38 or 39;
-FEV-10 stays near 1.7 s; every other query stays within a few percent
-with the same fresh tokens; answers and rows are identical everywhere.
+## 10. All 33 queries on all four methods with the new runner
 
-| Query | Saved time, s | Rerun time, s | Change | Saved recomputed KV | Rerun recomputed KV | Agreement saved / rerun, % |
-|---|---:|---:|---:|---:|---:|---:|
-| IMDB-3 | 32.35 | 22.20 | -31.4% | 1,228,087 | 10,355 | 79.16 / 79.16 |
-| IMDB-4 | 19.99 | 17.34 | -13.3% | 371,795 | 10,355 | 77.76 / 77.76 |
-| IMDB-5 | 17.76 | 16.52 | -7.0% | 198,942 | 10,355 | 80.17 / 80.17 |
-| IMDB-10 | 59.71 | 47.65 | -20.2% | 2,722,319 | 1,504,587 | 73.93 / 72.59 |
-| BIO-3 | 89.92 | 79.31 | -11.8% | 920,895 | 1,486 | 82.54 / 82.54 |
-| FEV-9 | 41.14 | 39.59 | -3.8% | 139,458 | 132,149 | 67.77 / 67.77 |
-| FEV-10 | 1.68 | 1.69 | +0.6% | 467 | 467 | 89.09 / 89.09 |
+Run: `modal run --detach -m quail.bench.quailb_parallel` with all four
+methods, teed to `results/benchmark/20260912T225056Z-all-methods-sf0.1.log`.
+Function call `fc-01M2BX28NBM9T7W4HDJTCBM3XQ`, one call per family
+and method group (listed in `reports/quailb-comparison.md`), run
+directory `/results/benchmarks/quailb/family-runs/20260912T225100Z-902686c5/`,
+where `measurements.parquet` holds every completed query and method.
+The `main` engine's recomputed KV on the six affected queries comes
+from the ablation tables of section 1 and 2, restated by quail-bench:
+`/results/ablations/streamed-filter-join-regret.json`.
 
-Recomputed KV here is `regret_distinct_tokens` (section 10). The
-per-document `regret_tokens` the prediction was stated in went from
-1,217,732, 361,440, 188,587, 1,217,732, 919,409, and 7,309 to 0 on the
-six queries. What remains is the prompt prefix the documents share:
-10,355 tokens across the reviews, 1,486 across the reports, and on
-FEV-9 132,149 across its two claim and two evidence aliases. IMDB-10's
-figures also hold the 1,494,232-token second copy of the reviews that
-its `r2` anchor computes in both runs (identical fresh tokens). The
-saved suite's build credited each alias only its within-set prefix, so
-the saved column is restated under the current rule: the saved
-per-document count plus the rerun's shared prefix credit, which
-scanned the same aliases.
+Prediction, stated before the run: Quail's regret under 1 percent of
+fresh tokens on filter-only queries except AGENT (about 11.9 million,
+68 percent), 3 to 10 percent on join queries from the label before
+each pair; stock and pipelined vLLM within 1 percent of Quail on
+filter-only queries and near it on joins; pipelined SGLang below Quail
+on join queries, FEV-9 near 4.1 million fresh against Quail's 4.3
+million; times within noise of the earlier runs; rows identical.
+
+Quail, the six queries whose join anchors `main` recomputed (the
+other 27 make the same requests before and after, with identical
+fresh tokens and rows, so their recomputed KV is unchanged; every
+query is in the report):
+
+| Query | Time before, s | Time after, s | Change | Recomputed KV before | Recomputed KV after |
+|---|---:|---:|---:|---:|---:|
+| IMDB-3 | 32.35 | 22.64 | -30.0% | 1,579,160 | 361,989 |
+| IMDB-4 | 19.99 | 17.38 | -13.1% | 479,784 | 118,395 |
+| IMDB-5 | 17.76 | 16.64 | -6.3% | 266,213 | 77,818 |
+| IMDB-10 | 59.71 | 48.58 | -18.6% | 4,072,039 | 2,854,868 |
+| BIO-3 | 89.92 | 79.96 | -11.1% | 3,194,945 | 2,275,033 |
+| FEV-9 | 41.14 | 38.23 | -7.1% | 2,286,831 | 2,279,522 |
 
 What happened against the prediction:
 
-- The six queries with per-document recomputed KV all went to 0 on
-  that count, and the five with a filtered anchor lost 7.0 to 31.4
-  percent of their time. IMDB-5's 7.0 percent is at the low end of the
-  predicted range because its recomputed share was the smallest
-  (188,587 of 2,118,230 fresh tokens).
-- FEV-9 came in at 39.59 s, just above the predicted 38 to 39, with
-  0 per-document recomputed tokens as predicted.
-- The 26 queries with no per-document recomputed KV have the same fresh
-  tokens and
-  the same rows as before. Their times moved between -3.4 and +11.5
-  percent. The FEVER family ran 2.5 to 7.1 percent slower across all
-  eight of its unchanged queries, and LEP-6 11.5 percent slower, which
-  is more than the few percent predicted; the fresh-token counts are
-  identical, so the difference is GPU-side timing between containers
-  rather than the engine doing different work.
-- Output rows are identical on all 33 queries. Agreement is identical
-  on 32; IMDB-10 moved from 73.93 to 72.59 percent while its output
-  rows did not change (64,840,220). The likely cause is that its join
-  prompts now sit on the streamed survivor's KV instead of a
-  recomputed copy, and with fp8 numerics the same prompt can decode
-  differently when its prefix was computed in a different batch. That
-  is not verified. Comparing the per-pair answers of the two runs on
-  the volume would settle it.
+- Filter-only queries: as predicted. Quail recomputes 1.1 to 1.3
+  percent on IMDB-1, IMDB-6, IMDB-7, LEP-1, LEP-8 (the openings the
+  documents share), 4.1 percent on FEV-1, 0.1 percent on BIO-1, and
+  11,886,152 tokens (68 percent) on each AGENT query.
+- Single-join queries: above the predicted 3 to 10 percent. IMDB-4
+  and IMDB-5 are 5.9 and 4.0 percent, LEP-2 to LEP-7 about 10, but
+  IMDB-2 is 16.8, FEV-2 29.7, and BIO-2 40.0 percent: the label is 6
+  tokens and the partner documents are short (2 to 12 tokens), so the
+  label is a third of every pair.
+- Chain queries: 52 to 55 percent (IMDB-9, IMDB-10, FEV-8, FEV-9),
+  not predicted. Two causes, both measured from the tables: a set
+  scanned under two aliases is computed twice (the 1,494,232 review
+  tokens as `r1` and again as `r2`), and a join that repeats an
+  earlier join's template on the same anchor set asks identical
+  prompts again (FEV-8's join 2 repeats 136,899 of join 0's SUPPORT
+  requests, about 3.0 million of its 5.0 million). Pipelining covers
+  the filter-to-join edge and the joins of one anchor group; it does
+  not carry KV between groups or aliases. That is the next target.
+- vLLM: within 1 percent of Quail on single-stage filters as
+  predicted, but not on filter chains: stock vLLM recomputes 25 and
+  31 percent on IMDB-6 and IMDB-7 (operator-at-a-time execution
+  resubmits every survivor after its block cache has turned over),
+  pipelined vLLM 3.5 and 16. On joins stock vLLM recomputes 2 to 11
+  times what Quail does on IMDB-3 to IMDB-7 and is 1.2 to 1.8 times
+  slower there; on FEVER and LEP it is within 10 percent of Quail's
+  count and 1.2 to 2.3 times slower.
+- SGLang: below Quail on FEV-9 (2,177,762 against 2,279,522; 4.1
+  against 4.3 million fresh) and LEP-3 to LEP-7 as predicted, above
+  it on FEV-2 and LEP-2. On the IMDB join queries it recomputed 77 to
+  95 percent of its fresh tokens (IMDB-2: 18,929,885 of 20.9 million)
+  and took 5 to 12 times Quail's time, which the earlier adapter did
+  not show; that needs its own look.
+- Times are within noise of the earlier runs and the rows are
+  identical on every query.
+- Not measured in this run: pipelined vLLM FEV-1 to FEV-9 and the
+  three baselines' FEV-10, because the FEVER container failed on
+  FEV-10 in the request backends (their runner did not pass the
+  equality join's key columns; fixed in this branch with a CPU test
+  that reproduces it), and pipelined SGLang BIO-2 and BIO-3, whose
+  container had not finished. The report fills those cells from the
+  September 5 suite and the September 11 FEV-10 run and labels each.
 
-Command, teed to `results/benchmark/20260912T023319Z-quail-only-sf0.1.log`
-and `results/benchmark/20260912T032332Z-quail-only-fever-sf0.1.log`
-(the FEVER run passed `--query FEV-1,...,FEV-10`):
-
-    modal run --detach -m quail.bench.quailb_parallel \
-      --output-dir /results/benchmarks/quailb/family-runs \
-      --model qwen3-4b-fp8 --sf 0.1 \
-      --ground-truth-collection gt_77bb8b128743a79aedddaa24c808c3f8 \
-      --no-include-baselines --no-include-sglang
-
-## 10. Recomputed KV counts the shared prompt prefix
-
-The benchmark report and its figures showed the engine's per-document
-`regret_tokens`, which is 0 on both AGENT queries although Quail
-computes the 11,882,610 tokens the 1,772 agent traces share as a
-prefix once per document. They now show `regret_distinct_tokens`: the
-per-document count plus the prefix tokens the scanned documents share
-(a set scanned under two aliases counts its second copy in full) minus
-the cross-row cache hits the engine reported. `quail/runtime/prefixes.py`
-derives it on the CPU after the run from the saved counts and the
-corpus tokens; every saved row on the volume already carries it, and
-nothing is tracked in the engine loop. The rule in CLAUDE.md names
-this figure now.
-
-AGENT-1 under the new figure, all from the saved rows:
-
-| Configuration | Query time, s | Fresh tokens | Recomputed KV tokens |
-|---|---:|---:|---:|
-| Quail | 234.86 | 17,389,113 | 11,882,610 |
-| Stock vLLM (operator-at-a-time) | 102.35 | 5,526,889 | 20,386 |
-| Pipelined vLLM | 99.15 | 5,526,889 | 20,386 |
-| Pipelined SGLang | 218.13 | 13,068,441 | 7,561,938 |
-
-vLLM's prefix cache reuses the shared prompt across documents and
-Quail's arena does not, which is the whole gap between them on AGENT.
-Two saved rows have no figure: the earlier SGLang adapter's cross-row
-count on FEV-7 and FEV-8 is 125,851 tokens, the whole evidence set,
-more than any prefix the trie credits, so the derived value is
-negative and the report marks it not measured rather than zero.
-
+Figure: plots/quailb_main.png (the full comparison and the per-family
+figures are in `reports/quailb-comparison.md`).

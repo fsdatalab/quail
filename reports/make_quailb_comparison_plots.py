@@ -420,16 +420,15 @@ def before_after_lines(root, rows, corpus):
         change = 100 * (after["runtime_s"] - before["runtime_s"]) / before["runtime_s"]
         if (query, "materialized") in ablation:
             earlier = ablation[(query, "materialized")]
-            assert earlier["fresh"] == before["fresh_tokens"], query
-            regret_before = earlier["regret"]
+            fresh_before, regret_before = earlier["fresh"], earlier["regret"]
         else:
             assert before["fresh_tokens"] == after["fresh_tokens"], query
-            regret_before = after["regret_tokens"]
+            fresh_before, regret_before = before["fresh_tokens"], after["regret_tokens"]
         lines.append(
             f"| {query} | {before['runtime_s']:.2f} | {after['runtime_s']:.2f} "
             f"| {change:+.1f}% | {token_cell(regret_before)} "
             f"| {token_cell(after['regret_tokens'])} "
-            f"| {before['fresh_tokens']:,} | {after['fresh_tokens']:,} "
+            f"| {fresh_before:,} | {after['fresh_tokens']:,} "
             f"| {before['predicted_rows']:,} / {after['predicted_rows']:,} |")
     return lines + [""]
 
@@ -458,6 +457,18 @@ def main(workdir):
     output = rows["quail"]["FEV-9"]
     calls = manifest["function_call_ids"]
     borrowed = sorted(key for key, source in sources.items() if source != "run")
+    labels = {key: label for key, label, _ in METHODS}
+
+    def borrowed_text(source):
+        cells = {}
+        for (method, query), where in sources.items():
+            if where == source:
+                cells.setdefault(method, []).append(query)
+        return "; ".join(
+            f"{labels[method]} " + ", ".join(
+                query for query in QUERY_ORDER if query in queries_of)
+            for method, queries_of in cells.items())
+
     lines = [
         "# QUAIL-B comparison", "",
         "- The main PDF covers all 33 queries with grouped bars and one metric "
@@ -472,15 +483,15 @@ def main(workdir):
         "- All four methods were run on September 12, 2026: "
         f"`/results/benchmarks/quailb/family-runs/{manifest['run_id']}/`,",
         "  function calls " + ", ".join(f"`{call}`" for call in calls.values()) + ".",
-        f"  {len(borrowed)} of the 132 cells come from earlier runs because that",
+        f"  {len(borrowed)} of the 132 cells come from earlier runs, because that",
         "  run's FEVER container failed on FEV-10 in the request backends (an",
         "  equality join's key columns were not passed to them; fixed on this",
-        "  branch) and was not rerun: pipelined vLLM FEV-1 to FEV-9 from the",
-        "  saved September 5 suite (FEV-9 from its September 6 rerun), and the",
-        "  three baselines' FEV-10 from the September 11 FEV-10 run",
-        f"  (`/results/benchmarks/quailb/family-runs/{fev10_manifest['run_id']}/`).",
-        "  The saved suite kept no answer tables, so its recomputed KV is not",
-        "  measured; the FEV-10 run's is.",
+        "  branch) and its SGLang BIODEX container had not finished; neither",
+        "  was rerun. From the saved September 5 suite (FEV-9 from its",
+        "  September 6 rerun), with no answer tables and so no recomputed KV",
+        f"  figure: {borrowed_text('saved')}. From the September 11 FEV-10 run",
+        f"  (`/results/benchmarks/quailb/family-runs/{fev10_manifest['run_id']}/`),",
+        f"  with recomputed KV: {borrowed_text('fev10')}.",
         f"- Quail was faster than stock vLLM on {faster} of {len(queries)} queries.",
         "- A horizontal line across each query's bar group shows its SoL estimate.",
         "  SoL models ideal computation and memory traffic with unlimited prefix KV.",
