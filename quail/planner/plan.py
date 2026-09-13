@@ -273,7 +273,7 @@ def resolve_model(name: str, models=None):
         constraint="unknown_model", needed=1, available=0, unit="specs")
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class EngineConfig:
     """Top-level engine configuration."""
     gpus: int

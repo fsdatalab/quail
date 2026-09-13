@@ -9,7 +9,7 @@ Configuration has two layers: `EngineConfig` says what to run, and the
 ## EngineConfig
 
 ```python
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class EngineConfig:
     gpus: int
     model: str

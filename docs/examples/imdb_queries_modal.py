@@ -19,10 +19,33 @@ import pyarrow.parquet as pq
 from huggingface_hub import hf_hub_download
 
 import quail
-from quail_b.data import ASPECTS, SOURCE_REVISIONS
-from quail_b.prompts import DISCUSS_ASPECT, F1
 
 app = modal.App("quail-engine")
+IMDB_REVISION = "e6281661ce1c48d982bc483cf8a173c1bbeb5d31"
+ASPECTS = (
+    "the acting",
+    "the plot",
+    "the directing",
+    "the cinematography",
+    "the soundtrack",
+    "the pacing",
+    "the ending",
+    "the dialogue",
+    "the special effects",
+    "the character development",
+    "the screenplay",
+    "the editing",
+)
+F1 = (
+    "Judge strictly from the review above whether it mentions at least one "
+    "positive aspect of the movie.\n\n{0}\n\nInstruction: answer TRUE if the "
+    "review mentions at least one positive aspect of the movie, FALSE "
+    "otherwise."
+)
+DISCUSS_ASPECT = (
+    "Does the review in DOCUMENT {0} discuss the movie aspect in "
+    "DOCUMENT {1}?"
+)
 IMAGE_REQUIREMENTS = (
     "sqlglot==30.17.0",
     "transformers==5.15.0",
@@ -41,7 +64,7 @@ def load_reviews(count: int = 8) -> pa.Table:
         "stanfordnlp/imdb",
         "plain_text/train-00000-of-00001.parquet",
         repo_type="dataset",
-        revision=SOURCE_REVISIONS["stanfordnlp/imdb"],
+        revision=IMDB_REVISION,
     )
     texts = pq.read_table(path, columns=["text"]).column("text").to_pylist()
     picked = [t for t in texts if 250 < len(t) < 600 and "<br" not in t]
@@ -72,7 +95,7 @@ image = (
         "TRITON_CACHE_DIR": "/root/.cache/kernels/triton",
         "TORCHINDUCTOR_CACHE_DIR": "/root/.cache/kernels/torchinductor",
     })
-    .add_local_python_source("quail", "quail_b")
+    .add_local_python_source("quail")
 )
 results_vol = modal.Volume.from_name("quail-results", create_if_missing=True)
 kernel_cache = modal.Volume.from_name("quail-kernel-cache", create_if_missing=True)
