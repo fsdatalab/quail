@@ -38,11 +38,11 @@ DATASET_FILE = "raw/train-00000-of-00001.parquet"
 
 # The filter question. Text before {0} is the criterion; it is moved after
 # the comment by Quail so the comment's KV does not depend on the question.
-FILTER_PROMPT = """Judge strictly from the comment above whether it is among the most toxic comments on a news site: hateful, threatening, or abusive, not merely rude or opinionated.
-
-{0}
-
-Instruction: answer TRUE if the comment is among the most toxic, FALSE otherwise."""
+FILTER_PROMPT = (
+    "Judge strictly from the comment above whether it is among the most "
+    "toxic comments on a news site: hateful, threatening, or abusive, not "
+    "merely rude or opinionated.\n\n{0}\n\nInstruction: answer TRUE if the "
+    "comment is among the most toxic, FALSE otherwise.")
 
 # Score column -> the statement the model judges for each toxic comment.
 FIELDS = {
