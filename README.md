@@ -61,8 +61,8 @@ Model execution requires a CUDA GPU. The supported models are Qwen3 4B fp8
 and Qwen3 32B fp8, with one model copy per GPU.
 
 ```bash
-git clone https://github.com/fsdatalab/quail-exploration.git
-cd quail-exploration
+git clone https://github.com/fsdatalab/quail.git
+cd quail
 uv sync
 uv run python demos/quickstart.py
 ```
