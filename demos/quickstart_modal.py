@@ -14,13 +14,22 @@ from demos import quickstart
 app = modal.App("quail-engine")
 volume = modal.Volume.from_name("quail-results", create_if_missing=True)
 RESULTS_DIR = Path("/results/quickstart")
+IMAGE_REQUIREMENTS = (
+    "sqlglot==30.17.0",
+    "transformers==5.15.0",
+    "huggingface-hub==1.27.0",
+    "pyarrow==25.0.1",
+    "numpy==2.3.5",
+    "bpe-qwen==0.1.5",
+    "datasets==5.0.1",
+    "vllm==0.26.0",
+)
 
 image = (
     modal.Image.from_registry(
         "nvidia/cuda:13.0.1-devel-ubuntu24.04", add_python="3.12")
     .entrypoint([])
-    .pip_install("vllm==0.26.0", "pyarrow", "sqlglot>=27.0",
-                 "bpe-qwen>=0.1.5", "datasets>=5.0.1")
+    .pip_install(*IMAGE_REQUIREMENTS)
     .env({
         "HF_HOME": "/results/models",
         "QUAIL_CACHE_DIR": "/results/kernels",

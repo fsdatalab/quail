@@ -1,6 +1,7 @@
 """Whole-query Modal function execution with a fake model."""
 
 import json
+import tomllib
 from pathlib import Path
 
 import pyarrow as pa
@@ -10,6 +11,28 @@ from test_session import make_executor
 from demos import quickstart, quickstart_modal
 from quail.runtime import execute as execution
 from quail.runtime.session import Session
+
+
+def test_release_dependencies_are_exact_and_match_modal_demo():
+    project = tomllib.loads(Path("pyproject.toml").read_text())
+    runtime = tuple(
+        requirement.split(";", 1)[0].strip()
+        for requirement in project["project"]["dependencies"]
+        if "sys_platform == 'emscripten' or sys_platform == 'win32'"
+        not in requirement
+    )
+    assert runtime == quickstart_modal.IMAGE_REQUIREMENTS
+    assert all(
+        "==" in requirement
+        for requirement in project["project"]["dependencies"]
+    )
+
+    dev = project["dependency-groups"]["dev"]
+    pinned_dev = (requirement for requirement in dev if requirement != "quail-b")
+    assert all("==" in requirement for requirement in pinned_dev)
+    quail_b_source = project["tool"]["uv"]["sources"]["quail-b"]
+    assert len(quail_b_source["rev"]) == 40
+    assert project["build-system"]["requires"] == ["hatchling==1.32.0"]
 
 
 def test_quickstarts_return_collected_rows_after_session_closes(monkeypatch, tmp_path):
