@@ -25,15 +25,22 @@ time.
 The filter loop fills each forward pass by two budgets: tokens and
 KV pages.
 
-- **Pipelining.** A document that passes one predicate enters the
-  next forward pass with its next predicate immediately.
-- **Token-based admission.** A forward pass is full when its token
-  budget or the arena's free pages are exhausted.
-- **KV rewind.** The document's KV from the first predicate stays
-  in the arena. Later predicates add only the question suffix tokens.
+### Pipelining
 
-KV pages are freed when a document fails a predicate or finishes its
-last one.
+A document that passes one predicate enters the next forward pass
+with its next predicate immediately. It does not wait for the rest
+of the batch.
+
+### Token-based admission
+
+A forward pass is full when its token budget or the arena's free
+pages are exhausted, not when a fixed request count is reached.
+
+### KV rewind
+
+The document's KV from the first predicate stays in the arena. Later
+predicates add only the question suffix tokens. KV pages are freed
+when a document fails a predicate or finishes its last one.
 
 ## Joins
 
@@ -41,13 +48,21 @@ A join packs one anchor document's prefix per forward pass and
 evaluates multiple partner documents against it. All partners in one
 forward pass share the anchor's KV through paged cross-attention.
 
-- **Gating.** Between join stages, anchors with no passing pair are
-  dropped and their pages freed.
-- **Streaming.** The first join group's anchor filter does not finish
-  before the join starts. Each document that passes its last filter
-  keeps its KV and enters the join immediately.
-- **Retention.** Later join groups reuse retained KV for their
-  anchors. If KV was evicted, the document is reprocessed.
+### Gating
+
+Between join stages, anchors with no passing pair are dropped and
+their pages freed.
+
+### Streaming
+
+The first join group's anchor filter does not finish before the join
+starts. Each document that passes its last filter keeps its KV and
+enters the join immediately.
+
+### Retention
+
+Later join groups reuse retained KV for their anchors. If KV was
+evicted, the document is reprocessed.
 
 The planner uses dynamic programming (Selinger-style) to choose the
 join order and anchors before inference. Filter survival is estimated

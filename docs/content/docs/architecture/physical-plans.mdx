@@ -4,12 +4,15 @@ title: Physical plans
 
 A physical plan is a directed acyclic graph of typed nodes. The
 planner produces it from the logical plan, and the runner executes
-it.
+it. You can inspect, edit, and re-run the plan before or after
+execution.
 
-## Nodes and ports
+## Structure
 
-Each node has typed input and output ports. An `InputPort` reads from
-one `OutputPort` of another node. Value types include
+### Nodes and ports
+
+Each node has typed input and output ports. An `InputPort` reads
+from one `OutputPort` of another node. Value types include
 `DOCUMENT_IDS`, `FILTER_ANSWERS`, `JOIN_ANSWERS`, and `ROWS`. The
 graph validates that connected ports have matching types.
 
@@ -24,16 +27,16 @@ class PhysicalNode:
     location: ClassVar[ExecutionLocation]
 ```
 
-## Node types
+### Node types
 
 **Generic nodes** (used by all backends):
 
 | Node | What it does |
 | --- | --- |
 | `Scan` | Names one tokenized input by alias. |
-| `Barrier` | Materializes survivor ids when the anchor changes between join steps. |
-| `Exchange` | With multiple GPUs, routes documents to the GPU holding their KV. |
-| `Recombine` | Joins TRUE answer tables on shared alias columns using Arrow. |
+| `Barrier` | Materializes survivor ids between join steps. |
+| `Exchange` | Routes documents across GPUs. |
+| `Recombine` | Joins TRUE answer tables using Arrow. |
 | `Project` | Reads the selected columns for surviving rows. |
 | `Limit` | Truncates the result. |
 
@@ -41,48 +44,84 @@ class PhysicalNode:
 
 | Node | What it does |
 | --- | --- |
-| `AiFilter` | Runs one table's filter stages on the GPU. |
-| `AiJoin` | Runs one join group with a fixed anchor on the GPU. |
+| `AiFilter` | Runs filter stages on the GPU. |
+| `AiJoin` | Runs join stages on the GPU. |
 
-**Request backend node** (vLLM, SGLang):
+### Node ids
 
-| Node | What it does |
-| --- | --- |
-| `RequestExecution` | Holds the tokenized prompts for submission to the inference server. |
-
-## Node ids
-
-Node ids are readable names:
-
-| Node | Id pattern | Example |
-| --- | --- | --- |
-| `Scan` | `scan:<alias>` | `scan:r` |
-| `AiFilter` | `ai_filter:<alias>` | `ai_filter:r` |
-| `AiJoin` | `ai_join:<anchor>` | `ai_join:r` |
-| `Barrier` | `barrier:<next_anchor>` | `barrier:e` |
-| `Foreign` | `apply:<name>` | `apply:same_page` |
-| `Project` | `project` | |
+Node ids are readable names like `ai_filter:r`, `ai_join:r`,
+`scan:r`, `barrier:e`, `apply:same_page`, `project`.
 
 ## Editing a plan
 
-You can edit the physical plan before running it:
+Physical plans are inspectable and editable. You get the plan,
+modify it, and run the modified version. Every edit returns a new
+immutable plan; the original is unchanged.
+
+This is useful for:
+
+- **Database integration.** Another query engine can call Quail's
+  planner, inspect the physical plan, insert or remove nodes, and
+  then execute the modified plan. The plan is a typed graph with a
+  serialization format, so it can cross process boundaries.
+- **Custom operators.** You can insert a user-defined `Foreign` node
+  between two operators, or remove one that the planner added.
+- **Debugging.** Inspect the plan with `explain()`, edit it, and
+  compare the execution of different plans.
+
+### API
 
 ```python
 plan = query.plan()
-plan2 = plan.insert(node, between=("ai_filter:c", "ai_join:e"))
-plan3 = plan2.remove("apply:same_page")
-result = query.run(plan=plan3)
 ```
 
-- **`insert(node, between=(producer, consumer))`**: put a node on
-  one edge.
-- **`remove(node_id)`**: take a node out and rewire. Only `Foreign`,
-  `Barrier`, and `Exchange` nodes can be removed.
-- **`move(node_id, between=...)`**: remove then insert.
+Get the physical plan without running it.
 
-Every edit returns a new plan. An illegal edit raises
-`PlanEditError`. After each edit, Quail re-validates the graph and
-re-estimates every node.
+```python
+plan2 = plan.insert(node, between=("ai_filter:c", "ai_join:e"))
+```
+
+Insert a node on the edge between two existing nodes. The new node
+must have one output of the same value type as the edge.
+
+```python
+plan3 = plan2.remove("apply:same_page")
+```
+
+Remove a node and rewire its consumers to its producer. Only
+`Foreign`, `Barrier`, and `Exchange` nodes can be removed — removing
+a `Scan`, `AiFilter`, or `AiJoin` would change what the query
+computes.
+
+```python
+plan4 = plan3.move("apply:same_page", between=("barrier:e", "ai_join:e"))
+```
+
+Move a node from its current position to a new edge.
+
+```python
+result = query.run(plan=plan4)
+```
+
+Run the edited plan. After each edit, Quail re-validates the graph
+(ports, types, cycles) and re-estimates every node. An illegal edit
+raises `PlanEditError`.
+
+### Example: inserting a custom operator
+
+```python
+from quail.physical.nodes import Foreign
+
+plan = query.plan()
+
+custom = Foreign(
+    node_id="apply:my_filter",
+    function="my_filter",
+    kind="per_batch",
+)
+edited = plan.insert(custom, between=("ai_filter:r", "ai_join:r"))
+result = query.run(plan=edited)
+```
 
 ## Execution
 
@@ -96,7 +135,6 @@ Model nodes run on the GPU. Relational nodes (`Recombine`,
 
 ## Serialization
 
-Each node type has a `NodeCodec` that encodes and decodes it for the
-process boundary. `plan_envelope` wraps the encoded graph with the
-backend, model, device, and worker count. The worker refuses the
-plan if any registered type is missing.
+Each node type has a `NodeCodec` for encoding and decoding across
+the process boundary. `plan_envelope` wraps the encoded graph with
+the backend, model, device, and worker count.
