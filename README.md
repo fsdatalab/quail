@@ -1,19 +1,36 @@
 # QUAIL-B
 
-QUAIL-B is a benchmark of 33 AI SQL queries over document tables.
+QUAIL-B is an academic benchmark of 33 AI SQL queries over document tables.
 AI SQL means SQL queries with predicates answered by a language model.
 
-The current benchmark only supports two AI SQL operations:
+## Contents
+
+- [Scope](#scope)
+- [Query plans](#query-plans)
+- [Scale factors](#scale-factors)
+- [Installation](#installation)
+- [Metrics](#metrics)
+- [Adapter interface](#adapter-interface)
+  - [Input](#input)
+  - [Output](#output)
+- [Running the benchmark](#running-the-benchmark)
+- [Data access and memory](#data-access-and-memory)
+- [Results](#results)
+- [Source definitions](#source-definitions)
+
+## Scope
+
+The benchmark supports two AI SQL operations:
 
 - **AI FILTER:** ask a boolean question about one document and keep the
   documents answered `TRUE`.
 - **AI JOIN:** ask a boolean question about two documents and keep the
   pairs answered `TRUE`.
 
-QUAIL-B is not a SQL engine. It provides 33 engine-independent query
-specifications, Arrow input tables, and reference answers. Your adapter
-executes each specification with your engine and returns the result.
-QUAIL-B then validates, scores, and saves the run.
+QUAIL-B is not a SQL engine. It provides engine-independent query
+specifications, Arrow input tables, and reference answers. An adapter is
+the integration function that executes each specification with an engine
+and returns the result. QUAIL-B validates, scores, and saves the run.
 
 For each query, the benchmark reports accuracy, query time, throughput,
 GPU cost, and token work.
@@ -25,7 +42,40 @@ queries by dataset. Gray nodes are table scans, blue nodes are AI FILTER,
 and orange nodes are AI JOIN. Percentages are the fixed planning
 selectivity estimates from the 0.1-scale reference labels.
 
-## Install
+## Scale factors
+
+The `scale_factor` parameter selects one published corpus. The supported
+values are `0.1`, `0.5`, and `1.0`. They represent 10%, 50%, and 100% of
+each dataset's full sampling target. The selected scale changes the input
+tables and reference answers. It does not change the 33 query definitions,
+prompts, or fixed planning selectivity estimates.
+
+The fraction applies to the primary sampling unit for each dataset: IMDB
+reviews, BioDEX reports, FEVER claims, LePaRD positive citation pairs, and
+SWE-Next trace snapshots. Fixed and derived tables do not necessarily grow
+in exact proportion. For example, IMDB has 12 fixed aspects, while BioDEX
+terms and FEVER evidence pages are derived from the documents selected at
+each scale.
+
+The published table sizes are:
+
+| Dataset | Input table | 0.1 rows | 0.5 rows | 1.0 rows |
+| --- | --- | ---: | ---: | ---: |
+| IMDB | `reviews` | 5,000 | 25,000 | 50,000 |
+| IMDB | `aspects` | 12 | 12 | 12 |
+| BioDEX | `reports` | 500 | 2,500 | 5,000 |
+| BioDEX | `terms` | 1,127 | 2,934 | 4,144 |
+| FEVER | `claims` | 500 | 2,500 | 5,000 |
+| FEVER | `evidence` | 287 | 1,037 | 1,478 |
+| LePaRD | `citation_contexts` | 500 | 2,496 | 4,972 |
+| LePaRD | `citation_passages` | 433 | 1,756 | 2,991 |
+| SWE-Next | `agent_traces` | 1,772 | 8,859 | 17,711 |
+
+Every value selects a fixed corpus built from pinned source revisions and a
+fixed sampling seed. A run records both the scale factor and exact corpus ID.
+Compare benchmark results only when these values match.
+
+## Installation
 
 Python 3.12.
 
@@ -33,7 +83,7 @@ Python 3.12.
 uv add "quail-b @ git+https://github.com/fsdatalab/quail-bench.git"
 ```
 
-## What QUAIL-B measures
+## Metrics
 
 - **Accuracy:** agreement with saved predicate answers, plus precision and
   recall of the final rows.
@@ -51,8 +101,10 @@ The three token counts are:
 - `regret_tokens`: `fresh_tokens - minimum_tokens`. This is the reusable
   document or anchor KV that the engine computed again. QUAIL-B computes it.
 
+KV is the model's key-value cache for previously computed tokens.
+
 To compute the last two counts, QUAIL-B needs the exact request prefixes.
-Your adapter returns `fresh_tokens` and `prompt_pieces`. `prompt_pieces`
+The adapter returns `fresh_tokens` and `prompt_pieces`. `prompt_pieces`
 contains the tokenizer name and the token IDs placed around each document:
 
 ```python
@@ -83,9 +135,11 @@ document, `tail`. See `quail_b.minimum.validate_prompt_pieces`.
 If an engine does not provide these values, accuracy and query performance
 still score, but its token counts are unavailable.
 
-## What your adapter receives
+## Adapter interface
 
-QUAIL-B calls your function as `run_query(query, tables)` once per query:
+### Input
+
+QUAIL-B calls `run_query(query, tables)` once per query:
 
 - `query` is a `QuerySpec`. It names the input tables, text columns,
   AI filter prompts, AI join prompts, and selected output columns.
@@ -122,10 +176,10 @@ query.select             # ("r.id", "a.id")
 For this query, `tables["reviews"]` has `id` and `body` columns.
 `tables["aspects"]` has `id` and `aspect` columns.
 
-## What your adapter returns
+### Output
 
-Your adapter translates the `QuerySpec` into your engine's AI SQL,
-executes it, and returns a `RunOutput`:
+The adapter translates the `QuerySpec` into the engine's AI SQL, executes
+it, and returns a `RunOutput`:
 
 ```python
 import pyarrow as pa
@@ -184,9 +238,9 @@ Filter and join indices start at 0. Pass `None` for the answer dictionaries
 if your engine did not record individual predicate answers. QUAIL-B can
 still score final output precision and recall.
 
-## Run the benchmark
+## Running the benchmark
 
-Pass that adapter to `quail_b.run`:
+Pass the adapter to `quail_b.run`:
 
 ```python
 quail_b.run(
@@ -198,7 +252,7 @@ quail_b.run(
 )
 ```
 
-### Data download and host memory
+## Data access and memory
 
 By default, `quail_b.run` reads the corpus and reference labels anonymously
 from the public `s3://quail-bench` bucket. The first run downloads immutable
@@ -222,14 +276,13 @@ published answer counts. They are planning values, not measured peaks.
 They exclude your engine, model, and returned result tables. Use 64 GiB
 for a full-scale run when the engine shares the same host.
 
-- Scale factors `0.1`, `0.5`, and `1.0` are supported.
 - Override the download cache with `cache_dir=` or `QUAIL_B_CACHE_DIR`.
 - Pass `data_dir=` to use local input Parquet files. Reference labels still
   come from S3 unless you pass a local published-data mirror as `root=`.
 - `gpu_count=` and `gpu_hourly_rate_usd=` add GPU cost.
 - An existing `output_dir` is never overwritten.
 
-## Read the results
+## Results
 
 `quail_b.run` writes `results/my-run/`:
 
@@ -267,6 +320,8 @@ Rebuild the report from saved answers:
 ```sh
 quail-b report results/my-run
 ```
+
+## Source definitions
 
 Query definitions: [`quail_b/queries.py`](quail_b/queries.py).
 Tables: [`quail_b/data.py`](quail_b/data.py).
