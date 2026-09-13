@@ -14,34 +14,41 @@ from quail_b.labels import (
     _validate_label_set_corpora,
     load_ground_truth,
 )
-from quail_b.queries import (
-    FilterSpec,
-    JoinSpec,
-    QuerySpec,
-    RelationSpec,
-    queries,
-)
+from quail_b.queries import QuerySpec, queries
 from quail_b.scoring import (
     RunOutput,
     evaluate,
     expected_rows,
     rows_from_answers,
 )
-from quail_b.substrait import build_plan
+from substrait_helpers import filter_rel, join_rel, project_plan, read_rel
 
 
-def _spec(query_id, description, relations, operators, select):
-    plan = build_plan(query_id, relations, operators, select)
-    return QuerySpec.from_plan(query_id, description, plan)
+def _spec(query_id, description, node, select):
+    return QuerySpec.from_plan(
+        query_id,
+        description,
+        project_plan(node, select),
+    )
 
 FILTER = "Judge the review.\n\n{0}\nAnswer TRUE or FALSE."
 JOIN = "Judge the pair.\n\n{0}\nAspect: {1}\nAnswer TRUE or FALSE."
+_REVIEWS = filter_rel(
+    read_rel("reviews", "r", "body"),
+    "filter-1",
+    FILTER,
+    "r.body",
+)
 SPEC = _spec(
-    "TEST-1", "one filter then one join",
-    (RelationSpec("r", "reviews", "body"),
-     RelationSpec("a", "aspects", "aspect")),
-    (FilterSpec("filter-1", "r", FILTER),
-     JoinSpec("join-1", ("r", "a"), JOIN)),
+    "TEST-1",
+    "one filter then one join",
+    join_rel(
+        _REVIEWS,
+        read_rel("aspects", "a", "aspect"),
+        "join-1",
+        JOIN,
+        ("r.body", "a.aspect"),
+    ),
     ("r.id", "a.id"),
 )
 CORPUS = {
@@ -192,9 +199,9 @@ def test_fev9_expected_rows_follow_the_join_chain_and_every_filter():
 
     spec = queries()["FEV-9"]
     assert [(filter_spec.relation, filter_spec.prompt)
-            for filter_spec in spec.filters] == [
+            for filter_spec in spec._info.filters] == [
         ("c1", F11), ("e1", F13), ("c2", F11), ("e2", F13)]
-    assert [join.relations for join in spec.joins] == [
+    assert [join.relations for join in spec._info.joins] == [
         ("c1", "e1"), ("c2", "e1"), ("c2", "e2")]
 
     rows = expected_rows(spec, truth, corpus)
@@ -209,8 +216,11 @@ def test_fev10_rows_keep_only_pairs_on_the_claims_own_page():
     corpus, truth = fever_truth()
     spec = queries()["FEV-10"]
     cross = queries()["FEV-5"]
-    assert spec.joins[0].on == (("evidence_wiki_url", "id"),)
-    assert spec.relations == cross.relations and not cross.joins[0].on
+    assert spec._info.joins[0].on == (("evidence_wiki_url", "id"),)
+    assert (
+        spec._info.relations == cross._info.relations
+        and not cross._info.joins[0].on
+    )
 
     # FEV-5 keeps every supported pair of surviving documents; FEV-10
     # drops (c1, e1) because c1's page is e0
@@ -251,7 +261,7 @@ def test_load_benchmark_with_local_reference_labels(tmp_path):
 
     corpus_id = PUBLISHED_CORPORA[0.1]
     spec = benchmark.get_query("IMDB-1")
-    template = spec.filters[0].prompt
+    template = spec._info.filters[0].prompt
     predicate_key = "test.review.filter"
     collection_dir = (tmp_path / GROUND_TRUTH_ROOT / "collections"
                       / collection_id)
@@ -491,29 +501,55 @@ def test_reused_label_set_rejects_changed_table_manifest(tmp_path):
 def _chain_spec():
     # FEV-8's shape: filters on the claims, three joins in a chain, every
     # alias selected
+    c1 = filter_rel(
+        read_rel("claims", "c1", "claim"),
+        "filter-1",
+        FILTER,
+        "c1.claim",
+    )
+    first = join_rel(
+        c1,
+        read_rel("evidence", "e1", "text"),
+        "join-1",
+        JOIN,
+        ("c1.claim", "e1.text"),
+    )
+    c2 = filter_rel(
+        read_rel("claims", "c2", "claim"),
+        "filter-2",
+        FILTER,
+        "c2.claim",
+    )
+    second = join_rel(
+        first,
+        c2,
+        "join-2",
+        JOIN,
+        ("e1.text", "c2.claim"),
+    )
     return _spec(
-        "CHAIN", "three joins", (
-            RelationSpec("c1", "claims", "claim"),
-            RelationSpec("e1", "evidence", "text"),
-            RelationSpec("c2", "claims", "claim"),
-            RelationSpec("e2", "evidence", "text")),
-        (FilterSpec("filter-1", "c1", FILTER),
-         JoinSpec("join-1", ("c1", "e1"), JOIN),
-         FilterSpec("filter-2", "c2", FILTER),
-         JoinSpec("join-2", ("e1", "c2"), JOIN),
-         JoinSpec("join-3", ("c2", "e2"), JOIN)),
-        ("c1.id", "e1.id", "c2.id", "e2.id"))
+        "CHAIN",
+        "three joins",
+        join_rel(
+            second,
+            read_rel("evidence", "e2", "text"),
+            "join-3",
+            JOIN,
+            ("c2.claim", "e2.text"),
+        ),
+        ("c1.id", "e1.id", "c2.id", "e2.id"),
+    )
 
 
 def _random_output(spec, rng, claims=12, evidence=8):
     filters = {}
-    for filter_spec in spec.filters:
+    for filter_spec in spec._info.filters:
         alias = filter_spec.relation
         filters[filter_spec.id] = pa.table({
             alias: [f"c{i}" for i in range(claims)],
             "answer": [rng.random() < 0.7 for _ in range(claims)]})
     joins = {}
-    for join in spec.joins:
+    for join in spec._info.joins:
         left, right = join.relations
         sizes = {"c": claims, "e": evidence}
         pairs = [(f"{left[0]}{i}", f"{right[0]}{j}")

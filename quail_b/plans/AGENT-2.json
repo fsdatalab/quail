@@ -1,0 +1,148 @@
+{
+  "execution_behavior": {
+    "variable_eval_mode": "VARIABLE_EVALUATION_MODE_PER_PLAN"
+  },
+  "expected_type_urls": [
+    "type.googleapis.com/org.fsdatalab.quail_b.substrait.v1.RelationMetadata",
+    "type.googleapis.com/org.fsdatalab.quail_b.substrait.v1.OperatorMetadata"
+  ],
+  "extension_urns": [
+    {
+      "extension_urn_anchor": 1,
+      "urn": "extension:org.fsdatalab.quail_b:functions_ai"
+    }
+  ],
+  "extensions": [
+    {
+      "extension_function": {
+        "extension_urn_reference": 1,
+        "function_anchor": 1,
+        "name": "ai_filter:str_str"
+      }
+    }
+  ],
+  "relations": [
+    {
+      "root": {
+        "input": {
+          "project": {
+            "common": {
+              "emit": {
+                "output_mapping": [
+                  2
+                ]
+              }
+            },
+            "expressions": [
+              {
+                "selection": {
+                  "direct_reference": {
+                    "struct_field": {}
+                  },
+                  "root_reference": {}
+                }
+              }
+            ],
+            "input": {
+              "filter": {
+                "advanced_extension": {
+                  "optimization": [
+                    {
+                      "@type": "type.googleapis.com/org.fsdatalab.quail_b.substrait.v1.OperatorMetadata",
+                      "operator_id": "filter-1",
+                      "schema_version": 1
+                    }
+                  ]
+                },
+                "common": {
+                  "direct": {}
+                },
+                "condition": {
+                  "scalar_function": {
+                    "arguments": [
+                      {
+                        "value": {
+                          "literal": {
+                            "string": "Judge strictly from the agent trace above whether, by the end of the trace, the agent has implemented a plausible fix that directly addresses the reported issue. A fix must include a code or configuration change whose purpose is to correct the issue. Inspection, reproduction, tests without a fix, and unrelated edits do not count.\n\n{0}\n\nInstruction: answer TRUE if the agent has implemented a plausible fix that directly addresses the reported issue. Answer FALSE otherwise."
+                          }
+                        }
+                      },
+                      {
+                        "value": {
+                          "selection": {
+                            "direct_reference": {
+                              "struct_field": {
+                                "field": 1
+                              }
+                            },
+                            "root_reference": {}
+                          }
+                        }
+                      }
+                    ],
+                    "function_reference": 1,
+                    "output_type": {
+                      "bool": {
+                        "nullability": "NULLABILITY_REQUIRED"
+                      }
+                    }
+                  }
+                },
+                "input": {
+                  "read": {
+                    "advanced_extension": {
+                      "optimization": [
+                        {
+                          "@type": "type.googleapis.com/org.fsdatalab.quail_b.substrait.v1.RelationMetadata",
+                          "alias": "t",
+                          "schema_version": 1,
+                          "text_column": "trace"
+                        }
+                      ]
+                    },
+                    "base_schema": {
+                      "names": [
+                        "id",
+                        "trace"
+                      ],
+                      "struct": {
+                        "nullability": "NULLABILITY_REQUIRED",
+                        "types": [
+                          {
+                            "string": {
+                              "nullability": "NULLABILITY_REQUIRED"
+                            }
+                          },
+                          {
+                            "string": {
+                              "nullability": "NULLABILITY_REQUIRED"
+                            }
+                          }
+                        ]
+                      }
+                    },
+                    "common": {
+                      "direct": {}
+                    },
+                    "named_table": {
+                      "names": [
+                        "agent_traces"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "names": [
+          "t"
+        ]
+      }
+    }
+  ],
+  "version": {
+    "minor_number": 103,
+    "producer": "quail-b"
+  }
+}

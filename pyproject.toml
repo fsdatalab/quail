@@ -13,6 +13,7 @@ dependencies = [
     "datasets>=5.0.1",
     "transformers>=4.48",
     "substrait-protobuf==0.103.0",
+    "protobuf>=6.31.1,<7",
 ]
 
 [dependency-groups]
@@ -48,9 +49,13 @@ ignore = ["D1"]
 [tool.ruff.lint.pydocstyle]
 convention = "google"
 
+[tool.ruff.lint.per-file-ignores]
+"quail_b/substrait_metadata_pb2.py" = ["ALL"]
+
 [tool.ruff.lint.isort]
 known-first-party = ["quail_b"]
 
 [tool.vulture]
 paths = ["quail_b"]
+exclude = ["*pb2.py"]
 min_confidence = 70

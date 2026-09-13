@@ -1,19 +1,19 @@
 """CPU checks for the QUAIL-B query catalog."""
 
+import json
 from importlib.resources import files
 
 import pytest
 from substrait import plan_pb2
 
 from quail_b.queries import (
+    FILTER_SELECTIVITY_ESTIMATES,
+    JOIN_SELECTIVITY_ESTIMATES,
     PRIVACY_QUERIES,
     QUERIES,
     QUERY_FAMILY_WORKLOADS,
     QUERY_ORDER,
-    FilterSpec,
-    JoinSpec,
     QuerySpec,
-    RelationSpec,
     queries,
     query_family_name,
     split_query_families,
@@ -21,11 +21,15 @@ from quail_b.queries import (
 )
 from quail_b.run import _query_hash
 from quail_b.substrait import (
+    AI_FILTER_NAME,
     AI_JOIN_NAME,
     AND_NAME,
     EQUAL_NAME,
-    build_plan,
-    plan_details,
+    _inspect_plan,
+)
+from quail_b.substrait_metadata_pb2 import (
+    OperatorMetadata,
+    RelationMetadata,
 )
 
 
@@ -41,54 +45,60 @@ def test_catalog_has_the_33_default_queries_and_two_privacy_queries():
     assert [spec.id for spec in PRIVACY_QUERIES] == ["PRIV-1", "PRIV-2"]
     assert list(queries(include_privacy=True)) == [*QUERY_ORDER, "PRIV-1", "PRIV-2"]
     for spec in QUERIES:
-        assert spec.has_estimates and spec.order == "by_cost", spec.id
-        assert all(name.endswith(".id") for name in spec.select), spec.id
+        info = _inspect_plan(spec.plan)
+        assert all(
+            filter_spec.prompt in FILTER_SELECTIVITY_ESTIMATES
+            for filter_spec in info.filters
+        ), spec.id
+        assert all(
+            join.prompt in JOIN_SELECTIVITY_ESTIMATES
+            for join in info.joins
+        ), spec.id
+        assert all(name.endswith(".id") for name in info.select), spec.id
     for spec in PRIVACY_QUERIES:
-        assert not spec.has_estimates and spec.order == "as_written", spec.id
+        info = _inspect_plan(spec.plan)
+        assert any(
+            filter_spec.prompt not in FILTER_SELECTIVITY_ESTIMATES
+            for filter_spec in info.filters
+        ), spec.id
 
 
-def test_spec_rejects_a_join_that_does_not_add_a_relation():
-    with pytest.raises(ValueError, match="must add one relation"):
-        build_plan(
-            "X-1",
-            (
-                RelationSpec("r", "reviews", "body"),
-                RelationSpec("a", "aspects", "aspect"),
-                RelationSpec("b", "aspects", "aspect"),
-            ),
-            (
-                JoinSpec("join-1", ("r", "a"), "{0} {1}"),
-                JoinSpec("join-2", ("r", "a"), "{0} {1}"),
-            ),
-            ("r.id",),
-        )
+def test_query_spec_contains_only_identity_and_plan_bytes():
+    assert tuple(QuerySpec.__dataclass_fields__) == (
+        "id",
+        "description",
+        "plan_bytes",
+    )
 
 
-def test_filters_are_explicit_ordered_operators():
+def test_filters_are_substrait_relations_over_their_input():
     spec = queries()["IMDB-4"]
 
     plan = spec.plan
     assert isinstance(plan, plan_pb2.Plan)
-    assert tuple(plan.expected_type_urls) == (
-        "type.googleapis.com/google.protobuf.Struct",
-    )
+    assert set(plan.expected_type_urls) == {
+        f"type.googleapis.com/{RelationMetadata.DESCRIPTOR.full_name}",
+        f"type.googleapis.com/{OperatorMetadata.DESCRIPTOR.full_name}",
+    }
     assert (
         plan.execution_behavior.variable_eval_mode
         == plan_pb2.ExecutionBehavior.VARIABLE_EVALUATION_MODE_PER_PLAN
     )
-    assert spec.relations == (
-        RelationSpec("r", "reviews", "body"),
-        RelationSpec("a", "aspects", "aspect"),
-    )
+    info = _inspect_plan(plan)
     assert [
-        (operator.id, operator.relation) for operator in spec.filters
+        (relation.alias, relation.table, relation.text_column)
+        for relation in info.relations
+    ] == [
+        ("r", "reviews", "body"),
+        ("a", "aspects", "aspect"),
+    ]
+    assert [
+        (operator.id, operator.relation) for operator in info.filters
     ] == [
         ("filter-1", "r"),
         ("filter-2", "r"),
     ]
-    assert [operator.id for operator in spec.joins] == ["join-1"]
-    assert isinstance(spec.operators[0], FilterSpec)
-    assert isinstance(spec.operators[-1], JoinSpec)
+    assert [operator.id for operator in info.joins] == ["join-1"]
 
     project = plan.relations[0].root.input.project
     join = project.input.join
@@ -130,7 +140,7 @@ def test_fev_10_combines_ai_and_ordinary_join_conditions():
 
 def test_repeated_tables_and_join_order_round_trip_through_substrait():
     spec = queries()["IMDB-9"]
-    details = plan_details(spec.plan)
+    details = _inspect_plan(spec.plan)
 
     assert [(relation.alias, relation.table) for relation in details.relations] == [
         ("r1", "reviews"),
@@ -188,6 +198,19 @@ def test_ai_extension_definition_is_packaged():
     assert "urn: extension:org.fsdatalab.quail_b:functions_ai" in extension
     assert "name: ai_filter" in extension
     assert "name: ai_join" in extension
+
+
+def test_substrait_plans_and_metadata_schema_are_packaged():
+    package = files("quail_b")
+    catalog = package.joinpath("plans", "catalog.json")
+    entries = json.loads(catalog.read_text())
+
+    assert len(entries) == 35
+    assert all(
+        package.joinpath("plans", f"{entry['id']}.json").is_file()
+        for entry in entries
+    )
+    assert package.joinpath("substrait_metadata.proto").is_file()
 
 
 def test_parallel_query_split_matches_stock_vllm():

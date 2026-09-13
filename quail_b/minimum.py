@@ -90,7 +90,7 @@ def validate_prompt_pieces(spec, pieces) -> dict:
     checked = {"tokenizer": pieces["tokenizer"],
                "preamble": _token_list(pieces.get("preamble", ()), "preamble"),
                "filters": [], "joins": []}
-    stages = {filter_spec.id for filter_spec in spec.filters}
+    stages = {filter_spec.id for filter_spec in spec._info.filters}
     for item in pieces.get("filters", ()):
         operator_id = item.get("id")
         if operator_id not in stages:
@@ -105,7 +105,7 @@ def validate_prompt_pieces(spec, pieces) -> dict:
         raise ValueError(
             f"prompt pieces: missing filter operators {sorted(stages)}"
         )
-    joins = {join.id: join for join in spec.joins}
+    joins = {join.id: join for join in spec._info.joins}
     operator_ids = set(joins)
     for item in pieces.get("joins", ()):
         operator_id = item.get("id")
@@ -194,7 +194,7 @@ def minimum_input_tokens(spec, pieces, filter_answers, join_answers,
     """
     sets = {
         relation.alias: (relation.table, relation.text_column)
-        for relation in spec.relations
+        for relation in spec._info.relations
     }
     pre = _tokens(pieces["preamble"])
     records: dict = {}
@@ -206,14 +206,16 @@ def minimum_input_tokens(spec, pieces, filter_answers, join_answers,
         return records[key]
 
     tails = {item["id"]: tuple(item["tail"]) for item in pieces["filters"]}
-    filters = {filter_spec.id: filter_spec for filter_spec in spec.filters}
+    filters = {
+        filter_spec.id: filter_spec for filter_spec in spec._info.filters
+    }
     for operator_id, table in filter_answers.items():
         alias = filters[operator_id].relation
         question = tails[operator_id]
         for row_id in table.column(alias).to_pylist():
             record(alias, row_id).suffixes.add(question)
     joins = {item["id"]: item for item in pieces["joins"]}
-    join_specs = {join.id: join for join in spec.joins}
+    join_specs = {join.id: join for join in spec._info.joins}
     for operator_id, table in join_answers.items():
         piece = joins[operator_id]
         anchor = piece["anchor"]

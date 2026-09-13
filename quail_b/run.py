@@ -22,7 +22,7 @@ from quail_b.scoring import (
     implied_rows_mask,
     scores_from_answers,
 )
-from quail_b.substrait import FilterSpec
+from quail_b.substrait import _Filter
 
 RUN_SCHEMA_VERSION = 2
 
@@ -53,8 +53,8 @@ def _query_hash(spec):
         )
     functions.sort()
     operators = []
-    for operator in spec.operators:
-        if isinstance(operator, FilterSpec):
+    for operator in spec._info.operators:
+        if isinstance(operator, _Filter):
             operators.append({
                 "kind": "filter",
                 "id": operator.id,
@@ -82,10 +82,10 @@ def _query_hash(spec):
                 "table": relation.table,
                 "text_column": relation.text_column,
             }
-            for relation in spec.relations
+            for relation in spec._info.relations
         ],
         "operators": operators,
-        "select": spec.select,
+        "select": spec._info.select,
     }
     encoded = json.dumps(
         definition,
@@ -190,7 +190,7 @@ def _validate_output(spec, output, tables):
                 codes.group_by(aliases).aggregate([]).num_rows != codes.num_rows):
             raise ValueError("duplicate document IDs in an answer table")
 
-    selected = [name.split(".")[0] for name in spec.select]
+    selected = [name.split(".")[0] for name in spec._info.select]
     if set(output.rows.column_names) != set(selected):
         raise ValueError("output columns must match the query's selected aliases")
     answers = scores_from_answers(spec, output, tables)
@@ -214,7 +214,9 @@ def _validate_output(spec, output, tables):
             survivors, relations, spec)
         if not (pc.all(mask).as_py() if sample.num_rows else True):
             raise ValueError("a returned row is not implied by the answers")
-    filters = {filter_spec.id: filter_spec for filter_spec in spec.filters}
+    filters = {
+        filter_spec.id: filter_spec for filter_spec in spec._info.filters
+    }
     for operator_id, table in (output.filter_answers or {}).items():
         if operator_id not in filters:
             raise ValueError(f"unknown filter operator {operator_id!r}")
@@ -222,7 +224,7 @@ def _validate_output(spec, output, tables):
         validate_ids(table, [alias])
         if table["answer"].null_count or str(table["answer"].type) != "bool":
             raise ValueError("predicate answers must be non-null booleans")
-    joins = {join.id: join for join in spec.joins}
+    joins = {join.id: join for join in spec._info.joins}
     for operator_id, table in (output.join_answers or {}).items():
         if operator_id not in joins:
             raise ValueError(f"unknown join operator {operator_id!r}")
@@ -238,7 +240,7 @@ def _score(spec, output, suite, gpu_count, gpu_hourly_rate_usd, tokens=None):
     seconds = output.runtime_s
     inputs = {
         relation.alias: len(suite.tables[relation.table])
-        for relation in spec.relations
+        for relation in spec._info.relations
     }
     metrics = {
         "runtime_s": seconds, "input_rows": inputs,
@@ -248,10 +250,12 @@ def _score(spec, output, suite, gpu_count, gpu_hourly_rate_usd, tokens=None):
     }
     if gpu_hourly_rate_usd is not None:
         metrics["cost_usd"] = seconds / 3600 * gpu_count * gpu_hourly_rate_usd
-    if spec.joins:
+    if spec._info.joins:
         pairs = output.measurements.get("evaluated_document_pairs")
         if output.join_answers is not None:
-            if set(output.join_answers) == {join.id for join in spec.joins}:
+            if set(output.join_answers) == {
+                join.id for join in spec._info.joins
+            }:
                 pairs = sum(len(table) for table in output.join_answers.values())
         if pairs is not None and (
                 isinstance(pairs, bool) or not isinstance(pairs, int) or pairs < 0):
@@ -326,7 +330,7 @@ def run(run_query, *, queries=None, scale_factor=0.1, output_dir,
             print(f"[quail-b] {spec.id}: {spec.description}", flush=True)
             tables = {
                 relation.table: suite.tables[relation.table]
-                for relation in spec.relations
+                for relation in spec._info.relations
             }
             try:
                 output = run_query(spec, tables)

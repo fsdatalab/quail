@@ -10,14 +10,17 @@ from quail_b.minimum import (
     token_metrics,
     validate_prompt_pieces,
 )
-from quail_b.queries import FilterSpec, JoinSpec, QuerySpec, RelationSpec
+from quail_b.queries import QuerySpec
 from quail_b.scoring import RunOutput
-from quail_b.substrait import build_plan
+from substrait_helpers import filter_rel, join_rel, project_plan, read_rel
 
 
-def _spec(query_id, description, relations, operators, select):
-    plan = build_plan(query_id, relations, operators, select)
-    return QuerySpec.from_plan(query_id, description, plan)
+def _spec(query_id, description, node, select):
+    return QuerySpec.from_plan(
+        query_id,
+        description,
+        project_plan(node, select),
+    )
 
 
 def _encode(texts):
@@ -50,13 +53,24 @@ def test_prefix_trie_size_counts_shared_prefixes_once():
 
 
 def test_minimum_input_tokens_counts_each_distinct_prefix_once():
+    documents = filter_rel(
+        read_rel("docs", "d", "body"),
+        "filter-1",
+        "useful {0}",
+        "d.body",
+    )
     spec = _spec(
-        "TEST-1", "one filter then one join",
-        (RelationSpec("d", "docs", "body"),
-         RelationSpec("a", "aspects", "name")),
-        (FilterSpec("filter-1", "d", "useful {0}"),
-         JoinSpec("join-1", ("d", "a"), "{0} mentions {1}")),
-        ("d.id", "a.id"))
+        "TEST-1",
+        "one filter then one join",
+        join_rel(
+            documents,
+            read_rel("aspects", "a", "name"),
+            "join-1",
+            "{0} mentions {1}",
+            ("d.body", "a.name"),
+        ),
+        ("d.id", "a.id"),
+    )
     corpus = {
         "docs": pa.table({"id": ["a", "b", "c"],
                           "body": ["same start one", "same start two", "other"]}),
@@ -89,14 +103,30 @@ def test_minimum_input_tokens_counts_each_distinct_prefix_once():
 
 
 def test_minimum_input_tokens_counts_a_document_once_across_uses():
+    second = filter_rel(
+        read_rel("docs", "d2", "body"),
+        "filter-1",
+        "short {0}",
+        "d2.body",
+    )
+    second = filter_rel(
+        second,
+        "filter-2",
+        "clear {0}",
+        "d2.body",
+    )
     spec = _spec(
-        "TEST-2", "a self join with two filter stages on one side",
-        (RelationSpec("d1", "docs", "body"),
-         RelationSpec("d2", "docs", "body")),
-        (FilterSpec("filter-1", "d2", "short {0}"),
-         FilterSpec("filter-2", "d2", "clear {0}"),
-         JoinSpec("join-1", ("d1", "d2"), "{0} before {1}")),
-        ("d1.id", "d2.id"))
+        "TEST-2",
+        "a self join with two filter stages on one side",
+        join_rel(
+            read_rel("docs", "d1", "body"),
+            second,
+            "join-1",
+            "{0} before {1}",
+            ("d1.body", "d2.body"),
+        ),
+        ("d1.id", "d2.id"),
+    )
     corpus = {"docs": pa.table({"id": ["a", "b"], "body": ["alpha", "beta"]})}
     first, second = _ids("\n\nshort?\nANSWER:"), _ids("\n\nclear?\nANSWER:")
     pieces = validate_prompt_pieces(spec, {
@@ -128,11 +158,18 @@ def test_minimum_input_tokens_counts_a_document_once_across_uses():
 
 
 def _filter_spec():
+    node = filter_rel(
+        read_rel("docs", "d", "body"),
+        "filter-1",
+        "useful {0}",
+        "d.body",
+    )
     return _spec(
-        "TEST-0", "one filter",
-        (RelationSpec("d", "docs", "body"),),
-        (FilterSpec("filter-1", "d", "useful {0}"),),
-        ("d.id",))
+        "TEST-0",
+        "one filter",
+        node,
+        ("d.id",),
+    )
 
 
 def _filter_output(**kwargs):

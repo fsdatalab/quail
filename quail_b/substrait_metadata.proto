@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+package org.fsdatalab.quail_b.substrait.v1;
+
+message RelationMetadata {
+  uint32 schema_version = 1;
+  string alias = 2;
+  string text_column = 3;
+}
+
+message OperatorMetadata {
+  uint32 schema_version = 1;
+  string operator_id = 2;
+}

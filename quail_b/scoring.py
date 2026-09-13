@@ -14,7 +14,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 from quail_b.data import _ids
-from quail_b.queries import JoinSpec, QuerySpec
+from quail_b.queries import QuerySpec
 
 
 @dataclass
@@ -159,7 +159,7 @@ def corpus_ids(spec: QuerySpec, corpus_rows) -> dict:
     return {relation.alias: pc.unique(pa.array(
         [str(row_id) for row_id in _ids(corpus_rows[relation.table])],
         type=pa.string()))
-        for relation in spec.relations}
+        for relation in spec._info.relations}
 
 
 def encode_ids(table: pa.Table, aliases, references: dict) -> pa.Table:
@@ -208,7 +208,7 @@ def _values_by_id(rows, column: str) -> dict[str, object]:
     return {str(row_id): value for row_id, value in zip(_ids(rows), values)}
 
 
-def _allowed_pairs(join: JoinSpec, spec: QuerySpec, corpus_rows):
+def _allowed_pairs(join, spec: QuerySpec, corpus_rows):
     """Return pair -> allowed for a join's equality conditions, or None."""
     if not join.on:
         return None
@@ -217,8 +217,8 @@ def _allowed_pairs(join: JoinSpec, spec: QuerySpec, corpus_rows):
             f"{spec.id}: the join on {join.on} needs the corpus rows to "
             f"apply its equality conditions")
     left, right = join.relations
-    left_rows = corpus_rows[spec.relation(left).table]
-    right_rows = corpus_rows[spec.relation(right).table]
+    left_rows = corpus_rows[spec._info.relation(left).table]
+    right_rows = corpus_rows[spec._info.relation(right).table]
     columns = [(_values_by_id(left_rows, left_column),
                 _values_by_id(right_rows, right_column))
                for left_column, right_column in join.on]
@@ -232,7 +232,7 @@ def _allowed_pairs(join: JoinSpec, spec: QuerySpec, corpus_rows):
     return allowed
 
 
-def _apply_conditions(table: pa.Table, join: JoinSpec, allowed) -> pa.Table:
+def _apply_conditions(table: pa.Table, join, allowed) -> pa.Table:
     if allowed is None:
         return table
     left, right = join.relations
@@ -254,8 +254,10 @@ def answer_relations(spec: QuerySpec, filter_answers, join_answers,
     """
     if join_answers is None or filter_answers is None:
         return None
-    survivors = {relation.alias: None for relation in spec.relations}
-    for filter_spec in spec.filters:
+    survivors = {
+        relation.alias: None for relation in spec._info.relations
+    }
+    for filter_spec in spec._info.filters:
         table = filter_answers.get(filter_spec.id)
         if table is None:
             return None
@@ -269,7 +271,7 @@ def answer_relations(spec: QuerySpec, filter_answers, join_answers,
         kept = survivors[alias]
         survivors[alias] = passed if kept is None else kept & passed
     relations = []
-    for join in spec.joins:
+    for join in spec._info.joins:
         table = join_answers.get(join.id)
         if table is None:
             return None
@@ -300,7 +302,8 @@ def rows_from_answers(spec: QuerySpec, filter_answers, join_answers,
     if relations:
         rows = _join_all(relations)
     else:
-        rows = _id_table({spec.base_alias: sorted(survivors[spec.base_alias])})
+        alias = spec._info.base_alias
+        rows = _id_table({alias: sorted(survivors[alias])})
     return _distinct(rows.select(sorted(rows.column_names)))
 
 
@@ -313,7 +316,7 @@ def implied_row_count(spec: QuerySpec, survivors: dict, relations: list) -> int:
     selected column, so the join's size is the distinct row count.
     """
     if not relations:
-        return len(survivors[spec.base_alias])
+        return len(survivors[spec._info.base_alias])
     pending = list(relations)
     current = pending.pop(0)
     current = current.append_column(
@@ -347,7 +350,7 @@ def implied_rows_mask(rows: pa.Table, survivors: dict, relations: list,
             mask = pc.and_(mask, pc.is_in(
                 rows.column(alias),
                 value_set=pa.array(sorted(survivors[alias]), pa.string())))
-    for join, relation in zip(spec.joins, relations):
+    for join, relation in zip(spec._info.joins, relations):
         left, right = join.relations
         pairs = pc.binary_join_element_wise(
             rows.column(left), rows.column(right), "\x1f")
@@ -355,8 +358,9 @@ def implied_rows_mask(rows: pa.Table, survivors: dict, relations: list,
             relation.column(left), relation.column(right), "\x1f")
         mask = pc.and_(mask, pc.is_in(pairs, value_set=pc.unique(known)))
     if not relations:
-        base = pa.array(sorted(survivors[spec.base_alias]), pa.string())
-        mask = pc.and_(mask, pc.is_in(rows.column(spec.base_alias),
+        alias = spec._info.base_alias
+        base = pa.array(sorted(survivors[alias]), pa.string())
+        mask = pc.and_(mask, pc.is_in(rows.column(alias),
                                       value_set=base))
     return mask
 
@@ -371,9 +375,11 @@ def scores_from_answers(spec: QuerySpec, output: RunOutput, corpus_rows):
         spec, output.filter_answers, output.join_answers, corpus_rows)
     if answers is None:
         return None
-    selected = {name.split(".")[0] for name in spec.select}
-    joined = {alias for join in spec.joins for alias in join.relations}
-    if not joined <= selected or spec.base_alias not in selected:
+    selected = {name.split(".")[0] for name in spec._info.select}
+    joined = {
+        alias for join in spec._info.joins for alias in join.relations
+    }
+    if not joined <= selected or spec._info.base_alias not in selected:
         return None
     return answers
 
@@ -393,10 +399,10 @@ def expected_survivors(spec: QuerySpec, ground_truth, corpus_rows
                        ) -> dict[str, list[str]]:
     """Return, per alias, the ids that pass every filter on it."""
     survivors = {}
-    for relation in spec.relations:
+    for relation in spec._info.relations:
         prompts = [
             filter_spec.prompt
-            for filter_spec in spec.filters
+            for filter_spec in spec._info.filters
             if filter_spec.relation == relation.alias
         ]
         survivors[relation.alias] = [
@@ -412,7 +418,7 @@ def expected_rows(spec: QuerySpec, ground_truth, corpus_rows) -> pa.Table:
     """Return the final rows the labels say the query should return."""
     survivors = expected_survivors(spec, ground_truth, corpus_rows)
     relations = []
-    for join in spec.joins:
+    for join in spec._info.joins:
         key = ground_truth.key_for_template(join.prompt)
         labels = ground_truth.predicates[key]
         left, right = join.relations
@@ -426,7 +432,8 @@ def expected_rows(spec: QuerySpec, ground_truth, corpus_rows) -> pa.Table:
     if relations:
         rows = _join_all(relations)
     else:
-        rows = _id_table({spec.base_alias: survivors[spec.base_alias]})
+        alias = spec._info.base_alias
+        rows = _id_table({alias: survivors[alias]})
     for alias in rows.column_names:
         rows = rows.join(
             _id_table({alias: survivors[alias]}),
@@ -437,7 +444,9 @@ def expected_rows(spec: QuerySpec, ground_truth, corpus_rows) -> pa.Table:
 def evaluate(spec: QuerySpec, output: RunOutput, ground_truth, corpus_rows) -> dict:
     per_predicate = []
     total = BinaryCounts()
-    filters = {filter_spec.id: filter_spec for filter_spec in spec.filters}
+    filters = {
+        filter_spec.id: filter_spec for filter_spec in spec._info.filters
+    }
     for operator_id, table in (output.filter_answers or {}).items():
         filter_spec = filters[operator_id]
         key = ground_truth.key_for_template(filter_spec.prompt)
@@ -453,7 +462,7 @@ def evaluate(spec: QuerySpec, output: RunOutput, ground_truth, corpus_rows) -> d
                 ))
         total.merge(item.counts)
         per_predicate.append(item.as_dict())
-    joins = {join.id: join for join in spec.joins}
+    joins = {join.id: join for join in spec._info.joins}
     for operator_id, table in (output.join_answers or {}).items():
         join = joins[operator_id]
         key = ground_truth.key_for_template(join.prompt)
@@ -469,7 +478,7 @@ def evaluate(spec: QuerySpec, output: RunOutput, ground_truth, corpus_rows) -> d
         per_predicate.append(item.as_dict())
 
     expected = expected_rows(spec, ground_truth, corpus_rows)
-    aliases = [name.split(".")[0] for name in spec.select]
+    aliases = [name.split(".")[0] for name in spec._info.select]
     expected = _distinct(expected.select(aliases))
     answers = scores_from_answers(spec, output, corpus_rows)
     if answers is not None:
@@ -490,10 +499,10 @@ def evaluate(spec: QuerySpec, output: RunOutput, ground_truth, corpus_rows) -> d
         predicted_count, matched_count = predicted.num_rows, matched.num_rows
     input_document_rows = sum(
         len(corpus_rows[relation.table])
-        for relation in spec.relations)
+        for relation in spec._info.relations)
     unique_documents = {
         (relation.table, str(row_id))
-        for relation in spec.relations
+        for relation in spec._info.relations
         for row_id in _ids(corpus_rows[relation.table])
     }
     return {

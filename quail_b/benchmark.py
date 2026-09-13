@@ -68,7 +68,7 @@ def load_benchmark(only=None, *, scale_factor=0.1, data_dir=None,
     names = sorted({
         relation.table
         for spec in specs
-        for relation in spec.relations
+        for relation in spec._info.relations
     })
     tables = {
         name: (

@@ -44,6 +44,10 @@ protocol-buffer format for relational query plans. `query.plan` returns the
 parsed plan. `query.plan_bytes` contains the deterministic binary serialization
 produced by the pinned Substrait 0.103 bindings.
 
+The query definitions are standard Substrait ProtoJSON files under
+[`quail_b/plans/`](quail_b/plans/). They are the source query plans, not
+generated views of another QUAIL-B query model.
+
 Protobuf does not define a canonical byte format across runtime versions.
 The saved `definition_hash` therefore resolves function anchors and hashes the
 validated relations, operators, prompts, and projection. It does not hash the
@@ -207,16 +211,24 @@ plan. The exact strings are also defined in `quail_b/prompts.py`.
 
 Substrait field references are numeric positions. The `ReadRel` schemas
 define those positions. Relation aliases and stable operator IDs are
-non-semantic benchmark metadata stored as packed `google.protobuf.Struct`
-values in each relation's `AdvancedExtension.optimization` field. The
-plan lists that message type in `expected_type_urls` and sets variable
-evaluation to `VARIABLE_EVALUATION_MODE_PER_PLAN`. The metadata has these
-forms:
+non-semantic benchmark metadata stored in versioned protobuf messages under
+each relation's `AdvancedExtension.optimization` field. Their definitions are
+in [`quail_b/substrait_metadata.proto`](quail_b/substrait_metadata.proto):
 
-```json
-{"kind": "quail_b.relation", "alias": "r", "text_column": "body"}
-{"kind": "quail_b.operator", "id": "filter-1"}
+```protobuf
+RelationMetadata {
+  schema_version: 1
+  alias: "r"
+  text_column: "body"
+}
+OperatorMetadata {
+  schema_version: 1
+  operator_id: "filter-1"
+}
 ```
+
+The plan lists both message types in `expected_type_urls` and sets variable
+evaluation to `VARIABLE_EVALUATION_MODE_PER_PLAN`.
 
 An adapter reads the relation tree, resolves function anchors through the
 plan's extension declarations, and translates the result to its engine.
@@ -376,6 +388,7 @@ quail-b report results/my-run
 
 ## Source definitions
 
-Query definitions: [`quail_b/queries.py`](quail_b/queries.py).
+Query plans: [`quail_b/plans/`](quail_b/plans/).
+Catalog loader: [`quail_b/queries.py`](quail_b/queries.py).
 Substrait extension: [`quail_b/substrait_extensions.yaml`](quail_b/substrait_extensions.yaml).
 Tables: [`quail_b/data.py`](quail_b/data.py).
