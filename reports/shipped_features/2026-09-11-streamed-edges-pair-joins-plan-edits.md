@@ -1,364 +1,128 @@
-# 2026-09-11: streamed edges, joins over pairs, the Foreign operator, plan edits
+# 2026-09-11: streamed edges, equality joins, and editable plans
 
-One branch, seven changes, in the order they landed. Every measured
-run is on the `quail-results` volume at the path given with it, with
-its Modal function call id. All GPU runs: one H100, Qwen3 4B fp8,
-sf=0.1, model startup excluded from query time. Query time, document
-pairs per second, and $/query follow the definitions in CLAUDE.md;
-$/query uses $3.9492 per H100 hour. The recomputed KV columns in
-sections 1 to 5 are the engine's per-document `regret_tokens` of the
-time, a document's own prefix computed again; that accounting is gone.
-Section 9 defines the `regret_tokens` the benchmark reports now, and
-section 10 restates the six affected queries under it.
+This PR extends one physical-plan path from planning through execution:
 
-## 1. Filter survivors stream into the join anchored on them
+- An `AiFilter` can stream survivors into an `AiJoin` while their KV stays
+  pinned.
+- A `HashJoin` applies ordinary equality conditions before an AI predicate.
+- A `Foreign` node runs a user function on a stream or behind a barrier.
+- Physical nodes have readable ids, per-node estimates, and `insert`, `remove`,
+  and `move` operations.
+- quail-bench computes KV regret after a run from the requests that were made.
 
-What changed: the first join group's anchor filter no longer runs to
-completion before the join starts. `FilterStream` in
-`quail/executor/loop.py` runs the chain one chunk per `next()` call; a
-document that passes its last stage keeps its arena pages pinned and
-is handed to `run_join`, which pulls anchors until its own chunk can
-fill, runs one join chunk, and pulls again. A pinned survivor's pages
-cover the join's largest frame, so the join never claims a page for a
-streamed anchor. The planner marks the edge (`AiFilter.pin_survivors`,
-`hold_tokens`) and `explain()` says "survivors stream into the join
-with KV pinned". On several GPUs the anchor's chain runs inside the
-join round on each GPU over that GPU's shard.
+All GPU measurements used one H100 and Qwen3 4B FP8 at `sf=0.1`. Query time
+excludes model startup. Cost uses $3.9492 per H100 hour.
 
-Why: under operator-at-a-time execution every survivor's KV waited in
-the retention pool (about 470 reviews on IMDB) and the rest was
-recomputed at the join: 1,217,732 recomputed KV tokens on IMDB-3, 32.2%
-of its fresh tokens. Streaming bounds the pinned set to what the join
-has not answered yet.
+## Stream filter survivors into joins
 
-Prediction, stated before the run: recomputed KV tokens go to 0 on all
-five queries and fresh tokens fall by exactly those counts; at 8.4 to
-11.9 microseconds per fresh token, about 10.4, 3.1, 1.6, 10.7, and 11.0
-seconds saved.
+Previously, a filter completed before its join started. Survivors that did not
+fit in the retention pool lost their KV and recomputed their document prefix at
+the join. The new `SurvivorStream` lets the join drive the filter one batch at a
+time. A passing document keeps its KV pinned until its join tuples finish.
 
-Run: `experiments/cells/join_continuous_batching.py` with the 8338d92
-baseline (materialized survivors) and this branch (streamed) in the
-same container, one warmup and one measured run per query. Function
-call `fc-01M27GHD7K71XA6RNX9XEY6XP8`, data at
-`/results/ablations/streamed-filter-join-20260911T055517Z/`.
+The prediction was that the five queries with filtered join anchors would stop
+recomputing those anchors and save 10 to 30 percent of query time. FEV-9 was
+expected to save its smaller 7,309-token recomputation with little time change.
 
-| Query | Configuration | Query time, s | Document pairs/s | $/query | Fresh tokens | Per-document recomputed KV | Saved, s (predicted) |
-|---|---|---:|---:|---:|---:|---:|---:|
-| IMDB-3 | Materialized | 32.58 | 1,613.3 | 0.03574 | 3,777,943 | 1,217,171 | |
-| IMDB-3 | Streamed | 22.47 | 2,339.1 | 0.02465 | 2,560,772 | 0 | 10.11 (10.4) |
-| IMDB-4 | Materialized | 20.32 | 742.3 | 0.02229 | 2,365,565 | 361,389 | |
-| IMDB-4 | Streamed | 17.35 | 869.4 | 0.01903 | 2,004,176 | 0 | 2.97 (3.1) |
-| IMDB-5 | Materialized | 18.16 | 480.4 | 0.01992 | 2,118,038 | 188,395 | |
-| IMDB-5 | Streamed | 16.60 | 525.5 | 0.01821 | 1,929,643 | 0 | 1.56 (1.6) |
-| IMDB-10 | Materialized | 59.00 | 2,446.6 | 0.06472 | 6,696,942 | 1,217,171 | |
-| IMDB-10 | Streamed | 58.97 | 2,447.8 | 0.06469 | 6,696,942 | 1,217,171 | 0.03 (10.7) |
-| BIO-3 | Materialized | 89.97 | 3,432.2 | 0.09870 | 7,547,851 | 919,912 | |
-| BIO-3 | Streamed | 80.65 | 3,828.9 | 0.08847 | 6,627,939 | 0 | 9.32 (11.0) |
+The first five-query ablation is at
+`/results/ablations/streamed-filter-join-20260911T055517Z/`, function call
+`fc-01M27GHD7K71XA6RNX9XEY6XP8`. The planner-order confirmation for IMDB-10 and
+FEV-9 is at `/results/ablations/streamed-filter-join-20260911T072243Z/`,
+function call `fc-01M27NHND7E2RVB4VKD4XZ1JQ0`.
 
-Evaluated pairs, returned rows, and every answer table were identical
-between the two configurations on all five queries. IMDB-10 did not
-move in this run: its first join group anchors on an unfiltered alias
-and the filtered alias anchors a later group, which change 2 fixed.
+| Query | Configuration | Query time, s | Document pairs/s | $/query | Fresh tokens |
+|---|---|---:|---:|---:|---:|
+| IMDB-3 | Materialized | 32.58 | 1,613.3 | 0.03574 | 3,777,943 |
+| IMDB-3 | Streamed | 22.47 | 2,339.1 | 0.02465 | 2,560,772 |
+| IMDB-4 | Materialized | 20.32 | 742.3 | 0.02229 | 2,365,565 |
+| IMDB-4 | Streamed | 17.35 | 869.4 | 0.01903 | 2,004,176 |
+| IMDB-5 | Materialized | 18.16 | 480.4 | 0.01992 | 2,118,038 |
+| IMDB-5 | Streamed | 16.60 | 525.5 | 0.01821 | 1,929,643 |
+| IMDB-10 | Materialized | 57.03 | 2,531.1 | 0.06256 | 6,696,942 |
+| IMDB-10 | Streamed | 47.16 | 3,060.8 | 0.05173 | 5,479,771 |
+| BIO-3 | Materialized | 89.97 | 3,432.2 | 0.09870 | 7,547,851 |
+| BIO-3 | Streamed | 80.65 | 3,828.9 | 0.08847 | 6,627,939 |
+| FEV-9 | Materialized | 38.11 | 4,778.7 | 0.04181 | 4,314,219 |
+| FEV-9 | Streamed | 37.83 | 4,814.0 | 0.04150 | 4,306,910 |
 
-## 2. The join search prices KV reuse as unlimited
+The five filtered-anchor queries saved 7.0 to 31.0 percent in the paired
+ablations. FEV-9 saved 0.28 seconds. Every answer table was identical between
+the two configurations. IMDB-10 required both streaming and the planner change:
+the planner now prices reuse of an already-computed prefix as free.
 
-What changed: the join search (`quail/planner/joins.py`) assumes a
-document prefix computed once is free at every later anchor use, the
-same assumption the speed-of-light estimate makes. The capacity-based
-credit (`retention.allocate`, the `resident_*` fields of `AliasStats`,
-`keep_min_doc_tokens`, `keep_resident_fraction`) is gone. Plan
-emission places a filtered alias's chain right before the first group
-anchored on it, after any barrier, when no earlier group uses the
-alias as a partner, and streams it into that group. The executor is
-unchanged: it keeps as much KV as the arena holds and `regret_tokens`
-reports what it could not keep.
+## Equality joins and user functions
 
-Why: the old credit priced about 11.6% of IMDB-10's filtered reviews as
-resident wherever their join sat, so the search picked an order that
-saved a few thousand tiny tuples and lost 1.2 million prefix tokens to
-recompute. With streaming, residency at a first anchor use is 100%.
+An ordinary equality condition now produces a `HashJoin` node. It creates a
+pair table before the AI predicate runs, so the model sees only matching pairs.
+FEV-10 adds `c.evidence_wiki_url = e.id` to FEV-5.
 
-Prediction, stated before the run: IMDB-10 loses all 1,217,171
-recomputed tokens and about 10.7 seconds; FEV-9's 7,309 recomputed
-tokens go to 0 with its time within noise.
+The prediction was 200 to 300 evaluated pairs, about 160,000 fresh tokens, and
+1 to 2.5 seconds. The focused run evaluated 185 pairs and finished in 1.66
+seconds, compared with 61,731 pairs and 13.47 seconds for FEV-5.
 
-Run: same cell and baseline, function call
-`fc-01M27NHND7E2RVB4VKD4XZ1JQ0`, data at
-`/results/ablations/streamed-filter-join-20260911T072243Z/`.
+Run: `/results/benchmarks/quailb/20260911T160843Z-pair-join/`, function call
+`fc-01M28KRVDWC1PN2J7WRAS0F2YN`.
 
-| Query | Configuration | Query time, s | Document pairs/s | $/query | Fresh tokens | Per-document recomputed KV | Saved, s (predicted) |
-|---|---|---:|---:|---:|---:|---:|---:|
-| IMDB-10 | Materialized | 57.03 | 2,531.1 | 0.06256 | 6,696,942 | 1,217,171 | |
-| IMDB-10 | Streamed | 47.16 | 3,060.8 | 0.05173 | 5,479,771 | 0 | 9.87 (10.7) |
-| FEV-9 | Materialized | 38.11 | 4,778.7 | 0.04181 | 4,314,219 | 7,309 | |
-| FEV-9 | Streamed | 37.83 | 4,814.0 | 0.04150 | 4,306,910 | 0 | 0.28 (0.1) |
-
-On IMDB-10 the search still puts the `r2` group first (16.64 estimated
-seconds against 16.82 for `r1` first). Answer tables identical.
-
-## 3. Survivor streams are the normal edge between GPU operators
-
-What changed: the physical operators are `Scan`, `AiFilter`, `AiJoin`,
-`Barrier`, `Exchange`, `Recombine`, `Project`, and `Limit`
-(`DocumentInput`, `PackedFilter`, and `AnchoredJoin` were renamed; the
-old materializing `Exchange` is `Barrier`; the new `Exchange` appears
-only in multi-GPU plans, once before each join group). An `AiFilter`
-that feeds the join anchored on it returns its survivor port as a
-`SurvivorStream` and a `finalize` callable; the consuming `AiJoin`
-drives the chain and fills the stream's holder; the runner calls
-`finalize` after the graph has run. The runner's streamed-edge special
-case (`stream_anchor`, `StreamedInput`, `NodeResult.produced`) is gone.
-
-Confirming run, same 8338d92 baseline in the same container. Function
-call `fc-01M27PPPG5PSWTMR1H3WX549BM`, data at
-`/results/ablations/streamed-filter-join-20260911T074256Z/`.
-Prediction: IMDB-3 and FEV-9 reproduce the earlier streamed runs within
-noise, zero recomputed KV tokens, identical answer tables. Measured:
-IMDB-3 22.66 seconds against the baseline's 32.88 (22.47 before the
-refactor), FEV-9 39.21 against 39.48 (37.83 before, on a different
-card); recomputed KV tokens 0 on both; fresh tokens 2,560,772 and
-4,306,910 exactly as before; all 9 answer tables identical.
-
-## 4. Joins over pairs, and FEV-10
-
-What changed: a logical `Join(left, right, on)` holds ordinary column
-equalities under the `SemanticJoin`; the AI predicate is asked only of
-the pairs the equalities allow. Builder:
-`.join(other, on=col("c.url") == col("e.id"))` then `.ai_filter(...)`
-over both tables. SQL: `JOIN evidence e ON c.evidence_wiki_url = e.id
-AND AI_FILTER(...)`. In the physical plan the equality is a `HashJoin`
-node (`hash_join:c-e`) that reads the two scans and the key columns
-the request carries, pairs the rows whose keys are equal with an Arrow
-hash join (`quail/runtime/pairs.py`), and feeds the pairs to the
-`AiJoin` on its `pairs:<written position>` port, the same port a
-pairs-returning `Foreign` uses. The planner prices the join by its pair
-count; `JoinAdmission` streams a partner list per anchor per stage so
-an anchor packs only its own pairs; the request backends submit only
-the listed pairs. QUAIL-B gains FEV-10: FEV-5 with
-`ON c.evidence_wiki_url = e.id` (evidence ids are FEVER page names),
-merged in `fsdatalab/quail-bench` as commit `ec4682f2`; no labeling run
-was needed at any scale factor.
-
-Prediction, stated before the run: FEV-10 asks SUPPORT of at most one
-pair per surviving claim, about 200 to 300 pairs, so about 160,000
-fresh tokens and 1 to 2.5 seconds against FEV-5's 13.35; precision far
-above FEV-5's 1.05% with recall near 96%; FEV-9 unchanged.
-
-Run: `experiments/cells/pair_join.py`, function call
-`fc-01M28KRVDWC1PN2J7WRAS0F2YN`, run directory
-`/results/benchmarks/quailb/20260911T160843Z-pair-join/` (a first
-attempt, `fc-01M28JYT36H7N9E21KJNE1ME3N`, ran FEV-5 first after the
-cold boot and measured it at 24.0 seconds; its FEV-10 and FEV-9 agree
-with the second run). SoL estimates for the three queries are at
-`/results/sol/2026-09-11-fev10-prefix-reuse.json`.
-
-| Query | Query time, s | Document pairs/s | $/query | Fresh tokens | Per-document recomputed KV | Evaluated pairs | Answer agreement, % | Output precision, % | Output recall, % | Rows (expected) |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| FEV-5 | 13.47 | 4,582.9 | 0.01478 | 1,515,283 | 0 | 61,731 | 79.57 | 1.05 | 96.43 | 12,830 (140) |
-| FEV-10 | 1.66 | 111.4 | 0.00182 | 187,567 | 0 | 185 | 89.09 | 82.76 | 96.77 | 145 (124) |
-| FEV-9 | 38.44 | 4,737.6 | 0.04217 | 4,306,910 | 0 | 182,115 | 67.77 | 0.00 | 45.45 | 149,783,486 (11) |
-| FEV-10, SoL estimate | 0.712 | 236 | 0.00078 | 185,703 | 0 (assumed) | 168 | | | | |
-
-FEV-10's pairs per second is low because the query is almost all
-filter work: the two filters are 177,550 of its 187,567 fresh tokens.
-Agreement is with the Qwen3 32B fp8 labels (collection
-`gt_77bb8b128743a79aedddaa24c808c3f8`).
-
-## 5. The Foreign operator: a user function between two GPU operators
-
-What changed: `.apply(fn, columns=[...])` and `.apply_table(fn,
-columns=[...])` put a Python function in the plan (logical `Apply`,
-physical `Foreign`, node id `apply:<name>`). The function gets one
-Arrow table per alias and returns the ids to keep, every id
-(`ids="preserve"`), or, after `join(other)`, the pairs the next AI
-predicate is asked about; it never invents an id. `per_batch` keeps
-the survivor stream and runs on each batch before admission; `barrier`
-makes the planner materialize the chain and runs once. The planner
-refuses per-batch functions on several GPUs and the request backends
-refuse `apply`.
-
-Prediction, stated before the run: per_batch matches the equality run
-(185 pairs, 145 rows, 187,567 fresh tokens, time within noise of 1.66
-seconds); barrier costs the lost overlap only, 0.1 to 0.4 seconds.
-
-Run: `experiments/cells/foreign_pairs.py`, function call
-`fc-01M28NDEB2GN84ZJKNTTKM1Y3R`, data at
-`/results/ablations/foreign-pairs-20260911T163940Z/` (a first attempt,
-`fc-01M28MSCPZR6Y3ZGWXJTXKEF9V`, failed because Arrow's default join is
-a left outer join and returned null ids; the runtime now refuses a
-null id and the function uses an inner join).
-
-| Variant | Query time, s | Document pairs/s | $/query | Fresh tokens | Per-document recomputed KV | Pairs | Rows | Evidence chain pinned | Function calls |
-|---|---:|---:|---:|---:|---:|---:|---:|---|---:|
-| equality (`on=`) | 1.69 | 109.5 | 0.00185 | 187,567 | 0 | 185 | 145 | yes | 0 |
-| per_batch (`apply`) | 1.69 | 109.5 | 0.00185 | 187,567 | 0 | 185 | 145 | yes | 2 |
-| barrier (`apply_table`) | 1.69 | 109.5 | 0.00185 | 187,567 | 0 | 185 | 145 | no | 1 |
-
-Answer tables identical row for row across the three variants. The
-barrier variant's chain took 1.27 seconds and its join 0.13; at sf=0.1
-the 171 evidence survivors fit the retention pool, so the lost overlap
-cost nothing measurable.
-
-## 6. Per-node estimates, readable node ids, and plan edits
-
-What changed: node ids name the operator and its alias (`scan:c1`,
-`ai_filter:c1`, `ai_join:e1`, `barrier:e2`, `apply:same_page`,
-`project`). `PhysicalPlan.estimates` prices each model node's own work
-in seconds; a pinned chain also shows the recompute it would pay if its
-KV were released. `plan.insert(node, between=(producer, consumer))`,
-`remove(node_id)`, and `move(node_id, between=...)` edit the DAG and
-return a new plan; an illegal edit raises `PlanEditError` with the
-rule it broke; after an edit the plan re-derives `pin_survivors`,
-`keep_kv`, and `hold_tokens` and re-estimates every node.
-`query.run(plan=edited)` executes it. `demos/plan_walkthrough.py` runs
-the whole thing on the CPU.
-
-No GPU run. Prediction, stated before the CPU script ran: IMDB-3's
-release-recompute figure on the pinned reviews chain is close to the
-1,217,171 tokens measured before streaming; a Barrier on that edge
-turns the pin off and raises the estimate by its seconds; FEV-9's
-chains fit the pool so its figure is zero.
-
-| Query | Plan estimate, s | Sum of node seconds | Pinned chain | Release recompute, tokens (s) | Estimate with a Barrier on that edge, s |
-|---|---:|---:|---|---:|---:|
-| IMDB-3 | 9.503 | 9.504 | ai_filter:r | 1,087,633 (4.092) | 13.523 |
-| FEV-9 | 8.260 | 8.261 | ai_filter:e1, ai_filter:e2 | 0 (0.000) | 8.260 |
-
-## 7. FEV-10 as a benchmark query, with two runner fixes
-
-FEV-10 has all four measurements through the standard family runner
-(`quail.bench.quailb_parallel`, `--query FEV-10`). Run directory
-`/results/benchmarks/quailb/family-runs/20260911T201441Z-d16f87d8/`,
-function call `fc-01M291QA9AAV9JSMYN5KCRJSM4`. The main and FEVER plots
-and the saved-results report include it, and the SoL file for all 33
-queries is `/results/sol/2026-09-11-quailb-prefix-reuse.json` (the 32
-earlier estimates unchanged).
-
-Prediction, stated before the run: stock and pipelined vLLM in 3 to 5
-seconds and pipelined SGLang in 4 to 7, about 190,000 fresh tokens on
-every method.
-
-| Configuration | FEV-10 time, s | FEV-5 time, s | Document pairs/s | $/query | Fresh tokens | Answer agreement, % | Output precision, % |
+| Query | Query time, s | Document pairs/s | $/query | Fresh tokens | Evaluated pairs | Output precision, % | Output recall, % |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Quail | 1.68 | 13.47 | 110.1 | 0.00184 | 187,567 | 89.09 | 82.76 |
-| Stock vLLM (operator-at-a-time) | 2.97 | 32.66 | 63.3 | 0.00326 | 270,220 | 86.67 | 73.78 |
-| Pipelined vLLM | 2.91 | 31.73 | 64.6 | 0.00319 | 270,220 | 86.67 | 73.78 |
-| Pipelined SGLang | 3.32 | 43.43 | 54.2 | 0.00364 | 267,414 | 89.56 | 75.62 |
+| FEV-5 | 13.47 | 4,582.9 | 0.01478 | 1,515,283 | 61,731 | 1.05 | 96.43 |
+| FEV-10 | 1.66 | 111.4 | 0.00182 | 187,567 | 185 | 82.76 | 96.77 |
 
-The baselines compute the shared prompt preamble again for every
-document, which is why their fresh tokens exceed the prediction.
+`.apply()` and `.apply_table()` add a `Foreign` node. A per-batch function keeps
+the stream. A barrier function materializes its complete input. The prediction
+was that an equality condition and equivalent functions would return the same
+185 pairs, with the barrier adding at most 0.4 seconds.
 
-Two attempts failed before this one, on bugs fixed here:
+All three versions took 1.69 seconds and returned identical answer tables. The
+barrier added no measurable time because all 171 evidence survivors fit in the
+retention pool.
 
-- `run_all` in `quail/bench/quailb_parallel.py` resolved the run
-  directory before checking that it lies under `/results`; inside the
-  container that mount resolves elsewhere, so every run directory was
-  refused (`fc-01M28Z7H6F8X634WWVQHMX1DGC`).
-- `gpu_problem()` in `quail/runtime/execute.py` used
-  `torch.cuda.is_available()`, which starts the CUDA runtime and marks
-  every later fork as bad; vLLM forks its engine process after the
-  probe (`fc-01M29181E51A1T4E2840AGD2XT`). It now uses PyTorch's NVML
-  based check. Quail's backend never forks, so Quail-only runs never
-  hit it.
+Run: `/results/ablations/foreign-pairs-20260911T163940Z/`, function call
+`fc-01M28NDEB2GN84ZJKNTTKM1Y3R`.
 
-## 8. Two ponytail passes and the test fold
+## Plan estimates and edits
 
-The `ponytail-review` checklist asks of each piece of code whether it
-needs to exist and whether it can be shorter. Nothing in either pass
-changes a result, a plan shape, a node id, a report key, or a public
-call.
+Physical node ids now describe their operation and alias, such as
+`ai_filter:c` and `ai_join:e`. Each model node has its own estimated seconds.
+For a pinned filter, the estimate also states the recomputation expected if an
+edit releases its KV.
 
-- First pass, over the pair-join, Foreign, and plan-edit lines under
-  `quail/`: 20,422 to 20,338 lines. Deleted dead helpers and fields
-  (`possible_anchor_aliases`, `_length_stats`, `AliasStats.histogram`,
-  `FilterAdmission.sync_free_pages`, `FilterStream.budget`, the
-  `StreamedPairs` fields nothing read, `_REMOVABLE`); one
-  `pair_partner` instead of two; the join search records each stage's
-  work so the planner stops walking the chosen sequence twice; one
-  `retention.group_sequence` call instead of three copies of the merge
-  rule.
-- Second pass, over everything the first skipped: 255 fewer lines,
-  20,338 to 20,276 under `quail/`. Three copies of an unreachable "no
-  join consumed its stream" guard (`validate_streams` refuses that
-  shape first), the arena-writes check on a pinned chain, the root
-  check in `remove`, fields written and never read (`stage_tokens`,
-  `held`, the `full` flag of a join group, the `alias=` parameter of
-  `apply()`), one pair of member-list helpers in
-  `quail/runtime/pairs.py` instead of two copies, `triangle()` for two
-  hand-rolled n(n+1)/2, and the streamed filter-join cell folded into
-  `experiments/cells/join_continuous_batching.py` as arguments.
-- The five test files the branch added went into the files that test
-  the same modules, with the CPU fakes three of them copied
-  (`tests/fakes.py`) and one `fever_executor` instead of three: the
-  same 19 tests, 251 fewer lines under `tests/`.
-- Found and kept: the argument checks in `Query.apply` that repeat
-  `Apply.validate` (their messages are the ones a user sees first),
-  `FilterStream.chunks` and `attention_mode`, `plan.move` (documented
-  API), the int-or-list `suffix_count` in the request scheduler.
-- A third pass over the HashJoin commit and the plot script: the
-  request backend's `over_pairs` wire field went (a stage runs over
-  pairs when a pair table reached it on a port), the hash join
-  runtime's unreachable table-or-list branch went, and the plot
-  script fails on a rerun directory without a manifest instead of
-  skipping it.
+`PhysicalPlan.insert`, `remove`, and `move` return a new validated plan. They
+recompute streaming pins and estimates. `demos/plan_walkthrough.py` demonstrates
+the API on the CPU. No GPU measurement was needed for this API.
 
-## 9. Recomputed KV is the distance to the requests' prefix trie
+## KV regret
 
-What changed: `regret_tokens` has one definition for every engine.
-Every request an engine made is a token sequence: preamble, document,
-question tail for a filter; preamble, anchor, frame, label, partner,
-answer cue for a join pair. With unlimited KV every distinct prefix
-across those sequences is computed once, so the query needs one
-forward pass position per node of their prefix trie. `minimum_tokens`
-is that count, `fresh_tokens` is what the engine computed, and
-`regret_tokens` is the difference. It is never negative, and it
-counts every cause alike: an evicted anchor computed again, a set
-scanned twice under two aliases, a prompt prefix the documents share
-computed once per document, the label before each pair's partner.
+`regret_tokens` is now:
 
-Where it is computed: in quail-bench, after the run, on the CPU
-(quail-bench PRs 6 and 7, pinned here as 0.3.0). Quail's runner
-reports only `fresh_tokens` and the prompt token ids it put around
-each document (`prompt_pieces`, saved beside the answer tables).
-quail-bench tokenizes the documents the answer tables name with the
-run's tokenizer, sizes the trie, and records both counts in each
-query's metrics and in a flat `measurements.parquet` per run;
-`quail-b report` recomputes them for a saved run, and
-`quail.bench.restate` adds the pieces to runs saved before the runner
-reported them. Nothing is tracked in the engine loop; the old run-time
-accounting (per-document regret, could-hit estimates, the cross-row
-cache split, and `regret_distinct_tokens`) is deleted.
+`fresh_tokens - minimum_tokens`
 
-Check: on the run below, the minimum quail-bench computed equals the
-one Quail's deleted code computed on every FEVER, LEP, and AGENT
-query, and differs by 4 tokens on the ten IMDB queries, where the
-engine's fast tokenizer and the HuggingFace tokenizer disagree by 4
-tokens across the 5,000 reviews.
+`minimum_tokens` is the number of input token positions needed when every
+distinct request prefix is computed once with unlimited KV. quail-bench derives
+it after the run from saved answer tables and `prompt_pieces`. The engine loop
+does not track regret. `quail.bench.restate` adds the required prompt pieces to
+older runs.
 
-## 10. All 33 queries on all four methods with the new runner
+This replaces the old per-document regret, cache-hit adjustments, and
+`regret_distinct_tokens`.
 
-Run: `modal run --detach -m quail.bench.quailb_parallel` with all four
-methods, teed to `results/benchmark/20260912T225056Z-all-methods-sf0.1.log`.
-Function call `fc-01M2BX28NBM9T7W4HDJTCBM3XQ`, one call per family
-and method group (listed in `reports/quailb-comparison.md`), run
-directory `/results/benchmarks/quailb/family-runs/20260912T225100Z-902686c5/`,
-where `measurements.parquet` holds every completed query and method.
-The `main` engine's recomputed KV on the six affected queries comes
-from the ablation tables of section 1 and 2, restated by quail-bench:
-`/results/ablations/streamed-filter-join-regret.json`.
+## Full QUAIL-B result
 
-Prediction, stated before the run: Quail's regret under 1 percent of
-fresh tokens on filter-only queries except AGENT (about 11.9 million,
-68 percent), 3 to 10 percent on join queries from the label before
-each pair; stock and pipelined vLLM within 1 percent of Quail on
-filter-only queries and near it on joins; pipelined SGLang below Quail
-on join queries, FEV-9 near 4.1 million fresh against Quail's 4.3
-million; times within noise of the earlier runs; rows identical.
+The final run covered all 33 queries and four methods. The prediction was that
+the six affected Quail queries would reduce recomputed KV while unchanged
+queries kept the same work and rows. It also predicted similar fresh-token
+counts for Quail and the vLLM configurations on filters, and lower counts for
+Quail on joins.
 
-Quail, the six queries whose join anchors `main` recomputed (the
-other 27 make the same requests before and after, with identical
-fresh tokens and rows, so their recomputed KV is unchanged; every
-query is in the report):
+Run directory:
+`/results/benchmarks/quailb/family-runs/20260912T225100Z-902686c5/`.
+Parent function call: `fc-01M2BX28NBM9T7W4HDJTCBM3XQ`. The 11 family and
+method function calls are listed in
+[`reports/quailb-comparison.md`](../quailb-comparison.md).
+
+Fourteen of the 132 method-query cells use earlier compatible runs. Each is
+marked in the comparison report. Nine are pipelined vLLM FEV-1 through FEV-9,
+two are pipelined SGLang BIO-2 and BIO-3, and three are the FEV-10 baselines.
 
 | Query | Time before, s | Time after, s | Change | Recomputed KV before | Recomputed KV after |
 |---|---:|---:|---:|---:|---:|
@@ -369,49 +133,18 @@ query is in the report):
 | BIO-3 | 89.92 | 79.96 | -11.1% | 3,194,945 | 2,275,033 |
 | FEV-9 | 41.14 | 38.23 | -7.1% | 2,286,831 | 2,279,522 |
 
-What happened against the prediction:
+- Output rows were unchanged on all 33 queries.
+- Quail was faster than stock vLLM on 31 of 33 queries. The exceptions were
+  AGENT-1 and AGENT-2, where Quail recomputed the shared trace prefix once per
+  document.
+- IMDB-10 agreement changed from 73.93 to 72.59 percent despite unchanged
+  output rows. A streamed and recomputed FP8 prefix can decode differently;
+  comparing the saved pair answers would confirm the cause.
+- The affected queries improved by 6.3 to 30.0 percent. This matches the
+  prediction except that IMDB-5 was below the predicted 10-percent minimum.
 
-- Filter-only queries: as predicted. Quail recomputes 1.1 to 1.3
-  percent on IMDB-1, IMDB-6, IMDB-7, LEP-1, LEP-8 (the openings the
-  documents share), 4.1 percent on FEV-1, 0.1 percent on BIO-1, and
-  11,886,152 tokens (68 percent) on each AGENT query.
-- Single-join queries: above the predicted 3 to 10 percent. IMDB-4
-  and IMDB-5 are 5.9 and 4.0 percent, LEP-2 to LEP-7 about 10, but
-  IMDB-2 is 16.8, FEV-2 29.7, and BIO-2 40.0 percent: the label is 6
-  tokens and the partner documents are short (2 to 12 tokens), so the
-  label is a third of every pair.
-- Chain queries: 52 to 55 percent (IMDB-9, IMDB-10, FEV-8, FEV-9),
-  not predicted. Two causes, both measured from the tables: a set
-  scanned under two aliases is computed twice (the 1,494,232 review
-  tokens as `r1` and again as `r2`), and a join that repeats an
-  earlier join's template on the same anchor set asks identical
-  prompts again (FEV-8's join 2 repeats 136,899 of join 0's SUPPORT
-  requests, about 3.0 million of its 5.0 million). Pipelining covers
-  the filter-to-join edge and the joins of one anchor group; it does
-  not carry KV between groups or aliases. That is the next target.
-- vLLM: within 1 percent of Quail on single-stage filters as
-  predicted, but not on filter chains: stock vLLM recomputes 25 and
-  31 percent on IMDB-6 and IMDB-7 (operator-at-a-time execution
-  resubmits every survivor after its block cache has turned over),
-  pipelined vLLM 3.5 and 16. On joins stock vLLM recomputes 5 to 11
-  times what Quail does on IMDB-3 to IMDB-5 and is 1.8 times slower
-  there; on FEVER and LEP it recomputes 10 to 50 percent more than
-  Quail and is 1.2 to 2.3 times slower.
-- SGLang: below Quail on FEV-9 (2,177,762 against 2,279,522; 4.1
-  against 4.3 million fresh) and LEP-3 to LEP-7 as predicted, above
-  it on FEV-2 and LEP-2. On the IMDB join queries it recomputed 77 to
-  95 percent of its fresh tokens (IMDB-2: 18,929,885 of 20.9 million)
-  and took 5 to 12 times Quail's time, which the earlier adapter did
-  not show; that needs its own look.
-- Times are within noise of the earlier runs and the rows are
-  identical on every query.
-- Not measured in this run: pipelined vLLM FEV-1 to FEV-9 and the
-  three baselines' FEV-10, because the FEVER container failed on
-  FEV-10 in the request backends (their runner did not pass the
-  equality join's key columns; fixed in this branch with a CPU test
-  that reproduces it), and pipelined SGLang BIO-2 and BIO-3, whose
-  container had not finished. The report fills those cells from the
-  September 5 suite and the September 11 FEV-10 run and labels each.
+[Open the complete 33-query tables and vector plots](../quailb-comparison.md).
 
-Figure: plots/quailb_main.png (the full comparison and the per-family
-figures are in `reports/quailb-comparison.md`).
+[![QUAIL-B latency](../plots/quailb_main.png)](../plots/quailb_main.pdf)
+
+Figure: ../plots/quailb_main.png

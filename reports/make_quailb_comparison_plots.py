@@ -278,16 +278,8 @@ def plot_comparison(title, queries, rows, relations, sol, name, overview=False):
             figure.legend(handles=handles, loc="upper center",
                           bbox_to_anchor=(0.5, 0.925), ncol=5, fontsize=11,
                           frameon=False)
-            footer_text = (
-                "SoL estimates ideal work with unlimited prefix KV reuse across "
-                "requests and reference-label survivors. "
-                "It has no measured accuracy.\n"
-                "Fresh tokens include recomputed KV. A dash marks zero, "
-                "a cross a value that was not measured. "
-                "Stock vLLM uses operator-at-a-time submission.")
-            figure.text(0.055, 0.035, footer_text, fontsize=10, linespacing=1.5)
             figure.subplots_adjust(left=0.075, right=0.97, top=0.83,
-                                   bottom=0.24 if overview else 0.20, hspace=0.60,
+                                   bottom=0.14 if overview else 0.10, hspace=0.60,
                                    wspace=0.28)
             pdf.savefig(figure, bbox_inches=None)
             if page == 0:
