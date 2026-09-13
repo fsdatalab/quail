@@ -12,6 +12,7 @@ dependencies = [
     "huggingface-hub>=0.26",
     "datasets>=5.0.1",
     "transformers>=4.48",
+    "substrait-protobuf>=0.103.0",
 ]
 
 [dependency-groups]

@@ -1,0 +1,26 @@
+%YAML 1.2
+---
+urn: extension:org.fsdatalab.quail_b:functions_ai
+scalar_functions:
+  - name: ai_filter
+    description: Return whether a document satisfies a natural-language prompt.
+    impls:
+      - args:
+          - name: prompt
+            value: string
+            constant: true
+          - name: document
+            value: string
+        return: boolean
+  - name: ai_join
+    description: Return whether two documents satisfy a natural-language prompt.
+    impls:
+      - args:
+          - name: prompt
+            value: string
+            constant: true
+          - name: left
+            value: string
+          - name: right
+            value: string
+        return: boolean

@@ -27,10 +27,16 @@ from quail_b.scoring import (
     expected_rows,
     rows_from_answers,
 )
+from quail_b.substrait import build_plan
+
+
+def _spec(query_id, description, relations, operators, select):
+    plan = build_plan(query_id, relations, operators, select)
+    return QuerySpec.from_plan(query_id, description, plan)
 
 FILTER = "Judge the review.\n\n{0}\nAnswer TRUE or FALSE."
 JOIN = "Judge the pair.\n\n{0}\nAspect: {1}\nAnswer TRUE or FALSE."
-SPEC = QuerySpec(
+SPEC = _spec(
     "TEST-1", "one filter then one join",
     (RelationSpec("r", "reviews", "body"),
      RelationSpec("a", "aspects", "aspect")),
@@ -485,7 +491,7 @@ def test_reused_label_set_rejects_changed_table_manifest(tmp_path):
 def _chain_spec():
     # FEV-8's shape: filters on the claims, three joins in a chain, every
     # alias selected
-    return QuerySpec(
+    return _spec(
         "CHAIN", "three joins", (
             RelationSpec("c1", "claims", "claim"),
             RelationSpec("e1", "evidence", "text"),

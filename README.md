@@ -37,6 +37,33 @@ GPU cost, and token work.
 
 ## Query plans
 
+Each `QuerySpec` contains a canonical
+[`substrait.Plan`](https://substrait.io/serialization/binary_serialization/).
+Substrait is a standard protocol-buffer format for relational query plans.
+`query.plan` returns the parsed plan. `query.plan_bytes` contains its
+deterministic binary serialization.
+
+QUAIL-B uses standard Substrait relations:
+
+| Query operation | Substrait representation |
+| --- | --- |
+| Read a document table | `ReadRel` with a `NamedTable` |
+| Apply an AI filter | `FilterRel` whose condition calls `ai_filter` |
+| Apply an AI join | inner `JoinRel` whose condition calls `ai_join` |
+| Apply an ordinary join condition | standard `equal`, combined with `and` |
+| Select output IDs | `ProjectRel` and `RelRoot` |
+
+The AI functions are defined in
+[`quail_b/substrait_extensions.yaml`](quail_b/substrait_extensions.yaml):
+
+- `ai_filter:str_str(prompt, document) -> boolean`
+- `ai_join:str_str_str(prompt, left, right) -> boolean`
+
+The extension URN is
+`extension:org.fsdatalab.quail_b:functions_ai`. Ordinary equality and
+boolean conjunction use the standard Substrait comparison and boolean
+extension URNs.
+
 See the [PDF of all 33 query plans](figures/quailb_anatomy.pdf). It groups
 queries by dataset. Gray nodes are table scans, blue nodes are AI FILTER,
 and orange nodes are AI JOIN. Percentages are the fixed planning
@@ -141,8 +168,8 @@ still score, but its token counts are unavailable.
 
 QUAIL-B calls `run_query(query, tables)` once per query:
 
-- `query` is a `QuerySpec`. It names the input tables, text columns,
-  AI filter prompts, AI join prompts, and selected output columns.
+- `query` is a `QuerySpec`. Its `plan` field is a Substrait `Plan`.
+- `query.id` and `query.description` identify the benchmark query.
 - `tables` is a dictionary of Arrow tables. Every table has an `id`
   column and the text column named by the query.
 
@@ -157,38 +184,36 @@ WHERE AI_FILTER(F1, r.body)
   AND AI_FILTER(F4, r.body);
 ```
 
-The actual `QuerySpec` separates relations from operators. The operators
-are in written order and have stable IDs:
+The IMDB-4 Substrait relation tree is:
 
-```python
-from quail_b import FilterSpec, JoinSpec, QuerySpec, RelationSpec
-from quail_b.prompts import DISCUSS_ASPECT, F1, F4
-
-
-query = QuerySpec(
-    id="IMDB-4",
-    description="F1 -> F4 -> J1, 2 filters then 1 join",
-    relations=(
-        RelationSpec(alias="r", table="reviews", text_column="body"),
-        RelationSpec(alias="a", table="aspects", text_column="aspect"),
-    ),
-    operators=(
-        FilterSpec(id="filter-1", relation="r", prompt=F1),
-        FilterSpec(id="filter-2", relation="r", prompt=F4),
-        JoinSpec(
-            id="join-1",
-            relations=("r", "a"),
-            prompt=DISCUSS_ASPECT,
-        ),
-    ),
-    select=("r.id", "a.id"),
-)
+```text
+RelRoot [r, a]
+└── ProjectRel [r.id, a.id]
+    └── JoinRel INNER [ai_join(J1, r.body, a.aspect)]
+        ├── FilterRel [ai_filter(F4, r.body)] id=filter-2
+        │   └── FilterRel [ai_filter(F1, r.body)] id=filter-1
+        │       └── ReadRel reviews [id, body] alias=r
+        └── ReadRel aspects [id, aspect] alias=a
 ```
 
-The prompt names in this example refer to the exact strings in
-`quail_b/prompts.py`. `FilterSpec.relation` identifies the filter input.
-`JoinSpec.relations` identifies the two join inputs in prompt-placeholder
-order.
+`F1`, `F4`, and `J1` stand for the full prompt string literals in the
+plan. The exact strings are also defined in `quail_b/prompts.py`.
+
+Substrait field references are numeric positions. The `ReadRel` schemas
+define those positions. Relation aliases and stable operator IDs are
+non-semantic benchmark metadata stored as packed `google.protobuf.Struct`
+values in each relation's `AdvancedExtension.optimization` field. The
+metadata has these forms:
+
+```json
+{"kind": "quail_b.relation", "alias": "r", "text_column": "body"}
+{"kind": "quail_b.operator", "id": "filter-1"}
+```
+
+An adapter reads the relation tree, resolves function anchors through the
+plan's extension declarations, and translates the result to its engine.
+Filters are `FilterRel` nodes over their input relation. They are not
+properties of an alias.
 
 For this query, `tables["reviews"]` has `id` and `body` columns.
 `tables["aspects"]` has `id` and `aspect` columns.
@@ -307,6 +332,7 @@ for a full-scale run when the engine shares the same host.
 
 ```
 results/my-run/run.json
+results/my-run/IMDB-4/plan.substrait
 results/my-run/IMDB-4/rows.parquet
 results/my-run/IMDB-4/filters-0.parquet
 results/my-run/IMDB-4/filters-1.parquet
@@ -343,4 +369,5 @@ quail-b report results/my-run
 ## Source definitions
 
 Query definitions: [`quail_b/queries.py`](quail_b/queries.py).
+Substrait extension: [`quail_b/substrait_extensions.yaml`](quail_b/substrait_extensions.yaml).
 Tables: [`quail_b/data.py`](quail_b/data.py).

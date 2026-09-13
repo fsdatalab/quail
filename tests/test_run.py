@@ -101,6 +101,9 @@ def test_join_runs_at_all_scales_and_report_cli(tmp_path):
         assert metrics["document_pairs_per_second"] == 1.0
         assert metrics["cost_usd"] == 0.004
         assert metrics["accuracy"]["output_accuracy"]["exact_match"]
+        plan_path = destination / "IMDB-4/plan.substrait"
+        assert plan_path.read_bytes() == quail_b.get_query("IMDB-4").plan_bytes
+        assert record["queries"][0]["files"]["plan"] == "plan.substrait"
         before = (destination / "report.md").read_text()
         quail_b.report(destination, rescore=False)
         assert (destination / "report.md").read_text() == before

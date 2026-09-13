@@ -12,6 +12,12 @@ from quail_b.minimum import (
 )
 from quail_b.queries import FilterSpec, JoinSpec, QuerySpec, RelationSpec
 from quail_b.scoring import RunOutput
+from quail_b.substrait import build_plan
+
+
+def _spec(query_id, description, relations, operators, select):
+    plan = build_plan(query_id, relations, operators, select)
+    return QuerySpec.from_plan(query_id, description, plan)
 
 
 def _encode(texts):
@@ -44,7 +50,7 @@ def test_prefix_trie_size_counts_shared_prefixes_once():
 
 
 def test_minimum_input_tokens_counts_each_distinct_prefix_once():
-    spec = QuerySpec(
+    spec = _spec(
         "TEST-1", "one filter then one join",
         (RelationSpec("d", "docs", "body"),
          RelationSpec("a", "aspects", "name")),
@@ -83,7 +89,7 @@ def test_minimum_input_tokens_counts_each_distinct_prefix_once():
 
 
 def test_minimum_input_tokens_counts_a_document_once_across_uses():
-    spec = QuerySpec(
+    spec = _spec(
         "TEST-2", "a self join with two filter stages on one side",
         (RelationSpec("d1", "docs", "body"),
          RelationSpec("d2", "docs", "body")),
@@ -122,7 +128,7 @@ def test_minimum_input_tokens_counts_a_document_once_across_uses():
 
 
 def _filter_spec():
-    return QuerySpec(
+    return _spec(
         "TEST-0", "one filter",
         (RelationSpec("d", "docs", "body"),),
         (FilterSpec("filter-1", "d", "useful {0}"),),

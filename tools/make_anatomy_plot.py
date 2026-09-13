@@ -44,6 +44,7 @@ from quail_b.queries import (
     QUERIES,
     QUERY_FAMILY_WORKLOADS,
 )
+from quail_b.substrait import plan_details
 
 # ---- colors (self-contained, no external style dependency) ----
 
@@ -108,10 +109,11 @@ class Join:
 
 def _build_tree(spec):
     """Build a plan tree from one QuerySpec."""
+    details = plan_details(spec.plan)
     subtrees = {}
-    for relation in spec.relations:
+    for relation in details.relations:
         node = Scan(relation.table, relation.alias)
-        for filter_spec in spec.filters:
+        for filter_spec in details.filters:
             if filter_spec.relation == relation.alias:
                 node = Filter(
                     TEMPLATE_LABELS[filter_spec.prompt],
@@ -120,9 +122,10 @@ def _build_tree(spec):
                 )
         subtrees[relation.alias] = node
 
-    current = subtrees[spec.base_alias]
-    joined = {spec.base_alias}
-    for join in spec.joins:
+    base_alias = details.relations[0].alias
+    current = subtrees[base_alias]
+    joined = {base_alias}
+    for join in details.joins:
         (added,) = set(join.relations) - joined
         current = Join(
             TEMPLATE_LABELS[join.prompt], join.prompt,

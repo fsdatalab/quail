@@ -3,7 +3,6 @@
 import hashlib
 import json
 import math
-from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -35,14 +34,25 @@ def _write_json(path, value):
 
 
 def _query_hash(spec):
-    return hashlib.sha256(
-        json.dumps(asdict(spec), sort_keys=True).encode()).hexdigest()
+    value = hashlib.sha256()
+    value.update(spec.id.encode())
+    value.update(b"\0")
+    value.update(spec.description.encode())
+    value.update(b"\0")
+    value.update(spec.plan_bytes)
+    return value.hexdigest()
 
 
-def _save_output(directory, output):
+def _save_output(directory, output, spec):
     directory.mkdir()
+    (directory / "plan.substrait").write_bytes(spec.plan_bytes)
     pq.write_table(output.rows, directory / "rows.parquet", compression="zstd")
-    paths = {"rows": "rows.parquet", "filters": None, "joins": None}
+    paths = {
+        "plan": "plan.substrait",
+        "rows": "rows.parquet",
+        "filters": None,
+        "joins": None,
+    }
     for kind, answers in (
             ("filters", output.filter_answers), ("joins", output.join_answers)):
         if answers is None:
@@ -270,7 +280,9 @@ def run(run_query, *, queries=None, scale_factor=0.1, output_dir,
                 if not isinstance(output, RunOutput):
                     raise TypeError("run_query must return a RunOutput")
                 item.update(
-                    files=_save_output(directory / spec.id, output), status="saved")
+                    files=_save_output(directory / spec.id, output, spec),
+                    status="saved",
+                )
                 json.dumps({"runtime_s": output.runtime_s,
                             "measurements": output.measurements}, allow_nan=False)
                 item.update(runtime_s=output.runtime_s,

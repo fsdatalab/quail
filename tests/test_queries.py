@@ -1,6 +1,9 @@
 """CPU checks for the QUAIL-B query catalog."""
 
+from importlib.resources import files
+
 import pytest
+from substrait import plan_pb2
 
 from quail_b.queries import (
     PRIVACY_QUERIES,
@@ -15,6 +18,14 @@ from quail_b.queries import (
     query_family_name,
     split_query_families,
     split_query_ids,
+)
+from quail_b.run import _query_hash
+from quail_b.substrait import (
+    AI_JOIN_NAME,
+    AND_NAME,
+    EQUAL_NAME,
+    build_plan,
+    plan_details,
 )
 
 
@@ -38,9 +49,8 @@ def test_catalog_has_the_33_default_queries_and_two_privacy_queries():
 
 def test_spec_rejects_a_join_that_does_not_add_a_relation():
     with pytest.raises(ValueError, match="must add one relation"):
-        QuerySpec(
+        build_plan(
             "X-1",
-            "bad",
             (
                 RelationSpec("r", "reviews", "body"),
                 RelationSpec("a", "aspects", "aspect"),
@@ -57,6 +67,7 @@ def test_spec_rejects_a_join_that_does_not_add_a_relation():
 def test_filters_are_explicit_ordered_operators():
     spec = queries()["IMDB-4"]
 
+    assert isinstance(spec.plan, plan_pb2.Plan)
     assert spec.relations == (
         RelationSpec("r", "reviews", "body"),
         RelationSpec("a", "aspects", "aspect"),
@@ -70,6 +81,78 @@ def test_filters_are_explicit_ordered_operators():
     assert [operator.id for operator in spec.joins] == ["join-1"]
     assert isinstance(spec.operators[0], FilterSpec)
     assert isinstance(spec.operators[-1], JoinSpec)
+
+    project = spec.plan.relations[0].root.input.project
+    join = project.input.join
+    assert join.left.filter.input.filter.input.HasField("read")
+    assert join.right.HasField("read")
+
+
+def test_fev_10_combines_ai_and_ordinary_join_conditions():
+    spec = queries()["FEV-10"]
+    plan = spec.plan
+    names = {
+        declaration.extension_function.function_anchor:
+        declaration.extension_function.name
+        for declaration in plan.extensions
+    }
+    assert set(names.values()) == {
+        AI_JOIN_NAME,
+        AND_NAME,
+        EQUAL_NAME,
+        "ai_filter:str_str",
+    }
+    condition = plan.relations[0].root.input.project.input.join.expression
+    assert names[condition.scalar_function.function_reference] == AND_NAME
+    assert {
+        names[argument.value.scalar_function.function_reference]
+        for argument in condition.scalar_function.arguments
+    } == {AI_JOIN_NAME, EQUAL_NAME}
+    join = plan.relations[0].root.input.project.input.join
+    assert tuple(join.left.filter.input.read.base_schema.names) == (
+        "id",
+        "claim",
+        "evidence_wiki_url",
+    )
+    assert tuple(join.right.filter.input.read.base_schema.names) == (
+        "id",
+        "text",
+    )
+
+
+def test_repeated_tables_and_join_order_round_trip_through_substrait():
+    spec = queries()["IMDB-9"]
+    details = plan_details(spec.plan)
+
+    assert [(relation.alias, relation.table) for relation in details.relations] == [
+        ("r1", "reviews"),
+        ("a1", "aspects"),
+        ("r2", "reviews"),
+        ("a2", "aspects"),
+    ]
+    assert [join.relations for join in details.joins] == [
+        ("r1", "a1"),
+        ("r2", "a1"),
+        ("r2", "a2"),
+    ]
+
+
+def test_query_plan_serialization_and_hash_are_deterministic():
+    original = queries()["IMDB-4"]
+    copy = QuerySpec.from_plan(original.id, original.description, original.plan)
+
+    assert copy.plan_bytes == original.plan_bytes
+    assert _query_hash(copy) == _query_hash(original)
+    changed = QuerySpec.from_plan(original.id, "changed", original.plan)
+    assert _query_hash(changed) != _query_hash(original)
+
+
+def test_ai_extension_definition_is_packaged():
+    extension = files("quail_b").joinpath("substrait_extensions.yaml").read_text()
+
+    assert "urn: extension:org.fsdatalab.quail_b:functions_ai" in extension
+    assert "name: ai_filter" in extension
+    assert "name: ai_join" in extension
 
 
 def test_parallel_query_split_matches_stock_vllm():

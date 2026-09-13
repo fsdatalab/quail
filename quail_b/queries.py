@@ -1,16 +1,17 @@
 """The QUAIL-B queries as data, for any engine's runner to build.
 
-A query is a base relation with filters, then joins that each add one
-more relation, then a projection. Written order matters: an alias's
-filters apply in the order listed, and joins apply in the order listed.
+Each query's canonical representation is a serialized Substrait plan.
 The runner of one engine turns a `QuerySpec` into that engine's query;
-the scoring reads the same spec to know which label answers each
+the scoring reads the same plan to know which label answers each
 predicate.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+from google.protobuf.message import DecodeError
+from substrait import plan_pb2
 
 from quail_b.prompts import (
     AGENT_IMPLEMENTED_FIX,
@@ -37,6 +38,15 @@ from quail_b.prompts import (
     REFUTE,
     SCENARIO_MATCH,
     SUPPORT,
+)
+from quail_b.substrait import (
+    FilterSpec,
+    JoinSpec,
+    OperatorSpec,
+    PlanDetails,
+    RelationSpec,
+    build_plan,
+    plan_details,
 )
 
 # Fixed planner inputs from the sf=0.1 Qwen3 32B fp8 labels.
@@ -72,114 +82,61 @@ JOIN_SELECTIVITY_ESTIMATES = {
 
 
 @dataclass(frozen=True)
-class RelationSpec:
-    """One document relation used by a query."""
-
-    alias: str
-    table: str
-    text_column: str
-
-
-@dataclass(frozen=True)
-class FilterSpec:
-    """One AI filter over a relation."""
-
-    id: str
-    relation: str
-    prompt: str
-
-
-@dataclass(frozen=True)
-class JoinSpec:
-    """One binary AI join with relations in placeholder order.
-
-    `on` lists ordinary equality conditions as (left column, right
-    column) pairs over the two relations. The AI predicate is asked only
-    of the pairs whose columns are equal; empty means every pair.
-    """
-
-    id: str
-    relations: tuple[str, str]
-    prompt: str
-    on: tuple[tuple[str, str], ...] = ()
-
-
-type OperatorSpec = FilterSpec | JoinSpec
-
-
-@dataclass(frozen=True)
 class QuerySpec:
-    """One benchmark query.
-
-    The first relation is the base. Operators are in written order.
-    Each join adds one relation to the preceding joins. `select` names
-    output columns as alias.column.
-    """
+    """One benchmark query identified by a canonical Substrait plan."""
 
     id: str
     description: str
-    relations: tuple[RelationSpec, ...]
-    operators: tuple[OperatorSpec, ...]
-    select: tuple[str, ...]
+    plan_bytes: bytes
+    _details: PlanDetails = field(init=False, repr=False, compare=False)
 
-    def __post_init__(self):
-        if not self.relations:
-            raise ValueError(f"{self.id}: a query needs at least one relation")
-        aliases = [relation.alias for relation in self.relations]
-        if len(set(aliases)) != len(aliases):
-            raise ValueError(f"{self.id}: relation aliases must be unique")
-        operator_ids = [operator.id for operator in self.operators]
-        if any(not isinstance(operator_id, str) or not operator_id
-               for operator_id in operator_ids):
-            raise ValueError(f"{self.id}: operator ids must be nonempty strings")
-        if len(set(operator_ids)) != len(operator_ids):
-            raise ValueError(f"{self.id}: operator ids must be unique")
-        names = set(aliases)
-        for operator in self.operators:
-            referenced = (
-                (operator.relation,)
-                if isinstance(operator, FilterSpec)
-                else operator.relations
-            )
-            if not set(referenced) <= names:
-                raise ValueError(
-                    f"{self.id}: operator {operator.id!r} references an "
-                    "unknown relation"
-                )
-            if isinstance(operator, JoinSpec) and len(set(referenced)) != 2:
-                raise ValueError(
-                    f"{self.id}: join {operator.id!r} needs two relations"
-                )
-        first_join = {alias: len(self.operators) for alias in aliases}
-        for index, operator in enumerate(self.operators):
-            if isinstance(operator, JoinSpec):
-                for alias in operator.relations:
-                    first_join[alias] = min(first_join[alias], index)
-        for index, operator in enumerate(self.operators):
-            if (isinstance(operator, FilterSpec)
-                    and index > first_join[operator.relation]):
-                raise ValueError(
-                    f"{self.id}: filter {operator.id!r} must precede joins "
-                    f"on relation {operator.relation!r}"
-                )
-        joins = self.joins
-        if len(self.relations) != len(joins) + 1:
-            raise ValueError(
-                f"{self.id}: {len(self.relations)} relations need "
-                f"{len(self.relations) - 1} joins, not {len(joins)}"
-            )
-        joined = {self.base_alias}
-        for join in joins:
-            referenced = set(join.relations)
-            if len(referenced & joined) != 1 or len(referenced - joined) != 1:
-                raise ValueError(
-                    f"{self.id}: join {join.id!r} must add one relation"
-                )
-            joined.update(referenced)
-        for name in self.select:
-            alias, separator, column = name.partition(".")
-            if not separator or alias not in names or not column:
-                raise ValueError(f"{self.id}: invalid selected column {name!r}")
+    def __post_init__(self) -> None:
+        if not isinstance(self.plan_bytes, bytes):
+            raise TypeError("plan_bytes must be bytes")
+        plan = plan_pb2.Plan()
+        try:
+            plan.ParseFromString(self.plan_bytes)
+        except DecodeError as error:
+            raise ValueError(f"{self.id}: invalid Substrait plan bytes") from error
+        canonical = plan.SerializeToString(deterministic=True)
+        object.__setattr__(self, "plan_bytes", canonical)
+        object.__setattr__(self, "_details", plan_details(plan))
+
+    @classmethod
+    def from_plan(
+        cls,
+        query_id: str,
+        description: str,
+        plan: plan_pb2.Plan,
+    ) -> "QuerySpec":
+        """Create a query from a Substrait plan."""
+        return cls(
+            query_id,
+            description,
+            plan.SerializeToString(deterministic=True),
+        )
+
+    @property
+    def plan(self) -> plan_pb2.Plan:
+        """Return a parsed copy of the canonical Substrait plan."""
+        plan = plan_pb2.Plan()
+        plan.ParseFromString(self.plan_bytes)
+        return plan
+
+    @property
+    def relations(self) -> tuple[RelationSpec, ...]:
+        """Return document relations decoded from the plan."""
+        return self._details.relations
+
+    @property
+    def operators(self) -> tuple[OperatorSpec, ...]:
+        """Return AI operators decoded from the plan."""
+        return self._details.operators
+
+    @property
+    def select(self) -> tuple[str, ...]:
+        """Return selected columns decoded from the plan."""
+        return self._details.select
 
     def relation(self, alias: str) -> RelationSpec:
         """Return the relation with this alias."""
@@ -234,6 +191,17 @@ class QuerySpec:
         return JOIN_SELECTIVITY_ESTIMATES.get(template)
 
 
+def _spec(
+    query_id: str,
+    description: str,
+    relations: tuple[RelationSpec, ...],
+    operators: tuple[OperatorSpec, ...],
+    select: tuple[str, ...],
+) -> QuerySpec:
+    plan = build_plan(query_id, relations, operators, select)
+    return QuerySpec.from_plan(query_id, description, plan)
+
+
 def _query(query_id, description, base, joins=(), select=None) -> QuerySpec:
     """Build one query from a base table and joins on it.
 
@@ -265,7 +233,7 @@ def _query(query_id, description, base, joins=(), select=None) -> QuerySpec:
         ))
     if select is None:
         select = tuple(f"{relation.alias}.id" for relation in relations)
-    return QuerySpec(
+    return _spec(
         query_id, description, tuple(relations), tuple(operators), tuple(select)
     )
 
@@ -303,7 +271,7 @@ QUERIES = (
     # IMDB-9/IMDB-10: 3-join chain r1-a1-r2-a2. Two reviews that
     # discuss the same aspect; what other aspect does the second
     # review feel positively about?
-    QuerySpec(
+    _spec(
         "IMDB-9",
         "3J chain r1-a1-r2-a2: two reviews discuss the same aspect, "
         "second review positive about another",
@@ -316,7 +284,7 @@ QUERIES = (
          JoinSpec("join-3", ("r2", "a2"), ASPECT_SENTIMENT)),
         ("r1.id", "a1.id", "r2.id", "a2.id"),
     ),
-    QuerySpec(
+    _spec(
         "IMDB-10",
         "F1 -> 3J chain r1-a1-r2-a2",
         (RelationSpec("r1", "reviews", "body"),
@@ -372,7 +340,7 @@ QUERIES = (
     # FEV-8/FEV-9: 3-join chain c1-e1-c2-e2. Evidence e1 supports
     # claim c1 but refutes claim c2; claim c2 is supported by
     # different evidence e2.
-    QuerySpec(
+    _spec(
         "FEV-8",
         "3J chain c1-e1-c2-e2: evidence supports c1 but refutes c2, "
         "c2 supported by different evidence",
@@ -385,7 +353,7 @@ QUERIES = (
          JoinSpec("join-3", ("c2", "e2"), SUPPORT)),
         ("c1.id", "e1.id", "c2.id", "e2.id"),
     ),
-    QuerySpec(
+    _spec(
         "FEV-9",
         "4F + 3J: F11 on c1 and c2, F13 on e1 and e2, then the "
         "c1-e1-c2-e2 join chain",
@@ -405,7 +373,7 @@ QUERIES = (
     # FEV-10: FEV-5 over pairs. A claim names its Wikipedia page and an
     # evidence row's id is its page name, so SUPPORT is asked only of a
     # claim and its own page: ON c.evidence_wiki_url = e.id AND AI.IF.
-    QuerySpec(
+    _spec(
         "FEV-10",
         "2F + 1J over pairs: F11 on claims, F13 on evidence, SUPPORT "
         "asked only of a claim and its own Wikipedia page",
