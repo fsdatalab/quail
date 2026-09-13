@@ -23,23 +23,16 @@ using the execution loop described below.
 The filter loop fills each GPU forward pass using two budgets: a
 token budget and a KV page budget.
 
-### Pipelining
-
-A document that passes one predicate enters the next forward pass
-with its next predicate immediately. It does not wait for every
-other document to finish the current predicate.
-
-### Token-based admission
-
-A forward pass is full when either the token budget or the arena's
-free pages are exhausted. There is no fixed request count.
-
-### KV rewind
-
-After a document passes a predicate, its KV stays in the GPU arena.
-The next predicate adds only the new question tokens on top of the
-existing document KV. Pages are freed when a document fails a
-predicate or finishes its last one.
+- **Pipelining.** A document that passes one predicate enters the
+  next forward pass with its next predicate immediately. It does not
+  wait for every other document to finish the current predicate.
+- **Token-based admission.** A forward pass is full when either the
+  token budget or the arena's free pages are exhausted. There is no
+  fixed request count.
+- **KV rewind.** After a document passes a predicate, its KV stays
+  in the GPU arena. The next predicate adds only the new question
+  tokens on top of the existing document KV. Pages are freed when a
+  document fails a predicate or finishes its last one.
 
 ## Join execution
 
@@ -47,22 +40,16 @@ A join evaluates one anchor document against multiple partner
 documents. All partners in one forward pass share the anchor's KV
 through paged cross-attention.
 
-### Streaming from filters
-
-The first join group does not wait for its anchor filter to finish.
-Each document that passes its last filter predicate keeps its KV
-pinned and enters the join immediately.
-
-### Gating
-
-Between join stages, anchors with no passing pair are dropped and
-their KV pages freed.
-
-### KV retention across joins
-
-When a query has multiple join groups, the engine retains document
-KV from earlier groups for use as anchors in later groups. If KV
-was evicted because of capacity limits, the document is reprocessed.
+- **Streaming from filters.** The first join group does not wait for
+  its anchor filter to finish. Each document that passes its last
+  filter predicate keeps its KV pinned and enters the join
+  immediately.
+- **Gating.** Between join stages, anchors with no passing pair are
+  dropped and their KV pages freed.
+- **KV retention across joins.** When a query has multiple join
+  groups, the engine retains document KV from earlier groups for use
+  as anchors in later groups. If KV was evicted because of capacity
+  limits, the document is reprocessed.
 
 ## Multiple GPUs
 
