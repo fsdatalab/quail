@@ -12,8 +12,13 @@ the package and quickstart lists remain equal.
 
 The PyPI distribution is named `quail-engine`, while its Python import remains
 `quail`. This avoids the unrelated package that already owns the `quail`
-distribution name. These changes prepare a wheel for repeatable validation.
-They do not publish one.
+distribution name. The project now uses the MIT license and publishes its
+repository and issue URLs in package metadata.
+
+`tools/release.sh` checks a clean release, builds the files, and can push the
+version tag. The tag starts a GitHub Actions workflow that uses PyPI trusted
+publishing. The workflow actions, `uv`, Twine, and Python dependencies all use
+exact versions. These changes do not publish a release by themselves.
 
 ## Prediction and validation
 
@@ -33,20 +38,20 @@ read the private `fsdatalab/quail-bench` repository. CI has the separate
 agent, not a test failure, but the prediction that all CPU tests pass remains
 unconfirmed until CI finishes.
 
+Prediction before release automation validation: the script will reject a
+version that differs from `pyproject.toml`, the workflow will parse, and the
+built package will carry the MIT license metadata and file.
+
 No model run was needed because this change does not alter query execution.
 There is therefore no Modal function call id or `quail-results` volume path.
 
 ## Work still required before release
 
-1. Choose a license. The repository has no `LICENSE` file or package license
-   metadata.
-2. Add the license, authors, repository URL, and issue URL to
-   `pyproject.toml`.
-3. Decide how pip users get QUAIL-B. It is currently a development dependency
+1. Decide how pip users get QUAIL-B. It is currently a development dependency
    fetched from a pinned Git commit, while the quickstart imports it.
-4. Add a trusted PyPI publishing workflow, configure the PyPI project, and
-   protect the release environment.
-5. Pick the first public version, build an sdist and wheel, inspect both, and
-   install the wheel in a clean Python 3.12 environment.
-6. Publish to TestPyPI first, test that install, then create the production
-   tag and publish the same artifacts to PyPI.
+2. Create the protected `pypi` GitHub environment and register the pending
+   trusted publisher on PyPI.
+3. Add author metadata if the project wants a named person or organization
+   on PyPI.
+4. Install the built wheel in a clean Python 3.12 environment.
+5. Merge this change, then run `PUBLISH=1 tools/release.sh 0.1.0` from `main`.

@@ -3,6 +3,7 @@ name = "quail-engine"
 version = "0.1.0"
 description = "Quail: a declarative query engine for AI_FILTER and AI_JOIN"
 readme = "README.md"
+license = "MIT"
 # <3.13: bpe-qwen ships wheels up to 3.12, and the Modal image runs 3.12
 requires-python = ">=3.12,<3.13"
 dependencies = [
@@ -17,6 +18,10 @@ dependencies = [
     # same version as the Modal image; vLLM has Linux wheels only
     "vllm==0.26.0; sys_platform == 'linux'",
 ]
+
+[project.urls]
+Repository = "https://github.com/fsdatalab/quail-exploration"
+Issues = "https://github.com/fsdatalab/quail-exploration/issues"
 
 [dependency-groups]
 dev = [
@@ -45,6 +50,7 @@ packages = ["quail"]
 [tool.uv]
 # uv's Python builds include the C headers Triton needs at startup
 python-preference = "only-managed"
+required-version = "==0.12.13"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

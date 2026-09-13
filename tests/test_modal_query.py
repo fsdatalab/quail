@@ -17,6 +17,8 @@ from quail.runtime.session import Session
 def test_release_dependencies_are_exact_and_match_modal_demo():
     project = tomllib.loads(Path("pyproject.toml").read_text())
     assert project["project"]["name"] == "quail-engine"
+    assert project["project"]["license"] == "MIT"
+    assert project["tool"]["uv"]["required-version"] == "==0.12.13"
     runtime = tuple(
         requirement.split(";", 1)[0].strip()
         for requirement in project["project"]["dependencies"]

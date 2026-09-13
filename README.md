@@ -85,3 +85,29 @@ See the [user guide](docs/content/docs/user-guide/index.mdx),
 [architecture](docs/content/docs/architecture/index.mdx), and
 [extension guide](docs/content/docs/extending/index.mdx) for details.
 Experiment scripts are in `experiments/`; their reports are in `reports/`.
+
+## Release
+
+The PyPI project uses trusted publishing, so releases do not use a saved API
+token. Before the first release:
+
+1. Create a protected GitHub environment named `pypi`.
+2. Add a pending publisher at
+   [PyPI publishing settings](https://pypi.org/manage/account/publishing/):
+   - PyPI project: `quail-engine`
+   - GitHub owner: `fsdatalab`
+   - GitHub repository: `quail-exploration`
+   - Workflow: `publish.yml`
+   - Environment: `pypi`
+3. Give the `pypi` environment access to the existing `QUAILB_TOKEN` secret.
+
+Set the version in `pyproject.toml` and refresh `uv.lock`. From a clean `main`
+branch matching `origin/main`, run:
+
+```bash
+PUBLISH=1 tools/release.sh 0.1.0
+```
+
+The script checks the version and clean worktree, runs all required checks,
+builds and validates the wheel and source archive, then pushes the matching
+tag. The tag starts the trusted publishing workflow.
