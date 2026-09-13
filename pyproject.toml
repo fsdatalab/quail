@@ -1,6 +1,6 @@
 [project]
 name = "quail-b"
-version = "0.3.0"
+version = "0.4.0"
 description = "quail-b: a benchmark of AI filter and join queries over document sets"
 readme = "README.md"
 # <3.13: the same Python as Quail, which installs this package
@@ -12,6 +12,8 @@ dependencies = [
     "huggingface-hub>=0.26",
     "datasets>=5.0.1",
     "transformers>=4.48",
+    "substrait-protobuf==0.103.0",
+    "protobuf>=6.31.1,<7",
 ]
 
 [dependency-groups]
@@ -48,7 +50,7 @@ ignore = ["D1"]
 convention = "google"
 
 [tool.ruff.lint.isort]
-known-first-party = ["quail_b"]
+known-first-party = ["quail_b", "tools"]
 
 [tool.vulture]
 paths = ["quail_b"]

@@ -1,0 +1,177 @@
+[
+  {
+    "id": "IMDB-1",
+    "description": "filter: F1 (at least one positive aspect)",
+    "privacy": false
+  },
+  {
+    "id": "IMDB-2",
+    "description": "join: J1 (reviews x aspects)",
+    "privacy": false
+  },
+  {
+    "id": "IMDB-3",
+    "description": "F1 -> J1, dependent",
+    "privacy": false
+  },
+  {
+    "id": "IMDB-4",
+    "description": "F1 -> F4 -> J1, 2 filters then 1 join",
+    "privacy": false
+  },
+  {
+    "id": "IMDB-5",
+    "description": "F1 -> F4 -> F5 -> J1, 3 filters then 1 join",
+    "privacy": false
+  },
+  {
+    "id": "IMDB-6",
+    "description": "F1 -> F4, 2 filters, no join",
+    "privacy": false
+  },
+  {
+    "id": "IMDB-7",
+    "description": "F1 -> F4 -> F5, 3 filters, no join",
+    "privacy": false
+  },
+  {
+    "id": "IMDB-8",
+    "description": "2J, same anchor: J1 (DISCUSS_ASPECT) -> J2 (ASPECT_SENTIMENT), reviews x aspects x aspects",
+    "privacy": false
+  },
+  {
+    "id": "IMDB-9",
+    "description": "3J chain r1-a1-r2-a2: two reviews discuss the same aspect, second review positive about another",
+    "privacy": false
+  },
+  {
+    "id": "IMDB-10",
+    "description": "F1 -> 3J chain r1-a1-r2-a2",
+    "privacy": false
+  },
+  {
+    "id": "BIO-1",
+    "description": "filter: F7 (female patient)",
+    "privacy": false
+  },
+  {
+    "id": "BIO-2",
+    "description": "join: J1 (reports x terms)",
+    "privacy": false
+  },
+  {
+    "id": "BIO-3",
+    "description": "F7 -> J1, dependent",
+    "privacy": false
+  },
+  {
+    "id": "FEV-1",
+    "description": "filter: F11 (about a person)",
+    "privacy": false
+  },
+  {
+    "id": "FEV-2",
+    "description": "join: J3 (claims x evidence)",
+    "privacy": false
+  },
+  {
+    "id": "FEV-3",
+    "description": "F11 -> J3, dependent",
+    "privacy": false
+  },
+  {
+    "id": "FEV-4",
+    "description": "F11 -> F12 -> J3, 2 filters then 1 join",
+    "privacy": false
+  },
+  {
+    "id": "FEV-5",
+    "description": "2F + 1J: two-sided pushdown - F11 on claims, F13 on evidence, each filtered before J3",
+    "privacy": false
+  },
+  {
+    "id": "FEV-6",
+    "description": "3F + 1J: two-sided pushdown, deeper - F11 -> F12 on claims, F13 on evidence, each filtered before J3",
+    "privacy": false
+  },
+  {
+    "id": "FEV-7",
+    "description": "2J, same anchor: J1 (SUPPORT) -> J2 (REFUTE), claims x evidence x evidence",
+    "privacy": false
+  },
+  {
+    "id": "FEV-8",
+    "description": "3J chain c1-e1-c2-e2: evidence supports c1 but refutes c2, c2 supported by different evidence",
+    "privacy": false
+  },
+  {
+    "id": "FEV-9",
+    "description": "4F + 3J: F11 on c1 and c2, F13 on e1 and e2, then the c1-e1-c2-e2 join chain",
+    "privacy": false
+  },
+  {
+    "id": "FEV-10",
+    "description": "2F + 1J over pairs: F11 on claims, F13 on evidence, SUPPORT asked only of a claim and its own Wikipedia page",
+    "privacy": false
+  },
+  {
+    "id": "LEP-1",
+    "description": "filter: LEP1 (reasoning does not apply)",
+    "privacy": false
+  },
+  {
+    "id": "LEP-2",
+    "description": "join: citation contexts x cited passages",
+    "privacy": false
+  },
+  {
+    "id": "LEP-3",
+    "description": "LEP1 -> join, dependent",
+    "privacy": false
+  },
+  {
+    "id": "LEP-4",
+    "description": "LEP1 -> LEP2 -> join, 2 filters then 1 join",
+    "privacy": false
+  },
+  {
+    "id": "LEP-5",
+    "description": "LEP1 -> LEP2 -> LEP3 -> join, 3 filters then 1 join",
+    "privacy": false
+  },
+  {
+    "id": "LEP-6",
+    "description": "LEP1..LEP5 -> join, 5 filters then 1 join",
+    "privacy": false
+  },
+  {
+    "id": "LEP-7",
+    "description": "2F + 1J: two-sided pushdown - LEP1+LEP2 on excerpts, LEPS1 on passages, each filtered before the join",
+    "privacy": false
+  },
+  {
+    "id": "LEP-8",
+    "description": "LEP1..LEP5, 5 filters, no join",
+    "privacy": false
+  },
+  {
+    "id": "AGENT-1",
+    "description": "filter: recovered after an unsuccessful approach",
+    "privacy": false
+  },
+  {
+    "id": "AGENT-2",
+    "description": "filter: implemented a plausible fix",
+    "privacy": false
+  },
+  {
+    "id": "PRIV-1",
+    "description": "2 filters: P_MSG + P_LOC",
+    "privacy": true
+  },
+  {
+    "id": "PRIV-2",
+    "description": "2 filters + 1 join: P_MSG + P_LOC -> scenarios",
+    "privacy": true
+  }
+]

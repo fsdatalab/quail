@@ -38,8 +38,9 @@ def _inputs(root, sf):
     collection.mkdir(parents=True)
     label_sets = {}
     predicates = [
-        ("filter", template, None) for template in spec.aliases[0].filters
-    ] + [("join", spec.joins[0].template, "aspects")]
+        ("filter", filter_spec.prompt, None)
+        for filter_spec in spec._info.filters
+    ] + [("join", spec._info.joins[0].prompt, "aspects")]
     for index, (kind, template, right) in enumerate(predicates):
         key = f"predicate_{index}"
         label_id = f"ls_{sf}_{index}"
@@ -75,9 +76,10 @@ def test_join_runs_at_all_scales_and_report_cli(tmp_path):
         calls.append(spec.id)
         assert set(tables) == {"reviews", "aspects"}
         return quail_b.RunOutput(
-            {("r", index): pa.table({"r": ["r0", "r1"], "answer": [True, True]})
-             for index in range(len(spec.aliases[0].filters))},
-            {0: pa.table({
+            {filter_spec.id: pa.table({
+                "r": ["r0", "r1"], "answer": [True, True]})
+             for filter_spec in spec._info.filters},
+            {"join-1": pa.table({
                 "r": ["r0", "r1"], "a": ["a0", "a0"], "answer": [True, True]})},
             pa.table({"r": ["r0", "r1"], "a": ["a0", "a0"]}),
             runtime_s=2.0)
@@ -89,6 +91,7 @@ def test_join_runs_at_all_scales_and_report_cli(tmp_path):
             execute, queries=["IMDB-4"], scale_factor=sf,
             output_dir=destination, root=tmp_path, gpu_count=2,
             gpu_hourly_rate_usd=3.6)
+        assert record["schema_version"] == 2
         metrics = record["queries"][0]["metrics"]
         assert metrics["input_rows"] == {"r": 2, "a": 1}
         assert metrics["fresh_tokens"] is None
@@ -98,6 +101,9 @@ def test_join_runs_at_all_scales_and_report_cli(tmp_path):
         assert metrics["document_pairs_per_second"] == 1.0
         assert metrics["cost_usd"] == 0.004
         assert metrics["accuracy"]["output_accuracy"]["exact_match"]
+        plan_path = destination / "IMDB-4/plan.substrait"
+        assert plan_path.read_bytes() == quail_b.get_query("IMDB-4").plan_bytes
+        assert record["queries"][0]["files"]["plan"] == "plan.substrait"
         before = (destination / "report.md").read_text()
         quail_b.report(destination, rescore=False)
         assert (destination / "report.md").read_text() == before
@@ -122,17 +128,20 @@ def test_prompt_pieces_give_the_minimum_and_the_regret(tmp_path, monkeypatch):
     spec = quail_b.get_query("IMDB-4")
     pieces = {
         "tokenizer": "test-tokenizer", "preamble": [1, 2],
-        "filters": [{"alias": "r", "position": index, "tail": [10 + index, 20]}
-                    for index in range(len(spec.aliases[0].filters))],
-        "joins": [{"position": 0, "anchor": "r", "frame": [30, 31],
+        "filters": [
+            {"id": filter_spec.id, "tail": [10 + index, 20]}
+            for index, filter_spec in enumerate(spec._info.filters)
+        ],
+        "joins": [{"id": "join-1", "anchor": "r", "frame": [30, 31],
                    "label": [40], "tail": [50, 51, 52]}],
     }
 
     def execute(spec, tables):
         return quail_b.RunOutput(
-            {("r", index): pa.table({"r": ["r0", "r1"], "answer": [True, True]})
-             for index in range(len(spec.aliases[0].filters))},
-            {0: pa.table({
+            {filter_spec.id: pa.table({
+                "r": ["r0", "r1"], "answer": [True, True]})
+             for filter_spec in spec._info.filters},
+            {"join-1": pa.table({
                 "r": ["r0", "r1"], "a": ["a0", "a0"], "answer": [True, True]})},
             pa.table({"r": ["r0", "r1"], "a": ["a0", "a0"]}),
             runtime_s=2.0, measurements={"fresh_tokens": 1000},
@@ -145,7 +154,7 @@ def test_prompt_pieces_give_the_minimum_and_the_regret(tmp_path, monkeypatch):
     # the preamble once, then "good" and "bad" (4 and 3 tokens, sharing
     # nothing); per review the two filter tails and the frame, which
     # share nothing; per anchor the label, "acting", and the tail
-    stages = len(spec.aliases[0].filters)
+    stages = len(spec._info.filters)
     assert stages == 2
     minimum = (2 + 4 + 3) + 2 * (2 * 2 + 2) + 2 * (1 + 6 + 3)
     assert metrics["minimum_tokens"] == minimum
@@ -173,7 +182,7 @@ def test_prompt_pieces_give_the_minimum_and_the_regret(tmp_path, monkeypatch):
         output.prompt_pieces = {"tokenizer": "test-tokenizer", "joins": []}
         return output
 
-    with pytest.raises(ValueError, match="missing filter stages"):
+    with pytest.raises(ValueError, match="missing filter operators"):
         quail_b.run(broken, queries=["IMDB-4"], output_dir=tmp_path / "broken",
                     root=tmp_path)
 
@@ -221,7 +230,9 @@ def test_saved_answers_survive_scoring_failure_and_can_move(tmp_path):
         labels = pq.read_table(table / "labels.parquet")
         pq.write_table(labels.slice(0, 1), table / "labels.parquet")
         return quail_b.RunOutput(
-            None, {0: pa.table({"r": ["r1"], "a": ["a0"], "answer": [True]})},
+            None,
+            {"join-1": pa.table({
+                "r": ["r1"], "a": ["a0"], "answer": [True]})},
             pa.table({"r": ["r1"], "a": ["a0"]}), runtime_s=2.0)
 
     quail_b.run(

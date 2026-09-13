@@ -44,6 +44,7 @@ from quail_b.queries import (
     QUERIES,
     QUERY_FAMILY_WORKLOADS,
 )
+from quail_b.substrait import _inspect_plan
 
 # ---- colors (self-contained, no external style dependency) ----
 
@@ -108,19 +109,28 @@ class Join:
 
 def _build_tree(spec):
     """Build a plan tree from one QuerySpec."""
+    details = _inspect_plan(spec.plan)
     subtrees = {}
-    for alias_spec in spec.aliases:
-        node = Scan(alias_spec.table, alias_spec.alias)
-        for template in alias_spec.filters:
-            node = Filter(TEMPLATE_LABELS[template], template, node)
-        subtrees[alias_spec.alias] = node
+    for relation in details.relations:
+        node = Scan(relation.table, relation.alias)
+        for filter_spec in details.filters:
+            if filter_spec.relation == relation.alias:
+                node = Filter(
+                    TEMPLATE_LABELS[filter_spec.prompt],
+                    filter_spec.prompt,
+                    node,
+                )
+        subtrees[relation.alias] = node
 
-    current = subtrees[spec.aliases[0].alias]
-    for i, join in enumerate(spec.joins):
-        added = spec.aliases[i + 1].alias
+    base_alias = details.relations[0].alias
+    current = subtrees[base_alias]
+    joined = {base_alias}
+    for join in details.joins:
+        (added,) = set(join.relations) - joined
         current = Join(
-            TEMPLATE_LABELS[join.template], join.template,
+            TEMPLATE_LABELS[join.prompt], join.prompt,
             current, subtrees[added])
+        joined.add(added)
     return current
 
 
@@ -265,12 +275,19 @@ def main():
     n_predicates = len(set(TEMPLATE_LABELS.keys())
                        & (set(FILTER_SELECTIVITY_ESTIMATES.keys())
                           | set(JOIN_SELECTIVITY_ESTIMATES.keys())
-                          | {t for s in QUERIES
-                             for t in s.filter_templates}
-                          | {j.template for s in QUERIES
-                             for j in s.joins}))
+                          | {
+                              filter_spec.prompt
+                              for spec in QUERIES
+                              for filter_spec in spec._info.filters
+                          }
+                          | {j.prompt for s in QUERIES
+                             for j in s._info.joins}))
     n_families = len(family_metas)
-    n_tables = len({a.table for s in QUERIES for a in s.aliases})
+    n_tables = len({
+        relation.table
+        for spec in QUERIES
+        for relation in spec._info.relations
+    })
 
     scale = 0.65
     fig, ax = plt.subplots(

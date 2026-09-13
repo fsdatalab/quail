@@ -3,7 +3,6 @@
 import hashlib
 import json
 import math
-from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -23,6 +22,9 @@ from quail_b.scoring import (
     implied_rows_mask,
     scores_from_answers,
 )
+from quail_b.substrait import _Filter
+
+RUN_SCHEMA_VERSION = 2
 
 
 def _write_json(path, value):
@@ -33,14 +35,77 @@ def _write_json(path, value):
 
 
 def _query_hash(spec):
-    return hashlib.sha256(
-        json.dumps(asdict(spec), sort_keys=True).encode()).hexdigest()
+    plan = spec.plan
+    urns = {
+        extension.extension_urn_anchor: extension.urn
+        for extension in plan.extension_urns
+    }
+    functions = []
+    for declaration in plan.extensions:
+        if not declaration.HasField("extension_function"):
+            continue
+        function = declaration.extension_function
+        functions.append(
+            (
+                urns[function.extension_urn_reference],
+                function.name,
+            )
+        )
+    functions.sort()
+    operators = []
+    for operator in spec._info.operators:
+        if isinstance(operator, _Filter):
+            operators.append({
+                "kind": "filter",
+                "id": operator.id,
+                "relation": operator.relation,
+                "prompt": operator.prompt,
+            })
+        else:
+            operators.append({
+                "kind": "join",
+                "id": operator.id,
+                "relations": operator.relations,
+                "prompt": operator.prompt,
+                "on": operator.on,
+            })
+    definition = {
+        "substrait_version": [
+            plan.version.major_number,
+            plan.version.minor_number,
+            plan.version.patch_number,
+        ],
+        "functions": functions,
+        "relations": [
+            {
+                "alias": relation.alias,
+                "table": relation.table,
+                "text_column": relation.text_column,
+            }
+            for relation in spec._info.relations
+        ],
+        "operators": operators,
+        "select": spec._info.select,
+    }
+    encoded = json.dumps(
+        definition,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
-def _save_output(directory, output):
+def _save_output(directory, output, spec):
     directory.mkdir()
+    (directory / "plan.substrait").write_bytes(spec.plan_bytes)
     pq.write_table(output.rows, directory / "rows.parquet", compression="zstd")
-    paths = {"rows": "rows.parquet", "filters": None, "joins": None}
+    paths = {
+        "plan": "plan.substrait",
+        "rows": "rows.parquet",
+        "filters": None,
+        "joins": None,
+    }
     for kind, answers in (
             ("filters", output.filter_answers), ("joins", output.join_answers)):
         if answers is None:
@@ -69,7 +134,7 @@ def _read_output(directory, record):
     pieces = paths.get("prompt_pieces")
     return RunOutput(
         None if filters is None else {
-            tuple(item["key"]): pq.read_table(file(item["path"])) for item in filters},
+            item["key"]: pq.read_table(file(item["path"])) for item in filters},
         None if joins is None else {
             item["key"]: pq.read_table(file(item["path"])) for item in joins},
         pq.read_table(file(paths["rows"])), record.get("runtime_s"),
@@ -125,7 +190,7 @@ def _validate_output(spec, output, tables):
                 codes.group_by(aliases).aggregate([]).num_rows != codes.num_rows):
             raise ValueError("duplicate document IDs in an answer table")
 
-    selected = [name.split(".")[0] for name in spec.select]
+    selected = [name.split(".")[0] for name in spec._info.select]
     if set(output.rows.column_names) != set(selected):
         raise ValueError("output columns must match the query's selected aliases")
     answers = scores_from_answers(spec, output, tables)
@@ -149,16 +214,21 @@ def _validate_output(spec, output, tables):
             survivors, relations, spec)
         if not (pc.all(mask).as_py() if sample.num_rows else True):
             raise ValueError("a returned row is not implied by the answers")
-    for (alias, position), table in (output.filter_answers or {}).items():
-        if position < 0 or position >= len(spec.alias(alias).filters):
-            raise ValueError("unknown filter position")
+    filters = {
+        filter_spec.id: filter_spec for filter_spec in spec._info.filters
+    }
+    for operator_id, table in (output.filter_answers or {}).items():
+        if operator_id not in filters:
+            raise ValueError(f"unknown filter operator {operator_id!r}")
+        alias = filters[operator_id].relation
         validate_ids(table, [alias])
         if table["answer"].null_count or str(table["answer"].type) != "bool":
             raise ValueError("predicate answers must be non-null booleans")
-    for position, table in (output.join_answers or {}).items():
-        if position < 0 or position >= len(spec.joins):
-            raise ValueError("unknown join position")
-        validate_ids(table, spec.joins[position].aliases)
+    joins = {join.id: join for join in spec._info.joins}
+    for operator_id, table in (output.join_answers or {}).items():
+        if operator_id not in joins:
+            raise ValueError(f"unknown join operator {operator_id!r}")
+        validate_ids(table, joins[operator_id].relations)
         if table["answer"].null_count or str(table["answer"].type) != "bool":
             raise ValueError("predicate answers must be non-null booleans")
 
@@ -168,7 +238,10 @@ def _score(spec, output, suite, gpu_count, gpu_hourly_rate_usd, tokens=None):
     _validate_output(spec, output, suite.tables)
     accuracy = evaluate(spec, output, suite.ground_truth, suite.tables)
     seconds = output.runtime_s
-    inputs = {alias.alias: len(suite.tables[alias.table]) for alias in spec.aliases}
+    inputs = {
+        relation.alias: len(suite.tables[relation.table])
+        for relation in spec._info.relations
+    }
     metrics = {
         "runtime_s": seconds, "input_rows": inputs,
         "accuracy": accuracy, "cost_usd": None,
@@ -177,10 +250,12 @@ def _score(spec, output, suite, gpu_count, gpu_hourly_rate_usd, tokens=None):
     }
     if gpu_hourly_rate_usd is not None:
         metrics["cost_usd"] = seconds / 3600 * gpu_count * gpu_hourly_rate_usd
-    if spec.joins:
+    if spec._info.joins:
         pairs = output.measurements.get("evaluated_document_pairs")
         if output.join_answers is not None:
-            if set(output.join_answers) == set(range(len(spec.joins))):
+            if set(output.join_answers) == {
+                join.id for join in spec._info.joins
+            }:
                 pairs = sum(len(table) for table in output.join_answers.values())
         if pairs is not None and (
                 isinstance(pairs, bool) or not isinstance(pairs, int) or pairs < 0):
@@ -234,7 +309,7 @@ def run(run_query, *, queries=None, scale_factor=0.1, output_dir,
             data_dir=data_dir, root=root)
     truth = suite.ground_truth
     record = {
-        "schema_version": 1, "quail_b_version": __version__,
+        "schema_version": RUN_SCHEMA_VERSION, "quail_b_version": __version__,
         "scale_factor": scale_factor, "corpus_id": suite.corpus_id,
         "collection_id": truth.collection_id, "reference_model": truth.reference_model,
         "metadata": metadata or {}, "gpu_count": gpu_count,
@@ -253,13 +328,18 @@ def run(run_query, *, queries=None, scale_factor=0.1, output_dir,
             item["status"] = "running"
             _write_json(path, record)
             print(f"[quail-b] {spec.id}: {spec.description}", flush=True)
-            tables = {alias.table: suite.tables[alias.table] for alias in spec.aliases}
+            tables = {
+                relation.table: suite.tables[relation.table]
+                for relation in spec._info.relations
+            }
             try:
                 output = run_query(spec, tables)
                 if not isinstance(output, RunOutput):
                     raise TypeError("run_query must return a RunOutput")
                 item.update(
-                    files=_save_output(directory / spec.id, output), status="saved")
+                    files=_save_output(directory / spec.id, output, spec),
+                    status="saved",
+                )
                 json.dumps({"runtime_s": output.runtime_s,
                             "measurements": output.measurements}, allow_nan=False)
                 item.update(runtime_s=output.runtime_s,

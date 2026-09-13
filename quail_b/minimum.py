@@ -75,9 +75,9 @@ def validate_prompt_pieces(spec, pieces) -> dict:
         pieces: A dict with `tokenizer` (a HuggingFace tokenizer name,
             the one that tokenized the documents), `preamble` (token
             ids before every document), `filters` (a list of
-            `{"alias", "position", "tail"}`: the ids after the
-            document of that filter stage) and `joins` (a list of
-            `{"position", "anchor", "frame", "label", "tail"}`: the
+            `{"id", "tail"}`: the operator ID and ids after the
+            document of that filter) and `joins` (a list of
+            `{"id", "anchor", "frame", "label", "tail"}`: the
             anchor alias, the ids after the anchor document, the ids
             before the partner document, and the ids after it).
 
@@ -90,34 +90,42 @@ def validate_prompt_pieces(spec, pieces) -> dict:
     checked = {"tokenizer": pieces["tokenizer"],
                "preamble": _token_list(pieces.get("preamble", ()), "preamble"),
                "filters": [], "joins": []}
-    stages = {(alias.alias, position)
-              for alias in spec.aliases for position in range(len(alias.filters))}
+    stages = {filter_spec.id for filter_spec in spec._info.filters}
     for item in pieces.get("filters", ()):
-        key = (item.get("alias"), item.get("position"))
-        if key not in stages:
-            raise ValueError(f"prompt pieces: unknown filter stage {key}")
-        stages.remove(key)
+        operator_id = item.get("id")
+        if operator_id not in stages:
+            raise ValueError(
+                f"prompt pieces: unknown filter operator {operator_id!r}"
+            )
+        stages.remove(operator_id)
         checked["filters"].append({
-            "alias": key[0], "position": int(key[1]),
+            "id": operator_id,
             "tail": _token_list(item.get("tail", ()), "filter tail")})
     if stages:
-        raise ValueError(f"prompt pieces: missing filter stages {sorted(stages)}")
-    positions = set(range(len(spec.joins)))
+        raise ValueError(
+            f"prompt pieces: missing filter operators {sorted(stages)}"
+        )
+    joins = {join.id: join for join in spec._info.joins}
+    operator_ids = set(joins)
     for item in pieces.get("joins", ()):
-        position = item.get("position")
-        if position not in positions:
-            raise ValueError(f"prompt pieces: unknown join position {position}")
-        positions.remove(position)
-        if item.get("anchor") not in spec.joins[position].aliases:
+        operator_id = item.get("id")
+        if operator_id not in operator_ids:
             raise ValueError(
-                f"prompt pieces: join {position} anchors on an alias it "
+                f"prompt pieces: unknown join operator {operator_id!r}"
+            )
+        operator_ids.remove(operator_id)
+        if item.get("anchor") not in joins[operator_id].relations:
+            raise ValueError(
+                f"prompt pieces: join {operator_id!r} anchors on an alias it "
                 f"does not join: {item.get('anchor')!r}")
         checked["joins"].append({
-            "position": int(position), "anchor": item["anchor"],
+            "id": operator_id, "anchor": item["anchor"],
             **{name: _token_list(item.get(name, ()), f"join {name}")
                for name in ("frame", "label", "tail")}})
-    if positions:
-        raise ValueError(f"prompt pieces: missing joins {sorted(positions)}")
+    if operator_ids:
+        raise ValueError(
+            f"prompt pieces: missing join operators {sorted(operator_ids)}"
+        )
     return checked
 
 
@@ -178,13 +186,16 @@ def minimum_input_tokens(spec, pieces, filter_answers, join_answers,
     Args:
         spec: The query.
         pieces: Validated prompt pieces (`validate_prompt_pieces`).
-        filter_answers: (alias, written position) -> table with the
-            alias's ids and answers, one row per document asked.
-        join_answers: Written position -> table with one id column per
-            alias and answers, one row per evaluated pair.
+        filter_answers: Filter operator ID to a table with the relation's
+            alias and answers, one row per document asked.
+        join_answers: Join operator ID to a table with one ID column per
+            relation and answers, one row per evaluated pair.
         documents: The document tokens.
     """
-    sets = {alias.alias: (alias.table, alias.column) for alias in spec.aliases}
+    sets = {
+        relation.alias: (relation.table, relation.text_column)
+        for relation in spec._info.relations
+    }
     pre = _tokens(pieces["preamble"])
     records: dict = {}
 
@@ -194,17 +205,21 @@ def minimum_input_tokens(spec, pieces, filter_answers, join_answers,
             records[key] = _Document(alias=alias, row_id=str(row_id))
         return records[key]
 
-    tails = {(item["alias"], item["position"]): tuple(item["tail"])
-             for item in pieces["filters"]}
-    for (alias, written_pos), table in filter_answers.items():
-        question = tails[(alias, written_pos)]
+    tails = {item["id"]: tuple(item["tail"]) for item in pieces["filters"]}
+    filters = {
+        filter_spec.id: filter_spec for filter_spec in spec._info.filters
+    }
+    for operator_id, table in filter_answers.items():
+        alias = filters[operator_id].relation
+        question = tails[operator_id]
         for row_id in table.column(alias).to_pylist():
             record(alias, row_id).suffixes.add(question)
-    joins = {item["position"]: item for item in pieces["joins"]}
-    for written_pos, table in join_answers.items():
-        piece = joins[written_pos]
+    joins = {item["id"]: item for item in pieces["joins"]}
+    join_specs = {join.id: join for join in spec._info.joins}
+    for operator_id, table in join_answers.items():
+        piece = joins[operator_id]
         anchor = piece["anchor"]
-        (partner,) = [alias for alias in spec.joins[written_pos].aliases
+        (partner,) = [alias for alias in join_specs[operator_id].relations
                       if alias != anchor]
         group = (tuple(piece["frame"]), tuple(piece["label"]), tuple(piece["tail"]))
         partner_set = sets[partner]

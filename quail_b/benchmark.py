@@ -65,7 +65,11 @@ def load_benchmark(only=None, *, scale_factor=0.1, data_dir=None,
         root, f"{GROUND_TRUTH_ROOT}/corpora/{corpus_id}/manifest.json")
     if manifest["corpus_id"] != corpus_id:
         raise ValueError("published corpus manifest has the wrong corpus ID")
-    names = sorted({alias.table for spec in specs for alias in spec.aliases})
+    names = sorted({
+        relation.table
+        for spec in specs
+        for relation in spec._info.relations
+    })
     tables = {
         name: (
             load_table(name, scale_factor=scale_factor, root=root).select(
