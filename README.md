@@ -6,6 +6,12 @@ Write queries in SQL or Python. Quail plans and executes their model calls toget
 Model execution requires a CUDA GPU. The supported models are Qwen3 4B fp8
 and Qwen3 32B fp8, with one model copy per GPU.
 
+Once published, install the distribution and import the `quail` package:
+
+```bash
+pip install quail-engine
+```
+
 ## Quickstart
 
 From this repository, install the dependencies with Python 3.12 and uv:
@@ -79,3 +85,28 @@ See the [user guide](docs/content/docs/user-guide/index.mdx),
 [architecture](docs/content/docs/architecture/index.mdx), and
 [extension guide](docs/content/docs/extending/index.mdx) for details.
 Experiment scripts are in `experiments/`; their reports are in `reports/`.
+
+## Release
+
+The PyPI project uses trusted publishing, so releases do not use a saved API
+token. Before the first release:
+
+1. Create a protected GitHub environment named `pypi`.
+2. Add a pending publisher at
+   [PyPI publishing settings](https://pypi.org/manage/account/publishing/):
+   - PyPI project: `quail-engine`
+   - GitHub owner: `fsdatalab`
+   - GitHub repository: `quail-exploration`
+   - Workflow: `publish.yml`
+   - Environment: `pypi`
+
+Set the version with `uv version` and commit that change. From a clean `main`
+branch matching `origin/main`, release it with one command:
+
+```bash
+tools/release.sh 0.1.0
+```
+
+The script checks the version and repository state, then pushes the matching
+tag. Following uv's official publishing guide, GitHub Actions builds with
+`uv build --no-sources` and publishes the files with `uv publish`.
