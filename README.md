@@ -246,10 +246,8 @@ results/my-run/measurements.parquet
 `report.md` includes query time, throughput, GPU cost, predicate accuracy,
 final-output precision and recall, input rows, and token work.
 
-These are representative measured rows from
-[Quail PR 91](https://github.com/fsdatalab/quail-exploration/pull/91):
-Quail after its streamed-edge change, one H100, Qwen3 4B fp8, scale 0.1,
-September 12, 2026.
+For example, these are results from Quail on one H100 with Qwen3 4B fp8
+at scale 0.1:
 
 | Dataset | Query | Query time, seconds | Recomputed KV tokens |
 | --- | --- | ---: | ---: |
@@ -259,12 +257,10 @@ September 12, 2026.
 | LePaRD | LEP-6 | 9.39 | 95,362 |
 | SWE-Next | AGENT-1 | 237.65 | 11,886,152 |
 
-The linked comparison covers all 33 queries and records the source for
-each configuration. Filter throughput is input documents per second.
-Join throughput is evaluated pairs per second across all stages.
-Predicate accuracy is agreement on evaluated answers; that count can
-differ between engines. Labels are Qwen3 32B fp8; FEVER and LePaRD also
-use source labels.
+Filter throughput is input documents per second. Join throughput is
+evaluated pairs per second across all stages. Predicate accuracy is
+agreement on evaluated answers; that count can differ between engines.
+Labels are Qwen3 32B fp8; FEVER and LePaRD also use source labels.
 
 Rebuild the report from saved answers:
 
