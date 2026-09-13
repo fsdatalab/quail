@@ -48,6 +48,7 @@ class NodeMetrics:
     kv_recomputations: int = 0
     peak_gpu_bytes: int = 0
     gpu_s: float = 0.0
+    chunks: int = 0
     extension: Mapping[str, Any] = field(default_factory=dict)
 
     def __add__(self, other: "NodeMetrics") -> "NodeMetrics":
@@ -72,6 +73,7 @@ class NodeMetrics:
             ),
             peak_gpu_bytes=max(self.peak_gpu_bytes, other.peak_gpu_bytes),
             gpu_s=self.gpu_s + other.gpu_s,
+            chunks=self.chunks + other.chunks,
             extension={**self.extension, **other.extension},
         )
 

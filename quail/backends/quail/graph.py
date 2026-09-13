@@ -134,7 +134,7 @@ def stage_partner_lists(group, lists_for, anchor_ids) -> list:
 
 
 def filter_result(node, answers, tokens, document_ids,
-                  gpu_s: float = 0.0) -> NodeResult:
+                  gpu_s: float = 0.0, chunks: int = 0) -> NodeResult:
     """Build one filter chain's node result from its local answers."""
     global_answers = {
         document_ids[int(local)]: row
@@ -156,6 +156,7 @@ def filter_result(node, answers, tokens, document_ids,
             evaluated_documents=len(global_answers),
             fresh_tokens=tokens,
             gpu_s=gpu_s,
+            chunks=chunks,
         ),
     )
 
@@ -412,6 +413,7 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
         # seconds a forward chunk was running on the GPU, summed over
         # the model nodes; wall_s minus this is time the GPU sat idle
         report["gpu_s"] = round(result.metrics.gpu_s, 3)
+        report["chunks"] = result.metrics.chunks
     return report
 
 

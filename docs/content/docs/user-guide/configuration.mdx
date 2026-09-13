@@ -32,8 +32,10 @@ class EngineConfig:
 - `gpu_timing`: when true, the Quail backend adds `gpu_s` to the
   result report: the seconds a forward chunk was running on the GPU,
   summed from the CUDA events each chunk records. `wall_s` minus
-  `gpu_s` is the time the GPU sat idle during the query. Off by
-  default.
+  `gpu_s` is the time the GPU sat idle during the query. `chunks`,
+  the number of forward passes, comes with it: `fresh_tokens` divided
+  by `chunks` is the mean forward pass size, to compare with the chunk
+  budget. Off by default.
 
 ```python
 session = quail.Session(quail.EngineConfig(

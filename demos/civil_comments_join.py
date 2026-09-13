@@ -37,9 +37,7 @@ DATASET_REVISION = "c227534cc0a34cf21db6a0bf0edd0f9050c8b305"
 DATASET_FILE = "raw/train-00000-of-00001.parquet"
 
 # Score column -> the statement the model judges. Toxicity is the filter.
-TOXIC = ("is toxic, meaning rude, disrespectful, or unreasonable enough "
-         "that most readers would leave the discussion; disagreement, "
-         "criticism, sarcasm, or a strong opinion alone is not toxic")
+TOXIC = "is toxic"
 FIELDS = {
     "severe_toxicity": "is very hateful, aggressive, or disrespectful, far "
                        "beyond ordinary rudeness",
@@ -119,6 +117,27 @@ Instruction: answer TRUE if the comment {criterion}, FALSE otherwise.', c.text),
 
 
 SQL = build_sql()
+
+
+def own_answers(result):
+    """Return an answer(prompt, assignment) callable replaying a run's answers."""
+    filters, joins = {}, {}
+    for (alias, _), table in result.answer_tables["filters"].items():
+        for row in table.to_pylist():
+            filters[(alias, row[alias])] = bool(row["answer"])
+    for table in result.answer_tables["joins"].values():
+        aliases = [name for name in table.column_names if name != "answer"]
+        for row in table.to_pylist():
+            key = tuple(sorted((alias, row[alias]) for alias in aliases))
+            joins[key] = bool(row["answer"])
+
+    def answer(prompt, assignment):
+        if len(prompt.args) == 1:
+            alias = prompt.args[0].alias
+            return filters.get((alias, assignment[alias]), False)
+        return joins.get(tuple(sorted(assignment.items())), False)
+
+    return answer
 
 
 def load_comments(parquet: str | None, limit: int | None) -> pa.Table:
@@ -232,6 +251,15 @@ def main() -> None:
             idle = wall_s - report["gpu_s"]
             print(f"gpu_s: {report['gpu_s']} busy, {idle:.2f} idle "
                   f"({100 * idle / wall_s:.1f}% of wall_s)")
+            budget = query.plan().settings["chunk_tokens"]
+            print(f"chunks: {report['chunks']}, mean "
+                  f"{report['fresh_tokens'] / report['chunks']:,.0f} fresh "
+                  f"tokens per chunk of the {budget:,} budget")
+            # the ideal time for exactly the answers this run gave
+            ideal = quail.speed_of_light_estimate(query, own_answers(result))
+            print(f"speed of light for this run's answers: {ideal.seconds:.2f} s, "
+                  f"{ideal.fresh_tokens:,.0f} fresh tokens; measured wall is "
+                  f"{wall_s / ideal.seconds:.2f}x ideal")
         print(f"total_s: {wall_s + boot_s:.2f} (boot + query)")
         print(f"fresh_tokens: {report.get('fresh_tokens')}")
         if pairs:

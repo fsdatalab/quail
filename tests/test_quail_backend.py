@@ -467,5 +467,6 @@ def test_gpu_timing_sums_the_chunk_events_only_when_asked(monkeypatch):
     per_node = [metrics["gpu_s"] for metrics in on["node_metrics"].values()]
     assert on["gpu_s"] == pytest.approx(sum(per_node), abs=1e-3)
     assert on["gpu_s"] > 0
+    assert on["chunks"] == round(on["gpu_s"] / 0.002)
     assert all(chunks == round(chunks)
                for chunks in (seconds / 0.002 for seconds in per_node))

@@ -699,8 +699,9 @@ class Query:
             node_metrics=out.get("node_metrics", {}),
             backend_metrics=out.get("backend_metrics"),
             remarks=list(plan.remarks) + list(self.session.notes))
-        if "gpu_s" in out:
-            report["gpu_s"] = out["gpu_s"]
+        for key in ("gpu_s", "chunks"):
+            if key in out:
+                report[key] = out[key]
 
         scans, logical_filters, logical_joins = collect_operators(self.logical)
         scans_by_alias = {scan.alias: scan for scan in scans}

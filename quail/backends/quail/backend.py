@@ -112,7 +112,8 @@ class QuailModelExecution:
             )
             return filter_result(
                 node, answers, tokens, document_ids,
-                gpu_s=_gpu_seconds(torch, spans, inputs))
+                gpu_s=_gpu_seconds(torch, spans, inputs),
+                chunks=_chunks(spans, inputs))
 
         stage_frames = inputs["stage_frames"]
         stream = inputs.get("anchor_stream")
@@ -164,6 +165,7 @@ class QuailModelExecution:
                 source.tokens,
                 stream["document_ids"],
                 gpu_s=_gpu_seconds(torch, source.spans, inputs),
+                chunks=_chunks(source.spans, inputs),
             ))
         else:
             anchor_ids = list(inputs["anchor_ids"])
@@ -210,6 +212,7 @@ class QuailModelExecution:
                 kv_misses=kv_round.get("misses", 0),
                 fresh_tokens=tokens,
                 gpu_s=_gpu_seconds(torch, spans, inputs),
+                chunks=_chunks(spans, inputs),
                 extension={"answers": answers},
             ),
         )
@@ -222,6 +225,11 @@ def _gpu_seconds(torch, spans, inputs) -> float:
     # every chunk's answers were read, so its end event has completed
     torch.cuda.synchronize()
     return sum(start.elapsed_time(end) for _, start, end in spans) / 1000.0
+
+
+def _chunks(spans, inputs) -> int:
+    """Forward chunks the loop launched; 0 unless timing was asked for."""
+    return len(spans) if inputs.get("gpu_timing") else 0
 
 
 def expected_join_nodes(plan) -> tuple[PhysicalNode, ...]:

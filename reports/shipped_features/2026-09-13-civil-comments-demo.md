@@ -242,3 +242,39 @@ chunk's start event. Time the CPU spends launching kernels inside a
 chunk counts as busy, so 0.5 percent is a lower bound on idle time;
 the kernel-level profiles in the 2026-09-07 report put that inside-
 chunk share at 0.1 to 2 percent on the unstreamed paths.
+
+## Sixth GPU run, 10,000 comments, local H100
+
+Same wording as the fourth run, `--limit 10000 --gpu-timing`.
+
+| Quantity | Measured |
+|---|---:|
+| Filter pass rate | 83.6 percent |
+| Join pairs evaluated | 259,098 |
+| Join pass rate | 13.9 percent |
+| Query time, s | 65.35 |
+| GPU idle | 0.11 s, 0.2 percent |
+| Document pairs/s | 3,965 |
+| Fresh tokens | 7,635,348 |
+| $/query | 0.0717 |
+| Output precision against the labels | 0.059 |
+| Output recall against the labels | 0.862 |
+
+Rates matched the 2,000-comment runs, so the sample size is not the
+issue. The filter criterion is now simply "is toxic", on the request
+that the long definition was doing more harm than good. Prediction:
+the filter passes 15 to 40 percent; a 4B model's notion of toxic is
+looser than the annotators' majority vote, so it will still be above
+the 11 percent the labels give.
+
+## Batch fill and saturation
+
+With `--gpu-timing` the report also carries `chunks`, the number of
+forward passes, and the demo prints the mean fresh tokens per chunk
+against the chunk budget (batch fill), and the speed-of-light
+estimate for exactly the answers the run gave (the ideal time with
+every prefix computed once, at the roofline). Measured wall over that
+ideal is the saturation number: 1.0 would mean the hardware was fully
+used on unavoidable work. Prediction for the 10,000-comment run: mean
+chunk above 90 percent of the 110,376-token budget, and measured wall
+between 1.3 and 2.0 times the speed of light.
