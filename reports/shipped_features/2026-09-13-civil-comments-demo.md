@@ -224,3 +224,21 @@ one percentage point.
 
 `gpu_s` did not appear in the fourth run's output because the session
 dropped it when assembling the report; that is fixed in this commit.
+
+## Fifth GPU run, 2,000 comments, local H100, with `--gpu-timing`
+
+Same command as the fourth run plus `--gpu-timing`. Every count
+matched the fourth run exactly (83.7 percent filter pass, 51,894 join
+pairs, 7,103 output pairs), so the streamed path is deterministic.
+
+| Quantity | Predicted | Measured |
+|---|---:|---:|
+| Query time, s | | 13.11 |
+| GPU busy, s | | 13.04 |
+| GPU idle, s | under 10 percent of wall | 0.07, 0.5 percent |
+
+The idle share is the time between one chunk's end event and the next
+chunk's start event. Time the CPU spends launching kernels inside a
+chunk counts as busy, so 0.5 percent is a lower bound on idle time;
+the kernel-level profiles in the 2026-09-07 report put that inside-
+chunk share at 0.1 to 2 percent on the unstreamed paths.
