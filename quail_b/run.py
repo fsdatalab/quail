@@ -24,6 +24,8 @@ from quail_b.scoring import (
     scores_from_answers,
 )
 
+RUN_SCHEMA_VERSION = 2
+
 
 def _write_json(path, value):
     path = Path(path)
@@ -69,7 +71,7 @@ def _read_output(directory, record):
     pieces = paths.get("prompt_pieces")
     return RunOutput(
         None if filters is None else {
-            tuple(item["key"]): pq.read_table(file(item["path"])) for item in filters},
+            item["key"]: pq.read_table(file(item["path"])) for item in filters},
         None if joins is None else {
             item["key"]: pq.read_table(file(item["path"])) for item in joins},
         pq.read_table(file(paths["rows"])), record.get("runtime_s"),
@@ -149,16 +151,19 @@ def _validate_output(spec, output, tables):
             survivors, relations, spec)
         if not (pc.all(mask).as_py() if sample.num_rows else True):
             raise ValueError("a returned row is not implied by the answers")
-    for (alias, position), table in (output.filter_answers or {}).items():
-        if position < 0 or position >= len(spec.alias(alias).filters):
-            raise ValueError("unknown filter position")
+    filters = {filter_spec.id: filter_spec for filter_spec in spec.filters}
+    for operator_id, table in (output.filter_answers or {}).items():
+        if operator_id not in filters:
+            raise ValueError(f"unknown filter operator {operator_id!r}")
+        alias = filters[operator_id].relation
         validate_ids(table, [alias])
         if table["answer"].null_count or str(table["answer"].type) != "bool":
             raise ValueError("predicate answers must be non-null booleans")
-    for position, table in (output.join_answers or {}).items():
-        if position < 0 or position >= len(spec.joins):
-            raise ValueError("unknown join position")
-        validate_ids(table, spec.joins[position].aliases)
+    joins = {join.id: join for join in spec.joins}
+    for operator_id, table in (output.join_answers or {}).items():
+        if operator_id not in joins:
+            raise ValueError(f"unknown join operator {operator_id!r}")
+        validate_ids(table, joins[operator_id].relations)
         if table["answer"].null_count or str(table["answer"].type) != "bool":
             raise ValueError("predicate answers must be non-null booleans")
 
@@ -168,7 +173,10 @@ def _score(spec, output, suite, gpu_count, gpu_hourly_rate_usd, tokens=None):
     _validate_output(spec, output, suite.tables)
     accuracy = evaluate(spec, output, suite.ground_truth, suite.tables)
     seconds = output.runtime_s
-    inputs = {alias.alias: len(suite.tables[alias.table]) for alias in spec.aliases}
+    inputs = {
+        relation.alias: len(suite.tables[relation.table])
+        for relation in spec.relations
+    }
     metrics = {
         "runtime_s": seconds, "input_rows": inputs,
         "accuracy": accuracy, "cost_usd": None,
@@ -180,7 +188,7 @@ def _score(spec, output, suite, gpu_count, gpu_hourly_rate_usd, tokens=None):
     if spec.joins:
         pairs = output.measurements.get("evaluated_document_pairs")
         if output.join_answers is not None:
-            if set(output.join_answers) == set(range(len(spec.joins))):
+            if set(output.join_answers) == {join.id for join in spec.joins}:
                 pairs = sum(len(table) for table in output.join_answers.values())
         if pairs is not None and (
                 isinstance(pairs, bool) or not isinstance(pairs, int) or pairs < 0):
@@ -234,7 +242,7 @@ def run(run_query, *, queries=None, scale_factor=0.1, output_dir,
             data_dir=data_dir, root=root)
     truth = suite.ground_truth
     record = {
-        "schema_version": 1, "quail_b_version": __version__,
+        "schema_version": RUN_SCHEMA_VERSION, "quail_b_version": __version__,
         "scale_factor": scale_factor, "corpus_id": suite.corpus_id,
         "collection_id": truth.collection_id, "reference_model": truth.reference_model,
         "metadata": metadata or {}, "gpu_count": gpu_count,
@@ -253,7 +261,10 @@ def run(run_query, *, queries=None, scale_factor=0.1, output_dir,
             item["status"] = "running"
             _write_json(path, record)
             print(f"[quail-b] {spec.id}: {spec.description}", flush=True)
-            tables = {alias.table: suite.tables[alias.table] for alias in spec.aliases}
+            tables = {
+                relation.table: suite.tables[relation.table]
+                for relation in spec.relations
+            }
             try:
                 output = run_query(spec, tables)
                 if not isinstance(output, RunOutput):

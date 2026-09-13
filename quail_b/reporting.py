@@ -13,7 +13,13 @@ import pyarrow.parquet as pq
 
 from quail_b._files import download_cache
 from quail_b.benchmark import load_benchmark
-from quail_b.run import _query_hash, _read_output, _score, _write_json
+from quail_b.run import (
+    RUN_SCHEMA_VERSION,
+    _query_hash,
+    _read_output,
+    _score,
+    _write_json,
+)
 
 MEASUREMENT_SCHEMA = pa.schema([
     ("query", pa.string()),
@@ -178,7 +184,7 @@ def report(run_dir, *, rescore=True, cache_dir=None, root=None):
     directory = Path(run_dir)
     path = directory / "run.json"
     record = json.loads(path.read_text())
-    if record["schema_version"] != 1:
+    if record["schema_version"] != RUN_SCHEMA_VERSION:
         raise ValueError("unsupported run format")
     if not rescore:
         return _write_report(directory, record)

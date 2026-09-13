@@ -112,12 +112,12 @@ prompt_pieces = {
     "tokenizer": "Qwen/Qwen3-4B-FP8",
     "preamble": [...],
     "filters": [
-        {"alias": "r", "position": 0, "tail": [...]},
-        {"alias": "r", "position": 1, "tail": [...]},
+        {"id": "filter-1", "tail": [...]},
+        {"id": "filter-2", "tail": [...]},
     ],
     "joins": [
         {
-            "position": 0,
+            "id": "join-1",
             "anchor": "r",
             "frame": [...],
             "label": [...],
@@ -157,21 +157,38 @@ WHERE AI_FILTER(F1, r.body)
   AND AI_FILTER(F4, r.body);
 ```
 
-The actual `QuerySpec` carries those operations without requiring one
-engine's SQL syntax:
+The actual `QuerySpec` separates relations from operators. The operators
+are in written order and have stable IDs:
 
 ```python
-query.id                 # "IMDB-4"
-query.aliases[0].alias   # "r"
-query.aliases[0].table   # "reviews"
-query.aliases[0].column  # "body"
-query.aliases[0].filters # (F1 prompt, F4 prompt)
-query.aliases[1].table   # "aspects"
-query.aliases[1].column  # "aspect"
-query.joins[0].aliases   # ("r", "a")
-query.joins[0].template  # J1 prompt
-query.select             # ("r.id", "a.id")
+from quail_b import FilterSpec, JoinSpec, QuerySpec, RelationSpec
+from quail_b.prompts import DISCUSS_ASPECT, F1, F4
+
+
+query = QuerySpec(
+    id="IMDB-4",
+    description="F1 -> F4 -> J1, 2 filters then 1 join",
+    relations=(
+        RelationSpec(alias="r", table="reviews", text_column="body"),
+        RelationSpec(alias="a", table="aspects", text_column="aspect"),
+    ),
+    operators=(
+        FilterSpec(id="filter-1", relation="r", prompt=F1),
+        FilterSpec(id="filter-2", relation="r", prompt=F4),
+        JoinSpec(
+            id="join-1",
+            relations=("r", "a"),
+            prompt=DISCUSS_ASPECT,
+        ),
+    ),
+    select=("r.id", "a.id"),
+)
 ```
+
+The prompt names in this example refer to the exact strings in
+`quail_b/prompts.py`. `FilterSpec.relation` identifies the filter input.
+`JoinSpec.relations` identifies the two join inputs in prompt-placeholder
+order.
 
 For this query, `tables["reviews"]` has `id` and `body` columns.
 `tables["aspects"]` has `id` and `aspect` columns.
@@ -191,17 +208,17 @@ def run_query(query, tables):
 
     return quail_b.RunOutput(
         filter_answers={
-            ("r", 0): pa.table({
+            "filter-1": pa.table({
                 "r": result.f1_ids,
                 "answer": result.f1_answers,
             }),
-            ("r", 1): pa.table({
+            "filter-2": pa.table({
                 "r": result.f4_ids,
                 "answer": result.f4_answers,
             }),
         },
         join_answers={
-            0: pa.table({
+            "join-1": pa.table({
                 "r": result.j1_review_ids,
                 "a": result.j1_aspect_ids,
                 "answer": result.j1_answers,
@@ -222,11 +239,12 @@ QUAIL-B.
 
 The returned fields mean:
 
-- `filter_answers[("r", 0)]` has every document evaluated by filter 0
-  on alias `r`, plus the model's boolean answer.
-- `filter_answers[("r", 1)]` has every document that reached filter 1,
-  plus its answer.
-- `join_answers[0]` has every pair evaluated by join 0, plus its answer.
+- `filter_answers["filter-1"]` has every document evaluated by the first
+  filter, plus the model's boolean answer.
+- `filter_answers["filter-2"]` has every document that reached the second
+  filter, plus its answer.
+- `join_answers["join-1"]` has every pair evaluated by the join, plus its
+  answer.
 - `rows` has the final query result. It has one ID column per alias in
   `query.select`.
 - `runtime_s` is query execution time. It excludes model startup,
@@ -234,9 +252,10 @@ The returned fields mean:
 - `measurements["fresh_tokens"]` is the input work measured by the engine.
 - `prompt_pieces` lets QUAIL-B compute the minimum and recomputed KV tokens.
 
-Filter and join indices start at 0. Pass `None` for the answer dictionaries
-if your engine did not record individual predicate answers. QUAIL-B can
-still score final output precision and recall.
+Operator IDs are unique within a query and do not change when an engine
+reorders execution. Pass `None` for the answer dictionaries if the engine
+did not record individual predicate answers. QUAIL-B can still score final
+output precision and recall.
 
 ## Running the benchmark
 

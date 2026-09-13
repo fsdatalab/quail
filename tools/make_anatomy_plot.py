@@ -109,18 +109,25 @@ class Join:
 def _build_tree(spec):
     """Build a plan tree from one QuerySpec."""
     subtrees = {}
-    for alias_spec in spec.aliases:
-        node = Scan(alias_spec.table, alias_spec.alias)
-        for template in alias_spec.filters:
-            node = Filter(TEMPLATE_LABELS[template], template, node)
-        subtrees[alias_spec.alias] = node
+    for relation in spec.relations:
+        node = Scan(relation.table, relation.alias)
+        for filter_spec in spec.filters:
+            if filter_spec.relation == relation.alias:
+                node = Filter(
+                    TEMPLATE_LABELS[filter_spec.prompt],
+                    filter_spec.prompt,
+                    node,
+                )
+        subtrees[relation.alias] = node
 
-    current = subtrees[spec.aliases[0].alias]
-    for i, join in enumerate(spec.joins):
-        added = spec.aliases[i + 1].alias
+    current = subtrees[spec.base_alias]
+    joined = {spec.base_alias}
+    for join in spec.joins:
+        (added,) = set(join.relations) - joined
         current = Join(
-            TEMPLATE_LABELS[join.template], join.template,
+            TEMPLATE_LABELS[join.prompt], join.prompt,
             current, subtrees[added])
+        joined.add(added)
     return current
 
 
@@ -267,10 +274,14 @@ def main():
                           | set(JOIN_SELECTIVITY_ESTIMATES.keys())
                           | {t for s in QUERIES
                              for t in s.filter_templates}
-                          | {j.template for s in QUERIES
+                          | {j.prompt for s in QUERIES
                              for j in s.joins}))
     n_families = len(family_metas)
-    n_tables = len({a.table for s in QUERIES for a in s.aliases})
+    n_tables = len({
+        relation.table
+        for spec in QUERIES
+        for relation in spec.relations
+    })
 
     scale = 0.65
     fig, ax = plt.subplots(

@@ -32,9 +32,11 @@ def test_load_table_and_query(tmp_path):
             benchmark.load_table(root=tmp_path, **kwargs)
     with pytest.raises(FileNotFoundError):
         benchmark.load_table("aspects", root=tmp_path)
-    assert benchmark.get_query("IMDB-1").aliases[0].table == "reviews"
+    assert benchmark.get_query("IMDB-1").relations[0].table == "reviews"
     join = benchmark.get_query("IMDB-4")
-    assert {alias.table for alias in join.aliases} == {"reviews", "aspects"}
+    assert {relation.table for relation in join.relations} == {
+        "reviews", "aspects"
+    }
     assert len(join.joins) == 1
     with pytest.raises(KeyError):
         benchmark.get_query("UNKNOWN")

@@ -3,13 +3,14 @@
 import pytest
 
 from quail_b.queries import (
+    FilterSpec,
+    JoinSpec,
     PRIVACY_QUERIES,
     QUERIES,
     QUERY_FAMILY_WORKLOADS,
     QUERY_ORDER,
-    AliasSpec,
-    JoinSpec,
     QuerySpec,
+    RelationSpec,
     queries,
     query_family_name,
     split_query_families,
@@ -35,11 +36,36 @@ def test_catalog_has_the_33_default_queries_and_two_privacy_queries():
         assert not spec.has_estimates and spec.order == "as_written", spec.id
 
 
-def test_spec_rejects_a_join_that_does_not_add_its_alias():
-    with pytest.raises(ValueError, match="must add alias"):
-        QuerySpec("X-1", "bad", (AliasSpec("r", "reviews", "body"),
-                                 AliasSpec("a", "aspects", "aspect")),
-                  (JoinSpec("{0} {1}", ("r", "r")),), ("r.id",))
+def test_spec_rejects_a_join_that_does_not_add_a_relation():
+    with pytest.raises(ValueError, match="must add one relation"):
+        QuerySpec(
+            "X-1",
+            "bad",
+            (
+                RelationSpec("r", "reviews", "body"),
+                RelationSpec("a", "aspects", "aspect"),
+            ),
+            (JoinSpec("join-1", ("r", "r"), "{0} {1}"),),
+            ("r.id",),
+        )
+
+
+def test_filters_are_explicit_ordered_operators():
+    spec = queries()["IMDB-4"]
+
+    assert spec.relations == (
+        RelationSpec("r", "reviews", "body"),
+        RelationSpec("a", "aspects", "aspect"),
+    )
+    assert [
+        (operator.id, operator.relation) for operator in spec.filters
+    ] == [
+        ("filter-1", "r"),
+        ("filter-2", "r"),
+    ]
+    assert [operator.id for operator in spec.joins] == ["join-1"]
+    assert isinstance(spec.operators[0], FilterSpec)
+    assert isinstance(spec.operators[-1], JoinSpec)
 
 
 def test_parallel_query_split_matches_stock_vllm():

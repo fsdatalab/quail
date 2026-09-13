@@ -72,74 +72,151 @@ JOIN_SELECTIVITY_ESTIMATES = {
 
 
 @dataclass(frozen=True)
-class AliasSpec:
-    """One use of one document table in a query."""
+class RelationSpec:
+    """One document relation used by a query."""
 
     alias: str
     table: str
-    column: str                    # the document text column
-    filters: tuple[str, ...] = ()  # prompt templates, written order
+    text_column: str
+
+
+@dataclass(frozen=True)
+class FilterSpec:
+    """One AI filter over a relation."""
+
+    id: str
+    relation: str
+    prompt: str
 
 
 @dataclass(frozen=True)
 class JoinSpec:
-    """One binary AI join; aliases in placeholder order.
+    """One binary AI join with relations in placeholder order.
 
     `on` lists ordinary equality conditions as (left column, right
-    column) pairs over the two aliases. The AI predicate is asked only
+    column) pairs over the two relations. The AI predicate is asked only
     of the pairs whose columns are equal; empty means every pair.
     """
 
-    template: str
-    aliases: tuple[str, str]
+    id: str
+    relations: tuple[str, str]
+    prompt: str
     on: tuple[tuple[str, str], ...] = ()
+
+
+type OperatorSpec = FilterSpec | JoinSpec
 
 
 @dataclass(frozen=True)
 class QuerySpec:
     """One benchmark query.
 
-    The first alias is the base relation. Join i adds alias i + 1, with
-    that alias's filters applied before the join. `select` names the
+    The first relation is the base. Operators are in written order.
+    Each join adds one relation to the preceding joins. `select` names
     output columns as alias.column.
     """
 
     id: str
     description: str
-    aliases: tuple[AliasSpec, ...]
-    joins: tuple[JoinSpec, ...]
+    relations: tuple[RelationSpec, ...]
+    operators: tuple[OperatorSpec, ...]
     select: tuple[str, ...]
 
     def __post_init__(self):
-        if len(self.aliases) != len(self.joins) + 1:
-            raise ValueError(
-                f"{self.id}: {len(self.aliases)} aliases need "
-                f"{len(self.aliases) - 1} joins, not {len(self.joins)}")
-        names = {spec.alias for spec in self.aliases}
-        for index, join in enumerate(self.joins):
-            added = self.aliases[index + 1].alias
-            if added not in join.aliases or not set(join.aliases) <= names:
+        if not self.relations:
+            raise ValueError(f"{self.id}: a query needs at least one relation")
+        aliases = [relation.alias for relation in self.relations]
+        if len(set(aliases)) != len(aliases):
+            raise ValueError(f"{self.id}: relation aliases must be unique")
+        operator_ids = [operator.id for operator in self.operators]
+        if any(not isinstance(operator_id, str) or not operator_id
+               for operator_id in operator_ids):
+            raise ValueError(f"{self.id}: operator ids must be nonempty strings")
+        if len(set(operator_ids)) != len(operator_ids):
+            raise ValueError(f"{self.id}: operator ids must be unique")
+        names = set(aliases)
+        for operator in self.operators:
+            referenced = (
+                (operator.relation,)
+                if isinstance(operator, FilterSpec)
+                else operator.relations
+            )
+            if not set(referenced) <= names:
                 raise ValueError(
-                    f"{self.id}: join {index} must add alias {added!r}")
+                    f"{self.id}: operator {operator.id!r} references an "
+                    "unknown relation"
+                )
+            if isinstance(operator, JoinSpec) and len(set(referenced)) != 2:
+                raise ValueError(
+                    f"{self.id}: join {operator.id!r} needs two relations"
+                )
+        first_join = {alias: len(self.operators) for alias in aliases}
+        for index, operator in enumerate(self.operators):
+            if isinstance(operator, JoinSpec):
+                for alias in operator.relations:
+                    first_join[alias] = min(first_join[alias], index)
+        for index, operator in enumerate(self.operators):
+            if (isinstance(operator, FilterSpec)
+                    and index > first_join[operator.relation]):
+                raise ValueError(
+                    f"{self.id}: filter {operator.id!r} must precede joins "
+                    f"on relation {operator.relation!r}"
+                )
+        joins = self.joins
+        if len(self.relations) != len(joins) + 1:
+            raise ValueError(
+                f"{self.id}: {len(self.relations)} relations need "
+                f"{len(self.relations) - 1} joins, not {len(joins)}"
+            )
+        joined = {self.base_alias}
+        for join in joins:
+            referenced = set(join.relations)
+            if len(referenced & joined) != 1 or len(referenced - joined) != 1:
+                raise ValueError(
+                    f"{self.id}: join {join.id!r} must add one relation"
+                )
+            joined.update(referenced)
+        for name in self.select:
+            alias, separator, column = name.partition(".")
+            if not separator or alias not in names or not column:
+                raise ValueError(f"{self.id}: invalid selected column {name!r}")
 
-    def alias(self, name: str) -> AliasSpec:
-        return next(spec for spec in self.aliases if spec.alias == name)
+    def relation(self, alias: str) -> RelationSpec:
+        """Return the relation with this alias."""
+        return next(relation for relation in self.relations
+                    if relation.alias == alias)
+
+    def operator(self, operator_id: str) -> OperatorSpec:
+        """Return the operator with this ID."""
+        return next(operator for operator in self.operators
+                    if operator.id == operator_id)
 
     @property
     def base_alias(self) -> str:
-        return self.aliases[0].alias
+        return self.relations[0].alias
+
+    @property
+    def filters(self) -> tuple[FilterSpec, ...]:
+        """Return the filter operators in written order."""
+        return tuple(operator for operator in self.operators
+                     if isinstance(operator, FilterSpec))
+
+    @property
+    def joins(self) -> tuple[JoinSpec, ...]:
+        """Return the join operators in written order."""
+        return tuple(operator for operator in self.operators
+                     if isinstance(operator, JoinSpec))
 
     @property
     def filter_templates(self) -> tuple[str, ...]:
-        return tuple(
-            template for spec in self.aliases for template in spec.filters)
+        return tuple(filter_spec.prompt for filter_spec in self.filters)
 
     @property
     def has_estimates(self) -> bool:
         return (
-            all(template in FILTER_SELECTIVITY_ESTIMATES
-                for template in self.filter_templates)
-            and all(join.template in JOIN_SELECTIVITY_ESTIMATES
+            all(filter_spec.prompt in FILTER_SELECTIVITY_ESTIMATES
+                for filter_spec in self.filters)
+            and all(join.prompt in JOIN_SELECTIVITY_ESTIMATES
                     for join in self.joins)
         )
 
@@ -166,17 +243,31 @@ def _query(query_id, description, base, joins=(), select=None) -> QuerySpec:
     partner in that placeholder order.
     """
     table, alias, column, filters = base
-    aliases = [AliasSpec(alias, table, column, tuple(filters))]
-    join_specs = []
+    relations = [RelationSpec(alias, table, column)]
+    operators = [
+        FilterSpec(f"filter-{index}", alias, template)
+        for index, template in enumerate(filters, start=1)
+    ]
+    filter_count = len(operators)
     for partner_table, partner_alias, partner_column, template, *rest in joins:
-        aliases.append(AliasSpec(
-            partner_alias, partner_table, partner_column,
-            tuple(rest[0]) if rest else ()))
-        join_specs.append(JoinSpec(template, (alias, partner_alias)))
+        relations.append(
+            RelationSpec(partner_alias, partner_table, partner_column)
+        )
+        for partner_filter in rest[0] if rest else ():
+            filter_count += 1
+            operators.append(FilterSpec(
+                f"filter-{filter_count}", partner_alias, partner_filter
+            ))
+        operators.append(JoinSpec(
+            f"join-{len(relations) - 1}",
+            (alias, partner_alias),
+            template,
+        ))
     if select is None:
-        select = tuple(f"{spec.alias}.id" for spec in aliases)
-    return QuerySpec(query_id, description, tuple(aliases),
-                     tuple(join_specs), tuple(select))
+        select = tuple(f"{relation.alias}.id" for relation in relations)
+    return QuerySpec(
+        query_id, description, tuple(relations), tuple(operators), tuple(select)
+    )
 
 
 QUERIES = (
@@ -216,25 +307,26 @@ QUERIES = (
         "IMDB-9",
         "3J chain r1-a1-r2-a2: two reviews discuss the same aspect, "
         "second review positive about another",
-        (AliasSpec("r1", "reviews", "body"),
-         AliasSpec("a1", "aspects", "aspect"),
-         AliasSpec("r2", "reviews", "body"),
-         AliasSpec("a2", "aspects", "aspect")),
-        (JoinSpec(DISCUSS_ASPECT, ("r1", "a1")),
-         JoinSpec(DISCUSS_ASPECT, ("r2", "a1")),
-         JoinSpec(ASPECT_SENTIMENT, ("r2", "a2"))),
+        (RelationSpec("r1", "reviews", "body"),
+         RelationSpec("a1", "aspects", "aspect"),
+         RelationSpec("r2", "reviews", "body"),
+         RelationSpec("a2", "aspects", "aspect")),
+        (JoinSpec("join-1", ("r1", "a1"), DISCUSS_ASPECT),
+         JoinSpec("join-2", ("r2", "a1"), DISCUSS_ASPECT),
+         JoinSpec("join-3", ("r2", "a2"), ASPECT_SENTIMENT)),
         ("r1.id", "a1.id", "r2.id", "a2.id"),
     ),
     QuerySpec(
         "IMDB-10",
         "F1 -> 3J chain r1-a1-r2-a2",
-        (AliasSpec("r1", "reviews", "body", (F1,)),
-         AliasSpec("a1", "aspects", "aspect"),
-         AliasSpec("r2", "reviews", "body"),
-         AliasSpec("a2", "aspects", "aspect")),
-        (JoinSpec(DISCUSS_ASPECT, ("r1", "a1")),
-         JoinSpec(DISCUSS_ASPECT, ("r2", "a1")),
-         JoinSpec(ASPECT_SENTIMENT, ("r2", "a2"))),
+        (RelationSpec("r1", "reviews", "body"),
+         RelationSpec("a1", "aspects", "aspect"),
+         RelationSpec("r2", "reviews", "body"),
+         RelationSpec("a2", "aspects", "aspect")),
+        (FilterSpec("filter-1", "r1", F1),
+         JoinSpec("join-1", ("r1", "a1"), DISCUSS_ASPECT),
+         JoinSpec("join-2", ("r2", "a1"), DISCUSS_ASPECT),
+         JoinSpec("join-3", ("r2", "a2"), ASPECT_SENTIMENT)),
         ("r1.id", "a1.id", "r2.id", "a2.id"),
     ),
 
@@ -284,26 +376,30 @@ QUERIES = (
         "FEV-8",
         "3J chain c1-e1-c2-e2: evidence supports c1 but refutes c2, "
         "c2 supported by different evidence",
-        (AliasSpec("c1", "claims", "claim"),
-         AliasSpec("e1", "evidence", "text"),
-         AliasSpec("c2", "claims", "claim"),
-         AliasSpec("e2", "evidence", "text")),
-        (JoinSpec(SUPPORT, ("c1", "e1")),
-         JoinSpec(REFUTE, ("c2", "e1")),
-         JoinSpec(SUPPORT, ("c2", "e2"))),
+        (RelationSpec("c1", "claims", "claim"),
+         RelationSpec("e1", "evidence", "text"),
+         RelationSpec("c2", "claims", "claim"),
+         RelationSpec("e2", "evidence", "text")),
+        (JoinSpec("join-1", ("c1", "e1"), SUPPORT),
+         JoinSpec("join-2", ("c2", "e1"), REFUTE),
+         JoinSpec("join-3", ("c2", "e2"), SUPPORT)),
         ("c1.id", "e1.id", "c2.id", "e2.id"),
     ),
     QuerySpec(
         "FEV-9",
         "4F + 3J: F11 on c1 and c2, F13 on e1 and e2, then the "
         "c1-e1-c2-e2 join chain",
-        (AliasSpec("c1", "claims", "claim", (F11,)),
-         AliasSpec("e1", "evidence", "text", (F13,)),
-         AliasSpec("c2", "claims", "claim", (F11,)),
-         AliasSpec("e2", "evidence", "text", (F13,))),
-        (JoinSpec(SUPPORT, ("c1", "e1")),
-         JoinSpec(REFUTE, ("c2", "e1")),
-         JoinSpec(SUPPORT, ("c2", "e2"))),
+        (RelationSpec("c1", "claims", "claim"),
+         RelationSpec("e1", "evidence", "text"),
+         RelationSpec("c2", "claims", "claim"),
+         RelationSpec("e2", "evidence", "text")),
+        (FilterSpec("filter-1", "c1", F11),
+         FilterSpec("filter-2", "e1", F13),
+         JoinSpec("join-1", ("c1", "e1"), SUPPORT),
+         FilterSpec("filter-3", "c2", F11),
+         JoinSpec("join-2", ("c2", "e1"), REFUTE),
+         FilterSpec("filter-4", "e2", F13),
+         JoinSpec("join-3", ("c2", "e2"), SUPPORT)),
         ("c1.id", "e1.id", "c2.id", "e2.id"),
     ),
     # FEV-10: FEV-5 over pairs. A claim names its Wikipedia page and an
@@ -313,9 +409,16 @@ QUERIES = (
         "FEV-10",
         "2F + 1J over pairs: F11 on claims, F13 on evidence, SUPPORT "
         "asked only of a claim and its own Wikipedia page",
-        (AliasSpec("c", "claims", "claim", (F11,)),
-         AliasSpec("e", "evidence", "text", (F13,))),
-        (JoinSpec(SUPPORT, ("c", "e"), on=(("evidence_wiki_url", "id"),)),),
+        (RelationSpec("c", "claims", "claim"),
+         RelationSpec("e", "evidence", "text")),
+        (FilterSpec("filter-1", "c", F11),
+         FilterSpec("filter-2", "e", F13),
+         JoinSpec(
+             "join-1",
+             ("c", "e"),
+             SUPPORT,
+             on=(("evidence_wiki_url", "id"),),
+         )),
         ("c.id", "e.id"),
     ),
 

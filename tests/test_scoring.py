@@ -14,7 +14,13 @@ from quail_b.labels import (
     _validate_label_set_corpora,
     load_ground_truth,
 )
-from quail_b.queries import AliasSpec, JoinSpec, QuerySpec, queries
+from quail_b.queries import (
+    FilterSpec,
+    JoinSpec,
+    QuerySpec,
+    RelationSpec,
+    queries,
+)
 from quail_b.scoring import (
     RunOutput,
     evaluate,
@@ -26,9 +32,10 @@ FILTER = "Judge the review.\n\n{0}\nAnswer TRUE or FALSE."
 JOIN = "Judge the pair.\n\n{0}\nAspect: {1}\nAnswer TRUE or FALSE."
 SPEC = QuerySpec(
     "TEST-1", "one filter then one join",
-    (AliasSpec("r", "reviews", "body", (FILTER,)),
-     AliasSpec("a", "aspects", "aspect")),
-    (JoinSpec(JOIN, ("r", "a")),),
+    (RelationSpec("r", "reviews", "body"),
+     RelationSpec("a", "aspects", "aspect")),
+    (FilterSpec("filter-1", "r", FILTER),
+     JoinSpec("join-1", ("r", "a"), JOIN)),
     ("r.id", "a.id"),
 )
 CORPUS = {
@@ -88,9 +95,9 @@ def _truth():
 
 def _output(join_answers, rows):
     return RunOutput(
-        filter_answers={("r", 0): pa.table({
+        filter_answers={"filter-1": pa.table({
             "r": ["r0", "r1"], "answer": [True, False]})},
-        join_answers={0: pa.table({
+        join_answers={"join-1": pa.table({
             "r": ["r0", "r0"], "a": ["a0", "a1"],
             "answer": [bool(answer) for answer in join_answers]})},
         rows=pa.table({"r": [row[0] for row in rows],
@@ -178,9 +185,10 @@ def test_fev9_expected_rows_follow_the_join_chain_and_every_filter():
     from quail_b.prompts import F11, F13
 
     spec = queries()["FEV-9"]
-    assert [alias.filters for alias in spec.aliases] == [
-        (F11,), (F13,), (F11,), (F13,)]
-    assert [join.aliases for join in spec.joins] == [
+    assert [(filter_spec.relation, filter_spec.prompt)
+            for filter_spec in spec.filters] == [
+        ("c1", F11), ("e1", F13), ("c2", F11), ("e2", F13)]
+    assert [join.relations for join in spec.joins] == [
         ("c1", "e1"), ("c2", "e1"), ("c2", "e2")]
 
     rows = expected_rows(spec, truth, corpus)
@@ -196,7 +204,7 @@ def test_fev10_rows_keep_only_pairs_on_the_claims_own_page():
     spec = queries()["FEV-10"]
     cross = queries()["FEV-5"]
     assert spec.joins[0].on == (("evidence_wiki_url", "id"),)
-    assert spec.aliases == cross.aliases and not cross.joins[0].on
+    assert spec.relations == cross.relations and not cross.joins[0].on
 
     # FEV-5 keeps every supported pair of surviving documents; FEV-10
     # drops (c1, e1) because c1's page is e0
@@ -207,12 +215,12 @@ def test_fev10_rows_keep_only_pairs_on_the_claims_own_page():
 
     # an engine's answers over every pair are held to the same equality
     filter_answers = {
-        ("c", 0): pa.table({"c": ["c0", "c1", "c2"],
-                            "answer": [True, True, False]}),
-        ("e", 0): pa.table({"e": ["e0", "e1", "e2"],
-                            "answer": [True, True, False]}),
+        "filter-1": pa.table({"c": ["c0", "c1", "c2"],
+                              "answer": [True, True, False]}),
+        "filter-2": pa.table({"e": ["e0", "e1", "e2"],
+                              "answer": [True, True, False]}),
     }
-    join_answers = {0: pa.table({
+    join_answers = {"join-1": pa.table({
         "c": ["c0", "c1", "c1"], "e": ["e0", "e1", "e0"],
         "answer": [True, True, False]})}
     assert rows_from_answers(spec, filter_answers, join_answers,
@@ -237,7 +245,7 @@ def test_load_benchmark_with_local_reference_labels(tmp_path):
 
     corpus_id = PUBLISHED_CORPORA[0.1]
     spec = benchmark.get_query("IMDB-1")
-    template = spec.aliases[0].filters[0]
+    template = spec.filters[0].prompt
     predicate_key = "test.review.filter"
     collection_dir = (tmp_path / GROUND_TRUTH_ROOT / "collections"
                       / collection_id)
@@ -303,7 +311,8 @@ def test_load_benchmark_with_local_reference_labels(tmp_path):
         calls.append(query.id)
         assert set(tables) == {"reviews"}
         return RunOutput(
-            {("r", 0): pa.table({"r": ["r0", "r1"], "answer": [True, False]})},
+            {"filter-1": pa.table({
+                "r": ["r0", "r1"], "answer": [True, False]})},
             {}, pa.table({"r": ["r0"]}), runtime_s=2.0,
             measurements={"fresh_tokens": 100})
 
@@ -478,28 +487,32 @@ def _chain_spec():
     # alias selected
     return QuerySpec(
         "CHAIN", "three joins", (
-            AliasSpec("c1", "claims", "claim", (FILTER,)),
-            AliasSpec("e1", "evidence", "text"),
-            AliasSpec("c2", "claims", "claim", (FILTER,)),
-            AliasSpec("e2", "evidence", "text")),
-        (JoinSpec(JOIN, ("c1", "e1")), JoinSpec(JOIN, ("e1", "c2")),
-         JoinSpec(JOIN, ("c2", "e2"))),
+            RelationSpec("c1", "claims", "claim"),
+            RelationSpec("e1", "evidence", "text"),
+            RelationSpec("c2", "claims", "claim"),
+            RelationSpec("e2", "evidence", "text")),
+        (FilterSpec("filter-1", "c1", FILTER),
+         JoinSpec("join-1", ("c1", "e1"), JOIN),
+         FilterSpec("filter-2", "c2", FILTER),
+         JoinSpec("join-2", ("e1", "c2"), JOIN),
+         JoinSpec("join-3", ("c2", "e2"), JOIN)),
         ("c1.id", "e1.id", "c2.id", "e2.id"))
 
 
 def _random_output(spec, rng, claims=12, evidence=8):
     filters = {}
-    for alias in ("c1", "c2"):
-        filters[(alias, 0)] = pa.table({
+    for filter_spec in spec.filters:
+        alias = filter_spec.relation
+        filters[filter_spec.id] = pa.table({
             alias: [f"c{i}" for i in range(claims)],
             "answer": [rng.random() < 0.7 for _ in range(claims)]})
     joins = {}
-    for position, join in enumerate(spec.joins):
-        left, right = join.aliases
+    for join in spec.joins:
+        left, right = join.relations
         sizes = {"c": claims, "e": evidence}
         pairs = [(f"{left[0]}{i}", f"{right[0]}{j}")
                  for i in range(sizes[left[0]]) for j in range(sizes[right[0]])]
-        joins[position] = pa.table({
+        joins[join.id] = pa.table({
             left: [a for a, _ in pairs], right: [b for _, b in pairs],
             "answer": [rng.random() < 0.4 for _ in pairs]})
     return RunOutput(filters, joins, None)

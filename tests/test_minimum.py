@@ -10,7 +10,7 @@ from quail_b.minimum import (
     token_metrics,
     validate_prompt_pieces,
 )
-from quail_b.queries import AliasSpec, JoinSpec, QuerySpec
+from quail_b.queries import FilterSpec, JoinSpec, QuerySpec, RelationSpec
 from quail_b.scoring import RunOutput
 
 
@@ -46,9 +46,10 @@ def test_prefix_trie_size_counts_shared_prefixes_once():
 def test_minimum_input_tokens_counts_each_distinct_prefix_once():
     spec = QuerySpec(
         "TEST-1", "one filter then one join",
-        (AliasSpec("d", "docs", "body", ("useful {0}",)),
-         AliasSpec("a", "aspects", "name")),
-        (JoinSpec("{0} mentions {1}", ("d", "a")),),
+        (RelationSpec("d", "docs", "body"),
+         RelationSpec("a", "aspects", "name")),
+        (FilterSpec("filter-1", "d", "useful {0}"),
+         JoinSpec("join-1", ("d", "a"), "{0} mentions {1}")),
         ("d.id", "a.id"))
     corpus = {
         "docs": pa.table({"id": ["a", "b", "c"],
@@ -57,13 +58,13 @@ def test_minimum_input_tokens_counts_each_distinct_prefix_once():
     }
     pieces = validate_prompt_pieces(spec, {
         "tokenizer": "test", "preamble": PRE,
-        "filters": [{"alias": "d", "position": 0, "tail": QUESTION}],
-        "joins": [{"position": 0, "anchor": "d", "frame": FRAME,
+        "filters": [{"id": "filter-1", "tail": QUESTION}],
+        "joins": [{"id": "join-1", "anchor": "d", "frame": FRAME,
                    "label": LABEL, "tail": TAIL}],
     })
-    filter_answers = {("d", 0): pa.table({
+    filter_answers = {"filter-1": pa.table({
         "d": ["a", "b", "c"], "answer": [True, True, False]})}
-    join_answers = {0: pa.table({
+    join_answers = {"join-1": pa.table({
         "d": ["a", "a", "b", "b"], "a": ["x", "y", "x", "y"],
         "answer": [True, False, True, True]})}
     minimum = minimum_input_tokens(
@@ -84,26 +85,28 @@ def test_minimum_input_tokens_counts_each_distinct_prefix_once():
 def test_minimum_input_tokens_counts_a_document_once_across_uses():
     spec = QuerySpec(
         "TEST-2", "a self join with two filter stages on one side",
-        (AliasSpec("d1", "docs", "body"),
-         AliasSpec("d2", "docs", "body", ("short {0}", "clear {0}"))),
-        (JoinSpec("{0} before {1}", ("d1", "d2")),),
+        (RelationSpec("d1", "docs", "body"),
+         RelationSpec("d2", "docs", "body")),
+        (FilterSpec("filter-1", "d2", "short {0}"),
+         FilterSpec("filter-2", "d2", "clear {0}"),
+         JoinSpec("join-1", ("d1", "d2"), "{0} before {1}")),
         ("d1.id", "d2.id"))
     corpus = {"docs": pa.table({"id": ["a", "b"], "body": ["alpha", "beta"]})}
     first, second = _ids("\n\nshort?\nANSWER:"), _ids("\n\nclear?\nANSWER:")
     pieces = validate_prompt_pieces(spec, {
         "tokenizer": "test", "preamble": PRE,
-        "filters": [{"alias": "d2", "position": 0, "tail": first},
-                    {"alias": "d2", "position": 1, "tail": second}],
-        "joins": [{"position": 0, "anchor": "d1", "frame": FRAME,
+        "filters": [{"id": "filter-1", "tail": first},
+                    {"id": "filter-2", "tail": second}],
+        "joins": [{"id": "join-1", "anchor": "d1", "frame": FRAME,
                    "label": LABEL, "tail": TAIL}],
     })
     # both rows pass the first stage, only "alpha" reaches the second;
     # the join anchors on d1, the same two documents
     filter_answers = {
-        ("d2", 0): pa.table({"d2": ["a", "b"], "answer": [True, True]}),
-        ("d2", 1): pa.table({"d2": ["a"], "answer": [True]}),
+        "filter-1": pa.table({"d2": ["a", "b"], "answer": [True, True]}),
+        "filter-2": pa.table({"d2": ["a"], "answer": [True]}),
     }
-    join_answers = {0: pa.table({
+    join_answers = {"join-1": pa.table({
         "d1": ["a", "a", "b", "b"], "d2": ["a", "b", "a", "b"],
         "answer": [True, True, False, True]})}
     minimum = minimum_input_tokens(
@@ -121,13 +124,14 @@ def test_minimum_input_tokens_counts_a_document_once_across_uses():
 def _filter_spec():
     return QuerySpec(
         "TEST-0", "one filter",
-        (AliasSpec("d", "docs", "body", ("useful {0}",)),),
-        (), ("d.id",))
+        (RelationSpec("d", "docs", "body"),),
+        (FilterSpec("filter-1", "d", "useful {0}"),),
+        ("d.id",))
 
 
 def _filter_output(**kwargs):
     return RunOutput(
-        {("d", 0): pa.table({"d": ["a"], "answer": [True]})},
+        {"filter-1": pa.table({"d": ["a"], "answer": [True]})},
         {}, pa.table({"d": ["a"]}), runtime_s=1.0, **kwargs)
 
 
@@ -146,7 +150,7 @@ def test_token_metrics_require_fresh_tokens_with_prompt_pieces():
     spec = _filter_spec()
     pieces = {
         "tokenizer": "test", "preamble": PRE,
-        "filters": [{"alias": "d", "position": 0, "tail": QUESTION}],
+        "filters": [{"id": "filter-1", "tail": QUESTION}],
     }
     output = _filter_output(prompt_pieces=pieces)
     with pytest.raises(ValueError, match="fresh_tokens"):
@@ -164,7 +168,7 @@ def test_token_metrics_need_answers_with_prompt_pieces():
     spec = _filter_spec()
     pieces = {
         "tokenizer": "test", "preamble": PRE,
-        "filters": [{"alias": "d", "position": 0, "tail": QUESTION}],
+        "filters": [{"id": "filter-1", "tail": QUESTION}],
     }
     output = RunOutput(
         None, None, pa.table({"d": ["a"]}), runtime_s=1.0,
