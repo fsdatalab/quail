@@ -2,10 +2,15 @@
 title: Execution
 ---
 
-After the [planner](/docs/architecture/planning) produces a physical
-plan, the execution engine runs it. The engine overlaps CPU and GPU
-work: while the GPU processes the current forward pass, the CPU
-prepares the next one.
+All queries run inside a
+[session](/docs/user-guide/sessions). The session loads the model,
+allocates the KV arena, and keeps tokenized documents in memory.
+When `run()` or `collect()` is called, the
+[planner](/docs/architecture/planning) produces a physical plan and
+the execution engine runs it.
+
+The engine overlaps CPU and GPU work: while the GPU processes the
+current forward pass, the CPU prepares the next one.
 
 ## The runner
 
@@ -18,7 +23,9 @@ Relational nodes (`Recombine`, `Project`, `Limit`) run on the CPU
 using Arrow. Model nodes (`AiFilter`, `AiJoin`) run on the GPU
 using the execution loop described below.
 
-## Filter execution
+## Operator execution
+
+### Filter execution
 
 The filter loop fills each GPU forward pass using two budgets: a
 token budget and a KV page budget.
@@ -39,7 +46,7 @@ token budget and a KV page budget.
   own question tokens. A document that fails (returns FALSE) or
   won't be used again in the query has all its KV freed.
 
-## Join execution
+### Join execution
 
 Recall from [Planning](/docs/architecture/planning#deciding-join-order-and-anchors)
 that the planner picks one side of a join as the *anchor* (the table
@@ -64,6 +71,11 @@ sharing one anchor's KV.
   document later.
 
 ## Model forward pass
+
+A single filter or join operator may require hundreds or thousands
+of model forward passes. The operator loops above pack documents
+(for filters) or anchor-partner pairs (for joins) into batches and
+submit each batch as one forward pass on the GPU.
 
 Quail loads the model using
 [vLLM's weight loader](https://github.com/fsdatalab/quail/blob/main/quail/executor/model.py),
@@ -94,11 +106,14 @@ RoPE, SiLU + FP8 quantize, and the attention merge + FP8 quantize
 for joins. These fused kernels reduce the number of GPU kernel
 launches per layer.
 
-After the final layer, Quail does not score every token in the
-vocabulary. At model load time, Quail keeps only the weight rows
-for the TRUE and FALSE token IDs and discards the rest of the output
-head. The answer for each predicate is whichever of TRUE or FALSE
-has the higher score.
+A standard language model ends each forward pass by multiplying the
+final hidden state against the full vocabulary matrix to produce a
+score for every possible next token. Quail only needs to know
+whether the answer is TRUE or FALSE, so at model load time it
+extracts the vocabulary matrix rows for the TRUE and FALSE token IDs
+and discards the rest. Each forward pass then multiplies against
+only those rows, producing two scores. The predicate passes if the
+TRUE score is higher.
 
 Quail uses [FlashAttention 3](https://arxiv.org/abs/2407.08608) on
 H100 and FlashAttention 2 on Blackwell GPUs.
@@ -136,17 +151,13 @@ All GPU execution code is in
 The fused kernels assume the Qwen3 architecture: QK-norm before
 RoPE, gated SiLU MLP, FP8 block-quantized weights.
 
-## Session lifetime
+## Lifetime and limits
 
-The model stays loaded in GPU memory across queries within one
-session. Tokenized documents are also reused. Collect results before
-closing the session, because row projection reads from the session's
-temporary files.
-
-`Session.close()` waits for background tokenization and releases
-temporary files.
-
-## Limits
+Within one session, the model stays loaded in GPU memory and
+tokenized documents are reused across queries. Collect results
+before closing the session, because row projection reads from the
+session's temporary files. `Session.close()` waits for background
+tokenization and releases temporary files.
 
 - Temporary token files must fit on local disk.
 - At most 8 GPUs in one host.
