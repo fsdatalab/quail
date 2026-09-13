@@ -82,19 +82,26 @@ model layer. For each layer:
    arena. Filters use a single causal paged attention call. Joins
    use two calls (one for self-attention among new tokens, one for
    cross-attention into the anchor's KV) merged with a fused
-   log-sum-exp kernel.
+   log-sum-exp kernel. We will describe the two attention paths in
+   detail in an upcoming technical report.
 5. **Output projection** via DeepGEMM.
-6. **MLP** (gate-up projection, SiLU activation, down projection),
-   each step fused with quantization where possible.
+6. **MLP** (gate-up projection, SiLU activation, down projection).
+
+Quail uses vLLM's model implementation and DeepGEMM for the main
+matrix multiplications, but writes its own Triton JIT kernels to
+fuse several small operations: RMSNorm + FP8 quantize, QK-norm +
+RoPE, SiLU + FP8 quantize, and the attention merge + FP8 quantize
+for joins. These fused kernels reduce the number of GPU kernel
+launches per layer.
 
 After the final layer, Quail does not score every token in the
-vocabulary. Instead, it keeps only the weight rows for TRUE and
-FALSE token IDs, discarding the rest of the output head at load
-time. The answer for each predicate is whichever of TRUE or FALSE
+vocabulary. At model load time, Quail keeps only the weight rows
+for the TRUE and FALSE token IDs and discards the rest of the output
+head. The answer for each predicate is whichever of TRUE or FALSE
 has the higher score.
 
 Quail uses [FlashAttention 3](https://arxiv.org/abs/2407.08608) on
-H100 (SM90) and FlashAttention 2 on Blackwell (SM120).
+H100 and FlashAttention 2 on Blackwell GPUs.
 
 ## Multiple GPUs
 
