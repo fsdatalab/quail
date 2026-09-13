@@ -1,0 +1,122 @@
+---
+title: Supported models and GPUs
+---
+
+## Models
+
+| Model | `model=` value | Parameters | Precision |
+| --- | --- | --- | --- |
+| Qwen3 4B | `"qwen3-4b-fp8"` | 4B | FP8 weights, BF16 KV |
+| Qwen3 32B | `"qwen3-32b-fp8"` | 32B | FP8 weights, BF16 KV |
+
+Both models use the same Quail execution engine, including
+DeepGEMM for matrix multiplications and FlashAttention 3 for
+attention.
+
+## GPUs
+
+| Device | `device=` value | Notes |
+| --- | --- | --- |
+| NVIDIA H100 SXM | `"h100-sxm"` | Tested. FlashAttention 3. |
+| NVIDIA RTX PRO 6000 Blackwell Server Edition | `"rtx-pro-6000-blackwell-server"` | Planning constants included. FlashAttention 2. Needs validation on RTX hardware. |
+
+The `device` setting must match the hardware where the model runs.
+Quail uses the device's memory, bandwidth, and FLOP specs to plan
+the query.
+
+## GPU count
+
+Quail supports 1, 2, 4, or 8 GPUs on one host. Each GPU holds one
+complete model copy. Quail does not split one model across GPUs.
+
+```python
+quail.Session(config=quail.EngineConfig(
+    model="qwen3-4b-fp8",
+    device="h100-sxm",
+    gpus=4,
+))
+```
+
+For filters, Quail divides documents across GPUs by token length.
+For joins, it divides anchors across GPUs and makes the other inputs
+available to each GPU. The CPU combines results after each operator.
+
+## No local GPU? Use Modal
+
+If you don't have a CUDA GPU, you can run Quail inside a
+[Modal](https://modal.com) GPU function. Quail does not depend on
+Modal — you write the Modal function, and Quail runs inside it like
+any other Python library.
+
+```python
+import modal
+from demos import quickstart
+
+app = modal.App("quail-engine")
+image = (
+    modal.Image.from_registry(
+        "nvidia/cuda:13.0.1-devel-ubuntu24.04", add_python="3.12")
+    .entrypoint([])
+    .pip_install("vllm==0.26.0", "pyarrow", "sqlglot>=27.0",
+                 "bpe-qwen>=0.1.5", "datasets>=5.0.1")
+    .add_local_python_source("quail", "quail_b", "demos")
+)
+
+@app.function(image=image, gpu="H100!", memory=98304, timeout=1200)
+def run_query():
+    return quickstart.run_query()
+```
+
+The session, data registration, and execution all happen inside the
+GPU function. For large datasets, pass a path and open it there
+instead of sending an Arrow table.
+
+### Cache volumes
+
+Mount volumes to persist model weights and compiled kernels across
+runs:
+
+```python
+weights = modal.Volume.from_name("quail-hf-cache", create_if_missing=True)
+kernels = modal.Volume.from_name("quail-kernel-cache", create_if_missing=True)
+
+image = image.env({
+    "HF_HOME": "/model-cache",
+    "QUAIL_CACHE_DIR": "/kernel-cache/quail",
+})
+
+@app.function(
+    image=image, gpu="H100!", memory=98304, timeout=1200,
+    volumes={"/model-cache": weights, "/kernel-cache": kernels},
+)
+def run_query():
+    return quickstart.run_query()
+```
+
+Quail's own cache is controlled by `QUAIL_CACHE_DIR` (default
+`~/.cache/quail/kernels`). Other libraries use their own environment
+variables: `HF_HOME`, `DG_CACHE_DIR`, `TRITON_CACHE_DIR`,
+`VLLM_CACHE_ROOT`.
+
+### Submit and retrieve
+
+```python
+@app.local_entrypoint()
+def main():
+    call = run_query.spawn()
+    print(f"function call id: {call.object_id}", flush=True)
+    rows, report = call.get()
+```
+
+Keep the function call id. After a disconnect, retrieve the result
+with `modal.FunctionCall.from_id("fc-...").get()`. For long runs,
+use `modal run --detach`.
+
+Collect rows before closing the session. To persist them, write to a
+mounted volume path and call `volume.commit()`. Quail does not write
+reports or commit volumes on its own.
+
+## Adding a model or device
+
+See [Extending Quail](/docs/extending/models) for how to register a
+new model or device.

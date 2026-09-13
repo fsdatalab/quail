@@ -1,0 +1,37 @@
+---
+title: Benchmarks
+description: Run QUAIL-B queries and generate comparison reports.
+---
+
+[QUAIL-B](https://github.com/fsdatalab/quail-bench) is a benchmark of
+33 AI-SQL filter and join queries over five datasets. Each query has
+three scale factors (0.1, 0.5, 1.0) that control the number of input
+rows.
+
+## Run a query
+
+```bash
+uv run modal run --detach -m quail.bench.quailb_parallel \
+  --sf 0.1 --model qwen3-4b-fp8 --query IMDB-4 \
+  --output-dir /results/benchmarks/quailb \
+  2>&1 | tee results/benchmark/quailb.log
+```
+
+Omit `--query` to run all queries. Add `--no-include-baselines` to run
+Quail alone (the default also runs vLLM baselines).
+
+Results are saved to the `quail-results` Modal volume under
+`/results/benchmarks/quailb/<run-id>/`.
+
+## Generate a report
+
+Download the results and run the report command:
+
+```bash
+uv run modal volume get quail-results \
+  "benchmarks/quailb/<run-id>/" "./results/<run-id>/"
+uv run quail-b report "./results/<run-id>/quail"
+```
+
+This writes `report.md` next to `run.json`. Reports use saved labels
+and do not rerun inference.

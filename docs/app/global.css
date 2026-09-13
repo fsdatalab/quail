@@ -1,48 +1,44 @@
 @import 'tailwindcss';
-@import 'fumadocs-ui/css/neutral.css';
+@import 'fumadocs-ui/css/lib/default-colors.css';
 @import 'fumadocs-ui/css/preset.css';
 
 @theme {
-  --color-cmu-carnegie-red: #c41230;
-  --color-cmu-iron: #6d6e71;
-  --color-cmu-steel: #e0e0e0;
-  --color-fd-background: #ffffff;
-  --color-fd-foreground: #111111;
-  --color-fd-muted: #f5f5f5;
-  --color-fd-muted-foreground: #5f6063;
-  --color-fd-popover: #ffffff;
-  --color-fd-popover-foreground: #111111;
-  --color-fd-card: #fafafa;
-  --color-fd-card-foreground: #111111;
-  --color-fd-border: #8a8a8f;
-  --color-fd-primary: #c41230;
-  --color-fd-primary-foreground: #ffffff;
-  --color-fd-secondary: #f1f1f1;
-  --color-fd-secondary-foreground: #111111;
-  --color-fd-accent: #f8e7ea;
-  --color-fd-accent-foreground: #7f0c20;
-  --color-fd-ring: #c41230;
-  --color-fd-overlay: rgb(0 0 0 / 45%);
+  /* CMU light — Carnegie Red accent on a warm white ground */
+  --color-fd-background: hsl(0, 0%, 100%);
+  --color-fd-foreground: hsl(0, 3%, 16%);
+  --color-fd-muted: hsl(0, 0%, 96%);
+  --color-fd-muted-foreground: hsl(0, 0%, 40%);
+  --color-fd-popover: hsl(0, 0%, 100%);
+  --color-fd-popover-foreground: hsl(0, 3%, 16%);
+  --color-fd-card: hsl(0, 0%, 99%);
+  --color-fd-card-foreground: hsl(0, 3%, 16%);
+  --color-fd-border: hsl(0, 0%, 88%);
+  --color-fd-primary: hsl(350, 82%, 42%);
+  --color-fd-primary-foreground: hsl(0, 0%, 100%);
+  --color-fd-secondary: hsl(0, 0%, 95%);
+  --color-fd-secondary-foreground: hsl(0, 3%, 16%);
+  --color-fd-accent: hsl(0, 0%, 93%);
+  --color-fd-accent-foreground: hsl(0, 3%, 16%);
+  --color-fd-ring: hsl(350, 82%, 42%);
 }
 
 .dark {
-  --color-fd-background: #0b0b0c;
-  --color-fd-foreground: #f7f7f7;
-  --color-fd-muted: #18181a;
-  --color-fd-muted-foreground: #b6b6b8;
-  --color-fd-popover: #151516;
-  --color-fd-popover-foreground: #f7f7f7;
-  --color-fd-card: #121213;
-  --color-fd-card-foreground: #f7f7f7;
-  --color-fd-border: #68686f;
-  --color-fd-primary: #ff8294;
-  --color-fd-primary-foreground: #160207;
-  --color-fd-secondary: #202022;
-  --color-fd-secondary-foreground: #f7f7f7;
-  --color-fd-accent: #3a1119;
-  --color-fd-accent-foreground: #ffdce1;
-  --color-fd-ring: #ff8294;
-  --color-fd-overlay: rgb(0 0 0 / 65%);
+  --color-fd-background: hsl(0, 3%, 10%);
+  --color-fd-foreground: hsl(0, 0%, 93%);
+  --color-fd-muted: hsl(0, 2%, 15%);
+  --color-fd-muted-foreground: hsl(0, 0%, 60%);
+  --color-fd-popover: hsl(0, 2%, 13%);
+  --color-fd-popover-foreground: hsl(0, 0%, 93%);
+  --color-fd-card: hsla(0, 2%, 18%, 0.5);
+  --color-fd-card-foreground: hsl(0, 0%, 93%);
+  --color-fd-border: hsla(0, 0%, 50%, 0.2);
+  --color-fd-primary: hsl(350, 80%, 62%);
+  --color-fd-primary-foreground: hsl(0, 0%, 100%);
+  --color-fd-secondary: hsl(0, 2%, 20%);
+  --color-fd-secondary-foreground: hsl(0, 0%, 90%);
+  --color-fd-accent: hsl(0, 2%, 20%);
+  --color-fd-accent-foreground: hsl(0, 0%, 90%);
+  --color-fd-ring: hsl(350, 80%, 62%);
 }
 
 html {
@@ -51,18 +47,16 @@ html {
 
 body {
   font-family: var(--font-quail-sans), sans-serif;
-  border-top: 4px solid #c41230;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: var(--font-quail-serif), Georgia, serif;
 }
 
 code,
 pre,
 .font-mono {
   font-family: var(--font-quail-mono), monospace;
-}
-
-::selection {
-  color: #ffffff;
-  background: #c41230;
 }
 
 html > body[data-scroll-locked] {

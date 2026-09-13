@@ -2,10 +2,11 @@
   "title": "Contributing",
   "pages": [
     "index",
+    "benchmark",
     "experiments",
     "reports",
     "release",
     "style"
   ],
-  "defaultOpen": true
+  "defaultOpen": false
 }

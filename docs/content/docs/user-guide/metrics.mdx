@@ -1,0 +1,71 @@
+---
+title: Metrics
+---
+
+After running a query, `result.report` is a plain dict with timing,
+token counts, and per-stage metrics.
+
+```python
+result = query.run()
+report = result.report
+```
+
+## Top-level fields
+
+| Key | What it tells you |
+| --- | --- |
+| `wall_s` | Query time in seconds. Excludes model startup. |
+| `boot_s` | Model startup time. |
+| `boot_kind` | `"cold"` (first query, model loaded from disk) or `"warm"` (model already in memory). |
+| `fresh_tokens` | Total input tokens the model computed across all forward passes. A token recomputed because its KV was evicted counts again. |
+| `worker_total_s` | Total time including tokenization and planning, but excluding report writes. |
+| `remarks` | Notes from the planner and tokenizer (for example, which tokenizer was selected). |
+
+## Per-stage metrics
+
+`report["stages"]` is a list with one entry per filter or join stage:
+
+| Field | What it tells you |
+| --- | --- |
+| `op` | `"filter"` or `"join"`. |
+| `alias` | The table alias this stage operates on. |
+| `provided_selectivity` | The selectivity you gave in the query, or `null` if you did not set one. |
+| `observed_selectivity` | The fraction of rows or pairs that passed. |
+| `evaluated` | How many rows or pairs the model evaluated. |
+
+## Per-node metrics
+
+`report["node_metrics"]` is a dict keyed by node id (for example,
+`"ai_filter:r"` or `"ai_join:r"`):
+
+| Field | What it tells you |
+| --- | --- |
+| `input_rows` | Rows or pairs that entered the node. |
+| `output_rows` | Rows or pairs that passed. |
+| `fresh_tokens` | Input tokens computed by this node. |
+| `evaluated_documents` | Documents evaluated (filters only). |
+
+## Boot details
+
+When `boot_kind` is `"cold"`, `report["boot"]` breaks down the
+startup:
+
+| Field | What it tells you |
+| --- | --- |
+| `load_model_s` | Time to load model weights onto the GPU. |
+| `arena_s` | Time to allocate the KV page pool. |
+| `warm_kernels_s` | Time to compile and warm GPU kernels. |
+| `warm_tier` | Which kernels were compiled (`"touch"` on first run, `"warm"` when cached). |
+
+## GPU cost
+
+To compute the GPU cost of a query:
+
+```python
+from quail.specs import H100_USD_PER_HOUR
+
+cost = (report["wall_s"] / 3600) * H100_USD_PER_HOUR
+```
+
+`H100_USD_PER_HOUR` is the Modal H100 hourly price ($3.9492).
+Multiply by `gpus` if you used more than one GPU.
