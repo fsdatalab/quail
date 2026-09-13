@@ -1,62 +1,31 @@
 ---
-title: Metrics and observers
-description: Reading per node metrics from a finished query, and observing execution.
+title: Observers
 ---
 
-## Metrics on the executed plan
+An observer runs after each physical node executes. Use observers
+for logging, progress reporting, or collecting custom metrics during
+query execution.
 
-A finished query carries its executed physical plan and each node's
-measured metrics, the way a DataFusion `ExecutionPlan` exposes
-`metrics()` after it runs:
+## Reading metrics without an observer
+
+Every finished query carries per-node metrics on the result:
 
 ```python
-result = session.sql("SELECT ...").run()
-
-result.plan                 # the executed PhysicalGraph
+result = query.run()
 result.node_metrics         # node id -> NodeMetrics
-print(result.explain())
+print(result.explain())     # prints the plan with measured metrics
 ```
 
-`query.explain()` describes the plan before execution.
-`result.explain()` formats the executed plan and measured metrics without
-running the query again. It returns one line per node in execution order
-with its fields and nonzero metrics:
-
-```
-<type_name> <node_id> [<explain fields>]  wall_s=<s> rows=<in>-><out> <nonzero metrics>
-```
-
-For a one-filter query that is a `quail.scan` line, a
-`quail.ai_filter` line with `evaluated_documents` and
-`fresh_tokens`, and a `quail.project` line with the row counts.
-
-`NodeMetrics` has `wall_s`, `input_rows`, `output_rows`,
+`NodeMetrics` fields: `wall_s`, `input_rows`, `output_rows`,
 `evaluated_documents`, `evaluated_document_pairs`, `fresh_tokens`,
 `cached_tokens`, `kv_hits`, `kv_misses`, `kv_removals`,
-`kv_recomputations`, `peak_gpu_bytes`, and an
-`extension` mapping for anything else. Model nodes carry the numbers
-the GPU executor measured. `Recombine`, `Project`, and `Limit` report
-row counts.
+`kv_recomputations`, `peak_gpu_bytes`, and an `extension` dict.
 
-`quail_ext_examples/cost_ledger.py` is a complete example built on
-these: it charges the query's GPU seconds, tokens, and dollars to the
-nodes that used them.
+For most use cases, reading `result.node_metrics` after the query
+is sufficient. Observers are for when something needs to happen
+during execution.
 
-```python
-from quail_ext_examples import cost_ledger
-
-ledger = cost_ledger.charge(result)
-ledger["totals"]["usd"]
-ledger["nodes"][1]["fresh_tokens"]
-```
-
-## Observers
-
-An observer sees every physical node once, right after it runs, with
-the node's outputs and metrics. Use one when something has to happen
-during execution, such as streaming progress to a log, rather than to
-read metrics afterwards. It cannot change values. Its report is
-attached to the query result.
+## The observer protocol
 
 ```python
 class ExecutionObserver(Protocol):
@@ -65,8 +34,15 @@ class ExecutionObserver(Protocol):
     def report(self) -> Mapping[str, Any]: ...
 ```
 
-You register the class (a factory); the runner creates a fresh
-observer per query:
+Source:
+[quail/runtime/runner.py](https://github.com/fsdatalab/quail/blob/main/quail/runtime/runner.py).
+
+`after_node` is called once per physical node, in execution order,
+with the node's outputs and metrics. The observer cannot modify
+values. `report()` is called after execution and attached to
+`result.report["observers"]`.
+
+## Example: logging progress
 
 ```python
 import logging
@@ -78,28 +54,29 @@ class Progress:
     def __init__(self):
         self.seen = []
 
-    def after_node(self, node, result) -> None:
+    def after_node(self, node, result):
         self.seen.append(node.node_id)
-        logging.info("%s done in %.2fs", node.node_id, result.metrics.wall_s)
+        logging.info("%s done in %.2fs", node.node_id,
+                     result.metrics.wall_s)
 
-    def report(self) -> dict:
-        return {"nodes": list(self.seen)}
-
-
-registry = quail.ExtensionRegistry.with_built_ins().register_observer(Progress)
-config = quail.EngineConfig(
-    gpus=1,
-    model="qwen3-4b-fp8",
-    backend="quail",
-    device="h100-sxm",
-)
-session = quail.Session(config, registry=registry)
-...
-result.observer(Progress)["nodes"]
+    def report(self):
+        return {"nodes_executed": list(self.seen)}
 ```
 
-`result.observer(Progress)` looks the report up by the class's `name`,
-which is the key it travels under inside `result.report["observers"]`.
+## Registration
 
-Observers see model nodes and the Arrow nodes in one pass because the
-worker runs the full graph once with the model outputs supplied.
+Register the class (the runner creates a fresh instance per query):
+
+```python
+registry = (
+    quail.ExtensionRegistry.with_built_ins()
+    .register_observer(Progress)
+)
+```
+
+Read the report after execution:
+
+```python
+result = query.run()
+result.report["observers"]["my.progress"]["nodes_executed"]
+```

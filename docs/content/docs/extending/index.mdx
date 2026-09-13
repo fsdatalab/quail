@@ -1,122 +1,77 @@
 ---
-title: The extension registry
-description: Register engine extensions and configure their worker dependencies.
+title: Overview
 ---
 
-Every session owns an `ExtensionRegistry`. It starts with Quail's own
-backends, models, devices, node codecs, and node runtimes. You add to it by
-registering objects, the way a DataFusion
-`SessionStateBuilder` takes rules and providers:
+Quail's behavior can be extended by registering objects on an
+`ExtensionRegistry`. The registry holds models, devices, inference
+engines, node types, optimizer rules, and observers. Built-in
+components register through the same interface.
+
+## Creating a registry
 
 ```python
 import quail
 
-from my_package.nodes import MyNode, MyNodeRuntime, PreferAllDocuments
-
-registry = (
-    quail.ExtensionRegistry.with_built_ins()
-    .register_node(MyNode, runtime=MyNodeRuntime())
-    .register_physical_rule(PreferAllDocuments())
-)
-config = quail.EngineConfig(
-    gpus=1,
-    model="qwen3-4b-fp8",
-    backend="quail",
-    device="h100-sxm",
-)
-session = quail.Session(config, registry=registry)
+registry = quail.ExtensionRegistry.with_built_ins()
 ```
 
-Names come from the objects. Rules, planners, observers, and backends have
-a `name`. Codecs use the node's `type_name`. Rules, planners, and observers
-accept `name=` to override the registration name. Runtimes accept `key=`.
+`with_built_ins()` populates the registry with Quail's included
+models, devices, backends, node codecs, and node runtimes. No model
+weights are loaded at registration time.
 
-A package that provides several things can also expose one entry
-point, `register_quail_extension(registry)`, and be loaded by module:
+## Registering extensions
+
+Each `register_*` method returns the registry, so calls can be
+chained:
 
 ```python
-from my_package import quail_extension
+registry = (
+    quail.ExtensionRegistry.with_built_ins()
+    .register_model(MY_MODEL)
+    .register_device(MY_DEVICE)
+    .register_observer(MyObserver)
+)
+```
 
-registry = quail.ExtensionRegistry.with_built_ins()
-registry.load_extension(quail_extension)
+Pass the registry when creating a session:
+
+```python
+session = quail.Session(config=config, registry=registry)
 ```
 
 ## What can be registered
 
-| Method | Registers | Page |
-| --- | --- | --- |
-| `register_logical_rule(rule)` | A logical optimizer rule. | [Logical nodes and rules](/docs/extending/logical-rules) |
-| `register_physical_planner(planner)` | A planner that offers extra physical candidates. | [Physical nodes](/docs/extending/physical-nodes) |
-| `register_physical_rule(rule)` | A physical graph rewrite. | same |
-| `register_node(node_type, runtime=...)` | A physical node's standard codec and runtime together. | same |
-| `register_codec(codec)` | A separate codec when needed. | same |
-| `register_runtime(runtime, key=...)` | A separate runtime when needed. | same |
-| `register_backend(backend)` | A model backend. | [Model backends](/docs/extending/model-backends) |
-| `register_model(spec)` | A `ModelSpec`. | [Adding a model](/docs/extending/models) |
-| `register_device(spec)` | A `DeviceSpec`. | same |
-| `register_observer(factory)` | An execution observer factory. | [Metrics and observers](/docs/extending/observers) |
+| Method | What it registers |
+| --- | --- |
+| `register_model(spec)` | A [`ModelSpec`](/docs/extending/models). |
+| `register_device(spec)` | A [`DeviceSpec`](/docs/extending/models). |
+| `register_backend(backend)` | A [custom inference engine](/docs/extending/backends). |
+| `register_observer(factory)` | An [execution observer](/docs/extending/observers). |
+| `register_logical_rule(rule)` | A logical plan rewrite rule. |
+| `register_physical_planner(planner)` | A planner that proposes physical plans. |
+| `register_physical_rule(rule)` | A physical graph rewrite rule. |
+| `register_node(node_type, runtime=...)` | A physical node type with its codec and runtime. |
 
-Every name is checked for duplicates. Registering the same name twice
-raises `ValueError`. Each method returns the registry, so calls chain.
-`register_node` checks both names before adding either object. A failed
-`load_extension` call leaves no partial registrations.
+Every name is checked for duplicates. Registering the same name
+twice raises `ValueError`.
 
-The lookup tables, including `registry.codecs` and `registry.physical_rules`,
-are read-only. Use the registration methods to add objects. Each method
-names the interface its argument must implement in its type annotation.
+Table providers are registered directly on the session with
+`session.register(name, provider)`, not on the extension registry.
 
-A table provider is not registered here. It is passed straight to
-`Session.register(name, provider)`.
+## On Modal
 
-## Running on Modal
-
-Create the registry and session inside the Modal GPU function. Register
-extensions there, including connections, locks, and other objects that must
-be created where the query runs.
-
-Add extension sources and packages to the image you define in your Modal script:
+Create the registry inside the GPU function. Add extension packages
+to the Modal image:
 
 ```python
-image = image.pip_install("some-dependency==1.2.3")
+image = image.pip_install("my-extension==1.0.0")
 image = image.add_local_python_source("my_package")
 ```
 
-Use this image in the function decorator. Inside the function, import the
-extension and register it normally:
+## Advanced extension points
 
-```python
-from my_package import quail_extension
-
-registry = quail.ExtensionRegistry.with_built_ins()
-registry.load_extension(quail_extension)
-config = quail.EngineConfig(
-    gpus=1,
-    model="qwen3-4b-fp8",
-    backend="quail",
-    device="h100-sxm",
-)
-with quail.Session(config, registry=registry) as session:
-    ...
-```
-
-The same registry is used for planning and execution. Registration functions
-run only when called. See [Running on Modal](/docs/user-guide/compute) for
-the complete submission pattern.
-
-## The default registrations
-
-`with_built_ins()` adds Quail's included model specifications, the H100
-specification, and the available backends. It also adds the standard node
-implementations. Registering these objects does not
-load model weights or start processes.
-
-For one GPU, Quail executes in the session's process. Its additional GPU child
-processes are used only by the existing multi-GPU path. Each child receives
-the registry once per query and reuses it across execution stages.
-
-## An example
-
-`quail_ext_examples/cost_ledger.py` in the repository turns a finished
-query's executed plan and per node metrics into a cost ledger. It
-registers nothing: the metrics are on the result. See
-[Metrics and observers](/docs/extending/observers).
+Logical rules, physical planners, physical rules, and custom node
+types are available for advanced use cases. The source code and test
+suite (especially
+[`tests/test_physical.py`](https://github.com/fsdatalab/quail/blob/main/tests/test_physical.py))
+are the best reference for these interfaces.

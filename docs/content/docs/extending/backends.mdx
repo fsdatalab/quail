@@ -1,0 +1,137 @@
+---
+title: Custom inference engines
+---
+
+A model backend controls how Quail runs the model. The Quail
+executor, vLLM, and SGLang are all implementations of the same
+`ModelBackend` protocol. Writing a custom backend lets you run
+Quail's queries through a different inference engine.
+
+## The ModelBackend protocol
+
+```python
+class ModelBackend(Protocol):
+    name: str
+
+    def supports(self, model: ModelSpec, device: DeviceSpec,
+                 gpu_count: int) -> SupportResult: ...
+
+    def plan(self, region: ModelRegion,
+             context: PlanningContext) -> Sequence[PhysicalCandidate]: ...
+
+    def start(self, context: GpuContext) -> ModelExecution: ...
+
+    def execute_request(self, context: BackendExecutionContext) -> Any: ...
+```
+
+Source:
+[quail/backends/base.py](https://github.com/fsdatalab/quail/blob/main/quail/backends/base.py).
+
+### supports
+
+Return `SupportResult.accept()` or `SupportResult.reject(reason)`.
+The session calls `supports` at creation time. An unsupported
+combination fails immediately with a `RefusalError`.
+
+### plan
+
+Receive the logical plan and planning context (model spec, device
+spec, GPU count, document token lengths). Return one or more
+`PhysicalCandidate` values. The planner picks the candidate with the
+lowest estimated time across all backends and registered planners.
+
+### start
+
+Called once per GPU with a `GpuContext`. Return a `ModelExecution`
+object that runs individual physical nodes.
+
+### execute_request
+
+Called in the worker process with the full execution context: the
+decoded physical graph, tokenized inputs, the registry, and a
+`runtime_state` dict that persists across queries in one container.
+Return a `PhysicalResponse` with Arrow output tables and metrics.
+
+## How the vLLM backend works
+
+The vLLM backend
+([`quail/backends/request.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/request.py))
+is a good reference for building a custom backend. Here is how it
+implements each method.
+
+### supports
+
+The vLLM backend accepts one GPU only and the two built-in Qwen3
+models. It rejects multi-GPU configurations because vLLM manages its
+own request scheduling.
+
+### plan
+
+The vLLM backend builds a single `RequestExecution` physical node
+containing the tokenized prompt parts for every filter and join
+stage. It uses the same filter ordering and join search as the Quail
+backend, so comparisons are fair.
+
+The `RequestExecution` node stores:
+- The shared preamble token IDs.
+- Per-filter: the alias, the predicate order, and the question token
+  IDs for each stage.
+- Per-join: the anchor, partner aliases, label/frame token IDs, and
+  the tail (answer cue) token IDs.
+
+### execute_request
+
+On the first query, the backend boots vLLM using an engine adapter
+(`VLLMEngine`) and stores the running engine in `runtime_state` so
+later queries reuse it.
+
+For filters, the backend renders each document's prompt as
+`preamble + document tokens + question tokens` and submits one vLLM
+`generate` request per document per predicate stage.
+
+For joins, the backend renders each anchor as
+`preamble + anchor document + frame` and each partner as
+`label + partner document + answer cue`, then submits one request
+per (anchor, partner) pair.
+
+The backend reads the TRUE/FALSE answer from each vLLM output and
+builds standard Arrow answer tables that the generic runner uses for
+`Recombine`, `Project`, and `Limit`.
+
+### Submission strategies
+
+The vLLM backend supports two filter strategies:
+- **Operator-at-a-time**: finish all documents for one predicate
+  before starting the next.
+- **Pipelined**: submit a document's next predicate as soon as the
+  current one returns TRUE.
+
+And two join strategies:
+- **Anchor-major**: evaluate all partners for one anchor, then move
+  to the next anchor.
+- **Suffix-major**: evaluate all anchors for one partner, then move
+  to the next partner. Only used when all anchor prefixes fit in
+  vLLM's KV cache at once.
+
+## Registration
+
+```python
+registry = quail.ExtensionRegistry.with_built_ins()
+registry.register_backend(MyBackend())
+```
+
+Select the backend in `EngineConfig`:
+
+```python
+config = quail.EngineConfig(
+    model="qwen3-4b-fp8",
+    device="h100-sxm",
+    backend="my_backend",
+)
+```
+
+## Testing
+
+[`tests/test_physical.py`](https://github.com/fsdatalab/quail/blob/main/tests/test_physical.py)
+contains `LocalFilterBackend`, a minimal backend that runs filters
+on the CPU without a GPU. It is a good starting point for testing.

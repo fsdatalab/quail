@@ -3,11 +3,10 @@
   "pages": [
     "index",
     "table-providers",
-    "logical-rules",
-    "physical-nodes",
-    "model-backends",
-    "observers",
-    "models"
+    "models",
+    "operators",
+    "backends",
+    "observers"
   ],
   "defaultOpen": false
 }
