@@ -80,7 +80,7 @@ export default function HomePage() {
           <div className="mt-8 flex flex-wrap gap-3">
             <Link
               href="/docs/user-guide/quickstart"
-              className="rounded-md bg-fd-primary px-4 py-2.5 text-sm font-medium text-fd-primary-foreground"
+              className="rounded-md bg-cmu-carnegie-red px-4 py-2.5 text-sm font-medium text-white"
             >
               Run the quickstart
             </Link>

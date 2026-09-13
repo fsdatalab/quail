@@ -38,15 +38,18 @@ parts depend on each other and should change together.
 The public configuration is:
 
 ```python
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class EngineConfig:
-    gpus: int = 1
-    model: str = "qwen3-4b-fp8"
-    backend: str = "quail"
-    device: str = "h100-sxm"
+    gpus: int
+    model: str
+    backend: str
+    device: str
+    gpu_timing: bool = False
 ```
 
-A normal user does not set `backend`. Quail is the default.
+Every session names its GPU count, model, backend, and device. Use
+`backend="quail"` for normal execution. `gpu_timing` controls optional
+measurement and remains off by default.
 
 `gpus` can be 1, 2, 4, or 8. All GPUs are in one Modal container. The
 container has one coordinator process and one GPU executor per H100.
