@@ -315,6 +315,7 @@ def execute_single(state, payload: dict, registry, graph) -> dict:
         "model_spec": state.get("spec") or state.get("model_spec"),
         "device": registry.device(payload["physical_plan"]["device"]),
         "chunk_tokens": payload["chunk_tokens"],
+        "gpu_timing": payload.get("gpu_timing", False),
     }
     return execute_single_graph(runtime_state, payload, graph)
 
