@@ -182,7 +182,7 @@ class _Client:
         return True
 
 
-def _execution(documents):
+def _execution(documents, **settings):
     return RequestModelExecution(GpuContext(
         gpu_index=0,
         gpu_count=1,
@@ -200,8 +200,44 @@ def _execution(documents):
             },
             "filter_submission": "operator-at-a-time",
             "join_submission": "anchor-major",
+            **settings,
         },
     ))
+
+
+def test_suffix_major_falls_back_when_the_anchors_exceed_kv():
+    class RecordingClient(_Client):
+        def generate(self, prompts, sampling_params, use_tqdm=False):
+            self.prompts = [tuple(prompt["prompt_token_ids"]) for prompt in prompts]
+            return super().generate(prompts, sampling_params, use_tqdm=use_tqdm)
+
+    node = RequestExecution(
+        node_id="request-model",
+        backend_name="pipelined_sglang",
+        aliases=("r", "p"),
+        preamble_token_ids=(3,),
+        joins=(RequestJoinSpec(
+            written_pos=0, aliases=("r", "p"), outer_aliases=("r",),
+            anchor="r", semantics="full", selectivity=0.5,
+            label_token_ids=(("r", (40,)), ("p", (41,))),
+            frame_token_ids=(("r", (30,)), ("p", (31,))),
+            tail_token_ids=(50,),
+        ),),
+    )
+    documents = {"r": [[10], [11]], "p": [[20], [21]]}
+    # two anchor prefixes of three tokens each: six tokens held at once
+    orders = {}
+    for kv_tokens in (5, 6):
+        execution = _execution(
+            documents, join_submission="suffix-major",
+            capacity={"kv_cache_size_tokens": kv_tokens, "block_size": 1,
+                      "max_num_seqs": 16})
+        execution.client = RecordingClient()
+        execution.execute(node, {})
+        orders[kv_tokens] = [(prompt[1], prompt[4])
+                             for prompt in execution.client.prompts]
+    assert orders[6] == [(10, 20), (11, 20), (10, 21), (11, 21)]
+    assert orders[5] == [(10, 20), (10, 21), (11, 20), (11, 21)]
 
 
 def test_filter_and_join_answer_relations():

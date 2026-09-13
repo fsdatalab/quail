@@ -481,6 +481,20 @@ class RequestModelExecution:
         self.filter_submission = settings["filter_submission"]
         self.join_submission = settings["join_submission"]
 
+    def _join_submission(self, prefixes) -> str:
+        """Suffix-major only when every anchor prefix fits in KV at once.
+
+        Suffix-major sends every anchor for one partner before the next
+        partner, so anchors that do not all fit are recomputed once per
+        partner; anchor-major keeps each anchor's prefix hot instead.
+        """
+        if self.join_submission != "suffix-major":
+            return self.join_submission
+        held = sum(len(prefix) for prefix in prefixes)
+        if held > self.capacity["kv_cache_size_tokens"]:
+            return "anchor-major"
+        return "suffix-major"
+
     def execute(
         self,
         node: PhysicalNode,
@@ -616,6 +630,7 @@ class RequestModelExecution:
                     for member_index in mine
                 ]
 
+            submission = self._join_submission(prefixes)
             if prefixes and suffixes and request_pairs != []:
                 result = run_join_grouped(
                     self.client,
@@ -623,7 +638,7 @@ class RequestModelExecution:
                     prefixes,
                     suffixes,
                     self.true_ids,
-                    submission=self.join_submission,
+                    submission=submission,
                     pairs=request_pairs,
                 )
                 answers = [bool(answer) for answer in result["answers"]]
@@ -672,7 +687,7 @@ class RequestModelExecution:
                 "written_pos": spec.written_pos,
                 "anchor": anchor,
                 "partners": list(partners),
-                "submission": self.join_submission,
+                "submission": submission,
                 "pairs": len(rows),
                 "true_pairs": len(true_rows),
                 "wall_s": result["wall"],
