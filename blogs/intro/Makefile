@@ -21,6 +21,8 @@ $(HTML): $(SOURCE) references.bib $(CSS) $(FIGURES)
 		--from=markdown+tex_math_dollars \
 		--to=html5 \
 		--standalone \
+		--toc \
+		--toc-depth=2 \
 		--css=$(CSS) \
 		--math-method=mathjax \
 		--citeproc \

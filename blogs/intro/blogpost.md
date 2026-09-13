@@ -82,7 +82,7 @@ We compare vLLM's measured latency with a *speed of light estimate*, which is an
 
 [^host-overhead]: Modal provides useful background on [GPU utilization](https://modal.com/blog/gpu-utilization-guide) and [host overhead](https://modal.com/blog/host-overhead-inference-efficiency) in inference engines.
 
-[^mfu]: *Model FLOPs utilization (MFU)* is the fraction of the GPU's peak arithmetic throughput used during a model forward pass. Reaching the speed of light estimate would require 100 percent MFU. Quail does not optimize the GPU kernels themselves, so we leave that problem to the GPU kernel experts.
+[^mfu]: *Model FLOPs utilization (MFU)* is the fraction of the GPU's peak arithmetic throughput used during a model forward pass. Reaching the speed of light estimate would require 100 percent MFU. Quail does not optimize the GPU kernels themselves.
 
 For BIO-3, vLLM computes 14 percent of its input tokens more than once, because it evicted their KV. The vLLM run takes almost 12 times the speed of light estimate. Surely, we can do better!
 
@@ -330,9 +330,9 @@ We have three performance goals for Quail:
 - Second, we want the GPU to spend close to 100 percent of query execution running model operations. AI-SQL filters and joins spend almost all of their model time on prefill, and many evaluations are ready at once, so the GPU should not have to wait for the CPU to prepare more work.
 - Third, while the GPU is active, we want high model FLOPs utilization, or MFU. MFU is the fraction of the GPU's peak arithmetic throughput used during a model forward pass.
 
-Quail's current design focuses on the first two goals. The KV manager uses the query plan to retain the KV that is expected to avoid the most future computation. The executor sends large chunks of tokens through the model, which reduces the CPU overhead of preparing and scheduling separate requests. For MFU, we use DeepGEMM for the main matrix multiplications, and FlashAttention 3 for attention. We leave further kernel optimization to the experts, in spirit to others working on batch inference optimization.[^sail-mfu]
+Quail's current design focuses on the first two goals. The KV manager uses the query plan to retain the KV that is expected to avoid the most future computation. The executor sends large chunks of tokens through the model, which reduces the CPU overhead of preparing and scheduling separate requests. For MFU, we use DeepGEMM for the main matrix multiplications, and FlashAttention 3 for attention. We have not optimized the kernels themselves.[^sail-mfu]
 
-[^sail-mfu]: In ["Chasing Speed of Light on TPU v6e"](https://www.sailresearch.com/blog/tpu-v6e-gemma), Sail Research describes increasing Gemma 4 31B prefill MFU from about 32 percent to 63 percent through attention tuning, communication overlap, and custom kernel work.
+[^sail-mfu]: Kernel optimization can substantially improve prefill MFU. In ["Chasing Speed of Light on TPU v6e"](https://www.sailresearch.com/blog/tpu-v6e-gemma), Sail Research reports increasing Gemma 4 31B prefill MFU from about 32 percent to 63 percent.
 
 ## Experimental setup
 
@@ -570,11 +570,11 @@ We are actively working on Quail, and we are excited about many directions. Here
 
 **Support more AI-SQL operators.** Quail currently supports filters and joins, both of which return only `TRUE` or `FALSE`, and are 100% prefill. As we add operators such as `AI_EXTRACT` and `AI_CLASSIFY`, which require decode, we'll need to adapt our cost models and execution strategies.
 
-**Support more models and hardware.** Quail currently supports Qwen3 4B FP8 and Qwen3 32B FP8 on H100 GPUs. We want to add more models, including hybrid models such as Qwen3.5 and Liquid models. We also want to support more hardware, including Blackwell GPUs and Apple Silicon. We still need to determine how to serve mixture of experts models efficiently for AI-SQL.
+**Support more models and hardware.** Quail currently supports Qwen3 4B FP8 and Qwen3 32B FP8 on H100 GPUs. We want to add more models, including hybrid models such as Qwen3.5 and Liquid models. We also want to support more hardware, including Blackwell GPUs and Apple Silicon.
 
 **Improve KV and HBM management.** We want to support automatic prefix caching across rows, and use host CPU DRAM for KV that does not fit in GPU HBM. We also want to improve KV management across GPUs. Quail currently partitions input documents across model copies, but filters can leave each GPU with a different number of surviving documents. As a result, one GPU may evict useful KV while another has unused HBM, and the GPUs may receive different amounts of downstream join work.
 
-**Improve model FLOPs utilization.** Quail currently relies on DeepGEMM and FlashAttention for its main GPU kernels. We have not optimized the kernels themselves, and we would love to work with inference experts who are interested in this workload.
+**Improve model FLOP/S utilization.** Quail currently relies on DeepGEMM and FlashAttention for its main GPU kernels. We have not optimized the kernels themselves, and we are stoked to be working with Modal and Doubleword, inference experts, on this.
 
 **Train models for AI-SQL operators.** We want to fine tune small models for specific predicates, which [Google's work on lightweight proxy models for AI-SQL](https://arxiv.org/abs/2603.15970) suggests can reduce cost substantially. One systems question is how to run and train these models alongside a larger model on the same GPU. Moreover, for joins, we want to train models that return the same answer when the two documents swap positions, since Quail chooses their order based on execution cost.
 
