@@ -169,9 +169,7 @@ every surviving document's prefix.
 </Callout>
 
 The planner estimates $A_s$ at each stage from the selectivities you
-provide. The public `speed_of_light_estimate()` function accepts an
-answer oracle so benchmarks can compute the exact $A_s$ from saved
-labels.
+provide.
 
 ### Work per join stage
 
@@ -212,11 +210,13 @@ tokens and the resident anchor context, plus self-attention among
 the suffix tokens. Suffixes do not attend to each other
 ([executor/pack.py](https://github.com/fsdatalab/quail/blob/main/quail/executor/pack.py)).
 
-### From operator work to query time
+### Computing the cost of a plan
 
-The per-operator work counts are summed across all filter stages and
-join stages in the candidate plan. The totals are then converted to
-seconds:
+When the planner evaluates a particular filter ordering or join
+plan, it sums the per-operator work counts across all stages in that
+plan, then converts the totals to an estimated time in seconds using
+the roofline equations below. This estimated time is the SoL for
+that plan. The plan with the lowest SoL wins.
 
 $$
 \mathrm{passes} = \left\lceil \frac{\mathrm{tokens}}{C} \right\rceil

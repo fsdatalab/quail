@@ -2,77 +2,72 @@
 title: Execution
 ---
 
-This page describes how the physical plan is executed on the GPU.
+After the [planner](/docs/architecture/planning) produces a physical
+plan, the execution engine runs it. The engine overlaps CPU and GPU
+work: while the GPU processes the current forward pass, the CPU
+prepares the next one.
 
 ## The runner
 
-`GenericRunner.run(graph, context)` walks nodes in topological
-order. For each node it calls the registered runtime, checks the
-output ports, records node metrics, and notifies observers.
+[`GenericRunner`](https://github.com/fsdatalab/quail/blob/main/quail/runtime/runner.py)
+walks the physical plan's nodes in topological order. For each node
+it calls the registered runtime, checks the output ports, records
+metrics, and notifies any observers.
 
-Relational nodes (`Recombine`, `Project`, `Limit`) run with Arrow
-on the CPU. Model nodes run on the GPU.
+Relational nodes (`Recombine`, `Project`, `Limit`) run on the CPU
+using Arrow. Model nodes (`AiFilter`, `AiJoin`) run on the GPU
+using the execution loop described below.
 
-## Planning
+## Filter execution
 
-The planner builds the physical plan from the model spec, device
-spec, and per-document token counts. It decides the filter order,
-the anchor of each join, the forward pass token budget and KV arena
-budget (based on GPU memory after the model weights), which document
-KV to retain across operator boundaries, and document shards per
-GPU.
-
-## Filters
-
-The filter loop fills each forward pass by two budgets: tokens and
-KV pages.
+The filter loop fills each GPU forward pass using two budgets: a
+token budget and a KV page budget.
 
 ### Pipelining
 
 A document that passes one predicate enters the next forward pass
-with its next predicate immediately. It does not wait for the rest
-of the batch.
+with its next predicate immediately. It does not wait for every
+other document to finish the current predicate.
 
 ### Token-based admission
 
-A forward pass is full when its token budget or the arena's free
-pages are exhausted, not when a fixed request count is reached.
+A forward pass is full when either the token budget or the arena's
+free pages are exhausted. There is no fixed request count.
 
 ### KV rewind
 
-The document's KV from the first predicate stays in the arena. Later
-predicates add only the question suffix tokens. KV pages are freed
-when a document fails a predicate or finishes its last one.
+After a document passes a predicate, its KV stays in the GPU arena.
+The next predicate adds only the new question tokens on top of the
+existing document KV. Pages are freed when a document fails a
+predicate or finishes its last one.
 
-## Joins
+## Join execution
 
-A join packs one anchor document's prefix per forward pass and
-evaluates multiple partner documents against it. All partners in one
-forward pass share the anchor's KV through paged cross-attention.
+A join evaluates one anchor document against multiple partner
+documents. All partners in one forward pass share the anchor's KV
+through paged cross-attention.
+
+### Streaming from filters
+
+The first join group does not wait for its anchor filter to finish.
+Each document that passes its last filter predicate keeps its KV
+pinned and enters the join immediately.
 
 ### Gating
 
 Between join stages, anchors with no passing pair are dropped and
-their pages freed.
+their KV pages freed.
 
-### Streaming
+### KV retention across joins
 
-The first join group's anchor filter does not finish before the join
-starts. Each document that passes its last filter keeps its KV and
-enters the join immediately.
-
-### Retention
-
-Later join groups reuse retained KV for their anchors. If KV was
-evicted, the document is reprocessed.
-
-The planner uses dynamic programming (Selinger-style) to choose the
-join order and anchors before inference.
+When a query has multiple join groups, the engine retains document
+KV from earlier groups for use as anchors in later groups. If KV
+was evicted because of capacity limits, the document is reprocessed.
 
 ## Multiple GPUs
 
 With multiple GPUs, each GPU has its own CUDA context and KV arena.
-A coordinator process sends work over pipes.
+A coordinator process distributes work over pipes.
 
 - **Filters**: each GPU filters its own shard of documents.
 - **Joins**: anchors stay on the GPU that filtered them. Every GPU
@@ -82,29 +77,31 @@ A coordinator process sends work over pipes.
 
 ## GPU code
 
+All GPU execution code is in
+[quail/executor/](https://github.com/fsdatalab/quail/tree/main/quail/executor):
+
 | File | What it does |
 | --- | --- |
-| `quail/executor/pack.py` | Admission logic for filters and joins. |
-| `quail/executor/arena.py` | The paged KV arena and page accounting. |
-| `quail/executor/attention.py` | Forward pass with two-call attention and log-sum-exp merge. |
-| `quail/executor/loop.py` | The overlapped filter and join execution loops. |
-| `quail/executor/model.py` | Weight loading through vLLM's loader. |
+| [`pack.py`](https://github.com/fsdatalab/quail/blob/main/quail/executor/pack.py) | Admission logic for filters and joins. |
+| [`arena.py`](https://github.com/fsdatalab/quail/blob/main/quail/executor/arena.py) | Paged KV arena and page accounting. |
+| [`attention.py`](https://github.com/fsdatalab/quail/blob/main/quail/executor/attention.py) | Forward pass with two-call attention and log-sum-exp merge. |
+| [`loop.py`](https://github.com/fsdatalab/quail/blob/main/quail/executor/loop.py) | Overlapped filter and join execution loops. |
+| [`model.py`](https://github.com/fsdatalab/quail/blob/main/quail/executor/model.py) | Weight loading through vLLM's loader. |
 
 The fused kernels assume the Qwen3 architecture: QK-norm before
 RoPE, gated SiLU MLP, FP8 block-quantized weights.
 
 ## Session lifetime
 
-The backend keeps the loaded model in memory for later queries.
-The session keeps tokenized documents for reuse. Collect your
-results before closing the session, because the row projection may
-still read from the session's temporary files.
+The model stays loaded in GPU memory across queries within one
+session. Tokenized documents are also reused. Collect results before
+closing the session, because row projection reads from the session's
+temporary files.
 
 `Session.close()` waits for background tokenization and releases
-temporary files. It does not unload the model.
+temporary files.
 
 ## Limits
 
 - Temporary token files must fit on local disk.
-- At most 8 GPUs in one host. Multi-host execution is not
-  implemented.
+- At most 8 GPUs in one host.
