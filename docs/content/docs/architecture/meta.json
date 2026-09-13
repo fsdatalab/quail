@@ -4,9 +4,8 @@
     "index",
     "logical-plans",
     "physical-plans",
-    "execution",
-    "design-decisions",
-    "sol-model"
+    "planning",
+    "execution"
   ],
   "defaultOpen": false
 }

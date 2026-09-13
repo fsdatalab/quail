@@ -1,16 +1,62 @@
 ---
-title: The speed of light model
+title: Planning
 ---
 
-The speed of light (SoL) estimate is the ideal execution time for a
-query on one GPU. It assumes peak hardware throughput, unlimited KV
-capacity for document prefixes, and zero host overhead. No
-implementation can reach it because those assumptions cannot all hold
-simultaneously.
+Before running a query, Quail's planner decides how to execute it.
+The planner takes the logical plan, the model spec (architecture,
+weight precision), the device spec (GPU memory, bandwidth, peak
+FLOP/s), and the token counts of every document. It produces a
+physical plan that specifies the execution order, token budgets, and
+KV retention policy.
 
-The estimate uses datasheet peak rates, model dimensions, and a
-count of the query's work. It has no fitted parameters and does not
-use any measured Quail runtime.
+## What the planner decides
+
+- **Filter order.** When a table has multiple AI predicates, the
+  planner orders them to minimize total model work. A predicate that
+  rejects most documents and is cheap to evaluate runs first.
+- **Join order and anchors.** With multiple joins, the planner
+  chooses which join runs first, which table is the anchor for each
+  join, and how many documents survive to later joins.
+- **Token budget.** The maximum tokens per model forward pass, based
+  on GPU memory and kernel index limits.
+- **KV capacity.** How much GPU memory to allocate for storing
+  document KV between operators.
+- **KV retention.** Which documents' KV to keep between operators,
+  and which to evict and recompute later.
+
+Implementation:
+[quail/planner/decide.py](https://github.com/fsdatalab/quail/blob/main/quail/planner/decide.py).
+
+## Cost estimation
+
+To compare candidate plans, the planner needs a cost estimate for
+each one. Quail estimates cost using a roofline model: for each
+candidate plan, it counts the arithmetic work and HBM traffic the
+model would perform, then takes the larger of the compute time and
+memory time for each model component.
+
+The inputs to the cost model are:
+
+- The **model dimensions**: layers, hidden width, heads, weight
+  precision. These determine the FLOP count per token and the weight
+  bytes per forward pass.
+- The **device specs**: peak FLOP/s and HBM bandwidth. These
+  determine how fast the GPU can do the work.
+- The **query's token counts**: how many documents, how long each
+  one is, how many predicates, and the estimated selectivities.
+
+The cost model uses no fitted parameters and no measurements from
+previous Quail runs. It computes directly from the hardware
+datasheet and the model architecture.
+
+## Speed of light estimate
+
+The speed of light (SoL) is the cost estimate applied to an ideal
+plan: one that assumes peak hardware throughput, unlimited KV
+capacity, and zero host overhead. No real execution reaches it
+because those assumptions cannot all hold simultaneously. It is
+useful as a lower bound when evaluating how close a measured run
+gets to the hardware limit.
 
 Implementation:
 [quail/planner/sol.py](https://github.com/fsdatalab/quail/blob/main/quail/planner/sol.py).
