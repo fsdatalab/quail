@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from itertools import chain
 from typing import Any
 
 import pyarrow as pa
+import pyarrow.compute as pc
 
 from quail.physical import (
     AiFilter,
@@ -167,18 +169,34 @@ def join_answer_cells(value: Mapping[str, Any]):
 
 
 def _join_answers_table(value: Mapping[str, Any]) -> pa.Table:
+    """Build the join answer table without visiting pairs in Python.
+
+    A join can hold tens of millions of pairs. Python visits the
+    anchors; the pairs are concatenated by chain and converted by
+    Arrow, and the partner ids come from one take.
+    """
     anchor = str(value["anchor"])
     partners = tuple(value["partners"])
     aliases = (anchor, *partners)
-    columns = {alias: [] for alias in aliases}
-    answers = []
     anchor_map = value["anchor_index"]
     partner_map = value["partner_index"]
-    for local, member_index, answer in join_answer_cells(value):
-        columns[anchor].append(int(anchor_map[local]))
-        for alias, document in zip(partners, partner_map[member_index]):
-            columns[alias].append(int(document))
-        answers.append(bool(answer))
+    streamed = value.get("anchor_partners") or {}
+    anchor_parts, member_parts, answer_parts = [], [], []
+    for raw_local, row in value["rows"].items():
+        local = int(raw_local)
+        members = streamed.get(local)
+        anchor_parts.append([int(anchor_map[local])] * len(row))
+        member_parts.append(range(len(row)) if members is None else members)
+        answer_parts.append(row)
+    members = pa.array(chain.from_iterable(member_parts), type=pa.int32())
+    columns = {anchor: pa.array(chain.from_iterable(anchor_parts),
+                                type=pa.int32())}
+    for index, alias in enumerate(partners):
+        documents = pa.array([int(member[index]) for member in partner_map],
+                             type=pa.int32())
+        columns[alias] = pc.take(documents, members)
+    # answers arrive as 0/1 integers or booleans; the cast covers both
+    answers = pc.cast(pa.array(chain.from_iterable(answer_parts)), pa.bool_())
     fields = []
     fields.extend(
         pa.field(alias, pa.int32(), nullable=False) for alias in aliases
@@ -195,11 +213,7 @@ def _join_answers_table(value: Mapping[str, Any]) -> pa.Table:
         metadata[b"quail.selectivity"] = str(
             value["selectivity"]
         ).encode("ascii")
-    arrays = []
-    arrays.extend(
-        pa.array(columns[alias], type=pa.int32()) for alias in aliases
-    )
-    arrays.append(pa.array(answers, type=pa.bool_()))
+    arrays = [columns[alias] for alias in aliases] + [answers]
     return pa.Table.from_arrays(arrays, schema=pa.schema(fields, metadata))
 
 

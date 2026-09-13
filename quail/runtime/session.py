@@ -938,7 +938,7 @@ class Query:
                     "a join answer relation is missing alias columns "
                     f"{sorted(missing_columns)}"
                 )
-            answers = table.column("answer").to_pylist()
+            answers = table.column("answer")
             answer_tables["joins"][written_pos] = table
             report["stages"].append(dict(
                 op="join", anchor=anchor,
@@ -946,8 +946,7 @@ class Query:
                 semantics=semantics,
                 provided_selectivity=logical_join.selectivity,
                 observed_selectivity=round(
-                    sum(bool(answer) for answer in answers)
-                    / max(1, len(answers)), 4
+                    (pc.sum(answers).as_py() or 0) / max(1, len(answers)), 4
                 ),
                 tuples=len(answers),
             ))

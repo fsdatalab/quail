@@ -4,7 +4,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 import quail
-from quail.bench.quailb import queries, register_privacy_sets, register_sets
+from quail.bench.quailb import queries, register_tables
 from quail.planner.decide import collect_operators
 from quail.planner.plan import EngineConfig, Refusal
 from quail_b.data import ASPECTS, SCENARIOS
@@ -65,8 +65,7 @@ def test_all_queries_compile_and_plan(tmp_path):
         _standin_sets(tmp_path)
         sess = quail.Session(EngineConfig(gpus=1, backend=backend),
                              tokenizer=lambda text: list(text.encode()))
-        register_sets(sess, tmp_path)
-        register_privacy_sets(sess, tmp_path)
+        register_tables(sess, tmp_path)
         qdefs = queries(sess)
         expected = {
             *(f"IMDB-{i}" for i in range(1, 11)),

@@ -142,14 +142,14 @@ def confirm_4b(
 ) -> str:
     import torch
 
-    from quail.bench.quailb import queries, register_sets
+    from quail.bench.quailb import queries, register_tables
     from quail.planner.plan import EngineConfig
     from quail.runtime.session import Session
     from quail_b.data import build_sets
 
     data = build_sets("/results/quailb_data", 0.1)
     session = Session(EngineConfig(model="qwen3-4b-fp8", gpus=1))
-    register_sets(session, data)
+    register_tables(session, data)
     definitions = queries(session)
     selected = [query_id.strip() for query_id in query_ids.split(",")
                 if query_id.strip()]
