@@ -1,20 +1,19 @@
 ---
-title: Repository layout and tests
-description: Where things live and how to check a change.
+title: Contributing
 ---
 
-## Layout
+## Repository layout
 
 | Path | Contents |
 | --- | --- |
-| `quail/` | The package. See [Architecture](/docs/architecture) for the module map. |
-| `quail/bench/` | Quail's QUAIL-B runner. The benchmark itself is the `quail_b` package from [fsdatalab/quail-bench](https://github.com/fsdatalab/quail-bench), pinned in `pyproject.toml`; the runner builds Quail queries from its specs, runs them on the same GPU as the baselines, and hands answers to its scoring. |
-| `quail_ext_examples/` | Example extensions. |
-| `tests/` | CPU tests. They fake the GPU and run in seconds. |
-| `experiments/` | Every Modal entry point that costs GPU time: ablation and profiling scripts, and the smokes, probes, and gates under `experiments/cells/`. |
-| `docs/` | This documentation site, including the design decisions and the speed of light model. |
+| [`quail/`](https://github.com/fsdatalab/quail/tree/main/quail) | The engine. |
+| [`quail/bench/`](https://github.com/fsdatalab/quail/tree/main/quail/bench) | QUAIL-B runner. |
+| [`tests/`](https://github.com/fsdatalab/quail/tree/main/tests) | CPU tests (no GPU needed). |
+| [`experiments/`](https://github.com/fsdatalab/quail/tree/main/experiments) | Modal GPU scripts. |
+| [`demos/`](https://github.com/fsdatalab/quail/tree/main/demos) | Runnable examples. |
+| [`docs/`](https://github.com/fsdatalab/quail/tree/main/docs) | This site (Fumadocs + Next.js). |
 
-## Checks
+## Running tests
 
 ```bash
 uv run ruff check quail tests experiments tools
@@ -23,31 +22,9 @@ uv run vulture
 uv run pytest -q
 ```
 
-`vulture` reports unused code in `quail/` at 70 percent confidence.
-Keep all four checks clean before pushing.
+All four must pass before pushing.
 
-## Running a GPU cell
-
-Every GPU run goes through Modal and attaches to an existing app:
-`quail-milestone1` for cells, `quail-engine` for the worker. Tee the
-output to a file, because the Modal CLI drops old log lines:
-
-```bash
-uv run modal run experiments/cells/session_smoke.py 2>&1 | tee results/session_smoke.log
-```
-
-Print the function call id and keep it in the tee file. Pull a result
-later with `modal.FunctionCall.from_id(id).get()` rather than writing
-Modal return values to local JSON.
-
-Historical experiment reports and plots live on the
-`cursor/reports-dev-f955` branch. Feature branches that target `main`
-do not add a report.
-
-## Adding a page here
-
-The site is Fumadocs on Next.js. Pages are MDX under
-`docs/content/docs/`. Each folder's `meta.json` sets the order.
+## Running the docs site locally
 
 ```bash
 cd docs
