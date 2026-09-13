@@ -185,9 +185,10 @@ survivor: $1{,}218 \times 51 = 62{,}118$ fresh tokens. Total:
 every surviving document's prefix.
 </Callout>
 
-The SoL calculation uses ground-truth labels to determine the exact
-set $A_s$ at each stage, because the surviving document lengths
-affect the attention pair count.
+The planner estimates $A_s$ at each stage from the selectivities you
+provide. The public `speed_of_light_estimate()` function accepts an
+answer oracle so benchmarks can compute the exact $A_s$ from saved
+labels.
 
 #### Joins
 
