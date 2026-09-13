@@ -292,10 +292,3 @@ def keep_even(tables):
 def same_key(tables):
     left, right = tables["r"], tables["p"]
     return left.join(right, keys=["key"], join_type="inner").select(["r", "p"])
-
-
-def same_page(tables):
-    """Pair each claim with the evidence row its wiki url names."""
-    claims, evidence = tables["c"], tables["e"]
-    return claims.join(evidence, keys=["evidence_wiki_url"],
-                       right_keys=["id"], join_type="inner").select(["c", "e"])
