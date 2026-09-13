@@ -357,10 +357,11 @@ class Join:
 
 @dataclass(frozen=True)
 class SemanticJoin:
-    """One n-way join predicate: a prompt asked of every input tuple.
+    """One join predicate between two tables.
 
-    The input is normally one Join, whose pairs the prompt evaluates.
-    Several inputs mean their cross product (the older shorthand).
+    The input is normally one Join node whose pairs the prompt
+    evaluates. A query that joins three or more tables has one
+    SemanticJoin per pair, each feeding into the next.
     """
     inputs: tuple    # tuple[LogicalNode]: one Join, or the accumulated
     #                  tree and then one scan per newly joined table

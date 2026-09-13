@@ -6,9 +6,9 @@ This section describes how Quail works internally.
 
 ## How a query runs
 
-1. The [SQL front end](https://github.com/fsdatalab/quail/blob/main/quail/sqlfront/compile.py)
-   or the [Python builder](https://github.com/fsdatalab/quail/blob/main/quail/builder.py)
-   produces a logical plan.
+1. Quail [parses](https://github.com/fsdatalab/quail/blob/main/quail/sqlfront/compile.py)
+   the user's SQL (or [Python builder](https://github.com/fsdatalab/quail/blob/main/quail/builder.py)
+   query) into a logical plan.
 2. The session reads Arrow batches from each registered table and
    tokenizes the document columns.
 3. The [planner](https://github.com/fsdatalab/quail/blob/main/quail/planner/decide.py)
@@ -33,9 +33,3 @@ This section describes how Quail works internally.
 | `quail.executor` | GPU code: packing, KV arena, attention. | [executor/](https://github.com/fsdatalab/quail/tree/main/quail/executor) |
 | `quail.specs` | Model and device constants. | [specs/](https://github.com/fsdatalab/quail/tree/main/quail/specs) |
 
-## Pages in this section
-
-- [Logical plans](/docs/architecture/logical-plans)
-- [Physical plans](/docs/architecture/physical-plans)
-- [Planning](/docs/architecture/planning)
-- [Execution](/docs/architecture/execution)

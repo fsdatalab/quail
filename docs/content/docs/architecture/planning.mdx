@@ -2,12 +2,12 @@
 title: Planning
 ---
 
-Before running a query, Quail's planner decides how to execute it.
-The planner takes the logical plan, the model spec (architecture,
-weight precision), the device spec (GPU memory, bandwidth, peak
-FLOP/s), and the token counts of every document. It produces a
-physical plan that specifies the execution order, token budgets, and
-KV retention policy.
+Given the user's query, Quail's parser converts it into a logical
+plan (see [Logical plans](/docs/architecture/logical-plans)). The
+planner then takes this logical plan, along with the model
+architecture, the GPU hardware specs, and the token lengths of the
+registered documents, and produces a physical plan that specifies the
+execution order, token budgets, and KV retention policy.
 
 ## What the planner decides
 
