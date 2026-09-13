@@ -41,14 +41,19 @@ The planner uses derived properties: `kappa` (KV bytes per token),
 `W_resident` (weight bytes on GPU after discarding the full output
 head), and `act_per_token` (activation memory per token).
 
-### Kernel constraint
+### Which models work with a spec alone
 
-The Quail executor's fused kernels assume the Qwen3 architecture:
-QK-norm before RoPE, gated SiLU MLP, FP8 block-quantized weights.
-Another Qwen3-family FP8 checkpoint works with a spec alone. A
-different architecture needs kernel changes in
-[quail/executor/](https://github.com/fsdatalab/quail/tree/main/quail/executor)
-or a different inference engine.
+The Quail executor's GPU kernels are written for the Qwen3
+architecture (QK-norm, gated SiLU MLP, FP8 block-quantized weights).
+Any Qwen3-family FP8 checkpoint can be added by registering a
+`ModelSpec` with the correct dimensions.
+
+A model with a different architecture (different attention layout,
+different activation function, different weight format) would need
+new GPU kernels in
+[quail/executor/](https://github.com/fsdatalab/quail/tree/main/quail/executor),
+or could run through a [custom inference engine](/docs/extending/backends)
+like vLLM or SGLang, which handle model loading independently.
 
 ## DeviceSpec
 
@@ -69,9 +74,11 @@ MY_DEVICE = DeviceSpec(
 Source:
 [quail/specs/base.py](https://github.com/fsdatalab/quail/blob/main/quail/specs/base.py).
 
-All values are per GPU. `peak_flops` is the dense FP8 rate (the H100
-datasheet quotes 2:1 sparsity — divide by 2 for dense). `bf16_flops`
-is the dense BF16 rate, used for attention.
+All values are per GPU. `peak_flops` is the dense FP8 rate.
+The [H100 datasheet](https://resources.nvidia.com/en-us-tensor-core)
+quotes rates with 2:1 structured sparsity; divide by 2 for the dense
+rate Quail uses. `bf16_flops` is the dense BF16 rate, used for
+attention (FlashAttention runs in BF16).
 
 ## Registration
 
