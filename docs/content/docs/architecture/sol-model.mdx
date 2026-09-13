@@ -20,38 +20,38 @@ Implementation:
 | Symbol | Meaning | Qwen3 4B fp8 | Qwen3 32B fp8 |
 |---|---|---|---|
 | `p` | Shared preamble tokens (on every document) | 2 | 2 |
-| `d_i` | Tokens in document `i` | corpus | corpus |
-| `q_s` | Tokens in filter stage `s`'s question | 41–62 | 41–62 |
-| `f_a` | Join frame tokens after anchor `a` | 36–42 | 36–42 |
-| `u_b` | One join tuple suffix for partner `b` | corpus | corpus |
-| `A_s` | Documents entering stage `s` | `A_1` = all | `A_1` = all |
-| `T(n)` | `\frac{n(n+1)}{2}`, causal self-attention pairs | | |
-| `P_A` | Attention projection parameters (Q, K, V, output) | 943,718,400 | 6,039,797,760 |
-| `P_M` | MLP parameters (gate, up, down) | 2,689,597,440 | 25,165,824,000 |
+| $d_i$ | Tokens in document `i` | corpus | corpus |
+| $q_s$ | Tokens in filter stage `s`'s question | 41–62 | 41–62 |
+| $f_a$ | Join frame tokens after anchor `a` | 36–42 | 36–42 |
+| $u_b$ | One join tuple suffix for partner `b` | corpus | corpus |
+| $A_s$ | Documents entering stage `s` | $A_1$ = all | $A_1$ = all |
+| `T(n)` | $\frac{n(n+1)}{2}$, causal self-attention pairs | | |
+| $P_A$ | Attention projection parameters (Q, K, V, output) | 943,718,400 | 6,039,797,760 |
+| $P_M$ | MLP parameters (gate, up, down) | 2,689,597,440 | 25,165,824,000 |
 | `L` | Layers | 36 | 64 |
-| `n_q, d_\mathrm{head}` | Query heads, head dimension | 32, 128 | 64, 128 |
-| `\kappa` | KV bytes per token: `2 \cdot L \cdot n_{kv} \cdot d_\mathrm{head} \cdot 2` | 147,456 | 262,144 |
-| `b_w` | Bytes per weight | 1 | 1 |
-| `R_\mathrm{dense}` | FP8 dense peak FLOP/s | `1.979 \times 10^{15}` | `1.979 \times 10^{15}` |
-| `R_\mathrm{attn}` | BF16 dense peak FLOP/s | `0.9895 \times 10^{15}` | `0.9895 \times 10^{15}` |
-| `\mathrm{BW}` | HBM bandwidth (bytes/s) | `3.35 \times 10^{12}` | `3.35 \times 10^{12}` |
+| $n_q, d_\mathrm{head}$ | Query heads, head dimension | 32, 128 | 64, 128 |
+| $\kappa$ | KV bytes per token: $2 \cdot L \cdot n_{kv} \cdot d_\mathrm{head} \cdot 2$ | 147,456 | 262,144 |
+| $b_w$ | Bytes per weight | 1 | 1 |
+| $R_\mathrm{dense}$ | FP8 dense peak FLOP/s | $1.979 \times 10^{15}$ | $1.979 \times 10^{15}$ |
+| $R_\mathrm{attn}$ | BF16 dense peak FLOP/s | $0.9895 \times 10^{15}$ | $0.9895 \times 10^{15}$ |
+| $\mathrm{BW}$ | HBM bandwidth (bytes/s) | $3.35 \times 10^{12}$ | $3.35 \times 10^{12}$ |
 | `C` | Tokens per forward pass | 110,376 | 41,943 |
 
-`p`, `d_i`, and `q_s` are the same for both models because all Qwen3
+`p`, $d_i$, and $q_s$ are the same for both models because all Qwen3
 models share one tokenizer. The hardware rows are the same because
 both run on an H100 SXM.
 
 `C` is the maximum tokens per forward pass, set by the fused kernels'
-32-bit index limit: `(2^{31} - 1)` divided by the widest projection
+32-bit index limit: $(2^{31} - 1)$ divided by the widest projection
 (19,456 columns at 4B, 51,200 at 32B). The 32B budget is about a
 quarter of the 4B budget, so the same query needs more forward passes
-and re-reads a 7.6`\times` larger weight set more often.
+and re-reads a 7.6$\times$ larger weight set more often.
 
-`P_A` sums the Q, K, V, and output projection parameters. `P_M` sums
+$P_A$ sums the Q, K, V, and output projection parameters. $P_M$ sums
 the gate, up, and down projection parameters. Embeddings, the output
 head, norms, and activation functions are omitted.
 
-`R_\mathrm{dense}` and `R_\mathrm{attn}` are the H100 datasheet peaks
+$R_\mathrm{dense}$ and $R_\mathrm{attn}$ are the H100 datasheet peaks
 divided by 2, because the datasheet quotes 2:1 structured sparsity
 and we run dense. Projections use FP8; attention uses BF16
 (FlashAttention-3 over BF16 KV). The two precisions have different
@@ -60,19 +60,19 @@ peak rates.
 ## KV reuse rule
 
 Every document has a **prefix**: the shared preamble `p` plus the
-document text `d_i`. In this model, a document's prefix KV is
+document text $d_i$. In this model, a document's prefix KV is
 computed once and stays resident for the rest of the query.
 
 A filter appends its question tokens and removes the question KV
-after reading the answer. A join appends an anchor frame `f_a`
+after reading the answer. A join appends an anchor frame $f_a$
 (containing the anchor label and complete question). The frame stays
 resident during the join stage. Each join tuple then appends a
-partner suffix `u_b` (partner label, partner document, answer cue).
+partner suffix $u_b$ (partner label, partner document, answer cue).
 The suffix KV is used once and removed. See
 [executor/pack.py](https://github.com/fsdatalab/quail/blob/main/quail/executor/pack.py).
 
 In the equations below, KV reuse appears as the difference between
-the stage 1 token count (which includes `d_i`) and the stage `s > 1`
+the stage 1 token count (which includes $d_i$) and the stage `s > 1`
 token count (which does not).
 
 ## Counting the work
@@ -86,99 +86,99 @@ per layer, KV rows written, and KV rows read.
 **Stage 1** processes every document from scratch:
 
 
-```
+$$
 \mathrm{tokens} = \sum_{i \in A_1} (p + d_i + q_1)
-```
+$$
 
 
 
-```
+$$
 \mathrm{pairs} = \sum_{i \in A_1} T(p + d_i + q_1)
-```
+$$
 
 
 
-```
+$$
 \mathrm{kvw} = \mathrm{tokens}, \quad \mathrm{kvr} = 0
-```
+$$
 
 
 **Stage `s > 1`** reuses the document prefix KV:
 
 
-```
+$$
 \mathrm{tokens} = |A_s| \cdot q_s
-```
+$$
 
 
 
-```
+$$
 \mathrm{pairs} = \sum_{i \in A_s} \bigl[ q_s \cdot (p + d_i) + T(q_s) \bigr]
-```
+$$
 
 
 
-```
+$$
 \mathrm{kvw} = \mathrm{tokens}, \quad \mathrm{kvr} = \sum_{i \in A_s} (p + d_i)
-```
+$$
 
 
-This is KV reuse. In stage 1, the token count includes `d_i`. In
-stage `s > 1`, it does not — only the question tokens `q_s` are
-fresh. In the pairs count, `d_i` appears only as the width of a
-rectangle (`q_s` new tokens attending over the resident prefix).
+This is KV reuse. In stage 1, the token count includes $d_i$. In
+stage `s > 1`, it does not — only the question tokens $q_s$ are
+fresh. In the pairs count, $d_i$ appears only as the width of a
+rectangle ($q_s$ new tokens attending over the resident prefix).
 Without reuse, stage `s > 1` would repeat the full scan: `p + d_i +
 q_s` tokens and `T(p + d_i + q_s)` pairs.
 
 **Example.** Over 5,000 IMDB reviews, F4 followed by F1 totals
 1,791,351 tokens. The F4 scan accounts for 1,729,233 tokens. F4
-leaves 1,218 documents, so F1 adds `1{,}218 \times 51 = 62{,}118`
+leaves 1,218 documents, so F1 adds $1{,}218 \times 51 = 62{,}118$
 fresh tokens. Rescanning those documents would also recompute their
 prefix tokens.
 
 The SoL calculation uses ground-truth labels to determine the exact
-set `A_s` at each stage, because the surviving document lengths
+set $A_s$ at each stage, because the surviving document lengths
 affect the attention pair count.
 
 ### Joins
 
 One side is the **anchor**. Its prefix KV stays resident while every
-partner's suffix is evaluated against it. The anchor frame is `f_a`
-tokens (anchor label + question). Each tuple suffix is `u_b` tokens
+partner's suffix is evaluated against it. The anchor frame is $f_a$
+tokens (anchor label + question). Each tuple suffix is $u_b$ tokens
 (partner label + partner document + answer cue).
 
 **Per anchor, when no filter ran on that side** (prefix computed
 here):
 
 
-```
+$$
 \mathrm{tokens} \mathrel{+}= p + d_a + f_a, \quad
 \mathrm{pairs} \mathrel{+}= T(p + d_a + f_a)
-```
+$$
 
 
 **Per anchor, when a filter already computed the prefix** (only the
 frame is new):
 
 
-```
+$$
 \mathrm{tokens} \mathrel{+}= f_a, \quad
 \mathrm{pairs} \mathrel{+}= f_a \cdot (p + d_a) + T(f_a), \quad
 \mathrm{kvr} \mathrel{+}= p + d_a
-```
+$$
 
 
 **Per (anchor, partner) tuple:**
 
 
-```
+$$
 \mathrm{tokens} \mathrel{+}= u_b, \quad
 \mathrm{pairs} \mathrel{+}= u_b \cdot (p + d_a + f_a) + T(u_b)
-```
+$$
 
 
 **KV write** equals all fresh tokens above. **KV read** per anchor
-(before its partner stream) adds `p + d_a + f_a`.
+(before its partner stream) adds $p + d_a + f_a$.
 
 Each tuple follows the same pattern as filter stage `s > 1`: a
 rectangle over the resident context plus a triangle over the new
@@ -213,50 +213,50 @@ quantities (tokens, pairs, KV writes, KV reads).
 The forward pass count is:
 
 
-```
+$$
 \mathrm{passes} = \left\lceil \frac{\mathrm{tokens}}{C} \right\rceil
-```
+$$
 
 
 Each model component contributes the larger of its compute time and
 its memory time:
 
 
-```
+$$
 T_A = \max\!\left(\frac{2 \, P_A \cdot \mathrm{tokens}}{R_\mathrm{dense}},\;
 \frac{P_A \cdot b_w \cdot \mathrm{passes}}{\mathrm{BW}}\right)
-```
+$$
 
 
 
-```
+$$
 T_M = \max\!\left(\frac{2 \, P_M \cdot \mathrm{tokens}}{R_\mathrm{dense}},\;
 \frac{P_M \cdot b_w \cdot \mathrm{passes}}{\mathrm{BW}}\right)
-```
+$$
 
 
 
-```
+$$
 T_\mathrm{attn} = \max\!\left(
 \frac{4 \, n_q \cdot d_\mathrm{head} \cdot L \cdot \mathrm{pairs}}{R_\mathrm{attn}},\;
 \frac{\kappa \cdot (\mathrm{kvw} + \mathrm{kvr})}{\mathrm{BW}}\right)
-```
+$$
 
 
 
-```
+$$
 \mathrm{SoL} = T_A + T_M + T_\mathrm{attn}
-```
+$$
 
 
 The factor of 2 in the projection terms counts one multiply and one
-add per parameter per token. The factor `4 \, n_q \cdot d_\mathrm{head}`
+add per parameter per token. The factor $4 \, n_q \cdot d_\mathrm{head}$
 per attention pair per layer accounts for the QK dot product
-(`2 \, d_\mathrm{head}` FLOPs) and the value weighting
-(`2 \, d_\mathrm{head}` FLOPs), times `n_q` heads. At 4B that is
+($2 \, d_\mathrm{head}$ FLOPs) and the value weighting
+($2 \, d_\mathrm{head}$ FLOPs), times $n_q$ heads. At 4B that is
 16,384 FLOPs per pair per layer.
 
-The `\max` within each component allows compute and memory to
+The $\max$ within each component allows compute and memory to
 overlap. The components are summed because they run in sequence.
 
 All query work is aggregated before computing the forward pass count.
@@ -266,21 +266,21 @@ Each component reads its weights once per ideal forward pass.
 ### Derived metrics
 
 
-```
+$$
 \mathrm{GPU cost} = \frac{\mathrm{SoL}}{3600} \times \mathrm{H100 price per hour}
-```
+$$
 
 
 
-```
+$$
 \mathrm{filter throughput} = \frac{\mathrm{input documents}}{\mathrm{SoL}}
-```
+$$
 
 
 
-```
+$$
 \mathrm{join throughput} = \frac{\sum \mathrm{evaluated pairs across join stages}}{\mathrm{SoL}}
-```
+$$
 
 
 These are the SoL values of these metrics. They are not measured
@@ -302,17 +302,17 @@ implement the work counts:
 
 | Function | What it computes |
 |---|---|
-| `scan(prefix, suffix)` | Stage 1: `(\mathrm{prefix} + \mathrm{suffix})` tokens, `T(\mathrm{prefix} + \mathrm{suffix})` pairs |
-| `ask(prefix, suffix)` | Stage `s > 1`: `\mathrm{suffix}` tokens, `\mathrm{suffix} \cdot \mathrm{prefix} + T(\mathrm{suffix})` pairs |
+| `scan(prefix, suffix)` | Stage 1: $(\mathrm{prefix} + \mathrm{suffix})$ tokens, $T(\mathrm{prefix} + \mathrm{suffix})$ pairs |
+| `ask(prefix, suffix)` | Stage `s > 1`: $\mathrm{suffix}$ tokens, $\mathrm{suffix} \cdot \mathrm{prefix} + T(\mathrm{suffix})$ pairs |
 | `stream(prefix, suffixes)` | A join's tuples: `ask` per suffix, one prefix read |
 
 The public entry point is
-[`quail.speed_of_light_estimate(query, answer)`](https://github.com/fsdatalab/quail/blob/main/quail/planner/estimate.py).
+[$quail.speed_of_light_estimate(query, answer)$](https://github.com/fsdatalab/quail/blob/main/quail/planner/estimate.py).
 It takes a query and an `answer(prompt, assignment)` callable that
 returns the TRUE or FALSE label for one (prompt, row) pair. The
 estimator runs filters in the planner's order, builds exact join
 relations from the labels, and searches join plans with
-[`optimize_left_deep()`](https://github.com/fsdatalab/quail/blob/main/quail/planner/leftdeep.py).
+[$optimize_left_deep()$](https://github.com/fsdatalab/quail/blob/main/quail/planner/leftdeep.py).
 
 The estimator does not call or simulate the production planner. The
 production planner imports the same work and component equations to
@@ -327,7 +327,7 @@ separate.
   SoL does not count those extra reads.
 - KV capacity is unlimited. Every document prefix stays available.
 - Compute and memory overlap perfectly within each component (the
-  `\max` terms).
+  $\max$ terms).
 - Forward passes are packed across the entire query. Operator
   boundaries do not add weight re-reads.
 - The join search covers eager binary full left-deep plans only.
