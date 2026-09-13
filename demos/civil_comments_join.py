@@ -17,8 +17,6 @@ short suffixes on that comment's KV.
 Run on a machine with a CUDA GPU:
 
     uv run python demos/civil_comments_join.py --limit 20000
-
---parquet takes any file with the same columns instead of the download.
 """
 
 import argparse
@@ -141,13 +139,12 @@ def own_answers(result):
     return answer
 
 
-def load_comments(parquet: str | None, limit: int | None) -> pa.Table:
+def load_comments(limit: int | None) -> pa.Table:
     """Return the comments with a string id and a 0/1 rejected score."""
-    if parquet is None:
-        from huggingface_hub import hf_hub_download
-        parquet = hf_hub_download(DATASET, DATASET_FILE, repo_type="dataset",
-                                  revision=DATASET_REVISION)
-    table = pq.read_table(parquet)
+    from huggingface_hub import hf_hub_download
+    path = hf_hub_download(DATASET, DATASET_FILE, repo_type="dataset",
+                           revision=DATASET_REVISION)
+    table = pq.read_table(path)
     table = table.filter(pc.is_valid(table["comment_text"]))
     if limit is not None:
         # the file is not shuffled: its first rows are mostly toxic
@@ -171,7 +168,6 @@ def labeled_pairs(comments: pa.Table) -> set:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--parquet", help="a file with the Kaggle columns")
     parser.add_argument("--limit", type=int, help="random sample of N comments")
     parser.add_argument("--filter-only", action="store_true",
                         help="run the toxicity filter alone, without the join")
@@ -188,7 +184,7 @@ def main() -> None:
         hourly_price = MODAL_GPU_USD_PER_HOUR[args.device]
 
     t0 = time.perf_counter()
-    comments = load_comments(args.parquet, args.limit)
+    comments = load_comments(args.limit)
     n_docs = comments.num_rows
     print(f"comments: {n_docs}, loaded in {time.perf_counter() - t0:.1f} s",
           flush=True)
