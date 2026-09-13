@@ -87,7 +87,7 @@ def sess(tmp_path):
 
 
 def test_session_requires_complete_execution_config():
-    with pytest.raises(TypeError, match="required positional arguments"):
+    with pytest.raises(TypeError, match="required keyword-only arguments"):
         EngineConfig()
     with pytest.raises(TypeError, match="required positional argument: 'config'"):
         quail.Session()
