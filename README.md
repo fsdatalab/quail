@@ -9,6 +9,7 @@ AI SQL means SQL queries with predicates answered by a language model.
 - [Query plans](#query-plans)
 - [Scale factors](#scale-factors)
 - [Installation](#installation)
+- [Reading benchmark inputs](#reading-benchmark-inputs)
 - [Metrics](#metrics)
 - [Adapter interface](#adapter-interface)
   - [Input](#input)
@@ -122,6 +123,45 @@ Python 3.12.
 ```sh
 uv add "quail-b @ git+https://github.com/fsdatalab/quail-bench.git"
 ```
+
+## Reading benchmark inputs
+
+Reading a query definition does not download a corpus:
+
+```python
+import quail_b
+
+query = quail_b.get_query("IMDB-4")
+print(query.id, query.description)
+plan = query.plan
+```
+
+Load the input tables for one query with `load_benchmark`. Set
+`accuracy=False` when reference answers are not needed:
+
+```python
+benchmark = quail_b.load_benchmark(
+    "IMDB-4",
+    scale_factor=0.1,
+    accuracy=False,
+)
+
+query = benchmark.queries[0]
+reviews = benchmark.tables["reviews"]
+aspects = benchmark.tables["aspects"]
+print(benchmark.corpus_id)
+```
+
+To load one published table without selecting a query:
+
+```python
+reviews = quail_b.load_table("reviews", scale_factor=0.1)
+```
+
+`load_benchmark` loads reference answers by default. Its
+`ground_truth` field then contains the selected reference collection.
+The [data access and memory](#data-access-and-memory) section describes
+downloads, caching, local data, and memory requirements.
 
 ## Metrics
 
