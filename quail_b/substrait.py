@@ -124,7 +124,7 @@ def _metadata(kind: str, **values) -> extensions_pb2.AdvancedExtension:
     metadata = struct_pb2.Struct()
     metadata.update({"kind": kind, **values})
     extension = extensions_pb2.AdvancedExtension()
-    extension.optimization.add().Pack(metadata)
+    extension.optimization.add().Pack(metadata, deterministic=True)
     return extension
 
 
