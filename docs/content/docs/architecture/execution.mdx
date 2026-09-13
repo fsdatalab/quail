@@ -26,41 +26,92 @@ token budget and a KV page budget.
 - **Pipelining.** A document that passes one predicate enters the
   next forward pass with its next predicate immediately. It does not
   wait for every other document to finish the current predicate.
-- **Token-based admission.** A forward pass is full when either the
-  token budget or the arena's free pages are exhausted. There is no
-  fixed request count.
-- **KV rewind.** After a document passes a predicate, its KV stays
-  in the GPU arena. The next predicate adds only the new question
-  tokens on top of the existing document KV. Pages are freed when a
-  document fails a predicate or finishes its last one.
+- **Token-based admission.** The engine packs documents into each
+  forward pass until the token budget or the KV page budget is full
+  (the token budget is the bottleneck for queries with many short
+  documents; the KV page budget is the bottleneck for queries with
+  fewer long documents). A forward pass with short documents fits
+  more documents than a forward pass with long documents.
+- **KV rewind.** Each predicate appends question tokens after the
+  document. Once the model answers, Quail drops the KV for the
+  question tokens and keeps only the KV for the document prefix.
+  The next predicate reuses the document prefix KV and appends its
+  own question tokens. A document that fails (returns FALSE) or
+  won't be used again in the query has all its KV freed.
 
 ## Join execution
 
-A join evaluates one anchor document against multiple partner
-documents. All partners in one forward pass share the anchor's KV
-through paged cross-attention.
+Recall from [Planning](/docs/architecture/planning#deciding-join-order-and-anchors)
+that the planner picks one side of a join as the *anchor* (the table
+with longer documents, whose KV stays in GPU memory) and the other
+as the *partner* (the table whose documents stream past). During
+execution, Quail processes each anchor document once, keeps its KV
+in the GPU arena, and then evaluates the join prompt for each
+partner by appending only the partner's tokens to the anchor's
+resident KV. Multiple partners fit in the same forward pass, all
+sharing one anchor's KV.
 
-- **Streaming from filters.** The first join group does not wait for
-  its anchor filter to finish. Each document that passes its last
-  filter predicate keeps its KV pinned and enters the join
-  immediately.
-- **Gating.** Between join stages, anchors with no passing pair are
-  dropped and their KV pages freed.
-- **KV retention across joins.** When a query has multiple join
-  groups, the engine retains document KV from earlier groups for use
-  as anchors in later groups. If KV was evicted because of capacity
-  limits, the document is reprocessed.
+- **Streaming from filters.** A document that passes its last filter
+  predicate does not wait for the filter to finish over all
+  documents. Quail keeps the document's KV pinned and starts
+  evaluating join partners against it right away.
+- **Gating.** After evaluating all partners for a group of anchors,
+  Quail drops any anchor that matched no partner and frees its KV.
+- **KV retention across joins.** When a query has multiple joins in
+  sequence, Quail keeps anchor document KV from earlier joins so it
+  can be reused in later joins without reprocessing. If GPU memory
+  runs out, Quail evicts the least valuable KV and reprocesses the
+  document later.
+
+## Model forward pass
+
+Quail loads the model using
+[vLLM's weight loader](https://github.com/fsdatalab/quail/blob/main/quail/executor/model.py),
+which handles checkpoint download, weight merging (QKV and gate-up
+projections), and FP8 quantization layout for DeepGEMM. No vLLM
+engine, scheduler, or KV pool is used — Quail uses vLLM only as a
+library for loading weights and running GPU kernels.
+
+Each forward pass processes a packed chunk of tokens through every
+model layer. For each layer:
+
+1. **RMSNorm + FP8 quantize** the input hidden state.
+2. **QKV projection** via DeepGEMM (FP8 matrix multiply).
+3. **QK-norm and RoPE** to produce query and key vectors.
+4. **Attention** over the new tokens and any resident KV in the
+   arena. Filters use a single causal paged attention call. Joins
+   use two calls (one for self-attention among new tokens, one for
+   cross-attention into the anchor's KV) merged with a fused
+   log-sum-exp kernel.
+5. **Output projection** via DeepGEMM.
+6. **MLP** (gate-up projection, SiLU activation, down projection),
+   each step fused with quantization where possible.
+
+After the final layer, Quail does not score every token in the
+vocabulary. Instead, it keeps only the weight rows for TRUE and
+FALSE token IDs, discarding the rest of the output head at load
+time. The answer for each predicate is whichever of TRUE or FALSE
+has the higher score.
+
+Quail uses [FlashAttention 3](https://arxiv.org/abs/2407.08608) on
+H100 (SM90) and FlashAttention 2 on Blackwell (SM120).
 
 ## Multiple GPUs
 
-With multiple GPUs, each GPU has its own CUDA context and KV arena.
-A coordinator process distributes work over pipes.
+When a session uses multiple GPUs (e.g., `gpus=4`), each GPU loads
+its own copy of the model and has its own KV arena. A coordinator
+CPU process divides the work and collects results.
 
-- **Filters**: each GPU filters its own shard of documents.
-- **Joins**: anchors stay on the GPU that filtered them. Every GPU
-  receives every surviving partner document.
-- **Between join groups**: the coordinator prunes survivors and
-  re-partitions the next anchor's documents.
+- **Filters**: the coordinator splits the documents across GPUs by
+  token length, so each GPU processes a roughly equal amount of
+  work. Each GPU runs the filter independently on its shard.
+- **Joins**: each anchor document stays on the GPU that filtered it
+  (so its KV is already resident). The coordinator sends all
+  surviving partner documents to every GPU, so each GPU can evaluate
+  its anchors against all partners.
+- **Between join groups**: the coordinator collects the results from
+  all GPUs, drops documents that matched no partner, and
+  redistributes the next join group's anchor documents across GPUs.
 
 ## GPU code
 
