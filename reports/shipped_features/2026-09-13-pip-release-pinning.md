@@ -23,8 +23,9 @@ only exact direct requirements.
 
 The lock check resolved 234 packages without changing the lock. Ruff, the
 long-string check, and Vulture passed. `uv build` produced the sdist and wheel,
-and Twine accepted both. The wheel contains 75 files and lists all nine
-platform-specific direct requirements with exact versions.
+named `quail_engine-0.1.0`, and Twine accepted both. The wheel contains 75
+files and lists all nine platform-specific direct requirements with exact
+versions.
 
 The CPU tests could not start in this environment. Dependency setup could not
 read the private `fsdatalab/quail-bench` repository. CI has the separate
