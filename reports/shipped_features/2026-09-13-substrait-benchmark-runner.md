@@ -48,10 +48,26 @@ contract asks for.
   keys. `ensure_data` finds a query's tables through `read_plan`.
 - `reports/make_quailb_eval_plots.py` is deleted: no note referenced
   it, and it read a result format no runner writes.
-- The SoL script, the comparison plot script, and the shared KV
-  retention scorer read query structure from `read_plan`; the scorer
-  keys the saved FEV-9 answers by operator id. Experiments call
-  `register_tables`.
+- Three one-off comparison cells are deleted:
+  `experiments/cells/fixed_join_plan.py`, `shared_kv_retention.py`, and
+  `join_continuous_batching.py`. Each ran a baseline checkout against the
+  current one for a past note and saved answer tables in the old
+  alias-and-position format. `reports/score_shared_kv_retention.py`,
+  which read that format, goes with them. The notes they produced keep
+  their numbers and volume paths and now name the commit the scripts
+  live at in the history.
+- `reports/make_quailb_comparison_plots.py` no longer reads the saved
+  September 5 suite (the runner's format before quail-bench). That
+  path filled pipelined vLLM's FEV-1 to FEV-9, which the September 12
+  run's FEVER container did not produce. Those 9 of 99 cells are now
+  marked missing: an x below the axis in the plots and a "not run" row
+  in the tables. The "Quail before and after this branch" section,
+  which existed only through that suite, is gone with it.
+  `reports/quailb-comparison.md`, `plots/quailb_main.pdf`, and
+  `plots/quailb_fev.pdf` are regenerated from the same volume files;
+  the other dataset figures do not change.
+- The SoL script and the comparison plot script read query structure
+  from `read_plan`. Experiments call `register_tables`.
 
 ## Checks
 

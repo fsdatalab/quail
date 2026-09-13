@@ -10,15 +10,15 @@
   pipeline their requests.
 - Quail, stock vLLM, and pipelined vLLM were run on September 12, 2026: `/results/benchmarks/quailb/family-runs/20260912T225100Z-902686c5/`,
   function calls `fc-01M2BX2FQ0S11V5Q5WDBGC865R`, `fc-01M2BX3KM90P4D4ME4SFDXB88Z`, `fc-01M2BX3KR9EZXZ3HW43XWNJT7N`, `fc-01M2BX3KX1ENZPPV61RRCMN7TG`, `fc-01M2BX3M38FRY6FE2PAGGS2WD2`, `fc-01M2BX3M80WJDF3HDE9PYB903D`.
-  11 of the 99 cells come from earlier runs, because that
-  run's FEVER container failed on FEV-10 in the request backends (an
-  equality join's key columns were not passed to them; fixed on this
-  branch) and was not rerun. From the saved September 5 suite (FEV-9 from its
-  September 6 rerun), with no answer tables and so no recomputed KV
-  figure: Pipelined vLLM FEV-1, FEV-2, FEV-3, FEV-4, FEV-5, FEV-6, FEV-7, FEV-8, FEV-9. From the September 11 FEV-10 run
-  (`/results/benchmarks/quailb/family-runs/20260911T201441Z-d16f87d8/`),
-  with recomputed KV: Stock vLLM FEV-10; Pipelined vLLM FEV-10.
-- Quail was faster than stock vLLM on 31 of 33 queries.
+  That run's FEVER container failed on FEV-10 in the request backends (an
+  equality join's key columns were not passed to them; fixed since) and
+  was not rerun. 2 of the 99 cells come from the September 11
+  FEV-10 run (`/results/benchmarks/quailb/family-runs/20260911T201441Z-d16f87d8/`): Pipelined vLLM FEV-10; Stock vLLM FEV-10.
+  9 cells have no measurement and are marked missing, in the
+  plots by an x below the axis and in the tables by a row that says so:
+  Pipelined vLLM FEV-1, FEV-2, FEV-3, FEV-4, FEV-5, FEV-6, FEV-7, FEV-8, FEV-9.
+- Quail was faster than stock vLLM on 31 of 33 queries
+  where both were measured.
 - A horizontal line across each query's bar group shows its SoL estimate.
   SoL models ideal computation and memory traffic with unlimited prefix KV.
   It credits matching token prefixes across requests, documents, and aliases.
@@ -181,39 +181,39 @@ Figure: plots/quailb_fev.pdf
 |---|---|---:|---:|---:|---:|---|---:|---:|---:|---:|---|
 | FEV-1 | Quail | 0.30 | 1,359 | 33,331 | 1,666.67 | docs/s | 0.00033 | 85.00 | 80.609 | 98.311 | September 12 |
 | FEV-1 | Stock vLLM | 0.48 | 1,359 | 33,331 | 1,041.67 | docs/s | 0.00053 | 84.00 | 78.877 | 99.662 | September 12 |
-| FEV-1 | Pipelined vLLM | 0.41 | Not measured | 33,331 | 1,219.51 | docs/s | 0.00045 | 84.00 | 78.877 | 99.662 | saved suite |
+| FEV-1 | Pipelined vLLM | missing | | | | | | | | | not run |
 | FEV-1 | SoL estimate | 0.121 | 0 (assumed) | 32,498 | 4,139.22 | docs/s | 0.00013 | Not measured | Not measured | Not measured | estimate |
 | FEV-2 | Quail | 28.87 | 963,563 | 3,245,254 | 4,970.56 | pairs/s | 0.03167 | 82.58 | 1.1787 | 95.82 | September 12 |
 | FEV-2 | Stock vLLM | 66.26 | 1,068,922 | 3,350,613 | 2,165.71 | pairs/s | 0.07269 | 82.31 | 1.1645 | 96.141 | September 12 |
-| FEV-2 | Pipelined vLLM | 70.02 | Not measured | 3,350,613 | 2,049.41 | pairs/s | 0.07681 | 82.31 | 1.1645 | 96.141 | saved suite |
+| FEV-2 | Pipelined vLLM | missing | | | | | | | | | not run |
 | FEV-2 | SoL estimate | 12.845 | 0 (assumed) | 3,244,940 | 11,171.71 | pairs/s | 0.01409 | Not measured | Not measured | Not measured | estimate |
 | FEV-3 | Quail | 21.40 | 689,396 | 2,404,957 | 4,841.45 | pairs/s | 0.02348 | 81.20 | 0.89349 | 95.135 | September 12 |
 | FEV-3 | Stock vLLM | 45.44 | 801,721 | 2,562,915 | 2,362.19 | pairs/s | 0.04985 | 80.63 | 0.85189 | 96.757 | September 12 |
-| FEV-3 | Pipelined vLLM | 55.74 | Not measured | 2,562,915 | 1,925.69 | pairs/s | 0.06115 | 80.63 | 0.85189 | 96.757 | saved suite |
+| FEV-3 | Pipelined vLLM | missing | | | | | | | | | not run |
 | FEV-3 | SoL estimate | 7.943 | 0 (assumed) | 2,010,333 | 10,694.58 | pairs/s | 0.00871 | Not measured | Not measured | Not measured | estimate |
 | FEV-4 | Quail | 4.72 | 82,965 | 531,453 | 2,857.84 | pairs/s | 0.00518 | 89.31 | 0.73677 | 78.571 | September 12 |
 | FEV-4 | Stock vLLM | 6.43 | 110,913 | 575,830 | 2,276.36 | pairs/s | 0.00705 | 90.50 | 0.76655 | 78.571 | September 12 |
-| FEV-4 | Pipelined vLLM | 8.03 | Not measured | 575,830 | 1,822.79 | pairs/s | 0.00881 | 90.50 | 0.76655 | 78.571 | saved suite |
+| FEV-4 | Pipelined vLLM | missing | | | | | | | | | not run |
 | FEV-4 | SoL estimate | 1.868 | 0 (assumed) | 477,123 | 5,991.95 | pairs/s | 0.00205 | Not measured | Not measured | Not measured | estimate |
 | FEV-5 | Quail | 13.43 | 411,979 | 1,515,283 | 4,596.50 | pairs/s | 0.01473 | 79.57 | 1.0522 | 96.429 | September 12 |
 | FEV-5 | Stock vLLM | 28.35 | 521,243 | 1,657,324 | 2,269.07 | pairs/s | 0.03110 | 79.01 | 0.99111 | 97.143 | September 12 |
-| FEV-5 | Pipelined vLLM | 31.73 | Not measured | 1,657,324 | 2,027.36 | pairs/s | 0.03481 | 79.01 | 0.99111 | 97.143 | saved suite |
+| FEV-5 | Pipelined vLLM | missing | | | | | | | | | not run |
 | FEV-5 | SoL estimate | 4.743 | 0 (assumed) | 1,202,271 | 9,923.87 | pairs/s | 0.00520 | Not measured | Not measured | Not measured | estimate |
 | FEV-6 | Quail | 3.53 | 50,656 | 398,331 | 2,276.77 | pairs/s | 0.00387 | 88.44 | 0.998 | 76.923 | September 12 |
 | FEV-6 | Stock vLLM | 5.74 | 68,025 | 426,594 | 1,528.22 | pairs/s | 0.00630 | 89.54 | 1.0215 | 76.923 | September 12 |
-| FEV-6 | Pipelined vLLM | 6.27 | Not measured | 426,594 | 1,399.04 | pairs/s | 0.00688 | 89.54 | 1.0215 | 76.923 | saved suite |
+| FEV-6 | Pipelined vLLM | missing | | | | | | | | | not run |
 | FEV-6 | SoL estimate | 1.375 | 0 (assumed) | 352,709 | 4,510.24 | pairs/s | 0.00151 | Not measured | Not measured | Not measured | estimate |
 | FEV-7 | Quail | 54.39 | 1,935,777 | 6,103,058 | 4,944.27 | pairs/s | 0.05967 | 64.66 | 0.00029045 | 15.652 | September 12 |
 | FEV-7 | Stock vLLM | 113.21 | 2,095,237 | 6,255,630 | 2,372.86 | pairs/s | 0.12419 | 63.95 | 0.0003172 | 17.391 | September 12 |
-| FEV-7 | Pipelined vLLM | 135.77 | Not measured | 6,255,630 | 1,978.58 | pairs/s | 0.14894 | 63.95 | 0.0003172 | 17.391 | saved suite |
+| FEV-7 | Pipelined vLLM | missing | | | | | | | | | not run |
 | FEV-7 | SoL estimate | 15.072 | 0 (assumed) | 3,807,384 | 11,082.38 | pairs/s | 0.01653 | Not measured | Not measured | Not measured | estimate |
 | FEV-8 | Quail | 84.49 | 5,046,570 | 9,476,743 | 5,017.15 | pairs/s | 0.09269 | 71.36 | 3.5365e-06 | 13.986 | September 12 |
 | FEV-8 | Stock vLLM | 181.54 | 5,450,894 | 9,881,067 | 2,338.18 | pairs/s | 0.19915 | 70.80 | 4.6155e-06 | 18.881 | September 12 |
-| FEV-8 | Pipelined vLLM | 201.38 | Not measured | 9,881,067 | 2,107.82 | pairs/s | 0.22091 | 70.80 | 4.6155e-06 | 18.881 | saved suite |
+| FEV-8 | Pipelined vLLM | missing | | | | | | | | | not run |
 | FEV-8 | SoL estimate | 19.139 | 0 (assumed) | 4,818,015 | 11,157.11 | pairs/s | 0.02100 | Not measured | Not measured | Not measured | estimate |
 | FEV-9 | Quail | 38.23 | 2,279,522 | 4,306,910 | 4,763.67 | pairs/s | 0.04194 | 67.77 | 3.3382e-06 | 45.455 | September 12 |
 | FEV-9 | Stock vLLM | 82.41 | 2,499,983 | 4,592,900 | 2,304.19 | pairs/s | 0.09040 | 67.05 | 2.9055e-06 | 45.455 | September 12 |
-| FEV-9 | Pipelined vLLM | 89.80 | Not measured | 4,593,156 | 2,114.57 | pairs/s | 0.09851 | 67.05 | 2.9055e-06 | 45.455 | saved suite |
+| FEV-9 | Pipelined vLLM | missing | | | | | | | | | not run |
 | FEV-9 | SoL estimate | 5.821 | 0 (assumed) | 1,474,838 | 9,857.99 | pairs/s | 0.00639 | Not measured | Not measured | Not measured | estimate |
 | FEV-10 | Quail | 1.65 | 2,927 | 187,567 | 112.12 | pairs/s | 0.00181 | 89.09 | 82.759 | 96.774 | September 12 |
 | FEV-10 | Stock vLLM | 2.97 | 4,308 | 270,220 | 63.30 | pairs/s | 0.00326 | 86.67 | 73.78 | 97.581 | FEV-10 run |
@@ -293,50 +293,3 @@ Figure: plots/quailb_agent.pdf
 | AGENT-2 | Stock vLLM | 103.35 | 23,928 | 5,569,417 | 17.15 | docs/s | 0.11337 | 93.57 | 83.099 | 98.883 | September 12 |
 | AGENT-2 | Pipelined vLLM | 100.05 | 23,928 | 5,569,417 | 17.71 | docs/s | 0.10975 | 93.57 | 83.099 | 98.883 | September 12 |
 | AGENT-2 | SoL estimate | 47.870 | 0 (assumed) | 5,545,489 | 37.02 | docs/s | 0.05251 | Not measured | Not measured | Not measured | estimate |
-
-## Quail before and after this branch
-
-Time before is the saved Quail suite (September 5, FEV-9 from September
-6); time after is the September 12 run. Recomputed KV before comes from
-the ablation cells that ran the `main` engine on the six queries whose
-join anchors it recomputed (`/results/ablations/streamed-filter-join-*`),
-computed by quail-bench from their saved answer tables; the other
-queries make the same requests with the same fresh tokens before and
-after, so their recomputed KV is the same number. FEV-10 did not exist
-before the branch.
-
-| Query | Time before, s | Time after, s | Change | Recomputed KV before | Recomputed KV after | Fresh before | Fresh after | Rows before / after |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| IMDB-1 | 14.25 | 14.43 | +1.3% | 20,349 | 20,349 | 1,759,232 | 1,759,232 | 4,380 / 4,380 |
-| IMDB-2 | 21.29 | 21.25 | -0.2% | 405,349 | 405,349 | 2,419,232 | 2,419,232 | 10,602 / 10,602 |
-| IMDB-3 | 32.35 | 22.64 | -30.0% | 1,579,160 | 361,989 | 3,777,943 | 2,560,772 | 9,650 / 9,650 |
-| IMDB-4 | 19.99 | 17.38 | -13.1% | 479,784 | 118,395 | 2,365,565 | 2,004,176 | 3,176 / 3,176 |
-| IMDB-5 | 17.76 | 16.64 | -6.3% | 266,213 | 77,818 | 2,118,038 | 1,929,643 | 2,076 / 2,076 |
-| IMDB-6 | 14.62 | 14.96 | +2.3% | 20,349 | 20,349 | 1,774,145 | 1,774,145 | 1,257 / 1,257 |
-| IMDB-7 | 14.81 | 15.23 | +2.8% | 21,112 | 21,112 | 1,796,602 | 1,796,602 | 727 / 727 |
-| IMDB-8 | 26.54 | 26.09 | -1.7% | 680,845 | 680,845 | 2,918,999 | 2,918,999 | 62,777 / 62,777 |
-| IMDB-9 | 47.61 | 47.45 | -0.3% | 2,914,348 | 2,914,348 | 5,338,231 | 5,338,231 | 71,374,780 / 71,374,780 |
-| IMDB-10 | 59.71 | 48.58 | -18.6% | 4,072,039 | 2,854,868 | 6,696,942 | 5,479,771 | 64,840,220 / 64,840,220 |
-| BIO-1 | 21.64 | 21.52 | -0.6% | 2,477 | 2,477 | 2,057,345 | 2,057,345 | 274 / 274 |
-| BIO-2 | 129.38 | 127.75 | -1.3% | 4,148,977 | 4,148,977 | 10,374,345 | 10,374,345 | 116,156 / 116,156 |
-| BIO-3 | 89.92 | 79.96 | -11.1% | 3,194,945 | 2,275,033 | 7,547,851 | 6,627,939 | 61,447 / 61,447 |
-| FEV-1 | 0.28 | 0.30 | +7.1% | 1,359 | 1,359 | 33,331 | 33,331 | 361 / 361 |
-| FEV-2 | 28.46 | 28.87 | +1.4% | 963,563 | 963,563 | 3,245,254 | 3,245,254 | 25,283 / 25,283 |
-| FEV-3 | 21.06 | 21.40 | +1.6% | 689,396 | 689,396 | 2,404,957 | 2,404,957 | 19,698 / 19,698 |
-| FEV-4 | 4.66 | 4.72 | +1.3% | 82,965 | 82,965 | 531,453 | 531,453 | 1,493 / 1,493 |
-| FEV-5 | 13.35 | 13.43 | +0.6% | 411,979 | 411,979 | 1,515,283 | 1,515,283 | 12,830 / 12,830 |
-| FEV-6 | 3.56 | 3.53 | -0.8% | 50,656 | 50,656 | 398,331 | 398,331 | 1,002 / 1,002 |
-| FEV-7 | 53.46 | 54.39 | +1.7% | 1,935,777 | 1,935,777 | 6,103,058 | 6,103,058 | 6,197,246 / 6,197,246 |
-| FEV-8 | 83.11 | 84.49 | +1.7% | 5,046,570 | 5,046,570 | 9,476,743 | 9,476,743 | 565,523,363 / 565,523,363 |
-| FEV-9 | 41.14 | 38.23 | -7.1% | 2,286,831 | 2,279,522 | 4,314,219 | 4,306,910 | 149,783,486 / 149,783,486 |
-| FEV-10 | new | 1.65 | | | 2,927 | | 187,567 | / 145 |
-| LEP-1 | 1.08 | 1.10 | +1.9% | 1,702 | 1,702 | 131,947 | 131,947 | 356 / 356 |
-| LEP-2 | 129.36 | 130.39 | +0.8% | 1,562,202 | 1,562,202 | 15,098,947 | 15,098,947 | 117,205 / 117,205 |
-| LEP-3 | 92.51 | 93.40 | +1.0% | 1,113,134 | 1,113,134 | 10,807,675 | 10,807,675 | 86,234 / 86,234 |
-| LEP-4 | 39.53 | 39.92 | +1.0% | 470,002 | 470,002 | 4,640,471 | 4,640,471 | 43,073 / 43,073 |
-| LEP-5 | 24.83 | 25.76 | +3.7% | 288,926 | 288,926 | 2,904,378 | 2,904,378 | 27,161 / 27,161 |
-| LEP-6 | 9.02 | 9.39 | +4.1% | 95,362 | 95,362 | 1,048,442 | 1,048,442 | 9,877 / 9,877 |
-| LEP-7 | 38.79 | 39.14 | +0.9% | 456,870 | 456,870 | 4,556,127 | 4,556,127 | 42,201 / 42,201 |
-| LEP-8 | 1.34 | 1.34 | +0.0% | 1,702 | 1,702 | 148,802 | 148,802 | 30 / 30 |
-| AGENT-1 | 240.49 | 237.65 | -1.2% | 11,886,152 | 11,886,152 | 17,389,113 | 17,389,113 | 344 / 344 |
-| AGENT-2 | 241.20 | 239.15 | -0.8% | 11,886,152 | 11,886,152 | 17,431,641 | 17,431,641 | 635 / 635 |

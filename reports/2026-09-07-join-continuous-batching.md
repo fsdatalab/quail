@@ -39,8 +39,9 @@ Figure: plots/join_continuous_batching.png
   - FEV-9: four filters, then a two-stage node and a single-stage node on
     171 filtered evidence anchors, with 287 of 342 anchor prefixes served
     from retained filter KV. One group per node, one gate.
-- Cell: `experiments/cells/join_continuous_batching.py`. Modal function
-  call `fc-01M1Y8JS68JN8NW1TJ0QVFET8C`. Results, answer tables, and the
+- Cell: `experiments/cells/join_continuous_batching.py`, removed on
+  September 13, 2026 and in the history at commit `5c78938`. Modal
+  function call `fc-01M1Y8JS68JN8NW1TJ0QVFET8C`. Results, answer tables, and the
   prediction as stated before the run are on `quail-results` at
   `/results/ablations/join-continuous-batching-20260907T154300Z/`.
 
