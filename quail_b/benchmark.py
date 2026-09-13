@@ -84,9 +84,12 @@ def load_benchmark(only=None, *, scale_factor=0.1, data_dir=None,
             raise ValueError(f"{name} does not match published corpus {corpus_id}")
     truth = None
     if accuracy:
+        # only the label sets the selected queries score against
         truth = load_ground_truth(
             root, scale_factor=scale_factor, corpus_id=corpus_id,
-            collection_id=collection_id)
+            collection_id=collection_id, templates={
+                operator.prompt for spec in specs
+                for operator in spec._info.operators})
         if collection_id is not None and truth.collection_id != collection_id:
             raise ValueError("ground truth has the wrong collection ID")
         if truth.corpus_id != corpus_id or truth.scale_factor != scale_factor:

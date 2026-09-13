@@ -12,20 +12,80 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from dataclasses import dataclass
+from functools import cached_property
 
+import pyarrow as pa
+import pyarrow.compute as pc
 from pyarrow import parquet as pq
 
 from quail_b._files import _list_files, _read_bytes
 from quail_b.data import GROUND_TRUTH_ROOT, _full_hash
 
+LABEL_COLUMNS = ("left_id", "right_id", "answer")
 
-@dataclass(frozen=True)
+
+def _answer_table(answers) -> pa.Table:
+    """Return labels as a table of left_id, right_id, and answer.
+
+    Args:
+        answers: A table with those columns, or a dict of
+            (left_id, right_id or None) -> answer.
+    """
+    if isinstance(answers, pa.Table):
+        table = answers
+    else:
+        pairs = list(answers)
+        table = pa.table({
+            "left_id": pa.array([left for left, _ in pairs], pa.string()),
+            "right_id": pa.array([right for _, right in pairs], pa.string()),
+            "answer": pa.array(list(answers.values()), pa.bool_()),
+        })
+    if table.column("left_id").null_count or table.column("answer").null_count:
+        raise ValueError("ground truth needs a left id and an answer per row")
+    return pa.table({
+        "left_id": pc.cast(table.column("left_id"), pa.string()),
+        "right_id": pc.cast(table.column("right_id"), pa.string()),
+        "answer": pc.cast(table.column("answer"), pa.bool_()),
+    })
+
+
 class PredicateLabels:
-    key: str
-    label_set_id: str
-    predicate: dict
-    answers: dict[tuple[str, str | None], bool]
-    source_rows: dict[str, int]
+    """The saved answers of one predicate over one corpus.
+
+    Attributes:
+        key: The predicate key.
+        label_set_id: The label set the answers came from.
+        predicate: The predicate as its manifest records it.
+        table: One row per labeled document or pair: `left_id`,
+            `right_id` (null for a filter), and the boolean `answer`.
+        source_rows: Rows per source the label set was built from.
+    """
+
+    def __init__(self, key: str, label_set_id: str, predicate: dict,
+                 answers, source_rows: dict[str, int]):
+        self.key = key
+        self.label_set_id = label_set_id
+        self.predicate = predicate
+        self.table = _answer_table(answers)
+        self.source_rows = source_rows
+
+    @cached_property
+    def answers(self) -> dict[tuple[str, str | None], bool]:
+        """(left_id, right_id or None) -> answer, for one lookup at a time.
+
+        Scoring joins `table` instead; this dict is built on first use
+        by callers that ask about one document or pair, such as the
+        speed of light estimate.
+        """
+        return dict(zip(
+            zip(self.table.column("left_id").to_pylist(),
+                self.table.column("right_id").to_pylist()),
+            self.table.column("answer").to_pylist()))
+
+    @property
+    def true_pairs(self) -> pa.Table:
+        """The rows answered TRUE."""
+        return self.table.filter(self.table.column("answer"))
 
     def answer(self, left_id: str, right_id: str | None = None) -> bool:
         pair = (str(left_id), None if right_id is None else str(right_id))
@@ -153,12 +213,21 @@ def _choose_collection(root, scale_factor: float,
 
 def load_ground_truth(root=None, scale_factor: float = 0.1,
                       corpus_id: str | None = None,
-                      collection_id: str | None = None
-                      ) -> GroundTruthCollection:
-    """Load labels from the public bucket or a local root directory."""
+                      collection_id: str | None = None,
+                      templates=None) -> GroundTruthCollection:
+    """Load labels from the public bucket or a local root directory.
+
+    Args:
+        root: Local directory or S3 URI, or None for the public bucket.
+        scale_factor: The corpus scale factor.
+        corpus_id: The corpus, or None for any at that scale factor.
+        collection_id: The collection, or None for the active one.
+        templates: Prompt templates whose label sets to load, or None
+            for every label set of the collection.
+    """
     _path, collection = _choose_collection(
         root, scale_factor, corpus_id, collection_id)
-    return _load_ground_truth_collection(root, collection)
+    return _load_ground_truth_collection(root, collection, templates)
 
 
 def _predicate_tables(predicate: dict) -> tuple[str, ...]:
@@ -246,8 +315,33 @@ def _validate_label_set_corpora(root, collection: dict,
                     f"{source_corpus_id} and {target_corpus_id}")
 
 
-def _load_ground_truth_collection(root, collection: dict
+def _read_label_set(parts: list[bytes], key: str, label_set_id: str,
+                    rows: int) -> pa.Table:
+    """Read one label set's Parquet parts and check them as columns."""
+    table = pa.concat_tables([
+        pq.read_table(io.BytesIO(part), columns=[
+            "predicate_key", "label_set_id", *LABEL_COLUMNS])
+        for part in parts
+    ])
+    for column, expected in (("predicate_key", key),
+                             ("label_set_id", label_set_id)):
+        mismatch = pc.fill_null(pc.not_equal(table.column(column), expected), True)
+        if pc.any(mismatch).as_py():
+            raise ValueError(
+                f"a label file of {key} has the wrong {column}")
+    table = _answer_table(table.select(list(LABEL_COLUMNS)))
+    distinct = table.group_by(["left_id", "right_id"]).aggregate([]).num_rows
+    if distinct != table.num_rows:
+        raise ValueError(f"duplicate ground truth for {key}")
+    if table.num_rows != rows:
+        raise ValueError(
+            f"{key} loaded {table.num_rows} rows, expected {rows}")
+    return table
+
+
+def _load_ground_truth_collection(root, collection: dict, templates=None
                                   ) -> GroundTruthCollection:
+    """Load a collection's label sets, or only those of some templates."""
     wanted = collection["label_sets"]
     all_paths = _list_files(root, f"{GROUND_TRUTH_ROOT}/label_sets")
     manifest_paths = {}
@@ -265,6 +359,11 @@ def _load_ground_truth_collection(root, collection: dict
         for key, path in manifest_paths.items()
     }
     _validate_label_set_corpora(root, collection, manifests)
+    if templates is not None:
+        wanted = {
+            key: label_set_id for key, label_set_id in wanted.items()
+            if manifests[key]["predicate"]["template"] in templates
+        }
     data_paths = {}
     for key, label_set_id in sorted(wanted.items()):
         manifest_path = manifest_paths[key]
@@ -288,36 +387,13 @@ def _load_ground_truth_collection(root, collection: dict
     predicates = {}
     for key, label_set_id in sorted(wanted.items()):
         manifest = manifests[key]
-        answers = {}
-        for part_path in data_paths[key]:
-            table = pq.read_table(
-                io.BytesIO(data_bytes[part_path]),
-                columns=["predicate_key", "label_set_id", "answer",
-                         "left_id", "right_id"])
-            for row in table.to_pylist():
-                if row["predicate_key"] != key:
-                    raise ValueError(
-                        f"{part_path} contains {row['predicate_key']}, "
-                        f"expected {key}")
-                if row["label_set_id"] != label_set_id:
-                    raise ValueError(
-                        f"{part_path} has the wrong label set id")
-                pair = (str(row["left_id"]),
-                        None if row["right_id"] is None
-                        else str(row["right_id"]))
-                if pair in answers:
-                    raise ValueError(
-                        f"duplicate ground truth for {key} and {pair}")
-                answers[pair] = bool(row["answer"])
-        if len(answers) != manifest["rows"]:
-            raise ValueError(
-                f"{key} loaded {len(answers)} rows, expected "
-                f"{manifest['rows']}")
         predicates[key] = PredicateLabels(
             key=key,
             label_set_id=label_set_id,
             predicate=manifest["predicate"],
-            answers=answers,
+            answers=_read_label_set(
+                [data_bytes[path] for path in data_paths[key]],
+                key, label_set_id, manifest["rows"]),
             source_rows=manifest["source_rows"],
         )
     summary = collection.get("summary", {})

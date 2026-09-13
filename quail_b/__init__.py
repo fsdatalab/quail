@@ -8,7 +8,7 @@ from quail_b.reporting import report
 from quail_b.run import run
 from quail_b.scoring import RunOutput
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "QuerySpec",

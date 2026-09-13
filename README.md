@@ -117,6 +117,7 @@ quail_b.run(
 - `output_dir`: Path to the directory where QUAIL-B writes run results (e.g. `"results/vllm-qwen3-4b"` or any custom path). Must be a new directory.
 - `queries`: List of query IDs to run. Omit `queries=` (or pass `None`) to run all 33 benchmark queries.
 - Data is downloaded from `s3://quail-bench` and cached locally in `~/.cache/quail-b`.
+- Only the reference labels of the selected queries' predicates are loaded, as Arrow tables of about 25 bytes per answer. Loading all 21 label sets at scale 0.1 (1.21 million answers) takes 1.9 s from cached files with a peak of 0.62 GiB, corpus tables included; at scale 1.0 (51.8 million answers) budget about 3 GiB.
 
 ### Inspecting Data and Queries Directly
 

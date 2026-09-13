@@ -1,6 +1,6 @@
 [project]
 name = "quail-b"
-version = "0.4.0"
+version = "0.5.0"
 description = "quail-b: a benchmark of AI filter and join queries over document sets"
 readme = "README.md"
 # <3.13: the same Python as Quail, which installs this package

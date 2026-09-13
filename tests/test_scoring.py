@@ -135,6 +135,14 @@ def test_scores_answers_and_final_rows():
     assert evaluation["unique_input_documents"] == 4
 
 
+def test_an_answer_without_a_label_is_an_error():
+    output = _output([0, 0], [])
+    output.join_answers["join-1"] = pa.table({
+        "r": ["r0", "r9"], "a": ["a0", "a1"], "answer": [True, False]})
+    with pytest.raises(KeyError, match="no ground truth"):
+        evaluate(SPEC, output, _truth(), CORPUS)
+
+
 def test_rows_from_answers_joins_true_pairs_of_surviving_documents():
     output = _output([1, 1], [])
     rows = rows_from_answers(spec=SPEC, filter_answers=output.filter_answers,
@@ -303,6 +311,20 @@ def test_load_benchmark_with_local_reference_labels(tmp_path):
     assert loaded.answer(predicate_key, "r0") is True
     assert loaded.answer(predicate_key, "r1") is False
     assert loaded.key_for_template(template) == predicate_key
+    assert loaded.predicates[predicate_key].table.to_pydict() == {
+        "left_id": ["r0", "r1"], "right_id": [None, None],
+        "answer": [True, False]}
+    # only the label sets of the given templates are read
+    narrowed = load_ground_truth(
+        tmp_path, scale_factor=0.1, corpus_id=corpus_id, templates={"other"})
+    assert not narrowed.predicates
+    pq.write_table(pa.Table.from_pylist([
+        {"predicate_key": predicate_key, "label_set_id": label_set_id,
+         "answer": True, "left_id": "r1", "right_id": None},
+    ]), label_dir / "parts" / "part_001.parquet")
+    with pytest.raises(ValueError, match="duplicate ground truth"):
+        load_ground_truth(tmp_path, scale_factor=0.1, corpus_id=corpus_id)
+    (label_dir / "parts" / "part_001.parquet").unlink()
 
     reviews = pa.Table.from_pylist(CORPUS["reviews"])
     corpus = corpus_identity(

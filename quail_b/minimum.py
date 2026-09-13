@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 
 import numpy as np
+import pyarrow as pa
+import pyarrow.compute as pc
 
 from quail_b.data import _ids
 
@@ -179,9 +181,21 @@ class DocumentTokens:
         return self._tokens[document]
 
 
+def _encoded(column) -> tuple[np.ndarray, pa.Array]:
+    """Return a string id column as dictionary indices and the dictionary."""
+    column = pc.cast(column, pa.string())
+    if isinstance(column, pa.ChunkedArray):
+        column = column.combine_chunks()
+    encoded = pc.dictionary_encode(column)
+    return np.asarray(encoded.indices), encoded.dictionary
+
+
 def minimum_input_tokens(spec, pieces, filter_answers, join_answers,
                          documents: DocumentTokens) -> int:
     """Return the fewest input tokens the run's requests need.
+
+    A join can hold tens of millions of pairs, so the pairs are
+    grouped by anchor in numpy; Python visits documents and anchors.
 
     Args:
         spec: The query.
@@ -212,10 +226,14 @@ def minimum_input_tokens(spec, pieces, filter_answers, join_answers,
     for operator_id, table in filter_answers.items():
         alias = filters[operator_id].relation
         question = tails[operator_id]
-        for row_id in table.column(alias).to_pylist():
+        ids = pc.unique(pc.cast(table.column(alias), pa.string()))
+        for row_id in ids.to_pylist():
             record(alias, row_id).suffixes.add(question)
     joins = {item["id"]: item for item in pieces["joins"]}
     join_specs = {join.id: join for join in spec._info.joins}
+    # a member key names one distinct partner set of one join: the
+    # sorted partner indices of that join's answer table
+    members_of: dict = {}
     for operator_id, table in join_answers.items():
         piece = joins[operator_id]
         anchor = piece["anchor"]
@@ -223,17 +241,28 @@ def minimum_input_tokens(spec, pieces, filter_answers, join_answers,
                       if alias != anchor]
         group = (tuple(piece["frame"]), tuple(piece["label"]), tuple(piece["tail"]))
         partner_set = sets[partner]
-        for anchor_id, partner_id in zip(table.column(anchor).to_pylist(),
-                                         table.column(partner).to_pylist()):
-            document = record(anchor, anchor_id)
+        anchors, anchor_ids = _encoded(table.column(anchor))
+        partners, partner_ids = _encoded(table.column(partner))
+        if not len(anchors):
+            continue
+        order = np.lexsort((partners, anchors))
+        anchors, partners = anchors[order], partners[order]
+        starts = np.flatnonzero(np.r_[True, anchors[1:] != anchors[:-1]])
+        ends = np.r_[starts[1:], len(anchors)]
+        for start, end in zip(starts.tolist(), ends.tolist()):
+            members = np.unique(partners[start:end])
+            key = (operator_id, members.tobytes())
+            if key not in members_of:
+                members_of[key] = frozenset(
+                    (partner_set, row_id) for row_id in pc.take(
+                        partner_ids, pa.array(members)).to_pylist())
+            document = record(anchor, anchor_ids[int(anchors[start])].as_py())
             document.suffixes.add(group[0])
-            document.groups.setdefault(group, set()).add(
-                (partner_set, str(partner_id)))
+            document.groups.setdefault(group, set()).add(key)
 
     documents.fetch([(*table_set, row_id) for table_set, row_id in records]
                     + [(*member_set, row_id)
-                       for document in records.values()
-                       for members in document.groups.values()
+                       for members in members_of.values()
                        for member_set, row_id in members])
     total = prefix_trie_size(
         np.concatenate((pre, documents[(*table_set, row_id)]))
@@ -245,14 +274,15 @@ def minimum_input_tokens(spec, pieces, filter_answers, join_answers,
         if suffixes not in suffix_sizes:
             suffix_sizes[suffixes] = prefix_trie_size(suffixes)
         total += suffix_sizes[suffixes]
-        for (_, label, tail), partners in document.groups.items():
-            members = frozenset(partners)
-            if members not in partner_sizes:
-                partner_sizes[members] = prefix_trie_size(
+        for (_, label, tail), keys in document.groups.items():
+            keys = frozenset(keys)
+            if keys not in partner_sizes:
+                members = frozenset().union(*(members_of[key] for key in keys))
+                partner_sizes[keys] = (len(members), prefix_trie_size(
                     documents[(*member_set, row_id)]
-                    for member_set, row_id in members)
-            total += (len(label) + partner_sizes[members]
-                      + len(tail) * len(members))
+                    for member_set, row_id in members))
+            count, size = partner_sizes[keys]
+            total += len(label) + size + len(tail) * count
     return total
 
 
