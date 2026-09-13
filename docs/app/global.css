@@ -1,6 +1,7 @@
 @import 'tailwindcss';
 @import 'fumadocs-ui/css/lib/default-colors.css';
 @import 'fumadocs-ui/css/preset.css';
+@import 'katex/dist/katex.min.css';
 
 @theme {
   /* CMU light — Carnegie Red accent on a warm white ground */

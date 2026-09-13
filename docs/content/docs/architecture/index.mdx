@@ -2,51 +2,40 @@
 title: Overview
 ---
 
-This section describes how Quail works internally. You do not need
-to read it to use Quail. It is here for contributors and for users
-who want to understand what happens between `session.sql(...)` and
-`result.collect()`.
+This section describes how Quail works internally.
 
 ## How a query runs
 
-1. The SQL front end or the Python builder produces a **logical plan**
-   of `Scan`, `SemanticFilter`, `SemanticJoin`, and `Project` nodes.
-2. Registered logical rules rewrite the plan (for example, pushing
-   filters below joins).
-3. The session reads Arrow batches from each registered table and
-   tokenizes the document columns into memory-mapped files.
-4. The model backend proposes one or more physical plans with time
-   estimates. The cheapest one is selected.
-5. The runner walks the physical graph in topological order. Model
-   nodes run on the GPU. Relational nodes (Project, Limit,
-   Recombine) run with Arrow.
-6. The result is a `QueryResult` with an Arrow table and an execution
-   report.
+1. The [SQL front end](https://github.com/fsdatalab/quail/blob/main/quail/sqlfront/compile.py)
+   or the [Python builder](https://github.com/fsdatalab/quail/blob/main/quail/builder.py)
+   produces a logical plan.
+2. The session reads Arrow batches from each registered table and
+   tokenizes the document columns.
+3. The [planner](https://github.com/fsdatalab/quail/blob/main/quail/planner/decide.py)
+   proposes one or more physical plans with cost estimates. The
+   cheapest one is selected.
+4. The [runner](https://github.com/fsdatalab/quail/blob/main/quail/runtime/runner.py)
+   executes the physical graph. Model nodes run on the GPU.
+   Relational nodes run with Arrow on the CPU.
+5. The query returns the matching rows as a `pyarrow.Table` and an
+   execution report with timing and token counts.
 
 ## Packages
 
-| Package | What it does |
-| --- | --- |
-| `quail.sqlfront` | Parses SQL into a logical plan. |
-| `quail.builder` | Builds logical plans from Python method calls. |
-| `quail.logical` | Logical node types, prompt binding, and rewrite rules. |
-| `quail.physical` | Typed physical nodes with ports and graph validation. |
-| `quail.planner` | Cost model, join ordering, filter ordering, KV retention. |
-| `quail.backends` | The `ModelBackend` protocol and the Quail, vLLM, and SGLang implementations. |
-| `quail.runtime` | Session, query execution, the generic runner, token store, and results. |
-| `quail.executor` | GPU code: token packing, paged KV, attention, the overlapped execution loop. |
-| `quail.specs` | Model and device constants used by the planner. |
-| `quail.extensions` | The per-session extension registry. |
+| Package | What it does | Source |
+| --- | --- | --- |
+| `quail.sqlfront` | Parses SQL into a logical plan. | [compile.py](https://github.com/fsdatalab/quail/blob/main/quail/sqlfront/compile.py) |
+| `quail.builder` | Builds logical plans from Python. | [builder.py](https://github.com/fsdatalab/quail/blob/main/quail/builder.py) |
+| `quail.logical` | Logical node types and prompt binding. | [logical.py](https://github.com/fsdatalab/quail/blob/main/quail/logical.py) |
+| `quail.physical` | Typed physical nodes with ports. | [physical/](https://github.com/fsdatalab/quail/tree/main/quail/physical) |
+| `quail.planner` | Cost model, join ordering, KV retention. | [planner/](https://github.com/fsdatalab/quail/tree/main/quail/planner) |
+| `quail.runtime` | Session, runner, token store, results. | [runtime/](https://github.com/fsdatalab/quail/tree/main/quail/runtime) |
+| `quail.executor` | GPU code: packing, KV arena, attention. | [executor/](https://github.com/fsdatalab/quail/tree/main/quail/executor) |
+| `quail.specs` | Model and device constants. | [specs/](https://github.com/fsdatalab/quail/tree/main/quail/specs) |
 
-## What is in this section
+## Pages in this section
 
-- [Logical plans](/docs/architecture/logical-plans): the node types
-  and how prompts are bound.
-- [Physical plans](/docs/architecture/physical-plans): typed nodes,
-  ports, editing, and serialization.
-- [Execution](/docs/architecture/execution): pipelining,
-  token-based admission, KV rewind, packed joins, multi-GPU, and
-  session lifetime.
-- [The speed of light model](/docs/architecture/sol-model): how the
-  ideal-work estimate is computed.
-
+- [Logical plans](/docs/architecture/logical-plans)
+- [Physical plans](/docs/architecture/physical-plans)
+- [Execution](/docs/architecture/execution)
+- [The speed of light model](/docs/architecture/sol-model)
