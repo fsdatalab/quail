@@ -67,7 +67,15 @@ def test_spec_rejects_a_join_that_does_not_add_a_relation():
 def test_filters_are_explicit_ordered_operators():
     spec = queries()["IMDB-4"]
 
-    assert isinstance(spec.plan, plan_pb2.Plan)
+    plan = spec.plan
+    assert isinstance(plan, plan_pb2.Plan)
+    assert tuple(plan.expected_type_urls) == (
+        "type.googleapis.com/google.protobuf.Struct",
+    )
+    assert (
+        plan.execution_behavior.variable_eval_mode
+        == plan_pb2.ExecutionBehavior.VARIABLE_EVALUATION_MODE_PER_PLAN
+    )
     assert spec.relations == (
         RelationSpec("r", "reviews", "body"),
         RelationSpec("a", "aspects", "aspect"),
@@ -82,7 +90,7 @@ def test_filters_are_explicit_ordered_operators():
     assert isinstance(spec.operators[0], FilterSpec)
     assert isinstance(spec.operators[-1], JoinSpec)
 
-    project = spec.plan.relations[0].root.input.project
+    project = plan.relations[0].root.input.project
     join = project.input.join
     assert join.left.filter.input.filter.input.HasField("read")
     assert join.right.HasField("read")

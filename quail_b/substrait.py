@@ -25,6 +25,7 @@ AND_NAME = "and:bool"
 
 _RELATION_METADATA = "quail_b.relation"
 _OPERATOR_METADATA = "quail_b.operator"
+_STRUCT_TYPE_URL = "type.googleapis.com/google.protobuf.Struct"
 _FUNCTION_URNS = {
     AI_FILTER_NAME: AI_EXTENSION_URN,
     AI_JOIN_NAME: AI_EXTENSION_URN,
@@ -528,6 +529,12 @@ def build_plan(
                 )
             )
         ],
+        expected_type_urls=[_STRUCT_TYPE_URL],
+        execution_behavior=plan_pb2.ExecutionBehavior(
+            variable_eval_mode=(
+                plan_pb2.ExecutionBehavior.VARIABLE_EVALUATION_MODE_PER_PLAN
+            )
+        ),
     )
 
 
@@ -749,6 +756,22 @@ def _decode_rel(
 
 def plan_details(plan: plan_pb2.Plan) -> PlanDetails:
     """Validate a QUAIL-B Substrait plan and return its benchmark fields."""
+    version = plan.version
+    if (
+        version.major_number,
+        version.minor_number,
+        version.patch_number,
+    ) != SUBSTRAIT_VERSION:
+        raise ValueError(
+            f"QUAIL-B requires Substrait {'.'.join(map(str, SUBSTRAIT_VERSION))}"
+        )
+    if _STRUCT_TYPE_URL not in plan.expected_type_urls:
+        raise ValueError("Substrait plan must declare its Struct metadata")
+    if (
+        plan.execution_behavior.variable_eval_mode
+        != plan_pb2.ExecutionBehavior.VARIABLE_EVALUATION_MODE_PER_PLAN
+    ):
+        raise ValueError("QUAIL-B requires per-plan variable evaluation")
     if len(plan.relations) != 1 or not plan.relations[0].HasField("root"):
         raise ValueError("QUAIL-B needs one Substrait root relation")
     root = plan.relations[0].root

@@ -203,7 +203,9 @@ Substrait field references are numeric positions. The `ReadRel` schemas
 define those positions. Relation aliases and stable operator IDs are
 non-semantic benchmark metadata stored as packed `google.protobuf.Struct`
 values in each relation's `AdvancedExtension.optimization` field. The
-metadata has these forms:
+plan lists that message type in `expected_type_urls` and sets variable
+evaluation to `VARIABLE_EVALUATION_MODE_PER_PLAN`. The metadata has these
+forms:
 
 ```json
 {"kind": "quail_b.relation", "alias": "r", "text_column": "body"}
