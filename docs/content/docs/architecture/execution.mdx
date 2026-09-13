@@ -106,14 +106,13 @@ RoPE, SiLU + FP8 quantize, and the attention merge + FP8 quantize
 for joins. These fused kernels reduce the number of GPU kernel
 launches per layer.
 
-A standard language model ends each forward pass by multiplying the
-final hidden state against the full vocabulary matrix to produce a
-score for every possible next token. Quail only needs to know
-whether the answer is TRUE or FALSE, so at model load time it
-extracts the vocabulary matrix rows for the TRUE and FALSE token IDs
-and discards the rest. Each forward pass then multiplies against
-only those rows, producing two scores. The predicate passes if the
-TRUE score is higher.
+Every predicate returns a single token: TRUE or FALSE. Multiple
+tokenizations count (e.g., "TRUE", " TRUE", "True"), so there are
+several token IDs per side. At model load time, Quail keeps only
+the vocabulary matrix rows for all TRUE and FALSE token IDs and
+discards the rest of the output head. Each forward pass scores only
+those rows. The predicate passes if the best TRUE token scores
+higher than the best FALSE token.
 
 Quail uses [FlashAttention 3](https://arxiv.org/abs/2407.08608) on
 H100 and FlashAttention 2 on Blackwell GPUs.
