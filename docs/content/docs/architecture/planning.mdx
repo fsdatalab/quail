@@ -255,7 +255,8 @@ one table and add one table at each join step (as opposed to bushy
 plans that join two intermediate results). For each step, it
 considers both possible anchor choices.
 
-The search uses dynamic programming. The state tracks which tables
+The search uses dynamic programming, following the approach
+introduced by [Selinger et al. (1979)](https://doi.org/10.1145/582095.582099). The state tracks which tables
 have been joined so far and which tables have prefix KV available.
 A state is kept only if no other state with the same joined tables
 does less work in all four quantities (tokens, pairs, KV writes,
@@ -265,11 +266,15 @@ The cost model assumes unlimited KV capacity: once a document's
 prefix is computed (by a filter or as a join anchor), it stays
 available for all later joins.
 
-### Computing the query estimate
+### From per-operator work to query time
 
-After counting the work across all filters and joins in the query,
-the total tokens, pairs, KV writes, and KV reads are combined into
-a single time estimate. The forward pass count is:
+The previous sections count the four work quantities for each
+operator (each filter stage, each join stage) separately. To get
+the query's total estimated time, we sum each quantity across all
+operators, then convert the totals into seconds using the GPU's
+peak rates.
+
+First, the number of forward passes:
 
 
 $$
@@ -318,9 +323,8 @@ per attention pair per layer accounts for the QK dot product
 The $\max$ within each component allows compute and memory to
 overlap. The components are summed because they run in sequence.
 
-All query work is aggregated before computing the forward pass count.
-Filter and join boundaries do not start separate passes in SoL.
-Each component reads its weights once per ideal forward pass.
+Filter and join boundaries do not start separate forward passes.
+Each component reads its weights once per forward pass.
 
 #### Derived metrics
 
