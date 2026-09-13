@@ -1,24 +1,26 @@
 ---
-title: The Quail backend
+title: Execution
 ---
 
-`QuailBackend` is the default model backend. It owns the scheduler,
-the paged KV arena, and the model calls.
+This page describes how the physical plan is executed on the GPU.
+
+## The runner
+
+`GenericRunner.run(graph, context)` walks nodes in topological
+order. For each node it calls the registered runtime, checks the
+output ports, records node metrics, and notifies observers.
+
+Relational nodes (`Recombine`, `Project`, `Limit`) run with Arrow
+on the CPU. Model nodes run on the GPU.
 
 ## Planning
 
-The planner builds a physical plan from the model spec, device spec,
-and per-document token counts. It decides:
-
-- The filter order per table.
-- The anchor of each join.
-- The forward pass token budget and KV arena budget, based on GPU
-  memory remaining after the model weights.
-- Which document KV to retain across operator boundaries.
-- Document shards per GPU when using multiple GPUs.
-
-A document that cannot fit in one forward pass is refused at plan
-time.
+The planner builds the physical plan from the model spec, device
+spec, and per-document token counts. It decides the filter order,
+the anchor of each join, the forward pass token budget and KV arena
+budget (based on GPU memory after the model weights), which document
+KV to retain across operator boundaries, and document shards per
+GPU.
 
 ## Filters
 
@@ -65,23 +67,7 @@ Later join groups reuse retained KV for their anchors. If KV was
 evicted, the document is reprocessed.
 
 The planner uses dynamic programming (Selinger-style) to choose the
-join order and anchors before inference. Filter survival is estimated
-from the selectivities you provide.
-
-## The executor
-
-`quail.executor` holds the GPU code:
-
-| File | What it does |
-| --- | --- |
-| `pack.py` | Admission logic for filters and joins. |
-| `arena.py` | The paged KV arena and page accounting. |
-| `attention.py` | The forward pass with two-call attention and log-sum-exp merge. |
-| `loop.py` | The overlapped filter and join execution loops. |
-| `model.py` | Weight loading through vLLM's loader. |
-
-The fused kernels assume the Qwen3 architecture: QK-norm before
-RoPE, gated SiLU MLP, FP8 block-quantized weights.
+join order and anchors before inference.
 
 ## Multiple GPUs
 
@@ -93,3 +79,16 @@ A coordinator process sends work over pipes.
   receives every surviving partner document.
 - **Between join groups**: the coordinator prunes survivors and
   re-partitions the next anchor's documents.
+
+## GPU code
+
+| File | What it does |
+| --- | --- |
+| `quail/executor/pack.py` | Admission logic for filters and joins. |
+| `quail/executor/arena.py` | The paged KV arena and page accounting. |
+| `quail/executor/attention.py` | Forward pass with two-call attention and log-sum-exp merge. |
+| `quail/executor/loop.py` | The overlapped filter and join execution loops. |
+| `quail/executor/model.py` | Weight loading through vLLM's loader. |
+
+The fused kernels assume the Qwen3 architecture: QK-norm before
+RoPE, gated SiLU MLP, FP8 block-quantized weights.

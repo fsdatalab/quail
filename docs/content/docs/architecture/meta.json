@@ -4,7 +4,7 @@
     "index",
     "logical-plans",
     "physical-plans",
-    "quail-backend",
+    "execution",
     "request-backends",
     "worker",
     "design-decisions",

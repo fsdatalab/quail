@@ -43,9 +43,9 @@ who want to understand what happens between `session.sql(...)` and
 - [Logical plans](/docs/architecture/logical-plans): the node types
   and how prompts are bound.
 - [Physical plans](/docs/architecture/physical-plans): typed nodes,
-  ports, and how to edit a plan.
-- [The Quail backend](/docs/architecture/quail-backend): pipelining,
-  token-based admission, KV rewind, and packed joins.
+  ports, editing, and serialization.
+- [Execution](/docs/architecture/execution): pipelining,
+  token-based admission, KV rewind, packed joins, and multi-GPU.
 - [The request backends](/docs/architecture/request-backends): vLLM
   and SGLang behind the same interface.
 - [In-process execution](/docs/architecture/worker): how a query

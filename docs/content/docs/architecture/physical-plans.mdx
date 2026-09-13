@@ -123,15 +123,8 @@ edited = plan.insert(custom, between=("ai_filter:r", "ai_join:r"))
 result = query.run(plan=edited)
 ```
 
-## Execution
-
-`GenericRunner.run(graph, context)` walks nodes in topological
-order. For each node it calls the registered runtime, checks that
-the output ports match, records node metrics, and notifies
-observers.
-
-Model nodes run on the GPU. Relational nodes (`Recombine`,
-`Project`, `Limit`) run with Arrow on the CPU.
+See [Execution](/docs/architecture/execution) for how the plan runs
+on the GPU.
 
 ## Serialization
 
