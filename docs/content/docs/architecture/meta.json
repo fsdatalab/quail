@@ -5,7 +5,6 @@
     "logical-plans",
     "physical-plans",
     "execution",
-    "worker",
     "design-decisions",
     "sol-model"
   ],

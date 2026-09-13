@@ -92,3 +92,19 @@ A coordinator process sends work over pipes.
 
 The fused kernels assume the Qwen3 architecture: QK-norm before
 RoPE, gated SiLU MLP, FP8 block-quantized weights.
+
+## Session lifetime
+
+The backend keeps the loaded model in memory for later queries.
+The session keeps tokenized documents for reuse. Collect your
+results before closing the session, because the row projection may
+still read from the session's temporary files.
+
+`Session.close()` waits for background tokenization and releases
+temporary files. It does not unload the model.
+
+## Limits
+
+- Temporary token files must fit on local disk.
+- At most 8 GPUs in one host. Multi-host execution is not
+  implemented.
