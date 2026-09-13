@@ -140,9 +140,20 @@ pipelined vLLM on the same query definitions.
 
 In the September 12, 2026 sf=0.1 run with Qwen3 4B fp8 and one H100 per
 configuration, Quail had lower query time than stock vLLM on 31 of the 33
-queries. Query time excludes model startup. QUAIL-B stores the full result
-tables and computes accuracy, output precision and recall, fresh input
-tokens, throughput, and GPU cost.
+queries. Its total query time was 1,542.13 seconds, compared with 3,249.04
+seconds for stock vLLM. Because both used one H100, total GPU cost fell by
+the same 52.5%.
+
+On IMDB-10, Quail computed 5.48 million fresh input tokens, compared with
+7.71 million for stock vLLM. Query time was 48.58 seconds, compared with
+85.89 seconds. Each backend's answers can change the rows that reach later
+stages, so the token difference includes both execution and answer-path
+differences.
+
+Query time excludes model startup. The saved run is
+`/results/benchmarks/quailb/family-runs/20260912T225100Z-902686c5/` on the
+`quail-results` Modal volume. QUAIL-B computes accuracy, output precision and
+recall, fresh input tokens, throughput, and GPU cost from the saved results.
 
 ```bash
 uv run modal run --detach -m quail.bench.quailb_parallel \

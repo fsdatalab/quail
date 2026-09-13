@@ -164,7 +164,17 @@ export default function HomePage() {
             In the September 12, 2026 QUAIL-B sf=0.1 run with Qwen3 4B
             fp8 and one H100 per configuration, Quail had lower query time
             than stock vLLM on 31 of 33 queries. Stock vLLM used
-            operator-at-a-time execution. Query time excludes model startup.
+            operator-at-a-time execution. Total query time was 1,542.13
+            seconds, compared with 3,249.04 seconds for stock vLLM. Total
+            GPU cost was 52.5% lower.
+          </p>
+          <p className="max-w-3xl leading-7 text-fd-muted-foreground">
+            On IMDB-10, Quail computed 5.48 million fresh input tokens,
+            compared with 7.71 million for stock vLLM. Query time was 48.58
+            seconds, compared with 85.89 seconds. Each backend&apos;s answers
+            can change the rows that reach later stages, so the token
+            difference is not execution-only. Query time excludes model
+            startup.
           </p>
           <p className="max-w-3xl text-sm leading-6 text-fd-muted-foreground">
             <Link href="/docs/user-guide/benchmark" className="underline">
