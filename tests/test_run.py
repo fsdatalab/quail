@@ -153,7 +153,7 @@ def test_prompt_pieces_give_the_minimum_and_the_regret(tmp_path, monkeypatch):
     metrics = record["queries"][0]["metrics"]
     # the preamble once, then "good" and "bad" (4 and 3 tokens, sharing
     # nothing); per review the two filter tails and the frame, which
-    # share nothing; per anchor the label, "acting", and the tail
+    # share nothing; per pair the label, "acting", and the tail
     stages = len(spec._info.filters)
     assert stages == 2
     minimum = (2 + 4 + 3) + 2 * (2 * 2 + 2) + 2 * (1 + 6 + 3)

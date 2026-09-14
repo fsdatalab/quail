@@ -203,7 +203,10 @@ def report(run_dir, *, rescore=True, cache_dir=None, root=None):
         if "files" not in item:
             continue
         try:
-            output = _read_output(_query_directory(directory, item), item)
+            query_directory = _query_directory(directory, item)
+            output = _read_output(query_directory, item, rows=False)
+            if output.filter_answers is None or output.join_answers is None:
+                output = _read_output(query_directory, item)
             item["metrics"] = _score(
                 spec, output, suite, record["gpu_count"],
                 record["gpu_hourly_rate_usd"], tokens)

@@ -570,6 +570,87 @@ def test_answers_count_and_check_rows_without_building_them():
                 broken, survivors, relations, spec)).as_py()
 
 
+def _fever_chain_spec(select=None):
+    # FEV-9's shape with every join written claim first, as the labels are
+    c1 = Filter(Scan("claims", "c1", "claim"), FILTER)
+    first = Join(c1, Scan("evidence", "e1", "text"), ("c1", "e1"), JOIN)
+    c2 = Filter(Scan("claims", "c2", "claim"), FILTER)
+    second = Join(first, c2, ("c2", "e1"), JOIN)
+    tree = Join(second, Scan("evidence", "e2", "text"), ("c2", "e2"), JOIN)
+    return QuerySpec.from_plan("CHAIN-2", "three joins", build_plan(tree, select))
+
+
+def _chain_truth(rng, claims=12, evidence=8):
+    """Random labels for the chain's two prompts over a small corpus."""
+    corpus = {
+        "claims": pa.table({"id": [f"c{i}" for i in range(claims)],
+                            "claim": ["a claim"] * claims}),
+        "evidence": pa.table({"id": [f"e{j}" for j in range(evidence)],
+                              "text": ["a passage"] * evidence}),
+    }
+    columns = {"claims": "claim", "evidence": "text"}
+
+    def predicate(key, template, kind, left, right=None):
+        return {"key": key, "template": template, "kind": kind,
+                "left_table": left, "left_column": columns[left],
+                "right_table": right,
+                "right_column": columns[right] if right else None}
+
+    filter_key, join_key = "test.claim.filter", "test.claim.evidence"
+    truth = GroundTruthCollection("gt_chain", "c_chain", 0.1, "qwen3-32b-fp8", {
+        filter_key: PredicateLabels(
+            filter_key, "ls_filter",
+            predicate(filter_key, FILTER, "filter", "claims"),
+            {(f"c{i}", None): rng.random() < 0.7 for i in range(claims)}, {}),
+        join_key: PredicateLabels(
+            join_key, "ls_join",
+            predicate(join_key, JOIN, "join", "claims", "evidence"),
+            {(f"c{i}", f"e{j}"): rng.random() < 0.4
+             for i in range(claims) for j in range(evidence)}, {}),
+    })
+    return corpus, truth
+
+
+def _tuples(table, selected):
+    table = table.select(selected)
+    return set(zip(*(table.column(name).to_pylist() for name in selected)))
+
+
+def test_row_counts_agree_with_built_rows():
+    import random
+
+    from quail_b.scoring import row_counts
+
+    # counted in DuckDB against the rows built in Arrow: with every alias
+    # selected (a traced run scores from its answers) and with a
+    # projection (which scores the saved rows)
+    for select in (None, ["c1", "e2"]):
+        spec = _fever_chain_spec(select)
+        selected = [name.split(".")[0] for name in spec._info.select]
+        for seed in range(4):
+            rng = random.Random(seed)
+            corpus, truth = _chain_truth(rng)
+            output = _random_output(spec, rng)
+            expected = _tuples(expected_rows(spec, truth, corpus), selected)
+            built = rows_from_answers(
+                spec, output.filter_answers, output.join_answers)
+            predicted = _tuples(built, selected)
+            counts = (len(predicted), len(expected), len(predicted & expected))
+            assert counts[1] > 0
+            output.rows = built.select(selected)
+            assert row_counts(spec, output, truth, corpus) == counts
+            # an untraced run is scored from its rows alone
+            untraced = RunOutput(None, None, built.select(selected))
+            assert row_counts(spec, untraced, truth, corpus) == counts
+    # a traced run with every alias selected needs no rows at all
+    spec = _fever_chain_spec()
+    rng = random.Random(7)
+    corpus, truth = _chain_truth(rng)
+    output = _random_output(spec, rng)
+    assert output.rows is None
+    assert row_counts(spec, output, truth, corpus)[2] >= 0
+
+
 def test_traced_rows_must_agree_with_the_answers():
     import random
 

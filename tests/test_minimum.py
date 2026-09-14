@@ -48,7 +48,7 @@ def test_prefix_trie_size_counts_shared_prefixes_once():
     assert prefix_trie_size([]) == 0
 
 
-def test_minimum_input_tokens_counts_each_distinct_prefix_once():
+def test_minimum_input_tokens_counts_each_document_prefix_once_and_pairs_apart():
     spec = _spec(
         "TEST-1",
         "one filter then one join",
@@ -81,12 +81,13 @@ def test_minimum_input_tokens_counts_each_distinct_prefix_once():
 
     # the three documents share the preamble, and the first two share
     # "same start " (11 tokens) beyond it; every document gets the
-    # question once, the two anchors get the frame once, and each
-    # anchor's pairs share the label and the partners' first token
+    # question once, the two anchors get the frame once, sharing the
+    # lead it has in common with the question; each pair gets its own
+    # label, partner, and tail
     pre = len(PRE)
     documents = 3 * pre + 14 + 14 + 5 - (pre + pre + 11)
     anchored = len(QUESTION) + len(FRAME) - _lcp(QUESTION, FRAME)
-    pairs = len(LABEL) + 3 + 2 * len(TAIL)
+    pairs = 2 * len(LABEL) + 4 + 2 * len(TAIL)
     assert minimum == documents + len(QUESTION) + 2 * anchored + 2 * pairs
 
 
@@ -124,7 +125,7 @@ def test_minimum_input_tokens_counts_a_document_once_across_uses():
     alpha = len(first) + len(second) + len(FRAME) - sum((
         _lcp(first, second), max(_lcp(FRAME, first), _lcp(FRAME, second))))
     beta = len(first) + len(FRAME) - _lcp(first, FRAME)
-    pairs = len(LABEL) + 9 + 2 * len(TAIL)
+    pairs = 2 * len(LABEL) + 9 + 2 * len(TAIL)
     assert minimum == documents + alpha + beta + 2 * pairs
 
 

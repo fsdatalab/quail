@@ -207,8 +207,8 @@ Each scale factor deterministically samples upstream snapshots defined in [`quai
 | Predicate accuracy | Agreement with reference labels on evaluated filter and join answers. |
 | Output precision & recall | Precision and recall of final output rows compared to reference result rows. |
 | Fresh tokens | Input token positions processed by model forward passes. |
-| Minimum tokens | Distinct input token positions required under an unlimited KV prefix cache. |
-| Recomputed KV tokens | Fresh tokens minus minimum tokens (`regret_tokens`). Measures redundant KV computation. |
+| Minimum tokens | Input token positions required under an unlimited KV prefix cache: each distinct prefix of the document requests once (a document's questions and frames share their common lead), and each pair's label, partner document, and answer cue once per pair. |
+| Recomputed KV tokens | Fresh tokens minus minimum tokens (`regret_tokens`). Measures redundant KV computation. Tokens that must be computed once per request, such as a pair's suffix, are never regret. |
 
 Reference labels are generated using `Qwen/Qwen3-32B-FP8`. FEVER and LePaRD also evaluate against published dataset ground truth.
 

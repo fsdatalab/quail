@@ -8,6 +8,7 @@ object is needed to score a run.
 
 from __future__ import annotations
 
+import tempfile
 from dataclasses import dataclass, field
 
 import pyarrow as pa
@@ -28,7 +29,8 @@ class RunOutput:
         join_answers: Join operator ID to a table with one ID column
             per joined relation and a boolean `answer` column, one row per
             evaluated tuple.
-        rows: The final rows, one ID column per selected alias.
+        rows: The final rows, one ID column per selected alias. None
+            when a saved run is rescored from its answers alone.
         runtime_s: Completed query execution time, excluding result collection.
         measurements: Engine-reported numbers. `fresh_tokens` is the
             count of input token positions a model forward pass processed
@@ -478,6 +480,122 @@ def agreement(table: pa.Table, aliases, labels) -> BinaryCounts:
     return counts
 
 
+def _quoted(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _chain(pairs: list[str], survivors: list[str]) -> str:
+    """Return the FROM clause joining pair and survivor tables by alias.
+
+    Every table is keyed by alias columns, so a natural join is the
+    join of the query: pairs meet on their shared alias, and a
+    survivor table keeps the ids that passed that alias's filters.
+    """
+    return " NATURAL JOIN ".join(
+        [f"(SELECT DISTINCT * FROM {_quoted(name)}) AS {_quoted(name)}"
+         for name in pairs]
+        + [_quoted(name) for name in survivors])
+
+
+def _projection(selected, from_clause: str, distinct: bool) -> str:
+    columns = ", ".join(_quoted(alias) for alias in selected)
+    return (f"SELECT {'DISTINCT ' if distinct else ''}{columns} "
+            f"FROM {from_clause}")
+
+
+def row_counts(spec: QuerySpec, output: RunOutput, ground_truth,
+               corpus_rows) -> tuple[int, int, int]:
+    """Return (predicted, expected, matched) result rows, without building them.
+
+    A result row is a tuple of one id per selected alias. The expected
+    rows are the join of the labels' true pairs, each alias restricted
+    to the ids that pass its filters; a traced run's predicted rows are
+    the same join over the engine's true pairs and survivors. A row is
+    in both exactly when every pair is true for both and every id
+    survives both, so the matched rows are the join over the
+    intersected pairs and survivors. DuckDB streams these joins and
+    counts them, so a result of hundreds of millions of rows is never
+    held in memory. An untraced run's rows are counted as saved.
+    """
+    import duckdb
+
+    selected = [name.split(".")[0] for name in spec._info.select]
+    aliases = [relation.alias for relation in spec._info.relations]
+    # with every alias selected, the joined tuples are already distinct
+    distinct = set(selected) != set(aliases)
+    with tempfile.TemporaryDirectory(prefix="quail_b_rows_") as spill:
+        con = duckdb.connect()
+        con.execute(f"SET temp_directory = '{spill}'")
+
+        def ids(name, values):
+            con.register(name, pa.table({
+                name.split(":", 1)[1]: pa.array(sorted(values), pa.string())}))
+
+        for alias, values in expected_survivors(
+                spec, ground_truth, corpus_rows).items():
+            ids(f"expected:{alias}", values)
+        for index, join in enumerate(spec._info.joins):
+            pairs = _labels(ground_truth, join.prompt).true_pairs
+            pairs = pairs.select(["left_id", "right_id"]).rename_columns(
+                list(join.relations))
+            con.register(f"expected_pairs:{index}",
+                         _apply_conditions(pairs, join, spec, corpus_rows))
+        expected_pairs = [f"expected_pairs:{i}"
+                          for i in range(len(spec._info.joins))]
+        expected_from = _chain(
+            expected_pairs, [f"expected:{alias}" for alias in aliases])
+
+        def count(query: str) -> int:
+            return con.execute(f"SELECT COUNT(*) FROM ({query})").fetchone()[0]
+
+        expected_count = count(_projection(selected, expected_from, distinct))
+        answers = scores_from_answers(spec, output, corpus_rows)
+        if answers is None:
+            # an untraced run: its saved rows, as strings like the ids above
+            if output.rows is None:
+                raise ValueError("scoring a run without answers needs its rows")
+            con.register("rows", output.rows)
+            rows = "SELECT DISTINCT " + ", ".join(
+                f"CAST({_quoted(alias)} AS VARCHAR) AS {_quoted(alias)}"
+                for alias in selected) + " FROM rows"
+            return (
+                count(rows),
+                expected_count,
+                count(f"({rows}) INTERSECT "
+                      f"({_projection(selected, expected_from, True)})"))
+        survivors, relations = answers
+        engine_ids = []
+        for alias in aliases:
+            if survivors[alias] is not None:
+                ids(f"engine:{alias}", survivors[alias])
+                engine_ids.append(f"engine:{alias}")
+            else:
+                ids(f"corpus:{alias}", corpus_ids(spec, corpus_rows)[alias]
+                    .to_pylist())
+                engine_ids.append(f"corpus:{alias}")
+        for index, relation in enumerate(relations):
+            con.register(f"engine_pairs:{index}", relation)
+        engine_pairs = [f"engine_pairs:{i}" for i in range(len(relations))]
+        engine_from = _chain(engine_pairs, engine_ids)
+        predicted_count = count(_projection(selected, engine_from, distinct))
+        if distinct:
+            matched_count = count(
+                f"({_projection(selected, expected_from, True)}) INTERSECT "
+                f"({_projection(selected, engine_from, True)})")
+        else:
+            for index, (expected_name, engine_name) in enumerate(
+                    zip(expected_pairs, engine_pairs)):
+                con.execute(
+                    f"CREATE VIEW {_quoted(f'both_pairs:{index}')} AS "
+                    f"SELECT * FROM {_quoted(expected_name)} INTERSECT "
+                    f"SELECT * FROM {_quoted(engine_name)}")
+            matched_count = count(_projection(selected, _chain(
+                [f"both_pairs:{i}" for i in range(len(relations))],
+                [f"expected:{alias}" for alias in aliases] + engine_ids),
+                False))
+        return predicted_count, expected_count, matched_count
+
+
 def evaluate(spec: QuerySpec, output: RunOutput, ground_truth, corpus_rows) -> dict:
     per_predicate = []
     total = BinaryCounts()
@@ -500,26 +618,8 @@ def evaluate(spec: QuerySpec, output: RunOutput, ground_truth, corpus_rows) -> d
         total.merge(item.counts)
         per_predicate.append(item.as_dict())
 
-    expected = expected_rows(spec, ground_truth, corpus_rows)
-    aliases = [name.split(".")[0] for name in spec._info.select]
-    expected = _distinct(expected.select(aliases))
-    answers = scores_from_answers(spec, output, corpus_rows)
-    if answers is not None:
-        # the rows are implied by the answers, which are small: count
-        # them and check the expected rows there instead of touching a
-        # result that can hold hundreds of millions of rows
-        survivors, relations = answers
-        predicted_count = implied_row_count(spec, survivors, relations)
-        matched_count = pc.sum(implied_rows_mask(
-            expected, survivors, relations, spec)).as_py() or 0
-    else:
-        # an untraced run: score the rows themselves, as small integer
-        # codes so that the hashing does not run over strings
-        references = corpus_ids(spec, corpus_rows)
-        predicted = _distinct(encode_ids(output.rows, aliases, references))
-        matched = predicted.join(encode_ids(expected, aliases, references),
-                                 keys=aliases, join_type="inner")
-        predicted_count, matched_count = predicted.num_rows, matched.num_rows
+    predicted_count, expected_count, matched_count = row_counts(
+        spec, output, ground_truth, corpus_rows)
     input_document_rows = sum(
         len(corpus_rows[relation.table])
         for relation in spec._info.relations)
@@ -533,7 +633,7 @@ def evaluate(spec: QuerySpec, output: RunOutput, ground_truth, corpus_rows) -> d
         "ground_truth_reference_model": ground_truth.reference_model,
         "answer_accuracy": (total.as_dict() if total.evaluated else None),
         "output_accuracy": _row_metrics(
-            predicted_count, expected.num_rows, matched_count),
+            predicted_count, expected_count, matched_count),
         "per_predicate": per_predicate,
         "input_document_rows": input_document_rows,
         "unique_input_documents": len(unique_documents),

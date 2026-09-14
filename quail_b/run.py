@@ -121,7 +121,8 @@ def _save_output(directory, output, spec):
     return paths
 
 
-def _read_output(directory, record):
+def _read_output(directory, record, rows=True):
+    """Read a saved output; rows=False skips the rows table, which can be huge."""
     def file(name):
         path = (directory / name).resolve()
         if not path.is_relative_to(directory.resolve()):
@@ -137,7 +138,8 @@ def _read_output(directory, record):
             item["key"]: pq.read_table(file(item["path"])) for item in filters},
         None if joins is None else {
             item["key"]: pq.read_table(file(item["path"])) for item in joins},
-        pq.read_table(file(paths["rows"])), record.get("runtime_s"),
+        pq.read_table(file(paths["rows"])) if rows else None,
+        record.get("runtime_s"),
         record.get("measurements", {}),
         None if pieces is None else json.loads(file(pieces).read_text()))
 
@@ -191,10 +193,15 @@ def _validate_output(spec, output, tables):
             raise ValueError("duplicate document IDs in an answer table")
 
     selected = [name.split(".")[0] for name in spec._info.select]
-    if set(output.rows.column_names) != set(selected):
-        raise ValueError("output columns must match the query's selected aliases")
     answers = scores_from_answers(spec, output, tables)
-    if answers is None:
+    if output.rows is None:
+        # a saved run rescored from its answers: its rows were checked
+        # when they were saved
+        if answers is None:
+            raise ValueError("a run without answers must include its rows")
+    elif set(output.rows.column_names) != set(selected):
+        raise ValueError("output columns must match the query's selected aliases")
+    elif answers is None:
         validate_ids(output.rows, selected)
     else:
         # a traced run's rows are implied by its answers: the count must
