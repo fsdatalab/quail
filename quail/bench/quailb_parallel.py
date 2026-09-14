@@ -20,8 +20,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import modal
-import quail_b
 
+import quail_b
 from quail.bench.results import combine_measurements, write_json
 
 base_image = (
