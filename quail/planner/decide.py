@@ -898,15 +898,26 @@ def _filter_alias(pred_or_list):
 
 # ------------------------------------------------------------- explain
 
-def explain(logical: LogicalPlan, physical, *, verbose: bool = False) -> str:
+def explain(logical: LogicalPlan, physical, *, verbose: bool = False,
+            result=None, usd_per_hour: float | None = None) -> str:
     """Format the logical and physical operator trees.
 
     Args:
         logical: The optimized logical plan.
         physical: The physical plan or planning refusal.
         verbose: Include runtime settings and internal node fields.
+        result: The QueryResult of running the plan. When given, each
+            node shows its measured rows, time, and tokens next to the
+            estimates, and the measured totals follow the tree.
+        usd_per_hour: Price of one GPU, for the measured cost per query.
     """
-    from quail.explain import _fields, logical_tree, physical_tree
+    from quail.explain import (
+        _fields,
+        logical_tree,
+        measured_stages,
+        measured_summary,
+        physical_tree,
+    )
 
     lines = ["logical:"]
     lines.extend("  " + line for line in logical_tree(logical).splitlines())
@@ -934,7 +945,15 @@ def explain(logical: LogicalPlan, physical, *, verbose: bool = False) -> str:
                      "packing shares forward passes across nodes")
     lines.extend("  " + line for line in physical_tree(
         physical.graph, logical=logical, verbose=verbose,
-        estimates=getattr(physical, "estimates", None)).splitlines())
+        estimates=getattr(physical, "estimates", None),
+        metrics=None if result is None else result.node_metrics,
+        stages=None if result is None else measured_stages(result.report),
+    ).splitlines())
+    if result is not None:
+        lines.append("")
+        lines.append("measured:")
+        lines.extend(measured_summary(
+            result.report, physical.graph, physical.workers, usd_per_hour))
     if verbose:
         lines.append("")
         lines.append("settings:")

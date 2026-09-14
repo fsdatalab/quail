@@ -50,6 +50,56 @@ Project: r.id, a.aspect
 `explain(verbose=True)` adds node ids, port connections, KV retention
 decisions, and planner remarks.
 
+## Measure the plan
+
+`explain(analyze=True)` works like `EXPLAIN ANALYZE` in DataFusion or
+PostgreSQL: it runs the query, then prints the same plan with each
+node's measured rows, time, and tokens next to the planner's
+estimates, followed by the totals of the run.
+
+```python
+print(query.explain(analyze=True))
+```
+
+```text
+physical: (backend=quail, model=qwen3-4b-fp8, workers=1)
+  KV=bf16, chunk budget=110,376 tokens
+
+  Limit: 1 (actual_rows=1, estimated_rows=1, wall_s=0.000)
+    Project: r.id (actual_rows=2, estimated_rows=1.5, wall_s=0.000)
+      AiFilter: r (actual_rows=2, estimated_rows=1.5, wall_s=0.412, estimated_seconds=0.380, fresh_tokens=60)
+        KV rewind=on
+        1. PROMPT('...', r.review) (selectivity=50%, observed=66.67%, evaluated=6 documents, question_tokens=10)
+        2. PROMPT('...', r.review) (selectivity=50%, observed=50%, evaluated=4 documents, question_tokens=10)
+        Scan reviews as r (actual_rows=6, estimated_rows=6, wall_s=0.000)
+          tokens=12, mean_doc_tokens=2
+
+measured:
+  query time=0.412 s (model startup excluded)
+  throughput=14.6 documents/second (6 input documents)
+  fresh_tokens=60
+  GPU cost=$0.0005/query (1 GPU x $3.9492/hour, startup excluded)
+  model startup=41.200 s (cold)
+```
+
+Each predicate line shows the selectivity you provided (or the
+planner's default) next to the fraction that actually passed and how
+many documents or pairs the model evaluated. A large gap between
+`selectivity` and `observed` is the usual reason a plan's order or
+its estimated time was off.
+
+`explain(analyze=True, verbose=True)` adds every measured field of
+each node, including KV hits and misses and GPU seconds.
+
+The query runs once for the measurement. To keep the rows as well,
+run it yourself and ask the result for the measured tree:
+
+```python
+result = query.run()
+rows = result.collect()
+print(result.explain())
+```
+
 ## Refusals
 
 If the planner cannot execute the query, `explain()` prints the

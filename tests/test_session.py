@@ -110,7 +110,7 @@ def make_executor(filter_truth, join_truth=None, seen=None):
         from test_quail_backend import graph_state
 
         from quail.backends.quail.graph import execute_single_graph
-        from quail.execution.runner import NodeResult
+        from quail.execution.runner import NodeMetrics, NodeResult
         from quail.execution.types import PhysicalResponse
         from quail.physical import AiFilter, Scan
 
@@ -138,11 +138,15 @@ def make_executor(filter_truth, join_truth=None, seen=None):
                             if not bit:
                                 break
                         rows[document] = row
+                    survivors = [d for d, row in rows.items()
+                                 if len(row) == len(node.stages) and all(row)]
                     return NodeResult({
-                        f"ids:{node.alias}": [d for d, row in rows.items()
-                            if len(row) == len(node.stages) and all(row)],
+                        f"ids:{node.alias}": survivors,
                         f"filter_answers:{node.alias}": rows,
-                    })
+                    }, NodeMetrics(input_rows=len(rows),
+                                   output_rows=len(survivors),
+                                   evaluated_documents=len(rows),
+                                   fresh_tokens=10 * len(rows)))
                 anchors = list(inputs["anchor_ids"])
                 outputs = {}
                 for stage in node.stages:
@@ -162,7 +166,11 @@ def make_executor(filter_truth, join_truth=None, seen=None):
                 outputs[f"ids:{node.anchor}"] = [a for a in anchors
                     if (a not in passing if stage.semantics == "anti"
                         else a in passing)]
-                return NodeResult(outputs)
+                return NodeResult(outputs, NodeMetrics(
+                    input_rows=len(anchors),
+                    output_rows=len(outputs[f"ids:{node.anchor}"]),
+                    evaluated_document_pairs=sum(
+                        len(row) for row in rows.values())))
 
         report = execute_single_graph(graph_state(FixedAnswers(), docs), {
             "filter_limit": None, "pre_ids": [],
@@ -180,6 +188,54 @@ FILTER_SQL = """
     WHERE AI_FILTER(PROMPT('q1: {0}', r.review), {'selectivity': 0.5})
       AND AI_FILTER(PROMPT('q2: {0}', r.review), {'selectivity': 0.5})
 """
+
+
+def test_explain_analyze_shows_measured_rows_beside_estimates(
+        sess, monkeypatch):
+    truth = {"r": {"q1:": [1, 1, 0, 1, 1, 0],
+                   "q2:": [1, 0, 1, 1, 0, 1]}}
+    query = sess.sql(FILTER_SQL + " LIMIT 1")
+    from quail.execution import execute as execution
+
+    execution_calls = []
+
+    def executor(request):
+        execution_calls.append(request)
+        return make_executor(truth)(request)
+
+    original = execution.execute_query
+    monkeypatch.setattr(
+        execution, "execute_query",
+        lambda q, physical_executor=executor, plan=None: original(
+            q, physical_executor=physical_executor, plan=plan))
+    planned = query.explain()
+    text = query.explain(analyze=True)
+
+    assert len(execution_calls) == 1
+    assert "actual_rows" not in planned
+    # the filter stages run q2 first, over all six documents
+    assert "AiFilter: r (actual_rows=2, estimated_rows=1.5, wall_s=" in text
+    assert "fresh_tokens=60)" in text
+    assert ("(selectivity=50%, observed=66.67%, evaluated=6 documents, "
+            "question_tokens=10)") in text
+    assert ("(selectivity=50%, observed=50%, evaluated=4 documents, "
+            "question_tokens=10)") in text
+    assert "Scan reviews as r (actual_rows=6, estimated_rows=6" in text
+    assert "Project: r.id (actual_rows=2, estimated_rows=1.5" in text
+    assert "Limit: 1 (actual_rows=1, estimated_rows=1" in text
+    assert "measured:" in text
+    assert "query time=1.000 s (model startup excluded)" in text
+    assert "throughput=6 documents/second (6 input documents)" in text
+    assert "fresh_tokens=1,234" in text
+    assert "GPU cost=$0.0011/query (1 GPU x $3.9492/hour" in text
+    assert "model startup=0.500 s" in text
+
+    # the executed result renders the same measured tree on its own
+    result = _run(sess.sql(FILTER_SQL + " LIMIT 1"), make_executor(truth))
+    assert "Limit: 1 (actual_rows=1, estimated_rows=1" in result.explain()
+    assert "observed=66.67%, evaluated=6 documents" in result.explain()
+    stages = [s for s in result.report["stages"] if s["op"] == "filter"]
+    assert [s["written_pos"] for s in stages] == [1, 0]
 
 
 def test_query_rows_observers_and_saved_reports(sess, tmp_path):

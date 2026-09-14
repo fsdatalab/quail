@@ -351,7 +351,8 @@ class ScanRuntime:
                 f"no prepared source for input {node.input_id!r}"
             )
         value = context.sources[node.input_id]
-        return NodeResult({f"ids:{node.alias}": value})
+        return NodeResult({f"ids:{node.alias}": value},
+                          NodeMetrics(output_rows=_row_count(value) or 0))
 
 
 class ExchangeRuntime:
@@ -411,6 +412,17 @@ class BarrierRuntime:
             )
             for alias in node.aliases
         })
+
+
+def _row_count(value) -> int | None:
+    """Rows of a table or sequence, or None when counting would run a plan."""
+    if isinstance(value, QueryResult):
+        return value.known_count()
+    if hasattr(value, "num_rows"):
+        return int(value.num_rows)
+    if hasattr(value, "__len__"):
+        return len(value)
+    return None
 
 
 def _ids_of(value) -> list:
@@ -647,7 +659,9 @@ class ProjectRuntime:
         value = next(iter(inputs.values()))
         if context.project is not None:
             value = context.project(node, value)
-        return NodeResult({"rows": value})
+        rows = _row_count(value) or 0
+        return NodeResult({"rows": value},
+                          NodeMetrics(input_rows=rows, output_rows=rows))
 
 
 class LimitRuntime:
@@ -660,13 +674,15 @@ class LimitRuntime:
             raise ValueError("Limit needs one input")
         value = next(iter(inputs.values()))
 
+        rows = _row_count(value) or 0
         if isinstance(value, QueryResult):
             value = value.with_limit(node.count)
         elif hasattr(value, "slice"):
             value = value.slice(0, node.count)
         else:
             value = value[:node.count]
-        return NodeResult({"rows": value})
+        return NodeResult({"rows": value}, NodeMetrics(
+            input_rows=rows, output_rows=_row_count(value) or 0))
 
 
 class ModelNodeRuntime:

@@ -307,7 +307,8 @@ def test_physical_explain_shows_shared_inputs_and_metrics():
     measured = {node.node_id: NodeMetrics(output_rows=42, wall_s=1.25,
                                          fresh_tokens=200)}
     text = physical_tree(graph, metrics=measured)
-    assert "actual_rows=42, wall_s=1.250" in text
-    assert "estimated_rows" not in text
+    assert ("actual_rows=42, estimated_rows=100, wall_s=1.250, "
+            "fresh_tokens=200") in text
+    assert "estimated_seconds" not in text
     assert "fresh_tokens=200" in physical_tree(
         graph, metrics=measured, verbose=True)

@@ -588,11 +588,33 @@ class Query:
                 len(self._doc_tokens[right_alias]))
         return fractions
 
-    def explain(self, *, verbose: bool = False) -> str:
-        """Return the optimized plan, optionally including runtime settings."""
+    def explain(self, *, verbose: bool = False,
+                analyze: bool = False) -> str:
+        """Return the optimized plan, optionally measured by running it.
+
+        Args:
+            verbose: Include runtime settings and internal node fields.
+            analyze: Run the query first, like EXPLAIN ANALYZE, and show
+                each node's measured rows, time, and tokens beside the
+                planner's estimates, then the measured totals.
+        """
         # plan() first: it replaces self.logical with the optimized tree
         physical = self.plan()
-        text = explain(self.logical, physical, verbose=verbose)
+        result = None
+        if analyze:
+            result = self.run()
+            # the root relation is lazy, so its row count is taken here
+            rows = result.count()
+            root = physical.graph.root.node_id
+            result.node_metrics[root] = replace(
+                result.node_metrics.get(root, NodeMetrics()),
+                output_rows=rows)
+            result.report.setdefault("node_metrics", {}).setdefault(
+                root, {})["output_rows"] = rows
+        text = explain(self.logical, physical, verbose=verbose,
+                       result=result,
+                       usd_per_hour=(
+                           self.session.device.usd_per_hour or None))
         if self._estimated:
             text += ("\n\n  note: token counts for "
                      + ", ".join(repr(a) for a in self._estimated)
@@ -759,6 +781,8 @@ class Query:
                 ),
                 projection=projection,
                 report={},
+                row_count=(value.num_rows if isinstance(value, pa.Table)
+                           else None),
             )
 
         sources = {
@@ -890,6 +914,7 @@ class Query:
                 answer_tables["filters"][(alias, written_pos)] = stage_table
                 report["stages"].append(dict(
                     op="filter", alias=alias, stage=index,
+                    written_pos=written_pos,
                     provided_selectivity=(
                         logical_filters[alias][written_pos].selectivity
                     ),
@@ -941,7 +966,7 @@ class Query:
             answers = table.column("answer")
             answer_tables["joins"][written_pos] = table
             report["stages"].append(dict(
-                op="join", anchor=anchor,
+                op="join", written_pos=written_pos, anchor=anchor,
                 partners=partners,
                 semantics=semantics,
                 provided_selectivity=logical_join.selectivity,
