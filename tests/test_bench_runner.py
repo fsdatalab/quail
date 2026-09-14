@@ -151,14 +151,14 @@ def _query(sess):
 def _run(query, join_answers):
     def execute(request):
         from quail.builtins import built_in_registry
-        from quail.execution import PhysicalResponse, export_physical_outputs
+        from quail.execution.runner import NodeMetrics, NodeResult, RunResult
+        from quail.execution.types import PhysicalResponse, export_physical_outputs
         from quail.physical import (
             AiFilter,
             AiJoin,
             Scan,
             decode_graph,
         )
-        from quail.runtime.runner import NodeMetrics, NodeResult, RunResult
 
         graph = decode_graph(request.plan["graph"], built_in_registry().codecs)
         filtered = next(
@@ -203,7 +203,7 @@ def _run(query, join_answers):
             "peak_gib": 1.0,
         })
 
-    from quail.runtime.execute import execute_query
+    from quail.execution.execute import execute_query
 
     return execute_query(query, physical_executor=execute)
 
@@ -211,10 +211,10 @@ def _run(query, join_answers):
 def _run_request_backend(query, join_answers):
     def execute(request):
         from quail.builtins import built_in_registry
-        from quail.execution import PhysicalResponse, export_physical_outputs
+        from quail.execution.result import answer_table
+        from quail.execution.runner import NodeMetrics, NodeResult, RunResult
+        from quail.execution.types import PhysicalResponse, export_physical_outputs
         from quail.physical import RequestExecution, decode_graph
-        from quail.runtime.result import answer_table
-        from quail.runtime.runner import NodeMetrics, NodeResult, RunResult
 
         graph = decode_graph(request.plan["graph"], built_in_registry().codecs)
         model = next(
@@ -264,7 +264,7 @@ def _run_request_backend(query, join_answers):
             "peak_gib": 1.0,
         })
 
-    from quail.runtime.execute import execute_query
+    from quail.execution.execute import execute_query
 
     return execute_query(query, physical_executor=execute)
 

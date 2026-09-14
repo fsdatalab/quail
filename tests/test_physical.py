@@ -10,6 +10,7 @@ import pytest
 import quail
 from quail.builtins import built_in_registry
 from quail.catalog import DocumentProvider
+from quail.execution.runner import NodeResult
 from quail.physical import (
     ExecutionLocation,
     InputPort,
@@ -24,7 +25,6 @@ from quail.physical import (
 )
 from quail.physical.optimizer import PhysicalCandidate, SupportResult
 from quail.planner.plan import EngineConfig, PhysicalPlan
-from quail.runtime.runner import NodeResult
 
 
 @dataclass(frozen=True)
@@ -218,14 +218,14 @@ def test_physical_extensions_plan_validate_and_execute(monkeypatch):
         import sys
         import types
 
+        from quail.execution.execute import _execute_physical
         from quail.physical import plan_envelope
-        from quail.runtime.execute import _execute_physical
 
         class ExampleBackend:
             name = "test.example"
 
             def execute_request(self, context):
-                from quail.execution import PhysicalResponse
+                from quail.execution.types import PhysicalResponse
 
                 return PhysicalResponse({}, {
                     "backend": self.name,
@@ -248,7 +248,7 @@ def test_physical_extensions_plan_validate_and_execute(monkeypatch):
             n_docs=2,
         )
         graph = PhysicalGraph((scan,), PortRef("input:d", "ids:d"))
-        from quail.execution import (
+        from quail.execution.types import (
             PhysicalRequest,
             document_input,
         )
@@ -298,8 +298,8 @@ def test_physical_explain_shows_shared_inputs_and_metrics():
     assert "input:d" not in text
     assert "input:d[ids:d]" in graph.explain(verbose=True)
 
+    from quail.execution.runner import NodeMetrics
     from quail.explain import physical_tree
-    from quail.runtime.runner import NodeMetrics
 
     node = Scan(node_id="input:d", alias="d", n_docs=100)
     graph = PhysicalGraph((node,), PortRef(node.node_id, "ids:d"))

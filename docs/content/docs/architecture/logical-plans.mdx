@@ -158,7 +158,7 @@ also be expressed as logical rules.
 
 Filter placement (filters above their scans, before joins) is
 handled during plan construction in
-[`LogicalPlanBuilder`](https://github.com/fsdatalab/quail/blob/main/quail/logical.py).
+[`LogicalPlanBuilder`](https://github.com/fsdatalab/quail/blob/main/quail/logical/nodes.py).
 
 Extensions can register additional rules through
 `registry.register_logical_rule(...)`.

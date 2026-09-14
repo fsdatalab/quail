@@ -8,9 +8,9 @@ from typing import ClassVar
 import pytest
 
 from quail.builtins import built_in_registry
+from quail.execution.runner import ExecutionContext, GenericRunner, ScanRuntime
 from quail.physical import NodeCodec, PhysicalGraph, PortRef, Scan
 from quail.physical.optimizer import apply_physical_rules
-from quail.runtime.runner import ExecutionContext, GenericRunner, ScanRuntime
 
 
 @dataclass(frozen=True)

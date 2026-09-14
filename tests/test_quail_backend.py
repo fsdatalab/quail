@@ -17,6 +17,7 @@ from quail.backends.quail import QuailModelExecution
 from quail.backends.quail.distributed import execute_distributed_graph
 from quail.backends.quail.graph import execute_single_graph
 from quail.builtins import built_in_registry
+from quail.execution.runner import NodeMetrics, NodeResult
 from quail.physical import (
     AiFilter,
     AiJoin,
@@ -27,7 +28,6 @@ from quail.physical import (
     Scan,
 )
 from quail.physical.base import input_ports
-from quail.runtime.runner import NodeMetrics, NodeResult
 from quail.specs import DEVICES, MODELS
 
 
@@ -260,7 +260,7 @@ def test_filter_execution_and_retention_inputs(monkeypatch):
             received["retain_survivors"] = retain_survivors
             return {0: [True]}, [], 3
 
-        patch.setattr("quail.executor.loop.run_filter", fake_run_filter)
+        patch.setattr("quail.backends.quail.executor.loop.run_filter", fake_run_filter)
         execution = QuailModelExecution(SimpleNamespace())
         execution.bind_loaded_model(
             model=object(), arena=FakeArena(), pipeline=SimpleNamespace()

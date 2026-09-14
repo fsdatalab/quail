@@ -13,9 +13,9 @@ Torch is imported lazily when model execution starts.
 
 import time
 
-from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
-from quail.executor.model import answer_weights
-from quail.executor.pack import FilterAdmission, JoinAdmission
+from quail.backends.quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
+from quail.backends.quail.executor.model import answer_weights
+from quail.backends.quail.executor.pack import FilterAdmission, JoinAdmission
 from quail.logical import true_false_ids
 from quail.progress import Progress, logger, quiet
 

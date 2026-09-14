@@ -12,7 +12,23 @@ import pyarrow as pa
 from quail.backends.base import GpuContext
 from quail.backends.request_scheduling import run_join_grouped, true_bit
 from quail.cost import budgets
-from quail.execution import PhysicalResponse, export_physical_outputs
+from quail.execution.pairs import (
+    allowed_members,
+    members_by_partner,
+    pair_partner,
+    partner_map,
+)
+from quail.execution.result import answer_table
+from quail.execution.runner import (
+    ExecutionContext,
+    GenericRunner,
+    ModelNodeRuntime,
+    NodeMetrics,
+    NodeResult,
+    compute_subgraph,
+    scalar_node_metrics,
+)
+from quail.execution.types import PhysicalResponse, export_physical_outputs
 from quail.logical import SHARED_PRE, Apply, join_outer_input
 from quail.physical import (
     Limit,
@@ -39,22 +55,6 @@ from quail.planner import (
 )
 from quail.planner.joins import search_joins, summarize_alias
 from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
-from quail.runtime.pairs import (
-    allowed_members,
-    members_by_partner,
-    pair_partner,
-    partner_map,
-)
-from quail.runtime.result import answer_table
-from quail.runtime.runner import (
-    ExecutionContext,
-    GenericRunner,
-    ModelNodeRuntime,
-    NodeMetrics,
-    NodeResult,
-    compute_subgraph,
-    scalar_node_metrics,
-)
 
 
 def _answer_ids(tokenizer) -> tuple[list[int], list[int]]:

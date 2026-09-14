@@ -8,11 +8,11 @@ from test_quail_backend import graph_state
 import quail
 from quail.backends.quail.graph import execute_single_graph, filter_result
 from quail.bench import quailb
-from quail.execution import PhysicalResponse
+from quail.execution.execute import execute_query
+from quail.execution.runner import NodeMetrics, NodeResult, SurvivorStream
+from quail.execution.types import PhysicalResponse
 from quail.physical import AiFilter, AiJoin, Barrier, Scan, decode_graph
 from quail.planner.plan import EngineConfig
-from quail.runtime.execute import execute_query
-from quail.runtime.runner import NodeMetrics, NodeResult, SurvivorStream
 from quail_b import prompts
 from quail_b.queries import FILTER_SELECTIVITY_ESTIMATES
 
@@ -206,7 +206,7 @@ def test_fixed_order_execution_and_backend_planning(monkeypatch):
 def test_distributed_fev9_executes_bound_join_nodes(monkeypatch):
     from quail.backends.quail import worker
     from quail.backends.quail.distributed import execute_distributed_graph
-    from quail.runtime.runner import ExecutionContext
+    from quail.execution.runner import ExecutionContext
     from quail.specs import H100_SXM, QWEN3_4B_FP8
 
     with quail.Session(_config(gpus=2, backend="quail"),
@@ -259,7 +259,7 @@ def test_distributed_fev9_executes_bound_join_nodes(monkeypatch):
 
 
 def _fever_children(session, docs, count):
-    from quail.runtime.runner import ExecutionContext
+    from quail.execution.runner import ExecutionContext
 
     children = []
     for _ in range(count):

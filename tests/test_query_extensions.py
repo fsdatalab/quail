@@ -7,7 +7,7 @@ import pyarrow.parquet as pq
 from modal._serialization import deserialize, serialize
 
 import quail
-from quail.execution import PhysicalResponse
+from quail.execution.types import PhysicalResponse
 
 
 def _tokens(text):
@@ -17,11 +17,11 @@ def _tokens(text):
 def test_query_scans_provider_and_preserves_extension_objects(
     tmp_path, monkeypatch
 ):
-    from quail.execution import export_physical_outputs
+    from quail.execution import execute as runtime
+    from quail.execution.runner import NodeMetrics, NodeResult, RunResult
+    from quail.execution.session import Session
+    from quail.execution.types import export_physical_outputs
     from quail.physical import AiFilter, Scan, decode_graph
-    from quail.runtime import execute as runtime
-    from quail.runtime.runner import NodeMetrics, NodeResult, RunResult
-    from quail.runtime.session import Session
 
     path = tmp_path / "documents.parquet"
     pq.write_table(pa.table({

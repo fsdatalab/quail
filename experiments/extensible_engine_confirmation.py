@@ -88,7 +88,7 @@ def _save(name: str, value: dict) -> str:
 
 
 def _query_record(query_id, query, gpu_count):
-    from quail.runtime.execute import execute_query
+    from quail.execution.execute import execute_query
     from quail.specs import H100_USD_PER_HOUR
 
     result = execute_query(query)
@@ -143,8 +143,8 @@ def confirm_4b(
     import torch
 
     from quail.bench.quailb import queries, register_tables
+    from quail.execution.session import Session
     from quail.planner.plan import EngineConfig
-    from quail.runtime.session import Session
     from quail_b.data import build_sets
 
     data = build_sets("/results/quailb_data", 0.1)

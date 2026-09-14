@@ -1,6 +1,8 @@
 """Quail: a declarative query engine for AI_FILTER and AI_JOIN."""
 
 from quail.catalog import DocumentProvider, ScanRequest, TableProvider
+from quail.execution.result import QueryResult
+from quail.execution.session import Query, RefusalError, Session
 from quail.extensions import ExtensionRegistry
 from quail.frontend.builder import col, prompt
 from quail.frontend.sql import SQLDialect
@@ -15,8 +17,6 @@ from quail.logical import (
 from quail.physical import NodeCodec, PhysicalGraph, PhysicalNode
 from quail.planner.estimate import SpeedOfLightEstimate, speed_of_light_estimate
 from quail.planner.plan import EngineConfig
-from quail.runtime.result import QueryResult
-from quail.runtime.session import Query, RefusalError, Session
 
 __all__ = [
     "SHARED_PRE",

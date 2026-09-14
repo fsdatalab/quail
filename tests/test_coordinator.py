@@ -10,7 +10,7 @@ from quail.backends.quail.coordinator import (
     merge_join_round,
     thin_survivors,
 )
-from quail.execution import join_answer_cells
+from quail.execution.types import join_answer_cells
 from quail.physical import AiFilter
 
 

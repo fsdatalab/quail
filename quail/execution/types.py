@@ -10,6 +10,8 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.compute as pc
 
+from quail.execution.pairs import COLUMNS_PREFIX
+from quail.execution.tokens import decode_token_documents
 from quail.physical import (
     AiFilter,
     OutputPort,
@@ -17,8 +19,6 @@ from quail.physical import (
     PortRef,
     ValueType,
 )
-from quail.runtime.pairs import COLUMNS_PREFIX
-from quail.runtime.tokens import decode_token_documents
 
 
 @dataclass(frozen=True)
@@ -48,7 +48,7 @@ class PhysicalRequest:
     """A physical plan, its token input bindings, and its relations.
 
     relations holds one value table per alias a HashJoin or an apply()
-    function reads, keyed ``columns:<alias>``; see quail.runtime.pairs.
+    function reads, keyed ``columns:<alias>``; see quail.execution.pairs.
     """
 
     plan: Mapping[str, Any]

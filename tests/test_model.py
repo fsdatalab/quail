@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from quail.executor.model import answer_weights, retain_answer_head
+from quail.backends.quail.executor.model import answer_weights, retain_answer_head
 
 
 @pytest.fixture
@@ -68,8 +68,8 @@ def test_retained_answer_weights_and_embedding_ownership(torch):
 
 
 def test_answerers_preserve_scores_and_share_retained_weights(torch):
+    from quail.backends.quail.executor.loop import Answerer
     from quail.backends.quail.worker import _PayloadAnswerer
-    from quail.executor.loop import Answerer
 
     model = _model(torch)
     hidden = torch.tensor([[1, 2, -1, 0], [0, 1, 3, -2]], dtype=torch.bfloat16)

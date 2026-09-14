@@ -6,6 +6,13 @@ import time
 from dataclasses import dataclass, field, fields, replace
 from typing import Any, Callable, Mapping, Protocol
 
+from quail.execution.pairs import columns_key, pair_ids_table, pair_table
+from quail.execution.result import (
+    IndexRelation,
+    QueryResult,
+    build_result_declaration,
+    true_answer_rows,
+)
 from quail.physical import (
     Barrier,
     Exchange,
@@ -21,13 +28,6 @@ from quail.physical import (
     Recombine,
     Scan,
     ValueType,
-)
-from quail.runtime.pairs import columns_key, pair_ids_table, pair_table
-from quail.runtime.result import (
-    IndexRelation,
-    QueryResult,
-    build_result_declaration,
-    true_answer_rows,
 )
 
 
@@ -374,7 +374,7 @@ class BarrierRuntime:
         import pyarrow as pa
         import pyarrow.compute as pc
 
-        from quail.execution import _join_answers_table
+        from quail.execution.types import _join_answers_table
 
         survivors = {}
         tables = []

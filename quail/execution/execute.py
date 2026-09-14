@@ -4,7 +4,8 @@ import os
 import time
 
 from quail.backends import BackendExecutionContext
-from quail.execution import PhysicalRequest, PhysicalResponse
+from quail.execution.session import RefusalError
+from quail.execution.types import PhysicalRequest, PhysicalResponse
 from quail.physical import (
     Scan,
     check_plan_envelope,
@@ -12,7 +13,6 @@ from quail.physical import (
     validate_streams,
 )
 from quail.planner.plan import Refusal
-from quail.runtime.session import RefusalError
 
 # Loaded models outlive individual sessions.
 _BACKEND_STATE: dict = {}

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from quail.runtime.tokens import shared_prefix_lengths
+from quail.execution.tokens import shared_prefix_lengths
 
 # store path -> per document prefix credits; a corpus is measured once
 # per process however many queries scan it

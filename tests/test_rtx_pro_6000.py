@@ -6,8 +6,8 @@ from types import ModuleType
 import pyarrow as pa
 
 import quail
+from quail.backends.quail.executor.attention import Pipeline, flash_attention_version
 from quail.cost import budgets
-from quail.executor.attention import Pipeline, flash_attention_version
 from quail.specs import H100_SXM, MODELS, RTX_PRO_6000_BLACKWELL_SERVER
 
 

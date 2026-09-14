@@ -5,7 +5,7 @@ import random
 import pytest
 from fakes import expected_filter_rows, run_streamed
 
-from quail.executor.pack import (
+from quail.backends.quail.executor.pack import (
     FilterAdmission,
     JoinAdmission,
     assemble,

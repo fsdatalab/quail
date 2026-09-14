@@ -127,18 +127,18 @@ def _write(result, name):
 def _boot_state(model):
     """Boot the worker state dict, as the worker's own boot does.
 
-    Mirrors quail.runtime.execute._execute_physical's boot with the
+    Mirrors quail.execution.execute._execute_physical's boot with the
     shipping Pipeline; warm_kernels runs the same tiered warmup.
     """
     import torch
     import torch.nn.functional as F
     from transformers import AutoTokenizer
 
+    from quail.backends.quail.executor.arena import KVArena
+    from quail.backends.quail.executor.attention import FILTER_ATTENTION, Pipeline
+    from quail.backends.quail.executor.loop import Answerer, AsyncAnswers, warm_kernels
+    from quail.backends.quail.executor.model import load_model
     from quail.cost import budgets
-    from quail.executor.arena import KVArena
-    from quail.executor.attention import FILTER_ATTENTION, Pipeline
-    from quail.executor.loop import Answerer, AsyncAnswers, warm_kernels
-    from quail.executor.model import load_model
     from quail.specs import DEVICES, MODELS
 
     spec = MODELS[model]
@@ -201,17 +201,17 @@ def _quailb_session(model, sf, gpus=1):
 
 def _run_query(state, build, captured):
     """One query through the real planner and worker core."""
+    from quail.backends.quail.executor.loop import AsyncAnswers
     from quail.backends.quail.worker import (
         _PayloadAnswerer,
         execute_single,
         quail_runtime_payload,
     )
-    from quail.execution import PhysicalResponse
-    from quail.executor.loop import AsyncAnswers
-    from quail.runtime.execute import (
+    from quail.execution.execute import (
         _validate_physical_request,
         execute_query,
     )
+    from quail.execution.types import PhysicalResponse
 
     def execute(request):
         request, registry, graph, _ = _validate_physical_request(
@@ -341,14 +341,14 @@ class ProfilerWindows:
 class LoopRecorder:
     """Records the execution loops from outside the engine.
 
-    Wraps quail.executor.loop.run_filter / run_join (module
+    Wraps quail.backends.quail.executor.loop.run_filter / run_join (module
     attributes, bound at the worker's call time), the pipeline's
     forward_chunk, and the arena's blocked-admission eviction method.
     Restores everything in unpatch().
     """
 
     def __init__(self, state, profiler=None):
-        import quail.executor.loop as loop_mod
+        import quail.backends.quail.executor.loop as loop_mod
 
         self.loop_mod = loop_mod
         self.torch = state["torch"]

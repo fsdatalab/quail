@@ -9,7 +9,7 @@ import pytest
 from test_session import make_executor
 
 import quail
-from quail.runtime import execute as execution
+from quail.execution import execute as execution
 
 
 def _tokens(text):
@@ -41,7 +41,7 @@ IMPORT_TEXT = """
 import sys
 import quail
 from quail.bench import quailb
-from quail.runtime import execute
+from quail.execution import execute
 from demos import quickstart
 
 assert "modal" not in sys.modules
@@ -64,7 +64,7 @@ def test_engine_import_and_gpu_requirement(monkeypatch):
 
 def test_query_reuses_plan_and_device(monkeypatch):
     with monkeypatch.context() as patch:
-        from quail.runtime import session as session_module
+        from quail.execution import session as session_module
 
         patch.setattr(execution, "gpu_problem", lambda: None)
         patch.setattr(execution, "_prepare_backend", lambda *args: None)

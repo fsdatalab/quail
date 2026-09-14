@@ -1,6 +1,6 @@
 """CPU check for the shared prefix credit."""
 
-from quail.runtime.prefixes import shared_prefix_tokens
+from quail.planner.prefixes import shared_prefix_tokens
 
 
 def test_shared_prefix_tokens_credits_the_trie_savings():

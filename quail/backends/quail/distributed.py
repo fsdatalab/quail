@@ -6,16 +6,8 @@ import time
 
 from quail.backends.quail import coordinator
 from quail.backends.quail.graph import executed_join_plan, model_answers
-from quail.execution import export_physical_outputs
-from quail.physical import (
-    AiFilter,
-    AiJoin,
-    PhysicalGraph,
-    Scan,
-)
-from quail.planner import balanced_shards
-from quail.runtime.pairs import columns_key
-from quail.runtime.runner import (
+from quail.execution.pairs import columns_key
+from quail.execution.runner import (
     ExecutionContext,
     GenericRunner,
     NodeMetrics,
@@ -24,6 +16,14 @@ from quail.runtime.runner import (
     compute_subgraph,
     scalar_node_metrics,
 )
+from quail.execution.types import export_physical_outputs
+from quail.physical import (
+    AiFilter,
+    AiJoin,
+    PhysicalGraph,
+    Scan,
+)
+from quail.planner import balanced_shards
 
 
 class DistributedQuailExecution:

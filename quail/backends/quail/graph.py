@@ -5,22 +5,16 @@ from __future__ import annotations
 import itertools
 import time
 
+from quail.backends.quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
 from quail.backends.quail.retention import apply_retention, retain_after_join
-from quail.execution import export_physical_outputs
-from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
-from quail.physical import (
-    AiFilter,
-    AiJoin,
-    PhysicalGraph,
-)
-from quail.runtime.pairs import (
+from quail.execution.pairs import (
     allowed_members,
     columns_key,
     members_by_partner,
     pair_partner,
     partner_map,
 )
-from quail.runtime.runner import (
+from quail.execution.runner import (
     ExecutionContext,
     GenericRunner,
     ModelNodeRuntime,
@@ -31,7 +25,13 @@ from quail.runtime.runner import (
     compute_subgraph,
     scalar_node_metrics,
 )
-from quail.runtime.tokens import DocumentPrefixes, chain_tokens
+from quail.execution.tokens import DocumentPrefixes, chain_tokens
+from quail.execution.types import export_physical_outputs
+from quail.physical import (
+    AiFilter,
+    AiJoin,
+    PhysicalGraph,
+)
 
 
 def quail_runtimes() -> dict:

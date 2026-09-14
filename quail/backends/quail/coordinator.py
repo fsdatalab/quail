@@ -5,10 +5,10 @@ process between child GPUs.
 """
 
 from quail.backends.quail.graph import partner_maps, runs_over_pairs
-from quail.execution import join_answer_cells
+from quail.execution.pairs import pair_partner
+from quail.execution.tokens import select_documents
+from quail.execution.types import join_answer_cells
 from quail.planner import balanced_shards
-from quail.runtime.pairs import pair_partner
-from quail.runtime.tokens import select_documents
 
 
 def _common_payload(payload: dict) -> dict:

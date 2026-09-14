@@ -9,9 +9,9 @@ import pytest
 from fakes import register_claims_evidence
 
 import quail
+from quail.execution.pairs import pair_fraction, pair_table, partner_map
 from quail.physical import AiJoin
 from quail.planner.plan import EngineConfig
-from quail.runtime.pairs import pair_fraction, pair_table, partner_map
 
 
 def _parquet(path, table):
@@ -24,7 +24,7 @@ def fake_tok(text):
 
 
 def _run(query, execute):
-    from quail.runtime.execute import execute_query
+    from quail.execution.execute import execute_query
 
     return execute_query(query, physical_executor=execute)
 
@@ -110,9 +110,9 @@ def make_executor(filter_truth, join_truth=None, seen=None):
         from test_quail_backend import graph_state
 
         from quail.backends.quail.graph import execute_single_graph
-        from quail.execution import PhysicalResponse
+        from quail.execution.runner import NodeResult
+        from quail.execution.types import PhysicalResponse
         from quail.physical import AiFilter, Scan
-        from quail.runtime.runner import NodeResult
 
         runtime = runtime_plan(request)
         if seen is not None:
@@ -216,7 +216,7 @@ def test_query_rows_observers_and_saved_reports(sess, tmp_path):
     with pytest.raises(KeyError):
         result.observer("example.missing")
 
-    from quail.runtime.result import QueryResult
+    from quail.execution.result import QueryResult
 
     # Saved reports can be loaded separately from their result tables.
     table, report = result.collect(), dict(result.report)

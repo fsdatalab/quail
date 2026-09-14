@@ -14,7 +14,7 @@ current forward pass, the CPU prepares the next one.
 
 ## The runner
 
-[`GenericRunner`](https://github.com/fsdatalab/quail/blob/main/quail/runtime/runner.py)
+[`GenericRunner`](https://github.com/fsdatalab/quail/blob/main/quail/execution/runner.py)
 walks the physical plan's nodes in topological order. For each node
 it calls the registered runtime, checks the output ports, records
 metrics, and notifies any observers.
@@ -78,7 +78,7 @@ of model forward passes. The operator loops above pack documents
 submit each batch as one forward pass on the GPU.
 
 Quail loads the model using
-[vLLM's weight loader](https://github.com/fsdatalab/quail/blob/main/quail/executor/model.py),
+[vLLM's weight loader](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/model.py),
 which handles checkpoint download, weight merging (QKV and gate-up
 projections), and FP8 quantization layout for DeepGEMM. No vLLM
 engine, scheduler, or KV pool is used — Quail uses vLLM only as a
@@ -137,15 +137,15 @@ CPU process divides the work and collects results.
 ## GPU code
 
 All GPU execution code is in
-[quail/executor/](https://github.com/fsdatalab/quail/tree/main/quail/executor):
+[quail/backends/quail/executor/](https://github.com/fsdatalab/quail/tree/main/quail/backends/quail/executor):
 
 | File | What it does |
 | --- | --- |
-| [`pack.py`](https://github.com/fsdatalab/quail/blob/main/quail/executor/pack.py) | Admission logic for filters and joins. |
-| [`arena.py`](https://github.com/fsdatalab/quail/blob/main/quail/executor/arena.py) | Paged KV arena and page accounting. |
-| [`attention.py`](https://github.com/fsdatalab/quail/blob/main/quail/executor/attention.py) | Forward pass with two-call attention and log-sum-exp merge. |
-| [`loop.py`](https://github.com/fsdatalab/quail/blob/main/quail/executor/loop.py) | Overlapped filter and join execution loops. |
-| [`model.py`](https://github.com/fsdatalab/quail/blob/main/quail/executor/model.py) | Weight loading through vLLM's loader. |
+| [`pack.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/pack.py) | Admission logic for filters and joins. |
+| [`arena.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/arena.py) | Paged KV arena and page accounting. |
+| [`attention.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/attention.py) | Forward pass with two-call attention and log-sum-exp merge. |
+| [`loop.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/loop.py) | Overlapped filter and join execution loops. |
+| [`model.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/model.py) | Weight loading through vLLM's loader. |
 
 The fused kernels assume the Qwen3 architecture: QK-norm before
 RoPE, gated SiLU MLP, FP8 block-quantized weights.

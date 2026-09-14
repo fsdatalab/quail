@@ -14,11 +14,11 @@ import pyarrow as pa
 
 import quail
 from quail.backends.quail import QuailModelExecution
+from quail.backends.quail.executor import loop
+from quail.backends.quail.executor.arena import KVArena, PageArena
+from quail.backends.quail.executor.attention import JOIN_ATTENTION
 from quail.backends.quail.graph import execute_single_graph
 from quail.builtins import built_in_registry
-from quail.executor import loop
-from quail.executor.arena import KVArena, PageArena
-from quail.executor.attention import JOIN_ATTENTION
 from quail.physical import (
     AiFilter,
     AiJoin,

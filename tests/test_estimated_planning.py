@@ -6,7 +6,7 @@ import pyarrow as pa
 from test_session import make_executor
 
 import quail
-from quail.runtime import execute as execution
+from quail.execution import execute as execution
 
 DOCS = pa.table({
     "id": [f"d{i}" for i in range(6)],

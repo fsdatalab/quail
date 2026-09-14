@@ -8,8 +8,8 @@ import pytest
 from test_session import make_executor
 
 from demos import quickstart, quickstart_modal
-from quail.runtime import execute as execution
-from quail.runtime.session import Session
+from quail.execution import execute as execution
+from quail.execution.session import Session
 
 
 def test_quickstarts_return_collected_rows_after_session_closes(monkeypatch, tmp_path):

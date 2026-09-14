@@ -1,8 +1,8 @@
 """Shared retention priority, capacity, and eviction tests."""
 
 
+from quail.backends.quail.executor.arena import KVArena, PageArena
 from quail.cost.retention import RetentionPolicy
-from quail.executor.arena import KVArena, PageArena
 
 
 def cpu_arena(pages, cap, uses):
@@ -85,8 +85,8 @@ def test_retention_priority_capacity_and_eviction():
 def test_filter_chains_share_retention_and_return_evicted_pages(monkeypatch):
     from types import SimpleNamespace
 
-    from quail.executor import loop
-    from quail.executor.attention import FILTER_ATTENTION
+    from quail.backends.quail.executor import loop
+    from quail.backends.quail.executor.attention import FILTER_ATTENTION
 
     arena = cpu_arena(32, 8, {'e1': (1, 0), 'e2': (1, 1)})
 

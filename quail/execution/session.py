@@ -15,7 +15,24 @@ from pyarrow import compute as pc
 
 from quail.builtins import built_in_registry
 from quail.catalog import Catalog, ScanRequest, TableProvider
-from quail.execution import PhysicalRequest, document_input
+from quail.execution.pairs import (
+    columns_key,
+    pair_fraction,
+    pair_table,
+)
+from quail.execution.result import IndexRelation, QueryResult, true_answer_rows
+from quail.execution.runner import (
+    ExecutionContext,
+    GenericRunner,
+    NodeMetrics,
+    scalar_node_metrics,
+)
+from quail.execution.tokens import (
+    ColumnStoreWriter,
+    ScanInput,
+    TokenStoreWriter,
+)
+from quail.execution.types import PhysicalRequest, document_input
 from quail.extensions import ExtensionRegistry
 from quail.frontend.builder import Query as BuilderQuery
 from quail.frontend.sql import SQLDialect, compile_sql
@@ -30,23 +47,6 @@ from quail.physical import PortRef, Project, Scan, ValueType, encode_graph
 from quail.planner import collect_applies, collect_operators, explain, plan_query
 from quail.planner.plan import EngineConfig, Refusal, resolve_model
 from quail.progress import Progress, say
-from quail.runtime.pairs import (
-    columns_key,
-    pair_fraction,
-    pair_table,
-)
-from quail.runtime.result import IndexRelation, QueryResult, true_answer_rows
-from quail.runtime.runner import (
-    ExecutionContext,
-    GenericRunner,
-    NodeMetrics,
-    scalar_node_metrics,
-)
-from quail.runtime.tokens import (
-    ColumnStoreWriter,
-    ScanInput,
-    TokenStoreWriter,
-)
 
 
 class RefusalError(RuntimeError):
@@ -616,7 +616,7 @@ class Query:
                 remove(), or move(); the planner's own plan when
                 omitted.
         """
-        from quail.runtime.execute import execute_query
+        from quail.execution.execute import execute_query
 
         return execute_query(self, plan=plan)
 
