@@ -2,7 +2,13 @@
 title: Overview
 ---
 
-This section describes how Quail works internally.
+Quail is structured like a traditional query engine: it parses a
+query into a logical plan, optimizes it, lowers it to a physical
+plan, and executes the physical plan. The execution model is
+Volcano-style (pull-based, operator at a time), but each operator
+processes documents in large batches sized to saturate the GPU.
+The goal is to keep the GPU busy on model forward passes and avoid
+idle time between batches.
 
 ## How a query runs
 
