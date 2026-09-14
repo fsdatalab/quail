@@ -22,21 +22,16 @@ This section describes how Quail works internally.
 
 ## Packages
 
-The packages follow the stages of a query, in the order a query passes
-through them. Each package imports only from the packages below it in
-this table.
+Each package imports only from the ones below it.
 
 | Package | What it does | Source |
 | --- | --- | --- |
-| `quail.frontend` | Parses AI SQL (`sql.py`) or builds plans from Python (`builder.py`) into a logical plan. | [frontend/](https://github.com/fsdatalab/quail/tree/main/quail/frontend) |
-| `quail.logical` | Logical node types (`nodes.py`) and prompt binding (`prompts.py`). Data types only; no rewriting. | [logical/](https://github.com/fsdatalab/quail/tree/main/quail/logical) |
-| `quail.physical` | Typed physical nodes with ports and plan encoding. Data types only. | [physical/](https://github.com/fsdatalab/quail/tree/main/quail/physical) |
-| `quail.planner` | Every plan transformation: the logical optimizer and its rules, the physical optimizer protocol, filter order, join order and anchors, KV retention schedule, and the speed-of-light estimate. | [planner/](https://github.com/fsdatalab/quail/tree/main/quail/planner) |
-| `quail.cost` | The cost model: work counts, roofline arithmetic, budgets, and retention prices. Arithmetic over the specs; imports nothing else. | [cost/](https://github.com/fsdatalab/quail/tree/main/quail/cost) |
-| `quail.execution` | Session, node runtimes and the runner, token store, results. | [execution/](https://github.com/fsdatalab/quail/tree/main/quail/execution) |
-| `quail.backends` | Model backends. `quail/` is Quail's own engine, with its GPU code under `quail/executor/`: packing, KV arena, attention, model loading. `vllm.py` and `sglang.py` are the baselines. | [backends/](https://github.com/fsdatalab/quail/tree/main/quail/backends) |
+| `quail.frontend` | SQL compiler and Python builder. | [frontend/](https://github.com/fsdatalab/quail/tree/main/quail/frontend) |
+| `quail.logical` | Logical plan nodes and prompt binding. | [logical/](https://github.com/fsdatalab/quail/tree/main/quail/logical) |
+| `quail.physical` | Physical plan nodes. | [physical/](https://github.com/fsdatalab/quail/tree/main/quail/physical) |
+| `quail.planner` | Logical rules, filter and join ordering, KV retention. | [planner/](https://github.com/fsdatalab/quail/tree/main/quail/planner) |
+| `quail.cost` | Cost model over the model and device specs. | [cost/](https://github.com/fsdatalab/quail/tree/main/quail/cost) |
+| `quail.execution` | Session, runner, token store, results. | [execution/](https://github.com/fsdatalab/quail/tree/main/quail/execution) |
+| `quail.backends` | Quail's GPU code (`backends/quail/executor/`) and the vLLM and SGLang baselines. | [backends/](https://github.com/fsdatalab/quail/tree/main/quail/backends) |
 | `quail.specs` | Model and device constants. | [specs/](https://github.com/fsdatalab/quail/tree/main/quail/specs) |
-
-`catalog.py`, `extensions.py`, `builtins.py`, `explain.py`, and
-`progress.py` stay at the top level; they are used by several stages.
 

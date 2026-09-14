@@ -102,8 +102,7 @@ Quail backend how to plan and cost the new node. Concretely:
 **Logical rules** rewrite the logical plan before physical planning.
 For example, a rule could rewrite `AI.CLASSIFY` with exactly two
 categories into an `AI_FILTER`, since two categories is equivalent
-to TRUE/FALSE. A rule gets the whole plan and walks it itself. Rules run
-in registration order and repeat until a round changes nothing.
+to TRUE/FALSE.
 
 **Physical rules** rewrite the physical graph after the planner
 selects one. For example, a rule could fuse consecutive classify
