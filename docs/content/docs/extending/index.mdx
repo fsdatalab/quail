@@ -55,8 +55,9 @@ session = quail.Session(config=config, registry=registry)
 Every name is checked for duplicates. Registering the same name
 twice raises `ValueError`.
 
-Table providers are registered directly on the session with
-`session.register(name, provider)`, not on the extension registry.
+Table providers are registered on the session with
+`session.register(name, provider)`. They do not go through the
+extension registry.
 
 ## On Modal
 

@@ -1,187 +1,79 @@
 ---
 title: Quickstart
-description: Install Quail, run one filter, and inspect its result.
 ---
 
-This quickstart runs a filter over eight published IMDB reviews. It uses
-QUAIL-B's IMDB-1 predicate to keep reviews that mention at least one positive
-aspect of the movie.
-
-You need a CUDA GPU, local or on Modal.
-
-## 1. Install
-
-Quail requires Python 3.12 and currently installs from this repository.
-Install [uv](https://docs.astral.sh/uv/getting-started/installation/) first,
-then run:
+## Install
 
 ```bash
-git clone https://github.com/fsdatalab/quail.git
-cd quail
-uv sync --no-dev
+pip install quail-engine
 ```
 
-## 2. Run the example
+Quail requires Python 3.12 and a CUDA GPU (local or on
+[Modal](/docs/user-guide/models#no-local-gpu-use-modal)).
 
-<Tabs items={['Local GPU', 'Modal H100']}>
-<Tab value="Local GPU">
+## Run a filter query with SQL
 
-```bash
-uv run python demos/quickstart.py
-```
-
-</Tab>
-<Tab value="Modal H100">
-
-Set up the Modal client once:
-
-```bash
-uv run --no-sync --with 'modal[api-proxy-support]==1.5.4' modal setup
-```
-
-Then submit the example and keep its full log:
-
-```bash
-mkdir -p results
-uv run --no-sync --with 'modal[api-proxy-support]==1.5.4' \
-  modal run demos/quickstart_modal.py \
-  2>&1 | tee results/quickstart.log
-```
-
-The command prints a Modal function call id before waiting for the result.
-Keep that id in the log so you can retrieve the call after a disconnect.
-
-</Tab>
-</Tabs>
-
-The example prints the matching review ids and an execution report. On a
-first run, model startup is reported separately from query time.
-
-<QueryOutput
-  title="Positive-aspect filter"
-  subtitle="September 13, 2026 · Qwen3 4B fp8 · 1 H100 · Quail backend"
-  metrics={[
-    { label: 'Rows returned', value: '4 / 8', detail: '50% selectivity' },
-    { label: 'Query time', value: '0.75 s', detail: 'startup excluded' },
-    { label: 'Model startup', value: '40.27 s', detail: 'cold process' },
-    { label: 'Fresh tokens', value: '1,117', detail: '8 documents' },
-  ]}
->
-
-```text
-[('rv0',), ('rv2',), ('rv3',), ('rv5',)]
-```
-
-</QueryOutput>
-
-This is measured output from Modal function call
-`fc-01M2CHCF0PZXTGTYV8N21BQ6CJ`. Its report is saved at
-`/results/docs-quickstart/f7dcd33796934181b89d3d6b740d5e82/filter.json`
-on the `quail-results` volume.
-
-## 3. Read the query
-
-[`demos/quickstart.py`](https://github.com/fsdatalab/quail/blob/main/demos/quickstart.py)
-does four things:
+This example filters the 100,000 movie reviews in the
+[Stanford IMDB dataset](https://huggingface.co/datasets/stanfordnlp/imdb)
+on an H100 SXM, keeping reviews that mention a positive aspect of the
+movie.
 
 ```python
+import pyarrow as pa, pyarrow.dataset as ds
 import quail
+from datasets import concatenate_datasets, load_dataset
 
-reviews = load_reviews()
+imdb = load_dataset("stanfordnlp/imdb")
+all_reviews = concatenate_datasets([imdb["train"], imdb["test"], imdb["unsupervised"]])
+reviews = ds.dataset(pa.table({
+    "id": pa.array(f"review-{i}" for i in range(len(all_reviews))),
+    "body": all_reviews.data.table.column("text"),
+}))
 
-config = quail.EngineConfig(
-    gpus=1,
-    model="qwen3-4b-fp8",
-    backend="quail",
-    device="h100-sxm",
-)
-
-with quail.Session(config) as session:
-    session.register(
-        "reviews",
-        quail.DocumentProvider.from_table(reviews, id_col="id"),
-    )
-    query = session.sql(FILTER_SQL)
-    result = query.run()
-    rows = result.collect()
-    report = result.report
+config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
+with quail.Session(config=config) as session:
+    session.register("reviews", quail.DocumentProvider.from_dataset(reviews, id_col="id"))
+    result = session.sql("""
+        SELECT r.id
+        FROM reviews r
+        WHERE AI_FILTER(PROMPT(
+            'Does this review mention a positive aspect of the movie?\n\n{0}',
+            r.body))
+    """, dialect="snowflake").collect()
+    print(result)
 ```
 
-1. `load_reviews()` downloads the public IMDB train split at a fixed revision
-   and selects eight short reviews.
-2. `Session.register()` gives the Arrow table the SQL name `reviews`.
-3. `Session.sql()` compiles the filter into a Quail logical plan.
-4. `run()` executes the filter. `collect()` returns an Arrow table.
+`session.register()` makes the dataset available under a SQL name.
+`AI_FILTER` evaluates the prompt on each review. The model returns
+TRUE or FALSE, and Quail returns the rows where the answer is TRUE.
 
-`FILTER_SQL` contains the complete predicate text:
+## Python builder API
 
-```sql
-SELECT r.id
-FROM reviews r
-WHERE AI_FILTER(PROMPT(
-  'Judge strictly from the review above whether it mentions at least one
-   positive aspect of the movie.
-
-   {0}
-
-   Instruction: answer TRUE if the review mentions at least one positive
-   aspect of the movie, FALSE otherwise.',
-  r.body
-))
-```
-
-The Python builder can express the same query without SQL. Both front ends
-compile to the same Quail logical plan.
-
-## 4. Inspect the result
-
-`Query.run()` returns a `QueryResult`:
+If you prefer building queries in Python instead of writing SQL, you
+can use the builder API:
 
 ```python
-rows = result.collect()     # pyarrow.Table
-count = result.count()      # number of matching rows
-metrics = result.report     # query time, token counts, and stage metrics
+from quail import col, prompt
+
+config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
+
+with quail.Session(config=config) as session:
+    session.register("reviews", quail.DocumentProvider.from_dataset(
+        reviews, id_col="id",
+    ))
+    result = (session.docs("reviews").alias("r")
+              .ai_filter(prompt(
+                  'Does this review mention a positive aspect of the movie?\n\n{0}',
+                  col("r.body")))
+              .select("r.id")
+              .collect())
 ```
 
-Start with these report fields:
+See the [Python API](/docs/user-guide/python-api) page for the full
+reference.
 
-| Field | Meaning |
-| --- | --- |
-| `wall_s` | Query time in seconds, excluding model startup. |
-| `boot_s` | Model startup time. |
-| `fresh_tokens` | Input tokens computed in model forward passes. |
-| `stages` | Rows or pairs evaluated and kept at each filter or join. |
-| `node_metrics` | Metrics for each physical plan node. |
+## Running on Modal
 
-See [Results and explain](/docs/user-guide/results) for every result method
-and report field.
-
-## 5. Inspect the plan without a GPU run
-
-Call `explain()` before `run()`:
-
-```python
-print(query.explain())
-```
-
-The output has two parts:
-
-- The logical plan shows the query's filters, joins, scans, and projection.
-- The physical plan shows the chosen backend, token budgets, expected row
-  counts, KV reuse, and estimated model time.
-
-Planning tokenizes a sample of each document column, but it does not execute
-the model.
-
-## Next steps
-
-<Cards>
-  <Card title="Write SQL" href="/docs/user-guide/sql"
-        description="Filters, joins, prompts, EXISTS, and refused syntax." />
-  <Card title="Use Python" href="/docs/user-guide/python-api"
-        description="Build the same logical plans without SQL." />
-  <Card title="Load your data" href="/docs/user-guide/sessions#registering-tables"
-        description="Register Arrow, Parquet, and Hugging Face tables." />
-  <Card title="Models and GPUs" href="/docs/user-guide/models"
-        description="Supported hardware and running on Modal." />
-</Cards>
+If you do not have a local GPU, you can run queries on Modal.
+See [No local GPU? Use Modal](/docs/user-guide/models#no-local-gpu-use-modal)
+for how to set up the function, volumes, and caches.
