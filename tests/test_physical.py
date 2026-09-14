@@ -22,8 +22,8 @@ from quail.physical import (
     ValueType,
     decode_graph,
 )
+from quail.physical.optimizer import PhysicalCandidate, SupportResult
 from quail.planner.plan import EngineConfig, PhysicalPlan
-from quail.planning import PhysicalCandidate, SupportResult
 from quail.runtime.runner import NodeResult
 
 

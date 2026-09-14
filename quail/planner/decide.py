@@ -35,12 +35,12 @@ from quail.physical import (
     Scan as PhysicalScan,
 )
 from quail.physical.base import input_ports
+from quail.physical.optimizer import ModelRegion, PlanningContext, apply_physical_rules
 from quail.planner import budgets, retention
 from quail.planner import joins as joinsearch
 from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
 from quail.planner.sol import speed_of_light, unrounded_seconds
 from quail.planner.work import Work, ask, scan
-from quail.planning import ModelRegion, PlanningContext, apply_physical_rules
 from quail.specs import DeviceSpec, ModelSpec
 
 # ---------------------------------------------------------- tree walk

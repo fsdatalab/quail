@@ -1,11 +1,11 @@
-"""Shared inputs and results for physical planning."""
+"""Physical optimizer rules and the planner protocol."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Protocol
 
-from quail.physical import PhysicalGraph
+from quail.physical.base import PhysicalGraph
 from quail.specs import DeviceSpec, ModelSpec
 
 

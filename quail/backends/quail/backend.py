@@ -18,13 +18,13 @@ from quail.physical import (
     Barrier,
     PhysicalNode,
 )
-from quail.planner import collect_operators, plan_quail
-from quail.planning import (
+from quail.physical.optimizer import (
     ModelRegion,
     PhysicalCandidate,
     PlanningContext,
     SupportResult,
 )
+from quail.planner import collect_operators, plan_quail
 from quail.runtime.runner import NodeMetrics, NodeResult, SurvivorStream
 from quail.runtime.tokens import DocumentKeys
 

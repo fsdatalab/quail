@@ -9,7 +9,7 @@ import pytest
 
 from quail.builtins import built_in_registry
 from quail.physical import NodeCodec, PhysicalGraph, PortRef, Scan
-from quail.planning import apply_physical_rules
+from quail.physical.optimizer import apply_physical_rules
 from quail.runtime.runner import ExecutionContext, GenericRunner, ScanRuntime
 
 

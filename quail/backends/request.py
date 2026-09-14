@@ -25,6 +25,7 @@ from quail.physical import (
     Scan,
 )
 from quail.physical.base import input_ports
+from quail.physical.optimizer import PhysicalCandidate, SupportResult
 from quail.planner import (
     budgets,
     collect_operators,
@@ -38,7 +39,6 @@ from quail.planner import (
 )
 from quail.planner.joins import search_joins, summarize_alias
 from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
-from quail.planning import PhysicalCandidate, SupportResult
 from quail.runtime.pairs import (
     allowed_members,
     members_by_partner,
