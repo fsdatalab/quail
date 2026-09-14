@@ -42,3 +42,53 @@ cd docs
 pnpm install
 pnpm dev
 ```
+
+## Roadmap
+
+We are looking for contributors on all of these. If something here
+interests you, open an issue and we will help you get started.
+
+### Simpler
+
+- **More models.** Add `ModelSpec` entries for other Qwen3 sizes or
+  other model families. See
+  [Custom models and GPUs](/docs/extending/models).
+- **More GPU types.** Add `DeviceSpec` entries for other NVIDIA GPUs
+  (e.g., A100, L40S, B200). Each spec needs the memory, bandwidth,
+  and peak FLOP rates from the datasheet.
+
+### Medium
+
+- **New AI-SQL operators.** `AI.CLASSIFY` (return one of N labels),
+  `AI.EXTRACT` (pull structured fields from a document), and
+  `AI.MAP` (run a free-form instruction and return the result).
+  These require decode (generating multiple tokens), which the
+  current engine does not do. See
+  [Custom operators](/docs/extending/operators).
+- **Automatic prefix caching across rows.** Quail currently reuses
+  KV only when the same document appears again in the query. vLLM's
+  automatic prefix caching can reuse KV across different rows that
+  share a token prefix (e.g., agent traces from the same run). The
+  lookup needs to stay cheap at AI-SQL request volumes.
+
+### Harder
+
+- **Hierarchical KV management.** Spill evicted document KV to host
+  CPU memory or disk instead of recomputing from scratch. The
+  tradeoff is recompute cost vs. PCIe/NVMe transfer time.
+- **Higher model FLOP utilization (MFU).** Quail uses DeepGEMM and
+  FlashAttention but has not optimized the GPU kernels beyond
+  fusing small operations. Higher MFU means faster forward passes
+  for the same hardware. This builds on work in the ML inference
+  community (e.g.,
+  [Sail Research on TPU v6e](https://www.sailresearch.com/blog/tpu-v6e-gemma)).
+- **Indexing to avoid full document scans.** A query that filters
+  100,000 documents currently evaluates every one. An index (e.g.,
+  embedding-based or keyword-based) could skip documents that
+  cannot pass, reducing the number of LLM calls.
+- **Integration with relational query engines.** A database like
+  DataFusion or DuckDB could use Quail as a backend for its AI-SQL
+  operators, passing a physical plan to Quail and getting Arrow
+  results back. Quail's
+  [plan editing API](/docs/architecture/physical-plans#editing-a-plan)
+  is a starting point for this.

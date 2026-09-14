@@ -4,13 +4,14 @@ title: Overview
 
 Quail is structured like a traditional query engine: it parses a
 query into a logical plan, optimizes it, lowers it to a physical
-plan, and executes the physical plan. The execution model is
-Volcano-style (pull-based, operator at a time), but each operator
-processes documents in large batches sized to saturate the GPU.
-The goal is to keep the GPU busy on model forward passes and avoid
-idle time between batches.
+plan, and executes the physical plan. Execution is pull-based
+(Volcano-style), with documents pipelining through operators in
+large batches sized to saturate the GPU. The two performance goals
+are to keep the GPU busy (minimize idle time between forward passes)
+and to minimize KV regret (document state that was evicted from GPU
+memory and needs to be recomputed).
 
-## How a query runs
+## Query lifecycle
 
 1. Quail [parses](https://github.com/fsdatalab/quail/blob/main/quail/frontend/sql.py)
    the user's SQL (or [Python builder](https://github.com/fsdatalab/quail/blob/main/quail/frontend/builder.py)
