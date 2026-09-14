@@ -21,17 +21,19 @@ from pathlib import Path
 
 import modal
 
-import quail_b
+from quail.bench.requirements import quail_b_requirement
 from quail.bench.results import combine_measurements, write_json
 
 base_image = (
     modal.Image.from_registry(
         "nvidia/cuda:13.0.1-devel-ubuntu24.04", add_python="3.12")
     .entrypoint([])
+    .apt_install("git")
+    # quail-b installs from git at the pinned commit, with its plan files
+    # and its own dependencies
     .pip_install("huggingface_hub", "numpy", "pyarrow",
                  "sqlglot>=27.0", "bpe-qwen>=0.1.5", "datasets>=5.0.1",
-                 # quail_b reads its query plans with substrait-protobuf
-                 "substrait-protobuf==0.103.0", "pandas>=2.0")
+                 quail_b_requirement())
     .env({
         "QUAIL_CACHE_DIR": "/root/.cache/kernels",
         "VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
@@ -44,20 +46,10 @@ base_image = (
         "TORCHINDUCTOR_CACHE_DIR": "/root/.cache/kernels/torchinductor",
     })
 )
-# quail_b ships its query plans as JSON files beside the code, which
-# add_local_python_source would not copy: mount the installed package
-QUAIL_B_DIR = Path(quail_b.__file__).parent
-
-
-def _with_sources(built: modal.Image) -> modal.Image:
-    """Mount quail and the installed quail_b package on a built image."""
-    # local sources go last: Modal refuses a build step after them
-    return built.add_local_python_source("quail").add_local_dir(
-        QUAIL_B_DIR, remote_path="/root/quail_b", ignore=["**/__pycache__"])
-
-
-image = _with_sources(base_image.pip_install("vllm==0.26.0"))
-sglang_image = _with_sources(base_image.pip_install("sglang==0.5.18"))
+# local sources go last: Modal refuses a build step after them
+image = base_image.pip_install("vllm==0.26.0").add_local_python_source("quail")
+sglang_image = base_image.pip_install(
+    "sglang==0.5.18").add_local_python_source("quail")
 
 app = modal.App("quail-milestone1")
 hf_cache = modal.Volume.from_name("quail-hf-cache", create_if_missing=True)
@@ -167,11 +159,14 @@ def run_query_family(
     ground_truth_collection: str,
     include_baselines: bool,
     include_quail: bool = True,
+    include_dumb_vllm: bool = False,
 ) -> str:
     """Run one query family through Quail and the vLLM baselines."""
     process_groups = [("quail",)] if include_quail else []
     if include_baselines:
         process_groups.append(("stock_vllm", "pipelined_vllm"))
+    if include_dumb_vllm:
+        process_groups.append(("dumb_vllm",))
     try:
         return _run_family(process_groups, "", model, sf, query_ids_csv,
                            run_dir, ground_truth_collection)
@@ -210,6 +205,7 @@ def _merge_suites(parts, query_ids, run_id, started, elapsed,
     fields = ("scale_factor", "corpus_id", "collection_id", "metadata",
               "gpu_count", "gpu_hourly_rate_usd")
     by_query = {}
+    skipped = {}
     for part in parts:
         if part["run_id"] != run_id:
             raise ValueError("query families disagree on run_id")
@@ -221,12 +217,15 @@ def _merge_suites(parts, query_ids, run_id, started, elapsed,
             if item["id"] in by_query:
                 raise ValueError(f"duplicate query {item['id']}")
             by_query[item["id"]] = dict(item, directory=f"{family}/{item['id']}")
-    if set(by_query) != set(query_ids):
+        skipped.update(part.get("skipped_queries", {}))
+    if set(by_query) | set(skipped) != set(query_ids):
         raise ValueError("completed queries do not match the requested queries")
     merged = dict(base)
     merged.pop("query_family")
     merged.update(
-        queries=[by_query[query_id] for query_id in query_ids],
+        queries=[by_query[query_id] for query_id in query_ids
+                 if query_id in by_query],
+        skipped_queries=skipped,
         started_at=started.isoformat(),
         finished_at=datetime.now(timezone.utc).isoformat(),
         parallel={
@@ -248,6 +247,7 @@ def run_all(
     include_baselines: bool = True,
     include_sglang: bool = True,
     include_quail: bool = True,
+    include_dumb_vllm: bool = False,
 ):
     from quail_b import select_queries
     from quail_b.queries import query_family_name, split_query_families
@@ -288,7 +288,7 @@ def run_all(
         t0 = time.time()
         for family_ids in families:
             family = query_family_name(family_ids)
-            if include_quail or include_baselines:
+            if include_quail or include_baselines or include_dumb_vllm:
                 family_call = run_query_family.spawn(
                     model=model,
                     sf=sf,
@@ -297,6 +297,7 @@ def run_all(
                     ground_truth_collection=ground_truth_collection,
                     include_baselines=include_baselines,
                     include_quail=include_quail,
+                    include_dumb_vllm=include_dumb_vllm,
                 )
                 family_calls.append((family, family_call))
                 call_ids[f"{family}:quail_vllm"] = family_call.object_id
@@ -339,6 +340,7 @@ def run_all(
         methods = (
             (("quail",) if include_quail else ())
             + (("stock_vllm", "pipelined_vllm") if include_baselines else ())
+            + (("dumb_vllm",) if include_dumb_vllm else ())
             + (("pipelined_sglang",) if include_sglang else ()))
         reports = {}
         paths = {}
@@ -400,6 +402,7 @@ def main(
     include_baselines: bool = True,
     include_sglang: bool = True,
     include_quail: bool = True,
+    include_dumb_vllm: bool = False,
 ):
     run_id = (
         f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-"
@@ -415,6 +418,7 @@ def main(
         include_baselines=include_baselines,
         include_sglang=include_sglang,
         include_quail=include_quail,
+        include_dumb_vllm=include_dumb_vllm,
     )
     print(f"function call id: {call.object_id} (all families)", flush=True)
     print(call.get(), flush=True)
