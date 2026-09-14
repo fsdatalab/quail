@@ -6,7 +6,7 @@ from test_planner import catalog, tok  # noqa: F401
 from test_session import _run, fake_tok, make_executor
 
 import quail
-from quail.builder import col, docs, prompt
+from quail.frontend.builder import col, docs, prompt
 from quail.physical import Project, Recombine
 from quail.planner.decide import plan_query
 from quail.planner.plan import EngineConfig

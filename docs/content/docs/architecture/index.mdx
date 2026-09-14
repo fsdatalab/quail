@@ -6,8 +6,8 @@ This section describes how Quail works internally.
 
 ## How a query runs
 
-1. Quail [parses](https://github.com/fsdatalab/quail/blob/main/quail/sqlfront/compile.py)
-   the user's SQL (or [Python builder](https://github.com/fsdatalab/quail/blob/main/quail/builder.py)
+1. Quail [parses](https://github.com/fsdatalab/quail/blob/main/quail/frontend/sql.py)
+   the user's SQL (or [Python builder](https://github.com/fsdatalab/quail/blob/main/quail/frontend/builder.py)
    query) into a logical plan.
 2. The session reads Arrow batches from each registered table and
    tokenizes the document columns.
@@ -24,8 +24,8 @@ This section describes how Quail works internally.
 
 | Package | What it does | Source |
 | --- | --- | --- |
-| `quail.sqlfront` | Parses SQL into a logical plan. | [compile.py](https://github.com/fsdatalab/quail/blob/main/quail/sqlfront/compile.py) |
-| `quail.builder` | Builds logical plans from Python. | [builder.py](https://github.com/fsdatalab/quail/blob/main/quail/builder.py) |
+| `quail.frontend.sql` | Parses SQL into a logical plan. | [compile.py](https://github.com/fsdatalab/quail/blob/main/quail/frontend/sql.py) |
+| `quail.frontend.builder` | Builds logical plans from Python. | [builder.py](https://github.com/fsdatalab/quail/blob/main/quail/frontend/builder.py) |
 | `quail.logical` | Logical node types and prompt binding. | [logical.py](https://github.com/fsdatalab/quail/blob/main/quail/logical.py) |
 | `quail.physical` | Typed physical nodes with ports. | [physical/](https://github.com/fsdatalab/quail/tree/main/quail/physical) |
 | `quail.planner` | Cost model, join ordering, KV retention. | [planner/](https://github.com/fsdatalab/quail/tree/main/quail/planner) |

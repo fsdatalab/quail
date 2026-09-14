@@ -13,11 +13,12 @@ from tempfile import TemporaryDirectory
 import pyarrow as pa
 from pyarrow import compute as pc
 
-from quail.builder import Query as BuilderQuery
 from quail.builtins import built_in_registry
 from quail.catalog import Catalog, ScanRequest, TableProvider
 from quail.execution import PhysicalRequest, document_input
 from quail.extensions import ExtensionRegistry
+from quail.frontend.builder import Query as BuilderQuery
+from quail.frontend.sql import SQLDialect, compile_sql
 from quail.logical import (
     CompileError,
     LogicalPlan,
@@ -46,7 +47,6 @@ from quail.runtime.tokens import (
     ScanInput,
     TokenStoreWriter,
 )
-from quail.sqlfront import SQLDialect, compile_sql
 
 
 class RefusalError(RuntimeError):

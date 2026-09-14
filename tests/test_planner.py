@@ -9,10 +9,10 @@ from fakes import keep_even, register_claims_evidence, two_alias_graph
 
 import quail
 from quail.backends.quail import expected_join_stages
-from quail.builder import col, docs, prompt
 from quail.catalog import Catalog, DocumentProvider
 from quail.cost.sol import speed_of_light
 from quail.cost.work import Work, ask, scan, triangle
+from quail.frontend.builder import col, docs, prompt
 from quail.physical import (
     AiFilter,
     AiJoin,

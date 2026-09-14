@@ -1,8 +1,9 @@
 """Quail: a declarative query engine for AI_FILTER and AI_JOIN."""
 
-from quail.builder import col, prompt
 from quail.catalog import DocumentProvider, ScanRequest, TableProvider
 from quail.extensions import ExtensionRegistry
+from quail.frontend.builder import col, prompt
+from quail.frontend.sql import SQLDialect
 from quail.logical import (
     SHARED_PRE,
     ColumnRef,
@@ -16,7 +17,6 @@ from quail.planner.estimate import SpeedOfLightEstimate, speed_of_light_estimate
 from quail.planner.plan import EngineConfig
 from quail.runtime.result import QueryResult
 from quail.runtime.session import Query, RefusalError, Session
-from quail.sqlfront import SQLDialect
 
 __all__ = [
     "SHARED_PRE",
