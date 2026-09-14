@@ -137,19 +137,31 @@ executor do not re-tokenize.
 ```python
 class LogicalOptimizerRule(Protocol):
     name: str
-    def rewrite(self, node, context) -> LogicalNode | None: ...
+    def rewrite(self, root, context) -> LogicalNode | None: ...
 ```
 
-`apply_logical_rules` rewrites the plan recursively: it rewrites
-all children first, then offers the current node to every registered
-rule. All rules are applied to every node. A rule returns a
-replacement node or `None` to leave it unchanged.
+A rule receives the whole plan and walks it itself, in whichever
+direction its rewrite needs. A rule that pushes information toward
+the scans, such as projection pushdown, walks from the root down and
+carries what it has learned. A rule that simplifies a node once its
+children are final walks from the scans up; `rewrite_bottom_up(root,
+fn)` does that walk for it. A rule returns the new root, or `None`
+when the plan is unchanged.
+
+`apply_logical_rules` offers the plan to every registered rule in
+order, then repeats the whole round until one round changes nothing.
+That way a rewrite that makes a later rule match is not missed. It
+stops after `MAX_PASSES` rounds (4) if the rules never settle, which
+happens only when two rules undo each other. It returns the plan and
+the name of each rule that changed it, one entry per change.
 
 Quail includes one built-in logical rule:
 
 - **[Projection pushdown](https://github.com/fsdatalab/quail/blob/main/quail/planner/logical_rules.py)**
-  (`ProjectionPushdown`): rewrites each `Scan` to load only the
-  columns the query actually uses.
+  (`ProjectionPushdown`): one pass from the root toward the scans. Each
+  node adds the columns its expressions read; each `Scan` keeps the
+  columns collected for its alias, so it loads only what the query
+  uses.
 
 Other optimizations like filter ordering and join ordering currently
 happen in the [planner](/docs/architecture/planning), because they

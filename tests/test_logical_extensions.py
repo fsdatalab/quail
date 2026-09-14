@@ -7,7 +7,10 @@ from quail.logical import ColumnRef, LogicalPlan, Project, Scan
 from quail.planner.logical_optimizer import (
     LogicalPlanningContext,
     apply_logical_rules,
+    rewrite_bottom_up,
 )
+
+CONTEXT = LogicalPlanningContext(catalog=None, engine_config=None)
 
 
 @dataclass(frozen=True)
@@ -47,25 +50,33 @@ class TaggedInput:
 
 
 class RenameTag:
-    name = "rename_tag"
+    """Rename one tag value to another, one node at a time."""
 
-    def rewrite(self, node, context):
-        if isinstance(node, TaggedInput) and node.tag == "old":
-            return replace(node, tag="new")
-        return None
+    def __init__(self, old, new):
+        self.name = f"rename_{old}_{new}"
+        self.old, self.new = old, new
+
+    def rewrite(self, root, context):
+        def rename(node):
+            if isinstance(node, TaggedInput) and node.tag == self.old:
+                return replace(node, tag=self.new)
+            return node
+
+        rewritten = rewrite_bottom_up(root, rename)
+        return None if rewritten is root else rewritten
+
+
+def _tagged_plan(tag):
+    field = ColumnRef("r", "reviews", "review")
+    scan = Scan("reviews", "r", "review")
+    return LogicalPlan(Project(TaggedInput(scan, tag), (field,)))
 
 
 def test_custom_logical_node_walks_and_rewrites_without_generic_changes():
-    field = ColumnRef("r", "reviews", "review")
-    scan = Scan("reviews", "r", "review")
-    tagged = TaggedInput(scan, "old")
-    plan = LogicalPlan(Project(tagged, (field,)))
+    plan = _tagged_plan("old")
 
     optimized, changed = apply_logical_rules(
-        plan,
-        (RenameTag(),),
-        LogicalPlanningContext(catalog=None, engine_config=None),
-    )
+        plan, (RenameTag("old", "new"),), CONTEXT)
 
     assert [node.type_name for node in optimized.walk()] == [
         "quail.scan",
@@ -73,4 +84,37 @@ def test_custom_logical_node_walks_and_rewrites_without_generic_changes():
         "quail.logical_project",
     ]
     assert optimized.root.input.tag == "new"
-    assert changed == ("rename_tag",)
+    assert changed == ("rename_old_new",)
+
+
+def test_rules_repeat_until_a_round_changes_nothing():
+    # The second rule only matches after the first has run, and it is
+    # listed first, so a single round would miss it.
+    rules = (RenameTag("mid", "new"), RenameTag("old", "mid"))
+
+    optimized, changed = apply_logical_rules(_tagged_plan("old"), rules, CONTEXT)
+
+    assert optimized.root.input.tag == "new"
+    assert changed == ("rename_old_mid", "rename_mid_new")
+
+
+def test_rules_that_never_settle_stop_at_the_pass_cap():
+    # Each round ends on a different tag than it started, so the rounds
+    # would repeat forever: a -> b -> c | c -> a | a -> b -> c | ...
+    rules = (RenameTag("a", "b"), RenameTag("c", "a"), RenameTag("b", "c"))
+
+    optimized, changed = apply_logical_rules(
+        _tagged_plan("a"), rules, CONTEXT, max_passes=3)
+
+    assert optimized.root.input.tag == "c"
+    assert len(changed) == 5
+
+
+def test_unchanged_plan_keeps_its_root_object():
+    plan = _tagged_plan("new")
+
+    optimized, changed = apply_logical_rules(
+        plan, (RenameTag("old", "new"),), CONTEXT)
+
+    assert optimized.root is plan.root
+    assert changed == ()

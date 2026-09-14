@@ -85,8 +85,7 @@ def test_projection_rule_preserves_schema_and_is_idempotent():
 
     assert twice == once
     assert twice is once
-    assert ProjectionPushdown().rewrite(plan.root.input, CONTEXT) is None
-    assert ProjectionPushdown().rewrite(once, CONTEXT) == once
+    assert ProjectionPushdown().rewrite(once, CONTEXT) is None
     _, changed = apply_logical_rules(
         LogicalPlan(once), (ProjectionPushdown(),), CONTEXT)
     assert changed == ()

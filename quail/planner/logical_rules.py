@@ -28,40 +28,29 @@ def _column_refs(expression) -> tuple[ColumnRef, ...]:
     return ()
 
 
-def required_columns(root: LogicalNode) -> dict[str, tuple[str, ...]]:
-    """Return the source columns each alias reads, in first use order.
-
-    A column is read when the root projection returns it, when a
-    filter or join prompt names it, or when a join condition compares
-    it.
-    """
-    needed: dict[str, dict[str, None]] = {}
-
-    def visit(node):
-        for expression in node.expressions():
-            for ref in _column_refs(expression):
-                needed.setdefault(ref.alias, {})[ref.column] = None
-        for child in node.children():
-            visit(child)
-
-    visit(root)
-    return {alias: tuple(columns) for alias, columns in needed.items()}
-
-
 def push_down_projection(root: LogicalNode) -> LogicalNode:
     """Rewrite every Scan to keep only the column values the plan reads.
+
+    One pass from the root toward the scans. Each node on the way adds
+    the columns its expressions read to the set carried down, in first
+    use order; a Scan keeps the columns collected for its alias. Every
+    node that reads an alias's column is an ancestor of that alias's
+    Scan, so the path holds the complete set.
 
     The document column is always tokenized. It is kept as a value too
     only when the root projection returns it.
     """
-    needed = required_columns(root)
     returned = {
         (ref.alias, ref.column)
         for ref in (root.output_schema() if isinstance(root, Project)
                     else ())
     }
 
-    def rewrite(node):
+    def descend(node, needed):
+        needed = {alias: dict(columns) for alias, columns in needed.items()}
+        for expression in node.expressions():
+            for ref in _column_refs(expression):
+                needed.setdefault(ref.alias, {})[ref.column] = None
         if isinstance(node, Scan):
             columns = tuple(
                 column for column in needed.get(node.alias, ())
@@ -70,28 +59,22 @@ def push_down_projection(root: LogicalNode) -> LogicalNode:
             )
             return node if columns == node.columns else replace(
                 node, columns=columns)
-        children = tuple(rewrite(child) for child in node.children())
+        children = tuple(descend(child, needed) for child in node.children())
         if children == node.children():
             return node
         return node.with_children(children)
 
-    return rewrite(root)
+    return descend(root, {})
 
 
 class ProjectionPushdown:
-    """Push the projected column set down to each Scan.
-
-    The rule fires at the root Project, where the whole tree is
-    visible, and rewrites the Scans beneath it. Other nodes pass
-    through unchanged.
-    """
+    """Push the projected column set down to each Scan."""
 
     name = "projection_pushdown"
 
-    def rewrite(self, node, context):
-        if not isinstance(node, Project):
-            return None
-        return push_down_projection(node)
+    def rewrite(self, root, context):
+        rewritten = push_down_projection(root)
+        return None if rewritten is root else rewritten
 
 
 def built_in_logical_rules() -> tuple:
