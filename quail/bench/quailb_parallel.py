@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import modal
+import quail_b
 
 from quail.bench.results import combine_measurements, write_json
 
@@ -43,11 +44,20 @@ base_image = (
         "TORCHINDUCTOR_CACHE_DIR": "/root/.cache/kernels/torchinductor",
     })
 )
-# local sources go last: Modal refuses a build step after them
-image = base_image.pip_install("vllm==0.26.0").add_local_python_source(
-    "quail", "quail_b")
-sglang_image = base_image.pip_install(
-    "sglang==0.5.18").add_local_python_source("quail", "quail_b")
+# quail_b ships its query plans as JSON files beside the code, which
+# add_local_python_source would not copy: mount the installed package
+QUAIL_B_DIR = Path(quail_b.__file__).parent
+
+
+def _with_sources(built: modal.Image) -> modal.Image:
+    """Mount quail and the installed quail_b package on a built image."""
+    # local sources go last: Modal refuses a build step after them
+    return built.add_local_python_source("quail").add_local_dir(
+        QUAIL_B_DIR, remote_path="/root/quail_b", ignore=["**/__pycache__"])
+
+
+image = _with_sources(base_image.pip_install("vllm==0.26.0"))
+sglang_image = _with_sources(base_image.pip_install("sglang==0.5.18"))
 
 app = modal.App("quail-milestone1")
 hf_cache = modal.Volume.from_name("quail-hf-cache", create_if_missing=True)
