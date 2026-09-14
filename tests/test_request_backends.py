@@ -42,6 +42,7 @@ def test_request_backends_plan_validate_and_execute(monkeypatch):
         "quail",
         "stock_vllm",
         "pipelined_vllm",
+        "dumb_vllm",
         "pipelined_sglang",
     }
 

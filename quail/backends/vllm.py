@@ -1,4 +1,4 @@
-"""vLLM engine adapter and the two vLLM request backends."""
+"""vLLM engine adapter and the vLLM request backends."""
 
 from __future__ import annotations
 
@@ -25,11 +25,15 @@ def _capacity(llm) -> dict:
         tokens = blocks * block_size
     if tokens is None or block_size is None:
         raise RuntimeError("vLLM did not report its KV capacity")
+    scheduler = config.scheduler_config
     return {
         "kv_cache_size_tokens": int(tokens),
         "num_gpu_blocks": None if blocks is None else int(blocks),
         "block_size": int(block_size),
-        "max_num_seqs": int(config.scheduler_config.max_num_seqs),
+        "max_num_seqs": int(scheduler.max_num_seqs),
+        "max_num_batched_tokens": int(scheduler.max_num_batched_tokens),
+        "max_model_len": int(config.model_config.max_model_len),
+        "gpu_memory_utilization": float(cache.gpu_memory_utilization),
         "kv_cache_dtype": str(cache.cache_dtype),
     }
 
@@ -64,27 +68,30 @@ class VLLMClient:
 
 
 class VLLMEngine:
-    """Boot vLLM for a request backend."""
+    """Boot vLLM for a request backend, with Quail's tuned engine settings."""
 
     kind = "vllm"
     label = "vLLM"
     runtime_package = "vllm==0.26.0"
 
+    def llm_kwargs(self) -> dict:
+        """Return the LLM constructor arguments beyond the model name."""
+        return {
+            "max_num_batched_tokens": MAX_BATCHED_TOKENS,
+            "max_num_seqs": MAX_SEQUENCES,
+            "gpu_memory_utilization": GPU_MEMORY_UTILIZATION,
+            "enable_prefix_caching": True,
+            "disable_log_stats": True,
+            "compilation_config": {
+                "cudagraph_capture_sizes": [CUDA_GRAPH_CAPTURE_SIZE]
+            },
+        }
+
     def boot(self, model_name: str, allowed_ids: list[int]) -> tuple[dict, dict]:
         from vllm import LLM, SamplingParams
 
         started = time.perf_counter()
-        llm = LLM(
-            model=model_name,
-            max_num_batched_tokens=MAX_BATCHED_TOKENS,
-            max_num_seqs=MAX_SEQUENCES,
-            gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
-            enable_prefix_caching=True,
-            disable_log_stats=True,
-            compilation_config={
-                "cudagraph_capture_sizes": [CUDA_GRAPH_CAPTURE_SIZE]
-            },
-        )
+        llm = LLM(model=model_name, **self.llm_kwargs())
         boot_s = time.perf_counter() - started
         sampling_params = SamplingParams(
             temperature=0.0,
@@ -113,6 +120,21 @@ class VLLMEngine:
         )
 
 
+class DefaultVLLMEngine(VLLMEngine):
+    """Boot vLLM with every engine setting at its default.
+
+    Only the model name is passed, as `vllm serve Qwen/Qwen3-4B-FP8`
+    would. The engine kind differs from `VLLMEngine` so this engine
+    never shares a loaded model with the tuned vLLM backends.
+    """
+
+    kind = "dumb_vllm"
+    label = "vLLM with default settings"
+
+    def llm_kwargs(self) -> dict:
+        return {}
+
+
 def stock_vllm_backend() -> RequestBackend:
     """Return stock vLLM with operator-at-a-time filter execution."""
     return RequestBackend(
@@ -128,4 +150,13 @@ def pipelined_vllm_backend() -> RequestBackend:
         name="pipelined_vllm",
         engine=VLLMEngine(),
         filter_submission="pipelined",
+    )
+
+
+def dumb_vllm_backend() -> RequestBackend:
+    """Return vLLM at its default settings, operator-at-a-time filters."""
+    return RequestBackend(
+        name="dumb_vllm",
+        engine=DefaultVLLMEngine(),
+        filter_submission="operator-at-a-time",
     )
