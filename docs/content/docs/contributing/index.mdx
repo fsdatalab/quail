@@ -86,6 +86,12 @@ interests you, open an issue and we will help you get started.
   100,000 documents currently evaluates every one. An index (e.g.,
   embedding-based or keyword-based) could skip documents that
   cannot pass, reducing the number of LLM calls.
+- **Online model training during query execution.** Fine-tune a
+  smaller model on the fly using the answers the large model
+  produces during the current query, then use the fine-tuned model
+  to complete the rest of the query or future queries over the same
+  predicate. This is related to
+  [Google's work on proxy models for AI-SQL](https://arxiv.org/abs/2603.15970).
 - **Integration with relational query engines.** A database like
   DataFusion or DuckDB could use Quail as a backend for its AI-SQL
   operators, passing a physical plan to Quail and getting Arrow
