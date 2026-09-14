@@ -24,7 +24,7 @@ from quail.logical import (
     join_conditions,
     oriented_join_conditions,
 )
-from quail.logical_optimizer import LogicalPlanningContext, apply_logical_rules
+from quail.logical.optimizer import LogicalPlanningContext, apply_logical_rules
 from quail.physical import PortRef, Project, Scan, ValueType, encode_graph
 from quail.planner import collect_applies, collect_operators, explain, plan_query
 from quail.planner.plan import EngineConfig, Refusal, resolve_model

@@ -11,7 +11,7 @@ from quail.physical import NodeCodec, PhysicalNode
 
 if TYPE_CHECKING:
     from quail.backends.base import ModelBackend
-    from quail.logical_optimizer import LogicalOptimizerRule
+    from quail.logical.optimizer import LogicalOptimizerRule
     from quail.planning import PhysicalOptimizerRule, PhysicalPlanner
     from quail.runtime.runner import ExecutionObserver, NodeRuntime
     from quail.specs import DeviceSpec, ModelSpec

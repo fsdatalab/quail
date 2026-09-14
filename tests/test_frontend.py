@@ -21,8 +21,8 @@ from quail.logical import (
     join_conditions,
     join_outer_input,
 )
-from quail.logical_optimizer import LogicalPlanningContext, apply_logical_rules
-from quail.logical_rules import built_in_logical_rules
+from quail.logical.optimizer import LogicalPlanningContext, apply_logical_rules
+from quail.logical.rules import built_in_logical_rules
 from quail.sqlfront import SQLDialect, compile_sql
 
 
