@@ -2,6 +2,7 @@
 
 from quail.backends import (
     QuailBackend,
+    dumb_vllm_backend,
     pipelined_sglang_backend,
     pipelined_vllm_backend,
     stock_vllm_backend,
@@ -25,6 +26,7 @@ def built_in_registry() -> ExtensionRegistry:
     registry.register_backend(QuailBackend())
     registry.register_backend(stock_vllm_backend())
     registry.register_backend(pipelined_vllm_backend())
+    registry.register_backend(dumb_vllm_backend())
     registry.register_backend(pipelined_sglang_backend())
     for rule in built_in_logical_rules():
         registry.register_logical_rule(rule)

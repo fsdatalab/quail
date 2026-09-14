@@ -9,10 +9,18 @@ from .base import (
 from .quail import QuailBackend, QuailModelExecution
 from .request import RequestBackend, RequestModelExecution
 from .sglang import SGLangClient, SGLangEngine, pipelined_sglang_backend
-from .vllm import VLLMClient, VLLMEngine, pipelined_vllm_backend, stock_vllm_backend
+from .vllm import (
+    DefaultVLLMEngine,
+    VLLMClient,
+    VLLMEngine,
+    dumb_vllm_backend,
+    pipelined_vllm_backend,
+    stock_vllm_backend,
+)
 
 __all__ = [
     "BackendExecutionContext",
+    "DefaultVLLMEngine",
     "GpuContext",
     "ModelBackend",
     "ModelExecution",
@@ -24,6 +32,7 @@ __all__ = [
     "SGLangEngine",
     "VLLMClient",
     "VLLMEngine",
+    "dumb_vllm_backend",
     "pipelined_sglang_backend",
     "pipelined_vllm_backend",
     "stock_vllm_backend",
