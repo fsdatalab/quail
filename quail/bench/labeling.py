@@ -38,6 +38,7 @@ from pathlib import Path
 import modal
 import pyarrow as pa
 
+from quail.bench.requirements import quail_b_requirement
 from quail_b import data
 from quail_b.data import GROUND_TRUTH_ROOT, PUBLIC_BUCKET
 from quail_b.predicates import (
@@ -1441,8 +1442,10 @@ image = (
     modal.Image.from_registry(
         "nvidia/cuda:13.0.1-devel-ubuntu24.04", add_python="3.12")
     .entrypoint([])
+    .apt_install("git")
     .pip_install("vllm==0.26.0", "huggingface_hub", "numpy", "pyarrow",
-                 "sqlglot>=27.0", "bpe-qwen>=0.1.5", "datasets>=5.0.1")
+                 "sqlglot>=27.0", "bpe-qwen>=0.1.5", "datasets>=5.0.1",
+                 quail_b_requirement())
     .env({
         "QUAIL_CACHE_DIR": "/root/.cache/kernels",
         "VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
@@ -1454,13 +1457,14 @@ image = (
         "TRITON_CACHE_DIR": "/root/.cache/kernels/triton",
         "TORCHINDUCTOR_CACHE_DIR": "/root/.cache/kernels/torchinductor",
     })
-    .add_local_python_source("quail", "quail_b")
+    .add_local_python_source("quail")
 )
 publish_image = (
     modal.Image.debian_slim(python_version="3.12")
+    .apt_install("git")
     .pip_install("boto3", "pyarrow", "numpy", "sqlglot>=27.0",
-                 "bpe-qwen>=0.1.5", "datasets>=5.0.1")
-    .add_local_python_source("quail", "quail_b"))
+                 "bpe-qwen>=0.1.5", "datasets>=5.0.1", quail_b_requirement())
+    .add_local_python_source("quail"))
 
 
 def _aws_credentials() -> dict[str, str]:
