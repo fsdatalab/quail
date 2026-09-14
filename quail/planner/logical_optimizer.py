@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 from quail.logical import LogicalNode, LogicalPlan
 
@@ -26,8 +26,8 @@ class LogicalOptimizerRule(Protocol):
     A rule walks the plan itself, in the direction its rewrite needs:
     from the root toward the scans when it pushes information down,
     from the scans toward the root when it simplifies a node once its
-    children are final (see `rewrite_bottom_up`). It returns the new
-    root, or None when the plan is unchanged.
+    children are final. It returns the new root, or None when the plan
+    is unchanged.
     """
 
     name: str
@@ -37,25 +37,6 @@ class LogicalOptimizerRule(Protocol):
         root: LogicalNode,
         context: LogicalPlanningContext,
     ) -> LogicalNode | None: ...
-
-
-def rewrite_bottom_up(
-    root: LogicalNode,
-    rewrite: Callable[[LogicalNode], LogicalNode],
-) -> LogicalNode:
-    """Rewrite children first, then offer each node to `rewrite`.
-
-    `rewrite` returns the node itself to leave it alone. When nothing
-    changes, the returned root is the same object that was passed in.
-    """
-
-    def visit(node):
-        children = tuple(visit(child) for child in node.children())
-        if children != node.children():
-            node = node.with_children(children)
-        return rewrite(node)
-
-    return visit(root)
 
 
 def apply_logical_rules(

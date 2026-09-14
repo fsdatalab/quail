@@ -144,9 +144,8 @@ A rule receives the whole plan and walks it itself, in whichever
 direction its rewrite needs. A rule that pushes information toward
 the scans, such as projection pushdown, walks from the root down and
 carries what it has learned. A rule that simplifies a node once its
-children are final walks from the scans up; `rewrite_bottom_up(root,
-fn)` does that walk for it. A rule returns the new root, or `None`
-when the plan is unchanged.
+children are final walks from the scans up. A rule returns the new
+root, or `None` when the plan is unchanged.
 
 `apply_logical_rules` offers the plan to every registered rule in
 order, then repeats the whole round until one round changes nothing.

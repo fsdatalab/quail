@@ -7,7 +7,6 @@ from quail.logical import ColumnRef, LogicalPlan, Project, Scan
 from quail.planner.logical_optimizer import (
     LogicalPlanningContext,
     apply_logical_rules,
-    rewrite_bottom_up,
 )
 
 CONTEXT = LogicalPlanningContext(catalog=None, engine_config=None)
@@ -57,12 +56,15 @@ class RenameTag:
         self.old, self.new = old, new
 
     def rewrite(self, root, context):
-        def rename(node):
+        def visit(node):
+            children = tuple(visit(child) for child in node.children())
+            if children != node.children():
+                node = node.with_children(children)
             if isinstance(node, TaggedInput) and node.tag == self.old:
                 return replace(node, tag=self.new)
             return node
 
-        rewritten = rewrite_bottom_up(root, rename)
+        rewritten = visit(root)
         return None if rewritten is root else rewritten
 
 

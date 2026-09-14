@@ -102,9 +102,7 @@ Quail backend how to plan and cost the new node. Concretely:
 **Logical rules** rewrite the logical plan before physical planning.
 For example, a rule could rewrite `AI.CLASSIFY` with exactly two
 categories into an `AI_FILTER`, since two categories is equivalent
-to TRUE/FALSE. A rule gets the whole plan and walks it itself;
-`rewrite_bottom_up` in `quail.planner.logical_optimizer` does the
-children-first walk for node-at-a-time rules like that one. Rules run
+to TRUE/FALSE. A rule gets the whole plan and walks it itself. Rules run
 in registration order and repeat until a round changes nothing.
 
 **Physical rules** rewrite the physical graph after the planner
