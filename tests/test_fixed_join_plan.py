@@ -390,8 +390,8 @@ def test_an_edited_fev9_plan_executes(monkeypatch):
 
 
 def test_retention_search_matches_enumeration():
+    from quail.cost.sol import speed_of_light
     from quail.planner.joins import search_joins, summarize_alias, walk
-    from quail.planner.sol import speed_of_light
     from quail.specs import H100_SXM, QWEN3_4B_FP8
 
     specs = [{"written_pos": index, "aliases": list(aliases),

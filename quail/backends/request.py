@@ -11,6 +11,7 @@ import pyarrow as pa
 
 from quail.backends.base import GpuContext
 from quail.backends.request_scheduling import run_join_grouped, true_bit
+from quail.cost import budgets
 from quail.execution import PhysicalResponse, export_physical_outputs
 from quail.logical import SHARED_PRE, Apply, join_outer_input
 from quail.physical import (
@@ -27,7 +28,6 @@ from quail.physical import (
 from quail.physical.base import input_ports
 from quail.physical.optimizer import PhysicalCandidate, SupportResult
 from quail.planner import (
-    budgets,
     collect_operators,
     default_order_rule,
     hash_join_nodes,

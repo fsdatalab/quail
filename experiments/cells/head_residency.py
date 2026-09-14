@@ -71,11 +71,11 @@ def probe(model_name: str) -> str:
     import torch.nn.functional as F
     from transformers import AutoTokenizer
 
+    from quail.cost import budgets
     from quail.executor.arena import KVArena
     from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION, Pipeline
     from quail.executor.loop import Answerer, AsyncAnswers, run_filter
     from quail.executor.model import load_model
-    from quail.planner import budgets
     from quail.specs import DEVICES, MODELS
 
     spec = MODELS[model_name]

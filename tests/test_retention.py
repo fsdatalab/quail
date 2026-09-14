@@ -1,8 +1,8 @@
 """Shared retention priority, capacity, and eviction tests."""
 
 
+from quail.cost.retention import RetentionPolicy
 from quail.executor.arena import KVArena, PageArena
-from quail.executor.retention import RetentionPolicy
 
 
 def cpu_arena(pages, cap, uses):
@@ -134,8 +134,8 @@ def test_retention_costs_and_future_use():
 
     import pytest
 
-    from quail.planner.retention import coefficients
-    from quail.planner.sol import prefix_recompute_seconds
+    from quail.cost.retention import coefficients
+    from quail.cost.sol import prefix_recompute_seconds
     from quail.specs import H100_SXM, QWEN3_4B_FP8
 
     policy = RetentionPolicy(**coefficients(QWEN3_4B_FP8, H100_SXM),

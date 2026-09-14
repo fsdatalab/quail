@@ -18,6 +18,7 @@ from quail.backends.quail.graph import (
     stage_partner_lists,
 )
 from quail.backends.quail.retention import apply_retention, retain_after_join
+from quail.cost import budgets
 from quail.execution import PhysicalResponse
 from quail.executor.arena import KVArena
 from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION, Pipeline
@@ -29,7 +30,6 @@ from quail.physical import (
     Scan,
     decode_graph,
 )
-from quail.planner import budgets
 from quail.progress import say, set_gpu_index
 from quail.runtime.runner import ExecutionContext, SurvivorStream
 from quail.runtime.tokens import (

@@ -11,9 +11,9 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from quail.planner import work as _workload
-from quail.planner.qwen3_cost import qwen3_components
-from quail.planner.roofline import ComponentLatency, component_latencies
+from quail.cost import work as _workload
+from quail.cost.qwen3_cost import qwen3_components
+from quail.cost.roofline import ComponentLatency, component_latencies
 from quail.specs import DeviceSpec, ModelSpec
 
 

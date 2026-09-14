@@ -1,6 +1,6 @@
+from quail.cost.work import Work
 from quail.planner.leftdeep import Extension, optimize_left_deep
 from quail.planner.live_rows import PairRelation, exact_live_rows
-from quail.planner.work import Work
 
 
 def test_live_rows_for_trees_and_cycles():

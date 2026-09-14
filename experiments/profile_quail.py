@@ -134,11 +134,11 @@ def _boot_state(model):
     import torch.nn.functional as F
     from transformers import AutoTokenizer
 
+    from quail.cost import budgets
     from quail.executor.arena import KVArena
     from quail.executor.attention import FILTER_ATTENTION, Pipeline
     from quail.executor.loop import Answerer, AsyncAnswers, warm_kernels
     from quail.executor.model import load_model
-    from quail.planner import budgets
     from quail.specs import DEVICES, MODELS
 
     spec = MODELS[model]

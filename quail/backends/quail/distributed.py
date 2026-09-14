@@ -293,7 +293,7 @@ class DistributedQuailExecution:
         self.prior_shards = placement
 
     def snapshot_after_filters(self):
-        from quail.planner.budgets import PAGE_TOKENS
+        from quail.cost.budgets import PAGE_TOKENS
 
         lengths = [len(self.pre) + len(self.docs[alias][document])
                    for alias, documents in self.retained.items()

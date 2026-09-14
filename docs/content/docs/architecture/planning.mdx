@@ -89,7 +89,7 @@ The cost model uses no fitted parameters. It computes directly from
 the hardware datasheet and the model architecture.
 
 Implementation:
-[quail/planner/sol.py](https://github.com/fsdatalab/quail/blob/main/quail/planner/sol.py).
+[quail/cost/sol.py](https://github.com/fsdatalab/quail/blob/main/quail/cost/sol.py).
 
 ### Notation
 
@@ -250,10 +250,10 @@ Filter and join boundaries do not start separate forward passes.
 
 | Module | What it does |
 |---|---|
-| [work.py](https://github.com/fsdatalab/quail/blob/main/quail/planner/work.py) | Count tokens, attention pairs, and KV traffic |
-| [qwen3_cost.py](https://github.com/fsdatalab/quail/blob/main/quail/planner/qwen3_cost.py) | Build the three model components for Qwen3 |
-| [roofline.py](https://github.com/fsdatalab/quail/blob/main/quail/planner/roofline.py) | Price one component from FLOPs, bytes, and hardware limits |
-| [sol.py](https://github.com/fsdatalab/quail/blob/main/quail/planner/sol.py) | Apply ideal packing and sum component times |
+| [work.py](https://github.com/fsdatalab/quail/blob/main/quail/cost/work.py) | Count tokens, attention pairs, and KV traffic |
+| [qwen3_cost.py](https://github.com/fsdatalab/quail/blob/main/quail/cost/qwen3_cost.py) | Build the three model components for Qwen3 |
+| [roofline.py](https://github.com/fsdatalab/quail/blob/main/quail/cost/roofline.py) | Price one component from FLOPs, bytes, and hardware limits |
+| [sol.py](https://github.com/fsdatalab/quail/blob/main/quail/cost/sol.py) | Apply ideal packing and sum component times |
 | [estimate.py](https://github.com/fsdatalab/quail/blob/main/quail/planner/estimate.py) | Run the filter and join search for one query |
 
 ### Assumptions

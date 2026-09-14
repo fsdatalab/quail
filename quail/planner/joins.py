@@ -9,8 +9,8 @@ of that KV as the arena holds and recomputes the rest.
 import itertools
 from dataclasses import dataclass
 
-from quail.planner.sol import speed_of_light
-from quail.planner.work import Work, triangle
+from quail.cost.sol import speed_of_light
+from quail.cost.work import Work, triangle
 
 
 @dataclass(frozen=True)

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from quail.planner.roofline import CostComponent
-from quail.planner.work import Work
+from quail.cost.roofline import CostComponent
+from quail.cost.work import Work
 from quail.specs import ModelSpec
 
 

@@ -11,6 +11,8 @@ import quail
 from quail.backends.quail import expected_join_stages
 from quail.builder import col, docs, prompt
 from quail.catalog import Catalog, DocumentProvider
+from quail.cost.sol import speed_of_light
+from quail.cost.work import Work, ask, scan, triangle
 from quail.physical import (
     AiFilter,
     AiJoin,
@@ -25,8 +27,6 @@ from quail.physical import (
 from quail.physical.base import input_ports
 from quail.planner.decide import explain, filter_cost, order_filters, plan_query
 from quail.planner.plan import EngineConfig, Refusal
-from quail.planner.sol import speed_of_light
-from quail.planner.work import Work, ask, scan, triangle
 from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8
 
 
@@ -245,7 +245,7 @@ def test_component_costs_and_model_weights():
     assert result.component("mlp") is result.components[1]
     assert result.seconds > max(result.compute, result.memory)
 
-    from quail.planner.qwen3_cost import dense_params
+    from quail.cost.qwen3_cost import dense_params
 
     work = ask(400, 50) * 1000
     result = speed_of_light(

@@ -1,6 +1,8 @@
-"""Priority for document KV retained between operators."""
+"""Priority and price of document KV retained between operators."""
 
 from dataclasses import dataclass, field
+
+from quail.cost.qwen3_cost import dense_params, flops_per_pair
 
 
 @dataclass(frozen=True)
@@ -23,3 +25,13 @@ def retention_pages(arena_tokens: int, chunk_tokens: int, page_tokens: int) -> i
     """Reserve two execution chunks before allocating retained pages."""
     return max(0, arena_tokens // page_tokens
                - -(-2 * chunk_tokens // page_tokens))
+
+
+def coefficients(model, device) -> dict:
+    """Return the model's ideal prefix computation coefficients."""
+    return {
+        "linear_seconds": 2 * dense_params(model) / device.arithmetic_bandwidth(
+            model.weight_precision),
+        "pair_seconds": flops_per_pair(model) * model.layers
+        / device.arithmetic_bandwidth(model.attention_precision),
+    }

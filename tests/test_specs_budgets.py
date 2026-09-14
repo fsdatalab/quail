@@ -4,7 +4,7 @@ from dataclasses import replace
 
 import pytest
 
-from quail.planner import budgets
+from quail.cost import budgets
 from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8
 
 

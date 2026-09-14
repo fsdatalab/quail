@@ -2,7 +2,10 @@
 
 from dataclasses import replace
 
-from quail.executor.retention import retention_pages
+from quail.cost import budgets
+from quail.cost.retention import coefficients, retention_pages
+from quail.cost.sol import speed_of_light, unrounded_seconds
+from quail.cost.work import Work, ask, scan
 from quail.logical import (
     Apply,
     CompileError,
@@ -36,11 +39,9 @@ from quail.physical import (
 )
 from quail.physical.base import input_ports
 from quail.physical.optimizer import ModelRegion, PlanningContext, apply_physical_rules
-from quail.planner import budgets, retention
 from quail.planner import joins as joinsearch
+from quail.planner import retention
 from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
-from quail.planner.sol import speed_of_light, unrounded_seconds
-from quail.planner.work import Work, ask, scan
 from quail.specs import DeviceSpec, ModelSpec
 
 # ---------------------------------------------------------- tree walk
@@ -458,7 +459,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     base_work = sum(filter_works.values(), Work())
 
     cap_pages = retention_pages(admission, chunk, budgets.PAGE_TOKENS)
-    costs = retention.coefficients(model, device)
+    costs = coefficients(model, device)
     # KV reuse is priced as unlimited
     filtered = set(filters)
 

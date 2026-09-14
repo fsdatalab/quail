@@ -1,4 +1,4 @@
-"""The planner: budgets from the specs, decisions from token arithmetic.
+"""The planner: physical plan assembly from the cost model's numbers.
 
 No wall prediction. KV is always bf16.
 

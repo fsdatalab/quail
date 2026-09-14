@@ -84,11 +84,11 @@ Quail backend how to plan and cost the new node. Concretely:
    `AI_FILTER`. The difference is decode: generating each label
    token is an additional forward pass that attends to all previous
    tokens. See
-   [`quail/planner/work.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/work.py).
+   [`quail/cost/work.py`](https://github.com/fsdatalab/quail/blob/main/quail/cost/work.py).
 2. **Cost estimation.** Pass the work counts through the
    [roofline model](/docs/architecture/planning#the-roofline-speed-of-light-model)
    to get estimated seconds. See
-   [`quail/planner/sol.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/sol.py).
+   [`quail/cost/sol.py`](https://github.com/fsdatalab/quail/blob/main/quail/cost/sol.py).
 3. **Graph construction.** Include the new physical node in the graph
    the planner builds. The planner in
    [`quail/planner/decide.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/decide.py)
