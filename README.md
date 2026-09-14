@@ -1,7 +1,7 @@
 # Quail
 
 Quail (QUery Aware Inference Layer) is an open-source, extensible
-execution engine for AI-SQL, developed at
+execution engine for AI-SQL, being developed at
 [Full Stack Data Lab](https://fsdatalab.github.io/) at CMU.
 
 AI-SQL is a variant of SQL with operators that let you write logic
@@ -13,9 +13,9 @@ FROM reviews r
 WHERE AI.IF(PROMPT('Does this review discuss the ending?\n\n{0}', r.body))
 ```
 
-**[Documentation](https://fsdatalab.github.io/quail)** ·
-**[Quickstart](https://fsdatalab.github.io/quail/docs/user-guide/quickstart)** ·
-**[QUAIL-B](https://github.com/fsdatalab/quail-bench)**
+[Documentation](https://fsdatalab.github.io/quail) |
+[Quickstart](https://fsdatalab.github.io/quail/docs/user-guide/quickstart) |
+[QUAIL-B](https://github.com/fsdatalab/quail-bench)
 
 ## Install
 
