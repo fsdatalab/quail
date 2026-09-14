@@ -30,8 +30,10 @@ base_image = (
     .entrypoint([])
     .pip_install("huggingface_hub", "numpy", "pyarrow",
                  "sqlglot>=27.0", "bpe-qwen>=0.1.5", "datasets>=5.0.1",
-                 # quail_b reads its query plans with substrait-protobuf
-                 "substrait-protobuf==0.103.0", "pandas>=2.0")
+                 # quail_b is mounted, not installed, so its own
+                 # dependencies are listed here: substrait-protobuf reads
+                 # the query plans, duckdb counts result rows when scoring
+                 "substrait-protobuf==0.103.0", "pandas>=2.0", "duckdb>=1.1,<2")
     .env({
         "QUAIL_CACHE_DIR": "/root/.cache/kernels",
         "VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
