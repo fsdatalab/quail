@@ -167,11 +167,14 @@ def run_query_family(
     ground_truth_collection: str,
     include_baselines: bool,
     include_quail: bool = True,
+    include_dumb_vllm: bool = False,
 ) -> str:
     """Run one query family through Quail and the vLLM baselines."""
     process_groups = [("quail",)] if include_quail else []
     if include_baselines:
         process_groups.append(("stock_vllm", "pipelined_vllm"))
+    if include_dumb_vllm:
+        process_groups.append(("dumb_vllm",))
     try:
         return _run_family(process_groups, "", model, sf, query_ids_csv,
                            run_dir, ground_truth_collection)
@@ -210,6 +213,7 @@ def _merge_suites(parts, query_ids, run_id, started, elapsed,
     fields = ("scale_factor", "corpus_id", "collection_id", "metadata",
               "gpu_count", "gpu_hourly_rate_usd")
     by_query = {}
+    skipped = {}
     for part in parts:
         if part["run_id"] != run_id:
             raise ValueError("query families disagree on run_id")
@@ -221,12 +225,15 @@ def _merge_suites(parts, query_ids, run_id, started, elapsed,
             if item["id"] in by_query:
                 raise ValueError(f"duplicate query {item['id']}")
             by_query[item["id"]] = dict(item, directory=f"{family}/{item['id']}")
-    if set(by_query) != set(query_ids):
+        skipped.update(part.get("skipped_queries", {}))
+    if set(by_query) | set(skipped) != set(query_ids):
         raise ValueError("completed queries do not match the requested queries")
     merged = dict(base)
     merged.pop("query_family")
     merged.update(
-        queries=[by_query[query_id] for query_id in query_ids],
+        queries=[by_query[query_id] for query_id in query_ids
+                 if query_id in by_query],
+        skipped_queries=skipped,
         started_at=started.isoformat(),
         finished_at=datetime.now(timezone.utc).isoformat(),
         parallel={
@@ -248,6 +255,7 @@ def run_all(
     include_baselines: bool = True,
     include_sglang: bool = True,
     include_quail: bool = True,
+    include_dumb_vllm: bool = False,
 ):
     from quail_b import select_queries
     from quail_b.queries import query_family_name, split_query_families
@@ -288,7 +296,7 @@ def run_all(
         t0 = time.time()
         for family_ids in families:
             family = query_family_name(family_ids)
-            if include_quail or include_baselines:
+            if include_quail or include_baselines or include_dumb_vllm:
                 family_call = run_query_family.spawn(
                     model=model,
                     sf=sf,
@@ -297,6 +305,7 @@ def run_all(
                     ground_truth_collection=ground_truth_collection,
                     include_baselines=include_baselines,
                     include_quail=include_quail,
+                    include_dumb_vllm=include_dumb_vllm,
                 )
                 family_calls.append((family, family_call))
                 call_ids[f"{family}:quail_vllm"] = family_call.object_id
@@ -339,6 +348,7 @@ def run_all(
         methods = (
             (("quail",) if include_quail else ())
             + (("stock_vllm", "pipelined_vllm") if include_baselines else ())
+            + (("dumb_vllm",) if include_dumb_vllm else ())
             + (("pipelined_sglang",) if include_sglang else ()))
         reports = {}
         paths = {}
@@ -400,6 +410,7 @@ def main(
     include_baselines: bool = True,
     include_sglang: bool = True,
     include_quail: bool = True,
+    include_dumb_vllm: bool = False,
 ):
     run_id = (
         f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-"
@@ -415,6 +426,7 @@ def main(
         include_baselines=include_baselines,
         include_sglang=include_sglang,
         include_quail=include_quail,
+        include_dumb_vllm=include_dumb_vllm,
     )
     print(f"function call id: {call.object_id} (all families)", flush=True)
     print(call.get(), flush=True)

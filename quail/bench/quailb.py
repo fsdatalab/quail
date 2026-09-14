@@ -26,6 +26,7 @@ import quail_b as benchmark
 from quail.bench import substrait
 from quail.bench.substrait import QueryPlan, read_plan
 from quail.planner import collect_operators
+from quail.planner.plan import Refusal
 from quail.specs import H100_USD_PER_HOUR
 from quail_b.queries import (
     FILTER_SELECTIVITY_ESTIMATES,
@@ -209,12 +210,37 @@ def run_query(session, spec: QuerySpec, tables) -> RunOutput:
     return output
 
 
+def refused_queries(session, query_ids, data_dir) -> dict[str, str]:
+    """Return id -> reason for the queries the session's backend refuses to plan.
+
+    A request backend refuses a query with an equality join or a user
+    function. Planning happens on the CPU, before any engine boots.
+    """
+    register_tables(session, data_dir)
+    refused = {}
+    for query_id in query_ids:
+        plan = build_query(session, benchmark.get_query(query_id)).plan()
+        if isinstance(plan, Refusal):
+            refused[query_id] = " ".join(plan.reasons)
+            print(f"[quail-b] {query_id}: skipped on {session.config.backend}: "
+                  f"{refused[query_id]}", flush=True)
+    return refused
+
+
 def run_suite(only=None, *, sf=0.1, config, data_dir=None,
               ground_truth_collection=None, output_dir,
               h100_usd_per_hour=H100_USD_PER_HOUR):
-    """Run Quail queries through QUAIL-B and save the benchmark report."""
+    """Run Quail queries through QUAIL-B and save the benchmark report.
+
+    Queries the backend refuses to plan are left out of the run and
+    listed under `skipped_queries` in the returned record.
+    """
     with quail.Session(config) as session:
-        return benchmark.run(
+        skipped = {}
+        if only and data_dir is not None:
+            skipped = refused_queries(session, only, data_dir)
+            only = [query_id for query_id in only if query_id not in skipped]
+        record = benchmark.run(
             partial(run_query, session), queries=only, scale_factor=sf,
             output_dir=output_dir, data_dir=data_dir,
             collection_id=ground_truth_collection,
@@ -230,6 +256,8 @@ def run_suite(only=None, *, sf=0.1, config, data_dir=None,
                     "scale_factor": SELECTIVITY_ESTIMATE_SCALE_FACTOR,
                 },
             })
+        record["skipped_queries"] = skipped
+        return record
 
 
 def main():
