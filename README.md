@@ -88,18 +88,21 @@ cd quail
 uv sync --no-dev
 ```
 
-Model execution requires an H100. Each GPU holds one model copy; Quail does
-not split one model across several GPUs.
+Model execution needs one CUDA GPU per model copy (H100 SXM or RTX PRO 6000
+Blackwell). Quail does not split one model across several GPUs.
+
+The model runs in the process that creates the `Session`. Quail does not
+depend on Modal or on any shared volume. Modal is one way to rent the GPU.
 
 ## Run the quickstart
 
-On an H100 machine:
+On a machine with a supported GPU:
 
 ```bash
 uv run python demos/quickstart.py
 ```
 
-From any machine, submit the same query to a Modal H100:
+Without a local GPU, submit the same query to a Modal H100:
 
 ```bash
 uv run --no-sync --with 'modal[api-proxy-support]==1.5.4' modal setup
@@ -152,6 +155,20 @@ Query time excludes model startup. The saved run is
 `quail-results` Modal volume. QUAIL-B computes accuracy, output precision and
 recall, fresh input tokens, throughput, and GPU cost from the saved results.
 
+On a machine with a supported GPU, run one query and save the results to a
+local directory. QUAIL-B downloads the inputs and reference labels from
+public S3.
+
+```bash
+uv run python -m quail.bench.quailb \
+  --sf 0.1 --only IMDB-4 \
+  --model qwen3-4b-fp8 --device h100-sxm \
+  --output-dir results/quailb/imdb-4
+uv run quail-b report results/quailb/imdb-4
+```
+
+To run Quail and both stock vLLM baselines on Modal H100s:
+
 ```bash
 uv run modal run --detach -m quail.bench.quailb_parallel \
   --sf 0.1 --model qwen3-4b-fp8 --query IMDB-4 \
@@ -159,8 +176,9 @@ uv run modal run --detach -m quail.bench.quailb_parallel \
   2>&1 | tee results/quailb.log
 ```
 
-See [Running QUAIL-B](docs/content/docs/user-guide/benchmark.mdx) for report
-generation, metric definitions, and baseline options.
+See [Benchmarks](docs/content/docs/contributing/benchmark.mdx) for report
+generation and baseline options, and
+[Metrics](docs/content/docs/user-guide/metrics.mdx) for the definitions.
 
 ## Documentation
 
@@ -169,9 +187,9 @@ generation, metric definitions, and baseline options.
 | Run one query | [Quickstart](docs/content/docs/user-guide/quickstart.mdx) |
 | Write filters and joins in SQL | [SQL reference](docs/content/docs/user-guide/sql.mdx) |
 | Build queries in Python | [Python API](docs/content/docs/user-guide/python-api.mdx) |
-| Load your own tables | [Data sources](docs/content/docs/user-guide/data-sources.mdx) |
+| Load your own tables | [Running queries](docs/content/docs/user-guide/sessions.mdx) |
 | Understand plans and metrics | [Results and explain](docs/content/docs/user-guide/results.mdx) |
-| Run on Modal | [Running on Modal](docs/content/docs/user-guide/compute.mdx) |
+| Pick a model or GPU, or run on Modal | [Supported models and GPUs](docs/content/docs/user-guide/models.mdx) |
 | Understand the engine | [Architecture](docs/content/docs/architecture/index.mdx) |
 | Add an extension | [Extending Quail](docs/content/docs/extending/index.mdx) |
 

@@ -7,8 +7,9 @@ This quickstart runs a filter over eight published IMDB reviews. It uses
 QUAIL-B's IMDB-1 predicate to keep reviews that mention at least one positive
 aspect of the movie.
 
-Model execution requires an H100. You can use a local H100 or submit the same
-code to a Modal H100.
+Model execution needs one CUDA GPU. You can run the example on your own GPU
+machine or submit the same code to a Modal H100. Quail does not depend on
+Modal.
 
 ## 1. Install
 
@@ -181,8 +182,8 @@ the model.
         description="Filters, joins, prompts, EXISTS, and refused syntax." />
   <Card title="Use Python" href="/docs/user-guide/python-api"
         description="Build the same logical plans without SQL." />
-  <Card title="Load your data" href="/docs/user-guide/data-sources"
+  <Card title="Load your data" href="/docs/user-guide/sessions#registering-tables"
         description="Register Arrow, Parquet, and Hugging Face tables." />
-  <Card title="Run on Modal" href="/docs/user-guide/compute"
-        description="Configure the GPU function, caches, and result storage." />
+  <Card title="Models and GPUs" href="/docs/user-guide/models"
+        description="Supported hardware, and running on Modal without a local GPU." />
 </Cards>
