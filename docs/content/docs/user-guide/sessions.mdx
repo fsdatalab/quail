@@ -16,6 +16,9 @@ with quail.Session(config=config) as session:
     ...
 ```
 
+`model` and `device` are required. `gpus` defaults to 1 and `backend`
+defaults to `"quail"`, the built-in engine.
+
 The session is a context manager. It releases token files and
 background work when it closes.
 
