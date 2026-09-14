@@ -3,6 +3,13 @@
 `run_query(session, spec, tables)` builds one query's Substrait plan
 on the session, runs it, and returns the answers keyed by the plan's
 operator ids, as QUAIL-B scores them.
+
+Runs on any machine with a supported GPU and saves to a local directory;
+no Modal or volume is involved:
+
+    uv run python -m quail.bench.quailb --sf 0.1 --only IMDB-4 \
+      --model qwen3-4b-fp8 --device h100-sxm \
+      --output-dir results/quailb/imdb-4
 """
 
 import argparse
@@ -230,9 +237,9 @@ def main():
     parser.add_argument("--sf", type=float, choices=(0.1, 0.5, 1.0), default=0.1)
     parser.add_argument("--only", help="comma-separated query IDs")
     parser.add_argument("--model", required=True)
-    parser.add_argument("--backend", required=True)
+    parser.add_argument("--backend", default="quail")
     parser.add_argument("--device", required=True)
-    parser.add_argument("--gpus", type=int, required=True)
+    parser.add_argument("--gpus", type=int, default=1)
     parser.add_argument("--data-dir", help="directory containing input Parquet files")
     parser.add_argument("--ground-truth-collection")
     parser.add_argument("--output-dir", required=True, help="new run directory")

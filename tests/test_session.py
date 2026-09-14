@@ -86,11 +86,15 @@ def sess(tmp_path):
     s.close()
 
 
-def test_session_requires_complete_execution_config():
-    with pytest.raises(TypeError, match="required keyword-only arguments"):
+def test_session_requires_model_and_device():
+    with pytest.raises(TypeError, match="'model' and 'device'"):
         EngineConfig()
+    with pytest.raises(TypeError, match="'device'"):
+        EngineConfig(model="qwen3-4b-fp8")
     with pytest.raises(TypeError, match="required positional argument: 'config'"):
         quail.Session()
+    config = EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
+    assert (config.gpus, config.backend) == (1, "quail")
 
 
 def make_executor(filter_truth, join_truth=None, seen=None):
