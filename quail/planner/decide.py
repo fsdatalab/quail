@@ -7,6 +7,7 @@ from quail.cost.retention import coefficients, retention_pages
 from quail.cost.sol import speed_of_light, unrounded_seconds
 from quail.cost.work import Work, ask, scan
 from quail.logical import (
+    DEFAULT_SELECTIVITY,
     Apply,
     CompileError,
     Join,
@@ -15,6 +16,7 @@ from quail.logical import (
     Scan,
     SemanticFilter,
     SemanticJoin,
+    effective_selectivity,
     join_conditions,
     oriented_join_conditions,
 )
@@ -110,14 +112,16 @@ def preamble_tokens(filters, joins) -> int:
 def default_order_rule(filters, joins) -> tuple[str, str]:
     """Return (rule, source).
 
-    'by_cost' when every predicate has a selectivity, 'as_written'
-    otherwise.
+    Always 'by_cost'; a predicate without a selectivity is priced with
+    DEFAULT_SELECTIVITY. Pass order="as_written" to keep written order.
     """
-    preds = [p for fs in filters.values() for p in fs]
-    sels = [p.selectivity for p in preds] + [j.selectivity for j in joins]
-    if sels and all(s is not None for s in sels):
-        return "by_cost", "default: every gated predicate has a selectivity"
-    return "as_written", "default: at least one predicate has no selectivity"
+    missing = any(p.selectivity is None for fs in filters.values()
+                  for p in fs) or any(j.selectivity is None for j in joins)
+    if missing:
+        return "by_cost", (
+            "default: by cost, with selectivity "
+            f"{DEFAULT_SELECTIVITY:g} for predicates without one")
+    return "by_cost", "default: by cost"
 
 
 def filter_cost(predicate, prefix_tokens: float, model: ModelSpec,
@@ -142,8 +146,7 @@ def order_filters_indexed(predicates, rule: str, *, prefix_tokens: float,
         return idx
 
     def selectivity(i):
-        return (predicates[i].selectivity
-                if predicates[i].selectivity is not None else 1.0)
+        return effective_selectivity(predicates[i].selectivity)
 
     ask_costs = [
         filter_cost(p, prefix_tokens, model, device, chunk_tokens,
@@ -275,7 +278,7 @@ def _filter_alias_work(preds, stats, order, pre: int) -> Work:
         q = _question_tokens(p.prompt)
         op = scan if si == 0 else ask
         total = total + op(pre + mean, q) * n
-        n *= p.selectivity if p.selectivity is not None else 1.0
+        n *= effective_selectivity(p.selectivity)
     return total
 
 
@@ -453,7 +456,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     for fs in filters.values():
         surv = 1.0
         for p in fs:
-            surv *= p.selectivity if p.selectivity is not None else 1.0
+            surv *= effective_selectivity(p.selectivity)
         live0[_filter_alias(fs[0])] *= surv
     filter_works = {
         alias: _filter_alias_work(preds, stats[alias], filter_orders[alias],
@@ -605,7 +608,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                 preamble_tokens=p.prompt.preamble_tokens,
                 selectivity=p.selectivity,
                 expected_docs=round(n * surv, 1)))
-            surv *= p.selectivity if p.selectivity is not None else 1.0
+            surv *= effective_selectivity(p.selectivity)
         keep = alias in retention_plan["initial"]
         pinned = alias in streamed
         writes = len(stages) > 1 or keep or pinned

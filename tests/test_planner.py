@@ -229,8 +229,8 @@ def test_filter_ordering_and_kv_writes(catalog):
                .select("r.id"))
     plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
                       doc_tokens={"r": [100] * 10})
-    assert plan.settings["order_rule"] == "as_written"
-    assert "no selectivity" in plan.settings["order_source"]
+    assert plan.settings["order_rule"] == "by_cost"
+    assert "selectivity 0.2" in plan.settings["order_source"]
 
 
 def test_component_costs_and_model_weights():
@@ -756,7 +756,7 @@ def test_aggregate_join_work_matches_per_document_sum():
 def test_explain_estimates_and_limits(catalog):
     for sels, expected in [
     ((0.5, 0.25), "12.5"), ((1.0, 0.0), "0"),
-    ((None, 0.5), "unknown"), ((None, 0.0), "0"),
+    ((None, 0.5), "10"), ((None, 0.0), "0"),
 ]:
         logical = _five_filter_plan(catalog, sels)
         plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,

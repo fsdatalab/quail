@@ -151,7 +151,8 @@ AI_FILTER(PROMPT(...), {'selectivity': 0.3, 'anchor': 'r'})
 
 - **`selectivity`**: optional. Your estimate of the fraction of rows
   that will pass. It does not need to be accurate. Quail uses it to
-  decide which filters and joins to run first.
+  decide which filters and joins to run first. If you leave it out,
+  Quail assumes 20% of rows pass.
 - **`anchor`** (joins only): optional. When evaluating a join, Quail
   picks one side to process first and keep in GPU memory, so those
   documents are not reprocessed for each pair. This side is called

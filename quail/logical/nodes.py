@@ -42,11 +42,20 @@ class Prompt:
     type_name: ClassVar[str] = "quail.prompt"
 
 
+# the planner's estimate for a predicate written without a selectivity
+DEFAULT_SELECTIVITY = 0.2
+
+
+def effective_selectivity(selectivity: Optional[float]) -> float:
+    """Return the selectivity the planner uses: the given one or the default."""
+    return DEFAULT_SELECTIVITY if selectivity is None else selectivity
+
+
 @dataclass(frozen=True)
 class FilterPredicate:
     prompt: Prompt
     selectivity: Optional[float] = None   # fraction of documents that
-    #                                       pass; ordering only
+    #                                       pass; None means not given
 
     type_name: ClassVar[str] = "quail.filter_predicate"
 

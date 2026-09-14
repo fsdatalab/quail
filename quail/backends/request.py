@@ -29,7 +29,12 @@ from quail.execution.runner import (
     scalar_node_metrics,
 )
 from quail.execution.types import PhysicalResponse, export_physical_outputs
-from quail.logical import SHARED_PRE, Apply, join_outer_input
+from quail.logical import (
+    SHARED_PRE,
+    Apply,
+    effective_selectivity,
+    join_outer_input,
+)
 from quail.physical import (
     Limit,
     PhysicalNode,
@@ -142,10 +147,7 @@ def plan_request_backend(
     }
     for alias, predicates in filters.items():
         for predicate in predicates:
-            live[alias] *= (
-                predicate.selectivity
-                if predicate.selectivity is not None else 1.0
-            )
+            live[alias] *= effective_selectivity(predicate.selectivity)
     search_specs = logical_join_specs(joins, context.pair_fractions)
     join_search = search_joins(
         search_specs,

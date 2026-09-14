@@ -4,6 +4,7 @@ from collections import Counter
 from collections.abc import Mapping
 
 from quail import logical as logical_nodes
+from quail.logical import DEFAULT_SELECTIVITY, effective_selectivity
 from quail.physical import (
     AiFilter,
     AiJoin,
@@ -32,7 +33,9 @@ def _prompt(prompt):
 
 
 def _selectivity(value):
-    return "unknown" if value is None else f"{value * 100:g}%"
+    if value is None:
+        return f"{DEFAULT_SELECTIVITY * 100:g}% (default)"
+    return f"{value * 100:g}%"
 
 
 def _fields(fields, depth):
@@ -201,12 +204,8 @@ def _estimated_rows(graph):
         elif isinstance(node, AiFilter):
             value = inputs[0] if inputs else None
             for stage in node.stages:
-                if value == 0 or stage.selectivity == 0:
-                    value = 0
-                elif value is None or stage.selectivity is None:
-                    value = None
-                else:
-                    value *= stage.selectivity
+                if value is not None:
+                    value *= effective_selectivity(stage.selectivity)
         elif isinstance(node, (Project, Limit, Exchange)) and len(inputs) == 1:
             value = inputs[0]
             if isinstance(node, Limit) and value is not None:

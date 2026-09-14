@@ -490,7 +490,7 @@ class BoundBuilder:
         self._inner.limit(n)
         return self
 
-    def select(self, *cols, order="as_written") -> "Query":
+    def select(self, *cols, order=None) -> "Query":
         return Query(self._session, self._inner.select(*cols),
                      order=order)
 
