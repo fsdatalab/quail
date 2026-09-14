@@ -1,6 +1,7 @@
 """Physical planning and runtime extension test."""
 
 import copy
+import re
 from dataclasses import dataclass, replace
 from typing import ClassVar
 
@@ -290,7 +291,9 @@ def test_physical_explain_shows_shared_inputs_and_metrics():
     graph = PhysicalGraph((source, first, second, project),
                           PortRef(project.node_id, "rows"))
     text = graph.explain()
-    assert text.startswith("Project: d.id")
+    # a column header, then the tree
+    assert text.splitlines()[0].split() == ["est.", "rows"]
+    assert text.splitlines()[1].startswith("Project: d.id")
     assert text.count("Scan: d [1]") == 1
     assert text.count("Reuse [1]") == 1
     assert "count=5" in text and "count=10" in text
@@ -307,8 +310,9 @@ def test_physical_explain_shows_shared_inputs_and_metrics():
     measured = {node.node_id: NodeMetrics(output_rows=42, wall_s=1.25,
                                          fresh_tokens=200)}
     text = physical_tree(graph, metrics=measured)
-    assert ("actual_rows=42, estimated_rows=100, wall_s=1.250, "
-            "fresh_tokens=200") in text
-    assert "estimated_seconds" not in text
+    # estimated rows, measured rows, time, and fresh tokens, in columns
+    assert re.search(r"Scan: d\s+100\s+42\s+1\.25 s\s+200$", text,
+                     re.MULTILINE)
+    assert "est. time" not in text
     assert "fresh_tokens=200" in physical_tree(
         graph, metrics=measured, verbose=True)

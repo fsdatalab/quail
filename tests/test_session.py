@@ -3,6 +3,8 @@
 Covers gating, tuple assembly, projection, and the report.
 """
 
+import re
+
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -212,28 +214,35 @@ def test_explain_analyze_shows_measured_rows_beside_estimates(
     text = query.explain(analyze=True)
 
     assert len(execution_calls) == 1
-    assert "actual_rows" not in planned
-    # the filter stages run q2 first, over all six documents
-    assert "AiFilter: r (actual_rows=2, estimated_rows=1.5, wall_s=" in text
-    assert "fresh_tokens=60)" in text
-    assert ("(selectivity=50%, observed=66.67%, evaluated=6 documents, "
-            "question_tokens=10)") in text
-    assert ("(selectivity=50%, observed=50%, evaluated=4 documents, "
-            "question_tokens=10)") in text
-    assert "Scan reviews as r (actual_rows=6, estimated_rows=6" in text
-    assert "Project: r.id (actual_rows=2, estimated_rows=1.5" in text
-    assert "Limit: 1 (actual_rows=1, estimated_rows=1" in text
-    assert "measured:" in text
-    assert "query time=1.000 s (model startup excluded)" in text
-    assert "throughput=6 documents/second (6 input documents)" in text
-    assert "fresh_tokens=1,234" in text
-    assert "GPU cost=$0.0011/query (1 GPU x $3.9492/hour" in text
-    assert "model startup=0.500 s" in text
+    assert "   rows   " not in planned and "run:" not in planned
+    header = next(line for line in text.splitlines() if "est. rows" in line)
+    assert header.split() == ["est.", "rows", "rows", "est.", "pass", "pass",
+                              "est.", "time", "time", "fresh", "tokens"]
+    # est. rows, rows, est. time, time, fresh tokens
+    assert re.search(
+        r"AiFilter: r\s+1\.5\s+2\s+[\d.]+ ms\s+<1 ms\s+60$", text, re.M)
+    # the filter runs q2 first over all six documents, then q1 over the
+    # four survivors: docs entering, evaluated, est. pass, observed pass
+    assert re.search(r"1st: predicate 2  PROMPT\('DOCUMENT:\\n\{0\}\\n\\nq2:'\)"
+                     r"\s+6\s+6\s+50%\s+66\.7%$", text, re.M)
+    assert re.search(r"2nd: predicate 1  PROMPT\('DOCUMENT:\\n\{0\}\\n\\nq1:'\)"
+                     r"\s+3\s+4\s+50%\s+50%$", text, re.M)
+    assert re.search(r"Scan reviews as r\s+6\s+6\s+<1 ms$", text, re.M)
+    assert re.search(r"Project: r\.id\s+1\.5\s+2\s+<1 ms$", text, re.M)
+    assert re.search(r"Limit: 1\s+1\s+1\s+<1 ms$", text, re.M)
+    assert "run:" in text
+    assert "query time   1 s (model startup excluded)" in text
+    assert "startup      500 ms" in text
+    assert "throughput   6 documents/second over 6 input documents" in text
+    assert "tokens       1,234 fresh" in text
+    assert ("GPU cost     $0.0011 per query (1 GPU at $3.9492/hour"
+            in text)
 
-    # the executed result renders the same measured tree on its own
+    # the executed result renders the same measured table on its own
     result = _run(sess.sql(FILTER_SQL + " LIMIT 1"), make_executor(truth))
-    assert "Limit: 1 (actual_rows=1, estimated_rows=1" in result.explain()
-    assert "observed=66.67%, evaluated=6 documents" in result.explain()
+    assert re.search(r"Limit: 1\s+1\s+1\s+<1 ms$", result.explain(), re.M)
+    assert re.search(r"1st: predicate 2\s+6\s+6\s+50%\s+66\.7%$",
+                     result.explain(), re.M)
     stages = [s for s in result.report["stages"] if s["op"] == "filter"]
     assert [s["written_pos"] for s in stages] == [1, 0]
 

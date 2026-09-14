@@ -918,8 +918,8 @@ def explain(logical: LogicalPlan, physical, *, verbose: bool = False,
         _fields,
         logical_tree,
         measured_stages,
-        measured_summary,
         physical_tree,
+        run_summary,
     )
 
     lines = ["logical:"]
@@ -931,8 +931,8 @@ def explain(logical: LogicalPlan, physical, *, verbose: bool = False,
         lines.extend(f"  {reason}" for reason in physical.reasons)
         return "\n".join(lines)
     lines.append("")
-    lines.append(f"physical: (backend={physical.backend}, "
-                 f"model={physical.model}, workers={physical.workers})")
+    lines.append(f"physical: backend={physical.backend}, "
+                 f"model={physical.model}, workers={physical.workers}")
     if physical.backend == "quail":
         chunk = physical.settings.get("chunk_tokens")
         admission = physical.settings.get("admission_tokens")
@@ -942,20 +942,22 @@ def explain(logical: LogicalPlan, physical, *, verbose: bool = False,
         if admission is not None:
             budgets.append(f"admission budget={admission:,} tokens")
         lines.append("  " + ", ".join(budgets))
-    if getattr(physical, "estimates", None):
-        lines.append("  node seconds price each node's work alone; they "
-                     "do not add up to the plan estimate because chunk "
-                     "packing shares forward passes across nodes")
+    lines.append("")
     lines.extend("  " + line for line in physical_tree(
         physical.graph, logical=logical, verbose=verbose,
         estimates=getattr(physical, "estimates", None),
         metrics=None if result is None else result.node_metrics,
         stages=None if result is None else measured_stages(result.report),
     ).splitlines())
+    if getattr(physical, "estimates", None):
+        lines.append("  est. time is each node's work alone; node times do "
+                     "not add up to the plan estimate")
+        lines.append("  because chunk packing shares forward passes across "
+                     "nodes")
     if result is not None:
         lines.append("")
-        lines.append("measured:")
-        lines.extend(measured_summary(
+        lines.append("run:")
+        lines.extend("  " + line for line in run_summary(
             result.report, physical.graph, physical.workers, usd_per_hour))
     if verbose:
         lines.append("")

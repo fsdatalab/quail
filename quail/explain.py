@@ -32,12 +32,6 @@ def _prompt(prompt):
     return f"PROMPT({prompt.template!r}, {args})"
 
 
-def _selectivity(value):
-    if value is None:
-        return f"{DEFAULT_SELECTIVITY * 100:g}% (default)"
-    return f"{value * 100:g}%"
-
-
 def _fields(fields, depth):
     lines = []
     pad = "  " * depth
@@ -52,78 +46,6 @@ def _fields(fields, depth):
                 lines.extend(_fields(item, depth + 1))
         else:
             lines.append(f"{pad}{key}={value}")
-    return lines
-
-
-def measured_stages(report) -> dict:
-    """Index a report's stage measurements by the predicate they ran.
-
-    Args:
-        report: An execution report (QueryResult.report).
-
-    Returns:
-        ("filter", alias, written_pos) and ("join", written_pos) keys
-        mapped to the stage dicts of report["stages"]. Stages saved
-        before written_pos was recorded are left out.
-    """
-    stages = {}
-    for stage in (report or {}).get("stages", ()):
-        written_pos = stage.get("written_pos")
-        if written_pos is None:
-            continue
-        if stage.get("op") == "filter":
-            stages[("filter", stage["alias"], written_pos)] = stage
-        elif stage.get("op") == "join":
-            stages[("join", written_pos)] = stage
-    return stages
-
-
-def _measured_stage(stage, evaluated_key, unit):
-    if stage is None:
-        return ""
-    return (f", observed={_selectivity(stage['observed_selectivity'])}, "
-            f"evaluated={stage[evaluated_key]:,} {unit}")
-
-
-def measured_summary(report, graph, workers, usd_per_hour=None) -> list:
-    """Return the measured totals of one run as indented explain lines.
-
-    Args:
-        report: The execution report (QueryResult.report).
-        graph: The executed physical graph, for the input document count.
-        workers: GPUs the query ran on.
-        usd_per_hour: Price of one GPU, for the cost per query.
-    """
-    wall = report.get("wall_s")
-    lines = []
-    if wall is None:
-        return ["  query time: not measured"]
-    lines.append(f"  query time={wall:.3f} s (model startup excluded)")
-    pairs = sum(stage.get("tuples", 0) for stage in report.get("stages", ())
-                if stage.get("op") == "join")
-    documents = sum(node.n_docs for node in graph.nodes
-                    if isinstance(node, Scan))
-    if wall > 0:
-        if pairs:
-            lines.append(f"  throughput={_number(pairs / wall)} document "
-                         f"pairs/second ({pairs:,} pairs evaluated across "
-                         "the join stages)")
-        else:
-            lines.append(f"  throughput={_number(documents / wall)} "
-                         f"documents/second ({documents:,} input "
-                         "documents)")
-    tokens = [f"fresh_tokens={report['fresh_tokens']:,}"]
-    if report.get("cached_tokens") is not None:
-        tokens.append(f"cached_tokens={report['cached_tokens']:,}")
-    lines.append("  " + ", ".join(tokens))
-    if usd_per_hour is not None:
-        cost = wall / 3600 * workers * usd_per_hour
-        lines.append(f"  GPU cost=${cost:.4f}/query ({workers} GPU x "
-                     f"${usd_per_hour:.4f}/hour, startup excluded)")
-    if report.get("boot_s") is not None:
-        kind = report.get("boot_kind")
-        lines.append(f"  model startup={report['boot_s']:.3f} s"
-                     + (f" ({kind})" if kind else ""))
     return lines
 
 
@@ -172,6 +94,134 @@ def logical_tree(logical):
 
     visit(logical.root, 0)
     return "\n".join(lines)
+
+
+DEFAULT_MARK = "*"
+DEFAULT_NOTE = (f"{DEFAULT_MARK} no selectivity was given; the planner "
+                f"assumes {DEFAULT_SELECTIVITY * 100:g}%")
+PROMPT_CHARS = 32
+
+# table columns in display order: (cell key, header)
+_COLUMNS = (
+    ("est_rows", "est. rows"),
+    ("rows", "rows"),
+    ("est_pass", "est. pass"),
+    ("pass", "pass"),
+    ("est_time", "est. time"),
+    ("time", "time"),
+    ("tokens", "fresh tokens"),
+)
+
+
+def _selectivity(value, mark=False):
+    if value is None:
+        default = f"{DEFAULT_SELECTIVITY * 100:g}%"
+        return default + DEFAULT_MARK if mark else default + " (default)"
+    return f"{value * 100:.3g}%"
+
+
+def _seconds(value):
+    if value is None:
+        return ""
+    if value < 0.001:
+        return "<1 ms"
+    if value < 1:
+        return f"{value * 1000:.3g} ms"
+    return f"{value:.3g} s"
+
+
+def _short_prompt(prompt):
+    template = prompt.template
+    if len(template) > PROMPT_CHARS:
+        template = template[:PROMPT_CHARS] + "…"
+    return f"PROMPT({template!r})"
+
+
+def _ordinal(n):
+    suffix = "th" if 10 <= n % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(
+        n % 10, "th")
+    return f"{n}{suffix}"
+
+
+def _table(rows):
+    """Lay out (text, cells) rows as a tree column and aligned columns."""
+    columns = [(key, label) for key, label in _COLUMNS
+               if any(cells.get(key) for _, cells in rows)]
+    width = max(len(text) for text, _ in rows)
+    widths = {
+        key: max(len(label), *(len(cells.get(key, "")) for _, cells in rows))
+        for key, label in columns
+    }
+    lines = []
+    if columns:
+        lines.append(" " * width + "".join(
+            f"   {label:>{widths[key]}}" for key, label in columns))
+    for text, cells in rows:
+        line = text.ljust(width) + "".join(
+            f"   {cells.get(key, ''):>{widths[key]}}" for key, _ in columns)
+        lines.append(line.rstrip())
+    return lines
+
+
+def measured_stages(report) -> dict:
+    """Index a report's stage measurements by the predicate they ran.
+
+    Args:
+        report: An execution report (QueryResult.report).
+
+    Returns:
+        ("filter", alias, written_pos) and ("join", written_pos) keys
+        mapped to the stage dicts of report["stages"]. Stages saved
+        before written_pos was recorded are left out.
+    """
+    stages = {}
+    for stage in (report or {}).get("stages", ()):
+        written_pos = stage.get("written_pos")
+        if written_pos is None:
+            continue
+        if stage.get("op") == "filter":
+            stages[("filter", stage["alias"], written_pos)] = stage
+        elif stage.get("op") == "join":
+            stages[("join", written_pos)] = stage
+    return stages
+
+
+def run_summary(report, graph, workers, usd_per_hour=None) -> list:
+    """Return the measured totals of one run as labeled lines.
+
+    Args:
+        report: The execution report (QueryResult.report).
+        graph: The executed physical graph, for the input document count.
+        workers: GPUs the query ran on.
+        usd_per_hour: Price of one GPU, for the cost per query.
+    """
+    wall = report.get("wall_s")
+    if wall is None:
+        return ["query time   not measured"]
+    items = [("query time", f"{_seconds(wall)} (model startup excluded)")]
+    if report.get("boot_s") is not None:
+        kind = f" ({report['boot_kind']})" if report.get("boot_kind") else ""
+        items.append(("startup", _seconds(report["boot_s"]) + kind))
+    pairs = sum(stage.get("tuples", 0) for stage in report.get("stages", ())
+                if stage.get("op") == "join")
+    documents = sum(node.n_docs for node in graph.nodes
+                    if isinstance(node, Scan))
+    if wall > 0 and pairs:
+        items.append(("throughput", f"{_number(pairs / wall)} document "
+                      f"pairs/second over {pairs:,} evaluated pairs"))
+    elif wall > 0:
+        items.append(("throughput", f"{_number(documents / wall)} "
+                      f"documents/second over {documents:,} input documents"))
+    tokens = f"{report['fresh_tokens']:,} fresh"
+    if report.get("cached_tokens") is not None:
+        tokens += f", {report['cached_tokens']:,} read from KV"
+    items.append(("tokens", tokens))
+    if usd_per_hour is not None:
+        cost = wall / 3600 * workers * usd_per_hour
+        items.append(("GPU cost", f"${cost:.4f} per query ({workers} GPU at "
+                      f"${usd_per_hour:.4f}/hour, startup excluded)"))
+    width = max(len(label) for label, _ in items)
+    return [f"{label.ljust(width)}   {value}" for label, value in items]
 
 
 def _logical_context(logical):
@@ -223,7 +273,7 @@ def _estimated_rows(graph):
 
 def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                   estimates=None, stages=None):
-    """Return a physical tree, with references for shared inputs.
+    """Return a physical tree with estimated and measured columns.
 
     Args:
         graph: The physical graph to display.
@@ -242,10 +292,23 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
     shared = {node.node_id: index for index, node in enumerate(
         (node for node in graph.topological_nodes() if uses[node.node_id] > 1), 1)}
     visited = set()
-    lines = []
+    rows = []
+    used_default = []
+
+    def stage_cells(selectivity, expected, measured, evaluated_key):
+        if selectivity is None:
+            used_default.append(True)
+        cells = {"est_rows": _number(expected),
+                 "est_pass": _selectivity(selectivity, mark=True)}
+        if measured is not None:
+            cells["rows"] = f"{measured[evaluated_key]:,}"
+            cells["pass"] = _selectivity(measured["observed_selectivity"])
+        return cells
 
     def describe(node):
+        """Return the node's title, detail lines, and predicate rows."""
         details = []
+        predicates = []
         title = type(node).__name__
         if isinstance(node, Scan):
             source = scans.get(node.alias)
@@ -269,18 +332,20 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                 kv.append("survivors stream into the join with KV pinned")
             details.append(", ".join(kv) if kv else
                            "KV: stored" if node.arena_writes else "KV: not stored")
-            predicates = filters.get(node.alias, ())
+            written = filters.get(node.alias, ())
+            order = [stage.written_pos for stage in node.stages]
+            reordered = order != sorted(order)
             for index, stage in enumerate(node.stages, 1):
-                predicate = (_prompt(predicates[stage.written_pos].prompt)
-                             if stage.written_pos < len(predicates)
-                             else f"predicate {stage.written_pos + 1}")
-                measured = _measured_stage(
+                label = f"predicate {stage.written_pos + 1}"
+                if reordered:
+                    label = f"{_ordinal(index)}: {label}"
+                if stage.written_pos < len(written):
+                    label += "  " + _short_prompt(
+                        written[stage.written_pos].prompt)
+                predicates.append((label, stage_cells(
+                    stage.selectivity, stage.expected_docs,
                     stages.get(("filter", node.alias, stage.written_pos)),
-                    "evaluated", "documents")
-                details.append(f"{index}. {predicate} "
-                               f"(selectivity={_selectivity(stage.selectivity)}"
-                               f"{measured}, "
-                               f"question_tokens={stage.question_tokens:,})")
+                    "evaluated")))
         elif isinstance(node, AiJoin):
             title += f": anchor={node.anchor}"
             source = {"none": "not resident", "filter": "from filters",
@@ -295,20 +360,21 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                 source = "streamed from its filter"
             keep = "yes" if node.keep_anchor_kv else "no"
             details.append(f"KV: anchor={source}, retain after join={keep}")
+            order = [stage.written_pos for stage in node.stages]
+            reordered = order != sorted(order)
             for index, stage in enumerate(node.stages, 1):
-                predicate = (_prompt(joins[stage.written_pos].predicate)
-                             if stage.written_pos < len(joins)
-                             else f"predicate {stage.written_pos + 1}")
-                pairs = (f" over pairs from {stage.pairs_from}"
-                         if stage.pairs_from else "")
-                measured = _measured_stage(
-                    stages.get(("join", stage.written_pos)), "tuples", "pairs")
-                details.append(
-                    f"{index}. {stage.semantics} ({stage.anchor}, "
-                    f"{', '.join(stage.partners)}){pairs}: {predicate} "
-                    f"(selectivity={_selectivity(stage.selectivity)}"
-                    f"{measured}, "
-                    f"estimated_evaluations={_number(stage.expected_tuples)})")
+                label = (f"join {stage.written_pos + 1} {stage.semantics} "
+                         f"({stage.anchor}, {', '.join(stage.partners)})")
+                if stage.pairs_from:
+                    label += f" over pairs from {stage.pairs_from}"
+                if reordered:
+                    label = f"{_ordinal(index)}: {label}"
+                if stage.written_pos < len(joins):
+                    label += "  " + _short_prompt(
+                        joins[stage.written_pos].predicate)
+                predicates.append((label, stage_cells(
+                    stage.selectivity, stage.expected_tuples,
+                    stages.get(("join", stage.written_pos)), "tuples")))
         elif isinstance(node, HashJoin):
             title += ": " + " and ".join(
                 f"{node.left}.{left} = {node.right}.{right}"
@@ -330,14 +396,14 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
         elif isinstance(node, RequestExecution):
             title += f": {node.backend_name}"
             for spec in node.filters:
-                predicates = filters.get(spec.alias, ())
+                written = filters.get(spec.alias, ())
                 for position in spec.written_positions:
-                    predicate = (_prompt(predicates[position].prompt)
-                                 if position < len(predicates)
+                    predicate = (_short_prompt(written[position].prompt)
+                                 if position < len(written)
                                  else f"predicate {position + 1}")
                     details.append(f"Filter {spec.alias}: {predicate}")
             for spec in node.joins:
-                predicate = (_prompt(joins[spec.written_pos].predicate)
+                predicate = (_short_prompt(joins[spec.written_pos].predicate)
                              if spec.written_pos < len(joins)
                              else f"predicate {spec.written_pos + 1}")
                 details.append(f"Join {spec.semantics}: {predicate}")
@@ -345,14 +411,14 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
             title = node.type_name
             if not verbose:
                 details.extend(_fields(node.explain_fields(), 0))
-        return title, details
+        return title, details, predicates
 
     def visit(node, depth):
         pad = "  " * depth
-        title, details = describe(node)
+        title, details, predicates = describe(node)
         reference = shared.get(node.node_id)
         if node.node_id in visited:
-            lines.append(f"{pad}Reuse [{reference}]")
+            rows.append((f"{pad}Reuse [{reference}]", {}))
             return
         visited.add(node.node_id)
         if reference:
@@ -361,44 +427,39 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                   for output in node.outputs
                   if not output.name.startswith("filter_answers:")]
         value = values[0] if len(values) == 1 else None
-        count = _number(value) if value is not None else "unknown"
         estimate = estimates_by_node.get(node.node_id, {})
-        if metrics is None:
-            title += f" (estimated_rows={count}"
-            if "seconds" in estimate:
-                title += f", estimated_seconds={estimate['seconds']:.3f}"
-            title += ")"
-            if "release_recompute_tokens" in estimate:
-                pinned = node.pin_survivors
-                details.append(
-                    ("if the KV were released here instead of pinned: "
-                     if pinned else "expected recompute at the join: ")
-                    + f"{estimate['release_recompute_tokens']:,} tokens, "
-                    f"{estimate['release_recompute_seconds']:.3f} s")
-        elif node.node_id in metrics:
-            measured = metrics[node.node_id]
-            parts = [f"actual_rows={measured.output_rows:,}"]
-            if value is not None:
-                parts.append(f"estimated_rows={count}")
-            parts.append(f"wall_s={measured.wall_s:.3f}")
-            if "seconds" in estimate:
-                parts.append(f"estimated_seconds={estimate['seconds']:.3f}")
-            if measured.fresh_tokens:
-                parts.append(f"fresh_tokens={measured.fresh_tokens:,}")
-            title += f" ({', '.join(parts)})"
-            if verbose:
-                details.extend(_fields(vars(measured), 0))
-        else:
-            title += " (metrics unavailable)"
-        lines.append(pad + title)
-        lines.extend(pad + "  " + detail for detail in details)
+        cells = {}
+        if value is not None:
+            cells["est_rows"] = _number(value)
+        if "seconds" in estimate:
+            cells["est_time"] = _seconds(estimate["seconds"])
+        if metrics is not None:
+            if node.node_id in metrics:
+                measured = metrics[node.node_id]
+                cells["rows"] = f"{measured.output_rows:,}"
+                cells["time"] = _seconds(measured.wall_s)
+                if measured.fresh_tokens:
+                    cells["tokens"] = f"{measured.fresh_tokens:,}"
+                if verbose:
+                    details.extend(_fields(vars(measured), 0))
+            else:
+                title += " (metrics unavailable)"
+        if "release_recompute_tokens" in estimate:
+            details.append(
+                ("if the KV were released here instead of pinned: "
+                 if node.pin_survivors else "expected recompute at the join: ")
+                + f"{estimate['release_recompute_tokens']:,} tokens, "
+                f"{estimate['release_recompute_seconds']:.3f} s")
+        rows.append((pad + title, cells))
+        rows.extend((pad + "  " + detail, {}) for detail in details)
+        rows.extend((pad + "  " + label, stage) for label, stage in predicates)
         if verbose:
-            lines.extend(_fields({"node_id": node.node_id,
-                                  "type": node.type_name,
-                                  **node.explain_fields()}, depth + 1))
-            for port in node.inputs:
-                lines.append(f"{pad}  {port.name} <- "
-                             f"{port.source.node_id}[{port.source.port}]")
+            rows.extend((line, {}) for line in _fields(
+                {"node_id": node.node_id, "type": node.type_name,
+                 **node.explain_fields()}, depth + 1))
+            rows.extend((f"{pad}  {port.name} <- "
+                         f"{port.source.node_id}[{port.source.port}]", {})
+                        for port in node.inputs)
         children = dict.fromkeys(port.source.node_id for port in node.inputs)
         for child in children:
             visit(graph.node(child), depth + 1)
@@ -409,4 +470,7 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
     for node in graph.topological_nodes():
         if node.node_id not in visited:
             visit(node, 0)
+    lines = _table(rows)
+    if used_default:
+        lines.append(DEFAULT_NOTE)
     return "\n".join(lines)
