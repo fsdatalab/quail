@@ -66,10 +66,13 @@ interests you, open an issue and we will help you get started.
   current engine does not do. See
   [Custom operators](/docs/extending/operators).
 - **Automatic prefix caching across rows.** Quail currently reuses
-  KV only when the same document appears again in the query. vLLM's
-  automatic prefix caching can reuse KV across different rows that
-  share a token prefix (e.g., agent traces from the same run). The
-  lookup needs to stay cheap at AI-SQL request volumes.
+  KV only when the same document appears again in the query. KV
+  could also be shared across rows that have the same token prefix
+  (e.g., agent traces from the same run, or the shared prompt
+  prefix before every document). See
+  [#77](https://github.com/fsdatalab/quail/issues/77) for the
+  shared prompt prefix case. The lookup needs to stay cheap at
+  AI-SQL request volumes.
 
 ### Harder
 
