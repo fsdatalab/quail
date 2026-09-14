@@ -28,7 +28,9 @@ base_image = (
         "nvidia/cuda:13.0.1-devel-ubuntu24.04", add_python="3.12")
     .entrypoint([])
     .pip_install("huggingface_hub", "numpy", "pyarrow",
-                 "sqlglot>=27.0", "bpe-qwen>=0.1.5", "datasets>=5.0.1")
+                 "sqlglot>=27.0", "bpe-qwen>=0.1.5", "datasets>=5.0.1",
+                 # quail_b reads its query plans with substrait-protobuf
+                 "substrait-protobuf==0.103.0", "pandas>=2.0")
     .env({
         "QUAIL_CACHE_DIR": "/root/.cache/kernels",
         "VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
