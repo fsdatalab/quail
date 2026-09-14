@@ -88,21 +88,16 @@ cd quail
 uv sync --no-dev
 ```
 
-Model execution needs one CUDA GPU per model copy (H100 SXM or RTX PRO 6000
-Blackwell). Quail does not split one model across several GPUs.
-
-The model runs in the process that creates the `Session`. Quail does not
-depend on Modal or on any shared volume. Modal is one way to rent the GPU.
+Quail needs one CUDA GPU per model copy (H100 or RTX PRO 6000 Blackwell),
+on your machine or in a Modal function.
 
 ## Run the quickstart
-
-On a machine with a supported GPU:
 
 ```bash
 uv run python demos/quickstart.py
 ```
 
-Without a local GPU, submit the same query to a Modal H100:
+Or on Modal:
 
 ```bash
 uv run --no-sync --with 'modal[api-proxy-support]==1.5.4' modal setup
@@ -155,9 +150,7 @@ Query time excludes model startup. The saved run is
 `quail-results` Modal volume. QUAIL-B computes accuracy, output precision and
 recall, fresh input tokens, throughput, and GPU cost from the saved results.
 
-On a machine with a supported GPU, run one query and save the results to a
-local directory. QUAIL-B downloads the inputs and reference labels from
-public S3.
+Run a query on your GPU:
 
 ```bash
 uv run python -m quail.bench.quailb \
@@ -167,7 +160,7 @@ uv run python -m quail.bench.quailb \
 uv run quail-b report results/quailb/imdb-4
 ```
 
-To run Quail and both stock vLLM baselines on Modal H100s:
+Or on Modal, with the vLLM baselines:
 
 ```bash
 uv run modal run --detach -m quail.bench.quailb_parallel \
@@ -176,9 +169,8 @@ uv run modal run --detach -m quail.bench.quailb_parallel \
   2>&1 | tee results/quailb.log
 ```
 
-See [Benchmarks](docs/content/docs/contributing/benchmark.mdx) for report
-generation and baseline options, and
-[Metrics](docs/content/docs/user-guide/metrics.mdx) for the definitions.
+See [Benchmarks](docs/content/docs/contributing/benchmark.mdx) and
+[Metrics](docs/content/docs/user-guide/metrics.mdx).
 
 ## Documentation
 
@@ -189,7 +181,7 @@ generation and baseline options, and
 | Build queries in Python | [Python API](docs/content/docs/user-guide/python-api.mdx) |
 | Load your own tables | [Running queries](docs/content/docs/user-guide/sessions.mdx) |
 | Understand plans and metrics | [Results and explain](docs/content/docs/user-guide/results.mdx) |
-| Pick a model or GPU, or run on Modal | [Supported models and GPUs](docs/content/docs/user-guide/models.mdx) |
+| Choose a model or GPU | [Models and GPUs](docs/content/docs/user-guide/models.mdx) |
 | Understand the engine | [Architecture](docs/content/docs/architecture/index.mdx) |
 | Add an extension | [Extending Quail](docs/content/docs/extending/index.mdx) |
 

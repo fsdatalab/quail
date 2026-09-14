@@ -8,28 +8,17 @@ FEVER, LEP, SWE-agent traces). It currently has 33 queries at three
 scale factors (0.1, 0.5, 1.0). We are actively adding queries and
 datasets.
 
-## Run a query on a local GPU
+## Run a query
 
-Neither Quail nor QUAIL-B needs Modal. On a machine with a supported GPU,
-run Quail on one query and save the results to a local directory:
+On your GPU:
 
 ```bash
-uv run python -m quail.bench.quailb \
-  --sf 0.1 --only IMDB-4 \
+uv run python -m quail.bench.quailb --sf 0.1 --only IMDB-4 \
   --model qwen3-4b-fp8 --device h100-sxm \
   --output-dir results/quailb/imdb-4
-uv run quail-b report results/quailb/imdb-4
 ```
 
-Omit `--only` to run all queries. `--gpus` defaults to 1 and `--backend`
-to `quail`. `--output-dir` must be a new directory.
-QUAIL-B downloads the inputs and labels from public S3; pass `--data-dir`
-to read the input tables from a directory of Parquet files instead.
-
-## Run a query on Modal
-
-The Modal runner adds the stock vLLM baselines and runs query families in
-parallel on separate H100s.
+On Modal, with the vLLM baselines:
 
 ```bash
 uv run modal run --detach -m quail.bench.quailb_parallel \
@@ -38,16 +27,17 @@ uv run modal run --detach -m quail.bench.quailb_parallel \
   2>&1 | tee results/benchmark/quailb.log
 ```
 
-Omit `--query` to run all queries. Add `--no-include-baselines` to run
-Quail alone (the default also runs vLLM baselines).
-
-Results are saved to the `quail-results` Modal volume under
-`/results/benchmarks/quailb/<run-id>/`.
+Omit `--only` / `--query` to run all queries. Add `--no-include-baselines`
+to run Quail alone on Modal. Modal results are saved to the
+`quail-results` volume under `/results/benchmarks/quailb/<run-id>/`.
 
 ## Generate a report
 
-A local run is already on disk; point `quail-b report` at its directory.
-For a Modal run, download the results first:
+```bash
+uv run quail-b report results/quailb/imdb-4
+```
+
+For a Modal run, download it first:
 
 ```bash
 uv run modal volume get quail-results \
