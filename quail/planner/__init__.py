@@ -1,4 +1,7 @@
-"""The planner: physical plan assembly from the cost model's numbers.
+"""The planner: every transformation of a plan.
+
+Logical optimizer rules, the physical optimizer protocol, and physical
+plan assembly from the cost model's numbers.
 
 No wall prediction. KV is always bf16.
 

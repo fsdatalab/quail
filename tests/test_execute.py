@@ -86,7 +86,7 @@ def test_query_reuses_plan_and_device(monkeypatch):
         session.close()
 
     with monkeypatch.context() as patch:
-        from quail.physical.optimizer import SupportResult
+        from quail.planner.physical_optimizer import SupportResult
         from quail.specs import H100_SXM
 
         registry = quail.ExtensionRegistry.with_built_ins()

@@ -10,8 +10,8 @@ from quail.backends.quail import quail_runtimes
 from quail.backends.request import request_runtimes
 from quail.execution.runner import built_in_runtimes
 from quail.extensions import ExtensionRegistry
-from quail.logical.rules import built_in_logical_rules
 from quail.physical import built_in_codecs
+from quail.planner.logical_rules import built_in_logical_rules
 from quail.specs import DEVICES, MODELS
 
 

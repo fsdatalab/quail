@@ -29,9 +29,9 @@ this table.
 | Package | What it does | Source |
 | --- | --- | --- |
 | `quail.frontend` | Parses AI SQL (`sql.py`) or builds plans from Python (`builder.py`) into a logical plan. | [frontend/](https://github.com/fsdatalab/quail/tree/main/quail/frontend) |
-| `quail.logical` | Logical node types (`nodes.py`), prompt binding (`prompts.py`), and the logical optimizer with its rules. | [logical/](https://github.com/fsdatalab/quail/tree/main/quail/logical) |
-| `quail.physical` | Typed physical nodes with ports, plan encoding, and the physical optimizer protocol. | [physical/](https://github.com/fsdatalab/quail/tree/main/quail/physical) |
-| `quail.planner` | Plan assembly: filter order, join order and anchors, KV retention schedule, and the speed-of-light estimate. | [planner/](https://github.com/fsdatalab/quail/tree/main/quail/planner) |
+| `quail.logical` | Logical node types (`nodes.py`) and prompt binding (`prompts.py`). Data types only; no rewriting. | [logical/](https://github.com/fsdatalab/quail/tree/main/quail/logical) |
+| `quail.physical` | Typed physical nodes with ports and plan encoding. Data types only. | [physical/](https://github.com/fsdatalab/quail/tree/main/quail/physical) |
+| `quail.planner` | Every plan transformation: the logical optimizer and its rules, the physical optimizer protocol, filter order, join order and anchors, KV retention schedule, and the speed-of-light estimate. | [planner/](https://github.com/fsdatalab/quail/tree/main/quail/planner) |
 | `quail.cost` | The cost model: work counts, roofline arithmetic, budgets, and retention prices. Arithmetic over the specs; imports nothing else. | [cost/](https://github.com/fsdatalab/quail/tree/main/quail/cost) |
 | `quail.execution` | Session, node runtimes and the runner, token store, results. | [execution/](https://github.com/fsdatalab/quail/tree/main/quail/execution) |
 | `quail.backends` | Model backends. `quail/` is Quail's own engine, with its GPU code under `quail/executor/`: packing, KV arena, attention, model loading. `vllm.py` and `sglang.py` are the baselines. | [backends/](https://github.com/fsdatalab/quail/tree/main/quail/backends) |

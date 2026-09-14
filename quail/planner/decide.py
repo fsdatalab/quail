@@ -38,9 +38,13 @@ from quail.physical import (
     Scan as PhysicalScan,
 )
 from quail.physical.base import input_ports
-from quail.physical.optimizer import ModelRegion, PlanningContext, apply_physical_rules
 from quail.planner import joins as joinsearch
 from quail.planner import retention
+from quail.planner.physical_optimizer import (
+    ModelRegion,
+    PlanningContext,
+    apply_physical_rules,
+)
 from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
 from quail.specs import DeviceSpec, ModelSpec
 

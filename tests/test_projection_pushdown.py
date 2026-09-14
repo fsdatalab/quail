@@ -19,11 +19,11 @@ from quail.logical import (
     bind_join_prompt,
     bind_prompt,
 )
-from quail.logical.optimizer import (
+from quail.planner.logical_optimizer import (
     LogicalPlanningContext,
     apply_logical_rules,
 )
-from quail.logical.rules import ProjectionPushdown, push_down_projection
+from quail.planner.logical_rules import ProjectionPushdown, push_down_projection
 from quail.planner.plan import EngineConfig
 
 CONTEXT = LogicalPlanningContext(catalog=None, engine_config=None)

@@ -20,13 +20,13 @@ from quail.physical import (
     Barrier,
     PhysicalNode,
 )
-from quail.physical.optimizer import (
+from quail.planner import collect_operators, plan_quail
+from quail.planner.physical_optimizer import (
     ModelRegion,
     PhysicalCandidate,
     PlanningContext,
     SupportResult,
 )
-from quail.planner import collect_operators, plan_quail
 
 
 class QuailModelExecution:

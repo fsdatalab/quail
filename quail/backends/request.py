@@ -42,7 +42,6 @@ from quail.physical import (
     Scan,
 )
 from quail.physical.base import input_ports
-from quail.physical.optimizer import PhysicalCandidate, SupportResult
 from quail.planner import (
     collect_operators,
     default_order_rule,
@@ -54,6 +53,7 @@ from quail.planner import (
     join_specs as logical_join_specs,
 )
 from quail.planner.joins import search_joins, summarize_alias
+from quail.planner.physical_optimizer import PhysicalCandidate, SupportResult
 from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
 
 

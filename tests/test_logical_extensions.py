@@ -4,7 +4,7 @@ from dataclasses import dataclass, replace
 from typing import ClassVar
 
 from quail.logical import ColumnRef, LogicalPlan, Project, Scan
-from quail.logical.optimizer import (
+from quail.planner.logical_optimizer import (
     LogicalPlanningContext,
     apply_logical_rules,
 )
