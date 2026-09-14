@@ -53,7 +53,7 @@ def run_dumb_vllm_query_family(
 
 
 @app.local_entrypoint()
-def main(query: str = "BIO-3", sf: float = 0.1, model: str = "qwen3-4b-fp8"):
+def check(query: str = "BIO-3", sf: float = 0.1, model: str = "qwen3-4b-fp8"):
     query_ids = [item.strip() for item in query.split(",") if item.strip()]
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_dir = f"/results/benchmarks/quailb/family-runs/{stamp}-dumb-vllm"
