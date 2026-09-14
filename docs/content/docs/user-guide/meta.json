@@ -1,15 +1,13 @@
 {
   "title": "User guide",
   "pages": [
-    "index",
     "quickstart",
     "sql",
+    "sessions",
     "python-api",
-    "data-sources",
-    "configuration",
     "results",
-    "compute",
-    "benchmark"
+    "metrics",
+    "models"
   ],
   "defaultOpen": true
 }

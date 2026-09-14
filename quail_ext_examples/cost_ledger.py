@@ -10,7 +10,13 @@ registered:
     import quail
     from quail_ext_examples import cost_ledger
 
-    session = quail.Session()
+    config = quail.EngineConfig(
+        gpus=1,
+        model="qwen3-4b-fp8",
+        backend="quail",
+        device="h100-sxm",
+    )
+    session = quail.Session(config)
     session.register("reviews", quail.DocumentProvider.from_parquet(
         "reviews.parquet", id_col="id"))
     result = session.sql(

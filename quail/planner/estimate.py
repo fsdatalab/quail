@@ -10,7 +10,7 @@ oracle at every step.
 
 The equations are in docs/content/docs/architecture/sol-model.mdx. The
 work counting and component pricing are the planner's own
-(quail.planner.work, quail.planner.sol); the search does not call or
+(quail.cost.work, quail.cost.sol); the search does not call or
 simulate the production planner.
 """
 
@@ -21,8 +21,11 @@ import math
 from dataclasses import dataclass, field
 from typing import Callable, Mapping
 
+from quail.cost import budgets
+from quail.cost.sol import SpeedOfLight, speed_of_light
+from quail.cost.work import Work, ask, scan, triangle
+from quail.execution.pairs import pair_table
 from quail.logical import oriented_join_conditions
-from quail.planner import budgets
 from quail.planner.decide import (
     collect_operators,
     default_order_rule,
@@ -31,10 +34,7 @@ from quail.planner.decide import (
 )
 from quail.planner.leftdeep import Extension, optimize_left_deep
 from quail.planner.live_rows import PairRelation, exact_live_rows
-from quail.planner.sol import SpeedOfLight, speed_of_light
-from quail.planner.work import Work, ask, scan, triangle
-from quail.runtime.pairs import pair_table
-from quail.runtime.prefixes import prefix_credits
+from quail.planner.prefixes import prefix_credits
 from quail.specs import DeviceSpec, ModelSpec
 
 # answer(prompt, assignment) -> bool, where assignment maps each alias

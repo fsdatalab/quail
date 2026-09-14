@@ -4,7 +4,7 @@ import random
 
 import pytest
 
-from quail.executor.arena import PageArena
+from quail.backends.quail.executor.arena import PageArena
 
 
 def test_allocation_preserves_page_ownership():

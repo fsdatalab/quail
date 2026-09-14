@@ -6,7 +6,7 @@ import pyarrow as pa
 from test_session import make_executor
 
 import quail
-from quail.runtime import execute as execution
+from quail.execution import execute as execution
 
 DOCS = pa.table({
     "id": [f"d{i}" for i in range(6)],
@@ -15,16 +15,22 @@ DOCS = pa.table({
 SQL = ("SELECT d.id FROM docs d WHERE "
        "AI_FILTER(PROMPT('question {0}', d.body), {'selectivity': 0.5})")
 TRUTH = {"d": {"question": [1, 0, 1, 0, 1, 0]}}
+CONFIG = quail.EngineConfig(
+    gpus=1,
+    model="qwen3-4b-fp8",
+    backend="quail",
+    device="h100-sxm",
+)
 
 
-def _session(tokenizer=str.split, **kwargs):
-    session = quail.Session(tokenizer=tokenizer, **kwargs)
+def _session(config, tokenizer=str.split, **kwargs):
+    session = quail.Session(config, tokenizer=tokenizer, **kwargs)
     session.register("docs", quail.DocumentProvider.from_table(DOCS, id_col="id"))
     return session
 
 
 def test_estimated_planning_token_reuse_and_concurrent_boot(monkeypatch):
-    session = _session()
+    session = _session(CONFIG)
     estimates = session.estimate_lengths("docs", "body")
     # every document is n copies of "pad ", so tokens per byte is
     # constant and the estimate lands on the exact count
@@ -38,7 +44,7 @@ def test_estimated_planning_token_reuse_and_concurrent_boot(monkeypatch):
         executor = make_executor(TRUTH)
         patch.setattr(execution, "_execute_physical",
                             lambda request, registry: executor(request))
-        session = _session()
+        session = _session(CONFIG)
         query = session.sql(SQL)
         text = query.explain()
         assert "estimated from a" in text
@@ -84,7 +90,7 @@ def test_estimated_planning_token_reuse_and_concurrent_boot(monkeypatch):
         patch.setattr(execution, "_prepare_backend", prepare)
         patch.setattr(execution, "_execute_physical", execute)
 
-        session = _session(tokenizer=waiting_tokenizer)
+        session = _session(CONFIG, tokenizer=waiting_tokenizer)
         query = session.sql(SQL)
         assert sorted(query.run().to_rows()) == [("d0",), ("d2",), ("d4",)]
         assert order == ["prepare", "execute"]

@@ -1,52 +1,100 @@
 ---
-title: Repository layout and tests
-description: Where things live and how to check a change.
+title: Contributing
 ---
 
-## Layout
+## How to contribute
+
+1. Open an [issue](https://github.com/fsdatalab/quail/issues)
+   proposing what you want to work on, or comment on an existing
+   issue to claim it.
+2. We will read and respond. Once there is agreement on the
+   approach, go ahead and open a PR.
+3. If you are adding new operators or functionality, also add
+   queries to [QUAIL-B](https://github.com/fsdatalab/quail-bench)
+   to test the new feature.
+
+## Repository layout
 
 | Path | Contents |
 | --- | --- |
-| `quail/` | The package. See [Architecture](/docs/architecture) for the module map. |
-| `quail/bench/` | Quail's QUAIL-B runner. The benchmark itself is the `quail_b` package from [fsdatalab/quail-bench](https://github.com/fsdatalab/quail-bench), pinned in `pyproject.toml`; the runner builds Quail queries from its specs, runs them on the same GPU as the baselines, and hands answers to its scoring. |
-| `quail_ext_examples/` | Example extensions. |
-| `tests/` | CPU tests. They fake the GPU and run in seconds. |
-| `experiments/` | Every Modal entry point that costs GPU time: ablation and profiling scripts, and the smokes, probes, and gates under `experiments/cells/`. |
-| `reports/` | Experiment reports, plot scripts, PNGs, `shipped_features/`, and `engine-wiki.md`. Experiment data lives on the `quail-results` volume, not in git. |
-| `docs/` | This documentation site, including the design decisions and the speed of light model. |
+| [`quail/`](https://github.com/fsdatalab/quail/tree/main/quail) | The engine. |
+| [`quail/bench/`](https://github.com/fsdatalab/quail/tree/main/quail/bench) | QUAIL-B runner. |
+| [`tests/`](https://github.com/fsdatalab/quail/tree/main/tests) | CPU tests (no GPU needed). |
+| [`experiments/`](https://github.com/fsdatalab/quail/tree/main/experiments) | Modal GPU scripts. |
+| [`demos/`](https://github.com/fsdatalab/quail/tree/main/demos) | Runnable examples. |
+| [`docs/`](https://github.com/fsdatalab/quail/tree/main/docs) | This site (Fumadocs + Next.js). |
 
-## Checks
+## Running tests
 
 ```bash
-uv run pytest
-uv run ruff check quail tests experiments
+uv run ruff check quail tests experiments tools
+uv run python tools/check_long_strings.py
 uv run vulture
+uv run pytest -q
 ```
 
-`vulture` reports unused code in `quail/` at 70 percent confidence.
-Keep all three clean before pushing.
+All four must pass before pushing.
 
-## Running a GPU cell
-
-Every GPU run goes through Modal and attaches to an existing app:
-`quail-milestone1` for cells, `quail-engine` for the worker. Tee the
-output to a file, because the Modal CLI drops old log lines:
-
-```bash
-uv run modal run experiments/cells/session_smoke.py 2>&1 | tee results/session_smoke.log
-```
-
-Print the function call id and keep it in the tee file. Pull a result
-later with `modal.FunctionCall.from_id(id).get()` rather than writing
-Modal return values to local JSON.
-
-## Adding a page here
-
-The site is Fumadocs on Next.js. Pages are MDX under
-`docs/content/docs/`. Each folder's `meta.json` sets the order.
+## Running the docs site locally
 
 ```bash
 cd docs
 pnpm install
 pnpm dev
 ```
+
+## Roadmap
+
+We are looking for contributors on all of these. If something here
+interests you, open an issue and we will help you get started.
+
+### Simpler
+
+- **More models.** Add `ModelSpec` entries for other Qwen3 sizes or
+  other model families. See
+  [Custom models and GPUs](/docs/extending/models).
+- **More GPU types.** Add `DeviceSpec` entries for other NVIDIA GPUs
+  (e.g., A100, L40S, B200). Each spec needs the memory, bandwidth,
+  and peak FLOP rates from the datasheet.
+
+### Medium
+
+- **New AI-SQL operators.** `AI.CLASSIFY` (return one of N labels),
+  `AI.EXTRACT` (pull structured fields from a document), and
+  `AI.MAP` (run a free-form instruction and return the result).
+  These require decode (generating multiple tokens), which the
+  current engine does not do. See
+  [Custom operators](/docs/extending/operators).
+- **Automatic prefix caching across rows.** Quail currently reuses
+  KV only when the same document appears again in the query. vLLM's
+  automatic prefix caching can reuse KV across different rows that
+  share a token prefix (e.g., agent traces from the same run). The
+  lookup needs to stay cheap at AI-SQL request volumes.
+
+### Harder
+
+- **Hierarchical KV management.** Spill evicted document KV to host
+  CPU memory or disk instead of recomputing from scratch. The
+  tradeoff is recompute cost vs. PCIe/NVMe transfer time.
+- **Higher model FLOP utilization (MFU).** Quail uses DeepGEMM and
+  FlashAttention but has not optimized the GPU kernels beyond
+  fusing small operations. Higher MFU means faster forward passes
+  for the same hardware. This builds on work in the ML inference
+  community (e.g.,
+  [Sail Research on TPU v6e](https://www.sailresearch.com/blog/tpu-v6e-gemma)).
+- **Indexing to avoid full document scans.** A query that filters
+  100,000 documents currently evaluates every one. An index (e.g.,
+  embedding-based or keyword-based) could skip documents that
+  cannot pass, reducing the number of LLM calls.
+- **Online model training during query execution.** Fine-tune a
+  smaller model on the fly using the answers the large model
+  produces during the current query, then use the fine-tuned model
+  to complete the rest of the query or future queries over the same
+  predicate. This is related to
+  [Google's work on proxy models for AI-SQL](https://arxiv.org/abs/2603.15970).
+- **Integration with relational query engines.** A query engine like
+  DataFusion or DuckDB could use Quail as a backend for its AI-SQL
+  operators, passing a physical plan to Quail and getting Arrow
+  results back. Quail's
+  [plan editing API](/docs/architecture/physical-plans#editing-a-plan)
+  is a starting point for this.

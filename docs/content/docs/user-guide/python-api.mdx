@@ -1,245 +1,224 @@
 ---
-title: Python builder API
-description: Building queries in Python instead of SQL.
+title: Python API
 ---
 
-The builder mirrors the SQL surface construct for construct. It
-starts from `Session.docs(name)` and ends with `select(...)`, which
-returns a runnable `Query`. The examples use the QUAIL-B predicates
-over the `reviews` and `aspects` tables from the
-[quickstart](/docs/user-guide/quickstart).
+You can build queries with Python method calls instead of writing
+SQL. Import `col` and `prompt` to get started:
 
 ```python
 from quail import col, prompt
-
-F1 = ("Judge strictly from the review above whether it mentions at "
-      "least one positive aspect of the movie.\n\n{0}\n\nInstruction: "
-      "answer TRUE if the review mentions at least one positive aspect "
-      "of the movie, FALSE otherwise.")
-F4 = ("Judge strictly from the review above whether it discusses the "
-      "ending of the movie.\n\n{0}\n\nInstruction: answer TRUE if the "
-      "review discusses the ending of the movie, FALSE otherwise.")
-
-query = (session.docs("reviews").alias("r")
-         .ai_filter(prompt(F1, col("r.body")), selectivity=0.6)
-         .ai_filter(prompt(F4, col("r.body")), selectivity=0.2)
-         .limit(100)
-         .select("r.id", "r.body"))
 ```
 
-This is QUAIL-B's IMDB-6 with a limit.
-
-## Methods
-
-| Method | SQL equivalent |
-| --- | --- |
-| `docs(provider)` | `FROM provider` |
-| `.alias(a)` | `FROM provider a`. Must come right after `docs()`. |
-| `.ai_filter(prompt, selectivity=None)` | A `WHERE AI_FILTER(...)` term over one table. |
-| `.ai_join(others, prompt, selectivity=None, anchor=None, semantics="full")` | `JOIN ... ON AI_FILTER(...)`, or `EXISTS` / `NOT EXISTS`. |
-| `.join(other, on=None)` | `JOIN ... ON col = col`. The next `.ai_filter()` over both tables is the AI predicate asked of those pairs. |
-| `.apply(fn, columns=[...], name=None, ids=None, kind="per_batch")` | No SQL form. A Python function between two operators; see below. |
-| `.apply_table(fn, columns=[...], name=None, ids=None)` | `.apply(..., kind="barrier")`: the function runs once over every survivor. |
-| `.limit(n)` | `LIMIT n` |
-| `.select(*cols, order="as_written")` | The `SELECT` list. Returns the `Query`. |
-
-`Query.run(plan=...)` executes an edited plan from `plan().insert()`,
-`.remove()`, or `.move()`; see [physical plans](../architecture/physical-plans).
-
-`col("r.body")` is a qualified column. `col("body")` is unqualified
-and resolves when exactly one table in scope has that column. `"*"`
-in `select` expands to every column of every table.
-
-## Joins
-
-`others` is one `docs(...)` builder or a list of them. Each side must
-be a single, optionally filtered, `docs(...)` query. Filters on a
-joined side are carried into the combined query.
+## Example
 
 ```python
-DISCUSS_ASPECT = ("Does the review in DOCUMENT {0} discuss the movie "
-                  "aspect in DOCUMENT {1}?")
-
-pairs = (session.docs("reviews").alias("r")
-         .ai_filter(prompt(F1, col("r.body")), selectivity=0.6)
-         .ai_join(session.docs("aspects").alias("a"),
-                  prompt(DISCUSS_ASPECT, col("r.body"), col("a.aspect")),
-                  selectivity=0.15)
-         .select("r.id", "a.aspect"))
+query = (
+    session.docs("reviews").alias("r")
+    .ai_filter(prompt('Is this review positive?\n\n{0}', col("r.body")))
+    .ai_join(
+        session.docs("aspects").alias("a"),
+        prompt('Does the review discuss this aspect?\n\n{0}\n\n{1}',
+               col("r.body"), col("a.aspect")))
+    .select("r.id", "a.aspect")
+)
+result = query.collect()
 ```
 
-That is the quickstart's join. A chain over four tables, QUAIL-B's
-IMDB-9, adds one `ai_join` per table:
+## Operators
+
+### ai_filter
+
+`ai_filter(prompt, selectivity=None)`
+
+Filter rows with an AI predicate. The model evaluates the prompt on
+each row and keeps those that return TRUE.
 
 ```python
-ASPECT_SENTIMENT = ("Does the review in DOCUMENT {0} express positive "
-                    "sentiment about the movie aspect in DOCUMENT {1}?")
-
-r1 = session.docs("reviews").alias("r1")
-a1 = session.docs("aspects").alias("a1")
-r2 = session.docs("reviews").alias("r2")
-a2 = session.docs("aspects").alias("a2")
-
-chain = (r1
-         .ai_join(a1, prompt(DISCUSS_ASPECT, col("r1.body"), col("a1.aspect")))
-         .ai_join(r2, prompt(DISCUSS_ASPECT, col("r2.body"), col("a1.aspect")))
-         .ai_join(a2, prompt(ASPECT_SENTIMENT, col("r2.body"), col("a2.aspect")))
-         .select("r1.id", "a1.id", "r2.id", "a2.id", order="by_cost"))
+query = (
+    session.docs("reviews").alias("r")
+    .ai_filter(
+        prompt('Is this review positive?\n\n{0}', col("r.body")),
+        selectivity=0.6)
+    .select("r.id")
+)
+result = query.collect()
 ```
 
-For `semantics="full"` the prompt must reference every table the call
-joins, plus at least one table already in the query, so every join
-connects to the join graph.
+`selectivity` is optional. If you want to apply several predicates,
+add multiple `ai_filter` calls. Quail may reorder them based on
+selectivity to reduce total work.
 
-`semantics="exists"` and `semantics="anti"` take exactly one inner
-table. The prompt names the inner table and one outer table. The
-anchor is always the outer table.
+### ai_join
+
+`ai_join(others, prompt, selectivity=None, anchor=None, semantics="full")`
+
+Join two or more tables with an AI predicate. The model evaluates the
+prompt on each pair of rows.
 
 ```python
-no_aspect = (session.docs("reviews").alias("r")
-             .ai_join(session.docs("aspects").alias("a"),
-                      prompt(DISCUSS_ASPECT, col("r.body"), col("a.aspect")),
-                      semantics="anti")
-             .select("r.id"))
+query = (
+    session.docs("reviews").alias("r")
+    .ai_join(
+        session.docs("aspects").alias("a"),
+        prompt('Does the review discuss this aspect?\n\n{0}\n\n{1}',
+               col("r.body"), col("a.aspect")),
+        selectivity=0.15)
+    .select("r.id", "a.aspect")
+)
+result = query.collect()
 ```
 
-## Joins over pairs
+`selectivity` and `anchor` are optional. Pass `semantics="exists"` to
+keep outer rows that match at least one inner row, or
+`semantics="anti"` to keep outer rows that match none.
 
-When an ordinary column relates the two tables, `join(other, on=...)`
-takes `col(...) == col(...)` conditions (one or a list) and the next
-`ai_filter` over both tables is the question asked of the pairs the
-conditions allow. Every other pair is never built, and the planner
-prices the join by the number of equal pairs. This is QUAIL-B's
-FEV-10: a claim names its Wikipedia page, and an evidence row's id is
-its page name.
+### join
+
+`join(other, on=None)`
+
+Add relational predicates to restrict which pairs the model sees.
+Follow `join()` with `ai_filter()` over both tables:
 
 ```python
-SUPPORT = ("Does the passage in DOCUMENT {1} support the claim in "
-           "DOCUMENT {0}?")
-
-same_page = (session.docs("claims").alias("c")
-             .ai_filter(prompt(F11, col("c.claim")))
-             .join(session.docs("evidence").alias("e"),
-                   on=col("c.evidence_wiki_url") == col("e.id"))
-             .ai_filter(prompt(SUPPORT, col("c.claim"), col("e.text")))
-             .select("c.id", "e.id"))
+query = (
+    session.docs("claims").alias("c")
+    .join(
+        session.docs("evidence").alias("e"),
+        on=col("c.wiki_url") == col("e.id"))
+    .ai_filter(
+        prompt('Does the passage support the claim?\n\n{0}\n\n{1}',
+               col("c.claim"), col("e.text")))
+    .select("c.id", "e.id")
+)
+result = query.collect()
 ```
 
-`ai_join(other, prompt)` is the shorthand for `join(other)` followed
-by `ai_filter(prompt)` when every pair is a candidate. A `join()` with
-no `ai_filter` over its pairs is refused at `select()`: a plain join
-belongs in the source database.
+### limit
 
-## A function between two operators
+`limit(n)`
 
-`apply(fn, columns=[...])` puts a Python function in the plan. The
-function receives a dict of Arrow tables keyed by alias. Each table
-holds that alias's row indices under the alias name plus the listed
-columns. What it returns depends on where it sits:
-
-- After a filter (or a scan): the ids to keep, as a list, an Arrow
-  array, or a one-column table. `ids="drop"` (the default) lets it
-  leave ids out; `ids="preserve"` says it returns every id.
-- After `join(other)`: the pairs the next `ai_filter` is asked about,
-  as a table with both alias columns. This is the `HashJoin` node an
-  equality becomes, written by hand: FEV-10 again, with the pairing
-  in Python.
-
-A function never invents an id. One that returns an id it was not
-given, or drops an id under `ids="preserve"`, fails the query.
+Return at most `n` rows.
 
 ```python
-def same_page(tables):
-    claims, evidence = tables["c"], tables["e"]
-    return claims.join(evidence, keys=["evidence_wiki_url"],
-                       right_keys=["id"], join_type="inner").select(["c", "e"])
-
-same_page_pairs = (session.docs("claims").alias("c")
-                   .ai_filter(prompt(F11, col("c.claim")))
-                   .join(session.docs("evidence").alias("e"))
-                   .apply(same_page, columns=[col("c.evidence_wiki_url"),
-                                              col("e.id")])
-                   .ai_filter(prompt(SUPPORT, col("c.claim"), col("e.text")))
-                   .select("c.id", "e.id"))
+query = (
+    session.docs("reviews").alias("r")
+    .ai_filter(prompt('Is this review positive?\n\n{0}', col("r.body")))
+    .limit(100)
+    .select("r.id", "r.body")
+)
 ```
 
-`kind` says how the function runs. `per_batch`, the default, runs it
-on each batch of survivors a filter chain hands its join, so the
-chain keeps streaming and its survivors' KV stays pinned. `barrier`
-(`apply_table`) runs it once over every survivor; the planner then
-finishes the chain before the function, and the join starts after
-it. The function is registered on the session under `name` (its own
-name by default); a session refuses two different functions under one
-name. Today per-batch functions run on one GPU, and `apply` is
-accepted by the Quail backend only; the planner refuses it otherwise.
+### select
 
-## Filter order
+`select(*cols)`
 
-`select(..., order=...)` sets the rule for ordering filter predicates
-over one table:
-
-- `"as_written"`: run predicates in the order you wrote them.
-- `"by_cost"`: order by estimated cost using the selectivities you
-  gave.
-
-The SQL front end takes the same argument as `session.sql(text,
-order=...)`. When `order` is left unset, Quail picks `by_cost` if
-every predicate has a selectivity and `as_written` otherwise. The
-chosen rule is reported as `order_rule` in the result report and in
-`explain()`.
-
-## Speed of light estimate
-
-`quail.speed_of_light_estimate(query, answer)` returns the ideal time of
-a query on one device without running it: every distinct document prefix
-computed once and kept in KV, forward passes packed across the whole
-query, and no host or scheduling overhead. The
-[SoL model](/docs/architecture/sol-model) page has the equations.
-
-`answer(prompt, assignment)` must return the exact TRUE or FALSE answer
-of one prompt for one row assignment. `assignment` maps each alias in
-the prompt to a row index of that alias's table. The estimator uses it
-for the survivors at every filter and join stage, so it needs labels for
-every row and every pair the query can evaluate. QUAIL-B passes its
-saved reference labels.
+Specify which columns to return. This must be the last operator
+and returns a `Query`.
 
 ```python
-def answer(prompt, assignment):
-    return labels[prompt.template][tuple(assignment.values())]
-
-estimate = quail.speed_of_light_estimate(query, answer)
-estimate.seconds          # ideal time on the session's device
-estimate.fresh_tokens     # input tokens a model forward pass processes
-estimate.usd_per_query    # seconds times the device's hourly price
-estimate.assumptions()    # KV capacity, plan space, prefix reuse
-estimate.as_dict()        # everything above plus per stage records
+.select("r.id")               # one column
+.select("r.id", "a.aspect")   # multiple columns
+.select("*")                   # all columns from all tables
 ```
 
-Keyword arguments: `model` and `device` price another spec than the
-session's, `chunk_tokens` overrides the planner's chunk budget, and
-`credit_shared_prefixes=False` computes each document once and reuses it
-only across that document's own questions instead of sharing prefixes
-across documents.
+### collect
 
-The estimate uses the answers you give it and unlimited KV. It is an
-estimate, not a measured run, and says nothing about accuracy.
+`collect(limit=None)`
 
-## Prompt helpers
+Execute the query and return a `pyarrow.Table`. This is when the
+model runs. See [Explain plans and runs](/docs/user-guide/results)
+for `run()`, `explain()`, and the execution report.
 
-The text the engine sends for a prompt is available without a session.
-`quail.bind_prompt(template, (quail.ColumnRef(alias, table, column),))`
-and `quail.bind_join_prompt(...)` return the bound prompt with its
-preamble, tail, and token counts when given a tokenizer.
-`quail.render_join_prompt_text(prompt, documents, anchor)` renders one
-join tuple, and `quail.true_false_ids(tokenizer)` returns the token ids
-the engine reads as TRUE and FALSE. `quail.SHARED_PRE` is the preamble
-every document prefix starts with. QUAIL-B's labeling pass uses these
-to ask the reference model the exact question the engine asks.
+## User-defined functions
+
+User-defined functions run on the CPU between AI operators. They do
+not run on the GPU. Quail may reorder AI filters and joins around
+each other, but it will not move an AI operator across a
+user-defined function.
+
+### apply
+
+`apply(fn, columns=[], name=None, ids=None, kind="per_batch")`
+
+Insert a Python function into the query plan. The function receives
+a dict of Arrow tables keyed by alias.
+
+The main use case is pairing rows from two tables before an AI join.
+For example, a claims table has an `evidence_wiki_url` column that
+names the evidence page for each claim. Instead of evaluating the AI
+predicate on every claim-evidence pair, you pair them by URL first:
+
+```python
+def match_by_url(tables):
+    """Pair each claim with the evidence row its URL names.
+
+    tables["c"] is a pyarrow.Table with columns "c" (the document ids),
+    "evidence_wiki_url", and any other columns requested.
+    tables["e"] has columns "e" (the document ids) and "id".
+    The returned table must have columns "c" and "e" (the id columns
+    from each side) to identify the pairs.
+    """
+    return tables["c"].join(
+        tables["e"],
+        keys=["evidence_wiki_url"],
+        right_keys=["id"],
+        join_type="inner",
+    ).select(["c", "e"])
+
+query = (
+    session.docs("claims").alias("c")
+    .join(session.docs("evidence").alias("e"))
+    .apply(match_by_url,
+           columns=[col("c.evidence_wiki_url"), col("e.id")])
+    .ai_filter(
+        prompt('Does the passage support the claim?\n\n{0}\n\n{1}',
+               col("c.claim"), col("e.text")))
+    .select("c.id", "e.id")
+)
+result = query.collect()
+```
+
+You can also use `apply` after a filter to drop rows with custom
+Python logic before the next AI operator runs.
+
+`kind="per_batch"` (default) runs the function on each batch as
+they stream through.
+
+### apply_table
+
+`apply_table(fn, columns=[], name=None, ids=None)`
+
+Like `apply`, but waits for the preceding stage to finish and calls
+`fn` once with all surviving rows. Equivalent to
+`apply(..., kind="barrier")`.
+
+Use this when your function needs to see every surviving row at once.
+With `apply`, rows arrive in batches as they stream through. With
+`apply_table`, Quail finishes the preceding stage first, then calls
+your function once with all the results.
+
+```python
+import pyarrow.compute as pc
+
+def deduplicate(tables):
+    reviews = tables["r"]
+    unique = pc.unique(reviews.column("body"))
+    mask = pc.is_in(reviews.column("body"), unique)
+    return reviews.filter(mask).column("r")
+
+query = (
+    session.docs("reviews").alias("r")
+    .apply_table(deduplicate, columns=[col("r.body")])
+    .ai_filter(prompt('Is this review positive?\n\n{0}', col("r.body")))
+    .select("r.id")
+)
+result = query.collect()
+```
+
+Note that `apply_table` fixes the execution order at that point in
+the query. The planner will not reorder operators across it.
 
 ## Errors
 
-Every mistake in the builder raises `quail.logical.CompileError` at
-the call that made it, with a message that names the fix. Examples:
-an alias set after a filter, two document columns on one table, a
-join prompt that does not reference a joined table, or an anchor that
-is not part of the join.
+Mistakes raise `quail.logical.CompileError` at the call that caused
+them.

@@ -9,9 +9,9 @@ import pytest
 from fakes import register_claims_evidence
 
 import quail
+from quail.execution.pairs import pair_fraction, pair_table, partner_map
 from quail.physical import AiJoin
 from quail.planner.plan import EngineConfig
-from quail.runtime.pairs import pair_fraction, pair_table, partner_map
 
 
 def _parquet(path, table):
@@ -24,7 +24,7 @@ def fake_tok(text):
 
 
 def _run(query, execute):
-    from quail.runtime.execute import execute_query
+    from quail.execution.execute import execute_query
 
     return execute_query(query, physical_executor=execute)
 
@@ -64,7 +64,13 @@ def runtime_plan(request):
 
 @pytest.fixture()
 def sess(tmp_path):
-    s = quail.Session(EngineConfig(gpus=1), tokenizer=fake_tok)
+    config = EngineConfig(
+        gpus=1,
+        model="qwen3-4b-fp8",
+        backend="quail",
+        device="h100-sxm",
+    )
+    s = quail.Session(config, tokenizer=fake_tok)
     # reviews: longer documents (they anchor); products: short
     s.register("reviews", quail.DocumentProvider.from_parquet(
         _parquet(tmp_path / "r.parquet", {
@@ -80,6 +86,17 @@ def sess(tmp_path):
     s.close()
 
 
+def test_session_requires_model_and_device():
+    with pytest.raises(TypeError, match="'model' and 'device'"):
+        EngineConfig()
+    with pytest.raises(TypeError, match="'device'"):
+        EngineConfig(model="qwen3-4b-fp8")
+    with pytest.raises(TypeError, match="required positional argument: 'config'"):
+        quail.Session()
+    config = EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
+    assert (config.gpus, config.backend) == (1, "quail")
+
+
 def make_executor(filter_truth, join_truth=None, seen=None):
     """Build a fake executor from filter and join truth tables."""
     def _match_key(alias, q):
@@ -93,9 +110,9 @@ def make_executor(filter_truth, join_truth=None, seen=None):
         from test_quail_backend import graph_state
 
         from quail.backends.quail.graph import execute_single_graph
-        from quail.execution import PhysicalResponse
+        from quail.execution.runner import NodeResult
+        from quail.execution.types import PhysicalResponse
         from quail.physical import AiFilter, Scan
-        from quail.runtime.runner import NodeResult
 
         runtime = runtime_plan(request)
         if seen is not None:
@@ -199,7 +216,7 @@ def test_query_rows_observers_and_saved_reports(sess, tmp_path):
     with pytest.raises(KeyError):
         result.observer("example.missing")
 
-    from quail.runtime.result import QueryResult
+    from quail.execution.result import QueryResult
 
     # Saved reports can be loaded separately from their result tables.
     table, report = result.collect(), dict(result.report)
@@ -231,7 +248,12 @@ class NodeTypes:
 
 def _observed_result(tmp_path, registry):
     session = quail.Session(
-        EngineConfig(gpus=1),
+        EngineConfig(
+            gpus=1,
+            model="qwen3-4b-fp8",
+            backend="quail",
+            device="h100-sxm",
+        ),
         tokenizer=fake_tok,
         registry=registry,
     )
@@ -278,8 +300,15 @@ def _pair_query(session, on):
 
 
 def test_session_plans_prices_and_ships_the_pair_table():
-    with quail.Session(EngineConfig(),
-                       tokenizer=lambda text: list(text.encode())) as session:
+    config = EngineConfig(
+        gpus=1,
+        model="qwen3-4b-fp8",
+        backend="quail",
+        device="h100-sxm",
+    )
+    with quail.Session(
+        config, tokenizer=lambda text: list(text.encode())
+    ) as session:
         register_claims_evidence(session)
         paired = _pair_query(session, on=True)
         cross = _pair_query(session, on=False)

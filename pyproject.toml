@@ -73,7 +73,7 @@ ignore = ["D1", "N803", "N806", "N812"]
 convention = "google"
 
 [tool.ruff.lint.isort]
-known-first-party = ["quail", "quail_b", "experiments", "reports"]
+known-first-party = ["quail", "quail_b", "experiments"]
 
 [tool.vulture]
 paths = ["quail"]

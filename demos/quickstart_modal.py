@@ -1,6 +1,7 @@
 """Run the shared quickstart on a Modal H100.
 
-uv run modal run demos/quickstart_modal.py 2>&1 | tee results/quickstart_modal.log
+uv run --no-sync --with 'modal[api-proxy-support]==1.5.4' \
+  modal run demos/quickstart_modal.py 2>&1 | tee results/quickstart_modal.log
 """
 
 import json
@@ -40,7 +41,7 @@ image = (
         "VLLM_CACHE_ROOT": "/results/kernels/vllm",
         "VLLM_USE_FLASHINFER_SAMPLER": "0",
     })
-    .add_local_python_source("quail", "quail_b", "demos")
+    .add_local_python_source("quail", "demos")
 )
 
 

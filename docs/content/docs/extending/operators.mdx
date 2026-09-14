@@ -1,0 +1,129 @@
+---
+title: Custom operators
+---
+
+Quail currently supports one AI operator: `AI_FILTER` / `AI.IF`,
+which returns TRUE or FALSE. Adding a new operator requires changes
+at three levels: a logical node, a physical node, and planning
+logic.
+
+We use `AI.CLASSIFY` as a running example. `AI.CLASSIFY` categorizes
+each document into one of N labels instead of returning TRUE/FALSE.
+It also requires decode (the model generates multiple tokens).
+
+## Logical node
+
+A logical node defines what the operator means in the query plan.
+For `AI.CLASSIFY`, the node holds the input, the prompt, and the
+allowed categories:
+
+```python
+@dataclass(frozen=True)
+class SemanticClassify:
+    input: LogicalNode
+    prompt: Prompt
+    categories: tuple[str, ...]
+
+    type_name: ClassVar[str] = "quail.semantic_classify"
+
+    def children(self):
+        return (self.input,)
+
+    def expressions(self):
+        return (self.prompt, self.categories)
+
+    def output_schema(self):
+        return self.input.output_schema()
+
+    def validate(self):
+        if not self.categories:
+            raise CompileError("AI.CLASSIFY needs at least one category")
+```
+
+See
+[`SemanticFilter`](https://github.com/fsdatalab/quail/blob/main/quail/logical/nodes.py)
+for how the existing filter node is built.
+
+## Physical node
+
+A physical node specifies how the operator runs on the GPU. For
+`AI.CLASSIFY`, the physical node holds the tokenized category labels:
+
+```python
+@dataclass(frozen=True)
+class AiClassify(PhysicalNode):
+    alias: str = ""
+    category_token_ids: tuple = ()
+
+    type_name: ClassVar[str] = "quail.ai_classify"
+    runtime_key: ClassVar[str] = type_name
+    location: ClassVar[ExecutionLocation] = ExecutionLocation.GPU_EXECUTOR
+```
+
+Each physical node also needs:
+
+- A **codec** to serialize the node across the process boundary.
+- A **runtime** that implements `execute(node, inputs, context)` and
+  returns the Arrow output tables.
+
+See
+[`AiFilter`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py)
+for how the existing filter physical node is built, and
+[`tests/test_physical.py`](https://github.com/fsdatalab/quail/blob/main/tests/test_physical.py)
+for a complete working example of a custom node with its codec,
+runtime, and planner.
+
+## Planning
+
+Adding a new operator to the planner means teaching the existing
+Quail backend how to plan and cost the new node. Concretely:
+
+1. **Work counting.** Add a function that counts fresh tokens,
+   attention pairs, KV written, and KV read for the new operator.
+   For `AI.CLASSIFY`, the prefill work per document is the same as
+   `AI_FILTER`. The difference is decode: generating each label
+   token is an additional forward pass that attends to all previous
+   tokens. See
+   [`quail/cost/work.py`](https://github.com/fsdatalab/quail/blob/main/quail/cost/work.py).
+2. **Cost estimation.** Pass the work counts through the
+   [roofline model](/docs/architecture/planning#the-roofline-speed-of-light-model)
+   to get estimated seconds. See
+   [`quail/cost/sol.py`](https://github.com/fsdatalab/quail/blob/main/quail/cost/sol.py).
+3. **Graph construction.** Include the new physical node in the graph
+   the planner builds. The planner in
+   [`quail/planner/decide.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/decide.py)
+   constructs the full physical graph (scans, filters, joins,
+   barriers, projection) and returns a `PhysicalCandidate` with the
+   graph and estimated time. The new node would be placed in the
+   graph alongside the existing node types.
+
+## Optional: logical and physical rules
+
+**Logical rules** rewrite the logical plan before physical planning.
+For example, a rule could rewrite `AI.CLASSIFY` with exactly two
+categories into an `AI_FILTER`, since two categories is equivalent
+to TRUE/FALSE.
+
+**Physical rules** rewrite the physical graph after the planner
+selects one. For example, a rule could fuse consecutive classify
+operators.
+
+See
+[`quail/planner/logical_optimizer.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/logical_optimizer.py)
+and
+[`quail/planner/physical_optimizer.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/physical_optimizer.py)
+for the rule protocols.
+
+## Registration
+
+All pieces are registered on the session's `ExtensionRegistry`:
+
+```python
+registry = quail.ExtensionRegistry.with_built_ins()
+registry.register_node(AiClassify, runtime=AiClassifyRuntime())
+registry.register_physical_planner(ClassifyPlanner())
+registry.register_logical_rule(SimplifyBinaryClassify())
+```
+
+See the [Overview](/docs/extending) for how to create and pass a
+registry.

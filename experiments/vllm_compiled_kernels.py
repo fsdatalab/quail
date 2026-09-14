@@ -53,7 +53,7 @@ import os
 
 import modal
 
-from quail.executor.attention import GROUP, Pipeline
+from quail.backends.quail.executor.attention import GROUP, Pipeline
 
 IMAGE_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
 
@@ -278,7 +278,7 @@ def _write(result, name):
 def _boot_state(model):
     """Boot the worker state dict with the kernel-source pipeline.
 
-    Mirrors quail.runtime.execute._execute_physical's boot, with the
+    Mirrors quail.execution.execute._execute_physical's boot, with the
     Pipeline subclass swapped in; warm_kernels runs the same tiered
     warmup the worker runs.
     """
@@ -286,11 +286,11 @@ def _boot_state(model):
     import torch.nn.functional as F
     from transformers import AutoTokenizer
 
-    from quail.executor.arena import KVArena
-    from quail.executor.attention import FILTER_ATTENTION
-    from quail.executor.loop import Answerer, AsyncAnswers, warm_kernels
-    from quail.executor.model import load_model
-    from quail.planner import budgets
+    from quail.backends.quail.executor.arena import KVArena
+    from quail.backends.quail.executor.attention import FILTER_ATTENTION
+    from quail.backends.quail.executor.loop import Answerer, AsyncAnswers, warm_kernels
+    from quail.backends.quail.executor.model import load_model
+    from quail.cost import budgets
     from quail.specs import DEVICES, MODELS
 
     spec = MODELS[model]
@@ -341,24 +341,29 @@ def _quailb_session(model, sf, gpus=1):
 
     d = build_sets(DATA_DIR, sf)
     results_vol.commit()
-    sess = quail.Session(EngineConfig(gpus=gpus, model=model))
+    sess = quail.Session(EngineConfig(
+        gpus=gpus,
+        model=model,
+        backend="quail",
+        device="h100-sxm",
+    ))
     register_tables(sess, d)
     return sess, queries(sess), d
 
 
 def _run_query(state, build, captured):
     """One query through the real planner and worker core."""
+    from quail.backends.quail.executor.loop import AsyncAnswers
     from quail.backends.quail.worker import (
         _PayloadAnswerer,
         execute_single,
         quail_runtime_payload,
     )
-    from quail.execution import PhysicalResponse
-    from quail.executor.loop import AsyncAnswers
-    from quail.runtime.execute import (
+    from quail.execution.execute import (
         _validate_physical_request,
         execute_query,
     )
+    from quail.execution.types import PhysicalResponse
 
     def execute(request):
         request, registry, graph, _ = _validate_physical_request(

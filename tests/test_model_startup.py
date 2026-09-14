@@ -2,8 +2,8 @@
 
 import pytest
 
+from quail.backends.quail.executor import model
 from quail.builtins import built_in_registry
-from quail.executor import model
 
 
 @pytest.fixture(autouse=True)

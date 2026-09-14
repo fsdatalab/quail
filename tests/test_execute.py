@@ -9,15 +9,23 @@ import pytest
 from test_session import make_executor
 
 import quail
-from quail.runtime import execute as execution
+from quail.execution import execute as execution
 
 
 def _tokens(text):
     return text.split()
 
 
-def _session(**kwargs):
-    session = quail.Session(tokenizer=_tokens, **kwargs)
+QUAIL_CONFIG = quail.EngineConfig(
+    gpus=1,
+    model="qwen3-4b-fp8",
+    backend="quail",
+    device="h100-sxm",
+)
+
+
+def _session(config, **kwargs):
+    session = quail.Session(config, tokenizer=_tokens, **kwargs)
     session.register("docs", quail.DocumentProvider.from_table(
         pa.table({"id": ["a", "b"], "body": ["one two", "three four"]}),
         id_col="id",
@@ -33,7 +41,7 @@ IMPORT_TEXT = """
 import sys
 import quail
 from quail.bench import quailb
-from quail.runtime import execute
+from quail.execution import execute
 from demos import quickstart
 
 assert "modal" not in sys.modules
@@ -47,7 +55,7 @@ def test_engine_import_and_gpu_requirement(monkeypatch):
         patch.setattr(
             execution, "gpu_problem", lambda: "no CUDA GPU is visible"
         )
-        session = _session()
+        session = _session(QUAIL_CONFIG)
         with pytest.raises(RuntimeError, match="process with a CUDA GPU") as error:
             session.sql(FILTER_SQL).run()
         assert "no CUDA GPU is visible" in str(error.value)
@@ -56,14 +64,14 @@ def test_engine_import_and_gpu_requirement(monkeypatch):
 
 def test_query_reuses_plan_and_device(monkeypatch):
     with monkeypatch.context() as patch:
-        from quail.runtime import session as session_module
+        from quail.execution import session as session_module
 
         patch.setattr(execution, "gpu_problem", lambda: None)
         patch.setattr(execution, "_prepare_backend", lambda *args: None)
         executor = make_executor({"d": {"question": [1, 0]}})
         patch.setattr(execution, "_execute_physical",
                             lambda request, registry: executor(request))
-        session = _session()
+        session = _session(QUAIL_CONFIG)
         query = session.sql(FILTER_SQL)
         query.explain()
         query.wait_for_tokens()
@@ -78,7 +86,7 @@ def test_query_reuses_plan_and_device(monkeypatch):
         session.close()
 
     with monkeypatch.context() as patch:
-        from quail.planning import SupportResult
+        from quail.planner.physical_optimizer import SupportResult
         from quail.specs import H100_SXM
 
         registry = quail.ExtensionRegistry.with_built_ins()
@@ -91,8 +99,13 @@ def test_query_reuses_plan_and_device(monkeypatch):
             return SupportResult.accept()
 
         patch.setattr(registry.backend("quail"), "supports", supports)
-        config = quail.EngineConfig(gpus=1, device=device.name)
-        with _session(config=config, registry=registry) as session:
+        config = quail.EngineConfig(
+            gpus=1,
+            model="qwen3-4b-fp8",
+            backend="quail",
+            device=device.name,
+        )
+        with _session(config, registry=registry) as session:
             query = session.sql(FILTER_SQL)
             assert session.device is device
             assert query.plan().device == device.name

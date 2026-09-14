@@ -268,18 +268,22 @@ def resolve_model(name: str, models=None):
     if name in models:
         return models[name]
     return Refusal(
-        reasons=(f"{name!r} names no registered ModelSpec; known: "
+        reasons=(f"unknown model {name!r}; registered models: "
                  f"{sorted(models)}",),
         constraint="unknown_model", needed=1, available=0, unit="specs")
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class EngineConfig:
-    """Top-level engine configuration."""
+    """Top-level engine configuration.
+
+    `model` and `device` have no defaults: they name the hardware and
+    weights the query runs on. `gpus` counts model copies on one host.
+    """
+    model: str
+    device: str
     gpus: int = 1
-    model: str = "qwen3-4b-fp8"
     backend: str = "quail"
-    device: str = "h100-sxm"
     # sum the CUDA event pair each forward chunk records into gpu_s;
     # off by default so a run never pays for a measurement it does not read
     gpu_timing: bool = False

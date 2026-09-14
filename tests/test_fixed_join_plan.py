@@ -8,13 +8,22 @@ from test_quail_backend import graph_state
 import quail
 from quail.backends.quail.graph import execute_single_graph, filter_result
 from quail.bench import quailb
-from quail.execution import PhysicalResponse
+from quail.execution.execute import execute_query
+from quail.execution.runner import NodeMetrics, NodeResult, SurvivorStream
+from quail.execution.types import PhysicalResponse
 from quail.physical import AiFilter, AiJoin, Barrier, Scan, decode_graph
 from quail.planner.plan import EngineConfig
-from quail.runtime.execute import execute_query
-from quail.runtime.runner import NodeMetrics, NodeResult, SurvivorStream
 from quail_b import prompts
 from quail_b.queries import FILTER_SELECTIVITY_ESTIMATES
+
+
+def _config(*, gpus, backend):
+    return EngineConfig(
+        gpus=gpus,
+        model="qwen3-4b-fp8",
+        backend=backend,
+        device="h100-sxm",
+    )
 
 
 def register_fever(session):
@@ -130,7 +139,7 @@ def test_fixed_order_execution_and_backend_planning(monkeypatch):
     ]:
             patch.setitem(FILTER_SELECTIVITY_ESTIMATES, prompts.F11, estimate)
             patch.setitem(FILTER_SELECTIVITY_ESTIMATES, prompts.F13, estimate)
-            with quail.Session(EngineConfig(),
+            with quail.Session(_config(gpus=1, backend="quail"),
                                tokenizer=lambda text: list(text.encode())) as session:
                 register_fever(session)
                 query = quailb.queries(session)["FEV-9"][1]()
@@ -186,7 +195,7 @@ def test_fixed_order_execution_and_backend_planning(monkeypatch):
                 }])
 
     for backend in ["stock_vllm", "pipelined_vllm", "pipelined_sglang"]:
-        with quail.Session(EngineConfig(backend=backend),
+        with quail.Session(_config(gpus=1, backend=backend),
                            tokenizer=lambda text: list(text.encode())) as session:
             register_fever(session)
             plan = quailb.queries(session)["FEV-9"][1]().plan()
@@ -197,10 +206,10 @@ def test_fixed_order_execution_and_backend_planning(monkeypatch):
 def test_distributed_fev9_executes_bound_join_nodes(monkeypatch):
     from quail.backends.quail import worker
     from quail.backends.quail.distributed import execute_distributed_graph
-    from quail.runtime.runner import ExecutionContext
+    from quail.execution.runner import ExecutionContext
     from quail.specs import H100_SXM, QWEN3_4B_FP8
 
-    with quail.Session(EngineConfig(gpus=2),
+    with quail.Session(_config(gpus=2, backend="quail"),
                        tokenizer=lambda text: list(text.encode())) as session:
         register_fever(session)
         query = quailb.queries(session)["FEV-9"][1]()
@@ -250,7 +259,7 @@ def test_distributed_fev9_executes_bound_join_nodes(monkeypatch):
 
 
 def _fever_children(session, docs, count):
-    from quail.runtime.runner import ExecutionContext
+    from quail.execution.runner import ExecutionContext
 
     children = []
     for _ in range(count):
@@ -323,7 +332,7 @@ def test_fev10_asks_the_model_about_same_page_pairs_only(monkeypatch):
         return {"columns": columns}
 
     for gpus in (1, 2):
-        with quail.Session(EngineConfig(gpus=gpus),
+        with quail.Session(_config(gpus=gpus, backend="quail"),
                            tokenizer=lambda text: list(text.encode())) as session:
             register_fever(session)
             query = quailb.queries(session)["FEV-10"][1]()
@@ -347,7 +356,7 @@ def test_fev10_asks_the_model_about_same_page_pairs_only(monkeypatch):
 
 
 def test_an_edited_fev9_plan_executes(monkeypatch):
-    with quail.Session(EngineConfig(),
+    with quail.Session(_config(gpus=1, backend="quail"),
                        tokenizer=lambda text: list(text.encode())) as session:
         register_fever(session)
         query = quailb.queries(session)["FEV-9"][1]()
@@ -381,8 +390,8 @@ def test_an_edited_fev9_plan_executes(monkeypatch):
 
 
 def test_retention_search_matches_enumeration():
+    from quail.cost.sol import speed_of_light
     from quail.planner.joins import search_joins, summarize_alias, walk
-    from quail.planner.sol import speed_of_light
     from quail.specs import H100_SXM, QWEN3_4B_FP8
 
     specs = [{"written_pos": index, "aliases": list(aliases),

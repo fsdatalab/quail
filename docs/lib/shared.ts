@@ -5,6 +5,6 @@ export const docsContentRoute = '/llms.mdx/docs';
 
 export const gitConfig = {
   user: 'fsdatalab',
-  repo: 'quail-exploration',
+  repo: 'quail',
   branch: 'main',
 };

@@ -1,203 +1,224 @@
 ---
 title: SQL reference
-description: The AI SQL subset Quail accepts, and what it refuses.
 ---
 
-Quail accepts a small SQL subset. It runs the model part of a query
-and nothing else. Ordinary relational work such as grouping, ordering,
-and arithmetic belongs in the database the document ids came from.
+## What is AI-SQL?
 
-Two spellings are accepted. Snowflake style uses `AI_FILTER`. BigQuery
-style uses `AI.IF` and is selected with `dialect="bq"`. Both compile to
-the same logical plan.
+AI-SQL extends standard SQL with operators that call a language model
+during query execution. You can filter rows, join tables, and match
+documents using natural language conditions instead of exact column
+comparisons.
 
-```python
-session.sql(text)                  # Snowflake spelling, the default
-session.sql(text, dialect="bq")    # BigQuery spelling
-```
-
-The examples below use the QUAIL-B benchmark's predicates over its
-`reviews` (IMDB) and `aspects` tables, the same ones the
-[quickstart](/docs/user-guide/quickstart) runs.
-
-## The shape of a query
-
-```sql
-SELECT <columns>
-FROM <provider> [<alias>]
-[JOIN <provider> [<alias>] ON [<col> = <col> AND]... AI_FILTER(PROMPT(...), {...})]...
-[WHERE <term> [AND <term>]...]
-[LIMIT <n>]
-```
-
-- `SELECT` lists columns only. `*` expands to every column of every
-  table in the query. No expressions, no aliases with computation.
-- `FROM` names one registered provider. The alias is optional and
-  defaults to the provider name.
-- `JOIN` adds a table. Only plain `JOIN` and `CROSS JOIN` are allowed.
-  `LEFT`, `RIGHT`, `FULL`, and `OUTER` are refused. `ON` holds the AI
-  predicate and, optionally, ordinary `column = column` conditions
-  that choose which pairs the model sees.
-- `WHERE` is a conjunction. Each term is an `AI_FILTER` call, an
-  `EXISTS` subquery, or a `NOT EXISTS` subquery.
-- `LIMIT` takes a positive integer literal.
-
-## Prompts
-
-```sql
-PROMPT('<template>', <column>, ...)
-```
-
-The template uses numbered placeholders. `{0}` is the first column
-argument, `{1}` the second, and so on. Every placeholder must be used
-at least once, and the placeholders must be exactly `{0}` through
-`{n-1}` for `n` column arguments.
-
-A filter prompt has one column. A join prompt has one column per
-joined table, and each placeholder must name a different table alias.
-Refer to a document a second time in the question text with its
-marker rather than adding a second placeholder.
-
-Quail rewrites each template into a fixed layout: a document block,
-then a task instruction, then the question, then an answer cue. Text
-you write before the first placeholder is moved after it, so the
-document's KV does not depend on the question and can be shared
-across questions. The benchmark's predicates put the instruction
-first and repeat it after the placeholder, which reads well and
-tokenizes the same way.
-
-## Filters
-
-Two predicates over one table, F1 and F4 from QUAIL-B:
+For example, to find reviews that discuss the ending of a movie:
 
 ```sql
 SELECT r.id
 FROM reviews r
-WHERE AI_FILTER(PROMPT('Judge strictly from the review above whether it mentions at least one positive aspect of the movie.
-
-{0}
-
-Instruction: answer TRUE if the review mentions at least one positive aspect of the movie, FALSE otherwise.', r.body),
-                {'selectivity': 0.6})
-  AND AI_FILTER(PROMPT('Judge strictly from the review above whether it discusses the ending of the movie.
-
-{0}
-
-Instruction: answer TRUE if the review discusses the ending of the movie, FALSE otherwise.', r.body),
-                {'selectivity': 0.2})
+WHERE AI.IF(PROMPT('Does this review discuss the ending of the movie?\n\n{0}', r.body))
 ```
 
-Each `AI_FILTER` term over one table is one filter predicate. All
-predicates over one table must read the same document column. That is
-what lets the document's KV be computed once.
+The model reads each review and returns TRUE or FALSE. Quail keeps
+the rows where the answer is TRUE.
 
-The optional second argument is an option object. A one-table filter
-accepts `selectivity` only: the fraction of documents you expect to
-pass. When every predicate has one, Quail orders the predicates by
-estimated cost; here it would ask F4 first because it drops more
-documents. It does not change the answer.
+Major database vendors define their own AI-SQL syntax, including
+[Snowflake Cortex AISQL](https://docs.snowflake.com/en/user-guide/snowflake-cortex/aisql),
+[BigQuery AI functions](https://cloud.google.com/blog/products/data-analytics/sql-reimagined-for-the-ai-era-with-bigquery-ai-functions),
+and [Databricks AI Functions](https://docs.databricks.com/aws/en/large-language-models/ai-functions).
+Quail supports two of these dialects:
 
-## Joins
+```python
+session.sql(text, dialect="snowflake")  # AI_FILTER syntax
+session.sql(text, dialect="bq")         # AI.IF syntax
+```
 
-Write the join predicate on the `JOIN`'s `ON` clause, Snowflake style:
+Both compile to the same plan. The rest of this page uses the
+BigQuery dialect.
+
+## PROMPT
+
+`PROMPT` writes the question that the model answers for each row.
+You write a template with `{0}`, `{1}`, etc. as placeholders for
+column values, and Quail substitutes each row's data in.
+
+For a filter, the prompt references one column:
 
 ```sql
-SELECT r.id, a.aspect
-FROM reviews r
-JOIN aspects a
-  ON AI_FILTER(PROMPT('Does the review in DOCUMENT {0} discuss the movie aspect in DOCUMENT {1}?',
-                      r.body, a.aspect),
-               {'selectivity': 0.15, 'anchor': 'r'})
+PROMPT('Does this review discuss the ending of the movie?\n\n{0}', r.body)
 ```
 
-Or cross join in `FROM` and put the predicate in `WHERE`, BigQuery
-style:
+Here `{0}` is replaced with each review's `body` text.
+
+For a join, the prompt references one column from each table:
+
+```sql
+PROMPT('Does the review discuss this aspect?\n\nReview: {0}\nAspect: {1}',
+       r.body, a.aspect)
+```
+
+Here `{0}` is the review and `{1}` is the aspect, and the model
+answers for every pair.
+
+## AI operators
+
+### AI.IF
+
+`AI.IF` takes a `PROMPT` and evaluates it on each row or each pair
+of rows. The model returns TRUE or FALSE.
+
+#### Filtering
+
+Use `AI.IF` in a `WHERE` clause to filter rows:
+
+```sql
+SELECT r.id
+FROM reviews r
+WHERE AI.IF(PROMPT('Does this review mention a positive aspect?\n\n{0}', r.body))
+  AND AI.IF(PROMPT('Does this review discuss the ending?\n\n{0}', r.body))
+```
+
+You can chain multiple filters with `AND`. Quail requires all
+filters on one table to read the same document column, so it can
+compute the document's model state once and reuse it across filters.
+
+#### Joining
+
+Use `AI.IF` to join two tables with a natural language condition.
+The model evaluates the prompt on each pair of rows.
 
 ```sql
 SELECT r.id, a.aspect
 FROM reviews r, aspects a
-WHERE AI.IF(PROMPT('Does the review in DOCUMENT {0} discuss the movie aspect in DOCUMENT {1}?',
+WHERE AI.IF(PROMPT('Does the review discuss this aspect?\n\nReview: {0}\nAspect: {1}',
                    r.body, a.aspect))
 ```
 
-One prompt can join more than two tables. It then has one placeholder
-per table. Every joined table must appear in at least one join
-predicate, and the join predicates must connect every table to the
-`FROM` table. QUAIL-B's IMDB-9 chains two reviews and two aspects that
-way.
-
-### Joins over pairs
-
-When an ordinary column relates the two tables, put the equality in
-`ON` next to the AI predicate. The model is then asked only about the
-pairs whose columns are equal; every other pair is never built. In
-QUAIL-B's FEV-10 a claim names its Wikipedia page and an evidence
-row's id is its page name, so the join asks whether a page supports a
-claim only for the claim's own page:
+You can also add relational predicates on `ON` to restrict which
+pairs the model sees. You can add more than one.
 
 ```sql
 SELECT c.id, e.id
 FROM claims c
 JOIN evidence e
-  ON c.evidence_wiki_url = e.id
- AND AI_FILTER(PROMPT('Does the passage in DOCUMENT {1} support the claim in DOCUMENT {0}?',
-                      c.claim, e.text))
-WHERE AI_FILTER(PROMPT('Is the claim in DOCUMENT {0} about a person?', c.claim))
+  ON c.wiki_url = e.id
+ AND AI.IF(PROMPT('Does the passage support the claim?\n\nClaim: {0}\nPassage: {1}',
+                  c.claim, e.text))
 ```
 
-The equality becomes a `HashJoin` node in the physical plan. It reads
-the two key columns, pairs the rows whose values are equal, and feeds
-those pairs to the AI join, which asks the model about the pairs both
-sides' survivors allow. The planner prices the join by the number of
-equal pairs instead of the cross product, and `explain()` shows the
-node with the fraction of pairs it keeps. Several equalities may be combined with `AND`; each must
-relate the joined table to a table already in the query, and the AI
-predicate must name the same two tables. A `JOIN` whose `ON` has an
-equality but no AI predicate is refused: a plain join belongs in the
-source database. A Python function between two operators has no SQL
-form; see `apply()` in the Python API.
+Here the model only evaluates pairs where `c.wiki_url = e.id`,
+instead of the full cross product.
 
-Join options:
+#### EXISTS and NOT EXISTS
 
-- `selectivity`: the fraction of tuples you expect to pass.
-- `anchor`: the alias whose KV stays on the GPU while its partners
-  stream past it. Leave it out to let the planner choose by token
-  count. In the query above the reviews are long and the aspects are
-  two words, so the planner picks `r` on its own.
+`EXISTS` and `NOT EXISTS` are semi-join operators. For each row in
+the outer table, the subquery runs against the inner table.
+`EXISTS` keeps the outer row if the subquery returns at least one
+match. `NOT EXISTS` keeps it if the subquery returns no matches.
 
-## Exists and anti joins
+This `EXISTS` query finds reviews that discuss at least one aspect:
 
 ```sql
 SELECT r.id
 FROM reviews r
-WHERE NOT EXISTS (SELECT 1 FROM aspects a
-                  WHERE AI_FILTER(PROMPT('Does the review in DOCUMENT {0} discuss the movie aspect in DOCUMENT {1}?',
-                                         r.body, a.aspect)))
+WHERE EXISTS (
+    SELECT 1 FROM aspects a
+    WHERE AI.IF(PROMPT('Does the review discuss this aspect?\n\nReview: {0}\nAspect: {1}',
+                       r.body, a.aspect)))
 ```
 
-`EXISTS` keeps outer documents that match at least one inner document.
-`NOT EXISTS` keeps outer documents that match none, here the reviews
-that discuss none of the twelve aspects. The subquery must be exactly
-`SELECT 1 FROM provider WHERE AI_FILTER(...)`, and the prompt must
-name the inner table and exactly one outer table. The anchor is always
-the outer table.
+This `NOT EXISTS` query finds reviews that do *not* discuss any of
+the listed aspects:
 
-`NOT` is only accepted as `NOT EXISTS`.
+```sql
+SELECT r.id
+FROM reviews r
+WHERE NOT EXISTS (
+    SELECT 1 FROM aspects a
+    WHERE AI.IF(PROMPT('Does the review discuss this aspect?\n\nReview: {0}\nAspect: {1}',
+                       r.body, a.aspect)))
+```
 
-## Refused
+The subquery must be `SELECT 1 FROM <table> WHERE AI.IF(...)`.
 
-The compiler refuses these with a message that says why:
+#### Options
 
-| Construct | Reason |
-| --- | --- |
-| `GROUP BY`, `ORDER BY`, `DISTINCT`, `HAVING`, `QUALIFY`, window functions | Relational work belongs in the source database. |
-| `UNION`, `EXCEPT`, `INTERSECT`, `OFFSET` | Same. |
-| `OR` between AI predicates | Put the disjunction inside one prompt's text. |
-| Any `AI_` function other than `AI_FILTER` | Only filters and joins are supported today. |
-| Subqueries other than `[NOT] EXISTS (SELECT 1 ...)` | Same. |
-| A query with no AI predicate | A plain scan belongs in the source database. |
-| A `JOIN` with an equality but no AI predicate | A plain join belongs in the source database. |
-| Outer joins | Only inner and cross joins. |
+Both `AI.IF` and `AI_FILTER` accept an optional second argument with
+planning hints:
 
-Errors are raised as `quail.logical.CompileError` when the query is
-compiled, before any GPU work.
+```sql
+AI.IF(PROMPT(...), {'selectivity': 0.3, 'anchor': 'r'})
+AI_FILTER(PROMPT(...), {'selectivity': 0.3, 'anchor': 'r'})
+```
+
+- **`selectivity`**: optional. Your estimate of the fraction of rows
+  that will pass. It does not need to be accurate. Quail uses it to
+  decide which filters and joins to run first.
+- **`anchor`** (joins only): optional. When evaluating a join, Quail
+  picks one side to process first and keep in GPU memory, so those
+  documents are not reprocessed for each pair. This side is called
+  the *anchor*. You usually want it to be the table with longer
+  documents. If omitted, Quail chooses automatically to minimize
+  query cost.
+
+### AI.CLASSIFY
+
+<Callout type="info">Coming soon</Callout>
+
+Categorize each document into one of a set of labels you provide,
+like BigQuery's
+[AI.CLASSIFY](https://cloud.google.com/blog/products/data-analytics/sql-reimagined-for-the-ai-era-with-bigquery-ai-functions).
+Example:
+
+```sql
+SELECT AI.CLASSIFY(r.body,
+    categories => ['positive', 'negative', 'neutral']) AS sentiment
+FROM reviews r
+```
+
+### AI.EXTRACT
+
+<Callout type="info">Coming soon</Callout>
+
+Pull structured fields out of each document, like Snowflake's
+[AI_EXTRACT](https://docs.snowflake.com/en/user-guide/snowflake-cortex/aisql).
+Example:
+
+```sql
+SELECT AI.EXTRACT(r.body, 'movie_title', 'rating') AS extracted
+FROM reviews r
+```
+
+### AI.MAP
+
+<Callout type="info">Coming soon</Callout>
+
+Run a free-form instruction on each document and return the generated
+text, like Snowflake's
+[AI_COMPLETE](https://docs.snowflake.com/en/user-guide/snowflake-cortex/aisql).
+Example:
+
+```sql
+SELECT AI.MAP('Summarize this review in one sentence.\n\n{0}', r.body) AS summary
+FROM reviews r
+```
+
+## SELECT, FROM, JOIN, LIMIT
+
+These work the way you expect from standard SQL:
+
+- **`SELECT`** lists columns. `*` expands to all columns. No
+  expressions or computed aliases.
+- **`FROM`** names a registered table, with an optional alias.
+- **`JOIN`** and `CROSS JOIN` are supported. Outer joins (`LEFT`,
+  `RIGHT`, `FULL`) are not.
+- **`LIMIT`** takes a positive integer.
+
+## Unsupported SQL operators (for now)
+
+- `GROUP BY`, `ORDER BY`, `DISTINCT`, `HAVING`, window functions
+- `UNION`, `EXCEPT`, `INTERSECT`, `OFFSET`
+- `OR` between AI predicates
+- Queries with no AI predicate
+- `JOIN` with only relational predicates (no AI operator)
+- Outer joins (`LEFT`, `RIGHT`, `FULL`)
+
+Using any of these raises `quail.logical.CompileError`.

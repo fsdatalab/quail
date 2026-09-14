@@ -2,7 +2,7 @@
 
 import os
 
-from quail.executor.loop import _marker_path
+from quail.backends.quail.executor.loop import _marker_path
 
 
 def test_warmup_marker_defaults_and_user_cache_paths(monkeypatch, tmp_path):

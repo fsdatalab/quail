@@ -51,7 +51,12 @@ def test_request_backends_plan_validate_and_execute(monkeypatch):
         "pipelined_sglang",
     ):
         session = quail.Session(
-            EngineConfig(backend=backend_name),
+            EngineConfig(
+                gpus=1,
+                model="qwen3-4b-fp8",
+                backend=backend_name,
+                device="h100-sxm",
+            ),
             tokenizer=_tokens,
         )
         session.register("docs", _table())
@@ -86,7 +91,12 @@ def test_request_backends_plan_validate_and_execute(monkeypatch):
 
     with monkeypatch.context() as patch:
         session = quail.Session(
-            EngineConfig(backend="stock_vllm"),
+            EngineConfig(
+                gpus=1,
+                model="qwen3-4b-fp8",
+                backend="stock_vllm",
+                device="h100-sxm",
+            ),
             tokenizer=_tokens,
         )
         session.register("docs", _table())
@@ -131,7 +141,14 @@ def test_request_backends_plan_validate_and_execute(monkeypatch):
         session.close()
 
         session = quail.Session(
-            EngineConfig(backend="stock_vllm"), tokenizer=_tokens)
+            EngineConfig(
+                gpus=1,
+                model="qwen3-4b-fp8",
+                backend="stock_vllm",
+                device="h100-sxm",
+            ),
+            tokenizer=_tokens,
+        )
         session.register("docs", quail.DocumentProvider.from_table(pa.table({
             "id": ["a", "b"], "body": ["one", "two"], "key": ["k1", "k2"],
         }), id_col="id"))

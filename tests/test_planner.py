@@ -9,8 +9,10 @@ from fakes import keep_even, register_claims_evidence, two_alias_graph
 
 import quail
 from quail.backends.quail import expected_join_stages
-from quail.builder import col, docs, prompt
 from quail.catalog import Catalog, DocumentProvider
+from quail.cost.sol import speed_of_light
+from quail.cost.work import Work, ask, scan, triangle
+from quail.frontend.builder import col, docs, prompt
 from quail.physical import (
     AiFilter,
     AiJoin,
@@ -25,8 +27,6 @@ from quail.physical import (
 from quail.physical.base import input_ports
 from quail.planner.decide import explain, filter_cost, order_filters, plan_query
 from quail.planner.plan import EngineConfig, Refusal
-from quail.planner.sol import speed_of_light
-from quail.planner.work import Work, ask, scan, triangle
 from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8
 
 
@@ -245,7 +245,7 @@ def test_component_costs_and_model_weights():
     assert result.component("mlp") is result.components[1]
     assert result.seconds > max(result.compute, result.memory)
 
-    from quail.planner.qwen3_cost import dense_params
+    from quail.cost.qwen3_cost import dense_params
 
     work = ask(400, 50) * 1000
     result = speed_of_light(
@@ -826,7 +826,12 @@ def _apply_query(session, kind):
 
 
 def test_planner_places_foreign_nodes_and_keeps_or_drops_the_stream():
-    with quail.Session(EngineConfig(),
+    with quail.Session(EngineConfig(
+        gpus=1,
+        model="qwen3-4b-fp8",
+        backend="quail",
+        device="h100-sxm",
+    ),
                        tokenizer=lambda text: list(text.encode())) as session:
         # claims are the long side, so the planner anchors on them
         register_claims_evidence(session, claim_words=200, text_words=10)
@@ -851,14 +856,24 @@ def test_planner_places_foreign_nodes_and_keeps_or_drops_the_stream():
         assert request.column_tables()["c"].column("url").to_pylist()[:2] == [
             "u0", "u1"]
 
-    with quail.Session(EngineConfig(gpus=2),
+    with quail.Session(EngineConfig(
+        gpus=2,
+        model="qwen3-4b-fp8",
+        backend="quail",
+        device="h100-sxm",
+    ),
                        tokenizer=lambda text: list(text.encode())) as session:
         register_claims_evidence(session, claim_words=200, text_words=10)
         plan = _apply_query(session, "per_batch").plan()
         assert isinstance(plan, Refusal)
         assert plan.constraint == "per_batch_apply_needs_one_gpu"
         assert not isinstance(_apply_query(session, "barrier").plan(), Refusal)
-    with quail.Session(EngineConfig(backend="stock_vllm"),
+    with quail.Session(EngineConfig(
+        gpus=1,
+        model="qwen3-4b-fp8",
+        backend="stock_vllm",
+        device="h100-sxm",
+    ),
                        tokenizer=lambda text: list(text.encode())) as session:
         register_claims_evidence(session, claim_words=200, text_words=10)
         plan = _apply_query(session, "barrier").plan()

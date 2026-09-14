@@ -5,7 +5,8 @@ uses, registers them with the twelve QUAIL-B movie aspects, and runs
 the two quickstart queries on Modal. The printed output is what the
 user guide shows.
 
-    uv run modal run docs/examples/imdb_queries_modal.py \
+    uv run --no-sync --with 'modal[api-proxy-support]==1.5.4' \
+        modal run docs/examples/imdb_queries_modal.py \
         2>&1 | tee results/docs_quickstart.log
 """
 
@@ -15,14 +16,29 @@ from pathlib import Path
 
 import modal
 import pyarrow as pa
-import pyarrow.parquet as pq
-from huggingface_hub import hf_hub_download
 
 import quail
-from quail_b.data import ASPECTS, SOURCE_REVISIONS
-from quail_b.prompts import DISCUSS_ASPECT, F1
+from demos.quickstart import FILTER_PROMPT, load_reviews
 
 app = modal.App("quail-engine")
+ASPECTS = (
+    "the acting",
+    "the plot",
+    "the directing",
+    "the cinematography",
+    "the soundtrack",
+    "the pacing",
+    "the ending",
+    "the dialogue",
+    "the special effects",
+    "the character development",
+    "the screenplay",
+    "the editing",
+)
+DISCUSS_ASPECT = (
+    "Does the review in DOCUMENT {0} discuss the movie aspect in "
+    "DOCUMENT {1}?"
+)
 IMAGE_REQUIREMENTS = (
     "sqlglot==30.17.0",
     "transformers==5.15.0",
@@ -33,23 +49,6 @@ IMAGE_REQUIREMENTS = (
     "datasets==5.0.1",
     "vllm==0.26.0",
 )
-
-
-def load_reviews(count: int = 8) -> pa.Table:
-    """Return short, tag-free reviews from the pinned IMDB train split."""
-    path = hf_hub_download(
-        "stanfordnlp/imdb",
-        "plain_text/train-00000-of-00001.parquet",
-        repo_type="dataset",
-        revision=SOURCE_REVISIONS["stanfordnlp/imdb"],
-    )
-    texts = pq.read_table(path, columns=["text"]).column("text").to_pylist()
-    picked = [t for t in texts if 250 < len(t) < 600 and "<br" not in t]
-    picked = picked[:count]
-    return pa.table({
-        "id": [f"rv{i}" for i in range(len(picked))],
-        "body": picked,
-    })
 
 
 def section(title: str) -> None:
@@ -72,7 +71,7 @@ image = (
         "TRITON_CACHE_DIR": "/root/.cache/kernels/triton",
         "TORCHINDUCTOR_CACHE_DIR": "/root/.cache/kernels/torchinductor",
     })
-    .add_local_python_source("quail", "quail_b")
+    .add_local_python_source("quail", "demos")
 )
 results_vol = modal.Volume.from_name("quail-results", create_if_missing=True)
 kernel_cache = modal.Volume.from_name("quail-kernel-cache", create_if_missing=True)
@@ -102,7 +101,13 @@ def run_queries() -> None:
     section("aspects")
     print(aspects.to_pydict())
 
-    with quail.Session() as session:
+    config = quail.EngineConfig(
+        gpus=1,
+        model="qwen3-4b-fp8",
+        backend="quail",
+        device="h100-sxm",
+    )
+    with quail.Session(config) as session:
         session.register("reviews", quail.DocumentProvider.from_table(
             reviews, id_col="id"))
         session.register("aspects", quail.DocumentProvider.from_table(
@@ -111,7 +116,7 @@ def run_queries() -> None:
         filter_sql = f"""
             SELECT r.id
             FROM reviews r
-            WHERE AI_FILTER(PROMPT('{F1}', r.body))
+            WHERE AI_FILTER(PROMPT('{FILTER_PROMPT}', r.body))
         """
         section("filter sql")
         print(filter_sql)
@@ -134,7 +139,10 @@ def run_queries() -> None:
             JOIN aspects a
               ON AI_FILTER(PROMPT('{DISCUSS_ASPECT}', r.body, a.aspect),
                            {{'selectivity': 0.15}})
-            WHERE AI_FILTER(PROMPT('{F1}', r.body), {{'selectivity': 0.6}})
+            WHERE AI_FILTER(
+              PROMPT('{FILTER_PROMPT}', r.body),
+              {{'selectivity': 0.6}}
+            )
         """
         section("join sql")
         print(join_sql)

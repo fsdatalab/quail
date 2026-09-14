@@ -6,7 +6,7 @@ from test_planner import catalog, tok  # noqa: F401
 from test_session import _run, fake_tok, make_executor
 
 import quail
-from quail.builder import col, docs, prompt
+from quail.frontend.builder import col, docs, prompt
 from quail.physical import Project, Recombine
 from quail.planner.decide import plan_query
 from quail.planner.plan import EngineConfig
@@ -44,7 +44,12 @@ def test_join_recombination_plans_and_results(catalog, tmp_path):  # noqa: F811
         "id": ["a", "b"], "body": ["one", "two"],
     })
     for backend in ("stock_vllm", "pipelined_vllm", "pipelined_sglang"):
-        with quail.Session(EngineConfig(backend=backend),
+        with quail.Session(EngineConfig(
+            gpus=1,
+            model="qwen3-4b-fp8",
+            backend=backend,
+            device="h100-sxm",
+        ),
                            tokenizer=_byte_tokens) as session:
             session.register("left", quail.DocumentProvider.from_table(
                 table, id_col="id"))
@@ -58,7 +63,12 @@ def test_join_recombination_plans_and_results(catalog, tmp_path):  # noqa: F811
         assert not [n for n in plan.nodes if isinstance(n, Recombine)]
         assert _sink_source(plan).port == "join_answers:0"
 
-    session = quail.Session(EngineConfig(gpus=1), tokenizer=fake_tok)
+    session = quail.Session(EngineConfig(
+        gpus=1,
+        model="qwen3-4b-fp8",
+        backend="quail",
+        device="h100-sxm",
+    ), tokenizer=fake_tok)
     pq.write_table(pa.table({
         "id": ["r0", "r1", "r2"],
         "review": ["review 0 " + "pad " * 20, "review 1 " + "pad " * 20,

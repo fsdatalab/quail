@@ -1,12 +1,14 @@
 ---
 title: Logical plans
-description: The logical node protocol, the built in nodes, and prompt binding.
 ---
 
-A logical plan says what a query means. Both front ends build one
-through `LogicalPlanBuilder`, so SQL and Python cannot drift.
+A logical plan describes what a query does. Both front ends (SQL and
+the Python builder) produce one through `LogicalPlanBuilder`, so
+they always generate the same plan for the same query.
 
 ## The node protocol
+
+All logical nodes implement this protocol:
 
 ```python
 class LogicalNode(Protocol):
@@ -21,58 +23,141 @@ class LogicalNode(Protocol):
     def explain_fields(self) -> dict[str, Any]: ...
 ```
 
-Nodes are frozen dataclasses. Rewrites return new nodes through
-`with_children` and `with_expressions`. `LogicalPlan.walk()` visits
-children before parents, and `LogicalPlan.validate()` calls every
-node's `validate`.
+`children()` returns the node's inputs in the plan tree. For
+example, a `SemanticFilter`'s child is its `Scan`, and a `Project`'s
+child is the filter or join below it. `expressions()` returns the data attached to the node, e.g., for a
+`SemanticFilter` these are the `FilterPredicate` objects (each
+containing a bound prompt and selectivity), and for a `Project`
+these are the output column references.
 
-## The built in nodes
+Nodes are frozen dataclasses. Since they are immutable,
+`with_children` and `with_expressions` return a new node with the
+specified fields replaced. Logical rules (see below) use these
+methods to transform the plan. `LogicalPlan.walk()` visits children
+before parents.
 
-| Node | Meaning |
+## Node types
+
+| Node | What it represents |
 | --- | --- |
-| `Scan(provider, alias, column)` | Which column of which provider supplies the document text for one alias. |
-| `SemanticFilter(input, predicates)` | One or more `FilterPredicate` values over one table, in written order. |
-| `SemanticJoin(inputs, predicate, semantics, selectivity, anchor)` | One n-way join: the cross product of its inputs filtered by one prompt. `semantics` is `full`, `exists`, or `anti`. |
-| `Project(input, columns, limit)` | Column projection. Always the root. |
+| `Scan(provider, alias, column)` | Read one document column from a registered table. |
+| `SemanticFilter(input, predicates)` | One or more AI predicates over one table. |
+| `SemanticJoin(inputs, predicate, semantics, selectivity, anchor)` | An AI join between two tables. `semantics` is `full`, `exists`, or `anti`. A query joining three or more tables has one `SemanticJoin` per pair. |
+| `Project(input, columns, limit)` | Column projection and optional limit. Always the root. |
 
-Filters attach directly above their scans. A filter therefore always
-runs before the joins its table feeds. There is no cost-based pushdown
-decision and no runtime reordering of filters against joins.
 
-## Prompts
+## Prompt binding
 
-A `Prompt` is a bound `PROMPT(...)` call split into three parts:
+When the parser sees a `PROMPT(...)`, it creates a `Prompt` object
+that rearranges the template into a fixed layout.
 
-- `preamble`: the fixed text before the document, `DOCUMENT:` and a
-  newline.
-- `frame`: for joins, the anchor note and the question written once
-  into the anchor's KV.
-- `tail`: the question and the answer cue.
+**For a filter**, `bind_prompt` produces:
 
-`bind_prompt` handles filters and `bind_join_prompt` handles joins.
-Both move any user text written before the first placeholder to after
-it, so the document's tokens are the same for every question about
-it. That is the property KV rewind depends on. When a tokenizer is
-given, the token counts and token ids of each part are stored on the
-prompt so the planner and the executor never tokenize the same text
-twice.
+1. **Preamble**: `DOCUMENT:\n`
+2. **Document text**: the value of the column for this row.
+3. **Question**: the instruction from the template, wrapped in an
+   evaluation prompt.
+4. **Answer cue**: `\nANSWER:`
+
+<details>
+<summary>Example: filter prompt layout</summary>
+
+```text
+PROMPT('Does this review mention a positive aspect?\n\n{0}', r.body)
+
+Sent to the model as:
+
+DOCUMENT:
+A beautiful film with outstanding performances...
+Evaluate TRUE or FALSE for the following question:
+Does this review mention a positive aspect?
+ANSWER:
+```
+
+</details>
+
+**For a join**, `bind_join_prompt` produces:
+
+1. **Preamble**: `DOCUMENT {0}:\n`
+2. **Anchor document text** (e.g., `r.body`).
+3. **Anchor frame**: a label identifying the document, followed by
+   the full question. This stays in the anchor's KV.
+4. **Partner label and document** (`DOCUMENT {1}:\n` + e.g.,
+   `a.aspect`).
+5. **Answer cue**: `\nANSWER:`
+
+The anchor's preamble, document, and frame are computed once. For
+each partner, only the partner label, partner document, and answer
+cue are new.
+
+<details>
+<summary>Example: join prompt layout</summary>
+
+```text
+PROMPT('Does the review discuss this aspect?\n\n{0}\n\n{1}', r.body, a.aspect)
+anchor: r
+
+Sent to the model as:
+
+DOCUMENT {0}:                                      ← anchor (r.body)
+A beautiful film with outstanding performances...
+                                                    ← anchor frame (computed once)
+(The document above is DOCUMENT {0}.)
+Evaluate TRUE or FALSE for the following question:
+Does the review discuss this aspect?
+Review: {0}
+Aspect: {1}
+
+DOCUMENT {1}:                                      ← partner (a.aspect)
+the acting
+ANSWER:
+```
+
+Everything above `DOCUMENT {1}:` is the anchor's KV, computed once.
+Each partner adds only `DOCUMENT {1}:` onward.
+
+</details>
+
+In both cases, the document is placed before the question. This way,
+the document's KV is the same regardless of which question follows,
+which is what makes KV rewind possible.
+
+<Callout type="info">
+`PROMPT('Does {0} mention...', r.body)` is not a simple format
+string where the document is inserted at `{0}`. Quail rearranges
+the template so the document always comes first, even if the user
+wrote the question before the placeholder.
+</Callout>
+
+Token counts and ids are stored on the `Prompt` so the planner and
+executor do not re-tokenize.
 
 ## Logical rules
 
 ```python
 class LogicalOptimizerRule(Protocol):
     name: str
-    def rewrite(self, node, context: LogicalPlanningContext) -> LogicalNode | None: ...
+    def rewrite(self, root, context) -> LogicalNode | None: ...
 ```
 
-`apply_logical_rules` walks the plan from children to parent and
-offers every node to every rule. A rule returns a replacement node or
-`None`. The context carries the catalog and the engine config. Quail
-registers no built in logical rules today; the mechanism exists for
-extensions.
+A rule gets the whole plan and returns a new root, or `None` if
+nothing changed. `apply_logical_rules` runs the rules in order and
+repeats until a pass changes nothing, up to `MAX_PASSES`.
 
-## Explain
+Quail includes one built-in logical rule:
 
-`Query.explain()` renders the logical tree with the built in nodes
-named and any other node shown by its `type_name` and
-`explain_fields()`.
+- **[Projection pushdown](https://github.com/fsdatalab/quail/blob/main/quail/planner/logical_rules.py)**
+  (`ProjectionPushdown`): rewrites each `Scan` to load only the
+  columns the query actually uses.
+
+Other optimizations like filter ordering and join ordering currently
+happen in the [planner](/docs/architecture/planning), because they
+depend on cost estimates from the model and device specs. They could
+also be expressed as logical rules.
+
+Filter placement (filters above their scans, before joins) is
+handled during plan construction in
+[`LogicalPlanBuilder`](https://github.com/fsdatalab/quail/blob/main/quail/logical/nodes.py).
+
+Extensions can register additional rules through
+`registry.register_logical_rule(...)`.

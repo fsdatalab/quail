@@ -1,14 +1,20 @@
 ---
 title: Physical plans
-description: Typed nodes, ports, graph validation, and the codec for the process boundary.
 ---
 
-A physical plan is an immutable directed acyclic graph of typed
-nodes. It is what a backend proposes, what physical rules rewrite,
-what crosses the process boundary to the worker, and what the generic
-runner executes.
+The planner converts the logical plan into a physical plan: a
+graph of typed nodes that specifies exactly what the GPU and CPU
+execute. Each node has typed input and output ports, so the graph
+can be validated, serialized, and edited before execution.
 
-## Nodes and ports
+## Structure
+
+### Nodes and ports
+
+Each node has typed input and output ports. An `InputPort` reads
+from one `OutputPort` of another node. Value types include
+`DOCUMENT_IDS`, `FILTER_ANSWERS`, `JOIN_ANSWERS`, and `ROWS`. The
+graph validates that connected ports have matching types.
 
 ```python
 @dataclass(frozen=True)
@@ -16,185 +22,115 @@ class PhysicalNode:
     node_id: str
     inputs: tuple[InputPort, ...] = ()
 
-    type_name: ClassVar[str]         # registry key for the codec
-    runtime_key: ClassVar[str]       # registry key for the runtime
-    location: ClassVar[ExecutionLocation]   # COORDINATOR or GPU_EXECUTOR
-    backend: ClassVar[str | None]    # set when the node belongs to one backend
-
-    @property
-    def outputs(self) -> tuple[OutputPort, ...]: ...
-    def attributes(self) -> dict: ...
-    @classmethod
-    def from_attributes(cls, node_id, inputs, attributes): ...
-    def embedded_nodes(self) -> tuple[PhysicalNode, ...]: ...
-    def explain_fields(self) -> Mapping[str, Any]: ...
+    type_name: ClassVar[str]
+    runtime_key: ClassVar[str]
+    location: ClassVar[ExecutionLocation]
 ```
 
-An `InputPort` names the input, gives its `ValueType`, and points at
-one `OutputPort` of another node through a `PortRef(node_id, port)`.
-Value types are `DOCUMENT_IDS`, `FILTER_ANSWERS`, `JOIN_ANSWERS`,
-`ROWS`, and `ANY`. Ports can carry a schema, a tuple of alias names,
-and the graph checks that connected ports agree.
+### Node types
 
-`PhysicalGraph.validate()` checks unique ids, that every input reads
-an existing output, that value types and schemas match, that the graph
-is acyclic, that the root port exists, and optionally that every
-`runtime_key` is registered.
+All node types are defined in
+[physical/nodes.py](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py).
 
-## The built in nodes
+**Generic nodes** (used by all backends):
 
-Generic nodes any backend can use:
-
-| Node | Location | Job |
-| --- | --- | --- |
-| `Scan` | coordinator | Names one tokenized input by alias and input id, with the document count and optional shard ranges. |
-| `Barrier` | coordinator | Materializes survivor ids when the anchor changes and prunes them with the finished join answers. |
-| `Exchange` | coordinator | Only with several GPUs: routes one alias's documents to the GPU holding their KV. On one GPU it passes ids through. |
-| `Recombine` | coordinator | Joins TRUE answer relations on shared alias columns with Arrow Acero. Planned only when a query has several full joins or a gate; a lone full join feeds its true pairs straight to `Project`. |
-| `Project` | coordinator | Reads the selected columns for the surviving positions. |
-| `Limit` | coordinator | Cuts the result stream. |
-
-Quail backend nodes:
-
-| Node | Job |
+| Node | What it does |
 | --- | --- |
-| `AiFilter` | One table's filter stages, with question token ids, arena write flag, and keep-KV flag. With `pin_survivors` it returns its survivors as a stream that the consuming join drives, each with its KV pinned. |
-| `AiJoin` | One join group with a fixed anchor alias and bound prompt tokens. Its anchor input is a finished list or a survivor stream. |
+| [`Scan`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Names one tokenized input by alias. |
+| [`Barrier`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Materializes survivor ids between join steps. |
+| [`Exchange`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Routes documents across GPUs. |
+| [`Recombine`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Joins TRUE answer tables using Arrow. |
+| [`Project`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Reads the selected columns for surviving rows. |
+| [`Limit`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Truncates the result. |
 
-Request backend node:
+**Quail backend nodes**:
 
-| Node | Job |
+| Node | What it does |
 | --- | --- |
-| `RequestExecution` | The tokenized filter and join prompt parts for vLLM or SGLang, plus output ports. |
+| [`AiFilter`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Runs filter stages on the GPU. |
+| [`AiJoin`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Runs join stages on the GPU. |
 
-There is no barrier node. Order comes from data dependencies.
+### Node ids
 
-## The plan wrapper
-
-`PhysicalPlan` holds the selected backend, model, device, worker
-count, the graph, an estimate in seconds, remarks, and a
-backend-owned `settings` mapping. Quail keeps its chunk size, KV
-capacity, predicate order, and filter limit in `settings`. Another
-backend does not fill those fields.
-
-## Node ids
-
-A node id names the operator and what it works on, so a plan can be
-read and edited without a legend:
-
-| Node | Id | Example |
-|---|---|---|
-| `Scan` | `scan:<alias>` | `scan:c1` |
-| `AiFilter` | `ai_filter:<alias>` | `ai_filter:c1` |
-| `AiJoin` | `ai_join:<anchor>`, then `:2`, `:3` when the alias anchors again | `ai_join:e1`, `ai_join:e1:2` |
-| `Barrier` | `barrier:<next anchor>` | `barrier:e2` |
-| `Exchange` | `exchange:<anchor>` | `exchange:e1` |
-| `HashJoin` | `hash_join:<left>-<right>` | `hash_join:c-e` |
-| `Foreign` | `apply:<name>` | `apply:same_page` |
-| `Recombine`, `Project`, `Limit` | `recombine`, `project`, `limit` | |
-
-## Estimates per node
-
-`PhysicalPlan.estimates` maps a node id to its own estimated seconds,
-priced through the same speed of light model as the plan total but
-for that node's work alone. The nodes do not add up to the plan
-estimate: chunk packing shares forward passes across nodes, so the
-whole is cheaper than the parts. A filter chain that a later join
-anchors on also carries `release_recompute_tokens` and
-`release_recompute_seconds`: the survivors expected to overflow the
-retention pool times their prefix cost, which is what the join pays
-if the chain's KV is released instead of pinned. `explain()` shows the
-seconds on each node line and the recompute figure under the chain.
-The figure is information for a reader; the join search never reads
-it.
+Node ids are readable names like `ai_filter:r`, `ai_join:r`,
+`scan:r`, `barrier:e`, `apply:same_page`, `project`.
 
 ## Editing a plan
 
-A plan is a DAG of typed nodes joined by ports, and the edits are the
-ordinary graph edits, one edge at a time:
+Physical plans are inspectable and editable. You get the plan,
+modify it, and run the modified version. Every edit returns a new
+immutable plan; the original is unchanged.
+
+This is useful for:
+
+- **Database integration.** Another query engine can call Quail's
+  planner, inspect the physical plan, insert or remove nodes, and
+  then execute the modified plan. The plan is a typed graph with a
+  serialization format, so it can cross process boundaries.
+- **Custom operators.** You can insert a user-defined `Foreign` node
+  between two operators, or remove one that the planner added.
+- **Debugging.** Inspect the plan with `explain()`, edit it, and
+  compare the execution of different plans.
+
+### API
 
 ```python
 plan = query.plan()
-plan2 = plan.insert(node, between=("ai_filter:c1", "ai_join:e1"))
+```
+
+Get the physical plan without running it.
+
+```python
+plan2 = plan.insert(node, between=("ai_filter:c", "ai_join:e"))
+```
+
+Insert a node on the edge between two existing nodes. The new node
+must have one output of the same value type as the edge.
+
+```python
 plan3 = plan2.remove("apply:same_page")
-plan4 = plan3.move("apply:same_page", between=("barrier:e2", "ai_join:e2"))
+```
+
+Remove a node and rewire its consumers to its producer. Only
+`Foreign`, `Barrier`, and `Exchange` nodes can be removed — removing
+a `Scan`, `AiFilter`, or `AiJoin` would change what the query
+computes.
+
+```python
+plan4 = plan3.move("apply:same_page", between=("barrier:e", "ai_join:e"))
+```
+
+Move a node from its current position to a new edge.
+
+```python
 result = query.run(plan=plan4)
 ```
 
-- `insert(node, between=(producer, consumer))` puts a node on one
-  edge. The consumer's port that read the producer reads the new node,
-  and the new node reads the producer; every other node, including
-  other consumers of the same producer port, is untouched. The node is
-  given with its id and attributes and no inputs, and must have one
-  output of the value type the edge carries.
-- `remove(node_id)` takes a node out and rewires its consumers to its
-  own producer. Only `Foreign`, `Barrier`, and `Exchange` nodes with
-  one input and one output of the same type can be removed; removing a
-  `Scan`, `AiFilter`, `AiJoin`, `Recombine`, `Project`, or `Limit`
-  would change what the query means.
-- `move(node_id, between=...)` is `remove` then `insert`.
+Run the edited plan. After each edit, Quail re-validates the graph
+(ports, types, cycles) and re-estimates every node. An illegal edit
+raises `PlanEditError`.
 
-Every edit returns a new plan and leaves the input plan untouched;
-`remove` after `insert` of the same node gives back an equal plan. An
-illegal edit raises `PlanEditError` at the call, naming the rule it
-broke, and returns nothing: there is no partially edited plan and no
-deferred check at run time. After each edit Quail validates the graph
-(ports, types, cycles, and the stream rule: a pinned chain reaches its
-join through per-batch nodes only), re-derives the two attributes that
-follow from the shape and are never set by hand (`pin_survivors`,
-which a `Barrier` on the edge turns off, and `hold_tokens`), and
-re-estimates every node. `query.run(plan=edited)` executes the edited
-plan.
+### Example: inserting a custom operator
 
-## Crossing the process boundary
+```python
+from quail.physical.nodes import Foreign
 
-Every node type has a `NodeCodec`. The codec encodes `node_id`, the
-input ports, and `attributes()`, and decodes through
-`from_attributes`. The codec checks that the attribute keys match the
-dataclass fields exactly, so a changed node shape fails loudly instead
-of silently dropping a field.
+plan = query.plan()
 
-`plan_envelope` wraps the encoded graph with the backend, model,
-device, worker count, and settings. The worker uses the registry from
-the query request and refuses the plan if any codec, backend, model,
-device, or runtime is missing. There is no separate plan version number;
-the registered type names are the contract.
+custom = Foreign(
+    node_id="apply:my_filter",
+    function="my_filter",
+    kind="per_batch",
+)
+edited = plan.insert(custom, between=("ai_filter:r", "ai_join:r"))
+result = query.run(plan=edited)
+```
 
-`explain_fields()` is separate from `attributes()` so a node can omit
-large values such as token id lists from the printed plan.
+See [Execution](/docs/architecture/execution) for how the plan runs
+on the GPU.
 
-## Execution
+## Serialization
 
-`GenericRunner.run(graph, context)` walks the nodes in topological
-order. For each node it gathers the input values by port, calls
-`context.runtimes[node.runtime_key].execute(node, inputs, context)`,
-checks that the returned ports match the declared outputs, adds the
-node's metrics, and notifies every observer.
-
-The run can be seeded with `initial_outputs`. The worker runs the
-compute subgraph (model nodes and their inputs) first, then runs the
-whole graph again with the model outputs supplied, so `Recombine`,
-`Project`, and `Limit` execute in the same pass and observers see
-every node exactly once.
-
-Model node outputs leave the executor as Arrow tables with metadata
-that names the alias, the predicate position, and for joins the
-anchor, partners, and semantics. `Recombine` needs nothing else to
-combine them.
-
-## Fixed join plans
-
-Join order and anchors are chosen before inference. The first anchor's filter
-chain runs last. Every filtered set with a future anchor use can retain passing
-document KV in one shared pool. Sets with no future anchor use release their KV.
-
-The executable graph contains the bound `AiJoin` stages and `Barrier`
-nodes that prune actual survivors. `explain()` shows this saved order.
-Older serialized plans containing `quail.adaptive_join_plan` must be regenerated
-from their logical queries. The public query API is unchanged.
-
-The plan records expected retained pages per set and the next anchor use at each
-join boundary. These estimates do not partition memory. Runtime replacement
-prefers the expected prefix computation saved per occupied KV page. The score
-uses document length and the probability of reaching the next planned use.
-Active KV is protected, and prefixes with no further use are released.
+Each node type has a `NodeCodec` for encoding and decoding across
+the process boundary. `plan_envelope` wraps the encoded graph with
+the backend, model, device, and worker count.

@@ -192,8 +192,13 @@ def main() -> None:
     print(f"labeled (comment, field) pairs: {len(labeled)}")
 
     with quail.Session(
-        config=quail.EngineConfig(gpus=args.gpus, device=args.device,
-                                  gpu_timing=args.gpu_timing),
+        config=quail.EngineConfig(
+            gpus=args.gpus,
+            model="qwen3-4b-fp8",
+            backend="quail",
+            device=args.device,
+            gpu_timing=args.gpu_timing,
+        ),
     ) as session:
         session.register("comments", quail.DocumentProvider.from_table(
             comments, id_col="comment_id"))

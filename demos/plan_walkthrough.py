@@ -59,8 +59,15 @@ def same_page(tables):
 
 def main():
     """Print and edit equivalent SQL and builder plans."""
-    with quail.Session(EngineConfig(),
-                       tokenizer=lambda text: list(text.encode())) as session:
+    config = EngineConfig(
+        gpus=1,
+        model="qwen3-4b-fp8",
+        backend="quail",
+        device="h100-sxm",
+    )
+    with quail.Session(
+        config, tokenizer=lambda text: list(text.encode())
+    ) as session:
         register_demo_data(session)
 
         print("=== SQL ===" + SQL)

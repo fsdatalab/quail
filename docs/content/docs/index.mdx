@@ -1,79 +1,47 @@
 ---
 title: Introduction
-description: A query engine for AI functions in SQL.
 ---
 
-Quail is a query engine for AI functions in SQL. Cloud warehouses now
-let a query call a language model per row: Snowflake's `AI_FILTER`,
-BigQuery's `AI.IF`, and their classify, extract, and aggregate
-relatives. Each call is scheduled and billed as an independent
-request. Quail treats those functions as query operators. It plans the
-whole query first, then schedules the model work so that documents
-share KV, forward passes stay full, and no row waits on a stage
-boundary.
+Quail (QUery Aware Inference Layer) is an open-source, extensible
+execution engine for AI-SQL, developed at
+[Full Stack Data Lab](https://fsdatalab.github.io/) at CMU.
 
-KV is the attention key and value tensors the model keeps for tokens
-it has already processed.
+AI-SQL is a variant of SQL with operators that let you write logic
+in natural language for an LLM to evaluate on every row:
 
-## What Quail runs today
+```sql
+SELECT r.id
+FROM reviews r
+WHERE AI.IF(PROMPT('Does this review discuss the ending?\n\n{0}', r.body))
+```
 
-- `AI_FILTER(PROMPT(...))` over one table: does this document satisfy
-  a true or false question?
-- `AI_FILTER(PROMPT(...))` across two or more tables: does this tuple
-  of documents, all in one prompt, satisfy a true or false question?
-  This is an AI join, including `EXISTS` and `NOT EXISTS` forms.
-- The same two shapes spelled as BigQuery's `AI.IF`.
+Quail currently supports AI-powered filters, joins, and
+`EXISTS` / `NOT EXISTS`. We are actively extending Quail with
+[more operators](/docs/user-guide/sql#ai-operators).
 
-The model answers each question with a single token, TRUE or FALSE.
-Quail constrains the decode step to those two tokens, so no open-ended
-generation runs. Operators that return a label, a number, an extracted
-field, or a summary, such as classify, score, extract, and summarize,
-are the next step and are not built yet.
+Quail supports two AI-SQL dialects
+([Snowflake](https://docs.snowflake.com/en/user-guide/snowflake-cortex/aisql)
+and
+[BigQuery](https://cloud.google.com/blog/products/data-analytics/sql-reimagined-for-the-ai-era-with-bigquery-ai-functions))
+and a [Python builder API](/docs/user-guide/python-api).
 
-## What makes it a query engine
+## Requirements
 
-- **Pipelining.** A document moves to the next filter question as soon
-  as it passes the current one, instead of waiting for a whole stage
-  to finish.
-- **Token-based admission.** The scheduler fills each forward pass by
-  token count and KV pages, not by request count, so every pass is
-  full.
-- **KV rewind.** A document's KV is computed once and stays on the GPU
-  while every later question about that document runs. Only the
-  question tokens are new work.
-- **Packed joins.** One anchor document's KV is shared by every
-  partner in a forward pass, with gating and dedup between stages.
+- Python 3.12
+- Qwen3 4B fp8 or Qwen3 32B fp8
+  ([more models coming](/docs/user-guide/models))
+- One CUDA GPU per model copy (local, or on
+  [Modal](/docs/user-guide/models#no-local-gpu-use-modal))
 
-## Scope
-
-- Models: Qwen3 4B fp8 and Qwen3 32B fp8.
-- Hardware: one H100 per model copy, 1, 2, 4, or 8 H100s in one Modal
-  container. Quail does not split one model across GPUs.
-- A query runs on the GPU in the calling process. On Modal, the GPU
-  function creates a normal session and runs the whole query there.
-- Stock vLLM, pipelined vLLM, and pipelined SGLang run the same
-  queries behind the same backend interface, for comparison.
-
-## Where to go next
+## Get started
 
 <Cards>
   <Card title="Quickstart" href="/docs/user-guide/quickstart"
-        description="Eight real IMDB reviews, a filter, a join, and the plans and reports they produce." />
+        description="Install Quail and run a filter query." />
   <Card title="SQL reference" href="/docs/user-guide/sql"
-        description="The AI SQL subset Quail accepts, with the benchmark's own predicates as examples." />
-  <Card title="Architecture" href="/docs/architecture"
-        description="How a query moves from SQL to a GPU and back." />
-  <Card title="Extending Quail" href="/docs/extending"
-        description="Table providers, backends, physical nodes, observers, each with working code." />
+        description="Filters, joins, prompts, and what SQL Quail accepts." />
+  <Card title="Python API" href="/docs/user-guide/python-api"
+        description="Build queries in Python instead of SQL." />
+  <Card title="Models and GPUs" href="/docs/user-guide/models"
+        description="Supported hardware and running on Modal." />
 </Cards>
-
-## How the documentation is organized
-
-- **User guide**: installing, writing queries, reading results, and
-  running on Modal.
-- **Architecture**: the logical and physical plans, the Quail backend,
-  the request backends, and query execution.
-- **Extending Quail**: the registry and each extension interface, with
-  working code from the test suite.
-- **Contributing**: repository layout, tests, experiment rules, and
-  writing rules.

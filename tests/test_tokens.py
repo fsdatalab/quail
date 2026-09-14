@@ -4,7 +4,7 @@ import pickle
 
 import pyarrow as pa
 
-from quail.runtime.tokens import (
+from quail.execution.tokens import (
     ArrowTokenDocuments,
     TokenStore,
     chain_tokens,
@@ -44,7 +44,7 @@ def test_token_views_chains_and_shared_prefixes():
     assert list(combined) == [1, 2, 10, 11, 20]
     assert combined.token_parts[1] is document
 
-    from quail.runtime.tokens import shared_prefix_lengths
+    from quail.execution.tokens import shared_prefix_lengths
 
     sequences = [
         [1, 2, 3, 4],       # shares [1, 2, 3] with the next

@@ -1,6 +1,6 @@
 """Apply saved KV retention decisions to a GPU arena."""
 
-from quail.executor.retention import RetentionPolicy
+from quail.cost.retention import RetentionPolicy
 
 
 def policy(config, uses):

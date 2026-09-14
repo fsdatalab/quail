@@ -2,7 +2,7 @@
 
 import pyarrow as pa
 
-from quail.runtime.result import (
+from quail.execution.result import (
     QueryResult,
     build_result_declaration,
     count_rows,

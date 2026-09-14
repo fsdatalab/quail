@@ -1,0 +1,49 @@
+---
+title: Benchmarks
+---
+
+[QUAIL-B](https://github.com/fsdatalab/quail-bench) is a benchmark of
+AI-SQL filter and join queries over five datasets (IMDB, BioDEX,
+FEVER, LEP, SWE-agent traces). It currently has 33 queries at three
+scale factors (0.1, 0.5, 1.0). We are actively adding queries and
+datasets.
+
+## Run a query
+
+On your GPU:
+
+```bash
+uv run python -m quail.bench.quailb --sf 0.1 --only IMDB-4 \
+  --model qwen3-4b-fp8 --device h100-sxm \
+  --output-dir results/quailb/imdb-4
+```
+
+On Modal, with the vLLM baselines:
+
+```bash
+uv run modal run --detach -m quail.bench.quailb_parallel \
+  --sf 0.1 --model qwen3-4b-fp8 --query IMDB-4 \
+  --output-dir /results/benchmarks/quailb \
+  2>&1 | tee results/benchmark/quailb.log
+```
+
+Omit `--only` / `--query` to run all queries. Add `--no-include-baselines`
+to run Quail alone on Modal. Modal results are saved to the
+`quail-results` volume under `/results/benchmarks/quailb/<run-id>/`.
+
+## Generate a report
+
+```bash
+uv run quail-b report results/quailb/imdb-4
+```
+
+For a Modal run, download it first:
+
+```bash
+uv run modal volume get quail-results \
+  "benchmarks/quailb/<run-id>/" "./results/<run-id>/"
+uv run quail-b report "./results/<run-id>/quail"
+```
+
+This writes `report.md` next to `run.json`. Reports use saved labels
+and do not rerun inference.

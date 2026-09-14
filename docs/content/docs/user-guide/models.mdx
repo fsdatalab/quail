@@ -1,0 +1,145 @@
+---
+title: Supported models and GPUs
+---
+
+We are actively adding support for more models and hardware. This
+page will be updated as new configurations become available.
+
+## Models
+
+| Model | `model=` value | Parameters | Precision |
+| --- | --- | --- | --- |
+| Qwen3 4B | `"qwen3-4b-fp8"` | 4B | FP8 weights, BF16 KV |
+| Qwen3 32B | `"qwen3-32b-fp8"` | 32B | FP8 weights, BF16 KV |
+
+Both models use the same Quail execution engine, including
+DeepGEMM for matrix multiplications and FlashAttention 3 for
+attention.
+
+## GPUs
+
+| Device | `device=` value | Notes |
+| --- | --- | --- |
+| NVIDIA H100 SXM | `"h100-sxm"` | Tested. FlashAttention 3. |
+| NVIDIA RTX PRO 6000 Blackwell Server Edition | `"rtx-pro-6000-blackwell-server"` | FlashAttention 2. |
+
+The `device` setting must match the hardware where the model runs.
+Quail uses the device's memory, bandwidth, and FLOP specs to plan
+the query.
+
+## GPU count
+
+Quail supports 1, 2, 4, or 8 GPUs on one host. Each GPU holds one
+complete model copy. Quail does not split one model across GPUs.
+
+```python
+quail.Session(config=quail.EngineConfig(
+    model="qwen3-4b-fp8",
+    device="h100-sxm",
+    gpus=4,
+))
+```
+
+Quail partitions the work across GPUs so each GPU processes a
+different subset of the documents. Results are combined after each
+operator.
+
+## No local GPU? Use Modal
+
+If you don't have a CUDA GPU, you can run Quail inside a
+[Modal](https://modal.com) GPU function. Quail does not depend on
+Modal — you write the Modal function, and Quail runs inside it like
+any other Python library.
+
+```python
+import modal
+
+app = modal.App("quail-engine")
+image = (
+    modal.Image.from_registry(
+        "nvidia/cuda:13.0.1-devel-ubuntu24.04", add_python="3.12")
+    .entrypoint([])
+    .pip_install(
+        "quail-engine==0.1.0",
+        "vllm==0.26.0",
+        "pyarrow==25.0.1",
+        "sqlglot==30.17.0",
+        "bpe-qwen==0.1.5",
+        "datasets==5.0.1",
+        "modal==1.5.4",
+    )
+)
+
+@app.function(image=image, gpu="H100!", memory=98304, timeout=1200)
+def run_query():
+    import quail
+    # your query here
+    config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
+    with quail.Session(config=config) as session:
+        ...
+        return result.collect(), result.report
+```
+
+The session, data registration, and execution all happen inside the
+GPU function. For large datasets, pass a path and open it there
+instead of sending an Arrow table.
+
+### Cache volumes
+
+Mount [Modal volumes](https://modal.com/docs/guide/volumes) to
+persist model weights and compiled kernels across runs:
+
+```python
+weights = modal.Volume.from_name("quail-hf-cache", create_if_missing=True)
+kernels = modal.Volume.from_name("quail-kernel-cache", create_if_missing=True)
+
+image = image.env({
+    "HF_HOME": "/model-cache",
+    "QUAIL_CACHE_DIR": "/kernel-cache/quail",
+})
+
+@app.function(
+    image=image, gpu="H100!", memory=98304, timeout=1200,
+    volumes={"/model-cache": weights, "/kernel-cache": kernels},
+)
+def run_query():
+    import quail
+    config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
+    with quail.Session(config=config) as session:
+        ...
+        return result.collect(), result.report
+```
+
+Quail's own cache is controlled by `QUAIL_CACHE_DIR` (default
+`~/.cache/quail/kernels`). Other libraries use their own environment
+variables: `HF_HOME`, `DG_CACHE_DIR`, `TRITON_CACHE_DIR`,
+`VLLM_CACHE_ROOT`.
+
+### Submit and retrieve
+
+```python
+@app.local_entrypoint()
+def main():
+    call = run_query.spawn()
+    print(f"function call id: {call.object_id}", flush=True)
+    rows, report = call.get()
+```
+
+Keep the function call id. After a disconnect, retrieve the result
+with `modal.FunctionCall.from_id("fc-...").get()`. For long runs,
+use `modal run --detach`.
+
+The function should return the results before the session closes:
+
+```python
+return result.collect(), result.report
+```
+
+If you want to save results to a Modal volume, write them to the
+mounted path and call `volume.commit()` inside the function. Quail
+does not do this automatically.
+
+## Adding a model or device
+
+See [Extending Quail](/docs/extending/models) for how to register a
+new model or device.

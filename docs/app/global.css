@@ -1,9 +1,81 @@
 @import 'tailwindcss';
-@import 'fumadocs-ui/css/ocean.css';
+@import 'fumadocs-ui/css/lib/default-colors.css';
 @import 'fumadocs-ui/css/preset.css';
+@import 'katex/dist/katex.min.css';
+
+@theme {
+  /* CMU light — Carnegie Red accent on a warm white ground */
+  --color-fd-background: hsl(0, 0%, 100%);
+  --color-fd-foreground: hsl(0, 3%, 16%);
+  --color-fd-muted: hsl(0, 0%, 96%);
+  --color-fd-muted-foreground: hsl(0, 0%, 40%);
+  --color-fd-popover: hsl(0, 0%, 100%);
+  --color-fd-popover-foreground: hsl(0, 3%, 16%);
+  --color-fd-card: hsl(0, 0%, 99%);
+  --color-fd-card-foreground: hsl(0, 3%, 16%);
+  --color-fd-border: hsl(0, 0%, 88%);
+  --color-fd-primary: hsl(350, 82%, 42%);
+  --color-fd-primary-foreground: hsl(0, 0%, 100%);
+  --color-fd-secondary: hsl(0, 0%, 95%);
+  --color-fd-secondary-foreground: hsl(0, 3%, 16%);
+  --color-fd-accent: hsl(0, 0%, 93%);
+  --color-fd-accent-foreground: hsl(0, 3%, 16%);
+  --color-fd-ring: hsl(350, 82%, 42%);
+}
+
+.dark {
+  --color-fd-background: hsl(0, 3%, 10%);
+  --color-fd-foreground: hsl(0, 0%, 93%);
+  --color-fd-muted: hsl(0, 2%, 15%);
+  --color-fd-muted-foreground: hsl(0, 0%, 60%);
+  --color-fd-popover: hsl(0, 2%, 13%);
+  --color-fd-popover-foreground: hsl(0, 0%, 93%);
+  --color-fd-card: hsla(0, 2%, 18%, 0.5);
+  --color-fd-card-foreground: hsl(0, 0%, 93%);
+  --color-fd-border: hsla(0, 0%, 50%, 0.2);
+  --color-fd-primary: hsl(350, 80%, 62%);
+  --color-fd-primary-foreground: hsl(0, 0%, 100%);
+  --color-fd-secondary: hsl(0, 2%, 20%);
+  --color-fd-secondary-foreground: hsl(0, 0%, 90%);
+  --color-fd-accent: hsl(0, 2%, 20%);
+  --color-fd-accent-foreground: hsl(0, 0%, 90%);
+  --color-fd-ring: hsl(350, 80%, 62%);
+}
 
 html {
   scrollbar-gutter: stable;
+}
+
+body {
+  font-family: var(--font-quail-sans), sans-serif;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: var(--font-quail-serif), Georgia, serif;
+}
+
+code,
+pre,
+.font-mono {
+  font-family: var(--font-quail-mono), monospace;
+}
+
+details {
+  margin: 1rem 0;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--color-fd-border);
+  border-radius: 0.5rem;
+  background: var(--color-fd-card);
+}
+
+details > summary {
+  cursor: pointer;
+  font-weight: 500;
+  font-size: 0.9rem;
+}
+
+details[open] > summary {
+  margin-bottom: 0.5rem;
 }
 
 html > body[data-scroll-locked] {

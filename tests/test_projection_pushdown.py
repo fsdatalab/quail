@@ -19,11 +19,11 @@ from quail.logical import (
     bind_join_prompt,
     bind_prompt,
 )
-from quail.logical_optimizer import (
+from quail.planner.logical_optimizer import (
     LogicalPlanningContext,
     apply_logical_rules,
 )
-from quail.logical_rules import ProjectionPushdown, push_down_projection
+from quail.planner.logical_rules import ProjectionPushdown, push_down_projection
 from quail.planner.plan import EngineConfig
 
 CONTEXT = LogicalPlanningContext(catalog=None, engine_config=None)
@@ -85,15 +85,22 @@ def test_projection_rule_preserves_schema_and_is_idempotent():
 
     assert twice == once
     assert twice is once
-    assert ProjectionPushdown().rewrite(plan.root.input, CONTEXT) is None
-    assert ProjectionPushdown().rewrite(once, CONTEXT) == once
+    assert ProjectionPushdown().rewrite(once, CONTEXT) is None
     _, changed = apply_logical_rules(
         LogicalPlan(once), (ProjectionPushdown(),), CONTEXT)
     assert changed == ()
 
 
 def _session(tmp_path, tokenizer=fake_tok):
-    session = quail.Session(EngineConfig(gpus=1), tokenizer=tokenizer)
+    session = quail.Session(
+        EngineConfig(
+            gpus=1,
+            model="qwen3-4b-fp8",
+            backend="quail",
+            device="h100-sxm",
+        ),
+        tokenizer=tokenizer,
+    )
     path = tmp_path / "reviews.parquet"
     pq.write_table(pa.table({
         "id": ["r0", "r1", "r2"],
@@ -189,7 +196,15 @@ class _UnstableProvider:
 
 
 def test_failed_scans_and_tokenization_leave_no_partial_cache(tmp_path):
-    session = quail.Session(EngineConfig(gpus=1), tokenizer=fake_tok)
+    session = quail.Session(
+        EngineConfig(
+            gpus=1,
+            model="qwen3-4b-fp8",
+            backend="quail",
+            device="h100-sxm",
+        ),
+        tokenizer=fake_tok,
+    )
     provider = _UnstableProvider()
     session.register("docs", provider)
     session.tokenize("docs", "body", ("id",))

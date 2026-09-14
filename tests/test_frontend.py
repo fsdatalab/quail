@@ -5,8 +5,9 @@ import pyarrow.parquet as pq
 import pytest
 from fakes import keep_even, same_key
 
-from quail.builder import col, docs, prompt
 from quail.catalog import Catalog, DocumentProvider
+from quail.frontend.builder import col, docs, prompt
+from quail.frontend.sql import SQLDialect, compile_sql
 from quail.logical import (
     SHARED_PRE,
     Apply,
@@ -21,9 +22,8 @@ from quail.logical import (
     join_conditions,
     join_outer_input,
 )
-from quail.logical_optimizer import LogicalPlanningContext, apply_logical_rules
-from quail.logical_rules import built_in_logical_rules
-from quail.sqlfront import SQLDialect, compile_sql
+from quail.planner.logical_optimizer import LogicalPlanningContext, apply_logical_rules
+from quail.planner.logical_rules import built_in_logical_rules
 
 
 def _parquet(path, columns):

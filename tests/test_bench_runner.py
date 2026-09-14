@@ -121,7 +121,13 @@ def _session(tmp_path, backend="quail"):
         pq.write_table(table, tmp_path / f"{name}.parquet")
     tokenizer = str.split if backend == "quail" else _token_ids
     sess = quail.Session(
-        EngineConfig(gpus=1, backend=backend), tokenizer=tokenizer
+        EngineConfig(
+            gpus=1,
+            model="qwen3-4b-fp8",
+            backend=backend,
+            device="h100-sxm",
+        ),
+        tokenizer=tokenizer,
     )
     for name in CORPUS:
         sess.register(name, DocumentProvider.from_parquet(
@@ -145,14 +151,14 @@ def _query(sess):
 def _run(query, join_answers):
     def execute(request):
         from quail.builtins import built_in_registry
-        from quail.execution import PhysicalResponse, export_physical_outputs
+        from quail.execution.runner import NodeMetrics, NodeResult, RunResult
+        from quail.execution.types import PhysicalResponse, export_physical_outputs
         from quail.physical import (
             AiFilter,
             AiJoin,
             Scan,
             decode_graph,
         )
-        from quail.runtime.runner import NodeMetrics, NodeResult, RunResult
 
         graph = decode_graph(request.plan["graph"], built_in_registry().codecs)
         filtered = next(
@@ -197,7 +203,7 @@ def _run(query, join_answers):
             "peak_gib": 1.0,
         })
 
-    from quail.runtime.execute import execute_query
+    from quail.execution.execute import execute_query
 
     return execute_query(query, physical_executor=execute)
 
@@ -205,10 +211,10 @@ def _run(query, join_answers):
 def _run_request_backend(query, join_answers):
     def execute(request):
         from quail.builtins import built_in_registry
-        from quail.execution import PhysicalResponse, export_physical_outputs
+        from quail.execution.result import answer_table
+        from quail.execution.runner import NodeMetrics, NodeResult, RunResult
+        from quail.execution.types import PhysicalResponse, export_physical_outputs
         from quail.physical import RequestExecution, decode_graph
-        from quail.runtime.result import answer_table
-        from quail.runtime.runner import NodeMetrics, NodeResult, RunResult
 
         graph = decode_graph(request.plan["graph"], built_in_registry().codecs)
         model = next(
@@ -258,7 +264,7 @@ def _run_request_backend(query, join_answers):
             "peak_gib": 1.0,
         })
 
-    from quail.runtime.execute import execute_query
+    from quail.execution.execute import execute_query
 
     return execute_query(query, physical_executor=execute)
 
@@ -368,8 +374,15 @@ def test_benchmark_query_prompts_and_labels():
         plan = read_plan(spec.plan)
         answer = answer_oracle(truth, corpus)
 
-        with quail.Session(EngineConfig(backend=backend), tokenizer=lambda text: list(
-            text.encode("utf-8"))) as session:
+        config = EngineConfig(
+            gpus=1,
+            model="qwen3-4b-fp8",
+            backend=backend,
+            device="h100-sxm",
+        )
+        with quail.Session(
+            config, tokenizer=lambda text: list(text.encode("utf-8"))
+        ) as session:
             for name, table in corpus.items():
                 session.register(name, DocumentProvider.from_table(table, id_col="id"))
             query = build_query(session, spec)

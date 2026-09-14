@@ -453,7 +453,13 @@ class QuailJudge:
 
         t0 = time.perf_counter()
         self.session = quail.Session(
-            quail.EngineConfig(gpus=gpus, model=MODEL_NAME))
+            quail.EngineConfig(
+                gpus=gpus,
+                model=MODEL_NAME,
+                backend="quail",
+                device="h100-sxm",
+            )
+        )
         self.boot_s = round(time.perf_counter() - t0, 2)
         self.queries = 0
         self.rows_answered = 0

@@ -1,0 +1,162 @@
+---
+title: Execution
+---
+
+All queries run inside a
+[session](/docs/user-guide/sessions). The session loads the model,
+allocates the KV arena, and keeps tokenized documents in memory.
+When `run()` or `collect()` is called, the
+[planner](/docs/architecture/planning) produces a physical plan and
+the execution engine runs it.
+
+The engine overlaps CPU and GPU work: while the GPU processes the
+current forward pass, the CPU prepares the next one.
+
+## The runner
+
+[`GenericRunner`](https://github.com/fsdatalab/quail/blob/main/quail/execution/runner.py)
+walks the physical plan's nodes in topological order. For each node
+it calls the registered runtime, checks the output ports, records
+metrics, and notifies any observers.
+
+Relational nodes (`Recombine`, `Project`, `Limit`) run on the CPU
+using Arrow. Model nodes (`AiFilter`, `AiJoin`) run on the GPU
+using the execution loop described below.
+
+## Operator execution
+
+### Filter execution
+
+The filter loop fills each GPU forward pass using two budgets: a
+token budget and a KV page budget.
+
+- **Pipelining.** A document that passes one predicate enters the
+  next forward pass with its next predicate immediately. It does not
+  wait for every other document to finish the current predicate.
+- **Token-based admission.** The engine packs documents into each
+  forward pass until the token budget or the KV page budget is full
+  (the token budget is the bottleneck for queries with many short
+  documents; the KV page budget is the bottleneck for queries with
+  fewer long documents). A forward pass with short documents fits
+  more documents than a forward pass with long documents.
+- **KV rewind.** Each predicate appends question tokens after the
+  document. Once the model answers, Quail drops the KV for the
+  question tokens and keeps only the KV for the document prefix.
+  The next predicate reuses the document prefix KV and appends its
+  own question tokens. A document that fails (returns FALSE) or
+  won't be used again in the query has all its KV freed.
+
+### Join execution
+
+Recall from [Planning](/docs/architecture/planning#deciding-join-order-and-anchors)
+that the planner picks one side of a join as the *anchor* (the table
+with longer documents, whose KV stays in GPU memory) and the other
+as the *partner* (the table whose documents stream past). During
+execution, Quail processes each anchor document once, keeps its KV
+in the GPU arena, and then evaluates the join prompt for each
+partner by appending only the partner's tokens to the anchor's
+resident KV. Multiple partners fit in the same forward pass, all
+sharing one anchor's KV.
+
+- **Streaming from filters.** A document that passes its last filter
+  predicate does not wait for the filter to finish over all
+  documents. Quail keeps the document's KV pinned and starts
+  evaluating join partners against it right away.
+- **Gating.** After evaluating all partners for a group of anchors,
+  Quail drops any anchor that matched no partner and frees its KV.
+- **KV retention across joins.** When a query has multiple joins in
+  sequence, Quail keeps anchor document KV from earlier joins so it
+  can be reused in later joins without reprocessing. If GPU memory
+  runs out, Quail evicts the least valuable KV and reprocesses the
+  document later.
+
+## Model forward pass
+
+A single filter or join operator may require hundreds or thousands
+of model forward passes. The operator loops above pack documents
+(for filters) or anchor-partner pairs (for joins) into batches and
+submit each batch as one forward pass on the GPU.
+
+Quail loads the model using
+[vLLM's weight loader](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/model.py),
+which handles checkpoint download, weight merging (QKV and gate-up
+projections), and FP8 quantization layout for DeepGEMM. No vLLM
+engine, scheduler, or KV pool is used — Quail uses vLLM only as a
+library for loading weights and running GPU kernels.
+
+Each forward pass processes a packed chunk of tokens through every
+model layer. For each layer:
+
+1. **RMSNorm + FP8 quantize** the input hidden state.
+2. **QKV projection** via DeepGEMM (FP8 matrix multiply).
+3. **QK-norm and RoPE** to produce query and key vectors.
+4. **Attention** over the new tokens and any resident KV in the
+   arena. Filters use a single causal paged attention call. Joins
+   use two calls (one for self-attention among new tokens, one for
+   cross-attention into the anchor's KV) merged with a fused
+   log-sum-exp kernel. We will describe the two attention paths in
+   detail in an upcoming technical report.
+5. **Output projection** via DeepGEMM.
+6. **MLP** (gate-up projection, SiLU activation, down projection).
+
+Quail uses vLLM's model implementation and DeepGEMM for the main
+matrix multiplications, but writes its own Triton JIT kernels to
+fuse several small operations: RMSNorm + FP8 quantize, QK-norm +
+RoPE, SiLU + FP8 quantize, and the attention merge + FP8 quantize
+for joins. These fused kernels reduce the number of GPU kernel
+launches per layer.
+
+Every predicate returns a single token: TRUE or FALSE. Multiple
+tokenizations count (e.g., "TRUE", " TRUE", "True"), so there are
+several token IDs per side. At model load time, Quail keeps only
+the vocabulary matrix rows for all TRUE and FALSE token IDs and
+discards the rest of the output head. Each forward pass scores only
+those rows. The predicate passes if the best TRUE token scores
+higher than the best FALSE token.
+
+Quail uses [FlashAttention 3](https://arxiv.org/abs/2407.08608) on
+H100 and FlashAttention 2 on Blackwell GPUs.
+
+## Multiple GPUs
+
+When a session uses multiple GPUs (e.g., `gpus=4`), each GPU loads
+its own copy of the model and has its own KV arena. A coordinator
+CPU process divides the work and collects results.
+
+- **Filters**: the coordinator splits the documents across GPUs by
+  token length, so each GPU processes a roughly equal amount of
+  work. Each GPU runs the filter independently on its shard.
+- **Joins**: each anchor document stays on the GPU that filtered it
+  (so its KV is already resident). The coordinator sends all
+  surviving partner documents to every GPU, so each GPU can evaluate
+  its anchors against all partners.
+- **Between join groups**: the coordinator collects the results from
+  all GPUs, drops documents that matched no partner, and
+  redistributes the next join group's anchor documents across GPUs.
+
+## GPU code
+
+All GPU execution code is in
+[quail/backends/quail/executor/](https://github.com/fsdatalab/quail/tree/main/quail/backends/quail/executor):
+
+| File | What it does |
+| --- | --- |
+| [`pack.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/pack.py) | Admission logic for filters and joins. |
+| [`arena.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/arena.py) | Paged KV arena and page accounting. |
+| [`attention.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/attention.py) | Forward pass with two-call attention and log-sum-exp merge. |
+| [`loop.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/loop.py) | Overlapped filter and join execution loops. |
+| [`model.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/model.py) | Weight loading through vLLM's loader. |
+
+The fused kernels assume the Qwen3 architecture: QK-norm before
+RoPE, gated SiLU MLP, FP8 block-quantized weights.
+
+## Lifetime and limits
+
+Within one session, the model stays loaded in GPU memory and
+tokenized documents are reused across queries. Collect results
+before closing the session, because row projection reads from the
+session's temporary files. `Session.close()` waits for background
+tokenization and releases temporary files.
+
+- Temporary token files must fit on local disk.
+- At most 8 GPUs in one host.

@@ -1,71 +1,44 @@
 ---
 title: Overview
-description: The layers of the engine and the path one query takes.
 ---
 
-Quail is built like a small database engine. A query is compiled to a
-logical plan, planned into a physical graph, and executed by node
-runtimes. The model-specific parts use a backend interface. A session
-runs the whole query in its process, including inside a Modal GPU function.
+Quail is structured like a traditional query engine: it parses a
+query into a logical plan, optimizes it, lowers it to a physical
+plan, and executes the physical plan. Execution is pull-based
+(Volcano-style), with documents pipelining through operators in
+large batches sized to saturate the GPU. The two performance goals
+are to keep the GPU busy (minimize idle time between forward passes)
+and to minimize KV regret (document state that was evicted from GPU
+memory and needs to be recomputed).
 
-## The query path
+## Query lifecycle
 
-<Mermaid chart={`
-flowchart TD
-    A[SQL or Python builder] --> B[Logical plan]
-    B --> C[Logical optimizer rules]
-    C --> F[Session: read sources and tokenize into a memory mapped Arrow file]
-    F --> G[Model backend proposes physical candidates]
-    G --> H[Physical rules rewrite the chosen graph]
-    H --> I[Generic runner executes the graph]
-    I --> J[Model nodes run on the GPU executors]
-    I --> K[Recombine, Project, Limit run with Arrow]
-    K --> L[QueryResult: Arrow table + report]
-`} />
+1. Quail [parses](https://github.com/fsdatalab/quail/blob/main/quail/frontend/sql.py)
+   the user's SQL (or [Python builder](https://github.com/fsdatalab/quail/blob/main/quail/frontend/builder.py)
+   query) into a logical plan.
+2. The session reads Arrow batches from each registered table and
+   tokenizes the document columns.
+3. The [planner](https://github.com/fsdatalab/quail/blob/main/quail/planner/decide.py)
+   proposes one or more physical plans with cost estimates. The
+   cheapest one is selected.
+4. The [runner](https://github.com/fsdatalab/quail/blob/main/quail/execution/runner.py)
+   executes the physical graph. Model nodes run on the GPU.
+   Relational nodes run with Arrow on the CPU.
+5. The query returns the matching rows as a `pyarrow.Table` and an
+   execution report with timing and token counts.
 
-1. The SQL front end or the builder produces a `LogicalPlan` of
-   `Scan`, `SemanticFilter`, `SemanticJoin`, and `Project` nodes.
-2. Registered logical rules rewrite the plan.
-3. `Query.run()` calls the in-process executor with the existing query.
-4. The session reads bounded Arrow batches from each registered source.
-5. It writes tokens, document lengths, and projected columns to temporary
-   memory mapped Arrow files.
-6. The selected model backend proposes one or more `PhysicalCandidate`
-   graphs with time estimates. Registered physical planners can add
-   more. The cheapest wins, then physical rules rewrite it.
-7. The generic runner walks the typed graph in topological order and
-   calls the runtime registered for each node type. Model nodes are
-   delegated to the backend's model execution object.
-8. Arrow Acero joins the TRUE answers, applies the projection and
-   limit. The query returns a `QueryResult` with its executed plan and
-   node metrics. Collect the rows before closing the session.
+## Packages
 
-## The layers
+Each package imports only from the ones below it.
 
-| Layer | Package | Job |
+| Package | What it does | Source |
 | --- | --- | --- |
-| Front ends | `quail.sqlfront`, `quail.builder` | Turn SQL or Python calls into one logical plan through the shared `LogicalPlanBuilder`. |
-| Logical plan | `quail.logical`, `quail.logical_optimizer` | Logical node protocol, the four built in nodes, prompt binding, and the rule runner. |
-| Physical plan | `quail.physical` | Typed nodes with ports, graph validation, and codecs for the process boundary. |
-| Planning | `quail.planning`, `quail.planner` | Backend planning inputs, candidates, physical rules, and the Quail cost model. |
-| Backends | `quail.backends` | The `ModelBackend` protocol and the Quail, vLLM, and SGLang implementations. |
-| Runtime | `quail.runtime` | Session, query execution, the generic runner, the token store, and results. |
-| Executor | `quail.executor` | Quail's GPU code: packing, the paged KV arena, attention, the overlapped loop, weight loading. |
-| Specs | `quail.specs` | Model and device constants every planner decision is computed from. |
-| Extensions | `quail.extensions` | The per session registry. |
+| `quail.frontend` | SQL compiler and Python builder. | [frontend/](https://github.com/fsdatalab/quail/tree/main/quail/frontend) |
+| `quail.logical` | Logical plan nodes and prompt binding. | [logical/](https://github.com/fsdatalab/quail/tree/main/quail/logical) |
+| `quail.physical` | Physical plan nodes. | [physical/](https://github.com/fsdatalab/quail/tree/main/quail/physical) |
+| `quail.planner` | Logical rules, filter and join ordering, KV retention. | [planner/](https://github.com/fsdatalab/quail/tree/main/quail/planner) |
+| `quail.cost` | Cost model over the model and device specs. | [cost/](https://github.com/fsdatalab/quail/tree/main/quail/cost) |
+| `quail.execution` | Session, runner, token store, results. | [execution/](https://github.com/fsdatalab/quail/tree/main/quail/execution) |
+| `quail.backends` | Quail's GPU code (`backends/quail/executor/`) and the vLLM and SGLang baselines. | [backends/](https://github.com/fsdatalab/quail/tree/main/quail/backends) |
+| `quail.specs` | Model and device constants. | [specs/](https://github.com/fsdatalab/quail/tree/main/quail/specs) |
 
-## Extension points
-
-Every built in piece registers through the same registry an extension
-would use. The interfaces are:
-
-- **Logical nodes and rules** describe what a query means and rewrite
-  it.
-- **Physical planners and rules** propose and rewrite typed graphs.
-- **Model backends** plan and run model work. They own their
-  scheduler, KV layout, and model calls. Quail has no public KV
-  interface on purpose.
-- **Table providers** supply schemas and bounded Arrow batches.
-- **Execution observers** record per node metrics.
-
-Each has its own page under [Extending Quail](/docs/extending).

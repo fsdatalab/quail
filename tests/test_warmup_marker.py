@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from quail.executor import loop
+from quail.backends.quail.executor import loop
 
 
 def _stub_torch():

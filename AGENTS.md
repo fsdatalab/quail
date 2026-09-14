@@ -34,7 +34,7 @@ these rules.
 
 CI runs these on every pull request. Run them before pushing:
 
-    uv run ruff check quail tests experiments reports tools
+ uv run ruff check quail tests experiments tools
     uv run python tools/check_long_strings.py
     uv run vulture
     uv run pytest -q
@@ -69,14 +69,17 @@ CI runs these on every pull request. Run them before pushing:
   strategy it used: operator-at-a-time execution or pipelining.
 - `de1|` in request ids is a wire-format version tag, not a product
   name. Leave it alone.
+- Every `Session` call passes an `EngineConfig` that names `model` and
+  `device`; neither has a default. `gpus` defaults to 1 and `backend` to
+  `"quail"`. Do not add a default model or device.
 
 # Scope
 
-Filter queries only, Qwen3 4B fp8 or Qwen3 32B fp8, one H100 per model
-(one model copy per GPU - no tensor-parallel weight sharding across
-GPUs). Open-ended maps, classification, speculation, and forking were
-removed on purpose. Do not reintroduce them without being asked; if a
-change needs one of them, say so instead of quietly adding it back.
+The current runtime supports filter queries only, Qwen3 4B fp8 or
+Qwen3 32B fp8, and one H100 per model copy. It does not use
+tensor-parallel weight sharding. `AI.CLASSIFY`, `AI.EXTRACT`, and
+`AI.MAP` are on the roadmap. Open-ended generation, speculation, and
+forking are not part of the current runtime.
 
 # Experiments
 
@@ -124,38 +127,28 @@ change needs one of them, say so instead of quietly adding it back.
 
 # Reports
 
-All experiment and feature reports live under `reports/`.
+Reports and experiment plots do not live on branches that target
+`main`. Do not add a per-PR feature report.
 
-- Every PR adds one file, and only one, to `reports/shipped_features/`,
-  named `YYYY-MM-DD-<short-slug>.md`. It says what changed, why, the
-  prediction stated before each run, the measured numbers against it,
-  and the `quail-results` volume path and Modal function call id of
-  each run. A PR with several features gets one file with a section
-  per feature. Do not add a separate report under `reports/`.
-- When a note's numbers are no longer current, delete it and any plot
-  script and PNGs only it referenced. Before starting a new task, scan
-  `reports/` for orphaned plot scripts and PNGs not referenced by any
-  current note, and delete them all.
-- `reports/engine-wiki.md` is a living reference doc, not a
-  per-PR report. Update it in place when the engine's design changes.
+Historical reports, plot code, figures, and `engine-wiki.md` live on
+the `cursor/reports-dev-f955` branch. Start report work from that
+branch and target changes back to it. Runtime data remains on the
+`quail-results` Modal volume.
 
 # Issues and PR descriptions
 
 Include a figure whenever one carries the point better than text:
 
-- For measured numbers, embed the report's committed plot. Link the
-  image by its raw GitHub URL pinned to a commit
-  (`.../raw/<sha>/reports/plots/<name>.png`) so it keeps
-  rendering as the branch moves. Do not make new plots just for an
-  issue or PR body; reuse the report's.
+- For measured numbers, link to the saved run or to a plot on the
+  report branch. Pin plot links to a commit so they keep rendering as
+  the branch moves.
 - For a design, plan, or dataflow change, include a mermaid diagram
   of the structure (GitHub renders ```mermaid blocks).
 
 # Plots
 
-Add a plot only when it carries the point better than a table. A plot
-lives under `reports/plots/` with its `make_<slug>_plots.py` in
-`reports/`, and the note links it.
+These rules apply to work on the report branch. Add a plot only when
+it carries the point better than a table.
 
 ## QUAIL-B plot standard
 

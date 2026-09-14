@@ -1,0 +1,264 @@
+---
+title: Planning
+---
+
+Given the user's query, Quail's parser converts it into a logical
+plan (see [Logical plans](/docs/architecture/logical-plans)). The
+planner then decides how to execute it: which filters run first,
+which table anchors each join, and how much GPU memory to use for
+KV. Each decision is guided by a cost estimate.
+
+Implementation:
+[quail/planner/decide.py](https://github.com/fsdatalab/quail/blob/main/quail/planner/decide.py).
+
+## Inputs
+
+The planner receives:
+
+- The **logical plan** (filters, joins, scans).
+- The **model spec** (layers, hidden width, heads, weight precision).
+- The **device spec** (GPU memory, peak FLOP/s, HBM bandwidth).
+- The **token lengths** of every document in every registered table.
+- The **selectivities** you provided (optional estimates of what
+  fraction of rows pass each predicate).
+
+## Deciding filter order
+
+When a table has multiple AI predicates, the planner chooses which
+predicate to evaluate first. A predicate that rejects many documents
+and is cheap to evaluate should run early, because it reduces the
+work for later predicates.
+
+To compare orderings, the planner estimates the cost of each
+predicate using the roofline model (see below). It considers two
+costs for each predicate: the cost when it runs first (the model
+processes the full document + question), and the cost when it runs
+later (the model processes only the question, because the document
+KV is already resident). It then picks the ordering with the lowest
+total estimated time.
+
+## Deciding join order and anchors
+
+When a query has more than one join, the planner chooses the order
+in which joins execute and which side anchors each one. Different
+orders produce different total work because earlier joins reduce the
+number of documents that reach later joins.
+
+The planner searches over **left-deep plans**: plans that start with
+one table and add one table at each join step (as opposed to bushy
+plans that join two intermediate results). For each step, it
+considers both possible anchor choices. Anchoring the side with
+longer documents computes each long prefix once. Anchoring the short
+side puts a full copy of every long document into every tuple
+suffix.
+
+The search uses dynamic programming, following the approach
+introduced by [Selinger et al. (1979)](https://doi.org/10.1145/582095.582099).
+The state tracks which tables have been joined so far and which
+tables have prefix KV available. A state is kept only if no other
+state with the same joined tables does less work in all four
+quantities tracked by the roofline model (tokens, pairs, KV writes,
+KV reads).
+
+## Deciding token budget and KV capacity
+
+The planner also decides:
+
+- **Token budget.** The maximum tokens per model forward pass, based
+  on GPU memory remaining after the model weights and kernel index
+  limits.
+- **KV capacity.** How many pages of GPU memory to allocate for
+  storing document KV between operators.
+- **KV retention.** Which documents' KV to keep between operators.
+  Documents whose KV is expected to save the most future
+  recomputation per page are kept first.
+
+## The roofline (speed-of-light) model
+
+The planner compares candidate plans using a roofline model. For
+each candidate, it counts the arithmetic work and HBM traffic the
+model would perform, then takes the larger of the compute time and
+memory time for each model component.
+
+The speed-of-light (SoL) estimate is the roofline model applied
+with ideal assumptions: peak GPU throughput, unlimited KV capacity,
+and zero host overhead. We use it both to choose between plans and
+as a lower bound when evaluating measured runs.
+
+The cost model uses no fitted parameters. It computes directly from
+the hardware datasheet and the model architecture.
+
+Implementation:
+[quail/cost/sol.py](https://github.com/fsdatalab/quail/blob/main/quail/cost/sol.py).
+
+### Notation
+
+| Symbol | Meaning | Qwen3 4B fp8 | Qwen3 32B fp8 |
+|---|---|---|---|
+| $p$ | Shared preamble tokens (on every document) | 2 | 2 |
+| $d_i$ | Tokens in document $i$ | corpus | corpus |
+| $q_s$ | Tokens in filter stage $s$'s question | 41–62 | 41–62 |
+| $f_a$ | Join frame tokens after anchor $a$ | 36–42 | 36–42 |
+| $u_b$ | One join tuple suffix for partner $b$ | corpus | corpus |
+| $A_s$ | Documents entering stage $s$ | $A_1$ = all | $A_1$ = all |
+| $T(n)$ | $\frac{n(n+1)}{2}$, causal self-attention pairs | | |
+| $P_A$ | Attention projection parameters (Q, K, V, output) | 943,718,400 | 6,039,797,760 |
+| $P_M$ | MLP parameters (gate, up, down) | 2,689,597,440 | 25,165,824,000 |
+| $L$ | Layers | 36 | 64 |
+| $n_q, d_\mathrm{head}$ | Query heads, head dimension | 32, 128 | 64, 128 |
+| $\kappa$ | KV bytes per token: $2 \cdot L \cdot n_{kv} \cdot d_\mathrm{head} \cdot 2$ | 147,456 | 262,144 |
+| $b_w$ | Bytes per weight | 1 | 1 |
+| $R_\mathrm{dense}$ | FP8 dense peak FLOP/s | $1.979 \times 10^{15}$ | $1.979 \times 10^{15}$ |
+| $R_\mathrm{attn}$ | BF16 dense peak FLOP/s | $0.9895 \times 10^{15}$ | $0.9895 \times 10^{15}$ |
+| $\mathrm{BW}$ | HBM bandwidth (bytes/s) | $3.35 \times 10^{12}$ | $3.35 \times 10^{12}$ |
+| $C$ | Tokens per forward pass | 110,376 | 41,943 |
+
+$R_\mathrm{dense}$ and $R_\mathrm{attn}$ are the H100 datasheet
+peaks divided by 2, because the datasheet quotes 2:1 structured
+sparsity and we run dense. Projections use FP8; attention uses BF16
+(FlashAttention-3 over BF16 KV).
+
+### Work per filter stage
+
+The model tracks four quantities: fresh tokens, attention pairs,
+KV written, and KV read.
+
+**Stage 1** (first predicate on a table, document not yet in KV):
+
+$$
+\mathrm{tokens} = \sum_{i \in A_1} (p + d_i + q_1)
+$$
+
+$$
+\mathrm{pairs} = \sum_{i \in A_1} T(p + d_i + q_1)
+$$
+
+$$
+\mathrm{kvw} = \mathrm{tokens}, \quad \mathrm{kvr} = 0
+$$
+
+**Stage $s > 1$** (document KV already resident, only question is
+new):
+
+$$
+\mathrm{tokens} = |A_s| \cdot q_s
+$$
+
+$$
+\mathrm{pairs} = \sum_{i \in A_s} \bigl[ q_s \cdot (p + d_i) + T(q_s) \bigr]
+$$
+
+$$
+\mathrm{kvw} = \mathrm{tokens}, \quad \mathrm{kvr} = \sum_{i \in A_s} (p + d_i)
+$$
+
+In stage 1, the token count includes $d_i$. In stage $s > 1$, only
+the question tokens $q_s$ are fresh. The $q_s$ new tokens attend
+over the resident prefix of length $p + d_i$, contributing
+$q_s \cdot (p + d_i)$ cross-attention pairs plus $T(q_s)$
+self-attention pairs.
+
+<Callout type="info">
+**Example.** A query has two filters over 5,000 IMDB reviews. The
+first filter (51 question tokens) scans all 5,000 documents:
+1,729,233 fresh tokens. It passes 1,218 documents. The second filter
+(also 51 question tokens) processes only the question for each
+survivor: $1{,}218 \times 51 = 62{,}118$ fresh tokens. Total:
+1,791,351. Without KV reuse, the second filter would also reprocess
+every surviving document's prefix.
+</Callout>
+
+The planner estimates $A_s$ at each stage from the selectivities you
+provide.
+
+### Work per join stage
+
+One side is the **anchor**. Its prefix KV stays resident while every
+partner's suffix is evaluated. The anchor frame is $f_a$ tokens
+(anchor label + question). Each tuple suffix is $u_b$ tokens
+(partner label + partner document + answer cue).
+
+**Per anchor, when no filter ran on that side** (prefix computed
+here):
+
+$$
+\mathrm{tokens} \mathrel{+}= p + d_a + f_a, \quad
+\mathrm{pairs} \mathrel{+}= T(p + d_a + f_a)
+$$
+
+**Per anchor, when a filter already computed the prefix** (only the
+frame is new):
+
+$$
+\mathrm{tokens} \mathrel{+}= f_a, \quad
+\mathrm{pairs} \mathrel{+}= f_a \cdot (p + d_a) + T(f_a), \quad
+\mathrm{kvr} \mathrel{+}= p + d_a
+$$
+
+**Per (anchor, partner) tuple:**
+
+$$
+\mathrm{tokens} \mathrel{+}= u_b, \quad
+\mathrm{pairs} \mathrel{+}= u_b \cdot (p + d_a + f_a) + T(u_b)
+$$
+
+**KV write** equals all fresh tokens above. **KV read** per anchor
+(before its partner stream) adds $p + d_a + f_a$.
+
+Each tuple's attention: cross-attention between the new suffix
+tokens and the resident anchor context, plus self-attention among
+the suffix tokens. Suffixes do not attend to each other
+([executor/pack.py](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/pack.py)).
+
+### Computing the cost of a plan
+
+When the planner evaluates a particular filter ordering or join
+plan, it sums the per-operator work counts across all stages in that
+plan, then converts the totals to an estimated time in seconds using
+the roofline equations below. This estimated time is the SoL for
+that plan. The plan with the lowest SoL wins.
+
+$$
+\mathrm{passes} = \left\lceil \frac{\mathrm{tokens}}{C} \right\rceil
+$$
+
+$$
+T_A = \max\!\left(\frac{2 \, P_A \cdot \mathrm{tokens}}{R_\mathrm{dense}},\;
+\frac{P_A \cdot b_w \cdot \mathrm{passes}}{\mathrm{BW}}\right)
+$$
+
+$$
+T_M = \max\!\left(\frac{2 \, P_M \cdot \mathrm{tokens}}{R_\mathrm{dense}},\;
+\frac{P_M \cdot b_w \cdot \mathrm{passes}}{\mathrm{BW}}\right)
+$$
+
+$$
+T_\mathrm{attn} = \max\!\left(
+\frac{4 \, n_q \cdot d_\mathrm{head} \cdot L \cdot \mathrm{pairs}}{R_\mathrm{attn}},\;
+\frac{\kappa \cdot (\mathrm{kvw} + \mathrm{kvr})}{\mathrm{BW}}\right)
+$$
+
+$$
+\mathrm{SoL} = T_A + T_M + T_\mathrm{attn}
+$$
+
+The $\max$ within each component allows compute and memory to
+overlap. The components are summed because they run in sequence.
+Filter and join boundaries do not start separate forward passes.
+
+### Implementation
+
+| Module | What it does |
+|---|---|
+| [work.py](https://github.com/fsdatalab/quail/blob/main/quail/cost/work.py) | Count tokens, attention pairs, and KV traffic |
+| [qwen3_cost.py](https://github.com/fsdatalab/quail/blob/main/quail/cost/qwen3_cost.py) | Build the three model components for Qwen3 |
+| [roofline.py](https://github.com/fsdatalab/quail/blob/main/quail/cost/roofline.py) | Price one component from FLOPs, bytes, and hardware limits |
+| [sol.py](https://github.com/fsdatalab/quail/blob/main/quail/cost/sol.py) | Apply ideal packing and sum component times |
+| [estimate.py](https://github.com/fsdatalab/quail/blob/main/quail/planner/estimate.py) | Run the filter and join search for one query |
+
+### Assumptions
+
+- Unlimited KV capacity: every document prefix stays available.
+- Peak GPU throughput on every operation.
+- Zero host overhead, scheduling cost, and kernel launch gaps.
+- Left-deep binary full joins only (no bushy plans).

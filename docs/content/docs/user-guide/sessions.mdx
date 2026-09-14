@@ -1,0 +1,80 @@
+---
+title: Running queries
+---
+
+Every Quail query runs inside a session. The session loads the model,
+compiles GPU kernels, and tokenizes your documents. Multiple queries
+on the same session reuse the loaded model and tokenized documents.
+
+## Creating a session
+
+```python
+import quail
+
+config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
+with quail.Session(config=config) as session:
+    ...
+```
+
+`gpus` defaults to 1 and `backend` to `"quail"`.
+
+The session is a context manager. It releases token files and
+background work when it closes.
+
+## Registering tables
+
+Register each input table before writing a query. The name you
+register becomes the SQL table name.
+
+```python
+session.register("reviews", quail.DocumentProvider.from_dataset(reviews, id_col="id"))
+session.register("aspects", quail.DocumentProvider.from_table(aspects, id_col="id"))
+```
+
+You can register as many tables as you need. These are the available
+`DocumentProvider` factories:
+
+| Factory | Source |
+| --- | --- |
+| `DocumentProvider.from_table(table, id_col)` | In-memory Arrow table |
+| `DocumentProvider.from_parquet(path, id_col)` | Parquet file or directory |
+| `DocumentProvider.from_ipc(path, id_col)` | Arrow IPC file |
+| `DocumentProvider.from_dataset(dataset, id_col)` | Any `pyarrow.dataset.Dataset` |
+| `DocumentProvider.from_hf(dataset, id_col)` | Hugging Face dataset |
+
+Every provider needs an `id_col` that identifies each document.
+
+## Running queries
+
+Once tables are registered, run queries with SQL or the Python
+builder. You can run multiple queries on the same session.
+
+```python
+result_1 = session.sql("""
+    SELECT r.id FROM reviews r
+    WHERE AI.IF(PROMPT('Is this review positive?\n\n{0}', r.body))
+""", dialect="bq").collect()
+
+result_2 = session.sql("""
+    SELECT r.id, a.aspect FROM reviews r, aspects a
+    WHERE AI.IF(PROMPT('Does the review discuss this aspect?\n\n{0}\n\n{1}',
+                       r.body, a.aspect))
+""", dialect="bq").collect()
+```
+
+The first `collect()` or `run()` loads the model onto the GPU.
+Later queries reuse the loaded model and compiled kernels.
+Tokenized documents are also reused across queries on the same
+session.
+
+## Multiple GPUs
+
+Set `gpus` to use more than one GPU. Each GPU holds one complete
+model copy.
+
+```python
+config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm", gpus=4)
+```
+
+See [Supported models and GPUs](/docs/user-guide/models) for the
+full list of configurations.

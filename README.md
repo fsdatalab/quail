@@ -1,112 +1,90 @@
 # Quail
 
-Quail runs language-model filters and joins over document collections.
-Write queries in SQL or Python. Quail plans and executes their model calls together.
+Quail (QUery Aware Inference Layer) is an open-source, extensible
+execution engine for AI-SQL, developed at
+[Full Stack Data Lab](https://fsdatalab.github.io/) at CMU.
 
-Model execution requires a CUDA GPU. The supported models are Qwen3 4B fp8
-and Qwen3 32B fp8, with one model copy per GPU.
+AI-SQL is a variant of SQL with operators that let you write logic
+in natural language for an LLM to evaluate on every row.
 
-Once published, install the distribution and import the `quail` package:
+```sql
+SELECT r.id
+FROM reviews r
+WHERE AI.IF(PROMPT('Does this review discuss the ending?\n\n{0}', r.body))
+```
+
+**[Documentation](https://fsdatalab.github.io/quail)** ·
+**[Quickstart](https://fsdatalab.github.io/quail/docs/user-guide/quickstart)** ·
+**[QUAIL-B](https://github.com/fsdatalab/quail-bench)**
+
+## Install
 
 ```bash
 pip install quail-engine
 ```
 
-## Quickstart
+Requires Python 3.12 and a CUDA GPU.
 
-From this repository, install the dependencies with Python 3.12 and uv:
+## Example
 
-```bash
-uv sync
+```python
+import pyarrow as pa
+import quail
+
+reviews = pa.table({
+    "id": ["r1", "r2", "r3"],
+    "body": [
+        "A beautiful film with outstanding performances.",
+        "Terrible pacing and a nonsensical plot.",
+        "The cinematography was stunning, though the story dragged.",
+    ],
+})
+
+config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
+with quail.Session(config=config) as session:
+    session.register("reviews", quail.DocumentProvider.from_table(reviews, id_col="id"))
+    result = session.sql("""
+        SELECT r.id
+        FROM reviews r
+        WHERE AI.IF(PROMPT(
+            'Does this review mention a positive aspect of the movie?\n\n{0}',
+            r.body))
+    """, dialect="bq").collect()
+    print(result)
 ```
 
-Run the example on a machine with a CUDA GPU:
+## Supported operators
 
-```bash
-uv run python demos/quickstart.py
-```
+Quail currently supports AI-powered filters, joins, and
+`EXISTS` / `NOT EXISTS`. We are actively adding more operators
+(`AI.CLASSIFY`, `AI.EXTRACT`, `AI.MAP`).
 
-The [example](demos/quickstart.py) runs QUAIL-B's IMDB-1 query on 100 reviews.
-It prints the matching rows and execution report.
+We support two AI-SQL dialects:
+[Snowflake `AI_FILTER`](https://docs.snowflake.com/en/user-guide/snowflake-cortex/aisql)
+and
+[BigQuery `AI.IF`](https://cloud.google.com/blog/products/data-analytics/sql-reimagined-for-the-ai-era-with-bigquery-ai-functions),
+plus a Python builder API.
 
-## Benchmark
+## Supported models and GPUs
 
-[QUAIL-B](https://github.com/fsdatalab/quail-bench) contains the query definitions,
-datasets, reference labels, and scoring. Supported scale factors are 0.1, 0.5, and 1.0.
-Reference labels load directly from QUAIL-B's public S3 bucket.
+| Model | Device |
+| --- | --- |
+| Qwen3 4B fp8 | NVIDIA H100 SXM |
+| Qwen3 32B fp8 | NVIDIA RTX PRO 6000 Blackwell Server Edition |
 
-For example, run IMDB-4 with Quail:
-
-```bash
-uv run python -m quail.bench.quailb \
-  --only IMDB-4 --sf 0.1 --output-dir results/imdb-4
-```
-
-Omit `--only` to run the full benchmark, or pass comma-separated query IDs.
-Choose a new directory with `--output-dir` for each run.
-
-The run directory contains `run.json`, saved query answers, and `report.md`
-with timings, throughput, GPU cost, and accuracy.
-
-Regenerate the report from saved answers without rerunning inference:
-
-```bash
-uv run quail-b report results/imdb-4
-```
-
-## Modal (optional)
-
-To run the quickstart on Modal instead, configure your account and submit it:
-
-```bash
-uv run modal setup
-mkdir -p results
-uv run modal run demos/quickstart_modal.py \
-  2>&1 | tee results/quickstart.log
-```
-
-The [Modal example](demos/quickstart_modal.py) calls the same query function on
-an H100. You control its image, volume mounts, cache settings, and report path.
-See the [benchmark guide](docs/content/docs/user-guide/benchmark.mdx) for running
-Quail and the comparison engines on Modal.
+1, 2, 4, or 8 GPUs per query. We are actively adding more models
+and hardware.
 
 ## Development
 
-The tests run on the CPU. Model execution tests use a fake executor.
-
 ```bash
-uv run pytest -q
-uv run ruff check quail tests experiments reports tools
+uv run ruff check quail tests experiments tools
 uv run python tools/check_long_strings.py
 uv run vulture
+uv run pytest -q
 ```
 
-See the [user guide](docs/content/docs/user-guide/index.mdx),
-[architecture](docs/content/docs/architecture/index.mdx), and
-[extension guide](docs/content/docs/extending/index.mdx) for details.
-Experiment scripts are in `experiments/`; their reports are in `reports/`.
+## Contributing
 
-## Release
-
-The PyPI project uses trusted publishing, so releases do not use a saved API
-token. Before the first release:
-
-1. Create a protected GitHub environment named `pypi`.
-2. Add a pending publisher at
-   [PyPI publishing settings](https://pypi.org/manage/account/publishing/):
-   - PyPI project: `quail-engine`
-   - GitHub owner: `fsdatalab`
-   - GitHub repository: `quail-exploration`
-   - Workflow: `publish.yml`
-   - Environment: `pypi`
-
-Set the version with `uv version` and commit that change. From a clean `main`
-branch matching `origin/main`, release it with one command:
-
-```bash
-tools/release.sh 0.1.0
-```
-
-The script checks the version and repository state, then pushes the matching
-tag. Following uv's official publishing guide, GitHub Actions builds with
-`uv build --no-sources` and publishes the files with `uv publish`.
+See the [contributing guide](https://fsdatalab.github.io/quail/docs/contributing)
+for how to propose and submit changes.

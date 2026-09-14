@@ -7,10 +7,12 @@ from dataclasses import replace
 from typing import Any
 
 from quail.backends.base import GpuContext
+from quail.backends.quail.executor import loop
+from quail.backends.quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
 from quail.backends.quail.graph import filter_result, stage_partner_lists
 from quail.backends.quail.worker import execute_quail_request, prepare_quail_request
-from quail.executor import loop
-from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
+from quail.execution.runner import NodeMetrics, NodeResult, SurvivorStream
+from quail.execution.tokens import DocumentKeys
 from quail.logical import SHARED_PRE
 from quail.physical import (
     AiFilter,
@@ -19,14 +21,12 @@ from quail.physical import (
     PhysicalNode,
 )
 from quail.planner import collect_operators, plan_quail
-from quail.planning import (
+from quail.planner.physical_optimizer import (
     ModelRegion,
     PhysicalCandidate,
     PlanningContext,
     SupportResult,
 )
-from quail.runtime.runner import NodeMetrics, NodeResult, SurvivorStream
-from quail.runtime.tokens import DocumentKeys
 
 
 class QuailModelExecution:

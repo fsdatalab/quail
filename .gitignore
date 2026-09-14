@@ -28,3 +28,4 @@ results/torchprof_*.json.gz
 
 # subagent git worktrees, created and removed per run
 .claude/worktrees/
+docs/out/

@@ -54,7 +54,12 @@ def run_backend_group(
         )
         suite = run_suite(
             query_ids, sf=sf,
-            config=EngineConfig(model=model, backend=method, gpus=1),
+            config=EngineConfig(
+                gpus=1,
+                model=model,
+                backend=method,
+                device="h100-sxm",
+            ),
             data_dir=Path(data_dir) / f"sf{sf}",
             ground_truth_collection=ground_truth_collection or None,
             output_dir=run_dir / method / family,
