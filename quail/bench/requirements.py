@@ -1,15 +1,18 @@
-"""The pip requirement of quail-b for Modal images, from the pyproject pin."""
+"""The pip requirement of quail-b for Modal images."""
 
-import tomllib
-from pathlib import Path
+import json
+from importlib.metadata import distribution
 
 
 def quail_b_requirement() -> str:
-    """Return the pip requirement of quail-b at the commit pyproject.toml pins."""
-    pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
-    if not pyproject.exists():
-        # inside a container the module is imported from the mounted
-        # package, with no pyproject.toml; the image is already built
-        return "quail-b"
-    source = tomllib.loads(pyproject.read_text())["tool"]["uv"]["sources"]
-    return f"quail-b @ git+{source['quail-b']['git']}@{source['quail-b']['rev']}"
+    """Return the pip requirement of the installed quail-b, at its exact commit.
+
+    An installation from git records its origin (PEP 610), so the image
+    installs the commit the environment runs, whatever pinned it.
+    """
+    quail_b = distribution("quail-b")
+    origin = quail_b.read_text("direct_url.json")
+    if origin is None:
+        return f"quail-b=={quail_b.version}"
+    origin = json.loads(origin)
+    return f"quail-b @ git+{origin['url']}@{origin['vcs_info']['commit_id']}"
