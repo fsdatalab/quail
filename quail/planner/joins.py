@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 from quail.cost.sol import speed_of_light
 from quail.cost.work import Work, triangle
+from quail.logical import effective_selectivity
 
 
 @dataclass(frozen=True)
@@ -65,8 +66,7 @@ def _alias_stats(lengths: dict) -> dict[str, AliasStats]:
 def surviving_docs(n_docs: float, n_partners: float,
                    tuple_selectivity) -> float:
     """Expected distinct documents with at least one matching tuple."""
-    if tuple_selectivity is None:
-        return n_docs
+    tuple_selectivity = effective_selectivity(tuple_selectivity)
     return n_docs * (1.0 - (1.0 - tuple_selectivity)
                      ** max(1.0, n_partners))
 
@@ -87,7 +87,7 @@ def thin(live: dict, spec: dict) -> None:
         new = {a: surviving_docs(live[a], others(a), sel)
                for a in aliases}
         live.update(new)
-    elif sel is not None:
+    else:
         anchor = spec["anchor"]
         matched = surviving_docs(live[anchor], others(anchor), sel)
         live[anchor] = (matched if spec["semantics"] == "exists"

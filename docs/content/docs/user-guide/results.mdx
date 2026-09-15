@@ -32,23 +32,87 @@ Project: r.id, a.aspect
       Scan aspects as a [aspect]
 ```
 
-**Physical plan** shows what the execution engine will do, including
-the model, token budgets, estimated row counts, and estimated time
-per node.
+**Physical plan** shows what the execution engine will do: the
+model and token budgets, then one row per operator with the
+planner's estimates in columns to the right. Predicate rows sit under
+the filter or join that runs them, numbered by their position in the
+query text, so `predicate 2` is the second `AI_FILTER` you wrote. When
+the planner runs them in a different order, each row says which runs
+first.
 
 ```text
-backend=quail, model=qwen3-4b-fp8, workers=1
-KV=bf16, chunk budget=110,376 tokens
+physical: backend=quail, model=qwen3-4b-fp8, workers=1
+  KV=bf16, chunk budget=110,376 tokens, admission budget=362,250 tokens
 
-Project: r.id, a.aspect
-  AiJoin: anchor=r (estimated_seconds=0.003)
-    AiFilter: r (estimated_rows=4.8, estimated_seconds=0.004)
-      Scan reviews as r (estimated_rows=8)
-    Scan aspects as a (estimated_rows=12)
+                                                            est. rows   est. pass   est. time
+  Limit: 1                                                          1
+    Project: r.id                                                 1.5
+      AiFilter: r                                                 1.5                 1.09 ms
+        KV rewind=on
+        1st: predicate 2  PROMPT('DOCUMENT:\n{0}\n\nq2:')           6         50%
+        2nd: predicate 1  PROMPT('DOCUMENT:\n{0}\n\nq1:')           3         50%
+        Scan reviews as r                                           6
+          tokens=12, mean_doc_tokens=2
 ```
+
+For an operator row, `est. rows` is how many rows the planner expects
+it to produce. For a predicate row, it is how many documents or pairs
+the planner expects to reach that predicate, and `est. pass` is the
+selectivity it was planned with. A selectivity you did not give shows
+as `20%*`, with a footnote.
 
 `explain(verbose=True)` adds node ids, port connections, KV retention
 decisions, and planner remarks.
+
+## Measure the plan
+
+`explain(analyze=True)` works like `EXPLAIN ANALYZE` in DataFusion or
+PostgreSQL: it runs the query, then prints the same table with a
+measured column next to each estimate, followed by the totals of the
+run.
+
+```python
+print(query.explain(analyze=True))
+```
+
+```text
+                                                            est. rows   rows   est. pass    pass   est. time    time   fresh tokens
+  Limit: 1                                                          1      1                                   <1 ms
+    Project: r.id                                                 1.5      2                                   <1 ms
+      AiFilter: r                                                 1.5      2                         1.09 ms   <1 ms             60
+        KV rewind=on
+        1st: predicate 2  PROMPT('DOCUMENT:\n{0}\n\nq2:')           6      6         50%   66.7%
+        2nd: predicate 1  PROMPT('DOCUMENT:\n{0}\n\nq1:')           3      4         50%     50%
+        Scan reviews as r                                           6      6                                   <1 ms
+          tokens=12, mean_doc_tokens=2
+
+run:
+  query time   1 s (model startup excluded)
+  startup      500 ms
+  throughput   6 documents/second over 6 input documents
+  tokens       1,234 fresh
+  GPU cost     $0.0011 per query (1 GPU at $3.9492/hour, startup excluded)
+```
+
+Read each pair of columns together: `est. rows` against `rows`,
+`est. pass` against `pass`, `est. time` against `time`. On a predicate
+row, `rows` is how many documents or pairs the model evaluated and
+`pass` is the fraction that came back true. A large gap between
+`est. pass` and `pass` is the usual reason a plan's order or its
+estimated time was off. `fresh tokens` counts the input tokens a
+model node processed in forward passes.
+
+`explain(analyze=True, verbose=True)` adds every measured field of
+each node, including KV hits and misses and GPU seconds.
+
+The query runs once for the measurement. To keep the rows as well,
+run it yourself and ask the result for the measured table:
+
+```python
+result = query.run()
+rows = result.collect()
+print(result.explain())
+```
 
 ## Refusals
 

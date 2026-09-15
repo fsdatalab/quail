@@ -44,9 +44,11 @@ query = (
 result = query.collect()
 ```
 
-`selectivity` is optional. If you want to apply several predicates,
-add multiple `ai_filter` calls. Quail may reorder them based on
-selectivity to reduce total work.
+`selectivity` is optional; a predicate without one is planned as if
+20% of its rows pass. If you want to apply several predicates, add
+multiple `ai_filter` calls. Quail reorders them by estimated cost to
+reduce total work. Pass `order="as_written"` to `select()` to keep
+the written order.
 
 ### ai_join
 
@@ -127,7 +129,8 @@ and returns a `Query`.
 
 Execute the query and return a `pyarrow.Table`. This is when the
 model runs. See [Explain plans and runs](/docs/user-guide/results)
-for `run()`, `explain()`, and the execution report.
+for `run()`, `explain()`, `explain(analyze=True)`, and the
+execution report.
 
 ## User-defined functions
 

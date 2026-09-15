@@ -29,6 +29,7 @@ report = result.report
 | --- | --- |
 | `op` | `"filter"` or `"join"`. |
 | `alias` | Which table alias this stage operates on. |
+| `written_pos` | The position of the predicate in the query text, counted from 0, so a stage can be matched to its `explain()` line whatever order the planner ran them in. |
 | `provided_selectivity` | The selectivity you set in the query, or `null` if you did not provide one. |
 | `observed_selectivity` | The actual fraction of rows or pairs that passed after execution. |
 | `evaluated` | How many rows (for a filter) or pairs (for a join) the model evaluated. |

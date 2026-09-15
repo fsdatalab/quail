@@ -7,6 +7,7 @@ from quail.cost.retention import coefficients, retention_pages
 from quail.cost.sol import speed_of_light, unrounded_seconds
 from quail.cost.work import Work, ask, scan
 from quail.logical import (
+    DEFAULT_SELECTIVITY,
     Apply,
     CompileError,
     Join,
@@ -15,6 +16,7 @@ from quail.logical import (
     Scan,
     SemanticFilter,
     SemanticJoin,
+    effective_selectivity,
     join_conditions,
     oriented_join_conditions,
 )
@@ -110,14 +112,16 @@ def preamble_tokens(filters, joins) -> int:
 def default_order_rule(filters, joins) -> tuple[str, str]:
     """Return (rule, source).
 
-    'by_cost' when every predicate has a selectivity, 'as_written'
-    otherwise.
+    Always 'by_cost'; a predicate without a selectivity is priced with
+    DEFAULT_SELECTIVITY. Pass order="as_written" to keep written order.
     """
-    preds = [p for fs in filters.values() for p in fs]
-    sels = [p.selectivity for p in preds] + [j.selectivity for j in joins]
-    if sels and all(s is not None for s in sels):
-        return "by_cost", "default: every gated predicate has a selectivity"
-    return "as_written", "default: at least one predicate has no selectivity"
+    missing = any(p.selectivity is None for fs in filters.values()
+                  for p in fs) or any(j.selectivity is None for j in joins)
+    if missing:
+        return "by_cost", (
+            "default: by cost, with selectivity "
+            f"{DEFAULT_SELECTIVITY:g} for predicates without one")
+    return "by_cost", "default: by cost"
 
 
 def filter_cost(predicate, prefix_tokens: float, model: ModelSpec,
@@ -142,8 +146,7 @@ def order_filters_indexed(predicates, rule: str, *, prefix_tokens: float,
         return idx
 
     def selectivity(i):
-        return (predicates[i].selectivity
-                if predicates[i].selectivity is not None else 1.0)
+        return effective_selectivity(predicates[i].selectivity)
 
     ask_costs = [
         filter_cost(p, prefix_tokens, model, device, chunk_tokens,
@@ -275,7 +278,7 @@ def _filter_alias_work(preds, stats, order, pre: int) -> Work:
         q = _question_tokens(p.prompt)
         op = scan if si == 0 else ask
         total = total + op(pre + mean, q) * n
-        n *= p.selectivity if p.selectivity is not None else 1.0
+        n *= effective_selectivity(p.selectivity)
     return total
 
 
@@ -453,7 +456,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     for fs in filters.values():
         surv = 1.0
         for p in fs:
-            surv *= p.selectivity if p.selectivity is not None else 1.0
+            surv *= effective_selectivity(p.selectivity)
         live0[_filter_alias(fs[0])] *= surv
     filter_works = {
         alias: _filter_alias_work(preds, stats[alias], filter_orders[alias],
@@ -605,7 +608,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                 preamble_tokens=p.prompt.preamble_tokens,
                 selectivity=p.selectivity,
                 expected_docs=round(n * surv, 1)))
-            surv *= p.selectivity if p.selectivity is not None else 1.0
+            surv *= effective_selectivity(p.selectivity)
         keep = alias in retention_plan["initial"]
         pinned = alias in streamed
         writes = len(stages) > 1 or keep or pinned
@@ -898,15 +901,26 @@ def _filter_alias(pred_or_list):
 
 # ------------------------------------------------------------- explain
 
-def explain(logical: LogicalPlan, physical, *, verbose: bool = False) -> str:
+def explain(logical: LogicalPlan, physical, *, verbose: bool = False,
+            result=None, usd_per_hour: float | None = None) -> str:
     """Format the logical and physical operator trees.
 
     Args:
         logical: The optimized logical plan.
         physical: The physical plan or planning refusal.
         verbose: Include runtime settings and internal node fields.
+        result: The QueryResult of running the plan. When given, each
+            node shows its measured rows, time, and tokens next to the
+            estimates, and the measured totals follow the tree.
+        usd_per_hour: Price of one GPU, for the measured cost per query.
     """
-    from quail.explain import _fields, logical_tree, physical_tree
+    from quail.explain import (
+        _fields,
+        logical_tree,
+        measured_stages,
+        physical_tree,
+        run_summary,
+    )
 
     lines = ["logical:"]
     lines.extend("  " + line for line in logical_tree(logical).splitlines())
@@ -917,8 +931,8 @@ def explain(logical: LogicalPlan, physical, *, verbose: bool = False) -> str:
         lines.extend(f"  {reason}" for reason in physical.reasons)
         return "\n".join(lines)
     lines.append("")
-    lines.append(f"physical: (backend={physical.backend}, "
-                 f"model={physical.model}, workers={physical.workers})")
+    lines.append(f"physical: backend={physical.backend}, "
+                 f"model={physical.model}, workers={physical.workers}")
     if physical.backend == "quail":
         chunk = physical.settings.get("chunk_tokens")
         admission = physical.settings.get("admission_tokens")
@@ -928,13 +942,23 @@ def explain(logical: LogicalPlan, physical, *, verbose: bool = False) -> str:
         if admission is not None:
             budgets.append(f"admission budget={admission:,} tokens")
         lines.append("  " + ", ".join(budgets))
-    if getattr(physical, "estimates", None):
-        lines.append("  node seconds price each node's work alone; they "
-                     "do not add up to the plan estimate because chunk "
-                     "packing shares forward passes across nodes")
+    lines.append("")
     lines.extend("  " + line for line in physical_tree(
         physical.graph, logical=logical, verbose=verbose,
-        estimates=getattr(physical, "estimates", None)).splitlines())
+        estimates=getattr(physical, "estimates", None),
+        metrics=None if result is None else result.node_metrics,
+        stages=None if result is None else measured_stages(result.report),
+    ).splitlines())
+    if getattr(physical, "estimates", None):
+        lines.append("  est. time is each node's work alone; node times do "
+                     "not add up to the plan estimate")
+        lines.append("  because chunk packing shares forward passes across "
+                     "nodes")
+    if result is not None:
+        lines.append("")
+        lines.append("run:")
+        lines.extend("  " + line for line in run_summary(
+            result.report, physical.graph, physical.workers, usd_per_hour))
     if verbose:
         lines.append("")
         lines.append("settings:")

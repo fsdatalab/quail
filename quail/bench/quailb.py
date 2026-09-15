@@ -39,8 +39,8 @@ from quail_b.queries import (
 from quail_b.queries import queries as query_specs
 from quail_b.scoring import RunOutput, reference_answer
 
-# the fixed planner inputs, by prompt; a query with an estimate for
-# every predicate is ordered by cost, any other in written order
+# the fixed planner inputs, by prompt; a predicate without an
+# estimate here gets the planner's default selectivity
 SELECTIVITY = {**FILTER_SELECTIVITY_ESTIMATES, **JOIN_SELECTIVITY_ESTIMATES}
 
 
@@ -52,9 +52,7 @@ def register_tables(session, data_dir):
 
 
 def _build(session, plan: QueryPlan):
-    order = ("by_cost" if all(op.prompt in SELECTIVITY for op in plan.operators)
-             else "as_written")
-    return substrait.build_query(session, plan, SELECTIVITY, order=order)
+    return substrait.build_query(session, plan, SELECTIVITY, order="by_cost")
 
 
 def build_query(session, spec: QuerySpec):

@@ -66,6 +66,14 @@ def tok(text):
     return text.split()
 
 
+def _cell(text, title):
+    """Return the column cells of the explain row that starts with title."""
+    for line in text.splitlines():
+        if line.strip().startswith(title):
+            return line.split(title, 1)[1].split()
+    raise AssertionError(f"no row starts with {title!r}")
+
+
 def _five_filter_plan(catalog, sels):
     q = docs(catalog, "reviews", tok).alias("r")
     for j, s in enumerate(sels):
@@ -229,8 +237,8 @@ def test_filter_ordering_and_kv_writes(catalog):
                .select("r.id"))
     plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
                       doc_tokens={"r": [100] * 10})
-    assert plan.settings["order_rule"] == "as_written"
-    assert "no selectivity" in plan.settings["order_source"]
+    assert plan.settings["order_rule"] == "by_cost"
+    assert "selectivity 0.2" in plan.settings["order_source"]
 
 
 def test_component_costs_and_model_weights():
@@ -756,17 +764,17 @@ def test_aggregate_join_work_matches_per_document_sum():
 def test_explain_estimates_and_limits(catalog):
     for sels, expected in [
     ((0.5, 0.25), "12.5"), ((1.0, 0.0), "0"),
-    ((None, 0.5), "unknown"), ((None, 0.0), "0"),
+    ((None, 0.5), "10"), ((None, 0.0), "0"),
 ]:
         logical = _five_filter_plan(catalog, sels)
         plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
                           doc_tokens={"r": [400] * 100})
         text = explain(logical, plan)
         physical = text.split("physical:", 1)[1]
-        assert f"Project: r.id (estimated_rows={expected})" in physical
-        assert f"AiFilter: r (estimated_rows={expected}, estimated_seconds=" \
-            in physical
-        assert "Scan reviews as r (estimated_rows=100)" in physical
+        assert _cell(physical, "Project: r.id") == [expected]
+        assert _cell(physical, "AiFilter: r")[0] == expected
+        assert _cell(physical, "AiFilter: r")[-1] in ("ms", "s")
+        assert _cell(physical, "Scan reviews as r") == ["100"]
         assert "tokens=40,000" in physical
         assert "node_id=" not in text
         assert "arena_writes" not in text
@@ -776,9 +784,10 @@ def test_explain_estimates_and_limits(catalog):
         assert "KV rewind=on" in text
         assert "joins follow" not in text
         assert "stage {" not in text
-        for index, stage in enumerate(filter_chain(plan).stages, 1):
+        for stage in filter_chain(plan).stages:
             template = logical.root.input.predicates[stage.written_pos].prompt.template
-            assert f"{index}. PROMPT({template!r}, r.review)" in physical
+            assert (f"predicate {stage.written_pos + 1}  PROMPT({template!r})"
+                    in physical)
         verbose = explain(logical, plan, verbose=True)
         assert "node_id=ai_filter:r" in verbose
         assert "admission_tokens=" in verbose
@@ -789,8 +798,8 @@ def test_explain_estimates_and_limits(catalog):
     plan = plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
                       doc_tokens={"r": [400] * 100})
     physical = explain(logical, plan).split("physical:", 1)[1]
-    assert "Limit: 10 (estimated_rows=10)" in physical
-    assert "Project: r.id (estimated_rows=25)" in physical
+    assert _cell(physical, "Limit: 10") == ["10"]
+    assert _cell(physical, "Project: r.id") == ["25"]
     assert "KV: not stored" in physical
 
     logical = _filtered_join(catalog)
@@ -799,8 +808,11 @@ def test_explain_estimates_and_limits(catalog):
     physical = explain(logical, plan).split("physical:", 1)[1]
     assert "AiJoin: anchor=" in physical
     assert "KV: anchor=" in physical
-    assert "estimated_evaluations=" in physical
-    assert "(estimated_rows=unknown)" in physical
+    # the join row has no row estimate, only a time; its stage row has
+    # the expected pairs and pass rate
+    assert _cell(physical, "AiJoin: anchor=")[-1] in ("ms", "s")
+    assert len(_cell(physical, "AiJoin: anchor=")[1:]) == 2
+    assert _cell(physical, "join 1 full (")[-1] == "10%"
     assert "expected_tuples=" not in physical
     assert "survivors stream into the join with KV pinned" in physical
     assert "KV: anchor=streamed from its filter" in physical
@@ -935,7 +947,7 @@ def test_node_ids_estimates_and_the_recompute_column(catalog):
     assert recompute["release_recompute_tokens"] > 0.9 * 10000 * 401
     assert recompute["release_recompute_seconds"] > 0
     text = explain(logical, plan)
-    assert "estimated_seconds=" in text
+    assert "est. time" in text
     assert "if the KV were released here instead of pinned" in text
     assert "do not add up to the plan estimate" in text
 

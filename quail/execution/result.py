@@ -249,7 +249,8 @@ class QueryResult:
                  answer_tables: dict | None = None,
                  limit: int | None = None,
                  survivor_indices: dict[str, pa.Array] | None = None,
-                 true_join_tables: dict[int, pa.Table] | None = None):
+                 true_join_tables: dict[int, pa.Table] | None = None,
+                 row_count: int | None = None):
         self.columns = columns
         self.schema = output_schema
         self.report = report
@@ -264,7 +265,7 @@ class QueryResult:
         self._projection = projection
         self.survivor_indices = survivor_indices or {}
         self.true_join_tables = true_join_tables or {}
-        self._row_count = None
+        self._row_count = row_count
         self._materialized = None
 
     @classmethod
@@ -355,11 +356,13 @@ class QueryResult:
 
     def explain(self, *, verbose: bool = False) -> str:
         """Return the executed operator tree with measured rows and time."""
-        from quail.explain import physical_tree
+        from quail.explain import measured_stages, physical_tree
 
         if self.plan is None:
             return "no physical plan was executed"
-        return physical_tree(self.plan, verbose=verbose, metrics=self.node_metrics)
+        return physical_tree(self.plan, verbose=verbose,
+                             metrics=self.node_metrics,
+                             stages=measured_stages(self.report))
 
     def observer(self, observer) -> dict:
         """Return the report one execution observer attached.
@@ -379,6 +382,10 @@ class QueryResult:
         table = self.collect(limit=limit)
         columns = [column.to_pylist() for column in table.columns]
         return list(zip(*columns))
+
+    def known_count(self) -> int | None:
+        """Return the row count when it is known without running the plan."""
+        return self._row_count
 
     def count(self) -> int:
         if self._row_count is None:

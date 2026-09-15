@@ -99,9 +99,5 @@ def test_all_queries_compile_and_plan(tmp_path):
                 assert all(join.selectivity is not None for join in joins), qid
             plan = query.plan()
             assert not isinstance(plan, Refusal), f"{qid} refused: {plan}"
-            expected_order = (
-                "as_written" if qid.startswith("PRIV-")
-                else "by_cost"
-            )
-            assert plan.settings["order_rule"] == expected_order, qid
+            assert plan.settings["order_rule"] == "by_cost", qid
             assert "physical:" in query.explain(), qid
