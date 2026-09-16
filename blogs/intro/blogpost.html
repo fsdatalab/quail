@@ -980,11 +980,11 @@ question is how to run and train many specialized models alongside a
 larger model on the same GPU.</p>
 <p><strong>Use proxy models for query planner hints.</strong> Proxy
 models need not be limited to evaluating predicates during execution.
-They could also provide planner hints. For example, predicted filter
-selectivities could help Quail choose the filter order. Predictions
-about which documents will reach later operators could help Quail decide
-which KV to retain. When used only as hints, proxy errors would affect
-runtime rather than query results.</p>
+They could also provide planner hints. For example, proxy models could
+predict filter selectivities, which would help Quail choose the filter
+order. They could also predict which documents will reach later
+operators, which would help Quail decide which KV to retain. Errors in
+the proxy model would not affect query accuracy, which is nice.</p>
 <p>More blog posts, and eventually a technical report, are coming soon.
 For now, please try Quail out! And if any of the ideas above sound
 interesting, apply to a Computer Science PhD program at Carnegie Mellon!
