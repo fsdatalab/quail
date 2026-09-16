@@ -960,21 +960,18 @@ href="https://arxiv.org/abs/2603.15970">Google’s work on lightweight
 proxy models for AI-SQL</a> suggests small filter models can reduce cost
 substantially. For joins, Quail currently runs a <em>KV-aware nested
 loop join</em>: Quail reuses each anchor’s KV, but recomputes every
-partner for each new anchor. Quail therefore evaluates every document
-pair with a model forward pass, which is slow. We want to train a
-specialized join model so Quail can run more like a hash join. In a hash
-join, the database builds an in-memory hash table over one relation,
-called the <em>build side</em>, then looks up matches for each row from
-the other relation, called the <em>probe side</em>. A specialized join
-model could encode each document independently and map matching
-documents to comparable representations. Quail could build an in-memory
-index from the <em>build side</em> representations, then find matches
-for each <em>probe side</em> representation without a full model forward
-pass for every document pair. Because the query planner may choose
-either relation as the <em>build side</em>, training should produce the
-same match score for <code>(left, right)</code> and
-<code>(right, left)</code>. One systems question is how to run and train
-many specialized models alongside a larger model on the same GPU.</p>
+partner for each new anchor, so every document pair still requires new
+model work. We could instead train a dual encoder, which encodes each
+document independently, on labeled matching and nonmatching pairs. The
+training objective would assign high similarity to matching pairs and
+low similarity to nonmatching pairs. Quail could then encode each
+document once, index the representations from one relation, and search
+the index with representations from the other relation. The resulting
+execution would look more like a hash join than a nested loop join. A
+symmetric similarity function would give the same match score regardless
+of which relation Quail indexes. One systems question is how to run and
+train many specialized models alongside a larger model on the same
+GPU.</p>
 <p>More blog posts, and eventually a technical report, are coming soon.
 For now, please try Quail out! If any of the ideas above sound
 interesting, please reach out! We are hiring PhD students and
