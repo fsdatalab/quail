@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Quail: a declarative query engine for AI_FILTER and AI_JOIN"
 readme = "README.md"
 license = "MIT"
-# <3.13: bpe-qwen ships wheels up to 3.12, and the Modal image runs 3.12
+# The Modal image and tested vLLM build use Python 3.12
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "sqlglot==30.17.0",
@@ -13,7 +13,7 @@ dependencies = [
     "pyarrow==25.0.1",
     "numpy==2.3.5; sys_platform != 'emscripten' and sys_platform != 'win32'",
     "numpy==2.5.2; sys_platform == 'emscripten' or sys_platform == 'win32'",
-    "bpe-qwen==0.1.5",
+    "gigatoken==0.10.0",
     "datasets==5.0.1",
     # same version as the Modal image; vLLM has Linux wheels only
     "vllm==0.26.0; sys_platform == 'linux'",

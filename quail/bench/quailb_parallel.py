@@ -32,7 +32,7 @@ base_image = (
     # quail-b installs from git at the pinned commit, with its plan files
     # and its own dependencies
     .pip_install("huggingface_hub", "numpy", "pyarrow",
-                 "sqlglot>=27.0", "bpe-qwen>=0.1.5", "datasets>=5.0.1",
+                 "sqlglot>=27.0", "gigatoken>=0.10.0", "datasets>=5.0.1",
                  quail_b_requirement())
     .env({
         "QUAIL_CACHE_DIR": "/root/.cache/kernels",

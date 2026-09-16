@@ -1444,7 +1444,7 @@ image = (
     .entrypoint([])
     .apt_install("git")
     .pip_install("vllm==0.26.0", "huggingface_hub", "numpy", "pyarrow",
-                 "sqlglot>=27.0", "bpe-qwen>=0.1.5", "datasets>=5.0.1",
+                 "sqlglot>=27.0", "gigatoken>=0.10.0", "datasets>=5.0.1",
                  quail_b_requirement())
     .env({
         "QUAIL_CACHE_DIR": "/root/.cache/kernels",
@@ -1463,7 +1463,7 @@ publish_image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("git")
     .pip_install("boto3", "pyarrow", "numpy", "sqlglot>=27.0",
-                 "bpe-qwen>=0.1.5", "datasets>=5.0.1", quail_b_requirement())
+                 "gigatoken>=0.10.0", "datasets>=5.0.1", quail_b_requirement())
     .add_local_python_source("quail"))
 
 
