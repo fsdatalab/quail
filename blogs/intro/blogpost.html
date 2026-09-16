@@ -978,6 +978,12 @@ independently, so Quail can index one relation and find matches from the
 other without a full model forward pass for every pair? A big systems
 question is how to run and train many specialized models alongside a
 larger model on the same GPU.</p>
+<p><strong>Use proxy models for query planner hints.</strong> A small
+proxy model could predict which documents are likely to pass later
+filters. Quail could use the predictions to choose the filter order and
+retain KV for likely survivors. The main model would still evaluate
+every predicate, so mistakes would affect runtime rather than query
+results.</p>
 <p>More blog posts, and eventually a technical report, are coming soon.
 For now, please try Quail out! And if any of the ideas above sound
 interesting, apply to a Computer Science PhD program at Carnegie Mellon!
