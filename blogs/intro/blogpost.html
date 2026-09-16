@@ -408,7 +408,7 @@ class="sourceCode python"><code class="sourceCode python"><span id="cb6-1"><a hr
 <span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;huggingface-hub==1.27.0&quot;</span>,</span>
 <span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;pyarrow==25.0.1&quot;</span>,</span>
 <span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;numpy==2.3.5&quot;</span>,</span>
-<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;bpe-qwen==0.1.5&quot;</span>,</span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;gigatoken==0.10.0&quot;</span>,</span>
 <span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;datasets==5.0.1&quot;</span>,</span>
 <span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;vllm==0.26.0&quot;</span>,</span>
 <span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a>)</span>
@@ -580,7 +580,7 @@ but processes a batch at a time, as in <a
 href="https://www.cidrdb.org/cidr2005/papers/P19.pdf">MonetDB</a>.
 Before execution, Quail tokenizes every document column referenced by an
 AI filter or join with <a
-href="https://github.com/sweepai/bpe-qwen"><code>bpe-qwen</code></a><a
+href="https://github.com/marcelroed/gigatoken">Gigatoken</a><a
 href="#fn7" class="footnote-ref" id="fnref7"
 role="doc-noteref"><sup>7</sup></a>, then loads one model copy per GPU.
 Below, we explain how Quail reuses parts of vLLM without running vLLM’s
@@ -1019,9 +1019,10 @@ cached rate to 8.41 million document tokens reused by the second filter,
 and the output rate to 200,000 tokens. We assume an infinite cache, so
 every reusable document token receives the cached rate.<a href="#fnref6"
 class="footnote-back" role="doc-backlink">↩︎</a></p></li>
-<li id="fn7"><p><code>bpe-qwen</code> is a Rust tokenizer for Qwen
-models. Its authors report 6.28 times higher sequential throughput than
-the Hugging Face tokenizer on WikiText.<a href="#fnref7"
+<li id="fn7"><p>Gigatoken is a Rust tokenizer. On our test machine, it
+processed 44,729 documents per second, compared with 5,871 for
+<code>bpe-qwen</code>, and matched the Hugging Face tokenizer on all
+12,009 tested IMDB and BioDEX documents.<a href="#fnref7"
 class="footnote-back" role="doc-backlink">↩︎</a></p></li>
 <li id="fn8"><p>Kernel fusion can substantially improve prefill MFU. In
 <a href="https://www.sailresearch.com/blog/tpu-v6e-gemma">“Chasing Speed

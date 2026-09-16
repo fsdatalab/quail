@@ -210,7 +210,7 @@ IMAGE_REQUIREMENTS = (
     "huggingface-hub==1.27.0",
     "pyarrow==25.0.1",
     "numpy==2.3.5",
-    "bpe-qwen==0.1.5",
+    "gigatoken==0.10.0",
     "datasets==5.0.1",
     "vllm==0.26.0",
 )
@@ -308,9 +308,9 @@ Figure 4 shows how these components work together.
 *Figure 4. Quail lowers BIO-3 to the physical plan on the left. On the right, one CPU worker runs its physical operators and manages KV. Each AI physical operator invokes Quail's inference program on the GPU.*
 :::
 
-**Physical plan executor.** Quail uses a pull-based executor, as in [Volcano](https://doi.org/10.1109/69.273032), but processes a batch at a time, as in [MonetDB](https://www.cidrdb.org/cidr2005/papers/P19.pdf). Before execution, Quail tokenizes every document column referenced by an AI filter or join with [`bpe-qwen`](https://github.com/sweepai/bpe-qwen)[^bpe-qwen], then loads one model copy per GPU. Below, we explain how Quail reuses parts of vLLM without running vLLM's request scheduler or KV manager. During execution, the CPU prepares one input batch while the GPU processes another.
+**Physical plan executor.** Quail uses a pull-based executor, as in [Volcano](https://doi.org/10.1109/69.273032), but processes a batch at a time, as in [MonetDB](https://www.cidrdb.org/cidr2005/papers/P19.pdf). Before execution, Quail tokenizes every document column referenced by an AI filter or join with [Gigatoken](https://github.com/marcelroed/gigatoken)[^gigatoken], then loads one model copy per GPU. Below, we explain how Quail reuses parts of vLLM without running vLLM's request scheduler or KV manager. During execution, the CPU prepares one input batch while the GPU processes another.
 
-[^bpe-qwen]: `bpe-qwen` is a Rust tokenizer for Qwen models. Its authors report 6.28 times higher sequential throughput than the Hugging Face tokenizer on WikiText.
+[^gigatoken]: Gigatoken is a Rust tokenizer. On our test machine, it processed 44,729 documents per second, compared with 5,871 for `bpe-qwen`, and matched the Hugging Face tokenizer on all 12,009 tested IMDB and BioDEX documents.
 
 **KV manager.** Each GPU has a fixed pool of KV pages in HBM. After each model evaluation, Quail retains only the KV that a later evaluation can reuse. For a filter, Quail places the document before the predicate-specific question. After the predicate returns `TRUE` or `FALSE`, Quail discards the question KV and rewinds to the end of the document KV. If the predicate returns `TRUE` and another AI operator uses the document, Quail retains the document KV. Otherwise, Quail releases it. For a join, Quail retains the KV for the anchor document and the shared join prompt while it evaluates the partner documents. After evaluating the join predicate for one partner, Quail discards the partner-specific KV and reuses the anchor KV for the next partner. After the last partner, Quail releases the anchor KV unless a later join can reuse it.
 
