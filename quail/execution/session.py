@@ -70,9 +70,9 @@ def pick_corpus_tokenizer(primary, fast, texts, sample=25):
         return primary, "tokenizer: transformers"
     for t in texts[:sample]:
         if list(fast(t)) != list(primary(t)):
-            return primary, ("tokenizer: transformers (bpe-qwen "
+            return primary, ("tokenizer: transformers (Gigatoken "
                              "failed parity on this column's sample)")
-    return fast, "tokenizer: bpe-qwen (parity-checked on sample)"
+    return fast, "tokenizer: Gigatoken (parity-checked on sample)"
 
 
 TOKENIZE_ROWS = 2048
@@ -115,7 +115,7 @@ class Session:
         self.catalog = Catalog()
         self._tok = tokenizer      # injectable for tests; lazy HF load
         self._tok_injected = tokenizer is not None
-        self._fast = None          # lazy bpe-qwen instance
+        self._fast = None          # lazy Gigatoken instance
         self._fast_tried = False
         self.notes = []            # tokenizer picks etc., for reports
         self._token_stores = {}
@@ -173,17 +173,15 @@ class Session:
         return self._tok
 
     def _fast_tokenizer(self):
-        """Return the bpe-qwen fast tokenizer, or None if unavailable."""
+        """Return the Gigatoken tokenizer, or None if unavailable."""
         if self._tok_injected:
             return None
         if not self._fast_tried:
             self._fast_tried = True
             try:
-                from bpe_qwen import AutoLinearTokenizer
-                fast = AutoLinearTokenizer.from_pretrained(
-                    self.model.hf_name)
-                self._fast = lambda text: fast(
-                    text, add_special_tokens=False)["input_ids"]
+                from gigatoken import Tokenizer
+                fast = Tokenizer(self.model.hf_name)
+                self._fast = fast.encode
             except Exception:
                 self._fast = None
         return self._fast

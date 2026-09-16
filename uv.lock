@@ -171,6 +171,43 @@ wheels = [
 ]
 
 [[package]]
+name = "awkward"
+version = "2.13.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "awkward-cpp" },
+    { name = "fsspec" },
+    { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "numpy", version = "2.5.2", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'emscripten' or sys_platform == 'win32'" },
+    { name = "packaging" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/43/97/2728ab879ed3edaecfbd8e9daa7d88a2f89a7ea584e413c4d8971fc0414d/awkward-2.13.0.tar.gz", hash = "sha256:36f127573295e1ddf65b551bf071b803ad4af21bd14519f4c4dd34953cb3efc2", size = 6479149, upload-time = "2026-08-14T16:52:43.873Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/25/34/b8eece9a8d024defc08418ea883361b3d7e3300392719ee27535e93885a5/awkward-2.13.0-py3-none-any.whl", hash = "sha256:ff40879e7179a6f14f4c4ee5f5297e3dcd027b99b4c64188bdb7dccdf625e982", size = 990112, upload-time = "2026-08-14T16:52:42.018Z" },
+]
+
+[[package]]
+name = "awkward-cpp"
+version = "56"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "numpy", version = "2.5.2", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'emscripten' or sys_platform == 'win32'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/43/92/6325292ccc2be3ede227fd0b4bd7b23bc7597790f31227171bec4009d2df/awkward_cpp-56.tar.gz", hash = "sha256:cd3635fab926c6630c0a85d92b59a15851c4f5a881ea749984069027634f8f52", size = 1501723, upload-time = "2026-08-14T15:30:10.748Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7b/b6/70252cacf3b291d24c399327437ff97c590110d067dd06857dc22ea9e269/awkward_cpp-56-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:0ab57bee218181ef6d9bf4b4fd990c22af5679460bc948603fc4b5888fe4b976", size = 628579, upload-time = "2026-08-14T15:29:08.958Z" },
+    { url = "https://files.pythonhosted.org/packages/80/30/870df24b47ab92f4a7a8974521712e9ce63facf36401f91978550b90053a/awkward_cpp-56-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:842668231ee2660eb79a67344697ab7a9d296e6413c99d9c693b7d2b382d1288", size = 581268, upload-time = "2026-08-14T15:29:10.332Z" },
+    { url = "https://files.pythonhosted.org/packages/04/2d/2658510cea4fb791d474ad2e1f16aeb530286f67e72e8ebc7121a5bb245c/awkward_cpp-56-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:57c3da66509fd29e40a0a5a83c9ec736e520f8f2d457832bdf2bfc01fa80d4ec", size = 626384, upload-time = "2026-08-14T15:29:11.813Z" },
+    { url = "https://files.pythonhosted.org/packages/a5/35/b33ce937f644f33a0a3c7185c525163f98152e1b29ee1a26917a3c25597a/awkward_cpp-56-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:82fa36172a714cd25907e9921c417f7a4c4f78e5151b6c0b2d82ed1ed3b8a5d8", size = 698758, upload-time = "2026-08-14T15:29:13.364Z" },
+    { url = "https://files.pythonhosted.org/packages/50/84/5cc8fe64c5ac67c77eb0eb189fc6fb09cdcb940d5dc58d89dfcde0275dbc/awkward_cpp-56-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:45c3c4c6be834e3d868e90f9cdd199a827e0915a32e10925b83270e84e798a19", size = 1626983, upload-time = "2026-08-14T15:29:15.159Z" },
+    { url = "https://files.pythonhosted.org/packages/b4/74/4dbfedd5fba6169f14f19f2637c7a40b5f1ed3d3128dde2056a5b644584c/awkward_cpp-56-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:e59f4f933052a1b97bec3ce749483fca8ebb424f0d220c103538c21730c6a9a8", size = 1745779, upload-time = "2026-08-14T15:29:16.681Z" },
+    { url = "https://files.pythonhosted.org/packages/a5/ff/b8d6d71b798a12092d3d8b165a503950bfe6eecb7a326e6812ab3e0f3892/awkward_cpp-56-cp312-cp312-win32.whl", hash = "sha256:248b67e18ae74da571d3e47d6883997a8dcddae5945f59754944134da2c0c94a", size = 710431, upload-time = "2026-08-14T15:29:18.263Z" },
+    { url = "https://files.pythonhosted.org/packages/3a/02/94052fe642039af714637b395ffdf5fb9aa64f787ef77c7a1f053758f1f9/awkward_cpp-56-cp312-cp312-win_amd64.whl", hash = "sha256:de92d1eac980f68fe7088cdd185761cdc7e99844f61d100e05ad0aa5c0baea65", size = 742006, upload-time = "2026-08-14T15:29:19.705Z" },
+    { url = "https://files.pythonhosted.org/packages/c7/02/66d0835e53a7e9d25d22a2c842282d34d439573392e5277c2c5f2356ecde/awkward_cpp-56-cp312-cp312-win_arm64.whl", hash = "sha256:dffa29e9e6f7fee78ee111abde63029c5c9d3e39ffd24350d1415534f208fba7", size = 880311, upload-time = "2026-08-14T15:29:21.41Z" },
+]
+
+[[package]]
 name = "blake3"
 version = "1.0.9"
 source = { registry = "https://pypi.org/simple" }
@@ -213,17 +250,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/53/06/f63fb1befdf77af18539fb24ea01f2da0f13965ed5de091061708ac96416/botocore-1.43.89.tar.gz", hash = "sha256:f0574942970742657b0e0716cf08c2dfe6bef8e6de5fbb7081c3424e262b4cca", size = 16074206, upload-time = "2026-09-04T19:24:52.464Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/9e/9d/96f9dee6d12eedf1c2b4264eefd59c7ac8cac10daadb9a7bfccc9ee881c6/botocore-1.43.89-py3-none-any.whl", hash = "sha256:d7211220c815427fe71225acc6909e4ab5dfab3b03770e72fd16cf9eb86b3d1a", size = 15768272, upload-time = "2026-09-04T19:24:49.769Z" },
-]
-
-[[package]]
-name = "bpe-qwen"
-version = "0.1.5"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/80/a7/124e83786c4aa75706b18ea003a6023cf44155c8b93ee00b01ef94d70cc0/bpe_qwen-0.1.5.tar.gz", hash = "sha256:67e2c4a6f75daabc14cef47d8c4e00cd56791ccdf99e331388628c7e18e8d880", size = 312775, upload-time = "2025-09-26T22:06:18.029Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/f7/35/010cd7e9a5d4f16d8e65cb3c02b64b766a7a7bd7d46bfd6dac861b5f2819/bpe_qwen-0.1.5-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:8cf6d6870c4cc0e375a277e2f1dd3f23151ef48d3961cb64bbc9c013d40fdff6", size = 986784, upload-time = "2025-09-26T22:06:12.074Z" },
-    { url = "https://files.pythonhosted.org/packages/de/63/51379bb93d172d554977a44692f5e1ee316170dab502066e748b269c2e70/bpe_qwen-0.1.5-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:d1a6f2cf1416a340faee84b5f42994b56025c04363c60e4782ef7199a5e0dcbc", size = 1088511, upload-time = "2025-09-26T22:06:13.213Z" },
-    { url = "https://files.pythonhosted.org/packages/2b/ff/e6ca8338d4482a9a0b01052dabcf03cc20fd976b2118ff86937e39e5d8cb/bpe_qwen-0.1.5-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:d7504544b5c08532068f4b7e718a7d127b81761313a56ea58df3265e29f57965", size = 1147765, upload-time = "2025-09-26T22:06:14.55Z" },
 ]
 
 [[package]]
@@ -832,6 +858,26 @@ wheels = [
 [package.optional-dependencies]
 http = [
     { name = "aiohttp" },
+]
+
+[[package]]
+name = "gigatoken"
+version = "0.10.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "awkward" },
+    { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "numpy", version = "2.5.2", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'emscripten' or sys_platform == 'win32'" },
+    { name = "typer" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/33/8a/fa097b404650a9eaea59de80bc8c33ad8ccb6b4a17ff6f33f213ec091057/gigatoken-0.10.0.tar.gz", hash = "sha256:562fd4284eacdebd8a8043ce21ddcdacb61210a036e6e700cd13bdca2b2af7ac", size = 1330282, upload-time = "2026-07-25T19:15:42.934Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/bf/fb/861532617e4804df169b4b4b7f62a73123fef77706af6046826e996cb718/gigatoken-0.10.0-cp310-abi3-macosx_10_12_x86_64.whl", hash = "sha256:a995afe33c98c28305decb0cbdfecd02f548e5c4176d5c93532a8030a683d0a1", size = 5130257, upload-time = "2026-07-25T19:15:32.463Z" },
+    { url = "https://files.pythonhosted.org/packages/05/8c/89091815057ea41a1e81061704266de52ac12e5411bc66d5f1b33a3f85a8/gigatoken-0.10.0-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:dff87a1da97d69718e4a0c2c00a7f29a509dfdaf69a9f8d8bb96829513c516c8", size = 4186567, upload-time = "2026-07-25T19:15:34.123Z" },
+    { url = "https://files.pythonhosted.org/packages/35/6f/d393a7735cbf775f612da4d0674f7ecc8900e0be4989fd46cbe23f650965/gigatoken-0.10.0-cp310-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:46f726b77e4132914f64ed42c7b81d82bdc40e9302138fcaca0b394eed62fc47", size = 4486995, upload-time = "2026-07-25T19:15:35.573Z" },
+    { url = "https://files.pythonhosted.org/packages/e7/32/a0b3af6db26b3704224d3ad856ebadfdb6ed5d50210ab16ab9ad27b30673/gigatoken-0.10.0-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:2f3481d0c067beacf1c0a7640d956edbc8973014ba8cfa3e18bfafb02f78e53b", size = 5336884, upload-time = "2026-07-25T19:15:37.245Z" },
+    { url = "https://files.pythonhosted.org/packages/39/fd/c47ad5bfeb18531030e4f9f3361e3635cc9522ab6c7e27cff0462375ba48/gigatoken-0.10.0-cp310-abi3-win_amd64.whl", hash = "sha256:0ecee2614e87ff478ffb74d6d15c282f75dbf2624ee7c4757cef130f67805d49", size = 5355471, upload-time = "2026-07-25T19:15:39.14Z" },
+    { url = "https://files.pythonhosted.org/packages/64/25/0f3a8f008a50e210860f9c374a4b2ce597f0462a0ae586ac2f8a57ff2d4c/gigatoken-0.10.0-cp310-abi3-win_arm64.whl", hash = "sha256:85fa2c51ff8fcb6a834f3a98c127d6634ec64758cafd05887ecac5c88414a59b", size = 4389954, upload-time = "2026-07-25T19:15:41.312Z" },
 ]
 
 [[package]]
@@ -2535,8 +2581,8 @@ name = "quail-engine"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "bpe-qwen" },
     { name = "datasets" },
+    { name = "gigatoken" },
     { name = "huggingface-hub" },
     { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
     { name = "numpy", version = "2.5.2", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'emscripten' or sys_platform == 'win32'" },
@@ -2559,8 +2605,8 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "bpe-qwen", specifier = "==0.1.5" },
     { name = "datasets", specifier = "==5.0.1" },
+    { name = "gigatoken", specifier = "==0.10.0" },
     { name = "huggingface-hub", specifier = "==1.27.0" },
     { name = "numpy", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'", specifier = "==2.3.5" },
     { name = "numpy", marker = "sys_platform == 'emscripten' or sys_platform == 'win32'", specifier = "==2.5.2" },
