@@ -1,9 +1,9 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1800 880" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 620" role="img" aria-labelledby="title desc">
   <title id="title">BIO-3 physical plan and Quail execution engine</title>
-  <desc id="desc">The BIO-3 physical plan appears on the left. On the right, a CPU region contains document tokenization, the physical plan executor, the packed filter and anchored join schedulers, the other physical operators, and the KV manager. A GPU region contains one model copy, one KV pool in HBM, and the model forward pass.</desc>
+  <desc id="desc">The BIO-3 physical plan appears on the left. On the right, a CPU region contains document tokenization, the physical plan executor, AI filter and AI join execution, other physical operators, and the KV manager. The AI physical operators send model inputs to Quail's inference program on the GPU and receive scores. A GPU region also contains one model copy and one KV pool in HBM.</desc>
 
   <defs>
-    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
       <path d="M 0 0 L 10 5 L 0 10 z" fill="#667085"/>
     </marker>
     <style>
@@ -13,86 +13,89 @@
       .cpu { fill: #dbe7f7; stroke: #667085; stroke-width: 2; }
       .gpu { fill: #dcebd3; stroke: #667085; stroke-width: 2; }
       .input { fill: #f2f4f7; stroke: #667085; stroke-width: 2; }
-      .edge { fill: none; stroke: #667085; stroke-width: 3; marker-end: url(#arrow); }
-      .edge-light { fill: none; stroke: #98a2b3; stroke-width: 2.5; marker-end: url(#arrow); }
-      .edge-both { fill: none; stroke: #98a2b3; stroke-width: 2.5; marker-start: url(#arrow); marker-end: url(#arrow); }
-      .heading { fill: #101828; font: 600 28px "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-anchor: middle; }
-      .zone-heading { fill: #344054; font: 600 22px "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-anchor: middle; }
-      .label { fill: #101828; font: 500 21px "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-anchor: middle; dominant-baseline: middle; }
-      .small { fill: #344054; font: 400 18px "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-anchor: middle; dominant-baseline: middle; }
-      .arrow-label { fill: #475467; font: 400 16px "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-anchor: middle; }
+      .edge { fill: none; stroke: #667085; stroke-width: 2.5; marker-end: url(#arrow); }
+      .edge-light { fill: none; stroke: #98a2b3; stroke-width: 2.25; marker-end: url(#arrow); }
+      .edge-both { fill: none; stroke: #98a2b3; stroke-width: 2.25; marker-start: url(#arrow); marker-end: url(#arrow); }
+      .heading { fill: #101828; font: 600 30px "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-anchor: middle; }
+      .zone-heading { fill: #344054; font: 600 24px "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-anchor: middle; }
+      .label { fill: #101828; font: 500 23px "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-anchor: middle; dominant-baseline: middle; }
+      .small { fill: #344054; font: 400 19px "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-anchor: middle; dominant-baseline: middle; }
+      .tiny { fill: #475467; font: 400 15px "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-anchor: middle; }
     </style>
   </defs>
 
-  <rect class="frame" x="25" y="25" width="1750" height="820" rx="12"/>
-  <line x1="700" y1="25" x2="700" y2="845" stroke="#d0d5dd" stroke-width="2"/>
+  <rect class="frame" x="20" y="20" width="1560" height="570" rx="12"/>
+  <line x1="600" y1="20" x2="600" y2="590" stroke="#d0d5dd" stroke-width="2"/>
 
   <g aria-label="BIO-3 physical plan">
-    <text class="heading" x="355" y="75">1. BIO-3 Physical Plan</text>
+    <text class="heading" x="355" y="70">BIO-3 Physical Plan</text>
 
-    <rect class="cpu" x="225" y="115" width="260" height="64" rx="10"/>
-    <text class="label" x="355" y="148">Project</text>
+    <rect class="cpu" x="190" y="100" width="230" height="52" rx="9"/>
+    <text class="label" x="305" y="127">Project</text>
 
-    <rect class="gpu" x="225" y="230" width="260" height="64" rx="10"/>
-    <text class="label" x="355" y="263">AnchoredJoin</text>
+    <rect class="gpu" x="190" y="190" width="230" height="52" rx="9"/>
+    <text class="label" x="305" y="217">AiJoin</text>
 
-    <rect class="gpu" x="55" y="370" width="280" height="64" rx="10"/>
-    <text class="label" x="195" y="403">PackedFilter</text>
+    <rect class="gpu" x="45" y="305" width="230" height="52" rx="9"/>
+    <text class="label" x="160" y="332">AiFilter</text>
 
-    <rect class="input" x="395" y="370" width="260" height="64" rx="10"/>
-    <text class="small" x="525" y="393">DocumentInput</text>
-    <text class="small" x="525" y="417">reaction terms</text>
+    <rect class="input" x="325" y="305" width="230" height="52" rx="9"/>
+    <text class="small" x="440" y="322">Scan</text>
+    <text class="small" x="440" y="342">reaction terms</text>
 
-    <rect class="input" x="55" y="510" width="280" height="64" rx="10"/>
-    <text class="small" x="195" y="533">DocumentInput</text>
-    <text class="small" x="195" y="557">medical reports</text>
+    <rect class="input" x="45" y="420" width="230" height="52" rx="9"/>
+    <text class="small" x="160" y="437">Scan</text>
+    <text class="small" x="160" y="457">medical reports</text>
 
-    <path class="edge" d="M 355 230 L 355 185"/>
-    <path class="edge" d="M 195 370 C 195 330, 280 330, 320 299"/>
-    <path class="edge" d="M 525 370 C 525 330, 430 330, 390 299"/>
-    <path class="edge" d="M 195 510 L 195 440"/>
+    <path class="edge" d="M 305 190 L 305 158"/>
+    <path class="edge" d="M 160 305 C 160 275, 240 275, 275 247"/>
+    <path class="edge" d="M 440 305 C 440 275, 370 275, 335 247"/>
+    <path class="edge" d="M 160 420 L 160 363"/>
   </g>
 
   <g aria-label="Execution engine">
-    <text class="heading" x="1235" y="75">Execution Engine</text>
+    <text class="heading" x="1090" y="70">Execution Engine</text>
 
-    <rect class="cpu-zone" x="735" y="105" width="590" height="705" rx="12"/>
-    <text class="zone-heading" x="1030" y="142">CPU</text>
+    <rect class="cpu-zone" x="630" y="90" width="560" height="465" rx="12"/>
+    <text class="zone-heading" x="910" y="120">CPU</text>
 
-    <rect class="gpu-zone" x="1360" y="105" width="380" height="705" rx="12"/>
-    <text class="zone-heading" x="1550" y="142">GPU</text>
+    <rect class="gpu-zone" x="1220" y="90" width="330" height="465" rx="12"/>
+    <text class="zone-heading" x="1385" y="120">GPU</text>
 
-    <rect class="input" x="775" y="165" width="510" height="60" rx="10"/>
-    <text class="label" x="1030" y="196">2. Tokenize Documents</text>
+    <rect class="input" x="665" y="140" width="490" height="50" rx="9"/>
+    <text class="label" x="920" y="166">Tokenize Documents</text>
 
-    <rect class="cpu" x="775" y="265" width="510" height="64" rx="10"/>
-    <text class="label" x="1030" y="298">Physical Plan Executor</text>
+    <rect class="cpu" x="665" y="225" width="490" height="52" rx="9"/>
+    <text class="label" x="910" y="252">Physical Plan Executor</text>
 
-    <rect class="cpu" x="775" y="375" width="510" height="220" rx="10"/>
-    <text class="label" x="1030" y="411">4. PackedFilter Scheduler</text>
-    <line x1="800" y1="438" x2="1260" y2="438" stroke="#a5b4c8" stroke-width="2"/>
-    <text class="label" x="1030" y="472">5. AnchoredJoin Scheduler</text>
-    <line x1="800" y1="500" x2="1260" y2="500" stroke="#a5b4c8" stroke-width="2"/>
-    <text class="label" x="1030" y="530">Other Physical Operators</text>
-    <text class="small" x="1030" y="564">Project, Limit, Exchange, Recombine</text>
+    <rect class="cpu" x="665" y="315" width="490" height="145" rx="9"/>
+    <text class="label" x="920" y="343">AiFilter Execution</text>
+    <line x1="690" y1="366" x2="1130" y2="366" stroke="#a5b4c8" stroke-width="2"/>
+    <text class="label" x="920" y="391">AiJoin Execution</text>
+    <line x1="690" y1="414" x2="1130" y2="414" stroke="#a5b4c8" stroke-width="2"/>
+    <text class="small" x="910" y="438">Other: Project, Limit, Exchange, Recombine</text>
 
-    <rect class="cpu" x="775" y="680" width="510" height="64" rx="10"/>
-    <text class="label" x="1030" y="713">3. KV Manager</text>
+    <rect class="cpu" x="665" y="495" width="490" height="50" rx="9"/>
+    <text class="label" x="920" y="521">KV Manager</text>
 
-    <rect class="gpu" x="1400" y="165" width="300" height="60" rx="10"/>
-    <text class="label" x="1550" y="196">2. Model Copy</text>
+    <rect class="gpu" x="1250" y="140" width="270" height="50" rx="9"/>
+    <text class="label" x="1385" y="166">Model Copy</text>
 
-    <rect class="gpu" x="1400" y="375" width="300" height="126" rx="10"/>
-    <text class="label" x="1550" y="438">6. Model Forward Pass</text>
+    <rect class="gpu" x="1250" y="315" width="270" height="100" rx="9"/>
+    <text class="small" x="1385" y="351">Quail Inference Program</text>
+    <text class="small" x="1385" y="380">GPU operator graph</text>
 
-    <rect class="gpu" x="1400" y="680" width="300" height="64" rx="10"/>
-    <text class="label" x="1550" y="713">KV Pages in HBM</text>
+    <rect class="gpu" x="1250" y="495" width="270" height="50" rx="9"/>
+    <text class="label" x="1385" y="521">KV Pages in HBM</text>
 
-    <path class="edge-light" d="M 1030 231 L 1030 259"/>
-    <path class="edge-light" d="M 1030 335 L 1030 369"/>
-    <path class="edge-both" d="M 1291 438 L 1394 438"/>
-    <path class="edge-light" d="M 1291 712 L 1394 712"/>
-    <path class="edge-light" d="M 1550 231 L 1550 369"/>
-    <path class="edge-light" d="M 1550 674 L 1550 507"/>
+    <path class="edge-light" d="M 910 196 L 910 219"/>
+    <path class="edge-light" d="M 910 283 L 910 309"/>
+    <path class="edge-light" d="M 1161 350 L 1244 350"/>
+    <text class="tiny" x="1203" y="340">model input</text>
+    <path class="edge-light" d="M 1244 380 L 1161 380"/>
+    <text class="tiny" x="1203" y="398">scores</text>
+    <path class="edge-light" d="M 1161 520 L 1244 520"/>
+    <path class="edge-light" d="M 1385 196 L 1385 309"/>
+    <path class="edge-light" d="M 1385 489 L 1385 421"/>
   </g>
 </svg>

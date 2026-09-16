@@ -22,6 +22,7 @@ SQL = """
             'Does this review discuss the ending of the movie?\\n\\n{0}',
             r.review
         ),
+        -- Optional, but helps Quail reorder filters.
         {'selectivity': 0.25}
     )
     AND AI.IF(
