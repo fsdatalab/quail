@@ -957,10 +957,9 @@ Apple Silicon.</p>
 <p><strong>Use the full memory hierarchy for KV.</strong> Quail
 currently keeps reusable KV in GPU HBM or recomputes it. When the KV
 does not fit in HBM, we want to move it to host DRAM or local SSD and
-bring it back before reuse. If moving the KV would take longer than
-recomputing it, Quail should discard it instead. We also want automatic
-prefix caching across rows, so Quail can reuse KV for matching token
-prefixes from different documents.</p>
+bring it back before reuse. We also want automatic prefix caching across
+rows, so Quail can reuse KV for matching token prefixes from different
+documents.</p>
 <p><strong>Improve model FLOP/S utilization.</strong> Quail currently
 relies on DeepGEMM and FlashAttention for its main GPU kernels. We have
 not optimized the kernels themselves, and we are stoked to be working
@@ -1021,8 +1020,8 @@ every reusable document token receives the cached rate.<a href="#fnref6"
 class="footnote-back" role="doc-backlink">↩︎</a></p></li>
 <li id="fn7"><p><a
 href="https://github.com/marcelroed/gigatoken">Gigatoken</a> is a fast
-tokenizer from the Doubleword team.<a href="#fnref7"
-class="footnote-back" role="doc-backlink">↩︎</a></p></li>
+tokenizer by Marcel Rød.<a href="#fnref7" class="footnote-back"
+role="doc-backlink">↩︎</a></p></li>
 <li id="fn8"><p>Kernel fusion can substantially improve prefill MFU. In
 <a href="https://www.sailresearch.com/blog/tpu-v6e-gemma">“Chasing Speed
 of Light on TPU v6e”</a>, Sail Research reports increasing Gemma 4 31B
