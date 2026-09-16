@@ -981,9 +981,9 @@ larger model on the same GPU.</p>
 <p><strong>Use proxy models for query planner hints.</strong> Proxy
 models need not be limited to evaluating predicates during execution.
 They could also provide planner hints. For example, a proxy model could
-predict which documents will pass later filters, helping Quail choose
-the filter order and decide which KV to retain. Errors in the proxy
-model would not affect query accuracy, which is nice.</p>
+predict which documents will pass filters, helping with filter ordering
+and KV retention. Errors in the proxy model would not affect query
+accuracy, which is nice.</p>
 <p>More blog posts, and eventually a technical report, are coming soon.
 For now, please try Quail out! And if any of the ideas above sound
 interesting, apply to a Computer Science PhD program at Carnegie Mellon!
