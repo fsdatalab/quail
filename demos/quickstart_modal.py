@@ -21,7 +21,7 @@ IMAGE_REQUIREMENTS = (
     "huggingface-hub==1.27.0",
     "pyarrow==25.0.1",
     "numpy==2.3.5",
-    "bpe-qwen==0.1.5",
+    "gigatoken==0.10.0",
     "datasets==5.0.1",
     "vllm==0.26.0",
 )
