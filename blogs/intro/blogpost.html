@@ -958,18 +958,22 @@ optimization.</p>
 good to train specialized models for filters and joins. <a
 href="https://arxiv.org/abs/2603.15970">Google’s work on lightweight
 proxy models for AI-SQL</a> suggests small filter models can reduce cost
-substantially. For joins, you may have realized our current algorithm is
-a <em>KV-aware nested loop join</em>: Quail reuses each anchor’s KV, but
-recomputes every partner for each new anchor. A specialized join model
-could instead use the same build and probe structure as a hash join.
-Quail would encode each row from the <em>build side</em> once and retain
-the representations in GPU memory. Quail would then encode each row from
-the <em>probe side</em> once and compare it with the stored build
-representations using a small scoring layer. Because the query planner
-may choose either relation as the build side, the model must give the
-same answer for <code>(left, right)</code> and
-<code>(right, left)</code>. One systems question is how to run and train
-many specialized models alongside a larger model on the same GPU.</p>
+substantially. In a hash join, the database builds an in-memory hash
+table over one relation, called the <em>build side</em>, then looks up
+matches for each row from the other relation, called the <em>probe
+side</em>. Each row is processed once. Quail cannot follow a similar
+plan with an ordinary LLM because the model state for each partner
+depends on the preceding anchor. Quail must recompute every partner for
+each new anchor. We want to train a specialized join model to encode
+each document independently and map matching documents to comparable
+representations. Quail could build an in-memory index from the <em>build
+side</em> representations, then find matches for each <em>probe
+side</em> representation without a full model forward pass for every
+document pair. Because the query planner may choose either relation as
+the <em>build side</em>, training should produce the same match score
+for <code>(left, right)</code> and <code>(right, left)</code>. One
+systems question is how to run and train many specialized models
+alongside a larger model on the same GPU.</p>
 <p>More blog posts, and eventually a technical report, are coming soon.
 For now, please try Quail out! If any of the ideas above sound
 interesting, please reach out! We are hiring PhD students and
