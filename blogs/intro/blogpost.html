@@ -942,6 +942,13 @@ or <code>FALSE</code>, and are 100% prefill. As we add operators such as
 <code>AI_EXTRACT</code> and <code>AI_CLASSIFY</code>, which require
 decode, we’ll need to adapt our cost models and execution
 strategies.</p>
+<p><strong>Explore more physical plans for existing operators.</strong>
+For example, for filter operators, Quail currently evaluates predicates
+sequentially. Sequential execution is likely cheaper when an early
+filter is selective. With many low-selectivity filters, meaning most
+documents pass, treating the prompts as the other side of a join may be
+cheaper and could benefit from Quail’s join-specific attention. It would
+be interesting to formalize the tradeoff in the cost model.</p>
 <p><strong>Support more models and hardware.</strong> Quail currently
 supports Qwen3 4B FP8 and Qwen3 32B FP8 on H100 GPUs. We want to add
 more models, including hybrid models such as Qwen3.5 and Liquid models.
