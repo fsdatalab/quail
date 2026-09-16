@@ -748,6 +748,11 @@ total.</li>
 vLLM baseline on 31. <strong>Quail’s mean speedup is 1.92×, its median
 speedup is 1.43×, and its largest speedup is 10.04× on
 BIO-2.</strong></p>
+<p>Quail’s total runtime across the 33 queries is 1,549.92 seconds,
+compared with 443.51 seconds for the combined speed of light estimates.
+<strong>Quail is 3.49× the estimate in aggregate, and the median query
+is 2.59× the estimate.</strong> The ratio ranges from 1.84× on BIO-3 to
+53.03× on LEP-5, whose estimate is only 0.49 seconds.</p>
 <p>Quail has less KV regret on 27 queries and ties on FEV-1. Quail has
 slightly more KV regret on BIO-1, LEP-1, and IMDB-1, where the
 difference is at most 288 tokens. The two large exceptions are AGENT-1

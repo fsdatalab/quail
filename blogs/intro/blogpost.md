@@ -378,6 +378,8 @@ We chose the parameters above by running the benchmark queries. Increasing the b
 
 Across all 33 queries at size 0.1, Quail is faster than the pipelined vLLM baseline on 31. **Quail's mean speedup is 1.92×, its median speedup is 1.43×, and its largest speedup is 10.04× on BIO-2.**
 
+Quail's total runtime across the 33 queries is 1,549.92 seconds, compared with 443.51 seconds for the combined speed of light estimates. **Quail is 3.49× the estimate in aggregate, and the median query is 2.59× the estimate.** The ratio ranges from 1.84× on BIO-3 to 53.03× on LEP-5, whose estimate is only 0.49 seconds.
+
 Quail has less KV regret on 27 queries and ties on FEV-1. Quail has slightly more KV regret on BIO-1, LEP-1, and IMDB-1, where the difference is at most 288 tokens. The two large exceptions are AGENT-1 and AGENT-2. For each, Quail has 11.86 million more KV regret tokens because it does not yet reuse matching prefixes across different rows. Section 4.4 examines AGENT-1 in detail.
 
 ## 4.3 BIO-3: Where Quail Wins
