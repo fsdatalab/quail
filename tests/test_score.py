@@ -2,7 +2,6 @@
 
 from types import SimpleNamespace
 
-import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -11,12 +10,10 @@ import quail
 from quail.catalog import Catalog, DocumentProvider
 from quail.execution.execute import execute_query
 from quail.execution.reranker import (
-    Qwen3VllmReranker,
     RerankerBatch,
     RerankerModelExecution,
     ScoreFilterRuntime,
     compare_score,
-    normalized_yes_score,
 )
 from quail.execution.runner import (
     ExecutionContext,
@@ -109,45 +106,11 @@ def test_score_rejects_unnamed_or_uncompared_calls(catalog, sql):
         compile_sql(sql, catalog, _tokens)
 
 
-def test_yes_score_normalization_and_comparisons():
-    assert normalized_yes_score(0.0) == 0.5
-    assert normalized_yes_score(1000.0) == 1.0
-    assert normalized_yes_score(-1000.0) == 0.0
+def test_score_comparisons():
     assert compare_score(0.7, ">=", 0.7)
     assert compare_score(0.7, "<=", 0.7)
     assert compare_score(0.7, ">", 0.6)
     assert compare_score(0.7, "<", 0.8)
-
-
-def test_vllm_adapter_subtracts_cached_tokens(monkeypatch):
-    monkeypatch.setitem(
-        __import__("sys").modules,
-        "vllm",
-        SimpleNamespace(PoolingParams=lambda **_kwargs: object()),
-    )
-    outputs = [
-        SimpleNamespace(
-            outputs=SimpleNamespace(data=SimpleNamespace(item=lambda: 0.0)),
-            prompt_token_ids=range(10),
-            num_cached_tokens=4,
-        ),
-        SimpleNamespace(
-            outputs=SimpleNamespace(data=SimpleNamespace(item=lambda: 1.0)),
-            prompt_token_ids=range(8),
-            num_cached_tokens=3,
-        ),
-    ]
-    def encode(prompts, **kwargs):
-        assert prompts == [{"prompt_token_ids": [1, 2]}]
-        assert all(type(token) is int
-                   for token in prompts[0]["prompt_token_ids"])
-        assert kwargs["pooling_task"] == "classify"
-        return outputs
-
-    llm = SimpleNamespace(encode=encode)
-    batch = Qwen3VllmReranker(llm).score([np.array([1, 2], dtype=np.int32)])
-    assert batch.fresh_tokens == 11
-    assert batch.cached_tokens == 7
 
 
 def test_projection_only_plan_does_not_filter(catalog):
@@ -239,9 +202,15 @@ class _FakeReranker:
     def __init__(self, scores):
         self.scores = tuple(scores)
 
-    def score(self, prompts):
-        self.prompts = prompts
-        assert len(prompts) == len(self.scores)
+    def score(self, spec, rows, documents):
+        self.prompts = []
+        for row in rows:
+            tokens = list(spec.prompt_token_parts[0])
+            for index, alias in enumerate(spec.aliases):
+                tokens.extend(documents[alias][row[index]])
+                tokens.extend(spec.prompt_token_parts[index + 1])
+            self.prompts.append(tokens)
+        assert len(rows) == len(self.scores)
         return RerankerBatch(self.scores, fresh_tokens=12, cached_tokens=3)
 
 
@@ -391,8 +360,96 @@ def test_score_assembles_stored_document_tokens(catalog, pair):
         ["Is this document relevant to refund?",
          "Is this document relevant to shipping?"] if pair else ["Refund?"]
     )
-    assert model.reranker.prompts == [
+    assert [list(prompt) for prompt in model.reranker.prompts] == [
         list(render_qwen3_reranker_input(text, document))
         for text in queries for document in ("refund please", "all good")
     ]
+    session.close()
+
+
+def test_score_cost_reuses_anchor_prefixes():
+    from quail.cost.work import ask, scan
+    from quail.planner.reranker import _score_work
+
+    # Two query documents, three candidates each, and a shared prompt.
+    work = _score_work(
+        6, 15, 9, prefix_tokens=17, groups=2, shared_tokens=3,
+    )
+    expected = scan(0, 24) + ask(3, 21) + ask(17, 7) * 4
+    assert work == expected
+    assert _score_work(0, 15, 9).tokens == 0
+
+
+
+
+def test_native_score_uses_shared_prefix_and_preserves_pair_order(monkeypatch):
+    from quail.backends.quail.executor import score as module
+    from quail.execution.tokens import TokenView
+
+    documents = {
+        "a": [TokenView(pa.array([10, 11], type=pa.int32()))],
+        "b": [TokenView(pa.array([20], type=pa.int32())),
+              TokenView(pa.array([30], type=pa.int32()))],
+    }
+    spec = SimpleNamespace(
+        name="score", aliases=("a", "b"),
+        prompt_token_parts=((1,), (2,), (3,)),
+    )
+    state = dict(torch=object(), arena=object(), pipeline=object(),
+                 async_answers=SimpleNamespace(ans=object()), chunk_tokens=1234)
+    monkeypatch.setattr(module, "AsyncScores", lambda *args: object())
+
+    def run(*args, **kwargs):
+        prefixes, suffixes, budget = args[4:7]
+        assert budget == 1234
+        assert list(prefixes[0]) == [1, 10, 11, 2]
+        assert prefixes[0].token_parts[1] is documents["a"][0]
+        assert [list(part) for part in suffixes[0]] == [[30, 3], [20, 3]]
+        return [{0: [0.9, 0.2]}], [], 8
+
+    monkeypatch.setattr(module, "run_join", run)
+    result = module.QuailScorer(state).score(spec, [(0, 1), (0, 0)], documents)
+    assert result.scores == (0.9, 0.2)
+    assert result.fresh_tokens == 8
+    assert result.cached_tokens == 4
+
+
+def test_distributed_score_preserves_rows_and_keeps_anchors_together(catalog):
+    from quail.backends.quail.distributed import DistributedQuailExecution
+
+    session = _session(catalog, gpus=2)
+    query = session.sql(
+        "SELECT AI.SCORE(PROMPT('Is {1} relevant to {0}?', q.text, d.body)) "
+        "AS score FROM queries q CROSS JOIN documents d"
+    )
+    request = query._prepare_physical()
+    node = next(node for node in query.plan().nodes if isinstance(node, AiScore))
+    execution = DistributedQuailExecution.__new__(DistributedQuailExecution)
+    execution.docs = {
+        scan.alias: request.inputs[scan.input_id].documents
+        for scan in query.plan().nodes if scan.type_name == "quail.scan"
+    }
+    execution.gpu_count = 2
+
+    def run(kind, subs):
+        assert kind == "scores"
+        results = []
+        for worker, sub in enumerate(subs):
+            rows = sub["inputs"]["score_rows"]
+            assert all(row[0] % 2 == worker for row in rows)
+            model = RerankerModelExecution.__new__(RerankerModelExecution)
+            model.documents = execution.docs
+            model.reranker = _FakeReranker([a / 2 + b / 4 for a, b in rows])
+            results.append(model.execute_rows(node, rows))
+        return results
+
+    execution.round_fn = run
+    result = execution.execute(node, {port.name: [1, 0] for port in node.inputs})
+    assert result.outputs["scores"].to_pylist() == [
+        {"q": 1, "d": 1, "score": 0.75},
+        {"q": 1, "d": 0, "score": 0.5},
+        {"q": 0, "d": 1, "score": 0.25},
+        {"q": 0, "d": 0, "score": 0.0},
+    ]
+    assert result.metrics.evaluated_document_pairs == 4
     session.close()

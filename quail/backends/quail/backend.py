@@ -11,10 +11,7 @@ from quail.backends.quail.executor import loop
 from quail.backends.quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
 from quail.backends.quail.graph import filter_result, stage_partner_lists
 from quail.backends.quail.worker import execute_quail_request, prepare_quail_request
-from quail.execution.reranker import (
-    execute_reranker_request,
-    prepare_reranker_request,
-)
+from quail.execution.reranker import RerankerModelExecution
 from quail.execution.runner import NodeMetrics, NodeResult, SurvivorStream
 from quail.execution.tokens import DocumentKeys
 from quail.logical import SHARED_PRE, ScoreExpression
@@ -66,6 +63,23 @@ class QuailModelExecution:
         node: PhysicalNode,
         inputs: Mapping[str, Any],
     ) -> Any:
+        if isinstance(node, AiScore):
+            from quail.backends.quail.executor.score import QuailScorer
+
+            execution = RerankerModelExecution(GpuContext(
+                gpu_index=self.context.gpu_index,
+                gpu_count=self.context.gpu_count,
+                model=self.context.model, device=self.context.device,
+                query_settings={
+                    "documents": inputs["documents"],
+                    "reranker": QuailScorer(self._state),
+                },
+            ))
+            if "score_rows" in inputs:
+                return execution.execute_rows(
+                    node, inputs["score_rows"], inputs.get("prior")
+                )
+            return execution.execute(node, inputs["score_inputs"])
         if not isinstance(node, (AiFilter, AiJoin)):
             raise TypeError(
                 f"Quail cannot execute physical node {node.type_name!r}")
@@ -424,19 +438,8 @@ class QuailBackend:
 
     def prepare_request(self, context) -> None:
         """Boot the GPU for a request before its documents are ready."""
-        if any(
-            isinstance(node, AiScore)
-            for node in context.graph.nodes
-        ):
-            prepare_reranker_request(context)
-            return
         prepare_quail_request(context)
 
     def execute_request(self, context) -> Any:
         """Run one Quail request inside a compute process."""
-        if any(
-            isinstance(node, AiScore)
-            for node in context.graph.nodes
-        ):
-            return execute_reranker_request(context, backend_name=self.name)
         return execute_quail_request(context)

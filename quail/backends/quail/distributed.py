@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
+
+import pyarrow as pa
 
 from quail.backends.quail import coordinator
 from quail.backends.quail.graph import executed_join_plan, model_answers
 from quail.execution.pairs import columns_key
+from quail.execution.reranker import RerankerModelExecution
 from quail.execution.runner import (
     ExecutionContext,
     GenericRunner,
@@ -20,6 +24,7 @@ from quail.execution.types import export_physical_outputs
 from quail.physical import (
     AiFilter,
     AiJoin,
+    AiScore,
     PhysicalGraph,
     Scan,
 )
@@ -78,12 +83,43 @@ class DistributedQuailExecution:
         return dict(self.payload)
 
     def execute(self, node, inputs):
+        if isinstance(node, AiScore):
+            return self._execute_score(node, inputs)
         if isinstance(node, AiFilter):
             return self._execute_filter(node, inputs)
         if isinstance(node, AiJoin):
             return self._execute_join(node, inputs)
         raise TypeError(
             f"distributed Quail cannot execute {node.type_name!r}")
+
+    def _execute_score(self, node, inputs):
+        rows, prior = RerankerModelExecution._candidate_rows(node, inputs)
+        shards = [[] for _ in range(self.gpu_count)]
+        for position, row in enumerate(rows):
+            shards[row[0] % self.gpu_count].append(position)
+        subs = [{
+            "node": node,
+            "inputs": {
+                "score_rows": [rows[index] for index in indices],
+                "prior": None if prior is None else prior.take(
+                    pa.array(indices, type=pa.int64())
+                ),
+                "documents": self.docs,
+            },
+        } for indices in shards]
+        started = time.perf_counter()
+        results = self.round_fn("scores", subs)
+        combined = pa.concat_tables([result.outputs["scores"] for result in results])
+        positions = [index for indices in shards for index in indices]
+        order = sorted(range(len(positions)), key=positions.__getitem__)
+        combined = combined.take(pa.array(order, type=pa.int64()))
+        metrics = NodeMetrics()
+        for result in results:
+            metrics += result.metrics
+        return NodeResult({"scores": combined}, replace(
+            metrics, wall_s=time.perf_counter() - started,
+            extension={"output": node.spec.name, "input_rows": len(rows)},
+        ))
 
     def begin(self):
         """Start a query that has no filter node."""
@@ -385,7 +421,19 @@ def execute_distributed_graph(payload, graph: PhysicalGraph, gpu_count: int,
         _outputs=export_physical_outputs(compute_subgraph(graph), result),
         wall_s=round(elapsed, 2),
         fresh_tokens=result.metrics.fresh_tokens,
+        cached_tokens=result.metrics.cached_tokens,
+        evaluated_documents=result.metrics.evaluated_documents,
+        evaluated_document_pairs=result.metrics.evaluated_document_pairs,
+        usd_per_query=elapsed / 3600 * gpu_count * (device.usd_per_hour or 0),
+        backend_metrics={"scores": [
+            dict(value.metrics.extension)
+            for node_id, value in result.nodes.items()
+            if graph.node(node_id).type_name == AiScore.type_name
+        ]},
         executed_join_plan=executed_join_plan(graph),
         node_metrics=scalar_node_metrics(result.nodes),
     )
+    pairs = result.metrics.evaluated_document_pairs
+    key = "document_pairs_per_second" if pairs else "documents_per_second"
+    report[key] = (pairs or result.metrics.evaluated_documents) / max(elapsed, 1e-9)
     return report

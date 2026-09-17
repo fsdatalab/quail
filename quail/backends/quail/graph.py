@@ -180,6 +180,8 @@ def filter_inputs(state, node, document_ids) -> dict:
 
 def prepare_model_inputs(node, inputs, context: ExecutionContext):
     """Prepare Quail scheduler inputs from typed port values."""
+    if isinstance(node, AiScore):
+        return {"score_inputs": inputs, "documents": context.state["docs"]}
     if not isinstance(node, (AiFilter, AiJoin)):
         return inputs
     return {
@@ -409,11 +411,23 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
         "_outputs": export_physical_outputs(compute_subgraph(graph), result),
         "wall_s": round(wall, 2),
         "fresh_tokens": result.metrics.fresh_tokens,
+        "cached_tokens": result.metrics.cached_tokens,
+        "evaluated_documents": result.metrics.evaluated_documents,
+        "evaluated_document_pairs": result.metrics.evaluated_document_pairs,
+        "usd_per_query": wall / 3600 * (state["device"].usd_per_hour or 0),
+        "backend_metrics": {"scores": [
+            dict(value.metrics.extension)
+            for node_id, value in result.nodes.items()
+            if graph.node(node_id).type_name == AiScore.type_name
+        ]},
         "node_metrics": scalar_node_metrics(result.nodes),
         "executed_join_plan": executed_join_plan(graph),
         "kv_manager": kv_manager,
         "peak_gib": round(torch.cuda.max_memory_allocated() / 2**30, 2),
     }
+    pairs = result.metrics.evaluated_document_pairs
+    key = "document_pairs_per_second" if pairs else "documents_per_second"
+    report[key] = (pairs or result.metrics.evaluated_documents) / max(wall, 1e-9)
     if state.get("gpu_timing"):
         # seconds a forward chunk was running on the GPU, summed over
         # the model nodes; wall_s minus this is time the GPU sat idle

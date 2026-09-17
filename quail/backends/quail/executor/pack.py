@@ -148,7 +148,10 @@ class JoinAdmission:
 
     def __init__(self, prefix_tokens, stage_suffixes, chunk_budget,
                  arena_pages, page_tokens, frame_tokens=None,
-                 resident=None, anchor_partners=None):
+                 resident=None, anchor_partners=None, temporary_suffix_pages=False):
+        self.temporary_suffix_pages = temporary_suffix_pages
+        self._page_cums = {}
+        self._page_reserve = 0
         self.prefix = []
         self.stages = [list(s) for s in stage_suffixes]
         self.frames = (list(frame_tokens) if frame_tokens
@@ -268,6 +271,16 @@ class JoinAdmission:
                 f"anchor {a}: prefix {prefix} tokens leaves no "
                 f"room for a partner in a {self.chunk_budget}-token "
                 f"chunk")
+        if self.temporary_suffix_pages:
+            largest = max(
+                (self._suffix_page_cost(a, j, i)
+                 for j in range(k) for i in range(self._count(a, j))),
+                default=0,
+            )
+            needed = pages_for(prefix + self._extra, self.page_tokens) + largest
+            if needed > self.arena_pages:
+                raise ValueError("anchor and one suffix exceed the KV arena")
+            self._page_reserve = max(self._page_reserve, largest)
         self._first.append(first)
         self._min_fresh = min(self._min_fresh, carried + first)
         if not need:
@@ -325,12 +338,27 @@ class JoinAdmission:
     def _first_cost(self, a, j, i):
         return self._suffix(a, j, i) + (self.frames[j] if i == 0 else 0)
 
-    def _take(self, a, j, i, room):
-        """(end, tokens): the longest partner run from i that fits."""
+    def _suffix_page_cost(self, a, j, i):
+        remainder = (self.prefix[a] + self.frames[j]) % self.page_tokens
+        return pages_for(remainder + self._suffix(a, j, i), self.page_tokens)
+
+    def _take(self, a, j, i, room, page_room):
+        """Return the partner run that fits the token and temporary page budgets."""
         cum = self._cum_of(a, j)
         frame = self.frames[j] if i == 0 else 0
         end = bisect_right(cum, cum[i] + room - frame) - 1
-        return end, frame + cum[end] - cum[i]
+        pages = 0
+        if self.temporary_suffix_pages:
+            key = (a, j)
+            if key not in self._page_cums:
+                costs = [0]
+                for index in range(self._count(a, j)):
+                    costs.append(costs[-1] + self._suffix_page_cost(a, j, index))
+                self._page_cums[key] = costs
+            costs = self._page_cums[key]
+            end = min(end, bisect_right(costs, costs[i] + page_room) - 1)
+            pages = costs[end] - costs[i]
+        return end, frame + cum[end] - cum[i], pages
 
     def _launch(self, a, j, end):
         """Record a launched group; True when the stream continues."""
@@ -352,6 +380,7 @@ class JoinAdmission:
         room = self.chunk_budget
         groups = []
         continued = []
+        temporary_pages = 0
         # 1) placed anchors: cut streams (front) and next-stage starts
         for _ in range(len(self.ready)):
             a = self.ready.popleft()
@@ -359,7 +388,13 @@ class JoinAdmission:
             if self._first_cost(a, j, i) > room:
                 self.ready.appendleft(a)    # FIFO; chunk nearly full
                 break
-            end, tokens = self._take(a, j, i, room)
+            end, tokens, pages = self._take(a, j, i, room, free_pages)
+            if end == i:
+                self.blocked_pages = self._suffix_page_cost(a, j, i) - free_pages
+                self.ready.appendleft(a)
+                break
+            free_pages -= pages
+            temporary_pages += pages
             groups.append((a, j, i, end, False))
             room -= tokens
             if self._launch(a, j, end):
@@ -375,9 +410,10 @@ class JoinAdmission:
                 if not self._zero_cost:
                     break
                 continue
-            if need > free_pages:
+            required = need + max(0, self._page_reserve - temporary_pages)
+            if required > free_pages:
                 blocked = True
-                self.blocked_pages = need - free_pages
+                self.blocked_pages = required - free_pages
                 held.append(a)
                 if not self._zero_cost:
                     break
@@ -386,10 +422,17 @@ class JoinAdmission:
             if carried + self._first[a] > room:
                 held.append(a)      # chunk room only; retry next chunk
                 continue
-            end, tokens = self._take(a, 0, 0, room - carried)
+            end, tokens, pages = self._take(
+                a, 0, 0, room - carried, free_pages - need)
+            if end == 0:
+                held.append(a)
+                self.blocked_pages = (
+                    need + self._suffix_page_cost(a, 0, 0) - free_pages)
+                break
+            temporary_pages += pages
             groups.append((a, 0, 0, end, carried > 0))
             room -= carried + tokens
-            free_pages -= need
+            free_pages -= need + pages
             if not need:
                 self._zero_cost -= 1
             self._stage[a] = 0

@@ -1,5 +1,7 @@
 """Physical planning for numeric AI.SCORE expressions."""
 
+import math
+
 from quail.cost import budgets
 from quail.cost.sol import speed_of_light
 from quail.cost.work import Work, triangle
@@ -49,13 +51,36 @@ def _query_template(prompt) -> str:
     raise ValueError("AI.SCORE supports one document or one document pair")
 
 
-def _score_work(count, mean_tokens, fixed_tokens) -> Work:
+def _score_work(count, mean_tokens, fixed_tokens, *, variance=0.0,
+                prefix_tokens=0.0, prefix_variance=0.0, groups=0.0,
+                shared_tokens=0, copies=1) -> Work:
+    if count <= 0:
+        return Work()
     length = mean_tokens + fixed_tokens
-    return Work(
+    work = Work(
         tokens=length,
-        pairs=triangle(length),
+        pairs=triangle(length) + variance / 2,
         kv_written=length,
     ) * count
+    reused = max(0.0, count - groups)
+    work += Work(
+        tokens=-prefix_tokens,
+        pairs=-triangle(prefix_tokens) - prefix_variance / 2,
+        kv_written=-prefix_tokens,
+        kv_read=prefix_tokens,
+    ) * reused
+    shared_reuses = max(0.0, groups - copies)
+    return work + Work(
+        tokens=-shared_tokens,
+        pairs=-triangle(shared_tokens),
+        kv_written=-shared_tokens,
+        kv_read=shared_tokens,
+    ) * shared_reuses
+
+
+def _variance(lengths) -> float:
+    mean = sum(lengths) / max(1, len(lengths))
+    return sum((length - mean) ** 2 for length in lengths) / max(1, len(lengths))
 
 
 def _score_spec(
@@ -67,11 +92,9 @@ def _score_spec(
     context,
     chunk_tokens: int,
     pair_fraction: float = 1.0,
+    prefix_groups: float | None = None,
 ):
     query_template = _query_template(prompt)
-    fixed_tokens = len(context.tokenizer(
-        render_qwen3_reranker_input(query_template, "")
-    ))
     rendered = render_qwen3_reranker_input(query_template, "{document}")
     before, after = rendered.split("{document}")
     parts = (before, after)
@@ -79,9 +102,35 @@ def _score_spec(
         first, middle = before.split("{0}")
         parts = (first, middle, after)
     token_parts = tuple(tuple(context.tokenizer(part)) for part in parts)
-    work = _score_work(expected_inputs, mean_tokens, fixed_tokens)
+    aliases = _prompt_aliases(prompt)
+    lengths = [context.document_tokens[alias] for alias in aliases]
+    fixed_tokens = sum(map(len, token_parts))
+    shared = len(token_parts[0])
+    prefix = float(shared)
+    prefix_variance = 0.0
+    groups = min(float(context.gpu_count), expected_inputs)
+    capacity = budgets.arena_tokens(context.model, context.device, chunk_tokens)
+    if len(aliases) == 2:
+        prefix += sum(lengths[0]) / max(1, len(lengths[0])) + len(token_parts[1])
+        prefix_variance = _variance(lengths[0])
+        groups = min(
+            expected_inputs,
+            len(lengths[0]) if prefix_groups is None else prefix_groups,
+        )
+        longest = sum(max(values, default=0) for values in lengths) + fixed_tokens
+        if longest > capacity:
+            prefix = float(shared)
+            prefix_variance = 0.0
+            groups = min(float(context.gpu_count), expected_inputs)
+    work = _score_work(
+        expected_inputs, mean_tokens, fixed_tokens,
+        variance=sum(_variance(values) for values in lengths),
+        prefix_tokens=prefix, prefix_variance=prefix_variance,
+        groups=groups, shared_tokens=shared, copies=context.gpu_count,
+    )
     estimate = speed_of_light(
-        work, context.model, context.device, chunk_tokens
+        work * (1 / max(1, min(context.gpu_count, expected_inputs))),
+        context.model, context.device, chunk_tokens,
     ).seconds
     return ScoreSpec(
         name=name,
@@ -209,6 +258,7 @@ def plan_reranker(region, context, *, backend_name: str):
 
     chunk = budgets.chunk_budget(context.model, context.device)
     total_work = Work()
+    total_seconds = 0.0
     live = {alias: float(count) for alias, count in counts.items()}
     current = dict(scan_refs)
     scored_prompts = set()
@@ -221,8 +271,9 @@ def plan_reranker(region, context, *, backend_name: str):
         expected,
         mean,
         pair_fraction=1.0,
+        prefix_groups=None,
     ):
-        nonlocal score_index, total_work
+        nonlocal score_index, total_work, total_seconds
         spec, work = _score_spec(
             prompt,
             name=name,
@@ -231,6 +282,7 @@ def plan_reranker(region, context, *, backend_name: str):
             context=context,
             chunk_tokens=chunk,
             pair_fraction=pair_fraction,
+            prefix_groups=prefix_groups,
         )
         node = AiScore(
             node_id=f"ai-score:{score_index}",
@@ -242,6 +294,7 @@ def plan_reranker(region, context, *, backend_name: str):
         score_index += 1
         nodes.append(node)
         total_work += work
+        total_seconds += spec.estimated_seconds
         scored_prompts.add(prompt)
         return PortRef(node.node_id, "scores"), spec
 
@@ -299,6 +352,11 @@ def plan_reranker(region, context, *, backend_name: str):
         left, right = _prompt_aliases(pair_prompt)
         pair_fraction = context.pair_fractions.get(0, 1.0)
         expected = live[left] * live[right] * pair_fraction
+        touched = (
+            1.0 if pair_fraction >= 1 else
+            -math.expm1(live[right] * math.log1p(-pair_fraction))
+        )
+        prefix_groups = live[left] * touched
         projected_name = next(
             (score.name for score in projected if score.prompt == pair_prompt),
             "__score_join_0",
@@ -310,6 +368,7 @@ def plan_reranker(region, context, *, backend_name: str):
             expected,
             means[left] + means[right],
             pair_fraction,
+            prefix_groups=prefix_groups,
         )
         matching_join = next(
             (join for join in joins if join.predicate == pair_prompt), None
@@ -349,9 +408,7 @@ def plan_reranker(region, context, *, backend_name: str):
             count=logical.root.limit,
         ))
 
-    estimate = speed_of_light(
-        total_work, context.model, context.device, chunk
-    ).seconds
+    estimate = total_seconds
     plan = PhysicalPlan(
         model=context.model.name,
         device=context.device.name,
@@ -361,8 +418,16 @@ def plan_reranker(region, context, *, backend_name: str):
         nodes=tuple(nodes),
         settings={
             "chunk_tokens": chunk,
-            "runner": "pooling",
-            "batching": "vllm_dynamic",
+            "true_ids": list(context.tokenizer("yes")),
+            "false_ids": list(context.tokenizer("no")),
+            "retained_kv_tokens": budgets.arena_tokens(
+                context.model, context.device, chunk
+            ),
+            "prefix_reuse": "fixed prompt and first document within each score",
+            "survivor_assumption": "uniform independent selection",
+            "estimated_fresh_tokens": total_work.tokens,
+            "estimated_attention_pairs": total_work.pairs,
+            "batching": "token_based_admission",
             "data_parallel_copies": context.gpu_count,
             "score_normalization": "yes_no_softmax",
             "order_rule": "cost_per_expected_rejection",

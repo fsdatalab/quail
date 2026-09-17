@@ -738,3 +738,44 @@ def test_join_admission_admits_incrementally_and_prices_room():
     assert sched.buildable_tokens() == 100
     with pytest.raises(ValueError):
         sched.admit(5000)
+
+
+def test_unified_join_accounts_for_suffix_pages():
+    sched = JoinAdmission(
+        [31, 31], [[1, 1, 1, 1]], 256, 8, 16,
+        temporary_suffix_pages=True,
+    )
+    groups = sched.next_chunk(8)
+    prefix_pages = sum(2 for *_, carried in groups if carried)
+    suffix_pages = sum(end - start for _, _, start, end, _ in groups)
+    assert prefix_pages + suffix_pages <= 8
+    assert sum(end - start for _, _, start, end, _ in groups) < 8
+
+
+def test_unified_join_reserves_room_for_later_larger_suffix():
+    sched = JoinAdmission(
+        [16, 16, 16], [[1, 63]], 256, 6, 16,
+        temporary_suffix_pages=True,
+    )
+    free = 6
+    seen = 0
+    for _ in range(20):
+        if sched.done():
+            break
+        groups = sched.next_chunk(free)
+        assert groups
+        new = sum(1 for *_, carried in groups if carried)
+        temporary = sum(
+            pages_for(sched.stages[j][i], 16)
+            for _, j, start, end, _ in groups for i in range(start, end)
+        )
+        assert new + temporary <= free
+        free -= new
+        for a, j, start, end, _ in groups:
+            seen += end - start
+            for kind, _ in sched.report(a, j, start, end, [0.5] * (end - start)):
+                if kind == "finished":
+                    free += 1
+    assert sched.done()
+    assert seen == 6
+    assert free == 6

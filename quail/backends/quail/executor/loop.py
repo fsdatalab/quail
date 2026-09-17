@@ -452,7 +452,10 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         [[len(s) for s in sufs] for sufs in stage_suffixes],
         budget, arena.accounting.n_pages, arena.accounting.page_tokens,
         frame_tokens=[len(f) for f in frames], resident=resident,
-        anchor_partners={a: partners_of(keys[a]) for a in range(len(keys))})
+        anchor_partners={a: partners_of(keys[a]) for a in range(len(keys))},
+        temporary_suffix_pages=(
+            (attention_mode or pipeline.attention_mode) == "unified"),
+    )
     spans = []
     tokens = 0
     outstanding = []     # (groups, handle) in launch order
@@ -652,7 +655,9 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
     warm_docs, question, doc = _warm_inputs(budget)
     q_max = len(question)
     original_mode = pipeline.attention_mode
-    for mode in (FILTER_ATTENTION, JOIN_ATTENTION):
+    modes = ((FILTER_ATTENTION, JOIN_ATTENTION) if pipeline.is_fp8
+             else (FILTER_ATTENTION,))
+    for mode in modes:
         logger.debug("kernels: warming %s attention, full chunk", mode)
         pipeline.attention_mode = mode
         run_filter(torch, arena, pipeline, async_ans, warm_docs,
@@ -668,7 +673,8 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
                        [question], budget, arena_writes=True)
     if join_chunk:
         logger.debug("kernels: warming join forward pass")
-        pipeline.attention_mode = JOIN_ATTENTION
+        pipeline.attention_mode = (JOIN_ATTENTION if pipeline.is_fp8
+                                   else FILTER_ATTENTION)
         run_join(torch, arena, pipeline, async_ans, warm_docs,
                  [[question] * 8], budget)
     pipeline.attention_mode = original_mode
@@ -687,6 +693,10 @@ def compile_kernels(torch, arena, pipeline, async_ans, budget):
     config heuristic generator to enumerate every token count at
     which the chosen GEMM configuration changes.
     """
+    if not pipeline.is_fp8:
+        _forward_warm(torch, arena, pipeline, async_ans, budget,
+                      join_chunk=True)
+        return
     from vllm.model_executor.warmup.deep_gemm_warmup import (
         _generate_optimal_warmup_m_values,
     )

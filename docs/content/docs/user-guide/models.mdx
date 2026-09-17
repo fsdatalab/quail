@@ -18,11 +18,10 @@ The generation models use the Quail execution engine, including
 DeepGEMM for matrix multiplications and FlashAttention 3 for
 attention.
 
-The reranker models run `AI.SCORE` through Quail's vLLM pooling
-path. They compute one score per row or row pair without decoding
-tokens. Quail normalizes the model's YES and NO logits to a value
-from 0 to 1. This value is useful for comparisons, but it is not a
-calibrated probability.
+The reranker models use the same Quail executor for `AI.SCORE`.
+Weights, activations, and KV use BF16. The final `yes` and `no`
+projection and score normalization use FP32. Each input produces
+one score between 0 and 1 without generating tokens.
 
 ## GPUs
 

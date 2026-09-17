@@ -459,7 +459,7 @@ class AiScore(PhysicalNode):
         return {
             "backend": self.backend_name,
             "model": self.model,
-            "batching": "vllm_dynamic",
+            "batching": "token_based_admission",
             "output": None if spec is None else spec.name,
             "aliases": [] if spec is None else list(spec.aliases),
             "expected_inputs": 0 if spec is None else spec.expected_inputs,
