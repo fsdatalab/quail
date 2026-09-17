@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from dataclasses import replace
 
+import numpy as np
 import pyarrow as pa
 
 from quail.backends.quail import coordinator
@@ -94,29 +95,35 @@ class DistributedQuailExecution:
 
     def _execute_score(self, node, inputs):
         rows, prior = RerankerModelExecution._candidate_rows(node, inputs)
-        shards = [[] for _ in range(self.gpu_count)]
-        for position, row in enumerate(rows):
-            shards[row[0] % self.gpu_count].append(position)
-        subs = [{
-            "node": node,
-            "inputs": {
-                "score_rows": [rows[index] for index in indices],
-                "prior": None if prior is None else prior.take(
-                    pa.array(indices, type=pa.int64())
-                ),
-                "documents": self.docs,
-            },
-        } for indices in shards]
         started = time.perf_counter()
-        results = self.round_fn("scores", subs)
-        combined = pa.concat_tables([result.outputs["scores"] for result in results])
-        positions = [index for indices in shards for index in indices]
-        order = sorted(range(len(positions)), key=positions.__getitem__)
-        combined = combined.take(pa.array(order, type=pa.int64()))
+        tables = []
         metrics = NodeMetrics()
-        for result in results:
-            metrics += result.metrics
-        return NodeResult({"scores": combined}, replace(
+        offset = 0
+        for batch in rows.batches():
+            shards = [np.flatnonzero(batch[:, 0] % self.gpu_count == worker)
+                      for worker in range(self.gpu_count)]
+            subs = [{
+                "node": node,
+                "inputs": {
+                    "score_rows": batch[indices],
+                    "prior": None if prior is None else prior.take(
+                        pa.array(offset + indices, type=pa.int64())
+                    ),
+                },
+            } for indices in shards]
+            if not getattr(self, "score_documents_sent", False):
+                for sub in subs:
+                    sub["inputs"]["documents"] = self.docs
+                self.score_documents_sent = True
+            results = self.round_fn("scores", subs)
+            combined = pa.concat_tables(
+                [result.outputs["scores"] for result in results])
+            order = np.argsort(np.concatenate(shards))
+            tables.append(combined.take(pa.array(order, type=pa.int64())))
+            for result in results:
+                metrics += result.metrics
+            offset += len(batch)
+        return NodeResult({"scores": pa.concat_tables(tables)}, replace(
             metrics, wall_s=time.perf_counter() - started,
             extension={"output": node.spec.name, "input_rows": len(rows)},
         ))

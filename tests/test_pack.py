@@ -779,3 +779,19 @@ def test_unified_join_reserves_room_for_later_larger_suffix():
     assert sched.done()
     assert seen == 6
     assert free == 6
+
+
+
+def test_numeric_join_answers_preserve_values_across_chunks():
+    import numpy as np
+
+    sched = JoinAdmission([16], [[16, 16, 16, 16]], 48, 20, 16,
+                          answer_dtype=np.float32)
+    expected = np.array([0.0, 0.125, 0.5, 1.0], dtype=np.float32)
+    while not sched.done():
+        groups = sched.next_chunk(19)
+        assert groups
+        for a, j, start, end, _ in groups:
+            sched.report(a, j, start, end, expected[start:end])
+    assert sched.answers[0][0].dtype == np.float32
+    np.testing.assert_array_equal(sched.answers[0][0], expected)

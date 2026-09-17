@@ -15,6 +15,8 @@ from array import array
 from bisect import bisect_right
 from collections import deque
 
+import numpy as np
+
 
 def orient(mean_left_tokens, mean_right_tokens):
     """Which side anchors: the longer one.
@@ -148,7 +150,10 @@ class JoinAdmission:
 
     def __init__(self, prefix_tokens, stage_suffixes, chunk_budget,
                  arena_pages, page_tokens, frame_tokens=None,
-                 resident=None, anchor_partners=None, temporary_suffix_pages=False):
+                 resident=None, anchor_partners=None, temporary_suffix_pages=False,
+                 answer_dtype=None):
+        self.answer_dtype = answer_dtype
+        self._answer_counts = [{} for _ in stage_suffixes]
         self.temporary_suffix_pages = temporary_suffix_pages
         self._page_cums = {}
         self._page_reserve = 0
@@ -451,18 +456,30 @@ class JoinAdmission:
         before the last answered FALSE, so the anchor's pages can go;
         ("finished", a) when its last-stage row is complete.
         """
-        row = self.answers[j].setdefault(a, [])
-        if len(row) != start or len(bits) != end - start:
+        if self.answer_dtype is None:
+            row = self.answers[j].setdefault(a, [])
+            received = len(row)
+        else:
+            if a not in self.answers[j]:
+                self.answers[j][a] = np.empty(
+                    self._count(a, j), dtype=self.answer_dtype)
+            row = self.answers[j][a]
+            received = self._answer_counts[j].get(a, 0)
+        if received != start or len(bits) != end - start:
             raise AssertionError(
                 f"anchor {a} stage {j}: answers for partners "
-                f"{start}:{end} arrived with {len(row)} recorded")
-        row.extend(bits)
+                f"{start}:{end} arrived with {received} recorded")
+        if self.answer_dtype is None:
+            row.extend(bits)
+        else:
+            row[start:end] = bits
+            self._answer_counts[j][a] = end
         self.in_flight -= 1
-        if any(bits):
+        if (any(bits) if self.answer_dtype is None else np.any(bits)):
             self._true[a][j] = True
         k = len(self.stages)
         n_j = self._count(a, j)
-        complete = len(row) == n_j
+        complete = end == n_j
         events = []
         if j == self._stage[a] and j + 1 < k:
             if self._true[a][j] and self._next[a] == n_j:

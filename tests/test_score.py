@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -404,19 +405,25 @@ def test_native_score_uses_shared_prefix_and_preserves_pair_order(monkeypatch):
         assert budget == 1234
         assert list(prefixes[0]) == [1, 10, 11, 2]
         assert prefixes[0].token_parts[1] is documents["a"][0]
-        assert [list(part) for part in suffixes[0]] == [[30, 3], [20, 3]]
+        assert [list(part) for part in suffixes[0]] == [[20, 3], [30, 3]]
+        assert list(kwargs["anchor_partners"](("score", "score", 0))[0]) == [1, 0]
         return [{0: [0.9, 0.2]}], [], 8
 
     monkeypatch.setattr(module, "run_join", run)
     result = module.QuailScorer(state).score(spec, [(0, 1), (0, 0)], documents)
-    assert result.scores == (0.9, 0.2)
+    np.testing.assert_allclose(result.scores, [0.9, 0.2])
     assert result.fresh_tokens == 8
     assert result.cached_tokens == 4
 
 
-def test_distributed_score_preserves_rows_and_keeps_anchors_together(catalog):
+def test_distributed_score_preserves_rows_and_keeps_anchors_together(
+        catalog, monkeypatch):
     from quail.backends.quail.distributed import DistributedQuailExecution
+    from quail.execution.reranker import ScoreRows
 
+    batches = ScoreRows.batches
+    monkeypatch.setattr(ScoreRows, "batches", lambda self: batches(self, size=2))
+    rounds = []
     session = _session(catalog, gpus=2)
     query = session.sql(
         "SELECT AI.SCORE(PROMPT('Is {1} relevant to {0}?', q.text, d.body)) "
@@ -433,6 +440,8 @@ def test_distributed_score_preserves_rows_and_keeps_anchors_together(catalog):
 
     def run(kind, subs):
         assert kind == "scores"
+        assert all(("documents" in sub["inputs"]) == (not rounds) for sub in subs)
+        rounds.append(kind)
         results = []
         for worker, sub in enumerate(subs):
             rows = sub["inputs"]["score_rows"]
@@ -453,3 +462,29 @@ def test_distributed_score_preserves_rows_and_keeps_anchors_together(catalog):
     ]
     assert result.metrics.evaluated_document_pairs == 4
     session.close()
+
+
+
+def test_score_rows_bound_large_products_and_preserve_order():
+    from quail.execution.reranker import ScoreRows
+
+    rows = ScoreRows((np.arange(100_000), np.arange(100_000)), product=True)
+    assert len(rows) == 10_000_000_000
+    first = next(rows.batches(size=7))
+    np.testing.assert_array_equal(first, np.column_stack((np.zeros(7), np.arange(7))))
+    rows = ScoreRows((np.array([2, 0]), np.array([4, 1, 3])), product=True)
+    np.testing.assert_array_equal(np.concatenate(list(rows.batches(size=4))),
+                                  [[2, 4], [2, 1], [2, 3], [0, 4], [0, 1], [0, 3]])
+    empty = ScoreRows((np.empty(0, dtype=np.int32), np.arange(3)), product=True)
+    assert list(empty.batches())[0].shape == (0, 2)
+
+
+@pytest.mark.parametrize("comparison,expected", [
+    ("<", [True, False, False]), ("<=", [True, True, False]),
+    (">", [False, False, True]), (">=", [False, True, True]),
+])
+def test_score_comparison_keeps_arrow_values(comparison, expected):
+    scores = pa.chunked_array([[0.25, 0.5], [0.75]])
+    answer = compare_score(scores, comparison, 0.5)
+    assert isinstance(answer, pa.ChunkedArray)
+    assert answer.to_pylist() == expected
