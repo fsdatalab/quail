@@ -21,6 +21,7 @@ from quail.execution.runner import (
     compute_subgraph,
     scalar_node_metrics,
 )
+from quail.execution.tokens import select_documents
 from quail.execution.types import export_physical_outputs
 from quail.physical import (
     AiFilter,
@@ -106,8 +107,12 @@ class DistributedQuailExecution:
         subs = [{"node": node, "inputs": {"score_rows": batch}}
                 for batch in batches]
         if not self.score_documents_sent:
+            documents = {
+                alias: select_documents(docs, range(len(docs)))
+                for alias, docs in self.docs.items()
+            }
             for sub in subs:
-                sub["inputs"]["documents"] = self.docs
+                sub["inputs"]["documents"] = documents
             self.score_documents_sent = True
         return self.round_fn("scores", subs)
 

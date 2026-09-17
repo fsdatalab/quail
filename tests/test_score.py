@@ -419,6 +419,8 @@ def test_native_score_uses_shared_prefix_and_preserves_pair_order(monkeypatch):
 
 def test_distributed_score_preserves_rows_and_keeps_anchors_together(
         catalog, monkeypatch):
+    import pickle
+
     from quail.backends.quail.distributed import DistributedQuailExecution
     from quail.backends.quail.worker import quail_runtime_payload
     from quail.execution.reranker import ScoreRows
@@ -438,6 +440,7 @@ def test_distributed_score_preserves_rows_and_keeps_anchors_together(
     assert "pre_ids" not in payload and "filter_limit" not in payload
 
     def run(kind, subs):
+        subs = pickle.loads(pickle.dumps(subs))
         if kind == "filters":
             assert len(subs) == 2
             assert all(sub["start_query"] and sub["node_id"] is None
@@ -451,7 +454,11 @@ def test_distributed_score_preserves_rows_and_keeps_anchors_together(
             rows = sub["inputs"]["score_rows"]
             assert all(row[0] % 2 == worker for row in rows)
             model = RerankerModelExecution.__new__(RerankerModelExecution)
-            model.documents = execution.docs
+            model.documents = sub["inputs"].get("documents", execution.docs)
+            for alias, documents in model.documents.items():
+                assert [list(doc) for doc in documents] == [
+                    list(doc) for doc in execution.docs[alias]
+                ]
             model.reranker = _FakeReranker([a / 2 + b / 4 for a, b in rows])
             results.append(model.execute_rows(node, rows))
         return results
