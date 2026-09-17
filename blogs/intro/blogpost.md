@@ -13,6 +13,8 @@ But now, thanks to LLMs, database users can finally unlock insights from unstruc
 Major database vendors now support AI-SQL, including [Snowflake Cortex AISQL](https://docs.snowflake.com/en/user-guide/snowflake-cortex/aisql), [BigQuery AI functions](https://cloud.google.com/blog/products/data-analytics/sql-reimagined-for-the-ai-era-with-bigquery-ai-functions), and [Databricks AI Functions](https://docs.databricks.com/aws/en/large-language-models/ai-functions).
 AI-SQL extends SQL with AI-powered operators, such as filters, joins, and classifiers.
 
+Much of today's AI-SQL work uses closed, frontier LLMs served through APIs. Open weight models now provide sufficient quality for many AI-SQL operators, so we believe the database community should move more of these workloads to open weight models and optimize inference together with query execution.
+
 In an AI-powered operator, the user simply specifies what they want in natural language, and LLMs are used to evaluate that instruction over the relevant data.
 For example, imagine that a database user has one table of medical reports, and another table of possible adverse reactions.[^biodex]
 The user wants to identify which reactions each report attributes to the patient, but only for reports that describe female patients. They might run the following AI-SQL query, which we call BIO-3 in [quail-bench](https://github.com/fsdatalab/quail-bench).[^quail-bench]
