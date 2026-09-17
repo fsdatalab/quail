@@ -420,6 +420,7 @@ def test_native_score_uses_shared_prefix_and_preserves_pair_order(monkeypatch):
 def test_distributed_score_preserves_rows_and_keeps_anchors_together(
         catalog, monkeypatch):
     from quail.backends.quail.distributed import DistributedQuailExecution
+    from quail.backends.quail.worker import quail_runtime_payload
     from quail.execution.reranker import ScoreRows
 
     batches = ScoreRows.batches
@@ -432,14 +433,16 @@ def test_distributed_score_preserves_rows_and_keeps_anchors_together(
     )
     request = query._prepare_physical()
     node = next(node for node in query.plan().nodes if isinstance(node, AiScore))
-    execution = DistributedQuailExecution.__new__(DistributedQuailExecution)
-    execution.docs = {
-        scan.alias: request.inputs[scan.input_id].documents
-        for scan in query.plan().nodes if scan.type_name == "quail.scan"
-    }
-    execution.gpu_count = 2
+    graph = query.plan().graph
+    payload = quail_runtime_payload(request, graph)
+    assert "pre_ids" not in payload and "filter_limit" not in payload
 
     def run(kind, subs):
+        if kind == "filters":
+            assert len(subs) == 2
+            assert all(sub["start_query"] and sub["node_id"] is None
+                       for sub in subs)
+            return [{"peak_gib": 0.0} for _ in subs]
         assert kind == "scores"
         assert all(("documents" in sub["inputs"]) == (not rounds) for sub in subs)
         rounds.append(kind)
@@ -453,7 +456,11 @@ def test_distributed_score_preserves_rows_and_keeps_anchors_together(
             results.append(model.execute_rows(node, rows))
         return results
 
-    execution.round_fn = run
+    execution = DistributedQuailExecution(
+        payload, graph, 2, run, session.model, session.device, session.registry
+    )
+    execution.begin()
+    assert execution.started
     result = execution.execute(node, {port.name: [1, 0] for port in node.inputs})
     assert result.outputs["scores"].to_pylist() == [
         {"q": 1, "d": 1, "score": 0.75},
