@@ -47,11 +47,19 @@ class SQLDialect(StrEnum):
     BQ = "bq"
 
 
+def _sqlglot_dialect(dialect: SQLDialect) -> str:
+    return "bigquery" if dialect is SQLDialect.BQ else "snowflake"
+
+
 def _normalize_ai_calls(sql: str, dialect: SQLDialect) -> str:
     """Lower dotted AI calls to internal function names."""
-    tokens = sqlglot.Dialect.get_or_raise(
-        "bigquery"
-    ).tokenizer().tokenize(sql)
+    tokenizer = sqlglot.Dialect.get_or_raise(
+        _sqlglot_dialect(dialect)
+    ).tokenizer()
+    try:
+        tokens = tokenizer.tokenize(sql)
+    except sqlglot.errors.SqlglotError as error:
+        raise CompileError(f"parse error: {error}") from error
     edits = []
     for index in range(len(tokens) - 3):
         head, dot, name, left = tokens[index:index + 4]
@@ -74,9 +82,30 @@ def _is_call(node, name: str) -> bool:
             and str(node.this).upper() == name)
 
 
+# each comparison class with its spelling when AI.SCORE is on the left
+# and the spelling that means the same when AI.SCORE is on the right
+_COMPARISON_CLASSES = {
+    exp.LT: ("<", ">"),
+    exp.LTE: ("<=", ">="),
+    exp.GT: (">", "<"),
+    exp.GTE: (">=", "<="),
+}
+
+
+def _score_comparison(node):
+    """Return (comparison, AI_SCORE call, threshold) or None."""
+    for kind, (left, right) in _COMPARISON_CLASSES.items():
+        if not isinstance(node, kind):
+            continue
+        if _is_call(node.this, "AI_SCORE"):
+            return left, node.this, node.expression
+        if _is_call(node.expression, "AI_SCORE"):
+            return right, node.expression, node.this
+    return None
+
+
 def _is_ai_score_comparison(node) -> bool:
-    return isinstance(node, (exp.LT, exp.LTE, exp.GT, exp.GTE)) \
-        and _is_call(node.this, "AI_SCORE")
+    return _score_comparison(node) is not None
 
 
 def _reject_forbidden(tree) -> None:
@@ -230,6 +259,11 @@ class _Binder:
                 aliases.append(r.alias)
         if join is None:
             join = len(aliases) > 1
+        if function == "AI_SCORE" and join and template.count("{0}") != 1:
+            raise CompileError(
+                "an AI.SCORE pair prompt mentions {0} exactly once, as "
+                "the place its document is inserted; refer to it again "
+                "in words")
         binder = bind_join_prompt if join else bind_prompt
         prompt = binder(template, tuple(refs), self.tokenizer)
         for r in refs:
@@ -243,30 +277,20 @@ class _Binder:
         )
 
     def parse_ai_score(self, node, allowed: set, scope=None, join=None):
-        """Parse a compared AI.SCORE call."""
-        comparisons = {
-            exp.LT: "<",
-            exp.LTE: "<=",
-            exp.GT: ">",
-            exp.GTE: ">=",
-        }
-        comparison = next(
-            (value for kind, value in comparisons.items()
-             if isinstance(node, kind)),
-            None,
-        )
-        if comparison is None or not _is_call(node.this, "AI_SCORE"):
+        """Parse a compared AI.SCORE call, with the threshold on either side."""
+        parsed = _score_comparison(node)
+        if parsed is None:
             raise CompileError(
                 "AI.SCORE must be compared with <, <=, >, or >="
             )
-        threshold = node.expression
+        comparison, call, threshold = parsed
         if not isinstance(threshold, exp.Literal) or threshold.is_string:
             raise CompileError("AI.SCORE threshold must be a number")
         value = float(threshold.this)
         if not 0.0 <= value <= 1.0:
             raise CompileError("AI.SCORE threshold must be between 0 and 1")
         prompt, options, aliases = self.parse_ai_call(
-            node.this,
+            call,
             "AI_SCORE",
             allowed,
             scope=scope,
@@ -336,12 +360,9 @@ def compile_sql(sql: str, catalog: Catalog,
             "or bq"
         ) from error
     sql = _normalize_ai_calls(sql, dialect)
-    sqlglot_dialect = (
-        "bigquery" if dialect is SQLDialect.BQ else "snowflake"
-    )
     try:
-        tree = sqlglot.parse_one(sql, dialect=sqlglot_dialect)
-    except sqlglot.errors.ParseError as e:
+        tree = sqlglot.parse_one(sql, dialect=_sqlglot_dialect(dialect))
+    except sqlglot.errors.SqlglotError as e:
         raise CompileError(f"parse error: {e}") from e
     if not isinstance(tree, exp.Select):
         raise CompileError("the query must be a single SELECT")
@@ -485,6 +506,18 @@ def compile_sql(sql: str, catalog: Catalog,
     projected_scores = tuple(
         column for column in columns if isinstance(column, ScoreExpression)
     )
+    names_by_prompt = {}
+    for score in projected_scores:
+        if score.name in dict(b.tables):
+            raise CompileError(
+                f"AI.SCORE output name {score.name!r} is also a table "
+                f"alias; pick another AS name")
+        names = names_by_prompt.setdefault(score.prompt, [])
+        if names:
+            raise CompileError(
+                f"the same AI.SCORE expression is projected as "
+                f"{names[0]!r} and {score.name!r}; project it once")
+        names.append(score.name)
 
     for alias, equalities in conditions.items():
         raise CompileError(

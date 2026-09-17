@@ -41,14 +41,31 @@ def _prompt_aliases(prompt) -> tuple[str, ...]:
     return tuple(dict.fromkeys(argument.alias for argument in prompt.args))
 
 
+class _RefusedError(Exception):
+    """Carries a Refusal out of the plan builder."""
+
+    def __init__(self, refusal: Refusal):
+        super().__init__(refusal.reasons[0])
+        self.refusal = refusal
+
+
 def _query_template(prompt) -> str:
     aliases = _prompt_aliases(prompt)
     if len(aliases) == 1:
         marker = f"{SHARED_PRE}{{0}}"
-        return prompt.template.replace(marker, "", 1).strip()
+        query = prompt.template.replace(marker, "", 1).strip()
+        return query.replace("{0}", "this document")
     if len(aliases) == 2 and len(prompt.args) == 2:
         return prompt.template.replace("{1}", "this document")
     raise ValueError("AI.SCORE supports one document or one document pair")
+
+
+def _longest_input(spec, context) -> int:
+    """Return the token count of the longest prompt this score computes."""
+    fixed = sum(map(len, spec.prompt_token_parts))
+    return fixed + sum(
+        max(context.document_tokens[alias], default=0) for alias in spec.aliases
+    )
 
 
 def _score_work(count, mean_tokens, fixed_tokens, *, variance=0.0,
@@ -155,19 +172,23 @@ def _projection_scores(logical) -> tuple[ScoreExpression, ...]:
 
 
 def _score_name(prompt, projected, fallback: str) -> str:
-    matches = [item.name for item in projected if item.prompt == prompt]
-    if len(matches) > 1:
-        raise ValueError("one AI.SCORE expression needs one output name")
-    return matches[0] if matches else fallback
+    # the front end rejects one prompt projected under two names
+    return next(
+        (item.name for item in projected if item.prompt == prompt), fallback
+    )
 
 
 def _ordered_filters(predicates, count, mean_tokens, context, chunk):
     remaining = list(enumerate(predicates))
     ordered = []
     live = float(count)
+    scored = set()
     while remaining:
         choices = []
         for written_pos, predicate in remaining:
+            if predicate.prompt in scored:
+                choices.append((0.0, written_pos, Work()))
+                continue
             spec, work = _score_spec(
                 predicate.prompt,
                 name=f"__score_filter_{written_pos}",
@@ -185,12 +206,20 @@ def _ordered_filters(predicates, count, mean_tokens, context, chunk):
         _, selected, work = min(choices)
         ordered.append((selected, predicates[selected], live, work))
         live *= effective_selectivity(predicates[selected].selectivity)
+        scored.add(predicates[selected].prompt)
         remaining = [item for item in remaining if item[0] != selected]
     return ordered, live
 
 
 def plan_reranker(region, context, *, backend_name: str):
     """Build one Quail plan for AI.SCORE expressions."""
+    try:
+        return _plan_reranker(region, context, backend_name=backend_name)
+    except _RefusedError as refused:
+        return (PhysicalCandidate(None, refused.refusal, float("inf")),)
+
+
+def _plan_reranker(region, context, *, backend_name: str):
     logical = region.logical_plan
     if any(isinstance(node, Apply) for node in logical.walk()):
         refusal = _refusal("AI.SCORE cannot be mixed with apply()")
@@ -205,6 +234,14 @@ def plan_reranker(region, context, *, backend_name: str):
     ] + list(joins)
     if not predicates and not projected:
         refusal = _refusal("a reranker model needs an AI.SCORE expression")
+        return (PhysicalCandidate(None, refusal, float("inf")),)
+    prompts = [predicate.prompt for predicate in predicates] + [
+        score.prompt for score in projected
+    ]
+    if any(len(_prompt_aliases(prompt)) > 2 for prompt in prompts):
+        refusal = _refusal(
+            "AI.SCORE supports one document or one document pair"
+        )
         return (PhysicalCandidate(None, refusal, float("inf")),)
     if any(predicate.comparison is None for predicate in predicates):
         refusal = _refusal(
@@ -257,11 +294,12 @@ def plan_reranker(region, context, *, backend_name: str):
     ]
 
     chunk = budgets.chunk_budget(context.model, context.device)
+    capacity = budgets.arena_tokens(context.model, context.device, chunk)
     total_work = Work()
     total_seconds = 0.0
     live = {alias: float(count) for alias, count in counts.items()}
     current = dict(scan_refs)
-    scored_prompts = set()
+    score_names = {}
     score_index = 0
 
     def add_score(
@@ -284,6 +322,21 @@ def plan_reranker(region, context, *, backend_name: str):
             pair_fraction=pair_fraction,
             prefix_groups=prefix_groups,
         )
+        need = _longest_input(spec, context)
+        budget, limit = min(
+            (chunk, "forward pass budget"), (capacity, "KV arena")
+        )
+        if need > budget:
+            what = (
+                f"a document in {spec.aliases[0]!r}" if len(spec.aliases) == 1
+                else f"one pair of {spec.aliases[0]!r} and {spec.aliases[1]!r}"
+            )
+            raise _RefusedError(Refusal(
+                reasons=(f"{what} needs {need} tokens with its prompt, "
+                         f"but the {limit} is {budget} tokens",),
+                constraint="suffix_over_chunk",
+                needed=need, available=budget, unit="tokens",
+            ))
         node = AiScore(
             node_id=f"ai-score:{score_index}",
             inputs=input_ports(tuple(inputs)),
@@ -295,7 +348,7 @@ def plan_reranker(region, context, *, backend_name: str):
         nodes.append(node)
         total_work += work
         total_seconds += spec.estimated_seconds
-        scored_prompts.add(prompt)
+        score_names[prompt] = spec.name
         return PortRef(node.node_id, "scores"), spec
 
     for alias in counts:
@@ -307,22 +360,28 @@ def plan_reranker(region, context, *, backend_name: str):
             chunk,
         )
         for written_pos, predicate, expected, _work in ordered:
-            name = _score_name(
-                predicate.prompt,
-                projected,
-                f"__score_{alias}_{written_pos}",
-            )
-            score_ref, spec = add_score(
-                predicate.prompt,
-                name,
-                (current[alias],),
-                expected,
-                means[alias],
-            )
+            if predicate.prompt in score_names:
+                # a second comparison of one prompt reads the column the
+                # first one computed instead of scoring the documents again
+                score_ref = current[alias]
+                name = score_names[predicate.prompt]
+            else:
+                name = _score_name(
+                    predicate.prompt,
+                    projected,
+                    f"__score_{alias}_{written_pos}",
+                )
+                score_ref, _spec = add_score(
+                    predicate.prompt,
+                    name,
+                    (current[alias],),
+                    expected,
+                    means[alias],
+                )
             filtered = ScoreFilter(
                 node_id=f"score-filter:{alias}:{written_pos}",
                 inputs=input_ports((score_ref,)),
-                score_name=spec.name,
+                score_name=name,
                 aliases=(alias,),
                 comparison=predicate.comparison,
                 threshold=predicate.threshold,
@@ -334,7 +393,7 @@ def plan_reranker(region, context, *, backend_name: str):
         live[alias] = live_count
 
         for expression in projected:
-            if expression.prompt in scored_prompts:
+            if expression.prompt in score_names:
                 continue
             if _prompt_aliases(expression.prompt) != (alias,):
                 continue

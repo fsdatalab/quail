@@ -55,6 +55,9 @@ class Prompt:
 # the planner's estimate for a predicate written without a selectivity
 DEFAULT_SELECTIVITY = 0.2
 
+# the comparisons an AI.SCORE predicate may use, in SQL spelling
+SCORE_COMPARISONS = ("<", "<=", ">", ">=")
+
 
 def effective_selectivity(selectivity: Optional[float]) -> float:
     """Return the selectivity the planner uses: the given one or the default."""
@@ -175,7 +178,7 @@ class SemanticFilter:
                 raise CompileError(
                     "AI.SCORE needs both a comparison and threshold"
                 )
-            if predicate.comparison not in {None, "<", "<=", ">", ">="}:
+            if predicate.comparison not in (None, *SCORE_COMPARISONS):
                 raise CompileError(
                     f"unsupported AI.SCORE comparison "
                     f"{predicate.comparison!r}"
@@ -309,7 +312,7 @@ class SemanticJoin:
             raise CompileError(
                 "AI.SCORE needs both a comparison and threshold"
             )
-        if self.comparison not in {None, "<", "<=", ">", ">="}:
+        if self.comparison not in (None, *SCORE_COMPARISONS):
             raise CompileError(
                 f"unsupported AI.SCORE comparison {self.comparison!r}"
             )

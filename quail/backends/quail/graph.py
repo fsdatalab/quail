@@ -33,6 +33,7 @@ from quail.physical import (
     AiJoin,
     AiScore,
     PhysicalGraph,
+    Scan,
     ScoreFilter,
 )
 
@@ -425,15 +426,32 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
         "kv_manager": kv_manager,
         "peak_gib": round(torch.cuda.max_memory_allocated() / 2**30, 2),
     }
-    pairs = result.metrics.evaluated_document_pairs
-    key = "document_pairs_per_second" if pairs else "documents_per_second"
-    report[key] = (pairs or result.metrics.evaluated_documents) / max(wall, 1e-9)
+    report.update(throughput(graph, result.metrics, wall))
     if state.get("gpu_timing"):
         # seconds a forward chunk was running on the GPU, summed over
         # the model nodes; wall_s minus this is time the GPU sat idle
         report["gpu_s"] = round(result.metrics.gpu_s, 3)
         report["chunks"] = result.metrics.chunks
     return report
+
+
+def throughput(graph, metrics, seconds: float) -> dict:
+    """Return the run's throughput under one key.
+
+    A run that evaluated document pairs reports evaluated pairs per
+    second. Any other run reports input document rows, summed over
+    every scan and counted before filters, per second.
+    """
+    seconds = max(seconds, 1e-9)
+    if metrics.evaluated_document_pairs:
+        return {
+            "document_pairs_per_second":
+                metrics.evaluated_document_pairs / seconds,
+        }
+    documents = sum(
+        node.n_docs for node in graph.nodes if isinstance(node, Scan)
+    )
+    return {"documents_per_second": documents / seconds}
 
 
 def model_answers(graph, result) -> tuple[dict, list]:

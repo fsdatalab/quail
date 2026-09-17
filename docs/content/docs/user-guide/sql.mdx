@@ -192,7 +192,8 @@ FROM documents d
 
 #### Filter rows
 
-Compare the score with `<`, `<=`, `>`, or `>=`:
+Compare the score with `<`, `<=`, `>`, or `>=`. The threshold may be
+on either side of the comparison:
 
 ```sql
 SELECT d.id
@@ -210,7 +211,9 @@ The hint does not change the scores or threshold.
 #### Join tables
 
 For a prompt with two document arguments, Quail includes the first in the
-reranker's query and uses the second as its candidate document:
+reranker's query and uses the second as its candidate document. The
+template mentions `{0}` once, where that document is inserted; refer to
+it again in words:
 
 ```sql
 SELECT q.id, d.id
@@ -220,8 +223,10 @@ JOIN documents d ON AI.SCORE(
 ) >= 0.8
 ```
 
-When the same score appears in `SELECT` and a filter or join condition,
-Quail computes it once. A query cannot combine `AI.SCORE` with `AI.IF`.
+When the same score appears in `SELECT`, a filter, or a join condition,
+Quail computes it once. Two comparisons of one score, such as a range,
+share that one computation. A query cannot combine `AI.SCORE` with
+`AI.IF`.
 
 #### Score definition
 

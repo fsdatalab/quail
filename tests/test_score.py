@@ -488,3 +488,204 @@ def test_score_comparison_keeps_arrow_values(comparison, expected):
     answer = compare_score(scores, comparison, 0.5)
     assert isinstance(answer, pa.ChunkedArray)
     assert answer.to_pylist() == expected
+
+
+class _RowReranker:
+    """Score each row as (sum of its document indices + 1) / 10."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def score(self, spec, rows, documents):
+        self.calls += 1
+        scores = [(int(sum(row)) + 1) / 10 for row in rows]
+        return RerankerBatch(scores, fresh_tokens=len(rows), cached_tokens=0)
+
+
+def _finish(query, session, reranker):
+    """Run a planned score query through a fake reranker to its result."""
+
+    def execute(request):
+        graph = compute_subgraph(query.plan().graph)
+        model = RerankerModelExecution.__new__(RerankerModelExecution)
+        model.reranker = reranker
+        model.documents = {
+            node.alias: request.inputs[node.input_id].documents
+            for node in query.plan().nodes if node.type_name == "quail.scan"
+        }
+        run = GenericRunner().run(
+            graph,
+            ExecutionContext(
+                runtimes=session.registry.runtimes,
+                model_execution=model,
+                sources={
+                    **{alias: range(2) for alias in model.documents},
+                    **request.relations,
+                },
+            ),
+        )
+        return PhysicalResponse(
+            export_physical_outputs(graph, run),
+            {
+                "backend": "quail",
+                "wall_s": 0.1,
+                "fresh_tokens": 12,
+                "cached_tokens": 3,
+                "node_metrics": scalar_node_metrics(run.nodes),
+            },
+        )
+
+    return execute_query(query, physical_executor=execute)
+
+
+def test_pair_score_keeps_the_filtered_document_score(catalog):
+    session = _session(catalog)
+    query = session.sql(
+        "SELECT q.id, d.id, "
+        "AI.SCORE(PROMPT('Refund? {0}', d.body)) AS s1, "
+        "AI.SCORE(PROMPT('Is {1} relevant to {0}?', q.text, d.body)) AS s2 "
+        "FROM queries q CROSS JOIN documents d "
+        "WHERE AI.SCORE(PROMPT('Refund? {0}', d.body)) >= 0.15"
+    )
+    result = _finish(query, session, _RowReranker())
+    assert result.collect().to_pylist() == [
+        {"q.id": 1, "d.id": 2, "s1": 0.2, "s2": 0.2},
+        {"q.id": 2, "d.id": 2, "s1": 0.2, "s2": 0.3},
+    ]
+    session.close()
+
+
+def test_range_filter_scores_each_document_once(catalog):
+    session = _session(catalog)
+    query = session.sql(
+        "SELECT d.id, AI.SCORE(PROMPT('Refund? {0}', d.body)) AS s "
+        "FROM documents d "
+        "WHERE AI.SCORE(PROMPT('Refund? {0}', d.body)) >= 0.15 "
+        "AND AI.SCORE(PROMPT('Refund? {0}', d.body)) <= 0.25"
+    )
+    physical = query.plan()
+    assert sum(isinstance(node, AiScore) for node in physical.nodes) == 1
+    assert sum(isinstance(node, ScoreFilter) for node in physical.nodes) == 2
+    reranker = _RowReranker()
+    result = _finish(query, session, reranker)
+    assert result.collect().to_pylist() == [{"d.id": 2, "s": 0.2}]
+    assert reranker.calls == 1
+    session.close()
+
+
+@pytest.mark.parametrize("sql,message", [
+    (
+        "SELECT q.id FROM queries q JOIN documents d ON AI.SCORE(PROMPT("
+        "'Compare {0} with {1}; is {1} about {0}?', q.text, d.body)) >= 0.5",
+        "exactly once",
+    ),
+    (
+        "SELECT d.id, AI.SCORE(PROMPT('Refund? {0}', d.body)) AS d "
+        "FROM documents d",
+        "also a table alias",
+    ),
+    (
+        "SELECT AI.SCORE(PROMPT('Refund? {0}', d.body)) AS a, "
+        "AI.SCORE(PROMPT('Refund? {0}', d.body)) AS b FROM documents d",
+        "project it once",
+    ),
+    (
+        "SELECT d.id FROM documents d WHERE AI.SCORE(PROMPT('Refund? {0",
+        "parse error",
+    ),
+])
+def test_score_query_shape_errors_are_compile_errors(catalog, sql, message):
+    with pytest.raises(CompileError, match=message):
+        compile_sql(sql, catalog, _tokens)
+
+
+def test_threshold_on_the_left_flips_the_comparison(catalog):
+    plan = compile_sql(
+        "SELECT q.id, d.id FROM queries q JOIN documents d ON "
+        "0.8 > AI.SCORE(PROMPT('Is {1} relevant to {0}', q.text, d.body)) "
+        "WHERE 0.5 <= AI.SCORE(PROMPT('Refund? {0}', d.body))",
+        catalog,
+        _tokens,
+    )
+    join = plan.root.input
+    assert isinstance(join, SemanticJoin)
+    assert (join.comparison, join.threshold) == ("<", 0.8)
+    predicate = next(
+        predicate for node in plan.walk()
+        if type(node).__name__ == "SemanticFilter"
+        for predicate in node.predicates
+    )
+    assert (predicate.comparison, predicate.threshold) == (">=", 0.5)
+
+
+def test_repeated_placeholder_names_the_document_in_the_query(catalog):
+    session = _session(catalog)
+    query = session.sql(
+        "SELECT d.id, AI.SCORE(PROMPT("
+        "'Refund request? {0} Does {0} ask for money?', d.body)) AS s "
+        "FROM documents d"
+    )
+    score = next(node for node in query.plan().nodes if isinstance(node, AiScore))
+    assert score.spec.query_template == (
+        "Refund request? Does this document ask for money?"
+    )
+    session.close()
+
+
+def test_oversized_document_is_refused_before_execution(catalog, monkeypatch):
+    from quail.cost import budgets
+    from quail.planner.plan import Refusal
+
+    monkeypatch.setattr(budgets, "chunk_budget", lambda model, device: 4)
+    session = _session(catalog)
+    query = session.sql(
+        "SELECT d.id, AI.SCORE(PROMPT('Refund? {0}', d.body)) AS s "
+        "FROM documents d"
+    )
+    plan = query.plan()
+    assert isinstance(plan, Refusal)
+    assert plan.constraint == "suffix_over_chunk"
+    assert "a document in 'd'" in plan.reasons[0]
+    session.close()
+
+
+def test_reranker_system_text_matches_the_published_prefix():
+    from quail.reranker import QWEN3_RERANKER_SYSTEM_TEXT
+
+    assert "\n" not in QWEN3_RERANKER_SYSTEM_TEXT
+    assert (
+        "based on the Query and the Instruct provided."
+        in QWEN3_RERANKER_SYSTEM_TEXT
+    )
+
+
+def test_compare_score_covers_every_sql_comparison():
+    from quail.logical import SCORE_COMPARISONS
+
+    for comparison in SCORE_COMPARISONS:
+        assert compare_score(0.5, comparison, 0.5) is not None
+
+
+def test_throughput_counts_input_rows_and_evaluated_pairs(catalog):
+    from quail.backends.quail.graph import throughput
+    from quail.execution.runner import NodeMetrics
+    from quail.explain import run_summary
+
+    session = _session(catalog)
+    query = session.sql(
+        "SELECT d.id FROM documents d "
+        "WHERE AI.SCORE(PROMPT('Refund? {0}', d.body)) >= 0.5"
+    )
+    graph = query.plan().graph
+    assert throughput(graph, NodeMetrics(evaluated_documents=5), 2.0) == {
+        "documents_per_second": 1.0,
+    }
+    assert throughput(graph, NodeMetrics(evaluated_document_pairs=6), 2.0) == {
+        "document_pairs_per_second": 3.0,
+    }
+    lines = run_summary(
+        {"wall_s": 2.0, "fresh_tokens": 10, "evaluated_document_pairs": 6},
+        graph, 1,
+    )
+    assert any("3 document pairs/second" in line for line in lines)
+    session.close()

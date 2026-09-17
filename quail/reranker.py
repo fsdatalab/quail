@@ -5,7 +5,7 @@ QWEN3_RERANKER_INSTRUCTION = (
 )
 QWEN3_RERANKER_SYSTEM_TEXT = (
     "Judge whether the Document meets the requirements based on the Query "
-    "and the\nInstruct provided. Note that the answer can only be \"yes\" "
+    "and the Instruct provided. Note that the answer can only be \"yes\" "
     "or \"no\"."
 )
 

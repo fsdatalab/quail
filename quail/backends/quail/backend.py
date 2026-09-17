@@ -9,6 +9,7 @@ from typing import Any
 from quail.backends.base import GpuContext
 from quail.backends.quail.executor import loop
 from quail.backends.quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
+from quail.backends.quail.executor.score import QuailScorer
 from quail.backends.quail.graph import filter_result, stage_partner_lists
 from quail.backends.quail.worker import execute_quail_request, prepare_quail_request
 from quail.execution.reranker import RerankerModelExecution
@@ -40,6 +41,7 @@ class QuailModelExecution:
     def __init__(self, context: GpuContext):
         self.context = context
         self._state: dict[str, Any] = {}
+        self._reranker: RerankerModelExecution | None = None
 
     @property
     def state(self) -> Mapping[str, Any]:
@@ -64,26 +66,30 @@ class QuailModelExecution:
         inputs: Mapping[str, Any],
     ) -> Any:
         if isinstance(node, AiScore):
-            from quail.backends.quail.executor.score import QuailScorer
-
-            execution = RerankerModelExecution(GpuContext(
-                gpu_index=self.context.gpu_index,
-                gpu_count=self.context.gpu_count,
-                model=self.context.model, device=self.context.device,
-                query_settings={
-                    "documents": inputs["documents"],
-                    "reranker": QuailScorer(self._state),
-                },
-            ))
+            execution = self._reranker_execution(inputs["documents"])
             if "score_rows" in inputs:
-                return execution.execute_rows(
-                    node, inputs["score_rows"], inputs.get("prior")
-                )
+                return execution.execute_rows(node, inputs["score_rows"])
             return execution.execute(node, inputs["score_inputs"])
         if not isinstance(node, (AiFilter, AiJoin)):
             raise TypeError(
                 f"Quail cannot execute physical node {node.type_name!r}")
         return self._execute_quail_node(node, inputs)
+
+    def _reranker_execution(self, documents) -> RerankerModelExecution:
+        """Return the reranker bound to this query's document tokens."""
+        execution = self._reranker
+        if execution is None or execution.documents is not documents:
+            execution = RerankerModelExecution(GpuContext(
+                gpu_index=self.context.gpu_index,
+                gpu_count=self.context.gpu_count,
+                model=self.context.model, device=self.context.device,
+                query_settings={
+                    "documents": documents,
+                    "reranker": QuailScorer(self._state),
+                },
+            ))
+            self._reranker = execution
+        return execution
 
     def _execute_quail_node(
         self,

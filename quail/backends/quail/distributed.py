@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import time
-from dataclasses import replace
 
 import numpy as np
 import pyarrow as pa
 
 from quail.backends.quail import coordinator
-from quail.backends.quail.graph import executed_join_plan, model_answers
+from quail.backends.quail.graph import (
+    executed_join_plan,
+    model_answers,
+    throughput,
+)
 from quail.execution.pairs import columns_key
-from quail.execution.reranker import RerankerModelExecution
+from quail.execution.reranker import score_in_batches
 from quail.execution.runner import (
     ExecutionContext,
     GenericRunner,
@@ -34,6 +37,9 @@ from quail.planner import balanced_shards
 
 class DistributedQuailExecution:
     """Dispatch typed Quail model nodes to one child per GPU."""
+
+    # the children keep the document tokens after the first score round
+    score_documents_sent = False
 
     def __init__(self, payload, graph, gpu_count, round_fn,
                  model_spec, device, registry):
@@ -94,39 +100,29 @@ class DistributedQuailExecution:
             f"distributed Quail cannot execute {node.type_name!r}")
 
     def _execute_score(self, node, inputs):
-        rows, prior = RerankerModelExecution._candidate_rows(node, inputs)
-        started = time.perf_counter()
-        tables = []
+        return score_in_batches(node, inputs, self._score_shards)
+
+    def _score_shards(self, node, batch):
+        """Score one batch of rows, one shard per GPU, in batch order."""
+        shards = [np.flatnonzero(batch[:, 0] % self.gpu_count == worker)
+                  for worker in range(self.gpu_count)]
+        subs = [{"node": node, "inputs": {"score_rows": batch[indices]}}
+                for indices in shards]
+        if not self.score_documents_sent:
+            for sub in subs:
+                sub["inputs"]["documents"] = self.docs
+            self.score_documents_sent = True
+        results = self.round_fn("scores", subs)
+        combined = pa.concat_tables(
+            [result.outputs["scores"] for result in results])
+        order = np.argsort(np.concatenate(shards))
         metrics = NodeMetrics()
-        offset = 0
-        for batch in rows.batches():
-            shards = [np.flatnonzero(batch[:, 0] % self.gpu_count == worker)
-                      for worker in range(self.gpu_count)]
-            subs = [{
-                "node": node,
-                "inputs": {
-                    "score_rows": batch[indices],
-                    "prior": None if prior is None else prior.take(
-                        pa.array(offset + indices, type=pa.int64())
-                    ),
-                },
-            } for indices in shards]
-            if not getattr(self, "score_documents_sent", False):
-                for sub in subs:
-                    sub["inputs"]["documents"] = self.docs
-                self.score_documents_sent = True
-            results = self.round_fn("scores", subs)
-            combined = pa.concat_tables(
-                [result.outputs["scores"] for result in results])
-            order = np.argsort(np.concatenate(shards))
-            tables.append(combined.take(pa.array(order, type=pa.int64())))
-            for result in results:
-                metrics += result.metrics
-            offset += len(batch)
-        return NodeResult({"scores": pa.concat_tables(tables)}, replace(
-            metrics, wall_s=time.perf_counter() - started,
-            extension={"output": node.spec.name, "input_rows": len(rows)},
-        ))
+        for result in results:
+            metrics += result.metrics
+        return NodeResult(
+            {"scores": combined.take(pa.array(order, type=pa.int64()))},
+            metrics,
+        )
 
     def begin(self):
         """Start a query that has no filter node."""
@@ -440,7 +436,5 @@ def execute_distributed_graph(payload, graph: PhysicalGraph, gpu_count: int,
         executed_join_plan=executed_join_plan(graph),
         node_metrics=scalar_node_metrics(result.nodes),
     )
-    pairs = result.metrics.evaluated_document_pairs
-    key = "document_pairs_per_second" if pairs else "documents_per_second"
-    report[key] = (pairs or result.metrics.evaluated_documents) / max(elapsed, 1e-9)
+    report.update(throughput(graph, result.metrics, elapsed))
     return report

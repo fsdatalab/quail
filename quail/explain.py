@@ -204,6 +204,9 @@ def run_summary(report, graph, workers, usd_per_hour=None) -> list:
         items.append(("startup", _seconds(report["boot_s"]) + kind))
     pairs = sum(stage.get("tuples", 0) for stage in report.get("stages", ())
                 if stage.get("op") == "join")
+    if not pairs:
+        # a score over document pairs has no join stage records
+        pairs = report.get("evaluated_document_pairs") or 0
     documents = sum(node.n_docs for node in graph.nodes
                     if isinstance(node, Scan))
     if wall > 0 and pairs:

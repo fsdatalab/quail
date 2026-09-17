@@ -20,8 +20,8 @@ class AsyncScores:
     def submit(self, normed):
         torch, ans = self.torch, self.ans
         logits = ans.F.linear(normed.float(), self.weights)
-        yes = logits.index_select(1, ans.true_cols).squeeze(1)
-        no = logits.index_select(1, ans.false_cols).squeeze(1)
+        yes = logits.index_select(1, ans.true_cols).amax(dim=1)
+        no = logits.index_select(1, ans.false_cols).amax(dim=1)
         scores = torch.sigmoid(yes - no)
         host = self.available.pop() if self.available else None
         if host is None or host.numel() < scores.shape[0]:

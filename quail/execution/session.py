@@ -740,55 +740,6 @@ class Query:
         def project(node, value):
             if not isinstance(node, Project):
                 raise TypeError(type(node).__name__)
-            if (
-                isinstance(value, pa.Table)
-                and (value.schema.metadata or {}).get(b"quail.kind")
-                == b"score_rows"
-            ):
-                arrays = []
-                fields = []
-                for name in node.columns:
-                    if name in value.column_names:
-                        column = value.column(name)
-                        arrays.append(column)
-                        fields.append(pa.field(name, column.type))
-                        continue
-                    try:
-                        alias, column_name = name.split(".", 1)
-                        scan = scans_by_alias[alias]
-                    except (ValueError, KeyError) as error:
-                        raise CompileError(
-                            f"unknown projection column {name!r}"
-                        ) from error
-                    store = self._token_inputs[alias]
-                    if column_name not in store.projected_columns:
-                        raise CompileError(
-                            f"projection column {name!r} was not loaded "
-                            f"by the scan of {alias!r}"
-                        )
-                    column = pc.take(
-                        store.column(column_name),
-                        value.column(alias),
-                    )
-                    arrays.append(column)
-                    fields.append(pa.field(
-                        name,
-                        column.type,
-                        nullable=column.null_count > 0,
-                        metadata={
-                            b"quail.alias": alias.encode("utf-8"),
-                            b"quail.provider": scan.provider.encode("utf-8"),
-                            b"quail.column": column_name.encode("utf-8"),
-                        },
-                    ))
-                table = pa.Table.from_arrays(
-                    arrays,
-                    schema=pa.schema(
-                        fields,
-                        metadata={b"quail.kind": b"query_result"},
-                    ),
-                )
-                return QueryResult.from_table(table)
             if node.inputs[0].value_type is ValueType.JOIN_ANSWERS:
                 value = true_answer_rows(value)
             relation = (
@@ -800,6 +751,14 @@ class Query:
             projection = []
             fields = []
             for name in node.columns:
+                if name in relation.schema.names:
+                    # a score column the graph computed; document
+                    # index columns are aliases, never "alias.column"
+                    projection.append((name, None))
+                    fields.append(pa.field(
+                        name, relation.schema.field(name).type
+                    ))
+                    continue
                 try:
                     alias, column = name.split(".", 1)
                     scan = scans_by_alias[alias]
