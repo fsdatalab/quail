@@ -5,6 +5,8 @@ bibliography: references.bib
 link-citations: true
 ---
 
+**TL;DR.** Much of today's AI-SQL work, meaning AI functions in SQL databases, uses closed, frontier LLMs served through APIs. But open weight models now provide sufficient quality for many AI functions and unlock optimizations that make some queries up to 10× faster. The database community should absolutely move more of these workloads to open weight models and optimize inference together with query execution. Quail is the open source query engine we are building to jointly optimize AI-SQL query plans and inference.
+
 # 1. The growth of AI-powered data processing
 
 For decades, database users have struggled to analyze unstructured text at scale.
@@ -12,8 +14,6 @@ SQL, our good old language, and corresponding relational database systems weren'
 But now, thanks to LLMs, database users can finally unlock insights from unstructured text columns.
 Major database vendors now support AI-SQL, including [Snowflake Cortex AISQL](https://docs.snowflake.com/en/user-guide/snowflake-cortex/aisql), [BigQuery AI functions](https://cloud.google.com/blog/products/data-analytics/sql-reimagined-for-the-ai-era-with-bigquery-ai-functions), and [Databricks AI Functions](https://docs.databricks.com/aws/en/large-language-models/ai-functions).
 AI-SQL extends SQL with AI-powered operators, such as filters, joins, and classifiers.
-
-Much of today's AI-SQL work uses closed, frontier LLMs served through APIs. Open weight models now provide sufficient quality for many AI-SQL operators, so we believe the database community should move more of these workloads to open weight models and optimize inference together with query execution.
 
 In an AI-powered operator, the user simply specifies what they want in natural language, and LLMs are used to evaluate that instruction over the relevant data.
 For example, imagine that a database user has one table of medical reports, and another table of possible adverse reactions.[^biodex]
