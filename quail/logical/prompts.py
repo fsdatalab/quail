@@ -29,7 +29,11 @@ def true_false_ids(tok):
 JOIN_DOC_LABEL = "\n\nDOCUMENT {}:\n"      # each partner block
 JOIN_ANCHOR_NOTE = "\n\n(The document above is DOCUMENT {}.)"
 JOIN_QUESTION_SEP = "\n\n"                 # anchor note -> question
-TASK_INSTRUCTION = "Evaluate TRUE or FALSE for the following question: "
+DATA_PROCESSING_INSTRUCTION = "You are performing a data processing task."
+TASK_INSTRUCTION = (
+    f"{DATA_PROCESSING_INSTRUCTION} "
+    "Evaluate TRUE or FALSE for the following question: "
+)
 ANSWER_CUE = "\nANSWER:"
 
 

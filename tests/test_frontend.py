@@ -191,7 +191,8 @@ def test_prompt_layout_and_predicate_order(catalog):
     assert p.preamble == SHARED_PRE
     # the static question is in the anchor frame; only the answer cue
     # is paid per tuple
-    assert p.frame == ("\n\nEvaluate TRUE or FALSE for the following "
+    assert p.frame == ("\n\nYou are performing a data processing task. "
+                       "Evaluate TRUE or FALSE for the following "
                        "question: Does {0} praise {1}?")
     assert p.tail == ANSWER_CUE
     assert p.tail_tokens == len(tok(p.tail))
@@ -239,11 +240,13 @@ def test_prompt_layout_and_predicate_order(catalog):
     # the preamble is always the engine's; the user's pre-document
     # text ("This review is negative:") moves into the tail
     assert pred.prompt.preamble == SHARED_PRE
-    assert pred.prompt.tail == ("{0}\n\nEvaluate TRUE or FALSE for the "
+    assert pred.prompt.tail == ("{0}\n\nYou are performing a data processing task. "
+                                "Evaluate TRUE or FALSE for the "
                                 "following question: This review is "
                                 "negative:\nANSWER:")
     assert pred.prompt.preamble_tokens == len(tok(SHARED_PRE))
     assert pred.prompt.tail_tokens == len(tok(
+        "You are performing a data processing task. "
         "Evaluate TRUE or FALSE for the following question: "
         "This review is negative: ANSWER:"))
 

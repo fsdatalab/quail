@@ -1,10 +1,12 @@
 """Shared Qwen3 reranker input format."""
 
+from quail.logical.prompts import DATA_PROCESSING_INSTRUCTION
+
 QWEN3_RERANKER_INSTRUCTION = (
     "Judge whether the document meets the requirements in the query."
 )
 QWEN3_RERANKER_SYSTEM_TEXT = (
-    "You are performing a data processing task. "
+    f"{DATA_PROCESSING_INSTRUCTION} "
     "Judge whether the Document meets the requirements based on the Query "
     "and the Instruct provided. Note that the answer can only be \"yes\" "
     "or \"no\"."

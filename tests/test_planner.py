@@ -205,7 +205,7 @@ def test_filter_ordering_and_kv_writes(catalog):
         selectivity=0.1)
     logical = logical.ai_filter(
         prompt(" ".join(["short"] * 10) + " {0}", col("r.review")),
-        selectivity=0.8435).select("r.id")
+        selectivity=0.8).select("r.id")
     plan = plan_query(
         logical, model=QWEN3_4B_FP8, device=H100_SXM,
         doc_tokens={"r": [400] * 100})

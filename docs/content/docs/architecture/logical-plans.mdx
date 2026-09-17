@@ -74,6 +74,11 @@ written order, the joins in written order, and the applies.
 When the parser sees a `PROMPT(...)`, it creates a `Prompt` object
 that rearranges the template into a fixed layout.
 
+All model task instructions include "You are performing a data processing
+task." `AI.IF` filters and joins place it before the question in their
+completion prompt. `AI.SCORE` places it in the reranker's system message.
+Quail and the stock vLLM backend use the same instruction text.
+
 **For a filter**, `bind_prompt` produces:
 
 1. **Preamble**: `DOCUMENT:\n`
@@ -92,6 +97,7 @@ Sent to the model as:
 
 DOCUMENT:
 A beautiful film with outstanding performances...
+You are performing a data processing task.
 Evaluate TRUE or FALSE for the following question:
 Does this review mention a positive aspect?
 ANSWER:
@@ -126,6 +132,7 @@ DOCUMENT {0}:                                      ← anchor (r.body)
 A beautiful film with outstanding performances...
                                                     ← anchor frame (computed once)
 (The document above is DOCUMENT {0}.)
+You are performing a data processing task.
 Evaluate TRUE or FALSE for the following question:
 Does the review discuss this aspect?
 Review: {0}
