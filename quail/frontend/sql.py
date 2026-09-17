@@ -19,6 +19,7 @@ from quail.logical import (
     ModelCall,
     bind_join_prompt,
     bind_prompt,
+    bind_score_prompt,
     is_score,
 )
 
@@ -267,7 +268,10 @@ class _Binder:
                 "an AI.SCORE pair prompt mentions {0} exactly once, as "
                 "the place its document is inserted; refer to it again "
                 "in words")
-        binder = bind_join_prompt if join else bind_prompt
+        if function == "AI_SCORE":
+            binder = bind_score_prompt
+        else:
+            binder = bind_join_prompt if join else bind_prompt
         prompt = binder(template, tuple(refs), self.tokenizer)
         for r in refs:
             self.note_doc_column(r)
@@ -523,6 +527,13 @@ def compile_sql(sql: str, catalog: Catalog,
         names.append(score.name)
 
     for alias, equalities in conditions.items():
+        if any(alias in score.expression.aliases()
+               for score in projected_scores):
+            raise CompileError(
+                f"JOIN {alias} ON {equalities[0]} projects a pair "
+                f"AI.SCORE; a projected pair score runs over CROSS JOIN, "
+                f"and an ON equality is supported when the score is "
+                f"compared in ON")
         raise CompileError(
             f"JOIN {alias} ON {equalities[0]} has no AI predicate over "
             f"its pairs; a plain join belongs in the database the ids "

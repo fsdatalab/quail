@@ -4,9 +4,6 @@ from __future__ import annotations
 
 import time
 
-import numpy as np
-import pyarrow as pa
-
 from quail.backends.quail import coordinator
 from quail.backends.quail.graph import (
     executed_join_plan,
@@ -100,29 +97,19 @@ class DistributedQuailExecution:
             f"distributed Quail cannot execute {node.type_name!r}")
 
     def _execute_score(self, node, inputs):
-        return score_in_batches(node, inputs, self._score_shards)
+        return score_in_batches(
+            node, inputs, self._score_round, shards=self.gpu_count
+        )
 
-    def _score_shards(self, node, batch):
-        """Score one batch of rows, one shard per GPU, in batch order."""
-        shards = [np.flatnonzero(batch[:, 0] % self.gpu_count == worker)
-                  for worker in range(self.gpu_count)]
-        subs = [{"node": node, "inputs": {"score_rows": batch[indices]}}
-                for indices in shards]
+    def _score_round(self, node, batches):
+        """Score one batch per GPU child and return their results in order."""
+        subs = [{"node": node, "inputs": {"score_rows": batch}}
+                for batch in batches]
         if not self.score_documents_sent:
             for sub in subs:
                 sub["inputs"]["documents"] = self.docs
             self.score_documents_sent = True
-        results = self.round_fn("scores", subs)
-        combined = pa.concat_tables(
-            [result.outputs["scores"] for result in results])
-        order = np.argsort(np.concatenate(shards))
-        metrics = NodeMetrics()
-        for result in results:
-            metrics += result.metrics
-        return NodeResult(
-            {"scores": combined.take(pa.array(order, type=pa.int64()))},
-            metrics,
-        )
+        return self.round_fn("scores", subs)
 
     def begin(self):
         """Start a query that has no filter node."""
@@ -427,7 +414,10 @@ def execute_distributed_graph(payload, graph: PhysicalGraph, gpu_count: int,
         cached_tokens=result.metrics.cached_tokens,
         evaluated_documents=result.metrics.evaluated_documents,
         evaluated_document_pairs=result.metrics.evaluated_document_pairs,
-        usd_per_query=elapsed / 3600 * gpu_count * (device.usd_per_hour or 0),
+        usd_per_query=(
+            None if device.usd_per_hour is None
+            else elapsed / 3600 * gpu_count * device.usd_per_hour
+        ),
         backend_metrics={"scores": [
             dict(value.metrics.extension)
             for node_id, value in result.nodes.items()

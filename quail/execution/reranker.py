@@ -32,18 +32,58 @@ def compare_score(scores, comparison: str, threshold: float):
 
 @dataclass(frozen=True)
 class ScoreRows:
-    """Document indices with an optional unexpanded Cartesian product."""
+    """Document indices with an optional unexpanded Cartesian product.
+
+    ``origin`` maps each row, or each left document of a product, to
+    its position in the rows this was sharded from. None means the
+    rows are in their original order.
+    """
 
     columns: tuple[np.ndarray, ...]
     product: bool = False
+    origin: np.ndarray | None = None
 
     def __len__(self):
         if self.product:
             return len(self.columns[0]) * len(self.columns[1])
         return len(self.columns[0])
 
+    def shard(self, count: int) -> list["ScoreRows"]:
+        """Split the rows by first document, so its KV stays on one GPU."""
+        first = self.columns[0]
+        shards = []
+        for worker in range(count):
+            keep = np.flatnonzero(first % count == worker)
+            origin = keep if self.origin is None else self.origin[keep]
+            columns = (
+                (first[keep], *self.columns[1:]) if self.product
+                else tuple(column[keep] for column in self.columns)
+            )
+            shards.append(replace(self, columns=columns, origin=origin))
+        return shards
+
+    def positions(self, start: int, end: int) -> np.ndarray:
+        """Return the original positions of rows start to end."""
+        local = np.arange(start, end, dtype=np.int64)
+        if not self.product:
+            return local if self.origin is None else self.origin[local]
+        width = len(self.columns[1])
+        left = local // width
+        if self.origin is not None:
+            left = self.origin[left]
+        return left * width + local % width
+
     def batches(self, size=DEFAULT_BATCH_ROWS):
-        """Yield bounded arrays in input order."""
+        """Yield bounded arrays in input order.
+
+        A product batch ends on a first-document boundary when a
+        document's partners fit in one batch, so its prefix KV is
+        computed once.
+        """
+        if self.product:
+            width = len(self.columns[1])
+            if 0 < width <= size:
+                size -= size % width
         for start in range(0, max(1, len(self)), size):
             end = min(start + size, len(self))
             if self.product and end > start:
@@ -147,14 +187,25 @@ def attach_prior_columns(table: pa.Table, priors: Mapping[str, pa.Table]):
     return table
 
 
-def score_in_batches(node, inputs, score_batch) -> NodeResult:
-    """Score the node's candidate rows in bounded batches.
+def _batches_with_positions(rows: ScoreRows):
+    start = 0
+    for batch in rows.batches():
+        end = start + len(batch)
+        yield rows.positions(start, end), batch
+        start = end
+
+
+def score_in_batches(node, inputs, score_batches, shards: int = 1) -> NodeResult:
+    """Score the node's candidate rows in bounded batches, in input order.
 
     Args:
         node: The AiScore node.
         inputs: Its input values by port name.
-        score_batch: Callable (node, rows) returning a NodeResult whose
-            "scores" table has one row per input row, in input order.
+        score_batches: Callable (node, batches) taking one row batch per
+            shard and returning one NodeResult per batch, each with a
+            "scores" table holding one row per input row in order.
+        shards: Row shards scored side by side; rows that share a first
+            document land in the same shard.
     """
     if not isinstance(node, AiScore):
         raise TypeError(type(node).__name__)
@@ -162,13 +213,31 @@ def score_in_batches(node, inputs, score_batch) -> NodeResult:
         raise ValueError("AI.SCORE needs a score specification")
     started = time.perf_counter()
     rows, priors = _candidate_rows(node, inputs)
+    parts = rows.shard(shards) if shards > 1 else [rows]
+    width = len(node.spec.aliases)
     tables = []
+    positions = []
     metrics = NodeMetrics()
-    for batch in rows.batches():
-        result = score_batch(node, batch)
-        tables.append(result.outputs["scores"])
-        metrics += result.metrics
-    table = attach_prior_columns(pa.concat_tables(tables), priors)
+    streams = [_batches_with_positions(part) for part in parts]
+    while streams:
+        rounds = [next(stream, None) for stream in streams]
+        if all(item is None for item in rounds):
+            break
+        batches = [
+            (np.empty(0, dtype=np.int64), np.empty((0, width), dtype=np.int32))
+            if item is None else item
+            for item in rounds
+        ]
+        results = score_batches(node, [batch for _, batch in batches])
+        for (where, _), result in zip(batches, results):
+            tables.append(result.outputs["scores"])
+            positions.append(where)
+            metrics += result.metrics
+    table = pa.concat_tables(tables)
+    order = np.concatenate(positions)
+    if len(order) and np.any(np.diff(order) < 0):
+        table = table.take(pa.array(np.argsort(order, kind="stable")))
+    table = attach_prior_columns(table, priors)
     return NodeResult({"scores": table}, replace(
         metrics, wall_s=time.perf_counter() - started,
         extension={"output": node.spec.name, "aliases": list(node.spec.aliases),
@@ -188,7 +257,10 @@ class RerankerModelExecution:
         node: AiScore,
         inputs: Mapping[str, object],
     ) -> NodeResult:
-        return score_in_batches(node, inputs, self.execute_rows)
+        return score_in_batches(
+            node, inputs,
+            lambda node, batches: [self.execute_rows(node, b) for b in batches],
+        )
 
     def execute_rows(self, node, rows):
         """Compute a score for each supplied row or document pair."""

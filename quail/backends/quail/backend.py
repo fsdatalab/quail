@@ -287,13 +287,8 @@ class QuailBackend:
         if device.name not in {"h100-sxm", "rtx-pro-6000-blackwell-server"}:
             return SupportResult.reject(
                 f"Quail does not support device {device.name!r}")
-        if model.name in RERANKER_MODEL_NAMES:
-            if gpu_count not in {1, 2, 4, 8}:
-                return SupportResult.reject(
-                    "Quail requires 1, 2, 4, or 8 GPUs"
-                )
-            return SupportResult.accept()
-        if model.name not in {"qwen3-4b-fp8", "qwen3-32b-fp8"}:
+        generative = {"qwen3-4b-fp8", "qwen3-32b-fp8"}
+        if model.name not in generative | set(RERANKER_MODEL_NAMES):
             return SupportResult.reject(
                 f"Quail does not support model {model.name!r}")
         if gpu_count not in {1, 2, 4, 8}:

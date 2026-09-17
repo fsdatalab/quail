@@ -3,10 +3,10 @@
 import math
 
 from quail.cost import budgets
+from quail.cost.budgets import PAGE_TOKENS
 from quail.cost.sol import speed_of_light
 from quail.cost.work import Work, triangle
 from quail.logical import (
-    SHARED_PRE,
     Alias,
     Apply,
     SemanticJoin,
@@ -51,23 +51,49 @@ class _RefusedError(Exception):
         self.refusal = refusal
 
 
+def _without_document(template: str, marker: str) -> str:
+    """Return the query text with the scored document's placeholder gone.
+
+    The reranker gives the document its own field, so a placeholder
+    standing alone at either end of the template only marks where the
+    document goes and is dropped. A placeholder inside a sentence
+    becomes "this document".
+    """
+    text = template.strip()
+    if text.startswith(marker):
+        text = text[len(marker):].lstrip()
+    if text.endswith(marker):
+        text = text[:-len(marker)].rstrip()
+    return text.replace(marker, "this document")
+
+
 def _query_template(prompt) -> str:
     aliases = _prompt_aliases(prompt)
     if len(aliases) == 1:
-        marker = f"{SHARED_PRE}{{0}}"
-        query = prompt.template.replace(marker, "", 1).strip()
-        return query.replace("{0}", "this document")
+        return _without_document(prompt.template, "{0}")
     if len(aliases) == 2 and len(prompt.args) == 2:
-        return prompt.template.replace("{1}", "this document")
+        return _without_document(prompt.template, "{1}")
     raise ValueError("AI.SCORE supports one document or one document pair")
 
 
-def _longest_input(spec, context) -> int:
-    """Return the token count of the longest prompt this score computes."""
-    fixed = sum(map(len, spec.prompt_token_parts))
-    return fixed + sum(
+def _pages(tokens: int) -> int:
+    return -(-tokens // PAGE_TOKENS)
+
+
+def _longest_input(spec, context) -> tuple[int, int]:
+    """Return the prefix and suffix token counts of the longest input.
+
+    The prefix is what stays resident while suffixes stream past it:
+    the fixed prompt head, plus the first document for a pair.
+    """
+    parts = spec.prompt_token_parts
+    longest = [
         max(context.document_tokens[alias], default=0) for alias in spec.aliases
-    )
+    ]
+    if len(spec.aliases) == 1:
+        return len(parts[0]), longest[0] + len(parts[1])
+    prefix = len(parts[0]) + longest[0] + len(parts[1])
+    return prefix, longest[1] + len(parts[2])
 
 
 def _score_work(count, mean_tokens, fixed_tokens, *, variance=0.0,
@@ -102,6 +128,18 @@ def _variance(lengths) -> float:
     return sum((length - mean) ** 2 for length in lengths) / max(1, len(lengths))
 
 
+def _token_parts(prompt, context) -> tuple[tuple[int, ...], ...]:
+    """Tokenize the fixed pieces of the rendered prompt around the documents."""
+    query_template = _query_template(prompt)
+    rendered = render_qwen3_reranker_input(query_template, "{document}")
+    before, after = rendered.split("{document}")
+    parts = (before, after)
+    if len(_prompt_aliases(prompt)) == 2:
+        first, middle = before.split("{0}")
+        parts = (first, middle, after)
+    return tuple(tuple(context.tokenizer(part)) for part in parts)
+
+
 def _score_spec(
     prompt,
     *,
@@ -112,15 +150,14 @@ def _score_spec(
     chunk_tokens: int,
     pair_fraction: float = 1.0,
     prefix_groups: float | None = None,
+    token_parts_by_prompt: dict | None = None,
 ):
-    query_template = _query_template(prompt)
-    rendered = render_qwen3_reranker_input(query_template, "{document}")
-    before, after = rendered.split("{document}")
-    parts = (before, after)
-    if len(_prompt_aliases(prompt)) == 2:
-        first, middle = before.split("{0}")
-        parts = (first, middle, after)
-    token_parts = tuple(tuple(context.tokenizer(part)) for part in parts)
+    if token_parts_by_prompt is None:
+        token_parts_by_prompt = {}
+    token_parts = token_parts_by_prompt.get(prompt)
+    if token_parts is None:
+        token_parts = _token_parts(prompt, context)
+        token_parts_by_prompt[prompt] = token_parts
     aliases = _prompt_aliases(prompt)
     lengths = [context.document_tokens[alias] for alias in aliases]
     fixed_tokens = sum(map(len, token_parts))
@@ -153,8 +190,8 @@ def _score_spec(
     ).seconds
     return ScoreSpec(
         name=name,
-        aliases=_prompt_aliases(prompt),
-        query_template=query_template,
+        aliases=aliases,
+        query_template=_query_template(prompt),
         arguments=tuple(
             (argument.alias, argument.column) for argument in prompt.args
         ),
@@ -181,7 +218,8 @@ def _score_name(prompt, projected, fallback: str) -> str:
     )
 
 
-def _ordered_filters(predicates, count, mean_tokens, context, chunk):
+def _ordered_filters(predicates, count, mean_tokens, context, chunk,
+                     token_parts_by_prompt):
     remaining = list(enumerate(predicates))
     ordered = []
     live = float(count)
@@ -199,6 +237,7 @@ def _ordered_filters(predicates, count, mean_tokens, context, chunk):
                 mean_tokens=mean_tokens,
                 context=context,
                 chunk_tokens=chunk,
+                token_parts_by_prompt=token_parts_by_prompt,
             )
             rejected = max(
                 1e-9, 1.0 - effective_selectivity(predicate.selectivity)
@@ -306,6 +345,7 @@ def _plan_reranker(region, context, *, backend_name: str):
     current = dict(scan_refs)
     score_names = {}
     score_index = 0
+    token_parts_by_prompt = {}
 
     def add_score(
         prompt,
@@ -326,21 +366,32 @@ def _plan_reranker(region, context, *, backend_name: str):
             chunk_tokens=chunk,
             pair_fraction=pair_fraction,
             prefix_groups=prefix_groups,
+            token_parts_by_prompt=token_parts_by_prompt,
         )
-        need = _longest_input(spec, context)
-        budget, limit = min(
-            (chunk, "forward pass budget"), (capacity, "KV arena")
+        prefix, suffix = _longest_input(spec, context)
+        what = (
+            f"a document in {spec.aliases[0]!r}" if len(spec.aliases) == 1
+            else f"one pair of {spec.aliases[0]!r} and {spec.aliases[1]!r}"
         )
-        if need > budget:
-            what = (
-                f"a document in {spec.aliases[0]!r}" if len(spec.aliases) == 1
-                else f"one pair of {spec.aliases[0]!r} and {spec.aliases[1]!r}"
-            )
+        # admission holds a prefix and one suffix at once, each rounded
+        # up to whole KV pages, so the arena check counts pages
+        arena_pages = capacity // PAGE_TOKENS
+        if prefix + suffix > chunk:
             raise _RefusedError(Refusal(
-                reasons=(f"{what} needs {need} tokens with its prompt, "
-                         f"but the {limit} is {budget} tokens",),
+                reasons=(f"{what} needs {prefix + suffix} tokens with its "
+                         f"prompt, but the forward pass budget is {chunk} "
+                         f"tokens",),
                 constraint="suffix_over_chunk",
-                needed=need, available=budget, unit="tokens",
+                needed=prefix + suffix, available=chunk, unit="tokens",
+            ))
+        if _pages(prefix) + _pages(suffix) > arena_pages:
+            raise _RefusedError(Refusal(
+                reasons=(f"{what} needs {_pages(prefix) + _pages(suffix)} "
+                         f"KV pages with its prompt, but the KV arena "
+                         f"holds {arena_pages}",),
+                constraint="suffix_over_chunk",
+                needed=_pages(prefix) + _pages(suffix), available=arena_pages,
+                unit="pages",
             ))
         node = AiScore(
             node_id=f"ai-score:{score_index}",
@@ -363,6 +414,7 @@ def _plan_reranker(region, context, *, backend_name: str):
             means[alias],
             context,
             chunk,
+            token_parts_by_prompt,
         )
         for written_pos, predicate, expected, _work in ordered:
             if predicate.prompt in score_names:

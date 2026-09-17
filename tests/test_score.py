@@ -462,7 +462,24 @@ def test_distributed_score_preserves_rows_and_keeps_anchors_together(
         {"q": 0, "d": 0, "score": 0.0},
     ]
     assert result.metrics.evaluated_document_pairs == 4
+    # each GPU scored its own query document's pairs in the same round
+    assert len(rounds) == 1
     session.close()
+
+
+def test_score_rows_shard_by_first_document_and_keep_positions():
+    from quail.execution.reranker import ScoreRows
+
+    rows = ScoreRows((np.array([3, 0, 1]), np.array([7, 8])), product=True)
+    even, odd = rows.shard(2)
+    assert even.columns[0].tolist() == [0] and odd.columns[0].tolist() == [3, 1]
+    assert odd.positions(0, 4).tolist() == [0, 1, 4, 5]
+    assert even.positions(0, 2).tolist() == [2, 3]
+    plain = ScoreRows((np.array([3, 0, 1]),))
+    assert [shard.positions(0, len(shard)).tolist() for shard in plain.shard(2)] \
+        == [[1], [0, 2]]
+    # a product batch ends on a first-document boundary when partners fit
+    assert [len(batch) for batch in rows.batches(size=5)] == [4, 2]
 
 
 
@@ -594,6 +611,11 @@ def test_range_filter_scores_each_document_once(catalog):
         "SELECT d.id FROM documents d WHERE AI.SCORE(PROMPT('Refund? {0",
         "parse error",
     ),
+    (
+        "SELECT q.id, AI.SCORE(PROMPT('Is {1} about {0}?', q.text, d.body)) "
+        "AS s FROM queries q JOIN documents d ON q.id = d.id",
+        "runs over CROSS JOIN",
+    ),
 ])
 def test_score_query_shape_errors_are_compile_errors(catalog, sql, message):
     with pytest.raises(CompileError, match=message):
@@ -616,25 +638,33 @@ def test_threshold_on_the_left_flips_the_comparison(catalog):
     assert (expression.comparison, expression.threshold) == (">=", 0.5)
 
 
-def test_repeated_placeholder_names_the_document_in_the_query(catalog):
+@pytest.mark.parametrize("template,query_text", [
+    ("Does {0} ask for a refund?", "Does this document ask for a refund?"),
+    ("Is {0} a refund request? Does {0} ask for money?",
+     "Is this document a refund request? Does this document ask for money?"),
+    ("Refund request?\n\n{0}", "Refund request?"),
+    ("{0}\n\nRefund request?", "Refund request?"),
+])
+def test_query_text_keeps_the_template_as_written(catalog, template, query_text):
     session = _session(catalog)
     query = session.sql(
-        "SELECT d.id, AI.SCORE(PROMPT("
-        "'Refund request? {0} Does {0} ask for money?', d.body)) AS s "
+        f"SELECT d.id, AI.SCORE(PROMPT('{template}', d.body)) AS s "
         "FROM documents d"
     )
     score = next(node for node in query.plan().nodes if isinstance(node, AiScore))
-    assert score.spec.query_template == (
-        "Refund request? Does this document ask for money?"
-    )
+    assert score.spec.query_template == query_text
     session.close()
 
 
-def test_oversized_document_is_refused_before_execution(catalog, monkeypatch):
+@pytest.mark.parametrize("budget,unit", [
+    ("chunk_budget", "tokens"), ("arena_tokens", "pages"),
+])
+def test_oversized_document_is_refused_before_execution(
+        catalog, monkeypatch, budget, unit):
     from quail.cost import budgets
     from quail.planner.plan import Refusal
 
-    monkeypatch.setattr(budgets, "chunk_budget", lambda model, device: 4)
+    monkeypatch.setattr(budgets, budget, lambda model, device, *rest: 4)
     session = _session(catalog)
     query = session.sql(
         "SELECT d.id, AI.SCORE(PROMPT('Refund? {0}', d.body)) AS s "
@@ -643,6 +673,7 @@ def test_oversized_document_is_refused_before_execution(catalog, monkeypatch):
     plan = query.plan()
     assert isinstance(plan, Refusal)
     assert plan.constraint == "suffix_over_chunk"
+    assert plan.unit == unit
     assert "a document in 'd'" in plan.reasons[0]
     session.close()
 

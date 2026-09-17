@@ -23,6 +23,12 @@ Weights, activations, and KV use BF16. The final `yes` and `no`
 projection and score normalization use FP32. Each input produces
 one score between 0 and 1 without generating tokens.
 
+Quail tokenizes each document once and the fixed prompt text
+separately, then joins the token lists. Where the prompt text meets
+a document, the tokens can differ from tokenizing the joined string,
+so a score can differ slightly from the reference implementation.
+Scores near a threshold can select different rows.
+
 ## GPUs
 
 | Device | `device=` value | Notes |

@@ -223,6 +223,15 @@ JOIN documents d ON AI.SCORE(
 ) >= 0.8
 ```
 
+A pair score returned in `SELECT` without a comparison runs over
+every pair, so write the tables with `CROSS JOIN`. An `ON` column
+equality narrows the pairs only when the score is compared in `ON`.
+
+In the reranker's query text, a placeholder that stands alone at the
+start or end of the template marks where the document goes and is
+left out, since the reranker holds the document in its own field. A
+placeholder inside a sentence reads "this document".
+
 When the same score appears in `SELECT`, a filter, or a join condition,
 Quail computes it once. Two comparisons of one score, such as a range,
 share that one computation. A query cannot combine `AI.SCORE` with
