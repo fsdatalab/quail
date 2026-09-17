@@ -137,6 +137,8 @@ def _token_parts(prompt, context) -> tuple[tuple[int, ...], ...]:
     if len(_prompt_aliases(prompt)) == 2:
         first, middle = before.split("{0}")
         parts = (first, middle, after)
+    # Documents are tokenized separately; tokens cannot span these boundaries.
+    # These ids can differ from tokenizing the complete prompt string.
     return tuple(tuple(context.tokenizer(part)) for part in parts)
 
 

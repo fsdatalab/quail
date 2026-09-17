@@ -155,6 +155,29 @@ wrote the question before the placeholder.
 Token counts and ids are stored on the `Prompt` so the planner and
 executor do not re-tokenize.
 
+### Tokenization
+
+Quail tokenizes documents separately from the fixed prompt text so
+document tokens can be reused across queries. The executor combines
+the token sequences without tokenizing the combined text again.
+Both `AI.IF` and `AI.SCORE` use this approach. `AI.SCORE` uses the
+reranker's prompt format, with fixed parts tokenized by `_token_parts`.
+
+For a single-document score, the input is:
+
+```python
+tokenize(before_document) + tokenize(document) + tokenize(after_document)
+```
+
+This can differ from tokenizing the complete prompt string. A token
+can span a boundary between parts, such as a space before the
+document and its first word. Separate tokenization prevents that
+combination and can change model scores.
+
+When comparing model implementations, pass the same token ids to
+both. Comparing with a complete prompt string also tests this
+tokenization difference.
+
 ## Logical rules
 
 ```python
