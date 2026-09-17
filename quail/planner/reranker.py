@@ -72,6 +72,13 @@ def _score_spec(
     fixed_tokens = len(context.tokenizer(
         render_qwen3_reranker_input(query_template, "")
     ))
+    rendered = render_qwen3_reranker_input(query_template, "{document}")
+    before, after = rendered.split("{document}")
+    parts = (before, after)
+    if len(_prompt_aliases(prompt)) == 2:
+        first, middle = before.split("{0}")
+        parts = (first, middle, after)
+    token_parts = tuple(tuple(context.tokenizer(part)) for part in parts)
     work = _score_work(expected_inputs, mean_tokens, fixed_tokens)
     estimate = speed_of_light(
         work, context.model, context.device, chunk_tokens
@@ -86,6 +93,7 @@ def _score_spec(
         expected_inputs=expected_inputs,
         estimated_seconds=estimate,
         pair_fraction=pair_fraction,
+        prompt_token_parts=token_parts,
     ), work
 
 

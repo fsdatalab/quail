@@ -39,7 +39,6 @@ from quail.frontend.sql import SQLDialect, compile_sql
 from quail.logical import (
     CompileError,
     LogicalPlan,
-    ScoreExpression,
     join_conditions,
     oriented_join_conditions,
 )
@@ -526,36 +525,22 @@ class Query:
                     self.session.catalog, self.session.config
                 ),
             )
-            scans, logical_filters, joins = collect_operators(self.logical)
-            has_score = any(
-                predicate.comparison is not None
-                for predicates in logical_filters.values()
-                for predicate in predicates
-            ) or any(
-                join.comparison is not None for join in joins
-            ) or any(
-                isinstance(expression, ScoreExpression)
-                for expression in self.logical.root.columns
-            )
+            scans, _, joins = collect_operators(self.logical)
             self._doc_tokens = {}
             self._token_inputs = {}
             estimated = []
             for s in scans:
-                projected_columns = (
-                    tuple(dict.fromkeys((*s.columns, s.column)))
-                    if has_score else s.columns
-                )
                 exact = self.session.token_lengths(s.provider, s.column)
                 if exact is not None:
                     store = self.session.tokenize(
-                        s.provider, s.column, projected_columns)
+                        s.provider, s.column, s.columns)
                     self._token_inputs[s.alias] = store
                     self._doc_tokens[s.alias] = store.lengths
                     continue
                 self._doc_tokens[s.alias] = self.session.estimate_lengths(
                     s.provider, s.column)
                 self._token_futures[s.alias] = self.session.tokenize_async(
-                    s.provider, s.column, projected_columns)
+                    s.provider, s.column, s.columns)
                 estimated.append(s.alias)
             self._estimated = tuple(estimated)
             started = time.perf_counter()
@@ -686,31 +671,10 @@ class Query:
     def _column_tables(self) -> dict:
         """One value table per alias a HashJoin or an apply() reads."""
         needed = {}
-        _, filters, joins = collect_operators(self.logical)
+        _, _, joins = collect_operators(self.logical)
         for join in joins:
             for condition in join_conditions(join):
                 for ref in (condition.left, condition.right):
-                    needed.setdefault(ref.alias, {})[ref.column] = None
-        has_score = any(
-            predicate.comparison is not None
-            for predicates in filters.values()
-            for predicate in predicates
-        ) or any(join.comparison is not None for join in joins) or any(
-            isinstance(expression, ScoreExpression)
-            for expression in self.logical.root.columns
-        )
-        if has_score:
-            for predicates in filters.values():
-                for predicate in predicates:
-                    for ref in predicate.prompt.args:
-                        needed.setdefault(ref.alias, {})[ref.column] = None
-            for join in joins:
-                for ref in join.predicate.args:
-                    needed.setdefault(ref.alias, {})[ref.column] = None
-            for expression in self.logical.root.columns:
-                if not isinstance(expression, ScoreExpression):
-                    continue
-                for ref in expression.prompt.args:
                     needed.setdefault(ref.alias, {})[ref.column] = None
         for apply in collect_applies(self.logical):
             for ref in apply.columns:

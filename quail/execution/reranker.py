@@ -23,7 +23,6 @@ from quail.execution.runner import (
 )
 from quail.execution.types import PhysicalResponse, export_physical_outputs
 from quail.physical import AiScore, ScoreFilter, ValueType
-from quail.reranker import QWEN3_RERANKER_TEMPLATE
 
 
 def normalized_yes_score(logit_difference: float) -> float:
@@ -59,8 +58,8 @@ class RerankerBatch:
 class RerankerModel(Protocol):
     """Model interface used by AI.SCORE execution."""
 
-    def score(self, queries, documents) -> RerankerBatch:
-        """Score aligned query and document lists."""
+    def score(self, prompts) -> RerankerBatch:
+        """Score complete tokenized reranker prompts."""
 
 
 class Qwen3VllmReranker:
@@ -69,16 +68,16 @@ class Qwen3VllmReranker:
     def __init__(self, llm):
         self.llm = llm
 
-    def score(self, queries, documents) -> RerankerBatch:
-        """Return normalized YES scores for aligned inputs."""
+    def score(self, prompts) -> RerankerBatch:
+        """Return normalized YES scores for tokenized prompts."""
         from vllm import PoolingParams
 
-        outputs = self.llm.score(
-            queries,
-            documents,
+        outputs = self.llm.encode(
+            [{"prompt_token_ids": [int(token) for token in prompt]}
+             for prompt in prompts],
+            pooling_task="classify",
             use_tqdm=False,
             pooling_params=PoolingParams(use_activation=False),
-            chat_template=QWEN3_RERANKER_TEMPLATE,
         )
         prompt_tokens = sum(
             len(getattr(output, "prompt_token_ids", ()))
@@ -90,7 +89,7 @@ class Qwen3VllmReranker:
         )
         return RerankerBatch(
             scores=tuple(
-                normalized_yes_score(float(output.outputs.score))
+                normalized_yes_score(float(output.outputs.data.item()))
                 for output in outputs
             ),
             fresh_tokens=prompt_tokens - cached_tokens,
@@ -137,11 +136,7 @@ class RerankerModelExecution:
 
     def __init__(self, context: GpuContext):
         self.reranker = context.query_settings["reranker"]
-        self.columns = context.query_settings["columns"]
-
-    def _value(self, alias: str, column: str, document: int) -> str:
-        value = self.columns[alias].column(column)[document].as_py()
-        return "" if value is None else str(value)
+        self.documents = context.query_settings["documents"]
 
     @staticmethod
     def _sources(node, inputs) -> list[tuple[object, object]]:
@@ -208,27 +203,18 @@ class RerankerModelExecution:
                 "AI.SCORE needs one prompt argument per document relation"
             )
 
-        if len(spec.aliases) == 1:
-            alias, column = spec.arguments[0]
-            queries = [spec.query_template] * len(rows)
-            documents = [
-                self._value(alias, column, row[0]) for row in rows
-            ]
-        else:
-            first, second = spec.arguments
-            queries = [
-                spec.query_template.format(
-                    self._value(first[0], first[1], row[0])
-                )
-                for row in rows
-            ]
-            documents = [
-                self._value(second[0], second[1], row[1])
-                for row in rows
-            ]
-
+        parts = spec.prompt_token_parts
+        if len(parts) != len(spec.aliases) + 1:
+            raise ValueError("AI.SCORE needs tokenized prompt parts")
+        prompts = []
+        for row in rows:
+            tokens = list(parts[0])
+            for index, alias in enumerate(spec.aliases):
+                tokens.extend(self.documents[alias][row[index]])
+                tokens.extend(parts[index + 1])
+            prompts.append(tokens)
         batch = (
-            self.reranker.score(queries, documents)
+            self.reranker.score(prompts)
             if rows else RerankerBatch((), 0, 0)
         )
         if prior is None:
@@ -350,7 +336,7 @@ def execute_reranker_request(context, *, backend_name: str):
         device=context.registry.device(envelope["device"]),
         query_settings={
             "reranker": state["reranker"],
-            "columns": context.request.column_tables(),
+            "documents": documents,
         },
     ))
     compute_graph = compute_subgraph(context.graph)

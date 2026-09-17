@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -55,10 +56,12 @@ def catalog(tmp_path):
     return value
 
 
-def _session(catalog, *, model="qwen3-reranker-0.6b-bf16", gpus=1):
+def _session(
+    catalog, *, model="qwen3-reranker-0.6b-bf16", gpus=1, tokenizer=_tokens
+):
     session = quail.Session(
         EngineConfig(model=model, device="h100-sxm", gpus=gpus),
-        tokenizer=_tokens,
+        tokenizer=tokenizer,
     )
     for name in ("documents", "queries"):
         session.register(name, catalog.get(name))
@@ -124,18 +127,25 @@ def test_vllm_adapter_subtracts_cached_tokens(monkeypatch):
     )
     outputs = [
         SimpleNamespace(
-            outputs=SimpleNamespace(score=0.0),
+            outputs=SimpleNamespace(data=SimpleNamespace(item=lambda: 0.0)),
             prompt_token_ids=range(10),
             num_cached_tokens=4,
         ),
         SimpleNamespace(
-            outputs=SimpleNamespace(score=1.0),
+            outputs=SimpleNamespace(data=SimpleNamespace(item=lambda: 1.0)),
             prompt_token_ids=range(8),
             num_cached_tokens=3,
         ),
     ]
-    llm = SimpleNamespace(score=lambda *_args, **_kwargs: outputs)
-    batch = Qwen3VllmReranker(llm).score(["a", "b"], ["c", "d"])
+    def encode(prompts, **kwargs):
+        assert prompts == [{"prompt_token_ids": [1, 2]}]
+        assert all(type(token) is int
+                   for token in prompts[0]["prompt_token_ids"])
+        assert kwargs["pooling_task"] == "classify"
+        return outputs
+
+    llm = SimpleNamespace(encode=encode)
+    batch = Qwen3VllmReranker(llm).score([np.array([1, 2], dtype=np.int32)])
     assert batch.fresh_tokens == 11
     assert batch.cached_tokens == 7
 
@@ -229,8 +239,9 @@ class _FakeReranker:
     def __init__(self, scores):
         self.scores = tuple(scores)
 
-    def score(self, queries, documents):
-        assert len(queries) == len(documents) == len(self.scores)
+    def score(self, prompts):
+        self.prompts = prompts
+        assert len(prompts) == len(self.scores)
         return RerankerBatch(self.scores, fresh_tokens=12, cached_tokens=3)
 
 
@@ -248,7 +259,10 @@ def test_score_execution_then_filter_retains_float64_column(catalog):
     graph = compute_subgraph(query.plan().graph)
     model = RerankerModelExecution.__new__(RerankerModelExecution)
     model.reranker = _FakeReranker((0.9, 0.1))
-    model.columns = request.column_tables()
+    model.documents = {
+        node.alias: request.inputs[node.input_id].documents
+        for node in query.plan().nodes if node.type_name == "quail.scan"
+    }
     run = GenericRunner().run(
         graph,
         ExecutionContext(
@@ -288,7 +302,10 @@ def test_score_query_finishes_with_projected_score(catalog):
         graph = compute_subgraph(query.plan().graph)
         model = RerankerModelExecution.__new__(RerankerModelExecution)
         model.reranker = _FakeReranker((0.9, 0.1))
-        model.columns = request.column_tables()
+        model.documents = {
+            node.alias: request.inputs[node.input_id].documents
+            for node in query.plan().nodes if node.type_name == "quail.scan"
+        }
         run = GenericRunner().run(
             graph,
             ExecutionContext(
@@ -340,3 +357,42 @@ def test_score_filter_runtime_handles_pair_answers():
         True, False, False, True
     ]
     assert result.outputs["scores"].num_rows == 2
+
+
+@pytest.mark.parametrize("pair", [False, True])
+def test_score_assembles_stored_document_tokens(catalog, pair):
+    from quail.reranker import render_qwen3_reranker_input
+
+    session = _session(catalog, tokenizer=list)
+    sql = (
+        "SELECT AI.SCORE(PROMPT('Is {1} relevant to {0}?', q.text, d.body)) "
+        "AS score FROM queries q CROSS JOIN documents d"
+        if pair else
+        "SELECT AI.SCORE(PROMPT('Refund? {0}', d.body)) AS score "
+        "FROM documents d"
+    )
+    query = session.sql(sql)
+    request = query._prepare_physical()
+    model = RerankerModelExecution.__new__(RerankerModelExecution)
+    model.documents = {
+        node.alias: request.inputs[node.input_id].documents
+        for node in query.plan().nodes if node.type_name == "quail.scan"
+    }
+    model.reranker = _FakeReranker([0.5] * (4 if pair else 2))
+    GenericRunner().run(
+        compute_subgraph(query.plan().graph),
+        ExecutionContext(
+            runtimes=session.registry.runtimes,
+            model_execution=model,
+            sources={alias: range(2) for alias in model.documents},
+        ),
+    )
+    queries = (
+        ["Is this document relevant to refund?",
+         "Is this document relevant to shipping?"] if pair else ["Refund?"]
+    )
+    assert model.reranker.prompts == [
+        list(render_qwen3_reranker_input(text, document))
+        for text in queries for document in ("refund please", "all good")
+    ]
+    session.close()

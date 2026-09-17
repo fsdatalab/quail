@@ -387,6 +387,7 @@ class ScoreSpec:
     expected_inputs: float
     estimated_seconds: float
     pair_fraction: float = 1.0
+    prompt_token_parts: tuple[tuple[int, ...], ...] = ()
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "ScoreSpec":
@@ -401,6 +402,9 @@ class ScoreSpec:
             expected_inputs=float(value["expected_inputs"]),
             estimated_seconds=float(value["estimated_seconds"]),
             pair_fraction=float(value.get("pair_fraction", 1.0)),
+            prompt_token_parts=tuple(
+                tuple(part) for part in value.get("prompt_token_parts", ())
+            ),
         )
 
     def to_dict(self) -> dict:
@@ -412,6 +416,7 @@ class ScoreSpec:
             "expected_inputs": self.expected_inputs,
             "estimated_seconds": self.estimated_seconds,
             "pair_fraction": self.pair_fraction,
+            "prompt_token_parts": [list(part) for part in self.prompt_token_parts],
         }
 
 
