@@ -43,7 +43,7 @@ from quail.logical import (
     oriented_join_conditions,
 )
 from quail.physical import PortRef, Project, Scan, ValueType, encode_graph
-from quail.planner import collect_applies, collect_operators, explain, plan_query
+from quail.planner import explain, plan_query
 from quail.planner.logical_optimizer import LogicalPlanningContext, apply_logical_rules
 from quail.planner.plan import EngineConfig, Refusal, resolve_model
 from quail.progress import Progress, say
@@ -525,7 +525,8 @@ class Query:
                     self.session.catalog, self.session.config
                 ),
             )
-            scans, _, joins = collect_operators(self.logical)
+            operators = self.logical.operators()
+            scans, joins = operators.scans, operators.joins
             self._doc_tokens = {}
             self._token_inputs = {}
             estimated = []
@@ -671,12 +672,12 @@ class Query:
     def _column_tables(self) -> dict:
         """One value table per alias a HashJoin or an apply() reads."""
         needed = {}
-        _, _, joins = collect_operators(self.logical)
-        for join in joins:
+        operators = self.logical.operators()
+        for join in operators.joins:
             for condition in join_conditions(join):
                 for ref in (condition.left, condition.right):
                     needed.setdefault(ref.alias, {})[ref.column] = None
-        for apply in collect_applies(self.logical):
+        for apply in operators.applies:
             for ref in apply.columns:
                 needed.setdefault(ref.alias, {})[ref.column] = None
         tables = {}
@@ -734,7 +735,10 @@ class Query:
             if key in out:
                 report[key] = out[key]
 
-        scans, logical_filters, logical_joins = collect_operators(self.logical)
+        operators = self.logical.operators()
+        scans, logical_filters, logical_joins = (
+            operators.scans, operators.filters, operators.joins
+        )
         scans_by_alias = {scan.alias: scan for scan in scans}
 
         def project(node, value):
@@ -959,7 +963,7 @@ class Query:
             metadata = table.schema.metadata or {}
             logical_join = logical_joins[written_pos]
             logical_aliases = [
-                argument.alias for argument in logical_join.predicate.args
+                argument.alias for argument in logical_join.prompt.args
             ]
             required_metadata = {
                 b"quail.anchor", b"quail.partners", b"quail.semantics"

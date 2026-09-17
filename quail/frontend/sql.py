@@ -7,16 +7,19 @@ from sqlglot import exp
 
 from quail.catalog import Catalog
 from quail.logical import (
+    Alias,
     ColumnRef,
+    Compare,
     CompileError,
     Equality,
     FilterPredicate,
     JoinSpec,
     LogicalPlan,
     LogicalPlanBuilder,
-    ScoreExpression,
+    ModelCall,
     bind_join_prompt,
     bind_prompt,
+    is_score,
 )
 
 # Every relational operator except the projection, named and refused.
@@ -271,13 +274,17 @@ class _Binder:
         return prompt, options, aliases
 
     def parse_ai_filter(self, node, allowed: set, scope=None, join=None):
-        """Parse an AI_FILTER node into prompt, options, and aliases."""
-        return self.parse_ai_call(
+        """Parse an AI_FILTER node into a boolean call, options, and aliases."""
+        prompt, options, aliases = self.parse_ai_call(
             node, "AI_FILTER", allowed, scope=scope, join=join
         )
+        return ModelCall(prompt, "boolean"), options, aliases
 
     def parse_ai_score(self, node, allowed: set, scope=None, join=None):
-        """Parse a compared AI.SCORE call, with the threshold on either side."""
+        """Parse a compared AI.SCORE call into a Compare, options, and aliases.
+
+        The threshold may be on either side of the comparison.
+        """
         parsed = _score_comparison(node)
         if parsed is None:
             raise CompileError(
@@ -296,7 +303,8 @@ class _Binder:
             scope=scope,
             join=join,
         )
-        return prompt, options, aliases, comparison, value
+        expression = Compare(ModelCall(prompt, "score"), comparison, value)
+        return expression, options, aliases
 
 
 def _parse_equality(b, term, joined_alias: str) -> Equality:
@@ -399,9 +407,9 @@ def compile_sql(sql: str, catalog: Catalog,
         equalities, predicates = [], []
         for term in _conjuncts(on):
             if _is_call(term, "AI_FILTER"):
-                predicates.append((*b.parse_ai_filter(
+                predicates.append(b.parse_ai_filter(
                     term, JOIN_OPTION_KEYS, join=True
-                ), None, None))
+                ))
             elif _is_ai_score_comparison(term):
                 predicates.append(b.parse_ai_score(
                     term, SCORE_OPTION_KEYS, join=True
@@ -424,7 +432,7 @@ def compile_sql(sql: str, catalog: Catalog,
 
     claimed = set()           # joined tables already carried by a spec
 
-    def add_join_spec(prompt, options, aliases, comparison, threshold):
+    def add_join_spec(predicate, options, aliases):
         joinable = {b.tables[0][0], *joined_aliases}
         outside = [a for a in aliases if a not in joinable]
         if outside:
@@ -455,11 +463,9 @@ def compile_sql(sql: str, catalog: Catalog,
                     f"join condition {condition} names a table the AI "
                     f"predicate over {aliases} does not")
         b.joins.append(JoinSpec(aliases=news,
-                                prompt=prompt, semantics="full",
+                                predicate=predicate, semantics="full",
                                 selectivity=options.get("selectivity"),
-                                anchor=anchor, on=on,
-                                comparison=comparison,
-                                threshold=threshold))
+                                anchor=anchor, on=on))
 
     for pred in on_preds:
         add_join_spec(*pred)
@@ -477,34 +483,31 @@ def compile_sql(sql: str, catalog: Catalog,
             raise CompileError(f"NOT is only supported as NOT EXISTS, "
                                f"got NOT {node.sql()}")
         if _is_ai_score_comparison(term):
-            prompt, options, aliases, comparison, threshold = \
+            predicate, options, aliases = \
                 b.parse_ai_score(term, SCORE_OPTION_KEYS)
         else:
             if any(_is_call(call, "AI_SCORE") for call in term.walk()):
                 raise CompileError(
                     "AI.SCORE must be compared with <, <=, >, or >="
                 )
-            prompt, options, aliases = b.parse_ai_filter(
+            predicate, options, aliases = b.parse_ai_filter(
                 term, JOIN_OPTION_KEYS)
-            comparison = threshold = None
         if len(aliases) == 1:
             if "anchor" in options:
                 raise CompileError(
                     "anchor is a join option; a one-provider "
                     "AI_FILTER takes only selectivity")
             b.filters.setdefault(aliases[0], []).append(
-                FilterPredicate(prompt=prompt,
-                                selectivity=options.get("selectivity"),
-                                comparison=comparison,
-                                threshold=threshold))
+                FilterPredicate(expression=predicate,
+                                selectivity=options.get("selectivity")))
             continue
         # a multi-provider WHERE predicate is a join predicate,
         # BigQuery style: tables cross-joined in FROM, filtered here
-        add_join_spec(prompt, options, aliases, comparison, threshold)
+        add_join_spec(predicate, options, aliases)
 
     columns = _compile_projection(b, tree.expressions)
     projected_scores = tuple(
-        column for column in columns if isinstance(column, ScoreExpression)
+        column for column in columns if isinstance(column, Alias)
     )
     names_by_prompt = {}
     for score in projected_scores:
@@ -512,7 +515,7 @@ def compile_sql(sql: str, catalog: Catalog,
             raise CompileError(
                 f"AI.SCORE output name {score.name!r} is also a table "
                 f"alias; pick another AS name")
-        names = names_by_prompt.setdefault(score.prompt, [])
+        names = names_by_prompt.setdefault(score.expression.prompt, [])
         if names:
             raise CompileError(
                 f"the same AI.SCORE expression is projected as "
@@ -532,8 +535,8 @@ def compile_sql(sql: str, catalog: Catalog,
         for predicate in predicates
     ]
     score_flags = [
-        predicate.comparison is not None for predicate in filter_predicates
-    ] + [join.comparison is not None for join in b.joins] \
+        is_score(predicate.expression) for predicate in filter_predicates
+    ] + [is_score(join.predicate) for join in b.joins] \
         + [True for _ in projected_scores]
     if any(score_flags) and not all(score_flags):
         raise CompileError(
@@ -565,7 +568,7 @@ def compile_sql(sql: str, catalog: Catalog,
 def _check_join_coverage(
     b: _Binder,
     joined_aliases: list,
-    projected_scores: tuple[ScoreExpression, ...] = (),
+    projected_scores: tuple[Alias, ...] = (),
 ) -> None:
     """Check that the join predicates cover and connect every JOINed table.
 
@@ -577,9 +580,9 @@ def _check_join_coverage(
     preds = [{r.alias for r in j.prompt.args}
              for j in b.joins if j.semantics == "full"]
     preds.extend(
-        {ref.alias for ref in score.prompt.args}
+        set(score.expression.aliases())
         for score in projected_scores
-        if len({ref.alias for ref in score.prompt.args}) > 1
+        if len(score.expression.aliases()) > 1
     )
     uncovered = [a for a in joined_aliases
                  if not any(a in p for p in preds)]
@@ -626,9 +629,9 @@ def _compile_exists(b: _Binder, node: exp.Exists, anti: bool) -> None:
     if len(terms) != 1:
         raise CompileError("the EXISTS subquery takes exactly one "
                            "AI_FILTER predicate")
-    prompt, options, aliases = b.parse_ai_filter(terms[0],
-                                                 JOIN_OPTION_KEYS,
-                                                 join=True)
+    predicate, options, aliases = b.parse_ai_filter(terms[0],
+                                                    JOIN_OPTION_KEYS,
+                                                    join=True)
     if len(aliases) != 2 or alias not in aliases:
         raise CompileError(
             "the EXISTS predicate must reference the inner provider "
@@ -640,7 +643,7 @@ def _compile_exists(b: _Binder, node: exp.Exists, anti: bool) -> None:
             f"exists/anti always anchor on the outer table {outer!r} "
             f"- the gate applies to its documents - got anchor "
             f"{anchor!r}")
-    b.joins.append(JoinSpec(aliases=(alias,), prompt=prompt,
+    b.joins.append(JoinSpec(aliases=(alias,), predicate=predicate,
                             semantics="anti" if anti else "exists",
                             selectivity=options.get("selectivity"),
                             anchor=outer))
@@ -670,7 +673,7 @@ def _compile_projection(b: _Binder, expressions) -> list:
                 raise CompileError(
                     "projected AI.SCORE must reference one or two relations"
                 )
-            columns.append(ScoreExpression(prompt=prompt, name=alias))
+            columns.append(Alias(ModelCall(prompt, "score"), alias))
             continue
         if any(_is_call(call, "AI_SCORE") for call in e.walk()):
             raise CompileError(

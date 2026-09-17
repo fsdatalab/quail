@@ -11,7 +11,9 @@ import quail
 from quail.logical import (
     ColumnRef,
     FilterPredicate,
+    Join,
     LogicalPlan,
+    ModelCall,
     Project,
     Scan,
     SemanticFilter,
@@ -32,14 +34,14 @@ CONTEXT = LogicalPlanningContext(catalog=None, engine_config=None)
 def _joined_plan(columns):
     r = Scan("reviews", "r", "review")
     p = Scan("products", "p", "description")
-    filtered = SemanticFilter(r, (FilterPredicate(bind_prompt(
-        "q {0}", (ColumnRef("r", "reviews", "review"),))),))
+    filtered = SemanticFilter(r, (FilterPredicate(ModelCall(bind_prompt(
+        "q {0}", (ColumnRef("r", "reviews", "review"),)))),))
     joined = SemanticJoin(
-        (filtered, p),
-        bind_join_prompt("same {0} {1}", (
+        Join(filtered, p),
+        ModelCall(bind_join_prompt("same {0} {1}", (
             ColumnRef("r", "reviews", "review"),
             ColumnRef("p", "products", "description"),
-        )),
+        ))),
     )
     return LogicalPlan(Project(joined, tuple(columns)))
 

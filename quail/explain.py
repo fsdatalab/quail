@@ -56,7 +56,7 @@ def logical_tree(logical):
     def visit(node, depth):
         details = []
         if isinstance(node, logical_nodes.Project):
-            columns = ", ".join(f"{c.alias}.{c.column}" for c in node.columns)
+            columns = ", ".join(node.explain_fields()["columns"])
             title = f"Project: {columns}"
             if node.limit is not None:
                 lines.append(f"{'  ' * depth}Limit: {node.limit:,}")
@@ -72,7 +72,7 @@ def logical_tree(logical):
                        for p in node.predicates]
         elif isinstance(node, logical_nodes.SemanticJoin):
             title = f"SemanticJoin ({node.semantics})"
-            details = [f"{_prompt(node.predicate)} "
+            details = [f"{_prompt(node.prompt)} "
                        f"(selectivity={_selectivity(node.selectivity)})"]
             if node.anchor is not None:
                 title += f" anchor={node.anchor}"
@@ -228,23 +228,11 @@ def run_summary(report, graph, workers, usd_per_hour=None) -> list:
 
 
 def _logical_context(logical):
-    scans, filters, joins = {}, {}, []
-
-    def visit(node):
-        for child in node.children():
-            visit(child)
-        if isinstance(node, logical_nodes.Scan):
-            scans[node.alias] = node
-        elif isinstance(node, logical_nodes.SemanticFilter):
-            for predicate in node.predicates:
-                filters.setdefault(predicate.prompt.args[0].alias, []).append(
-                    predicate)
-        elif isinstance(node, logical_nodes.SemanticJoin):
-            joins.append(node)
-
-    if logical is not None:
-        visit(logical.root)
-    return scans, filters, joins
+    if logical is None:
+        return {}, {}, []
+    operators = logical.operators()
+    scans = {scan.alias: scan for scan in operators.scans}
+    return scans, operators.filters, list(operators.joins)
 
 
 def _estimated_rows(graph):
@@ -374,7 +362,7 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                     label = f"{_ordinal(index)}: {label}"
                 if stage.written_pos < len(joins):
                     label += "  " + _short_prompt(
-                        joins[stage.written_pos].predicate)
+                        joins[stage.written_pos].prompt)
                 predicates.append((label, stage_cells(
                     stage.selectivity, stage.expected_tuples,
                     stages.get(("join", stage.written_pos)), "tuples")))
@@ -406,7 +394,7 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                                  else f"predicate {position + 1}")
                     details.append(f"Filter {spec.alias}: {predicate}")
             for spec in node.joins:
-                predicate = (_short_prompt(joins[spec.written_pos].predicate)
+                predicate = (_short_prompt(joins[spec.written_pos].prompt)
                              if spec.written_pos < len(joins)
                              else f"predicate {spec.written_pos + 1}")
                 details.append(f"Join {spec.semantics}: {predicate}")

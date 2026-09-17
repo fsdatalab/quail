@@ -15,7 +15,7 @@ from quail.backends.quail.worker import execute_quail_request, prepare_quail_req
 from quail.execution.reranker import RerankerModelExecution
 from quail.execution.runner import NodeMetrics, NodeResult, SurvivorStream
 from quail.execution.tokens import DocumentKeys
-from quail.logical import SHARED_PRE, ScoreExpression
+from quail.logical import SHARED_PRE, Alias, is_score
 from quail.physical import (
     AiFilter,
     AiJoin,
@@ -23,7 +23,7 @@ from quail.physical import (
     Barrier,
     PhysicalNode,
 )
-from quail.planner import collect_operators, plan_quail
+from quail.planner import plan_quail
 from quail.planner.physical_optimizer import (
     ModelRegion,
     PhysicalCandidate,
@@ -307,13 +307,13 @@ class QuailBackend:
         context: PlanningContext,
     ) -> tuple[PhysicalCandidate, ...]:
 
-        _, filters, joins = collect_operators(region.logical_plan)
+        operators = region.logical_plan.operators()
         has_score = any(
-            predicate.comparison is not None
-            for predicates in filters.values()
+            is_score(predicate.expression)
+            for predicates in operators.filters.values()
             for predicate in predicates
-        ) or any(join.comparison is not None for join in joins) or any(
-            isinstance(expression, ScoreExpression)
+        ) or any(is_score(join.predicate) for join in operators.joins) or any(
+            isinstance(expression, Alias)
             for expression in region.logical_plan.root.columns
         )
         if context.model.name in RERANKER_MODEL_NAMES:
@@ -372,7 +372,8 @@ class QuailBackend:
     def _bind_runtime_data(self, plan, region, context):
         """Put tokenized prompts and answer tokens in the physical plan."""
         tokenizer = context.tokenizer
-        _, filters, joins = collect_operators(region.logical_plan)
+        operators = region.logical_plan.operators()
+        filters, joins = operators.filters, operators.joins
         encoded_nodes = []
         for node in plan.nodes:
             if isinstance(node, AiFilter):
@@ -387,7 +388,7 @@ class QuailBackend:
             elif isinstance(node, AiJoin):
                 stages = []
                 for stage in node.stages:
-                    prompt = joins[stage.written_pos].predicate
+                    prompt = joins[stage.written_pos].prompt
                     runtime_ids = {
                         alias: (tuple(label), tuple(frame))
                         for alias, label, frame in prompt.label_token_ids
@@ -415,11 +416,7 @@ class QuailBackend:
                 tokens = tokenizer(word)
                 if tokens:
                     false_ids.add(tokens[0])
-        prompts = [
-            predicate.prompt
-            for predicates in filters.values()
-            for predicate in predicates
-        ] + [logical_join.predicate for logical_join in joins]
+        prompts = operators.prompts
         pre_ids = (
             list(tokenizer(SHARED_PRE)) if tokenizer is not None else
             list(prompts[0].preamble_token_ids) if prompts else []

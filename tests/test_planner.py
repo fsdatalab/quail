@@ -429,7 +429,7 @@ def test_join_token_costs_and_retention(catalog):
     # r is placeholder 0 (the anchor frame), p is placeholder
     # 1 (its block label)
     label = len(tok(join_label(1)))
-    pred = logical.root.input.predicate
+    pred = logical.root.input.prompt
     frame = len(tok(render_join_frame(pred.template, 0)))
     tail = len(tok(pred.tail))
     expect = 4 * (100 + pre + frame) + 12 * (10 + label + tail)
@@ -457,7 +457,7 @@ def test_join_token_costs_and_retention(catalog):
     assert group.keep_anchor_kv is False    # nothing consumes r later
 
     # resident anchors pay the frame only - no preamble, no document
-    pred = logical.root.input.predicate
+    pred = logical.root.input.prompt
     frame = len(tok(render_join_frame(pred.template, 0)))
     label = len(tok(join_label(1)))
     tail = len(tok(pred.tail))
@@ -558,7 +558,7 @@ def _filtered_join(catalog, doc_sel=0.5, join_sel=0.1):
 def test_search_matches_complete_left_deep_enumeration(catalog, tmp_path):
     import itertools as it
 
-    from quail.planner.decide import collect_operators, join_specs
+    from quail.planner.decide import join_specs
     from quail.planner.joins import _feasible_anchors, search_joins, walk
 
     catalog.register("tags", DocumentProvider.from_parquet(
@@ -576,7 +576,7 @@ def test_search_matches_complete_left_deep_enumeration(catalog, tmp_path):
                .select("r.id"))
     toks = {"r": [900] * 6, "t": [40] * 8, "p": [200] * 5,
             "g": [30] * 9}
-    _, _, joins = collect_operators(logical)
+    joins = logical.operators().joins
     specs = join_specs(joins)
     live0 = {a: float(len(t)) for a, t in toks.items()}
     pre = 1

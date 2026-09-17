@@ -24,7 +24,7 @@ from quail.execution.runner import (
 )
 from quail.execution.types import PhysicalResponse, export_physical_outputs
 from quail.frontend.sql import compile_sql
-from quail.logical import CompileError, ScoreExpression, SemanticJoin
+from quail.logical import Alias, Compare, CompileError, SemanticJoin
 from quail.physical import AiScore, ScoreFilter, decode_graph, encode_graph
 from quail.planner.plan import EngineConfig
 
@@ -75,9 +75,10 @@ def test_score_projection_is_a_named_numeric_expression(catalog):
         _tokens,
     )
     score = plan.root.columns[1]
-    assert isinstance(score, ScoreExpression)
+    assert isinstance(score, Alias)
     assert score.name == "score"
-    assert score.prompt.args[0].alias == "d"
+    assert score.expression.kind == "score"
+    assert score.expression.aliases() == ("d",)
 
 
 def test_score_join_comparison_uses_two_relations(catalog):
@@ -90,9 +91,9 @@ def test_score_join_comparison_uses_two_relations(catalog):
     )
     node = plan.root.input
     assert isinstance(node, SemanticJoin)
-    assert node.comparison == ">"
-    assert node.threshold == 0.8
-    assert tuple(ref.alias for ref in node.predicate.args) == ("q", "d")
+    assert isinstance(node.predicate, Compare)
+    assert (node.predicate.comparison, node.predicate.threshold) == (">", 0.8)
+    assert node.predicate.call.aliases() == ("q", "d")
 
 
 @pytest.mark.parametrize("sql", [
@@ -609,13 +610,10 @@ def test_threshold_on_the_left_flips_the_comparison(catalog):
     )
     join = plan.root.input
     assert isinstance(join, SemanticJoin)
-    assert (join.comparison, join.threshold) == ("<", 0.8)
-    predicate = next(
-        predicate for node in plan.walk()
-        if type(node).__name__ == "SemanticFilter"
-        for predicate in node.predicates
-    )
-    assert (predicate.comparison, predicate.threshold) == (">=", 0.5)
+    assert (join.predicate.comparison, join.predicate.threshold) == ("<", 0.8)
+    (predicate,) = plan.operators().filters["d"]
+    expression = predicate.expression
+    assert (expression.comparison, expression.threshold) == (">=", 0.5)
 
 
 def test_repeated_placeholder_names_the_document_in_the_query(catalog):

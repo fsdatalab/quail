@@ -25,10 +25,10 @@ class LogicalNode(Protocol):
 
 `children()` returns the node's inputs in the plan tree. For
 example, a `SemanticFilter`'s child is its `Scan`, and a `Project`'s
-child is the filter or join below it. `expressions()` returns the data attached to the node, e.g., for a
-`SemanticFilter` these are the `FilterPredicate` objects (each
-containing a bound prompt and selectivity), and for a `Project`
-these are the output column references.
+child is the filter or join below it. `expressions()` returns the
+expressions attached to the node: for a `SemanticFilter` these are
+its `FilterPredicate` objects, each holding a predicate expression and
+a selectivity hint, and for a `Project` these are the output columns.
 
 Nodes are frozen dataclasses. Since they are immutable,
 `with_children` and `with_expressions` return a new node with the
@@ -41,9 +41,32 @@ before parents.
 | Node | What it represents |
 | --- | --- |
 | `Scan(provider, alias, column)` | Read one document column from a registered table. |
-| `SemanticFilter(input, predicates)` | One or more AI predicates over one table. |
-| `SemanticJoin(inputs, predicate, semantics, selectivity, anchor)` | An AI join between two tables. `semantics` is `full`, `exists`, or `anti`. A query joining three or more tables has one `SemanticJoin` per pair. |
+| `SemanticFilter(input, predicates)` | One or more model predicates over one table. |
+| `Join(left, right, on)` | The pairs of two inputs, narrowed by ordinary column equalities. No `on` means every pair. |
+| `SemanticJoin(input, predicate, semantics, selectivity, anchor)` | One model predicate over the pairs its input `Join` produces. `semantics` is `full`, `exists`, or `anti`. A query joining three or more tables has one `SemanticJoin` per pair. |
+| `Apply(input, function, kind, ids, columns, aliases)` | A registered Python function between two operators. |
 | `Project(input, columns, limit)` | Column projection and optional limit. Always the root. |
+
+## Expressions
+
+The AI functions of the language are expressions, not operators. An
+operator holds expressions and does not change when a new AI
+function arrives.
+
+| Expression | Value |
+| --- | --- |
+| `ColumnRef(alias, provider, column)` | A column of a table. |
+| `ModelCall(prompt, kind)` | One prompt asked of every row. `kind` is `boolean` for `AI.IF`, which answers yes or no, or `score` for `AI.SCORE`, which answers a float between 0 and 1. |
+| `Compare(call, comparison, threshold)` | A score compared with a threshold. Answers yes or no. |
+| `Alias(expression, name)` | A model call returned as a named result column. |
+
+A predicate on a `SemanticFilter` or `SemanticJoin` answers yes or
+no: a boolean `ModelCall`, or a `Compare` around a score call.
+`Project.columns` holds `ColumnRef` and `Alias` values.
+
+`LogicalPlan.operators()` is the one walk that turns the tree into
+what the planner reads: the scans, each alias's filter predicates in
+written order, the joins in written order, and the applies.
 
 
 ## Prompt binding

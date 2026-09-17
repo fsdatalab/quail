@@ -7,9 +7,11 @@ from quail.cost.sol import speed_of_light
 from quail.cost.work import Work, triangle
 from quail.logical import (
     SHARED_PRE,
+    Alias,
     Apply,
-    ScoreExpression,
+    SemanticJoin,
     effective_selectivity,
+    is_score,
 )
 from quail.physical import (
     AiScore,
@@ -21,7 +23,7 @@ from quail.physical import (
     ScoreSpec,
 )
 from quail.physical.base import input_ports
-from quail.planner import collect_operators, hash_join_nodes
+from quail.planner import hash_join_nodes
 from quail.planner.physical_optimizer import PhysicalCandidate
 from quail.planner.plan import PhysicalPlan, Refusal
 from quail.reranker import render_qwen3_reranker_input
@@ -163,18 +165,19 @@ def _score_spec(
     ), work
 
 
-def _projection_scores(logical) -> tuple[ScoreExpression, ...]:
+def _projection_scores(logical) -> tuple[Alias, ...]:
     return tuple(
         expression
         for expression in logical.root.columns
-        if isinstance(expression, ScoreExpression)
+        if isinstance(expression, Alias)
     )
 
 
 def _score_name(prompt, projected, fallback: str) -> str:
     # the front end rejects one prompt projected under two names
     return next(
-        (item.name for item in projected if item.prompt == prompt), fallback
+        (item.name for item in projected if item.expression.prompt == prompt),
+        fallback,
     )
 
 
@@ -225,7 +228,8 @@ def _plan_reranker(region, context, *, backend_name: str):
         refusal = _refusal("AI.SCORE cannot be mixed with apply()")
         return (PhysicalCandidate(None, refusal, float("inf")),)
 
-    scans, filters, joins = collect_operators(logical)
+    operators = logical.operators()
+    scans, filters, joins = operators.scans, operators.filters, operators.joins
     projected = _projection_scores(logical)
     predicates = [
         predicate
@@ -236,14 +240,15 @@ def _plan_reranker(region, context, *, backend_name: str):
         refusal = _refusal("a reranker model needs an AI.SCORE expression")
         return (PhysicalCandidate(None, refusal, float("inf")),)
     prompts = [predicate.prompt for predicate in predicates] + [
-        score.prompt for score in projected
+        score.expression.prompt for score in projected
     ]
     if any(len(_prompt_aliases(prompt)) > 2 for prompt in prompts):
         refusal = _refusal(
             "AI.SCORE supports one document or one document pair"
         )
         return (PhysicalCandidate(None, refusal, float("inf")),)
-    if any(predicate.comparison is None for predicate in predicates):
+    if not all(is_score(item.predicate if isinstance(item, SemanticJoin)
+                        else item.expression) for item in predicates):
         refusal = _refusal(
             "AI.SCORE cannot be mixed with generative AI predicates"
         )
@@ -252,9 +257,9 @@ def _plan_reranker(region, context, *, backend_name: str):
         refusal = _refusal("AI.SCORE supports full joins only")
         return (PhysicalCandidate(None, refusal, float("inf")),)
     pair_prompts = [
-        *(join.predicate for join in joins),
-        *(score.prompt for score in projected
-          if len(_prompt_aliases(score.prompt)) == 2),
+        *(join.prompt for join in joins),
+        *(score.expression.prompt for score in projected
+          if len(score.expression.aliases()) == 2),
     ]
     if len(set(pair_prompts)) > 1:
         refusal = _refusal(
@@ -383,8 +388,8 @@ def _plan_reranker(region, context, *, backend_name: str):
                 inputs=input_ports((score_ref,)),
                 score_name=name,
                 aliases=(alias,),
-                comparison=predicate.comparison,
-                threshold=predicate.threshold,
+                comparison=predicate.expression.comparison,
+                threshold=predicate.expression.threshold,
                 selectivity=predicate.selectivity,
                 written_pos=written_pos,
             )
@@ -393,12 +398,13 @@ def _plan_reranker(region, context, *, backend_name: str):
         live[alias] = live_count
 
         for expression in projected:
-            if expression.prompt in score_names:
+            prompt = expression.expression.prompt
+            if prompt in score_names:
                 continue
-            if _prompt_aliases(expression.prompt) != (alias,):
+            if _prompt_aliases(prompt) != (alias,):
                 continue
             current[alias], _ = add_score(
-                expression.prompt,
+                prompt,
                 expression.name,
                 (current[alias],),
                 live[alias],
@@ -417,7 +423,8 @@ def _plan_reranker(region, context, *, backend_name: str):
         )
         prefix_groups = live[left] * touched
         projected_name = next(
-            (score.name for score in projected if score.prompt == pair_prompt),
+            (score.name for score in projected
+             if score.expression.prompt == pair_prompt),
             "__score_join_0",
         )
         score_ref, spec = add_score(
@@ -430,7 +437,7 @@ def _plan_reranker(region, context, *, backend_name: str):
             prefix_groups=prefix_groups,
         )
         matching_join = next(
-            (join for join in joins if join.predicate == pair_prompt), None
+            (join for join in joins if join.prompt == pair_prompt), None
         )
         if matching_join is not None:
             written_pos = joins.index(matching_join)
@@ -439,8 +446,8 @@ def _plan_reranker(region, context, *, backend_name: str):
                 inputs=input_ports((score_ref,)),
                 score_name=spec.name,
                 aliases=(left, right),
-                comparison=matching_join.comparison,
-                threshold=matching_join.threshold,
+                comparison=matching_join.predicate.comparison,
+                threshold=matching_join.predicate.threshold,
                 selectivity=matching_join.selectivity,
                 written_pos=written_pos,
             )
@@ -451,7 +458,7 @@ def _plan_reranker(region, context, *, backend_name: str):
 
     columns = tuple(
         expression.name
-        if isinstance(expression, ScoreExpression)
+        if isinstance(expression, Alias)
         else f"{expression.alias}.{expression.column}"
         for expression in logical.root.columns
     )

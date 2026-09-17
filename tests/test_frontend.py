@@ -74,7 +74,7 @@ def test_sql_dialects_and_builder_produce_the_same_plan(catalog):
     assert join.anchor is None
     # the prompt sits on a relational Join; no ON equality means
     # every pair is a candidate
-    (pairs,) = join.inputs
+    pairs = join.input
     assert isinstance(pairs, Join) and pairs.on == ()
     filt = pairs.left
     assert isinstance(filt, SemanticFilter)
@@ -87,7 +87,7 @@ def test_sql_dialects_and_builder_produce_the_same_plan(catalog):
         ("products", "description")
     # the join template is never canonicalized: it is the per-tuple
     # question, kept as written
-    assert join.predicate.template == \
+    assert join.prompt.template == \
         "Review {0} discusses product {1}"
 
     star = compile_sql(
@@ -133,12 +133,12 @@ def test_sql_dialects_and_builder_produce_the_same_plan(catalog):
     assert join.anchor == "b"
     assert join.selectivity == 0.02
     # both new tables are cross joined under one predicate
-    (outer_pairs,) = join.inputs
+    outer_pairs = join.input
     assert isinstance(outer_pairs, Join) and outer_pairs.on == ()
     assert isinstance(outer_pairs.left, Join)
     assert isinstance(outer_pairs.left.left, Scan)
     assert isinstance(join_outer_input(join), Scan)
-    assert [r.alias for r in join.predicate.args] == ["a", "b", "p"]
+    assert [r.alias for r in join.prompt.args] == ["a", "b", "p"]
 
     # Snowflake style (bare JOINs, the predicate on the last ON),
     # BigQuery style (comma cross product, the predicate in WHERE),
@@ -274,8 +274,8 @@ def test_join_predicates_and_semantics(catalog):
     assert isinstance(outer, SemanticJoin)
     inner = join_outer_input(outer)
     assert isinstance(inner, SemanticJoin)
-    assert [r.alias for r in inner.predicate.args] == ["a", "b"]
-    assert [r.alias for r in outer.predicate.args] == ["b", "p"]
+    assert [r.alias for r in inner.prompt.args] == ["a", "b"]
+    assert [r.alias for r in outer.prompt.args] == ["b", "p"]
     assert inner.selectivity == 0.5 and outer.selectivity == 0.2
     # both SQL styles and the chained builder produce the same plan
     built = (docs(catalog, "reviews", tok).alias("a")
@@ -333,11 +333,11 @@ def test_join_predicates_and_semantics(catalog):
     plan = compile_sql(sql, catalog, tok)
     outer = plan.root.input
     assert isinstance(outer, SemanticJoin)
-    inner = outer.inputs[0]                     # p already in the tree
+    inner = outer.input                         # p already in the tree
     assert isinstance(inner, SemanticJoin)
-    assert isinstance(inner.inputs[0], Join)
-    assert [r.alias for r in inner.predicate.args] == ["r", "p"]
-    assert [r.alias for r in outer.predicate.args] == ["r", "p"]
+    assert isinstance(inner.input, Join)
+    assert [r.alias for r in inner.prompt.args] == ["r", "p"]
+    assert [r.alias for r in outer.prompt.args] == ["r", "p"]
 
 
 PAIR_JOIN_SQL = """
@@ -358,7 +358,7 @@ def test_join_on_equality_prunes_the_pairs(catalog):
     plan = compile_sql(PAIR_JOIN_SQL, catalog, tok)
     join = plan.root.input
     assert isinstance(join, SemanticJoin)
-    (pairs,) = join.inputs
+    pairs = join.input
     assert isinstance(pairs, Join)
     assert [str(condition) for condition in pairs.on] == ["r.id = p.asin"]
     assert join_conditions(join) == pairs.on
