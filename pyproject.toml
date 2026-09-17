@@ -38,7 +38,7 @@ dev = [
 ]
 
 [tool.uv.sources]
-quail-b = { git = "https://github.com/fsdatalab/quail-bench.git", rev = "8f8b2e9d1648ffeee09ae68825f980eb6b8987f1" }
+quail-b = { git = "https://github.com/fsdatalab/quail-bench.git", rev = "5168c5e2d395bfa4b73ebfbf9e148c3152d2b282" }
 
 [build-system]
 requires = ["hatchling==1.32.0"]
