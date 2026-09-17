@@ -21,6 +21,7 @@ from .codec import (
 from .nodes import (
     AiFilter,
     AiJoin,
+    AiScore,
     Barrier,
     Exchange,
     FilterStage,
@@ -34,11 +35,14 @@ from .nodes import (
     RequestFilterSpec,
     RequestJoinSpec,
     Scan,
+    ScoreFilter,
+    ScoreSpec,
     validate_streams,
 )
 
 __all__ = [
     "AiJoin",
+    "AiScore",
     "Scan",
     "Barrier",
     "Exchange",
@@ -48,6 +52,8 @@ __all__ = [
     "HashJoin",
     "GraphValidationError",
     "Recombine",
+    "ScoreFilter",
+    "ScoreSpec",
     "InputPort",
     "JoinStage",
     "Limit",

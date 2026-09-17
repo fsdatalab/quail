@@ -160,6 +160,68 @@ AI_FILTER(PROMPT(...), {'selectivity': 0.3, 'anchor': 'r'})
   documents. If omitted, Quail chooses automatically to minimize
   query cost.
 
+### AI.SCORE
+
+`AI.SCORE` uses a reranker model to score whether a document meets a
+condition. A query can return the score as a `FLOAT64` value from 0 to
+1:
+
+```sql
+SELECT
+    d.id,
+    AI.SCORE(
+        PROMPT('The customer requests a refund: {0}', d.body)
+    ) AS refund_score
+FROM documents d
+```
+
+Returning a score does not filter any rows. The `AS` name is required.
+You can compare a score with `<`, `<=`, `>`, or `>=` inside
+`WHERE` or `JOIN ... ON`:
+
+```sql
+SELECT d.id
+FROM documents d
+WHERE AI.SCORE(
+    PROMPT('The customer requests a refund: {0}', d.body),
+    {'selectivity': 0.1}
+) >= 0.75
+```
+
+The score is the normalized YES score:
+
+```text
+exp(yes_logit) / (exp(yes_logit) + exp(no_logit))
+```
+
+It is between 0 and 1. It is not a calibrated probability.
+
+A prompt with two relations defines a join. The first argument is the
+query. The second argument is the candidate document.
+
+```sql
+SELECT q.id, d.id
+FROM queries q
+JOIN documents d ON AI.SCORE(
+    PROMPT('Is {1} relevant to {0}?', q.text, d.body)
+) >= 0.8
+```
+
+Use a reranker model in the session configuration:
+
+```python
+config = quail.EngineConfig(
+    model="qwen3-reranker-0.6b-bf16",
+    device="h100-sxm",
+)
+```
+
+Quail supports the 0.6B and 4B Qwen3 rerankers in BF16. Several GPUs
+run separate model copies and split the scoring requests between them.
+When the same `AI.SCORE` call appears in `SELECT` and `WHERE`, Quail
+computes the score once and uses it for both operations. `AI.SCORE`
+cannot be mixed with generative AI predicates in one query.
+
 ### AI.CLASSIFY
 
 <Callout type="info">Coming soon</Callout>

@@ -39,6 +39,7 @@ from quail.frontend.sql import SQLDialect, compile_sql
 from quail.logical import (
     CompileError,
     LogicalPlan,
+    ScoreExpression,
     join_conditions,
     oriented_join_conditions,
 )
@@ -525,22 +526,36 @@ class Query:
                     self.session.catalog, self.session.config
                 ),
             )
-            scans, _, joins = collect_operators(self.logical)
+            scans, logical_filters, joins = collect_operators(self.logical)
+            has_score = any(
+                predicate.comparison is not None
+                for predicates in logical_filters.values()
+                for predicate in predicates
+            ) or any(
+                join.comparison is not None for join in joins
+            ) or any(
+                isinstance(expression, ScoreExpression)
+                for expression in self.logical.root.columns
+            )
             self._doc_tokens = {}
             self._token_inputs = {}
             estimated = []
             for s in scans:
+                projected_columns = (
+                    tuple(dict.fromkeys((*s.columns, s.column)))
+                    if has_score else s.columns
+                )
                 exact = self.session.token_lengths(s.provider, s.column)
                 if exact is not None:
                     store = self.session.tokenize(
-                        s.provider, s.column, s.columns)
+                        s.provider, s.column, projected_columns)
                     self._token_inputs[s.alias] = store
                     self._doc_tokens[s.alias] = store.lengths
                     continue
                 self._doc_tokens[s.alias] = self.session.estimate_lengths(
                     s.provider, s.column)
                 self._token_futures[s.alias] = self.session.tokenize_async(
-                    s.provider, s.column, s.columns)
+                    s.provider, s.column, projected_columns)
                 estimated.append(s.alias)
             self._estimated = tuple(estimated)
             started = time.perf_counter()
@@ -671,9 +686,31 @@ class Query:
     def _column_tables(self) -> dict:
         """One value table per alias a HashJoin or an apply() reads."""
         needed = {}
-        for join in collect_operators(self.logical)[2]:
+        _, filters, joins = collect_operators(self.logical)
+        for join in joins:
             for condition in join_conditions(join):
                 for ref in (condition.left, condition.right):
+                    needed.setdefault(ref.alias, {})[ref.column] = None
+        has_score = any(
+            predicate.comparison is not None
+            for predicates in filters.values()
+            for predicate in predicates
+        ) or any(join.comparison is not None for join in joins) or any(
+            isinstance(expression, ScoreExpression)
+            for expression in self.logical.root.columns
+        )
+        if has_score:
+            for predicates in filters.values():
+                for predicate in predicates:
+                    for ref in predicate.prompt.args:
+                        needed.setdefault(ref.alias, {})[ref.column] = None
+            for join in joins:
+                for ref in join.predicate.args:
+                    needed.setdefault(ref.alias, {})[ref.column] = None
+            for expression in self.logical.root.columns:
+                if not isinstance(expression, ScoreExpression):
+                    continue
+                for ref in expression.prompt.args:
                     needed.setdefault(ref.alias, {})[ref.column] = None
         for apply in collect_applies(self.logical):
             for ref in apply.columns:
@@ -698,6 +735,7 @@ class Query:
         report = dict(
             backend=out.get("backend", plan.backend),
             wall_s=out["wall_s"], boot_s=out.get("boot_s"),
+            estimated_seconds=plan.estimated_seconds,
             boot_kind=out.get("boot_kind"),
             boot=out.get("boot"),
             coordinator_wall_s=round(coordinator_wall, 2),
@@ -722,6 +760,15 @@ class Query:
         for key in ("gpu_s", "chunks"):
             if key in out:
                 report[key] = out[key]
+        for key in (
+            "evaluated_documents",
+            "evaluated_document_pairs",
+            "documents_per_second",
+            "document_pairs_per_second",
+            "usd_per_query",
+        ):
+            if key in out:
+                report[key] = out[key]
 
         scans, logical_filters, logical_joins = collect_operators(self.logical)
         scans_by_alias = {scan.alias: scan for scan in scans}
@@ -729,6 +776,55 @@ class Query:
         def project(node, value):
             if not isinstance(node, Project):
                 raise TypeError(type(node).__name__)
+            if (
+                isinstance(value, pa.Table)
+                and (value.schema.metadata or {}).get(b"quail.kind")
+                == b"score_rows"
+            ):
+                arrays = []
+                fields = []
+                for name in node.columns:
+                    if name in value.column_names:
+                        column = value.column(name)
+                        arrays.append(column)
+                        fields.append(pa.field(name, column.type))
+                        continue
+                    try:
+                        alias, column_name = name.split(".", 1)
+                        scan = scans_by_alias[alias]
+                    except (ValueError, KeyError) as error:
+                        raise CompileError(
+                            f"unknown projection column {name!r}"
+                        ) from error
+                    store = self._token_inputs[alias]
+                    if column_name not in store.projected_columns:
+                        raise CompileError(
+                            f"projection column {name!r} was not loaded "
+                            f"by the scan of {alias!r}"
+                        )
+                    column = pc.take(
+                        store.column(column_name),
+                        value.column(alias),
+                    )
+                    arrays.append(column)
+                    fields.append(pa.field(
+                        name,
+                        column.type,
+                        nullable=column.null_count > 0,
+                        metadata={
+                            b"quail.alias": alias.encode("utf-8"),
+                            b"quail.provider": scan.provider.encode("utf-8"),
+                            b"quail.column": column_name.encode("utf-8"),
+                        },
+                    ))
+                table = pa.Table.from_arrays(
+                    arrays,
+                    schema=pa.schema(
+                        fields,
+                        metadata={b"quail.kind": b"query_result"},
+                    ),
+                )
+                return QueryResult.from_table(table)
             if node.inputs[0].value_type is ValueType.JOIN_ANSWERS:
                 value = true_answer_rows(value)
             relation = (

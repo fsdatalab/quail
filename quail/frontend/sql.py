@@ -14,6 +14,7 @@ from quail.logical import (
     JoinSpec,
     LogicalPlan,
     LogicalPlanBuilder,
+    ScoreExpression,
     bind_join_prompt,
     bind_prompt,
 )
@@ -36,6 +37,7 @@ FORBIDDEN = (
 # one option surface: anchor is rejected after parsing when the
 # predicate turns out to be a one-provider filter
 JOIN_OPTION_KEYS = {"selectivity", "anchor"}
+SCORE_OPTION_KEYS = {"selectivity"}
 
 
 class SQLDialect(StrEnum):
@@ -45,19 +47,23 @@ class SQLDialect(StrEnum):
     BQ = "bq"
 
 
-def _normalize_ai_if(sql: str, dialect: SQLDialect) -> str:
-    """Lower BigQuery AI.IF calls to the internal function name."""
-    if dialect is not SQLDialect.BQ:
-        return sql
+def _normalize_ai_calls(sql: str, dialect: SQLDialect) -> str:
+    """Lower dotted AI calls to internal function names."""
     tokens = sqlglot.Dialect.get_or_raise(
         "bigquery"
     ).tokenizer().tokenize(sql)
     edits = []
     for index in range(len(tokens) - 3):
         head, dot, name, left = tokens[index:index + 4]
-        if (head.text.upper() == "AI" and dot.text == "."
-                and name.text.upper() == "IF" and left.text == "("):
-            edits.append((head.start, left.end + 1, "AI_FILTER("))
+        function = name.text.upper()
+        replacement = None
+        if function == "SCORE":
+            replacement = "AI_SCORE("
+        elif function == "IF" and dialect is SQLDialect.BQ:
+            replacement = "AI_FILTER("
+        if head.text.upper() == "AI" and dot.text == "." \
+                and left.text == "(" and replacement is not None:
+            edits.append((head.start, left.end + 1, replacement))
     for start, end, replacement in reversed(edits):
         sql = sql[:start] + replacement + sql[end:]
     return sql
@@ -66,6 +72,11 @@ def _normalize_ai_if(sql: str, dialect: SQLDialect) -> str:
 def _is_call(node, name: str) -> bool:
     return (isinstance(node, exp.Anonymous)
             and str(node.this).upper() == name)
+
+
+def _is_ai_score_comparison(node) -> bool:
+    return isinstance(node, (exp.LT, exp.LTE, exp.GT, exp.GTE)) \
+        and _is_call(node.this, "AI_SCORE")
 
 
 def _reject_forbidden(tree) -> None:
@@ -82,9 +93,13 @@ def _reject_forbidden(tree) -> None:
             "evaluates it")
     for fn in tree.find_all(exp.Anonymous):
         name = str(fn.this).upper()
-        if name.startswith("AI_") and name != "AI_FILTER":
-            raise CompileError(f"{name} is not supported; AI_FILTER "
-                               f"is the only AI function")
+        if name.startswith("AI_") and name not in {
+            "AI_FILTER", "AI_SCORE",
+        }:
+            raise CompileError(
+                f"{name} is not supported; supported AI functions are "
+                "AI_FILTER and AI_SCORE"
+            )
     # subqueries are legal only as the EXISTS form, checked
     # structurally; any other subquery is refused here
     for sub in tree.find_all(exp.Subquery):
@@ -146,14 +161,14 @@ class _Binder:
                 f"is computed once")
         self.doc_columns[ref.alias] = ref.column
 
-    # ---- AI_FILTER parsing -------------------------------------------
+    # ---- AI predicate parsing ----------------------------------------
 
     def parse_options(self, node, allowed: set) -> dict:
         if node is None:
             return {}
         if not isinstance(node, exp.Struct):
             raise CompileError(
-                f"the second argument to AI_FILTER must be an option "
+                f"the second AI operator argument must be an option "
                 f"object like {{'selectivity': 0.3}}, got {node.sql()}")
         out = {}
         for prop in node.expressions:
@@ -178,20 +193,23 @@ class _Binder:
                 out[key] = str(value.this)
         return out
 
-    def parse_ai_filter(self, node, allowed: set, scope=None,
-                        join=None):
-        """Parse an AI_FILTER node into (prompt, options, aliases)."""
-        if not _is_call(node, "AI_FILTER"):
+    def parse_ai_call(self, node, function: str, allowed: set, scope=None,
+                      join=None):
+        """Parse one AI prompt call into prompt, options, and aliases."""
+        if not _is_call(node, function):
             raise CompileError(
-                f"only AI_FILTER(PROMPT(...)) predicates are "
+                f"only {function}(PROMPT(...)) predicates are "
                 f"supported here, got: {node.sql()}")
         args = node.expressions
         if not args or not _is_call(args[0], "PROMPT"):
-            raise CompileError("AI_FILTER's first argument must be "
-                               "PROMPT('template', columns...)")
+            raise CompileError(
+                f"{function}'s first argument must be "
+                "PROMPT('template', columns...)"
+            )
         if len(args) > 2:
-            raise CompileError("AI_FILTER takes PROMPT and at most one "
-                               "option object")
+            raise CompileError(
+                f"{function} takes PROMPT and at most one option object"
+            )
         options = self.parse_options(args[1] if len(args) == 2 else None,
                                      allowed)
         p_args = args[0].expressions
@@ -218,13 +236,51 @@ class _Binder:
             self.note_doc_column(r)
         return prompt, options, aliases
 
+    def parse_ai_filter(self, node, allowed: set, scope=None, join=None):
+        """Parse an AI_FILTER node into prompt, options, and aliases."""
+        return self.parse_ai_call(
+            node, "AI_FILTER", allowed, scope=scope, join=join
+        )
+
+    def parse_ai_score(self, node, allowed: set, scope=None, join=None):
+        """Parse a compared AI.SCORE call."""
+        comparisons = {
+            exp.LT: "<",
+            exp.LTE: "<=",
+            exp.GT: ">",
+            exp.GTE: ">=",
+        }
+        comparison = next(
+            (value for kind, value in comparisons.items()
+             if isinstance(node, kind)),
+            None,
+        )
+        if comparison is None or not _is_call(node.this, "AI_SCORE"):
+            raise CompileError(
+                "AI.SCORE must be compared with <, <=, >, or >="
+            )
+        threshold = node.expression
+        if not isinstance(threshold, exp.Literal) or threshold.is_string:
+            raise CompileError("AI.SCORE threshold must be a number")
+        value = float(threshold.this)
+        if not 0.0 <= value <= 1.0:
+            raise CompileError("AI.SCORE threshold must be between 0 and 1")
+        prompt, options, aliases = self.parse_ai_call(
+            node.this,
+            "AI_SCORE",
+            allowed,
+            scope=scope,
+            join=join,
+        )
+        return prompt, options, aliases, comparison, value
+
 
 def _parse_equality(b, term, joined_alias: str) -> Equality:
     """Parse one ordinary ON condition: two columns compared with =."""
     if not isinstance(term, exp.EQ) or not isinstance(term.this, exp.Column) \
             or not isinstance(term.expression, exp.Column):
         raise CompileError(
-            f"ON supports column = column and AI_FILTER(...), got "
+            f"ON supports column = column and AI predicates, got "
             f"{term.sql()}")
     left = b.resolve_column(term.this)
     right = b.resolve_column(term.expression)
@@ -279,7 +335,7 @@ def compile_sql(sql: str, catalog: Catalog,
             f"unsupported SQL dialect {dialect!r}; expected snowflake "
             "or bq"
         ) from error
-    sql = _normalize_ai_if(sql, dialect)
+    sql = _normalize_ai_calls(sql, dialect)
     sqlglot_dialect = (
         "bigquery" if dialect is SQLDialect.BQ else "snowflake"
     )
@@ -322,8 +378,20 @@ def compile_sql(sql: str, catalog: Catalog,
         equalities, predicates = [], []
         for term in _conjuncts(on):
             if _is_call(term, "AI_FILTER"):
-                predicates.append(term)
+                predicates.append((*b.parse_ai_filter(
+                    term, JOIN_OPTION_KEYS, join=True
+                ), None, None))
+            elif _is_ai_score_comparison(term):
+                predicates.append(b.parse_ai_score(
+                    term, SCORE_OPTION_KEYS, join=True
+                ))
             else:
+                if any(
+                    _is_call(call, "AI_SCORE") for call in term.walk()
+                ):
+                    raise CompileError(
+                        "AI.SCORE must be compared with <, <=, >, or >="
+                    )
                 equalities.append(_parse_equality(b, term, alias))
         if len(predicates) > 1:
             raise CompileError(
@@ -331,13 +399,11 @@ def compile_sql(sql: str, catalog: Catalog,
                 f"ON; ask one question per JOIN")
         if equalities:
             conditions[alias] = equalities
-        for term in predicates:
-            on_preds.append(b.parse_ai_filter(term, JOIN_OPTION_KEYS,
-                                              join=True))
+        on_preds.extend(predicates)
 
     claimed = set()           # joined tables already carried by a spec
 
-    def add_join_spec(prompt, options, aliases):
+    def add_join_spec(prompt, options, aliases, comparison, threshold):
         joinable = {b.tables[0][0], *joined_aliases}
         outside = [a for a in aliases if a not in joinable]
         if outside:
@@ -370,7 +436,9 @@ def compile_sql(sql: str, catalog: Catalog,
         b.joins.append(JoinSpec(aliases=news,
                                 prompt=prompt, semantics="full",
                                 selectivity=options.get("selectivity"),
-                                anchor=anchor, on=on))
+                                anchor=anchor, on=on,
+                                comparison=comparison,
+                                threshold=threshold))
 
     for pred in on_preds:
         add_join_spec(*pred)
@@ -387,8 +455,17 @@ def compile_sql(sql: str, catalog: Catalog,
         if anti:
             raise CompileError(f"NOT is only supported as NOT EXISTS, "
                                f"got NOT {node.sql()}")
-        prompt, options, aliases = b.parse_ai_filter(
-            term, JOIN_OPTION_KEYS)
+        if _is_ai_score_comparison(term):
+            prompt, options, aliases, comparison, threshold = \
+                b.parse_ai_score(term, SCORE_OPTION_KEYS)
+        else:
+            if any(_is_call(call, "AI_SCORE") for call in term.walk()):
+                raise CompileError(
+                    "AI.SCORE must be compared with <, <=, >, or >="
+                )
+            prompt, options, aliases = b.parse_ai_filter(
+                term, JOIN_OPTION_KEYS)
+            comparison = threshold = None
         if len(aliases) == 1:
             if "anchor" in options:
                 raise CompileError(
@@ -396,22 +473,42 @@ def compile_sql(sql: str, catalog: Catalog,
                     "AI_FILTER takes only selectivity")
             b.filters.setdefault(aliases[0], []).append(
                 FilterPredicate(prompt=prompt,
-                                selectivity=options.get("selectivity")))
+                                selectivity=options.get("selectivity"),
+                                comparison=comparison,
+                                threshold=threshold))
             continue
         # a multi-provider WHERE predicate is a join predicate,
         # BigQuery style: tables cross-joined in FROM, filtered here
-        add_join_spec(prompt, options, aliases)
+        add_join_spec(prompt, options, aliases, comparison, threshold)
+
+    columns = _compile_projection(b, tree.expressions)
+    projected_scores = tuple(
+        column for column in columns if isinstance(column, ScoreExpression)
+    )
 
     for alias, equalities in conditions.items():
         raise CompileError(
             f"JOIN {alias} ON {equalities[0]} has no AI predicate over "
             f"its pairs; a plain join belongs in the database the ids "
             f"came from")
-    _check_join_coverage(b, joined_aliases)
+    _check_join_coverage(b, joined_aliases, projected_scores)
 
-    columns = _compile_projection(b, tree.expressions)
+    filter_predicates = [
+        predicate
+        for predicates in b.filters.values()
+        for predicate in predicates
+    ]
+    score_flags = [
+        predicate.comparison is not None for predicate in filter_predicates
+    ] + [join.comparison is not None for join in b.joins] \
+        + [True for _ in projected_scores]
+    if any(score_flags) and not all(score_flags):
+        raise CompileError(
+            "AI.SCORE cannot be mixed with generative AI predicates "
+            "in one query"
+        )
 
-    if not b.joins and not b.filters:
+    if not b.joins and not b.filters and not projected_scores:
         raise CompileError("the query has no AI predicate; a plain "
                            "scan belongs in the database the ids came "
                            "from")
@@ -426,10 +523,17 @@ def compile_sql(sql: str, catalog: Catalog,
         )
     for join in b.joins:
         logical.add_join(join)
+    for alias in joined_aliases:
+        if alias not in claimed:
+            logical.add_cross_join(alias)
     return logical.project(tuple(columns), limit)
 
 
-def _check_join_coverage(b: _Binder, joined_aliases: list) -> None:
+def _check_join_coverage(
+    b: _Binder,
+    joined_aliases: list,
+    projected_scores: tuple[ScoreExpression, ...] = (),
+) -> None:
     """Check that the join predicates cover and connect every JOINed table.
 
     Every JOINed table must appear in a join predicate, and all
@@ -439,13 +543,18 @@ def _check_join_coverage(b: _Binder, joined_aliases: list) -> None:
         return
     preds = [{r.alias for r in j.prompt.args}
              for j in b.joins if j.semantics == "full"]
+    preds.extend(
+        {ref.alias for ref in score.prompt.args}
+        for score in projected_scores
+        if len({ref.alias for ref in score.prompt.args}) > 1
+    )
     uncovered = [a for a in joined_aliases
                  if not any(a in p for p in preds)]
     if uncovered:
         raise CompileError(
             f"JOINed tables {uncovered} appear in no join predicate: "
             f"every JOINed table must appear in at least one "
-            f"AI_FILTER(PROMPT(...)) join predicate - on a JOIN's ON "
+            f"AI predicate on a JOIN's ON "
             f"or as a WHERE term")
     root = b.tables[0][0]
     reached = {root}
@@ -514,8 +623,27 @@ def _compile_projection(b: _Binder, expressions) -> list:
                                              provider=provider,
                                              column=c))
             continue
+        alias = None
         if isinstance(e, exp.Alias):
+            alias = e.alias
             e = e.this
+        if _is_call(e, "AI_SCORE"):
+            if not alias:
+                raise CompileError("AI.SCORE needs an AS name in SELECT")
+            prompt, _options, aliases = b.parse_ai_call(
+                e, "AI_SCORE", set()
+            )
+            if len(aliases) not in {1, 2}:
+                raise CompileError(
+                    "projected AI.SCORE must reference one or two relations"
+                )
+            columns.append(ScoreExpression(prompt=prompt, name=alias))
+            continue
+        if any(_is_call(call, "AI_SCORE") for call in e.walk()):
+            raise CompileError(
+                "AI.SCORE in SELECT must be a direct expression with "
+                "an AS name"
+            )
         if not isinstance(e, exp.Column):
             raise CompileError(
                 f"the SELECT list is column selection only, got "

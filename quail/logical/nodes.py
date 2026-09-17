@@ -18,6 +18,16 @@ class ColumnRef:
 
 
 @dataclass(frozen=True)
+class ScoreExpression:
+    """One named numeric score produced by a reranker prompt."""
+
+    prompt: "Prompt"
+    name: str
+
+    type_name: ClassVar[str] = "quail.score_expression"
+
+
+@dataclass(frozen=True)
 class Prompt:
     """A bound PROMPT call, split into preamble, frame, and tail.
 
@@ -56,6 +66,8 @@ class FilterPredicate:
     prompt: Prompt
     selectivity: Optional[float] = None   # fraction of documents that
     #                                       pass; None means not given
+    comparison: Optional[str] = None
+    threshold: Optional[float] = None
 
     type_name: ClassVar[str] = "quail.filter_predicate"
 
@@ -158,6 +170,16 @@ class SemanticFilter:
     def validate(self) -> None:
         if not self.predicates:
             raise CompileError("SemanticFilter needs at least one predicate")
+        for predicate in self.predicates:
+            if (predicate.comparison is None) != (predicate.threshold is None):
+                raise CompileError(
+                    "AI.SCORE needs both a comparison and threshold"
+                )
+            if predicate.comparison not in {None, "<", "<=", ">", ">="}:
+                raise CompileError(
+                    f"unsupported AI.SCORE comparison "
+                    f"{predicate.comparison!r}"
+                )
 
     def with_children(self, children: tuple[LogicalNode, ...]):
         if len(children) != 1:
@@ -173,6 +195,8 @@ class SemanticFilter:
         return {
             "predicates": len(self.predicates),
             "selectivities": [p.selectivity for p in self.predicates],
+            "comparisons": [p.comparison for p in self.predicates],
+            "thresholds": [p.threshold for p in self.predicates],
         }
 
 
@@ -256,6 +280,8 @@ class SemanticJoin:
     selectivity: Optional[float] = None    # fraction of tuples that pass
     anchor: Optional[str] = None       # table alias whose KV is kept;
     #                                    None = planner picks
+    comparison: Optional[str] = None
+    threshold: Optional[float] = None
 
     type_name: ClassVar[str] = "quail.semantic_join"
 
@@ -279,6 +305,14 @@ class SemanticJoin:
         if self.semantics not in {"full", "exists", "anti"}:
             raise CompileError(
                 f"unknown join semantics {self.semantics!r}")
+        if (self.comparison is None) != (self.threshold is None):
+            raise CompileError(
+                "AI.SCORE needs both a comparison and threshold"
+            )
+        if self.comparison not in {None, "<", "<=", ">", ">="}:
+            raise CompileError(
+                f"unsupported AI.SCORE comparison {self.comparison!r}"
+            )
 
     def with_children(self, children: tuple[LogicalNode, ...]):
         if not children:
@@ -295,6 +329,8 @@ class SemanticJoin:
             "semantics": self.semantics,
             "selectivity": self.selectivity,
             "anchor": self.anchor,
+            "comparison": self.comparison,
+            "threshold": self.threshold,
         }
 
 
@@ -379,7 +415,7 @@ class Apply:
 class Project:
     """Column projection. Always the root operator."""
     input: LogicalNode
-    columns: tuple    # tuple[ColumnRef, ...]
+    columns: tuple    # tuple[ColumnRef | ScoreExpression, ...]
     limit: Optional[int] = None
 
     type_name: ClassVar[str] = "quail.logical_project"
@@ -391,11 +427,21 @@ class Project:
         return self.columns
 
     def output_schema(self) -> tuple[ColumnRef, ...]:
-        return self.columns
+        return tuple(
+            column for column in self.columns
+            if isinstance(column, ColumnRef)
+        )
 
     def validate(self) -> None:
         if not self.columns:
             raise CompileError("Project needs at least one column")
+        names = [
+            f"{column.alias}.{column.column}"
+            if isinstance(column, ColumnRef) else column.name
+            for column in self.columns
+        ]
+        if len(names) != len(set(names)):
+            raise CompileError(f"projection names must be unique, got {names}")
         if self.limit is not None and self.limit <= 0:
             raise CompileError("LIMIT must be a positive integer")
 
@@ -412,7 +458,9 @@ class Project:
     def explain_fields(self) -> dict:
         return {
             "columns": [
-                f"{column.alias}.{column.column}" for column in self.columns
+                (f"{column.alias}.{column.column}"
+                 if isinstance(column, ColumnRef) else column.name)
+                for column in self.columns
             ],
             "limit": self.limit,
         }
@@ -502,6 +550,8 @@ class JoinSpec:
     semantics: str = "full"
     selectivity: Optional[float] = None
     anchor: Optional[str] = None
+    comparison: Optional[str] = None
+    threshold: Optional[float] = None
     on: tuple = ()             # tuple[Equality, ...] over the tables
     applies: tuple = ()        # (function, kind, columns) returning pairs
 
@@ -570,10 +620,18 @@ class LogicalPlanBuilder:
             semantics=join.semantics,
             selectivity=join.selectivity,
             anchor=join.anchor,
+            comparison=join.comparison,
+            threshold=join.threshold,
         )
 
+    def add_cross_join(self, alias: str) -> None:
+        """Add one relational cross join without an AI predicate."""
+        if self._root is None:
+            raise CompileError("a logical join needs an input table")
+        self._root = Join(self._root, self._nodes[alias])
+
     def project(
-        self, columns: tuple[ColumnRef, ...], limit: int | None = None
+        self, columns: tuple, limit: int | None = None
     ) -> LogicalPlan:
         if self._root is None:
             raise CompileError("a logical plan needs an input table")

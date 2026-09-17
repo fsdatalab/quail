@@ -14,6 +14,7 @@ from quail.execution.pairs import (
     pair_partner,
     partner_map,
 )
+from quail.execution.reranker import ScoreFilterRuntime
 from quail.execution.runner import (
     ExecutionContext,
     GenericRunner,
@@ -30,7 +31,9 @@ from quail.execution.types import export_physical_outputs
 from quail.physical import (
     AiFilter,
     AiJoin,
+    AiScore,
     PhysicalGraph,
+    ScoreFilter,
 )
 
 
@@ -40,6 +43,8 @@ def quail_runtimes() -> dict:
     return {
         AiFilter.runtime_key: model_runtime,
         AiJoin.runtime_key: model_runtime,
+        AiScore.runtime_key: model_runtime,
+        ScoreFilter.runtime_key: ScoreFilterRuntime(),
     }
 
 

@@ -11,12 +11,17 @@ from quail.backends.quail.executor import loop
 from quail.backends.quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
 from quail.backends.quail.graph import filter_result, stage_partner_lists
 from quail.backends.quail.worker import execute_quail_request, prepare_quail_request
+from quail.execution.reranker import (
+    execute_reranker_request,
+    prepare_reranker_request,
+)
 from quail.execution.runner import NodeMetrics, NodeResult, SurvivorStream
 from quail.execution.tokens import DocumentKeys
-from quail.logical import SHARED_PRE
+from quail.logical import SHARED_PRE, ScoreExpression
 from quail.physical import (
     AiFilter,
     AiJoin,
+    AiScore,
     Barrier,
     PhysicalNode,
 )
@@ -27,6 +32,9 @@ from quail.planner.physical_optimizer import (
     PlanningContext,
     SupportResult,
 )
+from quail.planner.plan import Refusal
+from quail.planner.reranker import plan_reranker
+from quail.specs import RERANKER_MODEL_NAMES
 
 
 class QuailModelExecution:
@@ -256,12 +264,18 @@ class QuailBackend:
     runtime_package = "vllm==0.26.0"
 
     def supports(self, model, device, gpu_count: int) -> SupportResult:
-        if model.name not in {"qwen3-4b-fp8", "qwen3-32b-fp8"}:
-            return SupportResult.reject(
-                f"Quail does not support model {model.name!r}")
         if device.name not in {"h100-sxm", "rtx-pro-6000-blackwell-server"}:
             return SupportResult.reject(
                 f"Quail does not support device {device.name!r}")
+        if model.name in RERANKER_MODEL_NAMES:
+            if gpu_count not in {1, 2, 4, 8}:
+                return SupportResult.reject(
+                    "Quail requires 1, 2, 4, or 8 GPUs"
+                )
+            return SupportResult.accept()
+        if model.name not in {"qwen3-4b-fp8", "qwen3-32b-fp8"}:
+            return SupportResult.reject(
+                f"Quail does not support model {model.name!r}")
         if gpu_count not in {1, 2, 4, 8}:
             return SupportResult.reject(
                 "Quail requires 1, 2, 4, or 8 GPUs")
@@ -272,6 +286,39 @@ class QuailBackend:
         region: ModelRegion,
         context: PlanningContext,
     ) -> tuple[PhysicalCandidate, ...]:
+
+        _, filters, joins = collect_operators(region.logical_plan)
+        has_score = any(
+            predicate.comparison is not None
+            for predicates in filters.values()
+            for predicate in predicates
+        ) or any(join.comparison is not None for join in joins) or any(
+            isinstance(expression, ScoreExpression)
+            for expression in region.logical_plan.root.columns
+        )
+        if context.model.name in RERANKER_MODEL_NAMES:
+            if not has_score:
+                refusal = Refusal(
+                    reasons=("a reranker model needs AI.SCORE",),
+                    constraint="reranker_needs_score",
+                    needed=1,
+                    available=0,
+                    unit="AI.SCORE expressions",
+                )
+                return (PhysicalCandidate(None, refusal, float("inf")),)
+            return plan_reranker(region, context, backend_name=self.name)
+        if has_score:
+            refusal = Refusal(
+                reasons=(
+                    "AI.SCORE requires a reranker model such as "
+                    "qwen3-reranker-0.6b-bf16",
+                ),
+                constraint="score_needs_reranker",
+                needed=1,
+                available=0,
+                unit="reranker models",
+            )
+            return (PhysicalCandidate(None, refusal, float("inf")),)
 
         plan = plan_quail(
             region.logical_plan,
@@ -377,8 +424,19 @@ class QuailBackend:
 
     def prepare_request(self, context) -> None:
         """Boot the GPU for a request before its documents are ready."""
+        if any(
+            isinstance(node, AiScore)
+            for node in context.graph.nodes
+        ):
+            prepare_reranker_request(context)
+            return
         prepare_quail_request(context)
 
     def execute_request(self, context) -> Any:
         """Run one Quail request inside a compute process."""
+        if any(
+            isinstance(node, AiScore)
+            for node in context.graph.nodes
+        ):
+            return execute_reranker_request(context, backend_name=self.name)
         return execute_quail_request(context)

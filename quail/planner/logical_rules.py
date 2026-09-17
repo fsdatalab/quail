@@ -12,6 +12,7 @@ from quail.logical import (
     Project,
     Prompt,
     Scan,
+    ScoreExpression,
 )
 
 
@@ -25,6 +26,8 @@ def _column_refs(expression) -> tuple[ColumnRef, ...]:
         return tuple(expression.args)
     if isinstance(expression, Equality):
         return (expression.left, expression.right)
+    if isinstance(expression, ScoreExpression):
+        return tuple(expression.prompt.args)
     return ()
 
 
@@ -45,6 +48,12 @@ def push_down_projection(root: LogicalNode) -> LogicalNode:
         for ref in (root.output_schema() if isinstance(root, Project)
                     else ())
     }
+    score_inputs = {
+        (ref.alias, ref.column)
+        for expression in (root.columns if isinstance(root, Project) else ())
+        if isinstance(expression, ScoreExpression)
+        for ref in expression.prompt.args
+    }
 
     def descend(node, needed):
         needed = {alias: dict(columns) for alias, columns in needed.items()}
@@ -56,6 +65,7 @@ def push_down_projection(root: LogicalNode) -> LogicalNode:
                 column for column in needed.get(node.alias, ())
                 if column != node.column
                 or (node.alias, column) in returned
+                or (node.alias, column) in score_inputs
             )
             return node if columns == node.columns else replace(
                 node, columns=columns)
