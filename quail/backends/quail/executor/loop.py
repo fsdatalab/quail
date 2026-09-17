@@ -531,10 +531,13 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     spans = []
     tokens = 0
     outstanding = []     # (groups, handle) in launch order
+    scoring = answer_dtype is not None
+    label = "AI.SCORE" if scoring else f"join ({k} stages)"
+    total = (sum(sched._count(a, j) for a in range(len(prefixes)) for j in range(k))
+             if scoring else len(prefixes))
     progress = Progress(
-        f"join ({k} stages)",
-        total=None if anchor_source is not None else len(prefixes),
-        unit="anchors")
+        label, total=None if anchor_source is not None else total,
+        unit="scores" if scoring else "anchors")
     finished = [0]
 
     def admit(items):
@@ -631,7 +634,9 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
                     a, j, start, end, bits[pos:pos + cnt]):
                 event(kind, anchor)
             pos += cnt
-        progress.update(finished[0])
+        progress.update(
+            progress.done + sum(end - start for _, _, start, end, _ in groups)
+            if scoring else finished[0])
 
     while True:
         if anchor_source is not None and not anchor_source.done:
@@ -672,7 +677,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
             report(outstanding.pop(0))
     while outstanding:
         report(outstanding.pop(0))
-    progress.finish(f"join ({k} stages) done", f"{tokens:,} fresh tokens")
+    progress.finish(f"{label} done", f"{tokens:,} fresh tokens")
     return sched.answers, spans, tokens
 
 
