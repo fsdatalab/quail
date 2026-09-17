@@ -1,5 +1,5 @@
 ---
-title: "Quail, a Query Aware Inference Layer for AI-SQL"
+title: "Quail, a Query-Aware Inference Layer for AI-SQL"
 author: "Shreya Shankar, Charles Frye, Fergus Finn, Arnav Dhariya, Joseph Barrow, Meryem Arik"
 bibliography: references.bib
 link-citations: true

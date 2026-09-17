@@ -42,7 +42,9 @@ h6 {
   border-radius: 0.75rem;
   background: linear-gradient(135deg, #eff6ff 0%, #f8fafc 100%);
   box-shadow: 0 8px 24px rgb(37 99 235 / 8%);
-  animation: tldr-enter 500ms ease-out both;
+  animation: tldr-breathe 5s ease-in-out infinite;
+  transform-origin: center;
+  will-change: transform, box-shadow;
 }
 
 .tldr p {
@@ -53,15 +55,26 @@ h6 {
   color: #1d4ed8;
 }
 
-@keyframes tldr-enter {
-  from {
-    opacity: 0;
-    transform: translateY(0.5rem);
+@keyframes tldr-breathe {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0) scale(1);
+    box-shadow: 0 8px 24px rgb(37 99 235 / 8%);
   }
 
-  to {
-    opacity: 1;
-    transform: translateY(0);
+  25% {
+    transform: translate3d(1px, -1px, 0) scale(1.003);
+    box-shadow: 0 10px 28px rgb(37 99 235 / 14%);
+  }
+
+  50% {
+    transform: translate3d(0, 1px, 0) scale(0.999);
+    box-shadow: 0 7px 22px rgb(37 99 235 / 9%);
+  }
+
+  75% {
+    transform: translate3d(-1px, -1px, 0) scale(1.002);
+    box-shadow: 0 9px 26px rgb(37 99 235 / 12%);
   }
 }
 
