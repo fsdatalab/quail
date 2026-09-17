@@ -5,7 +5,9 @@ bibliography: references.bib
 link-citations: true
 ---
 
-**TL;DR.** Much of today's AI-SQL work, meaning AI functions in SQL databases, uses closed, frontier LLMs served through APIs. But open weight models now provide sufficient quality for many AI functions and unlock optimizations that make some queries up to 10× faster. The database community should absolutely move more of these workloads to open weight models and optimize inference together with query execution. Quail is the open source query engine we are building to jointly optimize AI-SQL query plans and inference.
+::: {.tldr}
+**TL;DR.** Much of today's AI-SQL work (i.e., AI functions in SQL databases) uses closed, frontier LLMs served through APIs. But open weight models now provide sufficient quality for many AI functions --- and, in turn, unlock new optimizations that make query execution 10× faster. The database community should absolutely move more of these workloads to open weight models, and optimize inference together with query execution. Quail is a system we are building to jointly optimize query planning and inference.
+:::
 
 # 1. The growth of AI-powered data processing
 

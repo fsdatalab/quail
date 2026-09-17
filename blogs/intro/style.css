@@ -34,6 +34,43 @@ h6 {
   line-height: 1.12;
 }
 
+.tldr {
+  margin: 0 0 3rem;
+  padding: 1.2rem 1.4rem;
+  border: 1px solid #bfdbfe;
+  border-left: 4px solid #2563eb;
+  border-radius: 0.75rem;
+  background: linear-gradient(135deg, #eff6ff 0%, #f8fafc 100%);
+  box-shadow: 0 8px 24px rgb(37 99 235 / 8%);
+  animation: tldr-enter 500ms ease-out both;
+}
+
+.tldr p {
+  margin: 0;
+}
+
+.tldr strong {
+  color: #1d4ed8;
+}
+
+@keyframes tldr-enter {
+  from {
+    opacity: 0;
+    transform: translateY(0.5rem);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tldr {
+    animation: none;
+  }
+}
+
 h1 {
   font-size: 2.15rem;
 }
