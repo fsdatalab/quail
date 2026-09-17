@@ -692,7 +692,7 @@ def test_oversized_document_is_refused_before_execution(
     session.close()
 
 
-def test_reranker_system_text_matches_the_published_prefix():
+def test_reranker_system_text_keeps_the_judgment_instruction():
     from quail.reranker import QWEN3_RERANKER_SYSTEM_TEXT
 
     assert "\n" not in QWEN3_RERANKER_SYSTEM_TEXT

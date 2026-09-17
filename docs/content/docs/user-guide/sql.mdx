@@ -167,6 +167,10 @@ AI_FILTER(PROMPT(...), {'selectivity': 0.3, 'anchor': 'r'})
 "no" for the prompt. Use it in `SELECT` to return scores, or compare it
 with a threshold in `WHERE` or `JOIN ... ON`.
 
+The system message says, "You are performing a data processing task."
+It asks the model to judge whether the document meets the query's
+requirements and answer "yes" or "no".
+
 Choose a reranker model when creating the session:
 
 ```python
