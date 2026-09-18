@@ -431,6 +431,7 @@ def test_publish_uploads_only_what_a_reader_needs(monkeypatch, tmp_path):
     monkeypatch.setattr(labeling, "ROOT", tmp_path)
     spec = _spec("quailb.imdb.review.discusses_ending")
     monkeypatch.setattr(labeling, "PREDICATES", (spec,))
+    monkeypatch.setattr(labeling, "PREDICATE_BY_KEY", {})
     corpus_dir = tmp_path / "corpora" / "c_x"
     corpus_dir.mkdir(parents=True)
     (corpus_dir / "manifest.json").write_text("{}")
