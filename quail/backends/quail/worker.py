@@ -15,13 +15,10 @@ from quail.backends.quail.executor.attention import (
     FILTER_ATTENTION,
     JOIN_ATTENTION,
 )
-from quail.backends.quail.executor.loop import AsyncAnswers, warm_kernels
-from quail.backends.quail.executor.model import (
-    answer_weights,
-    load_model,
-    resolve_model_path,
-)
+from quail.backends.quail.executor.loop import warm_kernels
+from quail.backends.quail.executor.model import load_model, resolve_model_path
 from quail.backends.quail.executor.models import build_pipeline
+from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers
 from quail.backends.quail.graph import (
     _join_round_kv,
     _tuple_suffix,
@@ -108,14 +105,14 @@ class LoadedGpu:
         self.chunk_tokens = None
 
     def bind_query(self, true_ids, false_ids, chunk_tokens):
-        """Attach the answerer and chunk budget for one query."""
-        answerer = _PayloadAnswerer(self.torch, self.F, self.model,
-                                    true_ids, false_ids)
-        self.async_ans = AsyncAnswers(self.torch, answerer)
+        """Attach the answer rows, readout, and chunk budget for one query."""
+        rows = AnswerRows(self.torch, self.F, self.model, true_ids, false_ids)
+        self.async_ans = AsyncAnswers(self.torch, rows)
         self.chunk_tokens = chunk_tokens
         self.execution.bind_query(
             torch=self.torch,
             async_answers=self.async_ans,
+            answer_rows=rows,
             chunk_tokens=chunk_tokens,
         )
 
@@ -700,24 +697,3 @@ def execute_quail_multi(payload, registry, graph):
     report.pop("filters", None)
     report.pop("joins", None)
     return PhysicalResponse(outputs, report)
-
-
-class _PayloadAnswerer:
-    """Answerer using TRUE/FALSE token ids from the payload."""
-
-    def __init__(self, torch, F, model, true_ids, false_ids):
-        self.F = F
-        self.allowed = sorted(set(true_ids) | set(false_ids))
-        self.weights = answer_weights(model, self.allowed)
-        self.true_cols = torch.tensor(
-            [i for i, t in enumerate(self.allowed)
-             if t in set(true_ids)], device="cuda")
-        self.false_cols = torch.tensor(
-            [i for i, t in enumerate(self.allowed)
-             if t in set(false_ids)], device="cuda")
-
-    def __call__(self, normed):
-        scores = self.F.linear(normed, self.weights)
-        t = scores.index_select(1, self.true_cols).amax(dim=1)
-        f = scores.index_select(1, self.false_cols).amax(dim=1)
-        return (t > f).int().cpu().tolist()

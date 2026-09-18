@@ -2,40 +2,10 @@
 
 import numpy as np
 
-from quail.backends.quail.executor.attention import FILTER_ATTENTION
 from quail.backends.quail.executor.loop import InputStaging, run_join
+from quail.backends.quail.executor.readout import AsyncScores
 from quail.execution.reranker import RerankerBatch
 from quail.execution.tokens import chain_tokens
-
-
-class AsyncScores:
-    """Copy normalized YES scores asynchronously after each forward pass."""
-
-    def __init__(self, torch, answerer):
-        self.torch = torch
-        self.ans = answerer
-        self.weights = answerer.weights.float()
-        self.available = []
-
-    def submit(self, normed):
-        torch, ans = self.torch, self.ans
-        logits = ans.F.linear(normed.float(), self.weights)
-        yes = logits.index_select(1, ans.true_cols).amax(dim=1)
-        no = logits.index_select(1, ans.false_cols).amax(dim=1)
-        scores = torch.sigmoid(yes - no)
-        host = self.available.pop() if self.available else None
-        if host is None or host.numel() < scores.shape[0]:
-            host = torch.empty(scores.shape[0], dtype=torch.float32, pin_memory=True)
-        host[:scores.shape[0]].copy_(scores, non_blocking=True)
-        event = torch.cuda.Event()
-        event.record()
-        return event, host, scores.shape[0]
-
-    def result(self, handle):
-        event, host, count = handle
-        event.synchronize()
-        self.available.append(host)
-        return host[:count].numpy()
 
 
 class QuailScorer:
@@ -75,10 +45,10 @@ class QuailScorer:
             total = int(prefix_lengths[anchor_index].sum()
                         + suffix_lengths[candidate_index].sum())
         keys = [("score", spec.name, index) for index in range(len(prefixes))]
-        answerer = state["async_answers"].ans
+        answer_rows = state["answer_rows"]
         async_scores = state.get("async_scores")
-        if async_scores is None or async_scores.ans is not answerer:
-            async_scores = AsyncScores(state["torch"], answerer)
+        if async_scores is None or async_scores.rows is not answer_rows:
+            async_scores = AsyncScores(state["torch"], answer_rows)
             state["async_scores"] = async_scores
         if "input_staging" not in state:
             state["input_staging"] = InputStaging(state["torch"])
@@ -86,10 +56,9 @@ class QuailScorer:
         answers, _, fresh = run_join(
             state["torch"], state["arena"], state["pipeline"], async_scores,
             prefixes, [suffixes], state["chunk_tokens"], anchor_keys=keys,
-            attention_mode=FILTER_ATTENTION,
             anchor_partners=(None if partners is None
                              else lambda key: [partners[key[2]]]),
-            answer_dtype=np.float32, staging=state["input_staging"],
+            staging=state["input_staging"],
         )
         scores = np.empty(len(rows), dtype=np.float32)
         for anchor, values in answers[0].items():

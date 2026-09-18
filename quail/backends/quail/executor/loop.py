@@ -19,10 +19,9 @@ from quail.backends.quail.executor.attention import (
     FILTER_ATTENTION,
     JOIN_ATTENTION,
     Chunk,
+    join_attention_mode,
 )
-from quail.backends.quail.executor.model import answer_weights
 from quail.backends.quail.executor.pack import FilterAdmission, JoinAdmission
-from quail.logical import true_false_ids
 from quail.progress import Progress, logger, quiet
 
 
@@ -126,63 +125,6 @@ def _staged_token_parts(torch, sequences, total, pinned=True, staging=None):
     if staging is not None:
         return staging.upload("tokens", total)
     return host.to("cuda", non_blocking=pinned)
-
-
-class Answerer:
-    """TRUE/FALSE from final-position hidden states.
-
-    Scored against only the allowed token rows - no full-vocabulary
-    logits.
-    """
-
-    def __init__(self, torch, F, model, tokenizer):
-        t_ids, f_ids = true_false_ids(tokenizer)
-        self.F = F
-        self.allowed = sorted(t_ids | f_ids)
-        self.true_ids = t_ids
-        self.weights = answer_weights(model, self.allowed)
-        self.true_cols = torch.tensor(
-            [i for i, t in enumerate(self.allowed) if t in t_ids],
-            device="cuda")
-        self.false_cols = torch.tensor(
-            [i for i, t in enumerate(self.allowed) if t in f_ids],
-            device="cuda")
-
-    def __call__(self, normed):
-        scores = self.F.linear(normed, self.weights)
-        t = scores.index_select(1, self.true_cols).amax(dim=1)
-        f = scores.index_select(1, self.false_cols).amax(dim=1)
-        return (t > f).int().cpu().tolist()
-
-class AsyncAnswers:
-    """Non-blocking TRUE/FALSE readout.
-
-    submit() returns an event and pinned host buffer; result() waits on
-    the event and reads the answers without stalling the GPU stream.
-    """
-
-    def __init__(self, torch, answerer):
-        self.torch = torch
-        self.ans = answerer
-
-    def submit(self, normed):
-        torch, ans = self.torch, self.ans
-        scores = ans.F.linear(normed, ans.weights)
-        t = scores.index_select(1, ans.true_cols).amax(dim=1)
-        f = scores.index_select(1, ans.false_cols).amax(dim=1)
-        bits = (t > f).to(torch.uint8)
-        host = torch.empty(bits.shape[0], dtype=torch.uint8,
-                           pin_memory=True)
-        host.copy_(bits, non_blocking=True)
-        event = torch.cuda.Event()
-        event.record()
-        return event, host
-
-    @staticmethod
-    def result(handle):
-        event, host = handle
-        event.synchronize()
-        return [int(b) for b in host.tolist()]
 
 
 # ------------------------------------------------------- chunk packing
@@ -459,8 +401,7 @@ def _forward(pipeline, arena, chunk):
 def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
              stage_suffixes, budget, stage_frames=None,
              anchor_keys=None, anchor_done=None, anchor_source=None,
-             attention_mode=None, anchor_partners=None, anchor_batch=None,
-             answer_dtype=None, staging=None):
+             anchor_partners=None, anchor_batch=None, staging=None):
     """The join driver: stream partner lists against anchors.
 
     Survivors are gated between stages.
@@ -469,7 +410,9 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         torch: The torch module, imported by the caller.
         arena: KVArena holding the anchors' KV pages.
         pipeline: ModelPipeline that runs each packed forward chunk.
-        async_ans: AsyncAnswers that reads TRUE/FALSE off the GPU.
+        async_ans: Readout that turns final hidden states into answer
+            rows: AsyncAnswers for TRUE/FALSE bits, AsyncScores for
+            numeric scores. Its dtype picks the answer array type.
         anchor_prefixes: Anchor id (list index) -> prefix token list.
             With anchor_source it must be an empty list; the join
             appends each streamed anchor's prefix to it.
@@ -490,8 +433,6 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
             prefix tokens for it. The join pulls until it can fill a
             chunk and then runs one. blocked means the source is out
             of arena pages until the join frees some.
-        attention_mode: Attention path set on the pipeline before each
-            join chunk; the pipeline's current mode when omitted.
         anchor_partners: Optional callable(anchor key) -> per stage,
             the indices into that stage's partner list the anchor
             streams, or None for the whole list. Omitted means every
@@ -499,7 +440,6 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         anchor_batch: Optional callable(keys) -> the keys to admit, run
             on each batch the source hands over before admission. A
             key it leaves out is freed, never admitted.
-        answer_dtype: Optional NumPy dtype for numeric answer arrays.
         staging: Optional reusable input transfer buffers.
 
     Returns:
@@ -521,6 +461,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     if len(keys) != len(prefixes):
         raise ValueError("anchor_keys must match anchor_prefixes")
     frames = stage_frames or [[] for _ in range(k)]
+    mode = join_attention_mode(pipeline.is_fp8)
 
     if k == 0:
         return [], [], 0
@@ -540,14 +481,13 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         budget, arena.n_pages, arena.page_tokens,
         frame_tokens=[len(f) for f in frames], resident=resident,
         anchor_partners={a: partners_of(keys[a]) for a in range(len(keys))},
-        temporary_suffix_pages=(
-            (attention_mode or pipeline.attention_mode) == "unified"),
-        answer_dtype=answer_dtype,
+        temporary_suffix_pages=mode == "unified",
+        answer_dtype=async_ans.dtype,
     )
     spans = []
     tokens = 0
     outstanding = []     # (groups, handle) in launch order
-    scoring = answer_dtype is not None
+    scoring = async_ans.dtype is not None
     label = "AI.SCORE" if scoring else f"join ({k} stages)"
     total = (sum(sched._count(a, j) for a in range(len(prefixes)) for j in range(k))
              if scoring else len(prefixes))
@@ -677,8 +617,9 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
                 if pull(evict_retained=True, force=True):
                     continue
             raise AssertionError("nothing buildable and nothing in flight")
-        if attention_mode is not None:
-            pipeline.attention_mode = attention_mode
+        # an interleaved source runs its own chunks on this pipeline
+        # between join chunks, so the join states its path every time
+        pipeline.attention_mode = mode
         chunk = build(groups)
         tokens += chunk.tokens
         e0 = torch.cuda.Event(enable_timing=True)
@@ -766,8 +707,6 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
                        [question], budget, arena_writes=True)
     if join_chunk:
         logger.debug("kernels: warming join forward pass")
-        pipeline.attention_mode = (JOIN_ATTENTION if pipeline.is_fp8
-                                   else FILTER_ATTENTION)
         run_join(torch, arena, pipeline, async_ans, warm_docs,
                  [[question] * 8], budget)
     pipeline.attention_mode = original_mode
@@ -928,7 +867,7 @@ class FilterStream:
         torch: The torch module, imported by the caller.
         arena: KVArena holding the documents' KV pages.
         pipeline: ModelPipeline that runs each packed forward chunk.
-        async_ans: AsyncAnswers that reads TRUE/FALSE off the GPU.
+        async_ans: AsyncAnswers readout for TRUE/FALSE bits.
         doc_ids: Per-document token lists.
         question_ids: Per-stage question token lists.
         budget: Chunk token budget.

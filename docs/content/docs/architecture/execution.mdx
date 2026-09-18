@@ -146,6 +146,7 @@ All GPU execution code is in
 | [`attention.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/attention.py) | The engine: kernels, quantization, two-call attention with log-sum-exp merge. |
 | [`models/qwen3.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/models/qwen3.py) | The Qwen3 forward pass over the engine. One file per architecture; `ModelSpec.arch` picks it. |
 | [`loop.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/loop.py) | Overlapped filter and join execution loops. |
+| [`readout.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/readout.py) | What each operator takes from the final hidden states: TRUE/FALSE bits for filters and joins, yes-against-no scores for AI.SCORE. |
 | [`model.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/model.py) | Weight loading through vLLM's loader. |
 
 The fused kernels in `attention.py` assume QK-norm before RoPE, a

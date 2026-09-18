@@ -122,9 +122,10 @@ def run_streamed(monkeypatch, *, doc_lengths, filter_truth, partner_lengths,
     """Drive a filter chain streamed into a join on a CPU arena."""
     monkeypatch.setattr(loop, "pack_chunk", fake_pack)
     model = FakeModel(filter_truth, join_truth)
-    pipeline = SimpleNamespace(attention_mode=JOIN_ATTENTION,
+    pipeline = SimpleNamespace(attention_mode=JOIN_ATTENTION, is_fp8=True,
                                forward_chunk=model.forward_chunk)
-    answers = SimpleNamespace(submit=lambda v: v, result=lambda v: v)
+    answers = SimpleNamespace(submit=lambda v: v, result=lambda v: v,
+                              dtype=None)
     arena = cpu_arena(pages)
     docs = [[DOC + d] * n for d, n in enumerate(doc_lengths)]
     questions = [[QUESTION + s] for s in range(stages)]
@@ -248,14 +249,16 @@ def run_graph_on_arena(monkeypatch, graph, *, n_docs=14, n_partners=4,
     model = FakeModel(filter_truth, join_truth)
     torch = fake_torch()
     arena = cpu_arena(pages)
-    pipeline = SimpleNamespace(attention_mode=JOIN_ATTENTION,
+    pipeline = SimpleNamespace(attention_mode=JOIN_ATTENTION, is_fp8=True,
                                forward_chunk=model.forward_chunk)
     execution = QuailModelExecution(SimpleNamespace())
     execution.bind_loaded_model(model=object(), arena=arena,
                                 pipeline=pipeline)
     execution.bind_query(
         torch=torch,
-        async_answers=SimpleNamespace(submit=lambda v: v, result=lambda v: v),
+        async_answers=SimpleNamespace(submit=lambda v: v, result=lambda v: v,
+                                      dtype=None),
+        answer_rows=object(),
         chunk_tokens=120)
     state = {
         "torch": torch, "arena": arena, "pipeline": pipeline,

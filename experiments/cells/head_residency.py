@@ -76,9 +76,10 @@ def probe(model_name: str) -> str:
         FILTER_ATTENTION,
         JOIN_ATTENTION,
     )
-    from quail.backends.quail.executor.loop import Answerer, AsyncAnswers, run_filter
+    from quail.backends.quail.executor.loop import run_filter
     from quail.backends.quail.executor.model import load_model
     from quail.backends.quail.executor.models import build_pipeline
+    from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers
     from quail.cost import budgets
     from quail.specs import DEVICES, MODELS
 
@@ -105,8 +106,8 @@ def probe(model_name: str) -> str:
                     dtype=torch.bfloat16)
     pipeline = build_pipeline(spec, model, arena,
                               attention_mode=FILTER_ATTENTION)
-    answerer = Answerer(torch, F, model, tokenizer)
-    another_answerer = Answerer(torch, F, model, tokenizer)
+    answerer = AnswerRows.from_tokenizer(torch, F, model, tokenizer)
+    another_answerer = AnswerRows.from_tokenizer(torch, F, model, tokenizer)
     shared_answer_weights = answerer.weights is another_answerer.weights
     async_ans = AsyncAnswers(torch, answerer)
 

@@ -39,7 +39,7 @@ class FakeExecution:
     def bind_loaded_model(self, *, model, arena, pipeline):
         self.calls.append("bind_loaded_model")
 
-    def bind_query(self, *, torch, async_answers, chunk_tokens):
+    def bind_query(self, *, torch, async_answers, answer_rows, chunk_tokens):
         self.calls.append(f"bind_query:{chunk_tokens}")
 
 
@@ -66,8 +66,8 @@ def booted(monkeypatch):
     monkeypatch.setattr(worker, "build_pipeline",
                         lambda *a, **k: SimpleNamespace())
     monkeypatch.setattr(worker, "AsyncAnswers",
-                        lambda torch, answerer: SimpleNamespace())
-    monkeypatch.setattr(worker, "_PayloadAnswerer",
+                        lambda torch, rows: SimpleNamespace())
+    monkeypatch.setattr(worker, "AnswerRows",
                         lambda *a, **k: SimpleNamespace())
     monkeypatch.setattr(worker, "warm_kernels",
                         lambda *a, **k: {"tier": "compiled"})

@@ -297,7 +297,8 @@ def test_filter_execution_and_retention_inputs(monkeypatch):
             model=object(), arena=FakeArena(), pipeline=SimpleNamespace()
         )
         execution.bind_query(
-            torch=fake_torch(), async_answers=object(), chunk_tokens=8192
+            torch=fake_torch(), async_answers=object(), answer_rows=object(),
+            chunk_tokens=8192,
         )
         node = AiFilter(
             node_id="filter:d",

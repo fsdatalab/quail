@@ -32,6 +32,15 @@ FILTER_ATTENTION = "unified"
 JOIN_ATTENTION = "merge_quant"
 
 
+def join_attention_mode(is_fp8: bool) -> str:
+    """The path a join's chunks run.
+
+    merge_quant writes fp8 GEMM inputs, so bf16 weights run the
+    unified path instead.
+    """
+    return JOIN_ATTENTION if is_fp8 else FILTER_ATTENTION
+
+
 @dataclass
 class Chunk:
     """One packed forward pass: token rows plus attention bookkeeping.
