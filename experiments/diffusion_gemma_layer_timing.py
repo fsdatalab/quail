@@ -92,7 +92,9 @@ def _timer(torch, totals, name):
 @app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
               volumes=volumes)
 def time_chunk(prediction: str, docs: int = 110, doc_tokens: int = 300,
-               wide_head_kernel: str = "triton") -> str:
+               wide_head_kernel: str = "triton",
+               random_tokens: bool = False) -> str:
+    import numpy as np
     import torch
 
     from quail.backends.quail.executor.arena import KVArena
@@ -118,12 +120,19 @@ def time_chunk(prediction: str, docs: int = 110, doc_tokens: int = 300,
                               wide_head_kernel=wide_head_kernel)
     tail = list(range(100, 116))
     groups = []
+    # random ids route the experts as broadly as real text does; the
+    # repeating pattern sends every row to the same few experts
+    rng = np.random.default_rng(1)
     for index in range(docs):
         key = ("t", index)
         arena.activate(key, doc_tokens + len(tail),
                        capacity_tokens=doc_tokens + len(tail) + 256,
                        base_tokens=doc_tokens)
-        prefix = [1000 + (i % 500) for i in range(doc_tokens)]
+        if random_tokens:
+            prefix = [int(t) for t in rng.integers(1000, spec.vocab - 1000,
+                                                   doc_tokens)]
+        else:
+            prefix = [1000 + (i % 500) for i in range(doc_tokens)]
         groups.append(dict(key=key, prefix=prefix, f=doc_tokens,
                            suffixes=[tail]))
 
@@ -184,6 +193,7 @@ def time_chunk(prediction: str, docs: int = 110, doc_tokens: int = 300,
     result = {
         "prediction": prediction,
         "wide_head_kernel": wide_head_kernel,
+        "random_tokens": random_tokens,
         "docs": docs, "doc_tokens": doc_tokens, "rows": rows,
         "chunk_tokens": chunk_tokens,
         "warm_s": warm_s, "plain_s": plain_s, "timed_s": timed_s,
@@ -192,19 +202,99 @@ def time_chunk(prediction: str, docs: int = 110, doc_tokens: int = 300,
         "accounted_s": accounted,
         "unaccounted_s": timed_s - accounted,
     }
+    suffix = "_random" if random_tokens else ""
     result["volume_path"] = _save(
-        f"diffusion_gemma_layer_timing_{wide_head_kernel}", result)
+        f"diffusion_gemma_layer_timing_{wide_head_kernel}{suffix}", result)
+    return json.dumps(result, indent=2)
+
+
+@app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
+              volumes=volumes)
+def time_loop(prediction: str, reviews: int = 1000) -> str:
+    """Run the filter loop over IMDB reviews with its phase counters on."""
+    import pyarrow.parquet as pq
+    import torch
+    from transformers import AutoTokenizer
+
+    from quail.backends.quail.executor import loop
+    from quail.backends.quail.executor.arena import KVArena
+    from quail.backends.quail.executor.model import load_model
+    from quail.backends.quail.executor.models import build_pipeline
+    from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers
+    from quail.cost import budgets
+    from quail.specs import DEVICES, MODELS
+    from quail_b.data import build_sets
+
+    spec = MODELS[MODEL]
+    device = DEVICES["h100-sxm"]
+    chunk_tokens = budgets.chunk_budget(spec, device)
+    model = load_model(spec.hf_name, max_batched_tokens=chunk_tokens)
+    full_pages, sliding_pages = budgets.arena_pages(spec, device, chunk_tokens,
+                                                    mean_doc_tokens=300)
+    arena = KVArena(n_layers=spec.layers, n_pages=full_pages,
+                    page_tokens=budgets.PAGE_TOKENS, n_kv=spec.n_kv,
+                    d_head=spec.d_head, dtype=torch.bfloat16,
+                    layer_kv=spec.kv_shapes,
+                    sliding_layers=spec.sliding_layer_set,
+                    sliding_window=spec.sliding_window,
+                    n_sliding_pages=sliding_pages)
+    pipeline = build_pipeline(spec, model, arena)
+    tokenizer = AutoTokenizer.from_pretrained(spec.hf_name)
+    rows = AnswerRows.from_tokenizer(torch, torch.nn.functional, model, tokenizer)
+    answers = AsyncAnswers(torch, rows)
+    data = build_sets("/results/quailb_data", 0.1)
+    table = pq.read_table(f"{data}/reviews.parquet")
+    texts = table.column("body").to_pylist()[:reviews]
+
+    def tok(text):
+        return tokenizer(text, add_special_tokens=False)["input_ids"]
+
+    docs = [tok(spec.turn_prefix + "DOCUMENT:\n" + text) for text in texts]
+    question = tok("\n\nYou are performing a data processing task. Evaluate "
+                   "TRUE or FALSE for the following question: Does the "
+                   "review mention a positive aspect?\nANSWER:"
+                   + spec.turn_suffix)
+    with torch.inference_mode():
+        loop.run_filter(torch, arena, pipeline, answers, docs[:120],
+                        [question], chunk_tokens, arena_writes=True)
+        torch.cuda.synchronize()
+        timing = {}
+        started = time.perf_counter()
+        _answers, spans, tokens = loop.run_filter(
+            torch, arena, pipeline, answers, docs, [question], chunk_tokens,
+            timing=timing, arena_writes=True)
+        torch.cuda.synchronize()
+        wall = time.perf_counter() - started
+    gpu_s = sum(e0.elapsed_time(e1) for _, e0, e1 in spans) / 1000
+    result = {
+        "prediction": prediction,
+        "reviews": len(docs), "fresh_tokens": tokens,
+        "doc_tokens_mean": sum(map(len, docs)) / len(docs),
+        "wall_s": wall, "gpu_s": gpu_s, "chunks": len(spans),
+        "rows_per_s": tokens / wall,
+        "cpu_phases_s": dict(sorted(
+            ((k, v) for k, v in timing.items() if isinstance(v, float)),
+            key=lambda kv: -kv[1])),
+        "n_chunks_counter": timing.get("n_chunks"),
+    }
+    result["volume_path"] = _save("diffusion_gemma_loop_timing", result)
     return json.dumps(result, indent=2)
 
 
 @app.local_entrypoint()
 def main(prediction: str = "", docs: int = 110, doc_tokens: int = 300,
-         kernels: str = "triton,fa4"):
+         kernels: str = "triton,fa4", random_tokens: bool = False,
+         runs: str = "chunk,loop"):
     if not prediction:
         raise ValueError("pass --prediction before starting")
-    calls = {kernel: time_chunk.spawn(prediction, docs, doc_tokens, kernel)
-             for kernel in kernels.split(",")}
-    for kernel, call in calls.items():
-        print(f"function call id: {call.object_id} ({kernel})", flush=True)
-    for kernel, call in calls.items():
+    calls = {}
+    if "chunk" in runs:
+        for kernel in kernels.split(","):
+            calls[kernel] = time_chunk.spawn(prediction, docs, doc_tokens,
+                                             kernel, random_tokens)
+    if "loop" in runs:
+        calls["loop"] = time_loop.spawn(prediction)
+    for name, call in calls.items():
+        print(f"function call id: {call.object_id} ({name})", flush=True)
+    for name, call in calls.items():
         print(call.get(), flush=True)
