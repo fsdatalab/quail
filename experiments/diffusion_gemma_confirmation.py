@@ -127,6 +127,10 @@ LAYOUTS = {
     "channel": {"turn_suffix": "<turn|>\n<|turn>model\n"
                                "<|channel>thought\n<channel|>",
                 "canvas_answer_row": 0},
+    # shorter canvases than the checkpoint's 256: the answer stays at
+    # row 4, after the model's empty thinking channel
+    "canvas32": {"canvas_tokens": 32},
+    "canvas8": {"canvas_tokens": 8},
 }
 
 
@@ -295,7 +299,7 @@ def _long_documents():
 
 @app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
               volumes=volumes)
-def long(prediction: str) -> str:
+def long(prediction: str, layout: str = "turn") -> str:
     """Filter and join over documents longer than the sliding window."""
     import pyarrow as pa
     import torch
@@ -303,7 +307,7 @@ def long(prediction: str) -> str:
     import quail
 
     ids, documents = _long_documents()
-    session = _session()
+    session = _session(layout)
     session.register("long_docs", quail.DocumentProvider.from_table(
         pa.table({"id": ids, "body": documents}),
         id_col="id", identity="diffusion-gemma-confirmation-long",
@@ -323,6 +327,7 @@ def long(prediction: str) -> str:
     join_result = _run(join_query)
     result = {
         "prediction": prediction,
+        "layout": layout,
         "gpu_device_name": torch.cuda.get_device_name(0),
         "elapsed_s": time.time() - started,
         "document_tokens": filter_result.get("stages"),
@@ -336,7 +341,9 @@ def long(prediction: str) -> str:
             [f"{topic}{i}", f"r{j}"] for topic in "fc" for i in range(3)
             for j in range(4) if (topic == "f") == (j < 2)),
     }
-    result["volume_path"] = _save("diffusion_gemma_confirmation_long", result)
+    suffix = "" if layout == "turn" else f"_{layout}"
+    result["volume_path"] = _save(
+        f"diffusion_gemma_confirmation_long{suffix}", result)
     return json.dumps(result, indent=2, default=str)
 
 
@@ -433,7 +440,7 @@ def main(prediction: str = "", runs: str = "probe,confirm,reference",
     functions = {
         "probe": lambda: probe.spawn(prediction),
         "confirm": lambda: confirm.spawn(prediction, layout),
-        "long": lambda: long.spawn(prediction),
+        "long": lambda: long.spawn(prediction, layout),
         "reference": lambda: reference.spawn(prediction),
     }
     selected = [name.strip() for name in runs.split(",") if name.strip()]
