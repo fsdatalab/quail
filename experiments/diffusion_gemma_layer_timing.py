@@ -16,18 +16,64 @@ Writes /results/ablations/diffusion_gemma_layer_timing.json.
 """
 
 import json
+import os
 import time
 
 import modal
 
-from experiments.diffusion_gemma_confirmation import (
-    MODEL,
-    _save,
-    image,
-    volumes,
+from quail.bench.requirements import quail_b_requirement
+
+MODEL = "diffusion-gemma-26b-a4b-fp8"
+
+image = (
+    modal.Image.from_registry(
+        "nvidia/cuda:13.0.1-devel-ubuntu24.04", add_python="3.12")
+    .entrypoint([])
+    .apt_install("git")
+    .pip_install(
+        "vllm==0.26.0",
+        "huggingface_hub[hf_transfer]",
+        "transformers>=5.8.0",
+        "pandas",
+        "pyarrow",
+        "numpy",
+        "datasets>=5.0.1",
+        "sqlglot>=27.0",
+        "gigatoken>=0.10.0",
+        quail_b_requirement(),
+    )
+    .env({
+        "VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
+        "VLLM_LOGGING_LEVEL": "WARNING",
+        "VLLM_USE_FLASHINFER_SAMPLER": "0",
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        "HF_HUB_ENABLE_HF_TRANSFER": "1",
+        "QUAIL_CACHE_DIR": "/root/.cache/kernels",
+        "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
+        "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
+        "TRITON_CACHE_DIR": "/root/.cache/kernels/triton",
+    })
+    .add_local_python_source("quail")
 )
 
 app = modal.App("quail-milestone1")
+results_vol = modal.Volume.from_name("quail-results", create_if_missing=True)
+volumes = {
+    "/root/.cache/huggingface": modal.Volume.from_name(
+        "quail-hf-cache", create_if_missing=True),
+    "/root/.cache/kernels": modal.Volume.from_name(
+        "quail-kernel-cache", create_if_missing=True),
+    "/results": results_vol,
+}
+
+
+def _save(name: str, value: dict) -> str:
+    path = f"/results/ablations/{name}.json"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as file:
+        json.dump(value, file, indent=2)
+    results_vol.commit()
+    return path
 
 
 def _timer(torch, totals, name):
