@@ -91,6 +91,138 @@ def _timer(torch, totals, name):
 
 @app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
               volumes=volumes)
+def primitives(prediction: str, docs: int = 20, doc_tokens: int = 300) -> str:
+    """Check each fused primitive against the reference ops on real weights."""
+    import numpy as np
+    import torch
+    from vllm import _custom_ops as ops
+
+    from quail.backends.quail.executor.arena import KVArena
+    from quail.backends.quail.executor.loop import pack_chunk
+    from quail.backends.quail.executor.model import load_model
+    from quail.backends.quail.executor.models import build_pipeline
+    from quail.cost import budgets
+    from quail.specs import DEVICES, MODELS
+
+    spec = MODELS[MODEL]
+    device = DEVICES["h100-sxm"]
+    chunk_tokens = budgets.chunk_budget(spec, device)
+    model = load_model(spec.hf_name, max_batched_tokens=chunk_tokens)
+    full_pages, sliding_pages = budgets.arena_pages(spec, device, chunk_tokens)
+    arena = KVArena(n_layers=spec.layers, n_pages=full_pages,
+                    page_tokens=budgets.PAGE_TOKENS, n_kv=spec.n_kv,
+                    d_head=spec.d_head, dtype=torch.bfloat16,
+                    layer_kv=spec.kv_shapes,
+                    sliding_layers=spec.sliding_layer_set,
+                    sliding_window=spec.sliding_window,
+                    n_sliding_pages=sliding_pages)
+    pipeline = build_pipeline(spec, model, arena, fused=False)
+    engine = pipeline.engine
+    layers = pipeline.layers
+    n = docs * doc_tokens
+    torch.manual_seed(0)
+    x = torch.randn(n, spec.hidden, device="cuda", dtype=torch.bfloat16) * 3
+    r = torch.randn(n, spec.hidden, device="cuda", dtype=torch.bfloat16) * 3
+    positions = torch.arange(n, device="cuda") % doc_tokens
+    result = {"prediction": prediction}
+
+    def rel(a, b):
+        a, b = a.float(), b.float()
+        return ((a - b).pow(2).mean().sqrt() / b.pow(2).mean().sqrt()).item()
+
+    with torch.inference_mode():
+        norm = layers[0].input_layernorm
+        # (a) norm then quant, one kernel against two
+        ref = engine.norm_rows(x, norm.weight, norm.variance_epsilon)
+        rq, rs = ops.scaled_fp8_quant(ref, use_per_token_if_dynamic=True)
+        fq, fs = engine.norm_quant_rows(x, norm.weight, norm.variance_epsilon)
+        result["norm_quant_rel"] = rel(fq.float() * fs, rq.float() * rs)
+        result["norm_quant_scale_shape"] = list(fs.shape)
+        # with the residual: the kernel adds x into r first
+        r2 = r.clone()
+        fq, fs = engine.norm_quant_rows(x, norm.weight, norm.variance_epsilon,
+                                        r2)
+        summed = (x.float() + r.float()).to(torch.bfloat16)
+        ref = engine.norm_rows(summed, norm.weight, norm.variance_epsilon)
+        rq, rs = ops.scaled_fp8_quant(ref, use_per_token_if_dynamic=True)
+        result["norm_quant_residual_rel"] = rel(fq.float() * fs, rq.float() * rs)
+        result["norm_quant_residual_updated_rel"] = rel(r2, summed)
+        # (b) the direct fp8 GEMM against the module
+        qkv_proj = layers[0].self_attn.qkv_proj
+        xq, xs = ops.scaled_fp8_quant(x, use_per_token_if_dynamic=True)
+        result["fp8_linear_rel"] = rel(engine.fp8_linear(qkv_proj, xq, xs),
+                                       qkv_proj(x)[0])
+        result["weight_scale_shape"] = list(qkv_proj.weight_scale.shape)
+        result["weight_shape"] = list(qkv_proj.weight.shape)
+        # (c) fused qk norm and rotary on a sliding and a full layer
+        for name, layer in (("sliding", layers[0]), ("full", layers[5])):
+            attn = layer.self_attn
+            H, KH, D = attn.num_heads, attn.num_kv_heads, attn.head_dim
+            qkv = attn.qkv_proj(x)[0]
+            q, k, _ = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], -1)
+            q = engine.norm_rows(q.reshape(n, H, D), attn.q_norm.weight,
+                                 attn.q_norm.variance_epsilon).view(n, H * D)
+            k = engine.norm_rows(k.reshape(n, KH, D), attn.k_norm.weight,
+                                 attn.k_norm.variance_epsilon).view(n, KH * D)
+            rope = attn.rotary_emb
+            q, k = engine.rope_inplace(positions, q, k, D, rope.cos_sin_cache,
+                                       rope.is_neox_style)
+            fq, fk = engine.qk_norm_rope_heads(
+                qkv, positions, n_q=H, n_kv=KH, head_dim=D,
+                q_weight=attn.q_norm.weight, k_weight=attn.k_norm.weight,
+                eps=attn.q_norm.variance_epsilon,
+                cos_sin_cache=rope.cos_sin_cache)
+            result[f"qk_{name}_q_rel"] = rel(fq, q)
+            result[f"qk_{name}_k_rel"] = rel(fk, k)
+            result[f"qk_{name}_neox"] = bool(rope.is_neox_style)
+            result[f"qk_{name}_cache"] = list(rope.cos_sin_cache.shape)
+            result[f"qk_{name}_eps"] = (attn.q_norm.variance_epsilon,
+                                        attn.k_norm.variance_epsilon)
+        # (d) the residual-add norm
+        norm = layers[0].post_feedforward_layernorm
+        h, r2 = x.clone(), r.clone()
+        engine.fused_add_rms_norm(h, r2, norm)
+        summed = (x.float() + r.float()).to(torch.bfloat16)
+        result["fused_add_norm_rel"] = rel(
+            h, engine.norm_rows(summed, norm.weight, norm.variance_epsilon))
+        result["fused_add_residual_rel"] = rel(r2, summed)
+        # (e) the scalar fold alone, on the reference path
+        tail = list(range(100, 116))
+        rng = np.random.default_rng(1)
+        groups = []
+        for index in range(docs):
+            key = ("t", index)
+            arena.activate(key, doc_tokens + len(tail),
+                           capacity_tokens=doc_tokens + len(tail) + 256,
+                           base_tokens=doc_tokens)
+            prefix = [int(t) for t in rng.integers(1000, spec.vocab - 1000,
+                                                   doc_tokens)]
+            groups.append(dict(key=key, prefix=prefix, f=doc_tokens,
+                               suffixes=[tail]))
+
+        def run(pipe):
+            chunk = pack_chunk(torch, arena, groups, attention_mode="unified",
+                               canvas=pipe.canvas_ids,
+                               answer_row=pipe.canvas_answer_row)
+            rows = pipe.forward_chunk(chunk)
+            for key in chunk.temporary_keys:
+                arena.free_key(key)
+            return rows.float()
+
+        before = run(pipeline)
+        result["layer_scalars"] = [float(layer.layer_scalar)
+                                   for layer in layers[:4]]
+        pipeline._fold_layer_scalars(model)
+        after = run(pipeline)
+        result["fold_rel"] = rel(after, before)
+        fused = build_pipeline(spec, model, arena, fused=True)
+        result["fused_after_fold_rel"] = rel(run(fused), before)
+    result["volume_path"] = _save("diffusion_gemma_primitives_check", result)
+    return json.dumps(result, indent=2)
+
+
+@app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
+              volumes=volumes)
 def check(prediction: str, docs: int = 110, doc_tokens: int = 300,
           wide_head_kernel: str = "triton") -> str:
     """Compare the fused forward path against the reference path.
@@ -479,6 +611,8 @@ def main(prediction: str = "", docs: int = 110, doc_tokens: int = 300,
                 calls[f"{kernel}/{backend}"] = time_chunk.spawn(
                     prediction, docs, doc_tokens, kernel, random_tokens,
                     backend, profile)
+    if "primitives" in runs:
+        calls["primitives"] = primitives.spawn(prediction, docs, doc_tokens)
     if "check" in runs:
         for kernel in kernels.split(","):
             calls[f"check/{kernel}"] = check.spawn(prediction, docs,
