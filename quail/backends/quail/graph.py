@@ -5,7 +5,6 @@ from __future__ import annotations
 import itertools
 import time
 
-from quail.backends.quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
 from quail.backends.quail.retention import apply_retention, retain_after_join
 from quail.execution.pairs import (
     allowed_members,
@@ -194,10 +193,8 @@ def prepare_model_inputs(node, inputs, context: ExecutionContext):
 def _model_inputs(node, inputs, context: ExecutionContext) -> dict:
     state = context.state
     if isinstance(node, AiFilter):
-        state["pipeline"].attention_mode = FILTER_ATTENTION
         return filter_inputs(state, node, next(iter(inputs.values())))
 
-    state["pipeline"].attention_mode = JOIN_ATTENTION
     stream = None
     by_alias = {}
     port_pairs = {}        # written position -> pair table from a port

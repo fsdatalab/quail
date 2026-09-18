@@ -398,7 +398,7 @@ def test_native_score_uses_shared_prefix_and_preserves_pair_order(monkeypatch):
         prompt_token_parts=((1,), (2,), (3,)),
     )
     state = dict(torch=object(), arena=object(), pipeline=object(),
-                 async_answers=SimpleNamespace(ans=object()), chunk_tokens=1234)
+                 answer_rows=object(), chunk_tokens=1234)
     monkeypatch.setattr(module, "AsyncScores", lambda *args: object())
 
     def run(*args, **kwargs):

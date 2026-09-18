@@ -11,6 +11,10 @@ The cell writes these files to the quail-results volume:
     /results/ablations/extensible_engine_confirmation_4b.json
     /results/ablations/extensible_engine_confirmation_4b_2gpu.json
     /results/ablations/extensible_engine_confirmation_32b.json
+    /results/ablations/extensible_engine_confirmation_score.json
+
+--runs picks the cells, --query-ids the QUAIL-B queries the 4b cell
+runs, and --output-suffix keeps two runs apart on the volume.
 """
 
 import hashlib
@@ -20,11 +24,16 @@ import time
 
 import modal
 
+from quail.bench.requirements import quail_b_requirement
+
 IMAGE_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
 
 image = (
     modal.Image.from_registry(IMAGE_BASE, add_python="3.12")
     .entrypoint([])
+    .apt_install("git")
+    # quail-b installs from git at the pinned commit, with its plan
+    # files and its own dependencies (the Substrait bindings among them)
     .pip_install(
         "vllm==0.26.0",
         "huggingface_hub[hf_transfer]",
@@ -32,8 +41,10 @@ image = (
         "pandas",
         "pyarrow",
         "numpy",
-        "datasets",
-        "sqlglot",
+        "datasets>=5.0.1",
+        "sqlglot>=27.0",
+        "gigatoken>=0.10.0",
+        quail_b_requirement(),
     )
     .env({
         "VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
@@ -46,7 +57,7 @@ image = (
         "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
         "TRITON_CACHE_DIR": "/root/.cache/kernels/triton",
     })
-    .add_local_python_source("quail", "quail_b")
+    .add_local_python_source("quail")
 )
 
 app = modal.App("quail-milestone1")
@@ -94,12 +105,9 @@ def _query_record(query_id, query, gpu_count):
     result = execute_query(query)
     table = result.collect()
     report = result.report
-    join_stages = [
-        stage for stage in report["stages"] if stage["op"] == "join"
-    ]
-    filter_stages = [
-        stage for stage in report["stages"] if stage["op"] == "filter"
-    ]
+    stages = report.get("stages", [])
+    join_stages = [stage for stage in stages if stage["op"] == "join"]
+    filter_stages = [stage for stage in stages if stage["op"] == "filter"]
     pairs = sum(stage["tuples"] for stage in join_stages)
     documents = sum(stage["evaluated"] for stage in filter_stages)
     work = pairs if join_stages else documents
@@ -117,7 +125,7 @@ def _query_record(query_id, query, gpu_count):
         ),
         "evaluated_documents": documents,
         "evaluated_document_pairs": pairs,
-        "fresh_tokens": report["fresh_tokens"],
+        "fresh_tokens": report.get("fresh_tokens"),
         "kv_manager": report.get("kv_manager"),
         "expected_join_plan": report.get("expected_join_plan"),
         "executed_join_plan": report.get("executed_join_plan"),
@@ -158,9 +166,9 @@ def confirm_4b(
     definitions = queries(session)
     selected = [query_id.strip() for query_id in query_ids.split(",")
                 if query_id.strip()]
-    unknown = set(selected) - {"BIO-2", "AGENT-1"}
+    unknown = set(selected) - set(definitions)
     if unknown:
-        raise ValueError(f"unknown 4B queries: {sorted(unknown)}")
+        raise ValueError(f"unknown queries: {sorted(unknown)}")
     started = time.time()
     records = [
         _query_record(query_id, definitions[query_id][1](),
@@ -266,10 +274,34 @@ def confirm_32b(prediction: str) -> str:
     return json.dumps(result, indent=2)
 
 
+@app.function(
+    image=image,
+    gpu="H100!",
+    memory=98304,
+    timeout=3600,
+    volumes=volumes,
+)
+def confirm_score(prediction: str,
+                  output_name: str = "extensible_engine_confirmation_score") -> str:
+    """AI.SCORE on the bf16 reranker: the unified attention path."""
+    session = _small_session("qwen3-reranker-0.6b-bf16", 1)
+    query = session.sql("""
+        SELECT l.id, AI.SCORE(PROMPT(
+          'Does document {0} mention a failing test?', l.body)) AS score
+        FROM left_docs l
+    """)
+    result = {
+        "prediction": prediction,
+        "query": _query_record("small-score", query, 1),
+    }
+    result["volume_path"] = _save(output_name, result)
+    return json.dumps(result, indent=2)
+
+
 @app.local_entrypoint()
 def main(
     prediction: str = "",
-    runs: str = "4b,4b_2gpu,32b",
+    runs: str = "4b,4b_2gpu,32b,score",
     output_suffix: str = "",
     query_ids: str = "BIO-2,AGENT-1",
 ):
@@ -284,6 +316,10 @@ def main(
         ),
         "4b_2gpu": lambda: confirm_4b_2gpu.spawn(prediction),
         "32b": lambda: confirm_32b.spawn(prediction),
+        "score": lambda: confirm_score.spawn(
+            prediction,
+            f"extensible_engine_confirmation_score{output_suffix}",
+        ),
     }
     unknown = set(selected) - set(functions)
     if unknown:

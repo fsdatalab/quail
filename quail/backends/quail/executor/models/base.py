@@ -30,16 +30,6 @@ class ModelPipeline:
         """One linear module per distinct GEMM shape, for kernel warm-up."""
         raise NotImplementedError
 
-    # the loop sets the attention mode per phase and reads the
-    # precision when choosing warm-up paths; both belong to the engine
-    @property
-    def attention_mode(self):
-        return self.engine.attention_mode
-
-    @attention_mode.setter
-    def attention_mode(self, mode):
-        self.engine.attention_mode = mode
-
     @property
     def is_fp8(self):
         return self.engine.is_fp8

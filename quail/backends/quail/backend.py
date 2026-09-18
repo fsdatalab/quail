@@ -8,7 +8,6 @@ from typing import Any
 
 from quail.backends.base import GpuContext
 from quail.backends.quail.executor import loop
-from quail.backends.quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
 from quail.backends.quail.executor.models import supported_archs
 from quail.backends.quail.executor.score import QuailScorer
 from quail.backends.quail.graph import filter_result, stage_partner_lists
@@ -52,11 +51,17 @@ class QuailModelExecution:
         """Attach the loaded model objects owned by this executor."""
         self._state.update(model=model, arena=arena, pipeline=pipeline)
 
-    def bind_query(self, *, torch, async_answers, chunk_tokens: int) -> None:
-        """Attach state that is valid for the current query."""
+    def bind_query(self, *, torch, async_answers, answer_rows,
+                   chunk_tokens: int) -> None:
+        """Attach state that is valid for the current query.
+
+        answer_rows are the retained output rows every readout scores
+        against; async_answers is the TRUE/FALSE readout over them.
+        """
         self._state.update(
             torch=torch,
             async_answers=async_answers,
+            answer_rows=answer_rows,
             chunk_tokens=chunk_tokens,
         )
 
@@ -163,7 +168,6 @@ class QuailModelExecution:
                                         stream["document_ids"]),
                 hold_survivors=True,
                 hold_extra_tokens=filter_node.hold_tokens,
-                attention_mode=FILTER_ATTENTION,
             )
         lists_for = inputs.get("anchor_partners")
         answers, spans, tokens = loop.run_join(
@@ -178,7 +182,6 @@ class QuailModelExecution:
             anchor_keys=inputs["anchor_keys"],
             anchor_done=inputs["anchor_done"],
             anchor_source=source,
-            attention_mode=JOIN_ATTENTION if source is not None else None,
             anchor_partners=(
                 None if lists_for is None else lambda key: lists_for(key[1])),
             anchor_batch=inputs.get("anchor_batch"),
