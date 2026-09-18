@@ -398,8 +398,23 @@ def test_derive_collection_copies_labels_by_content(monkeypatch, tmp_path):
         ("lc0", "lp1"): (True, "lepard_citation_edge")}
     active = json.loads((tmp_path / "corpora"
                          / summary["corpus_id"]
-                         / "active_collection.json").read_text())
+                         / f"active_collection.{labeling.PROMPT_FORMAT}.json"
+                         ).read_text())
     assert active["collection_id"] == summary["collection_id"]
+
+
+def test_activate_collection_preserves_raw_prompt_pointer(monkeypatch, tmp_path):
+    import json
+
+    monkeypatch.setattr(labeling, "ROOT", tmp_path)
+    directory = tmp_path / "corpora" / "c_test"
+    directory.mkdir(parents=True)
+    raw = directory / "active_collection.json"
+    raw.write_text('{"collection_id": "gt_raw"}')
+    labeling._activate_collection("c_test", "gt_chat")
+    assert raw.read_text() == '{"collection_id": "gt_raw"}'
+    active = directory / f"active_collection.{labeling.PROMPT_FORMAT}.json"
+    assert json.loads(active.read_text()) == {"collection_id": "gt_chat"}
 
 
 class _FakeS3:

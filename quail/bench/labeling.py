@@ -59,6 +59,7 @@ from quail_b.predicates import (
     workload_specs,
 )
 from quail_b.predicates import label_set_identity as _label_set_identity
+from quail_b.rendering import PROMPT_FORMAT
 
 SCALE_FACTOR = 0.1
 SUPPORTED_SCALE_FACTORS = (0.1, 0.5, 1.0)
@@ -733,7 +734,7 @@ def _collection_identity(corpus_manifest: dict,
 
 def _activate_collection(corpus_id: str, collection_id: str) -> None:
     _atomic_json(
-        ROOT / "corpora" / corpus_id / "active_collection.json",
+        ROOT / "corpora" / corpus_id / f"active_collection.{PROMPT_FORMAT}.json",
         {"collection_id": collection_id})
 
 
