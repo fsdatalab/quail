@@ -27,9 +27,11 @@ from dataclasses import dataclass
 from typing import Any
 
 GROUP = 128            # fp8 quant group size, matches the engine
-# FlashAttention's widest head; wider heads run vLLM's Triton paged
-# attention kernel, which needs arena pages.
+# FlashAttention 3's widest head; wider heads run a paged kernel that
+# needs arena pages: vLLM's Triton unified attention, or
+# FlashAttention 4, whose Hopper build takes heads up to 512.
 FA_MAX_HEAD_DIM = 256
+WIDE_HEAD_KERNELS = ("triton", "fa4")
 
 # Filters run "unified" (one causal paged attention call); joins run
 # "merge_quant" (two-call pattern with fused merge+quant kernel).
@@ -105,6 +107,7 @@ class Engine:
             raise ValueError(f"kernels must be 'quail' or 'vllm', "
                              f"got {kernels!r}")
         self.kernels = kernels
+        self.wide_head_kernel = "triton"
 
         self.fa_version = flash_attention_version(torch.cuda.get_device_capability())
         self.torch = torch
@@ -519,7 +522,7 @@ class Engine:
 
     def _fa(self, q, k, v, cu_q, cu_k, max_q, max_k, causal,
             block_table=None, seqused_k=None, softmax_scale=None,
-            window=None):
+            window=None, version=None):
         # vLLM's FA2 and FA3 both accept 16-token pages and return
         # LSE as [heads, total_queries] for the merge kernel.
         from vllm.vllm_flash_attn import flash_attn_varlen_func
@@ -532,21 +535,23 @@ class Engine:
             q, k, v, max_seqlen_q=max_q, cu_seqlens_q=cu_q,
             max_seqlen_k=max_k, cu_seqlens_k=cu_k,
             block_table=block_table, seqused_k=seqused_k,
-            causal=causal, fa_version=self.fa_version,
+            causal=causal, fa_version=version or self.fa_version,
             return_softmax_lse=True, **extra)
 
     def _paged(self, q3, kp, vp, cu_q, max_q, used, max_used, table, *,
                causal, softmax_scale=None, window=None):
         """One paged attention call.
 
-        FlashAttention, or vLLM's Triton kernel when the head is wider
-        than FlashAttention takes.
+        FlashAttention 3, or the wide-head kernel when the head is
+        wider than it takes.
         """
-        if q3.shape[-1] <= FA_MAX_HEAD_DIM:
+        wide = q3.shape[-1] > FA_MAX_HEAD_DIM
+        if not wide or self.wide_head_kernel == "fa4":
             out, _ = self._fa(
                 q3, kp, vp, cu_q, None, max_q, max_used, causal=causal,
                 block_table=table, seqused_k=used,
-                softmax_scale=softmax_scale, window=window)
+                softmax_scale=softmax_scale, window=window,
+                version=4 if wide else None)
             return out
         from vllm.v1.attention.ops.triton_unified_attention import (
             unified_attention,

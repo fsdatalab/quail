@@ -263,6 +263,7 @@ class _Engine:
         self.calls = []
         self.torch = sys.modules["torch"]
         self.is_fp8 = kwargs["fp8"]
+        self.wide_head_kernel = "triton"
 
     def attention_unified(self, q3, k3, v3, meta, *, softmax_scale=None,
                           window=None):
@@ -314,6 +315,13 @@ def test_pipeline_runs_the_gemma4_layer_order(monkeypatch):
                                       engine_class=_Engine)
     assert len(pipeline.canvas_ids) == 3
     assert pipeline.canvas_answer_row == 1
+    assert pipeline.engine.wide_head_kernel == "triton"
+    fa4 = DiffusionGemmaPipeline(_fake_model(torch), None, spec=spec,
+                                 engine_class=_Engine, wide_head_kernel="fa4")
+    assert fa4.engine.wide_head_kernel == "fa4"
+    with pytest.raises(ValueError, match="wide_head_kernel"):
+        DiffusionGemmaPipeline(_fake_model(torch), None, spec=spec,
+                               engine_class=_Engine, wide_head_kernel="cute")
     with pytest.raises(ValueError, match="canvas_answer_row"):
         DiffusionGemmaPipeline(
             _fake_model(torch), None, engine_class=_Engine,

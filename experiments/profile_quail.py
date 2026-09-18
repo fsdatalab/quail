@@ -124,11 +124,13 @@ def _write(result, name):
     kernel_cache.commit()
 
 
-def _boot_state(model):
+def _boot_state(model, **pipeline_kwargs):
     """Boot the worker state dict, as the worker's own boot does.
 
     Mirrors quail.execution.execute._execute_physical's boot with the
     shipping pipeline; warm_kernels runs the same tiered warmup.
+    pipeline_kwargs go to the model's pipeline, for experiments that
+    swap a kernel.
     """
     import torch
     import torch.nn.functional as F
@@ -145,15 +147,16 @@ def _boot_state(model):
     spec = MODELS[model]
     device = DEVICES["h100-sxm"]
     tokenizer = AutoTokenizer.from_pretrained(spec.hf_name)
-    model_mod = load_model(spec.hf_name, revision=spec.revision)
     chunk_tokens = budgets.chunk_budget(spec, device)
+    model_mod = load_model(spec.hf_name, revision=spec.revision,
+                           max_batched_tokens=chunk_tokens)
     arena_tok = budgets.arena_tokens(spec, device, chunk_tokens)
     arena = KVArena(n_layers=spec.layers,
                     n_pages=arena_tok // budgets.PAGE_TOKENS,
                     page_tokens=budgets.PAGE_TOKENS,
                     n_kv=spec.n_kv, d_head=spec.d_head,
-                    dtype=torch.bfloat16)
-    pipeline = build_pipeline(spec, model_mod, arena)
+                    dtype=torch.bfloat16, layer_kv=spec.kv_shapes)
+    pipeline = build_pipeline(spec, model_mod, arena, **pipeline_kwargs)
     from quail.backends import GpuContext, QuailBackend
     execution = QuailBackend().start(GpuContext(
         gpu_index=0,
@@ -513,7 +516,8 @@ def _measure(state, qdefs, qid, profiled, trace_dir):
 @app.function(timeout=3600, **GPU_KW)
 def measure(model: str = "qwen3-4b-fp8", sf: float = 0.1,
             queries: tuple = (),
-            out_prefix: str = "profile") -> str:
+            out_prefix: str = "profile",
+            wide_head_kernel: str = "") -> str:
     """Run each named query twice, once unprofiled and once profiled.
 
     The unprofiled pass gives the cited walls and the chunk timeline.
@@ -521,10 +525,15 @@ def measure(model: str = "qwen3-4b-fp8", sf: float = 0.1,
 
     out_prefix names the output files and trace directory; pick one
     that does not overwrite files a report already cites.
+    wide_head_kernel picks the attention kernel for heads wider than
+    FlashAttention 3 takes ("triton" or "fa4"); empty keeps the
+    pipeline's default.
     """
     if not queries:
         raise ValueError("pass at least one QuailB query id")
-    state, chunk_tokens, warm = _boot_state(model)
+    pipeline_kwargs = (
+        {"wide_head_kernel": wide_head_kernel} if wide_head_kernel else {})
+    state, chunk_tokens, warm = _boot_state(model, **pipeline_kwargs)
     _cupti_preinit(state["torch"])
     sess, qdefs = _quailb_session(model, sf)
     missing = [q for q in queries if q not in qdefs]
@@ -533,7 +542,8 @@ def measure(model: str = "qwen3-4b-fp8", sf: float = 0.1,
                        f"known: {sorted(qdefs)}")
     trace_dir = f"/results/ablations/{out_prefix}_traces"
     summary = dict(cell="profile_quail", model=model, sf=sf,
-                   chunk_tokens=chunk_tokens, warm=warm, queries={})
+                   chunk_tokens=chunk_tokens, warm=warm,
+                   wide_head_kernel=wide_head_kernel or None, queries={})
     for qid in queries:
         result = dict(query=qid, sf=sf, model=model,
                       chunk_tokens=chunk_tokens)
@@ -569,9 +579,9 @@ def _parse_queries(queries):
 
 @app.local_entrypoint()
 def run(queries: str, model: str = "qwen3-4b-fp8", sf: float = 0.1,
-        out_prefix: str = "profile"):
+        out_prefix: str = "profile", wide_head_kernel: str = ""):
     handle = measure.spawn(model, sf, _parse_queries(queries),
-                           out_prefix)
+                           out_prefix, wide_head_kernel)
     print(f"profile_quail fc: {handle.object_id}", flush=True)
     print(handle.get())
 

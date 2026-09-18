@@ -30,7 +30,7 @@ attention path.
 
 import numpy as np
 
-from quail.backends.quail.executor.attention import Engine
+from quail.backends.quail.executor.attention import WIDE_HEAD_KERNELS, Engine
 from quail.backends.quail.executor.models.base import ModelPipeline
 
 # The canvas starts as random token ids, as vLLM's sampler starts it;
@@ -70,12 +70,14 @@ class DiffusionGemmaPipeline(ModelPipeline):
         spec: The ModelSpec, for the vocabulary size and canvas length.
         kernels: Engine kernel set; only its KV scatter kernel runs here.
         engine_class: Engine class, replaceable by experiments.
+        wide_head_kernel: Attention kernel for the 512-wide heads,
+            "triton" (vLLM's unified attention) or "fa4".
     """
 
     needs_pages = True
 
     def __init__(self, model, arena, *, spec, kernels="quail",
-                 engine_class=Engine):
+                 engine_class=Engine, wide_head_kernel="triton"):
         backbone = model.model
         self.layers = backbone.layers
         self.embed = backbone.embed_tokens
@@ -89,6 +91,11 @@ class DiffusionGemmaPipeline(ModelPipeline):
             arena, n_q=attn.num_heads, n_kv=attn.num_kv_heads,
             head_dim=attn.head_dim, rotary=attn.rotary_emb,
             fp8=False, kernels=kernels)
+        if wide_head_kernel not in WIDE_HEAD_KERNELS:
+            raise ValueError(
+                f"wide_head_kernel must be one of {WIDE_HEAD_KERNELS}, "
+                f"got {wide_head_kernel!r}")
+        self.engine.wide_head_kernel = wide_head_kernel
         self.canvas_ids = canvas_token_ids(spec.vocab, spec.canvas_tokens)
         if not 0 <= spec.canvas_answer_row < spec.canvas_tokens:
             raise ValueError(
