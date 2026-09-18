@@ -209,11 +209,15 @@ def test_pack_chunk_appends_canvas_rows_after_each_suffix(monkeypatch):
 
 
 class _Norm:
+    """A norm module as the pipeline reads it; the fake engine applies it."""
+
+    hidden_size = 4
+    variance_epsilon = 1e-6
+
     def __init__(self, scale):
         self.scale = scale
-
-    def __call__(self, x):
-        return x * self.scale
+        self.has_weight = True
+        self.weight = scale
 
 
 class _Linear:
@@ -234,7 +238,8 @@ class _Attention:
         self.q_norm = _Norm(1.0)
         self.k_norm = _Norm(1.0)
         self.v_norm = _Norm(1.0)
-        self.rotary_emb = lambda positions, q, k: (q, k)
+        self.rotary_emb = SimpleNamespace(
+            cos_sin_cache=torch.zeros(2, dim), is_neox_style=True)
         self.is_sliding = sliding
 
 
@@ -251,7 +256,9 @@ class _Layer:
         self.post_feedforward_layernorm_1 = _Norm(1.0)
         self.pre_feedforward_layernorm_2 = _Norm(1.0)
         self.post_feedforward_layernorm_2 = _Norm(1.0)
-        self.router = lambda x: x
+        self.router = SimpleNamespace(
+            norm=_Norm(1.0), root_size=torch.tensor(1.0),
+            scale=torch.ones(hidden), proj=lambda x: (x, None))
         self.moe = lambda x, logits: x
         self.layer_scalar = torch.tensor([0.5])
 
@@ -272,6 +279,13 @@ class _Engine:
         meta["layer"] += 1
         return self.torch.zeros(q3.shape[0], q3.shape[1] * q3.shape[2])
 
+    def norm_rows(self, x, weight, eps):
+        # the fakes' norms scale by their weight and nothing else
+        return x * weight
+
+    def rope_inplace(self, positions, q, k, head_dim, cos_sin_cache, is_neox):
+        return q, k
+
 
 def _fake_model(torch, hidden=4):
     layers = [_Layer(torch, hidden, sliding=True, moe=True),
@@ -282,9 +296,11 @@ def _fake_model(torch, hidden=4):
         normalizer=torch.tensor(2.0),
         norm=_Norm(1.0),
         config=SimpleNamespace(sliding_window=1024))
+    post_norm = _Norm(0.25)
+    post_norm.has_weight = False
     return SimpleNamespace(
         model=backbone,
-        self_conditioning=SimpleNamespace(post_norm=_Norm(0.25)),
+        self_conditioning=SimpleNamespace(post_norm=post_norm),
         quail_vllm_config="config")
 
 
@@ -343,13 +359,14 @@ def test_pipeline_runs_the_gemma4_layer_order(monkeypatch):
     # sliding layer: 2 x 4 heads with the window; full layer: 2 x 8, no window
     assert calls == [(0, (6, 2, 4), (6, 1, 4), 1.0, 1024),
                      (1, (6, 2, 8), (6, 1, 8), 1.0, None)]
-    # A prompt row embeds to 1 x 2 = 2; a canvas row also passes the
-    # post-norm (x 0.25) and starts at 0.5. Attention adds 0 (its
-    # post-norm is x 0). The MoE layer adds the residual twice (dense
-    # MLP and experts, both identity) and halves: 2 -> 3, 0.5 -> 0.75.
-    # The dense layer adds it once and halves: 3 -> 3, 0.75 -> 0.75.
+    # A prompt row embeds to 1 x 2 = 2; a canvas row passes the
+    # weightless post-norm, which the fake engine applies as x 1, so it
+    # starts at 2 too. Attention adds 0 (its post-norm is x 0). The MoE
+    # layer adds the residual twice (dense MLP and experts, both
+    # identity) and halves: 2 -> 3. The dense layer adds it once and
+    # halves: 3 -> 3.
     assert out.shape == (2, 4)
-    assert out.tolist() == [[3.0] * 4, [0.75] * 4]
+    assert out.tolist() == [[3.0] * 4, [3.0] * 4]
 
 
 def test_filter_admission_takes_canvas_in_stage_tokens():

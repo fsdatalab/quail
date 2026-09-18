@@ -168,6 +168,28 @@ class Engine:
         ops.rms_norm(out, x, norm.weight, norm.variance_epsilon)
         return out
 
+    def norm_rows(self, x, weight, eps):
+        """RMS-normalize the last dimension of x with vLLM's CUDA kernel.
+
+        x may have any rank; weight is a vector over the last
+        dimension. Bypasses the module's own dispatch, which runs the
+        unfused PyTorch path on this build.
+        """
+        from vllm import _custom_ops as ops
+        width = x.shape[-1]
+        rows = x.reshape(-1, width)
+        if not rows.is_contiguous():
+            rows = rows.contiguous()
+        out = self.torch.empty_like(rows)
+        ops.rms_norm(out, rows, weight, eps)
+        return out.view(x.shape)
+
+    def rope_inplace(self, positions, q, k, head_dim, cos_sin_cache, is_neox):
+        """Rotate q and k in place with vLLM's CUDA kernel."""
+        from vllm import _custom_ops as ops
+        ops.rotary_embedding(positions, q, k, head_dim, cos_sin_cache, is_neox)
+        return q, k
+
     def fused_add_rms_norm(self, hidden, residual, norm):
         from vllm import _custom_ops as ops
         ops.fused_add_rms_norm(hidden, residual, norm.weight,
