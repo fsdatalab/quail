@@ -153,8 +153,11 @@ def filter_groups(specs, prompts_per_call: int = PROMPTS_PER_CALL) -> list:
 def label_set_identity(spec: PredicateSpec, corpus_id: str,
                        corpus_full_hash: str) -> dict:
     """This pass's label-set identity: the Quail judge, this part size."""
+    judge = QUAIL_JUDGE_SPEC
+    if spec.kind == "join":
+        judge = {**judge, "join_anchor": "arg0"}
     identity = _label_set_identity(
-        spec, corpus_id, corpus_full_hash, judge=QUAIL_JUDGE_SPEC)
+        spec, corpus_id, corpus_full_hash, judge=judge)
     return {**identity, "prompts_per_call": PROMPTS_PER_CALL,
             "join_pairs_per_call": JOIN_PAIRS_PER_CALL}
 
@@ -529,7 +532,7 @@ class QuailJudge:
                           quail.prompt(spec.template,
                                        quail.col(f"l.{spec.left_column}"),
                                        quail.col(f"r.{spec.right_column}")),
-                          semantics="full")
+                          anchor="l", semantics="full")
                  .select("l.id", "r.id"))
         expected = len(left_rows) * len(right_rows)
         result = self._run(query, expected)

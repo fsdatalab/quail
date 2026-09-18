@@ -158,7 +158,8 @@ class _FakeQuery:
     def ai_filter(self, _prompt, **_kwargs):
         return self
 
-    def ai_join(self, other, _prompt, **_kwargs):
+    def ai_join(self, other, _prompt, **kwargs):
+        self.session.join_anchors.append(kwargs.get("anchor"))
         self.names.append(other.names[0])
         return self
 
@@ -185,6 +186,7 @@ class _FakeQuery:
 class _FakeSession:
     def __init__(self, _config):
         self.tables = {}
+        self.join_anchors = []
 
     def register(self, name, provider):
         self.tables[name] = provider.table
@@ -213,6 +215,7 @@ def test_judge_answers_and_source_labels(monkeypatch, tmp_path):
             (0, 0): False, (0, 1): False, (1, 0): True, (1, 1): False}
         assert judge.queries == 2
         assert judge.rows_answered == 6
+        assert judge.session.join_anchors == ["l"]
 
     with monkeypatch.context() as patch:
         import pyarrow.parquet as pq
@@ -473,3 +476,16 @@ def test_publish_uploads_only_what_a_reader_needs(monkeypatch, tmp_path):
     assert f"{GROUND_TRUTH_ROOT}/corpora/c_x/reviews.parquet" in client.uploads
     assert (f"{GROUND_TRUTH_ROOT}/corpora/c_x/active_collection.json"
             in client.uploads)
+
+
+def test_fixed_join_order_does_not_reuse_automatic_anchor_labels():
+    for key, changed in (
+        ("quailb.fever.passage.supports_claim", True),
+        ("quailb.imdb.review.discusses_ending", False),
+        ("quailb.lepard.excerpt.cites_passage", False),
+    ):
+        spec = _spec(key)
+        old = labeling._label_set_identity(
+            spec, "c_test", "0" * 64, judge=labeling.QUAIL_JUDGE_SPEC)
+        new = labeling.label_set_identity(spec, "c_test", "0" * 64)
+        assert (new["label_set_id"] != old["label_set_id"]) == changed
