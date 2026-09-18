@@ -87,7 +87,9 @@ class DiffusionGemmaPipeline(ModelPipeline):
         self.canvas_ids = canvas_token_ids(spec.vocab, spec.canvas_tokens)
         _init_moe_workspace()
         # The engine's KV scatter kernel indexes rows in 32-bit ints.
-        widest = max(layer.self_attn.qkv_proj.weight.shape[0]
+        # vLLM keeps these fp8 weights transposed, so take the wider
+        # side.
+        widest = max(max(layer.self_attn.qkv_proj.weight.shape)
                      for layer in self.layers)
         self.max_chunk_tokens = (2**31 - 1) // widest
 

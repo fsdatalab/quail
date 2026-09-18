@@ -34,11 +34,11 @@ DIFFUSION_GEMMA_26B_FP8 = ModelSpec(
     w_bytes=1.0,           # fp8 weights, per-channel scales
     hf_name="RedHatAI/diffusiongemma-26B-A4B-it-FP8-dynamic",
     kv_bytes=2.0,
-    w_mem_bytes=27.5e9,    # estimate: fp8 linears and experts (24.5e9)
-    #                        + bf16 embeddings (1.5e9) + bf16 vision
-    #                        tower, router, and self-conditioning
-    #                        weights; the confirmation cell prints the
-    #                        loaded footprint
+    w_mem_bytes=27_682_404_352,    # measured as-loaded footprint (the
+    #                                probe cell): fp8 linears and
+    #                                experts + bf16 embeddings, vision
+    #                                tower, router, and
+    #                                self-conditioning weights
     vocab=262_144,
     tied_head=True,
     weight_precision="fp8",
