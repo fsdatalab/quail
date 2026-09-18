@@ -24,7 +24,10 @@ chat wrapper tokens, which is exactly how the two branches differ.
 Round one runs raw then chat, round two chat then raw. An earlier
 version ran all joins on one engine; vLLM 0.26.0 crashed in a model
 step at the start of the second join, so each child's output is saved
-to worker.log on the volume.
+to worker.log on the volume. A container whose GPU starts hot or
+throttled is refused and the entrypoint spawns again; the GPU's
+temperature, clock, and throttle flags are sampled every 30 seconds
+and saved with the result.
 
     run_log="results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-bio2-prompt-layout.log"
     cell=experiments/bio2_prompt_layout.py::compare_prompt_layouts
@@ -40,6 +43,8 @@ pull it with:
 import json
 import multiprocessing as mp
 import os
+import subprocess
+import threading
 import time
 import traceback
 from datetime import datetime, timezone
@@ -63,6 +68,50 @@ PREDICTION_TEXT = (
     "means batch composition, not the host, explains the September 18 "
     "vLLM time."
 )
+# A container whose GPU is already hot or throttled is refused; the
+# entrypoint spawns again, which usually lands on another machine.
+MAX_TEMPERATURE_C = 85
+GPU_QUERY = ("temperature.gpu,clocks.sm,clocks.max.sm,power.draw,"
+             "clocks_throttle_reasons.hw_slowdown,"
+             "clocks_throttle_reasons.sw_thermal_slowdown,"
+             "clocks_throttle_reasons.hw_thermal_slowdown")
+
+
+class GpuUnhealthyError(RuntimeError):
+    """The container's GPU is hot or throttled before any work starts."""
+
+
+def gpu_sample() -> dict:
+    """Return one nvidia-smi reading of temperature, clocks, and throttling."""
+    output = subprocess.check_output(
+        ["nvidia-smi", f"--query-gpu={GPU_QUERY}", "--format=csv,noheader,nounits"],
+        text=True).strip().splitlines()[0]
+    temperature, clock, max_clock, power, *reasons = [
+        field.strip() for field in output.split(",")]
+    return {
+        "time": time.time(), "temperature_c": int(temperature),
+        "clock_mhz": int(clock), "max_clock_mhz": int(max_clock),
+        "power_w": float(power),
+        "throttled": any(reason == "Active" for reason in reasons),
+    }
+
+
+def require_healthy_gpu() -> dict:
+    """Raise GpuUnhealthyError unless the GPU is cool and not throttled."""
+    sample = gpu_sample()
+    if sample["throttled"] or sample["temperature_c"] > MAX_TEMPERATURE_C:
+        raise GpuUnhealthyError(f"GPU unhealthy at start: {sample}")
+    return sample
+
+
+def sample_gpu_forever(samples: list, stop: threading.Event, every_s=30.0):
+    """Append a GPU reading every interval until stopped."""
+    while not stop.is_set():
+        try:
+            samples.append(gpu_sample())
+        except Exception as error:  # noqa: BLE001
+            samples.append({"time": time.time(), "error": str(error)})
+        stop.wait(every_s)
 
 
 def _cpu_model() -> str:
@@ -210,19 +259,28 @@ def compare_layouts(rounds: int = 2) -> str:
     import torch
     import vllm
 
+    first_sample = require_healthy_gpu()
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     root = Path(f"/results/ablations/bio2-prompt-layout-{stamp}")
     root.mkdir(parents=True)
+    samples = [first_sample]
+    stop = threading.Event()
+    sampler = threading.Thread(
+        target=sample_gpu_forever, args=(samples, stop), daemon=True)
+    sampler.start()
     joins = []
     for round_index in range(rounds):
         order = LAYOUTS if round_index % 2 == 0 else tuple(reversed(LAYOUTS))
         for layout in order:
             record = _run_child(root, f"round{round_index}-{layout}", layout)
             record["round"] = round_index
+            record["gpu_samples_before"] = len(samples)
             joins.append(record)
             (root / "joins.json").write_text(json.dumps(joins, indent=2))
             print(f"[layout] {json.dumps(record)}", flush=True)
             results_vol.commit()
+    stop.set()
+    sampler.join(timeout=60)
     by_layout = {
         name: [j["ms_per_pair"] for j in joins if j["layout"] == name]
         for name in LAYOUTS}
@@ -239,6 +297,8 @@ def compare_layouts(rounds: int = 2) -> str:
         "host": {"cpu_model": _cpu_model(), "cpu_count": os.cpu_count(),
                  "gpu_uuids": sorted({u for j in joins for u in j["gpu_uuids"]})},
         "versions": {"torch": torch.__version__, "vllm": vllm.__version__},
+        "gpu_samples": samples,
+        "gpu_throttled_samples": sum(1 for s in samples if s.get("throttled")),
         "result_volume_path": str(root / "result.json"),
     }
     (root / "result.json").write_text(json.dumps(result, indent=2))
@@ -247,9 +307,18 @@ def compare_layouts(rounds: int = 2) -> str:
 
 
 @app.local_entrypoint()
-def compare_prompt_layouts(rounds: int = 2):
-    """Start the comparison and print its function call id and result path."""
+def compare_prompt_layouts(rounds: int = 2, attempts: int = 4):
+    """Start the comparison, spawning again when a container's GPU is unhealthy."""
     print(f"prediction: {PREDICTION_TEXT}", flush=True)
-    call = compare_layouts.spawn(rounds)
-    print(f"function call id: {call.object_id}", flush=True)
-    print(f"result volume path: {call.get()}", flush=True)
+    for attempt in range(attempts):
+        call = compare_layouts.spawn(rounds)
+        print(f"function call id: {call.object_id} (attempt {attempt + 1})",
+              flush=True)
+        try:
+            print(f"result volume path: {call.get()}", flush=True)
+            return
+        except Exception as error:  # noqa: BLE001
+            if "GPU unhealthy at start" not in str(error):
+                raise
+            print(f"refused container: {error}", flush=True)
+    raise RuntimeError(f"no healthy GPU in {attempts} attempts")
