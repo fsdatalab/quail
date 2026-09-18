@@ -73,3 +73,16 @@ DIFFUSION_GEMMA_26B_FP8 = ModelSpec(
 DIFFUSION_GEMMA_26B_FP8_CANVAS32 = replace(
     DIFFUSION_GEMMA_26B_FP8, name="diffusion-gemma-26b-a4b-fp8-canvas32",
     canvas_tokens=32)
+
+# An 8-row canvas: the model's empty thinking channel (rows 0 to 3),
+# the answer row, and three rows after it.
+DIFFUSION_GEMMA_26B_FP8_CANVAS8 = replace(
+    DIFFUSION_GEMMA_26B_FP8, name="diffusion-gemma-26b-a4b-fp8-canvas8",
+    canvas_tokens=8)
+
+# The empty thinking channel prefilled in the prompt and a one-row
+# canvas holding only the answer: the fewest rows an answer can take.
+DIFFUSION_GEMMA_26B_FP8_CANVAS1 = replace(
+    DIFFUSION_GEMMA_26B_FP8, name="diffusion-gemma-26b-a4b-fp8-canvas1",
+    turn_suffix="<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+    canvas_tokens=1, canvas_answer_row=0)

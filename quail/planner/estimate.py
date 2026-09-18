@@ -182,6 +182,9 @@ class _Search:
         self.device = device
         self.chunk_tokens = chunk_tokens
         self.credit_shared = credit_shared
+        # a diffusion model answers on canvas rows appended to every
+        # evaluation's suffix; a decoder answers on the suffix's last row
+        self.canvas = model.canvas_tokens
         stores = query.token_inputs()
         operators = query.logical.operators()
         self.scans, self.filters, self.joins = (
@@ -260,9 +263,10 @@ class _Search:
         partner_rows = list(itertools.product(
             *[survivors[alias] for alias in partners]))
         suffixes = [
-            tail + sum(labels_by_alias[alias]["label"]
-                       + self.aliases[alias].tokens[row]
-                       for alias, row in zip(partners, partner_row))
+            tail + self.canvas
+            + sum(labels_by_alias[alias]["label"]
+                  + self.aliases[alias].tokens[row]
+                  for alias, row in zip(partners, partner_row))
             for partner_row in partner_rows
         ]
         all_tokens = sum(suffixes)
@@ -323,14 +327,14 @@ class _Search:
             for stage_index, written_pos in enumerate(order):
                 predicate = predicates[written_pos]
                 question_tokens = predicate.prompt.tail_tokens
+                suffix = question_tokens + self.canvas
                 for row in live:
                     if stage_index == 0 and not (
                             self.credit_shared and row in computed):
-                        work = work + self.first_use(
-                            alias, row, question_tokens)
+                        work = work + self.first_use(alias, row, suffix)
                     else:
                         prefix = self.pre + tokens[row]
-                        work = work + ask(prefix, question_tokens)
+                        work = work + ask(prefix, suffix)
                 if stage_index == 0:
                     computed.update(live)
                 passed = [

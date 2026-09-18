@@ -109,11 +109,14 @@ class DiffusionGemmaPipeline(ModelPipeline):
             router.quail_scale = (router.root_size.to(router.scale.dtype)
                                   * router.scale).detach()
         self.canvas_ids = canvas_token_ids(spec.vocab, spec.canvas_tokens)
-        if not 0 <= spec.canvas_answer_row < spec.canvas_tokens:
+        # an empty canvas reads the answer at the prompt's last row
+        if spec.canvas_tokens and not (
+                0 <= spec.canvas_answer_row < spec.canvas_tokens):
             raise ValueError(
                 f"canvas_answer_row {spec.canvas_answer_row} is outside "
                 f"the {spec.canvas_tokens}-row canvas")
-        self.canvas_answer_row = spec.canvas_answer_row
+        self.canvas_answer_row = (spec.canvas_answer_row
+                                  if spec.canvas_tokens else 0)
         _init_moe_workspace()
         # The engine's KV scatter kernel indexes rows in 32-bit ints.
         # vLLM keeps these fp8 weights transposed, so take the wider

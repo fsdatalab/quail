@@ -131,6 +131,14 @@ LAYOUTS = {
     # row 4, after the model's empty thinking channel
     "canvas32": {"canvas_tokens": 32},
     "canvas8": {"canvas_tokens": 8},
+    # the shortest canvas that still holds the channel and the answer row
+    "canvas5": {"canvas_tokens": 5},
+    # the channel prefilled in the prompt and a one-row canvas
+    "channel1": {"turn_suffix": "<turn|>\n<|turn>model\n"
+                                "<|channel>thought\n<channel|>",
+                 "canvas_answer_row": 0, "canvas_tokens": 1},
+    # no canvas: the answer is read at the prompt's last row
+    "canvas0": {"canvas_tokens": 0, "canvas_answer_row": 0},
 }
 
 

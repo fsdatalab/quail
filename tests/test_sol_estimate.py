@@ -8,7 +8,7 @@ import pyarrow.parquet as pq
 import quail
 from quail.catalog import DocumentProvider
 from quail.planner.plan import EngineConfig
-from quail.specs import H100_USD_PER_HOUR
+from quail.specs import DIFFUSION_GEMMA_26B_FP8_CANVAS8, H100_USD_PER_HOUR
 
 FILTER = "Judge the review.\n\n{0}\nAnswer TRUE or FALSE."
 JOIN = "Judge the pair.\n\n{0}\nAspect: {1}\nAnswer TRUE or FALSE."
@@ -100,3 +100,25 @@ def test_distinct_prefix_estimates_for_filters_and_joins(tmp_path):
     record = json.loads(json.dumps(estimate.as_dict()))
     assert record["sol_s"] == estimate.seconds
     assert record["join_stages"][0]["template"] == stage["template"]
+
+
+def test_canvas_rows_count_once_per_evaluation(tmp_path):
+    sess = _session(tmp_path)
+    try:
+        query = (sess.docs("reviews").alias("r")
+                 .ai_filter(quail.prompt(FILTER, quail.col("r.body")))
+                 .ai_join(
+                     sess.docs("aspects").alias("a"),
+                     quail.prompt(JOIN, quail.col("r.body"),
+                                  quail.col("a.aspect")))
+                 .select("r.id", "a.id"))
+        decoder = quail.speed_of_light_estimate(query, _answer)
+        canvas = quail.speed_of_light_estimate(
+            query, _answer, model=DIFFUSION_GEMMA_26B_FP8_CANVAS8)
+    finally:
+        sess.close()
+
+    # three filter evaluations and four join pairs each carry the
+    # eight canvas rows; the anchor frames carry none
+    assert canvas.fresh_tokens == decoder.fresh_tokens + 8 * (3 + 4)
+    assert canvas.join_pair_evaluations == 4
