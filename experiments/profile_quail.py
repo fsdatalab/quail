@@ -156,12 +156,15 @@ def _boot_state(model, **pipeline_kwargs):
     chunk_tokens = budgets.chunk_budget(spec, device)
     model_mod = load_model(spec.hf_name, revision=spec.revision,
                            max_batched_tokens=chunk_tokens)
-    arena_tok = budgets.arena_tokens(spec, device, chunk_tokens)
+    full_pages, sliding_pages = budgets.arena_pages(spec, device, chunk_tokens)
     arena = KVArena(n_layers=spec.layers,
-                    n_pages=arena_tok // budgets.PAGE_TOKENS,
+                    n_pages=full_pages,
                     page_tokens=budgets.PAGE_TOKENS,
                     n_kv=spec.n_kv, d_head=spec.d_head,
-                    dtype=torch.bfloat16, layer_kv=spec.kv_shapes)
+                    dtype=torch.bfloat16, layer_kv=spec.kv_shapes,
+                    sliding_layers=spec.sliding_layer_set,
+                    sliding_window=spec.sliding_window,
+                    n_sliding_pages=sliding_pages)
     pipeline = build_pipeline(spec, model_mod, arena, **pipeline_kwargs)
     from quail.backends import GpuContext, QuailBackend
     execution = QuailBackend().start(GpuContext(
@@ -229,6 +232,11 @@ def _run_query(state, build, captured):
             state["torch"], state["F"], state["model"],
             payload["true_ids"], payload["false_ids"],
         )
+        arena_pages = payload.get("arena_pages")
+        if arena_pages is not None:
+            for key in state["arena"].resident_keys():
+                state["arena"].free_key(key)
+            state["arena"].resize(*arena_pages)
         state["model_execution"].bind_query(
             torch=state["torch"],
             async_answers=AsyncAnswers(state["torch"], rows),

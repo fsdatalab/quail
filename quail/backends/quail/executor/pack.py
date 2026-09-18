@@ -138,6 +138,9 @@ class JoinAdmission:
         canvas_tokens: Rows a diffusion model adds after every suffix
             and after a frame entry. They take chunk room and page
             room but are never kept in the anchor's KV.
+        page_cost: Callable(tokens, base_tokens) giving the pages a
+            key of that many rows takes, in the arena's currency; None
+            prices one pool of page_tokens pages.
 
     Each chunk fills in priority order: partner streams cut by the
     previous chunk, then anchors starting their next stage, then
@@ -154,8 +157,12 @@ class JoinAdmission:
     def __init__(self, prefix_tokens, stage_suffixes, chunk_budget,
                  arena_pages, page_tokens, frame_tokens=None,
                  resident=None, anchor_partners=None, temporary_suffix_pages=False,
-                 answer_dtype=None, canvas_tokens=0):
+                 answer_dtype=None, canvas_tokens=0, page_cost=None):
         self.answer_dtype = answer_dtype
+        # page_cost(tokens, base_tokens) prices a key in the arena's
+        # currency; the default is one pool of page_tokens pages
+        self.page_cost = page_cost or (
+            lambda tokens, base_tokens=None: pages_for(tokens, page_tokens))
         self._answer_counts = [{} for _ in stage_suffixes]
         self.temporary_suffix_pages = temporary_suffix_pages
         self._page_cums = {}
@@ -254,7 +261,7 @@ class JoinAdmission:
                             f"of range")
                     cum.append(cum[-1] + self.stages[j][i])
                 cums.append(cum)
-        need = pages_for(prefix + self._extra, self.page_tokens)
+        need = self.page_cost(prefix + self._extra)
         if resident_pages is not None:
             need = max(0, need - resident_pages)
         elif need > self.arena_pages:
@@ -288,7 +295,7 @@ class JoinAdmission:
                  for j in range(k) for i in range(self._count(a, j))),
                 default=0,
             )
-            needed = pages_for(prefix + self._extra, self.page_tokens) + largest
+            needed = self.page_cost(prefix + self._extra) + largest
             if needed > self.arena_pages:
                 raise ValueError("anchor and one suffix exceed the KV arena")
             self._page_reserve = max(self._page_reserve, largest)
@@ -352,7 +359,7 @@ class JoinAdmission:
 
     def _suffix_page_cost(self, a, j, i):
         remainder = (self.prefix[a] + self.frames[j]) % self.page_tokens
-        return pages_for(remainder + self._suffix(a, j, i), self.page_tokens)
+        return self.page_cost(remainder + self._suffix(a, j, i), 0)
 
     def _take(self, a, j, i, room, page_room):
         """Return the partner run that fits the token and temporary page budgets."""
@@ -529,6 +536,9 @@ class FilterAdmission:
         kept_extra_tokens: Extra tokens per document that must fit in
             pages (shared preamble plus tail room).
         limit: Stop after this many survivors.
+        page_cost: Callable(tokens, base_tokens) giving the pages a
+            document of that many rows takes, in the arena's currency;
+            None prices one pool of page_tokens pages.
 
     Survivor suffixes pack before fresh admissions. Pages are granted
     in queue order; chunk room may be skipped.
@@ -536,7 +546,9 @@ class FilterAdmission:
 
     def __init__(self, doc_tokens, stage_tokens, chunk_budget,
                  arena_pages, page_tokens, kept_extra_tokens=0,
-                 limit=None, available_pages=None):
+                 limit=None, available_pages=None, page_cost=None):
+        self.page_cost = page_cost or (
+            lambda tokens, base_tokens=None: pages_for(tokens, page_tokens))
         self.doc_tokens = doc_tokens
         self.stage_tokens = list(stage_tokens)
         self.chunk_budget = chunk_budget
@@ -559,8 +571,8 @@ class FilterAdmission:
             if need > chunk_budget:
                 raise ValueError(f"document {d} + question needs {need} "
                                  f"tokens > chunk budget {chunk_budget}")
-            if arena_pages is not None and pages_for(
-                    t + kept_extra_tokens, page_tokens) > arena_pages:
+            if arena_pages is not None and self.page_cost(
+                    t + kept_extra_tokens) > arena_pages:
                 raise ValueError(f"document {d} needs more pages than "
                                  f"the arena holds")
         self.pending = _CompactQueue(len(self.doc_tokens))
@@ -599,9 +611,8 @@ class FilterAdmission:
         while self.pending and not blocked_pages:
             doc = self.pending.popleft()
             if self.free_pages is not None:
-                need_pages = pages_for(
-                    self.doc_tokens[doc] + self.kept_extra,
-                    self.page_tokens)
+                need_pages = self.page_cost(
+                    self.doc_tokens[doc] + self.kept_extra)
                 if need_pages > self.free_pages:
                     # pages are granted in order: put it back and stop
                     # claiming pages behind it
@@ -650,9 +661,18 @@ class FilterAdmission:
         if release:
             self.free_pages += held
             return (doc,)
-        self.free_pages += held - pages_for(self.doc_tokens[doc],
-                                            self.page_tokens)
+        self.free_pages += held - self.page_cost(
+            self.doc_tokens[doc], self.doc_tokens[doc])
         return ()
+
+    def trim(self, doc, pages):
+        """Credit pages a resident document released after its pass."""
+        if pages < 0:
+            raise ValueError("a trim cannot take pages")
+        if self.free_pages is None or not pages:
+            return
+        self.resident[doc] -= pages
+        self.free_pages += pages
 
     def add_free_pages(self, pages):
         """Add pages released by retained KV outside this chain."""

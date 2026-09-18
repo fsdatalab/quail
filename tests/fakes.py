@@ -39,19 +39,35 @@ FRAME = 4000
 SETTINGS = {"filter_limit": None, "pre_ids": [], "retention": {}}
 
 
-def cpu_arena(pages):
-    arena = KVArena.__new__(KVArena)
+def bare_arena(arena, pages):
+    """Give a tensor-free KVArena the accounting of a single-pool arena."""
     arena.accounting = PageArena(pages, 16)
+    arena.sliding = None
+    arena.window = 0
+    arena.sliding_layers = frozenset()
+    arena.pinned = False
+    arena._ratio = 1.0
     arena._rows = {}
     arena._capacity_rows = {}
+    arena._sliding_rows = {}
+    arena._base = {}
+    arena._sliding_start = {}
     arena._refresh_rows = lambda *args: None
     arena.reset_stats()
+    return arena
 
-    def allocate(key, tokens, capacity_tokens=None):
+
+def cpu_arena(pages):
+    arena = bare_arena(KVArena.__new__(KVArena), pages)
+
+    def allocate(key, tokens, capacity_tokens=None, base_tokens=None,
+                 sliding_tokens=None):
         got = arena.accounting.alloc(key, tokens, capacity_tokens)
         if got is not None:
             arena._rows[key] = None
             arena._capacity_rows[key] = None
+            arena._base[key] = tokens if base_tokens is None else base_tokens
+            arena._sliding_start[key] = 0
         return got
 
     arena.alloc = allocate

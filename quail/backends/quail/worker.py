@@ -81,13 +81,16 @@ class LoadedGpu:
         torch.cuda.synchronize()
 
         t0 = time.perf_counter()
-        arena_tok = budgets.arena_tokens(spec, device, budget)
+        full_pages, sliding_pages = budgets.arena_pages(spec, device, budget)
         self.arena = KVArena(n_layers=spec.layers,
-                             n_pages=arena_tok // budgets.PAGE_TOKENS,
+                             n_pages=full_pages,
                              page_tokens=budgets.PAGE_TOKENS,
                              n_kv=spec.n_kv, d_head=spec.d_head,
                              dtype=torch.bfloat16,
-                             layer_kv=spec.kv_shapes)
+                             layer_kv=spec.kv_shapes,
+                             sliding_layers=spec.sliding_layer_set,
+                             sliding_window=spec.sliding_window,
+                             n_sliding_pages=sliding_pages)
         self.arena_s = time.perf_counter() - t0
 
         t0 = time.perf_counter()
@@ -101,8 +104,16 @@ class LoadedGpu:
         self.async_ans = None
         self.chunk_tokens = None
 
-    def bind_query(self, true_ids, false_ids, chunk_tokens):
-        """Attach the answer rows, readout, and chunk budget for one query."""
+    def bind_query(self, true_ids, false_ids, chunk_tokens, arena_pages=None):
+        """Attach the answer rows, readout, and chunk budget for one query.
+
+        arena_pages resizes the KV pools to the plan's split; nothing
+        survives in the arena between queries.
+        """
+        if arena_pages is not None:
+            for key in self.arena.resident_keys():
+                self.arena.free_key(key)
+            self.arena.resize(*arena_pages)
         rows = AnswerRows(self.torch, self.F, self.model, true_ids, false_ids)
         self.async_ans = AsyncAnswers(self.torch, rows)
         self.chunk_tokens = chunk_tokens
@@ -184,7 +195,7 @@ def _single_gpu_context(registry, envelope):
 
 
 def _boot_for_query(runtime_state, backend, gpu_context,
-                    chunk_tokens, true_ids, false_ids):
+                    chunk_tokens, true_ids, false_ids, arena_pages=None):
     """Load or reuse a GPU, bind a query, warm kernels."""
     key = (backend.name, gpu_context.model.name)
     gpu = runtime_state.get(key)
@@ -195,7 +206,7 @@ def _boot_for_query(runtime_state, backend, gpu_context,
         cold = True
     else:
         cold = False
-    gpu.bind_query(true_ids, false_ids, chunk_tokens)
+    gpu.bind_query(true_ids, false_ids, chunk_tokens, arena_pages)
     warm_s, warm_tier = gpu.warm()
     boot = _boot_record(gpu, cold, warm_s, warm_tier, t_boot)
     say(f"model ready, boot {boot['boot_s']} s ({boot['kind']})")
@@ -212,7 +223,8 @@ def prepare_quail_request(context) -> None:
     gpu, boot = _boot_for_query(
         context.runtime_state, registry.backend(envelope["backend"]),
         _single_gpu_context(registry, envelope), settings["chunk_tokens"],
-        settings["true_ids"], settings["false_ids"])
+        settings["true_ids"], settings["false_ids"],
+        settings.get("arena_pages"))
     gpu.prepared_boot = boot
 
 
@@ -282,7 +294,8 @@ def execute_quail_payload(payload, registry, graph, backend, runtime_state):
     if boot is None:
         gpu, boot = _boot_for_query(
             runtime_state, backend, gpu_context, payload["chunk_tokens"],
-            payload["true_ids"], payload["false_ids"])
+            payload["true_ids"], payload["false_ids"],
+            payload.get("arena_pages"))
     say("running the query")
 
     state = _gpu_state(gpu)
@@ -385,7 +398,7 @@ def _child_boot(state, sub):
     else:
         cold = False
     gpu.bind_query(sub["true_ids"], sub["false_ids"],
-                   sub["chunk_tokens"])
+                   sub["chunk_tokens"], sub.get("arena_pages"))
     state["runtime_context"] = ExecutionContext(
         runtimes=registry.runtimes, model_execution=gpu.execution,
     )
@@ -664,6 +677,7 @@ def execute_quail_multi(payload, registry, graph):
     setup = {key: payload[key] for key in (
         "model", "physical_plan", "workers", "chunk_tokens", "true_ids", "false_ids",
     )}
+    setup["arena_pages"] = payload.get("arena_pages")
     setup.update(registry=registry, model_path=model_path)
     boots = _round("boot", [setup] * gpu_count)
     boot_s = round(time.perf_counter() - started, 2)

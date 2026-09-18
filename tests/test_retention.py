@@ -1,17 +1,14 @@
 """Shared retention priority, capacity, and eviction tests."""
 
 
-from quail.backends.quail.executor.arena import KVArena, PageArena
+from fakes import bare_arena
+
+from quail.backends.quail.executor.arena import KVArena
 from quail.cost.retention import RetentionPolicy
 
 
 def cpu_arena(pages, cap, uses):
-    arena = KVArena.__new__(KVArena)
-    arena.accounting = PageArena(pages, 16)
-    arena._rows = {}
-    arena._capacity_rows = {}
-    arena._refresh_rows = lambda *args: None
-    arena.reset_stats()
+    arena = bare_arena(KVArena.__new__(KVArena), pages)
     arena.accounting.configure_retention(RetentionPolicy(1.0, 0.01, uses), cap)
     return arena
 
@@ -89,11 +86,14 @@ def test_filter_chains_share_retention_and_return_evicted_pages(monkeypatch):
 
     arena = cpu_arena(32, 8, {'e1': (1, 0), 'e2': (1, 1)})
 
-    def allocate_rows(key, tokens, capacity_tokens=None):
+    def allocate_rows(key, tokens, capacity_tokens=None, base_tokens=None,
+                      sliding_tokens=None):
         pages = arena.accounting.alloc(key, tokens, capacity_tokens)
         if pages is not None:
             arena._rows[key] = None
             arena._capacity_rows[key] = None
+            arena._base[key] = tokens if base_tokens is None else base_tokens
+            arena._sliding_start[key] = 0
         return pages
 
     arena.alloc = allocate_rows

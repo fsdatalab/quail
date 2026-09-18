@@ -44,6 +44,10 @@ class ModelSpec:
     layer_kv: tuple = ()   # per layer (KV heads, head dim) when layers
     #                        differ; empty means every layer stores
     #                        n_kv x d_head
+    sliding_window: int = 0    # tokens a sliding-attention layer sees
+    #                            behind each row; 0 means no layer
+    #                            slides
+    sliding_layers: tuple = ()    # indices of the layers that slide
     canvas_tokens: int = 0    # rows a diffusion model denoises after
     #                           the answer cue; the answer is read at
     #                           the first one. 0 for an autoregressive
@@ -88,6 +92,29 @@ class ModelSpec:
     def kv_elements_per_token(self) -> int:
         """KV elements per token, dtype-free: 2 * sum of n_kv * d_head."""
         return 2 * sum(n_kv * d_head for n_kv, d_head in self.kv_shapes)
+
+    @property
+    def sliding_layer_set(self) -> frozenset:
+        """The layers that keep only the last sliding_window tokens of KV."""
+        if not self.sliding_window:
+            return frozenset()
+        bad = [i for i in self.sliding_layers if not 0 <= i < self.layers]
+        if bad:
+            raise ValueError(f"sliding_layers {bad} are outside the model")
+        return frozenset(self.sliding_layers)
+
+    @property
+    def kappa_sliding(self) -> float:
+        """KV bytes per token on the sliding layers alone."""
+        sliding = self.sliding_layer_set
+        return 2 * self.kv_bytes * sum(
+            n_kv * d_head for i, (n_kv, d_head) in enumerate(self.kv_shapes)
+            if i in sliding)
+
+    @property
+    def kappa_full(self) -> float:
+        """KV bytes per token on the layers that keep every token."""
+        return self.kappa - self.kappa_sliding
 
     @property
     def turn(self) -> tuple[str, str]:

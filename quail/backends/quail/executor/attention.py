@@ -63,6 +63,8 @@ class Chunk:
         tokens: Rows in the chunk.
         layout: (arena key, suffix count) per group in chunk order.
         temporary_keys: Arena keys the loop frees after the forward pass.
+        fresh_keys: Keys whose prefix this chunk computes; the loop
+            trims their sliding pages after the pass.
     """
 
     input_ids: Any
@@ -73,6 +75,7 @@ class Chunk:
     tokens: int
     layout: list
     temporary_keys: tuple = ()
+    fresh_keys: tuple = ()
 
 
 def flash_attention_version(capability: tuple[int, int]) -> int:
@@ -635,6 +638,15 @@ class Engine:
         canvas = meta.get("canvas")
         behind = None if window is None else (window - 1, 0)
         around = None if window is None else (window - 1, window - 1)
+        # a sliding layer reads the sliding pool when the arena keeps one
+        sliding_layers = getattr(self.arena, "sliding_layers", ())
+        pool = (meta.get("unified_sliding")
+                if layer in sliding_layers else None)
+        if unified is not None and pool is None:
+            pool = unified
+        canvas_pool = (canvas.get("sliding") if canvas is not None
+                       and layer in sliding_layers
+                       and canvas.get("sliding") is not None else canvas)
         if unified is None:
             if q3.shape[-1] > FA_MAX_HEAD_DIM:
                 raise ValueError(
@@ -653,23 +665,23 @@ class Engine:
                 out.index_copy_(0, canvas["rows"], out_c)
             meta["layer"] += 1
             return out.view(n, -1)
-        if unified["src"].numel():
-            self.kv_row_scatter(k3, v3, unified["src"], unified["dst"],
-                                layer)
-        if unified["tail_src"] is not None:
+        if pool["src"].numel():
+            self.kv_row_scatter(k3, v3, pool["src"], pool["dst"], layer)
+        if pool["tail_src"] is not None:
             k_pool, v_pool = self.arena.layer_kv(layer)
             self.kv_row_scatter(k_pool, v_pool,
-                                unified["tail_src"], unified["tail_dst"], layer)
+                                pool["tail_src"], pool["tail_dst"], layer)
         kp, vp = self.arena.paged_kv(layer)
         out = self._paged(
-            q3, kp, vp, unified["cu_q"], unified["max_q"], unified["used"],
-            unified["max_used"], unified["table"], causal=True,
+            q3, kp, vp, unified["cu_q"], unified["max_q"], pool["used"],
+            pool["max_used"], pool["table"], causal=True,
             softmax_scale=softmax_scale, window=behind)
         if canvas is not None:
             q_c = q3.index_select(0, canvas["rows"])
             out_c = self._paged(
-                q_c, kp, vp, canvas["cu_q"], canvas["max_q"], canvas["used"],
-                canvas["max_used"], canvas["table"], causal=False,
+                q_c, kp, vp, canvas["cu_q"], canvas["max_q"],
+                canvas_pool["used"], canvas_pool["max_used"],
+                canvas_pool["table"], causal=False,
                 softmax_scale=softmax_scale, window=around)
             out.index_copy_(0, canvas["rows"], out_c)
         meta["layer"] += 1

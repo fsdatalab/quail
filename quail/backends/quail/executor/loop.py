@@ -129,6 +129,87 @@ def _staged_token_parts(torch, sequences, total, pinned=True, staging=None):
 
 # ------------------------------------------------------- chunk packing
 
+class _PoolView:
+    """One key's rows and pages in one pool.
+
+    start is the logical row the pool's first page holds: 0 on the
+    every-token pool, the window origin on a trimmed key's sliding
+    pool.
+    """
+
+    __slots__ = ("rows", "pages", "start")
+
+    def __init__(self, rows, pages, start):
+        self.rows = rows
+        self.pages = pages
+        self.start = start
+
+
+class _PoolBuilder:
+    """The scatter map, block table, and lengths of one pool for a chunk."""
+
+    def __init__(self):
+        self.page_rows = []
+        self.lengths = []
+        self.src = []
+        self.dst = []
+        self.tail_src = []
+        self.tail_dst = []
+
+    def add_sequence(self, pages, kv_tokens):
+        self.page_rows.append(pages)
+        self.lengths.append(kv_tokens)
+
+    def scatter_direct(self, view, r0, r1, logical_start):
+        """Rows r0..r1 land at logical_start.. in the key's own pages.
+
+        Rows before the pool's start are not stored there.
+        """
+        first = max(logical_start, view.start)
+        skip = first - logical_start
+        if r0 + skip >= r1:
+            return
+        self.src.append(np.arange(r0 + skip, r1, dtype=np.int64))
+        offset = first - view.start
+        self.dst.append(view.rows[offset:offset + (r1 - r0 - skip)].numpy())
+
+    def scatter_suffix(self, view, temp, s0, s1, f, remainder, page_tokens):
+        """Suffix rows go to a temporary, after a copy of the kept tail."""
+        suffix_tokens = s1 - s0
+        self.src.append(np.arange(s0, s1, dtype=np.int64))
+        self.dst.append(temp.rows[remainder:remainder + suffix_tokens].numpy())
+        if remainder:
+            anchor_page = view.pages[(f - view.start) // page_tokens]
+            base = anchor_page * page_tokens
+            self.tail_src.append(np.arange(base, base + remainder, dtype=np.int64))
+            self.tail_dst.append(temp.rows[:remainder].numpy())
+
+    def build(self, arena, stage, torch, staging, index):
+        def concatenate(parts):
+            return np.concatenate(parts) if parts else np.empty(0, dtype=np.int64)
+
+        tag = "" if index == 0 else "_sliding"
+        if staging is None:
+            table = arena.block_table_rows(self.page_rows)
+        else:
+            width = max(map(len, self.page_rows))
+            block_table = np.zeros((len(self.page_rows), width), dtype=np.int32)
+            for row, pages in enumerate(self.page_rows):
+                block_table[row, :len(pages)] = pages
+            table = stage(f"block_table{tag}", block_table, torch.int32).view(
+                len(self.page_rows), width)
+        return dict(
+            src=stage(f"unified_src{tag}", concatenate(self.src), torch.int64),
+            dst=stage(f"unified_dst{tag}", concatenate(self.dst), torch.int64),
+            tail_src=(stage(f"tail_src{tag}", concatenate(self.tail_src),
+                            torch.int64) if self.tail_src else None),
+            tail_dst=(stage(f"tail_dst{tag}", concatenate(self.tail_dst),
+                            torch.int64) if self.tail_dst else None),
+            used=stage(f"unified_lengths{tag}", self.lengths, torch.int32),
+            table=table,
+            max_used=max(self.lengths))
+
+
 def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                attention_mode, staging=None, canvas=(), answer_row=0):
     """Build tensors for one chunk from groups in chunk order.
@@ -276,27 +357,22 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     # row pairs: the attention pass scatters them with a single kernel
     # launch per layer (kv_row_scatter)
     unified = None
+    unified_sliding = None
     temporary_keys = []
+    fresh_keys = []
     if attention_mode == "unified" and unified_groups:
         if len(unified_groups) != len(layout):
             raise ValueError(
                 "a unified chunk cannot mix paged and unpaged "
                 "groups: the one paged call covers every row or "
                 "none (the fast path packs whole chunks unpaged)")
-        kv_page_rows = []
-        kv_lengths = []
+        sliding = getattr(arena, "has_sliding", False)
+        # one builder per pool: the every-token pool, and the
+        # sliding pool that holds each key's rows from its window
+        # origin on
+        pools = [_PoolBuilder()] + ([_PoolBuilder()] if sliding else [])
         cu_q = [0]
-        activation_src = []
-        kv_dst = []
-        tail_src = []
-        tail_dst = []
-
         page_tokens = arena.page_tokens
-
-        def add_sequence(pages, kv_tokens, query_tokens):
-            kv_page_rows.append(pages)
-            kv_lengths.append(kv_tokens)
-            cu_q.append(cu_q[-1] + query_tokens)
 
         try:
             for spec in unified_groups:
@@ -305,79 +381,78 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 r0, r1 = spec["row0"], spec["row1"]
                 spans = spec["suffix_spans"]
                 logical_start = 0 if spec["fresh"] else f
-                rows = arena.capacity_rows(key)
+                if spec["fresh"]:
+                    fresh_keys.append(key)
                 count = r1 - r0
-                direct = len(spans) == 1 \
-                    and logical_start + count <= rows.numel()
+                views = [_PoolView(
+                    arena.capacity_rows(key), arena.owned_pages(key), 0)]
+                if sliding:
+                    views.append(_PoolView(
+                        arena.capacity_rows_sliding(key),
+                        arena.owned_sliding_pages(key),
+                        arena.sliding_start(key)))
+                direct = len(spans) == 1 and all(
+                    logical_start + count - view.start <= view.rows.numel()
+                    for view in views)
+                suffix_total = sum(e - s for s, e in spans)
                 if direct:
-                    activation_src.append(np.arange(r0, r1, dtype=np.int64))
-                    kv_dst.append(
-                        rows[logical_start:logical_start + count].numpy())
-                    add_sequence(
-                        arena.owned_pages(key),
-                        f + sum(e - s for s, e in spans), count)
+                    for pool, view in zip(pools, views):
+                        pool.scatter_direct(view, r0, r1, logical_start)
+                        pool.add_sequence(view.pages, f + suffix_total - view.start)
+                    cu_q.append(cu_q[-1] + count)
                     if canvas:
-                        canvas_seq.append(len(kv_lengths) - 1)
+                        canvas_seq.append(len(cu_q) - 2)
                     continue
 
                 prefix_count = spec["prefix_end"] - r0
                 if prefix_count:
-                    activation_src.append(np.arange(
-                        r0, spec["prefix_end"], dtype=np.int64))
-                    kv_dst.append(rows[:prefix_count].numpy())
-                    prefix_pages = arena.owned_pages(key)[
-                        :arena.pages_needed(f)]
-                    add_sequence(prefix_pages, f, prefix_count)
+                    for pool, view in zip(pools, views):
+                        pool.scatter_direct(view, r0, spec["prefix_end"], 0)
+                        pool.add_sequence(
+                            view.pages[:arena.pages_needed(f - view.start)],
+                            f - view.start)
+                    cu_q.append(cu_q[-1] + prefix_count)
 
-                anchor_pages = arena.owned_pages(key)
                 for s0, s1 in spans:
                     suffix_tokens = s1 - s0
-                    remainder = f % page_tokens
-                    got = arena.alloc_temporary(remainder + suffix_tokens)
+                    remainders = [(f - view.start) % page_tokens for view in views]
+                    got = arena.alloc_temporary(
+                        remainders[0] + suffix_tokens,
+                        sliding_tokens=(remainders[1] + suffix_tokens
+                                        if sliding else None))
                     if got is None:
                         raise RuntimeError(
                             "unified suffix pages exceed the free KV arena; "
                             "split the chunk")
-                    temp_key, temp_pages = got
+                    temp_key, _ = got
                     temporary_keys.append(temp_key)
-                    temp_rows = arena.capacity_rows(temp_key)
-                    activation_src.append(np.arange(s0, s1, dtype=np.int64))
-                    kv_dst.append(
-                        temp_rows[remainder:remainder + suffix_tokens].numpy())
-                    if remainder:
-                        anchor_page = anchor_pages[f // page_tokens]
-                        base = anchor_page * page_tokens
-                        tail_src.append(np.arange(
-                            base, base + remainder, dtype=np.int64))
-                        tail_dst.append(temp_rows[:remainder].numpy())
-                    full_pages = f // page_tokens
-                    add_sequence(
-                        anchor_pages[:full_pages] + temp_pages,
-                        f + suffix_tokens, suffix_tokens)
+                    temp_views = [_PoolView(
+                        arena.capacity_rows(temp_key),
+                        arena.owned_pages(temp_key), 0)]
+                    if sliding:
+                        temp_views.append(_PoolView(
+                            arena.capacity_rows_sliding(temp_key),
+                            arena.owned_sliding_pages(temp_key), 0))
+                    for pool, view, temp, remainder in zip(
+                            pools, views, temp_views, remainders):
+                        pool.scatter_suffix(view, temp, s0, s1, f, remainder,
+                                            page_tokens)
+                        kept_pages = (f - view.start) // page_tokens
+                        pool.add_sequence(
+                            view.pages[:kept_pages] + temp.pages,
+                            f - view.start + suffix_tokens)
+                    cu_q.append(cu_q[-1] + suffix_tokens)
                     if canvas:
-                        canvas_seq.append(len(kv_lengths) - 1)
+                        canvas_seq.append(len(cu_q) - 2)
 
-            if staging is None:
-                table = arena.block_table_rows(kv_page_rows)
-            else:
-                width = max(map(len, kv_page_rows))
-                block_table = np.zeros((len(kv_page_rows), width), dtype=np.int32)
-                for index, pages in enumerate(kv_page_rows):
-                    block_table[index, :len(pages)] = pages
-                table = stage("block_table", block_table, torch.int32).view(
-                    len(kv_page_rows), width)
+            built = [pool.build(arena, stage, torch, staging, index)
+                     for index, pool in enumerate(pools)]
             unified = dict(
-                src=stage("unified_src", concatenate(activation_src), torch.int64),
-                dst=stage("unified_dst", concatenate(kv_dst), torch.int64),
-                tail_src=(stage("tail_src", concatenate(tail_src), torch.int64)
-                          if tail_src else None),
-                tail_dst=(stage("tail_dst", concatenate(tail_dst), torch.int64)
-                          if tail_dst else None),
+                built[0],
                 cu_q=stage("unified_cu_q", cu_q, torch.int32),
-                used=stage("unified_lengths", kv_lengths, torch.int32),
-                table=table,
-                max_q=max(b - a for a, b in zip(cu_q, cu_q[1:])),
-                max_used=max(kv_lengths))
+                max_q=max(b - a for a, b in zip(cu_q, cu_q[1:])))
+            if sliding:
+                unified_sliding = built[1]
         except Exception:
             for key in temporary_keys:
                 arena.free_key(key)
@@ -418,10 +493,16 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             seq = stage("canvas_seq", canvas_seq, torch.int64)
             canvas_meta["table"] = unified["table"].index_select(0, seq)
             canvas_meta["used"] = unified["used"].index_select(0, seq)
-            canvas_meta["max_used"] = max(kv_lengths[i] for i in canvas_seq)
+            canvas_meta["max_used"] = max(
+                pools[0].lengths[i] for i in canvas_seq)
+            if unified_sliding is not None:
+                canvas_meta["sliding"] = dict(
+                    table=unified_sliding["table"].index_select(0, seq),
+                    used=unified_sliding["used"].index_select(0, seq),
+                    max_used=max(pools[1].lengths[i] for i in canvas_seq))
     meta = dict(
         layer=0, kv_src=kv_src, kv_dst=kv_dst, cross=cross,
-        unified=unified, canvas=canvas_meta,
+        unified=unified, unified_sliding=unified_sliding, canvas=canvas_meta,
         cu_a=stage("cu_a", cu_a, torch.int32),
         max_a=max(cu_a[i + 1] - cu_a[i] for i in range(len(cu_a) - 1)))
     out = Chunk(
@@ -430,7 +511,8 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         positions=stage("positions", concatenate(pos), torch.int64),
         final_indices=stage("finals", finals, torch.int64),
         meta=meta, attention_mode=attention_mode, tokens=token_count,
-        layout=layout, temporary_keys=tuple(temporary_keys))
+        layout=layout, temporary_keys=tuple(temporary_keys),
+        fresh_keys=tuple(fresh_keys))
     _tick(timing, "pack_h2d", t)
     return out
 
@@ -523,7 +605,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     # a frame entry's canvas rows land in the anchor's pages after the
     # frame, so the pages cover them
     frame_max = max(len(f) + (len(canvas) if f else 0) for f in frames)
-    resident = {a: len(arena.owned_pages(keys[a])) for a in range(len(keys))
+    resident = {a: arena.held_cost(keys[a]) for a in range(len(keys))
                 if arena.is_resident(keys[a])}
     # Every resident anchor stays available for the whole join while
     # fresh admissions evict unrelated retained KV.
@@ -541,6 +623,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         temporary_suffix_pages=mode == "unified",
         answer_dtype=async_ans.dtype,
         canvas_tokens=len(canvas),
+        page_cost=arena.page_cost,
     )
     spans = []
     tokens = 0
@@ -568,7 +651,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
             arena.pin(key)
             keys.append(key)
             prefixes.append(prefix)
-            sched.admit(len(prefix), len(arena.owned_pages(key)),
+            sched.admit(len(prefix), arena.held_cost(key),
                         partners=partners_of(key))
 
     def pull(evict_retained=False, force=False):
@@ -596,7 +679,8 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
             key = keys[a]
             f = len(prefixes[a])
             frame = frames[j]
-            got = arena.activate(key, f, capacity_tokens=f + frame_max)
+            got = arena.activate(key, f, capacity_tokens=f + frame_max,
+                                 base_tokens=f)
             assert got is not None, \
                 "scheduler admitted an anchor the arena cannot hold"
             sufs = [stage_suffixes[j][i]
@@ -683,6 +767,8 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         e0.record()
         normed = _forward(pipeline, arena, chunk)
         e1.record()
+        for key in getattr(chunk, "fresh_keys", ()):
+            arena.trim_window(key)
         spans.append((groups[0][1], e0, e1))
         outstanding.append((groups, async_ans.submit(normed)))
         # read the previous chunk's answers while this one runs
@@ -999,7 +1085,8 @@ class FilterStream:
             page_tokens=arena.page_tokens,
             kept_extra_tokens=capacity_extra, limit=limit,
             available_pages=(arena.free_pages
-                             if arena_writes else None))
+                             if arena_writes else None),
+            page_cost=getattr(arena, "page_cost", None))
         self.torch = torch
         self.arena = arena
         self.pipeline = pipeline
@@ -1125,7 +1212,8 @@ class FilterStream:
                 got = arena.activate(
                     self.keys[doc], logical,
                     capacity_tokens=len(self.doc_ids[doc])
-                    + self.capacity_extra)
+                    + self.capacity_extra,
+                    base_tokens=len(self.doc_ids[doc]))
                 assert got is not None, \
                     "scheduler admitted a doc the arena cannot hold"
         t = _tick(timing, "alloc", t)
@@ -1142,6 +1230,11 @@ class FilterStream:
         e0.record()
         normed = _forward(self.pipeline, arena, chunk)
         e1.record()
+        # a fresh document's sliding pages before its window origin
+        # were for this pass only
+        for doc, _stage, fresh in groups:
+            if fresh and self.arena_writes:
+                sched.trim(doc, arena.trim_window(self.keys[doc]))
         t = _tick(timing, "forward_launch", t)
         self.spans.append((0, e0, e1))
         self.outstanding.append((groups, self.async_ans.submit(normed)))

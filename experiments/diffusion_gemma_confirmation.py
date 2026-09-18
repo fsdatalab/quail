@@ -12,6 +12,9 @@ Three cells, each on its own H100:
   loaded footprint and the module facts the pipeline relies on.
 - confirm: a filter and a join through a Quail session, with the
   answers of a small labeled corpus.
+- long: a two-stage filter and a join over documents of about 2,500
+  tokens, past the 1,024-token sliding window, so the sliding-layer
+  pool is trimmed to the window and read back on the second stage.
 - reference: vLLM's own diffusion sampler on the same filter prompts,
   to compare its first answer token with Quail's. It renders the
   prompt three ways: bare text as Qwen3 gets it, inside a chat turn,
@@ -22,6 +25,7 @@ The cells write these files to the quail-results volume:
     /results/ablations/diffusion_gemma_confirmation_probe.json
     /results/ablations/diffusion_gemma_confirmation.json
     /results/ablations/diffusion_gemma_confirmation_channel.json  (--layout channel)
+    /results/ablations/diffusion_gemma_confirmation_long.json
     /results/ablations/diffusion_gemma_reference.json
 """
 
@@ -271,6 +275,71 @@ def confirm(prediction: str, layout: str = "turn") -> str:
     return json.dumps(result, indent=2, default=str)
 
 
+def _long_documents():
+    """Six documents of about 2,500 tokens: three food, three cars.
+
+    Each repeats its topic's sentences, with one closing sentence that
+    the second filter stage asks about.
+    """
+    documents, ids = [], []
+    for topic, sentences in (("food", FOOD), ("cars", CARS)):
+        for index in range(3):
+            body = " ".join(sentences[(index + i) % len(sentences)]
+                            for i in range(200))
+            closing = (" The bakery also sells bread." if index == 0
+                       else " Nothing about bread here.")
+            documents.append(body + closing)
+            ids.append(f"{topic[0]}{index}")
+    return ids, documents
+
+
+@app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
+              volumes=volumes)
+def long(prediction: str) -> str:
+    """Filter and join over documents longer than the sliding window."""
+    import pyarrow as pa
+    import torch
+
+    import quail
+
+    ids, documents = _long_documents()
+    session = _session()
+    session.register("long_docs", quail.DocumentProvider.from_table(
+        pa.table({"id": ids, "body": documents}),
+        id_col="id", identity="diffusion-gemma-confirmation-long",
+    ))
+    started = time.time()
+    filter_query = session.sql(
+        "SELECT d.id FROM long_docs d "
+        f"WHERE AI_FILTER(PROMPT('{FILTER_TEMPLATE}', d.body)) "
+        "AND AI_FILTER(PROMPT('Does {0} mention selling bread?', d.body))"
+    )
+    filter_result = _run(filter_query)
+    join_query = session.sql(
+        "SELECT l.id, r.id FROM long_docs l JOIN right_docs r "
+        f"ON AI_FILTER(PROMPT('{JOIN_TEMPLATE}', l.body, r.body), "
+        "{'selectivity': 0.5})"
+    )
+    join_result = _run(join_query)
+    result = {
+        "prediction": prediction,
+        "gpu_device_name": torch.cuda.get_device_name(0),
+        "elapsed_s": time.time() - started,
+        "document_tokens": filter_result.get("stages"),
+        "filter": filter_result,
+        "filter_kept": sorted(str(row[0]) for row in filter_result["rows"]),
+        "filter_expected": ["f0"],
+        "join": join_result,
+        "join_kept_pairs": sorted(
+            [str(value) for value in row] for row in join_result["rows"]),
+        "join_expected_pairs": sorted(
+            [f"{topic}{i}", f"r{j}"] for topic in "fc" for i in range(3)
+            for j in range(4) if (topic == "f") == (j < 2)),
+    }
+    result["volume_path"] = _save("diffusion_gemma_confirmation_long", result)
+    return json.dumps(result, indent=2, default=str)
+
+
 @app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
               volumes=volumes)
 def reference(prediction: str) -> str:
@@ -364,6 +433,7 @@ def main(prediction: str = "", runs: str = "probe,confirm,reference",
     functions = {
         "probe": lambda: probe.spawn(prediction),
         "confirm": lambda: confirm.spawn(prediction, layout),
+        "long": lambda: long.spawn(prediction),
         "reference": lambda: reference.spawn(prediction),
     }
     selected = [name.strip() for name in runs.split(",") if name.strip()]

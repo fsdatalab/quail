@@ -8,6 +8,7 @@ SLIDING_KV = (8, 256)
 FULL_KV = (2, 512)
 LAYER_KV = tuple(FULL_KV if (index + 1) % 6 == 0 else SLIDING_KV
                  for index in range(30))
+SLIDING_LAYERS = tuple(index for index in range(30) if (index + 1) % 6)
 
 # Per layer: a dense MLP (3 x 2816 x 2112) beside 128 experts of
 # 3 x 2816 x 704, eight of them active per token.
@@ -44,6 +45,8 @@ DIFFUSION_GEMMA_26B_FP8 = ModelSpec(
     weight_precision="fp8",
     arch="diffusion_gemma",
     layer_kv=LAYER_KV,
+    sliding_window=1024,
+    sliding_layers=SLIDING_LAYERS,
     canvas_tokens=256,     # the checkpoint's canvas_length
     turn_prefix="<bos><|turn>user\n",
     turn_suffix="<turn|>\n<|turn>model\n",

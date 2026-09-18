@@ -395,7 +395,11 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     workers = gpus
 
     chunk = budgets.chunk_budget(model, device)
-    admission = budgets.arena_tokens(model, device, chunk)
+    # the longest documents bind the sliding-pool split
+    longest_mean = max(
+        (st.mean_doc_tokens for st in stats.values()), default=None)
+    arena_split = budgets.arena_pages(model, device, chunk, longest_mean)
+    admission = arena_split[0] * budgets.PAGE_TOKENS
     pre = preamble_tokens(filters, joins)
     specs = join_specs(joins, pair_fractions)
 
@@ -749,6 +753,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
         nodes=tuple(nodes), remarks=tuple(remarks),
         settings={
             "chunk_tokens": chunk,
+            "arena_pages": list(arena_split),
             "admission_tokens": admission,
             "retention": retention_plan,
             "order_rule": rule,
