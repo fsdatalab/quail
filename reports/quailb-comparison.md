@@ -45,8 +45,11 @@
 - Fresh input tokens count every input position processed by a model
   forward pass. Repeated computation counts again. Recomputed KV tokens
   are fresh tokens minus the minimum for the run's actual requests with
-  unlimited KV. They are included in fresh tokens, not added to them.
-  The benchmark computes this minimum from saved answers after the run.
+  unlimited KV: each document once, each question and join frame once
+  per document, and each pair's partner label, partner document, and
+  answer cue once per pair. They are included in fresh tokens, not added
+  to them. The benchmark computes this minimum from saved answers after
+  the run.
 - Token throughput is total requested input tokens divided by query seconds.
   Count each complete prompt once per evaluated filter or join pair,
   including tokens served from KV. Exclude generated answer tokens.
@@ -143,9 +146,20 @@ Figure: plots/quailb_bio.pdf
 
 BIO-3 filter survivors: 362 in the reference, 349 in Quail, and 350 in pipelined stock vLLM.
 
-The cause of vLLM's lower BIO-2 time than its earlier raw-prompt
-run remains unknown. The runs did not isolate prompt changes
-from other execution changes.
+vLLM's BIO-2 time is 13% lower than in the September 12 run with
+raw prompts, saved at
+`/results/benchmarks/quailb/family-runs/20260912T225100Z-902686c5/`.
+Its time per pair is 13% lower on BIO-3 as well. The cause is not
+settled. It is not KV reuse. That run's recomputed KV figures came
+from an earlier benchmark rule that counted each pair's partner
+label once per anchor and shared partner document prefixes across
+pairs. On BIO-2 that understates the minimum by 8,293 tokens per
+anchor, 4,146,500 in total, which is all of Quail's 4,148,977
+recomputed tokens in that run beyond its 2,477 filter-stage
+tokens. Under the current rule, vLLM recomputed 154,747 tokens
+there and 157,341 here. The two runs used different containers and
+did not separate the prompt change from host and batch composition
+changes.
 
 | Query | Method | Seconds | Recomputed KV tokens | Fresh input tokens | Requested input tokens | Tokens/second | Throughput | Unit | $/query | Answer agreement (%) | Output precision (%) | Output recall (%) |
 |---|---|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|
