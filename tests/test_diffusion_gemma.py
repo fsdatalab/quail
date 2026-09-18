@@ -281,14 +281,22 @@ def test_pipeline_runs_the_gemma4_layer_order(monkeypatch):
         yield
 
     context.set_forward_context = set_forward_context
+    workspace = types.ModuleType("vllm.v1.worker.workspace")
+    workspace.is_workspace_manager_initialized = lambda: False
+    workspace.init_workspace_manager = lambda device: seen.setdefault(
+        "workspace", str(device))
     monkeypatch.setitem(sys.modules, "vllm.forward_context", context)
-    monkeypatch.setitem(sys.modules, "vllm",
-                        types.ModuleType("vllm"))
+    monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
+    monkeypatch.setitem(sys.modules, "vllm.v1", types.ModuleType("vllm.v1"))
+    monkeypatch.setitem(sys.modules, "vllm.v1.worker",
+                        types.ModuleType("vllm.v1.worker"))
+    monkeypatch.setitem(sys.modules, "vllm.v1.worker.workspace", workspace)
 
     spec = SimpleNamespace(vocab=50, canvas_tokens=3)
     pipeline = DiffusionGemmaPipeline(_fake_model(torch), None, spec=spec,
                                       engine_class=_Engine)
     assert len(pipeline.canvas_ids) == 3
+    assert seen["workspace"] == "cuda"
     assert not pipeline.is_fp8
     assert pipeline.max_chunk_tokens == (2**31 - 1) // 32
 

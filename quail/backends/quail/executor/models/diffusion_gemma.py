@@ -44,6 +44,19 @@ def canvas_token_ids(vocab: int, tokens: int, seed: int = CANVAS_SEED) -> tuple:
     return tuple(int(i) for i in rng.integers(0, vocab, tokens))
 
 
+def _init_moe_workspace():
+    """Give vLLM's fused MoE kernels the scratch buffers its worker would.
+
+    The buffers grow to the largest chunk on first use and stay
+    allocated; nothing locks them.
+    """
+    import torch
+    from vllm.v1.worker import workspace
+
+    if not workspace.is_workspace_manager_initialized():
+        workspace.init_workspace_manager(torch.device("cuda"))
+
+
 class DiffusionGemmaPipeline(ModelPipeline):
     """Forward passes for DiffusionGemma checkpoints loaded by vLLM.
 
@@ -72,6 +85,7 @@ class DiffusionGemmaPipeline(ModelPipeline):
             head_dim=attn.head_dim, rotary=attn.rotary_emb,
             fp8=False, kernels=kernels)
         self.canvas_ids = canvas_token_ids(spec.vocab, spec.canvas_tokens)
+        _init_moe_workspace()
         # The engine's KV scatter kernel indexes rows in 32-bit ints.
         widest = max(layer.self_attn.qkv_proj.weight.shape[0]
                      for layer in self.layers)
