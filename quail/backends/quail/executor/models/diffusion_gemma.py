@@ -112,7 +112,7 @@ class DiffusionGemmaPipeline(ModelPipeline):
         q, k = attn.rotary_emb(positions, q, k)
         v = attn.v_norm(v.unflatten(-1, (KH, D)))
         out = self.engine.attention_unified(
-            q.view(n, H, D), k.view(n, KH, D).contiguous(),
+            q.reshape(n, H, D), k.reshape(n, KH, D).contiguous(),
             v.contiguous(), meta, softmax_scale=1.0,
             window=self.window if attn.is_sliding else None)
         out, _ = attn.o_proj(out)
