@@ -209,14 +209,89 @@ def primitives(prediction: str, docs: int = 20, doc_tokens: int = 300) -> str:
                 arena.free_key(key)
             return rows.float()
 
-        before = run(pipeline)
-        result["layer_scalars"] = [float(layer.layer_scalar)
-                                   for layer in layers[:4]]
-        pipeline._fold_layer_scalars(model)
-        after = run(pipeline)
-        result["fold_rel"] = rel(after, before)
-        fused = build_pipeline(spec, model, arena, fused=True)
-        result["fused_after_fold_rel"] = rel(run(fused), before)
+        # (f) the reference layer step by step against the fused steps,
+        # on layer 0, before the fold touches the weights
+        chunk = pack_chunk(torch, arena, groups, attention_mode="unified",
+                           canvas=pipeline.canvas_ids,
+                           answer_row=pipeline.canvas_answer_row)
+        meta = chunk.meta
+        pos = chunk.positions
+        hidden0 = pipeline.embed(chunk.input_ids) * pipeline.normalizer
+        layer = layers[0]
+        attn = layer.self_attn
+        from vllm.forward_context import set_forward_context
+        with set_forward_context(None, pipeline.vllm_config,
+                                 num_tokens=hidden0.shape[0]):
+            meta["layer"] = 0
+            h1 = pipeline._norm(hidden0, layer.input_layernorm)
+            a = pipeline._attention(attn, h1, pos, meta)
+            a_n = pipeline._norm(a, layer.post_attention_layernorm)
+            mid = a_n + hidden0
+            f = pipeline._norm(mid, layer.pre_feedforward_layernorm)
+            d = layer.mlp(f)
+            d_n = pipeline._norm(d, layer.post_feedforward_layernorm_1)
+            r_in = pipeline._norm(mid, layer.pre_feedforward_layernorm_2)
+            logits = pipeline._router_logits(layer.router, mid)
+            routed = layer.moe(r_in, logits)
+            routed_n = pipeline._norm(routed, layer.post_feedforward_layernorm_2)
+            summed = pipeline._norm(d_n + routed_n,
+                                    layer.post_feedforward_layernorm)
+            out_ref = (summed + mid) * layer.layer_scalar
+            meta["layer"] = 0
+            out_layer = pipeline._layer(layer, hidden0, pos, meta)
+            result["step_layer_vs_steps_rel"] = rel(out_layer, out_ref)
+            # the fused steps
+            meta["layer"] = 0
+            xq, xs = engine.norm_quant_rows(
+                hidden0, layer.input_layernorm.weight,
+                layer.input_layernorm.variance_epsilon)
+            qkv = engine.fp8_linear(attn.qkv_proj, xq, xs)
+            result["step_qkv_rel"] = rel(qkv, attn.qkv_proj(h1)[0])
+            a2 = pipeline._attention_fused(attn, qkv, pos, meta)
+            a2, _ = attn.o_proj(a2)
+            result["step_attention_rel"] = rel(a2, a)
+            a2_n = pipeline._norm(a2, layer.post_attention_layernorm)
+            r = hidden0.clone()
+            xq, xs = engine.norm_quant_rows(
+                a2_n, layer.pre_feedforward_layernorm.weight,
+                layer.pre_feedforward_layernorm.variance_epsilon, r)
+            result["step_mid_rel"] = rel(r, mid)
+            gu = engine.fp8_linear(layer.mlp.gate_up_proj, xq, xs)
+            d2, _ = layer.mlp.down_proj(layer.mlp.act_fn(gu))
+            result["step_dense_rel"] = rel(d2, d)
+            d2_n = pipeline._norm(d2, layer.post_feedforward_layernorm_1)
+            r2_in = pipeline._norm(r, layer.pre_feedforward_layernorm_2)
+            logits2, _ = layer.router.proj(engine.norm_rows(
+                r, layer.router.quail_scale, layer.router.norm.variance_epsilon))
+            result["step_router_rel"] = rel(logits2, logits)
+            routed2 = layer.moe(r2_in, logits2)
+            result["step_routed_rel"] = rel(routed2, routed)
+            routed2_n = pipeline._norm(routed2, layer.post_feedforward_layernorm_2)
+            engine.fused_add_rms_norm(d2_n, routed2_n,
+                                      layer.post_feedforward_layernorm)
+            result["step_summed_rel"] = rel(d2_n, summed)
+            r.mul_(layer.layer_scalar)
+            out2 = d2_n * layer.layer_scalar + r
+            result["step_output_rel"] = rel(out2, out_ref)
+            # cumulative over the first layers, reference first
+            refs = []
+            h = hidden0.clone()
+            meta["layer"] = 0
+            for lay in layers[:3]:
+                h = pipeline._layer(lay, h, pos, meta)
+                refs.append(h.clone())
+            result["layer_scalars"] = [float(lay.layer_scalar)
+                                       for lay in layers[:4]]
+            fused = build_pipeline(spec, model, arena, fused=True)
+            all_layers = fused.layers
+            for k in range(1, 4):
+                fused.layers = all_layers[:k]
+                meta["layer"] = 0
+                out_k = fused._layers_fused(hidden0.clone(), pos, meta)
+                result[f"cumulative_{k}_rel"] = rel(out_k, refs[k - 1])
+            fused.layers = all_layers
+        for key in chunk.temporary_keys:
+            arena.free_key(key)
     result["volume_path"] = _save("diffusion_gemma_primitives_check", result)
     return json.dumps(result, indent=2)
 
