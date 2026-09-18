@@ -52,7 +52,9 @@ def test_spec_geometry_and_registration():
     assert SPEC.arch in supported_archs()
     assert QuailBackend().supports(SPEC, H100_SXM, 1).supported
     assert SPEC.canvas_tokens == 256
-    assert SPEC.turn == (SPEC.turn_prefix, SPEC.turn_suffix)
+    assert SPEC.turn == ("<bos><|turn>user\n", "<turn|>\n<|turn>model\n")
+    # the model opens its turn with a four-token empty thinking channel
+    assert SPEC.canvas_answer_row == 4
 
 
 def test_spec_budgets_and_moe_costs():

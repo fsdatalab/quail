@@ -46,9 +46,13 @@ DIFFUSION_GEMMA_26B_FP8 = ModelSpec(
     layer_kv=LAYER_KV,
     canvas_tokens=256,     # the checkpoint's canvas_length
     turn_prefix="<bos><|turn>user\n",
-    # The empty thinking channel keeps the answer at the first canvas
-    # row: with thinking off, the model may still open one.
-    turn_suffix="<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+    turn_suffix="<turn|>\n<|turn>model\n",
+    # With thinking off the model still opens its turn with an empty
+    # thinking channel, four tokens: <|channel> thought \n <channel|>.
+    # The answer follows at canvas row 4. Prefilling that channel into
+    # the prompt instead made the sampler end the turn at once on 7 of
+    # 16 documents (experiments/diffusion_gemma_confirmation.py).
+    canvas_answer_row=4,
     attn_params_per_layer=(25 * SLIDING_ATTN + 5 * FULL_ATTN) // 30,
     mlp_active_params_per_layer=DENSE_MLP + 8 * EXPERT,
     mlp_total_params_per_layer=DENSE_MLP + 128 * EXPERT,

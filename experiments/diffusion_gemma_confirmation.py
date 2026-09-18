@@ -21,7 +21,7 @@ The cells write these files to the quail-results volume:
 
     /results/ablations/diffusion_gemma_confirmation_probe.json
     /results/ablations/diffusion_gemma_confirmation.json
-    /results/ablations/diffusion_gemma_confirmation_turn.json  (--layout turn)
+    /results/ablations/diffusion_gemma_confirmation_channel.json  (--layout channel)
     /results/ablations/diffusion_gemma_reference.json
 """
 
@@ -114,18 +114,19 @@ def _save(name: str, value: dict) -> str:
     return path
 
 
-# Prompt layouts the confirm cell can run. "channel" is the spec as
-# registered: an empty thinking channel prefilled, the answer at the
-# first canvas row. "turn" leaves the model to write that channel
-# itself inside the canvas and reads the answer at canvas row 4.
+# Prompt layouts the confirm cell can run. "turn" is the spec as
+# registered: the model writes its empty thinking channel inside the
+# canvas and the answer is read at canvas row 4. "channel" prefills
+# that channel into the prompt and reads the first canvas row.
 LAYOUTS = {
-    "channel": {},
-    "turn": {"turn_suffix": "<turn|>\n<|turn>model\n",
-             "canvas_answer_row": 4},
+    "turn": {},
+    "channel": {"turn_suffix": "<turn|>\n<|turn>model\n"
+                               "<|channel>thought\n<channel|>",
+                "canvas_answer_row": 0},
 }
 
 
-def _session(layout: str = "channel"):
+def _session(layout: str = "turn"):
     from dataclasses import replace
 
     import pyarrow as pa
@@ -229,7 +230,7 @@ def probe(prediction: str) -> str:
 
 @app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
               volumes=volumes)
-def confirm(prediction: str, layout: str = "channel") -> str:
+def confirm(prediction: str, layout: str = "turn") -> str:
     import torch
 
     session = _session(layout)
@@ -264,7 +265,7 @@ def confirm(prediction: str, layout: str = "channel") -> str:
             [f"l{i}", f"r{j}"] for i in range(4) for j in range(4)
             if (i < 2) == (j < 2)),
     }
-    suffix = "" if layout == "channel" else f"_{layout}"
+    suffix = "" if layout == "turn" else f"_{layout}"
     result["volume_path"] = _save(
         f"diffusion_gemma_confirmation{suffix}", result)
     return json.dumps(result, indent=2, default=str)
@@ -355,7 +356,7 @@ def reference(prediction: str) -> str:
 
 @app.local_entrypoint()
 def main(prediction: str = "", runs: str = "probe,confirm,reference",
-         layout: str = "channel"):
+         layout: str = "turn"):
     if not prediction:
         raise ValueError("pass --prediction before starting")
     if layout not in LAYOUTS:
