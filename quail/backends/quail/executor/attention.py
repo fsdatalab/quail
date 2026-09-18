@@ -14,8 +14,8 @@ unfused equivalents. torch is imported lazily.
 
 A forward loop, in models/<arch>.py, calls four primitives: norm_quant,
 qk_norm_rope, attention, and activation_quant. Each picks the kernel
-set, the precision path, and the attention mode itself. The loop's
-input is a Chunk built by pack_chunk.
+set and the precision path itself; the attention path comes with the
+Chunk that pack_chunk built.
 
 The fused qk_norm_rope kernel assumes per-head Q and K RMSNorm before
 rotary, as Qwen3 has.
@@ -51,6 +51,8 @@ class Chunk:
         final_indices: Rows whose hidden state feeds the answer readout.
         meta: Attention-path bookkeeping built by pack_chunk: the layer
             counter, KV scatter maps, block tables, and sequence bounds.
+        attention_mode: "unified" or "merge_quant", the path the
+            packer laid the chunk out for.
         tokens: Rows in the chunk.
         layout: (arena key, suffix count) per group in chunk order.
         temporary_keys: Arena keys the loop frees after the forward pass.
@@ -60,6 +62,7 @@ class Chunk:
     positions: Any
     final_indices: Any
     meta: dict
+    attention_mode: str
     tokens: int
     layout: list
     temporary_keys: tuple = ()
@@ -86,11 +89,10 @@ class Engine:
         fp8: Whether the linear weights are fp8 block-quantized.
         kernels: "quail" for the fused Triton kernels, "vllm" for
             vLLM's unfused equivalents.
-        attention_mode: "unified" or "merge_quant".
     """
 
     def __init__(self, arena, *, n_q, n_kv, head_dim, rotary, fp8,
-                 kernels="quail", attention_mode):
+                 kernels="quail"):
         import torch
         from vllm.utils.deep_gemm import is_deep_gemm_e8m0_used
 
@@ -98,7 +100,6 @@ class Engine:
             raise ValueError(f"kernels must be 'quail' or 'vllm', "
                              f"got {kernels!r}")
         self.kernels = kernels
-        self.attention_mode = attention_mode
 
         self.fa_version = flash_attention_version(torch.cuda.get_device_capability())
         self.torch = torch
@@ -110,20 +111,6 @@ class Engine:
         self.use_ue8m0 = bool(is_deep_gemm_e8m0_used())
         self.fp8 = torch.float8_e4m3fn
         self.is_fp8 = bool(fp8)
-
-    # the mode is reassigned per phase (filters then joins in one
-    # session), so validate at every write, not just construction
-    @property
-    def attention_mode(self):
-        return self._attention_mode
-
-    @attention_mode.setter
-    def attention_mode(self, mode):
-        if mode not in ("merge_quant", "unified"):
-            raise ValueError(
-                "attention_mode must be 'merge_quant' or 'unified', "
-                f"got {mode!r}")
-        self._attention_mode = mode
 
     # ---- weights and quant ------------------------------------------
 
@@ -506,13 +493,16 @@ class Engine:
             return self.custom_qk_norm_rope(qkv, positions, attn)
         return self.vllm_qk_norm_rope(qkv, positions, attn)
 
-    def attention(self, q, k, v, meta):
-        """Attention over the chunk and the arena; the quantized o_proj input."""
-        if self.attention_mode == "merge_quant":
+    def attention(self, q, k, v, chunk):
+        """Attention over the chunk and the arena; the quantized o_proj input.
+
+        The chunk carries the path it was packed for.
+        """
+        if chunk.attention_mode == "merge_quant":
             if not self.is_fp8:
                 raise ValueError("BF16 forward passes require unified attention")
-            return self.attention_merge_quant(q, k, v, meta)
-        return self.quant(self.attention_unified(q, k, v, meta))
+            return self.attention_merge_quant(q, k, v, chunk.meta)
+        return self.quant(self.attention_unified(q, k, v, chunk.meta))
 
     # ---- attention: the two workload paths --------------------------
 

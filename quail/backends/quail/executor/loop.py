@@ -154,6 +154,10 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     def concatenate(parts):
         return np.concatenate(parts) if parts else np.empty(0, dtype=np.int64)
 
+    if attention_mode not in ("merge_quant", "unified"):
+        raise ValueError(
+            "attention_mode must be 'merge_quant' or 'unified', "
+            f"got {attention_mode!r}")
     t = time.perf_counter() if timing is not None else 0.0
     # unified scatters every fresh row through its own src/dst map, so
     # the cross and kv_writes bookkeeping below is two-call only
@@ -376,8 +380,8 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             torch, id_parts, token_count, pinned, staging),
         positions=stage("positions", concatenate(pos), torch.int64),
         final_indices=stage("finals", finals, torch.int64),
-        meta=meta, tokens=token_count, layout=layout,
-        temporary_keys=tuple(temporary_keys))
+        meta=meta, attention_mode=attention_mode, tokens=token_count,
+        layout=layout, temporary_keys=tuple(temporary_keys))
     _tick(timing, "pack_h2d", t)
     return out
 
@@ -561,8 +565,8 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
                     prefix=prefixes[a] if carried else None,
                     f=f + len(frame),
                     suffixes=sufs))
-        return pack_chunk(torch, arena, specs,
-                          attention_mode=pipeline.attention_mode, staging=staging)
+        return pack_chunk(torch, arena, specs, attention_mode=mode,
+                          staging=staging)
 
     def settle(anchor):
         if anchor_done is None:
@@ -617,9 +621,6 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
                 if pull(evict_retained=True, force=True):
                     continue
             raise AssertionError("nothing buildable and nothing in flight")
-        # an interleaved source runs its own chunks on this pipeline
-        # between join chunks, so the join states its path every time
-        pipeline.attention_mode = mode
         chunk = build(groups)
         tokens += chunk.tokens
         e0 = torch.cuda.Event(enable_timing=True)
@@ -688,14 +689,13 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
     """
     warm_docs, question, doc = _warm_inputs(budget)
     q_max = len(question)
-    original_mode = pipeline.attention_mode
     modes = ((FILTER_ATTENTION, JOIN_ATTENTION) if pipeline.is_fp8
              else (FILTER_ATTENTION,))
     for mode in modes:
         logger.debug("kernels: warming %s attention, full chunk", mode)
-        pipeline.attention_mode = mode
         run_filter(torch, arena, pipeline, async_ans, warm_docs,
-                   [question], budget, arena_writes=True)
+                   [question], budget, arena_writes=True,
+                   attention_mode=mode)
         # tiny chunks, one document each: the trailing-chunk shapes
         # of gated multi-stage runs (see TINY_WARM_TOKENS)
         for t in TINY_WARM_TOKENS:
@@ -704,12 +704,12 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
             logger.debug("kernels: warming %s attention, %s tokens", mode, t)
             body = (doc * (t // len(doc) + 1))[:max(8, t - q_max)]
             run_filter(torch, arena, pipeline, async_ans, [body],
-                       [question], budget, arena_writes=True)
+                       [question], budget, arena_writes=True,
+                       attention_mode=mode)
     if join_chunk:
         logger.debug("kernels: warming join forward pass")
         run_join(torch, arena, pipeline, async_ans, warm_docs,
                  [[question] * 8], budget)
-    pipeline.attention_mode = original_mode
     logger.debug("kernels: warming filter without KV writes")
     run_filter(torch, arena, pipeline, async_ans, warm_docs,
                [question], budget, arena_writes=False)
@@ -887,9 +887,8 @@ class FilterStream:
         hold_extra_tokens: Rows past the prefix a held document's
             pages must cover (the consumer's largest frame), so the
             consumer never needs a page this chain did not claim.
-        attention_mode: Attention path set on the pipeline before each
-            chunk; the pipeline's current mode when omitted. A chain
-            interleaved with a join on one pipeline states its own.
+        attention_mode: Attention path of this chain's chunks; unified
+            when omitted. The warm-up runs the merge_quant path too.
     """
 
     def __init__(self, torch, arena, pipeline, async_ans, doc_ids,
@@ -919,7 +918,7 @@ class FilterStream:
             # a later stage re-reads the KV, which needs the pages this
             # switch skips
             raise ValueError("arena_writes=False needs a single stage")
-        self.attention_mode = attention_mode or pipeline.attention_mode
+        self.attention_mode = attention_mode or FILTER_ATTENTION
         unified = self.attention_mode == "unified"
         # capacity must cover the longest tail past the kept preamble
         temp_tail = max(0, *(len(q) - p for q in question_ids)) \
@@ -1066,7 +1065,6 @@ class FilterStream:
                 assert got is not None, \
                     "scheduler admitted a doc the arena cannot hold"
         t = _tick(timing, "alloc", t)
-        self.pipeline.attention_mode = self.attention_mode
         chunk = pack_chunk(self.torch, arena,
                            [self._spec(*g) for g in groups],
                            timing=timing, pinned=self.pinned,
@@ -1095,7 +1093,7 @@ class FilterStream:
 def run_filter(torch, arena, pipeline, async_ans, doc_ids,
                question_ids, budget, timing=None,
                pinned=True, limit=None, *, arena_writes,
-               arena_keys=None, retain_survivors=()):
+               arena_keys=None, retain_survivors=(), attention_mode=None):
     """The filter chain run to the end; see FilterStream for the arguments.
 
     Returns:
@@ -1106,7 +1104,7 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
         torch, arena, pipeline, async_ans, doc_ids, question_ids, budget,
         timing=timing, pinned=pinned, limit=limit,
         arena_writes=arena_writes, arena_keys=arena_keys,
-        retain_survivors=retain_survivors)
+        retain_survivors=retain_survivors, attention_mode=attention_mode)
     while not stream.done:
         stream.next()
     return stream.answers, stream.spans, stream.tokens

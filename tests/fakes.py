@@ -16,7 +16,6 @@ import quail
 from quail.backends.quail import QuailModelExecution
 from quail.backends.quail.executor import loop
 from quail.backends.quail.executor.arena import KVArena, PageArena
-from quail.backends.quail.executor.attention import JOIN_ATTENTION
 from quail.backends.quail.graph import execute_single_graph
 from quail.builtins import built_in_registry
 from quail.physical import (
@@ -122,8 +121,7 @@ def run_streamed(monkeypatch, *, doc_lengths, filter_truth, partner_lengths,
     """Drive a filter chain streamed into a join on a CPU arena."""
     monkeypatch.setattr(loop, "pack_chunk", fake_pack)
     model = FakeModel(filter_truth, join_truth)
-    pipeline = SimpleNamespace(attention_mode=JOIN_ATTENTION, is_fp8=True,
-                               forward_chunk=model.forward_chunk)
+    pipeline = SimpleNamespace(is_fp8=True, forward_chunk=model.forward_chunk)
     answers = SimpleNamespace(submit=lambda v: v, result=lambda v: v,
                               dtype=None)
     arena = cpu_arena(pages)
@@ -249,8 +247,7 @@ def run_graph_on_arena(monkeypatch, graph, *, n_docs=14, n_partners=4,
     model = FakeModel(filter_truth, join_truth)
     torch = fake_torch()
     arena = cpu_arena(pages)
-    pipeline = SimpleNamespace(attention_mode=JOIN_ATTENTION, is_fp8=True,
-                               forward_chunk=model.forward_chunk)
+    pipeline = SimpleNamespace(is_fp8=True, forward_chunk=model.forward_chunk)
     execution = QuailModelExecution(SimpleNamespace())
     execution.bind_loaded_model(model=object(), arena=arena,
                                 pipeline=pipeline)

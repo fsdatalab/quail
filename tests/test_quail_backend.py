@@ -113,7 +113,7 @@ def graph_state(model_execution, docs):
     return {
         "torch": fake_torch(),
         "arena": FakeArena(),
-        "pipeline": SimpleNamespace(attention_mode=None),
+        "pipeline": SimpleNamespace(),
         "model_execution": model_execution,
         "runtimes": registry.runtimes,
         "model_spec": MODELS["qwen3-4b-fp8"],

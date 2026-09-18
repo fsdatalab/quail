@@ -11,10 +11,6 @@ import time
 from quail.backends.base import GpuContext
 from quail.backends.quail.distributed import execute_distributed_graph
 from quail.backends.quail.executor.arena import KVArena
-from quail.backends.quail.executor.attention import (
-    FILTER_ATTENTION,
-    JOIN_ATTENTION,
-)
 from quail.backends.quail.executor.loop import warm_kernels
 from quail.backends.quail.executor.model import load_model, resolve_model_path
 from quail.backends.quail.executor.models import build_pipeline
@@ -93,8 +89,7 @@ class LoadedGpu:
         self.arena_s = time.perf_counter() - t0
 
         t0 = time.perf_counter()
-        self.pipeline = build_pipeline(spec, self.model, self.arena,
-                                       attention_mode=FILTER_ATTENTION)
+        self.pipeline = build_pipeline(spec, self.model, self.arena)
         self.pipeline_s = time.perf_counter() - t0
 
         self.execution = backend.start(context)
@@ -411,8 +406,6 @@ def _child_filters(state, sub):
     filter_limit = sub.get("filter_limit")
     t0 = time.perf_counter()
     with torch.inference_mode():
-        pipeline = gpu.pipeline if gpu else state["pipeline"]
-        pipeline.attention_mode = FILTER_ATTENTION
         node_id = sub.get("node_id")
         if node_id is not None:
             graph = decode_graph(
@@ -496,8 +489,6 @@ def _child_joins(state, sub):
     out_joins, tokens_total = [], 0
     t0 = time.perf_counter()
     with torch.inference_mode():
-        pipeline = gpu.pipeline if gpu else state["pipeline"]
-        pipeline.attention_mode = JOIN_ATTENTION
         stage_suffixes, tuple_globs = [], []
         for j in group:
             locals_ = [range(len(sub["partners"][p]["index"]))

@@ -8,7 +8,6 @@ from typing import Any
 
 from quail.backends.base import GpuContext
 from quail.backends.quail.executor import loop
-from quail.backends.quail.executor.attention import FILTER_ATTENTION
 from quail.backends.quail.executor.models import supported_archs
 from quail.backends.quail.executor.score import QuailScorer
 from quail.backends.quail.graph import filter_result, stage_partner_lists
@@ -169,7 +168,6 @@ class QuailModelExecution:
                                         stream["document_ids"]),
                 hold_survivors=True,
                 hold_extra_tokens=filter_node.hold_tokens,
-                attention_mode=FILTER_ATTENTION,
             )
         lists_for = inputs.get("anchor_partners")
         answers, spans, tokens = loop.run_join(

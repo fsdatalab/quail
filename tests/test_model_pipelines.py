@@ -18,7 +18,7 @@ def test_every_registered_model_has_a_forward_pass():
 def test_unknown_architecture_is_refused_before_loading():
     spec = replace(QWEN3_4B_FP8, name="other", arch="other")
     with pytest.raises(ValueError, match="other"):
-        build_pipeline(spec, model=None, arena=None, attention_mode="unified")
+        build_pipeline(spec, model=None, arena=None)
     support = QuailBackend().supports(spec, H100_SXM, 1)
     assert not support.supported
     assert "other" in support.reason

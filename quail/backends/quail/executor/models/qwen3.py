@@ -14,8 +14,7 @@ from quail.backends.quail.executor.models.base import ModelPipeline
 class Qwen3Pipeline(ModelPipeline):
     """Forward passes for Qwen3 checkpoints loaded by vLLM."""
 
-    def __init__(self, model, arena, *, attention_mode, kernels="quail",
-                 engine_class=Engine):
+    def __init__(self, model, arena, *, kernels="quail", engine_class=Engine):
         import torch
 
         self.layers = model.model.layers
@@ -26,7 +25,7 @@ class Qwen3Pipeline(ModelPipeline):
             arena, n_q=attn.num_heads, n_kv=attn.num_kv_heads,
             head_dim=attn.head_dim, rotary=attn.rotary_emb,
             fp8=attn.qkv_proj.weight.dtype == torch.float8_e4m3fn,
-            kernels=kernels, attention_mode=attention_mode)
+            kernels=kernels)
         # The fused kernels compute element offsets in 32-bit ints,
         # so a chunk needs rows x widest_row < 2^31.
         widest = max(max(layer.self_attn.qkv_proj.weight.shape[0],
@@ -59,7 +58,7 @@ class Qwen3Pipeline(ModelPipeline):
             q, k = engine.qk_norm_rope(qkv, positions, attn)
             v = qkv[:, (engine.num_q_heads + engine.num_kv_heads)
                     * engine.head_dim:]
-            o_in, o_scale = engine.attention(q, k, v, meta)
+            o_in, o_scale = engine.attention(q, k, v, chunk)
             hidden = engine.gemm(o_in, o_scale, attn.o_proj)
             g_in, g_scale = engine.norm_quant(
                 hidden, layer.post_attention_layernorm, residual)
