@@ -226,7 +226,7 @@ def refused_queries(session, query_ids, data_dir) -> dict[str, str]:
 
 def run_suite(only=None, *, sf=0.1, config, data_dir=None,
               ground_truth_collection=None, output_dir,
-              h100_usd_per_hour=H100_USD_PER_HOUR):
+              h100_usd_per_hour=H100_USD_PER_HOUR, root=None):
     """Run Quail queries through QUAIL-B and save the benchmark report.
 
     Queries the backend refuses to plan are left out of the run and
@@ -240,7 +240,7 @@ def run_suite(only=None, *, sf=0.1, config, data_dir=None,
         record = benchmark.run(
             partial(run_query, session), queries=only, scale_factor=sf,
             output_dir=output_dir, data_dir=data_dir,
-            collection_id=ground_truth_collection,
+            collection_id=ground_truth_collection, root=root,
             gpu_count=config.gpus, gpu_hourly_rate_usd=h100_usd_per_hour,
             metadata={
                 "engine": config.backend, "model": config.model,
