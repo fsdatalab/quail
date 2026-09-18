@@ -29,6 +29,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+from statistics import mean, median
 
 import matplotlib.pyplot as plt
 import pyarrow.parquet as pq
@@ -66,6 +67,7 @@ def row_metrics(row):
         "seconds": row["runtime_s"],
         "recomputed": row["regret_tokens"],
         "fresh": row["fresh_tokens"],
+        "tokens_per_second": row["fresh_tokens"] / row["runtime_s"],
         "throughput": count / row["runtime_s"],
         "unit": "docs/s" if pairs is None else "pairs/s",
         "cost": row["runtime_s"] / 3600 * H100_USD_PER_HOUR,
@@ -78,6 +80,7 @@ def row_metrics(row):
 
 METRICS = (
     ("seconds", "Latency", "seconds"),
+    ("tokens_per_second", "Total fresh input tokens per second", "tokens/second"),
     ("recomputed", "Recomputed KV", "tokens"),
     ("fresh", "Fresh input tokens", "tokens"),
     ("agreement", "Answer agreement", "percent"),
@@ -125,6 +128,7 @@ def series_value(rows, sol, method, query, metric):
     """Return a measured value or an explicitly modeled value."""
     if method == "sol":
         return {"seconds": sol[query]["sol_s"], "fresh": sol[query]["tokens"],
+                "tokens_per_second": sol[query]["tokens"] / sol[query]["sol_s"],
                 "recomputed": 0, "agreement": None}[metric]
     if query not in rows[method]:
         return None
@@ -134,6 +138,7 @@ def series_value(rows, sol, method, query, metric):
 def metric_bars(axis, queries, rows, sol, metric, overview):
     """Draw measured bars and a SoL line across each query group."""
     measured = METHODS
+    unit = next(unit for key, _, unit in METRICS if key == metric)
     methods = measured + ([] if metric == "agreement"
                           else [("sol", "SoL estimate", DARK)])
     positive = [value for key, _, _ in methods for query in queries
@@ -154,11 +159,10 @@ def metric_bars(axis, queries, rows, sol, metric, overview):
         else:
             axis.set_yscale("log")
             axis.set_ylim(min(positive) / 2, maximum * 8)
-            axis.set_ylabel("seconds (log scale)" if metric == "seconds"
-                            else "tokens (log scale)")
+            axis.set_ylabel(f"{unit} (log scale)")
     else:
         axis.set_ylim(0, maximum * 1.6 if maximum else 1)
-        axis.set_ylabel("seconds" if metric == "seconds" else "tokens")
+        axis.set_ylabel(unit)
         if not maximum:
             axis.set_yticks([0])
     width = 0.82 / len(measured)
@@ -207,6 +211,7 @@ def metric_bars(axis, queries, rows, sol, metric, overview):
     latency_title = "Latency" if overview else "Latency (ratios: vLLM / Quail)"
     titles = {"seconds": latency_title, "recomputed": "Recomputed KV tokens",
               "fresh": "Fresh input tokens",
+              "tokens_per_second": "Total fresh input tokens per second",
               "agreement": "Answer agreement with reference labels"}
     axis.set_title(titles[metric], fontsize=13)
 
@@ -246,12 +251,14 @@ def plot_comparison(title, queries, rows, relations, sol, name, overview=False):
     """Export the vector PDF: one metric per page, then the input counts."""
     destination = HERE / "plots" / name
     groups = [[metric] for metric, _, _ in METRICS] if overview else [
-        ["seconds", "fresh", "recomputed", "agreement"]]
+        ["seconds", "fresh", "recomputed", "agreement"],
+        ["tokens_per_second"]]
     with PdfPages(destination.with_suffix(".pdf")) as pdf:
         for metrics in groups:
-            figure, axes = (plt.subplots(1, 1, figsize=(14, 8.5)) if overview
+            single = len(metrics) == 1
+            figure, axes = (plt.subplots(1, 1, figsize=(14, 8.5)) if single
                             else plt.subplots(2, 2, figsize=(14, 10)))
-            axes = [axes] if overview else list(axes.flat)
+            axes = [axes] if single else list(axes.flat)
             for axis, metric in zip(axes, metrics):
                 metric_bars(axis, queries, rows, sol, metric, overview)
             figure.suptitle(f"{title}, Qwen3 4B FP8, sf=0.1, one H100", y=0.97,
@@ -333,6 +340,9 @@ def main(workdir):
                                "quailb_main.pdf", overview=True)
     faster = sum(rows["quail"][q]["runtime_s"]
                  < rows["pipelined_vllm"][q]["runtime_s"] for q in queries)
+    speedups = {q: rows["pipelined_vllm"][q]["runtime_s"]
+                / rows["quail"][q]["runtime_s"] for q in queries}
+    fastest = max(speedups, key=speedups.get)
     settings = [item["measurements"]["backend_metrics"]["capacity"]
                 for item in suites["pipelined_vllm"]["queries"]]
     batch_tokens = sorted({item["max_num_batched_tokens"] for item in settings})
@@ -374,7 +384,11 @@ def main(workdir):
         f"  Its measured KV capacity is {kv_range}.",
         "  Both methods use the same planner's filter and join ordering rules.",
         f"- Quail is faster on {faster} of {len(queries)} queries.",
-        "  Query time excludes startup and result collection. Throughput counts",
+        f"  The arithmetic mean speedup is {mean(speedups.values()):.2f}x,",
+        f"  the median is {median(speedups.values()):.2f}x, and the maximum is",
+        f"  {speedups[fastest]:.2f}x on {fastest}. Each query has equal weight.",
+        "  Speedup is pipelined stock vLLM time divided by Quail time.",
+        "  Query time excludes startup and result collection. Table throughput counts",
         "  input documents for filters and evaluated pairs across stages for joins.",
         f"  GPU cost is query seconds / 3,600 * ${H100_USD_PER_HOUR:.4f}.",
         "- SoL means speed of light. It estimates ideal GPU time by dividing",
@@ -391,6 +405,9 @@ def main(workdir):
         "  are fresh tokens minus the minimum for the run's actual requests with",
         "  unlimited KV. They are included in fresh tokens, not added to them.",
         "  The benchmark computes this minimum from saved answers after the run.",
+        "  Token throughput is total fresh input tokens divided by query seconds.",
+        "  It includes recomputation and excludes generated answer tokens.",
+        "  More recomputation can raise this rate without making a query faster.",
         "- Answer agreement counts matching evaluated predicate answers. Output",
         "  precision is the fraction of returned rows matching the reference.",
         "  Output recall is the fraction of reference rows returned. Most join",
@@ -439,17 +456,19 @@ def main(workdir):
                 "from other execution changes."])
         lines.extend(["",
                       "| Query | Method | Seconds | Recomputed KV tokens "
-                      "| Fresh input tokens | Throughput | Unit | $/query "
+                      "| Fresh input tokens | Tokens/second | Throughput "
+                      "| Unit | $/query "
                       "| Answer agreement (%) | Output precision (%) "
                       "| Output recall (%) |",
-                      "|---|---|---:|---:|---:|---:|---|---:|---:|---:|---:|"])
+                      "|---|---|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|"])
         for query in selected:
             for key, label, _ in METHODS:
                 m = row_metrics(rows[key][query])
                 lines.append(
                     f"| {query} | {label} | {m['seconds']:.2f} "
                     f"| {token_cell(m['recomputed'])} "
-                    f"| {m['fresh']:,} | {m['throughput']:,.2f} "
+                    f"| {m['fresh']:,} | {m['tokens_per_second']:,.2f} "
+                    f"| {m['throughput']:,.2f} "
                     f"| {m['unit']} | {m['cost']:.5f} | {m['agreement']:.2f} "
                     f"| {m['precision']:.5g} | {m['recall']:.5g} |")
             estimate = sol[query]
@@ -460,7 +479,9 @@ def main(workdir):
                 unit = "docs/s"
             lines.append(
                 f"| {query} | SoL estimate | {estimate['sol_s']:.3f} | 0 (assumed) "
-                f"| {estimate['tokens']:,.0f} | {throughput:,.2f} | {unit} "
+                f"| {estimate['tokens']:,.0f} "
+                f"| {estimate['tokens'] / estimate['sol_s']:,.2f} "
+                f"| {throughput:,.2f} | {unit} "
                 f"| {estimate['cost_usd_per_query_at_sol']:.5f} "
                 "| Not measured | Not measured | Not measured |")
         lines.append("")
