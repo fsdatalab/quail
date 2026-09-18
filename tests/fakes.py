@@ -104,7 +104,7 @@ def fake_pack(torch, arena, specs, **kw):
         (len(spec["prefix"]) if spec["prefix"] is not None else 0)
         + sum(len(suffix) for suffix in spec["suffixes"])
         for spec in specs)
-    return SimpleNamespace(specs=specs, tokens=tokens)
+    return SimpleNamespace(specs=specs, tokens=tokens, temporary_keys=())
 
 
 def expected_filter_rows(filter_truth):

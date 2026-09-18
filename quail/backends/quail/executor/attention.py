@@ -41,7 +41,7 @@ class Chunk:
             counter, KV scatter maps, block tables, and sequence bounds.
         tokens: Rows in the chunk.
         layout: (arena key, suffix count) per group in chunk order.
-        temporary_keys: Arena keys the forward pass frees when it ends.
+        temporary_keys: Arena keys the loop frees after the forward pass.
     """
 
     input_ids: Any
@@ -591,14 +591,6 @@ class Pipeline:
     # ---- the forward loop -------------------------------------------
 
     def forward_chunk(self, chunk):
-        try:
-            return self._forward_chunk(chunk)
-        finally:
-            keys, chunk.temporary_keys = chunk.temporary_keys, ()
-            for key in keys:
-                self.arena.free_key(key)
-
-    def _forward_chunk(self, chunk):
         meta = chunk.meta
         meta["layer"] = 0
         positions = chunk.positions

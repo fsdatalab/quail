@@ -440,6 +440,20 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     return out
 
 
+def _forward(pipeline, arena, chunk):
+    """Run the forward pass, then release the chunk's temporary pages.
+
+    The loop owns every page it hands the forward pass, so it frees the
+    temporaries whether the pass returns or raises.
+    """
+    try:
+        return pipeline.forward_chunk(chunk)
+    finally:
+        keys, chunk.temporary_keys = chunk.temporary_keys, ()
+        for key in keys:
+            arena.free_key(key)
+
+
 # ------------------------------------------------------------ the join
 
 def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
@@ -670,7 +684,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         e0 = torch.cuda.Event(enable_timing=True)
         e1 = torch.cuda.Event(enable_timing=True)
         e0.record()
-        normed = pipeline.forward_chunk(chunk)
+        normed = _forward(pipeline, arena, chunk)
         e1.record()
         spans.append((groups[0][1], e0, e1))
         outstanding.append((groups, async_ans.submit(normed)))
@@ -1126,7 +1140,7 @@ class FilterStream:
         e0 = torch.cuda.Event(enable_timing=True)
         e1 = torch.cuda.Event(enable_timing=True)
         e0.record()
-        normed = self.pipeline.forward_chunk(chunk)
+        normed = _forward(self.pipeline, arena, chunk)
         e1.record()
         t = _tick(timing, "forward_launch", t)
         self.spans.append((0, e0, e1))
