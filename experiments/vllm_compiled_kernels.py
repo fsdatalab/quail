@@ -116,7 +116,7 @@ class KernelSourceEngine(Engine):
     """
 
     def __init__(self, arena, *, kernel_source="quail", **kwargs):
-        super().__init__(arena, kernels="quail", **kwargs)
+        super().__init__(arena, **kwargs)
         self._segments = None
         self.kernel_source = kernel_source
 

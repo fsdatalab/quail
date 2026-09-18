@@ -18,7 +18,6 @@ class Qwen3Pipeline(ModelPipeline):
                  engine_class=Engine):
         import torch
 
-        self.module = model
         self.layers = model.model.layers
         self.embed = model.model.embed_tokens
         self.final_norm = model.model.norm

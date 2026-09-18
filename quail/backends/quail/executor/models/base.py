@@ -16,7 +16,7 @@ class ModelPipeline:
     """
 
     engine = None
-    max_chunk_tokens = None    # rows one chunk may hold
+    max_chunk_tokens = None
 
     def forward_chunk(self, chunk):
         """Return the final-normed hidden state of chunk.final_indices.
