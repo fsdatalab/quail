@@ -1,4 +1,4 @@
-"""Packed forward pass over the paged arena.
+"""The forward-pass engine: kernels, quantization, and attention over the arena.
 
 DeepGEMM matmuls, fused Triton kernels, FlashAttention varlen
 self-attention, paged cross-attention against the arena, and
@@ -9,13 +9,16 @@ kernel) and unified (one causal paged attention call after scattering
 current KV into the arena). A chunk with no arena pages skips the
 arena and runs one causal varlen call per group.
 
-Pipeline(kernels="vllm") swaps the fused Triton kernels for vLLM's
+Engine(kernels="vllm") swaps the fused Triton kernels for vLLM's
 unfused equivalents. torch is imported lazily.
 
-The forward loop calls four primitives: norm_quant, qk_norm_rope,
-attention, and activation_quant. Each picks the kernel set, the
-precision path, and the attention mode itself, so the loop is
-straight-line code. Its input is a Chunk built by pack_chunk.
+A forward loop, in models/<arch>.py, calls four primitives: norm_quant,
+qk_norm_rope, attention, and activation_quant. Each picks the kernel
+set, the precision path, and the attention mode itself. The loop's
+input is a Chunk built by pack_chunk.
+
+The fused qk_norm_rope kernel assumes per-head Q and K RMSNorm before
+rotary, as Qwen3 has.
 """
 
 from dataclasses import dataclass
@@ -62,11 +65,23 @@ def flash_attention_version(capability: tuple[int, int]) -> int:
     raise ValueError(f"Quail does not support CUDA capability {capability}")
 
 
-class Pipeline:
-    """Packed forward passes with shared-prefix attention over the paged arena."""
+class Engine:
+    """Kernels, quantization, and shared-prefix attention over the paged arena.
 
-    def __init__(self, model, arena, kernels="quail", *,
-                 attention_mode):
+    Args:
+        arena: KVArena the attention paths read and write.
+        n_q: Query heads.
+        n_kv: KV heads.
+        head_dim: Head dimension.
+        rotary: The loaded model's rotary embedding module.
+        fp8: Whether the linear weights are fp8 block-quantized.
+        kernels: "quail" for the fused Triton kernels, "vllm" for
+            vLLM's unfused equivalents.
+        attention_mode: "unified" or "merge_quant".
+    """
+
+    def __init__(self, arena, *, n_q, n_kv, head_dim, rotary, fp8,
+                 kernels="quail", attention_mode):
         import torch
         from vllm.utils.deep_gemm import is_deep_gemm_e8m0_used
 
@@ -78,25 +93,14 @@ class Pipeline:
 
         self.fa_version = flash_attention_version(torch.cuda.get_device_capability())
         self.torch = torch
-        self.model = model
         self.arena = arena
-        self.layers = model.model.layers
-        self.embed = model.model.embed_tokens
-        self.final_norm = model.model.norm
-        self.rotary = self.layers[0].self_attn.rotary_emb
-        attn = self.layers[0].self_attn
-        self.num_q_heads = attn.num_heads
-        self.num_kv_heads = attn.num_kv_heads
-        self.head_dim = attn.head_dim
+        self.rotary = rotary
+        self.num_q_heads = n_q
+        self.num_kv_heads = n_kv
+        self.head_dim = head_dim
         self.use_ue8m0 = bool(is_deep_gemm_e8m0_used())
         self.fp8 = torch.float8_e4m3fn
-        self.is_fp8 = attn.qkv_proj.weight.dtype == self.fp8
-        # The fused kernels compute element offsets in 32-bit ints,
-        # so a chunk needs rows x widest_row < 2^31.
-        widest = max(max(layer.self_attn.qkv_proj.weight.shape[0],
-                         layer.mlp.gate_up_proj.weight.shape[0])
-                     for layer in self.layers)
-        self.max_chunk_tokens = (2**31 - 1) // widest
+        self.is_fp8 = bool(fp8)
 
     # the mode is reassigned per phase (filters then joins in one
     # session), so validate at every write, not just construction
@@ -587,36 +591,3 @@ class Pipeline:
             block_table=unified["table"], seqused_k=unified["used"])
         meta["layer"] += 1
         return out.view(n, H * D)
-
-    # ---- the forward loop -------------------------------------------
-
-    def forward_chunk(self, chunk):
-        meta = chunk.meta
-        meta["layer"] = 0
-        positions = chunk.positions
-        hidden = self.embed(chunk.input_ids)
-        residual = None
-        for layer in self.layers:
-            attn = layer.self_attn
-            if residual is None:
-                residual = hidden
-                q_in, q_scale = self.norm_quant(hidden, layer.input_layernorm)
-            else:
-                q_in, q_scale = self.norm_quant(
-                    hidden, layer.input_layernorm, residual)
-            qkv = self.gemm(q_in, q_scale, attn.qkv_proj)
-            q, k = self.qk_norm_rope(qkv, positions, attn)
-            v = qkv[:, (self.num_q_heads + self.num_kv_heads) * self.head_dim:]
-            o_in, o_scale = self.attention(q, k, v, meta)
-            hidden = self.gemm(o_in, o_scale, attn.o_proj)
-            g_in, g_scale = self.norm_quant(
-                hidden, layer.post_attention_layernorm, residual)
-            gate_up = self.gemm(g_in, g_scale, layer.mlp.gate_up_proj)
-            d_in, d_scale = self.activation_quant(gate_up)
-            hidden = self.gemm(d_in, d_scale, layer.mlp.down_proj)
-        final = chunk.final_indices
-        last_hidden = hidden.index_select(0, final)
-        last_residual = residual.index_select(0, final)
-        normed, _ = self.fused_add_rms_norm(
-            last_hidden, last_residual, self.final_norm)
-        return normed

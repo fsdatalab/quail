@@ -4,6 +4,10 @@ from dataclasses import dataclass, replace
 from typing import Literal
 
 Precision = Literal["fp8", "bf16"]
+# What a model answers with: a generative model scores TRUE against
+# FALSE for AI_FILTER and AI_JOIN; a reranker scores yes against no
+# for AI.SCORE.
+Role = Literal["generative", "reranker"]
 
 # Peak per-token activation bytes per hidden dim.
 ACT_BYTES_PER_HIDDEN = 32
@@ -35,6 +39,8 @@ class ModelSpec:
     tied_head: bool = False    # lm_head shares the embedding tensor
     weight_precision: Precision = "fp8"
     attention_precision: Precision = "bf16"
+    arch: str = "qwen3"    # forward pass in executor/models/<arch>.py
+    role: Role = "generative"
 
     @property
     def kappa(self) -> float:

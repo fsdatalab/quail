@@ -796,7 +796,6 @@ def request_runtimes() -> dict:
     return {RequestExecution.runtime_key: ModelNodeRuntime()}
 
 
-SUPPORTED_MODELS = frozenset({"qwen3-4b-fp8", "qwen3-32b-fp8"})
 SUPPORTED_DEVICES = frozenset({"h100-sxm", "rtx-pro-6000-blackwell-server"})
 
 
@@ -831,9 +830,10 @@ class RequestBackend:
 
     def supports(self, model, device, gpu_count: int) -> SupportResult:
         label = self.engine.label
-        if model.name not in SUPPORTED_MODELS:
+        if model.role != "generative":
             return SupportResult.reject(
-                f"{label} does not support model {model.name!r}"
+                f"{label} does not support model {model.name!r}: "
+                f"the request backends serve generative models only"
             )
         if device.name not in SUPPORTED_DEVICES:
             return SupportResult.reject(

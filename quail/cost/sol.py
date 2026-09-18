@@ -1,9 +1,9 @@
 """Speed of light calculation shared by the planner and reports.
 
 The workload code counts tokens, attention pairs, and KV movement. The
-Qwen3 model code turns those counts into named model components. The
-generic roofline code prices each component separately and adds their
-times in execution order.
+dense decoder cost code turns those counts into named model
+components. The generic roofline code prices each component
+separately and adds their times in execution order.
 """
 
 from __future__ import annotations
@@ -12,16 +12,16 @@ import math
 from dataclasses import dataclass
 
 from quail.cost import work as _workload
-from quail.cost.qwen3_cost import qwen3_components
+from quail.cost.dense_decoder_cost import dense_decoder_components
 from quail.cost.roofline import ComponentLatency, component_latencies
 from quail.specs import DeviceSpec, ModelSpec
 
 
 def _latencies(work: _workload.Work, model: ModelSpec, device: DeviceSpec,
                passes: float) -> tuple[ComponentLatency, ...]:
-    """Return the priced Qwen3 components for one work record."""
+    """Return the priced decoder components for one work record."""
     return component_latencies(
-        qwen3_components(work, model, passes), device)
+        dense_decoder_components(work, model, passes), device)
 
 
 def compute_seconds(work: _workload.Work, model: ModelSpec,

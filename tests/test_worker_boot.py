@@ -63,7 +63,8 @@ def booted(monkeypatch):
     monkeypatch.setattr(worker, "load_model",
                         lambda *a, **k: SimpleNamespace())
     monkeypatch.setattr(worker, "KVArena", lambda **k: SimpleNamespace())
-    monkeypatch.setattr(worker, "Pipeline", lambda *a, **k: SimpleNamespace())
+    monkeypatch.setattr(worker, "build_pipeline",
+                        lambda *a, **k: SimpleNamespace())
     monkeypatch.setattr(worker, "AsyncAnswers",
                         lambda torch, answerer: SimpleNamespace())
     monkeypatch.setattr(worker, "_PayloadAnswerer",

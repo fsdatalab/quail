@@ -14,7 +14,6 @@ from quail.backends.quail.executor.arena import KVArena
 from quail.backends.quail.executor.attention import (
     FILTER_ATTENTION,
     JOIN_ATTENTION,
-    Pipeline,
 )
 from quail.backends.quail.executor.loop import AsyncAnswers, warm_kernels
 from quail.backends.quail.executor.model import (
@@ -22,6 +21,7 @@ from quail.backends.quail.executor.model import (
     load_model,
     resolve_model_path,
 )
+from quail.backends.quail.executor.models import build_pipeline
 from quail.backends.quail.graph import (
     _join_round_kv,
     _tuple_suffix,
@@ -96,8 +96,8 @@ class LoadedGpu:
         self.arena_s = time.perf_counter() - t0
 
         t0 = time.perf_counter()
-        self.pipeline = Pipeline(self.model, self.arena,
-                                 attention_mode=FILTER_ATTENTION)
+        self.pipeline = build_pipeline(spec, self.model, self.arena,
+                                       attention_mode=FILTER_ATTENTION)
         self.pipeline_s = time.perf_counter() - t0
 
         self.execution = backend.start(context)

@@ -128,16 +128,17 @@ def _boot_state(model):
     """Boot the worker state dict, as the worker's own boot does.
 
     Mirrors quail.execution.execute._execute_physical's boot with the
-    shipping Pipeline; warm_kernels runs the same tiered warmup.
+    shipping pipeline; warm_kernels runs the same tiered warmup.
     """
     import torch
     import torch.nn.functional as F
     from transformers import AutoTokenizer
 
     from quail.backends.quail.executor.arena import KVArena
-    from quail.backends.quail.executor.attention import FILTER_ATTENTION, Pipeline
+    from quail.backends.quail.executor.attention import FILTER_ATTENTION
     from quail.backends.quail.executor.loop import Answerer, AsyncAnswers, warm_kernels
     from quail.backends.quail.executor.model import load_model
+    from quail.backends.quail.executor.models import build_pipeline
     from quail.cost import budgets
     from quail.specs import DEVICES, MODELS
 
@@ -152,8 +153,8 @@ def _boot_state(model):
                     page_tokens=budgets.PAGE_TOKENS,
                     n_kv=spec.n_kv, d_head=spec.d_head,
                     dtype=torch.bfloat16)
-    pipeline = Pipeline(model_mod, arena,
-                        attention_mode=FILTER_ATTENTION)
+    pipeline = build_pipeline(spec, model_mod, arena,
+                              attention_mode=FILTER_ATTENTION)
     from quail.backends import GpuContext, QuailBackend
     execution = QuailBackend().start(GpuContext(
         gpu_index=0,
