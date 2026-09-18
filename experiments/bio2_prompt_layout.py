@@ -13,7 +13,9 @@ fresh tokens to every pair. If the chat layout is instead about 13%
 faster here too, the cause is the batch composition (fewer requests per
 step under the 25,305-token step budget), not the host.
 
-The query runs through the real runner and planner. The join call is
+The query runs through the real runner and planner, with the BIO
+tables already on quail-results and the references read from the
+volume, as the September 18 run did. The join call is
 wrapped: for each round it runs the raw layout, resets the prefix
 cache, runs the chat layout, and resets again. The layout the checked
 out code renders natively is measured as is; the other is derived from
@@ -21,7 +23,8 @@ it by adding or removing the chat wrapper tokens, which is exactly how
 the two branches differ. The runner scores the native layout's answers.
 
     run_log="results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-bio2-prompt-layout.log"
-    uv run modal run --detach experiments/bio2_prompt_layout.py \
+    uv run modal run --detach \
+      experiments/bio2_prompt_layout.py::compare_prompt_layouts \
       2>&1 | tee "$run_log"
 
 The run prints its Modal function call id. The result is saved on
@@ -40,18 +43,12 @@ from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
 
-from quail.bench.quailb_parallel import (
-    DATA_DIR,
-    VOLUMES,
-    app,
-    ensure_data,
-    image,
-    results_vol,
-)
+from quail.bench.quailb_parallel import DATA_DIR, VOLUMES, app, image, results_vol
 
 QUERY = "BIO-2"
 SCALE_FACTOR = 0.1
 COLLECTION = "gt_91df55461cea394013812087a6ca6625"
+REFERENCE_ROOT = "/results"    # the collection is on quail-results
 # Qwen3 apply_chat_template(enable_thinking=False), as the runtime renders it.
 CHAT_PREFIX = "<|im_start|>user\n"
 CHAT_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
@@ -176,6 +173,7 @@ def _worker(directory: str, connection, rounds: int) -> None:
             data_dir=DATA_DIR, model="qwen3-4b-fp8", sf=SCALE_FACTOR,
             query_ids=(QUERY,), run_dir=str(root),
             ground_truth_collection=COLLECTION, methods=("pipelined_vllm",),
+            root=REFERENCE_ROOT,
         )
         if len(joins) != 2 * rounds:
             raise RuntimeError(f"expected {2 * rounds} join runs, got {len(joins)}")
@@ -208,7 +206,7 @@ def _worker(directory: str, connection, rounds: int) -> None:
 
 @app.function(
     image=image.add_local_python_source("experiments"),
-    gpu="H100!", memory=98304, timeout=7200, volumes=VOLUMES,
+    gpu="H100!", memory=98304, timeout=10800, volumes=VOLUMES,
 )
 def compare_layouts(rounds: int = 2) -> str:
     """Run the comparison in a child process and save its result."""
@@ -240,11 +238,9 @@ def compare_layouts(rounds: int = 2) -> str:
 
 
 @app.local_entrypoint()
-def main(rounds: int = 2):
+def compare_prompt_layouts(rounds: int = 2):
     """Start the comparison and print its function call id and result path."""
     print(f"prediction: {PREDICTION_TEXT}", flush=True)
-    collection = ensure_data.remote(SCALE_FACTOR, [QUERY], COLLECTION)
-    print(f"label collection: {collection}", flush=True)
     call = compare_layouts.spawn(rounds)
     print(f"function call id: {call.object_id}", flush=True)
     print(f"result volume path: {call.get()}", flush=True)
