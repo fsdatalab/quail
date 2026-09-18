@@ -222,8 +222,8 @@ def _run_query(state, build, captured):
     from quail.execution.types import PhysicalResponse
 
     def execute(request):
-        request, registry, graph, _ = _validate_physical_request(
-            request, query.session.registry)
+        registry = query.session.registry
+        graph, _ = _validate_physical_request(request, registry)
         payload = quail_runtime_payload(request, graph)
         rows = AnswerRows(
             state["torch"], state["F"], state["model"],
