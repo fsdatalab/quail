@@ -160,6 +160,98 @@ AI_FILTER(PROMPT(...), {'selectivity': 0.3, 'anchor': 'r'})
   documents. If omitted, Quail chooses automatically to minimize
   query cost.
 
+### AI.SCORE
+
+`AI.SCORE(PROMPT(...))` returns a reranker score between 0 and 1 as a
+`FLOAT64`. Higher scores mean the model more strongly favors "yes" over
+"no" for the prompt. Use it in `SELECT` to return scores, or compare it
+with a threshold in `WHERE` or `JOIN ... ON`.
+
+The system message says, "You are performing a data processing task."
+It asks the model to judge whether the document meets the query's
+requirements and answer "yes" or "no".
+
+Choose a reranker model when creating the session:
+
+```python
+config = quail.EngineConfig(
+    model="qwen3-reranker-0.6b-bf16",
+    device="h100-sxm",
+)
+```
+
+The supported models are `qwen3-reranker-0.6b-bf16` and
+`qwen3-reranker-4b-bf16`. Use `gpus` to run a model copy on each GPU.
+
+#### Return scores
+
+Give the score column a name with `AS`:
+
+```sql
+SELECT d.id,
+       AI.SCORE(PROMPT('Does the customer request a refund? {0}', d.body))
+           AS refund_score
+FROM documents d
+```
+
+#### Filter rows
+
+Compare the score with `<`, `<=`, `>`, or `>=`. The threshold may be
+on either side of the comparison:
+
+```sql
+SELECT d.id
+FROM documents d
+WHERE AI.SCORE(
+    PROMPT('Does the customer request a refund? {0}', d.body),
+    {'selectivity': 0.1}
+) >= 0.75
+```
+
+The optional `selectivity` hint estimates the fraction of rows that pass
+the comparison. Quail uses it to order filters and assumes 20% if omitted.
+The hint does not change the scores or threshold.
+
+#### Join tables
+
+For a prompt with two document arguments, Quail includes the first in the
+reranker's query and uses the second as its candidate document. The
+template mentions `{0}` once, where that document is inserted; refer to
+it again in words:
+
+```sql
+SELECT q.id, d.id
+FROM queries q
+JOIN documents d ON AI.SCORE(
+    PROMPT('Is {1} relevant to {0}?', q.text, d.body)
+) >= 0.8
+```
+
+A pair score returned in `SELECT` without a comparison runs over
+every pair, so write the tables with `CROSS JOIN`. An `ON` column
+equality narrows the pairs only when the score is compared in `ON`.
+
+In the reranker's query text, a placeholder that stands alone at the
+start or end of the template marks where the document goes and is
+left out, since the reranker holds the document in its own field. A
+placeholder inside a sentence reads "this document".
+
+When the same score appears in `SELECT`, a filter, or a join condition,
+Quail computes it once. Two comparisons of one score, such as a range,
+share that one computation. A query cannot combine `AI.SCORE` with
+`AI.IF`.
+
+#### Score definition
+
+Quail computes the score from the model's `yes` and `no` logits:
+
+```text
+score = exp(yes_logit) / (exp(yes_logit) + exp(no_logit))
+```
+
+A score of 0.75 does not mean 75% accuracy. Choose the threshold using
+labeled examples for your task.
+
 ### AI.CLASSIFY
 
 <Callout type="info">Coming soon</Callout>

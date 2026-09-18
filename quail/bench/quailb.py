@@ -25,7 +25,6 @@ import quail
 import quail_b as benchmark
 from quail.bench import substrait
 from quail.bench.substrait import QueryPlan, read_plan
-from quail.planner import collect_operators
 from quail.planner.plan import Refusal
 from quail.specs import H100_USD_PER_HOUR
 from quail_b.queries import (
@@ -169,11 +168,10 @@ def prompt_pieces(query, plan: QueryPlan, anchors) -> dict:
         plan: The query's plan, for the operator ids.
         anchors: Written join position -> the anchor alias.
     """
-    _, filters, joins = collect_operators(query.logical)
-    prompts = [predicate.prompt for predicates in filters.values()
-               for predicate in predicates]
-    prompts += [join.predicate for join in joins]
-    preamble = next((list(prompt.preamble_token_ids) for prompt in prompts
+    operators = query.logical.operators()
+    filters, joins = operators.filters, operators.joins
+    preamble = next((list(prompt.preamble_token_ids)
+                     for prompt in operators.prompts
                      if prompt.preamble_token_ids), [])
     pieces = {"tokenizer": query.session.model.hf_name, "preamble": preamble,
               "filters": [], "joins": []}
@@ -185,12 +183,12 @@ def prompt_pieces(query, plan: QueryPlan, anchors) -> dict:
     for position, join in enumerate(joins):
         anchor = anchors[position]
         parts = {alias: (list(label), list(frame))
-                 for alias, label, frame in join.predicate.label_token_ids}
+                 for alias, label, frame in join.prompt.label_token_ids}
         (partner,) = [alias for alias in parts if alias != anchor]
         pieces["joins"].append({
             "id": plan.join_id(position), "anchor": anchor,
             "frame": parts[anchor][1], "label": parts[partner][0],
-            "tail": list(join.predicate.tail_token_ids)})
+            "tail": list(join.prompt.tail_token_ids)})
     return pieces
 
 

@@ -5,7 +5,6 @@ import pyarrow.parquet as pq
 
 import quail
 from quail.bench.quailb import queries, register_tables
-from quail.planner.decide import collect_operators
 from quail.planner.plan import EngineConfig, Refusal
 from quail_b.data import ASPECTS, SCENARIOS
 from quail_b.queries import QUERY_ORDER
@@ -86,7 +85,8 @@ def test_all_queries_compile_and_plan(tmp_path):
         assert set(QUERY_ORDER) == expected - {"PRIV-1", "PRIV-2"}
         for qid, (_, build) in qdefs.items():
             query = build()
-            _, filters, joins = collect_operators(query.logical)
+            operators = query.logical.operators()
+            filters, joins = operators.filters, operators.joins
             predicates = [predicate for chain in filters.values()
                           for predicate in chain]
             if qid.startswith("PRIV-"):

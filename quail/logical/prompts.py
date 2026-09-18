@@ -29,7 +29,11 @@ def true_false_ids(tok):
 JOIN_DOC_LABEL = "\n\nDOCUMENT {}:\n"      # each partner block
 JOIN_ANCHOR_NOTE = "\n\n(The document above is DOCUMENT {}.)"
 JOIN_QUESTION_SEP = "\n\n"                 # anchor note -> question
-TASK_INSTRUCTION = "Evaluate TRUE or FALSE for the following question: "
+DATA_PROCESSING_INSTRUCTION = "You are performing a data processing task."
+TASK_INSTRUCTION = (
+    f"{DATA_PROCESSING_INSTRUCTION} "
+    "Evaluate TRUE or FALSE for the following question: "
+)
 ANSWER_CUE = "\nANSWER:"
 
 
@@ -199,6 +203,27 @@ def bind_prompt(template: str, args: tuple, tokenizer=None) -> Prompt:
                   tail=tail, preamble_tokens=pre_tok, tail_tokens=tail_tok,
                   frame=frame, frame_tokens=frame_tok,
                   preamble_token_ids=pre_ids, tail_token_ids=tail_ids)
+
+
+def bind_score_prompt(template: str, args: tuple,
+                      tokenizer=None) -> Prompt:
+    """Build an AI.SCORE Prompt that keeps the template as written.
+
+    The reranker renders its own layout, with the query text and the
+    document in separate fields, so the template is not rearranged.
+
+    Args:
+        template: Prompt template with {0}, and {1} for a pair.
+        args: Column references in placeholder order.
+        tokenizer: Unused; the planner tokenizes the rendered layout.
+    """
+    _check_placeholders(template, len(args))
+    aliases = [r.alias for r in args]
+    if len(set(aliases)) != len(aliases):
+        raise CompileError(
+            f"each AI.SCORE placeholder must name a distinct table, got "
+            f"aliases {aliases}")
+    return Prompt(template=template, args=tuple(args), preamble="", tail="")
 
 
 def bind_join_prompt(template: str, args: tuple,

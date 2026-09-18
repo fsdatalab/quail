@@ -5,13 +5,16 @@ from __future__ import annotations
 from dataclasses import replace
 
 from quail.logical import (
+    Alias,
     ColumnRef,
+    Compare,
     Equality,
     FilterPredicate,
     LogicalNode,
+    ModelCall,
     Project,
-    Prompt,
     Scan,
+    model_call,
 )
 
 
@@ -20,9 +23,9 @@ def _column_refs(expression) -> tuple[ColumnRef, ...]:
     if isinstance(expression, ColumnRef):
         return (expression,)
     if isinstance(expression, FilterPredicate):
-        return tuple(expression.prompt.args)
-    if isinstance(expression, Prompt):
-        return tuple(expression.args)
+        return _column_refs(expression.expression)
+    if isinstance(expression, (ModelCall, Compare, Alias)):
+        return tuple(model_call(expression).prompt.args)
     if isinstance(expression, Equality):
         return (expression.left, expression.right)
     return ()
@@ -45,6 +48,12 @@ def push_down_projection(root: LogicalNode) -> LogicalNode:
         for ref in (root.output_schema() if isinstance(root, Project)
                     else ())
     }
+    score_inputs = {
+        (ref.alias, ref.column)
+        for expression in (root.columns if isinstance(root, Project) else ())
+        if isinstance(expression, Alias)
+        for ref in _column_refs(expression)
+    }
 
     def descend(node, needed):
         needed = {alias: dict(columns) for alias, columns in needed.items()}
@@ -56,6 +65,7 @@ def push_down_projection(root: LogicalNode) -> LogicalNode:
                 column for column in needed.get(node.alias, ())
                 if column != node.column
                 or (node.alias, column) in returned
+                or (node.alias, column) in score_inputs
             )
             return node if columns == node.columns else replace(
                 node, columns=columns)

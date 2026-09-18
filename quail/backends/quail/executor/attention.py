@@ -58,6 +58,7 @@ class Pipeline:
         self.head_dim = attn.head_dim
         self.use_ue8m0 = bool(is_deep_gemm_e8m0_used())
         self.fp8 = torch.float8_e4m3fn
+        self.is_fp8 = attn.qkv_proj.weight.dtype == self.fp8
         # The fused kernels compute element offsets in 32-bit ints,
         # so a chunk needs rows x widest_row < 2^31.
         widest = max(max(layer.self_attn.qkv_proj.weight.shape[0],
@@ -90,6 +91,8 @@ class Pipeline:
         raise AttributeError(f"no weight scale on {type(linear).__name__}")
 
     def gemm(self, q_input, input_scale, linear):
+        if not self.is_fp8:
+            return self.torch.nn.functional.linear(q_input, linear.weight)
         # all linear projections (QKV, O, gate-up, down) run vLLM's
         # DeepGEMM fp8 matmul; weights and scales are vLLM's layout
         from vllm.utils.deep_gemm import fp8_gemm_nt
@@ -102,6 +105,8 @@ class Pipeline:
         return out
 
     def quant(self, x):
+        if not self.is_fp8:
+            return x, None
         from vllm.model_executor.layers.quantization.utils.fp8_utils import (
             per_token_group_quant_fp8,
         )
@@ -318,6 +323,8 @@ class Pipeline:
         return self._kernels
 
     def custom_silu_quant(self, gate_up):
+        if not self.is_fp8:
+            return self.vllm_silu_quant(gate_up)
         n, doubled = gate_up.shape
         half = doubled // 2
         gpb = 4
@@ -330,6 +337,8 @@ class Pipeline:
         return q, scales
 
     def custom_norm_quant(self, hidden, norm, residual):
+        if not self.is_fp8:
+            return self.vllm_norm_quant(hidden, norm, residual)
         n, h = hidden.shape
         block = 1 << (h - 1).bit_length()
         q = self.torch.empty((n, h), dtype=self.fp8, device="cuda")
@@ -526,6 +535,8 @@ class Pipeline:
                 self.arena.free_key(key)
 
     def _forward_chunk(self, chunk):
+        if not self.is_fp8 and self.attention_mode != "unified":
+            raise ValueError("BF16 forward passes require unified attention")
         meta = chunk["meta"]
         meta["layer"] = 0
         input_ids, positions = chunk["input_ids"], chunk["positions"]

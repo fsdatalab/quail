@@ -48,7 +48,6 @@ from quail.physical import (
 )
 from quail.physical.base import input_ports
 from quail.planner import (
-    collect_operators,
     default_order_rule,
     hash_join_nodes,
     order_filters_indexed,
@@ -94,7 +93,8 @@ def plan_request_backend(
                 needed=1, available=0, unit="backends"),
             estimated_seconds=float("inf"),
         ),)
-    scans, filters, joins = collect_operators(region.logical_plan)
+    operators = region.logical_plan.operators()
+    scans, filters, joins = operators.scans, operators.filters, operators.joins
     stats = {
         alias: CorpusStats(
             n_docs=len(lengths),
@@ -194,7 +194,7 @@ def plan_request_backend(
     join_specs = []
     for written_pos, selected_anchor in join_sequence:
         join = joins[written_pos]
-        prompt = join.predicate
+        prompt = join.prompt
         prompts.append(prompt)
         aliases_in_prompt = tuple(argument.alias for argument in prompt.args)
         labels = tuple(

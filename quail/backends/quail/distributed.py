@@ -5,8 +5,13 @@ from __future__ import annotations
 import time
 
 from quail.backends.quail import coordinator
-from quail.backends.quail.graph import executed_join_plan, model_answers
+from quail.backends.quail.graph import (
+    executed_join_plan,
+    model_answers,
+    throughput,
+)
 from quail.execution.pairs import columns_key
+from quail.execution.reranker import score_in_batches
 from quail.execution.runner import (
     ExecutionContext,
     GenericRunner,
@@ -16,10 +21,12 @@ from quail.execution.runner import (
     compute_subgraph,
     scalar_node_metrics,
 )
+from quail.execution.tokens import select_documents
 from quail.execution.types import export_physical_outputs
 from quail.physical import (
     AiFilter,
     AiJoin,
+    AiScore,
     PhysicalGraph,
     Scan,
 )
@@ -28,6 +35,9 @@ from quail.planner import balanced_shards
 
 class DistributedQuailExecution:
     """Dispatch typed Quail model nodes to one child per GPU."""
+
+    # the children keep the document tokens after the first score round
+    score_documents_sent = False
 
     def __init__(self, payload, graph, gpu_count, round_fn,
                  model_spec, device, registry):
@@ -78,12 +88,33 @@ class DistributedQuailExecution:
         return dict(self.payload)
 
     def execute(self, node, inputs):
+        if isinstance(node, AiScore):
+            return self._execute_score(node, inputs)
         if isinstance(node, AiFilter):
             return self._execute_filter(node, inputs)
         if isinstance(node, AiJoin):
             return self._execute_join(node, inputs)
         raise TypeError(
             f"distributed Quail cannot execute {node.type_name!r}")
+
+    def _execute_score(self, node, inputs):
+        return score_in_batches(
+            node, inputs, self._score_round, shards=self.gpu_count
+        )
+
+    def _score_round(self, node, batches):
+        """Score one batch per GPU child and return their results in order."""
+        subs = [{"node": node, "inputs": {"score_rows": batch}}
+                for batch in batches]
+        if not self.score_documents_sent:
+            documents = {
+                alias: select_documents(docs, range(len(docs)))
+                for alias, docs in self.docs.items()
+            }
+            for sub in subs:
+                sub["inputs"]["documents"] = documents
+            self.score_documents_sent = True
+        return self.round_fn("scores", subs)
 
     def begin(self):
         """Start a query that has no filter node."""
@@ -385,7 +416,20 @@ def execute_distributed_graph(payload, graph: PhysicalGraph, gpu_count: int,
         _outputs=export_physical_outputs(compute_subgraph(graph), result),
         wall_s=round(elapsed, 2),
         fresh_tokens=result.metrics.fresh_tokens,
+        cached_tokens=result.metrics.cached_tokens,
+        evaluated_documents=result.metrics.evaluated_documents,
+        evaluated_document_pairs=result.metrics.evaluated_document_pairs,
+        usd_per_query=(
+            None if device.usd_per_hour is None
+            else elapsed / 3600 * gpu_count * device.usd_per_hour
+        ),
+        backend_metrics={"scores": [
+            dict(value.metrics.extension)
+            for node_id, value in result.nodes.items()
+            if graph.node(node_id).type_name == AiScore.type_name
+        ]},
         executed_join_plan=executed_join_plan(graph),
         node_metrics=scalar_node_metrics(result.nodes),
     )
+    report.update(throughput(graph, result.metrics, elapsed))
     return report

@@ -7,7 +7,6 @@ import pyarrow.parquet as pq
 
 import quail
 from quail.catalog import DocumentProvider
-from quail.planner import collect_operators
 from quail.planner.plan import EngineConfig
 from quail.specs import H100_USD_PER_HOUR
 
@@ -52,7 +51,7 @@ def test_distinct_prefix_estimates_for_filters_and_joins(tmp_path):
         query = (sess.docs("reviews").alias("r")
                  .ai_filter(quail.prompt(FILTER, quail.col("r.body")))
                  .select("r.id"))
-        _, filters, _ = collect_operators(query.logical)
+        filters = query.logical.operators().filters
         question = filters["r"][0].prompt.tail_tokens
         distinct = quail.speed_of_light_estimate(query, _answer)
         per_document = quail.speed_of_light_estimate(

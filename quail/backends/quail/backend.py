@@ -9,24 +9,30 @@ from typing import Any
 from quail.backends.base import GpuContext
 from quail.backends.quail.executor import loop
 from quail.backends.quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
+from quail.backends.quail.executor.score import QuailScorer
 from quail.backends.quail.graph import filter_result, stage_partner_lists
 from quail.backends.quail.worker import execute_quail_request, prepare_quail_request
+from quail.execution.reranker import RerankerModelExecution
 from quail.execution.runner import NodeMetrics, NodeResult, SurvivorStream
 from quail.execution.tokens import DocumentKeys
-from quail.logical import SHARED_PRE
+from quail.logical import SHARED_PRE, Alias, is_score
 from quail.physical import (
     AiFilter,
     AiJoin,
+    AiScore,
     Barrier,
     PhysicalNode,
 )
-from quail.planner import collect_operators, plan_quail
+from quail.planner import plan_quail
 from quail.planner.physical_optimizer import (
     ModelRegion,
     PhysicalCandidate,
     PlanningContext,
     SupportResult,
 )
+from quail.planner.plan import Refusal
+from quail.planner.reranker import plan_reranker
+from quail.specs import RERANKER_MODEL_NAMES
 
 
 class QuailModelExecution:
@@ -35,6 +41,7 @@ class QuailModelExecution:
     def __init__(self, context: GpuContext):
         self.context = context
         self._state: dict[str, Any] = {}
+        self._reranker: RerankerModelExecution | None = None
 
     @property
     def state(self) -> Mapping[str, Any]:
@@ -58,10 +65,31 @@ class QuailModelExecution:
         node: PhysicalNode,
         inputs: Mapping[str, Any],
     ) -> Any:
+        if isinstance(node, AiScore):
+            execution = self._reranker_execution(inputs["documents"])
+            if "score_rows" in inputs:
+                return execution.execute_rows(node, inputs["score_rows"])
+            return execution.execute(node, inputs["score_inputs"])
         if not isinstance(node, (AiFilter, AiJoin)):
             raise TypeError(
                 f"Quail cannot execute physical node {node.type_name!r}")
         return self._execute_quail_node(node, inputs)
+
+    def _reranker_execution(self, documents) -> RerankerModelExecution:
+        """Return the reranker bound to this query's document tokens."""
+        execution = self._reranker
+        if execution is None or execution.documents is not documents:
+            execution = RerankerModelExecution(GpuContext(
+                gpu_index=self.context.gpu_index,
+                gpu_count=self.context.gpu_count,
+                model=self.context.model, device=self.context.device,
+                query_settings={
+                    "documents": documents,
+                    "reranker": QuailScorer(self._state),
+                },
+            ))
+            self._reranker = execution
+        return execution
 
     def _execute_quail_node(
         self,
@@ -256,12 +284,13 @@ class QuailBackend:
     runtime_package = "vllm==0.26.0"
 
     def supports(self, model, device, gpu_count: int) -> SupportResult:
-        if model.name not in {"qwen3-4b-fp8", "qwen3-32b-fp8"}:
-            return SupportResult.reject(
-                f"Quail does not support model {model.name!r}")
         if device.name not in {"h100-sxm", "rtx-pro-6000-blackwell-server"}:
             return SupportResult.reject(
                 f"Quail does not support device {device.name!r}")
+        generative = {"qwen3-4b-fp8", "qwen3-32b-fp8"}
+        if model.name not in generative | set(RERANKER_MODEL_NAMES):
+            return SupportResult.reject(
+                f"Quail does not support model {model.name!r}")
         if gpu_count not in {1, 2, 4, 8}:
             return SupportResult.reject(
                 "Quail requires 1, 2, 4, or 8 GPUs")
@@ -272,6 +301,39 @@ class QuailBackend:
         region: ModelRegion,
         context: PlanningContext,
     ) -> tuple[PhysicalCandidate, ...]:
+
+        operators = region.logical_plan.operators()
+        has_score = any(
+            is_score(predicate.expression)
+            for predicates in operators.filters.values()
+            for predicate in predicates
+        ) or any(is_score(join.predicate) for join in operators.joins) or any(
+            isinstance(expression, Alias)
+            for expression in region.logical_plan.root.columns
+        )
+        if context.model.name in RERANKER_MODEL_NAMES:
+            if not has_score:
+                refusal = Refusal(
+                    reasons=("a reranker model needs AI.SCORE",),
+                    constraint="reranker_needs_score",
+                    needed=1,
+                    available=0,
+                    unit="AI.SCORE expressions",
+                )
+                return (PhysicalCandidate(None, refusal, float("inf")),)
+            return plan_reranker(region, context, backend_name=self.name)
+        if has_score:
+            refusal = Refusal(
+                reasons=(
+                    "AI.SCORE requires a reranker model such as "
+                    "qwen3-reranker-0.6b-bf16",
+                ),
+                constraint="score_needs_reranker",
+                needed=1,
+                available=0,
+                unit="reranker models",
+            )
+            return (PhysicalCandidate(None, refusal, float("inf")),)
 
         plan = plan_quail(
             region.logical_plan,
@@ -305,7 +367,8 @@ class QuailBackend:
     def _bind_runtime_data(self, plan, region, context):
         """Put tokenized prompts and answer tokens in the physical plan."""
         tokenizer = context.tokenizer
-        _, filters, joins = collect_operators(region.logical_plan)
+        operators = region.logical_plan.operators()
+        filters, joins = operators.filters, operators.joins
         encoded_nodes = []
         for node in plan.nodes:
             if isinstance(node, AiFilter):
@@ -320,7 +383,7 @@ class QuailBackend:
             elif isinstance(node, AiJoin):
                 stages = []
                 for stage in node.stages:
-                    prompt = joins[stage.written_pos].predicate
+                    prompt = joins[stage.written_pos].prompt
                     runtime_ids = {
                         alias: (tuple(label), tuple(frame))
                         for alias, label, frame in prompt.label_token_ids
@@ -348,11 +411,7 @@ class QuailBackend:
                 tokens = tokenizer(word)
                 if tokens:
                     false_ids.add(tokens[0])
-        prompts = [
-            predicate.prompt
-            for predicates in filters.values()
-            for predicate in predicates
-        ] + [logical_join.predicate for logical_join in joins]
+        prompts = operators.prompts
         pre_ids = (
             list(tokenizer(SHARED_PRE)) if tokenizer is not None else
             list(prompts[0].preamble_token_ids) if prompts else []

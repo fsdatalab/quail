@@ -317,9 +317,13 @@ class QueryResult:
                 for batch in indices:
                     arrays = []
                     for alias, values in self._projection:
-                        selected = pc.take(
-                            values, batch.column(batch.schema.get_field_index(
-                                alias)))
+                        column = batch.column(
+                            batch.schema.get_field_index(alias))
+                        # a computed column such as a score is carried as is
+                        selected = (
+                            column if values is None
+                            else pc.take(values, column)
+                        )
                         if isinstance(selected, pa.ChunkedArray):
                             selected = selected.combine_chunks()
                         arrays.append(selected)

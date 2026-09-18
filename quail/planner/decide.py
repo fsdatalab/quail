@@ -8,14 +8,8 @@ from quail.cost.sol import speed_of_light, unrounded_seconds
 from quail.cost.work import Work, ask, scan
 from quail.logical import (
     DEFAULT_SELECTIVITY,
-    Apply,
     CompileError,
-    Join,
     LogicalPlan,
-    Project,
-    Scan,
-    SemanticFilter,
-    SemanticJoin,
     effective_selectivity,
     join_conditions,
     oriented_join_conditions,
@@ -52,40 +46,6 @@ from quail.specs import DeviceSpec, ModelSpec
 
 # ---------------------------------------------------------- tree walk
 
-def collect_operators(plan: LogicalPlan):
-    """Return (scans, filters_by_alias, joins_in_written_order)."""
-    scans, filters, joins = [], {}, []
-
-    def walk(node):
-        if isinstance(node, Project):
-            walk(node.input)
-        elif isinstance(node, SemanticJoin):
-            for child in node.inputs:
-                walk(child)
-            joins.append(node)
-        elif isinstance(node, Join):
-            walk(node.left)
-            walk(node.right)
-        elif isinstance(node, Apply):
-            walk(node.input)
-        elif isinstance(node, SemanticFilter):
-            walk(node.input)
-            filters[node.input.alias] = list(node.predicates)
-        elif isinstance(node, Scan):
-            scans.append(node)
-        else:
-            for child in node.children():
-                walk(child)
-
-    walk(plan.root)
-    return scans, filters, joins
-
-
-def collect_applies(plan: LogicalPlan) -> list:
-    """Return the Apply nodes of a plan, children before parents."""
-    return [node for node in plan.walk() if isinstance(node, Apply)]
-
-
 def _question_tokens(prompt) -> int:
     """Token count of the prompt's per-evaluation tail."""
     if prompt.tail_tokens is None or prompt.preamble_tokens is None:
@@ -102,8 +62,8 @@ def preamble_tokens(filters, joins) -> int:
             if p.prompt.preamble_tokens is not None:
                 return p.prompt.preamble_tokens
     for j in joins:
-        if j.predicate.preamble_tokens is not None:
-            return j.predicate.preamble_tokens
+        if j.prompt.preamble_tokens is not None:
+            return j.prompt.preamble_tokens
     return 0
 
 
@@ -197,12 +157,12 @@ def order_filters(predicates, rule: str, *, prefix_tokens: float,
 
 def _join_aliases(join) -> list:
     """Return the join's table aliases in placeholder order."""
-    return [r.alias for r in join.predicate.args]
+    return [r.alias for r in join.prompt.args]
 
 
 def _label_counts(join) -> dict:
     """Return alias -> (block_label_tokens, anchor_frame_tokens)."""
-    out = {a: (lt, nt) for a, lt, nt in join.predicate.labels}
+    out = {a: (lt, nt) for a, lt, nt in join.prompt.labels}
     if any(lt is None for lt, _ in out.values()):
         raise ValueError(
             "join prompts were bound without a tokenizer; the planner "
@@ -228,7 +188,7 @@ def join_specs(joins, pair_fractions=None) -> list:
             semantics=j.semantics, selectivity=j.selectivity,
             frame_tokens={a: nt for a, (lt, nt) in labels.items()},
             label_tokens={a: lt for a, (lt, nt) in labels.items()},
-            tail_tokens=_question_tokens(j.predicate),
+            tail_tokens=_question_tokens(j.prompt),
             on=[(c.left.alias, c.left.column, c.right.alias, c.right.column)
                 for c in conditions],
             pair_fraction=(pair_fractions.get(i, 1.0) if conditions
@@ -388,8 +348,9 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
         pair_fractions: join written position -> the fraction of the
             cross product its equality conditions keep.
     """
-    scans, filters, joins = collect_operators(plan)
-    applies = collect_applies(plan)
+    operators = plan.operators()
+    scans, filters, joins = operators.scans, operators.filters, operators.joins
+    applies = operators.applies
     alias_applies = {}
     join_applies = {}
     for apply in applies:

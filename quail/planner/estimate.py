@@ -27,7 +27,6 @@ from quail.cost.work import Work, ask, scan, triangle
 from quail.execution.pairs import pair_table
 from quail.logical import oriented_join_conditions
 from quail.planner.decide import (
-    collect_operators,
     default_order_rule,
     order_filters_indexed,
     preamble_tokens,
@@ -184,8 +183,10 @@ class _Search:
         self.chunk_tokens = chunk_tokens
         self.credit_shared = credit_shared
         stores = query.token_inputs()
-        self.scans, self.filters, self.joins = collect_operators(
-            query.logical)
+        operators = query.logical.operators()
+        self.scans, self.filters, self.joins = (
+            operators.scans, operators.filters, operators.joins
+        )
         self.order = query.order
         self.pre = preamble_tokens(self.filters, self.joins)
         self.aliases: dict[str, _AliasData] = {}
@@ -403,7 +404,7 @@ class _Search:
         edge_relations = []
         edge_aliases = []
         for join in joins:
-            stage_aliases = tuple(arg.alias for arg in join.predicate.args)
+            stage_aliases = tuple(arg.alias for arg in join.prompt.args)
             if join.semantics != "full":
                 raise NotImplementedError(
                     "the speed of light search needs full join semantics")
@@ -419,7 +420,7 @@ class _Search:
                 for right_row in base_rows[right]
                 if (allowed is None or right_row in allowed.get(left_row, ()))
                 and self.answer(
-                    join.predicate, {left: left_row, right: right_row})
+                    join.prompt, {left: left_row, right: right_row})
             )
             edge_relations.append(PairRelation(left, right, passing))
             edge_aliases.append(frozenset((left, right)))
@@ -468,17 +469,17 @@ class _Search:
                 join = joins[edge_index]
                 relation = edge_relations[edge_index]
                 stage_aliases = tuple(
-                    arg.alias for arg in join.predicate.args)
+                    arg.alias for arg in join.prompt.args)
                 for anchor in stage_aliases:
                     if not self.anchor_fits(
-                            join.predicate, anchor, stage_aliases, live):
+                            join.prompt, anchor, stage_aliases, live):
                         continue
                     partners = [alias for alias in stage_aliases
                                 if alias != anchor]
                     allowed = self.allowed_pairs.get(edge_index, {}).get(
                         anchor)
                     stage_work = self.join_stage_work(
-                        anchor, partners, live, join.predicate,
+                        anchor, partners, live, join.prompt,
                         live[anchor] if anchor in cached_now else (),
                         self.cross_resident(anchor, live, cached_now),
                         allowed=allowed,
@@ -492,7 +493,7 @@ class _Search:
                         if (left_row, right_row) in relation.pairs
                     )
                     step = {
-                        "template": join.predicate.template,
+                        "template": join.prompt.template,
                         "written_pos": edge_index,
                         "added_alias": added,
                         "aliases": list(stage_aliases),

@@ -11,10 +11,23 @@ page will be updated as new configurations become available.
 | --- | --- | --- | --- |
 | Qwen3 4B | `"qwen3-4b-fp8"` | 4B | FP8 weights, BF16 KV |
 | Qwen3 32B | `"qwen3-32b-fp8"` | 32B | FP8 weights, BF16 KV |
+| Qwen3 Reranker 0.6B | `"qwen3-reranker-0.6b-bf16"` | 0.6B | BF16 |
+| Qwen3 Reranker 4B | `"qwen3-reranker-4b-bf16"` | 4B | BF16 |
 
-Both models use the same Quail execution engine, including
+The generation models use the Quail execution engine, including
 DeepGEMM for matrix multiplications and FlashAttention 3 for
 attention.
+
+The reranker models use the same Quail executor for `AI.SCORE`.
+Weights, activations, and KV use BF16. The final `yes` and `no`
+projection and score normalization use FP32. Each input produces
+one score between 0 and 1 without generating tokens.
+
+Quail tokenizes each document once and the fixed prompt text
+separately, then joins the token lists. Where the prompt text meets
+a document, the tokens can differ from tokenizing the joined string,
+so a score can differ slightly from the reference implementation.
+Scores near a threshold can select different rows.
 
 ## GPUs
 
