@@ -6,8 +6,9 @@
   vector content when zoomed.
 - The setup was Qwen3 4B FP8, sf=0.1, lf=1, and one H100 per configuration.
   Quail and the vLLM configurations shared a physical GPU within each
-  family. Stock vLLM used operator-at-a-time submission; the other two
-  pipeline their requests.
+  family. Stock vLLM used operator-at-a-time submission. Pipelined stock
+  vLLM advances each document through filter stages independently, then
+  starts the join after all filters finish.
 - BioDEX uses non-thinking chat prompts and newly generated Qwen3 32B
   reference labels. BIO-1 and BIO-3 filter for serious adverse events.
   Quail and pipelined stock vLLM were rerun on September 18:
@@ -33,7 +34,11 @@
 - Quail was faster than stock vLLM on 28 of 30 queries
   where both were measured.
 - A horizontal line across each query's bar group shows its SoL estimate.
-  SoL models ideal computation and memory traffic with unlimited prefix KV.
+  SoL means speed of light. It estimates ideal GPU time by dividing
+  arithmetic and memory traffic by the hardware's peak rates. For each
+  model component, it takes the larger time, then adds component times.
+  It assumes ideal batching and unlimited retained KV, and excludes
+  startup and software scheduling overhead.
   It credits matching token prefixes across requests, documents, and aliases.
   It uses exact reference-label survivors and searches supported left-deep
   join plans. Different answers can change the work done by measured runs,
@@ -165,6 +170,10 @@ Figure: plots/quailb_bio.pdf
 | BIO-3 | r (reports) = 500, m (terms) = 1,127 |
 
 Quail was 1.13x, 4.99x, 4.75x faster than pipelined stock vLLM on BIO-1, BIO-2, and BIO-3, respectively.
+
+Pipelined stock vLLM's BIO-2 time decreased from the September 12
+run despite processing more fresh tokens. The cause is unknown;
+the runs do not isolate prompt changes from other execution changes.
 
 BIO-3 filter survivors: 362 in the reference, 349 in Quail, and 350 in pipelined stock vLLM.
 
