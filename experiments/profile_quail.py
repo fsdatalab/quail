@@ -387,7 +387,7 @@ class LoopRecorder:
         record, launches, idx = self._phase
         if self.profiler is not None:
             self.profiler.on_chunk(idx, self.chunk_seq)
-        launches.append((self._now(), chunk["tokens"]))
+        launches.append((self._now(), chunk.tokens))
         self._phase = (record, launches, idx + 1)
         self.chunk_seq += 1
         return self._orig["forward"](chunk)
@@ -452,11 +452,10 @@ class LoopRecorder:
     def _run_join(self, torch, arena, pipeline, async_ans,
                   anchor_prefixes, stage_suffixes, budget, **kw):
         keys = kw.get("anchor_keys") or list(range(len(anchor_prefixes)))
-        owned = self.arena.accounting.owned
         kv = dict(anchors=len(keys), hits=0, hit_tokens=0,
                   regret_tokens=0, first_tokens=0)
         for key, prefix in zip(keys, anchor_prefixes):
-            if key in owned:
+            if self.arena.is_resident(key):
                 kv["hits"] += 1
                 kv["hit_tokens"] += len(prefix)
             elif key in self.seen:

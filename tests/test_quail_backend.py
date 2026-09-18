@@ -62,6 +62,37 @@ class FakeArena:
         self.evicted_pages = 0
         self.evicted_prefix_tokens = 0
 
+    @property
+    def n_pages(self):
+        return self.accounting.n_pages
+
+    @property
+    def retained_pages(self):
+        return self.accounting.retained_pages
+
+    @property
+    def retained_prefix_tokens(self):
+        return self.accounting.retained_prefix_tokens
+
+    @property
+    def retention_cap_pages(self):
+        return self.accounting.retention_cap_pages
+
+    def pages_needed(self, tokens):
+        return self.accounting.pages_needed(tokens)
+
+    def configure_retention(self, policy, cap_pages):
+        self.accounting.configure_retention(policy, cap_pages)
+
+    def is_resident(self, key):
+        return key in self.accounting.owned
+
+    def resident_keys(self):
+        return list(self.accounting.owned)
+
+    def retained_keys(self):
+        return list(self.accounting.retained)
+
     def free_key(self, key):
         self.accounting.owned.discard(key)
         self.accounting.retained.discard(key)
