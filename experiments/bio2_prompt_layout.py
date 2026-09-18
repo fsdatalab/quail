@@ -169,7 +169,10 @@ def _measure_one(directory: str, layout: str, connection) -> None:
     record = {"layout": layout}
     try:
         import quail.backends.request as request_module
-        from quail.bench.process_isolation import run_backend_group
+        from quail.bench.process_isolation import (
+            run_backend_group,
+            visible_gpu_uuids,
+        )
 
         original_join = request_module.run_join_grouped
         calls = []
@@ -204,8 +207,14 @@ def _measure_one(directory: str, layout: str, connection) -> None:
                 "anchor_prefix_tokens": sum(len(p) for p in layout_prefixes),
                 "partner_suffix_tokens": sum(len(s) for s in layout_suffixes),
                 "capacity": client.capacity,
+                "gpu_uuids": list(visible_gpu_uuids()),
             })
             calls.append(record)
+            (root / "join.json").write_text(json.dumps(record, indent=2))
+            # Sent now: the runner's scoring rejects the layout it did not
+            # render (fresh tokens below the minimum of its own prompts).
+            connection.send(("ok", record))
+            connection.close()
             return result
 
         request_module.run_join_grouped = measured_join
@@ -217,14 +226,14 @@ def _measure_one(directory: str, layout: str, connection) -> None:
         )
         if len(calls) != 1:
             raise RuntimeError(f"expected one join run, got {len(calls)}")
-        record["gpu_uuids"] = suite["gpu_uuids"]
-        connection.send(("ok", record))
+        record["benchmark_status"] = suite["suites"]["pipelined_vllm"].get(
+            "status")
     except BaseException:
         (root / "error.txt").write_text(traceback.format_exc())
-        connection.send(("error", traceback.format_exc()))
+        if not calls:
+            connection.send(("error", traceback.format_exc()))
+            connection.close()
         raise
-    finally:
-        connection.close()
 
 
 def _run_child(root: Path, name: str, layout: str) -> dict:
