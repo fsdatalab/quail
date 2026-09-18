@@ -11,9 +11,13 @@ from __future__ import annotations
 
 import re
 
-# Fixed preamble before every document. A formatting label, not an
-# instruction; instruction text here biases short-document completions.
-SHARED_PRE = "DOCUMENT:\n"
+# These wrappers match Qwen3 apply_chat_template(enable_thinking=False).
+# The user message stays open across the reusable document prefix.
+CHAT_PREFIX = "<|im_start|>user\n"
+CHAT_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+PROMPT_FORMAT = "qwen3-chat-nonthinking-v1"
+DOCUMENT_PRE = "DOCUMENT:\n"
+SHARED_PRE = CHAT_PREFIX + DOCUMENT_PRE
 
 # Fixed strings for join prompt layout.
 JOIN_DOC_LABEL = "\n\nDOCUMENT {}:\n"      # each partner block
@@ -24,7 +28,7 @@ TASK_INSTRUCTION = (
     f"{DATA_PROCESSING_INSTRUCTION} "
     "Evaluate TRUE or FALSE for the following question: "
 )
-ANSWER_CUE = "\nANSWER:"
+ANSWER_CUE = "\nANSWER:" + CHAT_SUFFIX
 
 
 def _marker(placeholder: int) -> str:
@@ -64,7 +68,7 @@ def split_frame(template: str) -> tuple[str, str]:
             f"a brace that is not a placeholder: {tail[:40]!r}")
     frame = user_pre.strip()
     rest = tail[m.end():]
-    return frame, (SHARED_PRE + m.group(0)
+    return frame, (DOCUMENT_PRE + m.group(0)
                    + (f"\n\n{frame}" if frame else "") + rest)
 
 
@@ -85,7 +89,7 @@ def render_filter_prompt(template: str, document: str) -> str:
     m = re.match(r"(\{\d+\})(.*)", tail, re.DOTALL)
     if m is None or not tail.startswith("{0}"):
         raise ValueError(f"unexpected filter template layout: {template!r}")
-    return preamble + document + render_filter_question(m.group(2))
+    return CHAT_PREFIX + preamble + document + render_filter_question(m.group(2))
 
 
 def join_label(placeholder: int) -> str:

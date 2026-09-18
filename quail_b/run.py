@@ -13,6 +13,7 @@ import pyarrow.parquet as pq
 from quail_b._files import download_cache
 from quail_b.benchmark import load_benchmark
 from quail_b.minimum import token_metrics
+from quail_b.rendering import PROMPT_FORMAT
 from quail_b.scoring import (
     RunOutput,
     corpus_ids,
@@ -70,6 +71,7 @@ def _query_hash(spec):
                 "on": operator.on,
             })
     definition = {
+        "prompt_format": PROMPT_FORMAT,
         "substrait_version": [
             plan.version.major_number,
             plan.version.minor_number,

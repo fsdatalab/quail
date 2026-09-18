@@ -62,12 +62,13 @@ class PredicateLabels:
     """
 
     def __init__(self, key: str, label_set_id: str, predicate: dict,
-                 answers, source_rows: dict[str, int]):
+                 answers, source_rows: dict[str, int], predicate_payload=None):
         self.key = key
         self.label_set_id = label_set_id
         self.predicate = predicate
         self.table = _answer_table(answers)
         self.source_rows = source_rows
+        self.predicate_payload = predicate_payload
 
     @cached_property
     def answers(self) -> dict[tuple[str, str | None], bool]:
@@ -149,7 +150,8 @@ def _read_many(root, paths: list[str]) -> dict[str, bytes]:
 
 def _choose_collection(root, scale_factor: float,
                        corpus_id: str | None,
-                       collection_id: str | None) -> tuple[str, dict]:
+                       collection_id: str | None,
+                       prompt_format: str | None = None) -> tuple[str, dict]:
     if collection_id:
         path = (f"{GROUND_TRUTH_ROOT}/collections/{collection_id}"
                 "/manifest.json")
@@ -164,6 +166,11 @@ def _choose_collection(root, scale_factor: float,
                        "/active_collection.json")
         corpus_files = _list_files(root,
             f"{GROUND_TRUTH_ROOT}/corpora/{corpus_id}")
+        if prompt_format:
+            format_path = (f"{GROUND_TRUTH_ROOT}/corpora/{corpus_id}/"
+                           f"active_collection.{prompt_format}.json")
+            if format_path in corpus_files:
+                active_path = format_path
         if active_path in corpus_files:
             active = _read_json(root, active_path)
             active_id = active["collection_id"]
@@ -214,7 +221,8 @@ def _choose_collection(root, scale_factor: float,
 def load_ground_truth(root=None, scale_factor: float = 0.1,
                       corpus_id: str | None = None,
                       collection_id: str | None = None,
-                      templates=None) -> GroundTruthCollection:
+                      templates=None, *,
+                      prompt_format: str | None = None) -> GroundTruthCollection:
     """Load labels from the public bucket or a local root directory.
 
     Args:
@@ -224,9 +232,10 @@ def load_ground_truth(root=None, scale_factor: float = 0.1,
         collection_id: The collection, or None for the active one.
         templates: Prompt templates whose label sets to load, or None
             for every label set of the collection.
+        prompt_format: Prefer the active collection for this prompt format.
     """
     _path, collection = _choose_collection(
-        root, scale_factor, corpus_id, collection_id)
+        root, scale_factor, corpus_id, collection_id, prompt_format)
     return _load_ground_truth_collection(root, collection, templates)
 
 
@@ -395,6 +404,7 @@ def _load_ground_truth_collection(root, collection: dict, templates=None
                 [data_bytes[path] for path in data_paths[key]],
                 key, label_set_id, manifest["rows"]),
             source_rows=manifest["source_rows"],
+            predicate_payload=manifest.get("predicate_payload"),
         )
     summary = collection.get("summary", {})
     return GroundTruthCollection(

@@ -29,7 +29,7 @@ def _cached_file(root, path):
     """Cache immutable published files; always refresh active collection pointers."""
     if root is not None and not str(root).startswith("s3://"):
         return None
-    if path.endswith("active_collection.json"):
+    if Path(path).name.startswith("active_collection."):
         return None
     filesystem, _, source = _location(root, path)
     directory = _cache_dir.get() or os.environ.get("QUAIL_B_CACHE_DIR")

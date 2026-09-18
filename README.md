@@ -145,10 +145,7 @@ The benchmark evaluates 33 queries across 5 datasets:
 | SWE-Next | 2 | `agent_traces` | Software engineering agent trajectory evaluation |
 
 BIO-1 selects reports describing a serious or life-threatening adverse event.
-BIO-3 applies that filter before joining reports to reaction terms. The filter
-keeps 319 of the 500 reports at scale 0.1 according to the saved Qwen3 32B fp8
-reference labels. Results from the earlier patient-demographic filter are a
-different query definition and must not be compared with these queries.
+BIO-3 applies that filter before joining reports to reaction terms.
 
 Queries use two LLM-powered relational operators:
 

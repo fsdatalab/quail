@@ -177,6 +177,8 @@ def predicate_payload(spec: PredicateSpec) -> dict:
         "render": render,
         "shared_preamble": SHARED_PRE,
         "task_instruction": rendering.TASK_INSTRUCTION,
+        "answer_cue": rendering.ANSWER_CUE,
+        "prompt_format": rendering.PROMPT_FORMAT,
     }
 
 

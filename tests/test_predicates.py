@@ -45,16 +45,18 @@ def test_stable_ids_cover_predicate_semantics_and_inputs():
 
 
 def test_filter_and_join_prompts_use_the_engine_layout():
+    from quail_b.rendering import ANSWER_CUE, SHARED_PRE
+
     filter_prompt = render_filter_prompt(PREDICATES[0], "review text")
-    assert filter_prompt.startswith("DOCUMENT:\nreview text")
+    assert filter_prompt.startswith(SHARED_PRE + "review text")
     assert "Evaluate TRUE or FALSE" in filter_prompt
-    assert filter_prompt.endswith("\nANSWER:")
+    assert filter_prompt.endswith(ANSWER_CUE)
 
     join_prompt = render_join_prompt(PREDICATES[3], "review", "aspect")
-    assert join_prompt.startswith("DOCUMENT:\nreview")
+    assert join_prompt.startswith(SHARED_PRE + "review")
     assert "(The document above is DOCUMENT {0}.)" in join_prompt
     assert "DOCUMENT {1}:\naspect" in join_prompt
-    assert join_prompt.endswith("\nANSWER:")
+    assert join_prompt.endswith(ANSWER_CUE)
 
 
 def test_biodex_replacement_matches_saved_reference_identity(monkeypatch):
@@ -64,6 +66,9 @@ def test_biodex_replacement_matches_saved_reference_identity(monkeypatch):
         payload = predicate_payload(spec)
         # Historical labels predate task instructions in predicate identities.
         del payload["task_instruction"]
+        del payload["answer_cue"]
+        del payload["prompt_format"]
+        payload["shared_preamble"] = "DOCUMENT:\n"
         return payload
 
     monkeypatch.setattr(predicates, "predicate_payload", historical_payload)
@@ -84,5 +89,15 @@ def test_task_instruction_changes_label_identity(monkeypatch):
         rendering, "TASK_INSTRUCTION",
         "Evaluate TRUE or FALSE for the following question: ",
     )
+    previous = label_set_identity(spec, "c_one", "1" * 64)
+    assert current["label_set_id"] != previous["label_set_id"]
+
+
+def test_chat_suffix_changes_label_identity(monkeypatch):
+    from quail_b import rendering
+
+    spec = PREDICATES[0]
+    current = label_set_identity(spec, "c_one", "1" * 64)
+    monkeypatch.setattr(rendering, "ANSWER_CUE", "\nANSWER:")
     previous = label_set_identity(spec, "c_one", "1" * 64)
     assert current["label_set_id"] != previous["label_set_id"]
