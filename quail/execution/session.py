@@ -153,14 +153,16 @@ class Session:
     def sql(self, text: str, order: str | None = None,
             dialect: SQLDialect | str = SQLDialect.SNOWFLAKE) -> "Query":
         logical = compile_sql(
-            text, self.catalog, self.tokenizer, dialect=dialect
+            text, self.catalog, self.tokenizer, dialect=dialect,
+            turn=self.model.turn,
         )
         return Query(self, logical, order=order)
 
     def docs(self, name: str) -> "BoundBuilder":
         return BoundBuilder(self,
                             BuilderQuery(self.catalog, name,
-                                         self.tokenizer))
+                                         self.tokenizer,
+                                         turn=self.model.turn))
 
     @property
     def tokenizer(self):

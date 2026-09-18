@@ -46,9 +46,12 @@ def chunk_memory_bound(model: ModelSpec, device: DeviceSpec) -> int:
 def chunk_budget(model: ModelSpec, device: DeviceSpec) -> int:
     """Effective chunk budget, floored at the compute knee.
 
-    The budget is min(memory bound, kernel index cap) before the floor.
+    The budget is min(memory bound, kernel index cap, the spec's own
+    cap when it has one) before the floor.
     """
     b = min(chunk_memory_bound(model, device), kernel_index_cap(model))
+    if model.chunk_cap_tokens:
+        b = min(b, model.chunk_cap_tokens)
     return max(b, int(compute_knee(model, device)))
 
 

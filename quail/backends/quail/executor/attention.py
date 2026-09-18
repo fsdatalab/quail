@@ -15,7 +15,9 @@ unfused equivalents. torch is imported lazily.
 A forward loop, in models/<arch>.py, calls four primitives: norm_quant,
 qk_norm_rope, attention, and activation_quant. Each picks the kernel
 set and the precision path itself; the attention path comes with the
-Chunk that pack_chunk built.
+Chunk that pack_chunk built. A loop whose layers differ in head
+geometry calls attention_unified directly with (rows, heads, dim)
+tensors, its own softmax scale, and its sliding window.
 
 The fused qk_norm_rope kernel assumes per-head Q and K RMSNorm before
 rotary, as Qwen3 has.
@@ -442,7 +444,7 @@ class Engine:
         """
         assert k3.is_contiguous() and v3.is_contiguous()
         n = src.shape[0]
-        row = self.num_kv_heads * self.head_dim
+        row = k3.shape[1] * k3.shape[2]
         k_pool, v_pool = self.arena.layer_kv(layer)
         self._triton_kernels()["kv_scatter"][(n,)](
             k3, v3, k_pool, v_pool, src, dst,
@@ -496,38 +498,50 @@ class Engine:
     def attention(self, q, k, v, chunk):
         """Attention over the chunk and the arena; the quantized o_proj input.
 
-        The chunk carries the path it was packed for.
-        """
-        if chunk.attention_mode == "merge_quant":
-            if not self.is_fp8:
-                raise ValueError("BF16 forward passes require unified attention")
-            return self.attention_merge_quant(q, k, v, chunk.meta)
-        return self.quant(self.attention_unified(q, k, v, chunk.meta))
-
-    # ---- attention: the two workload paths --------------------------
-
-    def _fa(self, q, k, v, cu_q, cu_k, max_q, max_k, causal,
-            block_table=None, seqused_k=None):
-        # vLLM's FA2 and FA3 both accept 16-token pages and return
-        # LSE as [heads, total_queries] for the merge kernel.
-        from vllm.vllm_flash_attn import flash_attn_varlen_func
-        return flash_attn_varlen_func(
-            q, k, v, max_seqlen_q=max_q, cu_seqlens_q=cu_q,
-            max_seqlen_k=max_k, cu_seqlens_k=cu_k,
-            block_table=block_table, seqused_k=seqused_k,
-            causal=causal, fa_version=self.fa_version, return_softmax_lse=True)
-
-    def attention_merge_quant(self, q, k, v, meta):
-        """The two-call attention path with the fused merge plus FP8 quantize.
-
-        Returns the input pair for o_proj.
+        The chunk carries the path it was packed for. q, k, and v are
+        the flat per-row projections at this engine's head geometry.
         """
         n = q.shape[0]
         H, KH, D = self.num_q_heads, self.num_kv_heads, self.head_dim
         q3 = q.view(n, H, D)
         k3 = k.view(n, KH, D)
         v3 = v.contiguous().view(n, KH, D)
+        if chunk.attention_mode == "merge_quant":
+            if not self.is_fp8:
+                raise ValueError("BF16 forward passes require unified attention")
+            return self.attention_merge_quant(q3, k3, v3, chunk.meta)
+        return self.quant(self.attention_unified(q3, k3, v3, chunk.meta))
+
+    # ---- attention: the two workload paths --------------------------
+
+    def _fa(self, q, k, v, cu_q, cu_k, max_q, max_k, causal,
+            block_table=None, seqused_k=None, softmax_scale=None,
+            window=None):
+        # vLLM's FA2 and FA3 both accept 16-token pages and return
+        # LSE as [heads, total_queries] for the merge kernel.
+        from vllm.vllm_flash_attn import flash_attn_varlen_func
+        extra = {}
+        if softmax_scale is not None:
+            extra["softmax_scale"] = softmax_scale
+        if window is not None:
+            extra["window_size"] = list(window)
+        return flash_attn_varlen_func(
+            q, k, v, max_seqlen_q=max_q, cu_seqlens_q=cu_q,
+            max_seqlen_k=max_k, cu_seqlens_k=cu_k,
+            block_table=block_table, seqused_k=seqused_k,
+            causal=causal, fa_version=self.fa_version,
+            return_softmax_lse=True, **extra)
+
+    def attention_merge_quant(self, q3, k3, v3, meta):
+        """The two-call attention path with the fused merge plus FP8 quantize.
+
+        Takes (rows, heads, dim) tensors and returns the input pair
+        for o_proj. Canvas rows are not packed for this path.
+        """
+        n, H, D = q3.shape
         layer = meta["layer"]
+        if meta.get("canvas") is not None:
+            raise ValueError("canvas rows run the unified attention path")
 
         if meta["kv_src"] is not None:
             self.kv_row_scatter(k3, v3, meta["kv_src"], meta["kv_dst"],
@@ -555,27 +569,51 @@ class Engine:
         meta["layer"] += 1
         return q_out, scales
 
-    def attention_unified(self, q, k, v, meta):
+    def attention_unified(self, q3, k3, v3, meta, *, softmax_scale=None,
+                          window=None):
         """Write current KV to its cache slots, then one causal paged attention call.
 
-        The call reads retained and current KV together.
+        The call reads retained and current KV together. Takes
+        (rows, heads, dim) tensors and returns (rows, heads * dim).
 
         When meta["unified"] is None (no arena pages), falls back to
         a plain varlen causal call with no scatter or paged read.
+
+        Canvas rows (meta["canvas"]) get a second, non-causal call
+        over the same KV: each canvas row sees its whole prompt and
+        every row of its own canvas. Its result replaces the causal
+        call's rows.
+
+        Args:
+            q3: Queries, (rows, heads, dim).
+            k3: Keys, (rows, KV heads, dim), contiguous.
+            v3: Values, (rows, KV heads, dim), contiguous.
+            meta: The chunk's attention bookkeeping from pack_chunk.
+            softmax_scale: Attention logit scale; None is 1/sqrt(dim).
+            window: Sliding window in tokens, or None for full
+                attention. Causal rows see `window` keys behind them;
+                canvas rows see `window` keys on either side.
         """
-        n = q.shape[0]
-        H, KH, D = self.num_q_heads, self.num_kv_heads, self.head_dim
-        q3 = q.view(n, H, D)
-        k3 = k.view(n, KH, D)
-        v3 = v.contiguous().view(n, KH, D)
+        n = q3.shape[0]
         layer = meta["layer"]
         unified = meta["unified"]
+        canvas = meta.get("canvas")
+        behind = None if window is None else (window - 1, 0)
+        around = None if window is None else (window - 1, window - 1)
         if unified is None:
             out, _ = self._fa(
                 q3, k3, v3, meta["cu_a"], meta["cu_a"],
-                meta["max_a"], meta["max_a"], causal=True)
+                meta["max_a"], meta["max_a"], causal=True,
+                softmax_scale=softmax_scale, window=behind)
+            if canvas is not None:
+                q_c = q3.index_select(0, canvas["rows"])
+                out_c, _ = self._fa(
+                    q_c, k3, v3, canvas["cu_q"], meta["cu_a"],
+                    canvas["max_q"], meta["max_a"], causal=False,
+                    softmax_scale=softmax_scale, window=around)
+                out.index_copy_(0, canvas["rows"], out_c)
             meta["layer"] += 1
-            return out.view(n, H * D)
+            return out.view(n, -1)
         if unified["src"].numel():
             self.kv_row_scatter(k3, v3, unified["src"], unified["dst"],
                                 layer)
@@ -587,6 +625,15 @@ class Engine:
         out, _ = self._fa(
             q3, kp, vp, unified["cu_q"], None,
             unified["max_q"], unified["max_used"], causal=True,
-            block_table=unified["table"], seqused_k=unified["used"])
+            block_table=unified["table"], seqused_k=unified["used"],
+            softmax_scale=softmax_scale, window=behind)
+        if canvas is not None:
+            q_c = q3.index_select(0, canvas["rows"])
+            out_c, _ = self._fa(
+                q_c, kp, vp, canvas["cu_q"], None,
+                canvas["max_q"], canvas["max_used"], causal=False,
+                block_table=canvas["table"], seqused_k=canvas["used"],
+                softmax_scale=softmax_scale, window=around)
+            out.index_copy_(0, canvas["rows"], out_c)
         meta["layer"] += 1
-        return out.view(n, H * D)
+        return out.view(n, -1)

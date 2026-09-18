@@ -416,7 +416,8 @@ class QuailBackend:
                     false_ids.add(tokens[0])
         prompts = operators.prompts
         pre_ids = (
-            list(tokenizer(SHARED_PRE)) if tokenizer is not None else
+            list(tokenizer(context.model.turn_prefix + SHARED_PRE))
+            if tokenizer is not None else
             list(prompts[0].preamble_token_ids) if prompts else []
         )
         return replace(

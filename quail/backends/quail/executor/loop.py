@@ -130,7 +130,7 @@ def _staged_token_parts(torch, sequences, total, pinned=True, staging=None):
 # ------------------------------------------------------- chunk packing
 
 def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
-               attention_mode, staging=None):
+               attention_mode, staging=None, canvas=()):
     """Build tensors for one chunk from groups in chunk order.
 
     Each group is a dict with keys:
@@ -145,6 +145,12 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     causal segment (no scatter, no paged read). This only works with
     at most one suffix. Under unified attention a chunk is either all
     paged or all unpaged.
+
+    canvas is the token ids a diffusion model denoises: they follow
+    every suffix as extra rows, and the answer row is the first of
+    them instead of the suffix's last row. Canvas KV goes wherever the
+    suffix's KV goes and is never kept. Canvas rows run the unified
+    path only.
     """
     def stage(name, values, dtype):
         if staging is not None:
@@ -158,10 +164,15 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         raise ValueError(
             "attention_mode must be 'merge_quant' or 'unified', "
             f"got {attention_mode!r}")
+    canvas = tuple(canvas)
+    if canvas and attention_mode != "unified":
+        raise ValueError("canvas rows need the unified attention path")
     t = time.perf_counter() if timing is not None else 0.0
     # unified scatters every fresh row through its own src/dst map, so
     # the cross and kv_writes bookkeeping below is two-call only
     two_call = attention_mode != "unified"
+    canvas_rows = []      # (first row, end row) per canvas
+    canvas_seq = []       # its sequence in the unified paged call
     id_parts, token_count = [], 0
     pos, cu_a, finals = [], [0], []
     suffix_rows = []
@@ -198,9 +209,20 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             id_parts.append(suf)
             token_count += len(suf)
             pos.append(np.arange(f, f + len(suf), dtype=np.int64))
+            if canvas:
+                # the canvas continues the suffix's positions; its
+                # first row carries the answer
+                first = f + len(suf)
+                id_parts.append(canvas)
+                pos.append(np.arange(first, first + len(canvas),
+                                     dtype=np.int64))
+                canvas_rows.append((token_count, token_count + len(canvas)))
+                finals.append(token_count)
+                token_count += len(canvas)
+            else:
+                finals.append(token_count - 1)
             suffix_spans.append((srow, token_count))
             cu_a.append(token_count)
-            finals.append(token_count - 1)
             wst = g.get("write_suffix_tokens", 0)
             if si == 0 and wst and paged and two_call:
                 # the shared question preamble joins the kept KV right
@@ -291,6 +313,8 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                     add_sequence(
                         arena.owned_pages(key),
                         f + sum(e - s for s, e in spans), count)
+                    if canvas:
+                        canvas_seq.append(len(kv_lengths) - 1)
                     continue
 
                 prefix_count = spec["prefix_end"] - r0
@@ -327,6 +351,8 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                     add_sequence(
                         anchor_pages[:full_pages] + temp_pages,
                         f + suffix_tokens, suffix_tokens)
+                    if canvas:
+                        canvas_seq.append(len(kv_lengths) - 1)
 
             if staging is None:
                 table = arena.block_table_rows(kv_page_rows)
@@ -370,9 +396,29 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                          pinned)
     t = _tick(timing, "pack_kv", t)
 
+    canvas_meta = None
+    if canvas_rows:
+        if unified is None and len(canvas_rows) != len(cu_a) - 1:
+            raise ValueError(
+                "the unpaged canvas call pairs one canvas with each "
+                "causal segment; a group without a suffix has none")
+        cu_c = [0]
+        for a, b in canvas_rows:
+            cu_c.append(cu_c[-1] + b - a)
+        canvas_meta = dict(
+            rows=stage("canvas_rows", concatenate(
+                [np.arange(a, b, dtype=np.int64) for a, b in canvas_rows]),
+                torch.int64),
+            cu_q=stage("canvas_cu_q", cu_c, torch.int32),
+            max_q=len(canvas))
+        if unified is not None:
+            seq = stage("canvas_seq", canvas_seq, torch.int64)
+            canvas_meta["table"] = unified["table"].index_select(0, seq)
+            canvas_meta["used"] = unified["used"].index_select(0, seq)
+            canvas_meta["max_used"] = max(kv_lengths[i] for i in canvas_seq)
     meta = dict(
         layer=0, kv_src=kv_src, kv_dst=kv_dst, cross=cross,
-        unified=unified,
+        unified=unified, canvas=canvas_meta,
         cu_a=stage("cu_a", cu_a, torch.int32),
         max_a=max(cu_a[i + 1] - cu_a[i] for i in range(len(cu_a) - 1)))
     out = Chunk(
@@ -466,10 +512,13 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         raise ValueError("anchor_keys must match anchor_prefixes")
     frames = stage_frames or [[] for _ in range(k)]
     mode = join_attention_mode(pipeline.is_fp8)
+    canvas = tuple(getattr(pipeline, "canvas_ids", ()))
 
     if k == 0:
         return [], [], 0
-    frame_max = max(len(f) for f in frames)
+    # a frame entry's canvas rows land in the anchor's pages after the
+    # frame, so the pages cover them
+    frame_max = max(len(f) + (len(canvas) if f else 0) for f in frames)
     resident = {a: len(arena.owned_pages(keys[a])) for a in range(len(keys))
                 if arena.is_resident(keys[a])}
     # Every resident anchor stays available for the whole join while
@@ -487,6 +536,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         anchor_partners={a: partners_of(keys[a]) for a in range(len(keys))},
         temporary_suffix_pages=mode == "unified",
         answer_dtype=async_ans.dtype,
+        canvas_tokens=len(canvas),
     )
     spans = []
     tokens = 0
@@ -566,7 +616,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
                     f=f + len(frame),
                     suffixes=sufs))
         return pack_chunk(torch, arena, specs, attention_mode=mode,
-                          staging=staging)
+                          staging=staging, canvas=canvas)
 
     def settle(anchor):
         if anchor_done is None:
@@ -904,8 +954,10 @@ class FilterStream:
         retain = set() if retain_all else set(retain_survivors)
         if hold_survivors and (retain_all or retain):
             raise ValueError("held survivors are pinned, not retained")
-        stage_tokens = [len(question_ids[0])] \
-            + [len(q) - p for q in question_ids[1:]]
+        canvas = tuple(getattr(pipeline, "canvas_ids", ()))
+        c = len(canvas)
+        stage_tokens = [len(question_ids[0]) + c] \
+            + [len(q) - p + c for q in question_ids[1:]]
         tails = [question_ids[0]] + [q[p:] for q in question_ids[1:]]
         for i, t in enumerate(tails):
             if not t:
@@ -920,8 +972,9 @@ class FilterStream:
             raise ValueError("arena_writes=False needs a single stage")
         self.attention_mode = attention_mode or FILTER_ATTENTION
         unified = self.attention_mode == "unified"
-        # capacity must cover the longest tail past the kept preamble
-        temp_tail = max(0, *(len(q) - p for q in question_ids)) \
+        # capacity must cover the longest tail past the kept preamble,
+        # and the canvas rows that follow it
+        temp_tail = max(0, *(len(q) - p + c for q in question_ids)) \
             if unified and arena_writes else 0
         capacity_extra = p + temp_tail
         if hold_survivors:
@@ -953,6 +1006,7 @@ class FilterStream:
         self.preamble = p
         self.capacity_extra = capacity_extra
         self.tails = tails
+        self.canvas = canvas
         self.spans = []
         self.tokens = 0
         self.chunks = 0
@@ -1068,7 +1122,8 @@ class FilterStream:
         chunk = pack_chunk(self.torch, arena,
                            [self._spec(*g) for g in groups],
                            timing=timing, pinned=self.pinned,
-                           attention_mode=self.attention_mode)
+                           attention_mode=self.attention_mode,
+                           canvas=self.canvas)
         t = _tick(timing, "pack", t)
         self.tokens += chunk.tokens
         torch = self.torch

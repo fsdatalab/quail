@@ -196,19 +196,30 @@ class KVArena:
 
     Per-layer K and V pools of shape (n_pages, page_tokens, n_kv,
     d_head). Torch is imported when the tensor pools are created.
+
+    layer_kv gives each layer its own (n_kv, d_head) when the layers
+    differ, as Gemma 4's sliding and full-attention layers do; every
+    layer then holds the same pages at its own row width.
     """
 
     def __init__(self, n_layers: int, n_pages: int, page_tokens: int,
-                 n_kv: int, d_head: int, dtype=None, device="cuda"):
+                 n_kv: int, d_head: int, dtype=None, device="cuda",
+                 layer_kv=None):
         import torch
         self.torch = torch
         dtype = dtype or torch.bfloat16
         self.accounting = PageArena(n_pages, page_tokens)
-        shape = (n_pages * page_tokens, n_kv, d_head)
-        self.k = [torch.empty(shape, dtype=dtype, device=device)
-                  for _ in range(n_layers)]
-        self.v = [torch.empty(shape, dtype=dtype, device=device)
-                  for _ in range(n_layers)]
+        shapes = ([(n_kv, d_head)] * n_layers if layer_kv is None
+                  else [tuple(shape) for shape in layer_kv])
+        if len(shapes) != n_layers:
+            raise ValueError(
+                f"layer_kv names {len(shapes)} layers, the arena has "
+                f"{n_layers}")
+        rows = n_pages * page_tokens
+        self.k = [torch.empty((rows, heads, dim), dtype=dtype, device=device)
+                  for heads, dim in shapes]
+        self.v = [torch.empty((rows, heads, dim), dtype=dtype, device=device)
+                  for heads, dim in shapes]
         # row indices stay on the host: pageable H2D copies block the
         # CPU behind the running stream
         self._rows = {}       # key -> row-index tensor on CPU

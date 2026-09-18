@@ -135,6 +135,9 @@ class JoinAdmission:
             stage's partner list the anchor streams, or None for the
             whole list. Omitted anchors stream the whole list at every
             stage.
+        canvas_tokens: Rows a diffusion model adds after every suffix
+            and after a frame entry. They take chunk room and page
+            room but are never kept in the anchor's KV.
 
     Each chunk fills in priority order: partner streams cut by the
     previous chunk, then anchors starting their next stage, then
@@ -151,18 +154,21 @@ class JoinAdmission:
     def __init__(self, prefix_tokens, stage_suffixes, chunk_budget,
                  arena_pages, page_tokens, frame_tokens=None,
                  resident=None, anchor_partners=None, temporary_suffix_pages=False,
-                 answer_dtype=None):
+                 answer_dtype=None, canvas_tokens=0):
         self.answer_dtype = answer_dtype
         self._answer_counts = [{} for _ in stage_suffixes]
         self.temporary_suffix_pages = temporary_suffix_pages
         self._page_cums = {}
         self._page_reserve = 0
         self.prefix = []
-        self.stages = [list(s) for s in stage_suffixes]
+        self.stages = [[t + canvas_tokens for t in s] for s in stage_suffixes]
+        # frames: the rows a frame entry keeps in the anchor's KV;
+        # frame_rows: the rows it packs, canvas included
         self.frames = (list(frame_tokens) if frame_tokens
                        else [0] * len(self.stages))
         if len(self.frames) != len(self.stages):
             raise ValueError("frame_tokens must match stage_suffixes")
+        self.frame_rows = [f + canvas_tokens if f else 0 for f in self.frames]
         if not self.stages:
             raise ValueError("a join needs at least one stage")
         self.chunk_budget = chunk_budget
@@ -170,7 +176,7 @@ class JoinAdmission:
         self.page_tokens = page_tokens
         k = len(self.stages)
         self._cum = []
-        for j, (lens, frame) in enumerate(zip(self.stages, self.frames)):
+        for j, (lens, frame) in enumerate(zip(self.stages, self.frame_rows)):
             cum = [0]
             for t in lens:
                 cum.append(cum[-1] + t)
@@ -180,7 +186,7 @@ class JoinAdmission:
                     f"stage {j}: a {frame + max(lens)}-token partner "
                     f"exceeds the {chunk_budget}-token chunk budget "
                     f"(suffixes are atomic)")
-        self._extra = max(self.frames)
+        self._extra = max(self.frame_rows)
         self._lists = []           # per anchor, per stage: indices or None
         self._cums = []            # per anchor, per stage: cumulative sums
         self._page_cost = []
@@ -270,7 +276,7 @@ class JoinAdmission:
             self._stage[a] = _DONE
             self._settled.append(("finished" if k == 1 else "dropped", a))
             return a
-        first = self.frames[0] + self._suffix(a, 0, 0)
+        first = self.frame_rows[0] + self._suffix(a, 0, 0)
         if resident_pages is None and prefix + first > self.chunk_budget:
             raise ValueError(
                 f"anchor {a}: prefix {prefix} tokens leaves no "
@@ -329,11 +335,12 @@ class JoinAdmission:
         for a in self.ready:
             j, i = self._stage[a], self._next[a]
             cum = self._cum_of(a, j)
-            total += (self.frames[j] if i == 0 else 0) + cum[-1] - cum[i]
+            total += (self.frame_rows[j] if i == 0 else 0) + cum[-1] - cum[i]
             if total >= self.chunk_budget:
                 return self.chunk_budget
         for a in self.pending:
-            total += self._carried[a] + self.frames[0] + self._cum_of(a, 0)[-1]
+            total += (self._carried[a] + self.frame_rows[0]
+                      + self._cum_of(a, 0)[-1])
             if total >= self.chunk_budget:
                 return self.chunk_budget
         return total
@@ -341,7 +348,7 @@ class JoinAdmission:
     # ---- chunk building ------------------------------------------------
 
     def _first_cost(self, a, j, i):
-        return self._suffix(a, j, i) + (self.frames[j] if i == 0 else 0)
+        return self._suffix(a, j, i) + (self.frame_rows[j] if i == 0 else 0)
 
     def _suffix_page_cost(self, a, j, i):
         remainder = (self.prefix[a] + self.frames[j]) % self.page_tokens
@@ -350,7 +357,7 @@ class JoinAdmission:
     def _take(self, a, j, i, room, page_room):
         """Return the partner run that fits the token and temporary page budgets."""
         cum = self._cum_of(a, j)
-        frame = self.frames[j] if i == 0 else 0
+        frame = self.frame_rows[j] if i == 0 else 0
         end = bisect_right(cum, cum[i] + room - frame) - 1
         pages = 0
         if self.temporary_suffix_pages:

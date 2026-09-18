@@ -85,7 +85,8 @@ class LoadedGpu:
                              n_pages=arena_tok // budgets.PAGE_TOKENS,
                              page_tokens=budgets.PAGE_TOKENS,
                              n_kv=spec.n_kv, d_head=spec.d_head,
-                             dtype=torch.bfloat16)
+                             dtype=torch.bfloat16,
+                             layer_kv=spec.kv_shapes)
         self.arena_s = time.perf_counter() - t0
 
         t0 = time.perf_counter()

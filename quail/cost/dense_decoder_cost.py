@@ -1,7 +1,10 @@
-"""Dense decoder components used by the roofline calculation.
+"""Decoder components used by the roofline calculation.
 
 Any pre-norm decoder with grouped-query attention and a gated MLP
 is priced from its ModelSpec shape; nothing here is Qwen3-specific.
+A mixture-of-experts model gives its per-layer attention and MLP
+parameter counts on the spec: FLOPs follow the params one token
+multiplies, weight bytes follow the params a full chunk reads.
 """
 
 from __future__ import annotations
@@ -13,6 +16,8 @@ from quail.specs import ModelSpec
 
 def attention_projection_params(model: ModelSpec) -> int:
     """Return Q, K, V, and output projection parameters."""
+    if model.attn_params_per_layer:
+        return model.attn_params_per_layer * model.layers
     h = model.hidden
     head = model.d_head
     per_layer = (
@@ -24,8 +29,17 @@ def attention_projection_params(model: ModelSpec) -> int:
 
 
 def mlp_params(model: ModelSpec) -> int:
-    """Return gate, up, and down projection parameters."""
+    """Return the MLP parameters one token multiplies."""
+    if model.mlp_active_params_per_layer:
+        return model.mlp_active_params_per_layer * model.layers
     return 3 * model.hidden * model.intermediate * model.layers
+
+
+def mlp_weight_params(model: ModelSpec) -> int:
+    """Return the MLP parameters a full chunk reads: every expert."""
+    if model.mlp_total_params_per_layer:
+        return model.mlp_total_params_per_layer * model.layers
+    return mlp_params(model)
 
 
 def dense_params(model: ModelSpec) -> int:
@@ -60,7 +74,7 @@ def dense_decoder_components(work: Work, model: ModelSpec,
         CostComponent(
             name="mlp",
             flops=2.0 * mlp * work.tokens,
-            bytes_moved=mlp * model.w_bytes * passes,
+            bytes_moved=mlp_weight_params(model) * model.w_bytes * passes,
             precision=model.weight_precision,
         ),
         CostComponent(

@@ -147,6 +147,9 @@ def load_model(model_name: str, revision: str | None = None, *,
     _install_single_rank_groups(torch)
     with set_current_vllm_config(config):
         model = get_model(vllm_config=config)
+    # vLLM's fused MoE kernels read the forward context, which is
+    # built from this config
+    model.quail_vllm_config = config
     if answer_token_ids is None:
         from transformers import AutoTokenizer
 

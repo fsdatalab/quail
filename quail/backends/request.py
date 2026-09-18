@@ -231,7 +231,8 @@ def plan_request_backend(
         raise ValueError("request prompts have different preambles")
     preamble = next(iter(preambles), ())
     if not preamble and prompts and context.tokenizer is not None:
-        preamble = tuple(context.tokenizer(SHARED_PRE))
+        preamble = tuple(context.tokenizer(
+            context.model.turn_prefix + SHARED_PRE))
 
     request_node = RequestExecution(
         node_id="request-model",

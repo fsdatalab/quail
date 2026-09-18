@@ -41,16 +41,54 @@ class ModelSpec:
     attention_precision: Precision = "bf16"
     arch: str = "qwen3"    # forward pass in executor/models/<arch>.py
     role: Role = "generative"
+    layer_kv: tuple = ()   # per layer (KV heads, head dim) when layers
+    #                        differ; empty means every layer stores
+    #                        n_kv x d_head
+    canvas_tokens: int = 0    # rows a diffusion model denoises after
+    #                           the answer cue; the answer is read at
+    #                           the first one. 0 for an autoregressive
+    #                           model, which answers at the last
+    #                           prompt row.
+    turn_prefix: str = ""     # chat-turn text before every prompt
+    turn_suffix: str = ""     # chat-turn text after the answer cue
+    attn_params_per_layer: int = 0    # attention projection params of
+    #                                   one layer; 0 derives them from
+    #                                   n_q, n_kv, and d_head
+    mlp_active_params_per_layer: int = 0    # MLP params one token
+    #                                         multiplies per layer; 0
+    #                                         derives them from
+    #                                         intermediate
+    mlp_total_params_per_layer: int = 0     # MLP params a full chunk
+    #                                         reads per layer (every
+    #                                         expert); 0 means active
+    chunk_cap_tokens: int = 0    # upper bound on tokens per chunk; 0
+    #                              leaves the memory and kernel bounds
+
+    @property
+    def kv_shapes(self) -> tuple:
+        """Per layer, the (KV heads, head dim) its KV stores."""
+        if self.layer_kv:
+            if len(self.layer_kv) != self.layers:
+                raise ValueError(
+                    f"layer_kv names {len(self.layer_kv)} layers, "
+                    f"the model has {self.layers}")
+            return tuple(tuple(shape) for shape in self.layer_kv)
+        return ((self.n_kv, self.d_head),) * self.layers
 
     @property
     def kappa(self) -> float:
-        """KV bytes per cached token: 2 * L * n_kv * d_head * kv_bytes."""
-        return 2 * self.layers * self.n_kv * self.d_head * self.kv_bytes
+        """KV bytes per cached token, summed over the layers."""
+        return self.kv_elements_per_token * self.kv_bytes
 
     @property
     def kv_elements_per_token(self) -> int:
-        """KV elements per token, dtype-free: 2 * L * n_kv * d_head."""
-        return 2 * self.layers * self.n_kv * self.d_head
+        """KV elements per token, dtype-free: 2 * sum of n_kv * d_head."""
+        return 2 * sum(n_kv * d_head for n_kv, d_head in self.kv_shapes)
+
+    @property
+    def turn(self) -> tuple[str, str]:
+        """The chat-turn text wrapped around every prompt."""
+        return self.turn_prefix, self.turn_suffix
 
     # W_mem and W_resident are the weight-memory names used throughout
     # the code and the engine wiki.

@@ -172,13 +172,16 @@ def _check_placeholders(template: str, n_args: int) -> None:
             f"each used at least once")
 
 
-def bind_prompt(template: str, args: tuple, tokenizer=None) -> Prompt:
+def bind_prompt(template: str, args: tuple, tokenizer=None,
+                turn: tuple[str, str] = ("", "")) -> Prompt:
     """Build a filter Prompt from a template and column arguments.
 
     Args:
         template: Prompt template with {0}, {1}, ... placeholders.
         args: Column references in placeholder order.
         tokenizer: Optional callable (text -> token list) for counting.
+        turn: The model's chat-turn text: the piece before the
+            preamble and the piece after the answer cue.
     """
     import re
     _check_placeholders(template, len(args))
@@ -190,6 +193,8 @@ def bind_prompt(template: str, args: tuple, tokenizer=None) -> Prompt:
     if m:
         ph, question = m.group(1), m.group(2)
         tail = ph + render_filter_question(question)
+    preamble = turn[0] + preamble
+    tail = tail + turn[1]
     pre_tok = tail_tok = frame_tok = None
     pre_ids = tail_ids = ()
     if tokenizer is not None:
@@ -206,7 +211,8 @@ def bind_prompt(template: str, args: tuple, tokenizer=None) -> Prompt:
 
 
 def bind_score_prompt(template: str, args: tuple,
-                      tokenizer=None) -> Prompt:
+                      tokenizer=None,
+                      turn: tuple[str, str] = ("", "")) -> Prompt:
     """Build an AI.SCORE Prompt that keeps the template as written.
 
     The reranker renders its own layout, with the query text and the
@@ -216,6 +222,7 @@ def bind_score_prompt(template: str, args: tuple,
         template: Prompt template with {0}, and {1} for a pair.
         args: Column references in placeholder order.
         tokenizer: Unused; the planner tokenizes the rendered layout.
+        turn: Unused; the reranker layout carries its own turn text.
     """
     _check_placeholders(template, len(args))
     aliases = [r.alias for r in args]
@@ -227,13 +234,16 @@ def bind_score_prompt(template: str, args: tuple,
 
 
 def bind_join_prompt(template: str, args: tuple,
-                     tokenizer=None) -> Prompt:
+                     tokenizer=None,
+                     turn: tuple[str, str] = ("", "")) -> Prompt:
     """Build a join Prompt with one placeholder per table.
 
     Args:
         template: Prompt template with {0}, {1}, ... placeholders.
         args: Column references in placeholder order (one per table).
         tokenizer: Optional callable (text -> token list) for counting.
+        turn: The model's chat-turn text: the piece before the
+            preamble and the piece after the answer cue.
     """
     _check_placeholders(template, len(args))
     if len(args) < 2:
@@ -247,13 +257,15 @@ def bind_join_prompt(template: str, args: tuple,
             f"mention a table's document again, use its marker in the "
             f"question text, not a second placeholder")
     question = render_join_question(template)
+    preamble = turn[0] + SHARED_PRE
+    tail = ANSWER_CUE + turn[1]
     pre_tok = tail_tok = frame_tok = None
     labels = tuple((a, None, None) for a in aliases)
     pre_ids = tail_ids = ()
     label_ids = ()
     if tokenizer is not None:
-        pre_ids = tuple(tokenizer(SHARED_PRE))
-        tail_ids = tuple(tokenizer(ANSWER_CUE))
+        pre_ids = tuple(tokenizer(preamble))
+        tail_ids = tuple(tokenizer(tail))
         pre_tok = len(pre_ids)
         tail_tok = len(tail_ids)
         frame_tok = len(tokenizer(question))
@@ -269,7 +281,7 @@ def bind_join_prompt(template: str, args: tuple,
             for index, alias in enumerate(aliases)
         )
     return Prompt(template=template, args=tuple(args),
-                  preamble=SHARED_PRE, tail=ANSWER_CUE,
+                  preamble=preamble, tail=tail,
                   preamble_tokens=pre_tok, tail_tokens=tail_tok,
                   frame=question, frame_tokens=frame_tok, labels=labels,
                   preamble_token_ids=pre_ids, tail_token_ids=tail_ids,

@@ -12,11 +12,14 @@ class ModelPipeline:
     """The contract between the chunk loop and one model family.
 
     A subclass sets self.engine and self.max_chunk_tokens in __init__
-    and implements forward_chunk and linears.
+    and implements forward_chunk and linears. A diffusion model also
+    sets canvas_ids: the token ids the loop packs after every suffix,
+    whose first row carries the answer.
     """
 
     engine = None
     max_chunk_tokens = None
+    canvas_ids = ()
 
     def forward_chunk(self, chunk):
         """Return the final-normed hidden state of chunk.final_indices.
