@@ -91,7 +91,7 @@ def _timer(torch, totals, name):
 
 @app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
               volumes=volumes)
-def time_chunk(prediction: str, docs: int = 118, doc_tokens: int = 300,
+def time_chunk(prediction: str, docs: int = 110, doc_tokens: int = 300,
                wide_head_kernel: str = "triton") -> str:
     import torch
 
@@ -195,7 +195,7 @@ def time_chunk(prediction: str, docs: int = 118, doc_tokens: int = 300,
 
 
 @app.local_entrypoint()
-def main(prediction: str = "", docs: int = 118, doc_tokens: int = 300,
+def main(prediction: str = "", docs: int = 110, doc_tokens: int = 300,
          kernels: str = "triton,fa4"):
     if not prediction:
         raise ValueError("pass --prediction before starting")
