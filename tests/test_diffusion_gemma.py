@@ -51,10 +51,11 @@ def test_spec_geometry_and_registration():
     assert QWEN3_4B_FP8.kappa == 147_456.0
     assert SPEC.arch in supported_archs()
     assert QuailBackend().supports(SPEC, H100_SXM, 1).supported
-    assert SPEC.canvas_tokens == 256
-    assert SPEC.turn == ("<bos><|turn>user\n", "<turn|>\n<|turn>model\n")
+    assert SPEC.canvas_tokens == 1
+    assert SPEC.turn == ("<bos><|turn>user\n",
+                         "<turn|>\n<|turn>model\n<|channel>thought\n<channel|>")
     # the model opens its turn with a four-token empty thinking channel
-    assert SPEC.canvas_answer_row == 4
+    assert SPEC.canvas_answer_row == 0
 
 
 def test_spec_budgets_and_moe_costs():

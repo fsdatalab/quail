@@ -49,15 +49,18 @@ DIFFUSION_GEMMA_26B_FP8 = ModelSpec(
     layer_kv=LAYER_KV,
     sliding_window=1024,
     sliding_layers=SLIDING_LAYERS,
-    canvas_tokens=256,     # the checkpoint's canvas_length
+    # With thinking off the model opens its turn with an empty thinking
+    # channel, four tokens: <|channel> thought \n <channel|>. The prompt
+    # prefills that channel and the canvas holds the one answer row.
+    # The checkpoint's canvas_length is 256; on QUAIL-B IMDB the
+    # one-row canvas agrees with the reference within 0.01 of the
+    # 256-row canvas on every query, at 3 to 8 times lower runtime
+    # (runs 20260918T230410Z-cfe73359 and 20260918T155902Z-be7238e7 on
+    # the quail-results volume).
+    canvas_tokens=1,
     turn_prefix="<bos><|turn>user\n",
-    turn_suffix="<turn|>\n<|turn>model\n",
-    # With thinking off the model still opens its turn with an empty
-    # thinking channel, four tokens: <|channel> thought \n <channel|>.
-    # The answer follows at canvas row 4. Prefilling that channel into
-    # the prompt instead made the sampler end the turn at once on 7 of
-    # 16 documents (experiments/diffusion_gemma_confirmation.py).
-    canvas_answer_row=4,
+    turn_suffix="<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+    canvas_answer_row=0,
     attn_params_per_layer=(25 * SLIDING_ATTN + 5 * FULL_ATTN) // 30,
     mlp_active_params_per_layer=DENSE_MLP + 8 * EXPERT,
     mlp_total_params_per_layer=DENSE_MLP + 128 * EXPERT,
@@ -67,22 +70,18 @@ DIFFUSION_GEMMA_26B_FP8 = ModelSpec(
     #                             alone would allow 209k
 )
 
-# The same checkpoint with a 32-row canvas: eight times fewer canvas
-# rows per answer than the checkpoint's 256. The model was trained on
-# 256; QUAIL-B measures what a shorter canvas costs in accuracy.
+# The checkpoint's own 256-row canvas, for reference runs: the model
+# writes its empty thinking channel inside the canvas and the answer
+# is read at canvas row 4.
+DIFFUSION_GEMMA_26B_FP8_CANVAS256 = replace(
+    DIFFUSION_GEMMA_26B_FP8, name="diffusion-gemma-26b-a4b-fp8-canvas256",
+    turn_suffix="<turn|>\n<|turn>model\n",
+    canvas_tokens=256, canvas_answer_row=4)
+
+# Shorter canvases in that layout, as the benchmark measured them.
 DIFFUSION_GEMMA_26B_FP8_CANVAS32 = replace(
-    DIFFUSION_GEMMA_26B_FP8, name="diffusion-gemma-26b-a4b-fp8-canvas32",
-    canvas_tokens=32)
-
-# An 8-row canvas: the model's empty thinking channel (rows 0 to 3),
-# the answer row, and three rows after it.
+    DIFFUSION_GEMMA_26B_FP8_CANVAS256,
+    name="diffusion-gemma-26b-a4b-fp8-canvas32", canvas_tokens=32)
 DIFFUSION_GEMMA_26B_FP8_CANVAS8 = replace(
-    DIFFUSION_GEMMA_26B_FP8, name="diffusion-gemma-26b-a4b-fp8-canvas8",
-    canvas_tokens=8)
-
-# The empty thinking channel prefilled in the prompt and a one-row
-# canvas holding only the answer: the fewest rows an answer can take.
-DIFFUSION_GEMMA_26B_FP8_CANVAS1 = replace(
-    DIFFUSION_GEMMA_26B_FP8, name="diffusion-gemma-26b-a4b-fp8-canvas1",
-    turn_suffix="<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
-    canvas_tokens=1, canvas_answer_row=0)
+    DIFFUSION_GEMMA_26B_FP8_CANVAS256,
+    name="diffusion-gemma-26b-a4b-fp8-canvas8", canvas_tokens=8)

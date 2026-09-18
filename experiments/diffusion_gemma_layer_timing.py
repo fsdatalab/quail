@@ -93,7 +93,8 @@ def _timer(torch, totals, name):
               volumes=volumes)
 def time_chunk(prediction: str, docs: int = 110, doc_tokens: int = 300,
                wide_head_kernel: str = "triton",
-               random_tokens: bool = False) -> str:
+               random_tokens: bool = False, moe_backend: str = "auto",
+               profile: bool = False) -> str:
     import numpy as np
     import torch
 
@@ -107,7 +108,8 @@ def time_chunk(prediction: str, docs: int = 110, doc_tokens: int = 300,
     spec = MODELS[MODEL]
     device = DEVICES["h100-sxm"]
     chunk_tokens = budgets.chunk_budget(spec, device)
-    model = load_model(spec.hf_name, max_batched_tokens=chunk_tokens)
+    model = load_model(spec.hf_name, max_batched_tokens=chunk_tokens,
+                       moe_backend=moe_backend)
     full_pages, sliding_pages = budgets.arena_pages(spec, device, chunk_tokens)
     arena = KVArena(n_layers=spec.layers, n_pages=full_pages,
                     page_tokens=budgets.PAGE_TOKENS, n_kv=spec.n_kv,
@@ -153,6 +155,24 @@ def time_chunk(prediction: str, docs: int = 110, doc_tokens: int = 300,
     rows, plain_s = run()
     print(f"{wide_head_kernel}: {rows} rows in {plain_s:.2f} s, "
           f"{rows / plain_s:.0f} rows/s", flush=True)
+    kernels = None
+    if profile:
+        from torch.profiler import ProfilerActivity, profile as torch_profile
+        with torch_profile(activities=[ProfilerActivity.CUDA]) as prof:
+            run()
+        events = [e for e in prof.key_averages()
+                  if getattr(e, "self_device_time_total", 0) > 0]
+        events.sort(key=lambda e: -e.self_device_time_total)
+        total_us = sum(e.self_device_time_total for e in events)
+        kernels = {
+            "total_gpu_s": total_us / 1e6,
+            "top": [{"name": e.key[:120], "calls": e.count,
+                     "gpu_s": e.self_device_time_total / 1e6}
+                    for e in events[:40]],
+        }
+        for row in kernels["top"]:
+            print(f"{row['gpu_s']:7.3f} s {row['calls']:6d}  {row['name']}",
+                  flush=True)
 
     totals = {}
     engine = pipeline.engine
@@ -190,9 +210,15 @@ def time_chunk(prediction: str, docs: int = 110, doc_tokens: int = 300,
         wrap_forward(layer.moe, "experts")
     rows, timed_s = run()
     accounted = sum(totals.values())
+    moe = pipeline.layers[-1].moe
+    quant = getattr(moe, "quant_method", None)
     result = {
         "prediction": prediction,
         "wide_head_kernel": wide_head_kernel,
+        "moe_backend": moe_backend,
+        "moe_backend_used": str(getattr(quant, "fp8_backend", None)),
+        "moe_kernel": type(getattr(quant, "moe_kernel", None)).__name__,
+        "kernels": kernels,
         "random_tokens": random_tokens,
         "docs": docs, "doc_tokens": doc_tokens, "rows": rows,
         "chunk_tokens": chunk_tokens,
@@ -203,6 +229,8 @@ def time_chunk(prediction: str, docs: int = 110, doc_tokens: int = 300,
         "unaccounted_s": timed_s - accounted,
     }
     suffix = "_random" if random_tokens else ""
+    if moe_backend != "auto":
+        suffix += f"_{moe_backend}"
     result["volume_path"] = _save(
         f"diffusion_gemma_layer_timing_{wide_head_kernel}{suffix}", result)
     return json.dumps(result, indent=2)
@@ -347,14 +375,17 @@ def micro(prediction: str, rows: int = 62920) -> str:
 @app.local_entrypoint()
 def main(prediction: str = "", docs: int = 110, doc_tokens: int = 300,
          kernels: str = "triton,fa4", random_tokens: bool = False,
-         runs: str = "chunk,loop"):
+         runs: str = "chunk,loop", moe_backends: str = "auto",
+         profile: bool = False):
     if not prediction:
         raise ValueError("pass --prediction before starting")
     calls = {}
     if "chunk" in runs:
         for kernel in kernels.split(","):
-            calls[kernel] = time_chunk.spawn(prediction, docs, doc_tokens,
-                                             kernel, random_tokens)
+            for backend in moe_backends.split(","):
+                calls[f"{kernel}/{backend}"] = time_chunk.spawn(
+                    prediction, docs, doc_tokens, kernel, random_tokens,
+                    backend, profile)
     if "loop" in runs:
         calls["loop"] = time_loop.spawn(prediction)
     if "micro" in runs:
