@@ -371,16 +371,23 @@ During planning, Quail chooses which documents or document pairs require model e
 
 We chose the parameters above by running the benchmark queries. Increasing the batch or memory limits caused GPU OOM errors. Our roofline model predicts that the selected token budget is well above the point where model computation becomes compute bound.
 
-**Metrics.** We report four metrics for each query:
+**Metrics.** We report five metrics for each query:
 
 - **Query latency.** We measure the time after model startup and kernel warmup, and exclude result collection. We also report latency relative to the speed of light estimate from Section 2, which assumes peak GPU throughput, full overlap between CPU and GPU work, and enough GPU HBM to retain all reusable prefix KV.
 - **GPU cost.** We multiply the query latency in hours by Modal's H100 price of $3.9492 per hour.
+- **Input tokens per second.** We sum the full input lengths of all evaluated prompts, including tokens served from KV, and divide by query latency. Each evaluated prompt counts its full input once, regardless of how often its KV was recomputed. Generated tokens are excluded.
 - **Fresh input tokens.** We count every input token computed by the model, ignoring tokens read from KV. For example, if the model computes a report's tokens during the filter, then computes the same tokens again during the join, those tokens count twice.
 - **KV regret.** KV regret is the number of fresh input tokens beyond the minimum required when every distinct reusable token prefix is computed once. We identify prefixes by their tokens, even when they occur in different rows. For example, if two rows begin with the same 100 tokens and both prefixes are computed, the second 100 tokens are KV regret. KV regret is included in the fresh input token total.
 
 ## 4.2 Full benchmark results
 
 Across all 33 queries at size 0.1, Quail is faster than the pipelined vLLM baseline on 31. **Quail's mean speedup is 1.92×, its median speedup is 1.43×, and its largest speedup is 10.04× on BIO-2.**
+
+::: {.figure-block .wide-figure}
+[![Full input token throughput for Quail, the vLLM baseline, and SoL estimates across all 33 QUAIL-B queries.](figures/quailb_throughput.png){width=100%}](figures/quailb_throughput.pdf)
+
+*Figure 7. Full input tokens per second, including tokens served from KV. Bars show measured rates, and lines show SoL estimates. Each rate counts the prompts evaluated by that method. SoL uses reference-label survivors, so its rate is not an upper bound for runs evaluating different prompts. The measurements use the September 14 query versions.*
+:::
 
 Quail's total runtime across the 33 queries is 1,549.92 seconds, compared with 443.51 seconds for the combined speed of light estimates. **Quail is 3.49× the estimate in aggregate, and the median query is 2.59× the estimate.** The ratio ranges from 1.84× on BIO-3 to 53.03× on LEP-5!
 
@@ -402,12 +409,12 @@ BIO-3 is the motivating query in this post. It filters 500 medical reports for f
 
 Quail runs BIO-3 in 79.34 seconds, which is 8.06 times faster than the vLLM baseline. Quail also reduces KV regret from 1.22 million tokens to 2,751.
 
-As Figure 7 shows, vLLM finishes each model batch quickly, because most document KV is already cached. However, the CPU cannot process the individual requests fast enough to keep the GPU busy. Quail sends large token batches directly through the model, so it does not pay vLLM's request processing cost for every document pair.
+As Figure 8 shows, vLLM finishes each model batch quickly, because most document KV is already cached. However, the CPU cannot process the individual requests fast enough to keep the GPU busy. Quail sends large token batches directly through the model, so it does not pay vLLM's request processing cost for every document pair.
 
 ::: {.figure-block .wide-figure}
 [![Five seconds of GPU activity and top-level CPU operations during the BIO-3 join with Quail and pipelined vLLM.](figures/bio3_profile_comparison.png){width=100%}](figures/bio3_profile_comparison.pdf)
 
-*Figure 7. In these five-second windows, GPU operations cover 4.997 seconds with Quail and 1.892 seconds with vLLM. The lower row shows only top-level CPU operations. Both runs use an H100 and the same Qwen3 4B FP8 model.*
+*Figure 8. In these five-second windows, GPU operations cover 4.997 seconds with Quail and 1.892 seconds with vLLM. The lower row shows only top-level CPU operations. Both runs use an H100 and the same Qwen3 4B FP8 model.*
 :::
 
 ## 4.4 AGENT-1: Where vLLM wins
@@ -449,7 +456,7 @@ vLLM runs AGENT-1 in 98.45 seconds, which is 2.42 times faster than Quail.
 ::: {.figure-block .wide-figure}
 [![Five seconds of GPU activity and top-level CPU operations during the AGENT-1 filter with Quail and pipelined vLLM.](figures/agent1_profile_comparison.png){width=100%}](figures/agent1_profile_comparison.pdf)
 
-*Figure 8. AGENT-1 has one filter and no join. GPU operations cover 4.998 seconds with Quail and 4.988 seconds with vLLM in these five-second windows. The lower row shows only top-level CPU operations. Both keep the GPU busy, but vLLM computes far fewer fresh tokens by reusing prefixes across snapshots.*
+*Figure 9. AGENT-1 has one filter and no join. GPU operations cover 4.998 seconds with Quail and 4.988 seconds with vLLM in these five-second windows. The lower row shows only top-level CPU operations. Both keep the GPU busy, but vLLM computes far fewer fresh tokens by reusing prefixes across snapshots.*
 :::
 
 vLLM wins because its automatic prefix caching feature can reuse KV across different rows when their token prefixes match. Quail currently reuses KV only when the same document appears again in the query. As a result, Quail incurs 11.89 million KV regret tokens, while the vLLM baseline incurs only 23,928.
