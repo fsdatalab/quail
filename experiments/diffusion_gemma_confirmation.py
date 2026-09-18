@@ -148,7 +148,8 @@ def _run(query, gpu_count=1):
     table = result.collect()
     report = result.report
     return {
-        "rows": table.to_pylist(),
+        "columns": table.column_names,
+        "rows": [list(row.values()) for row in table.to_pylist()],
         "wall_s": report["wall_s"],
         "usd_per_query": report["wall_s"] / 3600 * gpu_count * H100_USD_PER_HOUR,
         "fresh_tokens": report.get("fresh_tokens"),
@@ -222,7 +223,7 @@ def confirm(prediction: str) -> str:
         "{'selectivity': 0.5})"
     )
     join_result = _run(join_query)
-    kept = sorted(row["id"] for row in filter_result["rows"])
+    kept = sorted(str(row[0]) for row in filter_result["rows"])
     result = {
         "prediction": prediction,
         "gpu_device_name": torch.cuda.get_device_name(0),
@@ -234,6 +235,8 @@ def confirm(prediction: str) -> str:
             sum(1 for i in range(8) if f"f{i}" in kept)
             + sum(1 for i in range(8) if f"c{i}" not in kept)) / 16,
         "join": join_result,
+        "join_kept_pairs": sorted(
+            [str(value) for value in row] for row in join_result["rows"]),
         "join_expected_pairs": sorted(
             [f"l{i}", f"r{j}"] for i in range(4) for j in range(4)
             if (i < 2) == (j < 2)),
