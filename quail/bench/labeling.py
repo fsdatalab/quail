@@ -1371,10 +1371,14 @@ def collection_files(root: Path, collection_id: str) -> list[Path]:
     corpus_dir = root / "corpora" / manifest["corpus_id"]
     files += sorted(path for path in corpus_dir.iterdir()
                     if path.is_file() and path.suffix in (".json", ".parquet"))
-    for key, label_set_id in sorted(manifest["label_sets"].items()):
-        spec = PREDICATE_BY_KEY[key]
-        label_dir = (root / "label_sets" / spec.workload / spec.slug
-                     / label_set_id)
+    for label_set_id in sorted(manifest["label_sets"].values()):
+        matches = list((root / "label_sets").glob(
+            f"*/*/{label_set_id}/manifest.json"))
+        if len(matches) != 1:
+            raise FileNotFoundError(
+                f"expected one manifest for {label_set_id}, found "
+                f"{len(matches)}")
+        label_dir = matches[0].parent
         compact = label_dir / "labels.parquet"
         if not compact.exists():
             raise FileNotFoundError(
