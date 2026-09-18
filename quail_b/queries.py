@@ -19,7 +19,6 @@ from quail_b.prompts import (
     F1,
     F4,
     F5,
-    F7,
     F11,
     F12,
     F13,
@@ -32,6 +31,7 @@ from quail_b.prompts import (
     LEPS1,
     REACTION,
     REFUTE,
+    SERIOUS_ADVERSE_EVENT,
     SUPPORT,
 )
 from quail_b.substrait import _inspect_plan
@@ -45,7 +45,8 @@ FILTER_SELECTIVITY_ESTIMATES = {
     F1: 4004 / 5000,
     F4: 1218 / 5000,
     F5: 2853 / 5000,
-    F7: 306 / 500,
+    # Same reports, saved label set ls_5627a6d5416349ee3e418c41594bc3a3.
+    SERIOUS_ADVERSE_EVENT: 319 / 500,
     AGENT_RECOVERED: 570 / 1772,
     AGENT_IMPLEMENTED_FIX: 537 / 1772,
     F11: 296 / 500,

@@ -51,7 +51,7 @@
   },
   {
     "id": "BIO-1",
-    "description": "filter: F7 (female patient)",
+    "description": "filter: serious adverse event",
     "privacy": false
   },
   {
@@ -61,7 +61,7 @@
   },
   {
     "id": "BIO-3",
-    "description": "F7 -> J1, dependent",
+    "description": "serious adverse event -> reaction join",
     "privacy": false
   },
   {

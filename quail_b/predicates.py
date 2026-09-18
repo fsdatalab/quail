@@ -63,8 +63,9 @@ PREDICATES = (
         prompts.ASPECT_SENTIMENT,
         "review", "reviews", "body", "aspect", "aspects", "aspect"),
     PredicateSpec(
-        "quailb.biodex.report.involves_female_patient", "biodex",
-        "report_involves_female_patient", "filter", prompts.F7,
+        "quailb.biodex.report.describes_serious_adverse_event", "biodex",
+        "report_describes_serious_adverse_event", "filter",
+        prompts.SERIOUS_ADVERSE_EVENT,
         "report", "reports", "report"),
     PredicateSpec(
         "quailb.biodex.report.experienced_reaction", "biodex",

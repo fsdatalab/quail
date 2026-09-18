@@ -23,7 +23,6 @@ from quail_b.prompts import (
     F1,
     F4,
     F5,
-    F7,
     F11,
     F12,
     F13,
@@ -36,6 +35,7 @@ from quail_b.prompts import (
     LEPS1,
     REACTION,
     REFUTE,
+    SERIOUS_ADVERSE_EVENT,
     SUPPORT,
 )
 from quail_b.queries import (
@@ -55,7 +55,7 @@ SCAN_COLOR = "#BBBBBB"
 
 TEMPLATE_LABELS = {
     F1: "F1", F4: "F4", F5: "F5",
-    F7: "F7",
+    SERIOUS_ADVERSE_EVENT: "serious",
     AGENT_RECOVERED: "recov.", AGENT_IMPLEMENTED_FIX: "impl.",
     F11: "F11", F12: "F12", F13: "F13",
     LEP1: "LEP1", LEP2: "LEP2", LEP3: "LEP3",

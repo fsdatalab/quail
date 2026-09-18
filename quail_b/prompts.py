@@ -29,10 +29,12 @@ DISCUSS_ASPECT = ("Does the review in DOCUMENT {0} discuss the movie "
 ASPECT_SENTIMENT = ("Does the review in DOCUMENT {0} express positive "
                     "sentiment about the movie aspect in DOCUMENT {1}?")
 
-F7 = ("Judge strictly from the report above whether it describes a "
-      "case involving a female patient.\n\n{0}\n\nInstruction: answer "
-      "TRUE if the report describes a case involving a female patient, "
-      "FALSE otherwise.")
+SERIOUS_ADVERSE_EVENT = (
+    "Judge strictly from the report above whether it describes a serious "
+    "or life-threatening adverse event.\n\n{0}\n\nInstruction: answer TRUE "
+    "if the report describes a serious or life-threatening adverse event, "
+    "FALSE otherwise."
+)
 
 REACTION = ("Does the medical report in DOCUMENT {0} describe the "
             "reaction in DOCUMENT {1} as something the patient "

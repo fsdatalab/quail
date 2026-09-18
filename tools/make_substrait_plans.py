@@ -28,7 +28,6 @@ from quail_b.prompts import (
     F1,
     F4,
     F5,
-    F7,
     F11,
     F12,
     F13,
@@ -44,6 +43,7 @@ from quail_b.prompts import (
     REACTION,
     REFUTE,
     SCENARIO_MATCH,
+    SERIOUS_ADVERSE_EVENT,
     SUPPORT,
 )
 from quail_b.substrait import (
@@ -418,11 +418,13 @@ QUERIES = (
     Query("IMDB-10", "F1 -> 3J chain r1-a1-r2-a2",
           _imdb_chain(_filters(_reviews("r1"), F1))),
 
-    Query("BIO-1", "filter: F7 (female patient)", _filters(_reports(), F7)),
+    Query("BIO-1", "filter: serious adverse event",
+          _filters(_reports(), SERIOUS_ADVERSE_EVENT)),
     Query("BIO-2", "join: J1 (reports x terms)",
           Join(_reports(), _terms(), ("r", "m"), REACTION)),
-    Query("BIO-3", "F7 -> J1, dependent",
-          Join(_filters(_reports(), F7), _terms(), ("r", "m"), REACTION)),
+    Query("BIO-3", "serious adverse event -> reaction join",
+          Join(_filters(_reports(), SERIOUS_ADVERSE_EVENT), _terms(),
+               ("r", "m"), REACTION)),
 
     Query("FEV-1", "filter: F11 (about a person)", _filters(_claims(), F11)),
     Query("FEV-2", "join: J3 (claims x evidence)",

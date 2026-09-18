@@ -55,3 +55,12 @@ def test_filter_and_join_prompts_use_the_engine_layout():
     assert "(The document above is DOCUMENT {0}.)" in join_prompt
     assert "DOCUMENT {1}:\naspect" in join_prompt
     assert join_prompt.endswith("\nANSWER:")
+
+
+def test_biodex_replacement_matches_saved_reference_identity():
+    spec = _spec("quailb.biodex.report.describes_serious_adverse_event")
+    identity = label_set_identity(
+        spec, "c_d7a294f1a0d83293b31ed8519df4262e",
+        "d7a294f1a0d83293b31ed8519df4262e5cf3f347a535cdb9abeb109f20ae75c8",
+    )
+    assert identity["label_set_id"] == "ls_5627a6d5416349ee3e418c41594bc3a3"

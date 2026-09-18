@@ -50,7 +50,7 @@
                       {
                         "value": {
                           "literal": {
-                            "string": "Judge strictly from the report above whether it describes a case involving a female patient.\n\n{0}\n\nInstruction: answer TRUE if the report describes a case involving a female patient, FALSE otherwise."
+                            "string": "Judge strictly from the report above whether it describes a serious or life-threatening adverse event.\n\n{0}\n\nInstruction: answer TRUE if the report describes a serious or life-threatening adverse event, FALSE otherwise."
                           }
                         }
                       },

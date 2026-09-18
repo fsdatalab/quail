@@ -144,6 +144,12 @@ The benchmark evaluates 33 queries across 5 datasets:
 | LePaRD | 8 | `citation_contexts`, `citation_passages` | Legal precedent retrieval and citation matching |
 | SWE-Next | 2 | `agent_traces` | Software engineering agent trajectory evaluation |
 
+BIO-1 selects reports describing a serious or life-threatening adverse event.
+BIO-3 applies that filter before joining reports to reaction terms. The filter
+keeps 319 of the 500 reports at scale 0.1 according to the saved Qwen3 32B fp8
+reference labels. Results from the earlier patient-demographic filter are a
+different query definition and must not be compared with these queries.
+
 Queries use two LLM-powered relational operators:
 
 - `ai_filter(prompt, document) -> boolean` (selection)

@@ -6,6 +6,7 @@ from importlib.resources import files
 import pytest
 from substrait import plan_pb2
 
+from quail_b.prompts import SERIOUS_ADVERSE_EVENT
 from quail_b.queries import (
     FILTER_SELECTIVITY_ESTIMATES,
     JOIN_SELECTIVITY_ESTIMATES,
@@ -65,6 +66,15 @@ def test_query_spec_contains_only_identity_and_plan_bytes():
         "description",
         "plan_bytes",
     )
+
+
+@pytest.mark.parametrize("query_id", ["BIO-1", "BIO-3"])
+def test_biodex_filters_match_the_replacement_reference(query_id):
+    info = _inspect_plan(queries()[query_id].plan)
+    assert [(op.id, op.relation, op.prompt) for op in info.filters] == [
+        ("filter-1", "r", SERIOUS_ADVERSE_EVENT),
+    ]
+    assert len(info.joins) == (1 if query_id == "BIO-3" else 0)
 
 
 def test_filters_are_substrait_relations_over_their_input():
