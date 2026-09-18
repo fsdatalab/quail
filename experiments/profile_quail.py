@@ -54,19 +54,25 @@ import time
 
 import modal
 
+from quail.bench.requirements import quail_b_requirement
+
 IMAGE_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
 
 image = (
     modal.Image.from_registry(IMAGE_BASE, add_python="3.12")
     .entrypoint([])
+    .apt_install("git")
     .pip_install(
         "vllm==0.26.0",
         "huggingface_hub[hf_transfer]",
-        "transformers>=5.2.0",
+        "transformers>=5.8.0",
         "pandas",
         "pyarrow",
         "numpy",
-        "datasets",
+        "datasets>=5.0.1",
+        "sqlglot>=27.0",
+        "gigatoken>=0.10.0",
+        quail_b_requirement(),
     )
     .env({"VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
           "VLLM_LOGGING_LEVEL": "WARNING",
@@ -79,7 +85,7 @@ image = (
           "TRITON_CACHE_DIR": "/root/.cache/kernels/triton",
           "TORCHINDUCTOR_CACHE_DIR":
               "/root/.cache/kernels/torchinductor"})
-    .add_local_python_source("quail", "quail_b")
+    .add_local_python_source("quail")
 )
 
 # House rule: never create new Modal app names - new GPU cells attach
