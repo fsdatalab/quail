@@ -281,6 +281,69 @@ def time_loop(prediction: str, reviews: int = 1000) -> str:
     return json.dumps(result, indent=2)
 
 
+@app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
+              volumes=volumes)
+def micro(prediction: str, rows: int = 62920) -> str:
+    """Time norm and rotary calls through the modules and as raw kernels."""
+    import torch
+    from vllm import _custom_ops as ops
+
+    from quail.backends.quail.executor.model import load_model
+    from quail.specs import MODELS
+
+    spec = MODELS[MODEL]
+    model = load_model(spec.hf_name, max_batched_tokens=rows)
+    layer = model.model.layers[0]
+    full = model.model.layers[5]
+    x = torch.randn(rows, 2816, device="cuda", dtype=torch.bfloat16)
+    positions = torch.arange(rows, device="cuda")
+
+    def timed(name, function, repeats=5):
+        function()
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(repeats):
+            function()
+        torch.cuda.synchronize()
+        return name, (time.perf_counter() - t0) / repeats
+
+    norm = layer.input_layernorm
+    out = torch.empty_like(x)
+    results = dict([
+        timed("norm_module_ms", lambda: norm(x)),
+        timed("norm_raw_kernel_ms", lambda: torch.ops._C.rms_norm(
+            out, x, norm.weight, norm.variance_epsilon)),
+        timed("norm_native_torch_ms", lambda: (
+            x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True)
+                                    + norm.variance_epsilon)
+        ).to(x.dtype) * norm.weight),
+    ])
+    for name, attn in (("sliding", layer.self_attn), ("full", full.self_attn)):
+        H, KH, D = attn.num_heads, attn.num_kv_heads, attn.head_dim
+        q = torch.randn(rows, H * D, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(rows, KH * D, device="cuda", dtype=torch.bfloat16)
+        rope = attn.rotary_emb
+        results.update([
+            timed(f"rotary_module_{name}_ms", lambda: rope(positions, q, k)),
+            timed(f"rotary_raw_kernel_{name}_ms", lambda: ops.rotary_embedding(
+                positions, q, k, D, rope.cos_sin_cache.to(q.dtype),
+                rope.is_neox_style)),
+            timed(f"qk_norm_module_{name}_ms", lambda: (
+                attn.q_norm(q.unflatten(-1, (H, D))),
+                attn.k_norm(k.unflatten(-1, (KH, D))))),
+        ])
+        results[f"rotary_class_{name}"] = type(rope).__name__
+        results[f"cos_sin_cache_{name}"] = (
+            str(rope.cos_sin_cache.dtype), list(rope.cos_sin_cache.shape))
+    results = {key: (round(value * 1000, 3) if isinstance(value, float) else value)
+               for key, value in results.items()}
+    results["prediction"] = prediction
+    results["rows"] = rows
+    results["norm_dispatch"] = type(norm).__name__
+    results["volume_path"] = _save("diffusion_gemma_micro_timing", results)
+    return json.dumps(results, indent=2)
+
+
 @app.local_entrypoint()
 def main(prediction: str = "", docs: int = 110, doc_tokens: int = 300,
          kernels: str = "triton,fa4", random_tokens: bool = False,
@@ -294,6 +357,8 @@ def main(prediction: str = "", docs: int = 110, doc_tokens: int = 300,
                                              kernel, random_tokens)
     if "loop" in runs:
         calls["loop"] = time_loop.spawn(prediction)
+    if "micro" in runs:
+        calls["micro"] = micro.spawn(prediction)
     for name, call in calls.items():
         print(f"function call id: {call.object_id} ({name})", flush=True)
     for name, call in calls.items():
