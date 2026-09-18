@@ -8,16 +8,29 @@
   Quail and the vLLM configurations shared a physical GPU within each
   family. Stock vLLM used operator-at-a-time submission; the other two
   pipeline their requests.
-- Quail, stock vLLM, and pipelined vLLM were run on September 12, 2026: `/results/benchmarks/quailb/family-runs/20260912T225100Z-902686c5/`,
+- BioDEX uses non-thinking chat prompts and newly generated Qwen3 32B
+  reference labels. BIO-1 and BIO-3 filter for serious adverse events.
+  Quail and pipelined stock vLLM were rerun on September 18:
+  `/results/benchmarks/quailb/family-runs/20260918T060700Z-biodex-chat/`.
+  The older BioDEX measurements are omitted. Other datasets retain
+  their earlier prompts and measurements.
+  Quail's planned limits were 110,376 tokens per chunk and 362,250
+  resident KV tokens. Pipelined stock vLLM used prefix caching,
+  25,305 batched tokens,
+  4,096 sequences, and GPU memory utilization
+  0.91. Its measured KV capacity
+  was 479,616 tokens. Both methods used
+  the same planner's filter and join ordering rules.
+- Other datasets use the September 12, 2026 run: `/results/benchmarks/quailb/family-runs/20260912T225100Z-902686c5/`,
   function calls `fc-01M2BX2FQ0S11V5Q5WDBGC865R`, `fc-01M2BX3KM90P4D4ME4SFDXB88Z`, `fc-01M2BX3KR9EZXZ3HW43XWNJT7N`, `fc-01M2BX3KX1ENZPPV61RRCMN7TG`, `fc-01M2BX3M38FRY6FE2PAGGS2WD2`, `fc-01M2BX3M80WJDF3HDE9PYB903D`.
   That run's FEVER container failed on FEV-10 in the request backends (an
   equality join's key columns were not passed to them; fixed since) and
   was not rerun. 2 of the 99 cells come from the September 11
   FEV-10 run (`/results/benchmarks/quailb/family-runs/20260911T201441Z-d16f87d8/`): Pipelined vLLM FEV-10; Stock vLLM FEV-10.
-  9 cells have no measurement and are marked missing, in the
-  plots by an x below the axis and in the tables by a row that says so:
-  Pipelined vLLM FEV-1, FEV-2, FEV-3, FEV-4, FEV-5, FEV-6, FEV-7, FEV-8, FEV-9.
-- Quail was faster than stock vLLM on 31 of 33 queries
+  12 cells have no current measurement. The main plot marks
+  them with an x below the axis:
+  Pipelined vLLM FEV-1, FEV-2, FEV-3, FEV-4, FEV-5, FEV-6, FEV-7, FEV-8, FEV-9; Stock vLLM BIO-1, BIO-2, BIO-3.
+- Quail was faster than stock vLLM on 28 of 30 queries
   where both were measured.
 - A horizontal line across each query's bar group shows its SoL estimate.
   SoL models ideal computation and memory traffic with unlimited prefix KV.
@@ -27,13 +40,19 @@
   so the gap from SoL is not purely execution overhead. SoL uses the
   distinct-prefix estimate, not the per-document-only estimate. No
   accuracy is assigned to SoL because it is not a measured model run.
-  SoL was recalculated for all 33 queries on the CPU on September 11,
-  2026, from saved labels and corpus rows.
+  SoL was calculated from saved labels and corpus rows on the CPU:
+  BioDEX on September 18, and the other datasets on September 11.
 - Answer agreement measures evaluated calls against saved Qwen3 32B labels.
   Each method can evaluate different calls after its filters and joins.
   Output precision is the fraction of returned rows matching the reference.
   Output recall is the fraction of reference rows returned. High answer
   agreement can coexist with poor final output precision.
+- The prediction was 20 to 35 seconds for BIO-1 and faster joins in Quail
+  than in pipelined stock vLLM. The measured times support both predictions.
+- Quail's output recall is 10.70% on BIO-2 and
+  10.41% on BIO-3 against the saved 32B references.
+  Per-answer agreement is 97.13% and
+  96.58%, respectively. Most evaluated pairs are negative.
 - Query time excludes startup. Throughput counts input documents for filters
   and evaluated document pairs across all stages for joins. GPU cost is query
   seconds divided by 3,600 and multiplied by $3.9492.
@@ -64,6 +83,8 @@
 Figure: plots/quailb_main.pdf
 
 SoL estimates on `quail-results`: `/results/sol/2026-09-11-quailb-prefix-reuse.json`.
+
+BioDEX SoL: `/results/sol/2026-09-18-biodex-chat/sol_quailb_sf0.1_BIO-1_BIO-2_BIO-3.json`.
 
 Corpus counts on `quail-results`: `/results/ground_truth/quailb/schema_v1/corpora/c_1aa2c4f0d0b6c816fd37aa5748c33341/manifest.json`.
 
@@ -143,20 +164,21 @@ Figure: plots/quailb_bio.pdf
 | BIO-2 | r (reports) = 500, m (terms) = 1,127 |
 | BIO-3 | r (reports) = 500, m (terms) = 1,127 |
 
+Quail was 1.13x, 4.99x, 4.75x faster than pipelined stock vLLM on BIO-1, BIO-2, and BIO-3, respectively.
+
+BIO-3 filter survivors: 362 in the reference, 349 in Quail, and 350 in pipelined stock vLLM.
+
 | Query | Method | Seconds | Recomputed KV tokens | Fresh input tokens | Throughput | Unit | $/query | Answer agreement (%) | Output precision (%) | Output recall (%) | Source |
 |---|---|---:|---:|---:|---:|---|---:|---:|---:|---:|---|
-| BIO-1 | Quail | 21.52 | 2,477 | 2,057,345 | 23.23 | docs/s | 0.02361 | 93.60 | 100 | 89.542 | September 12 |
-| BIO-1 | Stock vLLM | 25.75 | 2,461 | 2,057,329 | 19.42 | docs/s | 0.02825 | 94.00 | 100 | 90.196 | September 12 |
-| BIO-1 | Pipelined vLLM | 25.50 | 2,461 | 2,057,329 | 19.61 | docs/s | 0.02797 | 94.00 | 100 | 90.196 | September 12 |
-| BIO-1 | SoL estimate | 11.049 | 0 (assumed) | 2,054,868 | 45.25 | docs/s | 0.01212 | Not measured | Not measured | Not measured | estimate |
-| BIO-2 | Quail | 127.75 | 4,148,977 | 10,374,345 | 4,410.96 | pairs/s | 0.14014 | 81.83 | 14.167 | 85.959 | September 12 |
-| BIO-2 | Stock vLLM | 1074.34 | 4,301,247 | 10,526,615 | 524.51 | pairs/s | 1.17855 | 80.95 | 13.625 | 86.283 | September 12 |
-| BIO-2 | Pipelined vLLM | 1069.16 | 4,301,247 | 10,526,615 | 527.05 | pairs/s | 1.17287 | 80.95 | 13.624 | 86.283 | September 12 |
-| BIO-2 | SoL estimate | 62.002 | 0 (assumed) | 10,371,868 | 9,088.45 | pairs/s | 0.06802 | Not measured | Not measured | Not measured | estimate |
-| BIO-3 | Quail | 79.96 | 2,275,033 | 6,627,939 | 3,861.91 | pairs/s | 0.08772 | 82.54 | 14.733 | 79.917 | September 12 |
-| BIO-3 | Stock vLLM | 590.22 | 3,506,014 | 7,875,694 | 527.01 | pairs/s | 0.64747 | 81.23 | 13.912 | 81.171 | September 12 |
-| BIO-3 | Pipelined vLLM | 585.63 | 3,506,014 | 7,875,694 | 531.14 | pairs/s | 0.64244 | 81.23 | 13.912 | 81.171 | September 12 |
-| BIO-3 | SoL estimate | 43.087 | 0 (assumed) | 7,159,254 | 8,003.77 | pairs/s | 0.04727 | Not measured | Not measured | Not measured | estimate |
+| BIO-1 | Quail | 22.34 | 3,981 | 2,068,352 | 22.38 | docs/s | 0.02451 | 88.60 | 93.696 | 90.331 | September 18 BioDEX |
+| BIO-1 | Pipelined vLLM | 25.15 | 3,965 | 2,068,336 | 19.88 | docs/s | 0.02759 | 89.60 | 94.286 | 91.16 | September 18 BioDEX |
+| BIO-1 | SoL estimate | 11.111 | 0 (assumed) | 2,064,371 | 45.00 | docs/s | 0.01219 | Not measured | Not measured | Not measured | estimate |
+| BIO-2 | Quail | 187.01 | 3,981 | 15,451,352 | 3,013.21 | pairs/s | 0.20515 | 97.13 | 94.034 | 10.699 | September 18 BioDEX |
+| BIO-2 | Pipelined vLLM | 933.23 | 157,341 | 15,604,712 | 603.82 | pairs/s | 1.02375 | 97.13 | 94.771 | 10.588 | September 18 BioDEX |
+| BIO-2 | SoL estimate | 93.223 | 0 (assumed) | 15,447,371 | 6,044.63 | pairs/s | 0.10227 | Not measured | Not measured | Not measured | estimate |
+| BIO-3 | Quail | 136.51 | 4,330 | 11,432,720 | 2,881.28 | pairs/s | 0.14975 | 96.58 | 90.405 | 10.408 | September 18 BioDEX |
+| BIO-3 | Pipelined vLLM | 647.99 | 1,464,366 | 12,919,587 | 608.73 | pairs/s | 0.71085 | 96.58 | 90.062 | 10.487 | September 18 BioDEX |
+| BIO-3 | SoL estimate | 69.241 | 0 (assumed) | 11,777,555 | 5,892.11 | pairs/s | 0.07596 | Not measured | Not measured | Not measured | estimate |
 
 ## FEV
 

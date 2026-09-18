@@ -39,24 +39,27 @@ answers go back to the volume too:
     modal volume get quail-results /quailb_data/sf$SF $W/data/
     modal volume get quail-results $G/label_sets $W/allabels/
     modal volume get quail-results \
-        $G/collections/gt_77bb8b128743a79aedddaa24c808c3f8/manifest.json \
+        $G/collections/gt_8d0030fc5f187e81480fb859d7a2cd69/manifest.json \
         $W/collection_manifest.json
     uv run --with transformers --with pyarrow \
-        python reports/make_sol_quailb.py $W $SF
-    modal volume put quail-results $W/sol_quailb_sf$SF.json \
-        /sol/sol_quailb_sf$SF.json
+        python reports/make_sol_quailb.py $W $SF --queries BIO-1,BIO-2,BIO-3
+    modal volume put quail-results $W/sol_quailb_sf${SF}_BIO-1_BIO-2_BIO-3.json \
+        /sol/sol_quailb_sf${SF}_BIO-1_BIO-2_BIO-3.json
 
-The scale factor defaults to 0.1. The collection supplies all four
-query families. The run stops if the collection is for a different
-scale factor than the one requested.
+The scale factor defaults to 0.1. The run rejects references made with a
+different prompt format or scale factor.
 
 The saved estimates must be regenerated when a query definition changes.
-Pass --queries FEV-9 to recalculate only that query. The output filename then
+Use Quail revision 370c81fcad30ef9906e3684ad2e667c830bf29a4.
+Pass --queries FEV-9 to recalculate only that query.
+On a mounted results volume, --root /results reads the saved benchmark
+directly and --collection selects its reference labels. The output filename then
 includes the selected query IDs so the full suite file is not overwritten.
 """
 
 import argparse
 import collections
+import hashlib
 import json
 from functools import cache
 from pathlib import Path
@@ -69,11 +72,9 @@ from quail.bench.quailb import (
     answer_oracle,
     canonical_templates,
     queries,
-    register_tables,
 )
-from quail.planner import collect_operators
 from quail.planner.plan import EngineConfig
-from quail.runtime.prefixes import shared_prefix_tokens
+from quail.planner.prefixes import shared_prefix_tokens
 from quail.specs import (
     H100_PRICE_SOURCE,
     H100_USD_PER_HOUR,
@@ -81,19 +82,29 @@ from quail.specs import (
     QWEN3_32B_FP8,
 )
 from quail_b import data, prompts
+from quail_b.benchmark import load_benchmark, select_queries
 from quail_b.labels import GroundTruthCollection, PredicateLabels
+from quail_b.predicates import PREDICATE_BY_KEY, predicate_payload
 from quail_b.queries import (
     SELECTIVITY_ESTIMATE_COLLECTION,
     SELECTIVITY_ESTIMATE_CORPUS,
     SELECTIVITY_ESTIMATE_SCALE_FACTOR,
+    get_query,
 )
+from quail_b.rendering import PROMPT_FORMAT, SHARED_PRE
+
+if quail.SHARED_PRE != SHARED_PRE:
+    raise SystemExit("Use the Quail revision documented in this script.")
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("workdir")
 parser.add_argument("scale_factor", nargs="?", type=float, default=0.1)
 parser.add_argument("--queries", help="Comma-separated query IDs")
+parser.add_argument("--root", help="Saved benchmark root, such as /results")
+parser.add_argument("--collection", help="Reference collection id")
 args = parser.parse_args()
 W = Path(args.workdir)
+W.mkdir(parents=True, exist_ok=True)
 SF = args.scale_factor
 # "%g" so 0.1 stays "0.1" and 0.01 stays "0.01", matching the volume's
 # own directory names
@@ -104,15 +115,9 @@ MODELS = [QWEN3_4B_FP8, QWEN3_32B_FP8]
 
 # check the workdir holds this scale factor before tokenizing anything:
 # both of these otherwise surface much later as a missing parquet file
-if not (W / "data" / TAG).is_dir():
+if not args.root and not (W / "data" / TAG).is_dir():
     raise SystemExit(f"no corpus at {W / 'data' / TAG}: pull "
                      f"/quailb_data/{TAG} off the volume")
-COLLECTION = json.load(open(W / "collection_manifest.json"))
-if COLLECTION["scale_factor"] != SF:
-    raise SystemExit(
-        f"the collection in {W} is scale factor "
-        f"{COLLECTION['scale_factor']:g}, not {SF:g}: pull the labels for "
-        f"the corpus you are asking about")
 tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-4B-FP8")
 
 
@@ -149,6 +154,7 @@ def load_collection(workdir: Path, collection: dict) -> GroundTruthCollection:
                 bool(row["answer"])
                 for row in rows},
             source_rows=manifest.get("source_rows", {}),
+            predicate_payload=manifest.get("predicate_payload"),
         )
     if len(predicates) != len(active):
         raise ValueError(
@@ -163,14 +169,31 @@ def load_collection(workdir: Path, collection: dict) -> GroundTruthCollection:
     )
 
 
-truth = load_collection(W, COLLECTION)
-corpus_rows = data.read_corpus(W / "data" / TAG)
-corpus = data.corpus_identity(
-    corpus_rows, SF, data.DATA_SEED, data.SOURCE_REVISIONS)
-if corpus["corpus_id"] != truth.corpus_id:
-    raise SystemExit(
-        f"the corpus in {W} is {corpus['corpus_id']}, but the labels are "
-        f"for {truth.corpus_id}")
+if args.root:
+    benchmark = load_benchmark(
+        args.queries.split(",") if args.queries else None, scale_factor=SF,
+        root=args.root, collection_id=args.collection)
+    truth = benchmark.ground_truth
+    corpus_rows = benchmark.tables
+else:
+    collection = json.loads((W / "collection_manifest.json").read_text())
+    if collection["scale_factor"] != SF:
+        raise ValueError("the reference collection has a different scale factor")
+    truth = load_collection(W, collection)
+    corpus_rows = data.read_corpus(W / "data" / TAG)
+    corpus = data.corpus_identity(
+        corpus_rows, SF, data.DATA_SEED, data.SOURCE_REVISIONS)
+    if corpus["corpus_id"] != truth.corpus_id:
+        raise ValueError("the corpus and reference labels have different ids")
+    selected = select_queries(
+        args.queries.split(",") if args.queries else None, scale_factor=SF)
+    for query in selected:
+        for operator in query._info.operators:
+            labels = truth.predicates[truth.key_for_template(operator.prompt)]
+            spec = PREDICATE_BY_KEY[labels.key]
+            if ("qwen3_32b" in spec.source_policy
+                    and labels.predicate_payload != predicate_payload(spec)):
+                raise ValueError(f"{spec.key}: reference prompt format differs")
 answer = answer_oracle(truth, corpus_rows)
 
 # ================================================================
@@ -178,8 +201,10 @@ answer = answer_oracle(truth, corpus_rows)
 # ================================================================
 
 session = quail.Session(
-    EngineConfig(gpus=1, model=QWEN3_4B_FP8.name), tokenizer=encode)
-register_tables(session, W / "data" / TAG)
+    EngineConfig(gpus=1, model=QWEN3_4B_FP8.name, device="h100-sxm"),
+    tokenizer=encode)
+for name, table in corpus_rows.items():
+    session.register(name, quail.DocumentProvider.from_table(table, id_col="id"))
 query_defs = queries(session)
 query_ids = list(query_defs)
 if args.queries:
@@ -190,7 +215,7 @@ if args.queries:
 
 # 2. prompt lengths, for the record
 FILTER_TEMPLATES = {c: getattr(prompts, c) for c in (
-    "F1", "F4", "F5", "F7", "F11", "F12", "F13",
+    "F1", "F4", "F5", "SERIOUS_ADVERSE_EVENT", "F11", "F12", "F13",
     "LEP1", "LEP2", "LEP3", "LEP4", "LEP5", "LEPS1")}
 JOIN_TEMPLATES = {c: getattr(prompts, c) for c in (
     "DISCUSS_ASPECT", "ASPECT_SENTIMENT", "REACTION",
@@ -310,12 +335,14 @@ assumptions = {}
 for qid in query_ids:
     description, build = query_defs[qid]
     probe = build()
-    scans = collect_operators(probe.logical)[0]
+    scans = probe.logical.operators().scans
     for scan in scans:
         stores.setdefault(
             f"{scan.provider}.{scan.column}", probe.token_inputs()[scan.alias])
     rows[qid] = {
         "description": description,
+        "plan_sha256": hashlib.sha256(get_query(qid).plan_bytes).hexdigest(),
+        "prompt_format": PROMPT_FORMAT,
         "alias_columns": {
             scan.alias: f"{scan.provider}.{scan.column}" for scan in scans},
         "models": {},

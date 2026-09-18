@@ -2,7 +2,7 @@
 
 Pull the measured runs, the corpus manifest, and the SoL estimates:
 
-    W=/tmp/quail-comparison; mkdir -p "$W/run" "$W/fev10"
+    W=/tmp/quail-comparison; mkdir -p "$W/run" "$W/fev10" "$W/bio"
     RUNS=benchmarks/quailb/family-runs
     RUN=$RUNS/20260912T225100Z-902686c5
     uv run modal volume get quail-results "$RUN/manifest.json" "$W/run/manifest.json"
@@ -17,17 +17,33 @@ Pull the measured runs, the corpus manifest, and the SoL estimates:
     uv run modal volume get quail-results "$CORPUS/manifest.json" "$W/corpus.json"
     uv run modal volume get quail-results \
       sol/2026-09-11-quailb-prefix-reuse.json "$W/sol.json"
-    uv run --with matplotlib python reports/make_quailb_comparison_plots.py "$W"
+    BIO=$RUNS/20260918T060700Z-biodex-chat
+    uv run modal volume get quail-results "$BIO/manifest.json" "$W/bio/manifest.json"
+    uv run modal volume get quail-results "$BIO/measurements.parquet" \
+      "$W/bio/measurements.parquet"
+    for METHOD in quail pipelined_vllm; do
+      mkdir -p "$W/bio/$METHOD"
+      uv run modal volume get quail-results "$BIO/$METHOD/run.json" \
+        "$W/bio/$METHOD/run.json"
+    done
+    uv run modal volume get quail-results \
+      sol/2026-09-18-biodex-chat/sol_quailb_sf0.1_BIO-1_BIO-2_BIO-3.json \
+      "$W/bio-sol.json"
+    BENCH=git+https://github.com/fsdatalab/quail-bench.git
+    REV=fc27f35188f0fcc6a1f3b8fe3bfbb9e12d6842eb
+    uv run --with matplotlib --with "quail-b@$BENCH@$REV" \
+      python reports/make_quailb_comparison_plots.py "$W"
 
-Every method and query comes from the September 12 run, except the
-two vLLM configurations' FEV-10, which come from the September 11
-FEV-10 run. The September 12 FEVER container failed on FEV-10 in the
+BioDEX uses the September 18 chat-format run. Other queries come from
+September 12, except the two vLLM configurations' FEV-10, which come
+from the September 11 FEV-10 run. The September 12 FEVER container failed in the
 request backends (fixed since) and was not rerun, so pipelined vLLM
 has no FEV-1 to FEV-9 measurement: those cells are marked missing,
 not filled from older runs. SGLang is not reported.
 """
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
@@ -50,6 +66,7 @@ QUERY_ORDER = (
     [f"IMDB-{n}" for n in range(1, 11)] + [f"BIO-{n}" for n in range(1, 4)]
     + [f"FEV-{n}" for n in range(1, 11)] + [f"LEP-{n}" for n in range(1, 9)]
     + ["AGENT-1", "AGENT-2"])
+BIO_QUERIES = ("BIO-1", "BIO-2", "BIO-3")
 
 
 def token_cell(value):
@@ -104,8 +121,21 @@ def load_sol(root, queries, rows, corpus):
     """Load compatible estimates with prefix reuse across requests."""
     from quail.bench.substrait import read_plan
     from quail_b.queries import get_query
+    from quail_b.rendering import PROMPT_FORMAT
 
     source = json.loads((root / "sol.json").read_text())
+    bio_source = json.loads((root / "bio-sol.json").read_text())
+    bio_manifest = json.loads((root / "bio" / "manifest.json").read_text())
+    assert bio_source["corpus_id"] == corpus["corpus_id"]
+    assert bio_source["collection_id"] == bio_manifest["collection_id"]
+    assert bio_source["scale_factor"] == 0.1
+    assert bio_source["optimizer"]["persistent_kv_capacity"] == "unlimited"
+    assert set(bio_source["queries"]) == set(BIO_QUERIES)
+    for query, record in bio_source["queries"].items():
+        assert record["prompt_format"] == PROMPT_FORMAT
+        assert record["plan_sha256"] == hashlib.sha256(
+            get_query(query).plan_bytes).hexdigest()
+    source["queries"].update(bio_source["queries"])
     assert source["corpus_id"] == corpus["corpus_id"]
     assert source["scale_factor"] == 0.1
     assert source["optimizer"]["persistent_kv_capacity"] == "unlimited"
@@ -135,8 +165,10 @@ def series_value(rows, sol, method, query, metric):
 
 def metric_bars(axis, queries, rows, sol, metric, overview):
     """Draw measured bars and a SoL line across each query group."""
-    methods = METHODS + ([] if metric == "agreement"
-                         else [("sol", "SoL estimate", DARK)])
+    measured = [item for item in METHODS
+                if item[0] != "stock_vllm" or set(queries) != set(BIO_QUERIES)]
+    methods = measured + ([] if metric == "agreement"
+                          else [("sol", "SoL estimate", DARK)])
     positive = [value for key, _, _ in methods for query in queries
                 if (value := series_value(rows, sol, key, query, metric)) is not None
                 and value > 0]
@@ -162,9 +194,9 @@ def metric_bars(axis, queries, rows, sol, metric, overview):
         axis.set_ylabel("seconds" if metric == "seconds" else "tokens")
         if not maximum:
             axis.set_yticks([0])
-    width = 0.82 / len(METHODS)
+    width = 0.82 / len(measured)
     floor = axis.get_ylim()[0]
-    for method_index, (key, label, color) in enumerate(METHODS):
+    for method_index, (key, label, color) in enumerate(measured):
         xs, values = [], []
         for index, query in enumerate(queries):
             position = index - 0.41 + (method_index + 0.5) * width
@@ -186,6 +218,16 @@ def metric_bars(axis, queries, rows, sol, metric, overview):
                               ha="center", va="bottom", fontsize=8)
         axis.bar(xs, [value - floor for value in values], bottom=floor,
                  width=width * 0.9, color=color, label=label, edgecolor="none")
+    if metric == "seconds" and not overview:
+        for index, query in enumerate(queries):
+            if query not in BIO_QUERIES:
+                continue
+            quail_time = rows["quail"][query]["runtime_s"]
+            baseline_time = rows["pipelined_vllm"][query]["runtime_s"]
+            top = max(quail_time, baseline_time)
+            axis.text(index, top * (3 if logarithmic else 1.3),
+                      f"{baseline_time / quail_time:.2f}x faster", ha="center",
+                      va="bottom", fontsize=9)
     if metric != "agreement":
         for index, query in enumerate(queries):
             axis.hlines(series_value(rows, sol, "sol", query, metric),
@@ -248,7 +290,8 @@ def plot_comparison(title, queries, rows, relations, sol, name, overview=False):
             figure.suptitle(f"{title}, Qwen3 4B FP8, sf=0.1, one H100", y=0.97,
                             fontsize=16)
             handles = [Patch(facecolor=color, label=label)
-                       for _, label, color in METHODS]
+                       for key, label, color in METHODS
+                       if key != "stock_vllm" or set(queries) != set(BIO_QUERIES)]
             if metrics != ["agreement"]:
                 handles.append(Line2D([0], [0], color=DARK, linewidth=1.7,
                                       label="SoL estimate"))
@@ -286,8 +329,8 @@ def check_manifest(manifest):
 def load_rows(root, corpus):
     """Return {method: {query: row}} and the source of every cell.
 
-    The September 12 run supplies every cell it has and the FEV-10 run
-    fills the baselines' FEV-10. A cell neither run produced is absent.
+    BioDEX uses the chat-format run. Other cells come from September 12,
+    with the baselines' FEV-10 filled from its separate run.
     """
     manifest = json.loads((root / "run" / "manifest.json").read_text())
     fev10_manifest = json.loads((root / "fev10" / "manifest.json").read_text())
@@ -301,14 +344,40 @@ def load_rows(root, corpus):
         if "FEV-10" not in rows.setdefault(key, {}) and "FEV-10" in fev10.get(key, {}):
             rows[key]["FEV-10"] = fev10[key]["FEV-10"]
             sources[(key, "FEV-10")] = "fev10"
-    return rows, sources, manifest, fev10_manifest
+    from quail_b.queries import get_query
+    from quail_b.rendering import PROMPT_FORMAT
+    from quail_b.run import _query_hash
+
+    bio_manifest = json.loads((root / "bio" / "manifest.json").read_text())
+    assert bio_manifest["status"] == "complete"
+    assert bio_manifest["model"] == "qwen3-4b-fp8"
+    assert bio_manifest["sf"] == 0.1
+    assert set(bio_manifest["query_ids"]) == set(BIO_QUERIES)
+    assert set(bio_manifest["methods"]) == {"quail", "pipelined_vllm"}
+    bio_rows = measurement_rows(root / "bio" / "measurements.parquet")
+    for method, _, _ in METHODS:
+        for query in BIO_QUERIES:
+            rows[method].pop(query, None)
+            sources.pop((method, query), None)
+    for method in bio_manifest["methods"]:
+        suite = json.loads((root / "bio" / method / "run.json").read_text())
+        assert suite["corpus_id"] == corpus["corpus_id"]
+        assert suite["collection_id"] == bio_manifest["collection_id"]
+        assert suite["metadata"]["prompt_format"] == PROMPT_FORMAT
+        assert set(bio_rows[method]) == set(BIO_QUERIES)
+        for item in suite["queries"]:
+            assert item["status"] == "complete"
+            assert item["definition_hash"] == _query_hash(get_query(item["id"]))
+        rows[method].update(bio_rows[method])
+        sources.update({(method, query): "bio" for query in BIO_QUERIES})
+    return rows, sources, manifest, fev10_manifest, bio_manifest
 
 
 def main(workdir):
     """Regenerate the figures and the report from the pulled files."""
     root = Path(workdir)
     corpus = json.loads((root / "corpus.json").read_text())
-    rows, sources, manifest, fev10_manifest = load_rows(root, corpus)
+    rows, sources, manifest, fev10_manifest, bio_manifest = load_rows(root, corpus)
     queries = list(QUERY_ORDER)
     assert all(query in rows["quail"] for query in queries)
     compared = [query for query in queries if query in rows["stock_vllm"]]
@@ -323,12 +392,18 @@ def main(workdir):
             assert (sum(count for _, _, count in relations[query])
                     == row["input_rows"])
     sol = load_sol(root, queries, rows, corpus)
+    bio_baseline = json.loads(
+        (root / "bio" / "pipelined_vllm" / "run.json").read_text())
+    bio_capacity = bio_baseline["queries"][0]["measurements"][
+        "backend_metrics"]["capacity"]
     overview = plot_comparison("QUAIL-B", queries, rows, relations, sol,
                                "quailb_main.pdf", overview=True)
     fev = row_metrics(rows["quail"]["FEV-9"])
+    bio2 = row_metrics(rows["quail"]["BIO-2"])
+    bio3 = row_metrics(rows["quail"]["BIO-3"])
     output = rows["quail"]["FEV-9"]
     calls = {key: call for key, call in manifest["function_call_ids"].items()
-             if not key.endswith(":sglang")}
+             if not key.endswith(":sglang") and not key.startswith("bio:")}
     labels = {key: label for key, label, _ in METHODS}
 
     def cells_text(cells):
@@ -355,7 +430,20 @@ def main(workdir):
         "  Quail and the vLLM configurations shared a physical GPU within each",
         "  family. Stock vLLM used operator-at-a-time submission; the other two",
         "  pipeline their requests.",
-        "- Quail, stock vLLM, and pipelined vLLM were run on September 12, 2026: "
+        "- BioDEX uses non-thinking chat prompts and newly generated Qwen3 32B",
+        "  reference labels. BIO-1 and BIO-3 filter for serious adverse events.",
+        "  Quail and pipelined stock vLLM were rerun on September 18:",
+        f"  `/results/benchmarks/quailb/family-runs/{bio_manifest['run_id']}/`.",
+        "  The older BioDEX measurements are omitted. Other datasets retain",
+        "  their earlier prompts and measurements.",
+        "  Quail's planned limits were 110,376 tokens per chunk and 362,250",
+        "  resident KV tokens. Pipelined stock vLLM used prefix caching,",
+        f"  {bio_capacity['max_num_batched_tokens']:,} batched tokens,",
+        f"  {bio_capacity['max_num_seqs']:,} sequences, and GPU memory utilization",
+        f"  {bio_capacity['gpu_memory_utilization']:.2f}. Its measured KV capacity",
+        f"  was {bio_capacity['kv_cache_size_tokens']:,} tokens. Both methods used",
+        "  the same planner's filter and join ordering rules.",
+        "- Other datasets use the September 12, 2026 run: "
         f"`/results/benchmarks/quailb/family-runs/{manifest['run_id']}/`,",
         "  function calls " + ", ".join(f"`{call}`" for call in calls.values()) + ".",
         "  That run's FEVER container failed on FEV-10 in the request backends (an",
@@ -363,8 +451,8 @@ def main(workdir):
         f"  was not rerun. {len(borrowed)} of the 99 cells come from the September 11",
         f"  FEV-10 run (`/results/benchmarks/quailb/family-runs/"
         f"{fev10_manifest['run_id']}/`): {cells_text(borrowed)}.",
-        f"  {len(missing)} cells have no measurement and are marked missing, in the",
-        "  plots by an x below the axis and in the tables by a row that says so:",
+        f"  {len(missing)} cells have no current measurement. The main plot marks",
+        "  them with an x below the axis:",
         f"  {cells_text(missing)}.",
         f"- Quail was faster than stock vLLM on {faster} of {len(compared)} queries",
         "  where both were measured.",
@@ -376,13 +464,19 @@ def main(workdir):
         "  so the gap from SoL is not purely execution overhead. SoL uses the",
         "  distinct-prefix estimate, not the per-document-only estimate. No",
         "  accuracy is assigned to SoL because it is not a measured model run.",
-        "  SoL was recalculated for all 33 queries on the CPU on September 11,",
-        "  2026, from saved labels and corpus rows.",
+        "  SoL was calculated from saved labels and corpus rows on the CPU:",
+        "  BioDEX on September 18, and the other datasets on September 11.",
         "- Answer agreement measures evaluated calls against saved Qwen3 32B labels.",
         "  Each method can evaluate different calls after its filters and joins.",
         "  Output precision is the fraction of returned rows matching the reference.",
         "  Output recall is the fraction of reference rows returned. High answer",
         "  agreement can coexist with poor final output precision.",
+        "- The prediction was 20 to 35 seconds for BIO-1 and faster joins in Quail",
+        "  than in pipelined stock vLLM. The measured times support both predictions.",
+        f"- Quail's output recall is {bio2['recall']:.2f}% on BIO-2 and",
+        f"  {bio3['recall']:.2f}% on BIO-3 against the saved 32B references.",
+        f"  Per-answer agreement is {bio2['agreement']:.2f}% and",
+        f"  {bio3['agreement']:.2f}%, respectively. Most evaluated pairs are negative.",
         "- Query time excludes startup. Throughput counts input documents for filters",
         "  and evaluated document pairs across all stages for joins. GPU cost is query",
         f"  seconds divided by 3,600 and multiplied by ${H100_USD_PER_HOUR:.4f}.",
@@ -414,6 +508,8 @@ def main(workdir):
         f"Figure: plots/{overview}", "",
         "SoL estimates on `quail-results`: "
         "`/results/sol/2026-09-11-quailb-prefix-reuse.json`.", "",
+        "BioDEX SoL: `/results/sol/2026-09-18-biodex-chat/"
+        "sol_quailb_sf0.1_BIO-1_BIO-2_BIO-3.json`.", "",
         "Corpus counts on `quail-results`: `/results/ground_truth/quailb/"
         f"schema_v1/corpora/{corpus['corpus_id']}/manifest.json`.", "",
         "The download commands are in `reports/make_quailb_comparison_plots.py`.",
@@ -431,6 +527,24 @@ def main(workdir):
             counts = ", ".join(f"{alias} ({provider}) = {count:,}"
                                for alias, provider, count in relations[query])
             lines.append(f"| {query} | {counts} |")
+        if family == "BIO":
+            terms = corpus["tables"]["terms"]["rows"]
+            survivors = {}
+            for method in ("quail", "pipelined_vllm"):
+                pairs = rows[method]["BIO-3"]["evaluated_document_pairs"]
+                assert pairs % terms == 0
+                survivors[method] = pairs // terms
+            ratios = [
+                rows["pipelined_vllm"][query]["runtime_s"]
+                / rows["quail"][query]["runtime_s"] for query in BIO_QUERIES]
+            lines.extend([
+                "", "Quail was " + ", ".join(f"{ratio:.2f}x" for ratio in ratios)
+                + " faster than pipelined stock vLLM on BIO-1, BIO-2, and BIO-3,"
+                " respectively.",
+                "", "BIO-3 filter survivors: "
+                f"{sol['BIO-3']['documents_after_filters']:,} in the reference, "
+                f"{survivors['quail']:,} in Quail, and "
+                f"{survivors['pipelined_vllm']:,} in pipelined stock vLLM."])
         lines.extend(["",
                       "| Query | Method | Seconds | Recomputed KV tokens "
                       "| Fresh input tokens | Throughput | Unit | $/query "
@@ -439,12 +553,15 @@ def main(workdir):
                       "|---|---|---:|---:|---:|---:|---|---:|---:|---:|---:|---|"])
         for query in selected:
             for key, label, _ in METHODS:
+                if family == "BIO" and key == "stock_vllm":
+                    continue
                 if query not in rows[key]:
                     lines.append(f"| {query} | {label} | missing | | | | | | | | "
                                  "| not run |")
                     continue
                 m = row_metrics(rows[key][query])
                 source = {"run": "September 12",
+                          "bio": "September 18 BioDEX",
                           "fev10": "FEV-10 run"}[sources[(key, query)]]
                 lines.append(
                     f"| {query} | {label} | {m['seconds']:.2f} "
