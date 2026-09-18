@@ -15,7 +15,11 @@ import time
 
 import numpy as np
 
-from quail.backends.quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
+from quail.backends.quail.executor.attention import (
+    FILTER_ATTENTION,
+    JOIN_ATTENTION,
+    Chunk,
+)
 from quail.backends.quail.executor.model import answer_weights
 from quail.backends.quail.executor.pack import FilterAdmission, JoinAdmission
 from quail.logical import true_false_ids
@@ -223,7 +227,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         fresh = g.get("prefix") is not None
         f = g["f"]
         key = g["key"]
-        paged = key in arena.accounting.owned
+        paged = arena.is_resident(key)
         row0 = token_count
         if fresh:
             if not paged and len(g["suffixes"]) > 1:
@@ -316,7 +320,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         tail_src = []
         tail_dst = []
 
-        page_tokens = arena.accounting.page_tokens
+        page_tokens = arena.page_tokens
 
         def add_sequence(pages, kv_tokens, query_tokens):
             kv_page_rows.append(pages)
@@ -330,7 +334,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 r0, r1 = spec["row0"], spec["row1"]
                 spans = spec["suffix_spans"]
                 logical_start = 0 if spec["fresh"] else f
-                rows = arena._capacity_rows[key]
+                rows = arena.capacity_rows(key)
                 count = r1 - r0
                 direct = len(spans) == 1 \
                     and logical_start + count <= rows.numel()
@@ -339,7 +343,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                     kv_dst.append(
                         rows[logical_start:logical_start + count].numpy())
                     add_sequence(
-                        arena.accounting.owned[key],
+                        arena.owned_pages(key),
                         f + sum(e - s for s, e in spans), count)
                     continue
 
@@ -348,11 +352,11 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                     activation_src.append(np.arange(
                         r0, spec["prefix_end"], dtype=np.int64))
                     kv_dst.append(rows[:prefix_count].numpy())
-                    prefix_pages = arena.accounting.owned[key][
-                        :arena.accounting.pages_needed(f)]
+                    prefix_pages = arena.owned_pages(key)[
+                        :arena.pages_needed(f)]
                     add_sequence(prefix_pages, f, prefix_count)
 
-                anchor_pages = arena.accounting.owned[key]
+                anchor_pages = arena.owned_pages(key)
                 for s0, s1 in spans:
                     suffix_tokens = s1 - s0
                     remainder = f % page_tokens
@@ -363,7 +367,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                             "split the chunk")
                     temp_key, temp_pages = got
                     temporary_keys.append(temp_key)
-                    temp_rows = arena._capacity_rows[temp_key]
+                    temp_rows = arena.capacity_rows(temp_key)
                     activation_src.append(np.arange(s0, s1, dtype=np.int64))
                     kv_dst.append(
                         temp_rows[remainder:remainder + suffix_tokens].numpy())
@@ -411,7 +415,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         dst_parts = []
         for key, r0, r1, dest in kv_writes:
             src.extend(range(r0, r1))
-            rows = arena._capacity_rows[key][dest:dest + (r1 - r0)]
+            rows = arena.capacity_rows(key)[dest:dest + (r1 - r0)]
             if rows.numel() != r1 - r0:
                 raise AssertionError("KV write exceeds reserved rows")
             dst_parts.append(rows)
@@ -425,14 +429,13 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         unified=unified,
         cu_a=stage("cu_a", cu_a, torch.int32),
         max_a=max(cu_a[i + 1] - cu_a[i] for i in range(len(cu_a) - 1)))
-    out = dict(
+    out = Chunk(
         input_ids=_staged_token_parts(
             torch, id_parts, token_count, pinned, staging),
         positions=stage("positions", concatenate(pos), torch.int64),
         final_indices=stage("finals", finals, torch.int64),
-        meta=meta, tokens=token_count, layout=layout)
-    if temporary_keys:
-        out["temporary_keys"] = temporary_keys
+        meta=meta, tokens=token_count, layout=layout,
+        temporary_keys=tuple(temporary_keys))
     _tick(timing, "pack_h2d", t)
     return out
 
@@ -504,13 +507,12 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     if len(keys) != len(prefixes):
         raise ValueError("anchor_keys must match anchor_prefixes")
     frames = stage_frames or [[] for _ in range(k)]
-    owned = arena.accounting.owned
 
     if k == 0:
         return [], [], 0
     frame_max = max(len(f) for f in frames)
-    resident = {a: len(owned[keys[a]]) for a in range(len(keys))
-                if keys[a] in owned}
+    resident = {a: len(arena.owned_pages(keys[a])) for a in range(len(keys))
+                if arena.is_resident(keys[a])}
     # Every resident anchor stays available for the whole join while
     # fresh admissions evict unrelated retained KV.
     for a in resident:
@@ -521,7 +523,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     sched = JoinAdmission(
         [len(p) for p in prefixes],
         [[len(s) for s in sufs] for sufs in stage_suffixes],
-        budget, arena.accounting.n_pages, arena.accounting.page_tokens,
+        budget, arena.n_pages, arena.page_tokens,
         frame_tokens=[len(f) for f in frames], resident=resident,
         anchor_partners={a: partners_of(keys[a]) for a in range(len(keys))},
         temporary_suffix_pages=(
@@ -544,17 +546,17 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         if anchor_batch is not None and items:
             kept = set(anchor_batch([key for key, _ in items]))
             for key, _ in items:
-                if key not in kept and key in owned:
+                if key not in kept and arena.is_resident(key):
                     arena.free_key(key)
             items = [(key, prefix) for key, prefix in items if key in kept]
         for key, prefix in items:
-            if key not in owned:
+            if not arena.is_resident(key):
                 raise ValueError(
                     f"streamed anchor {key!r} has no KV in the arena")
             arena.pin(key)
             keys.append(key)
             prefixes.append(prefix)
-            sched.admit(len(prefix), len(owned[key]),
+            sched.admit(len(prefix), len(arena.owned_pages(key)),
                         partners=partners_of(key))
 
     def pull(evict_retained=False, force=False):
@@ -610,7 +612,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
 
     def settle(anchor):
         if anchor_done is None:
-            if keys[anchor] in owned:
+            if arena.is_resident(keys[anchor]):
                 arena.free_key(keys[anchor])
         else:
             anchor_done(anchor, sched.answers[k - 1].get(anchor, []))
@@ -619,7 +621,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         if kind == "finished":
             settle(anchor)
             finished[0] += 1
-        elif keys[anchor] in owned:
+        elif arena.is_resident(keys[anchor]):
             arena.free_key(keys[anchor])
 
     def report(entry):
@@ -651,7 +653,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
             # the free list is short for the next fresh anchor:
             # retained KV nothing here reads makes room
             arena.evict_retained(sched.blocked_pages)
-        groups = sched.next_chunk(arena.accounting.free_pages)
+        groups = sched.next_chunk(arena.free_pages)
         if not groups:
             if outstanding:
                 report(outstanding.pop(0))
@@ -664,7 +666,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         if attention_mode is not None:
             pipeline.attention_mode = attention_mode
         chunk = build(groups)
-        tokens += chunk["tokens"]
+        tokens += chunk.tokens
         e0 = torch.cuda.Event(enable_timing=True)
         e1 = torch.cuda.Event(enable_timing=True)
         e0.record()
@@ -974,17 +976,17 @@ class FilterStream:
         capacity_extra = p + temp_tail
         if hold_survivors:
             capacity_extra = max(capacity_extra, hold_extra_tokens)
-        if arena.accounting.retention_cap_pages is None:
-            arena.accounting.retention_cap_pages = max(
-                0, arena.accounting.n_pages
-                - arena.accounting.pages_needed(2 * budget))
+        if arena.retention_cap_pages is None:
+            arena.retention_cap_pages = max(
+                0, arena.n_pages
+                - arena.pages_needed(2 * budget))
         self.sched = FilterAdmission(
             [len(d) for d in doc_ids], stage_tokens, budget,
-            arena_pages=(arena.accounting.n_pages if arena_writes
+            arena_pages=(arena.n_pages if arena_writes
                          else None),
-            page_tokens=arena.accounting.page_tokens,
+            page_tokens=arena.page_tokens,
             kept_extra_tokens=capacity_extra, limit=limit,
-            available_pages=(arena.accounting.free_pages
+            available_pages=(arena.free_pages
                              if arena_writes else None))
         self.torch = torch
         self.arena = arena
@@ -1083,7 +1085,7 @@ class FilterStream:
                 return items, False
             if self.hold:
                 # the consumer frees and claims pages between chunks
-                sched.free_pages = arena.accounting.free_pages
+                sched.free_pages = arena.free_pages
             t = time.perf_counter() if timing is not None else 0.0
             groups = sched.next_chunk()
             t = _tick(timing, "next_chunk", t)
@@ -1093,9 +1095,9 @@ class FilterStream:
                 self._report(self.outstanding.pop(0), items)
                 continue
             if sched.blocked_pages and (evict_retained or not self.hold):
-                before = arena.accounting.free_pages
+                before = arena.free_pages
                 arena.evict_retained(sched.blocked_pages)
-                freed = arena.accounting.free_pages - before
+                freed = arena.free_pages - before
                 if freed:
                     if not self.hold:
                         sched.add_free_pages(freed)
@@ -1119,7 +1121,7 @@ class FilterStream:
                            timing=timing, pinned=self.pinned,
                            attention_mode=self.attention_mode)
         t = _tick(timing, "pack", t)
-        self.tokens += chunk["tokens"]
+        self.tokens += chunk.tokens
         torch = self.torch
         e0 = torch.cuda.Event(enable_timing=True)
         e1 = torch.cuda.Event(enable_timing=True)

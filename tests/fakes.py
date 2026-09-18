@@ -70,7 +70,7 @@ class FakeModel:
     def forward_chunk(self, chunk):
         bits = []
         kind = None
-        for spec in chunk["specs"]:
+        for spec in chunk.specs:
             for suffix in spec["suffixes"]:
                 head = suffix[0]
                 if head >= FRAME:
@@ -85,7 +85,7 @@ class FakeModel:
                     kind = "filter"
             if kind == "join" and spec["prefix"] is not None:
                 raise AssertionError("a streamed anchor packed its prefix")
-        self.launched.append((kind, chunk["specs"]))
+        self.launched.append((kind, chunk.specs))
         return bits
 
 
@@ -104,7 +104,7 @@ def fake_pack(torch, arena, specs, **kw):
         (len(spec["prefix"]) if spec["prefix"] is not None else 0)
         + sum(len(suffix) for suffix in spec["suffixes"])
         for spec in specs)
-    return {"specs": specs, "tokens": tokens}
+    return SimpleNamespace(specs=specs, tokens=tokens)
 
 
 def expected_filter_rows(filter_truth):

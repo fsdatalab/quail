@@ -446,7 +446,7 @@ def _child_filters(state, sub):
             answers = result.outputs[f"filter_answers:{alias}"]
             if node.keep_kv:
                 out["retained"][alias] = sorted(
-                    key[1] for key in arena.accounting.retained
+                    key[1] for key in arena.retained_keys()
                     if key[0] == alias)
             out["fresh_tokens"] += result.metrics.fresh_tokens
             out["filters"][alias] = {
@@ -455,7 +455,7 @@ def _child_filters(state, sub):
             out["survivors"][alias] = list(
                 result.outputs[f"ids:{alias}"]
             )
-    for alias, document in arena.accounting.retained:
+    for alias, document in arena.retained_keys():
         out["retained"].setdefault(alias, []).append(document)
     out["retained"] = {alias: sorted(set(documents))
                        for alias, documents in out["retained"].items()}
@@ -524,7 +524,7 @@ def _child_joins(state, sub):
         if filter_node is None:
             prefixes = [chain_tokens(pre, d) for d in anchor_docs]
             anchor_keys = [(anchor_alias, g) for g in anchors_glob]
-            round_kv = _join_round_kv(anchor_keys, arena.accounting.owned)
+            round_kv = _join_round_kv(anchor_keys, arena)
             anchor_stream = None
         else:
             # filled by the driver as this GPU's shard streams through
@@ -589,7 +589,7 @@ def _child_joins(state, sub):
             )
         last = ans[-1] if ans else {}
         for a, key in enumerate(anchor_keys):
-            if key not in arena.accounting.owned:
+            if not arena.is_resident(key):
                 continue
             matched = any(last.get(a, []))
             alive = (not matched if group[-1]["semantics"] == "anti"
@@ -608,11 +608,11 @@ def _child_joins(state, sub):
                 partner_index=tuple_globs[si],
                 anchor_partners=partner_lists[si]))
     if sub.get("final_group"):
-        for key in list(arena.accounting.owned):
+        for key in arena.resident_keys():
             arena.free_key(key)
     torch.cuda.synchronize()
     retained = {}
-    for alias, document in arena.accounting.retained:
+    for alias, document in arena.retained_keys():
         retained.setdefault(alias, []).append(document)
     return dict(joins=out_joins, fresh_tokens=tokens_total,
                 retained={alias: sorted(documents)
@@ -630,7 +630,7 @@ def _reset_child_query(state):
     """Clear KV and counters before a child starts a new query."""
     gpu = state.get("gpu")
     arena = gpu.arena if gpu else state["arena"]
-    for key in list(arena.accounting.owned):
+    for key in arena.resident_keys():
         arena.free_key(key)
     arena.reset_stats()
 

@@ -11,7 +11,15 @@ arena and runs one causal varlen call per group.
 
 Pipeline(kernels="vllm") swaps the fused Triton kernels for vLLM's
 unfused equivalents. torch is imported lazily.
+
+The forward loop calls four primitives: norm_quant, qk_norm_rope,
+attention, and activation_quant. Each picks the kernel set, the
+precision path, and the attention mode itself, so the loop is
+straight-line code. Its input is a Chunk built by pack_chunk.
 """
+
+from dataclasses import dataclass
+from typing import Any
 
 GROUP = 128            # fp8 quant group size, matches the engine
 
@@ -19,6 +27,30 @@ GROUP = 128            # fp8 quant group size, matches the engine
 # "merge_quant" (two-call pattern with fused merge+quant kernel).
 FILTER_ATTENTION = "unified"
 JOIN_ATTENTION = "merge_quant"
+
+
+@dataclass
+class Chunk:
+    """One packed forward pass: token rows plus attention bookkeeping.
+
+    Attributes:
+        input_ids: Token ids, one per packed row, on the GPU.
+        positions: Rotary position of each row.
+        final_indices: Rows whose hidden state feeds the answer readout.
+        meta: Attention-path bookkeeping built by pack_chunk: the layer
+            counter, KV scatter maps, block tables, and sequence bounds.
+        tokens: Rows in the chunk.
+        layout: (arena key, suffix count) per group in chunk order.
+        temporary_keys: Arena keys the forward pass frees when it ends.
+    """
+
+    input_ids: Any
+    positions: Any
+    final_indices: Any
+    meta: dict
+    tokens: int
+    layout: list
+    temporary_keys: tuple = ()
 
 
 def flash_attention_version(capability: tuple[int, int]) -> int:
@@ -411,8 +443,9 @@ class Pipeline:
         assert k3.is_contiguous() and v3.is_contiguous()
         n = src.shape[0]
         row = self.num_kv_heads * self.head_dim
+        k_pool, v_pool = self.arena.layer_kv(layer)
         self._triton_kernels()["kv_scatter"][(n,)](
-            k3, v3, self.arena.k[layer], self.arena.v[layer], src, dst,
+            k3, v3, k_pool, v_pool, src, dst,
             ROW=row, ROW_POW2=1 << (row - 1).bit_length())
 
     def merge_attn_quant(self, out_a, lse_a, out_b, lse_b, source):
@@ -437,6 +470,36 @@ class Pipeline:
             q.stride(0), scales.stride(1), scales.stride(0),
             D=dim, GPB=gpb, UE8M0=self.use_ue8m0)
         return q, scales
+
+    # ---- the primitives a forward loop calls -------------------------
+
+    def norm_quant(self, hidden, norm, residual=None):
+        """RMS-normed, quantized GEMM input; adds the residual first when given."""
+        if residual is None:
+            return self.quant(self.rms_norm(hidden, norm))
+        if self.kernels == "quail":
+            return self.custom_norm_quant(hidden, norm, residual)
+        return self.vllm_norm_quant(hidden, norm, residual)
+
+    def activation_quant(self, gate_up):
+        """SiLU-gated product of the two gate_up halves, quantized."""
+        if self.kernels == "quail":
+            return self.custom_silu_quant(gate_up)
+        return self.vllm_silu_quant(gate_up)
+
+    def qk_norm_rope(self, qkv, positions, attn):
+        """Per-head normed and rotated q and k from the fused qkv output."""
+        if self.kernels == "quail":
+            return self.custom_qk_norm_rope(qkv, positions, attn)
+        return self.vllm_qk_norm_rope(qkv, positions, attn)
+
+    def attention(self, q, k, v, meta):
+        """Attention over the chunk and the arena; the quantized o_proj input."""
+        if self.attention_mode == "merge_quant":
+            if not self.is_fp8:
+                raise ValueError("BF16 forward passes require unified attention")
+            return self.attention_merge_quant(q, k, v, meta)
+        return self.quant(self.attention_unified(q, k, v, meta))
 
     # ---- attention: the two workload paths --------------------------
 
@@ -514,9 +577,9 @@ class Pipeline:
             self.kv_row_scatter(k3, v3, unified["src"], unified["dst"],
                                 layer)
         if unified["tail_src"] is not None:
-            self.kv_row_scatter(
-                self.arena.k[layer], self.arena.v[layer],
-                unified["tail_src"], unified["tail_dst"], layer)
+            k_pool, v_pool = self.arena.layer_kv(layer)
+            self.kv_row_scatter(k_pool, v_pool,
+                                unified["tail_src"], unified["tail_dst"], layer)
         kp, vp = self.arena.paged_kv(layer)
         out, _ = self._fa(
             q3, kp, vp, unified["cu_q"], None,
@@ -531,55 +594,35 @@ class Pipeline:
         try:
             return self._forward_chunk(chunk)
         finally:
-            for key in chunk.pop("temporary_keys", ()):
+            keys, chunk.temporary_keys = chunk.temporary_keys, ()
+            for key in keys:
                 self.arena.free_key(key)
 
     def _forward_chunk(self, chunk):
-        if not self.is_fp8 and self.attention_mode != "unified":
-            raise ValueError("BF16 forward passes require unified attention")
-        meta = chunk["meta"]
+        meta = chunk.meta
         meta["layer"] = 0
-        input_ids, positions = chunk["input_ids"], chunk["positions"]
-        hidden = self.embed(input_ids)
+        positions = chunk.positions
+        hidden = self.embed(chunk.input_ids)
         residual = None
         for layer in self.layers:
             attn = layer.self_attn
             if residual is None:
                 residual = hidden
-                q_in, q_scale = self.quant(
-                    self.rms_norm(hidden, layer.input_layernorm))
-            elif self.kernels == "quail":
-                q_in, q_scale = self.custom_norm_quant(
-                    hidden, layer.input_layernorm, residual)
+                q_in, q_scale = self.norm_quant(hidden, layer.input_layernorm)
             else:
-                q_in, q_scale = self.vllm_norm_quant(
+                q_in, q_scale = self.norm_quant(
                     hidden, layer.input_layernorm, residual)
             qkv = self.gemm(q_in, q_scale, attn.qkv_proj)
-            if self.kernels == "quail":
-                q, k = self.custom_qk_norm_rope(qkv, positions, attn)
-            else:
-                q, k = self.vllm_qk_norm_rope(qkv, positions, attn)
-            v = qkv[:, (self.num_q_heads + self.num_kv_heads)
-                    * self.head_dim:]
-            if self.attention_mode == "merge_quant":
-                o_in, o_scale = self.attention_merge_quant(q, k, v, meta)
-            else:
-                attn_out = self.attention_unified(q, k, v, meta)
-                o_in, o_scale = self.quant(attn_out)
+            q, k = self.qk_norm_rope(qkv, positions, attn)
+            v = qkv[:, (self.num_q_heads + self.num_kv_heads) * self.head_dim:]
+            o_in, o_scale = self.attention(q, k, v, meta)
             hidden = self.gemm(o_in, o_scale, attn.o_proj)
-            if self.kernels == "quail":
-                g_in, g_scale = self.custom_norm_quant(
-                    hidden, layer.post_attention_layernorm, residual)
-            else:
-                g_in, g_scale = self.vllm_norm_quant(
-                    hidden, layer.post_attention_layernorm, residual)
+            g_in, g_scale = self.norm_quant(
+                hidden, layer.post_attention_layernorm, residual)
             gate_up = self.gemm(g_in, g_scale, layer.mlp.gate_up_proj)
-            if self.kernels == "quail":
-                d_in, d_scale = self.custom_silu_quant(gate_up)
-            else:
-                d_in, d_scale = self.vllm_silu_quant(gate_up)
+            d_in, d_scale = self.activation_quant(gate_up)
             hidden = self.gemm(d_in, d_scale, layer.mlp.down_proj)
-        final = chunk["final_indices"]
+        final = chunk.final_indices
         last_hidden = hidden.index_select(0, final)
         last_residual = residual.index_select(0, final)
         normed, _ = self.fused_add_rms_norm(

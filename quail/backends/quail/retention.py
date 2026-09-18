@@ -13,14 +13,13 @@ def apply_retention(arena, config, uses, survivors=None):
     if not config:
         return
     alive = {alias: set(documents) for alias, documents in (survivors or {}).items()}
-    for key in list(arena.accounting.retained):
+    for key in arena.retained_keys():
         alias, document = key
         if alias not in uses or (alias in alive and document not in alive[alias]):
             arena.free_key(key)
-    arena.accounting.configure_retention(
-        policy(config, uses), min(config["cap_pages"], arena.accounting.n_pages))
-    arena.evict_retained(max(
-        0, arena.accounting.retained_pages - arena.accounting.retention_cap_pages))
+    arena.configure_retention(
+        policy(config, uses), min(config["cap_pages"], arena.n_pages))
+    arena.evict_retained(max(0, arena.retained_pages - arena.retention_cap_pages))
 
 
 def retain_after_join(arena, key, tokens, config, uses):
@@ -28,5 +27,5 @@ def retain_after_join(arena, key, tokens, config, uses):
     priority = None
     if config:
         priority = policy(config, uses).priority(
-            key, tokens, arena.accounting.pages_needed(tokens))
+            key, tokens, arena.pages_needed(tokens))
     return arena.retain(key, tokens, priority=priority)
