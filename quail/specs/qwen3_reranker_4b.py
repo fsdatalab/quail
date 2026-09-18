@@ -18,4 +18,5 @@ QWEN3_RERANKER_4B_BF16 = ModelSpec(
     tied_head=True,
     weight_precision="bf16",
     attention_precision="bf16",
+    role="reranker",
 )

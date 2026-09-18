@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 
-from quail.cost.qwen3_cost import dense_params, flops_per_pair
+from quail.cost.dense_decoder_cost import dense_params, flops_per_pair
 
 
 @dataclass(frozen=True)

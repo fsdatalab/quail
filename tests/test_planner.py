@@ -253,7 +253,7 @@ def test_component_costs_and_model_weights():
     assert result.component("mlp") is result.components[1]
     assert result.seconds > max(result.compute, result.memory)
 
-    from quail.cost.qwen3_cost import dense_params
+    from quail.cost.dense_decoder_cost import dense_params
 
     work = ask(400, 50) * 1000
     result = speed_of_light(
