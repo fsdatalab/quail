@@ -436,14 +436,11 @@ def test_fused_path_matches_the_reference_path(monkeypatch):
     torch = pytest.importorskip("torch")
     _vllm_stubs(monkeypatch)
     spec = SimpleNamespace(vocab=50, canvas_tokens=3, canvas_answer_row=1)
-    # the fake norm scales by its weight, so the scalar fold below is
-    # exact only with unit scalars; the fold has its own test
     reference = DiffusionGemmaPipeline(
-        _fake_model(torch, layer_scalar=1.0), None, spec=spec,
-        engine_class=_Engine, fused=False)
-    fused = DiffusionGemmaPipeline(
-        _fake_model(torch, layer_scalar=1.0), None, spec=spec,
-        engine_class=_Engine)
+        _fake_model(torch), None, spec=spec, engine_class=_Engine,
+        fused=False)
+    fused = DiffusionGemmaPipeline(_fake_model(torch), None, spec=spec,
+                                   engine_class=_Engine)
     assert fused.fused
     expected = reference.forward_chunk(_chunk(torch))
     out = fused.forward_chunk(_chunk(torch))
@@ -451,22 +448,20 @@ def test_fused_path_matches_the_reference_path(monkeypatch):
     assert fused.engine.calls == reference.engine.calls
 
 
-def test_layer_scalars_fold_into_the_norms_after_them(monkeypatch):
+def test_layer_scalars_fold_into_the_post_feedforward_norms(monkeypatch):
     torch = pytest.importorskip("torch")
     _vllm_stubs(monkeypatch)
     spec = SimpleNamespace(vocab=50, canvas_tokens=3, canvas_answer_row=1)
     model = _fake_model(torch, layer_scalar=0.5)
     DiffusionGemmaPipeline(model, None, spec=spec, engine_class=_Engine)
-    first, second = model.model.layers
-    # the first layer's norms keep their weights; the second layer's
-    # sums are divided by the first layer's scalar
-    assert first.post_feedforward_layernorm.weight.item() == 1.0
-    assert second.post_feedforward_layernorm.weight.item() == 2.0
-    assert second.post_attention_layernorm.weight.item() == 0.0
+    for layer in model.model.layers:
+        assert layer.post_feedforward_layernorm.weight.item() == 0.5
+        assert layer.post_attention_layernorm.weight.item() == 0.0
+        assert layer.input_layernorm.weight.item() == 1.0
     assert model.quail_scalars_folded
     # building again does not fold twice
     DiffusionGemmaPipeline(model, None, spec=spec, engine_class=_Engine)
-    assert second.post_feedforward_layernorm.weight.item() == 2.0
+    assert model.model.layers[1].post_feedforward_layernorm.weight.item() == 0.5
 
 
 def test_filter_admission_takes_canvas_in_stage_tokens():

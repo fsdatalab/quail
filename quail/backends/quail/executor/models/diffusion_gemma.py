@@ -146,23 +146,19 @@ class DiffusionGemmaPipeline(ModelPipeline):
         return self._ones[key]
 
     def _fold_layer_scalars(self, model):
-        """Fold each layer's output scalar into the norms feeding its sums.
+        """Fold each layer's output scalar into its post-feedforward norm.
 
-        Layer l multiplies its output by s_l. Dividing the weights of
-        its post-attention and post-feedforward norms by the product
-        of the earlier layers' scalars lets the residual stream carry
-        the hidden state divided by that product instead. Every norm
-        reading the stream is scale-invariant, so the model's outputs
-        do not change, and the multiply disappears.
+        Layer l multiplies its output, the norm of its feedforward
+        branch plus the residual, by s_l. Scaling that norm's weight by
+        s_l leaves only the residual to scale, which the fused path does
+        in place. The scalars are far below one (0.07 to 0.5), so a
+        cumulative fold across layers would overflow the weights.
         """
         if getattr(model, "quail_scalars_folded", False):
             return
-        product = 1.0
         for layer in self.layers:
-            for name in ("post_attention_layernorm",
-                         "post_feedforward_layernorm"):
-                getattr(layer, name).weight.data.div_(product)
-            product *= float(layer.layer_scalar)
+            layer.post_feedforward_layernorm.weight.data.mul_(
+                float(layer.layer_scalar))
         model.quail_scalars_folded = True
 
     def forward_chunk(self, chunk):
@@ -193,7 +189,8 @@ class DiffusionGemmaPipeline(ModelPipeline):
     # The same arithmetic as _layer with the residual adds, the norms
     # that feed a linear, and that linear's input quantization fused,
     # and the per-head q and k norms fused with the rotary. The layer
-    # scalars are folded into norm weights at build time.
+    # scalars are folded into the post-feedforward norm weights at
+    # build time.
 
     def _norm_quant(self, x, norm, residual=None):
         return self.engine.norm_quant_rows(x, norm.weight,
@@ -231,6 +228,9 @@ class DiffusionGemmaPipeline(ModelPipeline):
                                           layer.post_feedforward_layernorm)
             else:
                 dense = self._norm(dense, layer.post_feedforward_layernorm)
+            # dense carries the layer scalar through its norm weight;
+            # the residual takes it here
+            residual.mul_(layer.layer_scalar)
             if index == last:
                 return dense + residual
             # residual becomes the layer's output; the next layer reads
