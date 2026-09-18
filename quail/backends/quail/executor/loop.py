@@ -13,6 +13,8 @@ Torch is imported lazily when model execution starts.
 
 import time
 
+import numpy as np
+
 from quail.backends.quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
 from quail.backends.quail.executor.model import answer_weights
 from quail.backends.quail.executor.pack import FilterAdmission, JoinAdmission
@@ -31,6 +33,8 @@ def _staged(torch, data, dtype, pinned=True):
 
     pinned=False reverts to pageable blocking copies.
     """
+    if isinstance(data, np.ndarray):
+        data = torch.as_tensor(data, dtype=dtype)
     if torch.is_tensor(data):
         if pinned:
             return data.pin_memory().to("cuda", non_blocking=True)
@@ -50,9 +54,52 @@ def _token_parts(sequence):
         yield from _token_parts(part)
 
 
-def _staged_token_parts(torch, sequences, total, pinned=True):
+class InputStaging:
+    """Reuse CPU and GPU input buffers on the current CUDA stream."""
+
+    def __init__(self, torch):
+        self.torch = torch
+        self.buffers = {}
+        self.fixed_tokens = {}
+
+    def host(self, name, count, dtype):
+        torch = self.torch
+        previous = self.buffers.get(name)
+        if previous is not None:
+            host, device, event = previous
+            # The CPU must not overwrite a buffer while its transfer is pending.
+            event.synchronize()
+        if previous is None or host.numel() < count or host.dtype != dtype:
+            host = torch.empty(count, dtype=dtype, pin_memory=True)
+            device = torch.empty(count, dtype=dtype, device="cuda")
+            event = torch.cuda.Event()
+        self.buffers[name] = host, device, event
+        return host[:count]
+
+    def upload(self, name, count):
+        host, device, event = self.buffers[name]
+        # Reusing the device buffer is ordered after its previous readers.
+        device[:count].copy_(host[:count], non_blocking=True)
+        event.record()
+        return device[:count]
+
+    def copy(self, name, data, dtype):
+        source = self.torch.as_tensor(data)
+        host = self.host(name, source.numel(), dtype)
+        host.copy_(source.reshape(-1))
+        return self.upload(name, source.numel())
+
+    def fixed(self, tokens):
+        key = id(tokens)
+        if key not in self.fixed_tokens:
+            self.fixed_tokens[key] = tokens, self.torch.as_tensor(tokens)
+        return self.fixed_tokens[key][1]
+
+
+def _staged_token_parts(torch, sequences, total, pinned=True, staging=None):
     """Copy Arrow token views into one GPU input tensor."""
-    host = torch.empty(total, dtype=torch.int64, pin_memory=pinned)
+    host = (torch.empty(total, dtype=torch.int64, pin_memory=pinned)
+            if staging is None else staging.host("tokens", total, torch.int64))
     offset = 0
     for sequence in sequences:
         for part in _token_parts(sequence):
@@ -63,6 +110,8 @@ def _staged_token_parts(torch, sequences, total, pinned=True):
                 source = torch.from_dlpack(part.arrow_array)
             elif torch.is_tensor(part):
                 source = part
+            elif staging is not None and isinstance(part, tuple):
+                source = staging.fixed(part)
             else:
                 source = torch.as_tensor(part)
             host[offset:offset + count].copy_(source)
@@ -70,6 +119,8 @@ def _staged_token_parts(torch, sequences, total, pinned=True):
     if offset != total:
         raise AssertionError(
             f"packed {offset} token ids into a {total}-token chunk")
+    if staging is not None:
+        return staging.upload("tokens", total)
     return host.to("cuda", non_blocking=pinned)
 
 
@@ -133,7 +184,7 @@ class AsyncAnswers:
 # ------------------------------------------------------- chunk packing
 
 def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
-               attention_mode):
+               attention_mode, staging=None):
     """Build tensors for one chunk from groups in chunk order.
 
     Each group is a dict with keys:
@@ -149,6 +200,14 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     at most one suffix. Under unified attention a chunk is either all
     paged or all unpaged.
     """
+    def stage(name, values, dtype):
+        if staging is not None:
+            return staging.copy(name, values, dtype)
+        return _staged(torch, values, dtype, pinned)
+
+    def concatenate(parts):
+        return np.concatenate(parts) if parts else np.empty(0, dtype=np.int64)
+
     t = time.perf_counter() if timing is not None else 0.0
     # unified scatters every fresh row through its own src/dst map, so
     # the cross and kv_writes bookkeeping below is two-call only
@@ -175,7 +234,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                     f"split the group")
             id_parts.append(g["prefix"])
             token_count += len(g["prefix"])
-            pos.extend(range(len(g["prefix"])))
+            pos.append(np.arange(len(g["prefix"]), dtype=np.int64))
             if paged or not g["suffixes"]:
                 cu_a.append(token_count)
             if paged and two_call:
@@ -188,7 +247,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             srow = token_count
             id_parts.append(suf)
             token_count += len(suf)
-            pos.extend(range(f, f + len(suf)))
+            pos.append(np.arange(f, f + len(suf), dtype=np.int64))
             suffix_spans.append((srow, token_count))
             cu_a.append(token_count)
             finals.append(token_count - 1)
@@ -226,7 +285,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         used = _staged(torch, cross_used, torch.int32, pinned)
         cross = dict(
             rows=_staged(torch, suffix_rows, torch.int64, pinned),
-            cu_q=_staged(torch, cu_q, torch.int32, pinned),
+            cu_q=stage("unified_cu_q", cu_q, torch.int32),
             max_q=max_q, used=used,
             max_used=max(cross_used), table=table)
         # row -> its index in call B's output, -1 for prefix rows;
@@ -276,9 +335,9 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 direct = len(spans) == 1 \
                     and logical_start + count <= rows.numel()
                 if direct:
-                    activation_src.extend(range(r0, r1))
-                    kv_dst.extend(
-                        rows[logical_start:logical_start + count].tolist())
+                    activation_src.append(np.arange(r0, r1, dtype=np.int64))
+                    kv_dst.append(
+                        rows[logical_start:logical_start + count].numpy())
                     add_sequence(
                         arena.accounting.owned[key],
                         f + sum(e - s for s, e in spans), count)
@@ -286,8 +345,9 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
 
                 prefix_count = spec["prefix_end"] - r0
                 if prefix_count:
-                    activation_src.extend(range(r0, spec["prefix_end"]))
-                    kv_dst.extend(rows[:prefix_count].tolist())
+                    activation_src.append(np.arange(
+                        r0, spec["prefix_end"], dtype=np.int64))
+                    kv_dst.append(rows[:prefix_count].numpy())
                     prefix_pages = arena.accounting.owned[key][
                         :arena.accounting.pages_needed(f)]
                     add_sequence(prefix_pages, f, prefix_count)
@@ -304,30 +364,38 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                     temp_key, temp_pages = got
                     temporary_keys.append(temp_key)
                     temp_rows = arena._capacity_rows[temp_key]
-                    activation_src.extend(range(s0, s1))
-                    kv_dst.extend(
-                        temp_rows[remainder:remainder + suffix_tokens]
-                        .tolist())
+                    activation_src.append(np.arange(s0, s1, dtype=np.int64))
+                    kv_dst.append(
+                        temp_rows[remainder:remainder + suffix_tokens].numpy())
                     if remainder:
                         anchor_page = anchor_pages[f // page_tokens]
                         base = anchor_page * page_tokens
-                        tail_src.extend(range(base, base + remainder))
-                        tail_dst.extend(temp_rows[:remainder].tolist())
+                        tail_src.append(np.arange(
+                            base, base + remainder, dtype=np.int64))
+                        tail_dst.append(temp_rows[:remainder].numpy())
                     full_pages = f // page_tokens
                     add_sequence(
                         anchor_pages[:full_pages] + temp_pages,
                         f + suffix_tokens, suffix_tokens)
 
-            table = arena.block_table_rows(kv_page_rows)
+            if staging is None:
+                table = arena.block_table_rows(kv_page_rows)
+            else:
+                width = max(map(len, kv_page_rows))
+                block_table = np.zeros((len(kv_page_rows), width), dtype=np.int32)
+                for index, pages in enumerate(kv_page_rows):
+                    block_table[index, :len(pages)] = pages
+                table = stage("block_table", block_table, torch.int32).view(
+                    len(kv_page_rows), width)
             unified = dict(
-                src=_staged(torch, activation_src, torch.int64, pinned),
-                dst=_staged(torch, kv_dst, torch.int64, pinned),
-                tail_src=(_staged(torch, tail_src, torch.int64, pinned)
+                src=stage("unified_src", concatenate(activation_src), torch.int64),
+                dst=stage("unified_dst", concatenate(kv_dst), torch.int64),
+                tail_src=(stage("tail_src", concatenate(tail_src), torch.int64)
                           if tail_src else None),
-                tail_dst=(_staged(torch, tail_dst, torch.int64, pinned)
+                tail_dst=(stage("tail_dst", concatenate(tail_dst), torch.int64)
                           if tail_dst else None),
-                cu_q=_staged(torch, cu_q, torch.int32, pinned),
-                used=_staged(torch, kv_lengths, torch.int32, pinned),
+                cu_q=stage("unified_cu_q", cu_q, torch.int32),
+                used=stage("unified_lengths", kv_lengths, torch.int32),
                 table=table,
                 max_q=max(b - a for a, b in zip(cu_q, cu_q[1:])),
                 max_used=max(kv_lengths))
@@ -355,13 +423,13 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     meta = dict(
         layer=0, kv_src=kv_src, kv_dst=kv_dst, cross=cross,
         unified=unified,
-        cu_a=_staged(torch, cu_a, torch.int32, pinned),
+        cu_a=stage("cu_a", cu_a, torch.int32),
         max_a=max(cu_a[i + 1] - cu_a[i] for i in range(len(cu_a) - 1)))
     out = dict(
         input_ids=_staged_token_parts(
-            torch, id_parts, token_count, pinned),
-        positions=_staged(torch, pos, torch.int64, pinned),
-        final_indices=_staged(torch, finals, torch.int64, pinned),
+            torch, id_parts, token_count, pinned, staging),
+        positions=stage("positions", concatenate(pos), torch.int64),
+        final_indices=stage("finals", finals, torch.int64),
         meta=meta, tokens=token_count, layout=layout)
     if temporary_keys:
         out["temporary_keys"] = temporary_keys
@@ -374,7 +442,8 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
 def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
              stage_suffixes, budget, stage_frames=None,
              anchor_keys=None, anchor_done=None, anchor_source=None,
-             attention_mode=None, anchor_partners=None, anchor_batch=None):
+             attention_mode=None, anchor_partners=None, anchor_batch=None,
+             answer_dtype=None, staging=None):
     """The join driver: stream partner lists against anchors.
 
     Survivors are gated between stages.
@@ -413,6 +482,8 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         anchor_batch: Optional callable(keys) -> the keys to admit, run
             on each batch the source hands over before admission. A
             key it leaves out is freed, never admitted.
+        answer_dtype: Optional NumPy dtype for numeric answer arrays.
+        staging: Optional reusable input transfer buffers.
 
     Returns:
         (ans, spans, tokens): ans[j][a] = 0/1 row over the stage-j
@@ -452,14 +523,21 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         [[len(s) for s in sufs] for sufs in stage_suffixes],
         budget, arena.accounting.n_pages, arena.accounting.page_tokens,
         frame_tokens=[len(f) for f in frames], resident=resident,
-        anchor_partners={a: partners_of(keys[a]) for a in range(len(keys))})
+        anchor_partners={a: partners_of(keys[a]) for a in range(len(keys))},
+        temporary_suffix_pages=(
+            (attention_mode or pipeline.attention_mode) == "unified"),
+        answer_dtype=answer_dtype,
+    )
     spans = []
     tokens = 0
     outstanding = []     # (groups, handle) in launch order
+    scoring = answer_dtype is not None
+    label = "AI.SCORE" if scoring else f"join ({k} stages)"
+    total = (sum(sched._count(a, j) for a in range(len(prefixes)) for j in range(k))
+             if scoring else len(prefixes))
     progress = Progress(
-        f"join ({k} stages)",
-        total=None if anchor_source is not None else len(prefixes),
-        unit="anchors")
+        label, total=None if anchor_source is not None else total,
+        unit="scores" if scoring else "anchors")
     finished = [0]
 
     def admit(items):
@@ -528,7 +606,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
                     f=f + len(frame),
                     suffixes=sufs))
         return pack_chunk(torch, arena, specs,
-                          attention_mode=pipeline.attention_mode)
+                          attention_mode=pipeline.attention_mode, staging=staging)
 
     def settle(anchor):
         if anchor_done is None:
@@ -556,7 +634,9 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
                     a, j, start, end, bits[pos:pos + cnt]):
                 event(kind, anchor)
             pos += cnt
-        progress.update(finished[0])
+        progress.update(
+            progress.done + sum(end - start for _, _, start, end, _ in groups)
+            if scoring else finished[0])
 
     while True:
         if anchor_source is not None and not anchor_source.done:
@@ -597,7 +677,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
             report(outstanding.pop(0))
     while outstanding:
         report(outstanding.pop(0))
-    progress.finish(f"join ({k} stages) done", f"{tokens:,} fresh tokens")
+    progress.finish(f"{label} done", f"{tokens:,} fresh tokens")
     return sched.answers, spans, tokens
 
 
@@ -652,7 +732,9 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
     warm_docs, question, doc = _warm_inputs(budget)
     q_max = len(question)
     original_mode = pipeline.attention_mode
-    for mode in (FILTER_ATTENTION, JOIN_ATTENTION):
+    modes = ((FILTER_ATTENTION, JOIN_ATTENTION) if pipeline.is_fp8
+             else (FILTER_ATTENTION,))
+    for mode in modes:
         logger.debug("kernels: warming %s attention, full chunk", mode)
         pipeline.attention_mode = mode
         run_filter(torch, arena, pipeline, async_ans, warm_docs,
@@ -668,7 +750,8 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
                        [question], budget, arena_writes=True)
     if join_chunk:
         logger.debug("kernels: warming join forward pass")
-        pipeline.attention_mode = JOIN_ATTENTION
+        pipeline.attention_mode = (JOIN_ATTENTION if pipeline.is_fp8
+                                   else FILTER_ATTENTION)
         run_join(torch, arena, pipeline, async_ans, warm_docs,
                  [[question] * 8], budget)
     pipeline.attention_mode = original_mode
@@ -687,6 +770,10 @@ def compile_kernels(torch, arena, pipeline, async_ans, budget):
     config heuristic generator to enumerate every token count at
     which the chosen GEMM configuration changes.
     """
+    if not pipeline.is_fp8:
+        _forward_warm(torch, arena, pipeline, async_ans, budget,
+                      join_chunk=True)
+        return
     from vllm.model_executor.warmup.deep_gemm_warmup import (
         _generate_optimal_warmup_m_values,
     )

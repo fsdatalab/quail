@@ -8,6 +8,8 @@ tensor backing and runs only where torch and a GPU exist.
 
 import heapq
 
+import numpy as np
+
 
 class PageArena:
     """Page accounting: a free list and per-document page lists."""
@@ -211,20 +213,25 @@ class KVArena:
         # the logical rows are the first `tokens` entries of the
         # capacity rows (same pages, same order), so build once and
         # slice instead of walking the pages twice
-        cap = self.torch.tensor(
-            self.accounting.row_indices(key, capacity_tokens),
-            dtype=self.torch.int64)
+        cap = self._page_rows(key, tokens if capacity_tokens is None
+                              else capacity_tokens)
         self._capacity_rows[key] = cap
         self._rows[key] = cap[:tokens]
         return pages
+
+    def _page_rows(self, key, tokens):
+        pages = np.asarray(self.accounting.owned[key], dtype=np.int64)
+        rows = (pages[:, None] * self.page_tokens
+                + np.arange(self.page_tokens, dtype=np.int64))
+        return self.torch.from_numpy(rows.reshape(-1)[:tokens])
 
     def _refresh_rows(self, key, logical_tokens=None):
         logical = (self.accounting.tokens[key]
                    if logical_tokens is None else logical_tokens)
         capacity = len(self.accounting.owned[key]) * self.page_tokens
-        cap = self.torch.tensor(
-            self.accounting.row_indices(key, capacity),
-            dtype=self.torch.int64)
+        cap = self._capacity_rows.get(key)
+        if cap is None or cap.numel() != capacity:
+            cap = self._page_rows(key, capacity)
         self._capacity_rows[key] = cap
         self._rows[key] = cap[:logical]
 

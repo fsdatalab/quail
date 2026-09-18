@@ -14,6 +14,7 @@ from quail.execution.pairs import (
     pair_partner,
     partner_map,
 )
+from quail.execution.reranker import ScoreFilterRuntime
 from quail.execution.runner import (
     ExecutionContext,
     GenericRunner,
@@ -30,7 +31,10 @@ from quail.execution.types import export_physical_outputs
 from quail.physical import (
     AiFilter,
     AiJoin,
+    AiScore,
     PhysicalGraph,
+    Scan,
+    ScoreFilter,
 )
 
 
@@ -40,6 +44,8 @@ def quail_runtimes() -> dict:
     return {
         AiFilter.runtime_key: model_runtime,
         AiJoin.runtime_key: model_runtime,
+        AiScore.runtime_key: model_runtime,
+        ScoreFilter.runtime_key: ScoreFilterRuntime(),
     }
 
 
@@ -175,6 +181,8 @@ def filter_inputs(state, node, document_ids) -> dict:
 
 def prepare_model_inputs(node, inputs, context: ExecutionContext):
     """Prepare Quail scheduler inputs from typed port values."""
+    if isinstance(node, AiScore):
+        return {"score_inputs": inputs, "documents": context.state["docs"]}
     if not isinstance(node, (AiFilter, AiJoin)):
         return inputs
     return {
@@ -404,17 +412,49 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
         "_outputs": export_physical_outputs(compute_subgraph(graph), result),
         "wall_s": round(wall, 2),
         "fresh_tokens": result.metrics.fresh_tokens,
+        "cached_tokens": result.metrics.cached_tokens,
+        "evaluated_documents": result.metrics.evaluated_documents,
+        "evaluated_document_pairs": result.metrics.evaluated_document_pairs,
+        "usd_per_query": (
+            None if state["device"].usd_per_hour is None
+            else wall / 3600 * state["device"].usd_per_hour
+        ),
+        "backend_metrics": {"scores": [
+            dict(value.metrics.extension)
+            for node_id, value in result.nodes.items()
+            if graph.node(node_id).type_name == AiScore.type_name
+        ]},
         "node_metrics": scalar_node_metrics(result.nodes),
         "executed_join_plan": executed_join_plan(graph),
         "kv_manager": kv_manager,
         "peak_gib": round(torch.cuda.max_memory_allocated() / 2**30, 2),
     }
+    report.update(throughput(graph, result.metrics, wall))
     if state.get("gpu_timing"):
         # seconds a forward chunk was running on the GPU, summed over
         # the model nodes; wall_s minus this is time the GPU sat idle
         report["gpu_s"] = round(result.metrics.gpu_s, 3)
         report["chunks"] = result.metrics.chunks
     return report
+
+
+def throughput(graph, metrics, seconds: float) -> dict:
+    """Return the run's throughput under one key.
+
+    A run that evaluated document pairs reports evaluated pairs per
+    second. Any other run reports input document rows, summed over
+    every scan and counted before filters, per second.
+    """
+    seconds = max(seconds, 1e-9)
+    if metrics.evaluated_document_pairs:
+        return {
+            "document_pairs_per_second":
+                metrics.evaluated_document_pairs / seconds,
+        }
+    documents = sum(
+        node.n_docs for node in graph.nodes if isinstance(node, Scan)
+    )
+    return {"documents_per_second": documents / seconds}
 
 
 def model_answers(graph, result) -> tuple[dict, list]:

@@ -15,7 +15,6 @@ from quail.bench.quailb import (
 )
 from quail.bench.substrait import AI_URN, Filter, Join, Relation, read_plan
 from quail.catalog import DocumentProvider
-from quail.planner import collect_operators
 from quail.planner.plan import EngineConfig, Refusal
 from quail_b.labels import GroundTruthCollection, PredicateLabels
 from quail_b.prompts import DISCUSS_ASPECT, F1, F4, F11, F13, SUPPORT
@@ -387,7 +386,9 @@ def test_benchmark_query_prompts_and_labels():
                 session.register(name, DocumentProvider.from_table(table, id_col="id"))
             query = build_query(session, spec)
             assert not isinstance(query.plan(), Refusal)
-            scans, filters, joins = collect_operators(query.logical)
+            operators = query.logical.operators()
+            scans, filters, joins = (
+                operators.scans, operators.filters, operators.joins)
             tables = {relation.alias: relation.table
                       for relation in plan.relations}
             assert [scan.alias for scan in scans] == list(tables)
@@ -399,13 +400,13 @@ def test_benchmark_query_prompts_and_labels():
                     for item in plan.filters if item.alias == alias]
                 for alias in tables if any(
                     item.alias == alias for item in plan.filters)}
-            assert [tuple(arg.alias for arg in join.predicate.args)
+            assert [tuple(arg.alias for arg in join.prompt.args)
                     for join in joins] == [join.aliases for join in plan.joins]
             # c0 is about a person and e0 supports it; c2 is not about a person
             assert answer(filters["c1"][0].prompt, {"c1": 0}) is True
             assert answer(filters["c1"][0].prompt, {"c1": 2}) is False
-            assert answer(joins[0].predicate, {"c1": 0, "e1": 0}) is True
-            assert answer(joins[0].predicate, {"c1": 0, "e1": 1}) is False
+            assert answer(joins[0].prompt, {"c1": 0, "e1": 0}) is True
+            assert answer(joins[0].prompt, {"c1": 0, "e1": 1}) is False
             # the same labels drive the speed of light estimate
             estimate = quail.speed_of_light_estimate(query, answer)
             assert estimate.post_filter_counts == {

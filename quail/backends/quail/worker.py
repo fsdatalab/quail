@@ -355,6 +355,16 @@ def _child_main(gpu_idx, conn):
                 conn.send(("ok", _child_boot(state, data)))
             elif kind == "filters":
                 conn.send(("ok", _child_filters(state, data)))
+            elif kind == "scores":
+                gpu = state["gpu"]
+                inputs = data["inputs"]
+                if "documents" in inputs:
+                    state["score_documents"] = inputs["documents"]
+                inputs["documents"] = state["score_documents"]
+                with gpu.torch.inference_mode():
+                    result = gpu.execution.execute(data["node"], inputs)
+                gpu.torch.cuda.synchronize()
+                conn.send(("ok", result))
             elif kind == "joins":
                 conn.send(("ok", _child_joins(state, data)))
         except Exception:

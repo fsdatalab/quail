@@ -377,6 +377,176 @@ class RequestExecution(PhysicalNode):
 
 
 @dataclass(frozen=True)
+class ScoreSpec:
+    """One batched AI.SCORE computation."""
+
+    name: str
+    aliases: tuple[str, ...]
+    query_template: str
+    arguments: tuple[tuple[str, str], ...]
+    expected_inputs: float
+    estimated_seconds: float
+    pair_fraction: float = 1.0
+    prompt_token_parts: tuple[tuple[int, ...], ...] = ()
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "ScoreSpec":
+        return cls(
+            name=str(value["name"]),
+            aliases=tuple(value["aliases"]),
+            query_template=str(value["query_template"]),
+            arguments=tuple(
+                (str(alias), str(column))
+                for alias, column in value["arguments"]
+            ),
+            expected_inputs=float(value["expected_inputs"]),
+            estimated_seconds=float(value["estimated_seconds"]),
+            pair_fraction=float(value.get("pair_fraction", 1.0)),
+            prompt_token_parts=tuple(
+                tuple(part) for part in value.get("prompt_token_parts", ())
+            ),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "aliases": list(self.aliases),
+            "query_template": self.query_template,
+            "arguments": [list(argument) for argument in self.arguments],
+            "expected_inputs": self.expected_inputs,
+            "estimated_seconds": self.estimated_seconds,
+            "pair_fraction": self.pair_fraction,
+            "prompt_token_parts": [list(part) for part in self.prompt_token_parts],
+        }
+
+
+@dataclass(frozen=True)
+class AiScore(PhysicalNode):
+    """Append one FLOAT64 reranker score to candidate rows."""
+
+    backend_name: str = ""
+    model: str = ""
+    spec: ScoreSpec | None = None
+
+    type_name: ClassVar[str] = "quail.ai_score"
+    runtime_key: ClassVar[str] = type_name
+    location: ClassVar[ExecutionLocation] = ExecutionLocation.GPU_EXECUTOR
+
+    @property
+    def backend(self) -> str:
+        """Return the backend selected for this model node."""
+        return self.backend_name
+
+    @property
+    def outputs(self) -> tuple[OutputPort, ...]:
+        if self.spec is None:
+            return ()
+        return (OutputPort(
+            "scores",
+            ValueType.SCORES,
+            schema=(*self.spec.aliases, self.spec.name),
+        ),)
+
+    def attributes(self) -> dict:
+        return {
+            "backend_name": self.backend_name,
+            "model": self.model,
+            "spec": None if self.spec is None else self.spec.to_dict(),
+        }
+
+    def explain_fields(self) -> Mapping[str, Any]:
+        spec = self.spec
+        return {
+            "backend": self.backend_name,
+            "model": self.model,
+            "batching": "token_based_admission",
+            "output": None if spec is None else spec.name,
+            "aliases": [] if spec is None else list(spec.aliases),
+            "expected_inputs": 0 if spec is None else spec.expected_inputs,
+            "estimated_seconds": (
+                0 if spec is None else spec.estimated_seconds
+            ),
+        }
+
+    @classmethod
+    def from_attributes(cls, node_id, inputs, attributes):
+        value = attributes["spec"]
+        return cls(
+            node_id=node_id,
+            inputs=inputs,
+            backend_name=str(attributes["backend_name"]),
+            model=str(attributes["model"]),
+            spec=None if value is None else ScoreSpec.from_mapping(value),
+        )
+
+
+@dataclass(frozen=True)
+class ScoreFilter(PhysicalNode):
+    """Apply one numeric comparison while retaining the score column."""
+
+    score_name: str = ""
+    aliases: tuple[str, ...] = ()
+    comparison: str = ""
+    threshold: float = 0.0
+    selectivity: float | None = None
+    written_pos: int = 0
+
+    type_name: ClassVar[str] = "quail.score_filter"
+    runtime_key: ClassVar[str] = type_name
+    location: ClassVar[ExecutionLocation] = ExecutionLocation.GPU_EXECUTOR
+
+    @property
+    def outputs(self) -> tuple[OutputPort, ...]:
+        answers = (
+            OutputPort(
+                f"filter_answers:{self.aliases[0]}",
+                ValueType.FILTER_ANSWERS,
+            )
+            if len(self.aliases) == 1 else
+            OutputPort(
+                f"join_answers:{self.written_pos}",
+                ValueType.JOIN_ANSWERS,
+            )
+        )
+        return (
+            OutputPort("scores", ValueType.SCORES),
+            answers,
+        )
+
+    def attributes(self) -> dict:
+        return {
+            "score_name": self.score_name,
+            "aliases": list(self.aliases),
+            "comparison": self.comparison,
+            "threshold": self.threshold,
+            "selectivity": self.selectivity,
+            "written_pos": self.written_pos,
+        }
+
+    def explain_fields(self) -> Mapping[str, Any]:
+        return {
+            "score": self.score_name,
+            "comparison": self.comparison,
+            "threshold": self.threshold,
+            "selectivity": self.selectivity,
+            "aliases": list(self.aliases),
+        }
+
+    @classmethod
+    def from_attributes(cls, node_id, inputs, attributes):
+        return cls(
+            node_id=node_id,
+            inputs=inputs,
+            score_name=str(attributes["score_name"]),
+            aliases=tuple(attributes["aliases"]),
+            comparison=str(attributes["comparison"]),
+            threshold=float(attributes["threshold"]),
+            selectivity=attributes["selectivity"],
+            written_pos=int(attributes["written_pos"]),
+        )
+
+
+@dataclass(frozen=True)
 class AiFilter(PhysicalNode):
     """Evaluate ordered predicates on one document input."""
 

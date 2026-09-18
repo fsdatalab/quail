@@ -12,6 +12,7 @@ from quail.logical import (
     JoinSpec,
     LogicalPlan,
     LogicalPlanBuilder,
+    ModelCall,
     bind_join_prompt,
     bind_prompt,
 )
@@ -147,7 +148,7 @@ class Query:
                 f"{aliases}; a two-provider predicate follows join() or "
                 f"is ai_join")
         self._filters.setdefault(aliases[0], []).append(
-            FilterPredicate(prompt=bound, selectivity=selectivity))
+            FilterPredicate(ModelCall(bound), selectivity=selectivity))
         return self
 
     def join(self, other: "Query", on=None) -> "Query":
@@ -202,7 +203,8 @@ class Query:
                     f"predicate over {aliases} does not join")
         self._pending_join = None
         self._joins.append(JoinSpec(aliases=tuple(new_aliases),
-                                    prompt=bound, selectivity=selectivity,
+                                    predicate=ModelCall(bound),
+                                    selectivity=selectivity,
                                     on=conditions, applies=tuple(applies)))
         return self
 
@@ -368,7 +370,7 @@ class Query:
                     f"got anchor {anchor!r}")
             anchor = outer
         self._joins.append(JoinSpec(aliases=tuple(new_aliases),
-                                    prompt=bound,
+                                    predicate=ModelCall(bound),
                                     semantics=semantics,
                                     selectivity=selectivity,
                                     anchor=anchor))
