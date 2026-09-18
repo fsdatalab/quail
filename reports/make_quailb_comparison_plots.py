@@ -12,6 +12,8 @@ Pull the saved measurements, corpus manifest, and SoL estimates:
       uv run modal volume get quail-results "$RUN/$METHOD/run.json" \
         "$W/run/$METHOD/run.json"
     done
+    uv run modal volume get quail-results "$RUN/requested_tokens.json" \
+      "$W/requested_tokens.json"
     CORPUS=ground_truth/quailb/schema_v1/corpora/c_1aa2c4f0d0b6c816fd37aa5748c33341
     uv run modal volume get quail-results "$CORPUS/manifest.json" "$W/corpus.json"
     uv run modal volume get quail-results \
@@ -20,6 +22,13 @@ Pull the saved measurements, corpus manifest, and SoL estimates:
     REV=fc27f35188f0fcc6a1f3b8fe3bfbb9e12d6842eb
     uv run --with matplotlib --with "quail-b@$BENCH@$REV" \
       python reports/make_quailb_comparison_plots.py "$W"
+
+To recount complete input prompts on a mounted results volume with Quail
+revision 307e4b2 and the benchmark revision above, run on CPU:
+
+    python reports/make_quailb_comparison_plots.py /results/$RUN \
+      --count-requested-tokens --root /results \
+      --sol-file /results/sol/2026-09-18-all-chat/sol_quailb_sf0.1.json
 
 All queries use non-thinking chat prompts. The saved run reuses the completed
 September 18 BioDEX measurements after checking its reference label identities.
@@ -67,7 +76,7 @@ def row_metrics(row):
         "seconds": row["runtime_s"],
         "recomputed": row["regret_tokens"],
         "fresh": row["fresh_tokens"],
-        "tokens_per_second": row["fresh_tokens"] / row["runtime_s"],
+        "tokens_per_second": row["requested_tokens"] / row["runtime_s"],
         "throughput": count / row["runtime_s"],
         "unit": "docs/s" if pairs is None else "pairs/s",
         "cost": row["runtime_s"] / 3600 * H100_USD_PER_HOUR,
@@ -80,7 +89,7 @@ def row_metrics(row):
 
 METRICS = (
     ("seconds", "Latency", "seconds"),
-    ("tokens_per_second", "Total fresh input tokens per second", "tokens/second"),
+    ("tokens_per_second", "Total requested input tokens per second", "tokens/second"),
     ("recomputed", "Recomputed KV", "tokens"),
     ("fresh", "Fresh input tokens", "tokens"),
     ("agreement", "Answer agreement", "percent"),
@@ -121,6 +130,11 @@ def load_sol(root, queries, rows, corpus, manifest):
         assert estimate["input_document_rows"] == rows["quail"][query]["input_rows"]
         assert estimate["tokens"] <= estimate["per_document"]["tokens"], query
         estimates[query] = estimate
+    counts = json.loads((root / "requested_tokens.json").read_text())
+    sol_hash = hashlib.sha256((root / "sol.json").read_bytes()).hexdigest()
+    assert counts["sol_sha256"] == sol_hash
+    for query, estimate in estimates.items():
+        estimate["requested_tokens"] = counts["sol"][query]
     return estimates
 
 
@@ -128,7 +142,8 @@ def series_value(rows, sol, method, query, metric):
     """Return a measured value or an explicitly modeled value."""
     if method == "sol":
         return {"seconds": sol[query]["sol_s"], "fresh": sol[query]["tokens"],
-                "tokens_per_second": sol[query]["tokens"] / sol[query]["sol_s"],
+                "tokens_per_second": (
+                    sol[query]["requested_tokens"] / sol[query]["sol_s"]),
                 "recomputed": 0, "agreement": None}[metric]
     if query not in rows[method]:
         return None
@@ -211,7 +226,7 @@ def metric_bars(axis, queries, rows, sol, metric, overview):
     latency_title = "Latency" if overview else "Latency (ratios: vLLM / Quail)"
     titles = {"seconds": latency_title, "recomputed": "Recomputed KV tokens",
               "fresh": "Fresh input tokens",
-              "tokens_per_second": "Total fresh input tokens per second",
+              "tokens_per_second": "Total requested input tokens per second",
               "agreement": "Answer agreement with reference labels"}
     axis.set_title(titles[metric], fontsize=13)
 
@@ -248,7 +263,7 @@ def document_page(title, queries, relations):
 
 
 def plot_comparison(title, queries, rows, relations, sol, name, overview=False):
-    """Export the vector PDF: one metric per page, then the input counts."""
+    """Export metric charts and input counts as a vector PDF."""
     destination = HERE / "plots" / name
     groups = [[metric] for metric, _, _ in METRICS] if overview else [
         ["seconds", "fresh", "recomputed", "agreement"],
@@ -306,9 +321,14 @@ def load_rows(root, corpus):
     assert set(manifest["query_ids"]) == set(QUERY_ORDER)
     assert set(manifest["methods"]) == {key for key, _, _ in METHODS}
     rows = measurement_rows(root / "run" / "measurements.parquet")
+    counts = json.loads((root / "requested_tokens.json").read_text())
+    for key in ("run_id", "corpus_id", "collection_id"):
+        assert counts[key] == manifest[key]
     suites = {}
     for method, _, _ in METHODS:
-        suite = json.loads((root / "run" / method / "run.json").read_text())
+        raw = (root / "run" / method / "run.json").read_bytes()
+        assert hashlib.sha256(raw).hexdigest() == counts["run_sha256"][method]
+        suite = json.loads(raw)
         assert suite["corpus_id"] == corpus["corpus_id"]
         assert suite["collection_id"] == manifest["collection_id"]
         assert suite["metadata"]["prompt_format"] == PROMPT_FORMAT
@@ -318,8 +338,162 @@ def load_rows(root, corpus):
             assert item["status"] == "complete"
             assert item["definition_hash"] == _query_hash(get_query(item["id"]))
             assert rows[method][item["id"]]["regret_tokens"] is not None
+            rows[method][item["id"]]["requested_tokens"] = (
+                counts["methods"][method][item["id"]])
         suites[method] = suite
     return rows, manifest, suites
+
+
+def requested_input_tokens(spec, output, documents):
+    """Sum complete prompt lengths for every evaluated predicate answer."""
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    from quail_b.minimum import validate_prompt_pieces
+
+    pieces = validate_prompt_pieces(spec, output.prompt_pieces)
+    relations = {r.alias: (r.table, r.text_column) for r in spec._info.relations}
+
+    def document_sum(table, alias):
+        counts = pc.value_counts(pc.cast(table.column(alias), pa.string()))
+        ids = counts.field("values").to_pylist()
+        keys = [(*relations[alias], row_id) for row_id in ids]
+        documents.fetch(keys)
+        return sum(len(documents[key]) * count for key, count in zip(
+            keys, counts.field("counts").to_pylist()))
+
+    total = 0
+    tails = {p["id"]: p["tail"] for p in pieces["filters"]}
+    for operator in spec._info.filters:
+        table = output.filter_answers[operator.id]
+        total += document_sum(table, operator.relation)
+        total += len(table) * (len(pieces["preamble"]) + len(tails[operator.id]))
+    joins = {p["id"]: p for p in pieces["joins"]}
+    for operator in spec._info.joins:
+        table = output.join_answers[operator.id]
+        piece = joins[operator.id]
+        total += len(table) * sum(len(piece[key]) for key in (
+            "frame", "label", "tail")) + len(table) * len(pieces["preamble"])
+        total += sum(document_sum(table, alias) for alias in operator.relations)
+    return total
+
+
+def reference_requested_tokens(query, answer, estimate):
+    """Replay the saved SoL stage order to count its complete input prompts."""
+    from quail.planner.estimate import _Search
+    from quail.planner.live_rows import PairRelation, exact_live_rows
+
+    session = query.session
+    search = _Search(query, answer, session.model, session.device,
+                     estimate["chunk_tokens"], False)
+    live = {alias: list(range(len(data.tokens)))
+            for alias, data in search.aliases.items()}
+    total = 0
+    for stage in estimate["filter_stages"]:
+        alias = stage["alias"]
+        predicate = search.filters[alias][stage["written_pos"]]
+        assert len(live[alias]) == stage["evaluated"]
+        total += sum(search.pre + search.aliases[alias].tokens[row]
+                     + predicate.prompt.tail_tokens for row in live[alias])
+        live[alias] = [row for row in live[alias]
+                       if answer(predicate.prompt, {alias: row})]
+        assert len(live[alias]) == stage["passed"]
+    base_rows = dict(live)
+    edges = []
+    for stage in estimate["join_stages"]:
+        position = stage["written_pos"]
+        prompt = search.joins[position].prompt
+        anchor = stage["anchor"]
+        (partner,) = stage["partners"]
+        labels = {alias: (label, frame) for alias, label, frame in prompt.labels}
+        fixed = search.pre + labels[anchor][1] + labels[partner][0]
+        fixed += prompt.tail_tokens
+        allowed = search.allowed_pairs.get(position, {}).get(anchor)
+        passing = set()
+        evaluated = 0
+        for left in live[anchor]:
+            for right in live[partner]:
+                if allowed is not None and right not in allowed.get(left, ()):
+                    continue
+                total += (fixed + search.aliases[anchor].tokens[left]
+                          + search.aliases[partner].tokens[right])
+                evaluated += 1
+                if answer(prompt, {anchor: left, partner: right}):
+                    passing.add((left, right))
+        assert evaluated == stage["evaluated_pairs"]
+        assert len(passing) == stage["passing_pairs"]
+        edges.append(PairRelation(anchor, partner, frozenset(passing)))
+        live = exact_live_rows(base_rows, edges)
+    return total
+
+
+def count_requested_tokens(run_directory, root, sol_path):
+    """Save input counts from existing answers and the saved SoL plan on CPU."""
+    from functools import cache
+
+    import quail
+    from quail.bench.quailb import answer_oracle, build_query
+    from quail.planner.plan import EngineConfig
+    from quail_b.benchmark import load_benchmark
+    from quail_b.minimum import DocumentTokens, load_tokenizer
+    from quail_b.queries import get_query
+    from quail_b.run import _query_hash, _read_output
+
+    run_directory = Path(run_directory)
+    manifest = json.loads((run_directory / "manifest.json").read_text())
+    benchmark = load_benchmark(
+        scale_factor=0.1, root=root, collection_id=manifest["collection_id"])
+    sol_bytes = Path(sol_path).read_bytes()
+    sol = json.loads(sol_bytes)
+    assert sol["corpus_id"] == manifest["corpus_id"]
+    assert sol["collection_id"] == manifest["collection_id"]
+    tokenizer = load_tokenizer("Qwen/Qwen3-4B-FP8")
+    documents = DocumentTokens(benchmark.tables, tokenizer)
+    result = {
+        "run_id": manifest["run_id"], "corpus_id": manifest["corpus_id"],
+        "collection_id": manifest["collection_id"],
+        "sol_sha256": hashlib.sha256(sol_bytes).hexdigest(),
+        "methods": {}, "sol": {}, "run_sha256": {},
+    }
+    for method, _, _ in METHODS:
+        raw = (run_directory / method / "run.json").read_bytes()
+        result["run_sha256"][method] = hashlib.sha256(raw).hexdigest()
+        result["methods"][method] = {}
+        for item in json.loads(raw)["queries"]:
+            spec = get_query(item["id"])
+            assert item["definition_hash"] == _query_hash(spec)
+            directory = run_directory / method / item["directory"]
+            output = _read_output(directory, item, rows=False)
+            total = requested_input_tokens(spec, output, documents)
+            if method == "pipelined_vllm":
+                measured = item["measurements"]
+                assert total == measured["fresh_tokens"] + measured["cached_tokens"]
+            result["methods"][method][item["id"]] = total
+        print("Counted complete prompts:", method, flush=True)
+
+    @cache
+    def encode(text):
+        return tuple(tokenizer([text])[0])
+
+    session = quail.Session(EngineConfig(
+        model="qwen3-4b-fp8", device="h100-sxm"), tokenizer=encode)
+    try:
+        for name, table in benchmark.tables.items():
+            session.register(name, quail.DocumentProvider.from_table(
+                table, id_col="id"))
+        answer = answer_oracle(benchmark.ground_truth, benchmark.tables)
+        for query in QUERY_ORDER:
+            spec = get_query(query)
+            saved = sol["queries"][query]
+            assert saved["plan_sha256"] == hashlib.sha256(spec.plan_bytes).hexdigest()
+            result["sol"][query] = reference_requested_tokens(
+                build_query(session, spec), answer, saved["models"]["qwen3-4b-fp8"])
+            print("Counted SoL prompts:", query, flush=True)
+    finally:
+        session.close()
+    destination = run_directory / "requested_tokens.json"
+    destination.write_text(json.dumps(result, indent=2) + "\n")
+    print(destination, flush=True)
 
 
 def main(workdir):
@@ -405,9 +579,13 @@ def main(workdir):
         "  are fresh tokens minus the minimum for the run's actual requests with",
         "  unlimited KV. They are included in fresh tokens, not added to them.",
         "  The benchmark computes this minimum from saved answers after the run.",
-        "  Token throughput is total fresh input tokens divided by query seconds.",
-        "  It includes recomputation and excludes generated answer tokens.",
-        "  More recomputation can raise this rate without making a query faster.",
+        "- Token throughput is total requested input tokens divided by query seconds.",
+        "  Count each complete prompt once per evaluated filter or join pair,",
+        "  including tokens served from KV. Exclude generated answer tokens.",
+        "  Counts come from saved answers, prompt pieces, and document tokens.",
+        "  All 33 vLLM totals match its recorded fresh plus cached token counts.",
+        "  Different survivors can change which prompts a method evaluates.",
+        "  The SoL line counts complete prompts under its reference survivors.",
         "- Answer agreement counts matching evaluated predicate answers. Output",
         "  precision is the fraction of returned rows matching the reference.",
         "  Output recall is the fraction of reference rows returned. Most join",
@@ -454,20 +632,21 @@ def main(workdir):
                 "", "The cause of vLLM's lower BIO-2 time than its earlier raw-prompt",
                 "run remains unknown. The runs did not isolate prompt changes",
                 "from other execution changes."])
-        lines.extend(["",
-                      "| Query | Method | Seconds | Recomputed KV tokens "
-                      "| Fresh input tokens | Tokens/second | Throughput "
-                      "| Unit | $/query "
-                      "| Answer agreement (%) | Output precision (%) "
-                      "| Output recall (%) |",
-                      "|---|---|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|"])
+        table_header_text = (
+            "| Query | Method | Seconds | Recomputed KV tokens "
+            "| Fresh input tokens | Requested input tokens | Tokens/second "
+            "| Throughput | Unit | $/query | Answer agreement (%) "
+            "| Output precision (%) | Output recall (%) |")
+        lines.extend(["", table_header_text,
+                      "|---|---|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|"])
         for query in selected:
             for key, label, _ in METHODS:
                 m = row_metrics(rows[key][query])
                 lines.append(
                     f"| {query} | {label} | {m['seconds']:.2f} "
                     f"| {token_cell(m['recomputed'])} "
-                    f"| {m['fresh']:,} | {m['tokens_per_second']:,.2f} "
+                    f"| {m['fresh']:,} | {rows[key][query]['requested_tokens']:,} "
+                    f"| {m['tokens_per_second']:,.2f} "
                     f"| {m['throughput']:,.2f} "
                     f"| {m['unit']} | {m['cost']:.5f} | {m['agreement']:.2f} "
                     f"| {m['precision']:.5g} | {m['recall']:.5g} |")
@@ -480,7 +659,8 @@ def main(workdir):
             lines.append(
                 f"| {query} | SoL estimate | {estimate['sol_s']:.3f} | 0 (assumed) "
                 f"| {estimate['tokens']:,.0f} "
-                f"| {estimate['tokens'] / estimate['sol_s']:,.2f} "
+                f"| {estimate['requested_tokens']:,} "
+                f"| {estimate['requested_tokens'] / estimate['sol_s']:,.2f} "
                 f"| {throughput:,.2f} | {unit} "
                 f"| {estimate['cost_usd_per_query_at_sol']:.5f} "
                 "| Not measured | Not measured | Not measured |")
@@ -493,4 +673,11 @@ def main(workdir):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("workdir")
-    main(parser.parse_args().workdir)
+    parser.add_argument("--count-requested-tokens", action="store_true")
+    parser.add_argument("--root")
+    parser.add_argument("--sol-file")
+    args = parser.parse_args()
+    if args.count_requested_tokens:
+        count_requested_tokens(args.workdir, args.root, args.sol_file)
+    else:
+        main(args.workdir)
