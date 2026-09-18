@@ -79,7 +79,7 @@ class DiffusionGemmaPipeline(ModelPipeline):
     needs_pages = True
 
     def __init__(self, model, arena, *, spec, kernels="quail",
-                 engine_class=Engine, wide_head_kernel="triton"):
+                 engine_class=Engine, wide_head_kernel="triton", fused=True):
         backbone = model.model
         self.layers = backbone.layers
         self.embed = backbone.embed_tokens
@@ -108,6 +108,9 @@ class DiffusionGemmaPipeline(ModelPipeline):
             # fold into one vector
             router.quail_scale = (router.root_size.to(router.scale.dtype)
                                   * router.scale).detach()
+        self.fused = fused
+        if fused:
+            self._fold_layer_scalars(model)
         self.canvas_ids = canvas_token_ids(spec.vocab, spec.canvas_tokens)
         # an empty canvas reads the answer at the prompt's last row
         if spec.canvas_tokens and not (
@@ -142,6 +145,26 @@ class DiffusionGemmaPipeline(ModelPipeline):
                 module.hidden_size, dtype=x.dtype, device=x.device)
         return self._ones[key]
 
+    def _fold_layer_scalars(self, model):
+        """Fold each layer's output scalar into the norms feeding its sums.
+
+        Layer l multiplies its output by s_l. Dividing the weights of
+        its post-attention and post-feedforward norms by the product
+        of the earlier layers' scalars lets the residual stream carry
+        the hidden state divided by that product instead. Every norm
+        reading the stream is scale-invariant, so the model's outputs
+        do not change, and the multiply disappears.
+        """
+        if getattr(model, "quail_scalars_folded", False):
+            return
+        product = 1.0
+        for layer in self.layers:
+            for name in ("post_attention_layernorm",
+                         "post_feedforward_layernorm"):
+                getattr(layer, name).weight.data.div_(product)
+            product *= float(layer.layer_scalar)
+        model.quail_scalars_folded = True
+
     def forward_chunk(self, chunk):
         from vllm.forward_context import set_forward_context
 
@@ -158,10 +181,78 @@ class DiffusionGemmaPipeline(ModelPipeline):
         # the fused MoE kernels look their layer up in the forward
         # context
         with set_forward_context(None, self.vllm_config, num_tokens=n):
-            for layer in self.layers:
-                hidden = self._layer(layer, hidden, positions, meta)
+            if self.fused:
+                hidden = self._layers_fused(hidden, positions, meta)
+            else:
+                for layer in self.layers:
+                    hidden = self._layer(layer, hidden, positions, meta)
         return self._norm(hidden.index_select(0, chunk.final_indices),
                           self.final_norm)
+
+    # ---- the fused path ---------------------------------------------
+    # The same arithmetic as _layer with the residual adds, the norms
+    # that feed a linear, and that linear's input quantization fused,
+    # and the per-head q and k norms fused with the rotary. The layer
+    # scalars are folded into norm weights at build time.
+
+    def _norm_quant(self, x, norm, residual=None):
+        return self.engine.norm_quant_rows(x, norm.weight,
+                                           norm.variance_epsilon, residual)
+
+    def _layers_fused(self, hidden, positions, meta):
+        engine = self.engine
+        residual = hidden
+        x_q, x_s = self._norm_quant(residual, self.layers[0].input_layernorm)
+        last = len(self.layers) - 1
+        for index, layer in enumerate(self.layers):
+            attn = layer.self_attn
+            qkv = engine.fp8_linear(attn.qkv_proj, x_q, x_s)
+            out = self._attention_fused(attn, qkv, positions, meta)
+            out, _ = attn.o_proj(out)
+            out = self._norm(out, layer.post_attention_layernorm)
+            # residual becomes the attention sum; the feedforward reads
+            # its norm
+            x_q, x_s = self._norm_quant(out, layer.pre_feedforward_layernorm,
+                                        residual)
+            mlp = layer.mlp
+            gate_up = engine.fp8_linear(mlp.gate_up_proj, x_q, x_s)
+            dense, _ = mlp.down_proj(mlp.act_fn(gate_up))
+            if layer.enable_moe_block:
+                dense = self._norm(dense, layer.post_feedforward_layernorm_1)
+                routed_in = self._norm(residual,
+                                       layer.pre_feedforward_layernorm_2)
+                router = layer.router
+                logits, _ = router.proj(engine.norm_rows(
+                    residual, router.quail_scale, router.norm.variance_epsilon))
+                routed = layer.moe(routed_in, logits)
+                routed = self._norm(routed, layer.post_feedforward_layernorm_2)
+                # dense becomes the norm of the two branches' sum
+                engine.fused_add_rms_norm(dense, routed,
+                                          layer.post_feedforward_layernorm)
+            else:
+                dense = self._norm(dense, layer.post_feedforward_layernorm)
+            if index == last:
+                return dense + residual
+            # residual becomes the layer's output; the next layer reads
+            # its norm
+            x_q, x_s = self._norm_quant(
+                dense, self.layers[index + 1].input_layernorm, residual)
+        raise AssertionError("a model needs at least one layer")
+
+    def _attention_fused(self, attn, qkv, positions, meta):
+        n = qkv.shape[0]
+        H, KH, D = attn.num_heads, attn.num_kv_heads, attn.head_dim
+        rope = attn.rotary_emb
+        q, k = self.engine.qk_norm_rope_heads(
+            qkv, positions, n_q=H, n_kv=KH, head_dim=D,
+            q_weight=attn.q_norm.weight, k_weight=attn.k_norm.weight,
+            eps=attn.q_norm.variance_epsilon, cos_sin_cache=rope.cos_sin_cache)
+        v = self._norm(qkv[:, (H + KH) * D:].reshape(n, KH, D), attn.v_norm)
+        return self.engine.attention_unified(
+            q.view(n, H, D), k.view(n, KH, D), v, meta, softmax_scale=1.0,
+            window=self.window if attn.is_sliding else None)
+
+    # ---- the reference path (fused=False) ---------------------------
 
     def _attention(self, attn, hidden, positions, meta):
         n = hidden.shape[0]

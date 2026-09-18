@@ -245,23 +245,35 @@ class _Attention:
 
 
 class _Layer:
-    def __init__(self, torch, hidden, sliding, moe):
+    def __init__(self, torch, hidden, sliding, moe, layer_scalar=0.5):
         heads, kv, dim = (2, 1, 4) if sliding else (2, 1, 8)
         self.self_attn = _Attention(torch, hidden, heads, kv, dim, sliding)
-        self.input_layernorm = _Norm(1.0)
-        self.post_attention_layernorm = _Norm(0.0)
-        self.pre_feedforward_layernorm = _Norm(1.0)
-        self.post_feedforward_layernorm = _Norm(1.0)
-        self.mlp = lambda x: x
+        self.input_layernorm = _Norm(torch.tensor(1.0))
+        self.post_attention_layernorm = _Norm(torch.tensor(0.0))
+        self.pre_feedforward_layernorm = _Norm(torch.tensor(1.0))
+        self.post_feedforward_layernorm = _Norm(torch.tensor(1.0))
+        self.mlp = _Mlp(torch, hidden)
         self.enable_moe_block = moe
-        self.post_feedforward_layernorm_1 = _Norm(1.0)
-        self.pre_feedforward_layernorm_2 = _Norm(1.0)
-        self.post_feedforward_layernorm_2 = _Norm(1.0)
+        self.post_feedforward_layernorm_1 = _Norm(torch.tensor(1.0))
+        self.pre_feedforward_layernorm_2 = _Norm(torch.tensor(1.0))
+        self.post_feedforward_layernorm_2 = _Norm(torch.tensor(1.0))
         self.router = SimpleNamespace(
-            norm=_Norm(1.0), root_size=torch.tensor(1.0),
+            norm=_Norm(torch.tensor(1.0)), root_size=torch.tensor(1.0),
             scale=torch.ones(hidden), proj=lambda x: (x, None))
         self.moe = lambda x, logits: x
-        self.layer_scalar = torch.tensor([0.5])
+        self.layer_scalar = torch.tensor([layer_scalar])
+
+
+class _Mlp:
+    """An identity feedforward with the linears the fused path calls."""
+
+    def __init__(self, torch, hidden):
+        self.gate_up_proj = _Linear(torch.eye(hidden))
+        self.down_proj = _Linear(torch.eye(hidden))
+        self.act_fn = lambda x: x
+
+    def __call__(self, x):
+        return x
 
 
 class _Engine:
@@ -287,10 +299,34 @@ class _Engine:
     def rope_inplace(self, positions, q, k, head_dim, cos_sin_cache, is_neox):
         return q, k
 
+    # the fused path's primitives, with the same fake norm (x times its
+    # weight) and no quantization
+    def norm_quant_rows(self, x, weight, eps, residual=None):
+        if residual is not None:
+            residual.add_(x)
+            x = residual
+        return x * weight, None
 
-def _fake_model(torch, hidden=4):
-    layers = [_Layer(torch, hidden, sliding=True, moe=True),
-              _Layer(torch, hidden, sliding=False, moe=False)]
+    def fp8_linear(self, module, x_q, x_s):
+        return module(x_q)[0]
+
+    def qk_norm_rope_heads(self, qkv, positions, *, n_q, n_kv, head_dim,
+                           q_weight, k_weight, eps, cos_sin_cache):
+        q = qkv[:, :n_q * head_dim] * q_weight
+        k = qkv[:, n_q * head_dim:(n_q + n_kv) * head_dim] * k_weight
+        return q.contiguous(), k.contiguous()
+
+    def fused_add_rms_norm(self, hidden, residual, norm):
+        residual.add_(hidden)
+        hidden.copy_(residual * norm.weight)
+        return hidden, residual
+
+
+def _fake_model(torch, hidden=4, layer_scalar=0.5):
+    layers = [_Layer(torch, hidden, sliding=True, moe=True,
+                     layer_scalar=layer_scalar),
+              _Layer(torch, hidden, sliding=False, moe=False,
+                     layer_scalar=layer_scalar)]
     backbone = SimpleNamespace(
         layers=layers,
         embed_tokens=lambda ids: torch.ones(ids.shape[0], hidden),
@@ -329,7 +365,7 @@ def test_pipeline_runs_the_gemma4_layer_order(monkeypatch):
 
     spec = SimpleNamespace(vocab=50, canvas_tokens=3, canvas_answer_row=1)
     pipeline = DiffusionGemmaPipeline(_fake_model(torch), None, spec=spec,
-                                      engine_class=_Engine)
+                                      engine_class=_Engine, fused=False)
     assert len(pipeline.canvas_ids) == 3
     assert pipeline.canvas_answer_row == 1
     assert pipeline.engine.wide_head_kernel == "triton"
@@ -368,6 +404,69 @@ def test_pipeline_runs_the_gemma4_layer_order(monkeypatch):
     # halves: 3 -> 3.
     assert out.shape == (2, 4)
     assert out.tolist() == [[3.0] * 4, [3.0] * 4]
+
+
+def _vllm_stubs(monkeypatch):
+    context = types.ModuleType("vllm.forward_context")
+
+    @contextlib.contextmanager
+    def set_forward_context(attn_metadata, vllm_config, num_tokens=None):
+        yield
+
+    context.set_forward_context = set_forward_context
+    workspace = types.ModuleType("vllm.v1.worker.workspace")
+    workspace.is_workspace_manager_initialized = lambda: True
+    monkeypatch.setitem(sys.modules, "vllm.forward_context", context)
+    monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
+    monkeypatch.setitem(sys.modules, "vllm.v1", types.ModuleType("vllm.v1"))
+    monkeypatch.setitem(sys.modules, "vllm.v1.worker",
+                        types.ModuleType("vllm.v1.worker"))
+    monkeypatch.setitem(sys.modules, "vllm.v1.worker.workspace", workspace)
+
+
+def _chunk(torch):
+    return SimpleNamespace(
+        input_ids=torch.zeros(6, dtype=torch.int64),
+        positions=torch.arange(6),
+        final_indices=torch.tensor([0, 3]),
+        meta={"layer": 0, "canvas": {"rows": torch.tensor([3, 4, 5])}})
+
+
+def test_fused_path_matches_the_reference_path(monkeypatch):
+    torch = pytest.importorskip("torch")
+    _vllm_stubs(monkeypatch)
+    spec = SimpleNamespace(vocab=50, canvas_tokens=3, canvas_answer_row=1)
+    # the fake norm scales by its weight, so the scalar fold below is
+    # exact only with unit scalars; the fold has its own test
+    reference = DiffusionGemmaPipeline(
+        _fake_model(torch, layer_scalar=1.0), None, spec=spec,
+        engine_class=_Engine, fused=False)
+    fused = DiffusionGemmaPipeline(
+        _fake_model(torch, layer_scalar=1.0), None, spec=spec,
+        engine_class=_Engine)
+    assert fused.fused
+    expected = reference.forward_chunk(_chunk(torch))
+    out = fused.forward_chunk(_chunk(torch))
+    assert torch.equal(out, expected)
+    assert fused.engine.calls == reference.engine.calls
+
+
+def test_layer_scalars_fold_into_the_norms_after_them(monkeypatch):
+    torch = pytest.importorskip("torch")
+    _vllm_stubs(monkeypatch)
+    spec = SimpleNamespace(vocab=50, canvas_tokens=3, canvas_answer_row=1)
+    model = _fake_model(torch, layer_scalar=0.5)
+    DiffusionGemmaPipeline(model, None, spec=spec, engine_class=_Engine)
+    first, second = model.model.layers
+    # the first layer's norms keep their weights; the second layer's
+    # sums are divided by the first layer's scalar
+    assert first.post_feedforward_layernorm.weight.item() == 1.0
+    assert second.post_feedforward_layernorm.weight.item() == 2.0
+    assert second.post_attention_layernorm.weight.item() == 0.0
+    assert model.quail_scalars_folded
+    # building again does not fold twice
+    DiffusionGemmaPipeline(model, None, spec=spec, engine_class=_Engine)
+    assert second.post_feedforward_layernorm.weight.item() == 2.0
 
 
 def test_filter_admission_takes_canvas_in_stage_tokens():

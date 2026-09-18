@@ -196,6 +196,49 @@ class Engine:
                                norm.variance_epsilon)
         return hidden, residual
 
+    def norm_quant_rows(self, x, weight, eps, residual=None):
+        """RMS-normalize rows and quantize them to fp8 with per-row scales.
+
+        One vLLM kernel. With residual, the kernel first adds x into
+        residual in place and normalizes the sum. Returns the fp8 rows
+        and their float32 scales, shaped (rows, 1).
+        """
+        from vllm import _custom_ops as ops
+        return ops.rms_norm_dynamic_per_token_quant(
+            x, weight, eps, self.torch.float8_e4m3fn, residual=residual)
+
+    def fp8_linear(self, module, x_q, x_s):
+        """One of vLLM's fp8 linears on rows already quantized per row.
+
+        module is a vLLM linear whose weight is fp8 with per-output-
+        channel scales; its own input quantization is skipped.
+        """
+        from vllm import _custom_ops as ops
+        return ops.cutlass_scaled_mm(
+            x_q, module.weight, scale_a=x_s, scale_b=module.weight_scale,
+            out_dtype=self.torch.bfloat16, bias=getattr(module, "bias", None))
+
+    def qk_norm_rope_heads(self, qkv, positions, *, n_q, n_kv, head_dim,
+                           q_weight, k_weight, eps, cos_sin_cache):
+        """The fused per-head q and k RMS norm plus neox rotary, any geometry.
+
+        custom_qk_norm_rope with the layer's own head counts, head
+        width, norm weights, and rotary cache instead of the engine's.
+        Returns contiguous q (rows, n_q * head_dim) and k (rows,
+        n_kv * head_dim).
+        """
+        n = qkv.shape[0]
+        q = self.torch.empty((n, n_q * head_dim), dtype=self.torch.bfloat16,
+                             device=qkv.device)
+        k = self.torch.empty((n, n_kv * head_dim), dtype=self.torch.bfloat16,
+                             device=qkv.device)
+        self._triton_kernels()["qk"][(n,)](
+            qkv, q, k, cos_sin_cache, positions, q_weight, k_weight,
+            qkv.stride(0), q.stride(0), k.stride(0), eps,
+            QH=n_q, KH=n_kv, HD=head_dim, HALF=head_dim // 2,
+            num_warps=8 if head_dim > 256 else 4)
+        return q, k
+
     # ---- the Triton fused kernels -----------------------------------
     # Each fuses a sequence of vLLM ops into one kernel launch.
 

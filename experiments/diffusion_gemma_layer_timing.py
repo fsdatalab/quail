@@ -91,6 +91,98 @@ def _timer(torch, totals, name):
 
 @app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
               volumes=volumes)
+def check(prediction: str, docs: int = 110, doc_tokens: int = 300,
+          wide_head_kernel: str = "triton") -> str:
+    """Compare the fused forward path against the reference path.
+
+    Builds the reference pipeline first, since the fused one folds the
+    layer scalars into the model's norm weights.
+    """
+    import numpy as np
+    import torch
+
+    from quail.backends.quail.executor.arena import KVArena
+    from quail.backends.quail.executor.loop import pack_chunk
+    from quail.backends.quail.executor.model import load_model
+    from quail.backends.quail.executor.models import build_pipeline
+    from quail.cost import budgets
+    from quail.specs import DEVICES, MODELS
+
+    spec = MODELS[MODEL]
+    device = DEVICES["h100-sxm"]
+    chunk_tokens = budgets.chunk_budget(spec, device)
+    model = load_model(spec.hf_name, max_batched_tokens=chunk_tokens)
+    full_pages, sliding_pages = budgets.arena_pages(spec, device, chunk_tokens)
+    arena = KVArena(n_layers=spec.layers, n_pages=full_pages,
+                    page_tokens=budgets.PAGE_TOKENS, n_kv=spec.n_kv,
+                    d_head=spec.d_head, dtype=torch.bfloat16,
+                    layer_kv=spec.kv_shapes,
+                    sliding_layers=spec.sliding_layer_set,
+                    sliding_window=spec.sliding_window,
+                    n_sliding_pages=sliding_pages)
+    tail = list(range(100, 116))
+    rng = np.random.default_rng(1)
+    groups = []
+    for index in range(docs):
+        key = ("t", index)
+        arena.activate(key, doc_tokens + len(tail),
+                       capacity_tokens=doc_tokens + len(tail) + 256,
+                       base_tokens=doc_tokens)
+        prefix = [int(t) for t in rng.integers(1000, spec.vocab - 1000,
+                                               doc_tokens)]
+        groups.append(dict(key=key, prefix=prefix, f=doc_tokens,
+                           suffixes=[tail]))
+
+    def run(pipeline):
+        chunk = pack_chunk(torch, arena, groups, attention_mode="unified",
+                           canvas=pipeline.canvas_ids,
+                           answer_row=pipeline.canvas_answer_row)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        with torch.inference_mode():
+            rows = pipeline.forward_chunk(chunk)
+        torch.cuda.synchronize()
+        seconds = time.perf_counter() - t0
+        for key in chunk.temporary_keys:
+            arena.free_key(key)
+        return rows.float(), seconds
+
+    answer = model.quail_answer_weights.float()
+    reference = build_pipeline(spec, model, arena, fused=False,
+                               wide_head_kernel="triton")
+    ref_rows, _ = run(reference)
+    ref_rows, ref_s = run(reference)
+    fused = build_pipeline(spec, model, arena, fused=True,
+                           wide_head_kernel=wide_head_kernel)
+    fused_rows, _ = run(fused)
+    fused_rows, fused_s = run(fused)
+    ref_logits = ref_rows @ answer.T
+    fused_logits = fused_rows @ answer.T
+    diff = (fused_rows - ref_rows).abs()
+    result = {
+        "prediction": prediction,
+        "wide_head_kernel": wide_head_kernel,
+        "docs": docs, "doc_tokens": doc_tokens,
+        "reference_s": ref_s, "fused_s": fused_s,
+        "speedup": ref_s / fused_s,
+        "max_abs_diff": diff.max().item(),
+        "mean_abs_diff": diff.mean().item(),
+        "reference_rms": ref_rows.pow(2).mean().sqrt().item(),
+        "relative_rms_diff": (diff.pow(2).mean().sqrt()
+                              / ref_rows.pow(2).mean().sqrt()).item(),
+        "answer_agreement": (ref_logits.argmax(1)
+                             == fused_logits.argmax(1)).float().mean().item(),
+        "logit_gap_max_abs_diff": (
+            (ref_logits[:, 0] - ref_logits[:, 1])
+            - (fused_logits[:, 0] - fused_logits[:, 1])).abs().max().item(),
+    }
+    result["volume_path"] = _save(
+        f"diffusion_gemma_fused_check_{wide_head_kernel}", result)
+    return json.dumps(result, indent=2)
+
+
+@app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
+              volumes=volumes)
 def time_chunk(prediction: str, docs: int = 110, doc_tokens: int = 300,
                wide_head_kernel: str = "triton",
                random_tokens: bool = False, moe_backend: str = "auto",
@@ -157,7 +249,8 @@ def time_chunk(prediction: str, docs: int = 110, doc_tokens: int = 300,
           f"{rows / plain_s:.0f} rows/s", flush=True)
     kernels = None
     if profile:
-        from torch.profiler import ProfilerActivity, profile as torch_profile
+        from torch.profiler import ProfilerActivity
+        from torch.profiler import profile as torch_profile
         with torch_profile(activities=[ProfilerActivity.CUDA]) as prof:
             run()
         events = [e for e in prof.key_averages()
@@ -386,6 +479,10 @@ def main(prediction: str = "", docs: int = 110, doc_tokens: int = 300,
                 calls[f"{kernel}/{backend}"] = time_chunk.spawn(
                     prediction, docs, doc_tokens, kernel, random_tokens,
                     backend, profile)
+    if "check" in runs:
+        for kernel in kernels.split(","):
+            calls[f"check/{kernel}"] = check.spawn(prediction, docs,
+                                                  doc_tokens, kernel)
     if "loop" in runs:
         calls["loop"] = time_loop.spawn(prediction)
     if "micro" in runs:
