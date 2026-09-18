@@ -130,7 +130,7 @@ def _staged_token_parts(torch, sequences, total, pinned=True, staging=None):
 # ------------------------------------------------------- chunk packing
 
 def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
-               attention_mode, staging=None, canvas=()):
+               attention_mode, staging=None, canvas=(), answer_row=0):
     """Build tensors for one chunk from groups in chunk order.
 
     Each group is a dict with keys:
@@ -147,10 +147,10 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     paged or all unpaged.
 
     canvas is the token ids a diffusion model denoises: they follow
-    every suffix as extra rows, and the answer row is the first of
-    them instead of the suffix's last row. Canvas KV goes wherever the
-    suffix's KV goes and is never kept. Canvas rows run the unified
-    path only.
+    every suffix as extra rows, and the answer row is canvas row
+    answer_row instead of the suffix's last row. Canvas KV goes
+    wherever the suffix's KV goes and is never kept. Canvas rows run
+    the unified path only.
     """
     def stage(name, values, dtype):
         if staging is not None:
@@ -167,6 +167,9 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     canvas = tuple(canvas)
     if canvas and attention_mode != "unified":
         raise ValueError("canvas rows need the unified attention path")
+    if canvas and not 0 <= answer_row < len(canvas):
+        raise ValueError(
+            f"answer_row {answer_row} is outside the {len(canvas)}-row canvas")
     t = time.perf_counter() if timing is not None else 0.0
     # unified scatters every fresh row through its own src/dst map, so
     # the cross and kv_writes bookkeeping below is two-call only
@@ -217,7 +220,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 pos.append(np.arange(first, first + len(canvas),
                                      dtype=np.int64))
                 canvas_rows.append((token_count, token_count + len(canvas)))
-                finals.append(token_count)
+                finals.append(token_count + answer_row)
                 token_count += len(canvas)
             else:
                 finals.append(token_count - 1)
@@ -513,6 +516,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     frames = stage_frames or [[] for _ in range(k)]
     mode = join_attention_mode(pipeline.is_fp8)
     canvas = tuple(getattr(pipeline, "canvas_ids", ()))
+    answer_row = getattr(pipeline, "canvas_answer_row", 0)
 
     if k == 0:
         return [], [], 0
@@ -616,7 +620,8 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
                     f=f + len(frame),
                     suffixes=sufs))
         return pack_chunk(torch, arena, specs, attention_mode=mode,
-                          staging=staging, canvas=canvas)
+                          staging=staging, canvas=canvas,
+                          answer_row=answer_row)
 
     def settle(anchor):
         if anchor_done is None:
@@ -1011,6 +1016,7 @@ class FilterStream:
         self.capacity_extra = capacity_extra
         self.tails = tails
         self.canvas = canvas
+        self.answer_row = getattr(pipeline, "canvas_answer_row", 0)
         self.spans = []
         self.tokens = 0
         self.chunks = 0
@@ -1127,7 +1133,7 @@ class FilterStream:
                            [self._spec(*g) for g in groups],
                            timing=timing, pinned=self.pinned,
                            attention_mode=self.attention_mode,
-                           canvas=self.canvas)
+                           canvas=self.canvas, answer_row=self.answer_row)
         t = _tick(timing, "pack", t)
         self.tokens += chunk.tokens
         torch = self.torch

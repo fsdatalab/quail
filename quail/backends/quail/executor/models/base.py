@@ -14,7 +14,7 @@ class ModelPipeline:
     A subclass sets self.engine and self.max_chunk_tokens in __init__
     and implements forward_chunk and linears. A diffusion model also
     sets canvas_ids: the token ids the loop packs after every suffix,
-    whose first row carries the answer. needs_pages says every chunk
+    with the answer at canvas_answer_row of them. needs_pages says every chunk
     must carry arena pages, for a model whose attention kernel reads
     paged KV only.
     """
@@ -22,6 +22,7 @@ class ModelPipeline:
     engine = None
     max_chunk_tokens = None
     canvas_ids = ()
+    canvas_answer_row = 0
     needs_pages = False
 
     def forward_chunk(self, chunk):

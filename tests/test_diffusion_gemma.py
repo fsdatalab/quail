@@ -188,6 +188,13 @@ def test_pack_chunk_appends_canvas_rows_after_each_suffix(monkeypatch):
     assert meta["canvas"]["cu_q"].tolist() == [0, 4, 8]
     assert meta["canvas"]["max_q"] == 4
 
+    later = loop.pack_chunk(torch, arena, groups, attention_mode="unified",
+                            canvas=canvas, answer_row=2)
+    assert later.final_indices.tolist() == [7, 14]
+    with pytest.raises(ValueError, match="answer_row"):
+        loop.pack_chunk(torch, arena, groups, attention_mode="unified",
+                        canvas=canvas, answer_row=4)
+
     plain = loop.pack_chunk(torch, arena, groups, attention_mode="unified")
     assert plain.meta["canvas"] is None
     assert plain.final_indices.tolist() == [4, 7]
@@ -300,10 +307,16 @@ def test_pipeline_runs_the_gemma4_layer_order(monkeypatch):
                         types.ModuleType("vllm.v1.worker"))
     monkeypatch.setitem(sys.modules, "vllm.v1.worker.workspace", workspace)
 
-    spec = SimpleNamespace(vocab=50, canvas_tokens=3)
+    spec = SimpleNamespace(vocab=50, canvas_tokens=3, canvas_answer_row=1)
     pipeline = DiffusionGemmaPipeline(_fake_model(torch), None, spec=spec,
                                       engine_class=_Engine)
     assert len(pipeline.canvas_ids) == 3
+    assert pipeline.canvas_answer_row == 1
+    with pytest.raises(ValueError, match="canvas_answer_row"):
+        DiffusionGemmaPipeline(
+            _fake_model(torch), None, engine_class=_Engine,
+            spec=SimpleNamespace(vocab=50, canvas_tokens=3,
+                                 canvas_answer_row=3))
     assert seen["workspace"] == "cuda"
     assert not pipeline.is_fp8
     assert pipeline.max_chunk_tokens == (2**31 - 1) // 32

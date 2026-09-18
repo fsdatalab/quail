@@ -49,6 +49,10 @@ class ModelSpec:
     #                           the first one. 0 for an autoregressive
     #                           model, which answers at the last
     #                           prompt row.
+    canvas_answer_row: int = 0    # canvas row the answer is read at;
+    #                               later than 0 when the model opens
+    #                               its turn with fixed tokens, such as
+    #                               an empty thinking channel
     turn_prefix: str = ""     # chat-turn text before every prompt
     turn_suffix: str = ""     # chat-turn text after the answer cue
     attn_params_per_layer: int = 0    # attention projection params of
