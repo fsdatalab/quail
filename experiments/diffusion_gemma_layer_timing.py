@@ -142,9 +142,10 @@ def time_chunk(prediction: str, docs: int = 110, doc_tokens: int = 300,
 
     rows, warm_s = run()
     rows, plain_s = run()
+    print(f"{wide_head_kernel}: {rows} rows in {plain_s:.2f} s, "
+          f"{rows / plain_s:.0f} rows/s", flush=True)
 
     totals = {}
-    timer = _timer(torch, totals, None)
     engine = pipeline.engine
     original_attention = engine.attention_unified
 
@@ -153,29 +154,31 @@ def time_chunk(prediction: str, docs: int = 110, doc_tokens: int = 300,
         return _timer(torch, totals, name)(original_attention)(
             q3, k3, v3, meta, **kwargs)
 
+    def wrap_forward(module, name):
+        # a module's forward is a plain attribute; the module itself
+        # cannot be replaced by a function
+        module.forward = _timer(torch, totals, name)(module.forward)
+
     engine.attention_unified = attention
-    pipeline.embed = _timer(torch, totals, "embed")(pipeline.embed)
-    pipeline.final_norm = _timer(torch, totals, "final_norm")(pipeline.final_norm)
+    wrap_forward(pipeline.embed, "embed")
+    wrap_forward(pipeline.final_norm, "final_norm")
     for layer in pipeline.layers:
         attn = layer.self_attn
         kind = "sliding" if attn.is_sliding else "full"
-        attn.qkv_proj = _timer(torch, totals, f"qkv_proj_{kind}")(attn.qkv_proj)
-        attn.o_proj = _timer(torch, totals, f"o_proj_{kind}")(attn.o_proj)
-        attn.rotary_emb = _timer(torch, totals, "rotary")(attn.rotary_emb)
-        attn.q_norm = _timer(torch, totals, "qkv_norms")(attn.q_norm)
-        attn.k_norm = _timer(torch, totals, "qkv_norms")(attn.k_norm)
-        attn.v_norm = _timer(torch, totals, "qkv_norms")(attn.v_norm)
+        wrap_forward(attn.qkv_proj, f"qkv_proj_{kind}")
+        wrap_forward(attn.o_proj, f"o_proj_{kind}")
+        wrap_forward(attn.rotary_emb, "rotary")
+        for norm in (attn.q_norm, attn.k_norm, attn.v_norm):
+            wrap_forward(norm, "qkv_norms")
         for name in ("input_layernorm", "post_attention_layernorm",
                      "pre_feedforward_layernorm", "post_feedforward_layernorm",
                      "post_feedforward_layernorm_1",
                      "pre_feedforward_layernorm_2",
                      "post_feedforward_layernorm_2"):
-            setattr(layer, name, _timer(torch, totals, "layer_norms")(
-                getattr(layer, name)))
-        layer.mlp = _timer(torch, totals, "dense_mlp")(layer.mlp)
-        layer.router = _timer(torch, totals, "router")(layer.router)
-        layer.moe = _timer(torch, totals, "experts")(layer.moe)
-    del timer
+            wrap_forward(getattr(layer, name), "layer_norms")
+        wrap_forward(layer.mlp, "dense_mlp")
+        wrap_forward(layer.router, "router")
+        wrap_forward(layer.moe, "experts")
     rows, timed_s = run()
     accounted = sum(totals.values())
     result = {
