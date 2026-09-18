@@ -134,16 +134,23 @@ def answer_weights(model, token_ids):
 
 
 def load_model(model_name: str, revision: str | None = None, *,
-               answer_token_ids=None):
-    """Load model weights and retain only TRUE/FALSE output rows."""
+               answer_token_ids=None, max_batched_tokens=None):
+    """Load model weights and retain only TRUE/FALSE output rows.
+
+    max_batched_tokens is the largest chunk the model will see. vLLM's
+    fused MoE kernels size their scratch buffers from it; a dense model
+    ignores it.
+    """
     import torch
     from vllm.config import set_current_vllm_config
     from vllm.engine.arg_utils import EngineArgs
     from vllm.model_executor.model_loader import get_model
 
     model_path = resolve_model_path(model_name, revision)
-    config = EngineArgs(model=model_path, dtype="auto",
-                        enforce_eager=True).create_engine_config()
+    args = dict(model=model_path, dtype="auto", enforce_eager=True)
+    if max_batched_tokens is not None:
+        args["max_num_batched_tokens"] = int(max_batched_tokens)
+    config = EngineArgs(**args).create_engine_config()
     _install_single_rank_groups(torch)
     with set_current_vllm_config(config):
         model = get_model(vllm_config=config)

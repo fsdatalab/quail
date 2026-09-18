@@ -64,10 +64,12 @@ class LoadedGpu:
         say(f"loading {spec.hf_name} onto GPU {gpu_index}, "
             f"{free / 2**30:.1f} of {total / 2**30:.1f} GiB free")
 
+        budget = budgets.chunk_budget(spec, device)
         t0 = time.perf_counter()
         self.model = load_model(model_path or spec.hf_name,
                                 revision=None if model_path else spec.revision,
-                                answer_token_ids=answer_token_ids)
+                                answer_token_ids=answer_token_ids,
+                                max_batched_tokens=budget)
         self.load_model_s = time.perf_counter() - t0
 
         # cuBLAS allocates its handle outside PyTorch's caching allocator.
@@ -79,7 +81,6 @@ class LoadedGpu:
         torch.cuda.synchronize()
 
         t0 = time.perf_counter()
-        budget = budgets.chunk_budget(spec, device)
         arena_tok = budgets.arena_tokens(spec, device, budget)
         self.arena = KVArena(n_layers=spec.layers,
                              n_pages=arena_tok // budgets.PAGE_TOKENS,

@@ -276,9 +276,11 @@ def reference(prediction: str) -> str:
         diffusion_config={"canvas_length": spec.canvas_tokens},
     )
     started = time.time()
+    # the diffusion sampler owns temperature and rejects it as a
+    # sampling parameter
     outputs = llm.generate(
         [TokensPrompt(prompt_token_ids=row) for row in ids],
-        SamplingParams(temperature=0.0, max_tokens=16))
+        SamplingParams(max_tokens=16))
     elapsed = time.time() - started
     answers = []
     for doc, row, output in zip(docs, ids, outputs):
