@@ -2,9 +2,9 @@
 
 The September 12 run with raw prompts took 1069.16 seconds on BIO-2's
 563,500 pairs; the September 18 run with non-thinking chat prompts took
-933.23 seconds, 13% less, on a different container. This cell runs the
-same join both ways in one process on one vLLM engine, so the host and
-the engine are held fixed and only the prompt layout changes.
+933.23 seconds, 13% less, on a different physical GPU. This cell runs
+the same join both ways in one container, so the host is held fixed and
+only the prompt layout changes.
 
 Prediction: the two layouts take the same time per pair within 5%, with
 the chat layout no faster than the raw layout, because vLLM's time on
@@ -13,19 +13,22 @@ fresh tokens to every pair. If the chat layout is instead about 13%
 faster here too, the cause is the batch composition (fewer requests per
 step under the 25,305-token step budget), not the host.
 
-The query runs through the real runner and planner, with the BIO
-tables already on quail-results and the references read from the
-volume, as the September 18 run did. The join call is
-wrapped: for each round it runs the raw layout, resets the prefix
-cache, runs the chat layout, and resets again. The layout the checked
-out code renders natively is measured as is; the other is derived from
-it by adding or removing the chat wrapper tokens, which is exactly how
-the two branches differ. The runner scores the native layout's answers.
+Each measured join runs on a fresh vLLM engine in a fresh child
+process, as the benchmark measures, with BIO-1 run first on that
+engine so kernels are warm, as in both saved runs. The BIO tables are
+already on quail-results and the references are read from the volume,
+as the September 18 run did. The join call is wrapped to submit the
+requested layout. The layout the checked out code renders natively is
+measured as is; the other is derived from it by adding or removing the
+chat wrapper tokens, which is exactly how the two branches differ.
+Round one runs raw then chat, round two chat then raw. An earlier
+version ran all joins on one engine; vLLM 0.26.0 crashed in a model
+step at the start of the second join, so each child's output is saved
+to worker.log on the volume.
 
     run_log="results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-bio2-prompt-layout.log"
-    uv run modal run --detach \
-      experiments/bio2_prompt_layout.py::compare_prompt_layouts \
-      2>&1 | tee "$run_log"
+    cell=experiments/bio2_prompt_layout.py::compare_prompt_layouts
+    uv run modal run --detach "$cell" 2>&1 | tee "$run_log"
 
 The run prints its Modal function call id. The result is saved on
 quail-results under /results/ablations/bio2-prompt-layout-<UTC>/result.json;
@@ -45,10 +48,12 @@ from pathlib import Path
 
 from quail.bench.quailb_parallel import DATA_DIR, VOLUMES, app, image, results_vol
 
-QUERY = "BIO-2"
+QUERIES = ("BIO-1", "BIO-2")
+MEASURED = "BIO-2"
 SCALE_FACTOR = 0.1
 COLLECTION = "gt_91df55461cea394013812087a6ca6625"
 REFERENCE_ROOT = "/results"    # the collection is on quail-results
+LAYOUTS = ("raw", "chat")
 # Qwen3 apply_chat_template(enable_thinking=False), as the runtime renders it.
 CHAT_PREFIX = "<|im_start|>user\n"
 CHAT_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
@@ -102,25 +107,28 @@ def layout_variants(prefixes, suffixes, prefix_ids, suffix_ids) -> dict:
     return {"raw": raw, "chat": chat, "native": "chat" if native_is_chat else "raw"}
 
 
-def _worker(directory: str, connection, rounds: int) -> None:
-    """Run BIO-2 on pipelined vLLM with the join measured under both layouts."""
+def _measure_one(directory: str, layout: str, connection) -> None:
+    """Run BIO-1 then BIO-2 on a fresh engine, submitting BIO-2 in one layout."""
     os.setsid()
     root = Path(directory)
+    root.mkdir(parents=True, exist_ok=True)
+    # vLLM's engine process inherits these descriptors, so its crash text
+    # lands in the file whatever the log stream drops.
+    log = os.open(str(root / "worker.log"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+    os.dup2(log, 1)
+    os.dup2(log, 2)
+    record = {"layout": layout}
     try:
-        import torch
-        import vllm
-
         import quail.backends.request as request_module
         from quail.bench.process_isolation import run_backend_group
 
         original_join = request_module.run_join_grouped
-        joins = []
-        engine_info = {}
+        calls = []
 
         @wraps(original_join)
         def measured_join(client, sampling_params, prefixes, suffixes,
                           true_ids, *args, **kwargs):
-            if joins:
+            if calls:
                 raise RuntimeError("BIO-2 should submit exactly one join")
             tokenizer = client.llm.get_tokenizer()
 
@@ -129,112 +137,113 @@ def _worker(directory: str, connection, rounds: int) -> None:
 
             variants = layout_variants(
                 prefixes, suffixes, encode(CHAT_PREFIX), encode(CHAT_SUFFIX))
-            native = variants["native"]
-            engine_info.update({
-                "capacity": client.capacity, "native_layout": native,
-                "anchor_prefix_tokens": {
-                    name: sum(len(p) for p in variants[name][0])
-                    for name in ("raw", "chat")},
-                "partner_suffix_tokens": {
-                    name: sum(len(s) for s in variants[name][1])
-                    for name in ("raw", "chat")},
+            layout_prefixes, layout_suffixes = variants[layout]
+            started = time.perf_counter()
+            result = original_join(
+                client, sampling_params, layout_prefixes, layout_suffixes,
+                true_ids, *args, **kwargs)
+            elapsed = time.perf_counter() - started
+            pairs = len(result["answers"])
+            record.update({
+                "native_layout": variants["native"],
+                "wall_s": elapsed, "generate_wall_s": result["wall"],
+                "pairs": pairs, "ms_per_pair": 1000.0 * elapsed / max(1, pairs),
+                "fresh_tokens": result["fresh_tokens"],
+                "cached_tokens": result["cached_tokens"],
+                "submission": result["submission"],
+                "true_pairs": int(sum(result["answers"])),
+                "anchor_prefix_tokens": sum(len(p) for p in layout_prefixes),
+                "partner_suffix_tokens": sum(len(s) for s in layout_suffixes),
+                "capacity": client.capacity,
             })
-            native_result = None
-            for round_index in range(rounds):
-                for name in ("raw", "chat"):
-                    if client.reset_prefix_cache() is False:
-                        raise RuntimeError("vLLM did not reset its prefix cache")
-                    layout_prefixes, layout_suffixes = variants[name]
-                    started = time.perf_counter()
-                    result = original_join(
-                        client, sampling_params, layout_prefixes,
-                        layout_suffixes, true_ids, *args, **kwargs)
-                    elapsed = time.perf_counter() - started
-                    pairs = len(result["answers"])
-                    record = {
-                        "round": round_index, "layout": name,
-                        "wall_s": elapsed, "generate_wall_s": result["wall"],
-                        "pairs": pairs,
-                        "ms_per_pair": 1000.0 * elapsed / max(1, pairs),
-                        "fresh_tokens": result["fresh_tokens"],
-                        "cached_tokens": result["cached_tokens"],
-                        "submission": result["submission"],
-                        "true_pairs": int(sum(result["answers"])),
-                    }
-                    joins.append(record)
-                    (root / "joins.json").write_text(json.dumps(joins, indent=2))
-                    print(f"[layout] {json.dumps(record)}", flush=True)
-                    if name == native:
-                        native_result = result
-            return native_result
+            calls.append(record)
+            return result
 
         request_module.run_join_grouped = measured_join
         suite = run_backend_group(
             data_dir=DATA_DIR, model="qwen3-4b-fp8", sf=SCALE_FACTOR,
-            query_ids=(QUERY,), run_dir=str(root),
+            query_ids=QUERIES, run_dir=str(root),
             ground_truth_collection=COLLECTION, methods=("pipelined_vllm",),
             root=REFERENCE_ROOT,
         )
-        if len(joins) != 2 * rounds:
-            raise RuntimeError(f"expected {2 * rounds} join runs, got {len(joins)}")
-        by_layout = {
-            name: [j["ms_per_pair"] for j in joins if j["layout"] == name]
-            for name in ("raw", "chat")}
-        summary = {
-            name: {"ms_per_pair_mean": sum(values) / len(values),
-                   "ms_per_pair_runs": values}
-            for name, values in by_layout.items()}
-        summary["chat_over_raw"] = (summary["chat"]["ms_per_pair_mean"]
-                                    / summary["raw"]["ms_per_pair_mean"])
-        result = {
-            "query": QUERY, "scale_factor": SCALE_FACTOR, "rounds": rounds,
-            "prediction": PREDICTION_TEXT, "joins": joins, "summary": summary,
-            "engine": engine_info,
-            "host": {"cpu_model": _cpu_model(), "cpu_count": os.cpu_count(),
-                     "gpu_uuids": suite["gpu_uuids"]},
-            "versions": {"torch": torch.__version__, "vllm": vllm.__version__},
-            "benchmark": suite,
-        }
-        (root / "result.json").write_text(json.dumps(result, indent=2))
+        if len(calls) != 1:
+            raise RuntimeError(f"expected one join run, got {len(calls)}")
+        record["gpu_uuids"] = suite["gpu_uuids"]
+        connection.send(("ok", record))
     except BaseException:
         (root / "error.txt").write_text(traceback.format_exc())
+        connection.send(("error", traceback.format_exc()))
         raise
     finally:
-        connection.send(None)
         connection.close()
 
 
-@app.function(
-    image=image.add_local_python_source("experiments"),
-    gpu="H100!", memory=98304, timeout=10800, volumes=VOLUMES,
-)
-def compare_layouts(rounds: int = 2) -> str:
-    """Run the comparison in a child process and save its result."""
+def _run_child(root: Path, name: str, layout: str) -> dict:
+    """Run one measurement in its own process group and return its record."""
     from quail.bench.process_isolation import _stop_process_group
 
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    root = Path(f"/results/ablations/bio2-prompt-layout-{stamp}")
-    root.mkdir(parents=True)
     context = mp.get_context("spawn")
     receiver, sender = context.Pipe(duplex=False)
-    process = context.Process(target=_worker, args=(str(root), sender, rounds))
+    process = context.Process(
+        target=_measure_one, args=(str(root / name), layout, sender))
     process.start()
     sender.close()
     try:
-        receiver.recv()
+        status, payload = receiver.recv()
     finally:
         receiver.close()
         cleanup = _stop_process_group(process)
         results_vol.commit()
-    if (root / "error.txt").exists():
-        raise RuntimeError((root / "error.txt").read_text())
-    result_path = root / "result.json"
-    result = json.loads(result_path.read_text())
-    result["process_cleanup"] = cleanup
-    result["result_volume_path"] = str(result_path)
-    result_path.write_text(json.dumps(result, indent=2))
+    if status != "ok":
+        raise RuntimeError(f"{name} failed:\n{payload}")
+    payload["run"] = name
+    payload["process_cleanup"] = cleanup
+    return payload
+
+
+@app.function(
+    image=image.add_local_python_source("experiments"),
+    gpu="H100!", memory=98304, timeout=14400, volumes=VOLUMES,
+)
+def compare_layouts(rounds: int = 2) -> str:
+    """Measure each layout on fresh engines, in alternating order per round."""
+    import torch
+    import vllm
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    root = Path(f"/results/ablations/bio2-prompt-layout-{stamp}")
+    root.mkdir(parents=True)
+    joins = []
+    for round_index in range(rounds):
+        order = LAYOUTS if round_index % 2 == 0 else tuple(reversed(LAYOUTS))
+        for layout in order:
+            record = _run_child(root, f"round{round_index}-{layout}", layout)
+            record["round"] = round_index
+            joins.append(record)
+            (root / "joins.json").write_text(json.dumps(joins, indent=2))
+            print(f"[layout] {json.dumps(record)}", flush=True)
+            results_vol.commit()
+    by_layout = {
+        name: [j["ms_per_pair"] for j in joins if j["layout"] == name]
+        for name in LAYOUTS}
+    summary = {
+        name: {"ms_per_pair_mean": sum(values) / len(values),
+               "ms_per_pair_runs": values}
+        for name, values in by_layout.items()}
+    summary["chat_over_raw"] = (summary["chat"]["ms_per_pair_mean"]
+                                / summary["raw"]["ms_per_pair_mean"])
+    result = {
+        "query": MEASURED, "warmup_query": QUERIES[0],
+        "scale_factor": SCALE_FACTOR, "rounds": rounds,
+        "prediction": PREDICTION_TEXT, "joins": joins, "summary": summary,
+        "host": {"cpu_model": _cpu_model(), "cpu_count": os.cpu_count(),
+                 "gpu_uuids": sorted({u for j in joins for u in j["gpu_uuids"]})},
+        "versions": {"torch": torch.__version__, "vllm": vllm.__version__},
+        "result_volume_path": str(root / "result.json"),
+    }
+    (root / "result.json").write_text(json.dumps(result, indent=2))
     results_vol.commit()
-    return str(result_path)
+    return str(root / "result.json")
 
 
 @app.local_entrypoint()
