@@ -49,8 +49,8 @@ def quail_runtimes() -> dict:
     }
 
 
-def _join_round_kv(anchor_keys, owned) -> dict:
-    hits = sum(key in owned for key in anchor_keys)
+def _join_round_kv(anchor_keys, arena) -> dict:
+    hits = sum(arena.is_resident(key) for key in anchor_keys)
     return {"hits": hits, "misses": len(anchor_keys) - hits}
 
 
@@ -224,13 +224,14 @@ def _model_inputs(node, inputs, context: ExecutionContext) -> dict:
             by_alias[alias] = list(value)
     if not state["joins_started"]:
         state["joins_started"] = True
-        accounting = state["arena"].accounting
+        arena = state["arena"]
+        retained = arena.retained_keys()
         state["kv_stats"].update(
-            retained_after_filters=len(accounting.retained),
-            retained_pages_after_filters=accounting.retained_pages,
-            retained_prefix_tokens_after_filters=accounting.retained_prefix_tokens,
+            retained_after_filters=len(retained),
+            retained_pages_after_filters=arena.retained_pages,
+            retained_prefix_tokens_after_filters=arena.retained_prefix_tokens,
             retained_by_alias_after_filters={
-                alias: sum(key[0] == alias for key in accounting.retained)
+                alias: sum(key[0] == alias for key in retained)
                 for alias in state["docs"]
             },
         )
@@ -273,7 +274,7 @@ def _model_inputs(node, inputs, context: ExecutionContext) -> dict:
             for document in anchor_ids
         ]
         anchor_keys = [(node.anchor, document) for document in anchor_ids]
-        round_kv = _join_round_kv(anchor_keys, state["arena"].accounting.owned)
+        round_kv = _join_round_kv(anchor_keys, state["arena"])
         state["kv_stats"]["join_anchor_hits"] += round_kv["hits"]
         state["kv_stats"]["join_anchor_misses"] += round_kv["misses"]
         anchor_stream = None
@@ -337,7 +338,7 @@ def record_model_result(node, result: NodeResult,
             state["kv_stats"]["join_anchor_hits"] += len(keys)
         live = set(result.outputs[f"ids:{node.anchor}"])
         for key, prefix in zip(keys, prepared["prefixes"]):
-            if key in state["arena"].accounting.owned:
+            if state["arena"].is_resident(key):
                 if node.keep_anchor_kv and key[1] in live:
                     config = state["retention"]
                     retain_after_join(state["arena"], key, len(prefix), config,
@@ -350,7 +351,7 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
     """Execute one Quail model graph on one GPU executor."""
     torch = state["torch"]
     arena = state["arena"]
-    for key in list(arena.accounting.owned):
+    for key in arena.resident_keys():
         arena.free_key(key)
     arena.reset_stats()
     retention = payload.get("retention", {})
@@ -397,7 +398,7 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
 
     filters, joins = model_answers(graph, result)
 
-    for key in list(arena.accounting.owned):
+    for key in arena.resident_keys():
         arena.free_key(key)
     kv_manager = {
         **runtime_state["kv_stats"],

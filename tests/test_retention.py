@@ -103,9 +103,12 @@ def test_filter_chains_share_retention_and_return_evicted_pages(monkeypatch):
     answers = SimpleNamespace(submit=lambda values: values,
                               result=lambda values: values)
     pipeline = SimpleNamespace(attention_mode=FILTER_ATTENTION,
-                               forward_chunk=lambda chunk: [True] * len(chunk['specs']))
-    monkeypatch.setattr(loop, 'pack_chunk', lambda torch, arena, specs, **kw: {
-        'specs': specs, 'tokens': sum(spec['f'] + 1 for spec in specs)})
+                               forward_chunk=lambda chunk: [True] * len(chunk.specs))
+    monkeypatch.setattr(
+        loop, 'pack_chunk',
+        lambda torch, arena, specs, **kw: SimpleNamespace(
+            specs=specs, tokens=sum(spec['f'] + 1 for spec in specs),
+            temporary_keys=()))
     for alias, lengths in [('e2', [16, 64]), ('e1', [32, 64])]:
         result, _, _ = loop.run_filter(
             torch, arena, pipeline, answers, [[1] * length for length in lengths],

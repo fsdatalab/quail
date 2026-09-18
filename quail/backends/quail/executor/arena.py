@@ -4,6 +4,22 @@ Pages are handed out from a free list and reached through block tables.
 
 PageArena is the accounting (pure Python, CPU-tested); KVArena is the
 tensor backing and runs only where torch and a GPU exist.
+
+KVArena is the whole surface the chunk loop, the packer, the attention
+paths, and the operator runtimes use. Everything they need is a method
+or property on it; nothing outside this module reads the accounting
+object or the K and V tensors directly. A replacement arena implements
+the same methods:
+
+- allocation: alloc, activate, alloc_temporary, free_key, pin, grow
+- retention: retain, evict_retained, evict_key, configure_retention,
+  retention_cap_pages, retained_keys, retained_pages,
+  retained_prefix_tokens
+- residency: is_resident, resident_keys, owned_pages, capacity_rows,
+  pages_needed, page_tokens, n_pages, free_pages
+- attention inputs: layer_kv, paged_kv, block_table, block_table_rows
+- counters: reset_stats, evicted_keys, evicted_pages,
+  evicted_prefix_tokens
 """
 
 import heapq
@@ -187,7 +203,6 @@ class KVArena:
         import torch
         self.torch = torch
         dtype = dtype or torch.bfloat16
-        self.page_tokens = page_tokens
         self.accounting = PageArena(n_pages, page_tokens)
         shape = (n_pages * page_tokens, n_kv, d_head)
         self.k = [torch.empty(shape, dtype=dtype, device=device)
@@ -239,7 +254,14 @@ class KVArena:
         self.accounting.pin(key)
 
     def retain(self, key, tokens: int, priority=None):
-        """Rewind a prefix and make it available for a later operator."""
+        """Rewind a prefix and make it available for a later operator.
+
+        Retention decisions are keyed by (alias, document), so only
+        such pairs may be retained; score and temporary keys cannot.
+        """
+        if not (isinstance(key, tuple) and len(key) == 2):
+            raise TypeError(f"retained keys are (alias, document) pairs, "
+                            f"got {key!r}")
         self.accounting.rewind(key, tokens)
         self._refresh_rows(key, tokens)
         self.accounting.retain(key, priority)
@@ -306,6 +328,68 @@ class KVArena:
         self._rows.pop(key)
         self._capacity_rows.pop(key)
         return self.accounting.free_key(key)
+
+    # ---- residency and retention, read by the loop and operators ------
+
+    @property
+    def page_tokens(self) -> int:
+        return self.accounting.page_tokens
+
+    @property
+    def n_pages(self) -> int:
+        return self.accounting.n_pages
+
+    @property
+    def free_pages(self) -> int:
+        return self.accounting.free_pages
+
+    @property
+    def retained_pages(self) -> int:
+        return self.accounting.retained_pages
+
+    @property
+    def retained_prefix_tokens(self) -> int:
+        return self.accounting.retained_prefix_tokens
+
+    @property
+    def retention_cap_pages(self):
+        return self.accounting.retention_cap_pages
+
+    @retention_cap_pages.setter
+    def retention_cap_pages(self, pages) -> None:
+        self.accounting.retention_cap_pages = pages
+
+    def pages_needed(self, tokens: int) -> int:
+        return self.accounting.pages_needed(tokens)
+
+    def configure_retention(self, policy, cap_pages: int) -> None:
+        """Set the eviction priority rule and the retained-page cap."""
+        self.accounting.configure_retention(policy, cap_pages)
+
+    def is_resident(self, key) -> bool:
+        return key in self.accounting.owned
+
+    def resident_keys(self) -> list:
+        """Every key holding pages, in allocation order."""
+        return list(self.accounting.owned)
+
+    def retained_keys(self) -> list:
+        """Every key whose KV is kept for a later operator."""
+        return list(self.accounting.retained)
+
+    def owned_pages(self, key) -> list:
+        """The page ids a resident key holds, in logical order."""
+        return self.accounting.owned[key]
+
+    def capacity_rows(self, key):
+        """Row index tensor (CPU) over every row in the key's pages."""
+        return self._capacity_rows[key]
+
+    # ---- tensors, read by the attention paths ------------------------
+
+    def layer_kv(self, layer: int):
+        """Flat K and V pools of one layer, shape (rows, n_kv, d_head)."""
+        return self.k[layer], self.v[layer]
 
     def paged_kv(self, layer: int):
         """Pools as (n_pages, page_tokens, n_kv, d_head) for paged attention."""
