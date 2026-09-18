@@ -176,6 +176,7 @@ def predicate_payload(spec: PredicateSpec) -> dict:
         "right_column": spec.right_column,
         "render": render,
         "shared_preamble": SHARED_PRE,
+        "task_instruction": rendering.TASK_INSTRUCTION,
     }
 
 

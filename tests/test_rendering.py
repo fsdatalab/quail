@@ -16,6 +16,7 @@ def test_filter_prompt_puts_the_document_first_and_the_question_after():
     text = render_filter_prompt(F1, "the review")
     lead, question = F1.split("{0}")
     assert text.startswith(SHARED_PRE + "the review")
+    assert "You are performing a data processing task." in text
     assert "Evaluate TRUE or FALSE for the following question: " in text
     assert question.strip() in text
     # the template text before the placeholder moves after the document
@@ -26,6 +27,7 @@ def test_filter_prompt_puts_the_document_first_and_the_question_after():
 def test_join_prompt_frames_the_anchor_and_labels_the_partners():
     text = render_join_prompt(DISCUSS_ASPECT, ("review", "aspect"), anchor=0)
     assert text.startswith(SHARED_PRE + "review")
+    assert "You are performing a data processing task." in text
     assert "(The document above is DOCUMENT {0}.)" in text
     assert "\n\nDOCUMENT {1}:\naspect" in text
     assert text.endswith(ANSWER_CUE)

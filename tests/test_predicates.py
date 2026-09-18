@@ -57,10 +57,32 @@ def test_filter_and_join_prompts_use_the_engine_layout():
     assert join_prompt.endswith("\nANSWER:")
 
 
-def test_biodex_replacement_matches_saved_reference_identity():
+def test_biodex_replacement_matches_saved_reference_identity(monkeypatch):
+    from quail_b import predicates
+
+    def historical_payload(spec):
+        payload = predicate_payload(spec)
+        # Historical labels predate task instructions in predicate identities.
+        del payload["task_instruction"]
+        return payload
+
+    monkeypatch.setattr(predicates, "predicate_payload", historical_payload)
     spec = _spec("quailb.biodex.report.describes_serious_adverse_event")
     identity = label_set_identity(
         spec, "c_d7a294f1a0d83293b31ed8519df4262e",
         "d7a294f1a0d83293b31ed8519df4262e5cf3f347a535cdb9abeb109f20ae75c8",
     )
     assert identity["label_set_id"] == "ls_5627a6d5416349ee3e418c41594bc3a3"
+
+
+def test_task_instruction_changes_label_identity(monkeypatch):
+    from quail_b import rendering
+
+    spec = PREDICATES[0]
+    current = label_set_identity(spec, "c_one", "1" * 64)
+    monkeypatch.setattr(
+        rendering, "TASK_INSTRUCTION",
+        "Evaluate TRUE or FALSE for the following question: ",
+    )
+    previous = label_set_identity(spec, "c_one", "1" * 64)
+    assert current["label_set_id"] != previous["label_set_id"]
