@@ -1,4 +1,8 @@
-"""Qwen3 components used by the roofline calculation."""
+"""Dense decoder components used by the roofline calculation.
+
+Any pre-norm decoder with grouped-query attention and a gated MLP
+is priced from its ModelSpec shape; nothing here is Qwen3-specific.
+"""
 
 from __future__ import annotations
 
@@ -39,9 +43,9 @@ def kv_bytes_per_token(model: ModelSpec) -> float:
     return model.kappa
 
 
-def qwen3_components(work: Work, model: ModelSpec,
-                     passes: float) -> tuple[CostComponent, ...]:
-    """Build the modeled Qwen3 components for one work record."""
+def dense_decoder_components(work: Work, model: ModelSpec,
+                             passes: float) -> tuple[CostComponent, ...]:
+    """Build the modeled decoder components for one work record."""
     if passes < 0:
         raise ValueError("passes must be nonnegative")
     attn_proj = attention_projection_params(model)

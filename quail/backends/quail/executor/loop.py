@@ -468,7 +468,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     Args:
         torch: The torch module, imported by the caller.
         arena: KVArena holding the anchors' KV pages.
-        pipeline: Pipeline that runs each packed forward chunk.
+        pipeline: ModelPipeline that runs each packed forward chunk.
         async_ans: AsyncAnswers that reads TRUE/FALSE off the GPU.
         anchor_prefixes: Anchor id (list index) -> prefix token list.
             With anchor_source it must be an empty list; the join
@@ -793,9 +793,7 @@ def compile_kernels(torch, arena, pipeline, async_ans, budget):
     from vllm.model_executor.warmup.deep_gemm_warmup import (
         _generate_optimal_warmup_m_values,
     )
-    layer = pipeline.layers[0]
-    linears = (layer.self_attn.qkv_proj, layer.self_attn.o_proj,
-               layer.mlp.gate_up_proj, layer.mlp.down_proj)
+    linears = pipeline.linears()
     work = [(m, lin) for lin in linears
             for m in _generate_optimal_warmup_m_values(
                 budget, lin.weight.shape[0], torch.device("cuda"))]
@@ -812,8 +810,8 @@ def compile_kernels(torch, arena, pipeline, async_ans, budget):
                                   device="cuda",
                                   dtype=torch.bfloat16)
                 cur = lin
-            q, s = pipeline.quant(buf[:m])
-            pipeline.gemm(q, s, lin)
+            q, s = pipeline.engine.quant(buf[:m])
+            pipeline.engine.gemm(q, s, lin)
             progress.update(done)
         buf = None
         torch.cuda.synchronize()
@@ -929,7 +927,7 @@ class FilterStream:
     Args:
         torch: The torch module, imported by the caller.
         arena: KVArena holding the documents' KV pages.
-        pipeline: Pipeline that runs each packed forward chunk.
+        pipeline: ModelPipeline that runs each packed forward chunk.
         async_ans: AsyncAnswers that reads TRUE/FALSE off the GPU.
         doc_ids: Per-document token lists.
         question_ids: Per-stage question token lists.

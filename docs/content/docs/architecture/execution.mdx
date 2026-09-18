@@ -143,12 +143,13 @@ All GPU execution code is in
 | --- | --- |
 | [`pack.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/pack.py) | Admission logic for filters and joins. |
 | [`arena.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/arena.py) | Paged KV arena and page accounting. |
-| [`attention.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/attention.py) | Forward pass with two-call attention and log-sum-exp merge. |
+| [`attention.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/attention.py) | The engine: kernels, quantization, two-call attention with log-sum-exp merge. |
+| [`models/qwen3.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/models/qwen3.py) | The Qwen3 forward pass over the engine. One file per architecture; `ModelSpec.arch` picks it. |
 | [`loop.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/loop.py) | Overlapped filter and join execution loops. |
 | [`model.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/model.py) | Weight loading through vLLM's loader. |
 
-The fused kernels assume the Qwen3 architecture: QK-norm before
-RoPE, gated SiLU MLP, FP8 block-quantized weights.
+The fused kernels in `attention.py` assume QK-norm before RoPE, a
+gated SiLU MLP, and FP8 block-quantized weights, as Qwen3 has.
 
 ## Lifetime and limits
 

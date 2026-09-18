@@ -6,7 +6,7 @@ from types import ModuleType
 import pyarrow as pa
 
 import quail
-from quail.backends.quail.executor.attention import Pipeline, flash_attention_version
+from quail.backends.quail.executor.attention import Engine, flash_attention_version
 from quail.cost import budgets
 from quail.specs import H100_SXM, MODELS, RTX_PRO_6000_BLACKWELL_SERVER
 
@@ -53,7 +53,7 @@ def test_attention_dispatch_preserves_paged_arguments(monkeypatch):
         module = ModuleType("vllm.vllm_flash_attn")
         module.flash_attn_varlen_func = fake_attention
         monkeypatch.setitem(sys.modules, "vllm.vllm_flash_attn", module)
-        pipeline = Pipeline.__new__(Pipeline)
+        pipeline = Engine.__new__(Engine)
         pipeline.fa_version = flash_attention_version(capability)
         table, lengths = object(), object()
         result = pipeline._fa(

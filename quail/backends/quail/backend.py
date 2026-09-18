@@ -9,6 +9,7 @@ from typing import Any
 from quail.backends.base import GpuContext
 from quail.backends.quail.executor import loop
 from quail.backends.quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
+from quail.backends.quail.executor.models import supported_archs
 from quail.backends.quail.executor.score import QuailScorer
 from quail.backends.quail.graph import filter_result, stage_partner_lists
 from quail.backends.quail.worker import execute_quail_request, prepare_quail_request
@@ -32,7 +33,6 @@ from quail.planner.physical_optimizer import (
 )
 from quail.planner.plan import Refusal
 from quail.planner.reranker import plan_reranker
-from quail.specs import RERANKER_MODEL_NAMES
 
 
 class QuailModelExecution:
@@ -287,10 +287,10 @@ class QuailBackend:
         if device.name not in {"h100-sxm", "rtx-pro-6000-blackwell-server"}:
             return SupportResult.reject(
                 f"Quail does not support device {device.name!r}")
-        generative = {"qwen3-4b-fp8", "qwen3-32b-fp8"}
-        if model.name not in generative | set(RERANKER_MODEL_NAMES):
+        if model.arch not in supported_archs():
             return SupportResult.reject(
-                f"Quail does not support model {model.name!r}")
+                f"Quail does not support model {model.name!r}: "
+                f"no forward pass for architecture {model.arch!r}")
         if gpu_count not in {1, 2, 4, 8}:
             return SupportResult.reject(
                 "Quail requires 1, 2, 4, or 8 GPUs")
@@ -311,7 +311,7 @@ class QuailBackend:
             isinstance(expression, Alias)
             for expression in region.logical_plan.root.columns
         )
-        if context.model.name in RERANKER_MODEL_NAMES:
+        if context.model.role == "reranker":
             if not has_score:
                 refusal = Refusal(
                     reasons=("a reranker model needs AI.SCORE",),
