@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 from .base import ModelSpec
 
 # Gemma 4 attention runs with softmax scale 1.0 and a 1024-token
@@ -64,3 +66,10 @@ DIFFUSION_GEMMA_26B_FP8 = ModelSpec(
     #                             with the chunk; the kernel index cap
     #                             alone would allow 209k
 )
+
+# The same checkpoint with a 32-row canvas: eight times fewer canvas
+# rows per answer than the checkpoint's 256. The model was trained on
+# 256; QUAIL-B measures what a shorter canvas costs in accuracy.
+DIFFUSION_GEMMA_26B_FP8_CANVAS32 = replace(
+    DIFFUSION_GEMMA_26B_FP8, name="diffusion-gemma-26b-a4b-fp8-canvas32",
+    canvas_tokens=32)
