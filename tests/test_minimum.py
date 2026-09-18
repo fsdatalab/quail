@@ -5,6 +5,7 @@ import pytest
 
 from quail_b.minimum import (
     DocumentTokens,
+    input_tokens,
     minimum_input_tokens,
     prefix_trie_size,
     token_metrics,
@@ -89,6 +90,11 @@ def test_minimum_input_tokens_counts_each_document_prefix_once_and_pairs_apart()
     anchored = len(QUESTION) + len(FRAME) - _lcp(QUESTION, FRAME)
     pairs = 2 * len(LABEL) + 4 + 2 * len(TAIL)
     assert minimum == documents + len(QUESTION) + 2 * anchored + 2 * pairs
+    full_inputs = (
+        3 * (len(PRE) + len(QUESTION)) + 14 + 14 + 5
+        + 4 * (len(PRE) + 14 + len(FRAME) + len(LABEL) + 2 + len(TAIL)))
+    assert input_tokens(spec, pieces, filter_answers, join_answers,
+                        DocumentTokens(corpus, _encode)) == full_inputs
 
 
 def test_minimum_input_tokens_counts_a_document_once_across_uses():
@@ -127,6 +133,12 @@ def test_minimum_input_tokens_counts_a_document_once_across_uses():
     beta = len(first) + len(FRAME) - _lcp(first, FRAME)
     pairs = 2 * len(LABEL) + 9 + 2 * len(TAIL)
     assert minimum == documents + alpha + beta + 2 * pairs
+    full_inputs = (
+        2 * (len(PRE) + len(first)) + 9
+        + len(PRE) + len(second) + 5
+        + 4 * (len(PRE) + len(FRAME) + len(LABEL) + len(TAIL)) + 36)
+    assert input_tokens(spec, pieces, filter_answers, join_answers,
+                        DocumentTokens(corpus, _encode)) == full_inputs
 
 
 def _filter_spec():
@@ -147,9 +159,11 @@ def test_token_metrics_record_fresh_tokens_without_prompt_pieces():
     spec = _filter_spec()
     output = _filter_output(measurements={"fresh_tokens": 40})
     assert token_metrics(spec, output, {}) == {
+        "input_tokens": None,
         "fresh_tokens": 40, "minimum_tokens": None, "regret_tokens": None,
     }
     assert token_metrics(spec, _filter_output(), {}) == {
+        "input_tokens": None,
         "fresh_tokens": None, "minimum_tokens": None, "regret_tokens": None,
     }
 
@@ -183,3 +197,33 @@ def test_token_metrics_need_answers_with_prompt_pieces():
         measurements={"fresh_tokens": 10}, prompt_pieces=pieces)
     with pytest.raises(ValueError, match="filter and join answers"):
         token_metrics(spec, output, {})
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_input_tokens_distinguish_empty_and_missing_stages(missing):
+    spec = _filter_spec()
+    pieces = validate_prompt_pieces(spec, {
+        "tokenizer": "test", "preamble": PRE,
+        "filters": [{"id": "filter-1", "tail": QUESTION}],
+    })
+    answers = {} if missing else {"filter-1": pa.table({
+        "d": pa.array([], type=pa.string()),
+        "answer": pa.array([], type=pa.bool_()),
+    })}
+    assert input_tokens(spec, pieces, answers, {}, DocumentTokens({}, _encode)) == (
+        None if missing else 0)
+
+
+def test_input_tokens_do_not_count_recomputed_kv(monkeypatch):
+    monkeypatch.setattr("quail_b.minimum.load_tokenizer", lambda _: _encode)
+    spec = _filter_spec()
+    corpus = {"docs": pa.table({"id": ["a"], "body": ["alpha"]})}
+    pieces = {
+        "tokenizer": "test", "preamble": PRE,
+        "filters": [{"id": "filter-1", "tail": QUESTION}],
+    }
+    counts = [token_metrics(spec, _filter_output(
+        prompt_pieces=pieces, measurements={"fresh_tokens": fresh}), corpus)
+        for fresh in (100, 200)]
+    assert counts[0]["input_tokens"] == counts[1]["input_tokens"]
+    assert counts[1]["regret_tokens"] - counts[0]["regret_tokens"] == 100

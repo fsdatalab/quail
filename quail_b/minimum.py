@@ -300,12 +300,51 @@ def _fresh_tokens(measurements) -> int | None:
     return fresh
 
 
+def input_tokens(spec, pieces, filter_answers, join_answers,
+                 documents: DocumentTokens) -> int | None:
+    """Count full prompt inputs, or return None for missing answer tables."""
+    sets = {
+        relation.alias: (relation.table, relation.text_column)
+        for relation in spec._info.relations
+    }
+
+    def document_tokens(table, alias):
+        indices, ids = _encoded(table.column(alias))
+        keys = [(*sets[alias], row_id) for row_id in ids.to_pylist()]
+        documents.fetch(keys)
+        counts = np.bincount(indices, minlength=len(keys))
+        return sum(int(count) * len(documents[key])
+                   for key, count in zip(keys, counts))
+
+    total = 0
+    preamble = len(pieces["preamble"])
+    filters = {item.id: item for item in spec._info.filters}
+    for piece in pieces["filters"]:
+        table = filter_answers.get(piece["id"])
+        if table is None:
+            return None
+        alias = filters[piece["id"]].relation
+        total += len(table) * (preamble + len(piece["tail"]))
+        total += document_tokens(table, alias)
+    joins = {item.id: item for item in spec._info.joins}
+    for piece in pieces["joins"]:
+        table = join_answers.get(piece["id"])
+        if table is None:
+            return None
+        total += len(table) * (preamble + sum(
+            len(piece[name]) for name in ("frame", "label", "tail")))
+        total += sum(document_tokens(table, alias)
+                     for alias in joins[piece["id"]].relations)
+    return total
+
+
 def token_metrics(spec, output, corpus_rows, stores=None) -> dict:
-    """Return the run's fresh, minimum, and regret token counts.
+    """Return the run's input, fresh, minimum, and regret token counts.
 
     `fresh_tokens` is engine-reported and is required when the output
-    includes `prompt_pieces`. `minimum_tokens` and `regret_tokens` are
-    None when there are no prompt pieces; they are never omitted.
+    includes `prompt_pieces`. `input_tokens`, `minimum_tokens`, and
+    `regret_tokens` are None without prompt pieces. `input_tokens` is also
+    None if a stage has no answer table; an empty table counts as zero.
 
     Args:
         spec: The query.
@@ -316,7 +355,8 @@ def token_metrics(spec, output, corpus_rows, stores=None) -> dict:
     """
     fresh = _fresh_tokens(output.measurements)
     if output.prompt_pieces is None:
-        return {"fresh_tokens": fresh, "minimum_tokens": None, "regret_tokens": None}
+        return {"input_tokens": None, "fresh_tokens": fresh,
+                "minimum_tokens": None, "regret_tokens": None}
     if fresh is None:
         raise ValueError("prompt pieces need a fresh_tokens measurement")
     if output.filter_answers is None or output.join_answers is None:
@@ -333,6 +373,8 @@ def token_metrics(spec, output, corpus_rows, stores=None) -> dict:
             f"fresh_tokens ({fresh}) is below the minimum the requests need "
             f"({minimum})")
     return {
+        "input_tokens": input_tokens(
+            spec, pieces, output.filter_answers, output.join_answers, stores[name]),
         "fresh_tokens": fresh, "minimum_tokens": minimum,
         "regret_tokens": fresh - minimum,
     }

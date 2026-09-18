@@ -24,6 +24,8 @@ from quail_b.run import (
 MEASUREMENT_SCHEMA = pa.schema([
     ("query", pa.string()),
     ("runtime_s", pa.float64()),
+    ("input_tokens", pa.int64()),
+    ("input_tokens_per_second", pa.float64()),
     ("fresh_tokens", pa.int64()),
     ("minimum_tokens", pa.int64()),
     ("regret_tokens", pa.int64()),
@@ -46,6 +48,10 @@ def measurement_rows(record) -> list[dict]:
 
         query: Query id.
         runtime_s: Query time in seconds, excluding startup and collection.
+        input_tokens: Full input lengths across evaluated prompts, including
+            reused KV. Null without prompt pieces and complete answer tables.
+        input_tokens_per_second: Input tokens divided by query time. Null
+            when the token count is unknown or query time is zero.
         fresh_tokens: Input token positions a model forward pass processed
             instead of reading from existing KV. Engine-reported. Null
             when the engine did not report it.
@@ -75,6 +81,8 @@ def measurement_rows(record) -> list[dict]:
         rows.append({
             "query": item["id"],
             "runtime_s": item["runtime_s"],
+            "input_tokens": metrics.get("input_tokens"),
+            "input_tokens_per_second": metrics.get("input_tokens_per_second"),
             "fresh_tokens": metrics["fresh_tokens"],
             "minimum_tokens": metrics["minimum_tokens"],
             "regret_tokens": metrics["regret_tokens"],
@@ -115,8 +123,8 @@ def _write_report(directory, record):
         "Predicate accuracy is agreement on evaluated answers. Engines may "
         "evaluate different documents and pairs.", "",
         "## Query results", "",
-        "| Query | Status | Seconds | $/query | Throughput | Unit |",
-        "| --- | --- | ---: | ---: | ---: | --- |",
+        "| Query | Status | Seconds | $/query | Throughput | Unit | Input tokens/s |",
+        "| --- | --- | ---: | ---: | ---: | --- | ---: |",
     ]
     for item in record["queries"]:
         metrics = item.get("metrics", {})
@@ -127,7 +135,8 @@ def _write_report(directory, record):
         lines.append(
             f"| {item['id']} | {item['status']} | "
             f"{_number(item.get('runtime_s'))} | {_number(metrics.get('cost_usd'))} | "
-            f"{_number(throughput)} | {unit} |")
+            f"{_number(throughput)} | {unit} | "
+            f"{_number(metrics.get('input_tokens_per_second'))} |")
     lines.extend([
         "", "## Accuracy", "",
         "| Query | Predicate accuracy | Evaluated answers | Output precision | "
@@ -144,9 +153,10 @@ def _write_report(directory, record):
             f"{_number(output.get('precision'))} | {_number(output.get('recall'))} |")
     lines.extend([
         "", "## Input rows and token counts", "",
-        "| Query | Input rows by alias | Fresh tokens | Minimum tokens | "
+        "| Query | Input rows by alias | Input tokens | Fresh tokens | "
+        "Minimum tokens | "
         "Recomputed KV tokens |",
-        "| --- | --- | ---: | ---: | ---: |",
+        "| --- | --- | ---: | ---: | ---: | ---: |",
     ])
     for item in record["queries"]:
         metrics = item.get("metrics", {})
@@ -154,6 +164,7 @@ def _write_report(directory, record):
         counts = ", ".join(f"{alias}: {count}" for alias, count in inputs.items())
         lines.append(
             f"| {item['id']} | {counts or 'unavailable'} | "
+            f"{_number(metrics.get('input_tokens'))} | "
             f"{_number(metrics.get('fresh_tokens'))} | "
             f"{_number(metrics.get('minimum_tokens'))} | "
             f"{_number(metrics.get('regret_tokens'))} |")

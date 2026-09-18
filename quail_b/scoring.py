@@ -40,7 +40,8 @@ class RunOutput:
         prompt_pieces: The prompt token ids around each document, as
             `quail_b.minimum.validate_prompt_pieces` describes, or None.
             With the answers and `fresh_tokens`, scoring fills
-            `minimum_tokens` and `regret_tokens`.
+            `input_tokens`, `input_tokens_per_second`, `minimum_tokens`,
+            and `regret_tokens`.
     """
 
     filter_answers: dict[str, pa.Table] | None

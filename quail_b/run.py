@@ -255,6 +255,9 @@ def _score(spec, output, suite, gpu_count, gpu_hourly_rate_usd, tokens=None):
         **token_metrics(spec, output, suite.tables, tokens),
         "evaluated_document_pairs": None,
     }
+    metrics["input_tokens_per_second"] = (
+        metrics["input_tokens"] / seconds
+        if metrics["input_tokens"] is not None and seconds else None)
     if gpu_hourly_rate_usd is not None:
         metrics["cost_usd"] = seconds / 3600 * gpu_count * gpu_hourly_rate_usd
     if spec._info.joins:

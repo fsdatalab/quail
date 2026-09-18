@@ -94,6 +94,8 @@ def test_join_runs_at_all_scales_and_report_cli(tmp_path):
         assert record["schema_version"] == 2
         metrics = record["queries"][0]["metrics"]
         assert metrics["input_rows"] == {"r": 2, "a": 1}
+        assert metrics["input_tokens"] is None
+        assert metrics["input_tokens_per_second"] is None
         assert metrics["fresh_tokens"] is None
         assert metrics["minimum_tokens"] is None
         assert metrics["regret_tokens"] is None
@@ -158,6 +160,8 @@ def test_prompt_pieces_give_the_minimum_and_the_regret(tmp_path, monkeypatch):
     assert stages == 2
     minimum = (2 + 4 + 3) + 2 * (2 * 2 + 2) + 2 * (1 + 6 + 3)
     assert metrics["minimum_tokens"] == minimum
+    assert metrics["input_tokens"] == 65
+    assert metrics["input_tokens_per_second"] == 32.5
     assert metrics["regret_tokens"] == 1000 - minimum
     assert loaded == ["test-tokenizer"]
     saved = json.loads((destination / "IMDB-4/prompt_pieces.json").read_text())
@@ -169,13 +173,15 @@ def test_prompt_pieces_give_the_minimum_and_the_regret(tmp_path, monkeypatch):
     table = pq.read_table(destination / "measurements.parquet")
     assert table.to_pylist()[0] == {
         "query": "IMDB-4", "runtime_s": 2.0, "fresh_tokens": 1000,
+        "input_tokens": 65, "input_tokens_per_second": 32.5,
         "minimum_tokens": minimum, "regret_tokens": 1000 - minimum,
         "evaluated_document_pairs": 2, "input_rows": 3,
         "answers_evaluated": 2 * stages + 2, "answers_correct": 2 * stages + 2,
         "predicted_rows": 2, "expected_rows": 2, "matching_rows": 2,
         "cost_usd": None,
     }
-    assert "| IMDB-4 | r: 2, a: 1 | 1000 |" in (destination / "report.md").read_text()
+    assert "| IMDB-4 | r: 2, a: 1 | 65 | 1000 |" in (
+        destination / "report.md").read_text()
 
     def broken(spec, tables):
         output = execute(spec, tables)
