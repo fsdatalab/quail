@@ -197,7 +197,7 @@ def _run(query, join_answers):
             "boot_s": 3.0,
             "boot_kind": "cold",
             "boot": {},
-            "fresh_tokens": 1000,
+            "fresh_tokens": 2000,
             "store": None,
             "peak_gib": 1.0,
         })
@@ -258,7 +258,7 @@ def _run_request_backend(query, join_answers):
             "boot_s": 3.0,
             "boot_kind": "cold",
             "boot": {},
-            "fresh_tokens": 1000,
+            "fresh_tokens": 2000,
             "cached_tokens": 0,
             "peak_gib": 1.0,
         })
@@ -347,7 +347,7 @@ def test_benchmark_results_and_scoring(tmp_path):
         CORPUS, lambda texts: [_token_ids(text) for text in texts])}
     measured = token_metrics(SPEC, output, CORPUS, stores)
     assert measured["minimum_tokens"] > 0
-    assert measured["regret_tokens"] == 1000 - measured["minimum_tokens"]
+    assert measured["regret_tokens"] == 2000 - measured["minimum_tokens"]
 
     # a plan that projects the review text instead of its id
     text_plan = SPEC.plan
@@ -431,6 +431,9 @@ def test_benchmark_query_prompts_and_labels():
             right = quail.ColumnRef(
                 "right", spec.right_table, spec.right_column)
             prompt = quail.bind_join_prompt(spec.template, (left, right))
-            rendered = render_join_prompt(spec.template, ("doc one", "doc two"))
-            assert rendered.startswith(prompt.preamble)
-            assert "doc one" in rendered and "doc two" in rendered
+            from quail.logical.prompts import render_join_prompt_text
+
+            for anchor in (0, 1):
+                documents = ("doc one", "doc two")
+                assert render_join_prompt(spec.template, documents, anchor) == (
+                    render_join_prompt_text(prompt, documents, anchor))

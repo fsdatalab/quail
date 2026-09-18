@@ -2,10 +2,13 @@
 
 from quail.logical.nodes import CompileError, Prompt
 
-# Fixed preamble before every document. Must be a formatting label,
-# not an instruction; instruction text here biases short-document
-# completions.
-SHARED_PRE = "DOCUMENT:\n"
+# These wrappers match Qwen3 apply_chat_template(enable_thinking=False).
+# The user message stays open across the reusable document prefix.
+CHAT_PREFIX = "<|im_start|>user\n"
+CHAT_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+PROMPT_FORMAT = "qwen3-chat-nonthinking-v1"
+DOCUMENT_PRE = "DOCUMENT:\n"
+SHARED_PRE = CHAT_PREFIX + DOCUMENT_PRE
 
 
 def true_false_ids(tok):
@@ -34,7 +37,7 @@ TASK_INSTRUCTION = (
     f"{DATA_PROCESSING_INSTRUCTION} "
     "Evaluate TRUE or FALSE for the following question: "
 )
-ANSWER_CUE = "\nANSWER:"
+ANSWER_CUE = "\nANSWER:" + CHAT_SUFFIX
 
 
 def _marker(placeholder: int) -> str:
@@ -154,7 +157,7 @@ def split_frame(template: str) -> tuple[str, str]:
             f"contain a brace that is not a placeholder: {tail[:40]!r}")
     frame = user_pre.strip()
     rest = tail[m.end():]
-    return frame, (SHARED_PRE + m.group(0)
+    return frame, (DOCUMENT_PRE + m.group(0)
                    + (f"\n\n{frame}" if frame else "") + rest)
 
 
@@ -184,6 +187,7 @@ def bind_prompt(template: str, args: tuple, tokenizer=None) -> Prompt:
     _check_placeholders(template, len(args))
     frame, template = split_frame(template)
     preamble, tail = split_template(template)
+    preamble = CHAT_PREFIX + preamble
     # Wrap the question text (after the placeholder) with the task
     # instruction and answer cue.
     m = re.match(r"(\{\d+\})(.*)", tail, re.DOTALL)
