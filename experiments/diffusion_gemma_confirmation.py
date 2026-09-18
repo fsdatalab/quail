@@ -21,6 +21,7 @@ The cells write these files to the quail-results volume:
 
     /results/ablations/diffusion_gemma_confirmation_probe.json
     /results/ablations/diffusion_gemma_confirmation.json
+    /results/ablations/diffusion_gemma_confirmation_turn.json  (--layout turn)
     /results/ablations/diffusion_gemma_reference.json
 """
 
@@ -113,15 +114,36 @@ def _save(name: str, value: dict) -> str:
     return path
 
 
-def _session():
+# Prompt layouts the confirm cell can run. "channel" is the spec as
+# registered: an empty thinking channel prefilled, the answer at the
+# first canvas row. "turn" leaves the model to write that channel
+# itself inside the canvas and reads the answer at canvas row 4.
+LAYOUTS = {
+    "channel": {},
+    "turn": {"turn_suffix": "<turn|>\n<|turn>model\n",
+             "canvas_answer_row": 4},
+}
+
+
+def _session(layout: str = "channel"):
+    from dataclasses import replace
+
     import pyarrow as pa
 
     import quail
+    from quail.builtins import built_in_registry
     from quail.planner.plan import EngineConfig
+    from quail.specs import MODELS
 
+    registry = built_in_registry()
+    name = MODEL
+    if LAYOUTS[layout]:
+        name = f"{MODEL}-{layout}"
+        registry.register_model(
+            replace(MODELS[MODEL], name=name, **LAYOUTS[layout]))
     session = quail.Session(EngineConfig(
-        gpus=1, model=MODEL, backend="quail", device="h100-sxm",
-    ))
+        gpus=1, model=name, backend="quail", device="h100-sxm",
+    ), registry=registry)
     session.register("docs", quail.DocumentProvider.from_table(
         pa.table({
             "id": [f"f{i}" for i in range(8)] + [f"c{i}" for i in range(8)],
@@ -207,10 +229,10 @@ def probe(prediction: str) -> str:
 
 @app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
               volumes=volumes)
-def confirm(prediction: str) -> str:
+def confirm(prediction: str, layout: str = "channel") -> str:
     import torch
 
-    session = _session()
+    session = _session(layout)
     started = time.time()
     filter_query = session.sql(
         "SELECT d.id FROM docs d "
@@ -226,6 +248,7 @@ def confirm(prediction: str) -> str:
     kept = sorted(str(row[0]) for row in filter_result["rows"])
     result = {
         "prediction": prediction,
+        "layout": layout,
         "gpu_device_name": torch.cuda.get_device_name(0),
         "elapsed_s": time.time() - started,
         "filter": filter_result,
@@ -241,7 +264,9 @@ def confirm(prediction: str) -> str:
             [f"l{i}", f"r{j}"] for i in range(4) for j in range(4)
             if (i < 2) == (j < 2)),
     }
-    result["volume_path"] = _save("diffusion_gemma_confirmation", result)
+    suffix = "" if layout == "channel" else f"_{layout}"
+    result["volume_path"] = _save(
+        f"diffusion_gemma_confirmation{suffix}", result)
     return json.dumps(result, indent=2, default=str)
 
 
@@ -329,12 +354,15 @@ def reference(prediction: str) -> str:
 
 
 @app.local_entrypoint()
-def main(prediction: str = "", runs: str = "probe,confirm,reference"):
+def main(prediction: str = "", runs: str = "probe,confirm,reference",
+         layout: str = "channel"):
     if not prediction:
         raise ValueError("pass --prediction before starting")
+    if layout not in LAYOUTS:
+        raise ValueError(f"unknown layout {layout!r}; one of {sorted(LAYOUTS)}")
     functions = {
         "probe": lambda: probe.spawn(prediction),
-        "confirm": lambda: confirm.spawn(prediction),
+        "confirm": lambda: confirm.spawn(prediction, layout),
         "reference": lambda: reference.spawn(prediction),
     }
     selected = [name.strip() for name in runs.split(",") if name.strip()]
