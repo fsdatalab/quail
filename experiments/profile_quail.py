@@ -135,10 +135,10 @@ def _boot_state(model):
     from transformers import AutoTokenizer
 
     from quail.backends.quail.executor.arena import KVArena
-    from quail.backends.quail.executor.attention import FILTER_ATTENTION
-    from quail.backends.quail.executor.loop import Answerer, AsyncAnswers, warm_kernels
+    from quail.backends.quail.executor.loop import warm_kernels
     from quail.backends.quail.executor.model import load_model
     from quail.backends.quail.executor.models import build_pipeline
+    from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers
     from quail.cost import budgets
     from quail.specs import DEVICES, MODELS
 
@@ -153,8 +153,7 @@ def _boot_state(model):
                     page_tokens=budgets.PAGE_TOKENS,
                     n_kv=spec.n_kv, d_head=spec.d_head,
                     dtype=torch.bfloat16)
-    pipeline = build_pipeline(spec, model_mod, arena,
-                              attention_mode=FILTER_ATTENTION)
+    pipeline = build_pipeline(spec, model_mod, arena)
     from quail.backends import GpuContext, QuailBackend
     execution = QuailBackend().start(GpuContext(
         gpu_index=0,
@@ -168,7 +167,7 @@ def _boot_state(model):
     execution.bind_loaded_model(
         model=model_mod, arena=arena, pipeline=pipeline
     )
-    answerer = Answerer(torch, F, model_mod, tokenizer)
+    answerer = AnswerRows.from_tokenizer(torch, F, model_mod, tokenizer)
     async_ans = AsyncAnswers(torch, answerer)
     with torch.inference_mode():
         warm = warm_kernels(torch, arena, pipeline, async_ans,
@@ -202,9 +201,8 @@ def _quailb_session(model, sf, gpus=1):
 
 def _run_query(state, build, captured):
     """One query through the real planner and worker core."""
-    from quail.backends.quail.executor.loop import AsyncAnswers
+    from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers
     from quail.backends.quail.worker import (
-        _PayloadAnswerer,
         execute_single,
         quail_runtime_payload,
     )
@@ -218,13 +216,14 @@ def _run_query(state, build, captured):
         request, registry, graph, _ = _validate_physical_request(
             request, query.session.registry)
         payload = quail_runtime_payload(request, graph)
-        answerer = _PayloadAnswerer(
+        rows = AnswerRows(
             state["torch"], state["F"], state["model"],
             payload["true_ids"], payload["false_ids"],
         )
         state["model_execution"].bind_query(
             torch=state["torch"],
-            async_answers=AsyncAnswers(state["torch"], answerer),
+            async_answers=AsyncAnswers(state["torch"], rows),
+            answer_rows=rows,
             chunk_tokens=payload["chunk_tokens"],
         )
         report = execute_single(state, payload, registry, graph)

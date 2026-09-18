@@ -246,15 +246,17 @@ The $\max$ within each component allows compute and memory to
 overlap. The components are summed because they run in sequence.
 Filter and join boundaries do not start separate forward passes.
 
-### Implementation
+### Follow the cost calculation
 
-| Module | What it does |
-|---|---|
-| [work.py](https://github.com/fsdatalab/quail/blob/main/quail/cost/work.py) | Count tokens, attention pairs, and KV traffic |
-| [dense_decoder_cost.py](https://github.com/fsdatalab/quail/blob/main/quail/cost/dense_decoder_cost.py) | Build the three model components from the model shape |
-| [roofline.py](https://github.com/fsdatalab/quail/blob/main/quail/cost/roofline.py) | Price one component from FLOPs, bytes, and hardware limits |
-| [sol.py](https://github.com/fsdatalab/quail/blob/main/quail/cost/sol.py) | Apply ideal packing and sum component times |
-| [estimate.py](https://github.com/fsdatalab/quail/blob/main/quail/planner/estimate.py) | Run the filter and join search for one query |
+You can follow a plan's cost estimate through these files.
+
+| Step | File |
+| --- | --- |
+| Count tokens, attention pairs, and KV reads and writes. | [work.py](https://github.com/fsdatalab/quail/blob/main/quail/cost/work.py) |
+| Count arithmetic work and memory traffic from the model's dimensions. | [dense_decoder_cost.py](https://github.com/fsdatalab/quail/blob/main/quail/cost/dense_decoder_cost.py) |
+| Convert those counts to time using the GPU's limits. | [roofline.py](https://github.com/fsdatalab/quail/blob/main/quail/cost/roofline.py) |
+| Estimate the number of batches and add the component times. | [sol.py](https://github.com/fsdatalab/quail/blob/main/quail/cost/sol.py) |
+| Compare filter and join orders for your query. | [estimate.py](https://github.com/fsdatalab/quail/blob/main/quail/planner/estimate.py) |
 
 ### Assumptions
 

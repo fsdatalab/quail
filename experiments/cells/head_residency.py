@@ -76,9 +76,10 @@ def probe(model_name: str) -> str:
         FILTER_ATTENTION,
         JOIN_ATTENTION,
     )
-    from quail.backends.quail.executor.loop import Answerer, AsyncAnswers, run_filter
+    from quail.backends.quail.executor.loop import run_filter
     from quail.backends.quail.executor.model import load_model
     from quail.backends.quail.executor.models import build_pipeline
+    from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers
     from quail.cost import budgets
     from quail.specs import DEVICES, MODELS
 
@@ -103,10 +104,9 @@ def probe(model_name: str) -> str:
                     page_tokens=budgets.PAGE_TOKENS,
                     n_kv=spec.n_kv, d_head=spec.d_head,
                     dtype=torch.bfloat16)
-    pipeline = build_pipeline(spec, model, arena,
-                              attention_mode=FILTER_ATTENTION)
-    answerer = Answerer(torch, F, model, tokenizer)
-    another_answerer = Answerer(torch, F, model, tokenizer)
+    pipeline = build_pipeline(spec, model, arena)
+    answerer = AnswerRows.from_tokenizer(torch, F, model, tokenizer)
+    another_answerer = AnswerRows.from_tokenizer(torch, F, model, tokenizer)
     shared_answer_weights = answerer.weights is another_answerer.weights
     async_ans = AsyncAnswers(torch, answerer)
 
@@ -119,10 +119,9 @@ def probe(model_name: str) -> str:
                 ("unified", FILTER_ATTENTION, True),
                 ("merge_quant", JOIN_ATTENTION, True),
                 ("unpaged", FILTER_ATTENTION, False)):
-            pipeline.attention_mode = mode
             answers, _, _ = run_filter(
                 torch, arena, pipeline, async_ans, doc_ids, [q_ids],
-                chunk, arena_writes=writes)
+                chunk, arena_writes=writes, attention_mode=mode)
             correct[label] = sum(
                 int(answers[d][0]) == int(flags[d])
                 for d in range(N_DOCS))

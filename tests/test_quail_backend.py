@@ -113,7 +113,7 @@ def graph_state(model_execution, docs):
     return {
         "torch": fake_torch(),
         "arena": FakeArena(),
-        "pipeline": SimpleNamespace(attention_mode=None),
+        "pipeline": SimpleNamespace(),
         "model_execution": model_execution,
         "runtimes": registry.runtimes,
         "model_spec": MODELS["qwen3-4b-fp8"],
@@ -297,7 +297,8 @@ def test_filter_execution_and_retention_inputs(monkeypatch):
             model=object(), arena=FakeArena(), pipeline=SimpleNamespace()
         )
         execution.bind_query(
-            torch=fake_torch(), async_answers=object(), chunk_tokens=8192
+            torch=fake_torch(), async_answers=object(), answer_rows=object(),
+            chunk_tokens=8192,
         )
         node = AiFilter(
             node_id="filter:d",

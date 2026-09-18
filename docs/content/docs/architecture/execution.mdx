@@ -134,22 +134,35 @@ CPU process divides the work and collects results.
   all GPUs, drops documents that matched no partner, and
   redistributes the next join group's anchor documents across GPUs.
 
-## GPU code
+## Change the GPU execution code
 
-All GPU execution code is in
-[quail/backends/quail/executor/](https://github.com/fsdatalab/quail/tree/main/quail/backends/quail/executor):
+You can find the GPU executor in
+[quail/backends/quail/executor/](https://github.com/fsdatalab/quail/tree/main/quail/backends/quail/executor).
+Use these files to change how Quail runs your query.
 
-| File | What it does |
+| To change | Edit |
 | --- | --- |
-| [`pack.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/pack.py) | Admission logic for filters and joins. |
-| [`arena.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/arena.py) | Paged KV arena and page accounting. |
-| [`attention.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/attention.py) | The engine: kernels, quantization, two-call attention with log-sum-exp merge. |
-| [`models/qwen3.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/models/qwen3.py) | The Qwen3 forward pass over the engine. One file per architecture; `ModelSpec.arch` picks it. |
-| [`loop.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/loop.py) | Overlapped filter and join execution loops. |
-| [`model.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/model.py) | Weight loading through vLLM's loader. |
+| Which documents and pairs enter a batch | [`pack.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/pack.py) |
+| How Quail allocates, keeps, and frees KV pages | [`arena.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/arena.py) |
+| GPU kernels and attention calculations | [`attention.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/attention.py) |
+| The Qwen3 forward pass | [`models/qwen3.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/models/qwen3.py) |
+| How filter and join batches run | [`loop.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/loop.py) |
+| How model outputs become Boolean answers or `AI.SCORE` values | [`readout.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/readout.py) |
+| How Quail loads model weights through vLLM | [`model.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/model.py) |
 
-The fused kernels in `attention.py` assume QK-norm before RoPE, a
-gated SiLU MLP, and FP8 block-quantized weights, as Qwen3 has.
+If you add a model architecture, put its forward pass in `models/`.
+Register it in `models/__init__.py` and set `ModelSpec.arch` to that
+name. You also need kernels for any operations the current engine
+does not support.
+
+Before you reuse the fused kernels in `attention.py`, check your
+model's operations. The kernels assume QK-norm before RoPE, a gated
+SiLU MLP, and FP8 block-quantized weights.
+
+Keep KV allocation and cleanup in the execution loop. Your model's
+forward pass should only compute the requested hidden states. Use
+`chunk.attention_mode` for the attention path chosen when the chunk
+was packed.
 
 ## Lifetime and limits
 

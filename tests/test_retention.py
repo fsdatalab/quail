@@ -86,7 +86,6 @@ def test_filter_chains_share_retention_and_return_evicted_pages(monkeypatch):
     from types import SimpleNamespace
 
     from quail.backends.quail.executor import loop
-    from quail.backends.quail.executor.attention import FILTER_ATTENTION
 
     arena = cpu_arena(32, 8, {'e1': (1, 0), 'e2': (1, 1)})
 
@@ -102,8 +101,8 @@ def test_filter_chains_share_retention_and_return_evicted_pages(monkeypatch):
         Event=lambda **kw: SimpleNamespace(record=lambda: None)))
     answers = SimpleNamespace(submit=lambda values: values,
                               result=lambda values: values)
-    pipeline = SimpleNamespace(attention_mode=FILTER_ATTENTION,
-                               forward_chunk=lambda chunk: [True] * len(chunk.specs))
+    pipeline = SimpleNamespace(
+        forward_chunk=lambda chunk: [True] * len(chunk.specs))
     monkeypatch.setattr(
         loop, 'pack_chunk',
         lambda torch, arena, specs, **kw: SimpleNamespace(

@@ -67,9 +67,8 @@ def test_retained_answer_weights_and_embedding_ownership(torch):
     assert torch.equal(model.quail_answer_weights, embedding[[1, 3, 5]])
 
 
-def test_answerers_preserve_scores_and_share_retained_weights(torch):
-    from quail.backends.quail.executor.loop import Answerer
-    from quail.backends.quail.worker import _PayloadAnswerer
+def test_answer_rows_preserve_scores_and_share_retained_weights(torch):
+    from quail.backends.quail.executor.readout import AnswerRows
 
     model = _model(torch)
     hidden = torch.tensor([[1, 2, -1, 0], [0, 1, 3, -2]], dtype=torch.bfloat16)
@@ -82,7 +81,8 @@ def test_answerers_preserve_scores_and_share_retained_weights(torch):
         return {"input_ids": [
             5 if "false" in word.lower() else 3 if word.startswith(" ") else 1]}
 
-    first = Answerer(cpu_torch, torch.nn.functional, model, tokenizer)
-    second = _PayloadAnswerer(cpu_torch, torch.nn.functional, model, [3, 1], [5])
+    first = AnswerRows.from_tokenizer(cpu_torch, torch.nn.functional, model,
+                                      tokenizer)
+    second = AnswerRows(cpu_torch, torch.nn.functional, model, [3, 1], [5])
     assert first.weights is second.weights is model.quail_answer_weights
     assert first(hidden) == second(hidden) == expected
