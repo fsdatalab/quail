@@ -956,6 +956,10 @@ class FilterStream:
             raise ValueError("held survivors are pinned, not retained")
         canvas = tuple(getattr(pipeline, "canvas_ids", ()))
         c = len(canvas)
+        # a model whose attention reads paged KV only writes pages even
+        # when the plan skipped them
+        arena_writes = arena_writes or bool(
+            getattr(pipeline, "needs_pages", False))
         stage_tokens = [len(question_ids[0]) + c] \
             + [len(q) - p + c for q in question_ids[1:]]
         tails = [question_ids[0]] + [q[p:] for q in question_ids[1:]]

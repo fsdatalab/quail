@@ -13,7 +13,9 @@ Three cells, each on its own H100:
 - confirm: a filter and a join through a Quail session, with the
   answers of a small labeled corpus.
 - reference: vLLM's own diffusion sampler on the same filter prompts,
-  to compare its first answer token with Quail's.
+  to compare its first answer token with Quail's. It renders the
+  prompt three ways: bare text as Qwen3 gets it, inside a chat turn,
+  and inside a chat turn with an empty thinking channel prefilled.
 
 The cells write these files to the quail-results volume:
 
@@ -263,10 +265,18 @@ def reference(prediction: str) -> str:
     def tok(text):
         return hf(text, add_special_tokens=False)["input_ids"]
 
-    prompt = bind_prompt(FILTER_TEMPLATE, (SimpleNamespace(alias="d"),),
-                         tok, turn=spec.turn)
+    turns = {
+        "bare": ("", ""),
+        "turn": ("<bos><|turn>user\n", "<turn|>\n<|turn>model\n"),
+        "turn+channel": spec.turn,
+    }
     docs = FOOD + CARS
-    ids = [render_filter_prompt_ids(prompt, tok(doc), tok) for doc in docs]
+    prompts = {}
+    for name, turn in turns.items():
+        prompt = bind_prompt(FILTER_TEMPLATE, (SimpleNamespace(alias="d"),),
+                             tok, turn=turn)
+        prompts[name] = [render_filter_prompt_ids(prompt, tok(doc), tok)
+                         for doc in docs]
     true_ids, false_ids = true_false_ids(hf)
     llm = LLM(
         model=spec.hf_name, max_num_seqs=4, gpu_memory_utilization=0.85,
@@ -275,33 +285,42 @@ def reference(prediction: str) -> str:
                       "diffusion_entropy_bound": 0.1},
         diffusion_config={"canvas_length": spec.canvas_tokens},
     )
-    started = time.time()
-    # the diffusion sampler owns temperature and rejects it as a
-    # sampling parameter
-    outputs = llm.generate(
-        [TokensPrompt(prompt_token_ids=row) for row in ids],
-        SamplingParams(max_tokens=16))
-    elapsed = time.time() - started
-    answers = []
-    for doc, row, output in zip(docs, ids, outputs):
-        generated = list(output.outputs[0].token_ids)
-        first = generated[0] if generated else None
-        answers.append({
-            "document": doc,
-            "prompt_tokens": len(row),
-            "text": output.outputs[0].text,
-            "first_token": first,
-            "first_is_true": first in true_ids,
-            "first_is_false": first in false_ids,
-        })
     result = {
         "prediction": prediction,
-        "prompt_text_example": hf.decode(ids[0]),
-        "generate_s": elapsed,
-        "answers": answers,
         "true_ids": sorted(true_ids),
         "false_ids": sorted(false_ids),
+        "layouts": {},
     }
+    for name, ids in prompts.items():
+        started = time.time()
+        # the diffusion sampler owns temperature and rejects it as a
+        # sampling parameter
+        outputs = llm.generate(
+            [TokensPrompt(prompt_token_ids=row) for row in ids],
+            SamplingParams(max_tokens=16))
+        elapsed = time.time() - started
+        answers = []
+        for doc, row, output in zip(docs, ids, outputs):
+            generated = list(output.outputs[0].token_ids)
+            first = generated[0] if generated else None
+            answers.append({
+                "document": doc[:40],
+                "prompt_tokens": len(row),
+                "text": output.outputs[0].text,
+                "tokens": generated[:6],
+                "first_is_true": first in true_ids,
+                "first_is_false": first in false_ids,
+            })
+        expected = [True] * 8 + [False] * 8
+        agree = sum(
+            1 for want, answer in zip(expected, answers)
+            if answer["first_is_true" if want else "first_is_false"])
+        result["layouts"][name] = {
+            "prompt_text_example": hf.decode(ids[0]),
+            "generate_s": elapsed,
+            "first_token_agreement": agree / 16,
+            "answers": answers,
+        }
     result["volume_path"] = _save("diffusion_gemma_reference", result)
     return json.dumps(result, indent=2, default=str)
 

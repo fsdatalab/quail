@@ -139,6 +139,14 @@ def test_filter_stream_charges_canvas_rows():
     assert stream.capacity_extra == 2 + 2 + 3
     assert stream.canvas == (1, 2, 3)
 
+    paged = SimpleNamespace(is_fp8=False, canvas_ids=(), needs_pages=True,
+                            forward_chunk=None)
+    stream = loop.FilterStream(
+        fake_torch(), cpu_arena(64), paged, answers, docs[:1], questions[:1],
+        200, arena_writes=False, arena_keys=[("d", 0)])
+    assert stream.arena_writes
+    assert stream.sched.free_pages is not None
+
 
 def _cpu_staging(monkeypatch):
     import torch

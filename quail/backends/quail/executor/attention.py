@@ -27,6 +27,9 @@ from dataclasses import dataclass
 from typing import Any
 
 GROUP = 128            # fp8 quant group size, matches the engine
+# FlashAttention's widest head; wider heads run vLLM's Triton paged
+# attention kernel, which needs arena pages.
+FA_MAX_HEAD_DIM = 256
 
 # Filters run "unified" (one causal paged attention call); joins run
 # "merge_quant" (two-call pattern with fused merge+quant kernel).
@@ -532,6 +535,33 @@ class Engine:
             causal=causal, fa_version=self.fa_version,
             return_softmax_lse=True, **extra)
 
+    def _paged(self, q3, kp, vp, cu_q, max_q, used, max_used, table, *,
+               causal, softmax_scale=None, window=None):
+        """One paged attention call.
+
+        FlashAttention, or vLLM's Triton kernel when the head is wider
+        than FlashAttention takes.
+        """
+        if q3.shape[-1] <= FA_MAX_HEAD_DIM:
+            out, _ = self._fa(
+                q3, kp, vp, cu_q, None, max_q, max_used, causal=causal,
+                block_table=table, seqused_k=used,
+                softmax_scale=softmax_scale, window=window)
+            return out
+        from vllm.v1.attention.ops.triton_unified_attention import (
+            unified_attention,
+        )
+        out = self.torch.empty_like(q3)
+        unified_attention(
+            q=q3, k=kp, v=vp, out=out, cu_seqlens_q=cu_q,
+            max_seqlen_q=max_q, seqused_k=used, max_seqlen_k=max_used,
+            softmax_scale=(q3.shape[-1] ** -0.5 if softmax_scale is None
+                           else softmax_scale),
+            causal=causal, window_size=window or (-1, -1),
+            block_table=table, softcap=0.0, q_descale=None,
+            k_descale=None, v_descale=None)
+        return out
+
     def attention_merge_quant(self, q3, k3, v3, meta):
         """The two-call attention path with the fused merge plus FP8 quantize.
 
@@ -601,6 +631,10 @@ class Engine:
         behind = None if window is None else (window - 1, 0)
         around = None if window is None else (window - 1, window - 1)
         if unified is None:
+            if q3.shape[-1] > FA_MAX_HEAD_DIM:
+                raise ValueError(
+                    f"a {q3.shape[-1]}-wide head runs paged attention "
+                    f"only; pack the chunk with arena pages")
             out, _ = self._fa(
                 q3, k3, v3, meta["cu_a"], meta["cu_a"],
                 meta["max_a"], meta["max_a"], causal=True,
@@ -622,17 +656,15 @@ class Engine:
             self.kv_row_scatter(k_pool, v_pool,
                                 unified["tail_src"], unified["tail_dst"], layer)
         kp, vp = self.arena.paged_kv(layer)
-        out, _ = self._fa(
-            q3, kp, vp, unified["cu_q"], None,
-            unified["max_q"], unified["max_used"], causal=True,
-            block_table=unified["table"], seqused_k=unified["used"],
+        out = self._paged(
+            q3, kp, vp, unified["cu_q"], unified["max_q"], unified["used"],
+            unified["max_used"], unified["table"], causal=True,
             softmax_scale=softmax_scale, window=behind)
         if canvas is not None:
             q_c = q3.index_select(0, canvas["rows"])
-            out_c, _ = self._fa(
-                q_c, kp, vp, canvas["cu_q"], None,
-                canvas["max_q"], canvas["max_used"], causal=False,
-                block_table=canvas["table"], seqused_k=canvas["used"],
+            out_c = self._paged(
+                q_c, kp, vp, canvas["cu_q"], canvas["max_q"], canvas["used"],
+                canvas["max_used"], canvas["table"], causal=False,
                 softmax_scale=softmax_scale, window=around)
             out.index_copy_(0, canvas["rows"], out_c)
         meta["layer"] += 1
