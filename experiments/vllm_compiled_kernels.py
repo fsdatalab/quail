@@ -54,23 +54,14 @@ import os
 import modal
 
 from quail.backends.quail.executor.attention import GROUP, Engine
+from quail.bench.requirements import quail_requirements
 
 IMAGE_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
 
 image = (
     modal.Image.from_registry(IMAGE_BASE, add_python="3.12")
     .entrypoint([])
-    .pip_install(
-        "vllm==0.26.0",
-        "huggingface_hub[hf_transfer]",
-        "transformers>=5.2.0",
-        "pandas",
-        "pyarrow",
-        "numpy",
-        "datasets",
-        "sqlglot>=27.0",
-        "gigatoken>=0.10.0",
-    )
+    .pip_install(*quail_requirements(), "hf_transfer", "pandas")
     .env({"VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
           "VLLM_LOGGING_LEVEL": "WARNING",
           "VLLM_USE_FLASHINFER_SAMPLER": "0",

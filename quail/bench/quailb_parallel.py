@@ -21,7 +21,7 @@ from pathlib import Path
 
 import modal
 
-from quail.bench.requirements import quail_b_requirement
+from quail.bench.requirements import quail_b_requirement, quail_requirements
 from quail.bench.results import combine_measurements, write_json
 
 base_image = (
@@ -31,8 +31,7 @@ base_image = (
     .apt_install("git")
     # quail-b installs from git at the pinned commit, with its plan files
     # and its own dependencies
-    .pip_install("huggingface_hub", "numpy", "pyarrow",
-                 "sqlglot>=27.0", "gigatoken>=0.10.0", "datasets>=5.0.1",
+    .pip_install(*quail_requirements(without=("vllm",)),
                  quail_b_requirement())
     .env({
         "QUAIL_CACHE_DIR": "/root/.cache/kernels",

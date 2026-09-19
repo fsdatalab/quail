@@ -23,6 +23,7 @@ from pathlib import Path
 
 import modal
 
+from quail.bench.requirements import quail_requirements
 from quail.specs import H100_USD_PER_HOUR
 
 IMAGE_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
@@ -74,14 +75,7 @@ MODELS = {
 image = (
     modal.Image.from_registry(IMAGE_BASE, add_python="3.12")
     .entrypoint([])
-    .pip_install(
-        "vllm==0.26.0",
-        "huggingface_hub",
-        "pandas",
-        "pyarrow",
-        "numpy",
-        "datasets",
-    )
+    .pip_install(*quail_requirements(), "pandas")
     .env({
         "VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
         "VLLM_LOGGING_LEVEL": "WARNING",
@@ -97,14 +91,7 @@ image = (
 
 data_image = (
     modal.Image.debian_slim(python_version="3.12")
-    .pip_install(
-        "numpy",
-        "pyarrow",
-        "pandas",
-        "huggingface_hub",
-        "datasets",
-        "transformers>=5.2.0",
-    )
+    .pip_install(*quail_requirements(without=("vllm",)), "pandas")
     .add_local_python_source("quail", "quail_b")
 )
 

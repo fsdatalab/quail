@@ -443,3 +443,16 @@ def test_benchmark_query_prompts_and_labels():
                 documents = ("doc one", "doc two")
                 assert render_join_prompt(spec.template, documents, anchor) == (
                     render_join_prompt_text(prompt, documents, anchor))
+
+
+def test_quail_requirements_follow_the_package_metadata():
+    from quail.bench.requirements import quail_requirements
+
+    pins = quail_requirements()
+    assert "sqlglot==30.17.0" in pins and "gigatoken==0.10.0" in pins
+    assert any(pin.startswith("vllm==") for pin in pins)
+    # one numpy pin survives the platform markers, without the marker
+    assert sum(pin.startswith("numpy==") for pin in pins) == 1
+    assert all(";" not in pin for pin in pins)
+    assert not any(pin.startswith("vllm") for pin in quail_requirements(
+        without=("vllm",)))
