@@ -142,9 +142,10 @@ def _reject_forbidden(tree) -> None:
 
 
 class _Binder:
-    def __init__(self, catalog: Catalog, tokenizer):
+    def __init__(self, catalog: Catalog, tokenizer, turn=("", "")):
         self.catalog = catalog
         self.tokenizer = tokenizer
+        self.turn = turn
         self.tables = []          # (alias, provider) in appearance order
         self.doc_columns = {}     # alias -> document column
         self.filters = {}         # alias -> [FilterPredicate]
@@ -272,7 +273,8 @@ class _Binder:
             binder = bind_score_prompt
         else:
             binder = bind_join_prompt if join else bind_prompt
-        prompt = binder(template, tuple(refs), self.tokenizer)
+        prompt = binder(template, tuple(refs), self.tokenizer,
+                        turn=self.turn)
         for r in refs:
             self.note_doc_column(r)
         return prompt, options, aliases
@@ -362,8 +364,12 @@ def _parse_limit(tree) -> int | None:
 def compile_sql(sql: str, catalog: Catalog,
                 tokenizer=None,
                 dialect: SQLDialect | str = SQLDialect.SNOWFLAKE,
+                turn: tuple[str, str] = ("", ""),
                 ) -> LogicalPlan:
-    """Compile AI SQL text into a LogicalPlan."""
+    """Compile AI SQL text into a LogicalPlan.
+
+    turn is the model's chat-turn text wrapped around every prompt.
+    """
     try:
         dialect = SQLDialect(dialect)
     except ValueError as error:
@@ -382,7 +388,7 @@ def compile_sql(sql: str, catalog: Catalog,
 
     limit = _parse_limit(tree)
 
-    b = _Binder(catalog, tokenizer)
+    b = _Binder(catalog, tokenizer, turn)
 
     from_ = _from_clause(tree)
     if from_ is None or not isinstance(from_.this, exp.Table):

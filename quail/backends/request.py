@@ -30,10 +30,10 @@ from quail.execution.runner import (
 )
 from quail.execution.types import PhysicalResponse, export_physical_outputs
 from quail.logical import (
-    SHARED_PRE,
     Apply,
     effective_selectivity,
     join_outer_input,
+    shared_preamble,
 )
 from quail.physical import (
     Limit,
@@ -128,13 +128,13 @@ def plan_request_backend(
 
     rule = context.order or default_order_rule(filters, joins)[0]
     chunk_tokens = budgets.chunk_budget(context.model, context.device)
-    shared_preamble = preamble_tokens(filters, joins)
+    preamble_count = preamble_tokens(filters, joins)
     filter_orders = {
         alias: order_filters_indexed(
             predicates,
             rule,
             prefix_tokens=(
-                shared_preamble + stats[alias].mean_doc_tokens
+                preamble_count + stats[alias].mean_doc_tokens
             ),
             model=context.model,
             device=context.device,
@@ -157,7 +157,7 @@ def plan_request_backend(
             for alias, lengths in context.document_tokens.items()
         },
         {},
-        shared_preamble,
+        preamble_count,
         chunk_tokens,
         context.model,
         context.device,
@@ -231,7 +231,8 @@ def plan_request_backend(
         raise ValueError("request prompts have different preambles")
     preamble = next(iter(preambles), ())
     if not preamble and prompts and context.tokenizer is not None:
-        preamble = tuple(context.tokenizer(SHARED_PRE))
+        preamble = tuple(context.tokenizer(
+            shared_preamble(context.model.turn_prefix)))
 
     request_node = RequestExecution(
         node_id="request-model",
@@ -866,7 +867,7 @@ class RequestBackend:
             allowed_ids = sorted(set(
                 envelope["settings"]["true_ids"]
             ) | set(envelope["settings"]["false_ids"]))
-            engine_state, boot = self.engine.boot(model.hf_name, allowed_ids)
+            engine_state, boot = self.engine.boot(model, allowed_ids)
             context.runtime_state[state_key] = engine_state
         else:
             boot = _warm_boot()

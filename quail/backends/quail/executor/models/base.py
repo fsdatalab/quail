@@ -11,12 +11,25 @@ loop sees only this class.
 class ModelPipeline:
     """The contract between the chunk loop and one model family.
 
-    A subclass sets self.engine and self.max_chunk_tokens in __init__
-    and implements forward_chunk and linears.
+    A subclass sets self.engine, self.spec, and self.max_chunk_tokens
+    in __init__ and implements forward_chunk; with gemm_warmup it also
+    implements linears. join_attention names the attention path a
+    join's chunks run: "merge_quant" (two calls, fused merge and fp8
+    quant) or "unified" (one causal call). A diffusion model also sets
+    canvas_ids: the token ids the loop packs after every suffix, with
+    the answer at canvas_answer_row of them. needs_pages says every
+    chunk must carry arena pages, for a model whose attention kernel
+    reads paged KV only.
     """
 
     engine = None
+    spec = None
     max_chunk_tokens = None
+    canvas_ids = ()
+    canvas_answer_row = 0
+    needs_pages = False
+    join_attention = "merge_quant"
+    gemm_warmup = True
 
     def forward_chunk(self, chunk):
         """Return the final-normed hidden state of chunk.final_indices.
@@ -29,7 +42,3 @@ class ModelPipeline:
     def linears(self):
         """One linear module per distinct GEMM shape, for kernel warm-up."""
         raise NotImplementedError
-
-    @property
-    def is_fp8(self):
-        return self.engine.is_fp8

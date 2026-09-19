@@ -13,6 +13,16 @@ from quail.backends.request_scheduling import (
 
 GPU_MEMORY_UTILIZATION = 0.91
 CUDA_GRAPH_CAPTURE_SIZE = 8_192
+# vLLM caps a diffusion model at 8 sequences per step whenever the
+# setting is 128 or more, sized for its 256-row canvas; one row needs
+# no cap, so stay just under the trigger.
+DIFFUSION_SEQUENCES = 127
+# top logprobs read at the canvas row; the answer word is in the top
+# 20 on 62 of 64 probed reviews
+DIFFUSION_LOGPROBS = 20
+# generated tokens a longer canvas gets; the answer word is read
+# from the text
+DIFFUSION_TEXT_TOKENS = 16
 
 
 def _capacity(llm) -> dict:
@@ -36,6 +46,23 @@ def _capacity(llm) -> dict:
         "gpu_memory_utilization": float(cache.gpu_memory_utilization),
         "kv_cache_dtype": str(cache.cache_dtype),
     }
+
+
+def sampling_kwargs(allowed_ids: list[int], canvas_tokens: int = 0) -> dict:
+    """SamplingParams arguments for one greedy answer token.
+
+    A diffusion model's sampler takes no temperature, min_tokens, or
+    allowed_token_ids. With a one-row canvas it commits that row after
+    one pass and returns its top logprobs, which the reader ranks TRUE
+    against FALSE; a longer canvas writes free text, and the reader
+    finds the answer word.
+    """
+    if canvas_tokens == 1:
+        return {"max_tokens": 1, "logprobs": DIFFUSION_LOGPROBS}
+    if canvas_tokens:
+        return {"max_tokens": DIFFUSION_TEXT_TOKENS}
+    return {"temperature": 0.0, "max_tokens": 1, "min_tokens": 1,
+            "allowed_token_ids": allowed_ids}
 
 
 class VLLMClient:
@@ -74,11 +101,18 @@ class VLLMEngine:
     label = "vLLM"
     runtime_package = "vllm==0.26.0"
 
-    def llm_kwargs(self) -> dict:
-        """Return the LLM constructor arguments beyond the model name."""
-        return {
-            "max_num_batched_tokens": MAX_BATCHED_TOKENS,
-            "max_num_seqs": MAX_SEQUENCES,
+    def llm_kwargs(self, spec) -> dict:
+        """Return the LLM constructor arguments beyond the model name.
+
+        A spec with its own chunk cap (a mixture-of-experts model)
+        batches at least that many tokens per step. A diffusion model
+        gets the spec's canvas; a one-row canvas takes one denoising
+        step, so a request is one prefill pass plus one row.
+        """
+        batched = max(MAX_BATCHED_TOKENS, spec.chunk_cap_tokens)
+        sequences = MAX_SEQUENCES
+        kwargs = {
+            "max_num_batched_tokens": batched,
             "gpu_memory_utilization": GPU_MEMORY_UTILIZATION,
             "enable_prefix_caching": True,
             "disable_log_stats": True,
@@ -86,19 +120,24 @@ class VLLMEngine:
                 "cudagraph_capture_sizes": [CUDA_GRAPH_CAPTURE_SIZE]
             },
         }
+        if spec.canvas_tokens:
+            diffusion = {"canvas_length": spec.canvas_tokens}
+            if spec.canvas_tokens == 1:
+                diffusion["max_denoising_steps"] = 1
+                sequences = DIFFUSION_SEQUENCES
+            kwargs["diffusion_config"] = diffusion
+        kwargs["max_num_seqs"] = sequences
+        return kwargs
 
-    def boot(self, model_name: str, allowed_ids: list[int]) -> tuple[dict, dict]:
+    def boot(self, spec, allowed_ids: list[int]) -> tuple[dict, dict]:
+        """Load the spec's model and return the engine state and boot record."""
         from vllm import LLM, SamplingParams
 
         started = time.perf_counter()
-        llm = LLM(model=model_name, **self.llm_kwargs())
+        llm = LLM(model=spec.hf_name, **self.llm_kwargs(spec))
         boot_s = time.perf_counter() - started
         sampling_params = SamplingParams(
-            temperature=0.0,
-            max_tokens=1,
-            min_tokens=1,
-            allowed_token_ids=allowed_ids,
-        )
+            **sampling_kwargs(allowed_ids, spec.canvas_tokens))
         capacity = _capacity(llm)
         client = VLLMClient(llm, capacity)
         client.generate(
@@ -131,7 +170,7 @@ class DefaultVLLMEngine(VLLMEngine):
     kind = "dumb_vllm"
     label = "vLLM with default settings"
 
-    def llm_kwargs(self) -> dict:
+    def llm_kwargs(self, spec) -> dict:
         return {}
 
 

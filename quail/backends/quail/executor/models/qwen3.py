@@ -14,9 +14,11 @@ from quail.backends.quail.executor.models.base import ModelPipeline
 class Qwen3Pipeline(ModelPipeline):
     """Forward passes for Qwen3 checkpoints loaded by vLLM."""
 
-    def __init__(self, model, arena, *, kernels="quail", engine_class=Engine):
+    def __init__(self, model, arena, *, spec, kernels="quail",
+                 engine_class=Engine):
         import torch
 
+        self.spec = spec
         self.layers = model.model.layers
         self.embed = model.model.embed_tokens
         self.final_norm = model.model.norm

@@ -1,6 +1,7 @@
 """CPU tests for vLLM and SGLang backend interfaces."""
 
 import asyncio
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -113,7 +114,7 @@ def test_request_backends_plan_validate_and_execute(monkeypatch):
 
         patch.setattr(
             "quail.backends.vllm.VLLMEngine.boot",
-            lambda self, model_name, allowed_ids: (
+            lambda self, spec, allowed_ids: (
                 {
                     "client": client,
                     "sampling_params": object(),
@@ -412,3 +413,74 @@ def test_sglang_submission_and_cancellation():
         assert len(aborted) == 1
 
     asyncio.run(run())
+
+
+def test_vllm_engine_settings_follow_the_model():
+    from quail.backends.vllm import VLLMEngine, sampling_kwargs
+    from quail.specs import DIFFUSION_GEMMA_26B_FP8, QWEN3_4B_FP8
+
+    engine = VLLMEngine()
+    assert engine.llm_kwargs(QWEN3_4B_FP8)["max_num_batched_tokens"] == 25_305
+    assert "diffusion_config" not in engine.llm_kwargs(QWEN3_4B_FP8)
+    # the mixture-of-experts model batches its own chunk cap; its
+    # one-row canvas commits after one denoising step, and stays under
+    # vLLM's eight-sequence cap trigger
+    gemma = engine.llm_kwargs(DIFFUSION_GEMMA_26B_FP8)
+    assert gemma["max_num_batched_tokens"] == 65_536
+    assert gemma["diffusion_config"] == {"canvas_length": 1,
+                                         "max_denoising_steps": 1}
+    assert gemma["max_num_seqs"] == 127
+    wide = engine.llm_kwargs(replace(DIFFUSION_GEMMA_26B_FP8, canvas_tokens=256))
+    assert wide["diffusion_config"] == {"canvas_length": 256}
+    assert wide["max_num_seqs"] == engine.llm_kwargs(QWEN3_4B_FP8)["max_num_seqs"]
+    assert sampling_kwargs([1, 2]) == {
+        "temperature": 0.0, "max_tokens": 1, "min_tokens": 1,
+        "allowed_token_ids": [1, 2]}
+    # the diffusion sampler rejects everything but the length; a
+    # one-row canvas returns its logprobs, a longer one free text
+    assert sampling_kwargs([1, 2], canvas_tokens=1) == {
+        "max_tokens": 1, "logprobs": 20}
+    assert sampling_kwargs([1, 2], canvas_tokens=256) == {"max_tokens": 16}
+
+
+def test_true_bit_reads_the_answer_word_from_free_text():
+    from types import SimpleNamespace
+
+    from quail.backends.request_scheduling import true_bit
+
+    def output(token_ids, text):
+        return SimpleNamespace(outputs=[SimpleNamespace(token_ids=token_ids,
+                                                        text=text)])
+
+    assert true_bit(output([7], "TRUE"), {7}) == 1
+    assert true_bit(output([8], "FALSE"), {7}) == 0
+    assert true_bit(output([1, 2], "The answer is TRUE."), {7}) == 1
+    assert true_bit(output([1, 2], "**FALSE** because"), {7}) == 0
+    assert true_bit(output([1, 2], "TRUEISH FALSE"), {7}) == 0
+    assert true_bit(output([], ""), {7}) == 0
+
+
+def test_true_bit_ranks_the_answer_words_in_the_logprobs():
+    from types import SimpleNamespace
+
+    from quail.backends.request_scheduling import true_bit
+
+    def entry(logprob, decoded=None):
+        return SimpleNamespace(logprob=logprob, decoded_token=decoded)
+
+    def output(logprobs, token_ids=(1,), text=""):
+        return SimpleNamespace(outputs=[SimpleNamespace(
+            token_ids=list(token_ids), text=text, logprobs=logprobs)])
+
+    # the sampled token is end-of-turn; TRUE outranks FALSE below it
+    assert true_bit(output([{1: entry(-0.1, "<eos>"), 7: entry(-2.0, " TRUE"),
+                             8: entry(-3.5, " FALSE")}]), {7}) == 1
+    assert true_bit(output([{1: entry(-0.1, "<eos>"), 7: entry(-4.0, " TRUE"),
+                             8: entry(-3.5, "FALSE")}]), {7}) == 0
+    # a decoded TRUE counts even when its id is not a known true id
+    assert true_bit(output([{1: entry(-0.1, "<eos>"), 9: entry(-1.0, "TRUE")}]),
+                    {7}) == 1
+    # neither word present: fall back to the text, then to FALSE
+    assert true_bit(output([{1: entry(-0.1, "<eos>")}], text="TRUE"), {7}) == 1
+    assert true_bit(output([{1: entry(-0.1, "<eos>")}]), {7}) == 0
+    assert true_bit(output(None), {7}) == 0

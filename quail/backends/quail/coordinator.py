@@ -15,6 +15,7 @@ def _common_payload(payload: dict) -> dict:
     return {
         "model": payload["model"],
         "chunk_tokens": payload["chunk_tokens"],
+        "arena_pages": payload.get("arena_pages"),
         "true_ids": payload["true_ids"],
         "false_ids": payload["false_ids"],
         "pre_ids": payload.get("pre_ids", []),

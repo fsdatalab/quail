@@ -16,6 +16,7 @@ instead of starting NCCL or gloo.
 from functools import lru_cache
 from pathlib import Path
 
+from quail.backends.quail.executor.moe_configs import write_configs
 from quail.progress import say
 
 
@@ -134,19 +135,41 @@ def answer_weights(model, token_ids):
 
 
 def load_model(model_name: str, revision: str | None = None, *,
-               answer_token_ids=None):
-    """Load model weights and retain only TRUE/FALSE output rows."""
+               answer_token_ids=None, max_batched_tokens=None,
+               moe_backend=None):
+    """Load model weights and retain only TRUE/FALSE output rows.
+
+    max_batched_tokens is the largest chunk the model will see. vLLM's
+    fused MoE kernels size their scratch buffers from it; a dense model
+    ignores it. moe_backend names the fused MoE kernel family vLLM
+    should use ("triton", "vllm_cutlass", ...); None lets vLLM pick.
+    """
+    import os
+    import tempfile
+
     import torch
     from vllm.config import set_current_vllm_config
     from vllm.engine.arg_utils import EngineArgs
     from vllm.model_executor.model_loader import get_model
 
+    # vLLM's Triton fused MoE reads tuned tile configs from this
+    # folder before its own; ours add entries for Quail's chunk sizes
+    if "VLLM_TUNED_CONFIG_FOLDER" not in os.environ:
+        folder = write_configs(Path(tempfile.gettempdir()) / "quail-moe-configs")
+        os.environ["VLLM_TUNED_CONFIG_FOLDER"] = str(folder)
     model_path = resolve_model_path(model_name, revision)
-    config = EngineArgs(model=model_path, dtype="auto",
-                        enforce_eager=True).create_engine_config()
+    args = dict(model=model_path, dtype="auto", enforce_eager=True)
+    if max_batched_tokens is not None:
+        args["max_num_batched_tokens"] = int(max_batched_tokens)
+    if moe_backend is not None:
+        args["moe_backend"] = moe_backend
+    config = EngineArgs(**args).create_engine_config()
     _install_single_rank_groups(torch)
     with set_current_vllm_config(config):
         model = get_model(vllm_config=config)
+    # vLLM's fused MoE kernels read the forward context, which is
+    # built from this config
+    model.quail_vllm_config = config
     if answer_token_ids is None:
         from transformers import AutoTokenizer
 

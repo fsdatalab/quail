@@ -7,16 +7,55 @@ KV admission calculation. Joins submit one request per document pair.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 
 MAX_SEQUENCES = 4_096
 MAX_BATCHED_TOKENS = 25_305
 
 
+_ANSWER_WORD = re.compile(r"\b(TRUE|FALSE)\b")
+_WHOLE_ANSWER_WORD = re.compile(r"^\s*(TRUE|FALSE)\s*$", re.IGNORECASE)
+
+
+def _ranked_answer(logprobs):
+    """The likelier of TRUE and FALSE in the first position's logprobs.
+
+    Each entry is judged by its decoded token. Returns 1 or 0, or None
+    when neither answer word is among the entries.
+    """
+    if not logprobs:
+        return None
+    best = None
+    for entry in logprobs[0].values():
+        match = _WHOLE_ANSWER_WORD.match(
+            getattr(entry, "decoded_token", None) or "")
+        if match is None:
+            continue
+        if best is None or entry.logprob > best[0]:
+            best = (entry.logprob, match.group(1).upper())
+    return None if best is None else int(best[1] == "TRUE")
+
+
 def true_bit(output, true_ids) -> int:
-    """Return 1 when a request's first output token is a TRUE token."""
-    token_ids = output.outputs[0].token_ids
-    return int(bool(token_ids and int(token_ids[0]) in true_ids))
+    """Whether the request answered TRUE.
+
+    The first generated token decides when it is a TRUE id, which the
+    allowed-token sampling of a decoder guarantees. A diffusion model's
+    sampler cannot restrict its tokens: with logprobs at the answer
+    row, TRUE and FALSE are ranked against each other; otherwise the
+    answer is the first TRUE or FALSE word in the text. No answer word
+    counts as FALSE.
+    """
+    completion = output.outputs[0]
+    token_ids = completion.token_ids
+    if token_ids and int(token_ids[0]) in true_ids:
+        return 1
+    ranked = _ranked_answer(getattr(completion, "logprobs", None))
+    if ranked is not None:
+        return ranked
+    match = _ANSWER_WORD.search(getattr(completion, "text", "") or "")
+    return int(match is not None and match.group(1) == "TRUE")
 
 
 def filter_document_cap(
