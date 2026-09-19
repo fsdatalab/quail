@@ -50,7 +50,7 @@ The scale factor defaults to 0.1. The run rejects references made with a
 different prompt format or scale factor.
 
 The saved estimates must be regenerated when a query definition changes.
-Use Quail revision 307e4b2b32244293bff3cf33c230c962f51f2a89.
+Use Quail revision a79de8e8 and its pinned raw-prompt benchmark.
 Pass --queries FEV-9 to recalculate only that query.
 On a mounted results volume, --root /results reads the saved benchmark
 directly and --collection selects its reference labels. The output filename then

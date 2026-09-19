@@ -1,57 +1,27 @@
-"""Generate the QUAIL-B overview and dataset plots without inference.
+r"""Generate the raw-prompt QUAIL-B report and all six comparison PDFs.
 
-Pull the saved measurements, corpus manifest, and SoL estimates:
+Pull the CPU-derived summary and regenerate the figures:
 
-    W=/tmp/quail-comparison; mkdir -p "$W/run"
-    RUN=benchmarks/quailb/family-runs/20260918T071546Z-all-chat
-    uv run modal volume get quail-results "$RUN/manifest.json" "$W/run/manifest.json"
-    uv run modal volume get quail-results "$RUN/measurements.parquet" \
-      "$W/run/measurements.parquet"
-    for METHOD in quail pipelined_vllm; do
-      mkdir -p "$W/run/$METHOD"
-      uv run modal volume get quail-results "$RUN/$METHOD/run.json" \
-        "$W/run/$METHOD/run.json"
-    done
-    uv run modal volume get quail-results "$RUN/requested_tokens.json" \
-      "$W/requested_tokens.json"
-    CORPUS=ground_truth/quailb/schema_v1/corpora/c_1aa2c4f0d0b6c816fd37aa5748c33341
-    uv run modal volume get quail-results "$CORPUS/manifest.json" "$W/corpus.json"
+    W=/tmp/quailb-raw; mkdir -p "$W"
     uv run modal volume get quail-results \
-      sol/2026-09-18-all-chat/sol_quailb_sf0.1.json "$W/sol.json"
-    B="$W/bio-comparison"; mkdir -p "$B"
-    OLD=benchmarks/quailb/family-runs/20260912T225100Z-902686c5
-    NEW=benchmarks/quailb/family-runs/20260918T060700Z-biodex-chat
-    uv run modal volume get quail-results "$OLD/quail/biodex/BIO-2/joins-0.parquet" \
-      "$B/raw.parquet"
-    uv run modal volume get quail-results "$NEW/quail/biodex/BIO-2/joins-0.parquet" \
-      "$B/chat.parquet"
-    for TABLE in reports terms; do
-      uv run modal volume get quail-results "quailb_data/sf0.1/$TABLE.parquet" \
-        "$B/$TABLE.parquet"
-    done
-    LABELS=ground_truth/quailb/schema_v1/label_sets/biodex/report_experienced_reaction
-    uv run modal volume get quail-results \
-      "$LABELS/ls_558442b4193e9a48bfe1aea9bc87a66a/labels.parquet" \
-      "$B/raw-reference.parquet"
-    uv run modal volume get quail-results \
-      "$LABELS/ls_4c0b69af26ad590e1b64ac5ffebf2484/labels.parquet" \
-      "$B/chat-reference.parquet"
-    uv run modal volume get quail-results \
-      ablations/bio2-prompt-layout-20260918T155056Z/result.json "$B/layout.json"
+      reports/quailb-raw-2026-09-19/comparison.json "$W/comparison.json"
     BENCH=git+https://github.com/fsdatalab/quail-bench.git
-    REV=d93a53583a0de61978916f349f21c9ecd6ce1ba3
+    REV=35696e5572b09f00e8af33a6a256168a9267f91e
     uv run --with matplotlib --with "quail-b@$BENCH@$REV" \
       python reports/make_quailb_comparison_plots.py "$W"
 
-To recount complete input prompts on a mounted results volume with Quail
-revision 307e4b2 and the benchmark revision above, run on CPU:
+To rebuild the summary on a CPU with the results volume mounted, use Quail
+a79de8e8 and its pinned QUAIL-B version. Recalculate the SoL estimates first:
 
-    python reports/make_quailb_comparison_plots.py /results/$RUN \
-      --count-requested-tokens --root /results \
-      --sol-file /results/sol/2026-09-18-all-chat/sol_quailb_sf0.1.json
+    W=/results/reports/quailb-raw-2026-09-19
+    uv run python reports/make_sol_quailb.py "$W" 0.1 --root /results \
+      --collection gt_be81cb241d74555dc2da79b5b0662554
+    uv run python reports/make_quailb_comparison_plots.py "$W" --prepare \
+      --root /results --sol-file "$W/sol_quailb_sf0.1.json"
 
-All queries use non-thinking chat prompts. The saved run reuses the completed
-September 18 BioDEX measurements after checking its reference label identities.
+Preparation validates saved plans and prompt token pieces, then recalculates
+scores, complete input token counts, and KV regret from saved answers.
+It does not run inference or change the original measurements.
 """
 
 import argparse
@@ -61,7 +31,6 @@ from pathlib import Path
 from statistics import mean, median
 
 import matplotlib.pyplot as plt
-import pyarrow.parquet as pq
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
@@ -70,17 +39,16 @@ from plot_colors import BLUE, DARK, ORANGE
 from quail.specs import H100_USD_PER_HOUR
 
 HERE = Path(__file__).resolve().parent
-METHODS = [
-    ("quail", "Quail", BLUE),
-    ("pipelined_vllm", "Pipelined vLLM", ORANGE),
-]
+METHODS = [("quail", "Quail", BLUE),
+           ("pipelined_vllm", "Pipelined vLLM", ORANGE)]
 QUERY_ORDER = (
     [f"IMDB-{n}" for n in range(1, 11)] + [f"BIO-{n}" for n in range(1, 4)]
     + [f"FEV-{n}" for n in range(1, 11)] + [f"LEP-{n}" for n in range(1, 6)]
     + ["AGENT-1", "AGENT-2"])
-
 SOURCE_QUERY_IDS = {q: "LEP-7" if q == "LEP-5" else q for q in QUERY_ORDER}
-CURRENT_QUERY_IDS = {source: q for q, source in SOURCE_QUERY_IDS.items()}
+CURRENT_QUERY_IDS = {old: new for new, old in SOURCE_QUERY_IDS.items()}
+SOURCE_RUN = "benchmarks/quailb/20260914T070913Z-f7beefb6"
+COLLECTION = "gt_be81cb241d74555dc2da79b5b0662554"
 
 
 def row_metrics(row):
@@ -111,49 +79,6 @@ METRICS = (
     ("cost_per_million", "GPU cost per million input tokens", "dollars/million tokens"),
     ("regret_percent", "Recomputed share of computed tokens", "percent"),
 )
-
-
-def input_relations(queries, corpus):
-    """Resolve each query alias to its saved input table count."""
-    from quail.bench.substrait import read_plan
-    from quail_b.queries import get_query
-
-    return {
-        query: [
-            (relation.alias, relation.table,
-             corpus["tables"][relation.table]["rows"])
-            for relation in read_plan(get_query(query).plan).relations]
-        for query in queries
-    }
-
-
-def load_sol(root, queries, rows, corpus, manifest):
-    """Load estimates matching the measured query and reference identities."""
-    from quail_b.queries import get_query
-    from quail_b.rendering import PROMPT_FORMAT
-
-    source = json.loads((root / "sol.json").read_text())
-    assert source["corpus_id"] == corpus["corpus_id"]
-    assert source["collection_id"] == manifest["collection_id"]
-    assert source["scale_factor"] == 0.1
-    assert source["optimizer"]["persistent_kv_capacity"] == "unlimited"
-    assert set(SOURCE_QUERY_IDS.values()) <= set(source["queries"])
-    estimates = {}
-    for query in queries:
-        record = source["queries"][SOURCE_QUERY_IDS[query]]
-        assert record["prompt_format"] == PROMPT_FORMAT
-        assert record["plan_sha256"] == hashlib.sha256(
-            get_query(query).plan_bytes).hexdigest()
-        estimate = record["models"]["qwen3-4b-fp8"]
-        assert estimate["input_document_rows"] == rows["quail"][query]["input_rows"]
-        assert estimate["tokens"] <= estimate["per_document"]["tokens"], query
-        estimates[query] = estimate
-    counts = json.loads((root / "requested_tokens.json").read_text())
-    sol_hash = hashlib.sha256((root / "sol.json").read_bytes()).hexdigest()
-    assert counts["sol_sha256"] == sol_hash
-    for query, estimate in estimates.items():
-        estimate["requested_tokens"] = counts["sol"][SOURCE_QUERY_IDS[query]]
-    return estimates
 
 
 def series_value(rows, sol, method, query, metric):
@@ -222,6 +147,8 @@ def metric_bars(axis, queries, rows, sol, metric, overview):
                  width=width * 0.9, color=color, label=label, edgecolor="none")
     if metric == "seconds" and not overview:
         for index, query in enumerate(queries):
+            if any(query not in rows[key] for key, _, _ in METHODS):
+                continue
             quail_time = rows["quail"][query]["runtime_s"]
             baseline_time = rows["pipelined_vllm"][query]["runtime_s"]
             top = max(quail_time, baseline_time)
@@ -300,99 +227,18 @@ def plot_comparison(title, queries, rows, relations, sol, name, overview=False):
             figure.subplots_adjust(left=0.075, right=0.97, top=0.83,
                                    bottom=0.14 if overview else 0.10, hspace=0.60,
                                    wspace=0.28)
-            figure.text(0.075, 0.02,
-                        "Reference labels: Qwen3 32B FP8 and dataset annotations.",
-                        fontsize=9)
+            note = "Raw prompts. References: Qwen3 32B FP8 and dataset annotations."
+            empty = [q for q in queries if q in rows["quail"]
+                     and not rows["quail"][q]["expected_rows"]]
+            if empty:
+                note += " Empty reference output: " + ", ".join(empty) + "."
+            figure.text(0.075, 0.02, note + " x = not measured.", fontsize=9)
             pdf.savefig(figure, bbox_inches=None)
             plt.close(figure)
         figure = document_page(title, queries, relations)
         pdf.savefig(figure, bbox_inches=None)
         plt.close(figure)
     return destination.with_suffix(".pdf").name
-
-
-def measurement_rows(path):
-    """Read a run's measurements.parquet as {method: {query: row}}."""
-    rows = {}
-    for row in pq.read_table(path).to_pylist():
-        rows.setdefault(row["method"], {})[row["query"]] = row
-    return rows
-
-
-def load_rows(root, corpus):
-    """Load complete measurements for both methods and all 30 retained queries."""
-    from quail_b.queries import get_query
-    from quail_b.rendering import PROMPT_FORMAT
-    from quail_b.run import _query_hash
-
-    manifest = json.loads((root / "run" / "manifest.json").read_text())
-    assert manifest["status"] == "complete"
-    assert manifest["model"] == "qwen3-4b-fp8"
-    assert manifest["sf"] == 0.1
-    assert set(SOURCE_QUERY_IDS.values()) <= set(manifest["query_ids"])
-    assert set(manifest["methods"]) == {key for key, _, _ in METHODS}
-    rows = measurement_rows(root / "run" / "measurements.parquet")
-    counts = json.loads((root / "requested_tokens.json").read_text())
-    for key in ("run_id", "corpus_id", "collection_id"):
-        assert counts[key] == manifest[key]
-    suites = {}
-    for method, _, _ in METHODS:
-        raw = (root / "run" / method / "run.json").read_bytes()
-        assert hashlib.sha256(raw).hexdigest() == counts["run_sha256"][method]
-        suite = json.loads(raw)
-        assert suite["corpus_id"] == corpus["corpus_id"]
-        assert suite["collection_id"] == manifest["collection_id"]
-        assert suite["metadata"]["prompt_format"] == PROMPT_FORMAT
-        assert set(rows[method]) == set(manifest["query_ids"])
-        assert {item["id"] for item in suite["queries"]} == set(manifest["query_ids"])
-        for item in suite["queries"]:
-            if item["id"] not in CURRENT_QUERY_IDS:
-                continue
-            query = CURRENT_QUERY_IDS[item["id"]]
-            assert item["status"] == "complete"
-            assert item["definition_hash"] == _query_hash(get_query(query))
-            assert rows[method][item["id"]]["regret_tokens"] is not None
-            rows[method][item["id"]]["requested_tokens"] = (
-                counts["methods"][method][item["id"]])
-        rows[method] = {
-            query: rows[method][source]
-            for query, source in SOURCE_QUERY_IDS.items()}
-        suites[method] = suite
-    return rows, manifest, suites
-
-
-def requested_input_tokens(spec, output, documents):
-    """Sum complete prompt lengths for every evaluated predicate answer."""
-    import pyarrow as pa
-    import pyarrow.compute as pc
-
-    from quail_b.minimum import validate_prompt_pieces
-
-    pieces = validate_prompt_pieces(spec, output.prompt_pieces)
-    relations = {r.alias: (r.table, r.text_column) for r in spec._info.relations}
-
-    def document_sum(table, alias):
-        counts = pc.value_counts(pc.cast(table.column(alias), pa.string()))
-        ids = counts.field("values").to_pylist()
-        keys = [(*relations[alias], row_id) for row_id in ids]
-        documents.fetch(keys)
-        return sum(len(documents[key]) * count for key, count in zip(
-            keys, counts.field("counts").to_pylist()))
-
-    total = 0
-    tails = {p["id"]: p["tail"] for p in pieces["filters"]}
-    for operator in spec._info.filters:
-        table = output.filter_answers[operator.id]
-        total += document_sum(table, operator.relation)
-        total += len(table) * (len(pieces["preamble"]) + len(tails[operator.id]))
-    joins = {p["id"]: p for p in pieces["joins"]}
-    for operator in spec._info.joins:
-        table = output.join_answers[operator.id]
-        piece = joins[operator.id]
-        total += len(table) * sum(len(piece[key]) for key in (
-            "frame", "label", "tail")) + len(table) * len(pieces["preamble"])
-        total += sum(document_sum(table, alias) for alias in operator.relations)
-    return total
 
 
 def reference_requested_tokens(query, answer, estimate):
@@ -444,51 +290,36 @@ def reference_requested_tokens(query, answer, estimate):
     return total
 
 
-def count_requested_tokens(run_directory, root, sol_path):
-    """Save input counts from existing answers and the saved SoL plan on CPU."""
+def saved_directory(root, method, item):
+    """Locate the saved query files, including the earlier BioDEX rerun."""
+    directory = root / SOURCE_RUN / method / item["directory"]
+    if not (directory / item["files"]["plan"]).exists():
+        candidates = [p.parent for p in (root / "benchmarks/quailb").rglob(
+            item["files"]["plan"])
+            if "20260914T070913Z-f7beefb6-biodex-rerun" in str(p)
+            and method in p.parts and p.parent.name == item["id"]]
+        assert len(candidates) == 1, (item["id"], candidates)
+        directory = candidates[0]
+    return directory
+
+
+def prepare(workdir, root, sol_path):
+    """Validate and rescore saved raw answers without inference."""
     from functools import cache
 
     import quail
-    from quail.bench.quailb import answer_oracle, build_query
+    from quail.bench.quailb import answer_oracle, build_query, prompt_pieces
+    from quail.bench.substrait import read_plan
     from quail.planner.plan import EngineConfig
     from quail_b.benchmark import load_benchmark
-    from quail_b.minimum import DocumentTokens, load_tokenizer
-    from quail_b.queries import get_query
-    from quail_b.run import _query_hash, _read_output
+    from quail_b.minimum import load_tokenizer
+    from quail_b.queries import QuerySpec, get_query
+    from quail_b.run import _query_hash, _read_output, _score
 
-    run_directory = Path(run_directory)
-    manifest = json.loads((run_directory / "manifest.json").read_text())
+    root = Path(root)
     benchmark = load_benchmark(
-        scale_factor=0.1, root=root, collection_id=manifest["collection_id"])
-    sol_bytes = Path(sol_path).read_bytes()
-    sol = json.loads(sol_bytes)
-    assert sol["corpus_id"] == manifest["corpus_id"]
-    assert sol["collection_id"] == manifest["collection_id"]
+        scale_factor=0.1, root=str(root), collection_id=COLLECTION)
     tokenizer = load_tokenizer("Qwen/Qwen3-4B-FP8")
-    documents = DocumentTokens(benchmark.tables, tokenizer)
-    result = {
-        "run_id": manifest["run_id"], "corpus_id": manifest["corpus_id"],
-        "collection_id": manifest["collection_id"],
-        "sol_sha256": hashlib.sha256(sol_bytes).hexdigest(),
-        "methods": {}, "sol": {}, "run_sha256": {},
-    }
-    for method, _, _ in METHODS:
-        raw = (run_directory / method / "run.json").read_bytes()
-        result["run_sha256"][method] = hashlib.sha256(raw).hexdigest()
-        result["methods"][method] = {}
-        for item in json.loads(raw)["queries"]:
-            if item["id"] not in CURRENT_QUERY_IDS:
-                continue
-            spec = get_query(CURRENT_QUERY_IDS[item["id"]])
-            assert item["definition_hash"] == _query_hash(spec)
-            directory = run_directory / method / item["directory"]
-            output = _read_output(directory, item, rows=False)
-            total = requested_input_tokens(spec, output, documents)
-            if method == "pipelined_vllm":
-                measured = item["measurements"]
-                assert total == measured["fresh_tokens"] + measured["cached_tokens"]
-            result["methods"][method][item["id"]] = total
-        print("Counted complete prompts:", method, flush=True)
 
     @cache
     def encode(text):
@@ -496,317 +327,261 @@ def count_requested_tokens(run_directory, root, sol_path):
 
     session = quail.Session(EngineConfig(
         model="qwen3-4b-fp8", device="h100-sxm"), tokenizer=encode)
-    try:
-        for name, table in benchmark.tables.items():
-            session.register(name, quail.DocumentProvider.from_table(
-                table, id_col="id"))
-        answer = answer_oracle(benchmark.ground_truth, benchmark.tables)
-        for query in QUERY_ORDER:
-            spec = get_query(query)
-            saved = sol["queries"][SOURCE_QUERY_IDS[query]]
-            assert saved["plan_sha256"] == hashlib.sha256(spec.plan_bytes).hexdigest()
-            result["sol"][SOURCE_QUERY_IDS[query]] = reference_requested_tokens(
-                build_query(session, spec), answer, saved["models"]["qwen3-4b-fp8"])
-            print("Counted SoL prompts:", query, flush=True)
-    finally:
-        session.close()
-    destination = run_directory / "requested_tokens.json"
-    destination.write_text(json.dumps(result, indent=2) + "\n")
-    print(destination, flush=True)
-
-
-def biodex_prompt_comparison(root):
-    """Compare saved prompt runs and score BIO-2 against dataset annotations."""
-    directory = root / "bio-comparison"
-    reports = pq.read_table(directory / "reports.parquet", columns=["id", "reactions"])
-    terms = pq.read_table(directory / "terms.parquet").to_pylist()
-    term_ids = {row["term"]: row["id"] for row in terms}
-    expected = {(row["id"], term_ids[reaction]) for row in reports.to_pylist()
-                for reaction in row["reactions"] if reaction in term_ids}
-    pairs = len(reports) * len(terms)
-    layout = json.loads((directory / "layout.json").read_text())
-    assert layout["query"] == "BIO-2" and layout["scale_factor"] == 0.1
-    lines = [
-        "## BIO-2 raw and chat comparison", "",
-        "The chat closing adds nine tokens after each pair's text. Both",
-        "benchmark runs evaluated 563,500 pairs. Quail's fresh input tokens rose",
-        "49%, and its query time rose from 127.75 to 187.01 seconds. Its computed",
-        "token rate stayed close to 82,000 per second.", "",
-        "A separate pipelined stock vLLM experiment compared raw and chat prompts",
-        "in one container. It used a fresh engine for each join and ran BIO-1",
-        "first. The prediction was that times would differ by less than 5%,",
-        "with chat no faster than raw.", "",
-        "| Round | Format | Seconds | Milliseconds/pair | Fresh tokens |",
-        "|---|---|---:|---:|---:|",
-    ]
-    times = {"raw": [], "chat": []}
-    for run in layout["joins"]:
-        assert run["pairs"] == pairs
-        times[run["layout"]].append(run["wall_s"])
-        lines.append(
-            f"| {run['round'] + 1} | {run['layout']} | {run['wall_s']:.1f} "
-            f"| {run['wall_s'] / pairs * 1000:.3f} | {run['fresh_tokens']:,} |")
-    difference = (mean(times["chat"]) / mean(times["raw"]) - 1) * 100
-    lines.extend([
-        "", f"Chat time differed from raw by {difference:.2f}% on average.",
-        "The result supports the 5% prediction, but chat was slightly faster.",
-        "It did not reproduce the 13% vLLM time reduction between benchmark runs.",
-        "Those runs used different machines. Host variation is a plausible",
-        "explanation; this experiment does not isolate every host difference.", "",
-        "Result on `quail-results`:",
-        f"`{layout['result_volume_path']}`.",
-        "Modal call: `fc-01M2TKCMJQVM0HV104NVCHTKY5`.",
-        "The experiment is `experiments/bio2_prompt_layout.py` at commit",
-        "`1f35316` on `claude/focused-carson-huqcvm`.", "",
-        "Earlier attempts used a cold engine or encountered throttling. They",
-        "are excluded from the controlled comparison above. Their records are",
-        "`/results/ablations/bio2-prompt-layout-20260918T142630Z/joins.json`",
-        "(`fc-01M2TEJJY4Z2G2DGG25NE8F28B`) and the cancelled call",
-        "`fc-01M2TG6KG63GSZTN2X3BRZ43AD`.", "",
-        "The September 12 recomputed KV values used an older minimum rule.",
-        "That rule counted a pair's partner label once per anchor and shared",
-        "partner document prefixes across pairs. It understated BIO-2's minimum",
-        "by 4,146,500 tokens. Under the current rule, vLLM recomputed 154,747",
-        "tokens in that run and 157,341 in the chat run. Those values are close.", "",
-        "### Accuracy against the same dataset annotations", "",
-        "The main correctness tables compare 4B answers with 32B reference",
-        "answers. Those references changed when the prompt format changed.",
-        "Here both formats are scored against the same reactions recorded in",
-        f"BioDEX: {len(expected):,} positive pairs out of {pairs:,}.",
-        "Matching is exact; a synonym absent from the recorded list counts as",
-        "wrong. These scores therefore measure agreement with dataset annotations.",
-        "F1 combines precision and recall and is shown as a percentage.", "",
-        "| Model and format | Predicted matches | Precision (%) "
-        "| Recall (%) | F1 (%) |",
-        "|---|---:|---:|---:|---:|",
-    ])
-    for name, title, columns in [
-        ("raw", "4B raw", ["r", "m", "answer"]),
-        ("chat", "4B chat", ["r", "m", "answer"]),
-        ("raw-reference", "32B raw", ["left_id", "right_id", "answer"]),
-        ("chat-reference", "32B chat", ["left_id", "right_id", "answer"]),
-    ]:
-        table = pq.read_table(directory / f"{name}.parquet", columns=columns)
-        values = zip(*(table[column].to_pylist() for column in columns))
-        answers = {(left, right): answer for left, right, answer in values}
-        assert len(answers) == len(table) == pairs
-        assert {left for left, _ in answers} == set(reports["id"].to_pylist())
-        assert {right for _, right in answers} == set(term_ids.values())
-        predicted = {pair for pair, answer in answers.items() if answer}
-        matches = len(predicted & expected)
-        precision = matches / len(predicted) if predicted else 0
-        recall = matches / len(expected)
-        f1 = 2 * matches / (len(predicted) + len(expected))
-        lines.append(
-            f"| {title} | {len(predicted):,} | {100 * precision:.1f} "
-            f"| {100 * recall:.1f} | {100 * f1:.1f} |")
-    lines.extend([
-        "", "Chat improves precision and F1 on this annotation comparison, while",
-        "missing more recorded reactions. It does not establish an accuracy",
-        "improvement across the whole benchmark.", "",
-        "The 4B answers come from `quail/biodex/BIO-2/joins-0.parquet` under",
-        "`/results/benchmarks/quailb/family-runs/20260912T225100Z-902686c5/` and",
-        "`/results/benchmarks/quailb/family-runs/20260918T060700Z-biodex-chat/`.",
-        "The 32B label sets are `ls_558442b4193e9a48bfe1aea9bc87a66a` and",
-        "`ls_4c0b69af26ad590e1b64ac5ffebf2484`. Annotation tables are under",
-        "`/results/quailb_data/sf0.1/`. Download commands are in the generator.", "",
-        "Possible follow-ups are to score different TRUE/FALSE thresholds and",
-        "test shorter pair prompts. Neither was measured here. Moving prompt",
-        "text requires checking answer quality and updating token accounting.", "",
-    ])
-    return lines
+    for name, table in benchmark.tables.items():
+        session.register(name, quail.DocumentProvider.from_table(table, id_col="id"))
+    result = {
+        "prompt_format": "raw-v1", "source_run": "/results/" + SOURCE_RUN,
+        "collection_id": COLLECTION, "corpus_id": benchmark.ground_truth.corpus_id,
+        "source_hashes": {}, "rows": {}, "missing": {}, "settings": {},
+        "query_hashes": {q: _query_hash(get_query(q)) for q in QUERY_ORDER},
+        "relations": {
+            q: [(r.alias, r.table, len(benchmark.tables[r.table]))
+                for r in get_query(q)._info.relations] for q in QUERY_ORDER},
+    }
+    stores = {}
+    for method, _, _ in METHODS:
+        raw = (root / SOURCE_RUN / method / "run.json").read_bytes()
+        suite = json.loads(raw)
+        assert suite["corpus_id"] == result["corpus_id"]
+        assert suite["scale_factor"] == 0.1
+        assert suite["metadata"]["model"] == "qwen3-4b-fp8"
+        result["source_hashes"][method] = hashlib.sha256(raw).hexdigest()
+        result["rows"][method] = {}
+        result["missing"][method] = {}
+        result["settings"][method] = {}
+        for item in suite["queries"]:
+            if item["id"] not in CURRENT_QUERY_IDS:
+                continue
+            qid = CURRENT_QUERY_IDS[item["id"]]
+            directory = saved_directory(root, method, item)
+            spec = get_query(qid)
+            saved = QuerySpec(qid, "Saved query", (
+                directory / item["files"]["plan"]).read_bytes())
+            assert _query_hash(saved) == item["definition_hash"], qid
+            if _query_hash(saved) != _query_hash(spec):
+                assert qid in ("BIO-1", "BIO-3"), qid
+                result["missing"][method][qid] = "Saved query uses the old filter."
+                continue
+            assert item["status"] == "complete", qid
+            output = _read_output(directory, item, rows=False)
+            query = build_query(session, spec)
+            positions = {j.id: n for n, j in enumerate(spec._info.joins)}
+            anchors = {positions[p["id"]]: p["anchor"]
+                       for p in output.prompt_pieces["joins"]}
+            expected = prompt_pieces(query, read_plan(spec.plan), anchors)
+            assert output.prompt_pieces == expected, (method, qid, "prompt pieces")
+            metrics = _score(spec, output, benchmark, 1, H100_USD_PER_HOUR, stores)
+            token_counter = None
+            if method == "pipelined_vllm":
+                token_counter = (output.measurements["fresh_tokens"]
+                                 + output.measurements["cached_tokens"])
+                # The saved runs used bpe-qwen for document tokenization.
+                assert abs(metrics["input_tokens"] - token_counter) <= (
+                    token_counter * 0.00001), qid
+            accuracy = metrics["accuracy"]
+            answers = accuracy["answer_accuracy"]
+            final = accuracy["output_accuracy"]
+            result["rows"][method][qid] = {
+                "runtime_s": item["runtime_s"],
+                "requested_tokens": metrics["input_tokens"],
+                "recorded_input_tokens": token_counter,
+                "fresh_tokens": metrics["fresh_tokens"],
+                "regret_tokens": metrics["regret_tokens"],
+                "matching_rows": final["matching_rows"],
+                "predicted_rows": final["predicted_rows"],
+                "expected_rows": final["expected_rows"],
+                "answers_correct": answers["correct"],
+                "answers_evaluated": answers["evaluated"],
+                "evaluated_document_pairs": metrics["evaluated_document_pairs"],
+                "input_rows": sum(metrics["input_rows"].values()),
+                "source_directory": str(directory),
+            }
+            backend = item["measurements"].get("backend_metrics") or {}
+            result["settings"][method][qid] = backend.get("capacity")
+            print("Rescored saved answers:", method, qid, flush=True)
+    source = json.loads(Path(sol_path).read_text())
+    assert source["corpus_id"] == result["corpus_id"]
+    assert source["collection_id"] == COLLECTION
+    assert source["optimizer"]["persistent_kv_capacity"] == "unlimited"
+    answer = answer_oracle(benchmark.ground_truth, benchmark.tables)
+    result["sol"] = {}
+    for qid in QUERY_ORDER:
+        spec = get_query(qid)
+        plan_hash = hashlib.sha256(spec.plan_bytes).hexdigest()
+        matching = [r for r in source["queries"].values()
+                    if r["plan_sha256"] == plan_hash]
+        assert len(matching) == 1, qid
+        record = matching[0]
+        assert record["prompt_format"] == "raw-v1"
+        assert record["plan_sha256"] == hashlib.sha256(spec.plan_bytes).hexdigest()
+        estimate = record["models"]["qwen3-4b-fp8"]
+        estimate["requested_tokens"] = reference_requested_tokens(
+            build_query(session, spec), answer, estimate)
+        result["sol"][qid] = estimate
+        print("Counted SoL prompts:", qid, flush=True)
+    result["sol_source"] = str(sol_path)
+    result["sol_sha256"] = hashlib.sha256(Path(sol_path).read_bytes()).hexdigest()
+    session.close()
+    Path(workdir, "comparison.json").write_text(json.dumps(result, indent=2) + "\n")
 
 
 def main(workdir):
-    """Regenerate the report and figures from the downloaded measurements."""
-    root = Path(workdir)
-    corpus = json.loads((root / "corpus.json").read_text())
-    rows, manifest, suites = load_rows(root, corpus)
-    queries = list(QUERY_ORDER)
+    """Regenerate all benchmark figures and the report from the saved summary."""
+    data = json.loads(Path(workdir, "comparison.json").read_text())
+    assert data["prompt_format"] == "raw-v1"
+    assert data["collection_id"] == COLLECTION
+    from quail_b.queries import get_query
+    from quail_b.run import _query_hash
+
+    by_hash = {value: key for key, value in data["query_hashes"].items()}
+    sources = {q: by_hash[_query_hash(get_query(q))] for q in QUERY_ORDER}
+    rows = {method: {q: data["rows"][method][source]
+                     for q, source in sources.items()
+                     if source in data["rows"][method]}
+            for method, _, _ in METHODS}
+    sol = {q: data["sol"][source] for q, source in sources.items()}
+    relations = {q: data["relations"][source] for q, source in sources.items()}
+    for method, _, _ in METHODS:
+        assert set(rows[method]) == set(QUERY_ORDER) - {"BIO-1", "BIO-3"}
     plt.style.use(HERE / "quail.mplstyle")
     plt.rcParams.update({"pdf.fonttype": 42, "figure.autolayout": False,
                          "savefig.bbox": None})
-    relations = input_relations(queries, corpus)
-    for method in rows.values():
-        for query, row in method.items():
-            assert sum(count for _, _, count in relations[query]) == row["input_rows"]
-    sol = load_sol(root, queries, rows, corpus, manifest)
-    overview = plot_comparison("QUAIL-B", queries, rows, relations, sol,
-                               "quailb_main.pdf", overview=True)
-    faster = sum(rows["quail"][q]["runtime_s"]
-                 < rows["pipelined_vllm"][q]["runtime_s"] for q in queries)
+    plot_comparison("QUAIL-B", QUERY_ORDER, rows, relations, sol,
+                    "quailb_main.pdf", overview=True)
+    paired = [q for q in QUERY_ORDER if all(q in rows[m] for m, _, _ in METHODS)]
     speedups = {q: rows["pipelined_vllm"][q]["runtime_s"]
-                / rows["quail"][q]["runtime_s"] for q in queries}
+                / rows["quail"][q]["runtime_s"] for q in paired}
     fastest = max(speedups, key=speedups.get)
-    settings = [item["measurements"]["backend_metrics"]["capacity"]
-                for item in suites["pipelined_vllm"]["queries"]]
-    batch_tokens = sorted({item["max_num_batched_tokens"] for item in settings})
-    sequences = sorted({item["max_num_seqs"] for item in settings})
-    kv_capacity = [item["kv_cache_size_tokens"] for item in settings]
-    bio2 = row_metrics(rows["quail"]["BIO-2"])
-    bio3 = row_metrics(rows["quail"]["BIO-3"])
-    checks = manifest["reference_checks"]
-    kv_range = (f"{min(kv_capacity):,} tokens"
-                if min(kv_capacity) == max(kv_capacity)
-                else f"{min(kv_capacity):,} to {max(kv_capacity):,} tokens")
-    imdb9 = row_metrics(rows["quail"]["IMDB-9"])
-    fev8 = row_metrics(rows["quail"]["FEV-8"])
-    lines = [
+    settings = [data["settings"]["pipelined_vllm"][sources[q]] for q in paired]
+    batch = sorted({s["max_num_batched_tokens"] for s in settings})
+    capacity = [s["kv_cache_size_tokens"] for s in settings]
+    capacity_text = (f"{min(capacity):,}" if min(capacity) == max(capacity)
+                     else f"{min(capacity):,} to {max(capacity):,}")
+    sequences = sorted({s["max_num_seqs"] for s in settings})
+    counter_difference = max(
+        abs(r["requested_tokens"] / r["recorded_input_tokens"] - 1) * 100
+        for r in rows["pipelined_vllm"].values())
+    report_text = [
         "# QUAIL-B comparison", "",
-        "- All 30 retained queries use Qwen3's chat format with thinking disabled.",
-        "  Both methods use Qwen3 4B FP8, sf=0.1, lf=1, and one H100.",
-        "  Quail and pipelined stock vLLM share a physical GPU within each family.",
-        "  Pipelined stock vLLM advances documents through filter stages",
-        "  independently, then starts joins after filtering finishes.",
-        "- Previous LEP-5, LEP-6, and LEP-8 were removed because their reference",
-        "  filters leave no rows at sf=0.1. Previous LEP-7 is now LEP-5.",
-        "  This report selects 60 measurements from the saved 66-measurement run.",
-        "  It checks query definitions before mapping historical IDs.",
-        "- The measured run is on `quail-results`:",
-        f"  `/results/benchmarks/quailb/family-runs/{manifest['run_id']}/`.",
-        "  It reuses the completed BioDEX run after checking that its corpus,",
-        "  query definitions, prompt format, and reference answers match.",
-        f"  BioDEX source: `{manifest['reused_biodex']}`.",
-        "  All other measurements are new. Earlier prompt formats are omitted.",
-        "- Model references use Qwen3 32B FP8 with thinking disabled.",
-        f"  The collection is `{manifest['collection_id']}`.",
-        "  Reference join prompts put the first argument first. FEVER joins",
-        "  were regenerated after fixing automatic prompt reordering. Saved",
-        "  benchmark answers were rescored without changing timings.",
-        "  The existing FEVER annotation and LePaRD citation rules still apply.",
-        f"  Saved-answer checks repeated {checks['compared']} answers",
-        f"  with {checks['answer_differences']} differences.",
-        "- Quail's planned limits are 110,376 tokens per chunk and 362,250",
-        "  resident KV tokens. Pipelined stock vLLM uses prefix caching,",
-        f"  {', '.join(f'{n:,}' for n in batch_tokens)} batched tokens, and",
-        f"  {', '.join(f'{n:,}' for n in sequences)} sequences.",
-        f"  Its measured KV capacity is {kv_range}.",
-        "  Both methods use the same planner's filter and join ordering rules.",
-        f"- Quail is faster on {faster} of {len(queries)} queries.",
-        f"  The arithmetic mean speedup is {mean(speedups.values()):.2f}x,",
-        f"  the median is {median(speedups.values()):.2f}x, and the maximum is",
-        f"  {speedups[fastest]:.2f}x on {fastest}. Each query has equal weight.",
-        "  Speedup is pipelined stock vLLM time divided by Quail time.",
-        "  Query time excludes startup and result collection.",
-        f"  GPU cost is query seconds / 3,600 * ${H100_USD_PER_HOUR:.4f}.",
-        "- SoL means speed of light. It estimates ideal GPU time by dividing",
-        "  arithmetic and memory traffic by the hardware's peak rates. For each",
-        "  model component, it takes the larger time, then adds component times.",
-        "  It assumes ideal batching and unlimited retained KV. Matching token",
-        "  prefixes are computed once across requests, documents, and aliases.",
-        "  It excludes startup and software scheduling overhead and uses exact",
-        "  reference-label survivors. The supported join search uses left-deep",
-        "  plans. Different measured answers change the work, so the gap from",
-        "  SoL is not purely execution overhead. SoL has no measured accuracy.",
-        "- Fresh input tokens count every input position processed by a model",
-        "  forward pass. Repeated computation counts again. Recomputed KV tokens",
-        "  are fresh tokens minus the minimum for the run's actual requests with",
-        "  unlimited KV: each document once, each question and join frame once",
-        "  per document, and each pair's partner label, partner document, and",
-        "  answer cue once per pair. They are included in fresh tokens, not added",
-        "  to them. The benchmark computes this minimum from saved answers after",
-        "  the run. KV regret is recomputed tokens / fresh tokens * 100%.",
-        "  A missing minimum or zero computed tokens leaves regret unreported.",
-        "- Token throughput is total requested input tokens divided by query seconds.",
-        "  Count each complete prompt once per evaluated filter or join pair,",
-        "  including tokens served from KV. Exclude generated answer tokens.",
-        "  Counts come from saved answers, prompt pieces, and document tokens.",
-        "  All retained vLLM totals match its recorded fresh plus cached token counts.",
-        "  Cost per million input tokens is query dollars / requested tokens * 1e6.",
-        "  It uses the same complete-prompt count as tokens per second.",
-        "  Different survivors can change which prompts a method evaluates.",
-        "  The SoL line counts complete prompts under its reference survivors.",
-        "- Answer agreement counts matching evaluated predicate answers. Output",
-        "  precision is the fraction of returned rows matching the reference.",
-        "  Output recall is the fraction of reference rows returned. Most join",
-        "  pairs can be negative, so high agreement can coexist with low recall.",
-        f"  Quail's BIO-2 and BIO-3 recall is {bio2['recall']:.2f}% and",
-        f"  {bio3['recall']:.2f}%, respectively.",
-        f"  Its IMDB-9 output recall is {imdb9['recall']:.4f}%, and its FEV-8",
-        f"  output precision is {fev8['precision']:.4f}%.",
-        "- The main PDF shows all queries with one metric per page. Each dataset",
-        "  PDF includes every query in that dataset. Input counts list each alias",
-        "  separately, before filtering. SoL is a horizontal line, not a measured",
-        "  bar. Latency labels show vLLM time divided by Quail time.",
-        "  Log scales are labeled; a dash marks zero.", "",
-        f"[Open the main vector PDF](plots/{overview})", "",
-        f"Figure: plots/{overview}", "",
-        "SoL estimates on `quail-results`:",
-        "`/results/sol/2026-09-18-all-chat/sol_quailb_sf0.1.json`.", "",
-        "The download commands are in `reports/make_quailb_comparison_plots.py`.", "",
+        "- All 30 queries use raw document/question prompts ending in `ANSWER:`.",
+        "  LePaRD has five queries. Original LEP-7 is now LEP-5.",
+        "  Both methods use Qwen3 4B FP8, sf=0.1, and one H100.",
+        "- Measurements are reused from saved raw runs. No inference was repeated.",
+        f"  Source on `quail-results`: `{data['source_run']}`.",
+        "  Saved plans and prompt token pieces match the restored definitions.",
+        "  Scores and token counts were recalculated from the saved answers.",
+        "- BIO-1 and BIO-3 are not measured for the serious-adverse-event filter.",
+        "  The saved demographic-filter results do not match those queries.",
+        "  All plots include both queries, with missing measurements marked x.",
+        "  Comparisons below use the 28 queries with both measurements.",
+        "- Original LEP-5, LEP-6, and LEP-8 are excluded because their reference",
+        "  outputs are empty at sf=0.1 with raw prompts too. Historical IDs are",
+        "  matched by query-definition hash before measurements are reused.",
+        "- References use Qwen3 32B FP8 and the benchmark's dataset annotations.",
+        f"  Raw reference collection: `{COLLECTION}`.",
+        "  Answer agreement counts matching predicate answers. Output precision",
+        "  and recall compare final rows with the reference output.",
+        "- Quail uses pipelining, token-based admission, and KV rewind.",
+        "  Stock vLLM uses pipelining and prefix caching. Filter stages advance",
+        "  independently; joins begin after filtering finishes.",
+        f"  vLLM batched-token limits: {', '.join(f'{n:,}' for n in batch)}.",
+        f"  Sequence limits: {', '.join(f'{n:,}' for n in sequences)}.",
+        f"  Measured vLLM KV capacity: {capacity_text} tokens.",
+        f"- Quail is faster on {sum(s > 1 for s in speedups.values())} of 28 queries.",
+        f"  Mean speedup: {mean(speedups.values()):.2f}x; median: "
+        f"{median(speedups.values()):.2f}x; maximum: "
+        f"{speedups[fastest]:.2f}x ({fastest}).",
+        "  Each query has equal weight. Speedup is vLLM time divided by Quail time.",
+        "- Latency excludes startup and result collection. GPU cost is query",
+        f"  seconds / 3,600 * ${H100_USD_PER_HOUR:.4f}.",
+        "- Tokens/second counts the full input prompt for every evaluated answer,",
+        "  including input tokens served from KV. Generated answers are excluded.",
+        "  Cost per million tokens uses that same total input count.",
+        "  Different survivors can change which requests each method evaluates.",
+        "  Counts use the named HuggingFace tokenizer. The old runs used bpe-qwen",
+        f"  for documents; recounts differ from vLLM counters by at most "
+        f"{counter_difference:.6f}%.",
+        "- KV regret is recomputed tokens / fresh computed tokens * 100%.",
+        "  The minimum computes each distinct input prefix once with unlimited KV.",
+        "  A pair's partner suffix is counted after its anchor. Regret is",
+        "  recalculated with the current benchmark rule from saved prompt pieces.",
+        "- SoL estimates ideal compute and memory time with unlimited retained KV",
+        "  and exact raw-reference survivors. Matching prefixes are reused across",
+        "  requests, documents, and aliases. The join search uses left-deep plans.",
+        "  It excludes software overhead. Different answers change the work, so",
+        "  the gap from SoL is not solely execution overhead. It has no accuracy.",
+        "  These estimates were recalculated on CPU for the restored queries.",
+        f"  Saved estimates: `{data['sol_source']}`.",
+        "- PDFs show latency, total input tokens/second, cost/query, cost per",
+        "  million input tokens, and KV regret percentage. Each PDF lists input",
+        "  counts separately for every alias. SoL uses lines; measurements use bars.",
+        "  A dash marks zero. An x marks a missing measurement.", "",
+        "[Main comparison PDF](plots/quailb_main.pdf)", "",
+        "CPU-derived summary on `quail-results`:",
+        "`/results/reports/quailb-raw-2026-09-19/comparison.json`.", "",
+        "Rebuild commands: `reports/make_quailb_comparison_plots.py`.", "",
     ]
     for family in ("IMDB", "BIO", "FEV", "LEP", "AGENT"):
-        selected = [q for q in queries if q.startswith(family + "-")]
+        selected = [q for q in QUERY_ORDER if q.startswith(family + "-")]
         name = plot_comparison(f"QUAIL-B {family}", selected, rows, relations,
                                sol, f"quailb_{family.lower()}.pdf")
-        lines.extend([f"## {family}", "",
-                      f"[Open the {family} vector PDF](plots/{name})", "",
-                      f"Figure: plots/{name}", "",
-                      "| Query | Input documents by alias and set |", "|---|---|"])
-        for query in selected:
-            counts = ", ".join(f"{alias} ({provider}) = {count:,}"
-                               for alias, provider, count in relations[query])
-            lines.append(f"| {query} | {counts} |")
-        if family == "BIO":
-            terms = corpus["tables"]["terms"]["rows"]
-            survivors = {}
-            for method, _, _ in METHODS:
-                pairs = rows[method]["BIO-3"]["evaluated_document_pairs"]
-                assert pairs % terms == 0
-                survivors[method] = pairs // terms
-            lines.extend([
-                "", "BIO-3 filter survivors: "
-                f"{sol['BIO-3']['documents_after_filters']:,} in the reference, "
-                f"{survivors['quail']:,} in Quail, and "
-                f"{survivors['pipelined_vllm']:,} in pipelined stock vLLM.",
-                "",
-                "The BIO-2 prompt comparison below explains the change in time",
-                "and separately scores both formats against dataset annotations."])
-        table_header_text = (
-            "| Query | Method | Seconds | Tokens/second | $/query "
-            "| $/million input tokens | KV regret (%) |")
-        lines.extend(["", table_header_text,
-                      "|---|---|---:|---:|---:|---:|---:|"])
-        for query in selected:
-            for key, label, _ in METHODS:
-                m = row_metrics(rows[key][query])
-                regret = ("Not measured" if m["regret_percent"] is None
-                          else f"{m['regret_percent']:.2f}")
-                lines.append(
-                    f"| {query} | {label} | {m['seconds']:.2f} "
+        report_text.extend([f"## {family}", "",
+                            f"[{family} comparison PDF](plots/{name})", "",
+                            "| Query | Input documents by alias and set |",
+                            "|---|---|"])
+        for q in selected:
+            counts = ", ".join(f"{a} ({t}) = {n:,}" for a, t, n in relations[q])
+            report_text.append(f"| {q} | {counts} |")
+        report_text.extend([
+            "", "| Query | Method | Seconds | Tokens/second | $/query "
+            "| $/million input tokens | KV regret (%) |",
+            "|---|---|---:|---:|---:|---:|---:|"])
+        for q in selected:
+            for method, label, _ in METHODS:
+                if q not in rows[method]:
+                    report_text.append(f"| {q} | {label} | Not measured | | | | |")
+                    continue
+                m = row_metrics(rows[method][q])
+                report_text.append(
+                    f"| {q} | {label} | {m['seconds']:.2f} "
                     f"| {m['tokens_per_second']:,.2f} | {m['cost']:.5f} "
-                    f"| {m['cost_per_million']:.6f} | {regret} |")
-            values = {metric: series_value(rows, sol, "sol", query, metric)
-                      for metric, _, _ in METRICS}
-            lines.append(
-                f"| {query} | SoL estimate | {values['seconds']:.3f} "
-                f"| {values['tokens_per_second']:,.2f} | {values['cost']:.5f} "
-                f"| {values['cost_per_million']:.6f} | 0 (assumed) |")
-        lines.extend(["", "Correctness against saved reference labels:", "",
-                      "| Query | Method | Answer agreement (%) "
-                      "| Output precision (%) | Output recall (%) |",
-                      "|---|---|---:|---:|---:|"])
-        for query in selected:
-            for key, label, _ in METHODS:
-                m = row_metrics(rows[key][query])
-                lines.append(
-                    f"| {query} | {label} | {m['agreement']:.2f} "
-                    f"| {m['precision']:.5g} | {m['recall']:.5g} |")
-        lines.append("")
-    lines.extend(biodex_prompt_comparison(root))
-    report = HERE / "quailb-comparison.md"
-    report.write_text("\n".join(lines))
-    print(f"Updated {report}, the main figure, and five dataset figures.")
+                    f"| {m['cost_per_million']:.6f} | {m['regret_percent']:.2f} |")
+            v = {m: series_value(rows, sol, "sol", q, m) for m, _, _ in METRICS}
+            report_text.append(
+                f"| {q} | SoL estimate | {v['seconds']:.3f} "
+                f"| {v['tokens_per_second']:,.2f} | {v['cost']:.5f} "
+                f"| {v['cost_per_million']:.6f} | 0 (assumed) |")
+        report_text.extend([
+            "", "| Query | Method | Reference rows | Returned rows "
+            "| Answer agreement (%) "
+            "| Output precision (%) | Output recall (%) |",
+            "|---|---|---:|---:|---:|---:|---:|"])
+        for q in selected:
+            for method, label, _ in METHODS:
+                if q not in rows[method]:
+                    report_text.append(f"| {q} | {label} | | Not measured | | | |")
+                    continue
+                m = row_metrics(rows[method][q])
+                row = rows[method][q]
+                recall = (f"{m['recall']:.5g}" if row["expected_rows"]
+                          else "Not defined")
+                report_text.append(
+                    f"| {q} | {label} | {row['expected_rows']:,} "
+                    f"| {row['predicted_rows']:,} | {m['agreement']:.2f} "
+                    f"| {m['precision']:.5g} | {recall} |")
+        report_text.append("")
+    (HERE / "quailb-comparison.md").write_text("\n".join(report_text))
+    print("Updated the report and all six PDFs.")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("workdir")
-    parser.add_argument("--count-requested-tokens", action="store_true")
+    parser.add_argument("--prepare", action="store_true")
     parser.add_argument("--root")
     parser.add_argument("--sol-file")
     args = parser.parse_args()
-    if args.count_requested_tokens:
-        count_requested_tokens(args.workdir, args.root, args.sol_file)
+    if args.prepare:
+        prepare(args.workdir, args.root, args.sol_file)
     else:
         main(args.workdir)
