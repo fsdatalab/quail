@@ -7,16 +7,30 @@ KV admission calculation. Joins submit one request per document pair.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 
 MAX_SEQUENCES = 4_096
 MAX_BATCHED_TOKENS = 25_305
 
 
+_ANSWER_WORD = re.compile(r"\b(TRUE|FALSE)\b")
+
+
 def true_bit(output, true_ids) -> int:
-    """Return 1 when a request's first output token is a TRUE token."""
-    token_ids = output.outputs[0].token_ids
-    return int(bool(token_ids and int(token_ids[0]) in true_ids))
+    """Whether the request answered TRUE.
+
+    The first generated token decides when it is a TRUE id, which the
+    allowed-token sampling of a decoder guarantees. A diffusion model
+    writes free text on its canvas, so its answer is the first TRUE or
+    FALSE word in the text; no answer word counts as FALSE.
+    """
+    completion = output.outputs[0]
+    token_ids = completion.token_ids
+    if token_ids and int(token_ids[0]) in true_ids:
+        return 1
+    match = _ANSWER_WORD.search(getattr(completion, "text", "") or "")
+    return int(match is not None and match.group(1) == "TRUE")
 
 
 def filter_document_cap(

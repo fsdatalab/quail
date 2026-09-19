@@ -42,11 +42,11 @@ def sampling_kwargs(allowed_ids: list[int], diffusion: bool = False) -> dict:
     """SamplingParams arguments for one greedy answer token.
 
     A diffusion model's sampler takes no temperature, min_tokens, or
-    allowed_token_ids; it commits the argmax of its canvas, so its
-    first token is the greedy answer without them.
+    allowed_token_ids, and writes free text on its canvas, so it gets
+    room for a few words and the reader finds the answer word.
     """
     if diffusion:
-        return {"max_tokens": 1}
+        return {"max_tokens": 16}
     return {"temperature": 0.0, "max_tokens": 1, "min_tokens": 1,
             "allowed_token_ids": allowed_ids}
 
@@ -92,9 +92,8 @@ class VLLMEngine:
 
         A spec with its own chunk cap (a mixture-of-experts model)
         batches at least that many tokens per step. A diffusion model
-        denoises a canvas as long as the spec's, the rows Quail itself
-        packs after the answer cue, instead of the checkpoint's own
-        canvas length.
+        keeps the checkpoint's own canvas: with a one-row canvas its
+        sampler writes end-of-turn tokens instead of answers.
         """
         batched = MAX_BATCHED_TOKENS
         if spec is not None:
@@ -109,8 +108,6 @@ class VLLMEngine:
                 "cudagraph_capture_sizes": [CUDA_GRAPH_CAPTURE_SIZE]
             },
         }
-        if spec is not None and spec.canvas_tokens:
-            kwargs["diffusion_config"] = {"canvas_length": spec.canvas_tokens}
         return kwargs
 
     def boot(self, model_name: str, allowed_ids: list[int],

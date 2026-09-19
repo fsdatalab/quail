@@ -424,11 +424,26 @@ def test_vllm_engine_settings_follow_the_model():
     # the mixture-of-experts model batches its own chunk cap
     gemma = engine.llm_kwargs(DIFFUSION_GEMMA_26B_FP8)
     assert gemma["max_num_batched_tokens"] == 65_536
-    # the diffusion canvas is as long as the spec's, one row
-    assert gemma["diffusion_config"] == {"canvas_length": 1}
-    assert "diffusion_config" not in engine.llm_kwargs(QWEN3_4B_FP8)
     assert sampling_kwargs([1, 2]) == {
         "temperature": 0.0, "max_tokens": 1, "min_tokens": 1,
         "allowed_token_ids": [1, 2]}
-    # the diffusion sampler rejects everything but the length
-    assert sampling_kwargs([1, 2], diffusion=True) == {"max_tokens": 1}
+    # the diffusion sampler rejects everything but the length; the
+    # answer word is read from the text
+    assert sampling_kwargs([1, 2], diffusion=True) == {"max_tokens": 16}
+
+
+def test_true_bit_reads_the_answer_word_from_free_text():
+    from types import SimpleNamespace
+
+    from quail.backends.request_scheduling import true_bit
+
+    def output(token_ids, text):
+        return SimpleNamespace(outputs=[SimpleNamespace(token_ids=token_ids,
+                                                        text=text)])
+
+    assert true_bit(output([7], "TRUE"), {7}) == 1
+    assert true_bit(output([8], "FALSE"), {7}) == 0
+    assert true_bit(output([1, 2], "The answer is TRUE."), {7}) == 1
+    assert true_bit(output([1, 2], "**FALSE** because"), {7}) == 0
+    assert true_bit(output([1, 2], "TRUEISH FALSE"), {7}) == 0
+    assert true_bit(output([], ""), {7}) == 0
