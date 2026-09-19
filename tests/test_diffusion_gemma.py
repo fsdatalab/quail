@@ -239,6 +239,8 @@ class _Attention:
         self.q_norm = _Norm(1.0)
         self.k_norm = _Norm(1.0)
         self.v_norm = _Norm(1.0)
+        self.v_norm.has_weight = False
+        self.v_norm.hidden_size = dim
         self.rotary_emb = SimpleNamespace(
             cos_sin_cache=torch.zeros(2, dim), is_neox_style=True)
         self.is_sliding = sliding
@@ -320,6 +322,25 @@ class _Engine:
         residual.add_(hidden)
         hidden.copy_(residual * norm.weight)
         return hidden, residual
+
+    def qkv_norm_rope_heads(self, qkv, positions, *, n_q, n_kv, head_dim,
+                            q_weight, k_weight, eps, cos_sin_cache):
+        q, k = self.qk_norm_rope_heads(
+            qkv, positions, n_q=n_q, n_kv=n_kv, head_dim=head_dim,
+            q_weight=q_weight, k_weight=k_weight, eps=eps,
+            cos_sin_cache=cos_sin_cache)
+        return q, k, qkv[:, (n_q + n_kv) * head_dim:].contiguous()
+
+    def gelu_mul_quant(self, gate_up):
+        # the fake feedforward's activation is the identity
+        return gate_up, None
+
+    def scale_add_norm_quant(self, x, residual, scale, weight, eps):
+        residual.mul_(scale).add_(x)
+        return residual * weight, None
+
+    def norm_rows2(self, x, weight1, weight2, eps):
+        return x * weight1, x * weight2
 
 
 def _fake_model(torch, hidden=4, layer_scalar=0.5):

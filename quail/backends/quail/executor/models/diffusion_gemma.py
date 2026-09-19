@@ -111,6 +111,8 @@ class DiffusionGemmaPipeline(ModelPipeline):
                                   * router.scale).detach()
         self.fused = fused
         if fused:
+            if any(layer.self_attn.v_norm.has_weight for layer in self.layers):
+                raise ValueError("the fused path expects a weightless v norm")
             self._fold_layer_scalars(model)
         self.canvas_ids = canvas_token_ids(spec.vocab, spec.canvas_tokens)
         # an empty canvas reads the answer at the prompt's last row
@@ -161,6 +163,13 @@ class DiffusionGemmaPipeline(ModelPipeline):
             layer.post_feedforward_layernorm.weight.data.mul_(
                 float(layer.layer_scalar))
         model.quail_scalars_folded = True
+
+    def _residual_scale(self, layer):
+        """The layer's output scalar as a float, read once."""
+        scale = getattr(layer, "quail_residual_scale", None)
+        if scale is None:
+            scale = layer.quail_residual_scale = float(layer.layer_scalar)
+        return scale
 
     def forward_chunk(self, chunk):
         from vllm.forward_context import set_forward_context
@@ -214,14 +223,18 @@ class DiffusionGemmaPipeline(ModelPipeline):
                                         residual)
             mlp = layer.mlp
             gate_up = engine.fp8_linear(mlp.gate_up_proj, x_q, x_s)
-            dense, _ = mlp.down_proj(mlp.act_fn(gate_up))
+            d_q, d_s = engine.gelu_mul_quant(gate_up)
+            dense = engine.fp8_linear(mlp.down_proj, d_q, d_s)
             if layer.enable_moe_block:
                 dense = self._norm(dense, layer.post_feedforward_layernorm_1)
-                routed_in = self._norm(residual,
-                                       layer.pre_feedforward_layernorm_2)
                 router = layer.router
-                logits, _ = router.proj(engine.norm_rows(
-                    residual, router.quail_scale, router.norm.variance_epsilon))
+                pre = layer.pre_feedforward_layernorm_2
+                # the expert input and the router input are two norms
+                # of the residual
+                routed_in, router_in = engine.norm_rows2(
+                    residual, pre.weight, router.quail_scale,
+                    pre.variance_epsilon)
+                logits, _ = router.proj(router_in)
                 routed = layer.moe(routed_in, logits)
                 routed = self._norm(routed, layer.post_feedforward_layernorm_2)
                 # dense becomes the norm of the two branches' sum
@@ -230,26 +243,28 @@ class DiffusionGemmaPipeline(ModelPipeline):
             else:
                 dense = self._norm(dense, layer.post_feedforward_layernorm)
             # dense carries the layer scalar through its norm weight;
-            # the residual takes it here
-            residual.mul_(layer.layer_scalar)
+            # the residual takes it in the kernel that sums them
+            scale = self._residual_scale(layer)
             if index == last:
-                return dense + residual
+                return dense + residual * scale
             # residual becomes the layer's output; the next layer reads
             # its norm
-            x_q, x_s = self._norm_quant(
-                dense, self.layers[index + 1].input_layernorm, residual)
+            next_norm = self.layers[index + 1].input_layernorm
+            x_q, x_s = engine.scale_add_norm_quant(
+                dense, residual, scale, next_norm.weight,
+                next_norm.variance_epsilon)
         raise AssertionError("a model needs at least one layer")
 
     def _attention_fused(self, attn, qkv, positions, meta):
         n = qkv.shape[0]
         H, KH, D = attn.num_heads, attn.num_kv_heads, attn.head_dim
         rope = attn.rotary_emb
-        q, k = self.engine.qk_norm_rope_heads(
+        q, k, v = self.engine.qkv_norm_rope_heads(
             qkv, positions, n_q=H, n_kv=KH, head_dim=D,
             q_weight=attn.q_norm.weight, k_weight=attn.k_norm.weight,
             eps=attn.q_norm.variance_epsilon, cos_sin_cache=rope.cos_sin_cache)
-        v = self._norm(qkv[:, (H + KH) * D:].reshape(n, KH, D), attn.v_norm)
-        return self._attend(attn, q.view(n, H, D), k.view(n, KH, D), v, meta)
+        return self._attend(attn, q.view(n, H, D), k.view(n, KH, D),
+                            v.view(n, KH, D), meta)
 
     def _attend(self, attn, q3, k3, v3, meta):
         """One layer's attention on the chunk's path: two-call or unified."""

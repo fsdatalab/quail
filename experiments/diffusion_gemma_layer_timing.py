@@ -349,6 +349,58 @@ def primitives(prediction: str, docs: int = 20, doc_tokens: int = 300) -> str:
             result[f"qk_{name}_cache"] = list(rope.cos_sin_cache.shape)
             result[f"qk_{name}_eps"] = (attn.q_norm.variance_epsilon,
                                         attn.k_norm.variance_epsilon)
+        # (g) the four fused elementwise kernels against the reference ops
+        mlp = layers[0].mlp
+        gate_up = mlp.gate_up_proj(x)[0]
+        ref = mlp.act_fn(gate_up)
+        rq, rs = ops.scaled_fp8_quant(ref, use_per_token_if_dynamic=True)
+        fq, fs = engine.gelu_mul_quant(gate_up)
+        result["gelu_quant_rel"] = rel(fq.float() * fs, rq.float() * rs)
+        result["gelu_quant_scale_rel"] = rel(fs, rs)
+        result["down_from_fused_rel"] = rel(
+            engine.fp8_linear(mlp.down_proj, fq, fs), mlp.down_proj(ref)[0])
+        norm = layers[1].input_layernorm
+        scale = float(layers[0].layer_scalar)
+        r2 = r.clone()
+        fq, fs = engine.scale_add_norm_quant(x, r2, scale, norm.weight,
+                                             norm.variance_epsilon)
+        summed = (r.float() * scale + x.float()).to(torch.bfloat16)
+        ref = engine.norm_rows(summed, norm.weight, norm.variance_epsilon)
+        rq, rs = ops.scaled_fp8_quant(ref, use_per_token_if_dynamic=True)
+        result["scale_norm_quant_rel"] = rel(fq.float() * fs, rq.float() * rs)
+        result["scale_norm_quant_residual_rel"] = rel(r2, summed)
+        pre = layers[0].pre_feedforward_layernorm_2
+        router = layers[0].router
+        o1, o2 = engine.norm_rows2(x, pre.weight, router.quail_scale,
+                                   pre.variance_epsilon)
+        result["norm2_a_rel"] = rel(o1, engine.norm_rows(
+            x, pre.weight, pre.variance_epsilon))
+        result["norm2_b_rel"] = rel(o2, engine.norm_rows(
+            x, router.quail_scale, pre.variance_epsilon))
+        for name, layer in (("sliding", layers[0]), ("full", layers[5])):
+            attn = layer.self_attn
+            H, KH, D = attn.num_heads, attn.num_kv_heads, attn.head_dim
+            qkv = attn.qkv_proj(x)[0]
+            _, _, v_ref = qkv.split([attn.q_size, attn.kv_size, attn.kv_size],
+                                    -1)
+            v_ref = engine.norm_rows(
+                v_ref.reshape(n, KH, D),
+                torch.ones(D, dtype=v_ref.dtype, device=v_ref.device),
+                attn.v_norm.variance_epsilon).view(n, KH * D)
+            rope = attn.rotary_emb
+            fq, fk, fv = engine.qkv_norm_rope_heads(
+                qkv, positions, n_q=H, n_kv=KH, head_dim=D,
+                q_weight=attn.q_norm.weight, k_weight=attn.k_norm.weight,
+                eps=attn.q_norm.variance_epsilon,
+                cos_sin_cache=rope.cos_sin_cache)
+            q2, k2 = engine.qk_norm_rope_heads(
+                qkv, positions, n_q=H, n_kv=KH, head_dim=D,
+                q_weight=attn.q_norm.weight, k_weight=attn.k_norm.weight,
+                eps=attn.q_norm.variance_epsilon,
+                cos_sin_cache=rope.cos_sin_cache)
+            result[f"qkv_{name}_q_rel"] = rel(fq, q2)
+            result[f"qkv_{name}_k_rel"] = rel(fk, k2)
+            result[f"qkv_{name}_v_rel"] = rel(fv, v_ref)
         # (d) the residual-add norm
         norm = layers[0].post_feedforward_layernorm
         h, r2 = x.clone(), r.clone()

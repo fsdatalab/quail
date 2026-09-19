@@ -244,6 +244,69 @@ class Engine:
             num_warps=8 if head_dim > 256 else 4)
         return q, k
 
+    def qkv_norm_rope_heads(self, qkv, positions, *, n_q, n_kv, head_dim,
+                            q_weight, k_weight, eps, cos_sin_cache):
+        """qk_norm_rope_heads plus the weightless per-head norm of v.
+
+        Returns contiguous q, k and v, so the v slice is never copied
+        on its own.
+        """
+        n = qkv.shape[0]
+        torch = self.torch
+        q = torch.empty((n, n_q * head_dim), dtype=torch.bfloat16,
+                        device=qkv.device)
+        k = torch.empty((n, n_kv * head_dim), dtype=torch.bfloat16,
+                        device=qkv.device)
+        v = torch.empty((n, n_kv * head_dim), dtype=torch.bfloat16,
+                        device=qkv.device)
+        self._triton_kernels()["qkv"][(n,)](
+            qkv, q, k, v, cos_sin_cache, positions, q_weight, k_weight,
+            qkv.stride(0), q.stride(0), k.stride(0), v.stride(0), eps,
+            QH=n_q, KH=n_kv, HD=head_dim, HALF=head_dim // 2,
+            num_warps=8 if head_dim > 256 else 4)
+        return q, k, v
+
+    def gelu_mul_quant(self, gate_up):
+        """gelu_tanh(gate) * up, quantized to fp8 with per-row scales."""
+        n, doubled = gate_up.shape
+        half = doubled // 2
+        q = self.torch.empty((n, half), dtype=self.torch.float8_e4m3fn,
+                             device=gate_up.device)
+        scales = self.torch.empty((n, 1), dtype=self.torch.float32,
+                                  device=gate_up.device)
+        self._triton_kernels()["gelu_quant"][(n,)](
+            gate_up, q, scales, gate_up.stride(0), q.stride(0),
+            HALF=half, BLOCK=1 << (half - 1).bit_length(), num_warps=8)
+        return q, scales
+
+    def scale_add_norm_quant(self, x, residual, scale, weight, eps):
+        """residual = residual * scale + x in place; the row norm, quantized.
+
+        norm_quant_rows with the residual scaled first. Returns the
+        fp8 rows and their float32 scales, shaped (rows, 1).
+        """
+        n, width = x.shape
+        q = self.torch.empty((n, width), dtype=self.torch.float8_e4m3fn,
+                             device=x.device)
+        scales = self.torch.empty((n, 1), dtype=self.torch.float32,
+                                  device=x.device)
+        self._triton_kernels()["scale_norm_quant"][(n,)](
+            x, residual, weight, q, scales, x.stride(0), residual.stride(0),
+            q.stride(0), float(scale), eps, H=width,
+            BLOCK=1 << (width - 1).bit_length(), num_warps=8)
+        return q, scales
+
+    def norm_rows2(self, x, weight1, weight2, eps):
+        """Two RMS norms of the same rows from one read."""
+        n, width = x.shape
+        o1 = self.torch.empty_like(x)
+        o2 = self.torch.empty_like(x)
+        self._triton_kernels()["norm2"][(n,)](
+            x, weight1, weight2, o1, o2, x.stride(0), o1.stride(0),
+            o2.stride(0), eps, H=width, BLOCK=1 << (width - 1).bit_length(),
+            num_warps=8)
+        return o1, o2
+
     # ---- the Triton fused kernels -----------------------------------
     # Each fuses a sequence of vLLM ops into one kernel launch.
 
@@ -458,9 +521,146 @@ class Engine:
             tl.store(out_ptr + t * stride_out_t + h0 * D + offs,
                      tl.reshape(y, (D * GPB,)).to(out_ptr.dtype.element_ty))
 
+        # gelu_tanh_and_mul fused with the per-row fp8 quantization the
+        # next linear would run on its output
+        @triton.jit
+        def gelu_mul_quant(gu_ptr, q_ptr, s_ptr, stride_gu, stride_q,
+                           HALF: tl.constexpr, BLOCK: tl.constexpr):
+            t = tl.program_id(0)
+            offs = tl.arange(0, BLOCK)
+            mask = offs < HALF
+            gate = tl.load(gu_ptr + t * stride_gu + offs, mask=mask,
+                           other=0.0).to(tl.float32)
+            up = tl.load(gu_ptr + t * stride_gu + HALF + offs, mask=mask,
+                         other=0.0).to(tl.float32)
+            inner = 0.7978845608028654 * (gate + 0.044715 * gate * gate * gate)
+            th = 1.0 - 2.0 / (tl.exp(2.0 * inner) + 1.0)
+            y = 0.5 * gate * (1.0 + th) * up
+            # the unfused path rounds the activation to bf16 first
+            y = y.to(tl.bfloat16).to(tl.float32)
+            amax = tl.max(tl.abs(y), axis=0)
+            scale = tl.maximum(amax / 448.0, 1.0 / (448.0 * 512.0))
+            q = tl.minimum(tl.maximum(y / scale, -448.0), 448.0)
+            tl.store(q_ptr + t * stride_q + offs,
+                     q.to(q_ptr.dtype.element_ty), mask=mask)
+            tl.store(s_ptr + t, scale)
+
+        # vLLM's rms_norm_dynamic_per_token_quant with a residual,
+        # with the residual scaled first: residual = residual * scale
+        # + x, then the row norm quantized per row
+        @triton.jit
+        def scale_add_rms_norm_quant(x_ptr, res_ptr, w_ptr, q_ptr, s_ptr,
+                                     stride_x, stride_res, stride_q,
+                                     scale, eps, H: tl.constexpr,
+                                     BLOCK: tl.constexpr):
+            t = tl.program_id(0)
+            offs = tl.arange(0, BLOCK)
+            mask = offs < H
+            x = tl.load(x_ptr + t * stride_x + offs, mask=mask,
+                        other=0.0).to(tl.float32)
+            r = tl.load(res_ptr + t * stride_res + offs, mask=mask,
+                        other=0.0).to(tl.float32)
+            r = r * scale + x
+            tl.store(res_ptr + t * stride_res + offs,
+                     r.to(res_ptr.dtype.element_ty), mask=mask)
+            ms = tl.sum(r * r, axis=0) / H
+            rstd = 1.0 / tl.sqrt(ms + eps)
+            w = tl.load(w_ptr + offs, mask=mask, other=0.0)
+            y = ((r * rstd).to(tl.bfloat16) * w.to(tl.bfloat16)).to(tl.float32)
+            amax = tl.max(tl.abs(y), axis=0)
+            qscale = tl.maximum(amax / 448.0, 1.0 / (448.0 * 512.0))
+            q = tl.minimum(tl.maximum(y / qscale, -448.0), 448.0)
+            tl.store(q_ptr + t * stride_q + offs,
+                     q.to(q_ptr.dtype.element_ty), mask=mask)
+            tl.store(s_ptr + t, qscale)
+
+        # one read of a row for two RMS norms with different weights
+        @triton.jit
+        def rms_norm2(x_ptr, w1_ptr, w2_ptr, o1_ptr, o2_ptr, stride_x,
+                      stride_o1, stride_o2, eps, H: tl.constexpr,
+                      BLOCK: tl.constexpr):
+            t = tl.program_id(0)
+            offs = tl.arange(0, BLOCK)
+            mask = offs < H
+            x = tl.load(x_ptr + t * stride_x + offs, mask=mask,
+                        other=0.0).to(tl.float32)
+            ms = tl.sum(x * x, axis=0) / H
+            xn = x * (1.0 / tl.sqrt(ms + eps))
+            w1 = tl.load(w1_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+            w2 = tl.load(w2_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+            tl.store(o1_ptr + t * stride_o1 + offs,
+                     (xn * w1).to(o1_ptr.dtype.element_ty), mask=mask)
+            tl.store(o2_ptr + t * stride_o2 + offs,
+                     (xn * w2).to(o2_ptr.dtype.element_ty), mask=mask)
+
+        # qk_norm_rope plus the weightless per-head v norm Gemma
+        # applies, written contiguous for the KV scatter
+        @triton.jit
+        def qkv_norm_rope(qkv_ptr, q_out_ptr, k_out_ptr, v_out_ptr, cs_ptr,
+                          pos_ptr, qw_ptr, kw_ptr, stride_qkv, stride_qo,
+                          stride_ko, stride_vo, eps, QH: tl.constexpr,
+                          KH: tl.constexpr, HD: tl.constexpr,
+                          HALF: tl.constexpr):
+            t = tl.program_id(0)
+            pos = tl.load(pos_ptr + t)
+            half_offs = tl.arange(0, HALF)
+            cos = tl.load(cs_ptr + pos * HD + half_offs).to(tl.float32)
+            sin = tl.load(cs_ptr + pos * HD + HALF + half_offs).to(tl.float32)
+            qw_a = tl.load(qw_ptr + half_offs).to(tl.float32)
+            qw_b = tl.load(qw_ptr + HALF + half_offs).to(tl.float32)
+            kw_a = tl.load(kw_ptr + half_offs).to(tl.float32)
+            kw_b = tl.load(kw_ptr + HALF + half_offs).to(tl.float32)
+
+            q_heads = tl.arange(0, QH)
+            qa_offs = q_heads[:, None] * HD + half_offs[None, :]
+            qb_offs = qa_offs + HALF
+            qa = tl.load(qkv_ptr + t * stride_qkv + qa_offs).to(tl.float32)
+            qb = tl.load(qkv_ptr + t * stride_qkv + qb_offs).to(tl.float32)
+            ms = (tl.sum(qa * qa, axis=1) + tl.sum(qb * qb, axis=1)) / HD
+            rstd = 1.0 / tl.sqrt(ms + eps)
+            qa = qa * rstd[:, None] * qw_a[None, :]
+            qb = qb * rstd[:, None] * qw_b[None, :]
+            out_a = qa * cos[None, :] - qb * sin[None, :]
+            out_b = qb * cos[None, :] + qa * sin[None, :]
+            tl.store(q_out_ptr + t * stride_qo + qa_offs,
+                     out_a.to(q_out_ptr.dtype.element_ty))
+            tl.store(q_out_ptr + t * stride_qo + qb_offs,
+                     out_b.to(q_out_ptr.dtype.element_ty))
+
+            k_heads = tl.arange(0, KH)
+            ka_offs = k_heads[:, None] * HD + half_offs[None, :]
+            kb_offs = ka_offs + HALF
+            base = qkv_ptr + t * stride_qkv + QH * HD
+            ka = tl.load(base + ka_offs).to(tl.float32)
+            kb = tl.load(base + kb_offs).to(tl.float32)
+            ms = (tl.sum(ka * ka, axis=1) + tl.sum(kb * kb, axis=1)) / HD
+            rstd = 1.0 / tl.sqrt(ms + eps)
+            ka = ka * rstd[:, None] * kw_a[None, :]
+            kb = kb * rstd[:, None] * kw_b[None, :]
+            out_a = ka * cos[None, :] - kb * sin[None, :]
+            out_b = kb * cos[None, :] + ka * sin[None, :]
+            tl.store(k_out_ptr + t * stride_ko + ka_offs,
+                     out_a.to(k_out_ptr.dtype.element_ty))
+            tl.store(k_out_ptr + t * stride_ko + kb_offs,
+                     out_b.to(k_out_ptr.dtype.element_ty))
+
+            base = qkv_ptr + t * stride_qkv + (QH + KH) * HD
+            va = tl.load(base + ka_offs).to(tl.float32)
+            vb = tl.load(base + kb_offs).to(tl.float32)
+            ms = (tl.sum(va * va, axis=1) + tl.sum(vb * vb, axis=1)) / HD
+            rstd = 1.0 / tl.sqrt(ms + eps)
+            tl.store(v_out_ptr + t * stride_vo + ka_offs,
+                     (va * rstd[:, None]).to(v_out_ptr.dtype.element_ty))
+            tl.store(v_out_ptr + t * stride_vo + kb_offs,
+                     (vb * rstd[:, None]).to(v_out_ptr.dtype.element_ty))
+
         self._kernels = {"silu": silu_mul_quant,
                          "norm": add_rms_norm_quant,
                          "qk": qk_norm_rope,
+                         "qkv": qkv_norm_rope,
+                         "gelu_quant": gelu_mul_quant,
+                         "scale_norm_quant": scale_add_rms_norm_quant,
+                         "norm2": rms_norm2,
                          "kv_scatter": kv_row_scatter,
                          "merge_quant": merge_attn_quant,
                          "merge": merge_attn}
