@@ -842,22 +842,19 @@ def stock_kernels(prediction: str, n_docs: int = 512,
 @app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
               volumes=volumes)
 def stock_answers(prediction: str, n_docs: int = 64,
-                  canvas_lengths: str = "1,8") -> str:
-    """What stock vLLM writes at its first canvas row, per canvas length.
+                  canvas_length: int = 256, max_tokens: int = 16) -> str:
+    """What stock vLLM writes on its canvas for the F1 filter prompt.
 
-    Boots stock vLLM once per canvas length on IMDB reviews with the
-    benchmark's F1 filter prompt and reports the first generated token
-    of each document, the share that is a TRUE or FALSE id, and the
-    time per document.
+    Boots stock vLLM with the given canvas length on IMDB reviews and
+    reports each document's generated tokens and text, the share whose
+    first token is a TRUE or FALSE id, and the time per document. One
+    boot per call: vLLM does not give the GPU back in-process.
     """
     import os as _os
     import time as _time
 
     _os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-    import gc
-
     import pyarrow.parquet as pq
-    import torch
     from transformers import AutoTokenizer
     from vllm import LLM, SamplingParams
 
@@ -877,35 +874,34 @@ def stock_answers(prediction: str, n_docs: int = 64,
     prompt = bind_prompt(F1, ("body",), tok, turn=spec.turn)
     prompts = [dict(prompt_token_ids=render_filter_prompt_ids(prompt, tok(b), tok))
                for b in bodies]
-    report = {"prediction": prediction, "n_docs": n_docs, "runs": {}}
-    for length in [int(x) for x in canvas_lengths.split(",")]:
-        llm = LLM(model=spec.hf_name, gpu_memory_utilization=0.9,
-                  max_num_batched_tokens=65536, max_num_seqs=1024,
-                  enable_prefix_caching=True, disable_log_stats=True,
-                  diffusion_config={"canvas_length": length})
-        sampling = SamplingParams(max_tokens=1)
-        llm.generate(prompts[:4], sampling, use_tqdm=False)
-        t0 = _time.perf_counter()
-        outputs = llm.generate(prompts, sampling, use_tqdm=False)
-        seconds = _time.perf_counter() - t0
-        firsts = [list(o.outputs[0].token_ids) for o in outputs]
-        texts = [o.outputs[0].text for o in outputs]
-        answered = sum(bool(t) and t[0] in true_ids | false_ids for t in firsts)
-        report["runs"][length] = {
-            "seconds": round(seconds, 2),
-            "docs_per_s": round(len(prompts) / seconds, 1),
-            "answered_true_or_false": answered,
-            "true": sum(bool(t) and t[0] in true_ids for t in firsts),
-            "first_tokens": firsts[:24],
-            "texts": texts[:24],
-        }
-        print(length, report["runs"][length], flush=True)
-        del llm
-        gc.collect()
-        torch.cuda.empty_cache()
-    report["true_ids"] = sorted(true_ids)
-    report["false_ids"] = sorted(false_ids)
-    report["volume_path"] = _save("diffusion_gemma_stock_answers", report)
+    report = {"prediction": prediction, "n_docs": n_docs,
+              "canvas_length": canvas_length, "max_tokens": max_tokens}
+    llm = LLM(model=spec.hf_name, gpu_memory_utilization=0.9,
+              max_num_batched_tokens=65536, max_num_seqs=1024,
+              enable_prefix_caching=True, disable_log_stats=True,
+              diffusion_config={"canvas_length": canvas_length})
+    sampling = SamplingParams(max_tokens=max_tokens)
+    llm.generate(prompts[:4], sampling, use_tqdm=False)
+    t0 = _time.perf_counter()
+    outputs = llm.generate(prompts, sampling, use_tqdm=False)
+    seconds = _time.perf_counter() - t0
+    tokens = [list(o.outputs[0].token_ids) for o in outputs]
+    texts = [o.outputs[0].text for o in outputs]
+    report.update({
+        "seconds": round(seconds, 2),
+        "docs_per_s": round(len(prompts) / seconds, 1),
+        "first_token_true_or_false": sum(
+            bool(t) and t[0] in true_ids | false_ids for t in tokens),
+        "text_has_true_or_false": sum(
+            ("TRUE" in text or "FALSE" in text) for text in texts),
+        "tokens": tokens[:32],
+        "texts": texts[:32],
+        "true_ids": sorted(true_ids), "false_ids": sorted(false_ids),
+    })
+    print(json.dumps({k: v for k, v in report.items() if k != "tokens"},
+                     indent=1), flush=True)
+    report["volume_path"] = _save(
+        f"diffusion_gemma_stock_answers_canvas{canvas_length}", report)
     return json.dumps(report, indent=2)
 
 
