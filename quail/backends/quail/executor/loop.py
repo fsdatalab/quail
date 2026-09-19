@@ -673,6 +673,22 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
             by_mode.setdefault(entry_mode(*entry[:4]), []).append(entry)
         return sorted(by_mode.items(), key=lambda item: item[0] != "merge")
 
+    def entry_rows(a, j, start, end, carried):
+        f = len(prefixes[a])
+        frame = frames[j]
+        sufs = [stage_suffixes[j][i]
+                for i in sched.partner_indices(a, j, start, end)]
+        rows = (f if carried else 0) + sum(len(s) + len(canvas) for s in sufs)
+        if frame and start == 0:
+            rows += len(frame) + len(canvas)
+        return rows
+
+    # groups that do not fit the window wait here, holding their
+    # pages, until they fill a chunk of their own: a chunk of a few
+    # hundred rows is launch-bound over the layers
+    deferred = []
+    deferred_rows = [0]
+
     if k == 0:
         return [], [], 0
     # a frame entry's canvas rows land in the anchor's pages after the
@@ -812,6 +828,23 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
             progress.done + sum(end - start for _, _, start, end, _ in groups)
             if scoring else finished[0])
 
+    def run_part(part, mode):
+        nonlocal tokens
+        chunk = build(part, mode)
+        tokens += chunk.tokens
+        e0 = torch.cuda.Event(enable_timing=True)
+        e1 = torch.cuda.Event(enable_timing=True)
+        e0.record()
+        normed = _forward(pipeline, arena, chunk)
+        e1.record()
+        for key in getattr(chunk, "fresh_keys", ()):
+            arena.trim_window(key)
+        spans.append((part[0][1], e0, e1))
+        outstanding.append((part, async_ans.submit(normed)))
+        # read the previous chunk's answers while this one runs
+        while len(outstanding) > 1:
+            report(outstanding.pop(0))
+
     while True:
         if anchor_source is not None and not anchor_source.done:
             pull()
@@ -830,28 +863,36 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
             if outstanding:
                 report(outstanding.pop(0))
                 continue
+            if deferred:
+                run_part(deferred[:], FILTER_ATTENTION)
+                deferred.clear()
+                deferred_rows[0] = 0
+                continue
             if anchor_source is not None and not anchor_source.done:
                 # the source has to move; it may evict retained KV to admit
                 if pull(evict_retained=True, force=True):
                     continue
             raise AssertionError("nothing buildable and nothing in flight")
-        # one chunk per attention path; the second is packed after
-        # the first ran so their temporary pages never coexist
         for mode, part in partition(groups):
-            chunk = build(part, mode)
-            tokens += chunk.tokens
-            e0 = torch.cuda.Event(enable_timing=True)
-            e1 = torch.cuda.Event(enable_timing=True)
-            e0.record()
-            normed = _forward(pipeline, arena, chunk)
-            e1.record()
-            for key in getattr(chunk, "fresh_keys", ()):
-                arena.trim_window(key)
-            spans.append((part[0][1], e0, e1))
-            outstanding.append((part, async_ans.submit(normed)))
-            # read the previous chunk's answers while this one runs
-            while len(outstanding) > 1:
-                report(outstanding.pop(0))
+            if mode == fixed_mode or not split_by_window:
+                if split_by_window:
+                    # hold the pages now; the chunk packs later
+                    for a, j, start, end, carried in part:
+                        f = len(prefixes[a])
+                        got = arena.activate(keys[a], f, capacity_tokens=f + frame_max,
+                                             base_tokens=f)
+                        assert got is not None, \
+                            "scheduler admitted an anchor the arena cannot hold"
+                    deferred.extend(part)
+                    deferred_rows[0] += sum(entry_rows(*e) for e in part)
+                    if deferred_rows[0] < budget // 2:
+                        continue
+                    part = deferred[:]
+                    deferred.clear()
+                    deferred_rows[0] = 0
+                run_part(part, mode)
+            else:
+                run_part(part, mode)
     while outstanding:
         report(outstanding.pop(0))
     progress.finish(f"{label} done", f"{tokens:,} fresh tokens")
