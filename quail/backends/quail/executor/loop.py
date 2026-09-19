@@ -915,13 +915,16 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
 
 # Chunk sizes (tokens) the tiny-chunk warmup ladder builds. A gated
 # chain's trailing chunks are 100-500 tokens, a shape the full-size
-# warm chunks do not cover, so each needs its own compile.
-TINY_WARM_TOKENS = (64, 128, 256, 512, 1024, 2048)
+# warm chunks do not cover, so each needs its own compile. The larger
+# sizes are the Triton fused MoE kernel's row buckets between the tiny
+# chunks and the full budget: a join's deferred or trailing chunk
+# lands in one, and its first use compiles the kernel.
+TINY_WARM_TOKENS = (64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768)
 
 # Bump when either pass covers a different set of shapes. A bumped
 # version invalidates every marker, so the next boot re-runs the
 # compile pass and re-commits the cache.
-WARMUP_VERSION = 2
+WARMUP_VERSION = 3
 
 
 def _warm_inputs(budget):
