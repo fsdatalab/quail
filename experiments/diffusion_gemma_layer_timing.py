@@ -91,6 +91,102 @@ def _timer(torch, totals, name):
 
 @app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
               volumes=volumes)
+def moe_tiles(prediction: str, docs: int = 110, doc_tokens: int = 300) -> str:
+    """Time the experts under a sweep of Triton fused MoE tile configs."""
+    import itertools
+
+    import numpy as np
+    import torch
+    from vllm.model_executor.layers.fused_moe import override_config
+
+    from quail.backends.quail.executor.arena import KVArena
+    from quail.backends.quail.executor.loop import pack_chunk
+    from quail.backends.quail.executor.model import load_model
+    from quail.backends.quail.executor.models import build_pipeline
+    from quail.cost import budgets
+    from quail.specs import DEVICES, MODELS
+
+    spec = MODELS[MODEL]
+    device = DEVICES["h100-sxm"]
+    chunk_tokens = budgets.chunk_budget(spec, device)
+    model = load_model(spec.hf_name, max_batched_tokens=chunk_tokens,
+                       moe_backend="triton")
+    full_pages, sliding_pages = budgets.arena_pages(spec, device, chunk_tokens)
+    arena = KVArena(n_layers=spec.layers, n_pages=full_pages,
+                    page_tokens=budgets.PAGE_TOKENS, n_kv=spec.n_kv,
+                    d_head=spec.d_head, dtype=torch.bfloat16,
+                    layer_kv=spec.kv_shapes,
+                    sliding_layers=spec.sliding_layer_set,
+                    sliding_window=spec.sliding_window,
+                    n_sliding_pages=sliding_pages)
+    pipeline = build_pipeline(spec, model, arena)
+    tail = list(range(100, 116))
+    rng = np.random.default_rng(1)
+    groups = []
+    for index in range(docs):
+        key = ("t", index)
+        arena.activate(key, doc_tokens + len(tail),
+                       capacity_tokens=doc_tokens + len(tail) + 256,
+                       base_tokens=doc_tokens)
+        prefix = [int(t) for t in rng.integers(1000, spec.vocab - 1000,
+                                               doc_tokens)]
+        groups.append(dict(key=key, prefix=prefix, f=doc_tokens,
+                           suffixes=[tail]))
+    totals = {}
+    for layer in pipeline.layers:
+        layer.moe.forward = _timer(torch, totals, "experts")(layer.moe.forward)
+
+    def run():
+        chunk = pack_chunk(torch, arena, groups, attention_mode="unified",
+                           canvas=pipeline.canvas_ids,
+                           answer_row=pipeline.canvas_answer_row)
+        totals.clear()
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        with torch.inference_mode():
+            pipeline.forward_chunk(chunk)
+        torch.cuda.synchronize()
+        seconds = time.perf_counter() - t0
+        for key in chunk.temporary_keys:
+            arena.free_key(key)
+        return chunk.tokens, seconds, totals.get("experts", 0.0)
+
+    rows, _, _ = run()
+    rows, plain_s, plain_experts = run()
+    trials = [{"config": "shipped", "chunk_s": plain_s,
+               "experts_s": plain_experts}]
+    print(f"shipped: chunk {plain_s:.3f} s, experts {plain_experts:.3f} s",
+          flush=True)
+    grid = itertools.product((64, 128), (128, 256), (128, 256), (8, 16, 32),
+                             (4, 8), (2, 3, 4))
+    for bm, bn, bk, gm, warps, stages in grid:
+        config = {"BLOCK_SIZE_M": bm, "BLOCK_SIZE_N": bn, "BLOCK_SIZE_K": bk,
+                  "GROUP_SIZE_M": gm, "num_warps": warps,
+                  "num_stages": stages}
+        try:
+            with override_config(config):
+                run()
+                _, chunk_s, experts_s = run()
+        except Exception as error:  # noqa: BLE001 - a tile can be invalid
+            trials.append({"config": config, "error": repr(error)[:160]})
+            continue
+        trials.append({"config": config, "chunk_s": chunk_s,
+                       "experts_s": experts_s})
+        print(f"{config}: chunk {chunk_s:.3f} s, experts {experts_s:.3f} s",
+              flush=True)
+    timed = [t for t in trials if "experts_s" in t]
+    best = min(timed, key=lambda t: t["experts_s"])
+    result = {
+        "prediction": prediction, "rows": rows, "docs": docs,
+        "shipped_experts_s": plain_experts, "shipped_chunk_s": plain_s,
+        "best": best, "trials": trials,
+    }
+    result["volume_path"] = _save("diffusion_gemma_moe_tiles", result)
+    return json.dumps(result, indent=2)
+
+
+@app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
+              volumes=volumes)
 def primitives(prediction: str, docs: int = 20, doc_tokens: int = 300) -> str:
     """Check each fused primitive against the reference ops on real weights."""
     import numpy as np
@@ -686,6 +782,8 @@ def main(prediction: str = "", docs: int = 110, doc_tokens: int = 300,
                 calls[f"{kernel}/{backend}"] = time_chunk.spawn(
                     prediction, docs, doc_tokens, kernel, random_tokens,
                     backend, profile)
+    if "tiles" in runs:
+        calls["tiles"] = moe_tiles.spawn(prediction, docs, doc_tokens)
     if "primitives" in runs:
         calls["primitives"] = primitives.spawn(prediction, docs, doc_tokens)
     if "check" in runs:
