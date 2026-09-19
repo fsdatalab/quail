@@ -471,3 +471,20 @@ def test_filter_admission_takes_canvas_in_stage_tokens():
                             kept_extra_tokens=2 + 2 + 4)
     first = sched.next_chunk()
     assert first == [(0, 0, True), (1, 0, True)]
+
+
+def test_tuned_moe_configs_cover_the_chunk_sizes():
+    import json
+
+    from quail.backends.quail.executor.model import MOE_CONFIGS
+
+    files = sorted(MOE_CONFIGS.glob("*.json"))
+    assert files, "no tuned MoE config files"
+    for path in files:
+        table = json.load(open(path))
+        assert "E=128,N=704" in path.name
+        for rows in ("16384", "32768", "65536"):
+            config = table[rows]
+            assert set(config) == {"BLOCK_SIZE_M", "BLOCK_SIZE_N",
+                                   "BLOCK_SIZE_K", "GROUP_SIZE_M",
+                                   "num_warps", "num_stages"}
