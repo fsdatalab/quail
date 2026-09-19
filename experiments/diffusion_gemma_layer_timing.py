@@ -1113,6 +1113,93 @@ def fa4_tiles(prediction: str, prefix: int = 448, suffix: int = 54,
     return json.dumps(result, indent=2)
 
 
+@app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
+              volumes=volumes)
+def stock_kernels(prediction: str, n_docs: int = 512,
+                  doc_tokens: int = 300) -> str:
+    """Record the kernels stock vLLM's compiled graph runs for this model.
+
+    Boots stock vLLM at its defaults, profiles one prefill-heavy pass
+    over filter-shaped prompts of random document tokens, and records
+    the kernels plus the resolved compilation config.
+    """
+    import os as _os
+
+    # the v1 engine runs the model in a child process by default,
+    # where this process's profiler cannot see the kernels
+    _os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+
+    import random
+
+    import torch
+    from transformers import AutoTokenizer
+    from vllm import LLM, SamplingParams
+
+    from quail.logical import bind_prompt, render_filter_prompt_ids
+    from quail.specs import MODELS
+
+    spec = MODELS[MODEL]
+    tokenizer = AutoTokenizer.from_pretrained(spec.hf_name)
+
+    def tok(text):
+        return tokenizer(text, add_special_tokens=False)["input_ids"]
+
+    rng = random.Random(0)
+    vocab = tokenizer.vocab_size
+    bodies = [[rng.randrange(1000, vocab) for _ in range(doc_tokens)]
+              for _ in range(n_docs)]
+    prompt = bind_prompt("Is {0} a positive review?", ("body",), tok,
+                         turn=spec.turn)
+    prompts = [dict(prompt_token_ids=render_filter_prompt_ids(prompt, b, tok))
+               for b in bodies]
+
+    llm = LLM(model=spec.hf_name, gpu_memory_utilization=0.92,
+              enable_prefix_caching=False, disable_log_stats=True)
+    sampling = SamplingParams(temperature=0.0, max_tokens=1, min_tokens=1)
+    config = llm.llm_engine.vllm_config
+    comp = config.compilation_config
+    report = dict(
+        prediction=prediction,
+        model=spec.hf_name,
+        optimization_level=int(config.optimization_level),
+        compilation_mode=str(comp.mode),
+        custom_ops=list(comp.custom_ops),
+        enabled_custom_ops=dict(comp.enabled_custom_ops),
+        disabled_custom_ops=dict(comp.disabled_custom_ops),
+        pass_config={
+            k: bool(getattr(comp.pass_config, k))
+            for k in ("fuse_norm_quant", "fuse_act_quant",
+                      "fuse_attn_quant", "enable_qk_norm_rope_fusion")
+            if getattr(comp.pass_config, k, None) is not None},
+        attention_backend=str(getattr(config.attention_config, "backend", "")),
+        kernels=[])
+
+    llm.generate(prompts[:32], sampling)   # warm outside the profile
+    with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU,
+                        torch.profiler.ProfilerActivity.CUDA]
+    ) as prof:
+        llm.generate(prompts, sampling)
+    rows = []
+    total_us = 0.0
+    for ev in prof.key_averages():
+        # op wrapper rows repeat a kernel's name with the same device
+        # time; keep the device-side rows only
+        if "CUDA" not in str(getattr(ev, "device_type", "")):
+            continue
+        cuda_us = (getattr(ev, "self_device_time_total", 0)
+                   or getattr(ev, "self_cuda_time_total", 0))
+        if not cuda_us:
+            continue
+        total_us += cuda_us
+        rows.append((round(cuda_us / 1e3, 2), ev.count, ev.key[:120]))
+    rows.sort(reverse=True)
+    report["cuda_busy_s"] = round(total_us / 1e6, 2)
+    report["kernels"] = [dict(ms=ms, n=n, name=k) for ms, n, k in rows[:80]]
+    report["volume_path"] = _save("diffusion_gemma_stock_kernels", report)
+    return json.dumps(report, indent=2)
+
+
 @app.local_entrypoint()
 def main(prediction: str = "", docs: int = 110, doc_tokens: int = 300,
          kernels: str = "triton,fa4", random_tokens: bool = False,
@@ -1143,6 +1230,8 @@ def main(prediction: str = "", docs: int = 110, doc_tokens: int = 300,
         calls["micro"] = micro.spawn(prediction)
     if "fa4" in runs:
         calls["fa4"] = fa4_tiles.spawn(prediction)
+    if "stock" in runs:
+        calls["stock"] = stock_kernels.spawn(prediction)
     for name, call in calls.items():
         print(f"function call id: {call.object_id} ({name})", flush=True)
     for name, call in calls.items():
