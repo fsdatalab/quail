@@ -843,13 +843,16 @@ def stock_kernels(prediction: str, n_docs: int = 512,
               volumes=volumes)
 def stock_answers(prediction: str, n_docs: int = 64,
                   canvas_length: int = 256, max_tokens: int = 16,
-                  logprobs: int = 20) -> str:
+                  logprobs: int = 20, max_denoising_steps: int = 0,
+                  max_num_seqs: int = 1024) -> str:
     """What stock vLLM writes on its canvas for the F1 filter prompt.
 
     Boots stock vLLM with the given canvas length on IMDB reviews and
     reports each document's generated tokens and text, the share whose
     first token is a TRUE or FALSE id, whether the first position's
     top logprobs rank TRUE against FALSE, and the time per document.
+    A denoising step count of 0 keeps the checkpoint's own. vLLM caps
+    this model at 8 sequences when max_num_seqs is 128 or more.
     One boot per call: vLLM does not give the GPU back in-process.
     """
     import os as _os
@@ -877,11 +880,16 @@ def stock_answers(prediction: str, n_docs: int = 64,
     prompts = [dict(prompt_token_ids=render_filter_prompt_ids(prompt, tok(b), tok))
                for b in bodies]
     report = {"prediction": prediction, "n_docs": n_docs,
-              "canvas_length": canvas_length, "max_tokens": max_tokens}
+              "canvas_length": canvas_length, "max_tokens": max_tokens,
+              "max_denoising_steps": max_denoising_steps or "checkpoint",
+              "max_num_seqs": max_num_seqs}
+    diffusion_config = {"canvas_length": canvas_length}
+    if max_denoising_steps:
+        diffusion_config["max_denoising_steps"] = max_denoising_steps
     llm = LLM(model=spec.hf_name, gpu_memory_utilization=0.9,
-              max_num_batched_tokens=65536, max_num_seqs=1024,
+              max_num_batched_tokens=65536, max_num_seqs=max_num_seqs,
               enable_prefix_caching=True, disable_log_stats=True,
-              diffusion_config={"canvas_length": canvas_length})
+              diffusion_config=diffusion_config)
     sampling = SamplingParams(max_tokens=max_tokens,
                               logprobs=logprobs or None)
     llm.generate(prompts[:4], sampling, use_tqdm=False)
@@ -913,6 +921,8 @@ def stock_answers(prediction: str, n_docs: int = 64,
         "logprob_readouts": readouts[:32],
         "seconds": round(seconds, 2),
         "docs_per_s": round(len(prompts) / seconds, 1),
+        "prompt_tokens_per_s": round(
+            sum(len(p["prompt_token_ids"]) for p in prompts) / seconds),
         "first_token_true_or_false": sum(
             bool(t) and t[0] in true_ids | false_ids for t in tokens),
         "text_has_true_or_false": sum(
@@ -924,7 +934,8 @@ def stock_answers(prediction: str, n_docs: int = 64,
     print(json.dumps({k: v for k, v in report.items() if k != "tokens"},
                      indent=1), flush=True)
     report["volume_path"] = _save(
-        f"diffusion_gemma_stock_answers_canvas{canvas_length}_lp{logprobs}",
+        f"diffusion_gemma_stock_answers_canvas{canvas_length}_lp{logprobs}"
+        f"_steps{max_denoising_steps}",
         report)
     return json.dumps(report, indent=2)
 
@@ -932,7 +943,9 @@ def stock_answers(prediction: str, n_docs: int = 64,
 @app.local_entrypoint()
 def main(prediction: str = "", docs: int = 110, doc_tokens: int = 300,
          random_tokens: bool = False, runs: str = "chunk,loop",
-         moe_backends: str = "auto", profile: bool = False):
+         moe_backends: str = "auto", profile: bool = False,
+         canvas: int = 256, max_tokens: int = 16, logprobs: int = 20,
+         denoising_steps: int = 0, seqs: int = 1024):
     if not prediction:
         raise ValueError("pass --prediction before starting")
     calls = {}
@@ -953,7 +966,10 @@ def main(prediction: str = "", docs: int = 110, doc_tokens: int = 300,
     if "stock" in runs:
         calls["stock"] = stock_kernels.spawn(prediction)
     if "answers" in runs:
-        calls["answers"] = stock_answers.spawn(prediction)
+        calls["answers"] = stock_answers.spawn(
+            prediction, canvas_length=canvas, max_tokens=max_tokens,
+            logprobs=logprobs, max_denoising_steps=denoising_steps,
+            max_num_seqs=seqs)
     for name, call in calls.items():
         print(f"function call id: {call.object_id} ({name})", flush=True)
     for name, call in calls.items():
