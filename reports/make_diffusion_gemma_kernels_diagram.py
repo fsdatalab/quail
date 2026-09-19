@@ -112,7 +112,7 @@ for (label, rows), h in zip(stages, heights):
             xc = col_x0 + ci * (col_w + col_gap) + 0.2 + (col_w - 0.4) / 2
             ax.annotate("", xy=(xc, y - h - STAGE_GAP + 0.03), xytext=(xc, y - h - 0.02), arrowprops=dict(arrowstyle="-|>", color="#888", lw=1))
     y -= h + STAGE_GAP
-items = [("gemm", "CUTLASS fp8 GEMM (vLLM)"), ("moe", "Triton fused MoE (vLLM kernel, Quail's tuned tile table for 32k and 64k rows)"), ("fa", "FlashAttention 3 / 4 (varlen, block table over arena pages)"),
+items = [("gemm", "CUTLASS fp8 GEMM (vLLM)"), ("moe", "Triton fused MoE (vLLM kernel, Quail-tuned tile table)"), ("fa", "FlashAttention 3 / 4 (varlen, block table over arena pages)"),
          ("kv", "KV page write (Quail Triton)"), ("vllm", "vLLM op"), ("vfused", "vLLM fused CUDA op"), ("cublas", "cuBLAS bf16"), ("quail", "Quail fused Triton"), ("inductor", "Inductor-generated Triton (stock, compiled)")]
 for i, (kind, text) in enumerate(items):
     xx = 0.2 + (i % 3) * 6.3; yy = -0.75 - (i // 3) * 0.42
