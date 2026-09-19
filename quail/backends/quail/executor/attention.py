@@ -423,11 +423,42 @@ class Engine:
                      tl.reshape(q, (D * GPB,)).to(q_ptr.dtype.element_ty))
             tl.store(s_ptr + heads * s_stride_g + t * s_stride_t, scale)
 
+        # the same LSE merge writing bf16 rows, for a model whose
+        # o_proj quantizes its own input
+        @triton.jit
+        def merge_attn(a_ptr, b_ptr, la_ptr, lb_ptr, source_ptr, out_ptr,
+                       stride_a_t, stride_a_h, stride_b_t, stride_b_h,
+                       stride_la_t, stride_la_h, stride_lb_t, stride_lb_h,
+                       stride_out_t, D: tl.constexpr, GPB: tl.constexpr):
+            t = tl.program_id(0)
+            block = tl.program_id(1)
+            offs = tl.arange(0, D * GPB)
+            h0 = block * GPB
+            a = tl.load(a_ptr + t * stride_a_t + h0 * stride_a_h + offs)
+            source = tl.load(source_ptr + t)
+            has_b = source >= 0
+            source_safe = tl.maximum(source, 0)
+            b = tl.load(b_ptr + source_safe * stride_b_t + h0 * stride_b_h
+                        + offs, mask=has_b, other=0.0)
+            heads = h0 + tl.arange(0, GPB)
+            la = tl.load(la_ptr + t * stride_la_t + heads * stride_la_h,
+                         mask=has_b, other=0.0)
+            lb = tl.load(lb_ptr + source_safe * stride_lb_t
+                         + heads * stride_lb_h, mask=has_b, other=0.0)
+            w = tl.sigmoid(lb - la)
+            a2 = tl.reshape(a, (GPB, D)).to(tl.float32)
+            b2 = tl.reshape(b, (GPB, D)).to(tl.float32)
+            merged = a2 + (b2 - a2) * w[:, None]
+            y = tl.where(has_b, merged, a2)
+            tl.store(out_ptr + t * stride_out_t + h0 * D + offs,
+                     tl.reshape(y, (D * GPB,)).to(out_ptr.dtype.element_ty))
+
         self._kernels = {"silu": silu_mul_quant,
                          "norm": add_rms_norm_quant,
                          "qk": qk_norm_rope,
                          "kv_scatter": kv_row_scatter,
-                         "merge_quant": merge_attn_quant}
+                         "merge_quant": merge_attn_quant,
+                         "merge": merge_attn}
         return self._kernels
 
     def custom_silu_quant(self, gate_up):
@@ -671,6 +702,68 @@ class Engine:
             out_a, lse_a, out_b, lse_b, cross["source"])
         meta["layer"] += 1
         return q_out, scales
+
+    def merge_attn(self, out_a, lse_a, out_b, lse_b, source):
+        """Merge cached and fresh attention into bf16 rows (rows, heads * dim)."""
+        n, heads, dim = out_a.shape
+        out = self.torch.empty((n, heads * dim), dtype=out_a.dtype,
+                               device=out_a.device)
+        gpb = 4 if dim <= GROUP else 1
+        self._triton_kernels()["merge"][(n, heads // gpb)](
+            out_a, out_b, lse_a, lse_b, source, out,
+            out_a.stride(0), out_a.stride(1),
+            out_b.stride(0), out_b.stride(1),
+            lse_a.stride(0), lse_a.stride(1),
+            lse_b.stride(0), lse_b.stride(1),
+            out.stride(0), D=dim, GPB=gpb)
+        return out
+
+    def attention_merge(self, q3, k3, v3, meta, *, softmax_scale=None,
+                        window=None):
+        """The two-call attention path returning bf16 rows.
+
+        Call A is causal over the chunk's own rows, with the window
+        when given. Call B reads each group's resident prefix once for
+        all of its suffix rows; the packer only chooses this path when
+        prefix plus suffix fit the window, so call B needs no window
+        mask. A sliding layer reads the sliding pool. The LSE merge
+        combines the two. Wide heads run FlashAttention 4 in both
+        calls, the one wide-head kernel that returns the LSE.
+        """
+        n, H, D = q3.shape
+        layer = meta["layer"]
+        wide = D > FA_MAX_HEAD_DIM
+        version = 4 if wide else None
+        sliding_layers = getattr(self.arena, "sliding_layers", ())
+        is_sliding = layer in sliding_layers
+        if meta["kv_src"] is not None:
+            dst = meta["kv_dst"]
+            if is_sliding and meta.get("kv_dst_sliding") is not None:
+                dst = meta["kv_dst_sliding"]
+            self.kv_row_scatter(k3, v3, meta["kv_src"], dst, layer)
+        behind = None if window is None else (window - 1, 0)
+        out_a, lse_a = self._fa(
+            q3, k3, v3, meta["cu_a"], meta["cu_a"], meta["max_a"],
+            meta["max_a"], causal=True, softmax_scale=softmax_scale,
+            window=behind, version=version)
+        cross = meta["cross"]
+        if cross is None:
+            meta["layer"] += 1
+            return out_a.view(n, H * D)
+        pool = cross
+        if is_sliding and cross.get("sliding") is not None:
+            pool = cross["sliding"]
+        q_suf = q3.index_select(0, cross["rows"])
+        kp, vp = self.arena.paged_kv(layer)
+        out_b, lse_b = self._fa(
+            q_suf, kp, vp, cross["cu_q"], None, cross["max_q"],
+            pool["max_used"], causal=False, block_table=pool["table"],
+            seqused_k=pool["used"], softmax_scale=softmax_scale,
+            version=version)
+        out = self.merge_attn(out_a, lse_a.transpose(0, 1), out_b,
+                              lse_b.transpose(0, 1), cross["source"])
+        meta["layer"] += 1
+        return out
 
     def attention_unified(self, q3, k3, v3, meta, *, softmax_scale=None,
                           window=None):

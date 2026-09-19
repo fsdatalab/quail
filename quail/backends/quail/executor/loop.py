@@ -241,13 +241,16 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     def concatenate(parts):
         return np.concatenate(parts) if parts else np.empty(0, dtype=np.int64)
 
-    if attention_mode not in ("merge_quant", "unified"):
+    if attention_mode not in ("merge_quant", "merge", "unified"):
         raise ValueError(
-            "attention_mode must be 'merge_quant' or 'unified', "
+            "attention_mode must be 'merge_quant', 'merge' or 'unified', "
             f"got {attention_mode!r}")
     canvas = tuple(canvas)
-    if canvas and attention_mode != "unified":
-        raise ValueError("canvas rows need the unified attention path")
+    # a one-row canvas is the suffix's last row seeing everything
+    # before it, which the causal two-call path already gives
+    if len(canvas) > 1 and attention_mode != "unified":
+        raise ValueError(
+            "a canvas longer than one row needs the unified attention path")
     if canvas and not 0 <= answer_row < len(canvas):
         raise ValueError(
             f"answer_row {answer_row} is outside the {len(canvas)}-row canvas")
@@ -261,6 +264,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     pos, cu_a, finals = [], [0], []
     suffix_rows = []
     kv_writes, layout = [], []
+    fresh_keys = []
     cross_keys, cross_used, cu_q = [], [], [0]
     max_q = 0
     unified_groups = []
@@ -285,6 +289,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             if paged and two_call:
                 kv_writes.append((key, row0, row0 + len(g["prefix"]),
                                   0))
+                fresh_keys.append(key)
         prefix_end = token_count
         s_row0 = token_count
         suffix_spans = []
@@ -344,6 +349,16 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             cu_q=stage("unified_cu_q", cu_q, torch.int32),
             max_q=max_q, used=used,
             max_used=max(cross_used), table=table)
+        if getattr(arena, "has_sliding", False):
+            # a sliding layer reads the prefix from the sliding pool,
+            # whose rows start at the key's window origin
+            starts = [arena.sliding_start(k) for k in cross_keys]
+            sliding_used = [f - start for f, start in zip(cross_used, starts)]
+            cross["sliding"] = dict(
+                table=arena.block_table_rows(
+                    [arena.owned_sliding_pages(k) for k in cross_keys]),
+                used=_staged(torch, sliding_used, torch.int32, pinned),
+                max_used=max(sliding_used))
         # row -> its index in call B's output, -1 for prefix rows;
         # the fused merge kernel's map
         source = [-1] * token_count
@@ -359,7 +374,6 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     unified = None
     unified_sliding = None
     temporary_keys = []
-    fresh_keys = []
     if attention_mode == "unified" and unified_groups:
         if len(unified_groups) != len(layout):
             raise ValueError(
@@ -459,24 +473,42 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             raise
 
     # All current KV writes use one scatter.
-    kv_src = kv_dst = None
+    kv_src = kv_dst = kv_dst_sliding = None
     if kv_writes:
         src = []
         dst_parts = []
+        sliding_parts = []
+        sliding = getattr(arena, "has_sliding", False)
         for key, r0, r1, dest in kv_writes:
             src.extend(range(r0, r1))
             rows = arena.capacity_rows(key)[dest:dest + (r1 - r0)]
             if rows.numel() != r1 - r0:
                 raise AssertionError("KV write exceeds reserved rows")
             dst_parts.append(rows)
+            if sliding:
+                start = arena.sliding_start(key)
+                if dest < start:
+                    raise ValueError(
+                        f"group {key!r}: a KV write at row {dest} lies "
+                        f"before the sliding window origin {start}")
+                rows = arena.capacity_rows_sliding(key)[
+                    dest - start:dest - start + (r1 - r0)]
+                if rows.numel() != r1 - r0:
+                    raise AssertionError(
+                        "KV write exceeds the reserved sliding rows")
+                sliding_parts.append(rows)
         kv_src = _staged(torch, src, torch.int64, pinned)
         kv_dst = _staged(torch, torch.cat(dst_parts), torch.int64,
                          pinned)
+        if sliding_parts:
+            kv_dst_sliding = _staged(
+                torch, torch.cat(sliding_parts), torch.int64, pinned)
     t = _tick(timing, "pack_kv", t)
 
     canvas_meta = None
     if canvas_rows:
-        if unified is None and len(canvas_rows) != len(cu_a) - 1:
+        if (attention_mode == "unified" and unified is None
+                and len(canvas_rows) != len(cu_a) - 1):
             raise ValueError(
                 "the unpaged canvas call pairs one canvas with each "
                 "causal segment; a group without a suffix has none")
@@ -501,7 +533,8 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                     used=unified_sliding["used"].index_select(0, seq),
                     max_used=max(pools[1].lengths[i] for i in canvas_seq))
     meta = dict(
-        layer=0, kv_src=kv_src, kv_dst=kv_dst, cross=cross,
+        layer=0, mode=attention_mode, kv_src=kv_src, kv_dst=kv_dst,
+        kv_dst_sliding=kv_dst_sliding, cross=cross,
         unified=unified, unified_sliding=unified_sliding, canvas=canvas_meta,
         cu_a=stage("cu_a", cu_a, torch.int32),
         max_a=max(cu_a[i + 1] - cu_a[i] for i in range(len(cu_a) - 1)))
@@ -596,9 +629,29 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     if len(keys) != len(prefixes):
         raise ValueError("anchor_keys must match anchor_prefixes")
     frames = stage_frames or [[] for _ in range(k)]
-    mode = join_attention_mode(pipeline.is_fp8)
+    fixed_mode = join_attention_mode(pipeline.is_fp8)
+    window = getattr(pipeline, "window", None)
     canvas = tuple(getattr(pipeline, "canvas_ids", ()))
     answer_row = getattr(pipeline, "canvas_answer_row", 0)
+
+    def chunk_mode(specs):
+        """The attention path of one chunk.
+
+        A windowed model (Gemma) runs the two-call path when every
+        group's prefix, longest suffix and canvas fit in the window,
+        so the prefix call needs no window mask; otherwise the
+        unified path. The two-call path needs the LSE from the
+        wide-head kernel, which only FA4 returns.
+        """
+        if (fixed_mode != FILTER_ATTENTION or window is None
+                or len(canvas) > 1
+                or getattr(pipeline.engine, "wide_head_kernel", "fa4") != "fa4"):
+            return fixed_mode
+        for spec in specs:
+            longest = max((len(suf) for suf in spec["suffixes"]), default=0)
+            if spec["f"] + longest + len(canvas) > window:
+                return FILTER_ATTENTION
+        return "merge"
 
     if k == 0:
         return [], [], 0
@@ -620,7 +673,9 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         budget, arena.n_pages, arena.page_tokens,
         frame_tokens=[len(f) for f in frames], resident=resident,
         anchor_partners={a: partners_of(keys[a]) for a in range(len(keys))},
-        temporary_suffix_pages=mode == "unified",
+        # a windowed model may pack any chunk unified, so it reserves
+        # the unified path's temporary pages throughout
+        temporary_suffix_pages=fixed_mode == FILTER_ATTENTION,
         answer_dtype=async_ans.dtype,
         canvas_tokens=len(canvas),
         page_cost=arena.page_cost,
@@ -703,7 +758,8 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
                     prefix=prefixes[a] if carried else None,
                     f=f + len(frame),
                     suffixes=sufs))
-        return pack_chunk(torch, arena, specs, attention_mode=mode,
+        return pack_chunk(torch, arena, specs,
+                          attention_mode=chunk_mode(specs),
                           staging=staging, canvas=canvas,
                           answer_row=answer_row)
 
@@ -832,6 +888,10 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
     q_max = len(question)
     modes = ((FILTER_ATTENTION, JOIN_ATTENTION) if pipeline.is_fp8
              else (FILTER_ATTENTION,))
+    if (not pipeline.is_fp8 and getattr(pipeline, "window", None) is not None
+            and getattr(pipeline.engine, "wide_head_kernel", "") == "fa4"):
+        # a windowed model's joins run the bf16 two-call path
+        modes += ("merge",)
     for mode in modes:
         logger.debug("kernels: warming %s attention, full chunk", mode)
         run_filter(torch, arena, pipeline, async_ans, warm_docs,

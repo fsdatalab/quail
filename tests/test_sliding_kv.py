@@ -206,3 +206,44 @@ def test_pack_chunk_builds_both_pools(monkeypatch):
         arena.free_key(temp)
     arena.free_key(key)
     assert arena.free_pages == 64
+
+
+def test_pack_chunk_merge_mode_reads_both_pools(monkeypatch):
+    _cpu_staging(monkeypatch)
+    arena = cpu_arena(pages=64, sliding_pages=32)
+    key = ("d", 0)
+    doc = list(range(40))
+    canvas = (900,)
+    arena.activate(key, 40, capacity_tokens=60, base_tokens=40)
+    # the fresh pass writes the prefix into both pools and reads it
+    # back for the suffix rows through call B
+    chunk = loop.pack_chunk(
+        torch, arena, [dict(key=key, prefix=doc, f=40,
+                            suffixes=[[500, 501], [502]])],
+        attention_mode="merge", canvas=canvas)
+    meta = chunk.meta
+    assert meta["mode"] == "merge"
+    assert chunk.fresh_keys == (key,)
+    assert meta["unified"] is None
+    # prefix rows 0..39 land at the key's first rows in both pools
+    assert meta["kv_src"].tolist() == list(range(40))
+    assert meta["kv_dst"].tolist() == arena.capacity_rows(key)[:40].tolist()
+    assert meta["kv_dst_sliding"].tolist() == \
+        arena.capacity_rows_sliding(key)[:40].tolist()
+    # each suffix plus its canvas row is one causal segment in call A
+    assert meta["cu_a"].tolist() == [0, 40, 43, 45]
+    # the canvas row is the suffix's last row and the answer
+    assert chunk.final_indices.tolist() == [42, 44]
+    assert meta["canvas"]["rows"].tolist() == [42, 44]
+    cross = meta["cross"]
+    assert cross["rows"].tolist() == [40, 41, 42, 43, 44]
+    assert cross["cu_q"].tolist() == [0, 5]
+    assert cross["used"].tolist() == [40]
+    assert cross["sliding"]["used"].tolist() == [40]
+    assert cross["sliding"]["table"].shape[1] == len(
+        arena.owned_sliding_pages(key))
+    assert cross["source"].tolist() == [-1] * 40 + [0, 1, 2, 3, 4]
+    with pytest.raises(ValueError, match="one row"):
+        loop.pack_chunk(
+            torch, arena, [dict(key=key, prefix=None, f=40, suffixes=[[1]])],
+            attention_mode="merge", canvas=(900, 901))

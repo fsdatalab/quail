@@ -249,9 +249,16 @@ class DiffusionGemmaPipeline(ModelPipeline):
             q_weight=attn.q_norm.weight, k_weight=attn.k_norm.weight,
             eps=attn.q_norm.variance_epsilon, cos_sin_cache=rope.cos_sin_cache)
         v = self._norm(qkv[:, (H + KH) * D:].reshape(n, KH, D), attn.v_norm)
-        return self.engine.attention_unified(
-            q.view(n, H, D), k.view(n, KH, D), v, meta, softmax_scale=1.0,
-            window=self.window if attn.is_sliding else None)
+        return self._attend(attn, q.view(n, H, D), k.view(n, KH, D), v, meta)
+
+    def _attend(self, attn, q3, k3, v3, meta):
+        """One layer's attention on the chunk's path: two-call or unified."""
+        window = self.window if attn.is_sliding else None
+        if meta.get("mode") == "merge":
+            return self.engine.attention_merge(q3, k3, v3, meta,
+                                               softmax_scale=1.0, window=window)
+        return self.engine.attention_unified(q3, k3, v3, meta,
+                                             softmax_scale=1.0, window=window)
 
     # ---- the reference path (fused=False) ---------------------------
 
@@ -266,9 +273,7 @@ class DiffusionGemmaPipeline(ModelPipeline):
         q, k = self.engine.rope_inplace(positions, q, k, D, rope.cos_sin_cache,
                                         rope.is_neox_style)
         v = self._norm(v.reshape(n, KH, D), attn.v_norm)
-        out = self.engine.attention_unified(
-            q.view(n, H, D), k.view(n, KH, D), v, meta, softmax_scale=1.0,
-            window=self.window if attn.is_sliding else None)
+        out = self._attend(attn, q.view(n, H, D), k.view(n, KH, D), v, meta)
         out, _ = attn.o_proj(out)
         return out
 
