@@ -32,6 +32,7 @@ import hashlib
 import json
 import sys
 from pathlib import Path
+from statistics import median
 
 import matplotlib.pyplot as plt
 
@@ -210,13 +211,15 @@ def report_lines(rows, queries, relations, sol, manifest, suites, figures):
         "  is what stock vLLM gives, and it costs the baseline recall.",
         f"- Pipelined stock vLLM batches {', '.join(f'{b:,}' for b in batch_tokens)}"
         f" tokens and {', '.join(f'{s:,}' for s in sequences)} sequences, with",
-        "  prefix caching. Quail's chunk budget is 65,536 tokens.",
-        f"- Quail is faster on {faster} of {len(queries)} queries. The median",
-        f"  speedup is {sorted(speedups.values())[len(queries) // 2]:.2f}x and the",
-        f"  maximum is {speedups[fastest]:.2f}x on {fastest}. Speedup is",
-        "  pipelined stock vLLM time divided by Quail time. Query time excludes",
-        "  startup and result collection. GPU cost is query seconds / 3,600",
-        "  times $3.9492.",
+        "  prefix caching. vLLM caps this model at 8 sequences per step because",
+        "  its diffusion sampler holds a [sequences, canvas rows, vocabulary]",
+        "  float32 tensor. Quail's chunk budget is 65,536 tokens.",
+        f"- Quail is faster on {faster} of {len(queries)} queries.",
+        f"  The median speedup is {median(speedups.values()):.2f}x and the maximum",
+        f"  is {speedups[fastest]:.2f}x on {fastest}.",
+        "  Speedup is pipelined stock vLLM time divided by Quail time.",
+        "  Query time excludes startup and result collection.",
+        "  GPU cost is query seconds / 3,600 times $3.9492.",
         "- SoL means speed of light: ideal GPU time from arithmetic and memory",
         "  traffic at the hardware's peak rates, with ideal batching, unlimited",
         "  retained KV, every distinct prompt prefix computed once, one canvas",
