@@ -159,11 +159,16 @@ class DiffusionGemmaPipeline(ModelPipeline):
         return scale
 
     def forward_chunk(self, chunk):
+        hidden = self.backbone_rows(chunk)
+        return self._norm(hidden.index_select(0, chunk.final_indices),
+                          self.final_norm)
+
+    def backbone_rows(self, chunk):
+        """Every row's hidden state after the last layer, before the final norm."""
         from vllm.forward_context import set_forward_context
 
         meta = chunk.meta
         meta["layer"] = 0
-        positions = chunk.positions
         n = chunk.input_ids.shape[0]
         hidden = self.embed(chunk.input_ids) * self.normalizer
         canvas = meta.get("canvas")
@@ -174,9 +179,7 @@ class DiffusionGemmaPipeline(ModelPipeline):
         # the fused MoE kernels look their layer up in the forward
         # context
         with set_forward_context(None, self.vllm_config, num_tokens=n):
-            hidden = self._layers(hidden, positions, meta)
-        return self._norm(hidden.index_select(0, chunk.final_indices),
-                          self.final_norm)
+            return self._layers(hidden, chunk.positions, meta)
 
     # ---- the layer stack --------------------------------------------
     # vLLM's layer arithmetic with the residual adds, the norms
