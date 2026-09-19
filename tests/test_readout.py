@@ -64,10 +64,10 @@ def test_run_join_evicts_then_halves_a_chunk_that_does_not_fit(monkeypatch):
                         lambda need: evictions.append(need) or ())
     pipeline = fake_pipeline(forward_chunk=lambda chunk: [1] * len(chunk.specs))
     answers = SimpleNamespace(submit=lambda v: v, result=lambda v: v, dtype=None)
-    result, _, _ = loop.run_join(fake_torch(), arena, pipeline, answers,
+    answers_out, _, _ = loop.run_join(fake_torch(), arena, pipeline, answers,
                                  [[1] * 8, [2] * 8], [[[3, 4]]], 64,
                                  anchor_keys=[("a", 0), ("a", 1)])
     # nothing retained to evict, so the two-group chunk ran as two chunks
     assert failed == [2] and len(evictions) == 1 and evictions[0] > 0
     assert sizes == [1, 1]
-    assert len(result) == 2
+    assert answers_out == [{0: [1], 1: [1]}]

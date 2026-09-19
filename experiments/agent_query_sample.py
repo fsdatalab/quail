@@ -23,12 +23,9 @@ from pathlib import Path
 
 import modal
 
+from quail.bench.images import cpu_image, gpu_image
 from quail.specs import H100_USD_PER_HOUR
 
-# the uv the images sync with; pyproject.toml requires this version
-UV_VERSION = "0.12.13"
-
-IMAGE_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
 SAMPLE_SIZE = 200
 SCALE_FACTOR = 0.1
 DATA_DIR = "/results/quailb_data"
@@ -74,41 +71,11 @@ MODELS = {
     },
 }
 
-image = (
-    modal.Image.from_registry(IMAGE_BASE, add_python="3.12")
-    .entrypoint([])
-    .apt_install("git")
-    # quail's pinned dependencies and the dev group (quail-b among
-    # them) from uv.lock; the quail source is mounted after
-    .uv_sync(groups=["dev"], uv_version=UV_VERSION)
-    .env({
-        "VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
-        "VLLM_LOGGING_LEVEL": "WARNING",
-        "VLLM_USE_FLASHINFER_SAMPLER": "0",
-        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-        "QUAIL_CACHE_DIR": "/root/.cache/kernels",
-        "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
-        "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
-        "TRITON_CACHE_DIR": "/root/.cache/kernels/triton",
-    })
-    .add_local_python_source("quail")
-)
+image = gpu_image()
 
-data_image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .apt_install("git")
-    .uv_sync(groups=["dev"], uv_version=UV_VERSION,
-             extra_options="--no-install-package vllm")
-    .add_local_python_source("quail")
-)
+data_image = cpu_image()
 
-finalize_image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .apt_install("git")
-    .uv_sync(groups=["dev"], uv_version=UV_VERSION,
-             extra_options="--no-install-package vllm")
-    .add_local_python_source("quail")
-)
+finalize_image = cpu_image()
 
 app = modal.App("quail-milestone1")
 hf_cache = modal.Volume.from_name("quail-hf-cache", create_if_missing=True)

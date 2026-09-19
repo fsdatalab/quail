@@ -38,6 +38,7 @@ from pathlib import Path
 import modal
 import pyarrow as pa
 
+from quail.bench.images import cpu_image, gpu_image
 from quail_b import data
 from quail_b.data import GROUND_TRUTH_ROOT, PUBLIC_BUCKET
 from quail_b.predicates import (
@@ -59,9 +60,6 @@ from quail_b.predicates import (
 )
 from quail_b.predicates import label_set_identity as _label_set_identity
 from quail_b.rendering import PROMPT_FORMAT
-
-# the uv the images sync with; pyproject.toml requires this version
-UV_VERSION = "0.12.13"
 
 SCALE_FACTOR = 0.1
 SUPPORTED_SCALE_FACTORS = (0.1, 0.5, 1.0)
@@ -1448,34 +1446,10 @@ def publish(root: Path, collection_ids: list[str],
 hf_cache = modal.Volume.from_name("quail-hf-cache", create_if_missing=True)
 kernel_cache = modal.Volume.from_name("quail-kernel-cache", create_if_missing=True)
 results_vol = modal.Volume.from_name("quail-results", create_if_missing=True)
-image = (
-    modal.Image.from_registry(
-        "nvidia/cuda:13.0.1-devel-ubuntu24.04", add_python="3.12")
-    .entrypoint([])
-    .apt_install("git")
-    # quail's pinned dependencies and the dev group (quail-b among
-    # them) from uv.lock; the quail source is mounted after
-    .uv_sync(groups=["dev"], uv_version=UV_VERSION)
-    .env({
-        "QUAIL_CACHE_DIR": "/root/.cache/kernels",
-        "VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
-        "VLLM_LOGGING_LEVEL": "WARNING",
-        "VLLM_USE_FLASHINFER_SAMPLER": "0",
-        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-        "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
-        "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
-        "TRITON_CACHE_DIR": "/root/.cache/kernels/triton",
-        "TORCHINDUCTOR_CACHE_DIR": "/root/.cache/kernels/torchinductor",
-    })
-    .add_local_python_source("quail")
-)
-publish_image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .apt_install("git")
-    # the dev group carries boto3 for the upload; no GPU stack here
-    .uv_sync(groups=["dev"], uv_version=UV_VERSION,
-             extra_options="--no-install-package vllm")
-    .add_local_python_source("quail"))
+image = gpu_image()
+# the dev group carries boto3 for the upload; no GPU stack here
+publish_image = cpu_image()
+
 
 
 def _aws_credentials() -> dict[str, str]:

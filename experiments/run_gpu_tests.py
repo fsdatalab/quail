@@ -7,31 +7,9 @@ Prints pytest's output and fails when a test fails.
 
 import modal
 
-# the uv the images sync with; pyproject.toml requires this version
-UV_VERSION = "0.12.13"
+from quail.bench.images import gpu_image
 
-image = (
-    modal.Image.from_registry(
-        "nvidia/cuda:13.0.1-devel-ubuntu24.04", add_python="3.12")
-    .entrypoint([])
-    .apt_install("git")
-    # quail's pinned dependencies and the dev group (pytest among
-    # them) from uv.lock; the quail source and the tests are mounted
-    .uv_sync(groups=["dev"], uv_version=UV_VERSION)
-    .env({
-        "VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
-        "VLLM_LOGGING_LEVEL": "WARNING",
-        "VLLM_USE_FLASHINFER_SAMPLER": "0",
-        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-        "HF_HUB_ENABLE_HF_TRANSFER": "1",
-        "QUAIL_CACHE_DIR": "/root/.cache/kernels",
-        "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
-        "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
-        "TRITON_CACHE_DIR": "/root/.cache/kernels/triton",
-    })
-    .add_local_python_source("quail")
-    .add_local_dir("tests/gpu", remote_path="/root/tests/gpu")
-)
+image = gpu_image(("tests/gpu", "/root/tests/gpu"))
 
 app = modal.App("quail-milestone1")
 volumes = {

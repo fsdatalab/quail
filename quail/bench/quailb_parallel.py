@@ -20,42 +20,11 @@ from pathlib import Path
 
 import modal
 
+from quail.bench.images import gpu_image, sglang_image
 from quail.bench.results import combine_measurements, write_json
 
-# the uv the images sync with; pyproject.toml requires this version
-UV_VERSION = "0.12.13"
-
-base_image = (
-    modal.Image.from_registry(
-        "nvidia/cuda:13.0.1-devel-ubuntu24.04", add_python="3.12")
-    .entrypoint([])
-    .apt_install("git")
-    # quail-b installs from git at the pinned commit, with its plan files
-    # and its own dependencies
-    .env({
-        "QUAIL_CACHE_DIR": "/root/.cache/kernels",
-        "VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
-        "VLLM_LOGGING_LEVEL": "WARNING",
-        "VLLM_USE_FLASHINFER_SAMPLER": "0",
-        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-        "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
-        "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
-        "TRITON_CACHE_DIR": "/root/.cache/kernels/triton",
-        "TORCHINDUCTOR_CACHE_DIR": "/root/.cache/kernels/torchinductor",
-    })
-)
-# local sources go last: Modal refuses a build step after them
-# quail's pinned dependencies and the dev group (quail-b among them)
-# from uv.lock; the SGLang image leaves vLLM out and brings its own
-# serving stack
-image = (base_image.uv_sync(groups=["dev"], uv_version=UV_VERSION)
-         .add_local_python_source("quail"))
-sglang_image = (
-    base_image
-    .uv_sync(groups=["dev"], uv_version=UV_VERSION,
-             extra_options="--no-install-package vllm")
-    .uv_pip_install("sglang==0.5.18")
-    .add_local_python_source("quail"))
+image = gpu_image()
+sglang_gpu_image = sglang_image()
 
 app = modal.App("quail-milestone1")
 hf_cache = modal.Volume.from_name("quail-hf-cache", create_if_missing=True)
@@ -192,7 +161,7 @@ def run_query_family(
 
 
 @app.function(
-    image=sglang_image,
+    image=sglang_gpu_image,
     gpu="H100!",
     memory=98304,
     timeout=36000,

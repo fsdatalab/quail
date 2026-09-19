@@ -54,31 +54,9 @@ import time
 
 import modal
 
-# the uv the images sync with; pyproject.toml requires this version
-UV_VERSION = "0.12.13"
+from quail.bench.images import gpu_image
 
-IMAGE_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
-
-image = (
-    modal.Image.from_registry(IMAGE_BASE, add_python="3.12")
-    .entrypoint([])
-    .apt_install("git")
-    # quail's pinned dependencies and the dev group (quail-b among
-    # them) from uv.lock; the quail source is mounted after
-    .uv_sync(groups=["dev"], uv_version=UV_VERSION)
-    .env({"VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
-          "VLLM_LOGGING_LEVEL": "WARNING",
-          "VLLM_USE_FLASHINFER_SAMPLER": "0",
-          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-          "HF_HUB_ENABLE_HF_TRANSFER": "1",
-          "QUAIL_CACHE_DIR": "/root/.cache/kernels",
-          "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
-          "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
-          "TRITON_CACHE_DIR": "/root/.cache/kernels/triton",
-          "TORCHINDUCTOR_CACHE_DIR":
-              "/root/.cache/kernels/torchinductor"})
-    .add_local_python_source("quail")
-)
+image = gpu_image()
 
 # House rule: never create new Modal app names - new GPU cells attach
 # to an existing app.
