@@ -654,10 +654,44 @@ class Engine:
             tl.store(v_out_ptr + t * stride_vo + kb_offs,
                      (vb * rstd[:, None]).to(v_out_ptr.dtype.element_ty))
 
+        # the LSE merge with the per-row fp8 quantization the output
+        # projection would run on its input; one program per row
+        @triton.jit
+        def merge_attn_rowquant(a_ptr, b_ptr, la_ptr, lb_ptr, source_ptr,
+                                q_ptr, s_ptr, stride_a_t, stride_b_t,
+                                stride_la_t, stride_la_h, stride_lb_t,
+                                stride_lb_h, stride_q_t, D: tl.constexpr,
+                                WIDTH: tl.constexpr):
+            t = tl.program_id(0)
+            offs = tl.arange(0, WIDTH)
+            heads = offs // D
+            a = tl.load(a_ptr + t * stride_a_t + offs).to(tl.float32)
+            source = tl.load(source_ptr + t)
+            has_b = source >= 0
+            source_safe = tl.maximum(source, 0)
+            b = tl.load(b_ptr + source_safe * stride_b_t + offs,
+                        mask=has_b, other=0.0).to(tl.float32)
+            la = tl.load(la_ptr + t * stride_la_t + heads * stride_la_h,
+                         mask=has_b, other=0.0)
+            lb = tl.load(lb_ptr + source_safe * stride_lb_t
+                         + heads * stride_lb_h, mask=has_b, other=0.0)
+            w = tl.sigmoid(lb - la)
+            merged = a + (b - a) * w
+            y = tl.where(has_b, merged, a)
+            # the unfused path rounds the attention output to bf16 first
+            y = y.to(tl.bfloat16).to(tl.float32)
+            amax = tl.max(tl.abs(y), axis=0)
+            scale = tl.maximum(amax / 448.0, 1.0 / (448.0 * 512.0))
+            q = tl.minimum(tl.maximum(y / scale, -448.0), 448.0)
+            tl.store(q_ptr + t * stride_q_t + offs,
+                     q.to(q_ptr.dtype.element_ty))
+            tl.store(s_ptr + t, scale)
+
         self._kernels = {"silu": silu_mul_quant,
                          "norm": add_rms_norm_quant,
                          "qk": qk_norm_rope,
                          "qkv": qkv_norm_rope,
+                         "merge_rowquant": merge_attn_rowquant,
                          "gelu_quant": gelu_mul_quant,
                          "scale_norm_quant": scale_add_rms_norm_quant,
                          "norm2": rms_norm2,
@@ -923,9 +957,28 @@ class Engine:
             out.stride(0), D=dim, GPB=gpb)
         return out
 
+    def merge_attn_rowquant(self, out_a, lse_a, out_b, lse_b, source):
+        """Merge cached and fresh attention into per-row fp8 rows and scales."""
+        n, heads, dim = out_a.shape
+        torch = self.torch
+        q = torch.empty((n, heads * dim), dtype=torch.float8_e4m3fn,
+                        device=out_a.device)
+        scales = torch.empty((n, 1), dtype=torch.float32, device=out_a.device)
+        assert out_a.is_contiguous() and out_b.is_contiguous()
+        self._triton_kernels()["merge_rowquant"][(n,)](
+            out_a, out_b, lse_a, lse_b, source, q, scales,
+            out_a.stride(0), out_b.stride(0),
+            lse_a.stride(0), lse_a.stride(1),
+            lse_b.stride(0), lse_b.stride(1),
+            q.stride(0), D=dim, WIDTH=heads * dim, num_warps=8)
+        return q, scales
+
     def attention_merge(self, q3, k3, v3, meta, *, softmax_scale=None,
-                        window=None):
+                        window=None, quant=False):
         """The two-call attention path returning bf16 rows.
+
+        With quant, returns the merged rows quantized to fp8 with
+        per-row scales, the input pair for fp8_linear.
 
         Call A is causal over the chunk's own rows, with the window
         when given. Call B reads each group's resident prefix once for
@@ -954,6 +1007,10 @@ class Engine:
         cross = meta["cross"]
         if cross is None:
             meta["layer"] += 1
+            if quant:
+                from vllm import _custom_ops as ops
+                return ops.scaled_fp8_quant(out_a.view(n, H * D),
+                                            use_per_token_if_dynamic=True)
             return out_a.view(n, H * D)
         pool = cross
         if is_sliding and cross.get("sliding") is not None:
@@ -965,8 +1022,9 @@ class Engine:
             pool["max_used"], causal=False, block_table=pool["table"],
             seqused_k=pool["used"], softmax_scale=softmax_scale,
             version=version)
-        out = self.merge_attn(out_a, lse_a.transpose(0, 1), out_b,
-                              lse_b.transpose(0, 1), cross["source"])
+        merge = self.merge_attn_rowquant if quant else self.merge_attn
+        out = merge(out_a, lse_a.transpose(0, 1), out_b,
+                    lse_b.transpose(0, 1), cross["source"])
         meta["layer"] += 1
         return out
 

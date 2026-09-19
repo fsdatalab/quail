@@ -215,7 +215,6 @@ class DiffusionGemmaPipeline(ModelPipeline):
             attn = layer.self_attn
             qkv = engine.fp8_linear(attn.qkv_proj, x_q, x_s)
             out = self._attention_fused(attn, qkv, positions, meta)
-            out, _ = attn.o_proj(out)
             out = self._norm(out, layer.post_attention_layernorm)
             # residual becomes the attention sum; the feedforward reads
             # its norm
@@ -263,8 +262,15 @@ class DiffusionGemmaPipeline(ModelPipeline):
             qkv, positions, n_q=H, n_kv=KH, head_dim=D,
             q_weight=attn.q_norm.weight, k_weight=attn.k_norm.weight,
             eps=attn.q_norm.variance_epsilon, cos_sin_cache=rope.cos_sin_cache)
-        return self._attend(attn, q.view(n, H, D), k.view(n, KH, D),
-                            v.view(n, KH, D), meta)
+        q3, k3, v3 = q.view(n, H, D), k.view(n, KH, D), v.view(n, KH, D)
+        if meta.get("mode") == "merge":
+            # the merge kernel writes o_proj's fp8 input
+            q_o, s_o = self.engine.attention_merge(
+                q3, k3, v3, meta, softmax_scale=1.0,
+                window=self.window if attn.is_sliding else None, quant=True)
+            return self.engine.fp8_linear(attn.o_proj, q_o, s_o)
+        out, _ = attn.o_proj(self._attend(attn, q3, k3, v3, meta))
+        return out
 
     def _attend(self, attn, q3, k3, v3, meta):
         """One layer's attention on the chunk's path: two-call or unified."""
