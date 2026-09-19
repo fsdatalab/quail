@@ -16,6 +16,7 @@ import quail
 from quail.backends.quail import QuailModelExecution
 from quail.backends.quail.executor import loop
 from quail.backends.quail.executor.arena import KVArena, PageArena
+from quail.backends.quail.executor.models.base import ModelPipeline
 from quail.backends.quail.graph import execute_single_graph
 from quail.builtins import built_in_registry
 from quail.physical import (
@@ -55,6 +56,14 @@ def bare_arena(arena, pages):
     arena._refresh_rows = lambda *args: None
     arena.reset_stats()
     return arena
+
+
+def fake_pipeline(**attributes):
+    """A ModelPipeline with the contract's defaults and the given overrides."""
+    pipeline = ModelPipeline()
+    for name, value in attributes.items():
+        setattr(pipeline, name, value)
+    return pipeline
 
 
 def cpu_arena(pages):
@@ -119,7 +128,8 @@ def fake_pack(torch, arena, specs, **kw):
         (len(spec["prefix"]) if spec["prefix"] is not None else 0)
         + sum(len(suffix) for suffix in spec["suffixes"])
         for spec in specs)
-    return SimpleNamespace(specs=specs, tokens=tokens, temporary_keys=())
+    return SimpleNamespace(specs=specs, tokens=tokens, temporary_keys=(),
+                           fresh_keys=())
 
 
 def expected_filter_rows(filter_truth):
@@ -137,7 +147,7 @@ def run_streamed(monkeypatch, *, doc_lengths, filter_truth, partner_lengths,
     """Drive a filter chain streamed into a join on a CPU arena."""
     monkeypatch.setattr(loop, "pack_chunk", fake_pack)
     model = FakeModel(filter_truth, join_truth)
-    pipeline = SimpleNamespace(is_fp8=True, forward_chunk=model.forward_chunk)
+    pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
     answers = SimpleNamespace(submit=lambda v: v, result=lambda v: v,
                               dtype=None)
     arena = cpu_arena(pages)
@@ -263,7 +273,7 @@ def run_graph_on_arena(monkeypatch, graph, *, n_docs=14, n_partners=4,
     model = FakeModel(filter_truth, join_truth)
     torch = fake_torch()
     arena = cpu_arena(pages)
-    pipeline = SimpleNamespace(is_fp8=True, forward_chunk=model.forward_chunk)
+    pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
     execution = QuailModelExecution(SimpleNamespace())
     execution.bind_loaded_model(model=object(), arena=arena,
                                 pipeline=pipeline)

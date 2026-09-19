@@ -171,19 +171,13 @@ def run_query_family(
     include_baselines: bool,
     include_quail: bool = True,
     include_dumb_vllm: bool = False,
-    join_attention: str = "",
     baselines: str = "stock_vllm,pipelined_vllm",
 ) -> str:
     """Run one query family through Quail and the vLLM baselines.
 
-    join_attention forces the join's attention path ("unified") for
-    measuring the two-call path's gain; empty keeps the default.
     baselines names the vLLM baseline methods that run when
     include_baselines is set.
     """
-    import os
-    if join_attention:
-        os.environ["QUAIL_JOIN_ATTENTION"] = join_attention
     process_groups = [("quail",)] if include_quail else []
     if include_baselines:
         process_groups.append(tuple(_methods(baselines)))
@@ -270,7 +264,6 @@ def run_all(
     include_sglang: bool = True,
     include_quail: bool = True,
     include_dumb_vllm: bool = False,
-    join_attention: str = "",
     baselines: str = "stock_vllm,pipelined_vllm",
 ):
     from quail_b import select_queries
@@ -321,7 +314,6 @@ def run_all(
                     include_baselines=include_baselines,
                     include_quail=include_quail,
                     include_dumb_vllm=include_dumb_vllm,
-                    join_attention=join_attention,
                     baselines=baselines,
                 )
                 family_calls.append((family, family_call))
@@ -472,7 +464,6 @@ def main(
     include_sglang: bool = True,
     include_quail: bool = True,
     include_dumb_vllm: bool = False,
-    join_attention: str = "",
     baselines: str = "stock_vllm,pipelined_vllm",
     finish: str = "",
 ):
@@ -498,7 +489,6 @@ def main(
         include_sglang=include_sglang,
         include_quail=include_quail,
         include_dumb_vllm=include_dumb_vllm,
-        join_attention=join_attention,
         baselines=baselines,
     )
     print(f"function call id: {call.object_id} (all families)", flush=True)

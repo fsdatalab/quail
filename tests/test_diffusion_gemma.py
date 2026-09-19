@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from fakes import cpu_arena, fake_torch
+from fakes import cpu_arena, fake_pipeline, fake_torch
 
 from quail.backends.quail.backend import QuailBackend
 from quail.backends.quail.executor import loop
@@ -132,8 +132,7 @@ def test_join_admission_charges_canvas_rows():
 
 
 def test_filter_stream_charges_canvas_rows():
-    pipeline = SimpleNamespace(is_fp8=False, canvas_ids=(1, 2, 3),
-                               forward_chunk=None)
+    pipeline = fake_pipeline(canvas_ids=(1, 2, 3))
     answers = SimpleNamespace(submit=lambda v: v, result=lambda v: v, dtype=None)
     docs = [[5] * 20, [6] * 30]
     questions = [[40, 41, 42], [40, 41, 43, 44]]
@@ -145,8 +144,7 @@ def test_filter_stream_charges_canvas_rows():
     assert stream.capacity_extra == 2 + 2 + 3
     assert stream.canvas == (1, 2, 3)
 
-    paged = SimpleNamespace(is_fp8=False, canvas_ids=(), needs_pages=True,
-                            forward_chunk=None)
+    paged = fake_pipeline(needs_pages=True)
     stream = loop.FilterStream(
         fake_torch(), cpu_arena(64), paged, answers, docs[:1], questions[:1],
         200, arena_writes=False, arena_keys=[("d", 0)])
@@ -335,6 +333,18 @@ class _Engine:
         return x * weight1, x * weight2
 
 
+def _spec_for(model, **overrides):
+    """A spec fake whose geometry matches the fake model's."""
+    attn = model.model.layers[0].self_attn
+    fields = dict(vocab=50, canvas_tokens=3, canvas_answer_row=1,
+                  sliding_window=model.model.config.sliding_window,
+                  n_q=attn.num_heads, n_kv=attn.num_kv_heads,
+                  head_dim=attn.head_dim, d_head=attn.head_dim,
+                  widest_projection=32)
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
 def _fake_model(torch, hidden=4, layer_scalar=0.5):
     layers = [_Layer(torch, hidden, sliding=True, moe=True,
                      layer_scalar=layer_scalar),
@@ -376,7 +386,7 @@ def test_pipeline_runs_the_gemma4_layer_order(monkeypatch):
                         types.ModuleType("vllm.v1.worker"))
     monkeypatch.setitem(sys.modules, "vllm.v1.worker.workspace", workspace)
 
-    spec = SimpleNamespace(vocab=50, canvas_tokens=3, canvas_answer_row=1)
+    spec = _spec_for(_fake_model(torch), canvas_tokens=3, canvas_answer_row=1)
     pipeline = DiffusionGemmaPipeline(_fake_model(torch), None, spec=spec,
                                       engine_class=_Engine)
     assert len(pipeline.canvas_ids) == 3
@@ -384,10 +394,14 @@ def test_pipeline_runs_the_gemma4_layer_order(monkeypatch):
     with pytest.raises(ValueError, match="canvas_answer_row"):
         DiffusionGemmaPipeline(
             _fake_model(torch), None, engine_class=_Engine,
-            spec=SimpleNamespace(vocab=50, canvas_tokens=3,
-                                 canvas_answer_row=3))
+            spec=_spec_for(_fake_model(torch), canvas_tokens=3,
+                           canvas_answer_row=3))
+    with pytest.raises(ValueError, match="geometry"):
+        DiffusionGemmaPipeline(
+            _fake_model(torch), None, engine_class=_Engine,
+            spec=_spec_for(_fake_model(torch), sliding_window=512))
     assert seen["workspace"] == "cuda"
-    assert not pipeline.is_fp8
+    assert pipeline.join_attention == "unified" and not pipeline.gemm_warmup
     assert pipeline.max_chunk_tokens == (2**31 - 1) // 32
 
     rows = torch.tensor([3, 4, 5])
@@ -433,8 +447,8 @@ def _vllm_stubs(monkeypatch):
 def test_layer_scalars_fold_into_the_post_feedforward_norms(monkeypatch):
     torch = pytest.importorskip("torch")
     _vllm_stubs(monkeypatch)
-    spec = SimpleNamespace(vocab=50, canvas_tokens=3, canvas_answer_row=1)
     model = _fake_model(torch, layer_scalar=0.5)
+    spec = _spec_for(model)
     DiffusionGemmaPipeline(model, None, spec=spec, engine_class=_Engine)
     for layer in model.model.layers:
         assert layer.post_feedforward_layernorm.weight.item() == 0.5

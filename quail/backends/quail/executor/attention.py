@@ -31,23 +31,11 @@ GROUP = 128            # fp8 quant group size, matches the engine
 # whose Hopper build takes heads up to 512, over arena pages.
 FA_MAX_HEAD_DIM = 256
 
-# Filters run "unified" (one causal paged attention call); joins run
-# "merge_quant" (two-call pattern with fused merge+quant kernel).
+# Filters run "unified" (one causal paged attention call); a join's
+# chunks run the path the model pipeline names, "merge_quant" (two
+# calls with the fused merge+quant kernel) for the fp8 Qwen3 models.
 FILTER_ATTENTION = "unified"
 JOIN_ATTENTION = "merge_quant"
-
-
-def join_attention_mode(is_fp8: bool) -> str:
-    """The path a join's chunks run.
-
-    merge_quant writes fp8 GEMM inputs, so bf16 weights run the
-    unified path instead. QUAIL_JOIN_ATTENTION=unified forces the
-    single-call path on any model.
-    """
-    import os
-    if os.environ.get("QUAIL_JOIN_ATTENTION") == FILTER_ATTENTION:
-        return FILTER_ATTENTION
-    return JOIN_ATTENTION if is_fp8 else FILTER_ATTENTION
 
 
 @dataclass
@@ -835,6 +823,12 @@ class Engine:
         meta["layer"] += 1
         return q_out, scales
 
+    def _pool(self, layer, tables):
+        """The block tables a layer reads: the sliding pool's on a sliding layer."""
+        if tables is None or layer not in self.arena.sliding_layers:
+            return tables
+        return tables.get("sliding") or tables
+
     def attention_unified(self, q3, k3, v3, meta, *, softmax_scale=None,
                           window=None):
         """Write current KV to its cache slots, then one causal paged attention call.
@@ -870,15 +864,8 @@ class Engine:
             canvas = None
         behind = None if window is None else (window - 1, 0)
         around = None if window is None else (window - 1, window - 1)
-        # a sliding layer reads the sliding pool when the arena keeps one
-        sliding_layers = getattr(self.arena, "sliding_layers", ())
-        pool = (meta.get("unified_sliding")
-                if layer in sliding_layers else None)
-        if unified is not None and pool is None:
-            pool = unified
-        canvas_pool = (canvas.get("sliding") if canvas is not None
-                       and layer in sliding_layers
-                       and canvas.get("sliding") is not None else canvas)
+        pool = self._pool(layer, unified)
+        canvas_pool = self._pool(layer, canvas)
         if unified is None:
             if q3.shape[-1] > FA_MAX_HEAD_DIM:
                 raise ValueError(

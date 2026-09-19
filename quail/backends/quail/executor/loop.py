@@ -17,12 +17,14 @@ import numpy as np
 
 from quail.backends.quail.executor.attention import (
     FILTER_ATTENTION,
-    JOIN_ATTENTION,
     Chunk,
-    join_attention_mode,
 )
 from quail.backends.quail.executor.pack import FilterAdmission, JoinAdmission
 from quail.progress import Progress, logger, quiet
+
+
+class ArenaFullError(RuntimeError):
+    """A chunk's suffix pages do not fit the free KV arena."""
 
 
 def _tick(timing, key, t0):
@@ -362,7 +364,6 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     # row pairs: the attention pass scatters them with a single kernel
     # launch per layer (kv_row_scatter)
     unified = None
-    unified_sliding = None
     temporary_keys = []
     if attention_mode == "unified" and unified_groups:
         if len(unified_groups) != len(layout):
@@ -370,7 +371,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 "a unified chunk cannot mix paged and unpaged "
                 "groups: the one paged call covers every row or "
                 "none (the fast path packs whole chunks unpaged)")
-        sliding = getattr(arena, "has_sliding", False)
+        sliding = arena.has_sliding
         # one builder per pool: the every-token pool, and the
         # sliding pool that holds each key's rows from its window
         # origin on
@@ -427,7 +428,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                     if got is None:
                         sliding_free = (arena.sliding.free_pages
                                         if sliding else None)
-                        raise RuntimeError(
+                        raise ArenaFullError(
                             "unified suffix pages exceed the free KV arena; "
                             f"split the chunk (asked {remainders[0] + suffix_tokens}"
                             f" rows; free pages {arena.accounting.free_pages}"
@@ -461,7 +462,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 cu_q=stage("unified_cu_q", cu_q, torch.int32),
                 max_q=max(b - a for a, b in zip(cu_q, cu_q[1:])))
             if sliding:
-                unified_sliding = built[1]
+                unified["sliding"] = built[1]
         except Exception:
             for key in temporary_keys:
                 arena.free_key(key)
@@ -505,15 +506,14 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             canvas_meta["used"] = unified["used"].index_select(0, seq)
             canvas_meta["max_used"] = max(
                 pools[0].lengths[i] for i in canvas_seq)
-            if unified_sliding is not None:
+            if "sliding" in unified:
                 canvas_meta["sliding"] = dict(
-                    table=unified_sliding["table"].index_select(0, seq),
-                    used=unified_sliding["used"].index_select(0, seq),
+                    table=unified["sliding"]["table"].index_select(0, seq),
+                    used=unified["sliding"]["used"].index_select(0, seq),
                     max_used=max(pools[1].lengths[i] for i in canvas_seq))
     meta = dict(
-        layer=0, mode=attention_mode, kv_src=kv_src, kv_dst=kv_dst,
-        cross=cross,
-        unified=unified, unified_sliding=unified_sliding, canvas=canvas_meta,
+        layer=0, kv_src=kv_src, kv_dst=kv_dst, cross=cross,
+        unified=unified, canvas=canvas_meta,
         cu_a=stage("cu_a", cu_a, torch.int32),
         max_a=max(cu_a[i + 1] - cu_a[i] for i in range(len(cu_a) - 1)))
     out = Chunk(
@@ -607,9 +607,9 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     if len(keys) != len(prefixes):
         raise ValueError("anchor_keys must match anchor_prefixes")
     frames = stage_frames or [[] for _ in range(k)]
-    fixed_mode = join_attention_mode(pipeline.is_fp8)
-    canvas = tuple(getattr(pipeline, "canvas_ids", ()))
-    answer_row = getattr(pipeline, "canvas_answer_row", 0)
+    mode = pipeline.join_attention
+    canvas = tuple(pipeline.canvas_ids)
+    answer_row = pipeline.canvas_answer_row
 
     def entry_rows(a, j, start, end, carried):
         f = len(prefixes[a])
@@ -643,7 +643,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         anchor_partners={a: partners_of(keys[a]) for a in range(len(keys))},
         # a windowed model may pack any chunk unified, so it reserves
         # the unified path's temporary pages throughout
-        temporary_suffix_pages=fixed_mode == FILTER_ATTENTION,
+        temporary_suffix_pages=mode == FILTER_ATTENTION,
         answer_dtype=async_ans.dtype,
         canvas_tokens=len(canvas),
         page_cost=arena.page_cost,
@@ -696,7 +696,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
                 break
         return moved
 
-    def build(chunk_groups, mode):
+    def build(chunk_groups):
         specs = []
         for a, j, start, end, carried in chunk_groups:
             key = keys[a]
@@ -760,7 +760,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
             progress.done + sum(end - start for _, _, start, end, _ in groups)
             if scoring else finished[0])
 
-    def run_part(part, mode):
+    def run_part(part):
         """Run one chunk of groups, halving it when its pages do not fit.
 
         The admission prices a chunk's temporary suffix pages, but the
@@ -769,35 +769,33 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         out. Halving costs only chunk efficiency.
         """
         try:
-            run_one(part, mode)
-        except RuntimeError as error:
-            if "free KV arena" not in str(error):
-                raise
+            run_one(part)
+        except ArenaFullError as error:
             # retained KV nothing here reads makes room first; it is
             # a cache
             need = arena.page_cost(sum(entry_rows(*e) for e in part))
             if arena.evict_retained(need):
                 logger.info("join chunk of %d groups retried after "
                             "evicting retained KV", len(part))
-                run_part(part, mode)
+                run_part(part)
                 return
             if len(part) < 2:
                 raise
             logger.info("join chunk of %d groups split: %s", len(part), error)
             half = len(part) // 2
-            run_part(part[:half], mode)
-            run_part(part[half:], mode)
+            run_part(part[:half])
+            run_part(part[half:])
 
-    def run_one(part, mode):
+    def run_one(part):
         nonlocal tokens
-        chunk = build(part, mode)
+        chunk = build(part)
         tokens += chunk.tokens
         e0 = torch.cuda.Event(enable_timing=True)
         e1 = torch.cuda.Event(enable_timing=True)
         e0.record()
         normed = _forward(pipeline, arena, chunk)
         e1.record()
-        for key in getattr(chunk, "fresh_keys", ()):
+        for key in chunk.fresh_keys:
             arena.trim_window(key)
         spans.append((part[0][1], e0, e1))
         outstanding.append((part, async_ans.submit(normed)))
@@ -828,7 +826,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
                 if pull(evict_retained=True, force=True):
                     continue
             raise AssertionError("nothing buildable and nothing in flight")
-        run_part(groups, fixed_mode)
+        run_part(groups)
     while outstanding:
         report(outstanding.pop(0))
     progress.finish(f"{label} done", f"{tokens:,} fresh tokens")
@@ -888,8 +886,7 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
     """
     warm_docs, question, doc = _warm_inputs(budget)
     q_max = len(question)
-    modes = ((FILTER_ATTENTION, JOIN_ATTENTION) if pipeline.is_fp8
-             else (FILTER_ATTENTION,))
+    modes = dict.fromkeys((FILTER_ATTENTION, pipeline.join_attention))
     for mode in modes:
         logger.debug("kernels: warming %s attention, full chunk", mode)
         run_filter(torch, arena, pipeline, async_ans, warm_docs,
@@ -924,7 +921,7 @@ def compile_kernels(torch, arena, pipeline, async_ans, budget):
     config heuristic generator to enumerate every token count at
     which the chosen GEMM configuration changes.
     """
-    if not pipeline.is_fp8:
+    if not pipeline.gemm_warmup:
         _forward_warm(torch, arena, pipeline, async_ans, budget,
                       join_chunk=True)
         return
@@ -1103,12 +1100,11 @@ class FilterStream:
         retain = set() if retain_all else set(retain_survivors)
         if hold_survivors and (retain_all or retain):
             raise ValueError("held survivors are pinned, not retained")
-        canvas = tuple(getattr(pipeline, "canvas_ids", ()))
+        canvas = tuple(pipeline.canvas_ids)
         c = len(canvas)
         # a model whose attention reads paged KV only writes pages even
         # when the plan skipped them
-        arena_writes = arena_writes or bool(
-            getattr(pipeline, "needs_pages", False))
+        arena_writes = arena_writes or pipeline.needs_pages
         stage_tokens = [len(question_ids[0]) + c] \
             + [len(q) - p + c for q in question_ids[1:]]
         tails = [question_ids[0]] + [q[p:] for q in question_ids[1:]]
@@ -1144,7 +1140,7 @@ class FilterStream:
             kept_extra_tokens=capacity_extra, limit=limit,
             available_pages=(arena.free_pages
                              if arena_writes else None),
-            page_cost=getattr(arena, "page_cost", None))
+            page_cost=arena.page_cost)
         self.torch = torch
         self.arena = arena
         self.pipeline = pipeline
@@ -1161,7 +1157,7 @@ class FilterStream:
         self.capacity_extra = capacity_extra
         self.tails = tails
         self.canvas = canvas
-        self.answer_row = getattr(pipeline, "canvas_answer_row", 0)
+        self.answer_row = pipeline.canvas_answer_row
         self.spans = []
         self.tokens = 0
         self.chunks = 0

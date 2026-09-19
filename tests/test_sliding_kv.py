@@ -168,7 +168,8 @@ def test_pack_chunk_builds_both_pools(monkeypatch):
         torch, arena, [dict(key=key, prefix=doc, f=100, suffixes=[tail])],
         attention_mode="unified", canvas=canvas)
     assert chunk.fresh_keys == (key,)
-    full, sliding = chunk.meta["unified"], chunk.meta["unified_sliding"]
+    full = chunk.meta["unified"]
+    sliding = full["sliding"]
     assert full["src"].tolist() == list(range(104))
     assert sliding["src"].tolist() == list(range(104))
     assert full["used"].tolist() == [104] and sliding["used"].tolist() == [104]
@@ -180,7 +181,8 @@ def test_pack_chunk_builds_both_pools(monkeypatch):
         torch, arena, [dict(key=key, prefix=None, f=100, suffixes=[[600]])],
         attention_mode="unified", canvas=canvas)
     assert chunk.fresh_keys == ()
-    full, sliding = chunk.meta["unified"], chunk.meta["unified_sliding"]
+    full = chunk.meta["unified"]
+    sliding = full["sliding"]
     assert full["used"].tolist() == [103]
     assert sliding["used"].tolist() == [103 - 64]
     assert sliding["table"].shape[1] == 4
@@ -196,7 +198,8 @@ def test_pack_chunk_builds_both_pools(monkeypatch):
         torch, arena, [dict(key=key, prefix=None, f=100,
                             suffixes=[[600], [601, 602]])],
         attention_mode="unified")
-    full, sliding = chunk.meta["unified"], chunk.meta["unified_sliding"]
+    full = chunk.meta["unified"]
+    sliding = full["sliding"]
     assert len(chunk.temporary_keys) == 2
     assert full["used"].tolist() == [101, 102]
     assert sliding["used"].tolist() == [37, 38]

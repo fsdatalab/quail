@@ -22,18 +22,15 @@ the sampler's first step.
 The projections and expert kernels are the loaded vLLM modules,
 called as they are: the checkpoint's fp8 weights carry per-channel
 scales with per-token activation quantization, which vLLM's own
-linear path handles. The norms and rotary go straight to vLLM's CUDA
-kernels through the engine, since the modules' own dispatch runs the
-unfused PyTorch path on this build, ten times slower. Attention and
-packing are Quail's. The engine's fused Qwen3 kernels are not used,
-so the pipeline reports is_fp8 False and every chunk runs the unified
-attention path.
+linear path handles. The norms and rotary go through the engine's
+kernels. Attention and packing are Quail's.
 """
 
 import numpy as np
 
 from quail.backends.quail.executor.attention import Engine
 from quail.backends.quail.executor.models.base import ModelPipeline
+from quail.cost import budgets
 
 # The canvas starts as random token ids, as vLLM's sampler starts it;
 # one fixed draw serves every document so answers are reproducible.
@@ -74,17 +71,31 @@ class DiffusionGemmaPipeline(ModelPipeline):
     """
 
     needs_pages = True
+    # every chunk runs one causal call; the two-call join path writes
+    # the engine's fp8 GEMM inputs, which this model does not use
+    join_attention = "unified"
+    gemm_warmup = False
 
     def __init__(self, model, arena, *, spec, engine_class=Engine):
         backbone = model.model
+        self.spec = spec
         self.layers = backbone.layers
         self.embed = backbone.embed_tokens
         self.normalizer = backbone.normalizer
         self.final_norm = backbone.norm
         self.canvas_norm = model.self_conditioning.post_norm
         self.vllm_config = model.quail_vllm_config
-        self.window = backbone.config.sliding_window
+        self.window = spec.sliding_window
         attn = self.layers[0].self_attn
+        loaded = (backbone.config.sliding_window, attn.num_heads,
+                  attn.num_kv_heads, attn.head_dim)
+        expected = (spec.sliding_window, spec.n_q, spec.n_kv, spec.d_head)
+        if loaded != expected:
+            raise ValueError(
+                f"the loaded model's geometry (window, q heads, kv heads, "
+                f"head dim) {loaded} differs from the spec's {expected}")
+        # the engine's fp8 GEMM path is not used: the projections run
+        # vLLM's own fp8 linear modules
         self.engine = engine_class(
             arena, n_q=attn.num_heads, n_kv=attn.num_kv_heads,
             head_dim=attn.head_dim, rotary=attn.rotary_emb, fp8=False)
@@ -101,6 +112,7 @@ class DiffusionGemmaPipeline(ModelPipeline):
         if any(layer.self_attn.v_norm.has_weight for layer in self.layers):
             raise ValueError("the fused qkv kernel expects a weightless v norm")
         self._fold_layer_scalars(model)
+        self.scales = [float(layer.layer_scalar) for layer in self.layers]
         self.canvas_ids = canvas_token_ids(spec.vocab, spec.canvas_tokens)
         # an empty canvas reads the answer at the prompt's last row
         if spec.canvas_tokens and not (
@@ -111,20 +123,12 @@ class DiffusionGemmaPipeline(ModelPipeline):
         self.canvas_answer_row = (spec.canvas_answer_row
                                   if spec.canvas_tokens else 0)
         _init_moe_workspace()
-        # The engine's KV scatter kernel indexes rows in 32-bit ints.
-        # vLLM keeps these fp8 weights transposed, so take the wider
-        # side.
-        widest = max(max(layer.self_attn.qkv_proj.weight.shape)
-                     for layer in self.layers)
-        self.max_chunk_tokens = (2**31 - 1) // widest
-
-    def linears(self):
-        layer = self.layers[0]
-        return (layer.self_attn.qkv_proj, layer.self_attn.o_proj,
-                layer.mlp.gate_up_proj, layer.mlp.down_proj)
+        self.max_chunk_tokens = budgets.kernel_index_cap(spec)
 
     def _norm(self, x, module):
         """One of the model's RMS norms, through the engine's kernel."""
+        # the module's own forward dispatches to an unfused PyTorch
+        # path on this vLLM build, ten times slower than the kernel
         weight = module.weight if module.has_weight else self._ones_like(module, x)
         return self.engine.norm_rows(x, weight, module.variance_epsilon)
 
@@ -150,13 +154,6 @@ class DiffusionGemmaPipeline(ModelPipeline):
             layer.post_feedforward_layernorm.weight.data.mul_(
                 float(layer.layer_scalar))
         model.quail_scalars_folded = True
-
-    def _residual_scale(self, layer):
-        """The layer's output scalar as a float, read once."""
-        scale = getattr(layer, "quail_residual_scale", None)
-        if scale is None:
-            scale = layer.quail_residual_scale = float(layer.layer_scalar)
-        return scale
 
     def forward_chunk(self, chunk):
         hidden = self.backbone_rows(chunk)
@@ -230,7 +227,7 @@ class DiffusionGemmaPipeline(ModelPipeline):
                 dense = self._norm(dense, layer.post_feedforward_layernorm)
             # dense carries the layer scalar through its norm weight;
             # the residual takes it in the kernel that sums them
-            scale = self._residual_scale(layer)
+            scale = self.scales[index]
             if index == last:
                 return dense + residual * scale
             # residual becomes the layer's output; the next layer reads
