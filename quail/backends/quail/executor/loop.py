@@ -699,6 +699,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     # hundred rows is launch-bound over the layers
     deferred = []
     deferred_rows = [0]
+    deferred_pages = [0]     # document pages the deferred groups hold
 
     if k == 0:
         return [], [], 0
@@ -908,6 +909,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
                 run_part(deferred[:], FILTER_ATTENTION)
                 deferred.clear()
                 deferred_rows[0] = 0
+                deferred_pages[0] = 0
                 continue
             if anchor_source is not None and not anchor_source.done:
                 # the source has to move; it may evict retained KV to admit
@@ -924,13 +926,19 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
                                              base_tokens=f)
                         assert got is not None, \
                             "scheduler admitted an anchor the arena cannot hold"
+                        deferred_pages[0] += arena.held_cost(keys[a])
                     deferred.extend(part)
                     deferred_rows[0] += sum(entry_rows(*e) for e in part)
-                    if deferred_rows[0] < budget // 2:
+                    # the waiting groups are long documents, so their
+                    # pages bound the wait before their rows do: past
+                    # an eighth of the arena the chunk runs small
+                    if (deferred_rows[0] < budget // 2
+                            and deferred_pages[0] < arena.n_pages // 8):
                         continue
                     part = deferred[:]
                     deferred.clear()
                     deferred_rows[0] = 0
+                    deferred_pages[0] = 0
                     run_part(part, FILTER_ATTENTION)
                     continue
                 run_part(part, mode)
