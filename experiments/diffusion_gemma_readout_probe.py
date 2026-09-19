@@ -8,7 +8,7 @@ model on IMDB reviews with the F1 filter prompt, exactly as the
 benchmark does, and records for each review whether logprobs came
 back, how the TRUE and FALSE entries are decoded, what true_bit
 reads, and what Quail answered for the same review in the run named
-by --quail-run. Writes /results/ablations/diffusion_gemma_readout_probe.json.
+by --quail-run. Writes /results/ablations/diffusion_gemma_readout_probe_k<logprobs>.json.
 """
 
 import json
@@ -32,7 +32,9 @@ MODEL = "diffusion-gemma-26b-a4b-fp8"
 @app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
               volumes=volumes)
 def probe(prediction: str, n_docs: int = 256,
-          quail_run: str = "20260919T193405Z-7f4d1afc") -> str:
+          quail_run: str = "20260919T193405Z-7f4d1afc",
+          logprobs: int = 0) -> str:
+    """logprobs above 0 overrides the backend's top-k, to measure the ranks."""
     import os
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     from pathlib import Path
@@ -61,6 +63,9 @@ def probe(prediction: str, n_docs: int = 256,
                for b in bodies]
     state, boot = VLLMEngine().boot(spec, sorted(set(true_ids) | set(false_ids)))
     client, sampling = state["client"], state["sampling_params"]
+    if logprobs:
+        from vllm import SamplingParams
+        sampling = SamplingParams(max_tokens=1, logprobs=logprobs)
     outputs = client.generate(prompts, sampling, use_tqdm=False)
     quail_answers = {}
     table = Path(f"/results/benchmarks/quailb/{quail_run}/quail/imdb/IMDB-1/"
@@ -84,14 +89,17 @@ def probe(prediction: str, n_docs: int = 256,
             record["entries"] = None
         else:
             first = rows[0] or {}
-            entries = [(int(t), lp.logprob, getattr(lp, "decoded_token", None))
+            entries = [(int(t), lp.logprob, getattr(lp, "decoded_token", None),
+                        getattr(lp, "rank", None))
                        for t, lp in first.items()]
             answer_entries = [e for e in entries if e[0] in true_ids | false_ids]
             record["answer_entries"] = answer_entries
+            record["best_rank"] = min((e[3] for e in answer_entries
+                                       if e[3] is not None), default=None)
             record["ranked"] = _ranked_answer(rows)
             if answer_entries:
                 counts["answer_ids_in_top"] += 1
-                for _, _, decoded in answer_entries:
+                for _, _, decoded, _ in answer_entries:
                     form = repr(decoded)
                     decoded_forms[form] = decoded_forms.get(form, 0) + 1
             if record["ranked"] is None:
@@ -100,12 +108,16 @@ def probe(prediction: str, n_docs: int = 256,
             counts["compared"] += 1
             counts["same_as_quail"] += int(record["quail"] == bool(record["read"]))
         records.append(record)
+    ranks = sorted(r["best_rank"] for r in records if r.get("best_rank"))
+    covered = {k: sum(rank <= k for rank in ranks)
+               for k in (20, 50, 100, 200, 500, 1000, 2000, 5000)}
     report = {"prediction": prediction, "n_docs": n_docs, "boot": boot,
               "sampling": str(sampling), "capacity": state["capacity"],
               "counts": counts, "decoded_forms": decoded_forms,
+              "best_rank_covered_by_k": covered, "worst_rank": max(ranks, default=None),
               "true_ids": sorted(true_ids), "false_ids": sorted(false_ids),
               "records": records[:40]}
-    out = Path("/results/ablations/diffusion_gemma_readout_probe.json")
+    out = Path(f"/results/ablations/diffusion_gemma_readout_probe_k{logprobs}.json")
     out.write_text(json.dumps(report, indent=1, default=str))
     volumes["/results"].commit()
     print(json.dumps({k: v for k, v in report.items() if k != "records"},
@@ -115,9 +127,9 @@ def probe(prediction: str, n_docs: int = 256,
 
 
 @app.local_entrypoint()
-def main(prediction: str = "", docs: int = 256):
+def main(prediction: str = "", docs: int = 256, logprobs: int = 0):
     if not prediction:
         raise ValueError("pass --prediction before starting")
-    call = probe.spawn(prediction, docs)
+    call = probe.spawn(prediction, docs, logprobs=logprobs)
     print(f"function call id: {call.object_id} (readout probe)", flush=True)
     print(call.get(), flush=True)
