@@ -60,6 +60,7 @@ DIFFUSION_GEMMA_26B_FP8 = ModelSpec(
     canvas_tokens=1,
     turn_prefix="<bos><|turn>user\n",
     turn_suffix="<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+    prompt_format="gemma4-chat-nonthinking-v1",
     canvas_answer_row=0,
     attn_params_per_layer=(25 * SLIDING_ATTN + 5 * FULL_ATTN) // 30,
     mlp_active_params_per_layer=DENSE_MLP + 8 * EXPERT,

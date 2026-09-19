@@ -4,8 +4,12 @@ from quail.logical.nodes import CompileError, Prompt
 
 # Fixed preamble before every document. Must be a formatting label,
 # not an instruction; instruction text here biases short-document
-# completions.
-SHARED_PRE = "DOCUMENT:\n"
+# completions. The model's chat-turn text (ModelSpec.turn) wraps the
+# whole prompt: its opening piece goes before this preamble and its
+# closing piece after the answer cue, so the user message stays open
+# across the reusable document prefix.
+DOCUMENT_PRE = "DOCUMENT:\n"
+SHARED_PRE = DOCUMENT_PRE
 
 
 def true_false_ids(tok):
@@ -154,7 +158,7 @@ def split_frame(template: str) -> tuple[str, str]:
             f"contain a brace that is not a placeholder: {tail[:40]!r}")
     frame = user_pre.strip()
     rest = tail[m.end():]
-    return frame, (SHARED_PRE + m.group(0)
+    return frame, (DOCUMENT_PRE + m.group(0)
                    + (f"\n\n{frame}" if frame else "") + rest)
 
 

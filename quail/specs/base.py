@@ -59,6 +59,7 @@ class ModelSpec:
     #                               an empty thinking channel
     turn_prefix: str = ""     # chat-turn text before every prompt
     turn_suffix: str = ""     # chat-turn text after the answer cue
+    prompt_format: str = "raw-v1"    # names the turn layout in run records
     attn_params_per_layer: int = 0    # attention projection params of
     #                                   one layer; 0 derives them from
     #                                   n_q, n_kv, and d_head

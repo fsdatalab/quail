@@ -26,7 +26,7 @@ import quail_b as benchmark
 from quail.bench import substrait
 from quail.bench.substrait import QueryPlan, read_plan
 from quail.planner.plan import Refusal
-from quail.specs import H100_USD_PER_HOUR
+from quail.specs import H100_USD_PER_HOUR, MODELS
 from quail_b.queries import (
     FILTER_SELECTIVITY_ESTIMATES,
     JOIN_SELECTIVITY_ESTIMATES,
@@ -225,7 +225,7 @@ def refused_queries(session, query_ids, data_dir) -> dict[str, str]:
 
 def run_suite(only=None, *, sf=0.1, config, data_dir=None,
               ground_truth_collection=None, output_dir,
-              h100_usd_per_hour=H100_USD_PER_HOUR):
+              h100_usd_per_hour=H100_USD_PER_HOUR, root=None):
     """Run Quail queries through QUAIL-B and save the benchmark report.
 
     Queries the backend refuses to plan are left out of the run and
@@ -239,10 +239,11 @@ def run_suite(only=None, *, sf=0.1, config, data_dir=None,
         record = benchmark.run(
             partial(run_query, session), queries=only, scale_factor=sf,
             output_dir=output_dir, data_dir=data_dir,
-            collection_id=ground_truth_collection,
+            collection_id=ground_truth_collection, root=root,
             gpu_count=config.gpus, gpu_hourly_rate_usd=h100_usd_per_hour,
             metadata={
                 "engine": config.backend, "model": config.model,
+                "prompt_format": MODELS[config.model].prompt_format,
                 "configuration": asdict(config),
                 "warmup": "engine startup and kernel warmup excluded",
                 "cache_reuse": "one session per backend and query family",

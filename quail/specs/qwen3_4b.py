@@ -18,4 +18,10 @@ QWEN3_4B_FP8 = ModelSpec(
     vocab=151_936,
     tied_head=True,        # lm_head shares the embedding tensor, so
     #                        nothing moves off the GPU at load
+    # Qwen3 apply_chat_template(enable_thinking=False): the user turn
+    # opens before the document preamble and closes after the answer
+    # cue, then the assistant turn opens with an empty think block.
+    turn_prefix="<|im_start|>user\n",
+    turn_suffix="<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+    prompt_format="qwen3-chat-nonthinking-v1",
 )
