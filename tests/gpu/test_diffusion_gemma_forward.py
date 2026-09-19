@@ -67,8 +67,12 @@ def _prompt_ids():
             for review in REVIEWS]
 
 
-def stock_rows_main(out_path):
-    """Record stock vLLM's last-layer hidden state of every prompt row."""
+def stock_rows_main(out_path, every_layer=False):
+    """Record stock vLLM's hidden state of every prompt row.
+
+    After the last layer, or with every_layer after each layer: a
+    list per prompt of one (rows, hidden) tensor per layer.
+    """
     import os
 
     # keep the engine in this process so the hook sees the forward
@@ -82,20 +86,29 @@ def stock_rows_main(out_path):
     llm = LLM(model=spec.hf_name, gpu_memory_utilization=0.9,
               enforce_eager=True, enable_prefix_caching=False,
               disable_log_stats=True)
-    captured = []
+    captured = {}
 
-    def record(module, args, output):
-        captured.append(output[0].detach().clone())
+    def recorder(index):
+        def record(module, args, output):
+            captured.setdefault(index, []).append(output[0].detach().clone())
+        return record
 
-    llm.apply_model(
-        lambda model: model.model.layers[-1].register_forward_hook(record))
+    def attach(model):
+        layers = model.model.layers
+        picked = enumerate(layers) if every_layer else [(len(layers) - 1,
+                                                          layers[-1])]
+        return [layer.register_forward_hook(recorder(i)) for i, layer in picked]
+
+    llm.apply_model(attach)
     rows = []
     for ids in prompts:
         captured.clear()
         # the prompt prefills in the first forward, ahead of the canvas
         llm.generate([dict(prompt_token_ids=ids)],
                      SamplingParams(max_tokens=1), use_tqdm=False)
-        rows.append(torch.cat(captured)[:len(ids)].float().cpu())
+        per_layer = [torch.cat(captured[i])[:len(ids)].float().cpu()
+                     for i in sorted(captured)]
+        rows.append(per_layer if every_layer else per_layer[-1])
     torch.save(rows, out_path)
 
 
@@ -207,4 +220,4 @@ def test_answers_agree_with_stock_vllm(stock_rows, quail):
 
 
 if __name__ == "__main__":
-    stock_rows_main(sys.argv[1])
+    stock_rows_main(sys.argv[1], every_layer=len(sys.argv) > 2)
