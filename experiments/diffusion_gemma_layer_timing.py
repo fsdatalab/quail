@@ -1147,7 +1147,8 @@ def stock_kernels(prediction: str, n_docs: int = 512,
 
     llm = LLM(model=spec.hf_name, gpu_memory_utilization=0.92,
               enable_prefix_caching=False, disable_log_stats=True)
-    sampling = SamplingParams(temperature=0.0, max_tokens=1, min_tokens=1)
+    # a diffusion model rejects temperature and min_tokens
+    sampling = SamplingParams(max_tokens=1)
     config = llm.llm_engine.vllm_config
     comp = config.compilation_config
     report = dict(
