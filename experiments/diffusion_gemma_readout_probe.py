@@ -62,11 +62,11 @@ def probe(prediction: str, n_docs: int = 256,
     prompt = bind_prompt(F1, ("body",), tok, turn=spec.turn)
     prompts = [dict(prompt_token_ids=render_filter_prompt_ids(prompt, tok(b), tok))
                for b in bodies]
+    if logprobs:
+        import quail.backends.vllm as backend
+        backend.DIFFUSION_LOGPROBS = logprobs
     state, boot = VLLMEngine().boot(spec, sorted(set(true_ids) | set(false_ids)))
     client, sampling = state["client"], state["sampling_params"]
-    if logprobs:
-        from vllm import SamplingParams
-        sampling = SamplingParams(max_tokens=1, logprobs=logprobs)
     outputs = client.generate(prompts, sampling, use_tqdm=False)
     quail_answers = {}
     table = Path(f"/results/benchmarks/quailb/{quail_run}/quail/imdb/IMDB-1/"

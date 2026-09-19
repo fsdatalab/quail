@@ -430,6 +430,7 @@ def test_vllm_engine_settings_follow_the_model():
     assert gemma["diffusion_config"] == {"canvas_length": 1,
                                          "max_denoising_steps": 1}
     assert gemma["max_num_seqs"] == 127
+    assert gemma["max_logprobs"] == 20
     wide = engine.llm_kwargs(replace(DIFFUSION_GEMMA_26B_FP8, canvas_tokens=256))
     assert wide["diffusion_config"] == {"canvas_length": 256}
     assert wide["max_num_seqs"] == engine.llm_kwargs(QWEN3_4B_FP8)["max_num_seqs"]

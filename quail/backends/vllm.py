@@ -125,6 +125,8 @@ class VLLMEngine:
             if spec.canvas_tokens == 1:
                 diffusion["max_denoising_steps"] = 1
                 sequences = DIFFUSION_SEQUENCES
+                # vLLM refuses a request for more logprobs than this
+                kwargs["max_logprobs"] = DIFFUSION_LOGPROBS
             kwargs["diffusion_config"] = diffusion
         kwargs["max_num_seqs"] = sequences
         return kwargs
