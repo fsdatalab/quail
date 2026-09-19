@@ -453,7 +453,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                             f"split the chunk (asked {remainders[0] + suffix_tokens}"
                             f" rows; free pages {arena.accounting.free_pages}"
                             f" every-token, {sliding_free} sliding; retained"
-                            f" {arena.retained_pages()}; groups {len(groups)})")
+                            f" {arena.retained_pages}; groups {len(groups)})")
                     temp_key, _ = got
                     temporary_keys.append(temp_key)
                     temp_views = [_PoolView(
