@@ -280,7 +280,7 @@ class Engine:
         return q, scales
 
     def scale_add_norm_quant(self, x, residual, scale, weight, eps):
-        """residual = residual * scale + x in place; the row norm, quantized.
+        """Residual = residual * scale + x in place; the row norm, quantized.
 
         norm_quant_rows with the residual scaled first. Returns the
         fp8 rows and their float32 scales, shaped (rows, 1).

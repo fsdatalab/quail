@@ -218,8 +218,9 @@ class DiffusionGemmaPipeline(ModelPipeline):
             out = self._norm(out, layer.post_attention_layernorm)
             # residual becomes the attention sum; the feedforward reads
             # its norm
-            x_q, x_s = self._norm_quant(out, layer.pre_feedforward_layernorm,
-                                        residual)
+            pre = layer.pre_feedforward_layernorm
+            x_q, x_s = engine.scale_add_norm_quant(
+                out, residual, 1.0, pre.weight, pre.variance_epsilon)
             mlp = layer.mlp
             gate_up = engine.fp8_linear(mlp.gate_up_proj, x_q, x_s)
             d_q, d_s = engine.gelu_mul_quant(gate_up)
