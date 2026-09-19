@@ -78,8 +78,9 @@ from quail.planner.prefixes import shared_prefix_tokens
 from quail.specs import (
     H100_PRICE_SOURCE,
     H100_USD_PER_HOUR,
-    QWEN3_4B_FP8,
-    QWEN3_32B_FP8,
+)
+from quail.specs import (
+    MODELS as MODEL_SPECS,
 )
 from quail_b import data, prompts
 from quail_b.benchmark import load_benchmark, select_queries
@@ -102,6 +103,9 @@ parser.add_argument("scale_factor", nargs="?", type=float, default=0.1)
 parser.add_argument("--queries", help="Comma-separated query IDs")
 parser.add_argument("--root", help="Saved benchmark root, such as /results")
 parser.add_argument("--collection", help="Reference collection id")
+parser.add_argument("--model", action="append",
+                    help="Model spec name, repeatable; the models share a "
+                         "tokenizer. Default: qwen3-4b-fp8 and qwen3-32b-fp8")
 args = parser.parse_args()
 W = Path(args.workdir)
 W.mkdir(parents=True, exist_ok=True)
@@ -110,15 +114,19 @@ SF = args.scale_factor
 # own directory names
 TAG = f"sf{SF:g}"
 selection = "_" + args.queries.replace(",", "_") if args.queries else ""
-OUT = W / f"sol_quailb_{TAG}{selection}.json"
-MODELS = [QWEN3_4B_FP8, QWEN3_32B_FP8]
+MODELS = [MODEL_SPECS[name]
+          for name in (args.model or ["qwen3-4b-fp8", "qwen3-32b-fp8"])]
+model_tag = "" if not args.model else "_" + "_".join(m.name for m in MODELS)
+OUT = W / f"sol_quailb_{TAG}{selection}{model_tag}.json"
+# the models of one run share a tokenizer, so one Session prices them all
+TOKENIZER = MODELS[0].hf_name
 
 # check the workdir holds this scale factor before tokenizing anything:
 # both of these otherwise surface much later as a missing parquet file
 if not args.root and not (W / "data" / TAG).is_dir():
     raise SystemExit(f"no corpus at {W / 'data' / TAG}: pull "
                      f"/quailb_data/{TAG} off the volume")
-tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-4B-FP8")
+tok = AutoTokenizer.from_pretrained(TOKENIZER)
 
 
 @cache
@@ -197,11 +205,11 @@ else:
 answer = answer_oracle(truth, corpus_rows)
 
 # ================================================================
-# PART 2: the queries, on one session with the shared Qwen3 tokenizer
+# PART 2: the queries, on one session with the models' shared tokenizer
 # ================================================================
 
 session = quail.Session(
-    EngineConfig(gpus=1, model=QWEN3_4B_FP8.name, device="h100-sxm"),
+    EngineConfig(gpus=1, model=MODELS[0].name, device="h100-sxm"),
     tokenizer=encode)
 for name, table in corpus_rows.items():
     session.register(name, quail.DocumentProvider.from_table(table, id_col="id"))
@@ -376,17 +384,17 @@ for qid in query_ids:
             },
         }
 
-hdr = (f"{'query':7} {'4B tokens':>11} {'4B anchor':>15} {'4B SoL':>9} "
-       f"{'4B per-doc':>10} {'32B SoL':>9} {'32B per-doc':>11} {'32B/4B':>7}")
+hdr = f"{'query':7} {'tokens':>11} {'anchor':>15}" + "".join(
+    f" {m.name + ' SoL':>28} {'per-doc':>9}" for m in MODELS)
 print(hdr)
 print("-" * len(hdr))
 for qid, row in rows.items():
-    a = row["models"]["qwen3-4b-fp8"]
-    b = row["models"]["qwen3-32b-fp8"]
-    print(f"{qid:7} {a['tokens']:>11,.0f} {str(a['anchor'] or '-'):>15} "
-          f"{a['sol_s']:>9.3f} {a['per_document']['sol_s']:>10.3f} "
-          f"{b['sol_s']:>9.3f} {b['per_document']['sol_s']:>11.3f} "
-          f"{b['sol_s'] / a['sol_s']:>7.2f}")
+    first = row["models"][MODELS[0].name]
+    line = f"{qid:7} {first['tokens']:>11,.0f} {str(first['anchor'] or '-'):>15}"
+    for model in MODELS:
+        m = row["models"][model.name]
+        line += f" {m['sol_s']:>28.3f} {m['per_document']['sol_s']:>9.3f}"
+    print(line)
 
 for key, store in stores.items():
     lengths = list(store.lengths)
@@ -398,7 +406,7 @@ for key, store in stores.items():
 json.dump({
     "what": f"SoL for {len(rows)} QUAIL-B queries at "
             f"sf={SF:g}, on "
-            "Qwen3-4B-fp8 and Qwen3-32B-fp8, one H100! request each. "
+            + " and ".join(m.name for m in MODELS) + ", one H100! request each. "
             "Every feasible left deep order and anchor choice is considered. "
             "No measured or fitted constant is used.",
     "method": "docs/content/docs/architecture/sol-model.mdx, "
@@ -467,7 +475,7 @@ json.dump({
         "corpora": f"/results/quailb_data/{TAG}, seed {data.DATA_SEED}",
         "labels": "/results/ground_truth/quailb/schema_v1/label_sets on "
                   "quail-results, qwen3-32b-fp8 answering",
-        "tokenizer": "Qwen/Qwen3-4B-FP8, shared by every Qwen3 model"},
+        "tokenizer": f"{TOKENIZER}, shared by every model of this run"},
     "chunk_tokens": {
         model.name: rows[query_ids[0]]["models"][model.name]["chunk_tokens"]
         for model in MODELS},
