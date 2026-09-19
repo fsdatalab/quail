@@ -65,7 +65,7 @@ def load_rows(root):
     from quail_b.run import _query_hash
 
     manifest = json.loads((root / "run" / "manifest.json").read_text())
-    assert manifest["status"] == "complete", manifest["status"]
+    assert manifest["status"] in ("complete", "partial"), manifest["status"]
     assert manifest["model"] == MODEL
     assert manifest["sf"] == 0.1
     assert set(manifest["summaries"]) == {key for key, _, _ in METHODS}
@@ -79,6 +79,7 @@ def load_rows(root):
         assert hashlib.sha256(raw).hexdigest() == counts["run_sha256"][method]
         suite = json.loads(raw)
         assert suite["collection_id"] == manifest["collection_id"]
+        measured = set()
         for item in suite["queries"]:
             if item["id"] not in queries:
                 continue
@@ -86,7 +87,12 @@ def load_rows(root):
             assert item["definition_hash"] == _query_hash(get_query(item["id"]))
             rows[method][item["id"]]["requested_tokens"] = (
                 counts["methods"][method][item["id"]])
-        rows[method] = {query: rows[method][query] for query in queries}
+            measured.add(item["id"])
+        # Quail measures every query; the baseline may have run out of
+        # time on some, and those stay absent rather than zero.
+        assert method != "quail" or measured == set(queries), method
+        rows[method] = {query: rows[method][query] for query in queries
+                        if query in measured}
         suites[method] = suite
     return rows, manifest, suites, queries
 
@@ -147,7 +153,7 @@ def count_requested_tokens(root, data_root):
         result["run_sha256"][method] = hashlib.sha256(raw).hexdigest()
         result["methods"][method] = {}
         for item in json.loads(raw)["queries"]:
-            if item["id"] not in queries:
+            if item["id"] not in queries or item["status"] != "complete":
                 continue
             spec = get_query(item["id"])
             assert item["definition_hash"] == _query_hash(spec)
@@ -184,12 +190,15 @@ def count_requested_tokens(root, data_root):
 
 def report_lines(rows, queries, relations, sol, manifest, suites, figures):
     """The report's markdown, from the measurements alone."""
+    measured = [q for q in queries if q in rows["pipelined_vllm"]]
+    unfinished = [q for q in queries if q not in rows["pipelined_vllm"]]
     speedups = {q: rows["pipelined_vllm"][q]["runtime_s"]
-                / rows["quail"][q]["runtime_s"] for q in queries}
+                / rows["quail"][q]["runtime_s"] for q in measured}
     faster = sum(ratio > 1 for ratio in speedups.values())
-    fastest = max(speedups, key=speedups.get)
+    fastest = max(speedups, key=speedups.get, default=None)
     settings = [item["measurements"]["backend_metrics"]["capacity"]
-                for item in suites["pipelined_vllm"]["queries"]]
+                for item in suites["pipelined_vllm"]["queries"]
+                if item["status"] == "complete"]
     batch_tokens = sorted({item["max_num_batched_tokens"] for item in settings})
     sequences = sorted({item["max_num_seqs"] for item in settings})
     lines = [
@@ -214,9 +223,11 @@ def report_lines(rows, queries, relations, sol, manifest, suites, figures):
         "  prefix caching. vLLM caps this model at 8 sequences per step because",
         "  its diffusion sampler holds a [sequences, canvas rows, vocabulary]",
         "  float32 tensor. Quail's chunk budget is 65,536 tokens.",
-        f"- Quail is faster on {faster} of {len(queries)} queries.",
-        f"  The median speedup is {median(speedups.values()):.2f}x and the maximum",
-        f"  is {speedups[fastest]:.2f}x on {fastest}.",
+        f"- Quail is faster on {faster} of the {len(measured)} queries the",
+        "  baseline finished.",
+        (f"  The median speedup is {median(speedups.values()):.2f}x and the"
+         f" maximum is {speedups[fastest]:.2f}x on {fastest}." if fastest
+         else "  The baseline finished no query."),
         "  Speedup is pipelined stock vLLM time divided by Quail time.",
         "  Query time excludes startup and result collection.",
         "  GPU cost is query seconds / 3,600 times $3.9492.",
@@ -228,7 +239,27 @@ def report_lines(rows, queries, relations, sol, manifest, suites, figures):
         "- Fresh input tokens count every input position a forward pass",
         "  processes, repeated computation included. KV regret is recomputed",
         "  tokens as a share of fresh tokens. Token throughput is total",
-        "  requested input tokens divided by query seconds.", "",
+        "  requested input tokens divided by query seconds.",
+    ]
+    if unfinished:
+        lines.extend([
+            "- Pipelined stock vLLM did not finish "
+            f"{', '.join(unfinished)} inside the ten hour limit of its query",
+            "  family's container, so those baseline values are not",
+            "  measured. They show as a cross at the axis in the figures and",
+            "  as \"Not measured\" in the tables, never as zero.",
+        ])
+    lines.extend([
+        "- A prefill-only stock vLLM is possible for this model but is not",
+        "  what this run measured: with a one-row canvas, one denoising step,",
+        "  and the sequence cap lifted, stock vLLM returns the TRUE and FALSE",
+        "  logprobs at the canvas row for 62 of 64 IMDB reviews at 57,708",
+        "  prompt tokens per second on that 64-review batch",
+        "  (`/results/ablations/`",
+        "  `diffusion_gemma_stock_answers_canvas1_lp20_steps1.json`).",
+    ])
+    lines += [
+        "",
         "[Open the main vector PDF](plots/quailb_diffusion_gemma_main.pdf)", "",
         "Figure: plots/quailb_diffusion_gemma_main.pdf", "",
     ]
@@ -250,6 +281,9 @@ def report_lines(rows, queries, relations, sol, manifest, suites, figures):
                       "|---|---|---:|---:|---:|---:|---:|"])
         for query in selected:
             for key, label, _ in METHODS:
+                if query not in rows[key]:
+                    lines.append(f"| {query} | {label} | Not measured | | | | |")
+                    continue
                 m = row_metrics(rows[key][query])
                 regret = ("Not measured" if m["regret_percent"] is None
                           else f"{m['regret_percent']:.2f}")
@@ -269,6 +303,9 @@ def report_lines(rows, queries, relations, sol, manifest, suites, figures):
                       "|---|---|---:|---:|---:|"])
         for query in selected:
             for key, label, _ in METHODS:
+                if query not in rows[key]:
+                    lines.append(f"| {query} | {label} | Not measured | | |")
+                    continue
                 m = row_metrics(rows[key][query])
                 lines.append(
                     f"| {query} | {label} | {m['agreement']:.2f} "

@@ -222,6 +222,8 @@ def metric_bars(axis, queries, rows, sol, metric, overview):
                  width=width * 0.9, color=color, label=label, edgecolor="none")
     if metric == "seconds" and not overview:
         for index, query in enumerate(queries):
+            if query not in rows["pipelined_vllm"]:
+                continue
             quail_time = rows["quail"][query]["runtime_s"]
             baseline_time = rows["pipelined_vllm"][query]["runtime_s"]
             top = max(quail_time, baseline_time)
