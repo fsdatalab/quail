@@ -842,13 +842,15 @@ def stock_kernels(prediction: str, n_docs: int = 512,
 @app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
               volumes=volumes)
 def stock_answers(prediction: str, n_docs: int = 64,
-                  canvas_length: int = 256, max_tokens: int = 16) -> str:
+                  canvas_length: int = 256, max_tokens: int = 16,
+                  logprobs: int = 20) -> str:
     """What stock vLLM writes on its canvas for the F1 filter prompt.
 
     Boots stock vLLM with the given canvas length on IMDB reviews and
     reports each document's generated tokens and text, the share whose
-    first token is a TRUE or FALSE id, and the time per document. One
-    boot per call: vLLM does not give the GPU back in-process.
+    first token is a TRUE or FALSE id, whether the first position's
+    top logprobs rank TRUE against FALSE, and the time per document.
+    One boot per call: vLLM does not give the GPU back in-process.
     """
     import os as _os
     import time as _time
@@ -880,14 +882,35 @@ def stock_answers(prediction: str, n_docs: int = 64,
               max_num_batched_tokens=65536, max_num_seqs=1024,
               enable_prefix_caching=True, disable_log_stats=True,
               diffusion_config={"canvas_length": canvas_length})
-    sampling = SamplingParams(max_tokens=max_tokens)
+    sampling = SamplingParams(max_tokens=max_tokens,
+                              logprobs=logprobs or None)
     llm.generate(prompts[:4], sampling, use_tqdm=False)
     t0 = _time.perf_counter()
     outputs = llm.generate(prompts, sampling, use_tqdm=False)
     seconds = _time.perf_counter() - t0
     tokens = [list(o.outputs[0].token_ids) for o in outputs]
     texts = [o.outputs[0].text for o in outputs]
+
+    def ranked(completion):
+        # the first position's top logprobs: TRUE against FALSE
+        rows = getattr(completion, "logprobs", None)
+        if not rows:
+            return "no logprobs"
+        first = rows[0] or {}
+        true = max((lp.logprob for t, lp in first.items() if t in true_ids),
+                   default=None)
+        false = max((lp.logprob for t, lp in first.items() if t in false_ids),
+                    default=None)
+        if true is None and false is None:
+            return "neither in top-k"
+        return "TRUE" if (false is None or (true is not None and true > false)) \
+            else "FALSE"
+
+    readouts = [ranked(o.outputs[0]) for o in outputs]
     report.update({
+        "logprob_readout_counts": {
+            key: readouts.count(key) for key in sorted(set(readouts))},
+        "logprob_readouts": readouts[:32],
         "seconds": round(seconds, 2),
         "docs_per_s": round(len(prompts) / seconds, 1),
         "first_token_true_or_false": sum(
@@ -901,7 +924,8 @@ def stock_answers(prediction: str, n_docs: int = 64,
     print(json.dumps({k: v for k, v in report.items() if k != "tokens"},
                      indent=1), flush=True)
     report["volume_path"] = _save(
-        f"diffusion_gemma_stock_answers_canvas{canvas_length}", report)
+        f"diffusion_gemma_stock_answers_canvas{canvas_length}_lp{logprobs}",
+        report)
     return json.dumps(report, indent=2)
 
 
