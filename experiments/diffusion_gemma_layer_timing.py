@@ -1,18 +1,26 @@
-r"""Time one DiffusionGemma chunk component by component.
-
-The profiles put DiffusionGemma's filter at about 11 documents per
-second on IMDB-3, some 18 times slower per row than Qwen3 4B, where
-the cost model expects under 2 times. This cell packs one chunk of
-synthetic documents, runs the pipeline once to warm up, then runs it
-again with each component wrapped in a synchronizing timer: the
-embedding, and per layer the norms, qkv projection, rotary, attention,
-o projection, dense MLP, router, and experts. Sliding and
-full-attention layers are summed separately.
+r"""Time DiffusionGemma's kernels on one H100, cell by cell.
 
     uv run modal run experiments/diffusion_gemma_layer_timing.py \
-      --prediction "..." 2>&1 | tee results/diffusion-gemma-layer-timing.log
+      --prediction "..." --runs chunk,loop 2>&1 | tee results/<stamp>.log
 
-Writes /results/ablations/diffusion_gemma_layer_timing.json.
+Cells, chosen with --runs:
+
+- chunk: pack one chunk of synthetic documents and time each
+  component of the pipeline with a synchronizing timer (the norms,
+  projections, rotary, attention, dense MLP, router, and experts),
+  sliding and full-attention layers summed separately. --profile
+  saves a Chrome trace.
+- gemms: the dense fp8 GEMM kernels at the chunk's row count.
+- tiles: the fused MoE kernel's tile configurations at 32k and 64k
+  rows; the winners are the table in executor/moe_configs.py.
+- loop: the filter loop over IMDB reviews, end to end.
+- micro: the fused elementwise kernels against their unfused parts.
+- stock: one stock vLLM prefill pass under the profiler, for the
+  kernel-per-layer figure.
+
+Each cell prints its Modal function call id and writes its record to
+/results/ablations/diffusion_gemma_<cell>.json on the quail-results
+volume.
 """
 
 import json
@@ -524,214 +532,6 @@ def micro(prediction: str, rows: int = 62920) -> str:
 
 @app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
               volumes=volumes)
-def fa4_tiles(prediction: str, prefix: int = 448, suffix: int = 54,
-              partners: int = 12, anchors: int = 54) -> str:
-    """Time the join attention on the full-layer shape, option by option.
-
-    Synthetic IMDB-2 layout: each anchor's prefix is shared by its
-    partners, and each pair's suffix rows see the prefix and the
-    pair's earlier rows. 16 query heads, 2 KV heads, 512-wide heads,
-    k = v as in the model's full-attention layers. Also times the
-    sliding-layer shape (16 query heads, 8 KV heads, 256-wide heads,
-    window 1024) on FlashAttention 3 and 4.
-    """
-    import torch
-    from vllm.vllm_flash_attn import flash_attn_varlen_func
-    from vllm.vllm_flash_attn.cute.interface import _flash_attn_fwd
-
-    page = 16
-    if prefix % page:
-        raise ValueError("prefix must be a whole number of pages")
-    pairs = anchors * partners
-    rows = pairs * suffix
-    own_pages = -(-suffix // page)
-    prefix_pages = prefix // page
-    n_pages = anchors * prefix_pages + pairs * own_pages
-    dev = "cuda"
-
-    def layout(H, KH, D):
-        q = torch.randn(rows, H, D, device=dev, dtype=torch.bfloat16) * 0.1
-        kv = torch.randn(n_pages, page, KH, D, device=dev,
-                         dtype=torch.bfloat16) * 0.1
-        table = torch.empty(pairs, prefix_pages + own_pages,
-                            device=dev, dtype=torch.int32)
-        for a in range(anchors):
-            for j in range(partners):
-                pair = a * partners + j
-                table[pair, :prefix_pages] = torch.arange(
-                    a * prefix_pages, (a + 1) * prefix_pages)
-                first = anchors * prefix_pages + pair * own_pages
-                table[pair, prefix_pages:] = torch.arange(
-                    first, first + own_pages)
-        # the same rows unpaged: per pair [prefix | own rows]
-        flat = kv.view(n_pages * page, KH, D)
-        row_ids = []
-        for pair in range(pairs):
-            pages = table[pair].tolist()
-            ids = [p * page + t for p in pages for t in range(page)]
-            row_ids.extend(ids[:prefix + suffix])
-        row_ids = torch.tensor(row_ids, device=dev)
-        unpaged = flat.index_select(0, row_ids)
-        own_ids = row_ids.view(pairs, -1)[:, prefix:].reshape(-1)
-        own = flat.index_select(0, own_ids)
-        cu_q = torch.arange(0, rows + 1, suffix, device=dev,
-                            dtype=torch.int32)
-        cu_k = torch.arange(0, pairs * (prefix + suffix) + 1, prefix + suffix,
-                            device=dev, dtype=torch.int32)
-        used = torch.full((pairs,), prefix + suffix, device=dev,
-                          dtype=torch.int32)
-        cu_anchor = torch.arange(0, rows + 1, partners * suffix, device=dev,
-                                 dtype=torch.int32)
-        anchor_table = table[::partners, :prefix_pages].contiguous()
-        anchor_used = torch.full((anchors,), prefix, device=dev,
-                                 dtype=torch.int32)
-        return dict(q=q, kv=kv, table=table, unpaged=unpaged, own=own,
-                    cu_q=cu_q, cu_k=cu_k, used=used, cu_anchor=cu_anchor,
-                    anchor_table=anchor_table, anchor_used=anchor_used)
-
-    def flops(H, D, own=True, shared=True):
-        per_pair = ((suffix * prefix if shared else 0)
-                    + (suffix * (suffix + 1) // 2 if own else 0))
-        return pairs * per_pair * H * D * 4
-
-    def timed(fn, repeats=10):
-        try:
-            fn()
-        except Exception as error:  # noqa: BLE001 - report, keep going
-            return f"failed: {type(error).__name__}: {str(error)[:160]}"
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        for _ in range(repeats):
-            fn()
-        torch.cuda.synchronize()
-        return (time.perf_counter() - t0) / repeats
-
-    def paged_fa(L, version, window=None, **knobs):
-        def run():
-            if not knobs:
-                return flash_attn_varlen_func(
-                    L["q"], L["kv"], L["kv"], max_seqlen_q=suffix,
-                    cu_seqlens_q=L["cu_q"], max_seqlen_k=prefix + suffix,
-                    block_table=L["table"], seqused_k=L["used"],
-                    causal=True, fa_version=version, softmax_scale=1.0,
-                    return_softmax_lse=True,
-                    window_size=list(window) if window else (-1, -1))
-            return _flash_attn_fwd(
-                L["q"], L["kv"], L["kv"], cu_seqlens_q=L["cu_q"],
-                seqused_k=L["used"], max_seqlen_q=suffix,
-                max_seqlen_k=prefix + suffix, page_table=L["table"],
-                softmax_scale=1.0, causal=True, num_splits=0,
-                return_lse=True, **knobs)
-        return run
-
-    def unpaged_fa(L, version):
-        def run():
-            return flash_attn_varlen_func(
-                L["q"], L["unpaged"], L["unpaged"], max_seqlen_q=suffix,
-                cu_seqlens_q=L["cu_q"], max_seqlen_k=prefix + suffix,
-                cu_seqlens_k=L["cu_k"], causal=True, fa_version=version,
-                softmax_scale=1.0, return_softmax_lse=True)
-        return run
-
-    def call_a(L, version):
-        def run():
-            return flash_attn_varlen_func(
-                L["q"], L["own"], L["own"], max_seqlen_q=suffix,
-                cu_seqlens_q=L["cu_q"], max_seqlen_k=suffix,
-                cu_seqlens_k=L["cu_q"], causal=True, fa_version=version,
-                softmax_scale=1.0, return_softmax_lse=True)
-        return run
-
-    def call_b(L, version):
-        def run():
-            return flash_attn_varlen_func(
-                L["q"], L["kv"], L["kv"], max_seqlen_q=partners * suffix,
-                cu_seqlens_q=L["cu_anchor"], max_seqlen_k=prefix,
-                block_table=L["anchor_table"], seqused_k=L["anchor_used"],
-                causal=False, fa_version=version, softmax_scale=1.0,
-                return_softmax_lse=True)
-        return run
-
-    def triton_paged(L, window=None):
-        from vllm.v1.attention.ops.triton_unified_attention import (
-            unified_attention,
-        )
-        out = torch.empty_like(L["q"])
-
-        def run():
-            unified_attention(
-                q=L["q"], k=L["kv"], v=L["kv"], out=out,
-                cu_seqlens_q=L["cu_q"], max_seqlen_q=suffix,
-                seqused_k=L["used"], max_seqlen_k=prefix + suffix,
-                softmax_scale=1.0, causal=True,
-                window_size=window or (-1, -1), block_table=L["table"],
-                softcap=0.0, q_descale=None, k_descale=None, v_descale=None)
-        return run
-
-    result = {"prediction": prediction, "prefix": prefix, "suffix": suffix,
-              "partners": partners, "anchors": anchors, "rows": rows}
-    full = layout(16, 2, 512)
-    variants = {
-        "fa4_paged_default": paged_fa(full, 4),
-        "fa4_unpaged_default": unpaged_fa(full, 4),
-        "fa4_paged_pack_gqa_off": paged_fa(full, 4, pack_gqa=False),
-        "fa4_paged_tile_128x64": paged_fa(full, 4, tile_mn=(128, 64)),
-        "fa4_paged_tile_64x128": paged_fa(full, 4, tile_mn=(64, 128)),
-        "fa4_paged_tile_128x128": paged_fa(full, 4, tile_mn=(128, 128)),
-        "fa4_paged_tile_128x64_pack_off": paged_fa(
-            full, 4, tile_mn=(128, 64), pack_gqa=False),
-        "fa4_paged_pv_rs": paged_fa(full, 4, mma_pv_is_rs=True),
-        "fa4_paged_no_overlap": paged_fa(full, 4, intra_wg_overlap=False),
-        "fa4_call_a_own_rows": call_a(full, 4),
-        "fa4_call_b_prefix": call_b(full, 4),
-        "triton_paged": triton_paged(full),
-    }
-    full_flops = flops(16, 512)
-    result["full_flops"] = full_flops
-    # call A covers each pair's own rows, call B the shared prefix
-    part = {"fa4_call_a_own_rows": flops(16, 512, shared=False),
-            "fa4_call_b_prefix": flops(16, 512, own=False)}
-    for name, fn in variants.items():
-        seconds = timed(fn)
-        if isinstance(seconds, str):
-            result[name] = seconds
-        else:
-            work = part.get(name, full_flops)
-            result[name] = {"ms": round(seconds * 1e3, 3),
-                            "tflops": round(work / seconds / 1e12, 1)}
-        print(name, result[name], flush=True)
-    a, b = result["fa4_call_a_own_rows"], result["fa4_call_b_prefix"]
-    if isinstance(a, dict) and isinstance(b, dict):
-        result["fa4_two_call_sum_ms"] = round(a["ms"] + b["ms"], 3)
-    del full
-    torch.cuda.empty_cache()
-
-    sliding = layout(16, 8, 256)
-    window = (1023, 0)
-    sliding_flops = flops(16, 256)
-    result["sliding_flops"] = sliding_flops
-    for name, fn in {
-        "sliding_fa3_paged_window": paged_fa(sliding, 3, window),
-        "sliding_fa4_paged_window": paged_fa(sliding, 4, window),
-        "sliding_fa3_paged_full": paged_fa(sliding, 3),
-        "sliding_triton_paged_window": triton_paged(sliding, window),
-    }.items():
-        seconds = timed(fn)
-        if isinstance(seconds, str):
-            result[name] = seconds
-        else:
-            result[name] = {"ms": round(seconds * 1e3, 3),
-                            "tflops": round(sliding_flops / seconds / 1e12, 1)}
-        print(name, result[name], flush=True)
-    result["h100_bf16_dense_peak_tflops"] = 989
-    result["gb_kv_full_per_token"] = 2 * 512 * 2 / 1e9
-    result["softmax_scale"] = 1.0
-    result["volume_path"] = _save("diffusion_gemma_fa4_tiles", result)
-    return json.dumps(result, indent=2)
-
-
-@app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
-              volumes=volumes)
 def stock_kernels(prediction: str, n_docs: int = 512,
                   doc_tokens: int = 300) -> str:
     """Record the kernels stock vLLM's compiled graph runs for this model.
@@ -818,113 +618,10 @@ def stock_kernels(prediction: str, n_docs: int = 512,
     return json.dumps(report, indent=2)
 
 
-@app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
-              volumes=volumes)
-def stock_answers(prediction: str, n_docs: int = 64,
-                  canvas_length: int = 256, max_tokens: int = 16,
-                  logprobs: int = 20, max_denoising_steps: int = 0,
-                  max_num_seqs: int = 1024) -> str:
-    """What stock vLLM writes on its canvas for the F1 filter prompt.
-
-    Boots stock vLLM with the given canvas length on IMDB reviews and
-    reports each document's generated tokens and text, the share whose
-    first token is a TRUE or FALSE id, whether the first position's
-    top logprobs rank TRUE against FALSE, and the time per document.
-    A denoising step count of 0 keeps the checkpoint's own. vLLM caps
-    this model at 8 sequences when max_num_seqs is 128 or more.
-    One boot per call: vLLM does not give the GPU back in-process.
-    """
-    import os as _os
-    import time as _time
-
-    _os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-    import pyarrow.parquet as pq
-    from transformers import AutoTokenizer
-    from vllm import LLM, SamplingParams
-
-    from quail.logical import bind_prompt, render_filter_prompt_ids, true_false_ids
-    from quail.specs import MODELS
-    from quail_b.prompts import F1
-
-    spec = MODELS[MODEL]
-    tokenizer = AutoTokenizer.from_pretrained(spec.hf_name)
-    true_ids, false_ids = true_false_ids(tokenizer)
-
-    def tok(text):
-        return tokenizer(text, add_special_tokens=False)["input_ids"]
-
-    bodies = pq.read_table("/results/quailb_data/sf0.1/reviews.parquet")
-    bodies = bodies["body"].to_pylist()[:n_docs]
-    prompt = bind_prompt(F1, ("body",), tok, turn=spec.turn)
-    prompts = [dict(prompt_token_ids=render_filter_prompt_ids(prompt, tok(b), tok))
-               for b in bodies]
-    report = {"prediction": prediction, "n_docs": n_docs,
-              "canvas_length": canvas_length, "max_tokens": max_tokens,
-              "max_denoising_steps": max_denoising_steps or "checkpoint",
-              "max_num_seqs": max_num_seqs}
-    diffusion_config = {"canvas_length": canvas_length}
-    if max_denoising_steps:
-        diffusion_config["max_denoising_steps"] = max_denoising_steps
-    llm = LLM(model=spec.hf_name, gpu_memory_utilization=0.9,
-              max_num_batched_tokens=65536, max_num_seqs=max_num_seqs,
-              enable_prefix_caching=True, disable_log_stats=True,
-              diffusion_config=diffusion_config)
-    sampling = SamplingParams(max_tokens=max_tokens,
-                              logprobs=logprobs or None)
-    llm.generate(prompts[:4], sampling, use_tqdm=False)
-    t0 = _time.perf_counter()
-    outputs = llm.generate(prompts, sampling, use_tqdm=False)
-    seconds = _time.perf_counter() - t0
-    tokens = [list(o.outputs[0].token_ids) for o in outputs]
-    texts = [o.outputs[0].text for o in outputs]
-
-    def ranked(completion):
-        # the first position's top logprobs: TRUE against FALSE
-        rows = getattr(completion, "logprobs", None)
-        if not rows:
-            return "no logprobs"
-        first = rows[0] or {}
-        true = max((lp.logprob for t, lp in first.items() if t in true_ids),
-                   default=None)
-        false = max((lp.logprob for t, lp in first.items() if t in false_ids),
-                    default=None)
-        if true is None and false is None:
-            return "neither in top-k"
-        return "TRUE" if (false is None or (true is not None and true > false)) \
-            else "FALSE"
-
-    readouts = [ranked(o.outputs[0]) for o in outputs]
-    report.update({
-        "logprob_readout_counts": {
-            key: readouts.count(key) for key in sorted(set(readouts))},
-        "logprob_readouts": readouts[:32],
-        "seconds": round(seconds, 2),
-        "docs_per_s": round(len(prompts) / seconds, 1),
-        "prompt_tokens_per_s": round(
-            sum(len(p["prompt_token_ids"]) for p in prompts) / seconds),
-        "first_token_true_or_false": sum(
-            bool(t) and t[0] in true_ids | false_ids for t in tokens),
-        "text_has_true_or_false": sum(
-            ("TRUE" in text or "FALSE" in text) for text in texts),
-        "tokens": tokens[:32],
-        "texts": texts[:32],
-        "true_ids": sorted(true_ids), "false_ids": sorted(false_ids),
-    })
-    print(json.dumps({k: v for k, v in report.items() if k != "tokens"},
-                     indent=1), flush=True)
-    report["volume_path"] = _save(
-        f"diffusion_gemma_stock_answers_canvas{canvas_length}_lp{logprobs}"
-        f"_steps{max_denoising_steps}",
-        report)
-    return json.dumps(report, indent=2)
-
-
 @app.local_entrypoint()
 def main(prediction: str = "", docs: int = 110, doc_tokens: int = 300,
          random_tokens: bool = False, runs: str = "chunk,loop",
-         moe_backends: str = "auto", profile: bool = False,
-         canvas: int = 256, max_tokens: int = 16, logprobs: int = 20,
-         denoising_steps: int = 0, seqs: int = 1024):
+         moe_backends: str = "auto", profile: bool = False):
     if not prediction:
         raise ValueError("pass --prediction before starting")
     calls = {}
@@ -940,15 +637,8 @@ def main(prediction: str = "", docs: int = 110, doc_tokens: int = 300,
         calls["loop"] = time_loop.spawn(prediction)
     if "micro" in runs:
         calls["micro"] = micro.spawn(prediction)
-    if "fa4" in runs:
-        calls["fa4"] = fa4_tiles.spawn(prediction)
     if "stock" in runs:
         calls["stock"] = stock_kernels.spawn(prediction)
-    if "answers" in runs:
-        calls["answers"] = stock_answers.spawn(
-            prediction, canvas_length=canvas, max_tokens=max_tokens,
-            logprobs=logprobs, max_denoising_steps=denoising_steps,
-            max_num_seqs=seqs)
     for name, call in calls.items():
         print(f"function call id: {call.object_id} ({name})", flush=True)
     for name, call in calls.items():
