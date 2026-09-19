@@ -44,7 +44,8 @@ def join_attention_mode(is_fp8: bool) -> str:
 
     merge_quant writes fp8 GEMM inputs, so bf16 weights run the
     unified path instead. QUAIL_JOIN_ATTENTION=unified forces the
-    single-call path, for measuring the two-call path's gain.
+    single-call path on any model; QUAIL_JOIN_ATTENTION=merge lets a
+    windowed bf16 model (DiffusionGemma) run the bf16 two-call path.
     """
     import os
     if os.environ.get("QUAIL_JOIN_ATTENTION") == FILTER_ATTENTION:

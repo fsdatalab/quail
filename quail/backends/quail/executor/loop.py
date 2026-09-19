@@ -11,6 +11,7 @@ Pack on CPU while the GPU runs, gate answers, free pages immediately.
 Torch is imported lazily when model execution starts.
 """
 
+import os
 import time
 
 import numpy as np
@@ -657,8 +658,13 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     # otherwise send nearly every chunk to the unified path. The
     # two-call path needs the LSE from the wide-head kernel, which
     # only FA4 returns.
+    # Opt-in: on DiffusionGemma the two-call path matched the unified
+    # path within noise on IMDB-2 and BIO-2 (runs 20260919T005552Z and
+    # 20260919T014xxxZ on the quail-results volume), because the merge
+    # pass costs what the shared prefix read saves.
     split_by_window = (
-        fixed_mode == FILTER_ATTENTION and window is not None
+        os.environ.get("QUAIL_JOIN_ATTENTION") == "merge"
+        and fixed_mode == FILTER_ATTENTION and window is not None
         and len(canvas) <= 1
         and getattr(pipeline.engine, "wide_head_kernel", "fa4") == "fa4")
 
@@ -991,9 +997,11 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
     q_max = len(question)
     modes = ((FILTER_ATTENTION, JOIN_ATTENTION) if pipeline.is_fp8
              else (FILTER_ATTENTION,))
-    if (not pipeline.is_fp8 and getattr(pipeline, "window", None) is not None
+    if (os.environ.get("QUAIL_JOIN_ATTENTION") == "merge"
+            and not pipeline.is_fp8
+            and getattr(pipeline, "window", None) is not None
             and getattr(pipeline.engine, "wide_head_kernel", "") == "fa4"):
-        # a windowed model's joins run the bf16 two-call path
+        # a windowed model's joins opted into the bf16 two-call path
         modes += ("merge",)
     for mode in modes:
         logger.debug("kernels: warming %s attention, full chunk", mode)
