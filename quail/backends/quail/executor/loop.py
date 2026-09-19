@@ -445,9 +445,14 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                         sliding_tokens=(remainders[1] + suffix_tokens
                                         if sliding else None))
                     if got is None:
+                        sliding_free = (arena.sliding.free_pages
+                                        if sliding else None)
                         raise RuntimeError(
                             "unified suffix pages exceed the free KV arena; "
-                            "split the chunk")
+                            f"split the chunk (asked {remainders[0] + suffix_tokens}"
+                            f" rows; free pages {arena.accounting.free_pages}"
+                            f" every-token, {sliding_free} sliding; retained"
+                            f" {arena.retained_pages()}; groups {len(groups)})")
                     temp_key, _ = got
                     temporary_keys.append(temp_key)
                     temp_views = [_PoolView(
@@ -847,13 +852,13 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
             # temporaries when the groups were deferred
             need = arena.page_cost(sum(entry_rows(*e) for e in part))
             if arena.evict_retained(need):
-                logger.debug("join chunk of %d groups retried after "
-                             "evicting retained KV", len(part))
+                logger.info("join chunk of %d groups retried after "
+                            "evicting retained KV", len(part))
                 run_part(part, mode)
                 return
             if len(part) < 2:
                 raise
-            logger.debug("join chunk of %d groups split: %s", len(part), error)
+            logger.info("join chunk of %d groups split: %s", len(part), error)
             half = len(part) // 2
             run_part(part[:half], mode)
             run_part(part[half:], mode)
