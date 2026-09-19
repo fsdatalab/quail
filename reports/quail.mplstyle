@@ -1,0 +1,45 @@
+axes.spines.top: False
+axes.spines.right: False
+axes.spines.left: False
+axes.spines.bottom: False
+axes.linewidth: 0.4
+axes.edgecolor: cccccc
+axes.labelsize: 9.5
+axes.labelcolor: 555555
+axes.titlesize: 12
+axes.titleweight: bold
+axes.titlepad: 14
+axes.grid: False
+axes.facecolor: white
+
+xtick.labelsize: 9
+xtick.color: 888888
+xtick.major.width: 0
+xtick.major.size: 0
+
+ytick.labelsize: 9
+ytick.color: 888888
+ytick.major.width: 0
+ytick.major.size: 0
+
+figure.dpi: 180
+figure.facecolor: white
+figure.autolayout: True
+
+savefig.dpi: 180
+savefig.bbox: tight
+savefig.pad_inches: 0.2
+savefig.facecolor: white
+
+font.size: 10
+font.family: sans-serif
+font.sans-serif: Helvetica Neue, Helvetica, Arial, DejaVu Sans
+
+text.color: 333333
+
+lines.linewidth: 1.5
+lines.markersize: 5
+
+legend.frameon: False
+legend.fontsize: 9
+legend.labelcolor: 555555

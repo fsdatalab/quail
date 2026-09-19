@@ -15,7 +15,8 @@ WHERE AI.IF(PROMPT('Does this review discuss the ending?\n\n{0}', r.body))
 
 [Documentation](https://fsdatalab.github.io/quail) |
 [Quickstart](https://fsdatalab.github.io/quail/docs/user-guide/quickstart) |
-[QUAIL-B](https://github.com/fsdatalab/quail-bench)
+[QUAIL-B](https://github.com/fsdatalab/quail-bench) |
+[Benchmark results](reports/quailb-comparison.md)
 
 ## Install
 
@@ -78,7 +79,7 @@ and hardware.
 ## Development
 
 ```bash
-uv run ruff check quail tests experiments tools
+uv run ruff check quail tests experiments tools reports
 uv run python tools/check_long_strings.py
 uv run vulture
 uv run pytest -q
