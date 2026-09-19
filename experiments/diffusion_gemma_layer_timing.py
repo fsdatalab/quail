@@ -17,6 +17,8 @@ Cells, chosen with --runs:
 - micro: the fused elementwise kernels against their unfused parts.
 - stock: one stock vLLM prefill pass under the profiler, for the
   kernel-per-layer figure.
+- seeds: the same filter under several canvas seeds, to measure how
+  many one-row answers change with the random canvas token.
 
 Each cell prints its Modal function call id and writes its record to
 /results/ablations/diffusion_gemma_<cell>.json on the quail-results
@@ -618,6 +620,90 @@ def stock_kernels(prediction: str, n_docs: int = 512,
     return json.dumps(report, indent=2)
 
 
+@app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
+              volumes=volumes)
+def canvas_seeds(prediction: str, reviews: int = 512, seeds: int = 4) -> str:
+    """How much the one-row answer depends on the random canvas token.
+
+    Runs the F1 filter over IMDB reviews once per canvas seed and
+    reports how many answers change between seeds.
+    """
+    import pyarrow.parquet as pq
+    import torch
+    from transformers import AutoTokenizer
+
+    from quail.backends.quail.executor import loop
+    from quail.backends.quail.executor.arena import KVArena
+    from quail.backends.quail.executor.model import load_model
+    from quail.backends.quail.executor.models import build_pipeline
+    from quail.backends.quail.executor.models.diffusion_gemma import (
+        canvas_token_ids,
+    )
+    from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers
+    from quail.cost import budgets
+    from quail.logical import bind_prompt
+    from quail.specs import DEVICES, MODELS
+    from quail_b.data import build_sets
+    from quail_b.prompts import F1
+
+    spec = MODELS[MODEL]
+    device = DEVICES["h100-sxm"]
+    chunk_tokens = budgets.chunk_budget(spec, device)
+    model = load_model(spec.hf_name, max_batched_tokens=chunk_tokens)
+    full_pages, sliding_pages = budgets.arena_pages(spec, device, chunk_tokens,
+                                                    mean_doc_tokens=300)
+    arena = KVArena(n_layers=spec.layers, n_pages=full_pages,
+                    page_tokens=budgets.PAGE_TOKENS, n_kv=spec.n_kv,
+                    d_head=spec.d_head, dtype=torch.bfloat16,
+                    layer_kv=spec.kv_shapes,
+                    sliding_layers=spec.sliding_layer_set,
+                    sliding_window=spec.sliding_window,
+                    n_sliding_pages=sliding_pages)
+    pipeline = build_pipeline(spec, model, arena)
+    tokenizer = AutoTokenizer.from_pretrained(spec.hf_name)
+    rows = AnswerRows.from_tokenizer(torch, torch.nn.functional, model, tokenizer)
+    answers = AsyncAnswers(torch, rows)
+    data = build_sets("/results/quailb_data", 0.1)
+    table = pq.read_table(f"{data}/reviews.parquet")
+    texts = table.column("body").to_pylist()[:reviews]
+
+    def tok(text):
+        return tokenizer(text, add_special_tokens=False)["input_ids"]
+
+    prompt = bind_prompt(F1, ("body",), tok, turn=spec.turn)
+    preamble = list(prompt.preamble_token_ids)
+    docs = [preamble + tok(text) for text in texts]
+    question = list(prompt.tail_token_ids)
+    per_seed = {}
+    with torch.inference_mode():
+        for seed in range(seeds):
+            pipeline.canvas_ids = canvas_token_ids(
+                spec.vocab, spec.canvas_tokens, seed=seed)
+            result, _, _ = loop.run_filter(
+                torch, arena, pipeline, answers, docs, [question],
+                chunk_tokens, arena_writes=True)
+            torch.cuda.synchronize()
+            per_seed[seed] = [bool(result[d][0]) for d in range(len(docs))]
+    flips = {}
+    for a in per_seed:
+        for b in per_seed:
+            if a < b:
+                flips[f"{a}-{b}"] = sum(x != y for x, y in zip(per_seed[a],
+                                                              per_seed[b]))
+    unstable = sum(len({per_seed[s][d] for s in per_seed}) > 1
+                   for d in range(len(docs)))
+    result = {
+        "prediction": prediction, "reviews": len(docs), "seeds": seeds,
+        "canvas_ids": {s: canvas_token_ids(spec.vocab, spec.canvas_tokens, seed=s)
+                       for s in range(seeds)},
+        "true_rate": {s: sum(v) / len(v) for s, v in per_seed.items()},
+        "flips_between_seeds": flips,
+        "reviews_with_any_flip": unstable,
+    }
+    result["volume_path"] = _save("diffusion_gemma_canvas_seeds", result)
+    return json.dumps(result, indent=2)
+
+
 @app.local_entrypoint()
 def main(prediction: str = "", docs: int = 110, doc_tokens: int = 300,
          random_tokens: bool = False, runs: str = "chunk,loop",
@@ -639,6 +725,8 @@ def main(prediction: str = "", docs: int = 110, doc_tokens: int = 300,
         calls["micro"] = micro.spawn(prediction)
     if "stock" in runs:
         calls["stock"] = stock_kernels.spawn(prediction)
+    if "seeds" in runs:
+        calls["seeds"] = canvas_seeds.spawn(prediction)
     for name, call in calls.items():
         print(f"function call id: {call.object_id} ({name})", flush=True)
     for name, call in calls.items():
