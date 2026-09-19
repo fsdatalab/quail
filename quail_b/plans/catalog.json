@@ -136,22 +136,7 @@
   },
   {
     "id": "LEP-5",
-    "description": "LEP1 -> LEP2 -> LEP3 -> join, 3 filters then 1 join",
-    "privacy": false
-  },
-  {
-    "id": "LEP-6",
-    "description": "LEP1..LEP5 -> join, 5 filters then 1 join",
-    "privacy": false
-  },
-  {
-    "id": "LEP-7",
     "description": "2F + 1J: two-sided pushdown - LEP1+LEP2 on excerpts, LEPS1 on passages, each filtered before the join",
-    "privacy": false
-  },
-  {
-    "id": "LEP-8",
-    "description": "LEP1..LEP5, 5 filters, no join",
     "privacy": false
   },
   {

@@ -272,16 +272,8 @@ def main():
                + (len(family_metas) - 1) * domain_y_gap)
 
     n_queries = len(QUERIES)
-    n_predicates = len(set(TEMPLATE_LABELS.keys())
-                       & (set(FILTER_SELECTIVITY_ESTIMATES.keys())
-                          | set(JOIN_SELECTIVITY_ESTIMATES.keys())
-                          | {
-                              filter_spec.prompt
-                              for spec in QUERIES
-                              for filter_spec in spec._info.filters
-                          }
-                          | {j.prompt for s in QUERIES
-                             for j in s._info.joins}))
+    n_predicates = len({f.prompt for s in QUERIES for f in s._info.filters}
+                       | {j.prompt for s in QUERIES for j in s._info.joins})
     n_families = len(family_metas)
     n_tables = len({
         relation.table

@@ -37,6 +37,8 @@ MEASUREMENT_SCHEMA = pa.schema([
     ("expected_rows", pa.int64()),
     ("matching_rows", pa.int64()),
     ("cost_usd", pa.float64()),
+    ("cost_usd_per_million_input_tokens", pa.float64()),
+    ("kv_regret_percent", pa.float64()),
 ])
 
 
@@ -70,6 +72,10 @@ def measurement_rows(record) -> list[dict]:
         expected_rows: Distinct result rows the labels require.
         matching_rows: Expected rows the engine also produced.
         cost_usd: GPU cost of `runtime_s`, or null when no rate was given.
+        cost_usd_per_million_input_tokens: Cost divided by full input tokens,
+            times one million. Null without cost or positive input tokens.
+        kv_regret_percent: Recomputed tokens divided by fresh tokens, times
+            100. Null without regret or positive fresh tokens.
     """
     rows = []
     for item in record["queries"]:
@@ -94,6 +100,9 @@ def measurement_rows(record) -> list[dict]:
             "expected_rows": output["expected_rows"],
             "matching_rows": output["matching_rows"],
             "cost_usd": metrics["cost_usd"],
+            "cost_usd_per_million_input_tokens": metrics.get(
+                "cost_usd_per_million_input_tokens"),
+            "kv_regret_percent": metrics.get("kv_regret_percent"),
         })
     return rows
 
@@ -123,8 +132,9 @@ def _write_report(directory, record):
         "Predicate accuracy is agreement on evaluated answers. Engines may "
         "evaluate different documents and pairs.", "",
         "## Query results", "",
-        "| Query | Status | Seconds | $/query | Throughput | Unit | Input tokens/s |",
-        "| --- | --- | ---: | ---: | ---: | --- | ---: |",
+        "| Query | Status | Seconds | $/query | Throughput | Unit | Input tokens/s "
+        "| $/million input tokens | KV regret (%) |",
+        "| --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: |",
     ]
     for item in record["queries"]:
         metrics = item.get("metrics", {})
@@ -136,7 +146,9 @@ def _write_report(directory, record):
             f"| {item['id']} | {item['status']} | "
             f"{_number(item.get('runtime_s'))} | {_number(metrics.get('cost_usd'))} | "
             f"{_number(throughput)} | {unit} | "
-            f"{_number(metrics.get('input_tokens_per_second'))} |")
+            f"{_number(metrics.get('input_tokens_per_second'))} | "
+            f"{_number(metrics.get('cost_usd_per_million_input_tokens'))} | "
+            f"{_number(metrics.get('kv_regret_percent'))} |")
     lines.extend([
         "", "## Accuracy", "",
         "| Query | Predicate accuracy | Evaluated answers | Output precision | "

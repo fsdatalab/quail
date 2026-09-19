@@ -102,6 +102,8 @@ def test_join_runs_at_all_scales_and_report_cli(tmp_path):
         assert metrics["evaluated_document_pairs"] == 2
         assert metrics["document_pairs_per_second"] == 1.0
         assert metrics["cost_usd"] == 0.004
+        assert metrics["cost_usd_per_million_input_tokens"] is None
+        assert metrics["kv_regret_percent"] is None
         assert metrics["accuracy"]["output_accuracy"]["exact_match"]
         plan_path = destination / "IMDB-4/plan.substrait"
         assert plan_path.read_bytes() == quail_b.get_query("IMDB-4").plan_bytes
@@ -117,7 +119,9 @@ def test_join_runs_at_all_scales_and_report_cli(tmp_path):
     assert calls == ["IMDB-4"] * 3
 
 
-def test_prompt_pieces_give_the_minimum_and_the_regret(tmp_path, monkeypatch):
+@pytest.mark.parametrize("hourly_rate", [None, 0.0, 3.6])
+def test_prompt_pieces_give_the_minimum_and_the_regret(
+        tmp_path, monkeypatch, hourly_rate):
     import quail_b.minimum
 
     def encode(texts):
@@ -151,7 +155,8 @@ def test_prompt_pieces_give_the_minimum_and_the_regret(tmp_path, monkeypatch):
 
     destination = tmp_path / "run"
     record = quail_b.run(execute, queries=["IMDB-4"], output_dir=destination,
-                         root=tmp_path)
+                         root=tmp_path, gpu_count=2,
+                         gpu_hourly_rate_usd=hourly_rate)
     metrics = record["queries"][0]["metrics"]
     # the preamble once, then "good" and "bad" (4 and 3 tokens, sharing
     # nothing); per review the two filter tails and the frame, which
@@ -163,6 +168,11 @@ def test_prompt_pieces_give_the_minimum_and_the_regret(tmp_path, monkeypatch):
     assert metrics["input_tokens"] == 65
     assert metrics["input_tokens_per_second"] == 32.5
     assert metrics["regret_tokens"] == 1000 - minimum
+    cost = None if hourly_rate is None else 2 / 3600 * 2 * hourly_rate
+    cost_per_million = None if cost is None else cost / 65 * 1e6
+    regret_percent = 100 * (1000 - minimum) / 1000
+    assert metrics["cost_usd_per_million_input_tokens"] == cost_per_million
+    assert metrics["kv_regret_percent"] == regret_percent
     assert loaded == ["test-tokenizer"]
     saved = json.loads((destination / "IMDB-4/prompt_pieces.json").read_text())
     assert saved == pieces
@@ -178,10 +188,34 @@ def test_prompt_pieces_give_the_minimum_and_the_regret(tmp_path, monkeypatch):
         "evaluated_document_pairs": 2, "input_rows": 3,
         "answers_evaluated": 2 * stages + 2, "answers_correct": 2 * stages + 2,
         "predicted_rows": 2, "expected_rows": 2, "matching_rows": 2,
-        "cost_usd": None,
+        "cost_usd": cost,
+        "cost_usd_per_million_input_tokens": cost_per_million,
+        "kv_regret_percent": regret_percent,
     }
     assert "| IMDB-4 | r: 2, a: 1 | 65 | 1000 |" in (
         destination / "report.md").read_text()
+
+    report_text = (destination / "report.md").read_text()
+    assert "$/million input tokens | KV regret (%)" in report_text
+    assert "| 95.9 |" in report_text
+
+    def empty(spec, tables):
+        output = execute(spec, tables)
+        output.filter_answers = {
+            key: table.slice(0, 0) for key, table in output.filter_answers.items()}
+        output.join_answers = {
+            key: table.slice(0, 0) for key, table in output.join_answers.items()}
+        output.rows = output.rows.slice(0, 0)
+        output.measurements = {"fresh_tokens": 0}
+        return output
+
+    empty_record = quail_b.run(
+        empty, queries=["IMDB-4"], output_dir=tmp_path / "empty", root=tmp_path,
+        gpu_hourly_rate_usd=3.6)
+    empty_metrics = empty_record["queries"][0]["metrics"]
+    assert empty_metrics["input_tokens"] == 0
+    assert empty_metrics["cost_usd_per_million_input_tokens"] is None
+    assert empty_metrics["kv_regret_percent"] is None
 
     def broken(spec, tables):
         output = execute(spec, tables)

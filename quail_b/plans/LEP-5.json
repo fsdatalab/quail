@@ -110,7 +110,7 @@
                     "common": {
                       "direct": {},
                       "hint": {
-                        "alias": "filter-3"
+                        "alias": "filter-2"
                       }
                     },
                     "condition": {
@@ -119,7 +119,7 @@
                           {
                             "value": {
                               "literal": {
-                                "string": "Judge strictly from the excerpt above whether it treats the cited passage as binding precedent.\n\n{0}\n\nInstruction: answer TRUE if the excerpt treats the cited passage as binding precedent, FALSE otherwise."
+                                "string": "Judge strictly from the excerpt above whether it discusses a procedural or jurisdictional issue.\n\n{0}\n\nInstruction: answer TRUE if the excerpt discusses a procedural or jurisdictional issue, FALSE otherwise."
                               }
                             }
                           },
@@ -149,7 +149,7 @@
                         "common": {
                           "direct": {},
                           "hint": {
-                            "alias": "filter-2"
+                            "alias": "filter-1"
                           }
                         },
                         "condition": {
@@ -158,7 +158,7 @@
                               {
                                 "value": {
                                   "literal": {
-                                    "string": "Judge strictly from the excerpt above whether it discusses a procedural or jurisdictional issue.\n\n{0}\n\nInstruction: answer TRUE if the excerpt discusses a procedural or jurisdictional issue, FALSE otherwise."
+                                    "string": "Judge strictly from the excerpt above whether it argues that the cited case's reasoning does not apply here.\n\n{0}\n\nInstruction: answer TRUE if the excerpt argues the cited case's reasoning does not apply here, FALSE otherwise."
                                   }
                                 }
                               },
@@ -184,79 +184,38 @@
                           }
                         },
                         "input": {
-                          "filter": {
-                            "common": {
-                              "direct": {},
-                              "hint": {
-                                "alias": "filter-1"
-                              }
-                            },
-                            "condition": {
-                              "scalar_function": {
-                                "arguments": [
+                          "read": {
+                            "base_schema": {
+                              "names": [
+                                "id",
+                                "destination_context"
+                              ],
+                              "struct": {
+                                "nullability": "NULLABILITY_REQUIRED",
+                                "types": [
                                   {
-                                    "value": {
-                                      "literal": {
-                                        "string": "Judge strictly from the excerpt above whether it argues that the cited case's reasoning does not apply here.\n\n{0}\n\nInstruction: answer TRUE if the excerpt argues the cited case's reasoning does not apply here, FALSE otherwise."
-                                      }
+                                    "string": {
+                                      "nullability": "NULLABILITY_REQUIRED"
                                     }
                                   },
                                   {
-                                    "value": {
-                                      "selection": {
-                                        "direct_reference": {
-                                          "struct_field": {
-                                            "field": 1
-                                          }
-                                        },
-                                        "root_reference": {}
-                                      }
+                                    "string": {
+                                      "nullability": "NULLABILITY_REQUIRED"
                                     }
                                   }
-                                ],
-                                "function_reference": 1,
-                                "output_type": {
-                                  "bool": {
-                                    "nullability": "NULLABILITY_REQUIRED"
-                                  }
-                                }
+                                ]
                               }
                             },
-                            "input": {
-                              "read": {
-                                "base_schema": {
-                                  "names": [
-                                    "id",
-                                    "destination_context"
-                                  ],
-                                  "struct": {
-                                    "nullability": "NULLABILITY_REQUIRED",
-                                    "types": [
-                                      {
-                                        "string": {
-                                          "nullability": "NULLABILITY_REQUIRED"
-                                        }
-                                      },
-                                      {
-                                        "string": {
-                                          "nullability": "NULLABILITY_REQUIRED"
-                                        }
-                                      }
-                                    ]
-                                  }
-                                },
-                                "common": {
-                                  "direct": {},
-                                  "hint": {
-                                    "alias": "d"
-                                  }
-                                },
-                                "named_table": {
-                                  "names": [
-                                    "citation_contexts"
-                                  ]
-                                }
+                            "common": {
+                              "direct": {},
+                              "hint": {
+                                "alias": "d"
                               }
+                            },
+                            "named_table": {
+                              "names": [
+                                "citation_contexts"
+                              ]
                             }
                           }
                         }
@@ -265,38 +224,79 @@
                   }
                 },
                 "right": {
-                  "read": {
-                    "base_schema": {
-                      "names": [
-                        "id",
-                        "passage_text"
-                      ],
-                      "struct": {
-                        "nullability": "NULLABILITY_REQUIRED",
-                        "types": [
-                          {
-                            "string": {
-                              "nullability": "NULLABILITY_REQUIRED"
-                            }
-                          },
-                          {
-                            "string": {
-                              "nullability": "NULLABILITY_REQUIRED"
-                            }
-                          }
-                        ]
-                      }
-                    },
+                  "filter": {
                     "common": {
                       "direct": {},
                       "hint": {
-                        "alias": "s"
+                        "alias": "filter-3"
                       }
                     },
-                    "named_table": {
-                      "names": [
-                        "citation_passages"
-                      ]
+                    "condition": {
+                      "scalar_function": {
+                        "arguments": [
+                          {
+                            "value": {
+                              "literal": {
+                                "string": "Judge strictly from the passage above whether it states a general legal rule.\n\n{0}\n\nInstruction: answer TRUE if the passage states a general legal rule, FALSE otherwise."
+                              }
+                            }
+                          },
+                          {
+                            "value": {
+                              "selection": {
+                                "direct_reference": {
+                                  "struct_field": {
+                                    "field": 1
+                                  }
+                                },
+                                "root_reference": {}
+                              }
+                            }
+                          }
+                        ],
+                        "function_reference": 1,
+                        "output_type": {
+                          "bool": {
+                            "nullability": "NULLABILITY_REQUIRED"
+                          }
+                        }
+                      }
+                    },
+                    "input": {
+                      "read": {
+                        "base_schema": {
+                          "names": [
+                            "id",
+                            "passage_text"
+                          ],
+                          "struct": {
+                            "nullability": "NULLABILITY_REQUIRED",
+                            "types": [
+                              {
+                                "string": {
+                                  "nullability": "NULLABILITY_REQUIRED"
+                                }
+                              },
+                              {
+                                "string": {
+                                  "nullability": "NULLABILITY_REQUIRED"
+                                }
+                              }
+                            ]
+                          }
+                        },
+                        "common": {
+                          "direct": {},
+                          "hint": {
+                            "alias": "s"
+                          }
+                        },
+                        "named_table": {
+                          "names": [
+                            "citation_passages"
+                          ]
+                        }
+                      }
                     }
                   }
                 },

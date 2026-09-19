@@ -1,6 +1,6 @@
 # QUAIL-B
 
-QUAIL-B is an academic benchmark of 33 AI SQL queries over document tables.
+QUAIL-B is an academic benchmark of 30 AI SQL queries over document tables.
 It publishes Substrait query plans, input tables, reference labels, and a
 scoring harness. It does not include an execution engine.
 

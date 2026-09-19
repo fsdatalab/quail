@@ -114,13 +114,13 @@ LEP5 = ("Judge strictly from the excerpt above whether it acknowledges "
         "Instruction: answer TRUE if the excerpt acknowledges "
         "disagreement between courts on the issue, FALSE otherwise.")
 
-# LEP-7 only: filters the passage side of the self-join, not just the
+# LEP-5 only: filters the passage side of the self-join, not just the
 # excerpt (anchor) side.
 LEPS1 = ("Judge strictly from the passage above whether it states a "
          "general legal rule.\n\n{0}\n\nInstruction: answer TRUE if "
          "the passage states a general legal rule, FALSE otherwise.")
 
-# The LEP-2..LEP-7 join predicate. Ground truth comes from the
+# The LEP-2..LEP-5 join predicate. Ground truth comes from the
 # dataset's own passage_id, not a judge pass.
 LEPJOIN = ("Is the passage in DOCUMENT {1} cited by the legal excerpt "
            "in DOCUMENT {0}?")
