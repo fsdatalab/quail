@@ -21,7 +21,6 @@ from pathlib import Path
 
 import modal
 
-from quail.bench.requirements import quail_b_requirement, quail_requirements
 from quail.bench.results import combine_measurements, write_json
 
 base_image = (
@@ -31,8 +30,6 @@ base_image = (
     .apt_install("git")
     # quail-b installs from git at the pinned commit, with its plan files
     # and its own dependencies
-    .pip_install(*quail_requirements(without=("vllm",)),
-                 quail_b_requirement())
     .env({
         "QUAIL_CACHE_DIR": "/root/.cache/kernels",
         "VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
@@ -46,9 +43,15 @@ base_image = (
     })
 )
 # local sources go last: Modal refuses a build step after them
-image = base_image.pip_install("vllm==0.26.0").add_local_python_source("quail")
-sglang_image = base_image.pip_install(
-    "sglang==0.5.18").add_local_python_source("quail")
+# quail's pinned dependencies and the dev group (quail-b among them)
+# from uv.lock; the SGLang image leaves vLLM out and brings its own
+# serving stack
+image = base_image.uv_sync(groups=["dev"]).add_local_python_source("quail")
+sglang_image = (
+    base_image
+    .uv_sync(groups=["dev"], extra_options="--no-install-package vllm")
+    .uv_pip_install("sglang==0.5.18")
+    .add_local_python_source("quail"))
 
 app = modal.App("quail-milestone1")
 hf_cache = modal.Volume.from_name("quail-hf-cache", create_if_missing=True)

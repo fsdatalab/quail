@@ -35,8 +35,6 @@ import time
 
 import modal
 
-from quail.bench.requirements import quail_b_requirement, quail_requirements
-
 IMAGE_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
 MODEL = "diffusion-gemma-26b-a4b-fp8"
 
@@ -44,8 +42,9 @@ image = (
     modal.Image.from_registry(IMAGE_BASE, add_python="3.12")
     .entrypoint([])
     .apt_install("git")
-    .pip_install(*quail_requirements(), "hf_transfer", "pandas",
-                 quail_b_requirement())
+    # quail's pinned dependencies and the dev group (quail-b among
+    # them) from uv.lock; the quail source is mounted after
+    .uv_sync(groups=["dev"])
     .env({
         "VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
         "VLLM_LOGGING_LEVEL": "WARNING",

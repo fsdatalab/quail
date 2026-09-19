@@ -38,7 +38,6 @@ from pathlib import Path
 import modal
 import pyarrow as pa
 
-from quail.bench.requirements import quail_b_requirement, quail_requirements
 from quail_b import data
 from quail_b.data import GROUND_TRUTH_ROOT, PUBLIC_BUCKET
 from quail_b.predicates import (
@@ -1451,7 +1450,9 @@ image = (
         "nvidia/cuda:13.0.1-devel-ubuntu24.04", add_python="3.12")
     .entrypoint([])
     .apt_install("git")
-    .pip_install(*quail_requirements(), quail_b_requirement())
+    # quail's pinned dependencies and the dev group (quail-b among
+    # them) from uv.lock; the quail source is mounted after
+    .uv_sync(groups=["dev"])
     .env({
         "QUAIL_CACHE_DIR": "/root/.cache/kernels",
         "VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
@@ -1468,8 +1469,8 @@ image = (
 publish_image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("git")
-    .pip_install(*quail_requirements(without=("vllm",)), "boto3",
-                 quail_b_requirement())
+    # the dev group carries boto3 for the upload; no GPU stack here
+    .uv_sync(groups=["dev"], extra_options="--no-install-package vllm")
     .add_local_python_source("quail"))
 
 

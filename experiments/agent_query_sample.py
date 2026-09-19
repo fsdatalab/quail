@@ -23,7 +23,6 @@ from pathlib import Path
 
 import modal
 
-from quail.bench.requirements import quail_requirements
 from quail.specs import H100_USD_PER_HOUR
 
 IMAGE_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
@@ -75,7 +74,10 @@ MODELS = {
 image = (
     modal.Image.from_registry(IMAGE_BASE, add_python="3.12")
     .entrypoint([])
-    .pip_install(*quail_requirements(), "pandas")
+    .apt_install("git")
+    # quail's pinned dependencies and the dev group (quail-b among
+    # them) from uv.lock; the quail source is mounted after
+    .uv_sync(groups=["dev"])
     .env({
         "VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
         "VLLM_LOGGING_LEVEL": "WARNING",
@@ -86,19 +88,21 @@ image = (
         "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
         "TRITON_CACHE_DIR": "/root/.cache/kernels/triton",
     })
-    .add_local_python_source("quail", "quail_b")
+    .add_local_python_source("quail")
 )
 
 data_image = (
     modal.Image.debian_slim(python_version="3.12")
-    .pip_install(*quail_requirements(without=("vllm",)), "pandas")
-    .add_local_python_source("quail", "quail_b")
+    .apt_install("git")
+    .uv_sync(groups=["dev"], extra_options="--no-install-package vllm")
+    .add_local_python_source("quail")
 )
 
 finalize_image = (
     modal.Image.debian_slim(python_version="3.12")
-    .pip_install("pyarrow")
-    .add_local_python_source("quail", "quail_b")
+    .apt_install("git")
+    .uv_sync(groups=["dev"], extra_options="--no-install-package vllm")
+    .add_local_python_source("quail")
 )
 
 app = modal.App("quail-milestone1")
