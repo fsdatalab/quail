@@ -15,20 +15,48 @@ MAX_BATCHED_TOKENS = 25_305
 
 
 _ANSWER_WORD = re.compile(r"\b(TRUE|FALSE)\b")
+_WHOLE_ANSWER_WORD = re.compile(r"^\s*(TRUE|FALSE)\s*$")
+
+
+def _ranked_answer(logprobs, true_ids):
+    """The likelier of TRUE and FALSE in the first position's logprobs.
+
+    Returns 1 or 0, or None when neither answer word is among them.
+    """
+    if not logprobs:
+        return None
+    best = None
+    for token_id, entry in logprobs[0].items():
+        if int(token_id) in true_ids:
+            word = "TRUE"
+        else:
+            match = _WHOLE_ANSWER_WORD.match(
+                getattr(entry, "decoded_token", None) or "")
+            if match is None:
+                continue
+            word = match.group(1)
+        if best is None or entry.logprob > best[0]:
+            best = (entry.logprob, word)
+    return None if best is None else int(best[1] == "TRUE")
 
 
 def true_bit(output, true_ids) -> int:
     """Whether the request answered TRUE.
 
     The first generated token decides when it is a TRUE id, which the
-    allowed-token sampling of a decoder guarantees. A diffusion model
-    writes free text on its canvas, so its answer is the first TRUE or
-    FALSE word in the text; no answer word counts as FALSE.
+    allowed-token sampling of a decoder guarantees. A diffusion model's
+    sampler cannot restrict its tokens: with logprobs at the answer
+    row, TRUE and FALSE are ranked against each other; otherwise the
+    answer is the first TRUE or FALSE word in the text. No answer word
+    counts as FALSE.
     """
     completion = output.outputs[0]
     token_ids = completion.token_ids
     if token_ids and int(token_ids[0]) in true_ids:
         return 1
+    ranked = _ranked_answer(getattr(completion, "logprobs", None), true_ids)
+    if ranked is not None:
+        return ranked
     match = _ANSWER_WORD.search(getattr(completion, "text", "") or "")
     return int(match is not None and match.group(1) == "TRUE")
 

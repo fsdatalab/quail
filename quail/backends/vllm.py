@@ -13,6 +13,13 @@ from quail.backends.request_scheduling import (
 
 GPU_MEMORY_UTILIZATION = 0.91
 CUDA_GRAPH_CAPTURE_SIZE = 8_192
+# vLLM caps a diffusion model at 8 sequences per step whenever the
+# setting is 128 or more, sized for its 256-row canvas; one row needs
+# no cap, so stay just under the trigger.
+DIFFUSION_SEQUENCES = 127
+# top logprobs read at the canvas row; the answer word is in the top
+# 20 on 62 of 64 probed reviews
+DIFFUSION_LOGPROBS = 20
 
 
 def _capacity(llm) -> dict:
@@ -38,14 +45,18 @@ def _capacity(llm) -> dict:
     }
 
 
-def sampling_kwargs(allowed_ids: list[int], diffusion: bool = False) -> dict:
+def sampling_kwargs(allowed_ids: list[int], canvas_tokens: int = 0) -> dict:
     """SamplingParams arguments for one greedy answer token.
 
     A diffusion model's sampler takes no temperature, min_tokens, or
-    allowed_token_ids, and writes free text on its canvas, so it gets
-    room for a few words and the reader finds the answer word.
+    allowed_token_ids. With a one-row canvas it commits that row after
+    one pass and returns its top logprobs, which the reader ranks TRUE
+    against FALSE; a longer canvas writes free text, and the reader
+    finds the answer word.
     """
-    if diffusion:
+    if canvas_tokens == 1:
+        return {"max_tokens": 1, "logprobs": DIFFUSION_LOGPROBS}
+    if canvas_tokens:
         return {"max_tokens": 16}
     return {"temperature": 0.0, "max_tokens": 1, "min_tokens": 1,
             "allowed_token_ids": allowed_ids}
@@ -92,15 +103,15 @@ class VLLMEngine:
 
         A spec with its own chunk cap (a mixture-of-experts model)
         batches at least that many tokens per step. A diffusion model
-        keeps the checkpoint's own canvas: with a one-row canvas its
-        sampler writes end-of-turn tokens instead of answers.
+        gets the spec's canvas; a one-row canvas takes one denoising
+        step, so a request is one prefill pass plus one row.
         """
         batched = MAX_BATCHED_TOKENS
+        sequences = MAX_SEQUENCES
         if spec is not None:
             batched = max(batched, spec.chunk_cap_tokens)
         kwargs = {
             "max_num_batched_tokens": batched,
-            "max_num_seqs": MAX_SEQUENCES,
             "gpu_memory_utilization": GPU_MEMORY_UTILIZATION,
             "enable_prefix_caching": True,
             "disable_log_stats": True,
@@ -108,6 +119,13 @@ class VLLMEngine:
                 "cudagraph_capture_sizes": [CUDA_GRAPH_CAPTURE_SIZE]
             },
         }
+        if spec is not None and spec.canvas_tokens:
+            diffusion = {"canvas_length": spec.canvas_tokens}
+            if spec.canvas_tokens == 1:
+                diffusion["max_denoising_steps"] = 1
+                sequences = DIFFUSION_SEQUENCES
+            kwargs["diffusion_config"] = diffusion
+        kwargs["max_num_seqs"] = sequences
         return kwargs
 
     def boot(self, model_name: str, allowed_ids: list[int],
@@ -117,8 +135,9 @@ class VLLMEngine:
         started = time.perf_counter()
         llm = LLM(model=model_name, **self.llm_kwargs(spec))
         boot_s = time.perf_counter() - started
-        diffusion = bool(spec is not None and spec.canvas_tokens)
-        sampling_params = SamplingParams(**sampling_kwargs(allowed_ids, diffusion))
+        canvas_tokens = 0 if spec is None else spec.canvas_tokens
+        sampling_params = SamplingParams(
+            **sampling_kwargs(allowed_ids, canvas_tokens))
         capacity = _capacity(llm)
         client = VLLMClient(llm, capacity)
         client.generate(
