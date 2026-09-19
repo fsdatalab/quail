@@ -23,10 +23,10 @@ from pathlib import Path
 
 import modal
 
+from quail.specs import H100_USD_PER_HOUR
+
 # the uv the images sync with; pyproject.toml requires this version
 UV_VERSION = "0.12.13"
-
-from quail.specs import H100_USD_PER_HOUR
 
 IMAGE_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
 SAMPLE_SIZE = 200

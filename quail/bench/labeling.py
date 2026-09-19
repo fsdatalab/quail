@@ -36,9 +36,6 @@ from dataclasses import asdict
 from pathlib import Path
 
 import modal
-
-# the uv the images sync with; pyproject.toml requires this version
-UV_VERSION = "0.12.13"
 import pyarrow as pa
 
 from quail_b import data
@@ -62,6 +59,9 @@ from quail_b.predicates import (
 )
 from quail_b.predicates import label_set_identity as _label_set_identity
 from quail_b.rendering import PROMPT_FORMAT
+
+# the uv the images sync with; pyproject.toml requires this version
+UV_VERSION = "0.12.13"
 
 SCALE_FACTOR = 0.1
 SUPPORTED_SCALE_FACTORS = (0.1, 0.5, 1.0)

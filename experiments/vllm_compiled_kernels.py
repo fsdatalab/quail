@@ -53,10 +53,10 @@ import os
 
 import modal
 
+from quail.backends.quail.executor.attention import GROUP, Engine
+
 # the uv the images sync with; pyproject.toml requires this version
 UV_VERSION = "0.12.13"
-
-from quail.backends.quail.executor.attention import GROUP, Engine
 
 IMAGE_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
 

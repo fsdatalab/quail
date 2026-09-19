@@ -21,10 +21,10 @@ from pathlib import Path
 
 import modal
 
+from quail.bench.results import combine_measurements, write_json
+
 # the uv the images sync with; pyproject.toml requires this version
 UV_VERSION = "0.12.13"
-
-from quail.bench.results import combine_measurements, write_json
 
 base_image = (
     modal.Image.from_registry(
@@ -49,7 +49,8 @@ base_image = (
 # quail's pinned dependencies and the dev group (quail-b among them)
 # from uv.lock; the SGLang image leaves vLLM out and brings its own
 # serving stack
-image = base_image.uv_sync(groups=["dev"], uv_version=UV_VERSION).add_local_python_source("quail")
+image = (base_image.uv_sync(groups=["dev"], uv_version=UV_VERSION)
+         .add_local_python_source("quail"))
 sglang_image = (
     base_image
     .uv_sync(groups=["dev"], uv_version=UV_VERSION,
