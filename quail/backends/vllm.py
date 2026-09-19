@@ -38,6 +38,19 @@ def _capacity(llm) -> dict:
     }
 
 
+def sampling_kwargs(allowed_ids: list[int], diffusion: bool = False) -> dict:
+    """SamplingParams arguments for one greedy answer token.
+
+    A diffusion model's sampler takes no temperature, min_tokens, or
+    allowed_token_ids; it commits the argmax of its canvas, so its
+    first token is the greedy answer without them.
+    """
+    if diffusion:
+        return {"max_tokens": 1}
+    return {"temperature": 0.0, "max_tokens": 1, "min_tokens": 1,
+            "allowed_token_ids": allowed_ids}
+
+
 class VLLMClient:
     """The request operations the backends need from one vLLM LLM."""
 
@@ -74,10 +87,17 @@ class VLLMEngine:
     label = "vLLM"
     runtime_package = "vllm==0.26.0"
 
-    def llm_kwargs(self) -> dict:
-        """Return the LLM constructor arguments beyond the model name."""
+    def llm_kwargs(self, spec=None) -> dict:
+        """Return the LLM constructor arguments beyond the model name.
+
+        A spec with its own chunk cap (a mixture-of-experts model)
+        batches at least that many tokens per step.
+        """
+        batched = MAX_BATCHED_TOKENS
+        if spec is not None:
+            batched = max(batched, spec.chunk_cap_tokens)
         return {
-            "max_num_batched_tokens": MAX_BATCHED_TOKENS,
+            "max_num_batched_tokens": batched,
             "max_num_seqs": MAX_SEQUENCES,
             "gpu_memory_utilization": GPU_MEMORY_UTILIZATION,
             "enable_prefix_caching": True,
@@ -87,18 +107,15 @@ class VLLMEngine:
             },
         }
 
-    def boot(self, model_name: str, allowed_ids: list[int]) -> tuple[dict, dict]:
+    def boot(self, model_name: str, allowed_ids: list[int],
+             spec=None) -> tuple[dict, dict]:
         from vllm import LLM, SamplingParams
 
         started = time.perf_counter()
-        llm = LLM(model=model_name, **self.llm_kwargs())
+        llm = LLM(model=model_name, **self.llm_kwargs(spec))
         boot_s = time.perf_counter() - started
-        sampling_params = SamplingParams(
-            temperature=0.0,
-            max_tokens=1,
-            min_tokens=1,
-            allowed_token_ids=allowed_ids,
-        )
+        diffusion = bool(spec is not None and spec.canvas_tokens)
+        sampling_params = SamplingParams(**sampling_kwargs(allowed_ids, diffusion))
         capacity = _capacity(llm)
         client = VLLMClient(llm, capacity)
         client.generate(
@@ -131,7 +148,7 @@ class DefaultVLLMEngine(VLLMEngine):
     kind = "dumb_vllm"
     label = "vLLM with default settings"
 
-    def llm_kwargs(self) -> dict:
+    def llm_kwargs(self, spec=None) -> dict:
         return {}
 
 

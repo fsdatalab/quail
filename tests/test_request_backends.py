@@ -113,7 +113,7 @@ def test_request_backends_plan_validate_and_execute(monkeypatch):
 
         patch.setattr(
             "quail.backends.vllm.VLLMEngine.boot",
-            lambda self, model_name, allowed_ids: (
+            lambda self, model_name, allowed_ids, spec=None: (
                 {
                     "client": client,
                     "sampling_params": object(),
@@ -412,3 +412,20 @@ def test_sglang_submission_and_cancellation():
         assert len(aborted) == 1
 
     asyncio.run(run())
+
+
+def test_vllm_engine_settings_follow_the_model():
+    from quail.backends.vllm import VLLMEngine, sampling_kwargs
+    from quail.specs import DIFFUSION_GEMMA_26B_FP8, QWEN3_4B_FP8
+
+    engine = VLLMEngine()
+    assert engine.llm_kwargs()["max_num_batched_tokens"] == 25_305
+    assert engine.llm_kwargs(QWEN3_4B_FP8)["max_num_batched_tokens"] == 25_305
+    # the mixture-of-experts model batches its own chunk cap
+    assert engine.llm_kwargs(
+        DIFFUSION_GEMMA_26B_FP8)["max_num_batched_tokens"] == 65_536
+    assert sampling_kwargs([1, 2]) == {
+        "temperature": 0.0, "max_tokens": 1, "min_tokens": 1,
+        "allowed_token_ids": [1, 2]}
+    # the diffusion sampler rejects everything but the length
+    assert sampling_kwargs([1, 2], diffusion=True) == {"max_tokens": 1}

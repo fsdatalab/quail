@@ -98,6 +98,11 @@ def ensure_data(sf: float, query_ids: list[str], collection_id: str):
     return suite.ground_truth.collection_id
 
 
+def _methods(csv: str) -> list[str]:
+    """The method names in a comma-separated list."""
+    return [item.strip() for item in csv.split(",") if item.strip()]
+
+
 def _run_family(process_groups, result_name, model, sf, query_ids_csv,
                 run_dir, ground_truth_collection, root=None) -> str:
     """Run one query family's methods, one child process per group.
@@ -168,18 +173,21 @@ def run_query_family(
     include_quail: bool = True,
     include_dumb_vllm: bool = False,
     join_attention: str = "",
+    baselines: str = "stock_vllm,pipelined_vllm",
 ) -> str:
     """Run one query family through Quail and the vLLM baselines.
 
     join_attention forces the join's attention path ("unified") for
     measuring the two-call path's gain; empty keeps the default.
+    baselines names the vLLM baseline methods that run when
+    include_baselines is set.
     """
     import os
     if join_attention:
         os.environ["QUAIL_JOIN_ATTENTION"] = join_attention
     process_groups = [("quail",)] if include_quail else []
     if include_baselines:
-        process_groups.append(("stock_vllm", "pipelined_vllm"))
+        process_groups.append(tuple(_methods(baselines)))
     if include_dumb_vllm:
         process_groups.append(("dumb_vllm",))
     try:
@@ -264,6 +272,7 @@ def run_all(
     include_quail: bool = True,
     include_dumb_vllm: bool = False,
     join_attention: str = "",
+    baselines: str = "stock_vllm,pipelined_vllm",
 ):
     from quail_b import select_queries
     from quail_b.queries import query_family_name, split_query_families
@@ -315,6 +324,7 @@ def run_all(
                     include_quail=include_quail,
                     include_dumb_vllm=include_dumb_vllm,
                     join_attention=join_attention,
+                    baselines=baselines,
                 )
                 family_calls.append((family, family_call))
                 call_ids[f"{family}:quail_vllm"] = family_call.object_id
@@ -356,7 +366,7 @@ def run_all(
 
         methods = (
             (("quail",) if include_quail else ())
-            + (("stock_vllm", "pipelined_vllm") if include_baselines else ())
+            + (tuple(_methods(baselines)) if include_baselines else ())
             + (("dumb_vllm",) if include_dumb_vllm else ())
             + (("pipelined_sglang",) if include_sglang else ()))
         reports = {}
@@ -421,6 +431,7 @@ def main(
     include_quail: bool = True,
     include_dumb_vllm: bool = False,
     join_attention: str = "",
+    baselines: str = "stock_vllm,pipelined_vllm",
 ):
     run_id = (
         f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-"
@@ -438,6 +449,7 @@ def main(
         include_quail=include_quail,
         include_dumb_vllm=include_dumb_vllm,
         join_attention=join_attention,
+        baselines=baselines,
     )
     print(f"function call id: {call.object_id} (all families)", flush=True)
     print(call.get(), flush=True)

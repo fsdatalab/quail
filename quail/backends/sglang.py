@@ -129,7 +129,8 @@ class SGLangEngine:
     label = "SGLang"
     runtime_package = "sglang==0.5.18"
 
-    def boot(self, model_name: str, allowed_ids: list[int]) -> tuple[dict, dict]:
+    def boot(self, model_name: str, allowed_ids: list[int],
+             spec=None) -> tuple[dict, dict]:
         import sglang as sgl
 
         started = time.perf_counter()
