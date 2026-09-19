@@ -21,6 +21,9 @@ import time
 
 import modal
 
+# the uv the images sync with; pyproject.toml requires this version
+UV_VERSION = "0.12.13"
+
 MODEL = "diffusion-gemma-26b-a4b-fp8"
 
 image = (
@@ -30,7 +33,7 @@ image = (
     .apt_install("git")
     # quail's pinned dependencies and the dev group (quail-b among
     # them) from uv.lock; the quail source is mounted after
-    .uv_sync(groups=["dev"])
+    .uv_sync(groups=["dev"], uv_version=UV_VERSION)
     .env({
         "VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
         "VLLM_LOGGING_LEVEL": "WARNING",

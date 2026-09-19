@@ -24,6 +24,9 @@ import time
 
 import modal
 
+# the uv the images sync with; pyproject.toml requires this version
+UV_VERSION = "0.12.13"
+
 IMAGE_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
 
 image = (
@@ -34,7 +37,7 @@ image = (
     # files and its own dependencies (the Substrait bindings among them)
     # quail's pinned dependencies and the dev group (quail-b among
     # them) from uv.lock; the quail source is mounted after
-    .uv_sync(groups=["dev"])
+    .uv_sync(groups=["dev"], uv_version=UV_VERSION)
     .env({
         "VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
         "VLLM_LOGGING_LEVEL": "WARNING",

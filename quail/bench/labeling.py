@@ -36,6 +36,9 @@ from dataclasses import asdict
 from pathlib import Path
 
 import modal
+
+# the uv the images sync with; pyproject.toml requires this version
+UV_VERSION = "0.12.13"
 import pyarrow as pa
 
 from quail_b import data
@@ -1452,7 +1455,7 @@ image = (
     .apt_install("git")
     # quail's pinned dependencies and the dev group (quail-b among
     # them) from uv.lock; the quail source is mounted after
-    .uv_sync(groups=["dev"])
+    .uv_sync(groups=["dev"], uv_version=UV_VERSION)
     .env({
         "QUAIL_CACHE_DIR": "/root/.cache/kernels",
         "VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
@@ -1470,7 +1473,8 @@ publish_image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("git")
     # the dev group carries boto3 for the upload; no GPU stack here
-    .uv_sync(groups=["dev"], extra_options="--no-install-package vllm")
+    .uv_sync(groups=["dev"], uv_version=UV_VERSION,
+             extra_options="--no-install-package vllm")
     .add_local_python_source("quail"))
 
 
