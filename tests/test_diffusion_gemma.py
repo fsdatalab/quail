@@ -5,9 +5,8 @@ import sys
 import types
 from types import SimpleNamespace
 
-import numpy as np
 import pytest
-from fakes import cpu_arena, fake_pipeline, fake_torch
+from fakes import cpu_arena, cpu_staging, fake_pipeline, fake_torch
 
 from quail.backends.quail.backend import QuailBackend
 from quail.backends.quail.executor import loop
@@ -152,27 +151,8 @@ def test_filter_stream_charges_canvas_rows():
     assert stream.sched.free_pages is not None
 
 
-def _cpu_staging(monkeypatch):
-    import torch
-
-    def staged(torch_, data, dtype, pinned=True):
-        if isinstance(data, np.ndarray) or torch.is_tensor(data):
-            return torch.as_tensor(data, dtype=dtype)
-        return torch.tensor(data, dtype=dtype)
-
-    def token_parts(torch_, sequences, total, pinned=True, staging=None):
-        ids = [int(t) for seq in sequences for part in loop._token_parts(seq)
-               for t in part]
-        assert len(ids) == total
-        return torch.tensor(ids, dtype=torch.int64)
-
-    monkeypatch.setattr(loop, "_staged", staged)
-    monkeypatch.setattr(loop, "_staged_token_parts", token_parts)
-    return torch
-
-
 def test_pack_chunk_appends_canvas_rows_after_each_suffix(monkeypatch):
-    torch = _cpu_staging(monkeypatch)
+    torch = cpu_staging(monkeypatch)
     arena = cpu_arena(64)
     canvas = (90, 91, 92, 93)
     groups = [dict(key=("d", 0), prefix=[1, 2, 3], f=3, suffixes=[[10, 11]]),
@@ -365,6 +345,13 @@ def _fake_model(torch, hidden=4, layer_scalar=0.5):
 
 
 def test_pipeline_runs_the_gemma4_layer_order(monkeypatch):
+    """The layer order and the residual arithmetic, on identity fakes.
+
+    The fused kernels are stand-ins here (a norm is x times its weight,
+    quantization is skipped), so this checks which kernel runs when and
+    what it is handed, not the kernels; tests/gpu compares the real
+    kernels against stock vLLM layer by layer.
+    """
     torch = pytest.importorskip("torch")
     context = types.ModuleType("vllm.forward_context")
     seen = {}
@@ -493,7 +480,7 @@ def test_one_row_canvas_skips_the_second_attention_call(
 
     from quail.backends.quail.executor.attention import Engine
 
-    _cpu_staging(monkeypatch)
+    cpu_staging(monkeypatch)
     arena = cpu_arena(64)
     groups = [dict(key=("d", 0), prefix=[1, 2, 3], f=3, suffixes=[[10, 11]])]
     chunk = loop.pack_chunk(torch, arena, groups, attention_mode="unified",

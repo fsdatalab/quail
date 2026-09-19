@@ -418,7 +418,7 @@ def test_benchmark_query_prompts_and_labels():
             # only the FEVER tables are registered
             assert all(query_id.startswith("FEV-") for query_id in queries(session))
 
-    # the benchmark renders the Qwen3 chat layout
+    # the benchmark renders the same raw prompt as Quail; Qwen has no turn text
     from quail.specs import QWEN3_4B_FP8
     from quail_b.predicates import PREDICATES
     from quail_b.rendering import render_filter_prompt, render_join_prompt

@@ -139,7 +139,7 @@ class JoinAdmission:
             and after a frame entry. They take chunk room and page
             room but are never kept in the anchor's KV.
         page_cost: Callable(tokens, base_tokens) giving the pages a
-            key of that many rows takes, in the arena's currency; None
+            key of that many rows takes, in the arena's every-token pages; None
             prices one pool of page_tokens pages.
 
     Each chunk fills in priority order: partner streams cut by the
@@ -160,7 +160,7 @@ class JoinAdmission:
                  answer_dtype=None, canvas_tokens=0, page_cost=None):
         self.answer_dtype = answer_dtype
         # page_cost(tokens, base_tokens) prices a key in the arena's
-        # currency; the default is one pool of page_tokens pages
+        # every-token pages; the default is one pool of page_tokens pages
         self.page_cost = page_cost or (
             lambda tokens, base_tokens=None: pages_for(tokens, page_tokens))
         self._answer_counts = [{} for _ in stage_suffixes]
@@ -537,7 +537,7 @@ class FilterAdmission:
             pages (shared preamble plus tail room).
         limit: Stop after this many survivors.
         page_cost: Callable(tokens, base_tokens) giving the pages a
-            document of that many rows takes, in the arena's currency;
+            document of that many rows takes, in the arena's every-token pages;
             None prices one pool of page_tokens pages.
 
     Survivor suffixes pack before fresh admissions. Pages are granted

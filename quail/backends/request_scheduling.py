@@ -15,28 +15,25 @@ MAX_BATCHED_TOKENS = 25_305
 
 
 _ANSWER_WORD = re.compile(r"\b(TRUE|FALSE)\b")
-_WHOLE_ANSWER_WORD = re.compile(r"^\s*(TRUE|FALSE)\s*$")
+_WHOLE_ANSWER_WORD = re.compile(r"^\s*(TRUE|FALSE)\s*$", re.IGNORECASE)
 
 
-def _ranked_answer(logprobs, true_ids):
+def _ranked_answer(logprobs):
     """The likelier of TRUE and FALSE in the first position's logprobs.
 
-    Returns 1 or 0, or None when neither answer word is among them.
+    Each entry is judged by its decoded token. Returns 1 or 0, or None
+    when neither answer word is among the entries.
     """
     if not logprobs:
         return None
     best = None
-    for token_id, entry in logprobs[0].items():
-        if int(token_id) in true_ids:
-            word = "TRUE"
-        else:
-            match = _WHOLE_ANSWER_WORD.match(
-                getattr(entry, "decoded_token", None) or "")
-            if match is None:
-                continue
-            word = match.group(1)
+    for entry in logprobs[0].values():
+        match = _WHOLE_ANSWER_WORD.match(
+            getattr(entry, "decoded_token", None) or "")
+        if match is None:
+            continue
         if best is None or entry.logprob > best[0]:
-            best = (entry.logprob, word)
+            best = (entry.logprob, match.group(1).upper())
     return None if best is None else int(best[1] == "TRUE")
 
 
@@ -54,7 +51,7 @@ def true_bit(output, true_ids) -> int:
     token_ids = completion.token_ids
     if token_ids and int(token_ids[0]) in true_ids:
         return 1
-    ranked = _ranked_answer(getattr(completion, "logprobs", None), true_ids)
+    ranked = _ranked_answer(getattr(completion, "logprobs", None))
     if ranked is not None:
         return ranked
     match = _ANSWER_WORD.search(getattr(completion, "text", "") or "")

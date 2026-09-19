@@ -210,9 +210,9 @@ class KVArena:
     key may be rewound to), rounded down to a page. A fresh key takes
     sliding pages for its whole prefix during its one pass, since the
     prefix rows attend to each other; trim_window then releases the
-    pages before the origin. Page counts the schedulers see are in one
-    currency: every-token pages, with sliding pages converted at the
-    pools' size ratio, so a count that fits admits in both pools.
+    pages before the origin. Page counts the schedulers see are in
+    every-token pages, with sliding pages converted at the pools' size
+    ratio, so a count that fits admits in both pools.
     """
 
     def __init__(self, n_layers: int, n_pages: int, page_tokens: int,
@@ -260,8 +260,16 @@ class KVArena:
         self._base = {}       # key -> tokens the window is anchored below
         self._sliding_start = {}  # key -> logical row of its first sliding page
 
-    def resize(self, n_pages: int, n_sliding_pages: int = 0) -> None:
-        """Rebuild both pools at new sizes; nothing may be resident."""
+    def resize(self, n_pages: int, n_sliding_pages: int = 0, *,
+               free_resident: bool = False) -> None:
+        """Rebuild both pools at new sizes.
+
+        Nothing survives a rebuild; free_resident frees every resident
+        key first, and without it a resident key is an error.
+        """
+        if free_resident:
+            for key in self.resident_keys():
+                self.free_key(key)
         if self.accounting.owned:
             raise RuntimeError("the arena holds keys; free them before resizing")
         if (n_pages, n_sliding_pages) == (self.n_pages, self.n_sliding_pages):
@@ -294,7 +302,7 @@ class KVArena:
     def trim_window(self, key) -> int:
         """Release a key's sliding pages before its window origin.
 
-        Returns the pages freed, in the schedulers' currency.
+        Returns the pages freed, in every-token pages.
         """
         if self.sliding is None:
             return 0
@@ -389,29 +397,30 @@ class KVArena:
     def evict_retained(self, pages_needed: int) -> tuple:
         """Evict retained prefixes in planned reuse priority order.
 
-        Stops once pages_needed have come free in the schedulers'
-        currency.
+        Stops once pages_needed have come free, counted in every-token
+        pages. Returns the evicted keys.
         """
-        keys = []
         start = self.free_pages
-        while self.free_pages - start < pages_needed:
+        return self._evict_until(
+            lambda: self.free_pages - start >= pages_needed)
+
+    def _evict_until(self, satisfied) -> tuple:
+        """Evict retained prefixes in priority order until satisfied() holds."""
+        keys = []
+        while not satisfied():
             victim = self.accounting.pop_retained_victim()
             if victim is None:
                 break
-            key, _, _ = victim
-            keys.append(key)
-            self.evict_key(key)
+            keys.append(victim[0])
+            self.evict_key(victim[0])
         return tuple(keys)
 
-    def _evict_until(self, need, need_sliding):
+    def _evict_for_pages(self, need, need_sliding):
         """Evict retained prefixes until both pools have the pages."""
-        while (self.accounting.free_pages < need
-               or (self.sliding is not None
-                   and self.sliding.free_pages < need_sliding)):
-            victim = self.accounting.pop_retained_victim()
-            if victim is None:
-                return
-            self.evict_key(victim[0])
+        self._evict_until(lambda: (
+            self.accounting.free_pages >= need
+            and (self.sliding is None
+                 or self.sliding.free_pages >= need_sliding)))
 
     def evict_key(self, key):
         """Free one retained prefix and record the lost KV."""
@@ -439,7 +448,7 @@ class KVArena:
             need_s = (max(0, self.sliding.pages_needed(capacity_s)
                           - len(self.sliding.owned[key]))
                       if self.sliding is not None else 0)
-            self._evict_until(need, need_s)
+            self._evict_for_pages(need, need_s)
             grown = self.accounting.grow(key, capacity)
             if grown is not None and self.sliding is not None:
                 grown = self.sliding.grow(key, capacity_s)
@@ -452,7 +461,7 @@ class KVArena:
             return self.accounting.owned[key]
 
         need = self.accounting.pages_needed(capacity)
-        self._evict_until(need, need)
+        self._evict_for_pages(need, need)
         pages = self.alloc(key, tokens, capacity, base_tokens)
         if pages is not None:
             self.accounting.pin(key)
@@ -490,14 +499,14 @@ class KVArena:
 
     @property
     def free_pages(self) -> int:
-        """Free pages in the schedulers' currency: the tighter pool."""
+        """Free pages in every-token pages: the tighter pool decides."""
         free = self.accounting.free_pages
         if self.sliding is None:
             return free
         return min(free, int(self.sliding.free_pages * self._ratio))
 
     def page_cost(self, tokens: int, base_tokens: int | None = None) -> int:
-        """Pages a key of `tokens` rows takes, in the schedulers' currency.
+        """Pages a key of `tokens` rows takes, in every-token pages.
 
         base_tokens prices the trimmed key: only the rows from its
         window origin on sit on the sliding pool. Without it the key is
@@ -508,15 +517,23 @@ class KVArena:
             return pages
         origin = 0 if base_tokens is None else self.origin(base_tokens)
         pages_s = self.sliding.pages_needed(max(0, tokens - origin))
-        return max(pages, -(-int(pages_s * self._ratio * 2**20) // 2**20))
+        return max(pages, self._as_every_token_pages(pages_s))
 
     def held_cost(self, key) -> int:
-        """Pages a resident key holds, in the schedulers' currency."""
+        """Pages a resident key holds, in every-token pages."""
         pages = len(self.accounting.owned[key])
         if self.sliding is None:
             return pages
-        pages_s = len(self.sliding.owned[key])
-        return max(pages, -(-int(pages_s * self._ratio * 2**20) // 2**20))
+        return max(pages, self._as_every_token_pages(
+            len(self.sliding.owned[key])))
+
+    def _as_every_token_pages(self, sliding_pages: int) -> int:
+        """Sliding pages converted at the pools' size ratio, rounded up.
+
+        The product is taken in fixed point so an exact ratio never
+        rounds up from float error.
+        """
+        return -(-int(sliding_pages * self._ratio * 2**20) // 2**20)
 
     @property
     def retained_pages(self) -> int:

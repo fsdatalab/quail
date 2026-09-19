@@ -15,7 +15,7 @@ from quail.backends.quail.worker import execute_quail_request, prepare_quail_req
 from quail.execution.reranker import RerankerModelExecution
 from quail.execution.runner import NodeMetrics, NodeResult, SurvivorStream
 from quail.execution.tokens import DocumentKeys
-from quail.logical import SHARED_PRE, Alias, is_score
+from quail.logical import Alias, is_score, shared_preamble
 from quail.physical import (
     AiFilter,
     AiJoin,
@@ -416,7 +416,7 @@ class QuailBackend:
                     false_ids.add(tokens[0])
         prompts = operators.prompts
         pre_ids = (
-            list(tokenizer(context.model.turn_prefix + SHARED_PRE))
+            list(tokenizer(shared_preamble(context.model.turn_prefix)))
             if tokenizer is not None else
             list(prompts[0].preamble_token_ids) if prompts else []
         )

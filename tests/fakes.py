@@ -58,6 +58,27 @@ def bare_arena(arena, pages):
     return arena
 
 
+def cpu_staging(monkeypatch):
+    """Stage packed chunks as plain CPU tensors; returns torch."""
+    import numpy as np
+    import torch
+
+    def staged(torch_, data, dtype, pinned=True):
+        if isinstance(data, np.ndarray) or torch.is_tensor(data):
+            return torch.as_tensor(data, dtype=dtype)
+        return torch.tensor(data, dtype=dtype)
+
+    def token_parts(torch_, sequences, total, pinned=True, staging=None):
+        ids = [int(t) for seq in sequences for part in loop._token_parts(seq)
+               for t in part]
+        assert len(ids) == total
+        return torch.tensor(ids, dtype=torch.int64)
+
+    monkeypatch.setattr(loop, "_staged", staged)
+    monkeypatch.setattr(loop, "_staged_token_parts", token_parts)
+    return torch
+
+
 def fake_pipeline(**attributes):
     """A ModelPipeline with the contract's defaults and the given overrides."""
     pipeline = ModelPipeline()

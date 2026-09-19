@@ -102,7 +102,7 @@ def arena_pages(model: ModelSpec, device: DeviceSpec,
     ratio = min(1.0, (min(mean, window) + SPLIT_EXTRA_TOKENS)
                 / (mean + SPLIT_EXTRA_TOKENS))
     full = int(free // (page_bytes_full + ratio * page_bytes_sliding))
-    sliding = -(-int(full * ratio) // 1)
+    sliding = int(full * ratio)
     floor = transient_sliding_pages(chunk_tokens)
     if sliding < floor:
         sliding = floor

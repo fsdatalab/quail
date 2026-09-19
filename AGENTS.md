@@ -75,8 +75,9 @@ CI runs these on every pull request. Run them before pushing:
 
 # Scope
 
-The current runtime supports filter queries only, Qwen3 4B fp8 or
-Qwen3 32B fp8, and one H100 per model copy. It does not use
+The current runtime supports filter and join queries on Qwen3 4B fp8,
+Qwen3 32B fp8, or DiffusionGemma 26B-A4B fp8, and one H100 per model
+copy. It does not use
 tensor-parallel weight sharding. `AI.CLASSIFY`, `AI.EXTRACT`, and
 `AI.MAP` are on the roadmap. Open-ended generation, speculation, and
 forking are not part of the current runtime.

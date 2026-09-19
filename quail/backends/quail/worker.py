@@ -112,9 +112,7 @@ class LoadedGpu:
         survives in the arena between queries.
         """
         if arena_pages is not None:
-            for key in self.arena.resident_keys():
-                self.arena.free_key(key)
-            self.arena.resize(*arena_pages)
+            self.arena.resize(*arena_pages, free_resident=True)
         rows = AnswerRows(self.torch, self.F, self.model, true_ids, false_ids)
         self.async_ans = AsyncAnswers(self.torch, rows)
         self.chunk_tokens = chunk_tokens

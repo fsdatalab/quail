@@ -54,9 +54,8 @@ class ModelSpec:
     experts: int = 0
     experts_active: int = 0    # experts one token multiplies
     expert_intermediate: int = 0    # one expert's MLP width
-    canvas_tokens: int = 0    # rows a diffusion model denoises after
-    #                           the answer cue; the answer is read at
-    #                           the first one. 0 for an autoregressive
+    canvas_tokens: int = 0    # rows a diffusion model appends after
+    #                           the answer cue. 0 for an autoregressive
     #                           model, which answers at the last
     #                           prompt row.
     canvas_answer_row: int = 0    # canvas row the answer is read at;

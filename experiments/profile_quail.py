@@ -227,9 +227,7 @@ def _run_query(state, build, captured):
         )
         arena_pages = payload.get("arena_pages")
         if arena_pages is not None:
-            for key in state["arena"].resident_keys():
-                state["arena"].free_key(key)
-            state["arena"].resize(*arena_pages)
+            state["arena"].resize(*arena_pages, free_resident=True)
         state["model_execution"].bind_query(
             torch=state["torch"],
             async_answers=AsyncAnswers(state["torch"], rows),

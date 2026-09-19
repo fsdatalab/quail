@@ -8,8 +8,12 @@ from quail.logical.nodes import CompileError, Prompt
 # any, wraps the whole prompt: its opening piece goes before this
 # preamble and its closing piece after the answer cue, so the user
 # message stays open across the reusable document prefix.
-DOCUMENT_PRE = "DOCUMENT:\n"
-SHARED_PRE = DOCUMENT_PRE
+SHARED_PRE = "DOCUMENT:\n"
+
+
+def shared_preamble(turn_prefix: str) -> str:
+    """The text before every document: the model's turn opener, then the preamble."""
+    return turn_prefix + SHARED_PRE
 
 
 def true_false_ids(tok):
@@ -258,7 +262,7 @@ def bind_join_prompt(template: str, args: tuple,
             f"mention a table's document again, use its marker in the "
             f"question text, not a second placeholder")
     question = render_join_question(template)
-    preamble = turn[0] + SHARED_PRE
+    preamble = shared_preamble(turn[0])
     tail = ANSWER_CUE + turn[1]
     pre_tok = tail_tok = frame_tok = None
     labels = tuple((a, None, None) for a in aliases)

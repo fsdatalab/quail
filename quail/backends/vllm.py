@@ -20,6 +20,9 @@ DIFFUSION_SEQUENCES = 127
 # top logprobs read at the canvas row; the answer word is in the top
 # 20 on 62 of 64 probed reviews
 DIFFUSION_LOGPROBS = 20
+# generated tokens a longer canvas gets; the answer word is read
+# from the text
+DIFFUSION_TEXT_TOKENS = 16
 
 
 def _capacity(llm) -> dict:
@@ -57,7 +60,7 @@ def sampling_kwargs(allowed_ids: list[int], canvas_tokens: int = 0) -> dict:
     if canvas_tokens == 1:
         return {"max_tokens": 1, "logprobs": DIFFUSION_LOGPROBS}
     if canvas_tokens:
-        return {"max_tokens": 16}
+        return {"max_tokens": DIFFUSION_TEXT_TOKENS}
     return {"temperature": 0.0, "max_tokens": 1, "min_tokens": 1,
             "allowed_token_ids": allowed_ids}
 

@@ -1,7 +1,7 @@
 """The sliding-layer KV pool: window origins, trimming, and one page currency."""
 
-import numpy as np
 import pytest
+from fakes import cpu_staging
 
 from quail.backends.quail.executor import loop
 from quail.backends.quail.executor.arena import KVArena
@@ -105,7 +105,20 @@ def test_page_costs_use_the_tighter_pool():
                     dtype=torch.float32, device="cpu")
     assert not plain.has_sliding
     assert plain.page_cost(100) == 7 and plain.page_cost(100, 100) == 7
-    assert plain.trim_window is not None
+    # without a sliding pool a trim releases nothing
+    plain.activate(key, 100, base_tokens=100)
+    plain.trim_window(key)
+    assert plain.held_cost(key) == 7
+
+
+def test_alloc_rolls_back_when_the_sliding_pool_is_short():
+    # 4 sliding pages hold 64 rows; a 100-row key needs 7 in each pool
+    arena = cpu_arena(pages=64, sliding_pages=4)
+    free = arena.accounting.free_pages
+    assert arena.alloc(("d", 0), 100) is None
+    assert arena.accounting.free_pages == free
+    assert not arena.accounting.owned and not arena.sliding.owned
+    assert arena.alloc(("d", 1), 40) is not None
 
 
 def test_temporaries_and_resize():
@@ -140,23 +153,8 @@ def test_filter_admission_credits_a_trim():
     assert sched.free_pages == 52
 
 
-def _cpu_staging(monkeypatch):
-    def staged(torch_, data, dtype, pinned=True):
-        if isinstance(data, np.ndarray) or torch.is_tensor(data):
-            return torch.as_tensor(data, dtype=dtype)
-        return torch.tensor(data, dtype=dtype)
-
-    def token_parts(torch_, sequences, total, pinned=True, staging=None):
-        ids = [int(t) for seq in sequences for part in loop._token_parts(seq)
-               for t in part]
-        return torch.tensor(ids, dtype=torch.int64)
-
-    monkeypatch.setattr(loop, "_staged", staged)
-    monkeypatch.setattr(loop, "_staged_token_parts", token_parts)
-
-
 def test_pack_chunk_builds_both_pools(monkeypatch):
-    _cpu_staging(monkeypatch)
+    cpu_staging(monkeypatch)
     arena = cpu_arena(pages=64, sliding_pages=32)
     key = ("d", 0)
     doc = list(range(100))
