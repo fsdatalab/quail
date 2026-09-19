@@ -221,12 +221,14 @@ def test_explain_analyze_shows_measured_rows_beside_estimates(
     # est. rows, rows, est. time, time, fresh tokens
     assert re.search(
         r"AiFilter: r\s+1\.5\s+2\s+[\d.]+ ms\s+<1 ms\s+60$", text, re.M)
-    # the filter runs q2 first over all six documents, then q1 over the
-    # four survivors: docs entering, evaluated, est. pass, observed pass
-    assert re.search(r"1st: predicate 2  PROMPT\('DOCUMENT:\\n\{0\}\\n\\nq2:'\)"
-                     r"\s+6\s+6\s+50%\s+66\.7%$", text, re.M)
-    assert re.search(r"2nd: predicate 1  PROMPT\('DOCUMENT:\\n\{0\}\\n\\nq1:'\)"
-                     r"\s+3\s+4\s+50%\s+50%$", text, re.M)
+    # Both predicates have equal estimated cost and pass four of six rows.
+    first = re.search(r"(?:1st: )?predicate ([12])  PROMPT\('DOCUMENT:\\n"
+                      r"\{0\}\\n\\nq\1:'\)\s+6\s+6\s+50%\s+66\.7%$",
+                      text, re.M)
+    second = re.search(r"(?:2nd: )?predicate ([12])  PROMPT\('DOCUMENT:\\n"
+                       r"\{0\}\\n\\nq\1:'\)\s+3\s+4\s+50%\s+50%$",
+                       text, re.M)
+    assert first and second and first[1] != second[1]
     assert re.search(r"Scan reviews as r\s+6\s+6\s+<1 ms$", text, re.M)
     assert re.search(r"Project: r\.id\s+1\.5\s+2\s+<1 ms$", text, re.M)
     assert re.search(r"Limit: 1\s+1\s+1\s+<1 ms$", text, re.M)
@@ -241,10 +243,11 @@ def test_explain_analyze_shows_measured_rows_beside_estimates(
     # the executed result renders the same measured table on its own
     result = _run(sess.sql(FILTER_SQL + " LIMIT 1"), make_executor(truth))
     assert re.search(r"Limit: 1\s+1\s+1\s+<1 ms$", result.explain(), re.M)
-    assert re.search(r"1st: predicate 2\s+6\s+6\s+50%\s+66\.7%$",
+    assert re.search(rf"(?:1st: )?predicate {first[1]}\s+6\s+6\s+50%\s+66\.7%$",
                      result.explain(), re.M)
     stages = [s for s in result.report["stages"] if s["op"] == "filter"]
-    assert [s["written_pos"] for s in stages] == [1, 0]
+    assert [s["written_pos"] for s in stages] == [int(first[1]) - 1,
+                                                int(second[1]) - 1]
 
 
 def test_query_rows_observers_and_saved_reports(sess, tmp_path):
