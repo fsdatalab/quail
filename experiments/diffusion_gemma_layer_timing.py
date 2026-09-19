@@ -91,6 +91,81 @@ def _timer(torch, totals, name):
 
 @app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
               volumes=volumes)
+def gemms(prediction: str, rows: int = 34870) -> str:
+    """Time the dense fp8 GEMM shapes of one layer on two kernels.
+
+    vLLM's CUTLASS scaled_mm against cuBLASLt through torch._scaled_mm,
+    both with per-row activation scales and per-channel weight scales.
+    """
+    import torch
+    from vllm import _custom_ops as ops
+
+    from quail.backends.quail.executor.model import load_model
+    from quail.cost import budgets
+    from quail.specs import DEVICES, MODELS
+
+    spec = MODELS[MODEL]
+    device = DEVICES["h100-sxm"]
+    model = load_model(spec.hf_name,
+                       max_batched_tokens=budgets.chunk_budget(spec, device),
+                       moe_backend="triton")
+    layers = model.model.layers
+    linears = {
+        "qkv_sliding": layers[0].self_attn.qkv_proj,
+        "o_sliding": layers[0].self_attn.o_proj,
+        "qkv_full": layers[5].self_attn.qkv_proj,
+        "o_full": layers[5].self_attn.o_proj,
+        "gate_up": layers[0].mlp.gate_up_proj,
+        "down": layers[0].mlp.down_proj,
+    }
+
+    def timed(fn, repeats=20):
+        fn()
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(repeats):
+            fn()
+        torch.cuda.synchronize()
+        return (time.perf_counter() - t0) / repeats
+
+    result = {"prediction": prediction, "rows": rows, "shapes": {}}
+    peak = device.peak_flops
+    for name, module in linears.items():
+        weight = module.weight            # (K, N) fp8, column-major B
+        scale_b = module.weight_scale     # (N, 1) float32
+        k, n = weight.shape
+        x = torch.randn(rows, k, device="cuda", dtype=torch.bfloat16)
+        xq, xs = ops.scaled_fp8_quant(x, use_per_token_if_dynamic=True)
+        cutlass = timed(lambda: ops.cutlass_scaled_mm(
+            xq, weight, scale_a=xs, scale_b=scale_b,
+            out_dtype=torch.bfloat16))
+        ref = ops.cutlass_scaled_mm(xq, weight, scale_a=xs, scale_b=scale_b,
+                                    out_dtype=torch.bfloat16)
+        entry = {"K": k, "N": n, "cutlass_us": cutlass * 1e6,
+                 "ideal_us": 2 * rows * k * n / peak * 1e6}
+        try:
+            b = weight.t().contiguous().t() if not weight.is_contiguous() \
+                else weight
+            out = torch._scaled_mm(xq, b, scale_a=xs, scale_b=scale_b.t(),
+                                   out_dtype=torch.bfloat16)
+            cublas = timed(lambda: torch._scaled_mm(
+                xq, b, scale_a=xs, scale_b=scale_b.t(),
+                out_dtype=torch.bfloat16))
+            entry["cublaslt_us"] = cublas * 1e6
+            entry["cublaslt_rel"] = ((out.float() - ref.float()).pow(2).mean()
+                                     .sqrt() / ref.float().pow(2).mean()
+                                     .sqrt()).item()
+        except Exception as error:  # noqa: BLE001 - report the shape
+            entry["cublaslt_error"] = repr(error)[:200]
+        result["shapes"][name] = entry
+        print(name, {k: (round(v, 1) if isinstance(v, float) else v)
+                     for k, v in entry.items()}, flush=True)
+    result["volume_path"] = _save("diffusion_gemma_gemms", result)
+    return json.dumps(result, indent=2)
+
+
+@app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
+              volumes=volumes)
 def moe_tiles(prediction: str, docs: int = 110, doc_tokens: int = 300) -> str:
     """Time the experts under a sweep of Triton fused MoE tile configs."""
     import itertools
@@ -792,6 +867,8 @@ def main(prediction: str = "", docs: int = 110, doc_tokens: int = 300,
                 calls[f"{kernel}/{backend}"] = time_chunk.spawn(
                     prediction, docs, doc_tokens, kernel, random_tokens,
                     backend, profile)
+    if "gemms" in runs:
+        calls["gemms"] = gemms.spawn(prediction)
     if "tiles" in runs:
         calls["tiles"] = moe_tiles.spawn(prediction, docs, doc_tokens)
     if "primitives" in runs:
