@@ -43,8 +43,12 @@ def join_attention_mode(is_fp8: bool) -> str:
     """The path a join's chunks run.
 
     merge_quant writes fp8 GEMM inputs, so bf16 weights run the
-    unified path instead.
+    unified path instead. QUAIL_JOIN_ATTENTION=unified forces the
+    single-call path, for measuring the two-call path's gain.
     """
+    import os
+    if os.environ.get("QUAIL_JOIN_ATTENTION") == FILTER_ATTENTION:
+        return FILTER_ATTENTION
     return JOIN_ATTENTION if is_fp8 else FILTER_ATTENTION
 
 

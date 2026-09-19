@@ -160,8 +160,16 @@ def run_query_family(
     include_baselines: bool,
     include_quail: bool = True,
     include_dumb_vllm: bool = False,
+    join_attention: str = "",
 ) -> str:
-    """Run one query family through Quail and the vLLM baselines."""
+    """Run one query family through Quail and the vLLM baselines.
+
+    join_attention forces the join's attention path ("unified") for
+    measuring the two-call path's gain; empty keeps the default.
+    """
+    import os
+    if join_attention:
+        os.environ["QUAIL_JOIN_ATTENTION"] = join_attention
     process_groups = [("quail",)] if include_quail else []
     if include_baselines:
         process_groups.append(("stock_vllm", "pipelined_vllm"))
@@ -248,6 +256,7 @@ def run_all(
     include_sglang: bool = True,
     include_quail: bool = True,
     include_dumb_vllm: bool = False,
+    join_attention: str = "",
 ):
     from quail_b import select_queries
     from quail_b.queries import query_family_name, split_query_families
@@ -298,6 +307,7 @@ def run_all(
                     include_baselines=include_baselines,
                     include_quail=include_quail,
                     include_dumb_vllm=include_dumb_vllm,
+                    join_attention=join_attention,
                 )
                 family_calls.append((family, family_call))
                 call_ids[f"{family}:quail_vllm"] = family_call.object_id
@@ -403,6 +413,7 @@ def main(
     include_sglang: bool = True,
     include_quail: bool = True,
     include_dumb_vllm: bool = False,
+    join_attention: str = "",
 ):
     run_id = (
         f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-"
@@ -419,6 +430,7 @@ def main(
         include_sglang=include_sglang,
         include_quail=include_quail,
         include_dumb_vllm=include_dumb_vllm,
+        join_attention=join_attention,
     )
     print(f"function call id: {call.object_id} (all families)", flush=True)
     print(call.get(), flush=True)
