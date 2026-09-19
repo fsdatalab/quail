@@ -64,6 +64,10 @@ DIFFUSION_GEMMA_26B_FP8 = ModelSpec(
     attn_params_per_layer=(25 * SLIDING_ATTN + 5 * FULL_ATTN) // 30,
     mlp_active_params_per_layer=DENSE_MLP + 8 * EXPERT,
     mlp_total_params_per_layer=DENSE_MLP + 128 * EXPERT,
+    # on one 35k-row chunk the Triton experts took 0.206 s against
+    # 0.218 s for vLLM's CUTLASS grouped GEMM
+    # (/results/ablations/diffusion_gemma_layer_timing_triton_random*.json)
+    moe_backend="triton",
     chunk_cap_tokens=65_536,    # the MoE kernels' token workspace and
     #                             the 512-wide attention heads grow
     #                             with the chunk; the kernel index cap

@@ -62,8 +62,9 @@ def _init_moe_workspace():
 class DiffusionGemmaPipeline(ModelPipeline):
     """Forward passes for DiffusionGemma checkpoints loaded by vLLM.
 
-    The full-attention layers' 512-wide heads run vLLM's Triton paged
-    attention kernel, so every chunk carries arena pages.
+    The full-attention layers' 512-wide heads run FlashAttention 4 by
+    default (vLLM's Triton paged attention is the alternative), so
+    every chunk carries arena pages.
 
     Args:
         model: vLLM's DiffusionGemmaForConditionalGeneration module.
@@ -73,13 +74,13 @@ class DiffusionGemmaPipeline(ModelPipeline):
         kernels: Engine kernel set; only its KV scatter kernel runs here.
         engine_class: Engine class, replaceable by experiments.
         wide_head_kernel: Attention kernel for the 512-wide heads,
-            "triton" (vLLM's unified attention) or "fa4".
+            "fa4" or "triton" (vLLM's unified attention).
     """
 
     needs_pages = True
 
     def __init__(self, model, arena, *, spec, kernels="quail",
-                 engine_class=Engine, wide_head_kernel="triton", fused=True):
+                 engine_class=Engine, wide_head_kernel="fa4", fused=True):
         backbone = model.model
         self.layers = backbone.layers
         self.embed = backbone.embed_tokens

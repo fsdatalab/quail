@@ -71,6 +71,10 @@ class ModelSpec:
     #                                         expert); 0 means active
     chunk_cap_tokens: int = 0    # upper bound on tokens per chunk; 0
     #                              leaves the memory and kernel bounds
+    moe_backend: str | None = None    # vLLM fused MoE kernel family the
+    #                                   engine loads ("triton",
+    #                                   "cutlass", ...); None lets vLLM
+    #                                   pick
 
     @property
     def kv_shapes(self) -> tuple:

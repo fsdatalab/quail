@@ -368,10 +368,11 @@ def test_pipeline_runs_the_gemma4_layer_order(monkeypatch):
                                       engine_class=_Engine, fused=False)
     assert len(pipeline.canvas_ids) == 3
     assert pipeline.canvas_answer_row == 1
-    assert pipeline.engine.wide_head_kernel == "triton"
-    fa4 = DiffusionGemmaPipeline(_fake_model(torch), None, spec=spec,
-                                 engine_class=_Engine, wide_head_kernel="fa4")
-    assert fa4.engine.wide_head_kernel == "fa4"
+    assert pipeline.engine.wide_head_kernel == "fa4"
+    triton = DiffusionGemmaPipeline(_fake_model(torch), None, spec=spec,
+                                    engine_class=_Engine,
+                                    wide_head_kernel="triton")
+    assert triton.engine.wide_head_kernel == "triton"
     with pytest.raises(ValueError, match="wide_head_kernel"):
         DiffusionGemmaPipeline(_fake_model(torch), None, spec=spec,
                                engine_class=_Engine, wide_head_kernel="cute")
