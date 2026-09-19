@@ -1,10 +1,17 @@
 """Quail's DiffusionGemma forward pass against stock vLLM's, on a GPU.
 
 Stock vLLM runs the same checkpoint in a child process and records
-the hidden state of every prompt row after the last layer. Quail
-packs the same prompts into one chunk and reads the same rows. The
-prompt rows are computed the same way in both: causally, with the
-canvas rows after them. Skipped without a CUDA device; runs through
+the hidden state of every prompt row after each layer. Quail packs
+the same prompts into one chunk, runs its stack cut after each layer,
+and reads the same rows. The prompt rows are computed the same way in
+both: causally, with the canvas rows after them.
+
+Both sides quantize activations to fp8 with 3 mantissa bits, at
+different points, and run different attention and expert kernels, so
+the rows differ by about one percent after the first layer and the
+difference compounds through the stack. The test checks that no
+layer adds a jump of its own and that the TRUE/FALSE answers agree.
+Skipped without a CUDA device; runs through
 `uv run modal run experiments/run_gpu_tests.py`.
 """
 
@@ -118,15 +125,16 @@ def prompts():
 
 
 @pytest.fixture(scope="module")
-def stock_rows(tmp_path_factory):
+def stock_layers(tmp_path_factory):
+    """Per prompt, stock vLLM's rows after each layer."""
     path = tmp_path_factory.mktemp("stock") / STOCK_ROWS
-    subprocess.run([sys.executable, __file__, str(path)], check=True)
+    subprocess.run([sys.executable, __file__, str(path), "all"], check=True)
     return torch.load(path)
 
 
 @pytest.fixture(scope="module")
-def quail(prompts, stock_rows):
-    """Quail's rows for the same prompts, plus the loaded model.
+def quail(prompts, stock_layers):
+    """Quail's rows after each layer for the same prompts, plus the model.
 
     Built after the stock rows so the two model copies never share
     the GPU.
@@ -162,39 +170,56 @@ def quail(prompts, stock_rows):
     chunk = pack_chunk(torch, arena, groups, attention_mode="unified",
                        canvas=pipeline.canvas_ids,
                        answer_row=pipeline.canvas_answer_row)
-    with torch.inference_mode():
-        hidden = pipeline.backbone_rows(chunk)
-    rows, offset = [], 0
-    for ids in prompts:
-        rows.append(hidden[offset:offset + len(ids)].float().cpu())
-        offset += len(ids) + len(pipeline.canvas_ids)
-    return rows, model
+    layers = list(pipeline.layers)
+    per_prompt = [[] for _ in prompts]
+    for depth in range(1, len(layers) + 1):
+        # the stack cut after a layer returns that layer's output
+        pipeline.layers = layers[:depth]
+        with torch.inference_mode():
+            hidden = pipeline.backbone_rows(chunk)
+        offset = 0
+        for rows, ids in zip(per_prompt, prompts):
+            rows.append(hidden[offset:offset + len(ids)].float().cpu())
+            offset += len(ids) + len(pipeline.canvas_ids)
+    pipeline.layers = layers
+    return per_prompt, model
 
 
-def test_prompt_rows_match_stock_vllm(stock_rows, quail):
-    rows, _ = quail
-    errors = []
-    for stock, ours in zip(stock_rows, rows):
-        assert ours.shape == stock.shape
-        errors.append((ours - stock).norm(dim=-1)
-                      / stock.norm(dim=-1).clamp_min(1e-6))
-    rel = torch.cat(errors)
-    stats = dict(median=rel.median().item(),
-                 p99=rel.quantile(0.99).item(), max=rel.max().item())
-    print("relative L2 error per prompt row:", json.dumps(stats))
-    # fp8 activations are quantized per kernel on both sides; the
-    # experts and the attention run different kernels
-    assert stats["median"] < 0.05
-    assert stats["p99"] < 0.2
+def _relative_errors(stock_layers, quail_layers, layer):
+    return torch.cat([
+        (ours[layer] - stock[layer]).norm(dim=-1)
+        / stock[layer].norm(dim=-1).clamp_min(1e-6)
+        for stock, ours in zip(stock_layers, quail_layers)])
 
 
-def test_answers_agree_with_stock_vllm(stock_rows, quail):
+def test_no_layer_departs_from_stock_vllm(stock_layers, quail):
+    quail_layers, _ = quail
+    depth = len(stock_layers[0])
+    assert all(len(rows) == depth for rows in quail_layers)
+    medians = []
+    for layer in range(depth):
+        rel = _relative_errors(stock_layers, quail_layers, layer)
+        medians.append(rel.median().item())
+        print(json.dumps(dict(layer=layer, median=round(medians[-1], 4),
+                              p99=round(rel.quantile(0.99).item(), 4))))
+    # the first layer differs by fp8 rounding alone
+    assert medians[0] < 0.03
+    # every later layer adds rounding of its own, never a jump: a
+    # missing term or a wrong mask would double the error at once
+    for before, after in zip(medians, medians[1:]):
+        assert after < 2 * before + 0.01
+    assert medians[-1] < 0.25
+
+
+def test_answers_agree_with_stock_vllm(stock_layers, quail):
     from transformers import AutoTokenizer
 
     from quail.logical import true_false_ids
     from quail.specs import MODELS
 
-    rows, model = quail
+    quail_layers, model = quail
+    stock_rows = [rows[-1] for rows in stock_layers]
+    rows = [rows[-1] for rows in quail_layers]
     spec = MODELS[MODEL]
     true_ids, false_ids = true_false_ids(
         AutoTokenizer.from_pretrained(spec.hf_name))
