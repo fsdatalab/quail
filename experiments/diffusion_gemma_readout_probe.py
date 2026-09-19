@@ -91,8 +91,9 @@ def probe(prediction: str, n_docs: int = 256,
             record["ranked"] = _ranked_answer(rows)
             if answer_entries:
                 counts["answer_ids_in_top"] += 1
-                for t, _, decoded in answer_entries:
-                    decoded_forms[repr(decoded)] = decoded_forms.get(repr(decoded), 0) + 1
+                for _, _, decoded in answer_entries:
+                    form = repr(decoded)
+                    decoded_forms[form] = decoded_forms.get(form, 0) + 1
             if record["ranked"] is None:
                 counts["neither_word"] += 1
         if record["quail"] is not None:
