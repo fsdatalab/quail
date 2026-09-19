@@ -485,8 +485,8 @@ def primitives(prediction: str, docs: int = 20, doc_tokens: int = 300) -> str:
                 layer.input_layernorm.variance_epsilon)
             qkv = engine.fp8_linear(attn.qkv_proj, xq, xs)
             result["step_qkv_rel"] = rel(qkv, attn.qkv_proj(h1)[0])
+            # the fused attention applies o_proj itself
             a2 = pipeline._attention_fused(attn, qkv, pos, meta)
-            a2, _ = attn.o_proj(a2)
             result["step_attention_rel"] = rel(a2, a)
             a2_n = pipeline._norm(a2, layer.post_attention_layernorm)
             r = hidden0.clone()
