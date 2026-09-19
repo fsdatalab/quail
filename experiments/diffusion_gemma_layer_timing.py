@@ -662,7 +662,6 @@ def canvas_seeds(prediction: str, reviews: int = 512, seeds: int = 4) -> str:
     pipeline = build_pipeline(spec, model, arena)
     tokenizer = AutoTokenizer.from_pretrained(spec.hf_name)
     rows = AnswerRows.from_tokenizer(torch, torch.nn.functional, model, tokenizer)
-    answers = AsyncAnswers(torch, rows)
     data = build_sets("/results/quailb_data", 0.1)
     table = pq.read_table(f"{data}/reviews.parquet")
     texts = table.column("body").to_pylist()[:reviews]
@@ -674,16 +673,31 @@ def canvas_seeds(prediction: str, reviews: int = 512, seeds: int = 4) -> str:
     preamble = list(prompt.preamble_token_ids)
     docs = [preamble + tok(text) for text in texts]
     question = list(prompt.tail_token_ids)
-    per_seed = {}
+
+    class MarginAnswers(AsyncAnswers):
+        """Bits for the loop, and the TRUE-minus-FALSE margins kept aside."""
+
+        def __init__(self, torch, rows):
+            super().__init__(torch, rows)
+            self.margins = []
+
+        def submit(self, normed):
+            t, f = self.rows.logits(normed)
+            self.margins.extend((t - f).float().cpu().tolist())
+            return super().submit(normed)
+
+    per_seed, margins = {}, {}
     with torch.inference_mode():
         for seed in range(seeds):
             pipeline.canvas_ids = canvas_token_ids(
                 spec.vocab, spec.canvas_tokens, seed=seed)
+            answers = MarginAnswers(torch, rows)
             result, _, _ = loop.run_filter(
                 torch, arena, pipeline, answers, docs, [question],
                 chunk_tokens, arena_writes=True)
             torch.cuda.synchronize()
             per_seed[seed] = [bool(result[d][0]) for d in range(len(docs))]
+            margins[seed] = answers.margins
     flips = {}
     for a in per_seed:
         for b in per_seed:
@@ -699,6 +713,9 @@ def canvas_seeds(prediction: str, reviews: int = 512, seeds: int = 4) -> str:
         "true_rate": {s: sum(v) / len(v) for s, v in per_seed.items()},
         "flips_between_seeds": flips,
         "reviews_with_any_flip": unstable,
+        "ids": table.column("id").to_pylist()[:reviews],
+        "answers": per_seed,
+        "margins": margins,
     }
     result["volume_path"] = _save("diffusion_gemma_canvas_seeds", result)
     return json.dumps(result, indent=2)
