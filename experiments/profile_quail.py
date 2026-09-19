@@ -155,7 +155,8 @@ def _boot_state(model, **pipeline_kwargs):
     tokenizer = AutoTokenizer.from_pretrained(spec.hf_name)
     chunk_tokens = budgets.chunk_budget(spec, device)
     model_mod = load_model(spec.hf_name, revision=spec.revision,
-                           max_batched_tokens=chunk_tokens)
+                           max_batched_tokens=chunk_tokens,
+                           moe_backend=spec.moe_backend)
     full_pages, sliding_pages = budgets.arena_pages(spec, device, chunk_tokens)
     arena = KVArena(n_layers=spec.layers,
                     n_pages=full_pages,
