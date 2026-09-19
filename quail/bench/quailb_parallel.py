@@ -92,7 +92,7 @@ def ensure_data(sf: float, query_ids: list[str], collection_id: str):
 
 
 def _run_family(process_groups, result_name, model, sf, query_ids_csv,
-                run_dir, ground_truth_collection) -> str:
+                run_dir, ground_truth_collection, root=None) -> str:
     """Run one query family's methods, one child process per group.
 
     Every group runs on the one GPU of this container, in a fresh
@@ -112,7 +112,7 @@ def _run_family(process_groups, result_name, model, sf, query_ids_csv,
         process_result = run_backend_group_in_fresh_process(
             data_dir=DATA_DIR, model=model, sf=sf, query_ids=query_ids,
             run_dir=run_dir, ground_truth_collection=ground_truth_collection,
-            methods=methods)
+            methods=methods, root=root)
         process_results.append(process_result)
         suites.update(process_result["suites"])
     gpu_uuids = {

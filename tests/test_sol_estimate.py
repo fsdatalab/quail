@@ -53,17 +53,16 @@ def test_distinct_prefix_estimates_for_filters_and_joins(tmp_path):
                  .select("r.id"))
         filters = query.logical.operators().filters
         question = filters["r"][0].prompt.tail_tokens
+        preamble = filters["r"][0].prompt.preamble_tokens
         distinct = quail.speed_of_light_estimate(query, _answer)
         per_document = quail.speed_of_light_estimate(
             query, _answer, credit_shared_prefixes=False)
     finally:
         sess.close()
 
-    # the preamble is one token under str.split; "good film" shares
-    # "good" with "good acting", so its resident prefix is the preamble
-    # plus that token and it pays two tokens less
-    assert per_document.fresh_tokens == 3 * (1 + 2 + question)
-    assert distinct.fresh_tokens == per_document.fresh_tokens - 2
+    # "good film" and "good acting" share the preamble and one document token.
+    assert per_document.fresh_tokens == 3 * (preamble + 2 + question)
+    assert distinct.fresh_tokens == per_document.fresh_tokens - preamble - 1
     assert distinct.filter_stages[0]["evaluated"] == 3
     assert distinct.filter_stages[0]["passed"] == 2
     assert distinct.post_filter_counts == {"r": 2}
