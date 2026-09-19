@@ -264,21 +264,12 @@ class DiffusionGemmaPipeline(ModelPipeline):
             q_weight=attn.q_norm.weight, k_weight=attn.k_norm.weight,
             eps=attn.q_norm.variance_epsilon, cos_sin_cache=rope.cos_sin_cache)
         q3, k3, v3 = q.view(n, H, D), k.view(n, KH, D), v.view(n, KH, D)
-        if meta.get("mode") == "merge":
-            # the merge kernel writes o_proj's fp8 input
-            q_o, s_o = self.engine.attention_merge(
-                q3, k3, v3, meta, softmax_scale=1.0,
-                window=self.window if attn.is_sliding else None, quant=True)
-            return self.engine.fp8_linear(attn.o_proj, q_o, s_o)
         out, _ = attn.o_proj(self._attend(attn, q3, k3, v3, meta))
         return out
 
     def _attend(self, attn, q3, k3, v3, meta):
-        """One layer's attention on the chunk's path: two-call or unified."""
+        """One layer's attention: the unified paged call."""
         window = self.window if attn.is_sliding else None
-        if meta.get("mode") == "merge":
-            return self.engine.attention_merge(q3, k3, v3, meta,
-                                               softmax_scale=1.0, window=window)
         return self.engine.attention_unified(q3, k3, v3, meta,
                                              softmax_scale=1.0, window=window)
 

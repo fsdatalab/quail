@@ -401,21 +401,6 @@ def primitives(prediction: str, docs: int = 20, doc_tokens: int = 300) -> str:
             result[f"qkv_{name}_q_rel"] = rel(fq, q2)
             result[f"qkv_{name}_k_rel"] = rel(fk, k2)
             result[f"qkv_{name}_v_rel"] = rel(fv, v_ref)
-        # (h) the row-quantizing merge against the bf16 merge then quant
-        for D in (256, 512):
-            Hh = 16
-            m = 64
-            a = torch.randn(m, Hh, D, device="cuda", dtype=torch.bfloat16)
-            b = torch.randn(m // 2, Hh, D, device="cuda", dtype=torch.bfloat16)
-            la = torch.randn(m, Hh, device="cuda", dtype=torch.float32)
-            lb = torch.randn(m // 2, Hh, device="cuda", dtype=torch.float32)
-            source = torch.full((m,), -1, device="cuda", dtype=torch.int32)
-            source[::2] = torch.arange(m // 2, device="cuda", dtype=torch.int32)
-            ref = engine.merge_attn(a, la, b, lb, source)
-            rq, rs = ops.scaled_fp8_quant(ref, use_per_token_if_dynamic=True)
-            fq, fs = engine.merge_attn_rowquant(a, la, b, lb, source)
-            result[f"merge_rowquant_{D}_rel"] = rel(fq.float() * fs,
-                                                    rq.float() * rs)
         # (d) the residual-add norm
         norm = layers[0].post_feedforward_layernorm
         h, r2 = x.clone(), r.clone()

@@ -11,7 +11,6 @@ Pack on CPU while the GPU runs, gate answers, free pages immediately.
 Torch is imported lazily when model execution starts.
 """
 
-import os
 import time
 
 import numpy as np
@@ -24,16 +23,6 @@ from quail.backends.quail.executor.attention import (
 )
 from quail.backends.quail.executor.pack import FilterAdmission, JoinAdmission
 from quail.progress import Progress, logger, quiet
-
-
-def fits_window(prefix_tokens, suffixes, canvas_tokens, window) -> bool:
-    """Whether every suffix row of a group sees its whole prefix.
-
-    True when the prefix, the longest suffix and the canvas fit in the
-    sliding window, so a prefix attention call needs no window mask.
-    """
-    longest = max((len(suffix) for suffix in suffixes), default=0)
-    return prefix_tokens + longest + canvas_tokens <= window
 
 
 def _tick(timing, key, t0):
@@ -252,9 +241,9 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     def concatenate(parts):
         return np.concatenate(parts) if parts else np.empty(0, dtype=np.int64)
 
-    if attention_mode not in ("merge_quant", "merge", "unified"):
+    if attention_mode not in ("merge_quant", "unified"):
         raise ValueError(
-            "attention_mode must be 'merge_quant', 'merge' or 'unified', "
+            "attention_mode must be 'merge_quant' or 'unified', "
             f"got {attention_mode!r}")
     canvas = tuple(canvas)
     # a one-row canvas is the suffix's last row seeing everything
@@ -360,16 +349,6 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             cu_q=stage("unified_cu_q", cu_q, torch.int32),
             max_q=max_q, used=used,
             max_used=max(cross_used), table=table)
-        if getattr(arena, "has_sliding", False):
-            # a sliding layer reads the prefix from the sliding pool,
-            # whose rows start at the key's window origin
-            starts = [arena.sliding_start(k) for k in cross_keys]
-            sliding_used = [f - start for f, start in zip(cross_used, starts)]
-            cross["sliding"] = dict(
-                table=arena.block_table_rows(
-                    [arena.owned_sliding_pages(k) for k in cross_keys]),
-                used=_staged(torch, sliding_used, torch.int32, pinned),
-                max_used=max(sliding_used))
         # row -> its index in call B's output, -1 for prefix rows;
         # the fused merge kernel's map
         source = [-1] * token_count
@@ -489,36 +468,19 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             raise
 
     # All current KV writes use one scatter.
-    kv_src = kv_dst = kv_dst_sliding = None
+    kv_src = kv_dst = None
     if kv_writes:
         src = []
         dst_parts = []
-        sliding_parts = []
-        sliding = getattr(arena, "has_sliding", False)
         for key, r0, r1, dest in kv_writes:
             src.extend(range(r0, r1))
             rows = arena.capacity_rows(key)[dest:dest + (r1 - r0)]
             if rows.numel() != r1 - r0:
                 raise AssertionError("KV write exceeds reserved rows")
             dst_parts.append(rows)
-            if sliding:
-                start = arena.sliding_start(key)
-                if dest < start:
-                    raise ValueError(
-                        f"group {key!r}: a KV write at row {dest} lies "
-                        f"before the sliding window origin {start}")
-                rows = arena.capacity_rows_sliding(key)[
-                    dest - start:dest - start + (r1 - r0)]
-                if rows.numel() != r1 - r0:
-                    raise AssertionError(
-                        "KV write exceeds the reserved sliding rows")
-                sliding_parts.append(rows)
         kv_src = _staged(torch, src, torch.int64, pinned)
         kv_dst = _staged(torch, torch.cat(dst_parts), torch.int64,
                          pinned)
-        if sliding_parts:
-            kv_dst_sliding = _staged(
-                torch, torch.cat(sliding_parts), torch.int64, pinned)
     t = _tick(timing, "pack_kv", t)
 
     canvas_meta = None
@@ -550,7 +512,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                     max_used=max(pools[1].lengths[i] for i in canvas_seq))
     meta = dict(
         layer=0, mode=attention_mode, kv_src=kv_src, kv_dst=kv_dst,
-        kv_dst_sliding=kv_dst_sliding, cross=cross,
+        cross=cross,
         unified=unified, unified_sliding=unified_sliding, canvas=canvas_meta,
         cu_a=stage("cu_a", cu_a, torch.int32),
         max_a=max(cu_a[i + 1] - cu_a[i] for i in range(len(cu_a) - 1)))
@@ -646,46 +608,8 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         raise ValueError("anchor_keys must match anchor_prefixes")
     frames = stage_frames or [[] for _ in range(k)]
     fixed_mode = join_attention_mode(pipeline.is_fp8)
-    window = getattr(pipeline, "window", None)
     canvas = tuple(getattr(pipeline, "canvas_ids", ()))
     answer_row = getattr(pipeline, "canvas_answer_row", 0)
-
-    # A windowed model (Gemma) runs the two-call path for groups whose
-    # prefix, longest suffix and canvas fit in the window, so the
-    # prefix call needs no window mask. Groups that do not fit go to
-    # the unified path in a chunk of their own: 2 percent of IMDB
-    # reviews exceed the window, and one such group per chunk would
-    # otherwise send nearly every chunk to the unified path. The
-    # two-call path needs the LSE from the wide-head kernel, which
-    # only FA4 returns.
-    # Opt-in: on DiffusionGemma the two-call path matched the unified
-    # path within noise on IMDB-2 and BIO-2 (runs 20260919T005552Z and
-    # 20260919T014xxxZ on the quail-results volume), because the merge
-    # pass costs what the shared prefix read saves. On the 25 sliding
-    # layers a row sees at most the window, so there is no prefix
-    # read to share; on the 5 full layers the shared prefix is 2 KB
-    # per token with 2 KV heads, too little to pay for the merge.
-    split_by_window = (
-        os.environ.get("QUAIL_JOIN_ATTENTION") == "merge"
-        and fixed_mode == FILTER_ATTENTION and window is not None
-        and len(canvas) <= 1
-        and getattr(pipeline.engine, "wide_head_kernel", "fa4") == "fa4")
-
-    def entry_mode(a, j, start, end):
-        if not split_by_window:
-            return fixed_mode
-        f = len(prefixes[a]) + len(frames[j])
-        sufs = [stage_suffixes[j][i]
-                for i in sched.partner_indices(a, j, start, end)]
-        return ("merge" if fits_window(f, sufs, len(canvas), window)
-                else FILTER_ATTENTION)
-
-    def partition(chunk_groups):
-        """The chunk's groups by attention path, two-call first."""
-        by_mode = {}
-        for entry in chunk_groups:
-            by_mode.setdefault(entry_mode(*entry[:4]), []).append(entry)
-        return sorted(by_mode.items(), key=lambda item: item[0] != "merge")
 
     def entry_rows(a, j, start, end, carried):
         f = len(prefixes[a])
@@ -696,13 +620,6 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         if frame and start == 0:
             rows += len(frame) + len(canvas)
         return rows
-
-    # groups that do not fit the window wait here, holding their
-    # pages, until they fill a chunk of their own: a chunk of a few
-    # hundred rows is launch-bound over the layers
-    deferred = []
-    deferred_rows = [0]
-    deferred_pages = [0]     # document pages the deferred groups hold
 
     if k == 0:
         return [], [], 0
@@ -849,8 +766,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         The admission prices a chunk's temporary suffix pages, but the
         packer takes them in both pools a page at a time, and on long
         documents with many short suffixes the tighter pool can run
-        out. Deferred groups also hold their document pages while
-        waiting. Halving costs only chunk efficiency.
+        out. Halving costs only chunk efficiency.
         """
         try:
             run_one(part, mode)
@@ -858,8 +774,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
             if "free KV arena" not in str(error):
                 raise
             # retained KV nothing here reads makes room first; it is
-            # a cache, and the admission did not plan for this chunk's
-            # temporaries when the groups were deferred
+            # a cache
             need = arena.page_cost(sum(entry_rows(*e) for e in part))
             if arena.evict_retained(need):
                 logger.info("join chunk of %d groups retried after "
@@ -908,45 +823,12 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
             if outstanding:
                 report(outstanding.pop(0))
                 continue
-            if deferred:
-                run_part(deferred[:], FILTER_ATTENTION)
-                deferred.clear()
-                deferred_rows[0] = 0
-                deferred_pages[0] = 0
-                continue
             if anchor_source is not None and not anchor_source.done:
                 # the source has to move; it may evict retained KV to admit
                 if pull(evict_retained=True, force=True):
                     continue
             raise AssertionError("nothing buildable and nothing in flight")
-        for mode, part in partition(groups):
-            if mode == fixed_mode or not split_by_window:
-                if split_by_window:
-                    # hold the pages now; the chunk packs later
-                    for a, j, start, end, carried in part:
-                        f = len(prefixes[a])
-                        got = arena.activate(keys[a], f, capacity_tokens=f + frame_max,
-                                             base_tokens=f)
-                        assert got is not None, \
-                            "scheduler admitted an anchor the arena cannot hold"
-                        deferred_pages[0] += arena.held_cost(keys[a])
-                    deferred.extend(part)
-                    deferred_rows[0] += sum(entry_rows(*e) for e in part)
-                    # the waiting groups are long documents, so their
-                    # pages bound the wait before their rows do: past
-                    # an eighth of the arena the chunk runs small
-                    if (deferred_rows[0] < budget // 2
-                            and deferred_pages[0] < arena.n_pages // 8):
-                        continue
-                    part = deferred[:]
-                    deferred.clear()
-                    deferred_rows[0] = 0
-                    deferred_pages[0] = 0
-                    run_part(part, FILTER_ATTENTION)
-                    continue
-                run_part(part, mode)
-            else:
-                run_part(part, mode)
+        run_part(groups, fixed_mode)
     while outstanding:
         report(outstanding.pop(0))
     progress.finish(f"{label} done", f"{tokens:,} fresh tokens")
@@ -1008,12 +890,6 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
     q_max = len(question)
     modes = ((FILTER_ATTENTION, JOIN_ATTENTION) if pipeline.is_fp8
              else (FILTER_ATTENTION,))
-    if (os.environ.get("QUAIL_JOIN_ATTENTION") == "merge"
-            and not pipeline.is_fp8
-            and getattr(pipeline, "window", None) is not None
-            and getattr(pipeline.engine, "wide_head_kernel", "") == "fa4"):
-        # a windowed model's joins opted into the bf16 two-call path
-        modes += ("merge",)
     for mode in modes:
         logger.debug("kernels: warming %s attention, full chunk", mode)
         run_filter(torch, arena, pipeline, async_ans, warm_docs,
