@@ -920,6 +920,209 @@ def micro(prediction: str, rows: int = 62920) -> str:
     return json.dumps(results, indent=2)
 
 
+@app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
+              volumes=volumes)
+def fa4_tiles(prediction: str, prefix: int = 448, suffix: int = 54,
+              partners: int = 12, anchors: int = 54) -> str:
+    """Time the join attention on the full-layer shape, option by option.
+
+    Synthetic IMDB-2 layout: each anchor's prefix is shared by its
+    partners, and each pair's suffix rows see the prefix and the
+    pair's earlier rows. 16 query heads, 2 KV heads, 512-wide heads,
+    k = v as in the model's full-attention layers. Also times the
+    sliding-layer shape (16 query heads, 8 KV heads, 256-wide heads,
+    window 1024) on FlashAttention 3 and 4.
+    """
+    import torch
+    from vllm.vllm_flash_attn import flash_attn_varlen_func
+    from vllm.vllm_flash_attn.cute.interface import _flash_attn_fwd
+
+    page = 16
+    if prefix % page:
+        raise ValueError("prefix must be a whole number of pages")
+    pairs = anchors * partners
+    rows = pairs * suffix
+    own_pages = -(-suffix // page)
+    prefix_pages = prefix // page
+    n_pages = anchors * prefix_pages + pairs * own_pages
+    dev = "cuda"
+
+    def layout(H, KH, D):
+        q = torch.randn(rows, H, D, device=dev, dtype=torch.bfloat16) * 0.1
+        kv = torch.randn(n_pages, page, KH, D, device=dev,
+                         dtype=torch.bfloat16) * 0.1
+        table = torch.empty(pairs, prefix_pages + own_pages,
+                            device=dev, dtype=torch.int32)
+        for a in range(anchors):
+            for j in range(partners):
+                pair = a * partners + j
+                table[pair, :prefix_pages] = torch.arange(
+                    a * prefix_pages, (a + 1) * prefix_pages)
+                first = anchors * prefix_pages + pair * own_pages
+                table[pair, prefix_pages:] = torch.arange(
+                    first, first + own_pages)
+        # the same rows unpaged: per pair [prefix | own rows]
+        flat = kv.view(n_pages * page, KH, D)
+        row_ids = []
+        for pair in range(pairs):
+            pages = table[pair].tolist()
+            ids = [p * page + t for p in pages for t in range(page)]
+            row_ids.extend(ids[:prefix + suffix])
+        row_ids = torch.tensor(row_ids, device=dev)
+        unpaged = flat.index_select(0, row_ids)
+        own_ids = row_ids.view(pairs, -1)[:, prefix:].reshape(-1)
+        own = flat.index_select(0, own_ids)
+        cu_q = torch.arange(0, rows + 1, suffix, device=dev,
+                            dtype=torch.int32)
+        cu_k = torch.arange(0, pairs * (prefix + suffix) + 1, prefix + suffix,
+                            device=dev, dtype=torch.int32)
+        used = torch.full((pairs,), prefix + suffix, device=dev,
+                          dtype=torch.int32)
+        cu_anchor = torch.arange(0, rows + 1, partners * suffix, device=dev,
+                                 dtype=torch.int32)
+        anchor_table = table[::partners, :prefix_pages].contiguous()
+        anchor_used = torch.full((anchors,), prefix, device=dev,
+                                 dtype=torch.int32)
+        return dict(q=q, kv=kv, table=table, unpaged=unpaged, own=own,
+                    cu_q=cu_q, cu_k=cu_k, used=used, cu_anchor=cu_anchor,
+                    anchor_table=anchor_table, anchor_used=anchor_used)
+
+    def flops(H, D):
+        per_pair = suffix * prefix + suffix * (suffix + 1) // 2
+        return pairs * per_pair * H * D * 4
+
+    def timed(fn, repeats=10):
+        try:
+            fn()
+        except Exception as error:  # noqa: BLE001 - report, keep going
+            return f"failed: {type(error).__name__}: {str(error)[:160]}"
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(repeats):
+            fn()
+        torch.cuda.synchronize()
+        return (time.perf_counter() - t0) / repeats
+
+    def paged_fa(L, version, window=None, **knobs):
+        def run():
+            if not knobs:
+                return flash_attn_varlen_func(
+                    L["q"], L["kv"], L["kv"], max_seqlen_q=suffix,
+                    cu_seqlens_q=L["cu_q"], max_seqlen_k=prefix + suffix,
+                    block_table=L["table"], seqused_k=L["used"],
+                    causal=True, fa_version=version, softmax_scale=1.0,
+                    return_softmax_lse=True,
+                    window_size=list(window) if window else (-1, -1))
+            return _flash_attn_fwd(
+                L["q"], L["kv"], L["kv"], cu_seqlens_q=L["cu_q"],
+                seqused_k=L["used"], max_seqlen_q=suffix,
+                max_seqlen_k=prefix + suffix, page_table=L["table"],
+                softmax_scale=1.0, causal=True, num_splits=0,
+                return_lse=True, **knobs)
+        return run
+
+    def unpaged_fa(L, version):
+        def run():
+            return flash_attn_varlen_func(
+                L["q"], L["unpaged"], L["unpaged"], max_seqlen_q=suffix,
+                cu_seqlens_q=L["cu_q"], max_seqlen_k=prefix + suffix,
+                cu_seqlens_k=L["cu_k"], causal=True, fa_version=version,
+                softmax_scale=1.0, return_softmax_lse=True)
+        return run
+
+    def call_a(L, version):
+        def run():
+            return flash_attn_varlen_func(
+                L["q"], L["own"], L["own"], max_seqlen_q=suffix,
+                cu_seqlens_q=L["cu_q"], max_seqlen_k=suffix,
+                cu_seqlens_k=L["cu_q"], causal=True, fa_version=version,
+                softmax_scale=1.0, return_softmax_lse=True)
+        return run
+
+    def call_b(L, version):
+        def run():
+            return flash_attn_varlen_func(
+                L["q"], L["kv"], L["kv"], max_seqlen_q=partners * suffix,
+                cu_seqlens_q=L["cu_anchor"], max_seqlen_k=prefix,
+                block_table=L["anchor_table"], seqused_k=L["anchor_used"],
+                causal=False, fa_version=version, softmax_scale=1.0,
+                return_softmax_lse=True)
+        return run
+
+    def triton_paged(L, window=None):
+        from vllm.v1.attention.ops.triton_unified_attention import (
+            unified_attention,
+        )
+        out = torch.empty_like(L["q"])
+
+        def run():
+            unified_attention(
+                q=L["q"], k=L["kv"], v=L["kv"], out=out,
+                cu_seqlens_q=L["cu_q"], max_seqlen_q=suffix,
+                seqused_k=L["used"], max_seqlen_k=prefix + suffix,
+                softmax_scale=1.0, causal=True,
+                window_size=window or (-1, -1), block_table=L["table"],
+                softcap=0.0, q_descale=None, k_descale=None, v_descale=None)
+        return run
+
+    result = {"prediction": prediction, "prefix": prefix, "suffix": suffix,
+              "partners": partners, "anchors": anchors, "rows": rows}
+    full = layout(16, 2, 512)
+    variants = {
+        "fa4_paged_default": paged_fa(full, 4),
+        "fa4_unpaged_default": unpaged_fa(full, 4),
+        "fa4_paged_pack_gqa_off": paged_fa(full, 4, pack_gqa=False),
+        "fa4_paged_tile_128x64": paged_fa(full, 4, tile_mn=(128, 64)),
+        "fa4_paged_tile_64x128": paged_fa(full, 4, tile_mn=(64, 128)),
+        "fa4_paged_tile_128x128": paged_fa(full, 4, tile_mn=(128, 128)),
+        "fa4_paged_tile_128x64_pack_off": paged_fa(
+            full, 4, tile_mn=(128, 64), pack_gqa=False),
+        "fa4_paged_pv_rs": paged_fa(full, 4, mma_pv_is_rs=True),
+        "fa4_paged_no_overlap": paged_fa(full, 4, intra_wg_overlap=False),
+        "fa4_call_a_own_rows": call_a(full, 4),
+        "fa4_call_b_prefix": call_b(full, 4),
+        "triton_paged": triton_paged(full),
+    }
+    full_flops = flops(16, 512)
+    result["full_flops"] = full_flops
+    for name, fn in variants.items():
+        seconds = timed(fn)
+        if isinstance(seconds, str):
+            result[name] = seconds
+        else:
+            result[name] = {"ms": round(seconds * 1e3, 3),
+                            "tflops": round(full_flops / seconds / 1e12, 1)}
+        print(name, result[name], flush=True)
+    a, b = result["fa4_call_a_own_rows"], result["fa4_call_b_prefix"]
+    if isinstance(a, dict) and isinstance(b, dict):
+        result["fa4_two_call_sum_ms"] = round(a["ms"] + b["ms"], 3)
+    del full
+    torch.cuda.empty_cache()
+
+    sliding = layout(16, 8, 256)
+    window = (1023, 0)
+    sliding_flops = flops(16, 256)
+    result["sliding_flops"] = sliding_flops
+    for name, fn in {
+        "sliding_fa3_paged_window": paged_fa(sliding, 3, window),
+        "sliding_fa4_paged_window": paged_fa(sliding, 4, window),
+        "sliding_fa3_paged_full": paged_fa(sliding, 3),
+        "sliding_triton_paged_window": triton_paged(sliding, window),
+    }.items():
+        seconds = timed(fn)
+        if isinstance(seconds, str):
+            result[name] = seconds
+        else:
+            result[name] = {"ms": round(seconds * 1e3, 3),
+                            "tflops": round(sliding_flops / seconds / 1e12, 1)}
+        print(name, result[name], flush=True)
+    result["h100_bf16_dense_peak_tflops"] = 989
+    result["gb_kv_full_per_token"] = 2 * 512 * 2 / 1e9
+    result["softmax_scale"] = 1.0
+    result["volume_path"] = _save("diffusion_gemma_fa4_tiles", result)
+    return json.dumps(result, indent=2)
+
+
 @app.local_entrypoint()
 def main(prediction: str = "", docs: int = 110, doc_tokens: int = 300,
          kernels: str = "triton,fa4", random_tokens: bool = False,
@@ -948,6 +1151,8 @@ def main(prediction: str = "", docs: int = 110, doc_tokens: int = 300,
         calls["loop"] = time_loop.spawn(prediction)
     if "micro" in runs:
         calls["micro"] = micro.spawn(prediction)
+    if "fa4" in runs:
+        calls["fa4"] = fa4_tiles.spawn(prediction)
     for name, call in calls.items():
         print(f"function call id: {call.object_id} ({name})", flush=True)
     for name, call in calls.items():

@@ -1041,7 +1041,9 @@ class Engine:
         Canvas rows (meta["canvas"]) get a second, non-causal call
         over the same KV: each canvas row sees its whole prompt and
         every row of its own canvas. Its result replaces the causal
-        call's rows.
+        call's rows. A one-row canvas is the last row of its causal
+        segment, which already sees the whole prompt, so it skips the
+        second call.
 
         Args:
             q3: Queries, (rows, heads, dim).
@@ -1057,6 +1059,8 @@ class Engine:
         layer = meta["layer"]
         unified = meta["unified"]
         canvas = meta.get("canvas")
+        if canvas is not None and canvas["max_q"] == 1:
+            canvas = None
         behind = None if window is None else (window - 1, 0)
         around = None if window is None else (window - 1, window - 1)
         # a sliding layer reads the sliding pool when the arena keeps one

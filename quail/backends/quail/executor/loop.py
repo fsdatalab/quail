@@ -661,7 +661,10 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     # Opt-in: on DiffusionGemma the two-call path matched the unified
     # path within noise on IMDB-2 and BIO-2 (runs 20260919T005552Z and
     # 20260919T014xxxZ on the quail-results volume), because the merge
-    # pass costs what the shared prefix read saves.
+    # pass costs what the shared prefix read saves. On the 25 sliding
+    # layers a row sees at most the window, so there is no prefix
+    # read to share; on the 5 full layers the shared prefix is 2 KB
+    # per token with 2 KV heads, too little to pay for the merge.
     split_by_window = (
         os.environ.get("QUAIL_JOIN_ATTENTION") == "merge"
         and fixed_mode == FILTER_ATTENTION and window is not None

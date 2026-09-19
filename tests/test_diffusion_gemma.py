@@ -509,3 +509,37 @@ def test_tuned_moe_configs_cover_the_chunk_sizes(tmp_path):
             assert set(table[rows]) == {"BLOCK_SIZE_M", "BLOCK_SIZE_N",
                                         "BLOCK_SIZE_K", "GROUP_SIZE_M",
                                         "num_warps", "num_stages"}
+
+
+@pytest.mark.parametrize("canvas, calls", [((90,), 1), ((90, 91), 2)])
+def test_one_row_canvas_skips_the_second_attention_call(
+        monkeypatch, canvas, calls):
+    """A one-row canvas is its segment's last causal row: one call covers it."""
+    import torch
+
+    from quail.backends.quail.executor.attention import Engine
+
+    _cpu_staging(monkeypatch)
+    arena = cpu_arena(64)
+    groups = [dict(key=("d", 0), prefix=[1, 2, 3], f=3, suffixes=[[10, 11]])]
+    chunk = loop.pack_chunk(torch, arena, groups, attention_mode="unified",
+                            canvas=canvas)
+    engine = Engine.__new__(Engine)
+    engine.arena = arena
+    engine.torch = torch
+    seen = []
+
+    def fa(q, k, v, cu_q, cu_k, max_q, max_k, causal, **kwargs):
+        seen.append((q.shape[0], causal))
+        return torch.zeros(q.shape[0], 2, 4), None
+
+    monkeypatch.setattr(engine, "_fa", fa)
+    rows = chunk.tokens
+    q3 = torch.zeros(rows, 2, 4)
+    meta = dict(chunk.meta, layer=0)
+    out = engine.attention_unified(q3, q3, q3, meta)
+    assert out.shape == (rows, 8)
+    assert len(seen) == calls
+    assert seen[0] == (rows, True)
+    if calls == 2:
+        assert seen[1] == (len(canvas), False)
