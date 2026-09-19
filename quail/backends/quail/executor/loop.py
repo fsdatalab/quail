@@ -845,6 +845,22 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         while len(outstanding) > 1:
             report(outstanding.pop(0))
 
+    def run_deferred(part):
+        """Run deferred groups as one unified chunk, halving on overflow.
+
+        The groups held their document pages while waiting, but their
+        suffix temporaries are only taken at packing, and the arena
+        may no longer have room for all of them at once.
+        """
+        try:
+            run_part(part, FILTER_ATTENTION)
+        except RuntimeError as error:
+            if "free KV arena" not in str(error) or len(part) < 2:
+                raise
+            half = len(part) // 2
+            run_deferred(part[:half])
+            run_deferred(part[half:])
+
     while True:
         if anchor_source is not None and not anchor_source.done:
             pull()
@@ -864,7 +880,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
                 report(outstanding.pop(0))
                 continue
             if deferred:
-                run_part(deferred[:], FILTER_ATTENTION)
+                run_deferred(deferred[:])
                 deferred.clear()
                 deferred_rows[0] = 0
                 continue
@@ -890,6 +906,8 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
                     part = deferred[:]
                     deferred.clear()
                     deferred_rows[0] = 0
+                    run_deferred(part)
+                    continue
                 run_part(part, mode)
             else:
                 run_part(part, mode)
