@@ -19,7 +19,7 @@ Pull the saved measurements, corpus manifest, and SoL estimates:
     uv run modal volume get quail-results \
       sol/2026-09-18-all-chat/sol_quailb_sf0.1.json "$W/sol.json"
     BENCH=git+https://github.com/fsdatalab/quail-bench.git
-    REV=fc27f35188f0fcc6a1f3b8fe3bfbb9e12d6842eb
+    REV=2c2c5b55ce5718a9e791931b4f55f92c475b8995
     uv run --with matplotlib --with "quail-b@$BENCH@$REV" \
       python reports/make_quailb_comparison_plots.py "$W"
 
@@ -56,29 +56,26 @@ METHODS = [
 ]
 QUERY_ORDER = (
     [f"IMDB-{n}" for n in range(1, 11)] + [f"BIO-{n}" for n in range(1, 4)]
-    + [f"FEV-{n}" for n in range(1, 11)] + [f"LEP-{n}" for n in range(1, 9)]
+    + [f"FEV-{n}" for n in range(1, 11)] + [f"LEP-{n}" for n in range(1, 6)]
     + ["AGENT-1", "AGENT-2"])
 
-
-def token_cell(value):
-    """Format a token count for a report table cell."""
-    return "Not measured" if value is None else f"{value:,}"
+SOURCE_QUERY_IDS = {q: "LEP-7" if q == "LEP-5" else q for q in QUERY_ORDER}
+CURRENT_QUERY_IDS = {source: q for q, source in SOURCE_QUERY_IDS.items()}
 
 
 def row_metrics(row):
     """Derive throughput, GPU cost, and accuracy from one measurement row."""
-    pairs = row["evaluated_document_pairs"]
-    count = row["input_rows"] if pairs is None else pairs
     matched = row["matching_rows"]
     predicted = row["predicted_rows"]
     expected = row["expected_rows"]
     return {
         "seconds": row["runtime_s"],
-        "recomputed": row["regret_tokens"],
-        "fresh": row["fresh_tokens"],
+        "regret_percent": (100 * row["regret_tokens"] / row["fresh_tokens"]
+                           if row["regret_tokens"] is not None
+                           and row["fresh_tokens"] else None),
         "tokens_per_second": row["requested_tokens"] / row["runtime_s"],
-        "throughput": count / row["runtime_s"],
-        "unit": "docs/s" if pairs is None else "pairs/s",
+        "cost_per_million": (row["runtime_s"] / 3600 * H100_USD_PER_HOUR
+                             / row["requested_tokens"] * 1e6),
         "cost": row["runtime_s"] / 3600 * H100_USD_PER_HOUR,
         "agreement": 100 * row["answers_correct"] / row["answers_evaluated"],
         "precision": (100 * matched / predicted if predicted
@@ -90,9 +87,9 @@ def row_metrics(row):
 METRICS = (
     ("seconds", "Latency", "seconds"),
     ("tokens_per_second", "Total requested input tokens per second", "tokens/second"),
-    ("recomputed", "Recomputed KV", "tokens"),
-    ("fresh", "Fresh input tokens", "tokens"),
-    ("agreement", "Answer agreement", "percent"),
+    ("cost", "GPU cost per query", "dollars/query"),
+    ("cost_per_million", "GPU cost per million input tokens", "dollars/million tokens"),
+    ("regret_percent", "Recomputed share of computed tokens", "percent"),
 )
 
 
@@ -120,9 +117,10 @@ def load_sol(root, queries, rows, corpus, manifest):
     assert source["collection_id"] == manifest["collection_id"]
     assert source["scale_factor"] == 0.1
     assert source["optimizer"]["persistent_kv_capacity"] == "unlimited"
-    assert set(source["queries"]) == set(queries)
+    assert set(SOURCE_QUERY_IDS.values()) <= set(source["queries"])
     estimates = {}
-    for query, record in source["queries"].items():
+    for query in queries:
+        record = source["queries"][SOURCE_QUERY_IDS[query]]
         assert record["prompt_format"] == PROMPT_FORMAT
         assert record["plan_sha256"] == hashlib.sha256(
             get_query(query).plan_bytes).hexdigest()
@@ -134,17 +132,22 @@ def load_sol(root, queries, rows, corpus, manifest):
     sol_hash = hashlib.sha256((root / "sol.json").read_bytes()).hexdigest()
     assert counts["sol_sha256"] == sol_hash
     for query, estimate in estimates.items():
-        estimate["requested_tokens"] = counts["sol"][query]
+        estimate["requested_tokens"] = counts["sol"][SOURCE_QUERY_IDS[query]]
     return estimates
 
 
 def series_value(rows, sol, method, query, metric):
     """Return a measured value or an explicitly modeled value."""
     if method == "sol":
-        return {"seconds": sol[query]["sol_s"], "fresh": sol[query]["tokens"],
-                "tokens_per_second": (
-                    sol[query]["requested_tokens"] / sol[query]["sol_s"]),
-                "recomputed": 0, "agreement": None}[metric]
+        seconds = sol[query]["sol_s"]
+        cost = seconds / 3600 * H100_USD_PER_HOUR
+        return {
+            "seconds": seconds,
+            "tokens_per_second": sol[query]["requested_tokens"] / seconds,
+            "cost": cost,
+            "cost_per_million": cost / sol[query]["requested_tokens"] * 1e6,
+            "regret_percent": 0,
+        }[metric]
     if query not in rows[method]:
         return None
     return row_metrics(rows[method][query])[metric]
@@ -154,27 +157,20 @@ def metric_bars(axis, queries, rows, sol, metric, overview):
     """Draw measured bars and a SoL line across each query group."""
     measured = METHODS
     unit = next(unit for key, _, unit in METRICS if key == metric)
-    methods = measured + ([] if metric == "agreement"
-                          else [("sol", "SoL estimate", DARK)])
+    methods = measured + [("sol", "SoL estimate", DARK)]
     positive = [value for key, _, _ in methods for query in queries
                 if (value := series_value(rows, sol, key, query, metric)) is not None
                 and value > 0]
     maximum = max(positive, default=0)
-    logarithmic = (metric != "agreement" and positive
+    logarithmic = (metric != "regret_percent" and positive
                    and maximum / min(positive) > 10)
-    if metric == "agreement":
-        axis.set_ylim(0, 122)
-        axis.set_yticks([0, 25, 50, 75, 100])
+    if metric == "regret_percent":
+        axis.set_ylim(0, min(105, max(1, maximum * 1.4)))
         axis.set_ylabel("percent")
     elif logarithmic:
-        if metric == "recomputed":
-            axis.set_yscale("symlog", linthresh=1)
-            axis.set_ylim(0, maximum * 30)
-            axis.set_ylabel("tokens (linear to 1, then log)")
-        else:
-            axis.set_yscale("log")
-            axis.set_ylim(min(positive) / 2, maximum * 8)
-            axis.set_ylabel(f"{unit} (log scale)")
+        axis.set_yscale("log")
+        axis.set_ylim(min(positive) / 2, maximum * 8)
+        axis.set_ylabel(f"{unit} (log scale)")
     else:
         axis.set_ylim(0, maximum * 1.6 if maximum else 1)
         axis.set_ylabel(unit)
@@ -197,8 +193,8 @@ def metric_bars(axis, queries, rows, sol, metric, overview):
             if not overview:
                 shown = f"{value / 1e6:.2f}M" if value >= 1e6 else (
                     f"{value / 1e3:.1f}k" if value >= 1000 else f"{value:.2f}")
-                if metric in ("fresh", "recomputed") and value < 1000:
-                    shown = f"{value:.0f}"
+                if metric in ("cost", "cost_per_million"):
+                    shown = f"{value:.2g}"
                 axis.annotate(shown, (position, value), xytext=(0, 3),
                               textcoords="offset points", rotation=90,
                               ha="center", va="bottom", fontsize=8)
@@ -213,22 +209,18 @@ def metric_bars(axis, queries, rows, sol, metric, overview):
             axis.annotate(f"{ratio:.2f}x", (index, top), xytext=(0, 35),
                           textcoords="offset points", ha="center",
                           va="bottom", fontsize=8)
-    if metric != "agreement":
-        for index, query in enumerate(queries):
-            axis.hlines(series_value(rows, sol, "sol", query, metric),
-                        index - 0.41, index + 0.41, color=DARK, linewidth=1.7,
-                        zorder=3, clip_on=False)
+    for index, query in enumerate(queries):
+        axis.hlines(series_value(rows, sol, "sol", query, metric),
+                    index - 0.41, index + 0.41, color=DARK, linewidth=1.7,
+                    zorder=3, clip_on=False)
     axis.set_xlim(-0.7, len(queries) - 0.3)
     axis.set_xticks(range(len(queries)),
                    queries,
                    rotation=55 if overview else 35, ha="right")
     axis.tick_params(axis="x", labelsize=9)
     latency_title = "Latency" if overview else "Latency (ratios: vLLM / Quail)"
-    titles = {"seconds": latency_title, "recomputed": "Recomputed KV tokens",
-              "fresh": "Fresh input tokens",
-              "tokens_per_second": "Total requested input tokens per second",
-              "agreement": "Answer agreement with reference labels"}
-    axis.set_title(titles[metric], fontsize=13)
+    title = next(title for key, title, _ in METRICS if key == metric)
+    axis.set_title(latency_title if metric == "seconds" else title, fontsize=13)
 
 
 def document_page(title, queries, relations):
@@ -266,7 +258,7 @@ def plot_comparison(title, queries, rows, relations, sol, name, overview=False):
     """Export metric charts and input counts as a vector PDF."""
     destination = HERE / "plots" / name
     groups = [[metric] for metric, _, _ in METRICS] if overview else [
-        ["seconds", "fresh", "recomputed", "agreement"],
+        ["seconds", "cost", "cost_per_million", "regret_percent"],
         ["tokens_per_second"]]
     with PdfPages(destination.with_suffix(".pdf")) as pdf:
         for metrics in groups:
@@ -280,9 +272,8 @@ def plot_comparison(title, queries, rows, relations, sol, name, overview=False):
                             fontsize=16)
             handles = [Patch(facecolor=color, label=label)
                        for _, label, color in METHODS]
-            if metrics != ["agreement"]:
-                handles.append(Line2D([0], [0], color=DARK, linewidth=1.7,
-                                      label="SoL estimate"))
+            handles.append(Line2D([0], [0], color=DARK, linewidth=1.7,
+                                  label="SoL estimate"))
             figure.legend(handles=handles, loc="upper center",
                           bbox_to_anchor=(0.5, 0.925), ncol=5, fontsize=11,
                           frameon=False)
@@ -309,7 +300,7 @@ def measurement_rows(path):
 
 
 def load_rows(root, corpus):
-    """Load complete measurements for both methods and all 33 queries."""
+    """Load complete measurements for both methods and all 30 retained queries."""
     from quail_b.queries import get_query
     from quail_b.rendering import PROMPT_FORMAT
     from quail_b.run import _query_hash
@@ -318,7 +309,7 @@ def load_rows(root, corpus):
     assert manifest["status"] == "complete"
     assert manifest["model"] == "qwen3-4b-fp8"
     assert manifest["sf"] == 0.1
-    assert set(manifest["query_ids"]) == set(QUERY_ORDER)
+    assert set(SOURCE_QUERY_IDS.values()) <= set(manifest["query_ids"])
     assert set(manifest["methods"]) == {key for key, _, _ in METHODS}
     rows = measurement_rows(root / "run" / "measurements.parquet")
     counts = json.loads((root / "requested_tokens.json").read_text())
@@ -332,14 +323,20 @@ def load_rows(root, corpus):
         assert suite["corpus_id"] == corpus["corpus_id"]
         assert suite["collection_id"] == manifest["collection_id"]
         assert suite["metadata"]["prompt_format"] == PROMPT_FORMAT
-        assert set(rows[method]) == set(QUERY_ORDER)
-        assert {item["id"] for item in suite["queries"]} == set(QUERY_ORDER)
+        assert set(rows[method]) == set(manifest["query_ids"])
+        assert {item["id"] for item in suite["queries"]} == set(manifest["query_ids"])
         for item in suite["queries"]:
+            if item["id"] not in CURRENT_QUERY_IDS:
+                continue
+            query = CURRENT_QUERY_IDS[item["id"]]
             assert item["status"] == "complete"
-            assert item["definition_hash"] == _query_hash(get_query(item["id"]))
+            assert item["definition_hash"] == _query_hash(get_query(query))
             assert rows[method][item["id"]]["regret_tokens"] is not None
             rows[method][item["id"]]["requested_tokens"] = (
                 counts["methods"][method][item["id"]])
+        rows[method] = {
+            query: rows[method][source]
+            for query, source in SOURCE_QUERY_IDS.items()}
         suites[method] = suite
     return rows, manifest, suites
 
@@ -460,7 +457,9 @@ def count_requested_tokens(run_directory, root, sol_path):
         result["run_sha256"][method] = hashlib.sha256(raw).hexdigest()
         result["methods"][method] = {}
         for item in json.loads(raw)["queries"]:
-            spec = get_query(item["id"])
+            if item["id"] not in CURRENT_QUERY_IDS:
+                continue
+            spec = get_query(CURRENT_QUERY_IDS[item["id"]])
             assert item["definition_hash"] == _query_hash(spec)
             directory = run_directory / method / item["directory"]
             output = _read_output(directory, item, rows=False)
@@ -484,9 +483,9 @@ def count_requested_tokens(run_directory, root, sol_path):
         answer = answer_oracle(benchmark.ground_truth, benchmark.tables)
         for query in QUERY_ORDER:
             spec = get_query(query)
-            saved = sol["queries"][query]
+            saved = sol["queries"][SOURCE_QUERY_IDS[query]]
             assert saved["plan_sha256"] == hashlib.sha256(spec.plan_bytes).hexdigest()
-            result["sol"][query] = reference_requested_tokens(
+            result["sol"][SOURCE_QUERY_IDS[query]] = reference_requested_tokens(
                 build_query(session, spec), answer, saved["models"]["qwen3-4b-fp8"])
             print("Counted SoL prompts:", query, flush=True)
     finally:
@@ -532,11 +531,15 @@ def main(workdir):
     fev8 = row_metrics(rows["quail"]["FEV-8"])
     lines = [
         "# QUAIL-B comparison", "",
-        "- All 33 queries use Qwen3's chat format with thinking disabled.",
+        "- All 30 retained queries use Qwen3's chat format with thinking disabled.",
         "  Both methods use Qwen3 4B FP8, sf=0.1, lf=1, and one H100.",
         "  Quail and pipelined stock vLLM share a physical GPU within each family.",
         "  Pipelined stock vLLM advances documents through filter stages",
         "  independently, then starts joins after filtering finishes.",
+        "- Previous LEP-5, LEP-6, and LEP-8 were removed because their reference",
+        "  filters leave no rows at sf=0.1. Previous LEP-7 is now LEP-5.",
+        "  This report selects 60 measurements from the saved 66-measurement run.",
+        "  It checks query definitions before mapping historical IDs.",
         "- The measured run is on `quail-results`:",
         f"  `/results/benchmarks/quailb/family-runs/{manifest['run_id']}/`.",
         "  It reuses the completed BioDEX run after checking that its corpus,",
@@ -562,8 +565,7 @@ def main(workdir):
         f"  the median is {median(speedups.values()):.2f}x, and the maximum is",
         f"  {speedups[fastest]:.2f}x on {fastest}. Each query has equal weight.",
         "  Speedup is pipelined stock vLLM time divided by Quail time.",
-        "  Query time excludes startup and result collection. Table throughput counts",
-        "  input documents for filters and evaluated pairs across stages for joins.",
+        "  Query time excludes startup and result collection.",
         f"  GPU cost is query seconds / 3,600 * ${H100_USD_PER_HOUR:.4f}.",
         "- SoL means speed of light. It estimates ideal GPU time by dividing",
         "  arithmetic and memory traffic by the hardware's peak rates. For each",
@@ -581,12 +583,15 @@ def main(workdir):
         "  per document, and each pair's partner label, partner document, and",
         "  answer cue once per pair. They are included in fresh tokens, not added",
         "  to them. The benchmark computes this minimum from saved answers after",
-        "  the run.",
+        "  the run. KV regret is recomputed tokens / fresh tokens * 100%.",
+        "  A missing minimum or zero computed tokens leaves regret unreported.",
         "- Token throughput is total requested input tokens divided by query seconds.",
         "  Count each complete prompt once per evaluated filter or join pair,",
         "  including tokens served from KV. Exclude generated answer tokens.",
         "  Counts come from saved answers, prompt pieces, and document tokens.",
-        "  All 33 vLLM totals match its recorded fresh plus cached token counts.",
+        "  All retained vLLM totals match its recorded fresh plus cached token counts.",
+        "  Cost per million input tokens is query dollars / requested tokens * 1e6.",
+        "  It uses the same complete-prompt count as tokens per second.",
         "  Different survivors can change which prompts a method evaluates.",
         "  The SoL line counts complete prompts under its reference survivors.",
         "- Answer agreement counts matching evaluated predicate answers. Output",
@@ -657,37 +662,35 @@ def main(workdir):
                 "run beyond its 2,477 filter-stage tokens. Under the current rule,",
                 "vLLM recomputed 154,747 tokens there and 157,341 here."])
         table_header_text = (
-            "| Query | Method | Seconds | Recomputed KV tokens "
-            "| Fresh input tokens | Requested input tokens | Tokens/second "
-            "| Throughput | Unit | $/query | Answer agreement (%) "
-            "| Output precision (%) | Output recall (%) |")
+            "| Query | Method | Seconds | Tokens/second | $/query "
+            "| $/million input tokens | KV regret (%) |")
         lines.extend(["", table_header_text,
-                      "|---|---|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|"])
+                      "|---|---|---:|---:|---:|---:|---:|"])
+        for query in selected:
+            for key, label, _ in METHODS:
+                m = row_metrics(rows[key][query])
+                regret = ("Not measured" if m["regret_percent"] is None
+                          else f"{m['regret_percent']:.2f}")
+                lines.append(
+                    f"| {query} | {label} | {m['seconds']:.2f} "
+                    f"| {m['tokens_per_second']:,.2f} | {m['cost']:.5f} "
+                    f"| {m['cost_per_million']:.6f} | {regret} |")
+            values = {metric: series_value(rows, sol, "sol", query, metric)
+                      for metric, _, _ in METRICS}
+            lines.append(
+                f"| {query} | SoL estimate | {values['seconds']:.3f} "
+                f"| {values['tokens_per_second']:,.2f} | {values['cost']:.5f} "
+                f"| {values['cost_per_million']:.6f} | 0 (assumed) |")
+        lines.extend(["", "Correctness against saved reference labels:", "",
+                      "| Query | Method | Answer agreement (%) "
+                      "| Output precision (%) | Output recall (%) |",
+                      "|---|---|---:|---:|---:|"])
         for query in selected:
             for key, label, _ in METHODS:
                 m = row_metrics(rows[key][query])
                 lines.append(
-                    f"| {query} | {label} | {m['seconds']:.2f} "
-                    f"| {token_cell(m['recomputed'])} "
-                    f"| {m['fresh']:,} | {rows[key][query]['requested_tokens']:,} "
-                    f"| {m['tokens_per_second']:,.2f} "
-                    f"| {m['throughput']:,.2f} "
-                    f"| {m['unit']} | {m['cost']:.5f} | {m['agreement']:.2f} "
+                    f"| {query} | {label} | {m['agreement']:.2f} "
                     f"| {m['precision']:.5g} | {m['recall']:.5g} |")
-            estimate = sol[query]
-            throughput = estimate["document_pairs_per_second_at_sol"]
-            unit = "pairs/s"
-            if throughput is None:
-                throughput = estimate["documents_per_second_at_sol"]
-                unit = "docs/s"
-            lines.append(
-                f"| {query} | SoL estimate | {estimate['sol_s']:.3f} | 0 (assumed) "
-                f"| {estimate['tokens']:,.0f} "
-                f"| {estimate['requested_tokens']:,} "
-                f"| {estimate['requested_tokens'] / estimate['sol_s']:,.2f} "
-                f"| {throughput:,.2f} | {unit} "
-                f"| {estimate['cost_usd_per_query_at_sol']:.5f} "
-                "| Not measured | Not measured | Not measured |")
         lines.append("")
     report = HERE / "quailb-comparison.md"
     report.write_text("\n".join(lines))
