@@ -25,6 +25,16 @@ from quail.backends.quail.executor.pack import FilterAdmission, JoinAdmission
 from quail.progress import Progress, logger, quiet
 
 
+def fits_window(prefix_tokens, suffixes, canvas_tokens, window) -> bool:
+    """Whether every suffix row of a group sees its whole prefix.
+
+    True when the prefix, the longest suffix and the canvas fit in the
+    sliding window, so a prefix attention call needs no window mask.
+    """
+    longest = max((len(suffix) for suffix in suffixes), default=0)
+    return prefix_tokens + longest + canvas_tokens <= window
+
+
 def _tick(timing, key, t0):
     if timing is not None:
         timing[key] = timing.get(key, 0.0) + time.perf_counter() - t0
@@ -634,24 +644,34 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     canvas = tuple(getattr(pipeline, "canvas_ids", ()))
     answer_row = getattr(pipeline, "canvas_answer_row", 0)
 
-    def chunk_mode(specs):
-        """The attention path of one chunk.
+    # A windowed model (Gemma) runs the two-call path for groups whose
+    # prefix, longest suffix and canvas fit in the window, so the
+    # prefix call needs no window mask. Groups that do not fit go to
+    # the unified path in a chunk of their own: 2 percent of IMDB
+    # reviews exceed the window, and one such group per chunk would
+    # otherwise send nearly every chunk to the unified path. The
+    # two-call path needs the LSE from the wide-head kernel, which
+    # only FA4 returns.
+    split_by_window = (
+        fixed_mode == FILTER_ATTENTION and window is not None
+        and len(canvas) <= 1
+        and getattr(pipeline.engine, "wide_head_kernel", "fa4") == "fa4")
 
-        A windowed model (Gemma) runs the two-call path when every
-        group's prefix, longest suffix and canvas fit in the window,
-        so the prefix call needs no window mask; otherwise the
-        unified path. The two-call path needs the LSE from the
-        wide-head kernel, which only FA4 returns.
-        """
-        if (fixed_mode != FILTER_ATTENTION or window is None
-                or len(canvas) > 1
-                or getattr(pipeline.engine, "wide_head_kernel", "fa4") != "fa4"):
+    def entry_mode(a, j, start, end):
+        if not split_by_window:
             return fixed_mode
-        for spec in specs:
-            longest = max((len(suf) for suf in spec["suffixes"]), default=0)
-            if spec["f"] + longest + len(canvas) > window:
-                return FILTER_ATTENTION
-        return "merge"
+        f = len(prefixes[a]) + len(frames[j])
+        sufs = [stage_suffixes[j][i]
+                for i in sched.partner_indices(a, j, start, end)]
+        return ("merge" if fits_window(f, sufs, len(canvas), window)
+                else FILTER_ATTENTION)
+
+    def partition(chunk_groups):
+        """The chunk's groups by attention path, two-call first."""
+        by_mode = {}
+        for entry in chunk_groups:
+            by_mode.setdefault(entry_mode(*entry[:4]), []).append(entry)
+        return sorted(by_mode.items(), key=lambda item: item[0] != "merge")
 
     if k == 0:
         return [], [], 0
@@ -728,7 +748,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
                 break
         return moved
 
-    def build(chunk_groups):
+    def build(chunk_groups, mode):
         specs = []
         for a, j, start, end, carried in chunk_groups:
             key = keys[a]
@@ -758,8 +778,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
                     prefix=prefixes[a] if carried else None,
                     f=f + len(frame),
                     suffixes=sufs))
-        return pack_chunk(torch, arena, specs,
-                          attention_mode=chunk_mode(specs),
+        return pack_chunk(torch, arena, specs, attention_mode=mode,
                           staging=staging, canvas=canvas,
                           answer_row=answer_row)
 
@@ -816,20 +835,23 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
                 if pull(evict_retained=True, force=True):
                     continue
             raise AssertionError("nothing buildable and nothing in flight")
-        chunk = build(groups)
-        tokens += chunk.tokens
-        e0 = torch.cuda.Event(enable_timing=True)
-        e1 = torch.cuda.Event(enable_timing=True)
-        e0.record()
-        normed = _forward(pipeline, arena, chunk)
-        e1.record()
-        for key in getattr(chunk, "fresh_keys", ()):
-            arena.trim_window(key)
-        spans.append((groups[0][1], e0, e1))
-        outstanding.append((groups, async_ans.submit(normed)))
-        # read the previous chunk's answers while this one runs
-        while len(outstanding) > 1:
-            report(outstanding.pop(0))
+        # one chunk per attention path; the second is packed after
+        # the first ran so their temporary pages never coexist
+        for mode, part in partition(groups):
+            chunk = build(part, mode)
+            tokens += chunk.tokens
+            e0 = torch.cuda.Event(enable_timing=True)
+            e1 = torch.cuda.Event(enable_timing=True)
+            e0.record()
+            normed = _forward(pipeline, arena, chunk)
+            e1.record()
+            for key in getattr(chunk, "fresh_keys", ()):
+                arena.trim_window(key)
+            spans.append((part[0][1], e0, e1))
+            outstanding.append((part, async_ans.submit(normed)))
+            # read the previous chunk's answers while this one runs
+            while len(outstanding) > 1:
+                report(outstanding.pop(0))
     while outstanding:
         report(outstanding.pop(0))
     progress.finish(f"{label} done", f"{tokens:,} fresh tokens")

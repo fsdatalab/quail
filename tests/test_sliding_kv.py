@@ -247,3 +247,9 @@ def test_pack_chunk_merge_mode_reads_both_pools(monkeypatch):
         loop.pack_chunk(
             torch, arena, [dict(key=key, prefix=None, f=40, suffixes=[[1]])],
             attention_mode="merge", canvas=(900, 901))
+
+
+def test_fits_window_counts_prefix_longest_suffix_and_canvas():
+    assert loop.fits_window(1000, [[1] * 20, [1] * 23], 1, 1024)
+    assert not loop.fits_window(1000, [[1] * 20, [1] * 24], 1, 1024)
+    assert loop.fits_window(1024, [], 0, 1024)
