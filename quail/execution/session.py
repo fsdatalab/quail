@@ -544,7 +544,6 @@ class Query:
                     s.provider, s.column, s.columns)
                 estimated.append(s.alias)
             self._estimated = tuple(estimated)
-            started = time.perf_counter()
             pair_fractions = self._pair_fractions(scans, joins)
             self._plan = plan_query(
                 self.logical, model=self.session.model,
@@ -559,7 +558,6 @@ class Query:
             if self.session.config.gpu_timing:
                 self._plan = replace(self._plan, settings={
                     **self._plan.settings, "gpu_timing": True})
-            say(f"plan ready in {time.perf_counter() - started:.2f} s")
         return self._plan
 
     def _pair_fractions(self, scans, joins) -> dict:
