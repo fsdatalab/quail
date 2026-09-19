@@ -840,7 +840,18 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         try:
             run_one(part, mode)
         except RuntimeError as error:
-            if "free KV arena" not in str(error) or len(part) < 2:
+            if "free KV arena" not in str(error):
+                raise
+            # retained KV nothing here reads makes room first; it is
+            # a cache, and the admission did not plan for this chunk's
+            # temporaries when the groups were deferred
+            need = arena.page_cost(sum(entry_rows(*e) for e in part))
+            if arena.evict_retained(need):
+                logger.debug("join chunk of %d groups retried after "
+                             "evicting retained KV", len(part))
+                run_part(part, mode)
+                return
+            if len(part) < 2:
                 raise
             logger.debug("join chunk of %d groups split: %s", len(part), error)
             half = len(part) // 2
