@@ -91,12 +91,15 @@ class VLLMEngine:
         """Return the LLM constructor arguments beyond the model name.
 
         A spec with its own chunk cap (a mixture-of-experts model)
-        batches at least that many tokens per step.
+        batches at least that many tokens per step. A diffusion model
+        denoises a canvas as long as the spec's, the rows Quail itself
+        packs after the answer cue, instead of the checkpoint's own
+        canvas length.
         """
         batched = MAX_BATCHED_TOKENS
         if spec is not None:
             batched = max(batched, spec.chunk_cap_tokens)
-        return {
+        kwargs = {
             "max_num_batched_tokens": batched,
             "max_num_seqs": MAX_SEQUENCES,
             "gpu_memory_utilization": GPU_MEMORY_UTILIZATION,
@@ -106,6 +109,9 @@ class VLLMEngine:
                 "cudagraph_capture_sizes": [CUDA_GRAPH_CAPTURE_SIZE]
             },
         }
+        if spec is not None and spec.canvas_tokens:
+            kwargs["diffusion_config"] = {"canvas_length": spec.canvas_tokens}
+        return kwargs
 
     def boot(self, model_name: str, allowed_ids: list[int],
              spec=None) -> tuple[dict, dict]:

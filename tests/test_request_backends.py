@@ -422,8 +422,11 @@ def test_vllm_engine_settings_follow_the_model():
     assert engine.llm_kwargs()["max_num_batched_tokens"] == 25_305
     assert engine.llm_kwargs(QWEN3_4B_FP8)["max_num_batched_tokens"] == 25_305
     # the mixture-of-experts model batches its own chunk cap
-    assert engine.llm_kwargs(
-        DIFFUSION_GEMMA_26B_FP8)["max_num_batched_tokens"] == 65_536
+    gemma = engine.llm_kwargs(DIFFUSION_GEMMA_26B_FP8)
+    assert gemma["max_num_batched_tokens"] == 65_536
+    # the diffusion canvas is as long as the spec's, one row
+    assert gemma["diffusion_config"] == {"canvas_length": 1}
+    assert "diffusion_config" not in engine.llm_kwargs(QWEN3_4B_FP8)
     assert sampling_kwargs([1, 2]) == {
         "temperature": 0.0, "max_tokens": 1, "min_tokens": 1,
         "allowed_token_ids": [1, 2]}
