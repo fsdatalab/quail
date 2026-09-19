@@ -8,7 +8,8 @@ model on IMDB reviews with the F1 filter prompt, exactly as the
 benchmark does, and records for each review whether logprobs came
 back, how the TRUE and FALSE entries are decoded, what true_bit
 reads, and what Quail answered for the same review in the run named
-by --quail-run. Writes /results/ablations/diffusion_gemma_readout_probe_k<logprobs>.json.
+by --quail-run. Writes
+/results/ablations/diffusion_gemma_readout_probe_k<logprobs>.json.
 """
 
 import json
@@ -34,7 +35,7 @@ MODEL = "diffusion-gemma-26b-a4b-fp8"
 def probe(prediction: str, n_docs: int = 256,
           quail_run: str = "20260919T193405Z-7f4d1afc",
           logprobs: int = 0) -> str:
-    """logprobs above 0 overrides the backend's top-k, to measure the ranks."""
+    """Run the readout; a logprobs count above 0 overrides the backend's."""
     import os
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     from pathlib import Path
