@@ -159,7 +159,7 @@ def _run_family(process_groups, result_name, model, sf, query_ids_csv,
     image=image,
     gpu="H100!",
     memory=98304,
-    timeout=21600,
+    timeout=36000,
     max_containers=8,
     volumes=VOLUMES,
 )
@@ -202,7 +202,7 @@ def run_query_family(
     image=sglang_image,
     gpu="H100!",
     memory=98304,
-    timeout=21600,
+    timeout=36000,
     max_containers=8,
     volumes=VOLUMES,
 )
