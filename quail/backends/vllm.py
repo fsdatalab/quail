@@ -98,7 +98,7 @@ class VLLMEngine:
     label = "vLLM"
     runtime_package = "vllm==0.26.0"
 
-    def llm_kwargs(self, spec=None) -> dict:
+    def llm_kwargs(self, spec) -> dict:
         """Return the LLM constructor arguments beyond the model name.
 
         A spec with its own chunk cap (a mixture-of-experts model)
@@ -106,10 +106,8 @@ class VLLMEngine:
         gets the spec's canvas; a one-row canvas takes one denoising
         step, so a request is one prefill pass plus one row.
         """
-        batched = MAX_BATCHED_TOKENS
+        batched = max(MAX_BATCHED_TOKENS, spec.chunk_cap_tokens)
         sequences = MAX_SEQUENCES
-        if spec is not None:
-            batched = max(batched, spec.chunk_cap_tokens)
         kwargs = {
             "max_num_batched_tokens": batched,
             "gpu_memory_utilization": GPU_MEMORY_UTILIZATION,
@@ -119,7 +117,7 @@ class VLLMEngine:
                 "cudagraph_capture_sizes": [CUDA_GRAPH_CAPTURE_SIZE]
             },
         }
-        if spec is not None and spec.canvas_tokens:
+        if spec.canvas_tokens:
             diffusion = {"canvas_length": spec.canvas_tokens}
             if spec.canvas_tokens == 1:
                 diffusion["max_denoising_steps"] = 1
@@ -128,16 +126,15 @@ class VLLMEngine:
         kwargs["max_num_seqs"] = sequences
         return kwargs
 
-    def boot(self, model_name: str, allowed_ids: list[int],
-             spec=None) -> tuple[dict, dict]:
+    def boot(self, spec, allowed_ids: list[int]) -> tuple[dict, dict]:
+        """Load the spec's model and return the engine state and boot record."""
         from vllm import LLM, SamplingParams
 
         started = time.perf_counter()
-        llm = LLM(model=model_name, **self.llm_kwargs(spec))
+        llm = LLM(model=spec.hf_name, **self.llm_kwargs(spec))
         boot_s = time.perf_counter() - started
-        canvas_tokens = 0 if spec is None else spec.canvas_tokens
         sampling_params = SamplingParams(
-            **sampling_kwargs(allowed_ids, canvas_tokens))
+            **sampling_kwargs(allowed_ids, spec.canvas_tokens))
         capacity = _capacity(llm)
         client = VLLMClient(llm, capacity)
         client.generate(
@@ -170,7 +167,7 @@ class DefaultVLLMEngine(VLLMEngine):
     kind = "dumb_vllm"
     label = "vLLM with default settings"
 
-    def llm_kwargs(self, spec=None) -> dict:
+    def llm_kwargs(self, spec) -> dict:
         return {}
 
 

@@ -129,13 +129,13 @@ class SGLangEngine:
     label = "SGLang"
     runtime_package = "sglang==0.5.18"
 
-    def boot(self, model_name: str, allowed_ids: list[int],
-             spec=None) -> tuple[dict, dict]:
+    def boot(self, spec, allowed_ids: list[int]) -> tuple[dict, dict]:
+        """Load the spec's model and return the engine state and boot record."""
         import sglang as sgl
 
         started = time.perf_counter()
         engine = sgl.Engine(
-            model_path=model_name,
+            model_path=spec.hf_name,
             mem_fraction_static=MEM_FRACTION_STATIC,
             max_running_requests=MAX_SEQUENCES,
             chunked_prefill_size=CHUNKED_PREFILL_TOKENS,

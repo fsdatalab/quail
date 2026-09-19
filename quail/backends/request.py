@@ -867,8 +867,7 @@ class RequestBackend:
             allowed_ids = sorted(set(
                 envelope["settings"]["true_ids"]
             ) | set(envelope["settings"]["false_ids"]))
-            engine_state, boot = self.engine.boot(model.hf_name, allowed_ids,
-                                                  spec=model)
+            engine_state, boot = self.engine.boot(model, allowed_ids)
             context.runtime_state[state_key] = engine_state
         else:
             boot = _warm_boot()

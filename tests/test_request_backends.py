@@ -114,7 +114,7 @@ def test_request_backends_plan_validate_and_execute(monkeypatch):
 
         patch.setattr(
             "quail.backends.vllm.VLLMEngine.boot",
-            lambda self, model_name, allowed_ids, spec=None: (
+            lambda self, spec, allowed_ids: (
                 {
                     "client": client,
                     "sampling_params": object(),
@@ -420,7 +420,6 @@ def test_vllm_engine_settings_follow_the_model():
     from quail.specs import DIFFUSION_GEMMA_26B_FP8, QWEN3_4B_FP8
 
     engine = VLLMEngine()
-    assert engine.llm_kwargs()["max_num_batched_tokens"] == 25_305
     assert engine.llm_kwargs(QWEN3_4B_FP8)["max_num_batched_tokens"] == 25_305
     assert "diffusion_config" not in engine.llm_kwargs(QWEN3_4B_FP8)
     # the mixture-of-experts model batches its own chunk cap; its
@@ -433,7 +432,7 @@ def test_vllm_engine_settings_follow_the_model():
     assert gemma["max_num_seqs"] == 127
     wide = engine.llm_kwargs(replace(DIFFUSION_GEMMA_26B_FP8, canvas_tokens=256))
     assert wide["diffusion_config"] == {"canvas_length": 256}
-    assert wide["max_num_seqs"] == engine.llm_kwargs()["max_num_seqs"]
+    assert wide["max_num_seqs"] == engine.llm_kwargs(QWEN3_4B_FP8)["max_num_seqs"]
     assert sampling_kwargs([1, 2]) == {
         "temperature": 0.0, "max_tokens": 1, "min_tokens": 1,
         "allowed_token_ids": [1, 2]}
