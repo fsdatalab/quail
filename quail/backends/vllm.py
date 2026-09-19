@@ -17,9 +17,10 @@ CUDA_GRAPH_CAPTURE_SIZE = 8_192
 # setting is 128 or more, sized for its 256-row canvas; one row needs
 # no cap, so stay just under the trigger.
 DIFFUSION_SEQUENCES = 127
-# top logprobs read at the canvas row; the answer word is in the top
-# 20 on 62 of 64 probed reviews
-DIFFUSION_LOGPROBS = 20
+# top logprobs read at the canvas row; the answer words rank within
+# the top 500 on 511 of 512 probed reviews and within 1,718 on all
+# (/results/ablations/diffusion_gemma_readout_probe_k5000.json)
+DIFFUSION_LOGPROBS = 500
 # generated tokens a longer canvas gets; the answer word is read
 # from the text
 DIFFUSION_TEXT_TOKENS = 16

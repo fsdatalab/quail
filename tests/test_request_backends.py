@@ -430,7 +430,7 @@ def test_vllm_engine_settings_follow_the_model():
     assert gemma["diffusion_config"] == {"canvas_length": 1,
                                          "max_denoising_steps": 1}
     assert gemma["max_num_seqs"] == 127
-    assert gemma["max_logprobs"] == 20
+    assert gemma["max_logprobs"] == 500
     wide = engine.llm_kwargs(replace(DIFFUSION_GEMMA_26B_FP8, canvas_tokens=256))
     assert wide["diffusion_config"] == {"canvas_length": 256}
     assert wide["max_num_seqs"] == engine.llm_kwargs(QWEN3_4B_FP8)["max_num_seqs"]
@@ -440,7 +440,7 @@ def test_vllm_engine_settings_follow_the_model():
     # the diffusion sampler rejects everything but the length; a
     # one-row canvas returns its logprobs, a longer one free text
     assert sampling_kwargs([1, 2], canvas_tokens=1) == {
-        "max_tokens": 1, "logprobs": 20}
+        "max_tokens": 1, "logprobs": 500}
     assert sampling_kwargs([1, 2], canvas_tokens=256) == {"max_tokens": 16}
 
 
