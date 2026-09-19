@@ -68,6 +68,8 @@ image = (
         "pyarrow",
         "numpy",
         "datasets",
+        "sqlglot>=27.0",
+        "gigatoken>=0.10.0",
     )
     .env({"VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
           "VLLM_LOGGING_LEVEL": "WARNING",
