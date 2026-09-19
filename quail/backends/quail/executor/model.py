@@ -16,13 +16,8 @@ instead of starting NCCL or gloo.
 from functools import lru_cache
 from pathlib import Path
 
+from quail.backends.quail.executor.moe_configs import write_configs
 from quail.progress import say
-
-# Tuned Triton fused MoE tile configs, in vLLM's file naming. The
-# 32768 and 65536 entries for the DiffusionGemma experts come from
-# experiments/diffusion_gemma_layer_timing.py (moe_tiles); vLLM's own
-# file stops at 16384 rows.
-MOE_CONFIGS = Path(__file__).parent / "moe_configs"
 
 
 @lru_cache(maxsize=8)
@@ -150,6 +145,7 @@ def load_model(model_name: str, revision: str | None = None, *,
     should use ("triton", "vllm_cutlass", ...); None lets vLLM pick.
     """
     import os
+    import tempfile
 
     import torch
     from vllm.config import set_current_vllm_config
@@ -157,8 +153,10 @@ def load_model(model_name: str, revision: str | None = None, *,
     from vllm.model_executor.model_loader import get_model
 
     # vLLM's Triton fused MoE reads tuned tile configs from this
-    # folder first; ours add entries for Quail's chunk sizes
-    os.environ.setdefault("VLLM_TUNED_CONFIG_FOLDER", str(MOE_CONFIGS))
+    # folder before its own; ours add entries for Quail's chunk sizes
+    if "VLLM_TUNED_CONFIG_FOLDER" not in os.environ:
+        folder = write_configs(Path(tempfile.gettempdir()) / "quail-moe-configs")
+        os.environ["VLLM_TUNED_CONFIG_FOLDER"] = str(folder)
     model_path = resolve_model_path(model_name, revision)
     args = dict(model=model_path, dtype="auto", enforce_eager=True)
     if max_batched_tokens is not None:
