@@ -34,7 +34,7 @@ these rules.
 
 CI runs these on every pull request. Run them before pushing:
 
- uv run ruff check quail tests experiments tools reports
+ uv run ruff check quail tests experiments tools
     uv run python tools/check_long_strings.py
     uv run vulture
     uv run pytest -q
@@ -127,26 +127,28 @@ forking are not part of the current runtime.
 
 # Reports
 
-Keep the current QUAIL-B comparison report, generators, and PDFs with
-the runtime code so one PR can update both. Do not add a per-PR feature report.
+Reports and experiment plots do not live on branches that target
+`main`. Do not add a per-PR feature report.
 
-Historical reports and `engine-wiki.md` remain on `cursor/reports-dev-f955`.
-Work on those historical reports targets that branch. Runtime data remains
-on the `quail-results` Modal volume.
+Historical reports, plot code, figures, and `engine-wiki.md` live on
+the `cursor/reports-dev-f955` branch. Start report work from that
+branch and target changes back to it. Runtime data remains on the
+`quail-results` Modal volume.
 
 # Issues and PR descriptions
 
 Include a figure whenever one carries the point better than text:
 
-- For measured numbers, link to the saved run or its report plot. Pin plot
-  links to a commit so they keep rendering as the branch moves.
+- For measured numbers, link to the saved run or to a plot on the
+  report branch. Pin plot links to a commit so they keep rendering as
+  the branch moves.
 - For a design, plan, or dataflow change, include a mermaid diagram
   of the structure (GitHub renders ```mermaid blocks).
 
 # Plots
 
-These rules apply to the current benchmark report and historical reports.
-Add a plot only when it carries the point better than a table.
+These rules apply to work on the report branch. Add a plot only when
+it carries the point better than a table.
 
 ## QUAIL-B plot standard
 
