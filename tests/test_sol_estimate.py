@@ -1,6 +1,7 @@
 """CPU checks for the public speed of light estimate."""
 
 import json
+from dataclasses import replace
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -8,7 +9,7 @@ import pyarrow.parquet as pq
 import quail
 from quail.catalog import DocumentProvider
 from quail.planner.plan import EngineConfig
-from quail.specs import DIFFUSION_GEMMA_26B_FP8_CANVAS8, H100_USD_PER_HOUR
+from quail.specs import DIFFUSION_GEMMA_26B_FP8, H100_USD_PER_HOUR
 
 FILTER = "Judge the review.\n\n{0}\nAnswer TRUE or FALSE."
 JOIN = "Judge the pair.\n\n{0}\nAspect: {1}\nAnswer TRUE or FALSE."
@@ -113,7 +114,8 @@ def test_canvas_rows_count_once_per_evaluation(tmp_path):
                  .select("r.id", "a.id"))
         decoder = quail.speed_of_light_estimate(query, _answer)
         canvas = quail.speed_of_light_estimate(
-            query, _answer, model=DIFFUSION_GEMMA_26B_FP8_CANVAS8)
+            query, _answer,
+            model=replace(DIFFUSION_GEMMA_26B_FP8, canvas_tokens=8))
     finally:
         sess.close()
 

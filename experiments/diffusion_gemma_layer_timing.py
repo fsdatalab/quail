@@ -254,359 +254,7 @@ def moe_tiles(prediction: str, docs: int = 110, doc_tokens: int = 300) -> str:
 
 @app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
               volumes=volumes)
-def primitives(prediction: str, docs: int = 20, doc_tokens: int = 300) -> str:
-    """Check each fused primitive against the reference ops on real weights."""
-    import numpy as np
-    import torch
-    from vllm import _custom_ops as ops
-
-    from quail.backends.quail.executor.arena import KVArena
-    from quail.backends.quail.executor.loop import pack_chunk
-    from quail.backends.quail.executor.model import load_model
-    from quail.backends.quail.executor.models import build_pipeline
-    from quail.cost import budgets
-    from quail.specs import DEVICES, MODELS
-
-    spec = MODELS[MODEL]
-    device = DEVICES["h100-sxm"]
-    chunk_tokens = budgets.chunk_budget(spec, device)
-    model = load_model(spec.hf_name, max_batched_tokens=chunk_tokens)
-    full_pages, sliding_pages = budgets.arena_pages(spec, device, chunk_tokens)
-    arena = KVArena(n_layers=spec.layers, n_pages=full_pages,
-                    page_tokens=budgets.PAGE_TOKENS, n_kv=spec.n_kv,
-                    d_head=spec.d_head, dtype=torch.bfloat16,
-                    layer_kv=spec.kv_shapes,
-                    sliding_layers=spec.sliding_layer_set,
-                    sliding_window=spec.sliding_window,
-                    n_sliding_pages=sliding_pages)
-    pipeline = build_pipeline(spec, model, arena, fused=False)
-    engine = pipeline.engine
-    layers = pipeline.layers
-    n = docs * doc_tokens
-    torch.manual_seed(0)
-    x = torch.randn(n, spec.hidden, device="cuda", dtype=torch.bfloat16) * 3
-    r = torch.randn(n, spec.hidden, device="cuda", dtype=torch.bfloat16) * 3
-    positions = torch.arange(n, device="cuda") % doc_tokens
-    result = {"prediction": prediction}
-
-    def rel(a, b):
-        a, b = a.float(), b.float()
-        return ((a - b).pow(2).mean().sqrt() / b.pow(2).mean().sqrt()).item()
-
-    with torch.inference_mode():
-        norm = layers[0].input_layernorm
-        # (a) norm then quant, one kernel against two
-        ref = engine.norm_rows(x, norm.weight, norm.variance_epsilon)
-        rq, rs = ops.scaled_fp8_quant(ref, use_per_token_if_dynamic=True)
-        fq, fs = engine.norm_quant_rows(x, norm.weight, norm.variance_epsilon)
-        result["norm_quant_rel"] = rel(fq.float() * fs, rq.float() * rs)
-        result["norm_quant_scale_shape"] = list(fs.shape)
-        # with the residual: the kernel adds x into r first
-        r2 = r.clone()
-        fq, fs = engine.norm_quant_rows(x, norm.weight, norm.variance_epsilon,
-                                        r2)
-        summed = (x.float() + r.float()).to(torch.bfloat16)
-        ref = engine.norm_rows(summed, norm.weight, norm.variance_epsilon)
-        rq, rs = ops.scaled_fp8_quant(ref, use_per_token_if_dynamic=True)
-        result["norm_quant_residual_rel"] = rel(fq.float() * fs, rq.float() * rs)
-        result["norm_quant_residual_updated_rel"] = rel(r2, summed)
-        # (b) the direct fp8 GEMM against the module
-        qkv_proj = layers[0].self_attn.qkv_proj
-        xq, xs = ops.scaled_fp8_quant(x, use_per_token_if_dynamic=True)
-        result["fp8_linear_rel"] = rel(engine.fp8_linear(qkv_proj, xq, xs),
-                                       qkv_proj(x)[0])
-        result["weight_scale_shape"] = list(qkv_proj.weight_scale.shape)
-        result["weight_shape"] = list(qkv_proj.weight.shape)
-        # (c) fused qk norm and rotary on a sliding and a full layer
-        for name, layer in (("sliding", layers[0]), ("full", layers[5])):
-            attn = layer.self_attn
-            H, KH, D = attn.num_heads, attn.num_kv_heads, attn.head_dim
-            qkv = attn.qkv_proj(x)[0]
-            q, k, _ = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], -1)
-            q = engine.norm_rows(q.reshape(n, H, D), attn.q_norm.weight,
-                                 attn.q_norm.variance_epsilon).view(n, H * D)
-            k = engine.norm_rows(k.reshape(n, KH, D), attn.k_norm.weight,
-                                 attn.k_norm.variance_epsilon).view(n, KH * D)
-            rope = attn.rotary_emb
-            q, k = engine.rope_inplace(positions, q, k, D, rope.cos_sin_cache,
-                                       rope.is_neox_style)
-            fq, fk = engine.qk_norm_rope_heads(
-                qkv, positions, n_q=H, n_kv=KH, head_dim=D,
-                q_weight=attn.q_norm.weight, k_weight=attn.k_norm.weight,
-                eps=attn.q_norm.variance_epsilon,
-                cos_sin_cache=rope.cos_sin_cache)
-            result[f"qk_{name}_q_rel"] = rel(fq, q)
-            result[f"qk_{name}_k_rel"] = rel(fk, k)
-            result[f"qk_{name}_neox"] = bool(rope.is_neox_style)
-            result[f"qk_{name}_cache"] = list(rope.cos_sin_cache.shape)
-            result[f"qk_{name}_eps"] = (attn.q_norm.variance_epsilon,
-                                        attn.k_norm.variance_epsilon)
-        # (g) the four fused elementwise kernels against the reference ops
-        mlp = layers[0].mlp
-        gate_up = mlp.gate_up_proj(x)[0]
-        ref = mlp.act_fn(gate_up)
-        rq, rs = ops.scaled_fp8_quant(ref, use_per_token_if_dynamic=True)
-        fq, fs = engine.gelu_mul_quant(gate_up)
-        result["gelu_quant_rel"] = rel(fq.float() * fs, rq.float() * rs)
-        result["gelu_quant_scale_rel"] = rel(fs, rs)
-        result["down_from_fused_rel"] = rel(
-            engine.fp8_linear(mlp.down_proj, fq, fs), mlp.down_proj(ref)[0])
-        norm = layers[1].input_layernorm
-        scale = float(layers[0].layer_scalar)
-        r2 = r.clone()
-        fq, fs = engine.scale_add_norm_quant(x, r2, scale, norm.weight,
-                                             norm.variance_epsilon)
-        summed = (r.float() * scale + x.float()).to(torch.bfloat16)
-        ref = engine.norm_rows(summed, norm.weight, norm.variance_epsilon)
-        rq, rs = ops.scaled_fp8_quant(ref, use_per_token_if_dynamic=True)
-        result["scale_norm_quant_rel"] = rel(fq.float() * fs, rq.float() * rs)
-        result["scale_norm_quant_residual_rel"] = rel(r2, summed)
-        pre = layers[0].pre_feedforward_layernorm_2
-        router = layers[0].router
-        o1, o2 = engine.norm_rows2(x, pre.weight, router.quail_scale,
-                                   pre.variance_epsilon)
-        result["norm2_a_rel"] = rel(o1, engine.norm_rows(
-            x, pre.weight, pre.variance_epsilon))
-        result["norm2_b_rel"] = rel(o2, engine.norm_rows(
-            x, router.quail_scale, pre.variance_epsilon))
-        for name, layer in (("sliding", layers[0]), ("full", layers[5])):
-            attn = layer.self_attn
-            H, KH, D = attn.num_heads, attn.num_kv_heads, attn.head_dim
-            qkv = attn.qkv_proj(x)[0]
-            _, _, v_ref = qkv.split([attn.q_size, attn.kv_size, attn.kv_size],
-                                    -1)
-            v_ref = engine.norm_rows(
-                v_ref.reshape(n, KH, D),
-                torch.ones(D, dtype=v_ref.dtype, device=v_ref.device),
-                attn.v_norm.variance_epsilon).view(n, KH * D)
-            rope = attn.rotary_emb
-            fq, fk, fv = engine.qkv_norm_rope_heads(
-                qkv, positions, n_q=H, n_kv=KH, head_dim=D,
-                q_weight=attn.q_norm.weight, k_weight=attn.k_norm.weight,
-                eps=attn.q_norm.variance_epsilon,
-                cos_sin_cache=rope.cos_sin_cache)
-            q2, k2 = engine.qk_norm_rope_heads(
-                qkv, positions, n_q=H, n_kv=KH, head_dim=D,
-                q_weight=attn.q_norm.weight, k_weight=attn.k_norm.weight,
-                eps=attn.q_norm.variance_epsilon,
-                cos_sin_cache=rope.cos_sin_cache)
-            result[f"qkv_{name}_q_rel"] = rel(fq, q2)
-            result[f"qkv_{name}_k_rel"] = rel(fk, k2)
-            result[f"qkv_{name}_v_rel"] = rel(fv, v_ref)
-        # (d) the residual-add norm
-        norm = layers[0].post_feedforward_layernorm
-        h, r2 = x.clone(), r.clone()
-        engine.fused_add_rms_norm(h, r2, norm)
-        summed = (x.float() + r.float()).to(torch.bfloat16)
-        result["fused_add_norm_rel"] = rel(
-            h, engine.norm_rows(summed, norm.weight, norm.variance_epsilon))
-        result["fused_add_residual_rel"] = rel(r2, summed)
-        # (e) the scalar fold alone, on the reference path
-        tail = list(range(100, 116))
-        rng = np.random.default_rng(1)
-        groups = []
-        for index in range(docs):
-            key = ("t", index)
-            arena.activate(key, doc_tokens + len(tail),
-                           capacity_tokens=doc_tokens + len(tail) + 256,
-                           base_tokens=doc_tokens)
-            prefix = [int(t) for t in rng.integers(1000, spec.vocab - 1000,
-                                                   doc_tokens)]
-            groups.append(dict(key=key, prefix=prefix, f=doc_tokens,
-                               suffixes=[tail]))
-
-        def run(pipe):
-            chunk = pack_chunk(torch, arena, groups, attention_mode="unified",
-                               canvas=pipe.canvas_ids,
-                               answer_row=pipe.canvas_answer_row)
-            rows = pipe.forward_chunk(chunk)
-            for key in chunk.temporary_keys:
-                arena.free_key(key)
-            return rows.float()
-
-        # (f) the reference layer step by step against the fused steps,
-        # on layer 0, before the fold touches the weights
-        chunk = pack_chunk(torch, arena, groups, attention_mode="unified",
-                           canvas=pipeline.canvas_ids,
-                           answer_row=pipeline.canvas_answer_row)
-        meta = chunk.meta
-        pos = chunk.positions
-        hidden0 = pipeline.embed(chunk.input_ids) * pipeline.normalizer
-        layer = layers[0]
-        attn = layer.self_attn
-        from vllm.forward_context import set_forward_context
-        with set_forward_context(None, pipeline.vllm_config,
-                                 num_tokens=hidden0.shape[0]):
-            meta["layer"] = 0
-            h1 = pipeline._norm(hidden0, layer.input_layernorm)
-            a = pipeline._attention(attn, h1, pos, meta)
-            a_n = pipeline._norm(a, layer.post_attention_layernorm)
-            mid = a_n + hidden0
-            f = pipeline._norm(mid, layer.pre_feedforward_layernorm)
-            d = layer.mlp(f)
-            d_n = pipeline._norm(d, layer.post_feedforward_layernorm_1)
-            r_in = pipeline._norm(mid, layer.pre_feedforward_layernorm_2)
-            logits = pipeline._router_logits(layer.router, mid)
-            routed = layer.moe(r_in, logits)
-            routed_n = pipeline._norm(routed, layer.post_feedforward_layernorm_2)
-            summed = pipeline._norm(d_n + routed_n,
-                                    layer.post_feedforward_layernorm)
-            out_ref = (summed + mid) * layer.layer_scalar
-            meta["layer"] = 0
-            out_layer = pipeline._layer(layer, hidden0, pos, meta)
-            result["step_layer_vs_steps_rel"] = rel(out_layer, out_ref)
-            # the fused steps
-            meta["layer"] = 0
-            xq, xs = engine.norm_quant_rows(
-                hidden0, layer.input_layernorm.weight,
-                layer.input_layernorm.variance_epsilon)
-            qkv = engine.fp8_linear(attn.qkv_proj, xq, xs)
-            result["step_qkv_rel"] = rel(qkv, attn.qkv_proj(h1)[0])
-            # the fused attention applies o_proj itself
-            a2 = pipeline._attention_fused(attn, qkv, pos, meta)
-            result["step_attention_rel"] = rel(a2, a)
-            a2_n = pipeline._norm(a2, layer.post_attention_layernorm)
-            r = hidden0.clone()
-            xq, xs = engine.norm_quant_rows(
-                a2_n, layer.pre_feedforward_layernorm.weight,
-                layer.pre_feedforward_layernorm.variance_epsilon, r)
-            result["step_mid_rel"] = rel(r, mid)
-            gu = engine.fp8_linear(layer.mlp.gate_up_proj, xq, xs)
-            d2, _ = layer.mlp.down_proj(layer.mlp.act_fn(gu))
-            result["step_dense_rel"] = rel(d2, d)
-            d2_n = pipeline._norm(d2, layer.post_feedforward_layernorm_1)
-            r2_in = pipeline._norm(r, layer.pre_feedforward_layernorm_2)
-            logits2, _ = layer.router.proj(engine.norm_rows(
-                r, layer.router.quail_scale, layer.router.norm.variance_epsilon))
-            result["step_router_rel"] = rel(logits2, logits)
-            routed2 = layer.moe(r2_in, logits2)
-            result["step_routed_rel"] = rel(routed2, routed)
-            routed2_n = pipeline._norm(routed2, layer.post_feedforward_layernorm_2)
-            engine.fused_add_rms_norm(d2_n, routed2_n,
-                                      layer.post_feedforward_layernorm)
-            result["step_summed_rel"] = rel(d2_n, summed)
-            r.mul_(layer.layer_scalar)
-            out2 = d2_n * layer.layer_scalar + r
-            result["step_output_rel"] = rel(out2, out_ref)
-            # cumulative over the first layers, reference first
-            refs = []
-            h = hidden0.clone()
-            meta["layer"] = 0
-            for lay in layers[:3]:
-                h = pipeline._layer(lay, h, pos, meta)
-                refs.append(h.clone())
-            result["layer_scalars"] = [float(lay.layer_scalar)
-                                       for lay in layers[:4]]
-            fused = build_pipeline(spec, model, arena, fused=True)
-            all_layers = fused.layers
-            for k in range(1, 4):
-                fused.layers = all_layers[:k]
-                meta["layer"] = 0
-                out_k = fused._layers_fused(hidden0.clone(), pos, meta)
-                result[f"cumulative_{k}_rel"] = rel(out_k, refs[k - 1])
-            fused.layers = all_layers
-        for key in chunk.temporary_keys:
-            arena.free_key(key)
-    result["volume_path"] = _save("diffusion_gemma_primitives_check", result)
-    return json.dumps(result, indent=2)
-
-
-@app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
-              volumes=volumes)
-def check(prediction: str, docs: int = 110, doc_tokens: int = 300,
-          wide_head_kernel: str = "triton") -> str:
-    """Compare the fused forward path against the reference path.
-
-    Builds the reference pipeline first, since the fused one folds the
-    layer scalars into the model's norm weights.
-    """
-    import numpy as np
-    import torch
-
-    from quail.backends.quail.executor.arena import KVArena
-    from quail.backends.quail.executor.loop import pack_chunk
-    from quail.backends.quail.executor.model import load_model
-    from quail.backends.quail.executor.models import build_pipeline
-    from quail.cost import budgets
-    from quail.specs import DEVICES, MODELS
-
-    spec = MODELS[MODEL]
-    device = DEVICES["h100-sxm"]
-    chunk_tokens = budgets.chunk_budget(spec, device)
-    model = load_model(spec.hf_name, max_batched_tokens=chunk_tokens)
-    full_pages, sliding_pages = budgets.arena_pages(spec, device, chunk_tokens)
-    arena = KVArena(n_layers=spec.layers, n_pages=full_pages,
-                    page_tokens=budgets.PAGE_TOKENS, n_kv=spec.n_kv,
-                    d_head=spec.d_head, dtype=torch.bfloat16,
-                    layer_kv=spec.kv_shapes,
-                    sliding_layers=spec.sliding_layer_set,
-                    sliding_window=spec.sliding_window,
-                    n_sliding_pages=sliding_pages)
-    tail = list(range(100, 116))
-    rng = np.random.default_rng(1)
-    groups = []
-    for index in range(docs):
-        key = ("t", index)
-        arena.activate(key, doc_tokens + len(tail),
-                       capacity_tokens=doc_tokens + len(tail) + 256,
-                       base_tokens=doc_tokens)
-        prefix = [int(t) for t in rng.integers(1000, spec.vocab - 1000,
-                                               doc_tokens)]
-        groups.append(dict(key=key, prefix=prefix, f=doc_tokens,
-                           suffixes=[tail]))
-
-    def run(pipeline):
-        chunk = pack_chunk(torch, arena, groups, attention_mode="unified",
-                           canvas=pipeline.canvas_ids,
-                           answer_row=pipeline.canvas_answer_row)
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        with torch.inference_mode():
-            rows = pipeline.forward_chunk(chunk)
-        torch.cuda.synchronize()
-        seconds = time.perf_counter() - t0
-        for key in chunk.temporary_keys:
-            arena.free_key(key)
-        return rows.float(), seconds
-
-    answer = model.quail_answer_weights.float()
-    reference = build_pipeline(spec, model, arena, fused=False,
-                               wide_head_kernel="triton")
-    ref_rows, _ = run(reference)
-    ref_rows, ref_s = run(reference)
-    fused = build_pipeline(spec, model, arena, fused=True,
-                           wide_head_kernel=wide_head_kernel)
-    fused_rows, _ = run(fused)
-    fused_rows, fused_s = run(fused)
-    ref_logits = ref_rows @ answer.T
-    fused_logits = fused_rows @ answer.T
-    diff = (fused_rows - ref_rows).abs()
-    result = {
-        "prediction": prediction,
-        "wide_head_kernel": wide_head_kernel,
-        "docs": docs, "doc_tokens": doc_tokens,
-        "reference_s": ref_s, "fused_s": fused_s,
-        "speedup": ref_s / fused_s,
-        "max_abs_diff": diff.max().item(),
-        "mean_abs_diff": diff.mean().item(),
-        "reference_rms": ref_rows.pow(2).mean().sqrt().item(),
-        "relative_rms_diff": (diff.pow(2).mean().sqrt()
-                              / ref_rows.pow(2).mean().sqrt()).item(),
-        "answer_agreement": (ref_logits.argmax(1)
-                             == fused_logits.argmax(1)).float().mean().item(),
-        "logit_gap_max_abs_diff": (
-            (ref_logits[:, 0] - ref_logits[:, 1])
-            - (fused_logits[:, 0] - fused_logits[:, 1])).abs().max().item(),
-    }
-    result["volume_path"] = _save(
-        f"diffusion_gemma_fused_check_{wide_head_kernel}", result)
-    return json.dumps(result, indent=2)
-
-
-@app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
-              volumes=volumes)
 def time_chunk(prediction: str, docs: int = 110, doc_tokens: int = 300,
-               wide_head_kernel: str = "triton",
                random_tokens: bool = False, moe_backend: str = "auto",
                profile: bool = False) -> str:
     import numpy as np
@@ -632,8 +280,7 @@ def time_chunk(prediction: str, docs: int = 110, doc_tokens: int = 300,
                     sliding_layers=spec.sliding_layer_set,
                     sliding_window=spec.sliding_window,
                     n_sliding_pages=sliding_pages)
-    pipeline = build_pipeline(spec, model, arena,
-                              wide_head_kernel=wide_head_kernel)
+    pipeline = build_pipeline(spec, model, arena)
     tail = list(range(100, 116))
     groups = []
     # random ids route the experts as broadly as real text does; the
@@ -667,8 +314,8 @@ def time_chunk(prediction: str, docs: int = 110, doc_tokens: int = 300,
 
     rows, warm_s = run()
     rows, plain_s = run()
-    print(f"{wide_head_kernel}: {rows} rows in {plain_s:.2f} s, "
-          f"{rows / plain_s:.0f} rows/s", flush=True)
+    print(f"{rows} rows in {plain_s:.2f} s, {rows / plain_s:.0f} rows/s",
+          flush=True)
     kernels = None
     if profile:
         from torch.profiler import ProfilerActivity
@@ -739,7 +386,6 @@ def time_chunk(prediction: str, docs: int = 110, doc_tokens: int = 300,
         "moe_config_keys": sorted(configs),
         "moe_config_32768": configs.get(32768),
         "prediction": prediction,
-        "wide_head_kernel": wide_head_kernel,
         "moe_backend": moe_backend,
         "moe_backend_used": str(getattr(quant, "fp8_backend", None)),
         "moe_kernel": type(getattr(quant, "moe_kernel", None)).__name__,
@@ -757,7 +403,7 @@ def time_chunk(prediction: str, docs: int = 110, doc_tokens: int = 300,
     if moe_backend != "auto":
         suffix += f"_{moe_backend}"
     result["volume_path"] = _save(
-        f"diffusion_gemma_layer_timing_{wide_head_kernel}{suffix}", result)
+        f"diffusion_gemma_layer_timing{suffix}", result)
     return json.dumps(result, indent=2)
 
 
@@ -1195,28 +841,19 @@ def stock_kernels(prediction: str, n_docs: int = 512,
 
 @app.local_entrypoint()
 def main(prediction: str = "", docs: int = 110, doc_tokens: int = 300,
-         kernels: str = "triton,fa4", random_tokens: bool = False,
-         runs: str = "chunk,loop", moe_backends: str = "auto",
-         profile: bool = False):
+         random_tokens: bool = False, runs: str = "chunk,loop",
+         moe_backends: str = "auto", profile: bool = False):
     if not prediction:
         raise ValueError("pass --prediction before starting")
     calls = {}
     if "chunk" in runs:
-        for kernel in kernels.split(","):
-            for backend in moe_backends.split(","):
-                calls[f"{kernel}/{backend}"] = time_chunk.spawn(
-                    prediction, docs, doc_tokens, kernel, random_tokens,
-                    backend, profile)
+        for backend in moe_backends.split(","):
+            calls[f"chunk/{backend}"] = time_chunk.spawn(
+                prediction, docs, doc_tokens, random_tokens, backend, profile)
     if "gemms" in runs:
         calls["gemms"] = gemms.spawn(prediction)
     if "tiles" in runs:
         calls["tiles"] = moe_tiles.spawn(prediction, docs, doc_tokens)
-    if "primitives" in runs:
-        calls["primitives"] = primitives.spawn(prediction, docs, doc_tokens)
-    if "check" in runs:
-        for kernel in kernels.split(","):
-            calls[f"check/{kernel}"] = check.spawn(prediction, docs,
-                                                  doc_tokens, kernel)
     if "loop" in runs:
         calls["loop"] = time_loop.spawn(prediction)
     if "micro" in runs:

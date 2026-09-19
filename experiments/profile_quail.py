@@ -523,8 +523,7 @@ def _measure(state, qdefs, qid, profiled, trace_dir):
 @app.function(timeout=3600, **GPU_KW)
 def measure(model: str = "qwen3-4b-fp8", sf: float = 0.1,
             queries: tuple = (),
-            out_prefix: str = "profile",
-            wide_head_kernel: str = "") -> str:
+            out_prefix: str = "profile") -> str:
     """Run each named query twice, once unprofiled and once profiled.
 
     The unprofiled pass gives the cited walls and the chunk timeline.
@@ -532,15 +531,10 @@ def measure(model: str = "qwen3-4b-fp8", sf: float = 0.1,
 
     out_prefix names the output files and trace directory; pick one
     that does not overwrite files a report already cites.
-    wide_head_kernel picks the attention kernel for heads wider than
-    FlashAttention 3 takes ("triton" or "fa4"); empty keeps the
-    pipeline's default.
     """
     if not queries:
         raise ValueError("pass at least one QuailB query id")
-    pipeline_kwargs = (
-        {"wide_head_kernel": wide_head_kernel} if wide_head_kernel else {})
-    state, chunk_tokens, warm = _boot_state(model, **pipeline_kwargs)
+    state, chunk_tokens, warm = _boot_state(model)
     _cupti_preinit(state["torch"])
     sess, qdefs = _quailb_session(model, sf)
     missing = [q for q in queries if q not in qdefs]
@@ -549,8 +543,7 @@ def measure(model: str = "qwen3-4b-fp8", sf: float = 0.1,
                        f"known: {sorted(qdefs)}")
     trace_dir = f"/results/ablations/{out_prefix}_traces"
     summary = dict(cell="profile_quail", model=model, sf=sf,
-                   chunk_tokens=chunk_tokens, warm=warm,
-                   wide_head_kernel=wide_head_kernel or None, queries={})
+                   chunk_tokens=chunk_tokens, warm=warm, queries={})
     for qid in queries:
         result = dict(query=qid, sf=sf, model=model,
                       chunk_tokens=chunk_tokens)
@@ -586,9 +579,8 @@ def _parse_queries(queries):
 
 @app.local_entrypoint()
 def run(queries: str, model: str = "qwen3-4b-fp8", sf: float = 0.1,
-        out_prefix: str = "profile", wide_head_kernel: str = ""):
-    handle = measure.spawn(model, sf, _parse_queries(queries),
-                           out_prefix, wide_head_kernel)
+        out_prefix: str = "profile"):
+    handle = measure.spawn(model, sf, _parse_queries(queries), out_prefix)
     print(f"profile_quail fc: {handle.object_id}", flush=True)
     print(handle.get())
 

@@ -41,13 +41,19 @@ class ModelSpec:
     attention_precision: Precision = "bf16"
     arch: str = "qwen3"    # forward pass in executor/models/<arch>.py
     role: Role = "generative"
-    layer_kv: tuple = ()   # per layer (KV heads, head dim) when layers
-    #                        differ; empty means every layer stores
-    #                        n_kv x d_head
-    sliding_window: int = 0    # tokens a sliding-attention layer sees
-    #                            behind each row; 0 means no layer
-    #                            slides
-    sliding_layers: tuple = ()    # indices of the layers that slide
+    # Layers that keep every token of KV, when the model mixes them
+    # with sliding layers: every full_attention_period-th layer, with
+    # its own KV geometry. 0 means every layer looks like n_kv x d_head.
+    full_attention_period: int = 0
+    full_n_kv: int = 0         # KV heads of a full-attention layer
+    full_d_head: int = 0       # head dim of a full-attention layer
+    sliding_window: int = 0    # tokens the other layers see behind each
+    #                            row; 0 means no layer slides
+    # Experts beside the dense MLP, for a mixture-of-experts model;
+    # 0 means the dense MLP alone.
+    experts: int = 0
+    experts_active: int = 0    # experts one token multiplies
+    expert_intermediate: int = 0    # one expert's MLP width
     canvas_tokens: int = 0    # rows a diffusion model denoises after
     #                           the answer cue; the answer is read at
     #                           the first one. 0 for an autoregressive
@@ -60,16 +66,6 @@ class ModelSpec:
     turn_prefix: str = ""     # chat-turn text before every prompt
     turn_suffix: str = ""     # chat-turn text after the answer cue
     prompt_format: str = "raw-v1"    # names the turn layout in run records
-    attn_params_per_layer: int = 0    # attention projection params of
-    #                                   one layer; 0 derives them from
-    #                                   n_q, n_kv, and d_head
-    mlp_active_params_per_layer: int = 0    # MLP params one token
-    #                                         multiplies per layer; 0
-    #                                         derives them from
-    #                                         intermediate
-    mlp_total_params_per_layer: int = 0     # MLP params a full chunk
-    #                                         reads per layer (every
-    #                                         expert); 0 means active
     chunk_cap_tokens: int = 0    # upper bound on tokens per chunk; 0
     #                              leaves the memory and kernel bounds
     moe_backend: str | None = None    # vLLM fused MoE kernel family the
@@ -77,16 +73,23 @@ class ModelSpec:
     #                                   "cutlass", ...); None lets vLLM
     #                                   pick
 
+    def is_full_layer(self, layer: int) -> bool:
+        """Whether the layer keeps every token with the full KV geometry."""
+        period = self.full_attention_period
+        return bool(period) and (layer + 1) % period == 0
+
     @property
     def kv_shapes(self) -> tuple:
         """Per layer, the (KV heads, head dim) its KV stores."""
-        if self.layer_kv:
-            if len(self.layer_kv) != self.layers:
-                raise ValueError(
-                    f"layer_kv names {len(self.layer_kv)} layers, "
-                    f"the model has {self.layers}")
-            return tuple(tuple(shape) for shape in self.layer_kv)
-        return ((self.n_kv, self.d_head),) * self.layers
+        full = (self.full_n_kv or self.n_kv, self.full_d_head or self.d_head)
+        return tuple(full if self.is_full_layer(i) else (self.n_kv, self.d_head)
+                     for i in range(self.layers))
+
+    @property
+    def widest_projection(self) -> int:
+        """Output columns of the widest dense projection in any layer."""
+        return max(self.ffn_width, max(
+            (self.n_q + 2 * n_kv) * d_head for n_kv, d_head in self.kv_shapes))
 
     @property
     def kappa(self) -> float:
@@ -103,10 +106,8 @@ class ModelSpec:
         """The layers that keep only the last sliding_window tokens of KV."""
         if not self.sliding_window:
             return frozenset()
-        bad = [i for i in self.sliding_layers if not 0 <= i < self.layers]
-        if bad:
-            raise ValueError(f"sliding_layers {bad} are outside the model")
-        return frozenset(self.sliding_layers)
+        return frozenset(i for i in range(self.layers)
+                         if not self.is_full_layer(i))
 
     @property
     def kappa_sliding(self) -> float:

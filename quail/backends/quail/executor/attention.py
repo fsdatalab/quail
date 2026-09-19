@@ -27,11 +27,9 @@ from dataclasses import dataclass
 from typing import Any
 
 GROUP = 128            # fp8 quant group size, matches the engine
-# FlashAttention 3's widest head; wider heads run a paged kernel that
-# needs arena pages: vLLM's Triton unified attention, or
-# FlashAttention 4, whose Hopper build takes heads up to 512.
+# FlashAttention 3's widest head; wider heads run FlashAttention 4,
+# whose Hopper build takes heads up to 512, over arena pages.
 FA_MAX_HEAD_DIM = 256
-WIDE_HEAD_KERNELS = ("triton", "fa4")
 
 # Filters run "unified" (one causal paged attention call); joins run
 # "merge_quant" (two-call pattern with fused merge+quant kernel).
@@ -114,7 +112,6 @@ class Engine:
             raise ValueError(f"kernels must be 'quail' or 'vllm', "
                              f"got {kernels!r}")
         self.kernels = kernels
-        self.wide_head_kernel = "triton"
 
         self.fa_version = flash_attention_version(torch.cuda.get_device_capability())
         self.torch = torch
@@ -188,12 +185,6 @@ class Engine:
         ops.rms_norm(out, rows, weight, eps)
         return out.view(x.shape)
 
-    def rope_inplace(self, positions, q, k, head_dim, cos_sin_cache, is_neox):
-        """Rotate q and k in place with vLLM's CUDA kernel."""
-        from vllm import _custom_ops as ops
-        ops.rotary_embedding(positions, q, k, head_dim, cos_sin_cache, is_neox)
-        return q, k
-
     def fused_add_rms_norm(self, hidden, residual, norm):
         from vllm import _custom_ops as ops
         ops.fused_add_rms_norm(hidden, residual, norm.weight,
@@ -222,33 +213,15 @@ class Engine:
             x_q, module.weight, scale_a=x_s, scale_b=module.weight_scale,
             out_dtype=self.torch.bfloat16, bias=getattr(module, "bias", None))
 
-    def qk_norm_rope_heads(self, qkv, positions, *, n_q, n_kv, head_dim,
-                           q_weight, k_weight, eps, cos_sin_cache):
+    def qkv_norm_rope_heads(self, qkv, positions, *, n_q, n_kv, head_dim,
+                            q_weight, k_weight, eps, cos_sin_cache):
         """The fused per-head q and k RMS norm plus neox rotary, any geometry.
 
         custom_qk_norm_rope with the layer's own head counts, head
-        width, norm weights, and rotary cache instead of the engine's.
-        Returns contiguous q (rows, n_q * head_dim) and k (rows,
-        n_kv * head_dim).
-        """
-        n = qkv.shape[0]
-        q = self.torch.empty((n, n_q * head_dim), dtype=self.torch.bfloat16,
-                             device=qkv.device)
-        k = self.torch.empty((n, n_kv * head_dim), dtype=self.torch.bfloat16,
-                             device=qkv.device)
-        self._triton_kernels()["qk"][(n,)](
-            qkv, q, k, cos_sin_cache, positions, q_weight, k_weight,
-            qkv.stride(0), q.stride(0), k.stride(0), eps,
-            QH=n_q, KH=n_kv, HD=head_dim, HALF=head_dim // 2,
-            num_warps=8 if head_dim > 256 else 4)
-        return q, k
-
-    def qkv_norm_rope_heads(self, qkv, positions, *, n_q, n_kv, head_dim,
-                            q_weight, k_weight, eps, cos_sin_cache):
-        """qk_norm_rope_heads plus the weightless per-head norm of v.
-
-        Returns contiguous q, k and v, so the v slice is never copied
-        on its own.
+        width, norm weights, and rotary cache instead of the engine's,
+        plus the weightless per-head norm of v. Returns contiguous q
+        (rows, n_q * head_dim), k and v (rows, n_kv * head_dim), so
+        the v slice is never copied on its own.
         """
         n = qkv.shape[0]
         torch = self.torch
@@ -814,29 +787,15 @@ class Engine:
                causal, softmax_scale=None, window=None):
         """One paged attention call.
 
-        FlashAttention 3, or the wide-head kernel when the head is
-        wider than it takes.
+        FlashAttention 3, or FlashAttention 4 when the head is wider
+        than it takes.
         """
         wide = q3.shape[-1] > FA_MAX_HEAD_DIM
-        if not wide or self.wide_head_kernel == "fa4":
-            out, _ = self._fa(
-                q3, kp, vp, cu_q, None, max_q, max_used, causal=causal,
-                block_table=table, seqused_k=used,
-                softmax_scale=softmax_scale, window=window,
-                version=4 if wide else None)
-            return out
-        from vllm.v1.attention.ops.triton_unified_attention import (
-            unified_attention,
-        )
-        out = self.torch.empty_like(q3)
-        unified_attention(
-            q=q3, k=kp, v=vp, out=out, cu_seqlens_q=cu_q,
-            max_seqlen_q=max_q, seqused_k=used, max_seqlen_k=max_used,
-            softmax_scale=(q3.shape[-1] ** -0.5 if softmax_scale is None
-                           else softmax_scale),
-            causal=causal, window_size=window or (-1, -1),
-            block_table=table, softcap=0.0, q_descale=None,
-            k_descale=None, v_descale=None)
+        out, _ = self._fa(
+            q3, kp, vp, cu_q, None, max_q, max_used, causal=causal,
+            block_table=table, seqused_k=used,
+            softmax_scale=softmax_scale, window=window,
+            version=4 if wide else None)
         return out
 
     def attention_merge_quant(self, q3, k3, v3, meta):

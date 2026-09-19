@@ -32,7 +32,7 @@ attention path.
 
 import numpy as np
 
-from quail.backends.quail.executor.attention import WIDE_HEAD_KERNELS, Engine
+from quail.backends.quail.executor.attention import Engine
 from quail.backends.quail.executor.models.base import ModelPipeline
 
 # The canvas starts as random token ids, as vLLM's sampler starts it;
@@ -62,25 +62,20 @@ def _init_moe_workspace():
 class DiffusionGemmaPipeline(ModelPipeline):
     """Forward passes for DiffusionGemma checkpoints loaded by vLLM.
 
-    The full-attention layers' 512-wide heads run FlashAttention 4 by
-    default (vLLM's Triton paged attention is the alternative), so
-    every chunk carries arena pages.
+    The full-attention layers' 512-wide heads run FlashAttention 4
+    over arena pages, so every chunk carries pages.
 
     Args:
         model: vLLM's DiffusionGemmaForConditionalGeneration module.
         arena: KVArena with one pool per layer at that layer's KV
             geometry (spec.kv_shapes).
         spec: The ModelSpec, for the vocabulary size and canvas length.
-        kernels: Engine kernel set; only its KV scatter kernel runs here.
-        engine_class: Engine class, replaceable by experiments.
-        wide_head_kernel: Attention kernel for the 512-wide heads,
-            "fa4" or "triton" (vLLM's unified attention).
+        engine_class: Engine class, replaceable by tests.
     """
 
     needs_pages = True
 
-    def __init__(self, model, arena, *, spec, kernels="quail",
-                 engine_class=Engine, wide_head_kernel="fa4", fused=True):
+    def __init__(self, model, arena, *, spec, engine_class=Engine):
         backbone = model.model
         self.layers = backbone.layers
         self.embed = backbone.embed_tokens
@@ -92,13 +87,7 @@ class DiffusionGemmaPipeline(ModelPipeline):
         attn = self.layers[0].self_attn
         self.engine = engine_class(
             arena, n_q=attn.num_heads, n_kv=attn.num_kv_heads,
-            head_dim=attn.head_dim, rotary=attn.rotary_emb,
-            fp8=False, kernels=kernels)
-        if wide_head_kernel not in WIDE_HEAD_KERNELS:
-            raise ValueError(
-                f"wide_head_kernel must be one of {WIDE_HEAD_KERNELS}, "
-                f"got {wide_head_kernel!r}")
-        self.engine.wide_head_kernel = wide_head_kernel
+            head_dim=attn.head_dim, rotary=attn.rotary_emb, fp8=False)
         self._ones = {}
         for layer in self.layers:
             rope = layer.self_attn.rotary_emb
@@ -109,11 +98,9 @@ class DiffusionGemmaPipeline(ModelPipeline):
             # fold into one vector
             router.quail_scale = (router.root_size.to(router.scale.dtype)
                                   * router.scale).detach()
-        self.fused = fused
-        if fused:
-            if any(layer.self_attn.v_norm.has_weight for layer in self.layers):
-                raise ValueError("the fused path expects a weightless v norm")
-            self._fold_layer_scalars(model)
+        if any(layer.self_attn.v_norm.has_weight for layer in self.layers):
+            raise ValueError("the fused qkv kernel expects a weightless v norm")
+        self._fold_layer_scalars(model)
         self.canvas_ids = canvas_token_ids(spec.vocab, spec.canvas_tokens)
         # an empty canvas reads the answer at the prompt's last row
         if spec.canvas_tokens and not (
@@ -187,16 +174,12 @@ class DiffusionGemmaPipeline(ModelPipeline):
         # the fused MoE kernels look their layer up in the forward
         # context
         with set_forward_context(None, self.vllm_config, num_tokens=n):
-            if self.fused:
-                hidden = self._layers_fused(hidden, positions, meta)
-            else:
-                for layer in self.layers:
-                    hidden = self._layer(layer, hidden, positions, meta)
+            hidden = self._layers(hidden, positions, meta)
         return self._norm(hidden.index_select(0, chunk.final_indices),
                           self.final_norm)
 
-    # ---- the fused path ---------------------------------------------
-    # The same arithmetic as _layer with the residual adds, the norms
+    # ---- the layer stack --------------------------------------------
+    # vLLM's layer arithmetic with the residual adds, the norms
     # that feed a linear, and that linear's input quantization fused,
     # and the per-head q and k norms fused with the rotary. The layer
     # scalars are folded into the post-feedforward norm weights at
@@ -206,7 +189,7 @@ class DiffusionGemmaPipeline(ModelPipeline):
         return self.engine.norm_quant_rows(x, norm.weight,
                                            norm.variance_epsilon, residual)
 
-    def _layers_fused(self, hidden, positions, meta):
+    def _layers(self, hidden, positions, meta):
         engine = self.engine
         residual = hidden
         x_q, x_s = self._norm_quant(residual, self.layers[0].input_layernorm)
@@ -272,45 +255,3 @@ class DiffusionGemmaPipeline(ModelPipeline):
         window = self.window if attn.is_sliding else None
         return self.engine.attention_unified(q3, k3, v3, meta,
                                              softmax_scale=1.0, window=window)
-
-    # ---- the reference path (fused=False) ---------------------------
-
-    def _attention(self, attn, hidden, positions, meta):
-        n = hidden.shape[0]
-        H, KH, D = attn.num_heads, attn.num_kv_heads, attn.head_dim
-        qkv, _ = attn.qkv_proj(hidden)
-        q, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
-        q = self._norm(q.reshape(n, H, D), attn.q_norm).view(n, H * D)
-        k = self._norm(k.reshape(n, KH, D), attn.k_norm).view(n, KH * D)
-        rope = attn.rotary_emb
-        q, k = self.engine.rope_inplace(positions, q, k, D, rope.cos_sin_cache,
-                                        rope.is_neox_style)
-        v = self._norm(v.reshape(n, KH, D), attn.v_norm)
-        out = self._attend(attn, q.view(n, H, D), k.view(n, KH, D), v, meta)
-        out, _ = attn.o_proj(out)
-        return out
-
-    def _router_logits(self, router, x):
-        """The router's logits: unweighted norm, one scale, projection."""
-        scaled = self._norm(x, router.norm) * router.quail_scale
-        logits, _ = router.proj(scaled)
-        return logits
-
-    def _layer(self, layer, hidden, positions, meta):
-        residual = hidden
-        hidden = self._norm(residual, layer.input_layernorm)
-        hidden = self._attention(layer.self_attn, hidden, positions, meta)
-        hidden = self._norm(hidden, layer.post_attention_layernorm)
-        hidden = hidden + residual
-        residual = hidden
-        hidden = self._norm(hidden, layer.pre_feedforward_layernorm)
-        hidden = layer.mlp(hidden)
-        if layer.enable_moe_block:
-            dense = self._norm(hidden, layer.post_feedforward_layernorm_1)
-            routed = self._norm(residual, layer.pre_feedforward_layernorm_2)
-            routed = layer.moe(routed, self._router_logits(layer.router, residual))
-            routed = self._norm(routed, layer.post_feedforward_layernorm_2)
-            hidden = dense + routed
-        hidden = self._norm(hidden, layer.post_feedforward_layernorm)
-        hidden = hidden + residual
-        return hidden * layer.layer_scalar

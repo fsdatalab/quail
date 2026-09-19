@@ -44,6 +44,8 @@ def test_spec_geometry_and_registration():
     assert len(shapes) == 30
     assert [i for i, s in enumerate(shapes) if s == (2, 512)] == [5, 11, 17, 23, 29]
     assert all(s == (8, 256) for i, s in enumerate(shapes) if (i + 1) % 6)
+    # the widest GEMM is the full layers' qkv projection
+    assert SPEC.widest_projection == 16 * 512 + 2 * 2 * 512
     # 25 sliding layers at 8 x 256 and 5 full layers at 2 x 512, K and V
     assert SPEC.kv_elements_per_token == 2 * (25 * 2048 + 5 * 1024)
     assert SPEC.kappa == 225_280.0
@@ -66,8 +68,9 @@ def test_spec_budgets_and_moe_costs():
     # a chunk reads every expert but a token multiplies eight of them
     assert mlp_weight_params(SPEC) > 10 * mlp_params(SPEC)
     assert mlp_weight_params(QWEN3_4B_FP8) == mlp_params(QWEN3_4B_FP8)
-    with pytest.raises(ValueError, match="layer_kv"):
-        _ = SPEC.__class__(**{**SPEC.__dict__, "layer_kv": ((8, 256),)}).kv_shapes
+    # the dense MLP and eight of the 128 experts per layer
+    assert mlp_params(SPEC) == 30 * 3 * 2816 * (2112 + 8 * 704)
+    assert mlp_weight_params(SPEC) == 30 * 3 * 2816 * (2112 + 128 * 704)
 
 
 # ------------------------------------------------------ chat turns
@@ -285,7 +288,6 @@ class _Engine:
         self.calls = []
         self.torch = sys.modules["torch"]
         self.is_fp8 = kwargs["fp8"]
-        self.wide_head_kernel = "triton"
 
     def attention_unified(self, q3, k3, v3, meta, *, softmax_scale=None,
                           window=None):
@@ -298,10 +300,7 @@ class _Engine:
         # the fakes' norms scale by their weight and nothing else
         return x * weight
 
-    def rope_inplace(self, positions, q, k, head_dim, cos_sin_cache, is_neox):
-        return q, k
-
-    # the fused path's primitives, with the same fake norm (x times its
+    # the fused primitives, with the same fake norm (x times its
     # weight) and no quantization
     def norm_quant_rows(self, x, weight, eps, residual=None):
         if residual is not None:
@@ -312,12 +311,6 @@ class _Engine:
     def fp8_linear(self, module, x_q, x_s):
         return module(x_q)[0]
 
-    def qk_norm_rope_heads(self, qkv, positions, *, n_q, n_kv, head_dim,
-                           q_weight, k_weight, eps, cos_sin_cache):
-        q = qkv[:, :n_q * head_dim] * q_weight
-        k = qkv[:, n_q * head_dim:(n_q + n_kv) * head_dim] * k_weight
-        return q.contiguous(), k.contiguous()
-
     def fused_add_rms_norm(self, hidden, residual, norm):
         residual.add_(hidden)
         hidden.copy_(residual * norm.weight)
@@ -325,11 +318,10 @@ class _Engine:
 
     def qkv_norm_rope_heads(self, qkv, positions, *, n_q, n_kv, head_dim,
                             q_weight, k_weight, eps, cos_sin_cache):
-        q, k = self.qk_norm_rope_heads(
-            qkv, positions, n_q=n_q, n_kv=n_kv, head_dim=head_dim,
-            q_weight=q_weight, k_weight=k_weight, eps=eps,
-            cos_sin_cache=cos_sin_cache)
-        return q, k, qkv[:, (n_q + n_kv) * head_dim:].contiguous()
+        q = qkv[:, :n_q * head_dim] * q_weight
+        k = qkv[:, n_q * head_dim:(n_q + n_kv) * head_dim] * k_weight
+        return (q.contiguous(), k.contiguous(),
+                qkv[:, (n_q + n_kv) * head_dim:].contiguous())
 
     def gelu_mul_quant(self, gate_up):
         # the fake feedforward's activation is the identity
@@ -386,17 +378,9 @@ def test_pipeline_runs_the_gemma4_layer_order(monkeypatch):
 
     spec = SimpleNamespace(vocab=50, canvas_tokens=3, canvas_answer_row=1)
     pipeline = DiffusionGemmaPipeline(_fake_model(torch), None, spec=spec,
-                                      engine_class=_Engine, fused=False)
+                                      engine_class=_Engine)
     assert len(pipeline.canvas_ids) == 3
     assert pipeline.canvas_answer_row == 1
-    assert pipeline.engine.wide_head_kernel == "fa4"
-    triton = DiffusionGemmaPipeline(_fake_model(torch), None, spec=spec,
-                                    engine_class=_Engine,
-                                    wide_head_kernel="triton")
-    assert triton.engine.wide_head_kernel == "triton"
-    with pytest.raises(ValueError, match="wide_head_kernel"):
-        DiffusionGemmaPipeline(_fake_model(torch), None, spec=spec,
-                               engine_class=_Engine, wide_head_kernel="cute")
     with pytest.raises(ValueError, match="canvas_answer_row"):
         DiffusionGemmaPipeline(
             _fake_model(torch), None, engine_class=_Engine,
@@ -444,30 +428,6 @@ def _vllm_stubs(monkeypatch):
     monkeypatch.setitem(sys.modules, "vllm.v1.worker",
                         types.ModuleType("vllm.v1.worker"))
     monkeypatch.setitem(sys.modules, "vllm.v1.worker.workspace", workspace)
-
-
-def _chunk(torch):
-    return SimpleNamespace(
-        input_ids=torch.zeros(6, dtype=torch.int64),
-        positions=torch.arange(6),
-        final_indices=torch.tensor([0, 3]),
-        meta={"layer": 0, "canvas": {"rows": torch.tensor([3, 4, 5])}})
-
-
-def test_fused_path_matches_the_reference_path(monkeypatch):
-    torch = pytest.importorskip("torch")
-    _vllm_stubs(monkeypatch)
-    spec = SimpleNamespace(vocab=50, canvas_tokens=3, canvas_answer_row=1)
-    reference = DiffusionGemmaPipeline(
-        _fake_model(torch), None, spec=spec, engine_class=_Engine,
-        fused=False)
-    fused = DiffusionGemmaPipeline(_fake_model(torch), None, spec=spec,
-                                   engine_class=_Engine)
-    assert fused.fused
-    expected = reference.forward_chunk(_chunk(torch))
-    out = fused.forward_chunk(_chunk(torch))
-    assert torch.equal(out, expected)
-    assert fused.engine.calls == reference.engine.calls
 
 
 def test_layer_scalars_fold_into_the_post_feedforward_norms(monkeypatch):

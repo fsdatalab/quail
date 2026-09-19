@@ -2,9 +2,9 @@
 
 Any pre-norm decoder with grouped-query attention and a gated MLP
 is priced from its ModelSpec shape; nothing here is Qwen3-specific.
-A mixture-of-experts model gives its per-layer attention and MLP
-parameter counts on the spec: FLOPs follow the params one token
-multiplies, weight bytes follow the params a full chunk reads.
+A mixture-of-experts model names its experts on the spec: FLOPs
+follow the params one token multiplies, weight bytes follow the
+params a full chunk reads.
 """
 
 from __future__ import annotations
@@ -15,31 +15,28 @@ from quail.specs import ModelSpec
 
 
 def attention_projection_params(model: ModelSpec) -> int:
-    """Return Q, K, V, and output projection parameters."""
-    if model.attn_params_per_layer:
-        return model.attn_params_per_layer * model.layers
+    """Return Q, K, V, and output projection parameters over the layers."""
     h = model.hidden
-    head = model.d_head
-    per_layer = (
-        h * model.n_q * head
-        + 2 * h * model.n_kv * head
-        + model.n_q * head * h
-    )
-    return per_layer * model.layers
+    return sum(h * model.n_q * head + 2 * h * n_kv * head
+               + model.n_q * head * h
+               for n_kv, head in model.kv_shapes)
 
 
 def mlp_params(model: ModelSpec) -> int:
     """Return the MLP parameters one token multiplies."""
-    if model.mlp_active_params_per_layer:
-        return model.mlp_active_params_per_layer * model.layers
-    return 3 * model.hidden * model.intermediate * model.layers
+    return _mlp_params(model, model.experts_active)
 
 
 def mlp_weight_params(model: ModelSpec) -> int:
     """Return the MLP parameters a full chunk reads: every expert."""
-    if model.mlp_total_params_per_layer:
-        return model.mlp_total_params_per_layer * model.layers
-    return mlp_params(model)
+    return _mlp_params(model, model.experts)
+
+
+def _mlp_params(model: ModelSpec, experts: int) -> int:
+    """The dense MLP plus this many experts, over the layers."""
+    per_layer = 3 * model.hidden * (
+        model.intermediate + experts * model.expert_intermediate)
+    return per_layer * model.layers
 
 
 def dense_params(model: ModelSpec) -> int:

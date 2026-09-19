@@ -29,9 +29,9 @@ def minimum_weight_gpus(model: ModelSpec, device: DeviceSpec) -> int:
 def kernel_index_cap(model: ModelSpec) -> int:
     """Max tokens per chunk from the int32 element-offset limit.
 
-    Constraint: rows x ffn_width < 2^31.
+    Constraint: rows x widest projection < 2^31.
     """
-    return INT32_MAX // model.ffn_width
+    return INT32_MAX // model.widest_projection
 
 
 def chunk_memory_bound(model: ModelSpec, device: DeviceSpec) -> int:
