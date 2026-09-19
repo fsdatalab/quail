@@ -606,9 +606,19 @@ def time_chunk(prediction: str, docs: int = 110, doc_tokens: int = 300,
         wrap_forward(layer.moe, "experts")
     rows, timed_s = run()
     accounted = sum(totals.values())
+    import os
+
+    from vllm.model_executor.layers.fused_moe.fused_moe import get_moe_configs
     moe = pipeline.layers[-1].moe
     quant = getattr(moe, "quant_method", None)
+    folder = os.environ.get("VLLM_TUNED_CONFIG_FOLDER", "")
+    configs = get_moe_configs(128, 704, "fp8_w8a8") or {}
     result = {
+        "moe_config_folder": folder,
+        "moe_config_folder_files": sorted(os.listdir(folder))[:5]
+        if folder and os.path.isdir(folder) else None,
+        "moe_config_keys": sorted(configs),
+        "moe_config_32768": configs.get(32768),
         "prediction": prediction,
         "wide_head_kernel": wide_head_kernel,
         "moe_backend": moe_backend,
