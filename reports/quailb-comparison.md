@@ -177,29 +177,8 @@ Figure: plots/quailb_bio.pdf
 
 BIO-3 filter survivors: 362 in the reference, 349 in Quail, and 350 in pipelined stock vLLM.
 
-vLLM's BIO-2 time is 13% lower than in the September 12 run with
-raw prompts, saved at
-`/results/benchmarks/quailb/family-runs/20260912T225100Z-902686c5/`.
-Its time per pair is 13% lower on BIO-3 as well. The cause is the
-host, not the prompt layout and not KV reuse. The two runs were on
-different physical GPUs. On one container, after this report's
-runs, the same join took 2.152 and 2.115 ms per pair with raw
-prompts and 2.141 and 2.098 ms with chat prompts: two rounds in
-alternating order, each on a fresh engine with BIO-1 run first,
-and the chat runs' fresh tokens matched this run's exactly. The
-result is
-`/results/ablations/bio2-prompt-layout-20260918T155056Z/result.json`
-(`fc-01M2TKCMJQVM0HV104NVCHTKY5`; the cell is
-`experiments/bio2_prompt_layout.py`). Across the three machines
-the raw layout has run on, the join took 1069, 1163, and 1213
-seconds, a 13% spread with nothing but the host changing. The
-September 12 recomputed KV figures came from an earlier benchmark
-rule that counted each pair's partner label once per anchor and
-shared partner document prefixes across pairs. On BIO-2 that
-understates the minimum by 8,293 tokens per anchor, 4,146,500 in
-total, which is all of Quail's 4,148,977 recomputed tokens in that
-run beyond its 2,477 filter-stage tokens. Under the current rule,
-vLLM recomputed 154,747 tokens there and 157,341 here.
+The BIO-2 prompt comparison below explains the change in time
+and separately scores both formats against dataset annotations.
 
 | Query | Method | Seconds | Tokens/second | $/query | $/million input tokens | KV regret (%) |
 |---|---|---:|---:|---:|---:|---:|
@@ -376,3 +355,78 @@ Correctness against saved reference labels:
 | AGENT-1 | Pipelined vLLM | 71.78 | 68.457 | 64.714 |
 | AGENT-2 | Quail | 93.06 | 83.264 | 99.5 |
 | AGENT-2 | Pipelined vLLM | 92.66 | 82.459 | 99.5 |
+
+## BIO-2 raw and chat comparison
+
+The chat closing adds nine tokens after each pair's text. Both
+benchmark runs evaluated 563,500 pairs. Quail's fresh input tokens rose
+49%, and its query time rose from 127.75 to 187.01 seconds. Its computed
+token rate stayed close to 82,000 per second.
+
+A separate pipelined stock vLLM experiment compared raw and chat prompts
+in one container. It used a fresh engine for each join and ran BIO-1
+first. The prediction was that times would differ by less than 5%,
+with chat no faster than raw.
+
+| Round | Format | Seconds | Milliseconds/pair | Fresh tokens |
+|---|---|---:|---:|---:|
+| 1 | raw | 1212.9 | 2.152 | 10,391,144 |
+| 1 | chat | 1206.6 | 2.141 | 15,604,712 |
+| 2 | chat | 1182.1 | 2.098 | 15,604,712 |
+| 2 | raw | 1192.0 | 2.115 | 10,391,144 |
+
+Chat time differed from raw by -0.67% on average.
+The result supports the 5% prediction, but chat was slightly faster.
+It did not reproduce the 13% vLLM time reduction between benchmark runs.
+Those runs used different machines. Host variation is a plausible
+explanation; this experiment does not isolate every host difference.
+
+Result on `quail-results`:
+`/results/ablations/bio2-prompt-layout-20260918T155056Z/result.json`.
+Modal call: `fc-01M2TKCMJQVM0HV104NVCHTKY5`.
+The experiment is `experiments/bio2_prompt_layout.py` at commit
+`1f35316` on `claude/focused-carson-huqcvm`.
+
+Earlier attempts used a cold engine or encountered throttling. They
+are excluded from the controlled comparison above. Their records are
+`/results/ablations/bio2-prompt-layout-20260918T142630Z/joins.json`
+(`fc-01M2TEJJY4Z2G2DGG25NE8F28B`) and the cancelled call
+`fc-01M2TG6KG63GSZTN2X3BRZ43AD`.
+
+The September 12 recomputed KV values used an older minimum rule.
+That rule counted a pair's partner label once per anchor and shared
+partner document prefixes across pairs. It understated BIO-2's minimum
+by 4,146,500 tokens. Under the current rule, vLLM recomputed 154,747
+tokens in that run and 157,341 in the chat run. Those values are close.
+
+### Accuracy against the same dataset annotations
+
+The main correctness tables compare 4B answers with 32B reference
+answers. Those references changed when the prompt format changed.
+Here both formats are scored against the same reactions recorded in
+BioDEX: 2,543 positive pairs out of 563,500.
+Matching is exact; a synonym absent from the recorded list counts as
+wrong. These scores therefore measure agreement with dataset annotations.
+F1 combines precision and recall and is shown as a percentage.
+
+| Model and format | Predicted matches | Precision (%) | Recall (%) | F1 (%) |
+|---|---:|---:|---:|---:|
+| 4B raw | 116,156 | 1.9 | 84.9 | 3.6 |
+| 4B chat | 2,045 | 20.9 | 16.8 | 18.7 |
+| 32B raw | 19,144 | 8.2 | 61.8 | 14.5 |
+| 32B chat | 17,974 | 9.7 | 68.4 | 17.0 |
+
+Chat improves precision and F1 on this annotation comparison, while
+missing more recorded reactions. It does not establish an accuracy
+improvement across the whole benchmark.
+
+The 4B answers come from `quail/biodex/BIO-2/joins-0.parquet` under
+`/results/benchmarks/quailb/family-runs/20260912T225100Z-902686c5/` and
+`/results/benchmarks/quailb/family-runs/20260918T060700Z-biodex-chat/`.
+The 32B label sets are `ls_558442b4193e9a48bfe1aea9bc87a66a` and
+`ls_4c0b69af26ad590e1b64ac5ffebf2484`. Annotation tables are under
+`/results/quailb_data/sf0.1/`. Download commands are in the generator.
+
+Possible follow-ups are to score different TRUE/FALSE thresholds and
+test shorter pair prompts. Neither was measured here. Moving prompt
+text requires checking answer quality and updating token accounting.

@@ -18,8 +18,28 @@ Pull the saved measurements, corpus manifest, and SoL estimates:
     uv run modal volume get quail-results "$CORPUS/manifest.json" "$W/corpus.json"
     uv run modal volume get quail-results \
       sol/2026-09-18-all-chat/sol_quailb_sf0.1.json "$W/sol.json"
+    B="$W/bio-comparison"; mkdir -p "$B"
+    OLD=benchmarks/quailb/family-runs/20260912T225100Z-902686c5
+    NEW=benchmarks/quailb/family-runs/20260918T060700Z-biodex-chat
+    uv run modal volume get quail-results "$OLD/quail/biodex/BIO-2/joins-0.parquet" \
+      "$B/raw.parquet"
+    uv run modal volume get quail-results "$NEW/quail/biodex/BIO-2/joins-0.parquet" \
+      "$B/chat.parquet"
+    for TABLE in reports terms; do
+      uv run modal volume get quail-results "quailb_data/sf0.1/$TABLE.parquet" \
+        "$B/$TABLE.parquet"
+    done
+    LABELS=ground_truth/quailb/schema_v1/label_sets/biodex/report_experienced_reaction
+    uv run modal volume get quail-results \
+      "$LABELS/ls_558442b4193e9a48bfe1aea9bc87a66a/labels.parquet" \
+      "$B/raw-reference.parquet"
+    uv run modal volume get quail-results \
+      "$LABELS/ls_4c0b69af26ad590e1b64ac5ffebf2484/labels.parquet" \
+      "$B/chat-reference.parquet"
+    uv run modal volume get quail-results \
+      ablations/bio2-prompt-layout-20260918T155056Z/result.json "$B/layout.json"
     BENCH=git+https://github.com/fsdatalab/quail-bench.git
-    REV=cd68a98e63abe904b777714feee4ee4984627e3a
+    REV=d93a53583a0de61978916f349f21c9ecd6ce1ba3
     uv run --with matplotlib --with "quail-b@$BENCH@$REV" \
       python reports/make_quailb_comparison_plots.py "$W"
 
@@ -495,6 +515,108 @@ def count_requested_tokens(run_directory, root, sol_path):
     print(destination, flush=True)
 
 
+def biodex_prompt_comparison(root):
+    """Compare saved prompt runs and score BIO-2 against dataset annotations."""
+    directory = root / "bio-comparison"
+    reports = pq.read_table(directory / "reports.parquet", columns=["id", "reactions"])
+    terms = pq.read_table(directory / "terms.parquet").to_pylist()
+    term_ids = {row["term"]: row["id"] for row in terms}
+    expected = {(row["id"], term_ids[reaction]) for row in reports.to_pylist()
+                for reaction in row["reactions"] if reaction in term_ids}
+    pairs = len(reports) * len(terms)
+    layout = json.loads((directory / "layout.json").read_text())
+    assert layout["query"] == "BIO-2" and layout["scale_factor"] == 0.1
+    lines = [
+        "## BIO-2 raw and chat comparison", "",
+        "The chat closing adds nine tokens after each pair's text. Both",
+        "benchmark runs evaluated 563,500 pairs. Quail's fresh input tokens rose",
+        "49%, and its query time rose from 127.75 to 187.01 seconds. Its computed",
+        "token rate stayed close to 82,000 per second.", "",
+        "A separate pipelined stock vLLM experiment compared raw and chat prompts",
+        "in one container. It used a fresh engine for each join and ran BIO-1",
+        "first. The prediction was that times would differ by less than 5%,",
+        "with chat no faster than raw.", "",
+        "| Round | Format | Seconds | Milliseconds/pair | Fresh tokens |",
+        "|---|---|---:|---:|---:|",
+    ]
+    times = {"raw": [], "chat": []}
+    for run in layout["joins"]:
+        assert run["pairs"] == pairs
+        times[run["layout"]].append(run["wall_s"])
+        lines.append(
+            f"| {run['round'] + 1} | {run['layout']} | {run['wall_s']:.1f} "
+            f"| {run['wall_s'] / pairs * 1000:.3f} | {run['fresh_tokens']:,} |")
+    difference = (mean(times["chat"]) / mean(times["raw"]) - 1) * 100
+    lines.extend([
+        "", f"Chat time differed from raw by {difference:.2f}% on average.",
+        "The result supports the 5% prediction, but chat was slightly faster.",
+        "It did not reproduce the 13% vLLM time reduction between benchmark runs.",
+        "Those runs used different machines. Host variation is a plausible",
+        "explanation; this experiment does not isolate every host difference.", "",
+        "Result on `quail-results`:",
+        f"`{layout['result_volume_path']}`.",
+        "Modal call: `fc-01M2TKCMJQVM0HV104NVCHTKY5`.",
+        "The experiment is `experiments/bio2_prompt_layout.py` at commit",
+        "`1f35316` on `claude/focused-carson-huqcvm`.", "",
+        "Earlier attempts used a cold engine or encountered throttling. They",
+        "are excluded from the controlled comparison above. Their records are",
+        "`/results/ablations/bio2-prompt-layout-20260918T142630Z/joins.json`",
+        "(`fc-01M2TEJJY4Z2G2DGG25NE8F28B`) and the cancelled call",
+        "`fc-01M2TG6KG63GSZTN2X3BRZ43AD`.", "",
+        "The September 12 recomputed KV values used an older minimum rule.",
+        "That rule counted a pair's partner label once per anchor and shared",
+        "partner document prefixes across pairs. It understated BIO-2's minimum",
+        "by 4,146,500 tokens. Under the current rule, vLLM recomputed 154,747",
+        "tokens in that run and 157,341 in the chat run. Those values are close.", "",
+        "### Accuracy against the same dataset annotations", "",
+        "The main correctness tables compare 4B answers with 32B reference",
+        "answers. Those references changed when the prompt format changed.",
+        "Here both formats are scored against the same reactions recorded in",
+        f"BioDEX: {len(expected):,} positive pairs out of {pairs:,}.",
+        "Matching is exact; a synonym absent from the recorded list counts as",
+        "wrong. These scores therefore measure agreement with dataset annotations.",
+        "F1 combines precision and recall and is shown as a percentage.", "",
+        "| Model and format | Predicted matches | Precision (%) "
+        "| Recall (%) | F1 (%) |",
+        "|---|---:|---:|---:|---:|",
+    ])
+    for name, title, columns in [
+        ("raw", "4B raw", ["r", "m", "answer"]),
+        ("chat", "4B chat", ["r", "m", "answer"]),
+        ("raw-reference", "32B raw", ["left_id", "right_id", "answer"]),
+        ("chat-reference", "32B chat", ["left_id", "right_id", "answer"]),
+    ]:
+        table = pq.read_table(directory / f"{name}.parquet", columns=columns)
+        values = zip(*(table[column].to_pylist() for column in columns))
+        answers = {(left, right): answer for left, right, answer in values}
+        assert len(answers) == len(table) == pairs
+        assert {left for left, _ in answers} == set(reports["id"].to_pylist())
+        assert {right for _, right in answers} == set(term_ids.values())
+        predicted = {pair for pair, answer in answers.items() if answer}
+        matches = len(predicted & expected)
+        precision = matches / len(predicted) if predicted else 0
+        recall = matches / len(expected)
+        f1 = 2 * matches / (len(predicted) + len(expected))
+        lines.append(
+            f"| {title} | {len(predicted):,} | {100 * precision:.1f} "
+            f"| {100 * recall:.1f} | {100 * f1:.1f} |")
+    lines.extend([
+        "", "Chat improves precision and F1 on this annotation comparison, while",
+        "missing more recorded reactions. It does not establish an accuracy",
+        "improvement across the whole benchmark.", "",
+        "The 4B answers come from `quail/biodex/BIO-2/joins-0.parquet` under",
+        "`/results/benchmarks/quailb/family-runs/20260912T225100Z-902686c5/` and",
+        "`/results/benchmarks/quailb/family-runs/20260918T060700Z-biodex-chat/`.",
+        "The 32B label sets are `ls_558442b4193e9a48bfe1aea9bc87a66a` and",
+        "`ls_4c0b69af26ad590e1b64ac5ffebf2484`. Annotation tables are under",
+        "`/results/quailb_data/sf0.1/`. Download commands are in the generator.", "",
+        "Possible follow-ups are to score different TRUE/FALSE thresholds and",
+        "test shorter pair prompts. Neither was measured here. Moving prompt",
+        "text requires checking answer quality and updating token accounting.", "",
+    ])
+    return lines
+
+
 def main(workdir):
     """Regenerate the report and figures from the downloaded measurements."""
     root = Path(workdir)
@@ -638,29 +760,8 @@ def main(workdir):
                 f"{survivors['quail']:,} in Quail, and "
                 f"{survivors['pipelined_vllm']:,} in pipelined stock vLLM.",
                 "",
-                "vLLM's BIO-2 time is 13% lower than in the September 12 run with",
-                "raw prompts, saved at",
-                "`/results/benchmarks/quailb/family-runs/20260912T225100Z-902686c5/`.",
-                "Its time per pair is 13% lower on BIO-3 as well. The cause is the",
-                "host, not the prompt layout and not KV reuse. The two runs were on",
-                "different physical GPUs. On one container, after this report's",
-                "runs, the same join took 2.152 and 2.115 ms per pair with raw",
-                "prompts and 2.141 and 2.098 ms with chat prompts: two rounds in",
-                "alternating order, each on a fresh engine with BIO-1 run first,",
-                "and the chat runs' fresh tokens matched this run's exactly. The",
-                "result is",
-                "`/results/ablations/bio2-prompt-layout-20260918T155056Z/result.json`",
-                "(`fc-01M2TKCMJQVM0HV104NVCHTKY5`; the cell is",
-                "`experiments/bio2_prompt_layout.py`). Across the three machines",
-                "the raw layout has run on, the join took 1069, 1163, and 1213",
-                "seconds, a 13% spread with nothing but the host changing. The",
-                "September 12 recomputed KV figures came from an earlier benchmark",
-                "rule that counted each pair's partner label once per anchor and",
-                "shared partner document prefixes across pairs. On BIO-2 that",
-                "understates the minimum by 8,293 tokens per anchor, 4,146,500 in",
-                "total, which is all of Quail's 4,148,977 recomputed tokens in that",
-                "run beyond its 2,477 filter-stage tokens. Under the current rule,",
-                "vLLM recomputed 154,747 tokens there and 157,341 here."])
+                "The BIO-2 prompt comparison below explains the change in time",
+                "and separately scores both formats against dataset annotations."])
         table_header_text = (
             "| Query | Method | Seconds | Tokens/second | $/query "
             "| $/million input tokens | KV regret (%) |")
@@ -692,6 +793,7 @@ def main(workdir):
                     f"| {query} | {label} | {m['agreement']:.2f} "
                     f"| {m['precision']:.5g} | {m['recall']:.5g} |")
         lines.append("")
+    lines.extend(biodex_prompt_comparison(root))
     report = HERE / "quailb-comparison.md"
     report.write_text("\n".join(lines))
     print(f"Updated {report}, the main figure, and five dataset figures.")
