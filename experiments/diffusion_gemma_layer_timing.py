@@ -987,8 +987,9 @@ def fa4_tiles(prediction: str, prefix: int = 448, suffix: int = 54,
                     cu_q=cu_q, cu_k=cu_k, used=used, cu_anchor=cu_anchor,
                     anchor_table=anchor_table, anchor_used=anchor_used)
 
-    def flops(H, D):
-        per_pair = suffix * prefix + suffix * (suffix + 1) // 2
+    def flops(H, D, own=True, shared=True):
+        per_pair = ((suffix * prefix if shared else 0)
+                    + (suffix * (suffix + 1) // 2 if own else 0))
         return pairs * per_pair * H * D * 4
 
     def timed(fn, repeats=10):
@@ -1085,13 +1086,17 @@ def fa4_tiles(prediction: str, prefix: int = 448, suffix: int = 54,
     }
     full_flops = flops(16, 512)
     result["full_flops"] = full_flops
+    # call A covers each pair's own rows, call B the shared prefix
+    part = {"fa4_call_a_own_rows": flops(16, 512, shared=False),
+            "fa4_call_b_prefix": flops(16, 512, own=False)}
     for name, fn in variants.items():
         seconds = timed(fn)
         if isinstance(seconds, str):
             result[name] = seconds
         else:
+            work = part.get(name, full_flops)
             result[name] = {"ms": round(seconds * 1e3, 3),
-                            "tflops": round(full_flops / seconds / 1e12, 1)}
+                            "tflops": round(work / seconds / 1e12, 1)}
         print(name, result[name], flush=True)
     a, b = result["fa4_call_a_own_rows"], result["fa4_call_b_prefix"]
     if isinstance(a, dict) and isinstance(b, dict):
