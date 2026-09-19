@@ -15,6 +15,7 @@ from quail_b.queries import (
     QUERY_FAMILY_WORKLOADS,
     QUERY_ORDER,
     QuerySpec,
+    get_query,
     queries,
     query_family_name,
     split_query_families,
@@ -258,3 +259,17 @@ def test_query_family_rejects_mixed_or_unknown_queries():
         query_family_name(("IMDB-1", "BIO-1"))
     with pytest.raises(ValueError, match="unknown query family"):
         split_query_families(("OTHER-1",))
+
+
+@pytest.mark.parametrize("query_id, expected", [
+    ("IMDB-2", "f3b93b898b0d631fb451046b072920cb81f12d5aabb8dc1b853f913030b4f45e"),
+    ("LEP-5", "6ca4bd71ae0304b98448d295d35213853c2d52242f8cc5bf23a817b0b9889a88"),
+])
+def test_raw_query_hash_matches_before_chat(query_id, expected, monkeypatch):
+    import importlib
+
+    run_module = importlib.import_module("quail_b.run")
+    spec = get_query(query_id)
+    assert run_module._query_hash(spec) == expected
+    monkeypatch.setattr(run_module, "PROMPT_FORMAT", "qwen3-chat-nonthinking-v1")
+    assert run_module._query_hash(spec) != expected

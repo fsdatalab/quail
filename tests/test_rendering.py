@@ -5,8 +5,6 @@ import pytest
 from quail_b.prompts import DISCUSS_ASPECT, F1
 from quail_b.rendering import (
     ANSWER_CUE,
-    CHAT_PREFIX,
-    CHAT_SUFFIX,
     SHARED_PRE,
     render_filter_prompt,
     render_join_prompt,
@@ -18,22 +16,22 @@ def test_filter_prompt_puts_the_document_first_and_the_question_after():
     text = render_filter_prompt(F1, "the review")
     lead, question = F1.split("{0}")
     assert text.startswith(SHARED_PRE + "the review")
-    assert "You are performing a data processing task." in text
+    assert "You are performing a data processing task." not in text
     assert "Evaluate TRUE or FALSE for the following question: " in text
     assert question.strip() in text
     # the template text before the placeholder moves after the document
     assert text.index("the review") < text.index(lead.strip())
     assert text.endswith(ANSWER_CUE)
-    assert text.startswith("<|im_start|>user\n")
-    assert text.endswith("<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")
-    assert text.count(CHAT_PREFIX) == 1
-    assert text.count(CHAT_SUFFIX) == 1
+    assert text.startswith("DOCUMENT:\n")
+    assert text.endswith("\nANSWER:")
+    assert "<|im_start|>" not in text
+    assert "<think>" not in text
 
 
 def test_join_prompt_frames_the_anchor_and_labels_the_partners():
     text = render_join_prompt(DISCUSS_ASPECT, ("review", "aspect"), anchor=0)
     assert text.startswith(SHARED_PRE + "review")
-    assert "You are performing a data processing task." in text
+    assert "You are performing a data processing task." not in text
     assert "(The document above is DOCUMENT {0}.)" in text
     assert "\n\nDOCUMENT {1}:\naspect" in text
     assert text.endswith(ANSWER_CUE)

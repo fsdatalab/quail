@@ -116,7 +116,7 @@ def test_load_benchmark_validates_selected_inputs(tmp_path):
         benchmark.select_queries(scale_factor=0.2)
 
 
-def test_current_benchmark_rejects_labels_from_an_old_prompt_format(
+def test_current_benchmark_rejects_chat_reference_labels(
         monkeypatch, tmp_path):
     from quail_b import benchmark as loading
     from quail_b.data import DATA_SEED, SOURCE_REVISIONS, corpus_identity
@@ -136,7 +136,7 @@ def test_current_benchmark_rejects_labels_from_an_old_prompt_format(
     labels = PredicateLabels(
         spec.key, "ls_old", {"template": spec.template},
         {("r0", None): True}, {},
-        predicate_payload={**payload, "answer_cue": "\nANSWER:"})
+        predicate_payload={**payload, "prompt_format": "qwen3-chat-nonthinking-v1"})
     truth = GroundTruthCollection(
         "gt_test", corpus_id, 0.1, "qwen3-32b-fp8", {spec.key: labels})
     monkeypatch.setattr(loading, "load_ground_truth", lambda *a, **kw: truth)

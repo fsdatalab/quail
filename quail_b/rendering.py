@@ -11,24 +11,15 @@ from __future__ import annotations
 
 import re
 
-# These wrappers match Qwen3 apply_chat_template(enable_thinking=False).
-# The user message stays open across the reusable document prefix.
-CHAT_PREFIX = "<|im_start|>user\n"
-CHAT_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
-PROMPT_FORMAT = "qwen3-chat-nonthinking-v1"
-DOCUMENT_PRE = "DOCUMENT:\n"
-SHARED_PRE = CHAT_PREFIX + DOCUMENT_PRE
+PROMPT_FORMAT = "raw-v1"
+SHARED_PRE = "DOCUMENT:\n"
 
 # Fixed strings for join prompt layout.
 JOIN_DOC_LABEL = "\n\nDOCUMENT {}:\n"      # each partner block
 JOIN_ANCHOR_NOTE = "\n\n(The document above is DOCUMENT {}.)"
 JOIN_QUESTION_SEP = "\n\n"                 # anchor note -> question
-DATA_PROCESSING_INSTRUCTION = "You are performing a data processing task."
-TASK_INSTRUCTION = (
-    f"{DATA_PROCESSING_INSTRUCTION} "
-    "Evaluate TRUE or FALSE for the following question: "
-)
-ANSWER_CUE = "\nANSWER:" + CHAT_SUFFIX
+TASK_INSTRUCTION = "Evaluate TRUE or FALSE for the following question: "
+ANSWER_CUE = "\nANSWER:"
 
 
 def _marker(placeholder: int) -> str:
@@ -68,7 +59,7 @@ def split_frame(template: str) -> tuple[str, str]:
             f"a brace that is not a placeholder: {tail[:40]!r}")
     frame = user_pre.strip()
     rest = tail[m.end():]
-    return frame, (DOCUMENT_PRE + m.group(0)
+    return frame, (SHARED_PRE + m.group(0)
                    + (f"\n\n{frame}" if frame else "") + rest)
 
 
@@ -89,7 +80,7 @@ def render_filter_prompt(template: str, document: str) -> str:
     m = re.match(r"(\{\d+\})(.*)", tail, re.DOTALL)
     if m is None or not tail.startswith("{0}"):
         raise ValueError(f"unexpected filter template layout: {template!r}")
-    return CHAT_PREFIX + preamble + document + render_filter_question(m.group(2))
+    return preamble + document + render_filter_question(m.group(2))
 
 
 def join_label(placeholder: int) -> str:

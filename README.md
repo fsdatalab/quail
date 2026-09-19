@@ -144,10 +144,12 @@ The benchmark evaluates 30 queries across 5 datasets:
 | LePaRD | 5 | `citation_contexts`, `citation_passages` | Legal precedent retrieval and citation matching |
 | SWE-Next | 2 | `agent_traces` | Software engineering agent trajectory evaluation |
 
-LePaRD has five queries. The previous LEP-5, LEP-6, and LEP-8 were removed
-because their reference filters leave no rows at sf=0.1. The previous LEP-7
-is now LEP-5; its plan and prompts are unchanged. Historical results must
-be matched by query definition, not by query ID alone.
+The original LEP-5, LEP-6, and LEP-8 have empty reference outputs at sf=0.1
+with raw prompts as well as chat prompts. They are excluded. The original LEP-7
+is now LEP-5; its plan and prompt text are unchanged.
+Filter and join prompts use the raw document/question format ending in `ANSWER:`.
+The benchmark uses the existing raw-prompt reference collections. Saved chat
+results remain historical and must not be presented as raw-prompt results.
 
 BIO-1 selects reports describing a serious or life-threatening adverse event.
 BIO-3 applies that filter before joining reports to reaction terms.
@@ -184,10 +186,9 @@ Project [r.id, a.id]
 
 In the Substrait plan, `F1`, `F4`, and `J1` are string prompt literals. Exact prompt texts and rendering logic are defined in [`quail_b/prompts.py`](quail_b/prompts.py) and [`quail_b/rendering.py`](quail_b/rendering.py).
 
-Every filter and join instruction starts with "You are performing a data
-processing task." The instruction follows the document, so the document's
-KV can be reused across questions. The predicate version includes this
-instruction.
+Every filter and join instruction starts with "Evaluate TRUE or FALSE for the
+following question:". It follows the document, so the document's KV can be reused
+across questions.
 
 ## Scale Factors
 

@@ -71,7 +71,6 @@ def _query_hash(spec):
                 "on": operator.on,
             })
     definition = {
-        "prompt_format": PROMPT_FORMAT,
         "substrait_version": [
             plan.version.major_number,
             plan.version.minor_number,
@@ -89,6 +88,8 @@ def _query_hash(spec):
         "operators": operators,
         "select": spec._info.select,
     }
+    if PROMPT_FORMAT != "raw-v1":
+        definition["prompt_format"] = PROMPT_FORMAT
     encoded = json.dumps(
         definition,
         ensure_ascii=False,

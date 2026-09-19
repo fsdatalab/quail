@@ -163,7 +163,7 @@ def _text_hash(value: str) -> str:
 def predicate_payload(spec: PredicateSpec) -> dict:
     render = ("filter_document_then_question_v1" if spec.kind == "filter"
               else "join_arg0_anchor_then_arg1_v1")
-    return {
+    payload = {
         "schema_version": SCHEMA_VERSION,
         "predicate_key": spec.key,
         "kind": spec.kind,
@@ -176,10 +176,16 @@ def predicate_payload(spec: PredicateSpec) -> dict:
         "right_column": spec.right_column,
         "render": render,
         "shared_preamble": SHARED_PRE,
-        "task_instruction": rendering.TASK_INSTRUCTION,
-        "answer_cue": rendering.ANSWER_CUE,
-        "prompt_format": rendering.PROMPT_FORMAT,
     }
+    # Published raw label hashes omit these fields for the original layout.
+    raw_instruction = "Evaluate TRUE or FALSE for the following question: "
+    if rendering.TASK_INSTRUCTION != raw_instruction:
+        payload["task_instruction"] = rendering.TASK_INSTRUCTION
+    if rendering.ANSWER_CUE != "\nANSWER:":
+        payload["answer_cue"] = rendering.ANSWER_CUE
+    if rendering.PROMPT_FORMAT != "raw-v1":
+        payload["prompt_format"] = rendering.PROMPT_FORMAT
+    return payload
 
 
 def predicate_version(spec: PredicateSpec) -> tuple[str, str]:
