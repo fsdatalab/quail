@@ -274,7 +274,10 @@ def document_page(title, queries, relations):
     return figure
 
 
-def plot_comparison(title, queries, rows, relations, sol, name, overview=False):
+def plot_comparison(title, queries, rows, relations, sol, name, overview=False,
+                    model_label="Qwen3 4B FP8",
+                    reference_note="Reference labels: Qwen3 32B FP8 and "
+                                   "dataset annotations."):
     """Export metric charts and input counts as a vector PDF."""
     destination = HERE / "plots" / name
     groups = [[metric] for metric, _, _ in METRICS] if overview else [
@@ -288,7 +291,7 @@ def plot_comparison(title, queries, rows, relations, sol, name, overview=False):
             axes = [axes] if single else list(axes.flat)
             for axis, metric in zip(axes, metrics):
                 metric_bars(axis, queries, rows, sol, metric, overview)
-            figure.suptitle(f"{title}, Qwen3 4B FP8, sf=0.1, one H100", y=0.97,
+            figure.suptitle(f"{title}, {model_label}, sf=0.1, one H100", y=0.97,
                             fontsize=16)
             handles = [Patch(facecolor=color, label=label)
                        for _, label, color in METHODS]
@@ -300,9 +303,7 @@ def plot_comparison(title, queries, rows, relations, sol, name, overview=False):
             figure.subplots_adjust(left=0.075, right=0.97, top=0.83,
                                    bottom=0.14 if overview else 0.10, hspace=0.60,
                                    wspace=0.28)
-            figure.text(0.075, 0.02,
-                        "Reference labels: Qwen3 32B FP8 and dataset annotations.",
-                        fontsize=9)
+            figure.text(0.075, 0.02, reference_note, fontsize=9)
             pdf.savefig(figure, bbox_inches=None)
             plt.close(figure)
         figure = document_page(title, queries, relations)
