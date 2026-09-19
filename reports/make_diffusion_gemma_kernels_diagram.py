@@ -27,10 +27,10 @@ COLS = ["vLLM kernels called one by one\n(Quail reference path, measured 09-18)"
 V, Q, G, F, KV, M, C, VF, I = "vllm", "quail", "gemm", "fa", "kv", "moe", "cublas", "vfused", "inductor"
 moe_rows = [[("moe_align_block_size + sort", V), ("moe_align_block_size + sort", V), ("radix sort x2, expert offsets, gemm starts", V)],
             [("per_token fp8 quant", V), ("per_token fp8 quant", V), ("expandInputRows (fp8 gather)", V)],
-            [("fused_moe_kernel (w13), Triton, tuned tiles", M), ("fused_moe_kernel (w13), Triton, tuned tiles", M), ("cutlass_3x_group_gemm (w13)", G)],
+            [("fused_moe_kernel (w13), Triton, Quail tile table", M), ("fused_moe_kernel (w13), Triton, Quail tile table", M), ("cutlass_3x_group_gemm (w13)", G)],
             [("act_and_mul (gelu_tanh)", V)] * 3,
             [("per_token fp8 quant", V)] * 3,
-            [("fused_moe_kernel (w2), Triton, tuned tiles", M), ("fused_moe_kernel (w2), Triton, tuned tiles", M), ("cutlass_3x_group_gemm (w2)", G)],
+            [("fused_moe_kernel (w2), Triton, Quail tile table", M), ("fused_moe_kernel (w2), Triton, Quail tile table", M), ("cutlass_3x_group_gemm (w2)", G)],
             [("moe_sum (top-8 weighted sum)", V), ("moe_sum (top-8 weighted sum)", V), ("finalizeMoeRouting (top-8 sum)", V)]]
 # each stage: list of rows; each row: 3 entries (text, kind) or None, so the same kernel sits on the same row
 stages = [
@@ -112,7 +112,7 @@ for (label, rows), h in zip(stages, heights):
             xc = col_x0 + ci * (col_w + col_gap) + 0.2 + (col_w - 0.4) / 2
             ax.annotate("", xy=(xc, y - h - STAGE_GAP + 0.03), xytext=(xc, y - h - 0.02), arrowprops=dict(arrowstyle="-|>", color="#888", lw=1))
     y -= h + STAGE_GAP
-items = [("gemm", "CUTLASS fp8 GEMM (vLLM)"), ("moe", "Triton fused MoE (vLLM, Quail's tile table)"), ("fa", "FlashAttention 3 / 4 (varlen, block table over arena pages)"),
+items = [("gemm", "CUTLASS fp8 GEMM (vLLM)"), ("moe", "Triton fused MoE (vLLM kernel, Quail's tuned tile table for 32k and 64k rows)"), ("fa", "FlashAttention 3 / 4 (varlen, block table over arena pages)"),
          ("kv", "KV page write (Quail Triton)"), ("vllm", "vLLM op"), ("vfused", "vLLM fused CUDA op"), ("cublas", "cuBLAS bf16"), ("quail", "Quail fused Triton"), ("inductor", "Inductor-generated Triton (stock, compiled)")]
 for i, (kind, text) in enumerate(items):
     xx = 0.2 + (i % 3) * 6.3; yy = -0.75 - (i // 3) * 0.42
@@ -124,7 +124,9 @@ note = ("One layer of 30. Layer kinds: 25 sliding layers (head 256, 16 q / 8 kv 
         "layers, reading the arena through FlashAttention's block table; stock vLLM runs FA4 on all 30 (its diffusion path needs FA4's per-sequence "
         "causal mask). Stock column from one profiled prefill pass at vLLM's defaults (-O2, Inductor, no vLLM fusion pass fired): the experts run "
         "CUTLASS grouped GEMM (31% of its GPU time), the dense GEMMs 13%, attention 4%, and the 256-row canvas denoising loop about 15%, which "
-        "Quail's one-row canvas never runs. Record: /results/ablations/diffusion_gemma_stock_kernels.json. A 35k-row chunk on the default column: "
+        "Quail's one-row canvas never runs. Record: /results/ablations/diffusion_gemma_stock_kernels.json. Quail runs the experts through vLLM's "
+        "Triton fused MoE kernel with a tile table Quail tuned for 32k and 64k row chunks (vLLM's own table stops at 16k rows); at chunk size it "
+        "beats the CUTLASS grouped GEMM by 6% (/results/ablations/diffusion_gemma_moe_tiles*.json). A 35k-row chunk on the default column: "
         "0.363 s, 96k rows/s.")
 ax.text(0.2, -2.25, "\n".join(textwrap.wrap(note, 185)), fontsize=8.8, color="#444", va="top")
 plt.savefig(OUT, dpi=300, bbox_inches="tight", facecolor="white")
