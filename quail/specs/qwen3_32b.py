@@ -20,10 +20,4 @@ QWEN3_32B_FP8 = ModelSpec(
     #                        after extracting answer rows.
     vocab=151_936,
     tied_head=False,       # separate lm_head; discarded after extracting answer rows
-    # Qwen3 apply_chat_template(enable_thinking=False): the user turn
-    # opens before the document preamble and closes after the answer
-    # cue, then the assistant turn opens with an empty think block.
-    turn_prefix="<|im_start|>user\n",
-    turn_suffix="<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
-    prompt_format="qwen3-chat-nonthinking-v1",
 )

@@ -184,7 +184,6 @@ def test_prompt_layout_and_predicate_order(catalog):
         render_join_frame,
         render_join_question,
     )
-    from quail.logical.prompts import DOCUMENT_PRE
     args = (ColumnRef("a", "reviews", "review"),
             ColumnRef("b", "threads", "thread"))
     p = bind_join_prompt("Does {0} praise {1}?", args, tok)
@@ -192,7 +191,7 @@ def test_prompt_layout_and_predicate_order(catalog):
     assert p.preamble == SHARED_PRE
     # the static question is in the anchor frame; only the answer cue
     # is paid per tuple
-    assert p.frame == ("\n\nYou are performing a data processing task. "
+    assert p.frame == ("\n\n"
                        "Evaluate TRUE or FALSE for the following "
                        "question: Does {0} praise {1}?")
     assert p.tail == ANSWER_CUE
@@ -214,22 +213,22 @@ def test_prompt_layout_and_predicate_order(catalog):
                  for p in plan.root.input.predicates]
     # canonical layout: the engine preamble sits before the document
     # and the user's pre-document text is relocated after it
-    assert templates == [DOCUMENT_PRE + "{0}\n\nfirst:",
-                         DOCUMENT_PRE + "{0}\n\nsecond:",
-                         DOCUMENT_PRE + "{0}\n\nthird:"]
+    assert templates == [SHARED_PRE + "{0}\n\nfirst:",
+                         SHARED_PRE + "{0}\n\nsecond:",
+                         SHARED_PRE + "{0}\n\nthird:"]
 
     from quail.logical import canonicalize_template, split_frame
     # no user text before the document: the preamble is prepended
     assert canonicalize_template("{0}\nQ: is it good?") == \
-        DOCUMENT_PRE + "{0}\nQ: is it good?"
+        SHARED_PRE + "{0}\nQ: is it good?"
     # user text before the document relocates after it, so the fixed
     # preamble is the only thing ahead of the document's KV
     assert canonicalize_template("negative review: {0}") == \
-        DOCUMENT_PRE + "{0}\n\nnegative review:"
+        SHARED_PRE + "{0}\n\nnegative review:"
     # two placeholders: only the first (the KV-owning document) moves
     # behind the preamble
     assert canonicalize_template("Does {0} match {1}?") == \
-        DOCUMENT_PRE + "{0}\n\nDoes match {1}?"
+        SHARED_PRE + "{0}\n\nDoes match {1}?"
     # no placeholder: no document to own, unchanged
     assert canonicalize_template("no placeholders") == "no placeholders"
     # the relocated text is recorded as the frame
@@ -241,13 +240,12 @@ def test_prompt_layout_and_predicate_order(catalog):
     # the preamble is always the engine's; the user's pre-document
     # text ("This review is negative:") moves into the tail
     assert pred.prompt.preamble == SHARED_PRE
-    assert pred.prompt.tail == ("{0}\n\nYou are performing a data processing task. "
+    assert pred.prompt.tail == ("{0}\n\n"
                                 "Evaluate TRUE or FALSE for the "
                                 "following question: This review is "
                                 "negative:" + ANSWER_CUE)
     assert pred.prompt.preamble_tokens == len(tok(SHARED_PRE))
     assert pred.prompt.tail_tokens == len(tok(
-        "You are performing a data processing task. "
         "Evaluate TRUE or FALSE for the following question: "
         "This review is negative:" + ANSWER_CUE))
 

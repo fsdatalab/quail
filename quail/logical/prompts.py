@@ -4,10 +4,10 @@ from quail.logical.nodes import CompileError, Prompt
 
 # Fixed preamble before every document. Must be a formatting label,
 # not an instruction; instruction text here biases short-document
-# completions. The model's chat-turn text (ModelSpec.turn) wraps the
-# whole prompt: its opening piece goes before this preamble and its
-# closing piece after the answer cue, so the user message stays open
-# across the reusable document prefix.
+# completions. A model's chat-turn text (ModelSpec.turn), when it has
+# any, wraps the whole prompt: its opening piece goes before this
+# preamble and its closing piece after the answer cue, so the user
+# message stays open across the reusable document prefix.
 DOCUMENT_PRE = "DOCUMENT:\n"
 SHARED_PRE = DOCUMENT_PRE
 
@@ -34,10 +34,7 @@ JOIN_DOC_LABEL = "\n\nDOCUMENT {}:\n"      # each partner block
 JOIN_ANCHOR_NOTE = "\n\n(The document above is DOCUMENT {}.)"
 JOIN_QUESTION_SEP = "\n\n"                 # anchor note -> question
 DATA_PROCESSING_INSTRUCTION = "You are performing a data processing task."
-TASK_INSTRUCTION = (
-    f"{DATA_PROCESSING_INSTRUCTION} "
-    "Evaluate TRUE or FALSE for the following question: "
-)
+TASK_INSTRUCTION = "Evaluate TRUE or FALSE for the following question: "
 ANSWER_CUE = "\nANSWER:"
 
 
@@ -158,7 +155,7 @@ def split_frame(template: str) -> tuple[str, str]:
             f"contain a brace that is not a placeholder: {tail[:40]!r}")
     frame = user_pre.strip()
     rest = tail[m.end():]
-    return frame, (DOCUMENT_PRE + m.group(0)
+    return frame, (SHARED_PRE + m.group(0)
                    + (f"\n\n{frame}" if frame else "") + rest)
 
 
