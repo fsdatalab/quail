@@ -19,7 +19,7 @@ Pull the saved measurements, corpus manifest, and SoL estimates:
     uv run modal volume get quail-results \
       sol/2026-09-18-all-chat/sol_quailb_sf0.1.json "$W/sol.json"
     BENCH=git+https://github.com/fsdatalab/quail-bench.git
-    REV=2c2c5b55ce5718a9e791931b4f55f92c475b8995
+    REV=cd68a98e63abe904b777714feee4ee4984627e3a
     uv run --with matplotlib --with "quail-b@$BENCH@$REV" \
       python reports/make_quailb_comparison_plots.py "$W"
 
