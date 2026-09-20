@@ -1,12 +1,12 @@
 """Run the Civil Comments comparison query with Quail.
 
 The query filters comments for toxicity, then evaluates 31 field
-statements on each survivor. The labels, questions, and deterministic
-sample are shared with ``demos/civil_comments_jev.py``.
+statements on each survivor. The package initializer shares the labels,
+questions, and deterministic sample with the Jev backend.
 
 Run one or two H100s from the repository root:
 
-    uv run modal run --detach demos/civil_comments_quail.py \
+    uv run modal run --detach demos/civil_comments/quail.py \
       --limit 20000 --gpus 1 \
       2>&1 | tee /tmp/civil-comments-quail.log
 

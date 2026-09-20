@@ -1,14 +1,14 @@
 """Run the Civil Comments comparison query with Jev.
 
 This runs the same filter-then-join plan, sample, label cutoff, and
-question text as ``demos/civil_comments_quail.py``. Jev's ``noul``
-probability is TRUE when it is at least 0.5.
+question text as the Quail backend. Jev's ``noul`` probability is TRUE
+when it is at least 0.5.
 
 Set the API key without putting it on the command line, then run:
 
     read -s TYPESAFE_API_KEY
     export TYPESAFE_API_KEY
-    uv run python demos/civil_comments_jev.py \
+    uv run python demos/civil_comments/jev.py \
       --limit 20000 --concurrency 256 \
       2>&1 | tee /tmp/civil-comments-jev.log
 
