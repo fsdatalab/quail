@@ -5,6 +5,7 @@ from __future__ import annotations
 import itertools
 import time
 
+from quail.backends.quail.executor.images import PageImages
 from quail.backends.quail.retention import apply_retention, retain_after_join
 from quail.execution.pairs import (
     allowed_members,
@@ -27,6 +28,7 @@ from quail.execution.runner import (
 )
 from quail.execution.tokens import DocumentPrefixes, chain_tokens
 from quail.execution.types import export_physical_outputs
+from quail.pdf.prompt import PagePrompts
 from quail.physical import (
     AiFilter,
     AiJoin,
@@ -139,8 +141,13 @@ def stage_partner_lists(group, lists_for, anchor_ids) -> list:
 
 
 def filter_result(node, answers, tokens, document_ids,
-                  gpu_s: float = 0.0, chunks: int = 0) -> NodeResult:
-    """Build one filter chain's node result from its local answers."""
+                  gpu_s: float = 0.0, chunks: int = 0,
+                  image_metrics: dict | None = None) -> NodeResult:
+    """Build one filter chain's node result from its local answers.
+
+    image_metrics are the chain's page render counters, kept under
+    the metrics extension for a chain over PDF rows.
+    """
     global_answers = {
         document_ids[int(local)]: row
         for local, row in answers.items()
@@ -162,19 +169,27 @@ def filter_result(node, answers, tokens, document_ids,
             fresh_tokens=tokens,
             gpu_s=gpu_s,
             chunks=chunks,
+            extension=({"images": dict(image_metrics)}
+                       if image_metrics else {}),
         ),
     )
 
 
 def filter_inputs(state, node, document_ids) -> dict:
-    """Scheduler inputs for one filter chain over the given documents."""
+    """Scheduler inputs for one filter chain over the given documents.
+
+    An alias whose documents are PDF page prompts also gets its image
+    source; the chain opens it when it starts.
+    """
+    documents = state["docs"][node.alias]
+    pre = state["pre"]
     return {
-        "documents": DocumentPrefixes(
-            state["pre"], state["docs"][node.alias], document_ids
-        ),
+        "documents": DocumentPrefixes(pre, documents, document_ids),
         "document_ids": document_ids,
         "limit": state["filter_limit"],
         "retain_survivors": node.keep_kv,
+        "images": (PageImages(documents, document_ids, len(pre))
+                   if isinstance(documents, PagePrompts) else None),
     }
 
 
@@ -417,11 +432,19 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
             None if state["device"].usd_per_hour is None
             else wall / 3600 * state["device"].usd_per_hour
         ),
-        "backend_metrics": {"scores": [
-            dict(value.metrics.extension)
-            for node_id, value in result.nodes.items()
-            if graph.node(node_id).type_name == AiScore.type_name
-        ]},
+        "backend_metrics": {
+            "scores": [
+                dict(value.metrics.extension)
+                for node_id, value in result.nodes.items()
+                if graph.node(node_id).type_name == AiScore.type_name
+            ],
+            # page render counters per filter chain over PDF rows
+            "images": {
+                graph.node(node_id).alias: value.metrics.extension["images"]
+                for node_id, value in result.nodes.items()
+                if "images" in value.metrics.extension
+            },
+        },
         "node_metrics": scalar_node_metrics(result.nodes),
         "executed_join_plan": executed_join_plan(graph),
         "kv_manager": kv_manager,

@@ -31,9 +31,11 @@ from quail.execution.tokens import (
     decode_payload_documents,
 )
 from quail.execution.types import PhysicalResponse
+from quail.pdf.prompt import PagePrompts
 from quail.physical import (
     AiFilter,
     AiJoin,
+    PDFScan,
     TextScan,
     decode_graph,
 )
@@ -165,21 +167,37 @@ def _boot_record(gpu, cold, warm_s, warm_tier, t_boot):
 
 
 def quail_runtime_payload(request, graph) -> dict:
-    """Build private Quail scheduler state from a standard request."""
+    """Build private Quail scheduler state from a standard request.
+
+    docs holds each TextScan alias's token documents; pdf_inputs holds
+    each PDFScan alias's PDFInput, which the GPU worker lays out as
+    PagePrompts once it knows the model.
+    """
     envelope = request.plan
     docs = {}
+    pdf_inputs = {}
     for node in graph.nodes:
-        if not isinstance(node, TextScan):
-            continue
-        docs[node.alias] = request.inputs[node.input_id].documents
+        if isinstance(node, TextScan):
+            docs[node.alias] = request.inputs[node.input_id].documents
+        elif isinstance(node, PDFScan):
+            pdf_inputs[node.alias] = request.inputs[node.input_id]
     return {
         "physical_plan": envelope,
         "model": envelope["model"],
         "workers": envelope["workers"],
         "docs": docs,
+        "pdf_inputs": pdf_inputs,
         "columns": request.column_tables(),
         **dict(envelope["settings"]),
     }
+
+
+def payload_documents(payload: dict, spec) -> dict:
+    """Every alias's document sequence: token documents and PDF page prompts."""
+    docs = decode_payload_documents(payload["docs"])
+    for alias, pdf_input in payload.get("pdf_inputs", {}).items():
+        docs[alias] = PagePrompts(pdf_input, spec)
+    return docs
 
 
 def _single_gpu_context(registry, envelope):
@@ -320,13 +338,14 @@ def _gpu_state(gpu):
 
 def execute_single(state, payload: dict, registry, graph) -> dict:
     """Execute the typed Quail graph on one GPU."""
+    spec = state.get("spec") or state.get("model_spec")
     runtime_state = {
         **state,
-        "docs": decode_payload_documents(payload["docs"]),
+        "docs": payload_documents(payload, spec),
         "columns": payload.get("columns", {}),
         "functions": registry.functions,
         "runtimes": registry.runtimes,
-        "model_spec": state.get("spec") or state.get("model_spec"),
+        "model_spec": spec,
         "device": registry.device(payload["physical_plan"]["device"]),
         "chunk_tokens": payload["chunk_tokens"],
         "gpu_timing": payload.get("gpu_timing", False),
@@ -666,6 +685,10 @@ def _round(kind, subs):
 def execute_quail_multi(payload, registry, graph):
     """Execute the typed Quail graph across GPU child processes."""
     payload = dict(payload)
+    if payload.get("pdf_inputs"):
+        raise ValueError(
+            f"PDF aliases {sorted(payload['pdf_inputs'])} run on one GPU; "
+            f"the planner refuses them at gpus > 1")
     payload["docs"] = decode_payload_documents(payload["docs"])
     gpu_count = payload["workers"]
     spec = registry.model(payload["model"])

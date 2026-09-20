@@ -130,7 +130,7 @@ class QuailModelExecution:
             retain_survivors = inputs.get("retain_survivors", ())
             if retain_survivors is False:
                 retain_survivors = ()
-            answers, spans, tokens = loop.run_filter(
+            chain = loop.FilterStream(
                 torch,
                 arena,
                 pipeline,
@@ -142,11 +142,14 @@ class QuailModelExecution:
                 arena_writes=node.arena_writes,
                 arena_keys=DocumentKeys(node.alias, document_ids),
                 retain_survivors=retain_survivors,
+                images=inputs.get("images"),
             )
+            answers, spans, tokens = loop.run_stream(chain)
             return filter_result(
                 node, answers, tokens, document_ids,
                 gpu_s=_gpu_seconds(torch, spans, inputs),
-                chunks=_chunks(spans, inputs))
+                chunks=_chunks(spans, inputs),
+                image_metrics=chain.image_metrics)
 
         stage_frames = inputs["stage_frames"]
         stream = inputs.get("anchor_stream")
@@ -168,24 +171,30 @@ class QuailModelExecution:
                                         stream["document_ids"]),
                 hold_survivors=True,
                 hold_extra_tokens=filter_node.hold_tokens,
+                images=stream.get("images"),
             )
         lists_for = inputs.get("anchor_partners")
-        answers, spans, tokens = loop.run_join(
-            torch,
-            arena,
-            pipeline,
-            async_answers,
-            inputs["prefixes"],
-            inputs["stage_suffixes"],
-            chunk_tokens,
-            stage_frames=stage_frames,
-            anchor_keys=inputs["anchor_keys"],
-            anchor_done=inputs["anchor_done"],
-            anchor_source=source,
-            anchor_partners=(
-                None if lists_for is None else lambda key: lists_for(key[1])),
-            anchor_batch=inputs.get("anchor_batch"),
-        )
+        try:
+            answers, spans, tokens = loop.run_join(
+                torch,
+                arena,
+                pipeline,
+                async_answers,
+                inputs["prefixes"],
+                inputs["stage_suffixes"],
+                chunk_tokens,
+                stage_frames=stage_frames,
+                anchor_keys=inputs["anchor_keys"],
+                anchor_done=inputs["anchor_done"],
+                anchor_source=source,
+                anchor_partners=(
+                    None if lists_for is None
+                    else lambda key: lists_for(key[1])),
+                anchor_batch=inputs.get("anchor_batch"),
+            )
+        finally:
+            if source is not None:
+                source.close()
         if source is not None:
             # admission order; a per-batch function may have dropped some
             anchor_ids = [key[1] for key in inputs["anchor_keys"]]
@@ -197,6 +206,7 @@ class QuailModelExecution:
                 stream["document_ids"],
                 gpu_s=_gpu_seconds(torch, source.spans, inputs),
                 chunks=_chunks(source.spans, inputs),
+                image_metrics=source.image_metrics,
             ))
         else:
             anchor_ids = list(inputs["anchor_ids"])

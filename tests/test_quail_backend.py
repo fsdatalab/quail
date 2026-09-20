@@ -287,11 +287,18 @@ def test_filter_execution_and_retention_inputs(monkeypatch):
     with monkeypatch.context() as patch:
         received = {}
 
-        def fake_run_filter(*args, retain_survivors, **kwargs):
-            received["retain_survivors"] = retain_survivors
-            return {0: [True]}, [], 3
+        class FakeStream:
+            def __init__(self, *args, retain_survivors, images=None, **kwargs):
+                received["retain_survivors"] = retain_survivors
+                received["images"] = images
+                self.answers, self.spans, self.tokens = {0: [True]}, [], 3
+                self.image_metrics = {"pages_rendered": 1}
 
-        patch.setattr("quail.backends.quail.executor.loop.run_filter", fake_run_filter)
+        patch.setattr("quail.backends.quail.executor.loop.FilterStream",
+                      FakeStream)
+        patch.setattr("quail.backends.quail.executor.loop.run_stream",
+                      lambda stream: (stream.answers, stream.spans,
+                                      stream.tokens))
         execution = QuailModelExecution(SimpleNamespace())
         execution.bind_loaded_model(
             model=object(), arena=FakeArena(), pipeline=SimpleNamespace()
@@ -313,11 +320,14 @@ def test_filter_execution_and_retention_inputs(monkeypatch):
                 "documents": [[1]],
                 "document_ids": [10],
                 "retain_survivors": False,
+                "images": "the image source",
             },
         )
 
         assert received["retain_survivors"] == ()
+        assert received["images"] == "the image source"
         assert result.outputs["ids:d"] == [10]
+        assert result.metrics.extension == {"images": {"pages_rendered": 1}}
 
 
 # ------------------------------------------------ streamed edges on a page arena
