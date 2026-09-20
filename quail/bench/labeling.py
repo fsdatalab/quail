@@ -77,7 +77,7 @@ after_write = _no_commit
 
 # Label counts follow from the table sizes each scale factor samples.
 # The hours use the 14,000 fresh tokens per second measured for the
-# BIO-2 join at 32B, so they are estimates until a pass confirms them.
+# BIO-2 join at 32B. These estimates exclude BIO-4's new term filters.
 _PREDICTIONS = {
     0.1: ("21 predicates need 1,210,264 labels: 993,450 model judgments "
           "through Quail and 216,814 source labels, about 1.5 H100 hours "
@@ -99,6 +99,12 @@ DERIVE_PREDICTION_TEXT = (
     "hash. The LePaRD citation join is recomputed from the smaller "
     "corpus; at sf=0.1 from sf=1.0, 2 of its 216,500 labels differ."
 )
+BIO4_PREDICTION_TEXT = (
+    "BIO-4 adds two filter labels per reaction term; "
+    "their time is not included in that estimate. "
+    "The rerun of 16 saved answers per predicate shows no differences, "
+    "and every workload finishes on one H100 without an out-of-memory failure."
+)
 
 
 def prediction_text(sf: float) -> str:
@@ -109,9 +115,7 @@ def prediction_text(sf: float) -> str:
         raise ValueError(
             f"scale factor {sf} is not one of {SUPPORTED_SCALE_FACTORS}"
         ) from error
-    return (f"At sf={sf}, {counts} The rerun of 16 saved answers per "
-            "predicate shows no differences, and every workload finishes "
-            "on one H100 without an out-of-memory failure.")
+    return f"At sf={sf}, {counts} {BIO4_PREDICTION_TEXT}"
 
 
 # One Quail query is one Parquet part, setting the resume granularity.
