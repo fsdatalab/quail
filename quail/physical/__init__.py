@@ -29,6 +29,7 @@ from .nodes import (
     HashJoin,
     JoinStage,
     Limit,
+    PDFScan,
     PhysicalScan,
     Project,
     Recombine,
@@ -44,6 +45,7 @@ from .nodes import (
 __all__ = [
     "AiJoin",
     "AiScore",
+    "PDFScan",
     "PhysicalScan",
     "TextScan",
     "Barrier",

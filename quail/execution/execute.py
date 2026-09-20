@@ -5,9 +5,16 @@ import time
 
 from quail.backends import BackendExecutionContext
 from quail.execution.session import RefusalError
-from quail.execution.types import PhysicalRequest, PhysicalResponse
+from quail.execution.types import (
+    PhysicalRequest,
+    PhysicalResponse,
+    TokenizedInput,
+)
+from quail.pdf import PDFInput
 from quail.physical import (
+    PDFScan,
     PhysicalScan,
+    TextScan,
     check_plan_envelope,
     decode_graph,
     validate_streams,
@@ -41,10 +48,8 @@ def _validate_physical_request(request, registry):
     graph.validate(runtime_keys=set(registry.runtimes))
     graph.validate_backend(envelope["backend"])
     validate_streams(graph)
-    needed_inputs = {
-        node.input_id for node in graph.nodes
-        if isinstance(node, PhysicalScan)
-    }
+    scans = [node for node in graph.nodes if isinstance(node, PhysicalScan)]
+    needed_inputs = {node.input_id for node in scans}
     missing = needed_inputs - set(request.inputs)
     extra = set(request.inputs) - needed_inputs
     if missing or extra:
@@ -52,7 +57,34 @@ def _validate_physical_request(request, registry):
             "execution request has wrong input bindings; "
             f"missing={sorted(missing)}, extra={sorted(extra)}"
         )
+    for node in scans:
+        check_scan_input(node, request.inputs[node.input_id])
     return graph, backend
+
+
+# the input each scan kind binds
+SCAN_INPUT_TYPES = {TextScan: TokenizedInput, PDFScan: PDFInput}
+
+
+def check_scan_input(node: PhysicalScan, value) -> None:
+    """Fail when a scan's bound input is of the wrong kind or shape."""
+    expected = SCAN_INPUT_TYPES.get(type(node))
+    if expected is None or not isinstance(value, expected):
+        raise TypeError(
+            f"scan {node.node_id!r} ({type(node).__name__}) is bound to "
+            f"{type(value).__name__}; it needs "
+            f"{expected.__name__ if expected else 'a known input type'}")
+    if len(value) != node.n_docs:
+        raise ValueError(
+            f"scan {node.node_id!r} plans {node.n_docs} documents but its "
+            f"input holds {len(value)}")
+    if isinstance(node, PDFScan) and (
+            value.row_mode != node.row_mode
+            or value.visual_tokens != node.visual_tokens):
+        raise ValueError(
+            f"scan {node.node_id!r} plans row_mode={node.row_mode!r} at "
+            f"{node.visual_tokens} visual tokens, but its input has "
+            f"row_mode={value.row_mode!r} at {value.visual_tokens}")
 
 
 def _execute_physical(request, registry):

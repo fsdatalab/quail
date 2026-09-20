@@ -12,6 +12,7 @@ import pyarrow.compute as pc
 
 from quail.execution.pairs import COLUMNS_PREFIX
 from quail.execution.tokens import decode_token_documents
+from quail.pdf import PDFInput
 from quail.physical import (
     AiFilter,
     OutputPort,
@@ -38,6 +39,10 @@ class TokenizedInput:
         return len(self.documents)
 
 
+# what a physical scan binds: text token documents or PDF page rows
+PreparedInput = TokenizedInput | PDFInput
+
+
 def document_input(tokens) -> TokenizedInput:
     """Build one physical input from a token document sequence."""
     return TokenizedInput(decode_token_documents(tokens))
@@ -45,23 +50,26 @@ def document_input(tokens) -> TokenizedInput:
 
 @dataclass(frozen=True)
 class PhysicalRequest:
-    """A physical plan, its token input bindings, and its relations.
+    """A physical plan, its scan input bindings, and its relations.
 
-    relations holds one value table per alias a HashJoin or an apply()
-    function reads, keyed ``columns:<alias>``; see quail.execution.pairs.
+    inputs holds one PreparedInput per scan input id: TokenizedInput
+    for a TextScan, PDFInput for a PDFScan. relations holds one value
+    table per alias a HashJoin or an apply() function reads, keyed
+    ``columns:<alias>``; see quail.execution.pairs.
     """
 
     plan: Mapping[str, Any]
-    inputs: Mapping[str, TokenizedInput]
+    inputs: Mapping[str, PreparedInput]
     relations: Mapping[str, pa.Table] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         for input_id, value in self.inputs.items():
             if not input_id:
                 raise ValueError("execution input ids cannot be empty")
-            if not isinstance(value, TokenizedInput):
+            if not isinstance(value, (TokenizedInput, PDFInput)):
                 raise TypeError(
-                    "physical execution inputs must be TokenizedInput values"
+                    "physical execution inputs must be TokenizedInput or "
+                    "PDFInput values"
                 )
         for key, value in self.relations.items():
             if not key.startswith(COLUMNS_PREFIX):
