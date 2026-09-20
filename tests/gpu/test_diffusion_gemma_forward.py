@@ -83,7 +83,7 @@ def test_expert_fusions_preserve_quantization(rows):
     torch.ops._C.gelu_tanh_and_mul(activated, gate_up)
     expected, scales = ops.scaled_fp8_quant(
         activated, use_per_token_if_dynamic=True)
-    actual, actual_scales = engine.gelu_mul_quant(gate_up, round_activation=True)
+    actual, actual_scales = engine.gelu_mul_quant_vllm(gate_up)
     torch.testing.assert_close(actual.float(), expected.float(), rtol=0, atol=0)
     torch.testing.assert_close(actual_scales, scales, rtol=0, atol=0)
 

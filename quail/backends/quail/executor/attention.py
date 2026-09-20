@@ -223,8 +223,15 @@ class Engine:
             num_warps=8 if head_dim > 256 else 4)
         return q, k, v
 
-    def gelu_mul_quant(self, gate_up, *, round_activation=False):
+    def gelu_mul_quant(self, gate_up):
         """gelu_tanh(gate) * up, quantized to fp8 with per-row scales."""
+        return self._gelu_mul_quant(gate_up, match_vllm_rounding=False)
+
+    def gelu_mul_quant_vllm(self, gate_up):
+        """Quantize GELU output after matching vLLM's BF16 rounding."""
+        return self._gelu_mul_quant(gate_up, match_vllm_rounding=True)
+
+    def _gelu_mul_quant(self, gate_up, *, match_vllm_rounding):
         n, doubled = gate_up.shape
         half = doubled // 2
         q = self.torch.empty((n, half), dtype=self.torch.float8_e4m3fn,
@@ -234,7 +241,7 @@ class Engine:
         self._triton_kernels()["gelu_quant"][(n,)](
             gate_up, q, scales, gate_up.stride(0), q.stride(0),
             HALF=half, BLOCK=1 << (half - 1).bit_length(),
-            ROUND_ACTIVATION=round_activation, num_warps=8)
+            match_vllm_rounding=match_vllm_rounding, num_warps=8)
         return q, scales
 
     def scale_add_norm_quant(self, x, residual, scale, weight, eps):
@@ -263,17 +270,17 @@ class Engine:
         """Return FP8 expert input, per-row scales, and BF16 router input."""
         return self._norm_rows2(x, weight, router_weight, eps, True)
 
-    def _norm_rows2(self, x, weight1, weight2, eps, quantize):
+    def _norm_rows2(self, x, weight1, weight2, eps, output_fp8):
         n, width = x.shape
-        dtype = self.torch.float8_e4m3fn if quantize else x.dtype
+        dtype = self.torch.float8_e4m3fn if output_fp8 else x.dtype
         first = self.torch.empty_like(x, dtype=dtype)
         second = self.torch.empty_like(x)
         scales = (self.torch.empty((n, 1), dtype=self.torch.float32,
-                                   device=x.device) if quantize else None)
+                                   device=x.device) if output_fp8 else None)
         self._triton_kernels()["norm2"][(n,)](
             x, weight1, weight2, first, second, scales, x.stride(0),
             first.stride(0), second.stride(0), eps, H=width,
-            BLOCK=1 << (width - 1).bit_length(), QUANTIZE=quantize,
+            BLOCK=1 << (width - 1).bit_length(), output_fp8=output_fp8,
             num_warps=8)
         return first, scales, second
 
@@ -467,7 +474,7 @@ class Engine:
         @triton.jit
         def gelu_mul_quant(gu_ptr, q_ptr, s_ptr, stride_gu, stride_q,
                            HALF: tl.constexpr, BLOCK: tl.constexpr,
-                           ROUND_ACTIVATION: tl.constexpr):
+                           match_vllm_rounding: tl.constexpr):
             t = tl.program_id(0)
             offs = tl.arange(0, BLOCK)
             mask = offs < HALF
@@ -475,7 +482,7 @@ class Engine:
                            other=0.0).to(tl.float32)
             up = tl.load(gu_ptr + t * stride_gu + HALF + offs, mask=mask,
                          other=0.0).to(tl.float32)
-            if ROUND_ACTIVATION:
+            if match_vllm_rounding:
                 # vLLM rounds GELU to BF16 before the gating multiplication.
                 cube = gate * gate * gate
                 inner = 0.7978845608028654 * (gate + 0.044715 * cube)
@@ -488,7 +495,7 @@ class Engine:
             # the unfused path rounds the activation to bf16 first
             y = y.to(tl.bfloat16).to(tl.float32)
             amax = tl.max(tl.abs(y), axis=0)
-            if ROUND_ACTIVATION:
+            if match_vllm_rounding:
                 scale = tl.maximum(tl.div_rn(amax, 448.0),
                                    1.0 / (448.0 * 512.0))
                 q = tl.div_rn(y, scale)
@@ -533,7 +540,7 @@ class Engine:
         @triton.jit
         def rms_norm2(x_ptr, w1_ptr, w2_ptr, o1_ptr, o2_ptr, s_ptr, stride_x,
                       stride_o1, stride_o2, eps, H: tl.constexpr,
-                      BLOCK: tl.constexpr, QUANTIZE: tl.constexpr):
+                      BLOCK: tl.constexpr, output_fp8: tl.constexpr):
             t = tl.program_id(0)
             # Keep the BF16 reduction order when one output becomes FP8.
             offs = tl.max_contiguous(tl.arange(0, BLOCK), 8)
@@ -545,7 +552,7 @@ class Engine:
             w1 = tl.load(w1_ptr + offs, mask=mask, other=0.0).to(tl.float32)
             w2 = tl.load(w2_ptr + offs, mask=mask, other=0.0).to(tl.float32)
             first = (xn * w1).to(x_ptr.dtype.element_ty)
-            if QUANTIZE:
+            if output_fp8:
                 # Preserve the BF16 intermediate's rounding before quantizing.
                 first = first.to(tl.float32)
                 scale = tl.maximum(tl.div_rn(tl.max(tl.abs(first), axis=0),

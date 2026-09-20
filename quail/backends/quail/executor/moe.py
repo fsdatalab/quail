@@ -70,8 +70,8 @@ class FP8Experts:
                 use_int4_w4a16=False, per_channel_quant=True)
 
         multiply(inputs, w1, gate_up, scales, self.quant.w1_scale, topk, False)
-        activated, activation_scales = self.engine.gelu_mul_quant(
-            gate_up.view(rows * topk, doubled), round_activation=True)
+        activated, activation_scales = self.engine.gelu_mul_quant_vllm(
+            gate_up.view(rows * topk, doubled))
         multiply(activated, w2, expert_out, activation_scales,
                  self.quant.w2_scale, 1, True)
         ops.moe_sum(expert_out, output)
