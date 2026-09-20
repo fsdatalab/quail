@@ -8,7 +8,7 @@ are searched over every feasible eager binary full left deep plan and
 anchor choice, with exact survivors from a caller supplied answer
 oracle at every step.
 
-The equations are in docs/content/docs/architecture/sol-model.mdx. The
+The equations are in docs/content/docs/architecture/planning.mdx. The
 work counting and component pricing are the planner's own
 (quail.cost.work, quail.cost.sol); the search does not call or
 simulate the production planner.
@@ -125,6 +125,8 @@ class SpeedOfLightEstimate:
             "bytes_moved": latency.bytes_moved,
             "tokens": self.work.tokens,
             "pairs": self.work.pairs,
+            "sliding_pairs": self.work.sliding_pairs,
+            "sliding_kv_read": self.work.sliding_kv_read,
             "kv_written": self.work.kv_written,
             "kv_read": self.work.kv_read,
             "components": [
@@ -185,6 +187,7 @@ class _Search:
         # a diffusion model answers on canvas rows appended to every
         # evaluation's suffix; a decoder answers on the suffix's last row
         self.canvas = model.canvas_tokens
+        self.window = model.sliding_window
         stores = query.token_inputs()
         operators = query.logical.operators()
         self.scans, self.filters, self.joins = (
@@ -243,9 +246,9 @@ class _Search:
         prefix = self.pre + data.tokens[row]
         shared_tokens = data.credits[row]
         if shared_tokens == 0:
-            return scan(prefix, suffix)
+            return scan(prefix, suffix, window=self.window)
         resident = self.pre + shared_tokens
-        return ask(resident, prefix - resident + suffix)
+        return ask(resident, prefix - resident + suffix, window=self.window)
 
     def join_stage_work(self, anchor, partners, survivors, prompt,
                         resident_rows, cross_resident_rows=(),
@@ -278,6 +281,7 @@ class _Search:
         work = Work()
         for row in survivors[anchor]:
             if allowed is None:
+                streamed = suffixes
                 suffix_tokens, suffix_triangles = all_tokens, all_triangles
             else:
                 mine = allowed.get(row, ())
@@ -287,14 +291,25 @@ class _Search:
                 suffix_tokens = sum(streamed)
                 suffix_triangles = sum(triangle(suffix) for suffix in streamed)
             prefix = self.pre + self.aliases[anchor].tokens[row]
-            work = work + (ask(prefix, frame) if row in resident_rows
+            work = work + (ask(prefix, frame, window=self.window)
+                           if row in resident_rows
                            else self.first_use(anchor, row, frame))
             anchor_prefix = prefix + frame
+            sliding_pairs = 0.0
+            if self.window:
+                sliding_pairs = (
+                    self.window * suffix_tokens if anchor_prefix >= self.window - 1
+                    else sum(triangle(anchor_prefix + suffix, self.window)
+                             - triangle(anchor_prefix, self.window)
+                             for suffix in streamed))
             work = work + Work(
                 tokens=suffix_tokens,
                 pairs=anchor_prefix * suffix_tokens + suffix_triangles,
                 kv_written=suffix_tokens,
                 kv_read=anchor_prefix,
+                sliding_pairs=sliding_pairs,
+                sliding_kv_read=(min(anchor_prefix, self.window - 1)
+                                 if self.window else 0.0),
             )
         return work
 
@@ -334,7 +349,7 @@ class _Search:
                         work = work + self.first_use(alias, row, suffix)
                     else:
                         prefix = self.pre + tokens[row]
-                        work = work + ask(prefix, suffix)
+                        work = work + ask(prefix, suffix, window=self.window)
                 if stage_index == 0:
                     computed.update(live)
                 passed = [

@@ -80,6 +80,8 @@ Quail backend how to plan and cost the new node. Concretely:
 
 1. **Work counting.** Add a function that counts fresh tokens,
    attention pairs, KV written, and KV read for the new operator.
+   Pass `window=model.sliding_window` to `scan`, `ask`, or `stream`
+   so you also count pairs and KV reads for sliding-window layers.
    For `AI.CLASSIFY`, the prefill work per document is the same as
    `AI_FILTER`. The difference is decode: generating each label
    token is an additional forward pass that attends to all previous

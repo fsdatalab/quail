@@ -136,13 +136,14 @@ def test_retention_costs_and_future_use():
 
     import pytest
 
+    from quail.backends.quail.retention import policy
     from quail.cost.retention import coefficients
     from quail.cost.sol import prefix_recompute_seconds
-    from quail.specs import H100_SXM, QWEN3_4B_FP8
+    from quail.specs import DIFFUSION_GEMMA_26B_FP8, H100_SXM, QWEN3_4B_FP8
 
-    policy = RetentionPolicy(**coefficients(QWEN3_4B_FP8, H100_SXM),
-                             uses={'a': (0.4, 2)})
-    for length in (1, 16, 17, 1000, 24000):
-        pages = -(-length // 16)
-        assert policy.priority(('a', 0), length, pages)[0] == pytest.approx(
-            0.4 * prefix_recompute_seconds(length, QWEN3_4B_FP8, H100_SXM) / pages)
+    for model in (QWEN3_4B_FP8, DIFFUSION_GEMMA_26B_FP8):
+        retained = policy(coefficients(model, H100_SXM), {'a': (0.4, 2)})
+        for length in (1, 16, 17, 1023, 1024, 1025, 24000):
+            pages = -(-length // 16)
+            assert retained.priority(('a', 0), length, pages)[0] == pytest.approx(
+                0.4 * prefix_recompute_seconds(length, model, H100_SXM) / pages)

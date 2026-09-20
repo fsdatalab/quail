@@ -44,14 +44,16 @@ def dense_params(model: ModelSpec) -> int:
     return attention_projection_params(model) + mlp_params(model)
 
 
-def flops_per_pair(model: ModelSpec) -> int:
-    """Return attention FLOPs per query and key pair in one layer."""
-    return 4 * model.n_q * model.d_head
-
-
-def kv_bytes_per_token(model: ModelSpec) -> float:
-    """Return bytes in one token's KV across every layer."""
-    return model.kappa
+def attention_pair_flops(model: ModelSpec) -> tuple[int, int]:
+    """Return FLOPs per pair across full layers and sliding layers."""
+    sliding = model.sliding_layer_set
+    full_flops = sliding_flops = 0
+    for layer, (_, head) in enumerate(model.kv_shapes):
+        if layer in sliding:
+            sliding_flops += 4 * model.n_q * head
+        else:
+            full_flops += 4 * model.n_q * head
+    return full_flops, sliding_flops
 
 
 def dense_decoder_components(work: Work, model: ModelSpec,
@@ -61,6 +63,7 @@ def dense_decoder_components(work: Work, model: ModelSpec,
         raise ValueError("passes must be nonnegative")
     attn_proj = attention_projection_params(model)
     mlp = mlp_params(model)
+    full_flops, sliding_flops = attention_pair_flops(model)
     return (
         CostComponent(
             name="attn_proj",
@@ -76,10 +79,10 @@ def dense_decoder_components(work: Work, model: ModelSpec,
         ),
         CostComponent(
             name="attention",
-            flops=(flops_per_pair(model) * work.pairs * model.layers),
+            flops=full_flops * work.pairs + sliding_flops * work.sliding_pairs,
             bytes_moved=(
-                kv_bytes_per_token(model)
-                * (work.kv_written + work.kv_read)),
+                model.kappa_full * (work.kv_written + work.kv_read)
+                + model.kappa_sliding * (work.kv_written + work.sliding_kv_read)),
             precision=model.attention_precision,
         ),
     )

@@ -7,6 +7,7 @@ of that KV as the arena holds and recomputes the rest.
 """
 
 import itertools
+from collections import Counter
 from dataclasses import dataclass
 
 from quail.cost.sol import speed_of_light
@@ -25,40 +26,64 @@ class KVState:
 
 @dataclass(frozen=True)
 class AliasStats:
-    """Document length sums used to cost one alias in constant time."""
+    """Length sums and counts below the attention window for one alias."""
 
     count: int
     total: int
     squared: int
     maximum: int
+    window: int = 0
+    short_counts: tuple[tuple[int, int], ...] = ()
 
     @property
     def mean(self) -> float:
         return self.total / self.count if self.count else 0.0
 
+    def window_pairs(self, offset: float) -> float:
+        """Sum sliding pairs for document lengths plus an offset."""
+        window = self.window
+        linear = window * (self.total + offset * self.count)
+        linear -= self.count * window * (window - 1) / 2
+        return linear + sum(
+            count * (triangle(length + offset)
+                     - window * (length + offset) + window * (window - 1) / 2)
+            for length, count in self.short_counts if length + offset < window)
 
-def summarize_alias(lengths) -> AliasStats:
+    def window_reads(self, offset: float) -> float:
+        """Sum retained prefix keys visible to the first suffix token."""
+        cap = self.window - 1
+        return self.count * cap - sum(
+            count * (cap - length - offset)
+            for length, count in self.short_counts if length + offset < cap)
+
+
+def summarize_alias(lengths, window: int = 0) -> AliasStats:
     """Summarize document lengths in one pass."""
     count = total = squared = maximum = 0
+    short_counts = Counter()
     for raw in lengths:
         length = int(raw)
         count += 1
         total += length
         squared += length * length
         maximum = max(maximum, length)
+        if length < window:
+            short_counts[length] += 1
     return AliasStats(
         count=count,
         total=total,
         squared=squared,
         maximum=maximum,
+        window=window,
+        short_counts=tuple(sorted(short_counts.items())),
     )
 
 
-def _alias_stats(lengths: dict) -> dict[str, AliasStats]:
+def _alias_stats(lengths: dict, window: int = 0) -> dict[str, AliasStats]:
     """Normalize raw length lists or accept summaries from a caller."""
     return {
         alias: (values if isinstance(values, AliasStats)
-                else summarize_alias(values))
+                else summarize_alias(values, window))
         for alias, values in lengths.items()
     }
 
@@ -168,15 +193,19 @@ def residency(anchor: str, state: KVState, resident_aliases,
 
 
 def stage_work(spec: dict, anchor: str, live: dict, lengths: dict,
-               pre: int, *, resident: bool = False) -> Work:
+               pre: int, *, resident: bool = False, window: int = 0) -> Work:
     """Expected Work of one stage at the current live counts.
 
     The length sums make the calculation constant time in the number
-    of documents. A resident prefix pays its frame only. A missing
-    prefix scans the preamble, document, and frame. Every tuple then
+    of documents without a window. With a window, it also visits the
+    distinct lengths below that window. A resident prefix pays its
+    frame only. A missing prefix scans the preamble, document, and frame.
+    Every tuple then
     carries partner labels, partner documents, and the answer cue.
     """
     stats = lengths[anchor]
+    if window != stats.window:
+        raise ValueError("length summaries must use the model attention window")
     n = live[anchor]
     tuples = cross_tuples(spec, live)
     if stats.count == 0 or n <= 0:
@@ -198,6 +227,9 @@ def stage_work(spec: dict, anchor: str, live: dict, lengths: dict,
             pairs=frame * prefix_sum + count * triangle(frame),
             kv_written=count * frame,
             kv_read=prefix_sum,
+            sliding_pairs=(stats.window_pairs(pre + frame) - stats.window_pairs(pre)
+                           if window else 0.0),
+            sliding_kv_read=stats.window_reads(pre) if window else 0.0,
         )
     else:
         scan_sum = prefix_sum + count * frame
@@ -207,6 +239,7 @@ def stage_work(spec: dict, anchor: str, live: dict, lengths: dict,
             tokens=scan_sum,
             pairs=(scan_squared + scan_sum) / 2,
             kv_written=scan_sum,
+            sliding_pairs=stats.window_pairs(pre + frame) if window else 0.0,
         )
     stream = Work(
         tokens=count * per_anchor * u,
@@ -215,6 +248,10 @@ def stage_work(spec: dict, anchor: str, live: dict, lengths: dict,
             + count * triangle(u)),
         kv_written=count * per_anchor * u,
         kv_read=prefix_sum + count * frame,
+        sliding_pairs=(per_anchor * (stats.window_pairs(pre + frame + u)
+                                    - stats.window_pairs(pre + frame))
+                       if window else 0.0),
+        sliding_kv_read=stats.window_reads(pre + frame) if window else 0.0,
     )
     return (start + stream) * frac
 
@@ -228,7 +265,7 @@ def walk(seq, live0: dict, lengths: dict, resident, pre: int,
     position, the anchor, the residency its cost assumed, and expected
     tuples and tokens.
     """
-    lengths = _alias_stats(lengths)
+    lengths = _alias_stats(lengths, model.sliding_window)
     resident = set(resident or ())
     state = KVState()
     total = Work()
@@ -245,7 +282,7 @@ def walk(seq, live0: dict, lengths: dict, resident, pre: int,
         kind = residency(anchor, state, resident, same_group)
         kept = lengths[anchor].count if kind != "none" else 0
         w = stage_work(spec, anchor, live, lengths, pre,
-                       resident=kind != "none")
+                       resident=kind != "none", window=model.sliding_window)
         records.append(dict(written_pos=spec["written_pos"],
                             anchor=anchor, resident=kind,
                             resident_docs=kept,
@@ -296,7 +333,7 @@ def search_joins(specs, live: dict, lengths: dict, resident,
         return dict(seq=[], records=[], work=Work(), states=0,
                     generated=0)
 
-    lengths = _alias_stats(lengths)
+    lengths = _alias_stats(lengths, model.sliding_window)
     resident = set(resident or ())
 
     def rank(work):
@@ -402,7 +439,8 @@ def search_joins(specs, live: dict, lengths: dict, resident,
                                      same_group)
                     kept = lengths[anchor].count if kind != "none" else 0
                     work = stage_work(spec, anchor, live_now, lengths, pre,
-                                      resident=kind != "none")
+                                      resident=kind != "none",
+                                      window=model.sliding_window)
                     step = dict(
                         written_pos=spec["written_pos"], anchor=anchor,
                         resident=kind, resident_docs=kept,

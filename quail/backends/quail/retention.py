@@ -5,7 +5,10 @@ from quail.cost.retention import RetentionPolicy
 
 def policy(config, uses):
     """Build the priority rule for one planned execution boundary."""
-    return RetentionPolicy(config["linear_seconds"], config["pair_seconds"], uses)
+    return RetentionPolicy(
+        config["linear_seconds"], config["pair_seconds"], uses,
+        sliding_pair_seconds=config.get("sliding_pair_seconds", 0.0),
+        sliding_window=config.get("sliding_window", 0))
 
 
 def apply_retention(arena, config, uses, survivors=None):

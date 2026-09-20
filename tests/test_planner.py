@@ -11,7 +11,7 @@ import quail
 from quail.backends.quail import expected_join_stages
 from quail.catalog import Catalog, DocumentProvider
 from quail.cost.sol import speed_of_light
-from quail.cost.work import Work, ask, scan, triangle
+from quail.cost.work import Work, ask, scan, stream, triangle
 from quail.frontend.builder import col, docs, prompt
 from quail.physical import (
     AiFilter,
@@ -268,6 +268,21 @@ def test_component_costs_and_model_weights():
     assert speed_of_light(
         work, larger_resident_copy, H100_SXM, 110_376).seconds \
         == pytest.approx(result.seconds)
+
+    from quail.cost.dense_decoder_cost import dense_decoder_components
+    from quail.specs import DIFFUSION_GEMMA_26B_FP8
+
+    model = DIFFUSION_GEMMA_26B_FP8
+    work = ask(4096, 16, window=model.sliding_window)
+    attention = dense_decoder_components(work, model, 1)[2]
+    assert attention.flops == 4 * 16 * (
+        5 * 512 * work.pairs + 25 * 256 * work.sliding_pairs)
+    assert attention.bytes_moved == (
+        5 * 2 * 2 * 512 * 2 * (16 + 4096)
+        + 25 * 2 * 8 * 256 * 2 * (16 + 1023))
+    assert work + work == work * 2
+    assert not work.dominates(replace(work, sliding_pairs=work.sliding_pairs - 1))
+    assert not work.dominates(replace(work, sliding_kv_read=1022))
 
 
 def test_join_anchors_groups_and_forced_order(catalog):
@@ -717,7 +732,8 @@ def test_join_search_residency_and_replanning():
                for record in found["records"])
 
 
-def test_aggregate_join_work_matches_per_document_sum():
+@pytest.mark.parametrize("window", [0, 128])
+def test_aggregate_join_work_matches_per_document_sum(window):
     import pytest
 
     from quail.planner.joins import stage_work, summarize_alias
@@ -725,8 +741,8 @@ def test_aggregate_join_work_matches_per_document_sum():
     live = {"a": 2.25, "b": 3.5}
     raw = {"a": [90, 100, 110], "b": [30, 50, 70, 90]}
     stats = {
-        "a": summarize_alias(raw["a"]),
-        "b": summarize_alias(raw["b"]),
+        "a": summarize_alias(raw["a"], window),
+        "b": summarize_alias(raw["b"], window),
     }
 
     def per_document(resident):
@@ -740,25 +756,31 @@ def test_aggregate_join_work_matches_per_document_sum():
         total = Work()
         for position, document in enumerate(raw["a"]):
             prefix = 10 + document
-            start = (ask(prefix, frame) if resident
-                     else scan(prefix, frame))
+            start = (ask(prefix, frame, window=window) if resident
+                     else scan(prefix, frame, window=window))
             stream = Work(
                 tokens=per_anchor * suffix,
                 pairs=per_anchor * (
                     suffix * (prefix + frame) + triangle(suffix)),
                 kv_written=per_anchor * suffix,
                 kv_read=prefix + frame,
+                sliding_pairs=(per_anchor * mask_pairs(
+                    prefix + frame, int(suffix), window) if window else 0),
+                sliding_kv_read=min(prefix + frame, window - 1) if window else 0,
             )
             total = total + (start + stream) * fraction
         return total
 
     for resident in (False, True):
-        actual = stage_work(spec, "a", live, stats, 10, resident=resident)
+        actual = stage_work(spec, "a", live, stats, 10,
+                            resident=resident, window=window)
         expected = per_document(resident)
         assert actual.tokens == pytest.approx(expected.tokens)
         assert actual.pairs == pytest.approx(expected.pairs)
         assert actual.kv_written == pytest.approx(expected.kv_written)
         assert actual.kv_read == pytest.approx(expected.kv_read)
+        assert actual.sliding_pairs == pytest.approx(expected.sliding_pairs)
+        assert actual.sliding_kv_read == pytest.approx(expected.sliding_kv_read)
 
 
 def test_explain_estimates_and_limits(catalog):
@@ -979,3 +1001,29 @@ def test_node_ids_estimates_and_the_recompute_column(catalog):
     assert [node.node_id for node in moved.nodes][:4] == [
         "scan:r", "scan:p", "barrier:r", "ai_filter:r"]
     assert moved.graph.node("ai_filter:r").pin_survivors
+
+
+def mask_pairs(prefix, suffix, window):
+    """Count allowed keys for every new query position."""
+    return sum(1 for q in range(prefix, prefix + suffix) for k in range(q + 1)
+               if not window or q - k < window)
+
+
+def test_work_matches_attention_masks():
+    for window, prefix, suffix in ((0, 2, 4), (1, 9, 3), (4, 0, 3),
+                                  (4, 2, 4), (4, 4, 1), (4, 9, 3)):
+        first = scan(prefix, suffix, window=window)
+        continuation = ask(prefix, suffix, window=window)
+        assert first.pairs == mask_pairs(0, prefix + suffix, 0)
+        assert continuation.pairs == mask_pairs(prefix, suffix, 0)
+        assert first.sliding_pairs == (
+            mask_pairs(0, prefix + suffix, window) if window else 0)
+        assert continuation.sliding_pairs == (
+            mask_pairs(prefix, suffix, window) if window else 0)
+        assert continuation.sliding_kv_read == (
+            min(prefix, window - 1) if window else 0)
+        branches = stream(prefix, [suffix, suffix + 1], window=window)
+        assert branches.sliding_pairs == (
+            sum(mask_pairs(prefix, s, window) for s in (suffix, suffix + 1))
+            if window else 0)
+        assert branches.sliding_kv_read == continuation.sliding_kv_read

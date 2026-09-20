@@ -159,7 +159,7 @@ def plan_request_backend(
         search_specs,
         live,
         {
-            alias: summarize_alias(lengths)
+            alias: summarize_alias(lengths, context.model.sliding_window)
             for alias, lengths in context.document_tokens.items()
         },
         {},
