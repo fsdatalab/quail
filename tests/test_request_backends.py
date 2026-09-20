@@ -1,12 +1,14 @@
 """CPU tests for vLLM and SGLang backend interfaces."""
 
 import asyncio
+import sys
 from dataclasses import replace
 from functools import partial
 from types import SimpleNamespace
 
 import numpy as np
 import pyarrow as pa
+import pytest
 
 import quail
 from quail.backends import pipelined_sglang_backend, stock_vllm_backend
@@ -445,6 +447,43 @@ def test_vllm_engine_settings_follow_the_model():
     assert sampling_kwargs([1, 2], canvas_tokens=1) == {
         "max_tokens": 1, "logprobs": -1, "detokenize": False}
     assert sampling_kwargs([1, 2], canvas_tokens=256) == {"max_tokens": 16}
+
+
+def test_vllm_canvas_matches_quail_after_boot_and_slot_reuse(monkeypatch):
+    from quail.backends.quail.executor.models.diffusion_gemma import canvas_token_ids
+    from quail.backends.vllm import diffusion_canvas
+    from quail.specs import DIFFUSION_GEMMA_26B_FP8
+
+    spec = DIFFUSION_GEMMA_26B_FP8
+
+    class States:
+        canvas_length = 1
+        vocab_size = spec.vocab
+
+        def __init__(self):
+            self.canvas = np.full((4, 1), -1, dtype=np.int64)
+
+    module = SimpleNamespace(DiffusionGemmaRequestStates=States)
+    monkeypatch.setitem(sys.modules, "vllm.model_executor.models",
+                        SimpleNamespace(diffusion_gemma=module))
+    with diffusion_canvas(spec) as tokens:
+        states = module.DiffusionGemmaRequestStates()
+    assert module.DiffusionGemmaRequestStates is States
+    assert tokens == canvas_token_ids(spec.vocab, 1)
+    states.init_canvas(np.array([3, 1]))
+    assert states.canvas[:, 0].tolist() == [-1, tokens[0], -1, tokens[0]]
+    states.canvas[1] = 42
+    states.init_canvas(np.array([1]))
+    assert states.canvas[1, 0] == tokens[0]
+    states.vocab_size = 100
+    with pytest.raises(ValueError, match="canvas geometry"):
+        states.init_canvas(np.array([0]))
+    with pytest.raises(RuntimeError, match="boot failed"), diffusion_canvas(spec):
+        raise RuntimeError("boot failed")
+    assert module.DiffusionGemmaRequestStates is States
+    with diffusion_canvas(QWEN3_4B_FP8) as tokens:
+        assert tokens == ()
+        assert module.DiffusionGemmaRequestStates is States
 
 
 def test_diffusion_filter_and_join_use_scores_instead_of_sampled_tokens():

@@ -89,28 +89,18 @@ def stock_rows_main(out_path, every_layer=False):
     # keep the engine in this process so the hook sees the forward
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     from vllm import LLM, SamplingParams
-    from vllm.model_executor.models import diffusion_gemma as vllm_model
 
-    from quail.backends.quail.executor.models.diffusion_gemma import (
-        canvas_token_ids,
-    )
+    from quail.backends.vllm import diffusion_canvas
     from quail.specs import MODELS
 
     prompts = _prompt_ids()
     spec = MODELS[MODEL]
     assert spec.canvas_tokens == 1
-    token = canvas_token_ids(spec.vocab, spec.canvas_tokens)[0]
-
-    def init_canvas(self, slot_indices_np):
-        self.canvas[slot_indices_np] = torch.full(
-            (slot_indices_np.shape[0], self.canvas_length), token,
-            dtype=torch.int64, device=self.device)
-
-    vllm_model.DiffusionGemmaRequestStates.init_canvas = init_canvas
-    llm = LLM(model=spec.hf_name, gpu_memory_utilization=0.9,
-              enforce_eager=True, enable_prefix_caching=False,
-              diffusion_config={"canvas_length": 1, "max_denoising_steps": 1},
-              disable_log_stats=True)
+    with diffusion_canvas(spec):
+        llm = LLM(model=spec.hf_name, gpu_memory_utilization=0.9,
+                  enforce_eager=True, enable_prefix_caching=False,
+                  diffusion_config={"canvas_length": 1, "max_denoising_steps": 1},
+                  disable_log_stats=True)
     captured = {}
 
     def recorder(index):

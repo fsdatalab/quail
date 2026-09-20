@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import time
+from contextlib import contextmanager
 
 from quail.backends.request import RequestBackend
 from quail.backends.request_scheduling import (
@@ -24,6 +25,40 @@ DIFFUSION_LOGPROBS = -1
 # generated tokens a longer canvas gets; the answer word is read
 # from the text
 DIFFUSION_TEXT_TOKENS = 16
+
+
+@contextmanager
+def diffusion_canvas(spec):
+    """Initialize a one-token vLLM canvas with Quail's fixed token.
+
+    Yields:
+        The initial canvas token IDs, or an empty tuple for other models.
+    """
+    if spec.canvas_tokens != 1:
+        yield ()
+        return
+    from vllm.model_executor.models import diffusion_gemma
+
+    from quail.backends.quail.executor.models.diffusion_gemma import (
+        canvas_token_ids,
+    )
+
+    tokens = canvas_token_ids(spec.vocab, spec.canvas_tokens)
+    original = diffusion_gemma.DiffusionGemmaRequestStates
+
+    class FixedCanvasStates(original):
+        def init_canvas(self, slots):
+            if self.canvas_length != 1 or self.vocab_size != spec.vocab:
+                raise ValueError("vLLM canvas geometry differs from the model spec")
+            self.canvas[slots] = tokens[0]
+
+    # vLLM 0.26 has no public canvas-input setting. Instances retain this
+    # subclass after construction; later engines see the original class.
+    diffusion_gemma.DiffusionGemmaRequestStates = FixedCanvasStates
+    try:
+        yield tokens
+    finally:
+        diffusion_gemma.DiffusionGemmaRequestStates = original
 
 
 def _capacity(llm) -> dict:
@@ -148,7 +183,8 @@ class VLLMEngine:
             # /results/ablations/diffusion_gemma_readout_probe_agent_k0_corpus_mp.json)
             os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         started = time.perf_counter()
-        llm = LLM(model=spec.hf_name, **self.llm_kwargs(spec))
+        with diffusion_canvas(spec) as canvas_ids:
+            llm = LLM(model=spec.hf_name, **self.llm_kwargs(spec))
         boot_s = time.perf_counter() - started
         sampling_params = SamplingParams(
             **sampling_kwargs(allowed_ids, spec.canvas_tokens))
@@ -157,6 +193,7 @@ class VLLMEngine:
         capacity.update(
             enable_prefix_caching=cache.enable_prefix_caching,
             canvas_length=spec.canvas_tokens,
+            initial_canvas_token_ids=list(canvas_ids),
             max_denoising_steps=1 if spec.canvas_tokens == 1 else None,
             logprobs=sampling_params.logprobs,
         )
