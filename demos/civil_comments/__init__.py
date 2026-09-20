@@ -180,10 +180,11 @@ def accuracy_summary(
 
 def requested_input_tokens(
     comments: pa.Table,
-    survivor_ids: set[str],
+    filter_ids: set[str],
+    join_ids: set[str],
     model_name: str = "RedHatAI/diffusiongemma-26B-A4B-it-FP8-dynamic",
 ) -> int:
-    """Count full Quail prompt tokens for this logical workload.
+    """Count full Quail prompt tokens for evaluated predicates.
 
     This is the comparison throughput numerator. It counts the complete
     prompt for every evaluated question, including a comment's shared
@@ -215,14 +216,6 @@ def requested_input_tokens(
     texts = comments["text"].to_pylist()
     ids = comments["comment_id"].to_pylist()
     comment_lengths = np.asarray([len(tokenizer(text)) for text in texts])
-    total = int(
-        (
-            filter_prompt.preamble_tokens
-            + comment_lengths
-            + filter_prompt.tail_tokens
-            + model.canvas_tokens
-        ).sum()
-    )
     labels = {
         alias: (label, frame) for alias, label, frame in join_prompt.labels
     }
@@ -230,6 +223,7 @@ def requested_input_tokens(
         len(tokenizer(f"The comment {value}."))
         for value in FIELDS.values()
     ])
+    total = 0
     pair_fixed = (
         join_prompt.preamble_tokens
         + labels["c"][1]
@@ -239,10 +233,16 @@ def requested_input_tokens(
     )
     field_sum = int(field_lengths.sum())
     for index, comment_id in enumerate(ids):
-        if comment_id not in survivor_ids:
-            continue
-        total += len(field_lengths) * (
-            pair_fixed + int(comment_lengths[index])
-        )
-        total += field_sum
+        if comment_id in filter_ids:
+            total += (
+                filter_prompt.preamble_tokens
+                + int(comment_lengths[index])
+                + filter_prompt.tail_tokens
+                + model.canvas_tokens
+            )
+        if comment_id in join_ids:
+            total += len(field_lengths) * (
+                pair_fixed + int(comment_lengths[index])
+            )
+            total += field_sum
     return total

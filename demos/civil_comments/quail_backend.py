@@ -1,8 +1,8 @@
 """Run the Civil Comments comparison query with Quail.
 
-The query filters comments for toxicity, then evaluates 31 field
-statements on each survivor. The package initializer shares the labels,
-questions, and deterministic sample with the Jev backend.
+The query joins comments to 31 field statements, then filters for
+toxicity. The package initializer shares the labels, questions, and
+deterministic sample with the Jev backend.
 
 Run one or two H100s from the repository root:
 
@@ -49,7 +49,7 @@ image = gpu_image(("demos", "/root/demos")).add_local_python_source("demos")
 
 
 def build_sql() -> str:
-    """Return the shared filter-then-join query."""
+    """Return the shared Civil Comments query."""
     return f"""
     SELECT c.comment_id, f.field
     FROM comments c

@@ -1,8 +1,8 @@
 """Run the Civil Comments comparison query with Jev.
 
-This runs the same filter-then-join plan, sample, label cutoff, and
-question text as the Quail backend. Jev's ``noul`` probability is TRUE
-when it is at least 0.5.
+This follows the SQL text's join-then-filter order with the same sample,
+label cutoff, and question text as the Quail backend. Jev's ``noul``
+probability is TRUE when it is at least 0.5.
 
 Set the API key without putting it on the command line, then run:
 
@@ -246,9 +246,32 @@ async def evaluate(
         )
     )
 
+    all_comments = list(zip(ids, texts))
+    join_rows, join_s = await run_pass(
+        "join",
+        [
+            (comment_id, {"DOCUMENT 0": text})
+            for comment_id, text in all_comments
+        ],
+        JOIN_QUESTIONS,
+        output / "join.jsonl",
+        concurrency,
+    )
+    joined_ids = {
+        comment_id
+        for comment_id, row in join_rows.items()
+        if any(
+            probability >= LABEL_CUTOFF
+            for probability in row["answers"].values()
+        )
+    }
     filter_rows, filter_s = await run_pass(
         "filter",
-        list(zip(ids, texts)),
+        [
+            (comment_id, text)
+            for comment_id, text in all_comments
+            if comment_id in joined_ids
+        ],
         FILTER_QUESTIONS,
         output / "filter.jsonl",
         concurrency,
@@ -258,22 +281,11 @@ async def evaluate(
         for comment_id, row in filter_rows.items()
         if row["answers"]["toxicity"] >= LABEL_CUTOFF
     }
-    join_items = [
-        (comment_id, {"DOCUMENT 0": text})
-        for comment_id, text in zip(ids, texts)
-        if comment_id in toxic_found
-    ]
-    join_rows, join_s = await run_pass(
-        "join",
-        join_items,
-        JOIN_QUESTIONS,
-        output / "join.jsonl",
-        concurrency,
-    )
     query_s = filter_s + join_s
     pairs_found = {
         (comment_id, field)
         for comment_id, row in join_rows.items()
+        if comment_id in toxic_found
         for field, probability in row["answers"].items()
         if probability >= LABEL_CUTOFF
     }
@@ -282,10 +294,15 @@ async def evaluate(
         row["input_tokens"]
         for row in [*filter_rows.values(), *join_rows.values()]
     )
-    logical_input_tokens = requested_input_tokens(comments, toxic_found)
+    logical_input_tokens = requested_input_tokens(
+        comments,
+        filter_ids=joined_ids,
+        join_ids=set(ids),
+    )
     summary = {
         "backend": "jev",
         "model": MODEL,
+        "plan_order": "join_then_filter",
         "comments": len(ids),
         "concurrency": concurrency,
         "wall_s": query_s,
@@ -300,7 +317,8 @@ async def evaluate(
             * USD_PER_MILLION_INPUT_TOKENS
             / 1_000_000
         ),
-        "evaluated_pairs": len(toxic_found) * len(FIELDS),
+        "evaluated_pairs": len(ids) * len(FIELDS),
+        "filter_evaluated_comments": len(joined_ids),
         "accuracy": accuracy,
         "field_counts": dict(Counter(field for _, field in pairs_found)),
         "result_path": str(output),
