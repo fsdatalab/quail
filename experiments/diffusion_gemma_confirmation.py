@@ -6,7 +6,7 @@ Run from the repository root and tee every line:
       --prediction "State the expected results before starting." \
       2>&1 | tee results/diffusion-gemma-confirmation.log
 
-Three cells, each on its own H100:
+Four cells, each on its own H100:
 
 - probe: load the fp8 checkpoint through Quail's loader, print the
   loaded footprint and the module facts the pipeline relies on.
@@ -24,7 +24,7 @@ The cells write these files to the quail-results volume:
 
     /results/ablations/diffusion_gemma_confirmation_probe.json
     /results/ablations/diffusion_gemma_confirmation.json
-    /results/ablations/diffusion_gemma_confirmation_channel.json  (--layout channel)
+    /results/ablations/diffusion_gemma_confirmation_channel1.json  (--layout channel1)
     /results/ablations/diffusion_gemma_confirmation_long.json
     /results/ablations/diffusion_gemma_reference.json
 """
@@ -89,27 +89,15 @@ def _save(name: str, value: dict) -> str:
     return path
 
 
-# Prompt layouts the confirm cell can run. "turn" is the spec as
-# registered: the model writes its empty thinking channel inside the
-# canvas and the answer is read at canvas row 4. "channel" prefills
-# that channel into the prompt and reads the first canvas row.
+# Prompt layouts the confirm and long cells can run. "turn" is the
+# registered spec: the empty thinking channel prefilled in the prompt
+# and a one-row canvas. "canvas256" is the checkpoint's own layout:
+# the model writes the channel inside a 256-row canvas and the answer
+# is read at canvas row 4.
 LAYOUTS = {
     "turn": {},
-    "channel": {"turn_suffix": "<turn|>\n<|turn>model\n"
-                               "<|channel>thought\n<channel|>",
-                "canvas_answer_row": 0},
-    # shorter canvases than the checkpoint's 256: the answer stays at
-    # row 4, after the model's empty thinking channel
-    "canvas32": {"canvas_tokens": 32},
-    "canvas8": {"canvas_tokens": 8},
-    # the shortest canvas that still holds the channel and the answer row
-    "canvas5": {"canvas_tokens": 5},
-    # the channel prefilled in the prompt and a one-row canvas
-    "channel1": {"turn_suffix": "<turn|>\n<|turn>model\n"
-                                "<|channel>thought\n<channel|>",
-                 "canvas_answer_row": 0, "canvas_tokens": 1},
-    # no canvas: the answer is read at the prompt's last row
-    "canvas0": {"canvas_tokens": 0, "canvas_answer_row": 0},
+    "canvas256": {"turn_suffix": "<turn|>\n<|turn>model\n",
+                  "canvas_tokens": 256, "canvas_answer_row": 4},
 }
 
 

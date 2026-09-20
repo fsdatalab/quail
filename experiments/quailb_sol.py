@@ -10,7 +10,7 @@ the volume (`modal volume get quail-results benchmarks/quailb/data/sf0.1 $W`):
 
     uv run python experiments/quailb_sol.py $W/sf0.1
         --collection gt_be81cb241d74555dc2da79b5b0662554
-        --model qwen3-4b-fp8 --model diffusion-gemma-26b-a4b-fp8-canvas8
+        --model qwen3-4b-fp8 --model diffusion-gemma-26b-a4b-fp8-canvas256
         --query IMDB-1,IMDB-2
 
 (one command; the options continue the first line)

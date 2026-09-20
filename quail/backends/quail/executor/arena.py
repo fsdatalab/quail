@@ -244,8 +244,6 @@ class KVArena:
         self.accounting = PageArena(n_pages, page_tokens)
         self.sliding = (PageArena(n_sliding_pages, page_tokens)
                         if self.sliding_layers else None)
-        self._ratio = (n_pages / n_sliding_pages if self.sliding is not None
-                       else 1.0)
         self.k, self.v = [], []
         for layer, (heads, dim) in enumerate(self.shapes):
             pages = n_sliding_pages if layer in self.sliding_layers else n_pages
@@ -449,11 +447,15 @@ class KVArena:
                           - len(self.sliding.owned[key]))
                       if self.sliding is not None else 0)
             self._evict_for_pages(need, need_s)
-            grown = self.accounting.grow(key, capacity)
-            if grown is not None and self.sliding is not None:
-                grown = self.sliding.grow(key, capacity_s)
-            if grown is None:
+            # neither pool grows unless both can, so a refusal leaves
+            # the key as it was
+            if need > self.accounting.free_pages or (
+                    self.sliding is not None
+                    and need_s > self.sliding.free_pages):
                 return None
+            self.accounting.grow(key, capacity)
+            if self.sliding is not None:
+                self.sliding.grow(key, capacity_s)
             self.accounting.tokens[key] = tokens
             if self.sliding is not None:
                 self.sliding.tokens[key] = tokens - self._sliding_start[key]
@@ -503,7 +505,8 @@ class KVArena:
         free = self.accounting.free_pages
         if self.sliding is None:
             return free
-        return min(free, int(self.sliding.free_pages * self._ratio))
+        return min(free, self.sliding.free_pages * self.accounting.n_pages
+                   // self.sliding.n_pages)
 
     def page_cost(self, tokens: int, base_tokens: int | None = None) -> int:
         """Pages a key of `tokens` rows takes, in every-token pages.
@@ -528,12 +531,9 @@ class KVArena:
             len(self.sliding.owned[key])))
 
     def _as_every_token_pages(self, sliding_pages: int) -> int:
-        """Sliding pages converted at the pools' size ratio, rounded up.
-
-        The product is taken in fixed point so an exact ratio never
-        rounds up from float error.
-        """
-        return -(-int(sliding_pages * self._ratio * 2**20) // 2**20)
+        """Sliding pages converted at the pools' size ratio, rounded up."""
+        return -(-sliding_pages * self.accounting.n_pages
+                 // self.sliding.n_pages)
 
     @property
     def retained_pages(self) -> int:

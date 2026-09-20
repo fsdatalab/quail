@@ -14,7 +14,7 @@ MAX_SEQUENCES = 4_096
 MAX_BATCHED_TOKENS = 25_305
 
 
-_ANSWER_WORD = re.compile(r"\b(TRUE|FALSE)\b")
+_ANSWER_WORD = re.compile(r"\b(TRUE|FALSE)\b", re.IGNORECASE)
 _WHOLE_ANSWER_WORD = re.compile(r"^\s*(TRUE|FALSE)\s*$", re.IGNORECASE)
 
 
@@ -55,7 +55,7 @@ def true_bit(output, true_ids) -> int:
     if ranked is not None:
         return ranked
     match = _ANSWER_WORD.search(getattr(completion, "text", "") or "")
-    return int(match is not None and match.group(1) == "TRUE")
+    return int(match is not None and match.group(1).upper() == "TRUE")
 
 
 def filter_document_cap(

@@ -44,7 +44,8 @@ def test_arena_pages_split_follows_document_length():
     assert full_long > 5 * full_short
     assert sliding_long < sliding_short
     assert sliding_long >= budgets.transient_sliding_pages(
-        budgets.chunk_budget(DIFFUSION_GEMMA_26B_FP8, H100_SXM))
+        budgets.chunk_budget(DIFFUSION_GEMMA_26B_FP8, H100_SXM),
+        DIFFUSION_GEMMA_26B_FP8.sliding_window)
     assert budgets.arena_pages(QWEN3_4B_FP8, H100_SXM)[1] == 0
 
 

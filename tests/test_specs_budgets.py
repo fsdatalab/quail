@@ -40,7 +40,8 @@ def test_arena_pages_needs_room_for_one_chunk_of_sliding_kv():
 
     full, sliding = budgets.arena_pages(DIFFUSION_GEMMA_26B_FP8, H100_SXM)
     assert full > 0 and sliding >= budgets.transient_sliding_pages(
-        budgets.chunk_budget(DIFFUSION_GEMMA_26B_FP8, H100_SXM))
+        budgets.chunk_budget(DIFFUSION_GEMMA_26B_FP8, H100_SXM),
+        DIFFUSION_GEMMA_26B_FP8.sliding_window)
     small = replace(H100_SXM, mem_bytes=40e9)
     with pytest.raises(ValueError, match="one chunk's sliding KV"):
         budgets.arena_pages(DIFFUSION_GEMMA_26B_FP8, small)

@@ -75,10 +75,13 @@ class DiffusionGemmaPipeline(ModelPipeline):
     # the engine's fp8 GEMM inputs, which this model does not use
     join_attention = "unified"
     gemm_warmup = False
+    # plus the Triton fused MoE kernel's row buckets between the small
+    # chunks and the full budget: a join's deferred or trailing chunk
+    # lands in one, and its first use compiles the kernel
+    warm_tokens = ModelPipeline.warm_tokens + (4096, 8192, 16384, 32768)
 
     def __init__(self, model, arena, *, spec, engine_class=Engine):
         backbone = model.model
-        self.spec = spec
         self.layers = backbone.layers
         self.embed = backbone.embed_tokens
         self.normalizer = backbone.normalizer
@@ -115,11 +118,6 @@ class DiffusionGemmaPipeline(ModelPipeline):
         self.scales = [float(layer.layer_scalar) for layer in self.layers]
         self.canvas_ids = canvas_token_ids(spec.vocab, spec.canvas_tokens)
         # an empty canvas reads the answer at the prompt's last row
-        if spec.canvas_tokens and not (
-                0 <= spec.canvas_answer_row < spec.canvas_tokens):
-            raise ValueError(
-                f"canvas_answer_row {spec.canvas_answer_row} is outside "
-                f"the {spec.canvas_tokens}-row canvas")
         self.canvas_answer_row = (spec.canvas_answer_row
                                   if spec.canvas_tokens else 0)
         _init_moe_workspace()
@@ -185,9 +183,9 @@ class DiffusionGemmaPipeline(ModelPipeline):
     # scalars are folded into the post-feedforward norm weights at
     # build time.
 
-    def _norm_quant(self, x, norm, residual=None):
+    def _norm_quant(self, x, norm):
         return self.engine.norm_quant_rows(x, norm.weight,
-                                           norm.variance_epsilon, residual)
+                                           norm.variance_epsilon)
 
     def _layers(self, hidden, positions, meta):
         engine = self.engine

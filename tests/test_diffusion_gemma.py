@@ -353,36 +353,12 @@ def test_pipeline_runs_the_gemma4_layer_order(monkeypatch):
     kernels against stock vLLM layer by layer.
     """
     torch = pytest.importorskip("torch")
-    context = types.ModuleType("vllm.forward_context")
-    seen = {}
-
-    @contextlib.contextmanager
-    def set_forward_context(attn_metadata, vllm_config, num_tokens=None):
-        seen["context"] = (vllm_config, num_tokens)
-        yield
-
-    context.set_forward_context = set_forward_context
-    workspace = types.ModuleType("vllm.v1.worker.workspace")
-    workspace.is_workspace_manager_initialized = lambda: False
-    workspace.init_workspace_manager = lambda device: seen.setdefault(
-        "workspace", str(device))
-    monkeypatch.setitem(sys.modules, "vllm.forward_context", context)
-    monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
-    monkeypatch.setitem(sys.modules, "vllm.v1", types.ModuleType("vllm.v1"))
-    monkeypatch.setitem(sys.modules, "vllm.v1.worker",
-                        types.ModuleType("vllm.v1.worker"))
-    monkeypatch.setitem(sys.modules, "vllm.v1.worker.workspace", workspace)
-
+    seen = _vllm_stubs(monkeypatch, workspace_ready=False)
     spec = _spec_for(_fake_model(torch), canvas_tokens=3, canvas_answer_row=1)
     pipeline = DiffusionGemmaPipeline(_fake_model(torch), None, spec=spec,
                                       engine_class=_Engine)
     assert len(pipeline.canvas_ids) == 3
     assert pipeline.canvas_answer_row == 1
-    with pytest.raises(ValueError, match="canvas_answer_row"):
-        DiffusionGemmaPipeline(
-            _fake_model(torch), None, engine_class=_Engine,
-            spec=_spec_for(_fake_model(torch), canvas_tokens=3,
-                           canvas_answer_row=3))
     with pytest.raises(ValueError, match="geometry"):
         DiffusionGemmaPipeline(
             _fake_model(torch), None, engine_class=_Engine,
@@ -413,22 +389,28 @@ def test_pipeline_runs_the_gemma4_layer_order(monkeypatch):
     assert out.tolist() == [[3.0] * 4, [3.0] * 4]
 
 
-def _vllm_stubs(monkeypatch):
+def _vllm_stubs(monkeypatch, workspace_ready=True):
+    """Stub the vLLM modules the pipeline imports; returns what they saw."""
+    seen = {}
     context = types.ModuleType("vllm.forward_context")
 
     @contextlib.contextmanager
     def set_forward_context(attn_metadata, vllm_config, num_tokens=None):
+        seen["context"] = (vllm_config, num_tokens)
         yield
 
     context.set_forward_context = set_forward_context
     workspace = types.ModuleType("vllm.v1.worker.workspace")
-    workspace.is_workspace_manager_initialized = lambda: True
+    workspace.is_workspace_manager_initialized = lambda: workspace_ready
+    workspace.init_workspace_manager = lambda device: seen.setdefault(
+        "workspace", str(device))
     monkeypatch.setitem(sys.modules, "vllm.forward_context", context)
     monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
     monkeypatch.setitem(sys.modules, "vllm.v1", types.ModuleType("vllm.v1"))
     monkeypatch.setitem(sys.modules, "vllm.v1.worker",
                         types.ModuleType("vllm.v1.worker"))
     monkeypatch.setitem(sys.modules, "vllm.v1.worker.workspace", workspace)
+    return seen
 
 
 def test_layer_scalars_fold_into_the_post_feedforward_norms(monkeypatch):

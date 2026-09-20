@@ -20,7 +20,8 @@ geometry calls attention_unified directly with (rows, heads, dim)
 tensors, its own softmax scale, and its sliding window.
 
 The fused qk_norm_rope kernel assumes per-head Q and K RMSNorm before
-rotary, as Qwen3 has.
+rotary, as Qwen3 and Gemma 4 have; qkv_norm_rope_heads is its form
+for any head geometry, with Gemma's weightless per-head V norm.
 """
 
 from dataclasses import dataclass
@@ -152,10 +153,7 @@ class Engine:
             dtype=self.torch.float32, device="cuda").permute(-1, -2)
 
     def rms_norm(self, x, norm):
-        from vllm import _custom_ops as ops
-        out = self.torch.empty_like(x)
-        ops.rms_norm(out, x, norm.weight, norm.variance_epsilon)
-        return out
+        return self.norm_rows(x, norm.weight, norm.variance_epsilon)
 
     def norm_rows(self, x, weight, eps):
         """RMS-normalize the last dimension of x with vLLM's CUDA kernel.
@@ -179,16 +177,15 @@ class Engine:
                                norm.variance_epsilon)
         return hidden, residual
 
-    def norm_quant_rows(self, x, weight, eps, residual=None):
+    def norm_quant_rows(self, x, weight, eps):
         """RMS-normalize rows and quantize them to fp8 with per-row scales.
 
-        One vLLM kernel. With residual, the kernel first adds x into
-        residual in place and normalizes the sum. Returns the fp8 rows
-        and their float32 scales, shaped (rows, 1).
+        One vLLM kernel. Returns the fp8 rows and their float32 scales,
+        shaped (rows, 1).
         """
         from vllm import _custom_ops as ops
         return ops.rms_norm_dynamic_per_token_quant(
-            x, weight, eps, self.torch.float8_e4m3fn, residual=residual)
+            x, weight, eps, self.torch.float8_e4m3fn)
 
     def fp8_linear(self, module, x_q, x_s):
         """One of vLLM's fp8 linears on rows already quantized per row.

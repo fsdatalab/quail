@@ -49,6 +49,24 @@ def _capacity(llm) -> dict:
     }
 
 
+def diffusion_kwargs(spec) -> dict:
+    """The LLM arguments a diffusion model's canvas readout needs.
+
+    The spec's canvas length; a one-row canvas takes one denoising
+    step, so a request is one prefill pass plus one row, and raises
+    the logprob cap the readout ranks TRUE against FALSE in.
+    """
+    if not spec.canvas_tokens:
+        return {}
+    diffusion = {"canvas_length": spec.canvas_tokens}
+    kwargs = {"diffusion_config": diffusion}
+    if spec.canvas_tokens == 1:
+        diffusion["max_denoising_steps"] = 1
+        # vLLM refuses a request for more logprobs than this
+        kwargs["max_logprobs"] = DIFFUSION_LOGPROBS
+    return kwargs
+
+
 def sampling_kwargs(allowed_ids: list[int], canvas_tokens: int = 0) -> dict:
     """SamplingParams arguments for one greedy answer token.
 
@@ -106,12 +124,11 @@ class VLLMEngine:
         """Return the LLM constructor arguments beyond the model name.
 
         A spec with its own chunk cap (a mixture-of-experts model)
-        batches at least that many tokens per step. A diffusion model
-        gets the spec's canvas; a one-row canvas takes one denoising
-        step, so a request is one prefill pass plus one row.
+        batches at least that many tokens per step. A one-row-canvas
+        diffusion model runs more sequences per step than vLLM's
+        default for its 256-row canvas.
         """
         batched = max(MAX_BATCHED_TOKENS, spec.chunk_cap_tokens)
-        sequences = MAX_SEQUENCES
         kwargs = {
             "max_num_batched_tokens": batched,
             "gpu_memory_utilization": GPU_MEMORY_UTILIZATION,
@@ -120,16 +137,10 @@ class VLLMEngine:
             "compilation_config": {
                 "cudagraph_capture_sizes": [CUDA_GRAPH_CAPTURE_SIZE]
             },
+            "max_num_seqs": (DIFFUSION_SEQUENCES if spec.canvas_tokens == 1
+                             else MAX_SEQUENCES),
         }
-        if spec.canvas_tokens:
-            diffusion = {"canvas_length": spec.canvas_tokens}
-            if spec.canvas_tokens == 1:
-                diffusion["max_denoising_steps"] = 1
-                sequences = DIFFUSION_SEQUENCES
-                # vLLM refuses a request for more logprobs than this
-                kwargs["max_logprobs"] = DIFFUSION_LOGPROBS
-            kwargs["diffusion_config"] = diffusion
-        kwargs["max_num_seqs"] = sequences
+        kwargs.update(diffusion_kwargs(spec))
         return kwargs
 
     def boot(self, spec, allowed_ids: list[int]) -> tuple[dict, dict]:
@@ -166,15 +177,16 @@ class DefaultVLLMEngine(VLLMEngine):
     """Boot vLLM with every engine setting at its default.
 
     Only the model name is passed, as `vllm serve Qwen/Qwen3-4B-FP8`
-    would. The engine kind differs from `VLLMEngine` so this engine
-    never shares a loaded model with the tuned vLLM backends.
+    would, plus the canvas a diffusion model's readout needs. The
+    engine kind differs from `VLLMEngine` so this engine never shares
+    a loaded model with the tuned vLLM backends.
     """
 
     kind = "dumb_vllm"
     label = "vLLM with default settings"
 
     def llm_kwargs(self, spec) -> dict:
-        return {}
+        return diffusion_kwargs(spec)
 
 
 def stock_vllm_backend() -> RequestBackend:

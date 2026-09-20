@@ -67,10 +67,10 @@ class ModelSpec:
     prompt_format: str = "raw-v1"    # names the turn layout in run records
     chunk_cap_tokens: int = 0    # upper bound on tokens per chunk; 0
     #                              leaves the memory and kernel bounds
-    moe_backend: str | None = None    # vLLM fused MoE kernel family the
-    #                                   engine loads ("triton",
-    #                                   "cutlass", ...); None lets vLLM
-    #                                   pick
+    moe_backend: str | None = None    # vLLM's moe_backend setting, one
+    #                                   of its MoEBackend names ("triton",
+    #                                   "cutlass", "deep_gemm", ...);
+    #                                   None lets vLLM pick
 
     def is_full_layer(self, layer: int) -> bool:
         """Whether the layer keeps every token with the full KV geometry."""

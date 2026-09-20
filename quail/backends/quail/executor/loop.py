@@ -248,11 +248,8 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             "attention_mode must be 'merge_quant' or 'unified', "
             f"got {attention_mode!r}")
     canvas = tuple(canvas)
-    # a one-row canvas is the suffix's last row seeing everything
-    # before it, which the causal two-call path already gives
-    if len(canvas) > 1 and attention_mode != "unified":
-        raise ValueError(
-            "a canvas longer than one row needs the unified attention path")
+    if canvas and attention_mode != "unified":
+        raise ValueError("canvas rows run the unified attention path")
     if canvas and not 0 <= answer_row < len(canvas):
         raise ValueError(
             f"answer_row {answer_row} is outside the {len(canvas)}-row canvas")
@@ -847,14 +844,6 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
 # Kernels key on token counts and model constants, never on token
 # values, so both passes run on synthetic ids.
 
-# Chunk sizes (tokens) the tiny-chunk warmup ladder builds. A gated
-# chain's trailing chunks are 100-500 tokens, a shape the full-size
-# warm chunks do not cover, so each needs its own compile. The larger
-# sizes are the Triton fused MoE kernel's row buckets between the tiny
-# chunks and the full budget: a join's deferred or trailing chunk
-# lands in one, and its first use compiles the kernel.
-TINY_WARM_TOKENS = (64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768)
-
 # Bump when either pass covers a different set of shapes. A bumped
 # version invalidates every marker, so the next boot re-runs the
 # compile pass and re-commits the cache.
@@ -892,9 +881,9 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
         run_filter(torch, arena, pipeline, async_ans, warm_docs,
                    [question], budget, arena_writes=True,
                    attention_mode=mode)
-        # tiny chunks, one document each: the trailing-chunk shapes
-        # of gated multi-stage runs (see TINY_WARM_TOKENS)
-        for t in TINY_WARM_TOKENS:
+        # small chunks, one document each: the trailing-chunk shapes
+        # of gated multi-stage runs (see ModelPipeline.warm_tokens)
+        for t in pipeline.warm_tokens:
             if t >= budget:
                 continue
             logger.debug("kernels: warming %s attention, %s tokens", mode, t)

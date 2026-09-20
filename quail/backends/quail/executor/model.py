@@ -141,8 +141,8 @@ def load_model(model_name: str, revision: str | None = None, *,
 
     max_batched_tokens is the largest chunk the model will see. vLLM's
     fused MoE kernels size their scratch buffers from it; a dense model
-    ignores it. moe_backend names the fused MoE kernel family vLLM
-    should use ("triton", "vllm_cutlass", ...); None lets vLLM pick.
+    ignores it. moe_backend is passed through as vLLM's moe_backend
+    setting (see ModelSpec.moe_backend); None lets vLLM pick.
     """
     import os
     import tempfile

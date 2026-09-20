@@ -65,15 +65,15 @@ def arena_bytes(model: ModelSpec, device: DeviceSpec,
 # Rows past a document that its pages also cover: the shared question
 # preamble and a stage tail, taken as a round number for the split.
 SPLIT_EXTRA_TOKENS = 64
-# Pages of rounding a chunk's fresh prefixes can add on the sliding
-# layers: one per document longer than the window, at most chunk /
-# window of them.
-TRANSIENT_SLACK_PAGES = 64
 
 
-def transient_sliding_pages(chunk_tokens: int) -> int:
-    """Sliding-layer pages one chunk's fresh prefixes take before trimming."""
-    return -(-chunk_tokens // PAGE_TOKENS) + TRANSIENT_SLACK_PAGES
+def transient_sliding_pages(chunk_tokens: int, window: int) -> int:
+    """Sliding-layer pages one chunk's fresh prefixes take before trimming.
+
+    The chunk's rows, plus one page of rounding per document longer
+    than the window, of which a chunk holds at most chunk / window.
+    """
+    return -(-chunk_tokens // PAGE_TOKENS) + -(-chunk_tokens // window)
 
 
 def arena_pages(model: ModelSpec, device: DeviceSpec,
@@ -103,7 +103,7 @@ def arena_pages(model: ModelSpec, device: DeviceSpec,
                 / (mean + SPLIT_EXTRA_TOKENS))
     full = int(free // (page_bytes_full + ratio * page_bytes_sliding))
     sliding = int(full * ratio)
-    floor = transient_sliding_pages(chunk_tokens)
+    floor = transient_sliding_pages(chunk_tokens, window)
     if sliding < floor:
         sliding = floor
         full = int((free - sliding * page_bytes_sliding) // page_bytes_full)

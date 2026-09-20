@@ -11,20 +11,22 @@ loop sees only this class.
 class ModelPipeline:
     """The contract between the chunk loop and one model family.
 
-    A subclass sets self.engine, self.spec, and self.max_chunk_tokens
-    in __init__ and implements forward_chunk; with gemm_warmup it also
-    implements linears. join_attention names the attention path a
-    join's chunks run: "merge_quant" (two calls, fused merge and fp8
-    quant) or "unified" (one causal call). A diffusion model also sets
+    A subclass sets self.engine and self.max_chunk_tokens in __init__
+    and implements forward_chunk; with gemm_warmup it also implements
+    linears. join_attention names the attention path a join's chunks
+    run: "merge_quant" (two calls, fused merge and fp8 quant) or
+    "unified" (one causal call). A diffusion model also sets
     canvas_ids: the token ids the loop packs after every suffix, with
     the answer at canvas_answer_row of them. needs_pages says every
     chunk must carry arena pages, for a model whose attention kernel
-    reads paged KV only.
+    reads paged KV only. warm_tokens are the chunk sizes the warmup
+    builds one small chunk of: a gated chain's trailing chunks are
+    100-500 tokens, a shape the full-size warm chunks do not cover.
     """
 
     engine = None
-    spec = None
     max_chunk_tokens = None
+    warm_tokens = (64, 128, 256, 512, 1024, 2048)
     canvas_ids = ()
     canvas_answer_row = 0
     needs_pages = False

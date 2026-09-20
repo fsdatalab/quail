@@ -47,7 +47,6 @@ def bare_arena(arena, pages):
     arena.window = 0
     arena.sliding_layers = frozenset()
     arena.pinned = False
-    arena._ratio = 1.0
     arena._rows = {}
     arena._capacity_rows = {}
     arena._sliding_rows = {}
