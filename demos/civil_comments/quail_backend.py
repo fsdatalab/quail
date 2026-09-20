@@ -1,8 +1,8 @@
 """Run the Civil Comments comparison query with Quail.
 
-The query joins comments to 30 semantic fields, filters for toxicity,
-and adds exact rejected-status metadata. The package initializer shares
-the labels, questions, and deterministic sample with the Jev backend.
+The query joins comments to 30 semantic fields and filters for toxicity.
+The package initializer shares the labels, questions, and deterministic
+sample with the Jev backend.
 
 Run one or two H100s from the repository root:
 
@@ -23,7 +23,6 @@ from pathlib import Path
 
 import modal
 import numpy as np
-import pyarrow as pa
 import pyarrow.parquet as pq
 
 from demos.civil_comments import (
@@ -34,7 +33,6 @@ from demos.civil_comments import (
     accuracy_summary,
     fields_table,
     load_comments,
-    rejected_pairs,
 )
 from quail.bench.images import gpu_image
 
@@ -191,16 +189,6 @@ def evaluate(directory: Path, limit: int | None, gpus: int) -> dict:
         )
         if yes
     }
-    exact_pairs = rejected_pairs(comments, toxic_found)
-    if exact_pairs:
-        metadata_table = pa.Table.from_pylist(
-            [
-                {"c.comment_id": comment_id, "f.field": field}
-                for comment_id, field in sorted(exact_pairs)
-            ],
-            schema=table.schema,
-        )
-        table = pa.concat_tables([table, metadata_table])
     pq.write_table(table, directory / "retained.parquet")
     pairs_found = {
         (row["c.comment_id"], row["f.field"]) for row in table.to_pylist()

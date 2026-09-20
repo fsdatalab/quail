@@ -258,10 +258,6 @@ def load_comments(limit: int | None) -> pa.Table:
         table
         .append_column("comment_id", pc.cast(table["id"], pa.string()))
         .append_column("text", table["comment_text"])
-        .append_column(
-            "rejected",
-            pc.cast(pc.equal(table["rating"], "rejected"), pa.float64()),
-        )
     )
 
 
@@ -271,20 +267,6 @@ def fields_table() -> pa.Table:
         "field": list(FIELDS),
         "statement": [field_statement(spec) for spec in FIELDS.values()],
     })
-
-
-def rejected_pairs(
-    comments: pa.Table,
-    retained_ids: set[str],
-) -> set[tuple[str, str]]:
-    """Return exact rejected-status pairs for retained comments."""
-    ids = comments["comment_id"].to_pylist()
-    rejected = np.asarray(comments["rejected"].to_pylist()) >= LABEL_CUTOFF
-    return {
-        (ids[int(index)], "rejected")
-        for index in np.flatnonzero(rejected)
-        if ids[int(index)] in retained_ids
-    }
 
 
 def labeled_outputs(comments: pa.Table) -> tuple[set[str], set[tuple[str, str]]]:
@@ -297,7 +279,6 @@ def labeled_outputs(comments: pa.Table) -> tuple[set[str], set[tuple[str, str]]]
         scores = np.asarray(comments[field].to_pylist()) >= LABEL_CUTOFF
         for index in np.flatnonzero(toxic & scores):
             pairs.add((ids[int(index)], field))
-    pairs.update(rejected_pairs(comments, toxic_ids))
     return toxic_ids, pairs
 
 

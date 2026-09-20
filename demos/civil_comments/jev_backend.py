@@ -39,7 +39,6 @@ from demos.civil_comments import (
     accuracy_summary,
     field_statement,
     load_comments,
-    rejected_pairs,
     requested_input_tokens,
 )
 
@@ -320,7 +319,6 @@ async def evaluate(
         for field, probability in row["answers"].items()
         if probability >= LABEL_CUTOFF
     }
-    pairs_found.update(rejected_pairs(comments, toxic_found))
     accuracy = accuracy_summary(comments, toxic_found, pairs_found)
     api_input_tokens = sum(
         row["input_tokens"]
