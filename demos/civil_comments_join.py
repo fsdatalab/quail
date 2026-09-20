@@ -35,7 +35,6 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from quail.bench.images import gpu_image
-from quail.specs import H100_USD_PER_HOUR
 
 DATASET = "pietrolesci/civilcomments-wilds"
 DATASET_REVISION = "c227534cc0a34cf21db6a0bf0edd0f9050c8b305"
@@ -218,6 +217,7 @@ def evaluate_tables(directory: Path, limit: int | None, gpus: int,
                     filter_only: bool) -> dict:
     """Run the query and write answers, the plan, and the timing report."""
     import quail
+    from quail.specs import H100_USD_PER_HOUR
 
     comments = load_comments(limit)
     fields = pa.table({
