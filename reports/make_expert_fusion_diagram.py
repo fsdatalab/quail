@@ -1,12 +1,10 @@
-"""Draw DiffusionGemma's forward pass before and after expert fusion.
+"""Draw the kernel categories in DiffusionGemma's forward pass.
 
 Run from the repository root:
     uv run --with matplotlib python reports/make_expert_fusion_diagram.py
 
-The figure describes code, not measured kernel launch counts. The unfused
-column is revision 189bfaa. The fused column is revision f76f7ed. It adds
-expert normalization plus
-quantization, and expert GELU plus multiplication plus quantization.
+The columns describe Quail revisions 189bfaa and f76f7ed. Colors follow the
+kernel diagram in PR #133. Boxes are operations, not measured launch counts.
 """
 
 from pathlib import Path
@@ -15,90 +13,118 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.patches import FancyArrowPatch, Rectangle
+from matplotlib.patches import FancyArrowPatch, FancyBboxPatch, Rectangle
 
-from plot_colors import BLUE, DARK, GRAY, GREEN
+from plot_colors import DARK
 
 ROOT = Path(__file__).parent
 plt.style.use(ROOT / "quail.mplstyle")
 
-# Aligned rows preserve the location of the operations removed by fusion.
+# The category colors match the forward-pass figure in PR #133.
+COLORS = {
+    "quail": ("#d6f2e3", "#1f8a5a", "Quail fused Triton"),
+    "gemm": ("#dbe8f8", "#2f6db5", "CUTLASS FP8 matrix multiplication"),
+    "moe": ("#e6dcf5", "#6e4bb3", "vLLM expert kernel, Quail tile settings"),
+    "attention": ("#fdebc8", "#d08a1a", "FlashAttention 3 or 4"),
+    "kv": ("#dff1fb", "#3b8fc4", "Quail KV write"),
+    "vllm": ("#e7e7e7", "#777777", "Separate vLLM operation"),
+    "vfused": ("#f0f3d6", "#7a8a1f", "vLLM fused CUDA operation"),
+    "cublas": ("#fbe0e6", "#c04a6a", "cuBLAS BF16 matrix multiplication"),
+}
+
 COMMON = {
-    0: "Token embeddings + canvas normalization\nPrompt + one fixed canvas token",
-    1: "Input normalization + FP8 quantization\nFuse the prior layer's residual addition",
-    2: "QKV projection\nFP8 matrix multiplication",
-    3: "Q/K/V normalization + rotary positions\nqkv_norm_rope",
-    4: "Write KV + run attention\nSliding or full attention, by layer",
-    5: "FP8 quant + output projection\nPost-attention normalization",
-    6: "Residual addition + dense input norm + FP8 quant\nscale_add_rms_norm_quant",
-    7: "Dense gate and up projection\nFP8 matrix multiplication",
-    8: "Dense GELU + multiplication + FP8 quant\ngelu_mul_quant",
-    9: "Dense down projection + normalization\nKeep the dense output for the branch sum",
-    11: "Router projection + select eight experts\n_gemma4_routing_kernel",
-    13: "Assign rows + expert gate and up projection\nfused_moe_kernel, w13",
-    16: "Expert down projection\nfused_moe_kernel, w2",
-    17: "Sum the eight weighted expert outputs\nmoe_sum",
-    18: "Expert output norm + add dense output + norm\nfused_add_rms_norm",
-    19: "Continue to the next layer\nInclude the scaled residual",
-    20: "After 30 layers, apply the final normalization\nCompare TRUE and FALSE at the canvas",
+    0: ("Input norm + FP8 quant, with prior residual add\nscale_add_rms_norm_quant", "quail"),
+    1: ("QKV projection\nCUTLASS FP8 matrix multiplication", "gemm"),
+    2: ("Q/K/V norms + rotary positions\nqkv_norm_rope", "quail"),
+    3: ("Write this layer's KV\nkv_row_scatter", "kv"),
+    4: ("Attention over the layer's KV pages\nFA3 for sliding layers; FA4 for full layers", "attention"),
+    5: ("Output projection input\nPer-token FP8 quantization", "vllm"),
+    6: ("Attention output projection\nCUTLASS FP8 matrix multiplication", "gemm"),
+    7: ("Post-attention normalization\nrms_norm", "vllm"),
+    8: ("Residual add + dense input norm + FP8 quant\nscale_add_rms_norm_quant", "quail"),
+    9: ("Dense gate and up projection\nCUTLASS FP8 matrix multiplication", "gemm"),
+    10: ("Dense GELU + multiplication + FP8 quant\ngelu_mul_quant", "quail"),
+    11: ("Dense down projection\nCUTLASS FP8 matrix multiplication", "gemm"),
+    12: ("Normalize the dense branch's output\nrms_norm", "vllm"),
+    14: ("Router projection\nBF16 matrix multiplication", "cublas"),
+    15: ("Select eight experts per token\n_gemma4_routing_kernel", "vllm"),
+    17: ("Assign rows to experts\nmoe_align_block_size + sort", "vllm"),
+    18: ("Expert gate and up projection\nfused_moe_kernel, w13", "moe"),
+    21: ("Expert down projection\nfused_moe_kernel, w2", "moe"),
+    22: ("Sum the eight weighted expert outputs\nmoe_sum", "vllm"),
+    23: ("Normalize the expert branch's output\nrms_norm", "vllm"),
+    24: ("Add dense and expert outputs + normalize\nfused_add_rms_norm", "vfused"),
 }
 LEFT = dict(COMMON)
 LEFT.update({
-    10: "Expert input norm + router input norm\nrms_norm2",
-    12: "Expert input FP8 quantization\ndynamic_per_token_scaled_fp8_quant",
-    14: "Expert GELU + multiplication\nact_and_mul",
-    15: "Expert activation FP8 quantization\ndynamic_per_token_scaled_fp8_quant",
+    13: ("Expert input norm + router input norm\nrms_norm2", "quail"),
+    16: ("Expert input\nPer-token FP8 quantization", "vllm"),
+    19: ("Expert GELU + multiplication\nact_and_mul", "vllm"),
+    20: ("Expert activation\nPer-token FP8 quantization", "vllm"),
 })
 RIGHT = dict(COMMON)
 RIGHT.update({
-    10: "Expert input norm + FP8 quant + router norm\nrms_norm2, QUANTIZE=True",
-    14: "Expert GELU + multiplication + FP8 quant\ngelu_mul_quant, ROUND_ACTIVATION=True",
+    13: ("Expert input norm + FP8 quant + router norm\nrms_norm2, QUANTIZE=True", "quail"),
+    19: ("Expert GELU + multiplication + FP8 quant\ngelu_mul_quant, ROUND_ACTIVATION=True", "quail"),
 })
 
-WIDTH, STEP, HEIGHT = 5.7, 0.70, 0.54
-TOP = 15.4
-fig, ax = plt.subplots(figsize=(12.8, 17.2))
+WIDTH, STEP, HEIGHT = 5.7, 0.72, 0.57
+TOP = 20.4
+fig, ax = plt.subplots(figsize=(12.8, 24.0))
 fig.subplots_adjust(left=0.02, right=0.98, top=0.99, bottom=0.02)
-ax.set(xlim=(0, 12.4), ylim=(-0.35, 17.0))
+ax.set(xlim=(0, 12.4), ylim=(-1.1, 22.6))
 ax.axis("off")
-ax.text(6.2, 16.75, "DiffusionGemma forward pass", ha="center",
+ax.text(6.2, 22.25, "DiffusionGemma forward-pass kernels", ha="center",
         va="center", fontsize=23, weight="bold", color=DARK)
-ax.text(6.2, 16.36, "Quail, 26B-A4B FP8  |  Green borders mark the new fusions",
+ax.text(6.2, 21.80, "Quail, 26B-A4B FP8. Colors identify every kernel category.",
         ha="center", va="center", fontsize=15, color=DARK)
+ax.text(6.2, 21.42, "Prompt and one canvas token enter the layer sequence below.",
+        ha="center", va="center", fontsize=13.5)
 
-for col, (heading, rows) in enumerate((("Before", LEFT), ("After", RIGHT))):
+for col, (heading, rows) in enumerate((
+        ("Before expert fusion", LEFT), ("With expert fusion", RIGHT))):
     x = 0.25 + col * 6.2
     center = x + WIDTH / 2
-    ax.text(center, 15.92, heading, ha="center", va="center",
+    ax.text(center, 20.94, heading, ha="center", va="center",
             fontsize=19, weight="bold")
     previous_bottom = None
-    for row, label in sorted(rows.items()):
+    for row, (label, kind) in sorted(rows.items()):
         top = TOP - row * STEP
-        height = HEIGHT + (STEP if col == 1 and row == 14 else 0)
-        changed = col == 1 and row in (10, 14)
-        color = GREEN if changed else BLUE if row in (0, 20) else GRAY
+        height = HEIGHT + (STEP if col == 1 and row == 19 else 0)
+        fill, border, _ = COLORS[kind]
         if previous_bottom is not None:
             ax.add_patch(FancyArrowPatch(
                 (center, previous_bottom), (center, top),
                 arrowstyle="-|>", mutation_scale=11,
                 color=DARK, linewidth=1.0, shrinkA=2, shrinkB=2))
-        ax.add_patch(Rectangle((x, top - height), WIDTH, height,
-                               facecolor="white", edgecolor=color,
-                               linewidth=2.7 if changed else 1.15))
+        ax.add_patch(FancyBboxPatch(
+            (x, top - height), WIDTH, height,
+            boxstyle="round,pad=0.015,rounding_size=0.045",
+            facecolor=fill, edgecolor=border, linewidth=1.5))
         ax.text(center, top - height / 2, label, ha="center", va="center",
-                fontsize=12.8, linespacing=1.35, color=DARK,
-                weight="bold" if changed else "normal")
+                fontsize=13.2, linespacing=1.35, color=DARK)
         previous_bottom = top - height
 
-ax.text(6.2, 0.38,
-        "Read each column from top to bottom. Boxes may group several kernels.",
+ax.text(6.2, 2.10,
+        "Repeat for 30 layers, then apply the final norm and compare TRUE and FALSE at the canvas.",
         ha="center", fontsize=12.5)
-ax.text(6.2, 0.08,
-        "The fusions keep the BF16 rounding steps and FP8 scales of the separate operations.",
-        ha="center", fontsize=12.5)
-ax.text(6.2, -0.22,
-        "Expert selection, matrix multiplications, and the weighted sum use the same kernels.",
-        ha="center", fontsize=12.5)
+ax.text(6.2, 1.78,
+        "The first layer only normalizes and quantizes its input; later layers include the prior residual add.",
+        ha="center", fontsize=12.0)
+ax.text(6.2, 1.46,
+        "Each box names an operation. Assignment and attention may use multiple kernel launches.",
+        ha="center", fontsize=12.0)
+
+for i, (fill, border, label) in enumerate(COLORS.values()):
+    x = 0.3 + (i % 2) * 6.2
+    y = 0.96 - (i // 2) * 0.43
+    ax.add_patch(Rectangle((x, y - 0.10), 0.30, 0.20,
+                           facecolor=fill, edgecolor=border, linewidth=1.4))
+    ax.text(x + 0.43, y, label, va="center", fontsize=13)
+
+ax.text(6.2, -0.85,
+        "Both existing and new Quail fusions are green. Expert selection and matrix kernels are unchanged.",
+        ha="center", fontsize=12.3)
 output = ROOT / "plots" / "diffusion_gemma_expert_fusion.png"
 output.parent.mkdir(exist_ok=True)
 fig.savefig(output, dpi=300)
