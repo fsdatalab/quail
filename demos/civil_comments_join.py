@@ -3,9 +3,9 @@
 The data is the Jigsaw Civil Comments release mirrored on Hugging Face
 as pietrolesci/civilcomments-wilds (config "raw"). A score is the
 fraction of annotators who applied the label, so a score of at least
-0.5 is the label. The filter prompt uses the Jigsaw toxicity wording:
-a rude, disrespectful, or unreasonable comment that is likely to make
-someone leave a discussion.
+0.5 is the label: a majority chose Toxic or Very Toxic, not Slightly
+toxic or hard to say. The filter prompt uses the ConversationAI rater
+definitions and their calibration examples.
 
 The query keeps the toxic comments, then joins each one with a table of
 31 statements: six toxicity subtypes, twenty-four identity groups, and
@@ -45,23 +45,35 @@ MODEL = "diffusion-gemma-26b-a4b-fp8"
 DEVICE = "h100-sxm"
 
 FILTER_PROMPT = (
-    "A toxic comment is a rude, disrespectful, or unreasonable comment "
-    "that is likely to make someone leave a discussion. Ordinary "
-    "disagreement or a strongly held opinion is not toxic.\n\n{0}\n\n"
-    "Instruction: answer TRUE if the comment is toxic, FALSE otherwise.")
+    "Rate the comment with these rater definitions. Very toxic: a very "
+    "hateful, aggressive, or disrespectful comment, or otherwise very "
+    "likely to make a user leave a discussion or give up on sharing "
+    "their perspective. Toxic: a rude, disrespectful, or unreasonable "
+    "comment, or otherwise somewhat likely to make a user leave a "
+    "discussion or give up on sharing their perspective. Not toxic: a "
+    "civil, polite, or merely opinionated comment that is unlikely to "
+    "make someone leave.\n\n"
+    "Answer TRUE only if the comment is toxic or very toxic. Answer "
+    "FALSE if it is not toxic, only slightly toxic, or hard to say.\n\n"
+    "Example: Peter is an idiot.\nTRUE\n"
+    "Example: That is fucking amazing! thanks for sharing.\nFALSE\n"
+    "Example: Agree\nFALSE\n\n"
+    "{0}\n\n"
+    "Instruction: answer TRUE or FALSE.")
 
 FIELDS = {
-    "severe_toxicity": "is an extreme of hate or violence, not an ordinary "
-                       "insult or rude remark",
-    "obscene": "uses swear words, curse words, or other obscene language",
-    "threat": "states a real intention to inflict pain, injury, or "
-              "violence on a person or group, not a figure of speech",
-    "insult": "is insulting, inflammatory, or negative toward a person or "
-              "a group of people",
-    "identity_attack": "is negative or hateful toward people because of "
-                       "their identity",
-    "sexual_explicit": "refers to sexual acts, body parts, or other lewd "
-                       "content",
+    "severe_toxicity": "is very hateful, aggressive, or disrespectful, or "
+                       "otherwise very likely to make a user leave",
+    "obscene": "contains swear words, curse words, or other obscene or "
+               "profane language",
+    "threat": "describes a wish or intention for pain, injury, or "
+              "violence against a person or group",
+    "insult": "is an insulting, inflammatory, or negative comment toward "
+              "a person or a group of people",
+    "identity_attack": "is a negative, discriminatory, or hateful comment "
+                       "about people based on identity",
+    "sexual_explicit": "contains references to sexual acts or body parts "
+                       "in a sexual way, or other lewd content",
     "male": "explicitly mentions men or boys",
     "female": "explicitly mentions women or girls",
     "transgender": "explicitly mentions transgender people",
@@ -103,10 +115,11 @@ FIELDS = {
 # Measured on the full table: 11.3% of comments are toxic, and among
 # those a joined field is true 6.7% of the time on average.
 JOIN_PROMPT = (
-    "Judge the statement on its own. Answer TRUE only if the description "
-    "in DOCUMENT {1} is specifically true of the comment in DOCUMENT {0}. "
-    "Answer FALSE if it is only loosely related or is a stronger claim "
-    "than the comment supports.")
+    "Judge only the statement in DOCUMENT {1} about the comment in "
+    "DOCUMENT {0}. A toxic comment is not automatically an insult, a "
+    "threat, or an identity attack. Answer TRUE only if that statement "
+    "is specifically true. Answer FALSE if it is only loosely related "
+    "or is a stronger claim than the comment supports.")
 
 app = modal.App("quail-milestone1")
 results_volume = modal.Volume.from_name("quail-results", create_if_missing=True)
