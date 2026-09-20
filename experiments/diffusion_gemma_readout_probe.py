@@ -11,7 +11,11 @@ came back, how the TRUE and FALSE entries are decoded, the TRUE minus
 FALSE logprob margin, what true_bit reads, and what Quail answered
 for the same document in the run named by --quail-run.
 --no-prefix-caching boots the engine without vLLM's prefix cache.
-Every document is answered three ways on the same engine: all
+--order corpus takes the first documents in corpus order, as the
+benchmark submits them (agent traces trajectory by trajectory, so
+each request extends the previous turn's prompt), instead of a
+sample spread over the corpus's lengths. Every document is answered
+three ways on the same engine: all
 prompts in one generate call (read), the benchmark's own filter
 chain through the engine's step loop (chain), and one prompt per
 generate call (alone); the benchmark run's baseline answer is kept
@@ -46,11 +50,12 @@ DATASETS = {
 def probe(prediction: str, n_docs: int = 256,
           quail_run: str = "20260919T220437Z-1550de75",
           logprobs: int = 0, dataset: str = "imdb",
-          prefix_caching: bool = True) -> str:
+          prefix_caching: bool = True, order: str = "spread") -> str:
     """Run the readout; a logprobs count above 0 overrides the backend's.
 
-    The documents are every k-th of the dataset in token order, so
-    the sample spans the lengths in the corpus.
+    With order "spread" the documents are every k-th of the dataset in
+    token order, so the sample spans the lengths in the corpus; with
+    "corpus" they are the first n_docs in corpus order.
     """
     import os
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
@@ -76,9 +81,14 @@ def probe(prediction: str, n_docs: int = 256,
 
     docs = pq.read_table(f"/results/quailb_data/sf0.1/{table_name}").to_pandas()
     docs["tokens"] = [len(tok(text)) for text in docs[column]]
-    docs = docs.sort_values("tokens")
-    step = max(1, len(docs) // n_docs)
-    docs = docs.iloc[::step].head(n_docs)
+    if order == "corpus":
+        if "trajectory_id" in docs.columns:
+            docs = docs.sort_values(["trajectory_id", "turn_index"])
+        docs = docs.head(n_docs)
+    else:
+        docs = docs.sort_values("tokens")
+        step = max(1, len(docs) // n_docs)
+        docs = docs.iloc[::step].head(n_docs)
     ids = docs["id"].tolist()
     lengths = dict(zip(ids, docs["tokens"].tolist()))
     prompt = bind_prompt(template, (column,), tok, turn=spec.turn)
@@ -174,12 +184,14 @@ def probe(prediction: str, n_docs: int = 256,
                for k in (20, 50, 100, 200, 500, 1000, 2000, 5000)}
     report = {"prediction": prediction, "n_docs": n_docs, "boot": boot,
               "dataset": dataset, "prefix_caching": prefix_caching,
+              "order": order,
               "sampling": str(sampling), "capacity": state["capacity"],
               "counts": counts, "decoded_forms": decoded_forms,
               "best_rank_covered_by_k": covered, "worst_rank": max(ranks, default=None),
               "true_ids": sorted(true_ids), "false_ids": sorted(false_ids),
               "records": records}
-    suffix = "" if prefix_caching else "_nocache"
+    suffix = ("" if prefix_caching else "_nocache") + (
+        "_corpus" if order == "corpus" else "")
     out = Path("/results/ablations/diffusion_gemma_readout_probe_"
                f"{dataset}_k{logprobs}{suffix}.json")
     out.write_text(json.dumps(report, indent=1, default=str))
@@ -192,10 +204,11 @@ def probe(prediction: str, n_docs: int = 256,
 
 @app.local_entrypoint()
 def main(prediction: str = "", docs: int = 256, logprobs: int = 0,
-         dataset: str = "imdb", prefix_caching: bool = True):
+         dataset: str = "imdb", prefix_caching: bool = True,
+         order: str = "spread"):
     if not prediction:
         raise ValueError("pass --prediction before starting")
     call = probe.spawn(prediction, docs, logprobs=logprobs, dataset=dataset,
-                       prefix_caching=prefix_caching)
+                       prefix_caching=prefix_caching, order=order)
     print(f"function call id: {call.object_id} (readout probe)", flush=True)
     print(call.get(), flush=True)
