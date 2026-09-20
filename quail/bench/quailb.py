@@ -25,9 +25,8 @@ import quail
 import quail_b as benchmark
 from quail.bench import substrait
 from quail.bench.substrait import QueryPlan, read_plan
-from quail.logical.prompts import PROMPT_FORMAT
 from quail.planner.plan import Refusal
-from quail.specs import H100_USD_PER_HOUR
+from quail.specs import H100_USD_PER_HOUR, MODELS
 from quail_b.queries import (
     FILTER_SELECTIVITY_ESTIMATES,
     JOIN_SELECTIVITY_ESTIMATES,
@@ -244,7 +243,7 @@ def run_suite(only=None, *, sf=0.1, config, data_dir=None,
             gpu_count=config.gpus, gpu_hourly_rate_usd=h100_usd_per_hour,
             metadata={
                 "engine": config.backend, "model": config.model,
-                "prompt_format": PROMPT_FORMAT,
+                "prompt_format": MODELS[config.model].prompt_format,
                 "configuration": asdict(config),
                 "warmup": "engine startup and kernel warmup excluded",
                 "cache_reuse": "one session per backend and query family",

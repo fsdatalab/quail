@@ -7,16 +7,47 @@ KV admission calculation. Joins submit one request per document pair.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 
 MAX_SEQUENCES = 4_096
 MAX_BATCHED_TOKENS = 25_305
 
 
+_ANSWER_WORD = re.compile(r"\b(TRUE|FALSE)\b", re.IGNORECASE)
+
+
 def true_bit(output, true_ids) -> int:
-    """Return 1 when a request's first output token is a TRUE token."""
-    token_ids = output.outputs[0].token_ids
-    return int(bool(token_ids and int(token_ids[0]) in true_ids))
+    """Read one token from a request restricted to TRUE/FALSE tokens."""
+    tokens = output.outputs[0].token_ids
+    if not tokens:
+        raise ValueError("request returned no answer token")
+    return int(tokens[0] in true_ids)
+
+
+def text_answer(output) -> int:
+    """Read the first TRUE or FALSE word from generated text."""
+    match = _ANSWER_WORD.search(output.outputs[0].text or "")
+    if match is None:
+        raise ValueError("request returned no TRUE/FALSE answer")
+    return int(match.group(1).upper() == "TRUE")
+
+
+def canvas_answer(output, *, true_ids, false_ids) -> int:
+    """Compare TRUE/FALSE token scores at the first canvas position.
+
+    Equal scores return FALSE.
+
+    Raises:
+        ValueError: A TRUE/FALSE token score is missing.
+    """
+    logprobs = output.outputs[0].logprobs
+    entries = logprobs[0] if logprobs else {}
+    if any(t not in entries for t in true_ids | false_ids):
+        raise ValueError("vLLM omitted requested TRUE/FALSE scores")
+    true = max(entries[t].logprob for t in true_ids)
+    false = max(entries[t].logprob for t in false_ids)
+    return int(true > false)
 
 
 def filter_document_cap(
@@ -51,10 +82,10 @@ def filter_document_cap(
 class _FilterChain:
     """Answers, survivors, and counters for one filter chain."""
 
-    def __init__(self, body_ids, question_ids, true_ids):
+    def __init__(self, body_ids, question_ids, read_answer):
         self.body_ids = body_ids
         self.question_ids = question_ids
-        self.true_ids = true_ids
+        self.read_answer = read_answer
         self.answers = {}
         self.survivors = []
         self.requests = 0
@@ -66,7 +97,7 @@ class _FilterChain:
         self.requests += 1
         self.prompt_tokens += len(output.prompt_token_ids)
         self.cached_tokens += int(getattr(output, "num_cached_tokens", 0) or 0)
-        answer = true_bit(output, self.true_ids)
+        answer = self.read_answer(output)
         self.answers[(document, stage + 1)] = answer
         if answer and stage + 1 < len(self.question_ids):
             return True
@@ -103,7 +134,7 @@ def run_filter_chain(
     budget_tokens,
     *,
     tag="q",
-    true_ids,
+    read_answer,
     block_size=1,
     max_num_seqs=None,
 ):
@@ -117,7 +148,7 @@ def run_filter_chain(
         body_ids, question_ids, budget_tokens,
         block_size=block_size, max_num_seqs=max_num_seqs,
     )
-    chain = _FilterChain(body_ids, question_ids, true_ids)
+    chain = _FilterChain(body_ids, question_ids, read_answer)
     inflight = {}
 
     def submit(document, stage):
@@ -163,7 +194,7 @@ async def run_filter_chain_async(
     question_ids,
     budget_tokens,
     *,
-    true_ids,
+    read_answer,
     block_size=1,
     max_num_seqs=None,
 ):
@@ -172,7 +203,7 @@ async def run_filter_chain_async(
         body_ids, question_ids, budget_tokens,
         block_size=block_size, max_num_seqs=max_num_seqs,
     )
-    chain = _FilterChain(body_ids, question_ids, true_ids)
+    chain = _FilterChain(body_ids, question_ids, read_answer)
     documents = iter(range(len(body_ids)))
 
     async def worker():
@@ -197,7 +228,7 @@ def run_join_grouped(
     sampling_params,
     prefixes,
     suffixes,
-    true_ids,
+    read_answer,
     *,
     submission="anchor-major",
     pairs=None,
@@ -209,7 +240,7 @@ def run_join_grouped(
         sampling_params: Sampling settings for every request.
         prefixes: Per-anchor prefix token lists.
         suffixes: Per-partner suffix token lists.
-        true_ids: Token ids that mean TRUE.
+        read_answer: Function that reads a Boolean answer from a response.
         submission: "anchor-major" or "suffix-major" request order.
         pairs: (anchor index, suffix index) list to evaluate, in
             anchor-major order; every anchor against every suffix when
@@ -234,7 +265,7 @@ def run_join_grouped(
     started = time.perf_counter()
     outputs = client.generate(prompts, sampling_params, use_tqdm=False)
     wall = time.perf_counter() - started
-    bits = [true_bit(output, true_ids) for output in outputs]
+    bits = [read_answer(output) for output in outputs]
     cached_by_output = [
         int(getattr(output, "num_cached_tokens", 0) or 0)
         for output in outputs
@@ -256,5 +287,3 @@ def run_join_grouped(
         "cached_per_request": cached_per_request,
         "submission": submission,
     }
-
-

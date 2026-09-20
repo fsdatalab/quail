@@ -29,9 +29,9 @@ def minimum_weight_gpus(model: ModelSpec, device: DeviceSpec) -> int:
 def kernel_index_cap(model: ModelSpec) -> int:
     """Max tokens per chunk from the int32 element-offset limit.
 
-    Constraint: rows x ffn_width < 2^31.
+    Constraint: rows x widest projection < 2^31.
     """
-    return INT32_MAX // model.ffn_width
+    return INT32_MAX // model.widest_projection
 
 
 def chunk_memory_bound(model: ModelSpec, device: DeviceSpec) -> int:
@@ -46,24 +46,83 @@ def chunk_memory_bound(model: ModelSpec, device: DeviceSpec) -> int:
 def chunk_budget(model: ModelSpec, device: DeviceSpec) -> int:
     """Effective chunk budget, floored at the compute knee.
 
-    The budget is min(memory bound, kernel index cap) before the floor.
+    The budget is min(memory bound, kernel index cap, the spec's own
+    cap when it has one) before the floor.
     """
     b = min(chunk_memory_bound(model, device), kernel_index_cap(model))
+    if model.chunk_cap_tokens:
+        b = min(b, model.chunk_cap_tokens)
     return max(b, int(compute_knee(model, device)))
 
 
-def arena_tokens(model: ModelSpec, device: DeviceSpec,
-                 chunk_tokens: int | None = None) -> int:
-    """Admission budget: tokens of document KV that can be resident at once.
+def arena_bytes(model: ModelSpec, device: DeviceSpec,
+                chunk_tokens: int) -> float:
+    """Bytes left for KV after resident weights and the activation reserve."""
+    return (device.mem_bytes * POOL_FRACTION - model.W_resident
+            - ACT_RESERVE_CHUNKS * chunk_tokens * model.act_per_token)
 
-    Computed from the memory left after resident weights and the
-    activation reservation.
+
+# Rows past a document that its pages also cover: the shared question
+# preamble and a stage tail, taken as a round number for the split.
+SPLIT_EXTRA_TOKENS = 64
+
+
+def transient_sliding_pages(chunk_tokens: int, window: int) -> int:
+    """Sliding-layer pages one chunk's fresh prefixes take before trimming.
+
+    The chunk's rows, plus one page of rounding per document longer
+    than the window, of which a chunk holds at most chunk / window.
+    """
+    return -(-chunk_tokens // PAGE_TOKENS) + -(-chunk_tokens // window)
+
+
+def arena_pages(model: ModelSpec, device: DeviceSpec,
+                chunk_tokens: int | None = None,
+                mean_doc_tokens: float | None = None) -> tuple[int, int]:
+    """Pages of the two KV pools: (every-token pool, sliding-layer pool).
+
+    A model without sliding layers gets one pool and 0 sliding pages.
+    With sliding layers, a document holds its whole prefix on the
+    full-attention layers and only the last window on the sliding
+    layers, so the sliding pool is sized to the fraction of a mean
+    document that the window keeps. It never drops below the pages one
+    chunk's fresh prefixes take before they are trimmed. An unknown
+    mean sizes it as if every document fit in the window, the largest
+    fraction.
     """
     if chunk_tokens is None:
         chunk_tokens = chunk_budget(model, device)
-    free = (device.mem_bytes * POOL_FRACTION - model.W_resident
-            - ACT_RESERVE_CHUNKS * chunk_tokens * model.act_per_token)
-    return int(free // model.kappa)
+    free = arena_bytes(model, device, chunk_tokens)
+    page_bytes_full = model.kappa_full * PAGE_TOKENS
+    page_bytes_sliding = model.kappa_sliding * PAGE_TOKENS
+    if not page_bytes_sliding:
+        return int(free // page_bytes_full), 0
+    window = model.sliding_window
+    mean = window if mean_doc_tokens is None else max(1.0, mean_doc_tokens)
+    ratio = min(1.0, (min(mean, window) + SPLIT_EXTRA_TOKENS)
+                / (mean + SPLIT_EXTRA_TOKENS))
+    full = int(free // (page_bytes_full + ratio * page_bytes_sliding))
+    sliding = int(full * ratio)
+    floor = transient_sliding_pages(chunk_tokens, window)
+    if sliding < floor:
+        sliding = floor
+        full = int((free - sliding * page_bytes_sliding) // page_bytes_full)
+    if full <= 0:
+        raise ValueError("the KV arena cannot hold one chunk's sliding KV")
+    return full, sliding
+
+
+def arena_tokens(model: ModelSpec, device: DeviceSpec,
+                 chunk_tokens: int | None = None,
+                 mean_doc_tokens: float | None = None) -> int:
+    """Admission budget: tokens of document KV that can be resident at once.
+
+    Computed from the memory left after resident weights and the
+    activation reservation. With sliding layers this is the
+    every-token pool; see arena_pages.
+    """
+    full, _ = arena_pages(model, device, chunk_tokens, mean_doc_tokens)
+    return full * PAGE_TOKENS
 
 
 # ---- roofline arithmetic
@@ -142,6 +201,7 @@ def derived_table(model: ModelSpec, device: DeviceSpec) -> dict:
     return {
         "minimum_weight_gpus": minimum_weight_gpus(model, device),
         "arena_tokens": arena_tokens(model, device, chunk),
+        "arena_pages": arena_pages(model, device, chunk),
         "chunk_memory_bound": chunk_memory_bound(model, device),
         "kernel_index_cap": kernel_index_cap(model),
         "chunk_budget": chunk,

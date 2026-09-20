@@ -339,7 +339,9 @@ def test_benchmark_results_and_scoring(tmp_path):
 
     pieces = output.prompt_pieces
     assert pieces["tokenizer"] == tokenizer_name
-    assert pieces["preamble"] == _token_ids(quail.SHARED_PRE)
+    # the model's user turn opens ahead of the document preamble
+    assert pieces["preamble"] == _token_ids(
+        sess.model.turn_prefix + quail.SHARED_PRE)
     assert [item["id"] for item in pieces["filters"]] == ["filter-1"]
     assert [(item["id"], item["anchor"]) for item in pieces["joins"]] == [
         ("join-1", "r")]
@@ -416,13 +418,16 @@ def test_benchmark_query_prompts_and_labels():
             # only the FEVER tables are registered
             assert all(query_id.startswith("FEV-") for query_id in queries(session))
 
+    # the benchmark renders the same raw prompt as Quail; Qwen has no turn text
+    from quail.specs import QWEN3_4B_FP8
     from quail_b.predicates import PREDICATES
     from quail_b.rendering import render_filter_prompt, render_join_prompt
 
+    turn = QWEN3_4B_FP8.turn
     for spec in PREDICATES:
         left = quail.ColumnRef("left", spec.left_table, spec.left_column)
         if spec.kind == "filter":
-            prompt = quail.bind_prompt(spec.template, (left,))
+            prompt = quail.bind_prompt(spec.template, (left,), turn=turn)
             assert prompt.tail.startswith("{0}")
             expected = (prompt.preamble + "doc one"
                         + prompt.tail.replace("{0}", "", 1))
@@ -430,10 +435,12 @@ def test_benchmark_query_prompts_and_labels():
         else:
             right = quail.ColumnRef(
                 "right", spec.right_table, spec.right_column)
-            prompt = quail.bind_join_prompt(spec.template, (left, right))
+            prompt = quail.bind_join_prompt(spec.template, (left, right),
+                                            turn=turn)
             from quail.logical.prompts import render_join_prompt_text
 
             for anchor in (0, 1):
                 documents = ("doc one", "doc two")
                 assert render_join_prompt(spec.template, documents, anchor) == (
                     render_join_prompt_text(prompt, documents, anchor))
+

@@ -1,15 +1,20 @@
 """CPU tests for vLLM and SGLang backend interfaces."""
 
 import asyncio
+import sys
+from dataclasses import replace
+from functools import partial
 from types import SimpleNamespace
 
 import numpy as np
 import pyarrow as pa
+import pytest
 
 import quail
 from quail.backends import pipelined_sglang_backend, stock_vllm_backend
 from quail.backends.base import BackendExecutionContext, GpuContext
 from quail.backends.request import RequestModelExecution
+from quail.backends.request_scheduling import true_bit
 from quail.backends.sglang import SGLangClient
 from quail.builtins import built_in_registry
 from quail.physical import (
@@ -113,7 +118,7 @@ def test_request_backends_plan_validate_and_execute(monkeypatch):
 
         patch.setattr(
             "quail.backends.vllm.VLLMEngine.boot",
-            lambda self, model_name, allowed_ids: (
+            lambda self, spec, allowed_ids: (
                 {
                     "client": client,
                     "sampling_params": object(),
@@ -200,11 +205,11 @@ class _Client:
         return True
 
 
-def _execution(documents, **settings):
+def _execution(documents, *, model=QWEN3_4B_FP8, **settings):
     return RequestModelExecution(GpuContext(
         gpu_index=0,
         gpu_count=1,
-        model=QWEN3_4B_FP8,
+        model=model,
         device=H100_SXM,
         query_settings={
             "client": _Client(),
@@ -358,7 +363,8 @@ def test_cached_token_accounting():
 
     result = asyncio.run(run_filter_chain_async(
         generate, object(), [[5, 5, 5, 5], [6, 6, 6, 6]],
-        [[8, 8], [9, 9]], 100, true_ids={1}, block_size=1,
+        [[8, 8], [9, 9]], 100, read_answer=partial(true_bit, true_ids={1}),
+        block_size=1,
     ))
 
     # four requests of six tokens; the fake engine served 14 of them
@@ -412,3 +418,110 @@ def test_sglang_submission_and_cancellation():
         assert len(aborted) == 1
 
     asyncio.run(run())
+
+
+def test_vllm_engine_settings_follow_the_model():
+    from quail.backends.vllm import VLLMEngine, sampling_kwargs
+    from quail.specs import DIFFUSION_GEMMA_26B_FP8, QWEN3_4B_FP8
+
+    engine = VLLMEngine()
+    assert engine.llm_kwargs(QWEN3_4B_FP8)["max_num_batched_tokens"] == 25_305
+    assert "diffusion_config" not in engine.llm_kwargs(QWEN3_4B_FP8)
+    # the mixture-of-experts model batches its own chunk cap; its
+    # one-row canvas commits after one denoising step, and stays under
+    # vLLM's eight-sequence cap trigger
+    gemma = engine.llm_kwargs(DIFFUSION_GEMMA_26B_FP8)
+    assert gemma["max_num_batched_tokens"] == 65_536
+    assert gemma["diffusion_config"] == {"canvas_length": 1,
+                                         "max_denoising_steps": 1}
+    assert gemma["max_num_seqs"] == 127
+    assert gemma["max_logprobs"] == -1
+    wide = engine.llm_kwargs(replace(DIFFUSION_GEMMA_26B_FP8, canvas_tokens=256))
+    assert wide["diffusion_config"] == {"canvas_length": 256}
+    assert wide["max_num_seqs"] == engine.llm_kwargs(QWEN3_4B_FP8)["max_num_seqs"]
+    assert sampling_kwargs([1, 2]) == {
+        "temperature": 0.0, "max_tokens": 1, "min_tokens": 1,
+        "allowed_token_ids": [1, 2]}
+    # the diffusion sampler rejects everything but the length; a
+    # one-row canvas returns its logprobs, a longer one free text
+    assert sampling_kwargs([1, 2], canvas_tokens=1) == {
+        "max_tokens": 1, "logprobs": -1, "detokenize": False}
+    assert sampling_kwargs([1, 2], canvas_tokens=256) == {"max_tokens": 16}
+
+
+def test_vllm_canvas_matches_quail_after_boot_and_slot_reuse(monkeypatch):
+    from quail.backends.quail.executor.models.diffusion_gemma import canvas_token_ids
+    from quail.backends.vllm import diffusion_canvas
+    from quail.specs import DIFFUSION_GEMMA_26B_FP8
+
+    spec = DIFFUSION_GEMMA_26B_FP8
+
+    class States:
+        canvas_length = 1
+        vocab_size = spec.vocab
+
+        def __init__(self):
+            self.canvas = np.full((4, 1), -1, dtype=np.int64)
+
+    module = SimpleNamespace(DiffusionGemmaRequestStates=States)
+    monkeypatch.setitem(sys.modules, "vllm.model_executor.models",
+                        SimpleNamespace(diffusion_gemma=module))
+    with diffusion_canvas(spec) as tokens:
+        states = module.DiffusionGemmaRequestStates()
+    assert module.DiffusionGemmaRequestStates is States
+    assert tokens == canvas_token_ids(spec.vocab, 1)
+    states.init_canvas(np.array([3, 1]))
+    assert states.canvas[:, 0].tolist() == [-1, tokens[0], -1, tokens[0]]
+    states.canvas[1] = 42
+    states.init_canvas(np.array([1]))
+    assert states.canvas[1, 0] == tokens[0]
+    states.vocab_size = 100
+    with pytest.raises(ValueError, match="canvas geometry"):
+        states.init_canvas(np.array([0]))
+    with pytest.raises(RuntimeError, match="boot failed"), diffusion_canvas(spec):
+        raise RuntimeError("boot failed")
+    assert module.DiffusionGemmaRequestStates is States
+    with diffusion_canvas(QWEN3_4B_FP8) as tokens:
+        assert tokens == ()
+        assert module.DiffusionGemmaRequestStates is States
+
+
+def test_diffusion_filter_and_join_use_scores_instead_of_sampled_tokens():
+    from quail.specs import DIFFUSION_GEMMA_26B_FP8
+
+    class ScoredClient(_Client):
+        def generate(self, prompts, sampling_params, use_tqdm=False):
+            outputs = super().generate(prompts, sampling_params, use_tqdm)
+            for output in outputs:
+                expected = output.outputs[0].token_ids[0] == 1
+                output.outputs[0].token_ids = [int(not expected)]
+                output.outputs[0].logprobs = [{
+                    1: SimpleNamespace(logprob=-1 if expected else -2),
+                    0: SimpleNamespace(logprob=-2 if expected else -1),
+                }]
+            return outputs
+
+    execution = _execution(
+        {"r": [[10], [11]], "p": [[20], [21]]},
+        model=DIFFUSION_GEMMA_26B_FP8, client=ScoredClient(),
+        false_ids=[0], sampling_params=SimpleNamespace(logprobs=500))
+    filters = RequestExecution(
+        node_id="filter", backend_name="stock_vllm", aliases=("r",),
+        preamble_token_ids=(3,),
+        filters=(RequestFilterSpec(alias="r", written_positions=(0,),
+                                   question_token_ids=((90,),)),))
+    filtered = execution.execute(filters, {})
+    assert filtered.outputs["filter_answers:r"]["answer"].to_pylist() == [True, False]
+    join = RequestExecution(
+        node_id="join", backend_name="stock_vllm", aliases=("r", "p"),
+        preamble_token_ids=(3,),
+        joins=(RequestJoinSpec(
+            written_pos=0, aliases=("r", "p"), outer_aliases=("r",),
+            anchor="r", semantics="full", selectivity=0.5,
+            label_token_ids=(("r", (40,)), ("p", (41,))),
+            frame_token_ids=(("r", (30,)), ("p", (31,))),
+            tail_token_ids=(50,),
+        ),))
+    joined = execution.execute(join, {})
+    assert joined.outputs["join_answers:0"]["answer"].to_pylist() == [
+        True, True, False, False]

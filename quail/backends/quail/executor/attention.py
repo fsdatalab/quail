@@ -15,30 +15,28 @@ unfused equivalents. torch is imported lazily.
 A forward loop, in models/<arch>.py, calls four primitives: norm_quant,
 qk_norm_rope, attention, and activation_quant. Each picks the kernel
 set and the precision path itself; the attention path comes with the
-Chunk that pack_chunk built.
+Chunk that pack_chunk built. A loop whose layers differ in head
+geometry calls attention_unified directly with (rows, heads, dim)
+tensors, its own softmax scale, and its sliding window.
 
 The fused qk_norm_rope kernel assumes per-head Q and K RMSNorm before
-rotary, as Qwen3 has.
+rotary, as Qwen3 and Gemma 4 have; qkv_norm_rope_heads is its form
+for any head geometry, with Gemma's weightless per-head V norm.
 """
 
 from dataclasses import dataclass
 from typing import Any
 
 GROUP = 128            # fp8 quant group size, matches the engine
+# FlashAttention 3's widest head; wider heads run FlashAttention 4,
+# whose Hopper build takes heads up to 512, over arena pages.
+FA_MAX_HEAD_DIM = 256
 
-# Filters run "unified" (one causal paged attention call); joins run
-# "merge_quant" (two-call pattern with fused merge+quant kernel).
+# Filters run "unified" (one causal paged attention call); a join's
+# chunks run the path the model pipeline names, "merge_quant" (two
+# calls with the fused merge+quant kernel) for the fp8 Qwen3 models.
 FILTER_ATTENTION = "unified"
 JOIN_ATTENTION = "merge_quant"
-
-
-def join_attention_mode(is_fp8: bool) -> str:
-    """The path a join's chunks run.
-
-    merge_quant writes fp8 GEMM inputs, so bf16 weights run the
-    unified path instead.
-    """
-    return JOIN_ATTENTION if is_fp8 else FILTER_ATTENTION
 
 
 @dataclass
@@ -56,6 +54,8 @@ class Chunk:
         tokens: Rows in the chunk.
         layout: (arena key, suffix count) per group in chunk order.
         temporary_keys: Arena keys the loop frees after the forward pass.
+        fresh_keys: Keys whose prefix this chunk computes; the loop
+            trims their sliding pages after the pass.
     """
 
     input_ids: Any
@@ -66,6 +66,7 @@ class Chunk:
     tokens: int
     layout: list
     temporary_keys: tuple = ()
+    fresh_keys: tuple = ()
 
 
 def flash_attention_version(capability: tuple[int, int]) -> int:
@@ -152,16 +153,116 @@ class Engine:
             dtype=self.torch.float32, device="cuda").permute(-1, -2)
 
     def rms_norm(self, x, norm):
+        return self.norm_rows(x, norm.weight, norm.variance_epsilon)
+
+    def norm_rows(self, x, weight, eps):
+        """RMS-normalize the last dimension of x with vLLM's CUDA kernel.
+
+        x may have any rank; weight is a vector over the last
+        dimension. Bypasses the module's own dispatch, which runs the
+        unfused PyTorch path on this build.
+        """
         from vllm import _custom_ops as ops
-        out = self.torch.empty_like(x)
-        ops.rms_norm(out, x, norm.weight, norm.variance_epsilon)
-        return out
+        width = x.shape[-1]
+        rows = x.reshape(-1, width)
+        if not rows.is_contiguous():
+            rows = rows.contiguous()
+        out = self.torch.empty_like(rows)
+        ops.rms_norm(out, rows, weight, eps)
+        return out.view(x.shape)
 
     def fused_add_rms_norm(self, hidden, residual, norm):
         from vllm import _custom_ops as ops
         ops.fused_add_rms_norm(hidden, residual, norm.weight,
                                norm.variance_epsilon)
         return hidden, residual
+
+    def norm_quant_rows(self, x, weight, eps):
+        """RMS-normalize rows and quantize them to fp8 with per-row scales.
+
+        One vLLM kernel. Returns the fp8 rows and their float32 scales,
+        shaped (rows, 1).
+        """
+        from vllm import _custom_ops as ops
+        return ops.rms_norm_dynamic_per_token_quant(
+            x, weight, eps, self.torch.float8_e4m3fn)
+
+    def fp8_linear(self, module, x_q, x_s):
+        """One of vLLM's fp8 linears on rows already quantized per row.
+
+        module is a vLLM linear whose weight is fp8 with per-output-
+        channel scales; its own input quantization is skipped.
+        """
+        from vllm import _custom_ops as ops
+        return ops.cutlass_scaled_mm(
+            x_q, module.weight, scale_a=x_s, scale_b=module.weight_scale,
+            out_dtype=self.torch.bfloat16, bias=getattr(module, "bias", None))
+
+    def qkv_norm_rope_heads(self, qkv, positions, *, n_q, n_kv, head_dim,
+                            q_weight, k_weight, eps, cos_sin_cache):
+        """The fused per-head q and k RMS norm plus neox rotary, any geometry.
+
+        custom_qk_norm_rope with the layer's own head counts, head
+        width, norm weights, and rotary cache instead of the engine's,
+        plus the weightless per-head norm of v. Returns contiguous q
+        (rows, n_q * head_dim), k and v (rows, n_kv * head_dim), so
+        the v slice is never copied on its own.
+        """
+        n = qkv.shape[0]
+        torch = self.torch
+        q = torch.empty((n, n_q * head_dim), dtype=torch.bfloat16,
+                        device=qkv.device)
+        k = torch.empty((n, n_kv * head_dim), dtype=torch.bfloat16,
+                        device=qkv.device)
+        v = torch.empty((n, n_kv * head_dim), dtype=torch.bfloat16,
+                        device=qkv.device)
+        self._triton_kernels()["qkv"][(n,)](
+            qkv, q, k, v, cos_sin_cache, positions, q_weight, k_weight,
+            qkv.stride(0), q.stride(0), k.stride(0), v.stride(0), eps,
+            QH=n_q, KH=n_kv, HD=head_dim, HALF=head_dim // 2,
+            num_warps=8 if head_dim > 256 else 4)
+        return q, k, v
+
+    def gelu_mul_quant(self, gate_up):
+        """gelu_tanh(gate) * up, quantized to fp8 with per-row scales."""
+        n, doubled = gate_up.shape
+        half = doubled // 2
+        q = self.torch.empty((n, half), dtype=self.torch.float8_e4m3fn,
+                             device=gate_up.device)
+        scales = self.torch.empty((n, 1), dtype=self.torch.float32,
+                                  device=gate_up.device)
+        self._triton_kernels()["gelu_quant"][(n,)](
+            gate_up, q, scales, gate_up.stride(0), q.stride(0),
+            HALF=half, BLOCK=1 << (half - 1).bit_length(), num_warps=8)
+        return q, scales
+
+    def scale_add_norm_quant(self, x, residual, scale, weight, eps):
+        """Residual = residual * scale + x in place; the row norm, quantized.
+
+        norm_quant_rows with the residual scaled first. Returns the
+        fp8 rows and their float32 scales, shaped (rows, 1).
+        """
+        n, width = x.shape
+        q = self.torch.empty((n, width), dtype=self.torch.float8_e4m3fn,
+                             device=x.device)
+        scales = self.torch.empty((n, 1), dtype=self.torch.float32,
+                                  device=x.device)
+        self._triton_kernels()["scale_norm_quant"][(n,)](
+            x, residual, weight, q, scales, x.stride(0), residual.stride(0),
+            q.stride(0), float(scale), eps, H=width,
+            BLOCK=1 << (width - 1).bit_length(), num_warps=8)
+        return q, scales
+
+    def norm_rows2(self, x, weight1, weight2, eps):
+        """Two RMS norms of the same rows from one read."""
+        n, width = x.shape
+        o1 = self.torch.empty_like(x)
+        o2 = self.torch.empty_like(x)
+        self._triton_kernels()["norm2"][(n,)](
+            x, weight1, weight2, o1, o2, x.stride(0), o1.stride(0),
+            o2.stride(0), eps, H=width, BLOCK=1 << (width - 1).bit_length(),
+            num_warps=8)
+        return o1, o2
 
     # ---- the Triton fused kernels -----------------------------------
     # Each fuses a sequence of vLLM ops into one kernel launch.
@@ -347,9 +448,146 @@ class Engine:
                      tl.reshape(q, (D * GPB,)).to(q_ptr.dtype.element_ty))
             tl.store(s_ptr + heads * s_stride_g + t * s_stride_t, scale)
 
+        # gelu_tanh_and_mul fused with the per-row fp8 quantization the
+        # next linear would run on its output
+        @triton.jit
+        def gelu_mul_quant(gu_ptr, q_ptr, s_ptr, stride_gu, stride_q,
+                           HALF: tl.constexpr, BLOCK: tl.constexpr):
+            t = tl.program_id(0)
+            offs = tl.arange(0, BLOCK)
+            mask = offs < HALF
+            gate = tl.load(gu_ptr + t * stride_gu + offs, mask=mask,
+                           other=0.0).to(tl.float32)
+            up = tl.load(gu_ptr + t * stride_gu + HALF + offs, mask=mask,
+                         other=0.0).to(tl.float32)
+            inner = 0.7978845608028654 * (gate + 0.044715 * gate * gate * gate)
+            th = 1.0 - 2.0 / (tl.exp(2.0 * inner) + 1.0)
+            y = 0.5 * gate * (1.0 + th) * up
+            # the unfused path rounds the activation to bf16 first
+            y = y.to(tl.bfloat16).to(tl.float32)
+            amax = tl.max(tl.abs(y), axis=0)
+            scale = tl.maximum(amax / 448.0, 1.0 / (448.0 * 512.0))
+            q = tl.minimum(tl.maximum(y / scale, -448.0), 448.0)
+            tl.store(q_ptr + t * stride_q + offs,
+                     q.to(q_ptr.dtype.element_ty), mask=mask)
+            tl.store(s_ptr + t, scale)
+
+        # vLLM's rms_norm_dynamic_per_token_quant with a residual,
+        # with the residual scaled first: residual = residual * scale
+        # + x, then the row norm quantized per row
+        @triton.jit
+        def scale_add_rms_norm_quant(x_ptr, res_ptr, w_ptr, q_ptr, s_ptr,
+                                     stride_x, stride_res, stride_q,
+                                     scale, eps, H: tl.constexpr,
+                                     BLOCK: tl.constexpr):
+            t = tl.program_id(0)
+            offs = tl.arange(0, BLOCK)
+            mask = offs < H
+            x = tl.load(x_ptr + t * stride_x + offs, mask=mask,
+                        other=0.0).to(tl.float32)
+            r = tl.load(res_ptr + t * stride_res + offs, mask=mask,
+                        other=0.0).to(tl.float32)
+            r = r * scale + x
+            tl.store(res_ptr + t * stride_res + offs,
+                     r.to(res_ptr.dtype.element_ty), mask=mask)
+            ms = tl.sum(r * r, axis=0) / H
+            rstd = 1.0 / tl.sqrt(ms + eps)
+            w = tl.load(w_ptr + offs, mask=mask, other=0.0)
+            y = ((r * rstd).to(tl.bfloat16) * w.to(tl.bfloat16)).to(tl.float32)
+            amax = tl.max(tl.abs(y), axis=0)
+            qscale = tl.maximum(amax / 448.0, 1.0 / (448.0 * 512.0))
+            q = tl.minimum(tl.maximum(y / qscale, -448.0), 448.0)
+            tl.store(q_ptr + t * stride_q + offs,
+                     q.to(q_ptr.dtype.element_ty), mask=mask)
+            tl.store(s_ptr + t, qscale)
+
+        # one read of a row for two RMS norms with different weights
+        @triton.jit
+        def rms_norm2(x_ptr, w1_ptr, w2_ptr, o1_ptr, o2_ptr, stride_x,
+                      stride_o1, stride_o2, eps, H: tl.constexpr,
+                      BLOCK: tl.constexpr):
+            t = tl.program_id(0)
+            offs = tl.arange(0, BLOCK)
+            mask = offs < H
+            x = tl.load(x_ptr + t * stride_x + offs, mask=mask,
+                        other=0.0).to(tl.float32)
+            ms = tl.sum(x * x, axis=0) / H
+            xn = x * (1.0 / tl.sqrt(ms + eps))
+            w1 = tl.load(w1_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+            w2 = tl.load(w2_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+            tl.store(o1_ptr + t * stride_o1 + offs,
+                     (xn * w1).to(o1_ptr.dtype.element_ty), mask=mask)
+            tl.store(o2_ptr + t * stride_o2 + offs,
+                     (xn * w2).to(o2_ptr.dtype.element_ty), mask=mask)
+
+        # qk_norm_rope plus the weightless per-head v norm Gemma
+        # applies, written contiguous for the KV scatter
+        @triton.jit
+        def qkv_norm_rope(qkv_ptr, q_out_ptr, k_out_ptr, v_out_ptr, cs_ptr,
+                          pos_ptr, qw_ptr, kw_ptr, stride_qkv, stride_qo,
+                          stride_ko, stride_vo, eps, QH: tl.constexpr,
+                          KH: tl.constexpr, HD: tl.constexpr,
+                          HALF: tl.constexpr):
+            t = tl.program_id(0)
+            pos = tl.load(pos_ptr + t)
+            half_offs = tl.arange(0, HALF)
+            cos = tl.load(cs_ptr + pos * HD + half_offs).to(tl.float32)
+            sin = tl.load(cs_ptr + pos * HD + HALF + half_offs).to(tl.float32)
+            qw_a = tl.load(qw_ptr + half_offs).to(tl.float32)
+            qw_b = tl.load(qw_ptr + HALF + half_offs).to(tl.float32)
+            kw_a = tl.load(kw_ptr + half_offs).to(tl.float32)
+            kw_b = tl.load(kw_ptr + HALF + half_offs).to(tl.float32)
+
+            q_heads = tl.arange(0, QH)
+            qa_offs = q_heads[:, None] * HD + half_offs[None, :]
+            qb_offs = qa_offs + HALF
+            qa = tl.load(qkv_ptr + t * stride_qkv + qa_offs).to(tl.float32)
+            qb = tl.load(qkv_ptr + t * stride_qkv + qb_offs).to(tl.float32)
+            ms = (tl.sum(qa * qa, axis=1) + tl.sum(qb * qb, axis=1)) / HD
+            rstd = 1.0 / tl.sqrt(ms + eps)
+            qa = qa * rstd[:, None] * qw_a[None, :]
+            qb = qb * rstd[:, None] * qw_b[None, :]
+            out_a = qa * cos[None, :] - qb * sin[None, :]
+            out_b = qb * cos[None, :] + qa * sin[None, :]
+            tl.store(q_out_ptr + t * stride_qo + qa_offs,
+                     out_a.to(q_out_ptr.dtype.element_ty))
+            tl.store(q_out_ptr + t * stride_qo + qb_offs,
+                     out_b.to(q_out_ptr.dtype.element_ty))
+
+            k_heads = tl.arange(0, KH)
+            ka_offs = k_heads[:, None] * HD + half_offs[None, :]
+            kb_offs = ka_offs + HALF
+            base = qkv_ptr + t * stride_qkv + QH * HD
+            ka = tl.load(base + ka_offs).to(tl.float32)
+            kb = tl.load(base + kb_offs).to(tl.float32)
+            ms = (tl.sum(ka * ka, axis=1) + tl.sum(kb * kb, axis=1)) / HD
+            rstd = 1.0 / tl.sqrt(ms + eps)
+            ka = ka * rstd[:, None] * kw_a[None, :]
+            kb = kb * rstd[:, None] * kw_b[None, :]
+            out_a = ka * cos[None, :] - kb * sin[None, :]
+            out_b = kb * cos[None, :] + ka * sin[None, :]
+            tl.store(k_out_ptr + t * stride_ko + ka_offs,
+                     out_a.to(k_out_ptr.dtype.element_ty))
+            tl.store(k_out_ptr + t * stride_ko + kb_offs,
+                     out_b.to(k_out_ptr.dtype.element_ty))
+
+            base = qkv_ptr + t * stride_qkv + (QH + KH) * HD
+            va = tl.load(base + ka_offs).to(tl.float32)
+            vb = tl.load(base + kb_offs).to(tl.float32)
+            ms = (tl.sum(va * va, axis=1) + tl.sum(vb * vb, axis=1)) / HD
+            rstd = 1.0 / tl.sqrt(ms + eps)
+            tl.store(v_out_ptr + t * stride_vo + ka_offs,
+                     (va * rstd[:, None]).to(v_out_ptr.dtype.element_ty))
+            tl.store(v_out_ptr + t * stride_vo + kb_offs,
+                     (vb * rstd[:, None]).to(v_out_ptr.dtype.element_ty))
+
         self._kernels = {"silu": silu_mul_quant,
                          "norm": add_rms_norm_quant,
                          "qk": qk_norm_rope,
+                         "qkv": qkv_norm_rope,
+                         "gelu_quant": gelu_mul_quant,
+                         "scale_norm_quant": scale_add_rms_norm_quant,
+                         "norm2": rms_norm2,
                          "kv_scatter": kv_row_scatter,
                          "merge_quant": merge_attn_quant}
         return self._kernels
@@ -442,7 +680,7 @@ class Engine:
         """
         assert k3.is_contiguous() and v3.is_contiguous()
         n = src.shape[0]
-        row = self.num_kv_heads * self.head_dim
+        row = k3.shape[1] * k3.shape[2]
         k_pool, v_pool = self.arena.layer_kv(layer)
         self._triton_kernels()["kv_scatter"][(n,)](
             k3, v3, k_pool, v_pool, src, dst,
@@ -496,38 +734,65 @@ class Engine:
     def attention(self, q, k, v, chunk):
         """Attention over the chunk and the arena; the quantized o_proj input.
 
-        The chunk carries the path it was packed for.
-        """
-        if chunk.attention_mode == "merge_quant":
-            if not self.is_fp8:
-                raise ValueError("BF16 forward passes require unified attention")
-            return self.attention_merge_quant(q, k, v, chunk.meta)
-        return self.quant(self.attention_unified(q, k, v, chunk.meta))
-
-    # ---- attention: the two workload paths --------------------------
-
-    def _fa(self, q, k, v, cu_q, cu_k, max_q, max_k, causal,
-            block_table=None, seqused_k=None):
-        # vLLM's FA2 and FA3 both accept 16-token pages and return
-        # LSE as [heads, total_queries] for the merge kernel.
-        from vllm.vllm_flash_attn import flash_attn_varlen_func
-        return flash_attn_varlen_func(
-            q, k, v, max_seqlen_q=max_q, cu_seqlens_q=cu_q,
-            max_seqlen_k=max_k, cu_seqlens_k=cu_k,
-            block_table=block_table, seqused_k=seqused_k,
-            causal=causal, fa_version=self.fa_version, return_softmax_lse=True)
-
-    def attention_merge_quant(self, q, k, v, meta):
-        """The two-call attention path with the fused merge plus FP8 quantize.
-
-        Returns the input pair for o_proj.
+        The chunk carries the path it was packed for. q, k, and v are
+        the flat per-row projections at this engine's head geometry.
         """
         n = q.shape[0]
         H, KH, D = self.num_q_heads, self.num_kv_heads, self.head_dim
         q3 = q.view(n, H, D)
         k3 = k.view(n, KH, D)
         v3 = v.contiguous().view(n, KH, D)
+        if chunk.attention_mode == "merge_quant":
+            if not self.is_fp8:
+                raise ValueError("BF16 forward passes require unified attention")
+            return self.attention_merge_quant(q3, k3, v3, chunk.meta)
+        return self.quant(self.attention_unified(q3, k3, v3, chunk.meta))
+
+    # ---- attention: the two workload paths --------------------------
+
+    def _fa(self, q, k, v, cu_q, cu_k, max_q, max_k, causal,
+            block_table=None, seqused_k=None, softmax_scale=None,
+            window=None, version=None):
+        # vLLM's FA2 and FA3 both accept 16-token pages and return
+        # LSE as [heads, total_queries] for the merge kernel.
+        from vllm.vllm_flash_attn import flash_attn_varlen_func
+        extra = {}
+        if softmax_scale is not None:
+            extra["softmax_scale"] = softmax_scale
+        if window is not None:
+            extra["window_size"] = list(window)
+        return flash_attn_varlen_func(
+            q, k, v, max_seqlen_q=max_q, cu_seqlens_q=cu_q,
+            max_seqlen_k=max_k, cu_seqlens_k=cu_k,
+            block_table=block_table, seqused_k=seqused_k,
+            causal=causal, fa_version=version or self.fa_version,
+            return_softmax_lse=True, **extra)
+
+    def _paged(self, q3, kp, vp, cu_q, max_q, used, max_used, table, *,
+               causal, softmax_scale=None, window=None):
+        """One paged attention call.
+
+        FlashAttention 3, or FlashAttention 4 when the head is wider
+        than it takes.
+        """
+        wide = q3.shape[-1] > FA_MAX_HEAD_DIM
+        out, _ = self._fa(
+            q3, kp, vp, cu_q, None, max_q, max_used, causal=causal,
+            block_table=table, seqused_k=used,
+            softmax_scale=softmax_scale, window=window,
+            version=4 if wide else None)
+        return out
+
+    def attention_merge_quant(self, q3, k3, v3, meta):
+        """The two-call attention path with the fused merge plus FP8 quantize.
+
+        Takes (rows, heads, dim) tensors and returns the input pair
+        for o_proj. Canvas rows are not packed for this path.
+        """
+        n, H, D = q3.shape
         layer = meta["layer"]
+        if meta.get("canvas") is not None:
+            raise ValueError("canvas rows run the unified attention path")
 
         if meta["kv_src"] is not None:
             self.kv_row_scatter(k3, v3, meta["kv_src"], meta["kv_dst"],
@@ -555,38 +820,85 @@ class Engine:
         meta["layer"] += 1
         return q_out, scales
 
-    def attention_unified(self, q, k, v, meta):
+    def _pool(self, layer, tables):
+        """The block tables a layer reads: the sliding pool's on a sliding layer."""
+        if tables is None or layer not in self.arena.sliding_layers:
+            return tables
+        return tables.get("sliding") or tables
+
+    def attention_unified(self, q3, k3, v3, meta, *, softmax_scale=None,
+                          window=None):
         """Write current KV to its cache slots, then one causal paged attention call.
 
-        The call reads retained and current KV together.
+        The call reads retained and current KV together. Takes
+        (rows, heads, dim) tensors and returns (rows, heads * dim).
 
         When meta["unified"] is None (no arena pages), falls back to
         a plain varlen causal call with no scatter or paged read.
+
+        Canvas rows (meta["canvas"]) get a second, non-causal call
+        over the same KV: each canvas row sees its whole prompt and
+        every row of its own canvas. Its result replaces the causal
+        call's rows. A one-row canvas is the last row of its causal
+        segment, which already sees the whole prompt, so it skips the
+        second call.
+
+        Args:
+            q3: Queries, (rows, heads, dim).
+            k3: Keys, (rows, KV heads, dim), contiguous.
+            v3: Values, (rows, KV heads, dim), contiguous.
+            meta: The chunk's attention bookkeeping from pack_chunk.
+            softmax_scale: Attention logit scale; None is 1/sqrt(dim).
+            window: Sliding window in tokens, or None for full
+                attention. Causal rows see `window` keys behind them;
+                canvas rows see `window` keys on either side.
         """
-        n = q.shape[0]
-        H, KH, D = self.num_q_heads, self.num_kv_heads, self.head_dim
-        q3 = q.view(n, H, D)
-        k3 = k.view(n, KH, D)
-        v3 = v.contiguous().view(n, KH, D)
+        n = q3.shape[0]
         layer = meta["layer"]
         unified = meta["unified"]
+        canvas = meta.get("canvas")
+        if canvas is not None and canvas["max_q"] == 1:
+            canvas = None
+        behind = None if window is None else (window - 1, 0)
+        around = None if window is None else (window - 1, window - 1)
+        pool = self._pool(layer, unified)
+        canvas_pool = self._pool(layer, canvas)
         if unified is None:
+            if q3.shape[-1] > FA_MAX_HEAD_DIM:
+                raise ValueError(
+                    f"a {q3.shape[-1]}-wide head runs paged attention "
+                    f"only; pack the chunk with arena pages")
             out, _ = self._fa(
                 q3, k3, v3, meta["cu_a"], meta["cu_a"],
-                meta["max_a"], meta["max_a"], causal=True)
+                meta["max_a"], meta["max_a"], causal=True,
+                softmax_scale=softmax_scale, window=behind)
+            if canvas is not None:
+                q_c = q3.index_select(0, canvas["rows"])
+                out_c, _ = self._fa(
+                    q_c, k3, v3, canvas["cu_q"], meta["cu_a"],
+                    canvas["max_q"], meta["max_a"], causal=False,
+                    softmax_scale=softmax_scale, window=around)
+                out.index_copy_(0, canvas["rows"], out_c)
             meta["layer"] += 1
-            return out.view(n, H * D)
-        if unified["src"].numel():
-            self.kv_row_scatter(k3, v3, unified["src"], unified["dst"],
-                                layer)
-        if unified["tail_src"] is not None:
+            return out.view(n, -1)
+        if pool["src"].numel():
+            self.kv_row_scatter(k3, v3, pool["src"], pool["dst"], layer)
+        if pool["tail_src"] is not None:
             k_pool, v_pool = self.arena.layer_kv(layer)
             self.kv_row_scatter(k_pool, v_pool,
-                                unified["tail_src"], unified["tail_dst"], layer)
+                                pool["tail_src"], pool["tail_dst"], layer)
         kp, vp = self.arena.paged_kv(layer)
-        out, _ = self._fa(
-            q3, kp, vp, unified["cu_q"], None,
-            unified["max_q"], unified["max_used"], causal=True,
-            block_table=unified["table"], seqused_k=unified["used"])
+        out = self._paged(
+            q3, kp, vp, unified["cu_q"], unified["max_q"], pool["used"],
+            pool["max_used"], pool["table"], causal=True,
+            softmax_scale=softmax_scale, window=behind)
+        if canvas is not None:
+            q_c = q3.index_select(0, canvas["rows"])
+            out_c = self._paged(
+                q_c, kp, vp, canvas["cu_q"], canvas["max_q"],
+                canvas_pool["used"], canvas_pool["max_used"],
+                canvas_pool["table"], causal=False,
+                softmax_scale=softmax_scale, window=around)
+            out.index_copy_(0, canvas["rows"], out_c)
         meta["layer"] += 1
-        return out.view(n, H * D)
+        return out.view(n, -1)

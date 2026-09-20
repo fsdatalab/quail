@@ -46,13 +46,17 @@ from quail.specs import DeviceSpec, ModelSpec
 
 # ---------------------------------------------------------- tree walk
 
-def _question_tokens(prompt) -> int:
-    """Token count of the prompt's per-evaluation tail."""
+def _question_tokens(prompt, canvas: int = 0) -> int:
+    """Token count of the prompt's per-evaluation tail.
+
+    canvas is the rows a diffusion model appends to every evaluation
+    to answer on; a decoder answers on the tail's last row.
+    """
     if prompt.tail_tokens is None or prompt.preamble_tokens is None:
         raise ValueError(
             "prompts were bound without a tokenizer; the planner "
             "needs token counts (pass one to compile_sql / docs)")
-    return prompt.tail_tokens
+    return prompt.tail_tokens + canvas
 
 
 def preamble_tokens(filters, joins) -> int:
@@ -88,7 +92,8 @@ def filter_cost(predicate, prefix_tokens: float, model: ModelSpec,
                 device: DeviceSpec, chunk_tokens: int, *, first: bool) -> float:
     """Return ideal time for one filter evaluation."""
     operation = scan if first else ask
-    work = operation(prefix_tokens, _question_tokens(predicate.prompt))
+    work = operation(prefix_tokens,
+                     _question_tokens(predicate.prompt, model.canvas_tokens))
     return unrounded_seconds(work, model, device, chunk_tokens)
 
 
@@ -170,12 +175,13 @@ def _label_counts(join) -> dict:
     return out
 
 
-def join_specs(joins, pair_fractions=None) -> list:
+def join_specs(joins, pair_fractions=None, canvas: int = 0) -> list:
     """The joins as the search's spec dicts, in written order.
 
     pair_fractions maps a written position to the fraction of the
     cross product its equality conditions keep; a join with
     conditions but no entry is priced as the full cross product.
+    canvas is the rows a diffusion model appends to every pair.
     """
     pair_fractions = pair_fractions or {}
     out = []
@@ -188,7 +194,7 @@ def join_specs(joins, pair_fractions=None) -> list:
             semantics=j.semantics, selectivity=j.selectivity,
             frame_tokens={a: nt for a, (lt, nt) in labels.items()},
             label_tokens={a: lt for a, (lt, nt) in labels.items()},
-            tail_tokens=_question_tokens(j.prompt),
+            tail_tokens=_question_tokens(j.prompt, canvas),
             on=[(c.left.alias, c.left.column, c.right.alias, c.right.column)
                 for c in conditions],
             pair_fraction=(pair_fractions.get(i, 1.0) if conditions
@@ -228,14 +234,15 @@ def hash_join_nodes(joins, pair_fractions, scan_ports) -> list:
     return nodes
 
 
-def _filter_alias_work(preds, stats, order, pre: int) -> Work:
+def _filter_alias_work(preds, stats, order, pre: int,
+                       canvas: int = 0) -> Work:
     """Expected Work of one filter chain: a scan, then asks over KV."""
     total = Work()
     mean = stats.mean_doc_tokens
     n = float(stats.n_docs)
     for si, predicate_index in enumerate(order):
         p = preds[predicate_index]
-        q = _question_tokens(p.prompt)
+        q = _question_tokens(p.prompt, canvas)
         op = scan if si == 0 else ask
         total = total + op(pre + mean, q) * n
         n *= effective_selectivity(p.selectivity)
@@ -395,9 +402,13 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     workers = gpus
 
     chunk = budgets.chunk_budget(model, device)
-    admission = budgets.arena_tokens(model, device, chunk)
+    # the longest documents bind the sliding-pool split
+    longest_mean = max(
+        (st.mean_doc_tokens for st in stats.values()), default=None)
+    arena_split = budgets.arena_pages(model, device, chunk, longest_mean)
+    admission = arena_split[0] * budgets.PAGE_TOKENS
     pre = preamble_tokens(filters, joins)
-    specs = join_specs(joins, pair_fractions)
+    specs = join_specs(joins, pair_fractions, model.canvas_tokens)
 
     # ---- the order rule first: the search below needs it
     rule, source = (order, f"user: order={order!r}") if order else \
@@ -421,7 +432,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
         live0[_filter_alias(fs[0])] *= surv
     filter_works = {
         alias: _filter_alias_work(preds, stats[alias], filter_orders[alias],
-                                  pre)
+                                  pre, model.canvas_tokens)
         for alias, preds in filters.items()
     }
     base_work = sum(filter_works.values(), Work())
@@ -507,7 +518,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     # ---- refusal checks on the predicted plan
     anchors = {wp: a for wp, a in found["seq"]}
     for s in scans:
-        fq = max((_question_tokens(p.prompt)
+        fq = max((_question_tokens(p.prompt, model.canvas_tokens)
                   for p in filters.get(s.alias, ())), default=None)
         if fq is None:
             continue
@@ -565,7 +576,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
             p = filters[alias][i]
             stages.append(FilterStage(
                 written_pos=i,
-                question_tokens=_question_tokens(p.prompt),
+                question_tokens=_question_tokens(p.prompt, model.canvas_tokens),
                 preamble_tokens=p.prompt.preamble_tokens,
                 selectivity=p.selectivity,
                 expected_docs=round(n * surv, 1)))
@@ -749,6 +760,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
         nodes=tuple(nodes), remarks=tuple(remarks),
         settings={
             "chunk_tokens": chunk,
+            "arena_pages": list(arena_split),
             "admission_tokens": admission,
             "retention": retention_plan,
             "order_rule": rule,
