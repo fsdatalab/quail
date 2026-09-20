@@ -8,6 +8,7 @@ Precision = Literal["fp8", "bf16"]
 # FALSE for AI_FILTER and AI_JOIN; a reranker scores yes against no
 # for AI.SCORE.
 Role = Literal["generative", "reranker"]
+InputModality = Literal["text", "image"]
 
 # Peak per-token activation bytes per hidden dim.
 ACT_BYTES_PER_HIDDEN = 32
@@ -71,6 +72,20 @@ class ModelSpec:
     #                                   of its MoEBackend names ("triton",
     #                                   "cutlass", "deep_gemm", ...);
     #                                   None lets vLLM pick
+    # Image input. A text-only model leaves these at their defaults.
+    input_modalities: frozenset[InputModality] = frozenset({"text"})
+    image_token_budgets: tuple[int, ...] = ()    # soft tokens one image
+    #                                              may use, as the image
+    #                                              processor accepts
+    default_image_tokens: int = 0    # budget when EngineConfig names none
+    max_images_per_request: int | None = None    # largest image count
+    #                                              one prompt was tested
+    #                                              with; None: untested
+    image_patch_pixels: int = 0    # side of one vision patch, in pixels
+    image_pool_kernel: int = 0     # patches pooled into one soft token,
+    #                                per side
+    image_frame_tokens: int = 0    # tokens around one image's soft
+    #                                tokens (begin and end markers)
 
     def is_full_layer(self, layer: int) -> bool:
         """Whether the layer keeps every token with the full KV geometry."""
