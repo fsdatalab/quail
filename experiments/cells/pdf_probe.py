@@ -28,6 +28,8 @@ Run from the repository root:
     uv run modal run -m experiments.cells.pdf_probe 2>&1 \\
         | tee /tmp/pdf_probe.log
 
+Pass ``--only render`` or ``--only vision`` to run one probe.
+
 Records land on the quail-results volume under
 /results/ablations/pdf_probe_vision.json and pdf_probe_render.json.
 """
@@ -303,13 +305,16 @@ def _time_encoder(torch, model, model_path):
         pixel_values = features["pixel_values"].to("cuda", torch.bfloat16)
         positions = features["image_position_ids"].to("cuda")
         timings = []
-        for _ in range(4):
-            torch.cuda.synchronize()
-            started = time.perf_counter()
-            embeds = model.embed_multimodal(
-                pixel_values=pixel_values, pixel_position_ids=positions)
-            torch.cuda.synchronize()
-            timings.append(time.perf_counter() - started)
+        # the loaded modules still require grad; without inference mode
+        # autograd keeps every encoder layer's activations
+        with torch.inference_mode():
+            for _ in range(4):
+                torch.cuda.synchronize()
+                started = time.perf_counter()
+                embeds = model.embed_multimodal(
+                    pixel_values=pixel_values, pixel_position_ids=positions)
+                torch.cuda.synchronize()
+                timings.append(time.perf_counter() - started)
         out[f"images_{count}"] = {
             "warm_ms": 1000 * min(timings[1:]),
             "first_ms": 1000 * timings[0],
@@ -323,10 +328,14 @@ def _time_encoder(torch, model, model_path):
 
 
 @app.local_entrypoint()
-def main():
-    render_call = probe_render.spawn()
-    vision_call = probe_vision.spawn()
-    print(f"probe_render function call id: {render_call.object_id}", flush=True)
-    print(f"probe_vision function call id: {vision_call.object_id}", flush=True)
-    render_call.get()
-    vision_call.get()
+def main(only: str = ""):
+    """Run both probes, or one of them with --only render|vision."""
+    calls = []
+    if only in ("", "render"):
+        calls.append(("probe_render", probe_render.spawn()))
+    if only in ("", "vision"):
+        calls.append(("probe_vision", probe_vision.spawn()))
+    for name, call in calls:
+        print(f"{name} function call id: {call.object_id}", flush=True)
+    for _, call in calls:
+        call.get()
