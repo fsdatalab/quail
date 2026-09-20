@@ -489,3 +489,49 @@ def test_fixed_join_order_does_not_reuse_automatic_anchor_labels():
             spec, "c_test", "0" * 64, judge=labeling.QUAIL_JUDGE_SPEC)
         new = labeling.label_set_identity(spec, "c_test", "0" * 64)
         assert (new["label_set_id"] != old["label_set_id"]) == changed
+
+
+def test_activate_new_predicate_reuses_existing_workload_labels(monkeypatch, tmp_path):
+    import json
+
+    old = _spec("quailb.biodex.report.describes_serious_adverse_event")
+    new = _spec("quailb.biodex.reaction.is_neurological")
+    monkeypatch.setattr(labeling, "ROOT", tmp_path)
+    monkeypatch.setattr(labeling, "PREDICATES", (old, new))
+    report_table = {"rows": 1, "ordered_rows_full_hash": "same-reports"}
+    for corpus_id in ("c_source", "c_target"):
+        manifest = {
+            "corpus_id": corpus_id, "corpus_full_hash": corpus_id + "-full",
+            "scale_factor": 0.1,
+            "tables": {"reports": report_table,
+                       "terms": {"rows": 1, "ordered_rows_full_hash": corpus_id}},
+        }
+        labeling._atomic_json(
+            tmp_path / "corpora" / corpus_id / "manifest.json", manifest)
+    source = {
+        "collection_id": "gt_source", "status": "complete",
+        "corpus_id": "c_source", "scale_factor": 0.1,
+        "label_sets": {old.key: "ls_original"},
+    }
+    labeling._atomic_json(
+        tmp_path / "collections/gt_source/manifest.json", source)
+    identity = labeling.label_set_identity(new, "c_target", "c_target-full")
+    for spec, label_id, corpus in (
+            (old, "ls_original", "c_source"),
+            (new, identity["label_set_id"], "c_target")):
+        labeling._atomic_json(
+            labeling._label_dir(spec, {"label_set_id": label_id}) / "manifest.json",
+            {"label_set_id": label_id, "status": "complete",
+             "corpus_id": corpus, "corpus_full_hash": corpus + "-full",
+             "rows": 1, "true_rows": 1, "source_rows": {MODEL_NAME: 1}})
+    summary = labeling.activate_reused_collection(
+        0.1, "c_target", "gt_source", "", relabeled_predicates=(new.key,))
+    assert summary["reused_predicates"] == 1
+    assert summary["new_predicates"] == 1
+    assert summary["label_sets"][old.key]["label_set_id"] == "ls_original"
+    assert summary["label_sets"][new.key]["label_set_id"] == identity["label_set_id"]
+    active = tmp_path / "corpora/c_target/active_collection.raw-v1.json"
+    assert json.loads(active.read_text())["collection_id"] == summary["collection_id"]
+    with pytest.raises(ValueError, match="unknown relabeled predicates"):
+        labeling.activate_reused_collection(
+            0.1, "c_target", "gt_source", "", relabeled_predicates=("unknown",))
