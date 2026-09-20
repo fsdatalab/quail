@@ -71,6 +71,7 @@ plus a Python builder API.
 | --- | --- |
 | Qwen3 4B fp8 | NVIDIA H100 SXM |
 | Qwen3 32B fp8 | NVIDIA RTX PRO 6000 Blackwell Server Edition |
+| DiffusionGemma 26B-A4B fp8 | NVIDIA H100 SXM |
 
 1, 2, 4, or 8 GPUs per query. We are actively adding more models
 and hardware.
