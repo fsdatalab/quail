@@ -437,21 +437,33 @@ def test_filter_admission_takes_canvas_in_stage_tokens():
     assert first == [(0, 0, True), (1, 0, True)]
 
 
-def test_tuned_moe_configs_cover_the_chunk_sizes(tmp_path):
+def test_tuned_moe_configs_preserve_upstream_settings(tmp_path):
     import json
 
     from quail.backends.quail.executor.moe_configs import TUNED, write_configs
 
-    folder = write_configs(tmp_path / "configs")
-    files = sorted(folder.glob("*.json"))
-    assert [path.name for path in files] == sorted(TUNED)
-    for path in files:
-        assert "E=128,N=704" in path.name
-        table = json.load(open(path))
-        for rows in ("16384", "32768", "65536"):
-            assert set(table[rows]) == {"BLOCK_SIZE_M", "BLOCK_SIZE_N",
-                                        "BLOCK_SIZE_K", "GROUP_SIZE_M",
-                                        "num_warps", "num_stages"}
+    base = tmp_path / "vllm"
+    base.mkdir()
+    upstream = {"16384": {"BLOCK_SIZE_M": 64}, "32768": {"BLOCK_SIZE_M": 16}}
+    for name in TUNED:
+        (base / name).write_text(json.dumps(upstream))
+    folder = write_configs(tmp_path / "configs", base)
+    for name, overrides in TUNED.items():
+        table = json.loads((folder / name).read_text())
+        assert table["16384"] == upstream["16384"]
+        assert table["32768"] == overrides["32768"]
+        assert table["65536"] == overrides["65536"]
+
+
+def test_tuned_moe_configs_fall_back_without_a_matching_upstream_table(tmp_path):
+    from quail.backends.quail.executor.moe_configs import TUNED, write_configs
+
+    folder = tmp_path / "configs"
+    folder.mkdir()
+    for name in TUNED:
+        (folder / name).write_text("{}")
+    write_configs(folder, tmp_path / "missing")
+    assert list(folder.glob("*.json")) == []
 
 
 @pytest.mark.parametrize("canvas, calls", [((90,), 1), ((90, 91), 2)])

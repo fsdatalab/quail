@@ -148,6 +148,7 @@ def load_model(model_name: str, revision: str | None = None, *,
     import tempfile
 
     import torch
+    import vllm
     from vllm.config import set_current_vllm_config
     from vllm.engine.arg_utils import EngineArgs
     from vllm.model_executor.model_loader import get_model
@@ -155,7 +156,9 @@ def load_model(model_name: str, revision: str | None = None, *,
     # vLLM's Triton fused MoE reads tuned tile configs from this
     # folder before its own; ours add entries for Quail's chunk sizes
     if "VLLM_TUNED_CONFIG_FOLDER" not in os.environ:
-        folder = write_configs(Path(tempfile.gettempdir()) / "quail-moe-configs")
+        base = Path(vllm.__file__).parent / "model_executor/layers/fused_moe/configs"
+        folder = write_configs(
+            Path(tempfile.gettempdir()) / "quail-moe-configs", base)
         os.environ["VLLM_TUNED_CONFIG_FOLDER"] = str(folder)
     model_path = resolve_model_path(model_name, revision)
     args = dict(model=model_path, dtype="auto", enforce_eager=True)

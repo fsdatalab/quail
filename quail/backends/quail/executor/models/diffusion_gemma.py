@@ -1,29 +1,8 @@
-"""DiffusionGemma forward pass over vLLM's loaded module.
+"""Run one DiffusionGemma forward pass with Quail's batching and KV.
 
-One pass per document: the prompt rows run in the model's encoder
-mode (causal attention, KV written to the arena) and the canvas rows
-that follow each answer cue run in its decoder mode (bidirectional
-over the canvas, reading the whole prompt, KV never kept). The TRUE
-and FALSE logits at the first canvas row are the answer, which is
-what the model's own sampler commits on its first denoising step
-when it is confident. There is no further denoising.
-
-Layer order, from vLLM's Gemma4DecoderLayer: input RMSNorm, fused
-QKV projection, per-head Q and K RMSNorm with rotary, unweighted V
-RMSNorm, attention at softmax scale 1.0 (sliding window on the
-sliding layers), output projection, post-attention RMSNorm, residual
-add; pre-feedforward RMSNorm, the dense MLP and the routed experts
-side by side with their own norms, post-feedforward RMSNorm,
-residual add, per-layer scalar. Embeddings are scaled by
-sqrt(hidden). Each canvas row's embedding passes through the
-self-conditioning post-norm with a zero conditioning signal, as on
-the sampler's first step.
-
-The projections and expert kernels are the loaded vLLM modules,
-called as they are: the checkpoint's fp8 weights carry per-channel
-scales with per-token activation quantization, which vLLM's own
-linear path handles. The norms and rotary go through the engine's
-kernels. Attention and packing are Quail's.
+Each prompt ends with a fixed canvas token. Its embedding receives the
+self-conditioning norm with zero conditioning, as in the first denoising
+step. The answer comes from TRUE/FALSE scores at that position.
 """
 
 import numpy as np
@@ -75,9 +54,7 @@ class DiffusionGemmaPipeline(ModelPipeline):
     # the engine's fp8 GEMM inputs, which this model does not use
     join_attention = "unified"
     gemm_warmup = False
-    # plus the Triton fused MoE kernel's row buckets between the small
-    # chunks and the full budget: a join's deferred or trailing chunk
-    # lands in one, and its first use compiles the kernel
+    # Partial join batches also need compiled expert kernels at these sizes.
     warm_tokens = ModelPipeline.warm_tokens + (4096, 8192, 16384, 32768)
 
     def __init__(self, model, arena, *, spec, engine_class=Engine):
@@ -125,8 +102,7 @@ class DiffusionGemmaPipeline(ModelPipeline):
 
     def _norm(self, x, module):
         """One of the model's RMS norms, through the engine's kernel."""
-        # the module's own forward dispatches to an unfused PyTorch
-        # path on this vLLM build, ten times slower than the kernel
+        # The loaded module dispatches to unfused PyTorch on this vLLM version.
         weight = module.weight if module.has_weight else self._ones_like(module, x)
         return self.engine.norm_rows(x, weight, module.variance_epsilon)
 
