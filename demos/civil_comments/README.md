@@ -64,7 +64,7 @@ All primary time and cost numbers exclude model startup.
 | Backend | Query time | Tokens/s | Cost | Cost vs. Quail | Filter F1 | Join F1 |
 |---|---:|---:|---:|---:|---:|---:|
 | Quail, 1 H100 | **85.53 s** | 284,022 | **$0.0938** | **1.00×** | 0.413 | **0.287** |
-| Jev, num_threads = 256 (no query planning) | rerun pending | rerun pending | rerun pending | rerun pending | rerun pending | rerun pending |
+| Jev, num_threads = 256 (no query planning) | 244.87 s | **313,379** | $1.8892 | **20.13×** | 0.425 | 0.260 |
 | Jev, num_threads = 256 (push down predicate) | 100.20 s | 253,935 | $0.7705 | **8.21×** | **0.430** | 0.263 |
 
 ## Run
