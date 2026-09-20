@@ -131,78 +131,89 @@ async def run_pass(
     concurrency: int,
 ) -> tuple[dict[str, dict], float]:
     """Run one checkpointed parallel API pass."""
-    completed = read_answers(checkpoint)
-    pending = [
-        (comment_id, state)
-        for comment_id, state in items
-        if comment_id not in completed
-    ]
-    print(
-        f"{name}: {len(items)} requests, {len(completed)} already done, "
-        f"{len(pending)} left, concurrency {concurrency}",
-        flush=True,
-    )
-    if not pending:
-        return completed, 0.0
-
+    timing_path = checkpoint.with_suffix(".timing.json")
+    elapsed_total = 0.0
+    if timing_path.exists():
+        elapsed_total = float(json.loads(timing_path.read_text())["wall_s"])
     api_key = os.environ["TYPESAFE_API_KEY"]
-    semaphore = asyncio.Semaphore(concurrency)
-    write_lock = asyncio.Lock()
-    started = time.perf_counter()
-    finished = 0
-    input_tokens = 0
-    limits = httpx.Limits(
-        max_connections=concurrency + 16,
-        max_keepalive_connections=concurrency,
-    )
-    async with httpx.AsyncClient(
-        http2=True,
-        limits=limits,
-        timeout=httpx.Timeout(60.0),
-    ) as client:
-
-        async def worker(comment_id, state):
-            nonlocal finished, input_tokens
-            async with semaphore:
-                row = await request(
-                    client,
-                    api_key,
-                    comment_id,
-                    state,
-                    questions,
-                )
-            async with write_lock:
-                with checkpoint.open("a") as handle:
-                    handle.write(json.dumps(row) + "\n")
-                finished += 1
-                input_tokens += row["input_tokens"]
-                if finished % 250 == 0 or finished == len(pending):
-                    elapsed = time.perf_counter() - started
-                    rate = finished / elapsed
-                    print(
-                        f"  {finished}/{len(pending)} at {rate:.1f} "
-                        f"requests/s; {input_tokens:,} API input tokens",
-                        flush=True,
-                    )
-
-        results = await asyncio.gather(
-            *(worker(comment_id, state) for comment_id, state in pending),
-            return_exceptions=True,
+    for round_index in range(4):
+        completed = read_answers(checkpoint)
+        pending = [
+            (comment_id, state)
+            for comment_id, state in items
+            if comment_id not in completed
+        ]
+        print(
+            f"{name}: {len(items)} requests, {len(completed)} already done, "
+            f"{len(pending)} left, concurrency {concurrency}",
+            flush=True,
         )
-    errors = [result for result in results if isinstance(result, Exception)]
-    elapsed = time.perf_counter() - started
-    print(
-        f"{name}: {len(pending) - len(errors)} completed, "
-        f"{len(errors)} failed, {elapsed:.2f} s",
-        flush=True,
-    )
+        if not pending:
+            return completed, elapsed_total
+
+        semaphore = asyncio.Semaphore(concurrency)
+        write_lock = asyncio.Lock()
+        started = time.perf_counter()
+        finished = 0
+        input_tokens = 0
+        limits = httpx.Limits(
+            max_connections=concurrency + 16,
+            max_keepalive_connections=concurrency,
+        )
+        async with httpx.AsyncClient(
+            http2=True,
+            limits=limits,
+            timeout=httpx.Timeout(60.0),
+        ) as client:
+
+            async def worker(comment_id, state):
+                nonlocal finished, input_tokens
+                async with semaphore:
+                    row = await request(
+                        client,
+                        api_key,
+                        comment_id,
+                        state,
+                        questions,
+                    )
+                async with write_lock:
+                    with checkpoint.open("a") as handle:
+                        handle.write(json.dumps(row) + "\n")
+                    finished += 1
+                    input_tokens += row["input_tokens"]
+                    if finished % 250 == 0 or finished == len(pending):
+                        elapsed = time.perf_counter() - started
+                        rate = finished / elapsed
+                        print(
+                            f"  {finished}/{len(pending)} at {rate:.1f} "
+                            f"requests/s; {input_tokens:,} API input tokens",
+                            flush=True,
+                        )
+
+            results = await asyncio.gather(
+                *(worker(comment_id, state) for comment_id, state in pending),
+                return_exceptions=True,
+            )
+        errors = [
+            result for result in results if isinstance(result, Exception)
+        ]
+        elapsed = time.perf_counter() - started
+        elapsed_total += elapsed
+        timing_path.write_text(json.dumps({"wall_s": elapsed_total}))
+        print(
+            f"{name}: {len(pending) - len(errors)} completed, "
+            f"{len(errors)} failed, {elapsed:.2f} s",
+            flush=True,
+        )
+        if errors and round_index < 3:
+            print(f"{name}: retrying failed requests", flush=True)
     completed = read_answers(checkpoint)
     missing = [comment_id for comment_id, _ in items if comment_id not in completed]
     if missing:
         raise RuntimeError(
             f"{name} is missing {len(missing)} responses; rerun to resume"
         )
-    return completed, elapsed
+    return completed, elapsed_total
 
 
 async def evaluate(
@@ -211,6 +222,11 @@ async def evaluate(
     output: Path,
 ) -> dict:
     """Run Jev and return its comparison summary."""
+    summary_path = output / "summary.json"
+    if summary_path.exists():
+        summary = json.loads(summary_path.read_text())
+        print(json.dumps(summary, indent=2), flush=True)
+        return summary
     comments = load_comments(None if limit == 0 else limit)
     ids = comments["comment_id"].to_pylist()
     texts = comments["text"].to_pylist()
@@ -230,7 +246,6 @@ async def evaluate(
         )
     )
 
-    query_started = time.perf_counter()
     filter_rows, filter_s = await run_pass(
         "filter",
         list(zip(ids, texts)),
@@ -255,7 +270,7 @@ async def evaluate(
         output / "join.jsonl",
         concurrency,
     )
-    query_s = time.perf_counter() - query_started
+    query_s = filter_s + join_s
     pairs_found = {
         (comment_id, field)
         for comment_id, row in join_rows.items()
@@ -290,7 +305,7 @@ async def evaluate(
         "field_counts": dict(Counter(field for _, field in pairs_found)),
         "result_path": str(output),
     }
-    (output / "summary.json").write_text(json.dumps(summary, indent=2))
+    summary_path.write_text(json.dumps(summary, indent=2))
     print(json.dumps(summary, indent=2), flush=True)
     return summary
 
