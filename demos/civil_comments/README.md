@@ -1,10 +1,18 @@
 # Civil Comments semantic query
 
-This demo compares Quail and Jev on a deterministic sample of 10,000 public
-comments from the Jigsaw Civil Comments dataset.
+This demo compares Quail and Jev on a sample of 10,000 public comments from
+[Jigsaw Civil Comments][dataset].
 
-Human annotators labeled each comment for toxicity and 30 semantic fields. A
-reference label is positive when at least 50% of annotators selected it.
+Human annotators rated each comment for toxicity, six toxicity subtypes, and
+24 identity mentions; each score is the fraction of annotators who selected
+that label; this demo calls a label positive at 50% or higher.
+
+The labels are subjective and noisy; perfect accuracy is impossible, and
+strong agreement is hard; the query is still interesting, it combines a
+semantic filter with a semantic join, and it shows the effect of planning,
+KV reuse, and API cost.
+
+[dataset]: https://huggingface.co/datasets/pietrolesci/civilcomments-wilds
 
 ## Query in English
 
