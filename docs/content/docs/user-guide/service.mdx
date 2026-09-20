@@ -1,0 +1,152 @@
+---
+title: Hosted queries with the query service
+---
+
+The query service is optional. It runs on a GPU host, accepts queries
+from a remote `Session`, saves their status and results, and keeps
+running after the client disconnects. Ordinary local use of Quail
+does not need it, does not start it, and does not install its
+dependencies.
+
+## Start the service
+
+Install the `service` extra on the GPU host and start one service per
+host. The service runs the models you name, on the device you name.
+
+```bash
+pip install "quail-engine[service]"
+quail-service --data-dir /var/lib/quail \
+  --model qwen3-4b-fp8 --device h100-sxm \
+  --host 0.0.0.0 --port 8642
+```
+
+Options:
+
+| Option | Meaning |
+| --- | --- |
+| `--data-dir` | Where the SQLite file, uploaded inputs, and results live. Keep it on a disk that survives restarts. |
+| `--model` | A model the service runs. Repeat for more than one. |
+| `--device`, `--gpus` | The device every query must name, and the GPU counts accepted (default 1). |
+| `--default-timeout` | Execution time limit in seconds when a submission names none. Default 1000. |
+| `--max-timeout` | Largest limit a submission may ask for. Default 4 hours. |
+| `--max-upload-gib` | Largest input snapshot accepted. Default 8. |
+| `--token` | A bearer token every `/v1` request must carry. Default `QUAIL_SERVICE_TOKEN`; none when unset. |
+
+The service needs no database server. It keeps one SQLite file it
+alone writes, and results as Arrow files beside it.
+
+## Connect from Python
+
+Pass `endpoint` to `Session`. Everything else is the same as a local
+session.
+
+```python
+import quail
+
+config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
+with quail.Session(config=config, endpoint="http://gpu-host:8642") as session:
+    session.register("reviews", quail.DocumentProvider.from_parquet(
+        "reviews.parquet", id_col="id"))
+    result = session.sql(SQL, dialect="bq").run()
+    table = result.collect()
+```
+
+`run()` submits the query, waits for the saved result, and returns a
+`QueryResult`. `collect()` does the same and returns the table. The
+client side needs only the standard library; set `QUAIL_SERVICE_TOKEN`
+when the service has a token.
+
+### Tables on a remote session
+
+`register` must describe each table so the service can read it
+without the client:
+
+| Provider | Sent as |
+| --- | --- |
+| `from_table`, `from_parquet`, `from_ipc`, `from_dataset` | An Arrow IPC snapshot, uploaded once and named by the hash of its bytes |
+| `from_hf` | A reference to the dataset pinned to a commit (`revision`); the current head is resolved at registration when omitted |
+| Any other provider | `TypeError` at `register()` |
+
+An accepted query owns its inputs. Closing the session does not remove
+them.
+
+### Submit without waiting
+
+```python
+with quail.Session(config=config, endpoint=endpoint) as session:
+    session.register("reviews", provider)
+    run = session.sql(SQL, dialect="bq").submit(timeout_s=1000)
+    query_id = run.id
+```
+
+`submit()` returns once the service has saved the record. Later, from
+any process:
+
+```python
+with quail.Session(config=config, endpoint=endpoint) as session:
+    run = session.get_run(query_id)
+    print(run.status().state)
+    for status in run.watch():
+        print(status.state, status.progress)
+    result = run.result()
+```
+
+- `status()` returns a complete saved snapshot: `state`, `revision`,
+  `progress`, `plan`, `error`, `result`, and the submitted `spec`,
+  `config`, and `inputs`.
+- `watch()` yields the current snapshot, then each newer revision,
+  until the query is done. Progress snapshots in between may be
+  skipped.
+- `result()` waits and returns the `QueryResult`, or raises
+  `QueryFailedError` with the saved status when the query failed, was
+  interrupted, or was cancelled.
+- `cancel()` stops a queued query at once and asks a running one to
+  stop; the record ends `cancelled`.
+- `submit(request_key="...")` makes a repeated submission return the
+  same run. The same key with a different query is an error.
+
+States are `queued`, `planning`, `running`, `succeeded`, `failed`,
+`interrupted`, and `cancelled`. A query that runs past its time limit
+ends `failed` with error type `TimeoutError`.
+
+### What a remote session cannot do
+
+- `explain()` and `plan()` before running. The service compiles and
+  plans the query; the chosen plan is on `run.status().plan["text"]`.
+- The Python builder API (`session.docs`). Write the query in SQL.
+- `run(plan=...)` with an edited plan.
+
+## In the browser
+
+Open `http://gpu-host:8642/queries/<query_id>` for a page with the
+state, progress, plan, error, and a result preview. It updates by
+itself. `http://gpu-host:8642/` lists recent queries.
+
+The routes under `/v1` return JSON:
+
+| Route | Purpose |
+| --- | --- |
+| `GET /v1/capabilities` | Models, device, GPU counts, and limits |
+| `PUT /v1/inputs/{sha256}` | Upload one Arrow IPC snapshot |
+| `POST /v1/queries` | Submit; returns the queued record |
+| `GET /v1/queries/{id}?after=N&wait=S` | Snapshot, waiting up to S seconds for a revision above N |
+| `GET /v1/queries/{id}/events` | Server-sent events, one per revision |
+| `POST /v1/queries/{id}/cancel` | Cancel |
+| `GET /v1/queries/{id}/result` | The rows as an Arrow IPC file |
+| `GET /v1/queries/{id}/files/report.json` | The execution report |
+
+## What is saved and what survives
+
+- Every status change is one SQLite transaction and raises the
+  record's `revision`. A read after an acknowledged change sees that
+  revision or a newer one.
+- `succeeded` is written only after the service has reopened the saved
+  result, report, and answer tables.
+- Records and finished results survive a restart when the data
+  directory survives. Queued records run after the restart. A record
+  that was executing during the restart becomes `interrupted`; it is
+  not restarted and not left `running`.
+- Cancelling or timing out a running query kills the executor process.
+  The next query pays the model boot again.
+- Losing the data directory loses everything. The service does not
+  resume GPU work after a crash and does not retry.

@@ -53,6 +53,27 @@ with quail.Session(config=config) as session:
     print(result)
 ```
 
+## Hosted queries
+
+To submit long queries, close the client, and fetch the result later,
+run the optional query service on the GPU host and give `Session` its
+address. The query code stays the same.
+
+```bash
+pip install "quail-engine[service]"
+quail-service --data-dir /var/lib/quail --model qwen3-4b-fp8 --device h100-sxm
+```
+
+```python
+with quail.Session(config=config, endpoint="http://gpu-host:8642") as session:
+    session.register("reviews", quail.DocumentProvider.from_table(reviews, id_col="id"))
+    run = session.sql(SQL, dialect="bq").submit()
+    print(run.id)                 # reattach later with session.get_run(run.id)
+    table = run.result().collect()
+```
+
+See [Hosted queries with the query service](https://fsdatalab.github.io/quail/docs/user-guide/service).
+
 ## Supported operators
 
 Quail currently supports AI-powered filters, joins, and

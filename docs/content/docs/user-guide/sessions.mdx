@@ -67,6 +67,18 @@ Later queries reuse the loaded model and compiled kernels.
 Tokenized documents are also reused across queries on the same
 session.
 
+## Running on a query service
+
+Pass `endpoint` to run queries on a deployed
+[query service](/docs/user-guide/service) instead of in this process.
+`register`, `sql`, `run`, and `collect` work the same; `submit()`
+returns a handle you can come back to later.
+
+```python
+with quail.Session(config=config, endpoint="http://gpu-host:8642") as session:
+    ...
+```
+
 ## Multiple GPUs
 
 Set `gpus` to use more than one GPU. Each GPU holds one complete
