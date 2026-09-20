@@ -109,6 +109,9 @@ class Store:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._changed = threading.Condition(self._lock)
+        # committed write transactions since open; a checkpoint compares it
+        self.write_count = 0
+        self.closed = False
         self._conn = sqlite3.connect(
             str(self.path), check_same_thread=False, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
@@ -119,6 +122,7 @@ class Store:
 
     def close(self) -> None:
         with self._lock:
+            self.closed = True
             self._conn.close()
 
     # -- transactions -----------------------------------------------------
@@ -133,8 +137,27 @@ class Store:
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise
+            self.write_count += 1
             self._changed.notify_all()
             return cursor.rowcount
+
+    def backup(self, path: str | Path) -> None:
+        """Write a complete, consistent copy of the database to ``path``.
+
+        Uses SQLite's online backup, so the copy includes every committed
+        transaction, including those still in the WAL file. The copy is
+        written beside ``path`` and renamed into place.
+        """
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f"{path.name}.tmp")
+        with self._lock:
+            target = sqlite3.connect(str(temporary))
+            try:
+                self._conn.backup(target)
+            finally:
+                target.close()
+        temporary.replace(path)
 
     def _row(self, query_id: str):
         with self._lock:

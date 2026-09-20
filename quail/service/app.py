@@ -68,6 +68,10 @@ class ServiceSettings:
     max_timeout_s: float = 4 * 3600.0
     max_upload_bytes: int = 8 << 30
     token: str | None = None
+    # the live SQLite file; default data_dir/quail.sqlite3. Set it to a
+    # local disk when data_dir is a network file system such as a Modal
+    # Volume, and keep a copy there with quail.service.checkpoint.
+    db_path: Path | None = None
     # tests: run jobs on a thread with these hooks instead of a child
     hooks: Hooks | None = field(default=None, compare=False)
     hooks_reference: str | None = None
@@ -82,19 +86,26 @@ class Service:
         self.data_dir = Path(settings.data_dir)
         self.inputs_dir = self.data_dir / "inputs"
         self.inputs_dir.mkdir(parents=True, exist_ok=True)
-        self.store = Store(self.data_dir / "quail.sqlite3")
+        self.store = Store(settings.db_path or self.data_dir / "quail.sqlite3")
         self.recovered = self.store.recover()
         executor = (InProcessExecutor(settings.hooks) if settings.in_process
                     else ChildProcessExecutor(settings.hooks_reference))
         self.scheduler = Scheduler(self.store, executor, self.data_dir)
         self.registry = built_in_registry()
         self._tokenizers = {}
+        self._closers = []
+
+    def add_closer(self, close) -> None:
+        """Run ``close()`` at shutdown, after the scheduler, before the store."""
+        self._closers.append(close)
 
     def start(self) -> None:
         self.scheduler.start()
 
     def stop(self) -> None:
         self.scheduler.stop()
+        for close in self._closers:
+            close()
         self.store.close()
 
     def capabilities(self) -> dict:

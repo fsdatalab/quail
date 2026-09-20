@@ -175,7 +175,8 @@ def _child_main(conn, hooks_reference: str | None) -> None:
     while True:
         try:
             job = conn.recv()
-        except EOFError:
+        except (EOFError, KeyboardInterrupt):
+            # the parent closed the pipe or the container is stopping
             return
         if job is None:
             return
