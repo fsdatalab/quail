@@ -3,7 +3,9 @@
 The data is the Jigsaw Civil Comments release mirrored on Hugging Face
 as pietrolesci/civilcomments-wilds (config "raw"). A score is the
 fraction of annotators who applied the label, so a score of at least
-0.5 is the label.
+0.5 is the label. The filter prompt uses the Jigsaw toxicity wording:
+a rude, disrespectful, or unreasonable comment that is likely to make
+someone leave a discussion.
 
 The query keeps the toxic comments, then joins each one with a table of
 31 statements: six toxicity subtypes, twenty-four identity groups, and
@@ -43,19 +45,19 @@ MODEL = "diffusion-gemma-26b-a4b-fp8"
 DEVICE = "h100-sxm"
 
 FILTER_PROMPT = (
-    "Judge strictly from the comment above whether it is among the most "
-    "toxic comments on a news site: hateful, threatening, or abusive, not "
-    "merely rude or opinionated.\n\n{0}\n\nInstruction: answer TRUE if the "
-    "comment is among the most toxic, FALSE otherwise.")
+    "A toxic comment is a rude, disrespectful, or unreasonable comment "
+    "that is likely to make someone leave a discussion. Ordinary "
+    "disagreement or a strongly held opinion is not toxic.\n\n{0}\n\n"
+    "Instruction: answer TRUE if the comment is toxic, FALSE otherwise.")
 
 FIELDS = {
-    "severe_toxicity": "is very hateful, aggressive, or disrespectful, far "
-                       "beyond ordinary rudeness",
+    "severe_toxicity": "is an extreme of hate or violence, not an ordinary "
+                       "insult or rude remark",
     "obscene": "uses swear words, curse words, or other obscene language",
-    "threat": "states an intention to inflict pain, injury, or violence on "
-              "a person or group",
+    "threat": "states a real intention to inflict pain, injury, or "
+              "violence on a person or group, not a figure of speech",
     "insult": "is insulting, inflammatory, or negative toward a person or "
-              "group",
+              "a group of people",
     "identity_attack": "is negative or hateful toward people because of "
                        "their identity",
     "sexual_explicit": "refers to sexual acts, body parts, or other lewd "
@@ -63,13 +65,13 @@ FIELDS = {
     "male": "explicitly mentions men or boys",
     "female": "explicitly mentions women or girls",
     "transgender": "explicitly mentions transgender people",
-    "other_gender": "explicitly mentions a gender identity other than male, "
+    "other_gender": "names a specific gender identity that is not male, "
                     "female, or transgender",
     "heterosexual": "explicitly mentions heterosexual people",
     "homosexual_gay_or_lesbian": "explicitly mentions gay or lesbian people",
     "bisexual": "explicitly mentions bisexual people",
-    "other_sexual_orientation": "explicitly mentions a sexual orientation "
-                                "other than heterosexual, gay, lesbian, or "
+    "other_sexual_orientation": "names a specific sexual orientation that "
+                                "is not heterosexual, gay, lesbian, or "
                                 "bisexual",
     "christian": "explicitly mentions Christians",
     "jewish": "explicitly mentions Jewish people",
@@ -77,15 +79,14 @@ FIELDS = {
     "hindu": "explicitly mentions Hindus",
     "buddhist": "explicitly mentions Buddhists",
     "atheist": "explicitly mentions atheists",
-    "other_religion": "explicitly mentions a religion other than "
-                      "Christianity, Judaism, Islam, Hinduism, Buddhism, "
-                      "or atheism",
+    "other_religion": "names a specific religion that is not Christianity, "
+                      "Judaism, Islam, Hinduism, Buddhism, or atheism",
     "black": "explicitly mentions Black people",
     "white": "explicitly mentions white people",
     "asian": "explicitly mentions Asian people",
     "latino": "explicitly mentions Latino people",
-    "other_race_or_ethnicity": "explicitly mentions a race or ethnicity "
-                               "other than Black, white, Asian, or Latino",
+    "other_race_or_ethnicity": "names a specific race or ethnicity that is "
+                               "not Black, white, Asian, or Latino",
     "physical_disability": "explicitly mentions people with a physical "
                            "disability",
     "intellectual_or_learning_disability": "explicitly mentions people "
@@ -93,16 +94,19 @@ FIELDS = {
                                            "learning disability",
     "psychiatric_or_mental_illness": "explicitly mentions people with a "
                                      "psychiatric or mental illness",
-    "other_disability": "explicitly mentions a disability that is not "
-                        "physical, intellectual, or psychiatric",
-    "rejected": "breaks a news site comment policy badly enough that a "
-                "moderator would remove it",
+    "other_disability": "names a specific disability that is not physical, "
+                        "intellectual, or psychiatric",
+    "rejected": "would actually be removed by a news-site moderator, not "
+                "merely because it is rude or unpopular",
 }
 
 # Measured on the full table: 11.3% of comments are toxic, and among
 # those a joined field is true 6.7% of the time on average.
-JOIN_PROMPT = ("Judge strictly whether the description in DOCUMENT {1} "
-               "applies to the comment in DOCUMENT {0}.")
+JOIN_PROMPT = (
+    "Judge the statement on its own. Answer TRUE only if the description "
+    "in DOCUMENT {1} is specifically true of the comment in DOCUMENT {0}. "
+    "Answer FALSE if it is only loosely related or is a stronger claim "
+    "than the comment supports.")
 
 app = modal.App("quail-milestone1")
 results_volume = modal.Volume.from_name("quail-results", create_if_missing=True)
@@ -258,9 +262,11 @@ def evaluate_tables(directory: Path, limit: int | None, gpus: int,
             session, query, result, filter_only)
         ideal = quail.speed_of_light_estimate(query, own_answers(result))
     answers = result.answer_tables["filters"][("c", 0)]
+    pq.write_table(answers, directory / "filter_answers.parquet")
     toxic_found = {ids[int(i)] for i, yes in zip(
         answers["c"].to_pylist(), answers["answer"].to_pylist()) if yes}
-    toxic_labeled = {pair[0] for pair in labeled}
+    toxic_labeled = {ids[int(i)] for i in np.flatnonzero(
+        np.asarray(comments["toxicity"].to_pylist()) >= 0.5)}
     toxic_hits = len(toxic_found & toxic_labeled)
     found = set() if filter_only else {
         (row["c.comment_id"], row["f.field"]) for row in table.to_pylist()}
