@@ -19,6 +19,7 @@ import pyarrow as pa
 
 import quail
 from demos.quickstart import FILTER_PROMPT, load_reviews
+from quail.bench.images import gpu_image
 
 app = modal.App("quail-engine")
 ASPECTS = (
@@ -39,40 +40,13 @@ DISCUSS_ASPECT = (
     "Does the review in DOCUMENT {0} discuss the movie aspect in "
     "DOCUMENT {1}?"
 )
-IMAGE_REQUIREMENTS = (
-    "sqlglot==30.17.0",
-    "transformers==5.15.0",
-    "huggingface-hub==1.27.0",
-    "pyarrow==25.0.1",
-    "numpy==2.3.5",
-    "bpe-qwen==0.1.5",
-    "datasets==5.0.1",
-    "vllm==0.26.0",
-)
 
 
 def section(title: str) -> None:
     print(f"\n===== {title} =====", flush=True)
 
 
-image = (
-    modal.Image.from_registry(
-        "nvidia/cuda:13.0.1-devel-ubuntu24.04", add_python="3.12")
-    .entrypoint([])
-    .pip_install(*IMAGE_REQUIREMENTS)
-    .env({
-        "QUAIL_CACHE_DIR": "/root/.cache/kernels",
-        "VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
-        "VLLM_LOGGING_LEVEL": "WARNING",
-        "VLLM_USE_FLASHINFER_SAMPLER": "0",
-        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-        "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
-        "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
-        "TRITON_CACHE_DIR": "/root/.cache/kernels/triton",
-        "TORCHINDUCTOR_CACHE_DIR": "/root/.cache/kernels/torchinductor",
-    })
-    .add_local_python_source("quail", "demos")
-)
+image = gpu_image(("demos", "/root/demos"))
 results_vol = modal.Volume.from_name("quail-results", create_if_missing=True)
 kernel_cache = modal.Volume.from_name("quail-kernel-cache", create_if_missing=True)
 volumes = {

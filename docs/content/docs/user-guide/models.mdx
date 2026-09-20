@@ -11,12 +11,26 @@ page will be updated as new configurations become available.
 | --- | --- | --- | --- |
 | Qwen3 4B | `"qwen3-4b-fp8"` | 4B | FP8 weights, BF16 KV |
 | Qwen3 32B | `"qwen3-32b-fp8"` | 32B | FP8 weights, BF16 KV |
+| DiffusionGemma 26B-A4B | `"diffusion-gemma-26b-a4b-fp8"` | 26B total, 4B active per token | FP8 weights, BF16 KV |
 | Qwen3 Reranker 0.6B | `"qwen3-reranker-0.6b-bf16"` | 0.6B | BF16 |
 | Qwen3 Reranker 4B | `"qwen3-reranker-4b-bf16"` | 4B | BF16 |
 
-The generation models use the Quail execution engine, including
+The Qwen3 FP8 models use the Quail execution engine, including
 DeepGEMM for matrix multiplications and FlashAttention 3 for
-attention.
+attention on H100.
+
+DiffusionGemma also runs through the Quail executor. It uses the
+`RedHatAI/diffusiongemma-26B-A4B-it-FP8-dynamic` checkpoint for filter
+and join predicates. Quail runs one forward pass with one answer
+position and reads a TRUE or FALSE decision. It uses the model's
+chat format without a generated thinking response.
+
+```python
+config = quail.EngineConfig(
+    model="diffusion-gemma-26b-a4b-fp8",
+    device="h100-sxm",
+)
+```
 
 The reranker models use the same Quail executor for `AI.SCORE`.
 Weights, activations, and KV use BF16. The final `yes` and `no`
@@ -61,8 +75,21 @@ operator.
 
 If you don't have a CUDA GPU, you can run Quail inside a
 [Modal](https://modal.com) GPU function. Quail does not depend on
-Modal — you write the Modal function, and Quail runs inside it like
-any other Python library.
+Modal. You write the Modal function, and Quail runs inside it.
+
+Install Modal on the machine you submit from:
+
+```bash
+pip install modal==1.5.4
+modal setup
+```
+
+The image below installs Quail from GitHub `main`, which includes
+DiffusionGemma. Quail declares its Python dependencies, including
+vLLM, PyArrow, and its tokenizer. You do not need to install those
+packages separately. CUDA comes from the base image.
+
+Save this example as `run_quail.py`:
 
 ```python
 import modal
@@ -72,26 +99,35 @@ image = (
     modal.Image.from_registry(
         "nvidia/cuda:13.0.1-devel-ubuntu24.04", add_python="3.12")
     .entrypoint([])
-    .pip_install(
-        "quail-engine==0.1.0",
-        "vllm==0.26.0",
-        "pyarrow==25.0.1",
-        "sqlglot==30.17.0",
-        "bpe-qwen==0.1.5",
-        "datasets==5.0.1",
-        "modal==1.5.4",
-    )
+    .apt_install("git")
+    .pip_install("quail-engine @ git+https://github.com/fsdatalab/quail.git@main")
 )
 
 @app.function(image=image, gpu="H100!", memory=98304, timeout=1200)
 def run_query():
+    import pyarrow as pa
     import quail
-    # your query here
+
+    reviews = pa.table({
+        "id": ["r1", "r2"],
+        "body": ["The acting was excellent.", "The plot was confusing."],
+    })
     config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
     with quail.Session(config=config) as session:
-        ...
+        session.register("reviews", quail.DocumentProvider.from_table(
+            reviews, id_col="id"))
+        result = session.sql("""
+            SELECT r.id
+            FROM reviews r
+            WHERE AI_FILTER(
+                PROMPT('Does this review praise the acting? {0}', r.body))
+        """).run()
         return result.collect(), result.report
 ```
+
+The imports inside `run_query` use the packages installed in the GPU
+image. PyArrow is used here to create the sample input table. Quail
+loads vLLM and its other execution dependencies internally.
 
 The session, data registration, and execution all happen inside the
 GPU function. For large datasets, pass a path and open it there
@@ -116,11 +152,8 @@ image = image.env({
     volumes={"/model-cache": weights, "/kernel-cache": kernels},
 )
 def run_query():
-    import quail
-    config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
-    with quail.Session(config=config) as session:
-        ...
-        return result.collect(), result.report
+    # Use the same run_query body from above.
+    ...
 ```
 
 Quail's own cache is controlled by `QUAIL_CACHE_DIR` (default
@@ -136,6 +169,14 @@ def main():
     call = run_query.spawn()
     print(f"function call id: {call.object_id}", flush=True)
     rows, report = call.get()
+    print(rows.to_pylist())
+    print(report)
+```
+
+Run the file from the machine where you installed Modal:
+
+```bash
+modal run --detach run_quail.py 2>&1 | tee run_quail.log
 ```
 
 Keep the function call id. After a disconnect, retrieve the result
