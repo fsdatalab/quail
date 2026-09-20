@@ -33,35 +33,21 @@ def text_answer(output) -> int:
     return int(match.group(1).upper() == "TRUE")
 
 
-def canvas_answer(output, *, true_ids, false_ids, top_k: int) -> int:
+def canvas_answer(output, *, true_ids, false_ids) -> int:
     """Compare TRUE/FALSE token scores at the first canvas position.
 
-    A missing class can be ruled out if the returned top-K scores
-    bound it below the winning class. Equal scores return FALSE.
+    Equal scores return FALSE.
 
     Raises:
-        ValueError: The returned scores cannot determine the answer.
+        ValueError: A TRUE/FALSE token score is missing.
     """
     logprobs = output.outputs[0].logprobs
     entries = logprobs[0] if logprobs else {}
-    true = max((entries[t].logprob for t in true_ids if t in entries),
-               default=None)
-    false = max((entries[t].logprob for t in false_ids if t in entries),
-                default=None)
-    if true is not None and false is not None:
-        return int(true > false)
-    # The sampled token may be outside the top K. Its score cannot
-    # bound omitted tokens, so only ranked top-K entries set the bound.
-    ranked = [entry.logprob for entry in entries.values()
-              if entry.rank is not None and 0 < entry.rank <= top_k]
-    if len(ranked) >= top_k > 0:
-        omitted_upper_bound = min(ranked)
-        if true is not None and true > omitted_upper_bound:
-            return 1
-        if false is not None and false >= omitted_upper_bound:
-            return 0
-    raise ValueError(
-        "vLLM returned insufficient TRUE/FALSE scores; increase logprobs")
+    if any(t not in entries for t in true_ids | false_ids):
+        raise ValueError("vLLM omitted requested TRUE/FALSE scores")
+    true = max(entries[t].logprob for t in true_ids)
+    false = max(entries[t].logprob for t in false_ids)
+    return int(true > false)
 
 
 def filter_document_cap(
@@ -301,5 +287,3 @@ def run_join_grouped(
         "cached_per_request": cached_per_request,
         "submission": submission,
     }
-
-

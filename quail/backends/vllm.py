@@ -18,10 +18,9 @@ CUDA_GRAPH_CAPTURE_SIZE = 8_192
 # setting is 128 or more, sized for its 256-row canvas; one row needs
 # no cap, so stay just under the trigger.
 DIFFUSION_SEQUENCES = 127
-# top logprobs read at the canvas row; the answer words rank within
-# the top 500 on 511 of 512 probed reviews and within 1,718 on all
-# (/results/ablations/diffusion_gemma_readout_probe_k5000.json)
-DIFFUSION_LOGPROBS = 500
+# DiffusionGemma ignores logprob_token_ids in vLLM 0.26. Request the full
+# vocabulary so TRUE/FALSE scores are returned regardless of their ranks.
+DIFFUSION_LOGPROBS = -1
 # generated tokens a longer canvas gets; the answer word is read
 # from the text
 DIFFUSION_TEXT_TOKENS = 16
@@ -70,7 +69,8 @@ def sampling_kwargs(allowed_ids: list[int], canvas_tokens: int = 0) -> dict:
     One canvas token uses returned scores; longer canvases use text.
     """
     if canvas_tokens == 1:
-        return {"max_tokens": 1, "logprobs": DIFFUSION_LOGPROBS}
+        return {"max_tokens": 1, "logprobs": DIFFUSION_LOGPROBS,
+                "detokenize": False}
     if canvas_tokens:
         return {"max_tokens": DIFFUSION_TEXT_TOKENS}
     return {"temperature": 0.0, "max_tokens": 1, "min_tokens": 1,

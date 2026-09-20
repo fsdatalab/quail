@@ -489,8 +489,7 @@ class RequestModelExecution:
         if context.model.canvas_tokens == 1:
             self.read_answer = partial(
                 canvas_answer, true_ids=true_ids,
-                false_ids=set(settings["false_ids"]),
-                top_k=self.sampling_params.logprobs)
+                false_ids=set(settings["false_ids"]))
         elif context.model.canvas_tokens:
             self.read_answer = text_answer
         else:
