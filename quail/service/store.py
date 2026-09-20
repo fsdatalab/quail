@@ -1,0 +1,341 @@
+"""SQLite storage for query records and uploaded inputs.
+
+One Store object is the only writer of its database file. Every
+change happens in one transaction and bumps the record's revision, so
+a read that starts after a write returns sees that revision or a
+newer one. Readers inside the same process can wait for a revision
+with ``wait``.
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import threading
+import time
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+
+from quail.service.records import (
+    ACTIVE_STATES,
+    TERMINAL_STATES,
+    InvalidRequestError,
+    QueryStatus,
+    RequestKeyConflictError,
+    UnknownQueryError,
+    spec_hash,
+)
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS queries (
+    id TEXT PRIMARY KEY,
+    request_key TEXT UNIQUE,
+    spec_hash TEXT NOT NULL,
+    spec_json TEXT NOT NULL,
+    config_json TEXT NOT NULL,
+    inputs_json TEXT NOT NULL,
+    state TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    started_at REAL,
+    timeout_s REAL NOT NULL,
+    cancel_requested INTEGER NOT NULL DEFAULT 0,
+    execution_epoch INTEGER NOT NULL DEFAULT 0,
+    progress_json TEXT,
+    plan_json TEXT,
+    error_json TEXT,
+    result_json TEXT
+);
+CREATE INDEX IF NOT EXISTS queries_by_state ON queries(state, created_at);
+CREATE TABLE IF NOT EXISTS inputs (
+    content_id TEXT PRIMARY KEY,
+    path TEXT NOT NULL,
+    byte_count INTEGER NOT NULL,
+    created_at REAL NOT NULL
+);
+"""
+
+INTERRUPTED_ERROR = {
+    "type": "Interrupted",
+    "message": "the service restarted while this query was executing",
+}
+
+
+@dataclass(frozen=True)
+class InputRecord:
+    """One uploaded input snapshot on the service's disk."""
+
+    content_id: str
+    path: str
+    byte_count: int
+
+
+def _dumps(value) -> str | None:
+    return None if value is None else json.dumps(value, default=str)
+
+
+def _loads(text) -> dict | None:
+    return None if text is None else json.loads(text)
+
+
+def _row_status(row) -> QueryStatus:
+    return QueryStatus(
+        id=row["id"],
+        request_key=row["request_key"],
+        spec=json.loads(row["spec_json"]),
+        config=json.loads(row["config_json"]),
+        inputs=json.loads(row["inputs_json"]),
+        state=row["state"],
+        revision=row["revision"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        started_at=row["started_at"],
+        timeout_s=row["timeout_s"],
+        cancel_requested=bool(row["cancel_requested"]),
+        progress=_loads(row["progress_json"]),
+        plan=_loads(row["plan_json"]),
+        error=_loads(row["error_json"]),
+        result=_loads(row["result_json"]),
+    )
+
+
+class Store:
+    """Query records and input snapshots in one SQLite file."""
+
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
+        self._changed = threading.Condition(self._lock)
+        self._conn = sqlite3.connect(
+            str(self.path), check_same_thread=False, isolation_level=None)
+        self._conn.row_factory = sqlite3.Row
+        # WAL lets the scheduler write while status readers read.
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=FULL")
+        self._conn.executescript(SCHEMA)
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
+    # -- transactions -----------------------------------------------------
+
+    def _write(self, statement: str, parameters=()) -> int:
+        """Run one write statement in its own transaction; return rowcount."""
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = self._conn.execute(statement, parameters)
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+            self._changed.notify_all()
+            return cursor.rowcount
+
+    def _row(self, query_id: str):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM queries WHERE id = ?", (query_id,)).fetchone()
+        if row is None:
+            raise UnknownQueryError(f"unknown query {query_id!r}")
+        return row
+
+    # -- records ----------------------------------------------------------
+
+    def create(self, *, spec: dict, config: dict, inputs: dict,
+               timeout_s: float, request_key: str | None = None
+               ) -> QueryStatus:
+        """Save a new record in the queued state and return its snapshot.
+
+        A repeated request key with the same specification returns the
+        record it created before. The same key with a different
+        specification raises RequestKeyConflictError.
+        """
+        if timeout_s <= 0:
+            raise InvalidRequestError("timeout_s must be positive")
+        digest = spec_hash(spec, config, inputs, timeout_s)
+        with self._lock:
+            if request_key is not None:
+                row = self._conn.execute(
+                    "SELECT * FROM queries WHERE request_key = ?",
+                    (request_key,)).fetchone()
+                if row is not None:
+                    if row["spec_hash"] != digest:
+                        raise RequestKeyConflictError(
+                            f"request key {request_key!r} was already used "
+                            f"for query {row['id']} with a different "
+                            "specification")
+                    return _row_status(row)
+            query_id = uuid.uuid4().hex
+            now = time.time()
+            self._write(
+                "INSERT INTO queries (id, request_key, spec_hash, spec_json, "
+                "config_json, inputs_json, state, revision, created_at, "
+                "updated_at, timeout_s) VALUES (?, ?, ?, ?, ?, ?, 'queued', 1, "
+                "?, ?, ?)",
+                (query_id, request_key, digest, _dumps(spec), _dumps(config),
+                 _dumps(inputs), now, now, timeout_s))
+            return self.get(query_id)
+
+    def get(self, query_id: str) -> QueryStatus:
+        return _row_status(self._row(query_id))
+
+    def execution_epoch(self, query_id: str) -> int:
+        return int(self._row(query_id)["execution_epoch"])
+
+    def list_recent(self, limit: int = 50) -> list[QueryStatus]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM queries ORDER BY created_at DESC LIMIT ?",
+                (limit,)).fetchall()
+        return [_row_status(row) for row in rows]
+
+    def wait(self, query_id: str, after: int, timeout: float) -> QueryStatus:
+        """Return the snapshot once its revision passes ``after``.
+
+        Returns the current snapshot when ``timeout`` seconds pass first.
+        """
+        deadline = time.monotonic() + timeout
+        with self._changed:
+            while True:
+                status = self.get(query_id)
+                remaining = deadline - time.monotonic()
+                if status.revision > after or remaining <= 0:
+                    return status
+                self._changed.wait(remaining)
+
+    def wait_for_change(self, timeout: float) -> None:
+        """Block until any record changes or ``timeout`` seconds pass."""
+        with self._changed:
+            self._changed.wait(timeout)
+
+    def next_queued(self) -> QueryStatus | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM queries WHERE state = 'queued' "
+                "ORDER BY created_at, rowid LIMIT 1").fetchone()
+        return None if row is None else _row_status(row)
+
+    def begin(self, query_id: str) -> int:
+        """Move a queued record to planning and return its execution epoch.
+
+        The epoch identifies this execution attempt. Later updates must
+        carry it, so an execution the service has already closed cannot
+        change the record.
+        """
+        with self._lock:
+            row = self._row(query_id)
+            if row["state"] != "queued":
+                raise InvalidRequestError(
+                    f"query {query_id} is {row['state']}, not queued")
+            epoch = int(row["execution_epoch"]) + 1
+            now = time.time()
+            self._write(
+                "UPDATE queries SET state = 'planning', execution_epoch = ?, "
+                "started_at = ?, revision = revision + 1, updated_at = ? "
+                "WHERE id = ? AND state = 'queued'",
+                (epoch, now, now, query_id))
+            return epoch
+
+    def update(self, query_id: str, epoch: int, *, state: str | None = None,
+               progress: dict | None = None, plan: dict | None = None
+               ) -> bool:
+        """Record execution progress. Returns False for a closed execution."""
+        if state is not None and state not in ACTIVE_STATES:
+            raise ValueError(f"update() cannot set state {state!r}")
+        assignments = ["revision = revision + 1", "updated_at = ?"]
+        parameters: list = [time.time()]
+        if state is not None:
+            assignments.append("state = ?")
+            parameters.append(state)
+        if progress is not None:
+            assignments.append("progress_json = ?")
+            parameters.append(_dumps(progress))
+        if plan is not None:
+            assignments.append("plan_json = ?")
+            parameters.append(_dumps(plan))
+        parameters.extend([query_id, epoch, *sorted(ACTIVE_STATES)])
+        count = self._write(
+            f"UPDATE queries SET {', '.join(assignments)} WHERE id = ? "
+            "AND execution_epoch = ? AND state IN (?, ?)", parameters)
+        return count == 1
+
+    def finish(self, query_id: str, epoch: int, state: str, *,
+               error: dict | None = None, result: dict | None = None
+               ) -> bool:
+        """Close an execution. Returns False when the record was closed already.
+
+        Only the current execution epoch can close a record, and a record
+        in a terminal state never changes again.
+        """
+        if state not in TERMINAL_STATES:
+            raise ValueError(f"finish() needs a terminal state, not {state!r}")
+        if state == "succeeded" and result is None:
+            raise ValueError("a succeeded record needs its result manifest")
+        count = self._write(
+            "UPDATE queries SET state = ?, error_json = ?, result_json = ?, "
+            "revision = revision + 1, updated_at = ? WHERE id = ? "
+            "AND execution_epoch = ? AND state IN (?, ?)",
+            (state, _dumps(error), _dumps(result), time.time(), query_id,
+             epoch, *sorted(ACTIVE_STATES)))
+        return count == 1
+
+    def request_cancel(self, query_id: str) -> QueryStatus:
+        """Cancel a queued record now, or ask a running one to stop.
+
+        A terminal record is returned unchanged.
+        """
+        with self._lock:
+            status = self.get(query_id)
+            if status.state == "queued":
+                self._write(
+                    "UPDATE queries SET state = 'cancelled', error_json = ?, "
+                    "revision = revision + 1, updated_at = ? WHERE id = ? "
+                    "AND state = 'queued'",
+                    (_dumps({"type": "Cancelled",
+                             "message": "cancelled before execution started"}),
+                     time.time(), query_id))
+            elif status.state in ACTIVE_STATES and not status.cancel_requested:
+                self._write(
+                    "UPDATE queries SET cancel_requested = 1, "
+                    "revision = revision + 1, updated_at = ? WHERE id = ?",
+                    (time.time(), query_id))
+            return self.get(query_id)
+
+    def recover(self) -> list[str]:
+        """Mark records left active by an earlier process as interrupted.
+
+        Returns the ids it changed. Queued records stay queued.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id FROM queries WHERE state IN (?, ?)",
+                sorted(ACTIVE_STATES)).fetchall()
+            ids = [row["id"] for row in rows]
+            for query_id in ids:
+                self._write(
+                    "UPDATE queries SET state = 'interrupted', error_json = ?, "
+                    "revision = revision + 1, updated_at = ? WHERE id = ?",
+                    (_dumps(INTERRUPTED_ERROR), time.time(), query_id))
+        return ids
+
+    # -- inputs -----------------------------------------------------------
+
+    def put_input(self, content_id: str, path: str, byte_count: int) -> None:
+        self._write(
+            "INSERT OR IGNORE INTO inputs (content_id, path, byte_count, "
+            "created_at) VALUES (?, ?, ?, ?)",
+            (content_id, path, byte_count, time.time()))
+
+    def get_input(self, content_id: str) -> InputRecord | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM inputs WHERE content_id = ?",
+                (content_id,)).fetchone()
+        if row is None:
+            return None
+        return InputRecord(row["content_id"], row["path"], row["byte_count"])
