@@ -180,7 +180,6 @@ class QueryRun:
         Raises QueryFailedError when the record ended failed, interrupted,
         or cancelled.
         """
-        status = self.status()
         for status in self.watch(poll_s):
             if status.done:
                 break

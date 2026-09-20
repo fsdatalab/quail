@@ -20,8 +20,8 @@ from pathlib import Path
 import pyarrow.ipc as ipc
 from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
+from starlette.datastructures import Headers
 from starlette.middleware import Middleware
-from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import (
     FileResponse,
@@ -259,16 +259,21 @@ class Service:
         return 201
 
 
-class _TokenMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app, token: str):
-        super().__init__(app)
-        self.token = token
+class _TokenMiddleware:
+    """Require ``Authorization: Bearer <token>`` on every /v1 route."""
 
-    async def dispatch(self, request, call_next):
-        header = request.headers.get("authorization", "")
-        if header != f"Bearer {self.token}" and request.url.path.startswith("/v1/"):
-            return _error(ServiceError("a bearer token is required"), 401)
-        return await call_next(request)
+    def __init__(self, app, token: str):
+        self.app = app
+        self.expected = f"Bearer {token}"
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["path"].startswith("/v1/"):
+            header = Headers(scope=scope).get("authorization", "")
+            if header != self.expected:
+                response = _error(ServiceError("a bearer token is required"), 401)
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
 
 
 def _error(error: Exception, status: int | None = None) -> JSONResponse:

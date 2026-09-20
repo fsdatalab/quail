@@ -9,6 +9,8 @@ The executor never touches the database; it only emits events.
 
 from __future__ import annotations
 
+import atexit
+import contextlib
 import importlib
 import threading
 import time
@@ -203,7 +205,8 @@ class _ChildExecution:
                                        f"query {self.job.id}",
                             "traceback": "",
                         })
-                    self.executor._discard_child()
+                    with self.executor._lock:
+                        self.executor._discard_child()
                     return
                 if kind == "done":
                     return
@@ -233,6 +236,7 @@ class ChildProcessExecutor:
         self._process = None
         self._conn = None
         self._lock = threading.Lock()
+        atexit.register(self.close)
 
     def _ensure_child(self) -> None:
         import multiprocessing as mp
@@ -242,17 +246,22 @@ class ChildProcessExecutor:
         self._discard_child()
         context = mp.get_context("spawn")
         parent_conn, child_conn = context.Pipe()
+        # not a daemon: a multi-GPU run starts its own worker processes,
+        # which a daemonic process may not do. The child exits on its own
+        # when the pipe closes, and close() kills it at interpreter exit.
         process = context.Process(
             target=_child_main, args=(child_conn, self.hooks_reference),
-            name="quail-service-executor", daemon=True)
+            name="quail-service-executor", daemon=False)
         process.start()
         child_conn.close()
         self._process, self._conn = process, parent_conn
 
     def _discard_child(self) -> None:
-        if self._conn is not None:
-            self._conn.close()
-        self._process, self._conn = None, None
+        conn, self._conn = self._conn, None
+        self._process = None
+        if conn is not None:
+            with contextlib.suppress(OSError):
+                conn.close()
 
     def _kill_child(self) -> None:
         with self._lock:

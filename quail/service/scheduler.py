@@ -21,6 +21,8 @@ from quail.service.store import Store
 logger = logging.getLogger("quail.service")
 
 DEFAULT_TIMEOUT_S = 1000.0
+# progress writes are one fsync each; a loop can report far faster
+PROGRESS_WRITE_INTERVAL_S = 0.5
 
 
 class Scheduler:
@@ -95,7 +97,17 @@ class Scheduler:
                 "type": type(error).__name__, "message": str(error)})
             return self.store.get(query_id)
 
+        last_progress = [0.0]
+
         def emit(kind, payload):
+            if kind == "progress":
+                now = time.monotonic()
+                complete = payload.get("total") and (
+                    payload.get("done") == payload.get("total"))
+                if not complete and now - last_progress[0] < \
+                        PROGRESS_WRITE_INTERVAL_S:
+                    return
+                last_progress[0] = now
             self._apply(query_id, epoch, job.artifact_dir, kind, payload)
 
         execution = self.executor.start(job, emit)
