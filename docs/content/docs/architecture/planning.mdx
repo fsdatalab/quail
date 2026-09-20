@@ -120,8 +120,9 @@ sparsity and we run dense. Projections use FP8; attention uses BF16
 
 ### Work per filter stage
 
-The model tracks four quantities: fresh tokens, attention pairs,
-KV written, and KV read.
+The model counts fresh tokens, attention pairs, KV written, and KV read.
+For models with sliding-window layers, it counts their attention pairs
+and KV reads separately.
 
 **Stage 1** (first predicate on a table, document not yet in KV):
 
@@ -245,6 +246,43 @@ $$
 The $\max$ within each component allows compute and memory to
 overlap. The components are summed because they run in sequence.
 Filter and join boundaries do not start separate forward passes.
+
+### Count sliding-window attention
+
+**Split the layers.** You count 25 sliding-window layers and five
+full-attention layers separately. For the sliding layers, use a window of
+1,024 keys and a head size of 256; for the full layers, use a head size of
+512 and the full pair count $T(n)$ above.
+
+**Count sliding pairs.** One pair means the model computes attention between
+one query token and one key token. For a sequence of $n$ tokens and a window
+of $W$ keys, use the following formula.
+
+$$
+T_W(n) = \begin{cases}
+\frac{n(n+1)}{2} & n \le W \\
+Wn - \frac{W(W-1)}{2} & n > W.
+\end{cases}
+$$
+
+Before the window fills, token $i$ attends to $i$ keys; after the window
+fills, each new token attends to $W$ keys.
+
+**Append a suffix.** For $s$ new tokens after a prefix of $p$ tokens, use
+$T_W(p+s)-T_W(p)$. Each suffix starts from the same prefix; one suffix never
+attends to another. Each suffix can read the last $\min(p, W-1)$ prefix
+keys; when suffixes share a prefix, you count that KV read once.
+
+**Convert pairs to cost.** For each layer, multiply its pair count by four,
+its query-head count, and its head size. Add the layer results to get the
+attention FLOPs; use the KV-head count and head size to get the KV bytes.
+You use these counts for filters, joins, and KV recomputation.
+
+**Reuse length summaries.** You scan each alias's document lengths once;
+the planner stores the total length and the counts below the window. It uses
+that summary to compare join plans without scanning the lengths again. For
+the standalone SoL estimate, you use each document's exact length and count
+each shared prefix once.
 
 ### Follow the cost calculation
 

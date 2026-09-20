@@ -5,6 +5,7 @@ from dataclasses import replace
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 
 import quail
 from quail.catalog import DocumentProvider
@@ -123,3 +124,40 @@ def test_canvas_rows_count_once_per_evaluation(tmp_path):
     # eight canvas rows; the anchor frames carry none
     assert canvas.fresh_tokens == decoder.fresh_tokens + 8 * (3 + 4)
     assert canvas.join_pair_evaluations == 4
+
+
+def test_planner_and_estimate_price_hybrid_queries_and_prefix_reuse(tmp_path):
+    pq.write_table(pa.table({
+        "id": ["r0", "r1"], "body": ["shared " * 1030 + s for s in ("a", "b")],
+    }), tmp_path / "reviews.parquet")
+    pq.write_table(pa.table({
+        "id": ["q0", "q1"], "body": ["one two", "three four"],
+    }), tmp_path / "questions.parquet")
+    with quail.Session(config=quail.EngineConfig(
+            model="diffusion-gemma-26b-a4b-fp8", device="h100-sxm"),
+            tokenizer=str.split) as session:
+        for name in ("reviews", "questions"):
+            session.register(name, quail.DocumentProvider.from_parquet(
+                str(tmp_path / f"{name}.parquet"), id_col="id"))
+        query = (session.docs("reviews").alias("r")
+                 .ai_filter(quail.prompt("First: {0}", quail.col("r.body")),
+                            selectivity=1.0)
+                 .ai_filter(quail.prompt("Second: {0}", quail.col("r.body")),
+                            selectivity=1.0)
+                 .ai_join(session.docs("questions").alias("q"),
+                          quail.prompt("Compare {0} and {1}", quail.col("r.body"),
+                                       quail.col("q.body")), selectivity=1.0)
+                 .select("r.id", "q.id"))
+        exact = quail.speed_of_light_estimate(
+            query, lambda *_: True, credit_shared_prefixes=False)
+        shared = quail.speed_of_light_estimate(query, lambda *_: True)
+        planned = query.plan()
+        pre = query.logical.operators().filters["r"][0].prompt.preamble_tokens
+    assert exact.join_stages[0]["anchor"] == "r"
+    assert exact.seconds == pytest.approx(planned.estimated_seconds)
+    assert exact.work.sliding_pairs < exact.work.pairs
+    assert exact.work.sliding_kv_read < exact.work.kv_read
+    assert exact.work.pairs - shared.work.pairs == sum(range(1, pre + 1031))
+    assert exact.work.sliding_pairs - shared.work.sliding_pairs == sum(
+        min(position, 1024) for position in range(1, pre + 1031))
+    assert shared.as_dict()["sliding_pairs"] == shared.work.sliding_pairs
