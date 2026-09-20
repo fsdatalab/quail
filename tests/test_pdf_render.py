@@ -162,8 +162,64 @@ def test_prefetcher_pdf_mode_hands_over_every_page_of_a_row(tmp_path):
         assert [page.page_id for page in first] == [0, 1, 2]
     finally:
         prefetcher.close()
-    with pytest.raises(ValueError, match="every row index once"):
+    with pytest.raises(ValueError, match="at most once"):
         PdfiumPrefetcher(inputs, GEMMA, processes=0, order=[0, 0])
+    # a row left out of the order is still rendered when taken
+    partial = PdfiumPrefetcher(inputs, GEMMA, processes=0, order=[1])
+    assert partial.outstanding_pages == 2
+    assert len(partial.take(0)) == 3
+    partial.close()
+
+
+def test_page_images_map_chain_documents_to_rows_past_the_preamble(tmp_path):
+    from quail.backends.quail.executor.images import PageImages
+    from quail.pdf.prefetch import RenderedPage
+
+    paths = [make_pdf(tmp_path / "a.pdf", [LETTER, LETTER]),
+             make_pdf(tmp_path / "b.pdf", [LETTER])]
+    inputs = pdf_input(paths, "page", budget=70)
+    prompts = PagePrompts(inputs, GEMMA)
+    opened = []
+
+    def open_inline(pdf_input_, spec, order):
+        opened.append(list(order))
+        return PdfiumPrefetcher(pdf_input_, spec, order, processes=0)
+
+    # the chain admits row 2 first, then row 0; row 1 is never asked for
+    images = PageImages(prompts, document_ids=[2, 0], pre_tokens=7,
+                        open_prefetcher=open_inline)
+    assert opened == [] and images.metrics() == {}
+    images.open()
+    images.open()
+    assert opened == [[2, 0]]
+    ((block, page),) = images.take(0)
+    assert page.page_id == 2 and block.page_id == 2
+    # the soft tokens start after the preamble and the start marker
+    assert block.offset == 7 + 1
+    assert block.soft_tokens == soft_tokens(GEMMA, *LETTER, 70)
+    assert page.grid == (
+        render_size(GEMMA, *LETTER, 70)[0] // PATCH,
+        render_size(GEMMA, *LETTER, 70)[1] // PATCH)
+    ((block, page),) = images.take(1)
+    assert (page.page_id, block.page_id) == (0, 0)
+    images.close()
+    assert images.metrics()["pages_rendered"] == 2
+    images.close()
+
+    class WrongPage:
+        def take(self, row):
+            return (RenderedPage(1, (1, 1), np.zeros((1, 768), np.uint8), 0.0),)
+
+        def metrics(self):
+            return {}
+
+        def close(self):
+            pass
+
+    mismatched = PageImages(prompts, [0], 0,
+                            open_prefetcher=lambda *a, **k: WrongPage())
+    with pytest.raises(RuntimeError, match="prompt lists \\[0\\]"):
+        mismatched.take(0)
 
 
 def test_prefetcher_lookahead_stays_under_the_page_bound(tmp_path):

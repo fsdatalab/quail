@@ -146,8 +146,9 @@ class PdfiumPrefetcher:
     Args:
         pdf_input: The bound PDF rows.
         spec: The model, for the render geometry.
-        order: Row indices in the order the chain will admit them;
-            every row once. Row index order when omitted.
+        order: Row indices in the order the chain will admit them,
+            each at most once; rows left out are rendered only when
+            taken. Row index order when omitted.
         processes: Render processes; DEFAULT_PROCESSES when None. Zero
             renders in the calling process when a row is submitted.
         max_outstanding_pages: Pages submitted but not yet taken before
@@ -166,9 +167,10 @@ class PdfiumPrefetcher:
         self.patch = spec.image_patch_pixels
         self.budget = pdf_input.visual_tokens
         self.order = (list(range(len(pdf_input.rows))) if order is None
-                      else list(order))
-        if sorted(self.order) != list(range(len(pdf_input.rows))):
-            raise ValueError("order must list every row index once")
+                      else [int(row) for row in order])
+        if len(set(self.order)) != len(self.order) or any(
+                not 0 <= row < len(pdf_input.rows) for row in self.order):
+            raise ValueError("order lists row indices, each at most once")
         self.max_outstanding = (DEFAULT_OUTSTANDING_PAGES
                                 if max_outstanding_pages is None
                                 else max_outstanding_pages)
