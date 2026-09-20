@@ -3,7 +3,7 @@
 Run from the repository root:
     uv run --with matplotlib python reports/make_expert_fusion_diagram.py
 
-The columns describe Quail revisions 189bfaa and f76f7ed. Colors follow the
+The columns describe Quail revisions f8b11e5 and a2c0d75. Colors follow the
 kernel diagram in PR #133. Boxes are operations, not measured launch counts.
 """
 
