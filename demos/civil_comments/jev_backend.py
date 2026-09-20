@@ -37,6 +37,7 @@ from demos.civil_comments import (
     LABEL_CUTOFF,
     TOXICITY_PROMPT_INSTRUCTIONS,
     accuracy_summary,
+    field_statement,
     load_comments,
     requested_input_tokens,
 )
@@ -61,10 +62,10 @@ JOIN_QUESTIONS = {
         "type": "noul",
         "instructions": (
             f"{JOIN_PROMPT_INSTRUCTIONS}\n\n"
-            f"DOCUMENT 1:\nThe comment {statement}."
+            f"DOCUMENT 1:\n{field_statement(spec)}"
         ),
     }
-    for field, statement in FIELDS.items()
+    for field, spec in FIELDS.items()
 }
 
 
