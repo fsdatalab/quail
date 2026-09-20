@@ -1,17 +1,20 @@
 """Quail's DiffusionGemma forward pass against stock vLLM's, on a GPU.
 
 Stock vLLM runs the same checkpoint in a child process and records
-the hidden state of every prompt row after each layer. Quail packs
-the same prompts into one chunk, runs its stack cut after each layer,
-and reads the same rows. The prompt rows are computed the same way in
-both: causally, with the canvas rows after them.
+the hidden state of every prompt row and of the canvas row after
+each layer: the prompt rows from its prefill pass, the canvas row
+from the decode step that follows. vLLM fills the canvas with a
+random token per request, so the child process gives it Quail's
+fixed draw instead. Quail packs the same prompts into one chunk with
+its canvas row after each, runs its stack cut after each layer, and
+reads the same rows.
 
 Both sides quantize activations to fp8 with 3 mantissa bits, at
 different points, and run different attention and expert kernels, so
 the rows differ by about one percent after the first layer and the
 difference compounds through the stack. The test checks that no
-layer adds a jump of its own and that the TRUE/FALSE answers agree.
-Skipped without a CUDA device; runs through
+layer adds a jump of its own and that the TRUE/FALSE answers at the
+canvas row agree. Skipped without a CUDA device; runs through
 `uv run modal run experiments/run_gpu_tests.py`.
 """
 
@@ -75,21 +78,34 @@ def _prompt_ids():
 
 
 def stock_rows_main(out_path, every_layer=False):
-    """Record stock vLLM's hidden state of every prompt row.
+    """Record stock vLLM's hidden state of every prompt row and the canvas row.
 
     After the last layer, or with every_layer after each layer: a
-    list per prompt of one (rows, hidden) tensor per layer.
+    list per prompt of one (rows, hidden) tensor per layer, the
+    prompt rows first and the canvas row last.
     """
     import os
 
     # keep the engine in this process so the hook sees the forward
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     from vllm import LLM, SamplingParams
+    from vllm.model_executor.models import diffusion_gemma as vllm_model
 
+    from quail.backends.quail.executor.models.diffusion_gemma import (
+        canvas_token_ids,
+    )
     from quail.specs import MODELS
 
     prompts = _prompt_ids()
     spec = MODELS[MODEL]
+    token = canvas_token_ids(spec.vocab, spec.canvas_tokens)[0]
+
+    def init_canvas(self, slot_indices_np):
+        self.canvas[slot_indices_np] = torch.full(
+            (slot_indices_np.shape[0], self.canvas_length), token,
+            dtype=torch.int64, device=self.device)
+
+    vllm_model.DiffusionGemmaRequestStates.init_canvas = init_canvas
     llm = LLM(model=spec.hf_name, gpu_memory_utilization=0.9,
               enforce_eager=True, enable_prefix_caching=False,
               disable_log_stats=True)
@@ -110,11 +126,15 @@ def stock_rows_main(out_path, every_layer=False):
     rows = []
     for ids in prompts:
         captured.clear()
-        # the prompt prefills in the first forward, ahead of the canvas
+        # the prompt prefills in the first forward; the canvas row is
+        # the one row of the decode step after it
         llm.generate([dict(prompt_token_ids=ids)],
                      SamplingParams(max_tokens=1), use_tqdm=False)
-        per_layer = [torch.cat(captured[i])[:len(ids)].float().cpu()
-                     for i in sorted(captured)]
+        per_layer = []
+        for i in sorted(captured):
+            prefill, decode = captured[i][0], captured[i][1]
+            per_layer.append(torch.cat(
+                [prefill[:len(ids)], decode[:1]]).float().cpu())
         rows.append(per_layer if every_layer else per_layer[-1])
     torch.save(rows, out_path)
 
@@ -179,7 +199,8 @@ def quail(prompts, stock_layers):
             hidden = pipeline.backbone_rows(chunk)
         offset = 0
         for rows, ids in zip(per_prompt, prompts):
-            rows.append(hidden[offset:offset + len(ids)].float().cpu())
+            # the prompt rows and the canvas row after them
+            rows.append(hidden[offset:offset + len(ids) + 1].float().cpu())
             offset += len(ids) + len(pipeline.canvas_ids)
     pipeline.layers = layers
     return per_prompt, model
@@ -238,7 +259,7 @@ def test_answers_agree_with_stock_vllm(stock_layers, quail):
 
     margins = [(margin(stock), margin(ours))
                for stock, ours in zip(stock_rows, rows)]
-    print("TRUE minus FALSE logit at the last prompt row, stock vs Quail:",
+    print("TRUE minus FALSE logit at the canvas row, stock vs Quail:",
           [(round(a, 2), round(b, 2)) for a, b in margins])
     agree = sum((a > 0) == (b > 0) for a, b in margins)
     assert agree == len(margins)
