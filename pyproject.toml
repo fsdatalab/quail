@@ -15,6 +15,9 @@ dependencies = [
     "numpy==2.5.2; sys_platform == 'emscripten' or sys_platform == 'win32'",
     "gigatoken==0.10.0",
     "datasets==5.0.1",
+    # reads PDF page sizes on the coordinator and renders pages on the
+    # worker; the Modal images install the same version
+    "pypdfium2==4.30.0",
     # same version as the Modal image; vLLM has Linux wheels only
     "vllm==0.26.0; sys_platform == 'linux'",
 ]
