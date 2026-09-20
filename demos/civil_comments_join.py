@@ -1,48 +1,54 @@
-"""Filter 448,000 Civil Comments for toxicity, then join each with 31 fields.
+"""Filter Civil Comments for toxicity, then join each with 31 fields.
 
 The data is the Jigsaw Civil Comments release mirrored on Hugging Face
-as pietrolesci/civilcomments-wilds (config "raw"). It has every column
-of the Kaggle train file: the text, seven toxicity scores, twenty-four
-identity scores, the moderator rating, reader reactions, and thread
-ids. A score is the fraction of annotators who applied the label, so a
-score of at least 0.5 is the label. The google/civil_comments mirror
-keeps only the seven toxicity scores.
+as pietrolesci/civilcomments-wilds (config "raw"). A score is the
+fraction of annotators who applied the label, so a score of at least
+0.5 is the label.
 
 The query keeps the toxic comments, then joins each one with a table of
-31 statements, one per remaining semantic field: six toxicity subtypes,
-twenty-four identity groups, and moderator rejection. Each comment is
-read by the model once; the filter question and the 31 statements are
-short suffixes on that comment's KV.
+31 statements: six toxicity subtypes, twenty-four identity groups, and
+moderator rejection. Each comment is read once. The filter question and
+the 31 statements are short suffixes on that comment's KV.
 
-Run on a machine with a CUDA GPU:
+Run DiffusionGemma 26B-A4B fp8 on Modal H100 GPUs from the repository
+root. --limit 0 uses every comment.
 
-    uv run python demos/civil_comments_join.py --limit 20000
+    uv run modal run --detach demos/civil_comments_join.py \
+      --limit 20000 \
+      2>&1 | tee /tmp/quail-civil-comments.log
+
+Inputs, answers, and timing are saved under
+/results/demos/civil-comments/<run-id> on the quail-results volume.
 """
 
-import argparse
-import time
+from __future__ import annotations
 
+import json
+import uuid
+from collections import Counter
+from pathlib import Path
+
+import modal
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-import quail
-from quail.specs import DEVICES, MODAL_GPU_USD_PER_HOUR
+from quail.bench.images import gpu_image
+from quail.specs import H100_USD_PER_HOUR
 
 DATASET = "pietrolesci/civilcomments-wilds"
 DATASET_REVISION = "c227534cc0a34cf21db6a0bf0edd0f9050c8b305"
 DATASET_FILE = "raw/train-00000-of-00001.parquet"
+MODEL = "diffusion-gemma-26b-a4b-fp8"
+DEVICE = "h100-sxm"
 
-# The filter question. Text before {0} is the criterion; it is moved after
-# the comment by Quail so the comment's KV does not depend on the question.
 FILTER_PROMPT = (
     "Judge strictly from the comment above whether it is among the most "
     "toxic comments on a news site: hateful, threatening, or abusive, not "
     "merely rude or opinionated.\n\n{0}\n\nInstruction: answer TRUE if the "
     "comment is among the most toxic, FALSE otherwise.")
 
-# Score column -> the statement the model judges for each toxic comment.
 FIELDS = {
     "severe_toxicity": "is very hateful, aggressive, or disrespectful, far "
                        "beyond ordinary rudeness",
@@ -95,11 +101,15 @@ FIELDS = {
 }
 
 # Measured on the full table: 11.3% of comments are toxic, and among
-# those a joined field is true 6.7% of the time on average. The prompts
-# follow the QUAIL-B pattern: the criterion before the document, then
-# the instruction after it.
+# those a joined field is true 6.7% of the time on average.
 JOIN_PROMPT = ("Judge strictly whether the description in DOCUMENT {1} "
                "applies to the comment in DOCUMENT {0}.")
+
+app = modal.App("quail-milestone1")
+results_volume = modal.Volume.from_name("quail-results", create_if_missing=True)
+hf_cache = modal.Volume.from_name("quail-hf-cache", create_if_missing=True)
+kernel_cache = modal.Volume.from_name("quail-kernel-cache", create_if_missing=True)
+image = gpu_image(("demos", "/root/demos")).add_local_python_source("demos")
 
 
 def build_sql(filter_only: bool = False) -> str:
@@ -113,9 +123,6 @@ def build_sql(filter_only: bool = False) -> str:
     FROM comments c{join}
     WHERE AI_FILTER(PROMPT('{FILTER_PROMPT}', c.text), {{'selectivity': 0.113}})
 """
-
-
-SQL = build_sql()
 
 
 def own_answers(result):
@@ -142,6 +149,7 @@ def own_answers(result):
 def load_comments(limit: int | None) -> pa.Table:
     """Return the comments with a string id and a 0/1 rejected score."""
     from huggingface_hub import hf_hub_download
+
     path = hf_hub_download(DATASET, DATASET_FILE, repo_type="dataset",
                            revision=DATASET_REVISION)
     table = pq.read_table(path)
@@ -160,117 +168,220 @@ def load_comments(limit: int | None) -> pa.Table:
 
 def labeled_pairs(comments: pa.Table) -> set:
     """(comment_id, field) pairs whose toxicity and field scores are >= 0.5."""
-    df = comments.to_pandas()
-    toxic = df[df["toxicity"] >= 0.5]
-    return {(comment_id, field) for field in FIELDS
-            for comment_id in toxic.loc[toxic[field] >= 0.5, "comment_id"]}
+    ids = comments["comment_id"].to_pylist()
+    toxic = np.asarray(comments["toxicity"].to_pylist()) >= 0.5
+    pairs = set()
+    for field in FIELDS:
+        scores = np.asarray(comments[field].to_pylist()) >= 0.5
+        for index in np.flatnonzero(toxic & scores):
+            pairs.add((ids[int(index)], field))
+    return pairs
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--limit", type=int, help="random sample of N comments")
-    parser.add_argument("--filter-only", action="store_true",
-                        help="run the toxicity filter alone, without the join")
-    parser.add_argument("--device", choices=sorted(DEVICES), default="h100-sxm")
-    parser.add_argument("--gpus", type=int, choices=(1, 2, 4, 8), default=1)
-    parser.add_argument("--gpu-usd-per-hour", type=float,
-                        help="hourly price per GPU; defaults to Modal pricing")
-    parser.add_argument("--gpu-timing", action="store_true",
-                        help="report seconds the GPU was busy, from CUDA events")
-    args = parser.parse_args()
-    hourly_price = args.gpu_usd_per_hour
-    price_source = "custom" if hourly_price is not None else "Modal"
-    if hourly_price is None:
-        hourly_price = MODAL_GPU_USD_PER_HOUR[args.device]
+def requested_input_tokens(session, query, result, filter_only: bool) -> int:
+    """Sum full prompt lengths of every evaluated filter and join pair."""
+    comment_lengths = np.asarray(session.token_lengths("comments", "text"))
+    canvas = session.model.canvas_tokens
+    filter_prompt = query.logical.operators().filters["c"][0].prompt
+    total = int((filter_prompt.preamble_tokens + comment_lengths
+                 + filter_prompt.tail_tokens + canvas).sum())
+    if filter_only:
+        return total
+    join_prompt = query.logical.operators().joins[0].prompt
+    labels = {alias: (label, frame)
+              for alias, label, frame in join_prompt.labels}
+    field_lengths = np.asarray(session.token_lengths("fields", "statement"))
+    answers = result.answer_tables["filters"][("c", 0)]
+    survivors = answers.filter(answers["answer"])["c"].to_numpy()
+    pair_fixed = (join_prompt.preamble_tokens + labels["c"][1]
+                  + labels["f"][0] + join_prompt.tail_tokens + canvas)
+    field_sum = int(field_lengths.sum())
+    n_fields = len(field_lengths)
+    for row in survivors:
+        total += n_fields * (pair_fixed + int(comment_lengths[int(row)]))
+        total += field_sum
+    return total
 
-    t0 = time.perf_counter()
-    comments = load_comments(args.limit)
-    n_docs = comments.num_rows
-    print(f"comments: {n_docs}, loaded in {time.perf_counter() - t0:.1f} s",
-          flush=True)
+
+def json_ready(value):
+    """Convert numpy scalars so a summary can be written as JSON."""
+    if isinstance(value, dict):
+        return {str(key): json_ready(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_ready(item) for item in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def evaluate_tables(directory: Path, limit: int | None, gpus: int,
+                    filter_only: bool) -> dict:
+    """Run the query and write answers, the plan, and the timing report."""
+    import quail
+
+    comments = load_comments(limit)
+    fields = pa.table({
+        "field": list(FIELDS),
+        "statement": [f"The comment {s}." for s in FIELDS.values()],
+    })
     labeled = labeled_pairs(comments)
-    print(f"labeled (comment, field) pairs: {len(labeled)}")
-
-    with quail.Session(
-        config=quail.EngineConfig(
-            gpus=args.gpus,
-            model="qwen3-4b-fp8",
-            backend="quail",
-            device=args.device,
-            gpu_timing=args.gpu_timing,
-        ),
-    ) as session:
+    ids = comments["comment_id"].to_pylist()
+    (directory / "inputs.json").write_text(json.dumps({
+        "dataset": DATASET,
+        "dataset_revision": DATASET_REVISION,
+        "model": MODEL,
+        "device": DEVICE,
+        "gpus": gpus,
+        "limit": limit,
+        "filter_only": filter_only,
+        "comments": len(ids),
+        "labeled_pairs": len(labeled),
+        "sql": build_sql(filter_only),
+    }, indent=2))
+    pq.write_table(comments.select(["comment_id", "text"]),
+                   directory / "comments.parquet")
+    with quail.Session(config=quail.EngineConfig(
+            model=MODEL, device=DEVICE, gpus=gpus, gpu_timing=True)) as session:
         session.register("comments", quail.DocumentProvider.from_table(
             comments, id_col="comment_id"))
         session.register("fields", quail.DocumentProvider.from_table(
-            pa.table({"field": list(FIELDS),
-                      "statement": [f"The comment {s}." for s in FIELDS.values()]}),
-            id_col="field"))
-        query = session.sql(build_sql(args.filter_only))
-        print(query.explain(), flush=True)
-
+            fields, id_col="field"))
+        query = session.sql(build_sql(filter_only))
+        explanation = query.explain()
+        print(explanation, flush=True)
+        (directory / "plan.txt").write_text(explanation)
         result = query.run()
         table = result.collect()
-        report = result.report
-        wall_s = report["wall_s"]
-        boot_s = report.get("boot_s", 0.0)
-        found = set() if args.filter_only else {
-            (row["c.comment_id"], row["f.field"]) for row in table.to_pylist()}
-        ids = comments["comment_id"].to_pylist()
-        answers = result.answer_tables["filters"][("c", 0)]
-        toxic_found = {ids[i] for i, yes in zip(answers["c"].to_pylist(),
-                                                answers["answer"].to_pylist())
-                       if yes}
-        toxic_labeled = {pair[0] for pair in labeled} | {
-            ids[i] for i, score in enumerate(comments["toxicity"].to_pylist())
-            if score >= 0.5}
-        toxic_hits = len(toxic_found & toxic_labeled)
-        print(f"filter precision against the toxicity labels: "
-              f"{toxic_hits / max(1, len(toxic_found)):.3f}")
-        print(f"filter recall against the toxicity labels: "
-              f"{toxic_hits / max(1, len(toxic_labeled)):.3f}")
-        if not args.filter_only:
-            print(f"(comment, field) pairs found: {len(found)}")
-            print(table.to_pandas()["f.field"].value_counts().to_string())
-            hits = len(found & labeled)
-            print(f"precision against the labels: "
-                  f"{hits / max(1, len(found)):.3f}")
-            print(f"recall against the labels: {hits / max(1, len(labeled)):.3f}")
-        pairs = 0
-        for stage in report.get("stages", ()):
-            if stage.get("op") == "filter":
-                print(f"  filter evaluated {stage['evaluated']} comments, "
-                      f"{stage['observed_selectivity']:.3f} passed")
-            elif stage.get("op") == "join":
-                pairs += stage["tuples"]
-                print(f"  join evaluated {stage['tuples']} pairs, "
-                      f"{stage['observed_selectivity']:.3f} passed")
-        print(f"boot_s: {boot_s} ({report.get('boot_kind')})")
-        print(f"wall_s: {wall_s}")
-        if "gpu_s" in report:
-            idle = wall_s - report["gpu_s"]
-            print(f"gpu_s: {report['gpu_s']} busy, {idle:.2f} idle "
-                  f"({100 * idle / wall_s:.1f}% of wall_s)")
-            budget = query.plan().settings["chunk_tokens"]
-            print(f"chunks: {report['chunks']}, mean "
-                  f"{report['fresh_tokens'] / report['chunks']:,.0f} fresh "
-                  f"tokens per chunk of the {budget:,} budget")
-            # the ideal time for exactly the answers this run gave
-            ideal = quail.speed_of_light_estimate(query, own_answers(result))
-            print(f"speed of light for this run's answers: {ideal.seconds:.2f} s, "
-                  f"{ideal.fresh_tokens:,.0f} fresh tokens; measured wall is "
-                  f"{wall_s / ideal.seconds:.2f}x ideal")
-        print(f"total_s: {wall_s + boot_s:.2f} (boot + query)")
-        print(f"fresh_tokens: {report.get('fresh_tokens')}")
-        if pairs:
-            print(f"document pairs/second: {pairs / wall_s:.1f}")
-        else:
-            print(f"documents/second: {n_docs / wall_s:.1f}")
-        cost_per_second = args.gpus * hourly_price / 3600
-        print(f"GPU price: ${hourly_price:.4f}/GPU-hour ({price_source})")
-        print(f"GPU cost/query: ${wall_s * cost_per_second:.4f}")
-        print(f"GPU startup cost: ${boot_s * cost_per_second:.4f}")
+        pq.write_table(table, directory / "retained.parquet")
+        report = dict(result.report)
+        input_tokens = requested_input_tokens(
+            session, query, result, filter_only)
+        ideal = quail.speed_of_light_estimate(query, own_answers(result))
+    answers = result.answer_tables["filters"][("c", 0)]
+    toxic_found = {ids[int(i)] for i, yes in zip(
+        answers["c"].to_pylist(), answers["answer"].to_pylist()) if yes}
+    toxic_labeled = {pair[0] for pair in labeled}
+    toxic_hits = len(toxic_found & toxic_labeled)
+    found = set() if filter_only else {
+        (row["c.comment_id"], row["f.field"]) for row in table.to_pylist()}
+    pair_hits = len(found & labeled)
+    wall_s = report["wall_s"]
+    boot_s = report.get("boot_s", 0.0)
+    pairs = 0
+    for stage in report.get("stages", ()):
+        if stage.get("op") == "filter":
+            print(f"  filter evaluated {stage['evaluated']} comments, "
+                  f"{stage['observed_selectivity']:.3f} passed", flush=True)
+        elif stage.get("op") == "join":
+            pairs += stage["tuples"]
+            print(f"  join evaluated {stage['tuples']} pairs, "
+                  f"{stage['observed_selectivity']:.3f} passed", flush=True)
+    field_counts = Counter(field for _, field in found)
+    summary = {
+        **report,
+        "model": MODEL,
+        "device": DEVICE,
+        "gpus": gpus,
+        "comments": len(ids),
+        "limit": limit,
+        "filter_only": filter_only,
+        "input_tokens": input_tokens,
+        "input_tokens_per_second": (
+            input_tokens / wall_s if wall_s else None),
+        "evaluated_pairs": pairs,
+        "gpu_cost_usd": wall_s * gpus * H100_USD_PER_HOUR / 3600,
+        "gpu_startup_cost_usd": boot_s * gpus * H100_USD_PER_HOUR / 3600,
+        "filter_precision": toxic_hits / max(1, len(toxic_found)),
+        "filter_recall": toxic_hits / max(1, len(toxic_labeled)),
+        "filter_found": len(toxic_found),
+        "filter_labeled": len(toxic_labeled),
+        "join_precision": None if filter_only else pair_hits / max(1, len(found)),
+        "join_recall": None if filter_only else pair_hits / max(1, len(labeled)),
+        "join_found": len(found),
+        "labeled_pairs": len(labeled),
+        "field_counts": dict(field_counts),
+        "sol_s": ideal.seconds,
+        "sol_fresh_tokens": ideal.fresh_tokens,
+        "wall_over_sol": wall_s / ideal.seconds if ideal.seconds else None,
+        "sol": ideal.as_dict(),
+        "result_volume_path": str(directory),
+    }
+    print(f"filter precision against the toxicity labels: "
+          f"{summary['filter_precision']:.3f}", flush=True)
+    print(f"filter recall against the toxicity labels: "
+          f"{summary['filter_recall']:.3f}", flush=True)
+    if not filter_only:
+        print(f"(comment, field) pairs found: {len(found)}", flush=True)
+        for field, count in field_counts.most_common():
+            print(f"  {field}: {count}", flush=True)
+        print(f"precision against the labels: "
+              f"{summary['join_precision']:.3f}", flush=True)
+        print(f"recall against the labels: "
+              f"{summary['join_recall']:.3f}", flush=True)
+    print(f"boot_s: {boot_s} ({report.get('boot_kind')})", flush=True)
+    print(f"wall_s: {wall_s}", flush=True)
+    if "gpu_s" in report:
+        idle = wall_s - report["gpu_s"]
+        print(f"gpu_s: {report['gpu_s']} busy, {idle:.2f} idle "
+              f"({100 * idle / wall_s:.1f}% of wall_s)", flush=True)
+    print(f"speed of light for this run's answers: {ideal.seconds:.2f} s, "
+          f"{ideal.fresh_tokens:,.0f} fresh tokens; measured wall is "
+          f"{summary['wall_over_sol']:.2f}x ideal", flush=True)
+    print(f"fresh_tokens: {report.get('fresh_tokens')}", flush=True)
+    print(f"input_tokens: {input_tokens}", flush=True)
+    if wall_s:
+        print(f"input_tokens_per_second: "
+              f"{summary['input_tokens_per_second']:.1f}", flush=True)
+    print(f"GPU cost/query: ${summary['gpu_cost_usd']:.4f}", flush=True)
+    print(f"GPU startup cost: ${summary['gpu_startup_cost_usd']:.4f}",
+          flush=True)
+    summary = json_ready(summary)
+    (directory / "summary.json").write_text(json.dumps(summary, indent=2))
+    print(f"result volume path: {directory}", flush=True)
+    return summary
 
 
-if __name__ == "__main__":
-    main()
+@app.function(
+    image=image, gpu="H100!", timeout=86_400, memory=98_304,
+    volumes={
+        "/results": results_volume,
+        "/root/.cache/huggingface": hf_cache,
+        "/root/.cache/kernels": kernel_cache,
+    },
+)
+def run(limit: int, gpus: int, filter_only: bool) -> dict:
+    """Load the comments and evaluate the query on a Modal GPU."""
+    results_volume.reload()
+    hf_cache.reload()
+    directory = Path("/results/demos/civil-comments") / uuid.uuid4().hex
+    directory.mkdir(parents=True)
+    sample = None if limit == 0 else limit
+    summary = evaluate_tables(directory, sample, gpus, filter_only)
+    results_volume.commit()
+    hf_cache.commit()
+    return summary
+
+
+@app.local_entrypoint()
+def main(limit: int = 20_000, gpus: int = 1, filter_only: bool = False):
+    """Run DiffusionGemma on one or more H100s. --limit 0 uses every comment."""
+    if limit < 0 or gpus not in (1, 2, 4, 8):
+        raise ValueError("limit must be >= 0; gpus must be 1, 2, 4, or 8")
+    gpu = "H100!" if gpus == 1 else f"H100!:{gpus}"
+    call = run.with_options(gpu=gpu).spawn(limit, gpus, filter_only)
+    print(f"function call id: {call.object_id}", flush=True)
+    summary = call.get()
+    print(json.dumps({
+        "wall_s": summary["wall_s"],
+        "sol_s": summary["sol_s"],
+        "wall_over_sol": summary["wall_over_sol"],
+        "fresh_tokens": summary.get("fresh_tokens"),
+        "input_tokens": summary["input_tokens"],
+        "input_tokens_per_second": summary["input_tokens_per_second"],
+        "gpu_cost_usd": summary["gpu_cost_usd"],
+        "filter_precision": summary["filter_precision"],
+        "filter_recall": summary["filter_recall"],
+        "join_precision": summary["join_precision"],
+        "join_recall": summary["join_recall"],
+        "result_volume_path": summary["result_volume_path"],
+    }, indent=2), flush=True)
