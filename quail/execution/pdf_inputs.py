@@ -6,18 +6,6 @@ import pyarrow as pa
 
 from quail.pdf import PDFInput
 from quail.planner.plan import PdfDocuments
-from quail.specs.base import ModelSpec
-from quail.specs.vision import image_prefix_tokens
-
-
-def planned_lengths(spec: ModelSpec, pdf_input: PDFInput) -> tuple[int, ...]:
-    """Each row's prompt prefix in tokens: its pages' soft and frame tokens."""
-    budget = pdf_input.visual_tokens
-    per_page = [
-        image_prefix_tokens(spec, page.width_points, page.height_points, budget)
-        for page in pdf_input.pages]
-    return tuple(sum(per_page[i] for i in row.page_ids)
-                 for row in pdf_input.rows)
 
 
 class PdfScanInput:
@@ -25,7 +13,8 @@ class PdfScanInput:
 
     The text counterpart is ScanInput; a query treats both the same
     way: lengths for planning, column() for value tables, and
-    physical_input() for the request binding.
+    physical_input() for the request binding. The lengths are
+    PagePrompts.lengths for the session's image budget.
     """
 
     def __init__(self, pdf_input: PDFInput, lengths: tuple[int, ...],

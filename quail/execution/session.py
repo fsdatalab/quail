@@ -20,7 +20,7 @@ from quail.execution.pairs import (
     pair_fraction,
     pair_table,
 )
-from quail.execution.pdf_inputs import PdfScanInput, planned_lengths
+from quail.execution.pdf_inputs import PdfScanInput
 from quail.execution.result import IndexRelation, QueryResult, true_answer_rows
 from quail.execution.runner import (
     ExecutionContext,
@@ -43,6 +43,7 @@ from quail.logical import (
     join_conditions,
     oriented_join_conditions,
 )
+from quail.pdf.prompt import PagePrompts
 from quail.physical import (
     PhysicalScan,
     PortRef,
@@ -262,7 +263,7 @@ class Session:
             if identity not in self._pdf_inputs:
                 pdf_input = provider.pdf_input(self.image_tokens)
                 self._pdf_inputs[identity] = (
-                    pdf_input, planned_lengths(self.model, pdf_input))
+                    pdf_input, PagePrompts(pdf_input, self.model).lengths)
             pdf_input, lengths = self._pdf_inputs[identity]
             return PdfScanInput(pdf_input, lengths, {
                 name: self._column_stores[(identity, name)]

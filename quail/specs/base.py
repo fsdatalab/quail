@@ -84,8 +84,19 @@ class ModelSpec:
     image_patch_pixels: int = 0    # side of one vision patch, in pixels
     image_pool_kernel: int = 0     # patches pooled into one soft token,
     #                                per side
-    image_frame_tokens: int = 0    # tokens around one image's soft
-    #                                tokens (begin and end markers)
+    # The prompt tokens one image becomes: a start marker, one soft
+    # token id per pooled patch block, an end marker. -1: none.
+    image_start_id: int = -1
+    image_soft_id: int = -1
+    image_end_id: int = -1
+    image_reserve_bytes: float = 0.0    # GPU memory kept free of KV for
+    #                                     the vision encoder's activations
+    #                                     when a query binds images
+
+    @property
+    def image_frame_tokens(self) -> int:
+        """Prompt tokens around one image's soft tokens: its start and end markers."""
+        return (self.image_start_id >= 0) + (self.image_end_id >= 0)
 
     def is_full_layer(self, layer: int) -> bool:
         """Whether the layer keeps every token with the full KV geometry."""

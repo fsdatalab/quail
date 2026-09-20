@@ -16,6 +16,7 @@ from quail.pdf import (
     read_manifest,
     rows_for_mode,
 )
+from quail.pdf.prompt import PagePrompts
 from quail.pdf.render import patch_positions, patchify, render_page
 from quail.specs import DIFFUSION_GEMMA_26B_FP8
 from quail.specs.vision import render_size, soft_tokens
@@ -55,6 +56,32 @@ def pdf_input(paths, row_mode="page", budget=280):
     rows = rows_for_mode(manifest.pages, len(manifest.sources), row_mode)
     return PDFInput(sources=manifest.sources, pages=manifest.pages, rows=rows,
                     row_mode=row_mode, visual_tokens=budget)
+
+
+def test_page_prompts_lay_out_marker_soft_marker_per_page(tmp_path):
+    paths = [make_pdf(tmp_path / "a.pdf", [LETTER, (792, 612)]),
+             make_pdf(tmp_path / "b.pdf", [LETTER])]
+    prompts = PagePrompts(pdf_input(paths, row_mode="pdf"), GEMMA)
+    letter = soft_tokens(GEMMA, *LETTER, 280)
+    assert len(prompts) == 2
+    assert prompts.lengths == (2 * (letter + 2), letter + 2)
+    row = prompts[0]
+    assert len(row) == prompts.lengths[0]
+    assert row[0] == GEMMA.image_start_id
+    assert row[1:1 + letter] == [GEMMA.image_soft_id] * letter
+    assert row[1 + letter] == GEMMA.image_end_id
+    assert row[2 + letter] == GEMMA.image_start_id
+    assert row[-1] == GEMMA.image_end_id
+    first, second = prompts.blocks(0)
+    assert (first.page_id, first.offset, first.soft_tokens) == (0, 1, letter)
+    assert second.offset == first.end + 2
+    assert second.end == len(row) - 1
+    assert prompts[1:] == [prompts[1]]
+    # the same rows in page mode: one page per row
+    by_page = PagePrompts(pdf_input(paths), GEMMA)
+    assert by_page.lengths == (letter + 2,) * 3
+    assert [block.page_id for row in range(3) for block in by_page.blocks(row)] \
+        == [0, 1, 2]
 
 
 def test_render_page_draws_at_the_target_size(tmp_path):

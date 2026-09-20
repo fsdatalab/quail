@@ -65,12 +65,6 @@ def soft_tokens(spec: ModelSpec, width: float, height: float,
     return (target_h // patch) * (target_w // patch) // (pool * pool)
 
 
-def image_prefix_tokens(spec: ModelSpec, width: float, height: float,
-                        budget: int) -> int:
-    """Prompt tokens one image occupies: its soft tokens and their frame."""
-    return soft_tokens(spec, width, height, budget) + spec.image_frame_tokens
-
-
 def resolve_image_tokens(spec: ModelSpec, requested: int | None) -> int:
     """The soft token budget a session uses, or 0 for a text-only model.
 

@@ -40,13 +40,21 @@ DIFFUSION_GEMMA_26B_FP8 = ModelSpec(
     chunk_cap_tokens=65_536,
     # Images go through the Gemma 4 vision tower: 16 px patches, 3 x 3
     # pooled into one soft token, at most one of these budgets per
-    # image, wrapped in <start_of_image> and <end_of_image>. The
-    # checkpoint's own processor confirmed the budgets and the soft
-    # token arithmetic (/results/ablations/pdf_probe_vision.json).
+    # image, wrapped in the checkpoint's boi and eoi tokens. The
+    # checkpoint's own processor confirmed the budgets, the token ids,
+    # and the soft token arithmetic
+    # (/results/ablations/pdf_probe_vision.json).
     input_modalities=frozenset({"text", "image"}),
     image_token_budgets=(70, 140, 280, 560, 1120),
     default_image_tokens=280,
     image_patch_pixels=16,
     image_pool_kernel=3,
-    image_frame_tokens=2,
+    image_start_id=255_999,
+    image_soft_id=258_880,
+    image_end_id=258_882,
+    # Eight letter pages at budget 280 took 1.44 GB above the loaded
+    # weights through vLLM's encoder path, whose one-hot position
+    # embedding needs about 0.8 GB per image in flight; 4 GiB lets it
+    # batch a few pages (pdf_probe_vision.json, peak_bytes).
+    image_reserve_bytes=4 * 2**30,
 )
