@@ -46,6 +46,18 @@ if not logger.handlers:
     logger.propagate = False
 
 _QUIET = 0
+_SINK = None
+
+
+def set_progress_sink(sink) -> None:
+    """Send every throttled progress count to ``sink`` as well as the log.
+
+    The sink is called as ``sink(label, done, total, unit)`` from the
+    thread that runs the loop, so it must return quickly and must not
+    block. Pass None to remove it.
+    """
+    global _SINK
+    _SINK = sink
 
 
 def say(message: str) -> None:
@@ -86,11 +98,17 @@ class Progress:
         if now - self._last >= self.every:
             self._last = now
             self.emit(self._line(self.label, now))
+            self._report()
 
     def finish(self, label: str, extra: str = "") -> None:
         """Log the final line under a past tense label."""
         line = self._line(label, time.perf_counter())
         self.emit(f"{line}, {extra}" if extra else line)
+        self._report()
+
+    def _report(self) -> None:
+        if _SINK is not None:
+            _SINK(self.label, self.done, self.total, self.unit)
 
     def _line(self, label: str, now: float) -> str:
         elapsed = now - self.started
