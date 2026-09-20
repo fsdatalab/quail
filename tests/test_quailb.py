@@ -5,10 +5,8 @@ import pyarrow.parquet as pq
 
 import quail
 from quail.bench.quailb import queries, register_tables
-from quail.logical.prompts import canonicalize_template
 from quail.planner.plan import EngineConfig, Refusal
 from quail_b.data import ASPECTS, SCENARIOS
-from quail_b.prompts import CARDIOVASCULAR_REACTION, NEUROLOGICAL_REACTION
 from quail_b.queries import QUERY_ORDER
 
 
@@ -96,11 +94,8 @@ def test_all_queries_compile_and_plan(tmp_path):
                            for predicate in predicates), qid
                 assert all(join.selectivity is None for join in joins), qid
             else:
-                for predicate in predicates:
-                    unknown = predicate.prompt.template in {
-                        canonicalize_template(NEUROLOGICAL_REACTION),
-                        canonicalize_template(CARDIOVASCULAR_REACTION)}
-                    assert (predicate.selectivity is None) == unknown, qid
+                assert all(predicate.selectivity is not None
+                           for predicate in predicates), qid
                 assert all(join.selectivity is not None for join in joins), qid
             plan = query.plan()
             assert not isinstance(plan, Refusal), f"{qid} refused: {plan}"

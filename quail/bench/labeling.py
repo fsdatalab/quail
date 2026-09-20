@@ -1057,9 +1057,11 @@ def finalize_collection(sf: float, corpus_id: str,
 
 def activate_reused_collection(
         sf: float, target_corpus_id: str, source_collection_id: str,
-        relabeled_workloads: str) -> dict:
+        relabeled_workloads: str, *,
+        relabeled_predicates: tuple[str, ...] = ()) -> dict:
     """Build one collection from new labels and verified unchanged tables."""
-    _, target_corpus, _ = _load_corpus(target_corpus_id)
+    with open(ROOT / "corpora" / target_corpus_id / "manifest.json") as f:
+        target_corpus = json.load(f)
     source_collection_path = (
         ROOT / "collections" / source_collection_id / "manifest.json")
     with open(source_collection_path) as f:
@@ -1087,12 +1089,15 @@ def activate_reused_collection(
     unknown = names - set(WORKLOADS)
     if unknown:
         raise ValueError(f"unknown relabeled workloads: {sorted(unknown)}")
+    unknown_predicates = set(relabeled_predicates) - set(PREDICATE_BY_KEY)
+    if unknown_predicates:
+        raise ValueError(f"unknown relabeled predicates: {sorted(unknown_predicates)}")
 
     identities = {}
     manifests = {}
     reused = {}
     for spec in PREDICATES:
-        if spec.workload in names:
+        if spec.workload in names or spec.key in relabeled_predicates:
             identity = label_set_identity(
                 spec, target_corpus["corpus_id"],
                 target_corpus["corpus_full_hash"])
@@ -1134,6 +1139,7 @@ def activate_reused_collection(
         "source_collection_id": source_collection_id,
         "source_corpus_id": source_corpus_id,
         "relabeled_workloads": sorted(names),
+        "relabeled_predicates": sorted(relabeled_predicates),
         "reused_predicates": len(reused),
         "new_predicates": len(PREDICATES) - len(reused),
         "predicate_count": len(PREDICATES),
