@@ -82,9 +82,18 @@ ESTIMATE_SAMPLE = 1024
 
 
 class Session:
+    """Register tables and run queries, here or on a query service.
+
+    Without ``endpoint`` every query runs in this process. With one,
+    ``register`` describes each table for the service, ``sql`` returns
+    a query that ``submit()`` sends there, and ``get_run`` reattaches
+    to an accepted query by id. The query API is the same either way.
+    """
+
     def __init__(self, config: EngineConfig, *,
                  tokenizer=None,
-                 registry: ExtensionRegistry | None = None):
+                 registry: ExtensionRegistry | None = None,
+                 endpoint: str | None = None):
         self.registry = registry or built_in_registry()
         model = resolve_model(config.model, self.registry.models)
         if isinstance(model, Refusal):
@@ -126,9 +135,25 @@ class Session:
         self._length_estimates = {}
         self._lock = threading.RLock()
         self._background = None
+        self._remote = None
+        if endpoint is not None:
+            from quail.service.client import RemoteConnection
+
+            self._remote = RemoteConnection(endpoint, self.registry.codecs)
+
+    @property
+    def endpoint(self) -> str | None:
+        """The query service this session submits to, or None."""
+        return None if self._remote is None else self._remote.client.endpoint
 
     def close(self):
-        """Wait for background tokenization and remove temporary token files."""
+        """Wait for background tokenization and remove temporary token files.
+
+        Closing a remote session removes its staged uploads only; the
+        service keeps every accepted query and the inputs it needs.
+        """
+        if self._remote is not None:
+            self._remote.close()
         if self._background is not None:
             self._background.shutdown(cancel_futures=True)
         for store in self._token_stores.values():
@@ -148,17 +173,52 @@ class Session:
         self.close()
 
     def register(self, name: str, provider: TableProvider) -> None:
+        """Register a table under ``name``.
+
+        On a remote session the provider must be one the service can
+        read: an in-memory table, a Parquet, IPC, or Arrow dataset
+        (uploaded as a snapshot), or a Hugging Face dataset (pinned to a
+        revision). Any other provider raises TypeError here rather than
+        running locally.
+        """
         self.catalog.register(name, provider)
+        if self._remote is not None:
+            try:
+                self._remote.register(name, provider)
+            except Exception:
+                del self.catalog.providers[name]
+                raise
 
     def sql(self, text: str, order: str | None = None,
             dialect: SQLDialect | str = SQLDialect.SNOWFLAKE) -> "Query":
+        if self._remote is not None:
+            from quail.service.client import RemoteQuery
+
+            return RemoteQuery(self, text, order=order,
+                               dialect=SQLDialect(dialect).value)
         logical = compile_sql(
             text, self.catalog, self.tokenizer, dialect=dialect,
             turn=self.model.turn,
         )
         return Query(self, logical, order=order)
 
+    def get_run(self, query_id: str):
+        """Reattach to a query the service already accepted.
+
+        Returns a QueryRun; it never resubmits or starts another
+        execution.
+        """
+        if self._remote is None:
+            raise RuntimeError(
+                "get_run() needs a Session with an endpoint; a local "
+                "session has no saved query records")
+        return self._remote.run(query_id)
+
     def docs(self, name: str) -> "BoundBuilder":
+        if self._remote is not None:
+            raise RuntimeError(
+                "the builder API is not available on a remote Session; "
+                "write the query with sql()")
         return BoundBuilder(self,
                             BuilderQuery(self.catalog, name,
                                          self.tokenizer,
@@ -640,6 +700,12 @@ class Query:
         from quail.execution.execute import execute_query
 
         return execute_query(self, plan=plan)
+
+    def submit(self, **_options):
+        """Submitting needs a query service; local queries use run()."""
+        raise RuntimeError(
+            "submit() needs a Session with an endpoint; this session runs "
+            "queries in the current process, so call run() or collect()")
 
     def execute_stream(self, batch_rows: int = 65_536,
                        limit: int | None = None) -> pa.RecordBatchReader:
