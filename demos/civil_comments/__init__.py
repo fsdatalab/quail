@@ -209,13 +209,6 @@ FIELDS = {
         "The program offers services for people with disabilities.",
         "The program offers ramps for wheelchair users.",
     ),
-    "rejected": FieldPrompt(
-        "would be removed by a civil news-site moderator for abuse, threats, "
-        "harassment, or other serious rule violations; disagreement alone is "
-        "not enough",
-        "You are worthless trash. Get out of here.",
-        "I disagree because this proposal would raise costs.",
-    ),
 }
 
 JOIN_PROMPT_INSTRUCTIONS = (
@@ -273,11 +266,25 @@ def load_comments(limit: int | None) -> pa.Table:
 
 
 def fields_table() -> pa.Table:
-    """Return the 31 field statements."""
+    """Return the 30 semantic field statements."""
     return pa.table({
         "field": list(FIELDS),
         "statement": [field_statement(spec) for spec in FIELDS.values()],
     })
+
+
+def rejected_pairs(
+    comments: pa.Table,
+    retained_ids: set[str],
+) -> set[tuple[str, str]]:
+    """Return exact rejected-status pairs for retained comments."""
+    ids = comments["comment_id"].to_pylist()
+    rejected = np.asarray(comments["rejected"].to_pylist()) >= LABEL_CUTOFF
+    return {
+        (ids[int(index)], "rejected")
+        for index in np.flatnonzero(rejected)
+        if ids[int(index)] in retained_ids
+    }
 
 
 def labeled_outputs(comments: pa.Table) -> tuple[set[str], set[tuple[str, str]]]:
@@ -290,6 +297,7 @@ def labeled_outputs(comments: pa.Table) -> tuple[set[str], set[tuple[str, str]]]
         scores = np.asarray(comments[field].to_pylist()) >= LABEL_CUTOFF
         for index in np.flatnonzero(toxic & scores):
             pairs.add((ids[int(index)], field))
+    pairs.update(rejected_pairs(comments, toxic_ids))
     return toxic_ids, pairs
 
 
