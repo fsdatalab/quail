@@ -591,9 +591,54 @@ def complete_answers(result, conversations, questions):
     return ordered
 
 
-def evaluate_tables(directory: Path, gpus: int) -> dict:
-    """Run the join and save every Boolean decision and its execution report."""
+def run_remote(query, directory: Path, endpoint: str):
+    """Submit the join to a query service, watch it, and return its result.
+
+    The query id goes to the log and to ``query_id.txt`` beside the
+    inputs, so a later run or a browser can reattach to the same query:
+    the status page is ``<endpoint>/queries/<id>``.
+    """
+    run = query.submit(request_key=f"agent-compaction:{directory.name}")
+    (directory / "query_id.txt").write_text(run.id)
+    print(f"query id: {run.id}", flush=True)
+    print(f"status page: {endpoint.rstrip('/')}/queries/{run.id}", flush=True)
+    for status in run.watch():
+        progress = status.progress or {}
+        print(f"{status.state} (revision {status.revision})"
+              + (f": {progress.get('label')} {progress.get('done')}"
+                 f"/{progress.get('total')} {progress.get('unit')}"
+                 if progress else ""), flush=True)
+    status = run.status()
+    if status.plan is not None:
+        print(status.plan["text"], flush=True)
+        (directory / "plan.txt").write_text(status.plan["text"])
+    return run.result()
+
+
+def token_lengths(session, name: str, column: str) -> np.ndarray:
+    """Token counts of one registered column, from the session or the tokenizer.
+
+    A local session has tokenized the column already. A remote session
+    has not, so the column is tokenized here with the model tokenizer.
+    """
+    exact = session.token_lengths(name, column)
+    if exact is None:
+        tokenizer = session.tokenizer
+        exact = [len(tokenizer(text))
+                 for text in session.column_values(name, column).to_pylist()]
+    return np.asarray(exact)
+
+
+def evaluate_tables(directory: Path, gpus: int, endpoint: str | None = None) -> dict:
+    """Run the join and save every Boolean decision and its execution report.
+
+    Args:
+        directory: The prepared inputs; outputs are written beside them.
+        gpus: GPUs the query asks for.
+        endpoint: A query service to submit to; None runs on this host.
+    """
     import quail
+    from quail.frontend.sql import compile_sql
     from quail.specs import MODAL_GPU_USD_PER_HOUR
 
     conversations = pq.read_table(directory / "conversations", columns=["id"])
@@ -603,25 +648,34 @@ def evaluate_tables(directory: Path, gpus: int) -> dict:
     input_tokens = 0
     if len(questions):
         with quail.Session(config=quail.EngineConfig(
-                model=MODEL, device=DEVICE, gpus=gpus)) as session:
+                model=MODEL, device=DEVICE, gpus=gpus),
+                endpoint=endpoint) as session:
             session.register("conversations", quail.DocumentProvider.from_parquet(
                 str(directory / "conversations"), id_col="id"))
             session.register("tool_questions", quail.DocumentProvider.from_parquet(
                 str(directory / "tool_questions"), id_col="id"))
             query = session.sql(SQL, dialect="bq")
-            explanation = query.explain()
-            print(explanation, flush=True)
-            (directory / "plan.txt").write_text(explanation)
-            result = query.run()
+            if endpoint is None:
+                explanation = query.explain()
+                print(explanation, flush=True)
+                (directory / "plan.txt").write_text(explanation)
+                result = query.run()
+                logical = query.logical
+            else:
+                result = run_remote(query, directory, endpoint)
+                # the service compiled the query; compile it here too for
+                # the prompt token pieces the throughput number needs
+                logical = compile_sql(SQL, session.catalog, session.tokenizer,
+                                      dialect="bq", turn=session.model.turn)
             answers = complete_answers(result, conversations, questions)
             pq.write_table(result.collect(), directory / "retained.parquet")
-            prompt = query.logical.operators().joins[0].prompt
+            prompt = logical.operators().joins[0].prompt
             pieces = {alias: (label, frame)
                       for alias, label, frame in prompt.label_token_ids}
             overhead = (len(prompt.preamble_token_ids) + len(pieces["c"][1])
                         + len(pieces["q"][0]) + len(prompt.tail_token_ids))
-            c_lengths = np.asarray(session.token_lengths("conversations", "state"))
-            q_lengths = np.asarray(session.token_lengths("tool_questions", "statement"))
+            c_lengths = token_lengths(session, "conversations", "state")
+            q_lengths = token_lengths(session, "tool_questions", "statement")
             input_tokens = int(c_lengths[answers["c"].to_numpy()].sum()
                                + q_lengths.sum() + overhead * len(questions))
             decisions = questions.append_column("answer", answers["answer"])
@@ -632,6 +686,7 @@ def evaluate_tables(directory: Path, gpus: int) -> dict:
     seconds = report["wall_s"]
     report.update(
         model=MODEL, device=DEVICE, gpus=gpus, input_tokens=input_tokens,
+        endpoint=endpoint,
         input_tokens_per_second=input_tokens / seconds if seconds else None,
         evaluated_pairs=len(questions),
         gpu_cost_usd=seconds * gpus * MODAL_GPU_USD_PER_HOUR[DEVICE] / 3600,
@@ -650,6 +705,25 @@ def evaluate(directory: str, gpus: int) -> dict:
     results_volume.reload()
     started = time.perf_counter()
     report = evaluate_tables(Path(directory), gpus)
+    report["evaluate_total_s"] = time.perf_counter() - started
+    (Path(directory) / "execution.json").write_text(json.dumps(report, indent=2))
+    results_volume.commit()
+    return report
+
+
+@app.function(image=preparation_image, timeout=86_400, memory=16_384,
+              volumes={"/results": results_volume,
+                       "/root/.cache/huggingface": hf_cache})
+def evaluate_remote(directory: str, gpus: int, endpoint: str) -> dict:
+    """Submit the prepared questions to a deployed query service and wait.
+
+    Runs without a GPU: the service owns execution, and this function
+    only uploads the inputs, watches the saved status, and fetches the
+    saved result.
+    """
+    results_volume.reload()
+    started = time.perf_counter()
+    report = evaluate_tables(Path(directory), gpus, endpoint)
     report["evaluate_total_s"] = time.perf_counter() - started
     (Path(directory) / "execution.json").write_text(json.dumps(report, indent=2))
     results_volume.commit()
@@ -701,14 +775,22 @@ def reconstruct(directory: str) -> dict:
 
 
 @app.local_entrypoint()
-def main(limit: int = 100, seed: int = 42, gpus: int = 1):
-    """Compact complete traces using DiffusionGemma on one or more H100s."""
+def main(limit: int = 100, seed: int = 42, gpus: int = 1, endpoint: str = ""):
+    """Compact complete traces using DiffusionGemma on one or more H100s.
+
+    With ``--endpoint`` the join is submitted to a deployed query
+    service instead of a GPU function here; the log shows the query id
+    and its status page.
+    """
     if limit < 1 or gpus not in (1, 2, 4, 8):
         raise ValueError("limit must be positive; gpus must be 1, 2, 4, or 8")
     call = prepare.spawn(limit, seed)
     print(f"function call id (prepare): {call.object_id}", flush=True)
     directory = call.get()
-    call = evaluate.with_options(gpu=f"H100!:{gpus}").spawn(directory, gpus)
+    if endpoint:
+        call = evaluate_remote.spawn(directory, gpus, endpoint)
+    else:
+        call = evaluate.with_options(gpu=f"H100!:{gpus}").spawn(directory, gpus)
     print(f"function call id (evaluate): {call.object_id}", flush=True)
     call.get()
     call = reconstruct.spawn(directory)

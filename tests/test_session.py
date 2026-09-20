@@ -174,7 +174,10 @@ def make_executor(filter_truth, join_truth=None, seen=None):
                     evaluated_document_pairs=sum(
                         len(row) for row in rows.values())))
 
-        report = execute_single_graph(graph_state(FixedAnswers(), docs), {
+        state = graph_state(FixedAnswers(), docs)
+        if getattr(request, "relations", None):
+            state["columns"] = request.column_tables()
+        report = execute_single_graph(state, {
             "filter_limit": None, "pre_ids": [],
         }, graph)
         outputs = report.pop("_outputs")
