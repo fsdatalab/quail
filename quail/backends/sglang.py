@@ -85,7 +85,7 @@ class SGLangClient:
         )
 
     def run_filter_chain(self, sampling_params, body_ids, question_ids,
-                         true_ids, *, tag="q"):
+                         read_answer, *, tag="q"):
         """Submit each document's next filter as soon as it passes."""
         del tag
         return self.engine.loop.run_until_complete(run_filter_chain_async(
@@ -94,7 +94,7 @@ class SGLangClient:
             body_ids,
             question_ids,
             self.capacity["kv_cache_size_tokens"],
-            true_ids=true_ids,
+            read_answer=read_answer,
             block_size=self.capacity["block_size"],
             max_num_seqs=self.capacity["max_num_seqs"],
         ))

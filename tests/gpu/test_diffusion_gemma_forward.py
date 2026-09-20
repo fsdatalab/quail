@@ -98,6 +98,7 @@ def stock_rows_main(out_path, every_layer=False):
 
     prompts = _prompt_ids()
     spec = MODELS[MODEL]
+    assert spec.canvas_tokens == 1
     token = canvas_token_ids(spec.vocab, spec.canvas_tokens)[0]
 
     def init_canvas(self, slot_indices_np):
@@ -108,6 +109,7 @@ def stock_rows_main(out_path, every_layer=False):
     vllm_model.DiffusionGemmaRequestStates.init_canvas = init_canvas
     llm = LLM(model=spec.hf_name, gpu_memory_utilization=0.9,
               enforce_eager=True, enable_prefix_caching=False,
+              diffusion_config={"canvas_length": 1, "max_denoising_steps": 1},
               disable_log_stats=True)
     captured = {}
 
@@ -133,6 +135,7 @@ def stock_rows_main(out_path, every_layer=False):
         per_layer = []
         for i in sorted(captured):
             prefill, decode = captured[i][0], captured[i][1]
+            assert decode.shape[0] == 1
             per_layer.append(torch.cat(
                 [prefill[:len(ids)], decode[:1]]).float().cpu())
         rows.append(per_layer if every_layer else per_layer[-1])

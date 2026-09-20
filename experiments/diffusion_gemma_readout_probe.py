@@ -8,16 +8,17 @@ model on IMDB reviews with the F1 filter prompt (--dataset imdb) or
 on agent traces with the AGENT-1 prompt (--dataset agent), exactly as
 the benchmark does, and records for each document whether logprobs
 came back, how the TRUE and FALSE entries are decoded, the TRUE minus
-FALSE logprob margin, what true_bit reads, and what Quail answered
+FALSE logprob margin, what canvas_answer reads, and what Quail answered
 for the same document in the run named by --quail-run.
 --no-prefix-caching boots the engine without vLLM's prefix cache.
---multiprocessing runs vLLM's engine core in its own process, as the
-benchmark does. --fixed-canvas gives every vLLM request Quail's fixed
+--multiprocessing runs vLLM's engine core in its own process.
+--fixed-canvas gives every vLLM request Quail's fixed
 canvas token, so the answers differ by the kernels alone. --order
 corpus takes the first documents in corpus order, as the
 benchmark submits them (agent traces trajectory by trajectory, so
 each request extends the previous turn's prompt), instead of a
-sample spread over the corpus's lengths. Every document is answered
+sample spread over the corpus's lengths. Insufficient answer scores
+raise an error. Every document is answered
 three ways on the same engine: all
 prompts in one generate call (read), the benchmark's own filter
 chain through the engine's step loop (chain), and one prompt per
@@ -27,6 +28,7 @@ _k<logprobs>[_nocache].json.
 """
 
 import json
+from functools import partial
 
 import modal
 
@@ -62,16 +64,15 @@ def probe(prediction: str, n_docs: int = 256,
     "corpus" they are the first n_docs in corpus order.
     """
     import os
-    # the benchmark runs vLLM's engine core in its own process (vLLM's
-    # default); in-process keeps the probe's engine state in view
+    # In-process execution lets the probe access the engine state.
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "1" if multiprocessing else "0"
     from pathlib import Path
 
     import pyarrow.parquet as pq
     from transformers import AutoTokenizer
 
-    from quail.backends.request_scheduling import _ranked_answer, true_bit
-    from quail.backends.vllm import VLLMEngine
+    from quail.backends.request_scheduling import canvas_answer
+    from quail.backends.vllm import DIFFUSION_LOGPROBS, VLLMEngine
     from quail.logical import bind_prompt, render_filter_prompt_ids, true_false_ids
     from quail.specs import MODELS
     from quail_b.prompts import AGENT_RECOVERED, F1
@@ -81,6 +82,8 @@ def probe(prediction: str, n_docs: int = 256,
     spec = MODELS[MODEL]
     tokenizer = AutoTokenizer.from_pretrained(spec.hf_name)
     true_ids, false_ids = true_false_ids(tokenizer)
+    read_answer = partial(canvas_answer, true_ids=true_ids, false_ids=false_ids,
+                          top_k=logprobs or DIFFUSION_LOGPROBS)
 
     def tok(text):
         return tokenizer(text, add_special_tokens=False)["input_ids"]
@@ -135,12 +138,11 @@ def probe(prediction: str, n_docs: int = 256,
     state, boot = Engine().boot(spec, sorted(set(true_ids) | set(false_ids)))
     client, sampling = state["client"], state["sampling_params"]
     outputs = client.generate(prompts, sampling, use_tqdm=False)
-    chain = client.run_filter_chain(sampling, bodies, [tail], set(true_ids),
+    chain = client.run_filter_chain(sampling, bodies, [tail], read_answer,
                                     tag="probe")
     chain_answers = [bool(chain["answers"][(i, 1)]) for i in range(len(ids))]
-    alone_answers = [bool(true_bit(client.generate([p], sampling,
-                                                   use_tqdm=False)[0],
-                                   set(true_ids)))
+    alone_answers = [bool(read_answer(client.generate([p], sampling,
+                                                      use_tqdm=False)[0]))
                      for p in prompts]
     run_answers = {}
     for method in ("quail", "pipelined_vllm"):
@@ -164,7 +166,7 @@ def probe(prediction: str, n_docs: int = 256,
         record = {"id": doc_id, "tokens": lengths[doc_id],
                   "text": completion.text,
                   "sampled": list(completion.token_ids),
-                  "read": true_bit(output, set(true_ids)),
+                  "read": read_answer(output),
                   "chain": chain_answers[index], "alone": alone_answers[index],
                   "quail": quail_answers.get(doc_id),
                   "bench": bench_answers.get(doc_id)}
@@ -185,7 +187,7 @@ def probe(prediction: str, n_docs: int = 256,
             record["answer_entries"] = answer_entries
             record["best_rank"] = min((e[3] for e in answer_entries
                                        if e[3] is not None), default=None)
-            record["ranked"] = _ranked_answer(rows)
+            record["ranked"] = read_answer(output)
             best = {}
             for token, logprob, _, _ in answer_entries:
                 side = "true" if token in true_ids else "false"

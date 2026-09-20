@@ -5,12 +5,18 @@ from __future__ import annotations
 import itertools
 import time
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Mapping
 
 import pyarrow as pa
 
 from quail.backends.base import GpuContext
-from quail.backends.request_scheduling import run_join_grouped, true_bit
+from quail.backends.request_scheduling import (
+    canvas_answer,
+    run_join_grouped,
+    text_answer,
+    true_bit,
+)
 from quail.cost import budgets
 from quail.execution.pairs import (
     allowed_members,
@@ -375,7 +381,7 @@ def _token_list(values) -> list[int]:
 
 
 def _operator_at_a_time_filter(client, sampling_params, bodies, questions,
-                               true_ids):
+                               read_answer):
     active = list(range(len(bodies)))
     answers = {}
     requests = prompt_tokens = cached_tokens = 0
@@ -393,7 +399,7 @@ def _operator_at_a_time_filter(client, sampling_params, bodies, questions,
         )
         next_active = []
         for document, output in zip(evaluated, outputs):
-            answer = bool(true_bit(output, true_ids))
+            answer = bool(read_answer(output))
             answers[(document, stage_index)] = answer
             requests += 1
             prompt_tokens += len(output.prompt_token_ids)
@@ -419,7 +425,7 @@ def _operator_at_a_time_filter(client, sampling_params, bodies, questions,
     }
 
 
-def _pipelined_filter(client, sampling_params, bodies, questions, true_ids,
+def _pipelined_filter(client, sampling_params, bodies, questions, read_answer,
                       tag):
     if not bodies:
         return {
@@ -437,7 +443,7 @@ def _pipelined_filter(client, sampling_params, bodies, questions, true_ids,
         sampling_params,
         bodies,
         [list(question) for question in questions],
-        true_ids,
+        read_answer,
         tag=tag,
     )
     stages = []
@@ -479,7 +485,16 @@ class RequestModelExecution:
         self.sampling_params = settings["sampling_params"]
         self.documents = settings["documents"]
         self.pairs = {}         # written position -> pair table, from ports
-        self.true_ids = set(settings["true_ids"])
+        true_ids = set(settings["true_ids"])
+        if context.model.canvas_tokens == 1:
+            self.read_answer = partial(
+                canvas_answer, true_ids=true_ids,
+                false_ids=set(settings["false_ids"]),
+                top_k=self.sampling_params.logprobs)
+        elif context.model.canvas_tokens:
+            self.read_answer = text_answer
+        else:
+            self.read_answer = partial(true_bit, true_ids=true_ids)
         self.capacity = settings["capacity"]
         self.filter_submission = settings["filter_submission"]
         self.join_submission = settings["join_submission"]
@@ -534,7 +549,7 @@ class RequestModelExecution:
                     self.sampling_params,
                     bodies,
                     spec.question_token_ids,
-                    self.true_ids,
+                    self.read_answer,
                 )
             elif self.filter_submission == "pipelined":
                 result = _pipelined_filter(
@@ -542,7 +557,7 @@ class RequestModelExecution:
                     self.sampling_params,
                     bodies,
                     spec.question_token_ids,
-                    self.true_ids,
+                    self.read_answer,
                     f"filter-{filter_index}-{spec.alias}",
                 )
             else:
@@ -640,7 +655,7 @@ class RequestModelExecution:
                     self.sampling_params,
                     prefixes,
                     suffixes,
-                    self.true_ids,
+                    self.read_answer,
                     submission=submission,
                     pairs=request_pairs,
                 )

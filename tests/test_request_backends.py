@@ -2,6 +2,7 @@
 
 import asyncio
 from dataclasses import replace
+from functools import partial
 from types import SimpleNamespace
 
 import numpy as np
@@ -11,6 +12,7 @@ import quail
 from quail.backends import pipelined_sglang_backend, stock_vllm_backend
 from quail.backends.base import BackendExecutionContext, GpuContext
 from quail.backends.request import RequestModelExecution
+from quail.backends.request_scheduling import true_bit
 from quail.backends.sglang import SGLangClient
 from quail.builtins import built_in_registry
 from quail.physical import (
@@ -201,11 +203,11 @@ class _Client:
         return True
 
 
-def _execution(documents, **settings):
+def _execution(documents, *, model=QWEN3_4B_FP8, **settings):
     return RequestModelExecution(GpuContext(
         gpu_index=0,
         gpu_count=1,
-        model=QWEN3_4B_FP8,
+        model=model,
         device=H100_SXM,
         query_settings={
             "client": _Client(),
@@ -359,7 +361,8 @@ def test_cached_token_accounting():
 
     result = asyncio.run(run_filter_chain_async(
         generate, object(), [[5, 5, 5, 5], [6, 6, 6, 6]],
-        [[8, 8], [9, 9]], 100, true_ids={1}, block_size=1,
+        [[8, 8], [9, 9]], 100, read_answer=partial(true_bit, true_ids={1}),
+        block_size=1,
     ))
 
     # four requests of six tokens; the fake engine served 14 of them
@@ -444,44 +447,42 @@ def test_vllm_engine_settings_follow_the_model():
     assert sampling_kwargs([1, 2], canvas_tokens=256) == {"max_tokens": 16}
 
 
-def test_true_bit_reads_the_answer_word_from_free_text():
-    from types import SimpleNamespace
+def test_diffusion_filter_and_join_use_scores_instead_of_sampled_tokens():
+    from quail.specs import DIFFUSION_GEMMA_26B_FP8
 
-    from quail.backends.request_scheduling import true_bit
+    class ScoredClient(_Client):
+        def generate(self, prompts, sampling_params, use_tqdm=False):
+            outputs = super().generate(prompts, sampling_params, use_tqdm)
+            for output in outputs:
+                expected = output.outputs[0].token_ids[0] == 1
+                output.outputs[0].token_ids = [int(not expected)]
+                output.outputs[0].logprobs = [{
+                    1: SimpleNamespace(logprob=-1 if expected else -2),
+                    0: SimpleNamespace(logprob=-2 if expected else -1),
+                }]
+            return outputs
 
-    def output(token_ids, text):
-        return SimpleNamespace(outputs=[SimpleNamespace(token_ids=token_ids,
-                                                        text=text)])
-
-    assert true_bit(output([7], "TRUE"), {7}) == 1
-    assert true_bit(output([8], "FALSE"), {7}) == 0
-    assert true_bit(output([1, 2], "The answer is TRUE."), {7}) == 1
-    assert true_bit(output([1, 2], "**FALSE** because"), {7}) == 0
-    assert true_bit(output([1, 2], "TRUEISH FALSE"), {7}) == 0
-    assert true_bit(output([], ""), {7}) == 0
-
-
-def test_true_bit_ranks_the_answer_words_in_the_logprobs():
-    from types import SimpleNamespace
-
-    from quail.backends.request_scheduling import true_bit
-
-    def entry(logprob, decoded=None):
-        return SimpleNamespace(logprob=logprob, decoded_token=decoded)
-
-    def output(logprobs, token_ids=(1,), text=""):
-        return SimpleNamespace(outputs=[SimpleNamespace(
-            token_ids=list(token_ids), text=text, logprobs=logprobs)])
-
-    # the sampled token is end-of-turn; TRUE outranks FALSE below it
-    assert true_bit(output([{1: entry(-0.1, "<eos>"), 7: entry(-2.0, " TRUE"),
-                             8: entry(-3.5, " FALSE")}]), {7}) == 1
-    assert true_bit(output([{1: entry(-0.1, "<eos>"), 7: entry(-4.0, " TRUE"),
-                             8: entry(-3.5, "FALSE")}]), {7}) == 0
-    # a decoded TRUE counts even when its id is not a known true id
-    assert true_bit(output([{1: entry(-0.1, "<eos>"), 9: entry(-1.0, "TRUE")}]),
-                    {7}) == 1
-    # neither word present: fall back to the text, then to FALSE
-    assert true_bit(output([{1: entry(-0.1, "<eos>")}], text="TRUE"), {7}) == 1
-    assert true_bit(output([{1: entry(-0.1, "<eos>")}]), {7}) == 0
-    assert true_bit(output(None), {7}) == 0
+    execution = _execution(
+        {"r": [[10], [11]], "p": [[20], [21]]},
+        model=DIFFUSION_GEMMA_26B_FP8, client=ScoredClient(),
+        false_ids=[0], sampling_params=SimpleNamespace(logprobs=500))
+    filters = RequestExecution(
+        node_id="filter", backend_name="stock_vllm", aliases=("r",),
+        preamble_token_ids=(3,),
+        filters=(RequestFilterSpec(alias="r", written_positions=(0,),
+                                   question_token_ids=((90,),)),))
+    filtered = execution.execute(filters, {})
+    assert filtered.outputs["filter_answers:r"]["answer"].to_pylist() == [True, False]
+    join = RequestExecution(
+        node_id="join", backend_name="stock_vllm", aliases=("r", "p"),
+        preamble_token_ids=(3,),
+        joins=(RequestJoinSpec(
+            written_pos=0, aliases=("r", "p"), outer_aliases=("r",),
+            anchor="r", semantics="full", selectivity=0.5,
+            label_token_ids=(("r", (40,)), ("p", (41,))),
+            frame_token_ids=(("r", (30,)), ("p", (31,))),
+            tail_token_ids=(50,),
+        ),))
+    joined = execution.execute(join, {})
+    assert joined.outputs["join_answers:0"]["answer"].to_pylist() == [
+        True, True, False, False]

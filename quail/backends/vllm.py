@@ -51,12 +51,7 @@ def _capacity(llm) -> dict:
 
 
 def diffusion_kwargs(spec) -> dict:
-    """The LLM arguments a diffusion model's canvas readout needs.
-
-    The spec's canvas length; a one-row canvas takes one denoising
-    step, so a request is one prefill pass plus one row, and raises
-    the logprob cap the readout ranks TRUE against FALSE in.
-    """
+    """Set the canvas length and denoising limit through the public API."""
     if not spec.canvas_tokens:
         return {}
     diffusion = {"canvas_length": spec.canvas_tokens}
@@ -69,13 +64,10 @@ def diffusion_kwargs(spec) -> dict:
 
 
 def sampling_kwargs(allowed_ids: list[int], canvas_tokens: int = 0) -> dict:
-    """SamplingParams arguments for one greedy answer token.
+    """Set public sampling options for the model's answer format.
 
-    A diffusion model's sampler takes no temperature, min_tokens, or
-    allowed_token_ids. With a one-row canvas it commits that row after
-    one pass and returns its top logprobs, which the reader ranks TRUE
-    against FALSE; a longer canvas writes free text, and the reader
-    finds the answer word.
+    Diffusion sampling rejects temperature and allowed_token_ids.
+    One canvas token uses returned scores; longer canvases use text.
     """
     if canvas_tokens == 1:
         return {"max_tokens": 1, "logprobs": DIFFUSION_LOGPROBS}
@@ -99,7 +91,7 @@ class VLLMClient:
         return self.llm.reset_prefix_cache()
 
     def run_filter_chain(self, sampling_params, body_ids, question_ids,
-                         true_ids, *, tag="q"):
+                         read_answer, *, tag="q"):
         """Pipeline filter stages through the engine's step loop."""
         return run_filter_chain(
             self.llm.llm_engine,
@@ -108,7 +100,7 @@ class VLLMClient:
             question_ids,
             self.capacity["kv_cache_size_tokens"],
             tag=tag,
-            true_ids=true_ids,
+            read_answer=read_answer,
             block_size=self.capacity["block_size"],
             max_num_seqs=self.capacity["max_num_seqs"],
         )
@@ -161,6 +153,13 @@ class VLLMEngine:
         sampling_params = SamplingParams(
             **sampling_kwargs(allowed_ids, spec.canvas_tokens))
         capacity = _capacity(llm)
+        cache = llm.llm_engine.vllm_config.cache_config
+        capacity.update(
+            enable_prefix_caching=cache.enable_prefix_caching,
+            canvas_length=spec.canvas_tokens,
+            max_denoising_steps=1 if spec.canvas_tokens == 1 else None,
+            logprobs=sampling_params.logprobs,
+        )
         client = VLLMClient(llm, capacity)
         client.generate(
             [{"prompt_token_ids": allowed_ids}], sampling_params

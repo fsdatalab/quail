@@ -1,6 +1,7 @@
 """CPU tests for the scheduling loops the request backends share."""
 
 import asyncio
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -9,15 +10,17 @@ from quail.backends.request_scheduling import (
     run_filter_chain,
     run_filter_chain_async,
     run_join_grouped,
+    true_bit,
 )
 
+READ_ANSWER = partial(true_bit, true_ids={1})
 
 def test_join_submission_order_and_empty_inputs():
     for submission in ["anchor-major", "suffix-major"]:
         prefixes = [[100 + i] * (4 + i) for i in range(5)]
         suffixes = [[200 + j] * 3 for j in range(4)]
         client = _ParityClient()
-        result = run_join_grouped(client, object(), prefixes, suffixes, {1},
+        result = run_join_grouped(client, object(), prefixes, suffixes, READ_ANSWER,
                                   submission=submission)
         expected = ([[100 + i, 200 + j] for i in range(5) for j in range(4)]
                     if submission == "anchor-major" else
@@ -35,12 +38,13 @@ def test_join_submission_order_and_empty_inputs():
         ) - result["cached_tokens"]
         assert result["submission"] == submission
         with pytest.raises(ValueError, match="unknown join submission"):
-            run_join_grouped(_ParityClient(), object(), prefixes, suffixes, {1},
+            run_join_grouped(_ParityClient(), object(), prefixes, suffixes, READ_ANSWER,
                              submission="unknown")
 
     for prefixes, suffixes in [([], [[1]]), ([[1]], []), ([], [])]:
-        result = run_join_grouped(_ParityClient(), object(), prefixes, suffixes, {1},
-                                  submission="suffix-major")
+        result = run_join_grouped(
+            _ParityClient(), object(), prefixes, suffixes, READ_ANSWER,
+            submission="suffix-major")
         assert result["answers"] == []
         assert result["cached_per_request"] == []
         assert result["fresh_tokens"] == 0
@@ -78,7 +82,7 @@ def test_filter_pipelining_advances_and_refills():
         question_ids=[[3] * 3, [4] * 3],
         budget_tokens=100,
         tag="test",
-        true_ids={1},
+        read_answer=READ_ANSWER,
         block_size=16,
         max_num_seqs=2,
     )
@@ -116,7 +120,7 @@ def test_filter_pipelining_advances_and_refills():
 
         result = await asyncio.wait_for(run_filter_chain_async(
             generate, {}, [[1] * 10, [2] * 20, [3] * 30],
-            [[8] * 3, [9] * 4], 64, true_ids={1}, block_size=16,
+            [[8] * 3, [9] * 4], 64, read_answer=READ_ANSWER, block_size=16,
             max_num_seqs=10,
         ), timeout=2)
         assert result["doc_cap"] == 2
@@ -148,7 +152,8 @@ def test_async_filter_failure_and_empty_input():
 
         with pytest.raises(ExceptionGroup, match="TaskGroup"):
             await run_filter_chain_async(
-                generate, {}, [[1], [2]], [[9]], 100, true_ids={1}, max_num_seqs=2,
+                generate, {}, [[1], [2]], [[9]], 100, read_answer=READ_ANSWER,
+                max_num_seqs=2,
             )
         assert cancelled.is_set()
 
@@ -158,7 +163,7 @@ def test_async_filter_failure_and_empty_input():
         raise AssertionError("no documents")
 
     result = asyncio.run(
-        run_filter_chain_async(generate, {}, [], [[9]], 100, true_ids={1}))
+        run_filter_chain_async(generate, {}, [], [[9]], 100, read_answer=READ_ANSWER))
     assert result["requests"] == 0
     assert result["survivors"] == []
 
@@ -186,7 +191,7 @@ def test_request_backend_evaluates_listed_pairs_only():
     pairs = [(0, 1), (0, 3), (2, 0), (2, 2), (2, 3)]
     for submission in ("anchor-major", "suffix-major"):
         client = _ParityClient()
-        result = run_join_grouped(client, object(), prefixes, suffixes, {1},
+        result = run_join_grouped(client, object(), prefixes, suffixes, READ_ANSWER,
                                   submission=submission, pairs=pairs)
         heads = [(p["prompt_token_ids"][0] - 100, p["prompt_token_ids"][-1] - 200)
                  for p in client.calls[0]]
