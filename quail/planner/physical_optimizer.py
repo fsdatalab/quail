@@ -46,6 +46,9 @@ class PlanningContext:
     # join written position -> its equality pairs as a fraction of
     # the cross product; joins without conditions are absent
     pair_fractions: Mapping[int, float] = field(default_factory=dict)
+    # aliases whose documents are PDF pages, with what the planner
+    # needs beyond their per-row lengths; text aliases are absent
+    pdf_documents: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

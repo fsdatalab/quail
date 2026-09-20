@@ -1,5 +1,6 @@
 """Choose filter order, joins, anchors, and KV retention before execution."""
 
+from collections.abc import Mapping
 from dataclasses import replace
 
 from quail.cost import budgets
@@ -24,6 +25,8 @@ from quail.physical import (
     HashJoin,
     JoinStage,
     Limit,
+    PDFScan,
+    PhysicalScan,
     PortRef,
     Recombine,
     TextScan,
@@ -39,7 +42,7 @@ from quail.planner.physical_optimizer import (
     PlanningContext,
     apply_physical_rules,
 )
-from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
+from quail.planner.plan import CorpusStats, PdfDocuments, PhysicalPlan, Refusal
 from quail.specs import DeviceSpec, ModelSpec
 
 # ---------------------------------------------------------- tree walk
@@ -341,22 +344,30 @@ def contiguous_shards(doc_tokens, workers: int):
 
 def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                 device: DeviceSpec, doc_tokens: dict, gpus: int = 1,
-                order: str | None = None, pair_fractions=None):
+                order: str | None = None, pair_fractions=None,
+                pdf_documents=None):
     """Compile a LogicalPlan into a PhysicalPlan or Refusal.
 
     Args:
         plan: The logical plan to compile.
         model: Model spec.
         device: Device spec.
-        doc_tokens: alias -> list of per-document token counts.
+        doc_tokens: alias -> list of per-document token counts. For a
+            PDF alias these are each row's planned prompt prefix.
         gpus: GPU count; one model copy runs per GPU.
         order: Stage order rule, 'by_cost' or 'as_written'; None picks
             the default rule.
         pair_fractions: join written position -> the fraction of the
             cross product its equality conditions keep.
+        pdf_documents: alias -> PdfDocuments for aliases bound to PDF
+            pages; text aliases are absent.
     """
     operators = plan.operators()
     scans, filters, joins = operators.scans, operators.filters, operators.joins
+    pdf_documents = dict(pdf_documents or {})
+    refused = refuse_pdf_documents(pdf_documents, model, joins)
+    if refused is not None:
+        return refused
     applies = operators.applies
     alias_applies = {}
     join_applies = {}
@@ -554,13 +565,9 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
             doc_tokens[s.alias], workers
         )
         sid = f"scan:{s.alias}"
-        nodes.append(TextScan(
-            node_id=sid,
-            alias=s.alias, input_id=s.alias,
-            n_docs=stats[s.alias].n_docs,
-            total_tokens=stats[s.alias].total_tokens,
-            shard_ranges=shard_ranges,
-            shard_token_loads=tuple(loads)))
+        nodes.append(scan_node(
+            sid, s.alias, stats[s.alias], shard_ranges, tuple(loads),
+            pdf_documents.get(s.alias)))
         ids_src[s.alias] = PortRef(sid, f"ids:{s.alias}")
     # the hash join reads the scans; survivors thin its pairs at the AI join
     pairs_src = {}
@@ -770,10 +777,64 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
         estimator=estimator)
 
 
+def scan_node(node_id: str, alias: str, stats: CorpusStats, shard_ranges,
+              shard_token_loads, pdf: PdfDocuments | None) -> PhysicalScan:
+    """The physical scan for one alias: a PDFScan when it binds pages."""
+    common = dict(
+        node_id=node_id, alias=alias, input_id=alias,
+        n_docs=stats.n_docs, total_tokens=stats.total_tokens,
+        shard_ranges=shard_ranges, shard_token_loads=shard_token_loads)
+    if pdf is None:
+        return TextScan(**common)
+    return PDFScan(**common, row_mode=pdf.row_mode, n_pages=pdf.n_pages,
+                   visual_tokens=pdf.visual_tokens,
+                   pages_per_row_max=pdf.pages_per_row_max)
+
+
+def refuse_pdf_documents(pdf_documents: Mapping[str, PdfDocuments],
+                         model: ModelSpec, joins) -> Refusal | None:
+    """The refusal a PDF alias earns before any plan is built, if any.
+
+    PDF rows go through AI.FILTER only: a join would place a partner's
+    pages after the anchor's, which the runtime does not render. The
+    model must take images, and no row may show more pages than the
+    model was tested with.
+    """
+    if not pdf_documents:
+        return None
+    if "image" not in model.input_modalities:
+        return Refusal(
+            reasons=(f"model {model.name!r} takes text only, but "
+                     f"{sorted(pdf_documents)} bind PDF pages",),
+            constraint="model_takes_text_only",
+            needed=1, available=0, unit="image models")
+    joined = sorted({ref.alias for join in joins
+                     for ref in join.prompt.args
+                     if ref.alias in pdf_documents})
+    if joined:
+        return Refusal(
+            reasons=(f"AI.JOIN over PDF rows is not supported; "
+                     f"{joined} bind PDF pages",),
+            constraint="pdf_rows_join_unsupported",
+            needed=0, available=len(joined), unit="joined PDF aliases")
+    limit = model.max_images_per_request
+    for alias, pdf in pdf_documents.items():
+        if limit is not None and pdf.pages_per_row_max > limit:
+            return Refusal(
+                reasons=(f"a row of {alias!r} shows {pdf.pages_per_row_max} "
+                         f"pages, but {model.name!r} was tested with at "
+                         f"most {limit} images in one prompt",),
+                constraint="images_per_row_over_limit",
+                needed=pdf.pages_per_row_max, available=limit,
+                unit="images")
+    return None
+
+
 def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                device: DeviceSpec, doc_tokens: dict, gpus: int = 1,
                order: str | None = None, backend: str = "quail",
-               registry=None, tokenizer=None, pair_fractions=None):
+               registry=None, tokenizer=None, pair_fractions=None,
+               pdf_documents=None):
     """Plan one query with the selected model backend.
 
     Args:
@@ -790,6 +851,9 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
             planning context.
         pair_fractions: join written position -> the fraction of the
             cross product its equality conditions keep.
+        pdf_documents: alias -> PdfDocuments for aliases bound to PDF
+            pages. A backend that plans such an alias as anything but a
+            PDFScan is refused.
     """
     if registry is None:
         # the built in registry imports every backend, and backends
@@ -825,6 +889,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         order=order,
         tokenizer=tokenizer,
         pair_fractions=dict(pair_fractions or {}),
+        pdf_documents=dict(pdf_documents or {}),
     )
     region = ModelRegion(plan)
     candidates = tuple(selected.plan(region, context))
@@ -849,6 +914,15 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         raise ValueError(
             f"physical planner returned backend {selected_plan.backend!r} "
             f"for selected backend {backend!r}")
+    pdf_scans = {node.alias for node in selected_plan.nodes
+                 if isinstance(node, PDFScan)}
+    unplanned = sorted(set(pdf_documents or {}) - pdf_scans)
+    if unplanned:
+        return Refusal(
+            reasons=(f"backend {backend!r} planned {unplanned} without PDF "
+                     f"page inputs; only the quail backend renders pages",),
+            constraint="pdf_input_unsupported",
+            needed=len(unplanned), available=0, unit="PDF scans")
     graph, changed = apply_physical_rules(
         selected_plan.graph,
         tuple(registry.physical_rules.values()),

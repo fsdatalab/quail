@@ -346,6 +346,7 @@ class QuailBackend:
             gpus=context.gpu_count,
             order=context.order,
             pair_fractions=context.pair_fractions,
+            pdf_documents=context.pdf_documents,
         )
         if not hasattr(plan, "graph"):
             return (
