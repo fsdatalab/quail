@@ -14,7 +14,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import FancyArrowPatch, FancyBboxPatch, Rectangle
-
 from plot_colors import DARK
 
 ROOT = Path(__file__).parent
@@ -33,15 +32,27 @@ COLORS = {
 }
 
 COMMON = {
-    0: ("Input norm + FP8 quant, with prior residual add\nscale_add_rms_norm_quant", "quail"),
+    0: (
+        "Input norm + FP8 quant, with prior residual add\n"
+        "scale_add_rms_norm_quant",
+        "quail",
+    ),
     1: ("QKV projection\nCUTLASS FP8 matrix multiplication", "gemm"),
     2: ("Q/K/V norms + rotary positions\nqkv_norm_rope", "quail"),
     3: ("Write this layer's KV\nkv_row_scatter", "kv"),
-    4: ("Attention over the layer's KV pages\nFA3 for sliding layers; FA4 for full layers", "attention"),
+    4: (
+        "Attention over the layer's KV pages\n"
+        "FA3 for sliding layers; FA4 for full layers",
+        "attention",
+    ),
     5: ("Output projection input\nPer-token FP8 quantization", "vllm"),
     6: ("Attention output projection\nCUTLASS FP8 matrix multiplication", "gemm"),
     7: ("Post-attention normalization\nrms_norm", "vllm"),
-    8: ("Residual add + dense input norm + FP8 quant\nscale_add_rms_norm_quant", "quail"),
+    8: (
+        "Residual add + dense input norm + FP8 quant\n"
+        "scale_add_rms_norm_quant",
+        "quail",
+    ),
     9: ("Dense gate and up projection\nCUTLASS FP8 matrix multiplication", "gemm"),
     10: ("Dense GELU + multiplication + FP8 quant\ngelu_mul_quant", "quail"),
     11: ("Dense down projection\nCUTLASS FP8 matrix multiplication", "gemm"),
@@ -64,8 +75,16 @@ LEFT.update({
 })
 RIGHT = dict(COMMON)
 RIGHT.update({
-    13: ("Expert input norm + FP8 quant + router norm\nrms_norm2, QUANTIZE=True", "quail"),
-    19: ("Expert GELU + multiplication + FP8 quant\ngelu_mul_quant, ROUND_ACTIVATION=True", "quail"),
+    13: (
+        "Expert input norm + FP8 quant + router norm\n"
+        "rms_norm2, QUANTIZE=True",
+        "quail",
+    ),
+    19: (
+        "Expert GELU + multiplication + FP8 quant\n"
+        "gelu_mul_quant, ROUND_ACTIVATION=True",
+        "quail",
+    ),
 })
 
 WIDTH, STEP, HEIGHT = 5.4, 0.72, 0.57
@@ -125,13 +144,16 @@ ax.text(bypass_x - 0.09, (source_y + target_y) / 2,
         bbox={"facecolor": "white", "edgecolor": "none", "pad": 1.5})
 
 ax.text(6.2, 2.10,
-        "Repeat for 30 layers, then apply the final norm and compare TRUE and FALSE at the canvas.",
+        "Repeat for 30 layers, then apply the final norm and compare "
+        "TRUE and FALSE at the canvas.",
         ha="center", fontsize=12.5)
 ax.text(6.2, 1.78,
-        "The first layer only normalizes and quantizes its input; later layers include the prior residual add.",
+        "The first layer only normalizes and quantizes its input; later "
+        "layers include the prior residual add.",
         ha="center", fontsize=12.0)
 ax.text(6.2, 1.46,
-        "Each box names an operation. Assignment and attention may use multiple kernel launches.",
+        "Each box names an operation. Assignment and attention may use "
+        "multiple kernel launches.",
         ha="center", fontsize=12.0)
 
 for i, (fill, border, label) in enumerate(COLORS.values()):
@@ -142,7 +164,8 @@ for i, (fill, border, label) in enumerate(COLORS.values()):
     ax.text(x + 0.43, y, label, va="center", fontsize=13)
 
 ax.text(6.2, -0.85,
-        "Both existing and new Quail fusions are green. Expert selection and matrix kernels are unchanged.",
+        "Both existing and new Quail fusions are green. Expert selection "
+        "and matrix kernels are unchanged.",
         ha="center", fontsize=12.3)
 output = ROOT / "plots" / "diffusion_gemma_expert_fusion.png"
 output.parent.mkdir(exist_ok=True)
