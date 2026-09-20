@@ -6,7 +6,7 @@ questions, and deterministic sample with the Jev backend.
 
 Run one or two H100s from the repository root:
 
-    uv run modal run --detach demos/civil_comments/quail.py \
+    uv run modal run --detach demos/civil_comments/quail_backend.py \
       --limit 20000 --gpus 1 \
       2>&1 | tee /tmp/civil-comments-quail.log
 
