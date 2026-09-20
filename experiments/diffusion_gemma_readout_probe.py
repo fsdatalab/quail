@@ -12,7 +12,9 @@ FALSE logprob margin, what true_bit reads, and what Quail answered
 for the same document in the run named by --quail-run.
 --no-prefix-caching boots the engine without vLLM's prefix cache.
 --multiprocessing runs vLLM's engine core in its own process, as the
-benchmark does. --order corpus takes the first documents in corpus order, as the
+benchmark does. --fixed-canvas gives every vLLM request Quail's fixed
+canvas token, so the answers differ by the kernels alone. --order
+corpus takes the first documents in corpus order, as the
 benchmark submits them (agent traces trajectory by trajectory, so
 each request extends the previous turn's prompt), instead of a
 sample spread over the corpus's lengths. Every document is answered
@@ -52,7 +54,7 @@ def probe(prediction: str, n_docs: int = 256,
           quail_run: str = "20260919T220437Z-1550de75",
           logprobs: int = 0, dataset: str = "imdb",
           prefix_caching: bool = True, order: str = "spread",
-          multiprocessing: bool = False) -> str:
+          multiprocessing: bool = False, fixed_canvas: bool = False) -> str:
     """Run the readout; a logprobs count above 0 overrides the backend's.
 
     With order "spread" the documents are every k-th of the dataset in
@@ -109,6 +111,26 @@ def probe(prediction: str, n_docs: int = 256,
         def llm_kwargs(self, spec):
             return {**super().llm_kwargs(spec),
                     "enable_prefix_caching": prefix_caching}
+
+    if fixed_canvas:
+        # vLLM fills a request's canvas with a bare torch.randint; give
+        # every request Quail's fixed draw instead so the two sides
+        # differ by their kernels alone (needs the in-process engine)
+        import torch
+        from vllm.model_executor.models import diffusion_gemma as vllm_model
+
+        from quail.backends.quail.executor.models.diffusion_gemma import (
+            canvas_token_ids,
+        )
+
+        token = canvas_token_ids(spec.vocab, 1)[0]
+
+        def init_canvas(self, slot_indices_np):
+            self.canvas[slot_indices_np] = torch.full(
+                (slot_indices_np.shape[0], self.canvas_length), token,
+                dtype=torch.int64, device=self.device)
+
+        vllm_model.DiffusionGemmaRequestStates.init_canvas = init_canvas
 
     state, boot = Engine().boot(spec, sorted(set(true_ids) | set(false_ids)))
     client, sampling = state["client"], state["sampling_params"]
@@ -189,13 +211,15 @@ def probe(prediction: str, n_docs: int = 256,
     report = {"prediction": prediction, "n_docs": n_docs, "boot": boot,
               "dataset": dataset, "prefix_caching": prefix_caching,
               "order": order, "multiprocessing": multiprocessing,
+              "fixed_canvas": fixed_canvas,
               "sampling": str(sampling), "capacity": state["capacity"],
               "counts": counts, "decoded_forms": decoded_forms,
               "best_rank_covered_by_k": covered, "worst_rank": max(ranks, default=None),
               "true_ids": sorted(true_ids), "false_ids": sorted(false_ids),
               "records": records}
     suffix = ("" if prefix_caching else "_nocache") + (
-        "_corpus" if order == "corpus" else "") + ("_mp" if multiprocessing else "")
+        "_corpus" if order == "corpus" else "") + (
+        "_mp" if multiprocessing else "") + ("_fixed" if fixed_canvas else "")
     out = Path("/results/ablations/diffusion_gemma_readout_probe_"
                f"{dataset}_k{logprobs}{suffix}.json")
     out.write_text(json.dumps(report, indent=1, default=str))
@@ -209,11 +233,13 @@ def probe(prediction: str, n_docs: int = 256,
 @app.local_entrypoint()
 def main(prediction: str = "", docs: int = 256, logprobs: int = 0,
          dataset: str = "imdb", prefix_caching: bool = True,
-         order: str = "spread", multiprocessing: bool = False):
+         order: str = "spread", multiprocessing: bool = False,
+         fixed_canvas: bool = False):
     if not prediction:
         raise ValueError("pass --prediction before starting")
     call = probe.spawn(prediction, docs, logprobs=logprobs, dataset=dataset,
                        prefix_caching=prefix_caching, order=order,
-                       multiprocessing=multiprocessing)
+                       multiprocessing=multiprocessing,
+                       fixed_canvas=fixed_canvas)
     print(f"function call id: {call.object_id} (readout probe)", flush=True)
     print(call.get(), flush=True)
