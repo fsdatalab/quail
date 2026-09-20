@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 
 from quail.backends.request import RequestBackend
@@ -147,6 +148,13 @@ class VLLMEngine:
         """Load the spec's model and return the engine state and boot record."""
         from vllm import LLM, SamplingParams
 
+        if spec.canvas_tokens == 1:
+            # vLLM's engine core in its own process returns the canvas
+            # row's logprobs unreliably under the step loop on long
+            # prompts (agreement with the in-process engine falls from
+            # 92 to 73 percent on agent traces,
+            # /results/ablations/diffusion_gemma_readout_probe_agent_k0_corpus_mp.json)
+            os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         started = time.perf_counter()
         llm = LLM(model=spec.hf_name, **self.llm_kwargs(spec))
         boot_s = time.perf_counter() - started
