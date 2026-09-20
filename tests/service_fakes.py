@@ -4,6 +4,7 @@ The child process executor imports this module by name, so everything
 here must be importable without pytest fixtures.
 """
 
+import threading
 import time
 
 import pyarrow as pa
@@ -57,3 +58,25 @@ def _failing_executor(request):
 
 
 failing_hooks = Hooks(physical_executor=_failing_executor, tokenizer=fake_tok)
+
+
+def start_server(app):
+    """Serve ``app`` with uvicorn on a free port; return (url, stop)."""
+    import uvicorn
+
+    config = uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning",
+                            timeout_graceful_shutdown=2)
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 30
+    while not server.started:
+        assert time.monotonic() < deadline, "uvicorn did not start"
+        time.sleep(0.01)
+    port = server.servers[0].sockets[0].getsockname()[1]
+
+    def stop():
+        server.should_exit = True
+        thread.join(30)
+
+    return f"http://127.0.0.1:{port}", stop

@@ -19,6 +19,17 @@ dependencies = [
     "vllm==0.26.0; sys_platform == 'linux'",
 ]
 
+[project.optional-dependencies]
+# the optional query service (quail-service); the client side of a
+# remote Session needs only the standard library
+service = [
+    "starlette==1.6.0",
+    "uvicorn==0.52.4",
+]
+
+[project.scripts]
+quail-service = "quail.service.__main__:main"
+
 [project.urls]
 Repository = "https://github.com/fsdatalab/quail-exploration"
 Issues = "https://github.com/fsdatalab/quail-exploration/issues"

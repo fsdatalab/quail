@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Quail query</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { font: 15px/1.45 system-ui, sans-serif; margin: 2rem auto; max-width: 64rem; padding: 0 1rem; color: #1a1a1a; }
+  h1 { font-size: 1.3rem; margin: 0 0 1rem; }
+  h2 { font-size: 1rem; margin: 1.5rem 0 .5rem; }
+  code, pre { font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  pre { background: #f6f6f6; padding: .75rem; overflow: auto; white-space: pre; }
+  table { border-collapse: collapse; width: 100%; }
+  td, th { text-align: left; padding: .25rem .5rem; border-bottom: 1px solid #e5e5e5; vertical-align: top; }
+  .state { display: inline-block; padding: .1rem .5rem; border-radius: .25rem; font-weight: 600; }
+  .queued, .planning, .running { background: #fff3cd; }
+  .succeeded { background: #d4edda; }
+  .failed, .interrupted { background: #f8d7da; }
+  .cancelled { background: #e2e3e5; }
+  .bar { height: .5rem; background: #e5e5e5; border-radius: .25rem; overflow: hidden; margin-top: .25rem; }
+  .bar > div { height: 100%; background: #2f6fdb; width: 0; }
+  button { font: inherit; padding: .3rem .8rem; }
+  .muted { color: #666; }
+</style>
+</head>
+<body>
+<h1 id="title">Quail query</h1>
+<div id="view"></div>
+<script>
+const parts = location.pathname.split("/").filter(Boolean);
+const queryId = parts[0] === "queries" ? parts[1] : null;
+const view = document.getElementById("view");
+
+function el(tag, attrs, ...children) {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(attrs || {})) {
+    if (key === "onclick") node.onclick = value; else node.setAttribute(key, value);
+  }
+  for (const child of children) node.append(child);
+  return node;
+}
+
+function when(seconds) {
+  return seconds ? new Date(seconds * 1000).toLocaleString() : "";
+}
+
+function renderList(items) {
+  document.getElementById("title").textContent = "Recent Quail queries";
+  const table = el("table", {}, el("tr", {},
+    el("th", {}, "id"), el("th", {}, "state"), el("th", {}, "created"), el("th", {}, "rows")));
+  for (const item of items) {
+    table.append(el("tr", {},
+      el("td", {}, el("a", { href: "/queries/" + item.id }, el("code", {}, item.id))),
+      el("td", {}, el("span", { class: "state " + item.state }, item.state)),
+      el("td", {}, when(item.created_at)),
+      el("td", {}, item.result ? String(item.result.rows) : "")));
+  }
+  view.replaceChildren(items.length ? table : el("p", { class: "muted" }, "No queries yet."));
+}
+
+async function cancel() {
+  await fetch(`/v1/queries/${queryId}/cancel`, { method: "POST" });
+}
+
+async function preview(status) {
+  const response = await fetch(`/v1/queries/${queryId}/rows?limit=20`);
+  if (!response.ok) return el("p", { class: "muted" }, "preview unavailable");
+  const data = await response.json();
+  const table = el("table", {}, el("tr", {}, ...data.columns.map(c => el("th", {}, c))));
+  for (const row of data.rows) {
+    table.append(el("tr", {}, ...row.map(v => el("td", {}, v === null ? "" : String(v)))));
+  }
+  const note = `${data.rows.length} of ${data.total_rows} rows`;
+  return el("div", {}, el("p", { class: "muted" }, note), table);
+}
+
+async function renderStatus(status) {
+  document.getElementById("title").textContent = "Quail query " + status.id;
+  const nodes = [];
+  const header = el("p", {},
+    el("span", { class: "state " + status.state }, status.state),
+    " ", el("span", { class: "muted" },
+      `revision ${status.revision}, updated ${when(status.updated_at)}`));
+  if (!["succeeded", "failed", "interrupted", "cancelled"].includes(status.state)) {
+    header.append(" ", el("button", { onclick: cancel },
+      status.cancel_requested ? "cancel requested" : "Cancel"));
+  }
+  nodes.push(header);
+  nodes.push(el("p", { class: "muted" },
+    `model ${status.config.model} on ${status.config.device} ` +
+    `(${status.config.gpus} GPU, backend ${status.config.backend}), ` +
+    `timeout ${status.timeout_s} s, created ${when(status.created_at)}` +
+    (status.started_at ? `, started ${when(status.started_at)}` : "")));
+  if (status.progress) {
+    const p = status.progress;
+    const text = p.total ? `${p.done.toLocaleString()} / ${p.total.toLocaleString()} ${p.unit}`
+                         : `${p.done.toLocaleString()} ${p.unit}`;
+    const bar = el("div", { class: "bar" }, el("div", { style: p.total ? `width:${100 * p.done / p.total}%` : "width:0" }));
+    nodes.push(el("h2", {}, "Progress"),
+      el("p", {}, `${p.label}: ${text} `, el("span", { class: "muted" }, `as of ${when(p.recorded_at)}`)), bar);
+  }
+  if (status.error) {
+    nodes.push(el("h2", {}, "Error"), el("pre", {}, `${status.error.type}: ${status.error.message}`));
+  }
+  if (status.result) {
+    nodes.push(el("h2", {}, `Result: ${status.result.rows.toLocaleString()} rows`),
+      el("p", {},
+        el("a", { href: `/v1/queries/${status.id}/result` }, "result.arrow"), " · ",
+        el("a", { href: `/v1/queries/${status.id}/files/report.json` }, "report.json")),
+      await preview(status));
+  }
+  if (status.plan) {
+    nodes.push(el("h2", {}, "Plan"), el("pre", {}, status.plan.text));
+  }
+  nodes.push(el("h2", {}, "SQL"), el("pre", {}, status.spec.sql));
+  nodes.push(el("h2", {}, "Inputs"), el("pre", {}, JSON.stringify(status.inputs, null, 2)));
+  view.replaceChildren(...nodes);
+}
+
+async function main() {
+  if (!queryId) {
+    const response = await fetch("/v1/queries?limit=100");
+    renderList((await response.json()).queries);
+    return;
+  }
+  const response = await fetch(`/v1/queries/${queryId}`);
+  if (!response.ok) {
+    view.replaceChildren(el("p", {}, `No query ${queryId} (${response.status}).`));
+    return;
+  }
+  let status = await response.json();
+  await renderStatus(status);
+  if (["succeeded", "failed", "interrupted", "cancelled"].includes(status.state)) return;
+  const source = new EventSource(`/v1/queries/${queryId}/events`);
+  source.onmessage = async (event) => {
+    status = JSON.parse(event.data);
+    await renderStatus(status);
+    if (["succeeded", "failed", "interrupted", "cancelled"].includes(status.state)) source.close();
+  };
+}
+
+main();
+</script>
+</body>
+</html>
