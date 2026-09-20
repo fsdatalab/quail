@@ -68,7 +68,8 @@ RIGHT.update({
     19: ("Expert GELU + multiplication + FP8 quant\ngelu_mul_quant, ROUND_ACTIVATION=True", "quail"),
 })
 
-WIDTH, STEP, HEIGHT = 5.7, 0.72, 0.57
+WIDTH, STEP, HEIGHT = 5.4, 0.72, 0.57
+X_POSITIONS = (0.2, 6.8)
 TOP = 20.4
 fig, ax = plt.subplots(figsize=(12.8, 24.0))
 fig.subplots_adjust(left=0.02, right=0.98, top=0.99, bottom=0.02)
@@ -83,7 +84,7 @@ ax.text(6.2, 21.42, "Prompt and one canvas token enter the layer sequence below.
 
 for col, (heading, rows) in enumerate((
         ("Before expert fusion", LEFT), ("With expert fusion", RIGHT))):
-    x = 0.25 + col * 6.2
+    x = X_POSITIONS[col]
     center = x + WIDTH / 2
     ax.text(center, 20.94, heading, ha="center", va="center",
             fontsize=19, weight="bold")
@@ -104,6 +105,24 @@ for col, (heading, rows) in enumerate((
         ax.text(center, top - height / 2, label, ha="center", va="center",
                 fontsize=13.2, linespacing=1.35, color=DARK)
         previous_bottom = top - height
+
+# The fused norm has two outputs. The BF16 router input follows the main
+# path; the FP8 expert input bypasses the router and enters the first expert
+# matrix multiplication after the router assigns rows to experts.
+right_x = X_POSITIONS[1]
+bypass_x = right_x - 0.34
+source_y = TOP - 13 * STEP - HEIGHT / 2
+target_y = TOP - 18 * STEP - HEIGHT / 2
+ax.plot([right_x, bypass_x], [source_y, source_y], color="#1f8a5a", lw=1.6)
+ax.plot([bypass_x, bypass_x], [source_y, target_y], color="#1f8a5a", lw=1.6)
+ax.add_patch(FancyArrowPatch(
+    (bypass_x, target_y), (right_x, target_y),
+    arrowstyle="-|>", mutation_scale=12, color="#1f8a5a", linewidth=1.6,
+    shrinkA=0, shrinkB=2))
+ax.text(bypass_x - 0.09, (source_y + target_y) / 2,
+        "FP8 expert input", rotation=90, ha="center", va="center",
+        fontsize=11.5, color="#1f8a5a",
+        bbox={"facecolor": "white", "edgecolor": "none", "pad": 1.5})
 
 ax.text(6.2, 2.10,
         "Repeat for 30 layers, then apply the final norm and compare TRUE and FALSE at the canvas.",
