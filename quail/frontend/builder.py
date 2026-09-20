@@ -4,6 +4,11 @@ from dataclasses import dataclass
 from typing import Optional
 
 from quail.catalog import Catalog
+from quail.frontend.columns import (
+    check_prompt_columns,
+    check_value_column,
+    value_columns,
+)
 from quail.logical import (
     ColumnRef,
     CompileError,
@@ -121,6 +126,7 @@ class Query:
 
     def _bind(self, p: PromptSpec, join: bool = False):
         refs = tuple(self._resolve(c) for c in p.cols)
+        check_prompt_columns(self._catalog, refs, "AI_FILTER", join)
         binder = bind_join_prompt if join else bind_prompt
         bound = binder(p.template, refs, self._tokenizer, turn=self._turn)
         for r in refs:
@@ -178,6 +184,8 @@ class Query:
                     "join(on=...) takes col(...) == col(...) conditions")
             left, right = (self._resolve(condition.left),
                            self._resolve(condition.right))
+            for ref in (left, right):
+                check_value_column(self._catalog, ref, "a join condition")
             sides = {left.alias, right.alias}
             if new_aliases[0] not in sides or len(sides) != 2:
                 raise CompileError(
@@ -244,6 +252,8 @@ class Query:
                 f"apply name {name!r} is already used by another function")
         columns = [columns] if isinstance(columns, ColSpec) else list(columns)
         refs = tuple(self._resolve(spec) for spec in columns)
+        for ref in refs:
+            check_value_column(self._catalog, ref, "apply()")
         if self._pending_join is not None:
             if ids not in (None, "pairs"):
                 raise CompileError(
@@ -398,13 +408,15 @@ class Query:
         for c in cols:
             if c == "*":
                 for alias, provider in self._tables:
-                    for name in self._catalog.get(provider).columns:
+                    for name in value_columns(self._catalog, provider):
                         columns.append(ColumnRef(alias=alias,
                                                  provider=provider,
                                                  column=name))
                 continue
             spec = col(c) if isinstance(c, str) else c
-            columns.append(self._resolve(spec))
+            ref = self._resolve(spec)
+            check_value_column(self._catalog, ref, "select()")
+            columns.append(ref)
         logical = LogicalPlanBuilder()
         for alias, provider in self._tables:
             logical.add_scan(

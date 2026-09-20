@@ -361,6 +361,12 @@ class ScanInput:
         """Return one stored value column."""
         return self._columns[name].values
 
+    def physical_input(self):
+        """The request binding for this scan's TextScan."""
+        from quail.execution.types import document_input
+
+        return document_input(self.tokens)
+
 
 class TokenSelection(Sequence):
     """Open selected token documents inside a child process."""
