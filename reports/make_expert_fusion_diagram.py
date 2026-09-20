@@ -76,13 +76,13 @@ LEFT.update({
 RIGHT = dict(COMMON)
 RIGHT.update({
     13: (
-        "Expert input norm + FP8 quant + router norm\n"
-        "rms_norm2, QUANTIZE=True",
+        "Create FP8 expert input and BF16 router input\n"
+        "rms_norm2",
         "quail",
     ),
     19: (
         "Expert GELU + multiplication + FP8 quant\n"
-        "gelu_mul_quant, ROUND_ACTIVATION=True",
+        "gelu_mul_quant, with vLLM's BF16 rounding",
         "quail",
     ),
 })
