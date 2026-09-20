@@ -1,4 +1,4 @@
-"""PDF page inputs: immutable page references and the page manifest."""
+"""PDF page inputs: page references, the page manifest, and page rendering."""
 
 from .manifest import (
     PdfManifest,
@@ -7,6 +7,7 @@ from .manifest import (
     read_manifest,
     stat_sources,
 )
+from .prefetch import ImagePrefetcher, PdfiumPrefetcher, RenderedPage
 from .types import (
     ROW_MODES,
     PDFInput,
@@ -19,13 +20,16 @@ from .types import (
 )
 
 __all__ = [
+    "ImagePrefetcher",
     "PDFInput",
     "PdfManifest",
     "PdfPageRef",
     "PdfReadError",
     "PdfRowRef",
     "PdfSource",
+    "PdfiumPrefetcher",
     "ROW_MODES",
+    "RenderedPage",
     "RowMode",
     "check_row_mode",
     "check_source_unchanged",
