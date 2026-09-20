@@ -222,11 +222,9 @@ JOIN_PROMPT_INSTRUCTIONS = (
     "DOCUMENT {1} defines one field and gives labeled calibration examples. "
     "Judge only whether the comment in DOCUMENT {0} meets the criterion. "
     "Words that appear only in the examples are not part of the comment. "
-    "The examples are illustrative, not exhaustive; different wording and "
-    "longer comments can still meet the criterion. "
     "A toxic comment is not automatically an insult, threat, or identity "
-    "attack. Answer TRUE whenever the criterion applies. Answer FALSE when "
-    "it does not apply."
+    "attack. Answer TRUE only if the criterion is specifically true. "
+    "Answer FALSE if it is loosely related or stronger than the comment."
 )
 
 FILTER_PROMPT = (
@@ -240,9 +238,9 @@ JOIN_PROMPT = JOIN_PROMPT_INSTRUCTIONS
 def field_statement(spec: FieldPrompt) -> str:
     """Render one field definition and its calibration examples."""
     return (
-        f"Field definition: The comment {spec.definition}.\n"
-        f'Example labeled TRUE: "{spec.true_example}"\n'
-        f'Example labeled FALSE: "{spec.false_example}"'
+        f"Criterion: the comment {spec.definition}.\n"
+        f"TRUE example: {spec.true_example}\n"
+        f"FALSE example: {spec.false_example}"
     )
 
 
