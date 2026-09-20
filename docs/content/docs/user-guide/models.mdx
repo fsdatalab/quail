@@ -19,12 +19,23 @@ The Qwen3 FP8 models use the Quail execution engine, including
 DeepGEMM for matrix multiplications and FlashAttention 3 for
 attention on H100.
 
-### When to use DiffusionGemma
+### DiffusionGemma
 
-Try DiffusionGemma when Qwen3 4B misses relevant matches in filters
-or joins and you can spend more time per query. It supports the
-same filter and join queries, so you can compare models by changing
-`model` in your configuration:
+DiffusionGemma supports filter and join predicates. Quail uses the
+`RedHatAI/diffusiongemma-26B-A4B-it-FP8-dynamic` checkpoint and reads
+one TRUE or FALSE answer without generating a thinking response.
+
+DiffusionGemma can improve accuracy at the cost of longer query
+times. Check both models on a labeled sample because the result
+depends on the predicate. On IMDB-2 in QUAIL-B, DiffusionGemma
+matched 88.89% of the Qwen3 32B reference answers, compared with
+76.41% for Qwen3 4B. The query took 32.41 seconds with
+DiffusionGemma and 21.20 seconds with Qwen3 4B on one H100. Each
+model used its own prompt format. See the full
+[DiffusionGemma report][diffusion-report] and
+[Qwen3 4B report][qwen-report] for the results and test setup.
+
+Select DiffusionGemma with the `model` setting:
 
 ```python
 config = quail.EngineConfig(
@@ -33,42 +44,8 @@ config = quail.EngineConfig(
 )
 ```
 
-For example, on the IMDB-2 review/aspect join at scale factor 0.1,
-DiffusionGemma returned more of the reference matches and a larger
-share of its returned matches were correct. Both runs used Quail
-on one H100:
-
-| Model | Query time | Answer agreement | Output precision | Output recall |
-| --- | --- | --- | --- | --- |
-| Qwen3 4B | 21.20 s | 76.41% | 76.20% | 40.99% |
-| DiffusionGemma 26B-A4B | 32.41 s | 88.89% | 90.16% | 74.30% |
-
-Agreement measures matching TRUE/FALSE answers. Precision measures
-how many returned rows match the reference; recall measures how
-many reference rows were returned. These results use saved Qwen3
-32B reference labels, not human judgments. Qwen3 uses raw prompts
-and DiffusionGemma uses its chat format. Query time excludes model
-startup and result collection.
-
-The improvement depends on the query. On AGENT-1, DiffusionGemma's
-answer agreement was 47.18%, compared with 73.81% for Qwen3 4B.
-Check precision, recall, and runtime on a labeled sample of your
-own queries before choosing a model.
-
-See the [DiffusionGemma benchmark report][diffusion-report] and
-the [Qwen3 4B benchmark report][qwen-report] for all query results
-and saved run locations. The DiffusionGemma report records an
-earlier stock vLLM configuration; the [model PR][diffusion-pr]
-documents the later validation with matching answer settings.
-
-Quail uses the
-`RedHatAI/diffusiongemma-26B-A4B-it-FP8-dynamic` checkpoint and
-computes one TRUE/FALSE answer per predicate without generating
-a thinking response.
-
 [diffusion-report]: https://github.com/fsdatalab/quail/blob/3e09be9564e60183a0018b3908b05cd77cbd0d77/reports/2026-09-19-diffusion-gemma-quailb.md
 [qwen-report]: https://github.com/fsdatalab/quail/blob/bbf18747238f504866e1ca7518d23d375f97f920/reports/quailb-comparison.md
-[diffusion-pr]: https://github.com/fsdatalab/quail/pull/133
 
 ### Rerankers
 
