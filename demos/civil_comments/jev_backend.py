@@ -221,6 +221,7 @@ async def evaluate(
     limit: int,
     concurrency: int,
     output: Path,
+    plan_order: str,
 ) -> dict:
     """Run Jev and return its comparison summary."""
     summary_path = output / "summary.json"
@@ -242,41 +243,69 @@ async def evaluate(
                 "comments": len(ids),
                 "label_cutoff": LABEL_CUTOFF,
                 "concurrency": concurrency,
+                "plan_order": plan_order,
             },
             indent=2,
         )
     )
 
     all_comments = list(zip(ids, texts))
-    join_rows, join_s = await run_pass(
-        "join",
-        [
-            (comment_id, {"DOCUMENT 0": text})
-            for comment_id, text in all_comments
-        ],
-        JOIN_QUESTIONS,
-        output / "join.jsonl",
-        concurrency,
-    )
-    joined_ids = {
-        comment_id
-        for comment_id, row in join_rows.items()
-        if any(
-            probability >= LABEL_CUTOFF
-            for probability in row["answers"].values()
+    if plan_order == "sql":
+        join_ids = set(ids)
+        join_rows, join_s = await run_pass(
+            "join",
+            [
+                (comment_id, {"DOCUMENT 0": text})
+                for comment_id, text in all_comments
+            ],
+            JOIN_QUESTIONS,
+            output / "join.jsonl",
+            concurrency,
         )
-    }
-    filter_rows, filter_s = await run_pass(
-        "filter",
-        [
-            (comment_id, text)
-            for comment_id, text in all_comments
-            if comment_id in joined_ids
-        ],
-        FILTER_QUESTIONS,
-        output / "filter.jsonl",
-        concurrency,
-    )
+        filter_ids = {
+            comment_id
+            for comment_id, row in join_rows.items()
+            if any(
+                probability >= LABEL_CUTOFF
+                for probability in row["answers"].values()
+            )
+        }
+        filter_rows, filter_s = await run_pass(
+            "filter",
+            [
+                (comment_id, text)
+                for comment_id, text in all_comments
+                if comment_id in filter_ids
+            ],
+            FILTER_QUESTIONS,
+            output / "filter.jsonl",
+            concurrency,
+        )
+    else:
+        filter_ids = set(ids)
+        filter_rows, filter_s = await run_pass(
+            "filter",
+            all_comments,
+            FILTER_QUESTIONS,
+            output / "filter.jsonl",
+            concurrency,
+        )
+        join_ids = {
+            comment_id
+            for comment_id, row in filter_rows.items()
+            if row["answers"]["toxicity"] >= LABEL_CUTOFF
+        }
+        join_rows, join_s = await run_pass(
+            "join",
+            [
+                (comment_id, {"DOCUMENT 0": text})
+                for comment_id, text in all_comments
+                if comment_id in join_ids
+            ],
+            JOIN_QUESTIONS,
+            output / "join.jsonl",
+            concurrency,
+        )
     toxic_found = {
         comment_id
         for comment_id, row in filter_rows.items()
@@ -297,13 +326,13 @@ async def evaluate(
     )
     logical_input_tokens = requested_input_tokens(
         comments,
-        filter_ids=joined_ids,
-        join_ids=set(ids),
+        filter_ids=filter_ids,
+        join_ids=join_ids,
     )
     summary = {
         "backend": "jev",
         "model": MODEL,
-        "plan_order": "join_then_filter",
+        "plan_order": plan_order,
         "comments": len(ids),
         "concurrency": concurrency,
         "wall_s": query_s,
@@ -318,8 +347,8 @@ async def evaluate(
             * USD_PER_MILLION_INPUT_TOKENS
             / 1_000_000
         ),
-        "evaluated_pairs": len(ids) * len(FIELDS),
-        "filter_evaluated_comments": len(joined_ids),
+        "evaluated_pairs": len(join_ids) * len(FIELDS),
+        "filter_evaluated_comments": len(filter_ids),
         "accuracy": accuracy,
         "field_counts": dict(Counter(field for _, field in pairs_found)),
         "result_path": str(output),
@@ -335,6 +364,11 @@ def main():
     parser.add_argument("--limit", type=int, default=10_000)
     parser.add_argument("--concurrency", type=int, default=256)
     parser.add_argument(
+        "--plan-order",
+        choices=("sql", "pushdown"),
+        default="sql",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=Path("/tmp") / f"civil-comments-jev-{uuid.uuid4().hex}",
@@ -342,7 +376,14 @@ def main():
     args = parser.parse_args()
     if args.limit < 0 or args.concurrency < 1:
         parser.error("limit must be >= 0 and concurrency must be >= 1")
-    asyncio.run(evaluate(args.limit, args.concurrency, args.output))
+    asyncio.run(
+        evaluate(
+            args.limit,
+            args.concurrency,
+            args.output,
+            args.plan_order,
+        )
+    )
 
 
 if __name__ == "__main__":
