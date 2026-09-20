@@ -5,26 +5,44 @@
   prefilled, and one canvas row after the answer cue on Quail's side.
   Quail and pipelined stock vLLM share a physical GPU within each
   query family.
-- The measured run is `/results/benchmarks/quailb/20260919T054043Z-8c1fa18b/`
+- The measured run is `/results/benchmarks/quailb/20260919T220437Z-1550de75/`
   on `quail-results`; reference labels are collection
   `gt_be81cb241d74555dc2da79b5b0662554` (Qwen3 32B FP8 answering).
 - Quail reads the TRUE and FALSE logits at its one canvas row and
-  compares them. Pipelined stock vLLM denoises the checkpoint's
-  256-row canvas per request, since its diffusion sampler takes no
-  temperature, min_tokens, or allowed_token_ids; its answer is the
-  first TRUE or FALSE word in the generated text, and a request that
-  ends its turn without an answer word counts as FALSE. That readout
-  is what stock vLLM gives, and it costs the baseline recall.
-- Pipelined stock vLLM batches 65,536 tokens and 8 sequences, with
-  prefix caching. vLLM caps this model at 8 sequences per step because
-  its diffusion sampler holds a [sequences, canvas rows, vocabulary]
-  float32 tensor. Quail's chunk budget is 65,536 tokens.
-- Quail is faster on 22 of the 22 queries the
+  compares them. Pipelined stock vLLM runs the same one-row canvas
+  with one denoising step, so a request is one prefill pass plus
+  that row; its diffusion sampler takes no temperature, min_tokens,
+  or allowed_token_ids, so the answer is read by ranking TRUE
+  against FALSE in the top 500 logprobs at the canvas row (the words
+  rank within 500 on 511 of 512 probed reviews,
+  `/results/ablations/diffusion_gemma_readout_probe_k5000.json`). A
+  request with neither word in its 500 falls back to its generated
+  text, then counts as FALSE.
+- The canvas row's input token is a random draw: vLLM draws it per
+  request, Quail fixes one draw. On 512 IMDB reviews under four seeds,
+  53 reviews change their answer and accuracy against the labels
+  ranges 0.904 to 0.941 (`/results/ablations/`
+  `diffusion_gemma_canvas_seeds.json`), so a few percent of the two
+  methods' answers differ for that reason.
+- Pipelined stock vLLM batches 65,536 tokens and 127 sequences, with
+  prefix caching. vLLM caps this model at 8 sequences per step when
+  the setting is 128 or more, sized for its 256-row canvas, so the
+  baseline stays just under that trigger. Quail's chunk budget is
+  65,536 tokens with no sequence cap.
+- Quail is faster on 28 of the 30 queries the
   baseline finished.
-  The median speedup is 28.62x and the maximum is 259.37x on FEV-2.
+  The median speedup is 11.73x and the maximum is 36.80x on FEV-1.
   Speedup is pipelined stock vLLM time divided by Quail time.
   Query time excludes startup and result collection.
   GPU cost is query seconds / 3,600 times $3.9492.
+- Quail is slower on AGENT-1, AGENT-2: on AGENT-1 Quail computes 19,119,565 fresh tokens against the baseline's 6,121,985; on AGENT-2 Quail computes 19,162,093 fresh tokens against the baseline's 6,164,545. The agent
+  corpus's traces share prefixes (every later turn's trace
+  starts with the earlier turn's), which vLLM's prefix cache
+  reuses and Quail's filter path computes again for each
+  document.
+- On the 30 queries both methods finished, they gave
+  the same TRUE or FALSE on 91.27 percent of the
+  2,675,597 predicate evaluations both made (per query below).
 - SoL means speed of light: ideal GPU time from arithmetic and memory
   traffic at the hardware's peak rates, with ideal batching, unlimited
   retained KV, every distinct prompt prefix computed once, one canvas
@@ -34,17 +52,10 @@
   processes, repeated computation included. KV regret is recomputed
   tokens as a share of fresh tokens. Token throughput is total
   requested input tokens divided by query seconds.
-- Pipelined stock vLLM did not finish IMDB-9, IMDB-10, BIO-2, BIO-3, FEV-7, FEV-8, FEV-9, FEV-10 inside the ten hour limit of its query
-  family's container, so those baseline values are not
-  measured. They show as a cross at the axis in the figures and
-  as "Not measured" in the tables, never as zero.
-- A prefill-only stock vLLM is possible for this model but is not
-  what this run measured: with a one-row canvas, one denoising step,
-  and the sequence cap lifted, stock vLLM returns the TRUE and FALSE
-  logprobs at the canvas row for 62 of 64 IMDB reviews at 57,708
-  prompt tokens per second on that 64-review batch
-  (`/results/ablations/`
-  `diffusion_gemma_stock_answers_canvas1_lp20_steps1.json`).
+- The baseline values of BIO-3, FEV-8, FEV-9, FEV-10
+  come from a rerun of those queries with the same code and
+  settings, `20260920T013141Z-5124c19e`, after Modal restarted the
+  measured run's orchestrator before their containers finished.
 
 [Open the main vector PDF](plots/quailb_diffusion_gemma_main.pdf)
 
@@ -71,35 +82,35 @@ Figure: plots/quailb_diffusion_gemma_imdb.pdf
 
 | Query | Method | Seconds | Tokens/second | $/query | $/million input tokens | KV regret (%) |
 |---|---|---:|---:|---:|---:|---:|
-| IMDB-1 | Quail | 19.66 | 93,254.63 | 0.02157 | 0.011763 | 2.75 |
-| IMDB-1 | Pipelined vLLM | 516.30 | 3,551.01 | 0.56638 | 0.308926 | 2.47 |
+| IMDB-1 | Quail | 19.94 | 91,945.14 | 0.02187 | 0.011931 | 2.75 |
+| IMDB-1 | Pipelined vLLM | 67.69 | 27,085.03 | 0.07426 | 0.040502 | 2.47 |
 | IMDB-1 | SoL estimate | 5.845 | 313,654.67 | 0.00641 | 0.003497 | 0 (assumed) |
-| IMDB-2 | Quail | 32.38 | 674,201.11 | 0.03552 | 0.001627 | 3.69 |
-| IMDB-2 | Pipelined vLLM | 5898.60 | 3,700.99 | 6.47076 | 0.296408 | 15.18 |
+| IMDB-2 | Quail | 32.41 | 673,577.04 | 0.03555 | 0.001629 | 3.69 |
+| IMDB-2 | Pipelined vLLM | 321.90 | 67,818.06 | 0.35312 | 0.016176 | 15.18 |
 | IMDB-2 | SoL estimate | 9.636 | 2,265,573.76 | 0.01057 | 0.000484 | 0 (assumed) |
-| IMDB-3 | Quail | 34.84 | 561,045.12 | 0.03822 | 0.001955 | 3.53 |
-| IMDB-3 | Pipelined vLLM | 2697.99 | 4,138.50 | 2.95970 | 0.265072 | 27.93 |
+| IMDB-3 | Quail | 34.79 | 561,851.45 | 0.03816 | 0.001952 | 3.53 |
+| IMDB-3 | Pipelined vLLM | 324.54 | 62,976.88 | 0.35602 | 0.017419 | 37.29 |
 | IMDB-3 | SoL estimate | 9.703 | 2,039,949.33 | 0.01064 | 0.000538 | 0 (assumed) |
-| IMDB-4 | Quail | 23.59 | 357,650.61 | 0.02588 | 0.003067 | 3.06 |
-| IMDB-4 | Pipelined vLLM | 833.72 | 4,859.93 | 0.91459 | 0.225724 | 10.95 |
+| IMDB-4 | Quail | 23.64 | 356,894.16 | 0.02593 | 0.003074 | 3.06 |
+| IMDB-4 | Pipelined vLLM | 160.88 | 64,138.38 | 0.17649 | 0.017104 | 25.83 |
 | IMDB-4 | SoL estimate | 7.003 | 1,140,773.12 | 0.00768 | 0.000962 | 0 (assumed) |
-| IMDB-5 | Quail | 22.77 | 315,471.67 | 0.02498 | 0.003477 | 3.00 |
-| IMDB-5 | Pipelined vLLM | 648.52 | 4,481.87 | 0.71143 | 0.244764 | 5.83 |
+| IMDB-5 | Quail | 22.86 | 314,229.66 | 0.02508 | 0.003491 | 3.00 |
+| IMDB-5 | Pipelined vLLM | 145.26 | 59,976.97 | 0.15935 | 0.018290 | 21.80 |
 | IMDB-5 | SoL estimate | 6.806 | 988,725.05 | 0.00747 | 0.001110 | 0 (assumed) |
-| IMDB-6 | Quail | 19.40 | 122,631.13 | 0.02128 | 0.008946 | 2.78 |
-| IMDB-6 | Pipelined vLLM | 559.21 | 3,740.43 | 0.61345 | 0.293281 | 2.89 |
+| IMDB-6 | Quail | 19.46 | 122,253.03 | 0.02135 | 0.008973 | 2.78 |
+| IMDB-6 | Pipelined vLLM | 74.91 | 33,689.87 | 0.08218 | 0.032562 | 3.66 |
 | IMDB-6 | SoL estimate | 5.997 | 392,729.37 | 0.00658 | 0.002793 | 0 (assumed) |
-| IMDB-7 | Quail | 19.80 | 140,361.92 | 0.02172 | 0.007816 | 2.81 |
-| IMDB-7 | Pipelined vLLM | 568.60 | 3,830.14 | 0.62375 | 0.286413 | 2.96 |
+| IMDB-7 | Quail | 19.84 | 140,078.93 | 0.02176 | 0.007831 | 2.81 |
+| IMDB-7 | Pipelined vLLM | 83.98 | 36,184.51 | 0.09213 | 0.030317 | 4.35 |
 | IMDB-7 | SoL estimate | 6.147 | 444,098.28 | 0.00674 | 0.002470 | 0 (assumed) |
-| IMDB-8 | Quail | 42.06 | 820,808.99 | 0.04614 | 0.001336 | 5.93 |
-| IMDB-8 | Pipelined vLLM | 9667.69 | 3,606.17 | 10.60546 | 0.304201 | 32.85 |
+| IMDB-8 | Quail | 42.08 | 820,418.87 | 0.04616 | 0.001337 | 5.93 |
+| IMDB-8 | Pipelined vLLM | 582.07 | 69,431.05 | 0.63853 | 0.015800 | 37.03 |
 | IMDB-8 | SoL estimate | 13.439 | 2,958,877.66 | 0.01474 | 0.000371 | 0 (assumed) |
-| IMDB-9 | Quail | 74.56 | 755,818.91 | 0.08179 | 0.001451 | 39.01 |
-| IMDB-9 | Pipelined vLLM | Not measured | | | | |
+| IMDB-9 | Quail | 75.11 | 750,284.36 | 0.08240 | 0.001462 | 39.01 |
+| IMDB-9 | Pipelined vLLM | 903.74 | 69,232.26 | 0.99140 | 0.015845 | 57.19 |
 | IMDB-9 | SoL estimate | 19.157 | 3,215,322.47 | 0.02102 | 0.000341 | 0 (assumed) |
-| IMDB-10 | Quail | 76.36 | 708,093.74 | 0.08377 | 0.001549 | 38.46 |
-| IMDB-10 | Pipelined vLLM | Not measured | | | | |
+| IMDB-10 | Quail | 76.58 | 706,059.52 | 0.08401 | 0.001554 | 38.46 |
+| IMDB-10 | Pipelined vLLM | 905.30 | 67,649.25 | 0.99311 | 0.016216 | 60.42 |
 | IMDB-10 | SoL estimate | 18.364 | 3,243,181.20 | 0.02015 | 0.000338 | 0 (assumed) |
 
 Correctness against saved reference labels:
@@ -107,25 +118,40 @@ Correctness against saved reference labels:
 | Query | Method | Answer agreement (%) | Output precision (%) | Output recall (%) |
 |---|---|---:|---:|---:|
 | IMDB-1 | Quail | 94.22 | 97.64 | 95.08 |
-| IMDB-1 | Pipelined vLLM | 53.84 | 94.538 | 44.955 |
+| IMDB-1 | Pipelined vLLM | 92.76 | 94.092 | 97.053 |
 | IMDB-2 | Quail | 88.89 | 90.161 | 74.296 |
-| IMDB-2 | Pipelined vLLM | 89.30 | 83.595 | 83.875 |
-| IMDB-3 | Quail | 89.39 | 87.683 | 73.004 |
-| IMDB-3 | Pipelined vLLM | 82.19 | 79.908 | 39.166 |
+| IMDB-2 | Pipelined vLLM | 84.41 | 72.927 | 83.551 |
+| IMDB-3 | Quail | 89.39 | 87.689 | 72.998 |
+| IMDB-3 | Pipelined vLLM | 84.99 | 68.571 | 82.978 |
 | IMDB-4 | Quail | 90.20 | 78.029 | 71.265 |
-| IMDB-4 | Pipelined vLLM | 82.44 | 69.279 | 18.259 |
+| IMDB-4 | Pipelined vLLM | 86.00 | 55.872 | 82.571 |
 | IMDB-5 | Quail | 91.29 | 77.703 | 72.447 |
-| IMDB-5 | Pipelined vLLM | 80.41 | 68.05 | 8.6316 |
+| IMDB-5 | Pipelined vLLM | 87.43 | 55.468 | 81.816 |
 | IMDB-6 | Quail | 94.28 | 85.246 | 85.659 |
-| IMDB-6 | Pipelined vLLM | 79.49 | 74.803 | 18.411 |
+| IMDB-6 | Pipelined vLLM | 90.68 | 69.365 | 92.151 |
 | IMDB-7 | Quail | 94.71 | 84.265 | 85.268 |
-| IMDB-7 | Pipelined vLLM | 78.67 | 67.742 | 6.25 |
+| IMDB-7 | Pipelined vLLM | 91.79 | 67.857 | 90.476 |
 | IMDB-8 | Quail | 84.49 | 51.964 | 43.471 |
-| IMDB-8 | Pipelined vLLM | 83.63 | 46.821 | 48.154 |
+| IMDB-8 | Pipelined vLLM | 75.43 | 29.229 | 52.116 |
 | IMDB-9 | Quail | 86.21 | 48.277 | 35.363 |
-| IMDB-9 | Pipelined vLLM | Not measured | | |
+| IMDB-9 | Pipelined vLLM | 78.59 | 23.926 | 45.786 |
 | IMDB-10 | Quail | 86.24 | 47.132 | 34.919 |
-| IMDB-10 | Pipelined vLLM | Not measured | | |
+| IMDB-10 | Pipelined vLLM | 78.70 | 22.706 | 45.719 |
+
+Answers the two methods gave each other:
+
+| Query | Evaluations both made | Same answer (%) |
+|---|---:|---:|
+| IMDB-1 | 5,000 | 94.94 |
+| IMDB-2 | 60,000 | 87.81 |
+| IMDB-3 | 51,620 | 88.08 |
+| IMDB-4 | 18,388 | 89.34 |
+| IMDB-5 | 14,985 | 90.67 |
+| IMDB-6 | 6,184 | 92.98 |
+| IMDB-7 | 6,935 | 94.07 |
+| IMDB-8 | 93,012 | 83.92 |
+| IMDB-9 | 152,976 | 85.32 |
+| IMDB-10 | 144,680 | 85.39 |
 
 ## BIO
 
@@ -141,14 +167,14 @@ Figure: plots/quailb_diffusion_gemma_bio.pdf
 
 | Query | Method | Seconds | Tokens/second | $/query | $/million input tokens | KV regret (%) |
 |---|---|---:|---:|---:|---:|---:|
-| BIO-1 | Quail | 24.88 | 80,297.23 | 0.02729 | 0.013662 | 0.29 |
-| BIO-1 | Pipelined vLLM | 77.11 | 25,908.38 | 0.08459 | 0.042342 | 0.27 |
+| BIO-1 | Quail | 24.76 | 80,686.39 | 0.02716 | 0.013596 | 0.29 |
+| BIO-1 | Pipelined vLLM | 42.07 | 47,487.40 | 0.04615 | 0.023101 | 0.27 |
 | BIO-1 | SoL estimate | 9.027 | 221,320.94 | 0.00990 | 0.004957 | 0 (assumed) |
-| BIO-2 | Quail | 217.06 | 10,385,388.67 | 0.23811 | 0.000106 | 3.83 |
-| BIO-2 | Pipelined vLLM | Not measured | | | | |
+| BIO-2 | Quail | 216.22 | 10,425,735.20 | 0.23719 | 0.000105 | 3.83 |
+| BIO-2 | Pipelined vLLM | 4640.74 | 485,752.80 | 5.09089 | 0.002258 | 24.98 |
 | BIO-2 | SoL estimate | 74.700 | 30,177,256.48 | 0.08195 | 0.000036 | 0 (assumed) |
-| BIO-3 | Quail | 184.28 | 10,256,614.08 | 0.20216 | 0.000107 | 3.74 |
-| BIO-3 | Pipelined vLLM | Not measured | | | | |
+| BIO-3 | Quail | 182.95 | 10,331,177.06 | 0.20070 | 0.000106 | 3.74 |
+| BIO-3 | Pipelined vLLM | 3959.62 | 528,396.05 | 4.34370 | 0.002076 | 31.59 |
 | BIO-3 | SoL estimate | 49.866 | 26,833,887.64 | 0.05470 | 0.000041 | 0 (assumed) |
 
 Correctness against saved reference labels:
@@ -156,11 +182,19 @@ Correctness against saved reference labels:
 | Query | Method | Answer agreement (%) | Output precision (%) | Output recall (%) |
 |---|---|---:|---:|---:|
 | BIO-1 | Quail | 79.20 | 75.779 | 99.06 |
-| BIO-1 | Pipelined vLLM | 72.40 | 73.879 | 87.774 |
+| BIO-1 | Pipelined vLLM | 63.00 | 64.316 | 94.357 |
 | BIO-2 | Quail | 96.30 | 54.026 | 51.461 |
-| BIO-2 | Pipelined vLLM | Not measured | | |
+| BIO-2 | Pipelined vLLM | 90.91 | 24.828 | 62.603 |
 | BIO-3 | Quail | 96.01 | 48.15 | 51.886 |
-| BIO-3 | Pipelined vLLM | Not measured | | |
+| BIO-3 | Pipelined vLLM | 90.94 | 20.261 | 59.462 |
+
+Answers the two methods gave each other:
+
+| Query | Evaluations both made | Same answer (%) |
+|---|---:|---:|
+| BIO-1 | 500 | 81.00 |
+| BIO-2 | 563,500 | 93.18 |
+| BIO-3 | 445,665 | 93.08 |
 
 ## FEV
 
@@ -184,34 +218,34 @@ Figure: plots/quailb_diffusion_gemma_fev.pdf
 | Query | Method | Seconds | Tokens/second | $/query | $/million input tokens | KV regret (%) |
 |---|---|---:|---:|---:|---:|---:|
 | FEV-1 | Quail | 0.46 | 88,178.26 | 0.00050 | 0.012441 | 10.42 |
-| FEV-1 | Pipelined vLLM | 54.29 | 747.14 | 0.05956 | 1.468274 | 9.32 |
+| FEV-1 | Pipelined vLLM | 16.93 | 2,395.87 | 0.01857 | 0.457872 | 9.32 |
 | FEV-1 | SoL estimate | 0.126 | 321,909.57 | 0.00014 | 0.003408 | 0 (assumed) |
-| FEV-2 | Quail | 50.99 | 1,419,499.78 | 0.05594 | 0.000773 | 3.27 |
-| FEV-2 | Pipelined vLLM | 13225.45 | 5,472.80 | 14.50832 | 0.200446 | 22.89 |
+| FEV-2 | Quail | 51.18 | 1,414,230.05 | 0.05614 | 0.000776 | 3.27 |
+| FEV-2 | Pipelined vLLM | 807.60 | 89,623.94 | 0.88594 | 0.012240 | 22.89 |
 | FEV-2 | SoL estimate | 14.986 | 4,829,729.77 | 0.01644 | 0.000227 | 0 (assumed) |
-| FEV-3 | Quail | 30.80 | 1,373,748.54 | 0.03379 | 0.000799 | 3.36 |
-| FEV-3 | Pipelined vLLM | 2244.65 | 5,370.95 | 2.46238 | 0.204247 | 20.62 |
+| FEV-3 | Quail | 30.64 | 1,380,922.16 | 0.03361 | 0.000794 | 3.36 |
+| FEV-3 | Pipelined vLLM | 503.30 | 89,549.23 | 0.55212 | 0.012250 | 22.74 |
 | FEV-3 | SoL estimate | 9.095 | 4,683,297.34 | 0.00998 | 0.000234 | 0 (assumed) |
-| FEV-4 | Quail | 6.96 | 785,081.47 | 0.00764 | 0.001397 | 3.17 |
-| FEV-4 | Pipelined vLLM | 100.28 | 3,317.35 | 0.11001 | 0.330685 | 4.69 |
+| FEV-4 | Quail | 6.31 | 865,953.57 | 0.00692 | 0.001267 | 3.17 |
+| FEV-4 | Pipelined vLLM | 73.48 | 84,252.33 | 0.08061 | 0.013020 | 16.79 |
 | FEV-4 | SoL estimate | 1.857 | 2,940,745.37 | 0.00204 | 0.000373 | 0 (assumed) |
-| FEV-5 | Quail | 17.13 | 1,332,827.32 | 0.01879 | 0.000823 | 3.39 |
-| FEV-5 | Pipelined vLLM | 460.04 | 5,852.24 | 0.50466 | 0.187450 | 11.68 |
+| FEV-5 | Quail | 17.09 | 1,335,946.87 | 0.01875 | 0.000821 | 3.39 |
+| FEV-5 | Pipelined vLLM | 280.60 | 89,548.23 | 0.30782 | 0.012250 | 23.64 |
 | FEV-5 | SoL estimate | 5.291 | 4,490,501.84 | 0.00580 | 0.000244 | 0 (assumed) |
-| FEV-6 | Quail | 4.36 | 709,186.70 | 0.00478 | 0.001547 | 3.32 |
-| FEV-6 | Pipelined vLLM | 85.35 | 2,987.19 | 0.09363 | 0.367234 | 4.18 |
+| FEV-6 | Quail | 4.34 | 712,454.84 | 0.00476 | 0.001540 | 3.32 |
+| FEV-6 | Pipelined vLLM | 45.27 | 74,732.78 | 0.04966 | 0.014679 | 21.82 |
 | FEV-6 | SoL estimate | 1.328 | 2,401,408.69 | 0.00146 | 0.000457 | 0 (assumed) |
-| FEV-7 | Quail | 74.83 | 1,417,339.66 | 0.08209 | 0.000774 | 5.28 |
-| FEV-7 | Pipelined vLLM | Not measured | | | | |
+| FEV-7 | Quail | 74.61 | 1,421,518.93 | 0.08185 | 0.000772 | 5.28 |
+| FEV-7 | Pipelined vLLM | 1596.81 | 90,835.85 | 1.75170 | 0.012077 | 23.64 |
 | FEV-7 | SoL estimate | 24.937 | 4,911,742.34 | 0.02736 | 0.000223 | 0 (assumed) |
-| FEV-8 | Quail | 101.15 | 1,435,288.24 | 0.11096 | 0.000764 | 14.27 |
-| FEV-8 | Pipelined vLLM | Not measured | | | | |
+| FEV-8 | Quail | 100.37 | 1,446,442.21 | 0.11011 | 0.000758 | 14.27 |
+| FEV-8 | Pipelined vLLM | 2371.11 | 91,698.77 | 2.60111 | 0.011963 | 49.19 |
 | FEV-8 | SoL estimate | 39.515 | 4,931,364.63 | 0.04335 | 0.000222 | 0 (assumed) |
-| FEV-9 | Quail | 33.08 | 1,325,166.29 | 0.03629 | 0.000828 | 16.74 |
-| FEV-9 | Pipelined vLLM | Not measured | | | | |
+| FEV-9 | Quail | 33.23 | 1,319,184.50 | 0.03645 | 0.000832 | 16.74 |
+| FEV-9 | Pipelined vLLM | 826.44 | 92,571.95 | 0.90660 | 0.011850 | 47.21 |
 | FEV-9 | SoL estimate | 13.174 | 4,778,883.94 | 0.01445 | 0.000230 | 0 (assumed) |
-| FEV-10 | Quail | 2.19 | 124,957.99 | 0.00240 | 0.008779 | 3.84 |
-| FEV-10 | Pipelined vLLM | Not measured | | | | |
+| FEV-10 | Quail | 2.20 | 124,390.00 | 0.00241 | 0.008819 | 3.84 |
+| FEV-10 | Pipelined vLLM | 10.45 | 26,403.25 | 0.01146 | 0.041548 | 3.41 |
 | FEV-10 | SoL estimate | 0.639 | 429,898.55 | 0.00070 | 0.002552 | 0 (assumed) |
 
 Correctness against saved reference labels:
@@ -219,25 +253,40 @@ Correctness against saved reference labels:
 | Query | Method | Answer agreement (%) | Output precision (%) | Output recall (%) |
 |---|---|---:|---:|---:|
 | FEV-1 | Quail | 97.20 | 97.945 | 97.279 |
-| FEV-1 | Pipelined vLLM | 53.80 | 94.366 | 22.789 |
+| FEV-1 | Pipelined vLLM | 93.80 | 91.746 | 98.299 |
 | FEV-2 | Quail | 94.88 | 88.509 | 3.751 |
-| FEV-2 | Pipelined vLLM | 94.88 | 86.087 | 3.9089 |
+| FEV-2 | Pipelined vLLM | 88.55 | 10.554 | 15.544 |
 | FEV-3 | Quail | 94.18 | 93.252 | 2.9383 |
-| FEV-3 | Pipelined vLLM | 93.37 | 87.273 | 0.92789 |
+| FEV-3 | Pipelined vLLM | 87.87 | 9.889 | 13.435 |
 | FEV-4 | Quail | 99.05 | 85.714 | 10.435 |
-| FEV-4 | Pipelined vLLM | 94.87 | 100 | 0.86957 |
+| FEV-4 | Pipelined vLLM | 91.80 | 2.2364 | 18.261 |
 | FEV-5 | Quail | 93.87 | 94.776 | 4.3036 |
-| FEV-5 | Pipelined vLLM | 85.80 | 81.25 | 0.44053 |
+| FEV-5 | Pipelined vLLM | 87.85 | 11.201 | 14.571 |
 | FEV-6 | Quail | 98.94 | 100 | 15.714 |
-| FEV-6 | Pipelined vLLM | 83.17 | 100 | 1.4286 |
+| FEV-6 | Pipelined vLLM | 92.29 | 2.6639 | 18.571 |
 | FEV-7 | Quail | 93.48 | 42.169 | 0.0098518 |
-| FEV-7 | Pipelined vLLM | Not measured | | |
+| FEV-7 | Pipelined vLLM | 82.24 | 1.6704 | 1.8935 |
 | FEV-8 | Quail | 90.17 | 36.697 | 0.00035541 |
-| FEV-8 | Pipelined vLLM | Not measured | | |
+| FEV-8 | Pipelined vLLM | 84.24 | 0.22035 | 0.32171 |
 | FEV-9 | Quail | 89.08 | 51.724 | 0.00071323 |
-| FEV-9 | Pipelined vLLM | Not measured | | |
-| FEV-10 | Quail | 97.06 | 100 | 92.623 |
-| FEV-10 | Pipelined vLLM | Not measured | | |
+| FEV-9 | Pipelined vLLM | 83.67 | 0.29713 | 0.28353 |
+| FEV-10 | Quail | 96.85 | 99.115 | 91.803 |
+| FEV-10 | Pipelined vLLM | 94.14 | 90.984 | 90.984 |
+
+Answers the two methods gave each other:
+
+| Query | Evaluations both made | Same answer (%) |
+|---|---:|---:|
+| FEV-1 | 500 | 95.00 |
+| FEV-2 | 143,500 | 92.41 |
+| FEV-3 | 84,017 | 92.28 |
+| FEV-4 | 11,184 | 92.54 |
+| FEV-5 | 44,587 | 92.43 |
+| FEV-6 | 6,252 | 93.27 |
+| FEV-7 | 210,084 | 91.21 |
+| FEV-8 | 282,839 | 90.40 |
+| FEV-9 | 84,707 | 90.42 |
+| FEV-10 | 951 | 94.74 |
 
 ## LEP
 
@@ -255,20 +304,20 @@ Figure: plots/quailb_diffusion_gemma_lep.pdf
 
 | Query | Method | Seconds | Tokens/second | $/query | $/million input tokens | KV regret (%) |
 |---|---|---:|---:|---:|---:|---:|
-| LEP-1 | Quail | 1.93 | 73,073.58 | 0.00212 | 0.015012 | 3.32 |
-| LEP-1 | Pipelined vLLM | 55.06 | 2,561.42 | 0.06040 | 0.428277 | 2.91 |
+| LEP-1 | Quail | 1.70 | 82,960.00 | 0.00186 | 0.013223 | 3.32 |
+| LEP-1 | Pipelined vLLM | 18.71 | 7,537.79 | 0.02052 | 0.145533 | 2.91 |
 | LEP-1 | SoL estimate | 0.446 | 316,314.12 | 0.00049 | 0.003468 | 0 (assumed) |
-| LEP-2 | Quail | 188.33 | 381,019.25 | 0.20660 | 0.002879 | 1.31 |
-| LEP-2 | Pipelined vLLM | 20566.09 | 3,489.11 | 22.56100 | 0.314407 | 9.51 |
+| LEP-2 | Quail | 185.10 | 387,668.05 | 0.20305 | 0.002830 | 1.31 |
+| LEP-2 | Pipelined vLLM | 1300.44 | 55,179.29 | 1.42658 | 0.019881 | 9.51 |
 | LEP-2 | SoL estimate | 55.216 | 1,299,582.69 | 0.06057 | 0.000844 | 0 (assumed) |
-| LEP-3 | Quail | 9.49 | 475,554.58 | 0.01041 | 0.002307 | 1.64 |
-| LEP-3 | Pipelined vLLM | 795.82 | 4,945.00 | 0.87301 | 0.221840 | 9.25 |
+| LEP-3 | Quail | 9.34 | 483,191.97 | 0.01025 | 0.002270 | 1.64 |
+| LEP-3 | Pipelined vLLM | 248.60 | 67,384.43 | 0.27271 | 0.016280 | 10.23 |
 | LEP-3 | SoL estimate | 2.125 | 1,485,419.30 | 0.00233 | 0.000739 | 0 (assumed) |
-| LEP-4 | Quail | 8.74 | 447,511.78 | 0.00959 | 0.002451 | 1.68 |
-| LEP-4 | Pipelined vLLM | 218.90 | 4,270.40 | 0.24013 | 0.256885 | 2.61 |
+| LEP-4 | Quail | 9.48 | 412,579.43 | 0.01040 | 0.002659 | 1.68 |
+| LEP-4 | Pipelined vLLM | 208.25 | 62,792.86 | 0.22845 | 0.017470 | 11.26 |
 | LEP-4 | SoL estimate | 1.119 | 1,183,673.07 | 0.00123 | 0.000927 | 0 (assumed) |
-| LEP-5 | Quail | 7.28 | 397,383.38 | 0.00799 | 0.002761 | 2.23 |
-| LEP-5 | Pipelined vLLM | 191.08 | 3,864.17 | 0.20961 | 0.283890 | 5.80 |
+| LEP-5 | Quail | 7.17 | 403,479.92 | 0.00787 | 0.002719 | 2.23 |
+| LEP-5 | Pipelined vLLM | 176.18 | 59,366.13 | 0.19327 | 0.018479 | 9.85 |
 | LEP-5 | SoL estimate | 1.152 | 1,013,814.30 | 0.00126 | 0.001082 | 0 (assumed) |
 
 Correctness against saved reference labels:
@@ -276,15 +325,25 @@ Correctness against saved reference labels:
 | Query | Method | Answer agreement (%) | Output precision (%) | Output recall (%) |
 |---|---|---:|---:|---:|
 | LEP-1 | Quail | 98.00 | 61.905 | 86.667 |
-| LEP-1 | Pipelined vLLM | 96.40 | 42.105 | 53.333 |
+| LEP-1 | Pipelined vLLM | 85.80 | 15.854 | 86.667 |
 | LEP-2 | Quail | 99.34 | 14.947 | 39.4 |
-| LEP-2 | Pipelined vLLM | 98.67 | 9.4218 | 55.4 |
+| LEP-2 | Pipelined vLLM | 95.07 | 2.5918 | 55.6 |
 | LEP-3 | Quail | 99.56 | 10.526 | 13.333 |
-| LEP-3 | Pipelined vLLM | 99.14 | 4.3478 | 13.333 |
+| LEP-3 | Pipelined vLLM | 95.64 | 0.34364 | 40 |
 | LEP-4 | Quail | 99.45 | 5.5556 | 16.667 |
-| LEP-4 | Pipelined vLLM | 98.36 | 0 | 0 |
+| LEP-4 | Pipelined vLLM | 95.44 | 0.28129 | 66.667 |
 | LEP-5 | Quail | 98.26 | 11.111 | 25 |
-| LEP-5 | Pipelined vLLM | 84.25 | 0 | 0 |
+| LEP-5 | Pipelined vLLM | 95.39 | 0.17301 | 50 |
+
+Answers the two methods gave each other:
+
+| Query | Evaluations both made | Same answer (%) |
+|---|---:|---:|
+| LEP-1 | 500 | 87.00 |
+| LEP-2 | 216,500 | 95.53 |
+| LEP-3 | 9,160 | 96.28 |
+| LEP-4 | 8,315 | 95.81 |
+| LEP-5 | 5,512 | 95.16 |
 
 ## AGENT
 
@@ -299,11 +358,11 @@ Figure: plots/quailb_diffusion_gemma_agent.pdf
 
 | Query | Method | Seconds | Tokens/second | $/query | $/million input tokens | KV regret (%) |
 |---|---|---:|---:|---:|---:|---:|
-| AGENT-1 | Quail | 279.53 | 68,392.63 | 0.30664 | 0.016040 | 68.23 |
-| AGENT-1 | Pipelined vLLM | 440.71 | 43,379.53 | 0.48346 | 0.025288 | 0.78 |
+| AGENT-1 | Quail | 279.44 | 68,414.66 | 0.30655 | 0.016035 | 68.23 |
+| AGENT-1 | Pipelined vLLM | 155.80 | 122,707.27 | 0.17091 | 0.008940 | 0.78 |
 | AGENT-1 | SoL estimate | 46.622 | 410,055.89 | 0.05114 | 0.002675 | 0 (assumed) |
-| AGENT-2 | Quail | 280.54 | 68,298.00 | 0.30775 | 0.016062 | 68.08 |
-| AGENT-2 | Pipelined vLLM | 404.97 | 47,312.94 | 0.44425 | 0.023186 | 0.77 |
+| AGENT-2 | Quail | 280.31 | 68,354.04 | 0.30750 | 0.016049 | 68.08 |
+| AGENT-2 | Pipelined vLLM | 148.82 | 128,748.29 | 0.16326 | 0.008521 | 0.77 |
 | AGENT-2 | SoL estimate | 46.983 | 407,811.34 | 0.05154 | 0.002690 | 0 (assumed) |
 
 Correctness against saved reference labels:
@@ -311,6 +370,13 @@ Correctness against saved reference labels:
 | Query | Method | Answer agreement (%) | Output precision (%) | Output recall (%) |
 |---|---|---:|---:|---:|
 | AGENT-1 | Quail | 47.18 | 38.964 | 95.23 |
-| AGENT-1 | Pipelined vLLM | 48.53 | 38.537 | 84.046 |
+| AGENT-1 | Pipelined vLLM | 49.72 | 36.222 | 61.184 |
 | AGENT-2 | Quail | 93.34 | 81.903 | 99.62 |
-| AGENT-2 | Pipelined vLLM | 91.14 | 87 | 82.543 |
+| AGENT-2 | Pipelined vLLM | 80.53 | 71.77 | 56.926 |
+
+Answers the two methods gave each other:
+
+| Query | Evaluations both made | Same answer (%) |
+|---|---:|---:|
+| AGENT-1 | 1,772 | 58.75 |
+| AGENT-2 | 1,772 | 80.98 |
