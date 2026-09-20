@@ -9,6 +9,7 @@ import numpy as np
 
 from quail.backends.quail.executor.attention import Engine
 from quail.backends.quail.executor.models.base import ModelPipeline
+from quail.backends.quail.executor.moe import FP8Experts
 from quail.cost import budgets
 
 # The canvas starts as random token ids, as vLLM's sampler starts it;
@@ -99,6 +100,9 @@ class DiffusionGemmaPipeline(ModelPipeline):
                                   if spec.canvas_tokens else 0)
         _init_moe_workspace()
         self.max_chunk_tokens = budgets.kernel_index_cap(spec)
+        self.experts = [FP8Experts(layer.moe.experts, self.engine)
+                        if layer.enable_moe_block else None
+                        for layer in self.layers]
 
     def _norm(self, x, module):
         """One of the model's RMS norms, through the engine's kernel."""
@@ -188,11 +192,11 @@ class DiffusionGemmaPipeline(ModelPipeline):
                 pre = layer.pre_feedforward_layernorm_2
                 # the expert input and the router input are two norms
                 # of the residual
-                routed_in, router_in = engine.norm_rows2(
+                routed_in, routed_scale, router_in = engine.norm_router_quant(
                     residual, pre.weight, router.quail_scale,
                     pre.variance_epsilon)
                 logits, _ = router.proj(router_in)
-                routed = layer.moe(routed_in, logits)
+                routed = self.experts[index](routed_in, routed_scale, logits)
                 routed = self._norm(routed, layer.post_feedforward_layernorm_2)
                 # dense becomes the norm of the two branches' sum
                 engine.fused_add_rms_norm(dense, routed,

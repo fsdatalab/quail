@@ -225,6 +225,13 @@ class Engine:
 
     def gelu_mul_quant(self, gate_up):
         """gelu_tanh(gate) * up, quantized to fp8 with per-row scales."""
+        return self._gelu_mul_quant(gate_up, match_vllm_rounding=False)
+
+    def gelu_mul_quant_vllm(self, gate_up):
+        """Quantize GELU output after matching vLLM's BF16 rounding."""
+        return self._gelu_mul_quant(gate_up, match_vllm_rounding=True)
+
+    def _gelu_mul_quant(self, gate_up, *, match_vllm_rounding):
         n, doubled = gate_up.shape
         half = doubled // 2
         q = self.torch.empty((n, half), dtype=self.torch.float8_e4m3fn,
@@ -233,7 +240,8 @@ class Engine:
                                   device=gate_up.device)
         self._triton_kernels()["gelu_quant"][(n,)](
             gate_up, q, scales, gate_up.stride(0), q.stride(0),
-            HALF=half, BLOCK=1 << (half - 1).bit_length(), num_warps=8)
+            HALF=half, BLOCK=1 << (half - 1).bit_length(),
+            match_vllm_rounding=match_vllm_rounding, num_warps=8)
         return q, scales
 
     def scale_add_norm_quant(self, x, residual, scale, weight, eps):
@@ -255,14 +263,26 @@ class Engine:
 
     def norm_rows2(self, x, weight1, weight2, eps):
         """Two RMS norms of the same rows from one read."""
+        first, _, second = self._norm_rows2(x, weight1, weight2, eps, False)
+        return first, second
+
+    def norm_router_quant(self, x, weight, router_weight, eps):
+        """Return FP8 expert input, per-row scales, and BF16 router input."""
+        return self._norm_rows2(x, weight, router_weight, eps, True)
+
+    def _norm_rows2(self, x, weight1, weight2, eps, output_fp8):
         n, width = x.shape
-        o1 = self.torch.empty_like(x)
-        o2 = self.torch.empty_like(x)
+        dtype = self.torch.float8_e4m3fn if output_fp8 else x.dtype
+        first = self.torch.empty_like(x, dtype=dtype)
+        second = self.torch.empty_like(x)
+        scales = (self.torch.empty((n, 1), dtype=self.torch.float32,
+                                   device=x.device) if output_fp8 else None)
         self._triton_kernels()["norm2"][(n,)](
-            x, weight1, weight2, o1, o2, x.stride(0), o1.stride(0),
-            o2.stride(0), eps, H=width, BLOCK=1 << (width - 1).bit_length(),
+            x, weight1, weight2, first, second, scales, x.stride(0),
+            first.stride(0), second.stride(0), eps, H=width,
+            BLOCK=1 << (width - 1).bit_length(), output_fp8=output_fp8,
             num_warps=8)
-        return o1, o2
+        return first, scales, second
 
     # ---- the Triton fused kernels -----------------------------------
     # Each fuses a sequence of vLLM ops into one kernel launch.
@@ -272,6 +292,7 @@ class Engine:
             return self._kernels
         import triton
         import triton.language as tl
+        from triton.language.extra.cuda import libdevice
 
         # fuses vLLM's silu_and_mul + per_token_group_quant_fp8
         @triton.jit
@@ -452,7 +473,8 @@ class Engine:
         # next linear would run on its output
         @triton.jit
         def gelu_mul_quant(gu_ptr, q_ptr, s_ptr, stride_gu, stride_q,
-                           HALF: tl.constexpr, BLOCK: tl.constexpr):
+                           HALF: tl.constexpr, BLOCK: tl.constexpr,
+                           match_vllm_rounding: tl.constexpr):
             t = tl.program_id(0)
             offs = tl.arange(0, BLOCK)
             mask = offs < HALF
@@ -460,14 +482,27 @@ class Engine:
                            other=0.0).to(tl.float32)
             up = tl.load(gu_ptr + t * stride_gu + HALF + offs, mask=mask,
                          other=0.0).to(tl.float32)
-            inner = 0.7978845608028654 * (gate + 0.044715 * gate * gate * gate)
-            th = 1.0 - 2.0 / (tl.exp(2.0 * inner) + 1.0)
-            y = 0.5 * gate * (1.0 + th) * up
+            if match_vllm_rounding:
+                # vLLM rounds GELU to BF16 before the gating multiplication.
+                cube = gate * gate * gate
+                inner = 0.7978845608028654 * (gate + 0.044715 * cube)
+                activated = (0.5 * gate * (1.0 + libdevice.tanh(inner)))
+                y = activated.to(tl.bfloat16).to(tl.float32) * up
+            else:
+                inner = 0.7978845608028654 * (gate + 0.044715 * gate * gate * gate)
+                th = 1.0 - 2.0 / (tl.exp(2.0 * inner) + 1.0)
+                y = 0.5 * gate * (1.0 + th) * up
             # the unfused path rounds the activation to bf16 first
             y = y.to(tl.bfloat16).to(tl.float32)
             amax = tl.max(tl.abs(y), axis=0)
-            scale = tl.maximum(amax / 448.0, 1.0 / (448.0 * 512.0))
-            q = tl.minimum(tl.maximum(y / scale, -448.0), 448.0)
+            if match_vllm_rounding:
+                scale = tl.maximum(tl.div_rn(amax, 448.0),
+                                   1.0 / (448.0 * 512.0))
+                q = tl.div_rn(y, scale)
+            else:
+                scale = tl.maximum(amax / 448.0, 1.0 / (448.0 * 512.0))
+                q = y / scale
+            q = tl.minimum(tl.maximum(q, -448.0), 448.0)
             tl.store(q_ptr + t * stride_q + offs,
                      q.to(q_ptr.dtype.element_ty), mask=mask)
             tl.store(s_ptr + t, scale)
@@ -503,11 +538,12 @@ class Engine:
 
         # one read of a row for two RMS norms with different weights
         @triton.jit
-        def rms_norm2(x_ptr, w1_ptr, w2_ptr, o1_ptr, o2_ptr, stride_x,
+        def rms_norm2(x_ptr, w1_ptr, w2_ptr, o1_ptr, o2_ptr, s_ptr, stride_x,
                       stride_o1, stride_o2, eps, H: tl.constexpr,
-                      BLOCK: tl.constexpr):
+                      BLOCK: tl.constexpr, output_fp8: tl.constexpr):
             t = tl.program_id(0)
-            offs = tl.arange(0, BLOCK)
+            # Keep the BF16 reduction order when one output becomes FP8.
+            offs = tl.max_contiguous(tl.arange(0, BLOCK), 8)
             mask = offs < H
             x = tl.load(x_ptr + t * stride_x + offs, mask=mask,
                         other=0.0).to(tl.float32)
@@ -515,8 +551,18 @@ class Engine:
             xn = x * (1.0 / tl.sqrt(ms + eps))
             w1 = tl.load(w1_ptr + offs, mask=mask, other=0.0).to(tl.float32)
             w2 = tl.load(w2_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+            first = (xn * w1).to(x_ptr.dtype.element_ty)
+            if output_fp8:
+                # Preserve the BF16 intermediate's rounding before quantizing.
+                first = first.to(tl.float32)
+                scale = tl.maximum(tl.div_rn(tl.max(tl.abs(first), axis=0),
+                                             448.0),
+                                   1.0 / (448.0 * 512.0))
+                first = tl.minimum(tl.maximum(tl.div_rn(first, scale), -448.0),
+                                   448.0)
+                tl.store(s_ptr + t, scale)
             tl.store(o1_ptr + t * stride_o1 + offs,
-                     (xn * w1).to(o1_ptr.dtype.element_ty), mask=mask)
+                     first.to(o1_ptr.dtype.element_ty), mask=mask)
             tl.store(o2_ptr + t * stride_o2 + offs,
                      (xn * w2).to(o2_ptr.dtype.element_ty), mask=mask)
 

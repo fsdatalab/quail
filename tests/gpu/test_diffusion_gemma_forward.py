@@ -60,6 +60,34 @@ REVIEWS = [
 STOCK_ROWS = "stock_rows.pt"
 
 
+@pytest.mark.parametrize("rows", [17, 1024])
+def test_expert_fusions_preserve_quantization(rows):
+    from vllm import _custom_ops as ops
+
+    from quail.backends.quail.executor.attention import Engine
+
+    engine = Engine(None, n_q=16, n_kv=8, head_dim=256, rotary=None, fp8=False)
+    torch.manual_seed(42)
+    x = torch.randn(rows, 2816, device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn(2, 2816, device="cuda", dtype=torch.bfloat16)
+    normal, router = engine.norm_rows2(x, *weights, 1e-6)
+    expected, scales = ops.scaled_fp8_quant(normal, use_per_token_if_dynamic=True)
+    actual, actual_scales, actual_router = engine.norm_router_quant(
+        x, *weights, 1e-6)
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=0, atol=0)
+    torch.testing.assert_close(actual_scales, scales, rtol=0, atol=0)
+    torch.testing.assert_close(actual_router, router, rtol=0, atol=0)
+
+    gate_up = torch.randn(rows * 8, 1408, device="cuda", dtype=torch.bfloat16) * 3
+    activated = torch.empty_like(gate_up[:, :704])
+    torch.ops._C.gelu_tanh_and_mul(activated, gate_up)
+    expected, scales = ops.scaled_fp8_quant(
+        activated, use_per_token_if_dynamic=True)
+    actual, actual_scales = engine.gelu_mul_quant_vllm(gate_up)
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=0, atol=0)
+    torch.testing.assert_close(actual_scales, scales, rtol=0, atol=0)
+
+
 def _prompt_ids():
     from transformers import AutoTokenizer
 

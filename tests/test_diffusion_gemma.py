@@ -243,7 +243,7 @@ class _Layer:
         self.router = SimpleNamespace(
             norm=_Norm(torch.tensor(1.0)), root_size=torch.tensor(1.0),
             scale=torch.ones(hidden), proj=lambda x: (x, None))
-        self.moe = lambda x, logits: x
+        self.moe = SimpleNamespace(experts=lambda x, logits: x)
         self.layer_scalar = torch.tensor([layer_scalar])
 
 
@@ -309,8 +309,8 @@ class _Engine:
         residual.mul_(scale).add_(x)
         return residual * weight, None
 
-    def norm_rows2(self, x, weight1, weight2, eps):
-        return x * weight1, x * weight2
+    def norm_router_quant(self, x, weight1, weight2, eps):
+        return x * weight1, None, x * weight2
 
 
 def _spec_for(model, **overrides):
@@ -391,6 +391,9 @@ def test_pipeline_runs_the_gemma4_layer_order(monkeypatch):
 
 def _vllm_stubs(monkeypatch, workspace_ready=True):
     """Stub the vLLM modules the pipeline imports; returns what they saw."""
+    monkeypatch.setattr(
+        "quail.backends.quail.executor.models.diffusion_gemma.FP8Experts",
+        lambda module, engine: lambda x, scale, logits: module(x, logits))
     seen = {}
     context = types.ModuleType("vllm.forward_context")
 
