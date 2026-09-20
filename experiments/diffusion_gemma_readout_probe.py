@@ -11,7 +11,11 @@ came back, how the TRUE and FALSE entries are decoded, the TRUE minus
 FALSE logprob margin, what true_bit reads, and what Quail answered
 for the same document in the run named by --quail-run.
 --no-prefix-caching boots the engine without vLLM's prefix cache.
-Writes /results/ablations/diffusion_gemma_readout_probe_<dataset>
+Every document is answered three ways on the same engine: all
+prompts in one generate call (read), the benchmark's own filter
+chain through the engine's step loop (chain), and one prompt per
+generate call (alone); the benchmark run's baseline answer is kept
+beside them (bench). Writes /results/ablations/diffusion_gemma_readout_probe_<dataset>
 _k<logprobs>[_nocache].json.
 """
 
@@ -78,8 +82,11 @@ def probe(prediction: str, n_docs: int = 256,
     ids = docs["id"].tolist()
     lengths = dict(zip(ids, docs["tokens"].tolist()))
     prompt = bind_prompt(template, (column,), tok, turn=spec.turn)
-    prompts = [dict(prompt_token_ids=render_filter_prompt_ids(prompt, tok(b), tok))
-               for b in docs[column]]
+    tail = tok(prompt.tail.replace("{0}", "", 1))
+    bodies = [tok(prompt.preamble) + tok(b) for b in docs[column]]
+    for body, text in zip(bodies, docs[column]):
+        assert body + tail == render_filter_prompt_ids(prompt, tok(text), tok)
+    prompts = [dict(prompt_token_ids=body + tail) for body in bodies]
     if logprobs:
         import quail.backends.vllm as backend
         backend.DIFFUSION_LOGPROBS = logprobs
@@ -92,24 +99,44 @@ def probe(prediction: str, n_docs: int = 256,
     state, boot = Engine().boot(spec, sorted(set(true_ids) | set(false_ids)))
     client, sampling = state["client"], state["sampling_params"]
     outputs = client.generate(prompts, sampling, use_tqdm=False)
-    quail_answers = {}
-    table = Path(f"/results/benchmarks/quailb/{quail_run}/quail/{query_dir}/"
-                 "filters-0.parquet")
-    if table.exists():
-        for row in pq.read_table(table).to_pylist():
-            quail_answers[row[id_column]] = bool(row["answer"])
+    chain = client.run_filter_chain(sampling, bodies, [tail], set(true_ids),
+                                    tag="probe")
+    chain_answers = [bool(chain["answers"][(i, 1)]) for i in range(len(ids))]
+    alone_answers = [bool(true_bit(client.generate([p], sampling,
+                                                   use_tqdm=False)[0],
+                                   set(true_ids)))
+                     for p in prompts]
+    run_answers = {}
+    for method in ("quail", "pipelined_vllm"):
+        table = Path(f"/results/benchmarks/quailb/{quail_run}/{method}/"
+                     f"{query_dir}/filters-0.parquet")
+        if table.exists():
+            run_answers[method] = {row[id_column]: bool(row["answer"])
+                                   for row in pq.read_table(table).to_pylist()}
+    quail_answers = run_answers.get("quail", {})
+    bench_answers = run_answers.get("pipelined_vllm", {})
     records = []
     counts = {"no_logprobs": 0, "neither_word": 0, "answer_ids_in_top": 0,
-              "same_as_quail": 0, "compared": 0}
+              "same_as_quail": 0, "compared": 0, "chain_same_as_read": 0,
+              "alone_same_as_read": 0, "chain_same_as_quail": 0,
+              "alone_same_as_quail": 0, "bench_same_as_read": 0,
+              "bench_compared": 0}
     decoded_forms = {}
-    for doc_id, output in zip(ids, outputs):
+    for index, (doc_id, output) in enumerate(zip(ids, outputs)):
         completion = output.outputs[0]
         rows = getattr(completion, "logprobs", None)
         record = {"id": doc_id, "tokens": lengths[doc_id],
                   "text": completion.text,
                   "sampled": list(completion.token_ids),
                   "read": true_bit(output, set(true_ids)),
-                  "quail": quail_answers.get(doc_id)}
+                  "chain": chain_answers[index], "alone": alone_answers[index],
+                  "quail": quail_answers.get(doc_id),
+                  "bench": bench_answers.get(doc_id)}
+        counts["chain_same_as_read"] += int(record["chain"] == bool(record["read"]))
+        counts["alone_same_as_read"] += int(record["alone"] == bool(record["read"]))
+        if record["bench"] is not None:
+            counts["bench_compared"] += 1
+            counts["bench_same_as_read"] += int(record["bench"] == bool(record["read"]))
         if not rows:
             counts["no_logprobs"] += 1
             record["entries"] = None
@@ -139,6 +166,8 @@ def probe(prediction: str, n_docs: int = 256,
         if record["quail"] is not None:
             counts["compared"] += 1
             counts["same_as_quail"] += int(record["quail"] == bool(record["read"]))
+            counts["chain_same_as_quail"] += int(record["quail"] == record["chain"])
+            counts["alone_same_as_quail"] += int(record["quail"] == record["alone"])
         records.append(record)
     ranks = sorted(r["best_rank"] for r in records if r.get("best_rank"))
     covered = {k: sum(rank <= k for rank in ranks)
