@@ -24,41 +24,9 @@ import time
 
 import modal
 
-from quail.bench.requirements import quail_b_requirement
+from quail.bench.images import gpu_image
 
-IMAGE_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
-
-image = (
-    modal.Image.from_registry(IMAGE_BASE, add_python="3.12")
-    .entrypoint([])
-    .apt_install("git")
-    # quail-b installs from git at the pinned commit, with its plan
-    # files and its own dependencies (the Substrait bindings among them)
-    .pip_install(
-        "vllm==0.26.0",
-        "huggingface_hub[hf_transfer]",
-        "transformers>=5.2.0",
-        "pandas",
-        "pyarrow",
-        "numpy",
-        "datasets>=5.0.1",
-        "sqlglot>=27.0",
-        "gigatoken>=0.10.0",
-        quail_b_requirement(),
-    )
-    .env({
-        "VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
-        "VLLM_LOGGING_LEVEL": "WARNING",
-        "VLLM_USE_FLASHINFER_SAMPLER": "0",
-        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-        "HF_HUB_ENABLE_HF_TRANSFER": "1",
-        "QUAIL_CACHE_DIR": "/root/.cache/kernels",
-        "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
-        "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
-        "TRITON_CACHE_DIR": "/root/.cache/kernels/triton",
-    })
-    .add_local_python_source("quail")
-)
+image = gpu_image()
 
 app = modal.App("quail-milestone1")
 hf_cache = modal.Volume.from_name("quail-hf-cache", create_if_missing=True)

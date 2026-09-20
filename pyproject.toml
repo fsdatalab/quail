@@ -35,6 +35,11 @@ dev = [
     "quail-b",
     "ruff==0.12.9",
     "vulture==2.16",
+    # the Modal images sync this group: the readout probe reads the
+    # corpus tables with pandas, and hf_transfer speeds up checkpoint
+    # downloads
+    "pandas==3.0.5",
+    "hf-transfer==0.1.9",
 ]
 
 [tool.uv.sources]
