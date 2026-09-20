@@ -50,7 +50,7 @@ from quail.physical import (
     RequestExecution,
     RequestFilterSpec,
     RequestJoinSpec,
-    Scan,
+    TextScan,
 )
 from quail.physical.base import input_ports
 from quail.planner import (
@@ -116,7 +116,7 @@ def plan_request_backend(
         if scan.alias not in stats:
             raise ValueError(f"no document tokens for alias {scan.alias!r}")
         summary = stats[scan.alias]
-        node = Scan(
+        node = TextScan(
             node_id=f"scan:{scan.alias}",
             alias=scan.alias,
             input_id=scan.alias,
@@ -750,7 +750,7 @@ def execute_request_graph(context, backend, engine_state, boot):
     documents = {
         node.alias: context.request.inputs[node.input_id].documents
         for node in context.graph.nodes
-        if isinstance(node, Scan)
+        if isinstance(node, TextScan)
     }
     settings = dict(envelope["settings"])
     model_execution = backend.start(GpuContext(

@@ -28,7 +28,7 @@ from quail.physical import (
     JoinStage,
     PhysicalGraph,
     PortRef,
-    Scan,
+    TextScan,
 )
 from quail.physical.base import input_ports
 from quail.specs import DEVICES, MODELS
@@ -226,8 +226,8 @@ def two_alias_graph(pin_survivors, *, stages=1, hash_join=False, foreign=None):
         stages=tuple(FilterStage(s, 1, 0, 0.8 - 0.1 * s, 14 * 0.8 ** s)
                      for s in range(stages)),
         question_token_ids=tuple((QUESTION + s,) for s in range(stages)))
-    nodes = [Scan(node_id="input:r", alias="r", input_id="r"), chain,
-             Scan(node_id="input:p", alias="p", input_id="p")]
+    nodes = [TextScan(node_id="input:r", alias="r", input_id="r"), chain,
+             TextScan(node_id="input:p", alias="p", input_id="p")]
     anchor_src = PortRef("filter:r", "ids:r")
     join_inputs = []
     pairs_from = ""

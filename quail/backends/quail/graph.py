@@ -32,7 +32,7 @@ from quail.physical import (
     AiJoin,
     AiScore,
     PhysicalGraph,
-    Scan,
+    PhysicalScan,
     ScoreFilter,
 )
 
@@ -450,7 +450,7 @@ def throughput(graph, metrics, seconds: float) -> dict:
                 metrics.evaluated_document_pairs / seconds,
         }
     documents = sum(
-        node.n_docs for node in graph.nodes if isinstance(node, Scan)
+        node.n_docs for node in graph.nodes if isinstance(node, PhysicalScan)
     )
     return {"documents_per_second": documents / seconds}
 

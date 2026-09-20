@@ -34,7 +34,7 @@ from quail.execution.types import PhysicalResponse
 from quail.physical import (
     AiFilter,
     AiJoin,
-    Scan,
+    TextScan,
     decode_graph,
 )
 from quail.progress import say, set_gpu_index
@@ -169,7 +169,7 @@ def quail_runtime_payload(request, graph) -> dict:
     envelope = request.plan
     docs = {}
     for node in graph.nodes:
-        if not isinstance(node, Scan):
+        if not isinstance(node, TextScan):
             continue
         docs[node.alias] = request.inputs[node.input_id].documents
     return {

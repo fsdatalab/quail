@@ -9,7 +9,7 @@ import pytest
 
 from quail.builtins import built_in_registry
 from quail.execution.runner import ExecutionContext, GenericRunner, ScanRuntime
-from quail.physical import NodeCodec, PhysicalGraph, PortRef, Scan
+from quail.physical import NodeCodec, PhysicalGraph, PortRef, TextScan
 from quail.planner.physical_optimizer import apply_physical_rules
 
 
@@ -27,7 +27,7 @@ class ChangeCount:
 
 
 @dataclass(frozen=True)
-class CustomInput(Scan):
+class CustomInput(TextScan):
     type_name: ClassVar[str] = "test.custom_input"
     runtime_key: ClassVar[str] = "test.custom_input_runtime"
 
@@ -41,7 +41,7 @@ def _module(monkeypatch, name, register):
 
 def _count(registry):
     graph = PhysicalGraph(
-        (Scan(node_id="input", alias="d", input_id="d", n_docs=1),),
+        (TextScan(node_id="input", alias="d", input_id="d", n_docs=1),),
         PortRef("input", "ids:d"),
     )
     rewritten, _ = apply_physical_rules(
@@ -151,7 +151,7 @@ def test_node_registration_validation_and_execution():
     registry = built_in_registry()
     with pytest.raises(ValueError, match="codec must describe"):
         registry.register_node(
-            CustomInput, runtime=ScanRuntime(), codec=NodeCodec(Scan),
+            CustomInput, runtime=ScanRuntime(), codec=NodeCodec(TextScan),
         )
     assert CustomInput.type_name not in registry.codecs
     assert CustomInput.runtime_key not in registry.runtimes

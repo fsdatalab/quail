@@ -28,7 +28,7 @@ from quail.physical import (
     AiJoin,
     AiScore,
     PhysicalGraph,
-    Scan,
+    PhysicalScan,
 )
 from quail.planner import balanced_shards
 
@@ -53,7 +53,7 @@ class DistributedQuailExecution:
         self.shards = {
             node.alias: node.shards
             for node in graph.nodes
-            if isinstance(node, Scan)
+            if isinstance(node, PhysicalScan)
             and len(node.shards) == gpu_count
         }
         self.filter_aliases = {

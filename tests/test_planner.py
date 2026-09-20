@@ -21,7 +21,7 @@ from quail.physical import (
     GraphValidationError,
     PhysicalGraph,
     PortRef,
-    Scan,
+    TextScan,
     validate_streams,
 )
 from quail.physical.base import input_ports
@@ -98,7 +98,7 @@ def test_gpu_copies_and_memory_refusals(catalog):
             assert plan.workers == gpus
             scan_node = next(
                 node for node in plan.nodes
-                if isinstance(node, Scan)
+                if isinstance(node, TextScan)
             )
             assert len(scan_node.shards) == gpus
 

@@ -25,7 +25,7 @@ from quail.physical import (
     JoinStage,
     PhysicalGraph,
     PortRef,
-    Scan,
+    TextScan,
 )
 from quail.physical.base import input_ports
 from quail.specs import DEVICES, MODELS
@@ -128,10 +128,10 @@ def test_fixed_join_executes_without_optimizer(monkeypatch):
         raise AssertionError("execution called the join optimizer")
 
     monkeypatch.setattr("quail.planner.joins.search_joins", unexpected_search)
-    scan_r = Scan(
+    scan_r = TextScan(
         node_id="input:r", alias="r", input_id="r"
     )
-    scan_p = Scan(
+    scan_p = TextScan(
         node_id="input:p", alias="p", input_id="p"
     )
     join = AiJoin(
@@ -230,7 +230,7 @@ def attach_plan(payload, graph):
 
 
 def test_filter_execution_and_retention_inputs(monkeypatch):
-    scan = Scan(
+    scan = TextScan(
         node_id="input:d", alias="d", input_id="d"
     )
     filtered = AiFilter(

@@ -36,7 +36,7 @@ def runtime_plan(request):
     from quail.physical import (
         AiFilter,
         AiJoin,
-        Scan,
+        TextScan,
         decode_graph,
     )
 
@@ -59,7 +59,7 @@ def runtime_plan(request):
                   if isinstance(node, AiJoin) for stage in node.stages],
         "shards": {
             node.alias: node.shards for node in graph.nodes
-            if isinstance(node, Scan)
+            if isinstance(node, TextScan)
         },
     }
 
@@ -114,7 +114,7 @@ def make_executor(filter_truth, join_truth=None, seen=None):
         from quail.backends.quail.graph import execute_single_graph
         from quail.execution.runner import NodeMetrics, NodeResult
         from quail.execution.types import PhysicalResponse
-        from quail.physical import AiFilter, Scan
+        from quail.physical import AiFilter, TextScan
 
         runtime = runtime_plan(request)
         if seen is not None:
@@ -123,7 +123,7 @@ def make_executor(filter_truth, join_truth=None, seen=None):
         graph = runtime["graph"]
         docs = {
             node.alias: request.inputs[node.input_id].documents
-            for node in graph.nodes if isinstance(node, Scan)
+            for node in graph.nodes if isinstance(node, TextScan)
         }
 
         class FixedAnswers:

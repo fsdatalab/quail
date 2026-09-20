@@ -211,8 +211,15 @@ class RequestJoinSpec:
 
 
 @dataclass(frozen=True)
-class Scan(PhysicalNode):
-    """Read one tokenized document input supplied by the coordinator."""
+class PhysicalScan(PhysicalNode):
+    """Read one document input supplied by the coordinator.
+
+    The base of every physical scan. Subclasses name the kind of input
+    they bind (text tokens, PDF pages) through their wire name and any
+    extra fields; the coordinator runtime, the output port, the shard
+    layout, and the shared attributes live here. Code that accepts any
+    document input tests for this class.
+    """
 
     alias: str = ""
     input_id: str = ""
@@ -221,8 +228,9 @@ class Scan(PhysicalNode):
     shard_ranges: tuple[tuple[int, int], ...] = ()
     shard_token_loads: tuple[int, ...] = ()
 
-    type_name: ClassVar[str] = "quail.scan"
-    runtime_key: ClassVar[str] = type_name
+    # Every scan hands its prepared source to the same coordinator
+    # runtime, so subclasses keep this key and change only type_name.
+    runtime_key: ClassVar[str] = "quail.scan"
     location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
 
     def __post_init__(self) -> None:
@@ -277,20 +285,35 @@ class Scan(PhysicalNode):
         }
 
     @classmethod
-    def from_attributes(cls, node_id, inputs, attributes):
-        return cls(
-            node_id=node_id,
-            inputs=inputs,
-            alias=attributes["alias"],
-            input_id=attributes["input_id"],
-            n_docs=int(attributes["n_docs"]),
-            total_tokens=int(attributes["total_tokens"]),
-            shard_ranges=tuple(
+    def _scan_fields(cls, attributes: Mapping[str, Any]) -> dict:
+        """Decode the fields every scan shares; subclasses add theirs."""
+        return {
+            "alias": attributes["alias"],
+            "input_id": attributes["input_id"],
+            "n_docs": int(attributes["n_docs"]),
+            "total_tokens": int(attributes["total_tokens"]),
+            "shard_ranges": tuple(
                 (int(start), int(stop))
                 for start, stop in attributes["shard_ranges"]
             ),
-            shard_token_loads=tuple(attributes["shard_token_loads"]),
-        )
+            "shard_token_loads": tuple(attributes["shard_token_loads"]),
+        }
+
+    @classmethod
+    def from_attributes(cls, node_id, inputs, attributes):
+        return cls(node_id=node_id, inputs=inputs,
+                   **cls._scan_fields(attributes))
+
+
+@dataclass(frozen=True)
+class TextScan(PhysicalScan):
+    """Read one tokenized text document input.
+
+    The wire name stays ``quail.scan`` so saved plan envelopes written
+    before PDF inputs existed still decode.
+    """
+
+    type_name: ClassVar[str] = "quail.scan"
 
 
 @dataclass(frozen=True)

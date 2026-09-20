@@ -26,12 +26,10 @@ from quail.physical import (
     Limit,
     PortRef,
     Recombine,
+    TextScan,
 )
 from quail.physical import (
     Project as PhysicalProject,
-)
-from quail.physical import (
-    Scan as PhysicalScan,
 )
 from quail.physical.base import input_ports
 from quail.planner import joins as joinsearch
@@ -556,7 +554,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
             doc_tokens[s.alias], workers
         )
         sid = f"scan:{s.alias}"
-        nodes.append(PhysicalScan(
+        nodes.append(TextScan(
             node_id=sid,
             alias=s.alias, input_id=s.alias,
             n_docs=stats[s.alias].n_docs,

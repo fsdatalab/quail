@@ -7,7 +7,7 @@ from quail.backends import BackendExecutionContext
 from quail.execution.session import RefusalError
 from quail.execution.types import PhysicalRequest, PhysicalResponse
 from quail.physical import (
-    Scan,
+    PhysicalScan,
     check_plan_envelope,
     decode_graph,
     validate_streams,
@@ -43,7 +43,7 @@ def _validate_physical_request(request, registry):
     validate_streams(graph)
     needed_inputs = {
         node.input_id for node in graph.nodes
-        if isinstance(node, Scan)
+        if isinstance(node, PhysicalScan)
     }
     missing = needed_inputs - set(request.inputs)
     extra = set(request.inputs) - needed_inputs

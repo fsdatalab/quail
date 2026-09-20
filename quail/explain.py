@@ -13,11 +13,11 @@ from quail.physical import (
     Foreign,
     HashJoin,
     Limit,
+    PhysicalScan,
     PortRef,
     Project,
     Recombine,
     RequestExecution,
-    Scan,
 )
 
 
@@ -208,7 +208,7 @@ def run_summary(report, graph, workers, usd_per_hour=None) -> list:
         # a score over document pairs has no join stage records
         pairs = report.get("evaluated_document_pairs") or 0
     documents = sum(node.n_docs for node in graph.nodes
-                    if isinstance(node, Scan))
+                    if isinstance(node, PhysicalScan))
     if wall > 0 and pairs:
         items.append(("throughput", f"{_number(pairs / wall)} document "
                       f"pairs/second over {pairs:,} evaluated pairs"))
@@ -240,7 +240,7 @@ def _estimated_rows(graph):
     for node in graph.topological_nodes():
         inputs = [rows.get(port.source) for port in node.inputs]
         value = None
-        if isinstance(node, Scan):
+        if isinstance(node, PhysicalScan):
             value = node.n_docs
         elif isinstance(node, AiFilter):
             value = inputs[0] if inputs else None
@@ -301,7 +301,7 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
         details = []
         predicates = []
         title = type(node).__name__
-        if isinstance(node, Scan):
+        if isinstance(node, PhysicalScan):
             source = scans.get(node.alias)
             title = (f"Scan {source.provider} as {node.alias}" if source else
                      f"Scan: {node.alias}")

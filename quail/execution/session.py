@@ -42,7 +42,14 @@ from quail.logical import (
     join_conditions,
     oriented_join_conditions,
 )
-from quail.physical import PortRef, Project, Scan, ValueType, encode_graph
+from quail.physical import (
+    PhysicalScan,
+    PortRef,
+    Project,
+    TextScan,
+    ValueType,
+    encode_graph,
+)
 from quail.planner import explain, plan_query
 from quail.planner.logical_optimizer import LogicalPlanningContext, apply_logical_rules
 from quail.planner.plan import EngineConfig, Refusal, resolve_model
@@ -661,7 +668,7 @@ class Query:
         self.wait_for_tokens()
         inputs = {}
         for node in plan.nodes:
-            if not isinstance(node, Scan):
+            if not isinstance(node, TextScan):
                 continue
             inputs[node.input_id] = document_input(
                 self._token_inputs[node.alias].tokens
@@ -809,7 +816,7 @@ class Query:
         sources = {
             node.input_id: range(node.n_docs)
             for node in plan.nodes
-            if isinstance(node, Scan)
+            if isinstance(node, PhysicalScan)
         }
         observers = self.session.registry.new_observers()
         run = GenericRunner().run(
