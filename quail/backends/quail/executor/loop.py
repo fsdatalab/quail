@@ -847,7 +847,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
 # Bump when either pass covers a different set of shapes. A bumped
 # version invalidates every marker, so the next boot re-runs the
 # compile pass and re-commits the cache.
-WARMUP_VERSION = 3
+WARMUP_VERSION = 4
 
 
 def _warm_inputs(budget):
