@@ -77,7 +77,7 @@ after_write = _no_commit
 
 # Label counts follow from the table sizes each scale factor samples.
 # The hours use the 14,000 fresh tokens per second measured for the
-# BIO-2 join at 32B, so they are estimates until a pass confirms them.
+# BIO-2 join at 32B. These estimates exclude BIO-4's new term filters.
 _PREDICTIONS = {
     0.1: ("21 predicates need 1,210,264 labels: 993,450 model judgments "
           "through Quail and 216,814 source labels, about 1.5 H100 hours "
@@ -99,6 +99,12 @@ DERIVE_PREDICTION_TEXT = (
     "hash. The LePaRD citation join is recomputed from the smaller "
     "corpus; at sf=0.1 from sf=1.0, 2 of its 216,500 labels differ."
 )
+BIO4_PREDICTION_TEXT = (
+    "BIO-4 adds two filter labels per reaction term; "
+    "their time is not included in that estimate. "
+    "The rerun of 16 saved answers per predicate shows no differences, "
+    "and every workload finishes on one H100 without an out-of-memory failure."
+)
 
 
 def prediction_text(sf: float) -> str:
@@ -109,9 +115,7 @@ def prediction_text(sf: float) -> str:
         raise ValueError(
             f"scale factor {sf} is not one of {SUPPORTED_SCALE_FACTORS}"
         ) from error
-    return (f"At sf={sf}, {counts} The rerun of 16 saved answers per "
-            "predicate shows no differences, and every workload finishes "
-            "on one H100 without an out-of-memory failure.")
+    return f"At sf={sf}, {counts} {BIO4_PREDICTION_TEXT}"
 
 
 # One Quail query is one Parquet part, setting the resume granularity.
@@ -1053,9 +1057,11 @@ def finalize_collection(sf: float, corpus_id: str,
 
 def activate_reused_collection(
         sf: float, target_corpus_id: str, source_collection_id: str,
-        relabeled_workloads: str) -> dict:
+        relabeled_workloads: str, *,
+        relabeled_predicates: tuple[str, ...] = ()) -> dict:
     """Build one collection from new labels and verified unchanged tables."""
-    _, target_corpus, _ = _load_corpus(target_corpus_id)
+    with open(ROOT / "corpora" / target_corpus_id / "manifest.json") as f:
+        target_corpus = json.load(f)
     source_collection_path = (
         ROOT / "collections" / source_collection_id / "manifest.json")
     with open(source_collection_path) as f:
@@ -1083,12 +1089,15 @@ def activate_reused_collection(
     unknown = names - set(WORKLOADS)
     if unknown:
         raise ValueError(f"unknown relabeled workloads: {sorted(unknown)}")
+    unknown_predicates = set(relabeled_predicates) - set(PREDICATE_BY_KEY)
+    if unknown_predicates:
+        raise ValueError(f"unknown relabeled predicates: {sorted(unknown_predicates)}")
 
     identities = {}
     manifests = {}
     reused = {}
     for spec in PREDICATES:
-        if spec.workload in names:
+        if spec.workload in names or spec.key in relabeled_predicates:
             identity = label_set_identity(
                 spec, target_corpus["corpus_id"],
                 target_corpus["corpus_full_hash"])
@@ -1130,6 +1139,7 @@ def activate_reused_collection(
         "source_collection_id": source_collection_id,
         "source_corpus_id": source_corpus_id,
         "relabeled_workloads": sorted(names),
+        "relabeled_predicates": sorted(relabeled_predicates),
         "reused_predicates": len(reused),
         "new_predicates": len(PREDICATES) - len(reused),
         "predicate_count": len(PREDICATES),
