@@ -11,7 +11,8 @@ came back, how the TRUE and FALSE entries are decoded, the TRUE minus
 FALSE logprob margin, what true_bit reads, and what Quail answered
 for the same document in the run named by --quail-run.
 --no-prefix-caching boots the engine without vLLM's prefix cache.
---order corpus takes the first documents in corpus order, as the
+--multiprocessing runs vLLM's engine core in its own process, as the
+benchmark does. --order corpus takes the first documents in corpus order, as the
 benchmark submits them (agent traces trajectory by trajectory, so
 each request extends the previous turn's prompt), instead of a
 sample spread over the corpus's lengths. Every document is answered
@@ -50,7 +51,8 @@ DATASETS = {
 def probe(prediction: str, n_docs: int = 256,
           quail_run: str = "20260919T220437Z-1550de75",
           logprobs: int = 0, dataset: str = "imdb",
-          prefix_caching: bool = True, order: str = "spread") -> str:
+          prefix_caching: bool = True, order: str = "spread",
+          multiprocessing: bool = False) -> str:
     """Run the readout; a logprobs count above 0 overrides the backend's.
 
     With order "spread" the documents are every k-th of the dataset in
@@ -58,7 +60,9 @@ def probe(prediction: str, n_docs: int = 256,
     "corpus" they are the first n_docs in corpus order.
     """
     import os
-    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+    # the benchmark runs vLLM's engine core in its own process (vLLM's
+    # default); in-process keeps the probe's engine state in view
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "1" if multiprocessing else "0"
     from pathlib import Path
 
     import pyarrow.parquet as pq
@@ -184,14 +188,14 @@ def probe(prediction: str, n_docs: int = 256,
                for k in (20, 50, 100, 200, 500, 1000, 2000, 5000)}
     report = {"prediction": prediction, "n_docs": n_docs, "boot": boot,
               "dataset": dataset, "prefix_caching": prefix_caching,
-              "order": order,
+              "order": order, "multiprocessing": multiprocessing,
               "sampling": str(sampling), "capacity": state["capacity"],
               "counts": counts, "decoded_forms": decoded_forms,
               "best_rank_covered_by_k": covered, "worst_rank": max(ranks, default=None),
               "true_ids": sorted(true_ids), "false_ids": sorted(false_ids),
               "records": records}
     suffix = ("" if prefix_caching else "_nocache") + (
-        "_corpus" if order == "corpus" else "")
+        "_corpus" if order == "corpus" else "") + ("_mp" if multiprocessing else "")
     out = Path("/results/ablations/diffusion_gemma_readout_probe_"
                f"{dataset}_k{logprobs}{suffix}.json")
     out.write_text(json.dumps(report, indent=1, default=str))
@@ -205,10 +209,11 @@ def probe(prediction: str, n_docs: int = 256,
 @app.local_entrypoint()
 def main(prediction: str = "", docs: int = 256, logprobs: int = 0,
          dataset: str = "imdb", prefix_caching: bool = True,
-         order: str = "spread"):
+         order: str = "spread", multiprocessing: bool = False):
     if not prediction:
         raise ValueError("pass --prediction before starting")
     call = probe.spawn(prediction, docs, logprobs=logprobs, dataset=dataset,
-                       prefix_caching=prefix_caching, order=order)
+                       prefix_caching=prefix_caching, order=order,
+                       multiprocessing=multiprocessing)
     print(f"function call id: {call.object_id} (readout probe)", flush=True)
     print(call.get(), flush=True)
