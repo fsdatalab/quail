@@ -120,8 +120,9 @@ sparsity and we run dense. Projections use FP8; attention uses BF16
 
 ### Work per filter stage
 
-The model tracks four quantities: fresh tokens, attention pairs,
-KV written, and KV read.
+The model counts fresh tokens, attention pairs, KV written, and KV read.
+For models with sliding-window layers, it counts their attention pairs
+and KV reads separately.
 
 **Stage 1** (first predicate on a table, document not yet in KV):
 
@@ -245,6 +246,39 @@ $$
 The $\max$ within each component allows compute and memory to
 overlap. The components are summed because they run in sequence.
 Filter and join boundaries do not start separate forward passes.
+
+### Models with sliding-window attention
+
+For DiffusionGemma, you need separate pair counts for its 25 sliding-window
+layers and five full-attention layers. The sliding window contains 1,024
+keys, including the current token. The head sizes are 256 and 512,
+respectively.
+
+For a window of $W$ keys, count a sequence of $n$ tokens with:
+
+$$
+T_W(n) = \begin{cases}
+\frac{n(n+1)}{2} & n \le W \\
+Wn - \frac{W(W-1)}{2} & n > W.
+\end{cases}
+$$
+
+When you append $s$ tokens to a prefix of $p$ tokens, count
+$T_W(p+s)-T_W(p)$ sliding pairs. Each independent suffix uses the
+same prefix length. It does not attend to other suffixes.
+Only the last $\min(p, W-1)$ prefix keys are visible to the suffix.
+The cost model charges that prefix read once when suffixes share it.
+
+For each layer, multiply its pair count by four times its query-head
+count and head size. Sum the layer costs to get the attention FLOPs.
+Count KV bytes using each layer's KV-head count and head size.
+You use the same counts when pricing a filter, a join, or prefix
+recomputation for KV retention.
+
+The planner summarizes document lengths below the window once per alias.
+It can then cost candidate joins without visiting every document again.
+The standalone SoL estimate uses each document's token count and credits
+shared prefixes before counting the remaining attention work.
 
 ### Follow the cost calculation
 

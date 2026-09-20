@@ -48,10 +48,7 @@ def prefix_recompute_seconds(prefix_tokens: int, model: ModelSpec,
     if prefix_tokens < 0:
         raise ValueError("prefix_tokens must be nonnegative")
     return compute_seconds(
-        _workload.Work(
-            tokens=prefix_tokens,
-            pairs=_workload.triangle(prefix_tokens),
-        ),
+        _workload.scan(prefix_tokens, 0, window=model.sliding_window),
         model,
         device,
     )

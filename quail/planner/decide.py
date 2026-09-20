@@ -93,7 +93,8 @@ def filter_cost(predicate, prefix_tokens: float, model: ModelSpec,
     """Return ideal time for one filter evaluation."""
     operation = scan if first else ask
     work = operation(prefix_tokens,
-                     _question_tokens(predicate.prompt, model.canvas_tokens))
+                     _question_tokens(predicate.prompt, model.canvas_tokens),
+                     window=model.sliding_window)
     return unrounded_seconds(work, model, device, chunk_tokens)
 
 
@@ -235,7 +236,7 @@ def hash_join_nodes(joins, pair_fractions, scan_ports) -> list:
 
 
 def _filter_alias_work(preds, stats, order, pre: int,
-                       canvas: int = 0) -> Work:
+                       canvas: int = 0, window: int = 0) -> Work:
     """Expected Work of one filter chain: a scan, then asks over KV."""
     total = Work()
     mean = stats.mean_doc_tokens
@@ -244,7 +245,7 @@ def _filter_alias_work(preds, stats, order, pre: int,
         p = preds[predicate_index]
         q = _question_tokens(p.prompt, canvas)
         op = scan if si == 0 else ask
-        total = total + op(pre + mean, q) * n
+        total = total + op(pre + mean, q, window=window) * n
         n *= effective_selectivity(p.selectivity)
     return total
 
@@ -276,7 +277,8 @@ def node_estimates(graph, *, filter_works, stage_works, live, stats, pre,
                 excess = max(0.0, live.get(node.alias, 0.0) - fits)
                 entry["release_recompute_tokens"] = round(excess * prefix)
                 entry["release_recompute_seconds"] = speed_of_light(
-                    scan(prefix, 0) * excess, model, device, chunk).seconds
+                    scan(prefix, 0, window=model.sliding_window) * excess,
+                    model, device, chunk).seconds
         elif isinstance(node, AiJoin):
             work = Work()
             for stage in node.stages:
@@ -377,7 +379,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                      "use apply_table() or set gpus=1",),
             constraint="per_batch_apply_needs_one_gpu",
             needed=1, available=gpus, unit="gpus")
-    length_stats = {a: joinsearch.summarize_alias(t)
+    length_stats = {a: joinsearch.summarize_alias(t, model.sliding_window)
                     for a, t in doc_tokens.items()}
     stats = {
         a: CorpusStats(n_docs=s.count, total_tokens=s.total,
@@ -432,7 +434,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
         live0[_filter_alias(fs[0])] *= surv
     filter_works = {
         alias: _filter_alias_work(preds, stats[alias], filter_orders[alias],
-                                  pre, model.canvas_tokens)
+                                  pre, model.canvas_tokens, model.sliding_window)
         for alias, preds in filters.items()
     }
     base_work = sum(filter_works.values(), Work())
