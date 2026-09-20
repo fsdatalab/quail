@@ -222,6 +222,59 @@ def test_text_model_refuses_pdf_rows(sources):
         assert plan.constraint == "model_takes_text_only"
 
 
+def test_pdf_rows_need_one_gpu(sources):
+    with quail.Session(EngineConfig(model=GEMMA.name, device="h100-sxm",
+                                    gpus=2), tokenizer=fake_tok) as session:
+        session.register("pages", quail.DocumentProvider.from_pdfs(
+            sources, id_col="doc_id", path_col="path", row_mode="page"))
+        plan = session.sql(FILTER_SQL).plan()
+        assert isinstance(plan, Refusal)
+        assert plan.constraint == "pdf_rows_need_one_gpu"
+
+
+def test_worker_lays_pdf_rows_out_as_page_prompts_with_an_image_source(sources):
+    from quail.backends.quail.executor.images import PageImages
+    from quail.backends.quail.graph import filter_inputs
+    from quail.backends.quail.worker import (
+        execute_quail_multi,
+        payload_documents,
+        quail_runtime_payload,
+    )
+    from quail.builtins import built_in_registry
+    from quail.pdf.prompt import PagePrompts
+    from quail.physical import AiFilter, decode_graph
+
+    with gemma_session() as session:
+        session.register("pages", quail.DocumentProvider.from_pdfs(
+            sources, id_col="doc_id", path_col="path", row_mode="page"))
+        query = session.sql(FILTER_SQL)
+        plan = query.plan()
+        request = query._prepare_physical()
+    graph = decode_graph(request.plan["graph"], built_in_registry().codecs)
+    payload = quail_runtime_payload(request, graph)
+    assert payload["docs"] == {}
+    assert isinstance(payload["pdf_inputs"]["p"], PDFInput)
+    docs = payload_documents(payload, GEMMA)
+    prompts = docs["p"]
+    assert isinstance(prompts, PagePrompts) and len(prompts) == 5
+    (scan,) = [n for n in plan.nodes if isinstance(n, PDFScan)]
+    assert sum(prompts.lengths) == scan.total_tokens
+    assert prompts[0][0] == GEMMA.image_start_id
+    assert prompts[0][-1] == GEMMA.image_end_id
+    (node,) = [n for n in graph.nodes if isinstance(n, AiFilter)]
+    state = {"docs": docs, "pre": [1, 2, 3], "filter_limit": None}
+    inputs = filter_inputs(state, node, [4, 0])
+    assert isinstance(inputs["images"], PageImages)
+    assert inputs["images"].document_ids == [4, 0]
+    assert inputs["images"].pre_tokens == 3
+    assert len(inputs["documents"]) == 2
+    assert list(inputs["documents"][0][:4]) == [1, 2, 3, GEMMA.image_start_id]
+    text_state = {"docs": {"p": [[7, 8]]}, "pre": [], "filter_limit": None}
+    assert filter_inputs(text_state, node, [0])["images"] is None
+    with pytest.raises(ValueError, match="one GPU"):
+        execute_quail_multi(payload, None, graph)
+
+
 def test_image_tokens_are_checked_at_session_start():
     with pytest.raises(quail.RefusalError, match="accepts image_tokens"):
         gemma_session(image_tokens=300)

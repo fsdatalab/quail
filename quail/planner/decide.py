@@ -365,7 +365,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     operators = plan.operators()
     scans, filters, joins = operators.scans, operators.filters, operators.joins
     pdf_documents = dict(pdf_documents or {})
-    refused = refuse_pdf_documents(pdf_documents, model, joins)
+    refused = refuse_pdf_documents(pdf_documents, model, joins, gpus)
     if refused is not None:
         return refused
     applies = operators.applies
@@ -792,13 +792,14 @@ def scan_node(node_id: str, alias: str, stats: CorpusStats, shard_ranges,
 
 
 def refuse_pdf_documents(pdf_documents: Mapping[str, PdfDocuments],
-                         model: ModelSpec, joins) -> Refusal | None:
+                         model: ModelSpec, joins, gpus: int = 1) -> Refusal | None:
     """The refusal a PDF alias earns before any plan is built, if any.
 
     PDF rows go through AI.FILTER only: a join would place a partner's
     pages after the anchor's, which the runtime does not render. The
-    model must take images, and no row may show more pages than the
-    model was tested with.
+    model must take images, no row may show more pages than the model
+    was tested with, and the pages render for one GPU's chain: the
+    multi-GPU coordinator splits token documents only.
     """
     if not pdf_documents:
         return None
@@ -808,6 +809,12 @@ def refuse_pdf_documents(pdf_documents: Mapping[str, PdfDocuments],
                      f"{sorted(pdf_documents)} bind PDF pages",),
             constraint="model_takes_text_only",
             needed=1, available=0, unit="image models")
+    if gpus > 1:
+        return Refusal(
+            reasons=(f"PDF rows run on one GPU; {sorted(pdf_documents)} "
+                     f"bind PDF pages with gpus={gpus}",),
+            constraint="pdf_rows_need_one_gpu",
+            needed=1, available=gpus, unit="gpus")
     joined = sorted({ref.alias for join in joins
                      for ref in join.prompt.args
                      if ref.alias in pdf_documents})
