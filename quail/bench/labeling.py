@@ -38,7 +38,7 @@ from pathlib import Path
 import modal
 import pyarrow as pa
 
-from quail.bench.requirements import quail_b_requirement
+from quail.bench.images import cpu_image, gpu_image
 from quail_b import data
 from quail_b.data import GROUND_TRUTH_ROOT, PUBLIC_BUCKET
 from quail_b.predicates import (
@@ -1456,33 +1456,10 @@ def publish(root: Path, collection_ids: list[str],
 hf_cache = modal.Volume.from_name("quail-hf-cache", create_if_missing=True)
 kernel_cache = modal.Volume.from_name("quail-kernel-cache", create_if_missing=True)
 results_vol = modal.Volume.from_name("quail-results", create_if_missing=True)
-image = (
-    modal.Image.from_registry(
-        "nvidia/cuda:13.0.1-devel-ubuntu24.04", add_python="3.12")
-    .entrypoint([])
-    .apt_install("git")
-    .pip_install("vllm==0.26.0", "huggingface_hub", "numpy", "pyarrow",
-                 "sqlglot>=27.0", "gigatoken>=0.10.0", "datasets>=5.0.1",
-                 quail_b_requirement())
-    .env({
-        "QUAIL_CACHE_DIR": "/root/.cache/kernels",
-        "VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
-        "VLLM_LOGGING_LEVEL": "WARNING",
-        "VLLM_USE_FLASHINFER_SAMPLER": "0",
-        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-        "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
-        "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
-        "TRITON_CACHE_DIR": "/root/.cache/kernels/triton",
-        "TORCHINDUCTOR_CACHE_DIR": "/root/.cache/kernels/torchinductor",
-    })
-    .add_local_python_source("quail")
-)
-publish_image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .apt_install("git")
-    .pip_install("boto3", "pyarrow", "numpy", "sqlglot>=27.0",
-                 "gigatoken>=0.10.0", "datasets>=5.0.1", quail_b_requirement())
-    .add_local_python_source("quail"))
+image = gpu_image()
+# the dev group carries boto3 for the upload; no GPU stack here
+publish_image = cpu_image()
+
 
 
 def _aws_credentials() -> dict[str, str]:
