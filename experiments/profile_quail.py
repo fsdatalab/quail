@@ -100,11 +100,13 @@ def _write(result, name):
     kernel_cache.commit()
 
 
-def _boot_state(model):
+def _boot_state(model, **pipeline_kwargs):
     """Boot the worker state dict, as the worker's own boot does.
 
     Mirrors quail.execution.execute._execute_physical's boot with the
     shipping pipeline; warm_kernels runs the same tiered warmup.
+    pipeline_kwargs go to the model's pipeline, for experiments that
+    swap a kernel.
     """
     import torch
     import torch.nn.functional as F
@@ -121,15 +123,20 @@ def _boot_state(model):
     spec = MODELS[model]
     device = DEVICES["h100-sxm"]
     tokenizer = AutoTokenizer.from_pretrained(spec.hf_name)
-    model_mod = load_model(spec.hf_name, revision=spec.revision)
     chunk_tokens = budgets.chunk_budget(spec, device)
-    arena_tok = budgets.arena_tokens(spec, device, chunk_tokens)
+    model_mod = load_model(spec.hf_name, revision=spec.revision,
+                           max_batched_tokens=chunk_tokens,
+                           moe_backend=spec.moe_backend)
+    full_pages, sliding_pages = budgets.arena_pages(spec, device, chunk_tokens)
     arena = KVArena(n_layers=spec.layers,
-                    n_pages=arena_tok // budgets.PAGE_TOKENS,
+                    n_pages=full_pages,
                     page_tokens=budgets.PAGE_TOKENS,
                     n_kv=spec.n_kv, d_head=spec.d_head,
-                    dtype=torch.bfloat16)
-    pipeline = build_pipeline(spec, model_mod, arena)
+                    dtype=torch.bfloat16, layer_kv=spec.kv_shapes,
+                    sliding_layers=spec.sliding_layer_set,
+                    sliding_window=spec.sliding_window,
+                    n_sliding_pages=sliding_pages)
+    pipeline = build_pipeline(spec, model_mod, arena, **pipeline_kwargs)
     from quail.backends import GpuContext, QuailBackend
     execution = QuailBackend().start(GpuContext(
         gpu_index=0,
@@ -189,13 +196,16 @@ def _run_query(state, build, captured):
     from quail.execution.types import PhysicalResponse
 
     def execute(request):
-        request, registry, graph, _ = _validate_physical_request(
-            request, query.session.registry)
+        registry = query.session.registry
+        graph, _ = _validate_physical_request(request, registry)
         payload = quail_runtime_payload(request, graph)
         rows = AnswerRows(
             state["torch"], state["F"], state["model"],
             payload["true_ids"], payload["false_ids"],
         )
+        arena_pages = payload.get("arena_pages")
+        if arena_pages is not None:
+            state["arena"].resize(*arena_pages, free_resident=True)
         state["model_execution"].bind_query(
             torch=state["torch"],
             async_answers=AsyncAnswers(state["torch"], rows),
@@ -546,8 +556,7 @@ def _parse_queries(queries):
 @app.local_entrypoint()
 def run(queries: str, model: str = "qwen3-4b-fp8", sf: float = 0.1,
         out_prefix: str = "profile"):
-    handle = measure.spawn(model, sf, _parse_queries(queries),
-                           out_prefix)
+    handle = measure.spawn(model, sf, _parse_queries(queries), out_prefix)
     print(f"profile_quail fc: {handle.object_id}", flush=True)
     print(handle.get())
 

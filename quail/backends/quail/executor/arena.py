@@ -16,7 +16,9 @@ the same methods:
   retention_cap_pages, retained_keys, retained_pages,
   retained_prefix_tokens
 - residency: is_resident, resident_keys, owned_pages, capacity_rows,
-  pages_needed, page_tokens, n_pages, free_pages
+  pages_needed, page_cost, held_cost, page_tokens, n_pages, free_pages
+- the sliding window: has_sliding, origin, sliding_start, trim_window,
+  owned_sliding_pages, capacity_rows_sliding, n_sliding_pages, resize
 - attention inputs: layer_kv, paged_kv, block_table, block_table_rows
 - counters: reset_stats, evicted_keys, evicted_pages,
   evicted_prefix_tokens
@@ -196,46 +198,155 @@ class KVArena:
 
     Per-layer K and V pools of shape (n_pages, page_tokens, n_kv,
     d_head). Torch is imported when the tensor pools are created.
+
+    layer_kv gives each layer its own (n_kv, d_head) when the layers
+    differ, as Gemma 4's sliding and full-attention layers do.
+
+    Sliding layers (sliding_layers, with sliding_window tokens behind
+    each row) keep a second, smaller pool of n_sliding_pages. A key
+    holds pages in both: its whole prefix on the every-token pool, and
+    on the sliding pool only the rows from its window origin on. The
+    origin is the window's start below base_tokens (the document the
+    key may be rewound to), rounded down to a page. A fresh key takes
+    sliding pages for its whole prefix during its one pass, since the
+    prefix rows attend to each other; trim_window then releases the
+    pages before the origin. Page counts the schedulers see are in
+    every-token pages, with sliding pages converted at the pools' size
+    ratio, so a count that fits admits in both pools.
     """
 
     def __init__(self, n_layers: int, n_pages: int, page_tokens: int,
-                 n_kv: int, d_head: int, dtype=None, device="cuda"):
+                 n_kv: int, d_head: int, dtype=None, device="cuda",
+                 layer_kv=None, sliding_layers=(), sliding_window=0,
+                 n_sliding_pages=0):
         import torch
         self.torch = torch
-        dtype = dtype or torch.bfloat16
+        self.dtype = dtype or torch.bfloat16
+        self.device = device
+        self.pinned = str(device).startswith("cuda")
+        shapes = ([(n_kv, d_head)] * n_layers if layer_kv is None
+                  else [tuple(shape) for shape in layer_kv])
+        if len(shapes) != n_layers:
+            raise ValueError(
+                f"layer_kv names {len(shapes)} layers, the arena has "
+                f"{n_layers}")
+        self.shapes = shapes
+        self.sliding_layers = (frozenset(sliding_layers) if sliding_window
+                               else frozenset())
+        self.window = sliding_window if self.sliding_layers else 0
+        if self.sliding_layers and n_sliding_pages <= 0:
+            raise ValueError("sliding layers need a sliding pool")
+        self._build(n_pages, page_tokens, n_sliding_pages)
+        self.reset_stats()
+
+    def _build(self, n_pages, page_tokens, n_sliding_pages):
+        torch = self.torch
         self.accounting = PageArena(n_pages, page_tokens)
-        shape = (n_pages * page_tokens, n_kv, d_head)
-        self.k = [torch.empty(shape, dtype=dtype, device=device)
-                  for _ in range(n_layers)]
-        self.v = [torch.empty(shape, dtype=dtype, device=device)
-                  for _ in range(n_layers)]
+        self.sliding = (PageArena(n_sliding_pages, page_tokens)
+                        if self.sliding_layers else None)
+        self.k, self.v = [], []
+        for layer, (heads, dim) in enumerate(self.shapes):
+            pages = n_sliding_pages if layer in self.sliding_layers else n_pages
+            shape = (pages * page_tokens, heads, dim)
+            self.k.append(torch.empty(shape, dtype=self.dtype, device=self.device))
+            self.v.append(torch.empty(shape, dtype=self.dtype, device=self.device))
         # row indices stay on the host: pageable H2D copies block the
         # CPU behind the running stream
         self._rows = {}       # key -> row-index tensor on CPU
         self._capacity_rows = {}  # key -> every row in the claimed pages
-        self.device = device
-        self.reset_stats()
+        self._sliding_rows = {}   # key -> every row in its sliding pages
+        self._base = {}       # key -> tokens the window is anchored below
+        self._sliding_start = {}  # key -> logical row of its first sliding page
+
+    def resize(self, n_pages: int, n_sliding_pages: int = 0, *,
+               free_resident: bool = False) -> None:
+        """Rebuild both pools at new sizes.
+
+        Nothing survives a rebuild; free_resident frees every resident
+        key first, and without it a resident key is an error.
+        """
+        if free_resident:
+            for key in self.resident_keys():
+                self.free_key(key)
+        if self.accounting.owned:
+            raise RuntimeError("the arena holds keys; free them before resizing")
+        if (n_pages, n_sliding_pages) == (self.n_pages, self.n_sliding_pages):
+            return
+        page_tokens = self.page_tokens
+        self.k = self.v = None
+        self._build(n_pages, page_tokens, n_sliding_pages)
 
     def reset_stats(self):
         self.evicted_keys = 0
         self.evicted_pages = 0
         self.evicted_prefix_tokens = 0
 
-    def alloc(self, key, tokens: int, capacity_tokens: int | None = None):
-        pages = self.accounting.alloc(key, tokens, capacity_tokens)
+    # ---- the window --------------------------------------------------
+
+    @property
+    def has_sliding(self) -> bool:
+        return self.sliding is not None
+
+    def origin(self, base_tokens: int) -> int:
+        """The logical row a key's sliding pages start at once trimmed."""
+        if not self.window or base_tokens <= self.window:
+            return 0
+        return (base_tokens - self.window) // self.page_tokens * self.page_tokens
+
+    def sliding_start(self, key) -> int:
+        """The logical row of the key's first sliding page."""
+        return self._sliding_start[key]
+
+    def trim_window(self, key) -> int:
+        """Release a key's sliding pages before its window origin.
+
+        Returns the pages freed, in every-token pages.
+        """
+        if self.sliding is None:
+            return 0
+        origin = self.origin(self._base[key])
+        start = self._sliding_start[key]
+        if origin <= start:
+            return 0
+        before = self.free_pages
+        drop = (origin - start) // self.page_tokens
+        owned = self.sliding.owned[key]
+        self.sliding.free.extend(owned[:drop])
+        self.sliding.owned[key] = owned[drop:]
+        self.sliding.tokens[key] -= origin - start
+        self._sliding_start[key] = origin
+        self._refresh_rows(key)
+        return self.free_pages - before
+
+    # ---- allocation ----------------------------------------------------
+
+    def alloc(self, key, tokens: int, capacity_tokens: int | None = None,
+              base_tokens: int | None = None, sliding_tokens=None):
+        """Pages for a fresh key in both pools, or None when either is short.
+
+        sliding_tokens sizes the sliding pages when they differ from
+        capacity_tokens, as a temporary's do.
+        """
+        capacity = tokens if capacity_tokens is None else capacity_tokens
+        pages = self.accounting.alloc(key, tokens, capacity)
         if pages is None:
             return None
+        if self.sliding is not None:
+            want = capacity if sliding_tokens is None else sliding_tokens
+            got = self.sliding.alloc(key, min(tokens, want), want)
+            if got is None:
+                self.accounting.free_key(key)
+                return None
+        self._base[key] = tokens if base_tokens is None else base_tokens
+        self._sliding_start[key] = 0
         # the logical rows are the first `tokens` entries of the
         # capacity rows (same pages, same order), so build once and
         # slice instead of walking the pages twice
-        cap = self._page_rows(key, tokens if capacity_tokens is None
-                              else capacity_tokens)
-        self._capacity_rows[key] = cap
-        self._rows[key] = cap[:tokens]
+        self._refresh_rows(key, tokens)
         return pages
 
-    def _page_rows(self, key, tokens):
-        pages = np.asarray(self.accounting.owned[key], dtype=np.int64)
+    def _page_rows(self, arena, key, tokens):
+        pages = np.asarray(arena.owned[key], dtype=np.int64)
         rows = (pages[:, None] * self.page_tokens
                 + np.arange(self.page_tokens, dtype=np.int64))
         return self.torch.from_numpy(rows.reshape(-1)[:tokens])
@@ -246,9 +357,12 @@ class KVArena:
         capacity = len(self.accounting.owned[key]) * self.page_tokens
         cap = self._capacity_rows.get(key)
         if cap is None or cap.numel() != capacity:
-            cap = self._page_rows(key, capacity)
+            cap = self._page_rows(self.accounting, key, capacity)
         self._capacity_rows[key] = cap
         self._rows[key] = cap[:logical]
+        if self.sliding is not None:
+            capacity_s = len(self.sliding.owned[key]) * self.page_tokens
+            self._sliding_rows[key] = self._page_rows(self.sliding, key, capacity_s)
 
     def pin(self, key):
         self.accounting.pin(key)
@@ -258,32 +372,53 @@ class KVArena:
 
         Retention decisions are keyed by (alias, document), so only
         such pairs may be retained; score and temporary keys cannot.
+        A key never rewinds below the base its window was anchored at.
         """
         if not (isinstance(key, tuple) and len(key) == 2):
             raise TypeError(f"retained keys are (alias, document) pairs, "
                             f"got {key!r}")
+        if self.sliding is not None and tokens < self._base[key]:
+            raise ValueError(
+                f"{key!r}: rewinding to {tokens} tokens drops rows of "
+                f"the sliding window anchored at {self._base[key]}")
         self.accounting.rewind(key, tokens)
+        if self.sliding is not None:
+            self.sliding.rewind(key, tokens - self._sliding_start[key])
         self._refresh_rows(key, tokens)
         self.accounting.retain(key, priority)
         cap = self.accounting.retention_cap_pages
-        before = self.accounting.free_pages
+        before = self.free_pages
         if cap is not None:
             self.evict_retained(max(0, self.accounting.retained_pages - cap))
-        return self.accounting.free_pages - before
+        return self.free_pages - before
 
     def evict_retained(self, pages_needed: int) -> tuple:
-        """Evict retained prefixes in planned reuse priority order."""
+        """Evict retained prefixes in planned reuse priority order.
+
+        Stops once pages_needed have come free, counted in every-token
+        pages. Returns the evicted keys.
+        """
+        start = self.free_pages
+        return self._evict_until(
+            lambda: self.free_pages - start >= pages_needed)
+
+    def _evict_until(self, satisfied) -> tuple:
+        """Evict retained prefixes in priority order until satisfied() holds."""
         keys = []
-        pages = 0
-        while pages < pages_needed:
+        while not satisfied():
             victim = self.accounting.pop_retained_victim()
             if victim is None:
                 break
-            key, victim_pages, _ = victim
-            keys.append(key)
-            pages += victim_pages
-            self.evict_key(key)
+            keys.append(victim[0])
+            self.evict_key(victim[0])
         return tuple(keys)
+
+    def _evict_for_pages(self, need, need_sliding):
+        """Evict retained prefixes until both pools have the pages."""
+        self._evict_until(lambda: (
+            self.accounting.free_pages >= need
+            and (self.sliding is None
+                 or self.sliding.free_pages >= need_sliding)))
 
     def evict_key(self, key):
         """Free one retained prefix and record the lost KV."""
@@ -295,38 +430,59 @@ class KVArena:
         self.evicted_prefix_tokens += prefix_tokens
         return pages
 
-    def activate(self, key, tokens: int, capacity_tokens: int | None = None):
-        """Make a prefix active, evicting retained KV when required."""
+    def activate(self, key, tokens: int, capacity_tokens: int | None = None,
+                 base_tokens: int | None = None):
+        """Make a prefix active, evicting retained KV when required.
+
+        base_tokens anchors a fresh key's sliding window; a resident
+        key keeps the base it was given.
+        """
         capacity = tokens if capacity_tokens is None else capacity_tokens
         if key in self.accounting.owned:
             self.accounting.pin(key)
-            current = len(self.accounting.owned[key])
-            need = max(0, self.accounting.pages_needed(capacity) - current)
-            if need > self.accounting.free_pages:
-                self.evict_retained(need - self.accounting.free_pages)
-            grown = self.accounting.grow(key, capacity)
-            if grown is None:
+            need = max(0, self.accounting.pages_needed(capacity)
+                       - len(self.accounting.owned[key]))
+            capacity_s = capacity - self._sliding_start[key]
+            need_s = (max(0, self.sliding.pages_needed(capacity_s)
+                          - len(self.sliding.owned[key]))
+                      if self.sliding is not None else 0)
+            self._evict_for_pages(need, need_s)
+            # neither pool grows unless both can, so a refusal leaves
+            # the key as it was
+            if need > self.accounting.free_pages or (
+                    self.sliding is not None
+                    and need_s > self.sliding.free_pages):
                 return None
+            self.accounting.grow(key, capacity)
+            if self.sliding is not None:
+                self.sliding.grow(key, capacity_s)
             self.accounting.tokens[key] = tokens
+            if self.sliding is not None:
+                self.sliding.tokens[key] = tokens - self._sliding_start[key]
             self._refresh_rows(key, tokens)
             return self.accounting.owned[key]
 
         need = self.accounting.pages_needed(capacity)
-        if need > self.accounting.free_pages:
-            self.evict_retained(need - self.accounting.free_pages)
-        pages = self.alloc(key, tokens, capacity)
+        self._evict_for_pages(need, need)
+        pages = self.alloc(key, tokens, capacity, base_tokens)
         if pages is not None:
             self.accounting.pin(key)
         return pages
 
-    def alloc_temporary(self, tokens: int):
+    def alloc_temporary(self, tokens: int, sliding_tokens: int | None = None):
         key = object()
-        pages = self.alloc(key, tokens)
+        pages = self.alloc(key, tokens, base_tokens=0,
+                           sliding_tokens=sliding_tokens)
         return None if pages is None else (key, pages)
 
     def free_key(self, key):
         self._rows.pop(key)
         self._capacity_rows.pop(key)
+        self._sliding_rows.pop(key, None)
+        self._base.pop(key, None)
+        self._sliding_start.pop(key, None)
+        if self.sliding is not None:
+            self.sliding.free_key(key)
         return self.accounting.free_key(key)
 
     # ---- residency and retention, read by the loop and operators ------
@@ -340,8 +496,44 @@ class KVArena:
         return self.accounting.n_pages
 
     @property
+    def n_sliding_pages(self) -> int:
+        return 0 if self.sliding is None else self.sliding.n_pages
+
+    @property
     def free_pages(self) -> int:
-        return self.accounting.free_pages
+        """Free pages in every-token pages: the tighter pool decides."""
+        free = self.accounting.free_pages
+        if self.sliding is None:
+            return free
+        return min(free, self.sliding.free_pages * self.accounting.n_pages
+                   // self.sliding.n_pages)
+
+    def page_cost(self, tokens: int, base_tokens: int | None = None) -> int:
+        """Pages a key of `tokens` rows takes, in every-token pages.
+
+        base_tokens prices the trimmed key: only the rows from its
+        window origin on sit on the sliding pool. Without it the key is
+        priced untrimmed, as a fresh key is admitted.
+        """
+        pages = self.accounting.pages_needed(tokens)
+        if self.sliding is None:
+            return pages
+        origin = 0 if base_tokens is None else self.origin(base_tokens)
+        pages_s = self.sliding.pages_needed(max(0, tokens - origin))
+        return max(pages, self._as_every_token_pages(pages_s))
+
+    def held_cost(self, key) -> int:
+        """Pages a resident key holds, in every-token pages."""
+        pages = len(self.accounting.owned[key])
+        if self.sliding is None:
+            return pages
+        return max(pages, self._as_every_token_pages(
+            len(self.sliding.owned[key])))
+
+    def _as_every_token_pages(self, sliding_pages: int) -> int:
+        """Sliding pages converted at the pools' size ratio, rounded up."""
+        return -(-sliding_pages * self.accounting.n_pages
+                 // self.sliding.n_pages)
 
     @property
     def retained_pages(self) -> int:
@@ -381,9 +573,17 @@ class KVArena:
         """The page ids a resident key holds, in logical order."""
         return self.accounting.owned[key]
 
+    def owned_sliding_pages(self, key) -> list:
+        """The sliding-pool page ids a resident key holds, in logical order."""
+        return self.sliding.owned[key]
+
     def capacity_rows(self, key):
         """Row index tensor (CPU) over every row in the key's pages."""
         return self._capacity_rows[key]
+
+    def capacity_rows_sliding(self, key):
+        """Row index tensor (CPU) over every row in the key's sliding pages."""
+        return self._sliding_rows[key]
 
     # ---- tensors, read by the attention paths ------------------------
 
@@ -406,8 +606,8 @@ class KVArena:
         table = self.block_table_rows(pages, pad_to=pad_to)
         torch = self.torch
         used = torch.tensor([self.accounting.tokens[k] for k in keys],
-                            dtype=torch.int32, pin_memory=True) \
-            .to(self.device, non_blocking=True)
+                            dtype=torch.int32, pin_memory=self.pinned) \
+            .to(self.device, non_blocking=self.pinned)
         return table, used
 
     def block_table_rows(self, pages, pad_to=None):
@@ -421,6 +621,6 @@ class KVArena:
             flat.extend(p)
             flat.extend([0] * (width - len(p)))
         table = torch.tensor(flat, dtype=torch.int32,
-                             pin_memory=True).view(len(pages), width) \
-            .to(self.device, non_blocking=True)
+                             pin_memory=self.pinned).view(len(pages), width) \
+            .to(self.device, non_blocking=self.pinned)
         return table

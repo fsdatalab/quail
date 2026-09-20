@@ -182,3 +182,18 @@ def test_prepared_boot_is_handed_to_the_query_and_used_once(
     assert second.metrics["boot_kind"] == "warm"
     assert len(boots) == 2
     assert runtime_state[("quail", "qwen3-4b-fp8")] is gpu
+
+
+def test_bind_query_resizes_the_arena_to_the_plan_split(booted):
+    calls = booted
+    backend = FakeBackend(calls)
+    registry = built_in_registry()
+    context = worker._single_gpu_context(registry, {
+        "workers": 1, "model": "qwen3-4b-fp8", "device": "h100-sxm",
+    })
+    gpu, _ = worker._boot_for_query({}, backend, context, 8192, [1], [2])
+    resized = []
+    gpu.arena = SimpleNamespace(
+        resize=lambda *pages, **kw: resized.append((pages, kw)))
+    gpu.bind_query([1], [2], 4096, arena_pages=(8, 2))
+    assert resized == [((8, 2), {"free_resident": True})]

@@ -16,6 +16,7 @@ import quail
 from quail.backends.quail import QuailModelExecution
 from quail.backends.quail.executor import loop
 from quail.backends.quail.executor.arena import KVArena, PageArena
+from quail.backends.quail.executor.models.base import ModelPipeline
 from quail.backends.quail.graph import execute_single_graph
 from quail.builtins import built_in_registry
 from quail.physical import (
@@ -39,19 +40,63 @@ FRAME = 4000
 SETTINGS = {"filter_limit": None, "pre_ids": [], "retention": {}}
 
 
-def cpu_arena(pages):
-    arena = KVArena.__new__(KVArena)
+def bare_arena(arena, pages):
+    """Give a tensor-free KVArena the accounting of a single-pool arena."""
     arena.accounting = PageArena(pages, 16)
+    arena.sliding = None
+    arena.window = 0
+    arena.sliding_layers = frozenset()
+    arena.pinned = False
     arena._rows = {}
     arena._capacity_rows = {}
+    arena._sliding_rows = {}
+    arena._base = {}
+    arena._sliding_start = {}
     arena._refresh_rows = lambda *args: None
     arena.reset_stats()
+    return arena
 
-    def allocate(key, tokens, capacity_tokens=None):
+
+def cpu_staging(monkeypatch):
+    """Stage packed chunks as plain CPU tensors; returns torch."""
+    import numpy as np
+    import torch
+
+    def staged(torch_, data, dtype, pinned=True):
+        if isinstance(data, np.ndarray) or torch.is_tensor(data):
+            return torch.as_tensor(data, dtype=dtype)
+        return torch.tensor(data, dtype=dtype)
+
+    def token_parts(torch_, sequences, total, pinned=True, staging=None):
+        ids = [int(t) for seq in sequences for part in loop._token_parts(seq)
+               for t in part]
+        assert len(ids) == total
+        return torch.tensor(ids, dtype=torch.int64)
+
+    monkeypatch.setattr(loop, "_staged", staged)
+    monkeypatch.setattr(loop, "_staged_token_parts", token_parts)
+    return torch
+
+
+def fake_pipeline(**attributes):
+    """A ModelPipeline with the contract's defaults and the given overrides."""
+    pipeline = ModelPipeline()
+    for name, value in attributes.items():
+        setattr(pipeline, name, value)
+    return pipeline
+
+
+def cpu_arena(pages):
+    arena = bare_arena(KVArena.__new__(KVArena), pages)
+
+    def allocate(key, tokens, capacity_tokens=None, base_tokens=None,
+                 sliding_tokens=None):
         got = arena.accounting.alloc(key, tokens, capacity_tokens)
         if got is not None:
             arena._rows[key] = None
             arena._capacity_rows[key] = None
+            arena._base[key] = tokens if base_tokens is None else base_tokens
+            arena._sliding_start[key] = 0
         return got
 
     arena.alloc = allocate
@@ -103,7 +148,8 @@ def fake_pack(torch, arena, specs, **kw):
         (len(spec["prefix"]) if spec["prefix"] is not None else 0)
         + sum(len(suffix) for suffix in spec["suffixes"])
         for spec in specs)
-    return SimpleNamespace(specs=specs, tokens=tokens, temporary_keys=())
+    return SimpleNamespace(specs=specs, tokens=tokens, temporary_keys=(),
+                           fresh_keys=())
 
 
 def expected_filter_rows(filter_truth):
@@ -121,7 +167,7 @@ def run_streamed(monkeypatch, *, doc_lengths, filter_truth, partner_lengths,
     """Drive a filter chain streamed into a join on a CPU arena."""
     monkeypatch.setattr(loop, "pack_chunk", fake_pack)
     model = FakeModel(filter_truth, join_truth)
-    pipeline = SimpleNamespace(is_fp8=True, forward_chunk=model.forward_chunk)
+    pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
     answers = SimpleNamespace(submit=lambda v: v, result=lambda v: v,
                               dtype=None)
     arena = cpu_arena(pages)
@@ -247,7 +293,7 @@ def run_graph_on_arena(monkeypatch, graph, *, n_docs=14, n_partners=4,
     model = FakeModel(filter_truth, join_truth)
     torch = fake_torch()
     arena = cpu_arena(pages)
-    pipeline = SimpleNamespace(is_fp8=True, forward_chunk=model.forward_chunk)
+    pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
     execution = QuailModelExecution(SimpleNamespace())
     execution.bind_loaded_model(model=object(), arena=arena,
                                 pipeline=pipeline)

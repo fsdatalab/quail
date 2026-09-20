@@ -5,12 +5,18 @@ from __future__ import annotations
 import itertools
 import time
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Mapping
 
 import pyarrow as pa
 
 from quail.backends.base import GpuContext
-from quail.backends.request_scheduling import run_join_grouped, true_bit
+from quail.backends.request_scheduling import (
+    canvas_answer,
+    run_join_grouped,
+    text_answer,
+    true_bit,
+)
 from quail.cost import budgets
 from quail.execution.pairs import (
     allowed_members,
@@ -30,10 +36,10 @@ from quail.execution.runner import (
 )
 from quail.execution.types import PhysicalResponse, export_physical_outputs
 from quail.logical import (
-    SHARED_PRE,
     Apply,
     effective_selectivity,
     join_outer_input,
+    shared_preamble,
 )
 from quail.physical import (
     Limit,
@@ -128,13 +134,13 @@ def plan_request_backend(
 
     rule = context.order or default_order_rule(filters, joins)[0]
     chunk_tokens = budgets.chunk_budget(context.model, context.device)
-    shared_preamble = preamble_tokens(filters, joins)
+    preamble_count = preamble_tokens(filters, joins)
     filter_orders = {
         alias: order_filters_indexed(
             predicates,
             rule,
             prefix_tokens=(
-                shared_preamble + stats[alias].mean_doc_tokens
+                preamble_count + stats[alias].mean_doc_tokens
             ),
             model=context.model,
             device=context.device,
@@ -157,7 +163,7 @@ def plan_request_backend(
             for alias, lengths in context.document_tokens.items()
         },
         {},
-        shared_preamble,
+        preamble_count,
         chunk_tokens,
         context.model,
         context.device,
@@ -231,7 +237,8 @@ def plan_request_backend(
         raise ValueError("request prompts have different preambles")
     preamble = next(iter(preambles), ())
     if not preamble and prompts and context.tokenizer is not None:
-        preamble = tuple(context.tokenizer(SHARED_PRE))
+        preamble = tuple(context.tokenizer(
+            shared_preamble(context.model.turn_prefix)))
 
     request_node = RequestExecution(
         node_id="request-model",
@@ -374,7 +381,7 @@ def _token_list(values) -> list[int]:
 
 
 def _operator_at_a_time_filter(client, sampling_params, bodies, questions,
-                               true_ids):
+                               read_answer):
     active = list(range(len(bodies)))
     answers = {}
     requests = prompt_tokens = cached_tokens = 0
@@ -392,7 +399,7 @@ def _operator_at_a_time_filter(client, sampling_params, bodies, questions,
         )
         next_active = []
         for document, output in zip(evaluated, outputs):
-            answer = bool(true_bit(output, true_ids))
+            answer = bool(read_answer(output))
             answers[(document, stage_index)] = answer
             requests += 1
             prompt_tokens += len(output.prompt_token_ids)
@@ -418,7 +425,7 @@ def _operator_at_a_time_filter(client, sampling_params, bodies, questions,
     }
 
 
-def _pipelined_filter(client, sampling_params, bodies, questions, true_ids,
+def _pipelined_filter(client, sampling_params, bodies, questions, read_answer,
                       tag):
     if not bodies:
         return {
@@ -436,7 +443,7 @@ def _pipelined_filter(client, sampling_params, bodies, questions, true_ids,
         sampling_params,
         bodies,
         [list(question) for question in questions],
-        true_ids,
+        read_answer,
         tag=tag,
     )
     stages = []
@@ -478,7 +485,15 @@ class RequestModelExecution:
         self.sampling_params = settings["sampling_params"]
         self.documents = settings["documents"]
         self.pairs = {}         # written position -> pair table, from ports
-        self.true_ids = set(settings["true_ids"])
+        true_ids = set(settings["true_ids"])
+        if context.model.canvas_tokens == 1:
+            self.read_answer = partial(
+                canvas_answer, true_ids=true_ids,
+                false_ids=set(settings["false_ids"]))
+        elif context.model.canvas_tokens:
+            self.read_answer = text_answer
+        else:
+            self.read_answer = partial(true_bit, true_ids=true_ids)
         self.capacity = settings["capacity"]
         self.filter_submission = settings["filter_submission"]
         self.join_submission = settings["join_submission"]
@@ -533,7 +548,7 @@ class RequestModelExecution:
                     self.sampling_params,
                     bodies,
                     spec.question_token_ids,
-                    self.true_ids,
+                    self.read_answer,
                 )
             elif self.filter_submission == "pipelined":
                 result = _pipelined_filter(
@@ -541,7 +556,7 @@ class RequestModelExecution:
                     self.sampling_params,
                     bodies,
                     spec.question_token_ids,
-                    self.true_ids,
+                    self.read_answer,
                     f"filter-{filter_index}-{spec.alias}",
                 )
             else:
@@ -639,7 +654,7 @@ class RequestModelExecution:
                     self.sampling_params,
                     prefixes,
                     suffixes,
-                    self.true_ids,
+                    self.read_answer,
                     submission=submission,
                     pairs=request_pairs,
                 )
@@ -866,7 +881,7 @@ class RequestBackend:
             allowed_ids = sorted(set(
                 envelope["settings"]["true_ids"]
             ) | set(envelope["settings"]["false_ids"]))
-            engine_state, boot = self.engine.boot(model.hf_name, allowed_ids)
+            engine_state, boot = self.engine.boot(model, allowed_ids)
             context.runtime_state[state_key] = engine_state
         else:
             boot = _warm_boot()

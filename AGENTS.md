@@ -75,8 +75,9 @@ CI runs these on every pull request. Run them before pushing:
 
 # Scope
 
-The current runtime supports filter queries only, Qwen3 4B fp8 or
-Qwen3 32B fp8, and one H100 per model copy. It does not use
+The current runtime supports filter and join queries on Qwen3 4B fp8,
+Qwen3 32B fp8, or DiffusionGemma 26B-A4B fp8, and one H100 per model
+copy. It does not use
 tensor-parallel weight sharding. `AI.CLASSIFY`, `AI.EXTRACT`, and
 `AI.MAP` are on the roadmap. Open-ended generation, speculation, and
 forking are not part of the current runtime.
@@ -112,11 +113,14 @@ forking are not part of the current runtime.
   result.
 - Report query time, throughput, and GPU cost for every benchmark
   query. Use the following definitions consistently:
-  - For a filter-only query, `documents/second` is the number of input
-    document rows divided by query runtime in seconds.
-  - For a query with joins, `document pairs/second` is the number of
-    evaluated document pairs, summed across all join stages, divided
-    by query runtime in seconds.
+  - Throughput is `tokens/second`: the total requested input tokens
+    divided by query runtime in seconds. Requested input tokens are
+    the full lengths of every prompt the query evaluated, summed,
+    counting a prompt's shared prefix every time whether or not its
+    KV was reused. quail-b reports it as `input_tokens_per_second`.
+    Do not report documents per second or document pairs per second
+    as throughput; give input document counts and evaluated pair
+    counts as plain counts beside the query.
   - `$/query` is query runtime in hours multiplied by the number of
     GPUs and the H100! hourly price. Use
     `quail.specs.H100_USD_PER_HOUR`, which is currently

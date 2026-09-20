@@ -573,7 +573,7 @@ def stock_kernels(model: str = "qwen3-4b-fp8",
 
     d = build_sets(DATA_DIR, 0.1)
     bodies = pq.read_table(f"{d}/reviews.parquet")["body"].to_pylist()
-    prompt = bind_prompt(F1, ("body",), tok)
+    prompt = bind_prompt(F1, ("body",), tok, turn=spec.turn)
     prompts = [dict(prompt_token_ids=render_filter_prompt_ids(
         prompt, tok(b), tok)) for b in bodies[:n_docs]]
 
