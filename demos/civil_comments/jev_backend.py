@@ -68,6 +68,8 @@ JOIN_QUESTIONS = {
     for field, spec in FIELDS.items()
 }
 
+COMBINED_QUESTIONS = {**FILTER_QUESTIONS, **JOIN_QUESTIONS}
+
 
 def read_answers(path: Path) -> dict[str, dict]:
     """Read completed responses from a checkpoint."""
@@ -251,36 +253,23 @@ async def evaluate(
 
     all_comments = list(zip(ids, texts))
     if plan_order == "sql":
+        filter_ids = set(ids)
         join_ids = set(ids)
-        join_rows, join_s = await run_pass(
-            "join",
+        combined_rows, query_s = await run_pass(
+            "combined",
             [
                 (comment_id, {"DOCUMENT 0": text})
                 for comment_id, text in all_comments
             ],
-            JOIN_QUESTIONS,
-            output / "join.jsonl",
+            COMBINED_QUESTIONS,
+            output / "combined.jsonl",
             concurrency,
         )
-        filter_ids = {
-            comment_id
-            for comment_id, row in join_rows.items()
-            if any(
-                probability >= LABEL_CUTOFF
-                for probability in row["answers"].values()
-            )
-        }
-        filter_rows, filter_s = await run_pass(
-            "filter",
-            [
-                (comment_id, text)
-                for comment_id, text in all_comments
-                if comment_id in filter_ids
-            ],
-            FILTER_QUESTIONS,
-            output / "filter.jsonl",
-            concurrency,
-        )
+        filter_rows = combined_rows
+        join_rows = combined_rows
+        filter_s = None
+        join_s = None
+        api_rows = combined_rows.values()
     else:
         filter_ids = set(ids)
         filter_rows, filter_s = await run_pass(
@@ -306,24 +295,22 @@ async def evaluate(
             output / "join.jsonl",
             concurrency,
         )
+        query_s = filter_s + join_s
+        api_rows = [*filter_rows.values(), *join_rows.values()]
     toxic_found = {
         comment_id
         for comment_id, row in filter_rows.items()
         if row["answers"]["toxicity"] >= LABEL_CUTOFF
     }
-    query_s = filter_s + join_s
     pairs_found = {
         (comment_id, field)
         for comment_id, row in join_rows.items()
         if comment_id in toxic_found
         for field, probability in row["answers"].items()
-        if probability >= LABEL_CUTOFF
+        if field in FIELDS and probability >= LABEL_CUTOFF
     }
     accuracy = accuracy_summary(comments, toxic_found, pairs_found)
-    api_input_tokens = sum(
-        row["input_tokens"]
-        for row in [*filter_rows.values(), *join_rows.values()]
-    )
+    api_input_tokens = sum(row["input_tokens"] for row in api_rows)
     logical_input_tokens = requested_input_tokens(
         comments,
         filter_ids=filter_ids,
@@ -338,6 +325,9 @@ async def evaluate(
         "wall_s": query_s,
         "filter_wall_s": filter_s,
         "join_wall_s": join_s,
+        "questions_per_combined_request": (
+            len(COMBINED_QUESTIONS) if plan_order == "sql" else None
+        ),
         "input_tokens": logical_input_tokens,
         "input_tokens_per_second": logical_input_tokens / query_s,
         "api_input_tokens": api_input_tokens,
