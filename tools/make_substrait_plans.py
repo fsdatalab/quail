@@ -24,6 +24,7 @@ from quail_b.prompts import (
     AGENT_IMPLEMENTED_FIX,
     AGENT_RECOVERED,
     ASPECT_SENTIMENT,
+    CARDIOVASCULAR_REACTION,
     DISCUSS_ASPECT,
     F1,
     F4,
@@ -35,6 +36,7 @@ from quail_b.prompts import (
     LEP2,
     LEPJOIN,
     LEPS1,
+    NEUROLOGICAL_REACTION,
     P_LOC,
     P_MSG,
     REACTION,
@@ -340,8 +342,8 @@ def _reports():
     return Scan("reports", "r", "report")
 
 
-def _terms():
-    return Scan("terms", "m", "term")
+def _terms(alias="m"):
+    return Scan("terms", alias, "term")
 
 
 def _claims(alias="c", *columns):
@@ -422,6 +424,13 @@ QUERIES = (
     Query("BIO-3", "serious adverse event -> reaction join",
           Join(_filters(_reports(), SERIOUS_ADVERSE_EVENT), _terms(),
                ("r", "m"), REACTION)),
+    Query("BIO-4", "3F + 2J: serious reports with neurological and "
+          "cardiovascular reactions",
+          Join(Join(_filters(_reports(), SERIOUS_ADVERSE_EVENT),
+                    _filters(_terms("n"), NEUROLOGICAL_REACTION),
+                    ("r", "n"), REACTION),
+               _filters(_terms("c"), CARDIOVASCULAR_REACTION),
+               ("r", "c"), REACTION)),
 
     Query("FEV-1", "filter: F11 (about a person)", _filters(_claims(), F11)),
     Query("FEV-2", "join: J3 (claims x evidence)",

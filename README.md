@@ -105,7 +105,7 @@ import quail_b
 
 quail_b.run(
     run_query,
-    queries=["IMDB-4"],  # Omit to run all 30 queries
+    queries=["IMDB-4"],  # Omit to run all 31 queries
     scale_factor=0.1,
     output_dir="results/my-run",  # Set your desired output directory path
     metadata={"engine": "my-engine", "model": "Qwen/Qwen3-4B-FP8"},
@@ -134,12 +134,12 @@ reviews = quail_b.load_table("reviews", scale_factor=0.1)
 
 ## Queries
 
-The benchmark evaluates 30 queries across 5 datasets:
+The benchmark defines 31 queries across 5 datasets:
 
 | Dataset | Queries | Relations | Description |
 | --- | ---: | --- | --- |
 | IMDB | 10 | `reviews`, `aspects` | Movie review aspect extraction and sentiment analysis |
-| BioDEX | 3 | `reports`, `terms` | Adverse drug reaction reporting from medical papers |
+| BioDEX | 4 | `reports`, `terms` | Adverse drug reaction reporting from medical papers |
 | FEVER | 10 | `claims`, `evidence` | Fact verification with two-sided selections and join chains |
 | LePaRD | 5 | `citation_contexts`, `citation_passages` | Legal precedent retrieval and citation matching |
 | SWE-Next | 2 | `agent_traces` | Software engineering agent trajectory evaluation |
@@ -153,13 +153,31 @@ results remain historical and must not be presented as raw-prompt results.
 
 BIO-1 selects reports describing a serious or life-threatening adverse event.
 BIO-3 applies that filter before joining reports to reaction terms.
+BIO-4 finds serious reports with both neurological and cardiovascular reactions.
+It filters the reports and two aliases of the reaction terms, then joins each
+term alias to the same report. Its output is `(r.id, n.id, c.id)`, with one row
+per matching reaction pair. A term may belong to both categories.
+
+BIO-4 has Qwen3 32B fp8 reference labels for both term filters at all three
+scale factors. The labels reuse the existing report and reaction-join answers
+after checking their corpus and prompt identities. At sf=0.1, 505 of 1,127
+terms pass the neurological filter and 394 pass the cardiovascular filter.
+Those fractions are fixed planner estimates at every scale factor.
+The public collections below include both filters. BIO-4 loads the matching
+collection automatically when accuracy scoring is enabled.
+
+| Scale factor | Reference collection |
+|---|---|
+| 0.1 | `gt_cd3ebdb784f64b9e028e50ea73cdedd0` |
+| 0.5 | `gt_68f9ce9439bd7615de92b33d576dff9e` |
+| 1.0 | `gt_e87691add604b02c4e43f0ff5bf0cc4f` |
 
 Queries use two LLM-powered relational operators:
 
 - `ai_filter(prompt, document) -> boolean` (selection)
 - `ai_join(prompt, left, right) -> boolean` (join)
 
-All 30 queries are stored as standard Substrait 0.103 ProtoJSON plans in [`quail_b/plans/`](quail_b/plans/). Custom AI functions are declared in [`quail_b/substrait_extensions.yaml`](quail_b/substrait_extensions.yaml). [All 30 plans](figures/quailb_anatomy.pdf) are diagrammed in one figure.
+All 31 queries are stored as standard Substrait 0.103 ProtoJSON plans in [`quail_b/plans/`](quail_b/plans/). Custom AI functions are declared in [`quail_b/substrait_extensions.yaml`](quail_b/substrait_extensions.yaml). [All 31 plans](figures/quailb_anatomy.pdf) are diagrammed in one figure.
 
 ### Example Query: IMDB-4
 
@@ -194,7 +212,7 @@ across questions.
 
 QUAIL-B defines three scale factors: `0.1`, `0.5`, and `1.0`. They correspond to 10%, 50%, and 100% of each dataset's sampling target.
 
-A scale factor changes the input table cardinalities and reference labels. It does not change the 30 query definitions.
+A scale factor changes the input table cardinalities and reference labels. It does not change the 31 query definitions.
 
 | Dataset | Relation | 0.1 | 0.5 | 1.0 |
 | --- | --- | ---: | ---: | ---: |

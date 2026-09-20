@@ -65,6 +65,11 @@
     "privacy": false
   },
   {
+    "id": "BIO-4",
+    "description": "3F + 2J: serious reports with neurological and cardiovascular reactions",
+    "privacy": false
+  },
+  {
     "id": "FEV-1",
     "description": "filter: F11 (about a person)",
     "privacy": false

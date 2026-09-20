@@ -19,7 +19,7 @@ def _spec(key):
 
 
 def test_stable_ids_cover_predicate_semantics_and_inputs():
-    assert len(PREDICATES) == 21
+    assert len(PREDICATES) == 23
     assert len({spec.key for spec in PREDICATES}) == len(PREDICATES)
     original = PREDICATES[0]
 

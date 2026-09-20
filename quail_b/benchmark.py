@@ -96,6 +96,15 @@ def load_benchmark(only=None, *, scale_factor=0.1, data_dir=None,
             raise ValueError("ground truth has the wrong collection ID")
         if truth.corpus_id != corpus_id or truth.scale_factor != scale_factor:
             raise ValueError("ground truth does not match the input corpus")
+        for spec in specs:
+            for operator in spec._info.operators:
+                try:
+                    truth.key_for_template(operator.prompt)
+                except KeyError as error:
+                    raise ValueError(
+                        f"{spec.id} has no reference labels for {operator.id}; "
+                        "provide a complete collection or set accuracy=False"
+                    ) from error
         for key, labels in truth.predicates.items():
             predicate = PREDICATE_BY_KEY.get(key)
             if (predicate is not None and "qwen3_32b" in predicate.source_policy

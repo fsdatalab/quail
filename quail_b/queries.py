@@ -15,6 +15,7 @@ from quail_b.prompts import (
     AGENT_IMPLEMENTED_FIX,
     AGENT_RECOVERED,
     ASPECT_SENTIMENT,
+    CARDIOVASCULAR_REACTION,
     DISCUSS_ASPECT,
     F1,
     F4,
@@ -29,6 +30,7 @@ from quail_b.prompts import (
     LEP5,
     LEPJOIN,
     LEPS1,
+    NEUROLOGICAL_REACTION,
     REACTION,
     REFUTE,
     SERIOUS_ADVERSE_EVENT,
@@ -47,6 +49,9 @@ FILTER_SELECTIVITY_ESTIMATES = {
     F5: 2853 / 5000,
     # Same reports, saved label set ls_5627a6d5416349ee3e418c41594bc3a3.
     SERIOUS_ADVERSE_EVENT: 319 / 500,
+    # BIO-4 labels: gt_cd3ebdb784f64b9e028e50ea73cdedd0.
+    NEUROLOGICAL_REACTION: 505 / 1127,
+    CARDIOVASCULAR_REACTION: 394 / 1127,
     AGENT_RECOVERED: 570 / 1772,
     AGENT_IMPLEMENTED_FIX: 537 / 1772,
     F11: 296 / 500,

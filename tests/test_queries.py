@@ -6,7 +6,12 @@ from importlib.resources import files
 import pytest
 from substrait import plan_pb2
 
-from quail_b.prompts import SERIOUS_ADVERSE_EVENT
+from quail_b.prompts import (
+    CARDIOVASCULAR_REACTION,
+    NEUROLOGICAL_REACTION,
+    REACTION,
+    SERIOUS_ADVERSE_EVENT,
+)
 from quail_b.queries import (
     FILTER_SELECTIVITY_ESTIMATES,
     JOIN_SELECTIVITY_ESTIMATES,
@@ -31,11 +36,11 @@ from quail_b.substrait import (
 from tools.make_substrait_plans import write_plans
 
 
-def test_catalog_has_the_30_default_queries_and_two_privacy_queries():
-    assert len(QUERIES) == 30
+def test_catalog_has_the_31_default_queries_and_two_privacy_queries():
+    assert len(QUERIES) == 31
     assert QUERY_ORDER == (
         *(f"IMDB-{i}" for i in range(1, 11)),
-        *(f"BIO-{i}" for i in range(1, 4)),
+        *(f"BIO-{i}" for i in range(1, 5)),
         *(f"FEV-{i}" for i in range(1, 11)),
         *(f"LEP-{i}" for i in range(1, 6)),
         "AGENT-1", "AGENT-2",
@@ -76,6 +81,25 @@ def test_biodex_filters_match_the_replacement_reference(query_id):
         ("filter-1", "r", SERIOUS_ADVERSE_EVENT),
     ]
     assert len(info.joins) == (1 if query_id == "BIO-3" else 0)
+
+
+def test_bio_4_filters_each_input_and_reuses_the_report_in_both_joins():
+    info = _inspect_plan(queries()["BIO-4"].plan)
+    assert [(op.relation, op.prompt) for op in info.filters] == [
+        ("r", SERIOUS_ADVERSE_EVENT),
+        ("n", NEUROLOGICAL_REACTION),
+        ("c", CARDIOVASCULAR_REACTION),
+    ]
+    assert [(op.relations, op.prompt) for op in info.joins] == [
+        (("r", "n"), REACTION),
+        (("r", "c"), REACTION),
+    ]
+    assert [(op.alias, op.table) for op in info.relations] == [
+        ("r", "reports"), ("n", "terms"), ("c", "terms"),
+    ]
+    assert info.select == ("r.id", "n.id", "c.id")
+    assert FILTER_SELECTIVITY_ESTIMATES[NEUROLOGICAL_REACTION] == 505 / 1127
+    assert FILTER_SELECTIVITY_ESTIMATES[CARDIOVASCULAR_REACTION] == 394 / 1127
 
 
 def test_filters_are_substrait_relations_over_their_input():
@@ -208,7 +232,7 @@ def test_substrait_plans_are_packaged():
     catalog = package.joinpath("plans", "catalog.json")
     entries = json.loads(catalog.read_text())
 
-    assert len(entries) == 32
+    assert len(entries) == 33
     assert all(
         package.joinpath("plans", f"{entry['id']}.json").is_file()
         for entry in entries
@@ -231,8 +255,8 @@ def test_parallel_query_split_matches_stock_vllm():
     assert split_query_ids(QUERY_ORDER, 4) == (
         QUERY_ORDER[0:8],
         QUERY_ORDER[8:16],
-        QUERY_ORDER[16:23],
-        QUERY_ORDER[23:30],
+        QUERY_ORDER[16:24],
+        QUERY_ORDER[24:31],
     )
 
 
@@ -246,10 +270,10 @@ def test_query_family_split_matches_benchmark_catalog():
     }
     assert split_query_families(QUERY_ORDER) == (
         QUERY_ORDER[0:10],
-        QUERY_ORDER[10:13],
-        QUERY_ORDER[13:23],
-        QUERY_ORDER[23:28],
-        QUERY_ORDER[28:30],
+        QUERY_ORDER[10:14],
+        QUERY_ORDER[14:24],
+        QUERY_ORDER[24:29],
+        QUERY_ORDER[29:31],
     )
     assert query_family_name(QUERY_ORDER[0:10]) == "imdb"
 

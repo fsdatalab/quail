@@ -1,4 +1,4 @@
-"""The 21 QUAIL-B predicates and the identity of their reference labels.
+"""The QUAIL-B predicates and the identity of their reference labels.
 
 A predicate is one TRUE or FALSE question over one table column
 (filter) or two (join). Its version hashes everything that can change
@@ -71,6 +71,14 @@ PREDICATES = (
         "quailb.biodex.report.experienced_reaction", "biodex",
         "report_experienced_reaction", "join", prompts.REACTION,
         "report", "reports", "report", "reaction", "terms", "term"),
+    PredicateSpec(
+        "quailb.biodex.reaction.is_neurological", "biodex",
+        "reaction_is_neurological", "filter", prompts.NEUROLOGICAL_REACTION,
+        "reaction", "terms", "term"),
+    PredicateSpec(
+        "quailb.biodex.reaction.is_cardiovascular", "biodex",
+        "reaction_is_cardiovascular", "filter", prompts.CARDIOVASCULAR_REACTION,
+        "reaction", "terms", "term"),
     PredicateSpec(
         "quailb.fever.claim.about_person", "fever",
         "claim_about_person", "filter", prompts.F11,

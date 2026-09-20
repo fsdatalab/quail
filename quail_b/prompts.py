@@ -40,6 +40,14 @@ REACTION = ("Does the medical report in DOCUMENT {0} describe the "
             "reaction in DOCUMENT {1} as something the patient "
             "experienced?")
 
+NEUROLOGICAL_REACTION = (
+    "Is this reaction neurological, affecting the nervous system? {0}"
+)
+
+CARDIOVASCULAR_REACTION = (
+    "Is this reaction cardiovascular, affecting the heart or blood vessels? {0}"
+)
+
 AGENT_RECOVERED = (
     "Judge strictly from the agent trace above whether the agent recovered "
     "after pursuing an approach that did not work. Recovery means the agent "

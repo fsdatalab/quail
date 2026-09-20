@@ -167,3 +167,51 @@ def test_prompt_format_selects_its_own_active_collection(tmp_path):
         _, manifest = _choose_collection(
             tmp_path, 0.1, "c_test", explicit, prompt_format)
         assert manifest["collection_id"] == expected
+
+
+def test_bio_4_requires_category_labels_before_a_run(monkeypatch, tmp_path):
+    from quail_b import benchmark as loading
+    from quail_b.data import DATA_SEED, SOURCE_REVISIONS, corpus_identity
+    from quail_b.labels import GroundTruthCollection, PredicateLabels
+    from quail_b.predicates import PREDICATES, predicate_payload
+
+    tables = {
+        "reports": pa.table({
+            "id": ["r0"], "report": ["a serious event"], "reactions": [["seizure"]],
+        }),
+        "terms": pa.table({"id": ["t0"], "term": ["seizure"]}),
+    }
+    corpus_id = PUBLISHED_CORPORA[0.1]
+    directory = tmp_path / GROUND_TRUTH_ROOT / "corpora" / corpus_id
+    directory.mkdir(parents=True)
+    manifest = corpus_identity(tables, 0.1, DATA_SEED, SOURCE_REVISIONS)
+    manifest["corpus_id"] = corpus_id
+    (directory / "manifest.json").write_text(json.dumps(manifest))
+    for name, table in tables.items():
+        pq.write_table(table, directory / f"{name}.parquet")
+
+    def collection(include_categories):
+        predicates = {}
+        for spec in PREDICATES:
+            if spec.workload != "biodex":
+                continue
+            if not include_categories and spec.left_table == "terms":
+                continue
+            left = "r0" if spec.left_table == "reports" else "t0"
+            right = "t0" if spec.kind == "join" else None
+            payload = predicate_payload(spec)
+            predicates[spec.key] = PredicateLabels(
+                spec.key, f"ls_{spec.slug}", payload, {(left, right): True}, {},
+                predicate_payload=payload)
+        return GroundTruthCollection(
+            "gt_bio4", corpus_id, 0.1, "qwen3-32b-fp8", predicates)
+
+    truth = collection(False)
+    monkeypatch.setattr(loading, "load_ground_truth", lambda *a, **kw: truth)
+    assert loading.load_benchmark("BIO-3", root=tmp_path).ground_truth is truth
+    with pytest.raises(ValueError, match="BIO-4 has no reference labels"):
+        loading.load_benchmark("BIO-4", root=tmp_path)
+    assert loading.load_benchmark(
+        "BIO-4", root=tmp_path, accuracy=False).ground_truth is None
+    truth = collection(True)
+    assert loading.load_benchmark("BIO-4", root=tmp_path).ground_truth is truth

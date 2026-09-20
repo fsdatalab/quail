@@ -14,6 +14,7 @@ from quail_b.labels import (
     _validate_label_set_corpora,
     load_ground_truth,
 )
+from quail_b.predicates import PREDICATES, predicate_payload
 from quail_b.queries import QuerySpec, queries
 from quail_b.scoring import (
     RunOutput,
@@ -22,6 +23,50 @@ from quail_b.scoring import (
     rows_from_answers,
 )
 from tools.make_substrait_plans import Filter, Join, Scan, build_plan
+
+
+def test_bio_4_scores_both_term_aliases_with_shared_reaction_labels():
+    spec = queries()["BIO-4"]
+    corpus = {
+        "reports": pa.table({"id": ["r0", "r1", "r2"]}),
+        "terms": pa.table({"id": ["t0", "t1", "t2", "t3"]}),
+    }
+    positive_filters = {
+        "report_describes_serious_adverse_event": {"r0", "r1"},
+        "reaction_is_neurological": {"t0", "t2"},
+        "reaction_is_cardiovascular": {"t1", "t2"},
+    }
+    predicates = {}
+    for predicate in PREDICATES:
+        if predicate.workload != "biodex":
+            continue
+        if predicate.kind == "filter":
+            answers = {
+                (row_id, None): row_id in positive_filters[predicate.slug]
+                for row_id in corpus[predicate.left_table]["id"].to_pylist()
+            }
+        else:
+            answers = {
+                (report, term): term != "t3" and (report != "r1" or term == "t0")
+                for report in corpus["reports"]["id"].to_pylist()
+                for term in corpus["terms"]["id"].to_pylist()
+            }
+        predicates[predicate.key] = PredicateLabels(
+            predicate.key, f"ls_{predicate.slug}", predicate_payload(predicate),
+            answers, {},
+        )
+    truth = GroundTruthCollection(
+        "gt_bio4", "c_bio4", 0.1, "qwen3-32b-fp8", predicates)
+    expected = expected_rows(spec, truth, corpus)
+    assert _tuples(expected, ["r", "n", "c"]) == {
+        ("r0", "t0", "t1"), ("r0", "t0", "t2"),
+        ("r0", "t2", "t1"), ("r0", "t2", "t2"),
+    }
+    scored = evaluate(spec, RunOutput(None, None, expected), truth, corpus)
+    assert scored["output_accuracy"]["precision"] == 1.0
+    assert scored["output_accuracy"]["recall"] == 1.0
+    assert scored["input_document_rows"] == 11
+    assert scored["unique_input_documents"] == 7
 
 
 def _spec(query_id, description, tree):
