@@ -38,8 +38,6 @@ from quail.bench.images import gpu_image
 
 MODEL = "diffusion-gemma-26b-a4b-fp8"
 DEVICE = "h100-sxm"
-FILTER_SELECTIVITY = 0.113
-JOIN_SELECTIVITY = 0.067
 
 app = modal.App("quail-milestone1")
 results_volume = modal.Volume.from_name("quail-results", create_if_missing=True)
@@ -54,10 +52,8 @@ def build_sql() -> str:
     SELECT c.comment_id, f.field
     FROM comments c
     JOIN fields f
-      ON AI_FILTER(PROMPT('{JOIN_PROMPT}', c.text, f.statement),
-                   {{'selectivity': {JOIN_SELECTIVITY}}})
-    WHERE AI_FILTER(PROMPT('{FILTER_PROMPT}', c.text),
-                    {{'selectivity': {FILTER_SELECTIVITY}}})
+      ON AI_FILTER(PROMPT('{JOIN_PROMPT}', c.text, f.statement))
+    WHERE AI_FILTER(PROMPT('{FILTER_PROMPT}', c.text))
 """
 
 
