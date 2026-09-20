@@ -53,8 +53,7 @@ DIFFUSION_GEMMA_26B_FP8 = ModelSpec(
     image_soft_id=258_880,
     image_end_id=258_882,
     # Eight letter pages at budget 280 took 1.44 GB above the loaded
-    # weights through vLLM's encoder path, whose one-hot position
-    # embedding needs about 0.8 GB per image in flight; 4 GiB lets it
-    # batch a few pages (pdf_probe_vision.json, peak_bytes).
+    # weights through vLLM's encoder path (pdf_probe_vision.json,
+    # peak_bytes); 4 GiB covers a chunk's pages at the largest budget.
     image_reserve_bytes=4 * 2**30,
 )

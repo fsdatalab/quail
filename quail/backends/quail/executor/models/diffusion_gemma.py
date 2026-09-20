@@ -3,12 +3,19 @@
 Each prompt ends with a fixed canvas token. Its embedding receives the
 self-conditioning norm with zero conditioning, as in the first denoising
 step. The answer comes from TRUE/FALSE scores at that position.
+
+A chunk's images go through the checkpoint's vision tower and replace
+their soft token rows before the first layer. Gemma 4 lets an image's
+soft tokens see each other on its sliding-window layers and keeps its
+full-attention layers causal, so the sliding layers run the engine's
+block attention over meta["blocks"].
 """
 
 import numpy as np
 
 from quail.backends.quail.executor.attention import Engine
 from quail.backends.quail.executor.models.base import ModelPipeline
+from quail.backends.quail.executor.models.vision import VisionEmbedder
 from quail.backends.quail.executor.moe import FP8Experts
 from quail.cost import budgets
 
@@ -48,6 +55,8 @@ class DiffusionGemmaPipeline(ModelPipeline):
             geometry (spec.kv_shapes).
         spec: The ModelSpec, for the vocabulary size and canvas length.
         engine_class: Engine class, replaceable by tests.
+        vision_class: VisionEmbedder class, replaceable by tests; built
+            only when the checkpoint carries a vision tower.
     """
 
     needs_pages = True
@@ -58,7 +67,8 @@ class DiffusionGemmaPipeline(ModelPipeline):
     # Partial join batches also need compiled expert kernels at these sizes.
     warm_tokens = ModelPipeline.warm_tokens + (4096, 8192, 16384, 32768)
 
-    def __init__(self, model, arena, *, spec, engine_class=Engine):
+    def __init__(self, model, arena, *, spec, engine_class=Engine,
+                 vision_class=VisionEmbedder):
         backbone = model.model
         self.layers = backbone.layers
         self.embed = backbone.embed_tokens
@@ -103,6 +113,10 @@ class DiffusionGemmaPipeline(ModelPipeline):
         self.experts = [FP8Experts(layer.moe.experts, self.engine)
                         if layer.enable_moe_block else None
                         for layer in self.layers]
+        self.vision = (vision_class(self.engine.torch, model)
+                       if getattr(model, "vision_tower", None) is not None
+                       else None)
+        self.takes_images = self.vision is not None
 
     def _norm(self, x, module):
         """One of the model's RMS norms, through the engine's kernel."""
@@ -146,6 +160,8 @@ class DiffusionGemmaPipeline(ModelPipeline):
         meta["layer"] = 0
         n = chunk.input_ids.shape[0]
         hidden = self.embed(chunk.input_ids) * self.normalizer
+        if chunk.images:
+            self._embed_images(hidden, chunk.images)
         canvas = meta.get("canvas")
         if canvas is not None:
             rows = canvas["rows"]
@@ -155,6 +171,17 @@ class DiffusionGemmaPipeline(ModelPipeline):
         # context
         with set_forward_context(None, self.vllm_config, num_tokens=n):
             return self._layers(hidden, chunk.positions, meta)
+
+    def _embed_images(self, hidden, images):
+        """Overwrite the images' soft token rows with the tower's embeddings."""
+        if self.vision is None:
+            raise ValueError("the loaded checkpoint has no vision tower")
+        torch = self.engine.torch
+        rows = torch.cat([
+            torch.arange(image.row0, image.row0 + image.rows,
+                         device=hidden.device)
+            for image in images])
+        hidden.index_copy_(0, rows, self.vision.embed(images).to(hidden.dtype))
 
     # ---- the layer stack --------------------------------------------
     # vLLM's layer arithmetic with the residual adds, the norms
@@ -229,7 +256,13 @@ class DiffusionGemmaPipeline(ModelPipeline):
         return out
 
     def _attend(self, attn, q3, k3, v3, meta):
-        """One layer's attention: the unified paged call."""
+        """One layer's attention: the unified paged call.
+
+        A sliding layer also runs the block call over the chunk's image
+        soft tokens; a full-attention layer leaves them causal.
+        """
         window = self.window if attn.is_sliding else None
-        return self.engine.attention_unified(q3, k3, v3, meta,
-                                             softmax_scale=1.0, window=window)
+        blocks = meta.get("blocks") if attn.is_sliding else None
+        return self.engine.attention_unified(
+            q3, k3, v3, meta, softmax_scale=1.0, window=window,
+            bidirectional_blocks=blocks)

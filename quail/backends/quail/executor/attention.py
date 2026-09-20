@@ -56,6 +56,8 @@ class Chunk:
         temporary_keys: Arena keys the loop frees after the forward pass.
         fresh_keys: Keys whose prefix this chunk computes; the loop
             trims their sliding pages after the pass.
+        images: The images whose soft token rows this chunk holds, in
+            row order; the model embeds them in place of those rows.
     """
 
     input_ids: Any
@@ -67,6 +69,23 @@ class Chunk:
     layout: list
     temporary_keys: tuple = ()
     fresh_keys: tuple = ()
+    images: tuple = ()
+
+
+@dataclass(frozen=True)
+class ChunkImage:
+    """One image's soft token rows in a chunk, with its rendered pixels.
+
+    Attributes:
+        row0: The chunk row of the image's first soft token.
+        rows: Its soft token count.
+        page: The rendered page (a quail.pdf.RenderedPage: uint8
+            patches and their grid).
+    """
+
+    row0: int
+    rows: int
+    page: Any
 
 
 def flash_attention_version(capability: tuple[int, int]) -> int:
@@ -873,7 +892,7 @@ class Engine:
         return tables.get("sliding") or tables
 
     def attention_unified(self, q3, k3, v3, meta, *, softmax_scale=None,
-                          window=None):
+                          window=None, bidirectional_blocks=None):
         """Write current KV to its cache slots, then one causal paged attention call.
 
         The call reads retained and current KV together. Takes
@@ -889,6 +908,11 @@ class Engine:
         segment, which already sees the whole prompt, so it skips the
         second call.
 
+        Bidirectional blocks (spans of prefix rows, such as one image's
+        soft tokens) get the same treatment over the KV up to each
+        block's end: a block row sees everything before it as the
+        causal call does, plus the rest of its block.
+
         Args:
             q3: Queries, (rows, heads, dim).
             k3: Keys, (rows, KV heads, dim), contiguous.
@@ -897,7 +921,11 @@ class Engine:
             softmax_scale: Attention logit scale; None is 1/sqrt(dim).
             window: Sliding window in tokens, or None for full
                 attention. Causal rows see `window` keys behind them;
-                canvas rows see `window` keys on either side.
+                canvas rows see `window` keys on either side; block
+                rows see `window` keys behind them and their whole
+                block ahead.
+            bidirectional_blocks: meta["blocks"] to run the block call
+                on this layer, or None to leave block rows causal.
         """
         n = q3.shape[0]
         layer = meta["layer"]
@@ -905,15 +933,22 @@ class Engine:
         canvas = meta.get("canvas")
         if canvas is not None and canvas["max_q"] == 1:
             canvas = None
+        blocks = bidirectional_blocks
         behind = None if window is None else (window - 1, 0)
         around = None if window is None else (window - 1, window - 1)
+        ahead = None if window is None else (window - 1, -1)
         pool = self._pool(layer, unified)
         canvas_pool = self._pool(layer, canvas)
+        blocks_pool = self._pool(layer, blocks)
         if unified is None:
             if q3.shape[-1] > FA_MAX_HEAD_DIM:
                 raise ValueError(
                     f"a {q3.shape[-1]}-wide head runs paged attention "
                     f"only; pack the chunk with arena pages")
+            if blocks is not None:
+                raise ValueError(
+                    "bidirectional blocks read paged KV; pack the chunk "
+                    "with arena pages")
             out, _ = self._fa(
                 q3, k3, v3, meta["cu_a"], meta["cu_a"],
                 meta["max_a"], meta["max_a"], causal=True,
@@ -938,6 +973,16 @@ class Engine:
             q3, kp, vp, unified["cu_q"], unified["max_q"], pool["used"],
             pool["max_used"], pool["table"], causal=True,
             softmax_scale=softmax_scale, window=behind)
+        if blocks is not None:
+            # the KV a block call reads ends at its block, so the
+            # bottom-right aligned window bounds only the rows behind
+            q_b = q3.index_select(0, blocks["rows"])
+            out_b = self._paged(
+                q_b, kp, vp, blocks["cu_q"], blocks["max_q"],
+                blocks_pool["used"], blocks_pool["max_used"],
+                blocks_pool["table"], causal=False,
+                softmax_scale=softmax_scale, window=ahead)
+            out.index_copy_(0, blocks["rows"], out_b)
         if canvas is not None:
             q_c = q3.index_select(0, canvas["rows"])
             out_c = self._paged(

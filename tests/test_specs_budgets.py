@@ -45,3 +45,14 @@ def test_arena_pages_needs_room_for_one_chunk_of_sliding_kv():
     small = replace(H100_SXM, mem_bytes=40e9)
     with pytest.raises(ValueError, match="one chunk's sliding KV"):
         budgets.arena_pages(DIFFUSION_GEMMA_26B_FP8, small)
+
+
+def test_image_model_keeps_its_vision_reserve_out_of_the_arena():
+    from quail.specs import DIFFUSION_GEMMA_26B_FP8
+
+    chunk = budgets.chunk_budget(DIFFUSION_GEMMA_26B_FP8, H100_SXM)
+    text_only = replace(DIFFUSION_GEMMA_26B_FP8, image_reserve_bytes=0.0)
+    assert (budgets.arena_bytes(text_only, H100_SXM, chunk)
+            - budgets.arena_bytes(DIFFUSION_GEMMA_26B_FP8, H100_SXM, chunk)
+            == DIFFUSION_GEMMA_26B_FP8.image_reserve_bytes == 4 * 2**30)
+    assert QWEN3_4B_FP8.image_reserve_bytes == 0
