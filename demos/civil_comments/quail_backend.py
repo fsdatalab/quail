@@ -7,7 +7,7 @@ questions, and deterministic sample with the Jev backend.
 Run one or two H100s from the repository root:
 
     uv run modal run --detach demos/civil_comments/quail_backend.py \
-      --limit 20000 --gpus 1 \
+      --limit 10000 --gpus 1 \
       2>&1 | tee /tmp/civil-comments-quail.log
 
 Results are saved under ``/results/demos/civil-comments/quail/<run-id>``
@@ -276,7 +276,7 @@ def run(limit: int, gpus: int) -> dict:
 
 
 @app.local_entrypoint()
-def main(limit: int = 20_000, gpus: int = 1):
+def main(limit: int = 10_000, gpus: int = 1):
     """Run the Quail configuration. ``--limit 0`` uses every comment."""
     if limit < 0 or gpus not in (1, 2, 4, 8):
         raise ValueError("limit must be >= 0; gpus must be 1, 2, 4, or 8")

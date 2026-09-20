@@ -9,7 +9,7 @@ Set the API key without putting it on the command line, then run:
     read -s TYPESAFE_API_KEY
     export TYPESAFE_API_KEY
     uv run python demos/civil_comments/jev_backend.py \
-      --limit 20000 --concurrency 256 \
+      --limit 10000 --concurrency 256 \
       2>&1 | tee /tmp/civil-comments-jev.log
 
 The script checkpoints answers under ``--output`` and resumes missing
@@ -313,7 +313,7 @@ async def evaluate(
 def main():
     """Parse arguments and run Jev."""
     parser = argparse.ArgumentParser()
-    parser.add_argument("--limit", type=int, default=20_000)
+    parser.add_argument("--limit", type=int, default=10_000)
     parser.add_argument("--concurrency", type=int, default=256)
     parser.add_argument(
         "--output",
