@@ -311,15 +311,10 @@ def report_lines(rows, queries, relations, sol, manifest, suites, figures,
         "  tokens as a share of fresh tokens. Token throughput is total",
         "  requested input tokens divided by query seconds.",
     ]
-    grafted = manifest.get("grafted", {})
-    if grafted:
-        runs = sorted(set(grafted.values()))
-        lines.extend([
-            f"- The baseline values of {', '.join(sorted(grafted, key=queries.index))}",
-            "  come from a rerun of those queries with the same code and",
-            f"  settings, `{'`, `'.join(runs)}`, after Modal restarted the",
-            "  measured run's orchestrator before their containers finished.",
-        ])
+    for rerun in manifest.get("reruns", []):
+        named = ", ".join(sorted(rerun["queries"], key=queries.index))
+        lines.append(f"- The baseline values of {named} come from the rerun "
+                     f"`{rerun['run']}` of those queries: {rerun['reason']}.")
     if unfinished:
         lines.extend([
             "- Pipelined stock vLLM did not finish "

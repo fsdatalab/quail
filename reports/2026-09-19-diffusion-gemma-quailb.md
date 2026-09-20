@@ -35,13 +35,13 @@
   Speedup is pipelined stock vLLM time divided by Quail time.
   Query time excludes startup and result collection.
   GPU cost is query seconds / 3,600 times $3.9492.
-- Quail is slower on AGENT-1, AGENT-2: on AGENT-1 Quail computes 19,119,565 fresh tokens against the baseline's 6,121,985; on AGENT-2 Quail computes 19,162,093 fresh tokens against the baseline's 6,164,545. The agent
+- Quail is slower on AGENT-1, AGENT-2: on AGENT-1 Quail computes 19,119,565 fresh tokens against the baseline's 6,122,049; on AGENT-2 Quail computes 19,162,093 fresh tokens against the baseline's 6,164,577. The agent
   corpus's traces share prefixes (every later turn's trace
   starts with the earlier turn's), which vLLM's prefix cache
   reuses and Quail's filter path computes again for each
   document.
 - On the 30 queries both methods finished, they gave
-  the same TRUE or FALSE on 91.27 percent of the
+  the same TRUE or FALSE on 91.30 percent of the
   2,675,597 predicate evaluations both made (per query below).
 - SoL means speed of light: ideal GPU time from arithmetic and memory
   traffic at the hardware's peak rates, with ideal batching, unlimited
@@ -52,10 +52,8 @@
   processes, repeated computation included. KV regret is recomputed
   tokens as a share of fresh tokens. Token throughput is total
   requested input tokens divided by query seconds.
-- The baseline values of BIO-3, FEV-8, FEV-9, FEV-10
-  come from a rerun of those queries with the same code and
-  settings, `20260920T013141Z-5124c19e`, after Modal restarted the
-  measured run's orchestrator before their containers finished.
+- The baseline values of BIO-3, FEV-8, FEV-9, FEV-10 come from the rerun `20260920T013141Z-5124c19e` of those queries: Modal restarted the measured run's orchestrator before their containers finished.
+- The baseline values of BIO-1, AGENT-1, AGENT-2 come from the rerun `20260920T032348Z-1e56c382` of those queries: the baseline engine now runs vLLM's engine core in-process; in its own process, the step loop's canvas-row logprobs came back unreliably on long prompts and the baseline's AGENT-1 answers drifted toward noise.
 
 [Open the main vector PDF](plots/quailb_diffusion_gemma_main.pdf)
 
@@ -168,7 +166,7 @@ Figure: plots/quailb_diffusion_gemma_bio.pdf
 | Query | Method | Seconds | Tokens/second | $/query | $/million input tokens | KV regret (%) |
 |---|---|---:|---:|---:|---:|---:|
 | BIO-1 | Quail | 24.76 | 80,686.39 | 0.02716 | 0.013596 | 0.29 |
-| BIO-1 | Pipelined vLLM | 42.07 | 47,487.40 | 0.04615 | 0.023101 | 0.27 |
+| BIO-1 | Pipelined vLLM | 36.05 | 55,417.34 | 0.03955 | 0.019795 | 0.27 |
 | BIO-1 | SoL estimate | 9.027 | 221,320.94 | 0.00990 | 0.004957 | 0 (assumed) |
 | BIO-2 | Quail | 216.22 | 10,425,735.20 | 0.23719 | 0.000105 | 3.83 |
 | BIO-2 | Pipelined vLLM | 4640.74 | 485,752.80 | 5.09089 | 0.002258 | 24.98 |
@@ -182,7 +180,7 @@ Correctness against saved reference labels:
 | Query | Method | Answer agreement (%) | Output precision (%) | Output recall (%) |
 |---|---|---:|---:|---:|
 | BIO-1 | Quail | 79.20 | 75.779 | 99.06 |
-| BIO-1 | Pipelined vLLM | 63.00 | 64.316 | 94.357 |
+| BIO-1 | Pipelined vLLM | 62.20 | 64.009 | 93.103 |
 | BIO-2 | Quail | 96.30 | 54.026 | 51.461 |
 | BIO-2 | Pipelined vLLM | 90.91 | 24.828 | 62.603 |
 | BIO-3 | Quail | 96.01 | 48.15 | 51.886 |
@@ -192,7 +190,7 @@ Answers the two methods gave each other:
 
 | Query | Evaluations both made | Same answer (%) |
 |---|---:|---:|
-| BIO-1 | 500 | 81.00 |
+| BIO-1 | 500 | 80.20 |
 | BIO-2 | 563,500 | 93.18 |
 | BIO-3 | 445,665 | 93.08 |
 
@@ -359,10 +357,10 @@ Figure: plots/quailb_diffusion_gemma_agent.pdf
 | Query | Method | Seconds | Tokens/second | $/query | $/million input tokens | KV regret (%) |
 |---|---|---:|---:|---:|---:|---:|
 | AGENT-1 | Quail | 279.44 | 68,414.66 | 0.30655 | 0.016035 | 68.23 |
-| AGENT-1 | Pipelined vLLM | 155.80 | 122,707.27 | 0.17091 | 0.008940 | 0.78 |
+| AGENT-1 | Pipelined vLLM | 159.15 | 120,124.37 | 0.17459 | 0.009132 | 0.78 |
 | AGENT-1 | SoL estimate | 46.622 | 410,055.89 | 0.05114 | 0.002675 | 0 (assumed) |
 | AGENT-2 | Quail | 280.31 | 68,354.04 | 0.30750 | 0.016049 | 68.08 |
-| AGENT-2 | Pipelined vLLM | 148.82 | 128,748.29 | 0.16326 | 0.008521 | 0.77 |
+| AGENT-2 | Pipelined vLLM | 157.58 | 121,591.07 | 0.17287 | 0.009022 | 0.77 |
 | AGENT-2 | SoL estimate | 46.983 | 407,811.34 | 0.05154 | 0.002690 | 0 (assumed) |
 
 Correctness against saved reference labels:
@@ -370,13 +368,13 @@ Correctness against saved reference labels:
 | Query | Method | Answer agreement (%) | Output precision (%) | Output recall (%) |
 |---|---|---:|---:|---:|
 | AGENT-1 | Quail | 47.18 | 38.964 | 95.23 |
-| AGENT-1 | Pipelined vLLM | 49.72 | 36.222 | 61.184 |
+| AGENT-1 | Pipelined vLLM | 38.49 | 35.603 | 98.026 |
 | AGENT-2 | Quail | 93.34 | 81.903 | 99.62 |
-| AGENT-2 | Pipelined vLLM | 80.53 | 71.77 | 56.926 |
+| AGENT-2 | Pipelined vLLM | 88.21 | 72.585 | 96.964 |
 
 Answers the two methods gave each other:
 
 | Query | Evaluations both made | Same answer (%) |
 |---|---:|---:|
-| AGENT-1 | 1,772 | 58.75 |
-| AGENT-2 | 1,772 | 80.98 |
+| AGENT-1 | 1,772 | 84.65 |
+| AGENT-2 | 1,772 | 92.61 |
