@@ -1,19 +1,12 @@
 """The Modal images the benchmark and experiment scripts run on."""
 
-import tomllib
-from pathlib import Path
-
 import modal
 
-
-def _required_uv() -> str:
-    """The uv version pyproject.toml requires; the images sync with it."""
-    pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
-    with pyproject.open("rb") as f:
-        return tomllib.load(f)["tool"]["uv"]["required-version"].lstrip("=")
-
-
-UV_VERSION = _required_uv()
+# the uv the images sync with; pyproject.toml's required-version must
+# match it (tests/test_images.py checks), and the value stays a literal
+# because Modal imports this module inside the container, where the
+# repository's pyproject.toml is not mounted
+UV_VERSION = "0.12.13"
 CUDA_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
 # every kernel cache under one mount, so a volume keeps them warm
 CACHE_ENV = {
