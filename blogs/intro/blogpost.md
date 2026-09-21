@@ -92,7 +92,7 @@ BIO-4 turns its joins into separate requests for every candidate report and reac
 ::: {.figure-block .wide-figure}
 [![Five seconds of GPU activity during a BIO-4 join with the vLLM baseline.](figures/bio4_vllm_bubbles.png){width=100%}](figures/bio4_vllm_bubbles.pdf)
 
-*Figure 2. BIO-4 join at scale factor 0.1 with the vLLM baseline. Green marks when the GPU is busy. The white gaps are idle time while the host prepares the next batch of requests.*
+*Figure 2. BIO-4 join at scale factor 0.1 with the vLLM baseline. Green marks when the GPU is busy. White gaps on the GPU row are idle time while the host prepares the next batch of requests. The light band on the CPU row is other host work.*
 :::
 
 The corresponding Quail timeline appears with the BIO-4 experiments in Section 4.3.
