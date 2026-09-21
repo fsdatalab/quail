@@ -34,9 +34,9 @@ CACHE_SCHEMA_VERSION = 9
 # the public bucket. build_sets downloads it instead of rebuilding from
 # the sources; the corpus id is checked after download.
 PUBLISHED_CORPORA = {
-    0.1: "c_1aa2c4f0d0b6c816fd37aa5748c33341",
-    0.5: "c_6773c85b3754908434661c1dadfad0fa",
-    1.0: "c_81a95887a650aaa1a343e0d688b81bef",
+    0.1: "c_89e6d982644aad4553e7893a5a53c481",
+    0.5: "c_b5e46fdff06aabae95ba6905f08a31de",
+    1.0: "c_424dc3196ca47bd0ab131129ec8d48df",
 }
 LEPARD_POSITIVE_PAIRS = 5_000
 # The base count for scaling. SWE-Next at the pinned revision yields

@@ -170,11 +170,16 @@ Those fractions are fixed planner estimates at every scale factor.
 The public collections below include both filters. BIO-4 loads the matching
 collection automatically when accuracy scoring is enabled.
 
-| Scale factor | Reference collection |
-|---|---|
-| 0.1 | `gt_cd3ebdb784f64b9e028e50ea73cdedd0` |
-| 0.5 | `gt_68f9ce9439bd7615de92b33d576dff9e` |
-| 1.0 | `gt_e87691add604b02c4e43f0ff5bf0cc4f` |
+| Scale factor | Corpus | Reference collection |
+|---|---|---|
+| 0.1 | `c_89e6d982644aad4553e7893a5a53c481` | `gt_a74b54853e14c80f5a7327f298b880ad` |
+| 0.5 | `c_b5e46fdff06aabae95ba6905f08a31de` | `gt_a93ababf8933c23cf93f739e6d214d27` |
+| 1.0 | `c_424dc3196ca47bd0ab131129ec8d48df` | `gt_c2872eec5eff63c1fcd64a3d103776a3` |
+
+Adding the two CUAD tables gave every scale factor a new corpus id.
+The collections above reuse all 23 earlier label sets unchanged (each
+reused set's table manifest matched exactly) and add the 8 CUAD label
+sets, which come from the CUAD annotation and needed no inference.
 
 CUAD-1 to CUAD-5 read contract PDFs. The `document` column of both
 relations is a file reference: `files/<id>.pdf` for a whole contract and
@@ -193,6 +198,9 @@ row. CUAD-3 to CUAD-5 read whole contracts, restricted by an ordinary
 `page_count <= 32` filter in the plan before the AI filters (430 of the
 510 contracts; 32 pages is the most one DiffusionGemma prompt holds).
 Scoring counts only the rows inside that bound as the query's input.
+At sf=1.0 the annotation keeps 453 of the 9,348 pages for CUAD-1 and 124
+for CUAD-2, and 78, 45, and 22 of the 430 bounded contracts for CUAD-3,
+CUAD-4, and CUAD-5.
 
 Queries use two LLM-powered relational operators:
 
