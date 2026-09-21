@@ -14,7 +14,6 @@ from quail.pdf import (
     PdfiumPrefetcher,
     PdfReadError,
     read_manifest,
-    rows_for_mode,
 )
 from quail.pdf.prompt import PagePrompts
 from quail.pdf.render import patch_positions, patchify, render_page
@@ -51,17 +50,18 @@ def make_pdf(path, sizes, *, left_half_black=False):
     return str(path)
 
 
-def pdf_input(paths, row_mode="page", budget=280):
+BUDGET = 280
+
+
+def pdf_input(paths, row_mode="page"):
     manifest = read_manifest(paths)
-    rows = rows_for_mode(manifest.pages, len(manifest.sources), row_mode)
-    return PDFInput(sources=manifest.sources, pages=manifest.pages, rows=rows,
-                    row_mode=row_mode, visual_tokens=budget)
+    return PDFInput.formed(manifest.sources, manifest.pages, row_mode)
 
 
 def test_page_prompts_lay_out_marker_soft_marker_per_page(tmp_path):
     paths = [make_pdf(tmp_path / "a.pdf", [LETTER, (792, 612)]),
              make_pdf(tmp_path / "b.pdf", [LETTER])]
-    prompts = PagePrompts(pdf_input(paths, row_mode="pdf"), GEMMA)
+    prompts = PagePrompts(pdf_input(paths, row_mode="pdf"), GEMMA, BUDGET)
     letter = soft_tokens(GEMMA, *LETTER, 280)
     assert len(prompts) == 2
     assert prompts.lengths == (2 * (letter + 2), letter + 2)
@@ -78,7 +78,7 @@ def test_page_prompts_lay_out_marker_soft_marker_per_page(tmp_path):
     assert second.end == len(row) - 1
     assert prompts[1:] == [prompts[1]]
     # the same rows in page mode: one page per row
-    by_page = PagePrompts(pdf_input(paths), GEMMA)
+    by_page = PagePrompts(pdf_input(paths), GEMMA, BUDGET)
     assert by_page.lengths == (letter + 2,) * 3
     assert [block.page_id for row in range(3) for block in by_page.blocks(row)] \
         == [0, 1, 2]
@@ -120,7 +120,7 @@ def test_prefetcher_returns_rows_in_order_with_the_planned_grid(tmp_path):
     paths = [make_pdf(tmp_path / "a.pdf", [LETTER] * 3, left_half_black=True),
              make_pdf(tmp_path / "b.pdf", [LETTER, (792, 612)])]
     inputs = pdf_input(paths)
-    prefetcher = PdfiumPrefetcher(inputs, GEMMA, processes=0)
+    prefetcher = PdfiumPrefetcher(inputs, GEMMA, BUDGET, processes=0)
     try:
         pages = []
         for row in range(len(inputs.rows)):
@@ -154,7 +154,7 @@ def test_prefetcher_pdf_mode_hands_over_every_page_of_a_row(tmp_path):
     paths = [make_pdf(tmp_path / "a.pdf", [LETTER] * 3),
              make_pdf(tmp_path / "b.pdf", [LETTER, (792, 612)])]
     inputs = pdf_input(paths, row_mode="pdf")
-    prefetcher = PdfiumPrefetcher(inputs, GEMMA, processes=0, order=[1, 0])
+    prefetcher = PdfiumPrefetcher(inputs, GEMMA, BUDGET, processes=0, order=[1, 0])
     try:
         second = prefetcher.take(1)
         assert [page.page_id for page in second] == [3, 4]
@@ -163,9 +163,9 @@ def test_prefetcher_pdf_mode_hands_over_every_page_of_a_row(tmp_path):
     finally:
         prefetcher.close()
     with pytest.raises(ValueError, match="at most once"):
-        PdfiumPrefetcher(inputs, GEMMA, processes=0, order=[0, 0])
+        PdfiumPrefetcher(inputs, GEMMA, BUDGET, processes=0, order=[0, 0])
     # a row left out of the order is still rendered when taken
-    partial = PdfiumPrefetcher(inputs, GEMMA, processes=0, order=[1])
+    partial = PdfiumPrefetcher(inputs, GEMMA, BUDGET, processes=0, order=[1])
     assert partial.outstanding_pages == 2
     assert len(partial.take(0)) == 3
     partial.close()
@@ -177,13 +177,14 @@ def test_page_images_map_chain_documents_to_rows_past_the_preamble(tmp_path):
 
     paths = [make_pdf(tmp_path / "a.pdf", [LETTER, LETTER]),
              make_pdf(tmp_path / "b.pdf", [LETTER])]
-    inputs = pdf_input(paths, "page", budget=70)
-    prompts = PagePrompts(inputs, GEMMA)
+    inputs = pdf_input(paths, "page")
+    prompts = PagePrompts(inputs, GEMMA, 70)
     opened = []
 
-    def open_inline(pdf_input_, spec, order, **options):
+    def open_inline(pdf_input_, spec, budget, order, **options):
         opened.append((list(order), options))
-        return PdfiumPrefetcher(pdf_input_, spec, order, processes=0, **options)
+        return PdfiumPrefetcher(pdf_input_, spec, budget, order, processes=0,
+                                **options)
 
     # the chain admits row 2 first, then row 0; row 1 is never asked for
     images = PageImages(prompts, document_ids=[2, 0], pre_tokens=7,
@@ -234,7 +235,7 @@ def test_page_images_map_chain_documents_to_rows_past_the_preamble(tmp_path):
 def test_prefetcher_lookahead_stays_under_the_page_bound(tmp_path):
     paths = [make_pdf(tmp_path / "a.pdf", [LETTER] * 6)]
     inputs = pdf_input(paths)
-    prefetcher = PdfiumPrefetcher(inputs, GEMMA, processes=0,
+    prefetcher = PdfiumPrefetcher(inputs, GEMMA, BUDGET, processes=0,
                                   max_outstanding_pages=2)
     try:
         assert prefetcher.outstanding_pages == 2
@@ -258,7 +259,7 @@ def test_prefetcher_refuses_a_source_edited_after_planning(tmp_path):
     make_pdf(path, [LETTER, LETTER])
     stat = os.stat(path)
     os.utime(path, ns=(stat.st_atime_ns, inputs.sources[0].mtime_ns + 10**9))
-    prefetcher = PdfiumPrefetcher(inputs, GEMMA, processes=0)
+    prefetcher = PdfiumPrefetcher(inputs, GEMMA, BUDGET, processes=0)
     try:
         with pytest.raises(PdfReadError, match="changed after planning"):
             prefetcher.take(0)
@@ -269,7 +270,7 @@ def test_prefetcher_refuses_a_source_edited_after_planning(tmp_path):
 def test_prefetcher_reopens_a_file_registered_again(tmp_path):
     path = make_pdf(tmp_path / "a.pdf", [LETTER])
     before = pdf_input([path])
-    prefetcher = PdfiumPrefetcher(before, GEMMA, processes=0)
+    prefetcher = PdfiumPrefetcher(before, GEMMA, BUDGET, processes=0)
     (page,) = prefetcher.take(0)
     prefetcher.close()
     assert page.patches.min() == 255
@@ -279,7 +280,7 @@ def test_prefetcher_reopens_a_file_registered_again(tmp_path):
     os.utime(path, ns=(stat.st_atime_ns, before.sources[0].mtime_ns + 10**9))
     after = pdf_input([path])
     assert after.sources[0] != before.sources[0]
-    prefetcher = PdfiumPrefetcher(after, GEMMA, processes=0)
+    prefetcher = PdfiumPrefetcher(after, GEMMA, BUDGET, processes=0)
     (page,) = prefetcher.take(0)
     prefetcher.close()
     assert page.patches[0].max() == 0
@@ -289,7 +290,7 @@ def test_prefetcher_renders_in_spawned_processes(tmp_path):
     paths = [make_pdf(tmp_path / "a.pdf", [LETTER, (792, 612)],
                       left_half_black=True)]
     inputs = pdf_input(paths)
-    prefetcher = PdfiumPrefetcher(inputs, GEMMA, processes=1)
+    prefetcher = PdfiumPrefetcher(inputs, GEMMA, BUDGET, processes=1)
     try:
         (portrait,) = prefetcher.take(0)
         (landscape,) = prefetcher.take(1)

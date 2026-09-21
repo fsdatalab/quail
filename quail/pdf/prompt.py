@@ -51,19 +51,25 @@ class PagePrompts(Sequence):
         pdf_input: The bound PDF rows.
         spec: A model with image support; its marker and soft token
             ids and its image geometry.
+        visual_tokens: The soft token budget every page is rendered for.
 
     Raises:
-        ValueError: The model has no soft token id.
+        ValueError: The model has no soft token id, or the budget is
+            not positive.
     """
 
-    def __init__(self, pdf_input: PDFInput, spec: ModelSpec):
+    def __init__(self, pdf_input: PDFInput, spec: ModelSpec,
+                 visual_tokens: int):
         if spec.image_soft_id < 0:
             raise ValueError(f"model {spec.name!r} has no image soft token id")
+        if visual_tokens <= 0:
+            raise ValueError("page prompts need a positive visual token budget")
         self.pdf_input = pdf_input
         self.spec = spec
-        budget = pdf_input.visual_tokens
+        self.visual_tokens = visual_tokens
         self._soft = tuple(
-            soft_tokens(spec, page.width_points, page.height_points, budget)
+            soft_tokens(spec, page.width_points, page.height_points,
+                        visual_tokens)
             for page in pdf_input.pages)
         self._blocks = tuple(self._row_blocks(row) for row in pdf_input.rows)
 

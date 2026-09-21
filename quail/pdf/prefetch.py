@@ -146,6 +146,7 @@ class PdfiumPrefetcher:
     Args:
         pdf_input: The bound PDF rows.
         spec: The model, for the render geometry.
+        visual_tokens: The soft token budget every page is rendered for.
         order: Row indices in the order the chain will admit them,
             each at most once; rows left out are rendered only when
             taken. Row index order when omitted.
@@ -157,15 +158,17 @@ class PdfiumPrefetcher:
     """
 
     def __init__(self, pdf_input: PDFInput, spec: ModelSpec,
-                 order: Sequence[int] | None = None, *,
+                 visual_tokens: int, order: Sequence[int] | None = None, *,
                  processes: int | None = None,
                  max_outstanding_pages: int | None = None):
         if not spec.image_patch_pixels:
             raise ValueError(f"model {spec.name!r} takes no images")
+        if visual_tokens <= 0:
+            raise ValueError("rendering needs a positive visual token budget")
         self.pdf_input = pdf_input
         self.spec = spec
         self.patch = spec.image_patch_pixels
-        self.budget = pdf_input.visual_tokens
+        self.budget = visual_tokens
         self.order = (list(range(len(pdf_input.rows))) if order is None
                       else [int(row) for row in order])
         if len(set(self.order)) != len(self.order) or any(

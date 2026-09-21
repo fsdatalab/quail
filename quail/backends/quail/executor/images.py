@@ -36,8 +36,8 @@ class PageImages:
         pre_tokens: Tokens the chain prepends to every document; block
             offsets shift by this many rows.
         open_prefetcher: Builds the page renderer from (pdf_input,
-            spec, order, max_outstanding_pages=...) at open(); a
-            PdfiumPrefetcher when omitted.
+            spec, visual_tokens, order, max_outstanding_pages=...) at
+            open(); a PdfiumPrefetcher when omitted.
     """
 
     def __init__(self, prompts: PagePrompts, document_ids: Sequence[int],
@@ -74,7 +74,7 @@ class PageImages:
                      else [self.document_ids[doc] for doc in docs])
             self._prefetcher = self._open_prefetcher(
                 self.prompts.pdf_input, self.prompts.spec,
-                order=order, **options)
+                self.prompts.visual_tokens, order=order, **options)
 
     def take(self, doc: int) -> tuple[tuple[ImageBlock, RenderedPage], ...]:
         """The document's pages with their soft token spans, in prompt order."""

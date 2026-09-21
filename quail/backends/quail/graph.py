@@ -188,9 +188,20 @@ def filter_inputs(state, node, document_ids) -> dict:
         "document_ids": document_ids,
         "limit": state["filter_limit"],
         "retain_survivors": node.keep_kv,
-        "images": (PageImages(documents, document_ids, len(pre))
-                   if isinstance(documents, PagePrompts) else None),
+        "images": page_images(documents, document_ids, pre),
     }
+
+
+def page_images(documents, document_ids, pre) -> PageImages | None:
+    """The image source of a chain over the alias's rows; None for text.
+
+    An alias laid out as PagePrompts shows the model rendered pages,
+    so the chain renders them ahead and packs each row's pages behind
+    the shared preamble.
+    """
+    if not isinstance(documents, PagePrompts):
+        return None
+    return PageImages(documents, document_ids, len(pre))
 
 
 def prepare_model_inputs(node, inputs, context: ExecutionContext):
@@ -292,10 +303,7 @@ def _model_inputs(node, inputs, context: ExecutionContext) -> dict:
         state["kv_stats"]["join_anchor_hits"] += round_kv["hits"]
         state["kv_stats"]["join_anchor_misses"] += round_kv["misses"]
         anchor_stream = None
-        if isinstance(anchor_docs, PagePrompts):
-            # the anchor rows are PDF pages: the join renders them
-            # ahead and packs each anchor's pages with its prefix
-            images = PageImages(anchor_docs, anchor_ids, len(state["pre"]))
+        images = page_images(anchor_docs, anchor_ids, state["pre"])
     else:
         # filled by the driver as the chain hands anchors over
         anchor_ids = None

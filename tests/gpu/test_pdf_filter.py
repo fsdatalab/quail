@@ -9,8 +9,6 @@ without a CUDA device; runs through
 `uv run modal run experiments/run_gpu_tests.py --keyword pdf`.
 """
 
-import ctypes
-
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -25,30 +23,14 @@ QUESTION = ("Judge strictly from the contract {0}. Is this agreement governed "
 
 def _write_contract(path, state):
     """A two-page agreement whose second page names its governing law."""
-    import pypdfium2 as pdfium
-    import pypdfium2.raw as pdfium_c
+    from pdfs import make_text_pdf
 
-    document = pdfium.PdfDocument.new()
-    font = pdfium_c.FPDFText_LoadStandardFont(document.raw, b"Helvetica")
-    pages = (
+    make_text_pdf(path, (
         ["SERVICES AGREEMENT", "between Alpha Corp. and Beta LLC.",
          "1. Services. Alpha provides the services in Exhibit A."],
         ["2. Governing Law.", "This Agreement is governed by the laws",
          f"of the State of {state}.", "3. Term. Two years from signing."],
-    )
-    for lines in pages:
-        page = document.new_page(612, 792)
-        for row, text in enumerate(lines):
-            block = pdfium_c.FPDFPageObj_CreateTextObj(document.raw, font, 28)
-            encoded = text.encode("utf-16-le") + b"\x00\x00"
-            buffer = ctypes.create_string_buffer(encoded, len(encoded))
-            pdfium_c.FPDFText_SetText(
-                block, ctypes.cast(buffer, ctypes.POINTER(ctypes.c_ushort)))
-            pdfium_c.FPDFPageObj_Transform(block, 1, 0, 0, 1, 60, 700 - 60 * row)
-            pdfium_c.FPDFPage_InsertObject(page.raw, block)
-        pdfium_c.FPDFPage_GenerateContent(page.raw)
-    document.save(str(path))
-    document.close()
+    ), font_size=28, line_height=60)
 
 
 def test_filter_over_pdf_rows_reads_the_pages(tmp_path):
