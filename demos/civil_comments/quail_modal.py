@@ -32,7 +32,7 @@ image = gpu_image(("demos", "/root/demos")).add_local_python_source("demos")
     image=image,
     gpu="H100!",
     timeout=86_400,
-    memory=98_304,
+    memory=65_536,
     volumes={
         str(RESULTS_MOUNT): results_volume,
         "/root/.cache/huggingface": hf_cache,
