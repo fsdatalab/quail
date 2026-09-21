@@ -12,6 +12,7 @@ from quail_b.data import (
     _agent_trace_rows,
     _lepard_documents,
     _n_agent_documents,
+    _n_docs,
     _n_lepard_pairs,
     _sample_lepard_pairs,
     _select_agent_snapshots,
@@ -24,8 +25,11 @@ def test_set_table_matches_design():
         "reports": 5_000,
         "claims": 5_000,
         "agent_traces": AGENT_TRACE_DOCUMENTS,
+        "contracts": 510,
         "policies": 1_000_000,
     }
+    assert _n_docs("contracts", 0.1) == 51
+    assert _n_docs("contracts", 1.0) == 510
     assert LEPARD_POSITIVE_PAIRS == 5_000
     assert _n_lepard_pairs(0.1) == 500
     assert len(ASPECTS) == 12

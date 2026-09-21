@@ -25,6 +25,17 @@ def download_cache(directory=None):
         _cache_dir.reset(token)
 
 
+def cache_directory() -> Path:
+    """The download cache: the chosen one, QUAIL_B_CACHE_DIR, or the default."""
+    directory = _cache_dir.get() or os.environ.get("QUAIL_B_CACHE_DIR")
+    if directory is None:
+        directory = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+        directory = directory / "quail-b"
+    directory = Path(directory).expanduser()
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
 def _cached_file(root, path):
     """Cache immutable published files; always refresh active collection pointers."""
     if root is not None and not str(root).startswith("s3://"):
@@ -32,12 +43,7 @@ def _cached_file(root, path):
     if Path(path).name.startswith("active_collection."):
         return None
     filesystem, _, source = _location(root, path)
-    directory = _cache_dir.get() or os.environ.get("QUAIL_B_CACHE_DIR")
-    if directory is None:
-        directory = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
-        directory = directory / "quail-b"
-    directory = Path(directory).expanduser()
-    directory.mkdir(parents=True, exist_ok=True)
+    directory = cache_directory()
     key = hashlib.sha256(source.encode()).hexdigest()
     cached = directory / key
     if not cached.exists():
@@ -80,5 +86,5 @@ def _list_files(root, path):
         info.path.removeprefix(f"{base}/")
         for info in filesystem.get_file_info(selector)
         if info.type == fs.FileType.File
-        and info.path.endswith((".json", ".parquet"))
+        and info.path.endswith((".json", ".parquet", ".pdf"))
     )

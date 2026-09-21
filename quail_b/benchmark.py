@@ -6,12 +6,15 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from quail_b.cuad import resolve_documents, verify_document_files
 from quail_b.data import (
     CORPUS_COLUMNS,
     DATA_SEED,
+    FILE_TABLES,
     GROUND_TRUTH_ROOT,
     PUBLISHED_CORPORA,
     SOURCE_REVISIONS,
+    corpus_files_dir,
     corpus_identity,
     load_table,
 )
@@ -56,10 +59,15 @@ def load_benchmark(only=None, *, scale_factor=0.1, data_dir=None,
     Args:
         only: Query IDs, or None for all queries.
         scale_factor: Published scale factor: 0.1, 0.5, or 1.0.
-        data_dir: Optional directory of input Parquet files to validate.
+        data_dir: Optional directory of input Parquet files to validate,
+            with the `files/` directory of any file table beside them.
         collection_id: Reference collection ID, or None for the active one.
         accuracy: Whether to load reference labels for scoring.
         root: Published data root, or None for the public S3 bucket.
+
+    Returns:
+        The benchmark. A file table's `document` column names local
+        files, absolute, with the page fragment kept.
     """
     specs = select_queries(only, scale_factor=scale_factor)
     corpus_id = PUBLISHED_CORPORA[scale_factor]
@@ -84,6 +92,15 @@ def load_benchmark(only=None, *, scale_factor=0.1, data_dir=None,
     for name in names:
         if identity["tables"][name] != manifest["tables"][name]:
             raise ValueError(f"{name} does not match published corpus {corpus_id}")
+    # a file table's published references are relative; the adapter
+    # gets them pointed at local files whose content is checked
+    for name in names:
+        if name not in FILE_TABLES:
+            continue
+        directory = (Path(data_dir) if data_dir is not None else corpus_files_dir(
+            name, tables[name], scale_factor=scale_factor, root=root))
+        verify_document_files(tables[name], directory)
+        tables[name] = resolve_documents(tables[name], directory)
     truth = None
     if accuracy:
         # only the label sets the selected queries score against

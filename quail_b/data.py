@@ -1,26 +1,30 @@
 """The QUAIL-B document sets: pinned sources, sampling, and identity.
 
-Five document sets by default (IMDB, BioDEX, FEVER, LePaRD, SWE-Next
-agent trace snapshots) plus the optional PrivacyPolicies set. Every
-table is sampled from a pinned upstream revision with one seed, so a
-scale factor names one exact corpus.
+Six document sets by default (IMDB, BioDEX, FEVER, LePaRD, SWE-Next
+agent trace snapshots, and the CUAD contract PDFs) plus the optional
+PrivacyPolicies set. Every table is sampled from a pinned upstream
+revision with one seed, so a scale factor names one exact corpus.
 """
 
 import hashlib
 import heapq
 import json
+import shutil
+import urllib.request
 from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from quail_b import cuad
 from quail_b._files import (
     GROUND_TRUTH_ROOT,
     _cached_file,
     _list_files,
     _location,
     _read_bytes,
+    cache_directory,
 )
 from quail_b._files import PUBLIC_BUCKET as PUBLIC_BUCKET
 
@@ -61,6 +65,8 @@ SOURCE_REVISIONS = {
         "e378a60ddd7050fe9519a31a4d41d4872eeec6ac",
     "mukund/PrivacyPolicies":
         "8fd6abfc7ca99d1f95c7f3f3a5dd5ea0cf9b7deb",
+    # CUAD v1 is one archive on Zenodo; its sha256 is the revision.
+    "zenodo/CUAD_v1": cuad.CUAD_ARCHIVE_SHA256,
 }
 
 # Base document counts at sf=1. LePaRD scales sampled citation pairs
@@ -70,6 +76,7 @@ SETS = {
     "reports": 5_000,
     "claims": 5_000,
     "agent_traces": AGENT_TRACE_DOCUMENTS,
+    "contracts": cuad.CONTRACTS,
     "policies": 1_000_000,
 }
 
@@ -772,12 +779,40 @@ def _build_agent_traces(d, sf, force=False):
     )
 
 
+def _cuad_archive() -> cuad.CuadArchive:
+    """The pinned CUAD archive, downloaded once into the cache."""
+    path = cache_directory() / "sources" / "CUAD_v1.zip"
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".zip.part")
+        urllib.request.urlretrieve(cuad.CUAD_ARCHIVE_URL, temporary)
+        temporary.replace(path)
+    return cuad.CuadArchive(path)
+
+
+def _build_contracts(d, sf, force=False):
+    """Build contracts.parquet, contract_pages.parquet, and files/."""
+    contract_path = d / "contracts.parquet"
+    page_path = d / "contract_pages.parquet"
+    if contract_path.exists() and page_path.exists() and not force:
+        return
+    archive = _cuad_archive()
+    titles = cuad.sample_titles(
+        [entry["title"] for entry in archive.entries()],
+        _n_docs("contracts", sf), DATA_SEED)
+    contracts, pages = cuad.build_contract_tables(
+        archive, titles, d / cuad.FILES_DIR)
+    pq.write_table(contracts, contract_path)
+    pq.write_table(pages, page_path)
+
+
 def _fetch_published_corpus(d, sf, root=None) -> bool:
     """Download the labeled corpus for this scale factor into d.
 
     Returns False when no corpus is published for sf, the bucket is
-    unreachable, or the downloaded tables do not hash to the published
-    corpus id; the caller then builds from the sources.
+    unreachable, a table this code expects is missing, or the
+    downloaded tables do not hash to the published corpus id; the
+    caller then builds from the sources.
     """
     corpus_id = PUBLISHED_CORPORA.get(sf)
     if corpus_id is None:
@@ -785,19 +820,28 @@ def _fetch_published_corpus(d, sf, root=None) -> bool:
     prefix = f"{GROUND_TRUTH_ROOT}/corpora/{corpus_id}"
     try:
         paths = [path for path in _list_files(root, prefix)
-                 if path.endswith(".parquet")]
+                 if path.endswith((".parquet", ".pdf"))]
     except OSError as error:
         print(f"[data] cannot reach the published corpus: {error}", flush=True)
         return False
     if not paths:
         return False
+    expected = {f"{prefix}/{table}.parquet" for table in CORPUS_COLUMNS}
+    if not expected <= set(paths):
+        print(f"[data] published corpus {corpus_id} lacks a table this "
+              "code expects; building from the sources", flush=True)
+        return False
     d.mkdir(parents=True, exist_ok=True)
+    written = []
     for path in paths:
-        (d / Path(path).name).write_bytes(_read_bytes(root, path))
+        local = d / Path(path).relative_to(prefix)
+        local.parent.mkdir(parents=True, exist_ok=True)
+        local.write_bytes(_read_bytes(root, path))
+        written.append(local)
     identity = corpus_identity(read_corpus(d), sf, DATA_SEED, SOURCE_REVISIONS)
     if identity["corpus_id"] != corpus_id:
-        for path in paths:
-            (d / Path(path).name).unlink()
+        for local in written:
+            local.unlink()
         print(f"[data] published corpus {corpus_id} does not match this "
               "code; building from the sources", flush=True)
         return False
@@ -834,10 +878,12 @@ def build_sets(data_dir, sf, lf=1, fetch=True):
         if current == expected:
             _build_lepard(d, sf)
             _build_agent_traces(d, sf)
+            _build_contracts(d, sf)
             return d
         base_sources = {
             name: revision for name, revision in SOURCE_REVISIONS.items()
-            if name != "TIGER-Lab/SWE-Next-SFT-Trajectories"
+            if name not in ("TIGER-Lab/SWE-Next-SFT-Trajectories",
+                            "zenodo/CUAD_v1")
         }
         same_sources = (
             current
@@ -855,6 +901,7 @@ def build_sets(data_dir, sf, lf=1, fetch=True):
                                 for name in other_tables):
             _build_lepard(d, sf, force=True)
             _build_agent_traces(d, sf, force=True)
+            _build_contracts(d, sf, force=True)
             marker.write_text(json.dumps(expected, indent=2, sort_keys=True))
             return d
     if fetch and _fetch_published_corpus(d, sf):
@@ -901,6 +948,7 @@ def build_sets(data_dir, sf, lf=1, fetch=True):
 
     _build_lepard(d, sf, force=True)
     _build_agent_traces(d, sf, force=True)
+    _build_contracts(d, sf, force=True)
 
     marker.write_text(json.dumps(expected, indent=2, sort_keys=True))
     return d
@@ -922,7 +970,14 @@ CORPUS_COLUMNS = {
     "citation_passages": ("id", "passage_text", "passage_ids"),
     "agent_traces": ("id", "trace", "trajectory_id", "turn_index",
                      "token_count"),
+    "contracts": ("id", "title", "page_count", "pdf_sha256", "document",
+                  "clauses"),
+    "contract_pages": ("id", "contract_id", "page_number", "pdf_sha256",
+                       "document", "clauses"),
 }
+# Tables whose `document` column refers to files published beside the
+# tables, under `files/`, instead of holding the document text.
+FILE_TABLES = ("contracts", "contract_pages")
 
 
 def _canonical(value) -> bytes:
@@ -983,6 +1038,39 @@ def read_corpus(data_dir: str | Path) -> dict[str, pa.Table]:
             data_dir / f"{table}.parquet", columns=list(columns))
         for table, columns in CORPUS_COLUMNS.items()
     }
+
+
+def _file_references(table: pa.Table) -> list[str]:
+    return sorted({
+        cuad.parse_document_reference(reference)[0]
+        for reference in table.column("document").to_pylist()})
+
+
+def corpus_files_dir(name: str, table: pa.Table, *, scale_factor: float,
+                     root=None) -> Path:
+    """Download the files a published table refers to and return their root.
+
+    The files land under the download cache, in the published layout
+    `corpora/<corpus_id>/files/`, so the table's relative references
+    resolve against the returned directory. Files already present are
+    kept.
+    """
+    if name not in FILE_TABLES:
+        raise ValueError(f"table {name!r} has no files")
+    corpus = PUBLISHED_CORPORA[scale_factor]
+    directory = cache_directory() / "corpora" / corpus
+    for reference in _file_references(table):
+        local = directory / reference
+        if local.exists():
+            continue
+        local.parent.mkdir(parents=True, exist_ok=True)
+        cached = _cached_file(root, f"{GROUND_TRUTH_ROOT}/corpora/{corpus}/{reference}")
+        if cached is not None:
+            shutil.copyfile(cached, local)
+        else:
+            local.write_bytes(_read_bytes(root, f"{GROUND_TRUTH_ROOT}/corpora/"
+                                          f"{corpus}/{reference}"))
+    return directory
 
 
 def load_table(name: str, *, scale_factor: float = 0.1,

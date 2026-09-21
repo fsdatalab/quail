@@ -16,6 +16,8 @@ dependencies = [
     "protobuf>=6.31.1,<7",
     # counts result rows of a join chain without materializing them
     "duckdb>=1.1,<2",
+    # reads the CUAD contract PDFs: page counts and page text for labels
+    "pypdfium2==4.30.0",
 ]
 
 [dependency-groups]
