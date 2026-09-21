@@ -1617,6 +1617,12 @@ def _aws_credentials() -> dict[str, str]:
 
 
 aws_from_launcher = modal.Secret.from_dict(_aws_credentials())
+# A gated dataset (OfficeQA Pro v2) downloads with the launching
+# machine's Hugging Face token; without one the build of its tables
+# raises PermissionError and the other tables are unaffected.
+hf_from_launcher = modal.Secret.from_dict(
+    {"HF_TOKEN": os.environ["HF_TOKEN"]} if os.environ.get("HF_TOKEN")
+    else {})
 # Experiment cells attach to this existing app so its caches remain useful.
 app = modal.App("quail-milestone1")
 
@@ -1673,7 +1679,8 @@ def run_compact(collection_id: str) -> str:
 @app.function(
     image=image, memory=CPU_MEMORY_MB, timeout=2 * CPU_TIMEOUT_S,
     volumes={"/root/.cache/huggingface": hf_cache,
-             "/results": results_vol})
+             "/results": results_vol},
+    secrets=[hf_from_launcher])
 def run_prepare_corpus(sf: float = SCALE_FACTOR) -> str:
     _mount()
     result = prepare_corpus(sf)

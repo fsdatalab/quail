@@ -102,6 +102,7 @@ def check_queries(sf: float, corpus_id: str, collection_id: str,
     timeout=2 * labels.CPU_TIMEOUT_S,
     volumes={"/root/.cache/huggingface": labels.hf_cache,
              "/results": labels.results_vol},
+    secrets=[labels.hf_from_launcher],
 )
 def build(sf: float) -> str:
     """Build one scale factor's corpus on the volume; return its id."""
