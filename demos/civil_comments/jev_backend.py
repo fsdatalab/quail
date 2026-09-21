@@ -1,15 +1,14 @@
 """Run the Civil Comments comparison query with Jev.
 
-This follows the SQL text's join-then-filter order with the same sample,
-label cutoff, and question text as the Quail backend. Jev's ``noul``
-probability is TRUE when it is at least 0.5.
+Each API request batches every question needed for one comment. Jev's
+``noul`` probability is TRUE when it is at least 0.5.
 
 Set the API key without putting it on the command line, then run:
 
     read -s TYPESAFE_API_KEY
     export TYPESAFE_API_KEY
     uv run python demos/civil_comments/jev_backend.py \
-      --limit 10000 --concurrency 256 \
+      --limit 10000 --concurrency 256 --strategy combined \
       2>&1 | tee /tmp/civil-comments-jev.log
 
 The script checkpoints answers under ``--output`` and resumes missing
@@ -25,6 +24,7 @@ import os
 import time
 import uuid
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
@@ -69,6 +69,20 @@ JOIN_QUESTIONS = {
 }
 
 COMBINED_QUESTIONS = {**FILTER_QUESTIONS, **JOIN_QUESTIONS}
+
+
+@dataclass
+class Execution:
+    """Hold the answers and measurements from one strategy."""
+
+    filter_rows: dict[str, dict]
+    join_rows: dict[str, dict]
+    filter_ids: set[str]
+    join_ids: set[str]
+    wall_s: float
+    api_input_tokens: int
+    filter_wall_s: float | None = None
+    join_wall_s: float | None = None
 
 
 def read_answers(path: Path) -> dict[str, dict]:
@@ -219,11 +233,80 @@ async def run_pass(
     return completed, elapsed_total
 
 
+async def run_combined(
+    comments: list[tuple[str, str]],
+    output: Path,
+    concurrency: int,
+) -> Execution:
+    """Ask all 31 questions in one request per comment."""
+    rows, wall_s = await run_pass(
+        "combined",
+        [
+            (comment_id, {"DOCUMENT 0": text})
+            for comment_id, text in comments
+        ],
+        COMBINED_QUESTIONS,
+        output / "combined.jsonl",
+        concurrency,
+    )
+    ids = set(rows)
+    return Execution(
+        filter_rows=rows,
+        join_rows=rows,
+        filter_ids=ids,
+        join_ids=ids,
+        wall_s=wall_s,
+        api_input_tokens=sum(row["input_tokens"] for row in rows.values()),
+    )
+
+
+async def run_pushdown(
+    comments: list[tuple[str, str]],
+    output: Path,
+    concurrency: int,
+) -> Execution:
+    """Filter comments before asking the 30 field questions."""
+    filter_rows, filter_s = await run_pass(
+        "filter",
+        comments,
+        FILTER_QUESTIONS,
+        output / "filter.jsonl",
+        concurrency,
+    )
+    join_ids = {
+        comment_id
+        for comment_id, row in filter_rows.items()
+        if row["answers"]["toxicity"] >= LABEL_CUTOFF
+    }
+    join_rows, join_s = await run_pass(
+        "join",
+        [
+            (comment_id, {"DOCUMENT 0": text})
+            for comment_id, text in comments
+            if comment_id in join_ids
+        ],
+        JOIN_QUESTIONS,
+        output / "join.jsonl",
+        concurrency,
+    )
+    api_rows = [*filter_rows.values(), *join_rows.values()]
+    return Execution(
+        filter_rows=filter_rows,
+        join_rows=join_rows,
+        filter_ids=set(filter_rows),
+        join_ids=join_ids,
+        wall_s=filter_s + join_s,
+        api_input_tokens=sum(row["input_tokens"] for row in api_rows),
+        filter_wall_s=filter_s,
+        join_wall_s=join_s,
+    )
+
+
 async def evaluate(
     limit: int,
     concurrency: int,
     output: Path,
-    plan_order: str,
+    strategy: str,
 ) -> dict:
     """Run Jev and return its comparison summary."""
     summary_path = output / "summary.json"
@@ -245,100 +328,58 @@ async def evaluate(
                 "comments": len(ids),
                 "label_cutoff": LABEL_CUTOFF,
                 "concurrency": concurrency,
-                "plan_order": plan_order,
+                "strategy": strategy,
             },
             indent=2,
         )
     )
 
     all_comments = list(zip(ids, texts))
-    if plan_order == "sql":
-        filter_ids = set(ids)
-        join_ids = set(ids)
-        combined_rows, query_s = await run_pass(
-            "combined",
-            [
-                (comment_id, {"DOCUMENT 0": text})
-                for comment_id, text in all_comments
-            ],
-            COMBINED_QUESTIONS,
-            output / "combined.jsonl",
-            concurrency,
-        )
-        filter_rows = combined_rows
-        join_rows = combined_rows
-        filter_s = None
-        join_s = None
-        api_rows = combined_rows.values()
-    else:
-        filter_ids = set(ids)
-        filter_rows, filter_s = await run_pass(
-            "filter",
-            all_comments,
-            FILTER_QUESTIONS,
-            output / "filter.jsonl",
-            concurrency,
-        )
-        join_ids = {
-            comment_id
-            for comment_id, row in filter_rows.items()
-            if row["answers"]["toxicity"] >= LABEL_CUTOFF
-        }
-        join_rows, join_s = await run_pass(
-            "join",
-            [
-                (comment_id, {"DOCUMENT 0": text})
-                for comment_id, text in all_comments
-                if comment_id in join_ids
-            ],
-            JOIN_QUESTIONS,
-            output / "join.jsonl",
-            concurrency,
-        )
-        query_s = filter_s + join_s
-        api_rows = [*filter_rows.values(), *join_rows.values()]
+    run_strategy = run_combined if strategy == "combined" else run_pushdown
+    execution = await run_strategy(all_comments, output, concurrency)
     toxic_found = {
         comment_id
-        for comment_id, row in filter_rows.items()
+        for comment_id, row in execution.filter_rows.items()
         if row["answers"]["toxicity"] >= LABEL_CUTOFF
     }
     pairs_found = {
         (comment_id, field)
-        for comment_id, row in join_rows.items()
+        for comment_id, row in execution.join_rows.items()
         if comment_id in toxic_found
         for field, probability in row["answers"].items()
         if field in FIELDS and probability >= LABEL_CUTOFF
     }
     accuracy = accuracy_summary(comments, toxic_found, pairs_found)
-    api_input_tokens = sum(row["input_tokens"] for row in api_rows)
     logical_input_tokens = requested_input_tokens(
         comments,
-        filter_ids=filter_ids,
-        join_ids=join_ids,
+        filter_ids=execution.filter_ids,
+        join_ids=execution.join_ids,
     )
     summary = {
         "backend": "jev",
         "model": MODEL,
-        "plan_order": plan_order,
+        "strategy": strategy,
         "comments": len(ids),
         "concurrency": concurrency,
-        "wall_s": query_s,
-        "filter_wall_s": filter_s,
-        "join_wall_s": join_s,
+        "wall_s": execution.wall_s,
+        "filter_wall_s": execution.filter_wall_s,
+        "join_wall_s": execution.join_wall_s,
         "questions_per_combined_request": (
-            len(COMBINED_QUESTIONS) if plan_order == "sql" else None
+            len(COMBINED_QUESTIONS) if strategy == "combined" else None
         ),
         "input_tokens": logical_input_tokens,
-        "input_tokens_per_second": logical_input_tokens / query_s,
-        "api_input_tokens": api_input_tokens,
-        "api_input_tokens_per_second": api_input_tokens / query_s,
+        "input_tokens_per_second": logical_input_tokens / execution.wall_s,
+        "api_input_tokens": execution.api_input_tokens,
+        "api_input_tokens_per_second": (
+            execution.api_input_tokens / execution.wall_s
+        ),
         "api_cost_usd": (
-            api_input_tokens
+            execution.api_input_tokens
             * USD_PER_MILLION_INPUT_TOKENS
             / 1_000_000
         ),
-        "evaluated_pairs": len(join_ids) * len(FIELDS),
-        "filter_evaluated_comments": len(filter_ids),
+        "evaluated_pairs": len(execution.join_ids) * len(FIELDS),
+        "filter_evaluated_comments": len(execution.filter_ids),
         "accuracy": accuracy,
         "field_counts": dict(Counter(field for _, field in pairs_found)),
         "result_path": str(output),
@@ -354,9 +395,9 @@ def main():
     parser.add_argument("--limit", type=int, default=10_000)
     parser.add_argument("--concurrency", type=int, default=256)
     parser.add_argument(
-        "--plan-order",
-        choices=("sql", "pushdown"),
-        default="sql",
+        "--strategy",
+        choices=("combined", "pushdown"),
+        default="combined",
     )
     parser.add_argument(
         "--output",
@@ -371,7 +412,7 @@ def main():
             args.limit,
             args.concurrency,
             args.output,
-            args.plan_order,
+            args.strategy,
         )
     )
 

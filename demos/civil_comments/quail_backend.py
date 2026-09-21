@@ -1,8 +1,8 @@
 """Run the Civil Comments comparison query with Quail.
 
 The query joins comments to 30 semantic fields and filters for toxicity.
-The package initializer shares the labels, questions, and deterministic
-sample with the Jev backend.
+The package initializer shares the sample, prompts, and scoring code with
+the Jev backend.
 
 Run one or two H100s from the repository root:
 
@@ -33,6 +33,7 @@ from demos.civil_comments import (
     accuracy_summary,
     fields_table,
     load_comments,
+    requested_input_tokens,
 )
 from quail.bench.images import gpu_image
 
@@ -55,63 +56,6 @@ def build_sql() -> str:
       ON AI_FILTER(PROMPT('{JOIN_PROMPT}', c.text, f.statement))
     WHERE AI_FILTER(PROMPT('{FILTER_PROMPT}', c.text))
 """
-
-
-def own_answers(result):
-    """Return a callable that replays a run's answers."""
-    filters, joins = {}, {}
-    for (alias, _), table in result.answer_tables["filters"].items():
-        for row in table.to_pylist():
-            filters[(alias, row[alias])] = bool(row["answer"])
-    for table in result.answer_tables["joins"].values():
-        aliases = [name for name in table.column_names if name != "answer"]
-        for row in table.to_pylist():
-            key = tuple(sorted((alias, row[alias]) for alias in aliases))
-            joins[key] = bool(row["answer"])
-
-    def answer(prompt, assignment):
-        if len(prompt.args) == 1:
-            alias = prompt.args[0].alias
-            return filters.get((alias, assignment[alias]), False)
-        return joins.get(tuple(sorted(assignment.items())), False)
-
-    return answer
-
-
-def requested_input_tokens(session, query, result) -> int:
-    """Sum full prompt lengths for every filter and join evaluation."""
-    comment_lengths = np.asarray(session.token_lengths("comments", "text"))
-    canvas = session.model.canvas_tokens
-    filter_prompt = query.logical.operators().filters["c"][0].prompt
-    total = int(
-        (
-            filter_prompt.preamble_tokens
-            + comment_lengths
-            + filter_prompt.tail_tokens
-            + canvas
-        ).sum()
-    )
-    join_prompt = query.logical.operators().joins[0].prompt
-    labels = {
-        alias: (label, frame) for alias, label, frame in join_prompt.labels
-    }
-    field_lengths = np.asarray(session.token_lengths("fields", "statement"))
-    answers = result.answer_tables["filters"][("c", 0)]
-    survivors = answers.filter(answers["answer"])["c"].to_numpy()
-    pair_fixed = (
-        join_prompt.preamble_tokens
-        + labels["c"][1]
-        + labels["f"][0]
-        + join_prompt.tail_tokens
-        + canvas
-    )
-    field_sum = int(field_lengths.sum())
-    for row in survivors:
-        total += len(field_lengths) * (
-            pair_fixed + int(comment_lengths[int(row)])
-        )
-        total += field_sum
-    return total
 
 
 def json_ready(value):
@@ -176,8 +120,6 @@ def evaluate(directory: Path, limit: int | None, gpus: int) -> dict:
         result = query.run()
         table = result.collect()
         report = dict(result.report)
-        input_tokens = requested_input_tokens(session, query, result)
-        ideal = quail.speed_of_light_estimate(query, own_answers(result))
 
     answers = result.answer_tables["filters"][("c", 0)]
     pq.write_table(answers, directory / "filter_answers.parquet")
@@ -189,6 +131,11 @@ def evaluate(directory: Path, limit: int | None, gpus: int) -> dict:
         )
         if yes
     }
+    input_tokens = requested_input_tokens(
+        comments,
+        filter_ids=set(ids),
+        join_ids=toxic_found,
+    )
     pq.write_table(table, directory / "retained.parquet")
     pairs_found = {
         (row["c.comment_id"], row["f.field"]) for row in table.to_pylist()
@@ -218,10 +165,6 @@ def evaluate(directory: Path, limit: int | None, gpus: int) -> dict:
         ),
         "accuracy": accuracy,
         "field_counts": dict(Counter(field for _, field in pairs_found)),
-        "sol_s": ideal.seconds,
-        "sol_fresh_tokens": ideal.fresh_tokens,
-        "wall_over_sol": wall_s / ideal.seconds,
-        "sol": ideal.as_dict(),
         "result_volume_path": str(directory),
     }
     summary = json_ready(summary)

@@ -51,19 +51,16 @@ WHERE AI_FILTER(
 
 The query has no selectivity hints.
 
-## Execution strategies
+## Execution
 
-Quail pushes the toxicity predicate below the join.
+Quail pushes the toxicity predicate below the join. Jev batches questions by
+comment; it never sends one request per comment-field pair.
 
-Jev supports two configurations:
-
-- **No query planning:** Send one API request per comment. Each request has 31
-  `noul` questions: one toxicity question and 30 semantic-field questions.
-  Apply the toxicity answer after the request.
-- **Push down predicate:** Send one toxicity question per comment. For each
-  survivor, send one request containing all 30 semantic-field questions.
-
-The Jev client never sends one request per comment-field pair.
+| Jev strategy | Requests | Questions per request |
+|---|---:|---:|
+| Combined, no planning | 10,000 | 31 |
+| Pushdown filter | 10,000 | 1 |
+| Pushdown fields | 3,016 | 30 |
 
 ## Results
 
@@ -85,8 +82,8 @@ read -s TYPESAFE_API_KEY
 export TYPESAFE_API_KEY
 
 uv run python demos/civil_comments/jev_backend.py \
-  --limit 10000 --concurrency 256 --plan-order sql
+  --limit 10000 --concurrency 256 --strategy combined
 
 uv run python demos/civil_comments/jev_backend.py \
-  --limit 10000 --concurrency 256 --plan-order pushdown
+  --limit 10000 --concurrency 256 --strategy pushdown
 ```
