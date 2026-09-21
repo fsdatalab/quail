@@ -92,7 +92,7 @@ BIO-4 turns its joins into separate requests for every candidate report and reac
 ::: {.figure-block .wide-figure}
 [![Five seconds of GPU activity during a BIO-4 join with the vLLM baseline.](figures/bio4_vllm_bubbles.png){width=100%}](figures/bio4_vllm_bubbles.pdf)
 
-*Figure 2. BIO-4 join at scale factor 0.1 with the vLLM baseline. Green marks when the GPU is busy. White gaps on the GPU row are idle time while the host prepares the next batch of requests. Orange on the CPU row marks host scheduling work.*
+*Figure 2. BIO-4 join at scale factor 0.1 with the vLLM baseline. Green marks busy GPU kernels. Orange marks vLLM scheduler or Quail executor annotations, and purple marks vLLM `execute_context` annotations. White gaps on the GPU row are idle time while the host prepares the next batch of requests.*
 :::
 
 The corresponding Quail timeline appears with the BIO-4 experiments in Section 4.3.
@@ -539,7 +539,7 @@ BIO-4 is the motivating query in this post. At scale factor 1.0, it filters 5,00
 ::: {.figure-block .wide-figure}
 [![Five seconds of GPU activity during a BIO-4 join with Quail and the vLLM baseline.](figures/bio4_profile_comparison.png){width=100%}](figures/bio4_profile_comparison.pdf)
 
-*Figure 10. The same BIO-4 join window for Quail on the left and the vLLM baseline on the right. These profile windows come from a scale factor 0.1 run. Quail keeps the GPU busy. The baseline shows idle gaps.*
+*Figure 10. The same BIO-4 join window for Quail on the left and the vLLM baseline on the right. These profile windows come from a scale factor 0.1 run. Green marks busy GPU kernels. Orange marks vLLM scheduler or Quail executor annotations, and purple marks vLLM `execute_context` annotations. Quail keeps the GPU busy, while the baseline shows idle gaps.*
 :::
 
 Quail takes 29.26 minutes, compared with 6.84 hours for the vLLM baseline. Quail is 14.04 times faster. It is 1.96 times the SoL estimate, while the vLLM baseline is 27.55 times the estimate.
