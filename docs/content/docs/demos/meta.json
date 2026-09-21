@@ -3,7 +3,6 @@
   "pages": [
     "index",
     "imdb-filter",
-    "civil-comments-join",
     "civil-comments",
     "editing-plans",
     "agent-trace-compaction"

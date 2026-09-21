@@ -56,15 +56,11 @@ WHERE AI_FILTER(
 
 The query has no selectivity hints.
 
-## Models
+## Model
 
-Quail runs [DiffusionGemma 26B-A4B fp8][diffusion-gemma] on one H100. The Jev
-comparison runs use [Jev 1.13.0][jev]. One call to Jev can answer the toxicity
-question and all 30 field questions for one comment.
+Quail runs [DiffusionGemma 26B-A4B fp8][diffusion-gemma] on one H100.
 
 ## Execution
-
-### Quail
 
 The Quail planner places the toxicity filter below the join. The relevant
 part of `query.explain()` is:
@@ -90,37 +86,18 @@ The two steps are pipelined. `AiJoin` starts when `AiFilter` produces the
 first matching comment rather than waiting for all 10,000 filter checks.
 The join reuses the comment KV computed by the filter.
 
-### Jev
-
-We provide two execution plans using Jev:
-
-- The *combined plan* asks all 31 questions in one call. Jev answers the 30
-  field questions even when the toxicity answer is negative.
-- The *toxicity-first plan* asks the toxicity question first. A second call
-  asks the 30 field questions only when the toxicity answer is positive.
-
-| Jev strategy | Request contents | Requests | Questions per request |
-|---|---|---:|---:|
-| Combined | Toxicity and all fields | 10,000 | 31 |
-| Toxicity first | Toxicity check | 10,000 | 1 |
-| Toxicity first | Field checks after toxicity passes | 3,016 | 30 |
-
 ## Results
 
 Primary query time and cost exclude model startup.
 
-| Backend | Query time | Tokens/s | Cost | Cost vs. Quail | Filter F1 | Join F1 |
-|---|---:|---:|---:|---:|---:|---:|
-| Quail, DiffusionGemma 26B-A4B fp8, 1 H100 | **85.53 s** | 284,022 | **$0.0938** | **1.00×** | 0.413 | **0.287** |
-| Jev 1.13.0, num_threads = 256 (combined) | 244.87 s | **313,379** | $1.8892 | **20.13×** | 0.425 | 0.260 |
-| Jev 1.13.0, num_threads = 256 (toxicity first) | 100.20 s | 253,935 | $0.7705 | **8.21×** | **0.430** | 0.263 |
+| Backend | Query time | Tokens/s | Cost | Filter F1 | Join F1 |
+|---|---:|---:|---:|---:|---:|
+| Quail, DiffusionGemma 26B-A4B fp8, 1 H100 | 85.53 s | 284,022 | $0.0938 | 0.413 | 0.287 |
 
 ## Run
 
 The source lives under
 [`demos/civil_comments/`](https://github.com/fsdatalab/quail/tree/main/demos/civil_comments).
-
-### Quail
 
 <Tabs items={['Local H100', 'Modal']}>
 <Tab>
@@ -148,26 +125,5 @@ function call id before waiting for the query.
 </Tab>
 </Tabs>
 
-### Jev
-
-```bash
-read -s TYPESAFE_API_KEY
-export TYPESAFE_API_KEY
-
-uv run --with 'httpx[http2]==0.28.1' \
-  python demos/civil_comments/jev_backend.py \
-  --limit 10000 --concurrency 256 --strategy combined \
-  --output results/civil-comments/jev/combined
-
-uv run --with 'httpx[http2]==0.28.1' \
-  python demos/civil_comments/jev_backend.py \
-  --limit 10000 --concurrency 256 --strategy pushdown \
-  --output results/civil-comments/jev/pushdown
-```
-
-The Jev runner writes local checkpoints under
-`results/civil-comments/jev/`.
-
 [dataset]: https://huggingface.co/datasets/pietrolesci/civilcomments-wilds
 [diffusion-gemma]: https://huggingface.co/RedHatAI/diffusiongemma-26B-A4B-it-FP8-dynamic
-[jev]: https://docs.typesafe.ai
