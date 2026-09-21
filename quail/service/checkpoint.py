@@ -35,35 +35,52 @@ def restore(source: Path, destination: Path) -> bool:
 
 
 class Checkpoint:
-    """Copy the store to ``target`` after each change, then call ``commit``.
+    """Copy the store to ``target`` after changes, then call ``commit``.
 
-    Copies are made at most once per ``min_interval_s`` and only when the
-    store has new committed writes. ``commit`` is what makes the copy and
-    every other file written since durable (``volume.commit`` on Modal).
-    The window of loss on a sudden container death is one interval.
+    A state change (a record created, started, finished, cancelled, or
+    given its plan) is copied within ``min_interval_s``. A write that
+    only moved a progress counter is copied at most every
+    ``progress_interval_s``; losing it costs nothing, because a restart
+    marks an unfinished record interrupted anyway. Every copy is a full
+    copy of the database file plus one ``commit`` (``volume.commit`` on
+    Modal), so this keeps a long-running query from copying the file
+    once a second.
     """
 
     def __init__(self, store: Store, target: Path,
                  commit: Callable[[], None] | None = None,
-                 min_interval_s: float = 1.0):
+                 min_interval_s: float = 1.0,
+                 progress_interval_s: float = 30.0):
         self.store = store
         self.target = Path(target)
         self.commit = commit
         self.min_interval_s = min_interval_s
+        self.progress_interval_s = progress_interval_s
         self._seen = -1
+        self._seen_durable = -1
+        self._last_copy = 0.0
         self._stop = threading.Event()
         self._thread = None
         self.copies = 0
 
-    def run_once(self) -> bool:
-        """Copy and commit when there are new writes. Returns True if it did."""
+    def run_once(self, force: bool = False) -> bool:
+        """Copy and commit when a copy is due. Returns True if it did.
+
+        ``force`` copies any new write now, ignoring the progress timer.
+        """
         count = self.store.write_count
+        durable = self.store.durable_write_count
         if count == self._seen or self.store.closed:
+            return False
+        progress_only = durable == self._seen_durable
+        if (progress_only and not force
+                and time.monotonic() - self._last_copy < self.progress_interval_s):
             return False
         self.store.backup(self.target)
         if self.commit is not None:
             self.commit()
-        self._seen = count
+        self._seen, self._seen_durable = count, durable
+        self._last_copy = time.monotonic()
         self.copies += 1
         return True
 
@@ -92,7 +109,7 @@ class Checkpoint:
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             try:
-                self.run_once()
+                self.run_once(force=True)
                 return
             except Exception:
                 logger.exception("final checkpoint of %s failed", self.target)

@@ -111,6 +111,7 @@ class Store:
         self._changed = threading.Condition(self._lock)
         # committed write transactions since open; a checkpoint compares it
         self.write_count = 0
+        self.durable_write_count = 0
         self.closed = False
         self._conn = sqlite3.connect(
             str(self.path), check_same_thread=False, isolation_level=None)
@@ -127,8 +128,14 @@ class Store:
 
     # -- transactions -----------------------------------------------------
 
-    def _write(self, statement: str, parameters=()) -> int:
-        """Run one write statement in its own transaction; return rowcount."""
+    def _write(self, statement: str, parameters=(), *,
+               durable: bool = True) -> int:
+        """Run one write statement in its own transaction; return rowcount.
+
+        ``durable=False`` marks a write whose loss on a crash costs
+        nothing (a progress counter); ``durable_write_count`` skips it so
+        a checkpoint can copy the file less often.
+        """
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -138,6 +145,8 @@ class Store:
                 self._conn.execute("ROLLBACK")
                 raise
             self.write_count += 1
+            if durable:
+                self.durable_write_count += 1
             self._changed.notify_all()
             return cursor.rowcount
 
@@ -284,7 +293,8 @@ class Store:
         parameters.extend([query_id, epoch, *sorted(ACTIVE_STATES)])
         count = self._write(
             f"UPDATE queries SET {', '.join(assignments)} WHERE id = ? "
-            "AND execution_epoch = ? AND state IN (?, ?)", parameters)
+            "AND execution_epoch = ? AND state IN (?, ?)", parameters,
+            durable=state is not None or plan is not None)
         return count == 1
 
     def finish(self, query_id: str, epoch: int, state: str, *,

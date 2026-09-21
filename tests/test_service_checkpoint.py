@@ -77,6 +77,33 @@ def test_checkpoint_copies_after_writes_and_commits(tmp_path):
     assert not checkpoint.run_once()
 
 
+def test_progress_only_writes_are_copied_on_the_slow_timer(tmp_path):
+    store = Store(tmp_path / "live" / "quail.sqlite3")
+    copy = tmp_path / "volume" / "quail.sqlite3"
+    checkpoint = Checkpoint(store, copy, progress_interval_s=0.3)
+    status = create(store)
+    epoch = store.begin(status.id)
+    assert checkpoint.run_once(), "a state change is copied at once"
+
+    for done in range(1, 4):
+        store.update(status.id, epoch, progress={"done": done})
+        assert not checkpoint.run_once(), "progress alone waits for the timer"
+    assert store.write_count == store.durable_write_count + 3
+    time.sleep(0.35)
+    assert checkpoint.run_once(), "the timer ran out"
+    with sqlite3.connect(str(copy)) as conn:
+        assert conn.execute("SELECT progress_json FROM queries").fetchone() == (
+            '{"done": 3}',)
+
+    store.update(status.id, epoch, progress={"done": 4})
+    assert not checkpoint.run_once()
+    assert checkpoint.run_once(force=True), "stop() forces the last progress"
+    store.update(status.id, epoch, progress={"done": 5})
+    store.update(status.id, epoch, state="running")
+    assert checkpoint.run_once(), "a state change is not held back"
+    store.close()
+
+
 def test_checkpoint_survives_a_failing_commit(tmp_path, caplog):
     store = Store(tmp_path / "live" / "quail.sqlite3")
     calls = []
