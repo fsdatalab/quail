@@ -46,12 +46,18 @@ from quail_b.scoring import RunOutput, reference_answer
 SELECTIVITY = {**FILTER_SELECTIVITY_ESTIMATES, **JOIN_SELECTIVITY_ESTIMATES}
 
 
+# A PDF provider forms these columns from the files it opens, so the
+# benchmark's copies are dropped rather than carried beside them.
+PDF_FORMED_COLUMNS = ("document", "page_count", "page_number")
+
+
 def pdf_provider(rows: pa.Table):
     """A PDF provider whose query rows are a file table's rows, in order.
 
     A `document` of `<path>` makes one row per file. A `document` of
     `<path>#page=<n>` makes one row per listed page. Either way the
-    rows keep the benchmark ids, so Quail's answers name them.
+    rows keep the benchmark ids, so Quail's answers name them, and
+    their other columns, so ordinary join conditions can read them.
 
     Raises:
         ValueError: The references mix the two forms.
@@ -60,14 +66,15 @@ def pdf_provider(rows: pa.Table):
                   for reference in rows.column("document").to_pylist()]
     paths = [path for path, _page in references]
     pages = [page for _path, page in references]
+    carried = rows.drop_columns(
+        [name for name in PDF_FORMED_COLUMNS if name in rows.schema.names])
+    carried = carried.append_column("path", pa.array(paths, pa.string()))
     if all(page is None for page in pages):
-        sources = pa.table({"id": _ids(rows), "path": paths})
         return quail.DocumentProvider.from_pdfs(
-            sources, id_col="id", path_col="path", row_mode="pdf")
+            carried, id_col="id", path_col="path", row_mode="pdf")
     if any(page is None for page in pages):
         raise ValueError("a file table names whole files or pages, not both")
-    listed = pa.table({"id": _ids(rows), "path": paths,
-                       "page": pa.array(pages, pa.int32())})
+    listed = carried.append_column("page", pa.array(pages, pa.int32()))
     return quail.DocumentProvider.from_pdf_pages(
         listed, id_col="id", path_col="path", page_col="page")
 

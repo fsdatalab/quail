@@ -13,6 +13,8 @@ from quail_b.data import ASPECTS, SCENARIOS
 from quail_b.queries import QUERY_ORDER
 
 CUAD_QUERIES = {f"CUAD-{i}" for i in range(1, 6)}
+FIN_QUERIES = {"FIN-1", "FIN-2"}
+PDF_QUERIES = CUAD_QUERIES | FIN_QUERIES
 
 
 def _standin_sets(tmp_path):
@@ -60,7 +62,42 @@ def _standin_sets(tmp_path):
         "scenario": SCENARIOS,
     }), tmp_path / "scenarios.parquet")
     _standin_contracts(tmp_path, page_counts=(2, 1, 40))
+    _standin_filings(tmp_path, page_counts=(3, 2))
     return tmp_path
+
+
+def _blank_pdf(path, page_count) -> str:
+    """Write a PDF of blank letter pages; return its sha256."""
+    document = pypdfium2.PdfDocument.new()
+    for _ in range(page_count):
+        document.new_page(612, 792)
+    document.save(str(path))
+    document.close()
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _standin_filings(tmp_path, page_counts):
+    """Blank filing PDFs under files/, one question per filing."""
+    files = tmp_path / "files"
+    files.mkdir(exist_ok=True)
+    questions, pages = [], []
+    for index, count in enumerate(page_counts):
+        digest = _blank_pdf(files / f"f{index}.pdf", count)
+        questions.append({
+            "id": f"fq{index}", "financebench_id": f"financebench_id_{index:05d}",
+            "filing": f"f{index}", "doc_name": f"FILING{index}", "company": "Co",
+            "question_type": "metrics-generated",
+            "question": f"question {index}", "answer": "42",
+            "evidence_pages": [1]})
+        pages += [{
+            "id": f"f{index}p{page}", "filing": f"f{index}",
+            "doc_name": f"FILING{index}", "page_number": page,
+            "page_count": count, "pdf_sha256": digest,
+            "document": f"files/f{index}.pdf#page={page}"}
+            for page in range(1, count + 1)]
+    pq.write_table(pa.Table.from_pylist(questions),
+                   tmp_path / "filing_questions.parquet")
+    pq.write_table(pa.Table.from_pylist(pages), tmp_path / "filing_pages.parquet")
 
 
 def _standin_contracts(tmp_path, page_counts):
@@ -69,13 +106,7 @@ def _standin_contracts(tmp_path, page_counts):
     files.mkdir(exist_ok=True)
     contracts, pages = [], []
     for index, count in enumerate(page_counts):
-        document = pypdfium2.PdfDocument.new()
-        for _ in range(count):
-            document.new_page(612, 792)
-        path = files / f"ct{index}.pdf"
-        document.save(str(path))
-        document.close()
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        digest = _blank_pdf(files / f"ct{index}.pdf", count)
         contracts.append({
             "id": f"ct{index}", "title": f"contract {index}",
             "page_count": count, "pdf_sha256": digest,
@@ -112,13 +143,13 @@ def test_all_queries_compile_and_plan(tmp_path):
             *(f"LEP-{i}" for i in range(1, 6)),
             "AGENT-1", "AGENT-2",
             "PRIV-1", "PRIV-2",
-            *CUAD_QUERIES,
+            *PDF_QUERIES,
         }
         assert set(qdefs) == expected
         assert set(QUERY_ORDER) == expected - {"PRIV-1", "PRIV-2"}
         for qid, (_, build) in qdefs.items():
             query = build()
-            if qid in CUAD_QUERIES:
+            if qid in PDF_QUERIES:
                 # PDF rows need a model that takes images
                 plan = query.plan()
                 assert isinstance(plan, Refusal), qid
@@ -159,14 +190,19 @@ def test_cuad_queries_plan_on_an_image_model_over_bounded_pdf_rows(tmp_path):
     assert "contracts" not in sess.catalog
     assert sess.catalog.get("contracts[page_count<=32]").statistics().row_count == 2
     assert sess.catalog.get("contract_pages").statistics().row_count == 43
-    for qid in sorted(CUAD_QUERIES):
+    # the page rows keep the benchmark's join columns beside the pages
+    assert "filing" in sess.catalog.get("filing_pages").columns
+    for qid in sorted(PDF_QUERIES):
         query = queries(sess)[qid][1]()
         plan = query.plan()
         assert not isinstance(plan, Refusal), f"{qid} refused: {plan}"
         explained = query.explain()
         assert "physical:" in explained, qid
-        mode = "page" if qid in ("CUAD-1", "CUAD-2") else "pdf"
+        mode = "pdf" if qid in ("CUAD-3", "CUAD-4", "CUAD-5") else "page"
         assert f"row_mode={mode}" in explained, qid
+        if qid in FIN_QUERIES:
+            # the pages anchor the join; the questions are the partners
+            assert "anchor=p" in explained, qid
 
 
 def test_page_rows_keep_their_benchmark_ids_through_a_symlinked_directory(
