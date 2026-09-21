@@ -15,6 +15,28 @@ ACT_BYTES_PER_HIDDEN = 32
 
 
 @dataclass(frozen=True)
+class VisionTower:
+    """The image encoder in front of a decoder.
+
+    A ViT: a patch projection, then layers of full (non-causal)
+    attention and a gated MLP, then a linear map from `hidden` into
+    the decoder width. `position_rows` is one axis of the learned 2D
+    position table. The tower this describes runs in bf16, including
+    on the fp8 text checkpoint, which leaves these weights unquantized.
+    """
+
+    layers: int
+    hidden: int
+    heads: int
+    head_dim: int
+    kv_heads: int
+    intermediate: int
+    position_rows: int
+    weight_precision: Precision = "bf16"
+    weight_bytes: float = 2.0
+
+
+@dataclass(frozen=True)
 class ModelSpec:
     name: str
     params: float        # P: dense parameter count; 2P FLOPs per token
@@ -92,6 +114,7 @@ class ModelSpec:
     image_reserve_bytes: float = 0.0    # GPU memory kept free of KV for
     #                                     the vision encoder's activations
     #                                     when a query binds images
+    vision_tower: VisionTower | None = None    # None: no image encoder
 
     @property
     def image_frame_tokens(self) -> int:

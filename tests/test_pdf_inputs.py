@@ -265,6 +265,21 @@ def test_the_estimate_prices_every_page_image_in_full(sources):
         assert estimate.fresh_tokens == 5 * (
             preamble + per_page + question + GEMMA.canvas_tokens)
         assert estimate.documents_by_alias == {"p": 5}
+        # the landscape page is letter rotated, so every page has the
+        # same soft token count; attention stays inside each page
+        patches = letter_soft(280) * GEMMA.image_pool_kernel ** 2
+        assert estimate.work.image_patches == 5 * patches
+        assert estimate.work.image_pairs == 5 * patches * patches
+        assert estimate.work.image_soft_tokens == 5 * letter_soft(280)
+        tower = GEMMA.vision_tower
+        attention = estimate.latency.component("vision_attention")
+        assert attention.precision == "bf16"
+        assert attention.flops == (
+            4 * tower.heads * tower.head_dim * tower.layers
+            * estimate.work.image_pairs)
+        assert [c.name for c in estimate.latency.components][:5] == [
+            "vision_embed", "vision_attn_proj", "vision_mlp",
+            "vision_attention", "vision_project"]
 
 
 def test_pdf_scan_round_trips_through_the_envelope(sources):

@@ -11,7 +11,8 @@ oracle at every step.
 The equations are in docs/content/docs/architecture/planning.mdx. The
 work counting and component pricing are the planner's own
 (quail.cost.work, quail.cost.sol); the search does not call or
-simulate the production planner.
+simulate the production planner. An image page is embedded once by
+the vision tower, with full attention inside the page.
 """
 
 from __future__ import annotations
@@ -23,8 +24,10 @@ from typing import Callable, Mapping
 
 from quail.cost import budgets
 from quail.cost.sol import SpeedOfLight, speed_of_light
+from quail.cost.vision_cost import image_work
 from quail.cost.work import Work, ask, scan, triangle
 from quail.execution.pairs import pair_table
+from quail.execution.pdf_inputs import PdfScanInput
 from quail.logical import oriented_join_conditions
 from quail.planner.decide import (
     default_order_rule,
@@ -39,6 +42,38 @@ from quail.specs import DeviceSpec, ModelSpec
 # answer(prompt, assignment) -> bool, where assignment maps each alias
 # in the prompt to a row index of that alias's corpus table
 AnswerOracle = Callable[[object, Mapping[str, int]], bool]
+
+
+def image_page_sizes(pdf_inputs, *, credit_shared: bool
+                     ) -> list[tuple[float, float]]:
+    """Return one (width, height) per page the vision tower embeds.
+
+    A page a row names twice is embedded once. With credit_shared, a
+    page two inputs name (same source path, size, mtime, and page
+    index) is embedded once across them.
+
+    Args:
+        pdf_inputs: The PDF inputs bound to the query's image scans.
+        credit_shared: Whether pages shared across those inputs count
+            once.
+    """
+    sizes = []
+    seen = set()
+    for pdf_input in pdf_inputs:
+        named = set()
+        for row in pdf_input.rows:
+            named.update(row.page_ids)
+        for page_id in sorted(named):
+            page = pdf_input.pages[page_id]
+            source = pdf_input.sources[page.source_index]
+            if credit_shared:
+                key = (source.path, source.size, source.mtime_ns,
+                       page.page_index)
+                if key in seen:
+                    continue
+                seen.add(key)
+            sizes.append((page.width_points, page.height_points))
+    return sizes
 
 
 @dataclass(frozen=True)
@@ -87,6 +122,16 @@ class SpeedOfLightEstimate:
 
     def assumptions(self) -> dict:
         """Return what the estimate takes as given, for a report."""
+        if not self.work.image_patches:
+            image_tower = "no images"
+        elif self.credit_shared_prefixes:
+            image_tower = (
+                "each distinct page embedded once, full attention inside "
+                "the page, tower weights read once")
+        else:
+            image_tower = (
+                "each alias's pages embedded once, full attention inside "
+                "the page, tower weights read once")
         return {
             "persistent_kv_capacity": "unlimited",
             "gpu_count": 1,
@@ -107,6 +152,7 @@ class SpeedOfLightEstimate:
                 "each document computed once"),
             "streamed_partner_kv": "not reusable",
             "chunk_tokens": self.chunk_tokens,
+            "image_tower": image_tower,
         }
 
     def as_dict(self) -> dict:
@@ -129,6 +175,9 @@ class SpeedOfLightEstimate:
             "sliding_kv_read": self.work.sliding_kv_read,
             "kv_written": self.work.kv_written,
             "kv_read": self.work.kv_read,
+            "image_patches": self.work.image_patches,
+            "image_pairs": self.work.image_pairs,
+            "image_soft_tokens": self.work.image_soft_tokens,
             "components": [
                 {
                     "name": component.name,
@@ -196,8 +245,11 @@ class _Search:
         self.order = query.order
         self.pre = preamble_tokens(self.filters, self.joins)
         self.aliases: dict[str, _AliasData] = {}
+        self.pdf_inputs = []
         for scan_node in self.scans:
             store = stores[scan_node.alias]
+            if isinstance(store, PdfScanInput):
+                self.pdf_inputs.append(store.pdf_input)
             tokens = [int(length) for length in store.lengths]
             credits = (prefix_credits(store) if credit_shared
                        else [0] * len(tokens))
@@ -606,13 +658,18 @@ def speed_of_light_estimate(
     resident = frozenset(search.filters)
     base_rows = {alias: tuple(rows) for alias, rows in survivors.items()}
     best, result = search.run_joins(base_rows, resident, filter_work)
+    # Every plan embeds the same pages, so the tower is priced once,
+    # after the search, and does not change which plan wins.
+    work = best.work + image_work(
+        image_page_sizes(search.pdf_inputs, credit_shared=credit_shared_prefixes),
+        model, query.session.image_tokens)
     return SpeedOfLightEstimate(
         model=model.name,
         device=device.name,
         chunk_tokens=chunk_tokens,
         credit_shared_prefixes=credit_shared_prefixes,
-        work=best.work,
-        latency=speed_of_light(best.work, model, device, chunk_tokens),
+        work=work,
+        latency=speed_of_light(work, model, device, chunk_tokens),
         usd_per_hour=device.usd_per_hour,
         alias_columns={
             alias: data.column for alias, data in search.aliases.items()},
