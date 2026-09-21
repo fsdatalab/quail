@@ -173,14 +173,18 @@ collection automatically when accuracy scoring is enabled.
 
 | Scale factor | Corpus | Reference collection |
 |---|---|---|
-| 0.1 | `c_89e6d982644aad4553e7893a5a53c481` | `gt_a74b54853e14c80f5a7327f298b880ad` |
-| 0.5 | `c_b5e46fdff06aabae95ba6905f08a31de` | `gt_a93ababf8933c23cf93f739e6d214d27` |
-| 1.0 | `c_424dc3196ca47bd0ab131129ec8d48df` | `gt_c2872eec5eff63c1fcd64a3d103776a3` |
+| 0.1 | `c_fb3ae1edb53c9eed1bdeec608b67a074` | `gt_a843f5845f6c5b7c980f6266c2be072d` |
+| 0.5 | `c_e6ac5ca1467ce66ff3e3efc703d03d44` | `gt_338b6803014990488d2485775ee0eb07` |
+| 1.0 | `c_68919f501432599e6817a92a28e756ae` | `gt_5cd55c4ba1035ea0ef713541a6e65900` |
 
-Adding the two CUAD tables gave every scale factor a new corpus id.
-The collections above reuse all 23 earlier label sets unchanged (each
-reused set's table manifest matched exactly) and add the 8 CUAD label
-sets, which come from the CUAD annotation and needed no inference.
+Adding the two CUAD tables, and then the two FinanceBench tables, gave
+every scale factor a new corpus id each time. The collections above
+reuse the 31 earlier label sets unchanged (each reused set's table
+manifest matched exactly): the 23 text sets and the 8 CUAD sets, which
+come from the CUAD annotation and needed no inference. They add the 2
+FinanceBench sets: the evidence-page join from the annotation, and the
+calculation filter from the reference model over 15, 75, and 150
+questions.
 
 ### QUAIL-B-PDF
 
@@ -224,7 +228,10 @@ figures, an AI filter over the question text labeled by the reference
 model like the text predicates. The join's reference labels are the
 evidence pages: a (question, page) pair is TRUE when the page is one of
 the question's evidence pages. Scale factors sample questions, so the
-page count follows from the sampled questions' filings.
+page count follows from the sampled questions' filings: 1,747, 7,568,
+and 12,013 pages at the three scale factors, with 17, 91, and 187
+evidence pairs; the reference model keeps 8, 33, and 70 of the
+questions for FIN-2.
 
 Queries use two LLM-powered relational operators:
 

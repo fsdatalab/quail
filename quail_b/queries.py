@@ -84,9 +84,10 @@ FILTER_SELECTIVITY_ESTIMATES = {
     CUAD_LICENSE_GRANT: 19 / 40,
     CUAD_NON_TRANSFERABLE_LICENSE: 9 / 40,
     CUAD_PERPETUAL_LICENSE: 2 / 40,
-    # 100 of the 150 FinanceBench questions carry a reasoning label;
-    # 63 of those name numerical or logical reasoning over figures.
-    FIN_NEEDS_CALCULATION: 63 / 100,
+    # FinanceBench sf=0.1 labels: gt_a843f5845f6c5b7c980f6266c2be072d.
+    # The judge kept 8 of the 15 sampled questions; the dataset's own
+    # reasoning labels had put the rate near 63 of 100.
+    FIN_NEEDS_CALCULATION: 8 / 15,
 }
 JOIN_SELECTIVITY_ESTIMATES = {
     DISCUSS_ASPECT: 17683 / 60000,
@@ -95,9 +96,10 @@ JOIN_SELECTIVITY_ESTIMATES = {
     SUPPORT: 311 / 143500,
     REFUTE: 477 / 143500,
     LEPJOIN: 500 / 216500,
-    # FinanceBench marks 189 evidence pages for its 150 questions; the
-    # 84 filings they read hold 12,600 pages between them.
-    FIN_PAGE_EVIDENCE: 189 / (150 * 12600),
+    # FinanceBench sf=0.1 labels, gt_a843f5845f6c5b7c980f6266c2be072d:
+    # 17 evidence pages among the 15 questions and the 1,747 pages of
+    # their filings, over every (question, page) pair.
+    FIN_PAGE_EVIDENCE: 17 / (15 * 1747),
 }
 
 
