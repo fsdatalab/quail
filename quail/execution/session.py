@@ -16,8 +16,8 @@ from pyarrow import compute as pc
 from quail.builtins import built_in_registry
 from quail.catalog import (
     Catalog,
+    OcrProvider,
     PDFProvider,
-    PdfTextProvider,
     ScanRequest,
     TableProvider,
 )
@@ -49,7 +49,6 @@ from quail.logical import (
     join_conditions,
     oriented_join_conditions,
 )
-from quail.pdf import PdfTextOptions
 from quail.pdf.prompt import PagePrompts
 from quail.physical import (
     PhysicalScan,
@@ -61,7 +60,6 @@ from quail.physical import (
 from quail.planner import explain, plan_query
 from quail.planner.logical_optimizer import LogicalPlanningContext, apply_logical_rules
 from quail.planner.plan import (
-    PDF_READINGS,
     EngineConfig,
     PdfDocuments,
     Refusal,
@@ -144,21 +142,8 @@ class Session:
                 available=0,
                 unit="image token budgets",
             )) from error
-        if config.pdf_read not in PDF_READINGS:
-            raise RefusalError(Refusal(
-                reasons=(f"pdf_read must be one of {PDF_READINGS}, got "
-                         f"{config.pdf_read!r}",),
-                constraint="pdf_read_unknown",
-                needed=1, available=0, unit="PDF readings"))
-        # how this session's queries read a PDF table; "auto" follows
-        # the model, and "image" on a text model is refused at plan time
-        self.pdf_reading = (
-            config.pdf_read if config.pdf_read != "auto"
-            else "image" if self.image_tokens else "text")
-        self.pdf_text_options = PdfTextOptions(ocr=config.pdf_ocr)
         self.catalog = Catalog()
         self._pdf_inputs = {}
-        self._text_views = {}
         self._tok = tokenizer      # injectable for tests; lazy HF load
         self._tok_injected = tokenizer is not None
         self._fast = None          # lazy Gigatoken instance
@@ -234,31 +219,20 @@ class Session:
                 self._fast = None
         return self._fast
 
-    def _source(self, provider_name: str) -> TableProvider:
-        """The table a query reads under a registered name.
+    def pdf_documents(self, provider_name: str) -> PdfDocuments | None:
+        """What the planner needs to know about an alias over PDF pages.
 
-        A PDF provider read as text is replaced by its text view, whose
-        document column holds the pages' extracted text; from here on
-        the text path treats it like any other table.
+        None for a table that is not PDF pages. A PDF provider's pages
+        are rendered; the OCR operator over one gives their text.
         """
         provider = self.catalog.get(provider_name)
-        if isinstance(provider, PDFProvider) and self.pdf_reading == "text":
-            identity = provider.content_identity()
-            if identity not in self._text_views:
-                self._text_views[identity] = PdfTextProvider(
-                    provider, self.pdf_text_options)
-            return self._text_views[identity]
-        return provider
-
-    def pdf_documents(self, provider_name: str) -> PdfDocuments:
-        """What the planner needs to know about a PDF alias's rows."""
-        provider = self.catalog.get(provider_name)
+        if not isinstance(provider, (PDFProvider, OcrProvider)):
+            return None
         pdf_input = provider.pdf_input()
         rows = dict(row_mode=pdf_input.row_mode, n_pages=pdf_input.page_count,
                     pages_per_row_max=pdf_input.pages_per_row_max)
-        if self.pdf_reading == "text":
-            return PdfDocuments(reading="text", ocr=self.pdf_text_options.ocr,
-                                **rows)
+        if isinstance(provider, OcrProvider):
+            return PdfDocuments(reading="ocr", **rows)
         return PdfDocuments(reading="image", visual_tokens=self.image_tokens,
                             **rows)
 
@@ -275,7 +249,7 @@ class Session:
             return self._tokenize(provider_name, column, projected_columns)
 
     def _tokenize(self, provider_name, column, projected_columns):
-        provider = self._source(provider_name)
+        provider = self.catalog.get(provider_name)
         identity = provider.content_identity()
         projected_columns = tuple(dict.fromkeys(projected_columns))
         token_key = (identity, column)
@@ -368,7 +342,7 @@ class Session:
 
     def token_lengths(self, provider_name: str, column: str):
         """Return the exact token counts when the column is tokenized."""
-        identity = self._source(provider_name).content_identity()
+        identity = self.catalog.get(provider_name).content_identity()
         store = self._token_stores.get((identity, column))
         return None if store is None else store.lengths
 
@@ -378,7 +352,7 @@ class Session:
         Reads the column's byte lengths and scales them by the tokens
         per byte measured on the first ESTIMATE_SAMPLE documents.
         """
-        provider = self._source(provider_name)
+        provider = self.catalog.get(provider_name)
         key = (provider.content_identity(), column)
         if key in self._length_estimates:
             return self._length_estimates[key]
@@ -425,7 +399,7 @@ class Session:
 
     def _corpus_tokenizer(self, provider_name, column, texts):
         """Pick and cache the tokenizer and token type for one column."""
-        key = (self._source(provider_name).content_identity(), column)
+        key = (self.catalog.get(provider_name).content_identity(), column)
         if key not in self._corpus_tokenizers:
             tok, note = pick_corpus_tokenizer(
                 self.tokenizer, self._fast_tokenizer(), texts)
@@ -479,7 +453,7 @@ class Session:
                 token file already exists.
             value_columns: Value columns without a column file yet.
         """
-        provider = self._source(provider_name)
+        provider = self.catalog.get(provider_name)
         identity = provider.content_identity()
         scan_columns = tuple(dict.fromkeys(
             ((column,) if column is not None else ()) + value_columns
@@ -618,24 +592,22 @@ class Query:
         self._doc_tokens = None
         self._token_inputs = None
         self._pdf_documents = {}
-        self._pdf_providers = {}
+        self._providers = {}
         self._token_futures = {}
         self._estimated = ()
         self.token_wait_s = 0.0
 
-    def pdf_text_metrics(self) -> dict[str, dict]:
-        """Extraction counters for every alias read as text, by alias.
+    def ocr_metrics(self) -> dict[str, dict]:
+        """The OCR operator's counters for every alias over one, by alias.
 
-        An alias whose text was never extracted (the plan was refused,
-        or the provider's text came from another alias's extraction)
-        is left out.
+        An alias whose text was never read (the plan was refused, or
+        another alias over the same operator read it) is left out.
         """
         out = {}
         for alias, pdf in self._pdf_documents.items():
-            if pdf.reading != "text":
+            if pdf.reading != "ocr":
                 continue
-            source = self.session._source(self._pdf_providers[alias])
-            metrics = source.metrics()
+            metrics = self.session.catalog.get(self._providers[alias]).metrics()
             if metrics is not None:
                 out[alias] = metrics
         return out
@@ -664,31 +636,28 @@ class Query:
             self._doc_tokens = {}
             self._token_inputs = {}
             self._pdf_documents = {}
-            self._pdf_providers = {}
+            self._providers = {}
             estimated = []
             for s in scans:
-                provider = self.session.catalog.get(s.provider)
-                if isinstance(provider, PDFProvider):
-                    self._pdf_providers[s.alias] = s.provider
-                    if self.session.pdf_reading == "image":
-                        if not self.session.image_tokens:
-                            self._plan = Refusal(
-                                reasons=(f"model {self.session.model.name!r} "
-                                         f"takes text only, but {s.alias!r} "
-                                         f"binds PDF pages read as images",),
-                                constraint="model_takes_text_only",
-                                needed=1, available=0, unit="image models")
-                            return self._plan
-                        store = self.session.prepare_pdf(s.provider, s.columns)
-                        self._token_inputs[s.alias] = store
-                        self._doc_tokens[s.alias] = store.lengths
-                        self._pdf_documents[s.alias] = self.session.pdf_documents(
-                            s.provider)
-                        continue
-                    # read as text: the alias takes the text path below
-                    # over the pages' extracted text
-                    self._pdf_documents[s.alias] = self.session.pdf_documents(
-                        s.provider)
+                self._providers[s.alias] = s.provider
+                pdf = self.session.pdf_documents(s.provider)
+                if pdf is not None:
+                    self._pdf_documents[s.alias] = pdf
+                if pdf is not None and pdf.reading == "image":
+                    if not self.session.image_tokens:
+                        self._plan = Refusal(
+                            reasons=(f"model {self.session.model.name!r} "
+                                     f"takes text only, but {s.alias!r} "
+                                     f"binds PDF pages; register the table "
+                                     f"through .ocr() to read their text",),
+                            constraint="model_takes_text_only",
+                            needed=1, available=0, unit="image models")
+                        return self._plan
+                    store = self.session.prepare_pdf(s.provider, s.columns)
+                    self._token_inputs[s.alias] = store
+                    self._doc_tokens[s.alias] = store.lengths
+                    continue
+                # the OCR operator's rows take the text path below
                 exact = self.session.token_lengths(s.provider, s.column)
                 if exact is not None:
                     store = self.session.tokenize(

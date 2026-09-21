@@ -1,14 +1,13 @@
 """Rules for model-only columns, shared by the SQL compiler and the builder.
 
 A PDF provider's ``document`` column holds page references. The
-model reads it, rendered or as extracted text; a query cannot return
-it, compare it, or hand it to an apply() function. AI.FILTER may
-read it, and so may a join predicate over two tables when it is the
-only PDF column in the prompt: when the pages are rendered, the
-planner anchors that join on the PDF alias, since the runtime renders
-the anchor's pages and not a partner's. The rules do not depend on
-the reading, so a query compiles the same way under both. An
-AI.SCORE reranker takes text.
+model reads it rendered; a query cannot return it, compare it, or
+hand it to an apply() function. AI.FILTER may read it, and so may a
+join predicate over two tables when it is the only PDF column in the
+prompt: the planner anchors that join on the PDF alias, since the
+runtime renders the anchor's pages and not a partner's. An AI.SCORE
+reranker takes text. The OCR operator over a PDF provider has a plain
+string ``document`` column, so none of this applies to it.
 """
 
 from __future__ import annotations

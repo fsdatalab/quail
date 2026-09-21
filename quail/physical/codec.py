@@ -15,8 +15,8 @@ from .nodes import (
     Foreign,
     HashJoin,
     Limit,
+    OcrScan,
     PDFScan,
-    PdfTextScan,
     Project,
     Recombine,
     RequestExecution,
@@ -138,7 +138,7 @@ def built_in_codecs() -> tuple[NodeCodec, ...]:
     return tuple(NodeCodec(node_type) for node_type in (
         TextScan,
         PDFScan,
-        PdfTextScan,
+        OcrScan,
         AiFilter,
         RequestExecution,
         AiScore,

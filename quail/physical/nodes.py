@@ -381,40 +381,34 @@ class PDFScan(PhysicalScan):
 
 
 @dataclass(frozen=True)
-class PdfTextScan(TextScan):
-    """Read one PDF page input as extracted text, tokenized like any text.
+class OcrScan(TextScan):
+    """Read the OCR operator's rows: PDF page text, tokenized like any text.
 
-    The session extracts each row's page text with LiteParse (its
-    text layer, and OCR when ocr is set) and tokenizes it before the
-    query runs, so the bound input is a TokenizedInput and every
-    backend reads it as a text scan. The row description is kept so
-    the plan says what the text came from.
+    The session reads each row's page text with LiteParse and
+    tokenizes it before the query runs, so the bound input is a
+    TokenizedInput and every backend reads it as a text scan. The row
+    description is kept so the plan says what the text came from.
     """
 
     row_mode: str = "page"
     n_pages: int = 0             # page references across every row
     pages_per_row_max: int = 0   # the longest row, in pages
-    ocr: bool = False            # whether OCR ran on page images
 
-    type_name: ClassVar[str] = "quail.pdf_text_scan"
+    type_name: ClassVar[str] = "quail.ocr_scan"
 
     def __post_init__(self) -> None:
         super().__post_init__()
         _check_pdf_rows(self.row_mode, self.pages_per_row_max)
 
     def attributes(self) -> dict:
-        return {**super().attributes(), **_pdf_row_attributes(self),
-                "ocr": self.ocr}
+        return {**super().attributes(), **_pdf_row_attributes(self)}
 
     def explain_fields(self) -> Mapping[str, Any]:
-        return {**super().explain_fields(), **_pdf_row_attributes(self),
-                "ocr": self.ocr}
+        return {**super().explain_fields(), **_pdf_row_attributes(self)}
 
     @classmethod
     def _scan_fields(cls, attributes: Mapping[str, Any]) -> dict:
-        return {**super()._scan_fields(attributes),
-                **_pdf_row_fields(attributes),
-                "ocr": bool(attributes["ocr"])}
+        return {**super()._scan_fields(attributes), **_pdf_row_fields(attributes)}
 
 
 @dataclass(frozen=True)

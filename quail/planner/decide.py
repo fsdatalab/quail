@@ -25,8 +25,8 @@ from quail.physical import (
     HashJoin,
     JoinStage,
     Limit,
+    OcrScan,
     PDFScan,
-    PdfTextScan,
     PhysicalScan,
     PortRef,
     Recombine,
@@ -785,8 +785,8 @@ def scan_node(node_id: str, alias: str, stats: CorpusStats, shard_ranges,
     """The physical scan for one alias.
 
     A text alias gets a TextScan. A PDF alias gets the scan of its
-    reading: a PDFScan binds the pages for rendering, a PdfTextScan
-    binds the tokens of their extracted text.
+    reading: a PDFScan binds the pages for rendering, an OcrScan binds
+    the tokens of the OCR operator's page text.
     """
     common = dict(
         node_id=node_id, alias=alias, input_id=alias,
@@ -796,8 +796,8 @@ def scan_node(node_id: str, alias: str, stats: CorpusStats, shard_ranges,
         return TextScan(**common)
     rows = dict(row_mode=pdf.row_mode, n_pages=pdf.n_pages,
                 pages_per_row_max=pdf.pages_per_row_max)
-    if pdf.reading == "text":
-        return PdfTextScan(**common, **rows, ocr=pdf.ocr)
+    if pdf.reading == "ocr":
+        return OcrScan(**common, **rows)
     return PDFScan(**common, **rows, visual_tokens=pdf.visual_tokens)
 
 
@@ -805,8 +805,8 @@ def image_aliases(pdf_documents: Mapping[str, PdfDocuments]
                   ) -> dict[str, PdfDocuments]:
     """The PDF aliases whose pages the model sees rendered.
 
-    Only these constrain the plan: a text reading is ordinary text
-    once its pages are extracted.
+    Only these constrain the plan: the OCR operator's rows are
+    ordinary text once their pages are read.
     """
     return {alias: pdf for alias, pdf in pdf_documents.items()
             if pdf.reading == "image"}
@@ -856,8 +856,8 @@ def refuse_pdf_documents(pdf_documents: Mapping[str, PdfDocuments],
 
     The model must take images, no row may show more pages than the
     model was tested with, and the pages render for one GPU's chain:
-    the multi-GPU coordinator splits token documents only. A text
-    reading earns none of these.
+    the multi-GPU coordinator splits token documents only. The OCR
+    operator's rows earn none of these.
     """
     pdf_documents = image_aliases(pdf_documents)
     if not pdf_documents:

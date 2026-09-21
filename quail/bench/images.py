@@ -23,10 +23,14 @@ CACHE_ENV = {
 }
 
 
+# LiteParse runs the system tesseract over scanned PDF pages
+APT_PACKAGES = ("git", "tesseract-ocr")
+
+
 def _cuda_base() -> modal.Image:
     return (modal.Image.from_registry(CUDA_BASE, add_python="3.12")
             .entrypoint([])
-            .apt_install("git")
+            .apt_install(*APT_PACKAGES)
             .env(CACHE_ENV))
 
 
@@ -57,7 +61,7 @@ def sglang_image() -> modal.Image:
 def cpu_image() -> modal.Image:
     """The CPU image: the locked dependencies without the GPU stack."""
     return (modal.Image.debian_slim(python_version="3.12")
-            .apt_install("git")
+            .apt_install(*APT_PACKAGES)
             .uv_sync(groups=["dev"], uv_version=UV_VERSION,
                      extra_options="--no-install-package vllm")
             .add_local_python_source("quail"))

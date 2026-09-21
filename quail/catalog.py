@@ -222,8 +222,8 @@ class PDFProvider:
 
     Both add ``page_count`` and the model only ``document`` column
     holding the row's page references. A query cannot return or
-    compare ``document``; a prompt reads it, and the plan decides
-    whether the model sees the pages rendered or as extracted text.
+    compare ``document``; a prompt reads it, and the model sees the
+    row's pages rendered. ``ocr()`` gives the same rows read as text.
 
     The provider reads page counts and sizes once, on the first call
     that needs them, and never renders or parses a page.
@@ -321,6 +321,16 @@ class PDFProvider:
 
     # ---- PDF specifics ------------------------------------------------
 
+    def ocr(self, **options) -> OcrProvider:
+        """The OCR operator over these rows: the same rows, read as text.
+
+        Args:
+            options: OcrOptions fields, such as ``language``.
+        """
+        from quail.pdf import OcrOptions
+
+        return OcrProvider(self, OcrOptions(**options))
+
     def paths(self) -> list[str]:
         """The distinct files, in first appearance order."""
         return list(dict.fromkeys(
@@ -380,22 +390,24 @@ class PDFProvider:
         return table
 
 
-class PdfTextProvider:
-    """A PDF provider's rows with each row's page text as its document.
+class OcrProvider:
+    """The OCR operator: a PDF provider's rows with each row's page text.
 
-    This is the text reading of a PDF table: ``document`` is a string
-    column holding the text of the row's pages, extracted with
-    LiteParse on the first scan that asks for it, and every other
-    column is the PDF provider's. The session builds one when a query
-    reads a PDF table as text, and from here on the rows go through
-    the ordinary tokenizer, token store, and text scan.
+    ``document`` is a string column holding the text of the row's
+    pages, read with LiteParse; every other column is the PDF
+    provider's. The first scan that asks for ``document`` parses the
+    files in a worker pool and yields rows file by file, so the
+    tokenizer works on the first file while the rest parse. The texts
+    are kept for later scans. From here on the rows go through the
+    ordinary tokenizer, token store, and text scan, on any backend.
     """
 
     def __init__(self, pdf: PDFProvider, options):
         self.pdf = pdf
         self.options = options
         self.id_col = pdf.id_col
-        self._texts = None
+        self._rows = None
+        self._metrics = None
 
     @property
     def document_column(self) -> str:
@@ -415,7 +427,7 @@ class PdfTextProvider:
         return pa.schema(fields)
 
     def content_identity(self) -> str:
-        return f"{self.pdf.content_identity()}|text:{self.options.identity()}"
+        return f"{self.pdf.content_identity()}|ocr:{self.options.identity()}"
 
     def statistics(self) -> TableStatistics:
         return self.pdf.statistics()
@@ -425,29 +437,62 @@ class PdfTextProvider:
         if request.filter is not None:
             raise ValueError("PDF provider does not support filter pushdown")
         table = self.pdf.row_table()
-        if self.document_column in request.columns:
-            table = table.set_column(
-                table.schema.get_field_index(self.document_column),
-                self.schema().field(self.document_column),
-                pa.array(self.texts().rows, pa.string()))
-        table = table.select(request.columns)
-        if request.limit is not None:
-            table = table.slice(0, request.limit)
-        return _table_reader(table, request.batch_rows)
+        if self._rows is not None:
+            table = self._with_texts(table, self._rows)
+        if self._rows is not None or self.document_column not in request.columns:
+            table = table.select(request.columns)
+            if request.limit is not None:
+                table = table.slice(0, request.limit)
+            return _table_reader(table, request.batch_rows)
+        return pa.RecordBatchReader.from_batches(
+            pa.schema([self.schema().field(name) for name in request.columns]),
+            self._streamed(table, request))
 
-    # ---- text specifics ----------------------------------------------
+    def _with_texts(self, table: pa.Table, texts) -> pa.Table:
+        return table.set_column(
+            table.schema.get_field_index(self.document_column),
+            self.schema().field(self.document_column),
+            pa.array(texts, pa.string()))
 
-    def texts(self):
-        """Every row's text; extracted on first use and kept."""
-        if self._texts is None:
-            from quail.pdf import row_texts
+    def _streamed(self, table: pa.Table, request: ScanRequest):
+        """Yield the requested columns file by file as the pool parses them.
 
-            self._texts = row_texts(self.pdf.pdf_input(), self.options)
-        return self._texts
+        Every row is read even past the limit, so the texts are whole
+        when they are kept for later scans.
+        """
+        import time
+
+        from quail.pdf import row_texts
+
+        started = time.perf_counter()
+        pdf_input = self.pdf.pdf_input()
+        texts = []
+        remaining = len(table) if request.limit is None else request.limit
+        for start, chunk in row_texts(pdf_input, self.options):
+            texts.extend(chunk)
+            piece = self._with_texts(table.slice(start, len(chunk)), chunk)
+            piece = piece.select(request.columns).slice(0, max(remaining, 0))
+            remaining -= len(piece)
+            yield from piece.to_batches(max_chunksize=request.batch_rows)
+        self._rows = tuple(texts)
+        self._metrics = {
+            "rows": len(texts),
+            "pages": pdf_input.page_count,
+            "empty_rows": sum(not text.strip() for text in texts),
+            "chars": sum(len(text) for text in texts),
+            "extract_s": round(time.perf_counter() - started, 4),
+            "processes": self.options.processes,
+        }
+
+    # ---- OCR specifics -----------------------------------------------
+
+    def pdf_input(self):
+        """The rows' page references, as the PDF provider reads them."""
+        return self.pdf.pdf_input()
 
     def metrics(self) -> dict | None:
-        """The extraction's counters, once it has run."""
-        return None if self._texts is None else dict(self._texts.metrics)
+        """The extraction's counters, once a scan has read the text."""
+        return None if self._metrics is None else dict(self._metrics)
 
     def estimate_token_lengths(self, count_tokens) -> list[int]:
         """Estimate each row's tokens from a sample of pages.

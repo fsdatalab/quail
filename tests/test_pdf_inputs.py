@@ -2,7 +2,7 @@
 
 No page is rendered here. The tests build small blank PDFs with
 PDFium so the page manifest and the token arithmetic are real. The
-text reading is covered in test_pdf_text.py.
+the OCR operator is covered in test_ocr.py.
 """
 
 import pyarrow as pa
@@ -262,9 +262,8 @@ def test_pdf_scan_round_trips_through_the_envelope(sources):
         assert scans and scans[0].attributes()["row_mode"] == "page"
 
 
-def test_text_model_refuses_pdf_rows_read_as_images(sources):
-    with quail.Session(EngineConfig(model="qwen3-4b-fp8", device="h100-sxm",
-                                    pdf_read="image"),
+def test_text_model_refuses_pdf_pages(sources):
+    with quail.Session(EngineConfig(model="qwen3-4b-fp8", device="h100-sxm"),
                        tokenizer=fake_tok) as session:
         session.register("pages", quail.DocumentProvider.from_pdfs(
             sources, id_col="doc_id", path_col="path", row_mode="page"))
@@ -424,15 +423,6 @@ def test_image_tokens_are_checked_at_session_start():
     with pytest.raises(quail.RefusalError, match="takes text only"):
         quail.Session(EngineConfig(model="qwen3-4b-fp8", device="h100-sxm",
                                    image_tokens=280), tokenizer=fake_tok)
-    with pytest.raises(quail.RefusalError, match="pdf_read must be one of"):
-        quail.Session(EngineConfig(model="qwen3-4b-fp8", device="h100-sxm",
-                                   pdf_read="ocr"), tokenizer=fake_tok)
-    # auto follows the model
-    with gemma_session() as session:
-        assert session.pdf_reading == "image"
-    with quail.Session(EngineConfig(model="qwen3-4b-fp8", device="h100-sxm"),
-                       tokenizer=fake_tok) as session:
-        assert session.pdf_reading == "text"
 
 
 def test_compiler_keeps_the_document_column_out_of_values(sources, tmp_path):
@@ -511,5 +501,5 @@ def test_check_scan_input_rejects_mismatched_bindings():
         PDFScan(node_id="scan:p", alias="p", input_id="p", n_docs=1,
                 row_mode="page", n_pages=1, pages_per_row_max=1)
     with pytest.raises(ValueError, match="only it, has a budget"):
-        PdfDocuments(reading="text", row_mode="page", n_pages=1,
+        PdfDocuments(reading="ocr", row_mode="page", n_pages=1,
                      pages_per_row_max=1, visual_tokens=280)

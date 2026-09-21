@@ -1,23 +1,22 @@
-"""Extract the text of PDF pages with LiteParse, for the text reading.
+"""Turn PDF pages into text with LiteParse, for the OCR operator.
 
-LiteParse (Apache 2.0, runs locally) reads each page's text layer
-laid out in reading order and, when asked, runs Tesseract OCR over
-the page images so scanned pages get text too. It parses one file per
-call, in a pool of persistent worker processes with a hard per-file
-timeout; this module fans the sources out over that pool and puts the
-page texts back into query row order.
+LiteParse (Apache 2.0, runs locally) reads each page's text layer in
+reading order and runs Tesseract over the pages it judges scanned,
+sparse, or garbled, so a scanned page gets text too. It parses one
+file per call, in a pool of persistent worker processes with a hard
+per-file timeout; this module fans the files out over that pool and
+hands their page texts back in file order, one file at a time, so the
+tokenizer can start on the first file while the pool parses the rest.
 
 Measured on FinanceBench 10-K filings (160 and 503 pages) on a CPU
-box: 3 to 6 ms per page from the text layer alone, about 80 ms per
-page with OCR on, and 4 workers gave 900 pages per second without
-OCR. Nothing here touches the GPU or the token store; the session
-tokenizes the text like any other document column.
+box: 3 to 6 ms per page from the text layer, about 80 ms per page
+when Tesseract runs, and 4 workers gave 900 text-layer pages per
+second.
 """
 
 from __future__ import annotations
 
-import time
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
@@ -35,49 +34,30 @@ PAGE_SEPARATOR = "\n\n"
 
 
 @dataclass(frozen=True)
-class PdfTextOptions:
-    """How PDF pages become text.
+class OcrOptions:
+    """How the OCR operator runs LiteParse.
 
     Attributes:
-        ocr: Run Tesseract over the page images as well as reading the
-            text layer. Off reads the text layer only, so a scanned
-            page comes out empty; on costs about 80 ms per page.
-        language: The Tesseract language code.
+        language: The Tesseract language code for scanned pages.
         processes: LiteParse worker processes; zero parses in the
             calling process, which CPU tests use.
         timeout_s: Hard limit per file in the worker pool.
     """
 
-    ocr: bool = False
     language: str = "eng"
     processes: int = DEFAULT_PROCESSES
     timeout_s: float = 600.0
 
     def identity(self) -> str:
         """The part of the options that changes the extracted text."""
-        return f"ocr={int(self.ocr)},language={self.language}"
+        return f"language={self.language}"
 
 
-@dataclass(frozen=True)
-class PdfTexts:
-    """Every row's text, with the counters of the extraction that made it.
-
-    Attributes:
-        rows: One string per query row, in row order; a whole-file
-            row joins its pages with PAGE_SEPARATOR.
-        metrics: pages read, pages that came out empty, characters,
-            wall seconds, and the options that ran.
-    """
-
-    rows: tuple[str, ...]
-    metrics: dict
-
-
-def _open_parser(options: PdfTextOptions, max_pages: int, **extra):
+def _open_parser(options: OcrOptions, max_pages: int, **extra):
     from liteparse import LiteParse
 
     settings = dict(
-        ocr_enabled=options.ocr, ocr_language=options.language,
+        ocr_enabled=True, ocr_language=options.language,
         output_format="text", quiet=True, continue_on_page_error=True,
         # LiteParse stops at 1000 pages unless told the real bound
         max_pages=max(max_pages, 1), **extra)
@@ -87,16 +67,20 @@ def _open_parser(options: PdfTextOptions, max_pages: int, **extra):
     return LiteParse(**settings)
 
 
-def page_texts(pdf_input: PDFInput, options: PdfTextOptions,
+def page_texts(pdf_input: PDFInput, options: OcrOptions,
                sources: Sequence[int] | None = None, *,
-               first_pages: int | None = None) -> dict[int, list[str]]:
-    """Each source's page texts in page order, keyed by source index.
+               first_pages: int | None = None
+               ) -> Iterator[tuple[int, list[str]]]:
+    """Yield (source index, its page texts in page order), in the order asked.
+
+    Every file is submitted to the pool at once; each is yielded as
+    soon as it and every file before it are parsed.
 
     Args:
         pdf_input: The bound PDF rows; every source when `sources` is
             omitted.
-        options: How the pages become text.
-        sources: The source indices to read.
+        options: How LiteParse runs.
+        sources: The source indices to read, in the order to yield.
         first_pages: Read only the first this many pages of each
             source, for a sample; every page when omitted.
 
@@ -132,39 +116,48 @@ def page_texts(pdf_input: PDFInput, options: PdfTextOptions,
 
     with _open_parser(options, max(counts, default=0), **extra) as parser:
         with ThreadPoolExecutor(max(1, options.processes)) as threads:
-            return dict(threads.map(lambda index: parse(parser, index),
-                                    wanted))
+            yield from threads.map(lambda index: parse(parser, index), wanted)
 
 
-def row_texts(pdf_input: PDFInput, options: PdfTextOptions) -> PdfTexts:
-    """Every row's text: its pages' text in prompt order.
+def row_texts(pdf_input: PDFInput, options: OcrOptions
+              ) -> Iterator[tuple[int, list[str]]]:
+    """Yield (first row index, the texts of consecutive rows), in row order.
+
+    A row's text is its pages' text in prompt order, joined with
+    PAGE_SEPARATOR. Rows are yielded as soon as every file their
+    pages come from is parsed; files parse in source order, and a
+    row's sources never follow its position, so nothing waits on a
+    file it does not read.
 
     Raises:
         PdfReadError: See page_texts.
     """
-    started = time.perf_counter()
-    by_source = page_texts(pdf_input, options)
-    rows = []
-    empty = 0
-    for row in pdf_input.rows:
-        pages = []
-        for page_id in row.page_ids:
-            page = pdf_input.pages[page_id]
-            text = by_source[page.source_index][page.page_index]
-            empty += not text.strip()
-            pages.append(text)
-        rows.append(PAGE_SEPARATOR.join(pages))
-    return PdfTexts(tuple(rows), {
-        "pages": pdf_input.page_count,
-        "empty_pages": empty,
-        "chars": sum(len(text) for text in rows),
-        "extract_s": round(time.perf_counter() - started, 4),
-        "processes": options.processes,
-        "ocr": options.ocr,
-    })
+    by_source: dict[int, list[str]] = {}
+    last_source = [
+        max(pdf_input.pages[page_id].source_index for page_id in row.page_ids)
+        for row in pdf_input.rows]
+    next_row = 0
+    for index, texts in page_texts(pdf_input, options):
+        by_source[index] = texts
+        start = next_row
+        while next_row < len(last_source) and last_source[next_row] <= index:
+            next_row += 1
+        if next_row == start:
+            continue
+        chunk = []
+        for row in pdf_input.rows[start:next_row]:
+            chunk.append(PAGE_SEPARATOR.join(
+                by_source[pdf_input.pages[page_id].source_index]
+                [pdf_input.pages[page_id].page_index]
+                for page_id in row.page_ids))
+        yield start, chunk
+    if next_row != len(last_source):
+        raise PdfReadError(
+            f"rows from {next_row} on read pages of a source that was never "
+            f"parsed; the rows do not follow source order")
 
 
-def sample_page_texts(pdf_input: PDFInput, options: PdfTextOptions,
+def sample_page_texts(pdf_input: PDFInput, options: OcrOptions,
                       pages: int = SAMPLE_PAGES) -> list[str]:
     """The text of about `pages` pages from the first sources, for an estimate.
 
@@ -179,6 +172,6 @@ def sample_page_texts(pdf_input: PDFInput, options: PdfTextOptions,
             break
         chosen.append(index)
         in_hand += min(count, pages)
-    by_source = page_texts(pdf_input, options, chosen, first_pages=pages)
-    texts = [text for index in chosen for text in by_source[index]]
+    texts = [text for _index, page in page_texts(
+        pdf_input, options, chosen, first_pages=pages) for text in page]
     return texts[:pages]

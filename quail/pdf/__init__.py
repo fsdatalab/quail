@@ -1,8 +1,9 @@
 """PDF page inputs: page references, the page manifest, and the two readings.
 
-A PDF table's rows are described once (PDFInput). A plan reads them
-either as page images (prompt, prefetch: soft tokens and rendering)
-or as extracted text (text: LiteParse, then the ordinary tokenizer).
+A PDF table's rows are described once (PDFInput). A query reads them
+as page images (prompt, prefetch: soft tokens and rendering) or, when
+the table is registered through the OCR operator, as text (ocr:
+LiteParse, then the ordinary tokenizer).
 """
 
 from .manifest import (
@@ -12,8 +13,8 @@ from .manifest import (
     read_manifest,
     stat_sources,
 )
+from .ocr import OcrOptions, row_texts, sample_page_texts
 from .prefetch import ImagePrefetcher, PdfiumPrefetcher, RenderedPage
-from .text import PdfTextOptions, PdfTexts, row_texts, sample_page_texts
 from .types import (
     ROW_MODES,
     PDFInput,
@@ -26,14 +27,13 @@ from .types import (
 
 __all__ = [
     "ImagePrefetcher",
+    "OcrOptions",
     "PDFInput",
     "PdfManifest",
     "PdfPageRef",
     "PdfReadError",
     "PdfRowRef",
     "PdfSource",
-    "PdfTextOptions",
-    "PdfTexts",
     "PdfiumPrefetcher",
     "ROW_MODES",
     "RenderedPage",

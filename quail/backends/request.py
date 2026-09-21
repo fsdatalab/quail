@@ -116,8 +116,8 @@ def plan_request_backend(
             graph=None,
             plan=Refusal(
                 reasons=(f"backend {backend_name!r} takes text only, but "
-                         f"{rendered} bind PDF pages read as images; read "
-                         f"them as text (pdf_read='text')",),
+                         f"{rendered} bind PDF pages read as images; "
+                         f"register the table through .ocr()",),
                 constraint="pdf_input_unsupported",
                 needed=len(rendered), available=0, unit="PDF scans"),
             estimated_seconds=float("inf"),

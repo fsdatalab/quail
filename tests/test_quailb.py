@@ -8,7 +8,7 @@ from pdfs import make_text_pdf
 
 import quail
 from quail.bench.quailb import queries, register_tables
-from quail.physical import PdfTextScan
+from quail.physical import OcrScan
 from quail.planner.plan import EngineConfig, Refusal
 from quail_b.data import ASPECTS, SCENARIOS
 from quail_b.queries import QUERY_ORDER
@@ -132,7 +132,7 @@ def test_all_queries_compile_and_plan(tmp_path):
             ),
             tokenizer=lambda text: list(text.encode()),
         )
-        register_tables(sess, tmp_path)
+        register_tables(sess, tmp_path, ocr=True)
         qdefs = queries(sess)
         expected = {
             *(f"IMDB-{i}" for i in range(1, 11)),
@@ -148,13 +148,13 @@ def test_all_queries_compile_and_plan(tmp_path):
         for qid, (_, build) in qdefs.items():
             query = build()
             if qid in PDF_QUERIES:
-                # a text model reads the pages as extracted text, on
-                # every backend, with the same query
+                # the tables were registered through the OCR operator,
+                # so a text model plans them on every backend
                 plan = query.plan()
                 assert not isinstance(plan, Refusal), f"{qid} refused: {plan}"
-                assert any(isinstance(node, PdfTextScan)
+                assert any(isinstance(node, OcrScan)
                            for node in plan.nodes), qid
-                assert "read as text, ocr=off" in query.explain(), qid
+                assert "OCR text" in query.explain(), qid
                 continue
             operators = query.logical.operators()
             filters, joins = operators.filters, operators.joins

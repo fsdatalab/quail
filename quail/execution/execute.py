@@ -12,8 +12,8 @@ from quail.execution.types import (
 )
 from quail.pdf import PDFInput
 from quail.physical import (
+    OcrScan,
     PDFScan,
-    PdfTextScan,
     PhysicalScan,
     TextScan,
     check_plan_envelope,
@@ -63,9 +63,9 @@ def _validate_physical_request(request, registry):
     return graph, backend
 
 
-# the input each scan kind binds; a text reading of PDF rows binds
-# their tokenized text like any text scan
-SCAN_INPUT_TYPES = {TextScan: TokenizedInput, PdfTextScan: TokenizedInput,
+# the input each scan kind binds; the OCR operator's rows bind their
+# tokenized page text like any text scan
+SCAN_INPUT_TYPES = {TextScan: TokenizedInput, OcrScan: TokenizedInput,
                     PDFScan: PDFInput}
 
 
@@ -145,9 +145,9 @@ def execute_query(query, physical_executor=None, plan=None):
         raise TypeError("a physical executor must return PhysicalResponse")
     result = query.finish(response, time.perf_counter() - started)
     result.report["token_wait_s"] = round(query.token_wait_s, 4)
-    pdf_text = query.pdf_text_metrics()
-    if pdf_text:
-        result.report["pdf_text"] = pdf_text
+    ocr = query.ocr_metrics()
+    if ocr:
+        result.report["ocr"] = ocr
     result.report["worker_total_s"] = round(
         time.perf_counter() - total_started, 4)
     return result

@@ -26,8 +26,8 @@ import quail
 import quail_b as benchmark
 from quail.bench import substrait
 from quail.bench.substrait import QueryPlan, Relation, read_plan
-from quail.catalog import PDFProvider
-from quail.planner.plan import PDF_READINGS, Refusal
+from quail.catalog import OcrProvider, PDFProvider
+from quail.planner.plan import Refusal
 from quail.specs import H100_USD_PER_HOUR, MODELS
 from quail_b.cuad import parse_document_reference, resolve_documents
 from quail_b.data import FILE_TABLES
@@ -53,13 +53,15 @@ PDF_FORMED_COLUMNS = (PDFProvider.document_column, PDFProvider.PAGE_COUNT,
                       PDFProvider.PAGE_NUMBER)
 
 
-def pdf_provider(rows: pa.Table):
+def pdf_provider(rows: pa.Table, ocr: bool = False):
     """A PDF provider whose query rows are a file table's rows, in order.
 
     A `document` of `<path>` makes one row per file. A `document` of
     `<path>#page=<n>` makes one row per listed page. Either way the
     rows keep the benchmark ids, so Quail's answers name them, and
     their other columns, so ordinary join conditions can read them.
+    With `ocr`, the rows are the OCR operator's: the pages' text
+    rather than their images.
 
     Raises:
         ValueError: The references mix the two forms.
@@ -72,33 +74,38 @@ def pdf_provider(rows: pa.Table):
         [name for name in PDF_FORMED_COLUMNS if name in rows.schema.names])
     carried = carried.append_column("path", pa.array(paths, pa.string()))
     if all(page is None for page in pages):
-        return quail.DocumentProvider.from_pdfs(
+        provider = quail.DocumentProvider.from_pdfs(
             carried, id_col="id", path_col="path", row_mode="pdf")
-    if any(page is None for page in pages):
+    elif any(page is None for page in pages):
         raise ValueError("a file table names whole files or pages, not both")
-    listed = carried.append_column("page", pa.array(pages, pa.int32()))
-    return quail.DocumentProvider.from_pdf_pages(
-        listed, id_col="id", path_col="path", page_col="page")
+    else:
+        listed = carried.append_column("page", pa.array(pages, pa.int32()))
+        provider = quail.DocumentProvider.from_pdf_pages(
+            listed, id_col="id", path_col="path", page_col="page")
+    return provider.ocr() if ocr else provider
 
 
-def register_relation(session, relation: Relation, table: pa.Table) -> pa.Table:
+def register_relation(session, relation: Relation, table: pa.Table,
+                      ocr: bool = False) -> pa.Table:
     """Register the rows one relation reads, once, and return them.
 
     The rows are the benchmark table inside the relation's bounds, in
     table order; that order is the row index Quail's answers use. A
-    file table becomes a PDF provider, any other a text table.
+    file table becomes a PDF provider (the OCR operator over one with
+    `ocr`), any other a text table.
     """
     rows = relation.rows(table)
     if relation.source not in session.catalog:
         if relation.table in FILE_TABLES:
-            provider = pdf_provider(rows)
+            provider = pdf_provider(rows, ocr)
         else:
             provider = quail.DocumentProvider.from_table(rows, id_col="id")
         session.register(relation.source, provider)
     return rows
 
 
-def register_plan(session, plan: QueryPlan, tables) -> dict[str, pa.Table]:
+def register_plan(session, plan: QueryPlan, tables,
+                  ocr: bool = False) -> dict[str, pa.Table]:
     """Register every relation of a plan; table name -> the rows it reads.
 
     Raises:
@@ -112,7 +119,7 @@ def register_plan(session, plan: QueryPlan, tables) -> dict[str, pa.Table]:
             raise ValueError(
                 f"{relation.table} is read under two different bounds")
         rows[relation.table] = register_relation(
-            session, relation, tables[relation.table])
+            session, relation, tables[relation.table], ocr)
     return rows
 
 
@@ -131,14 +138,14 @@ def read_tables(data_dir, names) -> dict[str, pa.Table]:
     return tables
 
 
-def register_tables(session, data_dir) -> None:
+def register_tables(session, data_dir, ocr: bool = False) -> None:
     """Register the relations of every query whose tables the directory holds."""
     available = {path.stem for path in Path(data_dir).glob("*.parquet")}
     tables = read_tables(data_dir, sorted(available))
     for spec in query_specs(include_privacy=True).values():
         plan = read_plan(spec.plan)
         if all(relation.table in available for relation in plan.relations):
-            register_plan(session, plan, tables)
+            register_plan(session, plan, tables, ocr)
 
 
 def _build(session, plan: QueryPlan):
@@ -254,24 +261,32 @@ def join_anchors(result) -> dict:
     }
 
 
-def image_lengths(session, plan: QueryPlan, tables) -> dict[str, dict[str, int]]:
-    """Table name -> row id -> the prompt positions a PDF row's pages take.
+def pdf_row_lengths(session, plan: QueryPlan, tables
+                    ) -> dict[str, dict[str, int]]:
+    """Table name -> row id -> the prompt positions a PDF row takes.
 
-    QUAIL-B cannot tokenize a rendered document, so the engine reports
-    the length of each; the session priced every row when it prepared
-    the PDF provider.
+    QUAIL-B holds a file table's page references, not what the model
+    read, so the engine reports each row's length: the soft and frame
+    tokens of rendered pages, or the token count of the OCR operator's
+    text. QUAIL-B takes both under its `images` key, as opaque
+    documents of that many positions.
     """
     lengths = {}
     for relation in plan.relations:
         if relation.table not in FILE_TABLES or relation.table in lengths:
             continue
-        prepared = session.prepare_pdf(relation.source)
+        provider = session.catalog.get(relation.source)
+        if isinstance(provider, OcrProvider):
+            row_lengths = session.tokenize(
+                relation.source, provider.document_column).lengths
+        else:
+            row_lengths = session.prepare_pdf(relation.source).lengths
         row_ids = _ids(tables[relation.table])
-        if len(prepared.lengths) != len(row_ids):
+        if len(row_lengths) != len(row_ids):
             raise ValueError(
-                f"{relation.source} has {len(prepared.lengths)} PDF rows for "
+                f"{relation.source} has {len(row_lengths)} PDF rows for "
                 f"{len(row_ids)} benchmark rows")
-        lengths[relation.table] = dict(zip(row_ids, prepared.lengths))
+        lengths[relation.table] = dict(zip(row_ids, map(int, row_lengths)))
     return lengths
 
 
@@ -287,7 +302,7 @@ def prompt_pieces(query, plan: QueryPlan, anchors, images=None) -> dict:
         plan: The query's plan, for the operator ids.
         anchors: Written join position -> the anchor alias.
         images: Table name -> row id -> prompt positions, for the
-            PDF relations (`image_lengths`); omitted when empty.
+            PDF relations (`pdf_row_lengths`); omitted when empty.
     """
     operators = query.logical.operators()
     filters, joins = operators.filters, operators.joins
@@ -315,25 +330,30 @@ def prompt_pieces(query, plan: QueryPlan, anchors, images=None) -> dict:
     return pieces
 
 
-def run_query(session, spec: QuerySpec, tables) -> RunOutput:
-    """Execute one query and return benchmark ids, answers, and measurements."""
+def run_query(session, spec: QuerySpec, tables, ocr: bool = False) -> RunOutput:
+    """Execute one query and return benchmark ids, answers, and measurements.
+
+    With `ocr`, a file table's rows are the OCR operator's text.
+    """
     plan = read_plan(spec.plan)
-    rows = register_plan(session, plan, tables)
+    rows = register_plan(session, plan, tables, ocr)
     query = _build(session, plan)
     result = query.run()
     output = run_output(result, plan, rows)
     output.prompt_pieces = prompt_pieces(
-        query, plan, join_anchors(result), image_lengths(session, plan, rows))
+        query, plan, join_anchors(result), pdf_row_lengths(session, plan, rows))
     return output
 
 
-def refused_queries(session, query_ids, data_dir) -> dict[str, str]:
+def refused_queries(session, query_ids, data_dir,
+                    ocr: bool = False) -> dict[str, str]:
     """Return id -> reason for the queries the session's backend refuses to plan.
 
     A request backend refuses a query with an equality join or a user
-    function. Planning happens on the CPU, before any engine boots.
+    function, and one with PDF pages it cannot render. Planning
+    happens on the CPU, before any engine boots.
     """
-    register_tables(session, data_dir)
+    register_tables(session, data_dir, ocr)
     refused = {}
     for query_id in query_ids:
         plan = build_query(session, benchmark.get_query(query_id)).plan()
@@ -346,19 +366,21 @@ def refused_queries(session, query_ids, data_dir) -> dict[str, str]:
 
 def run_suite(only=None, *, sf=0.1, config, data_dir=None,
               ground_truth_collection=None, output_dir,
-              h100_usd_per_hour=H100_USD_PER_HOUR, root=None):
+              h100_usd_per_hour=H100_USD_PER_HOUR, root=None, ocr=False):
     """Run Quail queries through QUAIL-B and save the benchmark report.
 
     Queries the backend refuses to plan are left out of the run and
-    listed under `skipped_queries` in the returned record.
+    listed under `skipped_queries` in the returned record. With `ocr`,
+    file tables are read through the OCR operator; otherwise the model
+    sees their pages rendered.
     """
     with quail.Session(config) as session:
         skipped = {}
         if only and data_dir is not None:
-            skipped = refused_queries(session, only, data_dir)
+            skipped = refused_queries(session, only, data_dir, ocr)
             only = [query_id for query_id in only if query_id not in skipped]
         record = benchmark.run(
-            partial(run_query, session), queries=only, scale_factor=sf,
+            partial(run_query, session, ocr=ocr), queries=only, scale_factor=sf,
             output_dir=output_dir, data_dir=data_dir,
             collection_id=ground_truth_collection, root=root,
             gpu_count=config.gpus, gpu_hourly_rate_usd=h100_usd_per_hour,
@@ -366,6 +388,7 @@ def run_suite(only=None, *, sf=0.1, config, data_dir=None,
                 "engine": config.backend, "model": config.model,
                 "prompt_format": MODELS[config.model].prompt_format,
                 "configuration": asdict(config),
+                "pdf_rows": "ocr text" if ocr else "page images",
                 "warmup": "engine startup and kernel warmup excluded",
                 "cache_reuse": "one session per backend and query family",
                 "planning": {
@@ -390,12 +413,8 @@ def main():
     parser.add_argument("--ground-truth-collection")
     parser.add_argument("--output-dir", required=True, help="new run directory")
     parser.add_argument(
-        "--pdf-read", choices=PDF_READINGS, default="auto",
-        help="how a PDF table is read: rendered pages, extracted text, "
-             "or whatever the model takes")
-    parser.add_argument(
-        "--pdf-ocr", action="store_true",
-        help="run OCR over page images in the text reading")
+        "--ocr", action="store_true",
+        help="read PDF tables through the OCR operator instead of as pages")
     args = parser.parse_args()
     run_suite(
         [value.strip() for value in args.only.split(",")] if args.only else None,
@@ -405,12 +424,10 @@ def main():
             model=args.model,
             backend=args.backend,
             device=args.device,
-            pdf_read=args.pdf_read,
-            pdf_ocr=args.pdf_ocr,
         ),
         data_dir=args.data_dir,
         ground_truth_collection=args.ground_truth_collection,
-        output_dir=args.output_dir)
+        output_dir=args.output_dir, ocr=args.ocr)
     print(f"saved {args.output_dir}")
 
 
