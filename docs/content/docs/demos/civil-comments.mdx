@@ -64,26 +64,46 @@ request can evaluate all 31 questions for a comment.
 
 ## Execution
 
-Quail evaluates the `WHERE` condition before the `JOIN`. A comment that fails
-the toxicity condition never joins with the 30 rows in `fields`.
+### Quail
 
-Jev does not execute the SQL plan. The demo compares two request schedules:
+The Quail planner places the toxicity filter below the join. The relevant
+part of `query.explain()` is:
 
-- **Combined:** send one request per comment with the toxicity question and
-  all 30 field questions.
-- **Toxicity first:** send the toxicity question first. Send the 30 field
-  questions only when the toxicity answer is positive.
+```text
+Project: c.comment_id, f.field
+  AiJoin: anchor=c
+    join 1 full (c, f)
+    AiFilter: c
+      survivors stream into the join with KV pinned
+      predicate 1
+      Scan comments as c
+    Scan fields as f
+```
 
-For the toxicity-first run, Jev sent 10,000 requests with one question. The
-toxicity check passed for 3,016 comments, so Jev then sent 3,016 requests with
-30 questions. The second schedule performs the same early filtering as
-Quail's `WHERE`-before-`JOIN` plan.
+The plan runs in two steps:
+
+1. `AiFilter` checks each row in `comments` for toxicity.
+2. Each matching comment enters `AiJoin`, which checks the comment against
+   the 30 rows in `fields`.
+
+The two steps are pipelined. `AiJoin` starts when `AiFilter` produces the
+first matching comment rather than waiting for all 10,000 filter checks.
+The join reuses the comment KV computed by the filter.
+
+### Jev
+
+Jev has no SQL planner. The demo selects one of two request schedules:
 
 | Jev strategy | Request contents | Requests | Questions per request |
 |---|---|---:|---:|
 | Combined | Toxicity and all fields | 10,000 | 31 |
 | Toxicity first | Toxicity check | 10,000 | 1 |
 | Toxicity first | Field checks after toxicity passes | 3,016 | 30 |
+
+The combined schedule evaluates every field before removing comments that
+fail the toxicity condition. The toxicity-first schedule applies the filter
+first. In the measured run, 3,016 comments passed, so the remaining 6,984
+comments required no field checks.
 
 ## Results
 
