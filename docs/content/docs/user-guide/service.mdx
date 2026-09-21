@@ -33,7 +33,10 @@ Options:
 | `--token` | A bearer token every `/v1` request must carry. Default `QUAIL_SERVICE_TOKEN`; none when unset. |
 
 The service needs no database server. It keeps one SQLite file it
-alone writes, and results as Arrow files beside it.
+alone writes, and results as Arrow files beside it. Restart it on
+the same `--data-dir` and those files are still there. A `queued`
+query runs. A query that was `planning` or `running` is marked
+`interrupted`.
 
 ## Connect from Python
 
@@ -100,14 +103,16 @@ with quail.Session(config=config, endpoint=endpoint) as session:
 - `result()` waits and returns the `QueryResult`, or raises
   `QueryFailedError` with the saved status when the query failed, was
   interrupted, or was cancelled.
-- `cancel()` stops a queued query at once and asks a running one to
-  stop; the record ends `cancelled`.
+- `cancel()` stops a queued query at once. On a running query it
+  kills the process that has the model loaded, and the record ends
+  `cancelled`. The next query loads the model again.
 - `submit(request_key="...")` makes a repeated submission return the
   same run. The same key with a different query is an error.
 
 States are `queued`, `planning`, `running`, `succeeded`, `failed`,
 `interrupted`, and `cancelled`. A query that runs past its time limit
-ends `failed` with error type `TimeoutError`.
+ends `failed` with error type `TimeoutError`, and the model process
+is killed the same way.
 
 ### Answers while the query runs
 
@@ -196,30 +201,10 @@ Where the data lives on Modal:
   thread copies the database to the Volume with SQLite's online backup
   (which includes the WAL) and calls `volume.commit()`.
 - When a new container starts it copies the database back from the
-  Volume, marks records that were executing as `interrupted`, and
-  serves saved results again. `max_containers=1` keeps one writer.
+  Volume before serving. `max_containers=1` keeps one writer.
 - The copy is made at most once per second, so a sudden container
   death can lose the last second of status changes. A result is only
   marked `succeeded` after its files are written, and the files are
   committed together with the database copy.
 - An idle container scales down after 15 minutes. The next request
   starts one, and the first query then pays the model boot again.
-
-## Saved records
-
-The service writes each status to SQLite before it returns that
-status. Each write adds one to `revision`.
-
-A record becomes `succeeded` only after the service has read the
-result file, the report, and the answer tables back from disk.
-
-Restart the service with the same `--data-dir`. The records and
-results are still there. The service runs queries that are still
-`queued`. It marks a query that was `planning` or `running` as
-`interrupted`. That query stays `interrupted`.
-
-Cancel and timeout kill the process that has the model loaded. The
-next query loads the model again.
-
-If the data directory is gone, the service starts with no records
-and no results.
