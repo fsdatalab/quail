@@ -17,7 +17,12 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import replace
 
-from quail.pdf.prefetch import ImagePrefetcher, PdfiumPrefetcher, RenderedPage
+from quail.pdf.prefetch import (
+    DEFAULT_OUTSTANDING_PAGES,
+    ImagePrefetcher,
+    PdfiumPrefetcher,
+    RenderedPage,
+)
 from quail.pdf.prompt import ImageBlock, PagePrompts
 
 
@@ -31,7 +36,8 @@ class PageImages:
         pre_tokens: Tokens the chain prepends to every document; block
             offsets shift by this many rows.
         open_prefetcher: Builds the page renderer from (pdf_input,
-            spec, order) at open(); a PdfiumPrefetcher when omitted.
+            spec, order, max_outstanding_pages=...) at open(); a
+            PdfiumPrefetcher when omitted.
     """
 
     def __init__(self, prompts: PagePrompts, document_ids: Sequence[int],
@@ -44,12 +50,24 @@ class PageImages:
         self._prefetcher: ImagePrefetcher | None = None
         self._metrics: dict = {}
 
-    def open(self) -> None:
-        """Start rendering the documents' pages in admission order."""
+    def open(self, chunk_tokens: int | None = None) -> None:
+        """Start rendering the documents' pages in admission order.
+
+        Args:
+            chunk_tokens: The chain's chunk budget. The chain takes a
+                whole chunk's pages before its forward runs, so the
+                renderer keeps two chunks' worth of pages in flight;
+                without it, the renderer's own default bound.
+        """
         if self._prefetcher is None:
+            options = {}
+            if chunk_tokens:
+                options["max_outstanding_pages"] = max(
+                    DEFAULT_OUTSTANDING_PAGES,
+                    2 * self.prompts.pages_within(chunk_tokens))
             self._prefetcher = self._open_prefetcher(
                 self.prompts.pdf_input, self.prompts.spec,
-                order=self.document_ids)
+                order=self.document_ids, **options)
 
     def take(self, doc: int) -> tuple[tuple[ImageBlock, RenderedPage], ...]:
         """The document's pages with their soft token spans, in prompt order."""

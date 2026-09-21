@@ -181,17 +181,20 @@ def test_page_images_map_chain_documents_to_rows_past_the_preamble(tmp_path):
     prompts = PagePrompts(inputs, GEMMA)
     opened = []
 
-    def open_inline(pdf_input_, spec, order):
-        opened.append(list(order))
-        return PdfiumPrefetcher(pdf_input_, spec, order, processes=0)
+    def open_inline(pdf_input_, spec, order, **options):
+        opened.append((list(order), options))
+        return PdfiumPrefetcher(pdf_input_, spec, order, processes=0, **options)
 
     # the chain admits row 2 first, then row 0; row 1 is never asked for
     images = PageImages(prompts, document_ids=[2, 0], pre_tokens=7,
                         open_prefetcher=open_inline)
     assert opened == [] and images.metrics() == {}
+    # a chunk of 65 letter pages at budget 70 (63 soft tokens and two
+    # markers each) keeps two chunks' pages in flight
+    images.open(chunk_tokens=65 * 65)
     images.open()
-    images.open()
-    assert opened == [[2, 0]]
+    assert opened == [([2, 0], {"max_outstanding_pages": 130})]
+    assert prompts.pages_within(65 * 65) == 65
     ((block, page),) = images.take(0)
     assert page.page_id == 2 and block.page_id == 2
     # the soft tokens start after the preamble and the start marker

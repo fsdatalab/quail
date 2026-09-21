@@ -1245,7 +1245,7 @@ class FilterStream:
         self._finished = 0
         self.image_metrics = {}
         if images is not None:
-            images.open()
+            images.open(budget)
 
     @property
     def answers(self):

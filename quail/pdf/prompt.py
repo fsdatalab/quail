@@ -102,3 +102,8 @@ class PagePrompts(Sequence):
         frame = self.spec.image_frame_tokens
         return tuple(sum(block.soft_tokens + frame for block in blocks)
                      for blocks in self._blocks)
+
+    def pages_within(self, tokens: int) -> int:
+        """The most pages whose prompt positions fit in `tokens`."""
+        smallest = min(self._soft, default=0) + self.spec.image_frame_tokens
+        return tokens // smallest if smallest else 0
