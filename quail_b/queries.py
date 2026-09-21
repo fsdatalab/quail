@@ -184,6 +184,26 @@ QUERY_FAMILY_WORKLOADS = {
     "CUAD": "cuad",
 }
 
+# A suite is the set of families one engine run can take by name. QUAIL-B
+# reads text documents; QUAIL-B-PDF reads PDF pages rendered as images.
+QUERY_SUITES = {
+    "QUAIL-B": ("IMDB", "BIO", "FEV", "LEP", "AGENT"),
+    "QUAIL-B-PDF": ("CUAD",),
+}
+
+
+def suite_query_ids(suite: str) -> tuple[str, ...]:
+    """Return the ids of one suite's queries, in benchmark order."""
+    try:
+        prefixes = QUERY_SUITES[suite]
+    except KeyError as error:
+        raise ValueError(
+            f"unknown query suite {suite!r}; "
+            f"choose from {sorted(QUERY_SUITES)}") from error
+    regular, _ = _load_queries()
+    return tuple(spec.id for spec in regular
+                 if spec.id.split("-", 1)[0] in prefixes)
+
 
 def queries(include_privacy: bool = False) -> dict[str, QuerySpec]:
     """Return the benchmark queries by id, in benchmark order."""

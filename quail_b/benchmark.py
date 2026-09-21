@@ -20,17 +20,26 @@ from quail_b.data import (
 )
 from quail_b.labels import GroundTruthCollection, _read_json, load_ground_truth
 from quail_b.predicates import PREDICATE_BY_KEY, predicate_payload
-from quail_b.queries import QuerySpec, queries
+from quail_b.queries import QUERY_SUITES, QuerySpec, queries, suite_query_ids
 from quail_b.rendering import PROMPT_FORMAT
 
 
 def select_queries(only=None, *, scale_factor=0.1) -> tuple[QuerySpec, ...]:
-    """Validate a scale factor and return the requested query definitions."""
+    """Validate a scale factor and return the requested query definitions.
+
+    Args:
+        only: Query ids, or None for every query. A suite name from
+            QUERY_SUITES ("QUAIL-B", "QUAIL-B-PDF") stands for the ids
+            of that suite's queries.
+        scale_factor: A published scale factor.
+    """
     if scale_factor not in PUBLISHED_CORPORA:
         raise ValueError("scale factor must be 0.1, 0.5, or 1.0")
     available = queries()
     ids = list(available) if only is None else (
         [only] if isinstance(only, str) else list(only))
+    ids = [query_id for item in ids for query_id in (
+        suite_query_ids(item) if item in QUERY_SUITES else (item,))]
     unknown = set(ids) - available.keys()
     if unknown:
         raise ValueError(f"unknown query IDs: {sorted(unknown)}")

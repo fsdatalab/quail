@@ -310,6 +310,24 @@ def test_cuad_queries_read_pages_or_bounded_contracts_as_documents():
     assert _inspect_plan(get_query("CUAD-5").plan).filters[0].id == "filter-1"
 
 
+def test_suites_split_the_text_queries_from_the_pdf_queries():
+    from quail_b import select_queries
+    from quail_b.queries import QUERY_SUITES, suite_query_ids
+
+    assert QUERY_SUITES == {
+        "QUAIL-B": ("IMDB", "BIO", "FEV", "LEP", "AGENT"),
+        "QUAIL-B-PDF": ("CUAD",),
+    }
+    text = suite_query_ids("QUAIL-B")
+    pdf = suite_query_ids("QUAIL-B-PDF")
+    assert text == QUERY_ORDER[0:31] and pdf == QUERY_ORDER[31:36]
+    assert [spec.id for spec in select_queries("QUAIL-B-PDF")] == list(pdf)
+    assert [spec.id for spec in select_queries(["IMDB-1", "QUAIL-B-PDF"])] \
+        == ["IMDB-1", *pdf]
+    with pytest.raises(ValueError, match="unknown query suite"):
+        suite_query_ids("QUAIL-B-VIDEO")
+
+
 def test_query_family_rejects_mixed_or_unknown_queries():
     with pytest.raises(ValueError, match="expected one query family"):
         query_family_name(("IMDB-1", "BIO-1"))

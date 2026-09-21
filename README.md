@@ -1,6 +1,6 @@
 # QUAIL-B
 
-QUAIL-B is an academic benchmark of 30 AI SQL queries over document tables. AI SQL is SQL with LLM-powered operators.
+QUAIL-B is an academic benchmark of 36 AI SQL queries over document tables. AI SQL is SQL with LLM-powered operators. Its first 31 queries read text documents. The other 5, QUAIL-B-PDF, read PDF pages rendered as images; see [QUAIL-B-PDF](#quail-b-pdf).
 
 This repository publishes the query plans, input tables, reference labels, and scoring harness. It does not include an execution engine. To benchmark your engine, you write an adapter function that translates each Substrait query plan into your engine's AI SQL dialect, executes it, and returns the execution results to QUAIL-B for scoring.
 
@@ -108,7 +108,7 @@ import quail_b
 
 quail_b.run(
     run_query,
-    queries=["IMDB-4"],  # Omit to run all 31 queries
+    queries=["IMDB-4"],  # Omit to run all 36 queries
     scale_factor=0.1,
     output_dir="results/my-run",  # Set your desired output directory path
     metadata={"engine": "my-engine", "model": "Qwen/Qwen3-4B-FP8"},
@@ -118,7 +118,7 @@ quail_b.run(
 ```
 
 - `output_dir`: Path to the directory where QUAIL-B writes run results (e.g. `"results/vllm-qwen3-4b"` or any custom path). Must be a new directory.
-- `queries`: List of query IDs to run. Omit `queries=` (or pass `None`) to run all 30 benchmark queries.
+- `queries`: List of query IDs to run. Omit `queries=` (or pass `None`) to run all 36 benchmark queries. A suite name stands for its queries: `"QUAIL-B"` for the 31 text queries, `"QUAIL-B-PDF"` for the 5 PDF queries.
 - Data is downloaded from `s3://quail-bench` and cached locally in `~/.cache/quail-b`.
 - Only the reference labels of the selected queries' predicates are loaded, as Arrow tables of about 25 bytes per answer. Loading the full published collection of 21 label sets at scale 0.1 (1.21 million answers) takes 1.9 s from cached files with a peak of 0.62 GiB, corpus tables included; at scale 1.0 (51.8 million answers) budget about 3 GiB.
 
@@ -180,6 +180,12 @@ Adding the two CUAD tables gave every scale factor a new corpus id.
 The collections above reuse all 23 earlier label sets unchanged (each
 reused set's table manifest matched exactly) and add the 8 CUAD label
 sets, which come from the CUAD annotation and needed no inference.
+
+### QUAIL-B-PDF
+
+QUAIL-B-PDF is the PDF version of the benchmark: the queries whose
+documents are PDF pages rendered as images instead of text. It needs a
+model that takes images, and it holds the CUAD family today.
 
 CUAD-1 to CUAD-5 read contract PDFs. The `document` column of both
 relations is a file reference: `files/<id>.pdf` for a whole contract and
