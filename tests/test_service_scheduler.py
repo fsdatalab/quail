@@ -75,6 +75,53 @@ def test_in_process_run_saves_plan_progress_and_a_readable_result(
     assert report["backend"] == "quail"
 
 
+def test_a_finished_execution_is_not_killed_while_it_reports_done(
+        store, tmp_path):
+    """Wait for a finished execution to report done instead of killing it.
+
+    The record closes on the execution's own final event a moment before
+    the executor reports done. Killing it there would throw away the
+    process that holds the loaded model.
+    """
+    stops = []
+
+    class SlowDoneExecution:
+        def __init__(self, emit):
+            self.emit = emit
+            self.started = time.monotonic()
+
+        def wait(self, timeout):
+            # first poll: the finished event has landed, done has not
+            if self.emit is not None:
+                self.emit("failed", {"type": "RuntimeError",
+                                     "message": "GPU said no"})
+                self.emit = None
+                return False
+            # done arrives 0.2 s after start; block like Event.wait does
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if time.monotonic() - self.started > 0.2:
+                    return True
+                time.sleep(0.01)
+            return False
+
+        def stop(self):
+            stops.append(1)
+
+    class Executor:
+        def start(self, job, emit):
+            return SlowDoneExecution(emit)
+
+        def close(self):
+            pass
+
+    status = submit(store, tmp_path)
+    scheduler = Scheduler(store, Executor(), tmp_path, poll_s=0.02)
+    final = scheduler.run_one(status)
+    assert final.state == "failed" and final.error["message"] == "GPU said no"
+    assert stops == [], "the executor was killed after finishing"
+
+
 def test_compile_and_executor_failures_are_saved(store, tmp_path):
     bad = submit(store, tmp_path, sql="SELECT r.nothing FROM reviews r")
     scheduler = Scheduler(store, InProcessExecutor(service_fakes.hooks),

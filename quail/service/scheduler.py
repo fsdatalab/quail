@@ -23,6 +23,8 @@ logger = logging.getLogger("quail.service")
 DEFAULT_TIMEOUT_S = 1000.0
 # progress writes are one fsync each; a loop can report far faster
 PROGRESS_WRITE_INTERVAL_S = 0.5
+# how long a finished execution may take to report done before it is killed
+FINISH_GRACE_S = 30.0
 
 
 class Scheduler:
@@ -115,7 +117,11 @@ class Scheduler:
         while not execution.wait(self.poll_s):
             current = self.store.get(query_id)
             if current.done:
-                execution.stop()
+                # Our own finished or failed event closed the record and
+                # the executor is about to report done. Killing it here
+                # would throw away the loaded model for the next query.
+                if not execution.wait(FINISH_GRACE_S):
+                    execution.stop()
                 break
             if current.cancel_requested:
                 self.store.finish(query_id, epoch, "cancelled", error={
