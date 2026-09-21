@@ -122,7 +122,10 @@ Primary query time and cost exclude model startup.
 The source lives under
 [`demos/civil_comments/`](https://github.com/fsdatalab/quail/tree/main/demos/civil_comments).
 
-Run Quail on a local H100:
+### Quail
+
+<Tabs items={['Local H100', 'Modal']}>
+<Tab>
 
 ```bash
 uv run python demos/civil_comments/quail_backend.py \
@@ -130,10 +133,10 @@ uv run python demos/civil_comments/quail_backend.py \
   --output results/civil-comments/quail/local
 ```
 
-The local runner writes files under `results/civil-comments/quail/` by
-default. The local runner contains no Modal setup.
+Results are written to `results/civil-comments/quail/local`.
 
-Run the same Quail backend on Modal:
+</Tab>
+<Tab>
 
 ```bash
 uv run modal run --detach demos/civil_comments/quail_modal.py \
@@ -144,7 +147,10 @@ The Modal wrapper mounts the `quail-results` volume and writes files under
 `demos/civil-comments/quail/` inside the volume. The wrapper prints the Modal
 function call id before waiting for the query.
 
-Run Jev:
+</Tab>
+</Tabs>
+
+### Jev
 
 ```bash
 read -s TYPESAFE_API_KEY
