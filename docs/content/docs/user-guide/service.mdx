@@ -205,18 +205,21 @@ Where the data lives on Modal:
 - An idle container scales down after 15 minutes. The next request
   starts one, and the first query then pays the model boot again.
 
-## What is saved and what survives
+## Saved records
 
-- Every status change is one SQLite transaction and raises the
-  record's `revision`. A read after an acknowledged change sees that
-  revision or a newer one.
-- `succeeded` is written only after the service has reopened the saved
-  result, report, and answer tables.
-- Records and finished results survive a restart when the data
-  directory survives. Queued records run after the restart. A record
-  that was executing during the restart becomes `interrupted`; it is
-  not restarted and not left `running`.
-- Cancelling or timing out a running query kills the executor process.
-  The next query pays the model boot again.
-- Losing the data directory loses everything. The service does not
-  resume GPU work after a crash and does not retry.
+The service writes each status to SQLite before it returns that
+status. Each write adds one to `revision`.
+
+A record becomes `succeeded` only after the service has read the
+result file, the report, and the answer tables back from disk.
+
+Restart the service with the same `--data-dir`. The records and
+results are still there. The service runs queries that are still
+`queued`. It marks a query that was `planning` or `running` as
+`interrupted`. That query stays `interrupted`.
+
+Cancel and timeout kill the process that has the model loaded. The
+next query loads the model again.
+
+If the data directory is gone, the service starts with no records
+and no results.
