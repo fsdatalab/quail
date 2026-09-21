@@ -1,5 +1,7 @@
 """CPU checks for the QUAIL-B labeling pass."""
 
+from pathlib import Path
+
 import pytest
 
 import quail.bench.labeling as labeling
@@ -498,6 +500,8 @@ def test_financebench_workload_judges_the_filter_and_reads_the_join(
 
     monkeypatch.setattr(quail, "Session", _FakeSession)
     monkeypatch.setattr(labeling, "ROOT", tmp_path)
+    # one anchor per join part, so the annotation join writes two parts
+    monkeypatch.setattr(labeling, "JOIN_PAIRS_PER_CALL", 4)
     assert "financebench" not in labeling.annotation_workloads()
     rows = _corpus_rows(
         reviews=["a"], reports=["r"], terms=["t"],
@@ -518,6 +522,9 @@ def test_financebench_workload_judges_the_filter_and_reads_the_join(
     assert answers["status"] == "complete"
     assert (answers["rows"], answers["true_rows"]) == (2 * 4, 3)
     assert answers["source_rows"] == {"financebench_evidence": 8}
+    parts = sorted((Path(answers["compact_path"]).parent / "parts").iterdir())
+    assert [part.name for part in parts] == [
+        "part_000000_000001.parquet", "part_000001_000002.parquet"]
     labels = pq.read_table(answers["compact_path"]).to_pylist()
     assert {(row["left_id"], row["right_id"]) for row in labels
             if row["answer"]} == {("fq0", "f0p2"), ("fq1", "f1p1"),

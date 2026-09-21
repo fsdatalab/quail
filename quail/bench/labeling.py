@@ -364,9 +364,9 @@ def _part_bounds(spec: PredicateSpec, identity: dict,
                  corpus_rows: dict[str, list[dict]]) -> list[tuple[int, int]]:
     """The left-row ranges the writers split this predicate into.
 
-    Must stay in step with _write_filter_parts, _write_qwen_join_parts
-    and _write_lepard_source, which is why the batch sizes are derived
-    the same way here rather than restated.
+    Must stay in step with _write_filter_parts and _write_qwen_join_parts,
+    which is why the batch sizes are derived the same way here rather
+    than restated; the source-labeled join writers read these bounds.
     """
     left = len(corpus_rows[spec.left_table])
     per_call = identity.get("prompts_per_call", LEGACY_PROMPTS_PER_CALL)
@@ -736,16 +736,16 @@ def _lepard_source_answer(cited_passage_ids, passage_ids) -> bool:
 
 def _write_source_join_parts(spec: PredicateSpec, left_rows: list[dict],
                              right_rows: list[dict], identity: dict,
-                             corpus_id: str, answer, source: str,
-                             anchor_batch: int = 50) -> None:
+                             corpus_id: str, answer, source: str) -> None:
     """Write a join's parts over every pair from the dataset's own labels.
 
     `answer(left row, right row)` gives each pair's answer and `source`
-    is the label source recorded on every row; the rest is as for the
-    model-judged join parts.
+    is the label source recorded on every row. The parts split the left
+    rows exactly as `_part_bounds` expects them for this predicate.
     """
-    for start in range(0, len(left_rows), anchor_batch):
-        end = min(start + anchor_batch, len(left_rows))
+    bounds = _part_bounds(spec, identity, {spec.left_table: left_rows,
+                                           spec.right_table: right_rows})
+    for start, end in bounds:
         part = _part_path(spec, identity, start, end)
         if part.exists():
             continue
