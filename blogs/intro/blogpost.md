@@ -81,21 +81,28 @@ To execute the plan with vLLM, we render one prompt for each filter input and on
 
 **A cost estimate for the query plan.** Before measuring the vLLM baseline, we estimate the lowest possible runtime for the same plan. We count the model's arithmetic work and HBM traffic from the token lengths, then use a [roofline model](https://modal.com/gpu-glossary/perf/roofline-model) to estimate the time. HBM is the GPU's main memory. The estimate uses the saved reference answers to determine which rows survive each stage. It assumes peak GPU throughput, full overlap between CPU and GPU work, and unlimited space for retained KV. No implementation can meet all of these assumptions. We call this lower bound the *speed of light estimate*, or SoL. For BIO-4 at scale factor 1.0, the SoL estimate is 894.37 seconds, or 14.91 minutes.[^mfu] The [implementation in Quail](https://github.com/fsdatalab/quail-exploration/blob/0d24478a82100b518d6110f5c1c8cec0c26c6487/quail/planner/sol.py) contains the full calculation.
 
-**How vLLM should perform.** The vLLM baseline evaluates 8,142,130 document pairs and 13,288 filter inputs. Each request produces one token constrained to `TRUE` or `FALSE`, so almost all model work is prefill. Prefill is the model work that reads the input prompt before producing an answer. With a large enough batch, vLLM should keep the H100 busy.
+**How we hoped vLLM would perform.** Each request produces one token constrained to `TRUE` or `FALSE`, so almost all model work is prefill. Prefill is the model work that reads the input prompt before producing an answer. BIO-4 provides millions of requests, so there should always be a large batch ready for the H100.
 
-**How vLLM actually performs.** We run vLLM 0.26.0 with Qwen3 4B FP8 on one H100. We tune `max_num_batched_tokens` and `max_num_seqs` to give vLLM enough batch capacity to use the GPU. The vLLM baseline takes 24,640.51 seconds, or 6.84 hours. That is 27.55 times the SoL estimate. The SoL estimate covers 8,849,019 document pairs, compared with the 8,142,130 pairs evaluated by the vLLM baseline, so the difference does not come from the baseline evaluating more pairs.
+**How vLLM actually performs.** We run vLLM 0.26.0 with Qwen3 4B FP8 on one H100. We give it enough batch capacity to use the GPU. The query takes 6.84 hours, or 27.55 times the SoL estimate. The baseline evaluates fewer pairs than the estimate, not more. Extra model work alone does not explain the gap.
 
-We find two sources of inefficiency:
+The first problem is visible in a GPU timeline. vLLM submits each pair as a separate request. The CPU still has to prepare and schedule every request, even when the GPU can reuse most of its document prefix. The GPU finishes these small batches quickly. If the CPU has not prepared the next batch, the GPU waits. These waits appear as idle gaps, or *bubbles*, between blocks of GPU work. This CPU scheduling time is what we mean by *host overhead*.[^host-overhead]
 
-- **KV regret.** A fresh input token is an input token that the model processes in a forward pass instead of reusing its KV. KV regret counts fresh input tokens that repeat earlier work because reusable KV was evicted. The vLLM baseline computes 174.6 million fresh input tokens on BIO-4. Of those, 50.3 million are recomputed KV tokens. That is 28.82 percent of the fresh input tokens.
+We are still preparing the BIO-4 version of this timeline. Figure 2 shows the same pattern in an earlier BIO-3 join. Quail keeps GPU work nearly continuous. The vLLM baseline leaves visible gaps while its CPU processes the individual requests.
 
-- **Host overhead.** Host overhead is the CPU time spent preparing and scheduling model work while the GPU is idle. The vLLM baseline submits more than 8 million pair prompts as separate requests. The CPU must process every request even when most of its document prefix comes from the prefix cache.[^host-overhead]
+<!-- TODO: Replace this BIO-3 profile with BIO-4-specific art when it lands. -->
+::: {.figure-block .wide-figure}
+[![Five seconds of GPU activity and CPU operations during a BIO-3 join with Quail and the vLLM baseline.](figures/bio3_profile_comparison.png){width=100%}](figures/bio3_profile_comparison.pdf)
+
+*Figure 2. Five seconds of an earlier BIO-3 join. Quail keeps the GPU busy, while the vLLM baseline has visible idle bubbles between batches. The CPU operations below the timeline show the request processing and scheduling work.*
+:::
+
+The second problem is repeated model work. A fresh input token is an input token that the model processes in a forward pass instead of reading its KV. When reusable KV is evicted and later computed again, we call those repeated tokens *KV regret*. On BIO-4, the vLLM baseline recomputes 50.3 million KV tokens.
 
 [^host-overhead]: Modal provides useful background on [GPU utilization](https://modal.com/blog/gpu-utilization-guide) and [host overhead](https://modal.com/blog/host-overhead-inference-efficiency) in inference engines.
 
 [^mfu]: *Model FLOP/s utilization (MFU)* is the fraction of the GPU's peak arithmetic throughput used during a model forward pass. The speed of light estimate assumes 100 percent MFU. That is not realistic, but we should still try to get as close as possible. We do not yet measure Quail's MFU.
 
-We can, and we should, reduce both sources of waste by optimizing inference for AI-SQL.
+Quail addresses both problems together. Its query plan tells the execution engine which KV will be reused, and its larger planned batches avoid per-request scheduling on the critical path.
 
 # 3. Introducing Quail
 
@@ -264,14 +271,14 @@ We have three performance goals for Quail:
 
 Our current evaluation focuses on the first two goals. Quail uses DeepGEMM, FlashAttention 3, and fused Triton kernels, but we do not yet measure MFU or tune the core matrix multiplication and attention kernels. We defer a full MFU study to future work.
 
-As shown in Figure 2, Quail consists of a query frontend, a query planner, and an execution engine. Through the frontend, the user provides Arrow tables or datasets, an AI-SQL or Python query, and the model and GPU or GPUs to use. The frontend creates a logical plan from the query. The query planner orders the filters and joins, chooses the anchor for each join, and determines how many tokens each model forward pass should process. The planner then lowers the logical plan into a physical operator plan, which the execution engine runs.
+As shown in Figure 3, Quail consists of a query frontend, a query planner, and an execution engine. Through the frontend, the user provides Arrow tables or datasets, an AI-SQL or Python query, and the model and GPU or GPUs to use. The frontend creates a logical plan from the query. The query planner orders the filters and joins, chooses the anchor for each join, and determines how many tokens each model forward pass should process. The planner then lowers the logical plan into a physical operator plan, which the execution engine runs.
 
 Quail is extensible, and its design is inspired by [Apache DataFusion](https://datafusion.apache.org/), an open source, extensible analytical query engine. ~~Users~~ We, and you, can add new query operators, planning rules, execution backends, models, or support for other hardware.
 
 ::: {.figure-block .wide-figure}
 [![Quail architecture.](figures/quail-architecture.svg?v=4){width=100%}](figures/quail-architecture.svg?v=4)
 
-*Figure 2. Quail turns Arrow data and an AI-SQL query into a logical plan. The planner applies SQL rewrites, lowers the AI operations into physical operators, and plans operator pipelines for KV reuse. The execution engine runs the physical plan and executes its AI operations on the GPU.*
+*Figure 3. Quail turns Arrow data and an AI-SQL query into a logical plan. The planner applies SQL rewrites, lowers the AI operations into physical operators, and plans operator pipelines for KV reuse. The execution engine runs the physical plan and executes its AI operations on the GPU.*
 :::
 
 ### 3.2.1 Query frontend
@@ -315,12 +322,12 @@ We then place physical operators into pipelines. Within a pipeline, Quail sends 
 2. **KV manager.** Quail allocates, pins, rewinds, and releases KV pages according to the physical plan.
 3. **Inference program.** On the GPU, Quail runs a model forward pass for each input batch. We describe the inference program in [Section 3.2.4](#inference-program).
 
-Figure 3 shows how these components work together.
+Figure 4 shows how these components work together.
 
 ::: {.figure-block .wide-figure}
 [![The physical operator plan and execution path for BIO-4.](figures/execution-engine.svg?v=10){width=100%}](figures/execution-engine.svg?v=10)
 
-*Figure 3. Quail lowers BIO-4 to the physical plan on the left. On the right, one CPU worker runs its physical operators and manages KV. Each AI physical operator invokes Quail's inference program on the GPU.*
+*Figure 4. Quail lowers BIO-4 to the physical plan on the left. On the right, one CPU worker runs its physical operators and manages KV. Each AI physical operator invokes Quail's inference program on the GPU.*
 :::
 
 **Physical plan executor.** Quail uses a pull-based executor, as in [Volcano](https://doi.org/10.1109/69.273032), but processes a batch at a time, as in [MonetDB](https://www.cidrdb.org/cidr2005/papers/P19.pdf). Before execution, Quail tokenizes every document column referenced by an AI filter or join with [Gigatoken](https://github.com/marcelroed/gigatoken)[^gigatoken], then loads one model copy per GPU. Below, we explain how Quail reuses parts of vLLM without running vLLM's request scheduler or KV manager. During execution, the CPU prepares one input batch while the GPU processes another.
@@ -337,12 +344,12 @@ During planning, Quail chooses which documents or document pairs require model e
 
 **Physical operator interface.** `AiFilter` and `AiJoin` may each invoke the model hundreds or thousands of times. For one such request, Quail passes token IDs and positions, plus KV page locations when reusable KV exists, to the inference program. Quail receives `TRUE` and `FALSE` scores in return.
 
-**vLLM's inference program.** vLLM is a general-purpose inference library designed to support many model architectures and hardware backends. As Figure 4 shows, vLLM can combine several sources of GPU code in one forward pass. vLLM JIT-compiles ordinary PyTorch operations with [`torch.compile`](https://docs.vllm.ai/en/stable/design/torch_compile/) and TorchInductor, and calls specialized kernels for operations such as attention and matrix multiplication. Before each forward pass, vLLM uses its scheduler to form a batch and its KV manager to assign cache pages.
+**vLLM's inference program.** vLLM is a general-purpose inference library designed to support many model architectures and hardware backends. As Figure 5 shows, vLLM can combine several sources of GPU code in one forward pass. vLLM JIT-compiles ordinary PyTorch operations with [`torch.compile`](https://docs.vllm.ai/en/stable/design/torch_compile/) and TorchInductor, and calls specialized kernels for operations such as attention and matrix multiplication. Before each forward pass, vLLM uses its scheduler to form a batch and its KV manager to assign cache pages.
 
 ::: {.figure-block}
 [![How vLLM turns a PyTorch model into GPU work.](figures/vllm-inference-program.svg){width=100%}](figures/vllm-inference-program.svg)
 
-*Figure 4. vLLM combines compiled PyTorch operations with specialized GPU kernels. vLLM chooses the kernels according to the model, data type, and hardware.*
+*Figure 5. vLLM combines compiled PyTorch operations with specialized GPU kernels. vLLM chooses the kernels according to the model, data type, and hardware.*
 :::
 
 **Quail's inference program.** Quail runs its own scheduler and KV manager, but reuses selected vLLM components inside the model forward pass. For Qwen3, Quail uses vLLM to load the same checkpoint and reuses its FP8 matrix multiplication and FlashAttention 3 kernels. Quail makes three small changes for AI-SQL.
@@ -358,7 +365,7 @@ During planning, Quail chooses which documents or document pairs require model e
 ::: {.figure-block}
 [![One attention step for a join.](figures/join-attention-step.svg){width=100%}](figures/join-attention-step.svg)
 
-*Figure 5. One attention step for a join. Quail first computes causal attention within each partner suffix, then computes attention from the same suffix queries into the shared anchor KV. Quail uses the log-sum-exp values from both calls to recover the result of attention over the full `anchor + partner` sequence.*
+*Figure 6. One attention step for a join. Quail first computes causal attention within each partner suffix, then computes attention from the same suffix queries into the shared anchor KV. Quail uses the log-sum-exp values from both calls to recover the result of attention over the full `anchor + partner` sequence.*
 :::
 
 **Third, restrict the output head to `TRUE` and `FALSE`.** Normally, a model would use its final output head to compute a score for every token in its vocabulary. For AI filters and joins, Quail needs only the scores for token IDs that represent `TRUE` or `FALSE`.[^answer-token-ids] Quail therefore multiplies the final hidden state by only the corresponding rows of the output-head matrix. By using the smaller matrix, Quail reduces computation and GPU memory use.
@@ -398,10 +405,28 @@ We chose the parameters above by running the benchmark queries. Increasing the b
 
 Across the 29 queries with matching measurements at scale factor 0.1, Quail is faster than the vLLM baseline on 27. The mean speedup is 1.91 times, the median speedup is 1.48 times, and the largest speedup is 10.04 times on BIO-2.
 
+### Per-query metrics table
+
+The final table will include one row for each query and method. We already have the BIO-4 cost and KV regret values below. Input token throughput and the remaining query rows still need to be filled from the saved benchmark results.
+
+::: {.metrics-table}
+| Query | Method | Input tokens/second | KV regret tokens | GPU cost/query |
+|---|---|---:|---:|---:|
+| BIO-4, scale 1.0 | Quail | TODO_NUMBERS | 18.0 million | $1.93 |
+| BIO-4, scale 1.0 | vLLM baseline | TODO_NUMBERS | 50.3 million | $27.03 |
+| BIO-4, scale 1.0 | SoL estimate | TODO_NUMBERS | 0 (assumed) | $0.98 |
+| `<QUERY_ID>` | Quail | TODO_NUMBERS | TODO_NUMBERS | TODO_NUMBERS |
+| `<QUERY_ID>` | vLLM baseline | TODO_NUMBERS | TODO_NUMBERS | TODO_NUMBERS |
+| `<QUERY_ID>` | SoL estimate | TODO_NUMBERS | 0 (assumed) | TODO_NUMBERS |
+:::
+
+**Headline throughput figure (TODO_NUMBERS).** The primary launch figure will show average input tokens per second for each dataset. Its planned path is `figures/quailb_tok_per_sec.png`. We will add it when the dataset averages are finalized. The latency figure remains below as the detailed per-query view.
+
+<!-- TODO_NUMBERS: Add figures/quailb_tok_per_sec.png and its PDF source here. -->
 ::: {.figure-block .wide-figure}
 [![Query latency for Quail, the vLLM baseline, and SoL estimates across the 31 default QUAIL-B queries. BIO-1 and BIO-3 are marked as not measured.](figures/quailb_latency.png){width=100%}](figures/quailb_latency.pdf)
 
-*Figure 6. Query latency at scale factor 0.1. Bars show measured query time, and horizontal lines show SoL estimates. The vertical axis uses a log scale because the query times span more than three orders of magnitude. An x marks BIO-1 and BIO-3, which do not have measurements for their current definitions.*
+*Figure 7. Query latency at scale factor 0.1. Bars show measured query time, and horizontal lines show SoL estimates. The vertical axis uses a log scale because the query times span more than three orders of magnitude. An x marks BIO-1 and BIO-3, which do not have measurements for their current definitions.*
 :::
 
 The 29 Quail runs take 1,484.25 seconds in total, compared with 3,149.83 seconds for the vLLM baseline. That is a 2.12 times aggregate speedup. The combined SoL estimate for the same queries is 449.43 seconds. Quail takes 3.30 times the estimate in aggregate, compared with 7.01 times for the vLLM baseline.
@@ -415,7 +440,7 @@ BIO-4 is the motivating query in this post. At scale factor 1.0, it filters 5,00
 ::: {.figure-block .wide-figure}
 [![BIO-4 results at scale factor 1.0. Quail takes 29.26 minutes and costs $1.93. The vLLM baseline takes 6.84 hours and costs $27.03. The SoL estimate is 14.91 minutes and $0.98.](figures/bio4_results.png){width=100%}](figures/bio4_results.pdf)
 
-*Figure 7. BIO-4 results at scale factor 1.0. Query time and GPU cost exclude model startup. Fresh input tokens count every token processed by a model forward pass. Recomputed KV tokens are included in the fresh input token total.*
+*Figure 8. BIO-4 results at scale factor 1.0. Query time and GPU cost exclude model startup. Fresh input tokens count every token processed by a model forward pass. Recomputed KV tokens are included in the fresh input token total.*
 :::
 
 Quail takes 29.26 minutes, compared with 6.84 hours for the vLLM baseline. Quail is 14.04 times faster. It is 1.96 times the SoL estimate, while the vLLM baseline is 27.55 times the estimate.
@@ -463,7 +488,7 @@ The vLLM baseline runs AGENT-1 in 98.45 seconds, which is 2.42 times faster than
 ::: {.figure-block .wide-figure}
 [![Five seconds of GPU activity and top-level CPU operations during the AGENT-1 filter with Quail and the vLLM baseline.](figures/agent1_profile_comparison.png){width=100%}](figures/agent1_profile_comparison.pdf)
 
-*Figure 8. AGENT-1 has one filter and no join. GPU operations cover 4.998 seconds with Quail and 4.988 seconds with the vLLM baseline in these five-second windows. The lower row shows only top-level CPU operations. Both keep the GPU busy, but the vLLM baseline computes far fewer fresh tokens by reusing prefixes across snapshots.*
+*Figure 9. AGENT-1 has one filter and no join. GPU operations cover 4.998 seconds with Quail and 4.988 seconds with the vLLM baseline in these five-second windows. The lower row shows only top-level CPU operations. Both keep the GPU busy, but the vLLM baseline computes far fewer fresh tokens by reusing prefixes across snapshots.*
 :::
 
 The vLLM baseline wins because its automatic prefix caching feature can reuse KV across different rows when their token prefixes match. Quail currently reuses KV only when the same document appears again in the query. As a result, Quail incurs 11.89 million KV regret tokens, while the vLLM baseline incurs only 23,928.
