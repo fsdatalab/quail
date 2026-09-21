@@ -248,6 +248,25 @@ def test_pdf_mode_plans_one_row_per_pdf(sources):
         assert scan.visual_tokens == 140
 
 
+def test_the_estimate_prices_every_page_image_in_full(sources):
+    """Pages share placeholder ids, not KV, so no page gets a prefix credit."""
+    from quail.planner.prefixes import prefix_credits
+
+    with gemma_session() as session:
+        session.register("pages", quail.DocumentProvider.from_pdfs(
+            sources, id_col="doc_id", path_col="path", row_mode="page"))
+        query = session.sql(FILTER_SQL)
+        assert prefix_credits(query.token_inputs()["p"]) == [0] * 5
+        estimate = quail.speed_of_light_estimate(
+            query, lambda prompt, assignment: True)
+        per_page = letter_soft(280) + GEMMA.image_frame_tokens
+        question = query.logical.operators().filters["p"][0].prompt.tail_tokens
+        preamble = query.logical.operators().filters["p"][0].prompt.preamble_tokens
+        assert estimate.fresh_tokens == 5 * (
+            preamble + per_page + question + GEMMA.canvas_tokens)
+        assert estimate.documents_by_alias == {"p": 5}
+
+
 def test_pdf_scan_round_trips_through_the_envelope(sources):
     from quail.builtins import built_in_registry
     from quail.physical import decode_graph

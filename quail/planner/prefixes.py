@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from quail.execution.pdf_inputs import PdfScanInput
 from quail.execution.tokens import shared_prefix_lengths
 
 # store path -> per document prefix credits; a corpus is measured once
@@ -15,7 +16,14 @@ def _documents(store):
 
 
 def prefix_credits(store) -> list[int]:
-    """Return, per document, the prefix tokens another document also has."""
+    """Return, per document, the prefix tokens another document also has.
+
+    PDF rows read as images get no credit: their placeholder token ids
+    match across pages, but the KV behind them comes from each page's
+    own pixels.
+    """
+    if isinstance(store, PdfScanInput):
+        return [0] * len(store.lengths)
     documents = _documents(store)
     path = getattr(documents, "path", None)
     if path is not None and path in _prefix_credit_cache:
