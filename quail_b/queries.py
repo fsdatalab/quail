@@ -31,6 +31,8 @@ from quail_b.prompts import (
     F11,
     F12,
     F13,
+    FIN_NEEDS_CALCULATION,
+    FIN_PAGE_EVIDENCE,
     LEP1,
     LEP2,
     LEP3,
@@ -82,6 +84,9 @@ FILTER_SELECTIVITY_ESTIMATES = {
     CUAD_LICENSE_GRANT: 19 / 40,
     CUAD_NON_TRANSFERABLE_LICENSE: 9 / 40,
     CUAD_PERPETUAL_LICENSE: 2 / 40,
+    # 100 of the 150 FinanceBench questions carry a reasoning label;
+    # 63 of those name numerical or logical reasoning over figures.
+    FIN_NEEDS_CALCULATION: 63 / 100,
 }
 JOIN_SELECTIVITY_ESTIMATES = {
     DISCUSS_ASPECT: 17683 / 60000,
@@ -90,6 +95,9 @@ JOIN_SELECTIVITY_ESTIMATES = {
     SUPPORT: 311 / 143500,
     REFUTE: 477 / 143500,
     LEPJOIN: 500 / 216500,
+    # FinanceBench marks 189 evidence pages for its 150 questions; the
+    # 84 filings they read hold 12,600 pages between them.
+    FIN_PAGE_EVIDENCE: 189 / (150 * 12600),
 }
 
 
@@ -182,13 +190,14 @@ QUERY_FAMILY_WORKLOADS = {
     "LEP": "lepard",
     "AGENT": "agent",
     "CUAD": "cuad",
+    "FIN": "financebench",
 }
 
 # A suite is the set of families one engine run can take by name. QUAIL-B
 # reads text documents; QUAIL-B-PDF reads PDF pages rendered as images.
 QUERY_SUITES = {
     "QUAIL-B": ("IMDB", "BIO", "FEV", "LEP", "AGENT"),
-    "QUAIL-B-PDF": ("CUAD",),
+    "QUAIL-B-PDF": ("CUAD", "FIN"),
 }
 
 

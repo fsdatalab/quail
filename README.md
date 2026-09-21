@@ -1,6 +1,6 @@
 # QUAIL-B
 
-QUAIL-B is an academic benchmark of 36 AI SQL queries over document tables. AI SQL is SQL with LLM-powered operators. Its first 31 queries read text documents. The other 5, QUAIL-B-PDF, read PDF pages rendered as images; see [QUAIL-B-PDF](#quail-b-pdf).
+QUAIL-B is an academic benchmark of 38 AI SQL queries over document tables. AI SQL is SQL with LLM-powered operators. Its first 31 queries read text documents. The other 7, QUAIL-B-PDF, read PDF pages rendered as images; see [QUAIL-B-PDF](#quail-b-pdf).
 
 This repository publishes the query plans, input tables, reference labels, and scoring harness. It does not include an execution engine. To benchmark your engine, you write an adapter function that translates each Substrait query plan into your engine's AI SQL dialect, executes it, and returns the execution results to QUAIL-B for scoring.
 
@@ -108,7 +108,7 @@ import quail_b
 
 quail_b.run(
     run_query,
-    queries=["IMDB-4"],  # Omit to run all 36 queries
+    queries=["IMDB-4"],  # Omit to run all 38 queries
     scale_factor=0.1,
     output_dir="results/my-run",  # Set your desired output directory path
     metadata={"engine": "my-engine", "model": "Qwen/Qwen3-4B-FP8"},
@@ -118,7 +118,7 @@ quail_b.run(
 ```
 
 - `output_dir`: Path to the directory where QUAIL-B writes run results (e.g. `"results/vllm-qwen3-4b"` or any custom path). Must be a new directory.
-- `queries`: List of query IDs to run. Omit `queries=` (or pass `None`) to run all 36 benchmark queries. A suite name stands for its queries: `"QUAIL-B"` for the 31 text queries, `"QUAIL-B-PDF"` for the 5 PDF queries.
+- `queries`: List of query IDs to run. Omit `queries=` (or pass `None`) to run all 38 benchmark queries. A suite name stands for its queries: `"QUAIL-B"` for the 31 text queries, `"QUAIL-B-PDF"` for the 7 PDF queries.
 - Data is downloaded from `s3://quail-bench` and cached locally in `~/.cache/quail-b`.
 - Only the reference labels of the selected queries' predicates are loaded, as Arrow tables of about 25 bytes per answer. Loading the full published collection of 21 label sets at scale 0.1 (1.21 million answers) takes 1.9 s from cached files with a peak of 0.62 GiB, corpus tables included; at scale 1.0 (51.8 million answers) budget about 3 GiB.
 
@@ -137,7 +137,7 @@ reviews = quail_b.load_table("reviews", scale_factor=0.1)
 
 ## Queries
 
-The benchmark defines 36 queries across 6 datasets:
+The benchmark defines 38 queries across 7 datasets:
 
 | Dataset | Queries | Relations | Description |
 | --- | ---: | --- | --- |
@@ -147,6 +147,7 @@ The benchmark defines 36 queries across 6 datasets:
 | LePaRD | 5 | `citation_contexts`, `citation_passages` | Legal precedent retrieval and citation matching |
 | SWE-Next | 2 | `agent_traces` | Software engineering agent trajectory evaluation |
 | CUAD | 5 | `contracts`, `contract_pages` | Contract clause review over PDF pages rendered as images |
+| FinanceBench | 2 | `filing_questions`, `filing_pages` | Evidence page retrieval for analyst questions over SEC filings rendered as images |
 
 The original LEP-5, LEP-6, and LEP-8 have empty reference outputs at sf=0.1
 with raw prompts as well as chat prompts. They are excluded. The original LEP-7
@@ -185,7 +186,7 @@ sets, which come from the CUAD annotation and needed no inference.
 
 QUAIL-B-PDF is the PDF version of the benchmark: the queries whose
 documents are PDF pages rendered as images instead of text. It needs a
-model that takes images, and it holds the CUAD family today.
+model that takes images, and it holds the CUAD and FinanceBench families.
 
 CUAD-1 to CUAD-5 read contract PDFs. The `document` column of both
 relations is a file reference: `files/<id>.pdf` for a whole contract and
@@ -208,12 +209,29 @@ At sf=1.0 the annotation keeps 453 of the 9,348 pages for CUAD-1 and 124
 for CUAD-2, and 78, 45, and 22 of the 430 bounded contracts for CUAD-3,
 CUAD-4, and CUAD-5.
 
+FIN-1 and FIN-2 read SEC filings from FinanceBench (Islam et al., 2023):
+150 questions an analyst would ask about a public company, each answered
+from one 10-K, 10-Q, 8-K, or earnings release, with the pages that hold
+the evidence marked. `filing_questions` has one row per question with its
+`filing` and `evidence_pages`; `filing_pages` has one row per page of
+every sampled question's filing, with a `files/<filing>.pdf#page=<n>`
+document reference. Both queries join a question with the pages of its
+own filing (an ordinary `q.filing = p.filing` condition in the plan) and
+ask, per page, whether it shows what the question needs; the engine
+anchors the join on the page and streams the filing's questions past it.
+FIN-2 first keeps the questions that need a calculation over reported
+figures, an AI filter over the question text labeled by the reference
+model like the text predicates. The join's reference labels are the
+evidence pages: a (question, page) pair is TRUE when the page is one of
+the question's evidence pages. Scale factors sample questions, so the
+page count follows from the sampled questions' filings.
+
 Queries use two LLM-powered relational operators:
 
 - `ai_filter(prompt, document) -> boolean` (selection)
 - `ai_join(prompt, left, right) -> boolean` (join)
 
-All 36 queries are stored as standard Substrait 0.103 ProtoJSON plans in [`quail_b/plans/`](quail_b/plans/). Custom AI functions are declared in [`quail_b/substrait_extensions.yaml`](quail_b/substrait_extensions.yaml). [All 36 plans](figures/quailb_anatomy.pdf) are diagrammed in one figure.
+All 38 queries are stored as standard Substrait 0.103 ProtoJSON plans in [`quail_b/plans/`](quail_b/plans/). Custom AI functions are declared in [`quail_b/substrait_extensions.yaml`](quail_b/substrait_extensions.yaml). [All 38 plans](figures/quailb_anatomy.pdf) are diagrammed in one figure.
 
 ### Example Query: IMDB-4
 
@@ -248,7 +266,7 @@ across questions.
 
 QUAIL-B defines three scale factors: `0.1`, `0.5`, and `1.0`. They correspond to 10%, 50%, and 100% of each dataset's sampling target.
 
-A scale factor changes the input table cardinalities and reference labels. It does not change the 36 query definitions.
+A scale factor changes the input table cardinalities and reference labels. It does not change the 38 query definitions.
 
 | Dataset | Relation | 0.1 | 0.5 | 1.0 |
 | --- | --- | ---: | ---: | ---: |
@@ -263,10 +281,15 @@ A scale factor changes the input table cardinalities and reference labels. It do
 | SWE-Next | `agent_traces` | 1,772 | 8,859 | 17,711 |
 | CUAD | `contracts` | 51 | 255 | 510 |
 | CUAD | `contract_pages` | 1,131 | 4,522 | 9,348 |
+| FinanceBench | `filing_questions` | 15 | 75 | 150 |
+| FinanceBench | `filing_pages` | see below | see below | see below |
 
 CUAD samples contracts, so the page count at a scale factor follows from
 the sampled contracts. The contract queries read the contracts of at most
-32 pages: 40, 215, and 430 at the three scale factors.
+32 pages: 40, 215, and 430 at the three scale factors. FinanceBench
+samples questions, and `filing_pages` holds every page of the sampled
+questions' filings; the corpus manifest records the count at each scale
+factor.
 
 Each scale factor deterministically samples upstream snapshots defined in [`quail_b/data.py`](quail_b/data.py).
 
@@ -343,6 +366,7 @@ quail-b report results/my-run
 | [`quail_b/rendering.py`](quail_b/rendering.py) | Exact prompt text rendering logic |
 | [`quail_b/data.py`](quail_b/data.py) | Dataset tables, sampling logic, and scale factors |
 | [`quail_b/cuad.py`](quail_b/cuad.py) | CUAD contract PDFs as file-backed relations and their page annotations |
+| [`quail_b/financebench.py`](quail_b/financebench.py) | FinanceBench filings as file-backed page relations and their evidence pages |
 | [`quail_b/labels.py`](quail_b/labels.py) | Reference labels and ground truth loading |
 | [`quail_b/run.py`](quail_b/run.py) | Benchmark runner and answer validator |
 | [`quail_b/scoring.py`](quail_b/scoring.py) | Accuracy, precision, recall, and cost scoring |

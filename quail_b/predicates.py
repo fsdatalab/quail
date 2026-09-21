@@ -13,7 +13,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 
-from quail_b import data, prompts, rendering
+from quail_b import data, financebench, prompts, rendering
 from quail_b.rendering import SHARED_PRE
 
 SCHEMA_VERSION = 1
@@ -187,6 +187,16 @@ PREDICATES = (
         "contract", "contracts", "document",
         source_policy="cuad_annotation",
         source_category="Irrevocable Or Perpetual License"),
+    PredicateSpec(
+        "quailb.financebench.question.needs_calculation", "financebench",
+        "question_needs_calculation", "filter", prompts.FIN_NEEDS_CALCULATION,
+        "question", "filing_questions", "question"),
+    PredicateSpec(
+        "quailb.financebench.page.answers_question", "financebench",
+        "page_answers_question", "join", prompts.FIN_PAGE_EVIDENCE,
+        "question", "filing_questions", "question",
+        "filing_page", "filing_pages", "document",
+        source_policy="financebench_evidence"),
 )
 
 PREDICATE_BY_KEY = {p.key: p for p in PREDICATES}
@@ -301,14 +311,35 @@ SOURCE_SPECS = {
         "rule": ("the predicate's clause category is in the row's clauses: "
                  "annotated in the contract, or with a span on the page"),
     },
+    "financebench_evidence": {
+        "dataset": "github/patronus-ai/financebench",
+        "revision": data.SOURCE_REVISIONS["github/patronus-ai/financebench"],
+        "rule": ("the page is one of the question's evidence pages; a page "
+                 "of another filing is false"),
+    },
 }
+
+# The source policies a dataset's own annotation answers, with no model.
+ANNOTATION_SOURCES = ("cuad_annotation", "financebench_evidence")
+
+
+def annotation_sourced(spec: PredicateSpec) -> bool:
+    """Whether the dataset's annotation answers this predicate outright."""
+    return spec.source_policy in ANNOTATION_SOURCES
 
 
 def annotation_answer(spec: PredicateSpec, row: dict) -> bool:
-    """The CUAD annotation's answer for one contract or page row."""
-    if spec.source_category is None:
-        raise ValueError(f"{spec.key} has no annotation category")
+    """The annotation's answer for one row of a filter."""
+    if spec.source_policy != "cuad_annotation" or spec.source_category is None:
+        raise ValueError(f"{spec.key} is not a filter the annotation answers")
     return spec.source_category in row["clauses"]
+
+
+def annotation_pair_answer(spec: PredicateSpec, left: dict, right: dict) -> bool:
+    """The annotation's answer for one (left, right) pair of a join."""
+    if spec.source_policy == "financebench_evidence":
+        return financebench.page_answers_question(right, left)
+    raise ValueError(f"{spec.key} is not a join the annotation answers")
 
 
 def label_sources(spec: PredicateSpec, judge: dict = JUDGE_SPEC) -> list[dict]:

@@ -35,6 +35,8 @@ from quail_b.prompts import (
     F11,
     F12,
     F13,
+    FIN_NEEDS_CALCULATION,
+    FIN_PAGE_EVIDENCE,
     LEP1,
     LEP2,
     LEP3,
@@ -80,6 +82,7 @@ TEMPLATE_LABELS = {
     CUAD_CHANGE_OF_CONTROL: "CoC", CUAD_EXCLUSIVITY: "excl.",
     CUAD_NON_COMPETE: "n-comp", CUAD_LICENSE_GRANT: "licens",
     CUAD_NON_TRANSFERABLE_LICENSE: "n-trns", CUAD_PERPETUAL_LICENSE: "perp.",
+    FIN_NEEDS_CALCULATION: "calc.", FIN_PAGE_EVIDENCE: "evid.",
 }
 
 

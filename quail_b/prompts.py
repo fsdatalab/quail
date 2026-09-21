@@ -222,3 +222,20 @@ CUAD_PERPETUAL_LICENSE = (
     "if the contract grants an irrevocable or perpetual license, FALSE "
     "otherwise."
 )
+
+# FinanceBench predicates. The question filter reads the question's
+# text; the page join reads a rendered filing page against a question,
+# and the evidence pages the dataset marks label it.
+FIN_NEEDS_CALCULATION = (
+    "Judge strictly from the analyst question above whether answering it "
+    "requires computing a value from two or more reported figures, such "
+    "as a ratio, a margin, a growth rate, or a change between periods, "
+    "rather than reading one reported figure or fact.\n\n{0}\n\n"
+    "Instruction: answer TRUE if the question requires a calculation over "
+    "reported figures, FALSE otherwise."
+)
+
+FIN_PAGE_EVIDENCE = (
+    "Does the filing page in DOCUMENT {1} show the figures or statements "
+    "an analyst needs to answer the question in DOCUMENT {0}?"
+)

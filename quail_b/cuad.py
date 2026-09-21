@@ -23,6 +23,8 @@ from pathlib import Path
 
 import pyarrow as pa
 
+from quail_b._sampling import stable_sample
+
 CUAD_ARCHIVE_URL = (
     "https://zenodo.org/records/4595826/files/CUAD_v1.zip?download=1"
 )
@@ -61,22 +63,9 @@ def _title_key(name: str) -> str:
     return unicodedata.normalize("NFC", name).strip().casefold()
 
 
-def contract_priority(title: str, seed: int) -> int:
-    """A stable random rank for one contract; the lowest ranks are sampled."""
-    value = f"{seed}\0{title}".encode()
-    return int.from_bytes(
-        hashlib.blake2b(value, digest_size=16).digest(), "big")
-
-
 def sample_titles(titles, n: int, seed: int) -> list[str]:
-    """The n contracts of lowest rank, in title order.
-
-    Ranks depend only on the title and the seed, so a smaller sample is
-    a subset of a larger one.
-    """
-    ranked = sorted(titles, key=lambda title: (contract_priority(title, seed),
-                                               title))
-    return sorted(ranked[:n])
+    """The n contracts of lowest stable rank, in title order."""
+    return stable_sample(titles, n, seed)
 
 
 def span_pages(page_texts: list[str], spans) -> dict[str, set[int]]:

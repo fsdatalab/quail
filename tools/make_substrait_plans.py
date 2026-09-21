@@ -40,6 +40,8 @@ from quail_b.prompts import (
     F11,
     F12,
     F13,
+    FIN_NEEDS_CALCULATION,
+    FIN_PAGE_EVIDENCE,
     LEP1,
     LEP2,
     LEPJOIN,
@@ -435,6 +437,20 @@ def _contracts():
                  "page_count", CONTRACT_PAGES_MAX)
 
 
+def _questions():
+    return Scan("filing_questions", "q", "question", ("filing",))
+
+
+def _filing_pages():
+    return Scan("filing_pages", "p", "document", ("filing",))
+
+
+def _evidence_join(questions):
+    """Each question against the pages of its own filing."""
+    return Join(questions, _filing_pages(), ("q", "p"), FIN_PAGE_EVIDENCE,
+                on=(("filing", "filing"),))
+
+
 def _imdb_chain(first):
     """Chain r1-a1-r2-a2: both reviews discuss a1, and r2 is positive about a2."""
     return Join(
@@ -580,6 +596,15 @@ QUERIES = (
           Join(_filters(_policies(), P_MSG, P_LOC),
                Scan("scenarios", "s", "scenario"), ("p", "s"),
                SCENARIO_MATCH), privacy=True),
+
+    # A question's filing is known, so the join asks about a question
+    # and the pages of that one filing; the engine anchors on the page.
+    Query("FIN-1", "join over filing pages: which pages of a question's "
+          "filing hold its evidence",
+          _evidence_join(_questions())),
+    Query("FIN-2", "filter on questions -> join over filing pages: the "
+          "evidence pages of the questions that need a calculation",
+          _evidence_join(_filters(_questions(), FIN_NEEDS_CALCULATION))),
 )
 
 

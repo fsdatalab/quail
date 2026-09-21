@@ -26,10 +26,13 @@ def test_set_table_matches_design():
         "claims": 5_000,
         "agent_traces": AGENT_TRACE_DOCUMENTS,
         "contracts": 510,
+        "filing_questions": 150,
         "policies": 1_000_000,
     }
     assert _n_docs("contracts", 0.1) == 51
     assert _n_docs("contracts", 1.0) == 510
+    assert _n_docs("filing_questions", 0.1) == 15
+    assert _n_docs("filing_questions", 1.0) == 150
     assert LEPARD_POSITIVE_PAIRS == 5_000
     assert _n_lepard_pairs(0.1) == 500
     assert len(ASPECTS) == 12

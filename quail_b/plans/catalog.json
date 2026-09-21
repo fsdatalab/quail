@@ -188,5 +188,15 @@
     "id": "PRIV-2",
     "description": "2 filters + 1 join: P_MSG + P_LOC -> scenarios",
     "privacy": true
+  },
+  {
+    "id": "FIN-1",
+    "description": "join over filing pages: which pages of a question's filing hold its evidence",
+    "privacy": false
+  },
+  {
+    "id": "FIN-2",
+    "description": "filter on questions -> join over filing pages: the evidence pages of the questions that need a calculation",
+    "privacy": false
   }
 ]

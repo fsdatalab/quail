@@ -17,7 +17,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from quail_b import cuad
+from quail_b import cuad, financebench
 from quail_b._files import (
     GROUND_TRUTH_ROOT,
     _cached_file,
@@ -27,6 +27,7 @@ from quail_b._files import (
     cache_directory,
 )
 from quail_b._files import PUBLIC_BUCKET as PUBLIC_BUCKET
+from quail_b._sampling import stable_sample
 
 DATA_SEED = 20260818
 CACHE_SCHEMA_VERSION = 9
@@ -67,6 +68,8 @@ SOURCE_REVISIONS = {
         "8fd6abfc7ca99d1f95c7f3f3a5dd5ea0cf9b7deb",
     # CUAD v1 is one archive on Zenodo; its sha256 is the revision.
     "zenodo/CUAD_v1": cuad.CUAD_ARCHIVE_SHA256,
+    # FinanceBench is a GitHub repository; the revision is its commit.
+    "github/patronus-ai/financebench": financebench.FINANCEBENCH_COMMIT,
 }
 
 # Base document counts at sf=1. LePaRD scales sampled citation pairs
@@ -77,6 +80,7 @@ SETS = {
     "claims": 5_000,
     "agent_traces": AGENT_TRACE_DOCUMENTS,
     "contracts": cuad.CONTRACTS,
+    "filing_questions": financebench.QUESTIONS,
     "policies": 1_000_000,
 }
 
@@ -806,6 +810,37 @@ def _build_contracts(d, sf, force=False):
     pq.write_table(pages, page_path)
 
 
+def _financebench_source(name: str) -> bytes:
+    """One file of the pinned FinanceBench commit, downloaded once."""
+    path = cache_directory() / "sources" / "financebench" / name
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + ".part")
+        url = (financebench.QUESTIONS_URL if name.endswith(".jsonl")
+               else financebench.pdf_url(Path(name).stem))
+        urllib.request.urlretrieve(url, temporary)
+        temporary.replace(path)
+    return path.read_bytes()
+
+
+def _build_filings(d, sf, force=False):
+    """Build filing_questions.parquet, filing_pages.parquet, and files/."""
+    question_path = d / "filing_questions.parquet"
+    page_path = d / "filing_pages.parquet"
+    if question_path.exists() and page_path.exists() and not force:
+        return
+    rows = financebench.read_questions(
+        _financebench_source("financebench_open_source.jsonl").decode("utf-8"))
+    by_id = {row["financebench_id"]: row for row in rows}
+    sampled = stable_sample(by_id, _n_docs("filing_questions", sf), DATA_SEED)
+    questions, pages = financebench.build_filing_tables(
+        [by_id[question_id] for question_id in sampled],
+        lambda doc_name: _financebench_source(f"{doc_name}.pdf"),
+        d / financebench.FILES_DIR)
+    pq.write_table(questions, question_path)
+    pq.write_table(pages, page_path)
+
+
 def _fetch_published_corpus(d, sf, root=None) -> bool:
     """Download the labeled corpus for this scale factor into d.
 
@@ -879,11 +914,13 @@ def build_sets(data_dir, sf, lf=1, fetch=True):
             _build_lepard(d, sf)
             _build_agent_traces(d, sf)
             _build_contracts(d, sf)
+            _build_filings(d, sf)
             return d
         base_sources = {
             name: revision for name, revision in SOURCE_REVISIONS.items()
             if name not in ("TIGER-Lab/SWE-Next-SFT-Trajectories",
-                            "zenodo/CUAD_v1")
+                            "zenodo/CUAD_v1",
+                            "github/patronus-ai/financebench")
         }
         same_sources = (
             current
@@ -902,6 +939,7 @@ def build_sets(data_dir, sf, lf=1, fetch=True):
             _build_lepard(d, sf, force=True)
             _build_agent_traces(d, sf, force=True)
             _build_contracts(d, sf, force=True)
+            _build_filings(d, sf, force=True)
             marker.write_text(json.dumps(expected, indent=2, sort_keys=True))
             return d
     if fetch and _fetch_published_corpus(d, sf):
@@ -949,6 +987,7 @@ def build_sets(data_dir, sf, lf=1, fetch=True):
     _build_lepard(d, sf, force=True)
     _build_agent_traces(d, sf, force=True)
     _build_contracts(d, sf, force=True)
+    _build_filings(d, sf, force=True)
 
     marker.write_text(json.dumps(expected, indent=2, sort_keys=True))
     return d
@@ -974,10 +1013,15 @@ CORPUS_COLUMNS = {
                   "clauses"),
     "contract_pages": ("id", "contract_id", "page_number", "pdf_sha256",
                        "document", "clauses"),
+    "filing_questions": ("id", "financebench_id", "filing", "doc_name",
+                         "company", "question_type", "question", "answer",
+                         "evidence_pages"),
+    "filing_pages": ("id", "filing", "doc_name", "page_number", "page_count",
+                     "pdf_sha256", "document"),
 }
 # Tables whose `document` column refers to files published beside the
 # tables, under `files/`, instead of holding the document text.
-FILE_TABLES = ("contracts", "contract_pages")
+FILE_TABLES = ("contracts", "contract_pages", "filing_pages")
 
 
 def _canonical(value) -> bytes:

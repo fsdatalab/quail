@@ -21,7 +21,7 @@ def _spec(key):
 
 
 def test_stable_ids_cover_predicate_semantics_and_inputs():
-    assert len(PREDICATES) == 31
+    assert len(PREDICATES) == 33
     assert len({spec.key for spec in PREDICATES}) == len(PREDICATES)
     original = PREDICATES[0]
 
@@ -103,7 +103,7 @@ def test_cuad_predicates_are_labeled_by_the_annotation():
     assert source["spec"]["dataset"] == "zenodo/CUAD_v1"
     assert annotation_answer(spec, {"clauses": ["Exclusivity", "Non-Compete"]})
     assert not annotation_answer(spec, {"clauses": ["Exclusivity"]})
-    with pytest.raises(ValueError, match="no annotation category"):
+    with pytest.raises(ValueError, match="not a filter the annotation"):
         annotation_answer(PREDICATES[0], {"clauses": []})
     # the category names the label, not the prompt: the version hash
     # depends on the words the model reads and nothing else
@@ -120,3 +120,28 @@ def test_raw_join_restores_the_published_predicate_hash():
 
     spec = _spec("quailb.imdb.review.discusses_aspect")
     assert predicate_version(spec)[0] == "pv_7fd88f0450b6e15acbae8810ef0405ae"
+
+
+def test_financebench_join_is_labeled_by_the_evidence_pages():
+    from quail_b.predicates import (
+        annotation_pair_answer,
+        annotation_sourced,
+        label_sources,
+    )
+
+    spec = _spec("quailb.financebench.page.answers_question")
+    assert annotation_sourced(spec)
+    assert not annotation_sourced(
+        _spec("quailb.financebench.question.needs_calculation"))
+    (source,) = label_sources(spec)
+    assert source["spec"]["dataset"] == "github/patronus-ai/financebench"
+    question = {"id": "fq0", "filing": "fl0", "evidence_pages": [60, 61]}
+    assert annotation_pair_answer(
+        spec, question, {"id": "fl0p60", "filing": "fl0", "page_number": 60})
+    assert not annotation_pair_answer(
+        spec, question, {"id": "fl0p59", "filing": "fl0", "page_number": 59})
+    assert not annotation_pair_answer(
+        spec, question, {"id": "fl1p60", "filing": "fl1", "page_number": 60})
+    with pytest.raises(ValueError, match="not a join the annotation"):
+        annotation_pair_answer(_spec("quailb.imdb.review.discusses_aspect"),
+                               {}, {})
