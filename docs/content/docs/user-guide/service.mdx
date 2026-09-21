@@ -133,6 +133,9 @@ for entry in run.stream_answers():
     elif entry["kind"] == "score":
         # entry["rows"] and entry["scores"] line up
         ...
+    elif entry["kind"] == "evict":
+        # a document prefix left KV; a later question recomputes it
+        print(entry["alias"], entry["document"], entry["tokens"])
 ```
 
 - `stream_answers()` yields the saved entries in order and ends when

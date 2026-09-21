@@ -68,9 +68,11 @@ def set_answer_sink(sink) -> None:
     says what finished: ``"filter"`` for one chunk's finished documents
     (row index, last stage asked, passed), ``"join"`` for one anchor's
     matches (its row index, the partner row index tuples that answered
-    true, how many pairs were asked), or ``"score"`` for one batch of
-    reranker scores (row indices and scores). Called from the loop's
-    thread; it must return quickly. Pass None to remove it.
+    true, how many pairs were asked), ``"score"`` for one batch of
+    reranker scores (row indices and scores), or ``"evict"`` for one
+    document prefix dropped from KV (alias, document index, tokens).
+    Called from the loop's thread; it must return quickly. Pass None
+    to remove it.
     """
     global _ANSWER_SINK
     _ANSWER_SINK = sink

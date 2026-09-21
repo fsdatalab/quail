@@ -28,6 +28,8 @@ import heapq
 
 import numpy as np
 
+from quail.progress import answer_sink
+
 
 class PageArena:
     """Page accounting: a free list and per-document page lists."""
@@ -191,6 +193,24 @@ class PageArena:
     @property
     def retained_prefix_tokens(self) -> int:
         return sum(self.tokens[key] for key in self.retained)
+
+
+def _evict_event(key, prefix_tokens):
+    """The answer-sink entry for one evicted document prefix.
+
+    Returns None when the key is not an alias and a document index.
+    """
+    if not (isinstance(key, tuple) and len(key) == 2):
+        return None
+    alias, document = key
+    if not isinstance(alias, str):
+        return None
+    try:
+        document = int(document)
+    except (TypeError, ValueError):
+        return None
+    return {"kind": "evict", "alias": alias, "document": document,
+            "tokens": int(prefix_tokens)}
 
 
 class KVArena:
@@ -421,13 +441,24 @@ class KVArena:
                  or self.sliding.free_pages >= need_sliding)))
 
     def evict_key(self, key):
-        """Free one retained prefix and record the lost KV."""
+        """Free one retained prefix, record the lost KV, and report it.
+
+        When an answer sink is listening, it is called with kind
+        ``evict``, the alias, the document index, and the prefix
+        length in tokens. Keys that are not an alias and a document
+        index are not reported.
+        """
         pages = len(self.accounting.owned[key])
         prefix_tokens = self.accounting.tokens[key]
         self.free_key(key)
         self.evicted_keys += 1
         self.evicted_pages += pages
         self.evicted_prefix_tokens += prefix_tokens
+        sink = answer_sink()
+        if sink is not None:
+            event = _evict_event(key, prefix_tokens)
+            if event is not None:
+                sink(event)
         return pages
 
     def activate(self, key, tokens: int, capacity_tokens: int | None = None,

@@ -186,8 +186,10 @@ class QueryRun:
         partner row index tuples that answered true), and ``asked`` (how
         many pairs were evaluated; the rest answered false). A ``"score"``
         entry is one batch of reranker scores: ``rows`` and ``scores``
-        line up. ``next`` is the entry to ask for next and ``done`` says
-        whether more can still arrive.
+        line up. An ``"evict"`` entry is one document prefix dropped
+        from KV: ``alias``, ``document`` (its row index), and
+        ``tokens`` (the prefix length). ``next`` is the entry to ask
+        for next and ``done`` says whether more can still arrive.
         """
         return self._client.answers(self.id, after=after, limit=limit)
 
