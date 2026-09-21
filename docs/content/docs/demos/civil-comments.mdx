@@ -58,14 +58,26 @@ request can evaluate all 31 questions for a comment.
 
 ## Execution
 
-Quail pushes the toxicity predicate below the join. Jev batches questions by
-comment. The Jev client never sends one request per comment-field pair.
+Quail checks toxicity before joining a comment with the 30 fields. The
+optimization is called predicate pushdown: a filter runs before a more
+expensive operation. For example, Quail skips all 30 field checks when a
+comment does not pass the toxicity filter.
 
-| Jev strategy | Requests | Questions per request |
-|---|---:|---:|
-| Combined, no planning | 10,000 | 31 |
-| Pushdown filter | 10,000 | 1 |
-| Pushdown fields | 3,016 | 30 |
+The Jev runner supports two strategies. The combined strategy sends all 31
+questions for every comment in one request. The toxicity-first strategy sends
+one toxicity question for every comment, then sends the 30 field questions
+only for comments classified as toxic. For example, 3,016 of the 10,000
+comments passed the toxicity check, so only 3,016 comments needed field
+questions.
+
+Jev batches questions by comment. The Jev runner never sends one request for
+each comment-field pair.
+
+| Jev strategy | Request contents | Requests | Questions per request |
+|---|---|---:|---:|
+| Combined | Toxicity and all fields | 10,000 | 31 |
+| Toxicity first | Toxicity check | 10,000 | 1 |
+| Toxicity first | Field checks after toxicity passes | 3,016 | 30 |
 
 ## Results
 
@@ -74,8 +86,8 @@ Primary query time and cost exclude model startup.
 | Backend | Query time | Tokens/s | Cost | Cost vs. Quail | Filter F1 | Join F1 |
 |---|---:|---:|---:|---:|---:|---:|
 | Quail, 1 H100 | **85.53 s** | 284,022 | **$0.0938** | **1.00×** | 0.413 | **0.287** |
-| Jev, num_threads = 256 (no query planning) | 244.87 s | **313,379** | $1.8892 | **20.13×** | 0.425 | 0.260 |
-| Jev, num_threads = 256 (push down predicate) | 100.20 s | 253,935 | $0.7705 | **8.21×** | **0.430** | 0.263 |
+| Jev, num_threads = 256 (combined) | 244.87 s | **313,379** | $1.8892 | **20.13×** | 0.425 | 0.260 |
+| Jev, num_threads = 256 (toxicity first) | 100.20 s | 253,935 | $0.7705 | **8.21×** | **0.430** | 0.263 |
 
 ## Run
 
