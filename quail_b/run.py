@@ -21,6 +21,7 @@ from quail_b.scoring import (
     evaluate,
     implied_row_count,
     implied_rows_mask,
+    relation_ids,
     scores_from_answers,
 )
 from quail_b.substrait import _Filter
@@ -82,6 +83,12 @@ def _query_hash(spec):
                 "alias": relation.alias,
                 "table": relation.table,
                 "text_column": relation.text_column,
+                # only a bounded relation names its bounds, so the
+                # hashes of the earlier queries stay what they were
+                **({"bounds": [
+                    {"column": bound.column, "value": bound.value}
+                    for bound in relation.bounds
+                ]} if relation.bounds else {}),
             }
             for relation in spec._info.relations
         ],
@@ -249,7 +256,7 @@ def _score(spec, output, suite, gpu_count, gpu_hourly_rate_usd, tokens=None):
     accuracy = evaluate(spec, output, suite.ground_truth, suite.tables)
     seconds = output.runtime_s
     inputs = {
-        relation.alias: len(suite.tables[relation.table])
+        relation.alias: len(relation_ids(relation, suite.tables[relation.table]))
         for relation in spec._info.relations
     }
     metrics = {

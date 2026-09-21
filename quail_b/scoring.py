@@ -157,11 +157,24 @@ def _as_string_ids(table: pa.Table, aliases) -> pa.Table:
     }))
 
 
+def relation_ids(relation, rows) -> pa.Array:
+    """The string ids of the rows a relation gives its AI operators.
+
+    A relation with column bounds keeps the rows within every bound;
+    the other rows are not part of the query's input.
+    """
+    ids = pa.array([str(row_id) for row_id in _ids(rows)], type=pa.string())
+    for bound in relation.bounds:
+        values = (rows.column(bound.column) if isinstance(rows, pa.Table)
+                  else pa.array([row[bound.column] for row in rows]))
+        ids = ids.filter(pc.fill_null(pc.less_equal(values, bound.value), False))
+    return ids
+
+
 def corpus_ids(spec: QuerySpec, corpus_rows) -> dict:
     """Per alias, the distinct corpus ids as strings, in one fixed order."""
-    return {relation.alias: pc.unique(pa.array(
-        [str(row_id) for row_id in _ids(corpus_rows[relation.table])],
-        type=pa.string()))
+    return {relation.alias: pc.unique(
+        relation_ids(relation, corpus_rows[relation.table]))
         for relation in spec._info.relations}
 
 
@@ -399,9 +412,7 @@ def expected_survivors(spec: QuerySpec, ground_truth, corpus_rows
     """Return, per alias, the ids that pass every filter on it."""
     survivors = {}
     for relation in spec._info.relations:
-        ids = pa.array(
-            [str(row_id) for row_id in _ids(corpus_rows[relation.table])],
-            pa.string())
+        ids = relation_ids(relation, corpus_rows[relation.table])
         for filter_spec in spec._info.filters:
             if filter_spec.relation != relation.alias:
                 continue
@@ -622,12 +633,13 @@ def evaluate(spec: QuerySpec, output: RunOutput, ground_truth, corpus_rows) -> d
     predicted_count, expected_count, matched_count = row_counts(
         spec, output, ground_truth, corpus_rows)
     input_document_rows = sum(
-        len(corpus_rows[relation.table])
+        len(relation_ids(relation, corpus_rows[relation.table]))
         for relation in spec._info.relations)
     unique_documents = {
-        (relation.table, str(row_id))
+        (relation.table, row_id)
         for relation in spec._info.relations
-        for row_id in _ids(corpus_rows[relation.table])
+        for row_id in relation_ids(
+            relation, corpus_rows[relation.table]).to_pylist()
     }
     return {
         "ground_truth_collection_id": ground_truth.collection_id,

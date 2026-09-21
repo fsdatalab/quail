@@ -16,13 +16,16 @@ from quail_b.labels import (
 )
 from quail_b.predicates import PREDICATES, predicate_payload
 from quail_b.queries import QuerySpec, queries
+from quail_b.run import _query_hash, _validate_output
 from quail_b.scoring import (
     RunOutput,
+    corpus_ids,
     evaluate,
     expected_rows,
     rows_from_answers,
 )
-from tools.make_substrait_plans import Filter, Join, Scan, build_plan
+from quail_b.substrait import _Bound
+from tools.make_substrait_plans import Bound, Filter, Join, Scan, build_plan
 
 
 def test_bio_4_scores_both_term_aliases_with_shared_reaction_labels():
@@ -737,3 +740,85 @@ def test_row_sample_is_taken_chunk_by_chunk():
     assert sample.column("r").to_pylist() == [
         f"r{i}" for i in range(0, step * 50, step)]
     assert _sample_rows(table, 1000) is table
+
+
+BOUNDED = _spec(
+    "TEST-BOUND",
+    "a page bound then one filter",
+    Filter(
+        Bound(Scan("contracts", "c", "document", int_columns=("page_count",)),
+              "page_count", 2),
+        FILTER,
+    ),
+)
+BOUNDED_CORPUS = {
+    "contracts": pa.table({
+        "id": ["c0", "c1", "c2"],
+        "document": ["files/c0.pdf", "files/c1.pdf", "files/c2.pdf"],
+        "page_count": pa.array([1, 2, 3], pa.int32()),
+    }),
+}
+
+
+def _bounded_truth():
+    key = "test.contract.filter"
+    return GroundTruthCollection(
+        collection_id="gt_test",
+        corpus_id="c_test",
+        scale_factor=0.1,
+        reference_model=None,
+        predicates={
+            key: PredicateLabels(
+                key=key,
+                label_set_id="ls_bound",
+                predicate={
+                    "key": key, "template": FILTER, "kind": "filter",
+                    "left_table": "contracts", "left_column": "document",
+                    "right_table": None, "right_column": None,
+                },
+                answers={("c0", None): True, ("c1", None): True,
+                         ("c2", None): True},
+                source_rows={"cuad": 3},
+            ),
+        },
+    )
+
+
+def test_bound_reads_back_from_the_plan_and_names_the_query_hash():
+    (relation,) = BOUNDED._info.relations
+    assert relation.bounds == (_Bound("page_count", 2),)
+    assert [operator.id for operator in BOUNDED._info.operators] == ["filter-1"]
+    unbounded = _spec(
+        "TEST-BOUND", "no bound",
+        Filter(Scan("contracts", "c", "document", int_columns=("page_count",)),
+               FILTER))
+    assert _query_hash(BOUNDED) != _query_hash(unbounded)
+    assert unbounded._info.relations[0].bounds == ()
+
+
+def test_bound_limits_the_rows_scored_and_rejects_answers_outside_it():
+    assert corpus_ids(BOUNDED, BOUNDED_CORPUS)["c"].to_pylist() == ["c0", "c1"]
+    expected = expected_rows(BOUNDED, _bounded_truth(), BOUNDED_CORPUS)
+    assert expected.column("c").to_pylist() == ["c0", "c1"]
+    output = RunOutput(
+        filter_answers={"filter-1": pa.table({
+            "c": ["c0", "c1"], "answer": [True, False]})},
+        join_answers={},
+        rows=pa.table({"c": ["c0"]}),
+        runtime_s=1.0,
+    )
+    _validate_output(BOUNDED, output, BOUNDED_CORPUS)
+    scores = evaluate(BOUNDED, output, _bounded_truth(), BOUNDED_CORPUS)
+    assert scores["output_accuracy"]["expected_rows"] == 2
+    assert scores["output_accuracy"]["predicted_rows"] == 1
+    assert scores["input_document_rows"] == 2
+    assert scores["unique_input_documents"] == 2
+    outside = RunOutput(
+        filter_answers={"filter-1": pa.table({
+            "c": ["c0", "c2"], "answer": [True, True]})},
+        join_answers={},
+        rows=pa.table({"c": ["c0", "c2"]}),
+        runtime_s=1.0,
+    )
+    with pytest.raises(ValueError, match="unknown document ID"):
+        _validate_output(BOUNDED, outside, BOUNDED_CORPUS)

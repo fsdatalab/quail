@@ -14,14 +14,28 @@ BOOLEAN_EXTENSION_URN = "extension:io.substrait:functions_boolean"
 AI_FILTER_NAME = "ai_filter:str_str"
 AI_JOIN_NAME = "ai_join:str_str_str"
 EQUAL_NAME = "equal:any_any"
+LTE_NAME = "lte:any_any"
 AND_NAME = "and:bool"
 
 _FUNCTION_URNS = {
     AI_FILTER_NAME: AI_EXTENSION_URN,
     AI_JOIN_NAME: AI_EXTENSION_URN,
     EQUAL_NAME: COMPARISON_EXTENSION_URN,
+    LTE_NAME: COMPARISON_EXTENSION_URN,
     AND_NAME: BOOLEAN_EXTENSION_URN,
 }
+
+
+@dataclass(frozen=True)
+class _Bound:
+    """An ordinary upper bound on one integer column of a relation.
+
+    Rows whose column is at most `value` reach the AI operators; the
+    others are not part of the query's input.
+    """
+
+    column: str
+    value: int
 
 
 @dataclass(frozen=True)
@@ -29,6 +43,7 @@ class _Relation:
     alias: str
     table: str
     text_column: str
+    bounds: tuple[_Bound, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -87,6 +102,7 @@ class _Decoded:
     tables: tuple[tuple[str, str], ...]
     text_columns: tuple[tuple[str, str], ...]
     operators: tuple[_Operator, ...]
+    bounds: tuple[tuple[str, _Bound], ...] = ()
 
 
 def _with_text_column(
@@ -175,6 +191,16 @@ def _literal_string(expression: algebra_pb2.Expression) -> str:
     return literal.string
 
 
+def _literal_int(expression: algebra_pb2.Expression) -> int:
+    if not expression.HasField("literal"):
+        raise ValueError("Substrait column bound must be an integer literal")
+    literal = expression.literal
+    kind = literal.WhichOneof("literal_type")
+    if kind not in ("i8", "i16", "i32", "i64"):
+        raise ValueError("Substrait column bound must be an integer literal")
+    return int(getattr(literal, kind))
+
+
 def _flatten(
     expression: algebra_pb2.Expression,
     functions: dict[int, str],
@@ -213,8 +239,25 @@ def _decode(
         child = _decode(rel.filter.input, functions)
         condition = rel.filter.condition
         function = condition.scalar_function
-        if functions.get(function.function_reference) != AI_FILTER_NAME:
-            raise ValueError("QUAIL-B FilterRel must call ai_filter")
+        name = functions.get(function.function_reference)
+        if name == LTE_NAME:
+            if child.operators:
+                raise ValueError(
+                    "a QUAIL-B column bound must precede the AI operators")
+            arguments = _arguments(condition)
+            if len(arguments) != 2:
+                raise ValueError("lte needs a field and an integer literal")
+            alias, column = _selected(child.fields, arguments[0])
+            bound = _Bound(column, _literal_int(arguments[1]))
+            return _Decoded(
+                child.fields,
+                child.tables,
+                child.text_columns,
+                child.operators,
+                (*child.bounds, (alias, bound)),
+            )
+        if name != AI_FILTER_NAME:
+            raise ValueError("QUAIL-B FilterRel must call ai_filter or lte")
         arguments = _arguments(condition)
         if len(arguments) != 2:
             raise ValueError("ai_filter needs a prompt and document")
@@ -226,6 +269,7 @@ def _decode(
             child.tables,
             _with_text_column(child.text_columns, field),
             (*child.operators, operator),
+            child.bounds,
         )
 
     if kind == "join":
@@ -288,6 +332,7 @@ def _decode(
             (*left.tables, *right.tables),
             text_columns,
             (*left.operators, *right.operators, operator),
+            (*left.bounds, *right.bounds),
         )
 
     raise ValueError(f"unsupported QUAIL-B Substrait relation {kind!r}")
@@ -371,7 +416,9 @@ def _inspect_plan(plan: plan_pb2.Plan) -> _PlanInfo:
     for alias, table in decoded.tables:
         if alias not in text_columns:
             raise ValueError(f"relation {alias!r} is not read by an AI function")
-        relations.append(_Relation(alias, table, text_columns[alias]))
+        bounds = tuple(
+            bound for bound_alias, bound in decoded.bounds if bound_alias == alias)
+        relations.append(_Relation(alias, table, text_columns[alias], bounds))
     info = _PlanInfo(tuple(relations), decoded.operators, select)
     _validate_info(info)
     return info

@@ -53,6 +53,7 @@ from quail_b.substrait import (
     BOOLEAN_EXTENSION_URN,
     COMPARISON_EXTENSION_URN,
     EQUAL_NAME,
+    LTE_NAME,
     SUBSTRAIT_VERSION,
 )
 
@@ -70,6 +71,7 @@ _FUNCTIONS = {
     AI_JOIN_NAME: (2, AI_EXTENSION_URN),
     EQUAL_NAME: (3, COMPARISON_EXTENSION_URN),
     AND_NAME: (4, BOOLEAN_EXTENSION_URN),
+    LTE_NAME: (5, COMPARISON_EXTENSION_URN),
 }
 
 
@@ -81,20 +83,31 @@ class Scan:
         table: The table name.
         alias: The relation alias, unique within a query.
         text: The column the AI functions read.
-        columns: Further columns, for ordinary join conditions.
+        columns: Further string columns, for ordinary join conditions.
+        int_columns: Integer columns, for ordinary bounds.
     """
 
     table: str
     alias: str
     text: str
     columns: tuple[str, ...] = ()
+    int_columns: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class Bound:
+    """Keep the rows of one scan whose integer column is at most a value."""
+
+    input: Scan
+    column: str
+    value: int
 
 
 @dataclass(frozen=True)
 class Filter:
     """Keep the documents of one relation that answer a prompt TRUE."""
 
-    input: Scan | Filter
+    input: Scan | Bound | Filter
     prompt: str
 
 
@@ -110,8 +123,8 @@ class Join:
         on: Column pairs, in `aliases` order, that must also be equal.
     """
 
-    left: Scan | Filter | Join
-    right: Scan | Filter | Join
+    left: Scan | Bound | Filter | Join
+    right: Scan | Bound | Filter | Join
     aliases: tuple[str, str]
     prompt: str
     on: tuple[tuple[str, str], ...] = ()
@@ -121,7 +134,7 @@ class Join:
 class Query:
     id: str
     description: str
-    tree: Scan | Filter | Join
+    tree: Scan | Bound | Filter | Join
     privacy: bool = False
 
 
@@ -138,6 +151,12 @@ def _bool_type():
         bool=type_pb2.Type.Boolean(
             nullability=type_pb2.Type.NULLABILITY_REQUIRED
         )
+    )
+
+
+def _int_type():
+    return type_pb2.Type(
+        i32=type_pb2.Type.I32(nullability=type_pb2.Type.NULLABILITY_REQUIRED)
     )
 
 
@@ -164,6 +183,12 @@ def _field(index):
 def _literal(text):
     return algebra.Expression(
         literal=algebra.Expression.Literal(string=text)
+    )
+
+
+def _int_literal(value):
+    return algebra.Expression(
+        literal=algebra.Expression.Literal(i32=value)
     )
 
 
@@ -199,13 +224,17 @@ class _Emitter:
     def emit(self, node):
         """Return (rel, fields, text columns by alias) for one tree."""
         if isinstance(node, Scan):
-            names = ("id", node.text, *node.columns)
+            names = ("id", node.text, *node.columns, *node.int_columns)
+            types = (
+                [_string_type() for _name in names[:len(names) - len(node.int_columns)]]
+                + [_int_type() for _name in node.int_columns]
+            )
             read = algebra.ReadRel(
                 common=_common(node.alias),
                 base_schema=type_pb2.NamedStruct(
                     names=names,
                     struct=type_pb2.Type.Struct(
-                        types=[_string_type() for _name in names],
+                        types=types,
                         nullability=type_pb2.Type.NULLABILITY_REQUIRED,
                     ),
                 ),
@@ -213,6 +242,19 @@ class _Emitter:
             )
             fields = tuple((node.alias, name) for name in names)
             return algebra.Rel(read=read), fields, {node.alias: node.text}
+
+        if isinstance(node, Bound):
+            rel, fields, text = self.emit(node.input)
+            self.functions.add(LTE_NAME)
+            relation = algebra.FilterRel(
+                common=algebra.RelCommon(direct=algebra.RelCommon.Direct()),
+                input=rel,
+                condition=_call(LTE_NAME, [
+                    _field(fields.index((node.input.alias, node.column))),
+                    _int_literal(node.value),
+                ]),
+            )
+            return algebra.Rel(filter=relation), fields, text
 
         if isinstance(node, Filter):
             rel, fields, text = self.emit(node.input)
