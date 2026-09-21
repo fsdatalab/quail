@@ -294,6 +294,32 @@ def test_child_process_execution_stops_on_cancel_or_timeout(
         scheduler.stop()
 
 
+def test_child_process_is_replaced_when_the_model_changes(store, tmp_path):
+    """A job for another model gets a fresh child; the same model reuses it."""
+    executor = ChildProcessExecutor("service_fakes:hooks")
+    scheduler = Scheduler(store, executor, tmp_path, poll_s=0.02)
+    try:
+        first = scheduler.run_one(submit(store, tmp_path))
+        assert first.state == "succeeded"
+        pid = executor._process.pid
+        assert scheduler.run_one(submit(store, tmp_path)).state == "succeeded"
+        assert executor._process.pid == pid, "same model, same child"
+
+        prepared = inputs.describe(quail.DocumentProvider.from_table(
+            service_fakes.reviews_table(), id_col="id"), tmp_path / "uploads")
+        store.put_input(prepared.content_id, str(prepared.upload_path),
+                        prepared.upload_path.stat().st_size)
+        other = store.create(
+            spec={"sql": service_fakes.FILTER_SQL, "dialect": "snowflake",
+                  "order": None},
+            config={**service_fakes.CONFIG, "model": "qwen3-32b-fp8"},
+            inputs={"reviews": prepared.spec}, timeout_s=1000.0)
+        assert scheduler.run_one(other).state == "succeeded"
+        assert executor._process.pid != pid, "another model, a new child"
+    finally:
+        executor.close()
+
+
 def test_load_hooks_checks_the_type():
     assert load_hooks(None) is None
     assert load_hooks("service_fakes:hooks") is service_fakes.hooks

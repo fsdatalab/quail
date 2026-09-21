@@ -234,13 +234,16 @@ class ChildProcessExecutor:
 
     ``stop`` kills the child; the next job starts a fresh one, which
     pays the model boot again. That is the reliable stop the current
-    GPU loop offers.
+    GPU loop offers. A job that names a different model than the child
+    has loaded also gets a fresh child: one model's weights and KV take
+    the whole GPU, and a new process is the sure way to give them back.
     """
 
     def __init__(self, hooks_reference: str | None = None):
         self.hooks_reference = hooks_reference
         self._process = None
         self._conn = None
+        self._loaded_model = None
         self._lock = threading.Lock()
         atexit.register(self.close)
 
@@ -278,7 +281,11 @@ class ChildProcessExecutor:
 
     def start(self, job: Job, emit: Emit) -> Execution:
         with self._lock:
+            model = job.config.get("model")
+            if self._loaded_model not in (None, model):
+                self._close_child_unlocked()
             self._ensure_child()
+            self._loaded_model = model
             self._conn.send(job)
             execution = _ChildExecution(self, emit, job)
         threading.Thread(target=execution.run, daemon=True,
@@ -287,17 +294,22 @@ class ChildProcessExecutor:
 
     def close(self) -> None:
         with self._lock:
-            if self._conn is not None and self._process is not None \
-                    and self._process.is_alive():
-                try:
-                    self._conn.send(None)
-                except (OSError, ValueError):
-                    pass
-                self._process.join(10)
-            self._kill_child_unlocked()
+            self._close_child_unlocked()
+
+    def _close_child_unlocked(self) -> None:
+        """Ask the child to exit, then make sure it did."""
+        if self._conn is not None and self._process is not None \
+                and self._process.is_alive():
+            try:
+                self._conn.send(None)
+            except (OSError, ValueError):
+                pass
+            self._process.join(10)
+        self._kill_child_unlocked()
 
     def _kill_child_unlocked(self) -> None:
         if self._process is not None and self._process.is_alive():
             self._process.kill()
             self._process.join(30)
         self._discard_child()
+        self._loaded_model = None
