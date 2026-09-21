@@ -1,0 +1,173 @@
+---
+title: Civil Comments
+description: Classify reader comments from English-language news sites.
+---
+
+The Civil Comments demo shows how you can use an AI filter and join to
+classify reader comments from English-language news sites.
+
+The demo uses 10,000 rows from [Jigsaw Civil Comments][dataset]. Each row
+contains a comment and crowd-sourced scores for toxicity, six toxicity
+subtypes, and 24 identity mentions.
+
+The dataset is labeled by human raters. A label is positive when selected by
+at least 50% of raters. Subjective labels can be noisy, so model predictions
+may not match every majority vote.
+
+## Query
+
+The `comments(comment_id, text)` table contains one comment per row. The
+`fields(field, statement)` table contains one classification criterion per
+row. The query returns a `(comment_id, field)` pair when the comment is toxic
+and matches the field criterion.
+
+| Fields | A match means |
+|---|---|
+| `severe_toxicity` | The comment is extremely hateful, aggressive, or disrespectful. |
+| `obscene` | The comment contains profanity. |
+| `threat` | The author expresses a wish or intent to cause pain, injury, or violence. |
+| `insult` | The comment directly insults a person or group. |
+| `identity_attack` | The comment attacks a person or group based on an identity. |
+| `sexual_explicit` | The comment describes sexual acts or body parts in a sexual or lewd way. |
+| `male`, `female`, `transgender`, `other_gender` | The comment mentions the named gender identity. |
+| `heterosexual`, `homosexual_gay_or_lesbian`, `bisexual`, `other_sexual_orientation` | The comment mentions the named sexual orientation. |
+| `christian`, `jewish`, `muslim`, `hindu`, `buddhist`, `atheist`, `other_religion` | The comment mentions the named religion or belief. |
+| `black`, `white`, `asian`, `latino`, `other_race_or_ethnicity` | The comment mentions the named race or ethnicity. |
+| `physical_disability`, `intellectual_or_learning_disability`, `psychiatric_or_mental_illness`, `other_disability` | The comment mentions the named disability category. |
+
+Each `statement` contains the field definition, one positive example, and one
+negative example. For example, the `threat` statement distinguishes “I will
+find you and break your legs” from a news report that says someone was
+attacked.
+
+```sql
+SELECT
+    c.comment_id,
+    f.field
+FROM comments AS c
+JOIN fields AS f
+  ON AI_FILTER(
+      PROMPT(:FIELD_PROMPT, c.text, f.statement)
+  )
+WHERE AI_FILTER(
+    PROMPT(:TOXICITY_PROMPT, c.text)
+);
+```
+
+The query has no selectivity hints.
+
+## Models
+
+Quail runs [DiffusionGemma 26B-A4B fp8][diffusion-gemma] on one H100. The Jev
+comparison runs use [Jev 1.13.0][jev]. One call to Jev can answer the toxicity
+question and all 30 field questions for one comment.
+
+## Execution
+
+### Quail
+
+The Quail planner places the toxicity filter below the join. The relevant
+part of `query.explain()` is:
+
+```text
+Project: c.comment_id, f.field
+  AiJoin: anchor=c
+    join 1 full (c, f)
+    AiFilter: c
+      survivors stream into the join with KV pinned
+      predicate 1
+      Scan comments as c
+    Scan fields as f
+```
+
+The plan runs in two steps:
+
+1. `AiFilter` checks each row in `comments` for toxicity.
+2. Each matching comment enters `AiJoin`, which checks the comment against
+   the 30 rows in `fields`.
+
+The two steps are pipelined. `AiJoin` starts when `AiFilter` produces the
+first matching comment rather than waiting for all 10,000 filter checks.
+The join reuses the comment KV computed by the filter.
+
+### Jev
+
+We provide two execution plans using Jev:
+
+- The *combined plan* asks all 31 questions in one call. Jev answers the 30
+  field questions even when the toxicity answer is negative.
+- The *toxicity-first plan* asks the toxicity question first. A second call
+  asks the 30 field questions only when the toxicity answer is positive.
+
+| Jev strategy | Request contents | Requests | Questions per request |
+|---|---|---:|---:|
+| Combined | Toxicity and all fields | 10,000 | 31 |
+| Toxicity first | Toxicity check | 10,000 | 1 |
+| Toxicity first | Field checks after toxicity passes | 3,016 | 30 |
+
+## Results
+
+Primary query time and cost exclude model startup.
+
+| Backend | Query time | Tokens/s | Cost | Cost vs. Quail | Filter F1 | Join F1 |
+|---|---:|---:|---:|---:|---:|---:|
+| Quail, DiffusionGemma 26B-A4B fp8, 1 H100 | **85.53 s** | 284,022 | **$0.0938** | **1.00×** | 0.413 | **0.287** |
+| Jev 1.13.0, num_threads = 256 (combined) | 244.87 s | **313,379** | $1.8892 | **20.13×** | 0.425 | 0.260 |
+| Jev 1.13.0, num_threads = 256 (toxicity first) | 100.20 s | 253,935 | $0.7705 | **8.21×** | **0.430** | 0.263 |
+
+## Run
+
+The source lives under
+[`demos/civil_comments/`](https://github.com/fsdatalab/quail/tree/main/demos/civil_comments).
+
+### Quail
+
+<Tabs items={['Local H100', 'Modal']}>
+<Tab>
+
+```bash
+uv run python demos/civil_comments/quail_backend.py \
+  --limit 10000 --gpus 1 \
+  --output results/civil-comments/quail/local
+```
+
+Results are written to `results/civil-comments/quail/local`.
+
+</Tab>
+<Tab>
+
+```bash
+uv run modal run --detach demos/civil_comments/quail_modal.py \
+  --limit 10000 --gpus 1
+```
+
+The Modal wrapper mounts the `quail-results` volume and writes files under
+`demos/civil-comments/quail/` inside the volume. The wrapper prints the Modal
+function call id before waiting for the query.
+
+</Tab>
+</Tabs>
+
+### Jev
+
+```bash
+read -s TYPESAFE_API_KEY
+export TYPESAFE_API_KEY
+
+uv run --with 'httpx[http2]==0.28.1' \
+  python demos/civil_comments/jev_backend.py \
+  --limit 10000 --concurrency 256 --strategy combined \
+  --output results/civil-comments/jev/combined
+
+uv run --with 'httpx[http2]==0.28.1' \
+  python demos/civil_comments/jev_backend.py \
+  --limit 10000 --concurrency 256 --strategy pushdown \
+  --output results/civil-comments/jev/pushdown
+```
+
+The Jev runner writes local checkpoints under
+`results/civil-comments/jev/`.
+
+[dataset]: https://huggingface.co/datasets/pietrolesci/civilcomments-wilds
+[diffusion-gemma]: https://huggingface.co/RedHatAI/diffusiongemma-26B-A4B-it-FP8-dynamic
+[jev]: https://docs.typesafe.ai
