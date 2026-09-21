@@ -42,7 +42,7 @@ def write_inputs(directory):
     }), directory / "tool_questions" / "part.parquet")
 
 
-def test_evaluate_tables_submits_to_a_service_and_records_the_query_id(
+def test_evaluate_submits_to_a_service_and_records_the_query_id(
         tmp_path, monkeypatch):
     settings = ServiceSettings(
         data_dir=tmp_path / "data", models=(demo.MODEL,), device=demo.DEVICE,
@@ -54,7 +54,7 @@ def test_evaluate_tables_submits_to_a_service_and_records_the_query_id(
     directory = tmp_path / "run"
     write_inputs(directory)
     try:
-        report = demo.evaluate_tables(directory, 1, url)
+        report = demo.evaluate(directory, 1, url)
     finally:
         stop()
     query_id = (directory / "query_id.txt").read_text()

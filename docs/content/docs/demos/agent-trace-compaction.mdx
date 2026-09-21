@@ -1,0 +1,146 @@
+---
+title: Agent trace compaction
+---
+
+We use *context compaction* to remove history in a trace that the agent
+no longer needs. Using the tool
+[fast Jev compaction][fastjev], you can ask a model what to retain in
+one Claude Code conversation.
+
+In this demo, we'll apply compaction to *many* traces in one Quail
+query. We'll be using an open model, DiffusionGemma, on an H100 GPU.
+
+The full example is in
+[`demos/agent_trace_compaction.py`][demoscript]. A Modal wrapper is in
+[`demos/agent_trace_compaction_modal.py`][modalscript].
+
+## Data preparation
+
+### Sample trajectories
+
+As our input, we use the
+[SWE Zero OpenHands dataset][dataset]. An issue is one repository task
+from SWE Bench. A trajectory is one recorded OpenHands attempt to solve
+an issue. We use *trace* and *trajectory* to mean the same thing on
+the rest of the page.
+
+OpenHands may make several attempts for one issue. We sample one
+trajectory per issue so every issue has the same weight. With
+`--limit 100`, we sample 100 issues. With `--seed 42`, we get the same
+sample on another run.
+
+### Build retention questions
+
+The point of compaction is to find old tool calls that no longer matter
+for what the agent does next. If a call no longer matters, we drop it.
+If the call still matters but the output is long, we can shorten the
+output and leave enough context to rerun the tool.
+
+For every old tool call we generate two Boolean questions and store
+them in `tool_questions`. We also build a compact version of each
+trajectory in `conversations`, where we swap full tool outputs for
+short status notes.
+
+## Run the query
+
+We join each question with its trajectory and let `AI.IF` decide
+whether the retention statement is true:
+
+```python
+SQL = """
+SELECT c.id, q.id, q.tool_call_id, q.kind
+FROM conversations c
+JOIN tool_questions q
+  ON c.id = q.conversation_id
+ AND AI.IF(
+     PROMPT(
+         'Using the compaction state in DOCUMENT {0}, evaluate whether
+          the retention statement in DOCUMENT {1} is true.',
+         c.state, q.statement
+     ),
+     {'anchor': 'c'}
+ )
+"""
+```
+
+Next, we register the two Parquet directories and execute the query:
+
+```python
+import quail
+
+config = quail.EngineConfig(
+    model="diffusion-gemma-26b-a4b-fp8",
+    device="h100-sxm",
+)
+with quail.Session(config=config) as session:
+    session.register(
+        "conversations",
+        quail.DocumentProvider.from_parquet("conversations", id_col="id"),
+    )
+    session.register(
+        "tool_questions",
+        quail.DocumentProvider.from_parquet("tool_questions", id_col="id"),
+    )
+    result = session.sql(SQL, dialect="bq").run()
+```
+
+We set `{'anchor': 'c'}` so Quail keeps the trajectory KV in GPU
+memory while it streams the questions. Each question only matches one
+trajectory because we join on `conversation_id`.
+
+We get TRUE or FALSE for each question. After the query finishes, we
+use the answers to rebuild the original OpenHands messages: keep,
+shorten, or drop each tool call.
+
+## Run the example
+
+### Run locally
+
+On a machine with one or more H100 GPUs:
+
+```bash
+uv run python demos/agent_trace_compaction.py \
+  --output-dir /tmp/compaction --limit 100 --seed 42
+```
+
+You can set `--gpus` to 1, 2, 4, or 8. Each GPU holds one model copy
+and processes a different slice of the query.
+
+### Run on Modal
+
+If you don't have a local H100, you can use [Modal](https://modal.com).
+The Modal script wraps the same `prepare`, `evaluate`, and
+`reconstruct` functions.
+
+```bash
+uv run modal setup
+uv run modal run --detach demos/agent_trace_compaction_modal.py \
+  --limit 100 --seed 42 \
+  2>&1 | tee /tmp/quail-agent-compaction.log
+```
+
+### Inspect the results
+
+The saved files are in the output directory (local) or on the
+`quail-results` volume (Modal):
+
+```text
+<output-dir>/<run-id>/
+```
+
+| Path | Contents |
+| --- | --- |
+| `inputs.json` | Sample settings |
+| `plan.txt` | Quail query plan |
+| `decisions.parquet` | TRUE or FALSE for each retention question |
+| `execution.json` | Query time, throughput, and GPU cost |
+| `compacted/` | Compacted OpenHands trajectories |
+| `summary.json` | Character counts and action totals |
+
+This demo only measures compaction. It doesn't test whether an agent
+can finish its task after compaction.
+
+[dataset]: https://huggingface.co/datasets/nvidia/SWE-Zero-openhands-trajectories
+[fastjev]: https://github.com/tamaratran/fast-jev-compaction
+[demoscript]: https://github.com/fsdatalab/quail/blob/main/demos/agent_trace_compaction.py
+[modalscript]: https://github.com/fsdatalab/quail/blob/main/demos/agent_trace_compaction_modal.py

@@ -55,6 +55,13 @@ physical: backend=quail, model=qwen3-4b-fp8, workers=1
           tokens=12, mean_doc_tokens=2
 ```
 
+<Callout type="info">
+The time estimates assume peak GPU throughput with no host overhead.
+Actual runtimes are longer because of kernel launch latency, memory
+allocation, and scheduling. Use `explain(analyze=True)` on a GPU to
+see measured times next to the estimates.
+</Callout>
+
 For an operator row, `est. rows` is how many rows the planner expects
 it to produce. For a predicate row, it is how many documents or pairs
 the planner expects to reach that predicate, and `est. pass` is the

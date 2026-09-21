@@ -1,0 +1,63 @@
+---
+title: Civil Comments join
+---
+
+In this example, we filter Civil Comments for toxicity, then join each
+toxic comment with 31 semantic fields: six toxicity subtypes, 24
+identity groups, and moderator rejection.
+
+The full example is in
+[`demos/civil_comments_join.py`][demoscript].
+
+## The data
+
+We use the [Jigsaw Civil Comments release][dataset] on Hugging Face
+(`pietrolesci/civilcomments-wilds`, config `raw`). Each comment has
+seven toxicity scores and 24 identity scores. A score is the fraction
+of annotators who applied the label. A score of at least 0.5 is the
+label.
+
+You can pass `--limit` to sample a subset of the comments. Without it,
+the script loads the full dataset.
+
+## The query
+
+We first filter for toxic comments, then join each one with a table
+of 31 statements. The query is one SQL string with both operators:
+
+```sql
+SELECT c.comment_id, f.field
+FROM comments c
+JOIN fields f
+  ON AI_FILTER(
+      PROMPT('Judge strictly whether the description in DOCUMENT {1}
+              applies to the comment in DOCUMENT {0}.', c.text, f.statement),
+      {'selectivity': 0.067})
+WHERE AI_FILTER(
+    PROMPT('Judge strictly from the comment above whether it is among
+            the most toxic comments on a news site…', c.text),
+    {'selectivity': 0.113})
+```
+
+Each comment is read by the model once. The filter question and 31
+join statements are short suffixes on the comment's KV.
+
+## Run the example
+
+On a machine with a CUDA GPU:
+
+```bash
+uv run python demos/civil_comments_join.py --limit 20000
+```
+
+You can also run the toxicity filter alone, without the join:
+
+```bash
+uv run python demos/civil_comments_join.py --limit 20000 --filter-only
+```
+
+The script prints per field precision and recall against the annotator
+labels, query time, and GPU cost.
+
+[dataset]: https://huggingface.co/datasets/pietrolesci/civilcomments-wilds
+[demoscript]: https://github.com/fsdatalab/quail/blob/main/demos/civil_comments_join.py

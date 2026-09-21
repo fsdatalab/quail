@@ -1,0 +1,59 @@
+---
+title: IMDB review filter
+---
+
+In this example, we filter the full
+[Stanford IMDB dataset][dataset] (100,000 reviews) with two questions.
+We keep only reviews where the model answers TRUE to both: does the
+review discuss the ending, and does the reviewer recommend the movie?
+
+The full example is in
+[`demos/imdb_ending_filter.py`][demoscript].
+
+## The query
+
+```python
+SQL = """
+SELECT r.review_id
+FROM reviews AS r
+WHERE AI.IF(
+    PROMPT(
+        'Does this review discuss the ending of the movie?\\n\\n{0}',
+        r.review
+    ),
+    {'selectivity': 0.25}
+)
+AND AI.IF(
+    PROMPT(
+        'Does the reviewer recommend watching the movie?\\n\\n{0}',
+        r.review
+    ),
+    {'selectivity': 0.5}
+)
+"""
+```
+
+We chain two `AI.IF` filters with `AND`. Quail evaluates the cheaper
+filter first (lower selectivity means fewer reviews reach the second
+filter). Each review is read by the model once; the two questions are
+short suffixes on the review's KV.
+
+## Run the example
+
+On a machine with an H100 GPU:
+
+```bash
+uv run python demos/imdb_ending_filter.py
+```
+
+You can change the device and GPU count:
+
+```bash
+uv run python demos/imdb_ending_filter.py --device h100-sxm --gpus 4
+```
+
+The script prints how many reviews matched, the selectivity at each
+stage, query time, throughput, and GPU cost.
+
+[dataset]: https://huggingface.co/datasets/stanfordnlp/imdb
+[demoscript]: https://github.com/fsdatalab/quail/blob/main/demos/imdb_ending_filter.py
