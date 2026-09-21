@@ -400,7 +400,7 @@ Across the 29 queries with matching measurements at scale factor 0.1, Quail is f
 
 ### Per-query metrics table
 
-The table below reports all 32 queries with matching results at scale factor 0.1. Tokens per second uses the same SoL token-work numerator for every method: `sol.tokens / runtime`. SoL uses its estimated runtime and assumes zero KV regret. Costs use about $3.96 per H100-hour. BIO-4 at scale factor 0.1 is included here. Its scale factor 1.0 results are in Section 4.3.
+The table below reports all 32 queries with matching results at scale factor 0.1. SoL assumes zero KV regret. Costs use about $3.96 per H100-hour. BIO-4 at scale factor 0.1 is included here. Its scale factor 1.0 results are in Section 4.3.
 
 ::: {.metrics-table}
 | query | method | tok_per_sec | kv_regret | cost_usd |
@@ -506,10 +506,10 @@ The table below reports all 32 queries with matching results at scale factor 0.1
 ::: {.figure-block .wide-figure}
 [![Average input token throughput by dataset for Quail, vLLM, and SoL.](figures/quailb_tok_per_sec.png){width=100%}](figures/quailb_tok_per_sec.pdf)
 
-*Figure 6. Average input tokens per second by dataset at scale factor 0.1, using Qwen3 4B FP8 on one H100. BIO contains BIO-2 and BIO-4. BIO-1 and BIO-3 are missing because their old-filter runs have not been remade.*
+*Figure 6. Average input tokens per second by dataset at scale factor 0.1, using Qwen3 4B FP8 on one H100. Bars show Quail and vLLM, while horizontal lines show SoL estimates. Dataset labels show the number of queries. BIO contains BIO-2 and BIO-4. BIO-1 and BIO-3 are missing because their old-filter runs have not been remade.*
 :::
 
-The throughput figure is the headline comparison. Under this shared-work definition, vLLM is ahead on AGENT. The latency figure below keeps the per-query detail.
+For every method, throughput divides the same SoL estimate of token work by that method's runtime. The throughput figure is the headline comparison. Under this definition, vLLM is ahead on AGENT. The latency figure below keeps the per-query detail.
 
 ::: {.figure-block .wide-figure}
 [![Query latency for Quail, the vLLM baseline, and SoL estimates across the 31 default QUAIL-B queries. BIO-1 and BIO-3 are marked as not measured.](figures/quailb_latency.png){width=100%}](figures/quailb_latency.pdf)
