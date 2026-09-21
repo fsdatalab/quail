@@ -194,9 +194,7 @@ Where the data lives on Modal:
   Volume has no file locking, and an in-place write can rewrite a whole
   file, so SQLite must not run there. After every change a checkpoint
   thread copies the database to the Volume with SQLite's online backup
-  (which includes the WAL) and calls `volume.commit()`. This is the
-  same shape as Modal's Datasette example, which builds its database
-  locally, copies it onto the Volume, and commits.
+  (which includes the WAL) and calls `volume.commit()`.
 - When a new container starts it copies the database back from the
   Volume, marks records that were executing as `interrupted`, and
   serves saved results again. `max_containers=1` keeps one writer.
