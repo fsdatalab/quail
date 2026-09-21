@@ -61,7 +61,7 @@ address. The query code stays the same.
 
 ```bash
 pip install "quail-engine[service]"
-quail-service --data-dir /var/lib/quail --model qwen3-4b-fp8 --device h100-sxm
+quail-server --data-dir /var/lib/quail --model qwen3-4b-fp8 --device h100-sxm
 ```
 
 ```python

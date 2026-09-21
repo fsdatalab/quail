@@ -13,12 +13,12 @@ import threading
 import time
 from pathlib import Path
 
-from quail.service.artifacts import ANSWERS_FILE, Answers, verify_result
-from quail.service.executor import Executor, Job
-from quail.service.records import InvalidRequestError, QueryStatus
-from quail.service.store import Store
+from quail.server.artifacts import ANSWERS_FILE, Answers, verify_result
+from quail.server.executor import Executor, Job
+from quail.server.records import InvalidRequestError, QueryStatus
+from quail.server.store import Store
 
-logger = logging.getLogger("quail.service")
+logger = logging.getLogger("quail.server")
 
 DEFAULT_TIMEOUT_S = 1000.0
 # progress writes are one fsync each; a loop can report far faster

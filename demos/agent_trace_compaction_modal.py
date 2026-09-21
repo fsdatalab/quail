@@ -58,9 +58,9 @@ def evaluate(directory: str, gpus: int) -> dict:
               volumes={"/vol/results": results_volume,
                        "/root/.cache/huggingface": hf_cache})
 def evaluate_remote(directory: str, gpus: int, endpoint: str) -> dict:
-    """Submit the join to a deployed query service and wait for it.
+    """Submit the join to a deployed Quail Server and wait for it.
 
-    Runs without a GPU: the service owns execution. This function
+    Runs without a GPU: the server owns execution. This function
     uploads the inputs, watches the saved status, and fetches the result.
     """
     from demos.agent_trace_compaction import evaluate as run_evaluate
@@ -87,8 +87,8 @@ def reconstruct(directory: str) -> dict:
 def main(limit: int = 100, seed: int = 42, gpus: int = 1, endpoint: str = ""):
     """Compact complete traces using DiffusionGemma on one or more H100s.
 
-    With ``--endpoint`` the join is submitted to a deployed query
-    service instead of a GPU function here; the log shows the query id
+    With ``--endpoint`` the join is submitted to a deployed Quail
+    Server instead of a GPU function here; the log shows the query id
     and its status page.
     """
     if limit < 1 or gpus not in (1, 2, 4, 8):

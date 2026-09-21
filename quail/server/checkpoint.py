@@ -1,6 +1,6 @@
 """Keep a durable copy of the live SQLite file on another disk.
 
-On Modal the service's data directory is a Volume: a network file
+On Modal the server's data directory is a Volume: a network file
 system with no file locking, where a file should have one writer and
 changes reach the Volume only on ``commit()``. SQLite's live file (and
 its WAL) therefore stays on the container's local disk, and this module
@@ -17,9 +17,9 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from quail.service.store import Store
+from quail.server.store import Store
 
-logger = logging.getLogger("quail.service")
+logger = logging.getLogger("quail.server")
 
 
 def restore(source: Path, destination: Path) -> bool:
@@ -61,6 +61,8 @@ class Checkpoint:
         self._last_copy = 0.0
         self._stop = threading.Event()
         self._thread = None
+        # one copy at a time: the thread and sync() callers share it
+        self._lock = threading.Lock()
         self.copies = 0
 
     def run_once(self, force: bool = False) -> bool:
@@ -68,21 +70,31 @@ class Checkpoint:
 
         ``force`` copies any new write now, ignoring the progress timer.
         """
-        count = self.store.write_count
-        durable = self.store.durable_write_count
-        if count == self._seen or self.store.closed:
-            return False
-        progress_only = durable == self._seen_durable
-        if (progress_only and not force
-                and time.monotonic() - self._last_copy < self.progress_interval_s):
-            return False
-        self.store.backup(self.target)
-        if self.commit is not None:
-            self.commit()
-        self._seen, self._seen_durable = count, durable
-        self._last_copy = time.monotonic()
-        self.copies += 1
-        return True
+        with self._lock:
+            count = self.store.write_count
+            durable = self.store.durable_write_count
+            if count == self._seen or self.store.closed:
+                return False
+            progress_only = durable == self._seen_durable
+            if (progress_only and not force and time.monotonic() - self._last_copy
+                    < self.progress_interval_s):
+                return False
+            self.store.backup(self.target)
+            if self.commit is not None:
+                self.commit()
+            self._seen, self._seen_durable = count, durable
+            self._last_copy = time.monotonic()
+            self.copies += 1
+            return True
+
+    def sync(self) -> None:
+        """Copy and commit every write so far, before the caller goes on.
+
+        The server calls this before it acknowledges a submission, so a
+        record the client has an id for is on the durable copy. Raises
+        when the copy or the commit fails.
+        """
+        self.run_once(force=True)
 
     def _loop(self) -> None:
         while not self._stop.is_set():

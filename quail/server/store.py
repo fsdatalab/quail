@@ -4,7 +4,8 @@ One Store object is the only writer of its database file. Every
 change happens in one transaction and bumps the record's revision, so
 a read that starts after a write returns sees that revision or a
 newer one. Readers inside the same process can wait for a revision
-with ``wait``.
+with ``wait``, or register a listener that is called after every
+committed write.
 """
 
 from __future__ import annotations
@@ -17,20 +18,21 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-from quail.service.records import (
+from quail.server.records import (
     ACTIVE_STATES,
     TERMINAL_STATES,
     InvalidRequestError,
+    QueryIdConflictError,
     QueryStatus,
-    RequestKeyConflictError,
     UnknownQueryError,
+    check_query_id,
     spec_hash,
 )
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS queries (
     id TEXT PRIMARY KEY,
-    request_key TEXT UNIQUE,
+    session_id TEXT,
     spec_hash TEXT NOT NULL,
     spec_json TEXT NOT NULL,
     config_json TEXT NOT NULL,
@@ -59,13 +61,13 @@ CREATE TABLE IF NOT EXISTS inputs (
 
 INTERRUPTED_ERROR = {
     "type": "Interrupted",
-    "message": "the service restarted while this query was executing",
+    "message": "the server restarted while this query was executing",
 }
 
 
 @dataclass(frozen=True)
 class InputRecord:
-    """One uploaded input snapshot on the service's disk."""
+    """One uploaded input snapshot on the server's disk."""
 
     content_id: str
     path: str
@@ -83,7 +85,7 @@ def _loads(text) -> dict | None:
 def _row_status(row) -> QueryStatus:
     return QueryStatus(
         id=row["id"],
-        request_key=row["request_key"],
+        session_id=row["session_id"],
         spec=json.loads(row["spec_json"]),
         config=json.loads(row["config_json"]),
         inputs=json.loads(row["inputs_json"]),
@@ -109,6 +111,7 @@ class Store:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._changed = threading.Condition(self._lock)
+        self._listeners = []
         # committed write transactions since open; a checkpoint compares it
         self.write_count = 0
         self.durable_write_count = 0
@@ -120,11 +123,30 @@ class Store:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=FULL")
         self._conn.executescript(SCHEMA)
+        columns = {row["name"] for row in
+                   self._conn.execute("PRAGMA table_info(queries)")}
+        if "session_id" not in columns:
+            # a database file written before records carried a session id
+            self._conn.execute("ALTER TABLE queries ADD COLUMN session_id TEXT")
 
     def close(self) -> None:
         with self._lock:
             self.closed = True
             self._conn.close()
+
+    def add_listener(self, listener) -> None:
+        """Call ``listener()`` after every committed write, on the writer's thread.
+
+        The listener must return at once; it is meant to wake waiters
+        elsewhere, not to do work.
+        """
+        with self._lock:
+            self._listeners.append(listener)
+
+    def remove_listener(self, listener) -> None:
+        with self._lock:
+            if listener in self._listeners:
+                self._listeners.remove(listener)
 
     # -- transactions -----------------------------------------------------
 
@@ -148,7 +170,10 @@ class Store:
             if durable:
                 self.durable_write_count += 1
             self._changed.notify_all()
-            return cursor.rowcount
+            listeners = list(self._listeners)
+        for listener in listeners:
+            listener()
+        return cursor.rowcount
 
     def backup(self, path: str | Path) -> None:
         """Write a complete, consistent copy of the database to ``path``.
@@ -179,51 +204,82 @@ class Store:
     # -- records ----------------------------------------------------------
 
     def create(self, *, spec: dict, config: dict, inputs: dict,
-               timeout_s: float, request_key: str | None = None
-               ) -> QueryStatus:
+               timeout_s: float, query_id: str | None = None,
+               session_id: str | None = None) -> QueryStatus:
         """Save a new record in the queued state and return its snapshot.
 
-        A repeated request key with the same specification returns the
-        record it created before. The same key with a different
-        specification raises RequestKeyConflictError.
+        The client may choose ``query_id``; the store picks one when it is
+        None. A repeated id with the same specification returns the
+        record it created before, so a retry after a lost response is
+        safe. The same id with a different specification raises
+        QueryIdConflictError.
         """
         if timeout_s <= 0:
             raise InvalidRequestError("timeout_s must be positive")
+        query_id = (uuid.uuid4().hex if query_id is None
+                    else check_query_id(query_id))
         digest = spec_hash(spec, config, inputs, timeout_s)
         with self._lock:
-            if request_key is not None:
-                row = self._conn.execute(
-                    "SELECT * FROM queries WHERE request_key = ?",
-                    (request_key,)).fetchone()
-                if row is not None:
-                    if row["spec_hash"] != digest:
-                        raise RequestKeyConflictError(
-                            f"request key {request_key!r} was already used "
-                            f"for query {row['id']} with a different "
-                            "specification")
-                    return _row_status(row)
-            query_id = uuid.uuid4().hex
+            row = self._conn.execute(
+                "SELECT * FROM queries WHERE id = ?", (query_id,)).fetchone()
+            if row is not None:
+                if row["spec_hash"] != digest:
+                    raise QueryIdConflictError(
+                        f"query id {query_id!r} was already used for a "
+                        "different specification")
+                return _row_status(row)
             now = time.time()
             self._write(
-                "INSERT INTO queries (id, request_key, spec_hash, spec_json, "
+                "INSERT INTO queries (id, session_id, spec_hash, spec_json, "
                 "config_json, inputs_json, state, revision, created_at, "
                 "updated_at, timeout_s) VALUES (?, ?, ?, ?, ?, ?, 'queued', 1, "
                 "?, ?, ?)",
-                (query_id, request_key, digest, _dumps(spec), _dumps(config),
+                (query_id, session_id, digest, _dumps(spec), _dumps(config),
                  _dumps(inputs), now, now, timeout_s))
             return self.get(query_id)
+
+    def discard(self, query_id: str) -> bool:
+        """Remove a record that was never acknowledged to its client.
+
+        A queued record is deleted, so the same id can be submitted
+        again. A record the scheduler already started is asked to
+        cancel instead. Returns True when the record was deleted.
+        """
+        with self._lock:
+            deleted = self._write(
+                "DELETE FROM queries WHERE id = ? AND state = 'queued'",
+                (query_id,))
+            if deleted == 1:
+                return True
+            self.request_cancel(query_id)
+            return False
 
     def get(self, query_id: str) -> QueryStatus:
         return _row_status(self._row(query_id))
 
+    def find(self, query_id: str) -> QueryStatus | None:
+        """The record with this id, or None."""
+        try:
+            return self.get(query_id)
+        except UnknownQueryError:
+            return None
+
     def execution_epoch(self, query_id: str) -> int:
         return int(self._row(query_id)["execution_epoch"])
 
-    def list_recent(self, limit: int = 50) -> list[QueryStatus]:
+    def list_recent(self, limit: int = 50,
+                    session_id: str | None = None) -> list[QueryStatus]:
+        """The newest records first, all of them or one session's."""
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM queries ORDER BY created_at DESC LIMIT ?",
-                (limit,)).fetchall()
+            if session_id is None:
+                rows = self._conn.execute(
+                    "SELECT * FROM queries ORDER BY created_at DESC LIMIT ?",
+                    (limit,)).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM queries WHERE session_id = ? "
+                    "ORDER BY created_at DESC LIMIT ?",
+                    (session_id, limit)).fetchall()
         return [_row_status(row) for row in rows]
 
     def wait(self, query_id: str, after: int, timeout: float) -> QueryStatus:
@@ -256,7 +312,7 @@ class Store:
         """Move a queued record to planning and return its execution epoch.
 
         The epoch identifies this execution attempt. Later updates must
-        carry it, so an execution the service has already closed cannot
+        carry it, so an execution the server has already closed cannot
         change the record.
         """
         with self._lock:

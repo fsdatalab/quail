@@ -5,10 +5,10 @@ import threading
 import time
 
 import pytest
-import service_fakes
+import server_fakes
 
-from quail.service.checkpoint import Checkpoint, restore
-from quail.service.store import Store
+from quail.server.checkpoint import Checkpoint, restore
+from quail.server.store import Store
 
 SPEC = {"sql": "SELECT r.id FROM reviews r", "dialect": "snowflake",
         "order": None}
@@ -16,7 +16,7 @@ INPUTS = {"reviews": {"kind": "snapshot", "content_id": "abc", "id_col": "id"}}
 
 
 def create(store):
-    return store.create(spec=SPEC, config=service_fakes.CONFIG, inputs=INPUTS,
+    return store.create(spec=SPEC, config=server_fakes.CONFIG, inputs=INPUTS,
                         timeout_s=1000.0)
 
 
@@ -104,6 +104,35 @@ def test_progress_only_writes_are_copied_on_the_slow_timer(tmp_path):
     store.close()
 
 
+def test_sync_copies_every_write_now_and_raises_when_the_commit_fails(tmp_path):
+    store = Store(tmp_path / "live" / "quail.sqlite3")
+    copy = tmp_path / "volume" / "quail.sqlite3"
+    failures = []
+
+    def commit():
+        if failures:
+            raise OSError(failures.pop())
+
+    checkpoint = Checkpoint(store, copy, commit=commit, progress_interval_s=60)
+    status = create(store)
+    epoch = store.begin(status.id)
+    checkpoint.sync()
+    store.update(status.id, epoch, progress={"done": 1})
+    assert not checkpoint.run_once(), "progress alone waits for the timer"
+    checkpoint.sync()
+    with sqlite3.connect(str(copy)) as conn:
+        assert conn.execute("SELECT progress_json FROM queries").fetchone() == (
+            '{"done": 1}',)
+    checkpoint.sync()      # nothing new: no copy, no error
+    assert checkpoint.copies == 2
+    store.update(status.id, epoch, state="running")
+    failures.append("volume busy")
+    with pytest.raises(OSError, match="volume busy"):
+        checkpoint.sync()
+    assert checkpoint.run_once(), "the failed copy is tried again"
+    store.close()
+
+
 def test_checkpoint_survives_a_failing_commit(tmp_path, caplog):
     store = Store(tmp_path / "live" / "quail.sqlite3")
     calls = []
@@ -125,16 +154,16 @@ def test_checkpoint_survives_a_failing_commit(tmp_path, caplog):
     store.close()
 
 
-def test_service_runs_closers_before_closing_the_store(tmp_path):
+def test_server_runs_closers_before_closing_the_store(tmp_path):
     pytest.importorskip("starlette")
-    from quail.service.app import ServiceSettings, create_app
+    from quail.server.app import ServerSettings, create_app
 
-    settings = ServiceSettings(
+    settings = ServerSettings(
         data_dir=tmp_path / "data", db_path=tmp_path / "local" / "live.sqlite3",
         models=("qwen3-4b-fp8",), device="h100-sxm", in_process=True,
-        hooks=service_fakes.hooks)
+        hooks=server_fakes.hooks)
     app = create_app(settings)
-    service = app.state.service
+    service = app.state.server
     assert service.store.path == tmp_path / "local" / "live.sqlite3"
     checkpoint = Checkpoint(service.store, tmp_path / "data" / "quail.sqlite3")
     service.add_closer(checkpoint.stop)

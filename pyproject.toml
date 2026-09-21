@@ -20,15 +20,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# the optional query service (quail-service); the client side of a
-# remote Session needs only the standard library
-service = [
+# Quail Server (quail-server), the optional query server; the client
+# side of a remote Session needs only the standard library
+server = [
     "starlette==1.6.0",
     "uvicorn==0.52.4",
 ]
 
 [project.scripts]
-quail-service = "quail.service.__main__:main"
+quail-server = "quail.server.__main__:main"
 
 [project.urls]
 Repository = "https://github.com/fsdatalab/quail-exploration"

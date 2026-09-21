@@ -1,4 +1,4 @@
-"""HTTP routes of the query service, driven with Starlette's test client."""
+"""HTTP routes of Quail Server, driven with Starlette's test client."""
 
 import hashlib
 import io
@@ -9,16 +9,16 @@ import time
 import pyarrow as pa
 import pyarrow.ipc as ipc
 import pytest
-import service_fakes
+import server_fakes
 
-from quail.service import inputs
+from quail.server import inputs
 
 pytest.importorskip("starlette")
 
-from quail.service.app import ServiceSettings, create_app  # noqa: E402
+from quail.server.app import ServerSettings, create_app  # noqa: E402
 
 SETTINGS = dict(models=("qwen3-4b-fp8",), device="h100-sxm",
-                hooks=service_fakes.hooks, in_process=True)
+                hooks=server_fakes.hooks, in_process=True)
 
 
 def ipc_bytes(table: pa.Table) -> bytes:
@@ -30,7 +30,7 @@ def ipc_bytes(table: pa.Table) -> bytes:
 
 def upload(client, table=None) -> str:
     payload = ipc_bytes(table if table is not None
-                        else service_fakes.reviews_table())
+                        else server_fakes.reviews_table())
     content_id = hashlib.sha256(payload).hexdigest()
     response = client.put(f"/v1/inputs/{content_id}", content=payload)
     assert response.status_code in (200, 201), response.text
@@ -39,9 +39,9 @@ def upload(client, table=None) -> str:
 
 def submission(content_id, **overrides) -> dict:
     body = {
-        "sql": service_fakes.FILTER_SQL,
+        "sql": server_fakes.FILTER_SQL,
         "dialect": "snowflake",
-        "config": service_fakes.CONFIG,
+        "config": server_fakes.CONFIG,
         "inputs": {"reviews": {"kind": "snapshot", "content_id": content_id,
                                "id_col": "id"}},
     }
@@ -68,7 +68,7 @@ def make_client(tmp_path):
     clients = []
 
     def make(**overrides):
-        settings = ServiceSettings(data_dir=tmp_path / "data",
+        settings = ServerSettings(data_dir=tmp_path / "data",
                                    **{**SETTINGS, **overrides})
         client = TestClient(create_app(settings))
         client.__enter__()
@@ -87,11 +87,11 @@ def test_capabilities_and_config_checks(make_client):
     assert capabilities["default_timeout_s"] == 1000.0
     content_id = upload(client)
     for config, message in [
-        ({**service_fakes.CONFIG, "model": "qwen3-32b-fp8"}, "does not run model"),
-        ({**service_fakes.CONFIG, "device": "rtx-pro-6000-blackwell-server"},
+        ({**server_fakes.CONFIG, "model": "qwen3-32b-fp8"}, "does not run model"),
+        ({**server_fakes.CONFIG, "device": "rtx-pro-6000-blackwell-server"},
          "runs on device"),
-        ({**service_fakes.CONFIG, "gpus": 2}, "GPUs"),
-        ({**service_fakes.CONFIG, "backend": "stock_vllm"}, "backends"),
+        ({**server_fakes.CONFIG, "gpus": 2}, "GPUs"),
+        ({**server_fakes.CONFIG, "backend": "stock_vllm"}, "backends"),
         ({"model": "qwen3-4b-fp8"}, "bad engine config"),
     ]:
         response = client.post("/v1/queries",
@@ -102,7 +102,7 @@ def test_capabilities_and_config_checks(make_client):
 
 def test_uploads_are_checked_and_saved_once(make_client):
     client = make_client(max_upload_bytes=4096)
-    payload = ipc_bytes(service_fakes.reviews_table())
+    payload = ipc_bytes(server_fakes.reviews_table())
     content_id = hashlib.sha256(payload).hexdigest()
     assert client.head(f"/v1/inputs/{content_id}").status_code == 404
     bad = client.put("/v1/inputs/notahash", content=payload)
@@ -124,12 +124,12 @@ def test_uploads_are_checked_and_saved_once(make_client):
     assert client.put(f"/v1/inputs/{content_id}",
                       content=payload).status_code == 200
     assert client.head(f"/v1/inputs/{content_id}").status_code == 200
-    service = client.app.state.service
-    assert not list(service.inputs_dir.glob("*.tmp"))
-    assert service.store.get_input(content_id).byte_count == len(payload)
+    server = client.app.state.server
+    assert not list(server.inputs_dir.glob("*.tmp"))
+    assert server.store.get_input(content_id).byte_count == len(payload)
 
 
-def test_submission_validation_and_request_keys(make_client):
+def test_submission_validation_and_client_query_ids(make_client):
     client = make_client()
     content_id = upload(client)
     no_input = client.post("/v1/queries", json=submission("f" * 64))
@@ -147,21 +147,108 @@ def test_submission_validation_and_request_keys(make_client):
     assert client.post("/v1/queries", json=submission(
         content_id, inputs={})).status_code == 400
 
-    first = client.post("/v1/queries",
-                        json=submission(content_id, request_key="k"))
+    bad_id = client.post("/v1/queries", json=submission(content_id, query_id="a/b"))
+    assert bad_id.status_code == 400
+    assert "query id" in bad_id.json()["error"]["message"]
+
+    first = client.post("/v1/queries", json=submission(
+        content_id, query_id="k", session_id="s1"))
     assert first.status_code == 201, first.text
     status = first.json()
+    assert status["id"] == "k" and status["session_id"] == "s1"
     assert status["state"] == "queued"
     assert status["timeout_s"] == 1000.0
     again = client.post("/v1/queries",
-                        json=submission(content_id, request_key="k"))
+                        json=submission(content_id, query_id="k"))
     assert again.json()["id"] == status["id"]
     conflict = client.post("/v1/queries", json=submission(
-        content_id, request_key="k", timeout_s=5))
+        content_id, query_id="k", timeout_s=5))
     assert conflict.status_code == 409
     assert client.get("/v1/queries/nope").status_code == 404
     listed = client.get("/v1/queries").json()["queries"]
     assert [item["id"] for item in listed] == [status["id"]]
+    other = client.post("/v1/queries", json=submission(content_id)).json()
+    assert len(other["id"]) == 32 and other["session_id"] is None
+    mine = client.get("/v1/queries", params={"session_id": "s1"}).json()
+    assert [item["id"] for item in mine["queries"]] == ["k"]
+
+
+def test_a_submission_is_made_durable_before_it_is_acknowledged(make_client):
+    client = make_client()
+    server = client.app.state.server
+    server.scheduler.stop()
+    content_id = upload(client)
+    synced = []
+    server.add_sync(lambda: synced.append(server.store.list_recent()[0].id))
+    accepted = client.post("/v1/queries", json=submission(content_id, query_id="d"))
+    assert accepted.status_code == 201
+    assert synced == ["d"], "the sync ran after the record was saved"
+    # a repeated submission returns the saved record without another sync
+    client.post("/v1/queries", json=submission(content_id, query_id="d"))
+    assert synced == ["d"]
+
+    def failing_sync():
+        raise OSError("volume commit failed")
+
+    server.add_sync(failing_sync)
+    refused = client.post("/v1/queries", json=submission(content_id, query_id="e"))
+    assert refused.status_code == 500
+    assert "volume commit failed" in refused.json()["error"]["message"]
+    assert client.get("/v1/queries/e").status_code == 404, "no record was kept"
+    assert client.get("/v1/queries/d").status_code == 200
+
+
+def test_waiting_readers_do_not_hold_worker_threads(tmp_path):
+    """Many long polls at once, and a submission still returns quickly.
+
+    Starlette runs blocking calls on a pool of 40 threads. A waiting
+    reader holds none of them, so 60 readers cannot block a submission.
+    """
+    import urllib.request
+
+    settings = ServerSettings(data_dir=tmp_path / "data", **SETTINGS)
+    app = create_app(settings)
+    url, stop = server_fakes.start_server(app)
+    try:
+        server = app.state.server
+        server.scheduler.stop()
+        payload = ipc_bytes(server_fakes.reviews_table())
+        content_id = hashlib.sha256(payload).hexdigest()
+        request = urllib.request.Request(
+            f"{url}/v1/inputs/{content_id}", data=payload, method="PUT")
+        urllib.request.urlopen(request).read()
+        body = json.dumps(submission(content_id, query_id="held")).encode()
+        request = urllib.request.Request(
+            f"{url}/v1/queries", method="POST", data=body,
+            headers={"content-type": "application/json"})
+        held = json.loads(urllib.request.urlopen(request).read())
+        seen = []
+
+        def poll():
+            with urllib.request.urlopen(
+                    f"{url}/v1/queries/held?after={held['revision']}&wait=20",
+                    timeout=60) as response:
+                seen.append(json.loads(response.read())["revision"])
+
+        threads = [threading.Thread(target=poll) for _ in range(60)]
+        for thread in threads:
+            thread.start()
+        time.sleep(1.0)
+        started = time.monotonic()
+        request = urllib.request.Request(
+            f"{url}/v1/queries", method="POST",
+            data=json.dumps(submission(content_id, query_id="other")).encode(),
+            headers={"content-type": "application/json"})
+        assert json.loads(urllib.request.urlopen(request).read())["id"] == "other"
+        assert time.monotonic() - started < 5.0
+        # a write to the held record wakes every reader
+        server.store.request_cancel("held")
+        for thread in threads:
+            thread.join(30)
+            assert not thread.is_alive()
+    finally:
+        stop()
+    assert seen == [held["revision"] + 1] * 60
 
 
 def test_lifecycle_over_http_with_long_poll_events_and_files(make_client):
@@ -186,9 +273,12 @@ def test_lifecycle_over_http_with_long_poll_events_and_files(make_client):
               for line in body.splitlines() if line.startswith("data: ")]
     assert [event["revision"] for event in events] == [final["revision"]]
 
+    # the rows come back as an Arrow IPC stream, batch by batch
     result = client.get(f"/v1/queries/{query_id}/result")
     assert result.status_code == 200
-    with ipc.open_file(pa.BufferReader(result.content)) as reader:
+    assert result.headers["content-type"] == "application/vnd.apache.arrow.stream"
+    assert result.headers["x-quail-rows"] == "2"
+    with ipc.open_stream(pa.BufferReader(result.content)) as reader:
         table = reader.read_all()
     assert sorted(table.column("r.id").to_pylist()) == ["r0", "r3"]
     report = client.get(f"/v1/queries/{query_id}/files/report.json").json()
@@ -215,14 +305,14 @@ def test_lifecycle_over_http_with_long_poll_events_and_files(make_client):
 def test_events_stream_newer_revisions_to_several_readers(tmp_path):
     import urllib.request
 
-    settings = ServiceSettings(data_dir=tmp_path / "data", **SETTINGS)
+    settings = ServerSettings(data_dir=tmp_path / "data", **SETTINGS)
     app = create_app(settings)
-    url, stop = service_fakes.start_server(app)
+    url, stop = server_fakes.start_server(app)
     try:
-        service = app.state.service
+        server = app.state.server
         # hold the scheduler so the record stays queued while readers attach
-        service.scheduler.stop()
-        payload = ipc_bytes(service_fakes.reviews_table())
+        server.scheduler.stop()
+        payload = ipc_bytes(server_fakes.reviews_table())
         content_id = hashlib.sha256(payload).hexdigest()
         request = urllib.request.Request(
             f"{url}/v1/inputs/{content_id}", data=payload, method="PUT")
@@ -246,7 +336,7 @@ def test_events_stream_newer_revisions_to_several_readers(tmp_path):
         for thread in threads:
             thread.start()
         time.sleep(0.5)
-        service.scheduler.start()
+        server.scheduler.start()
         for thread in threads:
             thread.join(30)
             assert not thread.is_alive()
@@ -262,7 +352,7 @@ def test_events_stream_newer_revisions_to_several_readers(tmp_path):
 
 
 def test_cancel_and_timeout_over_http(make_client):
-    client = make_client(hooks=service_fakes.sleeping_hooks)
+    client = make_client(hooks=server_fakes.sleeping_hooks)
     content_id = upload(client)
     queued = client.post("/v1/queries", json=submission(content_id)).json()
     slow = client.post("/v1/queries",
@@ -310,20 +400,20 @@ def test_bearer_token_guards_the_api_but_not_the_page(make_client):
 def test_restart_recovers_records_and_keeps_inputs(tmp_path):
     from starlette.testclient import TestClient
 
-    settings = ServiceSettings(data_dir=tmp_path / "data", **SETTINGS)
+    settings = ServerSettings(data_dir=tmp_path / "data", **SETTINGS)
     with TestClient(create_app(settings)) as client:
         content_id = upload(client)
         finished = client.post("/v1/queries", json=submission(content_id)).json()
         wait_done(client, finished["id"])
-        service = client.app.state.service
-        service.scheduler.stop()
+        server = client.app.state.server
+        server.scheduler.stop()
         queued = client.post("/v1/queries", json=submission(content_id)).json()
-        epoch = service.store.begin(queued["id"])
-        service.store.update(queued["id"], epoch, state="running")
+        epoch = server.store.begin(queued["id"])
+        server.store.update(queued["id"], epoch, state="running")
         active = client.post("/v1/queries", json=submission(content_id)).json()
     # the process "restarts": a new app over the same data directory
     with TestClient(create_app(settings)) as client:
-        assert client.app.state.service.recovered == [queued["id"]]
+        assert client.app.state.server.recovered == [queued["id"]]
         assert client.get(
             f"/v1/queries/{queued['id']}").json()["state"] == "interrupted"
         again = client.get(f"/v1/queries/{finished['id']}").json()
@@ -357,4 +447,4 @@ def test_hf_inputs_are_resolved_without_download(make_client, monkeypatch):
     response = client.post("/v1/queries", json=body)
     assert response.status_code == 201, response.text
     assert calls == [("org/reviews", "abc123")]
-    client.app.state.service.scheduler.stop()
+    client.app.state.server.scheduler.stop()

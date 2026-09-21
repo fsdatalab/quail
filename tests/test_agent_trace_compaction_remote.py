@@ -1,20 +1,20 @@
-"""The compaction demo's remote path against an in-process query service."""
+"""The compaction demo's remote path against an in-process Quail Server."""
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-import service_fakes
+import server_fakes
 from test_session import fake_tok, make_executor
 
 import quail
-from quail.service.executor import Hooks
+from quail.server.executor import Hooks
 
 pytest.importorskip("modal")
 pytest.importorskip("starlette")
 pytest.importorskip("uvicorn")
 
 from demos import agent_trace_compaction as demo  # noqa: E402
-from quail.service.app import ServiceSettings, create_app  # noqa: E402
+from quail.server.app import ServerSettings, create_app  # noqa: E402
 
 hooks = Hooks(
     physical_executor=make_executor({}, {("c", "q"): lambda a, q: q % 2 == 0}),
@@ -42,12 +42,12 @@ def write_inputs(directory):
     }), directory / "tool_questions" / "part.parquet")
 
 
-def test_evaluate_submits_to_a_service_and_records_the_query_id(
+def test_evaluate_submits_to_a_server_and_records_the_query_id(
         tmp_path, monkeypatch):
-    settings = ServiceSettings(
+    settings = ServerSettings(
         data_dir=tmp_path / "data", models=(demo.MODEL,), device=demo.DEVICE,
         in_process=True, hooks=hooks)
-    url, stop = service_fakes.start_server(create_app(settings))
+    url, stop = server_fakes.start_server(create_app(settings))
     # the client tokenizes the columns for the throughput number; use the
     # fake tokenizer instead of downloading the model's
     monkeypatch.setattr(quail.Session, "tokenizer", property(lambda s: fake_tok))
@@ -58,7 +58,7 @@ def test_evaluate_submits_to_a_service_and_records_the_query_id(
     finally:
         stop()
     query_id = (directory / "query_id.txt").read_text()
-    assert len(query_id) == 32
+    assert query_id == f"agent-compaction-{directory.name}"
     assert report["endpoint"] == url
     assert report["backend"] == "quail"
     assert report["input_tokens"] > 0

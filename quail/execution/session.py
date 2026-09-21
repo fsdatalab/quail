@@ -9,6 +9,7 @@ from itertools import chain
 from numbers import Integral
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Protocol, runtime_checkable
 
 import pyarrow as pa
 from pyarrow import compute as pc
@@ -81,11 +82,35 @@ TOKENIZE_ROWS = 2048
 ESTIMATE_SAMPLE = 1024
 
 
+@runtime_checkable
+class QueryLike(Protocol):
+    """What ``Session.sql`` returns, whether the query runs here or remotely.
+
+    ``Query`` runs in this process; ``quail.server.client.RemoteQuery``
+    sends the SQL to Quail Server. Both offer these methods, so code
+    written against one works with the other.
+    """
+
+    def run(self, plan=None) -> QueryResult: ...
+
+    def submit(self, **options): ...
+
+    def execute_stream(self, batch_rows: int = 65_536,
+                       limit: int | None = None) -> pa.RecordBatchReader: ...
+
+    def collect(self, limit: int | None = None,
+                batch_rows: int = 65_536) -> pa.Table: ...
+
+    def explain(self, **options) -> str: ...
+
+    def plan(self): ...
+
+
 class Session:
-    """Register tables and run queries, here or on a query service.
+    """Register tables and run queries, here or on Quail Server.
 
     Without ``endpoint`` every query runs in this process. With one,
-    ``register`` describes each table for the service, ``sql`` returns
+    ``register`` describes each table for the server, ``sql`` returns
     a query that ``submit()`` sends there, and ``get_run`` reattaches
     to an accepted query by id. The query API is the same either way.
     """
@@ -137,20 +162,29 @@ class Session:
         self._background = None
         self._remote = None
         if endpoint is not None:
-            from quail.service.client import RemoteConnection
+            from quail.server.client import RemoteConnection
 
             self._remote = RemoteConnection(endpoint, self.registry.codecs)
 
     @property
     def endpoint(self) -> str | None:
-        """The query service this session submits to, or None."""
+        """The Quail Server this session submits to, or None."""
         return None if self._remote is None else self._remote.client.endpoint
+
+    @property
+    def session_id(self) -> str | None:
+        """The id sent with every submission of a remote session, or None.
+
+        The server saves it on each record, so ``GET /v1/queries``
+        with ``session_id`` lists what this session submitted.
+        """
+        return None if self._remote is None else self._remote.session_id
 
     def close(self):
         """Wait for background tokenization and remove temporary token files.
 
         Closing a remote session removes its staged uploads only; the
-        service keeps every accepted query and the inputs it needs.
+        server keeps every accepted query and the inputs it needs.
         """
         if self._remote is not None:
             self._remote.close()
@@ -175,7 +209,7 @@ class Session:
     def register(self, name: str, provider: TableProvider) -> None:
         """Register a table under ``name``.
 
-        On a remote session the provider must be one the service can
+        On a remote session the provider must be one the server can
         read: an in-memory table, a Parquet, IPC, or Arrow dataset
         (uploaded as a snapshot), or a Hugging Face dataset (pinned to a
         revision). Any other provider raises TypeError here rather than
@@ -192,7 +226,7 @@ class Session:
     def sql(self, text: str, order: str | None = None,
             dialect: SQLDialect | str = SQLDialect.SNOWFLAKE) -> "Query":
         if self._remote is not None:
-            from quail.service.client import RemoteQuery
+            from quail.server.client import RemoteQuery
 
             return RemoteQuery(self, text, order=order,
                                dialect=SQLDialect(dialect).value)
@@ -203,7 +237,7 @@ class Session:
         return Query(self, logical, order=order)
 
     def get_run(self, query_id: str):
-        """Reattach to a query the service already accepted.
+        """Reattach to a query the server already accepted.
 
         Returns a QueryRun; it never resubmits or starts another
         execution.
@@ -702,7 +736,7 @@ class Query:
         return execute_query(self, plan=plan)
 
     def submit(self, **_options):
-        """Submitting needs a query service; local queries use run()."""
+        """Submitting needs Quail Server; local queries use run()."""
         raise RuntimeError(
             "submit() needs a Session with an endpoint; this session runs "
             "queries in the current process, so call run() or collect()")

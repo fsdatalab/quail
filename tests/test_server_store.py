@@ -1,17 +1,17 @@
-"""Saved query records: revisions, request keys, epochs, cancel, recovery."""
+"""Saved query records: revisions, query ids, epochs, cancel, recovery."""
 
 import threading
 import time
 
 import pytest
 
-from quail.service.records import (
+from quail.server.records import (
     InvalidRequestError,
+    QueryIdConflictError,
     QueryStatus,
-    RequestKeyConflictError,
     UnknownQueryError,
 )
-from quail.service.store import Store
+from quail.server.store import Store
 
 SPEC = {"sql": "SELECT r.id FROM reviews r", "dialect": "snowflake",
         "order": None}
@@ -50,16 +50,63 @@ def test_create_saves_a_queued_record_with_a_complete_snapshot(store):
         create(store, timeout_s=0)
 
 
-def test_request_key_returns_the_same_record_or_conflicts(store):
-    first = create(store, request_key="k1")
-    again = create(store, request_key="k1")
-    assert again.id == first.id
+def test_a_client_query_id_returns_the_same_record_or_conflicts(store):
+    first = create(store, query_id="demo-1")
+    assert first.id == "demo-1"
+    again = create(store, query_id="demo-1")
+    assert again == first
     assert len(store.list_recent()) == 1
-    with pytest.raises(RequestKeyConflictError):
+    with pytest.raises(QueryIdConflictError):
         store.create(spec={**SPEC, "sql": "SELECT 1"}, config=CONFIG,
-                     inputs=INPUTS, timeout_s=1000.0, request_key="k1")
-    other = create(store, request_key="k2")
+                     inputs=INPUTS, timeout_s=1000.0, query_id="demo-1")
+    other = create(store, query_id="demo-2")
     assert other.id != first.id
+    # the store picks an id when the client sends none
+    assert len(create(store).id) == 32
+    for bad in ("", "-x", "a/b", "a" * 129, 7):
+        with pytest.raises(InvalidRequestError, match="query id"):
+            create(store, query_id=bad)
+    assert store.find("demo-1") == first
+    assert store.find("nope") is None
+
+
+def test_records_carry_their_session_id(store):
+    mine = create(store, session_id="s1")
+    other = create(store, session_id="s2")
+    create(store)
+    assert mine.session_id == "s1"
+    assert [item.id for item in store.list_recent(session_id="s1")] == [mine.id]
+    assert [item.id for item in store.list_recent(session_id="s2")] == [other.id]
+    assert len(store.list_recent()) == 3
+
+
+def test_discard_deletes_a_queued_record_or_cancels_a_started_one(store):
+    queued = create(store, query_id="q")
+    assert store.discard(queued.id)
+    assert store.find("q") is None
+    # the same id can be used again, for a different query too
+    again = store.create(spec={**SPEC, "sql": "SELECT 1"}, config=CONFIG,
+                         inputs=INPUTS, timeout_s=1000.0, query_id="q")
+    assert again.spec["sql"] == "SELECT 1"
+    store.begin(again.id)
+    assert not store.discard(again.id)
+    assert store.get(again.id).cancel_requested
+
+
+def test_listeners_are_called_after_every_committed_write(store):
+    status = create(store)
+    calls = []
+
+    def listener():
+        calls.append(store.get(status.id).revision)
+
+    store.add_listener(listener)
+    epoch = store.begin(status.id)
+    store.update(status.id, epoch, progress={"done": 1})
+    assert calls == [2, 3], "each call sees the committed write"
+    store.remove_listener(listener)
+    store.update(status.id, epoch, progress={"done": 2})
+    assert calls == [2, 3]
 
 
 def test_updates_bump_revisions_and_only_the_current_epoch_writes(store):

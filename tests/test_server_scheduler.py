@@ -5,19 +5,19 @@ import time
 
 import pyarrow as pa
 import pytest
-import service_fakes
+import server_fakes
 from test_session import fake_tok
 
 import quail
 from quail.builtins import built_in_registry
-from quail.service import artifacts, inputs
-from quail.service.executor import (
+from quail.server import artifacts, inputs
+from quail.server.executor import (
     ChildProcessExecutor,
     InProcessExecutor,
     load_hooks,
 )
-from quail.service.scheduler import Scheduler
-from quail.service.store import Store
+from quail.server.scheduler import Scheduler
+from quail.server.store import Store
 
 
 @pytest.fixture()
@@ -27,17 +27,17 @@ def store(tmp_path):
     store.close()
 
 
-def submit(store, tmp_path, sql=service_fakes.FILTER_SQL, timeout_s=1000.0,
+def submit(store, tmp_path, sql=server_fakes.FILTER_SQL, timeout_s=1000.0,
            table=None):
     provider = quail.DocumentProvider.from_table(
-        table if table is not None else service_fakes.reviews_table(),
+        table if table is not None else server_fakes.reviews_table(),
         id_col="id")
     prepared = inputs.describe(provider, tmp_path / "uploads")
     store.put_input(prepared.content_id, str(prepared.upload_path),
                     prepared.upload_path.stat().st_size)
     return store.create(
         spec={"sql": sql, "dialect": "snowflake", "order": None},
-        config=service_fakes.CONFIG,
+        config=server_fakes.CONFIG,
         inputs={"reviews": prepared.spec}, timeout_s=timeout_s)
 
 
@@ -53,7 +53,7 @@ def wait_done(store, query_id, timeout=30.0):
 def test_in_process_run_saves_plan_progress_and_a_readable_result(
         store, tmp_path):
     status = submit(store, tmp_path)
-    scheduler = Scheduler(store, InProcessExecutor(service_fakes.hooks),
+    scheduler = Scheduler(store, InProcessExecutor(server_fakes.hooks),
                           tmp_path, poll_s=0.02)
     final = scheduler.run_one(status)
 
@@ -96,19 +96,19 @@ def test_join_answers_are_saved_per_anchor_while_running(store, tmp_path):
     The saved entries must agree with the final join answer table.
     """
     reviews = inputs.describe(quail.DocumentProvider.from_table(
-        service_fakes.reviews_table(), id_col="id"), tmp_path / "uploads")
+        server_fakes.reviews_table(), id_col="id"), tmp_path / "uploads")
     products = inputs.describe(quail.DocumentProvider.from_table(
-        service_fakes.products_table(), id_col="asin"), tmp_path / "uploads")
+        server_fakes.products_table(), id_col="asin"), tmp_path / "uploads")
     for prepared in (reviews, products):
         store.put_input(prepared.content_id, str(prepared.upload_path),
                         prepared.upload_path.stat().st_size)
     status = store.create(
-        spec={"sql": service_fakes.JOIN_SQL, "dialect": "snowflake",
+        spec={"sql": server_fakes.JOIN_SQL, "dialect": "snowflake",
               "order": None},
-        config=service_fakes.CONFIG,
+        config=server_fakes.CONFIG,
         inputs={"reviews": reviews.spec, "products": products.spec},
         timeout_s=1000.0)
-    scheduler = Scheduler(store, InProcessExecutor(service_fakes.hooks),
+    scheduler = Scheduler(store, InProcessExecutor(server_fakes.hooks),
                           tmp_path, poll_s=0.02)
     final = scheduler.run_one(status)
     assert final.state == "succeeded"
@@ -186,14 +186,14 @@ def test_a_finished_execution_is_not_killed_while_it_reports_done(
 
 def test_compile_and_executor_failures_are_saved(store, tmp_path):
     bad = submit(store, tmp_path, sql="SELECT r.nothing FROM reviews r")
-    scheduler = Scheduler(store, InProcessExecutor(service_fakes.hooks),
+    scheduler = Scheduler(store, InProcessExecutor(server_fakes.hooks),
                           tmp_path, poll_s=0.02)
     final = scheduler.run_one(bad)
     assert final.state == "failed"
     assert final.error["type"] == "CompileError"
 
     failing = submit(store, tmp_path)
-    scheduler = Scheduler(store, InProcessExecutor(service_fakes.failing_hooks),
+    scheduler = Scheduler(store, InProcessExecutor(server_fakes.failing_hooks),
                           tmp_path, poll_s=0.02)
     final = scheduler.run_one(failing)
     assert final.state == "failed"
@@ -209,8 +209,8 @@ def test_publication_failure_is_a_saved_failure_not_success(
     def broken_verify(directory, manifest):
         raise OSError("disk full")
 
-    monkeypatch.setattr("quail.service.scheduler.verify_result", broken_verify)
-    scheduler = Scheduler(store, InProcessExecutor(service_fakes.hooks),
+    monkeypatch.setattr("quail.server.scheduler.verify_result", broken_verify)
+    scheduler = Scheduler(store, InProcessExecutor(server_fakes.hooks),
                           tmp_path, poll_s=0.02)
     final = scheduler.run_one(status)
     assert final.state == "failed"
@@ -236,7 +236,7 @@ def test_verify_rejects_a_missing_or_short_result_file(tmp_path):
 def test_scheduler_thread_runs_queued_records_in_order(store, tmp_path):
     first = submit(store, tmp_path)
     second = submit(store, tmp_path)
-    scheduler = Scheduler(store, InProcessExecutor(service_fakes.hooks),
+    scheduler = Scheduler(store, InProcessExecutor(server_fakes.hooks),
                           tmp_path, poll_s=0.02)
     scheduler.start()
     try:
@@ -251,7 +251,7 @@ def test_scheduler_thread_runs_queued_records_in_order(store, tmp_path):
 def test_cancel_before_execution_never_starts_it(store, tmp_path):
     status = submit(store, tmp_path)
     store.request_cancel(status.id)
-    scheduler = Scheduler(store, InProcessExecutor(service_fakes.hooks),
+    scheduler = Scheduler(store, InProcessExecutor(server_fakes.hooks),
                           tmp_path, poll_s=0.02)
     final = scheduler.run_one(status)
     assert final.state == "cancelled"
@@ -263,7 +263,7 @@ def test_child_process_execution_stops_on_cancel_or_timeout(
         store, tmp_path, stop):
     timeout_s = 1.0 if stop == "timeout" else 1000.0
     status = submit(store, tmp_path, timeout_s=timeout_s)
-    executor = ChildProcessExecutor("service_fakes:sleeping_hooks")
+    executor = ChildProcessExecutor("server_fakes:sleeping_hooks")
     scheduler = Scheduler(store, executor, tmp_path, poll_s=0.05)
     scheduler.start()
     try:
@@ -288,7 +288,7 @@ def test_child_process_execution_stops_on_cancel_or_timeout(
             assert time.monotonic() < deadline
             time.sleep(0.05)
         again = submit(store, tmp_path)
-        executor.hooks_reference = "service_fakes:hooks"
+        executor.hooks_reference = "server_fakes:hooks"
         assert wait_done(store, again.id, timeout=60).state == "succeeded"
     finally:
         scheduler.stop()
@@ -296,7 +296,7 @@ def test_child_process_execution_stops_on_cancel_or_timeout(
 
 def test_child_process_is_replaced_when_the_model_changes(store, tmp_path):
     """A job for another model gets a fresh child; the same model reuses it."""
-    executor = ChildProcessExecutor("service_fakes:hooks")
+    executor = ChildProcessExecutor("server_fakes:hooks")
     scheduler = Scheduler(store, executor, tmp_path, poll_s=0.02)
     try:
         first = scheduler.run_one(submit(store, tmp_path))
@@ -306,13 +306,13 @@ def test_child_process_is_replaced_when_the_model_changes(store, tmp_path):
         assert executor._process.pid == pid, "same model, same child"
 
         prepared = inputs.describe(quail.DocumentProvider.from_table(
-            service_fakes.reviews_table(), id_col="id"), tmp_path / "uploads")
+            server_fakes.reviews_table(), id_col="id"), tmp_path / "uploads")
         store.put_input(prepared.content_id, str(prepared.upload_path),
                         prepared.upload_path.stat().st_size)
         other = store.create(
-            spec={"sql": service_fakes.FILTER_SQL, "dialect": "snowflake",
+            spec={"sql": server_fakes.FILTER_SQL, "dialect": "snowflake",
                   "order": None},
-            config={**service_fakes.CONFIG, "model": "qwen3-32b-fp8"},
+            config={**server_fakes.CONFIG, "model": "qwen3-32b-fp8"},
             inputs={"reviews": prepared.spec}, timeout_s=1000.0)
         assert scheduler.run_one(other).state == "succeeded"
         assert executor._process.pid != pid, "another model, a new child"
@@ -320,15 +320,79 @@ def test_child_process_is_replaced_when_the_model_changes(store, tmp_path):
         executor.close()
 
 
+def test_child_answers_do_not_wait_for_the_parent_to_read(
+        store, tmp_path, monkeypatch):
+    """The loop's emit returns at once even when the parent reads slowly.
+
+    The child queues events and a helper thread writes the pipe. The
+    burst here is 16 MB, compared with the 64 KB a Linux pipe buffers.
+    """
+    from quail.server.executor import Job
+
+    timing = tmp_path / "burst.txt"
+    monkeypatch.setenv("QUAIL_TEST_BURST_FILE", str(timing))
+    status = submit(store, tmp_path)
+    executor = ChildProcessExecutor("server_fakes:bursting_hooks")
+    try:
+        paths = {spec["content_id"]: store.get_input(spec["content_id"]).path
+                 for spec in status.inputs.values()}
+        job = Job(status.id, status.spec, status.config, status.inputs,
+                  paths, str(tmp_path / "results" / status.id))
+        received = []
+
+        def slow_emit(kind, payload):
+            if kind == "answers" and payload["kind"] == "evict":
+                received.append(payload["document"])
+                if len(received) == 1:
+                    time.sleep(2.0)    # the parent is busy for a while
+
+        execution = executor.start(job, slow_emit)
+        assert execution.wait(120)
+        assert len(received) == server_fakes.BURST_EVENTS
+        assert received == sorted(received), "events keep their order"
+        seconds = float(timing.read_text())
+        assert seconds < 1.0, f"the burst took {seconds:.2f} s in the loop"
+    finally:
+        executor.close()
+
+
+def test_a_stale_job_cannot_remove_the_next_jobs_sinks():
+    from quail.progress import (
+        answer_sink,
+        set_answer_sink,
+        set_progress_sink,
+    )
+
+    def first(payload):
+        pass
+
+    def second(payload):
+        pass
+
+    set_answer_sink(first)
+    set_answer_sink(second)          # the next job installs its sink
+    set_answer_sink(None, owner=first)
+    assert answer_sink() is second, "the stale job's removal is ignored"
+    set_answer_sink(None, owner=second)
+    assert answer_sink() is None
+    set_progress_sink(first)
+    set_progress_sink(None, owner=second)
+    from quail import progress
+
+    assert progress._SINK is first
+    set_progress_sink(None)
+    assert progress._SINK is None
+
+
 def test_load_hooks_checks_the_type():
     assert load_hooks(None) is None
-    assert load_hooks("service_fakes:hooks") is service_fakes.hooks
+    assert load_hooks("server_fakes:hooks") is server_fakes.hooks
     with pytest.raises(TypeError):
-        load_hooks("service_fakes:TRUTH")
+        load_hooks("server_fakes:TRUTH")
 
 
 def test_describe_and_resolve_supported_providers(tmp_path):
-    table = service_fakes.reviews_table()
+    table = server_fakes.reviews_table()
     memory = inputs.describe(
         quail.DocumentProvider.from_table(table, id_col="id"), tmp_path)
     assert memory.spec["kind"] == "snapshot"

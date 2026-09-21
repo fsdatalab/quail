@@ -15,7 +15,7 @@ host. The service runs the models you name, on the device you name.
 
 ```bash
 pip install "quail-engine[service]"
-quail-service --data-dir /var/lib/quail \
+quail-server --data-dir /var/lib/quail \
   --model qwen3-4b-fp8 --device h100-sxm \
   --host 0.0.0.0 --port 8642
 ```
@@ -30,7 +30,7 @@ Options:
 | `--default-timeout` | Execution time limit in seconds when a submission names none. Default 1000. |
 | `--max-timeout` | Largest limit a submission may ask for. Default 4 hours. |
 | `--max-upload-gib` | Largest input snapshot accepted. Default 8. |
-| `--token` | A bearer token every `/v1` request must carry. Default `QUAIL_SERVICE_TOKEN`; none when unset. |
+| `--token` | A bearer token every `/v1` request must carry. Default `QUAIL_SERVER_TOKEN`; none when unset. |
 
 The service needs no database server. It keeps one SQLite file it
 alone writes, and results as Arrow files beside it.
@@ -53,7 +53,7 @@ with quail.Session(config=config, endpoint="http://gpu-host:8642") as session:
 
 `run()` submits the query, waits for the saved result, and returns a
 `QueryResult`. `collect()` does the same and returns the table. The
-client side needs only the standard library; set `QUAIL_SERVICE_TOKEN`
+client side needs only the standard library; set `QUAIL_SERVER_TOKEN`
 when the service has a token.
 
 ### Tables on a remote session
@@ -174,21 +174,21 @@ The routes under `/v1` return JSON:
 
 ## On Modal
 
-`quail.service.modal_app` deploys the service as one web endpoint on
+`quail.server.modal_app` deploys the service as one web endpoint on
 the `quail-engine` app, backed by one H100 container:
 
 ```bash
-modal secret create quail-service-token QUAIL_SERVICE_TOKEN=<token>
-modal deploy -m quail.service.modal_app 2>&1 | tee service-deploy.log
+modal secret create quail-server-token QUAIL_SERVER_TOKEN=<token>
+modal deploy -m quail.server.modal_app 2>&1 | tee service-deploy.log
 ```
 
 The deploy prints the endpoint URL. The token is required because the
-URL is public; clients set `QUAIL_SERVICE_TOKEN` to the same value.
+URL is public; clients set `QUAIL_SERVER_TOKEN` to the same value.
 
 Where the data lives on Modal:
 
 - Results and uploaded inputs are written straight onto the
-  `quail-results` Volume under `/results/quail-service/`. They are
+  `quail-results` Volume under `/results/quail-server/`. They are
   write-once files.
 - The live SQLite file stays on the container's local disk. A Modal
   Volume has no file locking, and an in-place write can rewrite a whole

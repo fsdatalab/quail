@@ -158,6 +158,42 @@ def read_table(path: str | Path) -> pa.Table:
         return reader.read_all()
 
 
+class _Chunks:
+    """A write sink that hands back what was written since the last take."""
+
+    closed = False
+
+    def __init__(self):
+        self.parts = []
+
+    def write(self, data) -> int:
+        self.parts.append(bytes(data))
+        return len(data)
+
+    def flush(self) -> None:
+        pass
+
+    def take(self) -> bytes:
+        out = b"".join(self.parts)
+        self.parts.clear()
+        return out
+
+
+def iter_ipc_stream(path: str | Path):
+    """Yield the batches of a saved IPC file as one Arrow IPC stream.
+
+    The stream format is sequential, so a reader can take each batch as
+    it arrives instead of waiting for the whole file.
+    """
+    chunks = _Chunks()
+    with ipc.open_file(str(path)) as reader:
+        with ipc.new_stream(chunks, reader.schema) as writer:
+            for index in range(reader.num_record_batches):
+                writer.write_batch(reader.get_batch(index))
+                yield chunks.take()
+    yield chunks.take()
+
+
 def result_from_parts(table: pa.Table, report: dict,
                       filters: dict[tuple[str, int], pa.Table],
                       joins: dict[int, pa.Table],

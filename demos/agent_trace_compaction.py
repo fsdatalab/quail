@@ -577,13 +577,13 @@ def complete_answers(result, conversations, questions):
 
 
 def run_remote(query, directory: Path, endpoint: str):
-    """Submit the join to a query service, watch it, and return its result.
+    """Submit the join to Quail Server, watch it, and return its result.
 
     The query id goes to the log and to ``query_id.txt`` beside the
     inputs, so a later run or a browser can reattach to the same query:
     the status page is ``<endpoint>/queries/<id>``.
     """
-    run = query.submit(request_key=f"agent-compaction:{directory.name}")
+    run = query.submit(query_id=f"agent-compaction-{directory.name}")
     (directory / "query_id.txt").write_text(run.id)
     print(f"query id: {run.id}", flush=True)
     print(f"status page: {endpoint.rstrip('/')}/queries/{run.id}", flush=True)
@@ -620,7 +620,7 @@ def evaluate(directory: Path, gpus: int, endpoint: str | None = None) -> dict:
     Args:
         directory: The prepared inputs; outputs are written beside them.
         gpus: GPUs the query asks for.
-        endpoint: A query service to submit to; None runs on this host.
+        endpoint: A Quail Server to submit to; None runs on this host.
     """
     import quail
     from quail.frontend.sql import compile_sql
@@ -648,7 +648,7 @@ def evaluate(directory: Path, gpus: int, endpoint: str | None = None) -> dict:
                 logical = query.logical
             else:
                 result = run_remote(query, directory, endpoint)
-                # the service compiled the query; compile it here too for
+                # the server compiled the query; compile it here too for
                 # the prompt token pieces the throughput number needs
                 logical = compile_sql(SQL, session.catalog, session.tokenizer,
                                       dialect="bq", turn=session.model.turn)
@@ -729,7 +729,7 @@ if __name__ == "__main__":
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--gpus", type=int, default=1, choices=[1, 2, 4, 8])
-    parser.add_argument("--endpoint", help="submit the join to a query service")
+    parser.add_argument("--endpoint", help="submit the join to a Quail Server")
     args = parser.parse_args()
 
     directory = args.output_dir / uuid.uuid4().hex

@@ -2,7 +2,7 @@
 
 ``run_job`` does the work in the calling process with a local Session.
 ``ChildProcessExecutor`` runs it in one long-lived child process, so a
-GPU fault cannot take the service down and a stop request can kill the
+GPU fault cannot take the server down and a stop request can kill the
 child. ``InProcessExecutor`` runs it on a thread and exists for tests.
 The executor never touches the database; it only emits events.
 """
@@ -12,13 +12,14 @@ from __future__ import annotations
 import atexit
 import contextlib
 import importlib
+import queue
 import threading
 import time
 import traceback
 from dataclasses import dataclass, field
 from typing import Callable, Protocol
 
-from quail.service.inputs import resolve
+from quail.server.inputs import resolve
 
 Emit = Callable[[str, dict], None]
 
@@ -50,7 +51,7 @@ def load_hooks(reference: str | None) -> Hooks | None:
     module_name, _, attribute = reference.partition(":")
     hooks = getattr(importlib.import_module(module_name), attribute)
     if not isinstance(hooks, Hooks):
-        raise TypeError(f"{reference} is not a quail.service.executor.Hooks")
+        raise TypeError(f"{reference} is not a quail.server.executor.Hooks")
     return hooks
 
 
@@ -73,7 +74,7 @@ def run_job(job: Job, emit: Emit, hooks: Hooks | None = None) -> None:
     from quail.execution.session import RefusalError, Session
     from quail.planner.plan import EngineConfig, Refusal
     from quail.progress import set_answer_sink, set_progress_sink
-    from quail.service.artifacts import write_result
+    from quail.server.artifacts import write_result
 
     hooks = hooks or Hooks()
 
@@ -110,8 +111,8 @@ def run_job(job: Job, emit: Emit, hooks: Hooks | None = None) -> None:
                     query, physical_executor=hooks.physical_executor)
                 manifest = write_result(result, job.artifact_dir)
             finally:
-                set_progress_sink(None)
-                set_answer_sink(None)
+                set_progress_sink(None, owner=progress)
+                set_answer_sink(None, owner=answers)
         emit("finished", manifest)
     except Exception as error:
         emit("failed", error_event(error))
@@ -163,7 +164,7 @@ class _ThreadExecution:
 
 
 class InProcessExecutor:
-    """Run jobs on a thread of the service process (tests and CPU-only)."""
+    """Run jobs on a thread of the server process (tests and CPU-only)."""
 
     def __init__(self, hooks: Hooks | None = None):
         self.hooks = hooks
@@ -177,16 +178,39 @@ class InProcessExecutor:
 
 def _child_main(conn, hooks_reference: str | None) -> None:
     hooks = load_hooks(hooks_reference)
-    while True:
-        try:
-            job = conn.recv()
-        except (EOFError, KeyboardInterrupt):
-            # the parent closed the pipe or the container is stopping
-            return
-        if job is None:
-            return
-        run_job(job, lambda kind, payload: conn.send((kind, payload)), hooks)
-        conn.send(("done", {}))
+    # The loop thread only appends to this queue. A pipe write blocks
+    # once its buffer is full, so sending from the loop would stall the
+    # GPU whenever the parent falls behind on saving events.
+    events: queue.SimpleQueue = queue.SimpleQueue()
+
+    def send_events():
+        while True:
+            item = events.get()
+            if item is None:
+                return
+            try:
+                conn.send(item)
+            except (OSError, ValueError):
+                return      # the parent is gone; nothing left to tell
+
+    sender = threading.Thread(target=send_events, name="quail-events",
+                              daemon=True)
+    sender.start()
+    try:
+        while True:
+            try:
+                job = conn.recv()
+            except (EOFError, KeyboardInterrupt):
+                # the parent closed the pipe or the container is stopping
+                return
+            if job is None:
+                return
+            run_job(job, lambda kind, payload: events.put((kind, payload)),
+                    hooks)
+            events.put(("done", {}))
+    finally:
+        events.put(None)
+        sender.join(30)
 
 
 @dataclass
@@ -260,7 +284,7 @@ class ChildProcessExecutor:
         # when the pipe closes, and close() kills it at interpreter exit.
         process = context.Process(
             target=_child_main, args=(child_conn, self.hooks_reference),
-            name="quail-service-executor", daemon=False)
+            name="quail-server-executor", daemon=False)
         process.start()
         child_conn.close()
         self._process, self._conn = process, parent_conn

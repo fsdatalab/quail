@@ -1,4 +1,4 @@
-"""Turn table providers into inputs a remote service can read.
+"""Turn table providers into inputs Quail Server can read.
 
 A remote query must not depend on the client's memory, files, or
 provider objects. A supported provider becomes either an uploaded
@@ -22,8 +22,8 @@ from quail.catalog import (
     ScanRequest,
     TableProvider,
 )
-from quail.service.artifacts import write_ipc_file
-from quail.service.records import InvalidRequestError
+from quail.server.artifacts import write_ipc_file
+from quail.server.records import InvalidRequestError
 
 SUPPORTED = (
     "DocumentProvider.from_table, from_parquet, from_ipc, from_dataset, "
@@ -33,7 +33,7 @@ SUPPORTED = (
 
 @dataclass(frozen=True)
 class PreparedInput:
-    """A provider described for the service, with its upload if any."""
+    """A provider described for the server, with its upload if any."""
 
     spec: dict
     upload_path: Path | None = None
@@ -63,7 +63,7 @@ def describe(provider: TableProvider, workdir: str | Path, *,
     """Describe one provider for submission.
 
     Snapshots are written to ``workdir`` as Arrow IPC files. Raises
-    TypeError for a provider that cannot be sent to a service.
+    TypeError for a provider that cannot be sent to a server.
 
     Args:
         provider: The registered provider.
@@ -88,7 +88,7 @@ def describe(provider: TableProvider, workdir: str | Path, *,
         source = provider.scan(ScanRequest(columns=provider.columns))
     else:
         raise TypeError(
-            f"{type(provider).__name__} cannot be sent to a Quail service; "
+            f"{type(provider).__name__} cannot be sent to Quail Server; "
             f"register {SUPPORTED}")
     workdir.mkdir(parents=True, exist_ok=True)
     staging = workdir / f"snapshot-{id(provider)}.arrow"
@@ -109,7 +109,7 @@ def describe(provider: TableProvider, workdir: str | Path, *,
 
 
 def resolve(spec: dict, snapshot_paths: dict[str, str | Path]) -> TableProvider:
-    """Build the provider a service reads for one described input.
+    """Build the provider the server reads for one described input.
 
     Args:
         spec: The input description saved with the record.
