@@ -1,6 +1,6 @@
 # QUAIL-B
 
-QUAIL-B is an academic benchmark of 38 AI SQL queries over document tables. AI SQL is SQL with LLM-powered operators. Its first 31 queries read text documents. The other 7, QUAIL-B-PDF, read PDF pages rendered as images; see [QUAIL-B-PDF](#quail-b-pdf).
+QUAIL-B is an academic benchmark of 40 AI SQL queries over document tables. AI SQL is SQL with LLM-powered operators. Its first 31 queries read text documents. The other 9, QUAIL-B-PDF, read PDF pages rendered as images; see [QUAIL-B-PDF](#quail-b-pdf).
 
 This repository publishes the query plans, input tables, reference labels, and scoring harness. It does not include an execution engine. To benchmark your engine, you write an adapter function that translates each Substrait query plan into your engine's AI SQL dialect, executes it, and returns the execution results to QUAIL-B for scoring.
 
@@ -108,7 +108,7 @@ import quail_b
 
 quail_b.run(
     run_query,
-    queries=["IMDB-4"],  # Omit to run all 38 queries
+    queries=["IMDB-4"],  # Omit to run all 40 queries
     scale_factor=0.1,
     output_dir="results/my-run",  # Set your desired output directory path
     metadata={"engine": "my-engine", "model": "Qwen/Qwen3-4B-FP8"},
@@ -118,7 +118,7 @@ quail_b.run(
 ```
 
 - `output_dir`: Path to the directory where QUAIL-B writes run results (e.g. `"results/vllm-qwen3-4b"` or any custom path). Must be a new directory.
-- `queries`: List of query IDs to run. Omit `queries=` (or pass `None`) to run all 38 benchmark queries. A suite name stands for its queries: `"QUAIL-B"` for the 31 text queries, `"QUAIL-B-PDF"` for the 7 PDF queries.
+- `queries`: List of query IDs to run. Omit `queries=` (or pass `None`) to run all 40 benchmark queries. A suite name stands for its queries: `"QUAIL-B"` for the 31 text queries, `"QUAIL-B-PDF"` for the 9 PDF queries.
 - Data is downloaded from `s3://quail-bench` and cached locally in `~/.cache/quail-b`.
 - Only the reference labels of the selected queries' predicates are loaded, as Arrow tables of about 25 bytes per answer. Loading the full published collection of 21 label sets at scale 0.1 (1.21 million answers) takes 1.9 s from cached files with a peak of 0.62 GiB, corpus tables included; at scale 1.0 (51.8 million answers) budget about 3 GiB.
 
@@ -137,7 +137,7 @@ reviews = quail_b.load_table("reviews", scale_factor=0.1)
 
 ## Queries
 
-The benchmark defines 38 queries across 7 datasets:
+The benchmark defines 40 queries across 8 datasets:
 
 | Dataset | Queries | Relations | Description |
 | --- | ---: | --- | --- |
@@ -148,6 +148,7 @@ The benchmark defines 38 queries across 7 datasets:
 | SWE-Next | 2 | `agent_traces` | Software engineering agent trajectory evaluation |
 | CUAD | 5 | `contracts`, `contract_pages` | Contract clause review over PDF pages rendered as images |
 | FinanceBench | 2 | `filing_questions`, `filing_pages` | Evidence page retrieval for analyst questions over SEC filings rendered as images |
+| OfficeQA Pro v2 | 2 | `treasury_questions`, `treasury_pages` | Answer page retrieval for questions over U.S. Treasury statements rendered as images |
 
 The original LEP-5, LEP-6, and LEP-8 have empty reference outputs at sf=0.1
 with raw prompts as well as chat prompts. They are excluded. The original LEP-7
@@ -190,7 +191,8 @@ questions.
 
 QUAIL-B-PDF is the PDF version of the benchmark: the queries whose
 documents are PDF pages rendered as images instead of text. It needs a
-model that takes images, and it holds the CUAD and FinanceBench families.
+model that takes images, and it holds the CUAD, FinanceBench, and
+OfficeQA families.
 
 CUAD-1 to CUAD-5 read contract PDFs. The `document` column of both
 relations is a file reference: `files/<id>.pdf` for a whole contract and
@@ -233,12 +235,38 @@ and 12,013 pages at the three scale factors, with 17, 91, and 187
 evidence pairs; the reference model keeps 8, 33, and 70 of the
 questions for FIN-2.
 
+TREAS-1 and TREAS-2 read U.S. Treasury statements of receipts and
+expenditures from OfficeQA Pro v2 (Databricks): 90 questions over the
+Combined Statements of Receipts, Outlays, and Balances and the earlier
+receipts documents on govinfo, 1793 to 2024, each naming the document or
+documents it reads and the PDF page of each that holds the answer. Most
+questions combine several table cells, and a statement runs to hundreds
+of pages. `treasury_questions` has one row per question and source
+document, with the document's `statement` id, the question's
+`source_count`, and its `evidence_pages` in that document; a question
+over three documents is three rows. `treasury_pages` has one row per
+page of every sampled question's documents, with a
+`files/<statement>.pdf#page=<n>` document reference. Both queries join a
+question row with the pages of its statement (`q.statement =
+p.statement`) and ask, per page, whether it reports the figures the
+question needs. TREAS-2 first keeps the questions that combine several
+reported figures, an AI filter over the question text labeled by the
+reference model. The join's reference labels are the named pages: a
+(question row, page) pair is TRUE when the page is one the question's
+`source_docs` names for that statement. The dataset is gated on Hugging
+Face: building the treasury tables from source needs an account that
+accepted its terms at
+https://huggingface.co/datasets/databricks/officeqa-pro-v2 and that
+account's token in `HF_TOKEN`; reading a published corpus does not. The
+`pdf_page_number` field is read as a one based PDF page number, checked
+against each document's page count when the tables are built.
+
 Queries use two LLM-powered relational operators:
 
 - `ai_filter(prompt, document) -> boolean` (selection)
 - `ai_join(prompt, left, right) -> boolean` (join)
 
-All 38 queries are stored as standard Substrait 0.103 ProtoJSON plans in [`quail_b/plans/`](quail_b/plans/). Custom AI functions are declared in [`quail_b/substrait_extensions.yaml`](quail_b/substrait_extensions.yaml). [All 38 plans](figures/quailb_anatomy.pdf) are diagrammed in one figure.
+All 40 queries are stored as standard Substrait 0.103 ProtoJSON plans in [`quail_b/plans/`](quail_b/plans/). Custom AI functions are declared in [`quail_b/substrait_extensions.yaml`](quail_b/substrait_extensions.yaml). [All 40 plans](figures/quailb_anatomy.pdf) are diagrammed in one figure.
 
 ### Example Query: IMDB-4
 
@@ -273,7 +301,7 @@ across questions.
 
 QUAIL-B defines three scale factors: `0.1`, `0.5`, and `1.0`. They correspond to 10%, 50%, and 100% of each dataset's sampling target.
 
-A scale factor changes the input table cardinalities and reference labels. It does not change the 38 query definitions.
+A scale factor changes the input table cardinalities and reference labels. It does not change the 40 query definitions.
 
 | Dataset | Relation | 0.1 | 0.5 | 1.0 |
 | --- | --- | ---: | ---: | ---: |
@@ -290,13 +318,17 @@ A scale factor changes the input table cardinalities and reference labels. It do
 | CUAD | `contract_pages` | 1,131 | 4,522 | 9,348 |
 | FinanceBench | `filing_questions` | 15 | 75 | 150 |
 | FinanceBench | `filing_pages` | see below | see below | see below |
+| OfficeQA Pro v2 | `treasury_questions` | see below | see below | see below |
+| OfficeQA Pro v2 | `treasury_pages` | see below | see below | see below |
 
 CUAD samples contracts, so the page count at a scale factor follows from
 the sampled contracts. The contract queries read the contracts of at most
 32 pages: 40, 215, and 430 at the three scale factors. FinanceBench
 samples questions, and `filing_pages` holds every page of the sampled
 questions' filings; the corpus manifest records the count at each scale
-factor.
+factor. OfficeQA samples questions too; `treasury_questions` has one row
+per question and source document, and `treasury_pages` holds every page
+of the sampled questions' documents.
 
 Each scale factor deterministically samples upstream snapshots defined in [`quail_b/data.py`](quail_b/data.py).
 
@@ -374,6 +406,7 @@ quail-b report results/my-run
 | [`quail_b/data.py`](quail_b/data.py) | Dataset tables, sampling logic, and scale factors |
 | [`quail_b/cuad.py`](quail_b/cuad.py) | CUAD contract PDFs as file-backed relations and their page annotations |
 | [`quail_b/financebench.py`](quail_b/financebench.py) | FinanceBench filings as file-backed page relations and their evidence pages |
+| [`quail_b/officeqa.py`](quail_b/officeqa.py) | OfficeQA Pro v2 Treasury statements as file-backed page relations and their answer pages |
 | [`quail_b/labels.py`](quail_b/labels.py) | Reference labels and ground truth loading |
 | [`quail_b/run.py`](quail_b/run.py) | Benchmark runner and answer validator |
 | [`quail_b/scoring.py`](quail_b/scoring.py) | Accuracy, precision, recall, and cost scoring |

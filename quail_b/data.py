@@ -9,7 +9,9 @@ revision with one seed, so a scale factor names one exact corpus.
 import hashlib
 import heapq
 import json
+import os
 import shutil
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -17,7 +19,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from quail_b import cuad, financebench
+from quail_b import cuad, financebench, officeqa
 from quail_b._files import (
     GROUND_TRUTH_ROOT,
     _cached_file,
@@ -70,6 +72,7 @@ SOURCE_REVISIONS = {
     "zenodo/CUAD_v1": cuad.CUAD_ARCHIVE_SHA256,
     # FinanceBench is a GitHub repository; the revision is its commit.
     "github/patronus-ai/financebench": financebench.FINANCEBENCH_COMMIT,
+    "databricks/officeqa-pro-v2": officeqa.OFFICEQA_COMMIT,
 }
 
 # Base document counts at sf=1. LePaRD scales sampled citation pairs
@@ -81,6 +84,7 @@ SETS = {
     "agent_traces": AGENT_TRACE_DOCUMENTS,
     "contracts": cuad.CONTRACTS,
     "filing_questions": financebench.QUESTIONS,
+    "treasury_questions": officeqa.QUESTIONS,
     "policies": 1_000_000,
 }
 
@@ -823,6 +827,59 @@ def _financebench_source(name: str) -> bytes:
     return path.read_bytes()
 
 
+def _officeqa_source(name: str) -> bytes:
+    """One file of the pinned OfficeQA Pro v2 commit, downloaded once.
+
+    Raises:
+        PermissionError: No `HF_TOKEN` is set, or the token's account
+            has not accepted the dataset's terms.
+    """
+    path = cache_directory() / "sources" / "officeqa" / name
+    if not path.exists():
+        token = os.environ.get("HF_TOKEN", "")
+        if not token:
+            raise PermissionError(
+                f"OfficeQA Pro v2 is gated: accept its terms at "
+                f"{officeqa.OFFICEQA_TERMS_URL} and set HF_TOKEN to that "
+                f"account's token to build the treasury tables")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + ".part")
+        url = (officeqa.QUESTIONS_URL if name == officeqa.QUESTIONS_FILE
+               else officeqa.pdf_url(Path(name).stem))
+        request = urllib.request.Request(
+            url, headers={"Authorization": f"Bearer {token}"})
+        try:
+            with urllib.request.urlopen(request) as response, \
+                    open(temporary, "wb") as stream:
+                shutil.copyfileobj(response, stream)
+        except urllib.error.HTTPError as error:
+            if error.code in (401, 403):
+                raise PermissionError(
+                    f"HF_TOKEN cannot read {url}: accept the dataset's "
+                    f"terms at {officeqa.OFFICEQA_TERMS_URL}") from error
+            raise
+        temporary.replace(path)
+    return path.read_bytes()
+
+
+def _build_statements(d, sf, force=False):
+    """Build treasury_questions.parquet, treasury_pages.parquet, and files/."""
+    question_path = d / "treasury_questions.parquet"
+    page_path = d / "treasury_pages.parquet"
+    if question_path.exists() and page_path.exists() and not force:
+        return
+    rows = officeqa.read_questions(
+        _officeqa_source(officeqa.QUESTIONS_FILE).decode("utf-8"))
+    by_uid = {row["uid"]: row for row in rows}
+    sampled = stable_sample(by_uid, _n_docs("treasury_questions", sf), DATA_SEED)
+    questions, pages = officeqa.build_statement_tables(
+        [by_uid[uid] for uid in sampled],
+        lambda doc_name: _officeqa_source(f"{doc_name}.pdf"),
+        d / officeqa.FILES_DIR)
+    pq.write_table(questions, question_path)
+    pq.write_table(pages, page_path)
+
+
 def _build_filings(d, sf, force=False):
     """Build filing_questions.parquet, filing_pages.parquet, and files/."""
     question_path = d / "filing_questions.parquet"
@@ -915,12 +972,14 @@ def build_sets(data_dir, sf, lf=1, fetch=True):
             _build_agent_traces(d, sf)
             _build_contracts(d, sf)
             _build_filings(d, sf)
+            _build_statements(d, sf)
             return d
         base_sources = {
             name: revision for name, revision in SOURCE_REVISIONS.items()
             if name not in ("TIGER-Lab/SWE-Next-SFT-Trajectories",
                             "zenodo/CUAD_v1",
-                            "github/patronus-ai/financebench")
+                            "github/patronus-ai/financebench",
+                            "databricks/officeqa-pro-v2")
         }
         same_sources = (
             current
@@ -940,6 +999,7 @@ def build_sets(data_dir, sf, lf=1, fetch=True):
             _build_agent_traces(d, sf, force=True)
             _build_contracts(d, sf, force=True)
             _build_filings(d, sf, force=True)
+            _build_statements(d, sf, force=True)
             marker.write_text(json.dumps(expected, indent=2, sort_keys=True))
             return d
     if fetch and _fetch_published_corpus(d, sf):
@@ -988,6 +1048,7 @@ def build_sets(data_dir, sf, lf=1, fetch=True):
     _build_agent_traces(d, sf, force=True)
     _build_contracts(d, sf, force=True)
     _build_filings(d, sf, force=True)
+    _build_statements(d, sf, force=True)
 
     marker.write_text(json.dumps(expected, indent=2, sort_keys=True))
     return d
@@ -1018,10 +1079,15 @@ CORPUS_COLUMNS = {
                          "evidence_pages"),
     "filing_pages": ("id", "filing", "doc_name", "page_number", "page_count",
                      "pdf_sha256", "document"),
+    "treasury_questions": ("id", "officeqa_uid", "statement", "doc_name",
+                           "source_count", "question", "answer",
+                           "evidence_pages"),
+    "treasury_pages": ("id", "statement", "doc_name", "page_number",
+                       "page_count", "pdf_sha256", "document"),
 }
 # Tables whose `document` column refers to files published beside the
 # tables, under `files/`, instead of holding the document text.
-FILE_TABLES = ("contracts", "contract_pages", "filing_pages")
+FILE_TABLES = ("contracts", "contract_pages", "filing_pages", "treasury_pages")
 
 
 def _canonical(value) -> bytes:

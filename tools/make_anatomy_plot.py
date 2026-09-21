@@ -49,6 +49,8 @@ from quail_b.prompts import (
     REFUTE,
     SERIOUS_ADVERSE_EVENT,
     SUPPORT,
+    TREAS_COMBINES_FIGURES,
+    TREAS_PAGE_EVIDENCE,
 )
 from quail_b.queries import (
     FILTER_SELECTIVITY_ESTIMATES,
@@ -83,6 +85,7 @@ TEMPLATE_LABELS = {
     CUAD_NON_COMPETE: "n-comp", CUAD_LICENSE_GRANT: "licens",
     CUAD_NON_TRANSFERABLE_LICENSE: "n-trns", CUAD_PERPETUAL_LICENSE: "perp.",
     FIN_NEEDS_CALCULATION: "calc.", FIN_PAGE_EVIDENCE: "evid.",
+    TREAS_COMBINES_FIGURES: "comb.", TREAS_PAGE_EVIDENCE: "evid.",
 }
 
 

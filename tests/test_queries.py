@@ -36,8 +36,8 @@ from quail_b.substrait import (
 from tools.make_substrait_plans import write_plans
 
 
-def test_catalog_has_the_38_default_queries_and_two_privacy_queries():
-    assert len(QUERIES) == 38
+def test_catalog_has_the_40_default_queries_and_two_privacy_queries():
+    assert len(QUERIES) == 40
     assert QUERY_ORDER == (
         *(f"IMDB-{i}" for i in range(1, 11)),
         *(f"BIO-{i}" for i in range(1, 5)),
@@ -46,6 +46,7 @@ def test_catalog_has_the_38_default_queries_and_two_privacy_queries():
         "AGENT-1", "AGENT-2",
         *(f"CUAD-{i}" for i in range(1, 6)),
         "FIN-1", "FIN-2",
+        "TREAS-1", "TREAS-2",
     )
     assert [spec.id for spec in PRIVACY_QUERIES] == ["PRIV-1", "PRIV-2"]
     assert list(queries(include_privacy=True)) == [*QUERY_ORDER, "PRIV-1", "PRIV-2"]
@@ -234,7 +235,7 @@ def test_substrait_plans_are_packaged():
     catalog = package.joinpath("plans", "catalog.json")
     entries = json.loads(catalog.read_text())
 
-    assert len(entries) == 40
+    assert len(entries) == 42
     assert all(
         package.joinpath("plans", f"{entry['id']}.json").is_file()
         for entry in entries
@@ -257,8 +258,8 @@ def test_parallel_query_split_matches_stock_vllm():
     assert split_query_ids(QUERY_ORDER, 4) == (
         QUERY_ORDER[0:10],
         QUERY_ORDER[10:20],
-        QUERY_ORDER[20:29],
-        QUERY_ORDER[29:38],
+        QUERY_ORDER[20:30],
+        QUERY_ORDER[30:40],
     )
 
 
@@ -271,6 +272,7 @@ def test_query_family_split_matches_benchmark_catalog():
         "AGENT": "agent",
         "CUAD": "cuad",
         "FIN": "financebench",
+        "TREAS": "officeqa",
     }
     assert split_query_families(QUERY_ORDER) == (
         QUERY_ORDER[0:10],
@@ -280,6 +282,7 @@ def test_query_family_split_matches_benchmark_catalog():
         QUERY_ORDER[29:31],
         QUERY_ORDER[31:36],
         QUERY_ORDER[36:38],
+        QUERY_ORDER[38:40],
     )
     assert query_family_name(QUERY_ORDER[0:10]) == "imdb"
 
@@ -340,17 +343,42 @@ def test_financebench_queries_join_a_question_with_its_filing_pages():
         assert all(f.prompt == filter_spec.template for f in info.filters)
 
 
+def test_officeqa_queries_join_a_question_row_with_its_statement_pages():
+    from quail_b.predicates import PREDICATE_BY_KEY, PREDICATES
+
+    join_spec = PREDICATE_BY_KEY["quailb.officeqa.page.answers_question"]
+    assert (join_spec.kind, join_spec.source_policy) == (
+        "join", "officeqa_provenance")
+    assert (join_spec.left_table, join_spec.right_table) == (
+        "treasury_questions", "treasury_pages")
+    filter_spec = PREDICATE_BY_KEY["quailb.officeqa.question.combines_figures"]
+    assert (filter_spec.kind, filter_spec.source_policy) == (
+        "filter", "qwen3_32b")
+    assert [spec.key for spec in PREDICATES
+            if spec.workload == "officeqa"] == [filter_spec.key, join_spec.key]
+    for query_id, filters in (("TREAS-1", 0), ("TREAS-2", 1)):
+        info = _inspect_plan(get_query(query_id).plan)
+        assert [(r.table, r.text_column) for r in info.relations] == [
+            ("treasury_questions", "question"), ("treasury_pages", "document")]
+        (join,) = info.joins
+        assert join.relations == ("q", "p")
+        assert join.on == (("statement", "statement"),)
+        assert join.prompt == join_spec.template
+        assert len(info.filters) == filters
+        assert all(f.prompt == filter_spec.template for f in info.filters)
+
+
 def test_suites_split_the_text_queries_from_the_pdf_queries():
     from quail_b import select_queries
     from quail_b.queries import QUERY_SUITES, suite_query_ids
 
     assert QUERY_SUITES == {
         "QUAIL-B": ("IMDB", "BIO", "FEV", "LEP", "AGENT"),
-        "QUAIL-B-PDF": ("CUAD", "FIN"),
+        "QUAIL-B-PDF": ("CUAD", "FIN", "TREAS"),
     }
     text = suite_query_ids("QUAIL-B")
     pdf = suite_query_ids("QUAIL-B-PDF")
-    assert text == QUERY_ORDER[0:31] and pdf == QUERY_ORDER[31:38]
+    assert text == QUERY_ORDER[0:31] and pdf == QUERY_ORDER[31:40]
     assert [spec.id for spec in select_queries("QUAIL-B-PDF")] == list(pdf)
     assert [spec.id for spec in select_queries(["IMDB-1", "QUAIL-B-PDF"])] \
         == ["IMDB-1", *pdf]
