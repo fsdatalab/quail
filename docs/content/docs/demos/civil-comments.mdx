@@ -85,6 +85,10 @@ Primary query time and cost exclude model startup.
 The source lives under
 [`demos/civil_comments/`](https://github.com/fsdatalab/quail/tree/main/demos/civil_comments).
 
+Jev writes local checkpoints under `results/civil-comments/jev/`. Quail writes
+results to the `quail-results` Modal volume under
+`/demos/civil-comments/quail/`.
+
 ```bash
 uv run modal run --detach demos/civil_comments/quail_backend.py \
   --limit 10000 --gpus 1
@@ -93,10 +97,12 @@ read -s TYPESAFE_API_KEY
 export TYPESAFE_API_KEY
 
 uv run python demos/civil_comments/jev_backend.py \
-  --limit 10000 --concurrency 256 --strategy combined
+  --limit 10000 --concurrency 256 --strategy combined \
+  --output results/civil-comments/jev/combined
 
 uv run python demos/civil_comments/jev_backend.py \
-  --limit 10000 --concurrency 256 --strategy pushdown
+  --limit 10000 --concurrency 256 --strategy pushdown \
+  --output results/civil-comments/jev/pushdown
 ```
 
 [dataset]: https://huggingface.co/datasets/pietrolesci/civilcomments-wilds

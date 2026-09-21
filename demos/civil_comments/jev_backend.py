@@ -45,6 +45,7 @@ from demos.civil_comments import (
 MODEL = "jev-1.13.0"
 URL = "https://api.typesafe.ai/v1/systemone"
 USD_PER_MILLION_INPUT_TOKENS = 0.042
+LOCAL_RESULTS_DIR = Path("results/civil-comments/jev")
 
 FILTER_QUESTIONS = {
     "toxicity": {
@@ -402,7 +403,7 @@ def main():
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("/tmp") / f"civil-comments-jev-{uuid.uuid4().hex}",
+        default=LOCAL_RESULTS_DIR / uuid.uuid4().hex,
     )
     args = parser.parse_args()
     if args.limit < 0 or args.concurrency < 1:

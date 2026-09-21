@@ -10,8 +10,8 @@ Run one or two H100s from the repository root:
       --limit 10000 --gpus 1 \
       2>&1 | tee /tmp/civil-comments-quail.log
 
-Results are saved under ``/results/demos/civil-comments/quail/<run-id>``
-on the ``quail-results`` Modal volume. ``--limit 0`` uses all comments.
+Results are saved under ``/demos/civil-comments/quail/<run-id>`` on the
+``quail-results`` Modal volume. ``--limit 0`` uses all comments.
 """
 
 from __future__ import annotations
@@ -39,12 +39,19 @@ from quail.bench.images import gpu_image
 
 MODEL = "diffusion-gemma-26b-a4b-fp8"
 DEVICE = "h100-sxm"
+RESULTS_MOUNT = Path("/results")
+RESULTS_VOLUME_DIR = Path("demos/civil-comments/quail")
 
 app = modal.App("quail-milestone1")
 results_volume = modal.Volume.from_name("quail-results", create_if_missing=True)
 hf_cache = modal.Volume.from_name("quail-hf-cache", create_if_missing=True)
 kernel_cache = modal.Volume.from_name("quail-kernel-cache", create_if_missing=True)
 image = gpu_image(("demos", "/root/demos")).add_local_python_source("demos")
+
+
+def result_volume_path(directory: Path) -> str:
+    """Return a path relative to the Modal volume root."""
+    return f"/{directory.relative_to(RESULTS_MOUNT)}"
 
 
 def build_sql() -> str:
@@ -165,7 +172,7 @@ def evaluate(directory: Path, limit: int | None, gpus: int) -> dict:
         ),
         "accuracy": accuracy,
         "field_counts": dict(Counter(field for _, field in pairs_found)),
-        "result_volume_path": str(directory),
+        "result_volume_path": result_volume_path(directory),
     }
     summary = json_ready(summary)
     (directory / "summary.json").write_text(json.dumps(summary, indent=2))
@@ -180,7 +187,7 @@ def evaluate(directory: Path, limit: int | None, gpus: int) -> dict:
                 "gpu_cost_usd": summary["gpu_cost_usd"],
                 "filter": accuracy["filter"],
                 "join": accuracy["join"],
-                "result_volume_path": str(directory),
+                "result_volume_path": result_volume_path(directory),
             },
             indent=2,
         ),
@@ -195,7 +202,7 @@ def evaluate(directory: Path, limit: int | None, gpus: int) -> dict:
     timeout=86_400,
     memory=98_304,
     volumes={
-        "/results": results_volume,
+        str(RESULTS_MOUNT): results_volume,
         "/root/.cache/huggingface": hf_cache,
         "/root/.cache/kernels": kernel_cache,
     },
@@ -205,7 +212,7 @@ def run(limit: int, gpus: int) -> dict:
     results_volume.reload()
     hf_cache.reload()
     directory = (
-        Path("/results/demos/civil-comments/quail") / uuid.uuid4().hex
+        RESULTS_MOUNT / RESULTS_VOLUME_DIR / uuid.uuid4().hex
     )
     directory.mkdir(parents=True)
     summary = evaluate(directory, None if limit == 0 else limit, gpus)
