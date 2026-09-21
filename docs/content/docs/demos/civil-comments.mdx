@@ -3,15 +3,15 @@ title: Civil Comments
 description: Classify reader comments from English-language news sites.
 ---
 
-This demo shows how you can use an AI filter and join to classify reader
-comments from English-language news sites.
+The Civil Comments demo shows how you can use an AI filter and join to
+classify reader comments from English-language news sites.
 
-It uses 10,000 rows from [Jigsaw Civil Comments][dataset]. Each row contains
-a comment and crowd-sourced scores for toxicity, six toxicity subtypes, and
-24 identity mentions.
+The demo uses 10,000 rows from [Jigsaw Civil Comments][dataset]. Each row
+contains a comment and crowd-sourced scores for toxicity, six toxicity
+subtypes, and 24 identity mentions.
 
-Human raters produced the scores. A score records the fraction of raters who
-selected a label. The demo treats a score of 50% or higher as positive.
+The dataset is labeled by human raters. If 50% or more of raters select a
+label, the demo treats the label as positive.
 
 The labels are subjective and noisy. You should not expect high agreement
 with every majority vote. The demo instead shows how planning and KV reuse
@@ -34,8 +34,8 @@ The 30 fields comprise:
 - Four disability categories.
 
 Each field has a definition, one TRUE example, and one FALSE example.
-Historical `rejected` moderation metadata is excluded. It is not a semantic
-property of the text.
+Historical `rejected` moderation metadata is excluded because moderation
+status is not a semantic property of the text.
 
 ```sql
 SELECT
@@ -56,7 +56,7 @@ The query has no selectivity hints.
 ## Execution
 
 Quail pushes the toxicity predicate below the join. Jev batches questions by
-comment. It never sends one request per comment-field pair.
+comment. The Jev client never sends one request per comment-field pair.
 
 | Jev strategy | Requests | Questions per request |
 |---|---:|---:|
