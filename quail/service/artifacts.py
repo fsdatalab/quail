@@ -21,6 +21,53 @@ from quail.execution.result import QueryResult
 
 RESULT_FILE = "result.arrow"
 REPORT_FILE = "report.json"
+ANSWERS_FILE = "answers.jsonl"
+
+
+class Answers:
+    """Join answers saved one anchor per line, while the query runs.
+
+    Each line is the dict the engine reports when an anchor finishes.
+    The file is append-only and never renamed, so a reader can fetch
+    the lines it has not seen yet by line number while more arrive.
+    """
+
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        self.count = 0
+        self._handle = None
+
+    def append(self, payload: dict) -> None:
+        if self._handle is None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._handle = open(self.path, "a", encoding="utf-8")
+        self._handle.write(json.dumps(payload, separators=(",", ":")) + "\n")
+        self._handle.flush()
+        self.count += 1
+
+    def close(self) -> None:
+        if self._handle is not None:
+            self._handle.close()
+            self._handle = None
+
+
+def read_answers(path: str | Path, after: int = 0,
+                 limit: int | None = None) -> list[dict]:
+    """Return the saved anchor answers from line ``after`` on."""
+    path = Path(path)
+    if not path.exists():
+        return []
+    out = []
+    with open(path, encoding="utf-8") as handle:
+        for index, line in enumerate(handle):
+            if not line.endswith("\n"):
+                break       # the writer is still on this line
+            if index < after:
+                continue
+            if limit is not None and len(out) >= limit:
+                break
+            out.append(json.loads(line))
+    return out
 
 
 def write_ipc_file(path: Path, reader_or_table) -> int:

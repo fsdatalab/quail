@@ -13,7 +13,7 @@ import threading
 import time
 from pathlib import Path
 
-from quail.service.artifacts import verify_result
+from quail.service.artifacts import ANSWERS_FILE, Answers, verify_result
 from quail.service.executor import Executor, Job
 from quail.service.records import InvalidRequestError, QueryStatus
 from quail.service.store import Store
@@ -100,16 +100,37 @@ class Scheduler:
             return self.store.get(query_id)
 
         last_progress = [0.0]
+        counts = [None]        # the loop's last progress payload
+        written = [0]          # answers_saved on the record
+        answers = Answers(Path(job.artifact_dir) / ANSWERS_FILE)
+
+        def write_progress(payload):
+            written[0] = answers.count
+            self._apply(query_id, epoch, job.artifact_dir, "progress",
+                        {**payload, "answers_saved": answers.count})
 
         def emit(kind, payload):
-            if kind == "progress":
-                now = time.monotonic()
+            if kind == "answers":
+                # saved at once; the record learns the count on the
+                # progress timer, and a reader fetches what it has not seen
+                answers.append(payload)
+                complete = False
+                payload = counts[0] or {}
+            elif kind == "progress":
+                counts[0] = payload
                 complete = payload.get("total") and (
                     payload.get("done") == payload.get("total"))
+            if kind in ("answers", "progress"):
+                now = time.monotonic()
                 if not complete and now - last_progress[0] < \
                         PROGRESS_WRITE_INTERVAL_S:
                     return
                 last_progress[0] = now
+                write_progress(payload)
+                return
+            if kind in ("finished", "failed") and written[0] != answers.count:
+                # the record's count must be right before it closes
+                write_progress(counts[0] or {})
             self._apply(query_id, epoch, job.artifact_dir, kind, payload)
 
         execution = self.executor.start(job, emit)
@@ -136,6 +157,7 @@ class Scheduler:
                                f"{status.timeout_s:g} s timeout"})
                 execution.stop()
                 break
+        answers.close()
         final = self.store.get(query_id)
         if not final.done:
             self.store.finish(query_id, epoch, "failed", error={

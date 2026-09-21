@@ -36,6 +36,7 @@ from quail.builtins import built_in_registry
 from quail.execution.session import RefusalError, Session
 from quail.logical import CompileError
 from quail.planner.plan import EngineConfig
+from quail.service.artifacts import ANSWERS_FILE, read_answers
 from quail.service.executor import (
     ChildProcessExecutor,
     Hooks,
@@ -233,6 +234,18 @@ class Service:
             raise InvalidRequestError(f"{name!r} is not a file of this result")
         return directory / name
 
+    def saved_answers(self, status: QueryStatus, after: int,
+                      limit: int) -> dict:
+        """Join anchor answers saved so far, from line ``after`` on.
+
+        Available while the query runs and after it ends. ``next`` is
+        the line to ask for next; ``done`` says whether more can come.
+        """
+        path = self.scheduler.result_directory(status.id) / ANSWERS_FILE
+        items = read_answers(path, after, limit)
+        return {"answers": items, "next": after + len(items),
+                "done": status.done, "revision": status.revision}
+
     async def save_upload(self, request: Request, content_id: str) -> int:
         """Stream one snapshot upload to disk and check its hash."""
         if self.store.get_input(content_id) is not None:
@@ -412,6 +425,17 @@ def create_app(settings: ServiceSettings) -> Starlette:
                  else "application/vnd.apache.arrow.file")
         return FileResponse(str(path), media_type=media)
 
+    async def saved_answers(request):
+        query_id = request.path_params["query_id"]
+        after = max(int(request.query_params.get("after", "0")), 0)
+        limit = min(int(request.query_params.get("limit", "1000")), 10_000)
+        try:
+            status = service.store.get(query_id)
+        except ServiceError as error:
+            return _error(error)
+        return JSONResponse(await run_in_threadpool(
+            service.saved_answers, status, after, limit))
+
     async def rows(request):
         query_id = request.path_params["query_id"]
         limit = min(int(request.query_params.get("limit", "20")), 1000)
@@ -445,6 +469,7 @@ def create_app(settings: ServiceSettings) -> Starlette:
         Route("/v1/queries/{query_id}/result", result_file),
         Route("/v1/queries/{query_id}/files/{name:path}", result_file),
         Route("/v1/queries/{query_id}/rows", rows),
+        Route("/v1/queries/{query_id}/answers", saved_answers),
         Route("/", page),
         Route("/queries/{query_id}", page),
     ]

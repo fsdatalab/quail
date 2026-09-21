@@ -109,6 +109,29 @@ States are `queued`, `planning`, `running`, `succeeded`, `failed`,
 `interrupted`, and `cancelled`. A query that runs past its time limit
 ends `failed` with error type `TimeoutError`.
 
+### Answers while the query runs
+
+A join reports each anchor document's answers the moment the engine
+finishes that document. The service saves them as they arrive, so a
+client can show results filling in instead of waiting for the end:
+
+```python
+for entry in run.stream_answers():
+    # entry["document"] is the anchor's row index in its table;
+    # entry["pairs"] lists the partner row indices, one per answer
+    print(entry["anchor"], entry["document"],
+          sum(entry["answers"]), "of", len(entry["answers"]))
+```
+
+- `stream_answers()` yields one entry per finished anchor and ends
+  when the query is done. Entries agree with the saved join answer
+  tables.
+- `answers(after=N)` returns the entries saved so far from entry `N`
+  on, with `next` and `done`; `status().progress["answers_saved"]`
+  is the count the record knows about.
+- Filters and scores do not stream; their answers arrive with the
+  result.
+
 ### What a remote session cannot do
 
 - `explain()` and `plan()` before running. The service compiles and
@@ -132,6 +155,7 @@ The routes under `/v1` return JSON:
 | `GET /v1/queries/{id}?after=N&wait=S` | Snapshot, waiting up to S seconds for a revision above N |
 | `GET /v1/queries/{id}/events` | Server-sent events, one per revision |
 | `POST /v1/queries/{id}/cancel` | Cancel |
+| `GET /v1/queries/{id}/answers?after=N` | Join answers saved so far, one entry per finished anchor |
 | `GET /v1/queries/{id}/result` | The rows as an Arrow IPC file |
 | `GET /v1/queries/{id}/files/report.json` | The execution report |
 

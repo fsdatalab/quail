@@ -21,6 +21,15 @@ FILTER_SQL = """
       AND AI_FILTER(PROMPT('q2: {0}', r.review), {'selectivity': 0.5})
 """
 
+JOIN_SQL = """
+    SELECT r.id, p.asin FROM reviews r JOIN products p
+      ON AI_FILTER(PROMPT('m {0} {1}', r.review, p.description),
+                   {'anchor': 'r'})
+"""
+
+# answer for the pair (review i, product j); r0 matches p0 and p2
+JOIN_TRUTH = {("r", "p"): lambda a, b: (a + b) % 2 == 0}
+
 CONFIG = {"model": "qwen3-4b-fp8", "device": "h100-sxm",
           "gpus": 1, "backend": "quail"}
 
@@ -32,13 +41,20 @@ def reviews_table() -> pa.Table:
     })
 
 
+def products_table() -> pa.Table:
+    return pa.table({
+        "asin": [f"p{i}" for i in range(4)],
+        "description": [f"product {i}" for i in range(4)],
+    })
+
+
 def _executor_with_progress(request):
     from quail.progress import Progress
 
     progress = Progress("filter (2 stages)", total=6, every=0)
     progress.update(6)
     progress.finish("filter done")
-    return make_executor(TRUTH)(request)
+    return make_executor(TRUTH, JOIN_TRUTH)(request)
 
 
 hooks = Hooks(physical_executor=_executor_with_progress, tokenizer=fake_tok)

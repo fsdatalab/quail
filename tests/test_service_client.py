@@ -96,6 +96,34 @@ def test_submit_close_reattach_watch_and_collect(endpoint, tmp_path):
         assert run.result().count() == 2
 
 
+def test_stream_answers_yields_each_anchor_and_pages_over_http(
+        endpoint, tmp_path):
+    url = endpoint()
+    with quail.Session(CONFIG, endpoint=url) as session:
+        register_reviews(session, tmp_path)
+        session.register("products", quail.DocumentProvider.from_table(
+            service_fakes.products_table(), id_col="asin"))
+        run = session.sql(service_fakes.JOIN_SQL).submit()
+        streamed = list(run.stream_answers(poll_s=1.0))
+        assert sorted(entry["document"] for entry in streamed) == list(range(6))
+        assert all(entry["anchor"] == "r" and entry["partners"] == ["p"]
+                   and len(entry["pairs"]) == len(entry["answers"]) == 4
+                   for entry in streamed)
+        # r0 matches p0 and p2 under the fake rule
+        first = next(entry for entry in streamed if entry["document"] == 0)
+        assert [bool(a) for a in first["answers"]] == [True, False, True, False]
+        assert first["pairs"] == [[0], [1], [2], [3]]
+
+        page = run.answers(after=4, limit=1)
+        assert page["next"] == 5 and page["done"] is True
+        assert page["answers"] == [streamed[4]]
+        assert run.answers(after=6)["answers"] == []
+        assert run.status().progress["answers_saved"] == 6
+        assert sorted(run.result().to_rows()) == sorted(
+            (f"r{r}", f"p{p}") for r in range(6) for p in range(4)
+            if (r + p) % 2 == 0)
+
+
 def test_run_and_collect_are_submit_plus_result(endpoint, tmp_path):
     url = endpoint()
     with quail.Session(CONFIG, endpoint=url) as session:

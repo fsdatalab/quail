@@ -91,13 +91,17 @@ async function renderStatus(status) {
     `(${status.config.gpus} GPU, backend ${status.config.backend}), ` +
     `timeout ${status.timeout_s} s, created ${when(status.created_at)}` +
     (status.started_at ? `, started ${when(status.started_at)}` : "")));
-  if (status.progress) {
+  if (status.progress && status.progress.label) {
     const p = status.progress;
     const text = p.total ? `${p.done.toLocaleString()} / ${p.total.toLocaleString()} ${p.unit}`
                          : `${p.done.toLocaleString()} ${p.unit}`;
     const bar = el("div", { class: "bar" }, el("div", { style: p.total ? `width:${100 * p.done / p.total}%` : "width:0" }));
     nodes.push(el("h2", {}, "Progress"),
       el("p", {}, `${p.label}: ${text} `, el("span", { class: "muted" }, `as of ${when(p.recorded_at)}`)), bar);
+  }
+  if (status.progress && status.progress.answers_saved) {
+    nodes.push(el("p", {}, `${status.progress.answers_saved.toLocaleString()} join anchors answered so far · `,
+      el("a", { href: `/v1/queries/${status.id}/answers` }, "answers")));
   }
   if (status.error) {
     nodes.push(el("h2", {}, "Error"), el("pre", {}, `${status.error.type}: ${status.error.message}`));

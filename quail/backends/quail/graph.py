@@ -35,6 +35,7 @@ from quail.physical import (
     Scan,
     ScoreFilter,
 )
+from quail.progress import answer_sink
 
 
 def quail_runtimes() -> dict:
@@ -287,6 +288,22 @@ def _model_inputs(node, inputs, context: ExecutionContext) -> dict:
             "stream": stream,
         }
 
+    last = group[-1]
+    last_tuples = tuple_indices[last["written_pos"]]
+
+    def finished_answers(document, row) -> dict:
+        """The anchor's last-stage answers with their partner documents."""
+        members = None
+        if lists_for is not None and runs_over_pairs(last):
+            members = lists_for(document)[len(group) - 1]
+        pairs = ([list(last_tuples[position]) for position in range(len(row))]
+                 if members is None
+                 else [list(last_tuples[int(member)]) for member in members])
+        return {"node": node.node_id, "anchor": node.anchor,
+                "partners": list(last["partners"]), "document": int(document),
+                "pairs": pairs, "answers": [answer.item() if hasattr(
+                    answer, "item") else answer for answer in row]}
+
     def anchor_done(local_index, row):
         key = anchor_keys[local_index]
         matched = any(row)
@@ -298,6 +315,9 @@ def _model_inputs(node, inputs, context: ExecutionContext) -> dict:
                 config.get("after", {}).get(node.node_id, {}))
         else:
             state["arena"].free_key(key)
+        sink = answer_sink()
+        if sink is not None:
+            sink(finished_answers(key[1], row))
 
     state["prepared_join"] = {
         "node": node,

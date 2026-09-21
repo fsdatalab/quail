@@ -47,6 +47,7 @@ if not logger.handlers:
 
 _QUIET = 0
 _SINK = None
+_ANSWER_SINK = None
 
 
 def set_progress_sink(sink) -> None:
@@ -58,6 +59,24 @@ def set_progress_sink(sink) -> None:
     """
     global _SINK
     _SINK = sink
+
+
+def set_answer_sink(sink) -> None:
+    """Receive each join anchor's answers the moment the anchor finishes.
+
+    The sink is called as ``sink(payload)`` with the dict
+    ``quail.backends.quail.graph`` builds: the node id, the anchor and
+    partner aliases, the anchor's document index, the partner document
+    index tuples, and the answers in the same order. Called from the
+    loop's thread; it must return quickly. Pass None to remove it.
+    """
+    global _ANSWER_SINK
+    _ANSWER_SINK = sink
+
+
+def answer_sink():
+    """Return the answer sink, or None when nobody is listening."""
+    return _ANSWER_SINK
 
 
 def say(message: str) -> None:

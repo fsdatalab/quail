@@ -168,6 +168,11 @@ def make_executor(filter_truth, join_truth=None, seen=None):
                 outputs[f"ids:{node.anchor}"] = [a for a in anchors
                     if (a not in passing if stage.semantics == "anti"
                         else a in passing)]
+                # the real loop reports each anchor's last-stage row as
+                # it finishes; the hook frees its KV and streams answers
+                if inputs.get("anchor_done") is not None:
+                    for i, row in rows.items():
+                        inputs["anchor_done"](i, row)
                 return NodeResult(outputs, NodeMetrics(
                     input_rows=len(anchors),
                     output_rows=len(outputs[f"ids:{node.anchor}"]),

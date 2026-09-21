@@ -75,6 +75,52 @@ def test_in_process_run_saves_plan_progress_and_a_readable_result(
     assert report["backend"] == "quail"
 
 
+def test_join_answers_are_saved_per_anchor_while_running(store, tmp_path):
+    """Save each finished anchor to answers.jsonl with the record's count.
+
+    The saved entries must agree with the final join answer table.
+    """
+    reviews = inputs.describe(quail.DocumentProvider.from_table(
+        service_fakes.reviews_table(), id_col="id"), tmp_path / "uploads")
+    products = inputs.describe(quail.DocumentProvider.from_table(
+        service_fakes.products_table(), id_col="asin"), tmp_path / "uploads")
+    for prepared in (reviews, products):
+        store.put_input(prepared.content_id, str(prepared.upload_path),
+                        prepared.upload_path.stat().st_size)
+    status = store.create(
+        spec={"sql": service_fakes.JOIN_SQL, "dialect": "snowflake",
+              "order": None},
+        config=service_fakes.CONFIG,
+        inputs={"reviews": reviews.spec, "products": products.spec},
+        timeout_s=1000.0)
+    scheduler = Scheduler(store, InProcessExecutor(service_fakes.hooks),
+                          tmp_path, poll_s=0.02)
+    final = scheduler.run_one(status)
+    assert final.state == "succeeded"
+
+    saved = artifacts.read_answers(
+        tmp_path / final.result["directory"] / artifacts.ANSWERS_FILE)
+    assert len(saved) == 6, "one entry per review anchor"
+    assert {entry["document"] for entry in saved} == set(range(6))
+    assert saved[0]["anchor"] == "r" and saved[0]["partners"] == ["p"]
+    streamed = {(entry["document"], pair[0]): bool(answer)
+                for entry in saved
+                for pair, answer in zip(entry["pairs"], entry["answers"])}
+    result = artifacts.load_result(
+        tmp_path / final.result["directory"], final.result,
+        built_in_registry().codecs)
+    table = next(iter(result.answer_tables["joins"].values()))
+    final_answers = {(r, p): a for r, p, a in zip(
+        table["r"].to_pylist(), table["p"].to_pylist(),
+        table["answer"].to_pylist())}
+    assert streamed == final_answers and len(streamed) == 24
+    assert streamed[(0, 0)] is True and streamed[(0, 1)] is False
+    assert final.progress["answers_saved"] == 6, "the count is written last"
+    assert artifacts.read_answers(
+        tmp_path / final.result["directory"] / artifacts.ANSWERS_FILE,
+        after=4) == saved[4:]
+
+
 def test_a_finished_execution_is_not_killed_while_it_reports_done(
         store, tmp_path):
     """Wait for a finished execution to report done instead of killing it.

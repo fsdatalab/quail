@@ -72,7 +72,7 @@ def run_job(job: Job, emit: Emit, hooks: Hooks | None = None) -> None:
     from quail.execution.execute import execute_query
     from quail.execution.session import RefusalError, Session
     from quail.planner.plan import EngineConfig, Refusal
-    from quail.progress import set_progress_sink
+    from quail.progress import set_answer_sink, set_progress_sink
     from quail.service.artifacts import write_result
 
     hooks = hooks or Hooks()
@@ -80,6 +80,9 @@ def run_job(job: Job, emit: Emit, hooks: Hooks | None = None) -> None:
     def progress(label, done, total, unit):
         emit("progress", {"label": label, "done": done, "total": total,
                           "unit": unit, "recorded_at": time.time()})
+
+    def answers(payload):
+        emit("answers", payload)
 
     try:
         config = EngineConfig(**job.config)
@@ -101,12 +104,14 @@ def run_job(job: Job, emit: Emit, hooks: Hooks | None = None) -> None:
             })
             emit("state", {"state": "running"})
             set_progress_sink(progress)
+            set_answer_sink(answers)
             try:
                 result = execute_query(
                     query, physical_executor=hooks.physical_executor)
                 manifest = write_result(result, job.artifact_dir)
             finally:
                 set_progress_sink(None)
+                set_answer_sink(None)
         emit("finished", manifest)
     except Exception as error:
         emit("failed", error_event(error))

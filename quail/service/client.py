@@ -118,6 +118,11 @@ class ServiceClient:
         return QueryStatus.from_dict(
             self._request("POST", f"/v1/queries/{query_id}/cancel"))
 
+    def answers(self, query_id: str, *, after: int = 0,
+                limit: int = 1000) -> dict:
+        query = urllib.parse.urlencode({"after": after, "limit": limit})
+        return self._request("GET", f"/v1/queries/{query_id}/answers?{query}")
+
     def file(self, query_id: str, name: str) -> bytes:
         return self._request("GET", f"/v1/queries/{query_id}/files/{name}",
                              raw=True)
@@ -169,6 +174,37 @@ class QueryRun:
             if newer.revision > status.revision:
                 status = newer
                 yield status
+
+    def answers(self, after: int = 0, limit: int = 1000) -> dict:
+        """Return the join answers saved so far, from entry ``after`` on.
+
+        Each entry is one finished anchor: ``document`` (its index in the
+        anchor alias), ``pairs`` (partner document indices per pair), and
+        ``answers`` in the same order. ``next`` is the entry to ask for
+        next and ``done`` says whether more can still arrive.
+        """
+        return self._client.answers(self.id, after=after, limit=limit)
+
+    def stream_answers(self, poll_s: float = DEFAULT_POLL_S
+                       ) -> Iterator[dict]:
+        """Yield each anchor's answers as the service saves them.
+
+        Ends when the query is done and every saved entry was yielded.
+        Filters and scores do not stream; they arrive with the result.
+        """
+        seen = 0
+        for status in self.watch(poll_s):
+            saved = (status.progress or {}).get("answers_saved", 0)
+            if saved <= seen and not status.done:
+                continue
+            while True:
+                page = self.answers(after=seen)
+                yield from page["answers"]
+                seen = page["next"]
+                if not page["answers"]:
+                    break
+            if status.done:
+                return
 
     def cancel(self) -> QueryStatus:
         """Ask the service to stop this query. Returns the snapshot after."""
