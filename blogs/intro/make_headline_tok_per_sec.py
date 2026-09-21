@@ -27,6 +27,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
+from matplotlib.ticker import FuncFormatter
 
 HERE = Path(__file__).resolve().parent
 BLUE = "#4C72B0"
@@ -185,6 +186,16 @@ def plot_headline(rows, destination: Path):
         "QUAIL-B average tokens/sec by dataset\n"
         "Qwen3 4B FP8, one H100, scale factor 0.1"
     )
+    axis.ticklabel_format(style="plain", axis="y", useOffset=False)
+
+    def _fmt(value, _pos):
+        if value >= 1_000_000:
+            return f"{value / 1_000_000:g}M"
+        if value >= 1_000:
+            return f"{value / 1_000:g}k"
+        return f"{value:g}"
+
+    axis.yaxis.set_major_formatter(FuncFormatter(_fmt))
     axis.legend(
         handles=[
             Patch(facecolor=BLUE, label="Quail"),
