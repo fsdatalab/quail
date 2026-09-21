@@ -5,7 +5,6 @@ import hashlib
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pypdfium2
-import pytest
 
 import quail
 from quail.bench.quailb import queries, register_tables
@@ -170,9 +169,11 @@ def test_cuad_queries_plan_on_an_image_model_over_bounded_pdf_rows(tmp_path):
         assert f"row_mode={mode}" in explained, qid
 
 
-def test_page_rows_register_through_a_symlinked_data_directory(tmp_path):
-    """A mounted volume's real path differs from the reference; rows still match."""
+def test_page_rows_keep_their_benchmark_ids_through_a_symlinked_directory(
+        tmp_path):
+    """Page rows carry the table's ids; a mount's real path changes nothing."""
     from quail.bench.quailb import pdf_provider, read_tables
+    from quail.catalog import ScanRequest
 
     data = tmp_path / "data"
     data.mkdir()
@@ -180,8 +181,12 @@ def test_page_rows_register_through_a_symlinked_data_directory(tmp_path):
     link = tmp_path / "mount"
     link.symlink_to(data, target_is_directory=True)
     tables = read_tables(link, ["contract_pages"])
-    provider = pdf_provider(tables["contract_pages"])
-    assert provider.statistics().row_count == 5
-    # a table missing one page of a file no longer matches the files' rows
-    with pytest.raises(ValueError, match="every page of each file"):
-        pdf_provider(tables["contract_pages"].slice(0, 4))
+    # any subset of pages, in the table's order
+    provider = pdf_provider(tables["contract_pages"].take([4, 0, 3]))
+    assert provider.statistics().row_count == 3
+    rows = provider.scan(ScanRequest(columns=("id", "page", "page_count"),
+                                     filter=None, limit=None)).read_all()
+    assert rows.column("id").to_pylist() == ["ct1p3", "ct0p1", "ct1p2"]
+    assert rows.column("page").to_pylist() == [3, 1, 2]
+    assert rows.column("page_count").to_pylist() == [3, 2, 3]
+    assert [page.page_number for page in provider.pdf_input(280).row_pages(0)] == [3]

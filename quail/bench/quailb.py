@@ -50,13 +50,11 @@ def pdf_provider(rows: pa.Table):
     """A PDF provider whose query rows are a file table's rows, in order.
 
     A `document` of `<path>` makes one row per file. A `document` of
-    `<path>#page=<n>` makes one row per page; the table must then list
-    every page of each file, file by file in page order, because a PDF
-    provider forms its page rows from the files themselves.
+    `<path>#page=<n>` makes one row per listed page. Either way the
+    rows keep the benchmark ids, so Quail's answers name them.
 
     Raises:
-        ValueError: The references mix the two forms, or the page rows
-            do not cover the files in order.
+        ValueError: The references mix the two forms.
     """
     references = [parse_document_reference(reference)
                   for reference in rows.column("document").to_pylist()]
@@ -68,20 +66,10 @@ def pdf_provider(rows: pa.Table):
             sources, id_col="id", path_col="path", row_mode="pdf")
     if any(page is None for page in pages):
         raise ValueError("a file table names whole files or pages, not both")
-    files = list(dict.fromkeys(paths))
-    provider = quail.DocumentProvider.from_pdfs(
-        pa.table({"id": files, "path": files}),
-        id_col="id", path_col="path", row_mode="page")
-    # sources keep the real path, which differs from the reference on
-    # a mounted volume; the source index identifies the file either way
-    index = {path: source_index for source_index, path in enumerate(files)}
-    formed = [(page.source_index, page.page_number)
-              for page in provider.manifest().pages]
-    if formed != [(index[path], page) for path, page in references]:
-        raise ValueError(
-            "page rows must list every page of each file, in file then "
-            "page order, to match the rows a PDF provider forms")
-    return provider
+    listed = pa.table({"id": _ids(rows), "path": paths,
+                       "page": pa.array(pages, pa.int32())})
+    return quail.DocumentProvider.from_pdf_pages(
+        listed, id_col="id", path_col="path", page_col="page")
 
 
 def register_relation(session, relation: Relation, table: pa.Table) -> pa.Table:

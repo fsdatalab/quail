@@ -231,10 +231,7 @@ class PDFProvider:
             if name not in names:
                 raise CompileError(
                     f"{what} column {name!r} not in table schema {names}")
-        reserved = {self.document_column, self.PAGE_COUNT}
-        if row_mode == "page":
-            reserved.add(self.PAGE_NUMBER)
-        taken = sorted(reserved & set(names))
+        taken = sorted(self._added_columns(row_mode) & set(names))
         if taken:
             raise CompileError(
                 f"source columns {taken} clash with the columns a PDF "
@@ -246,6 +243,14 @@ class PDFProvider:
         self.path_col = path_col
         self.row_mode = row_mode
         self._manifest = None
+
+    @classmethod
+    def _added_columns(cls, row_mode: str) -> set[str]:
+        """The columns the provider adds to a row, which a source cannot hold."""
+        added = {cls.document_column, cls.PAGE_COUNT}
+        if row_mode == "page":
+            added.add(cls.PAGE_NUMBER)
+        return added
 
     # ---- TableProvider -----------------------------------------------
 
@@ -331,6 +336,92 @@ class PDFProvider:
         table = table.append_column(
             self.PAGE_COUNT,
             pa.array([counts[i] for i in source_rows], pa.int32()))
+        return table.append_column(
+            self.schema().field(self.document_column),
+            pa.array(range(len(rows)), pa.int64()))
+
+
+class PDFPagesProvider(PDFProvider):
+    """Query rows listed by the caller, one page each.
+
+    The table names each row's PDF path and one based page number and
+    carries its other columns along, the row id among them. Rows may
+    list any pages of the files, in any order, and need not cover a
+    file. The provider adds ``page_count`` and the model only
+    ``document`` column; the caller's page column keeps its name.
+    """
+
+    def __init__(self, pages: pa.Table, id_col: str, path_col: str,
+                 page_col: str):
+        if page_col not in pages.schema.names:
+            raise CompileError(
+                f"page column {page_col!r} not in table schema "
+                f"{tuple(pages.schema.names)}")
+        if not pa.types.is_integer(pages.schema.field(page_col).type):
+            raise CompileError(
+                f"page column {page_col!r} must hold integer page numbers")
+        super().__init__(pages, id_col, path_col, "page")
+        self.page_col = page_col
+        self.pages = pages
+        # the sources are the distinct files, in first appearance order
+        self.sources = pa.table({
+            path_col: pa.array(list(dict.fromkeys(self.paths_of_rows())),
+                               pa.string())})
+
+    @classmethod
+    def _added_columns(cls, row_mode: str) -> set[str]:
+        return {cls.document_column, cls.PAGE_COUNT}
+
+    def paths_of_rows(self) -> list[str]:
+        """Each listed row's PDF path."""
+        return [str(p) for p in self.pages.column(self.path_col).to_pylist()]
+
+    def schema(self) -> pa.Schema:
+        fields = list(self.pages.schema)
+        fields.append(pa.field(self.PAGE_COUNT, pa.int32()))
+        fields.append(pa.field(
+            self.document_column, pa.int64(),
+            metadata={MODEL_ONLY_KEY: b"pdf"}))
+        return pa.schema(fields)
+
+    def content_identity(self) -> str:
+        listed = list(zip(self.paths_of_rows(),
+                          self.pages.column(self.page_col).to_pylist()))
+        value = repr((super().content_identity(), listed)).encode("utf-8")
+        return "pdf:" + hashlib.sha256(value).hexdigest()
+
+    def _rows(self):
+        """One row per listed page, in table order.
+
+        Raises:
+            CompileError: A listed page number is null or outside its file.
+        """
+        from quail.pdf import PdfRowRef
+
+        manifest = self.manifest()
+        # the manifest lists sources in paths() order
+        source_index = {path: i for i, path in enumerate(self.paths())}
+        page_id = {(page.source_index, page.page_number): i
+                   for i, page in enumerate(manifest.pages)}
+        counts = manifest.page_counts
+        rows = []
+        for path, number in zip(self.paths_of_rows(),
+                                self.pages.column(self.page_col).to_pylist()):
+            source = source_index[path]
+            if number is None or not 1 <= number <= counts[source]:
+                raise CompileError(
+                    f"page {number!r} of {path!r} does not exist; the file "
+                    f"has {counts[source]} pages")
+            rows.append(PdfRowRef((page_id[source, number],)))
+        return tuple(rows)
+
+    def _row_table(self) -> pa.Table:
+        manifest = self.manifest()
+        rows = self._rows()
+        counts = [manifest.page_counts[manifest.pages[row.page_ids[0]].source_index]
+                  for row in rows]
+        table = self.pages.append_column(
+            self.PAGE_COUNT, pa.array(counts, pa.int32()))
         return table.append_column(
             self.schema().field(self.document_column),
             pa.array(range(len(rows)), pa.int64()))
@@ -426,6 +517,24 @@ class DocumentProvider:
                 per PDF. Required: it changes what a row means.
         """
         return PDFProvider(sources, id_col, path_col, row_mode)
+
+    @classmethod
+    def from_pdf_pages(cls, pages: pa.Table, id_col: str, path_col: str,
+                       page_col: str) -> PDFPagesProvider:
+        """Create a provider over listed PDF pages, one query row per row.
+
+        Use this when the rows already exist as a table with their own
+        ids, such as a page table with per page labels. The rows may
+        list any pages of any files, in any order.
+
+        Args:
+            pages: One row per page with its id, the PDF's local path,
+                its one based page number, and any value columns.
+            id_col: The row id column.
+            path_col: The column of local file paths.
+            page_col: The integer column of one based page numbers.
+        """
+        return PDFPagesProvider(pages, id_col, path_col, page_col)
 
 
 @dataclass

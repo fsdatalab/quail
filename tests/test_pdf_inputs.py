@@ -139,6 +139,50 @@ def test_pdf_mode_provider_rows(sources):
             id_col="doc_id", path_col="path", row_mode="pdf")
 
 
+def test_listed_pages_provider_keeps_the_rows_and_ids_it_is_given(sources):
+    a_path, b_path = sources.column("path").to_pylist()
+    listed = pa.table({
+        "page_id": ["b2", "a3", "a1"],
+        "path": [b_path, a_path, a_path],
+        "page_number": pa.array([2, 3, 1], pa.int32()),
+        "label": ["x", "y", "z"],
+    })
+    provider = quail.DocumentProvider.from_pdf_pages(
+        listed, id_col="page_id", path_col="path", page_col="page_number")
+    assert provider.columns == (
+        "page_id", "path", "page_number", "label", "page_count", "document")
+    assert model_only_columns(provider) == {"document"}
+    assert provider.statistics().row_count == 3
+    rows = provider.scan(quail.ScanRequest(
+        columns=("page_id", "page_number", "page_count", "label"))).read_all()
+    assert rows.to_pydict() == {
+        "page_id": ["b2", "a3", "a1"], "page_number": [2, 3, 1],
+        "page_count": [2, 3, 3], "label": ["x", "y", "z"]}
+    pdf_input = provider.pdf_input(280)
+    assert pdf_input.row_mode == "page"
+    assert [(p.source_index, p.page_number) for p in pdf_input.row_pages(0)] == [
+        (0, 2)]
+    assert [(p.source_index, p.page_number) for p in pdf_input.row_pages(1)] == [
+        (1, 3)]
+    # the identity tells listed pages apart from the same files' full rows
+    other = quail.DocumentProvider.from_pdf_pages(
+        listed.slice(0, 2), id_col="page_id", path_col="path",
+        page_col="page_number")
+    assert provider.content_identity() != other.content_identity()
+
+    with pytest.raises(CompileError, match="page column 'page'"):
+        quail.DocumentProvider.from_pdf_pages(
+            listed, id_col="page_id", path_col="path", page_col="page")
+    with pytest.raises(CompileError, match="integer page numbers"):
+        quail.DocumentProvider.from_pdf_pages(
+            listed, id_col="page_id", path_col="path", page_col="label")
+    beyond = listed.set_column(2, "page_number", pa.array([2, 4, 1], pa.int32()))
+    with pytest.raises(CompileError, match="page 4 of .* has 3 pages"):
+        quail.DocumentProvider.from_pdf_pages(
+            beyond, id_col="page_id", path_col="path",
+            page_col="page_number").statistics()
+
+
 def test_missing_pdf_is_reported(tmp_path):
     provider = quail.DocumentProvider.from_pdfs(
         pa.table({"id": ["x"], "path": [str(tmp_path / "missing.pdf")]}),
