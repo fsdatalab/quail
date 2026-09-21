@@ -10,11 +10,9 @@ The demo uses 10,000 rows from [Jigsaw Civil Comments][dataset]. Each row
 contains a comment and crowd-sourced scores for toxicity, six toxicity
 subtypes, and 24 identity mentions.
 
-The dataset is labeled by human raters. If 50% or more of raters select a
-label, the demo treats the label as positive.
-
-The labels are subjective and noisy. You should not expect high agreement
-with every majority vote.
+The dataset is labeled by human raters. A label is positive when selected by
+at least 50% of raters. Subjective labels can be noisy, so model predictions
+may not match every majority vote.
 
 ## Query
 
