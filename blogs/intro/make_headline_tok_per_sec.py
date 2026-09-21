@@ -1,9 +1,12 @@
 """Build the QUAIL-B avg tokens/sec-by-dataset headline figure.
 
-Tok/sec uses one shared numerator per query for Quail, vLLM, and SoL:
-    sol[query].tokens / runtime_s
-SoL uses sol_s. That matches finishing the same estimated token work, and
-avoids per-method fresh_tokens (which differ with KV reuse, e.g. AGENT).
+Tok/sec follows Quail AGENTS.md / quail-b: requested input tokens per
+second. One shared numerator per query for Quail, vLLM, and SoL:
+    requested_tokens / runtime_s
+(SoL uses sol_s). Requested tokens are the full prompt lengths summed,
+counting shared prefixes every time whether or not KV was reused.
+quail-b exposes this as input_tokens / input_tokens_per_second.
+Do not use per-method fresh_tokens.
 
 SoL is drawn as a horizontal line over each dataset group (not a bar),
 matching the latency plot style in make_bio4_plots.py.
@@ -52,7 +55,10 @@ def collect_rows(workdir: Path):
     for query, quail in comparison["rows"]["quail"].items():
         vllm = comparison["rows"]["pipelined_vllm"][query]
         sol = comparison["sol"][query]
-        shared = float(sol["tokens"])
+        shared = float(
+            sol.get("requested_tokens")
+            or comparison["rows"]["quail"][query]["requested_tokens"]
+        )
         rows.append(
             {
                 "query": query,
@@ -89,7 +95,7 @@ def collect_rows(workdir: Path):
         vllm_q = _load(bio4_vllm_path)["queries"][0]
         sol_est = _load(bio4_sol_path)["estimate"]
         assert quail_q["id"] == "BIO-4" and vllm_q["id"] == "BIO-4"
-        shared = float(sol_est["tokens"])
+        shared = float(quail_q["metrics"]["input_tokens"])
         rows.append(
             {
                 "query": "BIO-4",
@@ -156,12 +162,14 @@ def plot_headline(rows, destination: Path):
         )
     for position, name in enumerate(datasets):
         sol = statistics.mean(by[name]["SoL"])
-        axis.hlines(
-            sol,
-            position - 0.42,
-            position + 0.42,
+        # Plain segment only — no center markers.
+        axis.plot(
+            [position - 0.42, position + 0.42],
+            [sol, sol],
             color=DARK,
-            linewidth=2.0,
+            linewidth=2.2,
+            solid_capstyle="butt",
+            marker="",
             zorder=3,
         )
 
@@ -175,13 +183,13 @@ def plot_headline(rows, destination: Path):
     axis.set_ylabel("Average tokens / second")
     axis.set_title(
         "QUAIL-B average tokens/sec by dataset\n"
-        "Qwen3 4B FP8 · one H100 · scale factor 0.1"
+        "Qwen3 4B FP8, one H100, scale factor 0.1"
     )
     axis.legend(
         handles=[
             Patch(facecolor=BLUE, label="Quail"),
             Patch(facecolor=ORANGE, label="vLLM"),
-            Line2D([0], [0], color=DARK, linewidth=2.0, label="SoL estimate"),
+            Line2D([0], [0], color=DARK, linewidth=2.2, marker="", label="SoL estimate"),
         ],
         frameon=False,
         loc="upper right",
