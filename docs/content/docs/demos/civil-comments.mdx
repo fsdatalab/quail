@@ -53,6 +53,12 @@ WHERE AI_FILTER(
 
 The query has no selectivity hints.
 
+## Comparison
+
+The demo includes [Jev][jev] as a comparison point. Jev evaluates typed
+questions against a shared state and returns structured probabilities. One
+request can evaluate all 31 questions for a comment.
+
 ## Execution
 
 Quail pushes the toxicity predicate below the join. Jev batches questions by
@@ -94,3 +100,4 @@ uv run python demos/civil_comments/jev_backend.py \
 ```
 
 [dataset]: https://huggingface.co/datasets/pietrolesci/civilcomments-wilds
+[jev]: https://docs.typesafe.ai
