@@ -277,7 +277,10 @@ row are idle bubbles.</em></p>
 in Section 4.3.</p>
 <p>The second problem is <em>KV regret</em>: the model processes tokens
 again after their reusable KV has been evicted. On BIO-4, the vLLM
-baseline recomputes 50.3 million KV tokens.</p>
+baseline recomputes 50.3 million KV tokens (out of 174.6 million fresh
+input tokens).</p>
+<p>We can, and we should, reduce both sources of waste by optimizing
+inference for AI-SQL.</p>
 <p>Quail addresses both problems together. Its query plan tells the
 execution engine which KV will be reused, and its larger planned batches
 avoid per-request scheduling on the critical path.</p>

@@ -103,11 +103,13 @@ BIO-4 turns its joins into separate requests for every candidate report and reac
 
 The corresponding Quail timeline appears with the BIO-4 experiments in Section 4.3.
 
-The second problem is *KV regret*: the model processes tokens again after their reusable KV has been evicted. On BIO-4, the vLLM baseline recomputes 50.3 million KV tokens.
+The second problem is *KV regret*: the model processes tokens again after their reusable KV has been evicted. On BIO-4, the vLLM baseline recomputes 50.3 million KV tokens (out of 174.6 million fresh input tokens).
 
 [^host-overhead]: Modal provides useful background on [GPU utilization](https://modal.com/blog/gpu-utilization-guide) and [host overhead](https://modal.com/blog/host-overhead-inference-efficiency) in inference engines.
 
 [^mfu]: The speed of light estimate assumes 100 percent model FLOP/s utilization (MFU), so every forward pass sustains peak GPU arithmetic throughput. Real systems cannot reach that rate, but higher MFU still helps. We do not yet measure Quail's MFU.
+
+We can, and we should, reduce both sources of waste by optimizing inference for AI-SQL.
 
 Quail addresses both problems together. Its query plan tells the execution engine which KV will be reused, and its larger planned batches avoid per-request scheduling on the critical path.
 
