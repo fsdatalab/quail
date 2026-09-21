@@ -2,16 +2,10 @@ r"""Rebuild the blog profile figures from saved summaries.
 
     W=/tmp/quail-blog-profiles
     Q=ablations/blog-profiles-20260907T211904Z/quail
-    B=ablations/vllm-join-profile-20260907T013304Z
     A=ablations/vllm-join-profile-20260907T214358Z
-    mkdir -p "$W/quail/BIO-3" "$W/quail/AGENT-1"
-    mkdir -p "$W/pipelined_vllm/BIO-3" "$W/pipelined_vllm/AGENT-1"
-    uv run modal volume get quail-results \
-      "$Q/BIO-3/analysis.json" "$W/quail/BIO-3/analysis.json"
+    mkdir -p "$W/quail/AGENT-1" "$W/pipelined_vllm/AGENT-1"
     uv run modal volume get quail-results \
       "$Q/AGENT-1/analysis.json" "$W/quail/AGENT-1/analysis.json"
-    uv run modal volume get quail-results \
-      "$B/blog-analysis.json" "$W/pipelined_vllm/BIO-3/analysis.json"
     uv run modal volume get quail-results \
       "$A/blog-analysis.json" "$W/pipelined_vllm/AGENT-1/analysis.json"
     uv run python blogs/intro/make_profile_plots.py "$W"
@@ -28,7 +22,7 @@ from matplotlib.collections import PolyCollection
 from matplotlib.patches import Patch
 
 HERE = Path(__file__).resolve().parent
-METHODS = (("quail", "Quail"), ("pipelined_vllm", "Pipelined vLLM"))
+METHODS = (("quail", "Quail"), ("pipelined_vllm", "vLLM baseline"))
 BLUE = "#4C72B0"
 GRAY = "#BDBDBD"
 GREEN = "#55A868"
@@ -129,13 +123,13 @@ def plot(query, profiles):
 
 
 def main(workdir):
-    """Build the BIO-3 and AGENT-1 profile comparisons."""
-    for query in ("BIO-3", "AGENT-1"):
-        profiles = [
-            json.loads((workdir / method / query / "analysis.json").read_text())
-            for method, _ in METHODS
-        ]
-        plot(query, profiles)
+    """Build the AGENT-1 profile comparison."""
+    query = "AGENT-1"
+    profiles = [
+        json.loads((workdir / method / query / "analysis.json").read_text())
+        for method, _ in METHODS
+    ]
+    plot(query, profiles)
 
 
 if __name__ == "__main__":

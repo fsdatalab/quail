@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 620" role="img" aria-labelledby="title desc">
-  <title id="title">BIO-3 physical plan and Quail execution engine</title>
-  <desc id="desc">The BIO-3 physical plan appears on the left. On the right, a CPU region contains document tokenization, the physical plan executor, AI filter and AI join execution, other physical operators, and the KV manager. The AI physical operators send model inputs to Quail's inference program on the GPU and receive scores. A GPU region also contains one model copy and one KV pool in HBM.</desc>
+  <title id="title">BIO-4 physical plan and Quail execution engine</title>
+  <desc id="desc">The BIO-4 physical plan appears on the left. It has three filters and two joins. On the right, a CPU region contains document tokenization, the physical plan executor, AI filter and AI join execution, other physical operators, and the KV manager. The AI physical operators send model inputs to Quail's inference program on the GPU and receive scores. A GPU region also contains one model copy and one KV pool in HBM.</desc>
 
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
@@ -27,30 +27,44 @@
   <rect class="frame" x="20" y="20" width="1560" height="570" rx="12"/>
   <line x1="600" y1="20" x2="600" y2="590" stroke="#d0d5dd" stroke-width="2"/>
 
-  <g aria-label="BIO-3 physical plan">
-    <text class="heading" x="355" y="70">BIO-3 Physical Plan</text>
+  <g aria-label="BIO-4 physical plan">
+    <text class="heading" x="305" y="65">BIO-4 Physical Plan</text>
 
-    <rect class="cpu" x="190" y="100" width="230" height="52" rx="9"/>
-    <text class="label" x="305" y="127">Project</text>
+    <rect class="cpu" x="205" y="82" width="200" height="44" rx="9"/>
+    <text class="label" x="305" y="105">Project</text>
 
-    <rect class="gpu" x="190" y="190" width="230" height="52" rx="9"/>
-    <text class="label" x="305" y="217">AiJoin</text>
+    <rect class="gpu" x="205" y="154" width="200" height="44" rx="9"/>
+    <text class="label" x="305" y="177">AiJoin: n</text>
 
-    <rect class="gpu" x="45" y="305" width="230" height="52" rx="9"/>
-    <text class="label" x="160" y="332">AiFilter</text>
+    <rect class="gpu" x="92" y="238" width="200" height="44" rx="9"/>
+    <text class="label" x="192" y="261">AiJoin: c</text>
 
-    <rect class="input" x="325" y="305" width="230" height="52" rx="9"/>
-    <text class="small" x="440" y="322">Scan</text>
-    <text class="small" x="440" y="342">reaction terms</text>
+    <rect class="gpu" x="318" y="238" width="200" height="44" rx="9"/>
+    <text class="small" x="418" y="261">AiFilter: neurological</text>
 
-    <rect class="input" x="45" y="420" width="230" height="52" rx="9"/>
-    <text class="small" x="160" y="437">Scan</text>
-    <text class="small" x="160" y="457">medical reports</text>
+    <rect class="gpu" x="18" y="338" width="180" height="44" rx="9"/>
+    <text class="small" x="108" y="361">AiFilter: serious</text>
 
-    <path class="edge" d="M 305 190 L 305 158"/>
-    <path class="edge" d="M 160 305 C 160 275, 240 275, 275 247"/>
-    <path class="edge" d="M 440 305 C 440 275, 370 275, 335 247"/>
-    <path class="edge" d="M 160 420 L 160 363"/>
+    <rect class="gpu" x="215" y="338" width="180" height="44" rx="9"/>
+    <text class="small" x="305" y="361">AiFilter: cardiovascular</text>
+
+    <rect class="input" x="18" y="438" width="180" height="44" rx="9"/>
+    <text class="small" x="108" y="461">Scan reports</text>
+
+    <rect class="input" x="215" y="438" width="180" height="44" rx="9"/>
+    <text class="small" x="305" y="461">Scan terms as c</text>
+
+    <rect class="input" x="412" y="338" width="180" height="44" rx="9"/>
+    <text class="small" x="502" y="361">Scan terms as n</text>
+
+    <path class="edge" d="M 305 154 L 305 132"/>
+    <path class="edge" d="M 192 238 C 192 215, 255 217, 280 204"/>
+    <path class="edge" d="M 418 238 C 418 215, 355 217, 330 204"/>
+    <path class="edge" d="M 108 338 C 108 310, 155 309, 175 288"/>
+    <path class="edge" d="M 305 338 C 305 310, 240 309, 210 288"/>
+    <path class="edge" d="M 108 438 L 108 388"/>
+    <path class="edge" d="M 305 438 L 305 388"/>
+    <path class="edge" d="M 502 338 L 455 288"/>
   </g>
 
   <g aria-label="Execution engine">

@@ -1,5 +1,4 @@
 PANDOC ?= pandoc
-PDFTOPPM ?= pdftoppm
 SOURCE := blogpost.md
 CSS := style.css
 HTML := blogpost.html
@@ -28,9 +27,6 @@ $(HTML): $(SOURCE) references.bib $(CSS) $(FIGURES)
 		--math-method=mathjax \
 		--citeproc \
 		--output=$(HTML)
-
-figures/quailb_throughput.png: figures/quailb_throughput.pdf
-	$(PDFTOPPM) -f 1 -singlefile -r 300 -png $< figures/quailb_throughput
 
 clean:
 	rm -f $(HTML)

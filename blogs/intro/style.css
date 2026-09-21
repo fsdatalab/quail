@@ -37,14 +37,9 @@ h6 {
 .tldr {
   margin: 0 0 3rem;
   padding: 1.2rem 1.4rem;
-  border: 1px solid #bfdbfe;
-  border-left: 4px solid #2563eb;
+  border: 1px solid #2563eb;
   border-radius: 0.75rem;
-  background: linear-gradient(135deg, #eff6ff 0%, #f8fafc 100%);
-  box-shadow: 0 8px 24px rgb(37 99 235 / 8%);
-  animation: tldr-breathe 5s ease-in-out infinite;
-  transform-origin: center;
-  will-change: transform, box-shadow;
+  background: #eff6ff;
 }
 
 .tldr p {
@@ -53,35 +48,6 @@ h6 {
 
 .tldr strong {
   color: #1d4ed8;
-}
-
-@keyframes tldr-breathe {
-  0%,
-  100% {
-    transform: translate3d(0, 0, 0) scale(1);
-    box-shadow: 0 8px 24px rgb(37 99 235 / 8%);
-  }
-
-  25% {
-    transform: translate3d(1px, -1px, 0) scale(1.003);
-    box-shadow: 0 10px 28px rgb(37 99 235 / 14%);
-  }
-
-  50% {
-    transform: translate3d(0, 1px, 0) scale(0.999);
-    box-shadow: 0 7px 22px rgb(37 99 235 / 9%);
-  }
-
-  75% {
-    transform: translate3d(-1px, -1px, 0) scale(1.002);
-    box-shadow: 0 9px 26px rgb(37 99 235 / 12%);
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .tldr {
-    animation: none;
-  }
 }
 
 h1 {

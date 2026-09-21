@@ -127,24 +127,26 @@ details</a></li>
 Experimental setup</a></li>
 <li><a href="#full-benchmark-results"
 id="toc-full-benchmark-results">4.2 Full benchmark results</a></li>
-<li><a href="#bio-3-where-quail-wins"
-id="toc-bio-3-where-quail-wins">4.3 BIO-3: Where Quail Wins</a></li>
-<li><a href="#agent-1-where-vllm-wins"
-id="toc-agent-1-where-vllm-wins">4.4 AGENT-1: Where vLLM wins</a></li>
+<li><a href="#bio-4-at-scale-factor-1.0"
+id="toc-bio-4-at-scale-factor-1.0">4.3 BIO-4 at scale factor
+1.0</a></li>
+<li><a href="#agent-1-where-the-vllm-baseline-wins"
+id="toc-agent-1-where-the-vllm-baseline-wins">4.4 AGENT-1, where the
+vLLM baseline wins</a></li>
 </ul></li>
 <li><a href="#what-comes-next" id="toc-what-comes-next">5. What comes
 next</a></li>
 </ul>
 </nav>
 <div class="tldr">
-<p><strong>TL;DR.</strong> Much of today’s AI-SQL work (i.e., AI
-functions in SQL databases) uses closed, frontier LLMs served through
-APIs. But open weight models now provide sufficient quality for many AI
-functions — and, in turn, unlock new optimizations that make query
-execution 10× faster. The database community should absolutely move more
-of these workloads to open weight models, and optimize inference
-together with query execution. Quail is a system we are building to
-jointly optimize query planning and inference.</p>
+<p><strong>TL;DR.</strong> Much of today’s AI-SQL work, meaning AI
+functions in SQL databases, uses closed frontier LLMs through APIs. This
+can be costly! But now that open weight models have improved, we should
+totally use them for more AI-SQL workloads and optimize inference with
+query execution. In this post, we introduce Quail, a system that jointly
+optimizes query planning and inference. On one of our benchmark queries
+(BIO-4), Quail runs the query <strong>14.04 times faster</strong> than a
+hand-tuned vLLM baseline.</p>
 </div>
 <h1 id="the-growth-of-ai-powered-data-processing">1. The growth of
 AI-powered data processing</h1>
@@ -162,34 +164,8 @@ AI Functions</a>. AI-SQL extends SQL with AI-powered operators, such as
 filters, joins, and classifiers.</p>
 <p>In an AI-powered operator, the user simply specifies what they want
 in natural language, and LLMs are used to evaluate that instruction over
-the relevant data. For example, imagine that a database user has one
-table of medical reports, and another table of possible adverse
-reactions.<a href="#fn1" class="footnote-ref" id="fnref1"
-role="doc-noteref"><sup>1</sup></a> The user wants to identify which
-reactions each report attributes to the patient, but only for reports
-that describe female patients. They might run the following AI-SQL
-query, which we call BIO-3 in <a
-href="https://github.com/fsdatalab/quail-bench">quail-bench</a>.<a
-href="#fn2" class="footnote-ref" id="fnref2"
-role="doc-noteref"><sup>2</sup></a></p>
-<div class="sourceCode" id="cb1"><pre
-class="sourceCode sql"><code class="sourceCode sql"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> r.<span class="kw">id</span>, m.<span class="kw">id</span></span>
-<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> reports <span class="kw">AS</span> r</span>
-<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="kw">JOIN</span> reaction_terms <span class="kw">AS</span> m</span>
-<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>  <span class="kw">ON</span> AI.<span class="cf">IF</span>(PROMPT(</span>
-<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>       <span class="st">&#39;Does the medical report in {0} describe the reaction in {1} as something the patient experienced?&#39;</span>,</span>
-<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>       r.report,</span>
-<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>       m.term</span>
-<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>     ))</span>
-<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> AI.<span class="cf">IF</span>(PROMPT(</span>
-<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>        <span class="st">&#39;Does {0} describe a case involving a female patient?&#39;</span>,</span>
-<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>        r.report</span>
-<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>      ));</span></code></pre></div>
-<p>At a high level, the database compiles the aforementioned query into
-a plan that invokes an LLM on <em>each row</em> for the filter, then
-makes another LLM call on <em>each pair of rows</em> in the join. Query
-execution can therefore be incredibly costly, because a filter over
-<span class="math inline">\(N\)</span> rows requires <span
+the relevant data. Query execution can be costly. A filter over <span
+class="math inline">\(N\)</span> rows requires <span
 class="math inline">\(N\)</span> LLM calls, while a naive join between
 tables <span class="math inline">\(A\)</span> and <span
 class="math inline">\(B\)</span>, with <span
@@ -210,87 +186,90 @@ thousands, or even millions, of LLM calls.</p>
 <h1 id="key-idea-lets-jointly-optimize-query-plans-and-inference">2. Key
 idea: let’s jointly optimize query plans and inference</h1>
 <p>A natural thought is to use a general-purpose inference engine such
-as vLLM to execute the query plan. But sending the plan’s hundreds of
-thousands of related model calls to vLLM as separate requests is far
-from optimal, as we’ll show. Let’s start with the “expert” plan for
-BIO-3 shown in Figure 1:</p>
+as vLLM to execute the query plan. However, sending millions of related
+model calls to vLLM as separate requests has a large cost. Consider the
+following query.</p>
+<p><em>Given a dataset of medical reports and a dataset of possible
+adverse reactions, find serious adverse event reports that mention both
+a cardiovascular reaction and a neurological reaction.</em><a
+href="#fn1" class="footnote-ref" id="fnref1"
+role="doc-noteref"><sup>1</sup></a><a href="#fn2" class="footnote-ref"
+id="fnref2" role="doc-noteref"><sup>2</sup></a></p>
+<p>We call this query BIO-4 in <a
+href="https://github.com/fsdatalab/quail-bench">QUAIL-B</a>, a benchmark
+we are building to evaluate AI-SQL query engines. At scale factor 1.0,
+its inputs contain 5,000 reports and 4,144 reaction terms, with the
+terms used through two aliases. The plan in Figure 1 works as
+follows:</p>
 <ol type="1">
-<li>We first run the report filter, so rejected reports never enter the
-join.</li>
-<li>We then join the reports that pass the filter with the reaction
-terms.</li>
+<li>It filters the reports for serious adverse events.</li>
+<li>It filters the two reaction term inputs for cardiovascular and
+neurological reactions.</li>
+<li>It joins the surviving reports with the cardiovascular terms, then
+with the neurological terms.</li>
 </ol>
 <div class="figure-block">
 <p><a href="figures/vllm-query-plan.svg"><img
 src="figures/vllm-query-plan.svg" style="width:100.0%"
-alt="The vLLM query plan for BIO-3." /></a></p>
-<p><em>Figure 1. The expert plan for BIO-3 runs the report filter before
-the join, and uses each surviving report as the join anchor.</em></p>
+alt="The BIO-4 query plan used by the vLLM baseline." /></a></p>
+<p><em>Figure 1. The BIO-4 plan filters all three inputs before the
+joins. Both joins use the medical report as the anchor.</em></p>
 </div>
-<p>To execute the plan with vLLM, we’d render one prompt for each report
-in the filter, and one prompt for each report and reaction pair in the
-join. We’d submit every prompt as a separate inference request. A simple
-rendering strategy is to place the document text at the beginning of
-each prompt, followed by the natural language instruction in the AI-SQL
-operator. For a filter, there is only one document. For a join, we need
-to choose which document comes first, which we call the <em>anchor</em>,
-and which document comes second, which we call the <em>partner</em>. For
-our query, we place the much longer medical report first, to maximize
-the number of prefix tokens whose key and value state, called KV, can be
-reused across join prompts.</p>
+<p>To execute the plan with vLLM, we render one prompt for each filter
+input and one prompt for each candidate report and reaction pair. We
+submit every prompt as a separate inference request. We place the
+document text at the beginning of each prompt, followed by the
+instruction from the AI-SQL operator. For each join, we place the much
+longer medical report first. We call the first document the
+<em>anchor</em> and the second document the <em>partner</em>. This order
+maximizes the number of prefix tokens whose key and value state, called
+KV, can be reused across join prompts.</p>
 <p><strong>A cost estimate for the query plan.</strong> Before measuring
-a vLLM baseline, we estimate the lowest possible runtime for the same
-plan. At a high level, we can count the model’s arithmetic work and HBM
-(GPU DRAM) traffic from the token lengths, then use a <a
+the vLLM baseline, we estimate the lowest possible runtime for the same
+plan. We count the model’s arithmetic work and HBM traffic from the
+token lengths, then use a <a
 href="https://modal.com/gpu-glossary/perf/roofline-model">roofline
-model</a> to estimate the time. The estimate assumes peak GPU
-throughput, full overlap between CPU and GPU work, and enough HBM to
-retain all reusable KV. No implementation can meet all three
-assumptions, so we use the estimate only as a lower bound. We call this
-lower bound the <em>speed of light estimate</em>. For BIO-3, the
-estimate is 43.09 seconds.<a href="#fn3" class="footnote-ref"
-id="fnref3" role="doc-noteref"><sup>3</sup></a> The <a
+model</a> to estimate the time. HBM is the GPU’s main memory. The
+estimate uses the saved reference answers to determine which rows
+survive each stage. It assumes peak GPU throughput, full overlap between
+CPU and GPU work, and unlimited space for retained KV. No implementation
+can meet all of these assumptions. We call this lower bound the
+<em>speed of light estimate</em>, or SoL. For BIO-4 at scale factor 1.0,
+the SoL estimate is 894.37 seconds, or 14.91 minutes.<a href="#fn3"
+class="footnote-ref" id="fnref3" role="doc-noteref"><sup>3</sup></a> The
+<a
 href="https://github.com/fsdatalab/quail-exploration/blob/0d24478a82100b518d6110f5c1c8cec0c26c6487/quail/planner/sol.py">implementation
 in Quail</a> contains the full calculation.</p>
-<p><strong>How vLLM should perform.</strong> BIO-3 has 311,552 requests
-ready to run, and each request produces one token constrained to
-<code>TRUE</code> or <code>FALSE</code>. Almost all of the model work is
-prefill. With a large enough batch, vLLM should keep the H100 busy, and
-the workload should be fully compute-bound.</p>
+<p><strong>How vLLM should perform.</strong> The vLLM baseline evaluates
+8,142,130 document pairs and 13,288 filter inputs. Each request produces
+one token constrained to <code>TRUE</code> or <code>FALSE</code>, so
+almost all model work is prefill. Prefill is the model work that reads
+the input prompt before producing an answer. With a large enough batch,
+vLLM should keep the H100 busy.</p>
 <p><strong>How vLLM actually performs.</strong> We run vLLM 0.26.0 with
-Qwen3 4B FP8 on one H100. With the default settings, BIO-3 takes 605.68
-seconds, far longer than the 43.09-second estimate! This is truly far
-from what we expected. We then tune two important parameters,
-<code>max_num_batched_tokens</code> and <code>max_num_seqs</code>, to
-give vLLM enough batch capacity to saturate the GPU. Even after tuning,
-the run takes 510.91 seconds, or 11.86 times the speed of light
-estimate!</p>
+Qwen3 4B FP8 on one H100. We tune <code>max_num_batched_tokens</code>
+and <code>max_num_seqs</code> to give vLLM enough batch capacity to use
+the GPU. The vLLM baseline takes 24,640.51 seconds, or 6.84 hours. That
+is 27.55 times the SoL estimate. The SoL estimate covers 8,849,019
+document pairs, compared with the 8,142,130 pairs evaluated by the vLLM
+baseline, so the difference does not come from the baseline evaluating
+more pairs.</p>
 <p>We find two sources of inefficiency:</p>
 <ul>
 <li><p><strong>KV regret.</strong> A fresh input token is an input token
 that the model processes in a forward pass instead of reusing its KV. KV
 regret counts fresh input tokens that repeat earlier work because
-reusable KV was evicted. vLLM’s KV manager does not know which reports
-pass the filter and will be needed by the join. It may retain KV for
-rejected reports while evicting surviving reports, so the join must
-compute those report prefixes again. On BIO-3, 14 percent of the tuned
-baseline’s fresh input tokens are KV regret.</p></li>
+reusable KV was evicted. The vLLM baseline computes 174.6 million fresh
+input tokens on BIO-4. Of those, 50.3 million are recomputed KV tokens.
+That is 28.82 percent of the fresh input tokens.</p></li>
 <li><p><strong>Host overhead.</strong> Host overhead is the CPU time
-spent preparing and scheduling model work while the GPU is idle. In the
-five-second window shown in Figure 2, the GPU is idle for 62 percent of
-the time! Why? BIO-3 submits each of its 311,052 join pairs as a
-separate request. More than 99 percent of the prompt tokens come from
-the prefix cache, so the GPU finishes each batch before the CPU can
-prepare the next one.<a href="#fn4" class="footnote-ref" id="fnref4"
+spent preparing and scheduling model work while the GPU is idle. The
+vLLM baseline submits more than 8 million pair prompts as separate
+requests. The CPU must process every request even when most of its
+document prefix comes from the prefix cache.<a href="#fn4"
+class="footnote-ref" id="fnref4"
 role="doc-noteref"><sup>4</sup></a></p></li>
 </ul>
-<div class="figure-block wide-figure">
-<p><a href="figures/bio3_join_window.pdf"><img
-src="figures/bio3_join_window.png" style="width:100.0%"
-alt="Five seconds of GPU activity and top-level CPU operations during the BIO-3 join with vLLM." /></a></p>
-<p><em>Figure 2. GPU and CPU activity during five seconds of the BIO-3
-join with vLLM.</em></p>
-</div>
 <p>We can, and we should, reduce both sources of waste by optimizing
 inference for AI-SQL.</p>
 <h1 id="introducing-quail">3. Introducing Quail</h1>
@@ -459,11 +438,11 @@ active.</li>
 DeepGEMM, FlashAttention 3, and fused Triton kernels, but we do not yet
 measure MFU or tune the core matrix multiplication and attention
 kernels. We defer a full MFU study to future work.</p>
-<p>As shown in Figure 3, Quail consists of a query frontend, a query
+<p>As shown in Figure 2, Quail consists of a query frontend, a query
 planner, and an execution engine. Through the frontend, the user
 provides Arrow tables or datasets, an AI-SQL or Python query, and the
-model and GPU(s) to use. The frontend creates a logical plan from the
-query. The query planner orders the filters and joins, chooses the
+model and GPU or GPUs to use. The frontend creates a logical plan from
+the query. The query planner orders the filters and joins, chooses the
 anchor for each join, and determines how many tokens each model forward
 pass should process. The planner then lowers the logical plan into a
 physical operator plan, which the execution engine runs.</p>
@@ -476,7 +455,7 @@ models, or support for other hardware.</p>
 <p><a href="figures/quail-architecture.svg?v=4"><img
 src="figures/quail-architecture.svg?v=4" style="width:100.0%"
 alt="Quail architecture." /></a></p>
-<p><em>Figure 3. Quail turns Arrow data and an AI-SQL query into a
+<p><em>Figure 2. Quail turns Arrow data and an AI-SQL query into a
 logical plan. The planner applies SQL rewrites, lowers the AI operations
 into physical operators, and plans operator pipelines for KV reuse. The
 execution engine runs the physical plan and executes its AI operations
@@ -553,12 +532,11 @@ AI physical operator also specifies its prompts, forward pass token
 budget, and KV settings.</p>
 <p>We then place physical operators into pipelines. Within a pipeline,
 Quail sends each output batch directly to the next operator instead of
-materializing the complete intermediate relation. For example, for
-BIO-3, Quail sends each batch of reports that passes
-<code>AiFilter</code> directly to <code>AiJoin</code>. Quail keeps the
-KV for those reports pinned until <code>AiJoin</code> has compared them
-with the reaction terms. You can find the physical operators that Quail
-currently supports in our <a
+materializing the complete intermediate relation. For BIO-4, Quail sends
+each batch of reports that passes its filter directly to the first join.
+It keeps the report KV available while both joins compare those reports
+with the filtered reaction terms. You can find the physical operators
+that Quail currently supports in our <a
 href="https://fsdatalab.github.io/quail/docs/architecture/physical-plans">physical
 plan documentation</a>.</p>
 <h3 id="execution-engine">3.2.3 Execution engine</h3>
@@ -574,12 +552,12 @@ releases KV pages according to the physical plan.</li>
 forward pass for each input batch. We describe the inference program in
 <a href="#inference-program">Section 3.2.4</a>.</li>
 </ol>
-<p>Figure 4 shows how these components work together.</p>
+<p>Figure 3 shows how these components work together.</p>
 <div class="figure-block wide-figure">
-<p><a href="figures/execution-engine.svg?v=9"><img
-src="figures/execution-engine.svg?v=9" style="width:100.0%"
-alt="The physical operator plan and execution path for BIO-3." /></a></p>
-<p><em>Figure 4. Quail lowers BIO-3 to the physical plan on the left. On
+<p><a href="figures/execution-engine.svg?v=10"><img
+src="figures/execution-engine.svg?v=10" style="width:100.0%"
+alt="The physical operator plan and execution path for BIO-4." /></a></p>
+<p><em>Figure 3. Quail lowers BIO-4 to the physical plan on the left. On
 the right, one CPU worker runs its physical operators and manages KV.
 Each AI physical operator invokes Quail’s inference program on the
 GPU.</em></p>
@@ -634,7 +612,7 @@ program. Quail receives <code>TRUE</code> and <code>FALSE</code> scores
 in return.</p>
 <p><strong>vLLM’s inference program.</strong> vLLM is a general-purpose
 inference library designed to support many model architectures and
-hardware backends. As Figure 5 shows, vLLM can combine several sources
+hardware backends. As Figure 4 shows, vLLM can combine several sources
 of GPU code in one forward pass. vLLM JIT-compiles ordinary PyTorch
 operations with <a
 href="https://docs.vllm.ai/en/stable/design/torch_compile/"><code>torch.compile</code></a>
@@ -646,7 +624,7 @@ pages.</p>
 <p><a href="figures/vllm-inference-program.svg"><img
 src="figures/vllm-inference-program.svg" style="width:100.0%"
 alt="How vLLM turns a PyTorch model into GPU work." /></a></p>
-<p><em>Figure 5. vLLM combines compiled PyTorch operations with
+<p><em>Figure 4. vLLM combines compiled PyTorch operations with
 specialized GPU kernels. vLLM chooses the kernels according to the
 model, data type, and hardware.</em></p>
 </div>
@@ -687,7 +665,7 @@ FP8.</p>
 <p><a href="figures/join-attention-step.svg"><img
 src="figures/join-attention-step.svg" style="width:100.0%"
 alt="One attention step for a join." /></a></p>
-<p><em>Figure 6. One attention step for a join. Quail first computes
+<p><em>Figure 5. One attention step for a join. Quail first computes
 causal attention within each partner suffix, then computes attention
 from the same suffix queries into the shared anchor KV. Quail uses the
 log-sum-exp values from both calls to recover the result of attention
@@ -706,21 +684,25 @@ matrix, Quail reduces computation and GPU memory use.</p>
 <h2 id="experimental-setup">4.1 Experimental setup</h2>
 <p><strong>QUAIL-B.</strong> We created <a
 href="https://github.com/fsdatalab/quail-bench">QUAIL-B</a>, a benchmark
-of 33 AI-SQL queries over IMDB reviews, medical reports, fact checking
-claims, legal documents, and traces from software agents. It includes
-single filters, sequences of filters, and queries with one or more
-joins. Each dataset comes in three sizes: 0.1, 0.5, and 1.0. We evaluate
-all 33 queries at size 0.1, then examine BIO-3 and AGENT-1 in
-detail.</p>
+with 31 default AI-SQL queries and two privacy queries. The default
+queries cover IMDB reviews, medical reports, fact checking claims, legal
+documents, and traces from software agents. They include single filters,
+sequences of filters, and queries with one or more joins. Each dataset
+comes in three sizes, with scale factors 0.1, 0.5, and 1.0.</p>
+<p>We compare current measurements for 29 default queries at scale
+factor 0.1. We do not include BIO-1 and BIO-3 because their saved runs
+used an older report filter. We examine BIO-4 at scale factor 1.0 and
+AGENT-1 in more detail.</p>
 <p><strong>Hardware.</strong> Every configuration uses Qwen3 4B FP8,
 with BF16 KV, on one H100. For each query, we run Quail and vLLM one
 after the other on the same physical GPU.</p>
-<p><strong>vLLM baseline.</strong> We compare Quail with vLLM 0.26.0,
-using the same logical query plan and prompt layout. For a sequence of
-filters, the baseline submits a document’s next filter as soon as the
-previous filter returns <code>TRUE</code>. For a join, we manually
-choose the better anchor direction, and submit one inference request for
-each document pair in anchor order. We configure vLLM as follows:</p>
+<p><strong>vLLM baseline.</strong> We compare Quail with stock vLLM
+0.26.0, using the same logical query plan and prompt layout. The vLLM
+baseline uses pipelining. For a sequence of filters, it submits a
+document’s next filter as soon as the previous filter returns
+<code>TRUE</code>. For a join, we choose the better anchor direction and
+submit one inference request for each document pair in anchor order. We
+configure vLLM as follows:</p>
 <ul>
 <li>We enable automatic prefix caching.</li>
 <li>We set <code>max_num_batched_tokens</code> to 25,305, and
@@ -729,9 +711,14 @@ each document pair in anchor order. We configure vLLM as follows:</p>
 <li>We capture one CUDA graph for batches of 8,192 tokens.</li>
 </ul>
 <p>We chose the parameters above by running the benchmark queries.
-Increasing the batch or memory limits caused GPU OOM errors. Our
-roofline model predicts that the selected token budget is well above the
-point where model computation becomes compute bound.</p>
+Increasing the batch or memory limits caused GPU out of memory errors.
+Our roofline model predicts that the selected token budget is well above
+the point where model computation becomes compute bound.</p>
+<p><strong>Scope.</strong> We measure query engine performance. We do
+not evaluate whether Qwen3 4B FP8 is the best model for each query.
+Quail and the vLLM baseline use the same model, prompts, and logical
+query plan. Our goal is to run that chosen model and plan as quickly as
+possible.</p>
 <p><strong>Metrics.</strong> We report five metrics for each query:</p>
 <ul>
 <li><strong>Query latency.</strong> We measure the time after model
@@ -759,97 +746,57 @@ are KV regret. KV regret is included in the fresh input token
 total.</li>
 </ul>
 <h2 id="full-benchmark-results">4.2 Full benchmark results</h2>
-<p>Across all 33 queries at size 0.1, Quail is faster than the pipelined
-vLLM baseline on 31. <strong>Quail’s mean speedup is 1.92×, its median
-speedup is 1.43×, and its largest speedup is 10.04× on
-BIO-2.</strong></p>
+<p>Across the 29 queries with matching measurements at scale factor 0.1,
+Quail is faster than the vLLM baseline on 27. The mean speedup is 1.91
+times, the median speedup is 1.48 times, and the largest speedup is
+10.04 times on BIO-2.<a href="#fn11" class="footnote-ref" id="fnref11"
+role="doc-noteref"><sup>11</sup></a></p>
 <div class="figure-block wide-figure">
-<p><a href="figures/quailb_throughput.pdf"><img
-src="figures/quailb_throughput.png" style="width:100.0%"
-alt="Full input token throughput for Quail, the vLLM baseline, and SoL estimates across all 33 QUAIL-B queries." /></a></p>
-<p><em>Figure 7. Full input tokens per second, including tokens served
-from KV. Bars show measured rates, and lines show SoL estimates. Each
-rate counts the prompts evaluated by that method. SoL uses
-reference-label survivors, so its rate is not an upper bound for runs
-evaluating different prompts. The measurements use the September 14
-query versions.</em></p>
+<p><a href="figures/quailb_latency.pdf"><img
+src="figures/quailb_latency.png" style="width:100.0%"
+alt="Query latency for Quail, the vLLM baseline, and SoL estimates across the 31 default QUAIL-B queries. BIO-1 and BIO-3 are marked as not measured." /></a></p>
+<p><em>Figure 6. Query latency at scale factor 0.1. Bars show measured
+query time, and horizontal lines show SoL estimates. The vertical axis
+uses a log scale because the query times span more than three orders of
+magnitude. An x marks BIO-1 and BIO-3, which do not have measurements
+for their current definitions.</em></p>
 </div>
-<p>Quail’s total runtime across the 33 queries is 1,549.92 seconds,
-compared with 443.51 seconds for the combined speed of light estimates.
-<strong>Quail is 3.49× the estimate in aggregate, and the median query
-is 2.59× the estimate.</strong> The ratio ranges from 1.84× on BIO-3 to
-53.03× on LEP-5!</p>
-<p>Quail has less KV regret on 27 queries and ties on FEV-1. Quail has
-slightly more KV regret on BIO-1, LEP-1, and IMDB-1, where the
-difference is at most 288 tokens. The two large exceptions are AGENT-1
-and AGENT-2. For each, Quail has 11.86 million more KV regret tokens
-because it does not yet reuse matching prefixes across different rows.
-Section 4.4 examines AGENT-1 in detail.</p>
-<h2 id="bio-3-where-quail-wins">4.3 BIO-3: Where Quail Wins</h2>
-<p>BIO-3 is the motivating query in this post. It filters 500 medical
-reports for female patients, then joins the surviving reports with 1,127
-possible reaction terms.</p>
-<div class="metrics-table">
-<table>
-<colgroup>
-<col style="width: 27%" />
-<col style="width: 36%" />
-<col style="width: 36%" />
-</colgroup>
-<thead>
-<tr>
-<th>Metric</th>
-<th style="text-align: right;">Quail</th>
-<th style="text-align: right;">vLLM baseline</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>Query latency, seconds</td>
-<td style="text-align: right;">79.34</td>
-<td style="text-align: right;">639.70</td>
-</tr>
-<tr>
-<td>GPU cost per query</td>
-<td style="text-align: right;">$0.08704</td>
-<td style="text-align: right;">$0.70175</td>
-</tr>
-<tr>
-<td>Fresh input tokens</td>
-<td style="text-align: right;">6,627,939</td>
-<td style="text-align: right;">7,875,694</td>
-</tr>
-<tr>
-<td>KV regret tokens</td>
-<td style="text-align: right;">2,751</td>
-<td style="text-align: right;">1,217,146</td>
-</tr>
-<tr>
-<td>Latency relative to the speed of light estimate, 43.09 seconds</td>
-<td style="text-align: right;">1.84×</td>
-<td style="text-align: right;">14.85×</td>
-</tr>
-</tbody>
-</table>
-</div>
-<p>Quail runs BIO-3 in 79.34 seconds, which is 8.06 times faster than
-the vLLM baseline. Quail also reduces KV regret from 1.22 million tokens
-to 2,751.</p>
-<p>As Figure 8 shows, vLLM finishes each model batch quickly, because
-most document KV is already cached. However, the CPU cannot process the
-individual requests fast enough to keep the GPU busy. Quail sends large
-token batches directly through the model, so it does not pay vLLM’s
-request processing cost for every document pair.</p>
+<p>The 29 Quail runs take 1,484.25 seconds in total, compared with
+3,149.83 seconds for the vLLM baseline. That is a 2.12 times aggregate
+speedup. The combined SoL estimate for the same queries is 449.43
+seconds. Quail takes 3.30 times the estimate in aggregate, compared with
+7.01 times for the vLLM baseline.</p>
+<p>The main exceptions are AGENT-1 and AGENT-2. Quail does not yet reuse
+matching prefixes across different rows, so it recomputes 11.89 million
+KV tokens on each query. Section 4.4 examines AGENT-1.</p>
+<h2 id="bio-4-at-scale-factor-1.0">4.3 BIO-4 at scale factor 1.0</h2>
+<p>BIO-4 is the motivating query in this post. At scale factor 1.0, it
+filters 5,000 medical reports and two aliases of 4,144 reaction terms.
+It then runs two joins over the surviving inputs.</p>
 <div class="figure-block wide-figure">
-<p><a href="figures/bio3_profile_comparison.pdf"><img
-src="figures/bio3_profile_comparison.png" style="width:100.0%"
-alt="Five seconds of GPU activity and top-level CPU operations during the BIO-3 join with Quail and pipelined vLLM." /></a></p>
-<p><em>Figure 8. In these five-second windows, GPU operations cover
-4.997 seconds with Quail and 1.892 seconds with vLLM. The lower row
-shows only top-level CPU operations. Both runs use an H100 and the same
-Qwen3 4B FP8 model.</em></p>
+<p><a href="figures/bio4_results.pdf"><img
+src="figures/bio4_results.png" style="width:100.0%"
+alt="BIO-4 results at scale factor 1.0. Quail takes 29.26 minutes and costs $1.93. The vLLM baseline takes 6.84 hours and costs $27.03. The SoL estimate is 14.91 minutes and $0.98." /></a></p>
+<p><em>Figure 7. BIO-4 results at scale factor 1.0. Query time and GPU
+cost exclude model startup. Fresh input tokens count every token
+processed by a model forward pass. Recomputed KV tokens are included in
+the fresh input token total.</em></p>
 </div>
-<h2 id="agent-1-where-vllm-wins">4.4 AGENT-1: Where vLLM wins</h2>
+<p>Quail takes 29.26 minutes, compared with 6.84 hours for the vLLM
+baseline. Quail is 14.04 times faster. It is 1.96 times the SoL
+estimate, while the vLLM baseline is 27.55 times the estimate.<a
+href="#fn12" class="footnote-ref" id="fnref12"
+role="doc-noteref"><sup>12</sup></a></p>
+<p>The GPU cost follows the same ratio because each run uses one H100.
+Quail costs $1.93 per query, compared with $27.03 for the vLLM baseline.
+The SoL cost estimate is $0.98 per query.</p>
+<p>Quail also recomputes less KV. It recomputes 18.0 million tokens,
+compared with 50.3 million for the vLLM baseline. The two engines can
+make slightly different predicate decisions, which changes how many
+document pairs reach later joins. Each number above reports the work and
+time from that method’s measured run.</p>
+<h2 id="agent-1-where-the-vllm-baseline-wins">4.4 AGENT-1, where the
+vLLM baseline wins</h2>
 <p>AGENT-1 contains 1,772 cumulative snapshots from software agent runs.
 Each snapshot contains the complete trace up to one point in the run, so
 later snapshots from the same run begin with the full contents of
@@ -940,23 +887,23 @@ class="sourceCode sql"><code class="sourceCode sql"><span id="cb7-1"><a href="#c
 </tbody>
 </table>
 </div>
-<p>vLLM runs AGENT-1 in 98.45 seconds, which is 2.42 times faster than
-Quail.</p>
+<p>The vLLM baseline runs AGENT-1 in 98.45 seconds, which is 2.42 times
+faster than Quail.</p>
 <div class="figure-block wide-figure">
 <p><a href="figures/agent1_profile_comparison.pdf"><img
 src="figures/agent1_profile_comparison.png" style="width:100.0%"
-alt="Five seconds of GPU activity and top-level CPU operations during the AGENT-1 filter with Quail and pipelined vLLM." /></a></p>
-<p><em>Figure 9. AGENT-1 has one filter and no join. GPU operations
-cover 4.998 seconds with Quail and 4.988 seconds with vLLM in these
-five-second windows. The lower row shows only top-level CPU operations.
-Both keep the GPU busy, but vLLM computes far fewer fresh tokens by
-reusing prefixes across snapshots.</em></p>
+alt="Five seconds of GPU activity and top-level CPU operations during the AGENT-1 filter with Quail and the vLLM baseline." /></a></p>
+<p><em>Figure 8. AGENT-1 has one filter and no join. GPU operations
+cover 4.998 seconds with Quail and 4.988 seconds with the vLLM baseline
+in these five-second windows. The lower row shows only top-level CPU
+operations. Both keep the GPU busy, but the vLLM baseline computes far
+fewer fresh tokens by reusing prefixes across snapshots.</em></p>
 </div>
-<p>vLLM wins because its automatic prefix caching feature can reuse KV
-across different rows when their token prefixes match. Quail currently
-reuses KV only when the same document appears again in the query. As a
-result, Quail incurs 11.89 million KV regret tokens, while the vLLM
-baseline incurs only 23,928.</p>
+<p>The vLLM baseline wins because its automatic prefix caching feature
+can reuse KV across different rows when their token prefixes match.
+Quail currently reuses KV only when the same document appears again in
+the query. As a result, Quail incurs 11.89 million KV regret tokens,
+while the vLLM baseline incurs only 23,928.</p>
 <p>We plan to add automatic prefix caching to Quail, but the lookup must
 remain cheap at the request volumes that AI-SQL queries can produce.</p>
 <h1 id="what-comes-next">5. What comes next</h1>
@@ -1019,13 +966,41 @@ postdoc, please reach out.</p>
 role="doc-endnotes">
 <hr />
 <ol>
-<li id="fn1"><p>The example is based on the <a
+<li id="fn1"><p>The query is based on the <a
 href="https://aclanthology.org/2023.findings-emnlp.896/">BioDEX
 dataset</a>.<a href="#fnref1" class="footnote-back"
 role="doc-backlink">↩︎</a></p></li>
-<li id="fn2"><p>We are building quail-bench to evaluate AI-SQL query
-engines.<a href="#fnref2" class="footnote-back"
-role="doc-backlink">↩︎</a></p></li>
+<li id="fn2"><p>The SQL form of BIO-4 is shown below.</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode sql"><code class="sourceCode sql"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> r.<span class="kw">id</span>,</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>       n.<span class="kw">id</span> <span class="kw">AS</span> neurological_reaction_id,</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>       c.<span class="kw">id</span> <span class="kw">AS</span> cardiovascular_reaction_id</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> reports <span class="kw">AS</span> r</span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="kw">JOIN</span> reaction_terms <span class="kw">AS</span> n</span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>  <span class="kw">ON</span> AI.<span class="cf">IF</span>(PROMPT(</span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>       <span class="st">&#39;Does the medical report in {0} describe the reaction in {1} as something the patient experienced?&#39;</span>,</span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>       r.report,</span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>       n.term</span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>     ))</span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a><span class="kw">JOIN</span> reaction_terms <span class="kw">AS</span> c</span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>  <span class="kw">ON</span> AI.<span class="cf">IF</span>(PROMPT(</span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>       <span class="st">&#39;Does the medical report in {0} describe the reaction in {1} as something the patient experienced?&#39;</span>,</span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>       r.report,</span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>       c.term</span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a>     ))</span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> AI.<span class="cf">IF</span>(PROMPT(</span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a>        <span class="st">&#39;Does {0} describe a serious or life-threatening adverse event?&#39;</span>,</span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a>        r.report</span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a>      ))</span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> AI.<span class="cf">IF</span>(PROMPT(</span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a>        <span class="st">&#39;Is this reaction neurological, affecting the nervous system? {0}&#39;</span>,</span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a>        n.term</span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a>      ))</span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> AI.<span class="cf">IF</span>(PROMPT(</span>
+<span id="cb1-26"><a href="#cb1-26" aria-hidden="true" tabindex="-1"></a>        <span class="st">&#39;Is this reaction cardiovascular, affecting the heart or blood vessels? {0}&#39;</span>,</span>
+<span id="cb1-27"><a href="#cb1-27" aria-hidden="true" tabindex="-1"></a>        c.term</span>
+<span id="cb1-28"><a href="#cb1-28" aria-hidden="true" tabindex="-1"></a>      ));</span></code></pre></div>
+<a href="#fnref2" class="footnote-back" role="doc-backlink">↩︎</a></li>
 <li id="fn3"><p><em>Model FLOP/s utilization (MFU)</em> is the fraction
 of the GPU’s peak arithmetic throughput used during a model forward
 pass. The speed of light estimate assumes 100 percent MFU. That is not
@@ -1073,6 +1048,19 @@ role="doc-backlink">↩︎</a></p></li>
 Qwen, Quail accepts eight token IDs: four for <code>TRUE</code> and four
 for <code>FALSE</code>.<a href="#fnref10" class="footnote-back"
 role="doc-backlink">↩︎</a></p></li>
+<li id="fn11"><p>The base measurements are saved at
+<code>/results/benchmarks/quailb/20260914T070913Z-f7beefb6</code>. The
+BIO-4 scale factor 0.1 measurements are saved at
+<code>/results/benchmarks/quailb/family-runs/20260920T062701Z-bio4-4b</code>.
+The SoL estimates are saved at
+<code>/results/reports/quailb-raw-2026-09-19/sol_quailb_sf0.1.json</code>
+and <code>/results/sol/2026-09-20-bio4-qwen3-4b-sf0.1.json</code>.<a
+href="#fnref11" class="footnote-back" role="doc-backlink">↩︎</a></p></li>
+<li id="fn12"><p>The BIO-4 scale factor 1.0 measurements are saved at
+<code>/results/benchmarks/quailb/family-runs/20260920T064415Z-bio4-4b-sf1.0</code>.
+The SoL estimate is saved at
+<code>/results/sol/2026-09-20-bio4-qwen3-4b-sf1.0.json</code>.<a
+href="#fnref12" class="footnote-back" role="doc-backlink">↩︎</a></p></li>
 </ol>
 </section>
 </body>
