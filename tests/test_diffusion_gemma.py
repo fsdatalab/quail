@@ -155,12 +155,12 @@ class _ImageSource:
     """An image source that records the chain's calls."""
 
     def __init__(self):
-        self.opened = 0
+        self.opened = []
         self.taken = []
         self.closed = False
 
-    def open(self):
-        self.opened += 1
+    def open(self, chunk_tokens=None):
+        self.opened.append(chunk_tokens)
 
     def take(self, doc):
         self.taken.append(doc)
@@ -189,7 +189,8 @@ def test_filter_stream_hands_images_to_fresh_documents_only(monkeypatch):
         fake_torch(), cpu_arena(64), pipeline, answers, docs, questions, 200,
         arena_writes=True, arena_keys=[("d", d) for d in range(3)],
         images=source)
-    assert source.opened == 1 and stream.image_metrics == {}
+    # the source learns the chunk budget, to size its lookahead
+    assert source.opened == [200] and stream.image_metrics == {}
     loop.run_stream(stream)
     # every document was rendered once, for its fresh pass
     assert sorted(source.taken) == [0, 1, 2]
