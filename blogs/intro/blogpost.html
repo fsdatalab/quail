@@ -243,19 +243,17 @@ href="https://github.com/fsdatalab/quail-exploration/blob/0d24478a82100b518d6110
 in Quail</a> contains the full calculation.</p>
 <p><strong>How we hoped vLLM would perform.</strong> Each request
 produces one token constrained to <code>TRUE</code> or
-<code>FALSE</code>, so almost all model work is prefill. BIO-4 provides
-millions of requests, so there should always be a large batch ready for
-the H100.</p>
+<code>FALSE</code>, so almost all model work is prefill. BIO-4 compiles
+to millions of requests, so there should always be a large batch ready
+for the H100. With a large enough batch, vLLM should keep the H100
+busy.</p>
 <p><strong>How vLLM actually performs.</strong> We run vLLM 0.26.0 with
 Qwen3 4B FP8 on one H100. We give it enough batch capacity to use the
-GPU. The query takes 6.84 hours, or 27.55 times the SoL estimate. The
-baseline evaluates fewer pairs than the estimate, not more. Extra model
-work alone does not explain the gap.</p>
-<p>Look at a few seconds of GPU activity during a join and the story is
-hard to miss. With the vLLM baseline, the green GPU-active band is full
-of holes. The GPU starts a batch, finishes it, then sits idle while the
-host prepares the next wave of requests. Those idle gaps are the
-bubbles.</p>
+GPU. The query takes 6.84 hours, or 27.55 times the SoL estimate!</p>
+<p>During a join, the GPU-active row in Figure 3 shows long white gaps
+between short green bursts. After each batch finishes, the GPU sits idle
+while the host prepares the next wave of requests. Those idle gaps are
+the bubbles.</p>
 <p>BIO-4 turns its joins into separate requests for every candidate
 report and reaction pair. Each request must be scheduled, admitted into
 a batch, and tracked, even when most of its document prefix comes from

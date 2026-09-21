@@ -87,11 +87,11 @@ To execute the plan with vLLM, we render one prompt for each filter input and on
 
 **A cost estimate for the query plan.** Before measuring the vLLM baseline, we estimate the lowest possible runtime for the same plan. We count the model's arithmetic work and HBM traffic from the token lengths, then use a [roofline model](https://modal.com/gpu-glossary/perf/roofline-model) to estimate the time. The estimate uses the saved reference answers to determine which rows survive each stage. It assumes peak GPU throughput, full overlap between CPU and GPU work, and unlimited space for retained KV. No implementation can meet all of these assumptions, so this optimistic lower bound is our *speed of light estimate*, or SoL. For BIO-4 at scale factor 1.0, the SoL estimate is 894.37 seconds, or 14.91 minutes.[^mfu] The [implementation in Quail](https://github.com/fsdatalab/quail-exploration/blob/0d24478a82100b518d6110f5c1c8cec0c26c6487/quail/planner/sol.py) contains the full calculation.
 
-**How we hoped vLLM would perform.** Each request produces one token constrained to `TRUE` or `FALSE`, so almost all model work is prefill. BIO-4 provides millions of requests, so there should always be a large batch ready for the H100.
+**How we hoped vLLM would perform.** Each request produces one token constrained to `TRUE` or `FALSE`, so almost all model work is prefill. BIO-4 compiles to millions of requests, so there should always be a large batch ready for the H100. With a large enough batch, vLLM should keep the H100 busy.
 
-**How vLLM actually performs.** We run vLLM 0.26.0 with Qwen3 4B FP8 on one H100. We give it enough batch capacity to use the GPU. The query takes 6.84 hours, or 27.55 times the SoL estimate. The baseline evaluates fewer pairs than the estimate, not more. Extra model work alone does not explain the gap.
+**How vLLM actually performs.** We run vLLM 0.26.0 with Qwen3 4B FP8 on one H100. We give it enough batch capacity to use the GPU. The query takes 6.84 hours, or 27.55 times the SoL estimate!
 
-Look at a few seconds of GPU activity during a join and the story is hard to miss. With the vLLM baseline, the green GPU-active band is full of holes. The GPU starts a batch, finishes it, then sits idle while the host prepares the next wave of requests. Those idle gaps are the bubbles.
+During a join, the GPU-active row in Figure 3 shows long white gaps between short green bursts. After each batch finishes, the GPU sits idle while the host prepares the next wave of requests. Those idle gaps are the bubbles.
 
 BIO-4 turns its joins into separate requests for every candidate report and reaction pair. Each request must be scheduled, admitted into a batch, and tracked, even when most of its document prefix comes from the prefix cache. While the CPU does that bookkeeping, the H100 often has nothing ready to run. That host overhead appears as white space in Figure 3.[^host-overhead]
 
