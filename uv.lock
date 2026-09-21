@@ -2603,7 +2603,7 @@ wheels = [
 [[package]]
 name = "quail-b"
 version = "0.7.0"
-source = { git = "https://github.com/fsdatalab/quail-bench.git?rev=35d026dc2f5b5c1e787268173e81e512b749081a#35d026dc2f5b5c1e787268173e81e512b749081a" }
+source = { git = "https://github.com/fsdatalab/quail.git?rev=e9c67f3b9226767048d24357a4616b08cc7ae6e1#e9c67f3b9226767048d24357a4616b08cc7ae6e1" }
 dependencies = [
     { name = "datasets" },
     { name = "duckdb" },
@@ -2613,6 +2613,7 @@ dependencies = [
     { name = "pandas" },
     { name = "protobuf" },
     { name = "pyarrow" },
+    { name = "pypdfium2" },
     { name = "substrait-protobuf" },
     { name = "transformers" },
 ]
@@ -2669,7 +2670,7 @@ dev = [
     { name = "modal", extras = ["api-proxy-support"], specifier = "==1.5.4" },
     { name = "pandas", specifier = "==3.0.5" },
     { name = "pytest", specifier = "==9.1.1" },
-    { name = "quail-b", git = "https://github.com/fsdatalab/quail-bench.git?rev=35d026dc2f5b5c1e787268173e81e512b749081a" },
+    { name = "quail-b", git = "https://github.com/fsdatalab/quail.git?rev=e9c67f3b9226767048d24357a4616b08cc7ae6e1" },
     { name = "ruff", specifier = "==0.12.9" },
     { name = "vulture", specifier = "==2.16" },
 ]
