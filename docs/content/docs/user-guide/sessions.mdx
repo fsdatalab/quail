@@ -71,13 +71,19 @@ session.
 
 Pass `endpoint` to run queries on a deployed
 [Quail Server](/docs/user-guide/server) instead of in this process.
-`register`, `sql`, `run`, and `collect` work the same; `submit()`
-returns a handle you can come back to later.
+`register`, `sql`, `run`, and `collect` work the same. `submit()`
+returns a handle you can come back to later, from this process or
+another one.
 
 ```python
 with quail.Session(config=config, endpoint="http://gpu-host:8642") as session:
     ...
 ```
+
+Two things change. The server plans the query, so `explain()` and
+`plan()` are not available before it runs; read the chosen plan on
+the handle instead. The Python builder API (`session.docs`) is not
+available either, so write the query in SQL.
 
 ## Multiple GPUs
 

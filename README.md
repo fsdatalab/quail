@@ -55,13 +55,14 @@ with quail.Session(config=config) as session:
 
 ## Quail Server
 
-To submit long queries, close the client, and fetch the result later,
-run the optional Quail Server on the GPU host and give `Session` its
-address. The query code stays the same.
+Quail Server is optional. Run it on the GPU host when you want to
+submit a long query, close the client, and fetch the result later.
+Give `Session` the server's address; the query code stays the same.
 
 ```bash
 pip install "quail-engine[server]"
-quail-server --data-dir /var/lib/quail --model qwen3-4b-fp8 --device h100-sxm
+quail-server --data-dir /var/lib/quail --model qwen3-4b-fp8 \
+  --device h100-sxm --host 0.0.0.0
 ```
 
 ```python
