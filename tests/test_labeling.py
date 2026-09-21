@@ -270,8 +270,19 @@ def _write_corpus(root, sf, rows):
 
 
 def _corpus_rows(reviews, reports, terms, claims, evidence, contexts,
-                 passages):
+                 passages, contracts=()):
+    """Corpus rows; `contracts` lists each contract's clause categories."""
     return {
+        "contracts": [
+            {"id": f"ct{i}", "title": f"contract {i}", "page_count": 2,
+             "pdf_sha256": "0" * 64, "document": f"files/ct{i}.pdf",
+             "clauses": list(clauses)}
+            for i, clauses in enumerate(contracts)],
+        "contract_pages": [
+            {"id": f"ct{i}p1", "contract_id": f"ct{i}", "page_number": 1,
+             "pdf_sha256": "0" * 64, "document": f"files/ct{i}.pdf#page=1",
+             "clauses": list(clauses)}
+            for i, clauses in enumerate(contracts)],
         "reviews": [{"id": f"rv{i}", "body": body}
                     for i, body in enumerate(reviews)],
         "aspects": [{"id": "as0", "aspect": "the plot"}],
@@ -311,6 +322,7 @@ def test_derive_collection_copies_labels_by_content(monkeypatch, tmp_path):
         _spec("quailb.biodex.report.experienced_reaction"),
         _spec("quailb.fever.passage.supports_claim"),
         _spec("quailb.lepard.excerpt.cites_passage"),
+        _spec("quailb.cuad.contract.non_compete"),
     )
     monkeypatch.setattr(labeling, "PREDICATES", specs)
 
@@ -323,7 +335,8 @@ def test_derive_collection_copies_labels_by_content(monkeypatch, tmp_path):
                 ("second claim", "SUPPORTS", "page1")],
         evidence=[("page0", "yes page"), ("page1", "no")],
         contexts=[("context one", ["p1", "p2"]), ("context two", ["p3"])],
-        passages=[("passage a", ["p2"]), ("passage b", ["p1"])])
+        passages=[("passage a", ["p2"]), ("passage b", ["p1"])],
+        contracts=[("Exclusivity",), ("Non-Compete", "Exclusivity")])
     _, source_corpus, _ = _write_corpus(tmp_path, 1.0, source_rows)
     source_id = source_corpus["corpus_id"]
     identities = {
@@ -346,6 +359,9 @@ def test_derive_collection_copies_labels_by_content(monkeypatch, tmp_path):
         specs[3], source_rows["citation_contexts"],
         source_rows["citation_passages"], identities[specs[3].key],
         source_id)
+    labeling._write_filter_parts(
+        labeling.AnnotationLabeler(), None, source_rows["contracts"],
+        [specs[4]], identities, source_id, labeling.filter_batch_rows(specs[4]))
     for spec in specs:
         labeling._complete_manifest(spec, identities[spec.key], source_rows)
     collection_dir = tmp_path / "collections" / "gt_source"
@@ -357,7 +373,8 @@ def test_derive_collection_copies_labels_by_content(monkeypatch, tmp_path):
                        for key, identity in identities.items()}}))
 
     # the small corpus: a prefix of the documents, terms renumbered,
-    # and the context no longer cites p2 because that pair was not sampled
+    # the context no longer cites p2 because that pair was not sampled,
+    # and the one sampled contract is the source's second, renumbered ct0
     target_rows = _corpus_rows(
         reviews=["yes good", "bad"],
         reports=["yes report"],
@@ -365,7 +382,8 @@ def test_derive_collection_copies_labels_by_content(monkeypatch, tmp_path):
         claims=[("yes claim", "REFUTES", "page0")],
         evidence=[("page0", "yes page")],
         contexts=[("context one", ["p1"])],
-        passages=[("passage a", ["p2"]), ("passage b", ["p1"])])
+        passages=[("passage a", ["p2"]), ("passage b", ["p1"])],
+        contracts=[("Non-Compete", "Exclusivity")])
     monkeypatch.setattr(
         labeling, "_materialize_corpus",
         lambda sf: _write_corpus(tmp_path, sf, target_rows))
@@ -374,12 +392,13 @@ def test_derive_collection_copies_labels_by_content(monkeypatch, tmp_path):
 
     assert summary["cell"] == "quailb_ground_truth_collection_derived"
     assert summary["source_collection_id"] == "gt_source"
-    assert summary["total_labels"] == 2 + 2 + 1 + 2
+    assert summary["total_labels"] == 2 + 2 + 1 + 2 + 1
     assert summary["qwen_judgments"] == 2 + 2
     sets = summary["label_sets"]
     assert sets[specs[1].key]["copied_from"] == identities[
         specs[1].key]["label_set_id"]
     assert "recomputed_from" in sets[specs[3].key]
+    assert "recomputed_from" in sets[specs[4].key]
 
     def answers(spec):
         label_dir = labeling._label_dir_by_id(
@@ -399,11 +418,48 @@ def test_derive_collection_copies_labels_by_content(monkeypatch, tmp_path):
     assert answers(specs[3]) == {
         ("lc0", "lp0"): (False, "lepard_citation_edge"),
         ("lc0", "lp1"): (True, "lepard_citation_edge")}
+    assert answers(specs[4]) == {("ct0", None): (True, "cuad_annotation")}
     active = json.loads((tmp_path / "corpora"
                          / summary["corpus_id"]
                          / f"active_collection.{labeling.PROMPT_FORMAT}.json"
                          ).read_text())
     assert active["collection_id"] == summary["collection_id"]
+
+
+def test_cuad_workload_is_labeled_from_the_annotation_without_a_gpu(
+        monkeypatch, tmp_path):
+    import pyarrow.parquet as pq
+
+    from quail_b.predicates import workload_specs
+
+    monkeypatch.setattr(labeling, "ROOT", tmp_path)
+    assert labeling.annotation_workloads() == ("cuad",)
+    rows = _corpus_rows(
+        reviews=["a"], reports=["r"], terms=["t"],
+        claims=[("c", "SUPPORTS", "page0")], evidence=[("page0", "e")],
+        contexts=[("x", ["p1"])], passages=[("y", ["p1"])],
+        contracts=[("Exclusivity",), ("Non-Compete", "Exclusivity"), ()])
+    _, corpus, _ = _write_corpus(tmp_path, 0.1, rows)
+
+    partial = labeling.label_annotated_workload(corpus["corpus_id"], "cuad")
+
+    specs = workload_specs("cuad")
+    assert set(partial["manifests"]) == {spec.key for spec in specs}
+    assert partial["model_wall_s"] == 0.0
+    assert partial["deterministic_rerun"]["compared"] == 0
+    non_compete = partial["manifests"]["quailb.cuad.contract.non_compete"]
+    assert non_compete["status"] == "complete"
+    assert (non_compete["rows"], non_compete["true_rows"]) == (3, 1)
+    assert non_compete["source_rows"] == {"cuad_annotation": 3}
+    labels = pq.read_table(non_compete["compact_path"]).to_pylist()
+    assert [(row["left_id"], row["answer"]) for row in labels] == [
+        ("ct0", False), ("ct1", True), ("ct2", False)]
+    caps = partial["manifests"]["quailb.cuad.page.caps_liability"]
+    assert (caps["rows"], caps["true_rows"]) == (3, 0)
+    with pytest.raises(ValueError, match="labeled from its annotation"):
+        labeling.judge_workload(corpus["corpus_id"], "cuad")
+    with pytest.raises(ValueError, match="needs a model judge"):
+        labeling.label_annotated_workload(corpus["corpus_id"], "imdb")
 
 
 def test_activate_collection_preserves_raw_prompt_pointer(monkeypatch, tmp_path):
@@ -455,6 +511,8 @@ def test_publish_uploads_only_what_a_reader_needs(monkeypatch, tmp_path):
     (corpus_dir / "manifest.json").write_text("{}")
     (corpus_dir / "reviews.parquet").write_bytes(b"rows")
     (corpus_dir / "active_collection.json").write_text("{}")
+    (corpus_dir / "files").mkdir()
+    (corpus_dir / "files" / "ct0.pdf").write_bytes(b"%PDF")
     label_dir = tmp_path / "label_sets" / spec.workload / spec.slug / "ls_x"
     (label_dir / "parts").mkdir(parents=True)
     (label_dir / "manifest.json").write_text("{}")
@@ -471,9 +529,10 @@ def test_publish_uploads_only_what_a_reader_needs(monkeypatch, tmp_path):
 
     result = labeling.publish(tmp_path, ["gt_x"], client=client)
 
-    assert result["uploaded"] == 6 and result["skipped"] == 1
+    assert result["uploaded"] == 7 and result["skipped"] == 1
     assert not any("/parts/" in key for key in client.uploads)
     assert f"{GROUND_TRUTH_ROOT}/corpora/c_x/reviews.parquet" in client.uploads
+    assert f"{GROUND_TRUTH_ROOT}/corpora/c_x/files/ct0.pdf" in client.uploads
     assert (f"{GROUND_TRUTH_ROOT}/corpora/c_x/active_collection.json"
             in client.uploads)
 
