@@ -87,13 +87,13 @@ To execute the plan with vLLM, we render one prompt for each filter input and on
 
 The first problem is visible in a GPU timeline. vLLM submits each pair as a separate request. The CPU still has to prepare and schedule every request, even when the GPU can reuse most of its document prefix. The GPU finishes these small batches quickly. If the CPU has not prepared the next batch, the GPU waits. These waits appear as idle gaps, or *bubbles*, between blocks of GPU work. This CPU scheduling time is what we mean by *host overhead*.[^host-overhead]
 
-We are still preparing the BIO-4 version of this timeline. Figure 2 shows the same pattern in an earlier BIO-3 join. Quail keeps GPU work nearly continuous. The vLLM baseline leaves visible gaps while its CPU processes the individual requests.
+Figure 2 is still a BIO-3 stand-in. The BIO-4 capture failed during a model import, and we are retrying it. In this five-second window, Quail keeps the GPU active nearly 100 percent of the time. vLLM keeps it active about 38 percent of the time, with many idle gaps while its CPU processes the individual requests.
 
-<!-- TODO: Replace this BIO-3 profile with BIO-4-specific art when it lands. -->
+<!-- TODO: Replace this BIO-3 stand-in after the BIO-4 capture succeeds. -->
 ::: {.figure-block .wide-figure}
 [![Five seconds of GPU activity and CPU operations during a BIO-3 join with Quail and the vLLM baseline.](figures/bio3_profile_comparison.png){width=100%}](figures/bio3_profile_comparison.pdf)
 
-*Figure 2. Five seconds of an earlier BIO-3 join. Quail keeps the GPU busy, while the vLLM baseline has visible idle bubbles between batches. The CPU operations below the timeline show the request processing and scheduling work.*
+*Figure 2. Five seconds of a BIO-3 join used as a stand-in for BIO-4. Quail is active for nearly 100 percent of the window, compared with about 38 percent for vLLM. The vLLM timeline has many idle gaps between batches.*
 :::
 
 The second problem is repeated model work. A fresh input token is an input token that the model processes in a forward pass instead of reading its KV. When reusable KV is evicted and later computed again, we call those repeated tokens *KV regret*. On BIO-4, the vLLM baseline recomputes 50.3 million KV tokens.
