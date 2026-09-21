@@ -1,24 +1,28 @@
 ---
 title: Civil Comments
-description: Compare Quail and Jev on a semantic filter and join.
+description: Run a semantic filter and join over public comments.
 ---
 
-This demo compares Quail and Jev on a sample of 10,000 public comments from
-[Jigsaw Civil Comments][dataset].
+This demo shows how you can run a semantic filter and join over public
+comments.
 
-Human annotators rated each comment for toxicity, six toxicity subtypes, and
-24 identity mentions; each score is the fraction of annotators who selected
-that label; this demo calls a label positive at 50% or higher.
+The task is to find comments that are likely to be toxic, then identify which
+of 30 semantic labels apply to each toxic comment.
 
-The labels are subjective and noisy; perfect accuracy is impossible, and
-strong agreement is hard; the query is still interesting, it combines a
-semantic filter with a semantic join, and it shows the effect of planning,
-KV reuse, and API cost.
+The comments come from [Jigsaw Civil Comments][dataset]. Human raters scored
+each comment for toxicity, six toxicity subtypes, and 24 identity mentions.
+Each score records the fraction of raters who selected that label. We treat a
+score of 50% or higher as positive.
+
+The labels are subjective and noisy. You should not expect high agreement
+with every label. The query is still useful for showing how planning and KV
+reuse affect query time and cost.
 
 ## Query
 
-Select comments judged toxic; for each selected comment, return every
-applicable semantic field.
+The query is: given 10,000 comments and a table of 30 semantic labels, find
+the comments judged toxic, then return every label that applies to each
+result.
 
 The 30 fields comprise:
 
