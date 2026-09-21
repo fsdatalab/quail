@@ -16,23 +16,29 @@ may not match every majority vote.
 
 ## Query
 
-The query is: given a `comments` table and a `fields` table, return each
-`(comment_id, field)` pair where the comment is toxic and the field applies
-to the comment.
+The `comments(comment_id, text)` table contains one comment per row. The
+`fields(field, statement)` table contains one classification criterion per
+row. The query returns a `(comment_id, field)` pair when the comment is toxic
+and matches the field criterion.
 
-The 30 fields comprise:
+| Fields | A match means |
+|---|---|
+| `severe_toxicity` | The comment is extremely hateful, aggressive, or disrespectful. |
+| `obscene` | The comment contains profanity. |
+| `threat` | The author expresses a wish or intent to cause pain, injury, or violence. |
+| `insult` | The comment directly insults a person or group. |
+| `identity_attack` | The comment attacks a person or group based on an identity. |
+| `sexual_explicit` | The comment describes sexual acts or body parts in a sexual or lewd way. |
+| `male`, `female`, `transgender`, `other_gender` | The comment mentions the named gender identity. |
+| `heterosexual`, `homosexual_gay_or_lesbian`, `bisexual`, `other_sexual_orientation` | The comment mentions the named sexual orientation. |
+| `christian`, `jewish`, `muslim`, `hindu`, `buddhist`, `atheist`, `other_religion` | The comment mentions the named religion or belief. |
+| `black`, `white`, `asian`, `latino`, `other_race_or_ethnicity` | The comment mentions the named race or ethnicity. |
+| `physical_disability`, `intellectual_or_learning_disability`, `psychiatric_or_mental_illness`, `other_disability` | The comment mentions the named disability category. |
 
-- Six toxicity subtypes: severe toxicity, obscene, threat, insult, identity
-  attack, and sexual explicit.
-- Four gender identities.
-- Four sexual orientations.
-- Seven religions.
-- Five races or ethnicities.
-- Four disability categories.
-
-Each field has a definition, one TRUE example, and one FALSE example.
-Historical `rejected` moderation metadata is excluded because moderation
-status is not a semantic property of the text.
+Each `statement` contains the field definition, one positive example, and one
+negative example. For example, the `threat` statement distinguishes “I will
+find you and break your legs” from a news report that says someone was
+attacked.
 
 ```sql
 SELECT
@@ -58,20 +64,20 @@ request can evaluate all 31 questions for a comment.
 
 ## Execution
 
-Quail checks toxicity before joining a comment with the 30 fields. The
-optimization is called predicate pushdown: a filter runs before a more
-expensive operation. For example, Quail skips all 30 field checks when a
-comment does not pass the toxicity filter.
+Quail evaluates the `WHERE` condition before the `JOIN`. A comment that fails
+the toxicity condition never joins with the 30 rows in `fields`.
 
-The Jev runner supports two strategies. The combined strategy sends all 31
-questions for every comment in one request. The toxicity-first strategy sends
-one toxicity question for every comment, then sends the 30 field questions
-only for comments classified as toxic. For example, 3,016 of the 10,000
-comments passed the toxicity check, so only 3,016 comments needed field
-questions.
+Jev does not execute the SQL plan. The demo compares two request schedules:
 
-Jev batches questions by comment. The Jev runner never sends one request for
-each comment-field pair.
+- **Combined:** send one request per comment with the toxicity question and
+  all 30 field questions.
+- **Toxicity first:** send the toxicity question first. Send the 30 field
+  questions only when the toxicity answer is positive.
+
+For the toxicity-first run, Jev sent 10,000 requests with one question. The
+toxicity check passed for 3,016 comments, so Jev then sent 3,016 requests with
+30 questions. The second schedule performs the same early filtering as
+Quail's `WHERE`-before-`JOIN` plan.
 
 | Jev strategy | Request contents | Requests | Questions per request |
 |---|---|---:|---:|
