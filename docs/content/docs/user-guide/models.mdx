@@ -136,9 +136,9 @@ def run_query():
         result = session.sql("""
             SELECT r.id
             FROM reviews r
-            WHERE AI_FILTER(
+            WHERE AI.IF(
                 PROMPT('Does this review praise the acting? {0}', r.body))
-        """).run()
+        """, dialect="bq").run()
         return result.collect(), result.report
 ```
 

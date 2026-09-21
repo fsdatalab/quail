@@ -153,6 +153,8 @@ class Query:
             FilterPredicate(ModelCall(bound), selectivity=selectivity))
         return self
 
+    ai_if = ai_filter
+
     def join(self, other: "Query", on=None) -> "Query":
         """Join one table on ordinary column equalities.
 

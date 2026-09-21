@@ -463,6 +463,8 @@ class BoundBuilder:
         self._inner.ai_filter(p, selectivity=selectivity)
         return self
 
+    ai_if = ai_filter
+
     def join(self, other, on=None):
         inner = other._inner if isinstance(other, BoundBuilder) else other
         self._inner.join(inner, on=on)

@@ -45,8 +45,8 @@ def build_sql() -> str:
     SELECT c.comment_id, f.field
     FROM comments c
     JOIN fields f
-      ON AI_FILTER(PROMPT('{JOIN_PROMPT}', c.text, f.statement))
-    WHERE AI_FILTER(PROMPT('{FILTER_PROMPT}', c.text))
+      ON AI.IF(PROMPT('{JOIN_PROMPT}', c.text, f.statement))
+    WHERE AI.IF(PROMPT('{FILTER_PROMPT}', c.text))
 """
 
 
@@ -105,7 +105,7 @@ def evaluate(directory: Path, limit: int | None, gpus: int) -> dict:
             "fields",
             quail.DocumentProvider.from_table(fields_table(), id_col="field"),
         )
-        query = session.sql(sql)
+        query = session.sql(sql, dialect="bq")
         explanation = query.explain()
         print(explanation, flush=True)
         (directory / "plan.txt").write_text(explanation)

@@ -25,8 +25,8 @@ SELECT c.id, e.id
 FROM claims c
 JOIN evidence e
   ON c.evidence_wiki_url = e.id
- AND AI_FILTER(PROMPT('{SUPPORT}', c.claim, e.text))
-WHERE AI_FILTER(PROMPT('{PERSON}', c.claim))
+ AND AI.IF(PROMPT('{SUPPORT}', c.claim, e.text))
+WHERE AI.IF(PROMPT('{PERSON}', c.claim))
 """
 
 
@@ -71,7 +71,7 @@ def main():
         register_demo_data(session)
 
         print("=== SQL ===" + SQL)
-        query = session.sql(SQL)
+        query = session.sql(SQL, dialect="bq")
         print("=== query.explain() ===")
         print(query.explain())
         plan = query.plan()
@@ -101,11 +101,11 @@ def main():
 
         print("\n=== the builder form: a Python function pairs the rows ===")
         paired = (session.docs("claims").alias("c")
-                  .ai_filter(prompt(PERSON, col("c.claim")))
+                  .ai_if(prompt(PERSON, col("c.claim")))
                   .join(session.docs("evidence").alias("e"))
                   .apply(same_page, columns=[col("c.evidence_wiki_url"),
                                              col("e.id")])
-                  .ai_filter(prompt(SUPPORT, col("c.claim"), col("e.text")))
+                  .ai_if(prompt(SUPPORT, col("c.claim"), col("e.text")))
                   .select("c.id", "e.id"))
         print(paired.explain())
         print("node ids:", [node.node_id for node in paired.plan().nodes])

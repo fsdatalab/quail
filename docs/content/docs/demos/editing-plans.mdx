@@ -45,12 +45,12 @@ SUPPORT = (
 
 query = (
     session.docs("claims").alias("c")
-    .ai_filter(prompt(PERSON, col("c.claim")))
+    .ai_if(prompt(PERSON, col("c.claim")))
     .join(
         session.docs("evidence").alias("e"),
         on=col("c.evidence_wiki_url") == col("e.id"),
     )
-    .ai_filter(prompt(SUPPORT, col("c.claim"), col("e.text")))
+    .ai_if(prompt(SUPPORT, col("c.claim"), col("e.text")))
     .select("c.id", "e.id")
 )
 ```
@@ -173,11 +173,11 @@ def match_by_url(tables):
 
 query = (
     session.docs("claims").alias("c")
-    .ai_filter(prompt(PERSON, col("c.claim")))
+    .ai_if(prompt(PERSON, col("c.claim")))
     .join(session.docs("evidence").alias("e"))
     .apply(match_by_url, columns=[col("c.evidence_wiki_url"),
                                   col("e.id")])
-    .ai_filter(prompt(SUPPORT, col("c.claim"), col("e.text")))
+    .ai_if(prompt(SUPPORT, col("c.claim"), col("e.text")))
     .select("c.id", "e.id")
 )
 ```

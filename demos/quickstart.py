@@ -20,7 +20,7 @@ FILTER_PROMPT = (
 FILTER_SQL = f"""
     SELECT r.id
     FROM reviews r
-    WHERE AI_FILTER(PROMPT('{FILTER_PROMPT}', r.body))
+    WHERE AI.IF(PROMPT('{FILTER_PROMPT}', r.body))
 """
 
 
@@ -55,7 +55,7 @@ def run_query():
     with quail.Session(config) as session:
         session.register("reviews", quail.DocumentProvider.from_table(
             reviews, id_col="id"))
-        query = session.sql(FILTER_SQL)
+        query = session.sql(FILTER_SQL, dialect="bq")
         print(f"positive-aspect filter ({reviews.num_rows} reviews)")
         result = query.run()
         return result.collect(), result.report

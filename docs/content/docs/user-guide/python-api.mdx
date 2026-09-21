@@ -14,7 +14,7 @@ from quail import col, prompt
 ```python
 query = (
     session.docs("reviews").alias("r")
-    .ai_filter(prompt('Is this review positive?\n\n{0}', col("r.body")))
+    .ai_if(prompt('Is this review positive?\n\n{0}', col("r.body")))
     .ai_join(
         session.docs("aspects").alias("a"),
         prompt('Does the review discuss this aspect?\n\n{0}\n\n{1}',
@@ -26,9 +26,9 @@ result = query.collect()
 
 ## Operators
 
-### ai_filter
+### ai_if
 
-`ai_filter(prompt, selectivity=None)`
+`ai_if(prompt, selectivity=None)`
 
 Filter rows with an AI predicate. The model evaluates the prompt on
 each row and keeps those that return TRUE.
@@ -36,7 +36,7 @@ each row and keeps those that return TRUE.
 ```python
 query = (
     session.docs("reviews").alias("r")
-    .ai_filter(
+    .ai_if(
         prompt('Is this review positive?\n\n{0}', col("r.body")),
         selectivity=0.6)
     .select("r.id")
@@ -46,7 +46,7 @@ result = query.collect()
 
 `selectivity` is optional; a predicate without one is planned as if
 20% of its rows pass. If you want to apply several predicates, add
-multiple `ai_filter` calls. Quail reorders them by estimated cost to
+multiple `ai_if` calls. Quail reorders them by estimated cost to
 reduce total work. Pass `order="as_written"` to `select()` to keep
 the written order.
 
@@ -79,7 +79,7 @@ keep outer rows that match at least one inner row, or
 `join(other, on=None)`
 
 Add relational predicates to restrict which pairs the model sees.
-Follow `join()` with `ai_filter()` over both tables:
+Follow `join()` with `ai_if()` over both tables:
 
 ```python
 query = (
@@ -87,7 +87,7 @@ query = (
     .join(
         session.docs("evidence").alias("e"),
         on=col("c.wiki_url") == col("e.id"))
-    .ai_filter(
+    .ai_if(
         prompt('Does the passage support the claim?\n\n{0}\n\n{1}',
                col("c.claim"), col("e.text")))
     .select("c.id", "e.id")
@@ -104,7 +104,7 @@ Return at most `n` rows.
 ```python
 query = (
     session.docs("reviews").alias("r")
-    .ai_filter(prompt('Is this review positive?\n\n{0}', col("r.body")))
+    .ai_if(prompt('Is this review positive?\n\n{0}', col("r.body")))
     .limit(100)
     .select("r.id", "r.body")
 )
@@ -173,7 +173,7 @@ query = (
     .join(session.docs("evidence").alias("e"))
     .apply(match_by_url,
            columns=[col("c.evidence_wiki_url"), col("e.id")])
-    .ai_filter(
+    .ai_if(
         prompt('Does the passage support the claim?\n\n{0}\n\n{1}',
                col("c.claim"), col("e.text")))
     .select("c.id", "e.id")
@@ -212,7 +212,7 @@ def deduplicate(tables):
 query = (
     session.docs("reviews").alias("r")
     .apply_table(deduplicate, columns=[col("r.body")])
-    .ai_filter(prompt('Is this review positive?\n\n{0}', col("r.body")))
+    .ai_if(prompt('Is this review positive?\n\n{0}', col("r.body")))
     .select("r.id")
 )
 result = query.collect()

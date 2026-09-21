@@ -46,10 +46,10 @@ SELECT
     f.field
 FROM comments AS c
 JOIN fields AS f
-  ON AI_FILTER(
+  ON AI.IF(
       PROMPT(:FIELD_PROMPT, c.text, f.statement)
   )
-WHERE AI_FILTER(
+WHERE AI.IF(
     PROMPT(:TOXICITY_PROMPT, c.text)
 );
 ```

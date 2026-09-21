@@ -90,11 +90,11 @@ def run_queries() -> None:
         filter_sql = f"""
             SELECT r.id
             FROM reviews r
-            WHERE AI_FILTER(PROMPT('{FILTER_PROMPT}', r.body))
+            WHERE AI.IF(PROMPT('{FILTER_PROMPT}', r.body))
         """
         section("filter sql")
         print(filter_sql)
-        query = session.sql(filter_sql)
+        query = session.sql(filter_sql, dialect="bq")
         section("filter explain")
         print(query.explain())
         section("filter run")
@@ -111,16 +111,16 @@ def run_queries() -> None:
             SELECT r.id, a.aspect
             FROM reviews r
             JOIN aspects a
-              ON AI_FILTER(PROMPT('{DISCUSS_ASPECT}', r.body, a.aspect),
-                           {{'selectivity': 0.15}})
-            WHERE AI_FILTER(
+              ON AI.IF(PROMPT('{DISCUSS_ASPECT}', r.body, a.aspect),
+                       {{'selectivity': 0.15}})
+            WHERE AI.IF(
               PROMPT('{FILTER_PROMPT}', r.body),
               {{'selectivity': 0.6}}
             )
         """
         section("join sql")
         print(join_sql)
-        join = session.sql(join_sql)
+        join = session.sql(join_sql, dialect="bq")
         section("join explain")
         print(join.explain())
         section("join run")

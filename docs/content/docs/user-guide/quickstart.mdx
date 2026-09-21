@@ -36,16 +36,16 @@ with quail.Session(config=config) as session:
     result = session.sql("""
         SELECT r.id
         FROM reviews r
-        WHERE AI_FILTER(PROMPT(
+        WHERE AI.IF(PROMPT(
             'Does this review mention a positive aspect of the movie?\n\n{0}',
             r.body))
-    """, dialect="snowflake").run()
+    """, dialect="bq").run()
     table = result.collect()
     print(table)
 ```
 
 `session.register()` makes the dataset available under a SQL name.
-`AI_FILTER` evaluates the prompt on each review. The model returns
+`AI.IF` evaluates the prompt on each review. The model returns
 TRUE or FALSE, and Quail returns the rows where the answer is TRUE.
 
 The output is a PyArrow table with the matching rows:
@@ -68,10 +68,10 @@ with quail.Session(config=config) as session:
     query = session.sql("""
         SELECT r.id
         FROM reviews r
-        WHERE AI_FILTER(PROMPT(
+        WHERE AI.IF(PROMPT(
             'Does this review mention a positive aspect of the movie?\n\n{0}',
             r.body))
-    """, dialect="snowflake")
+    """, dialect="bq")
     print(query.explain(analyze=True))
 ```
 
@@ -108,7 +108,7 @@ with quail.Session(config=config) as session:
         reviews, id_col="id",
     ))
     result = (session.docs("reviews").alias("r")
-              .ai_filter(prompt(
+              .ai_if(prompt(
                   'Does this review mention a positive aspect of the movie?\n\n{0}',
                   col("r.body")))
               .select("r.id")

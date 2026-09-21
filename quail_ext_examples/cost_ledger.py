@@ -21,7 +21,7 @@ registered:
         "reviews.parquet", id_col="id"))
     result = session.sql(
         "SELECT r.id FROM reviews r "
-        "WHERE AI_FILTER(PROMPT('Is this review positive? {0}', r.body))"
+        "WHERE AI.IF(PROMPT('Is this review positive? {0}', r.body))"
     ).run()
     ledger = cost_ledger.charge(result)
     print(ledger["totals"]["usd"], ledger["totals"]["fresh_tokens"])

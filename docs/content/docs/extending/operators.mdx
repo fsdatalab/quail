@@ -2,7 +2,7 @@
 title: Custom operators
 ---
 
-Quail currently supports one AI operator: `AI_FILTER` / `AI.IF`,
+Quail currently supports one AI operator: `AI.IF` (Snowflake: `AI_FILTER`),
 which returns TRUE or FALSE. Adding a new operator requires changes
 at three levels: a logical node, a physical node, and planning
 logic.
@@ -83,7 +83,7 @@ Quail backend how to plan and cost the new node. Concretely:
    Pass `window=model.sliding_window` to `scan`, `ask`, or `stream`
    so you also count pairs and KV reads for sliding-window layers.
    For `AI.CLASSIFY`, the prefill work per document is the same as
-   `AI_FILTER`. The difference is decode: generating each label
+   `AI.IF`. The difference is decode: generating each label
    token is an additional forward pass that attends to all previous
    tokens. See
    [`quail/cost/work.py`](https://github.com/fsdatalab/quail/blob/main/quail/cost/work.py).
@@ -103,7 +103,7 @@ Quail backend how to plan and cost the new node. Concretely:
 
 **Logical rules** rewrite the logical plan before physical planning.
 For example, a rule could rewrite `AI.CLASSIFY` with exactly two
-categories into an `AI_FILTER`, since two categories is equivalent
+categories into an `AI.IF`, since two categories is equivalent
 to TRUE/FALSE.
 
 **Physical rules** rewrite the physical graph after the planner
