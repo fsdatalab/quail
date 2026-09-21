@@ -287,3 +287,21 @@ class EngineConfig:
     # sum the CUDA event pair each forward chunk records into gpu_s;
     # off by default so a run never pays for a measurement it does not read
     gpu_timing: bool = False
+    # soft tokens per PDF page image; None takes the model's default
+    # budget, and a text-only model refuses any value
+    image_tokens: int | None = None
+
+
+@dataclass(frozen=True)
+class PdfDocuments:
+    """What the planner knows about one alias bound to PDF pages.
+
+    The alias's per-row lengths in ``doc_tokens`` are the planned
+    prompt prefix of each row (soft tokens plus frame tokens of its
+    pages); this adds what a text alias has no need for.
+    """
+
+    row_mode: str
+    n_pages: int
+    visual_tokens: int
+    pages_per_row_max: int

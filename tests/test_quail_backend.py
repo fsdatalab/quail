@@ -5,6 +5,8 @@ from types import SimpleNamespace
 import pyarrow as pa
 import pytest
 from fakes import (
+    FRAME,
+    QUESTION,
     expected_filter_rows,
     fake_torch,
     keep_even,
@@ -22,10 +24,11 @@ from quail.physical import (
     AiFilter,
     AiJoin,
     FilterStage,
+    HashJoin,
     JoinStage,
     PhysicalGraph,
     PortRef,
-    Scan,
+    TextScan,
 )
 from quail.physical.base import input_ports
 from quail.specs import DEVICES, MODELS
@@ -128,10 +131,10 @@ def test_fixed_join_executes_without_optimizer(monkeypatch):
         raise AssertionError("execution called the join optimizer")
 
     monkeypatch.setattr("quail.planner.joins.search_joins", unexpected_search)
-    scan_r = Scan(
+    scan_r = TextScan(
         node_id="input:r", alias="r", input_id="r"
     )
-    scan_p = Scan(
+    scan_p = TextScan(
         node_id="input:p", alias="p", input_id="p"
     )
     join = AiJoin(
@@ -230,7 +233,7 @@ def attach_plan(payload, graph):
 
 
 def test_filter_execution_and_retention_inputs(monkeypatch):
-    scan = Scan(
+    scan = TextScan(
         node_id="input:d", alias="d", input_id="d"
     )
     filtered = AiFilter(
@@ -287,11 +290,18 @@ def test_filter_execution_and_retention_inputs(monkeypatch):
     with monkeypatch.context() as patch:
         received = {}
 
-        def fake_run_filter(*args, retain_survivors, **kwargs):
-            received["retain_survivors"] = retain_survivors
-            return {0: [True]}, [], 3
+        class FakeStream:
+            def __init__(self, *args, retain_survivors, images=None, **kwargs):
+                received["retain_survivors"] = retain_survivors
+                received["images"] = images
+                self.answers, self.spans, self.tokens = {0: [True]}, [], 3
+                self.image_metrics = {"pages_rendered": 1}
 
-        patch.setattr("quail.backends.quail.executor.loop.run_filter", fake_run_filter)
+        patch.setattr("quail.backends.quail.executor.loop.FilterStream",
+                      FakeStream)
+        patch.setattr("quail.backends.quail.executor.loop.run_stream",
+                      lambda stream: (stream.answers, stream.spans,
+                                      stream.tokens))
         execution = QuailModelExecution(SimpleNamespace())
         execution.bind_loaded_model(
             model=object(), arena=FakeArena(), pipeline=SimpleNamespace()
@@ -313,11 +323,58 @@ def test_filter_execution_and_retention_inputs(monkeypatch):
                 "documents": [[1]],
                 "document_ids": [10],
                 "retain_survivors": False,
+                "images": "the image source",
             },
         )
 
         assert received["retain_survivors"] == ()
+        assert received["images"] == "the image source"
         assert result.outputs["ids:d"] == [10]
+        assert result.metrics.extension == {"images": {"pages_rendered": 1}}
+
+
+def test_join_execution_hands_the_anchor_pages_to_run_join(monkeypatch):
+    received = {}
+
+    def fake_run_join(torch, arena, pipeline, async_ans, prefixes, suffixes,
+                      budget, **kwargs):
+        received.update(kwargs)
+        return [{0: [True]}], [], 5
+
+    class Images:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+        def metrics(self):
+            return {"pages_rendered": 2}
+
+    monkeypatch.setattr("quail.backends.quail.executor.loop.run_join",
+                        fake_run_join)
+    execution = QuailModelExecution(SimpleNamespace())
+    execution.bind_loaded_model(
+        model=object(), arena=FakeArena(), pipeline=SimpleNamespace())
+    execution.bind_query(
+        torch=fake_torch(), async_answers=object(), answer_rows=object(),
+        chunk_tokens=8192)
+    stage = JoinStage(
+        written_pos=0, exec_idx=0, anchor="p", partners=("q",),
+        semantics="full", selectivity=0.5, expected_tuples=1,
+        anchor_frame_tokens=0, pair_tail_tokens=1, anchor_resident="none",
+        tuple_tokens=0, frame_token_ids=(), label_token_ids=(("q", (10,)),),
+        tail_token_ids=(11,))
+    node = AiJoin(node_id="join", anchor="p", stages=(stage,))
+    images = Images()
+    result = execution.execute(node, {
+        "prefixes": [[1, 2]], "stage_suffixes": [[[3]]], "stage_frames": [[]],
+        "anchor_keys": [("p", 7)], "anchor_done": None, "anchor_ids": [7],
+        "partner_indices": {0: [[0]]}, "anchor_partners": None,
+        "group": [stage.runtime_spec()], "images": images,
+    })
+    assert received["images"] is images and images.closed
+    assert result.outputs["ids:p"] == [7]
+    assert result.metrics.extension["images"] == {"pages_rendered": 2}
 
 
 # ------------------------------------------------ streamed edges on a page arena
@@ -399,6 +456,72 @@ def test_pair_join_runs_through_the_quail_graph(monkeypatch):
                 if any(join_truth[("r", d)][i] for i in allowed[d])]
         root = result["_outputs"][PortRef("group:0", "ids:r")]
         assert sorted(root.column("r").to_pylist()) == kept
+
+
+def _partner_filter_graph():
+    """P's filter, materialized, into a join anchored on the unfiltered r.
+
+    The pairs come from a HashJoin on the key columns, so an r whose
+    partners the filter removed reaches the join with none.
+    """
+    nodes = [
+        TextScan(node_id="input:r", alias="r", input_id="r"),
+        TextScan(node_id="input:p", alias="p", input_id="p"),
+        AiFilter(
+            node_id="filter:p",
+            inputs=input_ports((PortRef("input:p", "ids:p"),)),
+            alias="p", arena_writes=True,
+            stages=(FilterStage(0, 1, 0, 0.8, 4 * 0.8),),
+            question_token_ids=((QUESTION,),)),
+        HashJoin(
+            node_id="hash_join:r-p",
+            inputs=input_ports((PortRef("input:r", "ids:r"),
+                                PortRef("filter:p", "ids:p"))),
+            left="r", right="p", on=(("key", "key"),), written_pos=0),
+        AiJoin(
+            node_id="group:0", anchor="r", anchor_resident="none",
+            inputs=input_ports((PortRef("input:r", "ids:r"),
+                                PortRef("filter:p", "ids:p"),
+                                PortRef("hash_join:r-p", "pairs:0"))),
+            stages=(JoinStage(
+                written_pos=0, exec_idx=0, anchor="r", partners=("p",),
+                semantics="full", selectivity=0.5, expected_tuples=1,
+                anchor_frame_tokens=1, pair_tail_tokens=0,
+                anchor_resident="none", tuple_tokens=0,
+                pairs_from="hash_join:r-p",
+                frame_token_ids=(FRAME,), label_token_ids=(("p", ()),),
+                tail_token_ids=()),)),
+    ]
+    return PhysicalGraph(tuple(nodes), PortRef("group:0", "ids:r"))
+
+
+def test_anchors_left_without_partners_by_a_partner_filter_settle(monkeypatch):
+    # document d has key d % 4 and pairs with partner d % 4 only; the
+    # filter on p drops some partners, so the documents keyed to them
+    # reach the join with no pair and no KV of their own in the arena
+    columns = _key_columns([d % 4 for d in range(14)], list(range(4)))
+    result, _, filter_truth, join_truth = run_graph_on_arena(
+        monkeypatch, _partner_filter_graph(), columns=columns,
+        fresh_anchors=True, seed=3)
+    surviving_partners = [i for i in range(4) if filter_truth[i][0]]
+    assert 0 < len(surviving_partners) < 4, "the seed must drop a partner"
+    stage = result["joins"][0]
+    assert sorted(stage["anchor_index"]) == list(range(14))
+    for local, document in enumerate(stage["anchor_index"]):
+        mine = [document % 4] if document % 4 in surviving_partners else []
+        # partners are positions in the surviving partner list
+        assert stage["anchor_partners"][local] == [
+            surviving_partners.index(i) for i in mine]
+        assert stage["rows"].get(local, []) == [
+            join_truth[("r", document)][i] for i in mine]
+    table = result["_outputs"][PortRef("group:0", "join_answers:0")]
+    assert sorted(zip(table.column("r").to_pylist(),
+                      table.column("p").to_pylist())) == [
+        (d, d % 4) for d in range(14) if d % 4 in surviving_partners]
+    root = result["_outputs"][PortRef("group:0", "ids:r")]
+    assert sorted(root.column("r").to_pylist()) == [
+        d for d in range(14)
+        if d % 4 in surviving_partners and join_truth[("r", d)][d % 4]]
 
 
 def _foreign_run(monkeypatch, graph, functions):

@@ -57,9 +57,15 @@ def chunk_budget(model: ModelSpec, device: DeviceSpec) -> int:
 
 def arena_bytes(model: ModelSpec, device: DeviceSpec,
                 chunk_tokens: int) -> float:
-    """Bytes left for KV after resident weights and the activation reserve."""
+    """Bytes left for KV after resident weights and the activation reserves.
+
+    An image model also keeps image_reserve_bytes free for its vision
+    tower's activations, whether or not the query binds images: the
+    arena is sized once at boot.
+    """
     return (device.mem_bytes * POOL_FRACTION - model.W_resident
-            - ACT_RESERVE_CHUNKS * chunk_tokens * model.act_per_token)
+            - ACT_RESERVE_CHUNKS * chunk_tokens * model.act_per_token
+            - model.image_reserve_bytes)
 
 
 # Rows past a document that its pages also cover: the shared question

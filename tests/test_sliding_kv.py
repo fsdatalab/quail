@@ -154,6 +154,137 @@ def test_filter_admission_credits_a_trim():
     assert sched.free_pages == 52
 
 
+def _image_group(key, blocks, pages, suffixes=([500],)):
+    """One fresh document: 2 preamble rows, then (start, soft.., end) per block."""
+    prefix = list(range(max(block.end for block in blocks) + 1))
+    return dict(key=key, prefix=prefix, f=len(prefix), suffixes=list(suffixes),
+                images=tuple(zip(blocks, pages)))
+
+
+def test_pack_chunk_lists_image_blocks_with_their_kv_bounds(monkeypatch):
+    from quail.pdf.prompt import ImageBlock
+
+    cpu_staging(monkeypatch)
+    arena = cpu_arena(pages=64, sliding_pages=32)
+    keys = [("d", 0), ("d", 1)]
+    # rows [pre pre start s s s s s end start s s s end]: blocks at 3..8 and
+    # 10..13, a 14-token prefix; the second document has one 3-token block
+    first = _image_group(keys[0], (ImageBlock(0, 3, 5), ImageBlock(1, 10, 3)),
+                         ("p0", "p1"))
+    second = _image_group(keys[1], (ImageBlock(2, 3, 3),), ("p2",))
+    for group in (first, second):
+        arena.activate(group["key"], group["f"], capacity_tokens=group["f"] + 4,
+                       base_tokens=group["f"])
+    chunk = loop.pack_chunk(torch, arena, [first, second],
+                            attention_mode="unified")
+    rows0 = 0
+    rows1 = first["f"] + 1
+    assert [(i.row0, i.rows, i.page) for i in chunk.images] == [
+        (rows0 + 3, 5, "p0"), (rows0 + 10, 3, "p1"), (rows1 + 3, 3, "p2")]
+    blocks = chunk.meta["blocks"]
+    assert blocks["rows"].tolist() == [3, 4, 5, 6, 7, 10, 11, 12,
+                                       rows1 + 3, rows1 + 4, rows1 + 5]
+    assert blocks["cu_q"].tolist() == [0, 5, 8, 11]
+    assert blocks["max_q"] == 5
+    # each block reads KV up to its own end, in both pools on a fresh pass
+    assert blocks["used"].tolist() == [8, 13, 6]
+    assert blocks["max_used"] == 13
+    assert blocks["sliding"]["used"].tolist() == [8, 13, 6]
+    # the block sequences read their document's block table
+    unified = chunk.meta["unified"]
+    assert blocks["table"].tolist() == [unified["table"][0].tolist()] * 2 \
+        + [unified["table"][1].tolist()]
+    assert blocks["sliding"]["table"].shape == (3, unified["sliding"]["table"].shape[1])
+    for key in keys:
+        arena.free_key(key)
+
+
+def test_pack_chunk_image_blocks_follow_a_prefix_with_two_suffixes(monkeypatch):
+    """With two suffixes the prefix is its own sequence; blocks read it."""
+    from quail.pdf.prompt import ImageBlock
+
+    cpu_staging(monkeypatch)
+    arena = cpu_arena(pages=64, sliding_pages=32)
+    key = ("d", 0)
+    group = _image_group(key, (ImageBlock(0, 3, 4),), ("p0",),
+                         suffixes=([500], [501, 502]))
+    arena.activate(key, group["f"], capacity_tokens=group["f"] + 4,
+                   base_tokens=group["f"])
+    chunk = loop.pack_chunk(torch, arena, [group], attention_mode="unified")
+    unified = chunk.meta["unified"]
+    # sequences: the prefix, then one per suffix
+    assert unified["cu_q"].tolist() == [0, group["f"], group["f"] + 1,
+                                        group["f"] + 3]
+    blocks = chunk.meta["blocks"]
+    assert blocks["used"].tolist() == [7]
+    assert blocks["table"].tolist() == [unified["table"][0].tolist()]
+    for temp in chunk.temporary_keys:
+        arena.free_key(temp)
+    arena.free_key(key)
+
+
+def test_pack_chunk_refuses_images_off_the_paged_unified_path(monkeypatch):
+    from quail.pdf.prompt import ImageBlock
+
+    cpu_staging(monkeypatch)
+    arena = cpu_arena(pages=64, sliding_pages=32)
+    key = ("d", 0)
+    group = _image_group(key, (ImageBlock(0, 3, 4),), ("p0",))
+    # no pages: an unpaged fresh group
+    with pytest.raises(ValueError, match="paged unified path"):
+        loop.pack_chunk(torch, arena, [group], attention_mode="unified")
+    arena.activate(key, group["f"], capacity_tokens=group["f"] + 4,
+                   base_tokens=group["f"])
+    with pytest.raises(ValueError, match="paged unified path"):
+        loop.pack_chunk(torch, arena, [group], attention_mode="merge_quant")
+    kept = dict(group, prefix=None)
+    with pytest.raises(ValueError, match="paged unified path"):
+        loop.pack_chunk(torch, arena, [kept], attention_mode="unified")
+    past = dict(group, images=((ImageBlock(0, 3, 40), "p0"),))
+    with pytest.raises(ValueError, match="runs past"):
+        loop.pack_chunk(torch, arena, [past], attention_mode="unified")
+    arena.free_key(key)
+
+
+def test_attention_unified_runs_one_block_call_per_layer(monkeypatch):
+    """Block rows get a second, non-causal call bounded at each block's end."""
+    from quail.backends.quail.executor.attention import Engine
+    from quail.pdf.prompt import ImageBlock
+
+    cpu_staging(monkeypatch)
+    arena = cpu_arena(pages=64, sliding_pages=32)
+    key = ("d", 0)
+    group = _image_group(key, (ImageBlock(0, 3, 4),), ("p0",))
+    arena.activate(key, group["f"], capacity_tokens=group["f"] + 4,
+                   base_tokens=group["f"])
+    chunk = loop.pack_chunk(torch, arena, [group], attention_mode="unified")
+    engine = Engine.__new__(Engine)
+    engine.arena = arena
+    engine.torch = torch
+    calls = []
+
+    def paged(q3, kp, vp, cu_q, max_q, used, max_used, table, *, causal,
+              softmax_scale=None, window=None):
+        calls.append((q3.shape[0], causal, window, used.tolist(), max_used))
+        return torch.zeros(q3.shape[0], 1, 2)
+
+    monkeypatch.setattr(engine, "_paged", paged)
+    monkeypatch.setattr(engine, "kv_row_scatter", lambda *args: None)
+    rows = chunk.tokens
+    q3 = torch.zeros(rows, 1, 2)
+    meta = dict(chunk.meta, layer=1)
+    engine.attention_unified(q3, q3, q3, meta, window=WINDOW,
+                             bidirectional_blocks=chunk.meta["blocks"])
+    assert calls == [
+        (rows, True, (WINDOW - 1, 0), [rows], rows),
+        (4, False, (WINDOW - 1, -1), [7], 7)]
+    # a layer handed no blocks runs the causal call alone
+    calls.clear()
+    engine.attention_unified(q3, q3, q3, dict(chunk.meta, layer=0))
+    assert [call[1] for call in calls] == [True]
+    arena.free_key(key)
+
+
 def test_pack_chunk_builds_both_pools(monkeypatch):
     cpu_staging(monkeypatch)
     arena = cpu_arena(pages=64, sliding_pages=32)

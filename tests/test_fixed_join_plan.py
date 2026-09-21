@@ -11,7 +11,7 @@ from quail.bench import quailb
 from quail.execution.execute import execute_query
 from quail.execution.runner import NodeMetrics, NodeResult, SurvivorStream
 from quail.execution.types import PhysicalResponse
-from quail.physical import AiFilter, AiJoin, Barrier, Scan, decode_graph
+from quail.physical import AiFilter, AiJoin, Barrier, TextScan, decode_graph
 from quail.planner.plan import EngineConfig
 from quail_b import prompts
 from quail_b.queries import FILTER_SELECTIVITY_ESTIMATES
@@ -149,7 +149,7 @@ def test_fixed_order_execution_and_backend_planning(monkeypatch):
                     groups = graph.nodes_by_type(AiJoin.type_name)
                     assert sum(len(group.stages) for group in groups) == 3
                     docs = {node.alias: request.inputs[node.input_id].documents
-                            for node in graph.nodes if isinstance(node, Scan)}
+                            for node in graph.nodes if isinstance(node, TextScan)}
                     state = graph_state(None, docs)
                     model = FixedFeverAnswers(state, capacity, empty)
                     state["model_execution"] = model
@@ -217,7 +217,7 @@ def test_distributed_fev9_executes_bound_join_nodes(monkeypatch):
         def execute(request):
             graph = decode_graph(request.plan["graph"], session.registry.codecs)
             docs = {node.alias: request.inputs[node.input_id].documents
-                    for node in graph.nodes if isinstance(node, Scan)}
+                    for node in graph.nodes if isinstance(node, TextScan)}
             children = []
             for _ in range(2):
                 state = graph_state(None, docs)
@@ -294,7 +294,7 @@ def fever_executor(session, monkeypatch, gpus, check=None, capacity=1):
     def execute(request):
         graph = decode_graph(request.plan["graph"], session.registry.codecs)
         docs = {node.alias: request.inputs[node.input_id].documents
-                for node in graph.nodes if isinstance(node, Scan)}
+                for node in graph.nodes if isinstance(node, TextScan)}
         extra = check(request, graph) if check else {}
         if gpus == 1:
             state = graph_state(None, docs)

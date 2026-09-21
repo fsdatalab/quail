@@ -322,6 +322,14 @@ class JoinAdmission:
             self.pending.append(a)
         return a
 
+    def runs(self, a) -> bool:
+        """Whether anchor a has a pair to evaluate at its first stage.
+
+        An anchor without one settles without a chunk, so nothing
+        should be prepared for it.
+        """
+        return self._count(a, 0) > 0
+
     def take_settled(self):
         """Events for anchors that settled without running a chunk.
 

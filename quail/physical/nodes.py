@@ -211,8 +211,15 @@ class RequestJoinSpec:
 
 
 @dataclass(frozen=True)
-class Scan(PhysicalNode):
-    """Read one tokenized document input supplied by the coordinator."""
+class PhysicalScan(PhysicalNode):
+    """Read one document input supplied by the coordinator.
+
+    The base of every physical scan. Subclasses name the kind of input
+    they bind (text tokens, PDF pages) through their wire name and any
+    extra fields; the coordinator runtime, the output port, the shard
+    layout, and the shared attributes live here. Code that accepts any
+    document input tests for this class.
+    """
 
     alias: str = ""
     input_id: str = ""
@@ -221,8 +228,9 @@ class Scan(PhysicalNode):
     shard_ranges: tuple[tuple[int, int], ...] = ()
     shard_token_loads: tuple[int, ...] = ()
 
-    type_name: ClassVar[str] = "quail.scan"
-    runtime_key: ClassVar[str] = type_name
+    # Every scan hands its prepared source to the same coordinator
+    # runtime, so subclasses keep this key and change only type_name.
+    runtime_key: ClassVar[str] = "quail.scan"
     location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
 
     def __post_init__(self) -> None:
@@ -277,20 +285,89 @@ class Scan(PhysicalNode):
         }
 
     @classmethod
-    def from_attributes(cls, node_id, inputs, attributes):
-        return cls(
-            node_id=node_id,
-            inputs=inputs,
-            alias=attributes["alias"],
-            input_id=attributes["input_id"],
-            n_docs=int(attributes["n_docs"]),
-            total_tokens=int(attributes["total_tokens"]),
-            shard_ranges=tuple(
+    def _scan_fields(cls, attributes: Mapping[str, Any]) -> dict:
+        """Decode the fields every scan shares; subclasses add theirs."""
+        return {
+            "alias": attributes["alias"],
+            "input_id": attributes["input_id"],
+            "n_docs": int(attributes["n_docs"]),
+            "total_tokens": int(attributes["total_tokens"]),
+            "shard_ranges": tuple(
                 (int(start), int(stop))
                 for start, stop in attributes["shard_ranges"]
             ),
-            shard_token_loads=tuple(attributes["shard_token_loads"]),
-        )
+            "shard_token_loads": tuple(attributes["shard_token_loads"]),
+        }
+
+    @classmethod
+    def from_attributes(cls, node_id, inputs, attributes):
+        return cls(node_id=node_id, inputs=inputs,
+                   **cls._scan_fields(attributes))
+
+
+@dataclass(frozen=True)
+class TextScan(PhysicalScan):
+    """Read one tokenized text document input.
+
+    The wire name stays ``quail.scan`` so saved plan envelopes written
+    before PDF inputs existed still decode.
+    """
+
+    type_name: ClassVar[str] = "quail.scan"
+
+
+@dataclass(frozen=True)
+class PDFScan(PhysicalScan):
+    """Read one PDF page input; each document is one page or one PDF.
+
+    total_tokens counts the planned prompt prefix of every row: its
+    pages' soft tokens plus their frame tokens. The executor renders
+    pages from the bound PDFInput; nothing here is pixels.
+    """
+
+    row_mode: str = "page"
+    n_pages: int = 0             # page references across every row
+    visual_tokens: int = 0       # soft token budget per page
+    pages_per_row_max: int = 0   # the longest row, in pages
+
+    type_name: ClassVar[str] = "quail.pdf_scan"
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.row_mode not in ("page", "pdf"):
+            raise ValueError(f"unknown PDF row mode {self.row_mode!r}")
+        if self.visual_tokens <= 0:
+            raise ValueError("a PDF scan needs a positive visual token budget")
+        if self.row_mode == "page" and self.pages_per_row_max > 1:
+            raise ValueError("a page mode PDF scan has one page per row")
+
+    def attributes(self) -> dict:
+        return {
+            **super().attributes(),
+            "row_mode": self.row_mode,
+            "n_pages": self.n_pages,
+            "visual_tokens": self.visual_tokens,
+            "pages_per_row_max": self.pages_per_row_max,
+        }
+
+    def explain_fields(self) -> Mapping[str, Any]:
+        return {
+            **super().explain_fields(),
+            "row_mode": self.row_mode,
+            "n_pages": self.n_pages,
+            "visual_tokens": self.visual_tokens,
+            "pages_per_row_max": self.pages_per_row_max,
+        }
+
+    @classmethod
+    def _scan_fields(cls, attributes: Mapping[str, Any]) -> dict:
+        return {
+            **super()._scan_fields(attributes),
+            "row_mode": str(attributes["row_mode"]),
+            "n_pages": int(attributes["n_pages"]),
+            "visual_tokens": int(attributes["visual_tokens"]),
+            "pages_per_row_max": int(attributes["pages_per_row_max"]),
+        }
 
 
 @dataclass(frozen=True)

@@ -6,6 +6,11 @@ import sqlglot
 from sqlglot import exp
 
 from quail.catalog import Catalog
+from quail.frontend.columns import (
+    check_prompt_columns,
+    check_value_column,
+    value_columns,
+)
 from quail.logical import (
     Alias,
     ColumnRef,
@@ -264,6 +269,7 @@ class _Binder:
                 aliases.append(r.alias)
         if join is None:
             join = len(aliases) > 1
+        check_prompt_columns(self.catalog, refs, function, join)
         if function == "AI_SCORE" and join and template.count("{0}") != 1:
             raise CompileError(
                 "an AI.SCORE pair prompt mentions {0} exactly once, as "
@@ -322,6 +328,8 @@ def _parse_equality(b, term, joined_alias: str) -> Equality:
             f"{term.sql()}")
     left = b.resolve_column(term.this)
     right = b.resolve_column(term.expression)
+    for ref in (left, right):
+        check_value_column(b.catalog, ref, "a join condition")
     sides = {left.alias, right.alias}
     if joined_alias not in sides or len(sides) != 2:
         raise CompileError(
@@ -671,7 +679,7 @@ def _compile_projection(b: _Binder, expressions) -> list:
     for e in expressions:
         if isinstance(e, exp.Star):
             for alias, provider in b.tables:
-                for c in b.catalog.get(provider).columns:
+                for c in value_columns(b.catalog, provider):
                     columns.append(ColumnRef(alias=alias,
                                              provider=provider,
                                              column=c))
@@ -702,5 +710,7 @@ def _compile_projection(b: _Binder, expressions) -> list:
                 f"the SELECT list is column selection only, got "
                 f"{e.sql()}: nothing computed, per the projection "
                 f"contract")
-        columns.append(b.resolve_column(e))
+        ref = b.resolve_column(e)
+        check_value_column(b.catalog, ref, "SELECT")
+        columns.append(ref)
     return columns

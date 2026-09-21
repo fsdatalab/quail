@@ -15,6 +15,9 @@ dependencies = [
     "numpy==2.5.2; sys_platform == 'emscripten' or sys_platform == 'win32'",
     "gigatoken==0.10.0",
     "datasets==5.0.1",
+    # reads PDF page sizes on the coordinator and renders pages on the
+    # worker; the Modal images install the same version
+    "pypdfium2==4.30.0",
     # same version as the Modal image; vLLM has Linux wheels only
     "vllm==0.26.0; sys_platform == 'linux'",
 ]
@@ -43,7 +46,10 @@ dev = [
 ]
 
 [tool.uv.sources]
-quail-b = { git = "https://github.com/fsdatalab/quail-bench.git", rev = "35d026dc2f5b5c1e787268173e81e512b749081a" }
+# The CUAD branch of quail-bench, pushed to this repository as
+# cursor/quail-bench-cuad-19aa until it is merged into
+# fsdatalab/quail-bench; then the pin moves back to that repository.
+quail-b = { git = "https://github.com/fsdatalab/quail.git", rev = "654531c64f49bce95fdbcb9c1cfeabd7c2d25d28" }
 
 [build-system]
 requires = ["hatchling==1.32.0"]

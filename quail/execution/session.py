@@ -14,12 +14,13 @@ import pyarrow as pa
 from pyarrow import compute as pc
 
 from quail.builtins import built_in_registry
-from quail.catalog import Catalog, ScanRequest, TableProvider
+from quail.catalog import Catalog, PDFProvider, ScanRequest, TableProvider
 from quail.execution.pairs import (
     columns_key,
     pair_fraction,
     pair_table,
 )
+from quail.execution.pdf_inputs import PdfScanInput
 from quail.execution.result import IndexRelation, QueryResult, true_answer_rows
 from quail.execution.runner import (
     ExecutionContext,
@@ -32,7 +33,7 @@ from quail.execution.tokens import (
     ScanInput,
     TokenStoreWriter,
 )
-from quail.execution.types import PhysicalRequest, document_input
+from quail.execution.types import PhysicalRequest
 from quail.extensions import ExtensionRegistry
 from quail.frontend.builder import Query as BuilderQuery
 from quail.frontend.sql import SQLDialect, compile_sql
@@ -42,11 +43,19 @@ from quail.logical import (
     join_conditions,
     oriented_join_conditions,
 )
-from quail.physical import PortRef, Project, Scan, ValueType, encode_graph
+from quail.pdf.prompt import PagePrompts
+from quail.physical import (
+    PhysicalScan,
+    PortRef,
+    Project,
+    ValueType,
+    encode_graph,
+)
 from quail.planner import explain, plan_query
 from quail.planner.logical_optimizer import LogicalPlanningContext, apply_logical_rules
 from quail.planner.plan import EngineConfig, Refusal, resolve_model
 from quail.progress import Progress, say
+from quail.specs.vision import resolve_image_tokens
 
 
 class RefusalError(RuntimeError):
@@ -112,7 +121,18 @@ class Session:
                 available=0,
                 unit="configurations",
             ))
+        try:
+            self.image_tokens = resolve_image_tokens(model, config.image_tokens)
+        except ValueError as error:
+            raise RefusalError(Refusal(
+                reasons=(str(error),),
+                constraint="image_tokens_unsupported",
+                needed=1,
+                available=0,
+                unit="image token budgets",
+            )) from error
         self.catalog = Catalog()
+        self._pdf_inputs = {}
         self._tok = tokenizer      # injectable for tests; lazy HF load
         self._tok_injected = tokenizer is not None
         self._fast = None          # lazy Gigatoken instance
@@ -222,6 +242,33 @@ class Session:
                 for name in projected_columns
             },
         )
+
+    def prepare_pdf(self, provider_name: str,
+                    projected_columns=()) -> PdfScanInput:
+        """Bind one PDF provider's rows and keep value columns beside them.
+
+        Reads the page manifest through the provider (cached there),
+        prices every row for this session's image budget, and stores
+        the requested value columns the same way tokenize() does.
+        """
+        with self._lock:
+            provider = self.catalog.get(provider_name)
+            identity = provider.content_identity()
+            projected_columns = tuple(dict.fromkeys(projected_columns))
+            missing = tuple(
+                name for name in projected_columns
+                if (identity, name) not in self._column_stores)
+            if missing:
+                self._load(provider_name, None, missing)
+            if identity not in self._pdf_inputs:
+                pdf_input = provider.pdf_input(self.image_tokens)
+                self._pdf_inputs[identity] = (
+                    pdf_input, PagePrompts(pdf_input, self.model).lengths)
+            pdf_input, lengths = self._pdf_inputs[identity]
+            return PdfScanInput(pdf_input, lengths, {
+                name: self._column_stores[(identity, name)]
+                for name in projected_columns
+            })
 
     def tokenize_async(self, provider_name: str, column: str,
                        projected_columns=()) -> Future:
@@ -504,6 +551,7 @@ class Query:
         self._plan = None
         self._doc_tokens = None
         self._token_inputs = None
+        self._pdf_documents = {}
         self._token_futures = {}
         self._estimated = ()
         self.token_wait_s = 0.0
@@ -531,8 +579,24 @@ class Query:
             scans, joins = operators.scans, operators.joins
             self._doc_tokens = {}
             self._token_inputs = {}
+            self._pdf_documents = {}
             estimated = []
             for s in scans:
+                provider = self.session.catalog.get(s.provider)
+                if isinstance(provider, PDFProvider):
+                    if not self.session.image_tokens:
+                        self._plan = Refusal(
+                            reasons=(f"model {self.session.model.name!r} "
+                                     f"takes text only, but {s.alias!r} "
+                                     f"binds PDF pages",),
+                            constraint="model_takes_text_only",
+                            needed=1, available=0, unit="image models")
+                        return self._plan
+                    store = self.session.prepare_pdf(s.provider, s.columns)
+                    self._token_inputs[s.alias] = store
+                    self._doc_tokens[s.alias] = store.lengths
+                    self._pdf_documents[s.alias] = store.documents()
+                    continue
                 exact = self.session.token_lengths(s.provider, s.column)
                 if exact is not None:
                     store = self.session.tokenize(
@@ -556,7 +620,8 @@ class Query:
                 backend=self.session.config.backend,
                 registry=self.session.registry,
                 tokenizer=self.session.tokenizer,
-                pair_fractions=pair_fractions)
+                pair_fractions=pair_fractions,
+                pdf_documents=self._pdf_documents)
             if self.session.config.gpu_timing:
                 self._plan = replace(self._plan, settings={
                     **self._plan.settings, "gpu_timing": True})
@@ -659,13 +724,10 @@ class Query:
         if isinstance(plan, Refusal):
             raise RefusalError(plan)
         self.wait_for_tokens()
-        inputs = {}
-        for node in plan.nodes:
-            if not isinstance(node, Scan):
-                continue
-            inputs[node.input_id] = document_input(
-                self._token_inputs[node.alias].tokens
-            )
+        inputs = {
+            node.input_id: self._token_inputs[node.alias].physical_input()
+            for node in plan.nodes if isinstance(node, PhysicalScan)
+        }
         envelope = plan.to_envelope(self.session.registry.codecs)
         return PhysicalRequest(envelope, inputs, self._column_tables())
 
@@ -809,7 +871,7 @@ class Query:
         sources = {
             node.input_id: range(node.n_docs)
             for node in plan.nodes
-            if isinstance(node, Scan)
+            if isinstance(node, PhysicalScan)
         }
         observers = self.session.registry.new_observers()
         run = GenericRunner().run(

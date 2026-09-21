@@ -5,6 +5,7 @@ from __future__ import annotations
 import itertools
 import time
 
+from quail.backends.quail.executor.images import PageImages
 from quail.backends.quail.retention import apply_retention, retain_after_join
 from quail.execution.pairs import (
     allowed_members,
@@ -27,12 +28,13 @@ from quail.execution.runner import (
 )
 from quail.execution.tokens import DocumentPrefixes, chain_tokens
 from quail.execution.types import export_physical_outputs
+from quail.pdf.prompt import PagePrompts
 from quail.physical import (
     AiFilter,
     AiJoin,
     AiScore,
     PhysicalGraph,
-    Scan,
+    PhysicalScan,
     ScoreFilter,
 )
 
@@ -139,8 +141,13 @@ def stage_partner_lists(group, lists_for, anchor_ids) -> list:
 
 
 def filter_result(node, answers, tokens, document_ids,
-                  gpu_s: float = 0.0, chunks: int = 0) -> NodeResult:
-    """Build one filter chain's node result from its local answers."""
+                  gpu_s: float = 0.0, chunks: int = 0,
+                  image_metrics: dict | None = None) -> NodeResult:
+    """Build one filter chain's node result from its local answers.
+
+    image_metrics are the chain's page render counters, kept under
+    the metrics extension for a chain over PDF rows.
+    """
     global_answers = {
         document_ids[int(local)]: row
         for local, row in answers.items()
@@ -162,19 +169,27 @@ def filter_result(node, answers, tokens, document_ids,
             fresh_tokens=tokens,
             gpu_s=gpu_s,
             chunks=chunks,
+            extension=({"images": dict(image_metrics)}
+                       if image_metrics else {}),
         ),
     )
 
 
 def filter_inputs(state, node, document_ids) -> dict:
-    """Scheduler inputs for one filter chain over the given documents."""
+    """Scheduler inputs for one filter chain over the given documents.
+
+    An alias whose documents are PDF page prompts also gets its image
+    source; the chain opens it when it starts.
+    """
+    documents = state["docs"][node.alias]
+    pre = state["pre"]
     return {
-        "documents": DocumentPrefixes(
-            state["pre"], state["docs"][node.alias], document_ids
-        ),
+        "documents": DocumentPrefixes(pre, documents, document_ids),
         "document_ids": document_ids,
         "limit": state["filter_limit"],
         "retain_survivors": node.keep_kv,
+        "images": (PageImages(documents, document_ids, len(pre))
+                   if isinstance(documents, PagePrompts) else None),
     }
 
 
@@ -264,10 +279,12 @@ def _model_inputs(node, inputs, context: ExecutionContext) -> dict:
                 pairs.rows.update(pairs.batch(ids))
             kept = set(ids)
             return [key for key in keys if key[1] in kept]
+    images = None
     if stream is None:
         anchor_ids = by_alias[node.anchor]
+        anchor_docs = state["docs"][node.anchor]
         prefixes = [
-            chain_tokens(state["pre"], state["docs"][node.anchor][document])
+            chain_tokens(state["pre"], anchor_docs[document])
             for document in anchor_ids
         ]
         anchor_keys = [(node.anchor, document) for document in anchor_ids]
@@ -275,6 +292,10 @@ def _model_inputs(node, inputs, context: ExecutionContext) -> dict:
         state["kv_stats"]["join_anchor_hits"] += round_kv["hits"]
         state["kv_stats"]["join_anchor_misses"] += round_kv["misses"]
         anchor_stream = None
+        if isinstance(anchor_docs, PagePrompts):
+            # the anchor rows are PDF pages: the join renders them
+            # ahead and packs each anchor's pages with its prefix
+            images = PageImages(anchor_docs, anchor_ids, len(state["pre"]))
     else:
         # filled by the driver as the chain hands anchors over
         anchor_ids = None
@@ -289,6 +310,10 @@ def _model_inputs(node, inputs, context: ExecutionContext) -> dict:
 
     def anchor_done(local_index, row):
         key = anchor_keys[local_index]
+        if not state["arena"].is_resident(key):
+            # an anchor left without partners settles without running,
+            # so it never took KV
+            return
         matched = any(row)
         alive = not matched if group[-1]["semantics"] == "anti" \
             else matched
@@ -320,6 +345,7 @@ def _model_inputs(node, inputs, context: ExecutionContext) -> dict:
         "anchor_partners": lists_for,
         "anchor_batch": anchor_batch,
         "group": group,
+        "images": images,
     }
 
 
@@ -417,11 +443,21 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
             None if state["device"].usd_per_hour is None
             else wall / 3600 * state["device"].usd_per_hour
         ),
-        "backend_metrics": {"scores": [
-            dict(value.metrics.extension)
-            for node_id, value in result.nodes.items()
-            if graph.node(node_id).type_name == AiScore.type_name
-        ]},
+        "backend_metrics": {
+            "scores": [
+                dict(value.metrics.extension)
+                for node_id, value in result.nodes.items()
+                if graph.node(node_id).type_name == AiScore.type_name
+            ],
+            # page render counters per chain over PDF rows, by the
+            # filter's alias or the join's anchor alias
+            "images": {
+                _image_alias(graph.node(node_id)):
+                    value.metrics.extension["images"]
+                for node_id, value in result.nodes.items()
+                if "images" in value.metrics.extension
+            },
+        },
         "node_metrics": scalar_node_metrics(result.nodes),
         "executed_join_plan": executed_join_plan(graph),
         "kv_manager": kv_manager,
@@ -450,7 +486,7 @@ def throughput(graph, metrics, seconds: float) -> dict:
                 metrics.evaluated_document_pairs / seconds,
         }
     documents = sum(
-        node.n_docs for node in graph.nodes if isinstance(node, Scan)
+        node.n_docs for node in graph.nodes if isinstance(node, PhysicalScan)
     )
     return {"documents_per_second": documents / seconds}
 
@@ -468,6 +504,11 @@ def model_answers(graph, result) -> tuple[dict, list]:
                 f"join_answers:{stage.written_pos}"
             ] for stage in node.stages)
     return filters, joins
+
+
+def _image_alias(node) -> str:
+    """The alias whose pages a node rendered: a filter's, or a join's anchor."""
+    return node.anchor if isinstance(node, AiJoin) else node.alias
 
 
 def executed_join_plan(graph) -> list[dict]:

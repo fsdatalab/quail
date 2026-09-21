@@ -23,10 +23,10 @@ from quail.physical import (
     Limit,
     PhysicalGraph,
     PhysicalNode,
+    PhysicalScan,
     PortRef,
     Project,
     Recombine,
-    Scan,
     ValueType,
 )
 
@@ -344,7 +344,7 @@ class ScanRuntime:
     """Read a prepared source registered by document alias."""
 
     def execute(self, node, inputs, context) -> NodeResult:
-        if not isinstance(node, Scan):
+        if not isinstance(node, PhysicalScan):
             raise TypeError(type(node).__name__)
         if node.input_id not in context.sources:
             raise KeyError(
@@ -735,7 +735,7 @@ class HashJoinRuntime:
 def built_in_runtimes() -> dict[str, NodeRuntime]:
     """Return runtimes for the backend independent physical nodes."""
     return {
-        Scan.runtime_key: ScanRuntime(),
+        PhysicalScan.runtime_key: ScanRuntime(),
         Barrier.runtime_key: BarrierRuntime(),
         Exchange.runtime_key: ExchangeRuntime(),
         Foreign.runtime_key: ForeignRuntime(),

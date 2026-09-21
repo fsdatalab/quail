@@ -18,9 +18,9 @@ from quail.physical import (
     Limit,
     PortRef,
     Project,
-    Scan,
     ScoreFilter,
     ScoreSpec,
+    TextScan,
 )
 from quail.physical.base import input_ports
 from quail.planner import hash_join_nodes
@@ -318,7 +318,7 @@ def _plan_reranker(region, context, *, backend_name: str):
         total = sum(int(length) for length in lengths)
         counts[scan.alias] = count
         means[scan.alias] = total / max(1, count)
-        node = Scan(
+        node = TextScan(
             node_id=f"scan:{scan.alias}",
             alias=scan.alias,
             input_id=scan.alias,

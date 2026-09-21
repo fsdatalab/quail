@@ -155,7 +155,7 @@ def _run(query, join_answers):
         from quail.physical import (
             AiFilter,
             AiJoin,
-            Scan,
+            TextScan,
             decode_graph,
         )
 
@@ -170,7 +170,7 @@ def _run(query, join_answers):
         nodes = {
             **{node.node_id: NodeResult({f"ids:{node.alias}": range(
                 len(request.inputs[node.input_id].documents))})
-               for node in graph.nodes if isinstance(node, Scan)},
+               for node in graph.nodes if isinstance(node, TextScan)},
             filtered.node_id: NodeResult({
                 "ids:r": [0],
                 "filter_answers:r": {0: [1], 1: [0]},

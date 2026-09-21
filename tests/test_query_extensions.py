@@ -21,7 +21,7 @@ def test_query_scans_provider_and_preserves_extension_objects(
     from quail.execution.runner import NodeMetrics, NodeResult, RunResult
     from quail.execution.session import Session
     from quail.execution.types import export_physical_outputs
-    from quail.physical import AiFilter, Scan, decode_graph
+    from quail.physical import AiFilter, TextScan, decode_graph
 
     path = tmp_path / "documents.parquet"
     pq.write_table(pa.table({
@@ -66,7 +66,7 @@ def test_query_scans_provider_and_preserves_extension_objects(
             physical.plan["graph"], registry.codecs
         )
         source = next(
-            node for node in graph.nodes if isinstance(node, Scan)
+            node for node in graph.nodes if isinstance(node, TextScan)
         )
         documents = physical.inputs[source.input_id].documents
         assert [list(document) for document in documents] == [

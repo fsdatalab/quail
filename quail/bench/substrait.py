@@ -4,16 +4,21 @@ A QUAIL-B query is a Substrait plan (a protocol buffer that describes
 a relational query): `ReadRel` scans, `FilterRel` calls to
 `ai_filter`, inner `JoinRel` calls to `ai_join` (joined with ordinary
 `equal` conditions by `and`), and a `ProjectRel` under the root that
-selects the id column of each relation. The alias of a relation and
-the id of an operator are the `RelCommon.hint.alias` of its node.
-Operator ids number filters and joins in post-order, inputs before the
-operator and left before right.
+selects the id column of each relation. A `FilterRel` directly over a
+scan may instead bound an integer column with `lte`; Quail applies
+that bound to the table before it registers it, since its planner
+only runs AI predicates. The alias of a relation and the id of an
+operator are the `RelCommon.hint.alias` of its node. Operator ids
+number filters and joins in post-order, inputs before the operator and
+left before right.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
+import pyarrow as pa
+import pyarrow.compute as pc
 from substrait import algebra_pb2, plan_pb2
 
 import quail
@@ -22,15 +27,50 @@ AI_URN = "extension:org.fsdatalab.quail_b:functions_ai"
 AI_FILTER = "ai_filter:str_str"
 AI_JOIN = "ai_join:str_str_str"
 EQUAL = "equal:any_any"
+LTE = "lte:any_any"
 AND = "and:bool"
 
 
 @dataclass(frozen=True)
+class Bound:
+    """Keep the rows whose integer column is at most a value."""
+
+    column: str
+    value: int
+
+    def apply(self, table: pa.Table) -> pa.Table:
+        keep = pc.less_equal(table.column(self.column), self.value)
+        return table.filter(pc.fill_null(keep, False))
+
+
+@dataclass(frozen=True)
 class Relation:
-    """One scanned table and the alias the query knows it by."""
+    """One scanned table and the alias the query knows it by.
+
+    Attributes:
+        alias: The relation alias.
+        table: The benchmark table.
+        bounds: Ordinary bounds on the table's rows, applied before
+            any AI predicate.
+    """
 
     alias: str
     table: str
+    bounds: tuple[Bound, ...] = ()
+
+    @property
+    def source(self) -> str:
+        """The name the bounded rows are registered under on a session."""
+        if not self.bounds:
+            return self.table
+        suffix = ",".join(f"{b.column}<={b.value}" for b in self.bounds)
+        return f"{self.table}[{suffix}]"
+
+    def rows(self, table: pa.Table) -> pa.Table:
+        """The benchmark table's rows inside every bound, in table order."""
+        for bound in self.bounds:
+            table = bound.apply(table)
+        return table
 
 
 @dataclass(frozen=True)
@@ -126,6 +166,15 @@ def _string(expression: algebra_pb2.Expression) -> str:
     return expression.literal.string
 
 
+def _integer(expression: algebra_pb2.Expression) -> int:
+    if not expression.HasField("literal"):
+        raise ValueError("a bound must be an integer literal")
+    kind = expression.literal.WhichOneof("literal_type")
+    if kind not in ("i8", "i16", "i32", "i64"):
+        raise ValueError("a bound must be an integer literal")
+    return int(getattr(expression.literal, kind))
+
+
 def _call(expression: algebra_pb2.Expression, functions) -> tuple[str, list]:
     """Return (function name, arguments) of a scalar function call."""
     if not expression.HasField("scalar_function"):
@@ -159,6 +208,16 @@ def _read(rel: algebra_pb2.Rel, functions):
     if kind == "filter":
         relations, operators, fields = _read(rel.filter.input, functions)
         name, arguments = _call(rel.filter.condition, functions)
+        if name == LTE and len(arguments) == 2:
+            if operators or len(relations) != 1:
+                raise ValueError(
+                    "a bound must sit directly over its relation's scan, "
+                    "before any AI operator")
+            alias, column = _field(fields, arguments[0])
+            (relation,) = relations
+            bound = Bound(column, _integer(arguments[1]))
+            return ([Relation(alias, relation.table, relation.bounds + (bound,))],
+                    operators, fields)
         if name != AI_FILTER or len(arguments) != 2:
             raise ValueError("a filter must call ai_filter(prompt, document)")
         alias, column = _field(fields, arguments[1])
@@ -233,7 +292,7 @@ def build_query(session, plan: QueryPlan, selectivity=None,
         filters.setdefault(item.alias, []).append(item)
 
     def relation_query(alias):
-        query = session.docs(by_alias[alias].table).alias(alias)
+        query = session.docs(by_alias[alias].source).alias(alias)
         for item in filters.get(alias, ()):
             query = query.ai_filter(
                 quail.prompt(item.prompt, quail.col(f"{alias}.{item.column}")),

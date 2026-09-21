@@ -18,6 +18,7 @@ import numpy as np
 from quail.backends.quail.executor.attention import (
     FILTER_ATTENTION,
     Chunk,
+    ChunkImage,
 )
 from quail.backends.quail.executor.pack import FilterAdmission, JoinAdmission
 from quail.progress import Progress, logger, quiet
@@ -234,6 +235,13 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     answer_row instead of the suffix's last row. Canvas KV goes
     wherever the suffix's KV goes and is never kept. Canvas rows run
     the unified path only.
+
+    A fresh group may carry images: (block, page) pairs where block
+    names the prefix span its soft tokens occupy (offset, soft_tokens)
+    and page is the rendered pixels. The chunk lists them as
+    ChunkImage rows for the model to embed, and meta["blocks"] gives
+    the attention path each block's rows and the KV bound it may read
+    up to. Images run the paged unified path only.
     """
     def stage(name, values, dtype):
         if staging is not None:
@@ -259,6 +267,9 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     two_call = attention_mode != "unified"
     canvas_rows = []      # (first row, end row) per canvas
     canvas_seq = []       # its sequence in the unified paged call
+    images = []           # ChunkImage per image, in row order
+    block_ends = []       # (unified group index, logical end) per image
+    blocks_meta = None
     id_parts, token_count = [], 0
     pos, cu_a, finals = [], [0], []
     suffix_rows = []
@@ -273,6 +284,19 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         key = g["key"]
         paged = arena.is_resident(key)
         row0 = token_count
+        if g.get("images"):
+            if not (fresh and paged and attention_mode == "unified"):
+                raise ValueError(
+                    f"group {key!r}: images ride a fresh prefix on the "
+                    f"paged unified path")
+            for block, page in g["images"]:
+                if block.end > len(g["prefix"]):
+                    raise ValueError(
+                        f"group {key!r}: image block {block} runs past "
+                        f"its {len(g['prefix'])}-token prefix")
+                images.append(ChunkImage(row0 + block.offset,
+                                         block.soft_tokens, page))
+                block_ends.append((len(unified_groups), block.end))
         if fresh:
             if not paged and len(g["suffixes"]) > 1:
                 raise ValueError(
@@ -375,6 +399,8 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         pools = [_PoolBuilder()] + ([_PoolBuilder()] if sliding else [])
         cu_q = [0]
         page_tokens = arena.page_tokens
+        prefix_seq = []       # per unified group, the sequence its prefix rows join
+        pool_starts = []      # per unified group, each pool view's start row
 
         try:
             for spec in unified_groups:
@@ -393,6 +419,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                         arena.capacity_rows_sliding(key),
                         arena.owned_sliding_pages(key),
                         arena.sliding_start(key)))
+                pool_starts.append([view.start for view in views])
                 direct = len(spans) == 1 and all(
                     logical_start + count - view.start <= view.rows.numel()
                     for view in views)
@@ -402,11 +429,13 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                         pool.scatter_direct(view, r0, r1, logical_start)
                         pool.add_sequence(view.pages, f + suffix_total - view.start)
                     cu_q.append(cu_q[-1] + count)
+                    prefix_seq.append(len(cu_q) - 2)
                     if canvas:
                         canvas_seq.append(len(cu_q) - 2)
                     continue
 
                 prefix_count = spec["prefix_end"] - r0
+                prefix_seq.append(len(cu_q) - 1 if prefix_count else None)
                 if prefix_count:
                     for pool, view in zip(pools, views):
                         pool.scatter_direct(view, r0, spec["prefix_end"], 0)
@@ -460,6 +489,10 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 max_q=max(b - a for a, b in zip(cu_q, cu_q[1:])))
             if sliding:
                 unified["sliding"] = built[1]
+            if images:
+                blocks_meta = _blocks_meta(
+                    torch, stage, images, block_ends, prefix_seq,
+                    pool_starts, unified)
         except Exception:
             for key in temporary_keys:
                 arena.free_key(key)
@@ -510,7 +543,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                     max_used=max(pools[1].lengths[i] for i in canvas_seq))
     meta = dict(
         layer=0, kv_src=kv_src, kv_dst=kv_dst, cross=cross,
-        unified=unified, canvas=canvas_meta,
+        unified=unified, canvas=canvas_meta, blocks=blocks_meta,
         cu_a=stage("cu_a", cu_a, torch.int32),
         max_a=max(cu_a[i + 1] - cu_a[i] for i in range(len(cu_a) - 1)))
     out = Chunk(
@@ -520,9 +553,52 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         final_indices=stage("finals", finals, torch.int64),
         meta=meta, attention_mode=attention_mode, tokens=token_count,
         layout=layout, temporary_keys=tuple(temporary_keys),
-        fresh_keys=tuple(fresh_keys))
+        fresh_keys=tuple(fresh_keys), images=tuple(images))
     _tick(timing, "pack_h2d", t)
     return out
+
+
+def _blocks_meta(torch, stage, images, block_ends, prefix_seq, pool_starts,
+                 unified):
+    """The block attention call's rows, sequences, and KV bounds per pool.
+
+    Each image block is one query sequence whose KV ends at the block's
+    last soft token, in the every-token pool and, when present, the
+    sliding pool.
+    """
+    rows = np.concatenate([
+        np.arange(image.row0, image.row0 + image.rows, dtype=np.int64)
+        for image in images])
+    cu_b = [0]
+    for image in images:
+        cu_b.append(cu_b[-1] + image.rows)
+    seq = []
+    for group, _end in block_ends:
+        if prefix_seq[group] is None:
+            raise AssertionError("an image block belongs to a prefix sequence")
+        seq.append(prefix_seq[group])
+    seq_index = stage("blocks_seq", seq, torch.int64)
+    meta = dict(
+        rows=stage("blocks_rows", rows, torch.int64),
+        cu_q=stage("blocks_cu_q", cu_b, torch.int32),
+        max_q=max(image.rows for image in images))
+    for index, pool in enumerate([unified] + [unified.get("sliding")]):
+        if pool is None:
+            continue
+        used = [end - pool_starts[group][index] for group, end in block_ends]
+        if min(used) <= 0:
+            raise ValueError(
+                "an image block lies before its key's sliding window origin")
+        entry = dict(
+            table=pool["table"].index_select(0, seq_index),
+            used=stage(f"blocks_used{'_sliding' if index else ''}", used,
+                       torch.int32),
+            max_used=max(used))
+        if index == 0:
+            meta.update(entry)
+        else:
+            meta["sliding"] = entry
+    return meta
 
 
 def _forward(pipeline, arena, chunk):
@@ -544,7 +620,8 @@ def _forward(pipeline, arena, chunk):
 def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
              stage_suffixes, budget, stage_frames=None,
              anchor_keys=None, anchor_done=None, anchor_source=None,
-             anchor_partners=None, anchor_batch=None, staging=None):
+             anchor_partners=None, anchor_batch=None, staging=None,
+             images=None):
     """The join driver: stream partner lists against anchors.
 
     Survivors are gated between stages.
@@ -584,6 +661,12 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
             on each batch the source hands over before admission. A
             key it leaves out is freed, never admitted.
         staging: Optional reusable input transfer buffers.
+        images: Optional image source for anchors whose prefixes hold
+            image placeholders (PageImages): take(a) gives anchor a's
+            rendered pages, which ride the chunk that packs its prefix.
+            Only for anchors listed in anchor_prefixes; a streamed
+            anchor's pages were embedded by its own chain. The caller
+            closes it.
 
     Returns:
         (ans, spans, tokens): ans[j][a] = 0/1 row over the stage-j
@@ -605,6 +688,19 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         raise ValueError("anchor_keys must match anchor_prefixes")
     frames = stage_frames or [[] for _ in range(k)]
     mode = pipeline.join_attention
+    if images is not None:
+        if anchor_source is not None:
+            raise ValueError(
+                "images belong to anchor_prefixes; a streamed anchor's "
+                "pages were embedded by its chain")
+        if mode != FILTER_ATTENTION:
+            raise ValueError("images run the paged unified path")
+        if not pipeline.takes_images:
+            raise ValueError(
+                f"{type(pipeline).__name__} does not embed images")
+    # pages taken for an anchor whose chunk was split or retried, so
+    # the retry packs the same pages instead of taking the row again
+    taken_pages = {}
     canvas = tuple(pipeline.canvas_ids)
     answer_row = pipeline.canvas_answer_row
 
@@ -645,6 +741,11 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         canvas_tokens=len(canvas),
         page_cost=arena.page_cost,
     )
+    if images is not None:
+        # an anchor without a partner never packs, so its pages are
+        # not rendered
+        images.open(budget, docs=[a for a in range(len(keys))
+                                  if sched.runs(a)])
     spans = []
     tokens = 0
     outstanding = []     # (groups, handle) in launch order
@@ -723,6 +824,11 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
                     prefix=prefixes[a] if carried else None,
                     f=f + len(frame),
                     suffixes=sufs))
+            if carried and images is not None:
+                if a not in taken_pages:
+                    taken_pages[a] = images.take(a)
+                specs[-2 if frame and start == 0 else -1]["images"] = \
+                    taken_pages[a]
         return pack_chunk(torch, arena, specs, attention_mode=mode,
                           staging=staging, canvas=canvas,
                           answer_row=answer_row)
@@ -794,6 +900,9 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         e1.record()
         for key in chunk.fresh_keys:
             arena.trim_window(key)
+        for a, _, _, _, carried in part:
+            if carried:
+                taken_pages.pop(a, None)
         spans.append((part[0][1], e0, e1))
         outstanding.append((part, async_ans.submit(normed)))
         # read the previous chunk's answers while this one runs
@@ -1074,13 +1183,18 @@ class FilterStream:
             consumer never needs a page this chain did not claim.
         attention_mode: Attention path of this chain's chunks; unified
             when omitted. The warm-up runs the merge_quant path too.
+        images: The documents' images, when their prefixes hold image
+            soft tokens: open() starts the source, take(doc) gives
+            (block, page) pairs for a fresh document in admission
+            order, close() releases the source, metrics() reports its
+            counters. None for text.
     """
 
     def __init__(self, torch, arena, pipeline, async_ans, doc_ids,
                  question_ids, budget, timing=None, pinned=True,
                  limit=None, *, arena_writes, arena_keys=None,
                  retain_survivors=(), hold_survivors=False,
-                 hold_extra_tokens=0, attention_mode=None):
+                 hold_extra_tokens=0, attention_mode=None, images=None):
         p = _shared_preamble_tokens(question_ids)
         keys = range(len(doc_ids)) if arena_keys is None else arena_keys
         if len(keys) != len(doc_ids):
@@ -1110,6 +1224,13 @@ class FilterStream:
             raise ValueError("arena_writes=False needs a single stage")
         self.attention_mode = attention_mode or FILTER_ATTENTION
         unified = self.attention_mode == "unified"
+        if images is not None:
+            if not (unified and arena_writes):
+                raise ValueError("images run the paged unified path")
+            if not pipeline.takes_images:
+                raise ValueError(
+                    f"{type(pipeline).__name__} does not embed images")
+        self.images = images
         # capacity must cover the longest tail past the kept preamble,
         # and the canvas rows that follow it
         temp_tail = max(0, *(len(q) - p + c for q in question_ids)) \
@@ -1155,17 +1276,34 @@ class FilterStream:
         self.progress = Progress(
             f"filter ({len(question_ids)} stages)", total=len(doc_ids))
         self._finished = 0
+        self.image_metrics = {}
+        if images is not None:
+            images.open(budget)
 
     @property
     def answers(self):
         """Per document, its 0/1 answers up to the first FALSE."""
         return self.sched.answers
 
+    def close(self):
+        """Release the image source; its counters stay in image_metrics.
+
+        _finish calls this when the chain completes; a caller that
+        abandons the chain early calls it to stop the render processes.
+        """
+        if self.images is not None:
+            self.image_metrics = self.images.metrics()
+            self.images.close()
+            self.images = None
+
     def _spec(self, doc, stage, fresh):
         if fresh:
-            return dict(key=self.keys[doc], prefix=self.doc_ids[doc],
+            spec = dict(key=self.keys[doc], prefix=self.doc_ids[doc],
                         f=len(self.doc_ids[doc]), suffixes=[self.tails[0]],
                         write_suffix_tokens=self.preamble)
+            if self.images is not None:
+                spec["images"] = self.images.take(doc)
+            return spec
         return dict(key=self.keys[doc], prefix=None,
                     f=len(self.doc_ids[doc]) + self.preamble,
                     suffixes=[self.tails[stage]])
@@ -1202,6 +1340,7 @@ class FilterStream:
             self._report(self.outstanding.pop(0), items)
         for doc in self.sched.drain_ready():
             self.arena.free_key(self.keys[doc])
+        self.close()
         self.progress.finish(
             f"filter ({len(self.tails)} stages) done",
             f"{self.tokens:,} fresh tokens")
@@ -1294,7 +1433,8 @@ class FilterStream:
 def run_filter(torch, arena, pipeline, async_ans, doc_ids,
                question_ids, budget, timing=None,
                pinned=True, limit=None, *, arena_writes,
-               arena_keys=None, retain_survivors=(), attention_mode=None):
+               arena_keys=None, retain_survivors=(), attention_mode=None,
+               images=None):
     """The filter chain run to the end; see FilterStream for the arguments.
 
     Returns:
@@ -1305,7 +1445,20 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
         torch, arena, pipeline, async_ans, doc_ids, question_ids, budget,
         timing=timing, pinned=pinned, limit=limit,
         arena_writes=arena_writes, arena_keys=arena_keys,
-        retain_survivors=retain_survivors, attention_mode=attention_mode)
-    while not stream.done:
-        stream.next()
+        retain_survivors=retain_survivors, attention_mode=attention_mode,
+        images=images)
+    return run_stream(stream)
+
+
+def run_stream(stream):
+    """Run a FilterStream to the end and return (answers, spans, tokens).
+
+    The stream's image source is closed whether the chain completes or
+    raises.
+    """
+    try:
+        while not stream.done:
+            stream.next()
+    finally:
+        stream.close()
     return stream.answers, stream.spans, stream.tokens

@@ -1,13 +1,20 @@
 """CPU checks that every QUAIL-B query builds and plans on Quail."""
 
+import hashlib
+
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pypdfium2
 
 import quail
 from quail.bench.quailb import queries, register_tables
 from quail.planner.plan import EngineConfig, Refusal
 from quail_b.data import ASPECTS, SCENARIOS
 from quail_b.queries import QUERY_ORDER
+
+CUAD_QUERIES = {f"CUAD-{i}" for i in range(1, 6)}
+FIN_QUERIES = {"FIN-1", "FIN-2"}
+PDF_QUERIES = CUAD_QUERIES | FIN_QUERIES
 
 
 def _standin_sets(tmp_path):
@@ -54,7 +61,63 @@ def _standin_sets(tmp_path):
         "id": [f"sc{i}" for i in range(len(SCENARIOS))],
         "scenario": SCENARIOS,
     }), tmp_path / "scenarios.parquet")
+    _standin_contracts(tmp_path, page_counts=(2, 1, 40))
+    _standin_filings(tmp_path, page_counts=(3, 2))
     return tmp_path
+
+
+def _blank_pdf(path, page_count) -> str:
+    """Write a PDF of blank letter pages; return its sha256."""
+    document = pypdfium2.PdfDocument.new()
+    for _ in range(page_count):
+        document.new_page(612, 792)
+    document.save(str(path))
+    document.close()
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _standin_filings(tmp_path, page_counts):
+    """Blank filing PDFs under files/, one question per filing."""
+    files = tmp_path / "files"
+    files.mkdir(exist_ok=True)
+    questions, pages = [], []
+    for index, count in enumerate(page_counts):
+        digest = _blank_pdf(files / f"f{index}.pdf", count)
+        questions.append({
+            "id": f"fq{index}", "financebench_id": f"financebench_id_{index:05d}",
+            "filing": f"f{index}", "doc_name": f"FILING{index}", "company": "Co",
+            "question_type": "metrics-generated",
+            "question": f"question {index}", "answer": "42",
+            "evidence_pages": [1]})
+        pages += [{
+            "id": f"f{index}p{page}", "filing": f"f{index}",
+            "doc_name": f"FILING{index}", "page_number": page,
+            "page_count": count, "pdf_sha256": digest,
+            "document": f"files/f{index}.pdf#page={page}"}
+            for page in range(1, count + 1)]
+    pq.write_table(pa.Table.from_pylist(questions),
+                   tmp_path / "filing_questions.parquet")
+    pq.write_table(pa.Table.from_pylist(pages), tmp_path / "filing_pages.parquet")
+
+
+def _standin_contracts(tmp_path, page_counts):
+    """Blank contract PDFs under files/, with both file-backed tables."""
+    files = tmp_path / "files"
+    files.mkdir(exist_ok=True)
+    contracts, pages = [], []
+    for index, count in enumerate(page_counts):
+        digest = _blank_pdf(files / f"ct{index}.pdf", count)
+        contracts.append({
+            "id": f"ct{index}", "title": f"contract {index}",
+            "page_count": count, "pdf_sha256": digest,
+            "document": f"files/ct{index}.pdf", "clauses": ["Exclusivity"]})
+        pages += [{
+            "id": f"ct{index}p{page}", "contract_id": f"ct{index}",
+            "page_number": page, "pdf_sha256": digest,
+            "document": f"files/ct{index}.pdf#page={page}", "clauses": []}
+            for page in range(1, count + 1)]
+    pq.write_table(pa.Table.from_pylist(contracts), tmp_path / "contracts.parquet")
+    pq.write_table(pa.Table.from_pylist(pages), tmp_path / "contract_pages.parquet")
 
 
 def test_all_queries_compile_and_plan(tmp_path):
@@ -80,11 +143,18 @@ def test_all_queries_compile_and_plan(tmp_path):
             *(f"LEP-{i}" for i in range(1, 6)),
             "AGENT-1", "AGENT-2",
             "PRIV-1", "PRIV-2",
+            *PDF_QUERIES,
         }
         assert set(qdefs) == expected
         assert set(QUERY_ORDER) == expected - {"PRIV-1", "PRIV-2"}
         for qid, (_, build) in qdefs.items():
             query = build()
+            if qid in PDF_QUERIES:
+                # PDF rows need a model that takes images
+                plan = query.plan()
+                assert isinstance(plan, Refusal), qid
+                assert "takes text only" in " ".join(plan.reasons), qid
+                continue
             operators = query.logical.operators()
             filters, joins = operators.filters, operators.joins
             predicates = [predicate for chain in filters.values()
@@ -101,3 +171,58 @@ def test_all_queries_compile_and_plan(tmp_path):
             assert not isinstance(plan, Refusal), f"{qid} refused: {plan}"
             assert plan.settings["order_rule"] == "by_cost", qid
             assert "physical:" in query.explain(), qid
+
+
+def test_cuad_queries_plan_on_an_image_model_over_bounded_pdf_rows(tmp_path):
+    _standin_sets(tmp_path)
+    sess = quail.Session(
+        EngineConfig(
+            gpus=1,
+            model="diffusion-gemma-26b-a4b-fp8",
+            backend="quail",
+            device="h100-sxm",
+        ),
+        tokenizer=lambda text: list(text.encode()),
+    )
+    register_tables(sess, tmp_path)
+    # the bounded contracts are their own provider: the 40-page one is out
+    assert "contracts[page_count<=32]" in sess.catalog
+    assert "contracts" not in sess.catalog
+    assert sess.catalog.get("contracts[page_count<=32]").statistics().row_count == 2
+    assert sess.catalog.get("contract_pages").statistics().row_count == 43
+    # the page rows keep the benchmark's join columns beside the pages
+    assert "filing" in sess.catalog.get("filing_pages").columns
+    for qid in sorted(PDF_QUERIES):
+        query = queries(sess)[qid][1]()
+        plan = query.plan()
+        assert not isinstance(plan, Refusal), f"{qid} refused: {plan}"
+        explained = query.explain()
+        assert "physical:" in explained, qid
+        mode = "pdf" if qid in ("CUAD-3", "CUAD-4", "CUAD-5") else "page"
+        assert f"row_mode={mode}" in explained, qid
+        if qid in FIN_QUERIES:
+            # the pages anchor the join; the questions are the partners
+            assert "anchor=p" in explained, qid
+
+
+def test_page_rows_keep_their_benchmark_ids_through_a_symlinked_directory(
+        tmp_path):
+    """Page rows carry the table's ids; a mount's real path changes nothing."""
+    from quail.bench.quailb import pdf_provider, read_tables
+    from quail.catalog import ScanRequest
+
+    data = tmp_path / "data"
+    data.mkdir()
+    _standin_contracts(data, page_counts=(2, 3))
+    link = tmp_path / "mount"
+    link.symlink_to(data, target_is_directory=True)
+    tables = read_tables(link, ["contract_pages"])
+    # any subset of pages, in the table's order
+    provider = pdf_provider(tables["contract_pages"].take([4, 0, 3]))
+    assert provider.statistics().row_count == 3
+    rows = provider.scan(ScanRequest(columns=("id", "page", "page_count"),
+                                     filter=None, limit=None)).read_all()
+    assert rows.column("id").to_pylist() == ["ct1p3", "ct0p1", "ct1p2"]
+    assert rows.column("page").to_pylist() == [3, 1, 2]
+    assert rows.column("page_count").to_pylist() == [3, 2, 3]
+    assert [page.page_number for page in provider.pdf_input(280).row_pages(0)] == [3]

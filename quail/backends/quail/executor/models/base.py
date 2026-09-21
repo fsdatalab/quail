@@ -22,6 +22,9 @@ class ModelPipeline:
     reads paged KV only. warm_tokens are the chunk sizes the warmup
     builds one small chunk of: a gated chain's trailing chunks are
     100-500 tokens, a shape the full-size warm chunks do not cover.
+    takes_images says forward_chunk embeds the chunk's images (Chunk.
+    images) in place of their soft token rows; the loop refuses to
+    pack images for a pipeline that does not.
     """
 
     engine = None
@@ -32,6 +35,7 @@ class ModelPipeline:
     needs_pages = False
     join_attention = "merge_quant"
     gemm_warmup = True
+    takes_images = False
 
     def forward_chunk(self, chunk):
         """Return the final-normed hidden state of chunk.final_indices.

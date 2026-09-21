@@ -151,6 +151,70 @@ def test_filter_stream_charges_canvas_rows():
     assert stream.sched.free_pages is not None
 
 
+class _ImageSource:
+    """An image source that records the chain's calls."""
+
+    def __init__(self):
+        self.opened = []
+        self.taken = []
+        self.closed = False
+
+    def open(self, chunk_tokens=None):
+        self.opened.append(chunk_tokens)
+
+    def take(self, doc):
+        self.taken.append(doc)
+        return (("block", f"page{doc}"),)
+
+    def metrics(self):
+        return {"pages_rendered": len(self.taken)}
+
+    def close(self):
+        self.closed = True
+
+
+def test_filter_stream_hands_images_to_fresh_documents_only(monkeypatch):
+    from fakes import FakeModel, fake_pack, fake_torch
+
+    monkeypatch.setattr(loop, "pack_chunk", fake_pack)
+    truth = [[1, 1], [1, 0], [1, 1]]
+    model = FakeModel(truth, {})
+    pipeline = fake_pipeline(forward_chunk=model.forward_chunk,
+                             takes_images=True)
+    answers = SimpleNamespace(submit=lambda v: v, result=lambda v: v, dtype=None)
+    docs = [[5] * 20, [6] * 30, [7] * 10]
+    questions = [[2000, 41], [2001, 41]]
+    source = _ImageSource()
+    stream = loop.FilterStream(
+        fake_torch(), cpu_arena(64), pipeline, answers, docs, questions, 200,
+        arena_writes=True, arena_keys=[("d", d) for d in range(3)],
+        images=source)
+    # the source learns the chunk budget, to size its lookahead
+    assert source.opened == [200] and stream.image_metrics == {}
+    loop.run_stream(stream)
+    # every document was rendered once, for its fresh pass
+    assert sorted(source.taken) == [0, 1, 2]
+    fresh_specs = [spec for _, specs in model.launched for spec in specs
+                   if spec["prefix"] is not None]
+    kept_specs = [spec for _, specs in model.launched for spec in specs
+                  if spec["prefix"] is None]
+    assert all(spec["images"] == (("block", f"page{spec['key'][1]}"),)
+               for spec in fresh_specs)
+    assert kept_specs and all("images" not in spec for spec in kept_specs)
+    assert source.closed and stream.image_metrics == {"pages_rendered": 3}
+    assert stream.answers == {0: [1, 1], 1: [1, 0], 2: [1, 1]}
+
+    text_pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
+    with pytest.raises(ValueError, match="does not embed images"):
+        loop.FilterStream(
+            fake_torch(), cpu_arena(64), text_pipeline, answers, docs,
+            questions, 200, arena_writes=True, images=_ImageSource())
+    with pytest.raises(ValueError, match="paged unified path"):
+        loop.FilterStream(
+            fake_torch(), cpu_arena(64), pipeline, answers, docs[:1],
+            questions[:1], 200, arena_writes=False, images=_ImageSource())
+
+
 def test_pack_chunk_appends_canvas_rows_after_each_suffix(monkeypatch):
     torch = cpu_staging(monkeypatch)
     arena = cpu_arena(64)
@@ -268,9 +332,11 @@ class _Engine:
         self.is_fp8 = kwargs["fp8"]
 
     def attention_unified(self, q3, k3, v3, meta, *, softmax_scale=None,
-                          window=None):
+                          window=None, bidirectional_blocks=None):
         self.calls.append((meta["layer"], q3.shape, k3.shape, softmax_scale,
                            window))
+        self.blocks = getattr(self, "blocks", [])
+        self.blocks.append(bidirectional_blocks)
         meta["layer"] += 1
         return self.torch.zeros(q3.shape[0], q3.shape[1] * q3.shape[2])
 
@@ -320,7 +386,7 @@ def _spec_for(model, **overrides):
                   sliding_window=model.model.config.sliding_window,
                   n_q=attn.num_heads, n_kv=attn.num_kv_heads,
                   head_dim=attn.head_dim, d_head=attn.head_dim,
-                  widest_projection=32)
+                  widest_projection=32, image_reserve_bytes=0.0)
     fields.update(overrides)
     return SimpleNamespace(**fields)
 
@@ -372,13 +438,15 @@ def test_pipeline_runs_the_gemma4_layer_order(monkeypatch):
         input_ids=torch.zeros(6, dtype=torch.int64),
         positions=torch.arange(6),
         final_indices=torch.tensor([0, 3]),
-        meta={"layer": 0, "canvas": {"rows": rows}})
+        meta={"layer": 0, "canvas": {"rows": rows}}, images=())
+    assert pipeline.vision is None and not pipeline.takes_images
     out = pipeline.forward_chunk(chunk)
     assert seen["context"] == ("config", 6)
     calls = pipeline.engine.calls
     # sliding layer: 2 x 4 heads with the window; full layer: 2 x 8, no window
     assert calls == [(0, (6, 2, 4), (6, 1, 4), 1.0, 1024),
                      (1, (6, 2, 8), (6, 1, 8), 1.0, None)]
+    assert pipeline.engine.blocks == [None, None]
     # A prompt row embeds to 1 x 2 = 2; a canvas row passes the
     # weightless post-norm, which the fake engine applies as x 1, so it
     # starts at 2 too. Attention adds 0 (its post-norm is x 0). The MoE
@@ -387,6 +455,112 @@ def test_pipeline_runs_the_gemma4_layer_order(monkeypatch):
     # halves: 3 -> 3.
     assert out.shape == (2, 4)
     assert out.tolist() == [[3.0] * 4, [3.0] * 4]
+
+
+def test_pipeline_embeds_images_and_runs_blocks_on_sliding_layers(monkeypatch):
+    """Soft token rows take the tower's output; only sliding layers see blocks."""
+    import numpy as np
+    torch = pytest.importorskip("torch")
+
+    from quail.backends.quail.executor.attention import ChunkImage
+    from quail.backends.quail.executor.models.vision import VisionEmbedder
+    from quail.pdf.prefetch import RenderedPage
+
+    _vllm_stubs(monkeypatch)
+    model = _fake_model(torch)
+    seen = {}
+
+    def embed_multimodal(*, pixel_values, pixel_position_ids):
+        seen["pixel_values"] = pixel_values
+        seen["positions"] = pixel_position_ids
+        # two soft tokens per page, each row the page id plus 10
+        return [torch.full((2, 4), float(10 + i))
+                for i in range(len(pixel_values))]
+
+    model.vision_tower = object()
+    model.embed_multimodal = embed_multimodal
+    pipeline = DiffusionGemmaPipeline(
+        model, None, spec=_spec_for(model), engine_class=_Engine,
+        vision_class=lambda torch_, m, **kw: VisionEmbedder(
+            torch_, m, device="cpu", **kw))
+    assert pipeline.takes_images
+    # rows: [start, soft, soft, end, question] for one document
+    patches = np.full((36, 3 * 16 * 16), 51, dtype=np.uint8)
+    page = RenderedPage(0, (6, 6), patches, 0.0)
+    chunk = SimpleNamespace(
+        input_ids=torch.zeros(5, dtype=torch.int64),
+        positions=torch.arange(5),
+        final_indices=torch.tensor([4]),
+        meta={"layer": 0, "blocks": {"rows": torch.tensor([1, 2])}},
+        images=(ChunkImage(1, 2, page),))
+    rows = {}
+    original = pipeline._layers
+
+    def layers(hidden, positions, meta):
+        rows["hidden"] = hidden.clone()
+        return original(hidden, positions, meta)
+
+    monkeypatch.setattr(pipeline, "_layers", layers)
+    pipeline.forward_chunk(chunk)
+    hidden = rows["hidden"]
+    # text rows embed to 1 x 2; the soft rows are the tower's output
+    assert hidden[0].tolist() == [2.0] * 4 and hidden[4].tolist() == [2.0] * 4
+    assert hidden[1].tolist() == [10.0] * 4 and hidden[2].tolist() == [10.0] * 4
+    # pixels reach the tower rescaled to [0, 1] with (column, row) positions
+    assert seen["pixel_values"][0].shape == (36, 768)
+    assert torch.allclose(seen["pixel_values"][0],
+                          torch.full((36, 768), 51 / 255))
+    assert seen["positions"][0][7].tolist() == [1, 1]
+    blocks = pipeline.engine.blocks
+    assert blocks[0] is chunk.meta["blocks"] and blocks[1] is None
+    assert pipeline.vision.images_embedded == 1
+
+    # a page whose soft token count differs from its rows is an error
+    chunk.images = (ChunkImage(1, 3, page),)
+    with pytest.raises(RuntimeError, match="reserved 3"):
+        pipeline.forward_chunk(chunk)
+
+
+def test_vision_embedder_runs_pages_through_the_tower_within_its_reserve():
+    """Pages split into tower calls whose patches fit the reserve; order holds."""
+    import numpy as np
+    torch = pytest.importorskip("torch")
+
+    from quail.backends.quail.executor.attention import ChunkImage
+    from quail.backends.quail.executor.models.vision import (
+        ACTIVATION_BYTES_PER_PATCH,
+        VisionEmbedder,
+        embed_runs,
+    )
+    from quail.pdf.prefetch import RenderedPage
+
+    calls = []
+
+    def embed_multimodal(*, pixel_values, pixel_position_ids):
+        calls.append(len(pixel_values))
+        return [torch.full((1, 2), float(values[0, 0] * 255))
+                for values in pixel_values]
+
+    model = SimpleNamespace(vision_tower=object(),
+                            embed_multimodal=embed_multimodal)
+    pages = [RenderedPage(i, (2, 2), np.full((4, 768), i, dtype=np.uint8), 0.0)
+             for i in range(5)]
+    images = [ChunkImage(i, 1, page) for i, page in enumerate(pages)]
+    # a budget of nine patches holds two 4-patch pages per run: 2, 2, 1
+    assert [len(run) for run in embed_runs(images, 9)] == [2, 2, 1]
+    # a page over the budget still embeds, alone
+    assert [len(run) for run in embed_runs(images, 3)] == [1] * 5
+
+    embedder = VisionEmbedder(torch, model, device="cpu",
+                              reserve_bytes=9 * ACTIVATION_BYTES_PER_PATCH)
+    assert embedder.patch_budget == 9
+    out = embedder.embed(images)
+    assert calls == [2, 2, 1] and embedder.embed_calls == 3
+    assert torch.allclose(out[:, 0], torch.arange(5, dtype=torch.float32))
+    # no reserve: one call for the whole chunk
+    calls.clear()
+    VisionEmbedder(torch, model, device="cpu").embed(images)
+    assert calls == [5]
 
 
 def _vllm_stubs(monkeypatch, workspace_ready=True):

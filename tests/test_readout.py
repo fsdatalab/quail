@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from quail.backends.quail.executor import loop
 from quail.backends.quail.executor.attention import (
@@ -40,6 +41,119 @@ def test_run_join_packs_every_chunk_for_its_path(monkeypatch):
                       [[1] * 8, [2] * 8], [[[3, 4]]], 64,
                       anchor_keys=[("a", 0), ("a", 1)])
         assert modes and all(mode == expected for mode in modes)
+
+
+class _Images:
+    """A PageImages stand-in: counts takes and opens per anchor."""
+
+    def __init__(self):
+        self.opened = None
+        self.docs = None
+        self.taken = []
+        self.closed = False
+
+    def open(self, chunk_tokens=None, docs=None):
+        self.opened = chunk_tokens
+        self.docs = docs
+
+    def take(self, doc):
+        self.taken.append(doc)
+        return (("block", f"page-{doc}"),)
+
+    def close(self):
+        self.closed = True
+
+
+def test_run_join_packs_an_anchor_page_with_its_prefix_once(monkeypatch):
+    from fakes import cpu_arena, fake_pipeline, fake_torch
+
+    packed = []
+    failed = []
+
+    def pack(torch, arena, specs, **kw):
+        if len(specs) > 1 and not failed:
+            # the split retries the same anchors: pages are not re-taken
+            failed.append(len(specs))
+            raise loop.ArenaFullError("unified suffix pages exceed the arena")
+        packed.append([(s["key"], s["prefix"] is not None, s.get("images"))
+                       for s in specs])
+        return SimpleNamespace(specs=specs, tokens=len(specs),
+                               attention_mode=kw["attention_mode"],
+                               temporary_keys=(), fresh_keys=())
+
+    monkeypatch.setattr(loop, "pack_chunk", pack)
+    arena = cpu_arena(64)
+    monkeypatch.setattr(arena, "evict_retained", lambda need: ())
+    pipeline = fake_pipeline(
+        join_attention=FILTER_ATTENTION,
+        forward_chunk=lambda chunk: [1] * sum(len(s["suffixes"])
+                                              for s in chunk.specs))
+    pipeline.takes_images = True
+    answers = SimpleNamespace(submit=lambda v: v, result=lambda v: v, dtype=None)
+    images = _Images()
+    out, _, _ = loop.run_join(fake_torch(), arena, pipeline, answers,
+                              [[1] * 8, [2] * 8], [[[3, 4], [5, 6]]], 64,
+                              anchor_keys=[("p", 0), ("p", 1)], images=images)
+    assert images.opened == 64 and not images.closed   # the caller closes
+    assert images.docs == [0, 1]
+    assert images.taken == [0, 1]
+    carried = [(key, imgs) for chunk in packed for key, fresh, imgs in chunk
+               if fresh]
+    assert carried == [(("p", 0), (("block", "page-0"),)),
+                       (("p", 1), (("block", "page-1"),))]
+    assert all(imgs is None for chunk in packed
+               for _, fresh, imgs in chunk if not fresh)
+    assert out == [{0: [1, 1], 1: [1, 1]}]
+
+
+def test_run_join_renders_no_pages_for_an_anchor_without_partners(monkeypatch):
+    from fakes import cpu_arena, fake_pipeline, fake_torch
+
+    def pack(torch, arena, specs, **kw):
+        return SimpleNamespace(specs=specs, tokens=len(specs),
+                               attention_mode=kw["attention_mode"],
+                               temporary_keys=(), fresh_keys=())
+
+    monkeypatch.setattr(loop, "pack_chunk", pack)
+    pipeline = fake_pipeline(
+        join_attention=FILTER_ATTENTION,
+        forward_chunk=lambda chunk: [1] * sum(len(s["suffixes"])
+                                              for s in chunk.specs))
+    pipeline.takes_images = True
+    answers = SimpleNamespace(submit=lambda v: v, result=lambda v: v, dtype=None)
+    images = _Images()
+    # anchor 1's partner list is empty: it settles without a chunk,
+    # so the renderer is not told about it and never renders its pages
+    partners = {("p", 0): [[1]], ("p", 1): [[]], ("p", 2): [[0, 1]]}
+    out, _, _ = loop.run_join(
+        fake_torch(), cpu_arena(64), pipeline, answers,
+        [[1] * 8, [2] * 8, [3] * 8], [[[3, 4], [5, 6]]], 64,
+        anchor_keys=list(partners), images=images,
+        anchor_partners=partners.__getitem__)
+    assert images.docs == [0, 2]
+    assert images.taken == [0, 2]
+    assert out == [{0: [1], 2: [1, 1]}]
+
+
+def test_run_join_checks_its_image_source_fits_the_path():
+    from fakes import cpu_arena, fake_pipeline, fake_torch
+
+    answers = SimpleNamespace(submit=lambda v: v, result=lambda v: v, dtype=None)
+    text_pipeline = fake_pipeline(join_attention=FILTER_ATTENTION)
+    text_pipeline.takes_images = False
+    with pytest.raises(ValueError, match="does not embed images"):
+        loop.run_join(fake_torch(), cpu_arena(64), text_pipeline, answers,
+                      [[1] * 8], [[[3]]], 64, images=_Images())
+    merge_pipeline = fake_pipeline(join_attention=JOIN_ATTENTION)
+    merge_pipeline.takes_images = True
+    with pytest.raises(ValueError, match="paged unified path"):
+        loop.run_join(fake_torch(), cpu_arena(64), merge_pipeline, answers,
+                      [[1] * 8], [[[3]]], 64, images=_Images())
+    with pytest.raises(ValueError, match="streamed anchor"):
+        loop.run_join(fake_torch(), cpu_arena(64), merge_pipeline, answers,
+                      [], [[[3]]], 64, anchor_keys=[],
+                      anchor_source=SimpleNamespace(done=True, chunks=0),
+                      images=_Images())
 
 
 def test_run_join_evicts_then_halves_a_chunk_that_does_not_fit(monkeypatch):

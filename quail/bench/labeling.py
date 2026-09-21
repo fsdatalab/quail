@@ -3,7 +3,8 @@
 Each predicate runs as a Quail query over the corpus with Qwen3 32B
 fp8: a filter over every document, a full join over every pair. FEVER
 and LePaRD supply source truth where the dataset gives the exact
-answer. Every part file is written under a content-addressed path on
+answer; CUAD's clause predicates are answered by its lawyer annotation
+alone, on the CPU. Every part file is written under a content-addressed path on
 the `quail-results` volume and skipped when it already exists, so an
 interrupted pass resumes where it stopped. Scale factors 0.1, 0.5 and
 1.0 are supported; a smaller one samples a prefix of a larger one's
@@ -40,7 +41,8 @@ import pyarrow as pa
 
 from quail.bench.images import cpu_image, gpu_image
 from quail_b import data
-from quail_b.data import GROUND_TRUTH_ROOT, PUBLIC_BUCKET
+from quail_b.cuad import FILES_DIR
+from quail_b.data import CORPUS_COLUMNS, GROUND_TRUTH_ROOT, PUBLIC_BUCKET
 from quail_b.predicates import (
     MODEL_NAME,
     MODEL_REVISION,
@@ -53,6 +55,9 @@ from quail_b.predicates import (
     _full_hash,
     _named_id,
     _text_hash,
+    annotation_answer,
+    annotation_pair_answer,
+    annotation_sourced,
     example_identity,
     judgment_identity,
     predicate_payload,
@@ -185,8 +190,27 @@ def part_size_fields(manifest: dict) -> dict:
     return fields
 
 
+def filter_batch_rows(spec: PredicateSpec,
+                      prompts_per_call: int = PROMPTS_PER_CALL) -> int:
+    """Left rows per part of one filter: its group's share of a call.
+
+    The group is every filter of the workload over the same column,
+    so a part of any member covers the same rows.
+    """
+    return next(n for _table, members, n
+                in filter_groups(workload_specs(spec.workload), prompts_per_call)
+                if spec in members)
+
+
 def join_specs(specs) -> tuple:
     return tuple(p for p in specs if p.kind == "join")
+
+
+def annotation_workloads() -> tuple[str, ...]:
+    """The workloads whose every predicate the annotation answers."""
+    return tuple(workload for workload in WORKLOADS
+                 if all(annotation_sourced(spec)
+                        for spec in workload_specs(workload)))
 
 
 def _load_corpus(corpus_id: str) -> tuple[Path, dict, dict]:
@@ -195,23 +219,6 @@ def _load_corpus(corpus_id: str) -> tuple[Path, dict, dict]:
     with open(target / "manifest.json") as f:
         manifest = json.load(f)
     return target, manifest, _read_rows(target)
-
-
-# Every table here feeds corpus_id, so adding or removing one
-# invalidates every label-set identity and forces a full relabel.
-CORPUS_COLUMNS = {
-    "reviews": ("id", "body"),
-    "aspects": ("id", "aspect"),
-    "reports": ("id", "report", "reactions"),
-    "terms": ("id", "term"),
-    "claims": ("id", "claim", "label", "evidence_wiki_url"),
-    "evidence": ("id", "text"),
-    "citation_contexts": ("id", "destination_context",
-                          "cited_passage_ids"),
-    "citation_passages": ("id", "passage_text", "passage_ids"),
-    "agent_traces": ("id", "trace", "trajectory_id", "turn_index",
-                     "token_count"),
-}
 
 
 def _atomic_json(path: Path, payload: dict) -> None:
@@ -264,27 +271,16 @@ def _read_rows(data_dir: Path) -> dict[str, list[dict]]:
 
 
 def _corpus_identity(rows: dict[str, list[dict]], sf: float) -> dict:
-    tables = {}
-    for table in sorted(rows):
-        row_hashes = [_full_hash(row) for row in rows[table]]
-        tables[table] = {
-            "rows": len(row_hashes),
-            "ordered_rows_full_hash": _full_hash(row_hashes),
-        }
-    payload = {
-        "schema_version": SCHEMA_VERSION,
-        "benchmark": "quailb",
-        "scale_factor": sf,
-        "data_seed": data.DATA_SEED,
-        "source_revisions": data.SOURCE_REVISIONS,
-        "tables": tables,
-    }
-    full = _full_hash(payload)
-    return {**payload, "corpus_id": _named_id("c", full),
-            "corpus_full_hash": full}
+    """The corpus id quail-b computes for these tables, with this code's pins."""
+    return data.corpus_identity(rows, sf, data.DATA_SEED, data.SOURCE_REVISIONS)
 
 
 def _materialize_corpus(sf: float) -> tuple[Path, dict, dict]:
+    """Build the corpus and copy its tables and referenced files to ROOT.
+
+    A file table's PDFs land under `files/` beside the tables, where
+    the table's relative references point.
+    """
     with tempfile.TemporaryDirectory(prefix="quailb_judge_") as temp:
         data_dir = data.build_sets(temp, sf=sf)
         rows = _read_rows(data_dir)
@@ -295,6 +291,9 @@ def _materialize_corpus(sf: float) -> tuple[Path, dict, dict]:
             destination = target / source.name
             if not destination.exists():
                 shutil.copy2(source, destination)
+        files = data_dir / FILES_DIR
+        if files.is_dir():
+            shutil.copytree(files, target / FILES_DIR, dirs_exist_ok=True)
         manifest = {**identity, "columns": CORPUS_COLUMNS}
         _atomic_json(target / "manifest.json", manifest)
     return target, manifest, _read_rows(target)
@@ -365,16 +364,14 @@ def _part_bounds(spec: PredicateSpec, identity: dict,
                  corpus_rows: dict[str, list[dict]]) -> list[tuple[int, int]]:
     """The left-row ranges the writers split this predicate into.
 
-    Must stay in step with _write_filter_parts, _write_qwen_join_parts
-    and _write_lepard_source, which is why the batch sizes are derived
-    the same way here rather than restated.
+    Must stay in step with _write_filter_parts and _write_qwen_join_parts,
+    which is why the batch sizes are derived the same way here rather
+    than restated; the source-labeled join writers read these bounds.
     """
     left = len(corpus_rows[spec.left_table])
     per_call = identity.get("prompts_per_call", LEGACY_PROMPTS_PER_CALL)
     if spec.kind == "filter":
-        step = next(n for _table, members, n
-                    in filter_groups(workload_specs(spec.workload), per_call)
-                    if spec in members)
+        step = filter_batch_rows(spec, per_call)
     elif spec.source_policy == "lepard_citation_edge":
         step = 50
     else:
@@ -456,6 +453,13 @@ class QuailJudge:
     registers its rows as an in-memory table under a fresh name, so
     the catalog grows by one entry per part.
     """
+
+    source = MODEL_NAME
+
+    @classmethod
+    def source_of(cls, spec: PredicateSpec) -> str:
+        """The label source recorded on this predicate's rows: the model."""
+        return cls.source
 
     def __init__(self, gpus: int = 1):
         import quail
@@ -554,6 +558,29 @@ class QuailJudge:
         return answers
 
 
+class AnnotationLabeler:
+    """Answer predicates from the dataset's annotation; no model, no GPU.
+
+    Answers the same filter interface as `QuailJudge`, so the part
+    writers do not care which one they hold. Each row's label source
+    is the predicate's own annotation, named by its source policy.
+    """
+
+    source = "annotation"
+
+    @staticmethod
+    def source_of(spec: PredicateSpec) -> str:
+        """The label source recorded on this predicate's rows."""
+        if not annotation_sourced(spec):
+            raise ValueError(f"{spec.key} is not answered by an annotation")
+        return spec.source_policy
+
+    def filter(self, spec: PredicateSpec, rows: list[dict]) -> list[bool]:
+        """One answer per row, in row order."""
+        self.source_of(spec)
+        return [annotation_answer(spec, row) for row in rows]
+
+
 class VerificationSample:
     """A few saved answers per predicate, asked again at the end."""
 
@@ -622,10 +649,23 @@ def _saved_verification_sample(
     return verification
 
 
-def _write_filter_parts(judge: QuailJudge, verification: VerificationSample,
+def _write_filter_parts(labeler, verification: VerificationSample | None,
                         rows: list[dict], specs: list[PredicateSpec],
                         identities: dict[str, dict], corpus_id: str,
                         batch_rows: int) -> None:
+    """Write the missing parts of these filters, `batch_rows` rows at a time.
+
+    Args:
+        labeler: A `QuailJudge` or `AnnotationLabeler`; its `source`
+            names the label source of every row it answers.
+        verification: Where a sample of the answers is kept to ask
+            again, or None when the answers are not a model's.
+        rows: The left table's rows.
+        specs: The filters, all over the same column of that table.
+        identities: Predicate key -> label-set identity.
+        corpus_id: The corpus the rows come from.
+        batch_rows: Rows per part; `filter_batch_rows` of every spec.
+    """
     for start in range(0, len(rows), batch_rows):
         end = min(start + batch_rows, len(rows))
         missing = [spec for spec in specs
@@ -634,18 +674,19 @@ def _write_filter_parts(judge: QuailJudge, verification: VerificationSample,
         if not missing:
             continue
         for spec in missing:
-            answers = judge.filter(spec, rows[start:end])
+            answers = labeler.filter(spec, rows[start:end])
             output = []
             for row, answer in zip(rows[start:end], answers):
                 output.append(_answer_row(
                     spec, identities[spec.key], corpus_id, row, None,
-                    answer, MODEL_NAME, None))
-                verification.add(spec, row, None, answer)
+                    answer, labeler.source_of(spec), None))
+                if verification is not None:
+                    verification.add(spec, row, None, answer)
             _atomic_parquet(
                 _part_path(spec, identities[spec.key], start, end), output)
         after_write()
-        print(f"[judge] filters {specs[0].workload} rows {start}:{end}",
-              flush=True)
+        print(f"[{labeler.source}] filters {specs[0].workload} rows "
+              f"{start}:{end}", flush=True)
 
 
 def _write_qwen_join_parts(judge: QuailJudge,
@@ -693,26 +734,54 @@ def _lepard_source_answer(cited_passage_ids, passage_ids) -> bool:
     return not cited_passage_ids.isdisjoint(passage_ids)
 
 
-def _write_lepard_source(spec: PredicateSpec, left_rows: list[dict],
-                          right_rows: list[dict], identity: dict,
-                          corpus_id: str, anchor_batch: int = 50) -> None:
-    right_passage_ids = [set(right["passage_ids"]) for right in right_rows]
-    for start in range(0, len(left_rows), anchor_batch):
-        end = min(start + anchor_batch, len(left_rows))
+def _write_source_join_parts(spec: PredicateSpec, left_rows: list[dict],
+                             right_rows: list[dict], identity: dict,
+                             corpus_id: str, answer, source: str) -> None:
+    """Write a join's parts over every pair from the dataset's own labels.
+
+    `answer(left row, right row)` gives each pair's answer and `source`
+    is the label source recorded on every row. The parts split the left
+    rows exactly as `_part_bounds` expects them for this predicate.
+    """
+    bounds = _part_bounds(spec, identity, {spec.left_table: left_rows,
+                                           spec.right_table: right_rows})
+    for start, end in bounds:
         part = _part_path(spec, identity, start, end)
         if part.exists():
             continue
         output = []
         for left in left_rows[start:end]:
-            cited_passage_ids = set(left["cited_passage_ids"])
-            for right, passage_ids in zip(right_rows, right_passage_ids):
+            for right in right_rows:
                 output.append(_answer_row(
                     spec, identity, corpus_id, left, right,
-                    _lepard_source_answer(cited_passage_ids, passage_ids),
-                    "lepard_citation_edge", None))
+                    answer(left, right), source, None))
         _atomic_parquet(part, output)
         after_write()
-        print(f"[judge] LePaRD source anchors {start}:{end}", flush=True)
+        print(f"[{source}] join {spec.workload} anchors {start}:{end}",
+              flush=True)
+
+
+def _write_lepard_source(spec: PredicateSpec, left_rows: list[dict],
+                         right_rows: list[dict], identity: dict,
+                         corpus_id: str) -> None:
+    right_passage_ids = {id(right): set(right["passage_ids"])
+                         for right in right_rows}
+
+    def answer(left, right):
+        return _lepard_source_answer(set(left["cited_passage_ids"]),
+                                     right_passage_ids[id(right)])
+
+    _write_source_join_parts(spec, left_rows, right_rows, identity,
+                             corpus_id, answer, "lepard_citation_edge")
+
+
+def _write_annotation_join(spec: PredicateSpec, left_rows: list[dict],
+                           right_rows: list[dict], identity: dict,
+                           corpus_id: str) -> None:
+    _write_source_join_parts(
+        spec, left_rows, right_rows, identity, corpus_id,
+        lambda left, right: annotation_pair_answer(spec, left, right),
+        AnnotationLabeler.source_of(spec))
 
 
 def _expected_rows(spec: PredicateSpec,
@@ -885,12 +954,7 @@ def prepare_corpus(sf: float = SCALE_FACTOR) -> dict:
         raise ValueError(
             f"scale factor {sf} is not one of {SUPPORTED_SCALE_FACTORS}")
     _, corpus_manifest, _ = _materialize_corpus(sf)
-    identities = {
-        spec.key: label_set_identity(
-            spec, corpus_manifest["corpus_id"],
-            corpus_manifest["corpus_full_hash"])
-        for spec in PREDICATES
-    }
+    identities = _identities(PREDICATES, corpus_manifest)
     collection = _collection_identity(corpus_manifest, identities)
     path = (ROOT / "collections" / collection["collection_id"]
             / "manifest.json")
@@ -905,24 +969,19 @@ def prepare_corpus(sf: float = SCALE_FACTOR) -> dict:
             "complete": complete}
 
 
-def judge_workload(corpus_id: str, workload: str) -> dict:
-    """Label one workload's predicates on one GPU.
-
-    Every part file is written under a content-addressed path and
-    skipped when it already exists, so a container that dies part way
-    resumes where it stopped.
-    """
-    specs = workload_specs(workload)
-    if not specs:
-        raise ValueError(f"no predicates for workload {workload!r}")
-    t_total = time.perf_counter()
-    _, corpus_manifest, rows = _load_corpus(corpus_id)
-    identities = {
+def _identities(specs, corpus_manifest: dict) -> dict[str, dict]:
+    """Predicate key -> this pass's label-set identity on that corpus."""
+    return {
         spec.key: label_set_identity(
             spec, corpus_manifest["corpus_id"],
             corpus_manifest["corpus_full_hash"])
         for spec in specs
     }
+
+
+def _start_label_sets(specs, identities: dict[str, dict],
+                      rows: dict[str, list[dict]]) -> None:
+    """Write a running manifest for each label set that has none yet."""
     for spec in specs:
         label_dir = _label_dir(spec, identities[spec.key])
         label_dir.mkdir(parents=True, exist_ok=True)
@@ -933,6 +992,31 @@ def judge_workload(corpus_id: str, workload: str) -> dict:
                 "predicate": asdict(spec),
                 "expected_rows": _expected_rows(spec, rows),
             })
+
+
+def _workload_specs(workload: str) -> tuple:
+    specs = workload_specs(workload)
+    if not specs:
+        raise ValueError(f"no predicates for workload {workload!r}")
+    return specs
+
+
+def judge_workload(corpus_id: str, workload: str) -> dict:
+    """Label one workload's predicates on one GPU.
+
+    Every part file is written under a content-addressed path and
+    skipped when it already exists, so a container that dies part way
+    resumes where it stopped.
+    """
+    specs = _workload_specs(workload)
+    if workload in annotation_workloads():
+        raise ValueError(
+            f"{workload} is labeled from its annotation; run "
+            "label_annotated_workload instead of a GPU judge")
+    t_total = time.perf_counter()
+    _, corpus_manifest, rows = _load_corpus(corpus_id)
+    identities = _identities(specs, corpus_manifest)
+    _start_label_sets(specs, identities, rows)
 
     judge = QuailJudge()
     boot_s = judge.boot_s
@@ -950,6 +1034,10 @@ def judge_workload(corpus_id: str, workload: str) -> dict:
         if spec.source_policy == "lepard_citation_edge":
             _write_lepard_source(spec, left, right, identities[spec.key],
                                  corpus_id_)
+            continue
+        if annotation_sourced(spec):
+            _write_annotation_join(spec, left, right, identities[spec.key],
+                                   corpus_id_)
             continue
         _write_qwen_join_parts(
             judge, verification, spec, left, right, identities[spec.key],
@@ -980,16 +1068,53 @@ def judge_workload(corpus_id: str, workload: str) -> dict:
     return partial
 
 
+def label_annotated_workload(corpus_id: str, workload: str) -> dict:
+    """Label one workload from its dataset's annotation, on the CPU.
+
+    Returns the same partial record as `judge_workload`, with no model
+    time and nothing to ask again, so `finalize_collection` takes it
+    unchanged.
+    """
+    specs = _workload_specs(workload)
+    if workload not in annotation_workloads():
+        raise ValueError(f"{workload} needs a model judge for some predicate")
+    t_total = time.perf_counter()
+    _, corpus_manifest, rows = _load_corpus(corpus_id)
+    identities = _identities(specs, corpus_manifest)
+    _start_label_sets(specs, identities, rows)
+    labeler = AnnotationLabeler()
+    for table, group, rows_per_call in filter_groups(specs):
+        _write_filter_parts(labeler, None, rows[table], list(group),
+                            identities, corpus_manifest["corpus_id"],
+                            rows_per_call)
+    for spec in join_specs(specs):
+        _write_annotation_join(spec, rows[spec.left_table],
+                               rows[spec.right_table], identities[spec.key],
+                               corpus_manifest["corpus_id"])
+    manifests = {spec.key: _complete_manifest(spec, identities[spec.key], rows)
+                 for spec in specs}
+    partial = {
+        "workload": workload,
+        "manifests": manifests,
+        "boot_s": 0.0,
+        "model_wall_s": 0.0,
+        "total_wall_s": round(time.perf_counter() - t_total, 2),
+        "queries_this_call": 0,
+        "rows_answered_this_call_including_verification": 0,
+        "deterministic_rerun": {
+            "compared": 0, "answer_differences": 0,
+            "submission_order": "none: the annotation answers every row"},
+    }
+    print(f"[{labeler.source}] {workload} done in "
+          f"{partial['total_wall_s']:.1f}s", flush=True)
+    return partial
+
+
 def finalize_collection(sf: float, corpus_id: str,
                         partials: dict[str, dict]) -> dict:
     """Assemble five workloads and activate their ground truth."""
     _, corpus_manifest, _ = _load_corpus(corpus_id)
-    identities = {
-        spec.key: label_set_identity(
-            spec, corpus_manifest["corpus_id"],
-            corpus_manifest["corpus_full_hash"])
-        for spec in PREDICATES
-    }
+    identities = _identities(PREDICATES, corpus_manifest)
     collection = _collection_identity(corpus_manifest, identities)
     collection_dir = (ROOT / "collections"
                       / collection["collection_id"])
@@ -1273,8 +1398,9 @@ def derive_collection(sf: float, source_collection_id: str) -> dict:
 
     Every model judgment and FEVER source label is copied by document
     content hash. The LePaRD citation join depends on which citation
-    pairs the corpus sampled, so it is recomputed from the target
-    corpus instead.
+    pairs the corpus sampled, and CUAD's annotation labels on the ids
+    the corpus gave its contracts, so those are recomputed from the
+    target corpus instead.
     """
     if float(sf) not in SUPPORTED_SCALE_FACTORS:
         raise ValueError(
@@ -1299,26 +1425,27 @@ def derive_collection(sf: float, source_collection_id: str) -> dict:
     t_total = time.perf_counter()
     _, corpus_manifest, rows = _materialize_corpus(sf)
     corpus_id = corpus_manifest["corpus_id"]
-    identities = {
-        spec.key: label_set_identity(
-            spec, corpus_id, corpus_manifest["corpus_full_hash"])
-        for spec in PREDICATES
-    }
+    identities = _identities(PREDICATES, corpus_manifest)
+    _start_label_sets(PREDICATES, identities, rows)
     origin = {}
     for spec in PREDICATES:
         identity = identities[spec.key]
-        label_dir = _label_dir(spec, identity)
-        label_dir.mkdir(parents=True, exist_ok=True)
-        if not (label_dir / "manifest.json").exists():
-            _atomic_json(label_dir / "manifest.json", {
-                **identity,
-                "status": "running",
-                "predicate": asdict(spec),
-                "expected_rows": _expected_rows(spec, rows),
-            })
         if spec.source_policy == "lepard_citation_edge":
             _write_lepard_source(spec, rows[spec.left_table],
                                  rows[spec.right_table], identity, corpus_id)
+            origin[spec.key] = {"recomputed_from": corpus_id}
+            continue
+        if annotation_sourced(spec):
+            # the ids a smaller corpus gives its documents differ, so the
+            # annotation is asked again rather than copied by content
+            if spec.kind == "join":
+                _write_annotation_join(spec, rows[spec.left_table],
+                                       rows[spec.right_table], identity,
+                                       corpus_id)
+            else:
+                _write_filter_parts(
+                    AnnotationLabeler(), None, rows[spec.left_table], [spec],
+                    identities, corpus_id, filter_batch_rows(spec))
             origin[spec.key] = {"recomputed_from": corpus_id}
             continue
         source_label_set_id = source["label_sets"][spec.key]
@@ -1371,10 +1498,11 @@ def derive_collection(sf: float, source_collection_id: str) -> dict:
 def collection_files(root: Path, collection_id: str) -> list[Path]:
     """Every file a reader of one collection needs, under root.
 
-    The collection and corpus manifests, the corpus tables, each
-    label set's manifest and compact `labels.parquet`, and the
-    manifests of any collection and corpus it reuses labels from.
-    Part files are not needed once a label set is compacted.
+    The collection and corpus manifests, the corpus tables and the
+    files they refer to, each label set's manifest and compact
+    `labels.parquet`, and the manifests of any collection and corpus
+    it reuses labels from. Part files are not needed once a label set
+    is compacted.
     """
     collection_dir = root / "collections" / collection_id
     with open(collection_dir / "manifest.json") as f:
@@ -1385,6 +1513,7 @@ def collection_files(root: Path, collection_id: str) -> list[Path]:
     corpus_dir = root / "corpora" / manifest["corpus_id"]
     files += sorted(path for path in corpus_dir.iterdir()
                     if path.is_file() and path.suffix in (".json", ".parquet"))
+    files += sorted((corpus_dir / FILES_DIR).rglob("*.pdf"))
     for label_set_id in sorted(manifest["label_sets"].values()):
         matches = list((root / "label_sets").glob(
             f"*/*/{label_set_id}/manifest.json"))
@@ -1488,6 +1617,12 @@ def _aws_credentials() -> dict[str, str]:
 
 
 aws_from_launcher = modal.Secret.from_dict(_aws_credentials())
+# A gated dataset (OfficeQA Pro v2) downloads with the launching
+# machine's Hugging Face token; without one the build of its tables
+# raises PermissionError and the other tables are unaffected.
+hf_from_launcher = modal.Secret.from_dict(
+    {"HF_TOKEN": os.environ["HF_TOKEN"]} if os.environ.get("HF_TOKEN")
+    else {})
 # Experiment cells attach to this existing app so its caches remain useful.
 app = modal.App("quail-milestone1")
 
@@ -1544,7 +1679,8 @@ def run_compact(collection_id: str) -> str:
 @app.function(
     image=image, memory=CPU_MEMORY_MB, timeout=2 * CPU_TIMEOUT_S,
     volumes={"/root/.cache/huggingface": hf_cache,
-             "/results": results_vol})
+             "/results": results_vol},
+    secrets=[hf_from_launcher])
 def run_prepare_corpus(sf: float = SCALE_FACTOR) -> str:
     _mount()
     result = prepare_corpus(sf)
@@ -1567,6 +1703,24 @@ def run_judge_workload(corpus_id: str, workload: str) -> str:
     results_vol.commit()
     kernel_cache.commit()
     return json.dumps(partial, sort_keys=True)
+
+
+@app.function(
+    image=image, memory=CPU_MEMORY_MB, timeout=CPU_TIMEOUT_S,
+    volumes={"/results": results_vol})
+def run_label_annotated_workload(corpus_id: str, workload: str) -> str:
+    """Label one workload from its dataset's annotation, on the CPU."""
+    _mount()
+    partial = label_annotated_workload(corpus_id, workload)
+    results_vol.commit()
+    return json.dumps(partial, sort_keys=True)
+
+
+def spawn_workload(corpus_id: str, workload: str):
+    """Start the labeling call a workload needs: a GPU judge or the CPU."""
+    if workload in annotation_workloads():
+        return run_label_annotated_workload.spawn(corpus_id, workload)
+    return run_judge_workload.spawn(corpus_id, workload)
 
 
 @app.function(
@@ -1699,10 +1853,9 @@ def main(sf: float = SCALE_FACTOR, compact_collection: str | None = None,
     if unknown:
         raise ValueError(f"unknown workloads: {unknown}")
 
-    calls = {w: run_judge_workload.spawn(corpus_id, w) for w in names}
+    calls = {w: spawn_workload(corpus_id, w) for w in names}
     for w, c in calls.items():
-        print(f"function call id (judge_workload {w}): {c.object_id}",
-              flush=True)
+        print(f"function call id (workload {w}): {c.object_id}", flush=True)
     partials = {}
     for w, c in calls.items():
         partials[w] = json.loads(c.get())

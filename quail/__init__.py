@@ -14,6 +14,7 @@ from quail.logical import (
     render_join_prompt_text,
     true_false_ids,
 )
+from quail.pdf import PdfReadError
 from quail.physical import NodeCodec, PhysicalGraph, PhysicalNode
 from quail.planner.estimate import SpeedOfLightEstimate, speed_of_light_estimate
 from quail.planner.plan import EngineConfig
@@ -25,6 +26,7 @@ __all__ = [
     "EngineConfig",
     "ExtensionRegistry",
     "NodeCodec",
+    "PdfReadError",
     "PhysicalGraph",
     "PhysicalNode",
     "Query",

@@ -20,7 +20,7 @@ from quail.physical import (
     PhysicalNode,
     PortRef,
     Project,
-    Scan,
+    TextScan,
     ValueType,
     decode_graph,
 )
@@ -67,7 +67,7 @@ class FirstDocumentsRuntime:
 
 
 def local_plan(context, *, count, estimate, source):
-    scan = Scan(
+    scan = TextScan(
         node_id="input:d",
         alias="d",
         input_id="d",
@@ -193,7 +193,7 @@ def test_physical_extensions_plan_validate_and_execute(monkeypatch):
     assert decode_graph(envelope["graph"], registry.codecs) == plan.graph
 
     registry = built_in_registry()
-    scan = Scan(
+    scan = TextScan(
         node_id="input:d",
         alias="d",
         input_id="d",
@@ -242,7 +242,7 @@ def test_physical_extensions_plan_validate_and_execute(monkeypatch):
         module.register_quail_extension = register
         patch.setitem(sys.modules, module_name, module)
         registry = built_in_registry()
-        scan = Scan(
+        scan = TextScan(
             node_id="input:d",
             alias="d",
             input_id="d",
@@ -277,7 +277,7 @@ def test_physical_extensions_plan_validate_and_execute(monkeypatch):
 def test_physical_explain_shows_shared_inputs_and_metrics():
     from quail.physical.base import input_ports
 
-    source = Scan(node_id="input:d", alias="d", n_docs=100)
+    source = TextScan(node_id="input:d", alias="d", n_docs=100)
     first = FirstDocuments(
         node_id="first", alias="d", count=5,
         inputs=input_ports((PortRef(source.node_id, "ids:d"),)))
@@ -304,7 +304,7 @@ def test_physical_explain_shows_shared_inputs_and_metrics():
     from quail.execution.runner import NodeMetrics
     from quail.explain import physical_tree
 
-    node = Scan(node_id="input:d", alias="d", n_docs=100)
+    node = TextScan(node_id="input:d", alias="d", n_docs=100)
     graph = PhysicalGraph((node,), PortRef(node.node_id, "ids:d"))
     assert "metrics unavailable" in physical_tree(graph, metrics={})
     measured = {node.node_id: NodeMetrics(output_rows=42, wall_s=1.25,
@@ -316,3 +316,30 @@ def test_physical_explain_shows_shared_inputs_and_metrics():
     assert "est. time" not in text
     assert "fresh_tokens=200" in physical_tree(
         graph, metrics=measured, verbose=True)
+
+
+def test_saved_text_scan_envelope_decodes_to_text_scan():
+    """A graph saved before PDF inputs existed still names its scans quail.scan."""
+    from quail.builtins import built_in_registry
+    from quail.physical import PhysicalScan
+
+    saved = {
+        "nodes": [{
+            "id": "input:d",
+            "type": "quail.scan",
+            "inputs": [],
+            "attributes": {
+                "alias": "d", "input_id": "d", "n_docs": 3,
+                "total_tokens": 30, "shard_ranges": [[0, 3]],
+                "shard_token_loads": [30],
+            },
+        }],
+        "root": {"node_id": "input:d", "port": "ids:d"},
+    }
+    graph = decode_graph(saved, built_in_registry().codecs)
+    (node,) = graph.nodes
+    assert type(node) is TextScan
+    assert isinstance(node, PhysicalScan)
+    assert node.shards == (range(0, 3),)
+    # the coordinator runtime is shared by every scan kind
+    assert TextScan.runtime_key == PhysicalScan.runtime_key == "quail.scan"

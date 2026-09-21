@@ -38,4 +38,26 @@ DIFFUSION_GEMMA_26B_FP8 = ModelSpec(
     moe_backend="triton",
     # Bound expert workspace and attention buffers for 512-wide heads.
     chunk_cap_tokens=65_536,
+    # Images go through the Gemma 4 vision tower: 16 px patches, 3 x 3
+    # pooled into one soft token, at most one of these budgets per
+    # image, wrapped in the checkpoint's boi and eoi tokens. The
+    # checkpoint's own processor confirmed the budgets, the token ids,
+    # and the soft token arithmetic
+    # (/results/ablations/pdf_probe_vision.json).
+    input_modalities=frozenset({"text", "image"}),
+    image_token_budgets=(70, 140, 280, 560, 1120),
+    default_image_tokens=280,
+    # One prompt held 32 CUAD contract pages (8,605 prompt tokens) at
+    # budget 280 with a steady 76 GB peak; more pages were not tried
+    # (/results/ablations/pdf_probe_images.json).
+    max_images_per_request=32,
+    image_patch_pixels=16,
+    image_pool_kernel=3,
+    image_start_id=255_999,
+    image_soft_id=258_880,
+    image_end_id=258_882,
+    # Eight letter pages at budget 280 took 1.44 GB above the loaded
+    # weights through vLLM's encoder path (pdf_probe_vision.json,
+    # peak_bytes); 4 GiB covers a chunk's pages at the largest budget.
+    image_reserve_bytes=4 * 2**30,
 )
