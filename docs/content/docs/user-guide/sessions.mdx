@@ -67,10 +67,10 @@ Later queries reuse the loaded model and compiled kernels.
 Tokenized documents are also reused across queries on the same
 session.
 
-## Running on a query service
+## Running on Quail Server
 
 Pass `endpoint` to run queries on a deployed
-[query service](/docs/user-guide/service) instead of in this process.
+[Quail Server](/docs/user-guide/server) instead of in this process.
 `register`, `sql`, `run`, and `collect` work the same; `submit()`
 returns a handle you can come back to later.
 
