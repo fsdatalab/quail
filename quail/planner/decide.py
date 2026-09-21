@@ -365,7 +365,9 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     operators = plan.operators()
     scans, filters, joins = operators.scans, operators.filters, operators.joins
     pdf_documents = dict(pdf_documents or {})
-    refused = refuse_pdf_documents(pdf_documents, model, joins, gpus)
+    refused = refuse_pdf_documents(pdf_documents, model, gpus)
+    if refused is None:
+        joins, refused = anchor_pdf_joins(joins, pdf_documents)
     if refused is not None:
         return refused
     applies = operators.applies
@@ -791,15 +793,50 @@ def scan_node(node_id: str, alias: str, stats: CorpusStats, shard_ranges,
                    pages_per_row_max=pdf.pages_per_row_max)
 
 
+def anchor_pdf_joins(joins, pdf_documents: Mapping[str, PdfDocuments]
+                     ) -> tuple[list, Refusal | None]:
+    """Anchor every join that reads PDF pages on its PDF alias.
+
+    The runtime renders an anchor's pages with its prefix; a partner's
+    tokens follow as a suffix and are never rendered. So a join may
+    read one PDF alias, and that alias is its anchor: a free choice
+    is fixed to it, a choice of another alias is refused.
+
+    Returns:
+        (joins, refusal): the joins with their anchors fixed, and the
+        refusal if one join cannot be anchored on PDF pages.
+    """
+    out = []
+    for join in joins:
+        pdf_aliases = sorted({ref.alias for ref in join.prompt.args
+                              if ref.alias in pdf_documents})
+        if len(pdf_aliases) > 1:
+            return out, Refusal(
+                reasons=(f"a join reads the pages of one PDF alias; "
+                         f"{pdf_aliases} all bind PDF pages",),
+                constraint="pdf_join_partner_unsupported",
+                needed=1, available=len(pdf_aliases),
+                unit="PDF aliases in one join")
+        if pdf_aliases and join.anchor not in (None, pdf_aliases[0]):
+            return out, Refusal(
+                reasons=(f"{pdf_aliases[0]!r} binds PDF pages and must "
+                         f"anchor the join, but the join is anchored "
+                         f"on {join.anchor!r}",),
+                constraint="pdf_join_partner_unsupported",
+                needed=1, available=0, unit="PDF anchors")
+        if pdf_aliases and join.anchor is None:
+            join = replace(join, anchor=pdf_aliases[0])
+        out.append(join)
+    return out, None
+
+
 def refuse_pdf_documents(pdf_documents: Mapping[str, PdfDocuments],
-                         model: ModelSpec, joins, gpus: int = 1) -> Refusal | None:
+                         model: ModelSpec, gpus: int = 1) -> Refusal | None:
     """The refusal a PDF alias earns before any plan is built, if any.
 
-    PDF rows go through AI.FILTER only: a join would place a partner's
-    pages after the anchor's, which the runtime does not render. The
-    model must take images, no row may show more pages than the model
-    was tested with, and the pages render for one GPU's chain: the
-    multi-GPU coordinator splits token documents only.
+    The model must take images, no row may show more pages than the
+    model was tested with, and the pages render for one GPU's chain:
+    the multi-GPU coordinator splits token documents only.
     """
     if not pdf_documents:
         return None
@@ -815,15 +852,6 @@ def refuse_pdf_documents(pdf_documents: Mapping[str, PdfDocuments],
                      f"bind PDF pages with gpus={gpus}",),
             constraint="pdf_rows_need_one_gpu",
             needed=1, available=gpus, unit="gpus")
-    joined = sorted({ref.alias for join in joins
-                     for ref in join.prompt.args
-                     if ref.alias in pdf_documents})
-    if joined:
-        return Refusal(
-            reasons=(f"AI.JOIN over PDF rows is not supported; "
-                     f"{joined} bind PDF pages",),
-            constraint="pdf_rows_join_unsupported",
-            needed=0, available=len(joined), unit="joined PDF aliases")
     limit = model.max_images_per_request
     for alias, pdf in pdf_documents.items():
         if limit is not None and pdf.pages_per_row_max > limit:

@@ -276,6 +276,97 @@ def test_pdf_rows_need_one_gpu(sources):
         assert plan.constraint == "pdf_rows_need_one_gpu"
 
 
+JOIN_SQL = """
+    SELECT q.id, p.doc_id FROM questions q JOIN pages p
+    ON q.doc_id = p.doc_id
+    AND AI.IF(PROMPT('Question: {0}\\nDoes this page answer it?\\n{1}',
+                     q.question, p.document))
+"""
+
+
+def _register_join_tables(session, sources):
+    session.register("pages", quail.DocumentProvider.from_pdfs(
+        sources, id_col="doc_id", path_col="path", row_mode="page"))
+    session.register("questions", quail.DocumentProvider.from_table(
+        pa.table({"id": [1, 2, 3],
+                  "doc_id": ["a", "a", "b"],
+                  "question": ["capex?", "revenue?", "net income?"]}),
+        id_col="id"))
+
+
+def test_join_over_pdf_pages_anchors_on_the_pages(sources):
+    from quail.physical import AiJoin
+
+    with gemma_session() as session:
+        _register_join_tables(session, sources)
+        plan = session.sql(JOIN_SQL, dialect="bq").plan()
+        assert not isinstance(plan, Refusal), plan
+        (scan,) = [n for n in plan.nodes if isinstance(n, PDFScan)]
+        assert scan.alias == "p"
+        (join,) = [n for n in plan.nodes if isinstance(n, AiJoin)]
+        assert join.anchor == "p"
+        assert all(stage.partners == ("q",) for stage in join.stages)
+        # an explicit text anchor cannot hold the pages
+        forced = session.sql(JOIN_SQL.replace(
+            "p.document))", "p.document), {'anchor': 'q'})"),
+            dialect="bq").plan()
+        assert isinstance(forced, Refusal)
+        assert forced.constraint == "pdf_join_partner_unsupported"
+
+
+def test_join_inputs_carry_an_image_source_for_pdf_anchors(sources):
+    from test_quail_backend import graph_state
+
+    from quail.backends.quail.executor.images import PageImages
+    from quail.backends.quail.graph import execute_single_graph
+    from quail.backends.quail.worker import (
+        payload_documents,
+        quail_runtime_payload,
+    )
+    from quail.builtins import built_in_registry
+    from quail.execution.runner import NodeMetrics, NodeResult
+    from quail.physical import AiJoin, decode_graph
+
+    with gemma_session() as session:
+        _register_join_tables(session, sources)
+        query = session.sql(JOIN_SQL, dialect="bq")
+        query.plan()
+        request = query._prepare_physical()
+    graph = decode_graph(request.plan["graph"], built_in_registry().codecs)
+    payload = quail_runtime_payload(request, graph)
+    payload["pre_ids"] = [1, 2]
+    docs = payload_documents(payload, GEMMA)
+    (join,) = [n for n in graph.nodes if isinstance(n, AiJoin)]
+    seen = {}
+
+    class CapturingExecution:
+        def execute(self, node, inputs):
+            if isinstance(node, AiJoin):
+                seen.update(inputs)
+                anchors = inputs["anchor_ids"]
+                return NodeResult(
+                    {f"ids:{node.anchor}": list(anchors),
+                     "join_answers:0": {
+                         "rows": {}, "anchor_index": list(anchors),
+                         "partner_index": inputs["partner_indices"][0],
+                         "anchor": node.anchor, "partners": ["q"],
+                         "semantics": "full", "selectivity": None,
+                         "written_pos": 0}},
+                    NodeMetrics(fresh_tokens=0, extension={"answers": [{}]}))
+            raise AssertionError(f"unexpected node {node}")
+
+    state = graph_state(CapturingExecution(), docs)
+    state["columns"] = payload["columns"]
+    execute_single_graph(state, payload, graph)
+    images = seen["images"]
+    assert isinstance(images, PageImages)
+    assert images.document_ids == list(seen["anchor_ids"]) == [0, 1, 2, 3, 4]
+    assert images.pre_tokens == 2
+    prefix = seen["prefixes"][0]
+    assert prefix[:3] == [1, 2, GEMMA.image_start_id]
+    assert len(prefix) == 2 + docs["p"].lengths[0]
+
+
 def test_worker_lays_pdf_rows_out_as_page_prompts_with_an_image_source(sources):
     from quail.backends.quail.executor.images import PageImages
     from quail.backends.quail.graph import filter_inputs
@@ -348,10 +439,12 @@ def test_compiler_keeps_the_document_column_out_of_values(sources, tmp_path):
         """)
         assert "document" not in {
             ref.column for ref in star.logical.output_schema()}
-        with pytest.raises(CompileError, match="AI.JOIN over PDF rows"):
+        session.register("more", quail.DocumentProvider.from_pdfs(
+            sources, id_col="doc_id", path_col="path", row_mode="page"))
+        with pytest.raises(CompileError, match="pages of one table"):
             session.sql("""
-                SELECT p.doc_id FROM pages p JOIN texts t
-                ON AI_FILTER(PROMPT('{0} matches {1}?', p.document, t.body))
+                SELECT p.doc_id FROM pages p JOIN more m
+                ON AI_FILTER(PROMPT('{0} matches {1}?', p.document, m.document))
             """)
         with pytest.raises(CompileError, match="a join condition"):
             session.sql("""

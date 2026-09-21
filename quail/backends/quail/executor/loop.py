@@ -620,7 +620,8 @@ def _forward(pipeline, arena, chunk):
 def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
              stage_suffixes, budget, stage_frames=None,
              anchor_keys=None, anchor_done=None, anchor_source=None,
-             anchor_partners=None, anchor_batch=None, staging=None):
+             anchor_partners=None, anchor_batch=None, staging=None,
+             images=None):
     """The join driver: stream partner lists against anchors.
 
     Survivors are gated between stages.
@@ -660,6 +661,12 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
             on each batch the source hands over before admission. A
             key it leaves out is freed, never admitted.
         staging: Optional reusable input transfer buffers.
+        images: Optional image source for anchors whose prefixes hold
+            image placeholders (PageImages): take(a) gives anchor a's
+            rendered pages, which ride the chunk that packs its prefix.
+            Only for anchors listed in anchor_prefixes; a streamed
+            anchor's pages were embedded by its own chain. The caller
+            closes it.
 
     Returns:
         (ans, spans, tokens): ans[j][a] = 0/1 row over the stage-j
@@ -681,6 +688,20 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         raise ValueError("anchor_keys must match anchor_prefixes")
     frames = stage_frames or [[] for _ in range(k)]
     mode = pipeline.join_attention
+    if images is not None:
+        if anchor_source is not None:
+            raise ValueError(
+                "images belong to anchor_prefixes; a streamed anchor's "
+                "pages were embedded by its chain")
+        if mode != FILTER_ATTENTION:
+            raise ValueError("images run the paged unified path")
+        if not pipeline.takes_images:
+            raise ValueError(
+                f"{type(pipeline).__name__} does not embed images")
+        images.open(budget)
+    # pages taken for an anchor whose chunk was split or retried, so
+    # the retry packs the same pages instead of taking the row again
+    taken_pages = {}
     canvas = tuple(pipeline.canvas_ids)
     answer_row = pipeline.canvas_answer_row
 
@@ -799,6 +820,11 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
                     prefix=prefixes[a] if carried else None,
                     f=f + len(frame),
                     suffixes=sufs))
+            if carried and images is not None:
+                if a not in taken_pages:
+                    taken_pages[a] = images.take(a)
+                specs[-2 if frame and start == 0 else -1]["images"] = \
+                    taken_pages[a]
         return pack_chunk(torch, arena, specs, attention_mode=mode,
                           staging=staging, canvas=canvas,
                           answer_row=answer_row)
@@ -870,6 +896,9 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         e1.record()
         for key in chunk.fresh_keys:
             arena.trim_window(key)
+        for a, _, _, _, carried in part:
+            if carried:
+                taken_pages.pop(a, None)
         spans.append((part[0][1], e0, e1))
         outstanding.append((part, async_ans.submit(normed)))
         # read the previous chunk's answers while this one runs

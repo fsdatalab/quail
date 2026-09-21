@@ -330,6 +330,50 @@ def test_filter_execution_and_retention_inputs(monkeypatch):
         assert result.metrics.extension == {"images": {"pages_rendered": 1}}
 
 
+def test_join_execution_hands_the_anchor_pages_to_run_join(monkeypatch):
+    received = {}
+
+    def fake_run_join(torch, arena, pipeline, async_ans, prefixes, suffixes,
+                      budget, **kwargs):
+        received.update(kwargs)
+        return [{0: [True]}], [], 5
+
+    class Images:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+        def metrics(self):
+            return {"pages_rendered": 2}
+
+    monkeypatch.setattr("quail.backends.quail.executor.loop.run_join",
+                        fake_run_join)
+    execution = QuailModelExecution(SimpleNamespace())
+    execution.bind_loaded_model(
+        model=object(), arena=FakeArena(), pipeline=SimpleNamespace())
+    execution.bind_query(
+        torch=fake_torch(), async_answers=object(), answer_rows=object(),
+        chunk_tokens=8192)
+    stage = JoinStage(
+        written_pos=0, exec_idx=0, anchor="p", partners=("q",),
+        semantics="full", selectivity=0.5, expected_tuples=1,
+        anchor_frame_tokens=0, pair_tail_tokens=1, anchor_resident="none",
+        tuple_tokens=0, frame_token_ids=(), label_token_ids=(("q", (10,)),),
+        tail_token_ids=(11,))
+    node = AiJoin(node_id="join", anchor="p", stages=(stage,))
+    images = Images()
+    result = execution.execute(node, {
+        "prefixes": [[1, 2]], "stage_suffixes": [[[3]]], "stage_frames": [[]],
+        "anchor_keys": [("p", 7)], "anchor_done": None, "anchor_ids": [7],
+        "partner_indices": {0: [[0]]}, "anchor_partners": None,
+        "group": [stage.runtime_spec()], "images": images,
+    })
+    assert received["images"] is images and images.closed
+    assert result.outputs["ids:p"] == [7]
+    assert result.metrics.extension["images"] == {"pages_rendered": 2}
+
+
 # ------------------------------------------------ streamed edges on a page arena
 
 

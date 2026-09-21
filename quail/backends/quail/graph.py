@@ -279,10 +279,12 @@ def _model_inputs(node, inputs, context: ExecutionContext) -> dict:
                 pairs.rows.update(pairs.batch(ids))
             kept = set(ids)
             return [key for key in keys if key[1] in kept]
+    images = None
     if stream is None:
         anchor_ids = by_alias[node.anchor]
+        anchor_docs = state["docs"][node.anchor]
         prefixes = [
-            chain_tokens(state["pre"], state["docs"][node.anchor][document])
+            chain_tokens(state["pre"], anchor_docs[document])
             for document in anchor_ids
         ]
         anchor_keys = [(node.anchor, document) for document in anchor_ids]
@@ -290,6 +292,10 @@ def _model_inputs(node, inputs, context: ExecutionContext) -> dict:
         state["kv_stats"]["join_anchor_hits"] += round_kv["hits"]
         state["kv_stats"]["join_anchor_misses"] += round_kv["misses"]
         anchor_stream = None
+        if isinstance(anchor_docs, PagePrompts):
+            # the anchor rows are PDF pages: the join renders them
+            # ahead and packs each anchor's pages with its prefix
+            images = PageImages(anchor_docs, anchor_ids, len(state["pre"]))
     else:
         # filled by the driver as the chain hands anchors over
         anchor_ids = None
@@ -335,6 +341,7 @@ def _model_inputs(node, inputs, context: ExecutionContext) -> dict:
         "anchor_partners": lists_for,
         "anchor_batch": anchor_batch,
         "group": group,
+        "images": images,
     }
 
 
@@ -438,9 +445,11 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
                 for node_id, value in result.nodes.items()
                 if graph.node(node_id).type_name == AiScore.type_name
             ],
-            # page render counters per filter chain over PDF rows
+            # page render counters per chain over PDF rows, by the
+            # filter's alias or the join's anchor alias
             "images": {
-                graph.node(node_id).alias: value.metrics.extension["images"]
+                _image_alias(graph.node(node_id)):
+                    value.metrics.extension["images"]
                 for node_id, value in result.nodes.items()
                 if "images" in value.metrics.extension
             },
@@ -491,6 +500,11 @@ def model_answers(graph, result) -> tuple[dict, list]:
                 f"join_answers:{stage.written_pos}"
             ] for stage in node.stages)
     return filters, joins
+
+
+def _image_alias(node) -> str:
+    """The alias whose pages a node rendered: a filter's, or a join's anchor."""
+    return node.anchor if isinstance(node, AiJoin) else node.alias
 
 
 def executed_join_plan(graph) -> list[dict]:

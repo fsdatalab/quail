@@ -207,8 +207,9 @@ class PDFProvider:
     ``page_number`` and ``page_count`` columns beside the repeated
     source columns. ``row_mode="pdf"`` keeps one row per source and
     adds ``page_count``. Both expose a model only ``document`` column
-    holding the row's page references; it can only be the document
-    argument of AI.FILTER.
+    holding the row's page references; it can only be a document
+    argument of an AI.FILTER or AI.JOIN prompt, and a join anchors on
+    the rows whose pages it reads.
 
     The provider reads page counts and sizes once, on the first call
     that needs them, and never renders a page.

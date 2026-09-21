@@ -174,6 +174,7 @@ class QuailModelExecution:
                 images=stream.get("images"),
             )
         lists_for = inputs.get("anchor_partners")
+        images = inputs.get("images")
         try:
             answers, spans, tokens = loop.run_join(
                 torch,
@@ -191,10 +192,13 @@ class QuailModelExecution:
                     None if lists_for is None
                     else lambda key: lists_for(key[1])),
                 anchor_batch=inputs.get("anchor_batch"),
+                images=images,
             )
         finally:
             if source is not None:
                 source.close()
+            if images is not None:
+                images.close()
         if source is not None:
             # admission order; a per-batch function may have dropped some
             anchor_ids = [key[1] for key in inputs["anchor_keys"]]
@@ -254,7 +258,11 @@ class QuailModelExecution:
                 fresh_tokens=tokens,
                 gpu_s=_gpu_seconds(torch, spans, inputs),
                 chunks=_chunks(spans, inputs),
-                extension={"answers": answers},
+                extension={
+                    "answers": answers,
+                    **({"images": dict(images.metrics())}
+                       if images is not None else {}),
+                },
             ),
         )
 

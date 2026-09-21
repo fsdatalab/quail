@@ -2,8 +2,10 @@
 
 A PDF provider's ``document`` column holds page references. The
 model reads it; a query cannot return it, compare it, or hand it to
-an apply() function, and only AI.FILTER over one table may read it:
-a join would put a partner's pages after the anchor, an AI.SCORE
+an apply() function. AI.FILTER may read it, and so may a join
+predicate over two tables when it is the only PDF column in the
+prompt: the planner anchors that join on the PDF alias, since the
+runtime renders the anchor's pages and not a partner's. An AI.SCORE
 reranker takes text.
 """
 
@@ -34,29 +36,38 @@ def check_value_column(catalog: Catalog, ref: ColumnRef, use: str) -> None:
     if ref.column in model_only_columns(catalog.get(ref.provider)):
         raise CompileError(
             f"column {ref.column!r} of {ref.alias!r} holds page images the "
-            f"model reads; it cannot appear in {use}. It can only be the "
-            f"document argument of AI.FILTER over {ref.alias!r}")
+            f"model reads; it cannot appear in {use}. It can only be a "
+            f"document argument of an AI.FILTER or AI.JOIN prompt")
 
 
 def check_prompt_columns(catalog: Catalog, refs: Iterable[ColumnRef],
                          function: str, join: bool) -> None:
-    """Fail unless every model-only prompt column is AI.FILTER's document.
+    """Fail unless a model-only prompt column is read the way pages allow.
+
+    A filter reads one table's pages. A join reads the pages of one of
+    its tables, the one the planner will anchor on; two PDF tables in
+    one prompt would need a partner's pages rendered, which the
+    runtime does not do.
 
     Args:
         catalog: The session catalog.
         refs: The prompt's column arguments.
         function: The AI function name as the SQL compiler spells it,
-            "AI_FILTER", "AI_SCORE", or "AI_JOIN".
+            "AI_FILTER" (a filter or a join predicate) or "AI_SCORE".
         join: Whether the prompt spans more than one table.
     """
+    pdf_aliases = []
     for ref in refs:
         if ref.column not in model_only_columns(catalog.get(ref.provider)):
             continue
         if function != "AI_FILTER":
             raise CompileError(
                 f"{function.replace('_', '.')} cannot read {ref.column!r} of "
-                f"{ref.alias!r}: page images go through AI.FILTER only")
-        if join:
-            raise CompileError(
-                f"AI.JOIN over PDF rows is not supported; {ref.alias!r} binds "
-                f"page images and can only be filtered on its own")
+                f"{ref.alias!r}: page images go through AI.FILTER, as a "
+                f"filter or as a join predicate")
+        if ref.alias not in pdf_aliases:
+            pdf_aliases.append(ref.alias)
+    if join and len(pdf_aliases) > 1:
+        raise CompileError(
+            f"a join reads the pages of one table; {pdf_aliases} all bind "
+            f"page images. Render one side as text, or join them in turn")
