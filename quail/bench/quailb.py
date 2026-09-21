@@ -20,13 +20,16 @@ from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.compute as pc
+import pyarrow.parquet as pq
 
 import quail
 import quail_b as benchmark
 from quail.bench import substrait
-from quail.bench.substrait import QueryPlan, read_plan
+from quail.bench.substrait import QueryPlan, Relation, read_plan
 from quail.planner.plan import Refusal
 from quail.specs import H100_USD_PER_HOUR, MODELS
+from quail_b.cuad import parse_document_reference, resolve_documents
+from quail_b.data import FILE_TABLES
 from quail_b.queries import (
     FILTER_SELECTIVITY_ESTIMATES,
     JOIN_SELECTIVITY_ESTIMATES,
@@ -43,11 +46,100 @@ from quail_b.scoring import RunOutput, reference_answer
 SELECTIVITY = {**FILTER_SELECTIVITY_ESTIMATES, **JOIN_SELECTIVITY_ESTIMATES}
 
 
-def register_tables(session, data_dir):
-    """Register every Parquet file of a directory as a document table."""
-    for path in sorted(Path(data_dir).glob("*.parquet")):
-        session.register(path.stem, quail.DocumentProvider.from_parquet(
-            str(path), id_col="id"))
+def pdf_provider(rows: pa.Table):
+    """A PDF provider whose query rows are a file table's rows, in order.
+
+    A `document` of `<path>` makes one row per file. A `document` of
+    `<path>#page=<n>` makes one row per page; the table must then list
+    every page of each file, file by file in page order, because a PDF
+    provider forms its page rows from the files themselves.
+
+    Raises:
+        ValueError: The references mix the two forms, or the page rows
+            do not cover the files in order.
+    """
+    references = [parse_document_reference(reference)
+                  for reference in rows.column("document").to_pylist()]
+    paths = [path for path, _page in references]
+    pages = [page for _path, page in references]
+    if all(page is None for page in pages):
+        sources = pa.table({"id": _ids(rows), "path": paths})
+        return quail.DocumentProvider.from_pdfs(
+            sources, id_col="id", path_col="path", row_mode="pdf")
+    if any(page is None for page in pages):
+        raise ValueError("a file table names whole files or pages, not both")
+    files = list(dict.fromkeys(paths))
+    provider = quail.DocumentProvider.from_pdfs(
+        pa.table({"id": files, "path": files}),
+        id_col="id", path_col="path", row_mode="page")
+    manifest = provider.manifest()
+    formed = [(manifest.sources[page.source_index].path, page.page_number)
+              for page in manifest.pages]
+    if formed != list(zip(paths, pages)):
+        raise ValueError(
+            "page rows must list every page of each file, in file then "
+            "page order, to match the rows a PDF provider forms")
+    return provider
+
+
+def register_relation(session, relation: Relation, table: pa.Table) -> pa.Table:
+    """Register the rows one relation reads, once, and return them.
+
+    The rows are the benchmark table inside the relation's bounds, in
+    table order; that order is the row index Quail's answers use. A
+    file table becomes a PDF provider, any other a text table.
+    """
+    rows = relation.rows(table)
+    if relation.source not in session.catalog:
+        if relation.table in FILE_TABLES:
+            provider = pdf_provider(rows)
+        else:
+            provider = quail.DocumentProvider.from_table(rows, id_col="id")
+        session.register(relation.source, provider)
+    return rows
+
+
+def register_plan(session, plan: QueryPlan, tables) -> dict[str, pa.Table]:
+    """Register every relation of a plan; table name -> the rows it reads.
+
+    Raises:
+        ValueError: Two relations read the same table inside different
+            bounds, so one set of rows cannot stand for the table.
+    """
+    rows = {}
+    bounds = {}
+    for relation in plan.relations:
+        if bounds.setdefault(relation.table, relation.bounds) != relation.bounds:
+            raise ValueError(
+                f"{relation.table} is read under two different bounds")
+        rows[relation.table] = register_relation(
+            session, relation, tables[relation.table])
+    return rows
+
+
+def read_tables(data_dir, names) -> dict[str, pa.Table]:
+    """Named tables from a directory of Parquet files.
+
+    A file table's references are resolved against the directory, the
+    way `quail_b.load_benchmark` hands them to the adapter.
+    """
+    tables = {}
+    for name in names:
+        table = pq.read_table(Path(data_dir) / f"{name}.parquet")
+        if name in FILE_TABLES:
+            table = resolve_documents(table, Path(data_dir))
+        tables[name] = table
+    return tables
+
+
+def register_tables(session, data_dir) -> None:
+    """Register the relations of every query whose tables the directory holds."""
+    available = {path.stem for path in Path(data_dir).glob("*.parquet")}
+    tables = read_tables(data_dir, sorted(available))
+    for spec in query_specs(include_privacy=True).values():
+        plan = read_plan(spec.plan)
+        if all(relation.table in available for relation in plan.relations):
+            register_plan(session, plan, tables)
 
 
 def _build(session, plan: QueryPlan):
@@ -62,13 +154,13 @@ def build_query(session, spec: QuerySpec):
 def queries(session) -> dict:
     """Id -> (description, callable() -> Query), for every registered table.
 
-    A query is listed when every table it reads is registered. Fresh
+    A query is listed when every relation it reads is registered. Fresh
     Query objects per call so each pass re-plans.
     """
     listed = {}
     for spec in query_specs(include_privacy=True).values():
         plan = read_plan(spec.plan)
-        if all(relation.table in session.catalog for relation in plan.relations):
+        if all(relation.source in session.catalog for relation in plan.relations):
             listed[spec.id] = (
                 spec.description, lambda plan=plan: _build(session, plan))
     return listed
@@ -112,7 +204,14 @@ def answer_oracle(ground_truth, tables):
 
 
 def run_output(result, plan: QueryPlan, tables) -> RunOutput:
-    """Translate a Quail result's row indices into benchmark ids by operator."""
+    """Translate a Quail result's row indices into benchmark ids by operator.
+
+    Args:
+        result: The Quail result.
+        plan: The query's plan.
+        tables: Table name -> the rows registered for it, in the order
+            the row indices count (`register_plan`).
+    """
     ids = {relation.alias: pa.array(_ids(tables[relation.table]), pa.string())
            for relation in plan.relations}
 
@@ -156,7 +255,28 @@ def join_anchors(result) -> dict:
     }
 
 
-def prompt_pieces(query, plan: QueryPlan, anchors) -> dict:
+def image_lengths(session, plan: QueryPlan, tables) -> dict[str, dict[str, int]]:
+    """Table name -> row id -> the prompt positions a PDF row's pages take.
+
+    QUAIL-B cannot tokenize a rendered document, so the engine reports
+    the length of each; the session priced every row when it prepared
+    the PDF provider.
+    """
+    lengths = {}
+    for relation in plan.relations:
+        if relation.table not in FILE_TABLES or relation.table in lengths:
+            continue
+        prepared = session.prepare_pdf(relation.source)
+        row_ids = _ids(tables[relation.table])
+        if len(prepared.lengths) != len(row_ids):
+            raise ValueError(
+                f"{relation.source} has {len(prepared.lengths)} PDF rows for "
+                f"{len(row_ids)} benchmark rows")
+        lengths[relation.table] = dict(zip(row_ids, prepared.lengths))
+    return lengths
+
+
+def prompt_pieces(query, plan: QueryPlan, anchors, images=None) -> dict:
     """Return the prompt token ids around each document, for QUAIL-B.
 
     QUAIL-B sizes the prefix trie of the run's requests from these
@@ -167,6 +287,8 @@ def prompt_pieces(query, plan: QueryPlan, anchors) -> dict:
         query: The built query, with bound prompts.
         plan: The query's plan, for the operator ids.
         anchors: Written join position -> the anchor alias.
+        images: Table name -> row id -> prompt positions, for the
+            PDF relations (`image_lengths`); omitted when empty.
     """
     operators = query.logical.operators()
     filters, joins = operators.filters, operators.joins
@@ -175,6 +297,8 @@ def prompt_pieces(query, plan: QueryPlan, anchors) -> dict:
                      if prompt.preamble_token_ids), [])
     pieces = {"tokenizer": query.session.model.hf_name, "preamble": preamble,
               "filters": [], "joins": []}
+    if images:
+        pieces["images"] = images
     for alias, predicates in filters.items():
         for position, predicate in enumerate(predicates):
             pieces["filters"].append({
@@ -194,15 +318,13 @@ def prompt_pieces(query, plan: QueryPlan, anchors) -> dict:
 
 def run_query(session, spec: QuerySpec, tables) -> RunOutput:
     """Execute one query and return benchmark ids, answers, and measurements."""
-    for name, table in tables.items():
-        if name not in session.catalog:
-            session.register(
-                name, quail.DocumentProvider.from_table(table, id_col="id"))
     plan = read_plan(spec.plan)
+    rows = register_plan(session, plan, tables)
     query = _build(session, plan)
     result = query.run()
-    output = run_output(result, plan, tables)
-    output.prompt_pieces = prompt_pieces(query, plan, join_anchors(result))
+    output = run_output(result, plan, rows)
+    output.prompt_pieces = prompt_pieces(
+        query, plan, join_anchors(result), image_lengths(session, plan, rows))
     return output
 
 
