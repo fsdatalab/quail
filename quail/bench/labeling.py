@@ -56,6 +56,8 @@ from quail_b.predicates import (
     _named_id,
     _text_hash,
     annotation_answer,
+    annotation_pair_answer,
+    annotation_sourced,
     example_identity,
     judgment_identity,
     predicate_payload,
@@ -202,15 +204,6 @@ def filter_batch_rows(spec: PredicateSpec,
 
 def join_specs(specs) -> tuple:
     return tuple(p for p in specs if p.kind == "join")
-
-
-# Filters answered from the dataset's own annotation, without a model.
-ANNOTATION_SOURCE = "cuad_annotation"
-
-
-def annotation_sourced(spec: PredicateSpec) -> bool:
-    """Whether the dataset's annotation answers this filter outright."""
-    return spec.kind == "filter" and spec.source_policy == ANNOTATION_SOURCE
 
 
 def annotation_workloads() -> tuple[str, ...]:
@@ -463,6 +456,11 @@ class QuailJudge:
 
     source = MODEL_NAME
 
+    @classmethod
+    def source_of(cls, spec: PredicateSpec) -> str:
+        """The label source recorded on this predicate's rows: the model."""
+        return cls.source
+
     def __init__(self, gpus: int = 1):
         import quail
 
@@ -561,18 +559,25 @@ class QuailJudge:
 
 
 class AnnotationLabeler:
-    """Answer filters from the dataset's annotation; no model, no GPU.
+    """Answer predicates from the dataset's annotation; no model, no GPU.
 
     Answers the same filter interface as `QuailJudge`, so the part
-    writers do not care which one they hold.
+    writers do not care which one they hold. Each row's label source
+    is the predicate's own annotation, named by its source policy.
     """
 
-    source = ANNOTATION_SOURCE
+    source = "annotation"
+
+    @staticmethod
+    def source_of(spec: PredicateSpec) -> str:
+        """The label source recorded on this predicate's rows."""
+        if not annotation_sourced(spec):
+            raise ValueError(f"{spec.key} is not answered by an annotation")
+        return spec.source_policy
 
     def filter(self, spec: PredicateSpec, rows: list[dict]) -> list[bool]:
         """One answer per row, in row order."""
-        if not annotation_sourced(spec):
-            raise ValueError(f"{spec.key} is not answered by an annotation")
+        self.source_of(spec)
         return [annotation_answer(spec, row) for row in rows]
 
 
@@ -674,7 +679,7 @@ def _write_filter_parts(labeler, verification: VerificationSample | None,
             for row, answer in zip(rows[start:end], answers):
                 output.append(_answer_row(
                     spec, identities[spec.key], corpus_id, row, None,
-                    answer, labeler.source, None))
+                    answer, labeler.source_of(spec), None))
                 if verification is not None:
                     verification.add(spec, row, None, answer)
             _atomic_parquet(
@@ -729,10 +734,16 @@ def _lepard_source_answer(cited_passage_ids, passage_ids) -> bool:
     return not cited_passage_ids.isdisjoint(passage_ids)
 
 
-def _write_lepard_source(spec: PredicateSpec, left_rows: list[dict],
-                          right_rows: list[dict], identity: dict,
-                          corpus_id: str, anchor_batch: int = 50) -> None:
-    right_passage_ids = [set(right["passage_ids"]) for right in right_rows]
+def _write_source_join_parts(spec: PredicateSpec, left_rows: list[dict],
+                             right_rows: list[dict], identity: dict,
+                             corpus_id: str, answer, source: str,
+                             anchor_batch: int = 50) -> None:
+    """Write a join's parts over every pair from the dataset's own labels.
+
+    `answer(left row, right row)` gives each pair's answer and `source`
+    is the label source recorded on every row; the rest is as for the
+    model-judged join parts.
+    """
     for start in range(0, len(left_rows), anchor_batch):
         end = min(start + anchor_batch, len(left_rows))
         part = _part_path(spec, identity, start, end)
@@ -740,15 +751,37 @@ def _write_lepard_source(spec: PredicateSpec, left_rows: list[dict],
             continue
         output = []
         for left in left_rows[start:end]:
-            cited_passage_ids = set(left["cited_passage_ids"])
-            for right, passage_ids in zip(right_rows, right_passage_ids):
+            for right in right_rows:
                 output.append(_answer_row(
                     spec, identity, corpus_id, left, right,
-                    _lepard_source_answer(cited_passage_ids, passage_ids),
-                    "lepard_citation_edge", None))
+                    answer(left, right), source, None))
         _atomic_parquet(part, output)
         after_write()
-        print(f"[judge] LePaRD source anchors {start}:{end}", flush=True)
+        print(f"[{source}] join {spec.workload} anchors {start}:{end}",
+              flush=True)
+
+
+def _write_lepard_source(spec: PredicateSpec, left_rows: list[dict],
+                         right_rows: list[dict], identity: dict,
+                         corpus_id: str) -> None:
+    right_passage_ids = {id(right): set(right["passage_ids"])
+                         for right in right_rows}
+
+    def answer(left, right):
+        return _lepard_source_answer(set(left["cited_passage_ids"]),
+                                     right_passage_ids[id(right)])
+
+    _write_source_join_parts(spec, left_rows, right_rows, identity,
+                             corpus_id, answer, "lepard_citation_edge")
+
+
+def _write_annotation_join(spec: PredicateSpec, left_rows: list[dict],
+                           right_rows: list[dict], identity: dict,
+                           corpus_id: str) -> None:
+    _write_source_join_parts(
+        spec, left_rows, right_rows, identity, corpus_id,
+        lambda left, right: annotation_pair_answer(spec, left, right),
+        AnnotationLabeler.source_of(spec))
 
 
 def _expected_rows(spec: PredicateSpec,
@@ -1002,6 +1035,10 @@ def judge_workload(corpus_id: str, workload: str) -> dict:
             _write_lepard_source(spec, left, right, identities[spec.key],
                                  corpus_id_)
             continue
+        if annotation_sourced(spec):
+            _write_annotation_join(spec, left, right, identities[spec.key],
+                                   corpus_id_)
+            continue
         _write_qwen_join_parts(
             judge, verification, spec, left, right, identities[spec.key],
             corpus_id_,
@@ -1050,6 +1087,10 @@ def label_annotated_workload(corpus_id: str, workload: str) -> dict:
         _write_filter_parts(labeler, None, rows[table], list(group),
                             identities, corpus_manifest["corpus_id"],
                             rows_per_call)
+    for spec in join_specs(specs):
+        _write_annotation_join(spec, rows[spec.left_table],
+                               rows[spec.right_table], identities[spec.key],
+                               corpus_manifest["corpus_id"])
     manifests = {spec.key: _complete_manifest(spec, identities[spec.key], rows)
                  for spec in specs}
     partial = {
@@ -1397,9 +1438,14 @@ def derive_collection(sf: float, source_collection_id: str) -> dict:
         if annotation_sourced(spec):
             # the ids a smaller corpus gives its documents differ, so the
             # annotation is asked again rather than copied by content
-            _write_filter_parts(
-                AnnotationLabeler(), None, rows[spec.left_table], [spec],
-                identities, corpus_id, filter_batch_rows(spec))
+            if spec.kind == "join":
+                _write_annotation_join(spec, rows[spec.left_table],
+                                       rows[spec.right_table], identity,
+                                       corpus_id)
+            else:
+                _write_filter_parts(
+                    AnnotationLabeler(), None, rows[spec.left_table], [spec],
+                    identities, corpus_id, filter_batch_rows(spec))
             origin[spec.key] = {"recomputed_from": corpus_id}
             continue
         source_label_set_id = source["label_sets"][spec.key]
