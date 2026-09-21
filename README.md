@@ -55,7 +55,10 @@ Optional fields (used for predicate accuracy and token accounting):
 - `filter_answers`: A dictionary mapping filter operator ID (such as `"filter-1"`) to a `pyarrow.Table` of evaluated document IDs and boolean `answer` values.
 - `join_answers`: A dictionary mapping join operator ID (such as `"join-1"`) to a `pyarrow.Table` of evaluated left/right ID pairs and boolean `answer` values.
 - `measurements`: A dictionary for engine telemetry. Reporting `measurements["fresh_tokens"]` records the count of input tokens processed in model forward passes.
-- `prompt_pieces`: Tokenized prompt IDs for prefix KV accounting.
+- `prompt_pieces`: Tokenized prompt IDs for prefix KV accounting. For a
+  PDF relation, whose documents are rendered pages and not text, add
+  `images`: table name to `{row id: prompt positions the document took}`.
+  `quail_b.minimum.validate_prompt_pieces` documents every field.
 
 If your engine does not record individual predicate answers, pass `filter_answers=None` and `join_answers=None`.
 

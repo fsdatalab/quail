@@ -18,7 +18,10 @@ prompt prefix the documents share computed once per document.
 The engine reports the prompt pieces it used as token ids (see
 `validate_prompt_pieces`); the documents are tokenized here with the
 tokenizer the pieces name, after the run, so nothing is tracked while
-the query runs.
+the query runs. A document that is rendered pages rather than text has
+no tokenizer: the engine reports how many prompt positions it took,
+and it counts as a sequence of its own that shares nothing with any
+other document past the preamble.
 """
 
 from __future__ import annotations
@@ -74,6 +77,27 @@ def _token_list(value, name):
     return [int(item) for item in value]
 
 
+def _image_lengths(value, tables) -> dict[str, dict[str, int]]:
+    """Check the prompt positions reported per rendered document."""
+    if not isinstance(value, dict):
+        raise ValueError("prompt pieces: images must map tables to row lengths")
+    lengths = {}
+    for table, rows in value.items():
+        if table not in tables:
+            raise ValueError(
+                f"prompt pieces: images name a table the query does not "
+                f"read: {table!r}")
+        if not isinstance(rows, dict) or any(
+                isinstance(length, bool) or not isinstance(length, int)
+                or length < 1 for length in rows.values()):
+            raise ValueError(
+                f"prompt pieces: images of {table} need a positive length "
+                "per row id")
+        lengths[table] = {str(row_id): int(length)
+                          for row_id, length in rows.items()}
+    return lengths
+
+
 def validate_prompt_pieces(spec, pieces) -> dict:
     """Check and normalize the prompt pieces an engine reports.
 
@@ -83,10 +107,12 @@ def validate_prompt_pieces(spec, pieces) -> dict:
             the one that tokenized the documents), `preamble` (token
             ids before every document), `filters` (a list of
             `{"id", "tail"}`: the operator ID and ids after the
-            document of that filter) and `joins` (a list of
+            document of that filter), `joins` (a list of
             `{"id", "anchor", "frame", "label", "tail"}`: the
             anchor alias, the ids after the anchor document, the ids
-            before the partner document, and the ids after it).
+            before the partner document, and the ids after it) and,
+            for documents that are rendered pages, `images` (table
+            name to `{row id: prompt positions the document took}`).
 
     Returns:
         The pieces as plain lists, with every stage of the query named.
@@ -96,7 +122,10 @@ def validate_prompt_pieces(spec, pieces) -> dict:
         raise ValueError("prompt pieces need a tokenizer name")
     checked = {"tokenizer": pieces["tokenizer"],
                "preamble": _token_list(pieces.get("preamble", ()), "preamble"),
-               "filters": [], "joins": []}
+               "filters": [], "joins": [],
+               "images": _image_lengths(
+                   pieces.get("images", {}),
+                   {relation.table for relation in spec._info.relations})}
     stages = {filter_spec.id for filter_spec in spec._info.filters}
     for item in pieces.get("filters", ()):
         operator_id = item.get("id")
@@ -149,8 +178,19 @@ def load_tokenizer(name: str):
     return encode
 
 
+# Tokenizer ids stay far below this; a rendered document's sequence
+# starts above it so no text document shares a prefix with it.
+_IMAGE_TOKEN_BASE = 2**31
+
+
 class DocumentTokens:
     """Token ids of documents, tokenized on first use and kept.
+
+    A rendered document (a PDF row) has no text to tokenize. Its
+    length comes from the engine's prompt pieces, and it becomes a
+    sequence of that length that starts with an id no other document
+    has, so the prefix trie counts it once and shares nothing past the
+    preamble.
 
     Args:
         corpus_rows: Table name to its rows.
@@ -162,6 +202,22 @@ class DocumentTokens:
         self.tokenizer = tokenizer
         self._texts = {}
         self._tokens = {}
+        self._image_lengths: dict[str, dict[str, int]] = {}
+        self._images = 0
+
+    def declare_images(self, lengths: dict[str, dict[str, int]]) -> None:
+        """Record the prompt positions of rendered documents, by table and id.
+
+        Raises:
+            ValueError: A document already declared changes length.
+        """
+        for table, rows in lengths.items():
+            known = self._image_lengths.setdefault(table, {})
+            for row_id, length in rows.items():
+                if known.setdefault(row_id, length) != length:
+                    raise ValueError(
+                        f"prompt pieces: {table} row {row_id} was {known[row_id]} "
+                        f"positions before and is {length} now")
 
     def _text(self, table, column, row_id):
         key = (table, column)
@@ -172,10 +228,27 @@ class DocumentTokens:
             self._texts[key] = dict(zip(map(str, _ids(rows)), values))
         return self._texts[key][row_id]
 
+    def _image(self, table, row_id) -> np.ndarray | None:
+        length = self._image_lengths.get(table, {}).get(row_id)
+        if length is None:
+            return None
+        self._images += 1
+        sequence = np.zeros(length, dtype=np.uint32)
+        sequence[0] = _IMAGE_TOKEN_BASE + self._images
+        return sequence
+
     def fetch(self, documents) -> None:
         """Tokenize the (table, column, id) documents not seen yet."""
-        missing = [document for document in dict.fromkeys(documents)
-                   if document not in self._tokens]
+        missing = []
+        for document in dict.fromkeys(documents):
+            if document in self._tokens:
+                continue
+            table, _column, row_id = document
+            image = self._image(table, row_id)
+            if image is not None:
+                self._tokens[document] = image
+            else:
+                missing.append(document)
         if not missing:
             return
         encoded = self.tokenizer([self._text(*document) for document in missing])
@@ -366,6 +439,7 @@ def token_metrics(spec, output, corpus_rows, stores=None) -> dict:
     name = pieces["tokenizer"]
     if name not in stores:
         stores[name] = DocumentTokens(corpus_rows, load_tokenizer(name))
+    stores[name].declare_images(pieces["images"])
     minimum = minimum_input_tokens(
         spec, pieces, output.filter_answers, output.join_answers, stores[name])
     if fresh < minimum:

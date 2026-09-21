@@ -214,6 +214,49 @@ def test_input_tokens_distinguish_empty_and_missing_stages(missing):
         None if missing else 0)
 
 
+def test_rendered_documents_count_their_reported_positions_once(monkeypatch):
+    monkeypatch.setattr("quail_b.minimum.load_tokenizer", lambda _: _encode)
+    spec = _spec("TEST-3", "two filters over pages",
+                 Filter(Filter(Scan("pages", "p", "document"), "caps {0}"),
+                        "uncapped {0}"))
+    corpus = {"pages": pa.table({
+        "id": ["ct0p1", "ct0p2"],
+        "document": ["files/ct0.pdf#page=1", "files/ct0.pdf#page=2"]})}
+    pieces = {
+        "tokenizer": "test", "preamble": PRE,
+        "filters": [{"id": "filter-1", "tail": QUESTION},
+                    {"id": "filter-2", "tail": TAIL}],
+        "images": {"pages": {"ct0p1": 300, "ct0p2": 200}},
+    }
+    answers = {
+        "filter-1": pa.table({"p": ["ct0p1", "ct0p2"], "answer": [True, False]}),
+        "filter-2": pa.table({"p": ["ct0p1"], "answer": [True]}),
+    }
+    stores = {}
+    output = RunOutput(answers, {}, pa.table({"p": ["ct0p1"]}), runtime_s=1.0,
+                       measurements={"fresh_tokens": 1000},
+                       prompt_pieces=pieces)
+    metrics = token_metrics(spec, output, corpus, stores)
+    # the preamble once, each page once, and the two question tails
+    # after page 1 share their empty lead: QUESTION and TAIL diverge at
+    # their first token
+    expected = (len(PRE) + 300 + 200 + len(QUESTION) + len(TAIL)
+                - _lcp(QUESTION, TAIL) + len(QUESTION))
+    assert metrics["minimum_tokens"] == expected
+    assert metrics["input_tokens"] == (
+        2 * len(PRE) + 300 + 200 + 2 * len(QUESTION) + len(PRE) + 300 + len(TAIL))
+    assert metrics["regret_tokens"] == 1000 - expected
+
+    # the same store serves the run's next query; a page cannot change size
+    output.prompt_pieces = {**pieces, "images": {"pages": {"ct0p1": 301}}}
+    with pytest.raises(ValueError, match="was 300 positions"):
+        token_metrics(spec, output, corpus, stores)
+    with pytest.raises(ValueError, match="does not read"):
+        validate_prompt_pieces(spec, {**pieces, "images": {"other": {}}})
+    with pytest.raises(ValueError, match="positive length"):
+        validate_prompt_pieces(spec, {**pieces, "images": {"pages": {"x": 0}}})
+
+
 def test_input_tokens_do_not_count_recomputed_kv(monkeypatch):
     monkeypatch.setattr("quail_b.minimum.load_tokenizer", lambda _: _encode)
     spec = _filter_spec()
