@@ -1,8 +1,13 @@
 """Compact recorded OpenHands traces with a Quail semantic join.
 
-Run from the repository root. The demo uses DiffusionGemma on Modal H100 GPUs:
+Run locally on a machine with one or more H100 GPUs:
 
-    uv run modal run --detach demos/agent_trace_compaction.py \
+    uv run python demos/agent_trace_compaction.py \
+      --output-dir /tmp/compaction --limit 100 --seed 42
+
+Or run on Modal with the companion script:
+
+    uv run modal run --detach demos/agent_trace_compaction_modal.py \
       --limit 100 --seed 42 \
       2>&1 | tee /tmp/quail-agent-compaction.log
 
@@ -13,10 +18,9 @@ and reconstructs messages. Quail replaces Jev's probabilities with Boolean
 retention decisions. These are not calibrated probabilities.
 The original tool outputs are omitted from the model's decision context.
 
-Inputs, decisions, compacted messages, and timing are saved under
-/results/demos/agent-compaction/<run-id> on the quail-results volume.
-The source ID index, sampled trajectories, and model weights stay on
-quail-hf-cache. No Jev key is needed.
+Inputs, decisions, compacted messages, and timing are saved under the
+output directory. The source ID index, sampled trajectories, and model
+weights are cached by huggingface_hub. No Jev key is needed.
 This measures compaction, not whether an agent can finish after compaction.
 
 Reference: https://github.com/tamaratran/fast-jev-compaction (MIT).
@@ -58,13 +62,10 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-import modal
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
-
-from quail.bench.images import cpu_image, gpu_image
 
 DATASET = "nvidia/SWE-Zero-openhands-trajectories"
 DATASET_REVISION = "7b3cd106d00f60918e722d33a1d74bc67072a7ea"
@@ -101,19 +102,10 @@ CONTEXT_TEXT = (
     "or re-read a file."
 )
 
-app = modal.App("quail-milestone1")
-results_volume = modal.Volume.from_name("quail-results", create_if_missing=True)
-hf_cache = modal.Volume.from_name("quail-hf-cache", create_if_missing=True)
-kernel_cache = modal.Volume.from_name("quail-kernel-cache", create_if_missing=True)
-
-preparation_image = cpu_image().add_local_python_source("demos")
-inference_image = gpu_image().add_local_python_source("demos")
-
 
 def json_text(value) -> str:
     """Serialize state fields with the reference library's compact spacing."""
     text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-    # A UTF-16 truncation can leave a lone surrogate; JSON.stringify escapes it.
     return text.encode("utf-8", errors="backslashreplace").decode("utf-8")
 
 
@@ -174,7 +166,6 @@ def collect_tool_calls(messages: list[dict]) -> list[ToolCall]:
             raise ValueError("message content must be text")
         if message["role"] == "tool":
             source_id = message.get("tool_call_id")
-            # The dataset omits result IDs; a single pending call is unambiguous.
             if source_id is None and len(pending) == 1:
                 source_id = next(iter(pending))
             if source_id not in pending:
@@ -194,7 +185,6 @@ def collect_tool_calls(messages: list[dict]) -> list[ToolCall]:
             if not isinstance(arguments, dict):
                 raise ValueError("tool arguments must be a JSON object")
             pending[source_id] = index, function["name"], arguments
-    # The original IDs follow call order, even if results arrive out of order.
     order = {call["id"]: i for i, call in enumerate(
         call for message in messages for call in message.get("tool_calls") or [])}
     return [replace(call, id=f"t{i + 1}") for i, call in enumerate(
@@ -554,14 +544,11 @@ def prepare_tables(rows, directory: Path) -> dict:
     return counts
 
 
-@app.function(image=preparation_image, timeout=86_400, memory=16_384,
-              volumes={"/results": results_volume,
-                       "/root/.cache/huggingface": hf_cache})
-def prepare(limit: int, seed: int) -> str:
-    """Save the original library's inputs without GPU inference."""
+def prepare(directory: Path, limit: int, seed: int) -> dict:
+    """Sample trajectories and write Parquet tables to *directory*."""
     if limit < 1:
         raise ValueError("limit must be positive")
-    directory = Path("/results/demos/agent-compaction") / uuid.uuid4().hex
+    directory.mkdir(parents=True, exist_ok=True)
     started = time.perf_counter()
     counts = prepare_tables(source_rows(limit, seed), directory)
     metadata = {**counts, "dataset": DATASET, "dataset_revision": DATASET_REVISION,
@@ -573,10 +560,8 @@ def prepare(limit: int, seed: int) -> str:
                 "truncate_result_chars": RESULT_HEAD_CHARS,
                 "sql": SQL, "prepare_s": time.perf_counter() - started}
     (directory / "inputs.json").write_text(json.dumps(metadata, indent=2))
-    results_volume.commit()
-    hf_cache.commit()
-    print(f"result volume path: {directory}", flush=True)
-    return str(directory)
+    print(f"output directory: {directory}", flush=True)
+    return metadata
 
 
 def complete_answers(result, conversations, questions):
@@ -591,7 +576,7 @@ def complete_answers(result, conversations, questions):
     return ordered
 
 
-def evaluate_tables(directory: Path, gpus: int) -> dict:
+def evaluate(directory: Path, gpus: int) -> dict:
     """Run the join and save every Boolean decision and its execution report."""
     import quail
     from quail.specs import MODAL_GPU_USD_PER_HOUR
@@ -638,39 +623,21 @@ def evaluate_tables(directory: Path, gpus: int) -> dict:
         gpu_startup_cost_usd=report.get("boot_s", 0) * gpus
         * MODAL_GPU_USD_PER_HOUR[DEVICE] / 3600,
     )
+    (directory / "execution.json").write_text(json.dumps(report, indent=2))
     return report
 
 
-@app.function(image=inference_image, gpu="H100!", timeout=86_400, memory=65_536,
-              volumes={"/results": results_volume,
-                       "/root/.cache/huggingface": hf_cache,
-                       "/root/.cache/kernels": kernel_cache})
-def evaluate(directory: str, gpus: int) -> dict:
-    """Evaluate the prepared questions on a Modal GPU."""
-    results_volume.reload()
-    started = time.perf_counter()
-    report = evaluate_tables(Path(directory), gpus)
-    report["evaluate_total_s"] = time.perf_counter() - started
-    (Path(directory) / "execution.json").write_text(json.dumps(report, indent=2))
-    results_volume.commit()
-    return report
-
-
-@app.function(image=preparation_image, timeout=86_400, memory=32_768,
-              volumes={"/results": results_volume})
-def reconstruct(directory: str) -> dict:
+def reconstruct(directory: Path) -> dict:
     """Apply the original retention rules and save the compacted conversations."""
-    results_volume.reload()
-    path = Path(directory)
     started = time.perf_counter()
     decisions = {}
-    for row in pq.read_table(path / "decisions.parquet").to_pylist():
+    for row in pq.read_table(directory / "decisions.parquet").to_pylist():
         decisions.setdefault(row["conversation_id"], {})[row["key"]] = row["answer"]
     totals = {"characters_before": 0, "characters_after": 0,
               "keep": 0, "truncate": 0, "drop": 0, "pinned": 0}
-    output = path / "compacted"
+    output = directory / "compacted"
     output.mkdir()
-    for filename in sorted((path / "messages").glob("*.parquet")):
+    for filename in sorted((directory / "messages").glob("*.parquet")):
         rows = []
         for original in pq.read_table(filename).to_pylist():
             messages = json.loads(original["messages"])
@@ -687,30 +654,29 @@ def reconstruct(directory: str) -> dict:
                          "messages": json.dumps(compacted),
                          "decisions": json.dumps(actions)})
         pq.write_table(pa.Table.from_pylist(rows), output / filename.name)
-    summary = {**json.loads((path / "inputs.json").read_text()),
-               **json.loads((path / "execution.json").read_text()), **totals,
+    summary = {**json.loads((directory / "inputs.json").read_text()),
+               **json.loads((directory / "execution.json").read_text()), **totals,
                "reconstruct_s": time.perf_counter() - started,
-               "result_volume_path": directory}
+               "output_directory": str(directory)}
     before = totals["characters_before"]
     summary["character_reduction_fraction"] = (
         1 - totals["characters_after"] / before if before else 0)
-    (path / "summary.json").write_text(json.dumps(summary, indent=2))
-    results_volume.commit()
+    (directory / "summary.json").write_text(json.dumps(summary, indent=2))
     print(json.dumps(summary, indent=2), flush=True)
     return summary
 
 
-@app.local_entrypoint()
-def main(limit: int = 100, seed: int = 42, gpus: int = 1):
-    """Compact complete traces using DiffusionGemma on one or more H100s."""
-    if limit < 1 or gpus not in (1, 2, 4, 8):
-        raise ValueError("limit must be positive; gpus must be 1, 2, 4, or 8")
-    call = prepare.spawn(limit, seed)
-    print(f"function call id (prepare): {call.object_id}", flush=True)
-    directory = call.get()
-    call = evaluate.with_options(gpu=f"H100!:{gpus}").spawn(directory, gpus)
-    print(f"function call id (evaluate): {call.object_id}", flush=True)
-    call.get()
-    call = reconstruct.spawn(directory)
-    print(f"function call id (reconstruct): {call.object_id}", flush=True)
-    call.get()
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Compact OpenHands traces")
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--limit", type=int, default=100)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--gpus", type=int, default=1, choices=[1, 2, 4, 8])
+    args = parser.parse_args()
+
+    directory = args.output_dir / uuid.uuid4().hex
+    prepare(directory, args.limit, args.seed)
+    evaluate(directory, args.gpus)
+    reconstruct(directory)

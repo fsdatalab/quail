@@ -2,7 +2,7 @@
 
 Run from the repository root:
 
-    .venv/bin/python -m demos.plan_walkthrough
+    uv run python demos/plan_walkthrough.py
 
 Three claims and three evidence passages live in memory. The tokenizer
 is a stand-in that counts bytes. The script does not execute inference.
