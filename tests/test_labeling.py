@@ -264,8 +264,13 @@ def _write_corpus(root, sf, rows):
     target = root / "corpora" / identity["corpus_id"]
     target.mkdir(parents=True, exist_ok=True)
     for table, table_rows in rows.items():
-        pq.write_table(pa.Table.from_pylist(table_rows),
-                       target / f"{table}.parquet")
+        if table_rows:
+            written = pa.Table.from_pylist(table_rows)
+        else:
+            # an empty table still needs its column names for _read_rows
+            written = pa.table({column: pa.array([], pa.string())
+                                for column in labeling.CORPUS_COLUMNS[table]})
+        pq.write_table(written, target / f"{table}.parquet")
     manifest = {**identity, "columns": labeling.CORPUS_COLUMNS}
     (target / "manifest.json").write_text(json.dumps(manifest))
     return target, manifest, rows
@@ -277,9 +282,10 @@ def _corpus_rows(reviews, reports, terms, claims, evidence, contexts,
 
     `contracts` lists each contract's clause categories. `filings` lists
     (question, evidence pages) per FinanceBench question; question i asks
-    about filing f{i}, which has two pages.
+    about filing f{i}, which has two pages. Any other corpus table the
+    pinned quail-b defines is empty.
     """
-    return {
+    rows = {
         "filing_questions": [
             {"id": f"fq{i}", "financebench_id": f"financebench_id_{i:05d}",
              "filing": f"f{i}", "doc_name": f"FILING{i}", "company": "Co",
@@ -324,6 +330,9 @@ def _corpus_rows(reviews, reports, terms, claims, evidence, contexts,
                           "trajectory_id": "at0000", "turn_index": 5,
                           "token_count": 2}],
     }
+    for table in labeling.CORPUS_COLUMNS:
+        rows.setdefault(table, [])
+    return rows
 
 
 def test_derive_collection_copies_labels_by_content(monkeypatch, tmp_path):
