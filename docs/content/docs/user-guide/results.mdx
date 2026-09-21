@@ -34,10 +34,10 @@ Project: r.id, a.aspect
 
 **Physical plan** shows what the execution engine will do: the
 model and token budgets, then one line per operator with the
-planner's estimates in columns to the right. Each `AI_FILTER` or
+planner's estimates in columns to the right. Each `AI.IF` or
 join predicate is listed under the operator that runs it, numbered
 by its position in the query text (`predicate 2` is the second
-`AI_FILTER` you wrote). When the planner reorders them, the output
+`AI.IF` you wrote). When the planner reorders them, the output
 says which runs first.
 
 ```text
