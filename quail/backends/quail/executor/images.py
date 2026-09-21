@@ -50,7 +50,8 @@ class PageImages:
         self._prefetcher: ImagePrefetcher | None = None
         self._metrics: dict = {}
 
-    def open(self, chunk_tokens: int | None = None) -> None:
+    def open(self, chunk_tokens: int | None = None,
+             docs: Sequence[int] | None = None) -> None:
         """Start rendering the documents' pages in admission order.
 
         Args:
@@ -58,6 +59,10 @@ class PageImages:
                 whole chunk's pages before its forward runs, so the
                 renderer keeps two chunks' worth of pages in flight;
                 without it, the renderer's own default bound.
+            docs: Local indices of the documents the chain will take,
+                in admission order; every document when omitted. A
+                document rendered ahead but never taken would hold its
+                pages in flight for the rest of the chain.
         """
         if self._prefetcher is None:
             options = {}
@@ -65,9 +70,11 @@ class PageImages:
                 options["max_outstanding_pages"] = max(
                     DEFAULT_OUTSTANDING_PAGES,
                     2 * self.prompts.pages_within(chunk_tokens))
+            order = (self.document_ids if docs is None
+                     else [self.document_ids[doc] for doc in docs])
             self._prefetcher = self._open_prefetcher(
                 self.prompts.pdf_input, self.prompts.spec,
-                order=self.document_ids, **options)
+                order=order, **options)
 
     def take(self, doc: int) -> tuple[tuple[ImageBlock, RenderedPage], ...]:
         """The document's pages with their soft token spans, in prompt order."""

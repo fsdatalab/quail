@@ -698,7 +698,6 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         if not pipeline.takes_images:
             raise ValueError(
                 f"{type(pipeline).__name__} does not embed images")
-        images.open(budget)
     # pages taken for an anchor whose chunk was split or retried, so
     # the retry packs the same pages instead of taking the row again
     taken_pages = {}
@@ -742,6 +741,11 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         canvas_tokens=len(canvas),
         page_cost=arena.page_cost,
     )
+    if images is not None:
+        # an anchor without a partner never packs, so its pages are
+        # not rendered
+        images.open(budget, docs=[a for a in range(len(keys))
+                                  if sched.runs(a)])
     spans = []
     tokens = 0
     outstanding = []     # (groups, handle) in launch order

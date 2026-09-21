@@ -195,6 +195,12 @@ def test_page_images_map_chain_documents_to_rows_past_the_preamble(tmp_path):
     images.open()
     assert opened == [([2, 0], {"max_outstanding_pages": 130})]
     assert prompts.pages_within(65 * 65) == 65
+    # a chain that will take only some documents renders only those
+    partial = PageImages(prompts, document_ids=[2, 0, 1], pre_tokens=0,
+                         open_prefetcher=open_inline)
+    partial.open(docs=[2, 0])
+    assert opened[-1] == ([1, 2], {})
+    partial.close()
     ((block, page),) = images.take(0)
     assert page.page_id == 2 and block.page_id == 2
     # the soft tokens start after the preamble and the start marker
