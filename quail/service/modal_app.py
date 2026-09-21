@@ -36,7 +36,7 @@ from quail.bench.images import gpu_image
 
 APP_NAME = "quail-engine"
 MODELS = ("qwen3-4b-fp8", "qwen3-32b-fp8", "diffusion-gemma-26b-a4b-fp8",
-          "qwen3-reranker-0.6b-bf16")
+          "qwen3-reranker-0.6b-bf16", "qwen3-reranker-4b-bf16")
 DEVICE = "h100-sxm"
 GPUS = 1
 
