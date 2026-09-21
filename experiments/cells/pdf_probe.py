@@ -28,10 +28,26 @@ Run from the repository root:
     uv run modal run -m experiments.cells.pdf_probe 2>&1 \\
         | tee /tmp/pdf_probe.log
 
-Pass ``--only render`` or ``--only vision`` to run one probe.
+Pass ``--only render``, ``--only vision``, or ``--only images`` to run
+one probe.
+
+- probe_images (H100): loads DiffusionGemma through stock vLLM with
+  Quail's one-token canvas readout and asks one TRUE and one FALSE
+  governing-law question over the first N pages of one CUAD contract,
+  with the page that names the governing law placed last, for N up
+  to 32. It reports whether vLLM accepts N images, whether both
+  answers are right, the time per request, and the peak GPU memory.
+  The largest N with both answers right is the image count the
+  benchmark's PDF-level queries can rely on.
+
+PREDICTION (images): the model answers both questions right through
+N = 16 (about 4,300 soft tokens); past 24 pages the fact page is
+far from the question and the FALSE answer flips first. vLLM
+accepts 32 images once limit_mm_per_prompt allows it.
 
 Records land on the quail-results volume under
-/results/ablations/pdf_probe_vision.json and pdf_probe_render.json.
+/results/ablations/pdf_probe_vision.json, pdf_probe_render.json, and
+pdf_probe_images.json.
 """
 
 from __future__ import annotations
@@ -39,6 +55,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import statistics
 import time
 import urllib.request
@@ -327,14 +344,167 @@ def _time_encoder(torch, model, model_path):
     return out
 
 
+CUAD_URL = "https://zenodo.org/records/4595826/files/CUAD_v1.zip?download=1"
+IMAGE_COUNTS = (1, 2, 4, 8, 12, 16, 20, 24, 32)
+MIN_PROBE_PAGES = 32
+RAW_INSTRUCTION = "Evaluate TRUE or FALSE for the following question: "
+WRONG_STATE = "Alaska"
+
+
+def _normal(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", text.lower())
+
+
+def _cuad_probe_contract(root: Path):
+    """One CUAD contract of MIN_PROBE_PAGES pages or more and its governing law.
+
+    Returns (pdf path, page count, state name, zero-based page of the
+    clause) for the first contract, by title, whose governing-law span
+    sits on one page.
+    """
+    import pypdfium2 as pdfium
+
+    data = json.loads((root / "CUAD_v1.json").read_text())["data"]
+    pdfs = {p.stem: p for p in root.glob("full_contract_pdf/**/*")
+            if p.suffix.lower() == ".pdf"}
+    for entry in sorted(data, key=lambda d: d["title"]):
+        path = pdfs.get(entry["title"])
+        if path is None:
+            continue
+        answers = [qa for qa in entry["paragraphs"][0]["qas"]
+                   if qa["id"].endswith("__Governing Law") and qa["answers"]]
+        if not answers:
+            continue
+        document = pdfium.PdfDocument(str(path))
+        if len(document) < MIN_PROBE_PAGES:
+            continue
+        clause = answers[0]["answers"][0]["text"]
+        place = re.search(
+            r"laws of (?:the )?([A-Z][A-Za-z]*(?: (?:of|the|[A-Z][A-Za-z]*))*)",
+            clause)
+        if place is None:
+            continue
+        span = _normal(clause)
+        pages = [i for i in range(len(document))
+                 if span in _normal(document[i].get_textpage().get_text_bounded())]
+        if len(pages) != 1:
+            continue
+        return str(path), len(document), place.group(1), pages[0]
+    raise RuntimeError("no CUAD contract fits the image probe")
+
+
+def _fetch_cuad(directory: Path) -> Path:
+    import zipfile
+
+    root = directory / "CUAD_v1"
+    if not root.exists():
+        directory.mkdir(parents=True, exist_ok=True)
+        archive = directory / "CUAD_v1.zip"
+        urllib.request.urlretrieve(CUAD_URL, archive)
+        with zipfile.ZipFile(archive) as bundle:
+            bundle.extractall(directory)
+    return root
+
+
+def _page_images(path: str, indices, size_hw):
+    from PIL import Image
+
+    return [Image.fromarray(render_page(path, i, size_hw)) for i in indices]
+
+
+def _filter_prompt(n_images: int, question: str) -> str:
+    return ("DOCUMENT:\n" + "<|image|>" * n_images + "\n\n" + RAW_INSTRUCTION
+            + question + "\nANSWER:")
+
+
+@app.function(image=image, gpu="H100!", memory=98304, volumes=volumes,
+              timeout=3600)
+def probe_images():
+    import torch
+    from transformers import AutoTokenizer
+    from vllm import LLM, SamplingParams
+
+    from quail.backends.quail.executor.model import resolve_model_path
+    from quail.backends.request_scheduling import canvas_answer
+    from quail.backends.vllm import (
+        diffusion_canvas,
+        diffusion_kwargs,
+        sampling_kwargs,
+    )
+    from quail.specs import DIFFUSION_GEMMA_26B_FP8
+
+    spec = DIFFUSION_GEMMA_26B_FP8
+    root = _fetch_cuad(Path("/tmp/cuad"))
+    path, n_pages, state, fact_page = _cuad_probe_contract(root)
+    size_hw = target_pixels(*LETTER_POINTS, 280)
+    record = {"model": spec.hf_name, "contract": Path(path).name,
+              "pages": n_pages, "governing_law": state, "fact_page": fact_page,
+              "render_hw": list(size_hw), "counts": {}}
+    print(json.dumps(record, indent=1), flush=True)
+
+    model_path = resolve_model_path(spec.hf_name, spec.revision or None)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
+
+    def first_ids(words):
+        return {tokenizer.encode(w, add_special_tokens=False)[0] for w in words}
+
+    true_ids = first_ids(("TRUE", " TRUE", "True", " True"))
+    false_ids = first_ids(("FALSE", " FALSE", "False", " False"))
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+    with diffusion_canvas(spec):
+        llm = LLM(model=spec.hf_name, max_model_len=16_384,
+                  limit_mm_per_prompt={"image": max(IMAGE_COUNTS)},
+                  gpu_memory_utilization=0.9, enable_prefix_caching=False,
+                  **diffusion_kwargs(spec))
+    params = SamplingParams(**sampling_kwargs(sorted(true_ids | false_ids), 1))
+    questions = {
+        "true": (f"Is this agreement governed by the laws of {state}?", 1),
+        "false": (f"Is this agreement governed by the laws of {WRONG_STATE}?",
+                  0),
+    }
+    for count in IMAGE_COUNTS:
+        others = [i for i in range(n_pages) if i != fact_page]
+        indices = others[:count - 1] + [fact_page]
+        images = _page_images(path, indices, size_hw)
+        item = {"pages": indices, "answers": {}}
+        try:
+            torch.cuda.reset_peak_memory_stats()
+            for name, (question, expected) in questions.items():
+                request = {"prompt": _filter_prompt(count, question),
+                           "multi_modal_data": {"image": images}}
+                torch.cuda.synchronize()
+                started = time.perf_counter()
+                output = llm.generate([request], params, use_tqdm=False)[0]
+                torch.cuda.synchronize()
+                answer = canvas_answer(output, true_ids=true_ids,
+                                       false_ids=false_ids)
+                item["answers"][name] = {
+                    "expected": expected, "answer": answer,
+                    "seconds": round(time.perf_counter() - started, 3),
+                    "prompt_tokens": len(output.prompt_token_ids)}
+            item["both_right"] = all(a["answer"] == a["expected"]
+                                     for a in item["answers"].values())
+            item["peak_bytes"] = torch.cuda.max_memory_allocated()
+        except Exception as error:  # noqa: BLE001 - the probe reports, not raises
+            item["error"] = repr(error)[:500]
+        record["counts"][count] = item
+        print(count, json.dumps(item), flush=True)
+    right = [n for n, item in record["counts"].items() if item.get("both_right")]
+    record["max_images_both_right"] = max(right) if right else 0
+    _save("pdf_probe_images.json", record)
+    return record
+
+
 @app.local_entrypoint()
 def main(only: str = ""):
-    """Run both probes, or one of them with --only render|vision."""
+    """Run every probe, or one of them with --only render|vision|images."""
     calls = []
     if only in ("", "render"):
         calls.append(("probe_render", probe_render.spawn()))
     if only in ("", "vision"):
         calls.append(("probe_vision", probe_vision.spawn()))
+    if only in ("", "images"):
+        calls.append(("probe_images", probe_images.spawn()))
     for name, call in calls:
         print(f"{name} function call id: {call.object_id}", flush=True)
     for _, call in calls:
