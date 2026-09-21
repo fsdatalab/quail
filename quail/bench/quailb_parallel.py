@@ -42,13 +42,25 @@ DATA_DIR = "/results/quailb_data"
 
 
 @app.function(image=image, timeout=1200, volumes=VOLUMES)
-def ensure_data(sf: float, query_ids: list[str], collection_id: str):
-    """Write the queries' tables to the volume and resolve the label collection."""
+def ensure_data(sf: float, query_ids: list[str], collection_id: str,
+                root: str = ""):
+    """Write the queries' tables to the volume and resolve the label collection.
+
+    A file table's PDFs are copied under `files/` beside the tables,
+    where the table's references point. `root` is a published-data
+    mirror, such as the volume's own ground-truth tree; empty means
+    the public bucket.
+    """
+    import shutil
+
     import pyarrow.parquet as pq
 
     import quail_b as benchmark
     from quail.bench.substrait import read_plan
+    from quail_b.cuad import FILES_DIR
+    from quail_b.data import FILE_TABLES, corpus_files_dir
 
+    root = root or None
     names = {
         relation.table for query_id in query_ids
         for relation in read_plan(benchmark.get_query(query_id).plan).relations
@@ -58,10 +70,16 @@ def ensure_data(sf: float, query_ids: list[str], collection_id: str):
     for name in sorted(names):
         path = directory / f"{name}.parquet"
         if not path.exists():
-            pq.write_table(benchmark.load_table(name, scale_factor=sf), path)
+            pq.write_table(
+                benchmark.load_table(name, scale_factor=sf, root=root), path)
+        if name in FILE_TABLES:
+            files = corpus_files_dir(
+                name, pq.read_table(path), scale_factor=sf, root=root)
+            shutil.copytree(files / FILES_DIR, directory / FILES_DIR,
+                            dirs_exist_ok=True)
     suite = benchmark.load_benchmark(
         query_ids, scale_factor=sf, data_dir=directory,
-        collection_id=collection_id or None)
+        collection_id=collection_id or None, root=root)
     results_vol.commit()
     return suite.ground_truth.collection_id
 
@@ -141,11 +159,13 @@ def run_query_family(
     include_quail: bool = True,
     include_dumb_vllm: bool = False,
     baselines: str = "stock_vllm,pipelined_vllm",
+    root: str = "",
 ) -> str:
     """Run one query family through Quail and the vLLM baselines.
 
     baselines names the vLLM baseline methods that run when
-    include_baselines is set.
+    include_baselines is set. root is the published-data mirror the
+    labels are read from; empty means the public bucket.
     """
     process_groups = [("quail",)] if include_quail else []
     if include_baselines:
@@ -154,7 +174,7 @@ def run_query_family(
         process_groups.append(("dumb_vllm",))
     try:
         return _run_family(process_groups, "", model, sf, query_ids_csv,
-                           run_dir, ground_truth_collection)
+                           run_dir, ground_truth_collection, root or None)
     finally:
         results_vol.commit()
         kernel_cache.commit()
@@ -174,11 +194,13 @@ def run_sglang_query_family(
     query_ids_csv: str,
     run_dir: str,
     ground_truth_collection: str,
+    root: str = "",
 ) -> str:
     """Run one query family through the SGLang backend."""
     try:
         return _run_family([("pipelined_sglang",)], "-sglang", model, sf,
-                           query_ids_csv, run_dir, ground_truth_collection)
+                           query_ids_csv, run_dir, ground_truth_collection,
+                           root or None)
     finally:
         results_vol.commit()
         kernel_cache.commit()
@@ -234,6 +256,7 @@ def run_all(
     include_quail: bool = True,
     include_dumb_vllm: bool = False,
     baselines: str = "stock_vllm,pipelined_vllm",
+    root: str = "",
 ):
     from quail_b import select_queries
     from quail_b.queries import query_family_name, split_query_families
@@ -253,6 +276,7 @@ def run_all(
         "model": model,
         "sf": sf,
         "query_ids": list(query_ids),
+        "root": root or "public bucket",
         "summaries": {},
         "function_call_ids": {},
     }
@@ -261,7 +285,8 @@ def run_all(
     results_vol.commit()
 
     try:
-        data_call = ensure_data.spawn(sf, query_ids, ground_truth_collection)
+        data_call = ensure_data.spawn(
+            sf, query_ids, ground_truth_collection, root)
         manifest["function_call_ids"]["data"] = data_call.object_id
         print(f"function call id: {data_call.object_id} (data)", flush=True)
         ground_truth_collection = data_call.get()
@@ -284,6 +309,7 @@ def run_all(
                     include_quail=include_quail,
                     include_dumb_vllm=include_dumb_vllm,
                     baselines=baselines,
+                    root=root,
                 )
                 family_calls.append((family, family_call))
                 call_ids[f"{family}:quail_vllm"] = family_call.object_id
@@ -299,6 +325,7 @@ def run_all(
                     query_ids_csv=",".join(family_ids),
                     run_dir=run_dir,
                     ground_truth_collection=ground_truth_collection,
+                    root=root,
                 )
                 sglang_calls.append((family, sglang_call))
                 call_ids[f"{family}:sglang"] = sglang_call.object_id
@@ -434,8 +461,10 @@ def main(
     include_quail: bool = True,
     include_dumb_vllm: bool = False,
     baselines: str = "stock_vllm,pipelined_vllm",
+    root: str = "",
     finish: str = "",
 ):
+    """Start one run; `--root /results` reads a corpus published on the volume."""
     if finish:
         # finish an earlier run whose orchestrator died
         call = finish_run.spawn(finish)
@@ -459,6 +488,7 @@ def main(
         include_quail=include_quail,
         include_dumb_vllm=include_dumb_vllm,
         baselines=baselines,
+        root=root,
     )
     print(f"function call id: {call.object_id} (all families)", flush=True)
     print(call.get(), flush=True)
