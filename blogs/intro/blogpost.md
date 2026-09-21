@@ -407,26 +407,118 @@ Across the 29 queries with matching measurements at scale factor 0.1, Quail is f
 
 ### Per-query metrics table
 
-The final table will include one row for each query and method. We already have the BIO-4 cost and KV regret values below. Input token throughput and the remaining query rows still need to be filled from the saved benchmark results.
+The table below reports all 31 queries with matching results at scale factor 0.1. For Quail and vLLM, tokens per second is fresh input tokens divided by query time. For SoL, it is the estimated token work divided by the estimated time. SoL assumes zero KV regret. Costs use about $3.96 per H100-hour. BIO-4 is not part of this scale factor 0.1 comparison. Its scale factor 1.0 results are in Section 4.3.
 
 ::: {.metrics-table}
-| Query | Method | Input tokens/second | KV regret tokens | GPU cost/query |
+| Query | Method | Tokens/second | KV regret tokens | GPU cost/query |
 |---|---|---:|---:|---:|
-| BIO-4, scale 1.0 | Quail | TODO_NUMBERS | 18.0 million | $1.93 |
-| BIO-4, scale 1.0 | vLLM baseline | TODO_NUMBERS | 50.3 million | $27.03 |
-| BIO-4, scale 1.0 | SoL estimate | TODO_NUMBERS | 0 (assumed) | $0.98 |
-| `<QUERY_ID>` | Quail | TODO_NUMBERS | TODO_NUMBERS | TODO_NUMBERS |
-| `<QUERY_ID>` | vLLM baseline | TODO_NUMBERS | TODO_NUMBERS | TODO_NUMBERS |
-| `<QUERY_ID>` | SoL estimate | TODO_NUMBERS | 0 (assumed) | TODO_NUMBERS |
+| IMDB-1 | Quail | 121830.47 | 20349 | $0.0159 |
+| IMDB-1 | vLLM | 101497.06 | 20061 | $0.0191 |
+| IMDB-1 | SoL | 261625.23 | 0 | $0.0073 |
+| IMDB-2 | Quail | 114114.72 | 20349 | $0.0233 |
+| IMDB-2 | vLLM | 96351.66 | 40741 | $0.0278 |
+| IMDB-2 | SoL | 260608.09 | 0 | $0.0101 |
+| IMDB-3 | Quail | 114371.24 | 24729 | $0.0246 |
+| IMDB-3 | vLLM | 98320.37 | 1398847 | $0.0440 |
+| IMDB-3 | SoL | 260463.14 | 0 | $0.0104 |
+| IMDB-4 | Quail | 115781.40 | 21606 | $0.0190 |
+| IMDB-4 | vLLM | 97619.73 | 577154 | $0.0289 |
+| IMDB-4 | SoL | 260781.15 | 0 | $0.0083 |
+| IMDB-5 | Quail | 116594.74 | 21839 | $0.0182 |
+| IMDB-5 | vLLM | 96936.72 | 531994 | $0.0277 |
+| IMDB-5 | SoL | 260748.31 | 0 | $0.0081 |
+| IMDB-6 | Quail | 118830.88 | 20349 | $0.0164 |
+| IMDB-6 | vLLM | 99623.40 | 63473 | $0.0201 |
+| IMDB-6 | SoL | 261461.05 | 0 | $0.0075 |
+| IMDB-7 | Quail | 116134.58 | 21112 | $0.0170 |
+| IMDB-7 | vLLM | 99332.32 | 337625 | $0.0234 |
+| IMDB-7 | SoL | 261295.26 | 0 | $0.0076 |
+| IMDB-8 | Quail | 112010.71 | 91872 | $0.0286 |
+| IMDB-8 | vLLM | 95547.89 | 942159 | $0.0434 |
+| IMDB-8 | SoL | 259850.37 | 0 | $0.0132 |
+| IMDB-9 | Quail | 111748.61 | 2144348 | $0.0525 |
+| IMDB-9 | vLLM | 94968.05 | 3018927 | $0.0719 |
+| IMDB-9 | SoL | 259601.01 | 0 | $0.0181 |
+| IMDB-10 | Quail | 113218.41 | 2132608 | $0.0532 |
+| IMDB-10 | vLLM | 96289.16 | 4360757 | $0.0880 |
+| IMDB-10 | SoL | 259396.32 | 0 | $0.0174 |
+| BIO-2 | Quail | 81597.81 | 2477 | $0.1398 |
+| BIO-2 | vLLM | 8243.63 | 154747 | $1.4038 |
+| BIO-2 | SoL | 167283.41 | 0 | $0.0682 |
+| FEV-1 | Quail | 114934.48 | 1359 | $0.0003 |
+| FEV-1 | vLLM | 81295.12 | 1359 | $0.0005 |
+| FEV-1 | SoL | 269033.05 | 0 | $0.0001 |
+| FEV-2 | Quail | 110270.27 | 678 | $0.0324 |
+| FEV-2 | vLLM | 55658.02 | 106037 | $0.0662 |
+| FEV-2 | SoL | 252623.90 | 0 | $0.0141 |
+| FEV-3 | Quail | 110167.52 | 2605 | $0.0240 |
+| FEV-3 | vLLM | 55187.66 | 90822 | $0.0511 |
+| FEV-3 | SoL | 253084.05 | 0 | $0.0087 |
+| FEV-4 | Quail | 110031.68 | 2605 | $0.0053 |
+| FEV-4 | vLLM | 80311.02 | 23952 | $0.0079 |
+| FEV-4 | SoL | 255502.24 | 0 | $0.0020 |
+| FEV-5 | Quail | 110604.60 | 2776 | $0.0151 |
+| FEV-5 | vLLM | 58946.66 | 95455 | $0.0309 |
+| FEV-5 | SoL | 253426.21 | 0 | $0.0051 |
+| FEV-6 | Quail | 98353.33 | 2776 | $0.0045 |
+| FEV-6 | vLLM | 75771.58 | 15909 | $0.0062 |
+| FEV-6 | SoL | 256593.63 | 0 | $0.0015 |
+| FEV-7 | Quail | 109688.32 | 135139 | $0.0612 |
+| FEV-7 | vLLM | 56581.31 | 298043 | $0.1215 |
+| FEV-7 | SoL | 252486.08 | 0 | $0.0234 |
+| FEV-8 | Quail | 109735.33 | 3120800 | $0.0949 |
+| FEV-8 | vLLM | 57625.63 | 3525124 | $0.1885 |
+| FEV-8 | SoL | 252432.47 | 0 | $0.0370 |
+| FEV-9 | Quail | 110433.59 | 1461116 | $0.0429 |
+| FEV-9 | vLLM | 60111.97 | 1648151 | $0.0840 |
+| FEV-9 | SoL | 252812.42 | 0 | $0.0125 |
+| FEV-10 | Quail | 111647.02 | 2773 | $0.0018 |
+| FEV-10 | vLLM | 92541.10 | 4308 | $0.0032 |
+| FEV-10 | SoL | 260638.44 | 0 | $0.0008 |
+| LEP-1 | Quail | 119951.82 | 1702 | $0.0012 |
+| LEP-1 | vLLM | 95555.80 | 1622 | $0.0015 |
+| LEP-1 | SoL | 264458.89 | 0 | $0.0005 |
+| LEP-2 | Quail | 114794.70 | 1702 | $0.1446 |
+| LEP-2 | vLLM | 95375.13 | 87430 | $0.1750 |
+| LEP-2 | SoL | 259917.06 | 0 | $0.0639 |
+| LEP-3 | Quail | 114706.80 | 2058 | $0.1036 |
+| LEP-3 | vLLM | 96008.09 | 165313 | $0.1328 |
+| LEP-3 | SoL | 256780.67 | 0 | $0.0025 |
+| LEP-4 | Quail | 115176.74 | 1852 | $0.0443 |
+| LEP-4 | vLLM | 99221.52 | 49540 | $0.0526 |
+| LEP-4 | SoL | 259005.21 | 0 | $0.0013 |
+| LEP-5 | Quail | 111492.44 | 1794 | $0.0286 |
+| LEP-5 | vLLM | 99172.69 | 35327 | $0.0386 |
+| LEP-5 | SoL | 264419.12 | 0 | $0.0005 |
+| LEP-6 | Quail | 104218.89 | 1732 | $0.0111 |
+| LEP-6 | vLLM | 96545.03 | 10758 | $0.0158 |
+| LEP-6 | SoL | 264485.95 | 0 | $0.0005 |
+| LEP-7 | Quail | 115432.66 | 3420 | $0.0434 |
+| LEP-7 | vLLM | 98377.99 | 51004 | $0.0524 |
+| LEP-7 | SoL | 260859.95 | 0 | $0.0014 |
+| LEP-8 | Quail | 111046.27 | 1702 | $0.0015 |
+| LEP-8 | vLLM | 67444.78 | 6065 | $0.0025 |
+| LEP-8 | SoL | 264485.95 | 0 | $0.0005 |
+| AGENT-1 | Quail | 73124.95 | 11886152 | $0.2614 |
+| AGENT-1 | vLLM | 56139.05 | 23928 | $0.1082 |
+| AGENT-1 | SoL | 115937.46 | 0 | $0.0522 |
+| AGENT-2 | Quail | 72969.32 | 11886152 | $0.2626 |
+| AGENT-2 | vLLM | 55957.17 | 23928 | $0.1094 |
+| AGENT-2 | SoL | 115844.40 | 0 | $0.0526 |
 :::
 
-**Headline throughput figure (TODO_NUMBERS).** The primary launch figure will show average input tokens per second for each dataset. Its planned path is `figures/quailb_tok_per_sec.png`. We will add it when the dataset averages are finalized. The latency figure remains below as the detailed per-query view.
+::: {.figure-block .wide-figure}
+[![Average input token throughput by dataset for Quail, vLLM, and SoL.](figures/quailb_tok_per_sec.png){width=100%}](figures/quailb_tok_per_sec.pdf)
 
-<!-- TODO_NUMBERS: Add figures/quailb_tok_per_sec.png and its PDF source here. -->
+*Figure 7. Average input tokens per second by dataset at scale factor 0.1, using Qwen3 4B FP8 on one H100. BIO contains BIO-2 only. BIO-1 and BIO-3 are missing because their saved runs used an older filter, and BIO-4 is not part of this scale factor 0.1 comparison.*
+:::
+
+The throughput figure is the headline comparison. The latency figure below keeps the per-query detail.
+
 ::: {.figure-block .wide-figure}
 [![Query latency for Quail, the vLLM baseline, and SoL estimates across the 31 default QUAIL-B queries. BIO-1 and BIO-3 are marked as not measured.](figures/quailb_latency.png){width=100%}](figures/quailb_latency.pdf)
 
-*Figure 7. Query latency at scale factor 0.1. Bars show measured query time, and horizontal lines show SoL estimates. The vertical axis uses a log scale because the query times span more than three orders of magnitude. An x marks BIO-1 and BIO-3, which do not have measurements for their current definitions.*
+*Figure 8. Query latency at scale factor 0.1. Bars show measured query time, and horizontal lines show SoL estimates. The vertical axis uses a log scale because the query times span more than three orders of magnitude. An x marks BIO-1 and BIO-3, which do not have measurements for their current definitions.*
 :::
 
 The 29 Quail runs take 1,484.25 seconds in total, compared with 3,149.83 seconds for the vLLM baseline. That is a 2.12 times aggregate speedup. The combined SoL estimate for the same queries is 449.43 seconds. Quail takes 3.30 times the estimate in aggregate, compared with 7.01 times for the vLLM baseline.
@@ -440,7 +532,7 @@ BIO-4 is the motivating query in this post. At scale factor 1.0, it filters 5,00
 ::: {.figure-block .wide-figure}
 [![BIO-4 results at scale factor 1.0. Quail takes 29.26 minutes and costs $1.93. The vLLM baseline takes 6.84 hours and costs $27.03. The SoL estimate is 14.91 minutes and $0.98.](figures/bio4_results.png){width=100%}](figures/bio4_results.pdf)
 
-*Figure 8. BIO-4 results at scale factor 1.0. Query time and GPU cost exclude model startup. Fresh input tokens count every token processed by a model forward pass. Recomputed KV tokens are included in the fresh input token total.*
+*Figure 9. BIO-4 results at scale factor 1.0. Query time and GPU cost exclude model startup. Fresh input tokens count every token processed by a model forward pass. Recomputed KV tokens are included in the fresh input token total.*
 :::
 
 Quail takes 29.26 minutes, compared with 6.84 hours for the vLLM baseline. Quail is 14.04 times faster. It is 1.96 times the SoL estimate, while the vLLM baseline is 27.55 times the estimate.
@@ -488,7 +580,7 @@ The vLLM baseline runs AGENT-1 in 98.45 seconds, which is 2.42 times faster than
 ::: {.figure-block .wide-figure}
 [![Five seconds of GPU activity and top-level CPU operations during the AGENT-1 filter with Quail and the vLLM baseline.](figures/agent1_profile_comparison.png){width=100%}](figures/agent1_profile_comparison.pdf)
 
-*Figure 9. AGENT-1 has one filter and no join. GPU operations cover 4.998 seconds with Quail and 4.988 seconds with the vLLM baseline in these five-second windows. The lower row shows only top-level CPU operations. Both keep the GPU busy, but the vLLM baseline computes far fewer fresh tokens by reusing prefixes across snapshots.*
+*Figure 10. AGENT-1 has one filter and no join. GPU operations cover 4.998 seconds with Quail and 4.988 seconds with the vLLM baseline in these five-second windows. The lower row shows only top-level CPU operations. Both keep the GPU busy, but the vLLM baseline computes far fewer fresh tokens by reusing prefixes across snapshots.*
 :::
 
 The vLLM baseline wins because its automatic prefix caching feature can reuse KV across different rows when their token prefixes match. Quail currently reuses KV only when the same document appears again in the query. As a result, Quail incurs 11.89 million KV regret tokens, while the vLLM baseline incurs only 23,928.
