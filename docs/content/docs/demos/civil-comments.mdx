@@ -56,10 +56,11 @@ WHERE AI_FILTER(
 
 The query has no selectivity hints.
 
-## Comparison
+## Models
 
-The demo includes [Jev][jev] as a comparison point. One call to Jev can
-answer the toxicity question and all 30 field questions for one comment.
+Quail runs [DiffusionGemma 26B-A4B fp8][diffusion-gemma] on one H100. The Jev
+comparison runs use [Jev 1.13.0][jev]. One call to Jev can answer the toxicity
+question and all 30 field questions for one comment.
 
 ## Execution
 
@@ -110,9 +111,9 @@ Primary query time and cost exclude model startup.
 
 | Backend | Query time | Tokens/s | Cost | Cost vs. Quail | Filter F1 | Join F1 |
 |---|---:|---:|---:|---:|---:|---:|
-| Quail, 1 H100 | **85.53 s** | 284,022 | **$0.0938** | **1.00×** | 0.413 | **0.287** |
-| Jev, num_threads = 256 (combined) | 244.87 s | **313,379** | $1.8892 | **20.13×** | 0.425 | 0.260 |
-| Jev, num_threads = 256 (toxicity first) | 100.20 s | 253,935 | $0.7705 | **8.21×** | **0.430** | 0.263 |
+| Quail, DiffusionGemma 26B-A4B fp8, 1 H100 | **85.53 s** | 284,022 | **$0.0938** | **1.00×** | 0.413 | **0.287** |
+| Jev 1.13.0, num_threads = 256 (combined) | 244.87 s | **313,379** | $1.8892 | **20.13×** | 0.425 | 0.260 |
+| Jev 1.13.0, num_threads = 256 (toxicity first) | 100.20 s | 253,935 | $0.7705 | **8.21×** | **0.430** | 0.263 |
 
 ## Run
 
@@ -168,4 +169,5 @@ The Jev runner writes local checkpoints under
 `results/civil-comments/jev/`.
 
 [dataset]: https://huggingface.co/datasets/pietrolesci/civilcomments-wilds
+[diffusion-gemma]: https://huggingface.co/RedHatAI/diffusiongemma-26B-A4B-it-FP8-dynamic
 [jev]: https://docs.typesafe.ai
