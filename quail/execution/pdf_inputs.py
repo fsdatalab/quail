@@ -5,14 +5,13 @@ from __future__ import annotations
 import pyarrow as pa
 
 from quail.pdf import PDFInput
-from quail.planner.plan import PdfDocuments
 
 
 class PdfScanInput:
     """One scan's PDF rows, their planned lengths, and stored value columns.
 
-    The text counterpart is ScanInput; a query treats both the same
-    way: lengths for planning, column() for value tables, and
+    The image reading's counterpart of ScanInput; a query treats both
+    the same way: lengths for planning, column() for value tables, and
     physical_input() for the request binding. The lengths are
     PagePrompts.lengths for the session's image budget.
     """
@@ -38,11 +37,3 @@ class PdfScanInput:
 
     def physical_input(self) -> PDFInput:
         return self.pdf_input
-
-    def documents(self) -> PdfDocuments:
-        """What the planner needs beyond the per-row lengths."""
-        return PdfDocuments(
-            row_mode=self.pdf_input.row_mode,
-            n_pages=self.pdf_input.page_count,
-            visual_tokens=self.pdf_input.visual_tokens,
-            pages_per_row_max=self.pdf_input.pages_per_row_max)

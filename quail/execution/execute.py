@@ -12,6 +12,7 @@ from quail.execution.types import (
 )
 from quail.pdf import PDFInput
 from quail.physical import (
+    OcrScan,
     PDFScan,
     PhysicalScan,
     TextScan,
@@ -62,8 +63,10 @@ def _validate_physical_request(request, registry):
     return graph, backend
 
 
-# the input each scan kind binds
-SCAN_INPUT_TYPES = {TextScan: TokenizedInput, PDFScan: PDFInput}
+# the input each scan kind binds; the OCR operator's rows bind their
+# tokenized page text like any text scan
+SCAN_INPUT_TYPES = {TextScan: TokenizedInput, OcrScan: TokenizedInput,
+                    PDFScan: PDFInput}
 
 
 def check_scan_input(node: PhysicalScan, value) -> None:
@@ -78,13 +81,10 @@ def check_scan_input(node: PhysicalScan, value) -> None:
         raise ValueError(
             f"scan {node.node_id!r} plans {node.n_docs} documents but its "
             f"input holds {len(value)}")
-    if isinstance(node, PDFScan) and (
-            value.row_mode != node.row_mode
-            or value.visual_tokens != node.visual_tokens):
+    if isinstance(node, PDFScan) and value.row_mode != node.row_mode:
         raise ValueError(
-            f"scan {node.node_id!r} plans row_mode={node.row_mode!r} at "
-            f"{node.visual_tokens} visual tokens, but its input has "
-            f"row_mode={value.row_mode!r} at {value.visual_tokens}")
+            f"scan {node.node_id!r} plans row_mode={node.row_mode!r}, but "
+            f"its input has row_mode={value.row_mode!r}")
 
 
 def _execute_physical(request, registry):
@@ -145,6 +145,9 @@ def execute_query(query, physical_executor=None, plan=None):
         raise TypeError("a physical executor must return PhysicalResponse")
     result = query.finish(response, time.perf_counter() - started)
     result.report["token_wait_s"] = round(query.token_wait_s, 4)
+    ocr = query.ocr_metrics()
+    if ocr:
+        result.report["ocr"] = ocr
     result.report["worker_total_s"] = round(
         time.perf_counter() - total_started, 4)
     return result

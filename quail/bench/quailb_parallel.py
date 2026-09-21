@@ -90,7 +90,8 @@ def _methods(csv: str) -> list[str]:
 
 
 def _run_family(process_groups, result_name, model, sf, query_ids_csv,
-                run_dir, ground_truth_collection, root=None) -> str:
+                run_dir, ground_truth_collection, root=None,
+                ocr=False) -> str:
     """Run one query family's methods, one child process per group.
 
     Every group runs on the one GPU of this container, in a fresh
@@ -110,7 +111,7 @@ def _run_family(process_groups, result_name, model, sf, query_ids_csv,
         process_result = run_backend_group_in_fresh_process(
             data_dir=DATA_DIR, model=model, sf=sf, query_ids=query_ids,
             run_dir=run_dir, ground_truth_collection=ground_truth_collection,
-            methods=methods, root=root)
+            methods=methods, root=root, ocr=ocr)
         process_results.append(process_result)
         suites.update(process_result["suites"])
     gpu_uuids = {
@@ -160,12 +161,15 @@ def run_query_family(
     include_dumb_vllm: bool = False,
     baselines: str = "stock_vllm,pipelined_vllm",
     root: str = "",
+    ocr: bool = False,
 ) -> str:
     """Run one query family through Quail and the vLLM baselines.
 
     baselines names the vLLM baseline methods that run when
     include_baselines is set. root is the published-data mirror the
-    labels are read from; empty means the public bucket.
+    labels are read from; empty means the public bucket. With ocr,
+    PDF tables are read through the OCR operator, so a text model and
+    the vLLM baselines run the PDF queries.
     """
     process_groups = [("quail",)] if include_quail else []
     if include_baselines:
@@ -174,7 +178,8 @@ def run_query_family(
         process_groups.append(("dumb_vllm",))
     try:
         return _run_family(process_groups, "", model, sf, query_ids_csv,
-                           run_dir, ground_truth_collection, root or None)
+                           run_dir, ground_truth_collection, root or None,
+                           ocr)
     finally:
         results_vol.commit()
         kernel_cache.commit()
@@ -195,12 +200,13 @@ def run_sglang_query_family(
     run_dir: str,
     ground_truth_collection: str,
     root: str = "",
+    ocr: bool = False,
 ) -> str:
     """Run one query family through the SGLang backend."""
     try:
         return _run_family([("pipelined_sglang",)], "-sglang", model, sf,
                            query_ids_csv, run_dir, ground_truth_collection,
-                           root or None)
+                           root or None, ocr)
     finally:
         results_vol.commit()
         kernel_cache.commit()
@@ -257,6 +263,7 @@ def run_all(
     include_dumb_vllm: bool = False,
     baselines: str = "stock_vllm,pipelined_vllm",
     root: str = "",
+    ocr: bool = False,
 ):
     from quail_b import select_queries
     from quail_b.queries import query_family_name, split_query_families
@@ -275,6 +282,7 @@ def run_all(
         "started_at": started.isoformat(),
         "model": model,
         "sf": sf,
+        "pdf_rows": "ocr text" if ocr else "page images",
         "query_ids": list(query_ids),
         "root": root or "public bucket",
         "summaries": {},
@@ -310,6 +318,7 @@ def run_all(
                     include_dumb_vllm=include_dumb_vllm,
                     baselines=baselines,
                     root=root,
+                    ocr=ocr,
                 )
                 family_calls.append((family, family_call))
                 call_ids[f"{family}:quail_vllm"] = family_call.object_id
@@ -326,6 +335,7 @@ def run_all(
                     run_dir=run_dir,
                     ground_truth_collection=ground_truth_collection,
                     root=root,
+                    ocr=ocr,
                 )
                 sglang_calls.append((family, sglang_call))
                 call_ids[f"{family}:sglang"] = sglang_call.object_id
@@ -463,8 +473,14 @@ def main(
     baselines: str = "stock_vllm,pipelined_vllm",
     root: str = "",
     finish: str = "",
+    ocr: bool = False,
 ):
-    """Start one run; `--root /results` reads a corpus published on the volume."""
+    """Start one run; `--root /results` reads a corpus published on the volume.
+
+    `--ocr` reads PDF tables through the OCR operator on every
+    backend, so a text model and the vLLM baselines run the PDF
+    queries; without it the model sees the pages rendered.
+    """
     if finish:
         # finish an earlier run whose orchestrator died
         call = finish_run.spawn(finish)
@@ -489,6 +505,7 @@ def main(
         include_dumb_vllm=include_dumb_vllm,
         baselines=baselines,
         root=root,
+        ocr=ocr,
     )
     print(f"function call id: {call.object_id} (all families)", flush=True)
     print(call.get(), flush=True)

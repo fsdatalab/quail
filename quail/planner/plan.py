@@ -294,14 +294,28 @@ class EngineConfig:
 
 @dataclass(frozen=True)
 class PdfDocuments:
-    """What the planner knows about one alias bound to PDF pages.
+    """What the planner knows about one alias whose rows are PDF pages.
 
-    The alias's per-row lengths in ``doc_tokens`` are the planned
-    prompt prefix of each row (soft tokens plus frame tokens of its
-    pages); this adds what a text alias has no need for.
+    Attributes:
+        reading: "image" when the alias is a PDF provider, whose pages
+            the model sees rendered and whose ``doc_tokens`` are each
+            row's soft plus frame tokens; "ocr" when it is the OCR
+            operator over one, whose page text is tokenized like any
+            text alias.
+        row_mode: One page per row, or one PDF.
+        n_pages: Page references across every row.
+        pages_per_row_max: The longest row, in pages.
+        visual_tokens: The render budget per page; image reading only.
     """
 
+    reading: str
     row_mode: str
     n_pages: int
-    visual_tokens: int
     pages_per_row_max: int
+    visual_tokens: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.reading not in ("image", "ocr"):
+            raise ValueError(f"unknown PDF reading {self.reading!r}")
+        if (self.reading == "image") != (self.visual_tokens is not None):
+            raise ValueError("the image reading, and only it, has a budget")

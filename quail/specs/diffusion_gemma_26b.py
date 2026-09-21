@@ -1,4 +1,4 @@
-from .base import ModelSpec
+from .base import ModelSpec, VisionTower
 
 DIFFUSION_GEMMA_26B_FP8 = ModelSpec(
     name="diffusion-gemma-26b-a4b-fp8",
@@ -60,4 +60,18 @@ DIFFUSION_GEMMA_26B_FP8 = ModelSpec(
     # weights through vLLM's encoder path (pdf_probe_vision.json,
     # peak_bytes); 4 GiB covers a chunk's pages at the largest budget.
     image_reserve_bytes=4 * 2**30,
+    # The 550M Gemma 4 vision encoder (technical report, Table 10):
+    # 27 layers, hidden 1152, 16 heads of 72, gated MLP 4304 wide.
+    # The fp8 checkpoint's quantization ignore list leaves every tower
+    # linear, the patch projection, and the vision-to-text projection
+    # in bf16. The position table is 2 x 10240 x 1152.
+    vision_tower=VisionTower(
+        layers=27,
+        hidden=1152,
+        heads=16,
+        head_dim=72,
+        kv_heads=16,
+        intermediate=4304,
+        position_rows=10_240,
+    ),
 )

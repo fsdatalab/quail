@@ -169,8 +169,9 @@ def _boot_record(gpu, cold, warm_s, warm_tier, t_boot):
 def quail_runtime_payload(request, graph) -> dict:
     """Build private Quail scheduler state from a standard request.
 
-    docs holds each TextScan alias's token documents; pdf_inputs holds
-    each PDFScan alias's PDFInput, which the GPU worker lays out as
+    docs holds each text scan alias's token documents (a PDF alias
+    read as text among them); pdf_inputs holds each PDFScan alias's
+    PDFInput with its render budget, which the GPU worker lays out as
     PagePrompts once it knows the model.
     """
     envelope = request.plan
@@ -180,7 +181,8 @@ def quail_runtime_payload(request, graph) -> dict:
         if isinstance(node, TextScan):
             docs[node.alias] = request.inputs[node.input_id].documents
         elif isinstance(node, PDFScan):
-            pdf_inputs[node.alias] = request.inputs[node.input_id]
+            pdf_inputs[node.alias] = (request.inputs[node.input_id],
+                                      node.visual_tokens)
     return {
         "physical_plan": envelope,
         "model": envelope["model"],
@@ -195,8 +197,9 @@ def quail_runtime_payload(request, graph) -> dict:
 def payload_documents(payload: dict, spec) -> dict:
     """Every alias's document sequence: token documents and PDF page prompts."""
     docs = decode_payload_documents(payload["docs"])
-    for alias, pdf_input in payload.get("pdf_inputs", {}).items():
-        docs[alias] = PagePrompts(pdf_input, spec)
+    for alias, (pdf_input, visual_tokens) in payload.get(
+            "pdf_inputs", {}).items():
+        docs[alias] = PagePrompts(pdf_input, spec, visual_tokens)
     return docs
 
 

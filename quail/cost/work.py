@@ -7,7 +7,13 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class Work:
-    """Tokens, full and sliding attention pairs, and KV movement."""
+    """Tokens, attention pairs, KV movement, and image-tower counts.
+
+    `image_patches` is the patches the vision tower embeds.
+    `image_pairs` is the sum, over images, of patches squared: attention
+    stays inside one image, so the images do not form one sequence.
+    `image_soft_tokens` is the pooled tokens projected into the decoder.
+    """
 
     tokens: float = 0.0
     pairs: float = 0.0
@@ -15,6 +21,9 @@ class Work:
     kv_read: float = 0.0
     sliding_pairs: float = 0.0
     sliding_kv_read: float = 0.0
+    image_patches: float = 0.0
+    image_pairs: float = 0.0
+    image_soft_tokens: float = 0.0
 
     def __add__(self, other: "Work") -> "Work":
         return Work(
@@ -24,6 +33,9 @@ class Work:
             self.kv_read + other.kv_read,
             self.sliding_pairs + other.sliding_pairs,
             self.sliding_kv_read + other.sliding_kv_read,
+            self.image_patches + other.image_patches,
+            self.image_pairs + other.image_pairs,
+            self.image_soft_tokens + other.image_soft_tokens,
         )
 
     def __mul__(self, count: float) -> "Work":
@@ -34,6 +46,9 @@ class Work:
             self.kv_read * count,
             self.sliding_pairs * count,
             self.sliding_kv_read * count,
+            self.image_patches * count,
+            self.image_pairs * count,
+            self.image_soft_tokens * count,
         )
 
     def dominates(self, other: "Work") -> bool:
@@ -45,6 +60,9 @@ class Work:
             and self.kv_read <= other.kv_read
             and self.sliding_pairs <= other.sliding_pairs
             and self.sliding_kv_read <= other.sliding_kv_read
+            and self.image_patches <= other.image_patches
+            and self.image_pairs <= other.image_pairs
+            and self.image_soft_tokens <= other.image_soft_tokens
         )
 
 

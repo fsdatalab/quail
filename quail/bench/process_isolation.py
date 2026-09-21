@@ -35,8 +35,12 @@ def run_backend_group(
     ground_truth_collection: str,
     methods: Sequence[str],
     root: str | None = None,
+    ocr: bool = False,
 ) -> dict:
-    """Run backend methods while sharing one loaded model when possible."""
+    """Run backend methods while sharing one loaded model when possible.
+
+    With `ocr`, PDF tables are read through the OCR operator.
+    """
     from quail import EngineConfig
     from quail.bench.quailb import run_suite
     from quail_b.queries import query_family_name
@@ -65,6 +69,7 @@ def run_backend_group(
             ground_truth_collection=ground_truth_collection or None,
             root=root,
             output_dir=run_dir / method / family,
+            ocr=ocr,
         )
         suite["run_id"] = run_dir.name
         suite["query_family"] = {"name": family, "query_ids": list(query_ids)}

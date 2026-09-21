@@ -18,6 +18,9 @@ dependencies = [
     # reads PDF page sizes on the coordinator and renders pages on the
     # worker; the Modal images install the same version
     "pypdfium2==4.30.0",
+    # extracts PDF page text (text layer, optional Tesseract OCR) for the
+    # text reading of a PDF table; Apache 2.0, runs locally
+    "liteparse==2.14.6",
     # same version as the Modal image; vLLM has Linux wheels only
     "vllm==0.26.0; sys_platform == 'linux'",
 ]

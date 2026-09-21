@@ -11,7 +11,7 @@ import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from quail.pdf.types import PdfPageRef, PdfSource
+from quail.pdf.types import PdfPageRef, PdfSource, page_counts
 
 
 class PdfReadError(RuntimeError):
@@ -27,10 +27,7 @@ class PdfManifest:
 
     @property
     def page_counts(self) -> tuple[int, ...]:
-        counts = [0] * len(self.sources)
-        for page in self.pages:
-            counts[page.source_index] += 1
-        return tuple(counts)
+        return page_counts(len(self.sources), self.pages)
 
 
 def stat_sources(paths: Sequence[str]) -> tuple[PdfSource, ...]:

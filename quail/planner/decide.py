@@ -25,6 +25,7 @@ from quail.physical import (
     HashJoin,
     JoinStage,
     Limit,
+    OcrScan,
     PDFScan,
     PhysicalScan,
     PortRef,
@@ -781,16 +782,34 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
 
 def scan_node(node_id: str, alias: str, stats: CorpusStats, shard_ranges,
               shard_token_loads, pdf: PdfDocuments | None) -> PhysicalScan:
-    """The physical scan for one alias: a PDFScan when it binds pages."""
+    """The physical scan for one alias.
+
+    A text alias gets a TextScan. A PDF alias gets the scan of its
+    reading: a PDFScan binds the pages for rendering, an OcrScan binds
+    the tokens of the OCR operator's page text.
+    """
     common = dict(
         node_id=node_id, alias=alias, input_id=alias,
         n_docs=stats.n_docs, total_tokens=stats.total_tokens,
         shard_ranges=shard_ranges, shard_token_loads=shard_token_loads)
     if pdf is None:
         return TextScan(**common)
-    return PDFScan(**common, row_mode=pdf.row_mode, n_pages=pdf.n_pages,
-                   visual_tokens=pdf.visual_tokens,
-                   pages_per_row_max=pdf.pages_per_row_max)
+    rows = dict(row_mode=pdf.row_mode, n_pages=pdf.n_pages,
+                pages_per_row_max=pdf.pages_per_row_max)
+    if pdf.reading == "ocr":
+        return OcrScan(**common, **rows)
+    return PDFScan(**common, **rows, visual_tokens=pdf.visual_tokens)
+
+
+def image_aliases(pdf_documents: Mapping[str, PdfDocuments]
+                  ) -> dict[str, PdfDocuments]:
+    """The PDF aliases whose pages the model sees rendered.
+
+    Only these constrain the plan: the OCR operator's rows are
+    ordinary text once their pages are read.
+    """
+    return {alias: pdf for alias, pdf in pdf_documents.items()
+            if pdf.reading == "image"}
 
 
 def anchor_pdf_joins(joins, pdf_documents: Mapping[str, PdfDocuments]
@@ -806,10 +825,11 @@ def anchor_pdf_joins(joins, pdf_documents: Mapping[str, PdfDocuments]
         (joins, refusal): the joins with their anchors fixed, and the
         refusal if one join cannot be anchored on PDF pages.
     """
+    rendered = image_aliases(pdf_documents)
     out = []
     for join in joins:
         pdf_aliases = sorted({ref.alias for ref in join.prompt.args
-                              if ref.alias in pdf_documents})
+                              if ref.alias in rendered})
         if len(pdf_aliases) > 1:
             return out, Refusal(
                 reasons=(f"a join reads the pages of one PDF alias; "
@@ -836,8 +856,10 @@ def refuse_pdf_documents(pdf_documents: Mapping[str, PdfDocuments],
 
     The model must take images, no row may show more pages than the
     model was tested with, and the pages render for one GPU's chain:
-    the multi-GPU coordinator splits token documents only.
+    the multi-GPU coordinator splits token documents only. The OCR
+    operator's rows earn none of these.
     """
+    pdf_documents = image_aliases(pdf_documents)
     if not pdf_documents:
         return None
     if "image" not in model.input_modalities:
@@ -951,7 +973,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
             f"for selected backend {backend!r}")
     pdf_scans = {node.alias for node in selected_plan.nodes
                  if isinstance(node, PDFScan)}
-    unplanned = sorted(set(pdf_documents or {}) - pdf_scans)
+    unplanned = sorted(set(image_aliases(pdf_documents or {})) - pdf_scans)
     if unplanned:
         return Refusal(
             reasons=(f"backend {backend!r} planned {unplanned} without PDF "

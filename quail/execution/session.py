@@ -14,7 +14,13 @@ import pyarrow as pa
 from pyarrow import compute as pc
 
 from quail.builtins import built_in_registry
-from quail.catalog import Catalog, PDFProvider, ScanRequest, TableProvider
+from quail.catalog import (
+    Catalog,
+    OcrProvider,
+    PDFProvider,
+    ScanRequest,
+    TableProvider,
+)
 from quail.execution.pairs import (
     columns_key,
     pair_fraction,
@@ -53,7 +59,12 @@ from quail.physical import (
 )
 from quail.planner import explain, plan_query
 from quail.planner.logical_optimizer import LogicalPlanningContext, apply_logical_rules
-from quail.planner.plan import EngineConfig, Refusal, resolve_model
+from quail.planner.plan import (
+    EngineConfig,
+    PdfDocuments,
+    Refusal,
+    resolve_model,
+)
 from quail.progress import Progress, say
 from quail.specs.vision import resolve_image_tokens
 
@@ -208,6 +219,23 @@ class Session:
                 self._fast = None
         return self._fast
 
+    def pdf_documents(self, provider_name: str) -> PdfDocuments | None:
+        """What the planner needs to know about an alias over PDF pages.
+
+        None for a table that is not PDF pages. A PDF provider's pages
+        are rendered; the OCR operator over one gives their text.
+        """
+        provider = self.catalog.get(provider_name)
+        if not isinstance(provider, (PDFProvider, OcrProvider)):
+            return None
+        pdf_input = provider.pdf_input()
+        rows = dict(row_mode=pdf_input.row_mode, n_pages=pdf_input.page_count,
+                    pages_per_row_max=pdf_input.pages_per_row_max)
+        if isinstance(provider, OcrProvider):
+            return PdfDocuments(reading="ocr", **rows)
+        return PdfDocuments(reading="image", visual_tokens=self.image_tokens,
+                            **rows)
+
     def tokenize(self, provider_name: str, column: str,
                  projected_columns=()) -> ScanInput:
         """Tokenize one document column and keep value columns beside it.
@@ -261,9 +289,10 @@ class Session:
             if missing:
                 self._load(provider_name, None, missing)
             if identity not in self._pdf_inputs:
-                pdf_input = provider.pdf_input(self.image_tokens)
+                pdf_input = provider.pdf_input()
                 self._pdf_inputs[identity] = (
-                    pdf_input, PagePrompts(pdf_input, self.model).lengths)
+                    pdf_input, PagePrompts(pdf_input, self.model,
+                                           self.image_tokens).lengths)
             pdf_input, lengths = self._pdf_inputs[identity]
             return PdfScanInput(pdf_input, lengths, {
                 name: self._column_stores[(identity, name)]
@@ -328,6 +357,17 @@ class Session:
         if key in self._length_estimates:
             return self._length_estimates[key]
         started = time.perf_counter()
+        estimate = getattr(provider, "estimate_token_lengths", None)
+        if estimate is not None:
+            # the provider knows its rows better than their byte
+            # lengths would tell: PDF pages before their text exists
+            tok = self.tokenizer
+            lengths = estimate(lambda texts: [len(tok(text)) for text in texts])
+            self._length_estimates[key] = lengths
+            say(f"estimated {provider_name}.{column}: {len(lengths):,} rows, "
+                f"about {sum(lengths):,} tokens from a page sample, "
+                f"{time.perf_counter() - started:.1f} s")
+            return lengths
         reader = provider.scan(ScanRequest(columns=(column,)))
         byte_lengths = []
         sample = []
@@ -552,9 +592,25 @@ class Query:
         self._doc_tokens = None
         self._token_inputs = None
         self._pdf_documents = {}
+        self._providers = {}
         self._token_futures = {}
         self._estimated = ()
         self.token_wait_s = 0.0
+
+    def ocr_metrics(self) -> dict[str, dict]:
+        """The OCR operator's counters for every alias over one, by alias.
+
+        An alias whose text was never read (the plan was refused, or
+        another alias over the same operator read it) is left out.
+        """
+        out = {}
+        for alias, pdf in self._pdf_documents.items():
+            if pdf.reading != "ocr":
+                continue
+            metrics = self.session.catalog.get(self._providers[alias]).metrics()
+            if metrics is not None:
+                out[alias] = metrics
+        return out
 
     def token_inputs(self) -> dict:
         """Return the token store of every scanned alias.
@@ -580,23 +636,28 @@ class Query:
             self._doc_tokens = {}
             self._token_inputs = {}
             self._pdf_documents = {}
+            self._providers = {}
             estimated = []
             for s in scans:
-                provider = self.session.catalog.get(s.provider)
-                if isinstance(provider, PDFProvider):
+                self._providers[s.alias] = s.provider
+                pdf = self.session.pdf_documents(s.provider)
+                if pdf is not None:
+                    self._pdf_documents[s.alias] = pdf
+                if pdf is not None and pdf.reading == "image":
                     if not self.session.image_tokens:
                         self._plan = Refusal(
                             reasons=(f"model {self.session.model.name!r} "
                                      f"takes text only, but {s.alias!r} "
-                                     f"binds PDF pages",),
+                                     f"binds PDF pages; register the table "
+                                     f"through .ocr() to read their text",),
                             constraint="model_takes_text_only",
                             needed=1, available=0, unit="image models")
                         return self._plan
                     store = self.session.prepare_pdf(s.provider, s.columns)
                     self._token_inputs[s.alias] = store
                     self._doc_tokens[s.alias] = store.lengths
-                    self._pdf_documents[s.alias] = store.documents()
                     continue
+                # the OCR operator's rows take the text path below
                 exact = self.session.token_lengths(s.provider, s.column)
                 if exact is not None:
                     store = self.session.tokenize(

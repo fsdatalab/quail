@@ -316,58 +316,99 @@ class TextScan(PhysicalScan):
     type_name: ClassVar[str] = "quail.scan"
 
 
+def _check_pdf_rows(row_mode: str, pages_per_row_max: int) -> None:
+    """Fail unless the PDF row description is consistent."""
+    if row_mode not in ("page", "pdf"):
+        raise ValueError(f"unknown PDF row mode {row_mode!r}")
+    if row_mode == "page" and pages_per_row_max > 1:
+        raise ValueError("a page mode PDF scan has one page per row")
+
+
+def _pdf_row_attributes(node) -> dict:
+    """The row description every PDF scan carries, for the wire."""
+    return {
+        "row_mode": node.row_mode,
+        "n_pages": node.n_pages,
+        "pages_per_row_max": node.pages_per_row_max,
+    }
+
+
+def _pdf_row_fields(attributes: Mapping[str, Any]) -> dict:
+    """Decode the row description every PDF scan carries."""
+    return {
+        "row_mode": str(attributes["row_mode"]),
+        "n_pages": int(attributes["n_pages"]),
+        "pages_per_row_max": int(attributes["pages_per_row_max"]),
+    }
+
+
 @dataclass(frozen=True)
 class PDFScan(PhysicalScan):
-    """Read one PDF page input; each document is one page or one PDF.
+    """Read one PDF page input as page images; a document is one page or one PDF.
 
     total_tokens counts the planned prompt prefix of every row: its
     pages' soft tokens plus their frame tokens. The executor renders
-    pages from the bound PDFInput; nothing here is pixels.
+    pages from the bound PDFInput at visual_tokens per page; nothing
+    here is pixels.
     """
 
     row_mode: str = "page"
     n_pages: int = 0             # page references across every row
-    visual_tokens: int = 0       # soft token budget per page
     pages_per_row_max: int = 0   # the longest row, in pages
+    visual_tokens: int = 0       # soft token budget per page
 
     type_name: ClassVar[str] = "quail.pdf_scan"
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        if self.row_mode not in ("page", "pdf"):
-            raise ValueError(f"unknown PDF row mode {self.row_mode!r}")
+        _check_pdf_rows(self.row_mode, self.pages_per_row_max)
         if self.visual_tokens <= 0:
             raise ValueError("a PDF scan needs a positive visual token budget")
-        if self.row_mode == "page" and self.pages_per_row_max > 1:
-            raise ValueError("a page mode PDF scan has one page per row")
 
     def attributes(self) -> dict:
-        return {
-            **super().attributes(),
-            "row_mode": self.row_mode,
-            "n_pages": self.n_pages,
-            "visual_tokens": self.visual_tokens,
-            "pages_per_row_max": self.pages_per_row_max,
-        }
+        return {**super().attributes(), **_pdf_row_attributes(self),
+                "visual_tokens": self.visual_tokens}
 
     def explain_fields(self) -> Mapping[str, Any]:
-        return {
-            **super().explain_fields(),
-            "row_mode": self.row_mode,
-            "n_pages": self.n_pages,
-            "visual_tokens": self.visual_tokens,
-            "pages_per_row_max": self.pages_per_row_max,
-        }
+        return {**super().explain_fields(), **_pdf_row_attributes(self),
+                "visual_tokens": self.visual_tokens}
 
     @classmethod
     def _scan_fields(cls, attributes: Mapping[str, Any]) -> dict:
-        return {
-            **super()._scan_fields(attributes),
-            "row_mode": str(attributes["row_mode"]),
-            "n_pages": int(attributes["n_pages"]),
-            "visual_tokens": int(attributes["visual_tokens"]),
-            "pages_per_row_max": int(attributes["pages_per_row_max"]),
-        }
+        return {**super()._scan_fields(attributes),
+                **_pdf_row_fields(attributes),
+                "visual_tokens": int(attributes["visual_tokens"])}
+
+
+@dataclass(frozen=True)
+class OcrScan(TextScan):
+    """Read the OCR operator's rows: PDF page text, tokenized like any text.
+
+    The session reads each row's page text with LiteParse and
+    tokenizes it before the query runs, so the bound input is a
+    TokenizedInput and every backend reads it as a text scan. The row
+    description is kept so the plan says what the text came from.
+    """
+
+    row_mode: str = "page"
+    n_pages: int = 0             # page references across every row
+    pages_per_row_max: int = 0   # the longest row, in pages
+
+    type_name: ClassVar[str] = "quail.ocr_scan"
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _check_pdf_rows(self.row_mode, self.pages_per_row_max)
+
+    def attributes(self) -> dict:
+        return {**super().attributes(), **_pdf_row_attributes(self)}
+
+    def explain_fields(self) -> Mapping[str, Any]:
+        return {**super().explain_fields(), **_pdf_row_attributes(self)}
+
+    @classmethod
+    def _scan_fields(cls, attributes: Mapping[str, Any]) -> dict:
+        return {**super()._scan_fields(attributes), **_pdf_row_fields(attributes)}
 
 
 @dataclass(frozen=True)

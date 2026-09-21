@@ -13,6 +13,7 @@ from quail.physical import (
     Foreign,
     HashJoin,
     Limit,
+    OcrScan,
     PDFScan,
     PhysicalScan,
     PortRef,
@@ -309,11 +310,12 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
             mean = node.total_tokens / node.n_docs if node.n_docs else 0
             details.append(f"tokens={node.total_tokens:,}, "
                            f"mean_doc_tokens={_number(mean)}")
-            if isinstance(node, PDFScan):
+            if isinstance(node, (PDFScan, OcrScan)):
+                reading = (f"visual_tokens={node.visual_tokens}"
+                           if isinstance(node, PDFScan) else "OCR text")
                 details.append(
                     f"row_mode={node.row_mode}, pages={node.n_pages:,}, "
-                    f"visual_tokens={node.visual_tokens}, "
-                    f"max_pages_per_row={node.pages_per_row_max}")
+                    f"{reading}, max_pages_per_row={node.pages_per_row_max}")
         elif isinstance(node, Project):
             title += ": " + ", ".join(node.columns)
         elif isinstance(node, Limit):

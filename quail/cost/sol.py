@@ -14,14 +14,21 @@ from dataclasses import dataclass
 from quail.cost import work as _workload
 from quail.cost.dense_decoder_cost import dense_decoder_components
 from quail.cost.roofline import ComponentLatency, component_latencies
+from quail.cost.vision_cost import vision_components
 from quail.specs import DeviceSpec, ModelSpec
 
 
 def _latencies(work: _workload.Work, model: ModelSpec, device: DeviceSpec,
                passes: float) -> tuple[ComponentLatency, ...]:
-    """Return the priced decoder components for one work record."""
+    """Return the priced components for one work record.
+
+    The vision tower runs before the decoder. A record with no image
+    work has no tower components, so a text query's list is unchanged.
+    """
     return component_latencies(
-        dense_decoder_components(work, model, passes), device)
+        vision_components(work, model)
+        + dense_decoder_components(work, model, passes),
+        device)
 
 
 def compute_seconds(work: _workload.Work, model: ModelSpec,
@@ -97,8 +104,14 @@ class SpeedOfLight:
             f"kv written     {work.kv_written:>18,.0f}",
             f"kv read        {work.kv_read:>18,.0f}",
             f"forward passes {self.passes:>18,d}",
-            f"bytes moved    {self.bytes_moved:>18,.0f}",
         ]
+        if work.image_patches:
+            lines.extend([
+                f"image patches  {work.image_patches:>18,.0f}",
+                f"image pairs    {work.image_pairs:>18,.0f}",
+                f"soft tokens    {work.image_soft_tokens:>18,.0f}",
+            ])
+        lines.append(f"bytes moved    {self.bytes_moved:>18,.0f}")
         for latency in self.components:
             name = latency.name
             lines.extend([

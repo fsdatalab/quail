@@ -247,6 +247,32 @@ The $\max$ within each component allows compute and memory to
 overlap. The components are summed because they run in sequence.
 Filter and join boundaries do not start separate forward passes.
 
+### Count the vision tower
+
+When the query shows PDF pages as images, add the vision tower in
+front of the decoder. Count each distinct page once. With the shared
+prefix credit off, count each alias's pages once instead. Attention
+stays inside one page, so a page of $P$ patches contributes $P^2$
+pairs, and the query's image pairs are the sum of those.
+
+The tower is a ViT in bf16: a patch projection, then every layer's
+full attention and gated MLP, then a linear map of the pooled soft
+tokens into the decoder width. Read the tower weights once for the
+query. Write each patch's K and V once per layer. Leave out norms,
+RoPE, the pooling adds, and any extra weight reads the runtime pays
+to stay inside its activation budget.
+
+$$
+T_\mathrm{vision} = T_\mathrm{embed} + T_\mathrm{proj} + T_\mathrm{mlp}
++ T_\mathrm{pairs} + T_\mathrm{out}
+$$
+
+Each of those five is a roofline over its own FLOPs and bytes, summed
+the same way as the decoder components. They run before the decoder,
+and they do not depend on filter or join order: every plan embeds the
+same pages. A query with no images adds nothing here, and its
+component list is the decoder's alone.
+
 ### Count sliding-window attention
 
 **Split the layers.** You count 25 sliding-window layers and five
@@ -292,6 +318,7 @@ You can follow a plan's cost estimate through these files.
 | --- | --- |
 | Count tokens, attention pairs, and KV reads and writes. | [work.py](https://github.com/fsdatalab/quail/blob/main/quail/cost/work.py) |
 | Count arithmetic work and memory traffic from the model's dimensions. | [dense_decoder_cost.py](https://github.com/fsdatalab/quail/blob/main/quail/cost/dense_decoder_cost.py) |
+| Count the vision tower the same way, for image pages. | [vision_cost.py](https://github.com/fsdatalab/quail/blob/main/quail/cost/vision_cost.py) |
 | Convert those counts to time using the GPU's limits. | [roofline.py](https://github.com/fsdatalab/quail/blob/main/quail/cost/roofline.py) |
 | Estimate the number of batches and add the component times. | [sol.py](https://github.com/fsdatalab/quail/blob/main/quail/cost/sol.py) |
 | Compare filter and join orders for your query. | [estimate.py](https://github.com/fsdatalab/quail/blob/main/quail/planner/estimate.py) |
