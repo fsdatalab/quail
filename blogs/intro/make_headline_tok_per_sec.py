@@ -154,10 +154,12 @@ def plot_headline(rows, destination: Path):
     figure, axis = plt.subplots(figsize=(10, 5.2))
     positions = list(range(len(datasets)))
     width = 0.36
+    all_bar_values = []
     for index, (method, color) in enumerate(
         (("Quail", BLUE), ("vLLM", ORANGE))
     ):
         values = [statistics.mean(by[name][method]) for name in datasets]
+        all_bar_values.extend(values)
         offset = (index - 0.5) * width
         axis.bar(
             [position + offset for position in positions],
@@ -165,6 +167,7 @@ def plot_headline(rows, destination: Path):
             width,
             color=color,
             zorder=2,
+            bottom=None,
         )
     for position, name in enumerate(datasets):
         if not by[name]["SoL"]:
@@ -181,6 +184,15 @@ def plot_headline(rows, destination: Path):
             zorder=3,
         )
 
+    sol_values = [
+        statistics.mean(by[name]["SoL"])
+        for name in datasets
+        if by[name]["SoL"]
+    ]
+    ymin = min(all_bar_values + sol_values) / 2.5
+    ymax = max(all_bar_values + sol_values) * 1.4
+    axis.set_ylim(ymin, ymax)
+
     axis.set_xticks(positions)
     axis.set_xticklabels(
         [
@@ -188,14 +200,16 @@ def plot_headline(rows, destination: Path):
             for name in datasets
         ]
     )
-    axis.set_ylabel("Average tokens / second")
+    axis.set_ylabel("Average tokens / second (log scale)")
     axis.set_title(
         "QUAIL-B average tokens/sec by dataset\n"
         "Qwen3 4B FP8, one H100, scale factor 0.1"
     )
-    axis.ticklabel_format(style="plain", axis="y", useOffset=False)
+    axis.set_yscale("log")
 
     def _fmt(value, _pos):
+        if value <= 0:
+            return ""
         if value >= 1_000_000:
             return f"{value / 1_000_000:g}M"
         if value >= 1_000:
@@ -203,6 +217,7 @@ def plot_headline(rows, destination: Path):
         return f"{value:g}"
 
     axis.yaxis.set_major_formatter(FuncFormatter(_fmt))
+    # Keep bars readable on log: floor just under the smallest dataset mean.
     axis.legend(
         handles=[
             Patch(facecolor=BLUE, label="Quail"),
