@@ -5,6 +5,7 @@ import hashlib
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pypdfium2
+import pytest
 
 import quail
 from quail.bench.quailb import queries, register_tables
@@ -167,3 +168,20 @@ def test_cuad_queries_plan_on_an_image_model_over_bounded_pdf_rows(tmp_path):
         assert "physical:" in explained, qid
         mode = "page" if qid in ("CUAD-1", "CUAD-2") else "pdf"
         assert f"row_mode={mode}" in explained, qid
+
+
+def test_page_rows_register_through_a_symlinked_data_directory(tmp_path):
+    """A mounted volume's real path differs from the reference; rows still match."""
+    from quail.bench.quailb import pdf_provider, read_tables
+
+    data = tmp_path / "data"
+    data.mkdir()
+    _standin_contracts(data, page_counts=(2, 3))
+    link = tmp_path / "mount"
+    link.symlink_to(data, target_is_directory=True)
+    tables = read_tables(link, ["contract_pages"])
+    provider = pdf_provider(tables["contract_pages"])
+    assert provider.statistics().row_count == 5
+    # a table missing one page of a file no longer matches the files' rows
+    with pytest.raises(ValueError, match="every page of each file"):
+        pdf_provider(tables["contract_pages"].slice(0, 4))

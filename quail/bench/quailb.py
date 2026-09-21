@@ -72,10 +72,12 @@ def pdf_provider(rows: pa.Table):
     provider = quail.DocumentProvider.from_pdfs(
         pa.table({"id": files, "path": files}),
         id_col="id", path_col="path", row_mode="page")
-    manifest = provider.manifest()
-    formed = [(manifest.sources[page.source_index].path, page.page_number)
-              for page in manifest.pages]
-    if formed != list(zip(paths, pages)):
+    # sources keep the real path, which differs from the reference on
+    # a mounted volume; the source index identifies the file either way
+    index = {path: source_index for source_index, path in enumerate(files)}
+    formed = [(page.source_index, page.page_number)
+              for page in provider.manifest().pages]
+    if formed != [(index[path], page) for path, page in references]:
         raise ValueError(
             "page rows must list every page of each file, in file then "
             "page order, to match the rows a PDF provider forms")
