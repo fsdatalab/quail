@@ -13,8 +13,7 @@ Where the data lives:
 - The live SQLite file stays on the container's local disk. A Volume
   has no file locking and rewrites a file on in-place writes, so SQLite
   must not run there. A checkpoint thread copies the database to the
-  Volume after each change and calls ``volume.commit()``, the way the
-  Modal Datasette example copies its database onto a Volume. A
+  Volume after each change and calls ``volume.commit()``. A
   submission is copied and committed before it is acknowledged. On
   start the copy is restored. ``max_containers=1`` keeps one writer.
 
