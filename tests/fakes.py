@@ -104,11 +104,17 @@ def cpu_arena(pages):
 
 
 class FakeModel:
-    """Answer packed suffixes from planted truth tables."""
+    """Answer packed suffixes from planted truth tables.
 
-    def __init__(self, filter_truth, join_truth):
+    Args:
+        fresh_anchors: Whether join anchors may pack their prefix. False
+            asserts every anchor arrived resident from its filter chain.
+    """
+
+    def __init__(self, filter_truth, join_truth, *, fresh_anchors=False):
         self.filter_truth = filter_truth
         self.join_truth = join_truth
+        self.fresh_anchors = fresh_anchors
         self.launched = []      # ("filter" | "join", specs)
 
     def forward_chunk(self, chunk):
@@ -127,7 +133,8 @@ class FakeModel:
                     document = spec["key"][1]
                     bits.append(self.filter_truth[document][head - QUESTION])
                     kind = "filter"
-            if kind == "join" and spec["prefix"] is not None:
+            if (kind == "join" and spec["prefix"] is not None
+                    and not self.fresh_anchors):
                 raise AssertionError("a streamed anchor packed its prefix")
         self.launched.append((kind, chunk.specs))
         return bits
@@ -273,8 +280,21 @@ def two_alias_graph(pin_survivors, *, stages=1, hash_join=False, foreign=None):
 
 def run_graph_on_arena(monkeypatch, graph, *, n_docs=14, n_partners=4,
                        seed=5, pages=64, stages=1, partner_tokens=20,
-                       **extra):
+                       fresh_anchors=False, **extra):
     """Run a graph over random documents through the real graph runtime.
+
+    Args:
+        monkeypatch: The pytest fixture; the chunk packer is faked.
+        graph: The physical graph to run.
+        n_docs: Documents under alias r.
+        n_partners: Documents under alias p.
+        seed: Seed for document lengths and the planted truth.
+        pages: Arena pages.
+        stages: Filter stages the planted truth answers.
+        partner_tokens: Tokens per partner document.
+        fresh_anchors: Whether the join's anchors reach it without a
+            filter chain, so they pack their own prefix.
+        **extra: More entries for the runtime state, such as `columns`.
 
     Returns:
         (result, model, filter_truth, join_truth); the arena is empty
@@ -290,7 +310,7 @@ def run_graph_on_arena(monkeypatch, graph, *, n_docs=14, n_partners=4,
                      for p in (0.8, 0.7)[:stages]] for _ in range(n_docs)]
     join_truth = {("r", d): [1 if rng.random() < 0.5 else 0
                              for _ in range(n_partners)] for d in range(n_docs)}
-    model = FakeModel(filter_truth, join_truth)
+    model = FakeModel(filter_truth, join_truth, fresh_anchors=fresh_anchors)
     torch = fake_torch()
     arena = cpu_arena(pages)
     pipeline = fake_pipeline(forward_chunk=model.forward_chunk)

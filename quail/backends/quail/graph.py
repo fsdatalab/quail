@@ -310,6 +310,10 @@ def _model_inputs(node, inputs, context: ExecutionContext) -> dict:
 
     def anchor_done(local_index, row):
         key = anchor_keys[local_index]
+        if not state["arena"].is_resident(key):
+            # an anchor left without partners settles without running,
+            # so it never took KV
+            return
         matched = any(row)
         alive = not matched if group[-1]["semantics"] == "anti" \
             else matched

@@ -5,6 +5,8 @@ from types import SimpleNamespace
 import pyarrow as pa
 import pytest
 from fakes import (
+    FRAME,
+    QUESTION,
     expected_filter_rows,
     fake_torch,
     keep_even,
@@ -22,6 +24,7 @@ from quail.physical import (
     AiFilter,
     AiJoin,
     FilterStage,
+    HashJoin,
     JoinStage,
     PhysicalGraph,
     PortRef,
@@ -453,6 +456,72 @@ def test_pair_join_runs_through_the_quail_graph(monkeypatch):
                 if any(join_truth[("r", d)][i] for i in allowed[d])]
         root = result["_outputs"][PortRef("group:0", "ids:r")]
         assert sorted(root.column("r").to_pylist()) == kept
+
+
+def _partner_filter_graph():
+    """P's filter, materialized, into a join anchored on the unfiltered r.
+
+    The pairs come from a HashJoin on the key columns, so an r whose
+    partners the filter removed reaches the join with none.
+    """
+    nodes = [
+        TextScan(node_id="input:r", alias="r", input_id="r"),
+        TextScan(node_id="input:p", alias="p", input_id="p"),
+        AiFilter(
+            node_id="filter:p",
+            inputs=input_ports((PortRef("input:p", "ids:p"),)),
+            alias="p", arena_writes=True,
+            stages=(FilterStage(0, 1, 0, 0.8, 4 * 0.8),),
+            question_token_ids=((QUESTION,),)),
+        HashJoin(
+            node_id="hash_join:r-p",
+            inputs=input_ports((PortRef("input:r", "ids:r"),
+                                PortRef("filter:p", "ids:p"))),
+            left="r", right="p", on=(("key", "key"),), written_pos=0),
+        AiJoin(
+            node_id="group:0", anchor="r", anchor_resident="none",
+            inputs=input_ports((PortRef("input:r", "ids:r"),
+                                PortRef("filter:p", "ids:p"),
+                                PortRef("hash_join:r-p", "pairs:0"))),
+            stages=(JoinStage(
+                written_pos=0, exec_idx=0, anchor="r", partners=("p",),
+                semantics="full", selectivity=0.5, expected_tuples=1,
+                anchor_frame_tokens=1, pair_tail_tokens=0,
+                anchor_resident="none", tuple_tokens=0,
+                pairs_from="hash_join:r-p",
+                frame_token_ids=(FRAME,), label_token_ids=(("p", ()),),
+                tail_token_ids=()),)),
+    ]
+    return PhysicalGraph(tuple(nodes), PortRef("group:0", "ids:r"))
+
+
+def test_anchors_left_without_partners_by_a_partner_filter_settle(monkeypatch):
+    # document d has key d % 4 and pairs with partner d % 4 only; the
+    # filter on p drops some partners, so the documents keyed to them
+    # reach the join with no pair and no KV of their own in the arena
+    columns = _key_columns([d % 4 for d in range(14)], list(range(4)))
+    result, _, filter_truth, join_truth = run_graph_on_arena(
+        monkeypatch, _partner_filter_graph(), columns=columns,
+        fresh_anchors=True, seed=3)
+    surviving_partners = [i for i in range(4) if filter_truth[i][0]]
+    assert 0 < len(surviving_partners) < 4, "the seed must drop a partner"
+    stage = result["joins"][0]
+    assert sorted(stage["anchor_index"]) == list(range(14))
+    for local, document in enumerate(stage["anchor_index"]):
+        mine = [document % 4] if document % 4 in surviving_partners else []
+        # partners are positions in the surviving partner list
+        assert stage["anchor_partners"][local] == [
+            surviving_partners.index(i) for i in mine]
+        assert stage["rows"].get(local, []) == [
+            join_truth[("r", document)][i] for i in mine]
+    table = result["_outputs"][PortRef("group:0", "join_answers:0")]
+    assert sorted(zip(table.column("r").to_pylist(),
+                      table.column("p").to_pylist())) == [
+        (d, d % 4) for d in range(14) if d % 4 in surviving_partners]
+    root = result["_outputs"][PortRef("group:0", "ids:r")]
+    assert sorted(root.column("r").to_pylist()) == [
+        d for d in range(14)
+        if d % 4 in surviving_partners and join_truth[("r", d)][d % 4]]
 
 
 def _foreign_run(monkeypatch, graph, functions):
