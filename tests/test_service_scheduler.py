@@ -74,6 +74,21 @@ def test_in_process_run_saves_plan_progress_and_a_readable_result(
     report = json.loads((directory / "report.json").read_text())
     assert report["backend"] == "quail"
 
+    # the filter chain streams each chunk's finished documents: the row
+    # index, the last stage asked, and whether it passed
+    saved = artifacts.read_answers(directory / artifacts.ANSWERS_FILE)
+    assert [entry["kind"] for entry in saved] == ["filter"]
+    assert saved[0]["alias"] == "r" and saved[0]["stages"] == 2
+    finished = {row: (stage, passed)
+                for row, stage, passed in saved[0]["documents"]}
+    assert {row for row, (_, passed) in finished.items() if passed} == {0, 3}
+    assert finished[0] == finished[3] == (1, True)
+    # the other four each fail exactly one question; which stage depends
+    # on the order the planner chose
+    assert sorted(stage for _, (stage, passed) in finished.items()
+                  if not passed) == [0, 0, 1, 1]
+    assert final.progress["answers_saved"] == 1
+
 
 def test_join_answers_are_saved_per_anchor_while_running(store, tmp_path):
     """Save each finished anchor to answers.jsonl with the record's count.

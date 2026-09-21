@@ -1074,13 +1074,19 @@ class FilterStream:
             consumer never needs a page this chain did not claim.
         attention_mode: Attention path of this chain's chunks; unified
             when omitted. The warm-up runs the merge_quant path too.
+        document_done: Called after each chunk's answers are read with
+            the documents that finished in it, as a list of
+            (position, stage, passed) tuples: the document's position
+            in doc_ids, the last stage it was asked, and whether it
+            passed that stage. Must return quickly.
     """
 
     def __init__(self, torch, arena, pipeline, async_ans, doc_ids,
                  question_ids, budget, timing=None, pinned=True,
                  limit=None, *, arena_writes, arena_keys=None,
                  retain_survivors=(), hold_survivors=False,
-                 hold_extra_tokens=0, attention_mode=None):
+                 hold_extra_tokens=0, attention_mode=None,
+                 document_done=None):
         p = _shared_preamble_tokens(question_ids)
         keys = range(len(doc_ids)) if arena_keys is None else arena_keys
         if len(keys) != len(doc_ids):
@@ -1155,6 +1161,7 @@ class FilterStream:
         self.progress = Progress(
             f"filter ({len(question_ids)} stages)", total=len(doc_ids))
         self._finished = 0
+        self.document_done = document_done
 
     @property
     def answers(self):
@@ -1177,6 +1184,7 @@ class FilterStream:
         bits = self.async_ans.result(handle)
         t = _tick(timing, "report_wait", t)
         last_stage = len(self.tails) - 1
+        finished = []
         for (doc, stage, _fresh), bit in zip(groups, bits):
             passed = bool(bit)
             last = stage == last_stage
@@ -1194,7 +1202,10 @@ class FilterStream:
                 items.append((self.keys[doc], self.doc_ids[doc]))
             if not passed or last:
                 self._finished += 1
+                finished.append((doc, stage, passed))
         self.progress.update(self._finished)
+        if finished and self.document_done is not None:
+            self.document_done(finished)
         _tick(timing, "report_rest", t)
 
     def _finish(self, items):
@@ -1294,7 +1305,8 @@ class FilterStream:
 def run_filter(torch, arena, pipeline, async_ans, doc_ids,
                question_ids, budget, timing=None,
                pinned=True, limit=None, *, arena_writes,
-               arena_keys=None, retain_survivors=(), attention_mode=None):
+               arena_keys=None, retain_survivors=(), attention_mode=None,
+               document_done=None):
     """The filter chain run to the end; see FilterStream for the arguments.
 
     Returns:
@@ -1305,7 +1317,8 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
         torch, arena, pipeline, async_ans, doc_ids, question_ids, budget,
         timing=timing, pinned=pinned, limit=limit,
         arena_writes=arena_writes, arena_keys=arena_keys,
-        retain_survivors=retain_survivors, attention_mode=attention_mode)
+        retain_survivors=retain_survivors, attention_mode=attention_mode,
+        document_done=document_done)
     while not stream.done:
         stream.next()
     return stream.answers, stream.spans, stream.tokens

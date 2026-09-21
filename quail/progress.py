@@ -62,14 +62,15 @@ def set_progress_sink(sink) -> None:
 
 
 def set_answer_sink(sink) -> None:
-    """Receive each join anchor's answers the moment the anchor finishes.
+    """Receive model answers the moment the engine has them.
 
-    The sink is called as ``sink(payload)`` with the dict
-    ``quail.backends.quail.graph`` builds: the node id, the anchor and
-    partner aliases, the anchor's row index, the partner row index
-    tuples that answered true, and how many pairs were asked. Called
-    from the loop's thread; it must return quickly. Pass None to remove
-    it.
+    The sink is called as ``sink(payload)`` with a dict whose ``kind``
+    says what finished: ``"filter"`` for one chunk's finished documents
+    (row index, last stage asked, passed), ``"join"`` for one anchor's
+    matches (its row index, the partner row index tuples that answered
+    true, how many pairs were asked), or ``"score"`` for one batch of
+    reranker scores (row indices and scores). Called from the loop's
+    thread; it must return quickly. Pass None to remove it.
     """
     global _ANSWER_SINK
     _ANSWER_SINK = sink

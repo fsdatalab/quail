@@ -176,22 +176,27 @@ class QueryRun:
                 yield status
 
     def answers(self, after: int = 0, limit: int = 1000) -> dict:
-        """Return the join answers saved so far, from entry ``after`` on.
+        """Return the answers saved so far, from entry ``after`` on.
 
-        Each entry is one finished anchor: ``document`` (its row index in
-        the anchor table), ``matches`` (the partner row index tuples that
-        answered true), and ``asked`` (how many pairs were evaluated; the
-        rest answered false). ``next`` is the entry to ask for next and
-        ``done`` says whether more can still arrive.
+        Each entry's ``kind`` says what finished. A ``"filter"`` entry is
+        one chunk of documents: ``documents`` lists ``[row index, last
+        stage asked, passed]``, and a document passed the filter when it
+        passed its last stage. A ``"join"`` entry is one finished anchor:
+        ``document`` (its row index in the anchor table), ``matches`` (the
+        partner row index tuples that answered true), and ``asked`` (how
+        many pairs were evaluated; the rest answered false). A ``"score"``
+        entry is one batch of reranker scores: ``rows`` and ``scores``
+        line up. ``next`` is the entry to ask for next and ``done`` says
+        whether more can still arrive.
         """
         return self._client.answers(self.id, after=after, limit=limit)
 
     def stream_answers(self, poll_s: float = DEFAULT_POLL_S
                        ) -> Iterator[dict]:
-        """Yield each anchor's answers as the service saves them.
+        """Yield each saved answer entry as the service saves it.
 
         Ends when the query is done and every saved entry was yielded.
-        Filters and scores do not stream; they arrive with the result.
+        See ``answers`` for the entry kinds.
         """
         seen = 0
         for status in self.watch(poll_s):

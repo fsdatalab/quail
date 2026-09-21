@@ -167,6 +167,29 @@ def filter_result(node, answers, tokens, document_ids,
     )
 
 
+def filter_document_sink(node, document_ids):
+    """The chain's document_done callback, or None when nobody listens.
+
+    Reports each chunk's finished documents to the answer sink as
+    ``{"kind": "filter", "node", "alias", "stages", "documents"}`` where
+    ``documents`` lists ``[row index, last stage asked, passed]`` per
+    document. A document that passed its last stage survived the filter;
+    every other listed document failed at the stage given.
+    """
+    sink = answer_sink()
+    if sink is None:
+        return None
+    stages = len(node.question_token_ids)
+
+    def document_done(finished):
+        sink({"kind": "filter", "node": node.node_id, "alias": node.alias,
+              "stages": stages,
+              "documents": [[int(document_ids[position]), stage, passed]
+                            for position, stage, passed in finished]})
+
+    return document_done
+
+
 def filter_inputs(state, node, document_ids) -> dict:
     """Scheduler inputs for one filter chain over the given documents."""
     return {
@@ -176,6 +199,7 @@ def filter_inputs(state, node, document_ids) -> dict:
         "document_ids": document_ids,
         "limit": state["filter_limit"],
         "retain_survivors": node.keep_kv,
+        "document_done": filter_document_sink(node, document_ids),
     }
 
 
@@ -305,7 +329,7 @@ def _model_inputs(node, inputs, context: ExecutionContext) -> dict:
             if answer:
                 member = position if members is None else int(members[position])
                 matches.append(list(last_tuples[member]))
-        return {"node": node.node_id, "anchor": node.anchor,
+        return {"kind": "join", "node": node.node_id, "anchor": node.anchor,
                 "partners": list(last["partners"]),
                 "semantics": last["semantics"], "document": int(document),
                 "asked": len(row), "matches": matches}

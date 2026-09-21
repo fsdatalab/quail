@@ -15,6 +15,7 @@ from quail.execution.runner import (
     NodeResult,
 )
 from quail.physical import AiScore, ScoreFilter, ValueType
+from quail.progress import answer_sink
 
 # one kernel per entry of quail.logical.SCORE_COMPARISONS
 _COMPARE = {
@@ -195,6 +196,22 @@ def _batches_with_positions(rows: ScoreRows):
         start = end
 
 
+def scored_batch(node, rows, table) -> dict:
+    """The answer-sink payload for one scored batch.
+
+    ``rows`` are the batch's row indices into each alias table, one int
+    per row for a single alias and one list per row for a pair;
+    ``scores`` line up with them.
+    """
+    rows = np.asarray(rows)
+    return {"kind": "score", "node": node.node_id, "output": node.spec.name,
+            "aliases": list(node.spec.aliases),
+            "rows": (rows[:, 0].tolist() if rows.shape[1] == 1
+                     else rows.tolist()),
+            "scores": [round(float(value), 4)
+                       for value in table.column(node.spec.name).to_pylist()]}
+
+
 def score_in_batches(node, inputs, score_batches, shards: int = 1) -> NodeResult:
     """Score the node's candidate rows in bounded batches, in input order.
 
@@ -229,10 +246,13 @@ def score_in_batches(node, inputs, score_batches, shards: int = 1) -> NodeResult
             for item in rounds
         ]
         results = score_batches(node, [batch for _, batch in batches])
-        for (where, _), result in zip(batches, results):
+        for (where, batch), result in zip(batches, results):
             tables.append(result.outputs["scores"])
             positions.append(where)
             metrics += result.metrics
+            sink = answer_sink()
+            if sink is not None and len(batch):
+                sink(scored_batch(node, batch, result.outputs["scores"]))
     table = pa.concat_tables(tables)
     order = np.concatenate(positions)
     if len(order) and np.any(np.diff(order) < 0):

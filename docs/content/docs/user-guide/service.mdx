@@ -111,27 +111,36 @@ ends `failed` with error type `TimeoutError`.
 
 ### Answers while the query runs
 
-A join reports each anchor document's answers the moment the engine
-finishes that document. The service saves them as they arrive, so a
-client can show results filling in instead of waiting for the end:
+The engine reports answers as it has them: a filter reports each
+chunk's finished documents, a join reports each anchor document the
+moment it finishes, and `AI.SCORE` reports each scored batch. The
+service saves them as they arrive, so a client can show results
+filling in instead of waiting for the end:
 
 ```python
 for entry in run.stream_answers():
-    # entry["document"] is the anchor's row index in its table;
-    # entry["matches"] lists the partner row indices that answered
-    # true; the other entry["asked"] pairs answered false
-    print(entry["anchor"], entry["document"],
-          len(entry["matches"]), "of", entry["asked"])
+    if entry["kind"] == "filter":
+        # [row index, last stage asked, passed] per document; a document
+        # passed the filter when it passed its last stage
+        survivors = [row for row, stage, passed in entry["documents"]
+                     if passed and stage == entry["stages"] - 1]
+    elif entry["kind"] == "join":
+        # entry["document"] is the anchor's row index in its table;
+        # entry["matches"] lists the partner row indices that answered
+        # true; the other entry["asked"] pairs answered false
+        print(entry["anchor"], entry["document"],
+              len(entry["matches"]), "of", entry["asked"])
+    elif entry["kind"] == "score":
+        # entry["rows"] and entry["scores"] line up
+        ...
 ```
 
-- `stream_answers()` yields one entry per finished anchor and ends
-  when the query is done. Entries carry ids only, no answer lists, and
-  agree with the saved join answer tables.
+- `stream_answers()` yields the saved entries in order and ends when
+  the query is done. Entries carry row indices, not documents, and
+  agree with the saved answer tables.
 - `answers(after=N)` returns the entries saved so far from entry `N`
   on, with `next` and `done`; `status().progress["answers_saved"]`
   is the count the record knows about.
-- Filters and scores do not stream; their answers arrive with the
-  result.
 
 ### What a remote session cannot do
 

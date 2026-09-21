@@ -54,3 +54,41 @@ def test_release_booted_models_clears_state_and_cuda_cache(monkeypatch):
         "cuda_allocated_bytes": 123,
         "cuda_reserved_bytes": 456,
     }
+
+
+def test_booting_a_different_model_releases_the_loaded_one(monkeypatch):
+    """A second model cannot load beside the first one's weights and arena."""
+    calls = []
+    monkeypatch.setattr(
+        worker, "release_booted_models",
+        lambda state: (calls.append(sorted(state)), state.clear()))
+
+    class _FakeLoaded:
+        def __init__(self, backend, context, answer_ids):
+            calls.append(("load", context.model.name))
+
+        def bind_query(self, *args):
+            calls.append("bind")
+
+        def warm(self):
+            return 0.0, None
+
+        load_model_s = arena_s = pipeline_s = 0.0
+
+    monkeypatch.setattr(worker, "LoadedGpu", _FakeLoaded)
+    monkeypatch.setattr(worker, "_boot_record",
+                        lambda gpu, cold, warm_s, tier, t: {
+                            "boot_s": 0.0, "kind": "cold" if cold else "warm"})
+    backend = SimpleNamespace(name="quail")
+    state = {("quail", "qwen3-4b-fp8"): object()}
+    context = SimpleNamespace(model=SimpleNamespace(name="qwen3-reranker"))
+
+    gpu, boot = worker._boot_for_query(state, backend, context, 100, [1], [2])
+
+    assert calls == [[("quail", "qwen3-4b-fp8")], ("load", "qwen3-reranker"),
+                     "bind"]
+    assert list(state) == [("quail", "qwen3-reranker")] and boot["kind"] == "cold"
+
+    # the same model again is reused, nothing released
+    gpu2, boot2 = worker._boot_for_query(state, backend, context, 100, [1], [2])
+    assert gpu2 is gpu and boot2["kind"] == "warm" and calls[-1] == "bind"

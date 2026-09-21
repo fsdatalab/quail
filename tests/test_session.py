@@ -142,6 +142,12 @@ def make_executor(filter_truth, join_truth=None, seen=None):
                         rows[document] = row
                     survivors = [d for d, row in rows.items()
                                  if len(row) == len(node.stages) and all(row)]
+                    # the real loop reports a chunk's finished documents
+                    # by position; the hook streams them
+                    if inputs.get("document_done") is not None:
+                        inputs["document_done"]([
+                            (position, len(row) - 1, bool(row[-1]))
+                            for position, row in enumerate(rows.values())])
                     return NodeResult({
                         f"ids:{node.alias}": survivors,
                         f"filter_answers:{node.alias}": rows,

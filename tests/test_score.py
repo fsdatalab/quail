@@ -261,6 +261,38 @@ def test_score_execution_then_filter_retains_float64_column(catalog):
     session.close()
 
 
+def test_scores_stream_to_the_answer_sink_per_batch(catalog):
+    from quail.progress import set_answer_sink
+
+    session = _session(catalog)
+    query = session.sql(
+        "SELECT d.id, "
+        "AI.SCORE(PROMPT('Requests a refund: {0}', d.body)) AS score "
+        "FROM documents d"
+    )
+    request = query._prepare_physical()
+    graph = compute_subgraph(query.plan().graph)
+    model = RerankerModelExecution.__new__(RerankerModelExecution)
+    model.reranker = _FakeReranker((0.9, 0.1))
+    model.documents = {
+        node.alias: request.inputs[node.input_id].documents
+        for node in query.plan().nodes if node.type_name == "quail.scan"
+    }
+    streamed = []
+    set_answer_sink(streamed.append)
+    try:
+        GenericRunner().run(graph, ExecutionContext(
+            runtimes=session.registry.runtimes, model_execution=model,
+            sources={"d": range(2), **request.relations}))
+    finally:
+        set_answer_sink(None)
+    session.close()
+    score_node = next(node for node in graph.nodes if isinstance(node, AiScore))
+    assert streamed == [{
+        "kind": "score", "node": score_node.node_id, "output": "score",
+        "aliases": ["d"], "rows": [0, 1], "scores": [0.9, 0.1]}]
+
+
 def test_score_query_finishes_with_projected_score(catalog):
     session = _session(catalog)
     query = session.sql(
