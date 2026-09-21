@@ -1,28 +1,27 @@
 ---
 title: Civil Comments
-description: Run a semantic filter and join over public comments.
+description: Classify reader comments from English-language news sites.
 ---
 
-This demo shows how you can run a semantic filter and join over public
-comments.
+This demo shows how you can use an AI filter and join to classify reader
+comments from English-language news sites.
 
-The task is to find comments that are likely to be toxic, then identify which
-of 30 semantic labels apply to each toxic comment.
+It uses 10,000 rows from [Jigsaw Civil Comments][dataset]. Each row contains
+a comment and crowd-sourced scores for toxicity, six toxicity subtypes, and
+24 identity mentions.
 
-The comments come from [Jigsaw Civil Comments][dataset]. Human raters scored
-each comment for toxicity, six toxicity subtypes, and 24 identity mentions.
-Each score records the fraction of raters who selected that label. We treat a
-score of 50% or higher as positive.
+Human raters produced the scores. A score records the fraction of raters who
+selected a label. The demo treats a score of 50% or higher as positive.
 
 The labels are subjective and noisy. You should not expect high agreement
-with every label. The query is still useful for showing how planning and KV
-reuse affect query time and cost.
+with every majority vote. The demo instead shows how planning and KV reuse
+affect query time and cost.
 
 ## Query
 
-The query is: given 10,000 comments and a table of 30 semantic labels, find
-the comments judged toxic, then return every label that applies to each
-result.
+The query is: given a `comments` table and a `fields` table, return each
+`(comment_id, field)` pair where the comment is toxic and the field applies
+to the comment.
 
 The 30 fields comprise:
 
@@ -35,8 +34,8 @@ The 30 fields comprise:
 - Four disability categories.
 
 Each field has a definition, one TRUE example, and one FALSE example.
-Historical `rejected` moderation metadata is excluded; it is not a semantic
-property of the comment text.
+Historical `rejected` moderation metadata is excluded. It is not a semantic
+property of the text.
 
 ```sql
 SELECT
@@ -57,7 +56,7 @@ The query has no selectivity hints.
 ## Execution
 
 Quail pushes the toxicity predicate below the join. Jev batches questions by
-comment; it never sends one request per comment-field pair.
+comment. It never sends one request per comment-field pair.
 
 | Jev strategy | Requests | Questions per request |
 |---|---:|---:|
