@@ -1,0 +1,169 @@
+{
+  "extension_urns": [
+    {
+      "extension_urn_anchor": 1,
+      "urn": "extension:org.fsdatalab.quail_b:functions_ai"
+    }
+  ],
+  "extensions": [
+    {
+      "extension_function": {
+        "extension_urn_reference": 1,
+        "function_anchor": 1,
+        "name": "ai_filter:str_str"
+      }
+    }
+  ],
+  "relations": [
+    {
+      "root": {
+        "input": {
+          "project": {
+            "common": {
+              "emit": {
+                "output_mapping": [
+                  2
+                ]
+              }
+            },
+            "expressions": [
+              {
+                "selection": {
+                  "direct_reference": {
+                    "struct_field": {}
+                  },
+                  "root_reference": {}
+                }
+              }
+            ],
+            "input": {
+              "filter": {
+                "common": {
+                  "direct": {},
+                  "hint": {
+                    "alias": "filter-2"
+                  }
+                },
+                "condition": {
+                  "scalar_function": {
+                    "arguments": [
+                      {
+                        "value": {
+                          "literal": {
+                            "string": "Judge strictly from the contract page above whether it leaves a party's liability uncapped for some breach, including a carve-out that exempts a kind of breach such as IP infringement or a confidentiality breach from a cap.\n\n{0}\n\nInstruction: answer TRUE if the page leaves a party's liability uncapped for some breach, FALSE otherwise."
+                          }
+                        }
+                      },
+                      {
+                        "value": {
+                          "selection": {
+                            "direct_reference": {
+                              "struct_field": {
+                                "field": 1
+                              }
+                            },
+                            "root_reference": {}
+                          }
+                        }
+                      }
+                    ],
+                    "function_reference": 1,
+                    "output_type": {
+                      "bool": {
+                        "nullability": "NULLABILITY_REQUIRED"
+                      }
+                    }
+                  }
+                },
+                "input": {
+                  "filter": {
+                    "common": {
+                      "direct": {},
+                      "hint": {
+                        "alias": "filter-1"
+                      }
+                    },
+                    "condition": {
+                      "scalar_function": {
+                        "arguments": [
+                          {
+                            "value": {
+                              "literal": {
+                                "string": "Judge strictly from the contract page above whether it caps a party's liability for breaching its obligations, as a maximum recoverable amount or a time limit for bringing claims.\n\n{0}\n\nInstruction: answer TRUE if the page caps a party's liability, FALSE otherwise."
+                              }
+                            }
+                          },
+                          {
+                            "value": {
+                              "selection": {
+                                "direct_reference": {
+                                  "struct_field": {
+                                    "field": 1
+                                  }
+                                },
+                                "root_reference": {}
+                              }
+                            }
+                          }
+                        ],
+                        "function_reference": 1,
+                        "output_type": {
+                          "bool": {
+                            "nullability": "NULLABILITY_REQUIRED"
+                          }
+                        }
+                      }
+                    },
+                    "input": {
+                      "read": {
+                        "base_schema": {
+                          "names": [
+                            "id",
+                            "document"
+                          ],
+                          "struct": {
+                            "nullability": "NULLABILITY_REQUIRED",
+                            "types": [
+                              {
+                                "string": {
+                                  "nullability": "NULLABILITY_REQUIRED"
+                                }
+                              },
+                              {
+                                "string": {
+                                  "nullability": "NULLABILITY_REQUIRED"
+                                }
+                              }
+                            ]
+                          }
+                        },
+                        "common": {
+                          "direct": {},
+                          "hint": {
+                            "alias": "p"
+                          }
+                        },
+                        "named_table": {
+                          "names": [
+                            "contract_pages"
+                          ]
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "names": [
+          "p"
+        ]
+      }
+    }
+  ],
+  "version": {
+    "minor_number": 103,
+    "producer": "quail-b"
+  }
+}

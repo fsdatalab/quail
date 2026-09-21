@@ -134,7 +134,7 @@ reviews = quail_b.load_table("reviews", scale_factor=0.1)
 
 ## Queries
 
-The benchmark defines 31 queries across 5 datasets:
+The benchmark defines 36 queries across 6 datasets:
 
 | Dataset | Queries | Relations | Description |
 | --- | ---: | --- | --- |
@@ -143,6 +143,7 @@ The benchmark defines 31 queries across 5 datasets:
 | FEVER | 10 | `claims`, `evidence` | Fact verification with two-sided selections and join chains |
 | LePaRD | 5 | `citation_contexts`, `citation_passages` | Legal precedent retrieval and citation matching |
 | SWE-Next | 2 | `agent_traces` | Software engineering agent trajectory evaluation |
+| CUAD | 5 | `contracts`, `contract_pages` | Contract clause review over PDF pages rendered as images |
 
 The original LEP-5, LEP-6, and LEP-8 have empty reference outputs at sf=0.1
 with raw prompts as well as chat prompts. They are excluded. The original LEP-7
@@ -172,12 +173,30 @@ collection automatically when accuracy scoring is enabled.
 | 0.5 | `gt_68f9ce9439bd7615de92b33d576dff9e` |
 | 1.0 | `gt_e87691add604b02c4e43f0ff5bf0cc4f` |
 
+CUAD-1 to CUAD-5 read contract PDFs. The `document` column of both
+relations is a file reference: `files/<id>.pdf` for a whole contract and
+`files/<id>.pdf#page=<n>` for one page. The engine renders the referenced
+pages and hands them to a model that takes images; there is no text
+column to read. `load_benchmark` downloads the PDF files beside the
+tables, checks each against the `pdf_sha256` column, and rewrites the
+references to absolute paths. The reference labels are the CUAD lawyer
+annotations, not a model's answers: a contract row is TRUE for a clause
+category when the contract has an annotated span of that category, and a
+page row when an annotated span touches the page. The predicates ask
+about the harder categories (limitation of liability and its carve-outs,
+change of control, exclusivity, non-compete, and license terms), not
+about names or dates. CUAD-1 and CUAD-2 read the 9,348 pages one page per
+row. CUAD-3 to CUAD-5 read whole contracts, restricted by an ordinary
+`page_count <= 32` filter in the plan before the AI filters (430 of the
+510 contracts; 32 pages is the most one DiffusionGemma prompt holds).
+Scoring counts only the rows inside that bound as the query's input.
+
 Queries use two LLM-powered relational operators:
 
 - `ai_filter(prompt, document) -> boolean` (selection)
 - `ai_join(prompt, left, right) -> boolean` (join)
 
-All 31 queries are stored as standard Substrait 0.103 ProtoJSON plans in [`quail_b/plans/`](quail_b/plans/). Custom AI functions are declared in [`quail_b/substrait_extensions.yaml`](quail_b/substrait_extensions.yaml). [All 31 plans](figures/quailb_anatomy.pdf) are diagrammed in one figure.
+All 36 queries are stored as standard Substrait 0.103 ProtoJSON plans in [`quail_b/plans/`](quail_b/plans/). Custom AI functions are declared in [`quail_b/substrait_extensions.yaml`](quail_b/substrait_extensions.yaml). [All 36 plans](figures/quailb_anatomy.pdf) are diagrammed in one figure.
 
 ### Example Query: IMDB-4
 
@@ -212,7 +231,7 @@ across questions.
 
 QUAIL-B defines three scale factors: `0.1`, `0.5`, and `1.0`. They correspond to 10%, 50%, and 100% of each dataset's sampling target.
 
-A scale factor changes the input table cardinalities and reference labels. It does not change the 31 query definitions.
+A scale factor changes the input table cardinalities and reference labels. It does not change the 36 query definitions.
 
 | Dataset | Relation | 0.1 | 0.5 | 1.0 |
 | --- | --- | ---: | ---: | ---: |
@@ -225,6 +244,12 @@ A scale factor changes the input table cardinalities and reference labels. It do
 | LePaRD | `citation_contexts` | 500 | 2,496 | 4,972 |
 | LePaRD | `citation_passages` | 433 | 1,756 | 2,991 |
 | SWE-Next | `agent_traces` | 1,772 | 8,859 | 17,711 |
+| CUAD | `contracts` | 51 | 255 | 510 |
+| CUAD | `contract_pages` | 1,131 | 4,522 | 9,348 |
+
+CUAD samples contracts, so the page count at a scale factor follows from
+the sampled contracts. The contract queries read the contracts of at most
+32 pages: 40, 215, and 430 at the three scale factors.
 
 Each scale factor deterministically samples upstream snapshots defined in [`quail_b/data.py`](quail_b/data.py).
 
@@ -300,6 +325,7 @@ quail-b report results/my-run
 | [`quail_b/prompts.py`](quail_b/prompts.py) | Prompt templates and prompt identifiers |
 | [`quail_b/rendering.py`](quail_b/rendering.py) | Exact prompt text rendering logic |
 | [`quail_b/data.py`](quail_b/data.py) | Dataset tables, sampling logic, and scale factors |
+| [`quail_b/cuad.py`](quail_b/cuad.py) | CUAD contract PDFs as file-backed relations and their page annotations |
 | [`quail_b/labels.py`](quail_b/labels.py) | Reference labels and ground truth loading |
 | [`quail_b/run.py`](quail_b/run.py) | Benchmark runner and answer validator |
 | [`quail_b/scoring.py`](quail_b/scoring.py) | Accuracy, precision, recall, and cost scoring |

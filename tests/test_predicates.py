@@ -2,6 +2,8 @@
 
 from dataclasses import replace
 
+import pytest
+
 from quail_b.predicates import (
     PREDICATES,
     example_identity,
@@ -19,7 +21,7 @@ def _spec(key):
 
 
 def test_stable_ids_cover_predicate_semantics_and_inputs():
-    assert len(PREDICATES) == 23
+    assert len(PREDICATES) == 31
     assert len({spec.key for spec in PREDICATES}) == len(PREDICATES)
     original = PREDICATES[0]
 
@@ -90,6 +92,27 @@ def test_answer_cue_changes_label_identity(monkeypatch):
     monkeypatch.setattr(rendering, "ANSWER_CUE", "\nANSWER: modified")
     previous = label_set_identity(spec, "c_one", "1" * 64)
     assert current["label_set_id"] != previous["label_set_id"]
+
+
+def test_cuad_predicates_are_labeled_by_the_annotation():
+    from quail_b.predicates import annotation_answer, label_sources
+
+    spec = _spec("quailb.cuad.contract.non_compete")
+    (source,) = label_sources(spec)
+    assert source["id"].startswith("s_")
+    assert source["spec"]["dataset"] == "zenodo/CUAD_v1"
+    assert annotation_answer(spec, {"clauses": ["Exclusivity", "Non-Compete"]})
+    assert not annotation_answer(spec, {"clauses": ["Exclusivity"]})
+    with pytest.raises(ValueError, match="no annotation category"):
+        annotation_answer(PREDICATES[0], {"clauses": []})
+    # the category names the label, not the prompt: the version hash
+    # depends on the words the model reads and nothing else
+    renamed = replace(spec, source_category="Other")
+    assert predicate_version(renamed) == predicate_version(spec)
+    prompt = render_filter_prompt(spec, "<pages>")
+    assert prompt.startswith("DOCUMENT:\n<pages>\n\nEvaluate TRUE or FALSE for "
+                             "the following question: Judge strictly from "
+                             "the contract above")
 
 
 def test_raw_join_restores_the_published_predicate_hash():

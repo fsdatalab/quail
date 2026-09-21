@@ -37,6 +37,9 @@ class PredicateSpec:
     right_table: str | None = None
     right_column: str | None = None
     source_policy: str = "qwen3_32b"
+    # for a filter labeled from the CUAD annotation: the clause category
+    # whose presence in the row's `clauses` list answers TRUE
+    source_category: str | None = None
 
 
 PREDICATES = (
@@ -140,6 +143,50 @@ PREDICATES = (
         "agent", "implemented_plausible_fix",
         "filter", prompts.AGENT_IMPLEMENTED_FIX,
         "agent_trace", "agent_traces", "trace"),
+    PredicateSpec(
+        "quailb.cuad.page.caps_liability", "cuad",
+        "page_caps_liability", "filter", prompts.CUAD_PAGE_CAPS_LIABILITY,
+        "contract_page", "contract_pages", "document",
+        source_policy="cuad_annotation", source_category="Cap On Liability"),
+    PredicateSpec(
+        "quailb.cuad.page.uncapped_liability", "cuad",
+        "page_uncapped_liability", "filter",
+        prompts.CUAD_PAGE_UNCAPPED_LIABILITY,
+        "contract_page", "contract_pages", "document",
+        source_policy="cuad_annotation", source_category="Uncapped Liability"),
+    PredicateSpec(
+        "quailb.cuad.contract.change_of_control", "cuad",
+        "contract_change_of_control", "filter", prompts.CUAD_CHANGE_OF_CONTROL,
+        "contract", "contracts", "document",
+        source_policy="cuad_annotation", source_category="Change Of Control"),
+    PredicateSpec(
+        "quailb.cuad.contract.exclusivity", "cuad",
+        "contract_exclusivity", "filter", prompts.CUAD_EXCLUSIVITY,
+        "contract", "contracts", "document",
+        source_policy="cuad_annotation", source_category="Exclusivity"),
+    PredicateSpec(
+        "quailb.cuad.contract.non_compete", "cuad",
+        "contract_non_compete", "filter", prompts.CUAD_NON_COMPETE,
+        "contract", "contracts", "document",
+        source_policy="cuad_annotation", source_category="Non-Compete"),
+    PredicateSpec(
+        "quailb.cuad.contract.license_grant", "cuad",
+        "contract_license_grant", "filter", prompts.CUAD_LICENSE_GRANT,
+        "contract", "contracts", "document",
+        source_policy="cuad_annotation", source_category="License Grant"),
+    PredicateSpec(
+        "quailb.cuad.contract.non_transferable_license", "cuad",
+        "contract_non_transferable_license", "filter",
+        prompts.CUAD_NON_TRANSFERABLE_LICENSE,
+        "contract", "contracts", "document",
+        source_policy="cuad_annotation",
+        source_category="Non-Transferable License"),
+    PredicateSpec(
+        "quailb.cuad.contract.perpetual_license", "cuad",
+        "contract_perpetual_license", "filter", prompts.CUAD_PERPETUAL_LICENSE,
+        "contract", "contracts", "document",
+        source_policy="cuad_annotation",
+        source_category="Irrevocable Or Perpetual License"),
 )
 
 PREDICATE_BY_KEY = {p.key: p for p in PREDICATES}
@@ -248,7 +295,20 @@ SOURCE_SPECS = {
         "rule": ("anchor cited_passage_ids intersects candidate "
                  "passage_ids"),
     },
+    "cuad_annotation": {
+        "dataset": "zenodo/CUAD_v1",
+        "revision": data.SOURCE_REVISIONS["zenodo/CUAD_v1"],
+        "rule": ("the predicate's clause category is in the row's clauses: "
+                 "annotated in the contract, or with a span on the page"),
+    },
 }
+
+
+def annotation_answer(spec: PredicateSpec, row: dict) -> bool:
+    """The CUAD annotation's answer for one contract or page row."""
+    if spec.source_category is None:
+        raise ValueError(f"{spec.key} has no annotation category")
+    return spec.source_category in row["clauses"]
 
 
 def label_sources(spec: PredicateSpec, judge: dict = JUDGE_SPEC) -> list[dict]:
@@ -258,16 +318,11 @@ def label_sources(spec: PredicateSpec, judge: dict = JUDGE_SPEC) -> list[dict]:
         full = _full_hash(judge)
         sources.append({"id": _named_id("j", full), "full_hash": full,
                         "spec": judge})
-    if spec.source_policy.startswith("fever_annotation"):
-        payload = SOURCE_SPECS["fever_annotation"]
-        full = _full_hash(payload)
-        sources.append({"id": _named_id("s", full), "full_hash": full,
-                        "spec": payload})
-    if spec.source_policy == "lepard_citation_edge":
-        payload = SOURCE_SPECS["lepard_citation_edge"]
-        full = _full_hash(payload)
-        sources.append({"id": _named_id("s", full), "full_hash": full,
-                        "spec": payload})
+    for name, payload in SOURCE_SPECS.items():
+        if spec.source_policy.startswith(name):
+            full = _full_hash(payload)
+            sources.append({"id": _named_id("s", full), "full_hash": full,
+                            "spec": payload})
     return sources
 
 

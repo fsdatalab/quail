@@ -155,6 +155,31 @@
     "privacy": false
   },
   {
+    "id": "CUAD-1",
+    "description": "filter over pages: caps liability",
+    "privacy": false
+  },
+  {
+    "id": "CUAD-2",
+    "description": "2 filters over pages: caps liability -> leaves some liability uncapped (a carve-out on the same page)",
+    "privacy": false
+  },
+  {
+    "id": "CUAD-3",
+    "description": "filter over contracts of at most 32 pages: rights upon a change of control",
+    "privacy": false
+  },
+  {
+    "id": "CUAD-4",
+    "description": "2 filters over contracts of at most 32 pages: exclusivity -> non-compete",
+    "privacy": false
+  },
+  {
+    "id": "CUAD-5",
+    "description": "3 filters over contracts of at most 32 pages: license grant -> non-transferable -> irrevocable or perpetual",
+    "privacy": false
+  },
+  {
     "id": "PRIV-1",
     "description": "2 filters: P_MSG + P_LOC",
     "privacy": true

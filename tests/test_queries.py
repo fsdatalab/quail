@@ -36,14 +36,15 @@ from quail_b.substrait import (
 from tools.make_substrait_plans import write_plans
 
 
-def test_catalog_has_the_31_default_queries_and_two_privacy_queries():
-    assert len(QUERIES) == 31
+def test_catalog_has_the_36_default_queries_and_two_privacy_queries():
+    assert len(QUERIES) == 36
     assert QUERY_ORDER == (
         *(f"IMDB-{i}" for i in range(1, 11)),
         *(f"BIO-{i}" for i in range(1, 5)),
         *(f"FEV-{i}" for i in range(1, 11)),
         *(f"LEP-{i}" for i in range(1, 6)),
         "AGENT-1", "AGENT-2",
+        *(f"CUAD-{i}" for i in range(1, 6)),
     )
     assert [spec.id for spec in PRIVACY_QUERIES] == ["PRIV-1", "PRIV-2"]
     assert list(queries(include_privacy=True)) == [*QUERY_ORDER, "PRIV-1", "PRIV-2"]
@@ -232,7 +233,7 @@ def test_substrait_plans_are_packaged():
     catalog = package.joinpath("plans", "catalog.json")
     entries = json.loads(catalog.read_text())
 
-    assert len(entries) == 33
+    assert len(entries) == 38
     assert all(
         package.joinpath("plans", f"{entry['id']}.json").is_file()
         for entry in entries
@@ -253,10 +254,10 @@ def test_checked_in_plans_equal_the_generator_output(tmp_path):
 
 def test_parallel_query_split_matches_stock_vllm():
     assert split_query_ids(QUERY_ORDER, 4) == (
-        QUERY_ORDER[0:8],
-        QUERY_ORDER[8:16],
-        QUERY_ORDER[16:24],
-        QUERY_ORDER[24:31],
+        QUERY_ORDER[0:9],
+        QUERY_ORDER[9:18],
+        QUERY_ORDER[18:27],
+        QUERY_ORDER[27:36],
     )
 
 
@@ -267,6 +268,7 @@ def test_query_family_split_matches_benchmark_catalog():
         "FEV": "fever",
         "LEP": "lepard",
         "AGENT": "agent",
+        "CUAD": "cuad",
     }
     assert split_query_families(QUERY_ORDER) == (
         QUERY_ORDER[0:10],
@@ -274,8 +276,38 @@ def test_query_family_split_matches_benchmark_catalog():
         QUERY_ORDER[14:24],
         QUERY_ORDER[24:29],
         QUERY_ORDER[29:31],
+        QUERY_ORDER[31:36],
     )
     assert query_family_name(QUERY_ORDER[0:10]) == "imdb"
+
+
+def test_cuad_queries_read_pages_or_bounded_contracts_as_documents():
+    from quail_b.predicates import PREDICATE_BY_KEY, PREDICATES
+
+    page_specs = [spec for spec in PREDICATES
+                  if spec.left_table == "contract_pages"]
+    contract_specs = [spec for spec in PREDICATES
+                      if spec.left_table == "contracts"]
+    assert len(page_specs) == 2 and len(contract_specs) == 6
+    assert all(spec.source_policy == "cuad_annotation"
+               and spec.source_category and spec.left_column == "document"
+               for spec in page_specs + contract_specs)
+    templates = {spec.template: spec.key for spec in PREDICATES}
+
+    for query_id in ("CUAD-1", "CUAD-2"):
+        info = _inspect_plan(get_query(query_id).plan)
+        (relation,) = info.relations
+        assert (relation.table, relation.text_column, relation.bounds) == (
+            "contract_pages", "document", ())
+    for query_id, filters in (("CUAD-3", 1), ("CUAD-4", 2), ("CUAD-5", 3)):
+        info = _inspect_plan(get_query(query_id).plan)
+        (relation,) = info.relations
+        assert (relation.table, relation.text_column) == ("contracts", "document")
+        assert [(bound.column, bound.value) for bound in relation.bounds] == [
+            ("page_count", 32)]
+        assert len(info.filters) == filters
+        assert all(templates[f.prompt] in PREDICATE_BY_KEY for f in info.filters)
+    assert _inspect_plan(get_query("CUAD-5").plan).filters[0].id == "filter-1"
 
 
 def test_query_family_rejects_mixed_or_unknown_queries():

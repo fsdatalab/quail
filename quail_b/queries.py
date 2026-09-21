@@ -16,6 +16,14 @@ from quail_b.prompts import (
     AGENT_RECOVERED,
     ASPECT_SENTIMENT,
     CARDIOVASCULAR_REACTION,
+    CUAD_CHANGE_OF_CONTROL,
+    CUAD_EXCLUSIVITY,
+    CUAD_LICENSE_GRANT,
+    CUAD_NON_COMPETE,
+    CUAD_NON_TRANSFERABLE_LICENSE,
+    CUAD_PAGE_CAPS_LIABILITY,
+    CUAD_PAGE_UNCAPPED_LIABILITY,
+    CUAD_PERPETUAL_LICENSE,
     DISCUSS_ASPECT,
     F1,
     F4,
@@ -63,6 +71,17 @@ FILTER_SELECTIVITY_ESTIMATES = {
     LEP4: 31 / 500,
     LEP5: 14 / 500,
     LEPS1: 351 / 433,
+    # CUAD labels come from the annotation, so these are the sf=0.1
+    # rates in the data itself: 1,131 pages, and the 40 contracts of
+    # at most 32 pages that the contract queries read.
+    CUAD_PAGE_CAPS_LIABILITY: 41 / 1131,
+    CUAD_PAGE_UNCAPPED_LIABILITY: 9 / 1131,
+    CUAD_CHANGE_OF_CONTROL: 11 / 40,
+    CUAD_EXCLUSIVITY: 13 / 40,
+    CUAD_NON_COMPETE: 4 / 40,
+    CUAD_LICENSE_GRANT: 19 / 40,
+    CUAD_NON_TRANSFERABLE_LICENSE: 9 / 40,
+    CUAD_PERPETUAL_LICENSE: 2 / 40,
 }
 JOIN_SELECTIVITY_ESTIMATES = {
     DISCUSS_ASPECT: 17683 / 60000,
@@ -162,6 +181,7 @@ QUERY_FAMILY_WORKLOADS = {
     "FEV": "fever",
     "LEP": "lepard",
     "AGENT": "agent",
+    "CUAD": "cuad",
 }
 
 

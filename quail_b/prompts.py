@@ -153,3 +153,72 @@ P_LOC = ("Judge strictly from the policy above whether this service "
 SCENARIO_MATCH = ("Based on the privacy policy in DOCUMENT {0}, could "
                   "the situation described in DOCUMENT {1} happen to a "
                   "user of this service?")
+
+
+# CUAD predicates: the document is a rendered contract page, or every
+# page of one contract, so the question names what the reader sees.
+# Each question follows the definition of one CUAD clause category,
+# whose lawyer annotation is the reference label.
+CUAD_PAGE_CAPS_LIABILITY = (
+    "Judge strictly from the contract page above whether it caps a "
+    "party's liability for breaching its obligations, as a maximum "
+    "recoverable amount or a time limit for bringing claims.\n\n{0}\n\n"
+    "Instruction: answer TRUE if the page caps a party's liability, "
+    "FALSE otherwise."
+)
+
+CUAD_PAGE_UNCAPPED_LIABILITY = (
+    "Judge strictly from the contract page above whether it leaves a "
+    "party's liability uncapped for some breach, including a carve-out "
+    "that exempts a kind of breach such as IP infringement or a "
+    "confidentiality breach from a cap.\n\n{0}\n\nInstruction: answer "
+    "TRUE if the page leaves a party's liability uncapped for some "
+    "breach, FALSE otherwise."
+)
+
+CUAD_CHANGE_OF_CONTROL = (
+    "Judge strictly from the contract above whether a party may "
+    "terminate, or must be notified or give consent, if the other party "
+    "undergoes a change of control, such as a merger, a stock sale, or "
+    "a sale of all or substantially all of its assets or business.\n\n"
+    "{0}\n\nInstruction: answer TRUE if the contract gives a party "
+    "rights upon the other party's change of control, FALSE otherwise."
+)
+
+CUAD_EXCLUSIVITY = (
+    "Judge strictly from the contract above whether it contains an "
+    "exclusive dealing commitment, such as buying all requirements from "
+    "one party, or a prohibition on selling, licensing, or working with "
+    "third parties, during or after the term.\n\n{0}\n\nInstruction: "
+    "answer TRUE if the contract contains an exclusive dealing "
+    "commitment, FALSE otherwise."
+)
+
+CUAD_NON_COMPETE = (
+    "Judge strictly from the contract above whether it restricts a "
+    "party's ability to compete with the other party, or to operate in "
+    "a certain geography, business, or technology sector.\n\n{0}\n\n"
+    "Instruction: answer TRUE if the contract restricts a party from "
+    "competing, FALSE otherwise."
+)
+
+CUAD_LICENSE_GRANT = (
+    "Judge strictly from the contract above whether one party grants "
+    "the other a license, such as to intellectual property, software, "
+    "or a trademark.\n\n{0}\n\nInstruction: answer TRUE if the contract "
+    "grants a license, FALSE otherwise."
+)
+
+CUAD_NON_TRANSFERABLE_LICENSE = (
+    "Judge strictly from the contract above whether it limits the "
+    "licensee's ability to transfer or sublicense the license granted to "
+    "a third party.\n\n{0}\n\nInstruction: answer TRUE if the license "
+    "granted is non-transferable, FALSE otherwise."
+)
+
+CUAD_PERPETUAL_LICENSE = (
+    "Judge strictly from the contract above whether it grants a license "
+    "that is irrevocable or perpetual.\n\n{0}\n\nInstruction: answer TRUE "
+    "if the contract grants an irrevocable or perpetual license, FALSE "
+    "otherwise."
+)

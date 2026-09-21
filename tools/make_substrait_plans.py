@@ -25,6 +25,14 @@ from quail_b.prompts import (
     AGENT_RECOVERED,
     ASPECT_SENTIMENT,
     CARDIOVASCULAR_REACTION,
+    CUAD_CHANGE_OF_CONTROL,
+    CUAD_EXCLUSIVITY,
+    CUAD_LICENSE_GRANT,
+    CUAD_NON_COMPETE,
+    CUAD_NON_TRANSFERABLE_LICENSE,
+    CUAD_PAGE_CAPS_LIABILITY,
+    CUAD_PAGE_UNCAPPED_LIABILITY,
+    CUAD_PERPETUAL_LICENSE,
     DISCUSS_ASPECT,
     F1,
     F4,
@@ -412,6 +420,21 @@ def _policies():
     return Scan("policies", "p", "policy_text")
 
 
+def _pages():
+    return Scan("contract_pages", "p", "document")
+
+
+# One prompt carries every page of a contract; the probe of
+# DiffusionGemma found 32 pages the most one prompt holds. 430 of
+# the 510 contracts have at most 32 pages.
+CONTRACT_PAGES_MAX = 32
+
+
+def _contracts():
+    return Bound(Scan("contracts", "c", "document", int_columns=("page_count",)),
+                 "page_count", CONTRACT_PAGES_MAX)
+
+
 def _imdb_chain(first):
     """Chain r1-a1-r2-a2: both reviews discuss a1, and r2 is positive about a2."""
     return Join(
@@ -530,6 +553,25 @@ QUERIES = (
           _filters(_traces(), AGENT_RECOVERED)),
     Query("AGENT-2", "filter: implemented a plausible fix",
           _filters(_traces(), AGENT_IMPLEMENTED_FIX)),
+
+    # CUAD: contract PDFs as images. A page row is one page; a
+    # contract row is every page of a contract with at most 32 pages.
+    Query("CUAD-1", "filter over pages: caps liability",
+          _filters(_pages(), CUAD_PAGE_CAPS_LIABILITY)),
+    Query("CUAD-2", "2 filters over pages: caps liability -> leaves some "
+          "liability uncapped (a carve-out on the same page)",
+          _filters(_pages(), CUAD_PAGE_CAPS_LIABILITY,
+                   CUAD_PAGE_UNCAPPED_LIABILITY)),
+    Query("CUAD-3", "filter over contracts of at most 32 pages: rights upon "
+          "a change of control",
+          _filters(_contracts(), CUAD_CHANGE_OF_CONTROL)),
+    Query("CUAD-4", "2 filters over contracts of at most 32 pages: "
+          "exclusivity -> non-compete",
+          _filters(_contracts(), CUAD_EXCLUSIVITY, CUAD_NON_COMPETE)),
+    Query("CUAD-5", "3 filters over contracts of at most 32 pages: license "
+          "grant -> non-transferable -> irrevocable or perpetual",
+          _filters(_contracts(), CUAD_LICENSE_GRANT,
+                   CUAD_NON_TRANSFERABLE_LICENSE, CUAD_PERPETUAL_LICENSE)),
 
     # PrivacyPolicies: only when that corpus is available.
     Query("PRIV-1", "2 filters: P_MSG + P_LOC",
