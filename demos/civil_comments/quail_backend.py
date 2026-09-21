@@ -1,27 +1,25 @@
-"""Run the Civil Comments comparison query with Quail.
+"""Run the Civil Comments query with Quail.
 
 The query joins comments to 30 semantic fields and filters for toxicity.
 The package initializer shares the sample, prompts, and scoring code with
 the Jev backend.
 
-Run one or two H100s from the repository root:
+Run on a local H100 from the repository root:
 
-    uv run modal run --detach demos/civil_comments/quail_backend.py \
+    uv run python demos/civil_comments/quail_backend.py \
       --limit 10000 --gpus 1 \
+      --output results/civil-comments/quail/local \
       2>&1 | tee /tmp/civil-comments-quail.log
-
-Results are saved under ``/demos/civil-comments/quail/<run-id>`` on the
-``quail-results`` Modal volume. ``--limit 0`` uses all comments.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import uuid
 from collections import Counter
 from pathlib import Path
 
-import modal
 import numpy as np
 import pyarrow.parquet as pq
 
@@ -35,23 +33,10 @@ from demos.civil_comments import (
     load_comments,
     requested_input_tokens,
 )
-from quail.bench.images import gpu_image
 
 MODEL = "diffusion-gemma-26b-a4b-fp8"
 DEVICE = "h100-sxm"
-RESULTS_MOUNT = Path("/results")
-RESULTS_VOLUME_DIR = Path("demos/civil-comments/quail")
-
-app = modal.App("quail-milestone1")
-results_volume = modal.Volume.from_name("quail-results", create_if_missing=True)
-hf_cache = modal.Volume.from_name("quail-hf-cache", create_if_missing=True)
-kernel_cache = modal.Volume.from_name("quail-kernel-cache", create_if_missing=True)
-image = gpu_image(("demos", "/root/demos")).add_local_python_source("demos")
-
-
-def result_volume_path(directory: Path) -> str:
-    """Return a path relative to the Modal volume root."""
-    return f"/{directory.relative_to(RESULTS_MOUNT)}"
+LOCAL_RESULTS_DIR = Path("results/civil-comments/quail")
 
 
 def build_sql() -> str:
@@ -172,7 +157,6 @@ def evaluate(directory: Path, limit: int | None, gpus: int) -> dict:
         ),
         "accuracy": accuracy,
         "field_counts": dict(Counter(field for _, field in pairs_found)),
-        "result_volume_path": result_volume_path(directory),
     }
     summary = json_ready(summary)
     (directory / "summary.json").write_text(json.dumps(summary, indent=2))
@@ -187,7 +171,6 @@ def evaluate(directory: Path, limit: int | None, gpus: int) -> dict:
                 "gpu_cost_usd": summary["gpu_cost_usd"],
                 "filter": accuracy["filter"],
                 "join": accuracy["join"],
-                "result_volume_path": result_volume_path(directory),
             },
             indent=2,
         ),
@@ -196,37 +179,27 @@ def evaluate(directory: Path, limit: int | None, gpus: int) -> dict:
     return summary
 
 
-@app.function(
-    image=image,
-    gpu="H100!",
-    timeout=86_400,
-    memory=98_304,
-    volumes={
-        str(RESULTS_MOUNT): results_volume,
-        "/root/.cache/huggingface": hf_cache,
-        "/root/.cache/kernels": kernel_cache,
-    },
-)
-def run(limit: int, gpus: int) -> dict:
-    """Run Quail on Modal."""
-    results_volume.reload()
-    hf_cache.reload()
-    directory = (
-        RESULTS_MOUNT / RESULTS_VOLUME_DIR / uuid.uuid4().hex
+def main():
+    """Run Quail on a local GPU."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--limit", type=int, default=10_000)
+    parser.add_argument("--gpus", type=int, choices=(1, 2, 4, 8), default=1)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=LOCAL_RESULTS_DIR / uuid.uuid4().hex,
     )
-    directory.mkdir(parents=True)
-    summary = evaluate(directory, None if limit == 0 else limit, gpus)
-    results_volume.commit()
-    hf_cache.commit()
-    return summary
+    args = parser.parse_args()
+    if args.limit < 0:
+        parser.error("limit must be >= 0")
+    args.output.mkdir(parents=True, exist_ok=False)
+    evaluate(
+        args.output,
+        None if args.limit == 0 else args.limit,
+        args.gpus,
+    )
+    print(f"results: {args.output}", flush=True)
 
 
-@app.local_entrypoint()
-def main(limit: int = 10_000, gpus: int = 1):
-    """Run the Quail configuration. ``--limit 0`` uses every comment."""
-    if limit < 0 or gpus not in (1, 2, 4, 8):
-        raise ValueError("limit must be >= 0; gpus must be 1, 2, 4, or 8")
-    gpu = "H100!" if gpus == 1 else f"H100!:{gpus}"
-    call = run.with_options(gpu=gpu).spawn(limit, gpus)
-    print(f"function call id: {call.object_id}", flush=True)
-    call.get()
+if __name__ == "__main__":
+    main()
