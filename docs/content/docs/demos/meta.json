@@ -2,6 +2,10 @@
   "title": "Demos",
   "pages": [
     "index",
-    "civil-comments"
+    "imdb-filter",
+    "civil-comments-join",
+    "civil-comments",
+    "editing-plans",
+    "agent-trace-compaction"
   ]
 }
