@@ -54,6 +54,8 @@ from quail_b.prompts import (
     SCENARIO_MATCH,
     SERIOUS_ADVERSE_EVENT,
     SUPPORT,
+    TREAS_COMBINES_FIGURES,
+    TREAS_PAGE_EVIDENCE,
 )
 from quail_b.substrait import (
     AI_EXTENSION_URN,
@@ -451,6 +453,20 @@ def _evidence_join(questions):
                 on=(("filing", "filing"),))
 
 
+def _treasury_questions():
+    return Scan("treasury_questions", "q", "question", ("statement",))
+
+
+def _treasury_pages():
+    return Scan("treasury_pages", "p", "document", ("statement",))
+
+
+def _provenance_join(questions):
+    """Each question row against the pages of the statement it reads."""
+    return Join(questions, _treasury_pages(), ("q", "p"), TREAS_PAGE_EVIDENCE,
+                on=(("statement", "statement"),))
+
+
 def _imdb_chain(first):
     """Chain r1-a1-r2-a2: both reviews discuss a1, and r2 is positive about a2."""
     return Join(
@@ -605,6 +621,17 @@ QUERIES = (
     Query("FIN-2", "filter on questions -> join over filing pages: the "
           "evidence pages of the questions that need a calculation",
           _evidence_join(_filters(_questions(), FIN_NEEDS_CALCULATION))),
+
+    # A question row names one statement, so the join asks about the
+    # question and the pages of that statement; the engine anchors on
+    # the page.
+    Query("TREAS-1", "join over Treasury statement pages: which pages of "
+          "the statement a question reads hold its answer",
+          _provenance_join(_treasury_questions())),
+    Query("TREAS-2", "filter on questions -> join over statement pages: the "
+          "answer pages of the questions that combine several figures",
+          _provenance_join(_filters(_treasury_questions(),
+                                    TREAS_COMBINES_FIGURES))),
 )
 
 

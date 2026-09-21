@@ -239,3 +239,18 @@ FIN_PAGE_EVIDENCE = (
     "Does the filing page in DOCUMENT {1} show the figures or statements "
     "an analyst needs to answer the question in DOCUMENT {0}?"
 )
+
+TREAS_COMBINES_FIGURES = (
+    "Judge strictly from the question above, asked of a U.S. Treasury "
+    "statement of receipts and expenditures, whether answering it requires "
+    "combining two or more reported figures, such as a total over several "
+    "months or years, a difference, a ratio, or a share, rather than "
+    "reading one reported figure.\n\n{0}\n\n"
+    "Instruction: answer TRUE if the question requires combining reported "
+    "figures, FALSE otherwise."
+)
+
+TREAS_PAGE_EVIDENCE = (
+    "Does the Treasury statement page in DOCUMENT {1} report the figures "
+    "needed to answer the question in DOCUMENT {0}?"
+)

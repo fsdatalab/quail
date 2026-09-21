@@ -198,5 +198,15 @@
     "id": "FIN-2",
     "description": "filter on questions -> join over filing pages: the evidence pages of the questions that need a calculation",
     "privacy": false
+  },
+  {
+    "id": "TREAS-1",
+    "description": "join over Treasury statement pages: which pages of the statement a question reads hold its answer",
+    "privacy": false
+  },
+  {
+    "id": "TREAS-2",
+    "description": "filter on questions -> join over statement pages: the answer pages of the questions that combine several figures",
+    "privacy": false
   }
 ]

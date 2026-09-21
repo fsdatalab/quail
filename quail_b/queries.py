@@ -45,6 +45,8 @@ from quail_b.prompts import (
     REFUTE,
     SERIOUS_ADVERSE_EVENT,
     SUPPORT,
+    TREAS_COMBINES_FIGURES,
+    TREAS_PAGE_EVIDENCE,
 )
 from quail_b.substrait import _inspect_plan
 
@@ -87,6 +89,11 @@ FILTER_SELECTIVITY_ESTIMATES = {
     # 100 of the 150 FinanceBench questions carry a reasoning label;
     # 63 of those name numerical or logical reasoning over figures.
     FIN_NEEDS_CALCULATION: 63 / 100,
+    # OfficeQA Pro v2 has no reasoning label. Its README says the pro
+    # questions were kept for being hard, and most ask for a total or a
+    # comparison over several table cells; two in three is a prior set
+    # before any run, to be replaced by the sf=0.1 labels.
+    TREAS_COMBINES_FIGURES: 2 / 3,
 }
 JOIN_SELECTIVITY_ESTIMATES = {
     DISCUSS_ASPECT: 17683 / 60000,
@@ -98,6 +105,11 @@ JOIN_SELECTIVITY_ESTIMATES = {
     # FinanceBench marks 189 evidence pages for its 150 questions; the
     # 84 filings they read hold 12,600 pages between them.
     FIN_PAGE_EVIDENCE: 189 / (150 * 12600),
+    # OfficeQA Pro v2 names one page per (question, statement) row; a
+    # Combined Statement runs to a few hundred pages. One page in 300 is
+    # a prior set before the statements are read, replaced by the
+    # sf=0.1 page counts once the treasury tables are built.
+    TREAS_PAGE_EVIDENCE: 1 / 300,
 }
 
 
@@ -191,13 +203,14 @@ QUERY_FAMILY_WORKLOADS = {
     "AGENT": "agent",
     "CUAD": "cuad",
     "FIN": "financebench",
+    "TREAS": "officeqa",
 }
 
 # A suite is the set of families one engine run can take by name. QUAIL-B
 # reads text documents; QUAIL-B-PDF reads PDF pages rendered as images.
 QUERY_SUITES = {
     "QUAIL-B": ("IMDB", "BIO", "FEV", "LEP", "AGENT"),
-    "QUAIL-B-PDF": ("CUAD", "FIN"),
+    "QUAIL-B-PDF": ("CUAD", "FIN", "TREAS"),
 }
 
 

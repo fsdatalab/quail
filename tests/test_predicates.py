@@ -21,7 +21,7 @@ def _spec(key):
 
 
 def test_stable_ids_cover_predicate_semantics_and_inputs():
-    assert len(PREDICATES) == 33
+    assert len(PREDICATES) == 35
     assert len({spec.key for spec in PREDICATES}) == len(PREDICATES)
     original = PREDICATES[0]
 
@@ -145,3 +145,25 @@ def test_financebench_join_is_labeled_by_the_evidence_pages():
     with pytest.raises(ValueError, match="not a join the annotation"):
         annotation_pair_answer(_spec("quailb.imdb.review.discusses_aspect"),
                                {}, {})
+
+
+def test_officeqa_join_is_labeled_by_the_source_page():
+    from quail_b.predicates import (
+        annotation_pair_answer,
+        annotation_sourced,
+        label_sources,
+    )
+
+    spec = _spec("quailb.officeqa.page.answers_question")
+    assert annotation_sourced(spec)
+    assert not annotation_sourced(
+        _spec("quailb.officeqa.question.combines_figures"))
+    (source,) = label_sources(spec)
+    assert source["spec"]["dataset"] == "databricks/officeqa-pro-v2"
+    question = {"id": "tq0", "statement": "ts0", "evidence_pages": [12]}
+    assert annotation_pair_answer(
+        spec, question, {"id": "ts0p12", "statement": "ts0", "page_number": 12})
+    assert not annotation_pair_answer(
+        spec, question, {"id": "ts0p13", "statement": "ts0", "page_number": 13})
+    assert not annotation_pair_answer(
+        spec, question, {"id": "ts1p12", "statement": "ts1", "page_number": 12})

@@ -13,7 +13,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 
-from quail_b import data, financebench, prompts, rendering
+from quail_b import data, financebench, officeqa, prompts, rendering
 from quail_b.rendering import SHARED_PRE
 
 SCHEMA_VERSION = 1
@@ -197,6 +197,16 @@ PREDICATES = (
         "question", "filing_questions", "question",
         "filing_page", "filing_pages", "document",
         source_policy="financebench_evidence"),
+    PredicateSpec(
+        "quailb.officeqa.question.combines_figures", "officeqa",
+        "question_combines_figures", "filter", prompts.TREAS_COMBINES_FIGURES,
+        "question", "treasury_questions", "question"),
+    PredicateSpec(
+        "quailb.officeqa.page.answers_question", "officeqa",
+        "page_answers_question", "join", prompts.TREAS_PAGE_EVIDENCE,
+        "question", "treasury_questions", "question",
+        "statement_page", "treasury_pages", "document",
+        source_policy="officeqa_provenance"),
 )
 
 PREDICATE_BY_KEY = {p.key: p for p in PREDICATES}
@@ -317,10 +327,17 @@ SOURCE_SPECS = {
         "rule": ("the page is one of the question's evidence pages; a page "
                  "of another filing is false"),
     },
+    "officeqa_provenance": {
+        "dataset": "databricks/officeqa-pro-v2",
+        "revision": data.SOURCE_REVISIONS["databricks/officeqa-pro-v2"],
+        "rule": ("the page is one the question's source_docs names for its "
+                 "statement; a page of another statement is false"),
+    },
 }
 
 # The source policies a dataset's own annotation answers, with no model.
-ANNOTATION_SOURCES = ("cuad_annotation", "financebench_evidence")
+ANNOTATION_SOURCES = ("cuad_annotation", "financebench_evidence",
+                      "officeqa_provenance")
 
 
 def annotation_sourced(spec: PredicateSpec) -> bool:
@@ -339,6 +356,8 @@ def annotation_pair_answer(spec: PredicateSpec, left: dict, right: dict) -> bool
     """The annotation's answer for one (left, right) pair of a join."""
     if spec.source_policy == "financebench_evidence":
         return financebench.page_answers_question(right, left)
+    if spec.source_policy == "officeqa_provenance":
+        return officeqa.page_answers_question(right, left)
     raise ValueError(f"{spec.key} is not a join the annotation answers")
 
 
