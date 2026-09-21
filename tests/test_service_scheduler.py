@@ -103,18 +103,19 @@ def test_join_answers_are_saved_per_anchor_while_running(store, tmp_path):
     assert len(saved) == 6, "one entry per review anchor"
     assert {entry["document"] for entry in saved} == set(range(6))
     assert saved[0]["anchor"] == "r" and saved[0]["partners"] == ["p"]
-    streamed = {(entry["document"], pair[0]): bool(answer)
-                for entry in saved
-                for pair, answer in zip(entry["pairs"], entry["answers"])}
+    assert all(entry["asked"] == 4 and entry["semantics"] == "full"
+               for entry in saved)
+    streamed = {(entry["document"], match[0])
+                for entry in saved for match in entry["matches"]}
     result = artifacts.load_result(
         tmp_path / final.result["directory"], final.result,
         built_in_registry().codecs)
     table = next(iter(result.answer_tables["joins"].values()))
-    final_answers = {(r, p): a for r, p, a in zip(
+    final_true = {(r, p) for r, p, a in zip(
         table["r"].to_pylist(), table["p"].to_pylist(),
-        table["answer"].to_pylist())}
-    assert streamed == final_answers and len(streamed) == 24
-    assert streamed[(0, 0)] is True and streamed[(0, 1)] is False
+        table["answer"].to_pylist()) if a}
+    assert streamed == final_true and table.num_rows == 24
+    assert (0, 0) in streamed and (0, 1) not in streamed
     assert final.progress["answers_saved"] == 6, "the count is written last"
     assert artifacts.read_answers(
         tmp_path / final.result["directory"] / artifacts.ANSWERS_FILE,

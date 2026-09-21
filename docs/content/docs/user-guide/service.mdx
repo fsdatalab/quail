@@ -118,14 +118,15 @@ client can show results filling in instead of waiting for the end:
 ```python
 for entry in run.stream_answers():
     # entry["document"] is the anchor's row index in its table;
-    # entry["pairs"] lists the partner row indices, one per answer
+    # entry["matches"] lists the partner row indices that answered
+    # true; the other entry["asked"] pairs answered false
     print(entry["anchor"], entry["document"],
-          sum(entry["answers"]), "of", len(entry["answers"]))
+          len(entry["matches"]), "of", entry["asked"])
 ```
 
 - `stream_answers()` yields one entry per finished anchor and ends
-  when the query is done. Entries agree with the saved join answer
-  tables.
+  when the query is done. Entries carry ids only, no answer lists, and
+  agree with the saved join answer tables.
 - `answers(after=N)` returns the entries saved so far from entry `N`
   on, with `next` and `done`; `status().progress["answers_saved"]`
   is the count the record knows about.

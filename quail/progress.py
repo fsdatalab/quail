@@ -66,9 +66,10 @@ def set_answer_sink(sink) -> None:
 
     The sink is called as ``sink(payload)`` with the dict
     ``quail.backends.quail.graph`` builds: the node id, the anchor and
-    partner aliases, the anchor's document index, the partner document
-    index tuples, and the answers in the same order. Called from the
-    loop's thread; it must return quickly. Pass None to remove it.
+    partner aliases, the anchor's row index, the partner row index
+    tuples that answered true, and how many pairs were asked. Called
+    from the loop's thread; it must return quickly. Pass None to remove
+    it.
     """
     global _ANSWER_SINK
     _ANSWER_SINK = sink

@@ -107,12 +107,10 @@ def test_stream_answers_yields_each_anchor_and_pages_over_http(
         streamed = list(run.stream_answers(poll_s=1.0))
         assert sorted(entry["document"] for entry in streamed) == list(range(6))
         assert all(entry["anchor"] == "r" and entry["partners"] == ["p"]
-                   and len(entry["pairs"]) == len(entry["answers"]) == 4
-                   for entry in streamed)
+                   and entry["asked"] == 4 for entry in streamed)
         # r0 matches p0 and p2 under the fake rule
         first = next(entry for entry in streamed if entry["document"] == 0)
-        assert [bool(a) for a in first["answers"]] == [True, False, True, False]
-        assert first["pairs"] == [[0], [1], [2], [3]]
+        assert first["matches"] == [[0], [2]]
 
         page = run.answers(after=4, limit=1)
         assert page["next"] == 5 and page["done"] is True

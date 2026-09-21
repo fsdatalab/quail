@@ -178,10 +178,11 @@ class QueryRun:
     def answers(self, after: int = 0, limit: int = 1000) -> dict:
         """Return the join answers saved so far, from entry ``after`` on.
 
-        Each entry is one finished anchor: ``document`` (its index in the
-        anchor alias), ``pairs`` (partner document indices per pair), and
-        ``answers`` in the same order. ``next`` is the entry to ask for
-        next and ``done`` says whether more can still arrive.
+        Each entry is one finished anchor: ``document`` (its row index in
+        the anchor table), ``matches`` (the partner row index tuples that
+        answered true), and ``asked`` (how many pairs were evaluated; the
+        rest answered false). ``next`` is the entry to ask for next and
+        ``done`` says whether more can still arrive.
         """
         return self._client.answers(self.id, after=after, limit=limit)
 
