@@ -1,17 +1,20 @@
 """Turn PDF pages into text with LiteParse, for the OCR operator.
 
 LiteParse (Apache 2.0, runs locally) reads each page's text layer in
-reading order and runs Tesseract over the pages it judges scanned,
-sparse, or garbled, so a scanned page gets text too. It parses one
-file per call, in a pool of persistent worker processes with a hard
-per-file timeout; this module fans the files out over that pool and
-hands their page texts back in file order, one file at a time, so the
-tokenizer can start on the first file while the pool parses the rest.
+reading order. It parses one file per call, in a pool of persistent
+worker processes with a hard per-file timeout; this module fans the
+files out over that pool and hands their page texts back in file
+order, one file at a time, so the tokenizer can start on the first
+file while the pool parses the rest. A page that has no text at all
+after that pass is a scan or a blank, and Tesseract runs over it, and
+only it, in a second pass.
 
-Measured on FinanceBench 10-K filings (160 and 503 pages) on a CPU
-box: 3 to 6 ms per page from the text layer, about 80 ms per page
-when Tesseract runs, and 4 workers gave 900 text-layer pages per
-second.
+Measured on the 66 files of CUAD at scale 0.1 (2,878 pages), one
+process: the text layer took 2.6 ms per page, and Tesseract over the
+11 pages left empty took 0.7 s and read one of them. LiteParse's own
+judgement of which pages need OCR sent enough text-layer pages to
+Tesseract to take 120 ms per page over the corpus, for that same one
+page, so it is not used.
 """
 
 from __future__ import annotations
@@ -38,7 +41,7 @@ class OcrOptions:
     """How the OCR operator runs LiteParse.
 
     Attributes:
-        language: The Tesseract language code for scanned pages.
+        language: The Tesseract language code for pages with no text.
         processes: LiteParse worker processes; zero parses in the
             calling process, which CPU tests use.
         timeout_s: Hard limit per file in the worker pool.
@@ -53,18 +56,38 @@ class OcrOptions:
         return f"language={self.language}"
 
 
-def _open_parser(options: OcrOptions, max_pages: int, **extra):
-    from liteparse import LiteParse
-
-    settings = dict(
-        ocr_enabled=True, ocr_language=options.language,
+def _settings(max_pages: int, **extra) -> dict:
+    return dict(
         output_format="text", quiet=True, continue_on_page_error=True,
         # LiteParse stops at 1000 pages unless told the real bound
         max_pages=max(max_pages, 1), **extra)
+
+
+def _open_parser(options: OcrOptions, max_pages: int, **extra):
+    """The text-layer parser, pooled when the options ask for workers."""
+    from liteparse import LiteParse
+
+    settings = _settings(max_pages, ocr_enabled=False, **extra)
     if options.processes > 0:
         settings.update(pool_size=options.processes,
                         parse_timeout=options.timeout_s)
     return LiteParse(**settings)
+
+
+def _tesseract_texts(options: OcrOptions, path: str, max_pages: int,
+                     pages: Sequence[int]) -> dict[int, str]:
+    """Tesseract's text for the given one based pages of one file.
+
+    Runs in the calling process; LiteParse takes the page list when
+    it is built, so each file with empty pages gets its own parser.
+    """
+    from liteparse import LiteParse
+
+    parser = LiteParse(**_settings(
+        max_pages, ocr_enabled=True, ocr_language=options.language,
+        target_pages=",".join(str(page) for page in pages)))
+    result = parser.parse(path)
+    return {page.page_num: page.text or "" for page in result.pages}
 
 
 def page_texts(pdf_input: PDFInput, options: OcrOptions,
@@ -112,6 +135,12 @@ def page_texts(pdf_input: PDFInput, options: OcrOptions,
         for page in result.pages:
             if 1 <= page.page_num <= limit:
                 texts[page.page_num - 1] = page.text or ""
+        empty = [number for number, text in enumerate(texts, 1)
+                 if not text.strip()]
+        if empty:
+            read = _tesseract_texts(options, source.path, counts[index], empty)
+            for number in empty:
+                texts[number - 1] = read.get(number, "")
         return index, texts
 
     with _open_parser(options, max(counts, default=0), **extra) as parser:

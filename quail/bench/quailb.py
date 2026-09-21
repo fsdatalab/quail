@@ -277,8 +277,10 @@ def pdf_row_lengths(session, plan: QueryPlan, tables
             continue
         provider = session.catalog.get(relation.source)
         if isinstance(provider, OcrProvider):
-            row_lengths = session.tokenize(
-                relation.source, provider.document_column).lengths
+            # quail-b takes an opaque document of at least one position,
+            # so a page with no text counts as one
+            row_lengths = [max(1, int(n)) for n in session.tokenize(
+                relation.source, provider.document_column).lengths]
         else:
             row_lengths = session.prepare_pdf(relation.source).lengths
         row_ids = _ids(tables[relation.table])
