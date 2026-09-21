@@ -1,0 +1,195 @@
+---
+title: Editing physical plans
+---
+
+Quail's planner picks the filter order, join anchors, and KV retention
+for you. Sometimes you want to change the plan, e.g. run a user
+defined function between two operators.
+
+In this example, we'll inspect a physical plan, edit it, and insert a
+user function. Note that we don't need a GPU here because we only plan
+the query, we don't execute it.
+
+The full example is in
+[`demos/plan_walkthrough.py`][demoscript].
+
+## Run the example
+
+```bash
+uv run python demos/plan_walkthrough.py
+```
+
+## The query
+
+We'll use a small version of a
+[FEVER](https://fever.ai/) query from
+[QUAIL-B](/docs/contributing/benchmark). In FEVER, each claim is a
+factual statement and each evidence passage is a Wikipedia paragraph.
+The goal is to find which passages support which claims.
+
+Here we have three claims and three evidence passages. We filter
+claims ("is the claim about a person?") and then check surviving
+claims against their evidence ("does the evidence support the
+claim?").
+
+We build the query with the [Python builder API](/docs/user-guide/python-api):
+
+```python
+from quail import col, prompt
+
+PERSON = "Is the claim in DOCUMENT {0} about a person?"
+SUPPORT = (
+    "Does the passage in DOCUMENT {1} support the claim in "
+    "DOCUMENT {0}?"
+)
+
+query = (
+    session.docs("claims").alias("c")
+    .ai_filter(prompt(PERSON, col("c.claim")))
+    .join(
+        session.docs("evidence").alias("e"),
+        on=col("c.evidence_wiki_url") == col("e.id"),
+    )
+    .ai_filter(prompt(SUPPORT, col("c.claim"), col("e.text")))
+    .select("c.id", "e.id")
+)
+```
+
+The `.join(..., on=...)` restricts which combinations of claims and
+evidence the model evaluates.
+
+## Inspect the plan
+
+We call `query.explain()`. The physical plan shows how the engine
+would execute the query:
+
+<Callout type="info">
+The time estimates assume peak GPU throughput with no host overhead.
+Actual runtimes are longer because of kernel launch latency, memory
+allocation, and scheduling. Use `explain(analyze=True)` on a GPU to
+see measured times next to the estimates.
+</Callout>
+
+```text
+physical: backend=quail, model=qwen3-4b-fp8, workers=1
+  KV=bf16, chunk budget=110,376 tokens
+
+                                                 est. rows  est. pass  est. time
+  Project: c.id, e.id
+    AiJoin: anchor=c                                                     4.29 ms
+      KV: anchor=streamed from its filter, retain after join=no
+      join 1 full (c, e) over hash_join:c-e            0.6       20%*
+      AiFilter: c                                      0.6               2.39 ms
+        survivors stream into the join with KV pinned
+        predicate 1                                      3       20%*
+        Scan claims as c
+          tokens=306, mean_doc_tokens=102
+      Scan evidence as e
+        tokens=4,506, mean_doc_tokens=1,502
+      HashJoin: c.evidence_wiki_url = e.id
+```
+
+"survivors stream into the join with KV pinned" means: when a claim
+passes the filter, the engine keeps its KV in GPU memory and
+immediately starts evaluating evidence passages against it. The filter
+and the join overlap.
+
+## Insert a barrier
+
+If we want the filter to finish *all* claims before the join starts,
+we insert a `Barrier`. A barrier is a synchronization point: the
+engine collects all filter survivors, then begins the join.
+
+```python
+from quail.physical import Barrier
+
+plan = query.plan()
+edited = plan.insert(
+    Barrier(node_id="barrier:c", next_anchor="c", aliases=("c",)),
+    between=("ai_filter:c", "ai_join:c"),
+)
+```
+
+In the edited plan, the barrier sits between the filter and the join.
+The filter's `pin_survivors` changes from `True` to `False` because
+survivors no longer stream directly into the join:
+
+```text
+      Barrier: next_anchor=c
+        AiFilter: c
+          retain KV for later joins
+```
+
+We can remove the barrier and get back the original plan:
+
+```python
+assert edited.remove("barrier:c") == plan
+```
+
+You can only remove nodes that don't change the query's results.
+`Barrier`, `Foreign`, and `Exchange` nodes are safe to remove because
+they control execution order or add user logic, not query semantics.
+Removing a filter or join would change which rows come back, so Quail
+refuses:
+
+```text
+PlanEditError: 'ai_filter:c' is a AiFilter; removing it would change
+what the query means
+```
+
+## Insert a user function
+
+With `.apply()`, we can run our own Python function between operators.
+The full signature is:
+
+```python
+query.apply(fn, columns=(), *, name=None, ids=None, kind="per_batch")
+```
+
+- `fn` receives a `dict[str, pa.Table]` keyed by alias. Each table
+  has the alias's row indices plus the columns you listed in `columns`.
+- `columns` is a list of `col(...)` references that your function
+  needs to read.
+- After a `.join()`, `fn` returns a table with both alias columns
+  (e.g. `c` and `e`) selecting which combinations the next AI
+  predicate evaluates.
+- Without a preceding `.join()`, `fn` returns the ids to keep.
+- `kind="per_batch"` runs on each batch as survivors stream through.
+  `kind="barrier"` waits for all survivors, then runs once.
+
+For example, instead of an `ON` clause, we can match claims to
+evidence with an Arrow join inside our function:
+
+```python
+def match_by_url(tables):
+    """Match each claim to the evidence page its URL names."""
+    return tables["c"].join(
+        tables["e"],
+        keys=["evidence_wiki_url"],
+        right_keys=["id"],
+        join_type="inner",
+    ).select(["c", "e"])
+
+query = (
+    session.docs("claims").alias("c")
+    .ai_filter(prompt(PERSON, col("c.claim")))
+    .join(session.docs("evidence").alias("e"))
+    .apply(match_by_url, columns=[col("c.evidence_wiki_url"),
+                                  col("e.id")])
+    .ai_filter(prompt(SUPPORT, col("c.claim"), col("e.text")))
+    .select("c.id", "e.id")
+)
+```
+
+We could do anything in `match_by_url`: filter by recency, sample a
+subset, or call an external service. Quail only sees the returned
+index table.
+
+In the physical plan, `match_by_url` appears as a `Foreign` node:
+
+```text
+      Foreign: match_by_url (per_batch, pairs) on c, e
+        columns: c.evidence_wiki_url, e.id
+```
+
+[demoscript]: https://github.com/fsdatalab/quail/blob/main/demos/plan_walkthrough.py
