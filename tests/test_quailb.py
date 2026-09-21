@@ -4,10 +4,11 @@ import hashlib
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-import pypdfium2
+from pdfs import make_text_pdf
 
 import quail
 from quail.bench.quailb import queries, register_tables
+from quail.physical import PdfTextScan
 from quail.planner.plan import EngineConfig, Refusal
 from quail_b.data import ASPECTS, SCENARIOS
 from quail_b.queries import QUERY_ORDER
@@ -66,23 +67,20 @@ def _standin_sets(tmp_path):
     return tmp_path
 
 
-def _blank_pdf(path, page_count) -> str:
-    """Write a PDF of blank letter pages; return its sha256."""
-    document = pypdfium2.PdfDocument.new()
-    for _ in range(page_count):
-        document.new_page(612, 792)
-    document.save(str(path))
-    document.close()
+def _text_pdf(path, page_count) -> str:
+    """Write a PDF of letter pages with a line of text each; return its sha256."""
+    make_text_pdf(path, [f"{path.stem} page {page} says hello"
+                         for page in range(1, page_count + 1)])
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _standin_filings(tmp_path, page_counts):
-    """Blank filing PDFs under files/, one question per filing."""
+    """Filing PDFs under files/, one question per filing."""
     files = tmp_path / "files"
     files.mkdir(exist_ok=True)
     questions, pages = [], []
     for index, count in enumerate(page_counts):
-        digest = _blank_pdf(files / f"f{index}.pdf", count)
+        digest = _text_pdf(files / f"f{index}.pdf", count)
         questions.append({
             "id": f"fq{index}", "financebench_id": f"financebench_id_{index:05d}",
             "filing": f"f{index}", "doc_name": f"FILING{index}", "company": "Co",
@@ -101,12 +99,12 @@ def _standin_filings(tmp_path, page_counts):
 
 
 def _standin_contracts(tmp_path, page_counts):
-    """Blank contract PDFs under files/, with both file-backed tables."""
+    """Contract PDFs under files/, with both file-backed tables."""
     files = tmp_path / "files"
     files.mkdir(exist_ok=True)
     contracts, pages = [], []
     for index, count in enumerate(page_counts):
-        digest = _blank_pdf(files / f"ct{index}.pdf", count)
+        digest = _text_pdf(files / f"ct{index}.pdf", count)
         contracts.append({
             "id": f"ct{index}", "title": f"contract {index}",
             "page_count": count, "pdf_sha256": digest,
@@ -150,10 +148,13 @@ def test_all_queries_compile_and_plan(tmp_path):
         for qid, (_, build) in qdefs.items():
             query = build()
             if qid in PDF_QUERIES:
-                # PDF rows need a model that takes images
+                # a text model reads the pages as extracted text, on
+                # every backend, with the same query
                 plan = query.plan()
-                assert isinstance(plan, Refusal), qid
-                assert "takes text only" in " ".join(plan.reasons), qid
+                assert not isinstance(plan, Refusal), f"{qid} refused: {plan}"
+                assert any(isinstance(node, PdfTextScan)
+                           for node in plan.nodes), qid
+                assert "read as text, ocr=off" in query.explain(), qid
                 continue
             operators = query.logical.operators()
             filters, joins = operators.filters, operators.joins
@@ -225,4 +226,4 @@ def test_page_rows_keep_their_benchmark_ids_through_a_symlinked_directory(
     assert rows.column("id").to_pylist() == ["ct1p3", "ct0p1", "ct1p2"]
     assert rows.column("page").to_pylist() == [3, 1, 2]
     assert rows.column("page_count").to_pylist() == [3, 2, 3]
-    assert [page.page_number for page in provider.pdf_input(280).row_pages(0)] == [3]
+    assert [page.page_number for page in provider.pdf_input().row_pages(0)] == [3]

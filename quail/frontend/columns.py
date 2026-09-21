@@ -1,12 +1,14 @@
 """Rules for model-only columns, shared by the SQL compiler and the builder.
 
 A PDF provider's ``document`` column holds page references. The
-model reads it; a query cannot return it, compare it, or hand it to
-an apply() function. AI.FILTER may read it, and so may a join
-predicate over two tables when it is the only PDF column in the
-prompt: the planner anchors that join on the PDF alias, since the
-runtime renders the anchor's pages and not a partner's. An AI.SCORE
-reranker takes text.
+model reads it, rendered or as extracted text; a query cannot return
+it, compare it, or hand it to an apply() function. AI.FILTER may
+read it, and so may a join predicate over two tables when it is the
+only PDF column in the prompt: when the pages are rendered, the
+planner anchors that join on the PDF alias, since the runtime renders
+the anchor's pages and not a partner's. The rules do not depend on
+the reading, so a query compiles the same way under both. An
+AI.SCORE reranker takes text.
 """
 
 from __future__ import annotations
@@ -35,7 +37,7 @@ def check_value_column(catalog: Catalog, ref: ColumnRef, use: str) -> None:
     """
     if ref.column in model_only_columns(catalog.get(ref.provider)):
         raise CompileError(
-            f"column {ref.column!r} of {ref.alias!r} holds page images the "
+            f"column {ref.column!r} of {ref.alias!r} holds the PDF pages the "
             f"model reads; it cannot appear in {use}. It can only be a "
             f"document argument of an AI.FILTER or AI.JOIN prompt")
 
@@ -63,11 +65,11 @@ def check_prompt_columns(catalog: Catalog, refs: Iterable[ColumnRef],
         if function != "AI_FILTER":
             raise CompileError(
                 f"{function.replace('_', '.')} cannot read {ref.column!r} of "
-                f"{ref.alias!r}: page images go through AI.FILTER, as a "
+                f"{ref.alias!r}: PDF pages go through AI.FILTER, as a "
                 f"filter or as a join predicate")
         if ref.alias not in pdf_aliases:
             pdf_aliases.append(ref.alias)
     if join and len(pdf_aliases) > 1:
         raise CompileError(
             f"a join reads the pages of one table; {pdf_aliases} all bind "
-            f"page images. Render one side as text, or join them in turn")
+            f"PDF pages. Give one side as text, or join them in turn")

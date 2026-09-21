@@ -26,7 +26,8 @@ import quail
 import quail_b as benchmark
 from quail.bench import substrait
 from quail.bench.substrait import QueryPlan, Relation, read_plan
-from quail.planner.plan import Refusal
+from quail.catalog import PDFProvider
+from quail.planner.plan import PDF_READINGS, Refusal
 from quail.specs import H100_USD_PER_HOUR, MODELS
 from quail_b.cuad import parse_document_reference, resolve_documents
 from quail_b.data import FILE_TABLES
@@ -48,7 +49,8 @@ SELECTIVITY = {**FILTER_SELECTIVITY_ESTIMATES, **JOIN_SELECTIVITY_ESTIMATES}
 
 # A PDF provider forms these columns from the files it opens, so the
 # benchmark's copies are dropped rather than carried beside them.
-PDF_FORMED_COLUMNS = ("document", "page_count", "page_number")
+PDF_FORMED_COLUMNS = (PDFProvider.document_column, PDFProvider.PAGE_COUNT,
+                      PDFProvider.PAGE_NUMBER)
 
 
 def pdf_provider(rows: pa.Table):
@@ -387,6 +389,13 @@ def main():
     parser.add_argument("--data-dir", help="directory containing input Parquet files")
     parser.add_argument("--ground-truth-collection")
     parser.add_argument("--output-dir", required=True, help="new run directory")
+    parser.add_argument(
+        "--pdf-read", choices=PDF_READINGS, default="auto",
+        help="how a PDF table is read: rendered pages, extracted text, "
+             "or whatever the model takes")
+    parser.add_argument(
+        "--pdf-ocr", action="store_true",
+        help="run OCR over page images in the text reading")
     args = parser.parse_args()
     run_suite(
         [value.strip() for value in args.only.split(",")] if args.only else None,
@@ -396,6 +405,8 @@ def main():
             model=args.model,
             backend=args.backend,
             device=args.device,
+            pdf_read=args.pdf_read,
+            pdf_ocr=args.pdf_ocr,
         ),
         data_dir=args.data_dir,
         ground_truth_collection=args.ground_truth_collection,

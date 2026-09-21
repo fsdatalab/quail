@@ -1,41 +1,32 @@
 """PDF page inputs: provider, planner, compiler rules, and request binding.
 
 No page is rendered here. The tests build small blank PDFs with
-PDFium so the page manifest and the token arithmetic are real.
+PDFium so the page manifest and the token arithmetic are real. The
+text reading is covered in test_pdf_text.py.
 """
 
 import pyarrow as pa
 import pytest
+from pdfs import LETTER, make_pdf
 
 import quail
 from quail.catalog import model_only_columns
 from quail.execution.execute import check_scan_input
 from quail.execution.types import PhysicalRequest, document_input
 from quail.logical import CompileError
-from quail.pdf import PDFInput, PdfPageRef, PdfRowRef, PdfSource, rows_for_mode
+from quail.pdf import PDFInput, PdfPageRef, PdfRowRef, PdfSource
 from quail.physical import PDFScan, TextScan
-from quail.planner.plan import EngineConfig, Refusal
+from quail.planner.plan import EngineConfig, PdfDocuments, Refusal
 from quail.specs import DIFFUSION_GEMMA_26B_FP8, QWEN3_4B_FP8
 from quail.specs.vision import render_size, resolve_image_tokens, soft_tokens
 
 pypdfium2 = pytest.importorskip("pypdfium2")
 
-LETTER = (612, 792)
 GEMMA = DIFFUSION_GEMMA_26B_FP8
 
 
 def fake_tok(text):
     return text.split()
-
-
-def make_pdf(path, sizes):
-    """Write a PDF with one blank page per (width, height) in points."""
-    document = pypdfium2.PdfDocument.new()
-    for width, height in sizes:
-        document.new_page(width, height)
-    document.save(str(path))
-    document.close()
-    return str(path)
 
 
 @pytest.fixture()
@@ -79,20 +70,28 @@ def test_pdf_input_validation():
     src = (PdfSource("/a.pdf", 1, 1), PdfSource("/b.pdf", 1, 1))
     pages = (PdfPageRef(0, 0, 612, 792), PdfPageRef(0, 1, 612, 792),
              PdfPageRef(1, 0, 612, 792))
-    assert rows_for_mode(pages, 2, "page") == (
+    assert PDFInput.formed(src, pages, "page").rows == (
         PdfRowRef((0,)), PdfRowRef((1,)), PdfRowRef((2,)))
-    assert rows_for_mode(pages, 2, "pdf") == (PdfRowRef((0, 1)), PdfRowRef((2,)))
+    good = PDFInput.formed(src, pages, "pdf")
+    assert good.rows == (PdfRowRef((0, 1)), PdfRowRef((2,)))
     with pytest.raises(ValueError, match="row_mode must be one of"):
-        rows_for_mode(pages, 2, "chapter")
+        PDFInput.formed(src, pages, "chapter")
     with pytest.raises(ValueError, match="source 2 has no pages"):
-        rows_for_mode(pages, 3, "pdf")
-    good = PDFInput(src, pages, rows_for_mode(pages, 2, "pdf"), "pdf", 280)
+        PDFInput.formed(src + (PdfSource("/c.pdf", 1, 1),), pages, "pdf")
     assert (len(good), good.page_count, good.pages_per_row_max) == (2, 3, 2)
     assert good.row_pages(0) == pages[:2]
+    assert good.page_counts == (2, 1) and good.source_rows == (0, 1)
+    listed = PDFInput.listed(src, pages, [(1, 1), (0, 2)])
+    assert listed.rows == (PdfRowRef((2,)), PdfRowRef((1,)))
+    assert listed.row_mode == "page" and listed.source_rows == (1, 0)
+    with pytest.raises(ValueError, match="page 3 of '/a.pdf' does not exist"):
+        PDFInput.listed(src, pages, [(0, 3)])
     with pytest.raises(ValueError, match="mixes pages of sources"):
-        PDFInput(src, pages, (PdfRowRef((1, 2)),), "pdf", 280)
+        PDFInput(src, pages, (PdfRowRef((1, 2)),), "pdf")
     with pytest.raises(ValueError, match="refers to page 7"):
-        PDFInput(src, pages, (PdfRowRef((7,)),), "page", 280)
+        PDFInput(src, pages, (PdfRowRef((7,)),), "page")
+    with pytest.raises(ValueError, match="page mode row shows one"):
+        PDFInput(src, pages, (PdfRowRef((0, 1)),), "page")
     with pytest.raises(ValueError, match="at least one page"):
         PdfRowRef(())
 
@@ -115,10 +114,15 @@ def test_page_mode_provider_rows_and_schema(sources):
         "page_count": [3, 3, 3, 2, 2],
         "title": ["first", "first", "first", "second", "second"],
     }
-    pdf_input = provider.pdf_input(280)
+    pdf_input = provider.pdf_input()
     assert pdf_input.row_mode == "page"
     assert [p.page_index for p in pdf_input.pages] == [0, 1, 2, 0, 1]
     assert pdf_input.pages[4].width_points == 792.0
+    # the identity covers the table's values, not only its schema
+    renamed = quail.DocumentProvider.from_pdfs(
+        sources.set_column(2, "title", pa.array(["x", "y"])),
+        id_col="doc_id", path_col="path", row_mode="page")
+    assert renamed.content_identity() != provider.content_identity()
 
 
 def test_pdf_mode_provider_rows(sources):
@@ -128,11 +132,13 @@ def test_pdf_mode_provider_rows(sources):
     rows = provider.scan(quail.ScanRequest(
         columns=("doc_id", "page_count"))).read_all().to_pydict()
     assert rows == {"doc_id": ["a", "b"], "page_count": [3, 2]}
-    pdf_input = provider.pdf_input(140)
+    pdf_input = provider.pdf_input()
     assert [r.page_ids for r in pdf_input.rows] == [(0, 1, 2), (3, 4)]
     with pytest.raises(CompileError, match="row_mode"):
         quail.DocumentProvider.from_pdfs(
             sources, id_col="doc_id", path_col="path", row_mode="chapter")
+    with pytest.raises(CompileError, match="not both"):
+        quail.catalog.PDFProvider(sources, "doc_id", "path")
     with pytest.raises(CompileError, match="clash with the columns"):
         quail.DocumentProvider.from_pdfs(
             sources.append_column("page_count", pa.array([1, 2])),
@@ -158,7 +164,7 @@ def test_listed_pages_provider_keeps_the_rows_and_ids_it_is_given(sources):
     assert rows.to_pydict() == {
         "page_id": ["b2", "a3", "a1"], "page_number": [2, 3, 1],
         "page_count": [2, 3, 3], "label": ["x", "y", "z"]}
-    pdf_input = provider.pdf_input(280)
+    pdf_input = provider.pdf_input()
     assert pdf_input.row_mode == "page"
     assert [(p.source_index, p.page_number) for p in pdf_input.row_pages(0)] == [
         (0, 2)]
@@ -256,8 +262,9 @@ def test_pdf_scan_round_trips_through_the_envelope(sources):
         assert scans and scans[0].attributes()["row_mode"] == "page"
 
 
-def test_text_model_refuses_pdf_rows(sources):
-    with quail.Session(EngineConfig(model="qwen3-4b-fp8", device="h100-sxm"),
+def test_text_model_refuses_pdf_rows_read_as_images(sources):
+    with quail.Session(EngineConfig(model="qwen3-4b-fp8", device="h100-sxm",
+                                    pdf_read="image"),
                        tokenizer=fake_tok) as session:
         session.register("pages", quail.DocumentProvider.from_pdfs(
             sources, id_col="doc_id", path_col="path", row_mode="page"))
@@ -388,7 +395,8 @@ def test_worker_lays_pdf_rows_out_as_page_prompts_with_an_image_source(sources):
     graph = decode_graph(request.plan["graph"], built_in_registry().codecs)
     payload = quail_runtime_payload(request, graph)
     assert payload["docs"] == {}
-    assert isinstance(payload["pdf_inputs"]["p"], PDFInput)
+    bound, budget = payload["pdf_inputs"]["p"]
+    assert isinstance(bound, PDFInput) and budget == 280
     docs = payload_documents(payload, GEMMA)
     prompts = docs["p"]
     assert isinstance(prompts, PagePrompts) and len(prompts) == 5
@@ -416,6 +424,15 @@ def test_image_tokens_are_checked_at_session_start():
     with pytest.raises(quail.RefusalError, match="takes text only"):
         quail.Session(EngineConfig(model="qwen3-4b-fp8", device="h100-sxm",
                                    image_tokens=280), tokenizer=fake_tok)
+    with pytest.raises(quail.RefusalError, match="pdf_read must be one of"):
+        quail.Session(EngineConfig(model="qwen3-4b-fp8", device="h100-sxm",
+                                   pdf_read="ocr"), tokenizer=fake_tok)
+    # auto follows the model
+    with gemma_session() as session:
+        assert session.pdf_reading == "image"
+    with quail.Session(EngineConfig(model="qwen3-4b-fp8", device="h100-sxm"),
+                       tokenizer=fake_tok) as session:
+        assert session.pdf_reading == "text"
 
 
 def test_compiler_keeps_the_document_column_out_of_values(sources, tmp_path):
@@ -475,7 +492,7 @@ def test_check_scan_input_rejects_mismatched_bindings():
                   pages_per_row_max=1)
     src = (PdfSource("/a.pdf", 1, 1),)
     pages = (PdfPageRef(0, 0, 612, 792),)
-    pdf_input = PDFInput(src, pages, (PdfRowRef((0,)),), "page", 280)
+    pdf_input = PDFInput(src, pages, (PdfRowRef((0,)),), "page")
     check_scan_input(pdf, pdf_input)
     check_scan_input(text, document_input([[1, 2]]))
     with pytest.raises(TypeError, match="needs PDFInput"):
@@ -484,10 +501,15 @@ def test_check_scan_input_rejects_mismatched_bindings():
         check_scan_input(text, pdf_input)
     with pytest.raises(ValueError, match="plans 1 documents but its input holds 2"):
         check_scan_input(text, document_input([[1], [2]]))
-    with pytest.raises(ValueError, match="visual tokens"):
-        check_scan_input(pdf, PDFInput(src, pages, (PdfRowRef((0,)),),
-                                       "page", 560))
+    with pytest.raises(ValueError, match="row_mode='page', but its input"):
+        check_scan_input(pdf, PDFInput(src, pages, (PdfRowRef((0,)),), "pdf"))
     with pytest.raises(ValueError, match="one page per row"):
         PDFScan(node_id="scan:p", alias="p", input_id="p", n_docs=1,
                 row_mode="page", n_pages=2, visual_tokens=280,
                 pages_per_row_max=2)
+    with pytest.raises(ValueError, match="positive visual token budget"):
+        PDFScan(node_id="scan:p", alias="p", input_id="p", n_docs=1,
+                row_mode="page", n_pages=1, pages_per_row_max=1)
+    with pytest.raises(ValueError, match="only it, has a budget"):
+        PdfDocuments(reading="text", row_mode="page", n_pages=1,
+                     pages_per_row_max=1, visual_tokens=280)

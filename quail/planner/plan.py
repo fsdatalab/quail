@@ -290,18 +290,44 @@ class EngineConfig:
     # soft tokens per PDF page image; None takes the model's default
     # budget, and a text-only model refuses any value
     image_tokens: int | None = None
+    # how a query reads a PDF table: "image" renders its pages for a
+    # vision model, "text" extracts their text with LiteParse and
+    # tokenizes it, "auto" is "image" when the model takes images and
+    # "text" otherwise
+    pdf_read: str = "auto"
+    # run OCR over page images in the text reading; off reads the text
+    # layer only, so a scanned page comes out empty
+    pdf_ocr: bool = False
+
+
+PDF_READINGS = ("auto", "image", "text")
 
 
 @dataclass(frozen=True)
 class PdfDocuments:
     """What the planner knows about one alias bound to PDF pages.
 
-    The alias's per-row lengths in ``doc_tokens`` are the planned
-    prompt prefix of each row (soft tokens plus frame tokens of its
-    pages); this adds what a text alias has no need for.
+    Attributes:
+        reading: "image" when the rows' pages are rendered, and the
+            alias's ``doc_tokens`` are each row's soft plus frame
+            tokens; "text" when their text is tokenized, and the
+            lengths are token counts like any text alias.
+        row_mode: One page per row, or one PDF.
+        n_pages: Page references across every row.
+        pages_per_row_max: The longest row, in pages.
+        visual_tokens: The render budget per page; image reading only.
+        ocr: Whether OCR ran on the pages; text reading only.
     """
 
+    reading: str
     row_mode: str
     n_pages: int
-    visual_tokens: int
     pages_per_row_max: int
+    visual_tokens: int | None = None
+    ocr: bool = False
+
+    def __post_init__(self) -> None:
+        if self.reading not in ("image", "text"):
+            raise ValueError(f"unknown PDF reading {self.reading!r}")
+        if (self.reading == "image") != (self.visual_tokens is not None):
+            raise ValueError("the image reading, and only it, has a budget")

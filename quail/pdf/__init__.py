@@ -1,4 +1,9 @@
-"""PDF page inputs: page references, the page manifest, and page rendering."""
+"""PDF page inputs: page references, the page manifest, and the two readings.
+
+A PDF table's rows are described once (PDFInput). A plan reads them
+either as page images (prompt, prefetch: soft tokens and rendering)
+or as extracted text (text: LiteParse, then the ordinary tokenizer).
+"""
 
 from .manifest import (
     PdfManifest,
@@ -8,6 +13,7 @@ from .manifest import (
     stat_sources,
 )
 from .prefetch import ImagePrefetcher, PdfiumPrefetcher, RenderedPage
+from .text import PdfTextOptions, PdfTexts, row_texts, sample_page_texts
 from .types import (
     ROW_MODES,
     PDFInput,
@@ -16,7 +22,6 @@ from .types import (
     PdfSource,
     RowMode,
     check_row_mode,
-    rows_for_mode,
 )
 
 __all__ = [
@@ -27,6 +32,8 @@ __all__ = [
     "PdfReadError",
     "PdfRowRef",
     "PdfSource",
+    "PdfTextOptions",
+    "PdfTexts",
     "PdfiumPrefetcher",
     "ROW_MODES",
     "RenderedPage",
@@ -34,6 +41,7 @@ __all__ = [
     "check_row_mode",
     "check_source_unchanged",
     "read_manifest",
-    "rows_for_mode",
+    "row_texts",
+    "sample_page_texts",
     "stat_sources",
 ]

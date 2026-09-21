@@ -35,8 +35,12 @@ def run_backend_group(
     ground_truth_collection: str,
     methods: Sequence[str],
     root: str | None = None,
+    pdf_read: str = "auto",
 ) -> dict:
-    """Run backend methods while sharing one loaded model when possible."""
+    """Run backend methods while sharing one loaded model when possible.
+
+    pdf_read is how a PDF table is read, as EngineConfig.pdf_read.
+    """
     from quail import EngineConfig
     from quail.bench.quailb import run_suite
     from quail_b.queries import query_family_name
@@ -60,6 +64,7 @@ def run_backend_group(
                 model=model,
                 backend=method,
                 device="h100-sxm",
+                pdf_read=pdf_read,
             ),
             data_dir=Path(data_dir) / f"sf{sf}",
             ground_truth_collection=ground_truth_collection or None,

@@ -62,6 +62,7 @@ from quail.planner import (
 from quail.planner import (
     join_specs as logical_join_specs,
 )
+from quail.planner.decide import image_aliases, scan_node
 from quail.planner.joins import search_joins, summarize_alias
 from quail.planner.physical_optimizer import PhysicalCandidate, SupportResult
 from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
@@ -109,6 +110,18 @@ def plan_request_backend(
         )
         for alias, lengths in context.document_tokens.items()
     }
+    rendered = sorted(image_aliases(context.pdf_documents))
+    if rendered:
+        return (PhysicalCandidate(
+            graph=None,
+            plan=Refusal(
+                reasons=(f"backend {backend_name!r} takes text only, but "
+                         f"{rendered} bind PDF pages read as images; read "
+                         f"them as text (pdf_read='text')",),
+                constraint="pdf_input_unsupported",
+                needed=len(rendered), available=0, unit="PDF scans"),
+            estimated_seconds=float("inf"),
+        ),)
     nodes = []
     input_refs = []
     aliases = tuple(scan.alias for scan in scans)
@@ -116,15 +129,10 @@ def plan_request_backend(
         if scan.alias not in stats:
             raise ValueError(f"no document tokens for alias {scan.alias!r}")
         summary = stats[scan.alias]
-        node = TextScan(
-            node_id=f"scan:{scan.alias}",
-            alias=scan.alias,
-            input_id=scan.alias,
-            n_docs=summary.n_docs,
-            total_tokens=summary.total_tokens,
-            shard_ranges=((0, summary.n_docs),),
-            shard_token_loads=(summary.total_tokens,),
-        )
+        node = scan_node(
+            f"scan:{scan.alias}", scan.alias, summary,
+            ((0, summary.n_docs),), (summary.total_tokens,),
+            context.pdf_documents.get(scan.alias))
         nodes.append(node)
         input_refs.append(PortRef(node.node_id, f"ids:{scan.alias}"))
 
