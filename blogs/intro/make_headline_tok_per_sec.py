@@ -55,10 +55,10 @@ def collect_rows(workdir: Path):
 
     for query, quail in comparison["rows"]["quail"].items():
         vllm = comparison["rows"]["pipelined_vllm"][query]
-        sol = comparison["sol"][query]
+        sol = comparison.get("sol", {}).get(query) or {}
         shared = float(
             sol.get("requested_tokens")
-            or comparison["rows"]["quail"][query]["requested_tokens"]
+            or quail["requested_tokens"]
         )
         rows.append(
             {
@@ -78,15 +78,17 @@ def collect_rows(workdir: Path):
                 "shared_tokens": shared,
             }
         )
-        rows.append(
-            {
-                "query": query,
-                "method": "SoL",
-                "tok_per_sec": _tok_per_sec(shared, float(sol["sol_s"])),
-                "runtime_s": float(sol["sol_s"]),
-                "shared_tokens": shared,
-            }
-        )
+        sol_s = sol.get("sol_s")
+        if sol_s is not None:
+            rows.append(
+                {
+                    "query": query,
+                    "method": "SoL",
+                    "tok_per_sec": _tok_per_sec(shared, float(sol_s)),
+                    "runtime_s": float(sol_s),
+                    "shared_tokens": shared,
+                }
+            )
 
     # BIO-4 only when present in comparison.json (same sf 0.1 suite).
     # Do not side-load a separate bio4-sf01-*.json family here — that mixed
@@ -165,6 +167,8 @@ def plot_headline(rows, destination: Path):
             zorder=2,
         )
     for position, name in enumerate(datasets):
+        if not by[name]["SoL"]:
+            continue
         sol = statistics.mean(by[name]["SoL"])
         # Plain segment only — no center markers.
         axis.plot(

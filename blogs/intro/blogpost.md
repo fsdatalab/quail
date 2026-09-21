@@ -408,100 +408,109 @@ Across the 29 queries with matching measurements at scale factor 0.1, Quail is f
 
 ### Per-query metrics table
 
-The table below reports all 31 queries with matching results in the scale factor 0.1 comparison. SoL assumes zero KV regret. Costs use about $3.96 per H100-hour. BIO-4 will return after its remade run lands in `comparison.json`. Its scale factor 1.0 results are in Section 4.3.
+The table below reports all 34 queries with matching results in the scale factor 0.1 comparison. SoL assumes zero KV regret. Costs use about $3.96 per H100-hour. BIO-1, BIO-3, and BIO-4 use remake run `20260921T190132Z-a2059688`; BIO-2 keeps its prior run. BIO-4 scale factor 1.0 results are in Section 4.3.
 
 ::: {.metrics-table}
 | query | method | tok_per_sec | kv_regret | cost_usd |
 | --- | --- | ---: | ---: | ---: |
-| AGENT-1 | Quail | 73124.95 | 11886152 | 0.2614 |
-| AGENT-1 | vLLM | 176628.88 | 23928 | 0.1082 |
-| AGENT-1 | SoL | 366357.25 | 0 | 0.0522 |
-| AGENT-2 | Quail | 72969.32 | 11886152 | 0.2626 |
-| AGENT-2 | vLLM | 175139.57 | 23928 | 0.1094 |
-| AGENT-2 | SoL | 364144.27 | 0 | 0.0526 |
-| BIO-2 | Quail | 18280145.54 | 2477 | 0.1398 |
-| BIO-2 | vLLM | 1820083.72 | 154747 | 1.4038 |
-| BIO-2 | SoL | 37485021.13 | 0 | 0.0682 |
+| AGENT-1 | Quail | 73124.95 | 11886152 | 0.2609 |
+| AGENT-1 | vLLM | 176628.88 | 23928 | 0.1080 |
+| AGENT-1 | SoL | 366357.25 | 0 | 0.0521 |
+| AGENT-2 | Quail | 72969.32 | 11886152 | 0.2621 |
+| AGENT-2 | vLLM | 175139.57 | 23928 | 0.1092 |
+| AGENT-2 | SoL | 364144.27 | 0 | 0.0525 |
+| BIO-1 | Quail | 94117.60 | 2484 | 0.0240 |
+| BIO-1 | vLLM | 80530.20 | 2468 | 0.0280 |
+| BIO-1 | SoL | 186194.32 | 0 | 0.0121 |
+| BIO-2 | Quail | 18280145.54 | 2477 | 0.1395 |
+| BIO-2 | vLLM | 1820083.72 | 154747 | 1.4008 |
+| BIO-2 | SoL | 37485021.13 | 0 | 0.0680 |
+| BIO-3 | Quail | 13225611.21 | 2869 | 0.1150 |
+| BIO-3 | vLLM | 1568143.71 | 1702055 | 0.9697 |
+| BIO-3 | SoL | 32399507.32 | 0 | 0.0469 |
+| BIO-4 | Quail | 14351284.26 | 624144 | 0.0761 |
+| BIO-4 | vLLM | 2013049.82 | 3907993 | 0.5427 |
+| BIO-4 | SoL | 28579085.47 | 0 | 0.0382 |
 | FEV-1 | Quail | 114934.48 | 1359 | 0.0003 |
-| FEV-1 | vLLM | 81295.12 | 1359 | 0.0005 |
+| FEV-1 | vLLM | 81295.12 | 1359 | 0.0004 |
 | FEV-1 | SoL | 275929.00 | 0 | 0.0001 |
-| FEV-10 | Quail | 157457.74 | 2773 | 0.0018 |
-| FEV-10 | vLLM | 90592.12 | 4308 | 0.0032 |
-| FEV-10 | SoL | 371434.56 | 0 | 0.0008 |
-| FEV-2 | Quail | 2429051.89 | 678 | 0.0324 |
-| FEV-2 | vLLM | 1187491.64 | 106037 | 0.0662 |
+| FEV-2 | Quail | 2429051.89 | 678 | 0.0323 |
+| FEV-2 | vLLM | 1187491.64 | 106037 | 0.0660 |
 | FEV-2 | SoL | 5565379.99 | 0 | 0.0141 |
-| FEV-3 | Quail | 1927155.34 | 2605 | 0.0240 |
-| FEV-3 | vLLM | 905895.80 | 90822 | 0.0511 |
+| FEV-3 | Quail | 1927155.34 | 2605 | 0.0239 |
+| FEV-3 | vLLM | 905895.80 | 90822 | 0.0509 |
 | FEV-3 | SoL | 5326652.62 | 0 | 0.0087 |
 | FEV-4 | Quail | 1115893.58 | 2605 | 0.0053 |
 | FEV-4 | vLLM | 751710.74 | 23952 | 0.0079 |
 | FEV-4 | SoL | 2967229.86 | 0 | 0.0020 |
-| FEV-5 | Quail | 1710195.47 | 2776 | 0.0151 |
-| FEV-5 | vLLM | 833203.34 | 95455 | 0.0309 |
+| FEV-5 | Quail | 1710195.47 | 2776 | 0.0150 |
+| FEV-5 | vLLM | 833203.34 | 95455 | 0.0308 |
 | FEV-5 | SoL | 5018814.70 | 0 | 0.0051 |
-| FEV-6 | Quail | 775403.46 | 2776 | 0.0045 |
+| FEV-6 | Quail | 775403.46 | 2776 | 0.0044 |
 | FEV-6 | vLLM | 557794.67 | 15909 | 0.0062 |
 | FEV-6 | SoL | 2347116.17 | 0 | 0.0015 |
-| FEV-7 | Quail | 2174277.32 | 135139 | 0.0612 |
-| FEV-7 | vLLM | 1094218.43 | 298043 | 0.1215 |
-| FEV-7 | SoL | 5691842.82 | 0 | 0.0234 |
-| FEV-8 | Quail | 2228621.90 | 3120800 | 0.0949 |
-| FEV-8 | vLLM | 1122434.17 | 3525124 | 0.1885 |
-| FEV-8 | SoL | 5725697.73 | 0 | 0.0370 |
-| FEV-9 | Quail | 1592046.28 | 1461116 | 0.0429 |
-| FEV-9 | vLLM | 812587.42 | 1648151 | 0.0840 |
+| FEV-7 | Quail | 2174277.32 | 135139 | 0.0610 |
+| FEV-7 | vLLM | 1094218.43 | 298043 | 0.1213 |
+| FEV-7 | SoL | 5691842.82 | 0 | 0.0233 |
+| FEV-8 | Quail | 2228621.90 | 3120800 | 0.0947 |
+| FEV-8 | vLLM | 1122434.17 | 3525124 | 0.1881 |
+| FEV-8 | SoL | 5725697.73 | 0 | 0.0369 |
+| FEV-9 | Quail | 1592046.28 | 1461116 | 0.0428 |
+| FEV-9 | vLLM | 812587.42 | 1648151 | 0.0838 |
 | FEV-9 | SoL | 5452523.60 | 0 | 0.0125 |
-| IMDB-1 | Quail | 121830.54 | 20349 | 0.0159 |
-| IMDB-1 | vLLM | 101513.73 | 20061 | 0.0191 |
+| FEV-10 | Quail | 157457.74 | 2773 | 0.0018 |
+| FEV-10 | vLLM | 90592.12 | 4308 | 0.0032 |
+| FEV-10 | SoL | 371434.56 | 0 | 0.0008 |
+| IMDB-1 | Quail | 121830.54 | 20349 | 0.0158 |
+| IMDB-1 | vLLM | 101513.73 | 20061 | 0.0190 |
 | IMDB-1 | SoL | 264443.38 | 0 | 0.0073 |
-| IMDB-10 | Quail | 1182286.98 | 2132608 | 0.0532 |
-| IMDB-10 | vLLM | 714926.16 | 4360757 | 0.0880 |
-| IMDB-10 | SoL | 3606897.01 | 0 | 0.0174 |
 | IMDB-2 | Quail | 988009.25 | 20349 | 0.0233 |
 | IMDB-2 | vLLM | 827243.13 | 40741 | 0.0278 |
 | IMDB-2 | SoL | 2273975.42 | 0 | 0.0101 |
 | IMDB-3 | Quail | 849463.20 | 24729 | 0.0246 |
-| IMDB-3 | vLLM | 475368.18 | 1398847 | 0.0440 |
+| IMDB-3 | vLLM | 475368.18 | 1398847 | 0.0439 |
 | IMDB-3 | SoL | 2003008.14 | 0 | 0.0104 |
 | IMDB-4 | Quail | 445828.31 | 21606 | 0.0190 |
-| IMDB-4 | vLLM | 293879.97 | 577154 | 0.0289 |
+| IMDB-4 | vLLM | 293879.97 | 577154 | 0.0288 |
 | IMDB-4 | SoL | 1026113.86 | 0 | 0.0083 |
 | IMDB-5 | Quail | 393738.79 | 21839 | 0.0182 |
 | IMDB-5 | vLLM | 258381.32 | 531994 | 0.0277 |
 | IMDB-5 | SoL | 879626.62 | 0 | 0.0081 |
 | IMDB-6 | Quail | 151586.07 | 20349 | 0.0164 |
-| IMDB-6 | vLLM | 124009.86 | 63473 | 0.0201 |
-| IMDB-6 | SoL | 333850.55 | 0 | 0.0075 |
+| IMDB-6 | vLLM | 124009.86 | 63473 | 0.0200 |
+| IMDB-6 | SoL | 333850.55 | 0 | 0.0074 |
 | IMDB-7 | Quail | 169817.00 | 21112 | 0.0170 |
 | IMDB-7 | vLLM | 123394.50 | 337625 | 0.0234 |
 | IMDB-7 | SoL | 379526.20 | 0 | 0.0076 |
 | IMDB-8 | Quail | 1465971.18 | 91872 | 0.0286 |
-| IMDB-8 | vLLM | 967414.76 | 942159 | 0.0434 |
+| IMDB-8 | vLLM | 967414.76 | 942159 | 0.0433 |
 | IMDB-8 | SoL | 3174099.85 | 0 | 0.0132 |
-| IMDB-9 | Quail | 1285940.17 | 2144348 | 0.0525 |
-| IMDB-9 | vLLM | 938999.72 | 3018927 | 0.0719 |
-| IMDB-9 | SoL | 3738700.60 | 0 | 0.0181 |
+| IMDB-9 | Quail | 1285940.17 | 2144348 | 0.0524 |
+| IMDB-9 | vLLM | 938999.72 | 3018927 | 0.0718 |
+| IMDB-9 | SoL | 3738700.60 | 0 | 0.0180 |
+| IMDB-10 | Quail | 1182286.98 | 2132608 | 0.0531 |
+| IMDB-10 | vLLM | 714926.16 | 4360757 | 0.0878 |
+| IMDB-10 | SoL | 3606897.01 | 0 | 0.0174 |
 | LEP-1 | Quail | 119951.82 | 1702 | 0.0012 |
 | LEP-1 | vLLM | 95613.77 | 1622 | 0.0015 |
 | LEP-1 | SoL | 267221.28 | 0 | 0.0005 |
-| LEP-2 | Quail | 520246.72 | 1702 | 0.1446 |
-| LEP-2 | vLLM | 429797.44 | 87430 | 0.1750 |
-| LEP-2 | SoL | 1178044.06 | 0 | 0.0639 |
-| LEP-3 | Quail | 32359.15 | 2058 | 0.1036 |
-| LEP-3 | vLLM | 25232.80 | 165313 | 0.1328 |
+| LEP-2 | Quail | 520246.72 | 1702 | 0.1443 |
+| LEP-2 | vLLM | 429797.44 | 87430 | 0.1747 |
+| LEP-2 | SoL | 1178044.06 | 0 | 0.0637 |
+| LEP-3 | Quail | 32359.15 | 2058 | 0.1034 |
+| LEP-3 | vLLM | 25232.80 | 165313 | 0.1326 |
 | LEP-3 | SoL | 1348878.62 | 0 | 0.0025 |
-| LEP-4 | Quail | 31448.77 | 1852 | 0.0443 |
-| LEP-4 | vLLM | 26474.53 | 49540 | 0.0526 |
+| LEP-4 | Quail | 31448.77 | 1852 | 0.0442 |
+| LEP-4 | vLLM | 26474.53 | 49540 | 0.0525 |
 | LEP-4 | SoL | 1054502.31 | 0 | 0.0013 |
 | LEP-5 | Quail | 5688.60 | 1794 | 0.0286 |
-| LEP-5 | vLLM | 4224.29 | 35327 | 0.0386 |
+| LEP-5 | vLLM | 4224.29 | 35327 | 0.0385 |
 | LEP-5 | SoL | 300823.31 | 0 | 0.0005 |
-| LEP-6 | Quail | 13549.90 | 1732 | 0.0111 |
+| LEP-6 | Quail | 13549.90 | 1732 | 0.0110 |
 | LEP-6 | vLLM | 9472.69 | 10758 | 0.0158 |
 | LEP-6 | SoL | 281667.61 | 0 | 0.0005 |
-| LEP-7 | Quail | 28188.78 | 3420 | 0.0434 |
-| LEP-7 | vLLM | 23364.36 | 51004 | 0.0524 |
+| LEP-7 | Quail | 28188.78 | 3420 | 0.0433 |
+| LEP-7 | vLLM | 23364.36 | 51004 | 0.0522 |
 | LEP-7 | SoL | 900460.88 | 0 | 0.0014 |
 | LEP-8 | Quail | 101725.37 | 1702 | 0.0015 |
 | LEP-8 | vLLM | 59266.09 | 6065 | 0.0025 |
@@ -511,10 +520,10 @@ The table below reports all 31 queries with matching results in the scale factor
 ::: {.figure-block .wide-figure}
 [![Average requested input token throughput by dataset for Quail, vLLM, and SoL.](figures/quailb_tok_per_sec.png){width=100%}](figures/quailb_tok_per_sec.pdf)
 
-*Figure 7. Average requested input tokens per second by dataset at scale factor 0.1, using Qwen3 4B FP8 on one H100. Bars show Quail and vLLM, while horizontal lines show SoL estimates. Dataset labels show the number of queries. BIO currently contains only BIO-2. BIO-1 and BIO-3 are missing because their saved runs used the old filter. BIO-4 will return after its remade run lands in `comparison.json`.*
+*Figure 7. Average requested input tokens per second by dataset at scale factor 0.1, using Qwen3 4B FP8 on one H100. Bars show Quail and vLLM, while horizontal lines show SoL estimates. Dataset labels show the number of queries. BIO contains all four queries.*
 :::
 
-For every method, throughput is the total requested input tokens divided by runtime. SoL uses the same requested-token total and its estimated runtime. The throughput figure is the headline comparison. Under this definition, vLLM is ahead on AGENT. The latency figure below keeps the per-query detail.
+For every method, throughput is the total requested input tokens divided by runtime. SoL uses the same requested-token total and its estimated runtime. On BIO, Quail averages about 11.5 million tokens per second, compared with 1.4 million for vLLM and 24.7 million for SoL. The throughput figure is the headline comparison. Under this definition, vLLM is ahead on AGENT. The latency figure below keeps the per-query detail.
 
 ::: {.figure-block .wide-figure}
 [![Query latency for Quail, the vLLM baseline, and SoL estimates across the 31 default QUAIL-B queries. BIO-1 and BIO-3 are marked as not measured.](figures/quailb_latency.png){width=100%}](figures/quailb_latency.pdf)
