@@ -49,7 +49,7 @@ dev = [
 # The CUAD branch of quail-bench, pushed to this repository as
 # cursor/quail-bench-cuad-19aa until it is merged into
 # fsdatalab/quail-bench; then the pin moves back to that repository.
-quail-b = { git = "https://github.com/fsdatalab/quail.git", rev = "e9c67f3b9226767048d24357a4616b08cc7ae6e1" }
+quail-b = { git = "https://github.com/fsdatalab/quail.git", rev = "ef5353f819624f8ac0e8fcd69bc0adbf159e05c8" }
 
 [build-system]
 requires = ["hatchling==1.32.0"]
