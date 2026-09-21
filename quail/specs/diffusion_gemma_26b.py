@@ -47,6 +47,10 @@ DIFFUSION_GEMMA_26B_FP8 = ModelSpec(
     input_modalities=frozenset({"text", "image"}),
     image_token_budgets=(70, 140, 280, 560, 1120),
     default_image_tokens=280,
+    # One prompt held 32 CUAD contract pages (8,605 prompt tokens) at
+    # budget 280 with a steady 76 GB peak; more pages were not tried
+    # (/results/ablations/pdf_probe_images.json).
+    max_images_per_request=32,
     image_patch_pixels=16,
     image_pool_kernel=3,
     image_start_id=255_999,
