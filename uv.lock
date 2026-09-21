@@ -1044,11 +1044,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/2a/39/e50c7c3a983047577ee07d2a9e53faf5a69493943ec3f6a384bdc792deb2/httpx-0.28.1-py3-none-any.whl", hash = "sha256:d909fcccc110f8c7faf814ca82a9a4d816bc5a6dbfea25d6591d6985b8ba59ad", size = 73517, upload-time = "2024-12-06T15:37:21.509Z" },
 ]
 
-[package.optional-dependencies]
-http2 = [
-    { name = "h2" },
-]
-
 [[package]]
 name = "httpx2"
 version = "2.12.0"
@@ -2609,7 +2604,6 @@ source = { editable = "." }
 dependencies = [
     { name = "datasets" },
     { name = "gigatoken" },
-    { name = "httpx", extra = ["http2"] },
     { name = "huggingface-hub" },
     { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
     { name = "numpy", version = "2.5.2", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'emscripten' or sys_platform == 'win32'" },
@@ -2636,7 +2630,6 @@ dev = [
 requires-dist = [
     { name = "datasets", specifier = "==5.0.1" },
     { name = "gigatoken", specifier = "==0.10.0" },
-    { name = "httpx", extras = ["http2"], specifier = ">=0.28.1" },
     { name = "huggingface-hub", specifier = "==1.27.0" },
     { name = "numpy", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'", specifier = "==2.3.5" },
     { name = "numpy", marker = "sys_platform == 'emscripten' or sys_platform == 'win32'", specifier = "==2.5.2" },

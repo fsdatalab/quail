@@ -17,7 +17,6 @@ dependencies = [
     "datasets==5.0.1",
     # same version as the Modal image; vLLM has Linux wheels only
     "vllm==0.26.0; sys_platform == 'linux'",
-    "httpx[http2]>=0.28.1",
 ]
 
 [project.urls]

@@ -153,11 +153,13 @@ function call id before waiting for the query.
 read -s TYPESAFE_API_KEY
 export TYPESAFE_API_KEY
 
-uv run python demos/civil_comments/jev_backend.py \
+uv run --with 'httpx[http2]==0.28.1' \
+  python demos/civil_comments/jev_backend.py \
   --limit 10000 --concurrency 256 --strategy combined \
   --output results/civil-comments/jev/combined
 
-uv run python demos/civil_comments/jev_backend.py \
+uv run --with 'httpx[http2]==0.28.1' \
+  python demos/civil_comments/jev_backend.py \
   --limit 10000 --concurrency 256 --strategy pushdown \
   --output results/civil-comments/jev/pushdown
 ```

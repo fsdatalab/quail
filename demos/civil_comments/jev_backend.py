@@ -7,7 +7,8 @@ Set the API key without putting it on the command line, then run:
 
     read -s TYPESAFE_API_KEY
     export TYPESAFE_API_KEY
-    uv run python demos/civil_comments/jev_backend.py \
+    uv run --with 'httpx[http2]==0.28.1' \
+      python demos/civil_comments/jev_backend.py \
       --limit 10000 --concurrency 256 --strategy combined \
       2>&1 | tee /tmp/civil-comments-jev.log
 
