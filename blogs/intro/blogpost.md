@@ -400,7 +400,7 @@ Across the 29 queries with matching measurements at scale factor 0.1, Quail is f
 
 ### Per-query metrics table
 
-The table below reports all 32 queries with matching results at scale factor 0.1. SoL assumes zero KV regret. Costs use about $3.96 per H100-hour. BIO-4 at scale factor 0.1 is included here. Its scale factor 1.0 results are in Section 4.3.
+The table below reports all 31 queries with matching results in the scale factor 0.1 comparison. SoL assumes zero KV regret. Costs use about $3.96 per H100-hour. BIO-4 will return after its remade run lands in `comparison.json`. Its scale factor 1.0 results are in Section 4.3.
 
 ::: {.metrics-table}
 | query | method | tok_per_sec | kv_regret | cost_usd |
@@ -498,15 +498,12 @@ The table below reports all 32 queries with matching results at scale factor 0.1
 | LEP-8 | Quail | 101725.37 | 1702 | 0.0015 |
 | LEP-8 | vLLM | 59266.09 | 6065 | 0.0025 |
 | LEP-8 | SoL | 281667.61 | 0 | 0.0005 |
-| BIO-4 | Quail | 13739453.85 | 624144 | 0.0797 |
-| BIO-4 | vLLM | 2315627.52 | 3907993 | 0.4728 |
-| BIO-4 | SoL | 28579085.47 | 0 | 0.0383 |
 :::
 
 ::: {.figure-block .wide-figure}
 [![Average requested input token throughput by dataset for Quail, vLLM, and SoL.](figures/quailb_tok_per_sec.png){width=100%}](figures/quailb_tok_per_sec.pdf)
 
-*Figure 6. Average requested input tokens per second by dataset at scale factor 0.1, using Qwen3 4B FP8 on one H100. Bars show Quail and vLLM, while horizontal lines show SoL estimates. Dataset labels show the number of queries. BIO contains BIO-2 and BIO-4. BIO-1 and BIO-3 are missing because their old-filter runs have not been remade.*
+*Figure 6. Average requested input tokens per second by dataset at scale factor 0.1, using Qwen3 4B FP8 on one H100. Bars show Quail and vLLM, while horizontal lines show SoL estimates. Dataset labels show the number of queries. BIO currently contains only BIO-2. BIO-1 and BIO-3 are missing because their saved runs used the old filter. BIO-4 will return after its remade run lands in `comparison.json`.*
 :::
 
 For every method, throughput is the total requested input tokens divided by runtime. SoL uses the same requested-token total and its estimated runtime. The throughput figure is the headline comparison. Under this definition, vLLM is ahead on AGENT. The latency figure below keeps the per-query detail.

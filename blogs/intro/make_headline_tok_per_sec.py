@@ -88,10 +88,13 @@ def collect_rows(workdir: Path):
             }
         )
 
+    # BIO-4 only when present in comparison.json (same sf 0.1 suite).
+    # Do not side-load a separate bio4-sf01-*.json family here — that mixed
+    # a different run into the headline and looked like a scale mismatch.
     bio4_quail_path = workdir / "bio4-sf01-quail.json"
     bio4_vllm_path = workdir / "bio4-sf01-vllm.json"
     bio4_sol_path = workdir / "bio4-sf01-sol.json"
-    if bio4_quail_path.exists() and bio4_vllm_path.exists() and bio4_sol_path.exists():
+    if False and bio4_quail_path.exists() and bio4_vllm_path.exists() and bio4_sol_path.exists():
         quail_q = _load(bio4_quail_path)["queries"][0]
         vllm_q = _load(bio4_vllm_path)["queries"][0]
         sol_est = _load(bio4_sol_path)["estimate"]
