@@ -223,32 +223,29 @@ input and one prompt for each candidate report and reaction pair. We
 submit every prompt as a separate inference request. We place the
 document text at the beginning of each prompt, followed by the
 instruction from the AI-SQL operator. For each join, we place the much
-longer medical report first. We call the first document the
-<em>anchor</em> and the second document the <em>partner</em>. This order
-maximizes the number of prefix tokens whose key and value state, called
-KV, can be reused across join prompts.</p>
+longer medical report first as the <em>anchor</em> and the reaction term
+second as the <em>partner</em>. This order maximizes reuse of the
+prefix’s key and value state (KV) across join prompts.</p>
 <p><strong>A cost estimate for the query plan.</strong> Before measuring
 the vLLM baseline, we estimate the lowest possible runtime for the same
 plan. We count the model’s arithmetic work and HBM traffic from the
 token lengths, then use a <a
 href="https://modal.com/gpu-glossary/perf/roofline-model">roofline
-model</a> to estimate the time. HBM is the GPU’s main memory. The
-estimate uses the saved reference answers to determine which rows
-survive each stage. It assumes peak GPU throughput, full overlap between
-CPU and GPU work, and unlimited space for retained KV. No implementation
-can meet all of these assumptions. We call this lower bound the
-<em>speed of light estimate</em>, or SoL. For BIO-4 at scale factor 1.0,
-the SoL estimate is 894.37 seconds, or 14.91 minutes.<a href="#fn3"
-class="footnote-ref" id="fnref3" role="doc-noteref"><sup>3</sup></a> The
-<a
+model</a> to estimate the time. The estimate uses the saved reference
+answers to determine which rows survive each stage. It assumes peak GPU
+throughput, full overlap between CPU and GPU work, and unlimited space
+for retained KV. No implementation can meet all of these assumptions, so
+this optimistic lower bound is our <em>speed of light estimate</em>, or
+SoL. For BIO-4 at scale factor 1.0, the SoL estimate is 894.37 seconds,
+or 14.91 minutes.<a href="#fn3" class="footnote-ref" id="fnref3"
+role="doc-noteref"><sup>3</sup></a> The <a
 href="https://github.com/fsdatalab/quail-exploration/blob/0d24478a82100b518d6110f5c1c8cec0c26c6487/quail/planner/sol.py">implementation
 in Quail</a> contains the full calculation.</p>
 <p><strong>How we hoped vLLM would perform.</strong> Each request
 produces one token constrained to <code>TRUE</code> or
-<code>FALSE</code>, so almost all model work is prefill. Prefill is the
-model work that reads the input prompt before producing an answer. BIO-4
-provides millions of requests, so there should always be a large batch
-ready for the H100.</p>
+<code>FALSE</code>, so almost all model work is prefill. BIO-4 provides
+millions of requests, so there should always be a large batch ready for
+the H100.</p>
 <p><strong>How vLLM actually performs.</strong> We run vLLM 0.26.0 with
 Qwen3 4B FP8 on one H100. We give it enough batch capacity to use the
 GPU. The query takes 6.84 hours, or 27.55 times the SoL estimate. The
@@ -278,10 +275,8 @@ row are idle bubbles.</em></p>
 </div>
 <p>The corresponding Quail timeline appears with the BIO-4 experiments
 in Section 4.3.</p>
-<p>The second problem is repeated model work. A fresh input token is an
-input token that the model processes in a forward pass instead of
-reading its KV. When reusable KV is evicted and later computed again, we
-call those repeated tokens <em>KV regret</em>. On BIO-4, the vLLM
+<p>The second problem is <em>KV regret</em>: the model processes tokens
+again after their reusable KV has been evicted. On BIO-4, the vLLM
 baseline recomputes 50.3 million KV tokens.</p>
 <p>Quail addresses both problems together. Its query plan tells the
 execution engine which KV will be reused, and its larger planned batches
@@ -485,12 +480,11 @@ supports AI filters and joins, along with relational projections and
 <p>Users define each <a
 href="https://fsdatalab.github.io/quail/docs/user-guide/sql#ai-operators">AI
 operator</a> with a prompt and can provide optional planning
-information. For example, <code>selectivity</code> is the expected
-fraction of documents or document pairs that will pass. If it is
-omitted, the predicates are kept in their written order. For a join,
-<code>anchor</code> is the input placed first in the prompt for KV reuse
-across pairs. If it is omitted, the anchor is chosen during
-planning.</p>
+information. The optional <code>selectivity</code> gives the expected
+fraction of documents or document pairs that will pass; without it,
+Quail keeps predicates in their written order. For a join, the optional
+<code>anchor</code> chooses which input comes first in the prompt for KV
+reuse; without it, the planner chooses the anchor.</p>
 <p>Users can specify the model and GPU count. Quail currently supports
 Qwen3 4B FP8 and Qwen3 32B FP8 on H100 GPUs, but other models and
 hardware can be added through the extension interface.</p>
@@ -531,11 +525,10 @@ and selectivity, following extremely well-known prior work (<a
 href="https://dsf.berkeley.edu/jmh/miscpapers/sigmod93.pdf">Hellerstein
 and Stonebraker</a> et al.). For joins, we use a <a
 href="https://doi.org/10.1145/582095.582099">Selinger-style</a> search
-(i.e., System R) to choose the join order and anchor for each join. Our
-cost model is the speed-of-light estimate that we briefly referred to in
-Section 2. We will explain the calculation in a future post. For now,
-you can check out the <a
-href="https://github.com/fsdatalab/quail/tree/main/quail/cost">cost
+(i.e., System R) to choose the join order and anchor for each join. The
+cost model uses the speed-of-light estimate from Section 2. We will
+explain the calculation in a future post. For now, you can check out the
+<a href="https://github.com/fsdatalab/quail/tree/main/quail/cost">cost
 model code</a>.</p>
 <p><strong>Inference-specific query rewrites.</strong> After the SQL
 rewrites, we translate the logical plan into a DAG of physical
@@ -608,27 +601,25 @@ documents and join anchors across the GPUs, run them independently, and
 combine the results on the CPU.</p>
 <h3 id="inference-program">3.2.4 Inference program</h3>
 <p>During planning, Quail chooses which documents or document pairs
-require model evaluation. During execution, Quail follows an inference
-program for each model evaluation on the GPU. We use <em>inference
-program</em> to mean the ordered GPU operations for one model forward
-pass: embedding lookup, transformer layers, attention, matrix
-multiplication, and output scoring. Given token IDs and positions, plus
-KV page locations when reusable KV exists, Quail uses the program to
-produce <code>TRUE</code> or <code>FALSE</code> scores. Here, we first
-describe the interface between physical operators and the inference
-program, then how vLLM represents an inference program, and finally the
-changes we make to Quail’s inference program.</p>
+require model evaluation. During execution, each evaluation follows an
+<em>inference program</em>: embedding lookup, transformer layers,
+attention, matrix multiplication, and output scoring, in that order.
+Given token IDs and positions, plus KV page locations when reusable KV
+exists, Quail uses the program to produce <code>TRUE</code> or
+<code>FALSE</code> scores. Here, we first describe the interface between
+physical operators and the inference program, then how vLLM represents
+an inference program, and finally the changes we make to Quail’s
+inference program.</p>
 <p><strong>Physical operator interface.</strong> <code>AiFilter</code>
 and <code>AiJoin</code> may each invoke the model hundreds or thousands
 of times. For one such request, Quail passes token IDs and positions,
 plus KV page locations when reusable KV exists, to the inference
 program. Quail receives <code>TRUE</code> and <code>FALSE</code> scores
 in return.</p>
-<p><strong>vLLM’s inference program.</strong> vLLM is a general-purpose
-inference library designed to support many model architectures and
-hardware backends. As Figure 6 shows, vLLM can combine several sources
-of GPU code in one forward pass. vLLM JIT-compiles ordinary PyTorch
-operations with <a
+<p><strong>vLLM’s inference program.</strong> vLLM supports many model
+architectures and hardware backends. As Figure 6 shows, it can combine
+several sources of GPU code in one forward pass. vLLM JIT-compiles
+ordinary PyTorch operations with <a
 href="https://docs.vllm.ai/en/stable/design/torch_compile/"><code>torch.compile</code></a>
 and TorchInductor, and calls specialized kernels for operations such as
 attention and matrix multiplication. Before each forward pass, vLLM uses
@@ -751,13 +742,10 @@ are excluded.</li>
 computed by the model, ignoring tokens read from KV. For example, if the
 model computes a report’s tokens during the filter, then computes the
 same tokens again during the join, those tokens count twice.</li>
-<li><strong>KV regret.</strong> KV regret is the number of fresh input
-tokens beyond the minimum required when every distinct reusable token
-prefix is computed once. We identify prefixes by their tokens, even when
-they occur in different rows. For example, if two rows begin with the
-same 100 tokens and both prefixes are computed, the second 100 tokens
-are KV regret. KV regret is included in the fresh input token
-total.</li>
+<li><strong>KV regret.</strong> We count fresh input tokens beyond the
+minimum needed to compute each distinct reusable prefix once.
+Token-identical prefixes match across rows, and this repeated work is
+already included in fresh input tokens.</li>
 </ul>
 <h2 id="full-benchmark-results">4.2 Full benchmark results</h2>
 <p>Across the 29 queries with matching measurements at scale factor 0.1,
@@ -1500,12 +1488,11 @@ scale factor 1.0 results are in Section 4.3.</p>
 </table>
 </div>
 <p>Figure 1 shows the headline throughput comparison. For every method,
-throughput is the total requested input tokens divided by runtime. SoL
-uses the same requested-token total and its estimated runtime. On BIO,
-Quail averages about 11.5 million tokens per second, compared with 1.4
-million for vLLM and 24.7 million for SoL. Under this definition, vLLM
-is ahead on AGENT. The latency figure below keeps the per-query
-detail.</p>
+we divide total requested input tokens by runtime. SoL uses the same
+requested-token total and its estimated runtime. On BIO, Quail averages
+about 11.5 million tokens per second, compared with 1.4 million for vLLM
+and 24.7 million for SoL. Under this definition, vLLM is ahead on AGENT.
+The latency figure below keeps the per-query detail.</p>
 <div class="figure-block wide-figure">
 <p><a href="figures/quailb_latency.pdf"><img
 src="figures/quailb_latency.png" style="width:100.0%"
@@ -1525,7 +1512,7 @@ seconds. Quail takes 3.30 times the estimate in aggregate, compared with
 matching prefixes across different rows, so it recomputes 11.89 million
 KV tokens on each query. Section 4.4 examines AGENT-1.</p>
 <h2 id="bio-4-at-scale-factor-1.0">4.3 BIO-4 at scale factor 1.0</h2>
-<p>BIO-4 is the motivating query in this post. At scale factor 1.0, it
+<p>This post uses BIO-4 as its motivating query. At scale factor 1.0, it
 filters 5,000 medical reports and two aliases of 4,144 reaction terms.
 It then runs two joins over the surviving inputs.</p>
 <div class="figure-block wide-figure">
@@ -1680,10 +1667,10 @@ strategies.</p>
 <p><strong>Explore more physical plans for existing operators.</strong>
 For example, for filter operators, Quail currently evaluates predicates
 sequentially. Sequential execution is likely cheaper when an early
-filter is selective. With many low-selectivity filters, meaning most
-documents pass, treating the prompts as the other side of a join may be
-cheaper and could benefit from Quail’s join-specific attention. It would
-be interesting to formalize the tradeoff in the cost model.</p>
+filter is selective. When most documents pass many filters, treating the
+prompts as the other side of a join may be cheaper and could benefit
+from Quail’s join-specific attention. It would be interesting to
+formalize the tradeoff in the cost model.</p>
 <p><strong>Support more models and hardware.</strong> Quail currently
 supports Qwen3 4B FP8 and Qwen3 32B FP8 on H100 GPUs. We want to add
 more models, including hybrid models such as Qwen3.5 and Liquid models.
@@ -1763,12 +1750,11 @@ class="sourceCode sql"><code class="sourceCode sql"><span id="cb1-1"><a href="#c
 <span id="cb1-27"><a href="#cb1-27" aria-hidden="true" tabindex="-1"></a>        c.term</span>
 <span id="cb1-28"><a href="#cb1-28" aria-hidden="true" tabindex="-1"></a>      ));</span></code></pre></div>
 <a href="#fnref2" class="footnote-back" role="doc-backlink">↩︎</a></li>
-<li id="fn3"><p><em>Model FLOP/s utilization (MFU)</em> is the fraction
-of the GPU’s peak arithmetic throughput used during a model forward
-pass. The speed of light estimate assumes 100 percent MFU. That is not
-realistic, but we should still try to get as close as possible. We do
-not yet measure Quail’s MFU.<a href="#fnref3" class="footnote-back"
-role="doc-backlink">↩︎</a></p></li>
+<li id="fn3"><p>The speed of light estimate assumes 100 percent model
+FLOP/s utilization (MFU), so every forward pass sustains peak GPU
+arithmetic throughput. Real systems cannot reach that rate, but higher
+MFU still helps. We do not yet measure Quail’s MFU.<a href="#fnref3"
+class="footnote-back" role="doc-backlink">↩︎</a></p></li>
 <li id="fn4"><p>Modal provides useful background on <a
 href="https://modal.com/blog/gpu-utilization-guide">GPU utilization</a>
 and <a
@@ -1787,9 +1773,9 @@ cached rate to 8.41 million document tokens reused by the second filter,
 and the output rate to 200,000 tokens. We assume an infinite cache, so
 every reusable document token receives the cached rate.<a href="#fnref6"
 class="footnote-back" role="doc-backlink">↩︎</a></p></li>
-<li id="fn7"><p><a
-href="https://github.com/marcelroed/gigatoken">Gigatoken</a> is a fast
-tokenizer by Marcel Rød.<a href="#fnref7" class="footnote-back"
+<li id="fn7"><p>Marcel Rød built the fast <a
+href="https://github.com/marcelroed/gigatoken">Gigatoken</a>
+tokenizer.<a href="#fnref7" class="footnote-back"
 role="doc-backlink">↩︎</a></p></li>
 <li id="fn8"><p>Kernel fusion can substantially improve prefill MFU. In
 <a href="https://www.sailresearch.com/blog/tpu-v6e-gemma">“Chasing Speed
