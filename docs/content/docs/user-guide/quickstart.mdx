@@ -11,7 +11,7 @@ pip install quail-engine
 Quail requires Python 3.12 and a CUDA GPU (local or on
 [Modal](/docs/user-guide/models#no-local-gpu-use-modal)).
 
-## Run a filter query with SQL
+## Run an AI filter
 
 This example filters the 100,000 movie reviews in the
 [Stanford IMDB dataset](https://huggingface.co/datasets/stanfordnlp/imdb)
@@ -39,13 +39,59 @@ with quail.Session(config=config) as session:
         WHERE AI_FILTER(PROMPT(
             'Does this review mention a positive aspect of the movie?\n\n{0}',
             r.body))
-    """, dialect="snowflake").collect()
-    print(result)
+    """, dialect="snowflake").run()
+    table = result.collect()
+    print(table)
 ```
 
 `session.register()` makes the dataset available under a SQL name.
 `AI_FILTER` evaluates the prompt on each review. The model returns
 TRUE or FALSE, and Quail returns the rows where the answer is TRUE.
+
+The output is a PyArrow table with the matching rows:
+
+```
+pyarrow.Table
+r.id: string
+----
+r.id: [["review-0","review-3","review-7",...]]
+```
+
+## See the plan and measured cost
+
+Call `explain(analyze=True)` to run the query and print the plan
+together with measured time, token counts, and GPU cost:
+
+```python
+with quail.Session(config=config) as session:
+    session.register("reviews", quail.DocumentProvider.from_dataset(reviews, id_col="id"))
+    query = session.sql("""
+        SELECT r.id
+        FROM reviews r
+        WHERE AI_FILTER(PROMPT(
+            'Does this review mention a positive aspect of the movie?\n\n{0}',
+            r.body))
+    """, dialect="snowflake")
+    print(query.explain(analyze=True))
+```
+
+The output shows the logical and physical plan, followed by the
+measured totals:
+
+```
+run:
+  query time   52.3 s (model startup excluded)
+  startup      14.1 s (cold)
+  throughput   34,600 documents/second over 100,000 input documents
+  tokens       8,123,456 fresh
+  GPU cost     $0.0574 per query (1 GPU at $3.9492/hour, startup excluded)
+```
+
+The GPU cost line is the query runtime in hours multiplied by the
+number of GPUs and the
+[Modal H100 hourly price](https://modal.com/pricing) ($3.9492/hour).
+Startup is excluded from both query time and cost. A 100K-document
+filter on Qwen3 4B typically costs a few cents per query.
 
 ## Python builder API
 
@@ -77,3 +123,10 @@ reference.
 If you do not have a local GPU, you can run queries on Modal.
 See [No local GPU? Use Modal](/docs/user-guide/models#no-local-gpu-use-modal)
 for how to set up the function, volumes, and caches.
+
+Modal bills per second of GPU time. An H100 costs $3.9492/hour.
+A single AI filter over 100K documents on Qwen3 4B takes roughly
+a minute of GPU time, so one query costs about $0.05 to $0.07.
+Model startup adds 10 to 30 seconds on a cold start; subsequent
+queries on a warm function skip that. Use `explain(analyze=True)`
+to see the exact cost of any query.
