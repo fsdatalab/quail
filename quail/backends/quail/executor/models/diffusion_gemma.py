@@ -113,7 +113,8 @@ class DiffusionGemmaPipeline(ModelPipeline):
         self.experts = [FP8Experts(layer.moe.experts, self.engine)
                         if layer.enable_moe_block else None
                         for layer in self.layers]
-        self.vision = (vision_class(self.engine.torch, model)
+        self.vision = (vision_class(self.engine.torch, model,
+                                    reserve_bytes=spec.image_reserve_bytes)
                        if getattr(model, "vision_tower", None) is not None
                        else None)
         self.takes_images = self.vision is not None

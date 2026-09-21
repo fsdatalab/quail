@@ -385,7 +385,7 @@ def _spec_for(model, **overrides):
                   sliding_window=model.model.config.sliding_window,
                   n_q=attn.num_heads, n_kv=attn.num_kv_heads,
                   head_dim=attn.head_dim, d_head=attn.head_dim,
-                  widest_projection=32)
+                  widest_projection=32, image_reserve_bytes=0.0)
     fields.update(overrides)
     return SimpleNamespace(**fields)
 
@@ -480,7 +480,8 @@ def test_pipeline_embeds_images_and_runs_blocks_on_sliding_layers(monkeypatch):
     model.embed_multimodal = embed_multimodal
     pipeline = DiffusionGemmaPipeline(
         model, None, spec=_spec_for(model), engine_class=_Engine,
-        vision_class=lambda torch_, m: VisionEmbedder(torch_, m, device="cpu"))
+        vision_class=lambda torch_, m, **kw: VisionEmbedder(
+            torch_, m, device="cpu", **kw))
     assert pipeline.takes_images
     # rows: [start, soft, soft, end, question] for one document
     patches = np.full((36, 3 * 16 * 16), 51, dtype=np.uint8)
@@ -517,6 +518,48 @@ def test_pipeline_embeds_images_and_runs_blocks_on_sliding_layers(monkeypatch):
     chunk.images = (ChunkImage(1, 3, page),)
     with pytest.raises(RuntimeError, match="reserved 3"):
         pipeline.forward_chunk(chunk)
+
+
+def test_vision_embedder_runs_pages_through_the_tower_within_its_reserve():
+    """Pages split into tower calls whose patches fit the reserve; order holds."""
+    import numpy as np
+    torch = pytest.importorskip("torch")
+
+    from quail.backends.quail.executor.attention import ChunkImage
+    from quail.backends.quail.executor.models.vision import (
+        ACTIVATION_BYTES_PER_PATCH,
+        VisionEmbedder,
+        embed_runs,
+    )
+    from quail.pdf.prefetch import RenderedPage
+
+    calls = []
+
+    def embed_multimodal(*, pixel_values, pixel_position_ids):
+        calls.append(len(pixel_values))
+        return [torch.full((1, 2), float(values[0, 0] * 255))
+                for values in pixel_values]
+
+    model = SimpleNamespace(vision_tower=object(),
+                            embed_multimodal=embed_multimodal)
+    pages = [RenderedPage(i, (2, 2), np.full((4, 768), i, dtype=np.uint8), 0.0)
+             for i in range(5)]
+    images = [ChunkImage(i, 1, page) for i, page in enumerate(pages)]
+    # a budget of nine patches holds two 4-patch pages per run: 2, 2, 1
+    assert [len(run) for run in embed_runs(images, 9)] == [2, 2, 1]
+    # a page over the budget still embeds, alone
+    assert [len(run) for run in embed_runs(images, 3)] == [1] * 5
+
+    embedder = VisionEmbedder(torch, model, device="cpu",
+                              reserve_bytes=9 * ACTIVATION_BYTES_PER_PATCH)
+    assert embedder.patch_budget == 9
+    out = embedder.embed(images)
+    assert calls == [2, 2, 1] and embedder.embed_calls == 3
+    assert torch.allclose(out[:, 0], torch.arange(5, dtype=torch.float32))
+    # no reserve: one call for the whole chunk
+    calls.clear()
+    VisionEmbedder(torch, model, device="cpu").embed(images)
+    assert calls == [5]
 
 
 def _vllm_stubs(monkeypatch, workspace_ready=True):
