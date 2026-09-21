@@ -3,10 +3,22 @@ title: Benchmarks
 ---
 
 [QUAIL-B](https://github.com/fsdatalab/quail-bench) is a benchmark of
-AI-SQL filter and join queries over five datasets (IMDB, BioDEX,
-FEVER, LEP, SWE-agent traces). It currently has 33 queries at three
-scale factors (0.1, 0.5, 1.0). We are actively adding queries and
-datasets.
+AI-SQL filter and join queries over six datasets at three scale
+factors (0.1, 0.5, 1.0). It has 30+ queries. We are actively adding
+queries and datasets.
+
+| Family | Dataset | Queries |
+| --- | --- | --- |
+| IMDB | [stanfordnlp/imdb](https://huggingface.co/datasets/stanfordnlp/imdb) | 10 |
+| BIO | [BioDEX/BioDEX-Reactions](https://huggingface.co/datasets/BioDEX/BioDEX-Reactions) | 4 |
+| FEV | [fever/fever](https://huggingface.co/datasets/fever/fever) | 10 |
+| LEP | [rmahari/LePaRD](https://huggingface.co/datasets/rmahari/LePaRD) | 5 |
+| AGENT | [TIGER-Lab/SWE-Next-SFT-Trajectories](https://huggingface.co/datasets/TIGER-Lab/SWE-Next-SFT-Trajectories) | 2 |
+| PRIV | [mukund/PrivacyPolicies](https://huggingface.co/datasets/mukund/PrivacyPolicies) | 2 |
+
+PRIV queries are optional and run at larger scale. Pass `--privacy`
+to include them. The query count tracks the pinned `quail_b` version
+in `pyproject.toml`.
 
 ## Run a query
 

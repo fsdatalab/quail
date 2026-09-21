@@ -33,12 +33,12 @@ Project: r.id, a.aspect
 ```
 
 **Physical plan** shows what the execution engine will do: the
-model and token budgets, then one row per operator with the
-planner's estimates in columns to the right. Predicate rows sit under
-the filter or join that runs them, numbered by their position in the
-query text, so `predicate 2` is the second `AI_FILTER` you wrote. When
-the planner runs them in a different order, each row says which runs
-first.
+model and token budgets, then one line per operator with the
+planner's estimates in columns to the right. Each `AI_FILTER` or
+join predicate is listed under the operator that runs it, numbered
+by its position in the query text (`predicate 2` is the second
+`AI_FILTER` you wrote). When the planner reorders them, the output
+says which runs first.
 
 ```text
 physical: backend=quail, model=qwen3-4b-fp8, workers=1
@@ -57,26 +57,26 @@ physical: backend=quail, model=qwen3-4b-fp8, workers=1
 
 <Callout type="info">
 The time estimates assume peak GPU throughput with no host overhead.
-Actual runtimes are longer because of kernel launch latency, memory
-allocation, and scheduling. Use `explain(analyze=True)` on a GPU to
-see measured times next to the estimates.
+Actual runtimes are longer, for many reasons, such as kernel launch
+latency and low MFU. Use `explain(analyze=True)` on a GPU to see
+measured times next to the estimates. We are working on better
+latency estimates.
 </Callout>
 
-For an operator row, `est. rows` is how many rows the planner expects
-it to produce. For a predicate row, it is how many documents or pairs
-the planner expects to reach that predicate, and `est. pass` is the
-selectivity it was planned with. A selectivity you did not give shows
-as `20%*`, with a footnote.
+On an operator line, `est. rows` is how many rows the planner expects
+it to produce. On a predicate line, `est. rows` is how many documents
+or pairs the planner expects to reach that predicate, and `est. pass`
+is the selectivity it planned with. A selectivity you did not set
+shows as `20%*`, with a footnote.
 
 `explain(verbose=True)` adds node ids, port connections, KV retention
 decisions, and planner remarks.
 
 ## Measure the plan
 
-`explain(analyze=True)` works like `EXPLAIN ANALYZE` in DataFusion or
-PostgreSQL: it runs the query, then prints the same table with a
-measured column next to each estimate, followed by the totals of the
-run.
+`explain(analyze=True)` works like `EXPLAIN ANALYZE` in a database:
+it runs the query, then prints actual rows, time, and tokens next to
+each estimate, followed by the query time, throughput, and GPU cost.
 
 ```python
 print(query.explain(analyze=True))
@@ -101,19 +101,24 @@ run:
   GPU cost     $0.0011 per query (1 GPU at $3.9492/hour, startup excluded)
 ```
 
-Read each pair of columns together: `est. rows` against `rows`,
-`est. pass` against `pass`, `est. time` against `time`. On a predicate
-row, `rows` is how many documents or pairs the model evaluated and
-`pass` is the fraction that came back true. A large gap between
-`est. pass` and `pass` is the usual reason a plan's order or its
-estimated time was off. `fresh tokens` counts the input tokens a
-model node processed in forward passes.
+Here is how to read the table:
 
-`explain(analyze=True, verbose=True)` adds every measured field of
-each node, including KV hits and misses and GPU seconds.
+- Each `est.` column is what the planner predicted. The column next
+  to it is what actually happened. Compare `est. rows` with `rows`,
+  `est. pass` with `pass`, `est. time` with `time`.
+- `rows` on a filter or join line is how many documents or pairs the
+  model evaluated. `pass` is the fraction that returned TRUE.
+- When `est. pass` and `pass` are far apart, the planner's
+  selectivity guess was wrong. That is the most common reason
+  a plan takes longer than its estimate.
+- `fresh tokens` is the total input tokens the model processed in
+  forward passes for that operator.
 
-The query runs once for the measurement. To keep the rows as well,
-run it yourself and ask the result for the measured table:
+`explain(analyze=True, verbose=True)` adds more detail per operator,
+including KV hits, KV misses, and GPU seconds.
+
+The query runs once for the measurement. To keep the result rows too,
+run the query yourself and print the plan from the result:
 
 ```python
 result = query.run()

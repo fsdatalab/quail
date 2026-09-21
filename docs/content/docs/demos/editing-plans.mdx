@@ -65,9 +65,10 @@ would execute the query:
 
 <Callout type="info">
 The time estimates assume peak GPU throughput with no host overhead.
-Actual runtimes are longer because of kernel launch latency, memory
-allocation, and scheduling. Use `explain(analyze=True)` on a GPU to
-see measured times next to the estimates.
+Actual runtimes are longer, for many reasons, such as kernel launch
+latency and low MFU. Use `explain(analyze=True)` on a GPU to see
+measured times next to the estimates. We are working on better
+latency estimates.
 </Callout>
 
 ```text
