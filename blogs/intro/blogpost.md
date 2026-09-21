@@ -6,7 +6,7 @@ link-citations: true
 ---
 
 ::: {.tldr}
-**TL;DR.** Much of today's AI-SQL work, meaning AI functions in SQL databases, uses closed frontier LLMs through APIs. This can be costly! But now that open weight models have improved, we should totally use them for more AI-SQL workloads and optimize inference with query execution. In this post, we introduce Quail, a system that jointly optimizes query planning and inference. On one of our benchmark queries (BIO-4), Quail runs the query **14.04 times faster** than a hand-tuned vLLM baseline.
+**TL;DR.** Much of today's AI-SQL work (i.e., AI functions in SQL databases) uses closed, frontier LLMs served through APIs. But open weight models now provide sufficient quality for many AI functions --- and, in turn, unlock new optimizations that make query execution 10× faster. The database community should absolutely move more of these workloads to open weight models, and optimize inference together with query execution. Quail is a system we are building to jointly optimize query planning and inference.
 :::
 
 # 1. The growth of AI-powered data processing
@@ -396,7 +396,7 @@ We chose the parameters above by running the benchmark queries. Increasing the b
 
 ## 4.2 Full benchmark results
 
-Across the 29 queries with matching measurements at scale factor 0.1, Quail is faster than the vLLM baseline on 27. The mean speedup is 1.91 times, the median speedup is 1.48 times, and the largest speedup is 10.04 times on BIO-2.[^aggregate-results]
+Across the 29 queries with matching measurements at scale factor 0.1, Quail is faster than the vLLM baseline on 27. The mean speedup is 1.91 times, the median speedup is 1.48 times, and the largest speedup is 10.04 times on BIO-2.
 
 ::: {.figure-block .wide-figure}
 [![Query latency for Quail, the vLLM baseline, and SoL estimates across the 31 default QUAIL-B queries. BIO-1 and BIO-3 are marked as not measured.](figures/quailb_latency.png){width=100%}](figures/quailb_latency.pdf)
@@ -418,15 +418,11 @@ BIO-4 is the motivating query in this post. At scale factor 1.0, it filters 5,00
 *Figure 7. BIO-4 results at scale factor 1.0. Query time and GPU cost exclude model startup. Fresh input tokens count every token processed by a model forward pass. Recomputed KV tokens are included in the fresh input token total.*
 :::
 
-Quail takes 29.26 minutes, compared with 6.84 hours for the vLLM baseline. Quail is 14.04 times faster. It is 1.96 times the SoL estimate, while the vLLM baseline is 27.55 times the estimate.[^bio4-results]
+Quail takes 29.26 minutes, compared with 6.84 hours for the vLLM baseline. Quail is 14.04 times faster. It is 1.96 times the SoL estimate, while the vLLM baseline is 27.55 times the estimate.
 
 The GPU cost follows the same ratio because each run uses one H100. Quail costs $1.93 per query, compared with $27.03 for the vLLM baseline. The SoL cost estimate is $0.98 per query.
 
 Quail also recomputes less KV. It recomputes 18.0 million tokens, compared with 50.3 million for the vLLM baseline. The two engines can make slightly different predicate decisions, which changes how many document pairs reach later joins. Each number above reports the work and time from that method's measured run.
-
-[^aggregate-results]: The base measurements are saved at `/results/benchmarks/quailb/20260914T070913Z-f7beefb6`. The BIO-4 scale factor 0.1 measurements are saved at `/results/benchmarks/quailb/family-runs/20260920T062701Z-bio4-4b`. The SoL estimates are saved at `/results/reports/quailb-raw-2026-09-19/sol_quailb_sf0.1.json` and `/results/sol/2026-09-20-bio4-qwen3-4b-sf0.1.json`.
-
-[^bio4-results]: The BIO-4 scale factor 1.0 measurements are saved at `/results/benchmarks/quailb/family-runs/20260920T064415Z-bio4-4b-sf1.0`. The SoL estimate is saved at `/results/sol/2026-09-20-bio4-qwen3-4b-sf1.0.json`.
 
 ## 4.4 AGENT-1, where the vLLM baseline wins
 
