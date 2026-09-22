@@ -70,7 +70,8 @@ def _execute_physical(request, registry):
     return response
 
 
-def execute_query(query, physical_executor=None, plan=None):
+def execute_query(query, physical_executor=None, plan=None,
+                  on_execution_ready=None):
     """Execute one query in its session's process.
 
     Args:
@@ -78,6 +79,8 @@ def execute_query(query, physical_executor=None, plan=None):
         physical_executor: Optional callable(PhysicalRequest) that
             returns the PhysicalResponse, for tests without a GPU.
         plan: An edited PhysicalPlan to run instead of the planner's.
+        on_execution_ready: Optional callback after backend preparation and
+            immediately before query execution.
     """
     total_started = time.perf_counter()
     if plan is not None:
@@ -104,6 +107,8 @@ def execute_query(query, physical_executor=None, plan=None):
         # Backend startup must not wait for background tokenization.
         _prepare_backend(plan, query.session.registry)
     request = query._prepare_physical()
+    if on_execution_ready is not None:
+        on_execution_ready()
     started = time.perf_counter()
     response = (
         physical_executor(request) if physical_executor is not None

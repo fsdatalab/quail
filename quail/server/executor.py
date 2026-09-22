@@ -120,15 +120,21 @@ def run_job(job: Job, emit: Emit, hooks: Hooks | None = None) -> None:
                     **job.model_phase,
                     "recorded_at": time.time(),
                 })
-            emit("state", {
-                "state": "running",
-                "phase": phase_event("executing", "Executing the query"),
-            })
             set_progress_sink(progress)
             set_answer_sink(answers)
             try:
+                def execution_ready():
+                    emit("state", {
+                        "state": "running",
+                        "phase": phase_event(
+                            "executing", "Executing the query"),
+                    })
+
                 result = execute_query(
-                    query, physical_executor=hooks.physical_executor)
+                    query,
+                    physical_executor=hooks.physical_executor,
+                    on_execution_ready=execution_ready,
+                )
                 manifest = write_result(result, job.artifact_dir)
             finally:
                 set_progress_sink(None, owner=progress)
