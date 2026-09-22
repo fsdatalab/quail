@@ -50,7 +50,7 @@
   }
   .brand {
     color: var(--foreground);
-    font: 600 1.15rem/1 var(--font-serif);
+    font: 500 .9rem/1 var(--font-sans);
     text-decoration: none;
   }
   .nav-link {
@@ -62,11 +62,11 @@
   main {
     width: min(100% - 2.5rem, 68rem);
     margin: 0 auto;
-    padding: 3rem 0 5rem;
+    padding: 3rem 0 6rem;
   }
   h1 {
-    margin: 0 0 2rem;
-    font: 500 clamp(1.9rem, 4vw, 2.5rem)/1.25 var(--font-serif);
+    margin: 0 0 1.5rem;
+    font: 600 2rem/1.3 var(--font-serif);
     overflow-wrap: anywhere;
   }
   h1 code {
@@ -74,8 +74,8 @@
     font: 400 .72em/1.25 var(--font-mono);
   }
   h2 {
-    margin: 2.5rem 0 .7rem;
-    font: 500 1.35rem/1.4 var(--font-serif);
+    margin: 2.75rem 0 .75rem;
+    font: 600 1.45rem/1.4 var(--font-serif);
   }
   p { margin: .7rem 0; }
   code, pre { font: .8125rem/1.6 var(--font-mono); }
@@ -87,7 +87,8 @@
     overflow: auto;
     border: 1px solid var(--border);
     border-radius: .5rem;
-    background: var(--subtle);
+    background: var(--card);
+    box-shadow: 0 1px 2px rgb(0 0 0 / 4%);
     white-space: pre;
   }
   .table-wrap {
@@ -97,7 +98,6 @@
     border-radius: .5rem;
   }
   table { width: 100%; border-collapse: collapse; font-size: .875rem; }
-  .query-table { min-width: 60rem; }
   .result-table { min-width: 36rem; }
   td, th {
     padding: .8rem 1rem;
@@ -113,20 +113,50 @@
     font-weight: 500;
   }
   tbody tr:hover { background: var(--card); }
-  .query-row { cursor: pointer; }
-  .query-row:focus-visible {
+  .query-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: .7rem;
+    margin-top: 1.25rem;
+  }
+  .query-card {
+    display: block;
+    min-width: 0;
+    padding: 1rem 1.05rem;
+    border: 1px solid var(--border);
+    border-radius: .5rem;
+    background: var(--card);
+    box-shadow: 0 1px 2px rgb(0 0 0 / 3%);
+    color: var(--foreground);
+    text-decoration: none;
+  }
+  .query-card:hover {
+    border-color: #bdbdbd;
+    text-decoration: none;
+  }
+  .query-card:focus-visible {
     outline: 2px solid var(--primary);
-    outline-offset: -2px;
+    outline-offset: 2px;
   }
-  .query-table td:first-child,
-  .query-table td:nth-child(2),
-  .query-table td:nth-child(4),
-  .query-table td:nth-child(5),
-  .query-table td:last-child {
-    white-space: nowrap;
+  .query-card-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 1rem;
   }
-  .query-link { font-weight: 500; text-decoration: none; }
-  .query-link:hover { text-decoration: underline; }
+  .query-card code {
+    color: var(--primary);
+    font-weight: 500;
+  }
+  .query-card-phase { margin: .55rem 0 .8rem; }
+  .query-card-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .15rem .85rem;
+    margin: 0;
+    color: var(--muted);
+    font-size: .78rem;
+  }
   .status-line {
     display: flex;
     flex-wrap: wrap;
@@ -177,10 +207,15 @@
     margin: 0 0 .8rem;
     font: 500 1.2rem/1.5 var(--font-serif);
   }
-  .meta {
+  .meta-list {
     max-width: 60rem;
-    margin-bottom: 1.8rem;
-    font-size: .8125rem;
+    margin: .65rem 0 1.8rem;
+    padding-left: 1.25rem;
+    list-style: disc;
+  }
+  .meta-list li {
+    margin: .3rem 0;
+    padding-left: .1rem;
   }
   .progress-copy {
     display: flex;
@@ -225,20 +260,12 @@
     border-radius: .5rem;
     text-align: center;
   }
-  footer {
-    width: min(100% - 2.5rem, 68rem);
-    margin: 0 auto;
-    padding: 1.5rem 0 2rem;
-    border-top: 1px solid var(--border);
-    color: var(--muted);
-    font-size: .75rem;
-  }
   @media (max-width: 40rem) {
-    .site-header-inner, main, footer { width: min(100% - 2rem, 68rem); }
+    .site-header-inner, main { width: min(100% - 2rem, 68rem); }
     main { padding: 2.5rem 0 4rem; }
-    h1 { margin-bottom: 2rem; }
+    h1 { font-size: 1.75rem; }
+    .query-grid { grid-template-columns: 1fr; }
     td, th { padding: .7rem .75rem; }
-    .meta { line-height: 1.8; }
   }
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; }
@@ -256,7 +283,6 @@
   <h1 id="title">Quail query</h1>
   <div id="view" aria-live="polite"></div>
 </main>
-<footer>Quail · Query-aware inference</footer>
 <script>
 const parts = location.pathname.split("/").filter(Boolean);
 const queryId = parts[0] === "queries" ? parts[1] : null;
@@ -330,38 +356,31 @@ function fileLink(path, filename) {
 function renderList(items) {
   document.getElementById("title").textContent = "Queries";
   document.title = "Queries · Quail";
-  const table = el("table", { class: "query-table" },
-    el("thead", {}, el("tr", {},
-    el("th", {}, "Id"), el("th", {}, "State"),
-    el("th", {}, "Phase"), el("th", {}, "Created"),
-    el("th", {}, "Model"), el("th", {}, "Rows"))), el("tbody"));
-  const body = table.querySelector("tbody");
+  const cards = [];
   for (const item of items) {
     const href = "/queries/" + item.id;
-    const open = () => { location.href = href; };
-    body.append(el("tr", {
-      class: "query-row", tabindex: "0", role: "link",
-      "aria-label": `Open query ${item.id}`,
-      onclick: open,
-      onkeydown: event => {
-        if (event.key === "Enter" || event.key === " ") open();
-      }
+    const model = item.config && item.config.model
+      ? item.config.model : "Not available";
+    const rows = item.result ? item.result.rows.toLocaleString() : "—";
+    cards.push(el("a", {
+      href, class: "query-card", "aria-label": `Open query ${item.id}`
     },
-      el("td", {}, el("a", {
-        href, class: "query-link"
-      }, el("code", {}, item.id))),
-      el("td", {}, el("span", { class: "state " + item.state },
+    el("div", { class: "query-card-header" },
+      el("code", {}, item.id),
+      el("span", { class: "state " + item.state },
         sentenceCase(item.state))),
-      el("td", {}, item.phase ? item.phase.message : ""),
-      el("td", {}, when(item.created_at)),
-      el("td", {}, item.config && item.config.model ? item.config.model : ""),
-      el("td", {}, item.result ? String(item.result.rows) : "")));
+    el("p", { class: "query-card-phase" },
+      item.phase ? item.phase.message : "No phase reported"),
+    el("p", { class: "query-card-meta" },
+      el("span", {}, `Created ${when(item.created_at)}`),
+      el("span", {}, `Model ${model}`),
+      el("span", {}, `Rows ${rows}`))));
   }
   view.replaceChildren(items.length
     ? el("div", {},
       el("p", { class: "muted" },
         "All queries on this server. Updates every 5 seconds."),
-      el("div", { class: "table-wrap" }, table))
+      el("div", { class: "query-grid" }, ...cards))
     : el("p", { class: "muted empty" }, "No queries yet."));
 }
 
@@ -404,12 +423,18 @@ async function renderStatus(status) {
   if (status.phase) {
     nodes.push(el("p", { class: "phase" }, status.phase.message));
   }
-  nodes.push(el("p", { class: "muted meta" },
-    `model ${status.config.model} on ${status.config.device} ` +
-    `(${status.config.gpus} GPU, backend ${status.config.backend}), ` +
-    `timeout ${status.timeout_s} s, created ${when(status.created_at)}` +
-    (status.started_at ? `, started ${when(status.started_at)}` : "") +
-    (status.session_id ? `, session ${status.session_id}` : "")));
+  const details = [
+    `Model ${status.config.model}`,
+    `Device ${status.config.device}`,
+    `${status.config.gpus} GPU, ${status.config.backend} backend`,
+    `Created ${when(status.created_at)}`,
+    `Timeout ${status.timeout_s} seconds`,
+  ];
+  if (status.started_at) details.push(`Started ${when(status.started_at)}`);
+  if (status.session_id) details.push(`Session ${status.session_id}`);
+  nodes.push(el("h2", {}, "Run details"),
+    el("ul", { class: "meta-list" },
+      ...details.map(detail => el("li", {}, detail))));
   if (status.progress && status.progress.label) {
     const p = status.progress;
     const text = p.total ? `${p.done.toLocaleString()} / ${p.total.toLocaleString()} ${p.unit}`
@@ -435,8 +460,8 @@ async function renderStatus(status) {
     nodes.push(el("h2", {}, "Error"), el("pre", {}, `${status.error.type}: ${status.error.message}`));
   }
   if (status.result) {
-    nodes.push(el("h2", {}, `Result: ${status.result.rows.toLocaleString()} rows`),
-      el("p", {},
+    nodes.push(el("h2", {}, "Result"),
+      el("p", {}, `${status.result.rows.toLocaleString()} rows. `,
         fileLink(`/v1/queries/${status.id}/result`, "result.arrows"), " · ",
         fileLink(`/v1/queries/${status.id}/files/report.json`, "report.json")),
       await preview(status));
