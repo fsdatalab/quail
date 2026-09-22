@@ -163,14 +163,17 @@ A compiled query bound to the session that parsed it.
   type={{
     session: {
       type: 'Session',
+      required: true,
       description: 'The Session that compiled this query.',
     },
     logical: {
       type: 'LogicalPlan',
+      required: true,
       description: 'The compiled logical plan.',
     },
     order: {
       type: 'str | None',
+      required: true,
       description:
         'Predicate order passed to sql, or None when the planner chooses the order.',
     },
@@ -312,14 +315,17 @@ asks for them.
   type={{
     schema: {
       type: 'pyarrow.Schema',
+      required: true,
       description: 'Arrow schema of the output columns.',
     },
     columns: {
       type: 'list[str]',
+      required: true,
       description: 'Output column names, in order.',
     },
     report: {
       type: 'dict',
+      required: true,
       description: (
         <>
           Execution metrics. The fields are on the{' '}
@@ -329,15 +335,18 @@ asks for them.
     },
     plan: {
       type: 'PhysicalPlan | None',
+      required: true,
       description:
         'The physical plan that ran. None until a plan was executed and decoded.',
     },
     node_metrics: {
       type: 'dict',
+      required: true,
       description: 'Measured metrics keyed by node id.',
     },
     answer_tables: {
       type: 'dict',
+      required: true,
       description:
         "Per-predicate Arrow tables. filters is keyed by (alias, position). joins is keyed by the join's position in the query text.",
     },

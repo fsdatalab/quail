@@ -242,18 +242,22 @@ the plan text is on the record at `QueryStatus.plan["text"]`.
   type={{
     session: {
       type: 'Session',
+      required: true,
       description: 'The Session that created this query.',
     },
     sql: {
       type: 'str',
+      required: true,
       description: 'The statement text.',
     },
     dialect: {
       type: "'bq' | 'snowflake'",
+      required: true,
       description: 'The SQL dialect.',
     },
     order: {
       type: 'str | None',
+      required: true,
       description: 'Predicate order passed to sql, or None.',
     },
   }}
@@ -397,6 +401,7 @@ already there.
   type={{
     id: {
       type: 'str',
+      required: true,
       description: 'The query id.',
     },
   }}
@@ -604,10 +609,12 @@ and the answer tables again and checked the result's row count.
   type={{
     id: {
       type: 'str',
+      required: true,
       description: 'The query id.',
     },
     state: {
       type: 'str',
+      required: true,
       typeDescription:
         "'queued' | 'planning' | 'running' | 'succeeded' | 'failed' | 'interrupted' | 'cancelled'",
       description:
@@ -615,72 +622,88 @@ and the answer tables again and checked the result's row count.
     },
     revision: {
       type: 'int',
+      required: true,
       description: 'Integer that increases on every write.',
     },
     created_at: {
       type: 'float',
+      required: true,
       description: 'Unix seconds when the record was saved.',
     },
     updated_at: {
       type: 'float',
+      required: true,
       description: 'Unix seconds of the latest write.',
     },
     started_at: {
       type: 'float | None',
+      required: true,
       description:
         'Unix seconds when the record left queued, or None while it is still queued.',
     },
     timeout_s: {
       type: 'float',
+      required: true,
       description: 'Execution limit in seconds.',
     },
     session_id: {
       type: 'str | None',
+      required: true,
       description: 'The client session that submitted the record, or None.',
     },
     cancel_requested: {
       type: 'bool',
+      required: true,
       description: 'True after a cancel request has been recorded.',
     },
     phase: {
       type: 'dict | None',
+      required: true,
       description: 'The current durable step. Keys are below.',
     },
     spec: {
       type: 'dict',
+      required: true,
       description: 'The SQL submission. Keys are below.',
     },
     config: {
       type: 'dict',
+      required: true,
       description: 'The engine config. Keys are below.',
     },
     inputs: {
       type: 'dict',
+      required: true,
       description:
         'Registered table name to the stored input description. Shapes are below.',
     },
     progress: {
       type: 'dict | None',
+      required: true,
       description:
         'The latest engine count, or None before the first one. Keys are below.',
     },
     plan: {
       type: 'dict | None',
+      required: true,
       description:
         'The plan, or None until planning has finished. Keys are below.',
     },
     error: {
       type: 'dict | None',
+      required: true,
       description:
         'The error, or None unless the record ended failed, interrupted, or cancelled. Keys are below.',
     },
     result: {
       type: 'dict | None',
+      required: true,
       description:
         'The result manifest, or None until the record is succeeded. Keys are below.',
     },
     done: {
       type: 'bool',
+      required: true,
       description:
         'True when state is an ending state. This is a computed Python property and is absent from raw HTTP JSON.',
     },
