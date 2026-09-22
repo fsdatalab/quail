@@ -304,6 +304,7 @@ def test_query_rows_observers_and_saved_reports(sess, tmp_path):
     assert stages[1]["evaluated"] == 4
     assert res.report["model_wall_s"] == 1.0
     assert res.report["wall_s"] == res.report["model_wall_s"]
+    assert res.report["finish_s"] >= 0
     assert res.report["input_ready_s"] >= res.report["planning_s"]
 
     limited = _run(

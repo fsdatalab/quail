@@ -4,7 +4,11 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 import quail
-from quail.bench.quailb import queries, register_tables
+from quail.bench.quailb import (
+    _submission_to_answer_s,
+    queries,
+    register_tables,
+)
 from quail.planner.plan import EngineConfig, Refusal
 from quail_b.data import ASPECTS, SCENARIOS
 from quail_b.queries import QUERY_ORDER
@@ -55,6 +59,21 @@ def _standin_sets(tmp_path):
         "scenario": SCENARIOS,
     }), tmp_path / "scenarios.parquet")
     return tmp_path
+
+
+def test_submission_to_answer_timing_includes_common_answer_work():
+    report = {
+        "model_wall_s": 10.0,
+        "finish_s": 0.5,
+        "input_ready_s": 2.0,
+        "physical_prepare_s": 0.25,
+    }
+    assert _submission_to_answer_s(
+        "quail", report, frontend_s=1.0, answer_prepare_s=0.75
+    ) == 14.5
+    assert _submission_to_answer_s(
+        "pipelined_vllm", report, frontend_s=1.0, answer_prepare_s=0.75
+    ) == 11.25
 
 
 def test_all_queries_compile_and_plan(tmp_path):

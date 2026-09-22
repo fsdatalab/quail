@@ -192,6 +192,27 @@ def prompt_pieces(query, plan: QueryPlan, anchors) -> dict:
     return pieces
 
 
+def _submission_to_answer_s(
+    backend: str,
+    report: dict,
+    *,
+    frontend_s: float,
+    answer_prepare_s: float,
+) -> float:
+    runtime_s = (
+        report["model_wall_s"]
+        + report["finish_s"]
+        + answer_prepare_s
+    )
+    if backend == "quail":
+        runtime_s += (
+            frontend_s
+            + report["input_ready_s"]
+            + report["physical_prepare_s"]
+        )
+    return runtime_s
+
+
 def run_query(session, spec: QuerySpec, tables) -> RunOutput:
     """Execute one query and return benchmark ids, answers, and measurements."""
     submitted = time.perf_counter()
@@ -206,21 +227,21 @@ def run_query(session, spec: QuerySpec, tables) -> RunOutput:
     answer_started = time.perf_counter()
     output = run_output(result, plan, tables)
     answer_prepare_s = time.perf_counter() - answer_started
+    runtime_s = _submission_to_answer_s(
+        session.config.backend,
+        result.report,
+        frontend_s=frontend_s,
+        answer_prepare_s=answer_prepare_s,
+    )
+    output.runtime_s = runtime_s
+    output.measurements.update(
+        wall_s=runtime_s,
+        submission_to_answer_s=runtime_s,
+        finish_s=result.report["finish_s"],
+        answer_prepare_s=answer_prepare_s,
+    )
     if session.config.backend == "quail":
-        runtime_s = (
-            frontend_s
-            + result.report["input_ready_s"]
-            + result.report["physical_prepare_s"]
-            + result.report["model_wall_s"]
-            + answer_prepare_s
-        )
-        output.runtime_s = runtime_s
-        output.measurements.update(
-            wall_s=runtime_s,
-            submission_to_answer_s=runtime_s,
-            frontend_s=frontend_s,
-            answer_prepare_s=answer_prepare_s,
-        )
+        output.measurements["frontend_s"] = frontend_s
     output.prompt_pieces = prompt_pieces(query, plan, join_anchors(result))
     return output
 
