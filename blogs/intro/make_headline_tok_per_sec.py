@@ -130,6 +130,12 @@ def plot_headline(rows, destination: Path):
 
     figure, left_axis = plt.subplots(figsize=(11.8, 5.5))
     right_axis = left_axis.twinx()
+    figure.suptitle(
+        "QUAIL-B average tokens/sec by dataset\n"
+        "Qwen3 4B FP8, one H100, scale factor 0.1",
+        fontsize=16,
+        y=0.98,
+    )
     positions = list(range(len(DATASETS)))
     width = 0.36
 
@@ -232,8 +238,7 @@ def plot_headline(rows, destination: Path):
         handlelength=2.5,
     )
 
-    # No title or subtitle: the blog caption supplies the figure context.
-    figure.subplots_adjust(left=0.085, right=0.90, bottom=0.18, top=0.96)
+    figure.subplots_adjust(left=0.085, right=0.90, bottom=0.18, top=0.82)
     destination = Path(destination)
     figure.savefig(destination.with_suffix(".pdf"), bbox_inches="tight")
     figure.savefig(destination.with_suffix(".png"), dpi=300, bbox_inches="tight")
