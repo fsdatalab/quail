@@ -54,23 +54,6 @@ def evaluate(directory: str, gpus: int) -> dict:
     return report
 
 
-@app.function(image=preparation_image, timeout=86_400, memory=16_384,
-              volumes={"/vol/results": results_volume,
-                       "/root/.cache/huggingface": hf_cache})
-def evaluate_remote(directory: str, gpus: int, endpoint: str) -> dict:
-    """Submit the join to a deployed Quail Server and wait for it.
-
-    Runs without a GPU: the server owns execution. This function
-    uploads the inputs, watches the saved status, and fetches the result.
-    """
-    from demos.agent_trace_compaction import evaluate as run_evaluate
-
-    results_volume.reload()
-    report = run_evaluate(Path(directory), gpus, endpoint)
-    results_volume.commit()
-    return report
-
-
 @app.function(image=preparation_image, timeout=86_400, memory=32_768,
               volumes={"/vol/results": results_volume})
 def reconstruct(directory: str) -> dict:
@@ -84,22 +67,14 @@ def reconstruct(directory: str) -> dict:
 
 
 @app.local_entrypoint()
-def main(limit: int = 100, seed: int = 42, gpus: int = 1, endpoint: str = ""):
-    """Compact complete traces using DiffusionGemma on one or more H100s.
-
-    With ``--endpoint`` the join is submitted to a deployed Quail
-    Server instead of a GPU function here; the log shows the query id
-    and its status page.
-    """
+def main(limit: int = 100, seed: int = 42, gpus: int = 1):
+    """Compact complete traces using DiffusionGemma on one or more H100s."""
     if limit < 1 or gpus not in (1, 2, 4, 8):
         raise ValueError("limit must be positive; gpus must be 1, 2, 4, or 8")
     call = prepare.spawn(limit, seed)
     print(f"function call id (prepare): {call.object_id}", flush=True)
     directory = call.get()
-    if endpoint:
-        call = evaluate_remote.spawn(directory, gpus, endpoint)
-    else:
-        call = evaluate.with_options(gpu=f"H100!:{gpus}").spawn(directory, gpus)
+    call = evaluate.with_options(gpu=f"H100!:{gpus}").spawn(directory, gpus)
     print(f"function call id (evaluate): {call.object_id}", flush=True)
     call.get()
     call = reconstruct.spawn(directory)
