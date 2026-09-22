@@ -78,6 +78,7 @@ def test_records_carry_their_session_id(store):
     assert [item.id for item in store.list_recent(session_id="s1")] == [mine.id]
     assert [item.id for item in store.list_recent(session_id="s2")] == [other.id]
     assert len(store.list_recent()) == 3
+    assert len(store.list_recent(limit=None)) == 3
 
 
 def test_discard_deletes_a_queued_record_or_cancels_a_started_one(store):

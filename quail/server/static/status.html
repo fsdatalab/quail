@@ -97,7 +97,7 @@
     border-radius: .5rem;
   }
   table { width: 100%; border-collapse: collapse; font-size: .875rem; }
-  .query-table { min-width: 44rem; }
+  .query-table { min-width: 60rem; }
   .result-table { min-width: 36rem; }
   td, th {
     padding: .8rem 1rem;
@@ -113,6 +113,18 @@
     font-weight: 500;
   }
   tbody tr:hover { background: var(--card); }
+  .query-row { cursor: pointer; }
+  .query-row:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: -2px;
+  }
+  .query-table td:first-child,
+  .query-table td:nth-child(2),
+  .query-table td:nth-child(4),
+  .query-table td:nth-child(5),
+  .query-table td:last-child {
+    white-space: nowrap;
+  }
   .query-link { font-weight: 500; text-decoration: none; }
   .query-link:hover { text-decoration: underline; }
   .status-line {
@@ -283,7 +295,11 @@ async function api(path, options = {}) {
 function el(tag, attrs, ...children) {
   const node = document.createElement(tag);
   for (const [key, value] of Object.entries(attrs || {})) {
-    if (key === "onclick") node.onclick = value; else node.setAttribute(key, value);
+    if (key === "onclick" || key === "onkeydown") {
+      node[key] = value;
+    } else {
+      node.setAttribute(key, value);
+    }
   }
   for (const child of children) node.append(child);
   return node;
@@ -316,22 +332,36 @@ function renderList(items) {
   document.title = "Queries · Quail";
   const table = el("table", { class: "query-table" },
     el("thead", {}, el("tr", {},
-    el("th", {}, "Id"), el("th", {}, "Status"),
-    el("th", {}, "Created"), el("th", {}, "Rows"))), el("tbody"));
+    el("th", {}, "Id"), el("th", {}, "State"),
+    el("th", {}, "Phase"), el("th", {}, "Created"),
+    el("th", {}, "Model"), el("th", {}, "Rows"))), el("tbody"));
   const body = table.querySelector("tbody");
   for (const item of items) {
-    body.append(el("tr", {},
+    const href = "/queries/" + item.id;
+    const open = () => { location.href = href; };
+    body.append(el("tr", {
+      class: "query-row", tabindex: "0", role: "link",
+      "aria-label": `Open query ${item.id}`,
+      onclick: open,
+      onkeydown: event => {
+        if (event.key === "Enter" || event.key === " ") open();
+      }
+    },
       el("td", {}, el("a", {
-        href: "/queries/" + item.id, class: "query-link"
+        href, class: "query-link"
       }, el("code", {}, item.id))),
       el("td", {}, el("span", { class: "state " + item.state },
-        sentenceCase(item.state)),
-        item.phase ? el("div", { class: "muted" }, item.phase.message) : ""),
+        sentenceCase(item.state))),
+      el("td", {}, item.phase ? item.phase.message : ""),
       el("td", {}, when(item.created_at)),
+      el("td", {}, item.config && item.config.model ? item.config.model : ""),
       el("td", {}, item.result ? String(item.result.rows) : "")));
   }
   view.replaceChildren(items.length
-    ? el("div", { class: "table-wrap" }, table)
+    ? el("div", {},
+      el("p", { class: "muted" },
+        "All queries on this server. Updates every 5 seconds."),
+      el("div", { class: "table-wrap" }, table))
     : el("p", { class: "muted empty" }, "No queries yet."));
 }
 
@@ -450,7 +480,7 @@ async function readEvents(afterRevision, onStatus) {
 async function main() {
   if (!queryId) {
     const refresh = async () => {
-      const response = await api("/v1/queries?limit=100");
+      const response = await api("/v1/queries?limit=all");
       if (!response.ok) {
         view.replaceChildren(el("p", {}, `HTTP ${response.status}`));
         return;
