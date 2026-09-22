@@ -5,11 +5,12 @@ Pull the CPU-derived summary and regenerate the figures:
     W=/tmp/quailb-raw; mkdir -p "$W"
     uv run modal volume get quail-results \
       reports/quailb-raw-2026-09-19/comparison.json "$W/comparison.json"
+    BIO4_SF01_RUN=benchmarks/quailb/family-runs/20260920T062701Z-bio4-4b
     uv run modal volume get quail-results \
-      benchmarks/quailb/family-runs/20260920T062701Z-bio4-4b/quail/biodex/run.json \
+      "$BIO4_SF01_RUN/quail/biodex/run.json" \
       "$W/bio4-sf0.1-quail.json"
     uv run modal volume get quail-results \
-      benchmarks/quailb/family-runs/20260920T062701Z-bio4-4b/pipelined_vllm/biodex/run.json \
+      "$BIO4_SF01_RUN/pipelined_vllm/biodex/run.json" \
       "$W/bio4-sf0.1-vllm.json"
     uv run modal volume get quail-results \
       sol/2026-09-20-bio4-qwen3-4b-sf0.1.json "$W/bio4-sf0.1-sol.json"
