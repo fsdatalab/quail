@@ -24,6 +24,7 @@ import pyarrow.compute as pc
 import quail
 import quail_b as benchmark
 from quail.bench import substrait
+from quail.bench.results import write_json
 from quail.bench.substrait import QueryPlan, read_plan
 from quail.planner.plan import Refusal
 from quail.specs import H100_USD_PER_HOUR, MODELS
@@ -41,6 +42,11 @@ from quail_b.scoring import RunOutput, reference_answer
 # the fixed planner inputs, by prompt; a predicate without an
 # estimate here gets the planner's default selectivity
 SELECTIVITY = {**FILTER_SELECTIVITY_ESTIMATES, **JOIN_SELECTIVITY_ESTIMATES}
+TEXT_VLLM_BACKENDS = frozenset({
+    "dumb_vllm",
+    "pipelined_vllm",
+    "stock_vllm",
+})
 
 
 def register_tables(session, data_dir):
@@ -242,7 +248,12 @@ def run_query(session, spec: QuerySpec, tables) -> RunOutput:
     )
     if session.config.backend == "quail":
         output.measurements["frontend_s"] = frontend_s
-    output.prompt_pieces = prompt_pieces(query, plan, join_anchors(result))
+    if session.config.backend in TEXT_VLLM_BACKENDS:
+        output.measurements["input_tokens"] = (
+            result.report["fresh_tokens"] + result.report["cached_tokens"]
+        )
+    else:
+        output.prompt_pieces = prompt_pieces(query, plan, join_anchors(result))
     return output
 
 
@@ -261,6 +272,25 @@ def refused_queries(session, query_ids, data_dir) -> dict[str, str]:
             print(f"[quail-b] {query_id}: skipped on {session.config.backend}: "
                   f"{refused[query_id]}", flush=True)
     return refused
+
+
+def _apply_reported_input_tokens(record) -> None:
+    """Use exact engine token counts when prompt pieces are unavailable."""
+    for item in record["queries"]:
+        reported = item.get("measurements", {}).get("input_tokens")
+        metrics = item.get("metrics")
+        if reported is None or metrics is None:
+            continue
+        metrics["input_tokens"] = reported
+        runtime_s = item.get("runtime_s")
+        metrics["input_tokens_per_second"] = (
+            reported / runtime_s if runtime_s else None
+        )
+        cost = metrics.get("cost_usd")
+        metrics["cost_usd_per_million_input_tokens"] = (
+            cost / reported * 1e6
+            if cost is not None and reported else None
+        )
 
 
 def run_suite(only=None, *, sf=0.1, config, data_dir=None,
@@ -302,6 +332,9 @@ def run_suite(only=None, *, sf=0.1, config, data_dir=None,
                 },
             })
         record["skipped_queries"] = skipped
+        _apply_reported_input_tokens(record)
+        write_json(Path(output_dir) / "run.json", record)
+        benchmark.report(output_dir, rescore=False)
         return record
 
 
