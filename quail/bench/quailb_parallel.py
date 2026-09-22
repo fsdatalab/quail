@@ -141,6 +141,7 @@ def run_query_family(
     include_quail: bool = True,
     include_dumb_vllm: bool = False,
     baselines: str = "stock_vllm,pipelined_vllm",
+    result_name: str = "",
 ) -> str:
     """Run one query family through Quail and the vLLM baselines.
 
@@ -153,7 +154,7 @@ def run_query_family(
     if include_dumb_vllm:
         process_groups.append(("dumb_vllm",))
     try:
-        return _run_family(process_groups, "", model, sf, query_ids_csv,
+        return _run_family(process_groups, result_name, model, sf, query_ids_csv,
                            run_dir, ground_truth_collection)
     finally:
         results_vol.commit()
@@ -174,10 +175,11 @@ def run_sglang_query_family(
     query_ids_csv: str,
     run_dir: str,
     ground_truth_collection: str,
+    result_name: str = "-sglang",
 ) -> str:
     """Run one query family through the SGLang backend."""
     try:
-        return _run_family([("pipelined_sglang",)], "-sglang", model, sf,
+        return _run_family([("pipelined_sglang",)], result_name, model, sf,
                            query_ids_csv, run_dir, ground_truth_collection)
     finally:
         results_vol.commit()
@@ -222,6 +224,24 @@ def _merge_suites(parts, query_ids, run_id, started, elapsed,
     return merged
 
 
+def _query_groups(query_ids) -> list[tuple[str, tuple[str, ...], str]]:
+    """Split BIO queries across containers and keep other families together."""
+    from quail_b.queries import query_family_name, split_query_families
+
+    groups = []
+    for family_ids in split_query_families(query_ids):
+        family_ids = tuple(family_ids)
+        family = query_family_name(family_ids)
+        if family == "biodex":
+            groups.extend(
+                (f"{family}-{query_id.lower()}", (query_id,), f"-{query_id.lower()}")
+                for query_id in family_ids
+            )
+        else:
+            groups.append((family, family_ids, ""))
+    return groups
+
+
 @app.function(image=image, timeout=43200, memory=4096, volumes=VOLUMES)
 def run_all(
     run_dir: str,
@@ -236,7 +256,6 @@ def run_all(
     baselines: str = "stock_vllm,pipelined_vllm",
 ):
     from quail_b import select_queries
-    from quail_b.queries import query_family_name, split_query_families
 
     only = [item.strip() for item in query.split(",")] if query else None
     query_ids = tuple(spec.id for spec in select_queries(only, scale_factor=sf))
@@ -267,12 +286,10 @@ def run_all(
         ground_truth_collection = data_call.get()
         manifest["collection_id"] = ground_truth_collection
 
-        families = split_query_families(query_ids)
         family_calls = []
         sglang_calls = []
         call_ids = manifest["function_call_ids"]
-        for family_ids in families:
-            family = query_family_name(family_ids)
+        for group, family_ids, result_name in _query_groups(query_ids):
             if include_quail or include_baselines or include_dumb_vllm:
                 family_call = run_query_family.spawn(
                     model=model,
@@ -284,27 +301,30 @@ def run_all(
                     include_quail=include_quail,
                     include_dumb_vllm=include_dumb_vllm,
                     baselines=baselines,
+                    result_name=result_name,
                 )
-                family_calls.append((family, family_call))
-                call_ids[f"{family}:quail_vllm"] = family_call.object_id
+                family_calls.append((group, family_call))
+                call_ids[f"{group}:quail_vllm"] = family_call.object_id
                 print(
                     f"function call id: {family_call.object_id} "
-                    f"({family}, Quail and vLLM, {','.join(family_ids)})",
+                    f"({group}, Quail and vLLM, {','.join(family_ids)})",
                     flush=True,
                 )
             if include_sglang:
+                sglang_result_name = f"{result_name}-sglang"
                 sglang_call = run_sglang_query_family.spawn(
                     model=model,
                     sf=sf,
                     query_ids_csv=",".join(family_ids),
                     run_dir=run_dir,
                     ground_truth_collection=ground_truth_collection,
+                    result_name=sglang_result_name,
                 )
-                sglang_calls.append((family, sglang_call))
-                call_ids[f"{family}:sglang"] = sglang_call.object_id
+                sglang_calls.append((group, sglang_call))
+                call_ids[f"{group}:sglang"] = sglang_call.object_id
                 print(
                     f"function call id: {sglang_call.object_id} "
-                    f"({family}, SGLang, {','.join(family_ids)})",
+                    f"({group}, SGLang, {','.join(family_ids)})",
                     flush=True,
                 )
 
@@ -367,9 +387,9 @@ def _finish_run(directory, manifest, family_calls, sglang_calls, query_ids,
         status="complete",
         parallel_wall_s=round(elapsed, 1),
         families={
-            **{part["query_family"]: part["result_path"]
+            **{Path(part["result_path"]).stem: part["result_path"]
                for part in family_parts},
-            **{f"{part['query_family']}-sglang": part["result_path"]
+            **{Path(part["result_path"]).stem: part["result_path"]
                for part in sglang_parts},
         },
         summaries=paths,
