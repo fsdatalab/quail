@@ -38,13 +38,14 @@ class Checkpoint:
     """Copy the store to ``target`` after changes, then call ``commit``.
 
     A state change (a record created, started, finished, cancelled, or
-    given its plan) is copied within ``min_interval_s``. A write that
+    given its plan) is attempted within ``min_interval_s``. A write that
     only moved a progress counter is copied at most every
     ``progress_interval_s``; losing it costs nothing, because a restart
     marks an unfinished record interrupted anyway. Every copy is a full
     copy of the database file plus one ``commit`` (``volume.commit`` on
     Modal), so this keeps a long-running query from copying the file
-    once a second.
+    once a second. Failures are logged and retried; a restart can only
+    restore the latest copy that completed successfully.
     """
 
     def __init__(self, store: Store, target: Path,

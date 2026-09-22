@@ -83,8 +83,10 @@ def spec_hash(spec: dict, config: dict, inputs: dict, timeout_s: float) -> str:
 class QueryStatus:
     """One complete saved status snapshot of a query record.
 
-    progress, plan, error, and result are plain dictionaries so the
-    snapshot serializes to JSON without any Quail object.
+    ``phase`` describes the current work without expanding the stable
+    top-level state machine. Phase, progress, plan, error, and result are
+    plain dictionaries so the snapshot serializes to JSON without any
+    Quail object.
     """
 
     id: str
@@ -99,6 +101,7 @@ class QueryStatus:
     session_id: str | None = None
     started_at: float | None = None
     cancel_requested: bool = False
+    phase: dict | None = None
     progress: dict | None = None
     plan: dict | None = None
     error: dict | None = None
@@ -106,6 +109,7 @@ class QueryStatus:
 
     @property
     def done(self) -> bool:
+        """Return whether the query reached a terminal state."""
         return self.state in TERMINAL_STATES
 
     def to_dict(self) -> dict:

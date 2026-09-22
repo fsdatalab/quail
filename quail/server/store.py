@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS queries (
     timeout_s REAL NOT NULL,
     cancel_requested INTEGER NOT NULL DEFAULT 0,
     execution_epoch INTEGER NOT NULL DEFAULT 0,
+    phase_json TEXT,
     progress_json TEXT,
     plan_json TEXT,
     error_json TEXT,
@@ -96,6 +97,7 @@ def _row_status(row) -> QueryStatus:
         started_at=row["started_at"],
         timeout_s=row["timeout_s"],
         cancel_requested=bool(row["cancel_requested"]),
+        phase=_loads(row["phase_json"]),
         progress=_loads(row["progress_json"]),
         plan=_loads(row["plan_json"]),
         error=_loads(row["error_json"]),
@@ -128,6 +130,8 @@ class Store:
         if "session_id" not in columns:
             # a database file written before records carried a session id
             self._conn.execute("ALTER TABLE queries ADD COLUMN session_id TEXT")
+        if "phase_json" not in columns:
+            self._conn.execute("ALTER TABLE queries ADD COLUMN phase_json TEXT")
 
     def close(self) -> None:
         with self._lock:
@@ -229,13 +233,15 @@ class Store:
                         "different specification")
                 return _row_status(row)
             now = time.time()
+            phase = {"name": "queued", "message": "Waiting to run",
+                     "recorded_at": now}
             self._write(
                 "INSERT INTO queries (id, session_id, spec_hash, spec_json, "
                 "config_json, inputs_json, state, revision, created_at, "
-                "updated_at, timeout_s) VALUES (?, ?, ?, ?, ?, ?, 'queued', 1, "
-                "?, ?, ?)",
+                "updated_at, timeout_s, phase_json) VALUES "
+                "(?, ?, ?, ?, ?, ?, 'queued', 1, ?, ?, ?, ?)",
                 (query_id, session_id, digest, _dumps(spec), _dumps(config),
-                 _dumps(inputs), now, now, timeout_s))
+                 _dumps(inputs), now, now, timeout_s, _dumps(phase)))
             return self.get(query_id)
 
     def discard(self, query_id: str) -> bool:
@@ -309,7 +315,7 @@ class Store:
         return None if row is None else _row_status(row)
 
     def begin(self, query_id: str) -> int:
-        """Move a queued record to planning and return its execution epoch.
+        """Start input preparation and return the execution epoch.
 
         The epoch identifies this execution attempt. Later updates must
         carry it, so an execution the server has already closed cannot
@@ -322,15 +328,22 @@ class Store:
                     f"query {query_id} is {row['state']}, not queued")
             epoch = int(row["execution_epoch"]) + 1
             now = time.time()
+            phase = {
+                "name": "resolving_inputs",
+                "message": "Resolving and preparing inputs",
+                "recorded_at": now,
+            }
             self._write(
                 "UPDATE queries SET state = 'planning', execution_epoch = ?, "
-                "started_at = ?, revision = revision + 1, updated_at = ? "
+                "started_at = ?, phase_json = ?, "
+                "revision = revision + 1, updated_at = ? "
                 "WHERE id = ? AND state = 'queued'",
-                (epoch, now, now, query_id))
+                (epoch, now, _dumps(phase), now, query_id))
             return epoch
 
     def update(self, query_id: str, epoch: int, *, state: str | None = None,
-               progress: dict | None = None, plan: dict | None = None
+               phase: dict | None = None, progress: dict | None = None,
+               plan: dict | None = None
                ) -> bool:
         """Record execution progress. Returns False for a closed execution."""
         if state is not None and state not in ACTIVE_STATES:
@@ -340,6 +353,9 @@ class Store:
         if state is not None:
             assignments.append("state = ?")
             parameters.append(state)
+        if phase is not None:
+            assignments.append("phase_json = ?")
+            parameters.append(_dumps(phase))
         if progress is not None:
             assignments.append("progress_json = ?")
             parameters.append(_dumps(progress))
@@ -350,7 +366,7 @@ class Store:
         count = self._write(
             f"UPDATE queries SET {', '.join(assignments)} WHERE id = ? "
             "AND execution_epoch = ? AND state IN (?, ?)", parameters,
-            durable=state is not None or plan is not None)
+            durable=state is not None or phase is not None or plan is not None)
         return count == 1
 
     def finish(self, query_id: str, epoch: int, state: str, *,
@@ -365,12 +381,22 @@ class Store:
             raise ValueError(f"finish() needs a terminal state, not {state!r}")
         if state == "succeeded" and result is None:
             raise ValueError("a succeeded record needs its result manifest")
+        phase = {
+            "name": state,
+            "message": {
+                "succeeded": "Query completed",
+                "failed": "Query failed",
+                "interrupted": "Query interrupted",
+                "cancelled": "Query cancelled",
+            }[state],
+            "recorded_at": time.time(),
+        }
         count = self._write(
             "UPDATE queries SET state = ?, error_json = ?, result_json = ?, "
-            "revision = revision + 1, updated_at = ? WHERE id = ? "
+            "phase_json = ?, revision = revision + 1, updated_at = ? WHERE id = ? "
             "AND execution_epoch = ? AND state IN (?, ?)",
-            (state, _dumps(error), _dumps(result), time.time(), query_id,
-             epoch, *sorted(ACTIVE_STATES)))
+            (state, _dumps(error), _dumps(result), _dumps(phase), time.time(),
+             query_id, epoch, *sorted(ACTIVE_STATES)))
         return count == 1
 
     def request_cancel(self, query_id: str) -> QueryStatus:
@@ -381,13 +407,17 @@ class Store:
         with self._lock:
             status = self.get(query_id)
             if status.state == "queued":
+                now = time.time()
+                phase = {"name": "cancelled", "message": "Query cancelled",
+                         "recorded_at": now}
                 self._write(
                     "UPDATE queries SET state = 'cancelled', error_json = ?, "
-                    "revision = revision + 1, updated_at = ? WHERE id = ? "
+                    "phase_json = ?, revision = revision + 1, updated_at = ? "
+                    "WHERE id = ? "
                     "AND state = 'queued'",
                     (_dumps({"type": "Cancelled",
                              "message": "cancelled before execution started"}),
-                     time.time(), query_id))
+                     _dumps(phase), now, query_id))
             elif status.state in ACTIVE_STATES and not status.cancel_requested:
                 self._write(
                     "UPDATE queries SET cancel_requested = 1, "
@@ -406,10 +436,17 @@ class Store:
                 sorted(ACTIVE_STATES)).fetchall()
             ids = [row["id"] for row in rows]
             for query_id in ids:
+                now = time.time()
+                phase = {
+                    "name": "interrupted",
+                    "message": "Query interrupted by a server restart",
+                    "recorded_at": now,
+                }
                 self._write(
                     "UPDATE queries SET state = 'interrupted', error_json = ?, "
-                    "revision = revision + 1, updated_at = ? WHERE id = ?",
-                    (_dumps(INTERRUPTED_ERROR), time.time(), query_id))
+                    "phase_json = ?, revision = revision + 1, updated_at = ? "
+                    "WHERE id = ?",
+                    (_dumps(INTERRUPTED_ERROR), _dumps(phase), now, query_id))
         return ids
 
     # -- inputs -----------------------------------------------------------

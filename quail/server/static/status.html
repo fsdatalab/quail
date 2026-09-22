@@ -13,6 +13,7 @@
   table { border-collapse: collapse; width: 100%; }
   td, th { text-align: left; padding: .25rem .5rem; border-bottom: 1px solid #e5e5e5; vertical-align: top; }
   .state { display: inline-block; padding: .1rem .5rem; border-radius: .25rem; font-weight: 600; }
+  .phase { font-size: 1.15rem; font-weight: 600; margin: .75rem 0; }
   .queued, .planning, .running { background: #fff3cd; }
   .succeeded { background: #d4edda; }
   .failed, .interrupted { background: #f8d7da; }
@@ -92,11 +93,11 @@ function fileLink(path, filename) {
 function renderList(items) {
   document.getElementById("title").textContent = "Recent Quail queries";
   const table = el("table", {}, el("tr", {},
-    el("th", {}, "id"), el("th", {}, "state"), el("th", {}, "created"), el("th", {}, "rows")));
+    el("th", {}, "id"), el("th", {}, "status"), el("th", {}, "created"), el("th", {}, "rows")));
   for (const item of items) {
     table.append(el("tr", {},
       el("td", {}, el("a", { href: "/queries/" + item.id }, el("code", {}, item.id))),
-      el("td", {}, el("span", { class: "state " + item.state }, item.state)),
+      el("td", {}, item.phase ? item.phase.message : item.state),
       el("td", {}, when(item.created_at)),
       el("td", {}, item.result ? String(item.result.rows) : "")));
   }
@@ -131,6 +132,9 @@ async function renderStatus(status) {
       status.cancel_requested ? "cancel requested" : "Cancel"));
   }
   nodes.push(header);
+  if (status.phase) {
+    nodes.push(el("p", { class: "phase" }, status.phase.message));
+  }
   nodes.push(el("p", { class: "muted" },
     `model ${status.config.model} on ${status.config.device} ` +
     `(${status.config.gpus} GPU, backend ${status.config.backend}), ` +

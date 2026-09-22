@@ -387,7 +387,16 @@ class RemoteQuery:
         return run
 
     def run(self, plan=None, *, timeout_s: float | None = None) -> QueryResult:
-        """Submit, wait for the saved result, and return it."""
+        """Submit, wait for the saved result, and return it.
+
+        Args:
+            plan: Must be None. Remote queries use the server's plan.
+            timeout_s: Execution time limit, or the server default.
+
+        Raises:
+            RuntimeError: If an edited plan is passed.
+            QueryFailedError: If the saved run does not succeed.
+        """
         if plan is not None:
             raise RuntimeError(
                 "a remote query runs the server's plan; edited plans are "

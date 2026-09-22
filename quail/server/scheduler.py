@@ -169,7 +169,11 @@ class Scheduler:
     def _apply(self, query_id: str, epoch: int, artifact_dir: str,
                kind: str, payload: dict) -> None:
         if kind == "state":
-            self.store.update(query_id, epoch, state=payload["state"])
+            self.store.update(
+                query_id, epoch, state=payload["state"],
+                phase=payload.get("phase"))
+        elif kind == "phase":
+            self.store.update(query_id, epoch, phase=payload)
         elif kind == "plan":
             self.store.update(query_id, epoch, plan=payload)
         elif kind == "progress":

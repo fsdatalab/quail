@@ -16,7 +16,7 @@ import queue
 import threading
 import time
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Protocol
 
 from quail.server.inputs import resolve
@@ -34,6 +34,7 @@ class Job:
     inputs: dict
     snapshot_paths: dict
     artifact_dir: str
+    model_phase: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -60,6 +61,16 @@ def error_event(error: BaseException) -> dict:
         "type": type(error).__name__,
         "message": str(error),
         "traceback": traceback.format_exc(),
+    }
+
+
+def phase_event(name: str, message: str, **details) -> dict:
+    """Build one timestamped phase payload."""
+    return {
+        "name": name,
+        "message": message,
+        "recorded_at": time.time(),
+        **details,
     }
 
 
@@ -90,6 +101,7 @@ def run_job(job: Job, emit: Emit, hooks: Hooks | None = None) -> None:
         with Session(config, tokenizer=hooks.tokenizer) as session:
             for name, spec in job.inputs.items():
                 session.register(name, resolve(spec, job.snapshot_paths))
+            emit("phase", phase_event("planning", "Planning the query"))
             query = session.sql(
                 job.spec["sql"], order=job.spec.get("order"),
                 dialect=job.spec.get("dialect") or "snowflake")
@@ -103,7 +115,15 @@ def run_job(job: Job, emit: Emit, hooks: Hooks | None = None) -> None:
                 "workers": plan.workers,
                 "envelope": plan.to_envelope(session.registry.codecs),
             })
-            emit("state", {"state": "running"})
+            if job.model_phase is not None:
+                emit("phase", {
+                    **job.model_phase,
+                    "recorded_at": time.time(),
+                })
+            emit("state", {
+                "state": "running",
+                "phase": phase_event("executing", "Executing the query"),
+            })
             set_progress_sink(progress)
             set_answer_sink(answers)
             try:
@@ -168,12 +188,33 @@ class InProcessExecutor:
 
     def __init__(self, hooks: Hooks | None = None):
         self.hooks = hooks
+        self._loaded_model = None
 
     def start(self, job: Job, emit: Emit) -> Execution:
+        model = job.config.get("model")
+        if self._loaded_model is None:
+            model_phase = {
+                "name": "loading_model",
+                "message": f"Loading and warming model {model}",
+                "model": model,
+            }
+        elif self._loaded_model != model:
+            model_phase = {
+                "name": "switching_model",
+                "message": (
+                    f"Switching from {self._loaded_model} and loading {model}"
+                ),
+                "previous_model": self._loaded_model,
+                "model": model,
+            }
+        else:
+            model_phase = None
+        self._loaded_model = model
+        job = replace(job, model_phase=model_phase)
         return _ThreadExecution(job, emit, self.hooks)
 
     def close(self) -> None:
-        pass
+        self._loaded_model = None
 
 
 def _child_main(conn, hooks_reference: str | None) -> None:
@@ -306,10 +347,29 @@ class ChildProcessExecutor:
     def start(self, job: Job, emit: Emit) -> Execution:
         with self._lock:
             model = job.config.get("model")
-            if self._loaded_model not in (None, model):
+            alive = self._process is not None and self._process.is_alive()
+            loaded_model = self._loaded_model if alive else None
+            if loaded_model not in (None, model):
+                model_phase = {
+                    "name": "switching_model",
+                    "message": (
+                        f"Switching from {loaded_model} and loading {model}"
+                    ),
+                    "previous_model": loaded_model,
+                    "model": model,
+                }
                 self._close_child_unlocked()
+            elif loaded_model is None:
+                model_phase = {
+                    "name": "loading_model",
+                    "message": f"Loading and warming model {model}",
+                    "model": model,
+                }
+            else:
+                model_phase = None
             self._ensure_child()
             self._loaded_model = model
+            job = replace(job, model_phase=model_phase)
             self._conn.send(job)
             execution = _ChildExecution(self, emit, job)
         threading.Thread(target=execution.run, daemon=True,

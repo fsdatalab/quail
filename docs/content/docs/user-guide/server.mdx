@@ -5,8 +5,9 @@ title: Quail Server
 Quail Server is an optional HTTP server that runs on the machine with
 the GPU. You start it once, and clients send SQL to it by passing
 `endpoint` when they create a `Session`. The server compiles the
-query, plans it, loads the model, and runs the work. Because that
-work lives in the server process, the query continues after your
+query, plans it, loads or switches the model when needed, and runs the
+work. Warm queries for the same model skip the model-loading phase.
+Because that work lives in the server process, the query continues after your
 client exits, and another process can read the same record later.
 Several clients share the model the server has already loaded.
 
@@ -46,18 +47,20 @@ with one of them when you want to name the device yourself.
 ### From another machine
 
 The default address, `127.0.0.1`, accepts connections only from the
-machine the server is running on. To accept connections from other
-machines, listen on every interface and set a token. The port is
-then reachable on the network, and every request under `/v1` has to
-present that token.
+machine the server is running on. To accept connections from another
+machine, use HTTPS through a reverse proxy, or use a trusted private
+network. Then listen on every interface and set a token. Plain HTTP on
+an untrusted network exposes both the bearer token and query data because
+neither is encrypted.
 
 ```bash
 QUAIL_SERVER_TOKEN=<token> quail-server --host 0.0.0.0
 ```
 
-Pass `endpoint="http://<host>:8642"` and set the same
-`QUAIL_SERVER_TOKEN` in the client's environment. The client sends
-it as a bearer token on each request.
+On a trusted private network, pass `endpoint="http://<host>:8642"`.
+Through a reverse proxy, pass its `https://` URL. Set the same
+`QUAIL_SERVER_TOKEN` in the remote client's environment. `Session` reads
+that variable and sends it as a bearer token on each request.
 
 ### Options
 
@@ -99,23 +102,38 @@ the same calls as a local session. This example waits until the
 saved result is ready and then reads it.
 
 ```python
+import pyarrow as pa
 import quail
 
+reviews = pa.table({
+    "id": ["r1", "r2"],
+    "body": ["The ending was excellent.", "I liked the soundtrack."],
+})
+sql = """
+    SELECT r.id
+    FROM reviews r
+    WHERE AI.IF(PROMPT('Does this discuss the ending? {0}', r.body))
+"""
 config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
 with quail.Session(config=config, endpoint="http://127.0.0.1:8642") as session:
-    session.register("reviews", quail.DocumentProvider.from_parquet(
-        "reviews.parquet", id_col="id"))
-    result = session.sql(SQL, dialect="bq").run()
-    table = result.collect()
+    session.register(
+        "reviews",
+        quail.DocumentProvider.from_table(reviews, id_col="id"),
+    )
+    run = session.sql(sql, dialect="bq").submit()
+    for status in run.watch():
+        print(status.phase["message"])
+    table = run.result().collect()
+    print(table)
 ```
 
 `sql()` returns a [`RemoteQuery`](#remotequery). The client talks
 HTTP with the Python standard library and reads the
 batches with pyarrow. The `server` extra is only required on the
-machine that runs `quail-server`. `Session` has no argument for the
-token. When the server requires one, set `QUAIL_SERVER_TOKEN` where
-the client runs, or construct `quail.server.client.ServerClient` and
-pass `token` to it.
+machine that runs `quail-server`. `Session` has no token argument. When
+the server requires one, set `QUAIL_SERVER_TOKEN` where the client runs.
+Constructing `ServerClient(token=...)` only configures that separate client;
+it does not configure a `Session`.
 
 ## Tables on a remote session
 
@@ -135,6 +153,9 @@ queries use it. Once a query has been accepted, its inputs stay on
 the server. Closing the session removes the staging files on the
 client and leaves the server's copy where it is.
 
+There is no deletion or garbage-collection API yet. Uploaded snapshots and
+saved query artifacts remain until an operator removes them.
+
 ## Submit without waiting
 
 `run()` and `collect()` block until the rows are ready. Call
@@ -144,14 +165,23 @@ the query continues if you disconnect. From any later process,
 `session.get_run(query_id)` returns a handle to that same run.
 
 ```python
-with quail.Session(config=config, endpoint=endpoint) as session:
-    session.register("reviews", provider)
-    run = session.sql(SQL, dialect="bq").submit(
+with quail.Session(
+    config=config,
+    endpoint="http://127.0.0.1:8642",
+) as session:
+    session.register(
+        "reviews",
+        quail.DocumentProvider.from_table(reviews, id_col="id"),
+    )
+    run = session.sql(sql, dialect="bq").submit(
         query_id="nightly-2026-09-21", timeout_s=1000)
 ```
 
 ```python
-with quail.Session(config=config, endpoint=endpoint) as session:
+with quail.Session(
+    config=config,
+    endpoint="http://127.0.0.1:8642",
+) as session:
     run = session.get_run("nightly-2026-09-21")
     for status in run.watch():
         print(status.state, status.progress)
@@ -181,11 +211,15 @@ stores it on every record that session submits, and
 `GET /v1/queries?session_id=<id>` lists those records.
 
 A record moves through `queued`, `planning`, and `running`, and then
-ends in `succeeded`, `failed`, `interrupted`, or `cancelled`. Once
-it is in one of those four ending states, the record stays as it
-is. The server marks a record `succeeded` only after it has opened
-the saved result, the report, and the answer tables again and
-checked that the result file has the row count the run reported.
+ends in `succeeded`, `failed`, `interrupted`, or `cancelled`. The
+structured `phase` field gives the finer current step: waiting,
+resolving inputs, planning, loading or switching a model when needed,
+executing, and the terminal outcome. A warm same-model query has no
+model-loading phase. These are saved transitions from the scheduler and
+executor, not estimated timers. Once a record reaches an ending state,
+it stays there. The server marks a record `succeeded` only after it has
+opened the saved result, report, and answer tables again and checked the
+result row count.
 
 Each submission has a time limit. Pass `timeout_s`, or leave it
 unset to use the server's `--default-timeout`. The clock starts when
@@ -236,16 +270,19 @@ HTTP 409, `QueryIdConflictError`.
 
 ##### run
 
-`RemoteQuery.run(timeout_s=None)`
+`RemoteQuery.run(plan=None, *, timeout_s=None)`
 
 Submit the query, wait until the saved result is ready, and return it.
 A record that ended `failed`, `interrupted`, or `cancelled` raises
-`QueryFailedError`. The exception carries the saved status.
+`QueryFailedError`. The exception carries the saved status. Remote
+queries always use the server's plan. Passing a non-`None` `plan` raises
+`RuntimeError`.
 
 **Parameters**
 
 | Name | Description |
 | --- | --- |
+| `plan` | Must be `None`. Edited plans are available only for local queries. |
 | `timeout_s` | Passed through to `submit`. |
 
 **Returns**
@@ -330,6 +367,25 @@ as it stands then.
 
 An iterator of `QueryStatus`.
 
+##### wait
+
+`QueryRun.wait(poll_s=30)`
+
+Wait until the record is finished and return its final `QueryStatus`.
+A record that ended `failed`, `interrupted`, or `cancelled` raises
+`QueryFailedError`. The exception has the final snapshot on its `status`
+attribute.
+
+**Parameters**
+
+| Name | Description |
+| --- | --- |
+| `poll_s` | Seconds to hold each long-poll open. The default is 30. |
+
+**Returns**
+
+The successful final `QueryStatus`.
+
 ##### result
 
 `QueryRun.result(poll_s=30)`
@@ -365,6 +421,15 @@ behavior matches `result`.
 **Returns**
 
 `pyarrow.RecordBatchReader`. The server chooses the batch size.
+
+```python
+reader = run.stream_result()
+try:
+    for batch in reader:
+        print(batch)
+finally:
+    reader.close()
+```
 
 ##### cancel
 
@@ -437,6 +502,7 @@ and the answer tables again and checked the result's row count.
 | `timeout_s` | Execution limit in seconds. |
 | `session_id` | The client session that submitted the record, or `None`. |
 | `cancel_requested` | True after a cancel request has been recorded. |
+| `phase` | The current durable step. Keys are below. |
 | `spec` | The SQL submission. Keys are below. |
 | `config` | The engine config. Keys are below. |
 | `inputs` | Registered table name to the stored input description. Shapes are below. |
@@ -444,7 +510,17 @@ and the answer tables again and checked the result's row count.
 | `plan` | The plan, or `None` until planning has finished. Keys are below. |
 | `error` | The error, or `None` unless the record ended `failed`, `interrupted`, or `cancelled`. Keys are below. |
 | `result` | The result manifest, or `None` until the record is `succeeded`. Keys are below. |
-| `done` | True when `state` is an ending state. |
+| `done` | True when `state` is an ending state. This is a computed Python property and is absent from raw HTTP JSON. |
+
+##### phase
+
+| Key | Description |
+| --- | --- |
+| `name` | Stable step name: `queued`, `resolving_inputs`, `planning`, `loading_model`, `switching_model`, `executing`, or a terminal state. |
+| `message` | Human-readable current work. |
+| `recorded_at` | Unix seconds when this phase was saved. |
+| `model` | Model being loaded, when the phase concerns a model. |
+| `previous_model` | Model being replaced, for `switching_model`. |
 
 ##### spec
 
@@ -546,14 +622,20 @@ query is finished and every saved entry has been yielded.
 `answers(after=N)` returns the entries saved so far, starting at
 entry `N`, together with `next` (the entry to ask for next) and
 `done` (whether more entries can still arrive). The count stored on
-the record is `status().progress["answers_saved"]`. Entries carry
-row indexes, which line up with the saved answer tables. The
-document text is in those tables and in the final result.
+the record is `status().progress["answers_saved"]`. While a query runs,
+these entries are appended to the server's internal `answers.jsonl`.
+That append-only file is not available through `/files/{name}`; read it
+through the answers route or these client methods.
+
+Entries carry row indexes. After a successful run, the server also writes
+final Arrow answer tables. Those tables contain row indexes, predicate
+metadata, and boolean answers, not source document text. The final result
+contains only the columns projected by the SQL query.
 
 ## Reading the plan
 
 The server compiles and plans the query as part of running it, so
-the plan is ready once the record has left `planning`. Read it from
+the plan is ready once `status.plan` is non-`None`. Read it from
 `run.status().plan["text"]` after you submit. Write the query in
 SQL. The server runs the plan it chose. Planning the query in this
 process, before it runs, is what a local
@@ -606,12 +688,46 @@ A submission body has `sql`, `dialect`, `order`, `config`, `inputs`,
 `query_id`, `session_id`, and `timeout_s`. `dialect` is `bq` or
 `snowflake`, the same values as `session.sql`.
 
+```json
+{
+  "sql": "SELECT r.id FROM reviews r WHERE AI.IF(PROMPT('Positive? {0}', r.body))",
+  "dialect": "bq",
+  "order": null,
+  "config": {
+    "model": "qwen3-4b-fp8",
+    "device": "h100-sxm",
+    "gpus": 1,
+    "backend": "quail"
+  },
+  "inputs": {
+    "reviews": {
+      "kind": "snapshot",
+      "content_id": "<lowercase sha256 of the uploaded Arrow IPC file>",
+      "id_col": "id"
+    }
+  },
+  "query_id": "reviews-2026-09-22",
+  "session_id": "raw-http-client",
+  "timeout_s": 1000
+}
+```
+
+Upload the Arrow IPC file with `PUT /v1/inputs/{content_id}` before this
+request. A Hugging Face input instead uses `kind`, `dataset`, `config`,
+`split`, `revision`, and `id_col`.
+
 ## On Modal
 
 You can also host the server on Modal. `quail.server.modal_app`
 deploys it as one web endpoint on the existing `quail-engine` app,
 backed by one H100. Hosting it there is optional. The `quail-server`
 command above runs on any machine with a supported GPU.
+
+Modal is not installed by the `server` extra. Deployment currently
+requires a checkout of this repository plus an installed and authenticated
+Modal CLI. The image build uses the checkout's `uv.lock`, installs the
+development dependency group, and adds the local `quail` package with
+`add_local_python_source("quail")`.
 
 ```bash
 modal secret create quail-server-token QUAIL_SERVER_TOKEN=<token>
@@ -625,6 +741,16 @@ set the same variable. The deployment accepts the same built-in
 models as a server you start yourself: `qwen3-4b-fp8`,
 `qwen3-32b-fp8`, `diffusion-gemma-26b-a4b-fp8`,
 `qwen3-reranker-0.6b-bf16`, and `qwen3-reranker-4b-bf16`.
+For gated DiffusionGemma weights, also put `HF_TOKEN` in the
+`quail-server-token` Modal secret, which the deployment attaches. Create
+that secret with both values:
+
+```bash
+modal secret create quail-server-token \
+  QUAIL_SERVER_TOKEN=<server-token> HF_TOKEN=<hugging-face-token>
+```
+
+Without `HF_TOKEN`, that model cannot download.
 
 Results and uploaded inputs are written to the `quail-results` Volume
 under `/results/quail-server/`. The live SQLite file stays on the
@@ -635,10 +761,12 @@ copies the database onto the Volume with SQLite's online backup,
 which includes the write-ahead log, and then calls
 `volume.commit()`.
 
-The server makes that copy and commits it before it returns a new
-query id, so an id you have received is on the Volume. A change of
-state is copied within one second. A write that only moved a
-progress counter is copied at most every 30 seconds.
+The server makes and commits a checkpoint before it returns a new query
+id, so an acknowledged id is on the Volume. After that, checkpointing is
+attempted every second for durable changes. Progress-only writes are
+copied at most every 30 seconds. A failed backup or commit is logged and
+retried on a later attempt. A restart restores the latest successful
+checkpoint, which may be older than the latest state clients observed.
 
 When a new container starts, it copies the database back from the
 Volume before it serves requests. `max_containers=1` keeps a single

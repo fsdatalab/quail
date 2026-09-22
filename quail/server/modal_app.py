@@ -13,14 +13,16 @@ Where the data lives:
 - The live SQLite file stays on the container's local disk. A Volume
   has no file locking and rewrites a file on in-place writes, so SQLite
   must not run there. A checkpoint thread copies the database to the
-  Volume after each change and calls ``volume.commit()``. A
+  Volume after durable changes and calls ``volume.commit()``. Failures are
+  logged and retried, so restart restores the latest successful copy. A
   submission is copied and committed before it is acknowledged. On
   start the copy is restored. ``max_containers=1`` keeps one writer.
 
 The endpoint is a public URL, so a bearer token is required. Create it
 once before deploying:
 
-    modal secret create quail-server-token QUAIL_SERVER_TOKEN=<token>
+    modal secret create quail-server-token \
+        QUAIL_SERVER_TOKEN=<token> HF_TOKEN=<token-for-gated-models>
 
 Clients read the same variable, or pass ``token`` to ``ServerClient``.
 """

@@ -224,7 +224,13 @@ class Session:
                 raise
 
     def sql(self, text: str, order: str | None = None,
-            dialect: SQLDialect | str = SQLDialect.SNOWFLAKE) -> "Query":
+            dialect: SQLDialect | str = SQLDialect.SNOWFLAKE) -> QueryLike:
+        """Compile SQL locally or prepare it for remote submission.
+
+        Returns:
+            A local ``Query`` when the session has no endpoint. A remote
+            session returns ``RemoteQuery`` and the server compiles the SQL.
+        """
         if self._remote is not None:
             from quail.server.client import RemoteQuery
 
@@ -590,6 +596,8 @@ class BoundBuilder:
 
 
 class Query:
+    """A compiled query that plans and executes in the current process."""
+
     def __init__(self, session: Session, logical: LogicalPlan,
                  order: str | None = None):
         self.session = session

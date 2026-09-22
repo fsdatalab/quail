@@ -292,6 +292,15 @@ class QueryResult:
     def execute_stream(self, batch_rows: int = DEFAULT_BATCH_ROWS,
                        limit: int | None = None
                        ) -> pa.RecordBatchReader:
+        """Stream projected result rows as Arrow record batches.
+
+        Args:
+            batch_rows: Maximum rows in each returned batch.
+            limit: Maximum rows to return, or all rows when omitted.
+
+        Returns:
+            An Arrow reader that the caller should exhaust or close.
+        """
         if batch_rows <= 0:
             raise ValueError("batch_rows must be positive")
         effective_limit = self.limit
@@ -337,6 +346,15 @@ class QueryResult:
     def collect(self, limit: int | None = None,
                 batch_rows: int = DEFAULT_BATCH_ROWS
                 ) -> pa.Table:
+        """Collect projected result rows into one Arrow table.
+
+        Args:
+            limit: Maximum rows to collect, or all rows when omitted.
+            batch_rows: Maximum rows read from the result at once.
+
+        Returns:
+            A table containing only the columns projected by the query.
+        """
         reader = self.execute_stream(batch_rows=batch_rows, limit=limit)
         try:
             return reader.read_all()
@@ -383,6 +401,7 @@ class QueryResult:
         return reports[name]
 
     def to_rows(self, limit: int | None = None) -> list[tuple]:
+        """Collect projected result rows as Python tuples."""
         table = self.collect(limit=limit)
         columns = [column.to_pylist() for column in table.columns]
         return list(zip(*columns))
@@ -392,6 +411,7 @@ class QueryResult:
         return self._row_count
 
     def count(self) -> int:
+        """Return the result row count, computing it when needed."""
         if self._row_count is None:
             count = count_rows(self._declaration)
             self._row_count = (count if self.limit is None

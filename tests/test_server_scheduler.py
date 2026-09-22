@@ -28,7 +28,7 @@ def store(tmp_path):
 
 
 def submit(store, tmp_path, sql=server_fakes.FILTER_SQL, timeout_s=1000.0,
-           table=None):
+           table=None, config=None):
     provider = quail.DocumentProvider.from_table(
         table if table is not None else server_fakes.reviews_table(),
         id_col="id")
@@ -37,7 +37,7 @@ def submit(store, tmp_path, sql=server_fakes.FILTER_SQL, timeout_s=1000.0,
                     prepared.upload_path.stat().st_size)
     return store.create(
         spec={"sql": sql, "dialect": "snowflake", "order": None},
-        config=server_fakes.CONFIG,
+        config=config or server_fakes.CONFIG,
         inputs={"reviews": prepared.spec}, timeout_s=timeout_s)
 
 
@@ -318,6 +318,61 @@ def test_child_process_is_replaced_when_the_model_changes(store, tmp_path):
         assert executor._process.pid != pid, "another model, a new child"
     finally:
         executor.close()
+
+
+def test_saved_phases_follow_work_and_skip_loading_for_a_warm_model(
+        store, tmp_path):
+    """Save real phase transitions and distinguish warm model reuse."""
+    executor = InProcessExecutor(server_fakes.hooks)
+    scheduler = Scheduler(store, executor, tmp_path, poll_s=0.02)
+    seen = {}
+
+    def record():
+        for status in store.list_recent():
+            phases = seen.setdefault(status.id, [])
+            name = status.phase["name"]
+            if not phases or phases[-1] != name:
+                phases.append(name)
+
+    store.add_listener(record)
+    try:
+        first = submit(store, tmp_path)
+        assert scheduler.run_one(first).state == "succeeded"
+        second = submit(store, tmp_path)
+        assert scheduler.run_one(second).state == "succeeded"
+
+        other = submit(
+            store,
+            tmp_path,
+            config={**server_fakes.CONFIG, "model": "qwen3-32b-fp8"},
+        )
+        assert scheduler.run_one(other).state == "succeeded"
+    finally:
+        executor.close()
+
+    assert seen[first.id] == [
+        "queued",
+        "resolving_inputs",
+        "planning",
+        "loading_model",
+        "executing",
+        "succeeded",
+    ]
+    assert seen[second.id] == [
+        "queued",
+        "resolving_inputs",
+        "planning",
+        "executing",
+        "succeeded",
+    ]
+    assert seen[other.id] == [
+        "queued",
+        "resolving_inputs",
+        "planning",
+        "switching_model",
+        "executing",
+        "succeeded",
+    ]
 
 
 def test_child_answers_do_not_wait_for_the_parent_to_read(
