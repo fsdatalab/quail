@@ -7,12 +7,15 @@ Quail Server is an optional server that runs on the GPU host. A
 of running them in your process. The server saves each query's
 record, its status, and its result, and it keeps running the query
 after the client disconnects. Local use of Quail does not start Quail
-Server, does not need it, and does not install its dependencies.
+Server, does not need it, and does not install its dependencies. It
+runs on any machine with a supported GPU; Modal, further down, is one
+way to host it, not a requirement.
 
 ## The design, compared with Spark Connect
 
-The split between client and server is modeled on Spark Connect. The
-ideas map one to one.
+The split between client and server is modeled after
+[Spark Connect](https://spark.apache.org/docs/latest/spark-connect-overview.html),
+Apache Spark's client-server protocol. The ideas map one to one.
 
 | Idea | Spark Connect | Quail Server |
 | --- | --- | --- |
@@ -41,33 +44,70 @@ record batch is one block of rows with one schema.
 
 ## Start the server
 
-Install the `server` extra on the GPU host and start one server per
-host. The server runs the models you name, on the device you name.
+Two commands start Quail Server on a machine with one supported GPU.
 
 ```bash
 pip install "quail-engine[server]"
-quail-server --data-dir /var/lib/quail \
-  --model qwen3-4b-fp8 --device h100-sxm \
-  --host 0.0.0.0 --port 8642
+quail-server
 ```
+
+With no options, the server:
+
+- Runs every built-in model: `diffusion-gemma-26b-a4b-fp8`,
+  `qwen3-32b-fp8`, `qwen3-4b-fp8`, `qwen3-reranker-0.6b-bf16`, and
+  `qwen3-reranker-4b-bf16`. Each query still names the model it wants.
+- Uses the GPU this machine has. It reads the name CUDA reports for
+  GPU 0 and maps it to a device name: a name holding
+  `H100 80GB HBM3` becomes `h100-sxm`, and one holding
+  `RTX PRO 6000 Blackwell` becomes `rtx-pro-6000-blackwell-server`.
+  With no GPU, or with a name it does not know, it prints those two
+  device names and exits; pass `--device` yourself.
+- Keeps the SQLite file, uploaded inputs, and results under
+  `~/.quail/server`.
+- Listens on `127.0.0.1:8642`, so only this machine can reach it.
+
+At startup it prints what it runs, the data directory, whether a
+token is required, and the line to connect with:
+
+```text
+Quail Server on h100-sxm: diffusion-gemma-26b-a4b-fp8, qwen3-32b-fp8, qwen3-4b-fp8, qwen3-reranker-0.6b-bf16, qwen3-reranker-4b-bf16
+data: /home/you/.quail/server
+token: none
+connect: quail.Session(config, endpoint="http://127.0.0.1:8642")
+the first query loads its model; later queries reuse it
+```
+
+### From another machine
+
+Pass `--host 0.0.0.0` to accept connections from other machines, and
+set a token, because the port is then open to the network. A bearer
+token is one secret string the client puts in the `Authorization`
+header of every request; anyone who has the string can use the
+server. Set it with `--token` or with `QUAIL_SERVER_TOKEN` in the
+server's environment.
+
+```bash
+QUAIL_SERVER_TOKEN=<token> quail-server --host 0.0.0.0
+```
+
+Clients then pass `endpoint="http://<host>:8642"` to `quail.Session`
+and set the same `QUAIL_SERVER_TOKEN` in their own environment.
+
+### Options
 
 | Option | Meaning |
 | --- | --- |
-| `--data-dir` | Required. Where the SQLite file, uploaded inputs, and results live. Keep it on a disk that survives restarts. |
-| `--model` | Required. A model this server runs. Repeat the option for more than one. |
-| `--device` | Required. The device name every query must ask for. |
+| `--data-dir` | Where the SQLite file, uploaded inputs, and results live. Default `~/.quail/server`. Keep it on a disk that survives restarts. |
+| `--model` | A model this server runs. Repeat the option for more than one. Default: every registered model. |
+| `--device` | The device name every query must ask for. Default: the GPU this machine has. |
 | `--gpus` | A GPU count this server accepts. Repeat for more than one. Default 1. |
 | `--backend` | An accepted backend. Repeat for more than one. Default `quail`. |
-| `--host` | Address to listen on. Default `127.0.0.1`. |
+| `--host` | Address to listen on. Default `127.0.0.1`. Use `0.0.0.0` to accept other machines. |
 | `--port` | Port to listen on. Default `8642`. |
 | `--default-timeout` | Execution time limit in seconds when a submission names none. Default 1000 seconds, which is about 17 minutes. |
 | `--max-timeout` | Largest time limit a submission may ask for, in seconds. Default 14400 seconds, which is 4 hours. |
 | `--max-upload-gib` | Largest input snapshot accepted, in GiB. Default 8. |
 | `--token` | A bearer token every `/v1` request must carry. Default is the value of `QUAIL_SERVER_TOKEN`; no token is required when that variable is unset. |
-
-A bearer token is one secret string the client puts in the
-`Authorization` header of every request. Anyone who has the string
-can use the server.
 
 Quail Server needs no database server. It keeps one SQLite file that
 it alone writes, with uploaded inputs and saved results as files
@@ -76,6 +116,20 @@ still there. A `queued` query runs. A query that was `planning` or
 `running` is marked `interrupted`; it is not restarted and not left
 `running`. Losing the data directory loses everything: Quail Server
 does not resume GPU work after a crash, and it does not retry.
+
+### What the machine needs
+
+- A CUDA GPU the server knows: an H100 SXM or an RTX PRO 6000
+  Blackwell Server. Those are the only two devices Quail has specs
+  for, and the three large built-in models are fp8 builds, meaning
+  their weights are stored in 8-bit floating point.
+- One whole GPU per model copy. Quail does not split one model's
+  weights across GPUs.
+- Disk space for the Hugging Face cache, which holds the downloaded
+  model weights, and for compiled kernels. Both go to their default
+  locations; the server does not move them.
+- `HF_TOKEN` in the environment for a gated model, such as
+  DiffusionGemma. Without it the weight download fails.
 
 ## Connect from Python
 
@@ -316,6 +370,9 @@ It does not hold one of the server's worker threads, so many waiting
 readers do not slow a submission.
 
 ## On Modal
+
+Modal is one way to host Quail Server, not a requirement; the
+`quail-server` command above needs no Modal.
 
 `quail.server.modal_app` deploys Quail Server as one web endpoint on
 the existing `quail-engine` app, backed by one H100 container. The

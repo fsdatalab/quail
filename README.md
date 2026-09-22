@@ -55,14 +55,16 @@ with quail.Session(config=config) as session:
 
 ## Quail Server
 
-Quail Server is optional. Run it on the GPU host when you want to
-submit a long query, close the client, and fetch the result later.
+Quail Server is optional. Run it when you want to submit a long
+query, close the client, and fetch the result later. It runs on any
+machine with a supported GPU, with no options; the docs also cover a
+Modal deployment. The client-server design is modeled after
+[Spark Connect](https://spark.apache.org/docs/latest/spark-connect-overview.html).
 Give `Session` the server's address; the query code stays the same.
 
 ```bash
 pip install "quail-engine[server]"
-quail-server --data-dir /var/lib/quail --model qwen3-4b-fp8 \
-  --device h100-sxm --host 0.0.0.0
+quail-server
 ```
 
 ```python
