@@ -207,7 +207,7 @@ def _percent_tick(value, _position):
 
 
 def _tokens_per_second_label(value: float) -> str:
-    """Format a tokens/second rate, for example ``1.42M tok/sec``."""
+    """Format a tokens/second rate on two lines."""
     if value >= 1_000_000:
         scaled = value / 1_000_000
         decimals = 1 if scaled >= 10 else 2
@@ -216,7 +216,7 @@ def _tokens_per_second_label(value: float) -> str:
         number = f"{value / 1_000:.0f}k"
     else:
         number = f"{value:.0f}"
-    return f"{number} tok/sec"
+    return f"{number}\ntok/sec"
 
 
 def plot_headline(rows, destination: Path):
@@ -243,12 +243,13 @@ def plot_headline(rows, destination: Path):
         y=0.98,
     )
     positions = list(range(len(DATASETS)))
-    width = 0.36
+    width = 0.32
+    pair_gap = 0.08
 
     for method_index, (method, color) in enumerate(
         (("Quail", BLUE), ("vLLM", ORANGE))
     ):
-        offset = (method_index - 0.5) * width
+        offset = (method_index - 0.5) * (width + pair_gap)
         values = [
             percent_of_sol(by[name][method], by[name]["SoL"]) for name in DATASETS
         ]
@@ -262,22 +263,27 @@ def plot_headline(rows, destination: Path):
         axis.bar_label(
             containers,
             fmt="%.1f%%",
-            padding=3,
+            padding=2,
             fontsize=11,
             color=DARK,
         )
-        if method == "Quail":
-            rates = [
-                _tokens_per_second_label(statistics.mean(by[name][method]))
-                for name in DATASETS
-            ]
-            axis.bar_label(
-                containers,
-                labels=rates,
-                padding=18,
-                fontsize=11,
+        if method != "Quail":
+            continue
+        for position, percent, name in zip(positions, values, DATASETS):
+            rate = statistics.mean(by[name][method])
+            axis.annotate(
+                _tokens_per_second_label(rate),
+                xy=(position + offset, percent),
+                xytext=(0, 16),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                fontsize=9,
                 color=BLUE,
                 fontstyle="italic",
+                linespacing=0.95,
+                zorder=4,
+                annotation_clip=False,
             )
 
     axis.axhline(
