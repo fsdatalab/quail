@@ -12,7 +12,7 @@ link-citations: true
 ::: {.figure-block .wide-figure}
 [![Average requested input token throughput by dataset for Quail, vLLM, and SoL.](figures/quailb_tok_per_sec.png){width=100%}](figures/quailb_tok_per_sec.pdf)
 
-*Figure 1. Average requested input tokens per second by dataset on QUAIL-B at scale factor 0.1, using Qwen3 4B FP8 on one H100. Bars show Quail and vLLM; horizontal lines show SoL estimates. The first four datasets use the left linear scale. BIO uses the separate linear scale on the right because its medical reports are much longer. Dataset labels show how many queries are averaged; BIO uses all four queries.*
+*Figure 1. Average requested input tokens per second by dataset on QUAIL-B at scale factor 0.1, using Qwen3 4B FP8 on one H100. Bars show Quail and vLLM; dashed horizontal lines show SoL estimates. IMDB, FEV, LEP, and AGENT use the left scale. BIO uses the right scale because its medical reports are much longer. Dataset labels show how many queries are averaged; BIO uses all four queries.*
 :::
 
 # 1. The growth of AI-powered data processing
