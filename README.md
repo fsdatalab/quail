@@ -55,23 +55,18 @@ with quail.Session(config=config) as session:
 
 ## Quail Server
 
-Quail Server is optional. Run it when you want to submit a long
-query, close the client, and fetch the result later. It runs on any
-machine with a supported GPU, with no options; the docs also cover a
-Modal deployment. The client-server design is modeled after
-[Spark Connect](https://spark.apache.org/docs/latest/spark-connect-overview.html).
-Give `Session` the server's address; the query code stays the same.
-
 ```bash
 pip install "quail-engine[server]"
 quail-server
 ```
 
+Pass `endpoint` to run the query on the server. `submit()` returns
+after the record is saved. Reattach with `session.get_run(id)`.
+
 ```python
-with quail.Session(config=config, endpoint="http://gpu-host:8642") as session:
+with quail.Session(config=config, endpoint="http://127.0.0.1:8642") as session:
     session.register("reviews", quail.DocumentProvider.from_table(reviews, id_col="id"))
     run = session.sql(SQL, dialect="bq").submit()
-    print(run.id)                 # reattach later with session.get_run(run.id)
     table = run.result().collect()
 ```
 

@@ -2,418 +2,265 @@
 title: Quail Server
 ---
 
-Quail Server is an optional server that runs on the GPU host. A
-`Session` created with an `endpoint` sends its queries there instead
-of running them in your process. The server saves each query's
-record, its status, and its result, and it keeps running the query
-after the client disconnects. Local use of Quail does not start Quail
-Server, does not need it, and does not install its dependencies. It
-runs on any machine with a supported GPU; Modal, further down, is one
-way to host it, not a requirement.
+Quail Server is the HTTP server for remote queries. Point a `Session`
+at it with `endpoint`. The client sends SQL. The server compiles the
+query, runs it, and stores the record and the result. The query
+continues after the client disconnects.
 
-## The design, compared with Spark Connect
-
-The split between client and server is modeled after
-[Spark Connect](https://spark.apache.org/docs/latest/spark-connect-overview.html),
-Apache Spark's client-server protocol. The ideas map one to one.
-
-| Idea | Spark Connect | Quail Server |
-| --- | --- | --- |
-| Thin client | The client sends an unresolved plan, in which SQL text is one relation type; the server resolves and runs it | The client sends the SQL text; the server compiles and plans it, because that needs the server's catalog and tokenizer |
-| Client-chosen session id | `session_id` on every request | `session_id`, chosen by the client session and sent with every submission |
-| Client-chosen operation id | `operation_id`; `ReattachExecute` resumes by it | `query_id`; it names the run and makes a repeated submission safe |
-| Result transport | Arrow batches inside `ExecutePlanResponse` | A stream of Arrow record batches over HTTP |
-| Reattaching | `ReattachExecute` | `session.get_run(query_id)` from another process |
-
-Two things differ.
-
-- The transport is HTTP with JSON control messages, not gRPC with
-  protobuf messages. There are three reasons. The client uses only
-  the Python standard library to make requests. The browser status
-  page uses the same routes with server-sent events, which are one
-  HTTP response the server holds open and adds to as the record
-  changes. Modal serves HTTP web endpoints.
-- Quail Server saves query records in SQLite. Spark Connect does not
-  keep operations across a server restart. A record here survives
-  one, and you can ask for its status and result afterwards.
-
-Table data never travels as JSON. It travels as Arrow IPC, the binary
-format Apache Arrow defines for tables. Inputs are uploaded as Arrow
-IPC files. Results come back as a stream of Arrow record batches; a
-record batch is one block of rows with one schema.
+Omit `endpoint` to run the query in the client process. That path
+does not start Quail Server.
 
 ## Start the server
 
-Two commands start Quail Server on a machine with one supported GPU.
+On a machine with one supported GPU:
 
 ```bash
 pip install "quail-engine[server]"
 quail-server
 ```
 
-With no options, the server:
+With no options, `quail-server`:
 
-- Runs every built-in model: `diffusion-gemma-26b-a4b-fp8`,
-  `qwen3-32b-fp8`, `qwen3-4b-fp8`, `qwen3-reranker-0.6b-bf16`, and
-  `qwen3-reranker-4b-bf16`. Each query still names the model it wants.
-- Uses the GPU this machine has. It reads the name CUDA reports for
-  GPU 0 and maps it to a device name: a name holding
-  `H100 80GB HBM3` becomes `h100-sxm`, and one holding
-  `RTX PRO 6000 Blackwell` becomes `rtx-pro-6000-blackwell-server`.
-  With no GPU, or with a name it does not know, it prints those two
-  device names and exits; pass `--device` yourself.
-- Keeps the SQLite file, uploaded inputs, and results under
-  `~/.quail/server`.
-- Listens on `127.0.0.1:8642`, so only this machine can reach it.
+- serves every built-in model. Each query still names its model.
+- selects the device from GPU 0. A CUDA name containing
+  `H100 80GB HBM3` is `h100-sxm`. A name containing
+  `RTX PRO 6000 Blackwell` is `rtx-pro-6000-blackwell-server`.
+- stores the SQLite file, uploads, and results in `~/.quail/server`.
+- listens on `127.0.0.1:8642`.
 
-At startup it prints what it runs, the data directory, whether a
-token is required, and the line to connect with:
+It prints the device, the models, the data directory, and the
+`endpoint` string to pass to `Session`. The first query loads its
+model. A later query that asks for the same model reuses it.
 
-```text
-Quail Server on h100-sxm: diffusion-gemma-26b-a4b-fp8, qwen3-32b-fp8, qwen3-4b-fp8, qwen3-reranker-0.6b-bf16, qwen3-reranker-4b-bf16
-data: /home/you/.quail/server
-token: none
-connect: quail.Session(config, endpoint="http://127.0.0.1:8642")
-the first query loads its model; later queries reuse it
-```
+If there is no CUDA GPU, or the GPU is not one of those two, the
+process exits. Pass `--device` with `h100-sxm` or
+`rtx-pro-6000-blackwell-server`.
 
-### From another machine
-
-Pass `--host 0.0.0.0` to accept connections from other machines, and
-set a token, because the port is then open to the network. A bearer
-token is one secret string the client puts in the `Authorization`
-header of every request; anyone who has the string can use the
-server. Set it with `--token` or with `QUAIL_SERVER_TOKEN` in the
-server's environment.
+### Accept connections from other machines
 
 ```bash
 QUAIL_SERVER_TOKEN=<token> quail-server --host 0.0.0.0
 ```
 
-Clients then pass `endpoint="http://<host>:8642"` to `quail.Session`
-and set the same `QUAIL_SERVER_TOKEN` in their own environment.
+Set `QUAIL_SERVER_TOKEN` to the same value in the client environment.
+Clients pass `endpoint="http://<host>:8642"`.
 
 ### Options
 
-| Option | Meaning |
-| --- | --- |
-| `--data-dir` | Where the SQLite file, uploaded inputs, and results live. Default `~/.quail/server`. Keep it on a disk that survives restarts. |
-| `--model` | A model this server runs. Repeat the option for more than one. Default: every registered model. |
-| `--device` | The device name every query must ask for. Default: the GPU this machine has. |
-| `--gpus` | A GPU count this server accepts. Repeat for more than one. Default 1. |
-| `--backend` | An accepted backend. Repeat for more than one. Default `quail`. |
-| `--host` | Address to listen on. Default `127.0.0.1`. Use `0.0.0.0` to accept other machines. |
-| `--port` | Port to listen on. Default `8642`. |
-| `--default-timeout` | Execution time limit in seconds when a submission names none. Default 1000 seconds, which is about 17 minutes. |
-| `--max-timeout` | Largest time limit a submission may ask for, in seconds. Default 14400 seconds, which is 4 hours. |
-| `--max-upload-gib` | Largest input snapshot accepted, in GiB. Default 8. |
-| `--token` | A bearer token every `/v1` request must carry. Default is the value of `QUAIL_SERVER_TOKEN`; no token is required when that variable is unset. |
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--data-dir` | `~/.quail/server` | SQLite file, uploads, and results |
+| `--model` | every built-in model | A model this server accepts. Repeat for more than one |
+| `--device` | this machine's GPU | Device name every query must use |
+| `--gpus` | `1` | A GPU count this server accepts. Repeat for more than one |
+| `--backend` | `quail` | An accepted backend. Repeat for more than one |
+| `--host` | `127.0.0.1` | Bind address. `0.0.0.0` accepts other machines |
+| `--port` | `8642` | Port |
+| `--default-timeout` | `1000` | Execution limit, in seconds, when a submission sets none |
+| `--max-timeout` | `14400` | Largest limit a submission may set, in seconds |
+| `--max-upload-gib` | `8` | Largest input snapshot, in GiB |
+| `--token` | `QUAIL_SERVER_TOKEN` | Bearer token required on `/v1`. No token when unset |
 
-Quail Server needs no database server. It keeps one SQLite file that
-it alone writes, with uploaded inputs and saved results as files
-beside it. Restart it on the same `--data-dir` and those files are
-still there. A `queued` query runs. A query that was `planning` or
-`running` is marked `interrupted`; it is not restarted and not left
-`running`. Losing the data directory loses everything: Quail Server
-does not resume GPU work after a crash, and it does not retry.
+Restart the server on the same `--data-dir`. Saved results are still
+there, and a `queued` query runs. A query that was `planning` or
+`running` is marked `interrupted`.
 
-### What the machine needs
+### What you need
 
-- A CUDA GPU the server knows: an H100 SXM or an RTX PRO 6000
-  Blackwell Server. Those are the only two devices Quail has specs
-  for, and the three large built-in models are fp8 builds, meaning
-  their weights are stored in 8-bit floating point.
-- One whole GPU per model copy. Quail does not split one model's
+- An H100 SXM or an RTX PRO 6000 Blackwell Server.
+- One GPU for each copy of a model. Quail does not shard one model's
   weights across GPUs.
-- Disk space for the Hugging Face cache, which holds the downloaded
-  model weights, and for compiled kernels. Both go to their default
-  locations; the server does not move them.
-- `HF_TOKEN` in the environment for a gated model, such as
-  DiffusionGemma. Without it the weight download fails.
+- `HF_TOKEN` for a gated model, such as DiffusionGemma.
 
-## Connect from Python
-
-Pass `endpoint` to `Session`. Everything else is the same as a local
-session.
+## Connect
 
 ```python
 import quail
 
 config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
-with quail.Session(config=config, endpoint="http://gpu-host:8642") as session:
+with quail.Session(config=config, endpoint="http://127.0.0.1:8642") as session:
     session.register("reviews", quail.DocumentProvider.from_parquet(
         "reviews.parquet", id_col="id"))
     result = session.sql(SQL, dialect="bq").run()
     table = result.collect()
 ```
 
-- `run()` submits the query, waits for the saved result, and returns
-  a `QueryResult`.
+- `run()` submits the query, waits, and returns a `QueryResult`.
 - `collect()` does the same and returns one Arrow table.
-- `execute_stream()` submits, waits, and streams the result rows back
-  from the server as Arrow record batches. The server chooses the
-  batch size, so `batch_rows` is accepted and ignored; `limit` works.
-- The client makes its HTTP requests with the Python standard library
-  and reads tables with pyarrow. It does not need the `server` extra;
-  that is for the host running the server.
-- `Session` takes no token argument. Set `QUAIL_SERVER_TOKEN` in the
-  client's environment when the server has a token. To pass one in
-  code, use `quail.server.client.ServerClient(endpoint, token=...)`
-  directly.
+- `execute_stream()` waits, then streams the rows as Arrow record
+  batches. The server picks the batch size, so `batch_rows` is
+  ignored. `limit` applies.
+- The client does not need the `server` extra.
+- `Session` has no token argument. Set `QUAIL_SERVER_TOKEN`, or
+  construct `quail.server.client.ServerClient(endpoint, token=...)`.
 
-## Tables on a remote session
+## Tables
 
-`register` must describe each table so the server can read it without
-the client. A provider it cannot describe raises `TypeError` at
-`register()`, and the table is not registered.
+`register` describes each table so the server can read it. Anything
+else raises `TypeError` at `register()`.
 
-| Provider | Sent as |
+| Provider | What is sent |
 | --- | --- |
-| `from_table`, `from_parquet`, `from_ipc`, `from_dataset` | One Arrow IPC snapshot file |
-| `from_hf` | A reference to the Hugging Face dataset, pinned to a commit. When the provider has no `revision`, the current head commit is looked up at `register()` and pinned |
-| Any other provider | `TypeError` |
+| `from_table`, `from_parquet`, `from_ipc`, `from_dataset` | One Arrow IPC file, named by the SHA-256 of its bytes |
+| `from_hf` | A Hugging Face dataset pinned to a commit. With no `revision`, the current head is pinned at `register()` |
 
-A snapshot file is named by the SHA-256 hash of its bytes. Before
-uploading, the client asks whether the server already holds that
-hash, so the same table is uploaded once however many queries use it.
+The client skips the upload when the server already has that hash.
+Closing the session deletes only the client's local staging files.
 
-An accepted query owns its inputs. Closing the session removes the
-client's staged snapshot files only; the server keeps every accepted
-query and the inputs it needs.
+## Submit
 
-## Submit without waiting
-
-`submit()` returns as soon as the server has saved the record.
+`submit()` returns once the record is saved. You can disconnect and
+reattach later, from this process or another one.
 
 ```python
 with quail.Session(config=config, endpoint=endpoint) as session:
     session.register("reviews", provider)
-    run = session.sql(SQL, dialect="bq").submit(query_id="nightly-2026-09-21",
-                                                timeout_s=1000)
-    query_id = run.id
+    run = session.sql(SQL, dialect="bq").submit(
+        query_id="nightly-2026-09-21", timeout_s=1000)
 ```
-
-Later, from any process:
 
 ```python
 with quail.Session(config=config, endpoint=endpoint) as session:
-    run = session.get_run(query_id)
-    print(run.status().state)
+    run = session.get_run("nightly-2026-09-21")
     for status in run.watch():
         print(status.state, status.progress)
     result = run.result()
 ```
 
-`submit(query_id=None, timeout_s=None)` returns a `QueryRun`.
-`run.id` is the query id. `session.get_run(id)` returns a `QueryRun`
-for an id the server already accepted; it never resubmits and never
-starts another execution.
+`session.get_run(id)` does not submit the query again.
 
-What a `QueryRun` offers:
+- `status()` returns the saved record: `state`, `revision`,
+  `progress`, `plan`, `error`, `result`, and the submission.
+- `watch()` yields the current record, then each newer `revision`,
+  until the query is done. The default poll is 30 seconds.
+- `result()` waits and returns the `QueryResult`. It raises
+  `QueryFailedError` when the record is `failed`, `interrupted`, or
+  `cancelled`.
+- `stream_result()` waits, then streams the rows as Arrow record
+  batches.
+- `cancel()` cancels a `queued` query immediately. On a running query
+  it kills the process that holds the model, and the record becomes
+  `cancelled`. The next query loads the model again.
 
-- `status()` returns the complete saved snapshot: `state`,
-  `revision`, `progress`, `plan`, `error`, `result`, `session_id`,
-  `timeout_s`, and the submitted `spec`, `config`, and `inputs`.
-- `watch(poll_s=30)` yields the current snapshot, then each newer
-  revision, until the query is done. Snapshots in between can be
-  skipped. Every change to a record is one SQLite transaction that
-  raises `revision` by one, so a read that starts after a change
-  returns sees that revision or a newer one.
-- `wait(poll_s=30)` waits for the end and returns the final snapshot.
-  It raises `QueryFailedError` when the record ended `failed`,
-  `interrupted`, or `cancelled`.
-- `result(poll_s=30)` waits and returns the `QueryResult`, with the
-  same failure rule as `wait()`.
-- `stream_result(poll_s=30)` waits, then streams the result rows as
-  Arrow record batches.
-- `cancel()` cancels a queued query at once. On a running query it
-  kills the process that has the model loaded, and the record ends
-  `cancelled`. The next query loads the model again. It returns the
-  snapshot taken after the request. The server closes the record
-  first and kills the process second. Each execution attempt carries
-  an execution epoch, a number that goes up by one every time a
-  record starts executing, so an event that arrives from a closed
-  execution is rejected and changes nothing.
+`query_id` is the name of the run. Submit the same id with the same
+query and the server returns the existing run. The same id with a
+different query, config, inputs, or timeout is HTTP 409,
+`QueryIdConflictError`. Omit `query_id` and the client generates one.
+An id is 1 to 128 characters: a letter or digit, then letters,
+digits, `.`, `_`, `:`, or `-`.
 
-`query_id` is both the name of the run and the key that makes a
-retry safe.
-
-- Choose your own id. If the response to `submit()` is lost, submit
-  the same id with the same query again and you get the same run
-  back, not a second execution.
-- The same id with a different query, engine config, inputs, or
-  timeout is an error: HTTP 409, `QueryIdConflictError`.
-- When you omit `query_id`, the client picks a random one.
-- An id is 1 to 128 characters. The first must be a letter or a
-  digit. The rest may be letters, digits, `.`, `_`, `:`, or `-`. That
-  is `QUERY_ID_PATTERN` in `quail/server/records.py`.
-
-`session.session_id` is the id this client session sends with every
-submission. The server saves it on each record, so
-`GET /v1/queries?session_id=<id>` lists what one session submitted.
+`session.session_id` is stored on every record from that session.
+`GET /v1/queries?session_id=<id>` lists them.
 
 The states are `queued`, `planning`, `running`, `succeeded`,
-`failed`, `interrupted`, and `cancelled`. The last four are terminal:
-a record in one of them never changes again. A record becomes
-`succeeded` only after the server has reread the saved result,
-report, and answer tables, and checked that the result file holds
-the row count the run reported. If any file cannot be reread, the
-record ends `failed` instead.
+`failed`, `interrupted`, and `cancelled`. A record in one of the last
+four does not change. The server sets `succeeded` only after it has
+reread the result, the report, and the answer tables.
 
-A query gets a time limit from `timeout_s`, or the server's
-`--default-timeout` when the submission names none. The clock starts
-when execution starts. A query that runs past the limit ends `failed`
-with error type `TimeoutError`, and the model process is killed the
-same way as on cancel. A limit above the server's `--max-timeout` is
-rejected at submission.
+`timeout_s` is the execution limit, counted from when the query
+starts running. When you omit it, the server uses `--default-timeout`.
+A query that exceeds the limit is `failed` with error type
+`TimeoutError`, and the model process is killed. A limit above
+`--max-timeout` is rejected.
 
 ## Answers while the query runs
 
-The engine reports answers as it has them. A filter reports each
-chunk's finished documents. A join reports each anchor document the
-moment it finishes. `AI.SCORE` reports each scored batch. The engine
-also reports when a document's prefix is dropped from KV, the
-key-value cache the model keeps for tokens it has already read.
-Quail Server saves these entries as they arrive, so a client can show
-results filling in instead of waiting for the end.
+The server stores answer entries as the engine produces them.
 
 ```python
 for entry in run.stream_answers():
     if entry["kind"] == "filter":
-        # [row index, last stage asked, passed] per document; a document
-        # that passed its last stage survived the filter
-        survivors = [row for row, _stage, passed in entry["documents"]
-                     if passed]
+        survivors = [row for row, _stage, passed in entry["documents"] if passed]
     elif entry["kind"] == "join":
-        # entry["anchor"] is the anchor alias and entry["document"] its row
-        # index; entry["matches"] lists the partner row index tuples that
-        # answered true, out of the entry["asked"] pairs evaluated
         print(entry["anchor"], entry["document"],
               len(entry["matches"]), "of", entry["asked"])
     elif entry["kind"] == "score":
-        # entry["rows"] and entry["scores"] line up
-        ...
+        ...  # entry["rows"] and entry["scores"]
     elif entry["kind"] == "evict":
-        # one document's prefix was dropped from KV
         print(entry["alias"], entry["document"], entry["tokens"])
 ```
 
-- `stream_answers(poll_s=30)` yields each saved entry in order, and
-  ends when the query is done and every saved entry was yielded.
-- `answers(after=N, limit=1000)` returns the entries saved so far
-  from entry `N` on. It also returns `next`, the entry to ask for
-  next, and `done`, whether more can still arrive.
-- `status().progress["answers_saved"]` is the entry count the record
-  knows about.
-- Entries carry row indices, not documents, and agree with the saved
-  answer tables.
-- Reporting them never slows the query. The executor runs in a child
-  process. It puts its events on a queue, and a helper thread writes
-  them to the pipe back to the server, the operating system channel
-  the two processes talk over. A pipe write blocks once its buffer is
-  full, so the GPU loop itself never waits on the server.
+- `filter`: one chunk of documents, each `[row, last stage, passed]`.
+- `join`: one finished anchor. `matches` lists the partner rows that
+  answered true, out of `asked` pairs.
+- `score`: one batch of reranker scores.
+- `evict`: one document prefix dropped from KV, in tokens.
+- `answers(after=N)` returns the entries from `N` on, plus `next` and
+  `done`. `status().progress["answers_saved"]` is the count on the
+  record.
 
-## What a remote session cannot do
+Entries carry row indexes, not document text.
 
-- `explain()` and `plan()` before the query runs. The server compiles
-  and plans it. Read the chosen plan at `run.status().plan["text"]`
-  after submission.
-- The Python builder API (`session.docs`). Write the query in SQL.
-- `run(plan=...)` with an edited plan. A remote query runs the plan
-  the server chose.
+## Unsupported
 
-## In the browser
+- `explain()` and `plan()` before the query runs. After you submit,
+  the plan text is `run.status().plan["text"]`.
+- `session.docs`. Write the query in SQL.
+- `run(plan=...)`. The server runs the plan it chose.
 
-Open `http://gpu-host:8642/queries/<query_id>` for a page showing the
-state, progress, plan, error, SQL, inputs, and a preview of the first
-20 result rows. It updates itself from server-sent events.
-`http://gpu-host:8642/` lists recent queries.
+## Browser
 
-The page calls the same `/v1` routes the Python client does, so it
-needs the token when the server has one.
+Open `http://<host>:8642/queries/<query_id>` for the state, progress,
+plan, error, SQL, inputs, and the first 20 result rows. The page
+updates from server-sent events. `http://<host>:8642/` lists recent
+queries.
 
-- Open the page once with `#token=<token>` after the URL. The page
-  saves the token in that browser's local storage and removes it from
-  the address bar.
-- Without a saved token, the page asks for one the first time a
-  request comes back 401.
-- Result and report links on the page are fetched with the token
-  attached and then saved, because a plain link cannot send a header.
+When the server has a token, open the page once as
+`.../queries/<query_id>#token=<token>`. The page stores the token in
+local storage and removes it from the address bar. Result links are
+fetched with that token, because a normal link cannot send the
+header.
 
-## The HTTP API
+## HTTP API
 
-Every `/v1` route needs `Authorization: Bearer <token>` when the
-server has a token. The two page routes do not.
+`/v1` routes require `Authorization: Bearer <token>` when a token is
+set. The HTML pages do not.
 
 | Route | Purpose |
 | --- | --- |
-| `GET /v1/capabilities` | Models, device, GPU counts, backends, and the timeout and upload limits |
-| `HEAD /v1/inputs/{content_id}` | 200 when the server already holds this snapshot, 404 when it does not |
-| `PUT /v1/inputs/{content_id}` | Upload one Arrow IPC file. `content_id` is its lowercase SHA-256 hex digest |
-| `POST /v1/queries` | Submit. Body fields: `sql`, `dialect`, `order`, `config`, `inputs`, `query_id`, `session_id`, `timeout_s`. Returns the saved record with HTTP 201 |
-| `GET /v1/queries?limit=&session_id=` | Recent records, newest first. `limit` defaults to 50 and is capped at 500. `session_id` filters to one client session |
-| `GET /v1/queries/{id}?after=N&wait=S` | The snapshot, waiting up to `S` seconds for a revision above `N`. `S` is capped at 60 seconds |
+| `GET /v1/capabilities` | Models, device, GPU counts, backends, limits |
+| `HEAD /v1/inputs/{content_id}` | `200` if this snapshot is already stored, otherwise `404` |
+| `PUT /v1/inputs/{content_id}` | Upload one Arrow IPC file. `content_id` is its SHA-256 hex digest |
+| `POST /v1/queries` | Submit. Returns the saved record, HTTP 201 |
+| `GET /v1/queries?limit=&session_id=` | Recent records, newest first |
+| `GET /v1/queries/{id}?after=N&wait=S` | The record, waiting up to `S` seconds for a newer revision |
 | `GET /v1/queries/{id}/events` | Server-sent events, one per revision |
 | `POST /v1/queries/{id}/cancel` | Cancel |
-| `GET /v1/queries/{id}/result` | The result rows as `application/vnd.apache.arrow.stream`, with the row count in the `x-quail-rows` header |
-| `GET /v1/queries/{id}/files/{name}` | One saved result file, returned as it is on disk. Only files named in the record's result manifest |
-| `GET /v1/queries/{id}/rows?limit=` | The first rows as JSON, for the status page. `limit` defaults to 20 and is capped at 1000 |
-| `GET /v1/queries/{id}/answers?after=N&limit=` | Answer entries saved so far, from entry `N` on. `limit` defaults to 1000 and is capped at 10000 |
-| `GET /queries/{id}` | The status page for one query |
-| `GET /` | The recent queries page |
+| `GET /v1/queries/{id}/result` | Result rows as an Arrow stream. Row count is `x-quail-rows` |
+| `GET /v1/queries/{id}/files/{name}` | One file named in the result manifest |
+| `GET /v1/queries/{id}/rows?limit=` | The first rows as JSON |
+| `GET /v1/queries/{id}/answers?after=N&limit=` | Answer entries from `N` on |
+| `GET /queries/{id}` | Status page |
+| `GET /` | Recent queries |
 
-A reader waiting for a newer revision, with a long poll (a request
-the server holds open until something changes or the wait runs out)
-or with server-sent events, waits on the server's event loop, the
-single thread that handles requests that are waiting on something.
-It does not hold one of the server's worker threads, so many waiting
-readers do not slow a submission.
+`POST /v1/queries` takes `sql`, `dialect`, `order`, `config`,
+`inputs`, `query_id`, `session_id`, and `timeout_s`.
 
 ## On Modal
 
-Modal is one way to host Quail Server, not a requirement; the
-`quail-server` command above needs no Modal.
-
-`quail.server.modal_app` deploys Quail Server as one web endpoint on
-the existing `quail-engine` app, backed by one H100 container. The
-deployment accepts `qwen3-4b-fp8`, `qwen3-32b-fp8`,
-`diffusion-gemma-26b-a4b-fp8`, `qwen3-reranker-0.6b-bf16`, and
-`qwen3-reranker-4b-bf16`.
+Modal is one way to host the server. `quail-server` on your own
+machine does not use it.
 
 ```bash
 modal secret create quail-server-token QUAIL_SERVER_TOKEN=<token>
-modal deploy -m quail.server.modal_app 2>&1 | tee server-deploy.log
+modal deploy -m quail.server.modal_app
 ```
 
-`modal deploy` prints the endpoint URL. Pass it as `endpoint` to
-`quail.Session`. The URL is public, so the token is required. The
-secret is named `quail-server-token` and holds `QUAIL_SERVER_TOKEN`.
-Clients set the same variable.
+`modal deploy` prints the URL. Pass it as `endpoint`. The URL is
+public, so the token is required. The deployment is one H100
+container on the `quail-engine` app, and it accepts the built-in
+models.
 
-Where the data lives:
-
-- Results and uploaded inputs are written straight onto the
-  `quail-results` Volume, under `/results/quail-server/`. They are
-  write-once files.
-- The live SQLite file stays on the container's local disk, at
-  `/tmp/quail-server/quail.sqlite3`. A Modal Volume has no file
-  locking, and an in-place write can rewrite a whole file, so SQLite
-  must not run there.
-- A checkpoint thread copies the database to
-  `/results/quail-server/quail.sqlite3` with SQLite's online backup,
-  and then calls `volume.commit()`. The copy includes the
-  write-ahead log, the side file SQLite writes changes to first so
-  that readers and the writer do not block each other.
-- A submission is copied to the Volume and committed before the
-  server acknowledges it. An id the client holds therefore survives a
-  container death. If that copy fails, the record is discarded and
-  the client gets an error instead of an id the server might forget.
-- A change that only moved a progress counter is copied at most every
-  30 seconds. A change of state is copied within 1 second, 30 times
-  sooner than a progress-only change. Losing a progress counter costs
-  nothing, because a restart marks an unfinished record `interrupted`
-  anyway.
-- When a new container starts it copies the database back from the
-  Volume before serving. `max_containers=1` keeps one writer.
+- Results and uploads are written to the `quail-results` Volume at
+  `/results/quail-server/`.
+- The live SQLite file is `/tmp/quail-server/quail.sqlite3` on the
+  container disk. A Volume has no file locking, so SQLite does not
+  run on the Volume. A checkpoint copies the database to
+  `/results/quail-server/quail.sqlite3` and calls `volume.commit()`.
+- That copy is committed before the server returns a new query id.
+  A state change is copied within 1 second. A progress update is
+  copied at most every 30 seconds.
+- A new container restores the database before it serves requests.
+  `max_containers=1`.
 - An idle container stops after 15 minutes. The next request starts
-  one, and the first query then waits for the model to load again.
+  a container, and the first query loads the model.
