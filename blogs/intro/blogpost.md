@@ -10,9 +10,9 @@ link-citations: true
 :::
 
 ::: {.figure-block .wide-figure}
-[![Average requested input token throughput by dataset for Quail, vLLM, and SoL.](figures/quailb_tok_per_sec.png){width=100%}](figures/quailb_tok_per_sec.pdf)
+[![Average requested input token throughput by dataset for Quail and vLLM, as a percent of SoL.](figures/quailb_tok_per_sec.png){width=100%}](figures/quailb_tok_per_sec.pdf)
 
-*Figure 1. Average requested input tokens per second by dataset on QUAIL-B at scale factor 0.1, using Qwen3 4B FP8 on one H100. Bars show Quail and vLLM; dashed horizontal lines show SoL estimates. IMDB, FEV, LEP, and AGENT use the left scale. BIO uses the right scale because its medical reports are much longer. Dataset labels show how many queries are averaged; BIO uses all four queries.*
+*Figure 1. Average requested input tokens per second on QUAIL-B at scale factor 0.1, using Qwen3 4B FP8 on one H100, as a percent of each dataset's SoL estimate. The top of the axis is 100% of SoL. SoL is the optimistic lower bound on runtime from GPU arithmetic and memory traffic. Each bar is the dataset's mean tokens per second divided by its mean SoL tokens per second. The label above each Quail percent is that bar's mean tokens per second. The averages use the current 31 queries. The original LEP-5, LEP-6, and LEP-8 are excluded. Dataset labels show how many queries are averaged.*
 :::
 
 # 1. The growth of AI-powered data processing
@@ -416,7 +416,7 @@ Across the 29 queries with matching measurements at scale factor 0.1, Quail is f
 
 ### Per-query metrics table
 
-The table below reports all 34 queries with matching results in the scale factor 0.1 comparison. SoL assumes zero KV regret. Costs use about $3.96 per H100-hour. BIO-1, BIO-3, and BIO-4 use remake run `20260921T190132Z-a2059688`; BIO-2 keeps its prior run. BIO-4 scale factor 1.0 results are in Section 4.3.
+The table below reports the 31 current QUAIL-B queries at scale factor 0.1. The original LEP-5, LEP-6, and LEP-8 are omitted. Current LEP-5 was saved as LEP-7; its plan is unchanged. SoL assumes zero KV regret. Costs use about $3.96 per H100-hour. BIO-1, BIO-3, and BIO-4 use remake run `20260921T190132Z-a2059688`; BIO-2 keeps its prior run. BIO-4 scale factor 1.0 results are in Section 4.3.
 
 ::: {.metrics-table}
 | query | method | tok_per_sec | kv_regret | cost_usd |
@@ -511,21 +511,12 @@ The table below reports all 34 queries with matching results in the scale factor
 | LEP-4 | Quail | 31448.77 | 1852 | 0.0442 |
 | LEP-4 | vLLM | 26474.53 | 49540 | 0.0525 |
 | LEP-4 | SoL | 1054502.31 | 0 | 0.0013 |
-| LEP-5 | Quail | 5688.60 | 1794 | 0.0286 |
-| LEP-5 | vLLM | 4224.29 | 35327 | 0.0385 |
-| LEP-5 | SoL | 300823.31 | 0 | 0.0005 |
-| LEP-6 | Quail | 13549.90 | 1732 | 0.0110 |
-| LEP-6 | vLLM | 9472.69 | 10758 | 0.0158 |
-| LEP-6 | SoL | 281667.61 | 0 | 0.0005 |
-| LEP-7 | Quail | 28188.78 | 3420 | 0.0433 |
-| LEP-7 | vLLM | 23364.36 | 51004 | 0.0522 |
-| LEP-7 | SoL | 900460.88 | 0 | 0.0014 |
-| LEP-8 | Quail | 101725.37 | 1702 | 0.0015 |
-| LEP-8 | vLLM | 59266.09 | 6065 | 0.0025 |
-| LEP-8 | SoL | 281667.61 | 0 | 0.0005 |
+| LEP-5 | Quail | 28188.78 | 3420 | 0.0433 |
+| LEP-5 | vLLM | 23364.36 | 51004 | 0.0522 |
+| LEP-5 | SoL | 900460.88 | 0 | 0.0014 |
 :::
 
-Figure 1 shows the headline throughput comparison. For every method, we divide total requested input tokens by runtime. SoL uses the same requested-token total and its estimated runtime. On BIO, Quail averages about 11.5 million tokens per second, compared with 1.4 million for vLLM and 24.7 million for SoL. Under this definition, vLLM is ahead on AGENT. The latency figure below keeps the per-query detail.
+Figure 1 shows average tokens per second as a percent of each dataset's SoL estimate. For every method, we divide total requested input tokens by runtime. SoL uses the same requested-token total and its estimated runtime. Each bar divides the dataset's mean rate by that dataset's mean SoL rate. The top of the axis is 100% of SoL. On BIO, Quail averages about 11.5 million tokens per second, which is 46.6% of the 24.7 million SoL estimate, compared with 1.4 million for vLLM, or 5.6% of SoL. vLLM is ahead on AGENT, at 48.2% of SoL compared with 20.0% for Quail. The latency figure below keeps the per-query detail.
 
 ::: {.figure-block .wide-figure}
 [![Query latency for Quail, the vLLM baseline, and SoL estimates across the 31 default QUAIL-B queries. BIO-1 and BIO-3 are marked as not measured.](figures/quailb_latency.png){width=100%}](figures/quailb_latency.pdf)
