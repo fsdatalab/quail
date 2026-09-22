@@ -10,9 +10,9 @@ link-citations: true
 :::
 
 ::: {.figure-block .wide-figure}
-[![Average requested input token throughput by dataset for Quail and vLLM, as a percent of SoL.](figures/quailb_tok_per_sec.png){width=100%}](figures/quailb_tok_per_sec.pdf)
+[![Average requested input token throughput by dataset for Quail and stock vLLM, as a percent of SoL.](figures/quailb_tok_per_sec.png){width=100%}](figures/quailb_tok_per_sec.pdf)
 
-*Figure 1. Average requested input tokens per second on QUAIL-B at scale factor 0.1, using Qwen3 4B FP8 on one H100, as a percent of each dataset's SoL estimate. The top of the axis is 100% of SoL. The vertical axis uses a log scale. SoL is the optimistic lower bound on runtime from GPU arithmetic and memory traffic. Each bar is the dataset's mean tokens per second divided by its mean SoL tokens per second. The label above each Quail percent is that bar's mean tokens per second. The averages use the current 31 queries. The original LEP-5, LEP-6, and LEP-8 are excluded. Dataset labels show how many queries are averaged.*
+*Figure 1. Average requested input tokens per second on QUAIL-B at scale factor 0.1, using Qwen3 4B FP8 on one H100, as a percent of each dataset's SoL estimate. The top of the axis is 100% of SoL. The vertical axis uses a log scale. SoL is the optimistic lower bound on runtime from GPU arithmetic and memory traffic. Each bar is the dataset's mean tokens per second divided by its mean SoL tokens per second. The label above each Quail percent is that bar's mean tokens per second. The averages use all 31 current queries.*
 :::
 
 # 1. The growth of AI-powered data processing
@@ -43,14 +43,14 @@ We call this query BIO-4 in [QUAIL-B](https://github.com/fsdatalab/quail-bench),
 3. It joins the surviving reports with the cardiovascular terms, then with the neurological terms.
 
 ::: {.figure-block}
-[![The BIO-4 query plan used by the vLLM baseline.](figures/vllm-query-plan.svg){width=100%}](figures/vllm-query-plan.svg)
+[![The BIO-4 query plan used by pipelined vLLM.](figures/vllm-query-plan.svg){width=100%}](figures/vllm-query-plan.svg)
 
 *Figure 2. The BIO-4 plan filters all three inputs before the joins. Both joins use the medical report as the anchor.*
 :::
 
 To execute the plan with vLLM, we render one prompt for each filter input and one prompt for each candidate report and reaction pair. We submit every prompt as a separate inference request. We place the document text at the beginning of each prompt, followed by the instruction from the AI-SQL operator. For each join, we place the much longer medical report first as the *anchor* and the reaction term second as the *partner*. This order maximizes reuse of the prefix's key and value state (KV) across join prompts.
 
-**A cost estimate for the query plan.** Before measuring the vLLM baseline, we estimate the lowest possible runtime for the same plan. We count the model's arithmetic work and HBM traffic from the token lengths, then use a [roofline model](https://modal.com/gpu-glossary/perf/roofline-model) to estimate the time. The estimate uses the saved reference answers to determine which rows survive each stage. It assumes peak GPU throughput, full overlap between CPU and GPU work, and unlimited space for retained KV. No implementation can meet all of these assumptions, so this optimistic lower bound is our *speed of light estimate*, or SoL. For BIO-4 at scale factor 1.0, the SoL estimate is 894.37 seconds, or 14.91 minutes.[^mfu] The [implementation in Quail](https://github.com/fsdatalab/quail-exploration/blob/0d24478a82100b518d6110f5c1c8cec0c26c6487/quail/planner/sol.py) contains the full calculation.
+**A cost estimate for the query plan.** Before measuring pipelined vLLM, we estimate the lowest possible runtime for the same plan. We count the model's arithmetic work and HBM traffic from the token lengths, then use a [roofline model](https://modal.com/gpu-glossary/perf/roofline-model) to estimate the time. The estimate uses the saved reference answers to determine which rows survive each stage. It assumes peak GPU throughput, full overlap between CPU and GPU work, and unlimited space for retained KV. No implementation can meet all of these assumptions, so this optimistic lower bound is our *speed of light estimate*, or SoL. For BIO-4 at scale factor 1.0, the SoL estimate is 894.37 seconds, or 14.91 minutes.[^mfu] The [implementation in Quail](https://github.com/fsdatalab/quail-exploration/blob/0d24478a82100b518d6110f5c1c8cec0c26c6487/quail/planner/sol.py) contains the full calculation.
 
 **How we hoped vLLM would perform.** Each request produces one token constrained to `TRUE` or `FALSE`, so almost all model work is prefill. BIO-4 compiles to millions of requests, so there should always be a large batch ready for the H100. With a large enough batch, vLLM should keep the H100 busy.
 
@@ -61,14 +61,14 @@ During a join, the GPU-active row in Figure 3 shows long white gaps between shor
 BIO-4 turns its joins into separate requests for every candidate report and reaction pair. Each request must be scheduled, admitted into a batch, and tracked, even when most of its document prefix comes from the prefix cache. While the CPU does that bookkeeping, the H100 often has nothing ready to run. That host overhead appears as white space in Figure 3.[^host-overhead]
 
 ::: {.figure-block .wide-figure}
-[![Five seconds of GPU activity during a BIO-4 join with the vLLM baseline.](figures/bio4_vllm_bubbles.png){width=100%}](figures/bio4_vllm_bubbles.pdf)
+[![Five seconds of GPU activity during a BIO-4 join with pipelined vLLM.](figures/bio4_vllm_bubbles.png){width=100%}](figures/bio4_vllm_bubbles.pdf)
 
-*Figure 3. Five-second midpoint of a BIO-4 join at scale factor 0.1 with the vLLM baseline. Green in the top row marks busy GPU kernels. The middle row shows scheduler and `execute_context` work. The bottom row shows PyTorch and CUDA API calls. White gaps on the GPU row are idle bubbles.*
+*Figure 3. Five-second midpoint of a BIO-4 join at scale factor 0.1 with pipelined vLLM. Green in the top row marks busy GPU kernels. The middle row shows scheduler and `execute_context` work. The bottom row shows PyTorch and CUDA API calls. White gaps on the GPU row are idle bubbles.*
 :::
 
 The corresponding Quail timeline appears with the BIO-4 experiments in Section 4.3.
 
-The second problem is *KV regret*: the model processes tokens again after their reusable KV has been evicted. On BIO-4, the vLLM baseline recomputes 50.3 million KV tokens (out of 174.6 million fresh input tokens).
+The second problem is *KV regret*: the model processes tokens again after their reusable KV has been evicted. On BIO-4, pipelined vLLM recomputes 50.3 million KV tokens (out of 174.6 million fresh input tokens).
 
 We can, and we should, reduce both sources of waste by optimizing inference for AI-SQL.
 
@@ -336,11 +336,11 @@ During planning, Quail chooses which documents or document pairs require model e
 
 **QUAIL-B.** We created [QUAIL-B](https://github.com/fsdatalab/quail-bench), a benchmark with 31 default AI-SQL queries and two privacy queries. The default queries cover IMDB reviews, medical reports, fact checking claims, legal documents, and traces from software agents. They include single filters, sequences of filters, and queries with one or more joins. Each dataset comes in three sizes, with scale factors 0.1, 0.5, and 1.0.
 
-We compare current measurements for 29 default queries at scale factor 0.1. We do not include BIO-1 and BIO-3 because their saved runs used an older report filter. We examine BIO-4 at scale factor 1.0 and AGENT-1 in more detail.
+We compare current measurements for all 31 default queries at scale factor 0.1. We examine BIO-4 at scale factor 1.0 and AGENT-1 in more detail.
 
 **Hardware.** Every configuration uses Qwen3 4B FP8, with BF16 KV, on one H100. For each query, we run Quail and vLLM one after the other on the same physical GPU.
 
-**vLLM baseline.** We compare Quail with stock vLLM 0.26.0, using the same logical query plan and prompt layout. The vLLM baseline uses pipelining. For a sequence of filters, it submits a document's next filter as soon as the previous filter returns `TRUE`. For a join, we choose the better anchor direction and submit one inference request for each document pair in anchor order. We configure vLLM as follows:
+**vLLM baselines.** We compare Quail with stock vLLM 0.26.0, using the same logical query plan and prompt layout. Stock vLLM runs one complete filter stage before submitting the next stage. For the eight queries with multiple filters on one document stream, we also measure pipelined vLLM. It submits a document's next filter as soon as the previous filter returns `TRUE`. Both vLLM configurations use Gigatoken inside vLLM to tokenize complete prompt strings. For joins, both choose the better anchor direction and submit one inference request for each document pair in anchor order. We configure vLLM as follows:
 
 - We enable automatic prefix caching.
 - We set `max_num_batched_tokens` to 25,305, and `max_num_seqs` to 4,096.
@@ -349,131 +349,149 @@ We compare current measurements for 29 default queries at scale factor 0.1. We d
 
 We chose the parameters above by running the benchmark queries. Increasing the batch or memory limits caused GPU out of memory errors. Our roofline model predicts that the selected token budget is well above the point where model computation becomes compute bound.
 
-**Scope.** We measure query engine performance. We do not evaluate whether Qwen3 4B FP8 is the best model for each query. Quail and the vLLM baseline use the same model, prompts, and logical query plan. Our goal is to run that chosen model and plan as quickly as possible.
+**Scope.** We measure query engine performance. We do not evaluate whether Qwen3 4B FP8 is the best model for each query. Quail and both vLLM configurations use the same model, prompts, and logical query plan. The engines do not always return the same answers. Weighted predicate agreement with the saved Qwen3 32B FP8 references is 70.72% for Quail and 77.36% for stock vLLM. The latency comparison is therefore not normalized to equal answer quality.
 
 **Metrics.** We report five metrics for each query:
 
-- **Query latency.** We measure the time after model startup and kernel warmup, and exclude result collection. We also report latency relative to the speed of light estimate from Section 2, which assumes peak GPU throughput, full overlap between CPU and GPU work, and enough GPU HBM to retain all reusable prefix KV.
+- **Query latency.** We measure the time after model startup and kernel warmup, and exclude result collection. Quail's timer starts from raw tables and query submission, including its frontend planning and input preparation. The vLLM timer starts when prompt text is submitted, and includes tokenization inside vLLM. It excludes the Quail CPU planning pass used to compile the vLLM requests. We also report latency relative to the speed of light estimate from Section 2, which assumes peak GPU throughput, full overlap between CPU and GPU work, and enough GPU HBM to retain all reusable prefix KV.
 - **GPU cost.** We multiply the query latency in hours by Modal's H100 price of $3.9492 per hour.
 - **Input tokens per second.** We sum the full input lengths of all evaluated prompts, including tokens served from KV, and divide by query latency. Each evaluated prompt counts its full input once, regardless of how often its KV was recomputed. Generated tokens are excluded.
 - **Fresh input tokens.** We count every input token computed by the model, ignoring tokens read from KV. For example, if the model computes a report's tokens during the filter, then computes the same tokens again during the join, those tokens count twice.
-- **KV regret.** We count fresh input tokens beyond the minimum needed to compute each distinct reusable prefix once. Token-identical prefixes match across rows, and this repeated work is already included in fresh input tokens.
+- **KV regret.** We count fresh input tokens beyond the minimum needed to compute each distinct reusable prefix once. Token-identical prefixes match across rows, and this repeated work is already included in fresh input tokens. The current vLLM runs tokenize complete strings, so they do not expose compatible prompt pieces for this calculation. Their KV regret is not measured.
 
 ## 4.2 Full benchmark results
 
-Across the 29 queries with matching measurements at scale factor 0.1, Quail is faster than the vLLM baseline on 27. The mean speedup is 1.91 times, the median speedup is 1.48 times, and the largest speedup is 10.04 times on BIO-2.
+Across all 31 queries at scale factor 0.1, Quail is faster than stock vLLM on 29. The mean speedup is 2.39 times, the median speedup is 1.78 times, and the largest speedup is 11.22 times on BIO-2.
 
 ### Per-query metrics table
 
-The table below reports the 31 current QUAIL-B queries at scale factor 0.1. The original LEP-5, LEP-6, and LEP-8 are omitted. Current LEP-5 was saved as LEP-7; its plan is unchanged. SoL assumes zero KV regret. Costs use about $3.96 per H100-hour. BIO-1, BIO-3, and BIO-4 use remake run `20260921T190132Z-a2059688`; BIO-2 keeps its prior run. BIO-4 scale factor 1.0 results are in Section 4.3.
+The table below reports the 31 current QUAIL-B queries at scale factor 0.1. SoL assumes zero KV regret. Costs use $3.9492 per H100-hour. All measured rows come from run `20260922T190951Z-efa30103`. Pipelined vLLM appears only where a query has multiple filters on one document stream. BIO-4 scale factor 1.0 results are in Section 4.3.
 
-::: {.metrics-table}
+::: {.metrics-table .benchmark-metrics}
 | query | method | tok_per_sec | kv_regret | cost_usd |
 | --- | --- | ---: | ---: | ---: |
-| AGENT-1 | Quail | 73124.95 | 11886152 | 0.2609 |
-| AGENT-1 | vLLM | 176628.88 | 23928 | 0.1080 |
-| AGENT-1 | SoL | 366357.25 | 0 | 0.0521 |
-| AGENT-2 | Quail | 72969.32 | 11886152 | 0.2621 |
-| AGENT-2 | vLLM | 175139.57 | 23928 | 0.1092 |
-| AGENT-2 | SoL | 364144.27 | 0 | 0.0525 |
-| BIO-1 | Quail | 94117.60 | 2484 | 0.0240 |
-| BIO-1 | vLLM | 80530.20 | 2468 | 0.0280 |
-| BIO-1 | SoL | 186194.32 | 0 | 0.0121 |
-| BIO-2 | Quail | 18280145.54 | 2477 | 0.1395 |
-| BIO-2 | vLLM | 1820083.72 | 154747 | 1.4008 |
-| BIO-2 | SoL | 37485021.13 | 0 | 0.0680 |
-| BIO-3 | Quail | 13225611.21 | 2869 | 0.1150 |
-| BIO-3 | vLLM | 1568143.71 | 1702055 | 0.9697 |
-| BIO-3 | SoL | 32399507.32 | 0 | 0.0469 |
-| BIO-4 | Quail | 14351284.26 | 624144 | 0.0761 |
-| BIO-4 | vLLM | 2013049.82 | 3907993 | 0.5427 |
-| BIO-4 | SoL | 28579085.47 | 0 | 0.0382 |
-| FEV-1 | Quail | 114934.48 | 1359 | 0.0003 |
-| FEV-1 | vLLM | 81295.12 | 1359 | 0.0004 |
-| FEV-1 | SoL | 275929.00 | 0 | 0.0001 |
-| FEV-2 | Quail | 2429051.89 | 678 | 0.0323 |
-| FEV-2 | vLLM | 1187491.64 | 106037 | 0.0660 |
-| FEV-2 | SoL | 5565379.99 | 0 | 0.0141 |
-| FEV-3 | Quail | 1927155.34 | 2605 | 0.0239 |
-| FEV-3 | vLLM | 905895.80 | 90822 | 0.0509 |
-| FEV-3 | SoL | 5326652.62 | 0 | 0.0087 |
-| FEV-4 | Quail | 1115893.58 | 2605 | 0.0053 |
-| FEV-4 | vLLM | 751710.74 | 23952 | 0.0079 |
-| FEV-4 | SoL | 2967229.86 | 0 | 0.0020 |
-| FEV-5 | Quail | 1710195.47 | 2776 | 0.0150 |
-| FEV-5 | vLLM | 833203.34 | 95455 | 0.0308 |
-| FEV-5 | SoL | 5018814.70 | 0 | 0.0051 |
-| FEV-6 | Quail | 775403.46 | 2776 | 0.0044 |
-| FEV-6 | vLLM | 557794.67 | 15909 | 0.0062 |
-| FEV-6 | SoL | 2347116.17 | 0 | 0.0015 |
-| FEV-7 | Quail | 2174277.32 | 135139 | 0.0610 |
-| FEV-7 | vLLM | 1094218.43 | 298043 | 0.1213 |
-| FEV-7 | SoL | 5691842.82 | 0 | 0.0233 |
-| FEV-8 | Quail | 2228621.90 | 3120800 | 0.0947 |
-| FEV-8 | vLLM | 1122434.17 | 3525124 | 0.1881 |
-| FEV-8 | SoL | 5725697.73 | 0 | 0.0369 |
-| FEV-9 | Quail | 1592046.28 | 1461116 | 0.0428 |
-| FEV-9 | vLLM | 812587.42 | 1648151 | 0.0838 |
-| FEV-9 | SoL | 5452523.60 | 0 | 0.0125 |
-| FEV-10 | Quail | 157457.74 | 2773 | 0.0018 |
-| FEV-10 | vLLM | 90592.12 | 4308 | 0.0032 |
-| FEV-10 | SoL | 371434.56 | 0 | 0.0008 |
-| IMDB-1 | Quail | 121830.54 | 20349 | 0.0158 |
-| IMDB-1 | vLLM | 101513.73 | 20061 | 0.0190 |
+| IMDB-1 | Quail | 118947.31 | 20350 | 0.0162 |
+| IMDB-1 | Stock vLLM | 100330.54 | not measured | 0.0192 |
 | IMDB-1 | SoL | 264443.38 | 0 | 0.0073 |
-| IMDB-2 | Quail | 988009.25 | 20349 | 0.0233 |
-| IMDB-2 | vLLM | 827243.13 | 40741 | 0.0278 |
+| IMDB-2 | Quail | 969277.94 | 20350 | 0.0237 |
+| IMDB-2 | Stock vLLM | 706839.11 | not measured | 0.0324 |
 | IMDB-2 | SoL | 2273975.42 | 0 | 0.0101 |
-| IMDB-3 | Quail | 849463.20 | 24729 | 0.0246 |
-| IMDB-3 | vLLM | 475368.18 | 1398847 | 0.0439 |
+| IMDB-3 | Quail | 924372.55 | 24730 | 0.0244 |
+| IMDB-3 | Stock vLLM | 489183.96 | not measured | 0.0462 |
 | IMDB-3 | SoL | 2003008.14 | 0 | 0.0104 |
-| IMDB-4 | Quail | 445828.31 | 21606 | 0.0190 |
-| IMDB-4 | vLLM | 293879.97 | 577154 | 0.0288 |
+| IMDB-4 | Quail | 527338.41 | 21607 | 0.0189 |
+| IMDB-4 | Stock vLLM | 286563.00 | not measured | 0.0347 |
+| IMDB-4 | Pipelined vLLM | 341464.59 | not measured | 0.0291 |
 | IMDB-4 | SoL | 1026113.86 | 0 | 0.0083 |
-| IMDB-5 | Quail | 393738.79 | 21839 | 0.0182 |
-| IMDB-5 | vLLM | 258381.32 | 531994 | 0.0277 |
+| IMDB-5 | Quail | 429888.89 | 21840 | 0.0181 |
+| IMDB-5 | Stock vLLM | 239369.27 | not measured | 0.0323 |
+| IMDB-5 | Pipelined vLLM | 275997.60 | not measured | 0.0280 |
 | IMDB-5 | SoL | 879626.62 | 0 | 0.0081 |
-| IMDB-6 | Quail | 151586.07 | 20349 | 0.0164 |
-| IMDB-6 | vLLM | 124009.86 | 63473 | 0.0200 |
+| IMDB-6 | Quail | 156978.05 | 20350 | 0.0163 |
+| IMDB-6 | Stock vLLM | 100561.55 | not measured | 0.0254 |
+| IMDB-6 | Pipelined vLLM | 127811.63 | not measured | 0.0200 |
 | IMDB-6 | SoL | 333850.55 | 0 | 0.0074 |
-| IMDB-7 | Quail | 169817.00 | 21112 | 0.0170 |
-| IMDB-7 | vLLM | 123394.50 | 337625 | 0.0234 |
+| IMDB-7 | Quail | 179735.25 | 21113 | 0.0165 |
+| IMDB-7 | Stock vLLM | 106871.87 | not measured | 0.0278 |
+| IMDB-7 | Pipelined vLLM | 128034.26 | not measured | 0.0232 |
 | IMDB-7 | SoL | 379526.20 | 0 | 0.0076 |
-| IMDB-8 | Quail | 1465971.18 | 91872 | 0.0286 |
-| IMDB-8 | vLLM | 967414.76 | 942159 | 0.0433 |
+| IMDB-8 | Quail | 1242265.24 | 91873 | 0.0285 |
+| IMDB-8 | Stock vLLM | 593922.12 | not measured | 0.0578 |
 | IMDB-8 | SoL | 3174099.85 | 0 | 0.0132 |
-| IMDB-9 | Quail | 1285940.17 | 2144348 | 0.0524 |
-| IMDB-9 | vLLM | 938999.72 | 3018927 | 0.0718 |
+| IMDB-9 | Quail | 976197.73 | 2144350 | 0.0598 |
+| IMDB-9 | Stock vLLM | 656719.28 | not measured | 0.0871 |
 | IMDB-9 | SoL | 3738700.60 | 0 | 0.0180 |
-| IMDB-10 | Quail | 1182286.98 | 2132608 | 0.0531 |
-| IMDB-10 | vLLM | 714926.16 | 4360757 | 0.0878 |
+| IMDB-10 | Quail | 973640.65 | 2132610 | 0.0595 |
+| IMDB-10 | Stock vLLM | 547818.90 | not measured | 0.1039 |
 | IMDB-10 | SoL | 3606897.01 | 0 | 0.0174 |
-| LEP-1 | Quail | 119951.82 | 1702 | 0.0012 |
-| LEP-1 | vLLM | 95613.77 | 1622 | 0.0015 |
+| BIO-1 | Quail | 93337.99 | 2484 | 0.0242 |
+| BIO-1 | Stock vLLM | 79164.04 | not measured | 0.0285 |
+| BIO-1 | SoL | 186194.32 | 0 | 0.0121 |
+| BIO-2 | Quail | 17932736.74 | 2484 | 0.1422 |
+| BIO-2 | Stock vLLM | 1596919.92 | not measured | 1.5958 |
+| BIO-2 | SoL | 37485021.13 | 0 | 0.0680 |
+| BIO-3 | Quail | 16808496.63 | 2869 | 0.1142 |
+| BIO-3 | Stock vLLM | 2046908.70 | not measured | 0.9263 |
+| BIO-3 | SoL | 32399507.32 | 0 | 0.0469 |
+| BIO-4 | Quail | 14351070.48 | 624144 | 0.0761 |
+| BIO-4 | Stock vLLM | 1958692.02 | not measured | 0.5578 |
+| BIO-4 | SoL | 28579085.47 | 0 | 0.0382 |
+| FEV-1 | Quail | 79902.33 | 1359 | 0.0005 |
+| FEV-1 | Stock vLLM | 33314.28 | not measured | 0.0011 |
+| FEV-1 | SoL | 275929.00 | 0 | 0.0001 |
+| FEV-2 | Quail | 2423773.73 | 678 | 0.0324 |
+| FEV-2 | Stock vLLM | 858897.88 | not measured | 0.0909 |
+| FEV-2 | SoL | 5565379.99 | 0 | 0.0141 |
+| FEV-3 | Quail | 2389325.39 | 2605 | 0.0237 |
+| FEV-3 | Stock vLLM | 913532.98 | not measured | 0.0664 |
+| FEV-3 | SoL | 5326652.62 | 0 | 0.0087 |
+| FEV-4 | Quail | 1427079.47 | 2605 | 0.0052 |
+| FEV-4 | Stock vLLM | 751447.42 | not measured | 0.0103 |
+| FEV-4 | Pipelined vLLM | 843696.47 | not measured | 0.0092 |
+| FEV-4 | SoL | 2967229.86 | 0 | 0.0020 |
+| FEV-5 | Quail | 2228421.82 | 2776 | 0.0149 |
+| FEV-5 | Stock vLLM | 939644.32 | not measured | 0.0380 |
+| FEV-5 | SoL | 5018814.70 | 0 | 0.0051 |
+| FEV-6 | Quail | 1164602.60 | 2776 | 0.0039 |
+| FEV-6 | Stock vLLM | 617766.49 | not measured | 0.0077 |
+| FEV-6 | Pipelined vLLM | 614566.61 | not measured | 0.0077 |
+| FEV-6 | SoL | 2347116.17 | 0 | 0.0015 |
+| FEV-7 | Quail | 2420578.31 | 135139 | 0.0608 |
+| FEV-7 | Stock vLLM | 865944.90 | not measured | 0.1661 |
+| FEV-7 | SoL | 5691842.82 | 0 | 0.0233 |
+| FEV-8 | Quail | 1404525.02 | 3120800 | 0.1652 |
+| FEV-8 | Stock vLLM | 816044.45 | not measured | 0.2759 |
+| FEV-8 | SoL | 5725697.73 | 0 | 0.0369 |
+| FEV-9 | Quail | 1610695.95 | 1461116 | 0.0607 |
+| FEV-9 | Stock vLLM | 854404.66 | not measured | 0.1194 |
+| FEV-9 | SoL | 5452523.60 | 0 | 0.0125 |
+| FEV-10 | Quail | 164604.91 | 2773 | 0.0018 |
+| FEV-10 | Stock vLLM | 92349.36 | not measured | 0.0032 |
+| FEV-10 | SoL | 371434.56 | 0 | 0.0008 |
+| LEP-1 | Quail | 106103.47 | 1702 | 0.0014 |
+| LEP-1 | Stock vLLM | 90514.78 | not measured | 0.0016 |
 | LEP-1 | SoL | 267221.28 | 0 | 0.0005 |
-| LEP-2 | Quail | 520246.72 | 1702 | 0.1443 |
-| LEP-2 | vLLM | 429797.44 | 87430 | 0.1747 |
+| LEP-2 | Quail | 522136.87 | 1702 | 0.1438 |
+| LEP-2 | Stock vLLM | 405102.72 | not measured | 0.1846 |
 | LEP-2 | SoL | 1178044.06 | 0 | 0.0637 |
-| LEP-3 | Quail | 32359.15 | 2058 | 0.1034 |
-| LEP-3 | vLLM | 25232.80 | 165313 | 0.1326 |
+| LEP-3 | Quail | 507950.08 | 2058 | 0.1027 |
+| LEP-3 | Stock vLLM | 398800.02 | not measured | 0.1384 |
 | LEP-3 | SoL | 1348878.62 | 0 | 0.0025 |
-| LEP-4 | Quail | 31448.77 | 1852 | 0.0442 |
-| LEP-4 | vLLM | 26474.53 | 49540 | 0.0525 |
+| LEP-4 | Quail | 405571.50 | 1852 | 0.0439 |
+| LEP-4 | Stock vLLM | 346528.82 | not measured | 0.0514 |
+| LEP-4 | Pipelined vLLM | 350482.13 | not measured | 0.0509 |
 | LEP-4 | SoL | 1054502.31 | 0 | 0.0013 |
-| LEP-5 | Quail | 28188.78 | 3420 | 0.0433 |
-| LEP-5 | vLLM | 23364.36 | 51004 | 0.0522 |
+| LEP-5 | Quail | 402751.49 | 3420 | 0.0431 |
+| LEP-5 | Stock vLLM | 342140.98 | not measured | 0.0504 |
+| LEP-5 | Pipelined vLLM | 345756.89 | not measured | 0.0498 |
 | LEP-5 | SoL | 900460.88 | 0 | 0.0014 |
+| AGENT-1 | Quail | 72720.76 | 11886152 | 0.2623 |
+| AGENT-1 | Stock vLLM | 168701.80 | not measured | 0.1131 |
+| AGENT-1 | SoL | 366357.25 | 0 | 0.0521 |
+| AGENT-2 | Quail | 73292.18 | 11886152 | 0.2609 |
+| AGENT-2 | Stock vLLM | 169700.75 | not measured | 0.1127 |
+| AGENT-2 | SoL | 364144.27 | 0 | 0.0525 |
 :::
 
-Figure 1 shows average tokens per second as a percent of each dataset's SoL estimate. For every method, we divide total requested input tokens by runtime. SoL uses the same requested-token total and its estimated runtime. Each bar divides the dataset's mean rate by that dataset's mean SoL rate. The top of the axis is 100% of SoL. The vertical axis uses a log scale. On BIO, Quail averages about 11.5 million tokens per second, which is 46.6% of the 24.7 million SoL estimate, compared with 1.4 million for vLLM, or 5.6% of SoL. vLLM is ahead on AGENT, at 48.2% of SoL compared with 20.0% for Quail. The latency figure below keeps the per-query detail.
+Figure 1 shows average tokens per second as a percent of each dataset's SoL estimate. Each measured method uses the full input lengths of the prompts it evaluated. SoL runtime uses exact reference survivors. The saved BIO-4 SoL result uses Quail's requested-token count because it does not store its own full prompt total. Each bar divides the dataset's mean rate by that dataset's mean SoL rate. The top of the axis is 100% of SoL. The vertical axis uses a log scale. On BIO, Quail averages 12.3 million tokens per second, which is 49.9% of SoL, compared with 5.8% for stock vLLM. Stock vLLM is ahead on AGENT, at 46.3% of SoL compared with 20.0% for Quail. The latency figure below keeps the per-query detail.
 
 ::: {.figure-block .wide-figure}
-[![Query latency for Quail, the vLLM baseline, and SoL estimates across the 31 default QUAIL-B queries. BIO-1 and BIO-3 are marked as not measured.](figures/quailb_latency.png){width=100%}](figures/quailb_latency.pdf)
+[![Query latency for Quail, stock vLLM, and SoL estimates across all 31 default QUAIL-B queries.](figures/quailb_latency.png){width=100%}](figures/quailb_latency.pdf)
 
-*Figure 8. Query latency at scale factor 0.1. Bars show measured query time, and horizontal lines show SoL estimates. The vertical axis uses a log scale because the query times span more than three orders of magnitude. An x marks BIO-1 and BIO-3, which do not have measurements for their current definitions.*
+*Figure 8. Query latency at scale factor 0.1. Bars show measured query time, and horizontal lines show SoL estimates. The vertical axis uses a log scale because the query times span more than three orders of magnitude.*
 :::
 
-The 29 Quail runs take 1,484.25 seconds in total, compared with 3,149.83 seconds for the vLLM baseline. That is a 2.12 times aggregate speedup. The combined SoL estimate for the same queries is 449.43 seconds. Quail takes 3.30 times the estimate in aggregate, compared with 7.01 times for the vLLM baseline.
+The 31 Quail runs take 1,700.68 seconds in total, compared with 4,563.75 seconds for stock vLLM. That is a 2.68 times aggregate speedup. The combined SoL estimate is 503.27 seconds. Quail takes 3.38 times the estimate in aggregate, compared with 9.07 times for stock vLLM.
+
+The two vLLM submission strategies differ only when multiple filters apply to the same document stream. Figure 9 therefore shows those eight queries instead of repeating two equivalent vLLM bars on all 31 queries.
+
+::: {.figure-block .wide-figure}
+[![Stock and pipelined vLLM latency on the eight QUAIL-B queries with multi-filter chains, with SoL estimates.](figures/quailb_filter_submission.png){width=100%}](figures/quailb_filter_submission.pdf)
+
+*Figure 9. Stock vLLM finishes one complete filter stage before submitting the next. Pipelined vLLM advances each passing document immediately. Labels show stock time divided by pipelined time. Horizontal lines show SoL estimates.*
+:::
+
+Pipelining reduces latency on seven of the eight queries. The mean stock-to-pipelined ratio is 1.12 times. The largest change is IMDB-6, where pipelined vLLM is 1.27 times faster. FEV-6 differs by less than 1%, and the two LePaRD queries differ by about 1%.
 
 The main exceptions are AGENT-1 and AGENT-2. Quail does not yet reuse matching prefixes across different rows, so it recomputes 11.89 million KV tokens on each query. Section 4.4 examines AGENT-1.
 
@@ -482,24 +500,24 @@ The main exceptions are AGENT-1 and AGENT-2. Quail does not yet reuse matching p
 This post uses BIO-4 as its motivating query. At scale factor 1.0, it filters 5,000 medical reports and two aliases of 4,144 reaction terms. It then runs two joins over the surviving inputs.
 
 ::: {.figure-block .wide-figure}
-[![BIO-4 results at scale factor 1.0. Quail takes 29.26 minutes and costs $1.93. The vLLM baseline takes 6.84 hours and costs $27.03. The SoL estimate is 14.91 minutes and $0.98.](figures/bio4_results.png){width=100%}](figures/bio4_results.pdf)
+[![BIO-4 results at scale factor 1.0. Quail takes 29.26 minutes and costs $1.93. Pipelined vLLM takes 6.84 hours and costs $27.03. The SoL estimate is 14.91 minutes and $0.98.](figures/bio4_results.png){width=100%}](figures/bio4_results.pdf)
 
-*Figure 9. BIO-4 results at scale factor 1.0. Query time and GPU cost exclude model startup. Fresh input tokens count every token processed by a model forward pass. Recomputed KV tokens are included in the fresh input token total.*
+*Figure 10. BIO-4 results at scale factor 1.0. Query time and GPU cost exclude model startup. Fresh input tokens count every token processed by a model forward pass. Recomputed KV tokens are included in the fresh input token total.*
 :::
 
 ::: {.figure-block .wide-figure}
-[![Five seconds of GPU activity during a BIO-4 join with Quail and the vLLM baseline.](figures/bio4_profile_comparison.png){width=100%}](figures/bio4_profile_comparison.pdf)
+[![Five seconds of GPU activity during a BIO-4 join with Quail and pipelined vLLM.](figures/bio4_profile_comparison.png){width=100%}](figures/bio4_profile_comparison.pdf)
 
-*Figure 10. The same BIO-4 join window for Quail on the left and the vLLM baseline on the right. This profile comes from a scale factor 0.1 run, even though this section reports scale factor 1.0 results. Quail keeps the GPU busy, while the baseline shows idle gaps.*
+*Figure 11. The same BIO-4 join window for Quail on the left and pipelined vLLM on the right. This profile comes from a scale factor 0.1 run, even though this section reports scale factor 1.0 results. Quail keeps the GPU busy, while vLLM shows idle gaps.*
 :::
 
-Quail takes 29.26 minutes, compared with 6.84 hours for the vLLM baseline. Quail is 14.04 times faster. It is 1.96 times the SoL estimate, while the vLLM baseline is 27.55 times the estimate.
+Quail takes 29.26 minutes, compared with 6.84 hours for pipelined vLLM. Quail is 14.04 times faster. It is 1.96 times the SoL estimate, while pipelined vLLM is 27.55 times the estimate.
 
-The GPU cost follows the same ratio because each run uses one H100. Quail costs $1.93 per query, compared with $27.03 for the vLLM baseline. The SoL cost estimate is $0.98 per query.
+The GPU cost follows the same ratio because each run uses one H100. Quail costs $1.93 per query, compared with $27.03 for pipelined vLLM. The SoL cost estimate is $0.98 per query.
 
-Quail also recomputes less KV. It recomputes 18.0 million tokens, compared with 50.3 million for the vLLM baseline. The two engines can make slightly different predicate decisions, which changes how many document pairs reach later joins. Each number above reports the work and time from that method's measured run.
+Quail also recomputes less KV. It recomputes 18.0 million tokens, compared with 50.3 million for pipelined vLLM. The two engines can make slightly different predicate decisions, which changes how many document pairs reach later joins. Each number above reports the work and time from that method's measured run.
 
-## 4.4 AGENT-1, where the vLLM baseline wins
+## 4.4 AGENT-1, where stock vLLM wins
 
 AGENT-1 contains 1,772 cumulative snapshots from software agent runs. Each snapshot contains the complete trace up to one point in the run, so later snapshots from the same run begin with the full contents of earlier snapshots. For example, two rows might look like the following:
 
@@ -524,24 +542,24 @@ WHERE AI.IF(
 ```
 
 ::: {.metrics-table}
-| Metric | Quail | vLLM baseline |
+| Metric | Quail | Stock vLLM |
 |---|---:|---:|
-| Query latency, seconds | 237.80 | 98.45 |
-| GPU cost per query | $0.26087 | $0.10800 |
-| Fresh input tokens | 17,389,113 | 5,526,889 |
-| KV regret tokens | 11,886,152 | 23,928 |
-| Latency relative to the speed of light estimate, 47.47 seconds | 5.01× | 2.07× |
+| Query latency, seconds | 239.12 | 103.07 |
+| GPU cost per query | $0.26232 | $0.11307 |
+| Fresh input tokens | 17,389,113 | 5,524,100 |
+| KV regret tokens | 11,886,152 | Not measured |
+| Latency relative to the speed of light estimate, 47.47 seconds | 5.04× | 2.17× |
 :::
 
-The vLLM baseline runs AGENT-1 in 98.45 seconds, which is 2.42 times faster than Quail.
+Stock vLLM runs AGENT-1 in 103.07 seconds, which is 2.32 times faster than Quail.
 
 ::: {.figure-block .wide-figure}
-[![Five seconds of GPU activity and top-level CPU operations during the AGENT-1 filter with Quail and the vLLM baseline.](figures/agent1_profile_comparison.png){width=100%}](figures/agent1_profile_comparison.pdf)
+[![Five seconds of GPU activity and top-level CPU operations during the AGENT-1 filter with Quail and vLLM.](figures/agent1_profile_comparison.png){width=100%}](figures/agent1_profile_comparison.pdf)
 
-*Figure 11. AGENT-1 has one filter and no join. GPU operations cover 4.998 seconds with Quail and 4.988 seconds with the vLLM baseline in these five-second windows. The lower row shows only top-level CPU operations. Both keep the GPU busy, but the vLLM baseline computes far fewer fresh tokens by reusing prefixes across snapshots.*
+*Figure 12. AGENT-1 has one filter and no join. GPU operations cover 4.998 seconds with Quail and 4.988 seconds with vLLM in these five-second windows. The lower row shows only top-level CPU operations. Both keep the GPU busy, but vLLM computes far fewer fresh tokens by reusing prefixes across snapshots.*
 :::
 
-The vLLM baseline wins because its automatic prefix caching feature can reuse KV across different rows when their token prefixes match. Quail currently reuses KV only when the same document appears again in the query. As a result, Quail incurs 11.89 million KV regret tokens, while the vLLM baseline incurs only 23,928.
+Stock vLLM wins because its automatic prefix caching feature can reuse KV across different rows when their token prefixes match. Quail currently reuses KV only when the same document appears again in the query. Quail computes 17.39 million fresh input tokens, compared with 5.52 million for stock vLLM. The current vLLM run does not expose compatible prompt pieces, so its KV regret is not measured.
 
 We plan to add automatic prefix caching to Quail, but the lookup must remain cheap at the request volumes that AI-SQL queries can produce.
 

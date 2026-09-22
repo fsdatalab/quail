@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html xmlns="http://www.w3.org/1999/xhtml" lang="" xml:lang="">
+<html xmlns="http://www.w3.org/1999/xhtml">
 <head>
   <meta charset="utf-8" />
   <meta name="generator" content="pandoc" />
@@ -7,6 +7,9 @@
   <meta name="author" content="Shreya Shankar, Charles Frye, Fergus Finn, Arnav Dhariya, Joseph Barrow, Meryem Arik" />
   <title>Quail, a Query-Aware Inference Layer for AI-SQL</title>
   <style>
+    /* Default styles provided by pandoc.
+    ** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+    */
     code{white-space: pre-wrap;}
     span.smallcaps{font-variant: small-caps;}
     div.columns{display: flex; gap: min(4vw, 1.5em);}
@@ -22,8 +25,9 @@
       vertical-align: middle;
     }
     /* CSS for syntax highlighting */
+    html { -webkit-text-size-adjust: 100%; }
     pre > code.sourceCode { white-space: pre; position: relative; }
-    pre > code.sourceCode > span { line-height: 1.25; }
+    pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
     pre > code.sourceCode > span:empty { height: 1.2em; }
     .sourceCode { overflow: visible; }
     code.sourceCode > span { color: inherit; text-decoration: inherit; }
@@ -87,8 +91,8 @@
     code span.wa { color: #60a0b0; font-weight: bold; font-style: italic; } /* Warning */
   </style>
   <link rel="stylesheet" href="style.css" />
-  <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
-  <script src="/usr/share/javascript/mathjax/MathJax.js"
+  <script defer=""
+  src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml-full.js"
   type="text/javascript"></script>
 </head>
 <body>
@@ -97,40 +101,6 @@
 <p class="author">Shreya Shankar, Charles Frye, Fergus Finn, Arnav
 Dhariya, Joseph Barrow, Meryem Arik</p>
 </header>
-<nav id="TOC" role="doc-toc">
-<ul>
-<li><a href="#the-growth-of-ai-powered-data-processing"
-id="toc-the-growth-of-ai-powered-data-processing">1. The growth of
-AI-powered data processing</a></li>
-<li><a href="#key-idea-lets-jointly-optimize-query-plans-and-inference"
-id="toc-key-idea-lets-jointly-optimize-query-plans-and-inference">2. Key
-idea: let’s jointly optimize query plans and inference</a></li>
-<li><a href="#introducing-quail" id="toc-introducing-quail">3.
-Introducing Quail</a>
-<ul>
-<li><a href="#getting-started-with-quail"
-id="toc-getting-started-with-quail">3.1 Getting started with
-Quail</a></li>
-<li><a href="#design-details" id="toc-design-details">3.2 Design
-details</a></li>
-</ul></li>
-<li><a href="#evaluation" id="toc-evaluation">4. Evaluation</a>
-<ul>
-<li><a href="#experimental-setup" id="toc-experimental-setup">4.1
-Experimental setup</a></li>
-<li><a href="#full-benchmark-results"
-id="toc-full-benchmark-results">4.2 Full benchmark results</a></li>
-<li><a href="#bio-4-at-scale-factor-1.0"
-id="toc-bio-4-at-scale-factor-1.0">4.3 BIO-4 at scale factor
-1.0</a></li>
-<li><a href="#agent-1-where-the-vllm-baseline-wins"
-id="toc-agent-1-where-the-vllm-baseline-wins">4.4 AGENT-1, where the
-vLLM baseline wins</a></li>
-</ul></li>
-<li><a href="#what-comes-next" id="toc-what-comes-next">5. What comes
-next</a></li>
-</ul>
-</nav>
 <div class="tldr">
 <p><strong>TL;DR.</strong> Much of today’s AI-SQL work (i.e., AI
 functions in SQL databases) uses closed, frontier LLMs served through
@@ -144,16 +114,15 @@ jointly optimize query planning and inference.</p>
 <div class="figure-block wide-figure">
 <p><a href="figures/quailb_tok_per_sec.pdf"><img
 src="figures/quailb_tok_per_sec.png" style="width:100.0%"
-alt="Average requested input token throughput by dataset for Quail and vLLM, as a percent of SoL." /></a></p>
+alt="Average requested input token throughput by dataset for Quail and stock vLLM, as a percent of SoL." /></a></p>
 <p><em>Figure 1. Average requested input tokens per second on QUAIL-B at
 scale factor 0.1, using Qwen3 4B FP8 on one H100, as a percent of each
-dataset’s SoL estimate. The top of the axis is 100% of SoL. The vertical axis uses a log scale. SoL is the
-optimistic lower bound on runtime from GPU arithmetic and memory traffic.
-Each bar is the dataset’s mean tokens per second divided by its mean SoL
-tokens per second. The label above each Quail percent is that bar’s mean
-tokens per second. The averages use the current 31 queries. The original
-LEP-5, LEP-6, and LEP-8 are excluded. Dataset labels show how many queries
-are averaged.</em></p>
+dataset’s SoL estimate. The top of the axis is 100% of SoL. The vertical
+axis uses a log scale. SoL is the optimistic lower bound on runtime from
+GPU arithmetic and memory traffic. Each bar is the dataset’s mean tokens
+per second divided by its mean SoL tokens per second. The label above
+each Quail percent is that bar’s mean tokens per second. The averages
+use all 31 current queries.</em></p>
 </div>
 <h1 id="the-growth-of-ai-powered-data-processing">1. The growth of
 AI-powered data processing</h1>
@@ -218,7 +187,7 @@ with the neurological terms.</li>
 <div class="figure-block">
 <p><a href="figures/vllm-query-plan.svg"><img
 src="figures/vllm-query-plan.svg" style="width:100.0%"
-alt="The BIO-4 query plan used by the vLLM baseline." /></a></p>
+alt="The BIO-4 query plan used by pipelined vLLM." /></a></p>
 <p><em>Figure 2. The BIO-4 plan filters all three inputs before the
 joins. Both joins use the medical report as the anchor.</em></p>
 </div>
@@ -231,7 +200,7 @@ longer medical report first as the <em>anchor</em> and the reaction term
 second as the <em>partner</em>. This order maximizes reuse of the
 prefix’s key and value state (KV) across join prompts.</p>
 <p><strong>A cost estimate for the query plan.</strong> Before measuring
-the vLLM baseline, we estimate the lowest possible runtime for the same
+pipelined vLLM, we estimate the lowest possible runtime for the same
 plan. We count the model’s arithmetic work and HBM traffic from the
 token lengths, then use a <a
 href="https://modal.com/gpu-glossary/perf/roofline-model">roofline
@@ -268,9 +237,9 @@ role="doc-noteref"><sup>4</sup></a></p>
 <div class="figure-block wide-figure">
 <p><a href="figures/bio4_vllm_bubbles.pdf"><img
 src="figures/bio4_vllm_bubbles.png" style="width:100.0%"
-alt="Five seconds of GPU activity during a BIO-4 join with the vLLM baseline." /></a></p>
+alt="Five seconds of GPU activity during a BIO-4 join with pipelined vLLM." /></a></p>
 <p><em>Figure 3. Five-second midpoint of a BIO-4 join at scale factor
-0.1 with the vLLM baseline. Green in the top row marks busy GPU kernels.
+0.1 with pipelined vLLM. Green in the top row marks busy GPU kernels.
 The middle row shows scheduler and <code>execute_context</code> work.
 The bottom row shows PyTorch and CUDA API calls. White gaps on the GPU
 row are idle bubbles.</em></p>
@@ -278,9 +247,9 @@ row are idle bubbles.</em></p>
 <p>The corresponding Quail timeline appears with the BIO-4 experiments
 in Section 4.3.</p>
 <p>The second problem is <em>KV regret</em>: the model processes tokens
-again after their reusable KV has been evicted. On BIO-4, the vLLM
-baseline recomputes 50.3 million KV tokens (out of 174.6 million fresh
-input tokens).</p>
+again after their reusable KV has been evicted. On BIO-4, pipelined vLLM
+recomputes 50.3 million KV tokens (out of 174.6 million fresh input
+tokens).</p>
 <p>We can, and we should, reduce both sources of waste by optimizing
 inference for AI-SQL.</p>
 <p>Quail addresses both problems together. Its query plan tells the
@@ -699,20 +668,22 @@ queries cover IMDB reviews, medical reports, fact checking claims, legal
 documents, and traces from software agents. They include single filters,
 sequences of filters, and queries with one or more joins. Each dataset
 comes in three sizes, with scale factors 0.1, 0.5, and 1.0.</p>
-<p>We compare current measurements for 29 default queries at scale
-factor 0.1. We do not include BIO-1 and BIO-3 because their saved runs
-used an older report filter. We examine BIO-4 at scale factor 1.0 and
-AGENT-1 in more detail.</p>
+<p>We compare current measurements for all 31 default queries at scale
+factor 0.1. We examine BIO-4 at scale factor 1.0 and AGENT-1 in more
+detail.</p>
 <p><strong>Hardware.</strong> Every configuration uses Qwen3 4B FP8,
 with BF16 KV, on one H100. For each query, we run Quail and vLLM one
 after the other on the same physical GPU.</p>
-<p><strong>vLLM baseline.</strong> We compare Quail with stock vLLM
-0.26.0, using the same logical query plan and prompt layout. The vLLM
-baseline uses pipelining. For a sequence of filters, it submits a
-document’s next filter as soon as the previous filter returns
-<code>TRUE</code>. For a join, we choose the better anchor direction and
-submit one inference request for each document pair in anchor order. We
-configure vLLM as follows:</p>
+<p><strong>vLLM baselines.</strong> We compare Quail with stock vLLM
+0.26.0, using the same logical query plan and prompt layout. Stock vLLM
+runs one complete filter stage before submitting the next stage. For the
+eight queries with multiple filters on one document stream, we also
+measure pipelined vLLM. It submits a document’s next filter as soon as
+the previous filter returns <code>TRUE</code>. Both vLLM configurations
+use Gigatoken inside vLLM to tokenize complete prompt strings. For
+joins, both choose the better anchor direction and submit one inference
+request for each document pair in anchor order. We configure vLLM as
+follows:</p>
 <ul>
 <li>We enable automatic prefix caching.</li>
 <li>We set <code>max_num_batched_tokens</code> to 25,305, and
@@ -726,16 +697,22 @@ Our roofline model predicts that the selected token budget is well above
 the point where model computation becomes compute bound.</p>
 <p><strong>Scope.</strong> We measure query engine performance. We do
 not evaluate whether Qwen3 4B FP8 is the best model for each query.
-Quail and the vLLM baseline use the same model, prompts, and logical
-query plan. Our goal is to run that chosen model and plan as quickly as
-possible.</p>
+Quail and both vLLM configurations use the same model, prompts, and
+logical query plan. The engines do not always return the same answers.
+Weighted predicate agreement with the saved Qwen3 32B FP8 references is
+70.72% for Quail and 77.36% for stock vLLM. The latency comparison is
+therefore not normalized to equal answer quality.</p>
 <p><strong>Metrics.</strong> We report five metrics for each query:</p>
 <ul>
 <li><strong>Query latency.</strong> We measure the time after model
-startup and kernel warmup, and exclude result collection. We also report
-latency relative to the speed of light estimate from Section 2, which
-assumes peak GPU throughput, full overlap between CPU and GPU work, and
-enough GPU HBM to retain all reusable prefix KV.</li>
+startup and kernel warmup, and exclude result collection. Quail’s timer
+starts from raw tables and query submission, including its frontend
+planning and input preparation. The vLLM timer starts when prompt text
+is submitted, and includes tokenization inside vLLM. It excludes the
+Quail CPU planning pass used to compile the vLLM requests. We also
+report latency relative to the speed of light estimate from Section 2,
+which assumes peak GPU throughput, full overlap between CPU and GPU
+work, and enough GPU HBM to retain all reusable prefix KV.</li>
 <li><strong>GPU cost.</strong> We multiply the query latency in hours by
 Modal’s H100 price of $3.9492 per hour.</li>
 <li><strong>Input tokens per second.</strong> We sum the full input
@@ -750,24 +727,24 @@ same tokens again during the join, those tokens count twice.</li>
 <li><strong>KV regret.</strong> We count fresh input tokens beyond the
 minimum needed to compute each distinct reusable prefix once.
 Token-identical prefixes match across rows, and this repeated work is
-already included in fresh input tokens.</li>
+already included in fresh input tokens. The current vLLM runs tokenize
+complete strings, so they do not expose compatible prompt pieces for
+this calculation. Their KV regret is not measured.</li>
 </ul>
 <h2 id="full-benchmark-results">4.2 Full benchmark results</h2>
-<p>Across the 29 queries with matching measurements at scale factor 0.1,
-Quail is faster than the vLLM baseline on 27. The mean speedup is 1.91
-times, the median speedup is 1.48 times, and the largest speedup is
-10.04 times on BIO-2.</p>
+<p>Across all 31 queries at scale factor 0.1, Quail is faster than stock
+vLLM on 29. The mean speedup is 2.39 times, the median speedup is 1.78
+times, and the largest speedup is 11.22 times on BIO-2.</p>
 <h3 id="per-query-metrics-table">Per-query metrics table</h3>
-<p>The table below reports the 31 current QUAIL-B queries at scale factor
-0.1. The original LEP-5, LEP-6, and LEP-8 are omitted. Current LEP-5 was
-saved as LEP-7; its plan is unchanged. SoL assumes zero KV regret. Costs
-use about $3.96 per H100-hour. BIO-1, BIO-3, and BIO-4 use remake run
-<code>20260921T190132Z-a2059688</code>; BIO-2 keeps its prior run. BIO-4
-scale factor 1.0 results are in Section 4.3.</p>
-<div class="metrics-table">
+<p>The table below reports the 31 current QUAIL-B queries at scale
+factor 0.1. SoL assumes zero KV regret. Costs use $3.9492 per H100-hour.
+All measured rows come from run <code>20260922T190951Z-efa30103</code>.
+Pipelined vLLM appears only where a query has multiple filters on one
+document stream. BIO-4 scale factor 1.0 results are in Section 4.3.</p>
+<div class="metrics-table benchmark-metrics">
 <table>
 <thead>
-<tr class="header">
+<tr>
 <th>query</th>
 <th>method</th>
 <th style="text-align: right;">tok_per_sec</th>
@@ -776,684 +753,757 @@ scale factor 1.0 results are in Section 4.3.</p>
 </tr>
 </thead>
 <tbody>
-<tr class="odd">
-<td>AGENT-1</td>
-<td>Quail</td>
-<td style="text-align: right;">73124.95</td>
-<td style="text-align: right;">11886152</td>
-<td style="text-align: right;">0.2609</td>
-</tr>
-<tr class="even">
-<td>AGENT-1</td>
-<td>vLLM</td>
-<td style="text-align: right;">176628.88</td>
-<td style="text-align: right;">23928</td>
-<td style="text-align: right;">0.1080</td>
-</tr>
-<tr class="odd">
-<td>AGENT-1</td>
-<td>SoL</td>
-<td style="text-align: right;">366357.25</td>
-<td style="text-align: right;">0</td>
-<td style="text-align: right;">0.0521</td>
-</tr>
-<tr class="even">
-<td>AGENT-2</td>
-<td>Quail</td>
-<td style="text-align: right;">72969.32</td>
-<td style="text-align: right;">11886152</td>
-<td style="text-align: right;">0.2621</td>
-</tr>
-<tr class="odd">
-<td>AGENT-2</td>
-<td>vLLM</td>
-<td style="text-align: right;">175139.57</td>
-<td style="text-align: right;">23928</td>
-<td style="text-align: right;">0.1092</td>
-</tr>
-<tr class="even">
-<td>AGENT-2</td>
-<td>SoL</td>
-<td style="text-align: right;">364144.27</td>
-<td style="text-align: right;">0</td>
-<td style="text-align: right;">0.0525</td>
-</tr>
-<tr class="odd">
-<td>BIO-1</td>
-<td>Quail</td>
-<td style="text-align: right;">94117.60</td>
-<td style="text-align: right;">2484</td>
-<td style="text-align: right;">0.0240</td>
-</tr>
-<tr class="even">
-<td>BIO-1</td>
-<td>vLLM</td>
-<td style="text-align: right;">80530.20</td>
-<td style="text-align: right;">2468</td>
-<td style="text-align: right;">0.0280</td>
-</tr>
-<tr class="odd">
-<td>BIO-1</td>
-<td>SoL</td>
-<td style="text-align: right;">186194.32</td>
-<td style="text-align: right;">0</td>
-<td style="text-align: right;">0.0121</td>
-</tr>
-<tr class="even">
-<td>BIO-2</td>
-<td>Quail</td>
-<td style="text-align: right;">18280145.54</td>
-<td style="text-align: right;">2477</td>
-<td style="text-align: right;">0.1395</td>
-</tr>
-<tr class="odd">
-<td>BIO-2</td>
-<td>vLLM</td>
-<td style="text-align: right;">1820083.72</td>
-<td style="text-align: right;">154747</td>
-<td style="text-align: right;">1.4008</td>
-</tr>
-<tr class="even">
-<td>BIO-2</td>
-<td>SoL</td>
-<td style="text-align: right;">37485021.13</td>
-<td style="text-align: right;">0</td>
-<td style="text-align: right;">0.0680</td>
-</tr>
-<tr class="odd">
-<td>BIO-3</td>
-<td>Quail</td>
-<td style="text-align: right;">13225611.21</td>
-<td style="text-align: right;">2869</td>
-<td style="text-align: right;">0.1150</td>
-</tr>
-<tr class="even">
-<td>BIO-3</td>
-<td>vLLM</td>
-<td style="text-align: right;">1568143.71</td>
-<td style="text-align: right;">1702055</td>
-<td style="text-align: right;">0.9697</td>
-</tr>
-<tr class="odd">
-<td>BIO-3</td>
-<td>SoL</td>
-<td style="text-align: right;">32399507.32</td>
-<td style="text-align: right;">0</td>
-<td style="text-align: right;">0.0469</td>
-</tr>
-<tr class="even">
-<td>BIO-4</td>
-<td>Quail</td>
-<td style="text-align: right;">14351284.26</td>
-<td style="text-align: right;">624144</td>
-<td style="text-align: right;">0.0761</td>
-</tr>
-<tr class="odd">
-<td>BIO-4</td>
-<td>vLLM</td>
-<td style="text-align: right;">2013049.82</td>
-<td style="text-align: right;">3907993</td>
-<td style="text-align: right;">0.5427</td>
-</tr>
-<tr class="even">
-<td>BIO-4</td>
-<td>SoL</td>
-<td style="text-align: right;">28579085.47</td>
-<td style="text-align: right;">0</td>
-<td style="text-align: right;">0.0382</td>
-</tr>
-<tr class="odd">
-<td>FEV-1</td>
-<td>Quail</td>
-<td style="text-align: right;">114934.48</td>
-<td style="text-align: right;">1359</td>
-<td style="text-align: right;">0.0003</td>
-</tr>
-<tr class="even">
-<td>FEV-1</td>
-<td>vLLM</td>
-<td style="text-align: right;">81295.12</td>
-<td style="text-align: right;">1359</td>
-<td style="text-align: right;">0.0004</td>
-</tr>
-<tr class="odd">
-<td>FEV-1</td>
-<td>SoL</td>
-<td style="text-align: right;">275929.00</td>
-<td style="text-align: right;">0</td>
-<td style="text-align: right;">0.0001</td>
-</tr>
-<tr class="even">
-<td>FEV-2</td>
-<td>Quail</td>
-<td style="text-align: right;">2429051.89</td>
-<td style="text-align: right;">678</td>
-<td style="text-align: right;">0.0323</td>
-</tr>
-<tr class="odd">
-<td>FEV-2</td>
-<td>vLLM</td>
-<td style="text-align: right;">1187491.64</td>
-<td style="text-align: right;">106037</td>
-<td style="text-align: right;">0.0660</td>
-</tr>
-<tr class="even">
-<td>FEV-2</td>
-<td>SoL</td>
-<td style="text-align: right;">5565379.99</td>
-<td style="text-align: right;">0</td>
-<td style="text-align: right;">0.0141</td>
-</tr>
-<tr class="odd">
-<td>FEV-3</td>
-<td>Quail</td>
-<td style="text-align: right;">1927155.34</td>
-<td style="text-align: right;">2605</td>
-<td style="text-align: right;">0.0239</td>
-</tr>
-<tr class="even">
-<td>FEV-3</td>
-<td>vLLM</td>
-<td style="text-align: right;">905895.80</td>
-<td style="text-align: right;">90822</td>
-<td style="text-align: right;">0.0509</td>
-</tr>
-<tr class="odd">
-<td>FEV-3</td>
-<td>SoL</td>
-<td style="text-align: right;">5326652.62</td>
-<td style="text-align: right;">0</td>
-<td style="text-align: right;">0.0087</td>
-</tr>
-<tr class="even">
-<td>FEV-4</td>
-<td>Quail</td>
-<td style="text-align: right;">1115893.58</td>
-<td style="text-align: right;">2605</td>
-<td style="text-align: right;">0.0053</td>
-</tr>
-<tr class="odd">
-<td>FEV-4</td>
-<td>vLLM</td>
-<td style="text-align: right;">751710.74</td>
-<td style="text-align: right;">23952</td>
-<td style="text-align: right;">0.0079</td>
-</tr>
-<tr class="even">
-<td>FEV-4</td>
-<td>SoL</td>
-<td style="text-align: right;">2967229.86</td>
-<td style="text-align: right;">0</td>
-<td style="text-align: right;">0.0020</td>
-</tr>
-<tr class="odd">
-<td>FEV-5</td>
-<td>Quail</td>
-<td style="text-align: right;">1710195.47</td>
-<td style="text-align: right;">2776</td>
-<td style="text-align: right;">0.0150</td>
-</tr>
-<tr class="even">
-<td>FEV-5</td>
-<td>vLLM</td>
-<td style="text-align: right;">833203.34</td>
-<td style="text-align: right;">95455</td>
-<td style="text-align: right;">0.0308</td>
-</tr>
-<tr class="odd">
-<td>FEV-5</td>
-<td>SoL</td>
-<td style="text-align: right;">5018814.70</td>
-<td style="text-align: right;">0</td>
-<td style="text-align: right;">0.0051</td>
-</tr>
-<tr class="even">
-<td>FEV-6</td>
-<td>Quail</td>
-<td style="text-align: right;">775403.46</td>
-<td style="text-align: right;">2776</td>
-<td style="text-align: right;">0.0044</td>
-</tr>
-<tr class="odd">
-<td>FEV-6</td>
-<td>vLLM</td>
-<td style="text-align: right;">557794.67</td>
-<td style="text-align: right;">15909</td>
-<td style="text-align: right;">0.0062</td>
-</tr>
-<tr class="even">
-<td>FEV-6</td>
-<td>SoL</td>
-<td style="text-align: right;">2347116.17</td>
-<td style="text-align: right;">0</td>
-<td style="text-align: right;">0.0015</td>
-</tr>
-<tr class="odd">
-<td>FEV-7</td>
-<td>Quail</td>
-<td style="text-align: right;">2174277.32</td>
-<td style="text-align: right;">135139</td>
-<td style="text-align: right;">0.0610</td>
-</tr>
-<tr class="even">
-<td>FEV-7</td>
-<td>vLLM</td>
-<td style="text-align: right;">1094218.43</td>
-<td style="text-align: right;">298043</td>
-<td style="text-align: right;">0.1213</td>
-</tr>
-<tr class="odd">
-<td>FEV-7</td>
-<td>SoL</td>
-<td style="text-align: right;">5691842.82</td>
-<td style="text-align: right;">0</td>
-<td style="text-align: right;">0.0233</td>
-</tr>
-<tr class="even">
-<td>FEV-8</td>
-<td>Quail</td>
-<td style="text-align: right;">2228621.90</td>
-<td style="text-align: right;">3120800</td>
-<td style="text-align: right;">0.0947</td>
-</tr>
-<tr class="odd">
-<td>FEV-8</td>
-<td>vLLM</td>
-<td style="text-align: right;">1122434.17</td>
-<td style="text-align: right;">3525124</td>
-<td style="text-align: right;">0.1881</td>
-</tr>
-<tr class="even">
-<td>FEV-8</td>
-<td>SoL</td>
-<td style="text-align: right;">5725697.73</td>
-<td style="text-align: right;">0</td>
-<td style="text-align: right;">0.0369</td>
-</tr>
-<tr class="odd">
-<td>FEV-9</td>
-<td>Quail</td>
-<td style="text-align: right;">1592046.28</td>
-<td style="text-align: right;">1461116</td>
-<td style="text-align: right;">0.0428</td>
-</tr>
-<tr class="even">
-<td>FEV-9</td>
-<td>vLLM</td>
-<td style="text-align: right;">812587.42</td>
-<td style="text-align: right;">1648151</td>
-<td style="text-align: right;">0.0838</td>
-</tr>
-<tr class="odd">
-<td>FEV-9</td>
-<td>SoL</td>
-<td style="text-align: right;">5452523.60</td>
-<td style="text-align: right;">0</td>
-<td style="text-align: right;">0.0125</td>
-</tr>
-<tr class="even">
-<td>FEV-10</td>
-<td>Quail</td>
-<td style="text-align: right;">157457.74</td>
-<td style="text-align: right;">2773</td>
-<td style="text-align: right;">0.0018</td>
-</tr>
-<tr class="odd">
-<td>FEV-10</td>
-<td>vLLM</td>
-<td style="text-align: right;">90592.12</td>
-<td style="text-align: right;">4308</td>
-<td style="text-align: right;">0.0032</td>
-</tr>
-<tr class="even">
-<td>FEV-10</td>
-<td>SoL</td>
-<td style="text-align: right;">371434.56</td>
-<td style="text-align: right;">0</td>
-<td style="text-align: right;">0.0008</td>
-</tr>
-<tr class="odd">
+<tr>
 <td>IMDB-1</td>
 <td>Quail</td>
-<td style="text-align: right;">121830.54</td>
-<td style="text-align: right;">20349</td>
-<td style="text-align: right;">0.0158</td>
+<td style="text-align: right;">118947.31</td>
+<td style="text-align: right;">20350</td>
+<td style="text-align: right;">0.0162</td>
 </tr>
-<tr class="even">
+<tr>
 <td>IMDB-1</td>
-<td>vLLM</td>
-<td style="text-align: right;">101513.73</td>
-<td style="text-align: right;">20061</td>
-<td style="text-align: right;">0.0190</td>
+<td>Stock vLLM</td>
+<td style="text-align: right;">100330.54</td>
+<td style="text-align: right;">not measured</td>
+<td style="text-align: right;">0.0192</td>
 </tr>
-<tr class="odd">
+<tr>
 <td>IMDB-1</td>
 <td>SoL</td>
 <td style="text-align: right;">264443.38</td>
 <td style="text-align: right;">0</td>
 <td style="text-align: right;">0.0073</td>
 </tr>
-<tr class="even">
+<tr>
 <td>IMDB-2</td>
 <td>Quail</td>
-<td style="text-align: right;">988009.25</td>
-<td style="text-align: right;">20349</td>
-<td style="text-align: right;">0.0233</td>
+<td style="text-align: right;">969277.94</td>
+<td style="text-align: right;">20350</td>
+<td style="text-align: right;">0.0237</td>
 </tr>
-<tr class="odd">
+<tr>
 <td>IMDB-2</td>
-<td>vLLM</td>
-<td style="text-align: right;">827243.13</td>
-<td style="text-align: right;">40741</td>
-<td style="text-align: right;">0.0278</td>
+<td>Stock vLLM</td>
+<td style="text-align: right;">706839.11</td>
+<td style="text-align: right;">not measured</td>
+<td style="text-align: right;">0.0324</td>
 </tr>
-<tr class="even">
+<tr>
 <td>IMDB-2</td>
 <td>SoL</td>
 <td style="text-align: right;">2273975.42</td>
 <td style="text-align: right;">0</td>
 <td style="text-align: right;">0.0101</td>
 </tr>
-<tr class="odd">
+<tr>
 <td>IMDB-3</td>
 <td>Quail</td>
-<td style="text-align: right;">849463.20</td>
-<td style="text-align: right;">24729</td>
-<td style="text-align: right;">0.0246</td>
+<td style="text-align: right;">924372.55</td>
+<td style="text-align: right;">24730</td>
+<td style="text-align: right;">0.0244</td>
 </tr>
-<tr class="even">
+<tr>
 <td>IMDB-3</td>
-<td>vLLM</td>
-<td style="text-align: right;">475368.18</td>
-<td style="text-align: right;">1398847</td>
-<td style="text-align: right;">0.0439</td>
+<td>Stock vLLM</td>
+<td style="text-align: right;">489183.96</td>
+<td style="text-align: right;">not measured</td>
+<td style="text-align: right;">0.0462</td>
 </tr>
-<tr class="odd">
+<tr>
 <td>IMDB-3</td>
 <td>SoL</td>
 <td style="text-align: right;">2003008.14</td>
 <td style="text-align: right;">0</td>
 <td style="text-align: right;">0.0104</td>
 </tr>
-<tr class="even">
+<tr>
 <td>IMDB-4</td>
 <td>Quail</td>
-<td style="text-align: right;">445828.31</td>
-<td style="text-align: right;">21606</td>
-<td style="text-align: right;">0.0190</td>
+<td style="text-align: right;">527338.41</td>
+<td style="text-align: right;">21607</td>
+<td style="text-align: right;">0.0189</td>
 </tr>
-<tr class="odd">
+<tr>
 <td>IMDB-4</td>
-<td>vLLM</td>
-<td style="text-align: right;">293879.97</td>
-<td style="text-align: right;">577154</td>
-<td style="text-align: right;">0.0288</td>
+<td>Stock vLLM</td>
+<td style="text-align: right;">286563.00</td>
+<td style="text-align: right;">not measured</td>
+<td style="text-align: right;">0.0347</td>
 </tr>
-<tr class="even">
+<tr>
+<td>IMDB-4</td>
+<td>Pipelined vLLM</td>
+<td style="text-align: right;">341464.59</td>
+<td style="text-align: right;">not measured</td>
+<td style="text-align: right;">0.0291</td>
+</tr>
+<tr>
 <td>IMDB-4</td>
 <td>SoL</td>
 <td style="text-align: right;">1026113.86</td>
 <td style="text-align: right;">0</td>
 <td style="text-align: right;">0.0083</td>
 </tr>
-<tr class="odd">
+<tr>
 <td>IMDB-5</td>
 <td>Quail</td>
-<td style="text-align: right;">393738.79</td>
-<td style="text-align: right;">21839</td>
-<td style="text-align: right;">0.0182</td>
+<td style="text-align: right;">429888.89</td>
+<td style="text-align: right;">21840</td>
+<td style="text-align: right;">0.0181</td>
 </tr>
-<tr class="even">
+<tr>
 <td>IMDB-5</td>
-<td>vLLM</td>
-<td style="text-align: right;">258381.32</td>
-<td style="text-align: right;">531994</td>
-<td style="text-align: right;">0.0277</td>
+<td>Stock vLLM</td>
+<td style="text-align: right;">239369.27</td>
+<td style="text-align: right;">not measured</td>
+<td style="text-align: right;">0.0323</td>
 </tr>
-<tr class="odd">
+<tr>
+<td>IMDB-5</td>
+<td>Pipelined vLLM</td>
+<td style="text-align: right;">275997.60</td>
+<td style="text-align: right;">not measured</td>
+<td style="text-align: right;">0.0280</td>
+</tr>
+<tr>
 <td>IMDB-5</td>
 <td>SoL</td>
 <td style="text-align: right;">879626.62</td>
 <td style="text-align: right;">0</td>
 <td style="text-align: right;">0.0081</td>
 </tr>
-<tr class="even">
+<tr>
 <td>IMDB-6</td>
 <td>Quail</td>
-<td style="text-align: right;">151586.07</td>
-<td style="text-align: right;">20349</td>
-<td style="text-align: right;">0.0164</td>
+<td style="text-align: right;">156978.05</td>
+<td style="text-align: right;">20350</td>
+<td style="text-align: right;">0.0163</td>
 </tr>
-<tr class="odd">
+<tr>
 <td>IMDB-6</td>
-<td>vLLM</td>
-<td style="text-align: right;">124009.86</td>
-<td style="text-align: right;">63473</td>
+<td>Stock vLLM</td>
+<td style="text-align: right;">100561.55</td>
+<td style="text-align: right;">not measured</td>
+<td style="text-align: right;">0.0254</td>
+</tr>
+<tr>
+<td>IMDB-6</td>
+<td>Pipelined vLLM</td>
+<td style="text-align: right;">127811.63</td>
+<td style="text-align: right;">not measured</td>
 <td style="text-align: right;">0.0200</td>
 </tr>
-<tr class="even">
+<tr>
 <td>IMDB-6</td>
 <td>SoL</td>
 <td style="text-align: right;">333850.55</td>
 <td style="text-align: right;">0</td>
 <td style="text-align: right;">0.0074</td>
 </tr>
-<tr class="odd">
+<tr>
 <td>IMDB-7</td>
 <td>Quail</td>
-<td style="text-align: right;">169817.00</td>
-<td style="text-align: right;">21112</td>
-<td style="text-align: right;">0.0170</td>
+<td style="text-align: right;">179735.25</td>
+<td style="text-align: right;">21113</td>
+<td style="text-align: right;">0.0165</td>
 </tr>
-<tr class="even">
+<tr>
 <td>IMDB-7</td>
-<td>vLLM</td>
-<td style="text-align: right;">123394.50</td>
-<td style="text-align: right;">337625</td>
-<td style="text-align: right;">0.0234</td>
+<td>Stock vLLM</td>
+<td style="text-align: right;">106871.87</td>
+<td style="text-align: right;">not measured</td>
+<td style="text-align: right;">0.0278</td>
 </tr>
-<tr class="odd">
+<tr>
+<td>IMDB-7</td>
+<td>Pipelined vLLM</td>
+<td style="text-align: right;">128034.26</td>
+<td style="text-align: right;">not measured</td>
+<td style="text-align: right;">0.0232</td>
+</tr>
+<tr>
 <td>IMDB-7</td>
 <td>SoL</td>
 <td style="text-align: right;">379526.20</td>
 <td style="text-align: right;">0</td>
 <td style="text-align: right;">0.0076</td>
 </tr>
-<tr class="even">
+<tr>
 <td>IMDB-8</td>
 <td>Quail</td>
-<td style="text-align: right;">1465971.18</td>
-<td style="text-align: right;">91872</td>
-<td style="text-align: right;">0.0286</td>
+<td style="text-align: right;">1242265.24</td>
+<td style="text-align: right;">91873</td>
+<td style="text-align: right;">0.0285</td>
 </tr>
-<tr class="odd">
+<tr>
 <td>IMDB-8</td>
-<td>vLLM</td>
-<td style="text-align: right;">967414.76</td>
-<td style="text-align: right;">942159</td>
-<td style="text-align: right;">0.0433</td>
+<td>Stock vLLM</td>
+<td style="text-align: right;">593922.12</td>
+<td style="text-align: right;">not measured</td>
+<td style="text-align: right;">0.0578</td>
 </tr>
-<tr class="even">
+<tr>
 <td>IMDB-8</td>
 <td>SoL</td>
 <td style="text-align: right;">3174099.85</td>
 <td style="text-align: right;">0</td>
 <td style="text-align: right;">0.0132</td>
 </tr>
-<tr class="odd">
+<tr>
 <td>IMDB-9</td>
 <td>Quail</td>
-<td style="text-align: right;">1285940.17</td>
-<td style="text-align: right;">2144348</td>
-<td style="text-align: right;">0.0524</td>
+<td style="text-align: right;">976197.73</td>
+<td style="text-align: right;">2144350</td>
+<td style="text-align: right;">0.0598</td>
 </tr>
-<tr class="even">
+<tr>
 <td>IMDB-9</td>
-<td>vLLM</td>
-<td style="text-align: right;">938999.72</td>
-<td style="text-align: right;">3018927</td>
-<td style="text-align: right;">0.0718</td>
+<td>Stock vLLM</td>
+<td style="text-align: right;">656719.28</td>
+<td style="text-align: right;">not measured</td>
+<td style="text-align: right;">0.0871</td>
 </tr>
-<tr class="odd">
+<tr>
 <td>IMDB-9</td>
 <td>SoL</td>
 <td style="text-align: right;">3738700.60</td>
 <td style="text-align: right;">0</td>
 <td style="text-align: right;">0.0180</td>
 </tr>
-<tr class="even">
+<tr>
 <td>IMDB-10</td>
 <td>Quail</td>
-<td style="text-align: right;">1182286.98</td>
-<td style="text-align: right;">2132608</td>
-<td style="text-align: right;">0.0531</td>
+<td style="text-align: right;">973640.65</td>
+<td style="text-align: right;">2132610</td>
+<td style="text-align: right;">0.0595</td>
 </tr>
-<tr class="odd">
+<tr>
 <td>IMDB-10</td>
-<td>vLLM</td>
-<td style="text-align: right;">714926.16</td>
-<td style="text-align: right;">4360757</td>
-<td style="text-align: right;">0.0878</td>
+<td>Stock vLLM</td>
+<td style="text-align: right;">547818.90</td>
+<td style="text-align: right;">not measured</td>
+<td style="text-align: right;">0.1039</td>
 </tr>
-<tr class="even">
+<tr>
 <td>IMDB-10</td>
 <td>SoL</td>
 <td style="text-align: right;">3606897.01</td>
 <td style="text-align: right;">0</td>
 <td style="text-align: right;">0.0174</td>
 </tr>
-<tr class="odd">
-<td>LEP-1</td>
+<tr>
+<td>BIO-1</td>
 <td>Quail</td>
-<td style="text-align: right;">119951.82</td>
-<td style="text-align: right;">1702</td>
-<td style="text-align: right;">0.0012</td>
+<td style="text-align: right;">93337.99</td>
+<td style="text-align: right;">2484</td>
+<td style="text-align: right;">0.0242</td>
 </tr>
-<tr class="even">
-<td>LEP-1</td>
-<td>vLLM</td>
-<td style="text-align: right;">95613.77</td>
-<td style="text-align: right;">1622</td>
+<tr>
+<td>BIO-1</td>
+<td>Stock vLLM</td>
+<td style="text-align: right;">79164.04</td>
+<td style="text-align: right;">not measured</td>
+<td style="text-align: right;">0.0285</td>
+</tr>
+<tr>
+<td>BIO-1</td>
+<td>SoL</td>
+<td style="text-align: right;">186194.32</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.0121</td>
+</tr>
+<tr>
+<td>BIO-2</td>
+<td>Quail</td>
+<td style="text-align: right;">17932736.74</td>
+<td style="text-align: right;">2484</td>
+<td style="text-align: right;">0.1422</td>
+</tr>
+<tr>
+<td>BIO-2</td>
+<td>Stock vLLM</td>
+<td style="text-align: right;">1596919.92</td>
+<td style="text-align: right;">not measured</td>
+<td style="text-align: right;">1.5958</td>
+</tr>
+<tr>
+<td>BIO-2</td>
+<td>SoL</td>
+<td style="text-align: right;">37485021.13</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.0680</td>
+</tr>
+<tr>
+<td>BIO-3</td>
+<td>Quail</td>
+<td style="text-align: right;">16808496.63</td>
+<td style="text-align: right;">2869</td>
+<td style="text-align: right;">0.1142</td>
+</tr>
+<tr>
+<td>BIO-3</td>
+<td>Stock vLLM</td>
+<td style="text-align: right;">2046908.70</td>
+<td style="text-align: right;">not measured</td>
+<td style="text-align: right;">0.9263</td>
+</tr>
+<tr>
+<td>BIO-3</td>
+<td>SoL</td>
+<td style="text-align: right;">32399507.32</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.0469</td>
+</tr>
+<tr>
+<td>BIO-4</td>
+<td>Quail</td>
+<td style="text-align: right;">14351070.48</td>
+<td style="text-align: right;">624144</td>
+<td style="text-align: right;">0.0761</td>
+</tr>
+<tr>
+<td>BIO-4</td>
+<td>Stock vLLM</td>
+<td style="text-align: right;">1958692.02</td>
+<td style="text-align: right;">not measured</td>
+<td style="text-align: right;">0.5578</td>
+</tr>
+<tr>
+<td>BIO-4</td>
+<td>SoL</td>
+<td style="text-align: right;">28579085.47</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.0382</td>
+</tr>
+<tr>
+<td>FEV-1</td>
+<td>Quail</td>
+<td style="text-align: right;">79902.33</td>
+<td style="text-align: right;">1359</td>
+<td style="text-align: right;">0.0005</td>
+</tr>
+<tr>
+<td>FEV-1</td>
+<td>Stock vLLM</td>
+<td style="text-align: right;">33314.28</td>
+<td style="text-align: right;">not measured</td>
+<td style="text-align: right;">0.0011</td>
+</tr>
+<tr>
+<td>FEV-1</td>
+<td>SoL</td>
+<td style="text-align: right;">275929.00</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.0001</td>
+</tr>
+<tr>
+<td>FEV-2</td>
+<td>Quail</td>
+<td style="text-align: right;">2423773.73</td>
+<td style="text-align: right;">678</td>
+<td style="text-align: right;">0.0324</td>
+</tr>
+<tr>
+<td>FEV-2</td>
+<td>Stock vLLM</td>
+<td style="text-align: right;">858897.88</td>
+<td style="text-align: right;">not measured</td>
+<td style="text-align: right;">0.0909</td>
+</tr>
+<tr>
+<td>FEV-2</td>
+<td>SoL</td>
+<td style="text-align: right;">5565379.99</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.0141</td>
+</tr>
+<tr>
+<td>FEV-3</td>
+<td>Quail</td>
+<td style="text-align: right;">2389325.39</td>
+<td style="text-align: right;">2605</td>
+<td style="text-align: right;">0.0237</td>
+</tr>
+<tr>
+<td>FEV-3</td>
+<td>Stock vLLM</td>
+<td style="text-align: right;">913532.98</td>
+<td style="text-align: right;">not measured</td>
+<td style="text-align: right;">0.0664</td>
+</tr>
+<tr>
+<td>FEV-3</td>
+<td>SoL</td>
+<td style="text-align: right;">5326652.62</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.0087</td>
+</tr>
+<tr>
+<td>FEV-4</td>
+<td>Quail</td>
+<td style="text-align: right;">1427079.47</td>
+<td style="text-align: right;">2605</td>
+<td style="text-align: right;">0.0052</td>
+</tr>
+<tr>
+<td>FEV-4</td>
+<td>Stock vLLM</td>
+<td style="text-align: right;">751447.42</td>
+<td style="text-align: right;">not measured</td>
+<td style="text-align: right;">0.0103</td>
+</tr>
+<tr>
+<td>FEV-4</td>
+<td>Pipelined vLLM</td>
+<td style="text-align: right;">843696.47</td>
+<td style="text-align: right;">not measured</td>
+<td style="text-align: right;">0.0092</td>
+</tr>
+<tr>
+<td>FEV-4</td>
+<td>SoL</td>
+<td style="text-align: right;">2967229.86</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.0020</td>
+</tr>
+<tr>
+<td>FEV-5</td>
+<td>Quail</td>
+<td style="text-align: right;">2228421.82</td>
+<td style="text-align: right;">2776</td>
+<td style="text-align: right;">0.0149</td>
+</tr>
+<tr>
+<td>FEV-5</td>
+<td>Stock vLLM</td>
+<td style="text-align: right;">939644.32</td>
+<td style="text-align: right;">not measured</td>
+<td style="text-align: right;">0.0380</td>
+</tr>
+<tr>
+<td>FEV-5</td>
+<td>SoL</td>
+<td style="text-align: right;">5018814.70</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.0051</td>
+</tr>
+<tr>
+<td>FEV-6</td>
+<td>Quail</td>
+<td style="text-align: right;">1164602.60</td>
+<td style="text-align: right;">2776</td>
+<td style="text-align: right;">0.0039</td>
+</tr>
+<tr>
+<td>FEV-6</td>
+<td>Stock vLLM</td>
+<td style="text-align: right;">617766.49</td>
+<td style="text-align: right;">not measured</td>
+<td style="text-align: right;">0.0077</td>
+</tr>
+<tr>
+<td>FEV-6</td>
+<td>Pipelined vLLM</td>
+<td style="text-align: right;">614566.61</td>
+<td style="text-align: right;">not measured</td>
+<td style="text-align: right;">0.0077</td>
+</tr>
+<tr>
+<td>FEV-6</td>
+<td>SoL</td>
+<td style="text-align: right;">2347116.17</td>
+<td style="text-align: right;">0</td>
 <td style="text-align: right;">0.0015</td>
 </tr>
-<tr class="odd">
+<tr>
+<td>FEV-7</td>
+<td>Quail</td>
+<td style="text-align: right;">2420578.31</td>
+<td style="text-align: right;">135139</td>
+<td style="text-align: right;">0.0608</td>
+</tr>
+<tr>
+<td>FEV-7</td>
+<td>Stock vLLM</td>
+<td style="text-align: right;">865944.90</td>
+<td style="text-align: right;">not measured</td>
+<td style="text-align: right;">0.1661</td>
+</tr>
+<tr>
+<td>FEV-7</td>
+<td>SoL</td>
+<td style="text-align: right;">5691842.82</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.0233</td>
+</tr>
+<tr>
+<td>FEV-8</td>
+<td>Quail</td>
+<td style="text-align: right;">1404525.02</td>
+<td style="text-align: right;">3120800</td>
+<td style="text-align: right;">0.1652</td>
+</tr>
+<tr>
+<td>FEV-8</td>
+<td>Stock vLLM</td>
+<td style="text-align: right;">816044.45</td>
+<td style="text-align: right;">not measured</td>
+<td style="text-align: right;">0.2759</td>
+</tr>
+<tr>
+<td>FEV-8</td>
+<td>SoL</td>
+<td style="text-align: right;">5725697.73</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.0369</td>
+</tr>
+<tr>
+<td>FEV-9</td>
+<td>Quail</td>
+<td style="text-align: right;">1610695.95</td>
+<td style="text-align: right;">1461116</td>
+<td style="text-align: right;">0.0607</td>
+</tr>
+<tr>
+<td>FEV-9</td>
+<td>Stock vLLM</td>
+<td style="text-align: right;">854404.66</td>
+<td style="text-align: right;">not measured</td>
+<td style="text-align: right;">0.1194</td>
+</tr>
+<tr>
+<td>FEV-9</td>
+<td>SoL</td>
+<td style="text-align: right;">5452523.60</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.0125</td>
+</tr>
+<tr>
+<td>FEV-10</td>
+<td>Quail</td>
+<td style="text-align: right;">164604.91</td>
+<td style="text-align: right;">2773</td>
+<td style="text-align: right;">0.0018</td>
+</tr>
+<tr>
+<td>FEV-10</td>
+<td>Stock vLLM</td>
+<td style="text-align: right;">92349.36</td>
+<td style="text-align: right;">not measured</td>
+<td style="text-align: right;">0.0032</td>
+</tr>
+<tr>
+<td>FEV-10</td>
+<td>SoL</td>
+<td style="text-align: right;">371434.56</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.0008</td>
+</tr>
+<tr>
+<td>LEP-1</td>
+<td>Quail</td>
+<td style="text-align: right;">106103.47</td>
+<td style="text-align: right;">1702</td>
+<td style="text-align: right;">0.0014</td>
+</tr>
+<tr>
+<td>LEP-1</td>
+<td>Stock vLLM</td>
+<td style="text-align: right;">90514.78</td>
+<td style="text-align: right;">not measured</td>
+<td style="text-align: right;">0.0016</td>
+</tr>
+<tr>
 <td>LEP-1</td>
 <td>SoL</td>
 <td style="text-align: right;">267221.28</td>
 <td style="text-align: right;">0</td>
 <td style="text-align: right;">0.0005</td>
 </tr>
-<tr class="even">
+<tr>
 <td>LEP-2</td>
 <td>Quail</td>
-<td style="text-align: right;">520246.72</td>
+<td style="text-align: right;">522136.87</td>
 <td style="text-align: right;">1702</td>
-<td style="text-align: right;">0.1443</td>
+<td style="text-align: right;">0.1438</td>
 </tr>
-<tr class="odd">
+<tr>
 <td>LEP-2</td>
-<td>vLLM</td>
-<td style="text-align: right;">429797.44</td>
-<td style="text-align: right;">87430</td>
-<td style="text-align: right;">0.1747</td>
+<td>Stock vLLM</td>
+<td style="text-align: right;">405102.72</td>
+<td style="text-align: right;">not measured</td>
+<td style="text-align: right;">0.1846</td>
 </tr>
-<tr class="even">
+<tr>
 <td>LEP-2</td>
 <td>SoL</td>
 <td style="text-align: right;">1178044.06</td>
 <td style="text-align: right;">0</td>
 <td style="text-align: right;">0.0637</td>
 </tr>
-<tr class="odd">
+<tr>
 <td>LEP-3</td>
 <td>Quail</td>
-<td style="text-align: right;">32359.15</td>
+<td style="text-align: right;">507950.08</td>
 <td style="text-align: right;">2058</td>
-<td style="text-align: right;">0.1034</td>
+<td style="text-align: right;">0.1027</td>
 </tr>
-<tr class="even">
+<tr>
 <td>LEP-3</td>
-<td>vLLM</td>
-<td style="text-align: right;">25232.80</td>
-<td style="text-align: right;">165313</td>
-<td style="text-align: right;">0.1326</td>
+<td>Stock vLLM</td>
+<td style="text-align: right;">398800.02</td>
+<td style="text-align: right;">not measured</td>
+<td style="text-align: right;">0.1384</td>
 </tr>
-<tr class="odd">
+<tr>
 <td>LEP-3</td>
 <td>SoL</td>
 <td style="text-align: right;">1348878.62</td>
 <td style="text-align: right;">0</td>
 <td style="text-align: right;">0.0025</td>
 </tr>
-<tr class="even">
+<tr>
 <td>LEP-4</td>
 <td>Quail</td>
-<td style="text-align: right;">31448.77</td>
+<td style="text-align: right;">405571.50</td>
 <td style="text-align: right;">1852</td>
-<td style="text-align: right;">0.0442</td>
+<td style="text-align: right;">0.0439</td>
 </tr>
-<tr class="odd">
+<tr>
 <td>LEP-4</td>
-<td>vLLM</td>
-<td style="text-align: right;">26474.53</td>
-<td style="text-align: right;">49540</td>
-<td style="text-align: right;">0.0525</td>
+<td>Stock vLLM</td>
+<td style="text-align: right;">346528.82</td>
+<td style="text-align: right;">not measured</td>
+<td style="text-align: right;">0.0514</td>
 </tr>
-<tr class="even">
+<tr>
+<td>LEP-4</td>
+<td>Pipelined vLLM</td>
+<td style="text-align: right;">350482.13</td>
+<td style="text-align: right;">not measured</td>
+<td style="text-align: right;">0.0509</td>
+</tr>
+<tr>
 <td>LEP-4</td>
 <td>SoL</td>
 <td style="text-align: right;">1054502.31</td>
 <td style="text-align: right;">0</td>
 <td style="text-align: right;">0.0013</td>
 </tr>
-<tr class="odd">
+<tr>
 <td>LEP-5</td>
 <td>Quail</td>
-<td style="text-align: right;">28188.78</td>
+<td style="text-align: right;">402751.49</td>
 <td style="text-align: right;">3420</td>
-<td style="text-align: right;">0.0433</td>
+<td style="text-align: right;">0.0431</td>
 </tr>
-<tr class="even">
+<tr>
 <td>LEP-5</td>
-<td>vLLM</td>
-<td style="text-align: right;">23364.36</td>
-<td style="text-align: right;">51004</td>
-<td style="text-align: right;">0.0522</td>
+<td>Stock vLLM</td>
+<td style="text-align: right;">342140.98</td>
+<td style="text-align: right;">not measured</td>
+<td style="text-align: right;">0.0504</td>
 </tr>
-<tr class="odd">
+<tr>
+<td>LEP-5</td>
+<td>Pipelined vLLM</td>
+<td style="text-align: right;">345756.89</td>
+<td style="text-align: right;">not measured</td>
+<td style="text-align: right;">0.0498</td>
+</tr>
+<tr>
 <td>LEP-5</td>
 <td>SoL</td>
 <td style="text-align: right;">900460.88</td>
 <td style="text-align: right;">0</td>
 <td style="text-align: right;">0.0014</td>
 </tr>
+<tr>
+<td>AGENT-1</td>
+<td>Quail</td>
+<td style="text-align: right;">72720.76</td>
+<td style="text-align: right;">11886152</td>
+<td style="text-align: right;">0.2623</td>
+</tr>
+<tr>
+<td>AGENT-1</td>
+<td>Stock vLLM</td>
+<td style="text-align: right;">168701.80</td>
+<td style="text-align: right;">not measured</td>
+<td style="text-align: right;">0.1131</td>
+</tr>
+<tr>
+<td>AGENT-1</td>
+<td>SoL</td>
+<td style="text-align: right;">366357.25</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.0521</td>
+</tr>
+<tr>
+<td>AGENT-2</td>
+<td>Quail</td>
+<td style="text-align: right;">73292.18</td>
+<td style="text-align: right;">11886152</td>
+<td style="text-align: right;">0.2609</td>
+</tr>
+<tr>
+<td>AGENT-2</td>
+<td>Stock vLLM</td>
+<td style="text-align: right;">169700.75</td>
+<td style="text-align: right;">not measured</td>
+<td style="text-align: right;">0.1127</td>
+</tr>
+<tr>
+<td>AGENT-2</td>
+<td>SoL</td>
+<td style="text-align: right;">364144.27</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.0525</td>
+</tr>
 </tbody>
 </table>
 </div>
-<p>Figure 1 shows average tokens per second as a percent of each dataset’s
-SoL estimate. For every method, we divide total requested input tokens by
-runtime. SoL uses the same requested-token total and its estimated
-runtime. Each bar divides the dataset’s mean rate by that dataset’s mean
-SoL rate. The top of the axis is 100% of SoL. The vertical axis uses a log scale. On BIO, Quail averages
-about 11.5 million tokens per second, which is 46.6% of the 24.7 million
-SoL estimate, compared with 1.4 million for vLLM, or 5.6% of SoL. vLLM is
-ahead on AGENT, at 48.2% of SoL compared with 20.0% for Quail. The
-latency figure below keeps the per-query detail.</p>
+<p>Figure 1 shows average tokens per second as a percent of each
+dataset’s SoL estimate. Each measured method uses the full input lengths
+of the prompts it evaluated. SoL runtime uses exact reference survivors.
+The saved BIO-4 SoL result uses Quail’s requested-token count because it
+does not store its own full prompt total. Each bar divides the dataset’s
+mean rate by that dataset’s mean SoL rate. The top of the axis is 100%
+of SoL. The vertical axis uses a log scale. On BIO, Quail averages 12.3
+million tokens per second, which is 49.9% of SoL, compared with 5.8% for
+stock vLLM. Stock vLLM is ahead on AGENT, at 46.3% of SoL compared with
+20.0% for Quail. The latency figure below keeps the per-query
+detail.</p>
 <div class="figure-block wide-figure">
 <p><a href="figures/quailb_latency.pdf"><img
 src="figures/quailb_latency.png" style="width:100.0%"
-alt="Query latency for Quail, the vLLM baseline, and SoL estimates across the 31 default QUAIL-B queries. BIO-1 and BIO-3 are marked as not measured." /></a></p>
+alt="Query latency for Quail, stock vLLM, and SoL estimates across all 31 default QUAIL-B queries." /></a></p>
 <p><em>Figure 8. Query latency at scale factor 0.1. Bars show measured
 query time, and horizontal lines show SoL estimates. The vertical axis
 uses a log scale because the query times span more than three orders of
-magnitude. An x marks BIO-1 and BIO-3, which do not have measurements
-for their current definitions.</em></p>
+magnitude.</em></p>
 </div>
-<p>The 29 Quail runs take 1,484.25 seconds in total, compared with
-3,149.83 seconds for the vLLM baseline. That is a 2.12 times aggregate
-speedup. The combined SoL estimate for the same queries is 449.43
-seconds. Quail takes 3.30 times the estimate in aggregate, compared with
-7.01 times for the vLLM baseline.</p>
+<p>The 31 Quail runs take 1,700.68 seconds in total, compared with
+4,563.75 seconds for stock vLLM. That is a 2.68 times aggregate speedup.
+The combined SoL estimate is 503.27 seconds. Quail takes 3.38 times the
+estimate in aggregate, compared with 9.07 times for stock vLLM.</p>
+<p>The two vLLM submission strategies differ only when multiple filters
+apply to the same document stream. Figure 9 therefore shows those eight
+queries instead of repeating two equivalent vLLM bars on all 31
+queries.</p>
+<div class="figure-block wide-figure">
+<p><a href="figures/quailb_filter_submission.pdf"><img
+src="figures/quailb_filter_submission.png" style="width:100.0%"
+alt="Stock and pipelined vLLM latency on the eight QUAIL-B queries with multi-filter chains, with SoL estimates." /></a></p>
+<p><em>Figure 9. Stock vLLM finishes one complete filter stage before
+submitting the next. Pipelined vLLM advances each passing document
+immediately. Labels show stock time divided by pipelined time.
+Horizontal lines show SoL estimates.</em></p>
+</div>
+<p>Pipelining reduces latency on seven of the eight queries. The mean
+stock-to-pipelined ratio is 1.12 times. The largest change is IMDB-6,
+where pipelined vLLM is 1.27 times faster. FEV-6 differs by less than
+1%, and the two LePaRD queries differ by about 1%.</p>
 <p>The main exceptions are AGENT-1 and AGENT-2. Quail does not yet reuse
 matching prefixes across different rows, so it recomputes 11.89 million
 KV tokens on each query. Section 4.4 examines AGENT-1.</p>
@@ -1464,8 +1514,8 @@ It then runs two joins over the surviving inputs.</p>
 <div class="figure-block wide-figure">
 <p><a href="figures/bio4_results.pdf"><img
 src="figures/bio4_results.png" style="width:100.0%"
-alt="BIO-4 results at scale factor 1.0. Quail takes 29.26 minutes and costs $1.93. The vLLM baseline takes 6.84 hours and costs $27.03. The SoL estimate is 14.91 minutes and $0.98." /></a></p>
-<p><em>Figure 9. BIO-4 results at scale factor 1.0. Query time and GPU
+alt="BIO-4 results at scale factor 1.0. Quail takes 29.26 minutes and costs $1.93. Pipelined vLLM takes 6.84 hours and costs $27.03. The SoL estimate is 14.91 minutes and $0.98." /></a></p>
+<p><em>Figure 10. BIO-4 results at scale factor 1.0. Query time and GPU
 cost exclude model startup. Fresh input tokens count every token
 processed by a model forward pass. Recomputed KV tokens are included in
 the fresh input token total.</em></p>
@@ -1473,25 +1523,25 @@ the fresh input token total.</em></p>
 <div class="figure-block wide-figure">
 <p><a href="figures/bio4_profile_comparison.pdf"><img
 src="figures/bio4_profile_comparison.png" style="width:100.0%"
-alt="Five seconds of GPU activity during a BIO-4 join with Quail and the vLLM baseline." /></a></p>
-<p><em>Figure 10. The same BIO-4 join window for Quail on the left and
-the vLLM baseline on the right. This profile comes from a scale factor
-0.1 run, even though this section reports scale factor 1.0 results.
-Quail keeps the GPU busy, while the baseline shows idle gaps.</em></p>
+alt="Five seconds of GPU activity during a BIO-4 join with Quail and pipelined vLLM." /></a></p>
+<p><em>Figure 11. The same BIO-4 join window for Quail on the left and
+pipelined vLLM on the right. This profile comes from a scale factor 0.1
+run, even though this section reports scale factor 1.0 results. Quail
+keeps the GPU busy, while vLLM shows idle gaps.</em></p>
 </div>
-<p>Quail takes 29.26 minutes, compared with 6.84 hours for the vLLM
-baseline. Quail is 14.04 times faster. It is 1.96 times the SoL
-estimate, while the vLLM baseline is 27.55 times the estimate.</p>
+<p>Quail takes 29.26 minutes, compared with 6.84 hours for pipelined
+vLLM. Quail is 14.04 times faster. It is 1.96 times the SoL estimate,
+while pipelined vLLM is 27.55 times the estimate.</p>
 <p>The GPU cost follows the same ratio because each run uses one H100.
-Quail costs $1.93 per query, compared with $27.03 for the vLLM baseline.
+Quail costs $1.93 per query, compared with $27.03 for pipelined vLLM.
 The SoL cost estimate is $0.98 per query.</p>
 <p>Quail also recomputes less KV. It recomputes 18.0 million tokens,
-compared with 50.3 million for the vLLM baseline. The two engines can
-make slightly different predicate decisions, which changes how many
-document pairs reach later joins. Each number above reports the work and
-time from that method’s measured run.</p>
-<h2 id="agent-1-where-the-vllm-baseline-wins">4.4 AGENT-1, where the
-vLLM baseline wins</h2>
+compared with 50.3 million for pipelined vLLM. The two engines can make
+slightly different predicate decisions, which changes how many document
+pairs reach later joins. Each number above reports the work and time
+from that method’s measured run.</p>
+<h2 id="agent-1-where-stock-vllm-wins">4.4 AGENT-1, where stock vLLM
+wins</h2>
 <p>AGENT-1 contains 1,772 cumulative snapshots from software agent runs.
 Each snapshot contains the complete trace up to one point in the run, so
 later snapshots from the same run begin with the full contents of
@@ -1506,7 +1556,7 @@ following:</p>
 <col style="width: 23%" />
 </colgroup>
 <thead>
-<tr class="header">
+<tr>
 <th>id</th>
 <th>trajectory_id</th>
 <th style="text-align: right;">turn_index</th>
@@ -1514,13 +1564,13 @@ following:</p>
 </tr>
 </thead>
 <tbody>
-<tr class="odd">
+<tr>
 <td><code>trace_42_turn_5</code></td>
 <td><code>trace_42</code></td>
 <td style="text-align: right;">5</td>
 <td><code>[USER] Fix the failing parser. [ASSISTANT] Tries approach A. [TOOL] The test fails.</code></td>
 </tr>
-<tr class="even">
+<tr>
 <td><code>trace_42_turn_10</code></td>
 <td><code>trace_42</code></td>
 <td style="text-align: right;">10</td>
@@ -1547,58 +1597,59 @@ class="sourceCode sql"><code class="sourceCode sql"><span id="cb7-1"><a href="#c
 <col style="width: 36%" />
 </colgroup>
 <thead>
-<tr class="header">
+<tr>
 <th>Metric</th>
 <th style="text-align: right;">Quail</th>
-<th style="text-align: right;">vLLM baseline</th>
+<th style="text-align: right;">Stock vLLM</th>
 </tr>
 </thead>
 <tbody>
-<tr class="odd">
+<tr>
 <td>Query latency, seconds</td>
-<td style="text-align: right;">237.80</td>
-<td style="text-align: right;">98.45</td>
+<td style="text-align: right;">239.12</td>
+<td style="text-align: right;">103.07</td>
 </tr>
-<tr class="even">
+<tr>
 <td>GPU cost per query</td>
-<td style="text-align: right;">$0.26087</td>
-<td style="text-align: right;">$0.10800</td>
+<td style="text-align: right;">$0.26232</td>
+<td style="text-align: right;">$0.11307</td>
 </tr>
-<tr class="odd">
+<tr>
 <td>Fresh input tokens</td>
 <td style="text-align: right;">17,389,113</td>
-<td style="text-align: right;">5,526,889</td>
+<td style="text-align: right;">5,524,100</td>
 </tr>
-<tr class="even">
+<tr>
 <td>KV regret tokens</td>
 <td style="text-align: right;">11,886,152</td>
-<td style="text-align: right;">23,928</td>
+<td style="text-align: right;">Not measured</td>
 </tr>
-<tr class="odd">
+<tr>
 <td>Latency relative to the speed of light estimate, 47.47 seconds</td>
-<td style="text-align: right;">5.01×</td>
-<td style="text-align: right;">2.07×</td>
+<td style="text-align: right;">5.04×</td>
+<td style="text-align: right;">2.17×</td>
 </tr>
 </tbody>
 </table>
 </div>
-<p>The vLLM baseline runs AGENT-1 in 98.45 seconds, which is 2.42 times
-faster than Quail.</p>
+<p>Stock vLLM runs AGENT-1 in 103.07 seconds, which is 2.32 times faster
+than Quail.</p>
 <div class="figure-block wide-figure">
 <p><a href="figures/agent1_profile_comparison.pdf"><img
 src="figures/agent1_profile_comparison.png" style="width:100.0%"
-alt="Five seconds of GPU activity and top-level CPU operations during the AGENT-1 filter with Quail and the vLLM baseline." /></a></p>
-<p><em>Figure 11. AGENT-1 has one filter and no join. GPU operations
-cover 4.998 seconds with Quail and 4.988 seconds with the vLLM baseline
-in these five-second windows. The lower row shows only top-level CPU
-operations. Both keep the GPU busy, but the vLLM baseline computes far
-fewer fresh tokens by reusing prefixes across snapshots.</em></p>
+alt="Five seconds of GPU activity and top-level CPU operations during the AGENT-1 filter with Quail and vLLM." /></a></p>
+<p><em>Figure 12. AGENT-1 has one filter and no join. GPU operations
+cover 4.998 seconds with Quail and 4.988 seconds with vLLM in these
+five-second windows. The lower row shows only top-level CPU operations.
+Both keep the GPU busy, but vLLM computes far fewer fresh tokens by
+reusing prefixes across snapshots.</em></p>
 </div>
-<p>The vLLM baseline wins because its automatic prefix caching feature
-can reuse KV across different rows when their token prefixes match.
-Quail currently reuses KV only when the same document appears again in
-the query. As a result, Quail incurs 11.89 million KV regret tokens,
-while the vLLM baseline incurs only 23,928.</p>
+<p>Stock vLLM wins because its automatic prefix caching feature can
+reuse KV across different rows when their token prefixes match. Quail
+currently reuses KV only when the same document appears again in the
+query. Quail computes 17.39 million fresh input tokens, compared with
+5.52 million for stock vLLM. The current vLLM run does not expose
+compatible prompt pieces, so its KV regret is not measured.</p>
 <p>We plan to add automatic prefix caching to Quail, but the lookup must
 remain cheap at the request volumes that AI-SQL queries can produce.</p>
 <h1 id="what-comes-next">5. What comes next</h1>
@@ -1657,7 +1708,7 @@ For now, please try Quail out! And if any of the ideas above sound
 interesting, apply to a Computer Science PhD program at Carnegie Mellon!
 If you are an undergraduate or master’s student, or are looking for a
 postdoc, please reach out.</p>
-<aside id="footnotes" class="footnotes footnotes-end-of-document"
+<section id="footnotes" class="footnotes footnotes-end-of-document"
 role="doc-endnotes">
 <hr />
 <ol>
@@ -1743,6 +1794,6 @@ Qwen, Quail accepts eight token IDs: four for <code>TRUE</code> and four
 for <code>FALSE</code>.<a href="#fnref10" class="footnote-back"
 role="doc-backlink">↩︎</a></p></li>
 </ol>
-</aside>
+</section>
 </body>
 </html>

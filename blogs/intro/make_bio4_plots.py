@@ -1,18 +1,28 @@
-"""Build the current aggregate latency plot and BIO-4 result image.
+"""Build the current latency, filter submission, and BIO-4 figures.
 
 Pull the saved results before running the script:
 
-    W=/tmp/quail-blog-bio4; mkdir -p "$W"
+    W=/tmp
+    R=benchmarks/quailb/20260922T190951Z-efa30103
     uv run modal volume get quail-results \
-      reports/quailb-raw-2026-09-19/comparison.json "$W/comparison.json"
-    R=benchmarks/quailb/family-runs/20260920T062701Z-bio4-4b
+      "$R/quail/run.json" "$W/quailb-gigatoken-quail.json"
     uv run modal volume get quail-results \
-      "$R/quail/biodex/run.json" "$W/bio4-sf01-quail.json"
+      "$R/stock_vllm/run.json" "$W/quailb-gigatoken-stock.json"
     uv run modal volume get quail-results \
-      "$R/pipelined_vllm/biodex/run.json" "$W/bio4-sf01-vllm.json"
+      "$R/pipelined_vllm/run.json" "$W/quailb-gigatoken-pipelined.json"
+    uv run modal volume get quail-results \
+      reports/quailb-raw-2026-09-19/comparison.json \
+      "$W/quailb-gigatoken-sol-base.json"
     uv run modal volume get quail-results \
       sol/2026-09-20-bio4-qwen3-4b-sf0.1.json \
-      "$W/bio4-sf01-sol.json"
+      "$W/quailb-gigatoken-sol-bio4.json"
+    G=/ground_truth/quailb/schema_v1/collections
+    uv run modal volume get quail-results \
+      "$G/gt_be81cb241d74555dc2da79b5b0662554/manifest.json" \
+      "$W/quailb-sol-collection.json"
+    uv run modal volume get quail-results \
+      "$G/gt_cd3ebdb784f64b9e028e50ea73cdedd0/manifest.json" \
+      "$W/quailb-run-collection.json"
     R=benchmarks/quailb/family-runs/20260920T064415Z-bio4-4b-sf1.0
     uv run modal volume get quail-results \
       "$R/quail/biodex/run.json" "$W/quail.json"
@@ -20,7 +30,10 @@ Pull the saved results before running the script:
       "$R/pipelined_vllm/biodex/run.json" "$W/vllm.json"
     uv run modal volume get quail-results \
       sol/2026-09-20-bio4-qwen3-4b-sf1.0.json "$W/sol.json"
-    uv run --with matplotlib python blogs/intro/make_bio4_plots.py "$W"
+    BENCH=git+https://github.com/fsdatalab/quail-bench.git
+    REV=35d026dc2f5b5c1e787268173e81e512b749081a
+    uv run --with matplotlib --with "quail-b@$BENCH@$REV" \
+      python blogs/intro/make_bio4_plots.py "$W"
 """
 
 import argparse
@@ -31,24 +44,13 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 
+from quailb_results import PIPELINE_QUERIES, QUERY_ORDER, load_results
+
 HERE = Path(__file__).resolve().parent
 BLUE = "#4C72B0"
 ORANGE = "#DD8452"
+TEAL = "#55A868"
 DARK = "#333333"
-GRAY = "#98A2B3"
-
-BASE_QUERY_ORDER = (
-    [f"IMDB-{number}" for number in range(1, 11)]
-    + [f"BIO-{number}" for number in range(1, 4)]
-    + [f"FEV-{number}" for number in range(1, 11)]
-    + [f"LEP-{number}" for number in range(1, 6)]
-    + ["AGENT-1", "AGENT-2"]
-)
-QUERY_ORDER = BASE_QUERY_ORDER[:13] + ["BIO-4"] + BASE_QUERY_ORDER[13:]
-SOURCE_QUERY_IDS = {
-    query: "LEP-7" if query == "LEP-5" else query
-    for query in BASE_QUERY_ORDER
-}
 
 
 def _load(path):
@@ -88,64 +90,23 @@ def _configure_matplotlib():
 
 def plot_aggregate(workdir):
     """Plot current scale factor 0.1 latency measurements."""
-    comparison = _load(workdir / "comparison.json")
-    bio4 = {
-        "quail": _bio4_row(_load(workdir / "bio4-sf01-quail.json")),
-        "pipelined_vllm": _bio4_row(
-            _load(workdir / "bio4-sf01-vllm.json")
-        ),
-    }
-    bio4_sol = _load(workdir / "bio4-sf01-sol.json")
-    assert bio4_sol["query"] == "BIO-4"
-    assert bio4_sol["scale_factor"] == 0.1
-
-    rows = {"quail": {}, "pipelined_vllm": {}}
-    sol = {}
-    for query in QUERY_ORDER:
-        if query == "BIO-4":
-            for method in rows:
-                rows[method][query] = bio4[method]["runtime_s"]
-            sol[query] = bio4_sol["estimate"]["sol_s"]
-            continue
-        source = SOURCE_QUERY_IDS[query]
-        for method in rows:
-            saved = comparison["rows"][method].get(source)
-            rows[method][query] = None if saved is None else saved["runtime_s"]
-        sol[query] = comparison["sol"][source]["sol_s"]
+    rows, sol = load_results(workdir)
 
     figure, axis = plt.subplots(figsize=(18, 6.5))
     positions = list(range(len(QUERY_ORDER)))
     width = 0.34
     methods = (
         ("quail", "Quail", BLUE, -width / 2),
-        ("pipelined_vllm", "vLLM baseline", ORANGE, width / 2),
+        ("stock_vllm", "Stock vLLM", ORANGE, width / 2),
     )
-    positive = [
-        value
-        for method in rows.values()
-        for value in method.values()
-        if value is not None and value > 0
-    ]
-    missing_height = min(positive) / 1.5
     for method, _, color, offset in methods:
         for position, query in zip(positions, QUERY_ORDER):
-            value = rows[method][query]
+            value = rows[method][query]["runtime_s"]
             x = position + offset
-            if value is None:
-                axis.scatter(
-                    [x],
-                    [missing_height],
-                    marker="x",
-                    s=42,
-                    color=color,
-                    linewidth=2,
-                    zorder=4,
-                )
-            else:
-                axis.bar(x, value, width, color=color, zorder=2)
+            axis.bar(x, value, width, color=color, zorder=2)
     for position, query in zip(positions, QUERY_ORDER):
         axis.hlines(
-            sol[query],
+            sol[query]["runtime_s"],
             position - 0.42,
             position + 0.42,
             color=DARK,
@@ -164,24 +125,88 @@ def plot_aggregate(workdir):
     axis.legend(
         handles=[
             Patch(facecolor=BLUE, label="Quail"),
-            Patch(facecolor=ORANGE, label="vLLM baseline"),
+            Patch(facecolor=ORANGE, label="Stock vLLM"),
             Line2D([0], [0], color=DARK, linewidth=1.6, label="SoL estimate"),
-            Line2D(
-                [0],
-                [0],
-                color=GRAY,
-                marker="x",
-                linestyle="none",
-                label="Not measured",
-            ),
         ],
         loc="upper center",
         bbox_to_anchor=(0.5, -0.25),
-        ncol=4,
+        ncol=3,
         frameon=False,
     )
     figure.subplots_adjust(bottom=0.30, left=0.08, right=0.99, top=0.90)
     destination = HERE / "figures" / "quailb_latency"
+    figure.savefig(destination.with_suffix(".pdf"), bbox_inches="tight")
+    figure.savefig(destination.with_suffix(".png"), dpi=300, bbox_inches="tight")
+    plt.close(figure)
+
+
+def plot_filter_submission(workdir):
+    """Compare vLLM filter submission strategies where they differ."""
+    rows, sol = load_results(workdir)
+    figure, axis = plt.subplots(figsize=(12.5, 5.8))
+    positions = list(range(len(PIPELINE_QUERIES)))
+    width = 0.34
+    methods = (
+        ("stock_vllm", "Stock vLLM", ORANGE, -width / 2),
+        ("pipelined_vllm", "Pipelined vLLM", TEAL, width / 2),
+    )
+    for method, _, color, offset in methods:
+        values = [rows[method][query]["runtime_s"] for query in PIPELINE_QUERIES]
+        axis.bar(
+            [position + offset for position in positions],
+            values,
+            width,
+            color=color,
+            zorder=2,
+        )
+    for position, query in zip(positions, PIPELINE_QUERIES):
+        axis.hlines(
+            sol[query]["runtime_s"],
+            position - 0.42,
+            position + 0.42,
+            color=DARK,
+            linewidth=1.6,
+            zorder=3,
+        )
+        stock = rows["stock_vllm"][query]["runtime_s"]
+        pipelined = rows["pipelined_vllm"][query]["runtime_s"]
+        axis.annotate(
+            f"{stock / pipelined:.2f}×",
+            (position, max(stock, pipelined)),
+            xytext=(0, 5),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            fontsize=10,
+        )
+    axis.set_yscale("log")
+    axis.set_ylabel("seconds (log scale)")
+    axis.set_xticks(positions, PIPELINE_QUERIES)
+    axis.set_xlim(-0.65, len(PIPELINE_QUERIES) - 0.35)
+    axis.set_title(
+        "vLLM filter submission on multi-filter chains\n"
+        "Qwen3 4B FP8, one H100, scale factor 0.1"
+    )
+    axis.legend(
+        handles=[
+            Patch(facecolor=ORANGE, label="Stock vLLM"),
+            Patch(facecolor=TEAL, label="Pipelined vLLM"),
+            Line2D([0], [0], color=DARK, linewidth=1.6, label="SoL estimate"),
+        ],
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.17),
+        ncol=3,
+        frameon=False,
+    )
+    figure.text(
+        0.08,
+        0.015,
+        "Labels are stock time divided by pipelined time. "
+        "Only queries with multiple filters on one document stream are shown.",
+        fontsize=10,
+    )
+    figure.subplots_adjust(bottom=0.27, left=0.09, right=0.98, top=0.82)
+    destination = HERE / "figures" / "quailb_filter_submission"
     figure.savefig(destination.with_suffix(".pdf"), bbox_inches="tight")
     figure.savefig(destination.with_suffix(".png"), dpi=300, bbox_inches="tight")
     plt.close(figure)
@@ -208,7 +233,7 @@ def plot_bio4_results(workdir):
     assert sol_source["scale_factor"] == 1.0
     sol = sol_source["estimate"]
 
-    columns = ("Quail", "vLLM baseline", "SoL estimate")
+    columns = ("Quail", "Pipelined vLLM", "SoL estimate")
     values = (
         (
             _duration(quail["runtime_s"]),
@@ -280,7 +305,7 @@ def plot_bio4_results(workdir):
     axis.text(
         0,
         0.06,
-        f"Quail is {speedup:.2f} times faster than the vLLM baseline.",
+        f"Quail is {speedup:.2f} times faster than pipelined vLLM.",
         transform=axis.transAxes,
         fontsize=14,
         weight="bold",
@@ -296,6 +321,7 @@ def main(workdir):
     """Build all plots from saved benchmark results."""
     _configure_matplotlib()
     plot_aggregate(workdir)
+    plot_filter_submission(workdir)
     plot_bio4_results(workdir)
 
 
