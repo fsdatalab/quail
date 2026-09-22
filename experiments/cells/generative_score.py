@@ -26,6 +26,14 @@ Each model writes, under /results/ai-score/generative-<run id>/:
     <model>/<query>.parquet one row per scored document or pair
 
 --models picks the models and --queries the QUAIL-B query ids.
+
+The `repeat` entrypoint runs AI.SCORE and AI_FILTER in two fresh
+sessions per model and writes repeat-<model>.json beside the main run:
+
+    uv run modal run --detach \
+      experiments/cells/generative_score.py::repeat \
+      --prediction "..." --run-dir /results/ai-score/generative-<run id> \
+      2>&1 | tee results/generative-score-repeat.log
 """
 
 import json
@@ -294,6 +302,69 @@ def score_model(model: str, query_ids: list[str], run_dir: str,
     _save_json(summary_path, summary)
     results_vol.commit()
     return summary_path
+
+
+@app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
+              volumes=volumes)
+def repeat_check(model: str, query_ids: list[str], run_dir: str,
+                 prediction: str) -> str:
+    """Run AI.SCORE and AI_FILTER in two fresh sessions and compare them."""
+    suite = _suite(query_ids)
+    passes = []
+    for _ in range(2):
+        session = _session(model, suite.tables)
+        try:
+            answers = {}
+            for query_id in query_ids:
+                predicate = _predicate(query_id)
+                table, _ = _run(session, score_sql(predicate))
+                kept, _ = _run(session, filter_sql(predicate))
+                ids = table.column("l.id").to_numpy(zero_copy_only=False)
+                answers[query_id] = (
+                    table.column("score").to_numpy(),
+                    np.isin(ids, kept.column("l.id").to_numpy(
+                        zero_copy_only=False)))
+            passes.append(answers)
+        finally:
+            session.close()
+    result = {"model": model, "prediction": prediction, "queries": {}}
+    for query_id in query_ids:
+        (score_a, filter_a), (score_b, filter_b) = (
+            passes[0][query_id], passes[1][query_id])
+        result["queries"][query_id] = {
+            "rows": len(score_a),
+            "largest_score_change": float(np.abs(score_a - score_b).max()),
+            "score_threshold_flips": int(((score_a > 0.5)
+                                          != (score_b > 0.5)).sum()),
+            "ai_filter_flips": int((filter_a != filter_b).sum()),
+            "score_vs_ai_filter_disagreements": [
+                int(((score_a > 0.5) != filter_a).sum()),
+                int(((score_b > 0.5) != filter_b).sum())],
+        }
+    path = f"{run_dir}/repeat-{model}.json"
+    result["result_volume_path"] = path
+    _save_json(path, result)
+    results_vol.commit()
+    kernel_cache.commit()
+    return json.dumps(result)
+
+
+@app.local_entrypoint()
+def repeat(prediction: str = "", run_dir: str = "",
+           models: str = "qwen3-4b-fp8,diffusion-gemma-26b-a4b-fp8",
+           queries: str = "IMDB-1,BIO-1"):
+    """Submit repeat_check for each model and print the call ids."""
+    if not prediction or not run_dir:
+        raise ValueError("pass --prediction and the main run's --run-dir")
+    print(f"PREDICTION: {prediction}", flush=True)
+    query_ids = [name.strip() for name in queries.split(",") if name.strip()]
+    calls = {model.strip(): repeat_check.spawn(
+        model.strip(), query_ids, run_dir, prediction)
+        for model in models.split(",") if model.strip()}
+    for model, call in calls.items():
+        print(f"function call id: {call.object_id} ({model})", flush=True)
+    for model, call in calls.items():
+        print(f"{model}: {call.get()}", flush=True)
 
 
 def plan_estimates(models, query_ids) -> dict:
