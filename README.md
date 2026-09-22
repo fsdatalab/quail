@@ -55,13 +55,16 @@ with quail.Session(config=config) as session:
 
 ## Quail Server
 
+Quail Server is an optional HTTP server that runs on the machine with
+the GPU. You start it once, send queries to it with `endpoint`, and
+the query keeps running after the client disconnects. `submit()`
+returns once the server has saved the record, and `get_run` reads
+that record later.
+
 ```bash
 pip install "quail-engine[server]"
 quail-server
 ```
-
-Pass `endpoint` to run the query on the server. `submit()` returns
-after the record is saved. Reattach with `session.get_run(id)`.
 
 ```python
 with quail.Session(config=config, endpoint="http://127.0.0.1:8642") as session:

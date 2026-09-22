@@ -69,19 +69,23 @@ session.
 
 ## Running on Quail Server
 
-Pass `endpoint` to run the query on
-[Quail Server](/docs/user-guide/server). `register`, `sql`, `run`,
-and `collect` are the same calls. `submit()` returns after the
-record is saved.
+A session can run the query on a
+[Quail Server](/docs/user-guide/server) that is already up on the GPU
+machine. Pass that server's address as `endpoint`. You still register
+tables and call `sql`, `run`, and `collect`. `submit()` returns as
+soon as the server has saved the record, and you can read that record
+later from this process or from another one.
 
 ```python
 with quail.Session(config=config, endpoint="http://127.0.0.1:8642") as session:
     ...
 ```
 
-The server plans the query. `explain()`, `plan()`, and `session.docs`
-are not available on a remote session. Write the query in SQL, and
-read the plan from `run.status().plan["text"]` after you submit.
+The server compiles and plans the query while it runs. After you
+submit, the plan it chose is the text at `run.status().plan["text"]`.
+Write the query in SQL. A remote session runs that plan; `explain()`,
+`plan()`, and the Python builder `session.docs` belong to a local
+session, where this process is the one planning the query.
 
 ## Multiple GPUs
 
