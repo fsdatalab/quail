@@ -274,25 +274,6 @@ def refused_queries(session, query_ids, data_dir) -> dict[str, str]:
     return refused
 
 
-def _apply_reported_input_tokens(record) -> None:
-    """Use exact engine token counts when prompt pieces are unavailable."""
-    for item in record["queries"]:
-        reported = item.get("measurements", {}).get("input_tokens")
-        metrics = item.get("metrics")
-        if reported is None or metrics is None:
-            continue
-        metrics["input_tokens"] = reported
-        runtime_s = item.get("runtime_s")
-        metrics["input_tokens_per_second"] = (
-            reported / runtime_s if runtime_s else None
-        )
-        cost = metrics.get("cost_usd")
-        metrics["cost_usd_per_million_input_tokens"] = (
-            cost / reported * 1e6
-            if cost is not None and reported else None
-        )
-
-
 def run_suite(only=None, *, sf=0.1, config, data_dir=None,
               ground_truth_collection=None, output_dir,
               h100_usd_per_hour=H100_USD_PER_HOUR, root=None):
@@ -332,7 +313,6 @@ def run_suite(only=None, *, sf=0.1, config, data_dir=None,
                 },
             })
         record["skipped_queries"] = skipped
-        _apply_reported_input_tokens(record)
         write_json(Path(output_dir) / "run.json", record)
         benchmark.report(output_dir, rescore=False)
         return record

@@ -5,7 +5,6 @@ import pyarrow.parquet as pq
 
 import quail
 from quail.bench.quailb import (
-    _apply_reported_input_tokens,
     _submission_to_answer_s,
     queries,
     register_tables,
@@ -75,26 +74,6 @@ def test_submission_to_answer_timing_includes_common_answer_work():
     assert _submission_to_answer_s(
         "pipelined_vllm", report, frontend_s=1.0, answer_prepare_s=0.75
     ) == 11.25
-
-
-def test_reported_input_tokens_fill_throughput_and_cost():
-    record = {"queries": [{
-        "runtime_s": 2.0,
-        "measurements": {"input_tokens": 100},
-        "metrics": {
-            "input_tokens": None,
-            "input_tokens_per_second": None,
-            "cost_usd": 0.25,
-            "cost_usd_per_million_input_tokens": None,
-        },
-    }]}
-
-    _apply_reported_input_tokens(record)
-
-    metrics = record["queries"][0]["metrics"]
-    assert metrics["input_tokens"] == 100
-    assert metrics["input_tokens_per_second"] == 50.0
-    assert metrics["cost_usd_per_million_input_tokens"] == 2500.0
 
 
 def test_all_queries_compile_and_plan(tmp_path):
