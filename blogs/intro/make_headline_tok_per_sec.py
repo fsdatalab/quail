@@ -59,7 +59,7 @@ HERE = Path(__file__).resolve().parent
 BLUE = "#4C72B0"
 ORANGE = "#DD8452"
 DARK = "#333333"
-DATASETS = ("IMDB", "FEV", "LEP", "AGENT", "BIO")
+DATASETS = ("BIO", "IMDB", "FEV", "LEP", "AGENT")
 # QUAIL-B README: 10 IMDB, 4 BioDEX, 10 FEVER, 5 LePaRD, 2 SWE-Next.
 QUERY_COUNTS = {"IMDB": 10, "FEV": 10, "LEP": 5, "AGENT": 2, "BIO": 4}
 # The saved comparison still uses ids from before the LePaRD deletion.
