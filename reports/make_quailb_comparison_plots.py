@@ -5,19 +5,20 @@ Pull the CPU-derived summary and regenerate the figures:
     W=/tmp/quailb-raw; mkdir -p "$W"
     uv run modal volume get quail-results \
       reports/quailb-raw-2026-09-19/comparison.json "$W/comparison.json"
+    BIO4_SF01_RUN=benchmarks/quailb/family-runs/20260920T062701Z-bio4-4b
     uv run modal volume get quail-results \
-      benchmarks/quailb/family-runs/20260920T062701Z-bio4-4b/quail/run.json \
+      "$BIO4_SF01_RUN/quail/biodex/run.json" \
       "$W/bio4-sf0.1-quail.json"
     uv run modal volume get quail-results \
-      benchmarks/quailb/family-runs/20260920T062701Z-bio4-4b/pipelined_vllm/run.json \
+      "$BIO4_SF01_RUN/pipelined_vllm/biodex/run.json" \
       "$W/bio4-sf0.1-vllm.json"
     uv run modal volume get quail-results \
       sol/2026-09-20-bio4-qwen3-4b-sf0.1.json "$W/bio4-sf0.1-sol.json"
     BIO4_SF1_RUN=benchmarks/quailb/family-runs/20260920T064415Z-bio4-4b-sf1.0
-    uv run modal volume get quail-results "$BIO4_SF1_RUN/quail/run.json" \
+    uv run modal volume get quail-results "$BIO4_SF1_RUN/quail/biodex/run.json" \
       "$W/bio4-sf1-quail.json"
     uv run modal volume get quail-results \
-      "$BIO4_SF1_RUN/pipelined_vllm/run.json" \
+      "$BIO4_SF1_RUN/pipelined_vllm/biodex/run.json" \
       "$W/bio4-sf1-vllm.json"
     uv run modal volume get quail-results \
       sol/2026-09-20-bio4-qwen3-4b-sf1.0.json "$W/bio4-sf1-sol.json"
@@ -56,7 +57,7 @@ from quail.specs import H100_USD_PER_HOUR
 
 HERE = Path(__file__).resolve().parent
 METHODS = [("quail", "Quail", BLUE),
-           ("pipelined_vllm", "Pipelined stock vLLM", ORANGE)]
+           ("pipelined_vllm", "Pipelined vLLM", ORANGE)]
 BASE_QUERY_ORDER = (
     [f"IMDB-{n}" for n in range(1, 11)] + [f"BIO-{n}" for n in range(1, 4)]
     + [f"FEV-{n}" for n in range(1, 11)] + [f"LEP-{n}" for n in range(1, 6)]
@@ -635,7 +636,7 @@ def main(workdir):
         "  Answer agreement counts matching predicate answers. Output precision",
         "  and recall compare final rows with the reference output.",
         "- Quail uses pipelining, token-based admission, and KV rewind.",
-        "  Stock vLLM uses pipelining and prefix caching. Filter stages advance",
+        "  Pipelined vLLM uses pipelining and prefix caching. Filter stages advance",
         "  independently; joins begin after filtering finishes.",
         f"  vLLM batched-token limits: {', '.join(f'{n:,}' for n in batch)}.",
         f"  Sequence limits: {', '.join(f'{n:,}' for n in sequences)}.",
@@ -736,15 +737,15 @@ def main(workdir):
                 "speedup at sf=0.1. The working target was 10x. At sf=1.0, Quail "
                 f"was {bio4_sf1_speedup:.2f}x faster.", "",
                 f"Quail took {quail_row['runtime_s'] / 60:.2f} minutes. Pipelined "
-                f"stock vLLM took {vllm_row['runtime_s'] / 3600:.2f} hours. Quail "
+                f"vLLM took {vllm_row['runtime_s'] / 3600:.2f} hours. Quail "
                 f"recomputed {quail_row['regret_tokens']:,} KV tokens, compared with "
-                f"{vllm_row['regret_tokens']:,} for pipelined stock vLLM.", "",
+                f"{vllm_row['regret_tokens']:,} for pipelined vLLM.", "",
                 "The methods evaluated different numbers of document pairs because",
                 "their answers changed which rows reached the joins. The throughput",
                 "for each method uses its own evaluated pair count.", "",
                 "Both methods returned many incorrect final rows. Quail's output",
-                "precision was 1.57%, compared with 1.41% for pipelined stock vLLM.",
-                "Output recall was 22.02% for Quail and 22.57% for stock vLLM.", "",
+                "precision was 1.57%, compared with 1.41% for pipelined vLLM.",
+                "Output recall was 22.02% for Quail and 22.57% for pipelined vLLM.",
                 "| Method | Seconds | Document pairs/s | $/query | Fresh tokens "
                 "| Recomputed KV tokens | KV regret (%) | Answer agreement (%) "
                 "| Output precision (%) | Output recall (%) |",
@@ -772,7 +773,8 @@ def main(workdir):
                 f"SoL source: `{sf1['sol']['volume_path']}`.",
                 f"Reference collection: `{BIO4_COLLECTIONS[1.0]}`.", "",
                 "Quail result function call: `fc-01M2YRXV1TAVKDDPPBKNHM90XH`.",
-                "Stock vLLM result function call: `fc-01M2YXPZA8E6EJYJMSGDTR0X69`.", "",
+                "Pipelined vLLM result function call: "
+                "`fc-01M2YXPZA8E6EJYJMSGDTR0X69`.", "",
             ])
     (HERE / "quailb-comparison.md").write_text("\n".join(report_text))
     print("Updated the report and all six PDFs.")
