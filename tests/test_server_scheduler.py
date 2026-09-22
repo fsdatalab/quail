@@ -186,11 +186,12 @@ def test_a_finished_execution_is_not_killed_while_it_reports_done(
 
 def test_compile_and_executor_failures_are_saved(store, tmp_path):
     bad = submit(store, tmp_path, sql="SELECT r.nothing FROM reviews r")
-    scheduler = Scheduler(store, InProcessExecutor(server_fakes.hooks),
-                          tmp_path, poll_s=0.02)
+    executor = InProcessExecutor(server_fakes.hooks)
+    scheduler = Scheduler(store, executor, tmp_path, poll_s=0.02)
     final = scheduler.run_one(bad)
     assert final.state == "failed"
     assert final.error["type"] == "CompileError"
+    assert executor._loaded_model is None
 
     failing = submit(store, tmp_path)
     scheduler = Scheduler(store, InProcessExecutor(server_fakes.failing_hooks),
@@ -302,6 +303,7 @@ def test_child_process_is_replaced_when_the_model_changes(store, tmp_path):
         first = scheduler.run_one(submit(store, tmp_path))
         assert first.state == "succeeded"
         pid = executor._process.pid
+        assert executor._loaded_model == "qwen3-4b-fp8"
         assert scheduler.run_one(submit(store, tmp_path)).state == "succeeded"
         assert executor._process.pid == pid, "same model, same child"
 
@@ -316,6 +318,7 @@ def test_child_process_is_replaced_when_the_model_changes(store, tmp_path):
             inputs={"reviews": prepared.spec}, timeout_s=1000.0)
         assert scheduler.run_one(other).state == "succeeded"
         assert executor._process.pid != pid, "another model, a new child"
+        assert executor._loaded_model == "qwen3-32b-fp8"
     finally:
         executor.close()
 

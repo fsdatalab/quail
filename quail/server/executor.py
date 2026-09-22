@@ -133,6 +133,8 @@ def run_job(job: Job, emit: Emit, hooks: Hooks | None = None) -> None:
                 result = execute_query(
                     query,
                     physical_executor=hooks.physical_executor,
+                    on_backend_ready=lambda: emit(
+                        "model_ready", {"model": config.model}),
                     on_execution_ready=execution_ready,
                 )
                 manifest = write_result(result, job.artifact_dir)
@@ -163,13 +165,19 @@ class Executor(Protocol):
 
 
 class _ThreadExecution:
-    def __init__(self, job: Job, emit: Emit, hooks: Hooks | None):
+    def __init__(self, job: Job, emit: Emit, hooks: Hooks | None,
+                 model_ready=None):
         self._done = threading.Event()
         self._stopped = False
 
         def guarded(kind, payload):
-            if not self._stopped:
-                emit(kind, payload)
+            if self._stopped:
+                return
+            if kind == "model_ready":
+                if model_ready is not None:
+                    model_ready(payload["model"])
+                return
+            emit(kind, payload)
 
         def target():
             try:
@@ -215,9 +223,10 @@ class InProcessExecutor:
             }
         else:
             model_phase = None
-        self._loaded_model = model
         job = replace(job, model_phase=model_phase)
-        return _ThreadExecution(job, emit, self.hooks)
+        return _ThreadExecution(
+            job, emit, self.hooks,
+            model_ready=lambda ready: setattr(self, "_loaded_model", ready))
 
     def close(self) -> None:
         self._loaded_model = None
@@ -287,6 +296,9 @@ class _ChildExecution:
                     return
                 if kind == "done":
                     return
+                if kind == "model_ready":
+                    self.executor._mark_model_ready(payload["model"])
+                    continue
                 if not self._stopped:
                     self.emit(kind, payload)
         finally:
@@ -314,6 +326,7 @@ class ChildProcessExecutor:
         self.hooks_reference = hooks_reference
         self._process = None
         self._conn = None
+        self._child_model = None
         self._loaded_model = None
         self._lock = threading.Lock()
         atexit.register(self.close)
@@ -339,6 +352,8 @@ class ChildProcessExecutor:
     def _discard_child(self) -> None:
         conn, self._conn = self._conn, None
         self._process = None
+        self._child_model = None
+        self._loaded_model = None
         if conn is not None:
             with contextlib.suppress(OSError):
                 conn.close()
@@ -350,22 +365,35 @@ class ChildProcessExecutor:
                 process.kill()
                 process.join(30)
 
+    def _mark_model_ready(self, model: str) -> None:
+        with self._lock:
+            if self._process is not None and self._process.is_alive():
+                self._loaded_model = model
+
     def start(self, job: Job, emit: Emit) -> Execution:
         with self._lock:
             model = job.config.get("model")
             alive = self._process is not None and self._process.is_alive()
             loaded_model = self._loaded_model if alive else None
-            if loaded_model not in (None, model):
-                model_phase = {
-                    "name": "switching_model",
-                    "message": (
-                        f"Switching from {loaded_model} and loading {model}"
-                    ),
-                    "previous_model": loaded_model,
-                    "model": model,
-                }
+            child_model = self._child_model if alive else None
+            if child_model not in (None, model):
+                if loaded_model is None:
+                    model_phase = {
+                        "name": "loading_model",
+                        "message": f"Loading and warming model {model}",
+                        "model": model,
+                    }
+                else:
+                    model_phase = {
+                        "name": "switching_model",
+                        "message": (
+                            f"Switching from {loaded_model} and loading {model}"
+                        ),
+                        "previous_model": loaded_model,
+                        "model": model,
+                    }
                 self._close_child_unlocked()
-            elif loaded_model is None:
+            elif loaded_model != model:
                 model_phase = {
                     "name": "loading_model",
                     "message": f"Loading and warming model {model}",
@@ -374,7 +402,7 @@ class ChildProcessExecutor:
             else:
                 model_phase = None
             self._ensure_child()
-            self._loaded_model = model
+            self._child_model = model
             job = replace(job, model_phase=model_phase)
             self._conn.send(job)
             execution = _ChildExecution(self, emit, job)
