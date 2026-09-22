@@ -153,23 +153,35 @@ result = query.run()
 A session created with `endpoint` returns a
 [`RemoteQuery`](/docs/user-guide/server#remotequery) from `sql()`.
 
-### Query
+### Query <ApiClass />
 
 A compiled query bound to the session that parsed it.
 
 #### Attributes
 
-| Attribute | Description |
-| --- | --- |
-| `session` | The `Session` that compiled this query. |
-| `logical` | The compiled logical plan. |
-| `order` | Predicate order passed to `sql`, or `None` when the planner chooses the order. |
+<TypeTable
+  type={{
+    session: {
+      type: 'Session',
+      description: 'The Session that compiled this query.',
+    },
+    logical: {
+      type: 'LogicalPlan',
+      description: 'The compiled logical plan.',
+    },
+    order: {
+      type: 'str | None',
+      description:
+        'Predicate order passed to sql, or None when the planner chooses the order.',
+    },
+  }}
+/>
 
 #### Methods
 
 ##### plan
 
-`Query.plan()`
+<ApiMethod>Query.plan()</ApiMethod>
 
 Build the physical plan. The first call plans the query. Later calls
 return that same plan.
@@ -181,7 +193,7 @@ the worker count, and the estimated seconds.
 
 ##### explain
 
-`Query.explain(verbose=False, analyze=False)`
+<ApiMethod>Query.explain(*, verbose=False, analyze=False)</ApiMethod>
 
 Print the plan. The shape of the text is the one in
 [Preview the plan](#preview-the-plan) and
@@ -189,10 +201,22 @@ Print the plan. The shape of the text is the one in
 
 **Parameters**
 
-| Name | Description |
-| --- | --- |
-| `verbose` | When true, the text adds node ids, port connections, KV retention, and planner remarks. |
-| `analyze` | When true, run the query first and print each node's measured rows, time, and tokens beside the estimates. |
+<TypeTable
+  type={{
+    verbose: {
+      type: 'bool',
+      default: 'False',
+      description:
+        'When true, the text adds node ids, port connections, KV retention, and planner remarks.',
+    },
+    analyze: {
+      type: 'bool',
+      default: 'False',
+      description:
+        "When true, run the query first and print each node's measured rows, time, and tokens beside the estimates.",
+    },
+  }}
+/>
 
 **Returns**
 
@@ -200,15 +224,22 @@ Print the plan. The shape of the text is the one in
 
 ##### run
 
-`Query.run(plan=None)`
+<ApiMethod>Query.run(plan=None)</ApiMethod>
 
 Execute the query in this process.
 
 **Parameters**
 
-| Name | Description |
-| --- | --- |
-| `plan` | A `PhysicalPlan` from `plan()`, or one edited with `insert`, `remove`, or `move`. Omit it to run the planner's plan. |
+<TypeTable
+  type={{
+    plan: {
+      type: 'PhysicalPlan | None',
+      default: 'None',
+      description:
+        "A PhysicalPlan from plan(), or one edited with insert, remove, or move. Omit it to run the planner's plan.",
+    },
+  }}
+/>
 
 **Returns**
 
@@ -216,17 +247,27 @@ Execute the query in this process.
 
 ##### collect
 
-`Query.collect(limit=None, batch_rows=65536)`
+<ApiMethod>Query.collect(limit=None, batch_rows=65536)</ApiMethod>
 
 Execute the query and return one Arrow table. This calls `run()`, then
 `QueryResult.collect`.
 
 **Parameters**
 
-| Name | Description |
-| --- | --- |
-| `limit` | Stop after this many rows. Omit it to read the full result. |
-| `batch_rows` | Rows per Arrow record batch while the table is built. The default is 65,536. |
+<TypeTable
+  type={{
+    limit: {
+      type: 'int | None',
+      default: 'None',
+      description: 'Stop after this many rows. Omit it to read the full result.',
+    },
+    batch_rows: {
+      type: 'int',
+      default: '65536',
+      description: 'Rows per Arrow record batch while the table is built.',
+    },
+  }}
+/>
 
 **Returns**
 
@@ -234,22 +275,32 @@ Execute the query and return one Arrow table. This calls `run()`, then
 
 ##### execute_stream
 
-`Query.execute_stream(batch_rows=65536, limit=None)`
+<ApiMethod>Query.execute_stream(batch_rows=65536, limit=None)</ApiMethod>
 
 Execute the query and stream the rows.
 
 **Parameters**
 
-| Name | Description |
-| --- | --- |
-| `batch_rows` | Rows per Arrow record batch. The default is 65,536. |
-| `limit` | Stop after this many rows. |
+<TypeTable
+  type={{
+    batch_rows: {
+      type: 'int',
+      default: '65536',
+      description: 'Rows per Arrow record batch.',
+    },
+    limit: {
+      type: 'int | None',
+      default: 'None',
+      description: 'Stop after this many rows.',
+    },
+  }}
+/>
 
 **Returns**
 
 `pyarrow.RecordBatchReader`.
 
-### QueryResult
+### QueryResult <ApiClass />
 
 The rows of a finished query, plus the report and the answer tables.
 The rows stay unread until `collect`, `to_rows`, or `execute_stream`
@@ -257,29 +308,67 @@ asks for them.
 
 #### Attributes
 
-| Attribute | Description |
-| --- | --- |
-| `schema` | Arrow schema of the output columns. |
-| `columns` | Output column names, in order. |
-| `report` | Execution metrics. The fields are on the [Metrics](/docs/user-guide/metrics) page. |
-| `plan` | The physical plan that ran. `None` until a plan was executed and decoded. |
-| `node_metrics` | Measured metrics keyed by node id. |
-| `answer_tables` | Per-predicate Arrow tables. `filters` is keyed by `(alias, position)`. `joins` is keyed by the join's position in the query text. |
+<TypeTable
+  type={{
+    schema: {
+      type: 'pyarrow.Schema',
+      description: 'Arrow schema of the output columns.',
+    },
+    columns: {
+      type: 'list[str]',
+      description: 'Output column names, in order.',
+    },
+    report: {
+      type: 'dict',
+      description: (
+        <>
+          Execution metrics. The fields are on the{' '}
+          <a href="/docs/user-guide/metrics">Metrics</a> page.
+        </>
+      ),
+    },
+    plan: {
+      type: 'PhysicalPlan | None',
+      description:
+        'The physical plan that ran. None until a plan was executed and decoded.',
+    },
+    node_metrics: {
+      type: 'dict',
+      description: 'Measured metrics keyed by node id.',
+    },
+    answer_tables: {
+      type: 'dict',
+      description:
+        "Per-predicate Arrow tables. filters is keyed by (alias, position). joins is keyed by the join's position in the query text.",
+    },
+  }}
+/>
 
 #### Methods
 
 ##### collect
 
-`QueryResult.collect(limit=None, batch_rows=65536)`
+<ApiMethod>QueryResult.collect(limit=None, batch_rows=65536)</ApiMethod>
 
 Read the result into one Arrow table.
 
 **Parameters**
 
-| Name | Description |
-| --- | --- |
-| `limit` | Stop after this many rows. A limit already set on the result is also applied. |
-| `batch_rows` | Rows per record batch while the table is read. The default is 65,536. |
+<TypeTable
+  type={{
+    limit: {
+      type: 'int | None',
+      default: 'None',
+      description:
+        'Stop after this many rows. A limit already set on the result is also applied.',
+    },
+    batch_rows: {
+      type: 'int',
+      default: '65536',
+      description: 'Rows per record batch while the table is read.',
+    },
+  }}
+/>
 
 **Returns**
 
@@ -287,16 +376,28 @@ Read the result into one Arrow table.
 
 ##### execute_stream
 
-`QueryResult.execute_stream(batch_rows=65536, limit=None)`
+<ApiMethod>
+  QueryResult.execute_stream(batch_rows=65536, limit=None)
+</ApiMethod>
 
 Stream the result as Arrow record batches.
 
 **Parameters**
 
-| Name | Description |
-| --- | --- |
-| `batch_rows` | Rows per record batch. The default is 65,536. |
-| `limit` | Stop after this many rows. |
+<TypeTable
+  type={{
+    batch_rows: {
+      type: 'int',
+      default: '65536',
+      description: 'Rows per record batch.',
+    },
+    limit: {
+      type: 'int | None',
+      default: 'None',
+      description: 'Stop after this many rows.',
+    },
+  }}
+/>
 
 **Returns**
 
@@ -304,16 +405,22 @@ Stream the result as Arrow record batches.
 
 ##### to_rows
 
-`QueryResult.to_rows(limit=None)`
+<ApiMethod>QueryResult.to_rows(limit=None)</ApiMethod>
 
 Read the result as a list of tuples, one tuple per row, in column
 order.
 
 **Parameters**
 
-| Name | Description |
-| --- | --- |
-| `limit` | Stop after this many rows. |
+<TypeTable
+  type={{
+    limit: {
+      type: 'int | None',
+      default: 'None',
+      description: 'Stop after this many rows.',
+    },
+  }}
+/>
 
 **Returns**
 
@@ -321,7 +428,7 @@ order.
 
 ##### count
 
-`QueryResult.count()`
+<ApiMethod>QueryResult.count()</ApiMethod>
 
 Return the number of rows. `len(result)` calls this.
 
@@ -331,16 +438,23 @@ Return the number of rows. `len(result)` calls this.
 
 ##### explain
 
-`QueryResult.explain(verbose=False)`
+<ApiMethod>QueryResult.explain(*, verbose=False)</ApiMethod>
 
 Print the executed plan with measured rows and time beside the
 operators.
 
 **Parameters**
 
-| Name | Description |
-| --- | --- |
-| `verbose` | When true, include every measured field of each node, including KV hits, KV misses, and GPU seconds. |
+<TypeTable
+  type={{
+    verbose: {
+      type: 'bool',
+      default: 'False',
+      description:
+        'When true, include every measured field of each node, including KV hits, KV misses, and GPU seconds.',
+    },
+  }}
+/>
 
 **Returns**
 

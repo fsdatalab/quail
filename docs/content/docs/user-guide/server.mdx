@@ -228,7 +228,7 @@ runs past the limit ends `failed` with error type `TimeoutError`,
 and the model process is killed the same way as on cancel. A limit
 above `--max-timeout` is rejected when you submit.
 
-## RemoteQuery
+## RemoteQuery <ApiClass />
 
 `session.sql` on a server session returns a `RemoteQuery`. It holds
 the statement text. The server compiles and plans that text when the
@@ -238,18 +238,34 @@ the plan text is on the record at `QueryStatus.plan["text"]`.
 
 #### Attributes
 
-| Attribute | Description |
-| --- | --- |
-| `session` | The `Session` that created this query. |
-| `sql` | The statement text. |
-| `dialect` | `bq` or `snowflake`. |
-| `order` | Predicate order passed to `sql`, or `None`. |
+<TypeTable
+  type={{
+    session: {
+      type: 'Session',
+      description: 'The Session that created this query.',
+    },
+    sql: {
+      type: 'str',
+      description: 'The statement text.',
+    },
+    dialect: {
+      type: "'bq' | 'snowflake'",
+      description: 'The SQL dialect.',
+    },
+    order: {
+      type: 'str | None',
+      description: 'Predicate order passed to sql, or None.',
+    },
+  }}
+/>
 
 #### Methods
 
 ##### submit
 
-`RemoteQuery.submit(query_id=None, timeout_s=None)`
+<ApiMethod>
+  RemoteQuery.submit(*, query_id=None, timeout_s=None)
+</ApiMethod>
 
 Send the query to the server and return once the record is saved. The
 query keeps running if the client disconnects. Submitting the same
@@ -259,10 +275,22 @@ HTTP 409, `QueryIdConflictError`.
 
 **Parameters**
 
-| Name | Description |
-| --- | --- |
-| `query_id` | Name of the run. Omit it and the client picks a random id. An id is 1 to 128 characters: a letter or digit, then letters, digits, `.`, `_`, `:`, or `-`. |
-| `timeout_s` | Execution limit in seconds, starting when the query leaves the queue. Omit it to use the server's `--default-timeout`. A value above `--max-timeout` is rejected. |
+<TypeTable
+  type={{
+    query_id: {
+      type: 'str | None',
+      default: 'None',
+      description:
+        'Name of the run. Omit it and the client picks a random id. An id is 1 to 128 characters: a letter or digit, then letters, digits, ., _, :, or -.',
+    },
+    timeout_s: {
+      type: 'float | None',
+      default: 'None',
+      description:
+        "Execution limit in seconds, starting when the query leaves the queue. Omit it to use the server's --default-timeout. A value above --max-timeout is rejected.",
+    },
+  }}
+/>
 
 **Returns**
 
@@ -270,7 +298,7 @@ HTTP 409, `QueryIdConflictError`.
 
 ##### run
 
-`RemoteQuery.run(plan=None, *, timeout_s=None)`
+<ApiMethod>RemoteQuery.run(plan=None, *, timeout_s=None)</ApiMethod>
 
 Submit the query, wait until the saved result is ready, and return it.
 A record that ended `failed`, `interrupted`, or `cancelled` raises
@@ -280,10 +308,20 @@ queries always use the server's plan. Passing a non-`None` `plan` raises
 
 **Parameters**
 
-| Name | Description |
-| --- | --- |
-| `plan` | Must be `None`. Edited plans are available only for local queries. |
-| `timeout_s` | Passed through to `submit`. |
+<TypeTable
+  type={{
+    plan: {
+      type: 'None',
+      default: 'None',
+      description: 'Must be None. Edited plans are available only for local queries.',
+    },
+    timeout_s: {
+      type: 'float | None',
+      default: 'None',
+      description: 'Passed through to submit.',
+    },
+  }}
+/>
 
 **Returns**
 
@@ -291,16 +329,27 @@ queries always use the server's plan. Passing a non-`None` `plan` raises
 
 ##### collect
 
-`RemoteQuery.collect(limit=None, batch_rows=65536)`
+<ApiMethod>RemoteQuery.collect(limit=None, batch_rows=65536)</ApiMethod>
 
 Submit the query, wait, and return one Arrow table.
 
 **Parameters**
 
-| Name | Description |
-| --- | --- |
-| `limit` | Stop after this many rows. |
-| `batch_rows` | Accepted so the call matches a local `Query`. The server chooses the batch size, and this argument is ignored. |
+<TypeTable
+  type={{
+    limit: {
+      type: 'int | None',
+      default: 'None',
+      description: 'Stop after this many rows.',
+    },
+    batch_rows: {
+      type: 'int',
+      default: '65536',
+      description:
+        'Accepted so the call matches a local Query. The server chooses the batch size, and this argument is ignored.',
+    },
+  }}
+/>
 
 **Returns**
 
@@ -308,22 +357,35 @@ Submit the query, wait, and return one Arrow table.
 
 ##### execute_stream
 
-`RemoteQuery.execute_stream(batch_rows=65536, limit=None)`
+<ApiMethod>
+  RemoteQuery.execute_stream(batch_rows=65536, limit=None)
+</ApiMethod>
 
 Submit the query, wait, and stream the rows.
 
 **Parameters**
 
-| Name | Description |
-| --- | --- |
-| `batch_rows` | Accepted so the call matches a local `Query`. The server chooses the batch size, and this argument is ignored. |
-| `limit` | Stop after this many rows. |
+<TypeTable
+  type={{
+    batch_rows: {
+      type: 'int',
+      default: '65536',
+      description:
+        'Accepted so the call matches a local Query. The server chooses the batch size, and this argument is ignored.',
+    },
+    limit: {
+      type: 'int | None',
+      default: 'None',
+      description: 'Stop after this many rows.',
+    },
+  }}
+/>
 
 **Returns**
 
 `pyarrow.RecordBatchReader`.
 
-## QueryRun
+## QueryRun <ApiClass />
 
 A handle to one record the server has accepted. `submit` returns one.
 `session.get_run(query_id)` returns a handle to a record that is
@@ -331,15 +393,20 @@ already there.
 
 #### Attributes
 
-| Attribute | Description |
-| --- | --- |
-| `id` | The query id. |
+<TypeTable
+  type={{
+    id: {
+      type: 'str',
+      description: 'The query id.',
+    },
+  }}
+/>
 
 #### Methods
 
 ##### status
 
-`QueryRun.status()`
+<ApiMethod>QueryRun.status()</ApiMethod>
 
 Read the current saved record.
 
@@ -349,7 +416,7 @@ Read the current saved record.
 
 ##### watch
 
-`QueryRun.watch(poll_s=30)`
+<ApiMethod>QueryRun.watch(poll_s=30)</ApiMethod>
 
 Yield the current record, then each newer revision, until the query
 is finished. The default poll is 30 seconds, so a progress update
@@ -359,9 +426,16 @@ as it stands then.
 
 **Parameters**
 
-| Name | Description |
-| --- | --- |
-| `poll_s` | Seconds to hold each long-poll open. The server stops the hold at 60 seconds. |
+<TypeTable
+  type={{
+    poll_s: {
+      type: 'float',
+      default: '30',
+      description:
+        'Seconds to hold each long-poll open. The server stops the hold at 60 seconds.',
+    },
+  }}
+/>
 
 **Returns**
 
@@ -369,7 +443,7 @@ An iterator of `QueryStatus`.
 
 ##### wait
 
-`QueryRun.wait(poll_s=30)`
+<ApiMethod>QueryRun.wait(poll_s=30)</ApiMethod>
 
 Wait until the record is finished and return its final `QueryStatus`.
 A record that ended `failed`, `interrupted`, or `cancelled` raises
@@ -378,9 +452,15 @@ attribute.
 
 **Parameters**
 
-| Name | Description |
-| --- | --- |
-| `poll_s` | Seconds to hold each long-poll open. The default is 30. |
+<TypeTable
+  type={{
+    poll_s: {
+      type: 'float',
+      default: '30',
+      description: 'Seconds to hold each long-poll open.',
+    },
+  }}
+/>
 
 **Returns**
 
@@ -388,7 +468,7 @@ The successful final `QueryStatus`.
 
 ##### result
 
-`QueryRun.result(poll_s=30)`
+<ApiMethod>QueryRun.result(poll_s=30)</ApiMethod>
 
 Wait until the record is finished and return the saved rows. A record
 that ended `failed`, `interrupted`, or `cancelled` raises
@@ -396,9 +476,15 @@ that ended `failed`, `interrupted`, or `cancelled` raises
 
 **Parameters**
 
-| Name | Description |
-| --- | --- |
-| `poll_s` | Seconds between polls while waiting. The default is 30. |
+<TypeTable
+  type={{
+    poll_s: {
+      type: 'float',
+      default: '30',
+      description: 'Seconds between polls while waiting.',
+    },
+  }}
+/>
 
 **Returns**
 
@@ -407,16 +493,22 @@ saved Arrow files and the report.
 
 ##### stream_result
 
-`QueryRun.stream_result(poll_s=30)`
+<ApiMethod>QueryRun.stream_result(poll_s=30)</ApiMethod>
 
 Wait until the record is finished, then stream the rows. The failure
 behavior matches `result`.
 
 **Parameters**
 
-| Name | Description |
-| --- | --- |
-| `poll_s` | Seconds between polls while waiting. The default is 30. |
+<TypeTable
+  type={{
+    poll_s: {
+      type: 'float',
+      default: '30',
+      description: 'Seconds between polls while waiting.',
+    },
+  }}
+/>
 
 **Returns**
 
@@ -433,7 +525,7 @@ finally:
 
 ##### cancel
 
-`QueryRun.cancel()`
+<ApiMethod>QueryRun.cancel()</ApiMethod>
 
 Ask the server to stop this query. A queued query ends immediately.
 A query that is already running has its model process killed, and the
@@ -445,17 +537,28 @@ record ends `cancelled`. The next query loads the model again.
 
 ##### answers
 
-`QueryRun.answers(after=0, limit=1000)`
+<ApiMethod>QueryRun.answers(after=0, limit=1000)</ApiMethod>
 
 Return answer entries saved so far, starting at entry `after`. The
 entry shapes are in [Answers while the query runs](#answers-while-the-query-runs).
 
 **Parameters**
 
-| Name | Description |
-| --- | --- |
-| `after` | First entry index to return. |
-| `limit` | Maximum entries in this page. The default is 1,000 and the server stops at 10,000. |
+<TypeTable
+  type={{
+    after: {
+      type: 'int',
+      default: '0',
+      description: 'First entry index to return.',
+    },
+    limit: {
+      type: 'int',
+      default: '1000',
+      description:
+        'Maximum entries in this page. The server stops at 10,000.',
+    },
+  }}
+/>
 
 **Returns**
 
@@ -465,22 +568,28 @@ arrive).
 
 ##### stream_answers
 
-`QueryRun.stream_answers(poll_s=30)`
+<ApiMethod>QueryRun.stream_answers(poll_s=30)</ApiMethod>
 
 Yield each saved answer entry in order. The iterator returns when the
 query is finished and every saved entry has been yielded.
 
 **Parameters**
 
-| Name | Description |
-| --- | --- |
-| `poll_s` | Seconds between polls. The default is 30. |
+<TypeTable
+  type={{
+    poll_s: {
+      type: 'float',
+      default: '30',
+      description: 'Seconds between polls.',
+    },
+  }}
+/>
 
 **Returns**
 
 An iterator of answer dicts.
 
-## QueryStatus
+## QueryStatus <ApiClass />
 
 One saved snapshot of a query record. `status`, `watch`, and
 `GET /v1/queries/{id}` return this object. Every write replaces the
@@ -491,26 +600,92 @@ and the answer tables again and checked the result's row count.
 
 #### Attributes
 
-| Attribute | Description |
-| --- | --- |
-| `id` | The query id. |
-| `state` | `queued`, `planning`, `running`, `succeeded`, `failed`, `interrupted`, or `cancelled`. |
-| `revision` | Integer that increases on every write. |
-| `created_at` | Unix seconds when the record was saved. |
-| `updated_at` | Unix seconds of the latest write. |
-| `started_at` | Unix seconds when the record left `queued`, or `None` while it is still queued. |
-| `timeout_s` | Execution limit in seconds. |
-| `session_id` | The client session that submitted the record, or `None`. |
-| `cancel_requested` | True after a cancel request has been recorded. |
-| `phase` | The current durable step. Keys are below. |
-| `spec` | The SQL submission. Keys are below. |
-| `config` | The engine config. Keys are below. |
-| `inputs` | Registered table name to the stored input description. Shapes are below. |
-| `progress` | The latest engine count, or `None` before the first one. Keys are below. |
-| `plan` | The plan, or `None` until planning has finished. Keys are below. |
-| `error` | The error, or `None` unless the record ended `failed`, `interrupted`, or `cancelled`. Keys are below. |
-| `result` | The result manifest, or `None` until the record is `succeeded`. Keys are below. |
-| `done` | True when `state` is an ending state. This is a computed Python property and is absent from raw HTTP JSON. |
+<TypeTable
+  type={{
+    id: {
+      type: 'str',
+      description: 'The query id.',
+    },
+    state: {
+      type: 'str',
+      typeDescription:
+        "'queued' | 'planning' | 'running' | 'succeeded' | 'failed' | 'interrupted' | 'cancelled'",
+      description:
+        'queued, planning, running, succeeded, failed, interrupted, or cancelled.',
+    },
+    revision: {
+      type: 'int',
+      description: 'Integer that increases on every write.',
+    },
+    created_at: {
+      type: 'float',
+      description: 'Unix seconds when the record was saved.',
+    },
+    updated_at: {
+      type: 'float',
+      description: 'Unix seconds of the latest write.',
+    },
+    started_at: {
+      type: 'float | None',
+      description:
+        'Unix seconds when the record left queued, or None while it is still queued.',
+    },
+    timeout_s: {
+      type: 'float',
+      description: 'Execution limit in seconds.',
+    },
+    session_id: {
+      type: 'str | None',
+      description: 'The client session that submitted the record, or None.',
+    },
+    cancel_requested: {
+      type: 'bool',
+      description: 'True after a cancel request has been recorded.',
+    },
+    phase: {
+      type: 'dict | None',
+      description: 'The current durable step. Keys are below.',
+    },
+    spec: {
+      type: 'dict',
+      description: 'The SQL submission. Keys are below.',
+    },
+    config: {
+      type: 'dict',
+      description: 'The engine config. Keys are below.',
+    },
+    inputs: {
+      type: 'dict',
+      description:
+        'Registered table name to the stored input description. Shapes are below.',
+    },
+    progress: {
+      type: 'dict | None',
+      description:
+        'The latest engine count, or None before the first one. Keys are below.',
+    },
+    plan: {
+      type: 'dict | None',
+      description:
+        'The plan, or None until planning has finished. Keys are below.',
+    },
+    error: {
+      type: 'dict | None',
+      description:
+        'The error, or None unless the record ended failed, interrupted, or cancelled. Keys are below.',
+    },
+    result: {
+      type: 'dict | None',
+      description:
+        'The result manifest, or None until the record is succeeded. Keys are below.',
+    },
+    done: {
+      type: 'bool',
+      description:
+        'True when state is an ending state. This is a computed Python property and is absent from raw HTTP JSON.',
+    },
+  }}
+/>
 
 ##### phase
 
