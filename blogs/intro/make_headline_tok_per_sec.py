@@ -1,52 +1,48 @@
-"""Build the QUAIL-B headline throughput figure as a percent of SoL.
+"""Build the current QUAIL-B throughput figure as a percent of SoL.
 
-Tokens/second follows Quail AGENTS.md / quail-b: requested input tokens per
-second. One shared numerator is used per query for Quail, vLLM, and SoL:
-
-    requested_tokens / runtime_s
-
-SoL uses ``sol_s`` as its runtime. Requested tokens are the full prompt lengths
-summed, counting shared prefixes every time whether or not KV was reused.
-quail-b exposes this as input_tokens / input_tokens_per_second. Do not use
-per-method fresh_tokens.
+Tokens/second is each method's requested input tokens divided by its query
+runtime. Requested input tokens count every complete evaluated prompt,
+including positions read from KV. SoL runtime uses exact reference survivors.
+The saved BIO-4 SoL result does not include its full requested-token count,
+so BIO-4 uses Quail's measured requested-token count as the SoL numerator.
 
 Each bar is that dataset's mean tokens/second divided by its mean SoL
 tokens/second. The y-axis is a log scale and runs up to 100%, so the peak
 is the SoL estimate for every dataset. SoL is a dashed line at 100%, not
 a bar.
 
-The 2026-09-19 comparison marks BIO-1 and BIO-3 missing and has no BIO-4
-row. When the remake files below are in the workdir, this script fills
-BIO-1, BIO-3, and BIO-4 from that remake. BIO-2 stays on the comparison
-file. BIO-1 and BIO-3 keep the requested-token total already stored on
-their SoL rows. BIO-4 uses the Quail run's input-token total, which is
-the shared numerator in the blog table.
-
-The figure averages the 31 queries in the QUAIL-B README. The saved
-comparison still has the deleted LePaRD queries. Original LEP-5, LEP-6,
-and LEP-8 are skipped. Current LEP-5 is read from the row saved as LEP-7.
-
 Pull the inputs, then run the script:
 
-    W=/tmp/quail-blog-headline; mkdir -p "$W"
+    W=/tmp
+    R=benchmarks/quailb/20260922T190951Z-efa30103
     uv run modal volume get quail-results \
-      reports/quailb-raw-2026-09-19/comparison.json "$W/comparison.json"
+      "$R/quail/run.json" "$W/quailb-gigatoken-quail.json"
     uv run modal volume get quail-results \
-      benchmarks/quailb/20260921T190132Z-a2059688/quail/biodex/run.json \
-      "$W/bio-remake-quail.json"
+      "$R/stock_vllm/run.json" "$W/quailb-gigatoken-stock.json"
     uv run modal volume get quail-results \
-      benchmarks/quailb/20260921T190132Z-a2059688/pipelined_vllm/biodex/run.json \
-      "$W/bio-remake-vllm.json"
+      "$R/pipelined_vllm/run.json" "$W/quailb-gigatoken-pipelined.json"
+    uv run modal volume get quail-results \
+      reports/quailb-raw-2026-09-19/comparison.json \
+      "$W/quailb-gigatoken-sol-base.json"
     uv run modal volume get quail-results \
       sol/2026-09-20-bio4-qwen3-4b-sf0.1.json \
-      "$W/bio4-sf01-sol.json"
-    uv run --with matplotlib python blogs/intro/make_headline_tok_per_sec.py "$W"
+      "$W/quailb-gigatoken-sol-bio4.json"
+    G=/ground_truth/quailb/schema_v1/collections
+    uv run modal volume get quail-results \
+      "$G/gt_be81cb241d74555dc2da79b5b0662554/manifest.json" \
+      "$W/quailb-sol-collection.json"
+    uv run modal volume get quail-results \
+      "$G/gt_cd3ebdb784f64b9e028e50ea73cdedd0/manifest.json" \
+      "$W/quailb-run-collection.json"
+    BENCH=git+https://github.com/fsdatalab/quail-bench.git
+    REV=35d026dc2f5b5c1e787268173e81e512b749081a
+    uv run --with matplotlib --with "quail-b@$BENCH@$REV" \
+      python blogs/intro/make_headline_tok_per_sec.py "$W"
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import statistics
 from collections import defaultdict
 from pathlib import Path
@@ -55,6 +51,7 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 from matplotlib.ticker import FixedLocator, FuncFormatter, NullLocator
+from quailb_results import QUERY_ORDER, load_results
 
 HERE = Path(__file__).resolve().parent
 BLUE = "#4C72B0"
@@ -63,18 +60,8 @@ DARK = "#333333"
 DATASETS = ("BIO", "IMDB", "FEV", "LEP", "AGENT")
 # QUAIL-B README: 10 IMDB, 4 BioDEX, 10 FEVER, 5 LePaRD, 2 SWE-Next.
 QUERY_COUNTS = {"IMDB": 10, "FEV": 10, "LEP": 5, "AGENT": 2, "BIO": 4}
-# The saved comparison still uses ids from before the LePaRD deletion.
-# Current LEP-5 was saved as LEP-7. Original LEP-5, LEP-6, and LEP-8
-# have empty reference outputs and are not in the benchmark.
-EXCLUDED_SAVED_QUERIES = frozenset({"LEP-5", "LEP-6", "LEP-8"})
-CURRENT_QUERY_ID = {"LEP-7": "LEP-5"}
-BIO_REMAKE_QUERIES = ("BIO-1", "BIO-3", "BIO-4")
 Y_MIN = 1
 Y_MAX = 100
-
-
-def _load(path: Path):
-    return json.loads(Path(path).read_text())
 
 
 def _dataset(query: str) -> str:
@@ -104,81 +91,40 @@ def percent_of_sol(method_rates: list[float], sol_rates: list[float]) -> float:
     return 100.0 * statistics.mean(method_rates) / sol_mean
 
 
-def _overlay_bio_remake(comparison: dict, workdir: Path) -> None:
-    """Fill BIO-1, BIO-3, and BIO-4 from the 2026-09-21 remake, when present."""
-    quail_path = workdir / "bio-remake-quail.json"
-    vllm_path = workdir / "bio-remake-vllm.json"
-    sol_path = workdir / "bio4-sf01-sol.json"
-    if not (quail_path.exists() and vllm_path.exists() and sol_path.exists()):
-        return
-
-    quail_by_id = {row["id"]: row for row in _load(quail_path)["queries"]}
-    vllm_by_id = {row["id"]: row for row in _load(vllm_path)["queries"]}
-    bio4_sol_s = float(_load(sol_path)["estimate"]["sol_s"])
-    sol_rows = comparison.setdefault("sol", {})
-
-    for query in BIO_REMAKE_QUERIES:
-        quail = quail_by_id[query]
-        vllm = vllm_by_id[query]
-        if query == "BIO-4":
-            shared = float(quail["metrics"]["input_tokens"])
-            sol = {"requested_tokens": shared, "sol_s": bio4_sol_s}
-        else:
-            sol = sol_rows[query]
-            shared = float(sol["requested_tokens"])
-        comparison["rows"]["quail"][query] = {
-            "runtime_s": float(quail["runtime_s"]),
-            "requested_tokens": shared,
-        }
-        comparison["rows"]["pipelined_vllm"][query] = {
-            "runtime_s": float(vllm["runtime_s"]),
-            "requested_tokens": shared,
-        }
-        sol_rows[query] = sol
-
-
 def collect_rows(workdir: Path):
-    """Return per-query rows for Quail, vLLM, and SoL."""
-    comparison = _load(workdir / "comparison.json")
-    _overlay_bio_remake(comparison, workdir)
+    """Return current per-query rows for Quail, stock vLLM, and SoL."""
+    measured, sol = load_results(workdir)
     rows = []
-
-    for saved_id, quail in comparison["rows"]["quail"].items():
-        if saved_id in EXCLUDED_SAVED_QUERIES:
-            continue
-        query = CURRENT_QUERY_ID.get(saved_id, saved_id)
-        vllm = comparison["rows"]["pipelined_vllm"][saved_id]
-        sol = comparison.get("sol", {}).get(saved_id) or {}
-        shared = float(sol.get("requested_tokens") or quail["requested_tokens"])
+    for query in QUERY_ORDER:
+        quail = measured["quail"][query]
+        stock = measured["stock_vllm"][query]
+        estimate = sol[query]
         rows.append(
             {
                 "query": query,
                 "method": "Quail",
-                "tok_per_sec": _tok_per_sec(shared, float(quail["runtime_s"])),
-                "runtime_s": float(quail["runtime_s"]),
-                "shared_tokens": shared,
+                "tok_per_sec": quail["input_tokens_per_second"],
+                "runtime_s": quail["runtime_s"],
             }
         )
         rows.append(
             {
                 "query": query,
-                "method": "vLLM",
-                "tok_per_sec": _tok_per_sec(shared, float(vllm["runtime_s"])),
-                "runtime_s": float(vllm["runtime_s"]),
-                "shared_tokens": shared,
+                "method": "Stock vLLM",
+                "tok_per_sec": stock["input_tokens_per_second"],
+                "runtime_s": stock["runtime_s"],
             }
         )
-        sol_s = sol.get("sol_s")
-        if sol_s is not None:
-            rows.append(
-                {
-                    "query": query,
-                    "method": "SoL",
-                    "tok_per_sec": _tok_per_sec(shared, float(sol_s)),
-                    "runtime_s": float(sol_s),
-                    "shared_tokens": shared,
-                }
-            )
+        rows.append(
+            {
+                "query": query,
+                "method": "SoL",
+                "tok_per_sec": _tok_per_sec(
+                    estimate["input_tokens"], estimate["runtime_s"]
+                ),
+                "runtime_s": estimate["runtime_s"],
+            }
+        )
 
     return rows
 
@@ -195,7 +141,7 @@ def _require_datasets(by) -> None:
     if datasets != list(DATASETS):
         raise ValueError(f"Expected datasets {DATASETS}, found {tuple(datasets)}")
     for name, count in QUERY_COUNTS.items():
-        for method in ("Quail", "vLLM", "SoL"):
+        for method in ("Quail", "Stock vLLM", "SoL"):
             found = len(by[name][method])
             if found != count:
                 raise ValueError(
@@ -222,7 +168,7 @@ def _tokens_per_second_label(value: float) -> str:
 
 
 def plot_headline(rows, destination: Path):
-    """Draw Quail and vLLM as a percent of each dataset's SoL estimate."""
+    """Draw Quail and stock vLLM relative to each dataset's SoL estimate."""
     by = _rates_by_dataset(rows)
     _require_datasets(by)
 
@@ -249,7 +195,7 @@ def plot_headline(rows, destination: Path):
     pair_gap = 0.08
 
     for method_index, (method, color) in enumerate(
-        (("Quail", BLUE), ("vLLM", ORANGE))
+        (("Quail", BLUE), ("Stock vLLM", ORANGE))
     ):
         offset = (method_index - 0.5) * (width + pair_gap)
         values = [
@@ -313,7 +259,7 @@ def plot_headline(rows, destination: Path):
     axis.legend(
         handles=[
             Patch(facecolor=BLUE, label="Quail"),
-            Patch(facecolor=ORANGE, label="vLLM"),
+            Patch(facecolor=ORANGE, label="Stock vLLM"),
             Line2D(
                 [0],
                 [0],
