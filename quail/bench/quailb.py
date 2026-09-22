@@ -24,6 +24,7 @@ import pyarrow.compute as pc
 import quail
 import quail_b as benchmark
 from quail.bench import substrait
+from quail.bench.results import write_json
 from quail.bench.substrait import QueryPlan, read_plan
 from quail.planner.plan import Refusal
 from quail.specs import H100_USD_PER_HOUR, MODELS
@@ -41,6 +42,11 @@ from quail_b.scoring import RunOutput, reference_answer
 # the fixed planner inputs, by prompt; a predicate without an
 # estimate here gets the planner's default selectivity
 SELECTIVITY = {**FILTER_SELECTIVITY_ESTIMATES, **JOIN_SELECTIVITY_ESTIMATES}
+TEXT_VLLM_BACKENDS = frozenset({
+    "dumb_vllm",
+    "pipelined_vllm",
+    "stock_vllm",
+})
 
 
 def register_tables(session, data_dir):
@@ -192,17 +198,62 @@ def prompt_pieces(query, plan: QueryPlan, anchors) -> dict:
     return pieces
 
 
+def _submission_to_answer_s(
+    backend: str,
+    report: dict,
+    *,
+    frontend_s: float,
+    answer_prepare_s: float,
+) -> float:
+    runtime_s = (
+        report["model_wall_s"]
+        + report["finish_s"]
+        + answer_prepare_s
+    )
+    if backend == "quail":
+        runtime_s += (
+            frontend_s
+            + report["input_ready_s"]
+            + report["physical_prepare_s"]
+        )
+    return runtime_s
+
+
 def run_query(session, spec: QuerySpec, tables) -> RunOutput:
     """Execute one query and return benchmark ids, answers, and measurements."""
+    submitted = time.perf_counter()
     for name, table in tables.items():
         if name not in session.catalog:
             session.register(
                 name, quail.DocumentProvider.from_table(table, id_col="id"))
     plan = read_plan(spec.plan)
     query = _build(session, plan)
+    frontend_s = time.perf_counter() - submitted
     result = query.run()
+    answer_started = time.perf_counter()
     output = run_output(result, plan, tables)
-    output.prompt_pieces = prompt_pieces(query, plan, join_anchors(result))
+    answer_prepare_s = time.perf_counter() - answer_started
+    runtime_s = _submission_to_answer_s(
+        session.config.backend,
+        result.report,
+        frontend_s=frontend_s,
+        answer_prepare_s=answer_prepare_s,
+    )
+    output.runtime_s = runtime_s
+    output.measurements.update(
+        wall_s=runtime_s,
+        submission_to_answer_s=runtime_s,
+        finish_s=result.report["finish_s"],
+        answer_prepare_s=answer_prepare_s,
+    )
+    if session.config.backend == "quail":
+        output.measurements["frontend_s"] = frontend_s
+    if session.config.backend in TEXT_VLLM_BACKENDS:
+        output.measurements["input_tokens"] = (
+            result.report["fresh_tokens"] + result.report["cached_tokens"]
+        )
+    else:
+        output.prompt_pieces = prompt_pieces(query, plan, join_anchors(result))
     return output
 
 
@@ -231,11 +282,12 @@ def run_suite(only=None, *, sf=0.1, config, data_dir=None,
     Queries the backend refuses to plan are left out of the run and
     listed under `skipped_queries` in the returned record.
     """
+    skipped = {}
+    if only and data_dir is not None:
+        with quail.Session(config) as preflight_session:
+            skipped = refused_queries(preflight_session, only, data_dir)
+        only = [query_id for query_id in only if query_id not in skipped]
     with quail.Session(config) as session:
-        skipped = {}
-        if only and data_dir is not None:
-            skipped = refused_queries(session, only, data_dir)
-            only = [query_id for query_id in only if query_id not in skipped]
         record = benchmark.run(
             partial(run_query, session), queries=only, scale_factor=sf,
             output_dir=output_dir, data_dir=data_dir,
@@ -245,7 +297,14 @@ def run_suite(only=None, *, sf=0.1, config, data_dir=None,
                 "engine": config.backend, "model": config.model,
                 "prompt_format": MODELS[config.model].prompt_format,
                 "configuration": asdict(config),
-                "warmup": "engine startup and kernel warmup excluded",
+                "warmup": (
+                    "tokenizer, engine, and kernel startup excluded"
+                ),
+                "timing_boundary": (
+                    "raw document tables and query submission to answer"
+                    if config.backend == "quail"
+                    else "prompt text submission to answer"
+                ),
                 "cache_reuse": "one session per backend and query family",
                 "planning": {
                     "collection_id": SELECTIVITY_ESTIMATE_COLLECTION,
@@ -254,6 +313,8 @@ def run_suite(only=None, *, sf=0.1, config, data_dir=None,
                 },
             })
         record["skipped_queries"] = skipped
+        write_json(Path(output_dir) / "run.json", record)
+        benchmark.report(output_dir, rescore=False)
         return record
 
 

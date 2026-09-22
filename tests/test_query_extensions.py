@@ -38,7 +38,6 @@ def test_query_scans_provider_and_preserves_extension_objects(
     session = quail.Session(config, tokenizer=_tokens)
 
     monkeypatch.setattr(Session, "tokenizer", property(lambda self: _tokens))
-    monkeypatch.setattr(Session, "_fast_tokenizer", lambda self: None)
     calls = []
 
     def register_rule(registry):

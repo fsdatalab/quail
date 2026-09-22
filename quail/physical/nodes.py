@@ -135,6 +135,7 @@ class RequestFilterSpec:
     alias: str
     written_positions: tuple[int, ...]
     question_token_ids: tuple[tuple[Any, ...], ...]
+    question_texts: tuple[str, ...] = ()
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "RequestFilterSpec":
@@ -146,6 +147,7 @@ class RequestFilterSpec:
             question_token_ids=tuple(
                 tuple(question) for question in value["question_token_ids"]
             ),
+            question_texts=tuple(value.get("question_texts", ())),
         )
 
     def to_dict(self) -> dict:
@@ -155,6 +157,7 @@ class RequestFilterSpec:
             "question_token_ids": [
                 list(question) for question in self.question_token_ids
             ],
+            "question_texts": list(self.question_texts),
         }
 
 
@@ -171,6 +174,9 @@ class RequestJoinSpec:
     label_token_ids: tuple[tuple[str, tuple[Any, ...]], ...]
     frame_token_ids: tuple[tuple[str, tuple[Any, ...]], ...]
     tail_token_ids: tuple[Any, ...]
+    label_texts: tuple[tuple[str, str], ...] = ()
+    frame_texts: tuple[tuple[str, str], ...] = ()
+    tail_text: str = ""
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "RequestJoinSpec":
@@ -190,6 +196,15 @@ class RequestJoinSpec:
                 for alias, tokens in value["frame_token_ids"]
             ),
             tail_token_ids=tuple(value["tail_token_ids"]),
+            label_texts=tuple(
+                (str(alias), str(text))
+                for alias, text in value.get("label_texts", ())
+            ),
+            frame_texts=tuple(
+                (str(alias), str(text))
+                for alias, text in value.get("frame_texts", ())
+            ),
+            tail_text=str(value.get("tail_text", "")),
         )
 
     def to_dict(self) -> dict:
@@ -207,6 +222,9 @@ class RequestJoinSpec:
                 [alias, list(tokens)] for alias, tokens in self.frame_token_ids
             ],
             "tail_token_ids": list(self.tail_token_ids),
+            "label_texts": [list(item) for item in self.label_texts],
+            "frame_texts": [list(item) for item in self.frame_texts],
+            "tail_text": self.tail_text,
         }
 
 
@@ -300,6 +318,7 @@ class RequestExecution(PhysicalNode):
     backend_name: str = ""
     aliases: tuple[str, ...] = ()
     preamble_token_ids: tuple[Any, ...] = ()
+    preamble_text: str = ""
     filters: tuple[RequestFilterSpec, ...] = ()
     joins: tuple[RequestJoinSpec, ...] = ()
 
@@ -345,6 +364,7 @@ class RequestExecution(PhysicalNode):
             "backend_name": self.backend_name,
             "aliases": list(self.aliases),
             "preamble_token_ids": list(self.preamble_token_ids),
+            "preamble_text": self.preamble_text,
             "filters": [spec.to_dict() for spec in self.filters],
             "joins": [spec.to_dict() for spec in self.joins],
         }
@@ -365,6 +385,7 @@ class RequestExecution(PhysicalNode):
             backend_name=str(attributes["backend_name"]),
             aliases=tuple(attributes["aliases"]),
             preamble_token_ids=tuple(attributes["preamble_token_ids"]),
+            preamble_text=str(attributes.get("preamble_text", "")),
             filters=tuple(
                 RequestFilterSpec.from_mapping(spec)
                 for spec in attributes["filters"]

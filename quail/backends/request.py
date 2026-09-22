@@ -38,7 +38,10 @@ from quail.execution.types import PhysicalResponse, export_physical_outputs
 from quail.logical import (
     Apply,
     effective_selectivity,
+    filter_question_text,
+    join_label,
     join_outer_input,
+    render_join_frame,
     shared_preamble,
 )
 from quail.physical import (
@@ -189,12 +192,17 @@ def plan_request_backend(
             tuple(predicates[position].prompt.tail_token_ids)
             for position in written_positions
         )
+        question_texts = tuple(
+            filter_question_text(predicates[position].prompt)
+            for position in written_positions
+        )
         if any(not question for question in questions):
             raise ValueError("filter prompts have no token ids")
         filter_specs.append(RequestFilterSpec(
             alias=alias,
             written_positions=written_positions,
             question_token_ids=questions,
+            question_texts=question_texts,
         ))
 
     join_specs = []
@@ -211,6 +219,14 @@ def plan_request_backend(
             (str(alias), tuple(frame))
             for alias, _label, frame in prompt.label_token_ids
         )
+        text_parts = tuple(
+            (
+                argument.alias,
+                join_label(index),
+                render_join_frame(prompt.template, index),
+            )
+            for index, argument in enumerate(prompt.args)
+        )
         if len(labels) != len(aliases_in_prompt) or not prompt.tail_token_ids:
             raise ValueError("join prompts have no token ids")
         outer_aliases = tuple(dict.fromkeys(
@@ -226,6 +242,13 @@ def plan_request_backend(
             label_token_ids=labels,
             frame_token_ids=frames,
             tail_token_ids=tuple(prompt.tail_token_ids),
+            label_texts=tuple(
+                (alias, label) for alias, label, _frame in text_parts
+            ),
+            frame_texts=tuple(
+                (alias, frame) for alias, _label, frame in text_parts
+            ),
+            tail_text=prompt.tail,
         ))
 
     preambles = {
@@ -236,6 +259,9 @@ def plan_request_backend(
     if len(preambles) > 1:
         raise ValueError("request prompts have different preambles")
     preamble = next(iter(preambles), ())
+    preamble_texts = {prompt.preamble for prompt in prompts}
+    if len(preamble_texts) > 1:
+        raise ValueError("request prompts have different preamble text")
     if not preamble and prompts and context.tokenizer is not None:
         preamble = tuple(context.tokenizer(
             shared_preamble(context.model.turn_prefix)))
@@ -246,6 +272,10 @@ def plan_request_backend(
         backend_name=backend_name,
         aliases=aliases,
         preamble_token_ids=tuple(preamble),
+        preamble_text=(
+            next(iter(preamble_texts), "")
+            or shared_preamble(context.model.turn_prefix)
+        ),
         filters=tuple(filter_specs),
         joins=tuple(join_specs),
     )
@@ -378,10 +408,14 @@ def _token_list(values) -> list[int]:
     return [int(token) for token in values]
 
 
+def _text_value(values, index: int) -> str:
+    value = values[index]
+    return value.as_py() if hasattr(value, "as_py") else str(value)
 
 
 def _operator_at_a_time_filter(client, sampling_params, bodies, questions,
-                               read_answer):
+                               read_answer, *, body_texts=None,
+                               question_texts=None):
     active = list(range(len(bodies)))
     answers = {}
     requests = prompt_tokens = cached_tokens = 0
@@ -389,10 +423,16 @@ def _operator_at_a_time_filter(client, sampling_params, bodies, questions,
     stages = []
     for stage_index, question in enumerate(questions):
         evaluated = list(active)
-        prompts = [
-            {"prompt_token_ids": bodies[index] + list(question)}
-            for index in evaluated
-        ]
+        if body_texts is not None and question_texts is not None:
+            prompts = [
+                body_texts[index] + question_texts[stage_index]
+                for index in evaluated
+            ]
+        else:
+            prompts = [
+                {"prompt_token_ids": bodies[index] + list(question)}
+                for index in evaluated
+            ]
         outputs = (
             client.generate(prompts, sampling_params, use_tqdm=False)
             if prompts else []
@@ -426,7 +466,7 @@ def _operator_at_a_time_filter(client, sampling_params, bodies, questions,
 
 
 def _pipelined_filter(client, sampling_params, bodies, questions, read_answer,
-                      tag):
+                      tag, *, body_texts=None, question_texts=None):
     if not bodies:
         return {
             "wall_s": 0.0,
@@ -445,6 +485,8 @@ def _pipelined_filter(client, sampling_params, bodies, questions, read_answer,
         [list(question) for question in questions],
         read_answer,
         tag=tag,
+        body_texts=body_texts,
+        question_texts=question_texts,
     )
     stages = []
     for stage in range(1, len(questions) + 1):
@@ -484,6 +526,7 @@ class RequestModelExecution:
         self.client = settings["client"]
         self.sampling_params = settings["sampling_params"]
         self.documents = settings["documents"]
+        self.document_texts = settings.get("document_texts", {})
         self.pairs = {}         # written position -> pair table, from ports
         true_ids = set(settings["true_ids"])
         if context.model.canvas_tokens == 1:
@@ -497,6 +540,7 @@ class RequestModelExecution:
         self.capacity = settings["capacity"]
         self.filter_submission = settings["filter_submission"]
         self.join_submission = settings["join_submission"]
+        self.submit_text = bool(getattr(self.client, "accepts_text", False))
 
     def _join_submission(self, prefixes) -> str:
         """Suffix-major only when every anchor prefix fits in KV at once.
@@ -542,6 +586,20 @@ class RequestModelExecution:
                 + _token_list(self.documents[spec.alias][document])
                 for document in document_ids
             ]
+            body_texts = None
+            question_texts = None
+            if self.submit_text:
+                texts = self.document_texts.get(spec.alias)
+                if (
+                    texts is None
+                    or len(spec.question_texts) != len(spec.question_token_ids)
+                ):
+                    raise ValueError("vLLM text prompts are missing filter text")
+                body_texts = [
+                    node.preamble_text + _text_value(texts, document)
+                    for document in document_ids
+                ]
+                question_texts = list(spec.question_texts)
             if self.filter_submission == "operator-at-a-time":
                 result = _operator_at_a_time_filter(
                     self.client,
@@ -549,6 +607,8 @@ class RequestModelExecution:
                     bodies,
                     spec.question_token_ids,
                     self.read_answer,
+                    body_texts=body_texts,
+                    question_texts=question_texts,
                 )
             elif self.filter_submission == "pipelined":
                 result = _pipelined_filter(
@@ -558,6 +618,8 @@ class RequestModelExecution:
                     spec.question_token_ids,
                     self.read_answer,
                     f"filter-{filter_index}-{spec.alias}",
+                    body_texts=body_texts,
+                    question_texts=question_texts,
                 )
             else:
                 raise ValueError(
@@ -625,15 +687,41 @@ class RequestModelExecution:
                 *(alias_documents[alias] for alias in partners)
             ))
             suffixes = []
+            prefix_texts = None
+            suffix_texts = None
+            if self.submit_text:
+                labels_text = dict(spec.label_texts)
+                frames_text = dict(spec.frame_texts)
+                if (
+                    any(alias not in self.document_texts for alias in spec.aliases)
+                    or set(labels_text) != set(spec.aliases)
+                    or set(frames_text) != set(spec.aliases)
+                ):
+                    raise ValueError("vLLM text prompts are missing join text")
+                prefix_texts = [
+                    node.preamble_text
+                    + _text_value(self.document_texts[anchor], document)
+                    + frames_text[anchor]
+                    for document in anchor_ids
+                ]
+                suffix_texts = []
             for member in members:
                 suffix = []
+                suffix_text = ""
                 for alias, document in zip(partners, member):
                     suffix.extend(_token_list(labels[alias]))
                     suffix.extend(_token_list(
                         self.documents[alias][document]
                     ))
+                    if suffix_texts is not None:
+                        suffix_text += labels_text[alias]
+                        suffix_text += _text_value(
+                            self.document_texts[alias], document
+                        )
                 suffix.extend(_token_list(spec.tail_token_ids))
                 suffixes.append(suffix)
+                if suffix_texts is not None:
+                    suffix_texts.append(suffix_text + spec.tail_text)
             # a join over pairs asks each anchor about its own members
             allowed = None
             request_pairs = None
@@ -657,6 +745,8 @@ class RequestModelExecution:
                     self.read_answer,
                     submission=submission,
                     pairs=request_pairs,
+                    prefix_texts=prefix_texts,
+                    suffix_texts=suffix_texts,
                 )
                 answers = [bool(answer) for answer in result["answers"]]
             else:
@@ -752,6 +842,12 @@ def execute_request_graph(context, backend, engine_state, boot):
         for node in context.graph.nodes
         if isinstance(node, Scan)
     }
+    document_texts = {
+        node.alias: context.request.inputs[node.input_id].texts
+        for node in context.graph.nodes
+        if isinstance(node, Scan)
+        and context.request.inputs[node.input_id].texts is not None
+    }
     settings = dict(envelope["settings"])
     model_execution = backend.start(GpuContext(
         gpu_index=0,
@@ -762,6 +858,7 @@ def execute_request_graph(context, backend, engine_state, boot):
             **settings,
             **engine_state,
             "documents": documents,
+            "document_texts": document_texts,
         },
     ))
     if engine_state["client"].reset_prefix_cache() is False:

@@ -23,7 +23,6 @@ def test_quickstarts_return_collected_rows_after_session_closes(monkeypatch, tmp
     monkeypatch.setattr(quickstart_modal.volume, "commit",
                         lambda: commits.append("volume"))
     monkeypatch.setattr(Session, "tokenizer", property(lambda self: str.split))
-    monkeypatch.setattr(Session, "_fast_tokenizer", lambda self: None)
     monkeypatch.setattr(execution, "gpu_problem", lambda: None)
     monkeypatch.setattr(execution, "_prepare_backend", lambda *args: None)
     executor = make_executor({"r": {"Instruction": [1, 0]}})

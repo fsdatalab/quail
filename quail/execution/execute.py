@@ -109,7 +109,10 @@ def execute_query(query, physical_executor=None, plan=None,
         _prepare_backend(plan, query.session.registry)
     if on_backend_ready is not None:
         on_backend_ready()
+    query.wait_for_tokens()
+    physical_prepare_started = time.perf_counter()
     request = query._prepare_physical()
+    physical_prepare_s = time.perf_counter() - physical_prepare_started
     if on_execution_ready is not None:
         on_execution_ready()
     started = time.perf_counter()
@@ -119,7 +122,18 @@ def execute_query(query, physical_executor=None, plan=None,
     )
     if not isinstance(response, PhysicalResponse):
         raise TypeError("a physical executor must return PhysicalResponse")
-    result = query.finish(response, time.perf_counter() - started)
+    coordinator_wall_s = time.perf_counter() - started
+    finish_started = time.perf_counter()
+    result = query.finish(response, coordinator_wall_s)
+    finish_s = time.perf_counter() - finish_started
+    model_wall_s = result.report["wall_s"]
+    result.report.update(
+        planning_s=round(query.planning_s, 4),
+        input_ready_s=round(query.input_ready_s, 4),
+        physical_prepare_s=round(physical_prepare_s, 4),
+        model_wall_s=model_wall_s,
+        finish_s=round(finish_s, 4),
+    )
     result.report["token_wait_s"] = round(query.token_wait_s, 4)
     result.report["worker_total_s"] = round(
         time.perf_counter() - total_started, 4)

@@ -23,6 +23,7 @@ from quail.logical.prompts import (
     SHARED_PRE,
     bind_join_prompt,
     bind_prompt,
+    filter_question_text,
     render_filter_prompt_ids,
     render_join_prompt_ids,
 )
@@ -86,7 +87,7 @@ def test_turn_text_wraps_filter_and_join_prompts():
     assert ids[:len(_tok(prompt.preamble))] == _tok(prompt.preamble)
     assert ids[-len(_tok(turn[1])):] == _tok(turn[1])
     assert ids == (_tok(prompt.preamble) + doc
-                   + _tok(prompt.tail.replace("{0}", "", 1)))
+                   + _tok(filter_question_text(prompt)))
     assert tuple(_tok(prompt.preamble)) == prompt.preamble_token_ids
 
     left, right = SimpleNamespace(alias="a"), SimpleNamespace(alias="b")

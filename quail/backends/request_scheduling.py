@@ -137,6 +137,9 @@ def run_filter_chain(
     read_answer,
     block_size=1,
     max_num_seqs=None,
+    body_texts=None,
+    question_texts=None,
+    render_prompt=None,
 ):
     """Submit the next filter after each document passes.
 
@@ -154,15 +157,15 @@ def run_filter_chain(
     def submit(document, stage):
         request_id = f"{tag}-{document}-{stage}"
         inflight[request_id] = (document, stage)
-        engine.add_request(
-            request_id,
-            {
-                "prompt_token_ids": (
-                    body_ids[document] + question_ids[stage]
-                )
-            },
-            sampling_params,
-        )
+        if body_texts is not None and question_texts is not None:
+            prompt = body_texts[document] + question_texts[stage]
+            if render_prompt is not None:
+                prompt = render_prompt(prompt)
+        else:
+            prompt = {
+                "prompt_token_ids": body_ids[document] + question_ids[stage]
+            }
+        engine.add_request(request_id, prompt, sampling_params)
 
     started = time.perf_counter()
     live = 0
@@ -232,6 +235,8 @@ def run_join_grouped(
     *,
     submission="anchor-major",
     pairs=None,
+    prefix_texts=None,
+    suffix_texts=None,
 ):
     """Submit the join's requests; answers come back in anchor-major order.
 
@@ -245,6 +250,8 @@ def run_join_grouped(
         pairs: (anchor index, suffix index) list to evaluate, in
             anchor-major order; every anchor against every suffix when
             omitted.
+        prefix_texts: Text form of each prefix when the engine tokenizes.
+        suffix_texts: Text form of each suffix when the engine tokenizes.
     """
     if pairs is None:
         pairs = [(anchor, suffix) for anchor in range(len(prefixes))
@@ -256,16 +263,22 @@ def run_join_grouped(
                        key=lambda index: (pairs[index][1], pairs[index][0]))
     else:
         raise ValueError(f"unknown join submission {submission!r}")
-    prompts = [
-        {"prompt_token_ids": prefixes[pairs[index][0]]
-         + suffixes[pairs[index][1]]}
-        for index in order
-    ]
+    if prefix_texts is not None and suffix_texts is not None:
+        prompts = [
+            prefix_texts[pairs[index][0]] + suffix_texts[pairs[index][1]]
+            for index in order
+        ]
+    else:
+        prompts = [
+            {"prompt_token_ids": prefixes[pairs[index][0]]
+             + suffixes[pairs[index][1]]}
+            for index in order
+        ]
 
     started = time.perf_counter()
     outputs = client.generate(prompts, sampling_params, use_tqdm=False)
-    wall = time.perf_counter() - started
     bits = [read_answer(output) for output in outputs]
+    wall = time.perf_counter() - started
     cached_by_output = [
         int(getattr(output, "num_cached_tokens", 0) or 0)
         for output in outputs

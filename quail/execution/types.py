@@ -26,6 +26,7 @@ class TokenizedInput:
     """A random access sequence of tokenized documents."""
 
     documents: Sequence
+    texts: Sequence | None = None
 
     def __post_init__(self) -> None:
         if not hasattr(self.documents, "__len__") \
@@ -33,14 +34,16 @@ class TokenizedInput:
             raise TypeError(
                 "a tokenized input needs a random access document sequence"
             )
+        if self.texts is not None and len(self.texts) != len(self.documents):
+            raise ValueError("document text and token sequences must have equal size")
 
     def __len__(self) -> int:
         return len(self.documents)
 
 
-def document_input(tokens) -> TokenizedInput:
+def document_input(tokens, texts=None) -> TokenizedInput:
     """Build one physical input from a token document sequence."""
-    return TokenizedInput(decode_token_documents(tokens))
+    return TokenizedInput(decode_token_documents(tokens), texts)
 
 
 @dataclass(frozen=True)
