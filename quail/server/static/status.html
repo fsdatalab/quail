@@ -401,7 +401,7 @@ async function renderStatus(status) {
     el("span", { class: "state " + status.state },
       sentenceCase(status.state)),
     el("span", { class: "muted" },
-      `revision ${status.revision}, updated ${when(status.updated_at)}`));
+      `Updated ${when(status.updated_at)}`));
   if (!DONE.includes(status.state)) {
     header.append(el("button", { onclick: cancel },
       status.cancel_requested ? "cancel requested" : "Cancel"));
