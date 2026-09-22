@@ -576,11 +576,6 @@ def complete_answers(result, conversations, questions):
     return ordered
 
 
-def token_lengths(session, name: str, column: str) -> np.ndarray:
-    """Return token counts for one registered column."""
-    return np.asarray(session.token_lengths(name, column))
-
-
 def evaluate(directory: Path, gpus: int) -> dict:
     """Run the join and save every Boolean decision and its execution report.
 
@@ -616,8 +611,10 @@ def evaluate(directory: Path, gpus: int) -> dict:
                       for alias, label, frame in prompt.label_token_ids}
             overhead = (len(prompt.preamble_token_ids) + len(pieces["c"][1])
                         + len(pieces["q"][0]) + len(prompt.tail_token_ids))
-            c_lengths = token_lengths(session, "conversations", "state")
-            q_lengths = token_lengths(session, "tool_questions", "statement")
+            c_lengths = np.asarray(
+                session.token_lengths("conversations", "state"))
+            q_lengths = np.asarray(
+                session.token_lengths("tool_questions", "statement"))
             input_tokens = int(c_lengths[answers["c"].to_numpy()].sum()
                                + q_lengths.sum() + overhead * len(questions))
             decisions = questions.append_column("answer", answers["answer"])
