@@ -16,6 +16,13 @@ def _module():
     return module
 
 
+def test_tokens_per_second_label_uses_suffixes():
+    module = _module()
+    assert module._tokens_per_second_label(11_487_790) == "11.5M"
+    assert module._tokens_per_second_label(1_422_504) == "1.42M"
+    assert module._tokens_per_second_label(705_447) == "705k"
+
+
 def test_percent_of_sol_divides_means():
     module = _module()
     assert module.percent_of_sol([10, 30], [40, 60]) == 40

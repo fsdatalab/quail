@@ -12,7 +12,7 @@ link-citations: true
 ::: {.figure-block .wide-figure}
 [![Average requested input token throughput by dataset for Quail and vLLM, as a percent of SoL.](figures/quailb_tok_per_sec.png){width=100%}](figures/quailb_tok_per_sec.pdf)
 
-*Figure 1. Average requested input tokens per second on QUAIL-B at scale factor 0.1, using Qwen3 4B FP8 on one H100, as a percent of each dataset's SoL estimate. The top of the axis is 100% of SoL. SoL is the optimistic lower bound on runtime from GPU arithmetic and memory traffic. Each bar is the dataset's mean tokens per second divided by its mean SoL tokens per second. The averages use the current 31 queries. The original LEP-5, LEP-6, and LEP-8 are excluded. Dataset labels show how many queries are averaged.*
+*Figure 1. Average requested input tokens per second on QUAIL-B at scale factor 0.1, using Qwen3 4B FP8 on one H100, as a percent of each dataset's SoL estimate. The top of the axis is 100% of SoL. SoL is the optimistic lower bound on runtime from GPU arithmetic and memory traffic. Each bar is the dataset's mean tokens per second divided by its mean SoL tokens per second. The label above each Quail percent is that bar's mean tokens per second. The averages use the current 31 queries. The original LEP-5, LEP-6, and LEP-8 are excluded. Dataset labels show how many queries are averaged.*
 :::
 
 # 1. The growth of AI-powered data processing

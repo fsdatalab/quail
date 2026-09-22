@@ -206,6 +206,17 @@ def _percent_tick(value, _position):
     return f"{value:.0f}%"
 
 
+def _tokens_per_second_label(value: float) -> str:
+    """Format a tokens/second rate with a k or M suffix."""
+    if value >= 1_000_000:
+        scaled = value / 1_000_000
+        decimals = 1 if scaled >= 10 else 2
+        return f"{scaled:.{decimals}f}M"
+    if value >= 1_000:
+        return f"{value / 1_000:.0f}k"
+    return f"{value:.0f}"
+
+
 def plot_headline(rows, destination: Path):
     """Draw Quail and vLLM as a percent of each dataset's SoL estimate."""
     by = _rates_by_dataset(rows)
@@ -253,6 +264,18 @@ def plot_headline(rows, destination: Path):
             fontsize=11,
             color=DARK,
         )
+        if method == "Quail":
+            rates = [
+                _tokens_per_second_label(statistics.mean(by[name][method]))
+                for name in DATASETS
+            ]
+            axis.bar_label(
+                containers,
+                labels=rates,
+                padding=18,
+                fontsize=11,
+                color=BLUE,
+            )
 
     axis.axhline(
         Y_MAX,
