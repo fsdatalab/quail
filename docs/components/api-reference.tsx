@@ -2,9 +2,11 @@ import type { ReactNode } from 'react';
 
 export function ApiClass() {
   return (
-    <span className="ms-2 inline-flex translate-y-[-0.1em] items-center rounded-md border border-fd-border bg-fd-muted px-2 py-0.5 font-sans text-xs font-medium text-fd-muted-foreground">
-      Class
-    </span>
+    <div className="mb-[-0.75rem] mt-8 flex">
+      <span className="inline-flex items-center rounded-md border border-fd-border bg-fd-muted px-2 py-0.5 font-sans text-xs font-medium text-fd-muted-foreground">
+        Class
+      </span>
+    </div>
   );
 }
 

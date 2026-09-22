@@ -228,7 +228,9 @@ runs past the limit ends `failed` with error type `TimeoutError`,
 and the model process is killed the same way as on cancel. A limit
 above `--max-timeout` is rejected when you submit.
 
-## RemoteQuery <ApiClass />
+<ApiClass />
+
+## RemoteQuery
 
 `session.sql` on a server session returns a `RemoteQuery`. It holds
 the statement text. The server compiles and plans that text when the
@@ -389,7 +391,9 @@ Submit the query, wait, and stream the rows.
 
 `pyarrow.RecordBatchReader`.
 
-## QueryRun <ApiClass />
+<ApiClass />
+
+## QueryRun
 
 A handle to one record the server has accepted. `submit` returns one.
 `session.get_run(query_id)` returns a handle to a record that is
@@ -594,7 +598,9 @@ query is finished and every saved entry has been yielded.
 
 An iterator of answer dicts.
 
-## QueryStatus <ApiClass />
+<ApiClass />
+
+## QueryStatus
 
 One saved snapshot of a query record. `status`, `watch`, and
 `GET /v1/queries/{id}` return this object. Every write replaces the

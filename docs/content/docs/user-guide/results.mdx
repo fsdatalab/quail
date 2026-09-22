@@ -153,7 +153,9 @@ result = query.run()
 A session created with `endpoint` returns a
 [`RemoteQuery`](/docs/user-guide/server#remotequery) from `sql()`.
 
-### Query <ApiClass />
+<ApiClass />
+
+### Query
 
 A compiled query bound to the session that parsed it.
 
@@ -303,7 +305,9 @@ Execute the query and stream the rows.
 
 `pyarrow.RecordBatchReader`.
 
-### QueryResult <ApiClass />
+<ApiClass />
+
+### QueryResult
 
 The rows of a finished query, plus the report and the answer tables.
 The rows stay unread until `collect`, `to_rows`, or `execute_stream`
