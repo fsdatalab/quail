@@ -348,6 +348,72 @@ def test_filter_and_join_answer_relations():
     assert result.metrics.evaluated_document_pairs == 4
 
 
+def test_vllm_receives_complete_filter_and_join_text():
+    class TextClient(_Client):
+        accepts_text = True
+
+        def generate(self, prompts, sampling_params, use_tqdm=False):
+            del sampling_params, use_tqdm
+            self.prompts = prompts
+            return [_Output(_tokens(prompt), False) for prompt in prompts]
+
+    filters = RequestExecution(
+        node_id="request-model",
+        backend_name="stock_vllm",
+        aliases=("r",),
+        preamble_token_ids=(3,),
+        preamble_text="DOCUMENT:\n",
+        filters=(RequestFilterSpec(
+            alias="r",
+            written_positions=(0,),
+            question_token_ids=((90,),),
+            question_texts=("\n\nIs this serious?\nANSWER:",),
+        ),),
+    )
+    filter_client = TextClient()
+    execution = _execution(
+        {"r": [[10]]},
+        document_texts={"r": ["patient report"]},
+        client=filter_client,
+    )
+    execution.execute(filters, {})
+    assert filter_client.prompts == [
+        "DOCUMENT:\npatient report\n\nIs this serious?\nANSWER:"
+    ]
+
+    join = RequestExecution(
+        node_id="request-model",
+        backend_name="stock_vllm",
+        aliases=("r", "p"),
+        preamble_token_ids=(3,),
+        preamble_text="DOCUMENT:\n",
+        joins=(RequestJoinSpec(
+            written_pos=0,
+            aliases=("r", "p"),
+            outer_aliases=("r",),
+            anchor="r",
+            semantics="full",
+            selectivity=0.5,
+            label_token_ids=(("r", (40,)), ("p", (41,))),
+            frame_token_ids=(("r", (30,)), ("p", (31,))),
+            tail_token_ids=(50,),
+            label_texts=(("r", "\nR:"), ("p", "\nP:")),
+            frame_texts=(("r", "\nQUESTION"), ("p", "\nQUESTION")),
+            tail_text="\nANSWER:",
+        ),),
+    )
+    join_client = TextClient()
+    execution = _execution(
+        {"r": [[10]], "p": [[20]]},
+        document_texts={"r": ["report"], "p": ["reaction"]},
+        client=join_client,
+    )
+    execution.execute(join, {})
+    assert join_client.prompts == [
+        "DOCUMENT:\nreport\nQUESTION\nP:reaction\nANSWER:"
+    ]
+
+
 def test_cached_token_accounting():
     from quail.backends.request_scheduling import run_filter_chain_async
 
@@ -426,6 +492,7 @@ def test_vllm_engine_settings_follow_the_model():
 
     engine = VLLMEngine()
     assert engine.llm_kwargs(QWEN3_4B_FP8)["max_num_batched_tokens"] == 25_305
+    assert engine.llm_kwargs(QWEN3_4B_FP8)["tokenizer_mode"] == "gigatoken"
     assert "diffusion_config" not in engine.llm_kwargs(QWEN3_4B_FP8)
     # the mixture-of-experts model batches its own chunk cap; its
     # one-row canvas commits after one denoising step, and stays under
@@ -441,12 +508,38 @@ def test_vllm_engine_settings_follow_the_model():
     assert wide["max_num_seqs"] == engine.llm_kwargs(QWEN3_4B_FP8)["max_num_seqs"]
     assert sampling_kwargs([1, 2]) == {
         "temperature": 0.0, "max_tokens": 1, "min_tokens": 1,
-        "allowed_token_ids": [1, 2]}
+        "allowed_token_ids": [1, 2], "detokenize": False}
     # the diffusion sampler rejects everything but the length; a
     # one-row canvas returns its logprobs, a longer one free text
     assert sampling_kwargs([1, 2], canvas_tokens=1) == {
         "max_tokens": 1, "logprobs": -1, "detokenize": False}
     assert sampling_kwargs([1, 2], canvas_tokens=256) == {"max_tokens": 16}
+
+
+def test_vllm_gigatoken_adapter_loads_gigatoken_directly(monkeypatch):
+    from quail.backends.vllm import GigatokenVLLMTokenizer
+
+    adapter = SimpleNamespace(get_vocab=lambda: {"a": 0, "abc": 1})
+    sources = []
+
+    class Tokenizer:
+        def __init__(self, source):
+            sources.append(source)
+
+        def as_hf(self):
+            return adapter
+
+    monkeypatch.setitem(
+        sys.modules, "gigatoken", SimpleNamespace(Tokenizer=Tokenizer)
+    )
+    loaded = GigatokenVLLMTokenizer.from_pretrained(
+        "Qwen/Qwen3-4B-FP8", truncation_side="right"
+    )
+    assert loaded is adapter
+    assert sources == ["Qwen/Qwen3-4B-FP8"]
+    assert loaded.truncation_side == "right"
+    assert loaded.max_token_id == 1
+    assert loaded.max_chars_per_token == 3
 
 
 def test_vllm_canvas_matches_quail_after_boot_and_slot_reuse(monkeypatch):

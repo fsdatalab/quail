@@ -27,6 +27,23 @@ DIFFUSION_LOGPROBS = -1
 DIFFUSION_TEXT_TOKENS = 16
 
 
+class GigatokenVLLMTokenizer:
+    """Load Gigatoken through vLLM's tokenizer registry."""
+
+    @classmethod
+    def from_pretrained(cls, path_or_repo_id, *_args, **kwargs):
+        """Return Gigatoken with the Hugging Face tokenizer interface."""
+        from gigatoken import Tokenizer
+
+        truncation_side = kwargs.pop("truncation_side", "left")
+        tokenizer = Tokenizer(path_or_repo_id).as_hf()
+        tokenizer.truncation_side = truncation_side
+        vocab = tokenizer.get_vocab()
+        tokenizer.max_token_id = max(vocab.values())
+        tokenizer.max_chars_per_token = max(len(token) for token in vocab)
+        return tokenizer
+
+
 @contextmanager
 def diffusion_canvas(spec):
     """Initialize a one-token vLLM canvas with Quail's fixed token.
@@ -109,11 +126,13 @@ def sampling_kwargs(allowed_ids: list[int], canvas_tokens: int = 0) -> dict:
     if canvas_tokens:
         return {"max_tokens": DIFFUSION_TEXT_TOKENS}
     return {"temperature": 0.0, "max_tokens": 1, "min_tokens": 1,
-            "allowed_token_ids": allowed_ids}
+            "allowed_token_ids": allowed_ids, "detokenize": False}
 
 
 class VLLMClient:
     """The request operations the backends need from one vLLM LLM."""
+
+    accepts_text = True
 
     def __init__(self, llm, capacity: dict):
         self.llm = llm
@@ -126,7 +145,8 @@ class VLLMClient:
         return self.llm.reset_prefix_cache()
 
     def run_filter_chain(self, sampling_params, body_ids, question_ids,
-                         read_answer, *, tag="q"):
+                         read_answer, *, tag="q", body_texts=None,
+                         question_texts=None):
         """Pipeline filter stages through the engine's step loop."""
         return run_filter_chain(
             self.llm.llm_engine,
@@ -138,6 +158,9 @@ class VLLMClient:
             read_answer=read_answer,
             block_size=self.capacity["block_size"],
             max_num_seqs=self.capacity["max_num_seqs"],
+            body_texts=body_texts,
+            question_texts=question_texts,
+            render_prompt=self.llm._preprocess_cmpl_one,
         )
 
 
@@ -162,6 +185,7 @@ class VLLMEngine:
             "gpu_memory_utilization": GPU_MEMORY_UTILIZATION,
             "enable_prefix_caching": True,
             "disable_log_stats": True,
+            "tokenizer_mode": "gigatoken",
             "compilation_config": {
                 "cudagraph_capture_sizes": [CUDA_GRAPH_CAPTURE_SIZE]
             },
@@ -174,6 +198,17 @@ class VLLMEngine:
     def boot(self, spec, allowed_ids: list[int]) -> tuple[dict, dict]:
         """Load the spec's model and return the engine state and boot record."""
         from vllm import LLM, SamplingParams
+        from vllm.renderers.registry import RENDERER_REGISTRY
+        from vllm.tokenizers import TokenizerRegistry
+
+        registered = (
+            "quail.backends.vllm", "GigatokenVLLMTokenizer"
+        )
+        if TokenizerRegistry.tokenizers.get("gigatoken") != registered:
+            TokenizerRegistry.register("gigatoken", *registered)
+        renderer = ("vllm.renderers.hf", "HfRenderer")
+        if RENDERER_REGISTRY.renderers.get("gigatoken") != renderer:
+            RENDERER_REGISTRY.register("gigatoken", *renderer)
 
         if spec.canvas_tokens == 1:
             # vLLM's engine core in its own process returns the canvas
@@ -192,15 +227,16 @@ class VLLMEngine:
         cache = llm.llm_engine.vllm_config.cache_config
         capacity.update(
             enable_prefix_caching=cache.enable_prefix_caching,
+            input_tokenizer_mode=(
+                llm.llm_engine.vllm_config.model_config.tokenizer_mode
+            ),
             canvas_length=spec.canvas_tokens,
             initial_canvas_token_ids=list(canvas_ids),
             max_denoising_steps=1 if spec.canvas_tokens == 1 else None,
             logprobs=sampling_params.logprobs,
         )
         client = VLLMClient(llm, capacity)
-        client.generate(
-            [{"prompt_token_ids": allowed_ids}], sampling_params
-        )
+        client.generate(["TRUE"], sampling_params)
         return (
             {
                 "client": client,

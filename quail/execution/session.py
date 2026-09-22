@@ -61,21 +61,6 @@ class RefusalError(RuntimeError):
             + " ".join(refusal.reasons))
 
 
-def pick_corpus_tokenizer(primary, fast, texts, sample=25):
-    """Pick the corpus tokenizer for one column.
-
-    Returns the fast tokenizer if it matches the primary on a sample,
-    otherwise the primary.
-    """
-    if fast is None:
-        return primary, "tokenizer: transformers"
-    for t in texts[:sample]:
-        if list(fast(t)) != list(primary(t)):
-            return primary, ("tokenizer: transformers (Gigatoken "
-                             "failed parity on this column's sample)")
-    return fast, "tokenizer: Gigatoken (parity-checked on sample)"
-
-
 TOKENIZE_ROWS = 2048
 
 # documents tokenized to measure tokens per byte for a length estimate
@@ -147,10 +132,8 @@ class Session:
                 unit="configurations",
             ))
         self.catalog = Catalog()
-        self._tok = tokenizer      # injectable for tests; lazy HF load
-        self._tok_injected = tokenizer is not None
-        self._fast = None          # lazy Gigatoken instance
-        self._fast_tried = False
+        self._tok = tokenizer      # injectable for tests
+        self._tokenizer_name = "configured tokenizer" if tokenizer else "Gigatoken"
         self.notes = []            # tokenizer picks etc., for reports
         self._token_stores = {}
         self._column_stores = {}
@@ -165,6 +148,8 @@ class Session:
             from quail.server.client import RemoteConnection
 
             self._remote = RemoteConnection(endpoint, self.registry.codecs)
+        elif tokenizer is None:
+            _ = self.tokenizer
 
     @property
     def endpoint(self) -> str | None:
@@ -266,27 +251,20 @@ class Session:
 
     @property
     def tokenizer(self):
-        """Return the primary tokenizer, loading from HuggingFace if needed."""
+        """Return Gigatoken's encoder, loading it when first used."""
         if self._tok is None:
-            from transformers import AutoTokenizer
-            hf = AutoTokenizer.from_pretrained(self.model.hf_name)
-            self._tok = lambda text: hf(
-                text, add_special_tokens=False)["input_ids"]
-        return self._tok
+            from gigatoken import Tokenizer
 
-    def _fast_tokenizer(self):
-        """Return the Gigatoken tokenizer, or None if unavailable."""
-        if self._tok_injected:
-            return None
-        if not self._fast_tried:
-            self._fast_tried = True
-            try:
-                from gigatoken import Tokenizer
-                fast = Tokenizer(self.model.hf_name)
-                self._fast = fast.encode
-            except Exception:
-                self._fast = None
-        return self._fast
+            fast = Tokenizer(self.model.hf_name)
+
+            def encode(text):
+                tokens = fast.encode(text)
+                if hasattr(tokens, "tolist"):
+                    return tokens.tolist()
+                return [int(token) for token in tokens]
+
+            self._tok = encode
+        return self._tok
 
     def tokenize(self, provider_name: str, column: str,
                  projected_columns=()) -> ScanInput:
@@ -411,12 +389,13 @@ class Session:
         return lengths
 
     def _corpus_tokenizer(self, provider_name, column, texts):
-        """Pick and cache the tokenizer and token type for one column."""
+        """Cache the session tokenizer and token type for one column."""
         key = (self.catalog.get(provider_name).content_identity(), column)
         if key not in self._corpus_tokenizers:
-            tok, note = pick_corpus_tokenizer(
-                self.tokenizer, self._fast_tokenizer(), texts)
-            self.notes.append(f"{provider_name}.{column}: {note}")
+            tok = self.tokenizer
+            self.notes.append(
+                f"{provider_name}.{column}: tokenizer: {self._tokenizer_name}"
+            )
             first_token = next(
                 (token for text in texts for token in tok(text)), None
             )
@@ -609,7 +588,10 @@ class Query:
         self._doc_tokens = None
         self._token_inputs = None
         self._token_futures = {}
+        self._token_finished_at = {}
         self._estimated = ()
+        self._planning_started_at = None
+        self._planning_finished_at = None
         self.token_wait_s = 0.0
 
     def token_inputs(self) -> dict:
@@ -624,6 +606,7 @@ class Query:
 
     def plan(self):
         if self._plan is None:
+            self._planning_started_at = time.perf_counter()
             self.logical, _ = apply_logical_rules(
                 self.logical,
                 tuple(self.session.registry.logical_rules.values()),
@@ -637,17 +620,28 @@ class Query:
             self._token_inputs = {}
             estimated = []
             for s in scans:
+                columns = s.columns
+                if self.session.config.backend in {
+                    "stock_vllm", "pipelined_vllm", "dumb_vllm"
+                }:
+                    columns = tuple(dict.fromkeys((*columns, s.column)))
                 exact = self.session.token_lengths(s.provider, s.column)
                 if exact is not None:
                     store = self.session.tokenize(
-                        s.provider, s.column, s.columns)
+                        s.provider, s.column, columns)
                     self._token_inputs[s.alias] = store
                     self._doc_tokens[s.alias] = store.lengths
                     continue
                 self._doc_tokens[s.alias] = self.session.estimate_lengths(
                     s.provider, s.column)
-                self._token_futures[s.alias] = self.session.tokenize_async(
-                    s.provider, s.column, s.columns)
+                future = self.session.tokenize_async(
+                    s.provider, s.column, columns)
+
+                def record_finished(_future, alias=s.alias):
+                    self._token_finished_at[alias] = time.perf_counter()
+
+                future.add_done_callback(record_finished)
+                self._token_futures[s.alias] = future
                 estimated.append(s.alias)
             self._estimated = tuple(estimated)
             pair_fractions = self._pair_fractions(scans, joins)
@@ -664,7 +658,27 @@ class Query:
             if self.session.config.gpu_timing:
                 self._plan = replace(self._plan, settings={
                     **self._plan.settings, "gpu_timing": True})
+            self._planning_finished_at = time.perf_counter()
         return self._plan
+
+    @property
+    def planning_s(self) -> float:
+        """Return wall time spent planning this query."""
+        if self._planning_started_at is None:
+            return 0.0
+        finished = self._planning_finished_at or time.perf_counter()
+        return finished - self._planning_started_at
+
+    @property
+    def input_ready_s(self) -> float:
+        """Return time until planning and document tokenization finished."""
+        if self._planning_started_at is None:
+            return 0.0
+        finished = [
+            self._planning_finished_at or time.perf_counter(),
+            *self._token_finished_at.values(),
+        ]
+        return max(finished) - self._planning_started_at
 
     def _pair_fractions(self, scans, joins) -> dict:
         """Pairs kept over the cross product, per join with conditions."""
@@ -730,6 +744,7 @@ class Query:
         started = time.perf_counter()
         for alias, future in list(self._token_futures.items()):
             self._token_inputs[alias] = future.result()
+            self._token_finished_at.setdefault(alias, time.perf_counter())
             del self._token_futures[alias]
         self.token_wait_s += time.perf_counter() - started
 
@@ -770,11 +785,21 @@ class Query:
             raise RefusalError(plan)
         self.wait_for_tokens()
         inputs = {}
+        logical_scans = {
+            scan.alias: scan for scan in self.logical.operators().scans
+        }
         for node in plan.nodes:
             if not isinstance(node, Scan):
                 continue
+            store = self._token_inputs[node.alias]
+            logical_scan = logical_scans[node.alias]
             inputs[node.input_id] = document_input(
-                self._token_inputs[node.alias].tokens
+                store.tokens,
+                (
+                    store.column(logical_scan.column)
+                    if logical_scan.column in store.projected_columns
+                    else None
+                ),
             )
         envelope = plan.to_envelope(self.session.registry.codecs)
         return PhysicalRequest(envelope, inputs, self._column_tables())

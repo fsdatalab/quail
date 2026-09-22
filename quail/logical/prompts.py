@@ -125,13 +125,22 @@ def render_filter_question(tail: str) -> str:
     return sep + TASK_INSTRUCTION + content + ANSWER_CUE
 
 
-def render_filter_prompt_ids(prompt, document_ids, tokenizer) -> list:
-    """The complete canonical token ids for one filter document."""
+def filter_question_text(prompt) -> str:
+    """Return the text appended after a filter document."""
     if len(prompt.args) != 1 or not prompt.tail.startswith("{0}"):
         raise ValueError("a filter prompt must start its tail with {0}")
-    tail = prompt.tail.replace("{0}", "", 1)
+    return prompt.tail[len("{0}"):]
+
+
+def render_filter_prompt_text(prompt, document: str) -> str:
+    """Render the complete canonical text for one filter document."""
+    return prompt.preamble + document + filter_question_text(prompt)
+
+
+def render_filter_prompt_ids(prompt, document_ids, tokenizer) -> list:
+    """The complete canonical token ids for one filter document."""
     return (list(tokenizer(prompt.preamble)) + list(document_ids)
-            + list(tokenizer(tail)))
+            + list(tokenizer(filter_question_text(prompt))))
 
 
 def split_template(template: str) -> tuple[str, str]:

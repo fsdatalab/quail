@@ -4,7 +4,10 @@ Covers gating, tuple assembly, projection, and the report.
 """
 
 import re
+import sys
+from types import SimpleNamespace
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -97,6 +100,28 @@ def test_session_requires_model_and_device():
         quail.Session()
     config = EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
     assert (config.gpus, config.backend) == (1, "quail")
+
+
+def test_local_session_loads_gigatoken_and_returns_python_ids(monkeypatch):
+    sources = []
+
+    class Tokenizer:
+        def __init__(self, source):
+            sources.append(source)
+
+        def encode(self, text):
+            assert text == "hello"
+            return np.array([1, 2], dtype=np.uint32)
+
+    monkeypatch.setitem(
+        sys.modules, "gigatoken", SimpleNamespace(Tokenizer=Tokenizer)
+    )
+    config = EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
+    with quail.Session(config) as session:
+        token_ids = session.tokenizer("hello")
+    assert sources == ["Qwen/Qwen3-4B-FP8"]
+    assert token_ids == [1, 2]
+    assert all(type(token_id) is int for token_id in token_ids)
 
 
 def make_executor(filter_truth, join_truth=None, seen=None):
@@ -277,7 +302,9 @@ def test_query_rows_observers_and_saved_reports(sess, tmp_path):
                                                               abs=1e-3)
     # stage 2 only saw stage-1 survivors
     assert stages[1]["evaluated"] == 4
-    assert res.report["wall_s"] == 1.0
+    assert res.report["model_wall_s"] == 1.0
+    assert res.report["wall_s"] == res.report["model_wall_s"]
+    assert res.report["input_ready_s"] >= res.report["planning_s"]
 
     limited = _run(
         sess.sql(FILTER_SQL + " LIMIT 1"), make_executor(truth))
