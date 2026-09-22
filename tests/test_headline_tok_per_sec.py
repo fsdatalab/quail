@@ -73,3 +73,24 @@ def test_bio_remake_keeps_saved_sol_requested_tokens(tmp_path):
     assert rows[("BIO-4", "Quail")]["shared_tokens"] == 995835615
     assert round(rows[("BIO-4", "Quail")]["tok_per_sec"], 2) == 14351284.26
     assert round(rows[("BIO-4", "SoL")]["tok_per_sec"], 2) == 28579085.47
+
+
+def test_deleted_lepard_queries_are_omitted(tmp_path):
+    module = _module()
+    queries = [f"LEP-{number}" for number in range(1, 9)]
+    comparison = {
+        "rows": {
+            "quail": {
+                query: {"runtime_s": 1, "requested_tokens": 100} for query in queries
+            },
+            "pipelined_vllm": {
+                query: {"runtime_s": 2, "requested_tokens": 100} for query in queries
+            },
+        },
+        "sol": {
+            query: {"requested_tokens": 100, "sol_s": 0.5} for query in queries
+        },
+    }
+    (tmp_path / "comparison.json").write_text(json.dumps(comparison))
+    kept = {row["query"] for row in module.collect_rows(tmp_path)}
+    assert kept == {"LEP-1", "LEP-2", "LEP-3", "LEP-4", "LEP-5"}

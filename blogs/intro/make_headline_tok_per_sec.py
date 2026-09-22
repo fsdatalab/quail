@@ -21,6 +21,10 @@ file. BIO-1 and BIO-3 keep the requested-token total already stored on
 their SoL rows. BIO-4 uses the Quail run's input-token total, which is
 the shared numerator in the blog table.
 
+The figure averages the 31 queries in the QUAIL-B README. The saved
+comparison still has the deleted LePaRD queries. Original LEP-5, LEP-6,
+and LEP-8 are skipped. Current LEP-5 is read from the row saved as LEP-7.
+
 Pull the inputs, then run the script:
 
     W=/tmp/quail-blog-headline; mkdir -p "$W"
@@ -56,7 +60,13 @@ BLUE = "#4C72B0"
 ORANGE = "#DD8452"
 DARK = "#333333"
 DATASETS = ("IMDB", "FEV", "LEP", "AGENT", "BIO")
-QUERY_COUNTS = {"IMDB": 10, "FEV": 10, "LEP": 8, "AGENT": 2, "BIO": 4}
+# QUAIL-B README: 10 IMDB, 4 BioDEX, 10 FEVER, 5 LePaRD, 2 SWE-Next.
+QUERY_COUNTS = {"IMDB": 10, "FEV": 10, "LEP": 5, "AGENT": 2, "BIO": 4}
+# The saved comparison still uses ids from before the LePaRD deletion.
+# Current LEP-5 was saved as LEP-7. Original LEP-5, LEP-6, and LEP-8
+# have empty reference outputs and are not in the benchmark.
+EXCLUDED_SAVED_QUERIES = frozenset({"LEP-5", "LEP-6", "LEP-8"})
+CURRENT_QUERY_ID = {"LEP-7": "LEP-5"}
 BIO_REMAKE_QUERIES = ("BIO-1", "BIO-3", "BIO-4")
 Y_MAX = 100
 
@@ -131,9 +141,12 @@ def collect_rows(workdir: Path):
     _overlay_bio_remake(comparison, workdir)
     rows = []
 
-    for query, quail in comparison["rows"]["quail"].items():
-        vllm = comparison["rows"]["pipelined_vllm"][query]
-        sol = comparison.get("sol", {}).get(query) or {}
+    for saved_id, quail in comparison["rows"]["quail"].items():
+        if saved_id in EXCLUDED_SAVED_QUERIES:
+            continue
+        query = CURRENT_QUERY_ID.get(saved_id, saved_id)
+        vllm = comparison["rows"]["pipelined_vllm"][saved_id]
+        sol = comparison.get("sol", {}).get(saved_id) or {}
         shared = float(sol.get("requested_tokens") or quail["requested_tokens"])
         rows.append(
             {

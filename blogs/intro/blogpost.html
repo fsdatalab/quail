@@ -150,8 +150,9 @@ scale factor 0.1, using Qwen3 4B FP8 on one H100, as a percent of each
 dataset’s SoL estimate. The top of the axis is 100% of SoL. SoL is the
 optimistic lower bound on runtime from GPU arithmetic and memory traffic.
 Each bar is the dataset’s mean tokens per second divided by its mean SoL
-tokens per second. Dataset labels show how many queries are
-averaged.</em></p>
+tokens per second. The averages use the current 31 queries. The original
+LEP-5, LEP-6, and LEP-8 are excluded. Dataset labels show how many queries
+are averaged.</em></p>
 </div>
 <h1 id="the-growth-of-ai-powered-data-processing">1. The growth of
 AI-powered data processing</h1>
@@ -756,9 +757,10 @@ Quail is faster than the vLLM baseline on 27. The mean speedup is 1.91
 times, the median speedup is 1.48 times, and the largest speedup is
 10.04 times on BIO-2.</p>
 <h3 id="per-query-metrics-table">Per-query metrics table</h3>
-<p>The table below reports all 34 queries with matching results in the
-scale factor 0.1 comparison. SoL assumes zero KV regret. Costs use about
-$3.96 per H100-hour. BIO-1, BIO-3, and BIO-4 use remake run
+<p>The table below reports the 31 current QUAIL-B queries at scale factor
+0.1. The original LEP-5, LEP-6, and LEP-8 are omitted. Current LEP-5 was
+saved as LEP-7; its plan is unchanged. SoL assumes zero KV regret. Costs
+use about $3.96 per H100-hour. BIO-1, BIO-3, and BIO-4 use remake run
 <code>20260921T190132Z-a2059688</code>; BIO-2 keeps its prior run. BIO-4
 scale factor 1.0 results are in Section 4.3.</p>
 <div class="metrics-table">
@@ -1406,86 +1408,23 @@ scale factor 1.0 results are in Section 4.3.</p>
 <tr class="odd">
 <td>LEP-5</td>
 <td>Quail</td>
-<td style="text-align: right;">5688.60</td>
-<td style="text-align: right;">1794</td>
-<td style="text-align: right;">0.0286</td>
-</tr>
-<tr class="even">
-<td>LEP-5</td>
-<td>vLLM</td>
-<td style="text-align: right;">4224.29</td>
-<td style="text-align: right;">35327</td>
-<td style="text-align: right;">0.0385</td>
-</tr>
-<tr class="odd">
-<td>LEP-5</td>
-<td>SoL</td>
-<td style="text-align: right;">300823.31</td>
-<td style="text-align: right;">0</td>
-<td style="text-align: right;">0.0005</td>
-</tr>
-<tr class="even">
-<td>LEP-6</td>
-<td>Quail</td>
-<td style="text-align: right;">13549.90</td>
-<td style="text-align: right;">1732</td>
-<td style="text-align: right;">0.0110</td>
-</tr>
-<tr class="odd">
-<td>LEP-6</td>
-<td>vLLM</td>
-<td style="text-align: right;">9472.69</td>
-<td style="text-align: right;">10758</td>
-<td style="text-align: right;">0.0158</td>
-</tr>
-<tr class="even">
-<td>LEP-6</td>
-<td>SoL</td>
-<td style="text-align: right;">281667.61</td>
-<td style="text-align: right;">0</td>
-<td style="text-align: right;">0.0005</td>
-</tr>
-<tr class="odd">
-<td>LEP-7</td>
-<td>Quail</td>
 <td style="text-align: right;">28188.78</td>
 <td style="text-align: right;">3420</td>
 <td style="text-align: right;">0.0433</td>
 </tr>
 <tr class="even">
-<td>LEP-7</td>
+<td>LEP-5</td>
 <td>vLLM</td>
 <td style="text-align: right;">23364.36</td>
 <td style="text-align: right;">51004</td>
 <td style="text-align: right;">0.0522</td>
 </tr>
 <tr class="odd">
-<td>LEP-7</td>
+<td>LEP-5</td>
 <td>SoL</td>
 <td style="text-align: right;">900460.88</td>
 <td style="text-align: right;">0</td>
 <td style="text-align: right;">0.0014</td>
-</tr>
-<tr class="even">
-<td>LEP-8</td>
-<td>Quail</td>
-<td style="text-align: right;">101725.37</td>
-<td style="text-align: right;">1702</td>
-<td style="text-align: right;">0.0015</td>
-</tr>
-<tr class="odd">
-<td>LEP-8</td>
-<td>vLLM</td>
-<td style="text-align: right;">59266.09</td>
-<td style="text-align: right;">6065</td>
-<td style="text-align: right;">0.0025</td>
-</tr>
-<tr class="even">
-<td>LEP-8</td>
-<td>SoL</td>
-<td style="text-align: right;">281667.61</td>
-<td style="text-align: right;">0</td>
-<td style="text-align: right;">0.0005</td>
 </tr>
 </tbody>
 </table>
