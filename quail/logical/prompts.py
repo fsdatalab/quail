@@ -33,6 +33,23 @@ def true_false_ids(tok):
             false.add(ids[0])
     return true, false
 
+
+def true_false_token_ids(tokenizer) -> tuple[list[int], list[int]]:
+    """The sorted token ids that mean TRUE and FALSE.
+
+    Args:
+        tokenizer: Callable text -> token ids, without special tokens.
+    """
+    true, false = set(), set()
+    for words, ids in (
+            (("TRUE", " TRUE", "True", " True"), true),
+            (("FALSE", " FALSE", "False", " False"), false)):
+        for word in words:
+            tokens = tokenizer(word)
+            if tokens:
+                ids.add(tokens[0])
+    return sorted(true), sorted(false)
+
 # Fixed strings for join prompt layout.
 JOIN_DOC_LABEL = "\n\nDOCUMENT {}:\n"      # each partner block
 JOIN_ANCHOR_NOTE = "\n\n(The document above is DOCUMENT {}.)"

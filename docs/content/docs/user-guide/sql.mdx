@@ -162,16 +162,12 @@ AI_FILTER(PROMPT(...), {'selectivity': 0.3, 'anchor': 'r'})
 
 ### AI.SCORE
 
-`AI.SCORE(PROMPT(...))` returns a reranker score between 0 and 1 as a
+`AI.SCORE(PROMPT(...))` returns a score between 0 and 1 as a
 `FLOAT64`. Higher scores mean the model more strongly favors "yes" over
 "no" for the prompt. Use it in `SELECT` to return scores, or compare it
 with a threshold in `WHERE` or `JOIN ... ON`.
 
-The system message says, "You are performing a data processing task."
-It asks the model to judge whether the document meets the query's
-requirements and answer "yes" or "no".
-
-Choose a reranker model when creating the session:
+Every model runs `AI.SCORE`:
 
 ```python
 config = quail.EngineConfig(
@@ -180,8 +176,17 @@ config = quail.EngineConfig(
 )
 ```
 
-The supported models are `qwen3-reranker-0.6b-bf16` and
-`qwen3-reranker-4b-bf16`. Use `gpus` to run a model copy on each GPU.
+- The rerankers, `qwen3-reranker-0.6b-bf16` and
+  `qwen3-reranker-4b-bf16`, use their own prompt layout. The system
+  message says, "You are performing a data processing task." It asks
+  the model to judge whether the document meets the query's
+  requirements and answer "yes" or "no".
+- The generative models, `qwen3-4b-fp8`, `qwen3-32b-fp8`, and
+  `diffusion-gemma-26b-a4b-fp8`, use the `AI.IF` prompt for the same
+  template and compare TRUE with FALSE. A score above 0.5 is the
+  answer `AI.IF` gives, apart from ties within rounding.
+
+Use `gpus` to run a model copy on each GPU.
 
 #### Return scores
 
@@ -214,8 +219,9 @@ The hint does not change the scores or threshold.
 
 #### Join tables
 
-For a prompt with two document arguments, Quail includes the first in the
-reranker's query and uses the second as its candidate document. The
+For a prompt with two document arguments, a reranker includes the first in
+its query and uses the second as its candidate document. A generative
+model reads the pair in the `AI.IF` join layout. The
 template mentions `{0}` once, where that document is inserted; refer to
 it again in words:
 
@@ -248,6 +254,12 @@ Quail computes the score from the model's `yes` and `no` logits:
 ```text
 score = exp(yes_logit) / (exp(yes_logit) + exp(no_logit))
 ```
+
+A generative model uses its highest TRUE and FALSE logits, over the
+spellings `TRUE`, `True`, and their space-prefixed forms, in place of
+`yes` and `no`. A reranker is trained to give this score; a generative
+model is not, so the same threshold can select different fractions of
+rows on different models.
 
 A score of 0.75 does not mean 75% accuracy. Choose the threshold using
 labeled examples for your task.
