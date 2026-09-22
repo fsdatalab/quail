@@ -62,10 +62,12 @@ result_2 = session.sql("""
 """, dialect="bq").collect()
 ```
 
-The first `collect()` or `run()` loads the model onto the GPU.
-Later queries reuse the loaded model and compiled kernels.
-Tokenized documents are also reused across queries on the same
-session.
+`sql()` returns a `Query`. The first `collect()` or `run()` loads
+the model onto the GPU. Later queries reuse the loaded model and
+compiled kernels. Tokenized documents are also reused across queries
+on the same session. The fields on `Query` and on the `QueryResult`
+it returns are on the [Explain plans and runs](/docs/user-guide/results#query)
+page.
 
 ## Running on Quail Server
 

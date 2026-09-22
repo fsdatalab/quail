@@ -141,12 +141,36 @@ Other common refusals:
 
 ## Running a query
 
-`run()` executes the query on the GPU and returns a `QueryResult`.
-`query.collect()` is a shortcut that calls `run().collect()`.
+`session.sql` compiles the statement in this process and returns a
+`Query`. `run()` executes that query on the GPU and returns a
+`QueryResult`. `query.collect()` is a shortcut that calls
+`run().collect()`. A session created with `endpoint` returns a
+`RemoteQuery` instead; that object and the saved record are on the
+[Quail Server](/docs/user-guide/server#the-objects) page.
 
 ```python
 result = query.run()
 ```
+
+### Query
+
+```python
+class Query:
+    session: Session
+    logical: LogicalPlan          # the compiled query
+    order: str | None             # predicate order, when you passed one
+
+    def plan() -> PhysicalPlan: ...
+    def explain(verbose=False, analyze=False) -> str: ...
+    def run(plan=None) -> QueryResult: ...
+    def collect(limit=None) -> pa.Table: ...
+    def execute_stream(limit=None) -> pa.RecordBatchReader: ...
+```
+
+`plan()` is the physical plan. Pass an edited plan to `run(plan=...)`
+to execute that plan instead of the one the planner chose. `explain()`
+prints the plan, and `explain(analyze=True)` runs the query first and
+prints the measured column beside the estimates.
 
 ### QueryResult
 
