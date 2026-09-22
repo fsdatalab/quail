@@ -40,11 +40,10 @@ import argparse
 import json
 from pathlib import Path
 
-from quailb_results import PIPELINE_QUERIES, QUERY_ORDER, load_results
-
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
+from quailb_results import PIPELINE_QUERIES, QUERY_ORDER, load_results
 
 HERE = Path(__file__).resolve().parent
 BLUE = "#4C72B0"
