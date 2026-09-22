@@ -56,7 +56,7 @@ from quail.specs import H100_USD_PER_HOUR
 
 HERE = Path(__file__).resolve().parent
 METHODS = [("quail", "Quail", BLUE),
-           ("pipelined_vllm", "Pipelined stock vLLM", ORANGE)]
+           ("pipelined_vllm", "Pipelined vLLM", ORANGE)]
 BASE_QUERY_ORDER = (
     [f"IMDB-{n}" for n in range(1, 11)] + [f"BIO-{n}" for n in range(1, 4)]
     + [f"FEV-{n}" for n in range(1, 11)] + [f"LEP-{n}" for n in range(1, 6)]
@@ -635,7 +635,7 @@ def main(workdir):
         "  Answer agreement counts matching predicate answers. Output precision",
         "  and recall compare final rows with the reference output.",
         "- Quail uses pipelining, token-based admission, and KV rewind.",
-        "  Stock vLLM uses pipelining and prefix caching. Filter stages advance",
+        "  Pipelined vLLM uses pipelining and prefix caching. Filter stages advance",
         "  independently; joins begin after filtering finishes.",
         f"  vLLM batched-token limits: {', '.join(f'{n:,}' for n in batch)}.",
         f"  Sequence limits: {', '.join(f'{n:,}' for n in sequences)}.",
@@ -736,15 +736,15 @@ def main(workdir):
                 "speedup at sf=0.1. The working target was 10x. At sf=1.0, Quail "
                 f"was {bio4_sf1_speedup:.2f}x faster.", "",
                 f"Quail took {quail_row['runtime_s'] / 60:.2f} minutes. Pipelined "
-                f"stock vLLM took {vllm_row['runtime_s'] / 3600:.2f} hours. Quail "
+                f"vLLM took {vllm_row['runtime_s'] / 3600:.2f} hours. Quail "
                 f"recomputed {quail_row['regret_tokens']:,} KV tokens, compared with "
-                f"{vllm_row['regret_tokens']:,} for pipelined stock vLLM.", "",
+                f"{vllm_row['regret_tokens']:,} for pipelined vLLM.", "",
                 "The methods evaluated different numbers of document pairs because",
                 "their answers changed which rows reached the joins. The throughput",
                 "for each method uses its own evaluated pair count.", "",
                 "Both methods returned many incorrect final rows. Quail's output",
-                "precision was 1.57%, compared with 1.41% for pipelined stock vLLM.",
-                "Output recall was 22.02% for Quail and 22.57% for stock vLLM.", "",
+                "precision was 1.57%, compared with 1.41% for pipelined vLLM.",
+                "Output recall was 22.02% for Quail and 22.57% for pipelined vLLM.",
                 "| Method | Seconds | Document pairs/s | $/query | Fresh tokens "
                 "| Recomputed KV tokens | KV regret (%) | Answer agreement (%) "
                 "| Output precision (%) | Output recall (%) |",
