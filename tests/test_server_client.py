@@ -82,6 +82,7 @@ def test_submit_close_reattach_watch_and_collect(endpoint, tmp_path):
             revisions)
         final = snapshots[-1]
         assert final.done and final.state == "succeeded"
+        assert final.phase["name"] == "succeeded"
         assert final.plan["backend"] == "quail" and "Scan" in final.plan["text"]
         assert final.progress["done"] == 6
         assert set(final.inputs) == {"reviews", "aspects"}

@@ -157,6 +157,8 @@ def test_submission_validation_and_client_query_ids(make_client):
     status = first.json()
     assert status["id"] == "k" and status["session_id"] == "s1"
     assert status["state"] == "queued"
+    assert status["phase"]["name"] == "queued"
+    assert "done" not in status
     assert status["timeout_s"] == 1000.0
     again = client.post("/v1/queries",
                         json=submission(content_id, query_id="k"))
@@ -261,6 +263,7 @@ def test_lifecycle_over_http_with_long_poll_events_and_files(make_client):
 
     final = wait_done(client, query_id)
     assert final["state"] == "succeeded", final
+    assert final["phase"]["name"] == "succeeded"
     assert final["result"]["rows"] == 2
     assert final["plan"]["backend"] == "quail"
     assert final["progress"]["done"] == 6
