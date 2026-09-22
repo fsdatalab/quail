@@ -17,7 +17,6 @@
     --card: #fcfcfc;
     --border: #e0e0e0;
     --primary: #c31331;
-    --primary-soft: #c313311a;
     --success: #137a45;
     --success-soft: #e9f6ef;
     --warning: #8a5a00;
@@ -43,48 +42,40 @@
   }
   .site-header-inner {
     display: flex;
-    align-items: baseline;
-    gap: .8rem;
+    align-items: center;
+    justify-content: space-between;
     width: min(100% - 2.5rem, 68rem);
     margin: 0 auto;
-    padding: 1.05rem 0;
+    padding: 1rem 0;
   }
   .brand {
     color: var(--foreground);
-    font: 600 1.1rem/1 var(--font-serif);
+    font: 600 1.15rem/1 var(--font-serif);
     text-decoration: none;
   }
-  .product {
+  .nav-link {
     color: var(--muted);
-    font-size: .75rem;
-    letter-spacing: .08em;
-    text-transform: uppercase;
+    font-size: .875rem;
+    text-decoration: none;
   }
+  .nav-link:hover { color: var(--foreground); text-decoration: underline; }
   main {
     width: min(100% - 2.5rem, 68rem);
     margin: 0 auto;
-    padding: 4.5rem 0 6rem;
-  }
-  .eyebrow {
-    margin: 0 0 .55rem;
-    color: var(--primary);
-    font-size: .75rem;
-    font-weight: 600;
-    letter-spacing: .11em;
-    text-transform: uppercase;
+    padding: 3rem 0 5rem;
   }
   h1 {
-    max-width: 54rem;
-    margin: 0 0 2.5rem;
-    font: 500 clamp(2rem, 5vw, 3.35rem)/1.12 var(--font-serif);
-    letter-spacing: -.035em;
+    margin: 0 0 2rem;
+    font: 500 clamp(1.9rem, 4vw, 2.5rem)/1.25 var(--font-serif);
     overflow-wrap: anywhere;
   }
+  h1 code {
+    color: var(--foreground);
+    font: 400 .72em/1.25 var(--font-mono);
+  }
   h2 {
-    margin: 2.75rem 0 .8rem;
-    padding-top: 1.15rem;
-    border-top: 1px solid var(--border);
-    font: 600 1.05rem/1.4 var(--font-serif);
+    margin: 2.5rem 0 .7rem;
+    font: 500 1.35rem/1.4 var(--font-serif);
   }
   p { margin: .7rem 0; }
   code, pre { font: .8125rem/1.6 var(--font-mono); }
@@ -116,12 +107,9 @@
   th {
     background: var(--subtle);
     color: var(--muted);
-    font-size: .7rem;
-    font-weight: 600;
-    letter-spacing: .08em;
-    text-transform: uppercase;
+    font-size: .8125rem;
+    font-weight: 500;
   }
-  tbody tr { transition: background-color 120ms ease; }
   tbody tr:hover { background: var(--card); }
   .query-link { font-weight: 500; text-decoration: none; }
   .query-link:hover { text-decoration: underline; }
@@ -139,11 +127,9 @@
     padding: .22rem .65rem;
     border: 1px solid currentColor;
     border-radius: 999px;
-    font-size: .72rem;
-    font-weight: 600;
-    letter-spacing: .055em;
+    font-size: .78rem;
+    font-weight: 500;
     line-height: 1.4;
-    text-transform: uppercase;
   }
   .state::before {
     width: .42rem;
@@ -174,8 +160,8 @@
   }
   .phase {
     max-width: 48rem;
-    margin: 0 0 1rem;
-    font: 500 clamp(1.2rem, 2.5vw, 1.55rem)/1.45 var(--font-serif);
+    margin: 0 0 .8rem;
+    font: 500 1.2rem/1.5 var(--font-serif);
   }
   .meta {
     max-width: 60rem;
@@ -235,7 +221,7 @@
   }
   @media (max-width: 40rem) {
     .site-header-inner, main, footer { width: min(100% - 2rem, 68rem); }
-    main { padding: 3rem 0 4rem; }
+    main { padding: 2.5rem 0 4rem; }
     h1 { margin-bottom: 2rem; }
     td, th { padding: .7rem .75rem; }
     .meta { line-height: 1.8; }
@@ -249,11 +235,10 @@
 <header class="site-header">
   <div class="site-header-inner">
     <a class="brand" href="/">Quail</a>
-    <span class="product">Query service</span>
+    <a class="nav-link" href="/queries">Queries</a>
   </div>
 </header>
 <main>
-  <p class="eyebrow">Query service</p>
   <h1 id="title">Quail query</h1>
   <div id="view" aria-live="polite"></div>
 </main>
@@ -306,6 +291,10 @@ function when(seconds) {
   return seconds ? new Date(seconds * 1000).toLocaleString() : "";
 }
 
+function sentenceCase(value) {
+  return value ? value.charAt(0).toUpperCase() + value.slice(1) : "";
+}
+
 // Plain links cannot send the token, so files are fetched and saved.
 function fileLink(path, filename) {
   return el("a", { class: "file", onclick: async () => {
@@ -321,17 +310,19 @@ function fileLink(path, filename) {
 }
 
 function renderList(items) {
-  document.getElementById("title").textContent = "Recent Quail queries";
+  document.getElementById("title").textContent = "Queries";
+  document.title = "Queries · Quail";
   const table = el("table", {}, el("thead", {}, el("tr", {},
-    el("th", {}, "id"), el("th", {}, "status"),
-    el("th", {}, "created"), el("th", {}, "rows"))), el("tbody"));
+    el("th", {}, "Id"), el("th", {}, "Status"),
+    el("th", {}, "Created"), el("th", {}, "Rows"))), el("tbody"));
   const body = table.querySelector("tbody");
   for (const item of items) {
     body.append(el("tr", {},
       el("td", {}, el("a", {
         href: "/queries/" + item.id, class: "query-link"
       }, el("code", {}, item.id))),
-      el("td", {}, el("span", { class: "state " + item.state }, item.state),
+      el("td", {}, el("span", { class: "state " + item.state },
+        sentenceCase(item.state)),
         item.phase ? el("div", { class: "muted" }, item.phase.message) : ""),
       el("td", {}, when(item.created_at)),
       el("td", {}, item.result ? String(item.result.rows) : "")));
@@ -363,10 +354,13 @@ async function preview(status) {
 }
 
 async function renderStatus(status) {
-  document.getElementById("title").textContent = "Quail query " + status.id;
+  document.getElementById("title").replaceChildren(
+    "Query ", el("code", {}, status.id));
+  document.title = `${status.id} · Quail`;
   const nodes = [];
   const header = el("p", { class: "status-line" },
-    el("span", { class: "state " + status.state }, status.state),
+    el("span", { class: "state " + status.state },
+      sentenceCase(status.state)),
     el("span", { class: "muted" },
       `revision ${status.revision}, updated ${when(status.updated_at)}`));
   if (!DONE.includes(status.state)) {
@@ -452,9 +446,16 @@ async function readEvents(afterRevision, onStatus) {
 
 async function main() {
   if (!queryId) {
-    const response = await api("/v1/queries?limit=100");
-    if (!response.ok) { view.replaceChildren(el("p", {}, `HTTP ${response.status}`)); return; }
-    renderList((await response.json()).queries);
+    const refresh = async () => {
+      const response = await api("/v1/queries?limit=100");
+      if (!response.ok) {
+        view.replaceChildren(el("p", {}, `HTTP ${response.status}`));
+        return;
+      }
+      renderList((await response.json()).queries);
+    };
+    await refresh();
+    setInterval(refresh, 5000);
     return;
   }
   const response = await api(`/v1/queries/${queryId}`);
