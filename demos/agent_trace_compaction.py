@@ -576,54 +576,19 @@ def complete_answers(result, conversations, questions):
     return ordered
 
 
-def run_remote(query, directory: Path, endpoint: str):
-    """Submit the join to Quail Server, watch it, and return its result.
-
-    The query id goes to the log and to ``query_id.txt`` beside the
-    inputs, so a later run or a browser can reattach to the same query:
-    the status page is ``<endpoint>/queries/<id>``.
-    """
-    run = query.submit(query_id=f"agent-compaction-{directory.name}")
-    (directory / "query_id.txt").write_text(run.id)
-    print(f"query id: {run.id}", flush=True)
-    print(f"status page: {endpoint.rstrip('/')}/queries/{run.id}", flush=True)
-    for status in run.watch():
-        progress = status.progress or {}
-        print(f"{status.state} (revision {status.revision})"
-              + (f": {progress.get('label')} {progress.get('done')}"
-                 f"/{progress.get('total')} {progress.get('unit')}"
-                 if progress else ""), flush=True)
-    status = run.status()
-    if status.plan is not None:
-        print(status.plan["text"], flush=True)
-        (directory / "plan.txt").write_text(status.plan["text"])
-    return run.result()
-
-
 def token_lengths(session, name: str, column: str) -> np.ndarray:
-    """Token counts of one registered column, from the session or the tokenizer.
-
-    A local session has tokenized the column already. A remote session
-    has not, so the column is tokenized here with the model tokenizer.
-    """
-    exact = session.token_lengths(name, column)
-    if exact is None:
-        tokenizer = session.tokenizer
-        exact = [len(tokenizer(text))
-                 for text in session.column_values(name, column).to_pylist()]
-    return np.asarray(exact)
+    """Return token counts for one registered column."""
+    return np.asarray(session.token_lengths(name, column))
 
 
-def evaluate(directory: Path, gpus: int, endpoint: str | None = None) -> dict:
+def evaluate(directory: Path, gpus: int) -> dict:
     """Run the join and save every Boolean decision and its execution report.
 
     Args:
         directory: The prepared inputs; outputs are written beside them.
         gpus: GPUs the query asks for.
-        endpoint: A Quail Server to submit to; None runs on this host.
     """
     import quail
-    from quail.frontend.sql import compile_sql
     from quail.specs import MODAL_GPU_USD_PER_HOUR
 
     conversations = pq.read_table(directory / "conversations", columns=["id"])
@@ -633,25 +598,17 @@ def evaluate(directory: Path, gpus: int, endpoint: str | None = None) -> dict:
     input_tokens = 0
     if len(questions):
         with quail.Session(config=quail.EngineConfig(
-                model=MODEL, device=DEVICE, gpus=gpus),
-                endpoint=endpoint) as session:
+                model=MODEL, device=DEVICE, gpus=gpus)) as session:
             session.register("conversations", quail.DocumentProvider.from_parquet(
                 str(directory / "conversations"), id_col="id"))
             session.register("tool_questions", quail.DocumentProvider.from_parquet(
                 str(directory / "tool_questions"), id_col="id"))
             query = session.sql(SQL, dialect="bq")
-            if endpoint is None:
-                explanation = query.explain()
-                print(explanation, flush=True)
-                (directory / "plan.txt").write_text(explanation)
-                result = query.run()
-                logical = query.logical
-            else:
-                result = run_remote(query, directory, endpoint)
-                # the server compiled the query; compile it here too for
-                # the prompt token pieces the throughput number needs
-                logical = compile_sql(SQL, session.catalog, session.tokenizer,
-                                      dialect="bq", turn=session.model.turn)
+            explanation = query.explain()
+            print(explanation, flush=True)
+            (directory / "plan.txt").write_text(explanation)
+            result = query.run()
+            logical = query.logical
             answers = complete_answers(result, conversations, questions)
             pq.write_table(result.collect(), directory / "retained.parquet")
             prompt = logical.operators().joins[0].prompt
@@ -671,7 +628,6 @@ def evaluate(directory: Path, gpus: int, endpoint: str | None = None) -> dict:
     seconds = report["wall_s"]
     report.update(
         model=MODEL, device=DEVICE, gpus=gpus, input_tokens=input_tokens,
-        endpoint=endpoint,
         input_tokens_per_second=input_tokens / seconds if seconds else None,
         evaluated_pairs=len(questions),
         gpu_cost_usd=seconds * gpus * MODAL_GPU_USD_PER_HOUR[DEVICE] / 3600,
@@ -729,10 +685,9 @@ if __name__ == "__main__":
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--gpus", type=int, default=1, choices=[1, 2, 4, 8])
-    parser.add_argument("--endpoint", help="submit the join to a Quail Server")
     args = parser.parse_args()
 
     directory = args.output_dir / uuid.uuid4().hex
     prepare(directory, args.limit, args.seed)
-    evaluate(directory, args.gpus, args.endpoint or None)
+    evaluate(directory, args.gpus)
     reconstruct(directory)
