@@ -329,7 +329,7 @@ function fileLink(path, filename) {
 
 function renderList(items) {
   document.getElementById("title").textContent = "Queries";
-  document.title = "Queries · Quail";
+  document.title = "Queries — Quail Server";
   const table = el("table", { class: "query-table" },
     el("thead", {}, el("tr", {},
       el("th", {}, "Id"),
@@ -395,7 +395,7 @@ async function preview(status) {
 async function renderStatus(status) {
   document.getElementById("title").replaceChildren(
     "Query ", el("code", {}, status.id));
-  document.title = `${status.id} · Quail`;
+  document.title = `${status.id} — Quail Server`;
   const nodes = [];
   const header = el("p", { class: "status-line" },
     el("span", { class: "state " + status.state },
@@ -440,7 +440,8 @@ async function renderStatus(status) {
       bar);
   }
   if (status.progress && status.progress.answers_saved) {
-    nodes.push(el("p", {}, `${status.progress.answers_saved.toLocaleString()} answer batches saved so far · `,
+    nodes.push(el("p", {},
+      `${status.progress.answers_saved.toLocaleString()} answer batches saved so far. Download `,
       fileLink(`/v1/queries/${status.id}/answers?limit=10000`, "answers.json")));
   }
   if (status.error) {
@@ -448,8 +449,8 @@ async function renderStatus(status) {
   }
   if (status.result) {
     nodes.push(el("h2", {}, "Result"),
-      el("p", {}, `${status.result.rows.toLocaleString()} rows. `,
-        fileLink(`/v1/queries/${status.id}/result`, "result.arrows"), " · ",
+      el("p", {}, `${status.result.rows.toLocaleString()} rows. Downloads: `,
+        fileLink(`/v1/queries/${status.id}/result`, "result.arrows"), " and ",
         fileLink(`/v1/queries/${status.id}/files/report.json`, "report.json")),
       await preview(status));
   }
@@ -457,7 +458,11 @@ async function renderStatus(status) {
     nodes.push(el("h2", {}, "Plan"), el("pre", {}, status.plan.text));
   }
   nodes.push(el("h2", {}, "SQL"), el("pre", {}, status.spec.sql));
-  nodes.push(el("h2", {}, "Inputs"), el("pre", {}, JSON.stringify(status.inputs, null, 2)));
+  const shownInputs = JSON.stringify(
+    status.inputs,
+    (key, value) => key === "kind" ? undefined : value,
+    2);
+  nodes.push(el("h2", {}, "Inputs"), el("pre", {}, shownInputs));
   view.replaceChildren(...nodes);
 }
 
