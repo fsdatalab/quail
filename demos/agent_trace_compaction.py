@@ -577,12 +577,7 @@ def complete_answers(result, conversations, questions):
 
 
 def evaluate(directory: Path, gpus: int) -> dict:
-    """Run the join and save every Boolean decision and its execution report.
-
-    Args:
-        directory: The prepared inputs; outputs are written beside them.
-        gpus: GPUs the query asks for.
-    """
+    """Run the join and save every Boolean decision and its execution report."""
     import quail
     from quail.specs import MODAL_GPU_USD_PER_HOUR
 
@@ -603,18 +598,15 @@ def evaluate(directory: Path, gpus: int) -> dict:
             print(explanation, flush=True)
             (directory / "plan.txt").write_text(explanation)
             result = query.run()
-            logical = query.logical
             answers = complete_answers(result, conversations, questions)
             pq.write_table(result.collect(), directory / "retained.parquet")
-            prompt = logical.operators().joins[0].prompt
+            prompt = query.logical.operators().joins[0].prompt
             pieces = {alias: (label, frame)
                       for alias, label, frame in prompt.label_token_ids}
             overhead = (len(prompt.preamble_token_ids) + len(pieces["c"][1])
                         + len(pieces["q"][0]) + len(prompt.tail_token_ids))
-            c_lengths = np.asarray(
-                session.token_lengths("conversations", "state"))
-            q_lengths = np.asarray(
-                session.token_lengths("tool_questions", "statement"))
+            c_lengths = np.asarray(session.token_lengths("conversations", "state"))
+            q_lengths = np.asarray(session.token_lengths("tool_questions", "statement"))
             input_tokens = int(c_lengths[answers["c"].to_numpy()].sum()
                                + q_lengths.sum() + overhead * len(questions))
             decisions = questions.append_column("answer", answers["answer"])
