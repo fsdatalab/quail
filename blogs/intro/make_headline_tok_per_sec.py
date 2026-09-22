@@ -47,12 +47,12 @@ import statistics
 from collections import defaultdict
 from pathlib import Path
 
+from quailb_results import QUERY_ORDER, load_results
+
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 from matplotlib.ticker import FixedLocator, FuncFormatter, NullLocator
-
-from quailb_results import QUERY_ORDER, load_results
 
 HERE = Path(__file__).resolve().parent
 BLUE = "#4C72B0"
