@@ -273,11 +273,18 @@ class Store:
     def execution_epoch(self, query_id: str) -> int:
         return int(self._row(query_id)["execution_epoch"])
 
-    def list_recent(self, limit: int = 50,
+    def list_recent(self, limit: int | None = 50,
                     session_id: str | None = None) -> list[QueryStatus]:
         """The newest records first, all of them or one session's."""
         with self._lock:
-            if session_id is None:
+            if limit is None and session_id is None:
+                rows = self._conn.execute(
+                    "SELECT * FROM queries ORDER BY created_at DESC").fetchall()
+            elif limit is None:
+                rows = self._conn.execute(
+                    "SELECT * FROM queries WHERE session_id = ? "
+                    "ORDER BY created_at DESC", (session_id,)).fetchall()
+            elif session_id is None:
                 rows = self._conn.execute(
                     "SELECT * FROM queries ORDER BY created_at DESC LIMIT ?",
                     (limit,)).fetchall()

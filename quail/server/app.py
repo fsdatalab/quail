@@ -449,7 +449,9 @@ def create_app(settings: ServerSettings) -> Starlette:
         return _status_response(status, 201)
 
     async def list_queries(request):
-        limit = min(int(request.query_params.get("limit", "50")), 500)
+        requested_limit = request.query_params.get("limit", "50")
+        limit = (None if requested_limit == "all"
+                 else min(int(requested_limit), 500))
         session_id = request.query_params.get("session_id")
         items = [status.to_dict() for status in await run_in_threadpool(
             server.store.list_recent, limit, session_id)]
@@ -577,6 +579,7 @@ def create_app(settings: ServerSettings) -> Starlette:
         Route("/v1/queries/{query_id}/rows", rows),
         Route("/v1/queries/{query_id}/answers", saved_answers),
         Route("/", page),
+        Route("/queries", page),
         Route("/queries/{query_id}", page),
     ]
     middleware = []

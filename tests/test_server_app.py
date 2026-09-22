@@ -173,6 +173,10 @@ def test_submission_validation_and_client_query_ids(make_client):
     assert len(other["id"]) == 32 and other["session_id"] is None
     mine = client.get("/v1/queries", params={"session_id": "s1"}).json()
     assert [item["id"] for item in mine["queries"]] == ["k"]
+    all_queries = client.get("/v1/queries", params={"limit": "all"}).json()
+    assert {item["id"] for item in all_queries["queries"]} == {
+        "k", other["id"],
+    }
 
 
 def test_a_submission_is_made_durable_before_it_is_acknowledged(make_client):
@@ -398,6 +402,7 @@ def test_bearer_token_guards_the_api_but_not_the_page(make_client):
     page = client.get("/queries/abc")
     assert page.status_code == 200 and "<title>Quail query" in page.text
     assert client.get("/").status_code == 200
+    assert client.get("/queries").status_code == 200
 
 
 def test_restart_recovers_records_and_keeps_inputs(tmp_path):
