@@ -17,6 +17,7 @@ prints the planner's estimate for every model and query before it
 submits the GPU functions:
 
     uv run modal run --detach experiments/cells/generative_score.py \
+      --prediction "State the expected results before starting." \
       2>&1 | tee results/generative-score.log
 
 Each model writes, under /results/ai-score/generative-<run id>/:
@@ -56,7 +57,7 @@ MODELS = (
     "qwen3-32b-fp8",
     "diffusion-gemma-26b-a4b-fp8",
 )
-QUERIES = ("IMDB-1", "BIO-1", "FEV-1", "LEP-1", "IMDB-2", "LEP-2")
+QUERIES = ("FEV-1", "LEP-1", "IMDB-1", "BIO-1", "IMDB-2", "LEP-2")
 
 
 def _predicate(query_id):
@@ -313,20 +314,25 @@ def plan_estimates(models, query_ids) -> dict:
 
 
 @app.local_entrypoint()
-def main(models: str = ",".join(MODELS), queries: str = ",".join(QUERIES)):
+def main(prediction: str = "", models: str = ",".join(MODELS),
+         queries: str = ",".join(QUERIES)):
+    if not prediction:
+        raise ValueError("pass --prediction before starting")
+    print(f"PREDICTION: {prediction}", flush=True)
     selected = [name.strip() for name in models.split(",") if name.strip()]
     query_ids = [name.strip() for name in queries.split(",") if name.strip()]
     unknown = (set(selected) - set(MODELS)) | (set(query_ids) - set(QUERIES))
     if unknown:
         raise ValueError(f"unknown models or queries: {sorted(unknown)}")
     estimates = plan_estimates(selected, query_ids)
-    print("PREDICTION (planner estimate, seconds):", flush=True)
+    print("planner estimate, seconds:", flush=True)
     print(json.dumps(estimates, indent=2), flush=True)
     run_dir = f"/results/ai-score/generative-{uuid.uuid4().hex[:12]}"
     print(f"run directory: {run_dir}", flush=True)
-    calls = {model: score_model.spawn(model, query_ids, run_dir,
-                                      estimates[model])
-             for model in selected}
+    calls = {model: score_model.spawn(
+        model, query_ids, run_dir,
+        {"text": prediction, "estimated_seconds": estimates[model]})
+        for model in selected}
     for model, call in calls.items():
         print(f"function call id: {call.object_id} ({model})", flush=True)
     for model, call in calls.items():
