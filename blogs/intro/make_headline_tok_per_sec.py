@@ -207,14 +207,16 @@ def _percent_tick(value, _position):
 
 
 def _tokens_per_second_label(value: float) -> str:
-    """Format a tokens/second rate with a k or M suffix."""
+    """Format a tokens/second rate, for example ``1.42M tok/sec``."""
     if value >= 1_000_000:
         scaled = value / 1_000_000
         decimals = 1 if scaled >= 10 else 2
-        return f"{scaled:.{decimals}f}M"
-    if value >= 1_000:
-        return f"{value / 1_000:.0f}k"
-    return f"{value:.0f}"
+        number = f"{scaled:.{decimals}f}M"
+    elif value >= 1_000:
+        number = f"{value / 1_000:.0f}k"
+    else:
+        number = f"{value:.0f}"
+    return f"{number} tok/sec"
 
 
 def plot_headline(rows, destination: Path):
@@ -275,6 +277,7 @@ def plot_headline(rows, destination: Path):
                 padding=18,
                 fontsize=11,
                 color=BLUE,
+                fontstyle="italic",
             )
 
     axis.axhline(
