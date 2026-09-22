@@ -11,9 +11,9 @@ quail-b exposes this as input_tokens / input_tokens_per_second. Do not use
 per-method fresh_tokens.
 
 Each bar is that dataset's mean tokens/second divided by its mean SoL
-tokens/second. The y-axis is a log scale and runs up to 100%, so the peak
-is the SoL estimate for every dataset. SoL is a dashed line at 100%, not
-a bar.
+tokens/second. The y-axis runs from 0% to 100%, so the peak is the SoL
+estimate for every dataset. SoL is a dashed line at 100%, not a bar. The
+figure is short so the 100% line sits close to the tallest bars.
 
 The 2026-09-19 comparison marks BIO-1 and BIO-3 missing and has no BIO-4
 row. When the remake files below are in the workdir, this script fills
@@ -54,7 +54,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
-from matplotlib.ticker import FixedLocator, FuncFormatter, NullLocator
+from matplotlib.ticker import FixedLocator, FuncFormatter
 
 HERE = Path(__file__).resolve().parent
 BLUE = "#4C72B0"
@@ -69,7 +69,6 @@ QUERY_COUNTS = {"IMDB": 10, "FEV": 10, "LEP": 5, "AGENT": 2, "BIO": 4}
 EXCLUDED_SAVED_QUERIES = frozenset({"LEP-5", "LEP-6", "LEP-8"})
 CURRENT_QUERY_ID = {"LEP-7": "LEP-5"}
 BIO_REMAKE_QUERIES = ("BIO-1", "BIO-3", "BIO-4")
-Y_MIN = 1
 Y_MAX = 100
 
 
@@ -237,7 +236,7 @@ def plot_headline(rows, destination: Path):
         }
     )
 
-    figure, axis = plt.subplots(figsize=(11.8, 5.5))
+    figure, axis = plt.subplots(figsize=(11.8, 3.8))
     figure.suptitle(
         "QUAIL-B average tokens/sec relative to SoL\n"
         "Qwen3 4B FP8, one H100, scale factor 0.1",
@@ -257,9 +256,8 @@ def plot_headline(rows, destination: Path):
         ]
         containers = axis.bar(
             [position + offset for position in positions],
-            [value - Y_MIN for value in values],
+            values,
             width,
-            bottom=Y_MIN,
             color=color,
             zorder=2,
         )
@@ -299,15 +297,13 @@ def plot_headline(rows, destination: Path):
     )
 
     axis.set_xlim(-0.58, len(DATASETS) - 0.42)
-    axis.set_yscale("log")
-    axis.set_ylim(Y_MIN, Y_MAX)
+    axis.set_ylim(0, Y_MAX)
     axis.set_xticks(positions)
     axis.set_xticklabels(
         [f"{name}\n({len(by[name]['Quail'])} queries)" for name in DATASETS]
     )
-    axis.set_ylabel("Percent of SoL estimate (log scale)")
-    axis.yaxis.set_major_locator(FixedLocator([1, 10, 100]))
-    axis.yaxis.set_minor_locator(NullLocator())
+    axis.set_ylabel("Percent of SoL estimate")
+    axis.yaxis.set_major_locator(FixedLocator([0, 25, 50, 75, 100]))
     axis.yaxis.set_major_formatter(FuncFormatter(_percent_tick))
 
     axis.legend(
@@ -325,14 +321,12 @@ def plot_headline(rows, destination: Path):
             ),
         ],
         frameon=False,
-        loc="lower left",
-        bbox_to_anchor=(0.0, 1.02),
-        ncol=3,
-        borderaxespad=0.2,
+        loc="upper left",
+        borderaxespad=0.4,
         handlelength=2.2,
     )
 
-    figure.subplots_adjust(left=0.12, right=0.98, bottom=0.18, top=0.78)
+    figure.subplots_adjust(left=0.08, right=0.98, bottom=0.22, top=0.78)
     destination = Path(destination)
     figure.savefig(destination.with_suffix(".pdf"), bbox_inches="tight")
     figure.savefig(destination.with_suffix(".png"), dpi=300, bbox_inches="tight")

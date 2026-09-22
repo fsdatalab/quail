@@ -12,7 +12,7 @@ link-citations: true
 ::: {.figure-block .wide-figure}
 [![Average requested input token throughput by dataset for Quail and vLLM, as a percent of SoL.](figures/quailb_tok_per_sec.png){width=100%}](figures/quailb_tok_per_sec.pdf)
 
-*Figure 1. Average requested input tokens per second on QUAIL-B at scale factor 0.1, using Qwen3 4B FP8 on one H100, as a percent of each dataset's SoL estimate. The top of the axis is 100% of SoL. The vertical axis uses a log scale. SoL is the optimistic lower bound on runtime from GPU arithmetic and memory traffic. Each bar is the dataset's mean tokens per second divided by its mean SoL tokens per second. The label above each Quail percent is that bar's mean tokens per second. The averages use the current 31 queries. The original LEP-5, LEP-6, and LEP-8 are excluded. Dataset labels show how many queries are averaged.*
+*Figure 1. Average requested input tokens per second on QUAIL-B at scale factor 0.1, using Qwen3 4B FP8 on one H100, as a percent of each dataset's SoL estimate. The top of the axis is 100% of SoL. SoL is the optimistic lower bound on runtime from GPU arithmetic and memory traffic. Each bar is the dataset's mean tokens per second divided by its mean SoL tokens per second. The label above each Quail percent is that bar's mean tokens per second. The averages use the current 31 queries. The original LEP-5, LEP-6, and LEP-8 are excluded. Dataset labels show how many queries are averaged.*
 :::
 
 # 1. The growth of AI-powered data processing
@@ -516,7 +516,7 @@ The table below reports the 31 current QUAIL-B queries at scale factor 0.1. The 
 | LEP-5 | SoL | 900460.88 | 0 | 0.0014 |
 :::
 
-Figure 1 shows average tokens per second as a percent of each dataset's SoL estimate. For every method, we divide total requested input tokens by runtime. SoL uses the same requested-token total and its estimated runtime. Each bar divides the dataset's mean rate by that dataset's mean SoL rate. The top of the axis is 100% of SoL. The vertical axis uses a log scale. On BIO, Quail averages about 11.5 million tokens per second, which is 46.6% of the 24.7 million SoL estimate, compared with 1.4 million for vLLM, or 5.6% of SoL. vLLM is ahead on AGENT, at 48.2% of SoL compared with 20.0% for Quail. The latency figure below keeps the per-query detail.
+Figure 1 shows average tokens per second as a percent of each dataset's SoL estimate. For every method, we divide total requested input tokens by runtime. SoL uses the same requested-token total and its estimated runtime. Each bar divides the dataset's mean rate by that dataset's mean SoL rate. The top of the axis is 100% of SoL. On BIO, Quail averages about 11.5 million tokens per second, which is 46.6% of the 24.7 million SoL estimate, compared with 1.4 million for vLLM, or 5.6% of SoL. vLLM is ahead on AGENT, at 48.2% of SoL compared with 20.0% for Quail. The latency figure below keeps the per-query detail.
 
 ::: {.figure-block .wide-figure}
 [![Query latency for Quail, the vLLM baseline, and SoL estimates across the 31 default QUAIL-B queries. BIO-1 and BIO-3 are marked as not measured.](figures/quailb_latency.png){width=100%}](figures/quailb_latency.pdf)
