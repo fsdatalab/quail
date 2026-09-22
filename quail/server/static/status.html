@@ -97,6 +97,8 @@
     border-radius: .5rem;
   }
   table { width: 100%; border-collapse: collapse; font-size: .875rem; }
+  .query-table { min-width: 44rem; }
+  .result-table { min-width: 36rem; }
   td, th {
     padding: .8rem 1rem;
     border-bottom: 1px solid var(--border);
@@ -312,7 +314,8 @@ function fileLink(path, filename) {
 function renderList(items) {
   document.getElementById("title").textContent = "Queries";
   document.title = "Queries · Quail";
-  const table = el("table", {}, el("thead", {}, el("tr", {},
+  const table = el("table", { class: "query-table" },
+    el("thead", {}, el("tr", {},
     el("th", {}, "Id"), el("th", {}, "Status"),
     el("th", {}, "Created"), el("th", {}, "Rows"))), el("tbody"));
   const body = table.querySelector("tbody");
@@ -340,7 +343,7 @@ async function preview(status) {
   const response = await api(`/v1/queries/${queryId}/rows?limit=20`);
   if (!response.ok) return el("p", { class: "muted" }, "preview unavailable");
   const data = await response.json();
-  const table = el("table", {},
+  const table = el("table", { class: "result-table" },
     el("thead", {}, el("tr", {}, ...data.columns.map(c => el("th", {}, c)))),
     el("tbody"));
   const body = table.querySelector("tbody");
