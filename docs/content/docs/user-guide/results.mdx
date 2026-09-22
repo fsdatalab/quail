@@ -142,52 +142,210 @@ Other common refusals:
 ## Running a query
 
 `session.sql` compiles the statement in this process and returns a
-`Query`. `run()` executes that query on the GPU and returns a
-`QueryResult`. `query.collect()` is a shortcut that calls
-`run().collect()`. A session created with `endpoint` returns a
-`RemoteQuery` instead; that object and the saved record are on the
-[Quail Server](/docs/user-guide/server#the-objects) page.
+`Query`. Running it executes the plan on the GPU. On Modal, collect
+the rows before the function returns, because a `QueryResult` reads
+its rows when you ask for them.
 
 ```python
 result = query.run()
 ```
 
+A session created with `endpoint` returns a
+[`RemoteQuery`](/docs/user-guide/server#remotequery) from `sql()`.
+
 ### Query
 
-```python
-class Query:
-    session: Session
-    logical: LogicalPlan          # the compiled query
-    order: str | None             # predicate order, when you passed one
+A compiled query bound to the session that parsed it.
 
-    def plan() -> PhysicalPlan: ...
-    def explain(verbose=False, analyze=False) -> str: ...
-    def run(plan=None) -> QueryResult: ...
-    def collect(limit=None) -> pa.Table: ...
-    def execute_stream(limit=None) -> pa.RecordBatchReader: ...
-```
+#### Attributes
 
-`plan()` is the physical plan. Pass an edited plan to `run(plan=...)`
-to execute that plan instead of the one the planner chose. `explain()`
-prints the plan, and `explain(analyze=True)` runs the query first and
-prints the measured column beside the estimates.
+| Attribute | Description |
+| --- | --- |
+| `session` | The `Session` that compiled this query. |
+| `logical` | The compiled logical plan. |
+| `order` | Predicate order passed to `sql`, or `None` when the planner chooses the order. |
+
+#### Methods
+
+##### plan
+
+`Query.plan()`
+
+Build the physical plan. The first call plans the query. Later calls
+return that same plan.
+
+**Returns**
+
+`PhysicalPlan`. The plan the executor will run, including the model,
+the worker count, and the estimated seconds.
+
+##### explain
+
+`Query.explain(verbose=False, analyze=False)`
+
+Print the plan. The shape of the text is the one in
+[Preview the plan](#preview-the-plan) and
+[Measure the plan](#measure-the-plan).
+
+**Parameters**
+
+| Name | Description |
+| --- | --- |
+| `verbose` | When true, the text adds node ids, port connections, KV retention, and planner remarks. |
+| `analyze` | When true, run the query first and print each node's measured rows, time, and tokens beside the estimates. |
+
+**Returns**
+
+`str`.
+
+##### run
+
+`Query.run(plan=None)`
+
+Execute the query in this process.
+
+**Parameters**
+
+| Name | Description |
+| --- | --- |
+| `plan` | A `PhysicalPlan` from `plan()`, or one edited with `insert`, `remove`, or `move`. Omit it to run the planner's plan. |
+
+**Returns**
+
+`QueryResult`.
+
+##### collect
+
+`Query.collect(limit=None, batch_rows=65536)`
+
+Execute the query and return one Arrow table. This calls `run()`, then
+`QueryResult.collect`.
+
+**Parameters**
+
+| Name | Description |
+| --- | --- |
+| `limit` | Stop after this many rows. Omit it to read the full result. |
+| `batch_rows` | Rows per Arrow record batch while the table is built. The default is 65,536. |
+
+**Returns**
+
+`pyarrow.Table`.
+
+##### execute_stream
+
+`Query.execute_stream(batch_rows=65536, limit=None)`
+
+Execute the query and stream the rows.
+
+**Parameters**
+
+| Name | Description |
+| --- | --- |
+| `batch_rows` | Rows per Arrow record batch. The default is 65,536. |
+| `limit` | Stop after this many rows. |
+
+**Returns**
+
+`pyarrow.RecordBatchReader`.
 
 ### QueryResult
 
-```python
-class QueryResult:
-    schema: pa.Schema              # output column schema
-    report: dict                   # execution metrics
-    plan: PhysicalPlan             # the executed physical plan
+The rows of a finished query, plus the report and the answer tables.
+The rows stay unread until `collect`, `to_rows`, or `execute_stream`
+asks for them.
 
-    def collect(limit=None) -> pa.Table: ...
-    def to_rows(limit=None) -> list[tuple]: ...
-    def count() -> int: ...        # len(result) also works
-    def execute_stream() -> pa.RecordBatchReader: ...
-```
+#### Attributes
 
-If you are on Modal, collect the rows before returning from the
-function.
+| Attribute | Description |
+| --- | --- |
+| `schema` | Arrow schema of the output columns. |
+| `columns` | Output column names, in order. |
+| `report` | Execution metrics. The fields are on the [Metrics](/docs/user-guide/metrics) page. |
+| `plan` | The physical plan that ran. `None` until a plan was executed and decoded. |
+| `node_metrics` | Measured metrics keyed by node id. |
+| `answer_tables` | Per-predicate Arrow tables. `filters` is keyed by `(alias, position)`. `joins` is keyed by the join's position in the query text. |
+
+#### Methods
+
+##### collect
+
+`QueryResult.collect(limit=None, batch_rows=65536)`
+
+Read the result into one Arrow table.
+
+**Parameters**
+
+| Name | Description |
+| --- | --- |
+| `limit` | Stop after this many rows. A limit already set on the result is also applied. |
+| `batch_rows` | Rows per record batch while the table is read. The default is 65,536. |
+
+**Returns**
+
+`pyarrow.Table`.
+
+##### execute_stream
+
+`QueryResult.execute_stream(batch_rows=65536, limit=None)`
+
+Stream the result as Arrow record batches.
+
+**Parameters**
+
+| Name | Description |
+| --- | --- |
+| `batch_rows` | Rows per record batch. The default is 65,536. |
+| `limit` | Stop after this many rows. |
+
+**Returns**
+
+`pyarrow.RecordBatchReader`.
+
+##### to_rows
+
+`QueryResult.to_rows(limit=None)`
+
+Read the result as a list of tuples, one tuple per row, in column
+order.
+
+**Parameters**
+
+| Name | Description |
+| --- | --- |
+| `limit` | Stop after this many rows. |
+
+**Returns**
+
+`list[tuple]`.
+
+##### count
+
+`QueryResult.count()`
+
+Return the number of rows. `len(result)` calls this.
+
+**Returns**
+
+`int`.
+
+##### explain
+
+`QueryResult.explain(verbose=False)`
+
+Print the executed plan with measured rows and time beside the
+operators.
+
+**Parameters**
+
+| Name | Description |
+| --- | --- |
+| `verbose` | When true, include every measured field of each node, including KV hits, KV misses, and GPU seconds. |
+
+**Returns**
+
+`str`. The text is `no physical plan was executed` when `plan` is
+`None`.
 
 ### Execution report
 

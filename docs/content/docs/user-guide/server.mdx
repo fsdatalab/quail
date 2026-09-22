@@ -109,15 +109,8 @@ with quail.Session(config=config, endpoint="http://127.0.0.1:8642") as session:
     table = result.collect()
 ```
 
-`session.sql` returns a `RemoteQuery`, which holds the SQL until the
-server compiles it. `run()` submits that query and waits until the
-saved result is ready, then returns a `QueryResult`. `collect()`
-waits the same way and returns one Arrow table. `execute_stream()` waits, then streams the
-result back as Arrow record batches. The server decides how many
-rows go in each batch, so a `batch_rows` argument is ignored.
-`limit` stops the stream after that many rows.
-
-The client talks HTTP with the Python standard library and reads the
+`sql()` returns a [`RemoteQuery`](#remotequery). The client talks
+HTTP with the Python standard library and reads the
 batches with pyarrow. The `server` extra is only required on the
 machine that runs `quail-server`. `Session` has no argument for the
 token. When the server requires one, set `QUAIL_SERVER_TOKEN` where
@@ -165,18 +158,9 @@ with quail.Session(config=config, endpoint=endpoint) as session:
     result = run.result()
 ```
 
-`status()` returns a `QueryStatus`, the saved record: the state, a
-`revision` that increases on every write, the latest progress, the
-plan text once planning has finished, any error, and the submission
-itself. The fields on these objects are below.
-`watch()` yields the current record and then each newer revision
-until the query is finished. The default poll is 30 seconds, so a
-progress update that was replaced before the next poll is skipped.
-`result()` waits for a terminal state and returns the `QueryResult`.
-If the record ended `failed`, `interrupted`, or `cancelled`, it
-raises `QueryFailedError`, and the exception carries the saved
-status. `stream_result()` waits the same way and then streams the
-rows as Arrow record batches.
+The loop in the example is `QueryRun.watch`, documented with the
+[other methods](#queryrun). The record it yields is a
+[`QueryStatus`](#querystatus).
 
 `cancel()` removes a queued query immediately. On a query that is
 already running, it kills the process that has the model loaded, and
@@ -210,97 +194,324 @@ runs past the limit ends `failed` with error type `TimeoutError`,
 and the model process is killed the same way as on cancel. A limit
 above `--max-timeout` is rejected when you submit.
 
-## The objects
+## RemoteQuery
 
-A session with `endpoint` and a session without one return different
-objects from `sql()`. On the server, `sql()` returns a `RemoteQuery`.
-It keeps the SQL text, the dialect, and the predicate order you
-passed, and the server compiles and plans that text when the query
-runs. A local session returns a `Query`, described under
-[Running a query](/docs/user-guide/results#running-a-query).
+`session.sql` on a server session returns a `RemoteQuery`. It holds
+the statement text. The server compiles and plans that text when the
+query runs. A local session returns a
+[`Query`](/docs/user-guide/results#query) instead. After you submit,
+the plan text is on the record at `QueryStatus.plan["text"]`.
 
-```python
-class RemoteQuery:
-    sql: str
-    dialect: str                 # "bq" or "snowflake"
-    order: str | None            # the order passed to sql(), if any
+#### Attributes
 
-    def submit(query_id=None, timeout_s=None) -> QueryRun: ...
-    def run(timeout_s=None) -> QueryResult: ...
-    def collect(limit=None) -> pa.Table: ...
-    def execute_stream(limit=None) -> pa.RecordBatchReader: ...
-```
+| Attribute | Description |
+| --- | --- |
+| `session` | The `Session` that created this query. |
+| `sql` | The statement text. |
+| `dialect` | `bq` or `snowflake`. |
+| `order` | Predicate order passed to `sql`, or `None`. |
 
-`submit()` returns a `QueryRun`, a handle to the record the server
-accepted. `session.get_run(query_id)` returns a handle to a record
-the server already has. `explain()` and `plan()` stay on a local
-`Query`. After you submit, read the plan from
-`status().plan["text"]`.
+#### Methods
 
-```python
-class QueryRun:
-    id: str                      # the query id
+##### submit
 
-    def status() -> QueryStatus: ...
-    def watch(poll_s=30) -> Iterator[QueryStatus]: ...
-    def result() -> QueryResult: ...
-    def stream_result() -> pa.RecordBatchReader: ...
-    def cancel() -> QueryStatus: ...
-    def answers(after=0, limit=1000) -> dict: ...
-    def stream_answers() -> Iterator[dict]: ...
-```
+`RemoteQuery.submit(query_id=None, timeout_s=None)`
 
-The saved record is a `QueryStatus`. `status()`, `watch()`, and
-`GET /v1/queries/{id}` all return this snapshot. Every write replaces
-it and increases `revision`.
+Send the query to the server and return once the record is saved. The
+query keeps running if the client disconnects. Submitting the same
+`query_id` with the same statement, engine config, inputs, and timeout
+returns the existing run. The same id with a different submission is
+HTTP 409, `QueryIdConflictError`.
 
-```python
-class QueryStatus:
-    id: str
-    state: str                   # queued, planning, running, or an ending state
-    revision: int
-    created_at: float            # unix seconds
-    updated_at: float
-    started_at: float | None     # set when the record leaves queued
-    timeout_s: float
-    session_id: str | None
-    cancel_requested: bool
-    spec: dict                   # the SQL submission
-    config: dict                 # model, device, gpus, backend
-    inputs: dict                 # table name to the stored input
-    progress: dict | None
-    plan: dict | None
-    error: dict | None
-    result: dict | None
+**Parameters**
 
-    done: bool                   # state is an ending state
-```
+| Name | Description |
+| --- | --- |
+| `query_id` | Name of the run. Omit it and the client picks a random id. An id is 1 to 128 characters: a letter or digit, then letters, digits, `.`, `_`, `:`, or `-`. |
+| `timeout_s` | Execution limit in seconds, starting when the query leaves the queue. Omit it to use the server's `--default-timeout`. A value above `--max-timeout` is rejected. |
 
-`spec` is the text you submitted: `sql`, `dialect`, and `order`.
-`config` is the engine config from the session: `model`, `device`,
-`gpus`, and `backend`. `inputs` maps each registered name to the
-description the server stored. A snapshot has `kind` `"snapshot"`,
-`content_id` (the SHA-256 of the Arrow file), `id_col`, and
-`columns`. A Hugging Face dataset has `kind` `"hf"`, `dataset`,
-`config`, `split`, `revision`, and `id_col`.
+**Returns**
 
-`progress` is the latest count the engine reported: `label`, `done`,
-`total`, `unit`, and `recorded_at`, plus `answers_saved`, the number
-of answer entries stored so far. `plan` is filled in once planning
-has finished. `text` is the plan printout, `estimated_seconds` is the
-planner's estimate, and `backend` and `workers` say how it will run.
-`envelope` is that same plan encoded for the executor.
+`QueryRun`.
 
-`error` is set when the record ends `failed`, `interrupted`, or
-`cancelled`. It has `type` and `message`. An error raised inside the
-executor also has `traceback`. `result` is set when the record is
-`succeeded`. It has `rows`, `columns`, and `files`. `files["result"]`
-is the Arrow file of output rows, `files["report"]` is the execution
-report, and `files["answers"]` lists the saved answer tables. A
-filter entry has `alias`, `position`, and `file`. A join entry has
-`position` and `file`. `QueryRun.result()` reads those files and
-returns the same `QueryResult` a local query returns. Its fields are
-under [QueryResult](/docs/user-guide/results#queryresult).
+##### run
+
+`RemoteQuery.run(timeout_s=None)`
+
+Submit the query, wait until the saved result is ready, and return it.
+A record that ended `failed`, `interrupted`, or `cancelled` raises
+`QueryFailedError`. The exception carries the saved status.
+
+**Parameters**
+
+| Name | Description |
+| --- | --- |
+| `timeout_s` | Passed through to `submit`. |
+
+**Returns**
+
+[`QueryResult`](/docs/user-guide/results#queryresult).
+
+##### collect
+
+`RemoteQuery.collect(limit=None, batch_rows=65536)`
+
+Submit the query, wait, and return one Arrow table.
+
+**Parameters**
+
+| Name | Description |
+| --- | --- |
+| `limit` | Stop after this many rows. |
+| `batch_rows` | Accepted so the call matches a local `Query`. The server chooses the batch size, and this argument is ignored. |
+
+**Returns**
+
+`pyarrow.Table`.
+
+##### execute_stream
+
+`RemoteQuery.execute_stream(batch_rows=65536, limit=None)`
+
+Submit the query, wait, and stream the rows.
+
+**Parameters**
+
+| Name | Description |
+| --- | --- |
+| `batch_rows` | Accepted so the call matches a local `Query`. The server chooses the batch size, and this argument is ignored. |
+| `limit` | Stop after this many rows. |
+
+**Returns**
+
+`pyarrow.RecordBatchReader`.
+
+## QueryRun
+
+A handle to one record the server has accepted. `submit` returns one.
+`session.get_run(query_id)` returns a handle to a record that is
+already there.
+
+#### Attributes
+
+| Attribute | Description |
+| --- | --- |
+| `id` | The query id. |
+
+#### Methods
+
+##### status
+
+`QueryRun.status()`
+
+Read the current saved record.
+
+**Returns**
+
+`QueryStatus`.
+
+##### watch
+
+`QueryRun.watch(poll_s=30)`
+
+Yield the current record, then each newer revision, until the query
+is finished. The default poll is 30 seconds, so a progress update
+that was replaced before the next poll is skipped. A lost connection
+raises `ServerError`. Calling `watch` again continues from the record
+as it stands then.
+
+**Parameters**
+
+| Name | Description |
+| --- | --- |
+| `poll_s` | Seconds to hold each long-poll open. The server stops the hold at 60 seconds. |
+
+**Returns**
+
+An iterator of `QueryStatus`.
+
+##### result
+
+`QueryRun.result(poll_s=30)`
+
+Wait until the record is finished and return the saved rows. A record
+that ended `failed`, `interrupted`, or `cancelled` raises
+`QueryFailedError`, and the exception carries the saved status.
+
+**Parameters**
+
+| Name | Description |
+| --- | --- |
+| `poll_s` | Seconds between polls while waiting. The default is 30. |
+
+**Returns**
+
+[`QueryResult`](/docs/user-guide/results#queryresult), built from the
+saved Arrow files and the report.
+
+##### stream_result
+
+`QueryRun.stream_result(poll_s=30)`
+
+Wait until the record is finished, then stream the rows. The failure
+behavior matches `result`.
+
+**Parameters**
+
+| Name | Description |
+| --- | --- |
+| `poll_s` | Seconds between polls while waiting. The default is 30. |
+
+**Returns**
+
+`pyarrow.RecordBatchReader`. The server chooses the batch size.
+
+##### cancel
+
+`QueryRun.cancel()`
+
+Ask the server to stop this query. A queued query ends immediately.
+A query that is already running has its model process killed, and the
+record ends `cancelled`. The next query loads the model again.
+
+**Returns**
+
+`QueryStatus`. The snapshot after the cancel request.
+
+##### answers
+
+`QueryRun.answers(after=0, limit=1000)`
+
+Return answer entries saved so far, starting at entry `after`. The
+entry shapes are in [Answers while the query runs](#answers-while-the-query-runs).
+
+**Parameters**
+
+| Name | Description |
+| --- | --- |
+| `after` | First entry index to return. |
+| `limit` | Maximum entries in this page. The default is 1,000 and the server stops at 10,000. |
+
+**Returns**
+
+A dict with `answers` (the entries), `next` (the index to pass as
+`after` on the next call), and `done` (whether more entries can still
+arrive).
+
+##### stream_answers
+
+`QueryRun.stream_answers(poll_s=30)`
+
+Yield each saved answer entry in order. The iterator returns when the
+query is finished and every saved entry has been yielded.
+
+**Parameters**
+
+| Name | Description |
+| --- | --- |
+| `poll_s` | Seconds between polls. The default is 30. |
+
+**Returns**
+
+An iterator of answer dicts.
+
+## QueryStatus
+
+One saved snapshot of a query record. `status`, `watch`, and
+`GET /v1/queries/{id}` return this object. Every write replaces the
+snapshot and increases `revision`. A record in `succeeded`, `failed`,
+`interrupted`, or `cancelled` stays as it is. The server writes
+`succeeded` only after it has opened the saved result, the report,
+and the answer tables again and checked the result's row count.
+
+#### Attributes
+
+| Attribute | Description |
+| --- | --- |
+| `id` | The query id. |
+| `state` | `queued`, `planning`, `running`, `succeeded`, `failed`, `interrupted`, or `cancelled`. |
+| `revision` | Integer that increases on every write. |
+| `created_at` | Unix seconds when the record was saved. |
+| `updated_at` | Unix seconds of the latest write. |
+| `started_at` | Unix seconds when the record left `queued`, or `None` while it is still queued. |
+| `timeout_s` | Execution limit in seconds. |
+| `session_id` | The client session that submitted the record, or `None`. |
+| `cancel_requested` | True after a cancel request has been recorded. |
+| `spec` | The SQL submission. Keys are below. |
+| `config` | The engine config. Keys are below. |
+| `inputs` | Registered table name to the stored input description. Shapes are below. |
+| `progress` | The latest engine count, or `None` before the first one. Keys are below. |
+| `plan` | The plan, or `None` until planning has finished. Keys are below. |
+| `error` | The error, or `None` unless the record ended `failed`, `interrupted`, or `cancelled`. Keys are below. |
+| `result` | The result manifest, or `None` until the record is `succeeded`. Keys are below. |
+| `done` | True when `state` is an ending state. |
+
+##### spec
+
+| Key | Description |
+| --- | --- |
+| `sql` | The statement text. |
+| `dialect` | `bq` or `snowflake`. |
+| `order` | Predicate order, or null. |
+
+##### config
+
+| Key | Description |
+| --- | --- |
+| `model` | Model name from `EngineConfig`. |
+| `device` | Device name from `EngineConfig`. |
+| `gpus` | GPU count. |
+| `backend` | Backend name. The default submission sends `quail`. |
+
+##### inputs
+
+Each value is one registered table.
+
+A snapshot has `kind` `"snapshot"`, `content_id` (the SHA-256 of the
+Arrow file), `id_col`, and `columns`.
+
+A Hugging Face dataset has `kind` `"hf"`, `dataset`, `config`,
+`split`, `revision`, and `id_col`.
+
+##### progress
+
+| Key | Description |
+| --- | --- |
+| `label` | What the engine is counting. |
+| `done` | How many units have finished. |
+| `total` | How many units were expected, or null when the total is open. |
+| `unit` | The unit, such as `documents`, `scores`, or `anchors`. |
+| `recorded_at` | Unix seconds of this count. |
+| `answers_saved` | How many answer entries are stored. |
+
+##### plan
+
+| Key | Description |
+| --- | --- |
+| `text` | The plan printout. |
+| `estimated_seconds` | The planner's time estimate. |
+| `backend` | Backend that will run the plan. |
+| `workers` | Worker count. |
+| `envelope` | The same plan encoded for the executor. |
+
+##### error
+
+| Key | Description |
+| --- | --- |
+| `type` | Exception name, such as `TimeoutError`, `Cancelled`, or `Interrupted`. |
+| `message` | The error text. |
+| `traceback` | Present when the executor raised. |
+
+##### result
+
+| Key | Description |
+| --- | --- |
+| `rows` | Row count of the output file. |
+| `columns` | Output column names. |
+| `files.result` | Relative path of the Arrow file of output rows. |
+| `files.report` | Relative path of the execution report. |
+| `files.answers.filters` | Filter answer tables. Each entry has `alias`, `position`, and `file`. |
+| `files.answers.joins` | Join answer tables. Each entry has `position` and `file`. |
 
 ## Answers while the query runs
 
@@ -344,10 +555,10 @@ document text is in those tables and in the final result.
 The server compiles and plans the query as part of running it, so
 the plan is ready once the record has left `planning`. Read it from
 `run.status().plan["text"]` after you submit. Write the query in
-SQL. A remote session runs the plan the server chose; `explain()`,
-`plan()`, `run(plan=...)`, and the Python builder `session.docs`
-belong to a local session, where this process is the one planning
-the query.
+SQL. The server runs the plan it chose. Planning the query in this
+process, before it runs, is what a local
+[`Query`](/docs/user-guide/results#query) does. The Python builder
+is part of that same local session.
 
 ## In the browser
 
