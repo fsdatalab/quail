@@ -1494,11 +1494,11 @@ queries.</p>
 <div class="figure-block wide-figure">
 <p><a href="figures/quailb_filter_submission.pdf"><img
 src="figures/quailb_filter_submission.png" style="width:100.0%"
-alt="Stock and pipelined vLLM latency on the eight QUAIL-B queries with multi-filter chains, with SoL estimates." /></a></p>
-<p><em>Figure 9. Stock vLLM finishes one complete filter stage before
-submitting the next. Pipelined vLLM advances each passing document
-immediately. Labels show stock time divided by pipelined time.
-Horizontal lines show SoL estimates.</em></p>
+alt="Stock and pipelined vLLM requested input token throughput relative to SoL on the eight QUAIL-B queries with multi-filter chains." /></a></p>
+<p><em>Figure 9. Requested input tokens per second as a percent of each
+query’s SoL estimate. Stock vLLM finishes one complete filter stage
+before submitting the next. Pipelined vLLM advances each passing
+document immediately. The dashed line marks 100% of SoL.</em></p>
 </div>
 <p>Pipelining reduces latency on seven of the eight queries. The mean
 stock-to-pipelined ratio is 1.12 times. The largest change is IMDB-6,

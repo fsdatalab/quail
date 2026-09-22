@@ -43,6 +43,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
+from matplotlib.ticker import FixedLocator, FuncFormatter, NullLocator
 from quailb_results import PIPELINE_QUERIES, QUERY_ORDER, load_results
 
 HERE = Path(__file__).resolve().parent
@@ -140,7 +141,7 @@ def plot_aggregate(workdir):
 
 
 def plot_filter_submission(workdir):
-    """Compare vLLM filter submission strategies where they differ."""
+    """Compare vLLM throughput relative to SoL where submission differs."""
     rows, sol = load_results(workdir)
     figure, axis = plt.subplots(figsize=(12.5, 5.8))
     positions = list(range(len(PIPELINE_QUERIES)))
@@ -150,61 +151,67 @@ def plot_filter_submission(workdir):
         ("pipelined_vllm", "Pipelined vLLM", TEAL, width / 2),
     )
     for method, _, color, offset in methods:
-        values = [rows[method][query]["runtime_s"] for query in PIPELINE_QUERIES]
-        axis.bar(
+        values = []
+        for query in PIPELINE_QUERIES:
+            measured_rate = rows[method][query]["input_tokens_per_second"]
+            estimate = sol[query]
+            sol_rate = estimate["input_tokens"] / estimate["runtime_s"]
+            values.append(100 * measured_rate / sol_rate)
+        containers = axis.bar(
             [position + offset for position in positions],
-            values,
+            [value - 1 for value in values],
             width,
+            bottom=1,
             color=color,
             zorder=2,
         )
-    for position, query in zip(positions, PIPELINE_QUERIES):
-        axis.hlines(
-            sol[query]["runtime_s"],
-            position - 0.42,
-            position + 0.42,
-            color=DARK,
-            linewidth=1.6,
-            zorder=3,
+        axis.bar_label(
+            containers,
+            labels=[f"{value:.1f}%" for value in values],
+            padding=3,
+            fontsize=9,
         )
-        stock = rows["stock_vllm"][query]["runtime_s"]
-        pipelined = rows["pipelined_vllm"][query]["runtime_s"]
-        axis.annotate(
-            f"{stock / pipelined:.2f}×",
-            (position, max(stock, pipelined)),
-            xytext=(0, 5),
-            textcoords="offset points",
-            ha="center",
-            va="bottom",
-            fontsize=10,
-        )
+    axis.axhline(
+        100,
+        color=DARK,
+        linewidth=1.6,
+        linestyle="--",
+        dash_capstyle="butt",
+        zorder=3,
+    )
     axis.set_yscale("log")
-    axis.set_ylabel("seconds (log scale)")
+    axis.set_ylim(1, 100)
+    axis.set_ylabel("Percent of SoL estimate (log scale)")
+    axis.yaxis.set_major_locator(FixedLocator([1, 10, 100]))
+    axis.yaxis.set_minor_locator(NullLocator())
+    axis.yaxis.set_major_formatter(
+        FuncFormatter(lambda value, _position: f"{value:.0f}%")
+    )
     axis.set_xticks(positions, PIPELINE_QUERIES)
     axis.set_xlim(-0.65, len(PIPELINE_QUERIES) - 0.35)
     axis.set_title(
-        "vLLM filter submission on multi-filter chains\n"
+        "vLLM tokens/sec relative to SoL on multi-filter chains\n"
         "Qwen3 4B FP8, one H100, scale factor 0.1"
     )
     axis.legend(
         handles=[
             Patch(facecolor=ORANGE, label="Stock vLLM"),
             Patch(facecolor=TEAL, label="Pipelined vLLM"),
-            Line2D([0], [0], color=DARK, linewidth=1.6, label="SoL estimate"),
+            Line2D(
+                [0],
+                [0],
+                color=DARK,
+                linewidth=1.6,
+                linestyle="--",
+                label="SoL estimate",
+            ),
         ],
         loc="upper center",
         bbox_to_anchor=(0.5, -0.17),
         ncol=3,
         frameon=False,
     )
-    figure.text(
-        0.08,
-        0.015,
-        "Labels are stock time divided by pipelined time. "
-        "Only queries with multiple filters on one document stream are shown.",
-        fontsize=10,
-    )
-    figure.subplots_adjust(bottom=0.27, left=0.09, right=0.98, top=0.82)
+    figure.subplots_adjust(bottom=0.22, left=0.10, right=0.98, top=0.82)
     destination = HERE / "figures" / "quailb_filter_submission"
     figure.savefig(destination.with_suffix(".pdf"), bbox_inches="tight")
     figure.savefig(destination.with_suffix(".png"), dpi=300, bbox_inches="tight")

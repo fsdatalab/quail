@@ -486,9 +486,9 @@ The 31 Quail runs take 1,700.68 seconds in total, compared with 4,563.75 seconds
 The two vLLM submission strategies differ only when multiple filters apply to the same document stream. Figure 9 therefore shows those eight queries instead of repeating two equivalent vLLM bars on all 31 queries.
 
 ::: {.figure-block .wide-figure}
-[![Stock and pipelined vLLM latency on the eight QUAIL-B queries with multi-filter chains, with SoL estimates.](figures/quailb_filter_submission.png){width=100%}](figures/quailb_filter_submission.pdf)
+[![Stock and pipelined vLLM requested input token throughput relative to SoL on the eight QUAIL-B queries with multi-filter chains.](figures/quailb_filter_submission.png){width=100%}](figures/quailb_filter_submission.pdf)
 
-*Figure 9. Stock vLLM finishes one complete filter stage before submitting the next. Pipelined vLLM advances each passing document immediately. Labels show stock time divided by pipelined time. Horizontal lines show SoL estimates.*
+*Figure 9. Requested input tokens per second as a percent of each query's SoL estimate. Stock vLLM finishes one complete filter stage before submitting the next. Pipelined vLLM advances each passing document immediately. The dashed line marks 100% of SoL.*
 :::
 
 Pipelining reduces latency on seven of the eight queries. The mean stock-to-pipelined ratio is 1.12 times. The largest change is IMDB-6, where pipelined vLLM is 1.27 times faster. FEV-6 differs by less than 1%, and the two LePaRD queries differ by about 1%.
