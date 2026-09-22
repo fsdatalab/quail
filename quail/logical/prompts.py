@@ -132,11 +132,6 @@ def filter_question_text(prompt) -> str:
     return prompt.tail[len("{0}"):]
 
 
-def render_filter_prompt_text(prompt, document: str) -> str:
-    """Render the complete canonical text for one filter document."""
-    return prompt.preamble + document + filter_question_text(prompt)
-
-
 def render_filter_prompt_ids(prompt, document_ids, tokenizer) -> list:
     """The complete canonical token ids for one filter document."""
     return (list(tokenizer(prompt.preamble)) + list(document_ids)
