@@ -48,41 +48,6 @@ We call this query BIO-4 in [QUAIL-B](https://github.com/fsdatalab/quail-bench),
 *Figure 2. The BIO-4 plan filters all three inputs before the joins. Both joins use the medical report as the anchor.*
 :::
 
-[^biodex]: The query is based on the [BioDEX dataset](https://aclanthology.org/2023.findings-emnlp.896/).
-
-[^bio4-sql]: The SQL form of BIO-4 is shown below.
-
-    ```sql
-    SELECT r.id,
-           n.id AS neurological_reaction_id,
-           c.id AS cardiovascular_reaction_id
-    FROM reports AS r
-    JOIN reaction_terms AS n
-      ON AI.IF(PROMPT(
-           'Does the medical report in {0} describe the reaction in {1} as something the patient experienced?',
-           r.report,
-           n.term
-         ))
-    JOIN reaction_terms AS c
-      ON AI.IF(PROMPT(
-           'Does the medical report in {0} describe the reaction in {1} as something the patient experienced?',
-           r.report,
-           c.term
-         ))
-    WHERE AI.IF(PROMPT(
-            'Does {0} describe a serious or life-threatening adverse event?',
-            r.report
-          ))
-      AND AI.IF(PROMPT(
-            'Is this reaction neurological, affecting the nervous system? {0}',
-            n.term
-          ))
-      AND AI.IF(PROMPT(
-            'Is this reaction cardiovascular, affecting the heart or blood vessels? {0}',
-            c.term
-          ));
-    ```
-
 To execute the plan with vLLM, we render one prompt for each filter input and one prompt for each candidate report and reaction pair. We submit every prompt as a separate inference request. We place the document text at the beginning of each prompt, followed by the instruction from the AI-SQL operator. For each join, we place the much longer medical report first as the *anchor* and the reaction term second as the *partner*. This order maximizes reuse of the prefix's key and value state (KV) across join prompts.
 
 **A cost estimate for the query plan.** Before measuring the vLLM baseline, we estimate the lowest possible runtime for the same plan. We count the model's arithmetic work and HBM traffic from the token lengths, then use a [roofline model](https://modal.com/gpu-glossary/perf/roofline-model) to estimate the time. The estimate uses the saved reference answers to determine which rows survive each stage. It assumes peak GPU throughput, full overlap between CPU and GPU work, and unlimited space for retained KV. No implementation can meet all of these assumptions, so this optimistic lower bound is our *speed of light estimate*, or SoL. For BIO-4 at scale factor 1.0, the SoL estimate is 894.37 seconds, or 14.91 minutes.[^mfu] The [implementation in Quail](https://github.com/fsdatalab/quail-exploration/blob/0d24478a82100b518d6110f5c1c8cec0c26c6487/quail/planner/sol.py) contains the full calculation.
@@ -104,10 +69,6 @@ BIO-4 turns its joins into separate requests for every candidate report and reac
 The corresponding Quail timeline appears with the BIO-4 experiments in Section 4.3.
 
 The second problem is *KV regret*: the model processes tokens again after their reusable KV has been evicted. On BIO-4, the vLLM baseline recomputes 50.3 million KV tokens (out of 174.6 million fresh input tokens).
-
-[^host-overhead]: Modal provides useful background on [GPU utilization](https://modal.com/blog/gpu-utilization-guide) and [host overhead](https://modal.com/blog/host-overhead-inference-efficiency) in inference engines.
-
-[^mfu]: The speed of light estimate assumes 100 percent model FLOP/s utilization (MFU), so every forward pass sustains peak GPU arithmetic throughput. Real systems cannot reach that rate, but higher MFU still helps. We do not yet measure Quail's MFU.
 
 We can, and we should, reduce both sources of waste by optimizing inference for AI-SQL.
 
@@ -222,11 +183,7 @@ GPU cost, including startup: $0.3675
 
 The full run costs $0.3675 at [Modal's H100 price](https://modal.com/pricing), including model startup.[^imdb-disk]
 
-[^imdb-disk]: The IMDB dataset was already on disk, so the measurement excludes the time and cost of downloading it.
-
 **Comparing with GPT-5 nano.** At current GPT-5 nano prices, the same two-filter workload would cost about $1.7470, or **4.8 times the measured Quail cost!**[^gpt5-nano-cost] Qwen3 4B and GPT-5 nano may not return the same answers, so the cost of reaching the same answer quality could be different.
-
-[^gpt5-nano-cost]: As of September 2026, [OpenAI lists GPT-5 nano](https://developers.openai.com/api/docs/models/gpt-5-nano) at $0.05 per million input tokens, $0.005 per million cached input tokens, and $0.40 per million output tokens. The estimate applies the regular rate to 32.50 million input tokens, the cached rate to 8.41 million document tokens reused by the second filter, and the output rate to 200,000 tokens. We assume an infinite cache, so every reusable document token receives the cached rate.
 
 **Running on Modal.** If you don't have a dedicated GPU, you can put the whole query inside a Modal GPU function. The function creates a normal Quail session and runs it:
 
@@ -341,8 +298,6 @@ Figure 5 shows how these components work together.
 
 **Physical plan executor.** Quail uses a pull-based executor, as in [Volcano](https://doi.org/10.1109/69.273032), but processes a batch at a time, as in [MonetDB](https://www.cidrdb.org/cidr2005/papers/P19.pdf). Before execution, Quail tokenizes every document column referenced by an AI filter or join with [Gigatoken](https://github.com/marcelroed/gigatoken)[^gigatoken], then loads one model copy per GPU. Below, we explain how Quail reuses parts of vLLM without running vLLM's request scheduler or KV manager. During execution, the CPU prepares one input batch while the GPU processes another.
 
-[^gigatoken]: Marcel Rød built the fast [Gigatoken](https://github.com/marcelroed/gigatoken) tokenizer.
-
 **KV manager.** Each GPU has a fixed pool of KV pages in HBM. After each model evaluation, Quail retains only the KV that a later evaluation can reuse. For a filter, Quail places the document before the predicate-specific question. After the predicate returns `TRUE` or `FALSE`, Quail discards the question KV and rewinds to the end of the document KV. If the predicate returns `TRUE` and another AI operator uses the document, Quail retains the document KV. Otherwise, Quail releases it. For a join, Quail retains the KV for the anchor document and the shared join prompt while it evaluates the partner documents. After evaluating the join predicate for one partner, Quail discards the partner-specific KV and reuses the anchor KV for the next partner. After the last partner, Quail releases the anchor KV unless a later join can reuse it.
 
 **Using multiple GPUs.** Our current multi-GPU support is simple. Quail supports models that fit on one H100, so we place one complete model copy and one KV pool on each GPU. We partition filter documents and join anchors across the GPUs, run them independently, and combine the results on the CPU.
@@ -365,11 +320,7 @@ During planning, Quail chooses which documents or document pairs require model e
 
 **First, fuse small operations.** We write [Triton](https://triton-lang.org/) kernels that fuse normalization with FP8 quantization, Q/K normalization with RoPE, and activation with FP8 quantization. By fusing these operations, Quail reduces kernel launches and intermediate HBM traffic.[^sail-mfu]
 
-[^sail-mfu]: Kernel fusion can substantially improve prefill MFU. In ["Chasing Speed of Light on TPU v6e"](https://www.sailresearch.com/blog/tpu-v6e-gemma), Sail Research reports increasing Gemma 4 31B prefill MFU from about 32 percent to 63 percent through several optimizations, including folding activation, normalization, and RoPE work into surrounding kernels.
-
 **Second, specialize attention for joins.** An AI join evaluates the sequences `(anchor, partner 1)`, `(anchor, partner 2)`, and so on. Quail computes the anchor keys and values (KV) once and keeps them in GPU memory. Without specialized attention, Quail would still process every `anchor + partner` pair as a separate attention sequence and reread the *same* anchor KV for every partner. Quail instead splits attention into two calls. First, Quail calls [FlashAttention 3](https://arxiv.org/abs/2407.08608) once across the batch to compute causal attention separately within every partner suffix. Second, Quail groups all suffix queries for one anchor and calls FlashAttention 3 once against that anchor's cached KV. By grouping the suffix queries, Quail reduces repeated reads of the anchor KV. Quail uses the two calls' log-sum-exp values and the [online softmax formula](https://arxiv.org/abs/1805.02867) to combine their outputs into the same result as one attention call over the full `anchor + partner` sequence.[^hydragen] Note that Quail runs attention in BF16, while the downstream output projection expects FP8 input. Quail therefore uses one Triton kernel to merge the two attention outputs and quantize the merged output to FP8.
-
-[^hydragen]: Quail uses one level of tree attention: it computes attention over the shared prefix and each unique suffix separately, then combines the results using their log-sum-exp values. The [Hydragen](https://arxiv.org/abs/2402.05099) authors use the same decomposition and extend it to tree-based prompt sharing. They focus mainly on decode, while Quail applies the decomposition during prefill.
 
 ::: {.figure-block}
 [![One attention step for a join.](figures/join-attention-step.svg){width=100%}](figures/join-attention-step.svg)
@@ -378,8 +329,6 @@ During planning, Quail chooses which documents or document pairs require model e
 :::
 
 **Third, restrict the output head to `TRUE` and `FALSE`.** Normally, a model would use its final output head to compute a score for every token in its vocabulary. For AI filters and joins, Quail needs only the scores for token IDs that represent `TRUE` or `FALSE`.[^answer-token-ids] Quail therefore multiplies the final hidden state by only the corresponding rows of the output-head matrix. By using the smaller matrix, Quail reduces computation and GPU memory use.
-
-[^answer-token-ids]: One might expect two token IDs, one for each answer. In Qwen, Quail accepts eight token IDs: four for `TRUE` and four for `FALSE`.
 
 # 4. Evaluation
 
@@ -615,3 +564,54 @@ We are actively working on Quail, and we are excited about many directions. Here
 **Use proxy models for query planner hints.** Proxy models need not be limited to evaluating predicates during execution. They could also provide planner hints. For example, a proxy model could predict which documents will pass filters, helping with filter ordering and KV retention. Errors in the proxy model would not affect query accuracy, which is nice.
 
 More blog posts, and eventually a technical report, are coming soon. For now, please try Quail out! And if any of the ideas above sound interesting, apply to a Computer Science PhD program at Carnegie Mellon! If you are an undergraduate or master's student, or are looking for a postdoc, please reach out.
+
+[^biodex]: The query is based on the [BioDEX dataset](https://aclanthology.org/2023.findings-emnlp.896/).
+
+[^bio4-sql]: The SQL form of BIO-4 is shown below.
+
+    ```sql
+    SELECT r.id,
+           n.id AS neurological_reaction_id,
+           c.id AS cardiovascular_reaction_id
+    FROM reports AS r
+    JOIN reaction_terms AS n
+      ON AI.IF(PROMPT(
+           'Does the medical report in {0} describe the reaction in {1} as something the patient experienced?',
+           r.report,
+           n.term
+         ))
+    JOIN reaction_terms AS c
+      ON AI.IF(PROMPT(
+           'Does the medical report in {0} describe the reaction in {1} as something the patient experienced?',
+           r.report,
+           c.term
+         ))
+    WHERE AI.IF(PROMPT(
+            'Does {0} describe a serious or life-threatening adverse event?',
+            r.report
+          ))
+      AND AI.IF(PROMPT(
+            'Is this reaction neurological, affecting the nervous system? {0}',
+            n.term
+          ))
+      AND AI.IF(PROMPT(
+            'Is this reaction cardiovascular, affecting the heart or blood vessels? {0}',
+            c.term
+          ));
+    ```
+
+[^mfu]: The speed of light estimate assumes 100 percent model FLOP/s utilization (MFU), so every forward pass sustains peak GPU arithmetic throughput. Real systems cannot reach that rate, but higher MFU still helps. We do not yet measure Quail's MFU.
+
+[^host-overhead]: Modal provides useful background on [GPU utilization](https://modal.com/blog/gpu-utilization-guide) and [host overhead](https://modal.com/blog/host-overhead-inference-efficiency) in inference engines.
+
+[^imdb-disk]: The IMDB dataset was already on disk, so the measurement excludes the time and cost of downloading it.
+
+[^gpt5-nano-cost]: As of September 2026, [OpenAI lists GPT-5 nano](https://developers.openai.com/api/docs/models/gpt-5-nano) at $0.05 per million input tokens, $0.005 per million cached input tokens, and $0.40 per million output tokens. The estimate applies the regular rate to 32.50 million input tokens, the cached rate to 8.41 million document tokens reused by the second filter, and the output rate to 200,000 tokens. We assume an infinite cache, so every reusable document token receives the cached rate.
+
+[^gigatoken]: Marcel Rød built the fast [Gigatoken](https://github.com/marcelroed/gigatoken) tokenizer.
+
+[^sail-mfu]: Kernel fusion can substantially improve prefill MFU. In ["Chasing Speed of Light on TPU v6e"](https://www.sailresearch.com/blog/tpu-v6e-gemma), Sail Research reports increasing Gemma 4 31B prefill MFU from about 32 percent to 63 percent through several optimizations, including folding activation, normalization, and RoPE work into surrounding kernels.
+
+[^hydragen]: Quail uses one level of tree attention: it computes attention over the shared prefix and each unique suffix separately, then combines the results using their log-sum-exp values. The [Hydragen](https://arxiv.org/abs/2402.05099) authors use the same decomposition and extend it to tree-based prompt sharing. They focus mainly on decode, while Quail applies the decomposition during prefill.
+
+[^answer-token-ids]: One might expect two token IDs, one for each answer. In Qwen, Quail accepts eight token IDs: four for `TRUE` and four for `FALSE`.
