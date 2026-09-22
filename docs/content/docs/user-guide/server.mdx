@@ -178,8 +178,8 @@ query loads its model again.
 
 Use a stable `query_id` to retry a submission. If a response is lost,
 submit the same query with the same id. The server returns the existing
-run. It rejects the id with HTTP 409 and `QueryIdConflictError` if the
-query, engine config, inputs, or timeout differ.
+run. If the query, engine config, inputs, or timeout differ, the server
+returns HTTP 409 and `QueryIdConflictError`.
 
 When omitted, `query_id` is random. An id has 1 to 128 characters. It must
 start with a letter or digit. The remaining characters may also include
@@ -774,9 +774,10 @@ The server saves answers while a query runs. Clients can display them
 before the final result is ready.
 
 A filter entry contains one completed chunk of documents. Each item gives
-the row index, last stage asked, and result. A join entry arrives after an
-anchor document finishes. `matches` contains the partner rows that
-returned true. `asked` gives the number of evaluated pairs.
+the row index, last stage asked, and whether the document passed. A join
+entry arrives after an anchor document finishes. `matches` contains the
+partner rows that returned true. `asked` gives the number of evaluated
+pairs.
 
 An `AI.SCORE` entry contains one batch of aligned `rows` and `scores`. An
 `evict` entry identifies a document prefix removed from KV by alias, row
