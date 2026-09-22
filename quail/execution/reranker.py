@@ -15,6 +15,12 @@ from quail.execution.runner import (
     NodeResult,
 )
 from quail.physical import AiScore, ScoreFilter, ValueType
+from quail.progress import answer_sink
+
+# Rows scored per reranker call. Each call's scores reach the answer sink
+# together, so this bounds how long a listener waits between batches; the
+# cost of a smaller batch is one partly filled chunk at the end of each call.
+SCORE_BATCH_ROWS = 2048
 
 # one kernel per entry of quail.logical.SCORE_COMPARISONS
 _COMPARE = {
@@ -187,15 +193,32 @@ def attach_prior_columns(table: pa.Table, priors: Mapping[str, pa.Table]):
     return table
 
 
-def _batches_with_positions(rows: ScoreRows):
+def _batches_with_positions(rows: ScoreRows, size: int):
     start = 0
-    for batch in rows.batches():
+    for batch in rows.batches(size):
         end = start + len(batch)
         yield rows.positions(start, end), batch
         start = end
 
 
-def score_in_batches(node, inputs, score_batches, shards: int = 1) -> NodeResult:
+def scored_batch(node, rows, table) -> dict:
+    """The answer-sink payload for one scored batch.
+
+    ``rows`` are the batch's row indices into each alias table, one int
+    per row for a single alias and one list per row for a pair;
+    ``scores`` line up with them.
+    """
+    rows = np.asarray(rows)
+    return {"kind": "score", "node": node.node_id, "output": node.spec.name,
+            "aliases": list(node.spec.aliases),
+            "rows": (rows[:, 0].tolist() if rows.shape[1] == 1
+                     else rows.tolist()),
+            "scores": [round(float(value), 4)
+                       for value in table.column(node.spec.name).to_pylist()]}
+
+
+def score_in_batches(node, inputs, score_batches, shards: int = 1,
+                     batch_rows: int = SCORE_BATCH_ROWS) -> NodeResult:
     """Score the node's candidate rows in bounded batches, in input order.
 
     Args:
@@ -206,6 +229,8 @@ def score_in_batches(node, inputs, score_batches, shards: int = 1) -> NodeResult
             "scores" table holding one row per input row in order.
         shards: Row shards scored side by side; rows that share a first
             document land in the same shard.
+        batch_rows: Rows per call of ``score_batches``; each call's scores
+            go to the answer sink as one batch.
     """
     if not isinstance(node, AiScore):
         raise TypeError(type(node).__name__)
@@ -218,7 +243,7 @@ def score_in_batches(node, inputs, score_batches, shards: int = 1) -> NodeResult
     tables = []
     positions = []
     metrics = NodeMetrics()
-    streams = [_batches_with_positions(part) for part in parts]
+    streams = [_batches_with_positions(part, batch_rows) for part in parts]
     while streams:
         rounds = [next(stream, None) for stream in streams]
         if all(item is None for item in rounds):
@@ -229,10 +254,13 @@ def score_in_batches(node, inputs, score_batches, shards: int = 1) -> NodeResult
             for item in rounds
         ]
         results = score_batches(node, [batch for _, batch in batches])
-        for (where, _), result in zip(batches, results):
+        for (where, batch), result in zip(batches, results):
             tables.append(result.outputs["scores"])
             positions.append(where)
             metrics += result.metrics
+            sink = answer_sink()
+            if sink is not None and len(batch):
+                sink(scored_batch(node, batch, result.outputs["scores"]))
     table = pa.concat_tables(tables)
     order = np.concatenate(positions)
     if len(order) and np.any(np.diff(order) < 0):

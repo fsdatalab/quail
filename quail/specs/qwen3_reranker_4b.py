@@ -19,4 +19,8 @@ QWEN3_RERANKER_4B_BF16 = ModelSpec(
     weight_precision="bf16",
     attention_precision="bf16",
     role="reranker",
+    # The activation reserve is sized per hidden unit and undercounts this
+    # model's warm-up at its memory-bound chunk (349k tokens OOMed on an
+    # H100); 64k is far past the compute knee.
+    chunk_cap_tokens=65_536,
 )

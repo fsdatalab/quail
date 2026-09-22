@@ -46,6 +46,49 @@ if not logger.handlers:
     logger.propagate = False
 
 _QUIET = 0
+_SINK = None
+_ANSWER_SINK = None
+
+
+def set_progress_sink(sink, *, owner=None) -> None:
+    """Send every throttled progress count to ``sink`` as well as the log.
+
+    The sink is called as ``sink(label, done, total, unit)`` from the
+    thread that runs the loop, so it must return quickly and must not
+    block. Pass None to remove it. The sink is one per process: the
+    query loop reads it from module state because its threads and
+    worker processes cannot carry a per-query value. With ``owner``,
+    the change applies only while ``owner`` is the installed sink, so
+    a query that outlived its own execution cannot remove the sink of
+    the query that came after it.
+    """
+    global _SINK
+    if owner is None or _SINK is owner:
+        _SINK = sink
+
+
+def set_answer_sink(sink, *, owner=None) -> None:
+    """Receive model answers the moment the engine has them.
+
+    The sink is called as ``sink(payload)`` with a dict whose ``kind``
+    says what finished: ``"filter"`` for one chunk's finished documents
+    (row index, last stage asked, passed), ``"join"`` for one anchor's
+    matches (its row index, the partner row index tuples that answered
+    true, how many pairs were asked), ``"score"`` for one batch of
+    reranker scores (row indices and scores), or ``"evict"`` for one
+    document prefix dropped from KV (alias, document index, tokens).
+    Called from the loop's thread; it must return quickly. Pass None
+    to remove it. One sink per process, as with ``set_progress_sink``;
+    ``owner`` works the same way.
+    """
+    global _ANSWER_SINK
+    if owner is None or _ANSWER_SINK is owner:
+        _ANSWER_SINK = sink
+
+
+def answer_sink():
+    """Return the answer sink, or None when nobody is listening."""
+    return _ANSWER_SINK
 
 
 def say(message: str) -> None:
@@ -86,11 +129,17 @@ class Progress:
         if now - self._last >= self.every:
             self._last = now
             self.emit(self._line(self.label, now))
+            self._report()
 
     def finish(self, label: str, extra: str = "") -> None:
         """Log the final line under a past tense label."""
         line = self._line(label, time.perf_counter())
         self.emit(f"{line}, {extra}" if extra else line)
+        self._report()
+
+    def _report(self) -> None:
+        if _SINK is not None:
+            _SINK(self.label, self.done, self.total, self.unit)
 
     def _line(self, label: str, now: float) -> str:
         elapsed = now - self.started

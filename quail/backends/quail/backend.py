@@ -51,6 +51,11 @@ class QuailModelExecution:
         """Attach the loaded model objects owned by this executor."""
         self._state.update(model=model, arena=arena, pipeline=pipeline)
 
+    def close(self) -> None:
+        """Drop every reference to the loaded model so its memory can go."""
+        self._state.clear()
+        self._reranker = None
+
     def bind_query(self, *, torch, async_answers, answer_rows,
                    chunk_tokens: int) -> None:
         """Attach state that is valid for the current query.
@@ -142,6 +147,7 @@ class QuailModelExecution:
                 arena_writes=node.arena_writes,
                 arena_keys=DocumentKeys(node.alias, document_ids),
                 retain_survivors=retain_survivors,
+                document_done=inputs.get("document_done"),
             )
             return filter_result(
                 node, answers, tokens, document_ids,
@@ -168,6 +174,7 @@ class QuailModelExecution:
                                         stream["document_ids"]),
                 hold_survivors=True,
                 hold_extra_tokens=filter_node.hold_tokens,
+                document_done=stream.get("document_done"),
             )
         lists_for = inputs.get("anchor_partners")
         answers, spans, tokens = loop.run_join(

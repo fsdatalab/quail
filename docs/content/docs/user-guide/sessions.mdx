@@ -62,10 +62,26 @@ result_2 = session.sql("""
 """, dialect="bq").collect()
 ```
 
-The first `collect()` or `run()` loads the model onto the GPU.
-Later queries reuse the loaded model and compiled kernels.
-Tokenized documents are also reused across queries on the same
-session.
+The first query loads the model onto the GPU. Later queries on the
+same session reuse that model, the compiled kernels, and the tokenized
+documents. `sql()` returns a [`Query`](/docs/user-guide/results#query).
+
+## Running on Quail Server
+
+Pass a [Quail Server](/docs/user-guide/server) URL as `endpoint`.
+`sql()` then returns a
+[`RemoteQuery`](/docs/user-guide/server#remotequery). Submitted queries
+continue after the client exits. Another client can retrieve the saved
+record by its query id.
+
+```python
+with quail.Session(config=config, endpoint="http://127.0.0.1:8642") as session:
+    ...
+```
+
+Remote queries use SQL. The server compiles and plans them when execution
+starts. After submission, read the plan from
+`run.status().plan["text"]`.
 
 ## Multiple GPUs
 

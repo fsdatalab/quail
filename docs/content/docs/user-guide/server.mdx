@@ -1,0 +1,939 @@
+---
+title: Quail Server
+---
+
+Quail Server runs queries on a GPU machine over HTTP. Start the server,
+then pass its URL as the `endpoint` of a `Session`.
+
+The server plans each query and loads its model. Later queries can reuse
+the loaded model. Queries continue after the client disconnects, and other
+clients can retrieve their saved records.
+
+## Start the server
+
+Install the `server` extra on the GPU machine. Then run `quail-server`.
+
+```bash
+pip install "quail-engine[server]"
+quail-server
+```
+
+By default, the server accepts every built-in model, detects GPU 0, stores
+data in `~/.quail/server`, and listens on `127.0.0.1:8642`. At startup it
+prints the device, accepted models, data directory, and endpoint.
+
+Each query selects a model in `EngineConfig`. The first query loads its
+weights and compiles its kernels. Queries for the same model reuse it. A
+query for another model replaces it because the model weights and KV use
+the available GPU memory.
+
+Quail recognizes an H100 80GB HBM3 as `h100-sxm` and an RTX PRO 6000
+Blackwell as `rtx-pro-6000-blackwell-server`. If detection fails, pass one
+of these names with `--device`.
+
+### From another machine
+
+The default address accepts connections only from the server machine. To
+connect from another machine, listen on every interface and require a
+bearer token.
+
+```bash
+QUAIL_SERVER_TOKEN=<token> quail-server --host 0.0.0.0
+```
+
+Use `endpoint="http://<host>:8642"` on a trusted private network. For an
+untrusted network, put the server behind an HTTPS reverse proxy and use
+the proxy URL. Plain HTTP does not encrypt the token or query data.
+
+Set the same `QUAIL_SERVER_TOKEN` on each client. `Session` sends it as a
+bearer token with every request.
+
+### Options
+
+Use these options to restrict accepted configurations or change storage
+and network settings.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--data-dir` | `~/.quail/server` | Directory for the SQLite file, uploads, and results. Keep it on a disk that survives restarts. |
+| `--model` | every built-in model | A model this server accepts. Repeat the option to list more than one. |
+| `--device` | this machine's GPU | The device name every query must use. |
+| `--gpus` | `1` | A GPU count this server accepts. Repeat the option for more than one count. |
+| `--backend` | `quail` | An accepted backend. Repeat the option for more than one. |
+| `--host` | `127.0.0.1` | Address to listen on. Use `0.0.0.0` to accept other machines. |
+| `--port` | `8642` | Port to listen on. |
+| `--default-timeout` | `1000` | Execution limit in seconds when a submission sets none. About 17 minutes. |
+| `--max-timeout` | `14400` | Largest limit a submission may set, in seconds. 4 hours. |
+| `--max-upload-gib` | `8` | Largest input snapshot accepted, in GiB. |
+| `--token` | `QUAIL_SERVER_TOKEN` | Bearer token required on `/v1`. When the variable is unset, no token is required. |
+
+The server stores its SQLite database, uploads, and results in
+`--data-dir`. Reuse that directory after a restart. Queued queries resume.
+Queries that were planning or running become `interrupted` and must be
+submitted again.
+
+### What the machine needs
+
+Quail Server supports an H100 SXM or RTX PRO 6000 Blackwell Server. Each
+GPU holds one complete model copy. See
+[Supported models and GPUs](/docs/user-guide/models) for valid
+configurations.
+
+Model weights and compiled kernels use their standard caches.
+DiffusionGemma also requires `HF_TOKEN` because its weights are gated.
+
+## Connect from Python
+
+Pass the server URL as `endpoint`. Register tables and run SQL through the
+resulting session. This example watches the query and reads its saved
+result.
+
+```python
+import pyarrow as pa
+import quail
+
+reviews = pa.table({
+    "id": ["r1", "r2"],
+    "body": ["The ending was excellent.", "I liked the soundtrack."],
+})
+sql = """
+    SELECT r.id
+    FROM reviews r
+    WHERE AI.IF(PROMPT('Does this discuss the ending? {0}', r.body))
+"""
+config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
+with quail.Session(config=config, endpoint="http://127.0.0.1:8642") as session:
+    session.register(
+        "reviews",
+        quail.DocumentProvider.from_table(reviews, id_col="id"),
+    )
+    run = session.sql(sql, dialect="bq").submit()
+    for status in run.watch():
+        print(status.phase["message"])
+    table = run.result().collect()
+    print(table)
+```
+
+`sql()` returns a [`RemoteQuery`](#remotequery). The client uses the Python
+standard library for HTTP and pyarrow for record batches. Only the server
+machine needs the `server` extra.
+
+When authentication is enabled, set `QUAIL_SERVER_TOKEN` on the client.
+`Session` has no token argument. A token passed to `ServerClient` applies
+only to that client instance.
+
+## Tables on a remote session
+
+`register()` prepares each table for the server. The server must be able to
+read it after the client exits. Unsupported providers raise `TypeError`
+and are not registered.
+
+| Provider | What the server receives |
+| --- | --- |
+| `from_table`, `from_parquet`, `from_ipc`, `from_dataset` | One Arrow IPC file. The file name is the SHA-256 of its bytes. |
+| `from_hf` | A Hugging Face dataset, pinned to a commit. If you omit `revision`, the client looks up the current head at `register()` and pins that. |
+
+The client checks the content hash before uploading a snapshot. Identical
+tables are uploaded only once. Closing the session removes local staging
+files, but accepted inputs remain on the server.
+
+There is no deletion or garbage-collection API. An operator must remove
+uploaded snapshots and saved query artifacts.
+
+## Submit without waiting
+
+`run()` and `collect()` wait for rows. `submit()` returns a `QueryRun` as
+soon as the server saves the query record. The query continues if the
+client disconnects. Use `session.get_run(query_id)` from another process
+to reconnect to it.
+
+```python
+with quail.Session(
+    config=config,
+    endpoint="http://127.0.0.1:8642",
+) as session:
+    session.register(
+        "reviews",
+        quail.DocumentProvider.from_table(reviews, id_col="id"),
+    )
+    run = session.sql(sql, dialect="bq").submit(
+        query_id="nightly-2026-09-21", timeout_s=1000)
+```
+
+```python
+with quail.Session(
+    config=config,
+    endpoint="http://127.0.0.1:8642",
+) as session:
+    run = session.get_run("nightly-2026-09-21")
+    for status in run.watch():
+        print(status.state, status.progress)
+    result = run.result()
+```
+
+`watch()` yields a [`QueryStatus`](#querystatus) each time the saved record
+changes. `cancel()` removes a queued query. Cancelling a running query
+stops the model process and leaves the record in `cancelled`. The next
+query loads its model again.
+
+Use a stable `query_id` to retry a submission. If a response is lost,
+submit the same query with the same id. The server returns the existing
+run. If the query, engine config, inputs, or timeout differ, the server
+returns HTTP 409 and `QueryIdConflictError`.
+
+When omitted, `query_id` is random. An id has 1 to 128 characters. It must
+start with a letter or digit. The remaining characters may also include
+`.`, `_`, `:`, and `-`.
+
+`session.session_id` identifies the client session. The server saves it on
+each submitted record. List those records with
+`GET /v1/queries?session_id=<id>`.
+
+A record moves from `queued` to `planning` to `running`. It ends as
+`succeeded`, `failed`, `interrupted`, or `cancelled`. The `phase` field
+reports more detail, including input resolution, model loading, and
+execution. These are saved state changes, not time estimates. A terminal
+record does not change again.
+
+The server records `succeeded` only after reopening the saved result,
+report, and answer tables and checking the result row count.
+
+Set `timeout_s` to limit execution. Otherwise the server uses
+`--default-timeout`. The timer starts when the query leaves the queue. A
+timeout stops the model process and records a `TimeoutError`. Values above
+`--max-timeout` are rejected at submission.
+
+<ApiClass />
+
+## RemoteQuery
+
+`session.sql` on a server session returns a `RemoteQuery`. It holds
+the statement text. The server compiles and plans that text when the
+query runs. A local session returns a
+[`Query`](/docs/user-guide/results#query) instead. After you submit,
+the plan text is on the record at `QueryStatus.plan["text"]`.
+
+#### Attributes
+
+<TypeTable
+  type={{
+    session: {
+      type: 'Session',
+      required: true,
+      description: 'The Session that created this query.',
+    },
+    sql: {
+      type: 'str',
+      required: true,
+      description: 'The statement text.',
+    },
+    dialect: {
+      type: "'bq' | 'snowflake'",
+      required: true,
+      description: 'The SQL dialect.',
+    },
+    order: {
+      type: 'str | None',
+      required: true,
+      description: 'Predicate order passed to sql, or None.',
+    },
+  }}
+/>
+
+#### Methods
+
+##### submit
+
+<ApiMethod>
+  RemoteQuery.submit(*, query_id=None, timeout_s=None)
+</ApiMethod>
+
+Send the query to the server and return once the record is saved. The
+query keeps running if the client disconnects. Submitting the same
+`query_id` with the same statement, engine config, inputs, and timeout
+returns the existing run. The same id with a different submission is
+HTTP 409, `QueryIdConflictError`.
+
+**Parameters**
+
+<TypeTable
+  type={{
+    query_id: {
+      type: 'str | None',
+      default: 'None',
+      description:
+        'Name of the run. Omit it and the client picks a random id. An id is 1 to 128 characters: a letter or digit, then letters, digits, ., _, :, or -.',
+    },
+    timeout_s: {
+      type: 'float | None',
+      default: 'None',
+      description:
+        "Execution limit in seconds, starting when the query leaves the queue. Omit it to use the server's --default-timeout. A value above --max-timeout is rejected.",
+    },
+  }}
+/>
+
+**Returns**
+
+`QueryRun`.
+
+##### run
+
+<ApiMethod>RemoteQuery.run(plan=None, *, timeout_s=None)</ApiMethod>
+
+Submit the query, wait until the saved result is ready, and return it.
+A record that ended `failed`, `interrupted`, or `cancelled` raises
+`QueryFailedError`. The exception carries the saved status. Remote
+queries always use the server's plan. Passing a non-`None` `plan` raises
+`RuntimeError`.
+
+**Parameters**
+
+<TypeTable
+  type={{
+    plan: {
+      type: 'None',
+      default: 'None',
+      description: 'Must be None. Edited plans are available only for local queries.',
+    },
+    timeout_s: {
+      type: 'float | None',
+      default: 'None',
+      description: 'Passed through to submit.',
+    },
+  }}
+/>
+
+**Returns**
+
+[`QueryResult`](/docs/user-guide/results#queryresult).
+
+##### collect
+
+<ApiMethod>RemoteQuery.collect(limit=None, batch_rows=65536)</ApiMethod>
+
+Submit the query, wait, and return one Arrow table.
+
+**Parameters**
+
+<TypeTable
+  type={{
+    limit: {
+      type: 'int | None',
+      default: 'None',
+      description: 'Stop after this many rows.',
+    },
+    batch_rows: {
+      type: 'int',
+      default: '65536',
+      description:
+        'Accepted so the call matches a local Query. The server chooses the batch size, and this argument is ignored.',
+    },
+  }}
+/>
+
+**Returns**
+
+`pyarrow.Table`.
+
+##### execute_stream
+
+<ApiMethod>
+  RemoteQuery.execute_stream(batch_rows=65536, limit=None)
+</ApiMethod>
+
+Submit the query, wait, and stream the rows.
+
+**Parameters**
+
+<TypeTable
+  type={{
+    batch_rows: {
+      type: 'int',
+      default: '65536',
+      description:
+        'Accepted so the call matches a local Query. The server chooses the batch size, and this argument is ignored.',
+    },
+    limit: {
+      type: 'int | None',
+      default: 'None',
+      description: 'Stop after this many rows.',
+    },
+  }}
+/>
+
+**Returns**
+
+`pyarrow.RecordBatchReader`.
+
+<ApiClass />
+
+## QueryRun
+
+A handle to one record the server has accepted. `submit` returns one.
+`session.get_run(query_id)` returns a handle to a record that is
+already there.
+
+#### Attributes
+
+<TypeTable
+  type={{
+    id: {
+      type: 'str',
+      required: true,
+      description: 'The query id.',
+    },
+  }}
+/>
+
+#### Methods
+
+##### status
+
+<ApiMethod>QueryRun.status()</ApiMethod>
+
+Read the current saved record.
+
+**Returns**
+
+`QueryStatus`.
+
+##### watch
+
+<ApiMethod>QueryRun.watch(poll_s=30)</ApiMethod>
+
+Yield the current record, then each newer revision, until the query
+is finished. The default poll is 30 seconds, so a progress update
+that was replaced before the next poll is skipped. A lost connection
+raises `ServerError`. Calling `watch` again continues from the record
+as it stands then.
+
+**Parameters**
+
+<TypeTable
+  type={{
+    poll_s: {
+      type: 'float',
+      default: '30',
+      description:
+        'Seconds to hold each long-poll open. The server stops the hold at 60 seconds.',
+    },
+  }}
+/>
+
+**Returns**
+
+An iterator of `QueryStatus`.
+
+##### wait
+
+<ApiMethod>QueryRun.wait(poll_s=30)</ApiMethod>
+
+Wait until the record is finished and return its final `QueryStatus`.
+A record that ended `failed`, `interrupted`, or `cancelled` raises
+`QueryFailedError`. The exception has the final snapshot on its `status`
+attribute.
+
+**Parameters**
+
+<TypeTable
+  type={{
+    poll_s: {
+      type: 'float',
+      default: '30',
+      description: 'Seconds to hold each long-poll open.',
+    },
+  }}
+/>
+
+**Returns**
+
+The successful final `QueryStatus`.
+
+##### result
+
+<ApiMethod>QueryRun.result(poll_s=30)</ApiMethod>
+
+Wait until the record is finished and return the saved rows. A record
+that ended `failed`, `interrupted`, or `cancelled` raises
+`QueryFailedError`, and the exception carries the saved status.
+
+**Parameters**
+
+<TypeTable
+  type={{
+    poll_s: {
+      type: 'float',
+      default: '30',
+      description: 'Seconds between polls while waiting.',
+    },
+  }}
+/>
+
+**Returns**
+
+[`QueryResult`](/docs/user-guide/results#queryresult), built from the
+saved Arrow files and the report.
+
+##### stream_result
+
+<ApiMethod>QueryRun.stream_result(poll_s=30)</ApiMethod>
+
+Wait until the record is finished, then stream the rows. The failure
+behavior matches `result`.
+
+**Parameters**
+
+<TypeTable
+  type={{
+    poll_s: {
+      type: 'float',
+      default: '30',
+      description: 'Seconds between polls while waiting.',
+    },
+  }}
+/>
+
+**Returns**
+
+`pyarrow.RecordBatchReader`. The server chooses the batch size.
+
+```python
+reader = run.stream_result()
+try:
+    for batch in reader:
+        print(batch)
+finally:
+    reader.close()
+```
+
+##### cancel
+
+<ApiMethod>QueryRun.cancel()</ApiMethod>
+
+Ask the server to stop this query. A queued query ends immediately.
+A query that is already running has its model process killed, and the
+record ends `cancelled`. The next query loads the model again.
+
+**Returns**
+
+`QueryStatus`. The snapshot after the cancel request.
+
+##### answers
+
+<ApiMethod>QueryRun.answers(after=0, limit=1000)</ApiMethod>
+
+Return answer entries saved so far, starting at entry `after`. The
+entry shapes are in [Answers while the query runs](#answers-while-the-query-runs).
+
+**Parameters**
+
+<TypeTable
+  type={{
+    after: {
+      type: 'int',
+      default: '0',
+      description: 'First entry index to return.',
+    },
+    limit: {
+      type: 'int',
+      default: '1000',
+      description:
+        'Maximum entries in this page. The server stops at 10,000.',
+    },
+  }}
+/>
+
+**Returns**
+
+A dict with `answers` (the entries), `next` (the index to pass as
+`after` on the next call), and `done` (whether more entries can still
+arrive).
+
+##### stream_answers
+
+<ApiMethod>QueryRun.stream_answers(poll_s=30)</ApiMethod>
+
+Yield each saved answer entry in order. The iterator returns when the
+query is finished and every saved entry has been yielded.
+
+**Parameters**
+
+<TypeTable
+  type={{
+    poll_s: {
+      type: 'float',
+      default: '30',
+      description: 'Seconds between polls.',
+    },
+  }}
+/>
+
+**Returns**
+
+An iterator of answer dicts.
+
+<ApiClass />
+
+## QueryStatus
+
+One saved snapshot of a query record. `status`, `watch`, and
+`GET /v1/queries/{id}` return this object. Every write replaces the
+snapshot and increases `revision`. A record in `succeeded`, `failed`,
+`interrupted`, or `cancelled` stays as it is. The server writes
+`succeeded` only after it has opened the saved result, the report,
+and the answer tables again and checked the result's row count.
+
+#### Attributes
+
+<TypeTable
+  type={{
+    id: {
+      type: 'str',
+      required: true,
+      description: 'The query id.',
+    },
+    state: {
+      type: 'str',
+      required: true,
+      typeDescription:
+        "'queued' | 'planning' | 'running' | 'succeeded' | 'failed' | 'interrupted' | 'cancelled'",
+      description:
+        'queued, planning, running, succeeded, failed, interrupted, or cancelled.',
+    },
+    revision: {
+      type: 'int',
+      required: true,
+      description: 'Integer that increases on every write.',
+    },
+    created_at: {
+      type: 'float',
+      required: true,
+      description: 'Unix seconds when the record was saved.',
+    },
+    updated_at: {
+      type: 'float',
+      required: true,
+      description: 'Unix seconds of the latest write.',
+    },
+    started_at: {
+      type: 'float | None',
+      required: true,
+      description:
+        'Unix seconds when the record left queued, or None while it is still queued.',
+    },
+    timeout_s: {
+      type: 'float',
+      required: true,
+      description: 'Execution limit in seconds.',
+    },
+    session_id: {
+      type: 'str | None',
+      required: true,
+      description: 'The client session that submitted the record, or None.',
+    },
+    cancel_requested: {
+      type: 'bool',
+      required: true,
+      description: 'True after a cancel request has been recorded.',
+    },
+    phase: {
+      type: 'dict | None',
+      required: true,
+      description: 'The current durable step. Keys are below.',
+    },
+    spec: {
+      type: 'dict',
+      required: true,
+      description: 'The SQL submission. Keys are below.',
+    },
+    config: {
+      type: 'dict',
+      required: true,
+      description: 'The engine config. Keys are below.',
+    },
+    inputs: {
+      type: 'dict',
+      required: true,
+      description:
+        'Registered table name to the stored input description. Shapes are below.',
+    },
+    progress: {
+      type: 'dict | None',
+      required: true,
+      description:
+        'The latest engine count, or None before the first one. Keys are below.',
+    },
+    plan: {
+      type: 'dict | None',
+      required: true,
+      description:
+        'The plan, or None until planning has finished. Keys are below.',
+    },
+    error: {
+      type: 'dict | None',
+      required: true,
+      description:
+        'The error, or None unless the record ended failed, interrupted, or cancelled. Keys are below.',
+    },
+    result: {
+      type: 'dict | None',
+      required: true,
+      description:
+        'The result manifest, or None until the record is succeeded. Keys are below.',
+    },
+    done: {
+      type: 'bool',
+      required: true,
+      description:
+        'True when state is an ending state. This is a computed Python property and is absent from raw HTTP JSON.',
+    },
+  }}
+/>
+
+##### phase
+
+| Key | Description |
+| --- | --- |
+| `name` | Stable step name: `queued`, `resolving_inputs`, `planning`, `loading_model`, `switching_model`, `executing`, or a terminal state. |
+| `message` | Human-readable current work. |
+| `recorded_at` | Unix seconds when this phase was saved. |
+| `model` | Model being loaded, when the phase concerns a model. |
+| `previous_model` | Model being replaced, for `switching_model`. |
+
+##### spec
+
+| Key | Description |
+| --- | --- |
+| `sql` | The statement text. |
+| `dialect` | `bq` or `snowflake`. |
+| `order` | Predicate order, or null. |
+
+##### config
+
+| Key | Description |
+| --- | --- |
+| `model` | Model name from `EngineConfig`. |
+| `device` | Device name from `EngineConfig`. |
+| `gpus` | GPU count. |
+| `backend` | Backend name. The default submission sends `quail`. |
+
+##### inputs
+
+Each value is one registered table.
+
+A snapshot has `kind` `"snapshot"`, `content_id` (the SHA-256 of the
+Arrow file), `id_col`, and `columns`.
+
+A Hugging Face dataset has `kind` `"hf"`, `dataset`, `config`,
+`split`, `revision`, and `id_col`.
+
+##### progress
+
+| Key | Description |
+| --- | --- |
+| `label` | What the engine is counting. |
+| `done` | How many units have finished. |
+| `total` | How many units were expected, or null when the total is open. |
+| `unit` | The unit, such as `documents`, `scores`, or `anchors`. |
+| `recorded_at` | Unix seconds of this count. |
+| `answers_saved` | How many answer entries are stored. |
+
+##### plan
+
+| Key | Description |
+| --- | --- |
+| `text` | The plan printout. |
+| `estimated_seconds` | The planner's time estimate. |
+| `backend` | Backend that will run the plan. |
+| `workers` | Worker count. |
+| `envelope` | The same plan encoded for the executor. |
+
+##### error
+
+| Key | Description |
+| --- | --- |
+| `type` | Exception name, such as `TimeoutError`, `Cancelled`, or `Interrupted`. |
+| `message` | The error text. |
+| `traceback` | Present when the executor raised. |
+
+##### result
+
+| Key | Description |
+| --- | --- |
+| `rows` | Row count of the output file. |
+| `columns` | Output column names. |
+| `files.result` | Relative path of the Arrow file of output rows. |
+| `files.report` | Relative path of the execution report. |
+| `files.answers.filters` | Filter answer tables. Each entry has `alias`, `position`, and `file`. |
+| `files.answers.joins` | Join answer tables. Each entry has `position` and `file`. |
+
+## Answers while the query runs
+
+The server saves answers while a query runs. Clients can display them
+before the final result is ready.
+
+A filter entry contains one completed chunk of documents. Each item gives
+the row index, last stage asked, and whether the document passed. A join
+entry arrives after an anchor document finishes. `matches` contains the
+partner rows that returned true. `asked` gives the number of evaluated
+pairs.
+
+An `AI.SCORE` entry contains one batch of aligned `rows` and `scores`. An
+`evict` entry identifies a document prefix removed from KV by alias, row
+index, and token length.
+
+```python
+for entry in run.stream_answers():
+    if entry["kind"] == "filter":
+        survivors = [row for row, _stage, passed in entry["documents"] if passed]
+    elif entry["kind"] == "join":
+        print(entry["anchor"], entry["document"],
+              len(entry["matches"]), "of", entry["asked"])
+    elif entry["kind"] == "score":
+        ...
+    elif entry["kind"] == "evict":
+        print(entry["alias"], entry["document"], entry["tokens"])
+```
+
+`stream_answers()` yields entries in order until the query and stream are
+complete. `answers(after=N)` returns entries starting at `N`, the next
+index, and whether more entries may arrive. The saved count is
+`status().progress["answers_saved"]`.
+
+Read live entries through these methods or the answers route. The internal
+`answers.jsonl` file is not available through `/files/{name}`.
+
+After a successful run, the server writes final Arrow answer tables. They
+contain row indexes, predicate metadata, and boolean answers. They do not
+contain source document text. The final result contains only columns
+selected by the SQL query.
+
+## Reading the plan
+
+The server compiles and plans submitted SQL. When `status.plan` is not
+`None`, read the plan from `run.status().plan["text"]`. Remote queries
+always use the server's plan.
+
+Local [`Query`](/docs/user-guide/results#query) objects support planning
+before execution. The Python builder is also available only on a local
+session.
+
+## In the browser
+
+Open `http://<host>:8642/queries/<query_id>` to inspect a query. The page
+shows its state, progress, plan, errors, SQL, inputs, and the first 20
+result rows. It updates through server-sent events while the query runs.
+Open `http://<host>:8642/` to list recent queries.
+
+If the server requires a token, open the page once with
+`#token=<token>` appended to the URL. The page saves the token in browser
+local storage and removes it from the address bar. It asks for a token
+after an unauthorized response if none is saved.
+
+The page sends the token when it fetches result and report files. It then
+saves those files locally.
+
+## HTTP API
+
+The Python client and status page use these routes. When authentication is
+enabled, every `/v1` route requires
+`Authorization: Bearer <token>`. The HTML pages load without this header
+and attach it to their API requests.
+
+| Route | Purpose |
+| --- | --- |
+| `GET /v1/capabilities` | Models, device, GPU counts, backends, and the timeout and upload limits |
+| `HEAD /v1/inputs/{content_id}` | `200` when this snapshot is already stored, `404` when it is not |
+| `PUT /v1/inputs/{content_id}` | Upload one Arrow IPC file. `content_id` is the lowercase SHA-256 hex digest of the bytes |
+| `POST /v1/queries` | Submit a query. Returns the saved record with HTTP 201 |
+| `GET /v1/queries?limit=&session_id=` | Recent records, newest first. `limit` defaults to 50 and stops at 500 |
+| `GET /v1/queries/{id}?after=N&wait=S` | The record, holding the request open for up to `S` seconds until the revision passes `N`. `S` stops at 60 |
+| `GET /v1/queries/{id}/events` | Server-sent events, one per revision |
+| `POST /v1/queries/{id}/cancel` | Cancel the query |
+| `GET /v1/queries/{id}/result` | The result rows as an Arrow stream. The row count is the `x-quail-rows` header |
+| `GET /v1/queries/{id}/files/{name}` | One file named in the record's result manifest, as stored on disk |
+| `GET /v1/queries/{id}/rows?limit=` | The first rows as JSON, for the status page. `limit` defaults to 20 and stops at 1000 |
+| `GET /v1/queries/{id}/answers?after=N&limit=` | Answer entries from entry `N` on. `limit` defaults to 1000 and stops at 10000 |
+| `GET /queries/{id}` | The status page for one query |
+| `GET /` | The list of recent queries |
+
+A submission body has `sql`, `dialect`, `order`, `config`, `inputs`,
+`query_id`, `session_id`, and `timeout_s`. `dialect` is `bq` or
+`snowflake`, the same values as `session.sql`.
+
+```json
+{
+  "sql": "SELECT r.id FROM reviews r WHERE AI.IF(PROMPT('Positive? {0}', r.body))",
+  "dialect": "bq",
+  "order": null,
+  "config": {
+    "model": "qwen3-4b-fp8",
+    "device": "h100-sxm",
+    "gpus": 1,
+    "backend": "quail"
+  },
+  "inputs": {
+    "reviews": {
+      "kind": "snapshot",
+      "content_id": "<lowercase sha256 of the uploaded Arrow IPC file>",
+      "id_col": "id"
+    }
+  },
+  "query_id": "reviews-2026-09-22",
+  "session_id": "raw-http-client",
+  "timeout_s": 1000
+}
+```
+
+Upload each Arrow IPC input with `PUT /v1/inputs/{content_id}` before
+submitting the request. A Hugging Face input uses `kind`, `dataset`,
+`config`, `split`, `revision`, and `id_col` instead.
+
+## On Modal
+
+Deploy `quail.server.modal_app` to run Quail Server on one H100 in the
+existing `quail-engine` Modal app.
+
+The `server` extra does not install Modal. To deploy, use a repository
+checkout with an installed and authenticated Modal CLI. The image uses the
+checkout's `uv.lock`, development dependencies, and local `quail` package.
+
+```bash
+modal secret create quail-server-token QUAIL_SERVER_TOKEN=<token>
+modal deploy -m quail.server.modal_app
+```
+
+`modal deploy` prints the endpoint URL. Pass it as `endpoint`. The URL is
+public, so create the `quail-server-token` secret before deployment.
+Clients must set the same `QUAIL_SERVER_TOKEN`.
+
+The deployment accepts these built-in models: `qwen3-4b-fp8`,
+`qwen3-32b-fp8`, `diffusion-gemma-26b-a4b-fp8`,
+`qwen3-reranker-0.6b-bf16`, and `qwen3-reranker-4b-bf16`.
+
+For DiffusionGemma, add `HF_TOKEN` to the same secret:
+
+```bash
+modal secret create quail-server-token \
+  QUAIL_SERVER_TOKEN=<server-token> HF_TOKEN=<hugging-face-token>
+```
+
+Without `HF_TOKEN`, DiffusionGemma cannot download its weights.
+
+Results and inputs go to the `quail-results` Volume under
+`/results/quail-server/`. The live SQLite database stays on the
+container's local disk at `/tmp/quail-server/quail.sqlite3`. A checkpoint
+thread copies it to the Volume with SQLite's online backup and commits the
+Volume.
+
+The server commits a checkpoint before returning a new query id. It then
+attempts to checkpoint durable changes every second and progress-only
+changes at most every 30 seconds. Failed checkpoints are logged and
+retried. A restart restores the latest successful checkpoint, which can
+be older than the latest state a client observed.
+
+New containers restore the database before serving requests.
+`max_containers=1` keeps one writer. A container stops after 15 idle
+minutes. The next request starts a new container, and its first query
+loads the model again.

@@ -35,6 +35,7 @@ from quail.physical import (
     Scan,
     ScoreFilter,
 )
+from quail.progress import answer_sink
 
 
 def quail_runtimes() -> dict:
@@ -166,6 +167,29 @@ def filter_result(node, answers, tokens, document_ids,
     )
 
 
+def filter_document_sink(node, document_ids):
+    """The chain's document_done callback, or None when nobody listens.
+
+    Reports each chunk's finished documents to the answer sink as
+    ``{"kind": "filter", "node", "alias", "stages", "documents"}`` where
+    ``documents`` lists ``[row index, last stage asked, passed]`` per
+    document. A document that passed its last stage survived the filter;
+    every other listed document failed at the stage given.
+    """
+    sink = answer_sink()
+    if sink is None:
+        return None
+    stages = len(node.question_token_ids)
+
+    def document_done(finished):
+        sink({"kind": "filter", "node": node.node_id, "alias": node.alias,
+              "stages": stages,
+              "documents": [[int(document_ids[position]), stage, passed]
+                            for position, stage, passed in finished]})
+
+    return document_done
+
+
 def filter_inputs(state, node, document_ids) -> dict:
     """Scheduler inputs for one filter chain over the given documents."""
     return {
@@ -175,6 +199,7 @@ def filter_inputs(state, node, document_ids) -> dict:
         "document_ids": document_ids,
         "limit": state["filter_limit"],
         "retain_survivors": node.keep_kv,
+        "document_done": filter_document_sink(node, document_ids),
     }
 
 
@@ -287,6 +312,28 @@ def _model_inputs(node, inputs, context: ExecutionContext) -> dict:
             "stream": stream,
         }
 
+    last = group[-1]
+    last_tuples = tuple_indices[last["written_pos"]]
+
+    def finished_answers(document, row) -> dict:
+        """The anchor's last-stage matches: partner tuples that answered true.
+
+        Every pair the anchor was asked about and is not listed answered
+        false; ``asked`` says how many pairs that covers.
+        """
+        members = None
+        if lists_for is not None and runs_over_pairs(last):
+            members = lists_for(document)[len(group) - 1]
+        matches = []
+        for position, answer in enumerate(row):
+            if answer:
+                member = position if members is None else int(members[position])
+                matches.append(list(last_tuples[member]))
+        return {"kind": "join", "node": node.node_id, "anchor": node.anchor,
+                "partners": list(last["partners"]),
+                "semantics": last["semantics"], "document": int(document),
+                "asked": len(row), "matches": matches}
+
     def anchor_done(local_index, row):
         key = anchor_keys[local_index]
         matched = any(row)
@@ -298,6 +345,10 @@ def _model_inputs(node, inputs, context: ExecutionContext) -> dict:
                 config.get("after", {}).get(node.node_id, {}))
         else:
             state["arena"].free_key(key)
+        sink = answer_sink()
+        # scores are floats, not yes/no answers; they arrive with the result
+        if sink is not None and getattr(row, "dtype", None) is None:
+            sink(finished_answers(key[1], row))
 
     state["prepared_join"] = {
         "node": node,

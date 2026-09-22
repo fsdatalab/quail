@@ -142,6 +142,12 @@ def make_executor(filter_truth, join_truth=None, seen=None):
                         rows[document] = row
                     survivors = [d for d, row in rows.items()
                                  if len(row) == len(node.stages) and all(row)]
+                    # the real loop reports a chunk's finished documents
+                    # by position; the hook streams them
+                    if inputs.get("document_done") is not None:
+                        inputs["document_done"]([
+                            (position, len(row) - 1, bool(row[-1]))
+                            for position, row in enumerate(rows.values())])
                     return NodeResult({
                         f"ids:{node.alias}": survivors,
                         f"filter_answers:{node.alias}": rows,
@@ -168,13 +174,21 @@ def make_executor(filter_truth, join_truth=None, seen=None):
                 outputs[f"ids:{node.anchor}"] = [a for a in anchors
                     if (a not in passing if stage.semantics == "anti"
                         else a in passing)]
+                # the real loop reports each anchor's last-stage row as
+                # it finishes; the hook frees its KV and streams answers
+                if inputs.get("anchor_done") is not None:
+                    for i, row in rows.items():
+                        inputs["anchor_done"](i, row)
                 return NodeResult(outputs, NodeMetrics(
                     input_rows=len(anchors),
                     output_rows=len(outputs[f"ids:{node.anchor}"]),
                     evaluated_document_pairs=sum(
                         len(row) for row in rows.values())))
 
-        report = execute_single_graph(graph_state(FixedAnswers(), docs), {
+        state = graph_state(FixedAnswers(), docs)
+        if getattr(request, "relations", None):
+            state["columns"] = request.column_tables()
+        report = execute_single_graph(state, {
             "filter_limit": None, "pre_ids": [],
         }, graph)
         outputs = report.pop("_outputs")

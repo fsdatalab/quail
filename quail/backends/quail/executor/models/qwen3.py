@@ -22,11 +22,14 @@ class Qwen3Pipeline(ModelPipeline):
         self.embed = model.model.embed_tokens
         self.final_norm = model.model.norm
         attn = self.layers[0].self_attn
+        fp8 = attn.qkv_proj.weight.dtype == torch.float8_e4m3fn
         self.engine = engine_class(
             arena, n_q=attn.num_heads, n_kv=attn.num_kv_heads,
             head_dim=attn.head_dim, rotary=attn.rotary_emb,
-            fp8=attn.qkv_proj.weight.dtype == torch.float8_e4m3fn,
-            kernels=kernels)
+            fp8=fp8, kernels=kernels)
+        # the merged two-call path ends in an fp8 quant; a bf16 model
+        # (the rerankers) runs every chunk through unified attention
+        self.join_attention = "merge_quant" if fp8 else "unified"
         # The fused kernels compute element offsets in 32-bit ints,
         # so a chunk needs rows x widest_row < 2^31.
         widest = max(max(layer.self_attn.qkv_proj.weight.shape[0],

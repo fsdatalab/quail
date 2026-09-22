@@ -200,6 +200,12 @@ def _boot_for_query(runtime_state, backend, gpu_context,
     gpu = runtime_state.get(key)
     t_boot = time.perf_counter()
     if gpu is None:
+        loaded = [name for _, name in runtime_state if name != key[1]]
+        if loaded:
+            # one model's weights and KV arena take the GPU; another
+            # model cannot load beside them
+            say(f"releasing {', '.join(loaded)} to load {key[1]}")
+            release_booted_models(runtime_state)
         gpu = LoadedGpu(backend, gpu_context, true_ids + false_ids)
         runtime_state[key] = gpu
         cold = True

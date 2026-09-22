@@ -53,6 +53,51 @@ with quail.Session(config=config) as session:
     print(result)
 ```
 
+## Quail Server
+
+Quail Server is an optional HTTP server that runs on the machine with
+the GPU. You start it once, send queries to it with `endpoint`, and
+the query keeps running after the client disconnects. `submit()`
+returns once the server has saved the record, and `get_run` reads
+that record later.
+
+```bash
+pip install "quail-engine[server]"
+quail-server
+```
+
+```python
+import pyarrow as pa
+import quail
+
+reviews = pa.table({
+    "id": ["r1", "r2"],
+    "body": ["The ending was excellent.", "I liked the soundtrack."],
+})
+sql = """
+    SELECT r.id
+    FROM reviews r
+    WHERE AI.IF(PROMPT('Does this discuss the ending? {0}', r.body))
+"""
+config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
+
+with quail.Session(
+    config=config,
+    endpoint="http://127.0.0.1:8642",
+) as session:
+    session.register(
+        "reviews",
+        quail.DocumentProvider.from_table(reviews, id_col="id"),
+    )
+    run = session.sql(sql, dialect="bq").submit()
+    for status in run.watch():
+        print(status.phase["message"])
+    table = run.result().collect()
+    print(table)
+```
+
+See [Quail Server](https://fsdatalab.github.io/quail/docs/user-guide/server).
+
 ## Supported operators
 
 Quail currently supports AI-powered filters, joins, and

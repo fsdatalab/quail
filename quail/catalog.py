@@ -110,6 +110,8 @@ class HuggingFaceProvider:
     arrow_schema: pa.Schema = field(
         default_factory=lambda: pa.schema([])
     )
+    # a dataset commit hash; empty means the repository's current head
+    revision: str = ""
 
     @property
     def columns(self) -> tuple[str, ...]:
@@ -124,6 +126,7 @@ class HuggingFaceProvider:
             self.config,
             self.split,
             str(self.arrow_schema),
+            self.revision,
         )).encode("utf-8")
         return "hf:" + hashlib.sha256(value).hexdigest()
 
@@ -131,7 +134,8 @@ class HuggingFaceProvider:
         from datasets import load_dataset_builder
 
         builder = load_dataset_builder(
-            self.dataset_name, self.config or None
+            self.dataset_name, self.config or None,
+            revision=self.revision or None,
         )
         split = builder.info.splits.get(self.split)
         count = None if split is None else int(split.num_examples)
@@ -146,6 +150,7 @@ class HuggingFaceProvider:
             self.dataset_name,
             self.config or None,
             split=self.split,
+            revision=self.revision or None,
         )
         table = dataset.data.table.select(request.columns)
         if request.filter is not None:
@@ -230,11 +235,23 @@ class DocumentProvider:
         id_col: str,
         split: str = "train",
         config: str = "",
+        revision: str = "",
     ) -> HuggingFaceProvider:
-        """Create a provider for a Hugging Face dataset."""
+        """Create a provider for a Hugging Face dataset.
+
+        Args:
+            dataset: The dataset repository name.
+            id_col: The column that identifies each document.
+            split: The split to read.
+            config: The dataset configuration, when it has more than one.
+            revision: A dataset commit hash. Empty reads the current head;
+                a remote Session needs a fixed revision and resolves the
+                head to one at registration.
+        """
         from datasets import load_dataset_builder
 
-        builder = load_dataset_builder(dataset, config or None)
+        builder = load_dataset_builder(dataset, config or None,
+                                       revision=revision or None)
         features = builder.info.features
         schema = getattr(features, "arrow_schema", None)
         if schema is None:
@@ -251,6 +268,7 @@ class DocumentProvider:
             split=split,
             config=config,
             arrow_schema=schema,
+            revision=revision,
         )
 
     @classmethod

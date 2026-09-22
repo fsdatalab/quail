@@ -6,6 +6,7 @@
     "sessions",
     "python-api",
     "results",
+    "server",
     "metrics",
     "models"
   ],

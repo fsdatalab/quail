@@ -146,29 +146,338 @@ Other common refusals:
 
 ## Running a query
 
-`run()` executes the query on the GPU and returns a `QueryResult`.
-`query.collect()` is a shortcut that calls `run().collect()`.
+`session.sql` compiles the statement in this process and returns a
+`Query`. Running it executes the plan on the GPU. On Modal, collect
+the rows before the function returns, because a `QueryResult` reads
+its rows when you ask for them.
 
 ```python
 result = query.run()
 ```
 
+A session created with `endpoint` returns a
+[`RemoteQuery`](/docs/user-guide/server#remotequery) from `sql()`.
+
+<ApiClass />
+
+### Query
+
+A compiled query bound to the session that parsed it.
+
+#### Attributes
+
+<TypeTable
+  type={{
+    session: {
+      type: 'Session',
+      required: true,
+      description: 'The Session that compiled this query.',
+    },
+    logical: {
+      type: 'LogicalPlan',
+      required: true,
+      description: 'The compiled logical plan.',
+    },
+    order: {
+      type: 'str | None',
+      required: true,
+      description:
+        'Predicate order passed to sql, or None when the planner chooses the order.',
+    },
+  }}
+/>
+
+#### Methods
+
+##### plan
+
+<ApiMethod>Query.plan()</ApiMethod>
+
+Build the physical plan. The first call plans the query. Later calls
+return that same plan.
+
+**Returns**
+
+`PhysicalPlan`. The plan the executor will run, including the model,
+the worker count, and the estimated seconds.
+
+##### explain
+
+<ApiMethod>Query.explain(*, verbose=False, analyze=False)</ApiMethod>
+
+Print the plan. The shape of the text is the one in
+[Preview the plan](#preview-the-plan) and
+[Measure the plan](#measure-the-plan).
+
+**Parameters**
+
+<TypeTable
+  type={{
+    verbose: {
+      type: 'bool',
+      default: 'False',
+      description:
+        'When true, the text adds node ids, port connections, KV retention, and planner remarks.',
+    },
+    analyze: {
+      type: 'bool',
+      default: 'False',
+      description:
+        "When true, run the query first and print each node's measured rows, time, and tokens beside the estimates.",
+    },
+  }}
+/>
+
+**Returns**
+
+`str`.
+
+##### run
+
+<ApiMethod>Query.run(plan=None)</ApiMethod>
+
+Execute the query in this process.
+
+**Parameters**
+
+<TypeTable
+  type={{
+    plan: {
+      type: 'PhysicalPlan | None',
+      default: 'None',
+      description:
+        "A PhysicalPlan from plan(), or one edited with insert, remove, or move. Omit it to run the planner's plan.",
+    },
+  }}
+/>
+
+**Returns**
+
+`QueryResult`.
+
+##### collect
+
+<ApiMethod>Query.collect(limit=None, batch_rows=65536)</ApiMethod>
+
+Execute the query and return one Arrow table. This calls `run()`, then
+`QueryResult.collect`.
+
+**Parameters**
+
+<TypeTable
+  type={{
+    limit: {
+      type: 'int | None',
+      default: 'None',
+      description: 'Stop after this many rows. Omit it to read the full result.',
+    },
+    batch_rows: {
+      type: 'int',
+      default: '65536',
+      description: 'Rows per Arrow record batch while the table is built.',
+    },
+  }}
+/>
+
+**Returns**
+
+`pyarrow.Table`.
+
+##### execute_stream
+
+<ApiMethod>Query.execute_stream(batch_rows=65536, limit=None)</ApiMethod>
+
+Execute the query and stream the rows.
+
+**Parameters**
+
+<TypeTable
+  type={{
+    batch_rows: {
+      type: 'int',
+      default: '65536',
+      description: 'Rows per Arrow record batch.',
+    },
+    limit: {
+      type: 'int | None',
+      default: 'None',
+      description: 'Stop after this many rows.',
+    },
+  }}
+/>
+
+**Returns**
+
+`pyarrow.RecordBatchReader`.
+
+<ApiClass />
+
 ### QueryResult
 
-```python
-class QueryResult:
-    schema: pa.Schema              # output column schema
-    report: dict                   # execution metrics
-    plan: PhysicalPlan             # the executed physical plan
+The rows of a finished query, plus the report and the answer tables.
+The rows stay unread until `collect`, `to_rows`, or `execute_stream`
+asks for them.
 
-    def collect(limit=None) -> pa.Table: ...
-    def to_rows(limit=None) -> list[tuple]: ...
-    def count() -> int: ...        # len(result) also works
-    def execute_stream() -> pa.RecordBatchReader: ...
-```
+#### Attributes
 
-If you are on Modal, collect the rows before returning from the
-function.
+<TypeTable
+  type={{
+    schema: {
+      type: 'pyarrow.Schema',
+      required: true,
+      description: 'Arrow schema of the output columns.',
+    },
+    columns: {
+      type: 'list[str]',
+      required: true,
+      description: 'Output column names, in order.',
+    },
+    report: {
+      type: 'dict',
+      required: true,
+      description: (
+        <>
+          Execution metrics. The fields are on the{' '}
+          <a href="/docs/user-guide/metrics">Metrics</a> page.
+        </>
+      ),
+    },
+    plan: {
+      type: 'PhysicalPlan | None',
+      required: true,
+      description:
+        'The physical plan that ran. None until a plan was executed and decoded.',
+    },
+    node_metrics: {
+      type: 'dict',
+      required: true,
+      description: 'Measured metrics keyed by node id.',
+    },
+    answer_tables: {
+      type: 'dict',
+      required: true,
+      description:
+        "Per-predicate Arrow tables. filters is keyed by (alias, position). joins is keyed by the join's position in the query text.",
+    },
+  }}
+/>
+
+#### Methods
+
+##### collect
+
+<ApiMethod>QueryResult.collect(limit=None, batch_rows=65536)</ApiMethod>
+
+Read the result into one Arrow table.
+
+**Parameters**
+
+<TypeTable
+  type={{
+    limit: {
+      type: 'int | None',
+      default: 'None',
+      description:
+        'Stop after this many rows. A limit already set on the result is also applied.',
+    },
+    batch_rows: {
+      type: 'int',
+      default: '65536',
+      description: 'Rows per record batch while the table is read.',
+    },
+  }}
+/>
+
+**Returns**
+
+`pyarrow.Table`.
+
+##### execute_stream
+
+<ApiMethod>
+  QueryResult.execute_stream(batch_rows=65536, limit=None)
+</ApiMethod>
+
+Stream the result as Arrow record batches.
+
+**Parameters**
+
+<TypeTable
+  type={{
+    batch_rows: {
+      type: 'int',
+      default: '65536',
+      description: 'Rows per record batch.',
+    },
+    limit: {
+      type: 'int | None',
+      default: 'None',
+      description: 'Stop after this many rows.',
+    },
+  }}
+/>
+
+**Returns**
+
+`pyarrow.RecordBatchReader`.
+
+##### to_rows
+
+<ApiMethod>QueryResult.to_rows(limit=None)</ApiMethod>
+
+Read the result as a list of tuples, one tuple per row, in column
+order.
+
+**Parameters**
+
+<TypeTable
+  type={{
+    limit: {
+      type: 'int | None',
+      default: 'None',
+      description: 'Stop after this many rows.',
+    },
+  }}
+/>
+
+**Returns**
+
+`list[tuple]`.
+
+##### count
+
+<ApiMethod>QueryResult.count()</ApiMethod>
+
+Return the number of rows. `len(result)` calls this.
+
+**Returns**
+
+`int`.
+
+##### explain
+
+<ApiMethod>QueryResult.explain(*, verbose=False)</ApiMethod>
+
+Print the executed plan with measured rows and time beside the
+operators.
+
+**Parameters**
+
+<TypeTable
+  type={{
+    verbose: {
+      type: 'bool',
+      default: 'False',
+      description:
+        'When true, include every measured field of each node, including KV hits, KV misses, and GPU seconds.',
+    },
+  }}
+/>
+
+**Returns**
+
+`str`. The text is `no physical plan was executed` when `plan` is
+`None`.
 
 ### Execution report
 
