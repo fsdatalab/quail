@@ -154,8 +154,7 @@ def _answer_token_parts(prompt, context) -> tuple[tuple[int, ...], ...]:
     """Tokenize the AI.IF layout around the documents, for a generative model.
 
     A document gets the AI.IF filter prompt and a pair the AI.IF join
-    prompt anchored on its first document, so a score above 0.5 is
-    the TRUE answer AI.IF gives for the same template.
+    prompt anchored on its first document.
     """
     tokenizer, turn = context.tokenizer, context.model.turn
     aliases = _prompt_aliases(prompt)

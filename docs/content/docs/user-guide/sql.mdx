@@ -183,8 +183,11 @@ config = quail.EngineConfig(
   requirements and answer "yes" or "no".
 - The generative models, `qwen3-4b-fp8`, `qwen3-32b-fp8`, and
   `diffusion-gemma-26b-a4b-fp8`, use the `AI.IF` prompt for the same
-  template and compare TRUE with FALSE. A score above 0.5 is the
-  answer `AI.IF` gives, apart from ties within rounding.
+  template and compare TRUE with FALSE. `AI.SCORE` runs that prompt
+  through a different execution path than `AI.IF`, so a score above
+  0.5 and the `AI.IF` answer can differ on some rows. On four QUAIL-B
+  filters they differed on 0% to 2.4% of rows for Qwen3 32B and
+  DiffusionGemma, and on 1.7% to 10% of rows for Qwen3 4B.
 
 Use `gpus` to run a model copy on each GPU.
 
