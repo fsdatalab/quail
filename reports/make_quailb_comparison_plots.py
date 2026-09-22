@@ -6,18 +6,18 @@ Pull the CPU-derived summary and regenerate the figures:
     uv run modal volume get quail-results \
       reports/quailb-raw-2026-09-19/comparison.json "$W/comparison.json"
     uv run modal volume get quail-results \
-      benchmarks/quailb/family-runs/20260920T062701Z-bio4-4b/quail/run.json \
+      benchmarks/quailb/family-runs/20260920T062701Z-bio4-4b/quail/biodex/run.json \
       "$W/bio4-sf0.1-quail.json"
     uv run modal volume get quail-results \
-      benchmarks/quailb/family-runs/20260920T062701Z-bio4-4b/pipelined_vllm/run.json \
+      benchmarks/quailb/family-runs/20260920T062701Z-bio4-4b/pipelined_vllm/biodex/run.json \
       "$W/bio4-sf0.1-vllm.json"
     uv run modal volume get quail-results \
       sol/2026-09-20-bio4-qwen3-4b-sf0.1.json "$W/bio4-sf0.1-sol.json"
     BIO4_SF1_RUN=benchmarks/quailb/family-runs/20260920T064415Z-bio4-4b-sf1.0
-    uv run modal volume get quail-results "$BIO4_SF1_RUN/quail/run.json" \
+    uv run modal volume get quail-results "$BIO4_SF1_RUN/quail/biodex/run.json" \
       "$W/bio4-sf1-quail.json"
     uv run modal volume get quail-results \
-      "$BIO4_SF1_RUN/pipelined_vllm/run.json" \
+      "$BIO4_SF1_RUN/pipelined_vllm/biodex/run.json" \
       "$W/bio4-sf1-vllm.json"
     uv run modal volume get quail-results \
       sol/2026-09-20-bio4-qwen3-4b-sf1.0.json "$W/bio4-sf1-sol.json"
@@ -772,7 +772,8 @@ def main(workdir):
                 f"SoL source: `{sf1['sol']['volume_path']}`.",
                 f"Reference collection: `{BIO4_COLLECTIONS[1.0]}`.", "",
                 "Quail result function call: `fc-01M2YRXV1TAVKDDPPBKNHM90XH`.",
-                "Stock vLLM result function call: `fc-01M2YXPZA8E6EJYJMSGDTR0X69`.", "",
+                "Pipelined vLLM result function call: "
+                "`fc-01M2YXPZA8E6EJYJMSGDTR0X69`.", "",
             ])
     (HERE / "quailb-comparison.md").write_text("\n".join(report_text))
     print("Updated the report and all six PDFs.")

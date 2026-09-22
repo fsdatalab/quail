@@ -182,7 +182,6 @@ for each method uses its own evaluated pair count.
 Both methods returned many incorrect final rows. Quail's output
 precision was 1.57%, compared with 1.41% for pipelined vLLM.
 Output recall was 22.02% for Quail and 22.57% for pipelined vLLM.
-
 | Method | Seconds | Document pairs/s | $/query | Fresh tokens | Recomputed KV tokens | KV regret (%) | Answer agreement (%) | Output precision (%) | Output recall (%) |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | Quail | 1755.31 | 4,572.90 | 1.92558 | 140,583,122 | 17,972,915 | 12.78 | 80.37 | 1.5747 | 22.024 |
@@ -196,7 +195,7 @@ SoL source: `/results/sol/2026-09-20-bio4-qwen3-4b-sf1.0.json`.
 Reference collection: `gt_e87691add604b02c4e43f0ff5bf0cc4f`.
 
 Quail result function call: `fc-01M2YRXV1TAVKDDPPBKNHM90XH`.
-Stock vLLM result function call: `fc-01M2YXPZA8E6EJYJMSGDTR0X69`.
+Pipelined vLLM result function call: `fc-01M2YXPZA8E6EJYJMSGDTR0X69`.
 
 ## FEV
 
