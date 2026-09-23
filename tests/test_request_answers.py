@@ -32,23 +32,17 @@ def test_token_and_text_answers():
         text_answer(_output(text=""))
 
 
-def test_canvas_uses_token_ids_and_scores_not_sampled_text():
-    assert _canvas({7: _entry(-4, decoded="FALSE"),
-                    8: _entry(-2, decoded="TRUE"),
-                    9: _entry(-5), 10: _entry(-5)}) == 0
-    assert _canvas({7: _entry(-4), 9: _entry(-1),
-                    8: _entry(-2), 10: _entry(-5)}) == 1
-
-
-@pytest.mark.parametrize("tokens", [(7, 8, 9, 10), (10, 9, 8, 7)])
-def test_canvas_ties_are_false_in_either_order(tokens):
-    assert _canvas({t: _entry(-2) for t in tokens}) == 0
-
-
-def test_canvas_reads_answer_scores_below_top_500():
-    assert _canvas({1: _entry(-1, 1), 7: _entry(-20, 600),
-                    9: _entry(-21, 700), 8: _entry(-22, 800),
-                    10: _entry(-23, 900)}) == 1
+@pytest.mark.parametrize("entries,expected", [
+    ({7: _entry(-4, decoded="FALSE"), 8: _entry(-2, decoded="TRUE"),
+      9: _entry(-5), 10: _entry(-5)}, 0),
+    ({7: _entry(-4), 9: _entry(-1), 8: _entry(-2), 10: _entry(-5)}, 1),
+    ({t: _entry(-2) for t in (7, 8, 9, 10)}, 0),
+    ({t: _entry(-2) for t in (10, 9, 8, 7)}, 0),
+    ({1: _entry(-1, 1), 7: _entry(-20, 600), 9: _entry(-21, 700),
+      8: _entry(-22, 800), 10: _entry(-23, 900)}, 1),
+])
+def test_canvas_reads_token_scores_not_sampled_text(entries, expected):
+    assert _canvas(entries) == expected
 
 
 @pytest.mark.parametrize("entries", [
