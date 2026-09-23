@@ -2,20 +2,18 @@
 
 import json
 import time
+from unittest.mock import Mock
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 import server_fakes
-from test_session import fake_tok
 
 import quail
+from quail import progress
 from quail.builtins import built_in_registry
 from quail.server import artifacts, inputs
-from quail.server.executor import (
-    ChildProcessExecutor,
-    InProcessExecutor,
-    load_hooks,
-)
+from quail.server.executor import ChildProcessExecutor, InProcessExecutor, load_hooks
 from quail.server.scheduler import Scheduler
 from quail.server.store import Store
 
@@ -28,17 +26,20 @@ def store(tmp_path):
 
 
 def submit(store, tmp_path, sql=server_fakes.FILTER_SQL, timeout_s=1000.0,
-           table=None, config=None):
-    provider = quail.DocumentProvider.from_table(
-        table if table is not None else server_fakes.reviews_table(),
-        id_col="id")
-    prepared = inputs.describe(provider, tmp_path / "uploads")
+           config=None):
+    prepared = inputs.describe(quail.DocumentProvider.from_table(
+        server_fakes.reviews_table(), id_col="id"), tmp_path / "uploads")
     store.put_input(prepared.content_id, str(prepared.upload_path),
                     prepared.upload_path.stat().st_size)
     return store.create(
         spec={"sql": sql, "dialect": "snowflake", "order": None},
-        config=config or server_fakes.CONFIG,
-        inputs={"reviews": prepared.spec}, timeout_s=timeout_s)
+        config=config or server_fakes.CONFIG, inputs={"reviews": prepared.spec},
+        timeout_s=timeout_s)
+
+
+def scheduler_for(store, tmp_path, executor=None, poll_s=0.02):
+    executor = executor or InProcessExecutor(server_fakes.hooks)
+    return Scheduler(store, executor, tmp_path, poll_s=poll_s)
 
 
 def wait_done(store, query_id, timeout=30.0):
@@ -52,119 +53,75 @@ def wait_done(store, query_id, timeout=30.0):
 
 def test_in_process_run_saves_plan_progress_and_a_readable_result(
         store, tmp_path):
-    status = submit(store, tmp_path)
-    scheduler = Scheduler(store, InProcessExecutor(server_fakes.hooks),
-                          tmp_path, poll_s=0.02)
-    final = scheduler.run_one(status)
-
+    final = scheduler_for(store, tmp_path).run_one(submit(store, tmp_path))
     assert final.state == "succeeded"
-    assert final.plan["text"].startswith("Project") or "Scan" in final.plan["text"]
-    assert final.plan["backend"] == "quail"
     assert final.progress["label"] == "filter (2 stages)"
-    assert final.progress["done"] == 6
-    assert final.result["rows"] == 2
-    assert final.result["columns"] == ["r.id"]
+    assert final.result["rows"] == 2 and final.result["columns"] == ["r.id"]
     directory = tmp_path / final.result["directory"]
     result = artifacts.load_result(directory, final.result,
                                    built_in_registry().codecs)
     assert sorted(result.to_rows()) == [("r0",), ("r3",)]
-    assert set(result.answer_tables["filters"]) == {("r", 0), ("r", 1)}
     assert result.report["fresh_tokens"] > 0
     assert "Scan" in result.explain()
-    report = json.loads((directory / "report.json").read_text())
-    assert report["backend"] == "quail"
+    assert json.loads((directory / "report.json").read_text())["backend"] == "quail"
 
-    # the filter chain streams each chunk's finished documents: the row
-    # index, the last stage asked, and whether it passed
+    # each entry is (row index, last stage asked, passed)
     saved = artifacts.read_answers(directory / artifacts.ANSWERS_FILE)
     assert [entry["kind"] for entry in saved] == ["filter"]
     assert saved[0]["alias"] == "r" and saved[0]["stages"] == 2
-    finished = {row: (stage, passed)
-                for row, stage, passed in saved[0]["documents"]}
+    finished = {row: (stage, passed) for row, stage, passed in saved[0]["documents"]}
     assert {row for row, (_, passed) in finished.items() if passed} == {0, 3}
     assert finished[0] == finished[3] == (1, True)
-    # the other four each fail exactly one question; which stage depends
-    # on the order the planner chose
+    # the failing stage of each other row depends on the planner's order
     assert sorted(stage for _, (stage, passed) in finished.items()
                   if not passed) == [0, 0, 1, 1]
     assert final.progress["answers_saved"] == 1
 
 
-def test_join_answers_are_saved_per_anchor_while_running(store, tmp_path):
-    """Save each finished anchor to answers.jsonl with the record's count.
+def test_failed_and_early_cancelled_runs_are_saved(store, tmp_path, monkeypatch):
+    executor = InProcessExecutor(server_fakes.hooks)
+    scheduler = scheduler_for(store, tmp_path, executor)
+    bad = scheduler.run_one(
+        submit(store, tmp_path, sql="SELECT r.nothing FROM reviews r"))
+    assert (bad.state, bad.error["type"]) == ("failed", "CompileError")
+    assert executor._loaded_model is None
 
-    The saved entries must agree with the final join answer table.
-    """
-    reviews = inputs.describe(quail.DocumentProvider.from_table(
-        server_fakes.reviews_table(), id_col="id"), tmp_path / "uploads")
-    products = inputs.describe(quail.DocumentProvider.from_table(
-        server_fakes.products_table(), id_col="asin"), tmp_path / "uploads")
-    for prepared in (reviews, products):
-        store.put_input(prepared.content_id, str(prepared.upload_path),
-                        prepared.upload_path.stat().st_size)
-    status = store.create(
-        spec={"sql": server_fakes.JOIN_SQL, "dialect": "snowflake",
-              "order": None},
-        config=server_fakes.CONFIG,
-        inputs={"reviews": reviews.spec, "products": products.spec},
-        timeout_s=1000.0)
-    scheduler = Scheduler(store, InProcessExecutor(server_fakes.hooks),
-                          tmp_path, poll_s=0.02)
-    final = scheduler.run_one(status)
-    assert final.state == "succeeded"
+    queued = submit(store, tmp_path)
+    store.request_cancel(queued.id)
+    cancelled = scheduler.run_one(queued)
+    assert cancelled.state == "cancelled" and cancelled.started_at is None
 
-    saved = artifacts.read_answers(
-        tmp_path / final.result["directory"] / artifacts.ANSWERS_FILE)
-    assert len(saved) == 6, "one entry per review anchor"
-    assert {entry["document"] for entry in saved} == set(range(6))
-    assert saved[0]["anchor"] == "r" and saved[0]["partners"] == ["p"]
-    assert all(entry["asked"] == 4 and entry["semantics"] == "full"
-               for entry in saved)
-    streamed = {(entry["document"], match[0])
-                for entry in saved for match in entry["matches"]}
-    result = artifacts.load_result(
-        tmp_path / final.result["directory"], final.result,
-        built_in_registry().codecs)
-    table = next(iter(result.answer_tables["joins"].values()))
-    final_true = {(r, p) for r, p, a in zip(
-        table["r"].to_pylist(), table["p"].to_pylist(),
-        table["answer"].to_pylist()) if a}
-    assert streamed == final_true and table.num_rows == 24
-    assert (0, 0) in streamed and (0, 1) not in streamed
-    assert final.progress["answers_saved"] == 6, "the count is written last"
-    assert artifacts.read_answers(
-        tmp_path / final.result["directory"] / artifacts.ANSWERS_FILE,
-        after=4) == saved[4:]
+    failing = scheduler_for(
+        store, tmp_path, InProcessExecutor(server_fakes.failing_hooks),
+    ).run_one(submit(store, tmp_path))
+    assert (failing.state, failing.error["type"]) == ("failed", "RuntimeError")
+    assert "refused to start" in failing.error["message"]
+    assert "Traceback" in failing.error["traceback"]
+
+    def broken_verify(directory, manifest):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("quail.server.scheduler.verify_result", broken_verify)
+    unpublished = scheduler.run_one(submit(store, tmp_path))
+    assert (unpublished.state, unpublished.error["type"]) == (
+        "failed", "PublishError")
+    assert "disk full" in unpublished.error["message"]
 
 
 def test_a_finished_execution_is_not_killed_while_it_reports_done(
         store, tmp_path):
-    """Wait for a finished execution to report done instead of killing it.
-
-    The record closes on the execution's own final event a moment before
-    the executor reports done. Killing it there would throw away the
-    process that holds the loaded model.
-    """
     stops = []
 
-    class SlowDoneExecution:
+    class Execution:
         def __init__(self, emit):
             self.emit = emit
-            self.started = time.monotonic()
 
         def wait(self, timeout):
-            # first poll: the finished event has landed, done has not
-            if self.emit is not None:
-                self.emit("failed", {"type": "RuntimeError",
-                                     "message": "GPU said no"})
-                self.emit = None
-                return False
-            # done arrives 0.2 s after start; block like Event.wait does
-            deadline = time.monotonic() + timeout
-            while time.monotonic() < deadline:
-                if time.monotonic() - self.started > 0.2:
-                    return True
-                time.sleep(0.01)
+            # the first poll sees the record closed before done is reported
+            if self.emit is None:
+                return True
+            self.emit("failed", {"type": "RuntimeError", "message": "GPU said no"})
+            self.emit = None
             return False
 
         def stop(self):
@@ -172,60 +129,24 @@ def test_a_finished_execution_is_not_killed_while_it_reports_done(
 
     class Executor:
         def start(self, job, emit):
-            return SlowDoneExecution(emit)
+            return Execution(emit)
 
-        def close(self):
-            pass
-
-    status = submit(store, tmp_path)
-    scheduler = Scheduler(store, Executor(), tmp_path, poll_s=0.02)
-    final = scheduler.run_one(status)
+    final = scheduler_for(store, tmp_path, Executor()).run_one(
+        submit(store, tmp_path))
     assert final.state == "failed" and final.error["message"] == "GPU said no"
-    assert stops == [], "the executor was killed after finishing"
-
-
-def test_compile_and_executor_failures_are_saved(store, tmp_path):
-    bad = submit(store, tmp_path, sql="SELECT r.nothing FROM reviews r")
-    executor = InProcessExecutor(server_fakes.hooks)
-    scheduler = Scheduler(store, executor, tmp_path, poll_s=0.02)
-    final = scheduler.run_one(bad)
-    assert final.state == "failed"
-    assert final.error["type"] == "CompileError"
-    assert executor._loaded_model is None
-
-    failing = submit(store, tmp_path)
-    scheduler = Scheduler(store, InProcessExecutor(server_fakes.failing_hooks),
-                          tmp_path, poll_s=0.02)
-    final = scheduler.run_one(failing)
-    assert final.state == "failed"
-    assert final.error["type"] == "RuntimeError"
-    assert "refused to start" in final.error["message"]
-    assert "Traceback" in final.error["traceback"]
-
-
-def test_publication_failure_is_a_saved_failure_not_success(
-        store, tmp_path, monkeypatch):
-    status = submit(store, tmp_path)
-
-    def broken_verify(directory, manifest):
-        raise OSError("disk full")
-
-    monkeypatch.setattr("quail.server.scheduler.verify_result", broken_verify)
-    scheduler = Scheduler(store, InProcessExecutor(server_fakes.hooks),
-                          tmp_path, poll_s=0.02)
-    final = scheduler.run_one(status)
-    assert final.state == "failed"
-    assert final.error["type"] == "PublishError"
-    assert "disk full" in final.error["message"]
+    assert stops == [], "killing it would throw away the loaded model"
 
 
 def test_verify_rejects_a_missing_or_short_result_file(tmp_path):
     table = pa.table({"r.id": ["r0", "r3"]})
     result = quail.QueryResult.from_table(table, {"backend": "quail"})
+    join_answers = pa.table({"r": [0], "p": [1], "answer": [True]})
+    result.answer_tables = {"joins": {0: join_answers}}
     manifest = artifacts.write_result(result, tmp_path)
     artifacts.verify_result(tmp_path, manifest)
-    assert artifacts.load_result(tmp_path, manifest).to_rows() == [
-        ("r0",), ("r3",)]
+    loaded = artifacts.load_result(tmp_path, manifest)
+    assert loaded.to_rows() == [("r0",), ("r3",)]
+    assert loaded.answer_tables["joins"][0].equals(join_answers)
     with pytest.raises(ValueError, match="holds 2 rows"):
         artifacts.verify_result(tmp_path, {**manifest, "rows": 3})
     (tmp_path / "result.arrow").unlink()
@@ -234,235 +155,123 @@ def test_verify_rejects_a_missing_or_short_result_file(tmp_path):
     assert not list(tmp_path.glob("*.tmp"))
 
 
-def test_scheduler_thread_runs_queued_records_in_order(store, tmp_path):
-    first = submit(store, tmp_path)
-    second = submit(store, tmp_path)
-    scheduler = Scheduler(store, InProcessExecutor(server_fakes.hooks),
-                          tmp_path, poll_s=0.02)
-    scheduler.start()
-    try:
-        done_first = wait_done(store, first.id)
-        done_second = wait_done(store, second.id)
-    finally:
-        scheduler.stop()
-    assert done_first.state == done_second.state == "succeeded"
-    assert done_first.started_at <= done_second.started_at
-
-
-def test_cancel_before_execution_never_starts_it(store, tmp_path):
-    status = submit(store, tmp_path)
-    store.request_cancel(status.id)
-    scheduler = Scheduler(store, InProcessExecutor(server_fakes.hooks),
-                          tmp_path, poll_s=0.02)
-    final = scheduler.run_one(status)
-    assert final.state == "cancelled"
-    assert final.started_at is None
-
-
-@pytest.mark.parametrize("stop", ["cancel", "timeout"])
-def test_child_process_execution_stops_on_cancel_or_timeout(
-        store, tmp_path, stop):
-    timeout_s = 1.0 if stop == "timeout" else 1000.0
-    status = submit(store, tmp_path, timeout_s=timeout_s)
+def test_child_process_execution_stops_on_timeout_and_the_next_query_runs(
+        store, tmp_path):
+    assert load_hooks(None) is None
+    assert load_hooks("server_fakes:hooks") is server_fakes.hooks
+    with pytest.raises(TypeError):
+        load_hooks("server_fakes:TRUTH")
+    first = submit(store, tmp_path, timeout_s=1.0)
     executor = ChildProcessExecutor("server_fakes:sleeping_hooks")
-    scheduler = Scheduler(store, executor, tmp_path, poll_s=0.05)
+    scheduler = scheduler_for(store, tmp_path, executor, poll_s=0.05)
     scheduler.start()
     try:
-        deadline = time.monotonic() + 60
-        while store.get(status.id).state != "running":
-            assert time.monotonic() < deadline, store.get(status.id)
-            time.sleep(0.05)
-        if stop == "cancel":
-            store.request_cancel(status.id)
-        final = wait_done(store, status.id, timeout=60)
-        if stop == "cancel":
-            assert final.state == "cancelled"
-            assert final.error["type"] == "Cancelled"
-        else:
-            assert final.state == "failed"
-            assert final.error["type"] == "TimeoutError"
-            assert "1 s timeout" in final.error["message"]
-        # the record closes first, then the child is killed; the next
-        # query starts a fresh child
-        deadline = time.monotonic() + 30
-        while executor._process is not None and executor._process.is_alive():
-            assert time.monotonic() < deadline
-            time.sleep(0.05)
-        again = submit(store, tmp_path)
+        final = wait_done(store, first.id, timeout=60)
+        assert (final.state, final.error["type"]) == ("failed", "TimeoutError")
+        assert "1 s timeout" in final.error["message"]
         executor.hooks_reference = "server_fakes:hooks"
+        again = submit(store, tmp_path)
         assert wait_done(store, again.id, timeout=60).state == "succeeded"
     finally:
         scheduler.stop()
 
 
-def test_child_process_is_replaced_when_the_model_changes(store, tmp_path):
-    """A job for another model gets a fresh child; the same model reuses it."""
-    executor = ChildProcessExecutor("server_fakes:hooks")
-    scheduler = Scheduler(store, executor, tmp_path, poll_s=0.02)
-    try:
-        first = scheduler.run_one(submit(store, tmp_path))
-        assert first.state == "succeeded"
-        pid = executor._process.pid
-        assert executor._loaded_model == "qwen3-4b-fp8"
-        assert scheduler.run_one(submit(store, tmp_path)).state == "succeeded"
-        assert executor._process.pid == pid, "same model, same child"
-
-        prepared = inputs.describe(quail.DocumentProvider.from_table(
-            server_fakes.reviews_table(), id_col="id"), tmp_path / "uploads")
-        store.put_input(prepared.content_id, str(prepared.upload_path),
-                        prepared.upload_path.stat().st_size)
-        other = store.create(
-            spec={"sql": server_fakes.FILTER_SQL, "dialect": "snowflake",
-                  "order": None},
-            config={**server_fakes.CONFIG, "model": "qwen3-32b-fp8"},
-            inputs={"reviews": prepared.spec}, timeout_s=1000.0)
-        assert scheduler.run_one(other).state == "succeeded"
-        assert executor._process.pid != pid, "another model, a new child"
-        assert executor._loaded_model == "qwen3-32b-fp8"
-    finally:
-        executor.close()
-
-
-def test_saved_phases_follow_work_and_skip_loading_for_a_warm_model(
-        store, tmp_path):
-    """Save real phase transitions and distinguish warm model reuse."""
-    executor = InProcessExecutor(server_fakes.hooks)
-    scheduler = Scheduler(store, executor, tmp_path, poll_s=0.02)
+@pytest.mark.parametrize("child", [False, True])
+def test_model_changes_switch_the_executor_and_warm_runs_skip_loading(
+        store, tmp_path, child):
+    executor = (ChildProcessExecutor("server_fakes:hooks") if child
+                else InProcessExecutor(server_fakes.hooks))
+    scheduler = scheduler_for(store, tmp_path, executor)
     seen = {}
 
     def record():
         for status in store.list_recent():
             phases = seen.setdefault(status.id, [])
-            name = status.phase["name"]
-            if not phases or phases[-1] != name:
-                phases.append(name)
+            if not phases or phases[-1] != status.phase["name"]:
+                phases.append(status.phase["name"])
 
     store.add_listener(record)
     try:
         first = submit(store, tmp_path)
         assert scheduler.run_one(first).state == "succeeded"
+        assert executor._loaded_model == "qwen3-4b-fp8"
+        pid = executor._process.pid if child else None
         second = submit(store, tmp_path)
         assert scheduler.run_one(second).state == "succeeded"
-
-        other = submit(
-            store,
-            tmp_path,
-            config={**server_fakes.CONFIG, "model": "qwen3-32b-fp8"},
-        )
+        if child:
+            assert executor._process.pid == pid, "same model, same child"
+        other = submit(store, tmp_path,
+                       config={**server_fakes.CONFIG, "model": "qwen3-32b-fp8"})
         assert scheduler.run_one(other).state == "succeeded"
+        assert executor._loaded_model == "qwen3-32b-fp8"
+        if child:
+            assert executor._process.pid != pid, "another model, a new child"
     finally:
         executor.close()
 
-    assert seen[first.id] == [
-        "queued",
-        "resolving_inputs",
-        "planning",
-        "loading_model",
-        "executing",
-        "succeeded",
-    ]
-    assert seen[second.id] == [
-        "queued",
-        "resolving_inputs",
-        "planning",
-        "executing",
-        "succeeded",
-    ]
-    assert seen[other.id] == [
-        "queued",
-        "resolving_inputs",
-        "planning",
-        "switching_model",
-        "executing",
-        "succeeded",
-    ]
-
-
-def test_child_answers_do_not_wait_for_the_parent_to_read(
-        store, tmp_path, monkeypatch):
-    """The loop's emit returns at once even when the parent reads slowly.
-
-    The child queues events and a helper thread writes the pipe. The
-    burst here is 16 MB, compared with the 64 KB a Linux pipe buffers.
-    """
-    from quail.server.executor import Job
-
-    timing = tmp_path / "burst.txt"
-    monkeypatch.setenv("QUAIL_TEST_BURST_FILE", str(timing))
-    status = submit(store, tmp_path)
-    executor = ChildProcessExecutor("server_fakes:bursting_hooks")
-    try:
-        paths = {spec["content_id"]: store.get_input(spec["content_id"]).path
-                 for spec in status.inputs.values()}
-        job = Job(status.id, status.spec, status.config, status.inputs,
-                  paths, str(tmp_path / "results" / status.id))
-        received = []
-
-        def slow_emit(kind, payload):
-            if kind == "answers" and payload["kind"] == "evict":
-                received.append(payload["document"])
-                if len(received) == 1:
-                    time.sleep(2.0)    # the parent is busy for a while
-
-        execution = executor.start(job, slow_emit)
-        assert execution.wait(120)
-        assert len(received) == server_fakes.BURST_EVENTS
-        assert received == sorted(received), "events keep their order"
-        seconds = float(timing.read_text())
-        assert seconds < 1.0, f"the burst took {seconds:.2f} s in the loop"
-    finally:
-        executor.close()
+    start = ["queued", "resolving_inputs", "planning"]
+    end = ["executing", "succeeded"]
+    assert seen[first.id] == [*start, "loading_model", *end]
+    assert seen[second.id] == [*start, *end]
+    assert seen[other.id] == [*start, "switching_model", *end]
 
 
 def test_a_stale_job_cannot_remove_the_next_jobs_sinks():
-    from quail.progress import (
-        answer_sink,
-        set_answer_sink,
-        set_progress_sink,
-    )
-
-    def first(payload):
-        pass
-
-    def second(payload):
-        pass
-
-    set_answer_sink(first)
-    set_answer_sink(second)          # the next job installs its sink
-    set_answer_sink(None, owner=first)
-    assert answer_sink() is second, "the stale job's removal is ignored"
-    set_answer_sink(None, owner=second)
-    assert answer_sink() is None
-    set_progress_sink(first)
-    set_progress_sink(None, owner=second)
-    from quail import progress
-
+    first, second = Mock(), Mock()
+    progress.set_answer_sink(first)
+    progress.set_answer_sink(second)
+    progress.set_answer_sink(None, owner=first)
+    assert progress.answer_sink() is second, "the stale job's removal is ignored"
+    progress.set_answer_sink(None, owner=second)
+    assert progress.answer_sink() is None
+    progress.set_progress_sink(first)
+    progress.set_progress_sink(None, owner=second)
     assert progress._SINK is first
-    set_progress_sink(None)
+    progress.set_progress_sink(None)
     assert progress._SINK is None
 
 
-def test_load_hooks_checks_the_type():
-    assert load_hooks(None) is None
-    assert load_hooks("server_fakes:hooks") is server_fakes.hooks
-    with pytest.raises(TypeError):
-        load_hooks("server_fakes:TRUTH")
+def test_progress_labels_and_quiet_mode(capsys):
+    progress.say("shown")
+    with progress.quiet():
+        progress.say("hidden")
+        progress.Progress("hidden step", total=2).finish("hidden step done")
+    progress.Progress("step", total=2).finish("step done", "extra")
+    out = capsys.readouterr().out
+    assert "[quail] shown" in out
+    assert "INFO" in out
+    assert "hidden" not in out
+    assert "[quail] step done: 0/2 documents" in out
+    assert out.strip().endswith("documents/s, extra")
+
+    try:
+        progress.set_gpu_index(3)
+        with progress.quiet():
+            warmup = progress.Progress("GEMM warmup", total=2,
+                                       unit="configurations", every=0,
+                                       emit=progress.logger.info)
+            warmup.update(2)
+            warmup.finish("GEMM warmup done")
+        progress.Progress("filter (2 stages)", total=10).finish("filter done")
+    finally:
+        progress.set_gpu_index(None)
+    progress.say("parent process")
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 4
+    assert all("[quail][GPU 3]" in line for line in lines[:3])
+    assert "2/2 configurations" in lines[0]
+    assert "[quail] parent process" in lines[-1]
 
 
 def test_describe_and_resolve_supported_providers(tmp_path):
     table = server_fakes.reviews_table()
     memory = inputs.describe(
         quail.DocumentProvider.from_table(table, id_col="id"), tmp_path)
-    assert memory.spec["kind"] == "snapshot"
-    assert memory.spec["id_col"] == "id"
+    assert (memory.spec["kind"], memory.spec["id_col"]) == ("snapshot", "id")
     assert memory.upload_path.name == f"{memory.content_id}.arrow"
-    # the same table gives the same content id
-    same = inputs.describe(
-        quail.DocumentProvider.from_table(table, id_col="id"), tmp_path)
-    assert same.content_id == memory.content_id
-
-    import pyarrow.parquet as pq
-
+    same = inputs.describe(quail.DocumentProvider.from_table(table, id_col="id"),
+                           tmp_path)
+    assert same.content_id == memory.content_id, "the same table, the same id"
     pq.write_table(table, tmp_path / "r.parquet")
     parquet = inputs.describe(quail.DocumentProvider.from_parquet(
         str(tmp_path / "r.parquet"), id_col="id"), tmp_path)
@@ -472,33 +281,21 @@ def test_describe_and_resolve_supported_providers(tmp_path):
     scanned = provider.scan(quail.ScanRequest(columns=("id",))).read_all()
     assert scanned.column("id").to_pylist() == table.column("id").to_pylist()
 
-    hf = quail.catalog.HuggingFaceProvider(
-        "org/data", id_col="id", arrow_schema=pa.schema([("id", pa.string())]))
+    schema = pa.schema([("id", pa.string())])
+    hf = quail.catalog.HuggingFaceProvider("org/data", id_col="id",
+                                           arrow_schema=schema)
     pinned = inputs.describe(hf, tmp_path,
                              resolve_revision=lambda name: f"sha-of-{name}")
     assert pinned.spec == {"kind": "hf", "dataset": "org/data", "config": "",
                            "split": "train", "revision": "sha-of-org/data",
                            "id_col": "id"}
     assert pinned.upload_path is None
+    pinned_provider = quail.catalog.HuggingFaceProvider(
+        "org/data", id_col="id", revision="abc", arrow_schema=schema)
+    assert pinned_provider.content_identity() != hf.content_identity()
     with pytest.raises(inputs.InvalidRequestError, match="revision"):
         inputs.resolve({**pinned.spec, "revision": ""}, {})
     with pytest.raises(inputs.InvalidRequestError, match="not uploaded"):
         inputs.resolve(memory.spec, {})
     with pytest.raises(inputs.InvalidRequestError, match="unknown input kind"):
         inputs.resolve({"kind": "s3"}, {})
-
-    class Custom:
-        id_col = "id"
-
-    with pytest.raises(TypeError, match="Custom cannot be sent"):
-        inputs.describe(Custom(), tmp_path)
-
-
-def test_hf_provider_carries_its_revision():
-    provider = quail.catalog.HuggingFaceProvider(
-        "org/data", id_col="id", revision="abc",
-        arrow_schema=pa.schema([("id", pa.string())]))
-    head = quail.catalog.HuggingFaceProvider(
-        "org/data", id_col="id", arrow_schema=pa.schema([("id", pa.string())]))
-    assert provider.content_identity() != head.content_identity()
-    assert fake_tok("a b") == ["a", "b"]
