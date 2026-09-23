@@ -835,6 +835,19 @@ def test_oversized_document_is_refused_before_execution(
     session.close()
 
 
+def test_reranker_refuses_a_query_without_score(catalog):
+    from quail.planner.plan import Refusal
+
+    with _session(catalog) as session:
+        plan = session.sql(
+            "SELECT d.id FROM documents d "
+            "WHERE AI_FILTER(PROMPT('Refund? {0}', d.body))"
+        ).plan()
+    assert isinstance(plan, Refusal)
+    assert plan.constraint == "reranker_only_scores"
+    assert plan.reasons == ("a reranker model can only be used with AI.SCORE",)
+
+
 def test_reranker_system_text_keeps_the_judgment_instruction():
     from quail.reranker import QWEN3_RERANKER_SYSTEM_TEXT
 

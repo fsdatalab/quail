@@ -323,7 +323,8 @@ def _plan_reranker(region, context, *, backend_name: str):
         for predicate in values
     ] + list(joins)
     if not predicates and not projected:
-        refusal = _refusal("a reranker model can only be used with AI.SCORE")
+        refusal = _refusal("a reranker model can only be used with AI.SCORE",
+                           "reranker_only_scores")
         return (PhysicalCandidate(None, refusal, float("inf")),)
     prompts = [predicate.prompt for predicate in predicates] + [
         score.expression.prompt for score in projected
