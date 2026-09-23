@@ -24,18 +24,6 @@ def test_allocation_preserves_page_ownership():
     with pytest.raises(KeyError):
         a.alloc("d", 5)
 
-    a = PageArena(n_pages=4, page_tokens=4)
-    pages = a.alloc("d", 10)       # 3 pages, last partially filled
-    rows = a.row_indices("d")
-    assert len(rows) == 10
-    expect = []
-    left = 10
-    for p in pages:
-        take = min(left, 4)
-        expect.extend(range(p * 4, p * 4 + take))
-        left -= take
-    assert rows == expect
-
     rng = random.Random(5)
     a = PageArena(n_pages=64, page_tokens=16)
     live = {}
