@@ -325,7 +325,7 @@ class QuailBackend:
         if context.model.role == "reranker":
             if not has_score:
                 refusal = Refusal(
-                    reasons=("a reranker model needs AI.SCORE",),
+                    reasons=("a reranker model can only be used with AI.SCORE",),
                     constraint="reranker_needs_score",
                     needed=1,
                     available=0,
