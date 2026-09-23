@@ -14,12 +14,24 @@ from quail.bench.quailb import (
     run_output,
 )
 from quail.bench.substrait import AI_URN, Filter, Join, Relation, read_plan
+from quail.builtins import built_in_registry
 from quail.catalog import DocumentProvider
+from quail.execution.execute import execute_query
+from quail.execution.result import answer_table
+from quail.execution.runner import NodeMetrics, NodeResult, RunResult
+from quail.execution.types import PhysicalResponse, export_physical_outputs
+from quail.logical.prompts import render_join_prompt_text
+from quail.physical import AiFilter, AiJoin, RequestExecution, decode_graph
+from quail.physical import Scan as PhysicalScan
 from quail.planner.plan import EngineConfig, Refusal
+from quail.specs import QWEN3_4B_FP8
 from quail_b.labels import GroundTruthCollection, PredicateLabels
-from quail_b.prompts import DISCUSS_ASPECT, F1, F4, F11, F13, SUPPORT
+from quail_b.minimum import DocumentTokens, token_metrics
+from quail_b.predicates import PREDICATES, predicate_payload
+from quail_b.prompts import DISCUSS_ASPECT, F1, F4, F11, F13, REFUTE, SUPPORT
 from quail_b.queries import get_query
 from quail_b.queries import queries as query_specs
+from quail_b.rendering import render_filter_prompt, render_join_prompt
 from quail_b.scoring import evaluate
 
 # IMDB-3 is F1 on the reviews, then the DISCUSS_ASPECT join with the aspects
@@ -30,57 +42,31 @@ CORPUS = {
 }
 
 
-def _predicate(key, template, kind, left_table, right_table=None):
-    columns = {"reviews": "body", "aspects": "aspect"}
-    return {
-        "key": key,
-        "template": template,
-        "kind": kind,
-        "left_table": left_table,
-        "left_column": columns[left_table],
-        "right_table": right_table,
-        "right_column": columns[right_table] if right_table else None,
+def _labels(key, template, answers, right_table=None):
+    predicate = {
+        "key": key, "template": template,
+        "kind": "join" if right_table else "filter",
+        "left_table": "reviews", "left_column": "body",
+        "right_table": right_table, "right_column": right_table and "aspect",
     }
+    return PredicateLabels(key, f"ls_{key}", predicate, answers,
+                           {"qwen3-32b-fp8": len(answers)})
 
 
 def _truth():
-    filter_key = "test.review.filter"
-    join_key = "test.review.aspect"
-    return GroundTruthCollection(
-        collection_id="gt_test",
-        corpus_id="c_test",
-        scale_factor=0.1,
-        reference_model="qwen3-32b-fp8",
-        predicates={
-            filter_key: PredicateLabels(
-                key=filter_key,
-                label_set_id="ls_filter",
-                predicate=_predicate(filter_key, F1, "filter", "reviews"),
-                answers={("r0", None): True, ("r1", None): False},
-                source_rows={"qwen3-32b-fp8": 2},
-            ),
-            join_key: PredicateLabels(
-                key=join_key,
-                label_set_id="ls_join",
-                predicate=_predicate(
-                    join_key, DISCUSS_ASPECT, "join", "reviews", "aspects"),
-                answers={
-                    ("r0", "a0"): True,
-                    ("r0", "a1"): False,
-                    ("r1", "a0"): False,
-                    ("r1", "a1"): True,
-                },
-                source_rows={"qwen3-32b-fp8": 4},
-            ),
-        },
+    predicates = (
+        _labels("test.review.filter", F1, {("r0", None): True, ("r1", None): False}),
+        _labels("test.review.aspect", DISCUSS_ASPECT, {
+            ("r0", "a0"): True, ("r0", "a1"): False,
+            ("r1", "a0"): False, ("r1", "a1"): True,
+        }, "aspects"),
     )
+    return GroundTruthCollection("gt_test", "c_test", 0.1, "qwen3-32b-fp8",
+                                 {labels.key: labels for labels in predicates})
 
 
 def fever_truth():
     """Labels for FEV-9 over a three claim, three evidence corpus."""
-    from quail_b.predicates import PREDICATES, predicate_payload
-    from quail_b.prompts import REFUTE
-
     corpus = {
         "claims": pa.table({"id": ["c0", "c1", "c2"],
                             "claim": ["person one", "person two", "a place"]}),
@@ -115,19 +101,16 @@ def _token_ids(text):
     return [byte + 1 for byte in text.encode("utf-8")]
 
 
+def _config(backend):
+    return EngineConfig(gpus=1, model="qwen3-4b-fp8", backend=backend,
+                        device="h100-sxm")
+
+
 def _session(tmp_path, backend="quail"):
     for name, table in CORPUS.items():
         pq.write_table(table, tmp_path / f"{name}.parquet")
     tokenizer = str.split if backend == "quail" else _token_ids
-    sess = quail.Session(
-        EngineConfig(
-            gpus=1,
-            model="qwen3-4b-fp8",
-            backend=backend,
-            device="h100-sxm",
-        ),
-        tokenizer=tokenizer,
-    )
+    sess = quail.Session(_config(backend), tokenizer=tokenizer)
     for name in CORPUS:
         sess.register(name, DocumentProvider.from_parquet(
             str(tmp_path / f"{name}.parquet"), id_col="id"))
@@ -147,30 +130,27 @@ def _query(sess):
             .select("r.id", "a.id"))
 
 
-def _run(query, join_answers):
+def _execute(query, nodes, **metrics):
     def execute(request):
-        from quail.builtins import built_in_registry
-        from quail.execution.runner import NodeMetrics, NodeResult, RunResult
-        from quail.execution.types import PhysicalResponse, export_physical_outputs
-        from quail.physical import (
-            AiFilter,
-            AiJoin,
-            Scan,
-            decode_graph,
-        )
-
         graph = decode_graph(request.plan["graph"], built_in_registry().codecs)
-        filtered = next(
-            node for node in graph.nodes if isinstance(node, AiFilter)
-        )
-        anchored = next(
-            node for node in graph.nodes if isinstance(node, AiJoin)
-        )
+        outputs = export_physical_outputs(
+            graph, RunResult(None, nodes(graph, request), NodeMetrics()))
+        return PhysicalResponse(outputs, {
+            "wall_s": 2.0, "boot_s": 3.0, "boot_kind": "cold", "boot": {},
+            "fresh_tokens": 2000, "peak_gib": 1.0, **metrics})
+
+    return execute_query(query, physical_executor=execute)
+
+
+def _run(query, join_answers):
+    def nodes(graph, request):
+        filtered = next(node for node in graph.nodes if isinstance(node, AiFilter))
+        anchored = next(node for node in graph.nodes if isinstance(node, AiJoin))
         join = anchored.stages[0].runtime_spec()
-        nodes = {
+        return {
             **{node.node_id: NodeResult({f"ids:{node.alias}": range(
                 len(request.inputs[node.input_id].documents))})
-               for node in graph.nodes if isinstance(node, Scan)},
+               for node in graph.nodes if isinstance(node, PhysicalScan)},
             filtered.node_id: NodeResult({
                 "ids:r": [0],
                 "filter_answers:r": {0: [1], 1: [0]},
@@ -189,37 +169,14 @@ def _run(query, join_answers):
                 },
             }),
         }
-        outputs = export_physical_outputs(
-            graph, RunResult(None, nodes, NodeMetrics())
-        )
-        return PhysicalResponse(outputs, {
-            "wall_s": 2.0,
-            "boot_s": 3.0,
-            "boot_kind": "cold",
-            "boot": {},
-            "fresh_tokens": 2000,
-            "store": None,
-            "peak_gib": 1.0,
-        })
 
-    from quail.execution.execute import execute_query
-
-    return execute_query(query, physical_executor=execute)
+    return _execute(query, nodes, store=None)
 
 
 def _run_request_backend(query, join_answers):
-    def execute(request):
-        from quail.builtins import built_in_registry
-        from quail.execution.result import answer_table
-        from quail.execution.runner import NodeMetrics, NodeResult, RunResult
-        from quail.execution.types import PhysicalResponse, export_physical_outputs
-        from quail.physical import RequestExecution, decode_graph
-
-        graph = decode_graph(request.plan["graph"], built_in_registry().codecs)
+    def nodes(graph, request):
         model = next(
-            node for node in graph.nodes
-            if isinstance(node, RequestExecution)
-        )
+            node for node in graph.nodes if isinstance(node, RequestExecution))
         filter_table = pa.table({
             "r": pa.array([0, 1], type=pa.int32()),
             "predicate": pa.array([0, 0], type=pa.int32()),
@@ -232,43 +189,23 @@ def _run_request_backend(query, join_answers):
             {"r": [0, 0], "a": [0, 1]},
             [bool(answer) for answer in join_answers],
             "join_answers",
-            metadata={
-                "anchor": "r",
-                "partners": "a",
-                "semantics": "full",
-                "written_pos": 0,
-            },
+            metadata={"anchor": "r", "partners": "a", "semantics": "full",
+                      "written_pos": 0},
         )
         true_aspects = [
             index for index, answer in enumerate(join_answers) if answer
         ]
-        nodes = {
-            model.node_id: NodeResult({
-                "ids:r": [0] if true_aspects else [],
-                "ids:a": true_aspects,
-                "filter_answers:r": filter_table,
-                "join_answers:0": join_table,
-            })
-        }
-        outputs = export_physical_outputs(
-            graph, RunResult(None, nodes, NodeMetrics())
-        )
-        return PhysicalResponse(outputs, {
-            "wall_s": 2.0,
-            "boot_s": 3.0,
-            "boot_kind": "cold",
-            "boot": {},
-            "fresh_tokens": 2000,
-            "cached_tokens": 0,
-            "peak_gib": 1.0,
-        })
+        return {model.node_id: NodeResult({
+            "ids:r": [0] if true_aspects else [],
+            "ids:a": true_aspects,
+            "filter_answers:r": filter_table,
+            "join_answers:0": join_table,
+        })}
 
-    from quail.execution.execute import execute_query
-
-    return execute_query(query, physical_executor=execute)
+    return _execute(query, nodes, cached_tokens=0)
 
 
-def test_read_plan_gives_relations_operators_and_projection():
+def test_read_plan_reads_operators_and_rejects_other_extensions():
     plan = read_plan(get_query("IMDB-4").plan)
     assert plan.relations == (Relation("r", "reviews"), Relation("a", "aspects"))
     assert plan.operators == (
@@ -292,8 +229,6 @@ def test_read_plan_gives_relations_operators_and_projection():
         assert len(set(ids)) == len(ids), spec.id
         assert all(name.endswith(".id") for name in plan.select), spec.id
 
-
-def test_read_plan_rejects_an_ai_function_from_another_extension():
     plan = get_query("IMDB-1").plan
     plan.extension_urns[0].urn = AI_URN + ".other"
     with pytest.raises(ValueError, match="ai_filter"):
@@ -302,12 +237,9 @@ def test_read_plan_rejects_an_ai_function_from_another_extension():
 
 def test_benchmark_results_and_scoring(tmp_path):
     plan = read_plan(SPEC.plan)
-    sess = _session(tmp_path)
-    try:
-        result = _run(_query(sess), [1, 0])
-        output = run_output(result, plan, CORPUS)
-    finally:
-        sess.close()
+    with _session(tmp_path) as sess:
+        quail_result = _run(_query(sess), [1, 0])
+    output = run_output(quail_result, plan, CORPUS)
 
     assert output.filter_answers["filter-1"].to_pydict() == {
         "r": ["r0", "r1"], "answer": [True, False]}
@@ -318,25 +250,18 @@ def test_benchmark_results_and_scoring(tmp_path):
     assert evaluation["answer_accuracy"]["accuracy"] == 1.0
     assert evaluation["output_accuracy"]["exact_match"] is True
 
-    sess = _session(tmp_path, backend="stock_vllm")
-    try:
+    with _session(tmp_path, backend="stock_vllm") as sess:
         query = _query(sess)
         result = _run_request_backend(query, [0, 0])
         output = run_output(result, plan, CORPUS)
         output.prompt_pieces = prompt_pieces(query, plan, join_anchors(result))
         tokenizer_name = sess.model.hf_name
-    finally:
-        sess.close()
 
     evaluation = evaluate(SPEC, output, _truth(), CORPUS)
     assert evaluation["answer_accuracy"]["evaluated"] == 4
     assert evaluation["answer_accuracy"]["correct"] == 3
-    assert [item["op"] for item in evaluation["per_predicate"]] == [
-        "filter", "join"
-    ]
+    assert [item["op"] for item in evaluation["per_predicate"]] == ["filter", "join"]
     assert output.rows.num_rows == 0
-    from quail_b.minimum import DocumentTokens, token_metrics
-
     pieces = output.prompt_pieces
     assert pieces["tokenizer"] == tokenizer_name
     # the model's user turn opens ahead of the document preamble
@@ -357,72 +282,54 @@ def test_benchmark_results_and_scoring(tmp_path):
     project.expressions[0].selection.direct_reference.struct_field.field = 1
     text_plan = read_plan(text_plan)
     assert text_plan.select == ("r.body", "a.id")
-    sess = _session(tmp_path)
-    try:
-        result = _run(_query(sess), [1, 0])
-        with pytest.raises(NotImplementedError):
-            run_output(result, text_plan, CORPUS)
-    finally:
-        sess.close()
+    with pytest.raises(NotImplementedError):
+        run_output(quail_result, text_plan, CORPUS)
 
 
-def test_benchmark_query_prompts_and_labels():
-    for backend in [
-    "quail", "stock_vllm", "pipelined_vllm", "pipelined_sglang",
-]:
-        corpus, truth = fever_truth()
-        spec = get_query("FEV-9")
-        plan = read_plan(spec.plan)
-        answer = answer_oracle(truth, corpus)
+@pytest.mark.parametrize(
+    "backend", ["quail", "stock_vllm", "pipelined_vllm", "pipelined_sglang"])
+def test_benchmark_query_prompts_and_labels(backend):
+    corpus, truth = fever_truth()
+    spec = get_query("FEV-9")
+    plan = read_plan(spec.plan)
+    answer = answer_oracle(truth, corpus)
+    with quail.Session(
+        _config(backend), tokenizer=lambda text: list(text.encode("utf-8"))
+    ) as session:
+        for name, table in corpus.items():
+            session.register(name, DocumentProvider.from_table(table, id_col="id"))
+        query = build_query(session, spec)
+        assert not isinstance(query.plan(), Refusal)
+        operators = query.logical.operators()
+        filters, joins = operators.filters, operators.joins
+        tables = {relation.alias: relation.table for relation in plan.relations}
+        assert [scan.alias for scan in operators.scans] == list(tables)
+        assert {alias: [p.prompt.template for p in chain]
+                for alias, chain in filters.items()} == {
+            alias: [
+                quail.bind_prompt(item.prompt, (quail.ColumnRef(
+                    alias, tables[alias], item.column),)).template
+                for item in plan.filters if item.alias == alias]
+            for alias in tables if any(
+                item.alias == alias for item in plan.filters)}
+        assert [tuple(arg.alias for arg in join.prompt.args)
+                for join in joins] == [join.aliases for join in plan.joins]
+        # c0 is about a person and e0 supports it; c2 is not about a person
+        assert answer(filters["c1"][0].prompt, {"c1": 0}) is True
+        assert answer(filters["c1"][0].prompt, {"c1": 2}) is False
+        assert answer(joins[0].prompt, {"c1": 0, "e1": 0}) is True
+        assert answer(joins[0].prompt, {"c1": 0, "e1": 1}) is False
+        # the same labels drive the speed of light estimate
+        estimate = quail.speed_of_light_estimate(query, answer)
+        assert estimate.post_filter_counts == {
+            "c1": 2, "e1": 2, "c2": 2, "e2": 2}
+        assert len(estimate.join_stages) == 3
+        assert queries(session)["FEV-9"][0] == spec.description
+        # only the FEVER tables are registered
+        assert all(query_id.startswith("FEV-") for query_id in queries(session))
 
-        config = EngineConfig(
-            gpus=1,
-            model="qwen3-4b-fp8",
-            backend=backend,
-            device="h100-sxm",
-        )
-        with quail.Session(
-            config, tokenizer=lambda text: list(text.encode("utf-8"))
-        ) as session:
-            for name, table in corpus.items():
-                session.register(name, DocumentProvider.from_table(table, id_col="id"))
-            query = build_query(session, spec)
-            assert not isinstance(query.plan(), Refusal)
-            operators = query.logical.operators()
-            scans, filters, joins = (
-                operators.scans, operators.filters, operators.joins)
-            tables = {relation.alias: relation.table
-                      for relation in plan.relations}
-            assert [scan.alias for scan in scans] == list(tables)
-            assert {alias: [p.prompt.template for p in chain]
-                    for alias, chain in filters.items()} == {
-                alias: [
-                    quail.bind_prompt(item.prompt, (quail.ColumnRef(
-                        alias, tables[alias], item.column),)).template
-                    for item in plan.filters if item.alias == alias]
-                for alias in tables if any(
-                    item.alias == alias for item in plan.filters)}
-            assert [tuple(arg.alias for arg in join.prompt.args)
-                    for join in joins] == [join.aliases for join in plan.joins]
-            # c0 is about a person and e0 supports it; c2 is not about a person
-            assert answer(filters["c1"][0].prompt, {"c1": 0}) is True
-            assert answer(filters["c1"][0].prompt, {"c1": 2}) is False
-            assert answer(joins[0].prompt, {"c1": 0, "e1": 0}) is True
-            assert answer(joins[0].prompt, {"c1": 0, "e1": 1}) is False
-            # the same labels drive the speed of light estimate
-            estimate = quail.speed_of_light_estimate(query, answer)
-            assert estimate.post_filter_counts == {
-                "c1": 2, "e1": 2, "c2": 2, "e2": 2}
-            assert len(estimate.join_stages) == 3
-            assert queries(session)["FEV-9"][0] == spec.description
-            # only the FEVER tables are registered
-            assert all(query_id.startswith("FEV-") for query_id in queries(session))
 
-    # the benchmark renders the same raw prompt as Quail; Qwen has no turn text
-    from quail.specs import QWEN3_4B_FP8
-    from quail_b.predicates import PREDICATES
-    from quail_b.rendering import render_filter_prompt, render_join_prompt
-
+def test_benchmark_renders_the_same_raw_prompt_as_quail():
     turn = QWEN3_4B_FP8.turn
     for spec in PREDICATES:
         left = quail.ColumnRef("left", spec.left_table, spec.left_column)
@@ -433,14 +340,9 @@ def test_benchmark_query_prompts_and_labels():
                         + prompt.tail.replace("{0}", "", 1))
             assert render_filter_prompt(spec.template, "doc one") == expected
         else:
-            right = quail.ColumnRef(
-                "right", spec.right_table, spec.right_column)
-            prompt = quail.bind_join_prompt(spec.template, (left, right),
-                                            turn=turn)
-            from quail.logical.prompts import render_join_prompt_text
-
+            right = quail.ColumnRef("right", spec.right_table, spec.right_column)
+            prompt = quail.bind_join_prompt(spec.template, (left, right), turn=turn)
+            documents = ("doc one", "doc two")
             for anchor in (0, 1):
-                documents = ("doc one", "doc two")
                 assert render_join_prompt(spec.template, documents, anchor) == (
                     render_join_prompt_text(prompt, documents, anchor))
-

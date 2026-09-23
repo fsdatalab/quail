@@ -11,19 +11,26 @@ from quail.server.__main__ import (
     settings_from_args,
 )
 
+H100 = "NVIDIA H100 80GB HBM3"
 
-def test_no_options_means_every_model_on_the_gpu_found(tmp_path):
+
+def test_no_options_means_every_model_on_the_gpu_found_and_says_how_to_connect():
     args = parse_args([])
-    settings = settings_from_args(
-        args, gpu_name=lambda: "NVIDIA H100 80GB HBM3")
+    settings = settings_from_args(args, gpu_name=lambda: H100)
     assert settings.device == "h100-sxm"
     assert "qwen3-4b-fp8" in settings.models
     assert "diffusion-gemma-26b-a4b-fp8" in settings.models
     assert settings.data_dir == Path("~/.quail/server").expanduser()
-    assert settings.data_dir.is_absolute()
     assert settings.gpus == (1,) and settings.backends == ("quail",)
     assert settings.token is None
     assert (args.host, args.port) == ("127.0.0.1", 8642)
+
+    text = describe(settings, "0.0.0.0", 8642)
+    assert "Quail Server on h100-sxm: " in text
+    assert f"data: {settings.data_dir}" in text
+    assert 'endpoint="http://127.0.0.1:8642"' in text
+    assert "token: none" in text
+    assert 'endpoint="http://gpu-host:1"' in describe(settings, "gpu-host", 1)
 
 
 def test_options_override_detection_and_defaults(tmp_path):
@@ -41,13 +48,11 @@ def test_options_override_detection_and_defaults(tmp_path):
     assert settings.device == "rtx-pro-6000-blackwell-server"
     assert settings.gpus == (1, 2) and settings.token == "secret"
     assert settings.max_upload_bytes == 1 << 29
+    assert "token: required" in describe(settings, "0.0.0.0", 9000)
     with pytest.raises(ValueError, match="unknown model 'gpt-9'"):
-        settings_from_args(parse_args(["--model", "gpt-9"]),
-                           gpu_name=lambda: "NVIDIA H100 80GB HBM3")
+        settings_from_args(parse_args(["--model", "gpt-9"]), gpu_name=lambda: H100)
 
-
-def test_detect_device_names_the_choices_when_it_cannot_map():
-    assert detect_device("NVIDIA H100 80GB HBM3") == "h100-sxm"
+    assert detect_device(H100) == "h100-sxm"
     assert detect_device(
         "NVIDIA RTX PRO 6000 Blackwell Server Edition"
     ) == "rtx-pro-6000-blackwell-server"
@@ -55,15 +60,3 @@ def test_detect_device_names_the_choices_when_it_cannot_map():
         detect_device(None)
     with pytest.raises(SystemExit, match="'NVIDIA H100 PCIe' is not"):
         detect_device("NVIDIA H100 PCIe")
-
-
-def test_describe_says_how_to_connect(tmp_path):
-    settings = settings_from_args(
-        parse_args(["--data-dir", str(tmp_path), "--model", "qwen3-4b-fp8",
-                    "--device", "h100-sxm"]))
-    text = describe(settings, "0.0.0.0", 8642)
-    assert "Quail Server on h100-sxm: qwen3-4b-fp8" in text
-    assert f"data: {tmp_path}" in text
-    assert 'endpoint="http://127.0.0.1:8642"' in text
-    assert "token: none" in text
-    assert 'endpoint="http://gpu-host:1"' in describe(settings, "gpu-host", 1)

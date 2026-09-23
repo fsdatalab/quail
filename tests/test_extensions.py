@@ -45,80 +45,72 @@ def _count(registry):
         PortRef("input", "ids:d"),
     )
     rewritten, _ = apply_physical_rules(
-        graph, tuple(registry.physical_rules.values()), None,
-    )
+        graph, tuple(registry.physical_rules.values()), None)
     return rewritten.nodes[0].n_docs
 
 
 def test_extension_order_and_nested_registration(monkeypatch):
-    with monkeypatch.context() as patch:
-        def register(registry):
-            assert "double" in registry.physical_rules
-            registry.register_physical_rule(ChangeCount("add_three", offset=3))
+    def register(registry):
+        assert "double" in registry.physical_rules
+        registry.register_physical_rule(ChangeCount("add_three", offset=3))
 
-        module = _module(patch, "test_order_extension", register)
-        registry = (
-            built_in_registry()
-            .register_physical_rule(ChangeCount("double", factor=2))
-            .load_extension(module)
-            .register_physical_rule(ChangeCount("double_again", factor=2))
-        )
-        assert _count(registry) == 10
+    registry = (
+        built_in_registry()
+        .register_physical_rule(ChangeCount("double", factor=2))
+        .load_extension(_module(monkeypatch, "test_order_extension", register))
+        .register_physical_rule(ChangeCount("double_again", factor=2))
+    )
+    assert _count(registry) == 10
 
-    with monkeypatch.context() as patch:
-        calls = []
+    calls = []
 
-        def register_inner(registry):
-            calls.append("inner")
-            registry.register_physical_rule(ChangeCount("inner"))
+    def register_inner(registry):
+        calls.append("inner")
+        registry.register_physical_rule(ChangeCount("inner"))
 
-        inner = _module(patch, "test_inner_extension", register_inner)
+    inner = _module(monkeypatch, "test_inner_extension", register_inner)
 
-        def register_outer(registry):
-            calls.append("outer")
-            registry.register_physical_rule(ChangeCount("before"))
-            registry.load_extension(inner)
-            registry.register_physical_rule(ChangeCount("after"))
+    def register_outer(registry):
+        calls.append("outer")
+        registry.register_physical_rule(ChangeCount("before"))
+        registry.load_extension(inner)
+        registry.register_physical_rule(ChangeCount("after"))
 
-        outer = _module(patch, "test_outer_extension", register_outer)
-        registry = built_in_registry().load_extension(outer)
-        assert list(registry.physical_rules) == ["before", "inner", "after"]
-        assert registry.extension_modules == (outer.__name__, inner.__name__)
-        assert calls == ["outer", "inner"]
+    outer = _module(monkeypatch, "test_outer_extension", register_outer)
+    registry = built_in_registry().load_extension(outer)
+    assert list(registry.physical_rules) == ["before", "inner", "after"]
+    assert registry.extension_modules == (outer.__name__, inner.__name__)
+    assert calls == ["outer", "inner"]
 
 
 def test_failed_extension_registration_rolls_back(monkeypatch):
-    with monkeypatch.context() as patch:
-        registry = built_in_registry().register_physical_rule(ChangeCount("existing"))
+    registry = built_in_registry().register_physical_rule(ChangeCount("existing"))
 
-        def register(registry):
-            registry.register_physical_rule(ChangeCount("added"))
-            registry.register_physical_rule(ChangeCount("existing"))
+    def register(registry):
+        registry.register_physical_rule(ChangeCount("added"))
+        registry.register_physical_rule(ChangeCount("existing"))
 
-        module = _module(patch, "test_failed_extension", register)
-        with pytest.raises(ValueError, match="duplicate physical_rule"):
-            registry.load_extension(module)
-        assert list(registry.physical_rules) == ["existing"]
-        assert registry.extension_modules == ()
-
-        def retry(registry):
-            registry.register_physical_rule(ChangeCount("added"))
-
-        module.register_quail_extension = retry
+    module = _module(monkeypatch, "test_failed_extension", register)
+    with pytest.raises(ValueError, match="duplicate physical_rule"):
         registry.load_extension(module)
-        assert list(registry.physical_rules) == ["existing", "added"]
+    assert list(registry.physical_rules) == ["existing"]
+    assert registry.extension_modules == ()
 
-    with monkeypatch.context() as patch:
-        def register(registry):
-            registry.register_physical_rule(ChangeCount("added"))
-            registry.load_extension("test_recursive_extension")
+    module.register_quail_extension = (
+        lambda registry: registry.register_physical_rule(ChangeCount("added")))
+    registry.load_extension(module)
+    assert list(registry.physical_rules) == ["existing", "added"]
 
-        module = _module(patch, "test_recursive_extension", register)
-        registry = built_in_registry()
-        with pytest.raises(ValueError, match="duplicate extension module"):
-            registry.load_extension(module)
-        assert not registry.physical_rules
-        assert not registry.extension_modules
+    def recursive(registry):
+        registry.register_physical_rule(ChangeCount("added"))
+        registry.load_extension("test_recursive_extension")
+
+    module = _module(monkeypatch, "test_recursive_extension", recursive)
+    registry = built_in_registry()
+    with pytest.raises(ValueError, match="duplicate extension module"):
+        registry.load_extension(module)
+    assert not registry.physical_rules
+    assert not registry.extension_modules
 
 
 def test_node_registration_validation_and_execution():
@@ -127,17 +119,14 @@ def test_node_registration_validation_and_execution():
         if existing == "codec":
             registry.register_codec(NodeCodec(CustomInput))
         else:
-            registry.register_runtime(
-                ScanRuntime(), key=CustomInput.runtime_key)
+            registry.register_runtime(ScanRuntime(), key=CustomInput.runtime_key)
         codecs, runtimes = dict(registry.codecs), dict(registry.runtimes)
         with pytest.raises(ValueError, match=f"duplicate {existing}"):
             registry.register_node(CustomInput, runtime=ScanRuntime())
         assert dict(registry.codecs) == codecs
         assert dict(registry.runtimes) == runtimes
 
-    registry = built_in_registry().register_node(
-        CustomInput, runtime=ScanRuntime(),
-    )
+    registry = built_in_registry().register_node(CustomInput, runtime=ScanRuntime())
     node = CustomInput(node_id="custom", alias="d", input_id="d", n_docs=2)
     codec = registry.codecs[node.type_name]
     assert codec.decode(codec.encode(node)) == node

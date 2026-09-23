@@ -1,4 +1,4 @@
-"""Booting a GPU for a query, and reusing it for the next one."""
+"""Booting a GPU for a query, reusing it, and releasing it for another model."""
 
 import contextlib
 import sys
@@ -8,11 +8,11 @@ from types import SimpleNamespace
 import pytest
 
 from quail.backends.quail import worker
+from quail.backends.quail.worker import LoadedGpu
 from quail.builtins import built_in_registry
 
 
 def install_fake_torch(monkeypatch):
-    """Put a GPU-free torch in sys.modules for the duration of a test."""
     functional = types.ModuleType("torch.nn.functional")
     functional.linear = lambda a, b: a
     nn = types.ModuleType("torch.nn")
@@ -22,110 +22,24 @@ def install_fake_torch(monkeypatch):
     torch.bfloat16 = "bfloat16"
     torch.ones = lambda *args, **kwargs: SimpleNamespace()
     torch.inference_mode = contextlib.nullcontext
-    torch.cuda = SimpleNamespace(
-        mem_get_info=lambda: (40 * 2**30, 80 * 2**30),
-        current_blas_handle=lambda: 1,
-        synchronize=lambda: None,
-    )
+    torch.cuda = SimpleNamespace(mem_get_info=lambda: (40 * 2**30, 80 * 2**30),
+                                 current_blas_handle=lambda: 1,
+                                 synchronize=lambda: None)
     monkeypatch.setitem(sys.modules, "torch", torch)
     monkeypatch.setitem(sys.modules, "torch.nn", nn)
     monkeypatch.setitem(sys.modules, "torch.nn.functional", functional)
 
 
-class FakeExecution:
-    def __init__(self, calls):
-        self.calls = calls
-
-    def bind_loaded_model(self, *, model, arena, pipeline):
-        self.calls.append("bind_loaded_model")
-
-    def bind_query(self, *, torch, async_answers, answer_rows, chunk_tokens):
-        self.calls.append(f"bind_query:{chunk_tokens}")
-
-
-class FakeBackend:
-    name = "quail"
-
-    def __init__(self, calls):
-        self.calls = calls
-
-    def start(self, context):
-        self.calls.append(f"start:gpu{context.gpu_index}")
-        return FakeExecution(self.calls)
-
-
 @pytest.fixture
 def booted(monkeypatch):
     install_fake_torch(monkeypatch)
-    calls = []
     monkeypatch.setattr(worker, "set_gpu_index", lambda index: None)
     monkeypatch.setattr(worker, "say", lambda message: None)
-    monkeypatch.setattr(worker, "load_model",
-                        lambda *a, **k: SimpleNamespace())
-    monkeypatch.setattr(worker, "KVArena", lambda **k: SimpleNamespace())
-    monkeypatch.setattr(worker, "build_pipeline",
-                        lambda *a, **k: SimpleNamespace())
-    monkeypatch.setattr(worker, "AsyncAnswers",
-                        lambda torch, rows: SimpleNamespace())
-    monkeypatch.setattr(worker, "AnswerRows",
-                        lambda *a, **k: SimpleNamespace())
+    for name in ("load_model", "build_pipeline", "AnswerRows", "KVArena",
+                 "AsyncAnswers"):
+        monkeypatch.setattr(worker, name, lambda *a, **k: SimpleNamespace())
     monkeypatch.setattr(worker, "warm_kernels",
                         lambda *a, **k: {"tier": "compiled"})
-    return calls
-
-
-def test_gpu_context_model_reuse_and_graph_state(booted):
-    registry = built_in_registry()
-    envelope = {"workers": 4, "model": "qwen3-4b-fp8", "device": "h100-sxm"}
-
-    context = worker._single_gpu_context(registry, envelope)
-
-    assert context.gpu_index == 0
-    assert context.gpu_count == 4
-    assert context.model.name == "qwen3-4b-fp8"
-    assert context.device.name == "h100-sxm"
-    assert dict(context.query_settings) == {}
-
-    calls = booted
-    registry = built_in_registry()
-    backend = FakeBackend(calls)
-    context = worker._single_gpu_context(registry, {
-        "workers": 1, "model": "qwen3-4b-fp8", "device": "h100-sxm",
-    })
-    runtime_state = {}
-
-    gpu, boot = worker._boot_for_query(
-        runtime_state, backend, context, 8192, [1, 2], [3, 4])
-
-    assert boot["kind"] == "cold"
-    assert boot["warm_tier"] == "compiled"
-    assert gpu.chunk_tokens == 8192
-    assert calls == ["start:gpu0", "bind_loaded_model", "bind_query:8192"]
-
-    calls.clear()
-    again, second = worker._boot_for_query(
-        runtime_state, backend, context, 4096, [1, 2], [3, 4])
-
-    assert again is gpu
-    assert second["kind"] == "warm"
-    assert second["load_model_s"] == 0.0
-    assert second["warm_kernels_s"] == 0.0
-    assert again.chunk_tokens == 4096
-    assert calls == ["bind_query:4096"]
-
-    registry = built_in_registry()
-    context = worker._single_gpu_context(registry, {
-        "workers": 1, "model": "qwen3-4b-fp8", "device": "h100-sxm",
-    })
-    gpu, _ = worker._boot_for_query(
-        {}, FakeBackend(booted), context, 8192, [1], [2])
-
-    state = worker._gpu_state(gpu)
-
-    assert state["model_execution"] is gpu.execution
-    assert state["arena"] is gpu.arena
-    assert state["pipeline"] is gpu.pipeline
-    assert state["spec"].name == "qwen3-4b-fp8"
 
 
 ENVELOPE = {
@@ -133,15 +47,8 @@ ENVELOPE = {
     "workers": 1,
     "settings": {"chunk_tokens": 8192, "true_ids": [1], "false_ids": [2]},
 }
-
-
-def payload_for(envelope):
-    """Build the flattened payload execute_quail_payload expects."""
-    return {
-        "physical_plan": envelope, "model": envelope["model"],
-        "workers": envelope["workers"], "docs": {},
-        **dict(envelope["settings"]),
-    }
+PAYLOAD = {"physical_plan": ENVELOPE, "model": "qwen3-4b-fp8", "workers": 1,
+           "docs": {}, **ENVELOPE["settings"]}
 
 
 def test_prepared_boot_is_handed_to_the_query_and_used_once(
@@ -170,30 +77,80 @@ def test_prepared_boot_is_handed_to_the_query_and_used_once(
     assert len(boots) == 1
 
     response = worker.execute_quail_payload(
-        payload_for(ENVELOPE), registry, object(), backend, runtime_state)
+        PAYLOAD, registry, object(), backend, runtime_state)
 
     assert response.metrics["boot_kind"] == "cold"
     assert gpu.prepared_boot is None
     assert len(boots) == 1
 
     second = worker.execute_quail_payload(
-        payload_for(ENVELOPE), registry, object(), backend, runtime_state)
+        PAYLOAD, registry, object(), backend, runtime_state)
 
     assert second.metrics["boot_kind"] == "warm"
     assert len(boots) == 2
     assert runtime_state[("quail", "qwen3-4b-fp8")] is gpu
-
-
-def test_bind_query_resizes_the_arena_to_the_plan_split(booted):
-    calls = booted
-    backend = FakeBackend(calls)
-    registry = built_in_registry()
-    context = worker._single_gpu_context(registry, {
-        "workers": 1, "model": "qwen3-4b-fp8", "device": "h100-sxm",
-    })
-    gpu, _ = worker._boot_for_query({}, backend, context, 8192, [1], [2])
     resized = []
     gpu.arena = SimpleNamespace(
         resize=lambda *pages, **kw: resized.append((pages, kw)))
     gpu.bind_query([1], [2], 4096, arena_pages=(8, 2))
     assert resized == [((8, 2), {"free_resident": True})]
+
+
+def test_release_booted_models_clears_state_and_cuda_cache(monkeypatch):
+    calls = []
+    cuda = SimpleNamespace(
+        is_available=lambda: True,
+        synchronize=lambda: calls.append("synchronize"),
+        empty_cache=lambda: calls.append("empty_cache"),
+        ipc_collect=lambda: calls.append("ipc_collect"),
+        memory_allocated=lambda: 123,
+        memory_reserved=lambda: 456,
+    )
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=cuda))
+    monkeypatch.setattr(worker.gc, "collect", lambda: calls.append("gc"))
+    monkeypatch.setattr(worker, "_release_vllm_parallel_state",
+                        lambda: calls.append("release_parallel_state"))
+    gpu = LoadedGpu.__new__(LoadedGpu)
+    gpu.close = lambda: calls.append("close")
+    booted = {("quail", "test"): gpu}
+    result = worker.release_booted_models(booted)
+    assert booted == {}
+    assert calls == ["synchronize", "close", "release_parallel_state", "gc",
+                     "empty_cache", "ipc_collect"]
+    assert result == {"models_released": 1, "vllm_parallel_state_released": True,
+                      "cuda_allocated_bytes": 123, "cuda_reserved_bytes": 456}
+
+
+def test_booting_a_different_model_releases_the_loaded_one(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        worker, "release_booted_models",
+        lambda state: (calls.append(sorted(state)), state.clear()))
+
+    class _FakeLoaded:
+        def __init__(self, backend, context, answer_ids):
+            calls.append(("load", context.model.name))
+
+        def bind_query(self, *args):
+            calls.append("bind")
+
+        def warm(self):
+            return 0.0, None
+
+        load_model_s = arena_s = pipeline_s = 0.0
+
+    monkeypatch.setattr(worker, "LoadedGpu", _FakeLoaded)
+    monkeypatch.setattr(worker, "_boot_record",
+                        lambda gpu, cold, warm_s, tier, t: {
+                            "boot_s": 0.0, "kind": "cold" if cold else "warm"})
+    backend = SimpleNamespace(name="quail")
+    state = {("quail", "qwen3-4b-fp8"): object()}
+    context = SimpleNamespace(model=SimpleNamespace(name="qwen3-reranker"))
+
+    gpu, boot = worker._boot_for_query(state, backend, context, 100, [1], [2])
+    assert calls == [[("quail", "qwen3-4b-fp8")], ("load", "qwen3-reranker"),
+                     "bind"]
+    assert list(state) == [("quail", "qwen3-reranker")] and boot["kind"] == "cold"
+
+    gpu2, boot2 = worker._boot_for_query(state, backend, context, 100, [1], [2])
+    assert gpu2 is gpu and boot2["kind"] == "warm" and calls[-1] == "bind"

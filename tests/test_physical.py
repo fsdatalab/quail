@@ -2,6 +2,8 @@
 
 import copy
 import re
+import sys
+import types
 from dataclasses import dataclass, replace
 from typing import ClassVar
 
@@ -11,7 +13,9 @@ import pytest
 import quail
 from quail.builtins import built_in_registry
 from quail.catalog import DocumentProvider
+from quail.execution.execute import _execute_physical
 from quail.execution.runner import NodeResult
+from quail.execution.types import PhysicalRequest, PhysicalResponse, document_input
 from quail.physical import (
     ExecutionLocation,
     InputPort,
@@ -23,6 +27,8 @@ from quail.physical import (
     Scan,
     ValueType,
     decode_graph,
+    encode_graph,
+    plan_envelope,
 )
 from quail.planner.physical_optimizer import PhysicalCandidate, SupportResult
 from quail.planner.plan import EngineConfig, PhysicalPlan
@@ -30,8 +36,6 @@ from quail.planner.plan import EngineConfig, PhysicalPlan
 
 @dataclass(frozen=True)
 class FirstDocuments(PhysicalNode):
-    """Return a fixed number of document ids."""
-
     alias: str = ""
     count: int = 1
 
@@ -41,23 +45,16 @@ class FirstDocuments(PhysicalNode):
 
     @property
     def outputs(self):
-        return (OutputPort(
-            f"ids:{self.alias}",
-            ValueType.DOCUMENT_IDS,
-            schema=(self.alias,),
-        ),)
+        return (OutputPort(f"ids:{self.alias}", ValueType.DOCUMENT_IDS,
+                           schema=(self.alias,)),)
 
     def attributes(self):
         return {"alias": self.alias, "count": self.count}
 
     @classmethod
     def from_attributes(cls, node_id, inputs, attributes):
-        return cls(
-            node_id=node_id,
-            inputs=inputs,
-            alias=attributes["alias"],
-            count=int(attributes["count"]),
-        )
+        return cls(node_id=node_id, inputs=inputs, alias=attributes["alias"],
+                   count=int(attributes["count"]))
 
 
 class FirstDocumentsRuntime:
@@ -67,42 +64,21 @@ class FirstDocumentsRuntime:
 
 
 def local_plan(context, *, count, estimate, source):
-    scan = Scan(
-        node_id="input:d",
-        alias="d",
-        input_id="d",
-        n_docs=len(context.document_tokens["d"]),
-    )
+    def ids_from(node_id):
+        return (InputPort("input:0", ValueType.DOCUMENT_IDS,
+                          PortRef(node_id, "ids:d"), schema=("d",)),)
+
+    scan = Scan(node_id="input:d", alias="d", input_id="d",
+                n_docs=len(context.document_tokens["d"]))
     filtered = FirstDocuments(
-        node_id="filter:d",
-        inputs=(InputPort(
-            "input:0",
-            ValueType.DOCUMENT_IDS,
-            PortRef("input:d", "ids:d"),
-            schema=("d",),
-        ),),
-        alias="d",
-        count=count,
-    )
+        node_id="filter:d", inputs=ids_from("input:d"), alias="d", count=count)
     project = Project(
-        node_id="project",
-        inputs=(InputPort(
-            "input:0",
-            ValueType.DOCUMENT_IDS,
-            PortRef("filter:d", "ids:d"),
-            schema=("d",),
-        ),),
-        columns=("d.id",),
-    )
+        node_id="project", inputs=ids_from("filter:d"), columns=("d.id",))
     plan = PhysicalPlan(
-        model=context.model.name,
-        device=context.device.name,
-        workers=context.gpu_count,
-        backend="local_filter",
-        estimated_seconds=estimate,
-        nodes=(scan, filtered, project),
-        settings={"planner_source": source},
-    )
+        model=context.model.name, device=context.device.name,
+        workers=context.gpu_count, backend="local_filter",
+        estimated_seconds=estimate, nodes=(scan, filtered, project),
+        settings={"planner_source": source})
     return PhysicalCandidate(plan.graph, plan, estimate)
 
 
@@ -117,12 +93,7 @@ class LocalFilterBackend:
 
     def plan(self, region, context):
         self.called = True
-        return (local_plan(
-            context,
-            count=1,
-            estimate=0.0,
-            source="backend",
-        ),)
+        return (local_plan(context, count=1, estimate=0.0, source="backend"),)
 
 
 class PreferredPlanner:
@@ -134,11 +105,7 @@ class PreferredPlanner:
     def plan(self, region, context):
         self.called = True
         return (local_plan(
-            context,
-            count=2,
-            estimate=-1.0,
-            source="preferred planner",
-        ),)
+            context, count=2, estimate=-1.0, source="preferred planner"),)
 
 
 class KeepFirstDocument:
@@ -146,13 +113,9 @@ class KeepFirstDocument:
 
     def rewrite(self, graph, context):
         return PhysicalGraph(
-            tuple(
-                replace(node, count=1)
-                if isinstance(node, FirstDocuments) else node
-                for node in graph.nodes
-            ),
-            graph.root,
-        )
+            tuple(replace(node, count=1) if isinstance(node, FirstDocuments)
+                  else node for node in graph.nodes),
+            graph.root)
 
 
 def test_physical_extensions_plan_validate_and_execute(monkeypatch):
@@ -164,25 +127,16 @@ def test_physical_extensions_plan_validate_and_execute(monkeypatch):
     registry.register_physical_rule(KeepFirstDocument())
     registry.register_node(FirstDocuments, runtime=FirstDocumentsRuntime())
     session = quail.Session(
-        EngineConfig(
-            gpus=1,
-            model="qwen3-4b-fp8",
-            backend="local_filter",
-            device="h100-sxm",
-        ),
+        EngineConfig(gpus=1, model="qwen3-4b-fp8", backend="local_filter",
+                     device="h100-sxm"),
         tokenizer=str.split,
         registry=registry,
     )
     session.register("docs", DocumentProvider.from_table(
         pa.table({"id": ["a", "b"], "body": ["one", "two"]}),
-        id_col="id",
-        identity="local-filter-docs",
-    ))
+        id_col="id", identity="local-filter-docs"))
     query = session.sql(
-        "SELECT d.id FROM docs d WHERE "
-        "AI_FILTER(PROMPT('ok {0}', d.body))"
-    )
-
+        "SELECT d.id FROM docs d WHERE AI_FILTER(PROMPT('ok {0}', d.body))")
     plan = query.plan()
     envelope = plan.to_envelope(registry.codecs)
 
@@ -193,17 +147,9 @@ def test_physical_extensions_plan_validate_and_execute(monkeypatch):
     assert decode_graph(envelope["graph"], registry.codecs) == plan.graph
 
     registry = built_in_registry()
-    scan = Scan(
-        node_id="input:d",
-        alias="d",
-        input_id="d",
-        n_docs=1,
-        shard_ranges=((0, 1),),
-        shard_token_loads=(1,),
-    )
+    scan = Scan(node_id="input:d", alias="d", input_id="d", n_docs=1,
+                shard_ranges=((0, 1),), shard_token_loads=(1,))
     plan = PhysicalGraph((scan,), PortRef("input:d", "ids:d"))
-    from quail.physical import encode_graph
-
     encoded = encode_graph(plan, registry.codecs)
     missing = copy.deepcopy(encoded)
     del missing["nodes"][0]["attributes"]["shard_ranges"]
@@ -215,63 +161,31 @@ def test_physical_extensions_plan_validate_and_execute(monkeypatch):
     with pytest.raises(ValueError, match="unknown fields"):
         decode_graph(extra, registry.codecs)
 
-    with monkeypatch.context() as patch:
-        import sys
-        import types
+    class ExampleBackend:
+        name = "test.example"
 
-        from quail.execution.execute import _execute_physical
-        from quail.physical import plan_envelope
+        def execute_request(self, context):
+            nodes = [node.node_id for node in context.graph.nodes]
+            return PhysicalResponse({}, {"backend": self.name, "nodes": nodes})
 
-        class ExampleBackend:
-            name = "test.example"
+    def register(registry):
+        registry.register_backend(ExampleBackend())
 
-            def execute_request(self, context):
-                from quail.execution.types import PhysicalResponse
-
-                return PhysicalResponse({}, {
-                    "backend": self.name,
-                    "nodes": [node.node_id for node in context.graph.nodes],
-                })
-
-        module_name = "test_quail_extension"
-        module = types.ModuleType(module_name)
-
-        def register(registry):
-            registry.register_backend(ExampleBackend())
-
-        module.register_quail_extension = register
-        patch.setitem(sys.modules, module_name, module)
-        registry = built_in_registry()
-        scan = Scan(
-            node_id="input:d",
-            alias="d",
-            input_id="d",
-            n_docs=2,
-        )
-        graph = PhysicalGraph((scan,), PortRef("input:d", "ids:d"))
-        from quail.execution.types import (
-            PhysicalRequest,
-            document_input,
-        )
-
-        request = PhysicalRequest(
-            plan_envelope(
-                backend=ExampleBackend.name,
-                model="qwen3-4b-fp8",
-                device="h100-sxm",
-                workers=1,
-                graph=graph,
-                codecs=registry.codecs,
-            ),
-            {"d": document_input(pa.array([[1], [2]]))},
-        )
-        registry.load_extension(module)
-        response = _execute_physical(request, registry)
-
-        assert response.metrics == {
-            "backend": "test.example",
-            "nodes": ["input:d"],
-        }
+    module = types.ModuleType("test_quail_extension")
+    module.register_quail_extension = register
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    registry = built_in_registry()
+    scan = Scan(node_id="input:d", alias="d", input_id="d", n_docs=2)
+    graph = PhysicalGraph((scan,), PortRef("input:d", "ids:d"))
+    request = PhysicalRequest(
+        plan_envelope(backend=ExampleBackend.name, model="qwen3-4b-fp8",
+                      device="h100-sxm", workers=1, graph=graph,
+                      codecs=registry.codecs),
+        {"d": document_input(pa.array([[1], [2]]))},
+    )
+    registry.load_extension(module)
+    response = _execute_physical(request, registry)
+    assert response.metrics == {"backend": "test.example", "nodes": ["input:d"]}
 
 
 def test_physical_explain_shows_shared_inputs_and_metrics():
@@ -291,7 +205,6 @@ def test_physical_explain_shows_shared_inputs_and_metrics():
     graph = PhysicalGraph((source, first, second, project),
                           PortRef(project.node_id, "rows"))
     text = graph.explain()
-    # a column header, then the tree
     assert text.splitlines()[0].split() == ["est.", "rows"]
     assert text.splitlines()[1].startswith("Project: d.id")
     assert text.count("Scan: d [1]") == 1
@@ -310,7 +223,6 @@ def test_physical_explain_shows_shared_inputs_and_metrics():
     measured = {node.node_id: NodeMetrics(output_rows=42, wall_s=1.25,
                                          fresh_tokens=200)}
     text = physical_tree(graph, metrics=measured)
-    # estimated rows, measured rows, time, and fresh tokens, in columns
     assert re.search(r"Scan: d\s+100\s+42\s+1\.25 s\s+200$", text,
                      re.MULTILINE)
     assert "est. time" not in text

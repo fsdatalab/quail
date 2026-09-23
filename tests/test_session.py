@@ -1,10 +1,10 @@
-"""End-to-end Session tests with a fake executor.
+"""End-to-end Session tests with a fake executor."""
 
-Covers gating, tuple assembly, projection, and the report.
-"""
-
+import json
 import re
+import subprocess
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -14,14 +14,19 @@ import pytest
 from fakes import register_claims_evidence
 
 import quail
+from demos import quickstart, quickstart_modal
+from quail.execution import execute as execution
 from quail.execution.pairs import pair_fraction, pair_table, partner_map
+from quail.execution.result import (
+    QueryResult,
+    build_result_declaration,
+    count_rows,
+    document_index_table,
+)
 from quail.physical import AiJoin
 from quail.planner.plan import EngineConfig
 
-
-def _parquet(path, table):
-    pq.write_table(pa.table(table), str(path))
-    return str(path)
+CONFIG = EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
 
 
 def fake_tok(text):
@@ -34,75 +39,28 @@ def _run(query, execute):
     return execute_query(query, physical_executor=execute)
 
 
-def runtime_plan(request):
-    from quail.builtins import built_in_registry
-    from quail.physical import (
-        AiFilter,
-        AiJoin,
-        Scan,
-        decode_graph,
-    )
-
-    graph = decode_graph(
-        request.plan["graph"], built_in_registry().codecs
-    )
-    filter_nodes = {
-        node.alias: node for node in graph.nodes
-        if isinstance(node, AiFilter)
-    }
-    return {
-        "graph": graph,
-        "filter_nodes": filter_nodes,
-        "filters": {
-            alias: [list(question)
-                    for question in node.question_token_ids]
-            for alias, node in filter_nodes.items()
-        },
-        "joins": [stage.runtime_spec() for node in graph.nodes
-                  if isinstance(node, AiJoin) for stage in node.stages],
-        "shards": {
-            node.alias: node.shards for node in graph.nodes
-            if isinstance(node, Scan)
-        },
-    }
-
-
 @pytest.fixture()
 def sess(tmp_path):
-    config = EngineConfig(
-        gpus=1,
-        model="qwen3-4b-fp8",
-        backend="quail",
-        device="h100-sxm",
-    )
-    s = quail.Session(config, tokenizer=fake_tok)
-    # reviews: longer documents (they anchor); products: short
+    s = quail.Session(CONFIG, tokenizer=fake_tok)
+    pq.write_table(pa.table({
+        "id": [f"r{i}" for i in range(6)],
+        "review": [f"review {i} " + "pad " * 20 for i in range(6)],
+    }), tmp_path / "r.parquet")
     s.register("reviews", quail.DocumentProvider.from_parquet(
-        _parquet(tmp_path / "r.parquet", {
-            "id": [f"r{i}" for i in range(6)],
-            "review": [f"review {i} " + "pad " * 20 for i in range(6)],
-        }), id_col="id"))
-    s.register("products", quail.DocumentProvider.from_parquet(
-        _parquet(tmp_path / "p.parquet", {
-            "asin": [f"p{i}" for i in range(4)],
-            "description": [f"product {i}" for i in range(4)],
-        }), id_col="asin"))
+        str(tmp_path / "r.parquet"), id_col="id"))
     yield s
     s.close()
 
 
-def test_session_requires_model_and_device():
+def test_session_requires_model_and_device_and_loads_gigatoken(monkeypatch):
     with pytest.raises(TypeError, match="'model' and 'device'"):
         EngineConfig()
     with pytest.raises(TypeError, match="'device'"):
         EngineConfig(model="qwen3-4b-fp8")
     with pytest.raises(TypeError, match="required positional argument: 'config'"):
         quail.Session()
-    config = EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
-    assert (config.gpus, config.backend) == (1, "quail")
+    assert (CONFIG.gpus, CONFIG.backend) == (1, "quail")
 
-
-def test_local_session_loads_gigatoken_and_returns_python_ids(monkeypatch):
     sources = []
 
     class Tokenizer:
@@ -113,18 +71,15 @@ def test_local_session_loads_gigatoken_and_returns_python_ids(monkeypatch):
             assert text == "hello"
             return np.array([1, 2], dtype=np.uint32)
 
-    monkeypatch.setitem(
-        sys.modules, "gigatoken", SimpleNamespace(Tokenizer=Tokenizer)
-    )
-    config = EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
-    with quail.Session(config) as session:
+    monkeypatch.setitem(sys.modules, "gigatoken", SimpleNamespace(Tokenizer=Tokenizer))
+    with quail.Session(CONFIG) as session:
         token_ids = session.tokenizer("hello")
     assert sources == ["Qwen/Qwen3-4B-FP8"]
     assert token_ids == [1, 2]
     assert all(type(token_id) is int for token_id in token_ids)
 
 
-def make_executor(filter_truth, join_truth=None, seen=None):
+def make_executor(filter_truth, join_truth=None):
     """Build a fake executor from filter and join truth tables."""
     def _match_key(alias, q):
         for key in filter_truth[alias]:
@@ -137,15 +92,12 @@ def make_executor(filter_truth, join_truth=None, seen=None):
         from test_quail_backend import graph_state
 
         from quail.backends.quail.graph import execute_single_graph
+        from quail.builtins import built_in_registry
         from quail.execution.runner import NodeMetrics, NodeResult
         from quail.execution.types import PhysicalResponse
-        from quail.physical import AiFilter, Scan
+        from quail.physical import AiFilter, Scan, decode_graph
 
-        runtime = runtime_plan(request)
-        if seen is not None:
-            seen["request"] = request
-            seen.update(runtime)
-        graph = runtime["graph"]
+        graph = decode_graph(request.plan["graph"], built_in_registry().codecs)
         docs = {
             node.alias: request.inputs[node.input_id].documents
             for node in graph.nodes if isinstance(node, Scan)
@@ -229,20 +181,17 @@ FILTER_SQL = """
     WHERE AI_FILTER(PROMPT('q1: {0}', r.review), {'selectivity': 0.5})
       AND AI_FILTER(PROMPT('q2: {0}', r.review), {'selectivity': 0.5})
 """
+TRUTH = {"r": {"q1:": [1, 1, 0, 1, 1, 0], "q2:": [1, 0, 1, 1, 0, 1]}}
 
 
 def test_explain_analyze_shows_measured_rows_beside_estimates(
         sess, monkeypatch):
-    truth = {"r": {"q1:": [1, 1, 0, 1, 1, 0],
-                   "q2:": [1, 0, 1, 1, 0, 1]}}
     query = sess.sql(FILTER_SQL + " LIMIT 1")
-    from quail.execution import execute as execution
-
     execution_calls = []
 
     def executor(request):
         execution_calls.append(request)
-        return make_executor(truth)(request)
+        return make_executor(TRUTH)(request)
 
     original = execution.execute_query
     monkeypatch.setattr(
@@ -257,7 +206,6 @@ def test_explain_analyze_shows_measured_rows_beside_estimates(
     header = next(line for line in text.splitlines() if "est. rows" in line)
     assert header.split() == ["est.", "rows", "rows", "est.", "pass", "pass",
                               "est.", "time", "time", "fresh", "tokens"]
-    # est. rows, rows, est. time, time, fresh tokens
     assert re.search(
         r"AiFilter: r\s+1\.5\s+2\s+[\d.]+ ms\s+<1 ms\s+60$", text, re.M)
     # Both predicates have equal estimated cost and pass four of six rows.
@@ -276,65 +224,60 @@ def test_explain_analyze_shows_measured_rows_beside_estimates(
     assert "startup      500 ms" in text
     assert "throughput   6 documents/second over 6 input documents" in text
     assert "tokens       1,234 fresh" in text
-    assert ("GPU cost     $0.0011 per query (1 GPU at $3.9492/hour"
-            in text)
+    assert "GPU cost     $0.0011 per query (1 GPU at $3.9492/hour" in text
 
     # the executed result renders the same measured table on its own
-    result = _run(sess.sql(FILTER_SQL + " LIMIT 1"), make_executor(truth))
-    assert re.search(r"Limit: 1\s+1\s+1\s+<1 ms$", result.explain(), re.M)
+    result = _run(sess.sql(FILTER_SQL + " LIMIT 1"), make_executor(TRUTH))
+    explained = result.explain()
+    assert re.search(r"Limit: 1\s+1\s+1\s+<1 ms$", explained, re.M)
     assert re.search(rf"(?:1st: )?predicate {first[1]}\s+6\s+6\s+50%\s+66\.7%$",
-                     result.explain(), re.M)
+                     explained, re.M)
     stages = [s for s in result.report["stages"] if s["op"] == "filter"]
     assert [s["written_pos"] for s in stages] == [int(first[1]) - 1,
                                                 int(second[1]) - 1]
 
 
-def test_query_rows_observers_and_saved_reports(sess, tmp_path):
-    truth = {"r": {"q1:": [1, 1, 0, 1, 1, 0],
-                         "q2:": [1, 0, 1, 1, 0, 1]}}
-    q = sess.sql(FILTER_SQL)
-    res = _run(q, make_executor(truth))
+def test_query_rows_observers_and_saved_reports(sess):
+    res = _run(sess.sql(FILTER_SQL), make_executor(TRUTH))
     assert res.columns == ["r.id"]
     assert sorted(res.to_rows()) == [("r0",), ("r3",)]
     stages = [s for s in res.report["stages"] if s["op"] == "filter"]
     assert stages[0]["evaluated"] == 6
-    assert stages[0]["observed_selectivity"] == pytest.approx(4 / 6,
-                                                              abs=1e-3)
-    # stage 2 only saw stage-1 survivors
-    assert stages[1]["evaluated"] == 4
-    assert res.report["model_wall_s"] == 1.0
-    assert res.report["wall_s"] == res.report["model_wall_s"]
+    assert stages[0]["observed_selectivity"] == pytest.approx(4 / 6, abs=1e-3)
+    assert stages[1]["evaluated"] == 4, "stage 2 only saw stage-1 survivors"
+    assert res.report["wall_s"] == res.report["model_wall_s"] == 1.0
     assert res.report["finish_s"] >= 0
     assert res.report["input_ready_s"] >= res.report["planning_s"]
+    assert "gpu_s" not in res.report
 
-    limited = _run(
-        sess.sql(FILTER_SQL + " LIMIT 1"), make_executor(truth))
+    def timed(request):
+        response = make_executor(TRUTH)(request)
+        response.metrics["gpu_s"] = 0.75
+        return response
+
+    limited = _run(sess.sql(FILTER_SQL + " LIMIT 1"), timed)
     assert limited.count() == 1
+    assert limited.report["gpu_s"] == 0.75
 
     registry = quail.ExtensionRegistry.with_built_ins().register_observer(
         NodeTypes)
-
-    result = _observed_result(tmp_path, registry)
-
+    session = quail.Session(CONFIG, tokenizer=fake_tok, registry=registry)
+    session.register("reviews", quail.DocumentProvider.from_table(
+        pa.table({"id": ["r0", "r1"], "review": ["first", "second"]}), id_col="id"))
+    result = _run(session.sql(
+        "SELECT r.id FROM reviews r WHERE "
+        "AI_FILTER(PROMPT('q: {0}', r.review)) LIMIT 1"
+    ), make_executor({"r": {"q:": [1, 0]}}))
     assert result.observer(NodeTypes)["types"] == [
-        "quail.scan",
-        "quail.ai_filter",
-        "quail.project",
-        "quail.limit",
-    ]
+        "quail.scan", "quail.ai_filter", "quail.project", "quail.limit"]
     assert result.observer(NodeTypes) is result.observer("test.node_types")
     with pytest.raises(KeyError):
         result.observer("example.missing")
 
-    from quail.execution.result import QueryResult
-
-    # Saved reports can be loaded separately from their result tables.
-    table, report = result.collect(), dict(result.report)
-
-    restored = QueryResult.from_table(table, report=report)
+    # saved reports can be loaded separately from their result tables
+    restored = QueryResult.from_table(result.collect(), report=dict(result.report))
     assert restored.plan is None
     restored.attach_executed_plan(registry.codecs)
-
     assert [node.node_id for node in restored.plan.topological_nodes()] == [
         node.node_id for node in result.plan.topological_nodes()]
     assert restored.node_metrics == result.node_metrics
@@ -356,31 +299,6 @@ class NodeTypes:
         return {"types": list(self.types)}
 
 
-def _observed_result(tmp_path, registry):
-    session = quail.Session(
-        EngineConfig(
-            gpus=1,
-            model="qwen3-4b-fp8",
-            backend="quail",
-            device="h100-sxm",
-        ),
-        tokenizer=fake_tok,
-        registry=registry,
-    )
-    session.register("reviews", quail.DocumentProvider.from_parquet(
-        _parquet(tmp_path / "reviews.parquet", {
-            "id": ["r0", "r1"],
-            "review": ["first", "second"],
-        }),
-        id_col="id",
-    ))
-    truth = {"r": {"q:": [1, 0]}}
-    return _run(session.sql(
-        "SELECT r.id FROM reviews r WHERE "
-        "AI_FILTER(PROMPT('q: {0}', r.review)) LIMIT 1"
-    ), make_executor(truth))
-
-
 def test_pair_table_lists_equal_keys_once_each():
     pairs = pair_table(
         "c", [pa.array(["u1", "u2", None, "u1"])],
@@ -397,12 +315,10 @@ def test_pair_table_lists_equal_keys_once_each():
 
 
 def _pair_query(session, on):
-    query = session.docs("claims").alias("c")
+    claims = session.docs("claims").alias("c")
     partner = session.docs("evidence").alias("e")
-    if on:
-        query = query.join(partner, on=quail.col("c.url") == quail.col("e.url"))
-    else:
-        query = query.join(partner)
+    query = (claims.join(partner, on=quail.col("c.url") == quail.col("e.url"))
+             if on else claims.join(partner))
     return query.ai_filter(
         quail.prompt("Does {1} support {0}?", quail.col("c.claim"),
                      quail.col("e.text")),
@@ -410,23 +326,13 @@ def _pair_query(session, on):
 
 
 def test_session_plans_prices_and_ships_the_pair_table():
-    config = EngineConfig(
-        gpus=1,
-        model="qwen3-4b-fp8",
-        backend="quail",
-        device="h100-sxm",
-    )
-    with quail.Session(
-        config, tokenizer=lambda text: list(text.encode())
-    ) as session:
+    with quail.Session(CONFIG, tokenizer=lambda text: list(text.encode())) as session:
         register_claims_evidence(session)
         paired = _pair_query(session, on=True)
         cross = _pair_query(session, on=False)
         paired_plan, cross_plan = paired.plan(), cross.plan()
-        paired_stage = paired_plan.graph.nodes_by_type(
-            AiJoin.type_name)[0].stages[0]
-        cross_stage = cross_plan.graph.nodes_by_type(
-            AiJoin.type_name)[0].stages[0]
+        paired_stage = paired_plan.graph.nodes_by_type(AiJoin.type_name)[0].stages[0]
+        cross_stage = cross_plan.graph.nodes_by_type(AiJoin.type_name)[0].stages[0]
         # c1 and c2 pair with e0 and e2, c0 with e1: 5 of 12 pairs
         hash_join = paired_plan.graph.node("hash_join:c-e")
         assert (hash_join.left, hash_join.right, hash_join.on) == (
@@ -434,6 +340,7 @@ def test_session_plans_prices_and_ships_the_pair_table():
         assert hash_join.pair_fraction == 5 / 12
         assert [port.source.node_id for port in hash_join.inputs] == [
             "scan:c", "scan:e"]
+        assert paired_plan.graph.node("scan:c").shards == (range(0, 4),)
         assert paired_stage.pairs_from == "hash_join:c-e"
         assert not cross_stage.pairs_from
         assert "hash_join:c-e" not in {node.node_id for node in cross_plan.nodes}
@@ -457,14 +364,105 @@ def test_session_plans_prices_and_ships_the_pair_table():
             cross, answer).join_pair_evaluations == 12
 
 
-def test_gpu_seconds_reach_the_result_report(sess):
-    truth = {"r": {"q1:": [1, 0, 1, 0, 1, 0], "q2:": [1, 1, 1, 1, 1, 1]}}
-    executor = make_executor(truth)
+IMPORT_TEXT = """
+import sys
+import quail
+from quail.bench import quailb
+from quail.execution import execute
+from demos import quickstart
 
-    def timed(request):
-        response = executor(request)
-        response.metrics["gpu_s"] = 0.75
-        return response
+assert "modal" not in sys.modules
+"""
 
-    assert "gpu_s" not in _run(sess.sql(FILTER_SQL), executor).report
-    assert _run(sess.sql(FILTER_SQL), timed).report["gpu_s"] == 0.75
+
+def test_engine_import_and_gpu_requirement(sess, monkeypatch):
+    subprocess.run([sys.executable, "-c", IMPORT_TEXT], check=True)
+    monkeypatch.setattr(execution, "gpu_problem", lambda: "no CUDA GPU is visible")
+    with pytest.raises(RuntimeError, match="process with a CUDA GPU") as error:
+        sess.sql(FILTER_SQL).run()
+    assert "no CUDA GPU is visible" in str(error.value)
+
+
+def test_arrow_result_assembly_streaming_and_collection():
+    true_join_tables = [
+        document_index_table({"r1": [0, 1], "a1": [0, 0]}, "join_answers"),
+        document_index_table({"r2": [0, 1], "a1": [0, 0]}, "join_answers"),
+        document_index_table({"r2": [0, 1, 1], "a2": [0, 0, 1]}, "join_answers"),
+    ]
+    survivors = {alias: pa.array(rows, type=pa.int32()) for alias, rows in
+                 {"r1": [0, 1], "r2": [0, 1], "a1": [0], "a2": [0, 1]}.items()}
+    declaration, _ = build_result_declaration(true_join_tables, survivors, "r1")
+    assert count_rows(declaration) == 6
+
+    relation = document_index_table({"r": list(range(5))}, "filter_survivors")
+    assert relation.schema.metadata[b"quail.kind"] == b"filter_survivors"
+    survivors = {"r": pa.array(range(5), type=pa.int32())}
+    declaration, index_schema = build_result_declaration([], survivors, "r")
+    schema = pa.schema([pa.field("r.id", pa.string(), nullable=False)],
+                       metadata={b"quail.kind": b"query_result"})
+    result = QueryResult(
+        columns=["r.id"], declaration=declaration,
+        document_index_schema=index_schema, output_schema=schema,
+        projection=[("r", pa.array([f"r{i}" for i in range(5)]))],
+        report={}, survivor_indices=survivors, true_join_tables={})
+
+    reader = result.execute_stream(batch_rows=2)
+    batches = list(reader)
+    assert isinstance(reader, pa.RecordBatchReader)
+    assert [len(batch) for batch in batches] == [2, 2, 1]
+    assert pa.Table.from_batches(batches).column("r.id").to_pylist() == [
+        "r0", "r1", "r2", "r3", "r4"]
+    assert result.count() == 5
+    assert result.collect(limit=3).column("r.id").to_pylist() == ["r0", "r1", "r2"]
+    assert not hasattr(result, "rows")
+
+
+@pytest.mark.parametrize("on_modal", [False, True])
+def test_quickstarts_return_collected_rows_after_session_closes(
+        monkeypatch, tmp_path, on_modal):
+    reviews = pa.table({"id": ["rv0", "rv1"], "body": [
+        "The acting was excellent.", "The acting was poor."]})
+    monkeypatch.setattr(quickstart, "load_reviews", lambda: reviews)
+    commits = []
+    monkeypatch.setattr(quickstart_modal, "RESULTS_DIR", tmp_path / "chosen-path")
+    monkeypatch.setattr(quickstart_modal.volume, "commit",
+                        lambda: commits.append("volume"))
+    monkeypatch.setattr(quail.Session, "tokenizer", property(lambda self: str.split))
+    monkeypatch.setattr(execution, "gpu_problem", lambda: None)
+    monkeypatch.setattr(execution, "_prepare_backend", lambda *args: None)
+    executor = make_executor({"r": {"Instruction": [1, 0]}})
+    monkeypatch.setattr(execution, "_execute_physical",
+                        lambda request, registry: executor(request))
+    closed = []
+    close = quail.Session.close
+
+    def record_close(session):
+        close(session)
+        closed.append(session)
+
+    monkeypatch.setattr(quail.Session, "close", record_close)
+
+    run = quickstart_modal.run_query.get_raw_f() if on_modal else quickstart.run_query
+    rows, report = run()
+    assert len(closed) == 1
+    assert closed[0]._token_directory is None
+    assert rows.to_pylist() == [{"r.id": "rv0"}]
+    assert report["fresh_tokens"] == 1234
+    assert report["worker_total_s"] >= 0
+    if not on_modal:
+        assert "result_volume_path" not in report
+        assert commits == []
+        return
+    path = Path(report["result_volume_path"])
+    assert path.parent == tmp_path / "chosen-path"
+    assert json.loads(path.read_text()) == report
+    assert commits == ["volume"]
+
+    def fail():
+        raise RuntimeError("query failed")
+
+    commits.clear()
+    monkeypatch.setattr(quickstart, "run_query", fail)
+    with pytest.raises(RuntimeError, match="query failed"):
+        quickstart_modal.run_query.get_raw_f()()
+    assert commits == ["volume"], "a failed query still commits the volume"

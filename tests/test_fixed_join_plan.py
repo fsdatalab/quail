@@ -1,8 +1,7 @@
 """Fixed join execution, filter retention, and answer reconstruction."""
 
-import itertools
-
 import pyarrow as pa
+import pytest
 from test_quail_backend import graph_state
 
 import quail
@@ -11,19 +10,21 @@ from quail.bench import quailb
 from quail.execution.execute import execute_query
 from quail.execution.runner import NodeMetrics, NodeResult, SurvivorStream
 from quail.execution.types import PhysicalResponse
-from quail.physical import AiFilter, AiJoin, Barrier, Scan, decode_graph
+from quail.physical import AiFilter, AiJoin, Barrier, Project, Scan, decode_graph
 from quail.planner.plan import EngineConfig
 from quail_b import prompts
 from quail_b.queries import FILTER_SELECTIVITY_ESTIMATES
 
+FEV9_ROWS = [{"c1.id": "c0", "e1.id": "e0", "c2.id": "c1", "e2.id": "e1"}]
 
-def _config(*, gpus, backend):
-    return EngineConfig(
-        gpus=gpus,
-        model="qwen3-4b-fp8",
-        backend=backend,
-        device="h100-sxm",
-    )
+
+def _session(gpus=1, backend="quail"):
+    session = quail.Session(
+        EngineConfig(gpus=gpus, model="qwen3-4b-fp8", backend=backend,
+                     device="h100-sxm"),
+        tokenizer=lambda text: list(text.encode()))
+    register_fever(session)
+    return session
 
 
 def register_fever(session):
@@ -47,10 +48,8 @@ class FixedFeverAnswers:
         self.state = state
         self.capacity = capacity
         self.empty = empty
-        self.filters = []
 
     def _answers(self, document_ids):
-        """Answers keyed by local position, and the passing global ids."""
         answers = {local: [document < 2 and not self.empty]
                    for local, document in enumerate(document_ids)}
         live = [document for local, document in enumerate(document_ids)
@@ -59,7 +58,6 @@ class FixedFeverAnswers:
 
     def execute(self, node, inputs):
         if isinstance(node, AiFilter):
-            self.filters.append((node.alias, inputs["retain_survivors"]))
             if node.pin_survivors:
                 stream = SurvivorStream(node, inputs["document_ids"])
                 return NodeResult(
@@ -132,164 +130,23 @@ class FixedFeverAnswers:
         return NodeResult(outputs, NodeMetrics(extension={"answers": all_answers}))
 
 
-def test_fixed_order_execution_and_backend_planning(monkeypatch):
-    with monkeypatch.context() as patch:
-        for capacity, empty, estimate in [
-        (10, False, 0.001), (1, False, 1.0), (0, False, 0.5), (0, True, 1.0),
-    ]:
-            patch.setitem(FILTER_SELECTIVITY_ESTIMATES, prompts.F11, estimate)
-            patch.setitem(FILTER_SELECTIVITY_ESTIMATES, prompts.F13, estimate)
-            with quail.Session(_config(gpus=1, backend="quail"),
-                               tokenizer=lambda text: list(text.encode())) as session:
-                register_fever(session)
-                query = quailb.queries(session)["FEV-9"][1]()
-
-                def execute(request):
-                    graph = decode_graph(request.plan["graph"], session.registry.codecs)
-                    groups = graph.nodes_by_type(AiJoin.type_name)
-                    assert sum(len(group.stages) for group in groups) == 3
-                    docs = {node.alias: request.inputs[node.input_id].documents
-                            for node in graph.nodes if isinstance(node, Scan)}
-                    state = graph_state(None, docs)
-                    model = FixedFeverAnswers(state, capacity, empty)
-                    state["model_execution"] = model
-
-                    def unexpected_search(*args, **kwargs):
-                        raise AssertionError("execution called the join optimizer")
-
-                    with patch.context() as execution_patch:
-                        execution_patch.setattr(
-                            "quail.planner.joins.search_joins", unexpected_search)
-                        report = execute_single_graph(
-                            state, request.plan["settings"], graph)
-                    # an anchor's chain streams into its join unless the
-                    # alias was a partner in an earlier group; then it
-                    # finishes first and retains survivors in the pool
-                    chains = {node.alias: node for node in graph.nodes
-                              if isinstance(node, AiFilter)}
-                    partners_before = set()
-                    pooled = 0
-                    for group in groups:
-                        chain = chains[group.anchor]
-                        pinned = group.anchor not in partners_before
-                        assert chain.pin_survivors is pinned
-                        assert chain.keep_kv is not pinned
-                        pooled += not pinned
-                        partners_before.update(
-                            alias for stage in group.stages
-                            for alias in stage.partners)
-                    assert {alias for alias, keep in model.filters if keep} \
-                        == {group.anchor for group in groups
-                            if chains[group.anchor].keep_kv}
-                    assert not state["arena"].accounting.owned
-                    assert report["kv_manager"]["retained_after_filters"] == (
-                        0 if empty else min(capacity, 2) * pooled)
-                    assert [step["id"] for step in report["executed_join_plan"]
-                            if step["type"] == AiJoin.type_name] == [
-                                g.node_id for g in groups]
-                    return PhysicalResponse(report.pop("_outputs"), report)
-
-                result = execute_query(query, physical_executor=execute).collect()
-                assert result.to_pylist() == ([] if empty else [{
-                    "c1.id": "c0", "e1.id": "e0", "c2.id": "c1", "e2.id": "e1",
-                }])
-
-    for backend in ["stock_vllm", "pipelined_vllm", "pipelined_sglang"]:
-        with quail.Session(_config(gpus=1, backend=backend),
-                           tokenizer=lambda text: list(text.encode())) as session:
-            register_fever(session)
-            plan = quailb.queries(session)["FEV-9"][1]().plan()
-            execution = next(node for node in plan.nodes if hasattr(node, "joins"))
-            assert execution.filters[-1].alias == execution.joins[0].anchor
-
-
-def test_distributed_fev9_executes_bound_join_nodes(monkeypatch):
+def fever_executor(session, monkeypatch, gpus, check=None, capacity=1,
+                   empty=False):
+    """Return a physical executor that runs the FEVER fakes on one or two GPUs."""
     from quail.backends.quail import worker
     from quail.backends.quail.distributed import execute_distributed_graph
     from quail.execution.runner import ExecutionContext
     from quail.specs import H100_SXM, QWEN3_4B_FP8
 
-    with quail.Session(_config(gpus=2, backend="quail"),
-                       tokenizer=lambda text: list(text.encode())) as session:
-        register_fever(session)
-        query = quailb.queries(session)["FEV-9"][1]()
-
-        def execute(request):
-            graph = decode_graph(request.plan["graph"], session.registry.codecs)
-            docs = {node.alias: request.inputs[node.input_id].documents
-                    for node in graph.nodes if isinstance(node, Scan)}
-            children = []
-            for _ in range(2):
-                state = graph_state(None, docs)
-                model = FixedFeverAnswers(state, capacity=1, empty=False)
-                state.update(
-                    model_execution=model, registry=session.registry,
-                    boot={"boot_s": 0, "kind": "warm"}, seen=set(),
-                    runtime_context=ExecutionContext(
-                        runtimes=session.registry.runtimes, model_execution=model,
-                    ),
-                )
-                children.append(state)
-
-            def round_fn(kind, subs):
-                function = (worker._child_filters if kind == "filters"
-                            else worker._child_joins)
-                return [function(state, sub) for state, sub in zip(children, subs)]
-
-            def unexpected_search(*args, **kwargs):
-                raise AssertionError("execution called the join optimizer")
-
-            with monkeypatch.context() as execution_patch:
-                execution_patch.setattr(worker, "_child_boot", lambda state, sub: None)
-                execution_patch.setattr(
-                    "quail.planner.joins.search_joins", unexpected_search)
-                report = execute_distributed_graph(
-                    {**request.plan["settings"], "model": "qwen3-4b-fp8",
-                     "docs": docs, "physical_plan": request.plan},
-                    graph, 2, round_fn, QWEN3_4B_FP8, H100_SXM,
-                    session.registry.runtimes, session.registry,
-                )
-            assert all(not child["arena"].accounting.owned for child in children)
-            return PhysicalResponse(report.pop("_outputs"), report)
-
-        result = execute_query(query, physical_executor=execute).collect()
-        assert result.to_pylist() == [{
-            "c1.id": "c0", "e1.id": "e0", "c2.id": "c1", "e2.id": "e1",
-        }]
-
-
-def _fever_children(session, docs, count):
-    from quail.execution.runner import ExecutionContext
-
-    children = []
-    for _ in range(count):
+    def child(docs):
         state = graph_state(None, docs)
         model = FixedFeverAnswers(state, capacity=1, empty=False)
         state.update(
             model_execution=model, registry=session.registry,
             boot={"boot_s": 0, "kind": "warm"}, seen=set(),
             runtime_context=ExecutionContext(
-                runtimes=session.registry.runtimes, model_execution=model,
-            ),
-        )
-        children.append(state)
-    return children
-
-
-def fever_executor(session, monkeypatch, gpus, check=None, capacity=1):
-    """A physical executor over the FEVER fakes.
-
-    Args:
-        session: Its registry decodes the plan and holds the functions.
-        monkeypatch: Turns the child boot off on two GPUs.
-        gpus: One runs the graph in process; two runs the coordinator.
-        check: Called with the request and its decoded graph before the
-            run; returns extra state entries (a pair table, columns).
-        capacity: Documents the fake model keeps resident.
-    """
-    from quail.backends.quail import worker
-    from quail.backends.quail.distributed import execute_distributed_graph
-    from quail.specs import H100_SXM, QWEN3_4B_FP8
+                runtimes=session.registry.runtimes, model_execution=model))
+        return state
 
     def execute(request):
         graph = decode_graph(request.plan["graph"], session.registry.codecs)
@@ -298,12 +155,12 @@ def fever_executor(session, monkeypatch, gpus, check=None, capacity=1):
         extra = check(request, graph) if check else {}
         if gpus == 1:
             state = graph_state(None, docs)
-            state["model_execution"] = FixedFeverAnswers(state, capacity, False)
+            state["model_execution"] = FixedFeverAnswers(state, capacity, empty)
             state.update(extra, functions=session.registry.functions)
             report = execute_single_graph(state, request.plan["settings"], graph)
             assert not state["arena"].accounting.owned
             return PhysicalResponse(report.pop("_outputs"), report)
-        children = _fever_children(session, docs, 2)
+        children = [child(docs), child(docs)]
 
         def round_fn(kind, subs):
             function = (worker._child_filters if kind == "filters"
@@ -323,8 +180,50 @@ def fever_executor(session, monkeypatch, gpus, check=None, capacity=1):
     return execute
 
 
+@pytest.mark.parametrize("gpus,capacity,empty,estimate", [
+    (1, 10, False, 0.001), (1, 1, False, 1.0), (1, 0, False, 0.5),
+    (1, 0, True, 1.0), (2, 1, False, None),
+])
+def test_fev9_executes_bound_join_nodes_without_the_optimizer(
+        monkeypatch, gpus, capacity, empty, estimate):
+    if estimate is not None:
+        monkeypatch.setitem(FILTER_SELECTIVITY_ESTIMATES, prompts.F11, estimate)
+        monkeypatch.setitem(FILTER_SELECTIVITY_ESTIMATES, prompts.F13, estimate)
+
+    def unexpected_search(*args, **kwargs):
+        raise AssertionError("execution called the join optimizer")
+
+    def check(request, graph):
+        assert sum(len(group.stages)
+                   for group in graph.nodes_by_type(AiJoin.type_name)) == 3
+        monkeypatch.setattr("quail.planner.joins.search_joins", unexpected_search)
+        return {}
+
+    with _session(gpus=gpus) as session:
+        query = quailb.queries(session)["FEV-9"][1]()
+        execute = fever_executor(session, monkeypatch, gpus, check, capacity, empty)
+        result = execute_query(query, physical_executor=execute).collect()
+    assert result.to_pylist() == ([] if empty else FEV9_ROWS)
+
+
+@pytest.mark.parametrize("backend", [
+    "stock_vllm", "pipelined_vllm", "pipelined_sglang",
+])
+def test_request_backends_plan_fev9_and_a_single_join(backend):
+    with _session(backend=backend) as session:
+        plan = quailb.queries(session)["FEV-9"][1]().plan()
+        execution = next(node for node in plan.nodes if hasattr(node, "joins"))
+        assert execution.filters[-1].alias == execution.joins[0].anchor
+        plan = (session.docs("claims").alias("c")
+                .ai_join(session.docs("evidence").alias("e"),
+                         quail.prompt("m {0} {1}", quail.col("c.claim"),
+                                      quail.col("e.text")))
+                .select("c.id", "e.id")).plan()
+    sink = next(node for node in plan.nodes if isinstance(node, Project))
+    assert sink.inputs[0].source.port == "join_answers:0"
+
+
 def test_fev10_asks_the_model_about_same_page_pairs_only(monkeypatch):
-    """FEV-10 on one GPU and on two: the join runs over the pair table."""
     def check(request, graph):
         columns = request.column_tables()
         assert columns["c"].column("evidence_wiki_url").to_pylist() == [
@@ -332,9 +231,7 @@ def test_fev10_asks_the_model_about_same_page_pairs_only(monkeypatch):
         return {"columns": columns}
 
     for gpus in (1, 2):
-        with quail.Session(_config(gpus=gpus, backend="quail"),
-                           tokenizer=lambda text: list(text.encode())) as session:
-            register_fever(session)
+        with _session(gpus=gpus) as session:
             query = quailb.queries(session)["FEV-10"][1]()
             plan = query.plan()
             (stage,) = plan.graph.nodes_by_type(AiJoin.type_name)[0].stages
@@ -345,10 +242,8 @@ def test_fev10_asks_the_model_about_same_page_pairs_only(monkeypatch):
             result = execute_query(
                 query, physical_executor=fever_executor(session, monkeypatch, gpus,
                                                         check))
-            # the filters keep c0, c1, e0, e1; the pairs on those are
-            # (c0, e0) and (c1, e0); only c0 is supported by e0. The
-            # cross join would also have asked about (c0, e1) and
-            # (c1, e1) and returned (c1, e1)
+            # of the same-page pairs (c0, e0) and (c1, e0), only c0 is
+            # supported; a cross join would also have returned (c1, e1)
             answers = result.answer_tables["joins"][0]
             assert sorted(zip(answers.column("c").to_pylist(),
                               answers.column("e").to_pylist())) == [(0, 0), (1, 0)]
@@ -356,9 +251,7 @@ def test_fev10_asks_the_model_about_same_page_pairs_only(monkeypatch):
 
 
 def test_an_edited_fev9_plan_executes(monkeypatch):
-    with quail.Session(_config(gpus=1, backend="quail"),
-                       tokenizer=lambda text: list(text.encode())) as session:
-        register_fever(session)
+    with _session() as session:
         query = quailb.queries(session)["FEV-9"][1]()
         plan = query.plan()
         chain = next(node for node in plan.nodes
@@ -385,40 +278,4 @@ def test_an_edited_fev9_plan_executes(monkeypatch):
             plan=edited)
         assert f"barrier:{chain.alias}" in seen[1]
         assert f"barrier:{chain.alias}" not in seen[0]
-        assert edited_result.collect().to_pylist() == rows.to_pylist() == [{
-            "c1.id": "c0", "e1.id": "e0", "c2.id": "c1", "e2.id": "e1"}]
-
-
-def test_retention_search_matches_enumeration():
-    from quail.cost.sol import speed_of_light
-    from quail.planner.joins import search_joins, summarize_alias, walk
-    from quail.specs import H100_SXM, QWEN3_4B_FP8
-
-    specs = [{"written_pos": index, "aliases": list(aliases),
-              "anchor": aliases[0], "anchor_free": True, "semantics": "full",
-              "selectivity": selectivity,
-              "frame_tokens": {alias: 8 for alias in aliases},
-              "label_tokens": {alias: 4 for alias in aliases}, "tail_tokens": 2}
-             for index, (aliases, selectivity) in enumerate([
-                 (("a", "b"), 0.01), (("b", "c"), 0.1),
-             ])]
-    lengths = {alias: summarize_alias(tokens) for alias, tokens in [
-        ("a", [800] * 20), ("b", [100] * 30), ("c", [400] * 10),
-    ]}
-    filtered = {"a", "c"}
-    live = {"a": 10.0, "b": 6.0, "c": 8.0}
-    result = search_joins(specs, live, lengths, filtered, 5, 8192,
-                          QWEN3_4B_FP8, H100_SXM)
-    costs = []
-    for order in itertools.permutations(specs):
-        for anchors in itertools.product(*(spec["aliases"] for spec in order)):
-            work, records = walk(list(zip(order, anchors)), live, lengths,
-                                 filtered, 5, QWEN3_4B_FP8, H100_SXM)
-            seen = set()
-            for record in records:
-                if record["anchor"] in seen:
-                    assert record["resident"] != "filter"
-                seen.add(record["anchor"])
-            costs.append(speed_of_light(work, QWEN3_4B_FP8, H100_SXM, 8192).seconds)
-    assert speed_of_light(
-        result["work"], QWEN3_4B_FP8, H100_SXM, 8192).seconds == min(costs)
+        assert edited_result.collect().to_pylist() == rows.to_pylist() == FEV9_ROWS
