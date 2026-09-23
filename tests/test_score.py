@@ -435,6 +435,82 @@ def test_score_assembles_stored_document_tokens(catalog, pair):
     session.close()
 
 
+@pytest.mark.parametrize("model", [
+    "qwen3-4b-fp8", "qwen3-32b-fp8", "diffusion-gemma-26b-a4b-fp8"])
+@pytest.mark.parametrize("pair", [False, True])
+def test_generative_score_uses_the_ai_if_prompt(catalog, model, pair):
+    from quail.logical.prompts import (
+        bind_join_prompt,
+        bind_prompt,
+        render_filter_prompt_ids,
+        render_join_prompt_ids,
+        true_false_token_ids,
+    )
+    from quail.specs import MODELS
+
+    session = _session(catalog, model=model, tokenizer=list)
+    template = "Is {1} relevant to {0}?" if pair else "Refund? {0}"
+    sql = (
+        f"SELECT AI.SCORE(PROMPT('{template}', q.text, d.body)) "
+        "AS score FROM queries q CROSS JOIN documents d"
+        if pair else
+        f"SELECT AI.SCORE(PROMPT('{template}', d.body)) AS score "
+        "FROM documents d"
+    )
+    query = session.sql(sql)
+    physical = query.plan()
+    assert physical.settings["score_normalization"] == "true_false_softmax"
+    true_ids, false_ids = true_false_token_ids(list)
+    assert physical.settings["true_ids"] == true_ids
+    assert physical.settings["false_ids"] == false_ids
+    request = query._prepare_physical()
+    model_execution = RerankerModelExecution.__new__(RerankerModelExecution)
+    model_execution.documents = {
+        node.alias: request.inputs[node.input_id].documents
+        for node in physical.nodes if node.type_name == "quail.scan"
+    }
+    model_execution.reranker = _FakeReranker([0.5] * (4 if pair else 2))
+    GenericRunner().run(
+        compute_subgraph(physical.graph),
+        ExecutionContext(
+            runtimes=session.registry.runtimes,
+            model_execution=model_execution,
+            sources={alias: range(2) for alias in model_execution.documents},
+        ),
+    )
+    turn = MODELS[model].turn
+    documents = ("refund please", "all good")
+    args = query.logical.root.columns[0].expression.prompt.args
+    if pair:
+        prompt = bind_join_prompt(template, args, list, turn)
+        expected = [
+            render_join_prompt_ids(prompt, [list(text), list(body)], 0, list)
+            for text in ("refund", "shipping") for body in documents
+        ]
+    else:
+        prompt = bind_prompt(template, args, list, turn)
+        expected = [render_filter_prompt_ids(prompt, list(body), list)
+                    for body in documents]
+    assert [list(tokens) for tokens in model_execution.reranker.prompts] == expected
+    session.close()
+
+
+@pytest.mark.parametrize("model,canvas", [
+    ("qwen3-4b-fp8", 0), ("diffusion-gemma-26b-a4b-fp8", 1)])
+def test_generative_score_cost_counts_the_canvas_row(catalog, model, canvas):
+    session = _session(catalog, model=model, tokenizer=list)
+    physical = session.sql(
+        "SELECT AI.SCORE(PROMPT('Refund? {0}', d.body)) AS score "
+        "FROM documents d").plan()
+    session.close()
+    head, tail = next(node for node in physical.nodes
+                      if isinstance(node, AiScore)).spec.prompt_token_parts
+    documents = len("refund please") + len("all good")
+    # the second document reads the shared head from KV
+    expected = documents + 2 * (len(head) + len(tail) + canvas) - len(head)
+    assert physical.settings["estimated_fresh_tokens"] == pytest.approx(expected)
+
+
 def test_score_cost_reuses_anchor_prefixes():
     from quail.cost.work import ask, scan
     from quail.planner.reranker import _score_work
@@ -757,6 +833,19 @@ def test_oversized_document_is_refused_before_execution(
     assert plan.unit == unit
     assert "a document in 'd'" in plan.reasons[0]
     session.close()
+
+
+def test_reranker_refuses_a_query_without_score(catalog):
+    from quail.planner.plan import Refusal
+
+    with _session(catalog) as session:
+        plan = session.sql(
+            "SELECT d.id FROM documents d "
+            "WHERE AI_FILTER(PROMPT('Refund? {0}', d.body))"
+        ).plan()
+    assert isinstance(plan, Refusal)
+    assert plan.constraint == "reranker_only_scores"
+    assert plan.reasons == ("a reranker model can only be used with AI.SCORE",)
 
 
 def test_reranker_system_text_keeps_the_judgment_instruction():

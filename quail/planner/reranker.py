@@ -13,6 +13,11 @@ from quail.logical import (
     effective_selectivity,
     is_score,
 )
+from quail.logical.prompts import (
+    bind_join_prompt,
+    bind_prompt,
+    true_false_token_ids,
+)
 from quail.physical import (
     AiScore,
     Limit,
@@ -87,13 +92,14 @@ def _longest_input(spec, context) -> tuple[int, int]:
     the fixed prompt head, plus the first document for a pair.
     """
     parts = spec.prompt_token_parts
+    canvas = context.model.canvas_tokens
     longest = [
         max(context.document_tokens[alias], default=0) for alias in spec.aliases
     ]
     if len(spec.aliases) == 1:
-        return len(parts[0]), longest[0] + len(parts[1])
+        return len(parts[0]), longest[0] + len(parts[1]) + canvas
     prefix = len(parts[0]) + longest[0] + len(parts[1])
-    return prefix, longest[1] + len(parts[2])
+    return prefix, longest[1] + len(parts[2]) + canvas
 
 
 def _score_work(count, mean_tokens, fixed_tokens, *, variance=0.0,
@@ -130,6 +136,8 @@ def _variance(lengths) -> float:
 
 def _token_parts(prompt, context) -> tuple[tuple[int, ...], ...]:
     """Tokenize the fixed pieces of the rendered prompt around the documents."""
+    if context.model.role != "reranker":
+        return _answer_token_parts(prompt, context)
     query_template = _query_template(prompt)
     rendered = render_qwen3_reranker_input(query_template, "{document}")
     before, after = rendered.split("{document}")
@@ -140,6 +148,39 @@ def _token_parts(prompt, context) -> tuple[tuple[int, ...], ...]:
     # Documents are tokenized separately; tokens cannot span these boundaries.
     # These ids can differ from tokenizing the complete prompt string.
     return tuple(tuple(context.tokenizer(part)) for part in parts)
+
+
+def _answer_token_parts(prompt, context) -> tuple[tuple[int, ...], ...]:
+    """Tokenize the AI.IF layout around the documents, for a generative model.
+
+    A document gets the AI.IF filter prompt and a pair the AI.IF join
+    prompt anchored on its first document.
+    """
+    tokenizer, turn = context.tokenizer, context.model.turn
+    aliases = _prompt_aliases(prompt)
+    if len(aliases) == 1:
+        bound = bind_prompt(prompt.template, prompt.args, tokenizer, turn)
+        return tuple(bound.preamble_token_ids), tuple(bound.tail_token_ids)
+    if len(prompt.args) != 2:
+        raise ValueError("AI.SCORE supports one document or one document pair")
+    bound = bind_join_prompt(prompt.template, prompt.args, tokenizer, turn)
+    pieces = {alias: (label, frame) for alias, label, frame in bound.label_token_ids}
+    left, right = aliases
+    return (tuple(bound.preamble_token_ids),
+            tuple(pieces[left][1]) + tuple(pieces[right][0]),
+            tuple(bound.tail_token_ids))
+
+
+def answer_ids(model, tokenizer) -> tuple[list[int], list[int]]:
+    """The token ids a score compares: yes and no, or TRUE and FALSE.
+
+    Args:
+        model: The ModelSpec; a reranker answers yes or no.
+        tokenizer: Callable text -> token ids.
+    """
+    if model.role == "reranker":
+        return list(tokenizer("yes")), list(tokenizer("no"))
+    return true_false_token_ids(tokenizer)
 
 
 def _score_spec(
@@ -162,7 +203,7 @@ def _score_spec(
         token_parts_by_prompt[prompt] = token_parts
     aliases = _prompt_aliases(prompt)
     lengths = [context.document_tokens[alias] for alias in aliases]
-    fixed_tokens = sum(map(len, token_parts))
+    fixed_tokens = sum(map(len, token_parts)) + context.model.canvas_tokens
     shared = len(token_parts[0])
     prefix = float(shared)
     prefix_variance = 0.0
@@ -256,7 +297,11 @@ def _ordered_filters(predicates, count, mean_tokens, context, chunk,
 
 
 def plan_reranker(region, context, *, backend_name: str):
-    """Build one Quail plan for AI.SCORE expressions."""
+    """Build one Quail plan for AI.SCORE expressions.
+
+    A reranker scores yes against no in its own prompt layout; a
+    generative model scores TRUE against FALSE in the AI.IF layout.
+    """
     try:
         return _plan_reranker(region, context, backend_name=backend_name)
     except _RefusedError as refused:
@@ -278,7 +323,8 @@ def _plan_reranker(region, context, *, backend_name: str):
         for predicate in values
     ] + list(joins)
     if not predicates and not projected:
-        refusal = _refusal("a reranker model needs an AI.SCORE expression")
+        refusal = _refusal("a reranker model can only be used with AI.SCORE",
+                           "reranker_only_scores")
         return (PhysicalCandidate(None, refusal, float("inf")),)
     prompts = [predicate.prompt for predicate in predicates] + [
         score.expression.prompt for score in projected
@@ -529,6 +575,7 @@ def _plan_reranker(region, context, *, backend_name: str):
         ))
 
     estimate = total_seconds
+    true_ids, false_ids = answer_ids(context.model, context.tokenizer)
     plan = PhysicalPlan(
         model=context.model.name,
         device=context.device.name,
@@ -538,8 +585,8 @@ def _plan_reranker(region, context, *, backend_name: str):
         nodes=tuple(nodes),
         settings={
             "chunk_tokens": chunk,
-            "true_ids": list(context.tokenizer("yes")),
-            "false_ids": list(context.tokenizer("no")),
+            "true_ids": true_ids,
+            "false_ids": false_ids,
             "retained_kv_tokens": budgets.arena_tokens(
                 context.model, context.device, chunk
             ),
@@ -549,7 +596,10 @@ def _plan_reranker(region, context, *, backend_name: str):
             "estimated_attention_pairs": total_work.pairs,
             "batching": "token_based_admission",
             "data_parallel_copies": context.gpu_count,
-            "score_normalization": "yes_no_softmax",
+            "score_normalization": (
+                "yes_no_softmax" if context.model.role == "reranker"
+                else "true_false_softmax"
+            ),
             "order_rule": "cost_per_expected_rejection",
         },
     )

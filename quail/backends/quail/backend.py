@@ -16,6 +16,7 @@ from quail.execution.reranker import RerankerModelExecution
 from quail.execution.runner import NodeMetrics, NodeResult, SurvivorStream
 from quail.execution.tokens import DocumentKeys
 from quail.logical import Alias, is_score, shared_preamble
+from quail.logical.prompts import true_false_token_ids
 from quail.physical import (
     AiFilter,
     AiJoin,
@@ -324,26 +325,15 @@ class QuailBackend:
         if context.model.role == "reranker":
             if not has_score:
                 refusal = Refusal(
-                    reasons=("a reranker model needs AI.SCORE",),
-                    constraint="reranker_needs_score",
+                    reasons=("a reranker model can only be used with AI.SCORE",),
+                    constraint="reranker_only_scores",
                     needed=1,
                     available=0,
                     unit="AI.SCORE expressions",
                 )
                 return (PhysicalCandidate(None, refusal, float("inf")),)
-            return plan_reranker(region, context, backend_name=self.name)
         if has_score:
-            refusal = Refusal(
-                reasons=(
-                    "AI.SCORE requires a reranker model such as "
-                    "qwen3-reranker-0.6b-bf16",
-                ),
-                constraint="score_needs_reranker",
-                needed=1,
-                available=0,
-                unit="reranker models",
-            )
-            return (PhysicalCandidate(None, refusal, float("inf")),)
+            return plan_reranker(region, context, backend_name=self.name)
 
         plan = plan_quail(
             region.logical_plan,
@@ -410,17 +400,9 @@ class QuailBackend:
                 node = replace(node, stages=tuple(stages))
             encoded_nodes.append(node)
 
-        true_ids = set()
-        false_ids = set()
-        if tokenizer is not None:
-            for word in ("TRUE", " TRUE", "True", " True"):
-                tokens = tokenizer(word)
-                if tokens:
-                    true_ids.add(tokens[0])
-            for word in ("FALSE", " FALSE", "False", " False"):
-                tokens = tokenizer(word)
-                if tokens:
-                    false_ids.add(tokens[0])
+        true_ids, false_ids = (
+            true_false_token_ids(tokenizer) if tokenizer is not None
+            else ([], []))
         prompts = operators.prompts
         pre_ids = (
             list(tokenizer(shared_preamble(context.model.turn_prefix)))
@@ -433,8 +415,8 @@ class QuailBackend:
             root=plan.root,
             settings={
                 **plan.settings,
-                "true_ids": sorted(true_ids),
-                "false_ids": sorted(false_ids),
+                "true_ids": true_ids,
+                "false_ids": false_ids,
                 "pre_ids": pre_ids,
                 "filter_limit": (
                     None if any(

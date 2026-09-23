@@ -21,7 +21,7 @@ attention on H100.
 
 ### DiffusionGemma
 
-DiffusionGemma supports filter and join predicates. Quail uses the
+DiffusionGemma supports filter and join predicates and `AI.SCORE`. Quail uses the
 `RedHatAI/diffusiongemma-26B-A4B-it-FP8-dynamic` checkpoint and reads
 one TRUE or FALSE answer without generating a thinking response.
 
@@ -50,6 +50,8 @@ config = quail.EngineConfig(
 ### Rerankers
 
 The reranker models use the same Quail executor for `AI.SCORE`.
+The generative models also run `AI.SCORE`; see
+[AI.SCORE](/docs/user-guide/sql#aiscore) for how their score is read.
 Weights, activations, and KV use BF16. The final `yes` and `no`
 projection and score normalization use FP32. Each input produces
 one score between 0 and 1 without generating tokens.
