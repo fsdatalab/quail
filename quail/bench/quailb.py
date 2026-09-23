@@ -252,8 +252,7 @@ def run_query(session, spec: QuerySpec, tables) -> RunOutput:
         output.measurements["input_tokens"] = (
             result.report["fresh_tokens"] + result.report["cached_tokens"]
         )
-    else:
-        output.prompt_pieces = prompt_pieces(query, plan, join_anchors(result))
+    output.prompt_pieces = prompt_pieces(query, plan, join_anchors(result))
     return output
 
 
