@@ -115,19 +115,15 @@ def test_request_backends_plan_validate_and_execute(monkeypatch):
     session.close()
 
 
-class _Output:
-    def __init__(self, prompt, answer, cached=0):
-        self.prompt_token_ids = prompt
-        self.num_cached_tokens = cached
-        self.outputs = [SimpleNamespace(token_ids=[1 if answer else 2])]
-
-
 class _Client:
     def generate(self, prompts, sampling_params, use_tqdm=False):
         assert all(isinstance(token, int)
                    for prompt in prompts for token in prompt["prompt_token_ids"])
-        return [_Output(prompt["prompt_token_ids"], 10 in prompt["prompt_token_ids"])
-                for prompt in prompts]
+        return [SimpleNamespace(
+            prompt_token_ids=prompt["prompt_token_ids"], num_cached_tokens=0,
+            outputs=[SimpleNamespace(
+                token_ids=[1 if 10 in prompt["prompt_token_ids"] else 2])],
+        ) for prompt in prompts]
 
     def reset_prefix_cache(self):
         return True
@@ -150,16 +146,9 @@ class _ScoredClient(_Client):
 
 def _execution(documents, *, model=QWEN3_4B_FP8, **settings):
     return RequestModelExecution(GpuContext(
-        gpu_index=0,
-        gpu_count=1,
-        model=model,
-        device=H100_SXM,
-        query_settings={
-            "client": _Client(),
-            "sampling_params": object(),
-            "documents": documents,
-            "true_ids": [1],
-            "capacity": CAPACITY,
+        gpu_index=0, gpu_count=1, model=model, device=H100_SXM, query_settings={
+            "client": _Client(), "sampling_params": object(),
+            "documents": documents, "true_ids": [1], "capacity": CAPACITY,
             "filter_submission": "operator-at-a-time",
             "join_submission": "anchor-major",
             **settings,
