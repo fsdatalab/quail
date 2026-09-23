@@ -3,6 +3,8 @@
 from dataclasses import dataclass, replace
 from typing import ClassVar
 
+import pytest
+
 from quail.logical import ColumnRef, LogicalPlan, Project, Scan
 from quail.planner.logical_optimizer import (
     LogicalPlanningContext,
@@ -31,18 +33,15 @@ class TaggedInput:
         return self.input.output_schema()
 
     def validate(self):
-        if not self.tag:
-            raise ValueError("tag cannot be empty")
+        pass
 
     def with_children(self, children):
-        if len(children) != 1:
-            raise ValueError("TaggedInput needs one child")
-        return replace(self, input=children[0])
+        (child,) = children
+        return replace(self, input=child)
 
     def with_expressions(self, expressions):
-        if len(expressions) != 1:
-            raise ValueError("TaggedInput needs one tag")
-        return replace(self, tag=expressions[0])
+        (tag,) = expressions
+        return replace(self, tag=tag)
 
     def explain_fields(self):
         return {"tag": self.tag}
@@ -74,34 +73,29 @@ def _tagged_plan(tag):
     return LogicalPlan(Project(TaggedInput(scan, tag), (field,)))
 
 
-def test_custom_logical_node_walks_and_rewrites_without_generic_changes():
-    plan = _tagged_plan("old")
-
-    optimized, changed = apply_logical_rules(
-        plan, (RenameTag("old", "new"),), CONTEXT)
+@pytest.mark.parametrize("start,rules,tag,changed", [
+    ("old", [("old", "new")], "new", ("rename_old_new",)),
+    # the second rule only matches after the first has run, and it is
+    # listed first, so a single round would miss it
+    ("old", [("mid", "new"), ("old", "mid")], "new",
+     ("rename_old_mid", "rename_mid_new")),
+    ("new", [("old", "new")], "new", ()),
+])
+def test_custom_logical_node_rewrites_until_a_round_changes_nothing(
+        start, rules, tag, changed):
+    plan = _tagged_plan(start)
+    optimized, applied = apply_logical_rules(
+        plan, tuple(RenameTag(old, new) for old, new in rules), CONTEXT)
 
     assert [node.type_name for node in optimized.walk()] == [
-        "quail.scan",
-        "test.tagged_input",
-        "quail.logical_project",
-    ]
-    assert optimized.root.input.tag == "new"
-    assert changed == ("rename_old_new",)
-
-
-def test_rules_repeat_until_a_round_changes_nothing():
-    # The second rule only matches after the first has run, and it is
-    # listed first, so a single round would miss it.
-    rules = (RenameTag("mid", "new"), RenameTag("old", "mid"))
-
-    optimized, changed = apply_logical_rules(_tagged_plan("old"), rules, CONTEXT)
-
-    assert optimized.root.input.tag == "new"
-    assert changed == ("rename_old_mid", "rename_mid_new")
+        "quail.scan", "test.tagged_input", "quail.logical_project"]
+    assert optimized.root.input.tag == tag
+    assert applied == changed
+    assert (optimized.root is plan.root) == (not changed)
 
 
 def test_rules_that_never_settle_stop_at_the_pass_cap():
-    # Each round ends on a different tag than it started, so the rounds
+    # each round ends on a different tag than it started, so the rounds
     # would repeat forever: a -> b -> c | c -> a | a -> b -> c | ...
     rules = (RenameTag("a", "b"), RenameTag("c", "a"), RenameTag("b", "c"))
 
@@ -110,13 +104,3 @@ def test_rules_that_never_settle_stop_at_the_pass_cap():
 
     assert optimized.root.input.tag == "c"
     assert len(changed) == 5
-
-
-def test_unchanged_plan_keeps_its_root_object():
-    plan = _tagged_plan("new")
-
-    optimized, changed = apply_logical_rules(
-        plan, (RenameTag("old", "new"),), CONTEXT)
-
-    assert optimized.root is plan.root
-    assert changed == ()

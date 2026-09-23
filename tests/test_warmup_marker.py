@@ -11,8 +11,7 @@ from quail.backends.quail.executor import loop
 
 def _stub_torch():
     return SimpleNamespace(
-        __version__="2.9.0",
-        version=SimpleNamespace(cuda="13.0"),
+        __version__="2.9.0", version=SimpleNamespace(cuda="13.0"),
         cuda=SimpleNamespace(get_device_name=lambda: "NVIDIA H100",
                              synchronize=lambda: None))
 
@@ -26,7 +25,7 @@ def _concurrent_warmup(path, start, touch, compiles, results):
             compiles.value += 1
 
     def touch_together(*args):
-        # Both cached workers must warm outside the compilation lock.
+        # both cached workers must warm outside the compilation lock
         touch.wait(timeout=10)
 
     loop.compile_kernels = compile_once
@@ -64,33 +63,33 @@ def test_concurrent_processes_compile_once_and_touch_in_parallel(tmp_path):
         results.close()
 
 
-def test_warmup_failure_and_cached_join_path(monkeypatch, tmp_path):
-    with monkeypatch.context() as patch:
-        for failure in ["compile", "synchronize"]:
-            path = tmp_path / f"{failure}.json"
-            patch.setattr(loop, "_marker_path", lambda *args: str(path))
-            patch.setattr(loop, "_marker_identity", lambda *args: {"version": 1})
+@pytest.mark.parametrize("failure", ["compile", "synchronize"])
+def test_warmup_failure_writes_no_marker(monkeypatch, tmp_path, failure):
+    path = tmp_path / "warm.json"
+    monkeypatch.setattr(loop, "_marker_path", lambda *args: str(path))
+    monkeypatch.setattr(loop, "_marker_identity", lambda *args: {"version": 1})
 
-            def fail(*args):
-                raise RuntimeError("GPU failed")
+    def fail(*args):
+        raise RuntimeError("GPU failed")
 
-            torch = _stub_torch()
-            patch.setattr(loop, "compile_kernels", fail if failure == "compile"
-                                else lambda *args: None)
-            if failure == "synchronize":
-                torch.cuda.synchronize = fail
-            with pytest.raises(RuntimeError, match="GPU failed"):
-                loop.warm_kernels(torch, None, None, None, 100, model_name="model")
-            assert not path.exists()
+    torch = _stub_torch()
+    monkeypatch.setattr(loop, "compile_kernels",
+                        fail if failure == "compile" else lambda *args: None)
+    if failure == "synchronize":
+        torch.cuda.synchronize = fail
+    with pytest.raises(RuntimeError, match="GPU failed"):
+        loop.warm_kernels(torch, None, None, None, 100, model_name="model")
+    assert not path.exists()
 
-            torch.cuda.synchronize = lambda: None
-            patch.setattr(loop, "compile_kernels", lambda *args: None)
-            assert loop.warm_kernels(torch, None, None, None, 100,
-                                     model_name="model")["tier"] == "compile"
+    torch.cuda.synchronize = lambda: None
+    monkeypatch.setattr(loop, "compile_kernels", lambda *args: None)
+    assert loop.warm_kernels(torch, None, None, None, 100,
+                             model_name="model")["tier"] == "compile"
 
-    with monkeypatch.context() as patch:
-        calls = []
-        patch.setattr(loop, "_forward_warm",
-                            lambda *args, **kwargs: calls.append(kwargs))
-        loop.touch_kernels(None, None, None, None, 100)
-        assert calls == [{"join_chunk": True}]
+
+def test_touch_kernels_warms_the_join_chunk(monkeypatch):
+    calls = []
+    monkeypatch.setattr(loop, "_forward_warm",
+                        lambda *args, **kwargs: calls.append(kwargs))
+    loop.touch_kernels(None, None, None, None, 100)
+    assert calls == [{"join_chunk": True}]

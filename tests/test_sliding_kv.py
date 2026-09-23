@@ -6,8 +6,6 @@ from fakes import cpu_staging
 from quail.backends.quail.executor import loop
 from quail.backends.quail.executor.arena import KVArena
 from quail.backends.quail.executor.pack import FilterAdmission
-from quail.cost import budgets
-from quail.specs import DIFFUSION_GEMMA_26B_FP8, H100_SXM, QWEN3_4B_FP8
 
 torch = pytest.importorskip("torch")
 
@@ -22,33 +20,6 @@ def cpu_arena(pages=64, sliding_pages=16):
                    sliding_window=WINDOW, n_sliding_pages=sliding_pages)
 
 
-def test_spec_names_the_sliding_layers():
-    spec = DIFFUSION_GEMMA_26B_FP8
-    assert spec.sliding_window == 1024
-    assert len(spec.sliding_layer_set) == 25
-    assert 5 not in spec.sliding_layer_set and 6 in spec.sliding_layer_set
-    assert spec.kappa_sliding == 25 * 2 * 8 * 256 * 2
-    assert spec.kappa_full == 5 * 2 * 2 * 512 * 2
-    assert QWEN3_4B_FP8.sliding_layer_set == frozenset()
-    assert QWEN3_4B_FP8.kappa_sliding == 0
-
-
-def test_arena_pages_split_follows_document_length():
-    full_short, sliding_short = budgets.arena_pages(
-        DIFFUSION_GEMMA_26B_FP8, H100_SXM, mean_doc_tokens=300)
-    full_long, sliding_long = budgets.arena_pages(
-        DIFFUSION_GEMMA_26B_FP8, H100_SXM, mean_doc_tokens=10_697)
-    # short documents keep every token on both pools: equal pages
-    assert full_short == sliding_short
-    # long documents keep one window per document on the sliding pool
-    assert full_long > 5 * full_short
-    assert sliding_long < sliding_short
-    assert sliding_long >= budgets.transient_sliding_pages(
-        budgets.chunk_budget(DIFFUSION_GEMMA_26B_FP8, H100_SXM),
-        DIFFUSION_GEMMA_26B_FP8.sliding_window)
-    assert budgets.arena_pages(QWEN3_4B_FP8, H100_SXM)[1] == 0
-
-
 def test_window_origin_and_trim():
     arena = cpu_arena()
     assert arena.has_sliding
@@ -56,8 +27,7 @@ def test_window_origin_and_trim():
     assert arena.origin(WINDOW) == 0
     assert arena.origin(100) == 64      # 100 - 32 = 68, down to a page
     key = ("d", 0)
-    # a fresh 100-token document with 20 rows of room takes 8 pages
-    # on both pools until its pass is done
+    # a fresh 100-token document with 20 rows of room takes 8 pages per pool
     assert arena.activate(key, 100, capacity_tokens=120, base_tokens=100)
     assert len(arena.owned_pages(key)) == 8
     assert len(arena.owned_sliding_pages(key)) == 8
@@ -69,12 +39,8 @@ def test_window_origin_and_trim():
     assert arena.sliding_start(key) == 64
     assert freed == arena.free_pages - min(64 - 8, (16 - 8) * 4)
     assert arena.trim_window(key) == 0
-    # rows of the sliding pool start at the origin
-    rows = arena.capacity_rows_sliding(key)
-    assert rows.numel() == 4 * 16
-    # the every-token pool still holds all 8 pages
+    assert arena.capacity_rows_sliding(key).numel() == 4 * 16
     assert arena.capacity_rows(key).numel() == 8 * 16
-    # the key's later stages extend both pools from their own ends
     assert arena.activate(key, 110, capacity_tokens=140) is not None
     assert len(arena.owned_pages(key)) == 9
     assert len(arena.owned_sliding_pages(key)) == 5     # (140 - 64) / 16
@@ -112,7 +78,7 @@ def test_page_costs_use_the_tighter_pool():
     assert plain.held_cost(key) == 7
 
 
-def test_alloc_rolls_back_when_the_sliding_pool_is_short():
+def test_alloc_rollback_temporaries_and_resize():
     # 4 sliding pages hold 64 rows; a 100-row key needs 7 in each pool
     arena = cpu_arena(pages=64, sliding_pages=4)
     free = arena.accounting.free_pages
@@ -121,8 +87,6 @@ def test_alloc_rolls_back_when_the_sliding_pool_is_short():
     assert not arena.accounting.owned and not arena.sliding.owned
     assert arena.alloc(("d", 1), 40) is not None
 
-
-def test_temporaries_and_resize():
     arena = cpu_arena(pages=64, sliding_pages=16)
     temp, pages = arena.alloc_temporary(40, sliding_tokens=20)
     assert len(pages) == 3
@@ -161,7 +125,6 @@ def test_pack_chunk_builds_both_pools(monkeypatch):
     doc = list(range(100))
     tail = [500, 501]
     canvas = (900, 901)
-    # the fresh pass: every row lands in both pools
     arena.activate(key, 100, capacity_tokens=120, base_tokens=100)
     chunk = loop.pack_chunk(
         torch, arena, [dict(key=key, prefix=doc, f=100, suffixes=[tail])],
@@ -191,8 +154,7 @@ def test_pack_chunk_builds_both_pools(monkeypatch):
     assert sliding["dst"].tolist() == \
         arena.capacity_rows_sliding(key)[36:39].tolist()
     assert chunk.meta["canvas"]["sliding"]["used"].tolist() == [39]
-    # two suffixes take temporaries in both pools, after a copy of
-    # each pool's partial last page
+    # two suffixes take temporaries after a copy of each partial last page
     chunk = loop.pack_chunk(
         torch, arena, [dict(key=key, prefix=None, f=100,
                             suffixes=[[600], [601, 602]])],

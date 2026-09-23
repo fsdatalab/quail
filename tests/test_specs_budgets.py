@@ -5,7 +5,12 @@ from dataclasses import replace
 import pytest
 
 from quail.cost import budgets
-from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8
+from quail.specs import (
+    H100_SXM,
+    QWEN3_4B_FP8,
+    QWEN3_32B_FP8,
+    RTX_PRO_6000_BLACKWELL_SERVER,
+)
 
 
 def test_model_weights_and_kv_memory_budgets():
@@ -33,6 +38,9 @@ def test_model_weights_and_kv_memory_budgets():
     assert tokens // 400 == 905
     fp8 = budgets.arena_tokens(QWEN3_4B_FP8.with_kv_bytes(1.0), H100_SXM)
     assert fp8 == pytest.approx(2 * tokens, rel=0.01)
+    for model in (QWEN3_4B_FP8, QWEN3_32B_FP8):
+        assert budgets.arena_tokens(model, RTX_PRO_6000_BLACKWELL_SERVER) \
+            > budgets.arena_tokens(model, H100_SXM)
 
 
 def test_arena_pages_needs_room_for_one_chunk_of_sliding_kv():

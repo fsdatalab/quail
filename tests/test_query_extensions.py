@@ -7,7 +7,11 @@ import pyarrow.parquet as pq
 from modal._serialization import deserialize, serialize
 
 import quail
-from quail.execution.types import PhysicalResponse
+from quail.execution import execute as runtime
+from quail.execution.runner import NodeMetrics, NodeResult, RunResult
+from quail.execution.session import Session
+from quail.execution.types import PhysicalResponse, export_physical_outputs
+from quail.physical import AiFilter, Scan, decode_graph
 
 
 def _tokens(text):
@@ -17,43 +21,28 @@ def _tokens(text):
 def test_query_scans_provider_and_preserves_extension_objects(
     tmp_path, monkeypatch
 ):
-    from quail.execution import execute as runtime
-    from quail.execution.runner import NodeMetrics, NodeResult, RunResult
-    from quail.execution.session import Session
-    from quail.execution.types import export_physical_outputs
-    from quail.physical import AiFilter, Scan, decode_graph
-
     path = tmp_path / "documents.parquet"
     pq.write_table(pa.table({
         "id": ["a", "b"],
         "body": ["first document", "second document"],
         "unused": [1, 2],
     }), path)
-    config = quail.EngineConfig(
-        gpus=1,
-        model="qwen3-4b-fp8",
-        backend="quail",
-        device="h100-sxm",
+    session = quail.Session(
+        quail.EngineConfig(gpus=1, model="qwen3-4b-fp8", backend="quail",
+                           device="h100-sxm"),
+        tokenizer=_tokens,
     )
-    session = quail.Session(config, tokenizer=_tokens)
-
     monkeypatch.setattr(Session, "tokenizer", property(lambda self: _tokens))
-    calls = []
+    calls = ["initialize"]
+    lock = Lock()
 
-    def register_rule(registry):
-        assert registry is session.registry
-        calls.append("initialize")
-        lock = Lock()
+    class CheckPlanning:
+        name = "test.planning"
 
-        class CheckPlanning:
-            name = "test.planning"
-
-            def rewrite(self, graph, context):
-                with lock:
-                    calls.append("plan")
-                return None
-
-        registry.register_physical_rule(CheckPlanning())
+        def rewrite(self, graph, context):
+            with lock:
+                calls.append("plan")
+            return None
 
     def execute(physical, registry):
         assert registry is session.registry
@@ -61,30 +50,18 @@ def test_query_scans_provider_and_preserves_extension_objects(
         calls.append("execute")
         assert "extensions" not in physical.plan
         assert physical.plan["device"] == session.config.device
-        graph = decode_graph(
-            physical.plan["graph"], registry.codecs
-        )
-        source = next(
-            node for node in graph.nodes if isinstance(node, Scan)
-        )
+        graph = decode_graph(physical.plan["graph"], registry.codecs)
+        source = next(node for node in graph.nodes if isinstance(node, Scan))
         documents = physical.inputs[source.input_id].documents
         assert [list(document) for document in documents] == [
             ["first", "document"],
             ["second", "document"],
         ]
-        filter_node = next(
-            node for node in graph.nodes if isinstance(node, AiFilter)
-        )
-        run = RunResult(
-            None,
-            {
-                filter_node.node_id: NodeResult({
-                    "ids:d": [0],
-                    "filter_answers:d": {0: [True], 1: [False]},
-                })
-            },
-            NodeMetrics(),
-        )
+        filter_node = next(node for node in graph.nodes if isinstance(node, AiFilter))
+        run = RunResult(None, {filter_node.node_id: NodeResult({
+            "ids:d": [0],
+            "filter_answers:d": {0: [True], 1: [False]},
+        })}, NodeMetrics())
         return PhysicalResponse(
             export_physical_outputs(graph, run),
             {"wall_s": 1.0, "boot_s": 0.0, "fresh_tokens": 4},
@@ -92,16 +69,13 @@ def test_query_scans_provider_and_preserves_extension_objects(
 
     monkeypatch.setattr(runtime, "gpu_problem", lambda: None)
     monkeypatch.setattr(runtime, "_execute_physical", execute)
-    monkeypatch.setattr(runtime, "_prepare_backend",
-                        lambda plan, registry: None)
+    monkeypatch.setattr(runtime, "_prepare_backend", lambda plan, registry: None)
 
-    register_rule(session.registry)
+    session.registry.register_physical_rule(CheckPlanning())
     session.register("docs", quail.DocumentProvider.from_parquet(path, id_col="id"))
-    query = session.sql(
-        "SELECT d.id FROM docs d WHERE "
-        "AI_FILTER(PROMPT('keep {0}', d.body))"
-    )
-    response = query.run()
+    response = session.sql(
+        "SELECT d.id FROM docs d WHERE AI_FILTER(PROMPT('keep {0}', d.body))"
+    ).run()
     materialized = quail.QueryResult.from_table(response.collect(), response.report)
     materialized.plan = response.plan
     materialized.node_metrics = response.node_metrics

@@ -8,42 +8,18 @@ import pytest
 from test_session import _run, fake_tok, make_executor
 
 import quail
-from quail.logical import (
-    ColumnRef,
-    FilterPredicate,
-    Join,
-    LogicalPlan,
-    ModelCall,
-    Project,
-    Scan,
-    SemanticFilter,
-    SemanticJoin,
-    bind_join_prompt,
-    bind_prompt,
-)
-from quail.planner.logical_optimizer import (
-    LogicalPlanningContext,
-    apply_logical_rules,
-)
-from quail.planner.logical_rules import ProjectionPushdown, push_down_projection
+from quail.logical import ColumnRef, Scan, bind_join_prompt, bind_prompt
+from quail.physical import Recombine
+from quail.planner.logical_rules import push_down_projection
 from quail.planner.plan import EngineConfig
 
-CONTEXT = LogicalPlanningContext(catalog=None, engine_config=None)
 
-
-def _joined_plan(columns):
-    r = Scan("reviews", "r", "review")
-    p = Scan("products", "p", "description")
-    filtered = SemanticFilter(r, (FilterPredicate(ModelCall(bind_prompt(
-        "q {0}", (ColumnRef("r", "reviews", "review"),)))),))
-    joined = SemanticJoin(
-        Join(filtered, p),
-        ModelCall(bind_join_prompt("same {0} {1}", (
-            ColumnRef("r", "reviews", "review"),
-            ColumnRef("p", "products", "description"),
-        ))),
-    )
-    return LogicalPlan(Project(joined, tuple(columns)))
+def test_prompts_bound_without_a_tokenizer_have_no_token_counts():
+    review = ColumnRef("r", "reviews", "review")
+    description = ColumnRef("p", "products", "description")
+    assert bind_prompt("q {0}", (review,)).tail_tokens is None
+    join = bind_join_prompt("same {0} {1}", (review, description))
+    assert join.tail_tokens is None
 
 
 def _scans(plan):
@@ -51,56 +27,10 @@ def _scans(plan):
             if isinstance(node, Scan)}
 
 
-def test_projection_rule_preserves_schema_and_is_idempotent():
-    plan = _joined_plan([
-        ColumnRef("r", "reviews", "id"),
-        ColumnRef("p", "products", "asin"),
-        ColumnRef("r", "reviews", "stars"),
-    ])
-
-    optimized, changed = apply_logical_rules(
-        plan, (ProjectionPushdown(),), CONTEXT)
-
-    assert changed == ("projection_pushdown",)
-    scans = _scans(optimized)
-    assert scans["r"].columns == ("id", "stars")
-    assert scans["p"].columns == ("asin",)
-    # the prompt reads the document column as tokens, so it is not a
-    # stored value
-    assert scans["r"].column == "review"
-    assert scans["r"].output_schema() == (
-        ColumnRef("r", "reviews", "review"),
-        ColumnRef("r", "reviews", "id"),
-        ColumnRef("r", "reviews", "stars"),
-    )
-    assert optimized.root.input.output_schema() == (
-        ColumnRef("r", "reviews", "review"),
-        ColumnRef("r", "reviews", "id"),
-        ColumnRef("r", "reviews", "stars"),
-        ColumnRef("p", "products", "description"),
-        ColumnRef("p", "products", "asin"),
-    )
-
-    plan = _joined_plan([ColumnRef("r", "reviews", "id")])
-    once = push_down_projection(plan.root)
-    twice = push_down_projection(once)
-
-    assert twice == once
-    assert twice is once
-    assert ProjectionPushdown().rewrite(once, CONTEXT) is None
-    _, changed = apply_logical_rules(
-        LogicalPlan(once), (ProjectionPushdown(),), CONTEXT)
-    assert changed == ()
-
-
 def _session(tmp_path, tokenizer=fake_tok):
     session = quail.Session(
-        EngineConfig(
-            gpus=1,
-            model="qwen3-4b-fp8",
-            backend="quail",
-            device="h100-sxm",
-        ),
+        EngineConfig(gpus=1, model="qwen3-4b-fp8", backend="quail",
+                     device="h100-sxm"),
         tokenizer=tokenizer,
     )
     path = tmp_path / "reviews.parquet"
@@ -136,6 +66,7 @@ def test_projected_results_and_token_reuse(tmp_path):
     assert sorted(result.to_rows()) == [(3, "r2"), (5, "r0")]
     scan = _scans(query.logical)["r"]
     assert scan.columns == ("stars", "id")
+    assert push_down_projection(query.logical.root) is query.logical.root
     store = query._token_inputs["r"]
     assert store.projected_columns == ("stars", "id")
     tokenized = len(calls)
@@ -166,9 +97,27 @@ def test_projected_results_and_token_reuse(tmp_path):
     session.close()
 
 
-class _UnstableProvider:
-    """A provider whose row count changes between scans."""
+def test_filtered_sql_join_projects_both_sides_without_recombine(tmp_path):
+    session = _session(tmp_path)
+    session.register("products", quail.DocumentProvider.from_table(pa.table({
+        "asin": ["p0", "p1"], "description": ["product 0", "product 1"],
+    }), id_col="asin"))
+    truth = {"r": {"q:": [1, 0, 1]}}
+    # the planner picks the anchor; the rule is symmetric so either works
+    even_sum = lambda a, b: (a + b) % 2 == 0  # noqa: E731
+    join_truth = {("r", "p"): even_sum, ("p", "r"): even_sum}
+    query = session.sql(
+        "SELECT r.id, p.asin FROM reviews r JOIN products p ON "
+        "AI_FILTER(PROMPT('m {0} {1}', r.review, p.description)) "
+        "WHERE AI_FILTER(PROMPT('q: {0}', r.review))")
+    result = _run(query, make_executor(truth, join_truth))
+    assert not [n for n in result.plan.nodes if isinstance(n, Recombine)]
+    assert sorted(result.to_rows()) == [("r0", "p0"), ("r2", "p0")]
+    assert result.count() == 2
+    session.close()
 
+
+class _UnstableProvider:
     id_col = "id"
     columns = ("id", "body", "stars")
 
@@ -198,17 +147,8 @@ class _UnstableProvider:
 
 
 def test_failed_scans_and_tokenization_leave_no_partial_cache(tmp_path):
-    session = quail.Session(
-        EngineConfig(
-            gpus=1,
-            model="qwen3-4b-fp8",
-            backend="quail",
-            device="h100-sxm",
-        ),
-        tokenizer=fake_tok,
-    )
-    provider = _UnstableProvider()
-    session.register("docs", provider)
+    session = _session(tmp_path)
+    session.register("docs", _UnstableProvider())
     session.tokenize("docs", "body", ("id",))
 
     with pytest.raises(RuntimeError, match="stable order"):

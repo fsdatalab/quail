@@ -1,7 +1,13 @@
 """CPU checks for the QUAIL-B labeling pass."""
 
+import json
+from types import SimpleNamespace
+
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
+import quail
 import quail.bench.labeling as labeling
 from quail.bench.labeling import (
     _check_reused_label_set,
@@ -9,7 +15,7 @@ from quail.bench.labeling import (
     _corpus_identity,
     _saved_verification_sample,
 )
-from quail_b.data import DATA_SEED, SOURCE_REVISIONS, corpus_identity
+from quail_b.data import DATA_SEED, GROUND_TRUTH_ROOT, SOURCE_REVISIONS, corpus_identity
 from quail_b.predicates import MODEL_NAME, PREDICATES
 
 
@@ -17,114 +23,86 @@ def _spec(key):
     return next(spec for spec in PREDICATES if spec.key == key)
 
 
+def _write_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value))
+
+
 def test_corpus_identity_and_label_reuse(monkeypatch, tmp_path):
-    rows = {"reviews": [{"id": "r0", "body": "text"}]}
+    rows = {"reviews": [{"id": "r0", "body": "a"}, {"id": "r1", "body": "b"}]}
     assert (corpus_identity(rows, 0.1, DATA_SEED, SOURCE_REVISIONS)
             == _corpus_identity(rows, 0.1))
+    assert _corpus_identity(rows, 0.1) == _corpus_identity(
+        {"reviews": list(rows["reviews"])}, 0.1)
+    for changed in ({"reviews": list(reversed(rows["reviews"]))},
+                    {"reviews": [{"id": "r0", "body": "a"},
+                                 {"id": "r1", "body": "changed"}]}):
+        assert (_corpus_identity(rows, 0.1)["corpus_id"]
+                != _corpus_identity(changed, 0.1)["corpus_id"])
 
-    rows = {
-        "reviews": [{"id": "r0", "body": "a"},
-                    {"id": "r1", "body": "b"}],
-    }
-    same = {"reviews": list(rows["reviews"])}
-    reversed_rows = {"reviews": list(reversed(rows["reviews"]))}
-    changed = {"reviews": [{"id": "r0", "body": "a"},
-                           {"id": "r1", "body": "changed"}]}
-    assert _corpus_identity(rows, 0.1) == _corpus_identity(same, 0.1)
-    assert (_corpus_identity(rows, 0.1)["corpus_id"]
-            != _corpus_identity(reversed_rows, 0.1)["corpus_id"])
-    assert (_corpus_identity(rows, 0.1)["corpus_id"]
-            != _corpus_identity(changed, 0.1)["corpus_id"])
+    # the fixed join order changes only the labels whose anchor was automatic
+    for key, changed in (
+        ("quailb.fever.passage.supports_claim", True),
+        ("quailb.imdb.review.discusses_ending", False),
+        ("quailb.lepard.excerpt.cites_passage", False),
+    ):
+        old = labeling._label_set_identity(
+            _spec(key), "c_test", "0" * 64, judge=labeling.QUAIL_JUDGE_SPEC)
+        new = labeling.label_set_identity(_spec(key), "c_test", "0" * 64)
+        assert (new["label_set_id"] != old["label_set_id"]) == changed
 
-    with monkeypatch.context() as patch:
-        import json
+    monkeypatch.setattr(labeling, "ROOT", tmp_path)
+    spec = _spec("quailb.imdb.review.mentions_positive_aspect")
+    table_manifest = {"rows": 2, "ordered_rows_full_hash": "abc"}
+    _write_json(tmp_path / "corpora/c_original/manifest.json", {
+        "corpus_id": "c_original", "corpus_full_hash": "full-original",
+        "tables": {"reviews": table_manifest}})
+    _write_json(
+        tmp_path / "label_sets" / spec.workload / spec.slug / "ls_old/manifest.json",
+        {"status": "complete", "label_set_id": "ls_old",
+         "corpus_id": "c_original", "corpus_full_hash": "full-original"})
+    source_collection = {"collection_id": "gt_middle", "corpus_id": "c_middle",
+                         "label_sets": {spec.key: "ls_old"}}
+    target = {"tables": {"reviews": dict(table_manifest)}}
 
-        spec = _spec("quailb.imdb.review.mentions_positive_aspect")
-        label_set_id = "ls_old"
-        table_manifest = {"rows": 2, "ordered_rows_full_hash": "abc"}
-        corpus = {
-            "corpus_id": "c_original",
-            "corpus_full_hash": "full-original",
-            "tables": {"reviews": table_manifest},
-        }
-        corpus_dir = tmp_path / "corpora" / corpus["corpus_id"]
-        corpus_dir.mkdir(parents=True)
-        (corpus_dir / "manifest.json").write_text(json.dumps(corpus))
-        label_dir = (
-            tmp_path / "label_sets" / spec.workload / spec.slug / label_set_id
-        )
-        label_dir.mkdir(parents=True)
-        (label_dir / "manifest.json").write_text(json.dumps({
-            "status": "complete",
-            "label_set_id": label_set_id,
-            "corpus_id": corpus["corpus_id"],
-            "corpus_full_hash": corpus["corpus_full_hash"],
-        }))
-        source_collection = {
-            "collection_id": "gt_middle",
-            "corpus_id": "c_middle",
-            "label_sets": {spec.key: label_set_id},
-        }
-        target = {"tables": {"reviews": dict(table_manifest)}}
-        patch.setattr(labeling, "ROOT", tmp_path)
+    reused = _check_reused_label_set(spec, "ls_old", source_collection, target)
+    assert reused["source_collection_id"] == "gt_middle"
+    assert reused["source_corpus_id"] == "c_original"
 
-        reused = _check_reused_label_set(
-            spec, label_set_id, source_collection, target)
-
-        assert reused["source_collection_id"] == "gt_middle"
-        assert reused["source_corpus_id"] == "c_original"
-
-        target["tables"]["reviews"]["ordered_rows_full_hash"] = "changed"
-        with pytest.raises(ValueError, match="table reviews changed"):
-            _check_reused_label_set(spec, label_set_id, source_collection, target)
+    target["tables"]["reviews"]["ordered_rows_full_hash"] = "changed"
+    with pytest.raises(ValueError, match="table reviews changed"):
+        _check_reused_label_set(spec, "ls_old", source_collection, target)
 
 
 def test_saved_label_parts_and_resume(monkeypatch, tmp_path):
-    with monkeypatch.context() as patch:
-        import pyarrow as pa
-        import pyarrow.parquet as pq
+    spec = _spec("quailb.imdb.review.discusses_ending")
+    monkeypatch.setattr(labeling, "ROOT", tmp_path)
+    parts = tmp_path / "label_sets" / spec.workload / spec.slug / "ls_test" / "parts"
+    parts.mkdir(parents=True)
+    saved = [{"answer": i % 2 == 0, "label_source": MODEL_NAME,
+              "left_id": f"rv{i}", "right_id": None} for i in range(85)]
+    # only the first of two parts is on disk, the resume case
+    pq.write_table(pa.Table.from_pylist(saved), parts / "part_000000_000085.parquet")
+    corpus = {"reviews": [{"id": f"rv{i}", "body": f"review {i}"}
+                          for i in range(170)]}
 
-        spec = _spec("quailb.imdb.review.discusses_ending")
-        identity = {"label_set_id": "ls_test"}
-        patch.setattr(labeling, "ROOT", tmp_path)
-        parts = (tmp_path / "label_sets" / spec.workload / spec.slug
-                 / identity["label_set_id"] / "parts")
-        parts.mkdir(parents=True)
-        saved = [{
-            "answer": i % 2 == 0,
-            "label_source": MODEL_NAME,
-            "left_id": f"rv{i}",
-            "right_id": None,
-        } for i in range(85)]
-        # only the first of two parts is on disk, the resume case
-        pq.write_table(pa.Table.from_pylist(saved),
-                       parts / "part_000000_000085.parquet")
-        corpus = {
-            "reviews": [{"id": f"rv{i}", "body": f"review {i}"}
-                        for i in range(170)]
-        }
+    sample = _saved_verification_sample(
+        corpus, {spec.key: {"label_set_id": "ls_test"}}, specs=(spec,))
 
-        sample = _saved_verification_sample(
-            corpus, {spec.key: identity}, specs=(spec,))
-
-        assert len(sample.rows[spec.key]) == 16
-        assert sample.rows[spec.key][0] == (
-            {"id": "rv0", "body": "review 0"}, None, True)
-
-    import pyarrow as pa
-    import pyarrow.parquet as pq
+    assert len(sample.rows[spec.key]) == 16
+    assert sample.rows[spec.key][0] == (
+        {"id": "rv0", "body": "review 0"}, None, True)
 
     parts_dir = tmp_path / "parts"
     parts_dir.mkdir()
-    pq.write_table(pa.table({"id": ["a", "b"], "answer": [True, False]}),
-                   parts_dir / "part_000000_000002.parquet")
-    pq.write_table(pa.table({"id": ["c"], "answer": [True]}),
-                   parts_dir / "part_000002_000003.parquet")
-    # a leftover generation of boundaries, which the caller does not
-    # name and compaction must therefore ignore
-    pq.write_table(pa.table({"id": ["a", "b", "c"],
-                             "answer": [True, False, True]}),
-                   parts_dir / "part_000000_000003.parquet")
+    for name, ids, answers in (("000000_000002", ["a", "b"], [True, False]),
+                               ("000002_000003", ["c"], [True]),
+                               ("000000_000003", ["a", "b", "c"],
+                                [True, False, True])):
+        pq.write_table(pa.table({"id": ids, "answer": answers}),
+                       parts_dir / f"part_{name}.parquet")
+    # the last part is a leftover generation of boundaries, which the
+    # caller does not name and compaction must therefore ignore
     parts = [parts_dir / "part_000000_000002.parquet",
              parts_dir / "part_000002_000003.parquet"]
 
@@ -167,8 +145,6 @@ class _FakeQuery:
         return self
 
     def run(self):
-        import pyarrow as pa
-
         tables = [self.session.tables[name] for name in self.names]
         if len(tables) == 1:
             text = tables[0].column(1).to_pylist()
@@ -198,66 +174,8 @@ class _FakeSession:
         pass
 
 
-def test_judge_answers_and_source_labels(monkeypatch, tmp_path):
-    with monkeypatch.context() as patch:
-        import quail
-
-        patch.setattr(quail, "Session", _FakeSession)
-        judge = labeling.QuailJudge()
-        spec = _spec("quailb.imdb.review.discusses_aspect")
-        reviews = [{"id": "rv0", "body": "no"}, {"id": "rv1", "body": "yes"}]
-        aspects = [{"id": "as0", "aspect": "yes the plot"},
-                   {"id": "as1", "aspect": "the acting"}]
-
-        assert judge.filter(_spec("quailb.imdb.review.discusses_ending"),
-                            reviews) == [False, True]
-        assert judge.join(spec, reviews, aspects) == {
-            (0, 0): False, (0, 1): False, (1, 0): True, (1, 1): False}
-        assert judge.queries == 2
-        assert judge.rows_answered == 6
-        assert judge.session.join_anchors == ["l"]
-
-    with monkeypatch.context() as patch:
-        import pyarrow.parquet as pq
-
-        import quail
-
-        patch.setattr(quail, "Session", _FakeSession)
-        patch.setattr(labeling, "ROOT", tmp_path)
-        judge = labeling.QuailJudge()
-        spec = _spec("quailb.fever.passage.supports_claim")
-        claims = [{"id": "cl0", "claim": "yes one", "label": "REFUTES",
-                   "evidence_wiki_url": "page0"},
-                  {"id": "cl1", "claim": "two", "label": "SUPPORTS",
-                   "evidence_wiki_url": "page1"}]
-        evidence = [{"id": "page0", "text": "yes"}, {"id": "page1", "text": "no"}]
-        identity = labeling.label_set_identity(spec, "c_test", "0" * 64)
-
-        labeling._write_qwen_join_parts(
-            judge, labeling.VerificationSample(), spec, claims, evidence,
-            identity, "c_test", source_label=labeling._fever_source_label)
-
-        parts = labeling._expected_parts(
-            spec, identity, {"claims": claims, "evidence": evidence})
-        assert len(parts) == 1 and parts[0].exists()
-        rows = {(row["left_id"], row["right_id"]): (row["answer"],
-                                                     row["label_source"])
-                for row in pq.read_table(parts[0]).to_pylist()}
-        assert rows == {
-            ("cl0", "page0"): (False, "fever_annotation"),   # source wins
-            ("cl0", "page1"): (False, MODEL_NAME),
-            ("cl1", "page0"): (False, MODEL_NAME),
-            ("cl1", "page1"): (True, "fever_annotation"),
-        }
-
-
 def _write_corpus(root, sf, rows):
     """Write one corpus under root the way _materialize_corpus does."""
-    import json
-
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-
     identity = labeling._corpus_identity(rows, sf)
     target = root / "corpora" / identity["corpus_id"]
     target.mkdir(parents=True, exist_ok=True)
@@ -298,12 +216,6 @@ def _corpus_rows(reviews, reports, terms, claims, evidence, contexts,
 
 
 def test_derive_collection_copies_labels_by_content(monkeypatch, tmp_path):
-    import json
-
-    import pyarrow.parquet as pq
-
-    import quail
-
     monkeypatch.setattr(quail, "Session", _FakeSession)
     monkeypatch.setattr(labeling, "ROOT", tmp_path)
     specs = (
@@ -346,15 +258,16 @@ def test_derive_collection_copies_labels_by_content(monkeypatch, tmp_path):
         specs[3], source_rows["citation_contexts"],
         source_rows["citation_passages"], identities[specs[3].key],
         source_id)
+    assert judge.queries == 3
+    assert judge.rows_answered == 3 + 4 + 4
+    assert judge.session.join_anchors == ["l", "l"]
     for spec in specs:
         labeling._complete_manifest(spec, identities[spec.key], source_rows)
-    collection_dir = tmp_path / "collections" / "gt_source"
-    collection_dir.mkdir(parents=True)
-    (collection_dir / "manifest.json").write_text(json.dumps({
+    _write_json(tmp_path / "collections/gt_source/manifest.json", {
         "status": "complete", "collection_id": "gt_source",
         "scale_factor": 1.0, "corpus_id": source_id,
         "label_sets": {key: identity["label_set_id"]
-                       for key, identity in identities.items()}}))
+                       for key, identity in identities.items()}})
 
     # the small corpus: a prefix of the documents, terms renumbered,
     # and the context no longer cites p2 because that pair was not sampled
@@ -394,6 +307,7 @@ def test_derive_collection_copies_labels_by_content(monkeypatch, tmp_path):
     # tm1 is "yes fever" here but was tm0 in the source
     assert answers(specs[1]) == {("rp0", "tm0"): (False, MODEL_NAME),
                                  ("rp0", "tm1"): (True, MODEL_NAME)}
+    # the FEVER annotation wins over the judge's TRUE
     assert answers(specs[2]) == {
         ("cl0", "page0"): (False, "fever_annotation")}
     assert answers(specs[3]) == {
@@ -406,66 +320,38 @@ def test_derive_collection_copies_labels_by_content(monkeypatch, tmp_path):
     assert active["collection_id"] == summary["collection_id"]
 
 
-def test_activate_collection_preserves_raw_prompt_pointer(monkeypatch, tmp_path):
-    import json
-
-    monkeypatch.setattr(labeling, "ROOT", tmp_path)
-    directory = tmp_path / "corpora" / "c_test"
-    directory.mkdir(parents=True)
-    raw = directory / "active_collection.json"
-    raw.write_text('{"collection_id": "gt_raw"}')
-    labeling._activate_collection("c_test", "gt_chat")
-    assert raw.read_text() == '{"collection_id": "gt_raw"}'
-    active = directory / f"active_collection.{labeling.PROMPT_FORMAT}.json"
-    assert json.loads(active.read_text()) == {"collection_id": "gt_chat"}
-
-
 class _FakeS3:
     """Records uploads; the bucket already holds one label file."""
 
     def __init__(self, existing):
-        self.existing = existing
+        self.contents = [{"Key": key, "Size": size} for key, size in existing.items()]
         self.uploads = []
 
     def get_paginator(self, _name):
-        existing = self.existing
-
-        class _Paginator:
-            def paginate(self, **_kwargs):
-                return [{"Contents": [{"Key": key, "Size": size}
-                                      for key, size in existing.items()]}]
-
-        return _Paginator()
+        return SimpleNamespace(paginate=lambda **_: [{"Contents": self.contents}])
 
     def upload_file(self, path, _bucket, key):
         self.uploads.append(key)
 
 
 def test_publish_uploads_only_what_a_reader_needs(monkeypatch, tmp_path):
-    import json
-
-    from quail_b.data import GROUND_TRUTH_ROOT
-
     monkeypatch.setattr(labeling, "ROOT", tmp_path)
     spec = _spec("quailb.imdb.review.discusses_ending")
     monkeypatch.setattr(labeling, "PREDICATES", (spec,))
     monkeypatch.setattr(labeling, "PREDICATE_BY_KEY", {})
     corpus_dir = tmp_path / "corpora" / "c_x"
-    corpus_dir.mkdir(parents=True)
-    (corpus_dir / "manifest.json").write_text("{}")
-    (corpus_dir / "reviews.parquet").write_bytes(b"rows")
-    (corpus_dir / "active_collection.json").write_text("{}")
     label_dir = tmp_path / "label_sets" / spec.workload / spec.slug / "ls_x"
     (label_dir / "parts").mkdir(parents=True)
-    (label_dir / "manifest.json").write_text("{}")
+    corpus_dir.mkdir(parents=True)
+    for path in (corpus_dir / "manifest.json",
+                 corpus_dir / "active_collection.json", label_dir / "manifest.json",
+                 tmp_path / "collections/gt_x/summary.json"):
+        _write_json(path, {})
+    (corpus_dir / "reviews.parquet").write_bytes(b"rows")
     (label_dir / "labels.parquet").write_bytes(b"labels")
     (label_dir / "parts" / "part_000000_000002.parquet").write_bytes(b"p")
-    collection_dir = tmp_path / "collections" / "gt_x"
-    collection_dir.mkdir(parents=True)
-    (collection_dir / "manifest.json").write_text(json.dumps({
-        "status": "complete", "corpus_id": "c_x",
-        "label_sets": {spec.key: "ls_x"}}))
-    (collection_dir / "summary.json").write_text("{}")
+    _write_json(tmp_path / "collections/gt_x/manifest.json", {
+        "status": "complete", "corpus_id": "c_x", "label_sets": {spec.key: "ls_x"}})
     prefix = f"{GROUND_TRUTH_ROOT}/label_sets/{spec.workload}/{spec.slug}"
     client = _FakeS3({f"{prefix}/ls_x/labels.parquet": 6})
 
@@ -478,22 +364,7 @@ def test_publish_uploads_only_what_a_reader_needs(monkeypatch, tmp_path):
             in client.uploads)
 
 
-def test_fixed_join_order_does_not_reuse_automatic_anchor_labels():
-    for key, changed in (
-        ("quailb.fever.passage.supports_claim", True),
-        ("quailb.imdb.review.discusses_ending", False),
-        ("quailb.lepard.excerpt.cites_passage", False),
-    ):
-        spec = _spec(key)
-        old = labeling._label_set_identity(
-            spec, "c_test", "0" * 64, judge=labeling.QUAIL_JUDGE_SPEC)
-        new = labeling.label_set_identity(spec, "c_test", "0" * 64)
-        assert (new["label_set_id"] != old["label_set_id"]) == changed
-
-
 def test_activate_new_predicate_reuses_existing_workload_labels(monkeypatch, tmp_path):
-    import json
-
     old = _spec("quailb.biodex.report.describes_serious_adverse_event")
     new = _spec("quailb.biodex.reaction.is_neurological")
     monkeypatch.setattr(labeling, "ROOT", tmp_path)
@@ -508,6 +379,8 @@ def test_activate_new_predicate_reuses_existing_workload_labels(monkeypatch, tmp
         }
         labeling._atomic_json(
             tmp_path / "corpora" / corpus_id / "manifest.json", manifest)
+    raw = tmp_path / "corpora/c_target/active_collection.json"
+    raw.write_text('{"collection_id": "gt_raw"}')
     source = {
         "collection_id": "gt_source", "status": "complete",
         "corpus_id": "c_source", "scale_factor": 0.1,
@@ -532,6 +405,7 @@ def test_activate_new_predicate_reuses_existing_workload_labels(monkeypatch, tmp
     assert summary["label_sets"][new.key]["label_set_id"] == identity["label_set_id"]
     active = tmp_path / "corpora/c_target/active_collection.raw-v1.json"
     assert json.loads(active.read_text())["collection_id"] == summary["collection_id"]
+    assert raw.read_text() == '{"collection_id": "gt_raw"}'
     with pytest.raises(ValueError, match="unknown relabeled predicates"):
         labeling.activate_reused_collection(
             0.1, "c_target", "gt_source", "", relabeled_predicates=("unknown",))

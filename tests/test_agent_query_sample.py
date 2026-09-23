@@ -15,24 +15,12 @@ def test_sample_and_reference_comparison():
     assert forward == reverse
     assert len(forward) == 5
 
-    reference = {
-        "selectivity": 0.5,
-        "answers": [
-            {"id": "a", "answer": True},
-            {"id": "b", "answer": True},
-            {"id": "c", "answer": False},
-            {"id": "d", "answer": False},
-        ],
-    }
-    candidate = {
-        "selectivity": 0.5,
-        "answers": [
-            {"id": "a", "answer": True},
-            {"id": "b", "answer": False},
-            {"id": "c", "answer": True},
-            {"id": "d", "answer": False},
-        ],
-    }
+    def answers(values):
+        return {"selectivity": 0.5, "answers": [
+            {"id": row_id, "answer": value} for row_id, value in zip("abcd", values)]}
+
+    reference = answers([True, True, False, False])
+    candidate = answers([True, False, True, False])
 
     result = _comparison(reference, candidate)
 

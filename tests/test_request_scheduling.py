@@ -37,9 +37,20 @@ def test_join_submission_order_and_empty_inputs():
             len(p) + len(s) for p in prefixes for s in suffixes
         ) - result["cached_tokens"]
         assert result["submission"] == submission
-        with pytest.raises(ValueError, match="unknown join submission"):
-            run_join_grouped(_ParityClient(), object(), prefixes, suffixes, READ_ANSWER,
-                             submission="unknown")
+        pairs = [(0, 1), (0, 3), (2, 0), (2, 2), (2, 3)]
+        client = _ParityClient()
+        result = run_join_grouped(client, object(), prefixes, suffixes, READ_ANSWER,
+                                  submission=submission, pairs=pairs)
+        heads = [(p["prompt_token_ids"][0] - 100, p["prompt_token_ids"][-1] - 200)
+                 for p in client.calls[0]]
+        assert heads == (pairs if submission == "anchor-major"
+                         else sorted(pairs, key=lambda pair: pair[::-1]))
+        # answers and cache counts come back in the listed order
+        assert result["answers"] == [int((a + s) % 2 == 0) for a, s in pairs]
+        assert result["cached_per_request"] == [(100 + a) % 7 for a, _ in pairs]
+    with pytest.raises(ValueError, match="unknown join submission"):
+        run_join_grouped(_ParityClient(), object(), prefixes, suffixes, READ_ANSWER,
+                         submission="unknown")
 
     for prefixes, suffixes in [([], [[1]]), ([[1]], []), ([], [])]:
         result = run_join_grouped(
@@ -114,14 +125,13 @@ def test_filter_pipelining_advances_and_refills():
             active -= 1
             events.append(("finish", document, question))
             return SimpleNamespace(
-                prompt_token_ids=prompt, num_cached_tokens=0,
+                prompt_token_ids=prompt, num_cached_tokens=document,
                 outputs=[SimpleNamespace(token_ids=[1 if answer else 0])],
             )
 
         result = await asyncio.wait_for(run_filter_chain_async(
             generate, {}, [[1] * 10, [2] * 20, [3] * 30],
             [[8] * 3, [9] * 4], 64, read_answer=READ_ANSWER, block_size=16,
-            max_num_seqs=10,
         ), timeout=2)
         assert result["doc_cap"] == 2
         assert peak == 2
@@ -129,6 +139,8 @@ def test_filter_pipelining_advances_and_refills():
         assert events.index(("start", 3, 8)) < events.index(("finish", 2, 8))
         assert result["survivors"] == [1]
         assert result["requests"] == 5
+        assert result["prompt_tokens"] == 13 + 14 + 23 + 24 + 33
+        assert result["cached_tokens"] == 1 + 1 + 2 + 2 + 3
         assert result["answers"] == {
             (0, 1): 1, (0, 2): 0, (1, 1): 1, (1, 2): 1, (2, 1): 0}
 
@@ -183,22 +195,3 @@ class _ParityClient:
                 prompt_token_ids=ids,
                 num_cached_tokens=ids[0] % 7))
         return outs
-
-
-def test_request_backend_evaluates_listed_pairs_only():
-    prefixes = [[100 + i] * (4 + i) for i in range(3)]
-    suffixes = [[200 + j] * 3 for j in range(4)]
-    pairs = [(0, 1), (0, 3), (2, 0), (2, 2), (2, 3)]
-    for submission in ("anchor-major", "suffix-major"):
-        client = _ParityClient()
-        result = run_join_grouped(client, object(), prefixes, suffixes, READ_ANSWER,
-                                  submission=submission, pairs=pairs)
-        heads = [(p["prompt_token_ids"][0] - 100, p["prompt_token_ids"][-1] - 200)
-                 for p in client.calls[0]]
-        assert sorted(heads) == pairs
-        if submission == "suffix-major":
-            assert heads == sorted(pairs, key=lambda pair: pair[::-1])
-        # answers and cache counts come back in the listed order
-        assert result["answers"] == [
-            1 if (100 + a + 200 + s) % 2 == 0 else 0 for a, s in pairs]
-        assert result["cached_per_request"] == [(100 + a) % 7 for a, _ in pairs]
