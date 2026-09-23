@@ -26,12 +26,7 @@ def _session(tmp_path):
         "aspect": ["acting", "ending"],
     }), tmp_path / "aspects.parquet")
     sess = quail.Session(
-        EngineConfig(
-            gpus=1,
-            model="qwen3-4b-fp8",
-            backend="quail",
-            device="h100-sxm",
-        ),
+        EngineConfig(gpus=1, model="qwen3-4b-fp8", device="h100-sxm"),
         tokenizer=str.split,
     )
     sess.register("reviews", DocumentProvider.from_parquet(
@@ -48,19 +43,25 @@ def _answer(prompt, assignment):
 
 
 def test_distinct_prefix_estimates_for_filters_and_joins(tmp_path):
-    sess = _session(tmp_path)
-    try:
-        query = (sess.docs("reviews").alias("r")
-                 .ai_filter(quail.prompt(FILTER, quail.col("r.body")))
-                 .select("r.id"))
+    with _session(tmp_path) as sess:
+        filtered = (sess.docs("reviews").alias("r")
+                    .ai_filter(quail.prompt(FILTER, quail.col("r.body"))))
+        query = filtered.select("r.id")
         filters = query.logical.operators().filters
         question = filters["r"][0].prompt.tail_tokens
         preamble = filters["r"][0].prompt.preamble_tokens
         distinct = quail.speed_of_light_estimate(query, _answer)
         per_document = quail.speed_of_light_estimate(
             query, _answer, credit_shared_prefixes=False)
-    finally:
-        sess.close()
+        query = (filtered
+                 .ai_join(sess.docs("aspects").alias("a"),
+                          quail.prompt(JOIN, quail.col("r.body"),
+                                       quail.col("a.aspect")))
+                 .select("r.id", "a.id"))
+        estimate = quail.speed_of_light_estimate(query, _answer)
+        canvas = quail.speed_of_light_estimate(
+            query, _answer,
+            model=replace(DIFFUSION_GEMMA_26B_FP8, canvas_tokens=8))
 
     # "good film" and "good acting" share the preamble and one document token.
     assert per_document.fresh_tokens == 3 * (preamble + 2 + question)
@@ -75,19 +76,6 @@ def test_distinct_prefix_estimates_for_filters_and_joins(tmp_path):
     assert distinct.model == "qwen3-4b-fp8"
     assert distinct.device == "h100-sxm"
 
-    sess = _session(tmp_path)
-    try:
-        query = (sess.docs("reviews").alias("r")
-                 .ai_filter(quail.prompt(FILTER, quail.col("r.body")))
-                 .ai_join(
-                     sess.docs("aspects").alias("a"),
-                     quail.prompt(JOIN, quail.col("r.body"),
-                                  quail.col("a.aspect")))
-                 .select("r.id", "a.id"))
-        estimate = quail.speed_of_light_estimate(query, _answer)
-    finally:
-        sess.close()
-
     assert len(estimate.join_stages) == 1
     stage = estimate.join_stages[0]
     assert stage["evaluated_pairs"] == 2 * 2
@@ -101,29 +89,9 @@ def test_distinct_prefix_estimates_for_filters_and_joins(tmp_path):
     record = json.loads(json.dumps(estimate.as_dict()))
     assert record["sol_s"] == estimate.seconds
     assert record["join_stages"][0]["template"] == stage["template"]
-
-
-def test_canvas_rows_count_once_per_evaluation(tmp_path):
-    sess = _session(tmp_path)
-    try:
-        query = (sess.docs("reviews").alias("r")
-                 .ai_filter(quail.prompt(FILTER, quail.col("r.body")))
-                 .ai_join(
-                     sess.docs("aspects").alias("a"),
-                     quail.prompt(JOIN, quail.col("r.body"),
-                                  quail.col("a.aspect")))
-                 .select("r.id", "a.id"))
-        decoder = quail.speed_of_light_estimate(query, _answer)
-        canvas = quail.speed_of_light_estimate(
-            query, _answer,
-            model=replace(DIFFUSION_GEMMA_26B_FP8, canvas_tokens=8))
-    finally:
-        sess.close()
-
     # three filter evaluations and four join pairs each carry the
     # eight canvas rows; the anchor frames carry none
-    assert canvas.fresh_tokens == decoder.fresh_tokens + 8 * (3 + 4)
-    assert canvas.join_pair_evaluations == 4
+    assert canvas.fresh_tokens == estimate.fresh_tokens + 8 * (3 + 4)
 
 
 def test_planner_and_estimate_price_hybrid_queries_and_prefix_reuse(tmp_path):

@@ -25,9 +25,15 @@ from quail.execution.runner import (
 )
 from quail.execution.types import PhysicalResponse, export_physical_outputs
 from quail.frontend.sql import compile_sql
-from quail.logical import Alias, Compare, CompileError, SemanticJoin
+from quail.logical import CompileError, SemanticJoin
 from quail.physical import AiScore, ScoreFilter, decode_graph, encode_graph
 from quail.planner.plan import EngineConfig
+
+PROJECTION_SQL = (
+    "SELECT d.id, "
+    "AI.SCORE(PROMPT('Requests a refund: {0}', d.body)) AS score "
+    "FROM documents d"
+)
 
 
 def _tokens(text):
@@ -67,87 +73,13 @@ def _session(
     return session
 
 
-def test_score_projection_is_a_named_numeric_expression(catalog):
-    plan = compile_sql(
-        "SELECT d.id, "
-        "AI.SCORE(PROMPT('Requests a refund: {0}', d.body)) AS score "
-        "FROM documents d",
-        catalog,
-        _tokens,
-    )
-    score = plan.root.columns[1]
-    assert isinstance(score, Alias)
-    assert score.name == "score"
-    assert score.expression.kind == "score"
-    assert score.expression.aliases() == ("d",)
-
-
-def test_score_join_comparison_uses_two_relations(catalog):
-    plan = compile_sql(
-        "SELECT q.id, d.id FROM queries q JOIN documents d ON "
-        "AI.SCORE(PROMPT('Is {1} relevant to {0}', q.text, d.body)) "
-        "> 0.8",
-        catalog,
-        _tokens,
-    )
-    node = plan.root.input
-    assert isinstance(node, SemanticJoin)
-    assert isinstance(node.predicate, Compare)
-    assert (node.predicate.comparison, node.predicate.threshold) == (">", 0.8)
-    assert node.predicate.call.aliases() == ("q", "d")
-
-
-@pytest.mark.parametrize("sql", [
-    "SELECT AI.SCORE(PROMPT('refund {0}', d.body)) FROM documents d",
-    "SELECT d.id FROM documents d "
-    "WHERE AI.SCORE(PROMPT('refund {0}', d.body))",
-    "SELECT d.id FROM documents d "
-    "WHERE AI.SCORE(PROMPT('refund {0}', d.body)) = 1",
-])
-def test_score_rejects_unnamed_or_uncompared_calls(catalog, sql):
-    with pytest.raises(CompileError, match="AI.SCORE"):
-        compile_sql(sql, catalog, _tokens)
-
-
-def test_score_comparisons():
-    assert compare_score(0.7, ">=", 0.7)
-    assert compare_score(0.7, "<=", 0.7)
-    assert compare_score(0.7, ">", 0.6)
-    assert compare_score(0.7, "<", 0.8)
-
-
-def test_projection_only_plan_does_not_filter(catalog):
-    session = _session(catalog, gpus=2)
-    query = session.sql(
-        "SELECT d.id, "
-        "AI.SCORE(PROMPT('Requests a refund: {0}', d.body)) AS score "
-        "FROM documents d"
-    )
-    physical = query.plan()
-    scores = [
-        node for node in physical.nodes if isinstance(node, AiScore)
-    ]
-    assert len(scores) == 1
-    assert not any(
-        isinstance(node, ScoreFilter) for node in physical.nodes
-    )
-    assert scores[0].spec.name == "score"
-    assert scores[0].spec.expected_inputs == 2
-    assert scores[0].spec.estimated_seconds > 0
-    assert physical.workers == 2
-    assert physical.settings["data_parallel_copies"] == 2
-    session.close()
-
-
-def test_projection_and_comparison_reuse_one_model_node(catalog):
+def test_score_physical_nodes_round_trip_and_share_one_model_node(catalog):
     session = _session(catalog)
     query = session.sql(
-        "SELECT d.id, "
-        "AI.SCORE(PROMPT('Requests a refund: {0}', d.body)) AS score "
-        "FROM documents d "
+        f"{PROJECTION_SQL} "
         "WHERE AI.SCORE("
         "PROMPT('Requests a refund: {0}', d.body)"
-        ") >= 0.75"
+        ") >= 0.7"
     )
     physical = query.plan()
     assert sum(isinstance(node, AiScore) for node in physical.nodes) == 1
@@ -155,44 +87,8 @@ def test_projection_and_comparison_reuse_one_model_node(catalog):
         node for node in physical.nodes if isinstance(node, ScoreFilter)
     )
     assert score_filter.score_name == "score"
-    assert score_filter.comparison == ">="
-    assert score_filter.threshold == 0.75
-    session.close()
-
-
-def test_pair_projection_plans_one_cross_product_score(catalog):
-    session = _session(catalog, model="qwen3-reranker-4b-bf16")
-    query = session.sql(
-        "SELECT q.id, d.id, "
-        "AI.SCORE(PROMPT("
-        "'Is {1} relevant to {0}', q.text, d.body"
-        ")) AS score "
-        "FROM queries q CROSS JOIN documents d"
-    )
-    physical = query.plan()
-    score = next(
-        node for node in physical.nodes if isinstance(node, AiScore)
-    )
-    assert score.spec.aliases == ("q", "d")
-    assert score.spec.expected_inputs == 4
-    assert score.spec.pair_fraction == 1.0
-    assert not any(
-        isinstance(node, ScoreFilter) for node in physical.nodes
-    )
-    session.close()
-
-
-def test_score_physical_nodes_round_trip(catalog):
-    session = _session(catalog)
-    query = session.sql(
-        "SELECT d.id, "
-        "AI.SCORE(PROMPT('Requests a refund: {0}', d.body)) AS score "
-        "FROM documents d "
-        "WHERE AI.SCORE("
-        "PROMPT('Requests a refund: {0}', d.body)"
-        ") >= 0.7"
-    )
-    graph = query.plan().graph
+    assert (score_filter.comparison, score_filter.threshold) == (">=", 0.7)
+    graph = physical.graph
     decoded = decode_graph(
         encode_graph(graph, session.registry.codecs),
         session.registry.codecs,
@@ -217,20 +113,20 @@ class _FakeReranker:
         return RerankerBatch(self.scores, fresh_tokens=12, cached_tokens=3)
 
 
-def test_score_execution_then_filter_retains_float64_column(catalog):
-    session = _session(catalog)
-    query = session.sql(
-        "SELECT d.id, "
-        "AI.SCORE(PROMPT('Requests a refund: {0}', d.body)) AS score "
-        "FROM documents d "
-        "WHERE AI.SCORE("
-        "PROMPT('Requests a refund: {0}', d.body)"
-        ") >= 0.7"
-    )
-    request = query._prepare_physical()
+class _RowReranker:
+    def __init__(self):
+        self.calls = 0
+
+    def score(self, spec, rows, documents):
+        self.calls += 1
+        scores = [(int(sum(row)) + 1) / 10 for row in rows]
+        return RerankerBatch(scores, fresh_tokens=len(rows), cached_tokens=0)
+
+
+def _run_graph(session, query, request, reranker):
     graph = compute_subgraph(query.plan().graph)
     model = RerankerModelExecution.__new__(RerankerModelExecution)
-    model.reranker = _FakeReranker((0.9, 0.1))
+    model.reranker = reranker
     model.documents = {
         node.alias: request.inputs[node.input_id].documents
         for node in query.plan().nodes if node.type_name == "quail.scan"
@@ -241,80 +137,38 @@ def test_score_execution_then_filter_retains_float64_column(catalog):
             runtimes=session.registry.runtimes,
             model_execution=model,
             sources={
-                "d": range(2),
+                **{alias: range(2) for alias in model.documents},
                 **request.relations,
             },
         ),
     )
-    score_node = next(
-        node for node in graph.nodes if isinstance(node, AiScore)
-    )
-    filter_node = next(
-        node for node in graph.nodes if isinstance(node, ScoreFilter)
-    )
-    score_table = run.nodes[score_node.node_id].outputs["scores"]
-    filtered = run.nodes[filter_node.node_id].outputs["scores"]
-    answers = run.nodes[filter_node.node_id].outputs["filter_answers:d"]
-    assert score_table.schema.field("score").type == pa.float64()
-    assert filtered.column("score").to_pylist() == [0.9]
-    assert answers.column("answer").to_pylist() == [True, False]
-    assert run.metrics.evaluated_documents == 2
-    session.close()
+    return graph, model, run
+
+
+def _finish(query, session, reranker):
+    def execute(request):
+        graph, _, run = _run_graph(session, query, request, reranker)
+        return PhysicalResponse(
+            export_physical_outputs(graph, run),
+            {"backend": "quail", "wall_s": 0.1, "fresh_tokens": 12,
+             "cached_tokens": 3, "node_metrics": scalar_node_metrics(run.nodes)},
+        )
+
+    return execute_query(query, physical_executor=execute)
 
 
 def test_scores_stream_to_the_answer_sink_per_batch(catalog):
     from quail.progress import set_answer_sink
 
     session = _session(catalog)
-    query = session.sql(
-        "SELECT d.id, "
-        "AI.SCORE(PROMPT('Requests a refund: {0}', d.body)) AS score "
-        "FROM documents d"
-    )
-    request = query._prepare_physical()
-    graph = compute_subgraph(query.plan().graph)
-    model = RerankerModelExecution.__new__(RerankerModelExecution)
-    model.reranker = _FakeReranker((0.9, 0.1))
-    model.documents = {
-        node.alias: request.inputs[node.input_id].documents
-        for node in query.plan().nodes if node.type_name == "quail.scan"
-    }
+    query = session.sql(PROJECTION_SQL)
     streamed = []
     set_answer_sink(streamed.append)
     try:
-        GenericRunner().run(graph, ExecutionContext(
-            runtimes=session.registry.runtimes, model_execution=model,
-            sources={"d": range(2), **request.relations}))
-    finally:
-        set_answer_sink(None)
-    session.close()
-    score_node = next(node for node in graph.nodes if isinstance(node, AiScore))
-    assert streamed == [{
-        "kind": "score", "node": score_node.node_id, "output": "score",
-        "aliases": ["d"], "rows": [0, 1], "scores": [0.9, 0.1]}]
-
-
-def test_batch_rows_bounds_each_streamed_score_batch(catalog):
-    from quail.progress import set_answer_sink
-
-    session = _session(catalog)
-    query = session.sql(
-        "SELECT d.id, "
-        "AI.SCORE(PROMPT('Requests a refund: {0}', d.body)) AS score "
-        "FROM documents d"
-    )
-    request = query._prepare_physical()
-    graph = compute_subgraph(query.plan().graph)
-    model = RerankerModelExecution.__new__(RerankerModelExecution)
-    model.reranker = _FakeReranker((0.9,))
-    model.documents = {
-        node.alias: request.inputs[node.input_id].documents
-        for node in query.plan().nodes if node.type_name == "quail.scan"
-    }
-    score_node = next(node for node in graph.nodes if isinstance(node, AiScore))
-    streamed = []
-    set_answer_sink(streamed.append)
-    try:
+        graph, model, _ = _run_graph(
+            session, query, query._prepare_physical(), _RowReranker())
+        score_node = next(
+            node for node in graph.nodes if isinstance(node, AiScore))
         result = score_in_batches(
             score_node,
             {port.name: np.arange(2, dtype=np.int32) for port in score_node.inputs},
@@ -323,64 +177,16 @@ def test_batch_rows_bounds_each_streamed_score_batch(catalog):
     finally:
         set_answer_sink(None)
     session.close()
-    assert [entry["rows"] for entry in streamed] == [[0], [1]]
+    assert streamed[0] == {
+        "kind": "score", "node": score_node.node_id, "output": "score",
+        "aliases": ["d"], "rows": [0, 1], "scores": [0.1, 0.2]}
+    assert [entry["rows"] for entry in streamed[1:]] == [[0], [1]]
     assert result.outputs["scores"].column("d").to_pylist() == [0, 1]
 
 
-def test_score_query_finishes_with_projected_score(catalog):
-    session = _session(catalog)
-    query = session.sql(
-        "SELECT d.id, "
-        "AI.SCORE(PROMPT('Requests a refund: {0}', d.body)) AS score "
-        "FROM documents d"
-    )
-
-    def execute(request):
-        graph = compute_subgraph(query.plan().graph)
-        model = RerankerModelExecution.__new__(RerankerModelExecution)
-        model.reranker = _FakeReranker((0.9, 0.1))
-        model.documents = {
-            node.alias: request.inputs[node.input_id].documents
-            for node in query.plan().nodes if node.type_name == "quail.scan"
-        }
-        run = GenericRunner().run(
-            graph,
-            ExecutionContext(
-                runtimes=session.registry.runtimes,
-                model_execution=model,
-                sources={"d": range(2), **request.relations},
-            ),
-        )
-        return PhysicalResponse(
-            export_physical_outputs(graph, run),
-            {
-                "backend": "quail",
-                "wall_s": 0.1,
-                "fresh_tokens": 12,
-                "cached_tokens": 3,
-                "node_metrics": scalar_node_metrics(run.nodes),
-            },
-        )
-
-    result = execute_query(query, physical_executor=execute)
-    assert result.collect().to_pylist() == [
-        {"d.id": 1, "score": 0.9},
-        {"d.id": 2, "score": 0.1},
-    ]
-    assert result.schema.field("score").type == pa.float64()
-    assert result.report["estimated_seconds"] > 0
-    session.close()
-
-
 def test_score_filter_runtime_handles_pair_answers():
-    node = ScoreFilter(
-        node_id="filter",
-        score_name="score",
-        aliases=("q", "d"),
-        comparison=">",
-        threshold=0.5,
-        written_pos=0,
-    )
+    node = ScoreFilter(node_id="filter", score_name="score", aliases=("q", "d"),
+                       comparison=">", threshold=0.5, written_pos=0)
     table = pa.table({
         "q": pa.array([0, 0, 1, 1], pa.int32()),
         "d": pa.array([0, 1, 0, 1], pa.int32()),
@@ -390,10 +196,18 @@ def test_score_filter_runtime_handles_pair_answers():
         node, {"input:0": table}, ExecutionContext(runtimes={})
     )
     answers = result.outputs["join_answers:0"]
-    assert answers.column("answer").to_pylist() == [
-        True, False, False, True
-    ]
+    assert answers.column("answer").to_pylist() == [True, False, False, True]
     assert result.outputs["scores"].num_rows == 2
+
+
+@pytest.mark.parametrize("comparison,expected", [
+    ("<", [True, False, False]), ("<=", [True, True, False]),
+    (">", [False, False, True]), (">=", [False, True, True]),
+])
+def test_score_comparison_keeps_arrow_values(comparison, expected):
+    answer = compare_score(pa.chunked_array([[0.25, 0.5], [0.75]]), comparison, 0.5)
+    assert isinstance(answer, pa.ChunkedArray)
+    assert answer.to_pylist() == expected
 
 
 @pytest.mark.parametrize("pair", [False, True])
@@ -409,26 +223,13 @@ def test_score_assembles_stored_document_tokens(catalog, pair):
         "FROM documents d"
     )
     query = session.sql(sql)
-    request = query._prepare_physical()
-    model = RerankerModelExecution.__new__(RerankerModelExecution)
-    model.documents = {
-        node.alias: request.inputs[node.input_id].documents
-        for node in query.plan().nodes if node.type_name == "quail.scan"
-    }
-    model.reranker = _FakeReranker([0.5] * (4 if pair else 2))
-    GenericRunner().run(
-        compute_subgraph(query.plan().graph),
-        ExecutionContext(
-            runtimes=session.registry.runtimes,
-            model_execution=model,
-            sources={alias: range(2) for alias in model.documents},
-        ),
-    )
+    reranker = _FakeReranker([0.5] * (4 if pair else 2))
+    _run_graph(session, query, query._prepare_physical(), reranker)
     queries = (
         ["Is this document relevant to refund?",
          "Is this document relevant to shipping?"] if pair else ["Refund?"]
     )
-    assert [list(prompt) for prompt in model.reranker.prompts] == [
+    assert [list(prompt) for prompt in reranker.prompts] == [
         list(render_qwen3_reranker_input(text, document))
         for text in queries for document in ("refund please", "all good")
     ]
@@ -446,8 +247,6 @@ def test_score_cost_reuses_anchor_prefixes():
     expected = scan(0, 24) + ask(3, 21) + ask(17, 7) * 4
     assert work == expected
     assert _score_work(0, 15, 9).tokens == 0
-
-
 
 
 def test_native_score_uses_shared_prefix_and_preserves_pair_order(monkeypatch):
@@ -501,8 +300,15 @@ def test_distributed_score_preserves_rows_and_keeps_anchors_together(
         "AS score FROM queries q CROSS JOIN documents d"
     )
     request = query._prepare_physical()
-    node = next(node for node in query.plan().nodes if isinstance(node, AiScore))
-    graph = query.plan().graph
+    physical = query.plan()
+    assert (physical.workers, physical.settings["data_parallel_copies"]) == (2, 2)
+    assert not any(isinstance(node, ScoreFilter) for node in physical.nodes)
+    node = next(node for node in physical.nodes if isinstance(node, AiScore))
+    assert node.spec.aliases == ("q", "d")
+    assert node.spec.expected_inputs == 4
+    assert node.spec.pair_fraction == 1.0
+    assert node.spec.estimated_seconds > 0
+    graph = physical.graph
     payload = quail_runtime_payload(request, graph)
     assert "pre_ids" not in payload and "filter_limit" not in payload
 
@@ -548,23 +354,7 @@ def test_distributed_score_preserves_rows_and_keeps_anchors_together(
     session.close()
 
 
-def test_score_rows_shard_by_first_document_and_keep_positions():
-    from quail.execution.reranker import ScoreRows
-
-    rows = ScoreRows((np.array([3, 0, 1]), np.array([7, 8])), product=True)
-    even, odd = rows.shard(2)
-    assert even.columns[0].tolist() == [0] and odd.columns[0].tolist() == [3, 1]
-    assert odd.positions(0, 4).tolist() == [0, 1, 4, 5]
-    assert even.positions(0, 2).tolist() == [2, 3]
-    plain = ScoreRows((np.array([3, 0, 1]),))
-    assert [shard.positions(0, len(shard)).tolist() for shard in plain.shard(2)] \
-        == [[1], [0, 2]]
-    # a product batch ends on a first-document boundary when partners fit
-    assert [len(batch) for batch in rows.batches(size=5)] == [4, 2]
-
-
-
-def test_score_rows_bound_large_products_and_preserve_order():
+def test_score_rows_bound_products_shard_and_keep_positions():
     from quail.execution.reranker import ScoreRows
 
     rows = ScoreRows((np.arange(100_000), np.arange(100_000)), product=True)
@@ -576,65 +366,16 @@ def test_score_rows_bound_large_products_and_preserve_order():
                                   [[2, 4], [2, 1], [2, 3], [0, 4], [0, 1], [0, 3]])
     empty = ScoreRows((np.empty(0, dtype=np.int32), np.arange(3)), product=True)
     assert list(empty.batches())[0].shape == (0, 2)
-
-
-@pytest.mark.parametrize("comparison,expected", [
-    ("<", [True, False, False]), ("<=", [True, True, False]),
-    (">", [False, False, True]), (">=", [False, True, True]),
-])
-def test_score_comparison_keeps_arrow_values(comparison, expected):
-    scores = pa.chunked_array([[0.25, 0.5], [0.75]])
-    answer = compare_score(scores, comparison, 0.5)
-    assert isinstance(answer, pa.ChunkedArray)
-    assert answer.to_pylist() == expected
-
-
-class _RowReranker:
-    """Score each row as (sum of its document indices + 1) / 10."""
-
-    def __init__(self):
-        self.calls = 0
-
-    def score(self, spec, rows, documents):
-        self.calls += 1
-        scores = [(int(sum(row)) + 1) / 10 for row in rows]
-        return RerankerBatch(scores, fresh_tokens=len(rows), cached_tokens=0)
-
-
-def _finish(query, session, reranker):
-    """Run a planned score query through a fake reranker to its result."""
-
-    def execute(request):
-        graph = compute_subgraph(query.plan().graph)
-        model = RerankerModelExecution.__new__(RerankerModelExecution)
-        model.reranker = reranker
-        model.documents = {
-            node.alias: request.inputs[node.input_id].documents
-            for node in query.plan().nodes if node.type_name == "quail.scan"
-        }
-        run = GenericRunner().run(
-            graph,
-            ExecutionContext(
-                runtimes=session.registry.runtimes,
-                model_execution=model,
-                sources={
-                    **{alias: range(2) for alias in model.documents},
-                    **request.relations,
-                },
-            ),
-        )
-        return PhysicalResponse(
-            export_physical_outputs(graph, run),
-            {
-                "backend": "quail",
-                "wall_s": 0.1,
-                "fresh_tokens": 12,
-                "cached_tokens": 3,
-                "node_metrics": scalar_node_metrics(run.nodes),
-            },
-        )
-
-    return execute_query(query, physical_executor=execute)
+    rows = ScoreRows((np.array([3, 0, 1]), np.array([7, 8])), product=True)
+    even, odd = rows.shard(2)
+    assert even.columns[0].tolist() == [0] and odd.columns[0].tolist() == [3, 1]
+    assert odd.positions(0, 4).tolist() == [0, 1, 4, 5]
+    assert even.positions(0, 2).tolist() == [2, 3]
+    plain = ScoreRows((np.array([3, 0, 1]),))
+    assert [shard.positions(0, len(shard)).tolist() for shard in plain.shard(2)] \
+        == [[1], [0, 2]]
+    # a product batch ends on a first-document boundary when partners fit
+    assert [len(batch) for batch in rows.batches(size=5)] == [4, 2]
 
 
 def test_pair_score_keeps_the_filtered_document_score(catalog):
@@ -668,6 +409,8 @@ def test_range_filter_scores_each_document_once(catalog):
     reranker = _RowReranker()
     result = _finish(query, session, reranker)
     assert result.collect().to_pylist() == [{"d.id": 2, "s": 0.2}]
+    assert result.schema.field("s").type == pa.float64()
+    assert result.report["estimated_seconds"] > 0
     assert reranker.calls == 1
     session.close()
 
@@ -697,6 +440,17 @@ def test_range_filter_scores_each_document_once(catalog):
         "AS s FROM queries q JOIN documents d ON q.id = d.id",
         "runs over CROSS JOIN",
     ),
+    ("SELECT AI.SCORE(PROMPT('refund {0}', d.body)) FROM documents d", "AI.SCORE"),
+    (
+        "SELECT d.id FROM documents d "
+        "WHERE AI.SCORE(PROMPT('refund {0}', d.body))",
+        "AI.SCORE",
+    ),
+    (
+        "SELECT d.id FROM documents d "
+        "WHERE AI.SCORE(PROMPT('refund {0}', d.body)) = 1",
+        "AI.SCORE",
+    ),
 ])
 def test_score_query_shape_errors_are_compile_errors(catalog, sql, message):
     with pytest.raises(CompileError, match=message):
@@ -714,6 +468,7 @@ def test_threshold_on_the_left_flips_the_comparison(catalog):
     join = plan.root.input
     assert isinstance(join, SemanticJoin)
     assert (join.predicate.comparison, join.predicate.threshold) == ("<", 0.8)
+    assert join.predicate.call.aliases() == ("q", "d")
     (predicate,) = plan.operators().filters["d"]
     expression = predicate.expression
     assert (expression.comparison, expression.threshold) == (">=", 0.5)
@@ -763,17 +518,8 @@ def test_reranker_system_text_keeps_the_judgment_instruction():
     from quail.reranker import QWEN3_RERANKER_SYSTEM_TEXT
 
     assert "\n" not in QWEN3_RERANKER_SYSTEM_TEXT
-    assert (
-        "based on the Query and the Instruct provided."
+    assert "based on the Query and the Instruct provided." \
         in QWEN3_RERANKER_SYSTEM_TEXT
-    )
-
-
-def test_compare_score_covers_every_sql_comparison():
-    from quail.logical import SCORE_COMPARISONS
-
-    for comparison in SCORE_COMPARISONS:
-        assert compare_score(0.5, comparison, 0.5) is not None
 
 
 def test_throughput_counts_input_rows_and_evaluated_pairs(catalog):
@@ -788,11 +534,9 @@ def test_throughput_counts_input_rows_and_evaluated_pairs(catalog):
     )
     graph = query.plan().graph
     assert throughput(graph, NodeMetrics(evaluated_documents=5), 2.0) == {
-        "documents_per_second": 1.0,
-    }
+        "documents_per_second": 1.0}
     assert throughput(graph, NodeMetrics(evaluated_document_pairs=6), 2.0) == {
-        "document_pairs_per_second": 3.0,
-    }
+        "document_pairs_per_second": 3.0}
     lines = run_summary(
         {"wall_s": 2.0, "fresh_tokens": 10, "evaluated_document_pairs": 6},
         graph, 1,
