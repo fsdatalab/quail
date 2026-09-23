@@ -75,36 +75,6 @@ def _failing_executor(request):
 
 failing_hooks = Hooks(physical_executor=_failing_executor, tokenizer=fake_tok)
 
-# how many answer events the bursting executor reports, and their size
-BURST_EVENTS = 4000
-BURST_BYTES = 4096
-
-
-def _bursting_executor(request):
-    """Report a burst of answers far larger than a pipe buffer holds.
-
-    Writes the seconds the burst took to the file named by
-    QUAIL_TEST_BURST_FILE, so a test can check the loop did not wait
-    for the parent to read.
-    """
-    import os
-
-    from quail.progress import answer_sink
-
-    sink = answer_sink()
-    started = time.perf_counter()
-    for index in range(BURST_EVENTS):
-        sink({"kind": "evict", "alias": "r", "document": index,
-              "tokens": 1, "pad": "x" * BURST_BYTES})
-    seconds = time.perf_counter() - started
-    with open(os.environ["QUAIL_TEST_BURST_FILE"], "w") as handle:
-        handle.write(f"{seconds}")
-    return make_executor(TRUTH)(request)
-
-
-bursting_hooks = Hooks(physical_executor=_bursting_executor,
-                       tokenizer=fake_tok)
-
 
 def start_server(app):
     """Serve ``app`` with uvicorn on a free port; return (url, stop)."""
