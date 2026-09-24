@@ -13,6 +13,11 @@ against five versions of it:
 - plane_a_restored: plane_a with the low bits put back; must equal bf16.
 - fp8_rne: ordinary fp8 KV, round to nearest with an amax scale per
   layer, K or V, and KV head.
+- plane_a_rne: e4m3 rounded to nearest with the power-of-two scale of
+  plane_a, so the bf16 value is the rounded value plus a remainder of at
+  most 8 bf16 steps.
+- plane_a_rne_keep: plane_a_rne with the shared preamble's positions
+  kept exact.
 - chunked: bf16 KV computed in 512-token chunks instead of one pass,
   which measures how much answers move from kernel shapes alone.
 
@@ -31,7 +36,9 @@ Run from the repository root and tee every line:
       --prediction "State the expected results before starting." \
       2>&1 | tee results/kv-plane-margin.log
 
-The cell writes /results/ablations/kv_plane_margin_<slug>.json to the
+--offset skips that many rows of each table, so a run can use
+documents an earlier run did not. The cell writes
+/results/ablations/kv_plane_margin_<slug><suffix>.json to the
 quail-results volume, with <slug> 4b or dgemma26b: one record per
 (document, question) and the per-head exponent counts of the stored KV.
 """
@@ -72,8 +79,10 @@ CHUNK_TOKENS = 512
 E4M3_MAX = 448.0
 E4M3_MIN_NORMAL_EXP = -6
 E4M3_SUBNORMAL_STEP = 2.0 ** -9
-THRESHOLDS = (0.25, 0.5, 1.0, 2.0, 4.0)
-VARIANTS = ("bf16", "plane_a", "plane_a_restored", "fp8_rne", "chunked")
+THRESHOLDS = (0.25, 0.5, 1.0, 2.0, 3.0, 4.0)
+VARIANTS = ("bf16", "plane_a", "plane_a_restored", "fp8_rne", "plane_a_rne",
+            "plane_a_rne_keep", "chunked")
+GATED = ("plane_a", "fp8_rne", "plane_a_rne", "plane_a_rne_keep")
 
 
 def _layers(cache):
@@ -153,6 +162,39 @@ def fp8_rne(torch, x):
     scale = amax / E4M3_MAX
     q = (x.float() / scale).to(torch.float8_e4m3fn).float() * scale
     return q.to(torch.bfloat16)
+
+
+def plane_a_rne(torch, x):
+    """Round bf16 KV to e4m3 with a power-of-two scale per head.
+
+    Args:
+        torch: The torch module.
+        x: bf16 KV of shape (1, heads, tokens, d_head).
+
+    Returns:
+        The rounded values as bf16, and how many normal-range values sit
+        more than 8 bf16 steps of the rounded value away from it.
+    """
+    shift = _pow2_scale(torch, x)
+    y = (x.float() * torch.exp2(-shift)).to(torch.float8_e4m3fn).float()
+    a = y * torch.exp2(shift)
+    normal = y.abs() >= 2.0 ** E4M3_MIN_NORMAL_EXP
+    step = torch.exp2(torch.floor(torch.log2(a.abs().clamp_min(1e-30))) - 7)
+    wide = normal & ((x.float() - a).abs() > 8 * step)
+    return a.to(torch.bfloat16), int(wide.sum())
+
+
+def _keep_first(tensors, lengths, keep):
+    """Put the exact KV back for the first keep positions still cached."""
+    out = []
+    for (k, v), (k0, v0), length in zip(tensors, keep[1], lengths):
+        first = 0 if length is None else length - k0.shape[2]
+        rows = max(0, keep[0] - first)
+        k, v = k.clone(), v.clone()
+        k[:, :, :rows] = k0[:, :, :rows]
+        v[:, :, :rows] = v0[:, :, :rows]
+        out.append((k, v))
+    return out
 
 
 def _entropy(counts):
@@ -250,12 +292,12 @@ class DiffusionGemma(Model):
         return out.last_hidden_state[0, self.spec.canvas_answer_row].float()
 
 
-def _documents(table, limit):
+def _documents(table, limit, offset):
     from quail_b.data import load_table
 
     column = TABLE_COLUMNS[table]
-    rows = load_table(table, scale_factor=0.1, limit=limit)
-    return [str(text) for text in rows.column(column).to_pylist()]
+    rows = load_table(table, scale_factor=0.1, limit=offset + limit)
+    return [str(text) for text in rows.column(column).to_pylist()[offset:]]
 
 
 def _questions(table, model):
@@ -307,6 +349,12 @@ def _run_document(torch, model, doc_ids, questions, head_counts, stats):
             for pair, exact_pair in zip(planes, exact)],
         "fp8_rne": [tuple(fp8_rne(torch, t) for t in pair) for pair in exact],
     }
+    rounded = [[plane_a_rne(torch, t) for t in pair] for pair in exact]
+    stats["rne_wide"] += sum(w for pair in rounded for _a, w in pair)
+    variants["plane_a_rne"] = [tuple(a for a, _w in pair) for pair in rounded]
+    variants["plane_a_rne_keep"] = _keep_first(
+        variants["plane_a_rne"], lengths, (len(preamble), exact))
+    del rounded
     for pair, exact_pair in zip(variants["plane_a_restored"], exact):
         for got, want in zip(pair, exact_pair):
             if not torch.equal(got, want):
@@ -354,13 +402,15 @@ def _summary(records, stats, head_counts):
         p99 = shifts[int(0.99 * (len(shifts) - 1))]
         lines.append(f"{name}: {flips} flips; |margin shift| max "
                      f"{shifts[-1]:.4f}, p99 {p99:.4f}")
-    got = [r["margins"]["plane_a"] for r in records]
-    for tau in THRESHOLDS:
-        below = sum(abs(m) < tau for m in got)
-        wrong = sum(abs(m) >= tau and (m > 0) != (b > 0)
-                    for m, b in zip(got, base))
-        lines.append(f"plane_a tau {tau}: {below} of {len(got)} fall back; "
-                     f"{wrong} accepted answers differ from bf16")
+    lines.append(f"rounded values more than 8 bf16 steps off: {stats['rne_wide']}")
+    for name in GATED:
+        got = [r["margins"][name] for r in records]
+        for tau in THRESHOLDS:
+            below = sum(abs(m) < tau for m in got)
+            wrong = sum(abs(m) >= tau and (m > 0) != (b > 0)
+                        for m, b in zip(got, base))
+            lines.append(f"{name} tau {tau}: {below} of {len(got)} fall back;"
+                         f" {wrong} accepted answers differ from bf16")
     return "\n".join(lines)
 
 
@@ -372,7 +422,7 @@ def _summary(records, stats, head_counts):
     volumes=volumes,
 )
 def measure(prediction: str, model_name: str, docs: str,
-            output_name: str) -> str:
+            output_name: str, offset: int = 0) -> str:
     """Run every document and question, save the records, return a summary."""
     import torch
 
@@ -385,13 +435,14 @@ def measure(prediction: str, model_name: str, docs: str,
     model = cls(torch, spec)
     print(f"model loaded in {time.perf_counter() - t0:.1f} s", flush=True)
     head_counts = {}
-    stats = {"escapes": 0, "values": 0, "chunked_kv_differs": 0}
+    stats = {"escapes": 0, "values": 0, "chunked_kv_differs": 0,
+             "rne_wide": 0}
     records = []
     limits = dict(part.split("=") for part in docs.split(","))
     with torch.inference_mode():
         for table, limit in limits.items():
             questions = _questions(table, model)
-            texts = _documents(table, int(limit))
+            texts = _documents(table, int(limit), offset)
             t1 = time.perf_counter()
             for index, text in enumerate(texts):
                 prefix_tokens, margins = _run_document(
@@ -399,7 +450,8 @@ def measure(prediction: str, model_name: str, docs: str,
                     head_counts, stats)
                 for q, (key, _pre, tail) in enumerate(questions):
                     records.append({
-                        "table": table, "document": index, "predicate": key,
+                        "table": table, "document": offset + index,
+                        "predicate": key,
                         "prefix_tokens": prefix_tokens,
                         "tail_tokens": len(tail),
                         "margins": {name: margins[name][q] for name in VARIANTS},
@@ -411,7 +463,7 @@ def measure(prediction: str, model_name: str, docs: str,
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as file:
         json.dump({"prediction": prediction, "model": spec.name,
-                   "revision": spec.revision, "docs": limits,
+                   "revision": spec.revision, "docs": limits, "offset": offset,
                    "chunk_tokens": CHUNK_TOKENS, "stats": stats,
                    "exponent_counts": counts, "records": records}, file)
     results_vol.commit()
@@ -424,12 +476,13 @@ def main(
     prediction: str = "",
     model: str = "qwen3-4b-fp8",
     docs: str = "reviews=200,citation_contexts=100,agent_traces=40",
+    offset: int = 0,
     output_suffix: str = "",
 ):
     """Start the cell, print its function call id, then its summary."""
     if not prediction:
         raise ValueError("pass --prediction before starting")
     name = f"kv_plane_margin_{SLUGS[model]}{output_suffix}"
-    call = measure.spawn(prediction, model, docs, name)
+    call = measure.spawn(prediction, model, docs, name, offset)
     print(f"function call id: {call.object_id}", flush=True)
     print(call.get(), flush=True)
