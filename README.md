@@ -23,7 +23,6 @@ Install [quail-engine from PyPI](https://pypi.org/project/quail-engine/).
 The package is named `quail-engine`; in Python, import `quail`.
 
 ```bash
-uv venv --python 3.12
 uv pip install quail-engine
 ```
 
@@ -66,9 +65,8 @@ returns once the server has saved the record, and `get_run` reads
 that record later.
 
 ```bash
-uv venv --python 3.12
 uv pip install "quail-engine[server]"
-.venv/bin/quail-server
+quail-server
 ```
 
 ```python
