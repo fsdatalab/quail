@@ -486,3 +486,243 @@ def main(
     call = measure.spawn(prediction, model, docs, name, offset)
     print(f"function call id: {call.object_id}", flush=True)
     print(call.get(), flush=True)
+
+
+# ---- layer-0 bound test ---------------------------------------------
+# Run with:
+#
+#     uv run modal run experiments/kv_plane_margin.py::bound \
+#       --prediction "State the expected results before starting." \
+#       2>&1 | tee results/kv-bound-layer0.log
+#
+# For DiffusionGemma's first layer, where the question rows' queries are
+# exact, it compares the actual change in each row's attention output
+# under plane_a_rne_keep KV with a limit computed from the rounded KV
+# and stored per-token error sizes. "oracle" is given each score's exact
+# change, which a proof cannot know; it shows how loose the rest is. It
+# writes
+# /results/ablations/kv_bound_layer0_dgemma26b.json.
+
+BOUND_RANKS = (8, 16, 32)
+BOUND_NAMES = ("naive",) + tuple(f"r{r}" for r in BOUND_RANKS) + ("oracle",)
+CAPTURE = {"on": False, "calls": []}
+
+
+def _install_capture():
+    """Record layer 0's attention inputs while CAPTURE["on"] is set."""
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    mapping = ALL_ATTENTION_FUNCTIONS._global_mapping
+    sdpa = mapping["sdpa"]
+    if getattr(sdpa, "quail_capture", False):
+        return
+
+    def capture(module, query, key, value, attention_mask, **kwargs):
+        if CAPTURE["on"] and module.layer_idx == 0:
+            scaling = kwargs.get("scaling")
+            CAPTURE["calls"].append((
+                query.detach().double(), key.detach().double(),
+                value.detach().double(),
+                float(module.scaling if scaling is None else scaling),
+                bool(module.is_causal)))
+        return sdpa(module, query, key, value, attention_mask, **kwargs)
+
+    capture.quail_capture = True
+    mapping["sdpa"] = capture
+
+
+def _captured(model, cache, tensors, lengths, tail_ids):
+    """Layer 0's attention inputs for one question: tail rows, then canvas."""
+    CAPTURE["calls"] = []
+    CAPTURE["on"] = True
+    try:
+        model.margin(cache, tensors, lengths, tail_ids)
+    finally:
+        CAPTURE["on"] = False
+    return CAPTURE["calls"]
+
+
+def _mask(torch, rows, keys, causal, device):
+    """Which keys each row may read: the last rows are the query rows."""
+    allowed = torch.ones((rows, keys), dtype=torch.bool, device=device)
+    if causal:
+        first = keys - rows
+        pos = torch.arange(keys, device=device)
+        row_pos = first + torch.arange(rows, device=device)
+        allowed = pos[None, :] <= row_pos[:, None]
+    return allowed
+
+
+def attention_bounds(torch, exact, approx, prefix, bases):
+    """Actual attention output change and its limits for one layer-0 call.
+
+    Args:
+        torch: The torch module.
+        exact: (query, key, value, scaling, causal) with the bf16 KV.
+        approx: The same with the rounded document KV.
+        prefix: How many leading key rows are document KV.
+        bases: Per query head, a list of (d_head, r) orthonormal bases.
+
+    Returns:
+        A dict of (rows, heads) tensors: the actual change, the limit
+        from sizes alone ("naive"), and the limits using each basis.
+    """
+    q, k_e, v_e, scaling, causal = exact
+    q2, k_a, v_a, _s, _c = approx
+    if not torch.equal(q, q2):
+        raise AssertionError("layer 0 queries must not depend on the document KV")
+    heads, kv_heads = q.shape[1], k_e.shape[1]
+    group = heads // kv_heads
+    rows, keys = q.shape[2], k_e.shape[2]
+    allowed = _mask(torch, rows, keys, causal, q.device)
+    out = {"actual": [], "naive": [], "oracle": []}
+    out.update({f"r{r}": [] for r in BOUND_RANKS})
+    for h in range(heads):
+        qh, kv = q[0, h], h // group
+        ke, ka, ve, va = k_e[0, kv], k_a[0, kv], v_e[0, kv], v_a[0, kv]
+        dk, dv = ke - ka, ve - va
+        if dk[prefix:].abs().max() > 0 or dv[prefix:].abs().max() > 0:
+            raise AssertionError("only document KV may differ")
+        s_a = (qh @ ka.T * scaling).masked_fill(~allowed, float("-inf"))
+        p_a = torch.softmax(s_a, dim=-1)
+        o_a = p_a @ va
+        s_e = (qh @ ke.T * scaling).masked_fill(~allowed, float("-inf"))
+        o_e = torch.softmax(s_e, dim=-1) @ ve
+        out["actual"].append((o_e - o_a).norm(dim=-1))
+        dv_norm = dv.norm(dim=-1)
+        spread = (va[None, :, :] - o_a[:, None, :]).norm(dim=-1)
+        eps = {"naive": scaling * qh.norm(dim=-1)[:, None] * dk.norm(dim=-1)[None]}
+        for r, basis in zip(BOUND_RANKS, bases[h]):
+            known = (qh @ basis) @ (dk @ basis).T
+            q_rest = (qh - qh @ basis @ basis.T).norm(dim=-1)
+            k_rest = (dk - dk @ basis @ basis.T).norm(dim=-1)
+            eps[f"r{r}"] = scaling * (known.abs() + q_rest[:, None] * k_rest[None])
+        # not computable without the exact KV: isolates the summing step
+        eps["oracle"] = scaling * (qh @ dk.T).abs()
+        for name, e in eps.items():
+            e = e.masked_fill(~allowed, 0.0)
+            low = (p_a * torch.exp(-e)).sum(-1, keepdim=True)
+            high = (p_a * torch.exp(e)).sum(-1, keepdim=True)
+            rho = torch.maximum(torch.exp(e) / low - 1, 1 - torch.exp(-e) / high)
+            key_term = (p_a * rho * spread).sum(-1)
+            value_term = (p_a * torch.exp(e) / low * dv_norm[None]).sum(-1)
+            out[name].append(key_term + value_term)
+            if name == "r16":
+                out.setdefault("r16_key", []).append(key_term)
+    return {name: torch.stack(v, dim=1) for name, v in out.items()}
+
+
+def _query_bases(torch, calls_by_item, heads):
+    """Per head, orthonormal bases spanning the most common query directions."""
+    bases = []
+    for h in range(heads):
+        rows = torch.cat([q[0, h] for calls in calls_by_item for q, *_ in calls])
+        _u, _s, vt = torch.linalg.svd(rows, full_matrices=False)
+        bases.append([vt[:r].T.contiguous() for r in BOUND_RANKS])
+    return bases
+
+
+def _bound_items(torch, model, table, limit, offset):
+    """Yield (document, question, prefix, exact calls, approx calls)."""
+    questions = _questions(table, model)
+    for index, text in enumerate(_documents(table, limit, offset)):
+        preamble = questions[0][1]
+        prefix = preamble + model.encode(text)
+        if len(prefix) + max(len(q[2]) for q in questions) + 1 >= 1000:
+            continue
+        cache = model.prefill(prefix)
+        exact, lengths = _snapshot(cache), _lengths(cache)
+        rounded = [tuple(plane_a_rne(torch, t)[0] for t in pair) for pair in exact]
+        approx = _keep_first(rounded, lengths, (len(preamble), exact))
+        for key, _pre, tail in questions:
+            yield (offset + index, key, len(prefix),
+                   _captured(model, cache, exact, lengths, tail),
+                   _captured(model, cache, approx, lengths, tail))
+
+
+def _quantile(values, p):
+    ordered = sorted(values)
+    return ordered[int(p * (len(ordered) - 1))]
+
+
+@app.function(
+    image=image,
+    gpu="H100!",
+    memory=131072,
+    timeout=7200,
+    volumes=volumes,
+)
+def measure_bound(prediction: str, docs: str, offset: int,
+                  calibration_offset: int, calibration_docs: int) -> str:
+    """Compare layer-0 attention limits with the actual change."""
+    import torch
+
+    from quail.specs import MODELS
+
+    print(f"prediction: {prediction}", flush=True)
+    model = DiffusionGemma(torch, MODELS["diffusion-gemma-26b-a4b-fp8"])
+    _install_capture()
+    limits = {t: int(n) for t, n in (p.split("=") for p in docs.split(","))}
+    records, entries = [], {name: [] for name in ("actual", "naive", "oracle",
+                                                  "r16_key")}
+    entries.update({f"r{r}": [] for r in BOUND_RANKS})
+    violations = 0
+    with torch.inference_mode():
+        calibration = [item[3] for table in limits for item in _bound_items(
+            torch, model, table, calibration_docs, calibration_offset)]
+        heads = calibration[0][0][0].shape[1]
+        bases = _query_bases(torch, calibration, heads)
+        print(f"bases from {len(calibration)} calibration questions", flush=True)
+        for table, limit in limits.items():
+            for doc, key, prefix, exact, approx in _bound_items(
+                    torch, model, table, limit, offset):
+                for part, (e, a) in enumerate(zip(exact, approx)):
+                    got = attention_bounds(torch, e, a, prefix, bases)
+                    for name in BOUND_NAMES:
+                        violations += int((got[name] < got["actual"]
+                                           * (1 - 1e-9)).sum())
+                    flat = {n: t.flatten().tolist() for n, t in got.items()}
+                    for n, values in flat.items():
+                        entries[n].extend(values)
+                    records.append({"table": table, "document": doc,
+                                    "predicate": key, "prefix_tokens": prefix,
+                                    "part": "canvas" if part else "tail",
+                                    **flat})
+            print(f"{table}: {len(records)} calls so far", flush=True)
+    path = "/results/ablations/kv_bound_layer0_dgemma26b.json"
+    with open(path, "w") as file:
+        json.dump({"prediction": prediction, "docs": limits, "offset": offset,
+                   "calibration_offset": calibration_offset,
+                   "calibration_docs": calibration_docs,
+                   "ranks": BOUND_RANKS, "violations": violations,
+                   "records": records}, file)
+    results_vol.commit()
+    actual = entries["actual"]
+    lines = [f"saved {path}", f"row-head entries: {len(actual)}",
+             f"limit below actual (must be 0): {violations}"]
+    for name in BOUND_NAMES:
+        ratios = [b / a for b, a in zip(entries[name], actual) if a > 0]
+        lines.append(
+            f"{name}: limit / actual median {_quantile(ratios, 0.5):.2f}, "
+            f"p90 {_quantile(ratios, 0.9):.2f}; sum of limits / sum of "
+            f"actual {sum(entries[name]) / sum(actual):.2f}")
+    key_share = sum(entries["r16_key"]) / sum(entries["r16"])
+    lines.append(f"r16: key term share of the limit {key_share:.2f}")
+    return "\n".join(lines)
+
+
+@app.local_entrypoint()
+def bound(
+    prediction: str = "",
+    docs: str = "reviews=60,citation_contexts=40",
+    offset: int = 400,
+    calibration_offset: int = 600,
+    calibration_docs: int = 10,
+):
+    """Start the layer-0 bound test, print its call id, then its summary."""
+    if not prediction:
+        raise ValueError("pass --prediction before starting")
+    call = measure_bound.spawn(prediction, docs, offset, calibration_offset,
+                               calibration_docs)
+    print(f"function call id: {call.object_id}", flush=True)
+    print(call.get(), flush=True)
