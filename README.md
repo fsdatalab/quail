@@ -24,7 +24,6 @@ The package is named `quail-engine`; in Python, import `quail`.
 
 ```bash
 uv venv --python 3.12
-source .venv/bin/activate
 uv pip install quail-engine
 ```
 
@@ -68,9 +67,8 @@ that record later.
 
 ```bash
 uv venv --python 3.12
-source .venv/bin/activate
 uv pip install "quail-engine[server]"
-quail-server
+.venv/bin/quail-server
 ```
 
 ```python

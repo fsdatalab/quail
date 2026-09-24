@@ -15,9 +15,8 @@ Install the `server` extra on the GPU machine. Then run `quail-server`.
 
 ```bash
 uv venv --python 3.12
-source .venv/bin/activate
 uv pip install "quail-engine[server]"
-quail-server
+.venv/bin/quail-server
 ```
 
 By default, the server accepts every built-in model, detects GPU 0, stores
