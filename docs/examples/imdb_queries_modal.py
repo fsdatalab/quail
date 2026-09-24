@@ -19,7 +19,7 @@ import pyarrow as pa
 
 import quail
 from demos.quickstart import FILTER_PROMPT, load_reviews
-from quail.bench.images import gpu_image
+from quail.bench.images import pypi_gpu_image
 
 app = modal.App("quail-engine")
 ASPECTS = (
@@ -46,7 +46,7 @@ def section(title: str) -> None:
     print(f"\n===== {title} =====", flush=True)
 
 
-image = gpu_image(("demos", "/root/demos"))
+image = pypi_gpu_image(("demos", "/root/demos"))
 results_vol = modal.Volume.from_name("quail-results", create_if_missing=True)
 kernel_cache = modal.Volume.from_name("quail-kernel-cache", create_if_missing=True)
 volumes = {
@@ -59,7 +59,7 @@ volumes = {
 
 @app.function(
     image=image,
-    gpu="H100!", memory=98304, volumes=volumes, timeout=1200,
+    gpu="H100!", memory=32768, volumes=volumes, timeout=1200,
 )
 def run_queries() -> None:
     destination = Path("/results/docs-quickstart") / uuid.uuid4().hex

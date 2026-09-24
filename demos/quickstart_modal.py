@@ -11,17 +11,17 @@ from pathlib import Path
 import modal
 
 from demos import quickstart
-from quail.bench.images import gpu_image
+from quail.bench.images import pypi_gpu_image
 
 app = modal.App("quail-engine")
 volume = modal.Volume.from_name("quail-results", create_if_missing=True)
 RESULTS_DIR = Path("/results/quickstart")
 
-image = gpu_image(("demos", "/root/demos"))
+image = pypi_gpu_image(("demos", "/root/demos"))
 
 
 @app.function(
-    image=image, gpu="H100!", memory=98304, timeout=1200,
+    image=image, gpu="H100!", memory=32768, timeout=1200,
     volumes={
         "/results": volume,
         "/root/.cache/huggingface": modal.Volume.from_name(

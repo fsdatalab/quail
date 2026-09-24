@@ -31,8 +31,9 @@ server = [
 quail-server = "quail.server.__main__:main"
 
 [project.urls]
-Repository = "https://github.com/fsdatalab/quail-exploration"
-Issues = "https://github.com/fsdatalab/quail-exploration/issues"
+Documentation = "https://fsdatalab.github.io/quail"
+Repository = "https://github.com/fsdatalab/quail"
+Issues = "https://github.com/fsdatalab/quail/issues"
 
 [dependency-groups]
 dev = [
@@ -62,6 +63,18 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["quail"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "LICENSE",
+    "README.md",
+    "pyproject.toml",
+    "quail",
+]
+exclude = [
+    "demos",
+    "docs",
+]
 
 [tool.uv]
 # uv's Python builds include the C headers Triton needs at startup

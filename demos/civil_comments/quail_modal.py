@@ -16,7 +16,7 @@ from pathlib import Path
 import modal
 
 from demos.civil_comments.quail_backend import evaluate
-from quail.bench.images import gpu_image
+from quail.bench.images import pypi_gpu_image
 
 RESULTS_MOUNT = Path("/results")
 RESULTS_DIR = Path("demos/civil-comments/quail")
@@ -25,7 +25,9 @@ app = modal.App("quail-milestone1")
 results_volume = modal.Volume.from_name("quail-results", create_if_missing=True)
 hf_cache = modal.Volume.from_name("quail-hf-cache", create_if_missing=True)
 kernel_cache = modal.Volume.from_name("quail-kernel-cache", create_if_missing=True)
-image = gpu_image(("demos", "/root/demos")).add_local_python_source("demos")
+image = pypi_gpu_image(("demos", "/root/demos")).add_local_python_source(
+    "demos"
+)
 
 
 @app.function(

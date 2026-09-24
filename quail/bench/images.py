@@ -1,5 +1,7 @@
 """The Modal images the benchmark and experiment scripts run on."""
 
+from importlib.metadata import version
+
 import modal
 
 # the uv the images sync with; pyproject.toml's required-version must
@@ -40,6 +42,20 @@ def gpu_image(*local_dirs: tuple[str, str]) -> modal.Image:
     image = (_cuda_base()
              .uv_sync(groups=["dev"], uv_version=UV_VERSION)
              .add_local_python_source("quail"))
+    for local, remote in local_dirs:
+        image = image.add_local_dir(local, remote_path=remote)
+    return image
+
+
+def pypi_gpu_image(*local_dirs: tuple[str, str]) -> modal.Image:
+    """A GPU image with the installed PyPI release of Quail.
+
+    Args:
+        local_dirs: (local path, remote path) pairs copied after Quail is
+            installed.
+    """
+    package = f"quail-engine=={version('quail-engine')}"
+    image = _cuda_base().uv_pip_install(package, uv_version=UV_VERSION)
     for local, remote in local_dirs:
         image = image.add_local_dir(local, remote_path=remote)
     return image

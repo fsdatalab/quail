@@ -57,8 +57,7 @@ JOIN tool_questions q
          'Using the compaction state in DOCUMENT {0}, evaluate whether
           the retention statement in DOCUMENT {1} is true.',
          c.state, q.statement
-     ),
-     {'anchor': 'c'}
+     )
  )
 """
 ```
@@ -83,10 +82,6 @@ with quail.Session(config=config) as session:
     )
     result = session.sql(SQL, dialect="bq").run()
 ```
-
-We set `{'anchor': 'c'}` so Quail keeps the trajectory KV in GPU
-memory while it streams the questions. Each question only matches one
-trajectory because we join on `conversation_id`.
 
 We get TRUE or FALSE for each question. After the query finishes, we
 use the answers to rebuild the original OpenHands messages: keep,

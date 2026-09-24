@@ -82,8 +82,7 @@ JOIN tool_questions q
          'Using the compaction state in DOCUMENT {0}, evaluate whether
           the retention statement in DOCUMENT {1} is true.',
          c.state, q.statement
-     ),
-     {'anchor': 'c'}
+     )
  )
 """
 

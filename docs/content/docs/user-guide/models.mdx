@@ -99,12 +99,12 @@ Modal. You write the Modal function, and Quail runs inside it.
 Install Modal on the machine you submit from:
 
 ```bash
-pip install modal==1.5.4
+uv pip install modal==1.5.4
 modal setup
 ```
 
-The image below installs Quail from GitHub `main`, which includes
-DiffusionGemma. Quail declares its Python dependencies, including
+The image below installs Quail 0.1.0 from PyPI. Quail declares its
+Python dependencies, including
 vLLM, PyArrow, and its tokenizer. You do not need to install those
 packages separately. CUDA comes from the base image.
 
@@ -118,11 +118,10 @@ image = (
     modal.Image.from_registry(
         "nvidia/cuda:13.0.1-devel-ubuntu24.04", add_python="3.12")
     .entrypoint([])
-    .apt_install("git")
-    .pip_install("quail-engine @ git+https://github.com/fsdatalab/quail.git@main")
+    .uv_pip_install("quail-engine==0.1.0")
 )
 
-@app.function(image=image, gpu="H100!", memory=98304, timeout=1200)
+@app.function(image=image, gpu="H100!", memory=32768, timeout=1200)
 def run_query():
     import pyarrow as pa
     import quail

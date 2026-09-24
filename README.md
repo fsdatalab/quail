@@ -20,7 +20,7 @@ WHERE AI.IF(PROMPT('Does this review discuss the ending?\n\n{0}', r.body))
 ## Install
 
 ```bash
-pip install quail-engine
+uv pip install quail-engine
 ```
 
 Requires Python 3.12 and a CUDA GPU.
@@ -62,7 +62,7 @@ returns once the server has saved the record, and `get_run` reads
 that record later.
 
 ```bash
-pip install "quail-engine[server]"
+uv pip install "quail-engine[server]"
 quail-server
 ```
 
