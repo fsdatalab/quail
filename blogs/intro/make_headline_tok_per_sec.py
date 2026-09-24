@@ -51,15 +51,19 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 from matplotlib.ticker import FixedLocator, FuncFormatter, NullLocator
-from quailb_results import QUERY_ORDER, load_results
+from quailb_results import QUERY_ORDER as BENCHMARK_QUERY_ORDER
+from quailb_results import load_results
 
 HERE = Path(__file__).resolve().parent
 BLUE = "#4C72B0"
 ORANGE = "#DD8452"
 DARK = "#333333"
 DATASETS = ("BIO", "IMDB", "FEV", "LEP", "AGENT")
-# QUAIL-B README: 10 IMDB, 4 BioDEX, 10 FEVER, 5 LePaRD, 2 SWE-Next.
-QUERY_COUNTS = {"IMDB": 10, "FEV": 10, "LEP": 5, "AGENT": 2, "BIO": 4}
+# The launch post reports 29 queries and omits FEV-9 and FEV-10.
+QUERY_ORDER = tuple(
+    query for query in BENCHMARK_QUERY_ORDER if query not in {"FEV-9", "FEV-10"}
+)
+QUERY_COUNTS = {"IMDB": 10, "FEV": 8, "LEP": 5, "AGENT": 2, "BIO": 4}
 Y_MIN = 1
 Y_MAX = 100
 
@@ -185,8 +189,8 @@ def plot_headline(rows, destination: Path):
 
     figure, axis = plt.subplots(figsize=(11.8, 5.5))
     figure.suptitle(
-        "QUAIL-B average tokens/sec relative to SoL\n"
-        "Qwen3 4B FP8, one H100, scale factor 0.1",
+        "QUAIL-B, scale factor 0.1\n"
+        "Qwen3 4B FP8, one H100",
         fontsize=16,
         y=0.98,
     )
@@ -251,7 +255,7 @@ def plot_headline(rows, destination: Path):
     axis.set_xticklabels(
         [f"{name}\n({len(by[name]['Quail'])} queries)" for name in DATASETS]
     )
-    axis.set_ylabel("Percent of SoL estimate (log scale)")
+    axis.set_ylabel("Percent of Speed-of-Light estimate (log scale)")
     axis.yaxis.set_major_locator(FixedLocator([1, 10, 100]))
     axis.yaxis.set_minor_locator(NullLocator())
     axis.yaxis.set_major_formatter(FuncFormatter(_percent_tick))
