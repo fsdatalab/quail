@@ -287,3 +287,5 @@ class EngineConfig:
     # sum the CUDA event pair each forward chunk records into gpu_s;
     # off by default so a run never pays for a measurement it does not read
     gpu_timing: bool = False
+    # names from quail.ablation.FEATURES this session runs without
+    disabled_features: tuple = ()

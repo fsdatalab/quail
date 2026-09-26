@@ -6,6 +6,7 @@ import os
 import time
 from contextlib import contextmanager
 
+from quail import ablation
 from quail.backends.request import RequestBackend
 from quail.backends.request_scheduling import (
     MAX_BATCHED_TOKENS,
@@ -185,7 +186,8 @@ class VLLMEngine:
             "gpu_memory_utilization": GPU_MEMORY_UTILIZATION,
             "enable_prefix_caching": True,
             "disable_log_stats": True,
-            "tokenizer_mode": "gigatoken",
+            "tokenizer_mode": ("gigatoken" if ablation.enabled("vllm_gigatoken")
+                               else "auto"),
             "compilation_config": {
                 "cudagraph_capture_sizes": [CUDA_GRAPH_CAPTURE_SIZE]
             },

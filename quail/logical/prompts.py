@@ -1,5 +1,6 @@
 """Prompt text, prompt token ids, and template binding."""
 
+from quail import ablation
 from quail.logical.nodes import CompileError, Prompt
 
 # Fixed preamble before every document. Must be a formatting label,
@@ -78,6 +79,8 @@ def render_join_question(template: str) -> str:
 
 def render_join_frame(template: str, placeholder: int) -> str:
     """The complete anchor frame, tokenized as one string."""
+    if not ablation.enabled("shared_join_prompts"):
+        return join_anchor_note(placeholder)
     return join_anchor_note(placeholder) + render_join_question(template)
 
 
@@ -285,6 +288,10 @@ def bind_join_prompt(template: str, args: tuple,
     question = render_join_question(template)
     preamble = shared_preamble(turn[0])
     tail = ANSWER_CUE + turn[1]
+    if not ablation.enabled("shared_join_prompts"):
+        # every tuple pays the question after its partner blocks
+        tail = question + tail
+        question = ""
     pre_tok = tail_tok = frame_tok = None
     labels = tuple((a, None, None) for a in aliases)
     pre_ids = tail_ids = ()

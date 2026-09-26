@@ -15,6 +15,7 @@ import time
 
 import numpy as np
 
+from quail import ablation
 from quail.backends.quail.executor.attention import (
     FILTER_ATTENTION,
     Chunk,
@@ -644,6 +645,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         answer_dtype=async_ans.dtype,
         canvas_tokens=len(canvas),
         page_cost=arena.page_cost,
+        stage_barriers=not ablation.enabled("join_continuous_batching"),
     )
     spans = []
     tokens = 0
@@ -724,6 +726,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
                     f=f + len(frame),
                     suffixes=sufs))
         return pack_chunk(torch, arena, specs, attention_mode=mode,
+                          pinned=ablation.enabled("pinned_staging"),
                           staging=staging, canvas=canvas,
                           answer_row=answer_row)
 
@@ -1114,7 +1117,10 @@ class FilterStream:
             # a later stage re-reads the KV, which needs the pages this
             # switch skips
             raise ValueError("arena_writes=False needs a single stage")
-        self.attention_mode = attention_mode or FILTER_ATTENTION
+        self.attention_mode = attention_mode or (
+            FILTER_ATTENTION if ablation.enabled("attention_paths")
+            else pipeline.join_attention)
+        pinned = pinned and ablation.enabled("pinned_staging")
         unified = self.attention_mode == "unified"
         # capacity must cover the longest tail past the kept preamble,
         # and the canvas rows that follow it
@@ -1126,7 +1132,8 @@ class FilterStream:
         if arena.retention_cap_pages is None:
             arena.retention_cap_pages = max(
                 0, arena.n_pages
-                - arena.pages_needed(2 * budget))
+                - (arena.pages_needed(2 * budget)
+                   if ablation.enabled("scan_ring") else 0))
         self.sched = FilterAdmission(
             [len(d) for d in doc_ids], stage_tokens, budget,
             arena_pages=(arena.n_pages if arena_writes

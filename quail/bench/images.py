@@ -32,16 +32,19 @@ def _cuda_base() -> modal.Image:
             .env(CACHE_ENV))
 
 
-def gpu_image(*local_dirs: tuple[str, str]) -> modal.Image:
+def gpu_image(*local_dirs: tuple[str, str], packages=()) -> modal.Image:
     """The GPU image: quail's locked dependencies and the dev group.
 
     Args:
         local_dirs: (local path, remote path) pairs mounted after the
             quail source; Modal refuses a build step after a mount.
+        packages: Extra pip requirements installed after the locked
+            dependencies.
     """
-    image = (_cuda_base()
-             .uv_sync(groups=["dev"], uv_version=UV_VERSION)
-             .add_local_python_source("quail"))
+    image = _cuda_base().uv_sync(groups=["dev"], uv_version=UV_VERSION)
+    if packages:
+        image = image.uv_pip_install(*packages, uv_version=UV_VERSION)
+    image = image.add_local_python_source("quail")
     for local, remote in local_dirs:
         image = image.add_local_dir(local, remote_path=remote)
     return image

@@ -35,8 +35,17 @@ def run_backend_group(
     ground_truth_collection: str,
     methods: Sequence[str],
     root: str | None = None,
+    disabled_features: Sequence[str] = (),
+    output_name: str | None = None,
+    started_at: float | None = None,
 ) -> dict:
-    """Run backend methods while sharing one loaded model when possible."""
+    """Run backend methods while sharing one loaded model when possible.
+
+    disabled_features names quail.ablation features every method runs
+    without. output_name replaces the method name in the output
+    directory. started_at is the wall clock time the process was
+    requested, for the startup measurement.
+    """
     from quail import EngineConfig
     from quail.bench.quailb import run_suite
     from quail_b.queries import query_family_name
@@ -60,11 +69,13 @@ def run_backend_group(
                 model=model,
                 backend=method,
                 device="h100-sxm",
+                disabled_features=tuple(disabled_features),
             ),
             data_dir=Path(data_dir) / f"sf{sf}",
             ground_truth_collection=ground_truth_collection or None,
             root=root,
-            output_dir=run_dir / method / family,
+            output_dir=run_dir / (output_name or method) / family,
+            started_at=started_at,
         )
         suite["run_id"] = run_dir.name
         suite["query_family"] = {"name": family, "query_ids": list(query_ids)}

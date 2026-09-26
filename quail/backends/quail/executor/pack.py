@@ -142,6 +142,12 @@ class JoinAdmission:
             key of that many rows takes, in the arena's every-token pages; None
             prices one pool of page_tokens pages.
 
+    With stage_barriers, anchors run in groups instead: fresh anchors
+    join the current group until one is blocked for pages or none are
+    left, an anchor that finishes a stage waits until every answer of
+    the group's stage is back, and the next group starts after the
+    last anchor of this one is done.
+
     Each chunk fills in priority order: partner streams cut by the
     previous chunk, then anchors starting their next stage, then
     fresh anchors whose pages fit the free list. Pages are granted in
@@ -157,8 +163,13 @@ class JoinAdmission:
     def __init__(self, prefix_tokens, stage_suffixes, chunk_budget,
                  arena_pages, page_tokens, frame_tokens=None,
                  resident=None, anchor_partners=None, temporary_suffix_pages=False,
-                 answer_dtype=None, canvas_tokens=0, page_cost=None):
+                 answer_dtype=None, canvas_tokens=0, page_cost=None,
+                 stage_barriers=False):
         self.answer_dtype = answer_dtype
+        self.stage_barriers = stage_barriers
+        self._group = set()        # anchors of the running group, not done
+        self._group_open = True    # fresh anchors may still join it
+        self._parked = deque()     # anchors waiting for the group's stage
         # page_cost(tokens, base_tokens) prices a key in the arena's
         # every-token pages; the default is one pool of page_tokens pages
         self.page_cost = page_cost or (
@@ -396,6 +407,10 @@ class JoinAdmission:
         buildable.
         """
         self.blocked_pages = 0
+        if (self._parked and not self.ready and not self.in_flight
+                and not self._group_open):
+            self.ready.extend(self._parked)
+            self._parked.clear()
         room = self.chunk_budget
         groups = []
         continued = []
@@ -421,7 +436,8 @@ class JoinAdmission:
         # 2) fresh anchors: pages in queue order, chunk room may skip
         held = []
         blocked = False
-        while self.pending and room >= self._min_fresh:
+        while self.pending and room >= self._min_fresh and (
+                self._group_open or not self.stage_barriers):
             a = self.pending.popleft()
             need = self._page_cost[a]
             if blocked and need:
@@ -433,6 +449,8 @@ class JoinAdmission:
             if required > free_pages:
                 blocked = True
                 self.blocked_pages = required - free_pages
+                if self.stage_barriers and self._group:
+                    self._group_open = False
                 held.append(a)
                 if not self._zero_cost:
                     break
@@ -455,10 +473,14 @@ class JoinAdmission:
             if not need:
                 self._zero_cost -= 1
             self._stage[a] = 0
+            if self.stage_barriers:
+                self._group.add(a)
             if self._launch(a, 0, end):
                 continued.append(a)
         self.pending.extendleft(reversed(held))
         self.ready.extendleft(reversed(continued))
+        if self.stage_barriers and self._group and not self.pending:
+            self._group_open = False
         return groups
 
     # ---- gating --------------------------------------------------------
@@ -503,7 +525,8 @@ class JoinAdmission:
                 self._stage[a] = j + 1
                 self._next[a] = 0
                 if self._count(a, j + 1):
-                    self.ready.append(a)
+                    (self._parked if self.stage_barriers
+                     else self.ready).append(a)
                 else:
                     # an empty row at the last stage, dropped otherwise
                     self._stage[a] = _DONE
@@ -514,12 +537,16 @@ class JoinAdmission:
         if j == k - 1 and complete:
             self._stage[a] = _DONE
             events.append(("finished", a))
+        if self.stage_barriers and self._stage[a] == _DONE:
+            self._group.discard(a)
+            if not self._group:
+                self._group_open = True
         return events
 
     # ---- progress ------------------------------------------------------
 
     def done(self):
-        return not self.pending and not self.ready \
+        return not self.pending and not self.ready and not self._parked \
             and not self.in_flight and not self._settled
 
 

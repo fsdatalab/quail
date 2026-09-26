@@ -14,6 +14,7 @@ from typing import Protocol, runtime_checkable
 import pyarrow as pa
 from pyarrow import compute as pc
 
+from quail import ablation
 from quail.builtins import built_in_registry
 from quail.catalog import Catalog, ScanRequest, TableProvider
 from quail.execution.pairs import (
@@ -104,6 +105,11 @@ class Session:
                  tokenizer=None,
                  registry: ExtensionRegistry | None = None,
                  endpoint: str | None = None):
+        if config.disabled_features and config.gpus != 1:
+            raise ValueError(
+                "disabled_features needs gpus=1; GPU child processes do "
+                "not inherit the switches")
+        ablation.configure(config.disabled_features)
         self.registry = registry or built_in_registry()
         model = resolve_model(config.model, self.registry.models)
         if isinstance(model, Refusal):
@@ -133,7 +139,9 @@ class Session:
             ))
         self.catalog = Catalog()
         self._tok = tokenizer      # injectable for tests
-        self._tokenizer_name = "configured tokenizer" if tokenizer else "Gigatoken"
+        self._tokenizer_name = (
+            "configured tokenizer" if tokenizer
+            else "Gigatoken" if ablation.enabled("gigatoken") else "bpe-qwen")
         self.notes = []            # tokenizer picks etc., for reports
         self._token_stores = {}
         self._column_stores = {}
@@ -252,6 +260,12 @@ class Session:
     @property
     def tokenizer(self):
         """Return Gigatoken's encoder, loading it when first used."""
+        if self._tok is None and not ablation.enabled("gigatoken"):
+            from bpe_qwen import AutoLinearTokenizer
+
+            linear = AutoLinearTokenizer.from_pretrained(self.model.hf_name)
+            self._tok = lambda text: list(
+                linear(text, add_special_tokens=False)["input_ids"])
         if self._tok is None:
             from gigatoken import Tokenizer
 
@@ -626,7 +640,8 @@ class Query:
                 }:
                     columns = tuple(dict.fromkeys((*columns, s.column)))
                 exact = self.session.token_lengths(s.provider, s.column)
-                if exact is not None:
+                if exact is not None or not ablation.enabled(
+                        "plan_on_estimates"):
                     store = self.session.tokenize(
                         s.provider, s.column, columns)
                     self._token_inputs[s.alias] = store
