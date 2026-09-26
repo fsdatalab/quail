@@ -10,10 +10,10 @@ BIO-4 in a fresh container on its own H100, all at once.
       --sf 0.1 2>&1 | tee "$run_log"
 
 Pass --only with comma-separated configuration names to rerun some of
-them into a new run directory. --startup-samples boots each
-configuration that many more times in fresh containers without running
-the query, since startup time varies from machine to machine. The log
-prints every function call id.
+them into a new run directory, or into an earlier one with --run-dir.
+--startup-samples boots each configuration that many more times in
+fresh containers without running the query, since startup time varies
+from machine to machine. The log prints every function call id.
 
 Saved on the quail-results volume under the printed run directory:
 configurations/<name>.json holds one configuration's summary, <name>/
@@ -111,15 +111,25 @@ CONFIGURATIONS = {c.name: c for c in (
 # these write the kernel and vLLM caches every later boot reads
 CACHE_WRITERS = ("gigatoken", "vllm-today")
 
-PREDICTION_TEXT = (
-    "sf=0.1 check: each configuration should finish. gigatoken and "
-    "quail-today-repeat should take close to the saved 72.5 s for Quail on "
-    "BIO-4, plus planning and tokenization now inside the timing; "
-    "vllm-today close to the saved 430 s. Configurations before "
-    "shared_join_prompts should compute about 3 times the fresh join "
-    "tokens of the later ones, because the 38-token question then follows "
-    "every partner instead of being written once per anchor."
-)
+PREDICTION_TEXT = {
+    0.1: (
+        "sf=0.1 check: each configuration should finish. gigatoken and "
+        "quail-today-repeat should take close to the saved 72.5 s for Quail "
+        "on BIO-4, plus planning and tokenization now inside the timing; "
+        "vllm-today close to the saved 430 s. Configurations before "
+        "shared_join_prompts should compute about 3 times the fresh join "
+        "tokens of the later ones, because the 38-token question then "
+        "follows every partner instead of being written once per anchor."),
+    0.5: (
+        "sf=0.5: 2,500 reports and 2,934 terms give about 3.2 million "
+        "evaluated pairs, 13 times sf=0.1. Quail today (gigatoken, "
+        "quail-today-repeat) about 700 s of query time, from 67.8 s of join "
+        "at sf=0.1 times 13. Configurations before shared_join_prompts about "
+        "2,100 s; from shared_join_prompts to projection_pushdown about "
+        "900 s; filter_join_streaming close to Quail today. vllm-today "
+        "5,000 to 10,000 s. Startup does not depend on the scale factor: "
+        "within the sf=0.1 spread of each configuration."),
+}
 
 
 def summarize(configuration, suite, result) -> dict:
@@ -236,16 +246,18 @@ def _line(summary) -> str:
 
 
 @app.local_entrypoint()
-def history(sf: float = 0.1, only: str = "", startup_samples: int = 0):
+def history(sf: float = 0.1, only: str = "", startup_samples: int = 0,
+            run_dir: str = ""):
     names = ([item.strip() for item in only.split(",") if item.strip()]
              or list(CONFIGURATIONS))
     unknown = sorted(set(names) - set(CONFIGURATIONS))
     if unknown:
         raise ValueError(f"unknown configurations {unknown}")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    run_dir = f"/results/ablations/bio4-history-sf{sf}-{stamp}"
+    run_dir = run_dir or f"/results/ablations/bio4-history-sf{sf}-{stamp}"
     print(f"run directory: {run_dir}", flush=True)
-    print(f"prediction: {PREDICTION_TEXT}", flush=True)
+    print(f"prediction: {PREDICTION_TEXT.get(sf, 'none stated')}",
+          flush=True)
     for name in names:
         configuration = CONFIGURATIONS[name]
         print(f"configuration {name}: backend={configuration.backend} "
