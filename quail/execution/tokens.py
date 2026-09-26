@@ -44,6 +44,8 @@ class TokenView(Sequence):
 
 
 class TokenChain(Sequence):
+    """Token parts read in sequence without copying them."""
+
     def __init__(self, *parts):
         flattened = []
         for part in parts:
@@ -63,7 +65,10 @@ class TokenChain(Sequence):
 
     def __getitem__(self, index):
         if isinstance(index, slice):
-            return list(self)[index]
+            start, stop, step = index.indices(self._length)
+            if step != 1:
+                return list(self)[index]
+            return TokenChain(*self._sliced_parts(start, stop))
         if index < 0:
             index += self._length
         if not 0 <= index < self._length:
@@ -73,6 +78,19 @@ class TokenChain(Sequence):
                 return part[index]
             index -= len(part)
         raise IndexError(index)
+
+    def _sliced_parts(self, start, stop):
+        """The parts covering [start, stop), each sliced to it."""
+        parts = []
+        offset = 0
+        for part in self._parts:
+            end = offset + len(part)
+            if end > start and offset < stop:
+                parts.append(part[max(0, start - offset):stop - offset])
+            offset = end
+            if offset >= stop:
+                break
+        return parts
 
     @property
     def token_parts(self):
@@ -471,15 +489,26 @@ def shared_prefix_lengths(sequences) -> list[int]:
     in; the per sequence credit is the longest common prefix with the
     lexicographic predecessor.
     """
-    order = sorted(range(len(sequences)),
-                   key=lambda index: tuple(sequences[index]))
-    credits = [0] * len(sequences)
-    previous = ()
-    for index in order:
-        current = tuple(sequences[index])
-        credits[index] = longest_common_prefix(previous, current)
-        previous = current
-    return credits
+    return prefix_tree(sequences, 1).share
+
+
+def _token_array(document):
+    """A document's token ids as an int32 array, without a Python list."""
+    import numpy as np
+
+    parts = getattr(document, "token_parts", (document,))
+    arrays = []
+    for part in parts:
+        if hasattr(part, "numpy"):
+            try:
+                arrays.append(np.asarray(part.numpy(), dtype=np.int32))
+                continue
+            except (TypeError, ValueError):
+                pass
+        arrays.append(np.asarray(list(part), dtype=np.int32))
+    if not arrays:
+        return np.empty(0, dtype=np.int32)
+    return arrays[0] if len(arrays) == 1 else np.concatenate(arrays)
 
 
 class PrefixTree:
@@ -520,20 +549,28 @@ def prefix_tree(documents, page_tokens: int) -> PrefixTree:
     import numpy as np
 
     n = len(documents)
-    arrays = [np.asarray(list(documents[i]), dtype=np.int32)
-              for i in range(n)]
-    # big-endian bytes sort like the token ids they encode
-    keys = [a.astype(">i4").tobytes() for a in arrays]
+    try:
+        arrays = [_token_array(documents[i]) for i in range(n)]
+    except (TypeError, ValueError):
+        # tokens that are not integers (a test tokenizer's words)
+        arrays = [tuple(documents[i]) for i in range(n)]
+        keys = arrays
+        common = longest_common_prefix
+    else:
+        # big-endian bytes sort like the token ids they encode
+        keys = [a.astype(">i4").tobytes() for a in arrays]
+
+        def common(a, b):
+            limit = min(len(a), len(b))
+            differ = np.flatnonzero(a[:limit] != b[:limit])
+            return int(differ[0]) if len(differ) else limit
     order = sorted(range(n), key=keys.__getitem__)
     parent = [None] * n
     share = [0] * n
     previous = None
     for index in order:
         if previous is not None:
-            a, b = arrays[previous], arrays[index]
-            limit = min(len(a), len(b))
-            differ = np.flatnonzero(a[:limit] != b[:limit])
-            lcp = int(differ[0]) if len(differ) else limit
+            lcp = common(arrays[previous], arrays[index])
             pages = lcp // page_tokens * page_tokens
             if pages:
                 parent[index] = previous

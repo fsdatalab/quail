@@ -3,8 +3,8 @@
 - prefix_sharing: documents that share a token prefix with another
   document borrow its KV pages for the shared part instead of
   computing it again.
-- tree_attention: each filter stage and join picks the attention path
-  the cost model prefers for its readers of shared KV.
+- tree_attention: each join is annotated with the attention path the
+  cost model prefers for its partners' reads of the anchor's KV.
 """
 
 from __future__ import annotations
@@ -84,15 +84,21 @@ def _mean(values) -> float:
 
 
 class TreeAttention:
-    """Choose unified or tree attention per filter stage and per join.
+    """Annotate each join with the attention path the cost model prefers.
 
-    A filter's first stage packs fresh documents, whose rows must read
-    any borrowed pages in the same call, so it is unified. Later
-    stages have one question tail per document: one reader per node,
-    so the choice is unified as well. A join's stage has every partner
-    of an anchor reading the anchor's KV, and the cost model decides.
-    Tree attention needs the two-call path, which the fp8 models
-    without canvas rows run.
+    A join stage has every partner of an anchor reading the anchor's
+    KV: under tree attention those reads are stacked into one, under
+    unified attention each partner reads the anchor itself. The choice
+    is by roofline (choose_attention_path). Tree attention needs the
+    two-call path, which the fp8 models without canvas rows run.
+
+    A filter is not annotated: its first stage packs fresh documents,
+    whose rows must read any borrowed pages in the same call, and its
+    later stages have one question tail per document, one reader per
+    node, for which unified always wins.
+
+    The annotation is shown by explain. The executor keeps the model
+    pipeline's path until a GPU run has measured the choice.
     """
 
     name = "tree_attention"
@@ -105,31 +111,17 @@ class TreeAttention:
         nodes = []
         changed = False
         for node in graph.nodes:
-            if isinstance(node, AiFilter) and not node.stage_attention:
-                choice = []
-                for index, stage in enumerate(node.stages):
-                    if index == 0 or not two_call:
-                        choice.append("unified")
-                        continue
-                    choice.append(choose_attention_path(
-                        model, device, readers=1,
-                        reader_rows=stage.question_tokens,
-                        node_tokens=_mean(
-                            context.document_tokens.get(node.alias, ()))))
-                node = replace(node, stage_attention=tuple(choice))
-                changed = True
-            elif isinstance(node, AiJoin) and not node.attention:
-                anchors = len(context.document_tokens.get(node.anchor, ()))
+            if isinstance(node, AiJoin) and not node.attention:
+                lengths = context.document_tokens.get(node.anchor, ())
                 path = "unified"
                 if two_call and node.stages:
                     stage = node.stages[0]
-                    readers = (stage.expected_tuples / anchors
-                               if anchors else 1.0)
+                    readers = (stage.expected_tuples / len(lengths)
+                               if len(lengths) else 1.0)
                     path = choose_attention_path(
                         model, device, readers=readers,
                         reader_rows=stage.pair_tail_tokens,
-                        node_tokens=_mean(
-                            context.document_tokens.get(node.anchor, ())))
+                        node_tokens=_mean(lengths))
                 node = replace(node, attention=path)
                 changed = True
             nodes.append(node)

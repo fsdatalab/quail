@@ -153,7 +153,6 @@ class QuailModelExecution:
                 retain_survivors=retain_survivors,
                 document_done=inputs.get("document_done"),
                 prefix_tree=tree,
-                stage_attention=node.stage_attention,
             )
             return filter_result(
                 node, answers, tokens, document_ids,
@@ -184,7 +183,6 @@ class QuailModelExecution:
                 document_done=stream.get("document_done"),
                 prefix_tree=_filter_prefix_tree(
                     filter_node, stream["documents"], arena),
-                stage_attention=filter_node.stage_attention,
             )
         lists_for = inputs.get("anchor_partners")
         answers, spans, tokens = loop.run_join(
@@ -202,7 +200,6 @@ class QuailModelExecution:
             anchor_partners=(
                 None if lists_for is None else lambda key: lists_for(key[1])),
             anchor_batch=inputs.get("anchor_batch"),
-            attention_mode=_join_attention(node, pipeline),
         )
         if source is not None:
             # admission order; a per-batch function may have dropped some
@@ -278,15 +275,6 @@ def _filter_prefix_tree(node, documents, arena):
         "(tree built in %.2f s)", node.alias, len(documents),
         tree.shared_tokens, time.perf_counter() - started)
     return tree
-
-
-def _join_attention(node, pipeline):
-    """The join's attention mode: the plan's choice, else the pipeline's."""
-    if node.attention == "tree" and pipeline.join_attention == "merge_quant":
-        return "merge_quant"
-    if node.attention == "unified":
-        return "unified"
-    return None
 
 
 def _gpu_seconds(torch, spans, inputs) -> float:

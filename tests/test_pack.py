@@ -423,33 +423,143 @@ def test_filter_admission_borrows_from_a_resident_parent():
     # all three fit one chunk in tree order; costs are own tokens
     assert groups == [(1, 0, True), (0, 0, True), (2, 0, True)]
     assert sched.resident == {1: 4, 0: 2, 2: 4}      # 60->4, 32->2, 52->4
-    # the root fails while its child is in flight: nothing to hold
     assert sched.report(1, 0, False) == (1,)
     assert sched.report(0, 0, False) == (0,)
     assert sched.report(2, 0, True) == (2,)
     assert sched.done() and sched.free_pages == 20
 
-    # a child cannot be admitted before its parent is resident
+    # a child waits while its parent is queued behind a full chunk
     tree = PrefixTree(order=[0, 1], parent=[None, 0], share=[0, 32])
     sched = FilterAdmission([64, 64], [10], 80, arena_pages=20,
                             page_tokens=16, tree=tree)
-    assert sched.next_chunk() == [(0, 0, True)]      # child needs room too
-    # the parent finishes before the child is admitted: held for it
-    assert sched.report(0, 0, False) == ()
-    assert sched.held_for_children == {0: True}
-    assert sched.resident == {0: 4}
+    assert sched.next_chunk() == [(0, 0, True)]      # no room for the child
+    # the parent leaves before the child is admitted: the child packs
+    # and pays for the whole document
+    assert sched.report(0, 0, False) == (0,)
     assert sched.next_chunk() == [(1, 0, True)]
-    assert sched.take_released() == [(0, True)]
-    assert sched.resident == {1: 2}
+    assert sched.share[1] == 0 and sched.parent[1] is None
+    assert sched.resident == {1: 4}
     assert sched.report(1, 0, True) == (1,)
-    assert sched.done()
+    assert sched.done() and sched.free_pages == 20
 
-    # a kept parent whose child never arrives is released at the end
-    sched = FilterAdmission([64, 64], [10], 80, arena_pages=20,
-                            page_tokens=16, tree=tree, limit=1)
-    assert sched.next_chunk() == [(0, 0, True)]
-    assert sched.report(0, 0, True, release=False) == ()
-    assert sched.done()
-    sched.release_held()
-    assert sched.take_released() == [(0, False)]
-    assert sched.free_pages == 20 - 4
+    # a kept borrower is rewound to its own tokens: pages_for(32)=2 kept
+    tree = PrefixTree(order=[0, 1], parent=[None, 0], share=[0, 32])
+    sched = FilterAdmission([64, 64], [10], 200, arena_pages=20,
+                            page_tokens=16, tree=tree, kept_extra_tokens=20)
+    assert sched.next_chunk() == [(0, 0, True), (1, 0, True)]
+    assert sched.resident == {0: 6, 1: 4}          # 84 -> 6, 52 -> 4
+    assert sched.report(1, 0, True, release=False) == ()
+    assert sched.free_pages == 20 - 6 - 2
+
+
+def _tree_stream(monkeypatch, *, truth, budget, hold=False, retain=(),
+                 limit=None, pages=64, cap=None, order=(0, 1, 2)):
+    """Three documents where doc 1 shares 32 tokens with doc 0."""
+    from types import SimpleNamespace
+
+    from fakes import (
+        DOC,
+        QUESTION,
+        FakeModel,
+        cpu_arena,
+        fake_pack,
+        fake_pipeline,
+        fake_torch,
+    )
+
+    from quail.backends.quail.executor import loop
+
+    monkeypatch.setattr(loop, "pack_chunk", fake_pack)
+    model = FakeModel(truth, {})
+    pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
+    answers = SimpleNamespace(submit=lambda v: v, result=lambda v: v, dtype=None)
+    arena = cpu_arena(pages)
+    if cap is not None:
+        arena.retention_cap_pages = cap
+    docs = [[DOC] * 64, [DOC] * 32 + [DOC + 1] * 32, [DOC + 2] * 64]
+    tree = PrefixTree(order=list(order), parent=[None, 0, None],
+                      share=[0, 32, 0])
+    stream = loop.FilterStream(
+        fake_torch(), arena, pipeline, answers, docs, [[QUESTION]], budget,
+        arena_writes=True, arena_keys=[("r", d) for d in range(3)],
+        prefix_tree=tree, hold_survivors=hold, retain_survivors=retain,
+        hold_extra_tokens=1, limit=limit)
+    return stream, arena
+
+
+def _run(stream, arena, free_handed=False):
+    handed = []
+    while not stream.done:
+        items, _ = stream.next()
+        for key, _prefix in items:
+            handed.append(key)
+            if free_handed:
+                arena.free_key(key)
+    return handed
+
+
+def test_filter_stream_shares_pages_with_a_resident_parent(monkeypatch):
+    # room for everything: the child borrows and packs 32 own tokens
+    stream, arena = _tree_stream(
+        monkeypatch, truth={0: [0], 1: [1], 2: [1]}, budget=500)
+    _run(stream, arena)
+    assert stream.answers == {0: [0], 1: [1], 2: [1]}
+    assert stream.tokens == 64 + 32 + 64 + 3
+    assert arena.free_pages == 64 and not arena.accounting.owned
+
+    # answers are read after the next chunk launches, so a child right
+    # behind its parent still borrows even when the parent fails
+    stream, arena = _tree_stream(
+        monkeypatch, truth={0: [0], 1: [1], 2: [1]}, budget=65)
+    _run(stream, arena)
+    assert stream.answers == {0: [0], 1: [1], 2: [1]}
+    assert stream.tokens == 64 + 32 + 64 + 3
+    assert arena.free_pages == 64
+
+    # with another document between them the parent has left when the
+    # child's turn comes: the child computes its whole document
+    stream, arena = _tree_stream(
+        monkeypatch, truth={0: [0], 1: [1], 2: [1]}, budget=65,
+        order=(0, 2, 1))
+    _run(stream, arena)
+    assert stream.answers == {0: [0], 1: [1], 2: [1]}
+    assert stream.tokens == 64 + 64 + 64 + 3
+    assert arena.free_pages == 64
+
+    # a retained parent under a cap of zero pages is evicted at once;
+    # the child still finishes and the arena is clean
+    stream, arena = _tree_stream(
+        monkeypatch, truth={0: [1], 1: [1], 2: [1]}, budget=65,
+        retain=True, cap=0)
+    _run(stream, arena)
+    assert stream.answers == {0: [1], 1: [1], 2: [1]}
+    assert arena.free_pages == 64 and arena.retained_keys() == []
+
+    # a retained parent with room keeps its pages while the child
+    # borrows them; freeing the parent leaves the child intact
+    stream, arena = _tree_stream(
+        monkeypatch, truth={0: [1], 1: [1], 2: [1]}, budget=500,
+        retain=True, cap=64)
+    _run(stream, arena)
+    assert sorted(arena.retained_keys()) == [("r", 0), ("r", 1), ("r", 2)]
+    assert arena.accounting.table_pages(("r", 1))[:2] == \
+        arena.accounting.table_pages(("r", 0))[:2]
+    arena.free_key(("r", 0))
+    assert len(arena.accounting.table_pages(("r", 1))) == 4
+    for key in arena.retained_keys():
+        arena.free_key(key)
+    assert arena.free_pages == 64
+
+    # held survivors are handed to a consumer that frees them
+    stream, arena = _tree_stream(
+        monkeypatch, truth={0: [1], 1: [1], 2: [1]}, budget=65, hold=True)
+    handed = _run(stream, arena, free_handed=True)
+    assert sorted(handed) == [("r", 0), ("r", 1), ("r", 2)]
+    assert arena.free_pages == 64
+
+    # a limit ends the run early; the chunk in flight still answers
+    stream, arena = _tree_stream(
+        monkeypatch, truth={0: [1], 1: [1], 2: [1]}, budget=65, limit=1)
+    _run(stream, arena)
+    assert 0 in stream.answers and 2 not in stream.answers
+    assert arena.free_pages == 64

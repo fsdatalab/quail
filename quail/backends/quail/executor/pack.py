@@ -539,14 +539,17 @@ class FilterAdmission:
         page_cost: Callable(tokens, base_tokens) giving the pages a
             document of that many rows takes, in the arena's every-token pages;
             None prices one pool of page_tokens pages.
-        tree: A PrefixTree over the documents, or None. A document with
-            a parent is admitted in the parent's chunk or later, packs
-            only the tokens past its share, and takes pages for those
-            alone. A finished parent keeps its pages until its last
-            child is admitted; such releases queue in `released`.
+        tree: A PrefixTree over the documents, or None. Documents are
+            admitted in tree order. A document whose parent is
+            resident borrows the parent's pages for its share and
+            packs and pays for only the tokens past it; one whose
+            parent has already left packs the whole document; one
+            whose parent is still queued waits.
 
     Survivor suffixes pack before fresh admissions. Pages are granted
-    in queue order; chunk room may be skipped.
+    in queue order; chunk room may be skipped. With a tree the
+    admission order is token-sorted, not table order, so a limit
+    takes the first survivors in that order.
     """
 
     def __init__(self, doc_tokens, stage_tokens, chunk_budget,
@@ -559,12 +562,7 @@ class FilterAdmission:
         n = len(doc_tokens)
         self.parent = [None] * n if tree is None else list(tree.parent)
         self.share = [0] * n if tree is None else list(tree.share)
-        self.children_left = [0] * n
-        for parent in self.parent:
-            if parent is not None:
-                self.children_left[parent] += 1
-        self.held_for_children = {}   # doc -> release flag of its report
-        self.released = []            # (doc, release) the caller applies
+        self.gone = set()          # docs reported at their last stage
         self.stage_tokens = list(stage_tokens)
         self.chunk_budget = chunk_budget
         self.page_tokens = page_tokens
@@ -637,9 +635,13 @@ class FilterAdmission:
             parent = self.parent[doc]
             if (parent is not None and parent not in self.resident
                     and parent not in admitted):
-                # the parent's pages are not there to borrow yet
-                skipped.append(doc)
-                continue
+                if parent not in self.gone:
+                    # the parent is queued behind a full chunk: wait
+                    skipped.append(doc)
+                    continue
+                # the parent's pages are gone: compute the whole document
+                self.parent[doc] = None
+                self.share[doc] = 0
             if self.free_pages is not None:
                 need_pages = self.page_cost(
                     self.own_tokens(doc) + self.kept_extra)
@@ -661,38 +663,8 @@ class FilterAdmission:
             self.in_flight.add(doc)
             admitted.add(doc)
             room -= cost
-            if parent is not None:
-                self._child_admitted(parent)
         self.pending.prepend(skipped)
         return groups
-
-    def _child_admitted(self, parent):
-        self.children_left[parent] -= 1
-        if self.children_left[parent] or parent not in self.held_for_children:
-            return
-        self._release(parent, self.held_for_children.pop(parent))
-
-    def _release(self, doc, release):
-        """Give a finished document's pages back; the caller frees the KV."""
-        if self.free_pages is not None:
-            held = self.resident.pop(doc)
-            if release:
-                self.free_pages += held
-            else:
-                self.free_pages += held - self.page_cost(
-                    self.doc_tokens[doc], self.doc_tokens[doc])
-        self.released.append((doc, release))
-
-    def take_released(self):
-        """Documents whose deferred release is due: (doc, release) pairs."""
-        out, self.released = self.released, []
-        return out
-
-    def release_held(self):
-        """Release every document still held for children, at the end."""
-        for doc, release in list(self.held_for_children.items()):
-            self._release(doc, release)
-        self.held_for_children.clear()
 
     # ---- gating --------------------------------------------------------
 
@@ -716,18 +688,16 @@ class FilterAdmission:
         if passed and not last:
             self.ready.append((doc, stage + 1))
             return ()
-        if self.children_left[doc]:
-            # children still to admit borrow its pages; released later
-            self.held_for_children[doc] = release
-            return ()
+        self.gone.add(doc)
         if self.free_pages is None:
             return ()
         held = self.resident.pop(doc)
         if release:
             self.free_pages += held
             return (doc,)
+        # rewound to its own tokens: borrowed pages stay the parent's
         self.free_pages += held - self.page_cost(
-            self.doc_tokens[doc], self.doc_tokens[doc])
+            self.own_tokens(doc), self.doc_tokens[doc])
         return ()
 
     def trim(self, doc, pages):

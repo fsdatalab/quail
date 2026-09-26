@@ -45,7 +45,7 @@ class PageArena:
         self.free = list(range(n_pages - 1, -1, -1))    # stack
         self.owned = {}       # key -> list of page ids it alone writes
         self.borrowed = {}    # key -> leading page ids read from a parent
-        self.holders = {}     # page id -> keys holding it
+        self.holds = [0] * n_pages    # page id -> keys holding it
         self.tokens = {}      # key -> resident token count, borrowed included
         self.pinned = set()    # current operators depend on these keys
         self._retained_sizes = {}
@@ -83,7 +83,7 @@ class PageArena:
         self.borrowed[key] = borrowed
         self.tokens[key] = tokens
         for page in borrowed + pages:
-            self.holders.setdefault(page, set()).add(key)
+            self.holds[page] += 1
         return pages
 
     def borrowable(self, borrow, tokens: int) -> list:
@@ -108,14 +108,12 @@ class PageArena:
     def borrowed_tokens(self, key) -> int:
         return len(self.borrowed[key]) * self.page_tokens
 
-    def release_pages(self, key, pages) -> int:
-        """Drop the key's hold on pages; returns how many went free."""
+    def release_pages(self, pages) -> int:
+        """Drop one hold on each page; returns how many went free."""
         freed = 0
         for page in pages:
-            holders = self.holders[page]
-            holders.discard(key)
-            if not holders:
-                del self.holders[page]
+            self.holds[page] -= 1
+            if not self.holds[page]:
                 self.free.append(page)
                 freed += 1
         return freed
@@ -127,7 +125,7 @@ class PageArena:
         self.tokens.pop(key)
         self.pinned.discard(key)
         self._forget_retained(key)
-        return self.release_pages(key, borrowed + pages)
+        return self.release_pages(borrowed + pages)
 
     def pin(self, key) -> None:
         """Protect a resident key while an operator uses it."""
@@ -197,7 +195,7 @@ class PageArena:
         released = self.owned[key][keep:]
         self.owned[key] = self.owned[key][:keep]
         self.tokens[key] = tokens
-        freed = self.release_pages(key, released)
+        freed = self.release_pages(released)
         if key in self.retained:
             self.retain(key)
         return freed
@@ -215,7 +213,7 @@ class PageArena:
         added = [self.free.pop() for _ in range(need)]
         self.owned[key].extend(added)
         for page in added:
-            self.holders.setdefault(page, set()).add(key)
+            self.holds[page] += 1
         return need
 
     def row_indices(self, key, tokens=None):
@@ -386,7 +384,7 @@ class KVArena:
         before = self.free_pages
         drop = (origin - start) // self.page_tokens
         owned = self.sliding.owned[key]
-        self.sliding.release_pages(key, owned[:drop])
+        self.sliding.release_pages(owned[:drop])
         self.sliding.owned[key] = owned[drop:]
         self.sliding.tokens[key] -= origin - start
         self._sliding_start[key] = origin

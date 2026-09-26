@@ -327,7 +327,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 # the shared question preamble joins the kept KV right
                 # after the document rows: after the fresh prefix, or
                 # after a kept document's f rows
-                dest = start + len(g["prefix"]) if fresh else f
+                dest = len(g["prefix"]) if fresh else f
                 kv_writes.append((key, srow, srow + wst, dest))
         s_count = token_count - s_row0
         layout.append((key, len(g["suffixes"])))
@@ -556,8 +556,7 @@ def _forward(pipeline, arena, chunk):
 def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
              stage_suffixes, budget, stage_frames=None,
              anchor_keys=None, anchor_done=None, anchor_source=None,
-             anchor_partners=None, anchor_batch=None, staging=None,
-             attention_mode=None):
+             anchor_partners=None, anchor_batch=None, staging=None):
     """The join driver: stream partner lists against anchors.
 
     Survivors are gated between stages.
@@ -597,9 +596,6 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
             on each batch the source hands over before admission. A
             key it leaves out is freed, never admitted.
         staging: Optional reusable input transfer buffers.
-        attention_mode: "merge_quant" or "unified" as the plan chose;
-            None runs the pipeline's join_attention. A canvas model
-            runs unified whatever is asked.
 
     Returns:
         (ans, spans, tokens): ans[j][a] = 0/1 row over the stage-j
@@ -620,10 +616,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     if len(keys) != len(prefixes):
         raise ValueError("anchor_keys must match anchor_prefixes")
     frames = stage_frames or [[] for _ in range(k)]
-    # the plan's choice; a canvas model runs the unified path only
     mode = pipeline.join_attention
-    if attention_mode is not None and not pipeline.canvas_ids:
-        mode = attention_mode
     canvas = tuple(pipeline.canvas_ids)
     answer_row = pipeline.canvas_answer_row
 
@@ -1102,10 +1095,6 @@ class FilterStream:
             with a parent borrows the parent's pages for its share and
             packs only the tokens after it. Needs arena_writes and the
             unified path.
-        stage_attention: Per stage, "unified" or "tree" as the plan
-            chose. A chunk holding only kept documents whose stages
-            all say "tree" runs the two-call path when the pipeline
-            has one; any other chunk runs attention_mode.
     """
 
     def __init__(self, torch, arena, pipeline, async_ans, doc_ids,
@@ -1113,8 +1102,7 @@ class FilterStream:
                  limit=None, *, arena_writes, arena_keys=None,
                  retain_survivors=(), hold_survivors=False,
                  hold_extra_tokens=0, attention_mode=None,
-                 document_done=None, prefix_tree=None,
-                 stage_attention=()):
+                 document_done=None, prefix_tree=None):
         p = _shared_preamble_tokens(question_ids)
         keys = range(len(doc_ids)) if arena_keys is None else arena_keys
         if len(keys) != len(doc_ids):
@@ -1173,7 +1161,6 @@ class FilterStream:
                              if arena_writes else None),
             page_cost=arena.page_cost, tree=prefix_tree)
         self.tree = prefix_tree
-        self.stage_attention = tuple(stage_attention)
         self.torch = torch
         self.arena = arena
         self.pipeline = pipeline
@@ -1206,23 +1193,10 @@ class FilterStream:
         """Per document, its 0/1 answers up to the first FALSE."""
         return self.sched.answers
 
-    def _share(self, doc) -> int:
-        return 0 if self.tree is None else self.tree.share[doc]
-
-    def _chunk_attention(self, groups) -> str:
-        """The attention path for one chunk; see stage_attention."""
-        if (not self.stage_attention or self.canvas
-                or self.pipeline.join_attention != "merge_quant"
-                or any(fresh for _, _, fresh in groups)):
-            return self.attention_mode
-        if all(self.stage_attention[stage] == "tree"
-               for _, stage, _ in groups):
-            return "merge_quant"
-        return self.attention_mode
-
     def _spec(self, doc, stage, fresh):
         if fresh:
-            share = self._share(doc)
+            # the scheduler's share: 0 once the parent has left
+            share = self.sched.share[doc]
             prefix = self.doc_ids[doc]
             if share:
                 prefix = prefix[share:]
@@ -1232,16 +1206,6 @@ class FilterStream:
         return dict(key=self.keys[doc], prefix=None,
                     f=len(self.doc_ids[doc]) + self.preamble,
                     suffixes=[self.tails[stage]])
-
-    def _apply_released(self):
-        """Free or retain documents the scheduler held for their children."""
-        for doc, release in self.sched.take_released():
-            if release:
-                self.arena.free_key(self.keys[doc])
-            else:
-                freed = self.arena.retain(self.keys[doc],
-                                          len(self.doc_ids[doc]))
-                self.sched.add_free_pages(freed)
 
     def _report(self, entry, items):
         timing = self.timing
@@ -1260,7 +1224,7 @@ class FilterStream:
             for d in self.sched.report(doc, stage, passed,
                                        release=not (keep or hold)):
                 self.arena.free_key(self.keys[d])
-            if keep and doc not in self.sched.held_for_children:
+            if keep:
                 freed = self.arena.retain(self.keys[doc],
                                           len(self.doc_ids[doc]))
                 self.sched.add_free_pages(freed)
@@ -1277,8 +1241,6 @@ class FilterStream:
     def _finish(self, items):
         while self.outstanding:
             self._report(self.outstanding.pop(0), items)
-        self.sched.release_held()
-        self._apply_released()
         for doc in self.sched.drain_ready():
             self.arena.free_key(self.keys[doc])
         self.progress.finish(
@@ -1306,13 +1268,13 @@ class FilterStream:
             if sched.done():
                 self._finish(items)
                 return items, False
-            if self.hold or self.tree is not None:
-                # the consumer frees and claims pages between chunks;
-                # borrowed pages go free only with their last holder
+            if self.arena_writes:
+                # the arena is the truth: a join consumer frees and
+                # claims pages between chunks, and a borrowed page goes
+                # free only with its last holder
                 sched.free_pages = arena.free_pages
             t = time.perf_counter() if timing is not None else 0.0
             groups = sched.next_chunk()
-            self._apply_released()
             t = _tick(timing, "next_chunk", t)
             if groups:
                 break
@@ -1333,13 +1295,13 @@ class FilterStream:
         for doc, stage, fresh in groups:
             if fresh and self.arena_writes:
                 logical = len(self.doc_ids[doc]) + self.preamble
-                share = self._share(doc)
+                share = sched.share[doc]
                 got = arena.activate(
                     self.keys[doc], logical,
                     capacity_tokens=len(self.doc_ids[doc])
                     + self.capacity_extra,
                     base_tokens=len(self.doc_ids[doc]),
-                    borrow=((self.keys[self.tree.parent[doc]], share)
+                    borrow=((self.keys[sched.parent[doc]], share)
                             if share else None))
                 assert got is not None, \
                     "scheduler admitted a doc the arena cannot hold"
@@ -1347,7 +1309,7 @@ class FilterStream:
         chunk = pack_chunk(self.torch, arena,
                            [self._spec(*g) for g in groups],
                            timing=timing, pinned=self.pinned,
-                           attention_mode=self._chunk_attention(groups),
+                           attention_mode=self.attention_mode,
                            canvas=self.canvas, answer_row=self.answer_row)
         t = _tick(timing, "pack", t)
         self.tokens += chunk.tokens
@@ -1379,7 +1341,7 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
                question_ids, budget, timing=None,
                pinned=True, limit=None, *, arena_writes,
                arena_keys=None, retain_survivors=(), attention_mode=None,
-               document_done=None, prefix_tree=None, stage_attention=()):
+               document_done=None, prefix_tree=None):
     """The filter chain run to the end; see FilterStream for the arguments.
 
     Returns:
@@ -1391,8 +1353,7 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
         timing=timing, pinned=pinned, limit=limit,
         arena_writes=arena_writes, arena_keys=arena_keys,
         retain_survivors=retain_survivors, attention_mode=attention_mode,
-        document_done=document_done, prefix_tree=prefix_tree,
-        stage_attention=stage_attention)
+        document_done=document_done, prefix_tree=prefix_tree)
     while not stream.done:
         stream.next()
     return stream.answers, stream.spans, stream.tokens

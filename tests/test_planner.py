@@ -670,7 +670,6 @@ def test_prefix_sharing_fires_on_a_store_with_shared_pages(tmp_path):
     plan = _plan(logical, {"r": store.lengths})
     chain = filter_chain(plan)
     assert chain.share_prefixes and chain.arena_writes
-    assert chain.stage_attention == ("unified",)
     assert "physical rule prefix_sharing changed the plan" in plan.remarks
     assert "share_prefixes=True" in explain(logical, plan, verbose=True)
 
@@ -698,8 +697,7 @@ def test_prefix_sharing_fires_on_a_store_with_shared_pages(tmp_path):
 
     # attributes round-trip through the codec
     from quail.physical import AiFilter
-    node = AiFilter(node_id="f", alias="r", share_prefixes=True,
-                    stage_attention=("unified", "tree"))
+    node = AiFilter(node_id="f", alias="r", share_prefixes=True)
     assert AiFilter.from_attributes(
         "f", (), node.attributes()) == node
     assert PrefixSharing().rewrite(plan.graph, None) is None

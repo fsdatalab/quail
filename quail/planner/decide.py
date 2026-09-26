@@ -851,22 +851,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         raise ValueError(
             f"physical planner returned backend {selected_plan.backend!r} "
             f"for selected backend {backend!r}")
-    graph, changed = apply_physical_rules(
-        selected_plan.graph,
-        tuple(registry.physical_rules.values()),
-        context,
-    )
-    if changed:
-        selected_plan = replace(
-            selected_plan,
-            nodes=graph.nodes,
-            root=graph.root,
-            remarks=selected_plan.remarks + tuple(
-                f"physical rule {name} changed the plan"
-                for name in changed
-            ),
-        )
-    return selected_plan
+    return _apply_rules(selected_plan, registry, context, "")
 
 
 def refine_plan(plan, *, model: ModelSpec, device: DeviceSpec,
@@ -895,6 +880,12 @@ def refine_plan(plan, *, model: ModelSpec, device: DeviceSpec,
         tokenizer=tokenizer,
         pair_fractions=dict(pair_fractions or {}),
     )
+    return _apply_rules(plan, registry, context,
+                        " once the documents were tokenized")
+
+
+def _apply_rules(plan, registry, context, when: str):
+    """Apply the registered physical rules; a remark names each that fired."""
     graph, changed = apply_physical_rules(
         plan.graph, tuple(registry.physical_rules.values()), context)
     if not changed:
@@ -902,8 +893,7 @@ def refine_plan(plan, *, model: ModelSpec, device: DeviceSpec,
     return replace(
         plan, nodes=graph.nodes, root=graph.root,
         remarks=plan.remarks + tuple(
-            f"physical rule {name} changed the plan once the documents "
-            f"were tokenized" for name in changed))
+            f"physical rule {name} changed the plan{when}" for name in changed))
 
 
 def _filter_alias(pred_or_list):

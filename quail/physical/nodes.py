@@ -581,9 +581,6 @@ class AiFilter(PhysicalNode):
     # documents borrow the KV pages of a document that shares their
     # token prefix (the prefix_sharing rule)
     share_prefixes: bool = False
-    # per stage, "unified" or "tree": the attention path the
-    # tree_attention rule chose; empty leaves the executor's default
-    stage_attention: tuple[str, ...] = ()
 
     type_name: ClassVar[str] = "quail.ai_filter"
     runtime_key: ClassVar[str] = type_name
@@ -617,7 +614,6 @@ class AiFilter(PhysicalNode):
                 list(question) for question in self.question_token_ids
             ],
             "share_prefixes": self.share_prefixes,
-            "stage_attention": list(self.stage_attention),
         }
 
     def explain_fields(self) -> Mapping[str, Any]:
@@ -644,7 +640,6 @@ class AiFilter(PhysicalNode):
                 for question in attributes["question_token_ids"]
             ),
             share_prefixes=bool(attributes.get("share_prefixes", False)),
-            stage_attention=tuple(attributes.get("stage_attention", ())),
         )
 
 
@@ -692,7 +687,8 @@ class AiJoin(PhysicalNode):
     keep_anchor_kv: bool = False
     stages: tuple[JoinStage, ...] = ()
     # "unified" or "tree": the attention path the tree_attention rule
-    # chose; empty leaves the model pipeline's default
+    # prefers by the cost model. Shown by explain; the executor runs
+    # the model pipeline's path until the choice is measured on a GPU.
     attention: str = ""
 
     type_name: ClassVar[str] = "quail.ai_join"

@@ -212,3 +212,22 @@ def test_pack_chunk_reads_borrowed_pages_in_the_unified_call(monkeypatch):
     arena.free_key(parent)
     arena.free_key(child)
     assert arena.free_pages == 64
+
+
+def test_activate_with_a_borrow_evicts_retained_kv_first():
+    arena = KVArena(n_layers=1, n_pages=8, page_tokens=16, n_kv=1, d_head=2,
+                    dtype=torch.float32, device="cpu")
+    parent, other, child = ("d", 0), ("d", 1), ("d", 2)
+    assert arena.activate(parent, 64, base_tokens=64)          # 4 pages
+    assert arena.activate(other, 48, base_tokens=48)           # 3 pages
+    arena.retain(other, 48)
+    # the child needs 3 own pages for 48 tokens past its 32 borrowed:
+    # only 1 is free, so the retained key goes
+    assert arena.activate(child, 80, base_tokens=80, borrow=(parent, 32))
+    assert not arena.is_resident(other)
+    assert arena.evicted_keys == 1
+    assert arena.owned_pages(child)[:2] == arena.owned_pages(parent)[:2]
+    assert arena.free_pages == 8 - 4 - 3
+    arena.free_key(parent)
+    arena.free_key(child)
+    assert arena.free_pages == 8
