@@ -31,13 +31,14 @@ exactly what the cache holds.
 
 Run from the repository root and tee every line:
 
-    uv run modal run experiments/kv_plane_margin.py \
+    uv run modal run experiments/kv_plane_margin.py::main \
       --model qwen3-4b-fp8 \
       --prediction "State the expected results before starting." \
       2>&1 | tee results/kv-plane-margin.log
 
---offset skips that many rows of each table, so a run can use
-documents an earlier run did not. The cell writes
+--docs takes table=count pairs; table=count@row starts that table at a
+given row, and --offset sets the start for tables that name none, so a
+run can use documents an earlier run did not. The cell writes
 /results/ablations/kv_plane_margin_<slug><suffix>.json to the
 quail-results volume, with <slug> 4b or dgemma26b: one record per
 (document, question) and the per-head exponent counts of the stored KV.
@@ -292,6 +293,21 @@ class DiffusionGemma(Model):
         return out.last_hidden_state[0, self.spec.canvas_answer_row].float()
 
 
+def _doc_spec(docs, offset):
+    """Parse "table=count" or "table=count@first_row" pairs.
+
+    Returns:
+        A dict of table -> (count, first row); offset is the first row
+        for a table that names none.
+    """
+    out = {}
+    for part in docs.split(","):
+        table, count = part.split("=")
+        count, _, start = count.partition("@")
+        out[table] = (int(count), int(start) if start else offset)
+    return out
+
+
 def _documents(table, limit, offset):
     from quail_b.data import load_table
 
@@ -438,11 +454,11 @@ def measure(prediction: str, model_name: str, docs: str,
     stats = {"escapes": 0, "values": 0, "chunked_kv_differs": 0,
              "rne_wide": 0}
     records = []
-    limits = dict(part.split("=") for part in docs.split(","))
+    limits = _doc_spec(docs, offset)
     with torch.inference_mode():
-        for table, limit in limits.items():
+        for table, (limit, start) in limits.items():
             questions = _questions(table, model)
-            texts = _documents(table, int(limit), offset)
+            texts = _documents(table, limit, start)
             t1 = time.perf_counter()
             for index, text in enumerate(texts):
                 prefix_tokens, margins = _run_document(
@@ -450,7 +466,7 @@ def measure(prediction: str, model_name: str, docs: str,
                     head_counts, stats)
                 for q, (key, _pre, tail) in enumerate(questions):
                     records.append({
-                        "table": table, "document": offset + index,
+                        "table": table, "document": start + index,
                         "predicate": key,
                         "prefix_tokens": prefix_tokens,
                         "tail_tokens": len(tail),
