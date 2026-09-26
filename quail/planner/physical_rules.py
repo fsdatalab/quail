@@ -118,9 +118,12 @@ class TreeAttention:
                     stage = node.stages[0]
                     readers = (stage.expected_tuples / len(lengths)
                                if len(lengths) else 1.0)
+                    # a partner's rows: its document and the question tail
+                    rows = stage.pair_tail_tokens + sum(
+                        _mean(context.document_tokens.get(partner, ()))
+                        for partner in stage.partners)
                     path = choose_attention_path(
-                        model, device, readers=readers,
-                        reader_rows=stage.pair_tail_tokens,
+                        model, device, readers=readers, reader_rows=rows,
                         node_tokens=_mean(lengths))
                 node = replace(node, attention=path)
                 changed = True

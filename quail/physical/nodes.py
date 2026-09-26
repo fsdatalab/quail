@@ -687,8 +687,7 @@ class AiJoin(PhysicalNode):
     keep_anchor_kv: bool = False
     stages: tuple[JoinStage, ...] = ()
     # "unified" or "tree": the attention path the tree_attention rule
-    # prefers by the cost model. Shown by explain; the executor runs
-    # the model pipeline's path until the choice is measured on a GPU.
+    # chose; empty leaves the model pipeline's default
     attention: str = ""
 
     type_name: ClassVar[str] = "quail.ai_join"

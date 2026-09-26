@@ -556,7 +556,8 @@ def _forward(pipeline, arena, chunk):
 def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
              stage_suffixes, budget, stage_frames=None,
              anchor_keys=None, anchor_done=None, anchor_source=None,
-             anchor_partners=None, anchor_batch=None, staging=None):
+             anchor_partners=None, anchor_batch=None, staging=None,
+             attention_mode=None):
     """The join driver: stream partner lists against anchors.
 
     Survivors are gated between stages.
@@ -596,6 +597,9 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
             on each batch the source hands over before admission. A
             key it leaves out is freed, never admitted.
         staging: Optional reusable input transfer buffers.
+        attention_mode: "merge_quant" or "unified" as the plan chose;
+            None runs the pipeline's join_attention. A canvas model
+            runs unified whatever is asked.
 
     Returns:
         (ans, spans, tokens): ans[j][a] = 0/1 row over the stage-j
@@ -616,7 +620,10 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     if len(keys) != len(prefixes):
         raise ValueError("anchor_keys must match anchor_prefixes")
     frames = stage_frames or [[] for _ in range(k)]
+    # the plan's choice; a canvas model runs the unified path only
     mode = pipeline.join_attention
+    if attention_mode is not None and not pipeline.canvas_ids:
+        mode = attention_mode
     canvas = tuple(pipeline.canvas_ids)
     answer_row = pipeline.canvas_answer_row
 
