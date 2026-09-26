@@ -416,8 +416,8 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     # ---- the order rule first: the search below needs it
     rule, source = (order, f"user: order={order!r}") if order else \
         default_order_rule(filters, joins)
-    if not ablation.enabled("filter_kv_reuse"):
-        rule, source = "as_written", "ablation: filter_kv_reuse off"
+    # filter order from selectivity estimates came with filter KV reuse
+    filter_rule = rule if ablation.enabled("filter_kv_reuse") else "as_written"
     fixed = rule == "as_written"
     if not ablation.enabled("join_search"):
         # each join anchors on its input with the most document tokens,
@@ -429,7 +429,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
         fixed = True
     filter_orders = {
         alias: order_filters_indexed(
-            predicates, rule,
+            predicates, filter_rule,
             prefix_tokens=pre + stats[alias].mean_doc_tokens,
             model=model, device=device, chunk_tokens=chunk)
         for alias, predicates in filters.items()
@@ -792,6 +792,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
             "admission_tokens": admission,
             "retention": retention_plan,
             "order_rule": rule,
+            "filter_order_rule": filter_rule,
             "order_source": source,
             "search_seconds": estimate,
         },

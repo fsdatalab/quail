@@ -76,7 +76,7 @@ def test_planner_switches_change_the_bio4_plan():
                    if isinstance(n, AiFilter) and n.alias == "r")
     assert not reports.pin_survivors and not reports.keep_kv
     assert plan.settings["retention"]["initial"] == {}
-    assert plan.settings["order_rule"] == "as_written"
+    assert plan.settings["filter_order_rule"] == "as_written"
     join = next(n for n in plan.nodes if isinstance(n, AiJoin))
     assert not join.keep_anchor_kv
 
@@ -89,12 +89,14 @@ def test_planner_switches_change_the_bio4_plan():
 
 
 def test_join_search_off_keeps_written_order_and_the_largest_anchor():
-    searched = next(n for n in bio4_plan()[0].nodes if isinstance(n, AiJoin))
+    # the cardiovascular join passes fewer terms, so the search runs it first
+    searched = next(n for n in bio4_plan(("filter_kv_reuse",))[0].nodes
+                    if isinstance(n, AiJoin))
     written = next(n for n in bio4_plan(("join_search",))[0].nodes
                    if isinstance(n, AiJoin))
-    assert written.anchor == "r"
+    assert written.anchor == searched.anchor == "r"
     assert [stage.written_pos for stage in written.stages] == [0, 1]
-    assert {stage.written_pos for stage in searched.stages} == {0, 1}
+    assert [stage.written_pos for stage in searched.stages] == [1, 0]
 
 
 def test_projection_pushdown_off_keeps_every_source_column():
