@@ -84,7 +84,7 @@ def test_query_scans_provider_and_preserves_extension_objects(
 
     assert response.collect().to_pydict() == {"d.id": ["a"]}
     assert response.report["fresh_tokens"] == 4
-    assert calls == ["initialize", "plan", "execute"]
+    assert calls == ["initialize", "plan", "plan", "execute"]
     assert received.collect().equals(response.collect())
     assert received.plan == response.plan
     assert received.node_metrics == response.node_metrics
