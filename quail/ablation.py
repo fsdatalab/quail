@@ -64,10 +64,6 @@ FEATURES = {feature.name: feature for feature in (
         "the kernel compile pass runs once; later boots only touch kernels",
         "every boot runs the compile pass"),
     Feature(
-        "shared_join_prompts", "2026-08-26T07:46:14Z", 52, False,
-        "the join question is written once into each anchor's KV",
-        "the join question follows every partner document"),
-    Feature(
         "filter_kv_reuse", "2026-08-29T22:52:51Z", 70, False,
         "filter survivors keep their KV for the joins; filters ordered "
         "by cost",

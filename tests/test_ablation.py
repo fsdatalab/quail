@@ -8,7 +8,6 @@ import quail_b as benchmark
 from quail import ablation
 from quail.backends.quail.executor.pack import JoinAdmission
 from quail.bench.quailb import build_query
-from quail.logical import bind_join_prompt
 from quail.physical import AiFilter, AiJoin
 
 CONFIG = dict(model="qwen3-4b-fp8", device="h100-sxm")
@@ -106,20 +105,6 @@ def test_projection_pushdown_off_keeps_every_source_column():
     assert scans["r"].columns == ("id", "report", "source")
     kept = {scan.alias: scan for scan in on.logical.operators().scans}
     assert "source" not in kept["r"].columns
-
-
-def test_shared_join_prompts_off_moves_the_question_after_every_partner():
-    args = (quail.ColumnRef("r", "reports", "report"),
-            quail.ColumnRef("n", "terms", "term"))
-    template = "Does {0} mention {1}?"
-    shared = bind_join_prompt(template, args, byte_tokens)
-    ablation.configure(("shared_join_prompts",))
-    per_pair = bind_join_prompt(template, args, byte_tokens)
-    assert per_pair.frame == ""
-    assert per_pair.tail_tokens == shared.tail_tokens + shared.frame_tokens
-    shared_frame = dict((a, f) for a, _, f in shared.labels)["r"]
-    pair_frame = dict((a, f) for a, _, f in per_pair.labels)["r"]
-    assert pair_frame == shared_frame - shared.frame_tokens
 
 
 def test_stage_barriers_hold_the_next_stage_until_the_group_answers():

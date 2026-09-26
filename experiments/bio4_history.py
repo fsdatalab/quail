@@ -81,7 +81,7 @@ BASELINE_COMMIT = "2026-08-18T09:30:18Z"
 TODAY = "2026-09-26T00:00:00Z"
 QUAIL_STEPS = (
     "pinned_staging", "attention_paths", "skip_arena_writes", "join_search",
-    "compile_once", "shared_join_prompts", "filter_kv_reuse", "scan_ring",
+    "compile_once", "filter_kv_reuse", "scan_ring",
     "boot_cache", "shared_retention", "join_continuous_batching",
     "projection_pushdown", "plan_on_estimates", "filter_join_streaming",
     "gigatoken",
@@ -116,17 +116,14 @@ PREDICTION_TEXT = {
         "sf=0.1 check: each configuration should finish. gigatoken and "
         "quail-today-repeat should take close to the saved 72.5 s for Quail "
         "on BIO-4, plus planning and tokenization now inside the timing; "
-        "vllm-today close to the saved 430 s. Configurations before "
-        "shared_join_prompts should compute about 3 times the fresh join "
-        "tokens of the later ones, because the 38-token question then "
-        "follows every partner instead of being written once per anchor."),
+        "vllm-today close to the saved 430 s."),
     0.5: (
         "sf=0.5: 2,500 reports and 2,934 terms give about 3.2 million "
         "evaluated pairs, 13 times sf=0.1. Quail today (gigatoken, "
         "quail-today-repeat) about 700 s of query time, from 67.8 s of join "
-        "at sf=0.1 times 13. Configurations before shared_join_prompts about "
-        "2,100 s; from shared_join_prompts to projection_pushdown about "
-        "900 s; filter_join_streaming close to Quail today. vllm-today "
+        "at sf=0.1 times 13. Configurations before filter_join_streaming "
+        "about 900 s, the Aug 18 engine with vLLM's kernels up to a quarter "
+        "more; filter_join_streaming close to Quail today. vllm-today "
         "5,000 to 10,000 s. Startup does not depend on the scale factor: "
         "within the sf=0.1 spread of each configuration."),
 }
