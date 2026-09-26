@@ -480,3 +480,63 @@ def shared_prefix_lengths(sequences) -> list[int]:
         credits[index] = longest_common_prefix(previous, current)
         previous = current
     return credits
+
+
+class PrefixTree:
+    """Which document each document borrows its KV prefix from.
+
+    Documents are visited in sorted token order. Each one's parent is
+    its predecessor in that order, and `share` is the tokens they have
+    in common rounded down to a whole page, so a document can read its
+    parent's pages instead of computing those tokens. A document with
+    nothing to borrow has parent None and share 0.
+
+    Attributes:
+        order: Document positions in sorted token order; a parent
+            always comes before its children.
+        parent: Per document, the position it borrows from, or None.
+        share: Per document, the borrowed tokens, a multiple of the
+            page size.
+    """
+
+    def __init__(self, order, parent, share):
+        self.order = order
+        self.parent = parent
+        self.share = share
+
+    @property
+    def shared_tokens(self) -> int:
+        """Tokens the tree lets the engine read instead of compute."""
+        return sum(self.share)
+
+
+def prefix_tree(documents, page_tokens: int) -> PrefixTree:
+    """Build the prefix tree of a document set.
+
+    Args:
+        documents: Token sequences, indexable by position.
+        page_tokens: Tokens per KV page; shares round down to it.
+    """
+    import numpy as np
+
+    n = len(documents)
+    arrays = [np.asarray(list(documents[i]), dtype=np.int32)
+              for i in range(n)]
+    # big-endian bytes sort like the token ids they encode
+    keys = [a.astype(">i4").tobytes() for a in arrays]
+    order = sorted(range(n), key=keys.__getitem__)
+    parent = [None] * n
+    share = [0] * n
+    previous = None
+    for index in order:
+        if previous is not None:
+            a, b = arrays[previous], arrays[index]
+            limit = min(len(a), len(b))
+            differ = np.flatnonzero(a[:limit] != b[:limit])
+            lcp = int(differ[0]) if len(differ) else limit
+            pages = lcp // page_tokens * page_tokens
+            if pages:
+                parent[index] = previous
+                share[index] = pages
+        previous = index
+    return PrefixTree(order, parent, share)

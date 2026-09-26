@@ -80,3 +80,51 @@ def test_retention_rewind_and_pinning():
     a.pin("doc")
 
     assert a.pop_retained_victim() is None
+
+
+def test_borrowed_pages_are_shared_until_the_last_holder_frees_them():
+    a = PageArena(n_pages=10, page_tokens=16)
+    parent = a.alloc("p", 40)                 # pages for 40 tokens: 3
+    child = a.alloc("c", 50, borrow=("p", 32))  # borrows 2, owns 2
+    assert len(child) == 2 and a.free_pages == 5
+    assert a.table_pages("c") == parent[:2] + child
+    assert a.borrowed_tokens("c") == 32
+    assert a.row_indices("c")[:32] == a.row_indices("p")[:32]
+    # the parent's shared pages outlive the parent
+    assert a.free_key("p") == 1
+    assert a.free_pages == 6
+    assert a.table_pages("c") == parent[:2] + child
+    assert a.free_key("c") == 4
+    assert a.free_pages == 10
+
+    # a grandchild borrows through its parent's borrowed pages
+    a.alloc("p", 40)
+    a.alloc("c", 50, borrow=("p", 32))
+    a.alloc("g", 60, borrow=("c", 48))
+    assert a.table_pages("g")[:2] == a.table_pages("p")[:2]
+    assert a.table_pages("g")[2] == a.owned["c"][0]
+    for key in ("p", "c", "g"):
+        a.free_key(key)
+    assert a.free_pages == 10
+
+    # rewinding never drops borrowed pages; growing adds own pages
+    a.alloc("p", 40)
+    a.alloc("c", 50, borrow=("p", 32))
+    assert a.rewind("c", 33) == 1
+    assert a.tokens["c"] == 33 and len(a.owned["c"]) == 1
+    with pytest.raises(ValueError):
+        a.rewind("c", 16)
+    assert a.grow("c", 64) == 1
+    assert len(a.table_pages("c")) == 4
+    assert a.retained_pages == 0
+    a.retain("c")
+    assert a.retained_pages == 2       # own pages only
+
+    with pytest.raises(ValueError):
+        a.alloc("x", 40, borrow=("p", 20))      # not a whole page
+    with pytest.raises(ValueError):
+        a.alloc("x", 16, borrow=("p", 32))      # past its own tokens
+    with pytest.raises(KeyError):
+        a.alloc("x", 40, borrow=("nobody", 16))
+    with pytest.raises(ValueError):
+        a.alloc("x", 80, borrow=("p", 48))      # parent holds 40

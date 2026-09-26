@@ -15,6 +15,7 @@ from quail.backends.quail.executor.pack import (
     matches,
     pages_for,
 )
+from quail.execution.tokens import PrefixTree
 
 
 def _drive_join(sched, truth, arena_pages, resident=None,
@@ -410,3 +411,45 @@ def test_numeric_join_answers_preserve_values_across_chunks():
             sched.report(a, j, start, end, expected[start:end])
     assert sched.answers[0][0].dtype == np.float32
     np.testing.assert_array_equal(sched.answers[0][0], expected)
+
+
+def test_filter_admission_borrows_from_a_resident_parent():
+    tree = PrefixTree(order=[1, 0, 2], parent=[1, None, 0], share=[32, 0, 48])
+    # doc 1 (60 tokens) is the root; doc 0 borrows 32 of its 64; doc 2
+    # borrows 48 of its 100 through doc 0. Pages: 16 tokens each.
+    sched = FilterAdmission([64, 60, 100], [10], 500, arena_pages=20,
+                            page_tokens=16, tree=tree)
+    groups = sched.next_chunk()
+    # all three fit one chunk in tree order; costs are own tokens
+    assert groups == [(1, 0, True), (0, 0, True), (2, 0, True)]
+    assert sched.resident == {1: 4, 0: 2, 2: 4}      # 60->4, 32->2, 52->4
+    # the root fails while its child is in flight: nothing to hold
+    assert sched.report(1, 0, False) == (1,)
+    assert sched.report(0, 0, False) == (0,)
+    assert sched.report(2, 0, True) == (2,)
+    assert sched.done() and sched.free_pages == 20
+
+    # a child cannot be admitted before its parent is resident
+    tree = PrefixTree(order=[0, 1], parent=[None, 0], share=[0, 32])
+    sched = FilterAdmission([64, 64], [10], 80, arena_pages=20,
+                            page_tokens=16, tree=tree)
+    assert sched.next_chunk() == [(0, 0, True)]      # child needs room too
+    # the parent finishes before the child is admitted: held for it
+    assert sched.report(0, 0, False) == ()
+    assert sched.held_for_children == {0: True}
+    assert sched.resident == {0: 4}
+    assert sched.next_chunk() == [(1, 0, True)]
+    assert sched.take_released() == [(0, True)]
+    assert sched.resident == {1: 2}
+    assert sched.report(1, 0, True) == (1,)
+    assert sched.done()
+
+    # a kept parent whose child never arrives is released at the end
+    sched = FilterAdmission([64, 64], [10], 80, arena_pages=20,
+                            page_tokens=16, tree=tree, limit=1)
+    assert sched.next_chunk() == [(0, 0, True)]
+    assert sched.report(0, 0, True, release=False) == ()
+    assert sched.done()
+    sched.release_held()
+    assert sched.take_released() == [(0, False)]
+    assert sched.free_pages == 20 - 4

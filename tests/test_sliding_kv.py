@@ -170,3 +170,45 @@ def test_pack_chunk_builds_both_pools(monkeypatch):
         arena.free_key(temp)
     arena.free_key(key)
     assert arena.free_pages == 64
+
+
+def test_pack_chunk_reads_borrowed_pages_in_the_unified_call(monkeypatch):
+    cpu_staging(monkeypatch)
+    arena = KVArena(n_layers=1, n_pages=64, page_tokens=16, n_kv=1, d_head=2,
+                    dtype=torch.float32, device="cpu")
+    parent, child = ("d", 0), ("d", 1)
+    doc = list(range(100))
+    tail = [500]
+    arena.activate(parent, 100, capacity_tokens=110, base_tokens=100)
+    # the child shares 64 tokens (4 pages) and adds 30 of its own
+    arena.activate(child, 94, capacity_tokens=104, base_tokens=94,
+                   borrow=(parent, 64))
+    assert arena.owned_pages(child)[:4] == arena.owned_pages(parent)[:4]
+    chunk = loop.pack_chunk(
+        torch, arena,
+        [dict(key=parent, prefix=doc, f=100, suffixes=[tail]),
+         dict(key=child, prefix=doc[64:94], start=64, f=94, suffixes=[tail])],
+        attention_mode="unified")
+    assert chunk.fresh_keys == (parent, child)
+    assert chunk.tokens == 101 + 31
+    positions = chunk.positions.tolist()
+    assert positions[:101] == list(range(101))
+    assert positions[101:] == list(range(64, 95))
+    unified = chunk.meta["unified"]
+    assert unified["used"].tolist() == [101, 95]
+    table = unified["table"].tolist()
+    assert table[1][:4] == table[0][:4]
+    # the child's rows land after the borrowed pages, in its own pages
+    dst = unified["dst"].tolist()
+    assert dst[101:] == arena.capacity_rows(child)[64:95].tolist()
+    assert arena.capacity_rows(child)[:64].tolist() == \
+        arena.capacity_rows(parent)[:64].tolist()
+    with pytest.raises(ValueError):
+        loop.pack_chunk(
+            torch, arena,
+            [dict(key=child, prefix=doc[64:94], start=64, f=94,
+                  suffixes=[tail])],
+            attention_mode="merge_quant")
+    arena.free_key(parent)
+    arena.free_key(child)
+    assert arena.free_pages == 64

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any
@@ -14,7 +15,7 @@ from quail.backends.quail.graph import filter_result, stage_partner_lists
 from quail.backends.quail.worker import execute_quail_request, prepare_quail_request
 from quail.execution.reranker import RerankerModelExecution
 from quail.execution.runner import NodeMetrics, NodeResult, SurvivorStream
-from quail.execution.tokens import DocumentKeys
+from quail.execution.tokens import DocumentKeys, prefix_tree
 from quail.logical import Alias, is_score, shared_preamble
 from quail.logical.prompts import true_false_token_ids
 from quail.physical import (
@@ -33,6 +34,7 @@ from quail.planner.physical_optimizer import (
 )
 from quail.planner.plan import Refusal
 from quail.planner.reranker import plan_reranker
+from quail.progress import logger
 
 
 class QuailModelExecution:
@@ -136,6 +138,7 @@ class QuailModelExecution:
             retain_survivors = inputs.get("retain_survivors", ())
             if retain_survivors is False:
                 retain_survivors = ()
+            tree = _filter_prefix_tree(node, inputs["documents"], arena)
             answers, spans, tokens = loop.run_filter(
                 torch,
                 arena,
@@ -149,11 +152,14 @@ class QuailModelExecution:
                 arena_keys=DocumentKeys(node.alias, document_ids),
                 retain_survivors=retain_survivors,
                 document_done=inputs.get("document_done"),
+                prefix_tree=tree,
+                stage_attention=node.stage_attention,
             )
             return filter_result(
                 node, answers, tokens, document_ids,
                 gpu_s=_gpu_seconds(torch, spans, inputs),
-                chunks=_chunks(spans, inputs))
+                chunks=_chunks(spans, inputs),
+                borrowed_tokens=tree.shared_tokens if tree else 0)
 
         stage_frames = inputs["stage_frames"]
         stream = inputs.get("anchor_stream")
@@ -176,6 +182,9 @@ class QuailModelExecution:
                 hold_survivors=True,
                 hold_extra_tokens=filter_node.hold_tokens,
                 document_done=stream.get("document_done"),
+                prefix_tree=_filter_prefix_tree(
+                    filter_node, stream["documents"], arena),
+                stage_attention=filter_node.stage_attention,
             )
         lists_for = inputs.get("anchor_partners")
         answers, spans, tokens = loop.run_join(
@@ -193,6 +202,7 @@ class QuailModelExecution:
             anchor_partners=(
                 None if lists_for is None else lambda key: lists_for(key[1])),
             anchor_batch=inputs.get("anchor_batch"),
+            attention_mode=_join_attention(node, pipeline),
         )
         if source is not None:
             # admission order; a per-batch function may have dropped some
@@ -255,6 +265,28 @@ class QuailModelExecution:
                 extension={"answers": answers},
             ),
         )
+
+
+def _filter_prefix_tree(node, documents, arena):
+    """The filter's prefix tree, or None when the plan did not ask for one."""
+    if not node.share_prefixes or arena.has_sliding:
+        return None
+    started = time.perf_counter()
+    tree = prefix_tree(documents, arena.page_tokens)
+    logger.info(
+        "prefix sharing on %s: %s documents borrow %s tokens "
+        "(tree built in %.2f s)", node.alias, len(documents),
+        tree.shared_tokens, time.perf_counter() - started)
+    return tree
+
+
+def _join_attention(node, pipeline):
+    """The join's attention mode: the plan's choice, else the pipeline's."""
+    if node.attention == "tree" and pipeline.join_attention == "merge_quant":
+        return "merge_quant"
+    if node.attention == "unified":
+        return "unified"
+    return None
 
 
 def _gpu_seconds(torch, spans, inputs) -> float:

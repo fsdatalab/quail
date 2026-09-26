@@ -9,6 +9,7 @@ from quail.execution.tokens import (
     TokenStore,
     chain_tokens,
     decode_token_documents,
+    prefix_tree,
     shared_prefix_lengths,
 )
 from quail.planner.prefixes import shared_prefix_tokens
@@ -69,3 +70,20 @@ def test_token_store_and_file_reference_transport(tmp_path):
     assert len(encoded) < 1000
     assert len(restored) == 10
     assert len(restored[0]) == 1000
+
+
+def test_prefix_tree_borrows_whole_pages_from_the_predecessor():
+    docs = [list(range(40)), list(range(50)), list(range(32)) + [99] * 20,
+            [7] * 20, [7] * 10]
+    tree = prefix_tree(docs, 16)
+    # sorted order: 0..39, 0..49, 0..31+99s, [7]*10, [7]*20
+    assert tree.order == [0, 1, 2, 4, 3]
+    # doc 1 shares 40 with doc 0, doc 2 shares 32 with doc 1; the two
+    # runs of 7s share 10, under a page, so neither borrows
+    assert tree.parent == [None, 0, 1, None, None]
+    assert tree.share == [0, 32, 32, 0, 0]
+    assert tree.shared_tokens == 64
+    parents_first = {index: position for position, index in enumerate(tree.order)}
+    assert all(parent is None or parents_first[parent] < parents_first[index]
+               for index, parent in enumerate(tree.parent))
+    assert prefix_tree([], 16).shared_tokens == 0

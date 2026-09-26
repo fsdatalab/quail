@@ -90,8 +90,9 @@ def cpu_arena(pages):
     arena = bare_arena(KVArena.__new__(KVArena), pages)
 
     def allocate(key, tokens, capacity_tokens=None, base_tokens=None,
-                 sliding_tokens=None):
-        got = arena.accounting.alloc(key, tokens, capacity_tokens)
+                 sliding_tokens=None, borrow=None):
+        got = arena.accounting.alloc(key, tokens, capacity_tokens,
+                                     borrow=borrow)
         if got is not None:
             arena._rows[key] = None
             arena._capacity_rows[key] = None

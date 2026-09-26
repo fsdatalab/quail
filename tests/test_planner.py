@@ -633,3 +633,74 @@ def test_work_matches_attention_masks():
             sum(mask_pairs(prefix, s, window) for s in (suffix, suffix + 1))
             if window else 0)
         assert branches.sliding_kv_read == continuation.sliding_kv_read
+
+
+def test_prefix_sharing_fires_on_a_store_with_shared_pages(tmp_path):
+    from quail.execution.tokens import TokenStore
+    from quail.planner.physical_rules import (
+        PrefixSharing,
+        TreeAttention,
+        page_aligned_shared_tokens,
+        sharing_pays,
+    )
+
+    def tokenizer(text):
+        return [int(t) for t in text.split()]
+
+    shared = " ".join(str(i) for i in range(40))
+    schema = pa.schema({"body": pa.string()})
+    store = TokenStore.write(
+        str(tmp_path / "shared.arrow"),
+        [pa.record_batch([[shared, shared + " 99 98", "7 7 7"]],
+                         schema=schema)],
+        document_column="body", tokenizer=tokenizer, token_type=pa.int32())
+    assert page_aligned_shared_tokens(store) == 32
+    plain = TokenStore.write(
+        str(tmp_path / "plain.arrow"),
+        [pa.record_batch([["1 2 3", "4 5 6"]], schema=schema)],
+        document_column="body", tokenizer=tokenizer, token_type=pa.int32())
+    assert page_aligned_shared_tokens(plain) == 0
+
+    cat = Catalog()
+    cat.register("reviews", DocumentProvider.from_parquet(
+        _parquet(tmp_path / "r.parquet", ["id", "review"]), id_col="id"))
+    logical = docs(cat, "reviews", tok).alias("r").ai_filter(
+        prompt("flag: {0}", col("r.review")), selectivity=0.5).select("r.id")
+
+    plan = _plan(logical, {"r": store.lengths})
+    chain = filter_chain(plan)
+    assert chain.share_prefixes and chain.arena_writes
+    assert chain.stage_attention == ("unified",)
+    assert "physical rule prefix_sharing changed the plan" in plan.remarks
+    assert "share_prefixes=True" in explain(logical, plan, verbose=True)
+
+    plan = _plan(logical, {"r": plain.lengths})
+    chain = filter_chain(plan)
+    assert not chain.share_prefixes and not chain.arena_writes
+
+    # no store behind the lengths: nothing to measure, nothing shared
+    plan = _plan(logical, {"r": [40, 42, 3]})
+    assert not filter_chain(plan).share_prefixes
+
+    # one shared page in 20,000 tokens saves less forward-pass time
+    # than writing KV pages for every token costs (about 1.2% on
+    # Qwen3 4B and an H100), so the filter stays unpaged
+    body = " ".join(str(i) for i in range(10_000))
+    little = TokenStore.write(
+        str(tmp_path / "little.arrow"),
+        [pa.record_batch([[body, " ".join(str(i) for i in range(16)) + " 5"]],
+                         schema=schema)],
+        document_column="body", tokenizer=tokenizer, token_type=pa.int32())
+    assert page_aligned_shared_tokens(little) == 16
+    assert not filter_chain(_plan(logical, {"r": little.lengths})).share_prefixes
+    assert sharing_pays(QWEN3_4B_FP8, H100_SXM, shared_tokens=16,
+                        total_tokens=10_017, writes_pages=True)
+
+    # attributes round-trip through the codec
+    from quail.physical import AiFilter
+    node = AiFilter(node_id="f", alias="r", share_prefixes=True,
+                    stage_attention=("unified", "tree"))
+    assert AiFilter.from_attributes(
+        "f", (), node.attributes()) == node
+    assert PrefixSharing().rewrite(plan.graph, None) is None
+    assert TreeAttention().rewrite(plan.graph, None) is None
