@@ -80,3 +80,31 @@ def test_estimated_planning_token_reuse_and_concurrent_boot(monkeypatch):
     assert order == ["prepare", "execute"]
     assert query.token_wait_s > 0.0
     session.close()
+
+
+def test_prefix_sharing_is_decided_once_the_tokens_are_exact(monkeypatch):
+    # a plan made on estimated lengths cannot see the token store; once
+    # tokenization finishes, the rules that read it run over the plan
+    shared = "pad " * 40
+    table = pa.table({
+        "id": [f"d{i}" for i in range(4)],
+        "body": [shared + f"tail {i} " * (i + 1) for i in range(4)],
+    })
+    session = quail.Session(
+        quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm"),
+        tokenizer=str.split)
+    session.register("docs", quail.DocumentProvider.from_table(table, id_col="id"))
+    query = session.sql(SQL)
+    first = query.plan()
+    chain = next(n for n in first.nodes if n.type_name == "quail.ai_filter")
+    assert query._estimated == ("d",) and not chain.share_prefixes
+    query.wait_for_tokens()
+    refined = query.plan()
+    chain = next(n for n in refined.nodes if n.type_name == "quail.ai_filter")
+    assert chain.share_prefixes and chain.arena_writes
+    assert any("once the documents were tokenized" in remark
+               for remark in refined.remarks)
+    # nothing left to refine: the plan is stable
+    query.wait_for_tokens()
+    assert query.plan() is refined
+    session.close()

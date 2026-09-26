@@ -44,7 +44,7 @@ from quail.logical import (
     oriented_join_conditions,
 )
 from quail.physical import PortRef, Project, Scan, ValueType, encode_graph
-from quail.planner import explain, plan_query
+from quail.planner import explain, plan_query, refine_plan
 from quail.planner.logical_optimizer import LogicalPlanningContext, apply_logical_rules
 from quail.planner.plan import EngineConfig, Refusal, resolve_model
 from quail.progress import Progress, say
@@ -740,13 +740,27 @@ class Query:
         return text
 
     def wait_for_tokens(self) -> None:
-        """Block until every background tokenization has finished."""
+        """Block until every background tokenization has finished.
+
+        A plan made on estimated lengths then gets the physical rules
+        that read the token stores applied with the exact inputs.
+        """
         started = time.perf_counter()
+        refine = bool(self._token_futures)
         for alias, future in list(self._token_futures.items()):
             self._token_inputs[alias] = future.result()
+            self._doc_tokens[alias] = self._token_inputs[alias].lengths
             self._token_finished_at.setdefault(alias, time.perf_counter())
             del self._token_futures[alias]
         self.token_wait_s += time.perf_counter() - started
+        if refine and self._plan is not None:
+            self._plan = refine_plan(
+                self._plan, model=self.session.model,
+                device=self.session.device, doc_tokens=self._doc_tokens,
+                gpus=self.session.config.gpus, order=self.order,
+                backend=self.session.config.backend,
+                registry=self.session.registry,
+                tokenizer=self.session.tokenizer)
 
     def run(self, plan=None) -> QueryResult:
         """Execute the query in the current process.

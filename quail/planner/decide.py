@@ -869,6 +869,43 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
     return selected_plan
 
 
+def refine_plan(plan, *, model: ModelSpec, device: DeviceSpec,
+                doc_tokens: dict, gpus: int = 1, backend: str = "quail",
+                registry=None, order: str | None = None,
+                tokenizer=None, pair_fractions=None):
+    """Run the physical rules again over a plan once its inputs are exact.
+
+    A plan made on estimated document lengths never saw the token
+    stores, which some rules read (prefix_sharing measures the shared
+    prefixes of a corpus). Takes the same inputs as plan_query and
+    returns the plan with any rule's rewrite applied.
+    """
+    if isinstance(plan, Refusal):
+        return plan
+    if registry is None:
+        from quail.builtins import built_in_registry
+        registry = built_in_registry()
+    context = PlanningContext(
+        model=model,
+        device=device,
+        gpu_count=gpus,
+        document_tokens=doc_tokens,
+        backend=backend,
+        order=order,
+        tokenizer=tokenizer,
+        pair_fractions=dict(pair_fractions or {}),
+    )
+    graph, changed = apply_physical_rules(
+        plan.graph, tuple(registry.physical_rules.values()), context)
+    if not changed:
+        return plan
+    return replace(
+        plan, nodes=graph.nodes, root=graph.root,
+        remarks=plan.remarks + tuple(
+            f"physical rule {name} changed the plan once the documents "
+            f"were tokenized" for name in changed))
+
+
 def _filter_alias(pred_or_list):
     p = pred_or_list[0] if isinstance(pred_or_list, list) else pred_or_list
     return p.prompt.args[0].alias
