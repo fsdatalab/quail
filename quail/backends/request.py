@@ -10,6 +10,7 @@ from typing import Any, Mapping
 
 import pyarrow as pa
 
+from quail import ablation
 from quail.backends.base import GpuContext
 from quail.backends.request_scheduling import (
     canvas_answer,
@@ -540,7 +541,8 @@ class RequestModelExecution:
         self.capacity = settings["capacity"]
         self.filter_submission = settings["filter_submission"]
         self.join_submission = settings["join_submission"]
-        self.submit_text = bool(getattr(self.client, "accepts_text", False))
+        self.submit_text = bool(getattr(self.client, "accepts_text", False)) \
+            and ablation.enabled("vllm_gigatoken")
 
     def _join_submission(self, prefixes) -> str:
         """Suffix-major only when every anchor prefix fits in KV at once.

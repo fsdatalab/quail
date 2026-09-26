@@ -90,11 +90,60 @@ def run_backend_group(
     }
 
 
-def _child_main(connection, arguments: dict) -> None:
-    """Run one backend group and send its result to the parent."""
+def startup_sample(
+    *,
+    data_dir: str,
+    model: str,
+    sf: float,
+    query_id: str,
+    backend: str,
+    disabled_features: Sequence[str] = (),
+    started_at: float,
+) -> dict:
+    """Start a session and boot its engine for one query without running it.
+
+    started_at is the wall clock time the process was requested. Returns
+    the seconds until the session was ready, the engine's boot record,
+    and their sum.
+    """
+    import time
+
+    import quail
+    import quail_b
+    from quail import EngineConfig
+    from quail.bench.quailb import build_query, register_tables
+    from quail.execution import execute
+
+    config = EngineConfig(gpus=1, model=model, backend=backend,
+                          device="h100-sxm",
+                          disabled_features=tuple(disabled_features))
+    with quail.Session(config) as session:
+        session_ready_s = time.time() - started_at
+        register_tables(session, Path(data_dir) / f"sf{sf}")
+        plan = build_query(session, quail_b.get_query(query_id)).plan()
+        if backend == "quail":
+            execute._prepare_backend(plan, session.registry)
+            (boot,) = [state.prepared_boot
+                       for state in execute._BACKEND_STATE.values()
+                       if getattr(state, "prepared_boot", None)]
+        else:
+            allowed = sorted(set(plan.settings["true_ids"])
+                             | set(plan.settings["false_ids"]))
+            _, boot = session.registry.backend(backend).engine.boot(
+                session.model, allowed)
+    return {
+        "session_ready_s": session_ready_s,
+        "boot": boot,
+        "startup_s": session_ready_s + boot["boot_s"],
+        "gpu_uuids": list(visible_gpu_uuids()),
+    }
+
+
+def _child_main(connection, arguments: dict, target=run_backend_group) -> None:
+    """Run the target and send its result to the parent."""
     os.setsid()
     try:
-        connection.send(("ok", run_backend_group(**arguments)))
+        connection.send(("ok", target(**arguments)))
     except BaseException:  # noqa: BLE001
         connection.send(("error", traceback.format_exc()))
     finally:
@@ -166,13 +215,17 @@ def _stop_process_group(process) -> dict:
     }
 
 
-def run_backend_group_in_fresh_process(**arguments) -> dict:
-    """Run one backend group and destroy its CUDA context afterward."""
+def run_backend_group_in_fresh_process(target=run_backend_group,
+                                       **arguments) -> dict:
+    """Run one backend group, or another target, in a fresh process.
+
+    The process's CUDA context is destroyed afterward.
+    """
     context = mp.get_context("spawn")
     parent_connection, child_connection = context.Pipe(duplex=False)
     process = context.Process(
         target=_child_main,
-        args=(child_connection, arguments),
+        args=(child_connection, arguments, target),
     )
     process.start()
     child_connection.close()

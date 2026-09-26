@@ -10,11 +10,15 @@ BIO-4 in a fresh container on its own H100, all at once.
       --sf 0.1 2>&1 | tee "$run_log"
 
 Pass --only with comma-separated configuration names to rerun some of
-them into a new run directory. The log prints every function call id.
+them into a new run directory. --startup-samples boots each
+configuration that many more times in fresh containers without running
+the query, since startup time varies from machine to machine. The log
+prints every function call id.
 
 Saved on the quail-results volume under the printed run directory:
-configurations/<name>.json holds one configuration's summary, and
-<name>/ holds its QUAIL-B run with answers and scores.
+configurations/<name>.json holds one configuration's summary, <name>/
+holds its QUAIL-B run with answers and scores, and
+startup/<name>-<sample>.json holds each extra startup sample.
 """
 
 import json
@@ -90,7 +94,8 @@ CONFIGURATIONS = {c.name: c for c in (
     Configuration("vllm-pipelined", "tuned vLLM, pipelined filters",
                   "pipelined_vllm", BASELINE_COMMIT),
     Configuration("vllm-today", "pipelined vLLM with Gigatoken",
-                  "pipelined_vllm", TODAY, 167),
+                  "pipelined_vllm", ablation.FEATURES["vllm_gigatoken"].merged,
+                  167),
     Configuration("quail-engine-vllm-kernels",
                   "Quail engine with vLLM's kernels", "quail", ENGINE_COMMIT,
                   extra_disabled=("triton_kernels",)),
@@ -186,6 +191,35 @@ def run_configuration(name: str, sf: float, run_dir: str, collection: str,
             kernel_cache.commit()
 
 
+@app.function(
+    image=image,
+    gpu="H100!",
+    memory=98304,
+    timeout=3600,
+    volumes=VOLUMES,
+)
+def sample_startup(name: str, sf: float, run_dir: str, sample: int) -> str:
+    """Start one configuration's session and engine in a fresh process."""
+    from quail.bench.process_isolation import (
+        run_backend_group_in_fresh_process,
+        startup_sample,
+    )
+
+    configuration = CONFIGURATIONS[name]
+    if "boot_cache" in configuration.disabled:
+        os.environ["VLLM_CACHE_ROOT"] = tempfile.mkdtemp(prefix="vllm-cache-")
+    try:
+        result = run_backend_group_in_fresh_process(
+            target=startup_sample, data_dir=DATA_DIR, model=MODEL, sf=sf,
+            query_id=QUERY, backend=configuration.backend,
+            disabled_features=configuration.disabled, started_at=time.time())
+        record = {"name": name, "sample": sample, **result}
+        write_json(Path(run_dir) / "startup" / f"{name}-{sample}.json", record)
+        return json.dumps(record)
+    finally:
+        results_vol.commit()
+
+
 def _line(summary) -> str:
     metrics = summary.get("metrics") or {}
     startup = summary["startup"]
@@ -202,7 +236,7 @@ def _line(summary) -> str:
 
 
 @app.local_entrypoint()
-def history(sf: float = 0.1, only: str = ""):
+def history(sf: float = 0.1, only: str = "", startup_samples: int = 0):
     names = ([item.strip() for item in only.split(",") if item.strip()]
              or list(CONFIGURATIONS))
     unknown = sorted(set(names) - set(CONFIGURATIONS))
@@ -229,6 +263,21 @@ def history(sf: float = 0.1, only: str = ""):
             commit_caches=name in CACHE_WRITERS)
         calls[name] = call
         print(f"function call id: {call.object_id} ({name})", flush=True)
+    samples = {}
+    for sample in range(1, startup_samples + 1):
+        for name in names:
+            call = sample_startup.spawn(name, sf, run_dir, sample)
+            samples[(name, sample)] = call
+            print(f"function call id: {call.object_id} "
+                  f"(startup {name} {sample})", flush=True)
+    for (name, sample), call in samples.items():
+        try:
+            record = json.loads(call.get())
+            print(f"startup: {name} {sample} {record['startup_s']:.1f} s",
+                  flush=True)
+        except Exception as error:  # noqa: BLE001
+            print(f"failed: startup {name} {sample}: "
+                  f"{type(error).__name__}: {error}", flush=True)
     for name, call in calls.items():
         try:
             print(f"finished: {_line(json.loads(call.get()))}", flush=True)

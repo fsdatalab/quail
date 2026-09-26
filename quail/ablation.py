@@ -107,8 +107,9 @@ FEATURES = {feature.name: feature for feature in (
         "bpe-qwen tokenizes documents and prompts"),
     Feature(
         "vllm_gigatoken", "2026-09-22T20:51:30Z", 167, False,
-        "vLLM tokenizes prompt text with Gigatoken",
-        "vLLM tokenizes prompt text with the Hugging Face tokenizer"),
+        "vLLM receives prompt text and tokenizes it with Gigatoken",
+        "vLLM receives prompt token ids built from each document's tokens, "
+        "and loads the Hugging Face tokenizer"),
 )}
 
 _disabled: frozenset = frozenset()
