@@ -349,7 +349,7 @@ def test_can_borrow_needs_the_parent_window():
     assert arena.sliding_start(middle) == 64
     assert not arena.can_borrow(middle, 16)
     assert arena.can_borrow(middle, 112)
-    # the root still has them; a shared count past its tokens is refused
+    # the root still has them; a shared length past its tokens is refused
     assert arena.can_borrow(root, 16)
     assert not arena.can_borrow(root, 112)
     assert not arena.can_borrow(("d", 9), 16)

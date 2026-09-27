@@ -181,6 +181,9 @@ def choose_attention_path(model: ModelSpec, device: DeviceSpec, *,
                           node_tokens: float) -> str:
     """Pick "unified" or "tree" attention for readers of one shared node.
 
+    The node is a join's anchor or a filter's parent document; its
+    readers are the partners or the children borrowing its pages.
+
     Under unified attention every reader reads the node's KV itself.
     Under tree attention the readers' rows are stacked into one read of
     the node, then merged with each reader's attention over its own

@@ -414,7 +414,8 @@ class KVArena:
         shared tokens): the key reads the parent's pages for its first
         `shared tokens`, a whole number of pages. On the sliding pool
         it reads the parent's pages from the window origin below the
-        shared tokens, so the parent must still hold them (see trim_window).
+        shared prefix, so the parent must still hold them (see
+        trim_window).
         """
         capacity = tokens if capacity_tokens is None else capacity_tokens
         borrowed, borrowed_s, start_s = self._borrow_plan(borrow)
@@ -440,8 +441,9 @@ class KVArena:
         """Whether a fresh key may borrow the parent's first `shared` tokens.
 
         The sliding pool must still hold the parent's rows from the
-        window origin below the shared tokens: a parent that borrowed most of
-        its own prefix never had them, and a trimmed one dropped them.
+        window origin below the shared prefix: a parent that borrowed
+        most of its own prefix never had them, and a trimmed one
+        dropped them.
         """
         if (parent not in self.accounting.owned
                 or shared > self.accounting.tokens[parent]):

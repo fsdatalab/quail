@@ -268,7 +268,10 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     canvas_seq = []       # its sequence in the unified paged call
     id_parts, token_count = [], 0
     pos, cu_a, finals = [], [0], []
-    reader_rows = []      # rows that read resident KV in call B
+    # rows that read resident KV in call B: a borrowing document's
+    # rows reading its parent, and a kept document's tail reading its
+    # own prefix (wider than the planner's readers, which are children)
+    reader_rows = []
     kv_writes, layout = [], []
     fresh_keys = []
     read_keys, read_used, cu_q = [], [], [0]
@@ -563,7 +566,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
 
 
 def attention_path(pipeline, requested, default="unified") -> str:
-    """The path a chain runs: the plan's request where the model has it.
+    """The path a filter stream or join runs: the plan's request where the model has it.
 
     None asks for the default. A model without tree attention, and a
     canvas model (whose rows the tree path does not pack), run unified.
@@ -1134,8 +1137,9 @@ class FilterStream:
             in doc_ids, the last stage it was asked, and whether it
             passed that stage. Must return quickly.
         prefix_tree: A PrefixTree over doc_ids, or None. A document
-            with a parent borrows the parent's pages for its shared tokens and
-            packs only the tokens after it. Needs arena_writes. Under
+            with a parent borrows the parent's pages for its shared
+            prefix and packs only the tokens after it. Needs
+            arena_writes. Under
             tree attention, documents borrowing the same pages in one
             chunk read them once.
     """
@@ -1255,7 +1259,7 @@ class FilterStream:
 
     def _spec(self, doc, stage, fresh):
         if fresh:
-            # the scheduler's count: 0 once the parent has left
+            # the scheduler's shared tokens: 0 once the parent has left
             shared = self.sched.shared[doc]
             prefix = self.doc_ids[doc]
             read_key = None

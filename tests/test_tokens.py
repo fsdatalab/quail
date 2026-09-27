@@ -1,4 +1,4 @@
-"""Arrow token payloads and shared prefix credits."""
+"""Arrow token payloads and shared prefix lengths."""
 
 import pickle
 
@@ -36,11 +36,11 @@ def test_token_views_chains_and_shared_prefixes():
     assert combined.token_parts[1] is first
 
     sequences = [[1, 2, 3, 4], [1, 2, 3, 9, 9], [1, 2], [7, 8], [7, 8]]
-    credits = shared_prefix_lengths(sequences)
+    shared = shared_prefix_lengths(sequences)
     # 13 tokens in total; the prefix trie has 4 + 2 + 2 = 8 nodes
-    assert sum(len(sequence) for sequence in sequences) - sum(credits) == 8
+    assert sum(len(sequence) for sequence in sequences) - sum(shared) == 8
     assert shared_prefix_lengths([]) == []
-    assert sum(shared_prefix_lengths(sequences[::-1])) == sum(credits)
+    assert sum(shared_prefix_lengths(sequences[::-1])) == sum(shared)
     assert shared_prefix_tokens([[1, 2, 3], [1, 2, 4], [9]]) == 2
 
 

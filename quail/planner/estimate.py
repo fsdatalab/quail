@@ -174,7 +174,11 @@ def _prompt_token_counts(prompt):
 
 
 class _Search:
-    """One estimate's state: corpus tokens, the oracle, and the credit."""
+    """One estimate's state: corpus tokens, the oracle, and the credit.
+
+    The credit is the shared prefix counted as read from KV rather
+    than computed, when credit_shared is on.
+    """
 
     def __init__(self, query, answer: AnswerOracle, model: ModelSpec,
                  device: DeviceSpec, chunk_tokens: int,

@@ -484,10 +484,10 @@ def shared_prefix_lengths(sequences) -> list[int]:
 
     The values sum to the tokens a prefix trie over the sequences
     saves: an execution with unlimited KV that computes every distinct
-    prefix once pays for each sequence only beyond its credited length.
+    prefix once pays for each sequence only beyond its shared length.
     The sum does not depend on the order the sequences are computed
-    in; the per sequence credit is the longest common prefix with the
-    lexicographic predecessor.
+    in; a sequence's shared length is the longest common prefix with
+    the lexicographic predecessor.
     """
     return prefix_tree(sequences, 1).shared
 
@@ -515,15 +515,14 @@ class PrefixTree:
     """Which document each document borrows its KV prefix from.
 
     Documents are visited in sorted token order. A document's shared
-    count is
-    the tokens it has in common with its predecessor, rounded down to
-    a whole page, so it can read those pages instead of computing
-    them. Its parent is the earliest document that computed those
-    pages itself: the predecessor, or an ancestor of the predecessor
-    that borrowed at least as much. Documents sharing one prefix thus
-    all borrow from the same parent, and a forward pass can read that
-    parent's pages once for all of them. A document with nothing to
-    borrow has parent None and shared 0.
+    length is the tokens it has in common with its predecessor,
+    rounded down to a whole page, so it can read those pages instead
+    of computing them. Its parent is the earliest document that
+    computed those pages itself: the predecessor, or an ancestor of
+    the predecessor that borrowed at least as much. Documents sharing
+    one prefix thus all borrow from the same parent, and a forward
+    pass can read that parent's pages once for all of them. A
+    document with nothing to borrow has parent None and shared 0.
 
     Attributes:
         order: Document positions in sorted token order; a parent

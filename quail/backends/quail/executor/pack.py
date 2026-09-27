@@ -541,8 +541,8 @@ class FilterAdmission:
             None prices one pool of page_tokens pages.
         tree: A PrefixTree over the documents, or None. Documents are
             admitted in tree order. A document whose parent is
-            resident borrows the parent's pages for its shared tokens and
-            packs and pays for only the tokens past it; one whose
+            resident borrows the parent's pages for its shared prefix
+            and packs and pays for only the tokens past it; one whose
             parent has already left packs the whole document; one
             whose parent is still queued waits. A parent that answers
             its last stage while children are still queued keeps its
