@@ -20,6 +20,7 @@ from quail.backends.quail.executor.attention import (
     Chunk,
 )
 from quail.backends.quail.executor.pack import FilterAdmission, JoinAdmission
+from quail.execution.tokens import PrefixTree
 from quail.progress import Progress, logger, quiet
 
 
@@ -1096,6 +1097,26 @@ def _shared_preamble_tokens(question_ids):
     return p
 
 
+def _predecessor_parents(tree, arena):
+    """On a sliding-window arena, borrow from the previous document in order.
+
+    A child reads its parent's sliding pages from the window origin
+    below its shared length, so the parent stays untrimmed until the
+    child is admitted, and the sliding pool is sized for trimmed
+    documents. The document just before the child in tree order holds
+    the same shared pages and is admitted right before it. Tree
+    attention, which wants siblings to name one parent, does not run
+    on these models.
+    """
+    if not arena.has_sliding:
+        return tree
+    parent = list(tree.parent)
+    for before, doc in zip(tree.order, tree.order[1:]):
+        if parent[doc] is not None:
+            parent[doc] = before
+    return PrefixTree(tree.order, parent, list(tree.shared))
+
+
 class FilterStream:
     """The filter chain, one chunk per next() call.
 
@@ -1182,6 +1203,7 @@ class FilterStream:
         if prefix_tree is not None and prefix_tree.shared_tokens:
             if not arena_writes:
                 raise ValueError("a prefix tree needs arena writes")
+            prefix_tree = _predecessor_parents(prefix_tree, arena)
         else:
             prefix_tree = None
         # capacity must cover the longest tail past the kept preamble,

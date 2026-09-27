@@ -358,3 +358,16 @@ def test_can_borrow_needs_the_parent_window():
     arena.free_key(middle)
     arena.free_key(root)
     assert arena.free_pages == 64
+
+
+def test_sliding_arena_borrows_from_the_previous_document():
+    from quail.execution.tokens import PrefixTree
+
+    # docs 1 and 2 both borrow doc 0's first page; on a sliding arena
+    # doc 2 borrows it from doc 1, the document admitted just before it
+    tree = PrefixTree(order=[0, 1, 2], parent=[None, 0, 0], shared=[0, 16, 16])
+    moved = loop._predecessor_parents(tree, cpu_arena())
+    assert moved.parent == [None, 0, 1] and moved.shared == [0, 16, 16]
+    plain = KVArena(n_layers=1, n_pages=8, page_tokens=16, n_kv=1, d_head=2,
+                    dtype=torch.float32, device="cpu")
+    assert loop._predecessor_parents(tree, plain) is tree
