@@ -221,7 +221,11 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
       prefix    Fresh prefix token list, or None when KV is resident.
       start     Logical position of the first fresh prefix token; the
                 key's pages before it are borrowed from a parent and
-                already hold KV. 0 when absent. Unified path only.
+                already hold KV. 0 when absent.
+      read_key  Under two-call attention, the parent whose pages the
+                fresh rows read for positions before start; the rows
+                still write the group's own key. Consecutive groups
+                with one read_key and start share one read of it.
       f         Kept-context length (suffix positions start here).
       suffixes  List of suffix token lists.
       write_suffix_tokens  Leading rows of the first suffix to scatter
@@ -277,6 +281,10 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         start = g.get("start", 0)
         paged = arena.is_resident(key)
         row0 = token_count
+        # a borrowing fresh group under two-call attention: its rows
+        # read the parent's pages in call B and form one causal
+        # segment with the tail in call A
+        borrowing = fresh and start and two_call
         if fresh:
             if not paged and len(g["suffixes"]) > 1:
                 raise ValueError(
@@ -284,21 +292,23 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                     f"[prefix | suffix] as one causal segment, which "
                     f"only one suffix may join - allocate pages or "
                     f"split the group")
-            if start and (not paged or two_call):
-                # only the unified paged call lets fresh rows read the
-                # borrowed pages before them
+            if start and not paged:
                 raise ValueError(
-                    f"group {key!r}: a borrowed prefix needs the "
-                    f"unified attention path over arena pages")
+                    f"group {key!r}: a borrowed prefix needs arena pages")
+            if borrowing and (len(g["suffixes"]) != 1
+                              or g.get("read_key") is None):
+                raise ValueError(
+                    f"group {key!r}: a borrowing group under two-call "
+                    f"attention names its read_key and has one suffix")
             id_parts.append(g["prefix"])
             token_count += len(g["prefix"])
             pos.append(np.arange(start, start + len(g["prefix"]),
                                  dtype=np.int64))
-            if paged or not g["suffixes"]:
+            if (paged or not g["suffixes"]) and not borrowing:
                 cu_a.append(token_count)
             if paged and two_call:
                 kv_writes.append((key, row0, row0 + len(g["prefix"]),
-                                  0))
+                                  start))
                 fresh_keys.append(key)
         prefix_end = token_count
         s_row0 = token_count
@@ -327,11 +337,26 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 # the shared question preamble joins the kept KV right
                 # after the document rows: after the fresh prefix, or
                 # after a kept document's f rows
-                dest = len(g["prefix"]) if fresh else f
+                dest = start + len(g["prefix"]) if fresh else f
                 kv_writes.append((key, srow, srow + wst, dest))
         s_count = token_count - s_row0
         layout.append((key, len(g["suffixes"])))
-        if s_count and f and paged and two_call:
+        if borrowing:
+            # every row of the group reads the parent's pages up to
+            # start; siblings packed back to back share that read
+            count = token_count - row0
+            suffix_rows.extend(range(row0, token_count))
+            read_key = g["read_key"]
+            if cross_keys and cross_keys[-1] == read_key \
+                    and cross_used[-1] == start:
+                cu_q[-1] += count
+                max_q = max(max_q, cu_q[-1] - cu_q[-2])
+            else:
+                cu_q.append(cu_q[-1] + count)
+                cross_keys.append(read_key)
+                cross_used.append(start)
+                max_q = max(max_q, count)
+        elif s_count and f and paged and two_call:
             suffix_rows.extend(range(s_row0, token_count))
             cu_q.append(cu_q[-1] + s_count)
             cross_keys.append(key)
@@ -1100,8 +1125,9 @@ class FilterStream:
             passed that stage. Must return quickly.
         prefix_tree: A PrefixTree over doc_ids, or None. A document
             with a parent borrows the parent's pages for its share and
-            packs only the tokens after it. Needs arena_writes and the
-            unified path.
+            packs only the tokens after it. Needs arena_writes. Under
+            the two-call path, documents borrowing the same pages in
+            one chunk read them once.
     """
 
     def __init__(self, torch, arena, pipeline, async_ans, doc_ids,
@@ -1140,9 +1166,8 @@ class FilterStream:
         self.attention_mode = attention_mode or FILTER_ATTENTION
         unified = self.attention_mode == "unified"
         if prefix_tree is not None and prefix_tree.shared_tokens:
-            if not arena_writes or not unified:
-                raise ValueError(
-                    "a prefix tree needs arena writes and unified attention")
+            if not arena_writes:
+                raise ValueError("a prefix tree needs arena writes")
         else:
             prefix_tree = None
         # capacity must cover the longest tail past the kept preamble,
@@ -1167,6 +1192,10 @@ class FilterStream:
             page_cost=arena.page_cost, tree=prefix_tree,
             can_borrow=self._can_borrow)
         self.tree = prefix_tree
+        # a document's place in tree order, for chunk order under
+        # two-call attention
+        self.tree_position = ({doc: i for i, doc in enumerate(prefix_tree.order)}
+                              if prefix_tree is not None else {})
         self.untrimmed = set()   # fresh docs whose children still borrow
         self.torch = torch
         self.arena = arena
@@ -1219,9 +1248,12 @@ class FilterStream:
             # the scheduler's share: 0 once the parent has left
             share = self.sched.share[doc]
             prefix = self.doc_ids[doc]
+            read_key = None
             if share:
                 prefix = prefix[share:]
+                read_key = self.keys[self.sched.parent[doc]]
             return dict(key=self.keys[doc], prefix=prefix, start=share,
+                        read_key=read_key,
                         f=len(self.doc_ids[doc]), suffixes=[self.tails[0]],
                         write_suffix_tokens=self.preamble)
         return dict(key=self.keys[doc], prefix=None,
@@ -1267,6 +1299,8 @@ class FilterStream:
         while self.outstanding:
             self._report(self.outstanding.pop(0), items)
         for doc in self.sched.drain_ready():
+            self.arena.free_key(self.keys[doc])
+        for doc in self.sched.release_parked():
             self.arena.free_key(self.keys[doc])
         self.progress.finish(
             f"filter ({len(self.tails)} stages) done",
@@ -1316,7 +1350,24 @@ class FilterStream:
                     continue
             if self.hold and sched.blocked_pages:
                 return items, True
+            if sched.parked:
+                # parked parents hold the pages: their children compute
+                # their whole documents instead
+                for doc in sched.release_parked():
+                    arena.free_key(self.keys[doc])
+                continue
             raise AssertionError("nothing buildable and nothing in flight")
+        if self.tree is not None and self.attention_mode != "unified":
+            # siblings back to back read their parent's pages once; a
+            # parent sorts under its own parent's place, so before them
+            def borrow_order(group):
+                doc, _, fresh = group
+                if not fresh:
+                    return (False, -1, 0)
+                parent = sched.parent[doc]
+                return (True, self.tree_position[
+                    doc if parent is None else parent], sched.share[doc])
+            groups.sort(key=borrow_order)
         for doc, stage, fresh in groups:
             if fresh and self.arena_writes:
                 logical = len(self.doc_ids[doc]) + self.preamble
@@ -1336,6 +1387,11 @@ class FilterStream:
                            timing=timing, pinned=self.pinned,
                            attention_mode=self.attention_mode,
                            canvas=self.canvas, answer_row=self.answer_row)
+        # a parked parent whose last child was just admitted: the
+        # children hold its pages, the chunk holds its block table
+        for doc in sched.take_released():
+            self.untrimmed.discard(doc)
+            arena.free_key(self.keys[doc])
         t = _tick(timing, "pack", t)
         self.tokens += chunk.tokens
         torch = self.torch

@@ -78,12 +78,30 @@ def test_prefix_tree_borrows_whole_pages_from_the_predecessor():
     tree = prefix_tree(docs, 16)
     # sorted order: 0..39, 0..49, 0..31+99s, [7]*10, [7]*20
     assert tree.order == [0, 1, 2, 4, 3]
-    # doc 1 shares 40 with doc 0, doc 2 shares 32 with doc 1; the two
+    # doc 1 shares 40 with doc 0; doc 2 shares 32 with doc 1, pages
+    # doc 1 itself borrowed from doc 0, so doc 2 reads doc 0. The two
     # runs of 7s share 10, under a page, so neither borrows
-    assert tree.parent == [None, 0, 1, None, None]
+    assert tree.parent == [None, 0, 0, None, None]
     assert tree.share == [0, 32, 32, 0, 0]
     assert tree.shared_tokens == 64
     parents_first = {index: position for position, index in enumerate(tree.order)}
     assert all(parent is None or parents_first[parent] < parents_first[index]
                for index, parent in enumerate(tree.parent))
     assert prefix_tree([], 16).shared_tokens == 0
+
+
+def test_prefix_tree_siblings_share_one_parent():
+    header = list(range(64))
+    docs = [header + [1] * 8, header + [2] * 8, header + [3] * 8,
+            header + [3] * 8 + [4] * 40, header + [5] * 8]
+    tree = prefix_tree(docs, 16)
+    # every record borrows the header from the first; doc 3 reads its
+    # 64 shared tokens from doc 0 too, as doc 2 owns none of them
+    assert tree.parent == [None, 0, 0, 0, 0]
+    assert tree.share == [0, 64, 64, 64, 64]
+    # a longer shared run makes a deeper node
+    docs = [header + [1] * 32, header + [1] * 32 + [2] * 8,
+            header + [1] * 32 + [3] * 8]
+    tree = prefix_tree(docs, 16)
+    assert tree.parent == [None, 0, 0]
+    assert tree.share == [0, 96, 96]

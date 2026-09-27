@@ -228,3 +228,16 @@ def test_physical_explain_shows_shared_inputs_and_metrics():
     assert "est. time" not in text
     assert "fresh_tokens=200" in physical_tree(
         graph, metrics=measured, verbose=True)
+
+
+def test_scalar_node_metrics_keeps_numeric_extension_values():
+    from quail.execution.runner import NodeMetrics, NodeResult, scalar_node_metrics
+
+    nodes = {"ai_filter:r": NodeResult({}, NodeMetrics(
+        fresh_tokens=10,
+        extension={"borrowed_prefix_tokens": 64, "answers": [1, 0],
+                   "flag": True}))}
+    metrics = scalar_node_metrics(nodes)["ai_filter:r"]
+    assert metrics["fresh_tokens"] == 10
+    assert metrics["borrowed_prefix_tokens"] == 64
+    assert "answers" not in metrics and "flag" not in metrics

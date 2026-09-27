@@ -73,6 +73,40 @@ The planner also decides:
   Documents whose KV is expected to save the most future
   recomputation per page are kept first.
 
+## Deciding prefix sharing and the attention path
+
+Two physical rules run after the plan is chosen, once the token
+counts are exact.
+
+**`prefix_sharing`.** Documents that start with the same tokens
+(snapshots of one agent trace, records after a common header) can
+share the KV of that prefix. The rule sorts the documents by token
+ids and measures how many whole 16-token KV pages each document
+shares with the one before it in sorted order. It fires when the
+forward-pass time those pages save is more than the cost of writing
+KV pages for the whole corpus, which a single-stage filter would
+otherwise skip; on Qwen3 4B and an H100 that is about 1.2% of the
+corpus tokens. A filter under `LIMIT` is left alone so the limit
+keeps table order. The filter node then carries
+`share_prefixes=True`, and the GPU worker builds the tree over its
+documents (about 0.2 seconds per 1,000 documents, from the token
+arrays). The rule runs on any corpus; on QUAIL-B only the AGENT
+corpus shares more than a page (68.8% of its tokens).
+
+**`tree_attention`.** The readers of one resident KV (a join's
+partners of one anchor, or the documents borrowing one parent's
+prefix) can each read it in the unified call or have their rows
+stacked into one read. Under unified attention the time is the
+readers' count times the larger of one reader's compute and its
+memory traffic; under tree attention the compute is the same, the
+KV is read once, and the merge kernel adds a small memory cost. Tree
+wins for many readers with few rows each on a long shared node; one
+reader per node, or long readers, keep unified. For a join the rule
+uses the expected partners per anchor; for a filter it groups the
+prefix tree's children by parent and picks the path that wins on
+the most borrowed tokens. The node's `attention` attribute records
+the choice, and the executor runs it.
+
 ## The roofline (speed-of-light) model
 
 The planner compares candidate plans using a roofline model. For

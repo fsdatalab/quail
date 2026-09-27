@@ -13,7 +13,7 @@ from dataclasses import replace
 
 from quail.cost.budgets import PAGE_TOKENS, choose_attention_path
 from quail.physical import AiFilter, AiJoin, PhysicalGraph
-from quail.planner.prefixes import prefix_credits
+from quail.planner.prefixes import page_tree, prefix_credits
 
 
 def _token_store(document_tokens):
@@ -25,6 +25,30 @@ def page_aligned_shared_tokens(store, page_tokens: int = PAGE_TOKENS) -> int:
     """Tokens a prefix tree over the store saves in whole KV pages."""
     return sum(credit // page_tokens * page_tokens
                for credit in prefix_credits(store))
+
+
+def filter_attention(model, device, store, lengths, question_tokens: int) -> str:
+    """The attention path for a filter whose documents share prefixes.
+
+    Documents borrowing the same pages of one parent are that node's
+    readers; each reads with its own tokens plus the question. The
+    path that wins on the most borrowed tokens wins the filter.
+    """
+    tree = page_tree(store)
+    groups = {}
+    for doc, parent in enumerate(tree.parent):
+        if parent is None:
+            continue
+        readers, rows = groups.get((parent, tree.share[doc]), (0, 0))
+        groups[(parent, tree.share[doc])] = (
+            readers + 1, rows + lengths[doc] - tree.share[doc])
+    votes = {"tree": 0, "unified": 0}
+    for (_, share), (readers, rows) in groups.items():
+        path = choose_attention_path(
+            model, device, readers=readers,
+            reader_rows=rows / readers + question_tokens, node_tokens=share)
+        votes[path] += readers * share
+    return "tree" if votes["tree"] > votes["unified"] else "unified"
 
 
 def sharing_pays(model, device, *, shared_tokens: int, total_tokens: int,
@@ -93,10 +117,10 @@ class TreeAttention:
     is by roofline (choose_attention_path). Tree attention needs the
     two-call path, which the fp8 models without canvas rows run.
 
-    A filter is not annotated: its first stage packs fresh documents,
-    whose rows must read any borrowed pages in the same call, and its
-    later stages have one question tail per document, one reader per
-    node, for which unified always wins.
+    A filter sharing prefixes is annotated from its tree: the
+    documents borrowing one parent's pages are that node's readers
+    (filter_attention). A filter that does not share has one reader
+    per node and stays on the unified path.
 
     Measured on LEP-4 and FEV-4 (experiments/join_attention_paths.py):
     unified is 2 to 3 percent faster where the rule picks it and tied
@@ -113,7 +137,17 @@ class TreeAttention:
         nodes = []
         changed = False
         for node in graph.nodes:
-            if isinstance(node, AiJoin) and not node.attention:
+            if isinstance(node, AiFilter) and not node.attention:
+                lengths = context.document_tokens.get(node.alias, ())
+                store = _token_store(lengths)
+                path = "unified"
+                if two_call and node.share_prefixes and store is not None:
+                    path = filter_attention(
+                        model, device, store, lengths,
+                        node.stages[0].question_tokens if node.stages else 0)
+                node = replace(node, attention=path)
+                changed = True
+            elif isinstance(node, AiJoin) and not node.attention:
                 lengths = context.document_tokens.get(node.anchor, ())
                 path = "unified"
                 if two_call and node.stages:

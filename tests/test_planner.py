@@ -705,3 +705,49 @@ def test_prefix_sharing_fires_on_a_store_with_shared_pages(tmp_path):
         "f", (), node.attributes()) == node
     assert PrefixSharing().rewrite(plan.graph, None) is None
     assert TreeAttention().rewrite(plan.graph, None) is None
+
+
+def test_tree_attention_picks_a_filter_path_from_its_prefix_tree(tmp_path):
+    from quail.execution.tokens import TokenStore
+    from quail.planner.physical_rules import filter_attention
+
+    def tokenizer(text):
+        return [int(t) for t in text.split()]
+
+    schema = pa.schema({"body": pa.string()})
+    # 40 records of 8 own tokens after a 2,048-token header: many
+    # short readers of one long node, where stacking their reads wins
+    header = " ".join(str(i) for i in range(2048))
+    records = [header + " " + " ".join([str(9000 + r)] * 8) for r in range(40)]
+    store = TokenStore.write(
+        str(tmp_path / "records.arrow"),
+        [pa.record_batch([records], schema=schema)],
+        document_column="body", tokenizer=tokenizer, token_type=pa.int32())
+    assert filter_attention(QWEN3_4B_FP8, H100_SXM, store, store.lengths,
+                            10) == "tree"
+    # a chain of snapshots each 3,000 tokens longer than the last: one
+    # reader per node with more rows than the node saves
+    snapshots = [" ".join(str(i) for i in range(3000 * (k + 1)))
+                 for k in range(4)]
+    chain = TokenStore.write(
+        str(tmp_path / "chain.arrow"),
+        [pa.record_batch([snapshots], schema=schema)],
+        document_column="body", tokenizer=tokenizer, token_type=pa.int32())
+    assert filter_attention(QWEN3_4B_FP8, H100_SXM, chain, chain.lengths,
+                            10) == "unified"
+
+    cat = Catalog()
+    cat.register("reviews", DocumentProvider.from_parquet(
+        _parquet(tmp_path / "r.parquet", ["id", "review"]), id_col="id"))
+    logical = docs(cat, "reviews", tok).alias("r").ai_filter(
+        prompt("flag: {0}", col("r.review")), selectivity=0.5).select("r.id")
+    plan = _plan(logical, {"r": store.lengths})
+    node = filter_chain(plan)
+    assert node.share_prefixes and node.attention == "tree"
+    assert "attention=tree" in explain(logical, plan, verbose=True)
+    plan = _plan(logical, {"r": chain.lengths})
+    node = filter_chain(plan)
+    assert node.share_prefixes and node.attention == "unified"
+    # a filter without shared prefixes has one reader per node
+    plan = _plan(logical, {"r": [40, 42, 3]})
+    assert filter_chain(plan).attention == "unified"

@@ -514,11 +514,15 @@ def _token_array(document):
 class PrefixTree:
     """Which document each document borrows its KV prefix from.
 
-    Documents are visited in sorted token order. Each one's parent is
-    its predecessor in that order, and `share` is the tokens they have
-    in common rounded down to a whole page, so a document can read its
-    parent's pages instead of computing those tokens. A document with
-    nothing to borrow has parent None and share 0.
+    Documents are visited in sorted token order. A document's share is
+    the tokens it has in common with its predecessor, rounded down to
+    a whole page, so it can read those pages instead of computing
+    them. Its parent is the earliest document that computed those
+    pages itself: the predecessor, or an ancestor of the predecessor
+    that borrowed at least as much. Documents sharing one prefix thus
+    all borrow from the same parent, and a forward pass can read that
+    parent's pages once for all of them. A document with nothing to
+    borrow has parent None and share 0.
 
     Attributes:
         order: Document positions in sorted token order; a parent
@@ -573,7 +577,11 @@ def prefix_tree(documents, page_tokens: int) -> PrefixTree:
             lcp = common(arrays[previous], arrays[index])
             pages = lcp // page_tokens * page_tokens
             if pages:
-                parent[index] = previous
+                # climb while the ancestor borrowed these pages too
+                owner = previous
+                while parent[owner] is not None and share[owner] >= pages:
+                    owner = parent[owner]
+                parent[index] = owner
                 share[index] = pages
         previous = index
     return PrefixTree(order, parent, share)

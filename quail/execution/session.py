@@ -4,7 +4,7 @@ import os
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import replace
+from dataclasses import fields, replace
 from itertools import chain
 from numbers import Integral
 from pathlib import Path
@@ -48,6 +48,15 @@ from quail.planner import explain, plan_query, refine_plan
 from quail.planner.logical_optimizer import LogicalPlanningContext, apply_logical_rules
 from quail.planner.plan import EngineConfig, Refusal, resolve_model
 from quail.progress import Progress, say
+
+
+def _node_metrics(metrics: dict) -> NodeMetrics:
+    """Rebuild a node's metrics from a report; extra numbers go to extension."""
+    names = {field.name for field in fields(NodeMetrics)} - {"extension"}
+    return NodeMetrics(
+        **{name: value for name, value in metrics.items() if name in names},
+        extension={name: value for name, value in metrics.items()
+                   if name not in names})
 
 
 class RefusalError(RuntimeError):
@@ -971,7 +980,7 @@ class Query:
             ),
             initial_outputs=response.outputs,
             initial_metrics={
-                node_id: NodeMetrics(**metrics)
+                node_id: _node_metrics(metrics)
                 for node_id, metrics in out.get("node_metrics", {}).items()
             },
         )

@@ -544,7 +544,9 @@ class FilterAdmission:
             resident borrows the parent's pages for its share and
             packs and pays for only the tokens past it; one whose
             parent has already left packs the whole document; one
-            whose parent is still queued waits.
+            whose parent is still queued waits. A parent that answers
+            its last stage while children are still queued keeps its
+            pages (parked) until the last child is admitted.
         can_borrow: Callable(doc, parent) -> bool, asked before a
             resident parent is borrowed from; False packs the whole
             document. None allows every borrow.
@@ -566,6 +568,8 @@ class FilterAdmission:
         self.parent = [None] * n if tree is None else list(tree.parent)
         self.share = [0] * n if tree is None else list(tree.share)
         self.gone = set()          # docs reported at their last stage
+        self.parked = set()        # answered, pages kept for queued children
+        self.released = []         # parked docs freed since the last drain
         self.can_borrow = can_borrow
         self.borrowed_tokens = 0   # tokens read from a parent, as admitted
         # children not yet admitted, per parent: a parent keeps its
@@ -684,9 +688,31 @@ class FilterAdmission:
             room -= cost
             if parent is not None:
                 self.children_left[parent] -= 1
+                if not self.children_left[parent] and parent in self.parked:
+                    self._release_parked(parent)
             self.borrowed_tokens += self.share[doc]
         self.pending.prepend(skipped)
         return groups
+
+    def _release_parked(self, doc):
+        self.parked.discard(doc)
+        self.gone.add(doc)
+        self.free_pages += self.resident.pop(doc)
+        self.released.append(doc)
+
+    def take_released(self):
+        """Parked docs freed since the last call, for arena key cleanup."""
+        out, self.released = self.released, []
+        return out
+
+    def release_parked(self):
+        """Free every parked doc; its queued children compute whole.
+
+        Returns the freed docs for arena key cleanup.
+        """
+        for doc in list(self.parked):
+            self._release_parked(doc)
+        return self.take_released()
 
     # ---- gating --------------------------------------------------------
 
@@ -710,9 +736,14 @@ class FilterAdmission:
         if passed and not last:
             self.ready.append((doc, stage + 1))
             return ()
-        self.gone.add(doc)
         if self.free_pages is None:
+            self.gone.add(doc)
             return ()
+        if release and self.children_left[doc]:
+            # queued children still borrow these pages
+            self.parked.add(doc)
+            return ()
+        self.gone.add(doc)
         held = self.resident.pop(doc)
         if release:
             self.free_pages += held

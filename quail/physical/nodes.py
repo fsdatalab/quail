@@ -581,6 +581,9 @@ class AiFilter(PhysicalNode):
     # documents borrow the KV pages of a document that shares their
     # token prefix (the prefix_sharing rule)
     share_prefixes: bool = False
+    # "unified" or "tree": the attention path the tree_attention rule
+    # chose; empty leaves the executor's default
+    attention: str = ""
 
     type_name: ClassVar[str] = "quail.ai_filter"
     runtime_key: ClassVar[str] = type_name
@@ -614,6 +617,7 @@ class AiFilter(PhysicalNode):
                 list(question) for question in self.question_token_ids
             ],
             "share_prefixes": self.share_prefixes,
+            "attention": self.attention,
         }
 
     def explain_fields(self) -> Mapping[str, Any]:
@@ -640,6 +644,7 @@ class AiFilter(PhysicalNode):
                 for question in attributes["question_token_ids"]
             ),
             share_prefixes=bool(attributes.get("share_prefixes", False)),
+            attention=str(attributes.get("attention", "")),
         )
 
 

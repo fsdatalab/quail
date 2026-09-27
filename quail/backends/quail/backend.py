@@ -156,6 +156,7 @@ class QuailModelExecution:
                 retain_survivors=retain_survivors,
                 document_done=inputs.get("document_done"),
                 prefix_tree=tree,
+                attention_mode=_join_attention(node, pipeline),
                 stats=stats,
             )
             return filter_result(
@@ -187,6 +188,7 @@ class QuailModelExecution:
                 document_done=stream.get("document_done"),
                 prefix_tree=_filter_prefix_tree(
                     filter_node, stream["documents"], arena),
+                attention_mode=_join_attention(filter_node, pipeline),
             )
         lists_for = inputs.get("anchor_partners")
         answers, spans, tokens = loop.run_join(
@@ -283,7 +285,7 @@ def _filter_prefix_tree(node, documents, arena):
 
 
 def _join_attention(node, pipeline):
-    """The join's attention mode: the plan's choice, else the pipeline's.
+    """A node's attention mode: the plan's choice, else the loop's default.
 
     A bf16 pipeline has no two-call path, so "tree" falls back to it.
     """

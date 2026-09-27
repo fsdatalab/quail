@@ -203,7 +203,7 @@ def test_pack_chunk_reads_borrowed_pages_in_the_unified_call(monkeypatch):
     assert dst[101:] == arena.capacity_rows(child)[64:95].tolist()
     assert arena.capacity_rows(child)[:64].tolist() == \
         arena.capacity_rows(parent)[:64].tolist()
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="read_key"):
         loop.pack_chunk(
             torch, arena,
             [dict(key=child, prefix=doc[64:94], start=64, f=94,
@@ -211,6 +211,53 @@ def test_pack_chunk_reads_borrowed_pages_in_the_unified_call(monkeypatch):
             attention_mode="merge_quant")
     arena.free_key(parent)
     arena.free_key(child)
+    assert arena.free_pages == 64
+
+
+def test_pack_chunk_stacks_borrowing_siblings_in_the_two_call_path(
+        monkeypatch):
+    cpu_staging(monkeypatch)
+    arena = KVArena(n_layers=1, n_pages=64, page_tokens=16, n_kv=1, d_head=2,
+                    dtype=torch.float32, device="cpu")
+    parent, a, b = ("d", 0), ("d", 1), ("d", 2)
+    doc = list(range(100))
+    tail = [500]
+    arena.activate(parent, 100, capacity_tokens=110, base_tokens=100)
+    # two siblings share 64 tokens (4 pages) of the parent
+    arena.activate(a, 74, capacity_tokens=84, base_tokens=74,
+                   borrow=(parent, 64))
+    arena.activate(b, 70, capacity_tokens=80, base_tokens=70,
+                   borrow=(parent, 64))
+    chunk = loop.pack_chunk(
+        torch, arena,
+        [dict(key=parent, prefix=doc, f=100, suffixes=[tail]),
+         dict(key=a, prefix=doc[64:74], start=64, read_key=parent, f=74,
+              suffixes=[tail], write_suffix_tokens=1),
+         dict(key=b, prefix=doc[64:70], start=64, read_key=parent, f=70,
+              suffixes=[tail], write_suffix_tokens=1)],
+        attention_mode="merge_quant")
+    assert chunk.fresh_keys == (parent, a, b)
+    # call A: the parent's prefix, its tail, then each sibling's
+    # prefix and tail as one causal segment
+    assert chunk.meta["cu_a"].tolist() == [0, 100, 101, 112, 119]
+    cross = chunk.meta["cross"]
+    # call B: the parent's tail reads its 100 rows; both siblings' 18
+    # rows read the parent's 64 shared positions in one sequence
+    assert cross["cu_q"].tolist() == [0, 1, 19]
+    assert cross["used"].tolist() == [100, 64]
+    assert cross["max_q"] == 18
+    assert cross["rows"].tolist() == [100] + list(range(101, 119))
+    table = cross["table"].tolist()
+    assert table[1][:4] == table[0][:4]
+    # the siblings' prefixes and kept tails write their own pages after
+    # the borrowed ones
+    dst = chunk.meta["kv_dst"].tolist()
+    assert dst[100:110] == arena.capacity_rows(a)[64:74].tolist()
+    assert dst[110:111] == arena.capacity_rows(a)[74:75].tolist()
+    assert dst[111:117] == arena.capacity_rows(b)[64:70].tolist()
+    assert dst[117:118] == arena.capacity_rows(b)[70:71].tolist()
+    for key in (parent, a, b):
+        arena.free_key(key)
     assert arena.free_pages == 64
 
 

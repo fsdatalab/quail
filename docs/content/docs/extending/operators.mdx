@@ -108,7 +108,17 @@ to TRUE/FALSE.
 
 **Physical rules** rewrite the physical graph after the planner
 selects one. For example, a rule could fuse consecutive classify
-operators.
+operators. A rule's `rewrite(graph, context)` returns the new graph
+or `None` when it changes nothing. `context` carries the model, the
+device, and each alias's document token lengths; it is `None` when
+the planner has no model. Physical rules run twice on the first query
+over a corpus: once on estimated lengths while tokenization runs in
+the background, and again once the token counts are exact. A rule
+must therefore be idempotent, and should leave a node alone when it
+already carries the rule's decision. The built-in `prefix_sharing`
+and `tree_attention` rules in
+[`quail/planner/physical_rules.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/physical_rules.py)
+are examples.
 
 See
 [`quail/planner/logical_optimizer.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/logical_optimizer.py)
