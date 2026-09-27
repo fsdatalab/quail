@@ -59,13 +59,10 @@ def tightest(docs, kind, extra, page_tokens=16):
                  page_tokens=page_tokens)
 
 
-def described(check, docs, setup, *inputs):
-    *inputs, retain = inputs if inputs and inputs[-1] is True else (*inputs, None)
+def described(check, docs, setup, *inputs, **options):
+    """Run a check, naming the corpus and arena in any failure."""
     try:
-        if retain:
-            check(docs, *inputs, setup, retain=True)
-        else:
-            check(docs, *inputs, setup)
+        check(docs, *inputs, setup, **options)
     except AssertionError as error:
         starts = [doc[::setup.page_tokens] for doc in docs]
         raise AssertionError(
@@ -88,5 +85,5 @@ def test_every_small_join(arena_kind):
         # the frame, one partner, and a canvas row after each
         setup = tightest(docs, arena_kind, len(frame) + len(partners[0]) + 2)
         described(check_join, docs, setup, frame, partners)
-        described(check_join, docs, setup, frame, partners, True)
+        described(check_join, docs, setup, frame, partners, retain=True)
         described(check_feed, docs, setup, [90, 91, 92], frame, partners)
