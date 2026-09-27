@@ -75,45 +75,45 @@ The planner also decides:
 
 ## Deciding whether to share prefixes
 
-The planner decides for each filter and each join whether its
-documents share prefixes (see
+The planner decides for each filter and join whether to share
+prefixes (see
 [Prefix sharing](/docs/architecture/execution#prefix-sharing)).
 
-To share, every document's KV must be written to GPU memory, so that
-later documents can read it. A join always writes its anchors' KV, so
-it shares whenever its anchors have at least one page in common. A
-filter with one predicate normally does not write KV, because nothing
-reads it again. For that filter, the planner compares two costs: the
-time saved by not computing the shared tokens, and the time to write
-KV for every document. It shares only when the first is larger.
+- Sharing needs every document's KV written to GPU memory, so later
+  documents can read it.
+- A join always writes its anchors' KV, so it shares whenever two
+  anchors have a page in common.
+- A filter with one predicate normally skips writing KV. It shares
+  only when the time saved on shared tokens is more than the time to
+  write KV for every document.
+- Under `LIMIT`, the planner does not share, because sharing changes
+  the order documents run in and `LIMIT` returns the first rows in
+  table order.
+- On the first query over a table, the planner decides again once the
+  documents are tokenized, because until then it only has estimated
+  lengths.
 
-For example, imagine a filter with one predicate over a table of
-movie reviews, where a few reviews happen to start with the same
-sentence. The shared tokens are well under 1% of the table, so
-writing KV for every review would cost more than it saves, and the
-planner does not share. Over a table of agent trace snapshots, where
-about two thirds of all tokens repeat an earlier snapshot, it shares.
+For example, imagine two single-predicate filters. One runs over
+movie reviews, where under 1% of tokens repeat: writing KV would cost
+more than it saves, so it does not share. The other runs over agent
+trace snapshots, where about two thirds of tokens repeat: it shares.
 
-Sharing changes the order documents run in, so the planner does not
-share under `LIMIT`, which returns the first rows in table order.
-
-The planner needs each document's tokens to make this decision. On
-the first query over a table, it plans with estimated lengths while
-the documents are tokenized, then decides again once the tokens are
-ready. The rule is called `prefix_sharing`, and
-`explain(verbose=True)` shows its choice as `share_prefixes`.
+The rule is `prefix_sharing`; `explain(verbose=True)` shows its
+choice as `share_prefixes`.
 
 ## Choosing the attention path
 
-For each filter and join, the planner estimates how long each
-[attention path](/docs/architecture/execution#attention-paths) would
-take, using the roofline model below, and picks the faster one. It
-looks at three numbers: how many documents read the same KV, how many
-tokens each of those documents adds, and how long the shared KV is.
-In a join, those are an anchor's partners and the anchor. In a filter
-with prefix sharing, they are the documents with the same parent and
-the parent's shared pages. The rule is called `tree_attention`, and
-`explain(verbose=True)` shows its choice as `attention`.
+For each filter and join, the planner estimates the time of each
+[attention path](/docs/architecture/execution#attention-paths) with
+the roofline model below and picks the faster one. It uses:
+
+- how many documents read the same KV: an anchor's partners, or the
+  documents with the same parent;
+- how many tokens each of those documents adds;
+- how long the shared KV is.
+
+The rule is `tree_attention`; `explain(verbose=True)` shows its
+choice as `attention`.
 
 ## The roofline (speed-of-light) model
 
