@@ -108,8 +108,20 @@ to TRUE/FALSE.
 
 **Physical rules** rewrite the physical graph after the planner
 selects one. For example, a rule could fuse consecutive classify
-operators. A physical rule can run twice on one query, so applying
-it to its own output must change nothing.
+operators.
+
+Rules run in this order:
+
+- Logical rules run in registration order, built-in rules first. The
+  whole list repeats until a round changes nothing, for at most four
+  rounds, so a rewrite that enables another rule is not missed.
+- Physical rules run once each, in registration order, built-in rules
+  first (`prefix_sharing`, then `tree_attention`). A rule sees every
+  change the rules before it made.
+- On the first query over a table, the physical rules run a second
+  time once the documents are tokenized. Write a rule to compute its
+  decision from the plan and the token counts each time, and to
+  return `None` when nothing changes, so running it again is safe.
 
 See
 [`quail/planner/logical_optimizer.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/logical_optimizer.py)

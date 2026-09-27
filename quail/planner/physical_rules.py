@@ -130,6 +130,9 @@ class TreeAttention:
     documents borrowing one parent's pages are that node's readers
     (filter_attention). A filter that does not share has one reader
     per node and stays on the unified path.
+
+    The choice is recomputed on every pass, so a plan first made on
+    estimated lengths gets the path its exact tokens call for.
     """
 
     name = "tree_attention"
@@ -143,7 +146,8 @@ class TreeAttention:
         nodes = []
         changed = False
         for node in graph.nodes:
-            if isinstance(node, AiFilter) and not node.attention:
+            path = None
+            if isinstance(node, AiFilter):
                 lengths = context.document_tokens.get(node.alias, ())
                 store = _token_store(lengths)
                 path = "unified"
@@ -151,9 +155,7 @@ class TreeAttention:
                     path = filter_attention(
                         model, device, store, lengths,
                         node.stages[0].question_tokens if node.stages else 0)
-                node = replace(node, attention=path)
-                changed = True
-            elif isinstance(node, AiJoin) and not node.attention:
+            elif isinstance(node, AiJoin):
                 lengths = context.document_tokens.get(node.anchor, ())
                 path = "unified"
                 if tree_available and node.stages:
@@ -167,6 +169,7 @@ class TreeAttention:
                     path = choose_attention_path(
                         model, device, readers=readers, reader_rows=rows,
                         node_tokens=_mean(lengths))
+            if path is not None and path != node.attention:
                 node = replace(node, attention=path)
                 changed = True
             nodes.append(node)

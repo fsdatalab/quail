@@ -93,6 +93,12 @@ prefixes (see
   documents are tokenized, because until then it only has estimated
   lengths.
 
+<Mermaid chart={`flowchart LR
+  A["plan on estimated lengths"] --> B["physical rules"]
+  B --> C["documents tokenized"]
+  C --> D["physical rules again,<br/>on exact token counts"]
+  D --> E["run"]`} />
+
 For example, imagine two single-predicate filters. One runs over
 movie reviews, where under 1% of tokens repeat: writing KV would cost
 more than it saves, so it does not share. The other runs over agent

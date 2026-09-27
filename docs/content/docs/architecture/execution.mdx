@@ -71,6 +71,13 @@ one before it. For snapshots of 1,000, 1,400, and 1,900 tokens:
   because KV is stored in pages of 16 tokens and a document can only
   read another's pages whole.
 
+<Mermaid chart={`flowchart LR
+  S1["Snapshot 1<br/>computes 1,000 tokens"]
+  S2["Snapshot 2<br/>computes 408 tokens"]
+  S3["Snapshot 3<br/>computes 508 tokens"]
+  S1 -->|"reads 992 tokens of KV"| S2
+  S2 -->|"reads 1,392 tokens of KV"| S3`} />
+
 The planner decides when to share; see
 [Planning](/docs/architecture/planning#deciding-whether-to-share-prefixes).
 
@@ -143,6 +150,21 @@ with partner documents.
 - With 2 partners of 1,000 tokens each, the anchor is read twice
   either way and most of the work is the partners' own tokens.
   Unified is faster.
+
+<Mermaid chart={`flowchart TB
+  subgraph U["Unified: one call"]
+    direction LR
+    U1["partner 1 rows"] --> UA1["anchor KV"]
+    U2["partner 2 rows"] --> UA2["anchor KV"]
+    U3["partner 3 rows"] --> UA3["anchor KV"]
+  end
+  subgraph T["Tree: two calls"]
+    direction LR
+    T1["partner 1, 2, 3 rows"] --> TA["anchor KV, read once"]
+    T1 --> TO["each partner's own rows"]
+    TA --> M["combine"]
+    TO --> M
+  end`} />
 
 Tree attention needs FP8 weights; other models always use unified.
 The planner picks the path for each operator; see
