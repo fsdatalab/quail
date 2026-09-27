@@ -695,11 +695,16 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     frame_max = max(len(f) + (len(canvas) if f else 0) for f in frames)
     if anchor_source is not None and mode == "unified":
         # the source leaves room for one partner's temporary rows, or
-        # held anchors could fill the arena before the join can run
-        longest = max((len(s) for suffixes in stage_suffixes for s in suffixes),
-                      default=0)
-        anchor_source.reserve_pages = arena.page_cost(
-            arena.page_tokens - 1 + longest + len(canvas), 0)
+        # held anchors could fill the arena before the join can run;
+        # the rows follow the anchor's last partial page, as the
+        # scheduler prices them
+        longest = [max((len(s) for s in suffixes), default=0) + len(canvas)
+                   for suffixes in stage_suffixes]
+        anchor_source.reserve_pages = max(
+            (arena.page_cost((len(doc) + len(frame)) % arena.page_tokens
+                             + rows, 0)
+             for doc in anchor_source.doc_ids
+             for frame, rows in zip(frames, longest)), default=0)
     def held_pages(key, prefix_tokens):
         # the scheduler prices an anchor at page_cost(prefix + frames)
         # less what it holds; a trimmed window holds fewer sliding
@@ -1429,7 +1434,10 @@ class FilterStream:
                     if not self.hold:
                         sched.add_free_pages(freed)
                     continue
-            if self.hold and sched.blocked_pages:
+            # a consumer that asks to evict can free nothing itself, so
+            # kept parents go before the chain reports blocked
+            if self.hold and sched.blocked_pages and not (
+                    evict_retained and sched.kept_for_children):
                 return items, True
             if sched.kept_for_children:
                 # kept parents hold the pages: their children compute
