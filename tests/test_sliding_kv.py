@@ -5,7 +5,6 @@ from fakes import cpu_staging
 
 from quail.backends.quail.executor import loop
 from quail.backends.quail.executor.arena import KVArena
-from quail.backends.quail.executor.pack import FilterAdmission
 
 torch = pytest.importorskip("torch")
 
@@ -102,20 +101,33 @@ def test_alloc_rollback_temporaries_and_resize():
     arena.resize(32, 8)     # a no-op at the same sizes
 
 
-def test_filter_admission_credits_a_trim():
-    sched = FilterAdmission([100], [10], 200, arena_pages=64, page_tokens=16,
-                            page_cost=lambda tokens, base=None: (
-                                28 if base is None else 12))
-    assert sched.next_chunk() == [(0, 0, True)]
-    assert sched.free_pages == 64 - 28
-    sched.trim(0, 16)
-    assert sched.free_pages == 64 - 12
-    assert sched.resident[0] == 12
-    with pytest.raises(ValueError):
-        sched.trim(0, -1)
-    # a kept survivor holds its trimmed cost: nothing more comes back
-    sched.report(0, 0, True, release=False)
-    assert sched.free_pages == 52
+def test_a_held_key_waits_for_its_borrowers():
+    arena = cpu_arena(pages=64, sliding_pages=32)
+    parent, child = ("d", 0), ("d", 1)
+    arena.activate(parent, 100, capacity_tokens=110, base_tokens=100)
+    arena.hold(parent, 1)
+    # a borrower sharing 48 tokens reads the window from row 16 on
+    arena.keep_window(parent, 48)
+    arena.trim_window(parent)
+    assert arena.sliding_start(parent) == 16
+    # freed while held: the pages stay, and retention cannot evict it
+    assert arena.free_key(parent) == 0
+    assert arena.is_resident(parent) and arena.can_borrow(parent, 48)
+    arena.activate(child, 60, capacity_tokens=70, base_tokens=60,
+                   borrow=(parent, 48))
+    arena.release(parent)
+    assert not arena.is_resident(parent)
+    arena.free_key(child)
+    assert arena.free_pages == 64
+
+    # a retained held key is passed over by eviction until its holds go
+    arena.activate(parent, 100, capacity_tokens=110, base_tokens=100)
+    arena.hold(parent, 2)
+    arena.retain(parent, 100)
+    assert arena.evict_retained(64) == ()
+    assert arena.drop_holds([parent])
+    assert arena.evict_retained(64) == (parent,)
+    assert arena.free_pages == 64
 
 
 def test_pack_chunk_builds_both_pools(monkeypatch):

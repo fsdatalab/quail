@@ -159,6 +159,8 @@ class PageArena:
         self._forget_retained(key)
         self.retained[key] = prefix_tokens
         # the pages evicting the key would free: those it alone holds
+        # now; a child freed later leaves more, so the count is a
+        # lower bound, and admission short of pages evicts anyway
         pages = sum(1 for page in self.table_pages(key) if self.holds[page] == 1)
         self.retained[key] = prefix_tokens
         self._retained_sizes[key] = pages
@@ -167,8 +169,11 @@ class PageArena:
         version = self._retention_version
         self._retained_versions[key] = version
         if priority is None:
-            priority = (self.retention_policy.priority(key, prefix_tokens, pages)
-                        if self.retention_policy else (prefix_tokens / pages,))
+            # a key whose pages its children all share frees none alone
+            priority = (self.retention_policy.priority(
+                key, prefix_tokens, max(1, pages))
+                if self.retention_policy
+                else (prefix_tokens / max(1, pages),))
         heapq.heappush(
             self._retained_heap,
             (priority, version, key, pages, prefix_tokens),
@@ -185,16 +190,27 @@ class PageArena:
         for key in keys:
             self.retain(key)
 
-    def pop_retained_victim(self):
-        """Remove the retained prefix with the lowest planned reuse priority."""
+    def pop_retained_victim(self, keep=frozenset()):
+        """Remove the retained prefix with the lowest planned reuse priority.
+
+        Keys in keep stay retained and are passed over.
+        """
+        passed = []
+        victim = None
         while self._retained_heap:
-            _, version, key, pages, prefix_tokens = heapq.heappop(
-                self._retained_heap)
+            entry = heapq.heappop(self._retained_heap)
+            _, version, key, pages, prefix_tokens = entry
             if self._retained_versions.get(key) != version:
                 continue
+            if key in keep:
+                passed.append(entry)
+                continue
             self._forget_retained(key)
-            return key, pages, prefix_tokens
-        return None
+            victim = key, pages, prefix_tokens
+            break
+        for entry in passed:
+            heapq.heappush(self._retained_heap, entry)
+        return victim
 
     def rewind(self, key, tokens: int) -> int:
         """Keep the first tokens and return unused trailing pages."""
@@ -343,6 +359,9 @@ class KVArena:
         self._sliding_rows = {}   # key -> every row in its sliding pages
         self._base = {}       # key -> tokens the window is anchored below
         self._sliding_start = {}  # key -> logical row of its first sliding page
+        self._holds = {}      # key -> queued keys that will borrow from it
+        self._deferred = set()    # held keys freed by their operator
+        self._window_floor = {}   # key -> lowest sliding row a borrower reads
 
     def resize(self, n_pages: int, n_sliding_pages: int = 0, *,
                free_resident: bool = False) -> None:
@@ -352,6 +371,7 @@ class KVArena:
         key first, and without it a resident key is an error.
         """
         if free_resident:
+            self.drop_holds()
             for key in self.resident_keys():
                 self.free_key(key)
         if self.accounting.owned:
@@ -383,14 +403,25 @@ class KVArena:
         """The logical row of the key's first sliding page."""
         return self._sliding_start[key]
 
+    def keep_window(self, key, shared: int) -> None:
+        """Keep the key's sliding rows a borrower of `shared` tokens reads.
+
+        trim_window never drops rows from the window origin below
+        `shared` on.
+        """
+        row = self.origin(shared)
+        self._window_floor[key] = min(self._window_floor.get(key, row), row)
+
     def trim_window(self, key) -> int:
         """Release a key's sliding pages before its window origin.
 
-        Returns the pages freed, in every-token pages.
+        Rows a borrower still reads (see keep_window) stay. Returns the
+        pages freed, in every-token pages.
         """
         if self.sliding is None:
             return 0
-        origin = self.origin(self._base[key])
+        origin = min(self.origin(self._base[key]),
+                     self._window_floor.get(key, self._base[key]))
         start = self._sliding_start[key]
         if origin <= start:
             return 0
@@ -533,10 +564,13 @@ class KVArena:
             lambda: self.free_pages - start >= pages_needed)
 
     def _evict_until(self, satisfied) -> tuple:
-        """Evict retained prefixes in priority order until satisfied() holds."""
+        """Evict retained prefixes in priority order until satisfied() holds.
+
+        A held key is never evicted: a queued borrower will read it.
+        """
         keys = []
         while not satisfied():
-            victim = self.accounting.pop_retained_victim()
+            victim = self.accounting.pop_retained_victim(keep=self._holds)
             if victim is None:
                 break
             keys.append(victim[0])
@@ -619,7 +653,53 @@ class KVArena:
                            sliding_tokens=sliding_tokens)
         return None if pages is None else (key, pages)
 
+    # ---- holds: keys that queued borrowers will read ------------------
+
+    def hold(self, key, borrowers: int) -> None:
+        """Keep a key for `borrowers` keys that will borrow its pages.
+
+        A held key is never evicted, and free_key on it waits until the
+        last borrower has released it.
+        """
+        if borrowers:
+            self._holds[key] = self._holds.get(key, 0) + borrowers
+
+    def release(self, key) -> None:
+        """One borrower of the key was admitted, or will not come."""
+        if key not in self._holds:
+            return
+        self._holds[key] -= 1
+        if not self._holds[key]:
+            del self._holds[key]
+            if key in self._deferred:
+                self._deferred.discard(key)
+                self.free_key(key)
+
+    def drop_holds(self, keys=None) -> bool:
+        """Release every hold on the keys (all keys by default).
+
+        Held keys already freed go free now, and retained ones become
+        evictable; their queued borrowers compute their whole prefix
+        instead. Returns whether any hold was released.
+        """
+        keys = list(self._holds) if keys is None else [
+            key for key in keys if key in self._holds]
+        for key in keys:
+            del self._holds[key]
+            if key in self._deferred:
+                self._deferred.discard(key)
+                self.free_key(key)
+        return bool(keys)
+
     def free_key(self, key):
+        """Free a key's pages, or once its holds are released.
+
+        Returns the pages that went free now.
+        """
+        if key in self._holds:
+            self._deferred.add(key)
+            return 0
+        self._window_floor.pop(key, None)
         self._rows.pop(key)
         self._capacity_rows.pop(key)
         self._sliding_rows.pop(key, None)

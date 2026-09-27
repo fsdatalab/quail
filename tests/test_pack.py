@@ -184,7 +184,8 @@ def test_admission_invariants_over_random_shapes():
         truth = [[1 if rng.random() < 0.7 else 0
                   for _ in range(n_stages)] for _ in range(n_docs)]
         sched = FilterAdmission(doc_tokens, stage_tokens, budget, arena_pages, 16)
-        chunks = _drive(sched, truth, deliver_lag=rng.choice((0, 1)))
+        chunks = _drive(sched, truth, deliver_lag=rng.choice((0, 1)),
+                        arena_pages=arena_pages)
         _check_invariants(sched, chunks, truth, doc_tokens, stage_tokens,
                           budget, arena_pages)
 
@@ -235,11 +236,20 @@ def test_gate_matches_assemble_vs_brute_force():
     assert matches(rows) == {0: [], 1: [1]}
 
 
-def _drive(sched, truth, deliver_lag=1):
+def _drive(sched, truth, deliver_lag=1, arena_pages=None):
+    """Run a filter scheduler, freeing pages as an arena would."""
     chunks, outstanding = [], []
+    held = {}       # doc -> pages its admission took
     idle = 0
     while not sched.done():
-        groups = sched.next_chunk()
+        free = (None if arena_pages is None
+                else arena_pages - sum(held.values()))
+        groups = sched.next_chunk(free)
+        for doc, _, fresh in groups:
+            if fresh and arena_pages is not None:
+                held[doc] = sched.page_cost(
+                    sched.own_tokens(doc) + sched.kept_extra)
+                assert sum(held.values()) <= arena_pages, "over the arena"
         if groups:
             chunks.append(groups)
             outstanding.append(groups)
@@ -251,7 +261,9 @@ def _drive(sched, truth, deliver_lag=1):
             assert idle < 3, "scheduler stopped making progress"
         while len(outstanding) > (deliver_lag if groups else 0):
             for doc, stage, _fresh in outstanding.pop(0):
-                sched.report(doc, stage, truth[doc][stage])
+                for freed in sched.report(doc, stage, truth[doc][stage]):
+                    del held[freed]
+    assert not held
     return chunks
 
 
@@ -268,7 +280,7 @@ def _check_invariants(sched, chunks, truth, doc_tokens, stage_tokens,
     for d, row in enumerate(truth):
         expect = row[:row.index(0) + 1] if 0 in row else row
         assert sched.answers[d] == expect, f"doc {d} gating wrong"
-    assert sched.free_pages == arena_pages
+    assert not sched.resident
     assert sched.survivors() == [d for d, row in enumerate(truth) if all(row)]
 
 
@@ -276,24 +288,23 @@ def test_filter_admission_order_and_rewind():
     # one resident survivor's next suffix packs before fresh docs
     sched = FilterAdmission([100, 100], [10, 10], 200,
                             arena_pages=100, page_tokens=16)
-    assert sched.next_chunk() == [(0, 0, True)]     # no room for doc 1 (110+110)
+    assert sched.next_chunk(100) == [(0, 0, True)]  # no room for doc 1 (110+110)
     sched.report(0, 0, True)
-    second = sched.next_chunk()
+    second = sched.next_chunk(100)
     assert second[0] == (0, 1, False)
     assert (1, 0, True) in second
 
-    # a kept document holds pages_for(doc + kept_extra) while in
-    # flight but is rewound to its own tokens: pages_for(70+30)=7
-    # charged, pages_for(70)=5 kept, 2 back to admission
+    # admission charges pages_for(doc + kept_extra): 70+30 -> 7 pages;
+    # a kept document is the caller's to rewind
     sched = FilterAdmission([70, 60], [10], 200,
                             arena_pages=7, page_tokens=16,
                             kept_extra_tokens=30)
-    assert sched.next_chunk() == [(0, 0, True)]
+    assert sched.next_chunk(7) == [(0, 0, True)]
     assert sched.report(0, 0, True, release=False) == ()
-    assert sched.free_pages == 2
     assert 0 not in sched.resident
-    sched.add_free_pages(5)
-    assert sched.next_chunk() == [(1, 0, True)]
+    assert sched.next_chunk(5) == []
+    assert sched.blocked_pages == 1
+    assert sched.next_chunk(6) == [(1, 0, True)]
 
     with pytest.raises(ValueError):
         FilterAdmission([1000], [10], 500, 100, 16)     # over chunk
@@ -308,28 +319,27 @@ def test_filter_admission_order_and_rewind():
     # without a page bin, a document too big for any arena is admitted
     sched = FilterAdmission([1000], [10], 2000, None, 16)
     assert sched.next_chunk() == [(0, 0, True)]
-    assert sched.free_pages is None and not sched.resident
+    assert sched.report(0, 0, False) == ()
 
 
 def test_filter_limit_drains_ready_documents():
     # the limit is met while docs 1 and 2 wait in ready; draining frees them
     sched = FilterAdmission([50, 50, 50], [10, 200], 250,
                             arena_pages=100, page_tokens=16, limit=1)
-    for doc, _, _ in sched.next_chunk():        # all fresh, stage 0
+    for doc, _, _ in sched.next_chunk(100):     # all fresh, stage 0
         sched.report(doc, 0, True)
-    groups = sched.next_chunk()
+    groups = sched.next_chunk(100)
     assert groups == [(0, 1, False)]            # room for one suffix
     sched.report(0, 1, True)                    # limit reached
     assert sched.done()
     assert sched.drain_ready() == [1, 2]
-    assert sched.free_pages == 100
     assert not sched.resident
 
 
 @pytest.mark.parametrize("arena_pages", [None, 400])
 def test_filter_limit_stops_admission_early(arena_pages):
     sched = FilterAdmission([100] * 40, [10], 230, arena_pages, 16, limit=3)
-    chunks = _drive(sched, [[1]] * 40, deliver_lag=0)
+    chunks = _drive(sched, [[1]] * 40, deliver_lag=0, arena_pages=arena_pages)
     assert len(sched.survivors()) >= 3
     assert sum(len(groups) for groups in chunks) < 40
 
@@ -419,39 +429,13 @@ def test_numeric_join_answers_preserve_values_across_chunks():
     np.testing.assert_array_equal(sched.answers[0][0], expected)
 
 
-def test_filter_admission_borrows_from_a_resident_parent():
-    # the stream tests cover borrowing, waiting, and kept parents; these
-    # are the cases a CPU arena cannot reach
-    # a borrow the arena cannot serve packs the whole document instead
+def test_filter_admission_packs_whole_when_the_arena_cannot_serve_a_borrow():
     tree = PrefixTree(order=[0, 1], parent=[None, 0], shared=[0, 32])
     sched = FilterAdmission([64, 64], [10], 200, arena_pages=20,
                             page_tokens=16, tree=tree,
-                            can_borrow=lambda doc, parent: False)
-    assert sched.next_chunk() == [(0, 0, True), (1, 0, True)]
-    assert sched.shared[1] == 0 and sched.resident == {0: 4, 1: 4}
-    assert sched.children_left[0] == 0
-
-    # a kept borrower is rewound to its own tokens: pages_for(32)=2 kept
-    tree = PrefixTree(order=[0, 1], parent=[None, 0], shared=[0, 32])
-    sched = FilterAdmission([64, 64], [10], 200, arena_pages=20,
-                            page_tokens=16, tree=tree, kept_extra_tokens=20)
-    assert sched.next_chunk() == [(0, 0, True), (1, 0, True)]
-    assert sched.resident == {0: 6, 1: 4}          # 84 -> 6, 52 -> 4
-    assert sched.report(1, 0, True, release=False) == ()
-    assert sched.free_pages == 20 - 6 - 2
-
-    # a kept parent freed as its last child enters adds no free pages:
-    # the child still holds the borrowed ones, and the arena frees the
-    # rest only after the chunk is packed
-    tree = PrefixTree(order=[0, 1], parent=[None, 0], shared=[0, 32])
-    sched = FilterAdmission([64, 64], [10], 80, arena_pages=20,
-                            page_tokens=16, tree=tree)
-    assert sched.next_chunk() == [(0, 0, True)]
-    assert sched.report(0, 0, False) == ()
-    assert sched.kept_for_children == {0}
-    assert sched.next_chunk() == [(1, 0, True)]
-    assert sched.take_freed_parents() == [0]
-    assert sched.free_pages == 20 - 4 - 2
+                            can_borrow=lambda doc, parent, same_chunk: False)
+    assert sched.next_chunk(20) == [(0, 0, True), (1, 0, True)]
+    assert sched.borrowing.shared(1) == 0 and sched.own_tokens(1) == 64
 
 
 def _tree_stream(monkeypatch, *, truth, budget, hold=False, retain=(),
@@ -530,7 +514,7 @@ def test_filter_stream_stacks_siblings_under_tree_attention(monkeypatch):
     _run(stream, arena)
     assert stream.answers == {0: [1], 1: [1], 2: [1], 3: [1]}
     assert stream.tokens == 64 + 8 + 8 + 64 + 4
-    assert stream.sched.borrowed_tokens == 64
+    assert stream.sched.borrowing.borrowed_tokens == 64
     assert packed == [[(("r", 0), 0, None), (("r", 1), 32, ("r", 0)),
                        (("r", 3), 32, ("r", 0)), (("r", 2), 0, None)]]
     assert arena.free_pages == 64 and not arena.accounting.owned
@@ -561,7 +545,7 @@ def test_filter_stream_shares_pages_with_a_resident_parent(monkeypatch):
     _run(stream, arena)
     assert stream.answers == {0: [0], 1: [1], 2: [1]}
     assert stream.tokens == 64 + 32 + 64 + 3
-    assert stream.sched.borrowed_tokens == 32
+    assert stream.sched.borrowing.borrowed_tokens == 32
     assert arena.free_pages == 64 and not arena.accounting.owned
 
     # with another document between them the parent has answered
@@ -572,7 +556,7 @@ def test_filter_stream_shares_pages_with_a_resident_parent(monkeypatch):
     _run(stream, arena)
     assert stream.answers == {0: [0], 1: [1], 2: [1]}
     assert stream.tokens == 64 + 64 + 32 + 3
-    assert stream.sched.borrowed_tokens == 32
+    assert stream.sched.borrowing.borrowed_tokens == 32
     assert arena.free_pages == 64 and not arena.accounting.owned
 
     # a limit ends the run with the parent kept: its key is freed
@@ -664,8 +648,8 @@ def test_join_anchors_borrow_a_resident_parents_pages(monkeypatch):
     assert arena.free_pages == 64 and not arena.accounting.owned
 
     # one anchor per chunk, with anchor 2 between parent and child: the
-    # parent has answered and been freed before the child's turn, so
-    # the child packs its whole prefix
+    # parent answers before the child's turn, and its pages stay held
+    # until the child borrows them
     packed.clear()
     arena = cpu_arena(64)
     out, _, tokens = loop.run_join(
@@ -675,6 +659,6 @@ def test_join_anchors_borrow_a_resident_parents_pages(monkeypatch):
         prefix_tree=PrefixTree(order=[0, 2, 1], parent=[None, 0, None],
                                shared=[0, 32, 0]))
     assert out == [{0: [1, 0], 1: [1, 0], 2: [1, 0]}]
-    assert (keys[1], 0, 64) in packed
-    assert stats["borrowed_tokens"] == 0
+    assert (keys[1], 32, 32) in packed
+    assert stats["borrowed_tokens"] == 32
     assert arena.free_pages == 64 and not arena.accounting.owned

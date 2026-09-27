@@ -19,7 +19,11 @@ from quail.backends.quail.executor.attention import (
     ATTENTION_PATHS,
     Chunk,
 )
-from quail.backends.quail.executor.pack import FilterAdmission, JoinAdmission
+from quail.backends.quail.executor.pack import (
+    FilterAdmission,
+    JoinAdmission,
+    partner_pages,
+)
 from quail.progress import Progress, logger, quiet
 
 
@@ -700,11 +704,11 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         # scheduler prices them
         longest = [max((len(s) for s in suffixes), default=0) + len(canvas)
                    for suffixes in stage_suffixes]
-        anchor_source.reserve_pages = max(
-            (arena.page_cost((len(doc) + len(frame)) % arena.page_tokens
-                             + rows, 0)
+        anchor_source.set_reserve(max(
+            (partner_pages(arena.page_cost, arena.page_tokens, len(doc),
+                           len(frame), rows)
              for doc in anchor_source.doc_ids
-             for frame, rows in zip(frames, longest)), default=0)
+             for frame, rows in zip(frames, longest)), default=0))
     def held_pages(key, prefix_tokens):
         # the scheduler prices an anchor at page_cost(prefix + frames)
         # less what it holds; a trimmed window holds fewer sliding
@@ -724,23 +728,6 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
 
     if prefix_tree is not None and not prefix_tree.shared_tokens:
         prefix_tree = None
-    # children not yet admitted, per anchor: an anchor keeps its
-    # sliding-window pages untrimmed while any remain
-    children_left = {}
-    for parent in (prefix_tree.parent if prefix_tree is not None else ()):
-        if parent is not None:
-            children_left[keys[parent]] = children_left.get(keys[parent], 0) + 1
-    untrimmed = set()
-
-    def can_borrow(a, parent, same_chunk):
-        shared = sched.shared[a]
-        if not same_chunk:
-            return arena.can_borrow(keys[parent], shared)
-        # a parent admitted in this chunk is allocated just before the
-        # child; its sliding pages will start below its own shared part
-        own = sched.borrows.get(parent, (None, 0))[1]
-        return arena.origin(own) <= arena.origin(shared)
-
     sched = JoinAdmission(
         [len(p) for p in prefixes],
         [[len(s) for s in sufs] for sufs in stage_suffixes],
@@ -754,8 +741,13 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         canvas_tokens=len(canvas),
         page_cost=arena.page_cost,
         tree=prefix_tree,
-        can_borrow=can_borrow if prefix_tree is not None else None,
     )
+    borrowing = sched.borrowing
+    borrowing.can_borrow = borrow_check(arena, keys, borrowing)
+    # counted after resident anchors detach: they pack no prefix
+    borrowers = borrowing.borrowers()
+    lowest_borrow = lowest_borrows(borrowing)
+    held = [keys[a] for a, n in enumerate(borrowers) if n]
     spans = []
     tokens = 0
     outstanding = []     # (groups, handle) in launch order
@@ -810,13 +802,17 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
             key = keys[a]
             f = len(prefixes[a])
             frame = frames[j]
-            parent, shared = sched.borrows.get(a, (None, 0)) if carried \
-                else (None, 0)
+            parent, shared = ((borrowing.parent(a), borrowing.shared(a))
+                              if carried else (None, 0))
+            fresh = not arena.is_resident(key)
             got = arena.activate(
                 key, f, capacity_tokens=f + frame_max, base_tokens=f,
                 borrow=(keys[parent], shared) if shared else None)
             assert got is not None, \
                 "scheduler admitted an anchor the arena cannot hold"
+            if fresh and a < len(borrowers) and borrowers[a]:
+                arena.hold(key, borrowers[a])
+                arena.keep_window(key, lowest_borrow[a])
             prefix = None
             if carried:
                 prefix = prefixes[a][shared:] if shared else prefixes[a]
@@ -908,13 +904,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         normed = _forward(pipeline, arena, chunk)
         e1.record()
         for key in chunk.fresh_keys:
-            untrimmed.add(key)
-        for key in list(untrimmed):
-            if children_left.get(key):
-                continue
-            untrimmed.discard(key)
-            if arena.is_resident(key):
-                arena.trim_window(key)
+            arena.trim_window(key)
         spans.append((part[0][1], e0, e1))
         outstanding.append((part, async_ans.submit(normed)))
         # read the previous chunk's answers while this one runs
@@ -935,10 +925,6 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
             # retained KV nothing here reads makes room
             arena.evict_retained(sched.blocked_pages)
         groups = sched.next_chunk(arena.free_pages)
-        for a, j, start, _end, carried in groups:
-            parent = prefix_tree.parent[a] if prefix_tree is not None else None
-            if carried and start == 0 and parent is not None:
-                children_left[keys[parent]] -= 1
         if not groups:
             if outstanding:
                 report(outstanding.pop(0))
@@ -947,13 +933,26 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
                 # the source has to move; it may evict retained KV to admit
                 if pull(evict_retained=True, force=True):
                     continue
+            if sched.blocked_pages and arena.evict_retained(sched.blocked_pages):
+                continue
+            # parents freed but held for queued children hold the
+            # pages: the children pack their whole prefixes
+            if arena.drop_holds(held):
+                continue
             raise AssertionError("nothing buildable and nothing in flight")
         run_part(groups)
+        # the packed children hold their parents' pages now
+        for a, _, start, _, carried in groups:
+            parent = (borrowing.tree_parent[a]
+                      if a < len(borrowing.tree_parent) else None)
+            if carried and start == 0 and parent is not None:
+                arena.release(keys[parent])
     while outstanding:
         report(outstanding.pop(0))
     progress.finish(f"{label} done", f"{tokens:,} fresh tokens")
+    arena.drop_holds(held)
     if stats is not None:
-        stats["borrowed_tokens"] = sched.borrowed_tokens
+        stats["borrowed_tokens"] = borrowing.borrowed_tokens
     return sched.answers, spans, tokens
 
 
@@ -1166,6 +1165,31 @@ def _shared_preamble_tokens(question_ids):
     return p
 
 
+def borrow_check(arena, keys, borrowing):
+    """can_borrow for Borrowing: whether the arena can serve a borrow.
+
+    A parent admitted in the same chunk is not allocated yet; its
+    sliding pages will start at the window origin below the tokens it
+    borrows itself.
+    """
+    def can_borrow(doc, parent, same_chunk):
+        shared = borrowing.tree_shared[doc]
+        if not same_chunk:
+            return arena.can_borrow(keys[parent], shared)
+        return arena.origin(borrowing.shared(parent)) <= arena.origin(shared)
+    return can_borrow
+
+
+def lowest_borrows(borrowing):
+    """Per document, the fewest tokens any of its borrowers shares."""
+    lowest = {}
+    for doc, parent in enumerate(borrowing.tree_parent):
+        if parent is not None:
+            shared = borrowing.tree_shared[doc]
+            lowest[parent] = min(lowest.get(parent, shared), shared)
+    return lowest
+
+
 class FilterStream:
     """The filter chain, one chunk per next() call.
 
@@ -1271,16 +1295,16 @@ class FilterStream:
                          else None),
             page_tokens=arena.page_tokens,
             kept_extra_tokens=capacity_extra, limit=limit,
-            available_pages=(arena.free_pages
-                             if arena_writes else None),
-            page_cost=arena.page_cost, tree=prefix_tree,
-            can_borrow=self._can_borrow)
+            page_cost=arena.page_cost, tree=prefix_tree)
+        borrowing = self.sched.borrowing
+        borrowing.can_borrow = borrow_check(arena, keys, borrowing)
         self.tree = prefix_tree
         # a document's place in tree order, for chunk order under
         # tree attention
         self.tree_position = ({doc: i for i, doc in enumerate(prefix_tree.order)}
                               if prefix_tree is not None else {})
-        self.untrimmed = set()   # fresh docs whose children still borrow
+        self.borrowers = borrowing.borrowers()
+        self.lowest_borrow = lowest_borrows(borrowing)
         # pages a join consumer needs free to run its held survivors
         self.reserve_pages = 0
         self.torch = torch
@@ -1315,29 +1339,15 @@ class FilterStream:
         """Per document, its 0/1 answers up to the first FALSE."""
         return self.sched.answers
 
-    def _can_borrow(self, doc, parent) -> bool:
-        """Whether the arena can serve doc's borrow from parent.
-
-        A parent admitted in the same chunk is not allocated yet; its
-        sliding pages will start at the window origin below its own
-        shared tokens.
-        """
-        shared = self.sched.shared[doc]
-        key = self.keys[parent]
-        if self.arena.is_resident(key):
-            return self.arena.can_borrow(key, shared)
-        return (self.arena.origin(self.sched.shared[parent])
-                <= self.arena.origin(shared))
-
     def _spec(self, doc, stage, fresh):
         if fresh:
-            # the scheduler's shared tokens: 0 once the parent has left
-            shared = self.sched.shared[doc]
+            borrowing = self.sched.borrowing
+            shared = borrowing.shared(doc)
             prefix = self.doc_ids[doc]
             read_key = None
             if shared:
                 prefix = prefix[shared:]
-                read_key = self.keys[self.sched.parent[doc]]
+                read_key = self.keys[borrowing.parent(doc)]
             return dict(key=self.keys[doc], prefix=prefix, start=shared,
                         read_key=read_key,
                         f=len(self.doc_ids[doc]), suffixes=[self.tails[0]],
@@ -1345,6 +1355,41 @@ class FilterStream:
         return dict(key=self.keys[doc], prefix=None,
                     f=len(self.doc_ids[doc]) + self.preamble,
                     suffixes=[self.tails[stage]])
+
+    def set_reserve(self, pages):
+        """Leave `pages` free for a join consumer's partner rows.
+
+        Raises:
+            ValueError: A document and its extra rows do not fit beside
+                the reserve.
+        """
+        for doc, ids in enumerate(self.doc_ids):
+            if (self.arena.page_cost(len(ids) + self.capacity_extra) + pages
+                    > self.arena.n_pages):
+                raise ValueError(
+                    f"document {doc} needs more pages than the arena "
+                    f"holds beside the join's {pages} pages of partner rows")
+        self.reserve_pages = pages
+
+    def _activate(self, doc):
+        """Allocate a fresh document's pages, borrowing as admission chose.
+
+        A document with borrowers is held for each of them, and keeps
+        the sliding rows the lowest of them reads.
+        """
+        borrowing = self.sched.borrowing
+        key = self.keys[doc]
+        shared = borrowing.shared(doc)
+        got = self.arena.activate(
+            key, len(self.doc_ids[doc]) + self.preamble,
+            capacity_tokens=len(self.doc_ids[doc]) + self.capacity_extra,
+            base_tokens=len(self.doc_ids[doc]),
+            borrow=((self.keys[borrowing.parent(doc)], shared)
+                    if shared else None))
+        assert got is not None, "scheduler admitted a doc the arena cannot hold"
+        if self.borrowers[doc]:
+            self.arena.hold(key, self.borrowers[doc])
+            self.arena.keep_window(key, self.lowest_borrow[doc])
 
     def _report(self, entry, items):
         timing = self.timing
@@ -1363,14 +1408,8 @@ class FilterStream:
             for d in self.sched.report(doc, stage, passed,
                                        release=not (keep or hold)):
                 self.arena.free_key(self.keys[d])
-            if (keep or hold) and doc in self.untrimmed:
-                # no child borrows a window from a document that left
-                self.untrimmed.discard(doc)
-                self.arena.trim_window(self.keys[doc])
             if keep:
-                freed = self.arena.retain(self.keys[doc],
-                                          len(self.doc_ids[doc]))
-                self.sched.add_free_pages(freed)
+                self.arena.retain(self.keys[doc], len(self.doc_ids[doc]))
             if hold:
                 items.append((self.keys[doc], self.doc_ids[doc]))
             if not passed or last:
@@ -1386,8 +1425,9 @@ class FilterStream:
             self._report(self.outstanding.pop(0), items)
         for doc in self.sched.drain_ready():
             self.arena.free_key(self.keys[doc])
-        for doc in self.sched.free_kept_parents():
-            self.arena.free_key(self.keys[doc])
+        # a limit can end the run with borrowers never admitted
+        self.arena.drop_holds([self.keys[doc] for doc, n
+                               in enumerate(self.borrowers) if n])
         self.progress.finish(
             f"filter ({len(self.tails)} stages) done",
             f"{self.tokens:,} fresh tokens")
@@ -1413,13 +1453,10 @@ class FilterStream:
             if sched.done():
                 self._finish(items)
                 return items, False
-            if self.arena_writes:
-                # the arena is the truth: a join consumer frees and
-                # claims pages between chunks, and a borrowed page goes
-                # free only with its last holder
-                sched.free_pages = max(0, arena.free_pages - self.reserve_pages)
+            free = (max(0, arena.free_pages - self.reserve_pages)
+                    if self.arena_writes else None)
             t = time.perf_counter() if timing is not None else 0.0
-            groups = sched.next_chunk()
+            groups = sched.next_chunk(free)
             t = _tick(timing, "next_chunk", t)
             if groups:
                 break
@@ -1427,24 +1464,18 @@ class FilterStream:
                 self._report(self.outstanding.pop(0), items)
                 continue
             if sched.blocked_pages and (evict_retained or not self.hold):
-                before = arena.free_pages
-                arena.evict_retained(sched.blocked_pages)
-                freed = arena.free_pages - before
-                if freed:
-                    if not self.hold:
-                        sched.add_free_pages(freed)
+                if arena.evict_retained(sched.blocked_pages):
                     continue
-            # a consumer that asks to evict can free nothing itself, so
-            # kept parents go before the chain reports blocked
-            if self.hold and sched.blocked_pages and not (
-                    evict_retained and sched.kept_for_children):
+            if self.hold and sched.blocked_pages and not evict_retained:
+                # the consumer frees pages before asking to evict
                 return items, True
-            if sched.kept_for_children:
-                # kept parents hold the pages: their children compute
-                # their whole documents instead
-                for doc in sched.free_kept_parents():
-                    arena.free_key(self.keys[doc])
+            # parents freed but held for queued children hold the
+            # pages: the children compute their whole documents
+            if arena.drop_holds([self.keys[doc] for doc, n
+                                 in enumerate(self.borrowers) if n]):
                 continue
+            if self.hold and sched.blocked_pages:
+                return items, True
             raise AssertionError("nothing buildable and nothing in flight")
         if self.tree is not None and self.attention_mode != "unified":
             # siblings back to back read their parent's pages once; a
@@ -1453,34 +1484,26 @@ class FilterStream:
                 doc, _, fresh = group
                 if not fresh:
                     return (False, -1, 0)
-                parent = sched.parent[doc]
+                parent = sched.borrowing.parent(doc)
                 return (True, self.tree_position[
-                    doc if parent is None else parent], sched.shared[doc])
+                    doc if parent is None else parent],
+                    sched.borrowing.shared(doc))
             groups.sort(key=borrow_order)
-        for doc, stage, fresh in groups:
-            if fresh and self.arena_writes:
-                logical = len(self.doc_ids[doc]) + self.preamble
-                shared = sched.shared[doc]
-                got = arena.activate(
-                    self.keys[doc], logical,
-                    capacity_tokens=len(self.doc_ids[doc])
-                    + self.capacity_extra,
-                    base_tokens=len(self.doc_ids[doc]),
-                    borrow=((self.keys[sched.parent[doc]], shared)
-                            if shared else None))
-                assert got is not None, \
-                    "scheduler admitted a doc the arena cannot hold"
+        fresh_docs = [doc for doc, _, fresh in groups if fresh]
+        if self.arena_writes:
+            for doc in fresh_docs:
+                self._activate(doc)
         t = _tick(timing, "alloc", t)
         chunk = pack_chunk(self.torch, arena,
                            [self._spec(*g) for g in groups],
                            timing=timing, pinned=self.pinned,
                            attention_mode=self.attention_mode,
                            canvas=self.canvas, answer_row=self.answer_row)
-        # a kept parent whose last child was just admitted: the
-        # children hold its pages, the chunk holds its block table
-        for doc in sched.take_freed_parents():
-            self.untrimmed.discard(doc)
-            arena.free_key(self.keys[doc])
+        # the packed children hold their parents' pages now
+        for doc in fresh_docs:
+            parent = sched.borrowing.tree_parent[doc]
+            if parent is not None:
+                arena.release(self.keys[parent])
         t = _tick(timing, "pack", t)
         self.tokens += chunk.tokens
         torch = self.torch
@@ -1490,16 +1513,10 @@ class FilterStream:
         normed = _forward(self.pipeline, arena, chunk)
         e1.record()
         # a fresh document's sliding pages before its window origin
-        # were for this pass only, unless a child still has to borrow
-        # the window below its shared tokens
+        # were for this pass only, except rows a borrower reads
         if self.arena_writes:
-            self.untrimmed.update(doc for doc, _, fresh in groups if fresh)
-            for doc in list(self.untrimmed):
-                if sched.children_left[doc]:
-                    continue
-                self.untrimmed.discard(doc)
-                if doc in sched.resident:
-                    sched.trim(doc, arena.trim_window(self.keys[doc]))
+            for doc in fresh_docs:
+                arena.trim_window(self.keys[doc])
         t = _tick(timing, "forward_launch", t)
         self.spans.append((0, e0, e1))
         self.outstanding.append((groups, self.async_ans.submit(normed)))
@@ -1536,5 +1553,5 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
     while not stream.done:
         stream.next()
     if stats is not None:
-        stats["borrowed_tokens"] = stream.sched.borrowed_tokens
+        stats["borrowed_tokens"] = stream.sched.borrowing.borrowed_tokens
     return stream.answers, stream.spans, stream.tokens

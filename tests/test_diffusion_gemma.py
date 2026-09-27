@@ -108,7 +108,7 @@ def test_filter_stream_charges_canvas_rows():
         200, arena_writes=False, arena_keys=[("d", 0)])
     assert stream.arena_writes
     assert arena.retention_cap_pages == 8
-    assert stream.sched.free_pages is not None
+    assert stream.sched.pages
 
 
 def test_pack_chunk_appends_canvas_rows_after_each_suffix(monkeypatch):

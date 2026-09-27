@@ -361,19 +361,37 @@ def _join_answers(anchors, frame, partners, tail):
     return answers
 
 
-def check_join(anchors, frame, partners, setup):
-    """Run a join and check its answers and its KV reads."""
+def check_join(anchors, frame, partners, setup, retain=False):
+    """Run a join and check its answers and its KV reads.
+
+    With retain, each finished anchor's KV stays in the arena as
+    evictable, as a join that keeps its anchors' KV for a later
+    operator leaves it, and fresh anchors evict it for pages.
+    """
     tail = list(setup.canvas)
     answers = _join_answers(anchors, frame, partners, tail)
     run = Run(setup, answers)
-    out, _, _ = loop.run_join(
+    keys = [("a", i) for i in range(len(anchors))]
+    if retain:
+        run.arena.retention_cap_pages = setup.pages
+    rows = {}
+
+    def anchor_done(a, row):
+        rows[a] = list(row)
+        if retain:
+            run.arena.retain(keys[a], len(anchors[a]))
+        else:
+            run.arena.free_key(keys[a])
+
+    loop.run_join(
         run.torch, run.arena, run.pipeline, passthrough(), anchors,
-        [partners], setup.budget, stage_frames=[frame],
-        anchor_keys=[("a", i) for i in range(len(anchors))],
-        attention_mode=setup.path, prefix_tree=run.tree(anchors))
+        [partners], setup.budget, stage_frames=[frame], anchor_keys=keys,
+        anchor_done=anchor_done, attention_mode=setup.path,
+        prefix_tree=run.tree(anchors))
     for a, anchor in enumerate(anchors):
-        assert out[0][a] == [answers[chain(anchor + frame + p + tail)]
-                             for p in partners], f"anchor {a}"
+        assert rows[a] == [answers[chain(anchor + frame + p + tail)]
+                           for p in partners], f"anchor {a}"
+    run.arena.evict_retained(setup.pages)
     assert not run.arena.accounting.owned
 
 

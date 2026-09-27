@@ -91,11 +91,12 @@ def test_small_filters(arena_kind, seed):
     check_filter(docs, questions(rng), setup)
 
 
+@pytest.mark.parametrize("retain", [False, True], ids=["free", "retain"])
 @pytest.mark.parametrize("seed", range(6))
-def test_small_joins(arena_kind, seed):
+def test_small_joins(arena_kind, seed, retain):
     rng = random.Random(100 + seed)
     docs, setup = small(rng, arena_kind, 30, (60, 400), (40, 80))
-    check_join(docs, *join_parts(), setup)
+    check_join(docs, *join_parts(), setup, retain=retain)
 
 
 @pytest.mark.parametrize("seed", range(6))
@@ -112,11 +113,12 @@ def test_large_filters(arena_kind, seed):
     check_filter(docs, questions(rng), setup)
 
 
+@pytest.mark.parametrize("retain", [False, True], ids=["free", "retain"])
 @pytest.mark.parametrize("seed", range(2))
-def test_large_joins(arena_kind, seed):
+def test_large_joins(arena_kind, seed, retain):
     rng = random.Random(400 + seed)
     docs, setup = large(rng, arena_kind)
-    check_join(docs, *join_parts(), setup)
+    check_join(docs, *join_parts(), setup, retain=retain)
 
 
 @pytest.mark.parametrize("seed", range(2))

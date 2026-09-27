@@ -52,6 +52,9 @@ def bare_arena(arena, pages):
     arena._sliding_rows = {}
     arena._base = {}
     arena._sliding_start = {}
+    arena._holds = {}
+    arena._deferred = set()
+    arena._window_floor = {}
     arena._refresh_rows = lambda *args: None
     arena.reset_stats()
     return arena
