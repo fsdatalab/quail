@@ -11,9 +11,9 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from quail.cost.budgets import PAGE_TOKENS, choose_attention_path
+from quail.cost.budgets import choose_attention_path
 from quail.physical import AiFilter, AiJoin, PhysicalGraph
-from quail.planner.prefixes import document_shared_tokens, page_tree
+from quail.planner.prefixes import page_tree
 
 
 def _token_store(document_tokens):
@@ -21,10 +21,9 @@ def _token_store(document_tokens):
     return getattr(document_tokens, "_store", None)
 
 
-def page_aligned_shared_tokens(store, page_tokens: int = PAGE_TOKENS) -> int:
+def page_aligned_shared_tokens(store) -> int:
     """Tokens a prefix tree over the store saves in whole KV pages."""
-    return sum(shared // page_tokens * page_tokens
-               for shared in document_shared_tokens(store))
+    return page_tree(store).shared_tokens
 
 
 def filter_attention(model, device, store, lengths, question_tokens: int) -> str:

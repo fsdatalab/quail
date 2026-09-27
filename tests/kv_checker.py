@@ -422,3 +422,43 @@ def check_feed(docs, question, frame, partners, setup):
         assert out[0][a] == [answers[chain(doc + frame + p + tail)]
                              for p in partners], f"anchor {key[1]}"
     assert not run.arena.accounting.owned
+
+
+def check_join_after_join(anchors, frame, partners, setup):
+    """Run a join that retains its anchors, then a join over more anchors.
+
+    The second join's fresh anchors may share a prefix with a retained
+    one, which has trimmed its sliding window; its KV reads are checked
+    like any other.
+    """
+    tail = list(setup.canvas)
+    answers = _join_answers(anchors, frame, partners, tail)
+    run = Run(setup, answers)
+    run.arena.retention_cap_pages = setup.pages
+    keys = [("a", i) for i in range(len(anchors))]
+    first = anchors[:1]
+
+    def retain(a, row):
+        run.arena.retain(keys[a], len(anchors[a]))
+
+    loop.run_join(
+        run.torch, run.arena, run.pipeline, passthrough(), first,
+        [partners], setup.budget, stage_frames=[frame], anchor_keys=keys[:1],
+        anchor_done=retain, attention_mode=setup.path,
+        prefix_tree=run.tree(first))
+    assert run.arena.is_resident(keys[0])
+    rows = {}
+
+    def free(a, row):
+        rows[a] = list(row)
+        run.arena.free_key(keys[a])
+
+    loop.run_join(
+        run.torch, run.arena, run.pipeline, passthrough(), anchors,
+        [partners], setup.budget, stage_frames=[frame], anchor_keys=keys,
+        anchor_done=free, attention_mode=setup.path,
+        prefix_tree=run.tree(anchors))
+    for a, anchor in enumerate(anchors):
+        assert rows[a] == [answers[chain(anchor + frame + p + tail)]
+                           for p in partners], f"anchor {a}"
+    assert not run.arena.accounting.owned

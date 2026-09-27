@@ -157,7 +157,6 @@ class PageArena:
         self.pinned.discard(key)
         prefix_tokens = self.tokens[key]
         self._forget_retained(key)
-        self.retained[key] = prefix_tokens
         # the pages evicting the key would free: those it alone holds
         # now; a child freed later leaves more, so the count is a
         # lower bound, and admission short of pages evicts anyway
@@ -362,6 +361,7 @@ class KVArena:
         self._holds = {}      # key -> queued keys that will borrow from it
         self._deferred = set()    # held keys freed by their operator
         self._window_floor = {}   # key -> lowest sliding row a borrower reads
+        self._trimmed = set()     # keys past their own pass's trim_window
 
     def resize(self, n_pages: int, n_sliding_pages: int = 0, *,
                free_resident: bool = False) -> None:
@@ -420,6 +420,7 @@ class KVArena:
         """
         if self.sliding is None:
             return 0
+        self._trimmed.add(key)
         origin = min(self.origin(self._base[key]),
                      self._window_floor.get(key, self._base[key]))
         start = self._sliding_start[key]
@@ -432,6 +433,15 @@ class KVArena:
         self._sliding_start[key] = origin
         self._refresh_rows(key)
         return self.free_pages - before
+
+    def _lift_floor(self, key) -> None:
+        """The last borrower is admitted: rows kept for it may go.
+
+        A key that already trimmed for its own pass trims again; one
+        still to run trims after that pass.
+        """
+        if self._window_floor.pop(key, None) is not None and key in self._trimmed:
+            self.trim_window(key)
 
     # ---- allocation ----------------------------------------------------
 
@@ -674,6 +684,8 @@ class KVArena:
             if key in self._deferred:
                 self._deferred.discard(key)
                 self.free_key(key)
+            else:
+                self._lift_floor(key)
 
     def drop_holds(self, keys=None) -> bool:
         """Release every hold on the keys (all keys by default).
@@ -689,6 +701,8 @@ class KVArena:
             if key in self._deferred:
                 self._deferred.discard(key)
                 self.free_key(key)
+            else:
+                self._lift_floor(key)
         return bool(keys)
 
     def free_key(self, key):
@@ -700,6 +714,7 @@ class KVArena:
             self._deferred.add(key)
             return 0
         self._window_floor.pop(key, None)
+        self._trimmed.discard(key)
         self._rows.pop(key)
         self._capacity_rows.pop(key)
         self._sliding_rows.pop(key, None)

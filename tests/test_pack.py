@@ -662,3 +662,26 @@ def test_join_anchors_borrow_a_resident_parents_pages(monkeypatch):
     assert (keys[1], 32, 32) in packed
     assert stats["borrowed_tokens"] == 32
     assert arena.free_pages == 64 and not arena.accounting.owned
+
+
+def test_join_child_of_an_anchor_with_no_partners_packs_whole():
+    # anchor 0 has no partner at stage 0, so it settles without a
+    # chunk; anchor 1 borrows from it in the tree and cannot wait for it
+    tree = PrefixTree(order=[0, 1], parent=[None, 0], shared=[0, 16])
+    sched = JoinAdmission([40, 40], [[10]], 512, 64, 16,
+                          anchor_partners={0: [[]], 1: [[0]]}, tree=tree)
+    assert sched.take_settled() == [("finished", 0)]
+    assert sched.next_chunk(free_pages=64) == [(1, 0, 0, 1, True)]
+    assert sched.borrowing.shared(1) == 0
+    assert sched.report(1, 0, 0, 1, [1]) == [("finished", 1)]
+    assert sched.done()
+
+
+def test_join_admission_gate_counts_a_borrowers_own_tokens():
+    # anchor 1 shares 80 of its 100 tokens with anchor 0: after anchor
+    # 0 packs 100 + 10 tokens, the 40 left hold anchor 1's 20 + 10
+    tree = PrefixTree(order=[0, 1], parent=[None, 0], shared=[0, 80])
+    sched = JoinAdmission([100, 100], [[10]], 150, 64, 16, tree=tree)
+    groups = sched.next_chunk(free_pages=64)
+    assert [g[0] for g in groups] == [0, 1]
+    assert sched.borrowing.shared(1) == 80

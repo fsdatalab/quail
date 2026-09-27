@@ -55,6 +55,7 @@ def bare_arena(arena, pages):
     arena._holds = {}
     arena._deferred = set()
     arena._window_floor = {}
+    arena._trimmed = set()
     arena._refresh_rows = lambda *args: None
     arena.reset_stats()
     return arena

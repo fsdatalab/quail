@@ -578,7 +578,7 @@ def prefix_tree(documents, page_tokens: int) -> PrefixTree:
             # a document computes at least its last token, so a
             # duplicate still packs a prefix of its own
             lcp = min(common(arrays[previous], arrays[index]),
-                      len(arrays[index]) - 1)
+                      max(len(arrays[index]) - 1, 0))
             pages = lcp // page_tokens * page_tokens
             if pages:
                 # climb while the ancestor borrowed these pages too

@@ -130,6 +130,38 @@ def test_a_held_key_waits_for_its_borrowers():
     assert arena.free_pages == 64
 
 
+def test_the_window_floor_lifts_with_the_last_hold():
+    arena = cpu_arena(pages=64, sliding_pages=32)
+    parent, child = ("d", 0), ("d", 1)
+    arena.activate(parent, 100, capacity_tokens=110, base_tokens=100)
+    arena.hold(parent, 1)
+    arena.keep_window(parent, 48)
+    arena.trim_window(parent)
+    assert arena.sliding_start(parent) == 16
+    arena.activate(child, 60, capacity_tokens=70, base_tokens=60,
+                   borrow=(parent, 48))
+    borrowed = arena.owned_sliding_pages(child)[:2]
+    # the last borrower is in: the parent keeps only its own window
+    arena.release(parent)
+    assert arena.is_resident(parent)
+    assert arena.sliding_start(parent) == 64
+    assert arena.owned_sliding_pages(child)[:2] == borrowed
+    arena.free_key(child)
+    arena.free_key(parent)
+    assert arena.free_pages == 64
+
+    # a key still to run its pass trims after it, without the floor
+    arena.activate(parent, 100, capacity_tokens=110, base_tokens=100)
+    arena.hold(parent, 2)
+    arena.keep_window(parent, 48)
+    assert arena.drop_holds([parent])
+    assert arena.sliding_start(parent) == 0
+    arena.trim_window(parent)
+    assert arena.sliding_start(parent) == 64
+    arena.free_key(parent)
+    assert arena.free_pages == 64
+
+
 def test_pack_chunk_builds_both_pools(monkeypatch):
     cpu_staging(monkeypatch)
     arena = cpu_arena(pages=64, sliding_pages=32)

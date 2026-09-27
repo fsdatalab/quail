@@ -1168,13 +1168,15 @@ def _shared_preamble_tokens(question_ids):
 def borrow_check(arena, keys, borrowing):
     """can_borrow for Borrowing: whether the arena can serve a borrow.
 
-    A parent admitted in the same chunk is not allocated yet; its
-    sliding pages will start at the window origin below the tokens it
-    borrows itself.
+    A fresh parent admitted in the same chunk is not allocated yet;
+    its sliding pages will start at the window origin below the tokens
+    it borrows itself. A parent already resident, admitted in this
+    chunk or earlier, has the pages it has: it may have trimmed its
+    window in an earlier query.
     """
     def can_borrow(doc, parent, same_chunk):
         shared = borrowing.tree_shared[doc]
-        if not same_chunk:
+        if not same_chunk or arena.is_resident(keys[parent]):
             return arena.can_borrow(keys[parent], shared)
         return arena.origin(borrowing.shared(parent)) <= arena.origin(shared)
     return can_borrow

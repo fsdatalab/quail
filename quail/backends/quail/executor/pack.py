@@ -136,8 +136,8 @@ class Borrowing:
     while the parent is still queued, borrow the parent's first shared
     tokens, or pack the whole document when the arena cannot serve the
     borrow (the parent has left, or trimmed its window below the
-    shared tokens). record() keeps the choice. Filter and join
-    admission both use it.
+    shared tokens) or the parent never runs (see skip()). record()
+    keeps the choice. Filter and join admission both use it.
 
     Args:
         n: Documents.
@@ -154,6 +154,7 @@ class Borrowing:
         self.tree_shared = [0] * n if tree is None else list(tree.shared)
         self.can_borrow = can_borrow
         self.admitted = set()
+        self.skipped = set()       # documents that never run a chunk
         self.chosen = {}           # admitted borrower -> (parent, shared)
         self.borrowed_tokens = 0   # prefix tokens read from a parent
 
@@ -168,6 +169,10 @@ class Borrowing:
         self.tree_parent[doc] = None
         self.tree_shared[doc] = 0
 
+    def skip(self, doc):
+        """The document never runs a chunk, so its borrowers pack whole."""
+        self.skipped.add(doc)
+
     def borrowers(self):
         """Per document, how many documents the tree has borrow from it."""
         counts = [0] * len(self.tree_parent)
@@ -179,7 +184,7 @@ class Borrowing:
     def decide(self, doc, chunk):
         """WAIT, None to pack the whole document, or (parent, shared)."""
         parent = self.tree_parent[doc]
-        if parent is None:
+        if parent is None or parent in self.skipped:
             return None
         if parent not in self.admitted:
             return self.WAIT
@@ -383,6 +388,7 @@ class JoinAdmission:
             self._first.append(0)
             self._stage[a] = _DONE
             self._settled.append(("finished" if k == 1 else "dropped", a))
+            self.borrowing.skip(a)
             return a
         first = self.frame_rows[0] + self._suffix(a, 0, 0)
         if resident_pages is None and prefix + first > self.chunk_budget:
@@ -401,7 +407,11 @@ class JoinAdmission:
                 raise ValueError("anchor and one suffix exceed the KV arena")
             self._page_reserve = max(self._page_reserve, largest)
         self._first.append(first)
-        self._min_fresh = min(self._min_fresh, carried + first)
+        # the fewest tokens any fresh anchor can pack: a borrower
+        # packs only the tokens past its shared prefix
+        tree_shared = self.borrowing.tree_shared
+        shared = tree_shared[a] if a < len(tree_shared) else 0
+        self._min_fresh = min(self._min_fresh, max(0, carried - shared) + first)
         if not need:
             self._zero_cost += 1
         return a

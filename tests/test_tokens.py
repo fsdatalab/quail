@@ -89,6 +89,10 @@ def test_prefix_tree_borrows_whole_pages_from_the_predecessor():
     assert all(parent is None or parents_first[parent] < parents_first[index]
                for index, parent in enumerate(tree.parent))
     assert prefix_tree([], 16).shared_tokens == 0
+    # an empty document has no last token to compute, and shares nothing
+    tree = prefix_tree([[], [], [5] * 16 + [6]], 16)
+    assert tree.parent == [None, None, None]
+    assert tree.shared == [0, 0, 0]
 
 
 def test_prefix_tree_siblings_share_one_parent():

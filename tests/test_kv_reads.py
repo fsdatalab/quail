@@ -10,7 +10,13 @@ import random
 
 import pytest
 from fakes import cpu_staging
-from kv_checker import Setup, check_feed, check_filter, check_join
+from kv_checker import (
+    Setup,
+    check_feed,
+    check_filter,
+    check_join,
+    check_join_after_join,
+)
 
 pytest.importorskip("torch")
 
@@ -126,3 +132,18 @@ def test_large_filters_feeding_joins(arena_kind, seed):
     rng = random.Random(500 + seed)
     docs, setup = large(rng, arena_kind)
     check_feed(docs, [90, 91, 92], *join_parts(), setup)
+
+
+def test_join_borrows_from_a_retained_anchor_of_an_earlier_join(arena_kind):
+    """A retained anchor trimmed its window; a child shares its first page.
+
+    On a sliding arena the child cannot borrow rows the anchor dropped,
+    so it packs whole; elsewhere it borrows the page.
+    """
+    path, sliding, canvas = arena_kind
+    parent = [1] * 64                  # four pages, two of them the window
+    child = [1] * 16 + [3] * 5
+    setup = Setup(path=path, window=32 if sliding else None,
+                  canvas=(99,) if canvas else (), pages=12,
+                  sliding_pages=12, budget=200, page_tokens=16)
+    check_join_after_join([parent, child], *join_parts(), setup)
