@@ -128,7 +128,7 @@ def progress_plot(summaries, names, out, notable=0.05):
     A Quail step is labeled when it changes end-to-end or query seconds
     by more than `notable` of the previous step's value; the label adds
     the answer agreement when the step moves it by 2 points or more.
-    The y-axis turns logarithmic when the values span more than 10x.
+    The y-axis turns logarithmic when the values span more than 4x.
     """
     quail = [n for n in names if summaries[n]["backend"] == "quail"]
     dates = [when(summaries[n]) for n in quail]
@@ -171,9 +171,14 @@ def progress_plot(summaries, names, out, notable=0.05):
                     fontsize=8, color=ORANGE, va="top")
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %-d"))
     everything = [sum(seconds(summaries[n])) for n in names] + list(query)
-    if max(everything) / min(everything) > 10:
+    if max(everything) / min(everything) > 4:
         ax.set_yscale("log")
         ax.set_ylabel("seconds (log scale)")
+        ticks = [t for t in (500, 700, 1000, 2000, 3000, 5000, 7000, 10000,
+                             20000) if min(everything) * 0.8 <= t
+                 <= max(everything) * 1.25]
+        ax.set_yticks(ticks, [f"{t:,}" for t in ticks])
+        ax.yaxis.set_minor_locator(plt.NullLocator())
     else:
         ax.set_ylabel("seconds")
         ax.set_ylim(bottom=0)
@@ -208,10 +213,13 @@ def time_plot(summaries, names, out):
     today = summaries.get("gigatoken")
     if baseline and today and "gigatoken" in names:
         speedup = seconds(baseline)[0] / seconds(today)[0]
-        top = sum(seconds(today))
-        ax.text(names.index("gigatoken"), top * 1.35,
-                f"query {speedup:.1f}x\nfaster than\nvLLM + Gigatoken",
-                ha="center", va="bottom", fontsize=8.5, color=DARK)
+        quail = [i for i, n in enumerate(names)
+                 if summaries[n]["backend"] == "quail"]
+        tallest = max(query[i] + startup[i] for i in quail)
+        ax.text((quail[0] + quail[-1]) / 2, tallest * 2.2,
+                f"Quail today: {speedup:.1f}x less query time than "
+                f"pipelined vLLM + Gigatoken",
+                ha="center", va="bottom", fontsize=9.5, color=DARK)
     fig.savefig(out, dpi=300)
     plt.close(fig)
 
