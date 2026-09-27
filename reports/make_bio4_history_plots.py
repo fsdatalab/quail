@@ -201,12 +201,12 @@ def quail_plot(summaries, names, out):
     startup = np.array([seconds(r)[1] for r in rows])
     query_steps = steps_over(query, 0.03)
     startup_steps = steps_over(startup, 0.15)
-    fig = plt.figure(figsize=(12, 8))
+    fig = plt.figure(figsize=(12, 6.4))
     fig.set_layout_engine("none")
-    top = fig.add_axes((0.07, 0.34, 0.78, 0.58))
-    low = fig.add_axes((0.07, 0.06, 0.78, 0.18))
-    stop = t[-1] + 2.5
-    date_axis(low, t[0] - 3, stop)
+    top = fig.add_axes((0.06, 0.34, 0.82, 0.6))
+    low = fig.add_axes((0.06, 0.07, 0.82, 0.17))
+    stop = t[-1] + 2
+    date_axis(low, t[0] - 0.8, stop)
     top.set_xlim(low.get_xlim())
     top.set_xticks([])
     # the first row is the first engine with vLLM's kernels, on the date
@@ -214,19 +214,21 @@ def quail_plot(summaries, names, out):
     step_line(top, t, query, stop, BLUE, first_apart=True)
     step_line(low, t, startup, stop, DARK, first_apart=True)
 
+    # the names sit in the empty band above every row but the first
     bottom = 20 * np.floor(query.min() / 20 - 1)
-    rail = query.max() + 0.04 * (query.max() - bottom)
+    rail = query[1:].max() + 0.08 * (query[1:].max() - bottom)
     top.set_ylim(bottom, rail)
     texts, weights = [], []
     for i, row in enumerate(rows):
         pr = row.get("pull_request")
-        texts.append(SHORT[row["name"]] + (f" #{pr}" if pr else ""))
+        value = f" ({query[0]:,.0f} s)" if i == 0 else ""
+        texts.append(SHORT[row["name"]] + (f" #{pr}" if pr else "") + value)
         marked = i in query_steps or i in startup_steps
         weights.append("bold" if marked else "normal")
     tallest = rail_labels(top, list(zip(t, query)), texts, rail, weights)
     height_in = top.get_position().height * fig.get_figheight()
     span = (rail - bottom) * height_in / (height_in - tallest - 0.05)
-    top.set_ylim(bottom, bottom + span)
+    top.set_ylim(bottom, max(bottom + span, query.max() + 10))
     top.set_yticks(np.arange(100 * np.ceil(bottom / 100), query.max(), 100))
     low.set_ylim(0, startup.max() * 1.12)
     low.set_yticks(np.arange(0, startup.max(), 20))
@@ -238,14 +240,13 @@ def quail_plot(summaries, names, out):
                               (low, startup, startup_steps)):
         for i, step in steps.items():
             middle = (values[i] + values[i - 1]) / 2
-            ax.annotate(signed(step), (t[i], middle), xytext=(6, 0),
+            if t[i] == t[i - 1]:
+                # same date: the label goes beside the earlier point
+                middle = values[i - 1]
+            ax.annotate(signed(step), (t[i], middle), xytext=(8, 0),
                         textcoords="offset points", ha="left", va="center",
                         fontsize=10, fontweight="bold",
                         color=GREEN if step < 0 else DARK)
-    top.text(t[0] - 0.3, query[0], f"{query[0]:,.0f} s", ha="right",
-             va="center", fontsize=10, fontweight="bold", color=BLUE)
-    low.text(t[0] - 0.3, startup[0], f"{startup[0]:,.0f} s", ha="right",
-             va="center", fontsize=10, fontweight="bold", color=DARK)
     top.text(stop + 0.3, query[-1], f"query today:\n{query[-1]:,.0f} s",
              ha="left", va="center", fontsize=10, fontweight="bold",
              color=BLUE, clip_on=False)
@@ -303,7 +304,7 @@ def versus_plot(summaries, names, out):
     """Startup and query seconds of vLLM and Quail by date."""
     vllm, vt, vq, vtotal = history(summaries, names, quail=False)
     quail, qt, qq, qtotal = history(summaries, names, quail=True)
-    fig = plt.figure(figsize=(12, 5.8))
+    fig = plt.figure(figsize=(12, 4.6))
     fig.set_layout_engine("none")
     ax = fig.add_axes((0.07, 0.09, 0.78, 0.8))
     stop = max(vt + qt) + 2.5
@@ -341,7 +342,7 @@ def versus_plot(summaries, names, out):
         plt.Line2D([], [], color=DARK, lw=1.2, label="startup + query"),
     ]
     ax.legend(handles=handles, loc="center left", bbox_to_anchor=(0.01, 0.42))
-    ax.set_ylim(0, vtotal.max() * 1.14)
+    ax.set_ylim(0, vtotal.max() * 1.12)
     ax.set_yticks(np.arange(0, vtotal.max(), 1000))
     ax.yaxis.grid(True, color=LIGHT_GRAY, lw=0.6)
     ax.set_axisbelow(True)
@@ -365,10 +366,10 @@ def token_plot(summaries, names, out):
          "percent",
          lambda r: 100 * agreement(r), "{:.1f}%"),
     )
-    fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+    fig, axes = plt.subplots(3, 1, figsize=(12, 7.6), sharex=True)
     fig.set_layout_engine("none")
-    fig.subplots_adjust(left=0.07, right=0.84, top=0.92, bottom=0.05,
-                        hspace=0.38)
+    fig.subplots_adjust(left=0.07, right=0.84, top=0.95, bottom=0.05,
+                        hspace=0.32)
     streaming = next(k for k, r in enumerate(quail)
                      if r["name"] == "filter_join_streaming")
     for ax, (title, unit, value, fmt) in zip(axes, panels):
@@ -378,7 +379,7 @@ def token_plot(summaries, names, out):
         step_line(ax, vt, v, stop, ORANGE, first_apart=False)
         step_line(ax, qt, q, stop, BLUE, first_apart=True)
         low, high = min(v.min(), q.min()), max(v.max(), q.max())
-        pad = 0.25 * (high - low)
+        pad = 0.15 * (high - low)
         ax.set_ylim(max(0, low - pad), high + pad)
         for name, values, color in (("vLLM today", v, ORANGE),
                                     ("Quail today", q, BLUE)):
