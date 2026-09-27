@@ -154,7 +154,7 @@ def spread(targets, gap) -> list[float]:
             for k in range(len(members))]
 
 
-def rail_labels(ax, points, texts, rail, weights, gap_in=0.3):
+def rail_labels(ax, points, texts, rail, weights, gap_in=0.26):
     """Labels on a slanted rail above the data, with leaders to points.
 
     Returns the label height in inches, so the caller can leave room.
@@ -168,7 +168,7 @@ def rail_labels(ax, points, texts, rail, weights, gap_in=0.3):
     for (x, y), at, text, weight in zip(points, xs, texts, weights):
         ax.plot([x, at], [y, rail], color=GRAY, lw=0.6, zorder=1)
         label = ax.text(at, rail, text, rotation=45, rotation_mode="anchor",
-                        ha="left", va="bottom", fontsize=9, color=DARK,
+                        ha="left", va="bottom", fontsize=8.5, color=DARK,
                         fontweight=weight, clip_on=False)
         box = label.get_window_extent(renderer)
         tallest = max(tallest, box.height / ax.figure.dpi)
@@ -204,10 +204,10 @@ def quail_plot(summaries, names, out):
     startup = np.array([seconds(r)[1] for r in rows])
     query_steps = steps_over(query, 0.03)
     startup_steps = steps_over(startup, 0.15)
-    fig = plt.figure(figsize=(12, 9.4))
+    fig = plt.figure(figsize=(12, 7.6))
     fig.set_layout_engine("none")
-    top = fig.add_axes((0.07, 0.33, 0.78, 0.6))
-    low = fig.add_axes((0.07, 0.05, 0.78, 0.2))
+    top = fig.add_axes((0.07, 0.3, 0.78, 0.63))
+    low = fig.add_axes((0.07, 0.06, 0.78, 0.2))
     stop = t[-1] + 2.5
     date_axis(low, t[0] - 3, stop)
     top.set_xlim(low.get_xlim())
@@ -217,8 +217,8 @@ def quail_plot(summaries, names, out):
     step_line(top, t, query, stop, BLUE, first_apart=True)
     step_line(low, t, startup, stop, DARK, first_apart=True)
 
-    bottom = 100 * np.floor(query.min() / 100 - 0.5)
-    rail = query.max() + 0.1 * (query.max() - bottom)
+    bottom = 20 * np.floor(query.min() / 20 - 1)
+    rail = query.max() + 0.04 * (query.max() - bottom)
     top.set_ylim(bottom, rail)
     texts, weights = [], []
     for i, row in enumerate(rows):
@@ -228,10 +228,10 @@ def quail_plot(summaries, names, out):
         weights.append("bold" if marked else "normal")
     tallest = rail_labels(top, list(zip(t, query)), texts, rail, weights)
     height_in = top.get_position().height * fig.get_figheight()
-    span = (rail - bottom) * height_in / (height_in - tallest - 0.1)
+    span = (rail - bottom) * height_in / (height_in - tallest - 0.05)
     top.set_ylim(bottom, bottom + span)
-    top.set_yticks(np.arange(bottom, query.max(), 100))
-    low.set_ylim(0, startup.max() * 1.3)
+    top.set_yticks(np.arange(100 * np.ceil(bottom / 100), query.max(), 100))
+    low.set_ylim(0, startup.max() * 1.12)
     low.set_yticks(np.arange(0, startup.max(), 20))
     for ax, values in ((top, query), (low, startup)):
         ax.vlines(t, ax.get_ylim()[0], values, color="#EFEFEF", lw=0.8,
