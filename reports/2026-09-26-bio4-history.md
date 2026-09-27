@@ -24,15 +24,15 @@
   against 79.5%), and where the join question sits (before #52 the
   question followed the term, and agreement was 94.5%).
 
-![Startup and query seconds for the vLLM baselines and Quail](plots/bio4_history_versus_vllm.png)
+![Query and startup seconds on Quail's code at each merge date](plots/bio4_history_quail.png)
+
+Figure: plots/bio4_history_quail.png
+
+![Query and startup seconds for the vLLM baselines and Quail by date](plots/bio4_history_versus_vllm.png)
 
 Figure: plots/bio4_history_versus_vllm.png
 
-![Startup and query seconds on Quail's code at each merge date](plots/bio4_history_steps.png)
-
-Figure: plots/bio4_history_steps.png
-
-![Fresh input tokens and recomputed KV tokens per configuration](plots/bio4_history_tokens.png)
+![Fresh input tokens, recomputed KV tokens, and answer agreement by date](plots/bio4_history_tokens.png)
 
 Figure: plots/bio4_history_tokens.png
 

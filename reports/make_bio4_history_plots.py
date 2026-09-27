@@ -18,13 +18,12 @@ Pass --table to print the report's tables instead of drawing. Startup
 seconds are the median of the configuration's startup samples, the one
 from its query run included.
 
-Writes three figures to plots/: bio4_history_versus_vllm.png (startup
-and query seconds of the vLLM baselines, Quail's first engine, and Quail
-today), bio4_history_steps.png (the same for every Quail configuration
-in merge order, with each step's change), and bio4_history_tokens.png
-(fresh input tokens, with the recomputed KV part marked, above each
-configuration's answer agreement). Speedups and
-percentages are derived here from the saved summaries.
+Writes three figures to plots/, each by date: bio4_history_quail.png
+(Quail's query and startup seconds at each merge, every change
+labeled), bio4_history_versus_vllm.png (the same for the vLLM baselines
+and Quail), and bio4_history_tokens.png (fresh input tokens, recomputed
+KV tokens, and answer agreement). Percentages and ratios are derived
+here from the saved summaries.
 """
 
 import json
@@ -32,17 +31,19 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.ticker import MaxNLocator
 
 HERE = Path(__file__).resolve().parent
 OUT = HERE / "plots"
 plt.style.use(HERE / "quail.mplstyle")
 sys.path.insert(0, str(HERE))
-from plot_colors import BLUE, DARK, GRAY, LIGHT_GRAY, ORANGE, RED  # noqa: E402
+from plot_colors import BLUE, DARK, GRAY, LIGHT_GRAY, ORANGE  # noqa: E402
 
-# bar order: the vLLM baselines, then Quail's steps in merge order
+GRAY_TEXT = "#777777"
+
+# the vLLM baselines, then Quail's steps in merge order
 ORDER = (
     "vllm-defaults", "vllm-tuned", "vllm-pipelined", "vllm-today",
     "quail-engine-vllm-kernels", "quail-engine", "pinned_staging",
@@ -111,137 +112,271 @@ def seconds(summary) -> tuple[float, float]:
     return summary["metrics"]["runtime_s"], summary["startup_median_s"]
 
 
-def tick(summary) -> str:
-    pr = summary.get("pull_request")
-    number = f" #{pr}" if pr else ""
-    return f"{SHORT[summary['name']]}\n{when(summary):%b %-d}{number}"
-
-
 def agreement(summary) -> float:
     """Share of predicate answers that match the reference labels."""
     return summary["metrics"]["accuracy"]["answer_accuracy"]["accuracy"]
 
 
-def label(summary) -> str:
-    """Row label: what the configuration adds, its date, and its PR."""
-    pr = summary.get("pull_request")
-    number = f", #{pr}" if pr else ""
-    return f"{SHORT[summary['name']]} ({when(summary):%b %-d}{number})"
+def change(rows, i) -> str:
+    """The change from the configuration before, when it is more than noise.
+
+    Query changes under 3% are within the spread of two runs of the same
+    code; startup changes under 15% are within the spread of its samples.
+    """
+    if not i:
+        return ""
+    (q, s), (pq, ps) = seconds(rows[i]), seconds(rows[i - 1])
+    parts = []
+    if abs(q / pq - 1) >= 0.03:
+        parts.append(f"query {q / pq - 1:+.0%}")
+    if abs(s / ps - 1) >= 0.15:
+        parts.append(f"startup {s / ps - 1:+.0%}")
+    return ", ".join(parts).replace("-", "\u2212")
 
 
-VERSUS_LABELS = {
-    "quail-engine-vllm-kernels": "Quail, first engine (Aug 18)",
-    "gigatoken": "Quail today (code of Sep 16)",
-}
+def spread(targets, gap) -> list[float]:
+    """Positions in the order of the sorted targets, at least gap apart.
+
+    Each run of crowded labels is centered on the mean of its targets.
+    """
+    blocks = []
+    for target in targets:
+        blocks.append([target, [target]])
+        while len(blocks) > 1:
+            (start, members), (next_start, _) = blocks[-2], blocks[-1]
+            if next_start >= start + gap * len(members):
+                break
+            members = members + blocks[-1][1]
+            center = sum(members) / len(members)
+            blocks[-2:] = [[center - gap * (len(members) - 1) / 2, members]]
+    return [start + gap * k for start, members in blocks
+            for k in range(len(members))]
 
 
-def stacked_rows(ax, rows, colors, text, labels=None):
-    """Horizontal query bars with startup stacked after them, top to bottom."""
-    y = np.arange(len(rows))
+def rail_labels(ax, points, texts, rail, weights, gap_in=0.3):
+    """Labels on a slanted rail above the data, with leaders to points.
+
+    Returns the label height in inches, so the caller can leave room.
+    """
+    x0, x1 = ax.get_xlim()
+    width_in = ax.get_position().width * ax.figure.get_figwidth()
+    gap = gap_in * (x1 - x0) / width_in
+    xs = spread([x for x, _ in points], gap)
+    tallest = 0.0
+    renderer = ax.figure.canvas.get_renderer()
+    for (x, y), at, text, weight in zip(points, xs, texts, weights):
+        ax.plot([x, at], [y, rail], color=GRAY, lw=0.6, zorder=1)
+        label = ax.text(at, rail, text, rotation=45, rotation_mode="anchor",
+                        ha="left", va="bottom", fontsize=9, color=DARK,
+                        fontweight=weight, clip_on=False)
+        box = label.get_window_extent(renderer)
+        tallest = max(tallest, box.height / ax.figure.dpi)
+    return tallest
+
+
+def date_axis(ax, start, stop):
+    """Weekly date ticks between two dates."""
+    ticks = np.arange(np.ceil(start), stop, 7)
+    ax.set_xticks(ticks, [f"{mdates.num2date(t):%b %-d}" for t in ticks])
+    ax.set_xlim(start, stop)
+
+
+def quail_plot(summaries, names, out):
+    """Quail's startup and query seconds at each merge date."""
+    rows = [summaries[n] for n in names if summaries[n]["backend"] == "quail"]
+    t = [mdates.date2num(when(r)) for r in rows]
     query = np.array([seconds(r)[0] for r in rows])
-    startup = np.array([seconds(r)[1] for r in rows])
-    ax.barh(y, query, color=colors, height=0.62)
-    ax.barh(y, startup, left=query, color=LIGHT_GRAY, height=0.62,
-            edgecolor=GRAY, linewidth=0.5)
+    total = query + np.array([seconds(r)[1] for r in rows])
+    fig = plt.figure(figsize=(12, 7))
+    fig.set_layout_engine("none")
+    ax = fig.add_axes((0.06, 0.07, 0.8, 0.8))
+    stop = t[-1] + 2.5
+    date_axis(ax, t[0] - 3, stop)
+    # the first row is the first engine with vLLM's kernels, on the date
+    # of the second
+    seconds_lines(ax, t, query, total, stop, BLUE, first_apart=True)
+    rail = total.max() + 0.08 * (total.max() - query.min())
+    texts, weights = [], []
     for i, row in enumerate(rows):
-        ax.text(query[i] + startup[i], i, "  " + text(row), va="center",
-                fontsize=9, color=DARK)
-    ax.set_yticks(y, labels or [label(r) for r in rows], fontsize=9.5)
-    ax.invert_yaxis()
-    ax.set_xlabel("seconds")
-    top = max(query + startup)
-    ax.set_xticks([t for t in MaxNLocator(nbins=6).tick_values(0, top)
-                   if t <= top * 1.05])
-    ax.xaxis.grid(True, color=LIGHT_GRAY, linewidth=0.6)
+        pr = row.get("pull_request")
+        words = SHORT[row["name"]] + (f" #{pr}" if pr else "")
+        note = change(rows, i)
+        texts.append(words + (f"   {note}" if note else ""))
+        weights.append("bold" if note else "normal")
+    bottom = 100 * np.floor(query.min() / 100 - 0.5)
+    ax.set_ylim(bottom, rail)
+    tallest = rail_labels(ax, list(zip(t, total)), texts, rail, weights)
+    height_in = ax.get_position().height * fig.get_figheight()
+    span = (rail - bottom) * height_in / (height_in - tallest - 0.1)
+    ax.set_ylim(bottom, bottom + span)
+    ax.set_yticks(np.arange(bottom, total.max(), 100))
+    ax.yaxis.grid(True, color=LIGHT_GRAY, lw=0.6)
     ax.set_axisbelow(True)
-
-
-def versus_plot(summaries, names, out):
-    """The vLLM baselines, Quail's first engine, and Quail today."""
-    picks = [n for n in names if summaries[n]["backend"] != "quail"]
-    picks += [n for n in ("quail-engine-vllm-kernels", "gigatoken")
-              if n in summaries]
-    rows = [summaries[n] for n in picks]
-    colors = [ORANGE if r["backend"] != "quail" else BLUE for r in rows]
-    vllm_today = summaries.get("vllm-today")
-
-    def text(row):
-        words = (f"{sum(seconds(row)):,.0f} s  ({seconds(row)[0]:,.0f} query"
-                 f" + {seconds(row)[1]:,.0f} startup)")
-        if row["backend"] == "quail" and vllm_today:
-            ratio = sum(seconds(vllm_today)) / sum(seconds(row))
-            words += f", {ratio:.1f}x less than vLLM today"
-        return words
-
-    fig, ax = plt.subplots(figsize=(12, 4.6))
-    stacked_rows(ax, rows, colors, text, labels=[
-        VERSUS_LABELS.get(r["name"], label(r)) for r in rows])
-    ax.set_xlim(0, max(sum(seconds(r)) for r in rows) * 1.45)
-    ax.set_title("BIO-4 at sf=0.5, startup + query: the vLLM baselines "
-                 "(orange) and Quail (blue)")
+    ax.set_ylabel("seconds")
+    ax.text(t[0] - 0.3, total[0], f"{total[0]:,.0f} s", ha="right",
+            va="center", fontsize=10, fontweight="bold", color=DARK)
+    ax.text(t[0] - 0.3, query[0], f"{query[0]:,.0f} s", ha="right",
+            va="center", fontsize=10, fontweight="bold", color=BLUE)
+    ax.text(stop + 0.3, total[-1], f"startup + query: {total[-1]:,.0f} s",
+            ha="left", va="bottom", fontsize=10, fontweight="bold",
+            color=DARK, clip_on=False)
+    ax.text(stop + 0.3, query[-1], f"query: {query[-1]:,.0f} s",
+            ha="left", va="top", fontsize=10, fontweight="bold", color=BLUE,
+            clip_on=False)
+    ax.text(stop + 0.3, (query[-1] + total[-1]) / 2,
+            f"startup: {total[-1] - query[-1]:,.0f} s", ha="left",
+            va="center", fontsize=9, color=GRAY_TEXT, clip_on=False)
+    ax.set_title("BIO-4 at sf=0.5 on Quail's code at each merge date",
+                 loc="left")
     fig.savefig(out, dpi=300)
     plt.close(fig)
 
 
-def steps_plot(summaries, names, out):
-    """Quail's configurations in merge order, with each step's change."""
-    rows = [summaries[n] for n in names if summaries[n]["backend"] == "quail"]
+def history(summaries, names, quail):
+    """Rows, dates, query seconds, and total seconds of Quail or vLLM."""
+    rows = [summaries[n] for n in names
+            if (summaries[n]["backend"] == "quail") == quail]
+    t = [mdates.date2num(when(r)) for r in rows]
+    query = np.array([seconds(r)[0] for r in rows])
+    total = query + np.array([seconds(r)[1] for r in rows])
+    return rows, t, query, total
 
-    def text(row):
-        q, s = seconds(row)
-        words = f"{q:,.0f} query + {s:,.0f} startup"
-        i = rows.index(row)
-        if i:
-            before = seconds(rows[i - 1])
-            dq, ds = q / before[0] - 1, s / before[1] - 1
-            changes = []
-            if abs(dq) >= 0.03:
-                changes.append(f"query {dq:+.0%}")
-            if abs(ds) >= 0.15:
-                changes.append(f"startup {ds:+.0%}")
-            if changes:
-                words += "   \u2190 " + ", ".join(changes)
-        return words
 
-    fig, ax = plt.subplots(figsize=(12, 7.5))
-    stacked_rows(ax, rows, [BLUE] * len(rows), text)
-    ax.set_xlim(0, max(sum(seconds(r)) for r in rows) * 1.6)
-    ax.set_title("BIO-4 at sf=0.5 on Quail's code at each merge date: "
-                 "query seconds (blue) + startup seconds (gray)")
+def step_line(ax, t, values, stop, color, first_apart, lw=2):
+    """A step line with a point at each date.
+
+    With first_apart, the first row shares the second row's date and is
+    drawn as a hollow point joined to it by a dotted line.
+    """
+    skip = 1 if first_apart else 0
+    ax.step(t[skip:] + [stop], list(values[skip:]) + [values[-1]],
+            where="post", color=color, lw=lw)
+    ax.scatter(t[skip:], values[skip:], s=24, color=color, edgecolor="white",
+               lw=1, zorder=3)
+    if first_apart:
+        ax.plot([t[0], t[0]], [values[1], values[0]], color=color, lw=0.8,
+                ls=":")
+        ax.scatter(t[:1], values[:1], s=24, color="white", edgecolor=color,
+                   lw=1.4, zorder=3)
+
+
+def seconds_lines(ax, t, query, total, stop, color, first_apart):
+    """Query line, startup band, and startup + query line as steps."""
+    skip = 1 if first_apart else 0
+    ax.fill_between(t[skip:] + [stop], list(query[skip:]) + [query[-1]],
+                    list(total[skip:]) + [total[-1]], step="post",
+                    color=LIGHT_GRAY, lw=0)
+    step_line(ax, t, total, stop, DARK, first_apart, lw=1.2)
+    step_line(ax, t, query, stop, color, first_apart)
+
+
+def versus_plot(summaries, names, out):
+    """Startup and query seconds of vLLM and Quail by date."""
+    vllm, vt, vq, vtotal = history(summaries, names, quail=False)
+    quail, qt, qq, qtotal = history(summaries, names, quail=True)
+    fig = plt.figure(figsize=(12, 5.8))
+    fig.set_layout_engine("none")
+    ax = fig.add_axes((0.07, 0.09, 0.78, 0.8))
+    stop = max(vt + qt) + 2.5
+    date_axis(ax, vt[0] - 2, stop)
+    seconds_lines(ax, vt, vq, vtotal, stop, ORANGE, first_apart=False)
+    seconds_lines(ax, qt, qq, qtotal, stop, BLUE, first_apart=True)
+    for row, x, y in zip(vllm, vt, vtotal):
+        pr = row.get("pull_request")
+        right = x == vt[-1]
+        name = SHORT[row["name"]] + (f" #{pr}" if pr else "")
+        if right:
+            name = f"vLLM today ({name.removeprefix('vLLM ')})"
+        text = f"{name}\n{y:,.0f} s ({when(row):%b %-d})"
+        ax.annotate(text, (x, y), xytext=(-6 if right else 6, 8),
+                    textcoords="offset points", ha="right" if right else "left",
+                    va="bottom", fontsize=9.5, color=DARK)
+    ax.annotate(f"Quail, first engine\n{qtotal[0]:,.0f} s (Aug 18)",
+                (qt[0], qtotal[0]), xytext=(6, 8), textcoords="offset points",
+                ha="left", va="bottom", fontsize=9.5, color=DARK)
+    ax.text(stop + 0.4, qtotal[-1],
+            f"Quail today: {qtotal[-1]:,.0f} s\n"
+            f"(code of {when(quail[-1]):%b %-d})",
+            ha="left", va="center", fontsize=10, color=DARK, clip_on=False)
+    arrow_x = stop - 1.2
+    ax.annotate("", (arrow_x, qtotal[-1] + 60), (arrow_x, vtotal[-1] - 60),
+                arrowprops={"arrowstyle": "<->", "color": DARK, "lw": 1})
+    ax.text(arrow_x - 0.5, (qtotal[-1] + vtotal[-1]) / 2,
+            f"{vtotal[-1] / qtotal[-1]:.1f}\u00d7 less time,\nstartup + query",
+            ha="right", va="center", fontsize=10, fontweight="bold",
+            color=DARK)
+    handles = [
+        plt.Line2D([], [], color=ORANGE, lw=2, label="vLLM, query"),
+        plt.Line2D([], [], color=BLUE, lw=2, label="Quail, query"),
+        plt.Rectangle((0, 0), 1, 1, color=LIGHT_GRAY, label="startup"),
+        plt.Line2D([], [], color=DARK, lw=1.2, label="startup + query"),
+    ]
+    ax.legend(handles=handles, loc="center left", bbox_to_anchor=(0.01, 0.42))
+    ax.set_ylim(0, vtotal.max() * 1.14)
+    ax.set_yticks(np.arange(0, vtotal.max(), 1000))
+    ax.yaxis.grid(True, color=LIGHT_GRAY, lw=0.6)
+    ax.set_axisbelow(True)
+    ax.set_ylabel("seconds")
+    ax.set_title("BIO-4 at sf=0.5: the vLLM baselines and Quail by date",
+                 loc="left")
     fig.savefig(out, dpi=300)
     plt.close(fig)
 
 
 def token_plot(summaries, names, out):
-    fresh = np.array([summaries[n]["metrics"]["fresh_tokens"] or 0
-                      for n in names], dtype=float)
-    regret = np.array([summaries[n]["metrics"].get("regret_tokens") or 0
-                       for n in names], dtype=float)
-    agree = np.array([100 * agreement(summaries[n]) for n in names])
-    x = np.arange(len(names))
-    fig, (top, bottom) = plt.subplots(
-        2, 1, figsize=(15, 9.5), sharex=True, layout="constrained",
-        gridspec_kw={"height_ratios": [3, 1.3]})
-    top.bar(x, (fresh - regret) / 1e6, color=BLUE, width=0.7)
-    top.bar(x, regret / 1e6, bottom=(fresh - regret) / 1e6, color=RED,
-            width=0.7)
-    for i, value in enumerate(fresh):
-        top.text(i, value / 1e6, f"{value / 1e6:.1f}", ha="center",
-                 va="bottom", fontsize=7.5, color=DARK)
-    top.set_ylabel("millions of tokens")
-    top.set_title("BIO-4: fresh input tokens (blue) and the recomputed KV "
-                  "tokens among them (red)")
-    colors = [ORANGE if summaries[n]["backend"] != "quail" else BLUE
-              for n in names]
-    bottom.bar(x, agree, color=colors, width=0.7)
-    for i, value in enumerate(agree):
-        bottom.text(i, value, f"{value:.1f}", ha="center", va="bottom",
-                    fontsize=7.5, color=DARK)
-    bottom.set_ylim(0, 105)
-    bottom.set_ylabel("percent")
-    bottom.set_title("Answer agreement with the reference labels")
-    bottom.set_xticks(x, [tick(summaries[n]) for n in names], rotation=90,
-                      fontsize=8)
+    """Fresh tokens, recomputed KV tokens, and agreement by date."""
+    vllm, vt, _, _ = history(summaries, names, quail=False)
+    quail, qt, _, _ = history(summaries, names, quail=True)
+    stop = max(vt + qt) + 2.5
+    panels = (
+        ("Fresh input tokens", "millions of tokens",
+         lambda r: r["metrics"]["fresh_tokens"] / 1e6, "{:.1f} M"),
+        ("Recomputed KV tokens", "millions of tokens",
+         lambda r: r["metrics"]["regret_tokens"] / 1e6, "{:.1f} M"),
+        ("Answer agreement with the Qwen3 32B reference labels", "percent",
+         lambda r: 100 * agreement(r), "{:.1f}%"),
+    )
+    fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+    fig.set_layout_engine("none")
+    fig.subplots_adjust(left=0.07, right=0.84, top=0.92, bottom=0.05,
+                        hspace=0.38)
+    streaming = next(k for k, r in enumerate(quail)
+                     if r["name"] == "filter_join_streaming")
+    for ax, (title, unit, value, fmt) in zip(axes, panels):
+        date_axis(ax, vt[0] - 2, stop)
+        v = np.array([value(r) for r in vllm])
+        q = np.array([value(r) for r in quail])
+        step_line(ax, vt, v, stop, ORANGE, first_apart=False)
+        step_line(ax, qt, q, stop, BLUE, first_apart=True)
+        low, high = min(v.min(), q.min()), max(v.max(), q.max())
+        pad = 0.25 * (high - low)
+        ax.set_ylim(max(0, low - pad), high + pad)
+        for name, values, color in (("vLLM today", v, ORANGE),
+                                    ("Quail today", q, BLUE)):
+            ax.text(stop + 0.4, values[-1],
+                    f"{name}: {fmt.format(values[-1])}", ha="left",
+                    va="center", fontsize=10, fontweight="bold", color=color,
+                    clip_on=False)
+        i = streaming
+        if abs(q[i] / q[i - 1] - 1) >= 0.03:
+            step = f"{q[i] / q[i - 1] - 1:+.0%}".replace("-", "\u2212")
+            ax.annotate(f"filter-join streaming #92: {step}", (qt[i], q[i]),
+                        xytext=(-8, -4), textcoords="offset points",
+                        ha="right", va="top", fontsize=9.5, color=DARK)
+        if abs(v[-1] / v[-2] - 1) >= 0.03:
+            ax.annotate("vLLM tokenizes whole prompt text (#167)",
+                        (vt[-1], v[-1]), xytext=(-8, 0),
+                        textcoords="offset points", ha="right", va="center",
+                        fontsize=9.5, color=DARK)
+        ax.annotate("Quail, first engine", (qt[0], q[0]), xytext=(-8, 0),
+                    textcoords="offset points", ha="right", va="center",
+                    fontsize=9.5, color=DARK)
+        ax.yaxis.grid(True, color=LIGHT_GRAY, lw=0.6)
+        ax.set_axisbelow(True)
+        ax.set_ylabel(unit)
+        ax.set_title(title, loc="left", fontsize=11)
+    fig.suptitle("BIO-4 at sf=0.5: tokens and answer agreement by date",
+                 x=0.07, ha="left", fontsize=13, fontweight="bold")
     fig.savefig(out, dpi=300)
     plt.close(fig)
 
@@ -294,7 +429,7 @@ def main():
         return
     OUT.mkdir(exist_ok=True)
     versus_plot(summaries, names, OUT / "bio4_history_versus_vllm.png")
-    steps_plot(summaries, names, OUT / "bio4_history_steps.png")
+    quail_plot(summaries, names, OUT / "bio4_history_quail.png")
     token_plot(summaries, names, OUT / "bio4_history_tokens.png")
     print(f"wrote three figures to {OUT}")
 
