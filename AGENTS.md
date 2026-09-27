@@ -34,7 +34,7 @@ these rules.
 
 CI runs these on every pull request. Run them before pushing:
 
-    uv run ruff check quail tests experiments reports tools
+ uv run ruff check quail tests experiments tools
     uv run python tools/check_long_strings.py
     uv run vulture
     uv run pytest -q
@@ -69,11 +69,15 @@ CI runs these on every pull request. Run them before pushing:
   strategy it used: operator-at-a-time execution or pipelining.
 - `de1|` in request ids is a wire-format version tag, not a product
   name. Leave it alone.
+- Every `Session` call passes an `EngineConfig` that names `model` and
+  `device`; neither has a default. `gpus` defaults to 1 and `backend` to
+  `"quail"`. Do not add a default model or device.
 
 # Scope
 
-The current runtime supports filter queries only, Qwen3 4B fp8 or
-Qwen3 32B fp8, and one H100 per model copy. It does not use
+The current runtime supports filter and join queries on Qwen3 4B fp8,
+Qwen3 32B fp8, or DiffusionGemma 26B-A4B fp8, and one H100 per model
+copy. It does not use
 tensor-parallel weight sharding. `AI.CLASSIFY`, `AI.EXTRACT`, and
 `AI.MAP` are on the roadmap. Open-ended generation, speculation, and
 forking are not part of the current runtime.
@@ -109,11 +113,14 @@ forking are not part of the current runtime.
   result.
 - Report query time, throughput, and GPU cost for every benchmark
   query. Use the following definitions consistently:
-  - For a filter-only query, `documents/second` is the number of input
-    document rows divided by query runtime in seconds.
-  - For a query with joins, `document pairs/second` is the number of
-    evaluated document pairs, summed across all join stages, divided
-    by query runtime in seconds.
+  - Throughput is `tokens/second`: the total requested input tokens
+    divided by query runtime in seconds. Requested input tokens are
+    the full lengths of every prompt the query evaluated, summed,
+    counting a prompt's shared prefix every time whether or not its
+    KV was reused. quail-b reports it as `input_tokens_per_second`.
+    Do not report documents per second or document pairs per second
+    as throughput; give input document counts and evaluated pair
+    counts as plain counts beside the query.
   - `$/query` is query runtime in hours multiplied by the number of
     GPUs and the H100! hourly price. Use
     `quail.specs.H100_USD_PER_HOUR`, which is currently
@@ -125,18 +132,15 @@ forking are not part of the current runtime.
 # Reports
 
 This is the dedicated report branch. Experiment reports, plot code,
-figures, and `engine-wiki.md` live here instead of on `main`.
+figures, and `engine-wiki.md` live here instead of on `main`. Start
+report work from this branch and target changes back to it. Runtime
+data remains on the `quail-results` Modal volume. Do not add a per-PR
+feature report.
 
-- Every PR adds one file, and only one, to `reports/shipped_features/`,
-  named `YYYY-MM-DD-<short-slug>.md`. It says what changed, why, the
-  prediction stated before each run, the measured numbers against it,
-  and the `quail-results` volume path and Modal function call id of
-  each run. A PR with several features gets one file with a section
-  per feature. Do not add a separate report under `reports/`.
 - When a note's numbers are no longer current, delete it and any plot
-  script and PNGs only it referenced. Before starting a new task, scan
-  `reports/` for orphaned plot scripts and PNGs not referenced by any
-  current note, and delete them all.
+  script and figures only it referenced. Before starting a new task,
+  scan `reports/` for orphaned plot scripts and figures not referenced
+  by any current note, and delete them all.
 - `reports/engine-wiki.md` is a living reference doc, not a
   per-PR report. Update it in place when the engine's design changes.
 
@@ -144,19 +148,16 @@ figures, and `engine-wiki.md` live here instead of on `main`.
 
 Include a figure whenever one carries the point better than text:
 
-- For measured numbers, embed the report's committed plot. Link the
-  image by its raw GitHub URL pinned to a commit
-  (`.../raw/<sha>/reports/plots/<name>.png`) so it keeps
-  rendering as the branch moves. Do not make new plots just for an
-  issue or PR body; reuse the report's.
+- For measured numbers, link to the saved run or to a plot on the
+  report branch. Pin plot links to a commit so they keep rendering as
+  the branch moves.
 - For a design, plan, or dataflow change, include a mermaid diagram
   of the structure (GitHub renders ```mermaid blocks).
 
 # Plots
 
-Add a plot only when it carries the point better than a table. A plot
-lives under `reports/plots/` with its `make_<slug>_plots.py` in
-`reports/`, and the note links it.
+These rules apply to work on the report branch. Add a plot only when
+it carries the point better than a table.
 
 ## QUAIL-B plot standard
 

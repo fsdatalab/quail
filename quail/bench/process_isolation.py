@@ -34,6 +34,7 @@ def run_backend_group(
     run_dir: str,
     ground_truth_collection: str,
     methods: Sequence[str],
+    root: str | None = None,
 ) -> dict:
     """Run backend methods while sharing one loaded model when possible."""
     from quail import EngineConfig
@@ -54,9 +55,15 @@ def run_backend_group(
         )
         suite = run_suite(
             query_ids, sf=sf,
-            config=EngineConfig(model=model, backend=method, gpus=1),
+            config=EngineConfig(
+                gpus=1,
+                model=model,
+                backend=method,
+                device="h100-sxm",
+            ),
             data_dir=Path(data_dir) / f"sf{sf}",
             ground_truth_collection=ground_truth_collection or None,
+            root=root,
             output_dir=run_dir / method / family,
         )
         suite["run_id"] = run_dir.name

@@ -10,12 +10,18 @@ registered:
     import quail
     from quail_ext_examples import cost_ledger
 
-    session = quail.Session()
+    config = quail.EngineConfig(
+        gpus=1,
+        model="qwen3-4b-fp8",
+        backend="quail",
+        device="h100-sxm",
+    )
+    session = quail.Session(config)
     session.register("reviews", quail.DocumentProvider.from_parquet(
         "reviews.parquet", id_col="id"))
     result = session.sql(
         "SELECT r.id FROM reviews r "
-        "WHERE AI_FILTER(PROMPT('Is this review positive? {0}', r.body))"
+        "WHERE AI.IF(PROMPT('Is this review positive? {0}', r.body))"
     ).run()
     ledger = cost_ledger.charge(result)
     print(ledger["totals"]["usd"], ledger["totals"]["fresh_tokens"])

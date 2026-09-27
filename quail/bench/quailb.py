@@ -3,6 +3,13 @@
 `run_query(session, spec, tables)` builds one query's Substrait plan
 on the session, runs it, and returns the answers keyed by the plan's
 operator ids, as QUAIL-B scores them.
+
+Runs on any machine with a supported GPU and saves to a local directory;
+no Modal or volume is involved:
+
+    uv run python -m quail.bench.quailb --sf 0.1 --only IMDB-4 \
+      --model qwen3-4b-fp8 --device h100-sxm \
+      --output-dir results/quailb/imdb-4
 """
 
 import argparse
@@ -17,9 +24,10 @@ import pyarrow.compute as pc
 import quail
 import quail_b as benchmark
 from quail.bench import substrait
+from quail.bench.results import write_json
 from quail.bench.substrait import QueryPlan, read_plan
-from quail.planner import collect_operators
-from quail.specs import H100_USD_PER_HOUR
+from quail.planner.plan import Refusal
+from quail.specs import H100_USD_PER_HOUR, MODELS
 from quail_b.queries import (
     FILTER_SELECTIVITY_ESTIMATES,
     JOIN_SELECTIVITY_ESTIMATES,
@@ -31,9 +39,14 @@ from quail_b.queries import (
 from quail_b.queries import queries as query_specs
 from quail_b.scoring import RunOutput, reference_answer
 
-# the fixed planner inputs, by prompt; a query with an estimate for
-# every predicate is ordered by cost, any other in written order
+# the fixed planner inputs, by prompt; a predicate without an
+# estimate here gets the planner's default selectivity
 SELECTIVITY = {**FILTER_SELECTIVITY_ESTIMATES, **JOIN_SELECTIVITY_ESTIMATES}
+TEXT_VLLM_BACKENDS = frozenset({
+    "dumb_vllm",
+    "pipelined_vllm",
+    "stock_vllm",
+})
 
 
 def register_tables(session, data_dir):
@@ -44,9 +57,7 @@ def register_tables(session, data_dir):
 
 
 def _build(session, plan: QueryPlan):
-    order = ("by_cost" if all(op.prompt in SELECTIVITY for op in plan.operators)
-             else "as_written")
-    return substrait.build_query(session, plan, SELECTIVITY, order=order)
+    return substrait.build_query(session, plan, SELECTIVITY, order="by_cost")
 
 
 def build_query(session, spec: QuerySpec):
@@ -163,11 +174,10 @@ def prompt_pieces(query, plan: QueryPlan, anchors) -> dict:
         plan: The query's plan, for the operator ids.
         anchors: Written join position -> the anchor alias.
     """
-    _, filters, joins = collect_operators(query.logical)
-    prompts = [predicate.prompt for predicates in filters.values()
-               for predicate in predicates]
-    prompts += [join.predicate for join in joins]
-    preamble = next((list(prompt.preamble_token_ids) for prompt in prompts
+    operators = query.logical.operators()
+    filters, joins = operators.filters, operators.joins
+    preamble = next((list(prompt.preamble_token_ids)
+                     for prompt in operators.prompts
                      if prompt.preamble_token_ids), [])
     pieces = {"tokenizer": query.session.model.hf_name, "preamble": preamble,
               "filters": [], "joins": []}
@@ -179,44 +189,121 @@ def prompt_pieces(query, plan: QueryPlan, anchors) -> dict:
     for position, join in enumerate(joins):
         anchor = anchors[position]
         parts = {alias: (list(label), list(frame))
-                 for alias, label, frame in join.predicate.label_token_ids}
+                 for alias, label, frame in join.prompt.label_token_ids}
         (partner,) = [alias for alias in parts if alias != anchor]
         pieces["joins"].append({
             "id": plan.join_id(position), "anchor": anchor,
             "frame": parts[anchor][1], "label": parts[partner][0],
-            "tail": list(join.predicate.tail_token_ids)})
+            "tail": list(join.prompt.tail_token_ids)})
     return pieces
+
+
+def _submission_to_answer_s(
+    backend: str,
+    report: dict,
+    *,
+    frontend_s: float,
+    answer_prepare_s: float,
+) -> float:
+    runtime_s = (
+        report["model_wall_s"]
+        + report["finish_s"]
+        + answer_prepare_s
+    )
+    if backend == "quail":
+        runtime_s += (
+            frontend_s
+            + report["input_ready_s"]
+            + report["physical_prepare_s"]
+        )
+    return runtime_s
 
 
 def run_query(session, spec: QuerySpec, tables) -> RunOutput:
     """Execute one query and return benchmark ids, answers, and measurements."""
+    submitted = time.perf_counter()
     for name, table in tables.items():
         if name not in session.catalog:
             session.register(
                 name, quail.DocumentProvider.from_table(table, id_col="id"))
     plan = read_plan(spec.plan)
     query = _build(session, plan)
+    frontend_s = time.perf_counter() - submitted
     result = query.run()
+    answer_started = time.perf_counter()
     output = run_output(result, plan, tables)
+    answer_prepare_s = time.perf_counter() - answer_started
+    runtime_s = _submission_to_answer_s(
+        session.config.backend,
+        result.report,
+        frontend_s=frontend_s,
+        answer_prepare_s=answer_prepare_s,
+    )
+    output.runtime_s = runtime_s
+    output.measurements.update(
+        wall_s=runtime_s,
+        submission_to_answer_s=runtime_s,
+        finish_s=result.report["finish_s"],
+        answer_prepare_s=answer_prepare_s,
+    )
+    if session.config.backend == "quail":
+        output.measurements["frontend_s"] = frontend_s
+    if session.config.backend in TEXT_VLLM_BACKENDS:
+        output.measurements["input_tokens"] = (
+            result.report["fresh_tokens"] + result.report["cached_tokens"]
+        )
     output.prompt_pieces = prompt_pieces(query, plan, join_anchors(result))
     return output
 
 
-def run_suite(only=None, *, sf=0.1, config=None, data_dir=None,
+def refused_queries(session, query_ids, data_dir) -> dict[str, str]:
+    """Return id -> reason for the queries the session's backend refuses to plan.
+
+    A request backend refuses a query with an equality join or a user
+    function. Planning happens on the CPU, before any engine boots.
+    """
+    register_tables(session, data_dir)
+    refused = {}
+    for query_id in query_ids:
+        plan = build_query(session, benchmark.get_query(query_id)).plan()
+        if isinstance(plan, Refusal):
+            refused[query_id] = " ".join(plan.reasons)
+            print(f"[quail-b] {query_id}: skipped on {session.config.backend}: "
+                  f"{refused[query_id]}", flush=True)
+    return refused
+
+
+def run_suite(only=None, *, sf=0.1, config, data_dir=None,
               ground_truth_collection=None, output_dir,
-              h100_usd_per_hour=H100_USD_PER_HOUR):
-    """Run Quail queries through QUAIL-B and save the benchmark report."""
-    config = config or quail.EngineConfig()
+              h100_usd_per_hour=H100_USD_PER_HOUR, root=None):
+    """Run Quail queries through QUAIL-B and save the benchmark report.
+
+    Queries the backend refuses to plan are left out of the run and
+    listed under `skipped_queries` in the returned record.
+    """
+    skipped = {}
+    if only and data_dir is not None:
+        with quail.Session(config) as preflight_session:
+            skipped = refused_queries(preflight_session, only, data_dir)
+        only = [query_id for query_id in only if query_id not in skipped]
     with quail.Session(config) as session:
-        return benchmark.run(
+        record = benchmark.run(
             partial(run_query, session), queries=only, scale_factor=sf,
             output_dir=output_dir, data_dir=data_dir,
-            collection_id=ground_truth_collection,
+            collection_id=ground_truth_collection, root=root,
             gpu_count=config.gpus, gpu_hourly_rate_usd=h100_usd_per_hour,
             metadata={
                 "engine": config.backend, "model": config.model,
+                "prompt_format": MODELS[config.model].prompt_format,
                 "configuration": asdict(config),
-                "warmup": "engine startup and kernel warmup excluded",
+                "warmup": (
+                    "tokenizer, engine, and kernel startup excluded"
+                ),
+                "timing_boundary": (
+                    "raw document tables and query submission to answer"
+                    if config.backend == "quail"
+                    else "prompt text submission to answer"
+                ),
                 "cache_reuse": "one session per backend and query family",
                 "planning": {
                     "collection_id": SELECTIVITY_ESTIMATE_COLLECTION,
@@ -224,14 +311,19 @@ def run_suite(only=None, *, sf=0.1, config=None, data_dir=None,
                     "scale_factor": SELECTIVITY_ESTIMATE_SCALE_FACTOR,
                 },
             })
+        record["skipped_queries"] = skipped
+        write_json(Path(output_dir) / "run.json", record)
+        benchmark.report(output_dir, rescore=False)
+        return record
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sf", type=float, choices=(0.1, 0.5, 1.0), default=0.1)
     parser.add_argument("--only", help="comma-separated query IDs")
-    parser.add_argument("--model", default="qwen3-4b-fp8")
+    parser.add_argument("--model", required=True)
     parser.add_argument("--backend", default="quail")
+    parser.add_argument("--device", required=True)
     parser.add_argument("--gpus", type=int, default=1)
     parser.add_argument("--data-dir", help="directory containing input Parquet files")
     parser.add_argument("--ground-truth-collection")
@@ -241,7 +333,11 @@ def main():
         [value.strip() for value in args.only.split(",")] if args.only else None,
         sf=args.sf,
         config=quail.EngineConfig(
-            model=args.model, backend=args.backend, gpus=args.gpus),
+            gpus=args.gpus,
+            model=args.model,
+            backend=args.backend,
+            device=args.device,
+        ),
         data_dir=args.data_dir,
         ground_truth_collection=args.ground_truth_collection,
         output_dir=args.output_dir)

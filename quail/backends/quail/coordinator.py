@@ -5,20 +5,21 @@ process between child GPUs.
 """
 
 from quail.backends.quail.graph import partner_maps, runs_over_pairs
-from quail.execution import join_answer_cells
+from quail.execution.pairs import pair_partner
+from quail.execution.tokens import select_documents
+from quail.execution.types import join_answer_cells
 from quail.planner import balanced_shards
-from quail.runtime.pairs import pair_partner
-from quail.runtime.tokens import select_documents
 
 
 def _common_payload(payload: dict) -> dict:
     return {
         "model": payload["model"],
         "chunk_tokens": payload["chunk_tokens"],
+        "arena_pages": payload.get("arena_pages"),
         "true_ids": payload["true_ids"],
         "false_ids": payload["false_ids"],
-        "pre_ids": payload["pre_ids"],
-        "filter_limit": payload["filter_limit"],
+        "pre_ids": payload.get("pre_ids", []),
+        "filter_limit": payload.get("filter_limit"),
         "retention": payload.get("retention", {}),
         "gpu_timing": payload.get("gpu_timing", False),
     }

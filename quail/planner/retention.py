@@ -1,17 +1,6 @@
-"""Retention priorities for the executor: costs and future anchor uses."""
+"""Planned anchor reuse at each execution boundary."""
 
 from quail.planner.joins import thin
-from quail.planner.qwen3_cost import dense_params, flops_per_pair
-
-
-def coefficients(model, device) -> dict:
-    """Return the model's ideal prefix computation coefficients."""
-    return {
-        "linear_seconds": 2 * dense_params(model) / device.arithmetic_bandwidth(
-            model.weight_precision),
-        "pair_seconds": flops_per_pair(model) * model.layers
-        / device.arithmetic_bandwidth(model.attention_precision),
-    }
 
 
 def group_sequence(seq):

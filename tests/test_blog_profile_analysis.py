@@ -19,7 +19,7 @@ def test_midpoint_window_uses_gpu_union_and_main_cpu_thread(tmp_path):
         ("cuda_runtime", "cudaLaunchKernel", 7.5, 0.1, 7),
         ("cuda_runtime", "cudaLaunchKernel", 8, 0.1, 7),
         ("cuda_runtime", "other thread", 0, 20, 99),
-        ("user_annotation", "quail.executor.loop.pack_chunk", 7, 5, 7),
+        ("user_annotation", "quail.backends.quail.executor.loop.pack_chunk", 7, 5, 7),
     ]
     trace = {"baseTimeNanoseconds": 1_000_000_000, "traceEvents": [
         {"ph": "X", "cat": category, "name": name, "ts": start * 1e6,
@@ -35,6 +35,6 @@ def test_midpoint_window_uses_gpu_union_and_main_cpu_thread(tmp_path):
     assert result["window"]["thread_id"] == 7
     assert result["window"]["gpu"] == [(7, 9), (11, 12)]
     assert result["window"]["cpu"] == [
-        [7, 12, 0, "quail.executor.loop.pack_chunk"],
+        [7, 12, 0, "quail.backends.quail.executor.loop.pack_chunk"],
         [7.5, 7.6, 1, "cudaLaunchKernel"], [8, 8.1, 1, "cudaLaunchKernel"],
     ]

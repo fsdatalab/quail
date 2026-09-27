@@ -10,6 +10,11 @@ import time
 
 from quail.backends.base import GpuContext
 from quail.backends.quail.distributed import execute_distributed_graph
+from quail.backends.quail.executor.arena import KVArena
+from quail.backends.quail.executor.loop import warm_kernels
+from quail.backends.quail.executor.model import load_model, resolve_model_path
+from quail.backends.quail.executor.models import build_pipeline
+from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers
 from quail.backends.quail.graph import (
     _join_round_kv,
     _tuple_suffix,
@@ -18,25 +23,21 @@ from quail.backends.quail.graph import (
     stage_partner_lists,
 )
 from quail.backends.quail.retention import apply_retention, retain_after_join
-from quail.execution import PhysicalResponse
-from quail.executor.arena import KVArena
-from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION, Pipeline
-from quail.executor.loop import AsyncAnswers, warm_kernels
-from quail.executor.model import answer_weights, load_model, resolve_model_path
+from quail.cost import budgets
+from quail.execution.runner import ExecutionContext, SurvivorStream
+from quail.execution.tokens import (
+    DocumentPrefixes,
+    chain_tokens,
+    decode_payload_documents,
+)
+from quail.execution.types import PhysicalResponse
 from quail.physical import (
     AiFilter,
     AiJoin,
     Scan,
     decode_graph,
 )
-from quail.planner import budgets
 from quail.progress import say, set_gpu_index
-from quail.runtime.runner import ExecutionContext, SurvivorStream
-from quail.runtime.tokens import (
-    DocumentPrefixes,
-    chain_tokens,
-    decode_payload_documents,
-)
 
 # Children outlive sessions so later queries can reuse their loaded models.
 _CHILDREN: list = []
@@ -63,10 +64,13 @@ class LoadedGpu:
         say(f"loading {spec.hf_name} onto GPU {gpu_index}, "
             f"{free / 2**30:.1f} of {total / 2**30:.1f} GiB free")
 
+        budget = budgets.chunk_budget(spec, device)
         t0 = time.perf_counter()
         self.model = load_model(model_path or spec.hf_name,
                                 revision=None if model_path else spec.revision,
-                                answer_token_ids=answer_token_ids)
+                                answer_token_ids=answer_token_ids,
+                                max_batched_tokens=budget,
+                                moe_backend=spec.moe_backend)
         self.load_model_s = time.perf_counter() - t0
 
         # cuBLAS allocates its handle outside PyTorch's caching allocator.
@@ -78,18 +82,20 @@ class LoadedGpu:
         torch.cuda.synchronize()
 
         t0 = time.perf_counter()
-        budget = budgets.chunk_budget(spec, device)
-        arena_tok = budgets.arena_tokens(spec, device, budget)
+        full_pages, sliding_pages = budgets.arena_pages(spec, device, budget)
         self.arena = KVArena(n_layers=spec.layers,
-                             n_pages=arena_tok // budgets.PAGE_TOKENS,
+                             n_pages=full_pages,
                              page_tokens=budgets.PAGE_TOKENS,
                              n_kv=spec.n_kv, d_head=spec.d_head,
-                             dtype=torch.bfloat16)
+                             dtype=torch.bfloat16,
+                             layer_kv=spec.kv_shapes,
+                             sliding_layers=spec.sliding_layer_set,
+                             sliding_window=spec.sliding_window,
+                             n_sliding_pages=sliding_pages)
         self.arena_s = time.perf_counter() - t0
 
         t0 = time.perf_counter()
-        self.pipeline = Pipeline(self.model, self.arena,
-                                 attention_mode=FILTER_ATTENTION)
+        self.pipeline = build_pipeline(spec, self.model, self.arena)
         self.pipeline_s = time.perf_counter() - t0
 
         self.execution = backend.start(context)
@@ -99,15 +105,21 @@ class LoadedGpu:
         self.async_ans = None
         self.chunk_tokens = None
 
-    def bind_query(self, true_ids, false_ids, chunk_tokens):
-        """Attach the answerer and chunk budget for one query."""
-        answerer = _PayloadAnswerer(self.torch, self.F, self.model,
-                                    true_ids, false_ids)
-        self.async_ans = AsyncAnswers(self.torch, answerer)
+    def bind_query(self, true_ids, false_ids, chunk_tokens, arena_pages=None):
+        """Attach the answer rows, readout, and chunk budget for one query.
+
+        arena_pages resizes the KV pools to the plan's split; nothing
+        survives in the arena between queries.
+        """
+        if arena_pages is not None:
+            self.arena.resize(*arena_pages, free_resident=True)
+        rows = AnswerRows(self.torch, self.F, self.model, true_ids, false_ids)
+        self.async_ans = AsyncAnswers(self.torch, rows)
         self.chunk_tokens = chunk_tokens
         self.execution.bind_query(
             torch=self.torch,
             async_answers=self.async_ans,
+            answer_rows=rows,
             chunk_tokens=chunk_tokens,
         )
 
@@ -182,18 +194,24 @@ def _single_gpu_context(registry, envelope):
 
 
 def _boot_for_query(runtime_state, backend, gpu_context,
-                    chunk_tokens, true_ids, false_ids):
+                    chunk_tokens, true_ids, false_ids, arena_pages=None):
     """Load or reuse a GPU, bind a query, warm kernels."""
     key = (backend.name, gpu_context.model.name)
     gpu = runtime_state.get(key)
     t_boot = time.perf_counter()
     if gpu is None:
+        loaded = [name for _, name in runtime_state if name != key[1]]
+        if loaded:
+            # one model's weights and KV arena take the GPU; another
+            # model cannot load beside them
+            say(f"releasing {', '.join(loaded)} to load {key[1]}")
+            release_booted_models(runtime_state)
         gpu = LoadedGpu(backend, gpu_context, true_ids + false_ids)
         runtime_state[key] = gpu
         cold = True
     else:
         cold = False
-    gpu.bind_query(true_ids, false_ids, chunk_tokens)
+    gpu.bind_query(true_ids, false_ids, chunk_tokens, arena_pages)
     warm_s, warm_tier = gpu.warm()
     boot = _boot_record(gpu, cold, warm_s, warm_tier, t_boot)
     say(f"model ready, boot {boot['boot_s']} s ({boot['kind']})")
@@ -210,7 +228,8 @@ def prepare_quail_request(context) -> None:
     gpu, boot = _boot_for_query(
         context.runtime_state, registry.backend(envelope["backend"]),
         _single_gpu_context(registry, envelope), settings["chunk_tokens"],
-        settings["true_ids"], settings["false_ids"])
+        settings["true_ids"], settings["false_ids"],
+        settings.get("arena_pages"))
     gpu.prepared_boot = boot
 
 
@@ -280,7 +299,8 @@ def execute_quail_payload(payload, registry, graph, backend, runtime_state):
     if boot is None:
         gpu, boot = _boot_for_query(
             runtime_state, backend, gpu_context, payload["chunk_tokens"],
-            payload["true_ids"], payload["false_ids"])
+            payload["true_ids"], payload["false_ids"],
+            payload.get("arena_pages"))
     say("running the query")
 
     state = _gpu_state(gpu)
@@ -347,6 +367,16 @@ def _child_main(gpu_idx, conn):
                 conn.send(("ok", _child_boot(state, data)))
             elif kind == "filters":
                 conn.send(("ok", _child_filters(state, data)))
+            elif kind == "scores":
+                gpu = state["gpu"]
+                inputs = data["inputs"]
+                if "documents" in inputs:
+                    state["score_documents"] = inputs["documents"]
+                inputs["documents"] = state["score_documents"]
+                with gpu.torch.inference_mode():
+                    result = gpu.execution.execute(data["node"], inputs)
+                gpu.torch.cuda.synchronize()
+                conn.send(("ok", result))
             elif kind == "joins":
                 conn.send(("ok", _child_joins(state, data)))
         except Exception:
@@ -373,7 +403,7 @@ def _child_boot(state, sub):
     else:
         cold = False
     gpu.bind_query(sub["true_ids"], sub["false_ids"],
-                   sub["chunk_tokens"])
+                   sub["chunk_tokens"], sub.get("arena_pages"))
     state["runtime_context"] = ExecutionContext(
         runtimes=registry.runtimes, model_execution=gpu.execution,
     )
@@ -396,8 +426,6 @@ def _child_filters(state, sub):
     filter_limit = sub.get("filter_limit")
     t0 = time.perf_counter()
     with torch.inference_mode():
-        pipeline = gpu.pipeline if gpu else state["pipeline"]
-        pipeline.attention_mode = FILTER_ATTENTION
         node_id = sub.get("node_id")
         if node_id is not None:
             graph = decode_graph(
@@ -428,7 +456,7 @@ def _child_filters(state, sub):
             answers = result.outputs[f"filter_answers:{alias}"]
             if node.keep_kv:
                 out["retained"][alias] = sorted(
-                    key[1] for key in arena.accounting.retained
+                    key[1] for key in arena.retained_keys()
                     if key[0] == alias)
             out["fresh_tokens"] += result.metrics.fresh_tokens
             out["filters"][alias] = {
@@ -437,7 +465,7 @@ def _child_filters(state, sub):
             out["survivors"][alias] = list(
                 result.outputs[f"ids:{alias}"]
             )
-    for alias, document in arena.accounting.retained:
+    for alias, document in arena.retained_keys():
         out["retained"].setdefault(alias, []).append(document)
     out["retained"] = {alias: sorted(set(documents))
                        for alias, documents in out["retained"].items()}
@@ -481,8 +509,6 @@ def _child_joins(state, sub):
     out_joins, tokens_total = [], 0
     t0 = time.perf_counter()
     with torch.inference_mode():
-        pipeline = gpu.pipeline if gpu else state["pipeline"]
-        pipeline.attention_mode = JOIN_ATTENTION
         stage_suffixes, tuple_globs = [], []
         for j in group:
             locals_ = [range(len(sub["partners"][p]["index"]))
@@ -506,7 +532,7 @@ def _child_joins(state, sub):
         if filter_node is None:
             prefixes = [chain_tokens(pre, d) for d in anchor_docs]
             anchor_keys = [(anchor_alias, g) for g in anchors_glob]
-            round_kv = _join_round_kv(anchor_keys, arena.accounting.owned)
+            round_kv = _join_round_kv(anchor_keys, arena)
             anchor_stream = None
         else:
             # filled by the driver as this GPU's shard streams through
@@ -571,7 +597,7 @@ def _child_joins(state, sub):
             )
         last = ans[-1] if ans else {}
         for a, key in enumerate(anchor_keys):
-            if key not in arena.accounting.owned:
+            if not arena.is_resident(key):
                 continue
             matched = any(last.get(a, []))
             alive = (not matched if group[-1]["semantics"] == "anti"
@@ -590,11 +616,11 @@ def _child_joins(state, sub):
                 partner_index=tuple_globs[si],
                 anchor_partners=partner_lists[si]))
     if sub.get("final_group"):
-        for key in list(arena.accounting.owned):
+        for key in arena.resident_keys():
             arena.free_key(key)
     torch.cuda.synchronize()
     retained = {}
-    for alias, document in arena.accounting.retained:
+    for alias, document in arena.retained_keys():
         retained.setdefault(alias, []).append(document)
     return dict(joins=out_joins, fresh_tokens=tokens_total,
                 retained={alias: sorted(documents)
@@ -612,7 +638,7 @@ def _reset_child_query(state):
     """Clear KV and counters before a child starts a new query."""
     gpu = state.get("gpu")
     arena = gpu.arena if gpu else state["arena"]
-    for key in list(arena.accounting.owned):
+    for key in arena.resident_keys():
         arena.free_key(key)
     arena.reset_stats()
 
@@ -656,6 +682,7 @@ def execute_quail_multi(payload, registry, graph):
     setup = {key: payload[key] for key in (
         "model", "physical_plan", "workers", "chunk_tokens", "true_ids", "false_ids",
     )}
+    setup["arena_pages"] = payload.get("arena_pages")
     setup.update(registry=registry, model_path=model_path)
     boots = _round("boot", [setup] * gpu_count)
     boot_s = round(time.perf_counter() - started, 2)
@@ -682,24 +709,3 @@ def execute_quail_multi(payload, registry, graph):
     report.pop("filters", None)
     report.pop("joins", None)
     return PhysicalResponse(outputs, report)
-
-
-class _PayloadAnswerer:
-    """Answerer using TRUE/FALSE token ids from the payload."""
-
-    def __init__(self, torch, F, model, true_ids, false_ids):
-        self.F = F
-        self.allowed = sorted(set(true_ids) | set(false_ids))
-        self.weights = answer_weights(model, self.allowed)
-        self.true_cols = torch.tensor(
-            [i for i, t in enumerate(self.allowed)
-             if t in set(true_ids)], device="cuda")
-        self.false_cols = torch.tensor(
-            [i for i, t in enumerate(self.allowed)
-             if t in set(false_ids)], device="cuda")
-
-    def __call__(self, normed):
-        scores = self.F.linear(normed, self.weights)
-        t = scores.index_select(1, self.true_cols).amax(dim=1)
-        f = scores.index_select(1, self.false_cols).amax(dim=1)
-        return (t > f).int().cpu().tolist()

@@ -48,7 +48,7 @@ def read_cpu_window(path, join_window_unix_ns, thread_id, start, end):
             category, name = event.get("cat"), event.get("name", "")
             if category not in ("cpu_op", "cuda_runtime") and not (
                 category == "user_annotation" and name.startswith(
-                    ("vllm.scheduler.", "quail.executor."))
+                    ("vllm.scheduler.", "quail.backends.quail.executor."))
             ):
                 continue
             left = (event["ts"] - join_start_us) / 1e6

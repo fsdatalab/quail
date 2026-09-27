@@ -29,7 +29,7 @@ the KV-cache write sit outside the compiled graph and are the same
 kernels the packed executor calls.
 
 Three kernel sources, the engine untouched (the non-quail paths live
-in a Pipeline subclass below):
+in an Engine subclass below):
 
   quail          our fused Triton kernels (the shipping executor)
   vllm_ops       vLLM's ops called one by one, unfused, and on the
@@ -53,35 +53,10 @@ import os
 
 import modal
 
-from quail.executor.attention import GROUP, Pipeline
+from quail.backends.quail.executor.attention import GROUP, Engine
+from quail.bench.images import gpu_image
 
-IMAGE_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
-
-image = (
-    modal.Image.from_registry(IMAGE_BASE, add_python="3.12")
-    .entrypoint([])
-    .pip_install(
-        "vllm==0.26.0",
-        "huggingface_hub[hf_transfer]",
-        "transformers>=5.2.0",
-        "pandas",
-        "pyarrow",
-        "numpy",
-        "datasets",
-    )
-    .env({"VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
-          "VLLM_LOGGING_LEVEL": "WARNING",
-          "VLLM_USE_FLASHINFER_SAMPLER": "0",
-          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-          "HF_HUB_ENABLE_HF_TRANSFER": "1",
-          "QUAIL_CACHE_DIR": "/root/.cache/kernels",
-          "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
-          "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
-          "TRITON_CACHE_DIR": "/root/.cache/kernels/triton",
-          "TORCHINDUCTOR_CACHE_DIR":
-              "/root/.cache/kernels/torchinductor"})
-    .add_local_python_source("quail", "quail_b")
-)
+image = gpu_image()
 
 # House rule: never create new Modal app names - new GPU cells attach
 # to an existing app.
@@ -107,18 +82,16 @@ MEASURED_QUERIES = {
 }
 
 
-class KernelSourcePipeline(Pipeline):
-    """Pipeline with a swappable kernel source for the small kernels.
+class KernelSourceEngine(Engine):
+    """Engine with a swappable kernel source for the small kernels.
 
     kernel_source picks who provides the between-GEMM kernels and the
     join merge; the loop, packing, arena, GEMMs, and attention calls
     are the base class's in every mode.
     """
 
-    def __init__(self, model, arena, *, attention_mode,
-                 kernel_source="quail"):
-        super().__init__(model, arena, kernels="quail",
-                         attention_mode=attention_mode)
+    def __init__(self, arena, *, kernel_source="quail", **kwargs):
+        super().__init__(arena, **kwargs)
         self._segments = None
         self.kernel_source = kernel_source
 
@@ -278,19 +251,20 @@ def _write(result, name):
 def _boot_state(model):
     """Boot the worker state dict with the kernel-source pipeline.
 
-    Mirrors quail.runtime.execute._execute_physical's boot, with the
-    Pipeline subclass swapped in; warm_kernels runs the same tiered
+    Mirrors quail.execution.execute._execute_physical's boot, with the
+    Engine subclass swapped in; warm_kernels runs the same tiered
     warmup the worker runs.
     """
     import torch
     import torch.nn.functional as F
     from transformers import AutoTokenizer
 
-    from quail.executor.arena import KVArena
-    from quail.executor.attention import FILTER_ATTENTION
-    from quail.executor.loop import Answerer, AsyncAnswers, warm_kernels
-    from quail.executor.model import load_model
-    from quail.planner import budgets
+    from quail.backends.quail.executor.arena import KVArena
+    from quail.backends.quail.executor.loop import warm_kernels
+    from quail.backends.quail.executor.model import load_model
+    from quail.backends.quail.executor.models import build_pipeline
+    from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers
+    from quail.cost import budgets
     from quail.specs import DEVICES, MODELS
 
     spec = MODELS[model]
@@ -304,8 +278,8 @@ def _boot_state(model):
                     page_tokens=budgets.PAGE_TOKENS,
                     n_kv=spec.n_kv, d_head=spec.d_head,
                     dtype=torch.bfloat16)
-    pipeline = KernelSourcePipeline(
-        model_mod, arena, attention_mode=FILTER_ATTENTION)
+    pipeline = build_pipeline(spec, model_mod, arena,
+                              engine_class=KernelSourceEngine)
     from quail.backends import GpuContext, QuailBackend
     execution = QuailBackend().start(GpuContext(
         gpu_index=0,
@@ -319,7 +293,7 @@ def _boot_state(model):
     execution.bind_loaded_model(
         model=model_mod, arena=arena, pipeline=pipeline
     )
-    answerer = Answerer(torch, F, model_mod, tokenizer)
+    answerer = AnswerRows.from_tokenizer(torch, F, model_mod, tokenizer)
     async_ans = AsyncAnswers(torch, answerer)
     with torch.inference_mode():
         warm = warm_kernels(torch, arena, pipeline, async_ans,
@@ -341,36 +315,41 @@ def _quailb_session(model, sf, gpus=1):
 
     d = build_sets(DATA_DIR, sf)
     results_vol.commit()
-    sess = quail.Session(EngineConfig(gpus=gpus, model=model))
+    sess = quail.Session(EngineConfig(
+        gpus=gpus,
+        model=model,
+        backend="quail",
+        device="h100-sxm",
+    ))
     register_tables(sess, d)
     return sess, queries(sess), d
 
 
 def _run_query(state, build, captured):
     """One query through the real planner and worker core."""
+    from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers
     from quail.backends.quail.worker import (
-        _PayloadAnswerer,
         execute_single,
         quail_runtime_payload,
     )
-    from quail.execution import PhysicalResponse
-    from quail.executor.loop import AsyncAnswers
-    from quail.runtime.execute import (
+    from quail.execution.execute import (
         _validate_physical_request,
         execute_query,
     )
+    from quail.execution.types import PhysicalResponse
 
     def execute(request):
         request, registry, graph, _ = _validate_physical_request(
             request, query.session.registry)
         payload = quail_runtime_payload(request, graph)
-        answerer = _PayloadAnswerer(
+        rows = AnswerRows(
             state["torch"], state["F"], state["model"],
             payload["true_ids"], payload["false_ids"],
         )
         state["model_execution"].bind_query(
             torch=state["torch"],
-            async_answers=AsyncAnswers(state["torch"], answerer),
+            async_answers=AsyncAnswers(state["torch"], rows),
+            answer_rows=rows,
             chunk_tokens=payload["chunk_tokens"],
         )
         report = execute_single(state, payload, registry, graph)
@@ -443,14 +422,14 @@ def probe(model: str = "qwen3-4b-fp8") -> str:
                                 dtype=torch.bfloat16)
         outs = {}
         for source in KERNEL_SOURCES:
-            pipeline.kernel_source = source
+            pipeline.engine.kernel_source = source
             hidden = hidden0.clone()
             residual = residual0.clone()
             if source == "quail":
-                q, s = pipeline.custom_norm_quant(
+                q, s = pipeline.engine.custom_norm_quant(
                     hidden, layer.input_layernorm, residual)
             else:
-                q, s = pipeline.vllm_norm_quant(
+                q, s = pipeline.engine.vllm_norm_quant(
                     hidden, layer.input_layernorm, residual)
             outs[source] = (_dequant(torch, q, s), residual)
         for source in ("vllm_ops", "vllm_compiled"):
@@ -464,11 +443,11 @@ def probe(model: str = "qwen3-4b-fp8") -> str:
                               dtype=torch.bfloat16)
         outs = {}
         for source in KERNEL_SOURCES:
-            pipeline.kernel_source = source
+            pipeline.engine.kernel_source = source
             if source == "quail":
-                q, s = pipeline.custom_silu_quant(gate_up)
+                q, s = pipeline.engine.custom_silu_quant(gate_up)
             else:
-                q, s = pipeline.vllm_silu_quant(gate_up)
+                q, s = pipeline.engine.vllm_silu_quant(gate_up)
             outs[source] = _dequant(torch, q, s)
         for source in ("vllm_ops", "vllm_compiled"):
             report[source]["silu_quant_max_abs"] = _max_abs(
@@ -482,13 +461,13 @@ def probe(model: str = "qwen3-4b-fp8") -> str:
                                   dtype=torch.int64)
         outs = {}
         for source in KERNEL_SOURCES:
-            pipeline.kernel_source = source
+            pipeline.engine.kernel_source = source
             t0 = time.perf_counter()
             if source == "quail":
-                qo, ko = pipeline.custom_qk_norm_rope(
+                qo, ko = pipeline.engine.custom_qk_norm_rope(
                     qkv.clone(), positions, attn)
             else:
-                qo, ko = pipeline.vllm_qk_norm_rope(
+                qo, ko = pipeline.engine.vllm_qk_norm_rope(
                     qkv.clone(), positions, attn)
             torch.cuda.synchronize()
             if source == "vllm_compiled":
@@ -505,7 +484,7 @@ def probe(model: str = "qwen3-4b-fp8") -> str:
         # count (also proves dynamic shapes hold - no recompile);
         # add_norm should be one generated kernel with the residual
         # write folded in plus the quant launch, not a separate copy
-        pipeline.kernel_source = "vllm_compiled"
+        pipeline.engine.kernel_source = "vllm_compiled"
 
         def count_kernels(fn):
             fn()
@@ -524,14 +503,14 @@ def probe(model: str = "qwen3-4b-fp8") -> str:
                            dtype=torch.bfloat16)
         pos2 = positions[:2048]
         kernels = count_kernels(
-            lambda: pipeline.vllm_qk_norm_rope(qkv2, pos2, attn))
+            lambda: pipeline.engine.vllm_qk_norm_rope(qkv2, pos2, attn))
         report["vllm_compiled"]["qk_kernel_launches"] = len(kernels)
         report["vllm_compiled"]["qk_kernels"] = kernels[:12]
 
         hidden2 = hidden0[:2048].clone()
         residual2 = residual0[:2048].clone()
         kernels = count_kernels(
-            lambda: pipeline.vllm_norm_quant(
+            lambda: pipeline.engine.vllm_norm_quant(
                 hidden2, layer.input_layernorm, residual2))
         report["vllm_compiled"]["norm_quant_kernel_launches"] = \
             len(kernels)
@@ -543,7 +522,7 @@ def probe(model: str = "qwen3-4b-fp8") -> str:
     for query_id in ("IMDB-1", "BIO-2"):
         rows = {}
         for source in KERNEL_SOURCES:
-            pipeline.kernel_source = source
+            pipeline.engine.kernel_source = source
             captured = {}
             result = _run_query(state, qdefs[query_id][1], captured)
             rows[source] = _row_key(result.collect())
@@ -594,7 +573,7 @@ def stock_kernels(model: str = "qwen3-4b-fp8",
 
     d = build_sets(DATA_DIR, 0.1)
     bodies = pq.read_table(f"{d}/reviews.parquet")["body"].to_pylist()
-    prompt = bind_prompt(F1, ("body",), tok)
+    prompt = bind_prompt(F1, ("body",), tok, turn=spec.turn)
     prompts = [dict(prompt_token_ids=render_filter_prompt_ids(
         prompt, tok(b), tok)) for b in bodies[:n_docs]]
 
@@ -712,7 +691,7 @@ def queries(model: str = "qwen3-4b-fp8", sf: float = 0.1,
             comparisons={})
         rows_by_source = {}
         for source in KERNEL_SOURCES:
-            pipeline.kernel_source = source
+            pipeline.engine.kernel_source = source
             # unmeasured warm run: first-call op init, and for
             # vllm_compiled the torch.compile of the three segments
             _run_query(state, build, {})
@@ -876,7 +855,7 @@ def profile_queries(model: str = "qwen3-4b-fp8",
                   sources={}, locked_clock=None)
 
     def profile_pass(source):
-        pipeline.kernel_source = source
+        pipeline.engine.kernel_source = source
         captured = {}
         with torch.profiler.profile(
                 activities=[torch.profiler.ProfilerActivity.CPU,
@@ -886,7 +865,7 @@ def profile_queries(model: str = "qwen3-4b-fp8",
         return prof, captured
 
     for source in KERNEL_SOURCES:
-        pipeline.kernel_source = source
+        pipeline.engine.kernel_source = source
         captured = {}
         _run_query(state, build, captured)   # unprofiled warm
         # clock and power during a normal, unprofiled run
@@ -940,7 +919,7 @@ def profile_queries(model: str = "qwen3-4b-fp8",
     if locked:
         try:
             for source in ("quail", "vllm_ops"):
-                pipeline.kernel_source = source
+                pipeline.engine.kernel_source = source
                 _run_query(state, build, {})   # settle at the pin
                 (_, clock_stats) = sampler.run(
                     lambda: _run_query(state, build, {}))

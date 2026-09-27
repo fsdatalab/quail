@@ -2,16 +2,15 @@
 
 from dataclasses import replace
 
-from quail.executor.retention import retention_pages
+from quail.cost import budgets
+from quail.cost.retention import coefficients, retention_pages
+from quail.cost.sol import speed_of_light, unrounded_seconds
+from quail.cost.work import Work, ask, scan
 from quail.logical import (
-    Apply,
+    DEFAULT_SELECTIVITY,
     CompileError,
-    Join,
     LogicalPlan,
-    Project,
-    Scan,
-    SemanticFilter,
-    SemanticJoin,
+    effective_selectivity,
     join_conditions,
     oriented_join_conditions,
 )
@@ -35,57 +34,29 @@ from quail.physical import (
     Scan as PhysicalScan,
 )
 from quail.physical.base import input_ports
-from quail.planner import budgets, retention
 from quail.planner import joins as joinsearch
+from quail.planner import retention
+from quail.planner.physical_optimizer import (
+    ModelRegion,
+    PlanningContext,
+    apply_physical_rules,
+)
 from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
-from quail.planner.sol import speed_of_light, unrounded_seconds
-from quail.planner.work import Work, ask, scan
-from quail.planning import ModelRegion, PlanningContext, apply_physical_rules
 from quail.specs import DeviceSpec, ModelSpec
 
 # ---------------------------------------------------------- tree walk
 
-def collect_operators(plan: LogicalPlan):
-    """Return (scans, filters_by_alias, joins_in_written_order)."""
-    scans, filters, joins = [], {}, []
+def _question_tokens(prompt, canvas: int = 0) -> int:
+    """Token count of the prompt's per-evaluation tail.
 
-    def walk(node):
-        if isinstance(node, Project):
-            walk(node.input)
-        elif isinstance(node, SemanticJoin):
-            for child in node.inputs:
-                walk(child)
-            joins.append(node)
-        elif isinstance(node, Join):
-            walk(node.left)
-            walk(node.right)
-        elif isinstance(node, Apply):
-            walk(node.input)
-        elif isinstance(node, SemanticFilter):
-            walk(node.input)
-            filters[node.input.alias] = list(node.predicates)
-        elif isinstance(node, Scan):
-            scans.append(node)
-        else:
-            for child in node.children():
-                walk(child)
-
-    walk(plan.root)
-    return scans, filters, joins
-
-
-def collect_applies(plan: LogicalPlan) -> list:
-    """Return the Apply nodes of a plan, children before parents."""
-    return [node for node in plan.walk() if isinstance(node, Apply)]
-
-
-def _question_tokens(prompt) -> int:
-    """Token count of the prompt's per-evaluation tail."""
+    canvas is the rows a diffusion model appends to every evaluation
+    to answer on; a decoder answers on the tail's last row.
+    """
     if prompt.tail_tokens is None or prompt.preamble_tokens is None:
         raise ValueError(
             "prompts were bound without a tokenizer; the planner "
             "needs token counts (pass one to compile_sql / docs)")
-    return prompt.tail_tokens
+    return prompt.tail_tokens + canvas
 
 
 def preamble_tokens(filters, joins) -> int:
@@ -95,8 +66,8 @@ def preamble_tokens(filters, joins) -> int:
             if p.prompt.preamble_tokens is not None:
                 return p.prompt.preamble_tokens
     for j in joins:
-        if j.predicate.preamble_tokens is not None:
-            return j.predicate.preamble_tokens
+        if j.prompt.preamble_tokens is not None:
+            return j.prompt.preamble_tokens
     return 0
 
 
@@ -105,21 +76,25 @@ def preamble_tokens(filters, joins) -> int:
 def default_order_rule(filters, joins) -> tuple[str, str]:
     """Return (rule, source).
 
-    'by_cost' when every predicate has a selectivity, 'as_written'
-    otherwise.
+    Always 'by_cost'; a predicate without a selectivity is priced with
+    DEFAULT_SELECTIVITY. Pass order="as_written" to keep written order.
     """
-    preds = [p for fs in filters.values() for p in fs]
-    sels = [p.selectivity for p in preds] + [j.selectivity for j in joins]
-    if sels and all(s is not None for s in sels):
-        return "by_cost", "default: every gated predicate has a selectivity"
-    return "as_written", "default: at least one predicate has no selectivity"
+    missing = any(p.selectivity is None for fs in filters.values()
+                  for p in fs) or any(j.selectivity is None for j in joins)
+    if missing:
+        return "by_cost", (
+            "default: by cost, with selectivity "
+            f"{DEFAULT_SELECTIVITY:g} for predicates without one")
+    return "by_cost", "default: by cost"
 
 
 def filter_cost(predicate, prefix_tokens: float, model: ModelSpec,
                 device: DeviceSpec, chunk_tokens: int, *, first: bool) -> float:
     """Return ideal time for one filter evaluation."""
     operation = scan if first else ask
-    work = operation(prefix_tokens, _question_tokens(predicate.prompt))
+    work = operation(prefix_tokens,
+                     _question_tokens(predicate.prompt, model.canvas_tokens),
+                     window=model.sliding_window)
     return unrounded_seconds(work, model, device, chunk_tokens)
 
 
@@ -137,8 +112,7 @@ def order_filters_indexed(predicates, rule: str, *, prefix_tokens: float,
         return idx
 
     def selectivity(i):
-        return (predicates[i].selectivity
-                if predicates[i].selectivity is not None else 1.0)
+        return effective_selectivity(predicates[i].selectivity)
 
     ask_costs = [
         filter_cost(p, prefix_tokens, model, device, chunk_tokens,
@@ -189,12 +163,12 @@ def order_filters(predicates, rule: str, *, prefix_tokens: float,
 
 def _join_aliases(join) -> list:
     """Return the join's table aliases in placeholder order."""
-    return [r.alias for r in join.predicate.args]
+    return [r.alias for r in join.prompt.args]
 
 
 def _label_counts(join) -> dict:
     """Return alias -> (block_label_tokens, anchor_frame_tokens)."""
-    out = {a: (lt, nt) for a, lt, nt in join.predicate.labels}
+    out = {a: (lt, nt) for a, lt, nt in join.prompt.labels}
     if any(lt is None for lt, _ in out.values()):
         raise ValueError(
             "join prompts were bound without a tokenizer; the planner "
@@ -202,12 +176,13 @@ def _label_counts(join) -> dict:
     return out
 
 
-def join_specs(joins, pair_fractions=None) -> list:
+def join_specs(joins, pair_fractions=None, canvas: int = 0) -> list:
     """The joins as the search's spec dicts, in written order.
 
     pair_fractions maps a written position to the fraction of the
     cross product its equality conditions keep; a join with
     conditions but no entry is priced as the full cross product.
+    canvas is the rows a diffusion model appends to every pair.
     """
     pair_fractions = pair_fractions or {}
     out = []
@@ -220,7 +195,7 @@ def join_specs(joins, pair_fractions=None) -> list:
             semantics=j.semantics, selectivity=j.selectivity,
             frame_tokens={a: nt for a, (lt, nt) in labels.items()},
             label_tokens={a: lt for a, (lt, nt) in labels.items()},
-            tail_tokens=_question_tokens(j.predicate),
+            tail_tokens=_question_tokens(j.prompt, canvas),
             on=[(c.left.alias, c.left.column, c.right.alias, c.right.column)
                 for c in conditions],
             pair_fraction=(pair_fractions.get(i, 1.0) if conditions
@@ -260,17 +235,18 @@ def hash_join_nodes(joins, pair_fractions, scan_ports) -> list:
     return nodes
 
 
-def _filter_alias_work(preds, stats, order, pre: int) -> Work:
+def _filter_alias_work(preds, stats, order, pre: int,
+                       canvas: int = 0, window: int = 0) -> Work:
     """Expected Work of one filter chain: a scan, then asks over KV."""
     total = Work()
     mean = stats.mean_doc_tokens
     n = float(stats.n_docs)
     for si, predicate_index in enumerate(order):
         p = preds[predicate_index]
-        q = _question_tokens(p.prompt)
+        q = _question_tokens(p.prompt, canvas)
         op = scan if si == 0 else ask
-        total = total + op(pre + mean, q) * n
-        n *= p.selectivity if p.selectivity is not None else 1.0
+        total = total + op(pre + mean, q, window=window) * n
+        n *= effective_selectivity(p.selectivity)
     return total
 
 
@@ -301,7 +277,8 @@ def node_estimates(graph, *, filter_works, stage_works, live, stats, pre,
                 excess = max(0.0, live.get(node.alias, 0.0) - fits)
                 entry["release_recompute_tokens"] = round(excess * prefix)
                 entry["release_recompute_seconds"] = speed_of_light(
-                    scan(prefix, 0) * excess, model, device, chunk).seconds
+                    scan(prefix, 0, window=model.sliding_window) * excess,
+                    model, device, chunk).seconds
         elif isinstance(node, AiJoin):
             work = Work()
             for stage in node.stages:
@@ -380,8 +357,9 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
         pair_fractions: join written position -> the fraction of the
             cross product its equality conditions keep.
     """
-    scans, filters, joins = collect_operators(plan)
-    applies = collect_applies(plan)
+    operators = plan.operators()
+    scans, filters, joins = operators.scans, operators.filters, operators.joins
+    applies = operators.applies
     alias_applies = {}
     join_applies = {}
     for apply in applies:
@@ -397,11 +375,11 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
         raise CompileError("a join takes one apply() returning pairs")
     if gpus > 1 and any(apply.kind == "per_batch" for apply in applies):
         return Refusal(
-            reasons=("per-batch apply() functions run on one GPU today; "
-                     "use apply_table() or one GPU",),
+            reasons=("per-batch apply() requires one GPU; "
+                     "use apply_table() or set gpus=1",),
             constraint="per_batch_apply_needs_one_gpu",
             needed=1, available=gpus, unit="gpus")
-    length_stats = {a: joinsearch.summarize_alias(t)
+    length_stats = {a: joinsearch.summarize_alias(t, model.sliding_window)
                     for a, t in doc_tokens.items()}
     stats = {
         a: CorpusStats(n_docs=s.count, total_tokens=s.total,
@@ -418,17 +396,21 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     if weight_gpus > 1:
         return Refusal(
             reasons=(
-                f"one model copy needs the memory of {weight_gpus} GPUs, "
-                "but Quail does not split weights across GPUs",
+                f"the model needs {weight_gpus} GPUs of memory, "
+                f"but Quail loads one complete copy per GPU",
             ),
             constraint="weights_need_more_cards",
             needed=weight_gpus, available=1, unit="cards")
     workers = gpus
 
     chunk = budgets.chunk_budget(model, device)
-    admission = budgets.arena_tokens(model, device, chunk)
+    # the longest documents bind the sliding-pool split
+    longest_mean = max(
+        (st.mean_doc_tokens for st in stats.values()), default=None)
+    arena_split = budgets.arena_pages(model, device, chunk, longest_mean)
+    admission = arena_split[0] * budgets.PAGE_TOKENS
     pre = preamble_tokens(filters, joins)
-    specs = join_specs(joins, pair_fractions)
+    specs = join_specs(joins, pair_fractions, model.canvas_tokens)
 
     # ---- the order rule first: the search below needs it
     rule, source = (order, f"user: order={order!r}") if order else \
@@ -448,17 +430,17 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     for fs in filters.values():
         surv = 1.0
         for p in fs:
-            surv *= p.selectivity if p.selectivity is not None else 1.0
+            surv *= effective_selectivity(p.selectivity)
         live0[_filter_alias(fs[0])] *= surv
     filter_works = {
         alias: _filter_alias_work(preds, stats[alias], filter_orders[alias],
-                                  pre)
+                                  pre, model.canvas_tokens, model.sliding_window)
         for alias, preds in filters.items()
     }
     base_work = sum(filter_works.values(), Work())
 
     cap_pages = retention_pages(admission, chunk, budgets.PAGE_TOKENS)
-    costs = retention.coefficients(model, device)
+    costs = coefficients(model, device)
     # KV reuse is priced as unlimited
     filtered = set(filters)
 
@@ -538,18 +520,16 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     # ---- refusal checks on the predicted plan
     anchors = {wp: a for wp, a in found["seq"]}
     for s in scans:
-        fq = max((_question_tokens(p.prompt)
+        fq = max((_question_tokens(p.prompt, model.canvas_tokens)
                   for p in filters.get(s.alias, ())), default=None)
         if fq is None:
             continue
         need = pre + stats[s.alias].max_doc_tokens + fq
         if need > chunk:
             return Refusal(
-                reasons=(f"a document of {s.alias!r} plus the engine "
-                         f"preamble and its question tail needs {need} "
-                         f"tokens; the chunk budget is {chunk} and "
-                         f"suffixes are atomic - no chunk can ever "
-                         f"hold it",),
+                reasons=(f"a document in {s.alias!r} needs {need} tokens "
+                         f"with its prompt, but the forward pass budget "
+                         f"is {chunk} tokens",),
                 constraint="suffix_over_chunk",
                 needed=need, available=chunk, unit="tokens")
     for spec in specs:
@@ -561,12 +541,9 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                 + spec["tail_tokens"])
         if need > chunk:
             return Refusal(
-                reasons=(f"the join anchored on {anchor!r} needs "
-                         f"{need} tokens per tuple (anchor document, "
-                         f"each partner document with its label, and "
-                         f"the question, in one prompt); that is over "
-                         f"the chunk budget of {chunk}, and suffixes "
-                         f"are atomic",),
+                reasons=(f"one join pair anchored on {anchor!r} needs "
+                         f"{need} tokens, but the forward pass budget "
+                         f"is {chunk} tokens",),
                 constraint="suffix_over_chunk",
                 needed=need, available=chunk, unit="tokens")
 
@@ -601,11 +578,11 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
             p = filters[alias][i]
             stages.append(FilterStage(
                 written_pos=i,
-                question_tokens=_question_tokens(p.prompt),
+                question_tokens=_question_tokens(p.prompt, model.canvas_tokens),
                 preamble_tokens=p.prompt.preamble_tokens,
                 selectivity=p.selectivity,
                 expected_docs=round(n * surv, 1)))
-            surv *= p.selectivity if p.selectivity is not None else 1.0
+            surv *= effective_selectivity(p.selectivity)
         keep = alias in retention_plan["initial"]
         pinned = alias in streamed
         writes = len(stages) > 1 or keep or pinned
@@ -785,6 +762,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
         nodes=tuple(nodes), remarks=tuple(remarks),
         settings={
             "chunk_tokens": chunk,
+            "arena_pages": list(arena_split),
             "admission_tokens": admission,
             "retention": retention_plan,
             "order_rule": rule,
@@ -856,7 +834,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         candidates += tuple(physical_planner.plan(region, context))
     if not candidates:
         return Refusal(
-            reasons=(f"backend {backend!r} produced no physical plan",),
+            reasons=(f"backend {backend!r} could not produce a plan",),
             constraint="no_physical_plan",
             needed=1,
             available=0,
@@ -898,15 +876,26 @@ def _filter_alias(pred_or_list):
 
 # ------------------------------------------------------------- explain
 
-def explain(logical: LogicalPlan, physical, *, verbose: bool = False) -> str:
+def explain(logical: LogicalPlan, physical, *, verbose: bool = False,
+            result=None, usd_per_hour: float | None = None) -> str:
     """Format the logical and physical operator trees.
 
     Args:
         logical: The optimized logical plan.
         physical: The physical plan or planning refusal.
         verbose: Include runtime settings and internal node fields.
+        result: The QueryResult of running the plan. When given, each
+            node shows its measured rows, time, and tokens next to the
+            estimates, and the measured totals follow the tree.
+        usd_per_hour: Price of one GPU, for the measured cost per query.
     """
-    from quail.explain import _fields, logical_tree, physical_tree
+    from quail.explain import (
+        _fields,
+        logical_tree,
+        measured_stages,
+        physical_tree,
+        run_summary,
+    )
 
     lines = ["logical:"]
     lines.extend("  " + line for line in logical_tree(logical).splitlines())
@@ -917,8 +906,8 @@ def explain(logical: LogicalPlan, physical, *, verbose: bool = False) -> str:
         lines.extend(f"  {reason}" for reason in physical.reasons)
         return "\n".join(lines)
     lines.append("")
-    lines.append(f"physical: (backend={physical.backend}, "
-                 f"model={physical.model}, workers={physical.workers})")
+    lines.append(f"physical: backend={physical.backend}, "
+                 f"model={physical.model}, workers={physical.workers}")
     if physical.backend == "quail":
         chunk = physical.settings.get("chunk_tokens")
         admission = physical.settings.get("admission_tokens")
@@ -928,13 +917,23 @@ def explain(logical: LogicalPlan, physical, *, verbose: bool = False) -> str:
         if admission is not None:
             budgets.append(f"admission budget={admission:,} tokens")
         lines.append("  " + ", ".join(budgets))
-    if getattr(physical, "estimates", None):
-        lines.append("  node seconds price each node's work alone; they "
-                     "do not add up to the plan estimate because chunk "
-                     "packing shares forward passes across nodes")
+    lines.append("")
     lines.extend("  " + line for line in physical_tree(
         physical.graph, logical=logical, verbose=verbose,
-        estimates=getattr(physical, "estimates", None)).splitlines())
+        estimates=getattr(physical, "estimates", None),
+        metrics=None if result is None else result.node_metrics,
+        stages=None if result is None else measured_stages(result.report),
+    ).splitlines())
+    if getattr(physical, "estimates", None):
+        lines.append("  est. time is each node's work alone; node times do "
+                     "not add up to the plan estimate")
+        lines.append("  because chunk packing shares forward passes across "
+                     "nodes")
+    if result is not None:
+        lines.append("")
+        lines.append("run:")
+        lines.extend("  " + line for line in run_summary(
+            result.report, physical.graph, physical.workers, usd_per_hour))
     if verbose:
         lines.append("")
         lines.append("settings:")

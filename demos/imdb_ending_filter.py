@@ -73,7 +73,12 @@ def main() -> None:
           flush=True)
 
     with quail.Session(
-        config=quail.EngineConfig(gpus=args.gpus, device=args.device),
+        config=quail.EngineConfig(
+            gpus=args.gpus,
+            model="qwen3-4b-fp8",
+            backend="quail",
+            device=args.device,
+        ),
     ) as session:
         session.register(
             "reviews",

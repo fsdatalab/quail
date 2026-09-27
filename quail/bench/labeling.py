@@ -38,6 +38,7 @@ from pathlib import Path
 import modal
 import pyarrow as pa
 
+from quail.bench.images import cpu_image, gpu_image
 from quail_b import data
 from quail_b.data import GROUND_TRUTH_ROOT, PUBLIC_BUCKET
 from quail_b.predicates import (
@@ -58,6 +59,7 @@ from quail_b.predicates import (
     workload_specs,
 )
 from quail_b.predicates import label_set_identity as _label_set_identity
+from quail_b.rendering import PROMPT_FORMAT
 
 SCALE_FACTOR = 0.1
 SUPPORTED_SCALE_FACTORS = (0.1, 0.5, 1.0)
@@ -75,7 +77,7 @@ after_write = _no_commit
 
 # Label counts follow from the table sizes each scale factor samples.
 # The hours use the 14,000 fresh tokens per second measured for the
-# BIO-2 join at 32B, so they are estimates until a pass confirms them.
+# BIO-2 join at 32B. These estimates exclude BIO-4's new term filters.
 _PREDICTIONS = {
     0.1: ("21 predicates need 1,210,264 labels: 993,450 model judgments "
           "through Quail and 216,814 source labels, about 1.5 H100 hours "
@@ -97,6 +99,12 @@ DERIVE_PREDICTION_TEXT = (
     "hash. The LePaRD citation join is recomputed from the smaller "
     "corpus; at sf=0.1 from sf=1.0, 2 of its 216,500 labels differ."
 )
+BIO4_PREDICTION_TEXT = (
+    "BIO-4 adds two filter labels per reaction term; "
+    "their time is not included in that estimate. "
+    "The rerun of 16 saved answers per predicate shows no differences, "
+    "and every workload finishes on one H100 without an out-of-memory failure."
+)
 
 
 def prediction_text(sf: float) -> str:
@@ -107,9 +115,7 @@ def prediction_text(sf: float) -> str:
         raise ValueError(
             f"scale factor {sf} is not one of {SUPPORTED_SCALE_FACTORS}"
         ) from error
-    return (f"At sf={sf}, {counts} The rerun of 16 saved answers per "
-            "predicate shows no differences, and every workload finishes "
-            "on one H100 without an out-of-memory failure.")
+    return f"At sf={sf}, {counts} {BIO4_PREDICTION_TEXT}"
 
 
 # One Quail query is one Parquet part, setting the resume granularity.
@@ -151,8 +157,11 @@ def filter_groups(specs, prompts_per_call: int = PROMPTS_PER_CALL) -> list:
 def label_set_identity(spec: PredicateSpec, corpus_id: str,
                        corpus_full_hash: str) -> dict:
     """This pass's label-set identity: the Quail judge, this part size."""
+    judge = QUAIL_JUDGE_SPEC
+    if spec.kind == "join":
+        judge = {**judge, "join_anchor": "arg0"}
     identity = _label_set_identity(
-        spec, corpus_id, corpus_full_hash, judge=QUAIL_JUDGE_SPEC)
+        spec, corpus_id, corpus_full_hash, judge=judge)
     return {**identity, "prompts_per_call": PROMPTS_PER_CALL,
             "join_pairs_per_call": JOIN_PAIRS_PER_CALL}
 
@@ -453,7 +462,13 @@ class QuailJudge:
 
         t0 = time.perf_counter()
         self.session = quail.Session(
-            quail.EngineConfig(gpus=gpus, model=MODEL_NAME))
+            quail.EngineConfig(
+                gpus=gpus,
+                model=MODEL_NAME,
+                backend="quail",
+                device="h100-sxm",
+            )
+        )
         self.boot_s = round(time.perf_counter() - t0, 2)
         self.queries = 0
         self.rows_answered = 0
@@ -521,7 +536,7 @@ class QuailJudge:
                           quail.prompt(spec.template,
                                        quail.col(f"l.{spec.left_column}"),
                                        quail.col(f"r.{spec.right_column}")),
-                          semantics="full")
+                          anchor="l", semantics="full")
                  .select("l.id", "r.id"))
         expected = len(left_rows) * len(right_rows)
         result = self._run(query, expected)
@@ -726,7 +741,7 @@ def _collection_identity(corpus_manifest: dict,
 
 def _activate_collection(corpus_id: str, collection_id: str) -> None:
     _atomic_json(
-        ROOT / "corpora" / corpus_id / "active_collection.json",
+        ROOT / "corpora" / corpus_id / f"active_collection.{PROMPT_FORMAT}.json",
         {"collection_id": collection_id})
 
 
@@ -1042,9 +1057,11 @@ def finalize_collection(sf: float, corpus_id: str,
 
 def activate_reused_collection(
         sf: float, target_corpus_id: str, source_collection_id: str,
-        relabeled_workloads: str) -> dict:
+        relabeled_workloads: str, *,
+        relabeled_predicates: tuple[str, ...] = ()) -> dict:
     """Build one collection from new labels and verified unchanged tables."""
-    _, target_corpus, _ = _load_corpus(target_corpus_id)
+    with open(ROOT / "corpora" / target_corpus_id / "manifest.json") as f:
+        target_corpus = json.load(f)
     source_collection_path = (
         ROOT / "collections" / source_collection_id / "manifest.json")
     with open(source_collection_path) as f:
@@ -1072,12 +1089,15 @@ def activate_reused_collection(
     unknown = names - set(WORKLOADS)
     if unknown:
         raise ValueError(f"unknown relabeled workloads: {sorted(unknown)}")
+    unknown_predicates = set(relabeled_predicates) - set(PREDICATE_BY_KEY)
+    if unknown_predicates:
+        raise ValueError(f"unknown relabeled predicates: {sorted(unknown_predicates)}")
 
     identities = {}
     manifests = {}
     reused = {}
     for spec in PREDICATES:
-        if spec.workload in names:
+        if spec.workload in names or spec.key in relabeled_predicates:
             identity = label_set_identity(
                 spec, target_corpus["corpus_id"],
                 target_corpus["corpus_full_hash"])
@@ -1119,6 +1139,7 @@ def activate_reused_collection(
         "source_collection_id": source_collection_id,
         "source_corpus_id": source_corpus_id,
         "relabeled_workloads": sorted(names),
+        "relabeled_predicates": sorted(relabeled_predicates),
         "reused_predicates": len(reused),
         "new_predicates": len(PREDICATES) - len(reused),
         "predicate_count": len(PREDICATES),
@@ -1364,10 +1385,14 @@ def collection_files(root: Path, collection_id: str) -> list[Path]:
     corpus_dir = root / "corpora" / manifest["corpus_id"]
     files += sorted(path for path in corpus_dir.iterdir()
                     if path.is_file() and path.suffix in (".json", ".parquet"))
-    for key, label_set_id in sorted(manifest["label_sets"].items()):
-        spec = PREDICATE_BY_KEY[key]
-        label_dir = (root / "label_sets" / spec.workload / spec.slug
-                     / label_set_id)
+    for label_set_id in sorted(manifest["label_sets"].values()):
+        matches = list((root / "label_sets").glob(
+            f"*/*/{label_set_id}/manifest.json"))
+        if len(matches) != 1:
+            raise FileNotFoundError(
+                f"expected one manifest for {label_set_id}, found "
+                f"{len(matches)}")
+        label_dir = matches[0].parent
         compact = label_dir / "labels.parquet"
         if not compact.exists():
             raise FileNotFoundError(
@@ -1431,30 +1456,10 @@ def publish(root: Path, collection_ids: list[str],
 hf_cache = modal.Volume.from_name("quail-hf-cache", create_if_missing=True)
 kernel_cache = modal.Volume.from_name("quail-kernel-cache", create_if_missing=True)
 results_vol = modal.Volume.from_name("quail-results", create_if_missing=True)
-image = (
-    modal.Image.from_registry(
-        "nvidia/cuda:13.0.1-devel-ubuntu24.04", add_python="3.12")
-    .entrypoint([])
-    .pip_install("vllm==0.26.0", "huggingface_hub", "numpy", "pyarrow",
-                 "sqlglot>=27.0", "bpe-qwen>=0.1.5", "datasets>=5.0.1")
-    .env({
-        "QUAIL_CACHE_DIR": "/root/.cache/kernels",
-        "VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
-        "VLLM_LOGGING_LEVEL": "WARNING",
-        "VLLM_USE_FLASHINFER_SAMPLER": "0",
-        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-        "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
-        "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
-        "TRITON_CACHE_DIR": "/root/.cache/kernels/triton",
-        "TORCHINDUCTOR_CACHE_DIR": "/root/.cache/kernels/torchinductor",
-    })
-    .add_local_python_source("quail", "quail_b")
-)
-publish_image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .pip_install("boto3", "pyarrow", "numpy", "sqlglot>=27.0",
-                 "bpe-qwen>=0.1.5", "datasets>=5.0.1")
-    .add_local_python_source("quail", "quail_b"))
+image = gpu_image()
+# the dev group carries boto3 for the upload; no GPU stack here
+publish_image = cpu_image()
+
 
 
 def _aws_credentials() -> dict[str, str]:

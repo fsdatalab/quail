@@ -1,4 +1,7 @@
-"""The planner: budgets from the specs, decisions from token arithmetic.
+"""The planner: every transformation of a plan.
+
+Logical optimizer rules, the physical optimizer protocol, and physical
+plan assembly from the cost model's numbers.
 
 No wall prediction. KV is always bf16.
 
@@ -7,8 +10,6 @@ The names below are the planning interface a model backend uses.
 
 from .decide import (
     balanced_shards,
-    collect_applies,
-    collect_operators,
     default_order_rule,
     explain,
     hash_join_nodes,
@@ -26,8 +27,6 @@ __all__ = [
     "PhysicalPlan",
     "Refusal",
     "balanced_shards",
-    "collect_applies",
-    "collect_operators",
     "default_order_rule",
     "hash_join_nodes",
     "explain",

@@ -73,7 +73,12 @@ def main():
     truth = make_join_parquets(f"{tmp}/reports.parquet",
                                f"{tmp}/cands.parquet")
 
-    sess = quail.Session(EngineConfig(gpus=1))
+    sess = quail.Session(EngineConfig(
+        gpus=1,
+        model="qwen3-4b-fp8",
+        backend="quail",
+        device="h100-sxm",
+    ))
     sess.register("docs", quail.DocumentProvider.from_parquet(
         f"{tmp}/docs.parquet", id_col="id"))
     sess.register("reports", quail.DocumentProvider.from_parquet(

@@ -3,11 +3,15 @@
 from dataclasses import dataclass, replace
 from typing import ClassVar
 
+import pytest
+
 from quail.logical import ColumnRef, LogicalPlan, Project, Scan
-from quail.logical_optimizer import (
+from quail.planner.logical_optimizer import (
     LogicalPlanningContext,
     apply_logical_rules,
 )
+
+CONTEXT = LogicalPlanningContext(catalog=None, engine_config=None)
 
 
 @dataclass(frozen=True)
@@ -29,48 +33,74 @@ class TaggedInput:
         return self.input.output_schema()
 
     def validate(self):
-        if not self.tag:
-            raise ValueError("tag cannot be empty")
+        pass
 
     def with_children(self, children):
-        if len(children) != 1:
-            raise ValueError("TaggedInput needs one child")
-        return replace(self, input=children[0])
+        (child,) = children
+        return replace(self, input=child)
 
     def with_expressions(self, expressions):
-        if len(expressions) != 1:
-            raise ValueError("TaggedInput needs one tag")
-        return replace(self, tag=expressions[0])
+        (tag,) = expressions
+        return replace(self, tag=tag)
 
     def explain_fields(self):
         return {"tag": self.tag}
 
 
 class RenameTag:
-    name = "rename_tag"
+    """Rename one tag value to another, one node at a time."""
 
-    def rewrite(self, node, context):
-        if isinstance(node, TaggedInput) and node.tag == "old":
-            return replace(node, tag="new")
-        return None
+    def __init__(self, old, new):
+        self.name = f"rename_{old}_{new}"
+        self.old, self.new = old, new
+
+    def rewrite(self, root, context):
+        def visit(node):
+            children = tuple(visit(child) for child in node.children())
+            if children != node.children():
+                node = node.with_children(children)
+            if isinstance(node, TaggedInput) and node.tag == self.old:
+                return replace(node, tag=self.new)
+            return node
+
+        rewritten = visit(root)
+        return None if rewritten is root else rewritten
 
 
-def test_custom_logical_node_walks_and_rewrites_without_generic_changes():
+def _tagged_plan(tag):
     field = ColumnRef("r", "reviews", "review")
     scan = Scan("reviews", "r", "review")
-    tagged = TaggedInput(scan, "old")
-    plan = LogicalPlan(Project(tagged, (field,)))
+    return LogicalPlan(Project(TaggedInput(scan, tag), (field,)))
 
-    optimized, changed = apply_logical_rules(
-        plan,
-        (RenameTag(),),
-        LogicalPlanningContext(catalog=None, engine_config=None),
-    )
+
+@pytest.mark.parametrize("start,rules,tag,changed", [
+    ("old", [("old", "new")], "new", ("rename_old_new",)),
+    # the second rule only matches after the first has run, and it is
+    # listed first, so a single round would miss it
+    ("old", [("mid", "new"), ("old", "mid")], "new",
+     ("rename_old_mid", "rename_mid_new")),
+    ("new", [("old", "new")], "new", ()),
+])
+def test_custom_logical_node_rewrites_until_a_round_changes_nothing(
+        start, rules, tag, changed):
+    plan = _tagged_plan(start)
+    optimized, applied = apply_logical_rules(
+        plan, tuple(RenameTag(old, new) for old, new in rules), CONTEXT)
 
     assert [node.type_name for node in optimized.walk()] == [
-        "quail.scan",
-        "test.tagged_input",
-        "quail.logical_project",
-    ]
-    assert optimized.root.input.tag == "new"
-    assert changed == ("rename_tag",)
+        "quail.scan", "test.tagged_input", "quail.logical_project"]
+    assert optimized.root.input.tag == tag
+    assert applied == changed
+    assert (optimized.root is plan.root) == (not changed)
+
+
+def test_rules_that_never_settle_stop_at_the_pass_cap():
+    # each round ends on a different tag than it started, so the rounds
+    # would repeat forever: a -> b -> c | c -> a | a -> b -> c | ...
+    rules = (RenameTag("a", "b"), RenameTag("c", "a"), RenameTag("b", "c"))
+
+    optimized, changed = apply_logical_rules(
+        _tagged_plan("a"), rules, CONTEXT, max_passes=3)
+
+    assert optimized.root.input.tag == "c"
+    assert len(changed) == 5

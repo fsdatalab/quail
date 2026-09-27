@@ -1,10 +1,10 @@
 [project]
 name = "quail-engine"
 version = "0.1.0"
-description = "Quail: a declarative query engine for AI_FILTER and AI_JOIN"
+description = "Quail: a declarative query engine for AI.IF and AI_JOIN"
 readme = "README.md"
 license = "MIT"
-# <3.13: bpe-qwen ships wheels up to 3.12, and the Modal image runs 3.12
+# The Modal image and tested vLLM build use Python 3.12
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "sqlglot==30.17.0",
@@ -13,15 +13,27 @@ dependencies = [
     "pyarrow==25.0.1",
     "numpy==2.3.5; sys_platform != 'emscripten' and sys_platform != 'win32'",
     "numpy==2.5.2; sys_platform == 'emscripten' or sys_platform == 'win32'",
-    "bpe-qwen==0.1.5",
+    "gigatoken==0.10.0",
     "datasets==5.0.1",
     # same version as the Modal image; vLLM has Linux wheels only
     "vllm==0.26.0; sys_platform == 'linux'",
 ]
 
+[project.optional-dependencies]
+# Quail Server (quail-server), the optional query server; the client
+# side of a remote Session needs only the standard library
+server = [
+    "starlette==1.6.0",
+    "uvicorn==0.52.4",
+]
+
+[project.scripts]
+quail-server = "quail.server.__main__:main"
+
 [project.urls]
-Repository = "https://github.com/fsdatalab/quail-exploration"
-Issues = "https://github.com/fsdatalab/quail-exploration/issues"
+Documentation = "https://fsdatalab.github.io/quail"
+Repository = "https://github.com/fsdatalab/quail"
+Issues = "https://github.com/fsdatalab/quail/issues"
 
 [dependency-groups]
 dev = [
@@ -35,10 +47,15 @@ dev = [
     "quail-b",
     "ruff==0.12.9",
     "vulture==2.16",
+    # the Modal images sync this group: the readout probe reads the
+    # corpus tables with pandas, and hf_transfer speeds up checkpoint
+    # downloads
+    "pandas==3.0.5",
+    "hf-transfer==0.1.9",
 ]
 
 [tool.uv.sources]
-quail-b = { git = "https://github.com/fsdatalab/quail-bench.git", rev = "5f7ce82663de1535dccdab3d0249225f34323713" }
+quail-b = { git = "https://github.com/fsdatalab/quail-bench.git", rev = "a4a08bbcecb38aeb7933188a322a1ec3d0570ea2" }
 
 [build-system]
 requires = ["hatchling==1.32.0"]
@@ -46,6 +63,18 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["quail"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "LICENSE",
+    "README.md",
+    "pyproject.toml",
+    "quail",
+]
+exclude = [
+    "demos",
+    "docs",
+]
 
 [tool.uv]
 # uv's Python builds include the C headers Triton needs at startup
@@ -73,7 +102,7 @@ ignore = ["D1", "N803", "N806", "N812"]
 convention = "google"
 
 [tool.ruff.lint.isort]
-known-first-party = ["quail", "quail_b", "experiments", "reports"]
+known-first-party = ["quail", "quail_b", "experiments"]
 
 [tool.vulture]
 paths = ["quail"]
