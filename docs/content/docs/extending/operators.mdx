@@ -110,33 +110,21 @@ to TRUE/FALSE.
 selects one. For example, a rule could fuse consecutive classify
 operators.
 
-Rules run in this order:
+Rule order:
 
-- Logical rules run in registration order, built-in rules first. The
-  whole list repeats until a round changes nothing, for at most four
-  rounds, so a rewrite that enables another rule is not missed.
-- Physical rules run once each, in registration order, built-in rules
-  first (`prefix_sharing`, then `tree_attention`). A rule sees every
-  change the rules before it made.
-- On the first query over a table, the physical rules run a second
-  time once the documents are tokenized. Write a rule to compute its
-  decision from the plan and the token counts each time, and to
-  return `None` when nothing changes, so running it again is safe.
+- Logical rules run in the order they were registered, built-in rules
+  first. Quail repeats them until the plan stops changing, up to four
+  passes.
+- Physical rules run once each, in the order they were registered:
+  `prefix_sharing`, `tree_attention`, then extension rules.
+- On the first query over a table, the physical rules run again after
+  tokenization. A rule decides from the current plan and token counts,
+  not from what it chose before, and returns `None` if nothing changes.
 
-This follows the rule order in Apache DataFusion and Spark:
-
-- DataFusion's logical optimizer runs its rule list in order and
-  repeats it until a pass changes nothing, for at most
-  `datafusion.optimizer.max_passes` passes (three by default). Its
-  physical optimizer runs each rule once, in order. Quail splits
-  logical and physical rules the same way.
-- Spark's Catalyst groups rules into batches. Each batch runs its
-  rules in order, either once or repeated until the plan stops
-  changing, for at most `spark.sql.optimizer.maxIterations` rounds
-  (100 by default). Quail's logical rules act like one repeating
-  batch, and its physical rules act like one batch that runs once.
-- Both log a warning when the pass limit stops the rules before the
-  plan settles. Quail stops silently.
+DataFusion does the same: logical rules repeat, up to three passes by
+default, and physical rules run once. Spark repeats its rules up to
+100 times by default. Both log a warning when they hit the limit;
+Quail does not.
 
 See
 [`quail/planner/logical_optimizer.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/logical_optimizer.py)
