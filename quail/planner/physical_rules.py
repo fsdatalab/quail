@@ -13,7 +13,7 @@ from dataclasses import replace
 
 from quail.cost.budgets import PAGE_TOKENS, choose_attention_path
 from quail.physical import AiFilter, AiJoin, PhysicalGraph
-from quail.planner.prefixes import page_tree, prefix_credits
+from quail.planner.prefixes import document_shared_tokens, page_tree
 
 
 def _token_store(document_tokens):
@@ -23,8 +23,8 @@ def _token_store(document_tokens):
 
 def page_aligned_shared_tokens(store, page_tokens: int = PAGE_TOKENS) -> int:
     """Tokens a prefix tree over the store saves in whole KV pages."""
-    return sum(credit // page_tokens * page_tokens
-               for credit in prefix_credits(store))
+    return sum(shared // page_tokens * page_tokens
+               for shared in document_shared_tokens(store))
 
 
 def filter_attention(model, device, store, lengths, question_tokens: int) -> str:
@@ -39,15 +39,15 @@ def filter_attention(model, device, store, lengths, question_tokens: int) -> str
     for doc, parent in enumerate(tree.parent):
         if parent is None:
             continue
-        readers, rows = groups.get((parent, tree.share[doc]), (0, 0))
-        groups[(parent, tree.share[doc])] = (
-            readers + 1, rows + lengths[doc] - tree.share[doc])
+        readers, rows = groups.get((parent, tree.shared[doc]), (0, 0))
+        groups[(parent, tree.shared[doc])] = (
+            readers + 1, rows + lengths[doc] - tree.shared[doc])
     votes = {"tree": 0, "unified": 0}
-    for (_, share), (readers, rows) in groups.items():
+    for (_, shared), (readers, rows) in groups.items():
         path = choose_attention_path(
             model, device, readers=readers,
-            reader_rows=rows / readers + question_tokens, node_tokens=share)
-        votes[path] += readers * share
+            reader_rows=rows / readers + question_tokens, node_tokens=shared)
+        votes[path] += readers * shared
     return "tree" if votes["tree"] > votes["unified"] else "unified"
 
 
@@ -115,7 +115,8 @@ class TreeAttention:
     KV: under tree attention those reads are stacked into one, under
     unified attention each partner reads the anchor itself. The choice
     is by roofline (choose_attention_path). Tree attention needs the
-    two-call path, which the fp8 models without canvas rows run.
+    fp8 merge kernel and packs no canvas rows, so other models stay
+    unified.
 
     A filter sharing prefixes is annotated from its tree: the
     documents borrowing one parent's pages are that node's readers
@@ -133,7 +134,8 @@ class TreeAttention:
         if context is None:
             return None
         model, device = context.model, context.device
-        two_call = model.weight_precision == "fp8" and not model.canvas_tokens
+        tree_available = (model.weight_precision == "fp8"
+                          and not model.canvas_tokens)
         nodes = []
         changed = False
         for node in graph.nodes:
@@ -141,7 +143,7 @@ class TreeAttention:
                 lengths = context.document_tokens.get(node.alias, ())
                 store = _token_store(lengths)
                 path = "unified"
-                if two_call and node.share_prefixes and store is not None:
+                if tree_available and node.share_prefixes and store is not None:
                     path = filter_attention(
                         model, device, store, lengths,
                         node.stages[0].question_tokens if node.stages else 0)
@@ -150,7 +152,7 @@ class TreeAttention:
             elif isinstance(node, AiJoin) and not node.attention:
                 lengths = context.document_tokens.get(node.anchor, ())
                 path = "unified"
-                if two_call and node.stages:
+                if tree_available and node.stages:
                     stage = node.stages[0]
                     readers = (stage.expected_tuples / len(lengths)
                                if len(lengths) else 1.0)

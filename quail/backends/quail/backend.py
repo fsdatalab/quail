@@ -156,7 +156,7 @@ class QuailModelExecution:
                 retain_survivors=retain_survivors,
                 document_done=inputs.get("document_done"),
                 prefix_tree=tree,
-                attention_mode=_join_attention(node, pipeline),
+                attention_mode=node.attention or None,
                 stats=stats,
             )
             return filter_result(
@@ -188,7 +188,7 @@ class QuailModelExecution:
                 document_done=stream.get("document_done"),
                 prefix_tree=_filter_prefix_tree(
                     filter_node, stream["documents"], arena),
-                attention_mode=_join_attention(filter_node, pipeline),
+                attention_mode=filter_node.attention or None,
             )
         lists_for = inputs.get("anchor_partners")
         answers, spans, tokens = loop.run_join(
@@ -206,7 +206,7 @@ class QuailModelExecution:
             anchor_partners=(
                 None if lists_for is None else lambda key: lists_for(key[1])),
             anchor_batch=inputs.get("anchor_batch"),
-            attention_mode=_join_attention(node, pipeline),
+            attention_mode=node.attention or None,
         )
         if source is not None:
             # admission order; a per-batch function may have dropped some
@@ -282,18 +282,6 @@ def _filter_prefix_tree(node, documents, arena):
         "(tree built in %.2f s)", node.alias, len(documents),
         tree.shared_tokens, time.perf_counter() - started)
     return tree
-
-
-def _join_attention(node, pipeline):
-    """A node's attention mode: the plan's choice, else the loop's default.
-
-    A bf16 pipeline has no two-call path, so "tree" falls back to it.
-    """
-    if node.attention == "tree" and pipeline.join_attention == "merge_quant":
-        return "merge_quant"
-    if node.attention == "unified":
-        return "unified"
-    return None
 
 
 def _gpu_seconds(torch, spans, inputs) -> float:

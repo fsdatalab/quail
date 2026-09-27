@@ -489,7 +489,7 @@ def shared_prefix_lengths(sequences) -> list[int]:
     in; the per sequence credit is the longest common prefix with the
     lexicographic predecessor.
     """
-    return prefix_tree(sequences, 1).share
+    return prefix_tree(sequences, 1).shared
 
 
 def _token_array(document):
@@ -514,7 +514,8 @@ def _token_array(document):
 class PrefixTree:
     """Which document each document borrows its KV prefix from.
 
-    Documents are visited in sorted token order. A document's share is
+    Documents are visited in sorted token order. A document's shared
+    count is
     the tokens it has in common with its predecessor, rounded down to
     a whole page, so it can read those pages instead of computing
     them. Its parent is the earliest document that computed those
@@ -522,25 +523,25 @@ class PrefixTree:
     that borrowed at least as much. Documents sharing one prefix thus
     all borrow from the same parent, and a forward pass can read that
     parent's pages once for all of them. A document with nothing to
-    borrow has parent None and share 0.
+    borrow has parent None and shared 0.
 
     Attributes:
         order: Document positions in sorted token order; a parent
             always comes before its children.
         parent: Per document, the position it borrows from, or None.
-        share: Per document, the borrowed tokens, a multiple of the
+        shared: Per document, the borrowed tokens, a multiple of the
             page size.
     """
 
-    def __init__(self, order, parent, share):
+    def __init__(self, order, parent, shared):
         self.order = order
         self.parent = parent
-        self.share = share
+        self.shared = shared
 
     @property
     def shared_tokens(self) -> int:
         """Tokens the tree lets the engine read instead of compute."""
-        return sum(self.share)
+        return sum(self.shared)
 
 
 def prefix_tree(documents, page_tokens: int) -> PrefixTree:
@@ -570,7 +571,7 @@ def prefix_tree(documents, page_tokens: int) -> PrefixTree:
             return int(differ[0]) if len(differ) else limit
     order = sorted(range(n), key=keys.__getitem__)
     parent = [None] * n
-    share = [0] * n
+    shared = [0] * n
     previous = None
     for index in order:
         if previous is not None:
@@ -579,9 +580,9 @@ def prefix_tree(documents, page_tokens: int) -> PrefixTree:
             if pages:
                 # climb while the ancestor borrowed these pages too
                 owner = previous
-                while parent[owner] is not None and share[owner] >= pages:
+                while parent[owner] is not None and shared[owner] >= pages:
                     owner = parent[owner]
                 parent[index] = owner
-                share[index] = pages
+                shared[index] = pages
         previous = index
-    return PrefixTree(order, parent, share)
+    return PrefixTree(order, parent, shared)

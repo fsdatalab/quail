@@ -210,12 +210,12 @@ class KernelSourceEngine(Engine):
     # its eager merge kernel plus the standalone group-quant. out_b
     # covers only the rows with cached context, so those rows are
     # gathered, merged, and scattered back; the row list comes from
-    # the chunk meta stashed by attention_merge_quant below.
+    # the chunk meta stashed by attention_tree below.
 
-    def attention_merge_quant(self, q, k, v, meta):
-        cross = meta.get("cross")
-        self._merge_rows = None if cross is None else cross["rows"]
-        return super().attention_merge_quant(q, k, v, meta)
+    def attention_tree(self, q, k, v, meta):
+        reads = meta.get("reads")
+        self._merge_rows = None if reads is None else reads["rows"]
+        return super().attention_tree(q, k, v, meta)
 
     def merge_attn_quant(self, out_a, lse_a, out_b, lse_b, source):
         if self.kernel_source == "quail":

@@ -16,7 +16,7 @@ import time
 import numpy as np
 
 from quail.backends.quail.executor.attention import (
-    FILTER_ATTENTION,
+    ATTENTION_PATHS,
     Chunk,
 )
 from quail.backends.quail.executor.pack import FilterAdmission, JoinAdmission
@@ -222,7 +222,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
       start     Logical position of the first fresh prefix token; the
                 key's pages before it are borrowed from a parent and
                 already hold KV. 0 when absent.
-      read_key  Under two-call attention, the parent whose pages the
+      read_key  Under tree attention, the parent whose pages the
                 fresh rows read for positions before start; the rows
                 still write the group's own key. Consecutive groups
                 with one read_key and start share one read of it.
@@ -250,9 +250,9 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     def concatenate(parts):
         return np.concatenate(parts) if parts else np.empty(0, dtype=np.int64)
 
-    if attention_mode not in ("merge_quant", "unified"):
+    if attention_mode not in ATTENTION_PATHS:
         raise ValueError(
-            "attention_mode must be 'merge_quant' or 'unified', "
+            f"attention_mode must be one of {ATTENTION_PATHS}, "
             f"got {attention_mode!r}")
     canvas = tuple(canvas)
     if canvas and attention_mode != "unified":
@@ -262,16 +262,16 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             f"answer_row {answer_row} is outside the {len(canvas)}-row canvas")
     t = time.perf_counter() if timing is not None else 0.0
     # unified scatters every fresh row through its own src/dst map, so
-    # the cross and kv_writes bookkeeping below is two-call only
-    two_call = attention_mode != "unified"
+    # the reads and kv_writes bookkeeping below is tree only
+    tree_path = attention_mode == "tree"
     canvas_rows = []      # (first row, end row) per canvas
     canvas_seq = []       # its sequence in the unified paged call
     id_parts, token_count = [], 0
     pos, cu_a, finals = [], [0], []
-    suffix_rows = []
+    reader_rows = []      # rows that read resident KV in call B
     kv_writes, layout = [], []
     fresh_keys = []
-    cross_keys, cross_used, cu_q = [], [], [0]
+    read_keys, read_used, cu_q = [], [], [0]
     max_q = 0
     unified_groups = []
     for g in groups:
@@ -281,10 +281,10 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         start = g.get("start", 0)
         paged = arena.is_resident(key)
         row0 = token_count
-        # a borrowing fresh group under two-call attention: its rows
-        # read the parent's pages in call B and form one causal
-        # segment with the tail in call A
-        borrowing = fresh and start and two_call
+        # a borrowing fresh group under tree attention: its rows read
+        # the parent's pages in call B and form one causal segment
+        # with the tail in call A
+        borrowing = fresh and start and tree_path
         if fresh:
             if not paged and len(g["suffixes"]) > 1:
                 raise ValueError(
@@ -298,7 +298,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             if borrowing and (len(g["suffixes"]) != 1
                               or g.get("read_key") is None):
                 raise ValueError(
-                    f"group {key!r}: a borrowing group under two-call "
+                    f"group {key!r}: a borrowing group under tree "
                     f"attention names its read_key and has one suffix")
             id_parts.append(g["prefix"])
             token_count += len(g["prefix"])
@@ -306,7 +306,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                                  dtype=np.int64))
             if (paged or not g["suffixes"]) and not borrowing:
                 cu_a.append(token_count)
-            if paged and two_call:
+            if paged and tree_path:
                 kv_writes.append((key, row0, row0 + len(g["prefix"]),
                                   start))
                 fresh_keys.append(key)
@@ -333,7 +333,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             suffix_spans.append((srow, token_count))
             cu_a.append(token_count)
             wst = g.get("write_suffix_tokens", 0)
-            if si == 0 and wst and paged and two_call:
+            if si == 0 and wst and paged and tree_path:
                 # the shared question preamble joins the kept KV right
                 # after the document rows: after the fresh prefix, or
                 # after a kept document's f rows
@@ -345,22 +345,22 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             # every row of the group reads the parent's pages up to
             # start; siblings packed back to back share that read
             count = token_count - row0
-            suffix_rows.extend(range(row0, token_count))
+            reader_rows.extend(range(row0, token_count))
             read_key = g["read_key"]
-            if cross_keys and cross_keys[-1] == read_key \
-                    and cross_used[-1] == start:
+            if read_keys and read_keys[-1] == read_key \
+                    and read_used[-1] == start:
                 cu_q[-1] += count
                 max_q = max(max_q, cu_q[-1] - cu_q[-2])
             else:
                 cu_q.append(cu_q[-1] + count)
-                cross_keys.append(read_key)
-                cross_used.append(start)
+                read_keys.append(read_key)
+                read_used.append(start)
                 max_q = max(max_q, count)
-        elif s_count and f and paged and two_call:
-            suffix_rows.extend(range(s_row0, token_count))
+        elif s_count and f and paged and tree_path:
+            reader_rows.extend(range(s_row0, token_count))
             cu_q.append(cu_q[-1] + s_count)
-            cross_keys.append(key)
-            cross_used.append(f)
+            read_keys.append(key)
+            read_used.append(f)
             max_q = max(max_q, s_count)
         if attention_mode == "unified":
             if paged:
@@ -374,24 +374,24 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                     "group - an unpaged kept group has no KV to read")
 
     t = _tick(timing, "pack_py", t)
-    cross = None
-    if cross_keys:
-        table, _ = arena.block_table(cross_keys)
+    reads = None
+    if read_keys:
+        table, _ = arena.block_table(read_keys)
         t = _tick(timing, "pack_blocktable", t)
-        used = _staged(torch, cross_used, torch.int32, pinned)
-        cross = dict(
-            rows=_staged(torch, suffix_rows, torch.int64, pinned),
+        used = _staged(torch, read_used, torch.int32, pinned)
+        reads = dict(
+            rows=_staged(torch, reader_rows, torch.int64, pinned),
             cu_q=stage("unified_cu_q", cu_q, torch.int32),
             max_q=max_q, used=used,
-            max_used=max(cross_used), table=table)
-        # row -> its index in call B's output, -1 for prefix rows;
-        # the fused merge kernel's map
+            max_used=max(read_used), table=table)
+        # row -> its index in call B's output, -1 for rows that read
+        # nothing resident; the fused merge kernel's map
         source = [-1] * token_count
-        for i, row in enumerate(suffix_rows):
+        for i, row in enumerate(reader_rows):
             source[row] = i
-        cross["source"] = _staged(
+        reads["source"] = _staged(
             torch, source, torch.int32, pinned)
-    t = _tick(timing, "pack_cross", t)
+    t = _tick(timing, "pack_reads", t)
 
     # all of the chunk's KV writes as one list of (source, destination)
     # row pairs: the attention pass scatters them with a single kernel
@@ -546,7 +546,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                     used=unified["sliding"]["used"].index_select(0, seq),
                     max_used=max(pools[1].lengths[i] for i in canvas_seq))
     meta = dict(
-        layer=0, kv_src=kv_src, kv_dst=kv_dst, cross=cross,
+        layer=0, kv_src=kv_src, kv_dst=kv_dst, reads=reads,
         unified=unified, canvas=canvas_meta,
         cu_a=stage("cu_a", cu_a, torch.int32),
         max_a=max(cu_a[i + 1] - cu_a[i] for i in range(len(cu_a) - 1)))
@@ -560,6 +560,19 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         fresh_keys=tuple(fresh_keys))
     _tick(timing, "pack_h2d", t)
     return out
+
+
+def attention_path(pipeline, requested, default="unified") -> str:
+    """The path a chain runs: the plan's request where the model has it.
+
+    None asks for the default. A model without tree attention, and a
+    canvas model (whose rows the tree path does not pack), run unified.
+    """
+    if requested is None:
+        requested = default
+    if requested == "tree" and pipeline.tree_attention and not pipeline.canvas_ids:
+        return "tree"
+    return "unified"
 
 
 def _forward(pipeline, arena, chunk):
@@ -622,9 +635,8 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
             on each batch the source hands over before admission. A
             key it leaves out is freed, never admitted.
         staging: Optional reusable input transfer buffers.
-        attention_mode: "merge_quant" or "unified" as the plan chose;
-            None runs the pipeline's join_attention. A canvas model
-            runs unified whatever is asked.
+        attention_mode: "tree" or "unified" as the plan chose; None
+            and a model without tree attention run unified.
 
     Returns:
         (ans, spans, tokens): ans[j][a] = 0/1 row over the stage-j
@@ -645,10 +657,8 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     if len(keys) != len(prefixes):
         raise ValueError("anchor_keys must match anchor_prefixes")
     frames = stage_frames or [[] for _ in range(k)]
-    # the plan's choice; a canvas model runs the unified path only
-    mode = pipeline.join_attention
-    if attention_mode is not None and not pipeline.canvas_ids:
-        mode = attention_mode
+    # a join's partners read their anchor: tree unless the plan says
+    mode = attention_path(pipeline, attention_mode, default="tree")
     canvas = tuple(pipeline.canvas_ids)
     answer_row = pipeline.canvas_answer_row
 
@@ -684,7 +694,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         anchor_partners={a: partners_of(keys[a]) for a in range(len(keys))},
         # a windowed model may pack any chunk unified, so it reserves
         # the unified path's temporary pages throughout
-        temporary_suffix_pages=mode == FILTER_ATTENTION,
+        temporary_suffix_pages=mode == "unified",
         answer_dtype=async_ans.dtype,
         canvas_tokens=len(canvas),
         page_cost=arena.page_cost,
@@ -919,7 +929,7 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
     """
     warm_docs, question, doc = _warm_inputs(budget)
     q_max = len(question)
-    modes = dict.fromkeys((FILTER_ATTENTION, pipeline.join_attention))
+    modes = ("unified", "tree") if pipeline.tree_attention else ("unified",)
     for mode in modes:
         logger.debug("kernels: warming %s attention, full chunk", mode)
         run_filter(torch, arena, pipeline, async_ans, warm_docs,
@@ -1116,18 +1126,18 @@ class FilterStream:
         hold_extra_tokens: Rows past the prefix a held document's
             pages must cover (the consumer's largest frame), so the
             consumer never needs a page this chain did not claim.
-        attention_mode: Attention path of this chain's chunks; unified
-            when omitted. The warm-up runs the merge_quant path too.
+        attention_mode: "tree" or "unified" as the plan chose; None
+            and a model without tree attention run unified.
         document_done: Called after each chunk's answers are read with
             the documents that finished in it, as a list of
             (position, stage, passed) tuples: the document's position
             in doc_ids, the last stage it was asked, and whether it
             passed that stage. Must return quickly.
         prefix_tree: A PrefixTree over doc_ids, or None. A document
-            with a parent borrows the parent's pages for its share and
+            with a parent borrows the parent's pages for its shared tokens and
             packs only the tokens after it. Needs arena_writes. Under
-            the two-call path, documents borrowing the same pages in
-            one chunk read them once.
+            tree attention, documents borrowing the same pages in one
+            chunk read them once.
     """
 
     def __init__(self, torch, arena, pipeline, async_ans, doc_ids,
@@ -1163,7 +1173,7 @@ class FilterStream:
             # a later stage re-reads the KV, which needs the pages this
             # switch skips
             raise ValueError("arena_writes=False needs a single stage")
-        self.attention_mode = attention_mode or FILTER_ATTENTION
+        self.attention_mode = attention_path(pipeline, attention_mode)
         unified = self.attention_mode == "unified"
         if prefix_tree is not None and prefix_tree.shared_tokens:
             if not arena_writes:
@@ -1193,7 +1203,7 @@ class FilterStream:
             can_borrow=self._can_borrow)
         self.tree = prefix_tree
         # a document's place in tree order, for chunk order under
-        # two-call attention
+        # tree attention
         self.tree_position = ({doc: i for i, doc in enumerate(prefix_tree.order)}
                               if prefix_tree is not None else {})
         self.untrimmed = set()   # fresh docs whose children still borrow
@@ -1234,25 +1244,25 @@ class FilterStream:
 
         A parent admitted in the same chunk is not allocated yet; its
         sliding pages will start at the window origin below its own
-        share.
+        shared tokens.
         """
-        share = self.sched.share[doc]
+        shared = self.sched.shared[doc]
         key = self.keys[parent]
         if self.arena.is_resident(key):
-            return self.arena.can_borrow(key, share)
-        return (self.arena.origin(self.sched.share[parent])
-                <= self.arena.origin(share))
+            return self.arena.can_borrow(key, shared)
+        return (self.arena.origin(self.sched.shared[parent])
+                <= self.arena.origin(shared))
 
     def _spec(self, doc, stage, fresh):
         if fresh:
-            # the scheduler's share: 0 once the parent has left
-            share = self.sched.share[doc]
+            # the scheduler's count: 0 once the parent has left
+            shared = self.sched.shared[doc]
             prefix = self.doc_ids[doc]
             read_key = None
-            if share:
-                prefix = prefix[share:]
+            if shared:
+                prefix = prefix[shared:]
                 read_key = self.keys[self.sched.parent[doc]]
-            return dict(key=self.keys[doc], prefix=prefix, start=share,
+            return dict(key=self.keys[doc], prefix=prefix, start=shared,
                         read_key=read_key,
                         f=len(self.doc_ids[doc]), suffixes=[self.tails[0]],
                         write_suffix_tokens=self.preamble)
@@ -1300,7 +1310,7 @@ class FilterStream:
             self._report(self.outstanding.pop(0), items)
         for doc in self.sched.drain_ready():
             self.arena.free_key(self.keys[doc])
-        for doc in self.sched.release_parked():
+        for doc in self.sched.free_kept_parents():
             self.arena.free_key(self.keys[doc])
         self.progress.finish(
             f"filter ({len(self.tails)} stages) done",
@@ -1350,10 +1360,10 @@ class FilterStream:
                     continue
             if self.hold and sched.blocked_pages:
                 return items, True
-            if sched.parked:
-                # parked parents hold the pages: their children compute
+            if sched.kept_for_children:
+                # kept parents hold the pages: their children compute
                 # their whole documents instead
-                for doc in sched.release_parked():
+                for doc in sched.free_kept_parents():
                     arena.free_key(self.keys[doc])
                 continue
             raise AssertionError("nothing buildable and nothing in flight")
@@ -1366,19 +1376,19 @@ class FilterStream:
                     return (False, -1, 0)
                 parent = sched.parent[doc]
                 return (True, self.tree_position[
-                    doc if parent is None else parent], sched.share[doc])
+                    doc if parent is None else parent], sched.shared[doc])
             groups.sort(key=borrow_order)
         for doc, stage, fresh in groups:
             if fresh and self.arena_writes:
                 logical = len(self.doc_ids[doc]) + self.preamble
-                share = sched.share[doc]
+                shared = sched.shared[doc]
                 got = arena.activate(
                     self.keys[doc], logical,
                     capacity_tokens=len(self.doc_ids[doc])
                     + self.capacity_extra,
                     base_tokens=len(self.doc_ids[doc]),
-                    borrow=((self.keys[sched.parent[doc]], share)
-                            if share else None))
+                    borrow=((self.keys[sched.parent[doc]], shared)
+                            if shared else None))
                 assert got is not None, \
                     "scheduler admitted a doc the arena cannot hold"
         t = _tick(timing, "alloc", t)
@@ -1387,9 +1397,9 @@ class FilterStream:
                            timing=timing, pinned=self.pinned,
                            attention_mode=self.attention_mode,
                            canvas=self.canvas, answer_row=self.answer_row)
-        # a parked parent whose last child was just admitted: the
+        # a kept parent whose last child was just admitted: the
         # children hold its pages, the chunk holds its block table
-        for doc in sched.take_released():
+        for doc in sched.take_freed_parents():
             self.untrimmed.discard(doc)
             arena.free_key(self.keys[doc])
         t = _tick(timing, "pack", t)
@@ -1402,7 +1412,7 @@ class FilterStream:
         e1.record()
         # a fresh document's sliding pages before its window origin
         # were for this pass only, unless a child still has to borrow
-        # the window below its share
+        # the window below its shared tokens
         if self.arena_writes:
             self.untrimmed.update(doc for doc, _, fresh in groups if fresh)
             for doc in list(self.untrimmed):

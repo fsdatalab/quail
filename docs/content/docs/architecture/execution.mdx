@@ -111,7 +111,7 @@ model layer. For each layer:
    a fused kernel merges the two by log-sum-exp and quantizes to FP8.
    The planner's `tree_attention` rule picks the path per operator by
    a roofline (see [Planning](/docs/architecture/planning#deciding-prefix-sharing-and-the-attention-path)).
-   Tree attention needs the FP8 two-call kernels; a bf16 model or a
+   Tree attention needs the FP8 merge kernel; a bf16 model or a
    diffusion model with canvas rows always runs unified.
 5. **Output projection** via DeepGEMM.
 6. **MLP** (gate-up projection, SiLU activation, down projection).

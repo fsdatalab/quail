@@ -9,7 +9,6 @@ import pytest
 from fakes import cpu_arena, fake_pipeline, fake_torch
 
 from quail.backends.quail.executor import loop, model
-from quail.backends.quail.executor.attention import JOIN_ATTENTION
 from quail.backends.quail.executor.model import answer_weights, retain_answer_head
 from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers, AsyncScores
 from quail.builtins import built_in_registry
@@ -111,7 +110,7 @@ def test_run_join_evicts_then_halves_a_chunk_that_does_not_fit(monkeypatch):
     # nothing retained to evict, so the two-group chunk ran as two chunks
     assert failed == [2] and len(evictions) == 1 and evictions[0] > 0
     assert sizes == [1, 1]
-    assert modes == {JOIN_ATTENTION}
+    assert modes == {"tree"}
     assert answers_out == [{0: [1], 1: [1]}]
 
 

@@ -208,13 +208,13 @@ def test_pack_chunk_reads_borrowed_pages_in_the_unified_call(monkeypatch):
             torch, arena,
             [dict(key=child, prefix=doc[64:94], start=64, f=94,
                   suffixes=[tail])],
-            attention_mode="merge_quant")
+            attention_mode="tree")
     arena.free_key(parent)
     arena.free_key(child)
     assert arena.free_pages == 64
 
 
-def test_pack_chunk_stacks_borrowing_siblings_in_the_two_call_path(
+def test_pack_chunk_stacks_borrowing_siblings_under_tree_attention(
         monkeypatch):
     cpu_staging(monkeypatch)
     arena = KVArena(n_layers=1, n_pages=64, page_tokens=16, n_kv=1, d_head=2,
@@ -235,19 +235,19 @@ def test_pack_chunk_stacks_borrowing_siblings_in_the_two_call_path(
               suffixes=[tail], write_suffix_tokens=1),
          dict(key=b, prefix=doc[64:70], start=64, read_key=parent, f=70,
               suffixes=[tail], write_suffix_tokens=1)],
-        attention_mode="merge_quant")
+        attention_mode="tree")
     assert chunk.fresh_keys == (parent, a, b)
     # call A: the parent's prefix, its tail, then each sibling's
     # prefix and tail as one causal segment
     assert chunk.meta["cu_a"].tolist() == [0, 100, 101, 112, 119]
-    cross = chunk.meta["cross"]
+    reads = chunk.meta["reads"]
     # call B: the parent's tail reads its 100 rows; both siblings' 18
     # rows read the parent's 64 shared positions in one sequence
-    assert cross["cu_q"].tolist() == [0, 1, 19]
-    assert cross["used"].tolist() == [100, 64]
-    assert cross["max_q"] == 18
-    assert cross["rows"].tolist() == [100] + list(range(101, 119))
-    table = cross["table"].tolist()
+    assert reads["cu_q"].tolist() == [0, 1, 19]
+    assert reads["used"].tolist() == [100, 64]
+    assert reads["max_q"] == 18
+    assert reads["rows"].tolist() == [100] + list(range(101, 119))
+    table = reads["table"].tolist()
     assert table[1][:4] == table[0][:4]
     # the siblings' prefixes and kept tails write their own pages after
     # the borrowed ones
@@ -349,7 +349,7 @@ def test_can_borrow_needs_the_parent_window():
     assert arena.sliding_start(middle) == 64
     assert not arena.can_borrow(middle, 16)
     assert arena.can_borrow(middle, 112)
-    # the root still has them; a share past its tokens is refused
+    # the root still has them; a shared count past its tokens is refused
     assert arena.can_borrow(root, 16)
     assert not arena.can_borrow(root, 112)
     assert not arena.can_borrow(("d", 9), 16)

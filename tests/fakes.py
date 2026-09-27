@@ -91,7 +91,7 @@ def cpu_arena(pages):
 
     def allocate(key, tokens, capacity_tokens=None, base_tokens=None,
                  sliding_tokens=None, borrow=None):
-        borrowed = (arena.accounting.prefix_pages(*borrow) if borrow else ())
+        borrowed = (arena.accounting.shared_pages(*borrow) if borrow else ())
         got = arena.accounting.alloc(key, tokens, capacity_tokens,
                                      borrowed=borrowed)
         if got is not None:

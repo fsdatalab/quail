@@ -47,8 +47,8 @@ def _model(torch, dtype):
 
 
 @pytest.mark.parametrize("dtype_name, expected", [
-    ("float8_e4m3fn", "merge_quant"), ("bfloat16", "unified")])
-def test_join_attention_follows_the_weight_precision(dtype_name, expected):
+    ("float8_e4m3fn", True), ("bfloat16", False)])
+def test_tree_attention_follows_the_weight_precision(dtype_name, expected):
     torch = pytest.importorskip("torch")
     engines = []
 
@@ -58,6 +58,6 @@ def test_join_attention_follows_the_weight_precision(dtype_name, expected):
 
     pipeline = Qwen3Pipeline(_model(torch, getattr(torch, dtype_name)), None,
                              spec=None, engine_class=engine)
-    assert engines[0]["fp8"] is (expected == "merge_quant")
-    assert pipeline.join_attention == expected
+    assert engines[0]["fp8"] is expected
+    assert pipeline.tree_attention is expected
     assert pipeline.max_chunk_tokens == (2**31 - 1) // 4096

@@ -142,7 +142,7 @@ def test_pack_chunk_appends_canvas_rows_after_each_suffix(monkeypatch):
     assert plain.meta["canvas"] is None
     assert plain.final_indices.tolist() == [4, 7]
     with pytest.raises(ValueError, match="unified"):
-        loop.pack_chunk(torch, arena, groups, attention_mode="merge_quant",
+        loop.pack_chunk(torch, arena, groups, attention_mode="tree",
                         canvas=canvas)
 
 
@@ -301,7 +301,7 @@ def test_pipeline_runs_the_gemma4_layer_order(monkeypatch):
             _fake_model(torch), None, engine_class=_Engine,
             spec=_spec_for(_fake_model(torch), sliding_window=512))
     assert seen["workspace"] == "cuda"
-    assert pipeline.join_attention == "unified" and not pipeline.gemm_warmup
+    assert not pipeline.tree_attention and not pipeline.gemm_warmup
     assert pipeline.max_chunk_tokens == (2**31 - 1) // 32
 
     rows = torch.tensor([3, 4, 5])

@@ -85,7 +85,7 @@ def test_retention_rewind_and_pinning():
 def test_borrowed_pages_are_shared_until_the_last_holder_frees_them():
     a = PageArena(n_pages=10, page_tokens=16)
     parent = a.alloc("p", 40)                 # pages for 40 tokens: 3
-    child = a.alloc("c", 50, borrowed=a.prefix_pages("p", 32))  # borrows 2, owns 2
+    child = a.alloc("c", 50, borrowed=a.shared_pages("p", 32))  # borrows 2, owns 2
     assert len(child) == 2 and a.free_pages == 5
     assert a.table_pages("c") == parent[:2] + child
     assert a.borrowed_tokens("c") == 32
@@ -99,8 +99,8 @@ def test_borrowed_pages_are_shared_until_the_last_holder_frees_them():
 
     # a grandchild borrows through its parent's borrowed pages
     a.alloc("p", 40)
-    a.alloc("c", 50, borrowed=a.prefix_pages("p", 32))
-    a.alloc("g", 60, borrowed=a.prefix_pages("c", 48))
+    a.alloc("c", 50, borrowed=a.shared_pages("p", 32))
+    a.alloc("g", 60, borrowed=a.shared_pages("c", 48))
     assert a.table_pages("g")[:2] == a.table_pages("p")[:2]
     assert a.table_pages("g")[2] == a.owned["c"][0]
     for key in ("p", "c", "g"):
@@ -109,7 +109,7 @@ def test_borrowed_pages_are_shared_until_the_last_holder_frees_them():
 
     # rewinding never drops borrowed pages; growing adds own pages
     a.alloc("p", 40)
-    a.alloc("c", 50, borrowed=a.prefix_pages("p", 32))
+    a.alloc("c", 50, borrowed=a.shared_pages("p", 32))
     assert a.rewind("c", 33) == 1
     assert a.tokens["c"] == 33 and len(a.owned["c"]) == 1
     with pytest.raises(ValueError):
@@ -125,16 +125,16 @@ def test_borrowed_pages_are_shared_until_the_last_holder_frees_them():
     a.alloc("p", 40)
 
     with pytest.raises(ValueError):
-        a.prefix_pages("p", 20)                 # not a whole page
+        a.shared_pages("p", 20)                 # not a whole page
     with pytest.raises(ValueError):
-        a.alloc("x", 16, borrowed=a.prefix_pages("p", 32))  # past its tokens
+        a.alloc("x", 16, borrowed=a.shared_pages("p", 32))  # past its tokens
     with pytest.raises(KeyError):
-        a.prefix_pages("nobody", 16)
+        a.shared_pages("nobody", 16)
     with pytest.raises(ValueError):
-        a.prefix_pages("p", 48)                 # parent holds 40
+        a.shared_pages("p", 48)                 # parent holds 40
     # a slice of the parent, as the sliding pool borrows, and dropping
     # leading pages takes borrowed pages before own ones
-    a.alloc("s", 48, borrowed=a.prefix_pages("p", 32, 16))
+    a.alloc("s", 48, borrowed=a.shared_pages("p", 32, 16))
     assert a.table_pages("s")[:1] == a.table_pages("p")[1:2]
     # the parent still holds the borrowed page; one own page goes free
     assert a.drop_leading("s", 2) == 1

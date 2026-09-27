@@ -420,7 +420,7 @@ def test_numeric_join_answers_preserve_values_across_chunks():
 
 
 def test_filter_admission_borrows_from_a_resident_parent():
-    tree = PrefixTree(order=[1, 0, 2], parent=[1, None, 0], share=[32, 0, 48])
+    tree = PrefixTree(order=[1, 0, 2], parent=[1, None, 0], shared=[32, 0, 48])
     # doc 1 (60 tokens) is the root; doc 0 borrows 32 of its 64; doc 2
     # borrows 48 of its 100 through doc 0. Pages: 16 tokens each.
     sched = FilterAdmission([64, 60, 100], [10], 500, arena_pages=20,
@@ -435,42 +435,42 @@ def test_filter_admission_borrows_from_a_resident_parent():
     assert sched.done() and sched.free_pages == 20
 
     # a child waits while its parent is queued behind a full chunk
-    tree = PrefixTree(order=[0, 1], parent=[None, 0], share=[0, 32])
+    tree = PrefixTree(order=[0, 1], parent=[None, 0], shared=[0, 32])
     sched = FilterAdmission([64, 64], [10], 80, arena_pages=20,
                             page_tokens=16, tree=tree)
     assert sched.next_chunk() == [(0, 0, True)]      # no room for the child
     # the parent answers before the child is admitted: its pages are
-    # parked for the child, which borrows them and pays for its own
+    # kept for the child, which borrows them and pays for its own
     assert sched.report(0, 0, False) == ()
-    assert sched.parked == {0} and sched.resident == {0: 4}
+    assert sched.kept_for_children == {0} and sched.resident == {0: 4}
     assert sched.next_chunk() == [(1, 0, True)]
-    assert sched.share[1] == 32 and sched.parent[1] == 0
-    # the last child admitted releases the parked parent
-    assert sched.take_released() == [0] and not sched.parked
+    assert sched.shared[1] == 32 and sched.parent[1] == 0
+    # the last child admitted frees the kept parent
+    assert sched.take_freed_parents() == [0] and not sched.kept_for_children
     assert sched.resident == {1: 2}
     assert sched.report(1, 0, True) == (1,)
     assert sched.done() and sched.free_pages == 20
 
-    # a parked parent whose children never come is released at the end
+    # a kept parent whose children never come is freed at the end
     sched = FilterAdmission([64, 64], [10], 80, arena_pages=20,
                             page_tokens=16, tree=tree, limit=1)
     assert sched.next_chunk() == [(0, 0, True)]
     assert sched.report(0, 0, True) == ()
-    assert sched.done() and sched.parked == {0}
-    assert sched.release_parked() == [0]
+    assert sched.done() and sched.kept_for_children == {0}
+    assert sched.free_kept_parents() == [0]
     assert sched.free_pages == 20 and not sched.resident
 
     # a borrow the arena cannot serve packs the whole document instead
-    tree = PrefixTree(order=[0, 1], parent=[None, 0], share=[0, 32])
+    tree = PrefixTree(order=[0, 1], parent=[None, 0], shared=[0, 32])
     sched = FilterAdmission([64, 64], [10], 200, arena_pages=20,
                             page_tokens=16, tree=tree,
                             can_borrow=lambda doc, parent: False)
     assert sched.next_chunk() == [(0, 0, True), (1, 0, True)]
-    assert sched.share[1] == 0 and sched.resident == {0: 4, 1: 4}
+    assert sched.shared[1] == 0 and sched.resident == {0: 4, 1: 4}
     assert sched.children_left[0] == 0
 
     # a kept borrower is rewound to its own tokens: pages_for(32)=2 kept
-    tree = PrefixTree(order=[0, 1], parent=[None, 0], share=[0, 32])
+    tree = PrefixTree(order=[0, 1], parent=[None, 0], shared=[0, 32])
     sched = FilterAdmission([64, 64], [10], 200, arena_pages=20,
                             page_tokens=16, tree=tree, kept_extra_tokens=20)
     assert sched.next_chunk() == [(0, 0, True), (1, 0, True)]
@@ -508,7 +508,7 @@ def _tree_stream(monkeypatch, *, truth, budget, hold=False, retain=(),
         docs = [[DOC] * 64, [DOC] * 32 + [DOC + 1] * 32, [DOC + 2] * 64]
     if tree is None:
         tree = PrefixTree(order=list(order), parent=[None, 0, None],
-                          share=[0, 32, 0])
+                          shared=[0, 32, 0])
     stream = loop.FilterStream(
         fake_torch(), arena, pipeline, answers, docs, [[QUESTION]], budget,
         arena_writes=True, arena_keys=[("r", d) for d in range(len(docs))],
@@ -528,7 +528,7 @@ def _run(stream, arena, free_handed=False):
     return handed
 
 
-def test_filter_stream_stacks_siblings_on_the_two_call_path(monkeypatch):
+def test_filter_stream_stacks_siblings_under_tree_attention(monkeypatch):
     from fakes import DOC, fake_pack
 
     from quail.backends.quail.executor import loop
@@ -540,16 +540,17 @@ def test_filter_stream_stacks_siblings_on_the_two_call_path(monkeypatch):
                        for s in specs])
         return fake_pack(torch, arena, specs, **kw)
 
-    # two siblings and another root packed in one chunk on the two-call
-    # path: the siblings follow their parent in one run, each naming it
-    # as the read key, and the other root comes at its place in tree order
+    # two siblings and another root packed in one chunk under tree
+    # attention: the siblings follow their parent in one run, each
+    # naming it as the read key, and the other root comes at its place
+    # in tree order
     docs = [[DOC] * 64, [DOC] * 32 + [DOC + 1] * 8, [DOC + 2] * 64,
             [DOC] * 32 + [DOC + 3] * 8]
     tree = PrefixTree(order=[0, 1, 3, 2], parent=[None, 0, None, 0],
-                      share=[0, 32, 0, 32])
+                      shared=[0, 32, 0, 32])
     stream, arena = _tree_stream(
         monkeypatch, truth={0: [1], 1: [1], 2: [1], 3: [1]}, budget=500,
-        docs=docs, tree=tree, attention_mode="merge_quant")
+        docs=docs, tree=tree, attention_mode="tree")
     monkeypatch.setattr(loop, "pack_chunk", recording_pack)
     _run(stream, arena)
     assert stream.answers == {0: [1], 1: [1], 2: [1], 3: [1]}
@@ -564,11 +565,11 @@ def test_filter_stream_stacks_siblings_on_the_two_call_path(monkeypatch):
     docs = [[DOC] * 48 + [DOC + 1] * 16, [DOC] * 48 + [DOC + 1] * 16 + [5] * 8,
             [DOC] * 48]
     tree = PrefixTree(order=[2, 0, 1], parent=[2, 0, None],
-                      share=[48, 64, 0])
+                      shared=[48, 64, 0])
     packed.clear()
     stream, arena = _tree_stream(
         monkeypatch, truth={0: [1], 1: [1], 2: [1]}, budget=500,
-        docs=docs, tree=tree, attention_mode="merge_quant")
+        docs=docs, tree=tree, attention_mode="tree")
     monkeypatch.setattr(loop, "pack_chunk", recording_pack)
     _run(stream, arena)
     assert packed == [[(("r", 2), 0, None), (("r", 0), 48, ("r", 2)),
@@ -597,7 +598,7 @@ def test_filter_stream_shares_pages_with_a_resident_parent(monkeypatch):
     assert arena.free_pages == 64
 
     # with another document between them the parent has answered
-    # before the child's turn: its pages are parked, the child borrows
+    # before the child's turn: its pages are kept, the child borrows
     stream, arena = _tree_stream(
         monkeypatch, truth={0: [0], 1: [1], 2: [1]}, budget=65,
         order=(0, 2, 1))
@@ -607,7 +608,7 @@ def test_filter_stream_shares_pages_with_a_resident_parent(monkeypatch):
     assert stream.sched.borrowed_tokens == 32
     assert arena.free_pages == 64 and not arena.accounting.owned
 
-    # a limit ends the run with the parent parked: its key is freed
+    # a limit ends the run with the parent kept: its key is freed
     stream, arena = _tree_stream(
         monkeypatch, truth={0: [1], 1: [1], 2: [1]}, budget=65,
         order=(0, 2, 1), limit=1)

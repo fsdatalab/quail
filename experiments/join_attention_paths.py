@@ -1,9 +1,9 @@
-"""Measure a join both ways: two-call (tree) attention against unified.
+"""Measure a join both ways: tree attention against unified.
 
 The tree_attention planner rule picks the path by a roofline. On
 QUAIL-B it picks "unified" only for the LePaRD joins: a 208-token
 anchor read by partners of about 63 rows each. This runs one such
-query and one the rule leaves on the two-call path, each forced both
+query and one the rule leaves on the tree path, each forced both
 ways in one session, and records runtime and fresh tokens.
 
     mkdir -p results/benchmark
