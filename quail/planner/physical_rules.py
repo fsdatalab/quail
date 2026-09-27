@@ -27,25 +27,21 @@ def page_aligned_shared_tokens(store, page_tokens: int = PAGE_TOKENS) -> int:
                for credit in prefix_credits(store))
 
 
-# CPU seconds per document to sort a corpus and take prefixes, measured
-# on the worker (13 us per document on AGENT); the GPU idles meanwhile
-TREE_SECONDS_PER_DOCUMENT = 20e-6
-
-
 def sharing_pays(model, device, *, shared_tokens: int, total_tokens: int,
-                 n_docs: int, writes_pages: bool) -> bool:
+                 writes_pages: bool) -> bool:
     """Whether borrowing shared prefixes saves more than it costs.
 
-    Borrowing saves the forward pass over the shared tokens. It costs
-    the tree build on the worker, and, for a filter that did not write
-    KV pages, writing them for every token of the corpus.
+    Borrowing saves the forward pass over the shared tokens. For a
+    filter that did not write KV pages, it costs writing them for every
+    token of the corpus. The worker's sort of the corpus is not priced:
+    about 12 microseconds per document, under 1 percent of the filter's
+    forward passes on 300-token documents.
     """
     if shared_tokens <= 0:
         return False
     saved = shared_tokens * 2.0 * model.params / device.peak_flops
-    cost = n_docs * TREE_SECONDS_PER_DOCUMENT
-    if not writes_pages:
-        cost += total_tokens * model.kappa / device.hbm_bw
+    cost = (0.0 if writes_pages
+            else total_tokens * model.kappa / device.hbm_bw)
     return saved > cost
 
 
@@ -72,7 +68,7 @@ class PrefixSharing:
                 if store is not None and sharing_pays(
                         context.model, context.device,
                         shared_tokens=page_aligned_shared_tokens(store),
-                        total_tokens=sum(lengths), n_docs=len(lengths),
+                        total_tokens=sum(lengths),
                         writes_pages=node.arena_writes):
                     node = replace(node, share_prefixes=True,
                                    arena_writes=True)

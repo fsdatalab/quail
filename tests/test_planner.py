@@ -692,14 +692,11 @@ def test_prefix_sharing_fires_on_a_store_with_shared_pages(tmp_path):
         document_column="body", tokenizer=tokenizer, token_type=pa.int32())
     assert page_aligned_shared_tokens(little) == 16
     assert not filter_chain(_plan(logical, {"r": little.lengths})).share_prefixes
-    # one shared page saves 58 microseconds of forward pass; sorting
-    # 10,000 documents costs 0.2 s, so even a page-writing filter declines
-    assert not sharing_pays(QWEN3_4B_FP8, H100_SXM, shared_tokens=16,
-                            total_tokens=10_017, n_docs=10_000,
-                            writes_pages=True)
+    # a filter that already writes pages shares any whole page
+    assert sharing_pays(QWEN3_4B_FP8, H100_SXM, shared_tokens=16,
+                        total_tokens=10_017, writes_pages=True)
     assert sharing_pays(QWEN3_4B_FP8, H100_SXM, shared_tokens=12_000_000,
-                        total_tokens=17_000_000, n_docs=1772,
-                        writes_pages=False)
+                        total_tokens=17_000_000, writes_pages=False)
 
     # attributes round-trip through the codec
     from quail.physical import AiFilter
