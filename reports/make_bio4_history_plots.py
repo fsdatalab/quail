@@ -18,10 +18,10 @@ Pass --table to print the report's tables instead of drawing. Startup
 seconds are the median of the configuration's startup samples, the one
 from its query run included.
 
-Writes three figures to plots/, each by date: bio4_history_quail.png
+Writes three figures to plots/, each by date: bio4_history_quail.pdf
 (Quail's query and startup seconds at each merge, every change
-labeled), bio4_history_versus_vllm.png (the same for the vLLM baselines
-and Quail), and bio4_history_tokens.png (fresh input tokens, recomputed
+labeled), bio4_history_versus_vllm.pdf (the same for the vLLM baselines
+and Quail), and bio4_history_tokens.pdf (fresh input tokens, recomputed
 KV tokens, and answer agreement). Percentages and ratios are derived
 here from the saved summaries.
 """
@@ -39,9 +39,7 @@ HERE = Path(__file__).resolve().parent
 OUT = HERE / "plots"
 plt.style.use(HERE / "quail.mplstyle")
 sys.path.insert(0, str(HERE))
-from plot_colors import BLUE, DARK, GRAY, LIGHT_GRAY, ORANGE  # noqa: E402
-
-GRAY_TEXT = "#777777"
+from plot_colors import BLUE, DARK, GRAY, GREEN, LIGHT_GRAY, ORANGE  # noqa: E402
 
 # the vLLM baselines, then Quail's steps in merge order
 ORDER = (
@@ -73,7 +71,6 @@ SHORT = {
     "plan_on_estimates": "plan on estimates",
     "filter_join_streaming": "filter-join streaming",
     "gigatoken": "Gigatoken",
-    "quail-today-repeat": "today's code, second run",
 }
 
 
@@ -204,10 +201,10 @@ def quail_plot(summaries, names, out):
     startup = np.array([seconds(r)[1] for r in rows])
     query_steps = steps_over(query, 0.03)
     startup_steps = steps_over(startup, 0.15)
-    fig = plt.figure(figsize=(12, 7.6))
+    fig = plt.figure(figsize=(12, 8))
     fig.set_layout_engine("none")
-    top = fig.add_axes((0.07, 0.3, 0.78, 0.63))
-    low = fig.add_axes((0.07, 0.06, 0.78, 0.2))
+    top = fig.add_axes((0.07, 0.34, 0.78, 0.58))
+    low = fig.add_axes((0.07, 0.06, 0.78, 0.18))
     stop = t[-1] + 2.5
     date_axis(low, t[0] - 3, stop)
     top.set_xlim(low.get_xlim())
@@ -233,20 +230,18 @@ def quail_plot(summaries, names, out):
     top.set_yticks(np.arange(100 * np.ceil(bottom / 100), query.max(), 100))
     low.set_ylim(0, startup.max() * 1.12)
     low.set_yticks(np.arange(0, startup.max(), 20))
-    for ax, values in ((top, query), (low, startup)):
-        ax.vlines(t, ax.get_ylim()[0], values, color="#EFEFEF", lw=0.8,
-                  zorder=0)
+    for ax in (top, low):
         ax.yaxis.grid(True, color=LIGHT_GRAY, lw=0.6)
         ax.set_axisbelow(True)
-    for ax, values, steps, color in ((top, query, query_steps, BLUE),
-                                     (low, startup, startup_steps, DARK)):
+        ax.set_ylabel("seconds")
+    for ax, values, steps in ((top, query, query_steps),
+                              (low, startup, startup_steps)):
         for i, step in steps.items():
             middle = (values[i] + values[i - 1]) / 2
             ax.annotate(signed(step), (t[i], middle), xytext=(6, 0),
                         textcoords="offset points", ha="left", va="center",
-                        fontsize=10, fontweight="bold", color=color)
-    top.set_ylabel("query seconds")
-    low.set_ylabel("startup seconds")
+                        fontsize=10, fontweight="bold",
+                        color=GREEN if step < 0 else DARK)
     top.text(t[0] - 0.3, query[0], f"{query[0]:,.0f} s", ha="right",
              va="center", fontsize=10, fontweight="bold", color=BLUE)
     low.text(t[0] - 0.3, startup[0], f"{startup[0]:,.0f} s", ha="right",
@@ -257,22 +252,12 @@ def quail_plot(summaries, names, out):
     low.text(stop + 0.3, startup[-1], f"startup today:\n{startup[-1]:,.0f} s",
              ha="left", va="center", fontsize=10, fontweight="bold",
              color=DARK, clip_on=False)
-    repeat = summaries.get("quail-today-repeat")
-    if repeat:
-        again = seconds(repeat)[0]
-        top.scatter([t[-1]], [again], s=24, color="white", edgecolor=BLUE,
-                    lw=1.4, zorder=3)
-        spread_pct = f"{100 * (again / query[-1] - 1):+.1f}%".replace("-", "\u2212")
-        top.annotate(f"same code, second run: {again:,.0f} s ({spread_pct})",
-                     (t[-1], again), xytext=(0, -10),
-                     textcoords="offset points", ha="center", va="top",
-                     fontsize=9, color=GRAY_TEXT)
     total_first, total_last = query[0] + startup[0], query[-1] + startup[-1]
-    fig.text(0.07, 0.975, "BIO-4 at sf=0.5 on Quail's code at each merge "
-             f"date: startup + query went from {total_first:,.0f} s to "
-             f"{total_last:,.0f} s", ha="left", va="top", fontsize=12,
-             fontweight="bold", color=DARK)
-    fig.savefig(out, dpi=300)
+    top.set_title(f"BIO-4 query time on Quail's code at each merge date "
+                  f"(startup + query: {total_first:,.0f} s to "
+                  f"{total_last:,.0f} s)")
+    low.set_title("BIO-4 startup time (process start to engine ready)")
+    fig.savefig(out)
     plt.close(fig)
 
 
@@ -348,7 +333,7 @@ def versus_plot(summaries, names, out):
     ax.text(arrow_x - 0.5, (qtotal[-1] + vtotal[-1]) / 2,
             f"{vtotal[-1] / qtotal[-1]:.1f}\u00d7 less time,\nstartup + query",
             ha="right", va="center", fontsize=10, fontweight="bold",
-            color=DARK)
+            color=GREEN)
     handles = [
         plt.Line2D([], [], color=ORANGE, lw=2, label="vLLM, query"),
         plt.Line2D([], [], color=BLUE, lw=2, label="Quail, query"),
@@ -361,9 +346,8 @@ def versus_plot(summaries, names, out):
     ax.yaxis.grid(True, color=LIGHT_GRAY, lw=0.6)
     ax.set_axisbelow(True)
     ax.set_ylabel("seconds")
-    ax.set_title("BIO-4 at sf=0.5: the vLLM baselines and Quail by date",
-                 loc="left")
-    fig.savefig(out, dpi=300)
+    ax.set_title("BIO-4 startup + query time: vLLM baselines and Quail by date")
+    fig.savefig(out)
     plt.close(fig)
 
 
@@ -373,11 +357,12 @@ def token_plot(summaries, names, out):
     quail, qt, _, _ = history(summaries, names, quail=True)
     stop = max(vt + qt) + 2.5
     panels = (
-        ("Fresh input tokens", "millions of tokens",
+        ("Fresh input tokens by date", "millions of tokens",
          lambda r: r["metrics"]["fresh_tokens"] / 1e6, "{:.1f} M"),
-        ("Recomputed KV tokens", "millions of tokens",
+        ("Recomputed KV tokens by date", "millions of tokens",
          lambda r: r["metrics"]["regret_tokens"] / 1e6, "{:.1f} M"),
-        ("Answer agreement with the Qwen3 32B reference labels", "percent",
+        ("Answer agreement with the Qwen3 32B reference labels by date",
+         "percent",
          lambda r: 100 * agreement(r), "{:.1f}%"),
     )
     fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
@@ -406,7 +391,8 @@ def token_plot(summaries, names, out):
             step = f"{q[i] / q[i - 1] - 1:+.0%}".replace("-", "\u2212")
             ax.annotate(f"filter-join streaming #92: {step}", (qt[i], q[i]),
                         xytext=(-8, -4), textcoords="offset points",
-                        ha="right", va="top", fontsize=9.5, color=DARK)
+                        ha="right", va="top", fontsize=9.5, color=GREEN,
+                        fontweight="bold")
         if abs(v[-1] / v[-2] - 1) >= 0.03:
             ax.annotate("vLLM tokenizes whole prompt text (#167)",
                         (vt[-1], v[-1]), xytext=(-8, 0),
@@ -418,10 +404,8 @@ def token_plot(summaries, names, out):
         ax.yaxis.grid(True, color=LIGHT_GRAY, lw=0.6)
         ax.set_axisbelow(True)
         ax.set_ylabel(unit)
-        ax.set_title(title, loc="left", fontsize=11)
-    fig.suptitle("BIO-4 at sf=0.5: tokens and answer agreement by date",
-                 x=0.07, ha="left", fontsize=13, fontweight="bold")
-    fig.savefig(out, dpi=300)
+        ax.set_title(f"BIO-4 {title[0].lower()}{title[1:]}", fontsize=11)
+    fig.savefig(out)
     plt.close(fig)
 
 
@@ -472,9 +456,9 @@ def main():
         tables(summaries, names)
         return
     OUT.mkdir(exist_ok=True)
-    versus_plot(summaries, names, OUT / "bio4_history_versus_vllm.png")
-    quail_plot(summaries, names, OUT / "bio4_history_quail.png")
-    token_plot(summaries, names, OUT / "bio4_history_tokens.png")
+    versus_plot(summaries, names, OUT / "bio4_history_versus_vllm.pdf")
+    quail_plot(summaries, names, OUT / "bio4_history_quail.pdf")
+    token_plot(summaries, names, OUT / "bio4_history_tokens.pdf")
     print(f"wrote three figures to {OUT}")
 
 
