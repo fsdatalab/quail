@@ -73,6 +73,7 @@ SHORT = {
     "plan_on_estimates": "plan on estimates",
     "filter_join_streaming": "filter-join streaming",
     "gigatoken": "Gigatoken",
+    "quail-today-repeat": "today's code, second run",
 }
 
 
@@ -181,53 +182,96 @@ def date_axis(ax, start, stop):
     ax.set_xlim(start, stop)
 
 
+def signed(change) -> str:
+    return f"{change:+.0%}".replace("-", "\u2212")
+
+
+def steps_over(values, threshold) -> dict:
+    """Index -> change from the row before, for changes of threshold or more."""
+    return {i: values[i] / values[i - 1] - 1 for i in range(1, len(values))
+            if abs(values[i] / values[i - 1] - 1) >= threshold}
+
+
 def quail_plot(summaries, names, out):
-    """Quail's startup and query seconds at each merge date."""
+    """Quail's query seconds and startup seconds at each merge date.
+
+    Query moves under 3% and startup moves under 15% are within the
+    spread of repeated runs, so only larger moves are marked.
+    """
     rows = [summaries[n] for n in names if summaries[n]["backend"] == "quail"]
     t = [mdates.date2num(when(r)) for r in rows]
     query = np.array([seconds(r)[0] for r in rows])
-    total = query + np.array([seconds(r)[1] for r in rows])
-    fig = plt.figure(figsize=(12, 7))
+    startup = np.array([seconds(r)[1] for r in rows])
+    query_steps = steps_over(query, 0.03)
+    startup_steps = steps_over(startup, 0.15)
+    fig = plt.figure(figsize=(12, 9.4))
     fig.set_layout_engine("none")
-    ax = fig.add_axes((0.06, 0.07, 0.8, 0.8))
+    top = fig.add_axes((0.07, 0.33, 0.78, 0.6))
+    low = fig.add_axes((0.07, 0.05, 0.78, 0.2))
     stop = t[-1] + 2.5
-    date_axis(ax, t[0] - 3, stop)
+    date_axis(low, t[0] - 3, stop)
+    top.set_xlim(low.get_xlim())
+    top.set_xticks([])
     # the first row is the first engine with vLLM's kernels, on the date
     # of the second
-    seconds_lines(ax, t, query, total, stop, BLUE, first_apart=True)
-    rail = total.max() + 0.08 * (total.max() - query.min())
+    step_line(top, t, query, stop, BLUE, first_apart=True)
+    step_line(low, t, startup, stop, DARK, first_apart=True)
+
+    bottom = 100 * np.floor(query.min() / 100 - 0.5)
+    rail = query.max() + 0.1 * (query.max() - bottom)
+    top.set_ylim(bottom, rail)
     texts, weights = [], []
     for i, row in enumerate(rows):
         pr = row.get("pull_request")
-        words = SHORT[row["name"]] + (f" #{pr}" if pr else "")
-        note = change(rows, i)
-        texts.append(words + (f"   {note}" if note else ""))
-        weights.append("bold" if note else "normal")
-    bottom = 100 * np.floor(query.min() / 100 - 0.5)
-    ax.set_ylim(bottom, rail)
-    tallest = rail_labels(ax, list(zip(t, total)), texts, rail, weights)
-    height_in = ax.get_position().height * fig.get_figheight()
+        texts.append(SHORT[row["name"]] + (f" #{pr}" if pr else ""))
+        marked = i in query_steps or i in startup_steps
+        weights.append("bold" if marked else "normal")
+    tallest = rail_labels(top, list(zip(t, query)), texts, rail, weights)
+    height_in = top.get_position().height * fig.get_figheight()
     span = (rail - bottom) * height_in / (height_in - tallest - 0.1)
-    ax.set_ylim(bottom, bottom + span)
-    ax.set_yticks(np.arange(bottom, total.max(), 100))
-    ax.yaxis.grid(True, color=LIGHT_GRAY, lw=0.6)
-    ax.set_axisbelow(True)
-    ax.set_ylabel("seconds")
-    ax.text(t[0] - 0.3, total[0], f"{total[0]:,.0f} s", ha="right",
-            va="center", fontsize=10, fontweight="bold", color=DARK)
-    ax.text(t[0] - 0.3, query[0], f"{query[0]:,.0f} s", ha="right",
-            va="center", fontsize=10, fontweight="bold", color=BLUE)
-    ax.text(stop + 0.3, total[-1], f"startup + query: {total[-1]:,.0f} s",
-            ha="left", va="bottom", fontsize=10, fontweight="bold",
-            color=DARK, clip_on=False)
-    ax.text(stop + 0.3, query[-1], f"query: {query[-1]:,.0f} s",
-            ha="left", va="top", fontsize=10, fontweight="bold", color=BLUE,
-            clip_on=False)
-    ax.text(stop + 0.3, (query[-1] + total[-1]) / 2,
-            f"startup: {total[-1] - query[-1]:,.0f} s", ha="left",
-            va="center", fontsize=9, color=GRAY_TEXT, clip_on=False)
-    ax.set_title("BIO-4 at sf=0.5 on Quail's code at each merge date",
-                 loc="left")
+    top.set_ylim(bottom, bottom + span)
+    top.set_yticks(np.arange(bottom, query.max(), 100))
+    low.set_ylim(0, startup.max() * 1.3)
+    low.set_yticks(np.arange(0, startup.max(), 20))
+    for ax, values in ((top, query), (low, startup)):
+        ax.vlines(t, ax.get_ylim()[0], values, color="#EFEFEF", lw=0.8,
+                  zorder=0)
+        ax.yaxis.grid(True, color=LIGHT_GRAY, lw=0.6)
+        ax.set_axisbelow(True)
+    for ax, values, steps, color in ((top, query, query_steps, BLUE),
+                                     (low, startup, startup_steps, DARK)):
+        for i, step in steps.items():
+            middle = (values[i] + values[i - 1]) / 2
+            ax.annotate(signed(step), (t[i], middle), xytext=(6, 0),
+                        textcoords="offset points", ha="left", va="center",
+                        fontsize=10, fontweight="bold", color=color)
+    top.set_ylabel("query seconds")
+    low.set_ylabel("startup seconds")
+    top.text(t[0] - 0.3, query[0], f"{query[0]:,.0f} s", ha="right",
+             va="center", fontsize=10, fontweight="bold", color=BLUE)
+    low.text(t[0] - 0.3, startup[0], f"{startup[0]:,.0f} s", ha="right",
+             va="center", fontsize=10, fontweight="bold", color=DARK)
+    top.text(stop + 0.3, query[-1], f"query today:\n{query[-1]:,.0f} s",
+             ha="left", va="center", fontsize=10, fontweight="bold",
+             color=BLUE, clip_on=False)
+    low.text(stop + 0.3, startup[-1], f"startup today:\n{startup[-1]:,.0f} s",
+             ha="left", va="center", fontsize=10, fontweight="bold",
+             color=DARK, clip_on=False)
+    repeat = summaries.get("quail-today-repeat")
+    if repeat:
+        again = seconds(repeat)[0]
+        top.scatter([t[-1]], [again], s=24, color="white", edgecolor=BLUE,
+                    lw=1.4, zorder=3)
+        spread_pct = f"{100 * (again / query[-1] - 1):+.1f}%".replace("-", "\u2212")
+        top.annotate(f"same code, second run: {again:,.0f} s ({spread_pct})",
+                     (t[-1], again), xytext=(0, -10),
+                     textcoords="offset points", ha="center", va="top",
+                     fontsize=9, color=GRAY_TEXT)
+    total_first, total_last = query[0] + startup[0], query[-1] + startup[-1]
+    fig.text(0.07, 0.975, "BIO-4 at sf=0.5 on Quail's code at each merge "
+             f"date: startup + query went from {total_first:,.0f} s to "
+             f"{total_last:,.0f} s", ha="left", va="top", fontsize=12,
+             fontweight="bold", color=DARK)
     fig.savefig(out, dpi=300)
     plt.close(fig)
 
