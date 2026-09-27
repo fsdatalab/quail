@@ -23,9 +23,9 @@ from pathlib import Path
 
 import modal
 
+from quail.bench.images import cpu_image, gpu_image
 from quail.specs import H100_USD_PER_HOUR
 
-IMAGE_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
 SAMPLE_SIZE = 200
 SCALE_FACTOR = 0.1
 DATA_DIR = "/results/quailb_data"
@@ -71,48 +71,11 @@ MODELS = {
     },
 }
 
-image = (
-    modal.Image.from_registry(IMAGE_BASE, add_python="3.12")
-    .entrypoint([])
-    .pip_install(
-        "vllm==0.26.0",
-        "huggingface_hub",
-        "pandas",
-        "pyarrow",
-        "numpy",
-        "datasets",
-    )
-    .env({
-        "VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
-        "VLLM_LOGGING_LEVEL": "WARNING",
-        "VLLM_USE_FLASHINFER_SAMPLER": "0",
-        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-        "QUAIL_CACHE_DIR": "/root/.cache/kernels",
-        "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
-        "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
-        "TRITON_CACHE_DIR": "/root/.cache/kernels/triton",
-    })
-    .add_local_python_source("quail", "quail_b")
-)
+image = gpu_image()
 
-data_image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .pip_install(
-        "numpy",
-        "pyarrow",
-        "pandas",
-        "huggingface_hub",
-        "datasets",
-        "transformers>=5.2.0",
-    )
-    .add_local_python_source("quail", "quail_b")
-)
+data_image = cpu_image()
 
-finalize_image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .pip_install("pyarrow")
-    .add_local_python_source("quail", "quail_b")
-)
+finalize_image = cpu_image()
 
 app = modal.App("quail-milestone1")
 hf_cache = modal.Volume.from_name("quail-hf-cache", create_if_missing=True)

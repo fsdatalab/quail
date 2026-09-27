@@ -2,13 +2,10 @@
   "title": "Quail",
   "pages": [
     "index",
-    "---User guide---",
     "user-guide",
-    "---Architecture---",
+    "demos",
     "architecture",
-    "---Extending Quail---",
     "extending",
-    "---Contributing---",
     "contributing"
   ]
 }

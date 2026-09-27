@@ -8,9 +8,9 @@ are searched over every feasible eager binary full left deep plan and
 anchor choice, with exact survivors from a caller supplied answer
 oracle at every step.
 
-The equations are in docs/content/docs/architecture/sol-model.mdx. The
+The equations are in docs/content/docs/architecture/planning.mdx. The
 work counting and component pricing are the planner's own
-(quail.planner.work, quail.planner.sol); the search does not call or
+(quail.cost.work, quail.cost.sol); the search does not call or
 simulate the production planner.
 """
 
@@ -21,20 +21,19 @@ import math
 from dataclasses import dataclass, field
 from typing import Callable, Mapping
 
+from quail.cost import budgets
+from quail.cost.sol import SpeedOfLight, speed_of_light
+from quail.cost.work import Work, ask, scan, triangle
+from quail.execution.pairs import pair_table
 from quail.logical import oriented_join_conditions
-from quail.planner import budgets
 from quail.planner.decide import (
-    collect_operators,
     default_order_rule,
     order_filters_indexed,
     preamble_tokens,
 )
 from quail.planner.leftdeep import Extension, optimize_left_deep
 from quail.planner.live_rows import PairRelation, exact_live_rows
-from quail.planner.sol import SpeedOfLight, speed_of_light
-from quail.planner.work import Work, ask, scan, triangle
-from quail.runtime.pairs import pair_table
-from quail.runtime.prefixes import prefix_credits
+from quail.planner.prefixes import prefix_credits
 from quail.specs import DeviceSpec, ModelSpec
 
 # answer(prompt, assignment) -> bool, where assignment maps each alias
@@ -126,6 +125,8 @@ class SpeedOfLightEstimate:
             "bytes_moved": latency.bytes_moved,
             "tokens": self.work.tokens,
             "pairs": self.work.pairs,
+            "sliding_pairs": self.work.sliding_pairs,
+            "sliding_kv_read": self.work.sliding_kv_read,
             "kv_written": self.work.kv_written,
             "kv_read": self.work.kv_read,
             "components": [
@@ -183,9 +184,15 @@ class _Search:
         self.device = device
         self.chunk_tokens = chunk_tokens
         self.credit_shared = credit_shared
+        # a diffusion model answers on canvas rows appended to every
+        # evaluation's suffix; a decoder answers on the suffix's last row
+        self.canvas = model.canvas_tokens
+        self.window = model.sliding_window
         stores = query.token_inputs()
-        self.scans, self.filters, self.joins = collect_operators(
-            query.logical)
+        operators = query.logical.operators()
+        self.scans, self.filters, self.joins = (
+            operators.scans, operators.filters, operators.joins
+        )
         self.order = query.order
         self.pre = preamble_tokens(self.filters, self.joins)
         self.aliases: dict[str, _AliasData] = {}
@@ -239,9 +246,9 @@ class _Search:
         prefix = self.pre + data.tokens[row]
         shared_tokens = data.credits[row]
         if shared_tokens == 0:
-            return scan(prefix, suffix)
+            return scan(prefix, suffix, window=self.window)
         resident = self.pre + shared_tokens
-        return ask(resident, prefix - resident + suffix)
+        return ask(resident, prefix - resident + suffix, window=self.window)
 
     def join_stage_work(self, anchor, partners, survivors, prompt,
                         resident_rows, cross_resident_rows=(),
@@ -259,9 +266,10 @@ class _Search:
         partner_rows = list(itertools.product(
             *[survivors[alias] for alias in partners]))
         suffixes = [
-            tail + sum(labels_by_alias[alias]["label"]
-                       + self.aliases[alias].tokens[row]
-                       for alias, row in zip(partners, partner_row))
+            tail + self.canvas
+            + sum(labels_by_alias[alias]["label"]
+                  + self.aliases[alias].tokens[row]
+                  for alias, row in zip(partners, partner_row))
             for partner_row in partner_rows
         ]
         all_tokens = sum(suffixes)
@@ -273,6 +281,7 @@ class _Search:
         work = Work()
         for row in survivors[anchor]:
             if allowed is None:
+                streamed = suffixes
                 suffix_tokens, suffix_triangles = all_tokens, all_triangles
             else:
                 mine = allowed.get(row, ())
@@ -282,14 +291,25 @@ class _Search:
                 suffix_tokens = sum(streamed)
                 suffix_triangles = sum(triangle(suffix) for suffix in streamed)
             prefix = self.pre + self.aliases[anchor].tokens[row]
-            work = work + (ask(prefix, frame) if row in resident_rows
+            work = work + (ask(prefix, frame, window=self.window)
+                           if row in resident_rows
                            else self.first_use(anchor, row, frame))
             anchor_prefix = prefix + frame
+            sliding_pairs = 0.0
+            if self.window:
+                sliding_pairs = (
+                    self.window * suffix_tokens if anchor_prefix >= self.window - 1
+                    else sum(triangle(anchor_prefix + suffix, self.window)
+                             - triangle(anchor_prefix, self.window)
+                             for suffix in streamed))
             work = work + Work(
                 tokens=suffix_tokens,
                 pairs=anchor_prefix * suffix_tokens + suffix_triangles,
                 kv_written=suffix_tokens,
                 kv_read=anchor_prefix,
+                sliding_pairs=sliding_pairs,
+                sliding_kv_read=(min(anchor_prefix, self.window - 1)
+                                 if self.window else 0.0),
             )
         return work
 
@@ -322,14 +342,14 @@ class _Search:
             for stage_index, written_pos in enumerate(order):
                 predicate = predicates[written_pos]
                 question_tokens = predicate.prompt.tail_tokens
+                suffix = question_tokens + self.canvas
                 for row in live:
                     if stage_index == 0 and not (
                             self.credit_shared and row in computed):
-                        work = work + self.first_use(
-                            alias, row, question_tokens)
+                        work = work + self.first_use(alias, row, suffix)
                     else:
                         prefix = self.pre + tokens[row]
-                        work = work + ask(prefix, question_tokens)
+                        work = work + ask(prefix, suffix, window=self.window)
                 if stage_index == 0:
                     computed.update(live)
                 passed = [
@@ -403,7 +423,7 @@ class _Search:
         edge_relations = []
         edge_aliases = []
         for join in joins:
-            stage_aliases = tuple(arg.alias for arg in join.predicate.args)
+            stage_aliases = tuple(arg.alias for arg in join.prompt.args)
             if join.semantics != "full":
                 raise NotImplementedError(
                     "the speed of light search needs full join semantics")
@@ -419,7 +439,7 @@ class _Search:
                 for right_row in base_rows[right]
                 if (allowed is None or right_row in allowed.get(left_row, ()))
                 and self.answer(
-                    join.predicate, {left: left_row, right: right_row})
+                    join.prompt, {left: left_row, right: right_row})
             )
             edge_relations.append(PairRelation(left, right, passing))
             edge_aliases.append(frozenset((left, right)))
@@ -468,17 +488,17 @@ class _Search:
                 join = joins[edge_index]
                 relation = edge_relations[edge_index]
                 stage_aliases = tuple(
-                    arg.alias for arg in join.predicate.args)
+                    arg.alias for arg in join.prompt.args)
                 for anchor in stage_aliases:
                     if not self.anchor_fits(
-                            join.predicate, anchor, stage_aliases, live):
+                            join.prompt, anchor, stage_aliases, live):
                         continue
                     partners = [alias for alias in stage_aliases
                                 if alias != anchor]
                     allowed = self.allowed_pairs.get(edge_index, {}).get(
                         anchor)
                     stage_work = self.join_stage_work(
-                        anchor, partners, live, join.predicate,
+                        anchor, partners, live, join.prompt,
                         live[anchor] if anchor in cached_now else (),
                         self.cross_resident(anchor, live, cached_now),
                         allowed=allowed,
@@ -492,7 +512,7 @@ class _Search:
                         if (left_row, right_row) in relation.pairs
                     )
                     step = {
-                        "template": join.predicate.template,
+                        "template": join.prompt.template,
                         "written_pos": edge_index,
                         "added_alias": added,
                         "aliases": list(stage_aliases),

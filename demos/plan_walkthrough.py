@@ -2,7 +2,7 @@
 
 Run from the repository root:
 
-    .venv/bin/python -m demos.plan_walkthrough
+    uv run python demos/plan_walkthrough.py
 
 Three claims and three evidence passages live in memory. The tokenizer
 is a stand-in that counts bytes. The script does not execute inference.
@@ -25,8 +25,8 @@ SELECT c.id, e.id
 FROM claims c
 JOIN evidence e
   ON c.evidence_wiki_url = e.id
- AND AI_FILTER(PROMPT('{SUPPORT}', c.claim, e.text))
-WHERE AI_FILTER(PROMPT('{PERSON}', c.claim))
+ AND AI.IF(PROMPT('{SUPPORT}', c.claim, e.text))
+WHERE AI.IF(PROMPT('{PERSON}', c.claim))
 """
 
 
@@ -59,12 +59,19 @@ def same_page(tables):
 
 def main():
     """Print and edit equivalent SQL and builder plans."""
-    with quail.Session(EngineConfig(),
-                       tokenizer=lambda text: list(text.encode())) as session:
+    config = EngineConfig(
+        gpus=1,
+        model="qwen3-4b-fp8",
+        backend="quail",
+        device="h100-sxm",
+    )
+    with quail.Session(
+        config, tokenizer=lambda text: list(text.encode())
+    ) as session:
         register_demo_data(session)
 
         print("=== SQL ===" + SQL)
-        query = session.sql(SQL)
+        query = session.sql(SQL, dialect="bq")
         print("=== query.explain() ===")
         print(query.explain())
         plan = query.plan()
@@ -94,11 +101,11 @@ def main():
 
         print("\n=== the builder form: a Python function pairs the rows ===")
         paired = (session.docs("claims").alias("c")
-                  .ai_filter(prompt(PERSON, col("c.claim")))
+                  .ai_if(prompt(PERSON, col("c.claim")))
                   .join(session.docs("evidence").alias("e"))
                   .apply(same_page, columns=[col("c.evidence_wiki_url"),
                                              col("e.id")])
-                  .ai_filter(prompt(SUPPORT, col("c.claim"), col("e.text")))
+                  .ai_if(prompt(SUPPORT, col("c.claim"), col("e.text")))
                   .select("c.id", "e.id"))
         print(paired.explain())
         print("node ids:", [node.node_id for node in paired.plan().nodes])

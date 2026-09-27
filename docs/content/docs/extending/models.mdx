@@ -1,95 +1,99 @@
 ---
-title: Adding a model or device
-description: Registering a ModelSpec or DeviceSpec.
+title: Custom models and GPUs
 ---
 
-The planner never reads a model config file. Every decision comes from
-a `ModelSpec` and a `DeviceSpec`, so adding a model is adding a spec.
+Every planning decision in Quail comes from a `ModelSpec` and a
+`DeviceSpec`. Adding support for a new model or GPU means registering
+a spec.
 
 ## ModelSpec
+
+A `ModelSpec` describes the model architecture. Every field except
+`params` and `w_mem_bytes` comes from the checkpoint's `config.json`.
 
 ```python
 from quail.specs import ModelSpec
 
-QWEN3_4B_FP8 = ModelSpec(
+MY_MODEL = ModelSpec(
     name="qwen3-4b-fp8",
-    params=4.0e9,          # dense parameter count
+    params=4.0e9,
     layers=36,
     hidden=2560,
-    n_q=32,                # query heads
-    n_kv=8,                # KV heads
+    n_q=32,
+    n_kv=8,
     d_head=128,
-    ffn_width=19456,       # gate_up output columns, 2 x intermediate
-    w_bytes=1.0,           # fp8
+    ffn_width=19456,
+    w_bytes=1.0,
     hf_name="Qwen/Qwen3-4B-FP8",
-    revision="96b30dc...", # pinned hub commit hash
+    revision="96b30dc...",
     vocab=151936,
     tied_head=True,
 )
 ```
 
-Every field except `params` and `w_mem_bytes` comes from the
-checkpoint's `config.json`. `revision` pins the hub commit so the
-worker resolves the weights from its cache without hub round trips.
-`w_mem_bytes` is the measured weight footprint as loaded; leave it 0
-to fall back to `params * w_bytes`.
+Source:
+[quail/specs/base.py](https://github.com/fsdatalab/quail/blob/main/quail/specs/base.py).
 
-Derived properties the planner uses: `kappa` (KV bytes per token),
-`W_resident` (weight bytes on the GPU after the full untied output head
-is discarded), and `act_per_token`.
+`revision` pins the Hugging Face hub commit so the worker resolves
+weights from cache without network round trips.
 
-Register it in `quail/specs/__init__.py` for a built in model, or from
-an extension:
+The planner uses derived properties: `kappa` (KV bytes per token),
+`W_resident` (weight bytes on GPU after discarding the full output
+head), and `act_per_token` (activation memory per token).
 
-```python
-registry = quail.ExtensionRegistry.with_built_ins()
-registry.register_model(MY_MODEL)
-```
+### Which models work with a spec alone
 
-Then `EngineConfig(model="my-model")` selects it.
+The Quail executor's GPU kernels are written for the Qwen3
+architecture (QK-norm, gated SiLU MLP, FP8 block-quantized weights).
+Any Qwen3-family FP8 checkpoint can be added by registering a
+`ModelSpec` with the correct dimensions.
 
-## The kernel constraint
-
-The Quail executor's fused kernels assume the Qwen3 architecture:
-QK-norm before rope, a gated SiLU MLP, and fp8 block-quantized
-weights. Another Qwen3-family fp8 checkpoint works with a spec alone.
-A different architecture needs kernel changes in `quail/executor/`
-first, or a different model backend.
-
-The request backends have no such constraint beyond what vLLM or
-SGLang can load.
+A model with a different architecture (different attention layout,
+different activation function, different weight format) would need
+new GPU kernels in
+[quail/backends/quail/executor/](https://github.com/fsdatalab/quail/tree/main/quail/backends/quail/executor),
+or could run through a [custom inference engine](/docs/extending/backends)
+like vLLM or SGLang, which handle model loading independently.
 
 ## DeviceSpec
+
+A `DeviceSpec` describes the GPU hardware.
 
 ```python
 from quail.specs import DeviceSpec
 
-H100_SXM = DeviceSpec(
+MY_DEVICE = DeviceSpec(
     name="h100-sxm",
     mem_bytes=80e9,
-    hbm_bw=3.35e12,        # bytes per second
-    peak_flops=1.979e15,   # dense fp8
-    bf16_flops=0.989e15,   # dense bf16, used for attention
+    hbm_bw=3.35e12,
+    peak_flops=1.979e15,
+    bf16_flops=0.989e15,
 )
 ```
 
-The built in devices use these per-GPU constants:
+Source:
+[quail/specs/base.py](https://github.com/fsdatalab/quail/blob/main/quail/specs/base.py).
 
-| Device name | Memory | Memory bandwidth | Dense FP8 | Dense BF16 |
-| --- | --- | --- | --- | --- |
-| `h100-sxm` | 80 GB | 3.35 TB/s | 1,979 TFLOPS | 989.5 TFLOPS |
-| `rtx-pro-6000-blackwell-server` | 96 GB | 1.597 TB/s | about 1,000 TFLOPS | about 500 TFLOPS |
+All values are per GPU. `peak_flops` is the dense FP8 rate.
+The [H100 datasheet](https://resources.nvidia.com/en-us-tensor-core)
+quotes rates with 2:1 structured sparsity; divide by 2 for the dense
+rate Quail uses. `bf16_flops` is the dense BF16 rate, used for
+attention (FlashAttention runs in BF16).
 
-The RTX constants describe the Blackwell Server Edition with GDDR7 memory.
-They come from [NVIDIA's server specifications](https://www.nvidia.com/en-us/data-center/rtx-pro-6000-blackwell-server-edition/).
-The dense compute estimates assume the rounded server tensor rates include
-sparsity and halve them. The server page does not explicitly label sparsity;
-they are approximate planning assumptions, not published dense server specs. Quail does not use sparse weights. `hbm_bw` stores memory
-bandwidth for both HBM and GDDR devices.
+## Registration
 
-Register with `registry.register_device(spec)` and select with
-`Session(EngineConfig(device="name"))`. A backend must also accept the device,
-and its kernels must support that GPU. Quail selects FlashAttention-3 on H100
-and FlashAttention-2 on RTX PRO 6000 Blackwell. RTX execution still needs a
-GPU validation run. The supplied Modal examples request H100s. On an RTX
-host, use a normal session with the RTX device specification.
+```python
+registry = quail.ExtensionRegistry.with_built_ins()
+registry.register_model(MY_MODEL)
+registry.register_device(MY_DEVICE)
+```
+
+Then use the registered names in `EngineConfig`:
+
+```python
+config = quail.EngineConfig(
+    model="my-model",
+    device="my-device",
+    gpus=1,
+)
+```

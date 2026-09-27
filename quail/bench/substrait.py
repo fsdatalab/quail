@@ -216,7 +216,7 @@ def read_plan(plan: plan_pb2.Plan) -> QueryPlan:
 
 
 def build_query(session, plan: QueryPlan, selectivity=None,
-                order: str = "as_written"):
+                order: str | None = None):
     """Build the Quail query of a plan on a session.
 
     Args:

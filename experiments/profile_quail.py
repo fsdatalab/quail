@@ -45,9 +45,7 @@ The recorded 2026-08-30 runs used prefixes "discrepancy" and
 "ringfix" through this cell's predecessor
 (experiments/discrepancy_timeline.py, which hardcoded the two queries
 and their windows). Their reports were removed on 2026-09-06; the data
-stays under /results/ablations/ on the quail-results volume, and the
-KV retention change they led to is described in
-reports/shipped_features/2026-08-30-scan-ring-retention.md.
+stays under /results/ablations/ on the quail-results volume.
 """
 
 import json
@@ -56,33 +54,9 @@ import time
 
 import modal
 
-IMAGE_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
+from quail.bench.images import gpu_image
 
-image = (
-    modal.Image.from_registry(IMAGE_BASE, add_python="3.12")
-    .entrypoint([])
-    .pip_install(
-        "vllm==0.26.0",
-        "huggingface_hub[hf_transfer]",
-        "transformers>=5.2.0",
-        "pandas",
-        "pyarrow",
-        "numpy",
-        "datasets",
-    )
-    .env({"VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
-          "VLLM_LOGGING_LEVEL": "WARNING",
-          "VLLM_USE_FLASHINFER_SAMPLER": "0",
-          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-          "HF_HUB_ENABLE_HF_TRANSFER": "1",
-          "QUAIL_CACHE_DIR": "/root/.cache/kernels",
-          "DG_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
-          "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
-          "TRITON_CACHE_DIR": "/root/.cache/kernels/triton",
-          "TORCHINDUCTOR_CACHE_DIR":
-              "/root/.cache/kernels/torchinductor"})
-    .add_local_python_source("quail", "quail_b")
-)
+image = gpu_image()
 
 # House rule: never create new Modal app names - new GPU cells attach
 # to an existing app.
@@ -126,36 +100,43 @@ def _write(result, name):
     kernel_cache.commit()
 
 
-def _boot_state(model):
+def _boot_state(model, **pipeline_kwargs):
     """Boot the worker state dict, as the worker's own boot does.
 
-    Mirrors quail.runtime.execute._execute_physical's boot with the
-    shipping Pipeline; warm_kernels runs the same tiered warmup.
+    Mirrors quail.execution.execute._execute_physical's boot with the
+    shipping pipeline; warm_kernels runs the same tiered warmup.
+    pipeline_kwargs go to the model's pipeline, for experiments that
+    swap a kernel.
     """
     import torch
     import torch.nn.functional as F
     from transformers import AutoTokenizer
 
-    from quail.executor.arena import KVArena
-    from quail.executor.attention import FILTER_ATTENTION, Pipeline
-    from quail.executor.loop import Answerer, AsyncAnswers, warm_kernels
-    from quail.executor.model import load_model
-    from quail.planner import budgets
+    from quail.backends.quail.executor.arena import KVArena
+    from quail.backends.quail.executor.loop import warm_kernels
+    from quail.backends.quail.executor.model import load_model
+    from quail.backends.quail.executor.models import build_pipeline
+    from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers
+    from quail.cost import budgets
     from quail.specs import DEVICES, MODELS
 
     spec = MODELS[model]
     device = DEVICES["h100-sxm"]
     tokenizer = AutoTokenizer.from_pretrained(spec.hf_name)
-    model_mod = load_model(spec.hf_name, revision=spec.revision)
     chunk_tokens = budgets.chunk_budget(spec, device)
-    arena_tok = budgets.arena_tokens(spec, device, chunk_tokens)
+    model_mod = load_model(spec.hf_name, revision=spec.revision,
+                           max_batched_tokens=chunk_tokens,
+                           moe_backend=spec.moe_backend)
+    full_pages, sliding_pages = budgets.arena_pages(spec, device, chunk_tokens)
     arena = KVArena(n_layers=spec.layers,
-                    n_pages=arena_tok // budgets.PAGE_TOKENS,
+                    n_pages=full_pages,
                     page_tokens=budgets.PAGE_TOKENS,
                     n_kv=spec.n_kv, d_head=spec.d_head,
-                    dtype=torch.bfloat16)
-    pipeline = Pipeline(model_mod, arena,
-                        attention_mode=FILTER_ATTENTION)
+                    dtype=torch.bfloat16, layer_kv=spec.kv_shapes,
+                    sliding_layers=spec.sliding_layer_set,
+                    sliding_window=spec.sliding_window,
+                    n_sliding_pages=sliding_pages)
+    pipeline = build_pipeline(spec, model_mod, arena, **pipeline_kwargs)
     from quail.backends import GpuContext, QuailBackend
     execution = QuailBackend().start(GpuContext(
         gpu_index=0,
@@ -169,7 +150,7 @@ def _boot_state(model):
     execution.bind_loaded_model(
         model=model_mod, arena=arena, pipeline=pipeline
     )
-    answerer = Answerer(torch, F, model_mod, tokenizer)
+    answerer = AnswerRows.from_tokenizer(torch, F, model_mod, tokenizer)
     async_ans = AsyncAnswers(torch, answerer)
     with torch.inference_mode():
         warm = warm_kernels(torch, arena, pipeline, async_ans,
@@ -191,36 +172,44 @@ def _quailb_session(model, sf, gpus=1):
 
     d = build_sets(DATA_DIR, sf)
     results_vol.commit()
-    sess = quail.Session(EngineConfig(gpus=gpus, model=model))
+    sess = quail.Session(EngineConfig(
+        gpus=gpus,
+        model=model,
+        backend="quail",
+        device="h100-sxm",
+    ))
     register_tables(sess, d)
     return sess, queries(sess)
 
 
 def _run_query(state, build, captured):
     """One query through the real planner and worker core."""
+    from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers
     from quail.backends.quail.worker import (
-        _PayloadAnswerer,
         execute_single,
         quail_runtime_payload,
     )
-    from quail.execution import PhysicalResponse
-    from quail.executor.loop import AsyncAnswers
-    from quail.runtime.execute import (
+    from quail.execution.execute import (
         _validate_physical_request,
         execute_query,
     )
+    from quail.execution.types import PhysicalResponse
 
     def execute(request):
-        request, registry, graph, _ = _validate_physical_request(
-            request, query.session.registry)
+        registry = query.session.registry
+        graph, _ = _validate_physical_request(request, registry)
         payload = quail_runtime_payload(request, graph)
-        answerer = _PayloadAnswerer(
+        rows = AnswerRows(
             state["torch"], state["F"], state["model"],
             payload["true_ids"], payload["false_ids"],
         )
+        arena_pages = payload.get("arena_pages")
+        if arena_pages is not None:
+            state["arena"].resize(*arena_pages, free_resident=True)
         state["model_execution"].bind_query(
             torch=state["torch"],
-            async_answers=AsyncAnswers(state["torch"], answerer),
+            async_answers=AsyncAnswers(state["torch"], rows),
+            answer_rows=rows,
             chunk_tokens=payload["chunk_tokens"],
         )
         report = execute_single(state, payload, registry, graph)
@@ -338,14 +327,14 @@ class ProfilerWindows:
 class LoopRecorder:
     """Records the execution loops from outside the engine.
 
-    Wraps quail.executor.loop.run_filter / run_join (module
+    Wraps quail.backends.quail.executor.loop.run_filter / run_join (module
     attributes, bound at the worker's call time), the pipeline's
     forward_chunk, and the arena's blocked-admission eviction method.
     Restores everything in unpatch().
     """
 
     def __init__(self, state, profiler=None):
-        import quail.executor.loop as loop_mod
+        import quail.backends.quail.executor.loop as loop_mod
 
         self.loop_mod = loop_mod
         self.torch = state["torch"]
@@ -384,7 +373,7 @@ class LoopRecorder:
         record, launches, idx = self._phase
         if self.profiler is not None:
             self.profiler.on_chunk(idx, self.chunk_seq)
-        launches.append((self._now(), chunk["tokens"]))
+        launches.append((self._now(), chunk.tokens))
         self._phase = (record, launches, idx + 1)
         self.chunk_seq += 1
         return self._orig["forward"](chunk)
@@ -449,11 +438,10 @@ class LoopRecorder:
     def _run_join(self, torch, arena, pipeline, async_ans,
                   anchor_prefixes, stage_suffixes, budget, **kw):
         keys = kw.get("anchor_keys") or list(range(len(anchor_prefixes)))
-        owned = self.arena.accounting.owned
         kv = dict(anchors=len(keys), hits=0, hit_tokens=0,
                   regret_tokens=0, first_tokens=0)
         for key, prefix in zip(keys, anchor_prefixes):
-            if key in owned:
+            if self.arena.is_resident(key):
                 kv["hits"] += 1
                 kv["hit_tokens"] += len(prefix)
             elif key in self.seen:
@@ -568,8 +556,7 @@ def _parse_queries(queries):
 @app.local_entrypoint()
 def run(queries: str, model: str = "qwen3-4b-fp8", sf: float = 0.1,
         out_prefix: str = "profile"):
-    handle = measure.spawn(model, sf, _parse_queries(queries),
-                           out_prefix)
+    handle = measure.spawn(model, sf, _parse_queries(queries), out_prefix)
     print(f"profile_quail fc: {handle.object_id}", flush=True)
     print(handle.get())
 

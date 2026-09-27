@@ -25,7 +25,7 @@ Two probe functions on the same image, one cold container per call
   volume (one-time cost); the second call, in a fresh container, is
   the steady-state cold boot every later container sees.
 
-Each probe mirrors quail.executor.model.load_model step by step
+Each probe mirrors quail.backends.quail.executor.model.load_model step by step
 (dtype="auto", single-rank group stubs, no NCCL) and adds a raw read
 of the cached safetensors files to separate "the volume is slow"
 from "vLLM is slow". Records are written to the quail-results
@@ -108,7 +108,7 @@ def _profile(model_name: str, revision: str | None) -> dict:
     from vllm.model_executor.model_loader import get_model
     phases["import_vllm_s"] = round(time.perf_counter() - t0, 2)
 
-    from quail.executor.model import (
+    from quail.backends.quail.executor.model import (
         _install_single_rank_groups,
         retain_answer_head,
     )

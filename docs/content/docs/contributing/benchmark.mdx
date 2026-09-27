@@ -1,0 +1,61 @@
+---
+title: Benchmarks
+---
+
+[QUAIL-B](https://github.com/fsdatalab/quail-bench) is a benchmark of
+AI-SQL filter and join queries over six datasets at three scale
+factors (0.1, 0.5, 1.0). It has 30+ queries. We are actively adding
+queries and datasets.
+
+| Family | Dataset | Queries |
+| --- | --- | --- |
+| IMDB | [stanfordnlp/imdb](https://huggingface.co/datasets/stanfordnlp/imdb) | 10 |
+| BIO | [BioDEX/BioDEX-Reactions](https://huggingface.co/datasets/BioDEX/BioDEX-Reactions) | 4 |
+| FEV | [fever/fever](https://huggingface.co/datasets/fever/fever) | 10 |
+| LEP | [rmahari/LePaRD](https://huggingface.co/datasets/rmahari/LePaRD) | 5 |
+| AGENT | [TIGER-Lab/SWE-Next-SFT-Trajectories](https://huggingface.co/datasets/TIGER-Lab/SWE-Next-SFT-Trajectories) | 2 |
+| PRIV | [mukund/PrivacyPolicies](https://huggingface.co/datasets/mukund/PrivacyPolicies) | 2 |
+
+PRIV queries are optional and run at larger scale. Pass `--privacy`
+to include them. The query count tracks the pinned `quail_b` version
+in `pyproject.toml`.
+
+## Run a query
+
+On your GPU:
+
+```bash
+uv run python -m quail.bench.quailb --sf 0.1 --only IMDB-4 \
+  --model qwen3-4b-fp8 --device h100-sxm \
+  --output-dir results/quailb/imdb-4
+```
+
+On Modal, with the vLLM baselines:
+
+```bash
+uv run modal run --detach -m quail.bench.quailb_parallel \
+  --sf 0.1 --model qwen3-4b-fp8 --query IMDB-4 \
+  --output-dir /results/benchmarks/quailb \
+  2>&1 | tee results/benchmark/quailb.log
+```
+
+Omit `--only` / `--query` to run all queries. Add `--no-include-baselines`
+to run Quail alone on Modal. Modal results are saved to the
+`quail-results` volume under `/results/benchmarks/quailb/<run-id>/`.
+
+## Generate a report
+
+```bash
+uv run quail-b report results/quailb/imdb-4
+```
+
+For a Modal run, download it first:
+
+```bash
+uv run modal volume get quail-results \
+  "benchmarks/quailb/<run-id>/" "./results/<run-id>/"
+uv run quail-b report "./results/<run-id>/quail"
+```
+
+This writes `report.md` next to `run.json`. Reports use saved labels
+and do not rerun inference.

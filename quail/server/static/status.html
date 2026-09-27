@@ -1,0 +1,538 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Quail query</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&amp;family=Inter:wght@400;500;600&amp;family=Lora:wght@500;600&amp;display=swap" rel="stylesheet">
+<style>
+  :root {
+    --background: #fff;
+    --foreground: #2a2828;
+    --muted: #666;
+    --subtle: #f5f5f5;
+    --card: #fcfcfc;
+    --border: #e0e0e0;
+    --primary: #c31331;
+    --success: #137a45;
+    --success-soft: #e9f6ef;
+    --warning: #8a5a00;
+    --warning-soft: #fff7df;
+    --danger: #a92035;
+    --danger-soft: #fbecef;
+    --font-sans: "Inter", sans-serif;
+    --font-serif: "Lora", Georgia, serif;
+    --font-mono: "IBM Plex Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  html { background: var(--background); color: var(--foreground); }
+  body {
+    margin: 0;
+    min-width: 20rem;
+    font: 0.9375rem/1.65 var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--primary); text-underline-offset: .2em; }
+  a:hover { text-decoration-thickness: .12em; }
+  .site-header {
+    border-bottom: 1px solid var(--border);
+  }
+  .site-header-inner {
+    display: flex;
+    align-items: center;
+    width: min(100% - 2.5rem, 68rem);
+    margin: 0 auto;
+    padding: 1rem 0;
+  }
+  .brand {
+    color: var(--foreground);
+    font: 500 .9rem/1 var(--font-sans);
+    text-decoration: none;
+  }
+  .breadcrumb {
+    margin: 0 0 1.25rem;
+  }
+  .breadcrumb a {
+    color: var(--muted);
+    font-size: .875rem;
+  }
+  .breadcrumb a:hover { color: var(--foreground); }
+  main {
+    width: min(100% - 2.5rem, 68rem);
+    margin: 0 auto;
+    padding: 3rem 0 6rem;
+  }
+  h1 {
+    margin: 0 0 1.5rem;
+    font: 600 2rem/1.3 var(--font-serif);
+    overflow-wrap: anywhere;
+  }
+  h1 code {
+    color: var(--foreground);
+    font: 400 .72em/1.25 var(--font-mono);
+  }
+  h2 {
+    margin: 2.75rem 0 .75rem;
+    font: 600 1.45rem/1.4 var(--font-serif);
+  }
+  p { margin: .7rem 0; }
+  code, pre { font: .8125rem/1.6 var(--font-mono); }
+  code { overflow-wrap: anywhere; }
+  pre {
+    max-height: 32rem;
+    margin: .75rem 0 0;
+    padding: 1.15rem 1.25rem;
+    overflow: auto;
+    border: 1px solid var(--border);
+    border-radius: .5rem;
+    background: var(--card);
+    box-shadow: 0 1px 2px rgb(0 0 0 / 4%);
+    white-space: pre;
+  }
+  .table-wrap {
+    margin-top: 1rem;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+    border-radius: .5rem;
+  }
+  table { width: 100%; border-collapse: collapse; font-size: .875rem; }
+  .query-table { min-width: 42rem; }
+  .result-table { min-width: 36rem; }
+  td, th {
+    padding: .8rem 1rem;
+    border-bottom: 1px solid var(--border);
+    text-align: left;
+    vertical-align: top;
+  }
+  tr:last-child td { border-bottom: 0; }
+  th {
+    background: var(--subtle);
+    color: var(--muted);
+    font-size: .8125rem;
+    font-weight: 500;
+  }
+  tbody tr:hover { background: var(--card); }
+  .query-row { cursor: pointer; }
+  .query-row:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: -2px;
+  }
+  .query-table td:first-child,
+  .query-table td:nth-child(3),
+  .query-table td:last-child {
+    white-space: nowrap;
+  }
+  .query-link { font-weight: 500; text-decoration: none; }
+  .query-link:hover { text-decoration: underline; }
+  .query-phase { margin: .3rem 0 0; color: var(--muted); }
+  .status-line {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: .65rem;
+    margin: 0 0 1.35rem;
+  }
+  .state {
+    display: inline-flex;
+    align-items: center;
+    gap: .4rem;
+    padding: .22rem .65rem;
+    border: 1px solid currentColor;
+    border-radius: 999px;
+    font-size: .78rem;
+    font-weight: 500;
+    line-height: 1.4;
+  }
+  .state::before {
+    width: .42rem;
+    height: .42rem;
+    border-radius: 50%;
+    background: currentColor;
+    content: "";
+  }
+  .queued, .planning, .running {
+    border-color: #e8c872;
+    background: var(--warning-soft);
+    color: var(--warning);
+  }
+  .succeeded {
+    border-color: #9bcbb0;
+    background: var(--success-soft);
+    color: var(--success);
+  }
+  .failed, .interrupted {
+    border-color: #e2a8b1;
+    background: var(--danger-soft);
+    color: var(--danger);
+  }
+  .cancelled {
+    border-color: #c8c8c8;
+    background: var(--subtle);
+    color: var(--muted);
+  }
+  .phase {
+    max-width: 48rem;
+    margin: 0 0 .8rem;
+    font: 500 1.2rem/1.5 var(--font-serif);
+  }
+  .meta-list {
+    max-width: 60rem;
+    margin: .65rem 0 1.8rem;
+    padding-left: 1.25rem;
+    list-style: disc;
+  }
+  .meta-list li {
+    margin: .3rem 0;
+    padding-left: .1rem;
+  }
+  .progress-copy {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    gap: .25rem 1rem;
+    margin-bottom: .55rem;
+  }
+  .progress-value { font: 500 .78rem/1.6 var(--font-mono); }
+  .bar {
+    height: .38rem;
+    overflow: hidden;
+    border-radius: 999px;
+    background: var(--border);
+  }
+  .bar > div {
+    width: 0;
+    height: 100%;
+    border-radius: inherit;
+    background: var(--primary);
+    transition: width 300ms ease;
+  }
+  button {
+    padding: .35rem .75rem;
+    border: 1px solid var(--border);
+    border-radius: .35rem;
+    background: var(--background);
+    color: var(--foreground);
+    font: 500 .78rem/1.4 var(--font-sans);
+    cursor: pointer;
+  }
+  button:hover { border-color: #b9b9b9; background: var(--subtle); }
+  button:focus-visible, a:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 3px;
+  }
+  .muted { color: var(--muted); }
+  a.file { cursor: pointer; font-family: var(--font-mono); font-size: .82rem; }
+  .empty {
+    padding: 2.5rem;
+    border: 1px dashed var(--border);
+    border-radius: .5rem;
+    text-align: center;
+  }
+  @media (max-width: 40rem) {
+    .site-header-inner, main { width: min(100% - 2rem, 68rem); }
+    main { padding: 2.5rem 0 4rem; }
+    h1 { font-size: 1.75rem; }
+    td, th { padding: .7rem .75rem; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; }
+  }
+</style>
+</head>
+<body>
+<header class="site-header">
+  <div class="site-header-inner">
+    <a class="brand" href="/">Quail Server</a>
+  </div>
+</header>
+<main>
+  <nav id="breadcrumb" class="breadcrumb" hidden>
+    <a href="/queries">← Queries</a>
+  </nav>
+  <h1 id="title">Quail query</h1>
+  <div id="view" aria-live="polite"></div>
+</main>
+<script>
+const parts = location.pathname.split("/").filter(Boolean);
+const queryId = parts[0] === "queries" ? parts[1] : null;
+const view = document.getElementById("view");
+const breadcrumb = document.getElementById("breadcrumb");
+const DONE = ["succeeded", "failed", "interrupted", "cancelled"];
+const TOKEN_KEY = "quail-server-token";
+if (queryId) breadcrumb.hidden = false;
+
+// The /v1 routes need the server's bearer token when one is set. A link
+// may carry it as "#token=..." once; it is then kept in this browser
+// and removed from the address bar. Without one, the first 401 asks.
+function readToken() {
+  const match = location.hash.match(/token=([^&]+)/);
+  if (match) {
+    localStorage.setItem(TOKEN_KEY, decodeURIComponent(match[1]));
+    history.replaceState(null, "", location.pathname + location.search);
+  }
+  return localStorage.getItem(TOKEN_KEY) || "";
+}
+let token = readToken();
+
+async function api(path, options = {}) {
+  const headers = { ...(options.headers || {}) };
+  if (token) headers["authorization"] = "Bearer " + token;
+  let response = await fetch(path, { ...options, headers });
+  if (response.status === 401) {
+    const entered = prompt("This Quail Server needs a token.");
+    if (entered === null) return response;
+    token = entered.trim();
+    localStorage.setItem(TOKEN_KEY, token);
+    headers["authorization"] = "Bearer " + token;
+    response = await fetch(path, { ...options, headers });
+  }
+  return response;
+}
+
+function el(tag, attrs, ...children) {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(attrs || {})) {
+    if (key === "onclick" || key === "onkeydown") {
+      node[key] = value;
+    } else {
+      node.setAttribute(key, value);
+    }
+  }
+  for (const child of children) node.append(child);
+  return node;
+}
+
+function when(seconds) {
+  return seconds ? new Date(seconds * 1000).toLocaleString() : "";
+}
+
+function sentenceCase(value) {
+  return value ? value.charAt(0).toUpperCase() + value.slice(1) : "";
+}
+
+// Plain links cannot send the token, so files are fetched and saved.
+function fileLink(path, filename) {
+  return el("a", { class: "file", onclick: async () => {
+    const response = await api(path);
+    if (!response.ok) { alert(`${filename}: HTTP ${response.status}`); return; }
+    const url = URL.createObjectURL(await response.blob());
+    const anchor = el("a", { href: url, download: filename });
+    document.body.append(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(url);
+  } }, filename);
+}
+
+function renderList(items) {
+  document.getElementById("title").textContent = "Queries";
+  document.title = "Queries — Quail Server";
+  const table = el("table", { class: "query-table" },
+    el("thead", {}, el("tr", {},
+      el("th", {}, "Id"),
+      el("th", {}, "Status"),
+      el("th", {}, "Created"),
+      el("th", {}, "Rows"))),
+    el("tbody"));
+  const body = table.querySelector("tbody");
+  for (const item of items) {
+    const href = "/queries/" + item.id;
+    const rows = item.result ? item.result.rows.toLocaleString() : "—";
+    const open = () => { location.href = href; };
+    body.append(el("tr", {
+      class: "query-row", tabindex: "0", role: "link",
+      "aria-label": `Open query ${item.id}`,
+      onclick: open,
+      onkeydown: event => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          open();
+        }
+      }
+    },
+    el("td", {}, el("a", { href, class: "query-link" },
+      el("code", {}, item.id))),
+    el("td", {},
+      el("span", { class: "state " + item.state },
+        sentenceCase(item.state)),
+      el("p", { class: "query-phase" },
+        item.phase ? item.phase.message : "No phase reported")),
+    el("td", {}, when(item.created_at)),
+    el("td", {}, rows)));
+  }
+  view.replaceChildren(items.length
+    ? el("div", {},
+      el("p", { class: "muted" },
+        "All queries on this server. Updates every 5 seconds."),
+      el("div", { class: "table-wrap" }, table))
+    : el("p", { class: "muted empty" }, "No queries yet."));
+}
+
+async function cancel() {
+  await api(`/v1/queries/${queryId}/cancel`, { method: "POST" });
+}
+
+async function preview(status) {
+  const response = await api(`/v1/queries/${queryId}/rows?limit=20`);
+  if (!response.ok) return el("p", { class: "muted" }, "preview unavailable");
+  const data = await response.json();
+  const table = el("table", { class: "result-table" },
+    el("thead", {}, el("tr", {}, ...data.columns.map(c => el("th", {}, c)))),
+    el("tbody"));
+  const body = table.querySelector("tbody");
+  for (const row of data.rows) {
+    body.append(el("tr", {},
+      ...row.map(v => el("td", {}, v === null ? "" : String(v)))));
+  }
+  const note = `${data.rows.length} of ${data.total_rows} rows`;
+  return el("div", {}, el("p", { class: "muted" }, note),
+    el("div", { class: "table-wrap" }, table));
+}
+
+async function renderStatus(status) {
+  document.getElementById("title").replaceChildren(
+    "Query ", el("code", {}, status.id));
+  document.title = `${status.id} — Quail Server`;
+  const nodes = [];
+  const header = el("p", { class: "status-line" },
+    el("span", { class: "state " + status.state },
+      sentenceCase(status.state)),
+    el("span", { class: "muted" },
+      `Updated ${when(status.updated_at)}`));
+  if (!DONE.includes(status.state)) {
+    header.append(el("button", { onclick: cancel },
+      status.cancel_requested ? "cancel requested" : "Cancel"));
+  }
+  nodes.push(header);
+  if (status.phase) {
+    nodes.push(el("p", { class: "phase" }, status.phase.message));
+  }
+  const details = [
+    `Model ${status.config.model}`,
+    `Device ${status.config.device}`,
+    `${status.config.gpus} GPU, ${status.config.backend} backend`,
+    `Created ${when(status.created_at)}`,
+    `Timeout ${status.timeout_s} seconds`,
+  ];
+  if (status.started_at) details.push(`Started ${when(status.started_at)}`);
+  if (status.session_id) details.push(`Session ${status.session_id}`);
+  nodes.push(el("h2", {}, "Run details"),
+    el("ul", { class: "meta-list" },
+      ...details.map(detail => el("li", {}, detail))));
+  if (status.progress && status.progress.label) {
+    const p = status.progress;
+    const text = p.total ? `${p.done.toLocaleString()} / ${p.total.toLocaleString()} ${p.unit}`
+                         : `${p.done.toLocaleString()} ${p.unit}`;
+    const percent = p.total ? Math.min(100, 100 * p.done / p.total) : 0;
+    const bar = el("div", {
+      class: "bar", role: "progressbar", "aria-label": p.label,
+      "aria-valuenow": String(p.done),
+      ...(p.total ? { "aria-valuemax": String(p.total) } : {})
+    }, el("div", { style: `width:${percent}%` }));
+    nodes.push(el("h2", {}, "Progress"),
+      el("p", { class: "progress-copy" },
+        el("span", {}, p.label),
+        el("span", { class: "progress-value" }, text),
+        el("span", { class: "muted" }, `as of ${when(p.recorded_at)}`)),
+      bar);
+  }
+  if (status.progress && status.progress.answers_saved) {
+    nodes.push(el("p", {},
+      `${status.progress.answers_saved.toLocaleString()} answer batches saved so far. Download `,
+      fileLink(`/v1/queries/${status.id}/answers?limit=10000`, "answers.json")));
+  }
+  if (status.error) {
+    nodes.push(el("h2", {}, "Error"), el("pre", {}, `${status.error.type}: ${status.error.message}`));
+  }
+  if (status.result) {
+    nodes.push(el("h2", {}, "Result"),
+      el("p", {}, `${status.result.rows.toLocaleString()} rows. Downloads: `,
+        fileLink(`/v1/queries/${status.id}/result`, "result.arrows"), " and ",
+        fileLink(`/v1/queries/${status.id}/files/report.json`, "report.json")),
+      await preview(status));
+  }
+  if (status.plan) {
+    nodes.push(el("h2", {}, "Plan"), el("pre", {}, status.plan.text));
+  }
+  nodes.push(el("h2", {}, "SQL"), el("pre", {}, status.spec.sql));
+  const shownInputs = JSON.stringify(
+    status.inputs,
+    (key, value) => key === "kind" ? undefined : value,
+    2);
+  nodes.push(el("h2", {}, "Inputs"), el("pre", {}, shownInputs));
+  view.replaceChildren(...nodes);
+}
+
+// Read server-sent events with fetch, which can send the token; the
+// browser's EventSource cannot. Returns the last status seen.
+async function readEvents(afterRevision, onStatus) {
+  const response = await api(`/v1/queries/${queryId}/events`,
+    { headers: { "last-event-id": String(afterRevision) } });
+  if (!response.ok) throw new Error(`events: HTTP ${response.status}`);
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffered = "";
+  let last = null;
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) return last;
+    buffered += decoder.decode(value, { stream: true });
+    let end;
+    while ((end = buffered.indexOf("\n\n")) >= 0) {
+      const message = buffered.slice(0, end);
+      buffered = buffered.slice(end + 2);
+      for (const line of message.split("\n")) {
+        if (line.startsWith("data: ")) {
+          last = JSON.parse(line.slice(6));
+          await onStatus(last);
+        }
+      }
+    }
+  }
+}
+
+async function main() {
+  if (!queryId) {
+    const refresh = async () => {
+      const response = await api("/v1/queries?limit=all");
+      if (!response.ok) {
+        view.replaceChildren(el("p", {}, `HTTP ${response.status}`));
+        return;
+      }
+      renderList((await response.json()).queries);
+    };
+    await refresh();
+    setInterval(refresh, 5000);
+    return;
+  }
+  const response = await api(`/v1/queries/${queryId}`);
+  if (!response.ok) {
+    view.replaceChildren(el("p", {}, `No query ${queryId} (${response.status}).`));
+    return;
+  }
+  let status = await response.json();
+  await renderStatus(status);
+  while (!DONE.includes(status.state)) {
+    try {
+      const last = await readEvents(status.revision, async (next) => {
+        status = next;
+        await renderStatus(status);
+      });
+      if (last === null && !DONE.includes(status.state)) {
+        // the stream closed without an event; fetch the snapshot and go on
+        const again = await api(`/v1/queries/${queryId}`);
+        if (again.ok) { status = await again.json(); await renderStatus(status); }
+      }
+    } catch (error) {
+      await new Promise(resolve => setTimeout(resolve, 2000));
+    }
+  }
+}
+
+main();
+</script>
+</body>
+</html>

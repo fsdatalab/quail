@@ -6,21 +6,15 @@ import itertools
 import time
 
 from quail.backends.quail.retention import apply_retention, retain_after_join
-from quail.execution import export_physical_outputs
-from quail.executor.attention import FILTER_ATTENTION, JOIN_ATTENTION
-from quail.physical import (
-    AiFilter,
-    AiJoin,
-    PhysicalGraph,
-)
-from quail.runtime.pairs import (
+from quail.execution.pairs import (
     allowed_members,
     columns_key,
     members_by_partner,
     pair_partner,
     partner_map,
 )
-from quail.runtime.runner import (
+from quail.execution.reranker import ScoreFilterRuntime
+from quail.execution.runner import (
     ExecutionContext,
     GenericRunner,
     ModelNodeRuntime,
@@ -31,7 +25,17 @@ from quail.runtime.runner import (
     compute_subgraph,
     scalar_node_metrics,
 )
-from quail.runtime.tokens import DocumentPrefixes, chain_tokens
+from quail.execution.tokens import DocumentPrefixes, chain_tokens
+from quail.execution.types import export_physical_outputs
+from quail.physical import (
+    AiFilter,
+    AiJoin,
+    AiScore,
+    PhysicalGraph,
+    Scan,
+    ScoreFilter,
+)
+from quail.progress import answer_sink
 
 
 def quail_runtimes() -> dict:
@@ -40,11 +44,13 @@ def quail_runtimes() -> dict:
     return {
         AiFilter.runtime_key: model_runtime,
         AiJoin.runtime_key: model_runtime,
+        AiScore.runtime_key: model_runtime,
+        ScoreFilter.runtime_key: ScoreFilterRuntime(),
     }
 
 
-def _join_round_kv(anchor_keys, owned) -> dict:
-    hits = sum(key in owned for key in anchor_keys)
+def _join_round_kv(anchor_keys, arena) -> dict:
+    hits = sum(arena.is_resident(key) for key in anchor_keys)
     return {"hits": hits, "misses": len(anchor_keys) - hits}
 
 
@@ -161,6 +167,29 @@ def filter_result(node, answers, tokens, document_ids,
     )
 
 
+def filter_document_sink(node, document_ids):
+    """The chain's document_done callback, or None when nobody listens.
+
+    Reports each chunk's finished documents to the answer sink as
+    ``{"kind": "filter", "node", "alias", "stages", "documents"}`` where
+    ``documents`` lists ``[row index, last stage asked, passed]`` per
+    document. A document that passed its last stage survived the filter;
+    every other listed document failed at the stage given.
+    """
+    sink = answer_sink()
+    if sink is None:
+        return None
+    stages = len(node.question_token_ids)
+
+    def document_done(finished):
+        sink({"kind": "filter", "node": node.node_id, "alias": node.alias,
+              "stages": stages,
+              "documents": [[int(document_ids[position]), stage, passed]
+                            for position, stage, passed in finished]})
+
+    return document_done
+
+
 def filter_inputs(state, node, document_ids) -> dict:
     """Scheduler inputs for one filter chain over the given documents."""
     return {
@@ -170,11 +199,14 @@ def filter_inputs(state, node, document_ids) -> dict:
         "document_ids": document_ids,
         "limit": state["filter_limit"],
         "retain_survivors": node.keep_kv,
+        "document_done": filter_document_sink(node, document_ids),
     }
 
 
 def prepare_model_inputs(node, inputs, context: ExecutionContext):
     """Prepare Quail scheduler inputs from typed port values."""
+    if isinstance(node, AiScore):
+        return {"score_inputs": inputs, "documents": context.state["docs"]}
     if not isinstance(node, (AiFilter, AiJoin)):
         return inputs
     return {
@@ -186,10 +218,8 @@ def prepare_model_inputs(node, inputs, context: ExecutionContext):
 def _model_inputs(node, inputs, context: ExecutionContext) -> dict:
     state = context.state
     if isinstance(node, AiFilter):
-        state["pipeline"].attention_mode = FILTER_ATTENTION
         return filter_inputs(state, node, next(iter(inputs.values())))
 
-    state["pipeline"].attention_mode = JOIN_ATTENTION
     stream = None
     by_alias = {}
     port_pairs = {}        # written position -> pair table from a port
@@ -216,13 +246,14 @@ def _model_inputs(node, inputs, context: ExecutionContext) -> dict:
             by_alias[alias] = list(value)
     if not state["joins_started"]:
         state["joins_started"] = True
-        accounting = state["arena"].accounting
+        arena = state["arena"]
+        retained = arena.retained_keys()
         state["kv_stats"].update(
-            retained_after_filters=len(accounting.retained),
-            retained_pages_after_filters=accounting.retained_pages,
-            retained_prefix_tokens_after_filters=accounting.retained_prefix_tokens,
+            retained_after_filters=len(retained),
+            retained_pages_after_filters=arena.retained_pages,
+            retained_prefix_tokens_after_filters=arena.retained_prefix_tokens,
             retained_by_alias_after_filters={
-                alias: sum(key[0] == alias for key in accounting.retained)
+                alias: sum(key[0] == alias for key in retained)
                 for alias in state["docs"]
             },
         )
@@ -265,7 +296,7 @@ def _model_inputs(node, inputs, context: ExecutionContext) -> dict:
             for document in anchor_ids
         ]
         anchor_keys = [(node.anchor, document) for document in anchor_ids]
-        round_kv = _join_round_kv(anchor_keys, state["arena"].accounting.owned)
+        round_kv = _join_round_kv(anchor_keys, state["arena"])
         state["kv_stats"]["join_anchor_hits"] += round_kv["hits"]
         state["kv_stats"]["join_anchor_misses"] += round_kv["misses"]
         anchor_stream = None
@@ -281,6 +312,28 @@ def _model_inputs(node, inputs, context: ExecutionContext) -> dict:
             "stream": stream,
         }
 
+    last = group[-1]
+    last_tuples = tuple_indices[last["written_pos"]]
+
+    def finished_answers(document, row) -> dict:
+        """The anchor's last-stage matches: partner tuples that answered true.
+
+        Every pair the anchor was asked about and is not listed answered
+        false; ``asked`` says how many pairs that covers.
+        """
+        members = None
+        if lists_for is not None and runs_over_pairs(last):
+            members = lists_for(document)[len(group) - 1]
+        matches = []
+        for position, answer in enumerate(row):
+            if answer:
+                member = position if members is None else int(members[position])
+                matches.append(list(last_tuples[member]))
+        return {"kind": "join", "node": node.node_id, "anchor": node.anchor,
+                "partners": list(last["partners"]),
+                "semantics": last["semantics"], "document": int(document),
+                "asked": len(row), "matches": matches}
+
     def anchor_done(local_index, row):
         key = anchor_keys[local_index]
         matched = any(row)
@@ -292,6 +345,10 @@ def _model_inputs(node, inputs, context: ExecutionContext) -> dict:
                 config.get("after", {}).get(node.node_id, {}))
         else:
             state["arena"].free_key(key)
+        sink = answer_sink()
+        # scores are floats, not yes/no answers; they arrive with the result
+        if sink is not None and getattr(row, "dtype", None) is None:
+            sink(finished_answers(key[1], row))
 
     state["prepared_join"] = {
         "node": node,
@@ -329,7 +386,7 @@ def record_model_result(node, result: NodeResult,
             state["kv_stats"]["join_anchor_hits"] += len(keys)
         live = set(result.outputs[f"ids:{node.anchor}"])
         for key, prefix in zip(keys, prepared["prefixes"]):
-            if key in state["arena"].accounting.owned:
+            if state["arena"].is_resident(key):
                 if node.keep_anchor_kv and key[1] in live:
                     config = state["retention"]
                     retain_after_join(state["arena"], key, len(prefix), config,
@@ -342,7 +399,7 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
     """Execute one Quail model graph on one GPU executor."""
     torch = state["torch"]
     arena = state["arena"]
-    for key in list(arena.accounting.owned):
+    for key in arena.resident_keys():
         arena.free_key(key)
     arena.reset_stats()
     retention = payload.get("retention", {})
@@ -389,7 +446,7 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
 
     filters, joins = model_answers(graph, result)
 
-    for key in list(arena.accounting.owned):
+    for key in arena.resident_keys():
         arena.free_key(key)
     kv_manager = {
         **runtime_state["kv_stats"],
@@ -404,17 +461,49 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
         "_outputs": export_physical_outputs(compute_subgraph(graph), result),
         "wall_s": round(wall, 2),
         "fresh_tokens": result.metrics.fresh_tokens,
+        "cached_tokens": result.metrics.cached_tokens,
+        "evaluated_documents": result.metrics.evaluated_documents,
+        "evaluated_document_pairs": result.metrics.evaluated_document_pairs,
+        "usd_per_query": (
+            None if state["device"].usd_per_hour is None
+            else wall / 3600 * state["device"].usd_per_hour
+        ),
+        "backend_metrics": {"scores": [
+            dict(value.metrics.extension)
+            for node_id, value in result.nodes.items()
+            if graph.node(node_id).type_name == AiScore.type_name
+        ]},
         "node_metrics": scalar_node_metrics(result.nodes),
         "executed_join_plan": executed_join_plan(graph),
         "kv_manager": kv_manager,
         "peak_gib": round(torch.cuda.max_memory_allocated() / 2**30, 2),
     }
+    report.update(throughput(graph, result.metrics, wall))
     if state.get("gpu_timing"):
         # seconds a forward chunk was running on the GPU, summed over
         # the model nodes; wall_s minus this is time the GPU sat idle
         report["gpu_s"] = round(result.metrics.gpu_s, 3)
         report["chunks"] = result.metrics.chunks
     return report
+
+
+def throughput(graph, metrics, seconds: float) -> dict:
+    """Return the run's throughput under one key.
+
+    A run that evaluated document pairs reports evaluated pairs per
+    second. Any other run reports input document rows, summed over
+    every scan and counted before filters, per second.
+    """
+    seconds = max(seconds, 1e-9)
+    if metrics.evaluated_document_pairs:
+        return {
+            "document_pairs_per_second":
+                metrics.evaluated_document_pairs / seconds,
+        }
+    documents = sum(
+        node.n_docs for node in graph.nodes if isinstance(node, Scan)
+    )
+    return {"documents_per_second": documents / seconds}
 
 
 def model_answers(graph, result) -> tuple[dict, list]:

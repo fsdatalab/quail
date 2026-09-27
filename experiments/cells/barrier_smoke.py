@@ -85,7 +85,12 @@ def build_query(sess):
 
 
 def run_one(gpus, flags, truth1, truth2, tmp):
-    sess = quail.Session(EngineConfig(gpus=gpus))
+    sess = quail.Session(EngineConfig(
+        gpus=gpus,
+        model="qwen3-4b-fp8",
+        backend="quail",
+        device="h100-sxm",
+    ))
     sess.register("reports", quail.DocumentProvider.from_parquet(
         f"{tmp}/reports.parquet", id_col="id"))
     sess.register("cands", quail.DocumentProvider.from_parquet(
