@@ -73,23 +73,35 @@ The planner also decides:
   Documents whose KV is expected to save the most future
   recomputation per page are kept first.
 
-## Deciding prefix sharing and the attention path
+## Deciding whether to share prefixes
 
-Two rules run on the chosen plan:
+For each filter, the planner measures how many whole KV pages its
+documents have in common (see
+[Prefix sharing](/docs/architecture/execution#prefix-sharing)). It
+turns sharing on when the compute saved on those tokens is more than
+the cost of writing every document's KV to the arena. A filter with
+one predicate normally skips those writes, because nothing reads its
+KV again; with sharing, the children read it. Sharing changes the
+order documents run in, so the planner leaves it off under `LIMIT`
+to keep table order.
 
-- **`prefix_sharing`** turns on prefix sharing for a filter when its
-  documents share enough leading tokens. Sharing needs every
-  document's KV written to the arena, which a single-predicate
-  filter otherwise skips, so the rule compares the compute saved on
-  shared tokens with the cost of those writes. It is off under
-  `LIMIT`, so the limit keeps table order.
-- **`tree_attention`** picks unified or tree attention for each
-  filter and join. Tree attention reads a shared KV once for all the
-  rows that need it, so it is faster when many short rows read one
-  long KV. The rule compares the two with the roofline model below.
+This decision needs each document's tokens. On the first query over
+a table, the planner plans on estimated lengths while tokenization
+runs, then decides again once the tokens are ready. The rule is
+`prefix_sharing`, and `explain(verbose=True)` shows its choice as
+`share_prefixes`.
 
-Both rules need exact token counts, so on the first query over a
-table they run again once tokenization finishes.
+## Choosing the attention path
+
+For each filter and join, the planner estimates the time of both
+[attention paths](/docs/architecture/execution#attention-paths) with
+the roofline model below and keeps the faster one. The inputs are how
+many groups of rows read each shared KV, how many rows each group
+has, and how long the shared KV is. For a join, the groups are an
+anchor's partners and the shared KV is the anchor. For a filter with
+prefix sharing, the groups are the documents that read one parent's
+pages. The rule is `tree_attention`, and `explain(verbose=True)`
+shows its choice as `attention`.
 
 ## The roofline (speed-of-light) model
 

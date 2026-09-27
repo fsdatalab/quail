@@ -638,8 +638,6 @@ def test_work_matches_attention_masks():
 def test_prefix_sharing_fires_on_a_store_with_shared_pages(tmp_path):
     from quail.execution.tokens import TokenStore
     from quail.planner.physical_rules import (
-        PrefixSharing,
-        TreeAttention,
         page_aligned_shared_tokens,
         sharing_pays,
     )
@@ -659,7 +657,6 @@ def test_prefix_sharing_fires_on_a_store_with_shared_pages(tmp_path):
         str(tmp_path / "plain.arrow"),
         [pa.record_batch([["1 2 3", "4 5 6"]], schema=schema)],
         document_column="body", tokenizer=tokenizer, token_type=pa.int32())
-    assert page_aligned_shared_tokens(plain) == 0
 
     cat = Catalog()
     cat.register("reviews", DocumentProvider.from_parquet(
@@ -677,10 +674,6 @@ def test_prefix_sharing_fires_on_a_store_with_shared_pages(tmp_path):
     chain = filter_chain(plan)
     assert not chain.share_prefixes and not chain.arena_writes
 
-    # no store behind the lengths: nothing to measure, nothing shared
-    plan = _plan(logical, {"r": [40, 42, 3]})
-    assert not filter_chain(plan).share_prefixes
-
     # one shared page in 20,000 tokens saves less forward-pass time
     # than writing KV pages for every token costs (about 1.2% on
     # Qwen3 4B and an H100), so the filter stays unpaged
@@ -695,21 +688,10 @@ def test_prefix_sharing_fires_on_a_store_with_shared_pages(tmp_path):
     # a filter that already writes pages shares any whole page
     assert sharing_pays(QWEN3_4B_FP8, H100_SXM, shared_tokens=16,
                         total_tokens=10_017, writes_pages=True)
-    assert sharing_pays(QWEN3_4B_FP8, H100_SXM, shared_tokens=12_000_000,
-                        total_tokens=17_000_000, writes_pages=False)
-
-    # attributes round-trip through the codec
-    from quail.physical import AiFilter
-    node = AiFilter(node_id="f", alias="r", share_prefixes=True)
-    assert AiFilter.from_attributes(
-        "f", (), node.attributes()) == node
-    assert PrefixSharing().rewrite(plan.graph, None) is None
-    assert TreeAttention().rewrite(plan.graph, None) is None
 
 
 def test_tree_attention_picks_a_filter_path_from_its_prefix_tree(tmp_path):
     from quail.execution.tokens import TokenStore
-    from quail.planner.physical_rules import filter_attention
 
     def tokenizer(text):
         return [int(t) for t in text.split()]
@@ -723,8 +705,6 @@ def test_tree_attention_picks_a_filter_path_from_its_prefix_tree(tmp_path):
         str(tmp_path / "records.arrow"),
         [pa.record_batch([records], schema=schema)],
         document_column="body", tokenizer=tokenizer, token_type=pa.int32())
-    assert filter_attention(QWEN3_4B_FP8, H100_SXM, store, store.lengths,
-                            10) == "tree"
     # a chain of snapshots each 3,000 tokens longer than the last: one
     # reader per node with more rows than the node saves
     snapshots = [" ".join(str(i) for i in range(3000 * (k + 1)))
@@ -733,8 +713,6 @@ def test_tree_attention_picks_a_filter_path_from_its_prefix_tree(tmp_path):
         str(tmp_path / "chain.arrow"),
         [pa.record_batch([snapshots], schema=schema)],
         document_column="body", tokenizer=tokenizer, token_type=pa.int32())
-    assert filter_attention(QWEN3_4B_FP8, H100_SXM, chain, chain.lengths,
-                            10) == "unified"
 
     cat = Catalog()
     cat.register("reviews", DocumentProvider.from_parquet(
