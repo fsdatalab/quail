@@ -48,15 +48,14 @@ class PrefixSharing:
 
     Fires for a filter whose documents share whole pages of prefix
     worth more forward-pass time than the page writes the filter takes
-    on, on a model whose KV sits in one pool (no sliding-window
-    layers). The filter then writes pages even when it has one stage,
-    since borrowed pages must exist.
+    on. The filter then writes pages even when it has one stage, since
+    borrowed pages must exist.
     """
 
     name = "prefix_sharing"
 
     def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
-        if context is None or context.model.sliding_window:
+        if context is None:
             return None
         nodes = []
         changed = False

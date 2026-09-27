@@ -563,6 +563,12 @@ class FilterAdmission:
         self.parent = [None] * n if tree is None else list(tree.parent)
         self.share = [0] * n if tree is None else list(tree.share)
         self.gone = set()          # docs reported at their last stage
+        # children not yet admitted, per parent: a parent keeps its
+        # sliding-window pages untrimmed while any remain
+        self.children_left = [0] * n
+        for parent in self.parent:
+            if parent is not None:
+                self.children_left[parent] += 1
         self.stage_tokens = list(stage_tokens)
         self.chunk_budget = chunk_budget
         self.page_tokens = page_tokens
@@ -663,6 +669,8 @@ class FilterAdmission:
             self.in_flight.add(doc)
             admitted.add(doc)
             room -= cost
+            if parent is not None:
+                self.children_left[parent] -= 1
         self.pending.prepend(skipped)
         return groups
 

@@ -267,7 +267,7 @@ class QuailModelExecution:
 
 def _filter_prefix_tree(node, documents, arena):
     """The filter's prefix tree, or None when the plan did not ask for one."""
-    if not node.share_prefixes or arena.has_sliding:
+    if not node.share_prefixes:
         return None
     started = time.perf_counter()
     tree = prefix_tree(documents, arena.page_tokens)

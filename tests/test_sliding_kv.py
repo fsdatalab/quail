@@ -231,3 +231,59 @@ def test_activate_with_a_borrow_evicts_retained_kv_first():
     arena.free_key(parent)
     arena.free_key(child)
     assert arena.free_pages == 8
+
+
+def test_sliding_pool_borrows_the_window_below_the_share(monkeypatch):
+    cpu_staging(monkeypatch)
+    arena = cpu_arena(pages=64, sliding_pages=32)
+    parent, child = ("d", 0), ("d", 1)
+    doc = list(range(100))
+    tail = [500]
+    # the parent stays untrimmed until the child has borrowed
+    arena.activate(parent, 100, capacity_tokens=110, base_tokens=100)
+    # the child shares 64 tokens: its sliding window starts at
+    # origin(64) = 32 and reads the parent's sliding pages for [32, 64)
+    arena.activate(child, 94, capacity_tokens=104, base_tokens=94,
+                   borrow=(parent, 64))
+    assert arena.sliding_start(child) == 32
+    assert arena.owned_pages(child)[:4] == arena.owned_pages(parent)[:4]
+    assert arena.owned_sliding_pages(child)[:2] == \
+        arena.owned_sliding_pages(parent)[2:4]
+    # the child's sliding pages: 2 borrowed + pages for [64, 104) = 3 own
+    assert len(arena.owned_sliding_pages(child)) == 5
+    chunk = loop.pack_chunk(
+        torch, arena,
+        [dict(key=parent, prefix=doc, f=100, suffixes=[tail]),
+         dict(key=child, prefix=doc[64:94], start=64, f=94, suffixes=[tail])],
+        attention_mode="unified")
+    sliding = chunk.meta["unified"]["sliding"]
+    assert sliding["used"].tolist() == [101, 95 - 32]
+    table = sliding["table"].tolist()
+    full = chunk.meta["unified"]["table"].tolist()
+    assert table[1][:2] == table[0][2:4]
+    assert full[1][:4] == full[0][:4]
+    # the child's rows land after the borrowed window in its own pages
+    dst = sliding["dst"].tolist()
+    assert dst[101:] == arena.capacity_rows_sliding(child)[32:63].tolist()
+    # the parent trims once the child holds the window; the child's
+    # borrowed pages survive, and its own trim drops them first
+    freed = arena.trim_window(parent)
+    assert freed > 0 and arena.sliding_start(parent) == 64
+    assert arena.owned_sliding_pages(child)[:2] == \
+        arena.owned_sliding_pages(parent)[:0] + arena.owned_sliding_pages(child)[:2]
+    assert arena.trim_window(child) > 0      # origin(94) = 48: one page
+    assert arena.sliding_start(child) == 48
+    assert len(arena.owned_sliding_pages(child)) == 4
+    arena.free_key(parent)
+    arena.free_key(child)
+    assert arena.free_pages == 64
+
+    # a parent trimmed past the child's window refuses the borrow
+    arena.activate(parent, 100, capacity_tokens=110, base_tokens=100)
+    arena.trim_window(parent)                 # keeps rows from 64
+    with pytest.raises(ValueError, match="trimmed"):
+        arena.activate(child, 94, capacity_tokens=104, base_tokens=94,
+                       borrow=(parent, 64))
+    assert not arena.is_resident(child)
+    arena.free_key(parent)
+    assert arena.free_pages == 64

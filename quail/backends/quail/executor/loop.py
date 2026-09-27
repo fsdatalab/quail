@@ -1143,8 +1143,6 @@ class FilterStream:
             if not arena_writes or not unified:
                 raise ValueError(
                     "a prefix tree needs arena writes and unified attention")
-            if arena.has_sliding:
-                raise ValueError("a prefix tree needs a single KV pool")
         else:
             prefix_tree = None
         # capacity must cover the longest tail past the kept preamble,
@@ -1168,6 +1166,7 @@ class FilterStream:
                              if arena_writes else None),
             page_cost=arena.page_cost, tree=prefix_tree)
         self.tree = prefix_tree
+        self.untrimmed = set()   # fresh docs whose children still borrow
         self.torch = torch
         self.arena = arena
         self.pipeline = pipeline
@@ -1327,10 +1326,16 @@ class FilterStream:
         normed = _forward(self.pipeline, arena, chunk)
         e1.record()
         # a fresh document's sliding pages before its window origin
-        # were for this pass only
-        for doc, _stage, fresh in groups:
-            if fresh and self.arena_writes:
-                sched.trim(doc, arena.trim_window(self.keys[doc]))
+        # were for this pass only, unless a child still has to borrow
+        # the window below its share
+        if self.arena_writes:
+            self.untrimmed.update(doc for doc, _, fresh in groups if fresh)
+            for doc in list(self.untrimmed):
+                if sched.children_left[doc]:
+                    continue
+                self.untrimmed.discard(doc)
+                if doc in sched.resident:
+                    sched.trim(doc, arena.trim_window(self.keys[doc]))
         t = _tick(timing, "forward_launch", t)
         self.spans.append((0, e0, e1))
         self.outstanding.append((groups, self.async_ans.submit(normed)))
