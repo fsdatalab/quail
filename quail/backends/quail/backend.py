@@ -138,7 +138,10 @@ class QuailModelExecution:
             retain_survivors = inputs.get("retain_survivors", ())
             if retain_survivors is False:
                 retain_survivors = ()
-            tree = _filter_prefix_tree(node, inputs["documents"], arena)
+            # sorted admission would change which rows a limit keeps
+            tree = (None if inputs.get("limit") is not None
+                    else _filter_prefix_tree(node, inputs["documents"], arena))
+            stats = {}
             answers, spans, tokens = loop.run_filter(
                 torch,
                 arena,
@@ -153,12 +156,13 @@ class QuailModelExecution:
                 retain_survivors=retain_survivors,
                 document_done=inputs.get("document_done"),
                 prefix_tree=tree,
+                stats=stats,
             )
             return filter_result(
                 node, answers, tokens, document_ids,
                 gpu_s=_gpu_seconds(torch, spans, inputs),
                 chunks=_chunks(spans, inputs),
-                borrowed_tokens=tree.shared_tokens if tree else 0)
+                borrowed_tokens=stats.get("borrowed_tokens", 0))
 
         stage_frames = inputs["stage_frames"]
         stream = inputs.get("anchor_stream")

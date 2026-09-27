@@ -27,19 +27,25 @@ def page_aligned_shared_tokens(store, page_tokens: int = PAGE_TOKENS) -> int:
                for credit in prefix_credits(store))
 
 
+# CPU seconds per document to sort a corpus and take prefixes, measured
+# on the worker (13 us per document on AGENT); the GPU idles meanwhile
+TREE_SECONDS_PER_DOCUMENT = 20e-6
+
+
 def sharing_pays(model, device, *, shared_tokens: int, total_tokens: int,
-                 writes_pages: bool) -> bool:
+                 n_docs: int, writes_pages: bool) -> bool:
     """Whether borrowing shared prefixes saves more than it costs.
 
-    Borrowing saves the forward pass over the shared tokens. A filter
-    that did not write KV pages starts writing them for every token,
-    which costs the KV bytes of the whole corpus in memory traffic.
+    Borrowing saves the forward pass over the shared tokens. It costs
+    the tree build on the worker, and, for a filter that did not write
+    KV pages, writing them for every token of the corpus.
     """
     if shared_tokens <= 0:
         return False
     saved = shared_tokens * 2.0 * model.params / device.peak_flops
-    cost = (0.0 if writes_pages
-            else total_tokens * model.kappa / device.hbm_bw)
+    cost = n_docs * TREE_SECONDS_PER_DOCUMENT
+    if not writes_pages:
+        cost += total_tokens * model.kappa / device.hbm_bw
     return saved > cost
 
 
@@ -66,7 +72,7 @@ class PrefixSharing:
                 if store is not None and sharing_pays(
                         context.model, context.device,
                         shared_tokens=page_aligned_shared_tokens(store),
-                        total_tokens=sum(lengths),
+                        total_tokens=sum(lengths), n_docs=len(lengths),
                         writes_pages=node.arena_writes):
                     node = replace(node, share_prefixes=True,
                                    arena_writes=True)
@@ -96,8 +102,9 @@ class TreeAttention:
     later stages have one question tail per document, one reader per
     node, for which unified always wins.
 
-    The annotation is shown by explain. The executor keeps the model
-    pipeline's path until a GPU run has measured the choice.
+    Measured on LEP-4 and FEV-4 (experiments/join_attention_paths.py):
+    unified is 2 to 3 percent faster where the rule picks it and tied
+    elsewhere, with equal agreement against vLLM's answers.
     """
 
     name = "tree_attention"

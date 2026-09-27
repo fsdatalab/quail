@@ -567,6 +567,7 @@ class FilterAdmission:
         self.share = [0] * n if tree is None else list(tree.share)
         self.gone = set()          # docs reported at their last stage
         self.can_borrow = can_borrow
+        self.borrowed_tokens = 0   # tokens read from a parent, as admitted
         # children not yet admitted, per parent: a parent keeps its
         # sliding-window pages untrimmed while any remain
         self.children_left = [0] * n
@@ -589,8 +590,12 @@ class FilterAdmission:
         # kept_extra_tokens: the shared question preamble that joins
         # the document's kept KV after stage 1, so pages must cover it
         self.kept_extra = kept_extra_tokens
+        if tree is not None and arena_pages is None:
+            raise ValueError("a prefix tree needs page accounting")
+        # a document packs whole when its parent has left, so the
+        # guard is on its full length
         for d, t in enumerate(self.doc_tokens):
-            need = self.own_tokens(d) + max(stage_tokens)
+            need = t + max(stage_tokens)
             if need > chunk_budget:
                 raise ValueError(f"document {d} + question needs {need} "
                                  f"tokens > chunk budget {chunk_budget}")
@@ -679,6 +684,7 @@ class FilterAdmission:
             room -= cost
             if parent is not None:
                 self.children_left[parent] -= 1
+            self.borrowed_tokens += self.share[doc]
         self.pending.prepend(skipped)
         return groups
 

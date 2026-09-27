@@ -298,6 +298,12 @@ def test_filter_admission_order_and_rewind():
     with pytest.raises(ValueError):
         FilterAdmission([1000], [10], 500, 100, 16)     # over chunk
     with pytest.raises(ValueError):
+        FilterAdmission([64, 100], [1], 80, 100, 16,   # whole doc over chunk
+                        tree=PrefixTree([0, 1], [None, 0], [0, 48]))
+    with pytest.raises(ValueError):
+        FilterAdmission([64], [1], 80, None, 16,        # tree without pages
+                        tree=PrefixTree([0], [None], [0]))
+    with pytest.raises(ValueError):
         FilterAdmission([1000], [10], 2000, 2, 16)      # over arena
     # without a page bin, a document too big for any arena is admitted
     sched = FilterAdmission([1000], [10], 2000, None, 16)
@@ -514,6 +520,7 @@ def test_filter_stream_shares_pages_with_a_resident_parent(monkeypatch):
     _run(stream, arena)
     assert stream.answers == {0: [0], 1: [1], 2: [1]}
     assert stream.tokens == 64 + 32 + 64 + 3
+    assert stream.sched.borrowed_tokens == 32
     assert arena.free_pages == 64 and not arena.accounting.owned
 
     # answers are read after the next chunk launches, so a child right
@@ -533,6 +540,7 @@ def test_filter_stream_shares_pages_with_a_resident_parent(monkeypatch):
     _run(stream, arena)
     assert stream.answers == {0: [0], 1: [1], 2: [1]}
     assert stream.tokens == 64 + 64 + 64 + 3
+    assert stream.sched.borrowed_tokens == 0
     assert arena.free_pages == 64
 
     # a retained parent under a cap of zero pages is evicted at once;

@@ -1245,6 +1245,10 @@ class FilterStream:
             for d in self.sched.report(doc, stage, passed,
                                        release=not (keep or hold)):
                 self.arena.free_key(self.keys[d])
+            if (keep or hold) and doc in self.untrimmed:
+                # no child borrows a window from a document that left
+                self.untrimmed.discard(doc)
+                self.arena.trim_window(self.keys[doc])
             if keep:
                 freed = self.arena.retain(self.keys[doc],
                                           len(self.doc_ids[doc]))
@@ -1368,8 +1372,11 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
                question_ids, budget, timing=None,
                pinned=True, limit=None, *, arena_writes,
                arena_keys=None, retain_survivors=(), attention_mode=None,
-               document_done=None, prefix_tree=None):
+               document_done=None, prefix_tree=None, stats=None):
     """The filter chain run to the end; see FilterStream for the arguments.
+
+    stats, when given, receives borrowed_tokens: the document tokens
+    read from a parent's KV pages instead of computed.
 
     Returns:
         (answers, spans, tokens): answers[d] = 0/1 list up to the
@@ -1383,4 +1390,6 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
         document_done=document_done, prefix_tree=prefix_tree)
     while not stream.done:
         stream.next()
+    if stats is not None:
+        stats["borrowed_tokens"] = stream.sched.borrowed_tokens
     return stream.answers, stream.spans, stream.tokens

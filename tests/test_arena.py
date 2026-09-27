@@ -118,7 +118,11 @@ def test_borrowed_pages_are_shared_until_the_last_holder_frees_them():
     assert len(a.table_pages("c")) == 4
     assert a.retained_pages == 0
     a.retain("c")
-    assert a.retained_pages == 2       # own pages only
+    assert a.retained_pages == 2       # the pages it alone holds
+    a.free_key("p")
+    a.retain("c")
+    assert a.retained_pages == 4       # now the borrowed pages too
+    a.alloc("p", 40)
 
     with pytest.raises(ValueError):
         a.prefix_pages("p", 20)                 # not a whole page

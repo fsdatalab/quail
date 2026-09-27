@@ -158,12 +158,14 @@ class PageArena:
         prefix_tokens = self.tokens[key]
         self._forget_retained(key)
         self.retained[key] = prefix_tokens
-        self._retained_sizes[key] = len(self.owned[key])
-        self._retained_pages += len(self.owned[key])
+        # the pages evicting the key would free: those it alone holds
+        pages = sum(1 for page in self.table_pages(key) if self.holds[page] == 1)
+        self.retained[key] = prefix_tokens
+        self._retained_sizes[key] = pages
+        self._retained_pages += pages
         self._retention_version += 1
         version = self._retention_version
         self._retained_versions[key] = version
-        pages = len(self.owned[key])
         if priority is None:
             priority = (self.retention_policy.priority(key, prefix_tokens, pages)
                         if self.retention_policy else (prefix_tokens / pages,))
@@ -554,9 +556,8 @@ class KVArena:
         length in tokens. Keys that are not an alias and a document
         index are not reported.
         """
-        pages = len(self.accounting.owned[key])
         prefix_tokens = self.accounting.tokens[key]
-        self.free_key(key)
+        pages = self.free_key(key)
         self.evicted_keys += 1
         self.evicted_pages += pages
         self.evicted_prefix_tokens += prefix_tokens
