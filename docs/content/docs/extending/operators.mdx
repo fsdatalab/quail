@@ -113,8 +113,8 @@ operators.
 Rule order:
 
 - Logical rules run in the order they were registered, built-in rules
-  first. Quail repeats them until the plan stops changing, up to four
-  passes.
+  first. Quail repeats them until the plan stops changing, up to
+  `MAX_PASSES` passes (a constant, set to four).
 - Physical rules run once each, in the order they were registered:
   `prefix_sharing`, `tree_attention`, then extension rules.
 - On the first query over a table, the physical rules run again after
