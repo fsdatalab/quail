@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 
+from quail import ablation
 from quail.cost import budgets
 from quail.cost.retention import coefficients, retention_pages
 from quail.cost.sol import speed_of_light, unrounded_seconds
@@ -415,10 +416,20 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     # ---- the order rule first: the search below needs it
     rule, source = (order, f"user: order={order!r}") if order else \
         default_order_rule(filters, joins)
+    # filter order from selectivity estimates came with filter KV reuse
+    filter_rule = rule if ablation.enabled("filter_kv_reuse") else "as_written"
     fixed = rule == "as_written"
+    if not ablation.enabled("join_search"):
+        # each join anchors on its input with the most document tokens,
+        # and joins run in written order
+        specs = [dict(spec, anchor_free=False, anchor=(
+            spec["anchor"] if not spec["anchor_free"]
+            else max(spec["aliases"], key=lambda a: stats[a].total_tokens)))
+            for spec in specs]
+        fixed = True
     filter_orders = {
         alias: order_filters_indexed(
-            predicates, rule,
+            predicates, filter_rule,
             prefix_tokens=pre + stats[alias].mean_doc_tokens,
             model=model, device=device, chunk_tokens=chunk)
         for alias, predicates in filters.items()
@@ -440,9 +451,11 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     base_work = sum(filter_works.values(), Work())
 
     cap_pages = retention_pages(admission, chunk, budgets.PAGE_TOKENS)
+    if not ablation.enabled("scan_ring"):
+        cap_pages = admission // budgets.PAGE_TOKENS
     costs = coefficients(model, device)
     # KV reuse is priced as unlimited
-    filtered = set(filters)
+    filtered = set(filters) if ablation.enabled("filter_kv_reuse") else set()
 
     def run_search(honor_forced=True):
         found = joinsearch.search_joins(
@@ -496,10 +509,22 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
             for alias in spec["aliases"]:
                 if alias != anchor and alias not in streamed:
                     partner_before.add(alias)
+    if not (ablation.enabled("filter_join_streaming")
+            and ablation.enabled("filter_kv_reuse")):
+        streamed = {}
     retention_plan["initial"] = {
         alias: use for alias, use in retention_plan["initial"].items()
         if alias not in streamed
     }
+    if not ablation.enabled("shared_retention") and sequence_groups:
+        first_anchor = sequence_groups[0][0][1]
+        retention_plan["initial"] = {
+            alias: use for alias, use in retention_plan["initial"].items()
+            if alias == first_anchor
+        }
+    if not ablation.enabled("filter_kv_reuse"):
+        retention_plan["initial"] = {}
+        retention_plan["after"] = {gid: {} for gid in retention_plan["after"]}
     retention_plan.update(**costs, cap_pages=cap_pages)
     forced = sorted({s["anchor"] for s in specs
                      if s["semantics"] == "full"
@@ -585,7 +610,8 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
             surv *= effective_selectivity(p.selectivity)
         keep = alias in retention_plan["initial"]
         pinned = alias in streamed
-        writes = len(stages) > 1 or keep or pinned
+        writes = len(stages) > 1 or keep or pinned \
+            or not ablation.enabled("skip_arena_writes")
         # pinned pages also cover the consuming join's largest frame
         hold = max((spec["frame_tokens"][alias]
                     for spec, _ in sequence_groups[streamed[alias]])
@@ -766,6 +792,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
             "admission_tokens": admission,
             "retention": retention_plan,
             "order_rule": rule,
+            "filter_order_rule": filter_rule,
             "order_source": source,
             "search_seconds": estimate,
         },

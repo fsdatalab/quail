@@ -275,11 +275,14 @@ def refused_queries(session, query_ids, data_dir) -> dict[str, str]:
 
 def run_suite(only=None, *, sf=0.1, config, data_dir=None,
               ground_truth_collection=None, output_dir,
-              h100_usd_per_hour=H100_USD_PER_HOUR, root=None):
+              h100_usd_per_hour=H100_USD_PER_HOUR, root=None,
+              started_at=None):
     """Run Quail queries through QUAIL-B and save the benchmark report.
 
     Queries the backend refuses to plan are left out of the run and
-    listed under `skipped_queries` in the returned record.
+    listed under `skipped_queries` in the returned record. started_at,
+    a wall clock time, makes the record's metadata give the seconds
+    from then until the session was ready.
     """
     skipped = {}
     if only and data_dir is not None:
@@ -287,6 +290,8 @@ def run_suite(only=None, *, sf=0.1, config, data_dir=None,
             skipped = refused_queries(preflight_session, only, data_dir)
         only = [query_id for query_id in only if query_id not in skipped]
     with quail.Session(config) as session:
+        session_ready_s = (
+            None if started_at is None else time.time() - started_at)
         record = benchmark.run(
             partial(run_query, session), queries=only, scale_factor=sf,
             output_dir=output_dir, data_dir=data_dir,
@@ -305,6 +310,7 @@ def run_suite(only=None, *, sf=0.1, config, data_dir=None,
                     else "prompt text submission to answer"
                 ),
                 "cache_reuse": "one session per backend and query family",
+                "session_ready_s": session_ready_s,
                 "planning": {
                     "collection_id": SELECTIVITY_ESTIMATE_COLLECTION,
                     "corpus_id": SELECTIVITY_ESTIMATE_CORPUS,

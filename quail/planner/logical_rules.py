@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from quail import ablation
 from quail.logical import (
     Alias,
     ColumnRef,
@@ -77,13 +78,27 @@ def push_down_projection(root: LogicalNode) -> LogicalNode:
     return descend(root, {})
 
 
+def keep_source_columns(root: LogicalNode, catalog) -> LogicalNode:
+    """Rewrite every Scan to keep every column of its source table."""
+    if isinstance(root, Scan):
+        columns = tuple(catalog.get(root.provider).schema().names)
+        return root if columns == root.columns else replace(
+            root, columns=columns)
+    children = tuple(
+        keep_source_columns(child, catalog) for child in root.children())
+    return root if children == root.children() else root.with_children(children)
+
+
 class ProjectionPushdown:
     """Push the projected column set down to each Scan."""
 
     name = "projection_pushdown"
 
     def rewrite(self, root, context):
-        rewritten = push_down_projection(root)
+        if not ablation.enabled("projection_pushdown"):
+            rewritten = keep_source_columns(root, context.catalog)
+        else:
+            rewritten = push_down_projection(root)
         return None if rewritten is root else rewritten
 
 

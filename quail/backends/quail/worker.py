@@ -8,6 +8,7 @@ import gc
 import itertools
 import time
 
+from quail import ablation
 from quail.backends.base import GpuContext
 from quail.backends.quail.distributed import execute_distributed_graph
 from quail.backends.quail.executor.arena import KVArena
@@ -66,8 +67,9 @@ class LoadedGpu:
 
         budget = budgets.chunk_budget(spec, device)
         t0 = time.perf_counter()
+        revision = spec.revision if ablation.enabled("boot_cache") else None
         self.model = load_model(model_path or spec.hf_name,
-                                revision=None if model_path else spec.revision,
+                                revision=None if model_path else revision,
                                 answer_token_ids=answer_token_ids,
                                 max_batched_tokens=budget,
                                 moe_backend=spec.moe_backend)
@@ -95,7 +97,9 @@ class LoadedGpu:
         self.arena_s = time.perf_counter() - t0
 
         t0 = time.perf_counter()
-        self.pipeline = build_pipeline(spec, self.model, self.arena)
+        options = ({} if ablation.enabled("triton_kernels")
+                   else {"kernels": "vllm"})
+        self.pipeline = build_pipeline(spec, self.model, self.arena, **options)
         self.pipeline_s = time.perf_counter() - t0
 
         self.execution = backend.start(context)
@@ -135,7 +139,9 @@ class LoadedGpu:
         with self.torch.inference_mode():
             warm = warm_kernels(self.torch, self.arena, self.pipeline,
                                 self.async_ans, self.chunk_tokens,
-                                model_name=self.spec.hf_name)
+                                model_name=self.spec.hf_name,
+                                force_compile=not ablation.enabled(
+                                    "compile_once"))
         self.torch.cuda.synchronize()
         warm_s = time.perf_counter() - t0
         self._warmed = True
