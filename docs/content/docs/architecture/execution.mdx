@@ -45,17 +45,11 @@ token budget and a KV page budget.
   The next predicate reuses the document prefix KV and appends its
   own question tokens. A document that fails (returns FALSE) or
   won't be used again in the query has all its KV freed.
-- **Prefix sharing.** When the planner's `prefix_sharing` rule fires
-  (see [Planning](/docs/architecture/planning#deciding-prefix-sharing-and-the-attention-path)),
-  the worker sorts its documents by token ids and builds a prefix
-  tree: each document's parent is the earlier document that computed
-  the whole KV pages the two share. Documents are admitted in tree
-  order. A child whose parent's KV is resident borrows the parent's
-  pages for the shared prefix and computes only the tokens after it;
-  a page is freed when its last holder drops it. A child whose parent
-  has already left computes its whole document. On a sliding-window
-  model the child also borrows the parent's window pages below the
-  share, so a parent keeps its window until every child is admitted.
+- **Prefix sharing.** When documents start with the same tokens,
+  such as successive snapshots of one agent trace, Quail computes the
+  KV for those tokens once. A document reads the KV pages of an
+  earlier document with the same start and computes only the tokens
+  after it.
 
 ### Join execution
 
@@ -102,17 +96,12 @@ model layer. For each layer:
 2. **QKV projection** via DeepGEMM (FP8 matrix multiply).
 3. **QK-norm and RoPE** to produce query and key vectors.
 4. **Attention** over the new tokens and any resident KV in the
-   arena. There are two paths. *Unified* attention is one causal
-   paged call in which every row reads the KV its own document needs.
-   *Tree* attention is two calls: one for self-attention among the
-   new tokens, one in which the rows of every reader of the same
-   resident KV (partners of one join anchor, or documents borrowing
-   one parent's prefix) are stacked and read it once, non-causally;
-   a fused kernel merges the two by log-sum-exp and quantizes to FP8.
-   The planner's `tree_attention` rule picks the path per operator by
-   a roofline (see [Planning](/docs/architecture/planning#deciding-prefix-sharing-and-the-attention-path)).
-   Tree attention needs the FP8 merge kernel; a bf16 model or a
-   diffusion model with canvas rows always runs unified.
+   arena, by one of two paths. *Unified* attention is one causal
+   call over every row. *Tree* attention is two calls: one over the
+   new tokens, and one in which all rows that read the same resident
+   KV (the partners of one join anchor, or documents sharing one
+   prefix) read it together. A fused kernel merges the two results.
+   The planner picks the path for each operator.
 5. **Output projection** via DeepGEMM.
 6. **MLP** (gate-up projection, SiLU activation, down projection).
 

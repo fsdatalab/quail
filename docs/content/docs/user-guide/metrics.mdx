@@ -17,7 +17,7 @@ report = result.report
 | `wall_s` | Query execution time in seconds, not counting model startup. |
 | `boot_s` | How long it took to load the model and compile kernels. |
 | `boot_kind` | `"cold"` if this was the first query in the session (model loaded from disk), `"warm"` if the model was already in memory. |
-| `fresh_tokens` | Total input tokens processed by the model. If a token's KV was evicted and the model had to reprocess it, it counts again. A token read from another document's KV pages under prefix sharing is not counted. |
+| `fresh_tokens` | Total input tokens processed by the model. If a token's KV was evicted and the model had to reprocess it, it counts again. Prefix tokens read from another document's KV are not counted. |
 | `worker_total_s` | Wall time including tokenization and planning, but not report writes. |
 | `remarks` | Notes from the planner and tokenizer, for example which tokenizer was selected and why. |
 
@@ -46,10 +46,7 @@ the nodes shown in `explain()` output.
 | `output_rows` | How many passed. |
 | `fresh_tokens` | Input tokens this node processed. |
 | `evaluated_documents` | Documents evaluated (filters only). |
-
-A filter that shared prefixes also reports `borrowed_prefix_tokens`:
-document tokens read from another document's KV pages instead of
-computed.
+| `borrowed_prefix_tokens` | Prefix tokens read from another document's KV instead of computed (filters with prefix sharing only). |
 
 ## Boot details
 

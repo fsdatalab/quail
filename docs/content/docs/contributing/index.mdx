@@ -65,11 +65,9 @@ interests you, open an issue and we will help you get started.
   These require decode (generating multiple tokens), which the
   current engine does not do. See
   [Custom operators](/docs/extending/operators).
-- **Prefix sharing across GPU workers.** The `prefix_sharing` rule
-  builds the prefix tree per GPU worker over that worker's shard of
-  the documents, so two documents sharing a prefix on different
-  workers each compute it. Splitting the corpus by prefix tree
-  instead of by row range would close that gap.
+- **Prefix sharing across GPU workers.** Each GPU worker shares
+  prefixes only among its own documents. Sending documents with the
+  same start to the same worker would let the whole table share.
 
 ### Harder
 

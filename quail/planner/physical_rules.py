@@ -57,9 +57,7 @@ def sharing_pays(model, device, *, shared_tokens: int, total_tokens: int,
 
     Borrowing saves the forward pass over the shared tokens. For a
     filter that did not write KV pages, it costs writing them for every
-    token of the corpus. The worker's sort of the corpus is not priced:
-    about 12 microseconds per document, under 1 percent of the filter's
-    forward passes on 300-token documents.
+    token of the corpus.
     """
     if shared_tokens <= 0:
         return False
@@ -122,10 +120,6 @@ class TreeAttention:
     documents borrowing one parent's pages are that node's readers
     (filter_attention). A filter that does not share has one reader
     per node and stays on the unified path.
-
-    Measured on LEP-4 and FEV-4 (experiments/join_attention_paths.py):
-    unified is 2 to 3 percent faster where the rule picks it and tied
-    elsewhere, with equal agreement against vLLM's answers.
     """
 
     name = "tree_attention"

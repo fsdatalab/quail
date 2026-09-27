@@ -70,11 +70,8 @@ is the selectivity it planned with. A selectivity you did not set
 shows as `20%*`, with a footnote.
 
 `explain(verbose=True)` adds node ids, port connections, KV retention
-decisions, and planner remarks. It also shows each filter's and
-join's physical settings, including `share_prefixes` (whether the
-filter's documents borrow KV for a shared token prefix) and
-`attention` (`unified` or `tree`), which the `prefix_sharing` and
-`tree_attention` rules set.
+decisions, planner remarks, and each operator's physical settings,
+such as `share_prefixes` and `attention`.
 
 ## Measure the plan
 
