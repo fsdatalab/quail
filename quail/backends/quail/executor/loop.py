@@ -223,10 +223,13 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
       start     Logical position of the first fresh prefix token; the
                 key's pages before it are borrowed from a parent and
                 already hold KV. 0 when absent.
-      read_key  Under tree attention, the parent whose pages the
-                fresh rows read for positions before start; the rows
-                still write the group's own key. Consecutive groups
-                with one read_key and start share one read of it.
+      read_key  Under tree attention, for a group with one suffix,
+                the parent whose pages the fresh rows read for
+                positions before start; the rows still write the
+                group's own key. Consecutive groups with one read_key
+                and start share one read of it. Without it, the fresh
+                prefix reads the key's own borrowed pages and each
+                suffix reads the whole key as usual.
       f         Kept-context length (suffix positions start here).
       suffixes  List of suffix token lists.
       write_suffix_tokens  Leading rows of the first suffix to scatter
@@ -285,10 +288,14 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         start = g.get("start", 0)
         paged = arena.is_resident(key)
         row0 = token_count
-        # a borrowing fresh group under tree attention: its rows read
-        # the parent's pages in call B and form one causal segment
-        # with the tail in call A
+        # a borrowing fresh group under tree attention reads the pages
+        # before start in call B. With one suffix and a read_key the
+        # group is one causal segment that reads the parent, stacked
+        # with its siblings; otherwise the prefix is its own segment
+        # reading the key's borrowed pages
         borrowing = fresh and start and tree_path
+        stacked = (borrowing and len(g["suffixes"]) == 1
+                   and g.get("read_key") is not None)
         if fresh:
             if not paged and len(g["suffixes"]) > 1:
                 raise ValueError(
@@ -299,17 +306,18 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             if start and not paged:
                 raise ValueError(
                     f"group {key!r}: a borrowed prefix needs arena pages")
-            if borrowing and (len(g["suffixes"]) != 1
-                              or g.get("read_key") is None):
-                raise ValueError(
-                    f"group {key!r}: a borrowing group under tree "
-                    f"attention names its read_key and has one suffix")
             id_parts.append(g["prefix"])
             token_count += len(g["prefix"])
             pos.append(np.arange(start, start + len(g["prefix"]),
                                  dtype=np.int64))
-            if (paged or not g["suffixes"]) and not borrowing:
+            if (paged or not g["suffixes"]) and not stacked:
                 cu_a.append(token_count)
+            if borrowing and not stacked:
+                reader_rows.extend(range(row0, token_count))
+                cu_q.append(cu_q[-1] + token_count - row0)
+                read_keys.append(key)
+                read_used.append(start)
+                max_q = max(max_q, token_count - row0)
             if paged and tree_path:
                 kv_writes.append((key, row0, row0 + len(g["prefix"]),
                                   start))
@@ -345,7 +353,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 kv_writes.append((key, srow, srow + wst, dest))
         s_count = token_count - s_row0
         layout.append((key, len(g["suffixes"])))
-        if borrowing:
+        if stacked:
             # every row of the group reads the parent's pages up to
             # start; siblings packed back to back share that read
             count = token_count - row0
@@ -599,7 +607,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
              stage_suffixes, budget, stage_frames=None,
              anchor_keys=None, anchor_done=None, anchor_source=None,
              anchor_partners=None, anchor_batch=None, staging=None,
-             attention_mode=None):
+             attention_mode=None, prefix_tree=None, stats=None):
     """The join driver: stream partner lists against anchors.
 
     Survivors are gated between stages.
@@ -641,6 +649,11 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         staging: Optional reusable input transfer buffers.
         attention_mode: "tree" or "unified" as the plan chose; None
             and a model without tree attention run unified.
+        prefix_tree: A PrefixTree over anchor_prefixes, or None. A fresh
+            anchor whose parent's pages are resident borrows them for
+            its shared length and packs only the tokens after it.
+        stats: When given, receives borrowed_tokens: the anchor prefix
+            tokens read from a parent's KV pages instead of computed.
 
     Returns:
         (ans, spans, tokens): ans[j][a] = 0/1 row over the stage-j
@@ -690,6 +703,20 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     def partners_of(key):
         return None if anchor_partners is None else anchor_partners(key)
 
+    if prefix_tree is not None and prefix_tree.shared_tokens:
+        prefix_tree = _predecessor_parents(prefix_tree, arena)
+    else:
+        prefix_tree = None
+
+    def can_borrow(a, parent, same_chunk):
+        shared = sched.shared[a]
+        if not same_chunk:
+            return arena.can_borrow(keys[parent], shared)
+        # a parent admitted in this chunk is allocated just before the
+        # child; its sliding pages will start below its own shared part
+        own = sched.borrows.get(parent, (None, 0))[1]
+        return arena.origin(own) <= arena.origin(shared)
+
     sched = JoinAdmission(
         [len(p) for p in prefixes],
         [[len(s) for s in sufs] for sufs in stage_suffixes],
@@ -702,6 +729,8 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         answer_dtype=async_ans.dtype,
         canvas_tokens=len(canvas),
         page_cost=arena.page_cost,
+        tree=prefix_tree,
+        can_borrow=can_borrow if prefix_tree is not None else None,
     )
     spans = []
     tokens = 0
@@ -757,10 +786,16 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
             key = keys[a]
             f = len(prefixes[a])
             frame = frames[j]
-            got = arena.activate(key, f, capacity_tokens=f + frame_max,
-                                 base_tokens=f)
+            parent, shared = sched.borrows.get(a, (None, 0)) if carried \
+                else (None, 0)
+            got = arena.activate(
+                key, f, capacity_tokens=f + frame_max, base_tokens=f,
+                borrow=(keys[parent], shared) if shared else None)
             assert got is not None, \
                 "scheduler admitted an anchor the arena cannot hold"
+            prefix = None
+            if carried:
+                prefix = prefixes[a][shared:] if shared else prefixes[a]
             sufs = [stage_suffixes[j][i]
                     for i in sched.partner_indices(a, j, start, end)]
             if frame and start == 0:
@@ -768,8 +803,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
                 # document rows. The pair entry reads doc + frame.
                 # The frame entry's answer bit is skipped by report().
                 specs.append(dict(
-                    key=key,
-                    prefix=prefixes[a] if carried else None,
+                    key=key, prefix=prefix, start=shared,
                     f=f, suffixes=[frame],
                     write_suffix_tokens=len(frame)))
                 specs.append(dict(
@@ -777,8 +811,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
                     suffixes=sufs))
             else:
                 specs.append(dict(
-                    key=key,
-                    prefix=prefixes[a] if carried else None,
+                    key=key, prefix=prefix, start=shared,
                     f=f + len(frame),
                     suffixes=sufs))
         return pack_chunk(torch, arena, specs, attention_mode=mode,
@@ -885,6 +918,8 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     while outstanding:
         report(outstanding.pop(0))
     progress.finish(f"{label} done", f"{tokens:,} fresh tokens")
+    if stats is not None:
+        stats["borrowed_tokens"] = sched.borrowed_tokens
     return sched.answers, spans, tokens
 
 

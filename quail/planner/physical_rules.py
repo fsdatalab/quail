@@ -73,7 +73,8 @@ class PrefixSharing:
     Fires for a filter whose documents share whole pages of prefix
     worth more forward-pass time than the page writes the filter takes
     on. The filter then writes pages even when it has one stage, since
-    borrowed pages must exist.
+    borrowed pages must exist. A join always writes its anchors' KV,
+    so it fires for any join whose anchors share a whole page.
     """
 
     name = "prefix_sharing"
@@ -94,6 +95,15 @@ class PrefixSharing:
                         writes_pages=node.arena_writes):
                     node = replace(node, share_prefixes=True,
                                    arena_writes=True)
+                    changed = True
+            elif isinstance(node, AiJoin) and not node.share_prefixes:
+                lengths = context.document_tokens.get(node.anchor)
+                store = _token_store(lengths)
+                if store is not None and sharing_pays(
+                        context.model, context.device,
+                        shared_tokens=page_aligned_shared_tokens(store),
+                        total_tokens=sum(lengths), writes_pages=True):
+                    node = replace(node, share_prefixes=True)
                     changed = True
             nodes.append(node)
         if not changed:

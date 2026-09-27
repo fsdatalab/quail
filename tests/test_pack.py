@@ -599,3 +599,69 @@ def test_filter_stream_shares_pages_with_a_resident_parent(monkeypatch):
     handed = _run(stream, arena, free_handed=True)
     assert sorted(handed) == [("r", 0), ("r", 1), ("r", 2)]
     assert arena.free_pages == 64
+
+
+def test_join_anchors_borrow_a_resident_parents_pages(monkeypatch):
+    from types import SimpleNamespace
+
+    from fakes import (
+        DOC,
+        FRAME,
+        PARTNER,
+        cpu_arena,
+        fake_pack,
+        fake_pipeline,
+        fake_torch,
+    )
+
+    from quail.backends.quail.executor import loop
+
+    packed = []
+
+    def recording_pack(torch, arena, specs, **kw):
+        packed.extend((s["key"], s.get("start", 0),
+                       None if s["prefix"] is None else len(s["prefix"]))
+                      for s in specs if s["prefix"] is not None)
+        return fake_pack(torch, arena, specs, **kw)
+
+    monkeypatch.setattr(loop, "pack_chunk", recording_pack)
+    keys = [("a", d) for d in range(3)]
+    # anchor 1 shares 32 tokens (2 pages) with anchor 0; anchor 2 none
+    prefixes = [[DOC] * 64, [DOC] * 32 + [DOC + 1] * 32, [DOC + 2] * 64]
+    tree = PrefixTree(order=[0, 1, 2], parent=[None, 0, None],
+                      shared=[0, 32, 0])
+    def forward(chunk):
+        # partner 0 matches every anchor; frame entries answer nothing
+        return [int(suffix[0] == PARTNER) if suffix[0] < FRAME else 0
+                for spec in chunk.specs for suffix in spec["suffixes"]]
+
+    pipeline = fake_pipeline(forward_chunk=forward)
+    answers = SimpleNamespace(submit=lambda v: v, result=lambda v: v, dtype=None)
+    arena = cpu_arena(64)
+    stats = {}
+    out, _, tokens = loop.run_join(
+        fake_torch(), arena, pipeline, answers, prefixes,
+        [[[PARTNER + 0], [PARTNER + 1]]], 500, stage_frames=[[FRAME]],
+        anchor_keys=keys, prefix_tree=tree, stats=stats)
+    assert out == [{0: [1, 0], 1: [1, 0], 2: [1, 0]}]
+    # the child packs its 32 own tokens from position 32
+    assert packed == [(keys[0], 0, 64), (keys[1], 32, 32), (keys[2], 0, 64)]
+    assert tokens == 64 + 32 + 64 + 3 * (1 + 2)
+    assert stats["borrowed_tokens"] == 32
+    assert arena.free_pages == 64 and not arena.accounting.owned
+
+    # one anchor per chunk, with anchor 2 between parent and child: the
+    # parent has answered and been freed before the child's turn, so
+    # the child packs its whole prefix
+    packed.clear()
+    arena = cpu_arena(64)
+    out, _, tokens = loop.run_join(
+        fake_torch(), arena, pipeline, answers, prefixes,
+        [[[PARTNER + 0], [PARTNER + 1]]], 67, stage_frames=[[FRAME]],
+        anchor_keys=keys, stats=stats,
+        prefix_tree=PrefixTree(order=[0, 2, 1], parent=[None, 0, None],
+                               shared=[0, 32, 0]))
+    assert out == [{0: [1, 0], 1: [1, 0], 2: [1, 0]}]
+    assert (keys[1], 0, 64) in packed
+    assert stats["borrowed_tokens"] == 0
+    assert arena.free_pages == 64 and not arena.accounting.owned

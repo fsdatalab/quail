@@ -729,3 +729,30 @@ def test_tree_attention_picks_a_filter_path_from_its_prefix_tree(tmp_path):
     # a filter without shared prefixes has one reader per node
     plan = _plan(logical, {"r": [40, 42, 3]})
     assert filter_chain(plan).attention == "unified"
+
+
+def test_prefix_sharing_fires_on_join_anchors_with_shared_pages(catalog, tmp_path):
+    from quail.execution.tokens import TokenStore
+
+    def tokenizer(text):
+        return [int(t) for t in text.split()]
+
+    schema = pa.schema({"body": pa.string()})
+    shared = " ".join(str(i) for i in range(400))
+    reviews = TokenStore.write(
+        str(tmp_path / "anchors.arrow"),
+        [pa.record_batch([[shared + f" {9000 + r}" for r in range(20)]],
+                         schema=schema)],
+        document_column="body", tokenizer=tokenizer, token_type=pa.int32())
+    logical = (docs(catalog, "reviews", tok).alias("r")
+               .ai_join(docs(catalog, "products", tok).alias("p"),
+                        prompt("m {0} {1}", col("r.review"),
+                               col("p.description")),
+                        selectivity=0.5, anchor="r")
+               .select("r.id", "p.asin"))
+    plan = _plan(logical, {"r": reviews.lengths, "p": [20] * 20})
+    join = plan.graph.nodes_by_type(AiJoin.type_name)[0]
+    assert join.share_prefixes
+    # anchors with nothing in common share nothing
+    plan = _plan(logical, {"r": [401] * 20, "p": [20] * 20})
+    assert not plan.graph.nodes_by_type(AiJoin.type_name)[0].share_prefixes

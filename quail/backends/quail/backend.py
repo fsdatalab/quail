@@ -140,7 +140,7 @@ class QuailModelExecution:
                 retain_survivors = ()
             # sorted admission would change which rows a limit keeps
             tree = (None if inputs.get("limit") is not None
-                    else _filter_prefix_tree(node, inputs["documents"], arena))
+                    else _prefix_tree(node, inputs["documents"], arena))
             stats = {}
             answers, spans, tokens = loop.run_filter(
                 torch,
@@ -186,11 +186,12 @@ class QuailModelExecution:
                 hold_survivors=True,
                 hold_extra_tokens=filter_node.hold_tokens,
                 document_done=stream.get("document_done"),
-                prefix_tree=_filter_prefix_tree(
+                prefix_tree=_prefix_tree(
                     filter_node, stream["documents"], arena),
                 attention_mode=filter_node.attention or None,
             )
         lists_for = inputs.get("anchor_partners")
+        join_stats = {}
         answers, spans, tokens = loop.run_join(
             torch,
             arena,
@@ -207,6 +208,9 @@ class QuailModelExecution:
                 None if lists_for is None else lambda key: lists_for(key[1])),
             anchor_batch=inputs.get("anchor_batch"),
             attention_mode=node.attention or None,
+            prefix_tree=(None if source is not None else _prefix_tree(
+                node, inputs["prefixes"], arena)),
+            stats=join_stats,
         )
         if source is not None:
             # admission order; a per-batch function may have dropped some
@@ -266,20 +270,25 @@ class QuailModelExecution:
                 fresh_tokens=tokens,
                 gpu_s=_gpu_seconds(torch, spans, inputs),
                 chunks=_chunks(spans, inputs),
-                extension={"answers": answers},
+                extension={
+                    "answers": answers,
+                    **({"borrowed_prefix_tokens": join_stats["borrowed_tokens"]}
+                       if join_stats.get("borrowed_tokens") else {}),
+                },
             ),
         )
 
 
-def _filter_prefix_tree(node, documents, arena):
-    """The filter's prefix tree, or None when the plan did not ask for one."""
+def _prefix_tree(node, documents, arena):
+    """The node's prefix tree, or None when the plan did not ask for one."""
     if not node.share_prefixes:
         return None
     started = time.perf_counter()
     tree = prefix_tree(documents, arena.page_tokens)
     logger.info(
         "prefix sharing on %s: %s documents borrow %s tokens "
-        "(tree built in %.2f s)", node.alias, len(documents),
+        "(tree built in %.2f s)", getattr(node, "alias", None) or node.anchor,
+        len(documents),
         tree.shared_tokens, time.perf_counter() - started)
     return tree
 

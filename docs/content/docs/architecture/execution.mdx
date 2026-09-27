@@ -48,33 +48,31 @@ token budget and a KV page budget.
 
 ### Prefix sharing
 
-Many tables hold documents that begin with the same text. Each
-snapshot of an agent trace repeats the turns before it, and records
-exported from one system often start with the same header. Without
-sharing, Quail computes the KV for that text once per document.
+When several documents start with the same tokens, Quail computes the
+KV for those tokens once, and each document reads it instead of
+computing it again.
 
-With prefix sharing, the KV for a common start is computed once and
-read by every document that begins with it. Sharing works in whole KV
-pages of 16 tokens: a document reads the pages it has in common with
-an earlier document and computes only the tokens after them. For
-example, take three snapshots of one trace:
+For example, imagine a table where each row is one snapshot of an
+agent's work on a task. The agent's trace grows turn by turn, and the
+table stores the trace after every turn, so each snapshot is the
+previous snapshot plus the new turns. Take three snapshots of 1,000,
+1,400, and 1,900 tokens. Without prefix sharing, Quail computes all
+4,300 tokens. With it, Quail computes the first snapshot's 1,000
+tokens, then only the 408 new tokens of the second and the 508 new
+tokens of the third: 1,916 tokens in all. The counts are 408 and 508
+rather than 400 and 500 because KV is stored in pages of 16 tokens,
+and a document can only read another document's pages whole.
 
-| Document | Tokens | Read from the earlier snapshot | Computed |
-| --- | --- | --- | --- |
-| Snapshot 1 | 1,000 | none | 1,000 |
-| Snapshot 2 | 1,400 | 992 (62 pages) | 408 |
-| Snapshot 3 | 1,900 | 1,392 (87 pages) | 508 |
+To find the shared starts, Quail sorts the documents by their tokens,
+so documents that start the same way sit next to each other. Each
+document gets a *parent*: an earlier document whose pages it reads.
+Attention reads a document's KV through a list of pages, and a
+document's list starts with its parent's pages. A parent keeps its
+pages until all of its children have run, and a page is freed once no
+document uses it.
 
-Without sharing the three cost 4,300 tokens; with it they cost 1,916.
-
-Quail sorts the documents by their tokens, so documents with the
-same start sit next to each other. Each document then gets a
-*parent*: the earlier document whose pages it reads. A document's
-block table, the list of KV pages attention reads for it, starts with
-its parent's pages and continues with its own. A parent's pages stay
-in memory until all of its children have run, and a page is freed
-when no document lists it any more. The planner decides when to use
-prefix sharing; see
+Filters and joins both share prefixes. In a join, the anchors share
+with each other. The planner decides when to share; see
 [Planning](/docs/architecture/planning#deciding-whether-to-share-prefixes).
 
 ### Join execution
@@ -128,25 +126,33 @@ model layer. For each layer:
 
 ### Attention paths
 
-Rows in one forward pass often read the same resident KV. The
-partners of a join anchor all read the anchor's KV, and documents
-that share a prefix all read their parent's pages. Quail has two ways
-to compute this attention.
+Some rows in a forward pass read the same KV. In a join, every
+partner of one anchor reads the anchor's KV. In a filter with prefix
+sharing, every document with the same parent reads the parent's
+pages. Quail can compute this attention in two ways.
 
-- **Unified attention** runs one causal attention call over every
-  row. Each group of rows reads all the KV it needs, so a shared KV is
-  read from memory once per group that uses it.
-- **Tree attention** runs two calls. The first covers each group's
-  own new tokens. In the second, every group that reads the same
-  resident KV is stacked together, so that KV is read from memory
-  once. A fused kernel merges the two results.
+- **Unified attention** makes one attention call over all the rows.
+  Each document's rows read all the KV they need, so KV that several
+  documents need is read from memory once for each of them.
+- **Tree attention** makes two calls. The first covers each
+  document's own new tokens. In the second, the rows of all the
+  documents that read the same KV are put together, so that KV is
+  read from memory once. A small kernel then combines the two
+  results.
 
-Tree attention saves memory reads and adds the merge, so it wins
-when many short groups read one long KV: for example, several
-hundred partners of 20 tokens each reading one 2,000-token anchor.
-Unified attention wins when few groups read each KV, or when each
-group is long. Tree attention needs FP8 weights; other models always
-run unified. The planner picks the path for each operator; see
+Tree attention reads less memory but does the extra combine step.
+
+For example, imagine a join where one anchor document of 2,000 tokens
+is compared with 300 partner documents of 20 tokens each. With
+unified attention, the 2,000-token anchor is read from memory 300
+times, once per partner. With tree attention, it is read once for all
+300. Here tree attention is faster. Now imagine the same anchor
+compared with 2 partners of 1,000 tokens each. The anchor is read
+only twice either way, and most of the work is the partners' own
+tokens, so unified attention is faster.
+
+Tree attention needs FP8 weights; other models always use unified
+attention. The planner picks the path for each operator; see
 [Planning](/docs/architecture/planning#choosing-the-attention-path).
 
 Quail uses vLLM's model implementation and DeepGEMM for the main

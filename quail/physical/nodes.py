@@ -694,6 +694,9 @@ class AiJoin(PhysicalNode):
     # "unified" or "tree": the attention path the tree_attention rule
     # chose; empty leaves the model pipeline's default
     attention: str = ""
+    # anchors borrow the KV pages of an anchor that shares their token
+    # prefix (the prefix_sharing rule)
+    share_prefixes: bool = False
 
     type_name: ClassVar[str] = "quail.ai_join"
     runtime_key: ClassVar[str] = type_name
@@ -721,6 +724,7 @@ class AiJoin(PhysicalNode):
             "keep_anchor_kv": self.keep_anchor_kv,
             "stages": [stage.to_dict() for stage in self.stages],
             "attention": self.attention,
+            "share_prefixes": self.share_prefixes,
         }
 
     def explain_fields(self) -> dict:
@@ -740,6 +744,7 @@ class AiJoin(PhysicalNode):
                 for stage in attributes["stages"]
             ),
             attention=str(attributes.get("attention", "")),
+            share_prefixes=bool(attributes.get("share_prefixes", False)),
         )
 
 

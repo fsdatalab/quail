@@ -203,12 +203,18 @@ def test_pack_chunk_reads_borrowed_pages_in_the_unified_call(monkeypatch):
     assert dst[101:] == arena.capacity_rows(child)[64:95].tolist()
     assert arena.capacity_rows(child)[:64].tolist() == \
         arena.capacity_rows(parent)[:64].tolist()
-    with pytest.raises(ValueError, match="read_key"):
-        loop.pack_chunk(
-            torch, arena,
-            [dict(key=child, prefix=doc[64:94], start=64, f=94,
-                  suffixes=[tail])],
-            attention_mode="tree")
+    # under tree attention without a read_key, the fresh rows read the
+    # child's own first 64 rows (the borrowed pages) and the suffix
+    # reads all 94
+    chunk = loop.pack_chunk(
+        torch, arena,
+        [dict(key=child, prefix=doc[64:94], start=64, f=94,
+              suffixes=[tail, [501]])],
+        attention_mode="tree")
+    reads = chunk.meta["reads"]
+    assert reads["used"].tolist() == [64, 94]
+    assert reads["cu_q"].tolist() == [0, 30, 32]
+    assert chunk.meta["cu_a"].tolist() == [0, 30, 31, 32]
     arena.free_key(parent)
     arena.free_key(child)
     assert arena.free_pages == 64

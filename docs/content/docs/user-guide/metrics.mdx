@@ -46,7 +46,7 @@ the nodes shown in `explain()` output.
 | `output_rows` | How many passed. |
 | `fresh_tokens` | Input tokens this node processed. |
 | `evaluated_documents` | Documents evaluated (filters only). |
-| `borrowed_prefix_tokens` | Prefix tokens read from another document's KV instead of computed (filters with prefix sharing only). |
+| `borrowed_prefix_tokens` | Prefix tokens read from another document's KV instead of computed. Only filters and joins that share prefixes report it. |
 
 ## Boot details
 
