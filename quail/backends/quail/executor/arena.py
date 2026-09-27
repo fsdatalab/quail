@@ -674,6 +674,22 @@ class KVArena:
         return max(pages, self._as_every_token_pages(
             len(self.sliding.owned[key])))
 
+    def growth_cost(self, key, capacity_tokens: int) -> int:
+        """Pages a resident key needs to grow to capacity, in every-token pages.
+
+        The same counts activate takes for a resident key: each pool's
+        pages beyond the ones the key's table already has, the sliding
+        pool's from the key's window start.
+        """
+        need = max(0, self.accounting.pages_needed(capacity_tokens)
+                   - len(self.accounting.table_pages(key)))
+        if self.sliding is None:
+            return need
+        need_s = max(0, self.sliding.pages_needed(
+            capacity_tokens - self._sliding_start[key])
+            - len(self.sliding.table_pages(key)))
+        return max(need, self._as_every_token_pages(need_s))
+
     def _as_every_token_pages(self, sliding_pages: int) -> int:
         """Sliding pages converted at the pools' size ratio, rounded up."""
         return -(-sliding_pages * self.accounting.n_pages

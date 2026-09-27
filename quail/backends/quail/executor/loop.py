@@ -693,8 +693,23 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     # a frame entry's canvas rows land in the anchor's pages after the
     # frame, so the pages cover them
     frame_max = max(len(f) + (len(canvas) if f else 0) for f in frames)
-    resident = {a: arena.held_cost(keys[a]) for a in range(len(keys))
-                if arena.is_resident(keys[a])}
+    if anchor_source is not None and mode == "unified":
+        # the source leaves room for one partner's temporary rows, or
+        # held anchors could fill the arena before the join can run
+        longest = max((len(s) for suffixes in stage_suffixes for s in suffixes),
+                      default=0)
+        anchor_source.reserve_pages = arena.page_cost(
+            arena.page_tokens - 1 + longest + len(canvas), 0)
+    def held_pages(key, prefix_tokens):
+        # the scheduler prices an anchor at page_cost(prefix + frames)
+        # less what it holds; a trimmed window holds fewer sliding
+        # pages than that price assumes, so count what growing takes
+        capacity = prefix_tokens + frame_max
+        return (arena.page_cost(capacity)
+                - arena.growth_cost(key, capacity))
+
+    resident = {a: held_pages(keys[a], len(prefixes[a]))
+                for a in range(len(keys)) if arena.is_resident(keys[a])}
     # Every resident anchor stays available for the whole join while
     # fresh admissions evict unrelated retained KV.
     for a in resident:
@@ -762,7 +777,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
             arena.pin(key)
             keys.append(key)
             prefixes.append(prefix)
-            sched.admit(len(prefix), arena.held_cost(key),
+            sched.admit(len(prefix), held_pages(key, len(prefix)),
                         partners=partners_of(key))
 
     def pull(evict_retained=False, force=False):
@@ -1261,6 +1276,8 @@ class FilterStream:
         self.tree_position = ({doc: i for i, doc in enumerate(prefix_tree.order)}
                               if prefix_tree is not None else {})
         self.untrimmed = set()   # fresh docs whose children still borrow
+        # pages a join consumer needs free to run its held survivors
+        self.reserve_pages = 0
         self.torch = torch
         self.arena = arena
         self.pipeline = pipeline
@@ -1395,7 +1412,7 @@ class FilterStream:
                 # the arena is the truth: a join consumer frees and
                 # claims pages between chunks, and a borrowed page goes
                 # free only with its last holder
-                sched.free_pages = arena.free_pages
+                sched.free_pages = max(0, arena.free_pages - self.reserve_pages)
             t = time.perf_counter() if timing is not None else 0.0
             groups = sched.next_chunk()
             t = _tick(timing, "next_chunk", t)

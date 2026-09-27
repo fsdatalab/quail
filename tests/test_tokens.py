@@ -37,8 +37,9 @@ def test_token_views_chains_and_shared_prefixes():
 
     sequences = [[1, 2, 3, 4], [1, 2, 3, 9, 9], [1, 2], [7, 8], [7, 8]]
     shared = shared_prefix_lengths(sequences)
-    # 13 tokens in total; the prefix trie has 4 + 2 + 2 = 8 nodes
-    assert sum(len(sequence) for sequence in sequences) - sum(shared) == 8
+    # 15 tokens in total; the prefix trie has 4 + 2 + 2 = 8 nodes, and
+    # the second [7, 8] computes its last token
+    assert sum(len(sequence) for sequence in sequences) - sum(shared) == 9
     assert shared_prefix_lengths([]) == []
     assert sum(shared_prefix_lengths(sequences[::-1])) == sum(shared)
     assert shared_prefix_tokens([[1, 2, 3], [1, 2, 4], [9]]) == 2

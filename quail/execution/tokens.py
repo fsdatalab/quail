@@ -516,10 +516,11 @@ class PrefixTree:
 
     Documents are visited in sorted token order. A document's shared
     length is the tokens it has in common with its predecessor,
-    rounded down to a whole page, so it can read those pages instead
-    of computing them. Its parent is the earliest document that
-    computed those pages itself: the predecessor, or an ancestor of
-    the predecessor that borrowed at least as much. Documents sharing
+    rounded down to a whole page and short of its last token, so it
+    can read those pages instead of computing them. Its parent is the
+    earliest document that computed those pages itself: the
+    predecessor, or an ancestor of the predecessor that borrowed at
+    least as much. Documents sharing
     one prefix thus all borrow from the same parent, and a forward
     pass can read that parent's pages once for all of them. A
     document with nothing to borrow has parent None and shared 0.
@@ -574,7 +575,10 @@ def prefix_tree(documents, page_tokens: int) -> PrefixTree:
     previous = None
     for index in order:
         if previous is not None:
-            lcp = common(arrays[previous], arrays[index])
+            # a document computes at least its last token, so a
+            # duplicate still packs a prefix of its own
+            lcp = min(common(arrays[previous], arrays[index]),
+                      len(arrays[index]) - 1)
             pages = lcp // page_tokens * page_tokens
             if pages:
                 # climb while the ancestor borrowed these pages too
