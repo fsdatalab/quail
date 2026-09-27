@@ -1164,7 +1164,8 @@ class FilterStream:
             kept_extra_tokens=capacity_extra, limit=limit,
             available_pages=(arena.free_pages
                              if arena_writes else None),
-            page_cost=arena.page_cost, tree=prefix_tree)
+            page_cost=arena.page_cost, tree=prefix_tree,
+            can_borrow=self._can_borrow)
         self.tree = prefix_tree
         self.untrimmed = set()   # fresh docs whose children still borrow
         self.torch = torch
@@ -1198,6 +1199,20 @@ class FilterStream:
     def answers(self):
         """Per document, its 0/1 answers up to the first FALSE."""
         return self.sched.answers
+
+    def _can_borrow(self, doc, parent) -> bool:
+        """Whether the arena can serve doc's borrow from parent.
+
+        A parent admitted in the same chunk is not allocated yet; its
+        sliding pages will start at the window origin below its own
+        share.
+        """
+        share = self.sched.share[doc]
+        key = self.keys[parent]
+        if self.arena.is_resident(key):
+            return self.arena.can_borrow(key, share)
+        return (self.arena.origin(self.sched.share[parent])
+                <= self.arena.origin(share))
 
     def _spec(self, doc, stage, fresh):
         if fresh:

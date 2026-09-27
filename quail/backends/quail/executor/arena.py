@@ -434,6 +434,20 @@ class KVArena:
         self._refresh_rows(key, tokens)
         return pages
 
+    def can_borrow(self, parent, share: int) -> bool:
+        """Whether a fresh key may borrow the parent's first `share` tokens.
+
+        The sliding pool must still hold the parent's rows from the
+        window origin below the share: a parent that borrowed most of
+        its own prefix never had them, and a trimmed one dropped them.
+        """
+        if (parent not in self.accounting.owned
+                or share > self.accounting.tokens[parent]):
+            return False
+        if self.sliding is None:
+            return True
+        return self._sliding_start[parent] <= self.origin(share)
+
     def _borrow_plan(self, borrow):
         """The pages a borrow takes from each pool, and the sliding start.
 

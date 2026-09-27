@@ -287,3 +287,27 @@ def test_sliding_pool_borrows_the_window_below_the_share(monkeypatch):
     assert not arena.is_resident(child)
     arena.free_key(parent)
     assert arena.free_pages == 64
+
+
+def test_can_borrow_needs_the_parent_window():
+    arena = cpu_arena(pages=64, sliding_pages=32)
+    root, middle = ("d", 0), ("d", 1)
+    arena.activate(root, 100, capacity_tokens=110, base_tokens=100)
+    # a child sharing most of the root borrows: the root is untrimmed
+    assert arena.can_borrow(root, 96)
+    arena.activate(middle, 120, capacity_tokens=130, base_tokens=120,
+                   borrow=(root, 96))
+    # its sliding pages start at origin(96) = 64, so a child sharing
+    # only the first 16 tokens cannot get the window below them
+    assert arena.sliding_start(middle) == 64
+    assert not arena.can_borrow(middle, 16)
+    assert arena.can_borrow(middle, 112)
+    # the root still has them; a share past its tokens is refused
+    assert arena.can_borrow(root, 16)
+    assert not arena.can_borrow(root, 112)
+    assert not arena.can_borrow(("d", 9), 16)
+    arena.trim_window(root)
+    assert not arena.can_borrow(root, 16)
+    arena.free_key(middle)
+    arena.free_key(root)
+    assert arena.free_pages == 64

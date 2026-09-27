@@ -442,6 +442,15 @@ def test_filter_admission_borrows_from_a_resident_parent():
     assert sched.report(1, 0, True) == (1,)
     assert sched.done() and sched.free_pages == 20
 
+    # a borrow the arena cannot serve packs the whole document instead
+    tree = PrefixTree(order=[0, 1], parent=[None, 0], share=[0, 32])
+    sched = FilterAdmission([64, 64], [10], 200, arena_pages=20,
+                            page_tokens=16, tree=tree,
+                            can_borrow=lambda doc, parent: False)
+    assert sched.next_chunk() == [(0, 0, True), (1, 0, True)]
+    assert sched.share[1] == 0 and sched.resident == {0: 4, 1: 4}
+    assert sched.children_left[0] == 0
+
     # a kept borrower is rewound to its own tokens: pages_for(32)=2 kept
     tree = PrefixTree(order=[0, 1], parent=[None, 0], share=[0, 32])
     sched = FilterAdmission([64, 64], [10], 200, arena_pages=20,

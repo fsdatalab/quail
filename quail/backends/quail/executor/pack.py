@@ -545,6 +545,9 @@ class FilterAdmission:
             packs and pays for only the tokens past it; one whose
             parent has already left packs the whole document; one
             whose parent is still queued waits.
+        can_borrow: Callable(doc, parent) -> bool, asked before a
+            resident parent is borrowed from; False packs the whole
+            document. None allows every borrow.
 
     Survivor suffixes pack before fresh admissions. Pages are granted
     in queue order; chunk room may be skipped. With a tree the
@@ -555,7 +558,7 @@ class FilterAdmission:
     def __init__(self, doc_tokens, stage_tokens, chunk_budget,
                  arena_pages, page_tokens, kept_extra_tokens=0,
                  limit=None, available_pages=None, page_cost=None,
-                 tree=None):
+                 tree=None, can_borrow=None):
         self.page_cost = page_cost or (
             lambda tokens, base_tokens=None: pages_for(tokens, page_tokens))
         self.doc_tokens = doc_tokens
@@ -563,6 +566,7 @@ class FilterAdmission:
         self.parent = [None] * n if tree is None else list(tree.parent)
         self.share = [0] * n if tree is None else list(tree.share)
         self.gone = set()          # docs reported at their last stage
+        self.can_borrow = can_borrow
         # children not yet admitted, per parent: a parent keeps its
         # sliding-window pages untrimmed while any remain
         self.children_left = [0] * n
@@ -646,6 +650,10 @@ class FilterAdmission:
                     skipped.append(doc)
                     continue
                 # the parent's pages are gone: compute the whole document
+                self.parent[doc] = None
+                self.share[doc] = 0
+            elif (parent is not None and self.can_borrow is not None
+                  and not self.can_borrow(doc, parent)):
                 self.parent[doc] = None
                 self.share[doc] = 0
             if self.free_pages is not None:
