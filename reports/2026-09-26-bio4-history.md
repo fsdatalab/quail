@@ -24,13 +24,13 @@
   against 79.5%), and where the join question sits (before #52 the
   question followed the term, and agreement was 94.5%).
 
-![BIO-4 time on the Quail code of each merge date](plots/bio4_history_progress.png)
+![Startup and query seconds for the vLLM baselines and Quail](plots/bio4_history_versus_vllm.png)
 
-Figure: plots/bio4_history_progress.png
+Figure: plots/bio4_history_versus_vllm.png
 
-![Query and startup seconds per configuration](plots/bio4_history_time.png)
+![Startup and query seconds on Quail's code at each merge date](plots/bio4_history_steps.png)
 
-Figure: plots/bio4_history_time.png
+Figure: plots/bio4_history_steps.png
 
 ![Fresh input tokens and recomputed KV tokens per configuration](plots/bio4_history_tokens.png)
 
