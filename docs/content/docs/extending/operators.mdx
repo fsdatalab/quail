@@ -123,6 +123,21 @@ Rules run in this order:
   decision from the plan and the token counts each time, and to
   return `None` when nothing changes, so running it again is safe.
 
+This follows the rule order in Apache DataFusion and Spark:
+
+- DataFusion's logical optimizer runs its rule list in order and
+  repeats it until a pass changes nothing, for at most
+  `datafusion.optimizer.max_passes` passes (three by default). Its
+  physical optimizer runs each rule once, in order. Quail splits
+  logical and physical rules the same way.
+- Spark's Catalyst groups rules into batches. Each batch runs its
+  rules in order, either once or repeated until the plan stops
+  changing, for at most `spark.sql.optimizer.maxIterations` rounds
+  (100 by default). Quail's logical rules act like one repeating
+  batch, and its physical rules act like one batch that runs once.
+- Both log a warning when the pass limit stops the rules before the
+  plan settles. Quail stops silently.
+
 See
 [`quail/planner/logical_optimizer.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/logical_optimizer.py)
 and
