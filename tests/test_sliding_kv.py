@@ -366,14 +366,37 @@ def test_can_borrow_needs_the_parent_window():
     assert arena.free_pages == 64
 
 
-def test_sliding_arena_borrows_from_the_previous_document():
-    from quail.execution.tokens import PrefixTree
+def test_join_anchor_keeps_its_window_for_a_later_child(monkeypatch):
+    from types import SimpleNamespace
 
-    # docs 1 and 2 both borrow doc 0's first page; on a sliding arena
-    # doc 2 borrows it from doc 1, the document admitted just before it
-    tree = PrefixTree(order=[0, 1, 2], parent=[None, 0, 0], shared=[0, 16, 16])
-    moved = loop._predecessor_parents(tree, cpu_arena())
-    assert moved.parent == [None, 0, 1] and moved.shared == [0, 16, 16]
-    plain = KVArena(n_layers=1, n_pages=8, page_tokens=16, n_kv=1, d_head=2,
-                    dtype=torch.float32, device="cpu")
-    assert loop._predecessor_parents(tree, plain) is tree
+    from fakes import fake_pipeline, fake_torch
+
+    from quail.execution.tokens import prefix_tree
+
+    cpu_staging(monkeypatch)
+    # anchor 1 shares 80 tokens with anchor 0, anchor 2 only the first
+    # 32; anchor 2 borrows from anchor 0, whose window below row 32
+    # must outlive the first chunk
+    prefixes = [[1] * 96, [1] * 80 + [2] * 16, [1] * 32 + [3] * 64]
+    tree = prefix_tree(prefixes, 16)
+    assert tree.parent == [None, 0, 0] and tree.shared == [0, 80, 32]
+
+    def forward(chunk):
+        return [0] * sum(n for _, n in chunk.layout)
+
+    # real tensors, fake CUDA events
+    fake = fake_torch()
+    cpu = SimpleNamespace(**{n: getattr(torch, n) for n in dir(torch)
+                             if not n.startswith("_")})
+    cpu.cuda, cpu.inference_mode = fake.cuda, fake.inference_mode
+    answers = SimpleNamespace(submit=lambda v: v, result=lambda v: v, dtype=None)
+    arena = cpu_arena(pages=64, sliding_pages=32)
+    stats = {}
+    _, _, tokens = loop.run_join(
+        cpu, arena, fake_pipeline(forward_chunk=forward), answers,
+        prefixes, [[[9], [10]]], 130, stage_frames=[[5]],
+        anchor_keys=[("a", d) for d in range(3)], prefix_tree=tree,
+        stats=stats)
+    assert stats["borrowed_tokens"] == 80 + 32
+    assert tokens == 96 + 16 + 64 + 3 * 3
+    assert not arena.accounting.owned

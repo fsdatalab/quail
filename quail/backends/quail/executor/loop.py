@@ -20,7 +20,6 @@ from quail.backends.quail.executor.attention import (
     Chunk,
 )
 from quail.backends.quail.executor.pack import FilterAdmission, JoinAdmission
-from quail.execution.tokens import PrefixTree
 from quail.progress import Progress, logger, quiet
 
 
@@ -703,10 +702,15 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
     def partners_of(key):
         return None if anchor_partners is None else anchor_partners(key)
 
-    if prefix_tree is not None and prefix_tree.shared_tokens:
-        prefix_tree = _predecessor_parents(prefix_tree, arena)
-    else:
+    if prefix_tree is not None and not prefix_tree.shared_tokens:
         prefix_tree = None
+    # children not yet admitted, per anchor: an anchor keeps its
+    # sliding-window pages untrimmed while any remain
+    children_left = {}
+    for parent in (prefix_tree.parent if prefix_tree is not None else ()):
+        if parent is not None:
+            children_left[keys[parent]] = children_left.get(keys[parent], 0) + 1
+    untrimmed = set()
 
     def can_borrow(a, parent, same_chunk):
         shared = sched.shared[a]
@@ -884,7 +888,13 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         normed = _forward(pipeline, arena, chunk)
         e1.record()
         for key in chunk.fresh_keys:
-            arena.trim_window(key)
+            untrimmed.add(key)
+        for key in list(untrimmed):
+            if children_left.get(key):
+                continue
+            untrimmed.discard(key)
+            if arena.is_resident(key):
+                arena.trim_window(key)
         spans.append((part[0][1], e0, e1))
         outstanding.append((part, async_ans.submit(normed)))
         # read the previous chunk's answers while this one runs
@@ -905,6 +915,10 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
             # retained KV nothing here reads makes room
             arena.evict_retained(sched.blocked_pages)
         groups = sched.next_chunk(arena.free_pages)
+        for a, j, start, _end, carried in groups:
+            parent = prefix_tree.parent[a] if prefix_tree is not None else None
+            if carried and start == 0 and parent is not None:
+                children_left[keys[parent]] -= 1
         if not groups:
             if outstanding:
                 report(outstanding.pop(0))
@@ -1132,26 +1146,6 @@ def _shared_preamble_tokens(question_ids):
     return p
 
 
-def _predecessor_parents(tree, arena):
-    """On a sliding-window arena, borrow from the previous document in order.
-
-    A child reads its parent's sliding pages from the window origin
-    below its shared length, so the parent stays untrimmed until the
-    child is admitted, and the sliding pool is sized for trimmed
-    documents. The document just before the child in tree order holds
-    the same shared pages and is admitted right before it. Tree
-    attention, which wants siblings to name one parent, does not run
-    on these models.
-    """
-    if not arena.has_sliding:
-        return tree
-    parent = list(tree.parent)
-    for before, doc in zip(tree.order, tree.order[1:]):
-        if parent[doc] is not None:
-            parent[doc] = before
-    return PrefixTree(tree.order, parent, list(tree.shared))
-
-
 class FilterStream:
     """The filter chain, one chunk per next() call.
 
@@ -1238,7 +1232,6 @@ class FilterStream:
         if prefix_tree is not None and prefix_tree.shared_tokens:
             if not arena_writes:
                 raise ValueError("a prefix tree needs arena writes")
-            prefix_tree = _predecessor_parents(prefix_tree, arena)
         else:
             prefix_tree = None
         # capacity must cover the longest tail past the kept preamble,

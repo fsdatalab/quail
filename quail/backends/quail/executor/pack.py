@@ -743,9 +743,12 @@ class FilterAdmission:
         return groups
 
     def _free_kept_parent(self, doc):
+        # no credit: the arena frees the key only after the chunk is
+        # packed, and the children keep the pages they borrowed; the
+        # caller reads the arena's free pages before the next chunk
         self.kept_for_children.discard(doc)
         self.finished.add(doc)
-        self.free_pages += self.resident.pop(doc)
+        self.resident.pop(doc)
         self.freed_parents.append(doc)
 
     def take_freed_parents(self):

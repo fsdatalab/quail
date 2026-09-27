@@ -440,6 +440,19 @@ def test_filter_admission_borrows_from_a_resident_parent():
     assert sched.report(1, 0, True, release=False) == ()
     assert sched.free_pages == 20 - 6 - 2
 
+    # a kept parent freed as its last child enters adds no free pages:
+    # the child still holds the borrowed ones, and the arena frees the
+    # rest only after the chunk is packed
+    tree = PrefixTree(order=[0, 1], parent=[None, 0], shared=[0, 32])
+    sched = FilterAdmission([64, 64], [10], 80, arena_pages=20,
+                            page_tokens=16, tree=tree)
+    assert sched.next_chunk() == [(0, 0, True)]
+    assert sched.report(0, 0, False) == ()
+    assert sched.kept_for_children == {0}
+    assert sched.next_chunk() == [(1, 0, True)]
+    assert sched.take_freed_parents() == [0]
+    assert sched.free_pages == 20 - 4 - 2
+
 
 def _tree_stream(monkeypatch, *, truth, budget, hold=False, retain=(),
                  limit=None, pages=64, cap=None, order=(0, 1, 2),
