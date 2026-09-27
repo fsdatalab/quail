@@ -37,9 +37,8 @@ Figures (vector PDFs):
   cardiovascular reactions), and two joins of the surviving reports
   against each term list. Qwen3 4B FP8, bf16 KV, one H100 per
   configuration.
-- Every configuration ran the code on this branch (commit `6537700`
-  and its parents on `claude/compassionate-maxwell-ux26bx`) with the
-  features merged after its date switched off. Each switch in `quail/ablation.py` recreates
+- Every configuration ran the code on this branch (commit `6537700`)
+  with the features merged after its date switched off. Each switch in `quail/ablation.py` recreates
   what the engine did before one pull request. Checking out old
   commits instead was not possible: BIO-4 was added on Sep 20, `main`
   was squashed on Sep 7, and the latency definition changed on Sep 22.
