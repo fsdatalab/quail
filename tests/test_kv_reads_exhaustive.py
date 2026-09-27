@@ -10,7 +10,7 @@ both attention paths, a sliding-window arena, and a canvas row, with
 the fewest arena pages and the smallest chunk budget each case fits,
 where admission blocks and parents wait. KV_EXHAUSTIVE=1 adds every
 three-document corpus and roomier arenas and budgets; it takes about
-twenty minutes. See kv_checker for the check.
+ten minutes of CPU time. See kv_checker for the check.
 """
 
 import itertools
