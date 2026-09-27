@@ -97,18 +97,30 @@ Built on:
 - **Modal**: every GPU run and the result volumes.
 - **SGLang**: a second baseline.
 
-Learned from:
+Learned from. Treat these as whole projects to study, not single
+features: their APIs, their code layout, their tests, their docs, and
+how they release and explain changes.
 
-- **Apache DataFusion**: a query engine built to be extended, with
-  clear extension points and docs. Model Quail's extension registry,
-  rules, and docs on it.
-- **Apache Spark (Catalyst)**: logical and physical plans rewritten by
-  named rules. Model Quail's planner rules on it.
-- **Modal's docs**: short pages that start with what a feature does,
-  then a small example with full context. Write Quail's docs the same
-  way.
-- **The vLLM paper and docs** on paged KV and prefix caching: explain
-  one mechanism per section, with a small example.
+- **Apache Spark**: the model for Quail as a whole.
+  - Catalyst, for logical and physical plans rewritten by named rules
+    (Quail's planner rules).
+  - The DataFrame and SQL APIs, for Quail's builder and `sql()`.
+  - Spark Connect, for a thin client talking to a remote server
+    (Quail Server and the remote `Session`).
+  - `EXPLAIN` and the Spark UI, for showing a plan and what it cost
+    (`explain()`, `explain(analyze=True)`).
+- **Apache DataFusion**: an Arrow-native query engine built to be
+  extended, with clear extension points (Quail's extension registry,
+  custom operators, and rules) and docs for each.
+- **DuckDB**: an engine that is easy to embed and whose docs answer a
+  question in one short page with a runnable example.
+- **Apache Arrow**: columnar data and Arrow Flight for moving results
+  between processes.
+- **vLLM**: the serving engine Quail runs beside and compares
+  against; its paper and docs explain one mechanism per section, such
+  as paged KV and prefix caching, with a small example.
+- **Modal**: docs that start with what a feature does, then a small
+  example with full context.
 - **Selinger et al. (1979)**: cost-based join ordering, which the
   planner follows.
 
