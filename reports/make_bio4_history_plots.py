@@ -74,6 +74,30 @@ SHORT = {
 }
 
 
+# what each configuration adds over the one before, in plain words
+CHANGE = {
+    "vllm-defaults": "vLLM at default settings",
+    "vllm-tuned": "vLLM with tuned batch and CUDA graph settings",
+    "vllm-pipelined": "vLLM with each document's filters pipelined",
+    "vllm-today": "vLLM tokenizes prompt text with Gigatoken",
+    "quail-engine-vllm-kernels": "Quail's first engine, on vLLM's kernels",
+    "quail-engine": "fused Triton kernels",
+    "pinned_staging": "copy inputs to the GPU without blocking",
+    "attention_paths": "separate attention code for filters and joins",
+    "skip_arena_writes": "don't store filter KV that nothing reads",
+    "join_search": "pick the join order and anchor by search",
+    "compile_once": "compile kernels once, later boots load them",
+    "filter_kv_reuse": "joins reuse the filters' KV; cheap filters first",
+    "scan_ring": "cap kept KV so new work always fits",
+    "boot_cache": "keep vLLM's cache on a volume; pin model version",
+    "shared_retention": "keep KV for every join input, not just one",
+    "join_continuous_batching": "join work admitted continuously",
+    "projection_pushdown": "read only the columns the query uses",
+    "plan_on_estimates": "plan while tokenization is still running",
+    "filter_join_streaming": "filter results stream straight into the join",
+    "gigatoken": "Gigatoken tokenizer",
+}
+
 def load(workdirs) -> dict:
     """Name -> summary for every saved configuration that completed.
 
@@ -201,12 +225,12 @@ def quail_plot(summaries, names, out):
     startup = np.array([seconds(r)[1] for r in rows])
     query_steps = steps_over(query, 0.03)
     startup_steps = steps_over(startup, 0.15)
-    fig = plt.figure(figsize=(12, 6.4))
+    fig = plt.figure(figsize=(12, 7.4))
     fig.set_layout_engine("none")
-    top = fig.add_axes((0.06, 0.34, 0.82, 0.6))
-    low = fig.add_axes((0.06, 0.07, 0.82, 0.17))
+    top = fig.add_axes((0.06, 0.31, 0.82, 0.64))
+    low = fig.add_axes((0.06, 0.06, 0.82, 0.16))
     stop = t[-1] + 2
-    date_axis(low, t[0] - 0.8, stop)
+    date_axis(low, t[0] - 1.6, stop)
     top.set_xlim(low.get_xlim())
     top.set_xticks([])
     # the first row is the first engine with vLLM's kernels, on the date
@@ -221,11 +245,16 @@ def quail_plot(summaries, names, out):
     texts, weights = [], []
     for i, row in enumerate(rows):
         pr = row.get("pull_request")
-        value = f" ({query[0]:,.0f} s)" if i == 0 else ""
-        texts.append(SHORT[row["name"]] + (f" #{pr}" if pr else "") + value)
+        texts.append((f"#{pr} " if pr else "") + CHANGE[row["name"]])
         marked = i in query_steps or i in startup_steps
         weights.append("bold" if marked else "normal")
-    tallest = rail_labels(top, list(zip(t, query)), texts, rail, weights)
+    # the first engine shares the date of #3, so #3's label names both
+    texts[1] += f" (before: vLLM's, {query[0]:,.0f} s)"
+    tallest = rail_labels(top, list(zip(t[1:], query[1:])), texts[1:], rail,
+                          weights[1:])
+    top.annotate(f"{query[0]:,.0f} s", (t[0], query[0]), xytext=(8, 0),
+                 textcoords="offset points", ha="left", va="center",
+                 fontsize=8.5, color=DARK)
     height_in = top.get_position().height * fig.get_figheight()
     span = (rail - bottom) * height_in / (height_in - tallest - 0.05)
     top.set_ylim(bottom, max(bottom + span, query.max() + 10))
@@ -240,11 +269,12 @@ def quail_plot(summaries, names, out):
                               (low, startup, startup_steps)):
         for i, step in steps.items():
             middle = (values[i] + values[i - 1]) / 2
-            if t[i] == t[i - 1]:
-                # same date: the label goes beside the earlier point
-                middle = values[i - 1]
-            ax.annotate(signed(step), (t[i], middle), xytext=(8, 0),
-                        textcoords="offset points", ha="left", va="center",
+            # same date: the label goes left of the drop
+            left = t[i] == t[i - 1]
+            ax.annotate(signed(step), (t[i], middle),
+                        xytext=(-6 if left else 8, 0),
+                        textcoords="offset points",
+                        ha="right" if left else "left", va="center",
                         fontsize=10, fontweight="bold",
                         color=GREEN if step < 0 else DARK)
     top.text(stop + 0.3, query[-1], f"query today:\n{query[-1]:,.0f} s",
