@@ -9,6 +9,7 @@ and the answer readout fails. The runners give each request an answer
 from its hash and check that the loop returns it.
 """
 
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import numpy as np
@@ -19,13 +20,34 @@ from quail.backends.quail.executor import loop
 from quail.backends.quail.executor.arena import KVArena
 from quail.execution.tokens import prefix_tree
 
-PAGE = 16
-WINDOW = 32
-MASK = (1 << 61) - 1
+
+@dataclass(frozen=True)
+class Setup:
+    """One arena and chunk configuration to run a workload on.
+
+    Attributes:
+        path: The attention path, "unified" or "tree".
+        window: The sliding window in tokens, or None for an arena
+            without sliding layers.
+        canvas: Token ids of the canvas rows a diffusion model appends
+            after every suffix; the first one answers.
+        pages: Every-token pool pages.
+        sliding_pages: Sliding pool pages.
+        budget: Chunk token budget.
+        page_tokens: Tokens per KV page.
+    """
+
+    path: str
+    window: int | None = None
+    canvas: tuple = ()
+    pages: int = 400
+    sliding_pages: int = 400
+    budget: int = 600
+    page_tokens: int = 16
 
 
 def mix(previous, token):
-    return (previous * 1_000_003 + token + 1) & MASK
+    return (previous * 1_000_003 + token + 1) & ((1 << 61) - 1)
 
 
 def chain(tokens):
@@ -38,8 +60,8 @@ def chain(tokens):
 class Pool:
     """(token, position, hash) per physical row of one KV pool."""
 
-    def __init__(self, pages):
-        rows = pages * PAGE
+    def __init__(self, pages, page_tokens):
+        rows = pages * page_tokens
         self.token = np.full(rows, -1, dtype=np.int64)
         self.position = np.full(rows, -1, dtype=np.int64)
         self.hash = np.full(rows, -1, dtype=np.int64)
@@ -48,12 +70,14 @@ class Pool:
 class HashModel:
     """A forward pass whose answers are right only if every KV read is."""
 
-    def __init__(self, arena, answers):
-        self.full = Pool(arena.accounting.n_pages)
-        self.sliding = (Pool(arena.sliding.n_pages) if arena.has_sliding
-                        else None)
+    def __init__(self, arena, answers, canvas):
+        self.page = arena.page_tokens
+        self.window = arena.window
+        self.full = Pool(arena.accounting.n_pages, self.page)
+        self.sliding = (Pool(arena.sliding.n_pages, self.page)
+                        if arena.has_sliding else None)
         self.answers = answers      # request hash -> answer bit
-        self.checked = 0
+        self.canvas = canvas
 
     def forward_chunk(self, chunk):
         ids = chunk.input_ids.tolist()
@@ -71,7 +95,6 @@ class HashModel:
                 f"row {row} at position {positions[row]} read KV no "
                 f"request has")
             out.append(self.answers[h])
-            self.checked += 1
         return out
 
     # ---- unified: one paged call per pool --------------------------------
@@ -97,9 +120,11 @@ class HashModel:
             for row in range(cu[i], cu[i + 1]):
                 seq_of[row] = i
 
+        page = self.page
+
         def phys(maps_table, i, view_row):
             pages = maps_table[i]
-            return int(pages[view_row // PAGE]) * PAGE + view_row % PAGE
+            return int(pages[view_row // page]) * page + view_row % page
 
         table = unified["table"].tolist()
         used = unified["used"].tolist()
@@ -114,7 +139,7 @@ class HashModel:
             assert view == position, "a query row's KV index is off"
             # a join's frame entry does not keep its canvas row, whose
             # answer nothing reads
-            unkept = ids[row] in CANVAS and row == cu[i + 1] - 1
+            unkept = ids[row] in self.canvas and row == cu[i + 1] - 1
             assert unkept or full[0].get(phys(table, i, view)) == row, \
                 "a query row is not written where it reads itself"
             previous = 0
@@ -136,16 +161,17 @@ class HashModel:
         if sliding is not None:
             s_table = unified["sliding"]["table"].tolist()
             s_used = unified["sliding"]["used"].tolist()
-            for row in range(len(ids)):
-                i = seq_of[row]
+            for i in range(len(cu) - 1):
+                # the sequence's rows need the window before its first
+                # row through its last row
                 count = cu[i + 1] - cu[i]
-                view = s_used[i] - count + row - cu[i]
-                origin = positions[row] - view
-                for k in range(max(0, positions[row] - WINDOW + 1),
-                               positions[row] + 1):
-                    assert k >= origin, (
-                        f"row at {positions[row]} needs window row {k}; "
-                        f"the sliding pages start at {origin}")
+                first = positions[cu[i]]
+                origin = first - (s_used[i] - count)
+                lowest = max(0, first - self.window + 1)
+                assert lowest >= origin, (
+                    f"row at {first} needs window row {lowest}; the "
+                    f"sliding pages start at {origin}")
+                for k in range(lowest, positions[cu[i + 1] - 1] + 1):
                     got = value(self.sliding, sliding,
                                 phys(s_table, i, k - origin))
                     want = value(self.full, full, phys(table, i, k))
@@ -205,8 +231,10 @@ class HashModel:
                     int(self.full.position[phys]),
                     int(self.full.hash[phys]))
 
+        page = self.page
+
         def phys(i, view_row):
-            return int(read_table[i][view_row // PAGE]) * PAGE + view_row % PAGE
+            return int(read_table[i][view_row // page]) * page + view_row % page
 
         def row_hash(row):
             if hashes[row] is not None:
@@ -249,17 +277,21 @@ class HashModel:
             previous = h
 
 
-def make_arena(sliding, pages, sliding_pages):
-    if sliding:
-        return KVArena(n_layers=2, n_pages=pages, page_tokens=PAGE, n_kv=1,
-                       d_head=1, dtype=torch.float32, device="cpu",
+def make_arena(setup):
+    if setup.window is not None:
+        return KVArena(n_layers=2, n_pages=setup.pages,
+                       page_tokens=setup.page_tokens, n_kv=1, d_head=1,
+                       dtype=torch.float32, device="cpu",
                        layer_kv=[(1, 1), (1, 1)], sliding_layers=(1,),
-                       sliding_window=WINDOW, n_sliding_pages=sliding_pages)
-    return KVArena(n_layers=1, n_pages=pages, page_tokens=PAGE, n_kv=1,
-                   d_head=1, dtype=torch.float32, device="cpu")
+                       sliding_window=setup.window,
+                       n_sliding_pages=setup.sliding_pages)
+    return KVArena(n_layers=1, n_pages=setup.pages,
+                   page_tokens=setup.page_tokens, n_kv=1, d_head=1,
+                   dtype=torch.float32, device="cpu")
 
 
 def cpu_torch():
+    """Real CPU tensors with fake CUDA events."""
     fake = fake_torch()
     real = SimpleNamespace(**{n: getattr(torch, n) for n in dir(torch)
                               if not n.startswith("_")})
@@ -267,16 +299,9 @@ def cpu_torch():
     return real
 
 
-IDENTITY = SimpleNamespace(submit=lambda v: v, result=lambda v: v, dtype=None)
-
-# a diffusion model's one canvas row follows every suffix and answers
-CANVAS = (99,)
-
-
-def pipeline_for(model, canvas):
-    return fake_pipeline(forward_chunk=model.forward_chunk,
-                         tree_attention=True,
-                         canvas_ids=CANVAS if canvas else ())
+def passthrough():
+    """An answer readout that returns the model's answers as they are."""
+    return SimpleNamespace(submit=lambda v: v, result=lambda v: v, dtype=None)
 
 
 def answer(h):
@@ -284,19 +309,36 @@ def answer(h):
     return (h >> 7) & 1
 
 
-def check_filter(docs, questions, *, path, sliding, canvas, pages,
-                 sliding_pages, budget):
+class Run:
+    """The arena, checking model, and pipeline of one checked run."""
+
+    def __init__(self, setup, answers):
+        self.setup = setup
+        self.arena = make_arena(setup)
+        self.model = HashModel(self.arena, answers, setup.canvas)
+        self.pipeline = fake_pipeline(forward_chunk=self.model.forward_chunk,
+                                      tree_attention=True,
+                                      canvas_ids=setup.canvas)
+        self.torch = cpu_torch()
+
+    def tree(self, docs):
+        return prefix_tree(docs, self.setup.page_tokens)
+
+
+def check_filter(docs, questions, setup):
     """Run a filter chain and check its answers and its KV reads."""
-    tail = list(CANVAS) if canvas else []
-    answers = {chain(doc + q + tail): 0 for doc in docs for q in questions}
-    answers = {h: answer(h) for h in answers}
-    arena = make_arena(sliding, pages, sliding_pages)
-    model = HashModel(arena, answers)
+    tail = list(setup.canvas)
+    answers = {}
+    for doc in docs:
+        for q in questions:
+            h = chain(doc + q + tail)
+            answers[h] = answer(h)
+    run = Run(setup, answers)
     got, _, _ = loop.run_filter(
-        cpu_torch(), arena, pipeline_for(model, canvas), IDENTITY, docs,
-        questions, budget, arena_writes=True,
+        run.torch, run.arena, run.pipeline, passthrough(), docs, questions,
+        setup.budget, arena_writes=True,
         arena_keys=[("d", i) for i in range(len(docs))],
-        attention_mode=path, prefix_tree=prefix_tree(docs, PAGE))
+        attention_mode=setup.path, prefix_tree=run.tree(docs))
     for d, doc in enumerate(docs):
         want = []
         for q in questions:
@@ -304,7 +346,7 @@ def check_filter(docs, questions, *, path, sliding, canvas, pages,
             if not want[-1]:
                 break
         assert got[d] == want, f"document {d}"
-    assert not arena.accounting.owned
+    assert not run.arena.accounting.owned
 
 
 def _join_answers(anchors, frame, partners, tail):
@@ -319,46 +361,41 @@ def _join_answers(anchors, frame, partners, tail):
     return answers
 
 
-def check_join(anchors, frame, partners, *, path, sliding, canvas, pages,
-               sliding_pages, budget):
+def check_join(anchors, frame, partners, setup):
     """Run a join and check its answers and its KV reads."""
-    tail = list(CANVAS) if canvas else []
+    tail = list(setup.canvas)
     answers = _join_answers(anchors, frame, partners, tail)
-    arena = make_arena(sliding, pages, sliding_pages)
-    model = HashModel(arena, answers)
+    run = Run(setup, answers)
     out, _, _ = loop.run_join(
-        cpu_torch(), arena, pipeline_for(model, canvas), IDENTITY, anchors,
-        [partners], budget, stage_frames=[frame],
+        run.torch, run.arena, run.pipeline, passthrough(), anchors,
+        [partners], setup.budget, stage_frames=[frame],
         anchor_keys=[("a", i) for i in range(len(anchors))],
-        attention_mode=path, prefix_tree=prefix_tree(anchors, PAGE))
+        attention_mode=setup.path, prefix_tree=run.tree(anchors))
     for a, anchor in enumerate(anchors):
         assert out[0][a] == [answers[chain(anchor + frame + p + tail)]
                              for p in partners], f"anchor {a}"
-    assert not arena.accounting.owned
+    assert not run.arena.accounting.owned
 
 
-def check_feed(docs, question, frame, partners, *, path, sliding, canvas,
-               pages, sliding_pages, budget):
+def check_feed(docs, question, frame, partners, setup):
     """Run a filter whose survivors' KV feeds a join, and check both."""
-    tail = list(CANVAS) if canvas else []
+    tail = list(setup.canvas)
     answers = _join_answers(docs, frame, partners, tail)
     for doc in docs:
         h = chain(doc + question + tail)
         answers[h] = answer(h >> 3)
-    arena = make_arena(sliding, pages, sliding_pages)
-    model = HashModel(arena, answers)
-    pipeline = pipeline_for(model, canvas)
-    cpu = cpu_torch()
+    run = Run(setup, answers)
     source = loop.FilterStream(
-        cpu, arena, pipeline, IDENTITY, docs, [question], budget,
-        arena_writes=True, arena_keys=[("d", i) for i in range(len(docs))],
+        run.torch, run.arena, run.pipeline, passthrough(), docs, [question],
+        setup.budget, arena_writes=True,
+        arena_keys=[("d", i) for i in range(len(docs))],
         hold_survivors=True, hold_extra_tokens=len(frame) + len(tail),
-        prefix_tree=prefix_tree(docs, PAGE), attention_mode=path)
+        prefix_tree=run.tree(docs), attention_mode=setup.path)
     keys = []
     out, _, _ = loop.run_join(
-        cpu, arena, pipeline, IDENTITY, [], [partners], budget,
-        stage_frames=[frame], anchor_keys=keys, anchor_source=source,
-        attention_mode=path)
+        run.torch, run.arena, run.pipeline, passthrough(), [], [partners],
+        setup.budget, stage_frames=[frame], anchor_keys=keys,
+        anchor_source=source, attention_mode=setup.path)
     survivors = {d for d, doc in enumerate(docs)
                  if answers[chain(doc + question + tail)]}
     assert {key[1] for key in keys} == survivors
@@ -366,4 +403,4 @@ def check_feed(docs, question, frame, partners, *, path, sliding, canvas,
         doc = docs[key[1]]
         assert out[0][a] == [answers[chain(doc + frame + p + tail)]
                              for p in partners], f"anchor {key[1]}"
-    assert not arena.accounting.owned
+    assert not run.arena.accounting.owned
