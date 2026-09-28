@@ -150,6 +150,29 @@ def test_round_scorer_prunes_by_bounds_and_resolves_documents():
     assert rounds.requests(0, 1) == [1, 2] and rounds.tokens == 1 + 2 + 2
 
 
+def test_round_scorer_stops_once_membership_is_decided():
+    # (1, 2) and (1, 3) are accepted, (4,) and (6,) are not; after the
+    # cue (6,) resolves at -2, which prunes (4,) at -9, and every alive
+    # label is then accepted: the document is decided without reading
+    # (1,), and its label is the top-bounded alive label
+    ids = ((1, 2), (1, 3), (4,), (6,))
+    targets = [1, 2, 3, 4, 6]
+    row = np.array([[[-1.0, -9.0, -9.0, -9.0, -2.0]]])
+    decided = RoundScorer(ids, targets, documents=1, search=True,
+                          demand=[0, 1, 3])
+    decided.update(0, decided.requests(0, 0), row)
+    assert decided.label.tolist() == [0] and decided.requests(0, 1) is None
+    # without demand the search reads on
+    full = RoundScorer(ids, targets, documents=1, search=True)
+    full.update(0, full.requests(0, 0), row)
+    assert full.label.tolist() == [-1] and full.requests(0, 1) == [1]
+    # a mixed alive set keeps reading: (4,) at -1.5 stays above the bounds
+    mixed = RoundScorer(ids, targets, documents=1, search=True, demand=[0, 1])
+    mixed.update(0, mixed.requests(0, 0),
+                 np.array([[[-1.0, -9.0, -9.0, -1.5, -9.0]]]))
+    assert mixed.label.tolist() == [-1]
+
+
 def test_classify_prompt_is_quail_b_text_with_labels_after_it():
     ref = ColumnRef("t", "agent_traces", "trace")
     bound = bind_classify_prompt(AGENT_OUTCOME, (ref,), OUTCOMES,
@@ -610,6 +633,41 @@ def _chain(session, *, filters=1):
         ["complaint", "question"], name="kind").select("d.id", "topic", "kind")
 
 
+def test_planner_demands_membership_for_filter_only_labels(session):
+    from quail.planner.classify import _Table
+
+    # a label only a filter tests is scored to the membership decision;
+    # a projected label is scored in full
+    plan = (session.docs("documents").alias("d").ai_classify(
+        quail.prompt("What is {0} about?", quail.col("d.body")),
+        ["refund", "shipping", "praise"], name="topic")
+        .label_in("topic", ("refund", "shipping"), selectivity=0.5)
+        .select("d.id")).plan()
+    (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
+    assert classify.spec.demand == ("refund", "shipping")
+    assert classify.explain_fields()["demand"] == ["refund", "shipping"]
+    plan = _topic(session).plan()
+    (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
+    assert classify.spec.demand is None
+    encoded = encode_graph(plan.graph, session.registry.codecs)
+    assert decode_graph(encoded, session.registry.codecs) == plan.graph
+
+    # the cost model: many long labels on short documents favor the
+    # search; one-token labels on long documents favor trie paths
+    from quail.cost import budgets
+
+    chunk = budgets.chunk_budget(QWEN3_4B_FP8, H100_SXM)
+    table = _Table(alias="d", mean=200.0, longest=300, budget=chunk,
+                   chunk=chunk, scoring=None, backend_name="quail",
+                   model=QWEN3_4B_FP8, device=H100_SXM, tokenizer=_bytes)
+    long_labels = tuple(tuple(range(100 + 5 * i, 104 + 5 * i))
+                        for i in range(30))
+    assert table.choose(1000, 20, 30, long_labels, False) == "trie_search"
+    short_labels = ((1,), (2,), (3,))
+    long_documents = _Table(**{**table.__dict__, "mean": 3000.0})
+    assert long_documents.choose(1000, 20, 30, short_labels, False) == "trie_paths"
+
+
 def test_chained_classifications_share_one_node(session):
     query = _chain(session)
     plan = query.plan()
@@ -653,11 +711,11 @@ def test_classify_refusals_and_builder_errors(session):
     assert "AI.IF" in mixed.plan().reasons[0]
     assert not isinstance(query.plan(), Refusal)
 
-    # the plan setting picks the scoring rule; trie paths by default
+    # the plan setting picks the scoring rule; the cost model by default
     plan = query.plan()
     (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
-    assert classify.spec.scoring == "trie_paths"
-    assert plan.settings["label_scoring"] == "trie_paths"
+    assert classify.spec.scoring in ("trie_paths", "trie_search")
+    assert plan.settings["label_scoring"] == "cost model"
     for rule in ("trie_nodes", "label_chains", "trie_paths", "trie_rounds",
                  "trie_search", "next_rule"):
         ruled = quail.Session(EngineConfig(

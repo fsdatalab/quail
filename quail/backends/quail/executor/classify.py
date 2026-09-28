@@ -216,8 +216,12 @@ class QuailClassifier:
                               if index else None),
                     read_all_rows=read_all, label=stage_spec.name))
                 continue
-            scorer = RoundScorer(stage_spec.label_token_ids, targets, len(rows),
-                                 search=stage_spec.scoring == "trie_search")
+            scorer = RoundScorer(
+                stage_spec.label_token_ids, targets, len(rows),
+                search=stage_spec.scoring == "trie_search",
+                demand=(None if stage_spec.demand is None else
+                        [stage_spec.labels.index(label)
+                         for label in stage_spec.demand]))
             scorers[index] = scorer
             for round in range(request.rounds):
                 position = len(stages)

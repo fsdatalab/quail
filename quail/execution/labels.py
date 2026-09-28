@@ -133,19 +133,31 @@ class RoundScorer:
     reads next (``trie_search``), so that label resolves first and
     prunes the rest. Nodes are indexed in ``nodes``, shortest first.
 
+    With ``demand``, only whether the label is one of those labels
+    matters: a document is also resolved once every alive label is in
+    the demanded set, or none is, and its label is then the alive
+    label with the highest bound.
+
     Args:
         label_ids: One token id sequence per label.
         targets: The token ids, one per column of the log probabilities.
         documents: How many documents the scorer tracks.
         search: Read one node per round, best first.
+        demand: Indices of the labels a filter accepts, when the
+            label is only tested for membership; None scores fully.
     """
 
-    def __init__(self, label_ids, targets, documents, search=False):
+    def __init__(self, label_ids, targets, documents, search=False,
+                 demand=None):
         self.label_ids = [tuple(ids) for ids in label_ids]
         self.lengths = np.array([len(ids) for ids in self.label_ids])
         self.nodes = sorted(label_trie(label_ids), key=lambda n: (len(n), n))
         self.index = {node: i for i, node in enumerate(self.nodes)}
         self.search = search
+        self.demand = None
+        if demand is not None:
+            self.demand = np.zeros(len(self.label_ids), dtype=bool)
+            self.demand[list(demand)] = True
         # a node is read at most once per document
         self.rounds = len(self.nodes) if search else int(self.lengths.max())
         self.column = {token: i for i, token in enumerate(targets)}
@@ -192,15 +204,21 @@ class RoundScorer:
                     self.read[doc, label] += 1
         alive = self.alive[doc]
         resolved = alive & (self.read[doc] == self.lengths)
-        if not resolved.any():
-            return
-        scores = np.where(resolved, self.partial[doc], -np.inf)
-        best = int(np.argmax(scores))
-        bound = self.partial[doc]
-        earlier = np.arange(len(self.label_ids)) < best
-        keep = alive & ~resolved & (
-            (bound > scores[best]) | ((bound == scores[best]) & earlier))
-        self.alive[doc] = keep
-        self.alive[doc, best] = True
-        if not keep.any():
-            self.label[doc] = best
+        if resolved.any():
+            scores = np.where(resolved, self.partial[doc], -np.inf)
+            best = int(np.argmax(scores))
+            bound = self.partial[doc]
+            earlier = np.arange(len(self.label_ids)) < best
+            keep = alive & ~resolved & (
+                (bound > scores[best]) | ((bound == scores[best]) & earlier))
+            self.alive[doc] = keep
+            self.alive[doc, best] = True
+            if not keep.any():
+                self.label[doc] = best
+                return
+        if self.demand is not None and self.label[doc] < 0:
+            alive = self.alive[doc]
+            inside = self.demand[alive]
+            if inside.all() or not inside.any():
+                bound = np.where(alive, self.partial[doc], -np.inf)
+                self.label[doc] = int(np.argmax(bound))

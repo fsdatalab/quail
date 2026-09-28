@@ -64,6 +64,16 @@ LABEL_SCORINGS = ("trie_nodes", "label_chains", "trie_paths", "trie_rounds",
                   "trie_search")
 DEFAULT_LABEL_SCORING = "trie_paths"
 
+# The cost model between trie_paths and trie_search, from the sf 0.1
+# runs on Qwen3 4B fp8 (runs 20260928T221901Z-0d0a17ad and
+# 20260928T222720Z-e303e50b): trie_search read 14% (BIO-5), 45%
+# (IMDB-14), and 47% (AGENT-4) of the label tokens trie_paths reads,
+# and ran about three times as many forward passes, each extra pass
+# costing about 20 ms on BIO-5 and AGENT-4.
+SEARCH_READ_FRACTION = 0.5
+SEARCH_PASS_SECONDS = 0.02
+SEARCH_PASS_FACTOR = 2.0     # extra passes per trie_paths pass
+
 
 def suffix_lengths(scoring: str, labels) -> list[int]:
     """Tokens of each suffix a document streams under one scoring rule.
@@ -116,7 +126,9 @@ class _Table:
         budget: Tokens one forward pass may hold: the smaller of the
             chunk budget and the KV arena.
         chunk: The chunk budget in tokens.
-        scoring: The label scoring rule every classification uses.
+        scoring: The label scoring rule every classification uses, or
+            None to choose trie_paths or trie_search per classification
+            by cost.
     """
 
     alias: str
@@ -124,7 +136,7 @@ class _Table:
     longest: int
     budget: int
     chunk: int
-    scoring: str
+    scoring: str | None
     backend_name: str
     model: object
     device: object
@@ -134,7 +146,7 @@ class _Table:
         """The prompt tokens before the document."""
         return tuple(self.tokenizer(call.prompt.preamble))
 
-    def classify(self, call, name, live, resident=False):
+    def classify(self, call, name, live, resident=False, demand=None):
         """Return a ClassifySpec for one prompt and the work it does.
 
         Args:
@@ -143,6 +155,8 @@ class _Table:
             live: How many documents are expected to reach it.
             resident: Whether the documents' KV is resident from an
                 earlier stage of the same chain.
+            demand: The labels a filter accepts when only membership
+                is needed, else None.
 
         Raises:
             _RefusedError: A document and its prompt exceed the budget.
@@ -151,7 +165,9 @@ class _Table:
         tail = tuple(call.prompt.tail_token_ids)
         labels = tuple(tuple(self.tokenizer(label_text(label)))
                        for label in call.labels)
-        suffixes = suffix_lengths(self.scoring, labels)
+        scoring = self.scoring or self.choose(live, len(head), len(tail) - 1,
+                                              labels, resident)
+        suffixes = suffix_lengths(scoring, labels)
         # head, document, and frame stay resident while the longest
         # suffix and the frame entry's own rows are packed beside them
         need = len(head) + self.longest + len(tail) + max(suffixes)
@@ -170,9 +186,33 @@ class _Table:
             arguments=tuple((ref.alias, ref.column) for ref in call.prompt.args),
             expected_inputs=live, estimated_seconds=estimate,
             prompt_token_parts=(head, tail), labels=tuple(call.labels),
-            label_token_ids=labels, scoring=self.scoring,
+            label_token_ids=labels, scoring=scoring,
+            demand=None if demand is None else tuple(demand),
         )
         return spec, step
+
+    def choose(self, live, head_tokens, frame_tokens, labels, resident) -> str:
+        """The cheaper of trie_paths and trie_search for one classification.
+
+        trie_search reads SEARCH_READ_FRACTION of the label tokens
+        trie_paths reads, and runs SEARCH_PASS_FACTOR more forward
+        passes than trie_paths' token count divides into, each costing
+        SEARCH_PASS_SECONDS.
+        """
+        paths = suffix_lengths("trie_paths", labels)
+        whole = classify_work(live, self.mean, head_tokens, frame_tokens,
+                              paths, resident=resident)
+        pruned = classify_work(
+            live, self.mean, head_tokens, frame_tokens,
+            [length * SEARCH_READ_FRACTION for length in paths],
+            resident=resident)
+        seconds_paths = speed_of_light(whole, self.model, self.device,
+                                       self.chunk).seconds
+        passes = whole.tokens / self.chunk
+        seconds_search = (
+            speed_of_light(pruned, self.model, self.device, self.chunk).seconds
+            + SEARCH_PASS_FACTOR * passes * SEARCH_PASS_SECONDS)
+        return "trie_search" if seconds_search < seconds_paths else "trie_paths"
 
     def node(self, spec, input_port, index) -> AiClassify:
         """The plan node running a classification and its chained stages."""
@@ -222,8 +262,9 @@ def plan_classify(region, context, *, backend_name: str):
             f"{model.name!r} has a separate head")
     if context.tokenizer is None:
         return _refused("AI.CLASSIFY planning needs the model's tokenizer")
-    scoring = context.label_scoring or DEFAULT_LABEL_SCORING
-    if scoring not in LABEL_SCORINGS:
+    # None lets the cost model choose per classification
+    scoring = context.label_scoring
+    if scoring is not None and scoring not in LABEL_SCORINGS:
         return _refused(f"unknown label scoring rule {scoring!r}; the rules "
                         f"are {LABEL_SCORINGS}")
 
@@ -243,6 +284,14 @@ def plan_classify(region, context, *, backend_name: str):
         column.expression: column.name for column in logical.root.columns
         if isinstance(column, Alias)
     }
+    # a label that is only tested for membership, with one accepted
+    # set, is scored only as far as that decision needs
+    demands = {}
+    for predicate in predicates:
+        test = predicate.expression
+        demands.setdefault(test.call, set()).add(tuple(test.accepted))
+    demands = {call: next(iter(accepted)) for call, accepted in demands.items()
+               if call not in named and len(accepted) == 1}
     # ("classify", call) and ("filter", written position) in plan order:
     # a prompt is classified where it is first needed
     steps = []
@@ -275,7 +324,8 @@ def plan_classify(region, context, *, backend_name: str):
                      and table.head(item) == table.head(last_call))
             try:
                 spec, step = table.classify(item, named[item], live,
-                                            resident=joins)
+                                            resident=joins,
+                                            demand=demands.get(item))
             except _RefusedError as refused:
                 return _refused(refused.reason, "suffix_over_chunk",
                                 refused.needed, refused.available, "tokens")
@@ -341,7 +391,7 @@ def plan_classify(region, context, *, backend_name: str):
             "estimated_attention_pairs": work.pairs,
             "batching": "token_based_admission",
             "data_parallel_copies": context.gpu_count,
-            "label_scoring": scoring,
+            "label_scoring": scoring or "cost model",
             "order_rule": "written order",
         },
     )
