@@ -137,10 +137,14 @@ class QuailClassifier:
         if (readout is None or list(readout.targets.tolist()) != targets
                 or readout.rows != readout_rows):
             torch = state["torch"]
+            head = full_output_head(state["model"])
             readout = AsyncLabelLogprobs(
-                torch, torch.nn.functional, full_output_head(state["model"]),
-                targets, rows=readout_rows)
+                torch, torch.nn.functional, head, targets, rows=readout_rows)
             state["label_readout"] = readout
+            logger.info("label readout: head %s x %s in %s, %s targets, "
+                        "%s rows per request", *head.shape,
+                        str(head.dtype).replace("torch.", ""), len(targets),
+                        readout_rows)
         if "input_staging" not in state:
             state["input_staging"] = InputStaging(state["torch"])
         state["input_staging"].fixed_tokens.clear()

@@ -98,7 +98,9 @@ class AsyncLabelLogprobs:
     one suffix in order, NaN past the suffix's own rows.
     """
 
-    BLOCK_ROWS = 64    # rows per head block: 64 x 151,936 x 6 bytes = 58 MiB
+    # rows per head block: every block reads the whole head, so few big
+    # blocks; 512 x 151,936 logits in bf16 and float32 are 445 MiB
+    BLOCK_ROWS = 512
 
     def __init__(self, torch, F, head, targets, rows=1):
         self.torch = torch
