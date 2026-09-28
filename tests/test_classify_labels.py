@@ -114,12 +114,44 @@ def test_labels_copy_by_content_and_join_a_reused_collection(
                       .read_text())["collection_id"] == summary["collection_id"]
 
 
-def test_quail_runner_skips_classifications_it_cannot_run():
-    from quail.bench import quailb
+def test_every_classification_query_plans_on_quail():
+    import pyarrow as pa
+
+    import quail
+    from quail.bench.quailb import build_query
+    from quail.bench.substrait import Classify, Filter, Join, read_plan
+    from quail.physical import AiClassify, AiFilter, AiJoin
+    from quail.planner.plan import EngineConfig, Refusal
     from quail_b.queries import get_query
 
-    assert quailb.runs_on_quail(get_query("IMDB-4"))
-    assert quailb.runs_on_quail(get_query("IMDB-11"))
-    # IMDB-12 classifies after an AI.IF filter; LEP-6 joins
-    assert not quailb.runs_on_quail(get_query("IMDB-12"))
-    assert not quailb.runs_on_quail(get_query("LEP-6"))
+    # each query over three-row tables holding the columns its plan reads
+    shapes = {"IMDB-12": (AiFilter,), "AGENT-3": (AiFilter,),
+              "IMDB-13": (AiJoin,), "BIO-6": (AiJoin,), "LEP-6": (AiJoin,)}
+    for query_id, extra in shapes.items():
+        spec = get_query(query_id)
+        plan = read_plan(spec.plan)
+        columns = {relation.alias: {"id"} for relation in plan.relations}
+        for operator in plan.operators:
+            if isinstance(operator, (Filter, Classify)):
+                columns[operator.alias].add(operator.column)
+            elif isinstance(operator, Join):
+                for alias, column in zip(operator.aliases, operator.columns):
+                    columns[alias].add(column)
+                for left, right in operator.on:
+                    columns[operator.aliases[0]].add(left)
+                    columns[operator.aliases[1]].add(right)
+        for name in plan.select:
+            alias, column = name.split(".", 1)
+            columns[alias].add(column)
+        with quail.Session(EngineConfig(model="qwen3-4b-fp8", device="h100-sxm"),
+                           tokenizer=lambda text: list(text.encode())) as session:
+            for relation in plan.relations:
+                session.register(relation.table, quail.DocumentProvider.from_table(
+                    pa.table({column: [f"{column} {row}" for row in range(3)]
+                              for column in sorted(columns[relation.alias])}),
+                    id_col="id"))
+            physical = build_query(session, spec).plan()
+            assert not isinstance(physical, Refusal), (query_id, physical)
+            kinds = {type(node) for node in physical.nodes}
+            assert AiClassify in kinds and all(kind in kinds for kind in extra), \
+                query_id

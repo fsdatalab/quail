@@ -16,8 +16,8 @@ QWEN3_32B_FP8 = ModelSpec(
     w_mem_bytes=34.37e9,   # measured as-loaded footprint: fp8 weights
     #                        + two bf16 vocab matrices (embedding and
     #                        untied lm_head) + block scales. The head
-    #                        (head_mem_bytes, 1.56e9) is discarded
-    #                        after extracting answer rows.
+    #                        (head_mem_bytes, 1.56e9) stays resident
+    #                        for AI.CLASSIFY: about 5,900 KV tokens.
     vocab=151_936,
-    tied_head=False,       # separate lm_head; discarded after extracting answer rows
+    tied_head=False,       # separate lm_head, kept for AI.CLASSIFY
 )

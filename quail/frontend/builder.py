@@ -349,12 +349,13 @@ class Query:
                 raise CompileError(
                     "every joined side must be a single (optionally "
                     "filtered) docs(...) query")
-            if other._labels:
-                raise CompileError(
-                    "a joined side cannot carry an AI.CLASSIFY column yet")
             alias, provider = other._tables[0]
             if alias in self._scope():
                 raise CompileError(f"duplicate table alias {alias!r}")
+            for name, column in other._labels.items():
+                if name in self._labels or name in self._scope():
+                    raise CompileError(f"the name {name!r} is already used")
+                self._labels[name] = column
             self._tables.append((alias, provider))
             for a, preds in other._filters.items():
                 self._filters.setdefault(a, []).extend(preds)

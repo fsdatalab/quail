@@ -507,9 +507,10 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     fixed = rule == "as_written"
     filter_orders = {
         alias: [asks[alias][index] for index in order_filters_indexed(
-            ask_filters.get(alias, []), rule,
+            ask_filters[alias], rule,
             prefix_tokens=pre + stats[alias].mean_doc_tokens,
             model=model, device=device, chunk_tokens=chunk)]
+        if alias in ask_filters else []
         for alias in filters
     }
 

@@ -17,19 +17,16 @@ def test_model_weights_and_kv_memory_budgets():
     # Tied output weights must remain available for input embeddings.
     assert QWEN3_4B_FP8.head_mem_bytes == 0.0
     assert QWEN3_4B_FP8.W_resident == QWEN3_4B_FP8.W_mem
-    # Unused rows of the separate 32B output weights can be released.
+    # The separate 32B output head stays resident for AI.CLASSIFY: its
+    # 1,555,824,640 bytes are 5,936 KV tokens (262,144 bytes each, in
+    # whole 16-token pages) the arena does not get.
     head = QWEN3_32B_FP8.head_mem_bytes
     assert head == 151_936 * 5_120 * 2
-    assert QWEN3_32B_FP8.W_resident == QWEN3_32B_FP8.W_mem - head
-    # the freed bytes become arena tokens at the KV rate:
-    # 1,555,824,640 bytes / 262,144 bytes per 32B KV token = 5,935,
-    # rounded to whole 16-token pages
-    kept = replace(QWEN3_32B_FP8, tied_head=True)
-    grown = budgets.arena_tokens(QWEN3_32B_FP8, H100_SXM)
-    assert grown == 112_304
-    assert grown - budgets.arena_tokens(kept, H100_SXM) == 5_936
+    assert QWEN3_32B_FP8.W_resident == QWEN3_32B_FP8.W_mem
+    assert budgets.arena_tokens(QWEN3_32B_FP8, H100_SXM) == 112_304 - 5_936
     # the chunk budget does not move: the 32B chunk is capped by the
     # int32 kernel index, not by memory
+    kept = replace(QWEN3_32B_FP8, tied_head=True)
     assert budgets.chunk_budget(QWEN3_32B_FP8, H100_SXM) == \
         budgets.chunk_budget(kept, H100_SXM)
 

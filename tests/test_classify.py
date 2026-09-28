@@ -633,6 +633,33 @@ def _chain(session, *, filters=1):
         ["complaint", "question"], name="kind").select("d.id", "topic", "kind")
 
 
+def test_sql_classifies_and_tests_labels(session):
+    call = ("AI.CLASSIFY(PROMPT('What is {0} about?', d.body), "
+            "ARRAY['refund', 'shipping', 'praise'])")
+    query = session.sql(
+        f"SELECT d.id, {call} AS topic FROM documents d "
+        f"WHERE {call} IN ('refund', 'shipping')")
+    built = (session.docs("documents").alias("d").ai_classify(
+        quail.prompt("What is {0} about?", quail.col("d.body")),
+        ["refund", "shipping", "praise"], name="topic")
+        .label_in("topic", ["refund", "shipping"]).select("d.id", "topic"))
+    assert query.logical == built.logical
+    (test,) = [n for n in query.plan().nodes if isinstance(n, LabelFilter)]
+    assert (test.score_name, test.accepted) == ("topic", ("refund", "shipping"))
+    # a label filter alone, with a selectivity option
+    filtered = session.sql(
+        f"SELECT d.id FROM documents d WHERE {call[:-1]}, "
+        f"{{'selectivity': 0.5}}) IN ('praise')")
+    (predicate,) = filtered.logical.operators().filters["d"]
+    assert predicate.selectivity == 0.5
+    assert predicate.expression.accepted == ("praise",)
+    for bad in (f"SELECT d.id, {call} FROM documents d",
+                f"SELECT d.id FROM documents d WHERE {call} = 'refund'",
+                f"SELECT d.id FROM documents d WHERE {call} IN ('other')"):
+        with pytest.raises(CompileError):
+            session.sql(bad)
+
+
 def test_planner_demands_membership_for_filter_only_labels(session):
     from quail.planner.classify import _Table
 
@@ -733,11 +760,11 @@ def test_classify_refusals_and_builder_errors(session):
             assert plan.settings["label_scoring"] == rule
         ruled.close()
 
+    # Qwen3 32B keeps its separate output head, so it classifies too
     big = quail.Session(EngineConfig(model="qwen3-32b-fp8", device="h100-sxm"),
                         tokenizer=_bytes)
     big.register("documents", session.catalog.get("documents"))
-    refused = _topic(big).plan()
-    assert isinstance(refused, Refusal) and "full output head" in refused.reasons[0]
+    assert not isinstance(_topic(big).plan(), Refusal)
     big.close()
 
     vllm = quail.Session(EngineConfig(model="qwen3-4b-fp8", device="h100-sxm",

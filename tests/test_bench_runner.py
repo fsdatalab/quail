@@ -12,7 +12,6 @@ from quail.bench.quailb import (
     prompt_pieces,
     queries,
     run_output,
-    runs_on_quail,
 )
 from quail.bench.substrait import AI_URN, Filter, Join, Relation, read_plan
 from quail.builtins import built_in_registry
@@ -224,8 +223,6 @@ def test_read_plan_reads_operators_and_rejects_other_extensions():
     assert join.on == (("evidence_wiki_url", "id"),)
 
     for spec in query_specs(include_privacy=True).values():
-        if not runs_on_quail(spec):
-            continue
         plan = read_plan(spec.plan)
         assert len(plan.relations) == len(plan.joins) + 1, spec.id
         ids = [op.id for op in plan.operators]

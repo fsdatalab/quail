@@ -110,7 +110,7 @@ def _install_single_rank_groups(torch):
 
 
 def retain_answer_head(torch, model, token_ids):
-    """Keep the answer rows and release the full output head."""
+    """Keep the answer rows and the full output head as one bf16 matrix."""
     allowed = tuple(sorted(set(token_ids)))
     if not allowed:
         raise ValueError("TRUE/FALSE token ids must not be empty")
@@ -122,34 +122,24 @@ def retain_answer_head(torch, model, token_ids):
     weights = weight.detach().index_select(0, indices).to(dtype=torch.bfloat16)
     model.register_buffer("quail_answer_weights", weights, persistent=False)
     model.quail_answer_token_ids = allowed
-    if _tied_to_embedding(model, weight):
-        # AI.CLASSIFY reads the whole head; logits are computed in
-        # bf16, as vLLM computes them, and normalized in float32
-        model.quail_full_head = weight.detach().to(dtype=torch.bfloat16)
+    # AI.CLASSIFY reads the whole head; logits are computed in bf16, as
+    # vLLM computes them, and normalized in float32. A head tied to the
+    # embedding costs nothing to keep; a separate bf16 head stays
+    # resident, priced into the KV arena by the model spec.
+    model.quail_full_head = weight.detach().to(dtype=torch.bfloat16)
     # lm_head can be the same module as embed_tokens; drop only this reference.
     model.lm_head = None
-
-
-def _tied_to_embedding(model, weight) -> bool:
-    """Return whether the output head shares memory with a model parameter."""
-    return any(
-        parameter.data_ptr() == weight.data_ptr()
-        for name, parameter in model.named_parameters(remove_duplicate=False)
-        if not name.startswith("lm_head")
-    )
 
 
 def full_output_head(model):
     """Return the whole output head for full-vocabulary log probabilities.
 
     Raises:
-        ValueError: The model's head was discarded after loading, as it
-            is for a head not tied to the embedding.
+        ValueError: The model booted without keeping its head.
     """
     head = getattr(model, "quail_full_head", None)
     if head is None:
-        raise ValueError("this model's full output head was not kept; "
-                         "AI.CLASSIFY needs a head tied to the embedding")
+        raise ValueError("this model's full output head was not kept")
     return head
 
 

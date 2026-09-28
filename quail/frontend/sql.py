@@ -1,5 +1,6 @@
 """Parse supported Snowflake and BigQuery AI SQL into a LogicalPlan."""
 
+from dataclasses import replace
 from enum import StrEnum
 
 import sqlglot
@@ -14,6 +15,7 @@ from quail.logical import (
     Equality,
     FilterPredicate,
     JoinSpec,
+    LabelIn,
     LogicalPlan,
     LogicalPlanBuilder,
     ModelCall,
@@ -22,6 +24,7 @@ from quail.logical import (
     bind_score_prompt,
     is_score,
 )
+from quail.logical.prompts import bind_classify_prompt
 
 # Every relational operator except the projection, named and refused.
 # OR is rejected separately with its own message.
@@ -71,6 +74,8 @@ def _normalize_ai_calls(sql: str, dialect: SQLDialect) -> str:
         replacement = None
         if function == "SCORE":
             replacement = "AI_SCORE("
+        elif function == "CLASSIFY":
+            replacement = "AI_CLASSIFY("
         elif function == "IF" and dialect is SQLDialect.BQ:
             replacement = "AI_FILTER("
         if head.text.upper() == "AI" and dot.text == "." \
@@ -228,7 +233,7 @@ class _Binder:
         return out
 
     def parse_ai_call(self, node, function: str, allowed: set, scope=None,
-                      join=None):
+                      join=None, labels=None):
         """Parse one AI prompt call into prompt, options, and aliases."""
         if not _is_call(node, function):
             raise CompileError(
@@ -269,15 +274,49 @@ class _Binder:
                 "an AI.SCORE pair prompt mentions {0} exactly once, as "
                 "the place its document is inserted; refer to it again "
                 "in words")
-        if function == "AI_SCORE":
-            binder = bind_score_prompt
+        if labels is not None:
+            prompt = bind_classify_prompt(template, tuple(refs), labels, (),
+                                          self.tokenizer, turn=self.turn)
         else:
-            binder = bind_join_prompt if join else bind_prompt
-        prompt = binder(template, tuple(refs), self.tokenizer,
-                        turn=self.turn)
+            if function == "AI_SCORE":
+                binder = bind_score_prompt
+            else:
+                binder = bind_join_prompt if join else bind_prompt
+            prompt = binder(template, tuple(refs), self.tokenizer,
+                            turn=self.turn)
         for r in refs:
             self.note_doc_column(r)
         return prompt, options, aliases
+
+    def parse_ai_classify(self, node, scope=None):
+        """Parse an AI_CLASSIFY call into a label ModelCall, options, and aliases.
+
+        The call is AI_CLASSIFY(PROMPT('template', column),
+        ARRAY['label', ...]) with an optional options object after
+        the labels; sqlglot parses it as its AIClassify function.
+        """
+        categories = node.args.get("categories")
+        if not isinstance(categories, exp.Array):
+            raise CompileError(
+                "AI.CLASSIFY takes PROMPT('template', column) and an ARRAY "
+                "of labels")
+        labels = []
+        for item in categories.expressions:
+            if not (isinstance(item, exp.Literal) and item.is_string):
+                raise CompileError("AI.CLASSIFY labels must be string literals")
+            labels.append(str(item.this))
+        config = node.args.get("config")
+        call = exp.Anonymous(
+            this="AI_CLASSIFY",
+            expressions=[node.this] + ([config] if config is not None else []))
+        prompt, options, aliases = self.parse_ai_call(
+            call, "AI_CLASSIFY", {"selectivity"}, scope=scope, join=False,
+            labels=tuple(labels))
+        if len(aliases) != 1:
+            raise CompileError("AI.CLASSIFY reads one document column")
+        model_call = ModelCall(prompt, "label", tuple(labels), ())
+        model_call.validate()
+        return model_call, options, aliases
 
     def parse_ai_filter(self, node, allowed: set, scope=None, join=None):
         """Parse an AI_FILTER node into a boolean call, options, and aliases."""
@@ -492,6 +531,23 @@ def compile_sql(sql: str, catalog: Catalog,
         if anti:
             raise CompileError(f"NOT is only supported as NOT EXISTS, "
                                f"got NOT {node.sql()}")
+        if isinstance(node, exp.In) and isinstance(node.this, exp.AIClassify):
+            call, options, aliases = b.parse_ai_classify(node.this)
+            accepted = []
+            for item in node.expressions:
+                if not (isinstance(item, exp.Literal) and item.is_string):
+                    raise CompileError(
+                        "AI.CLASSIFY IN (...) lists string literals")
+                accepted.append(str(item.this))
+            predicate = LabelIn(call, tuple(accepted))
+            predicate.validate()
+            b.filters.setdefault(aliases[0], []).append(
+                FilterPredicate(expression=predicate,
+                                selectivity=options.get("selectivity")))
+            continue
+        if any(isinstance(call, exp.AIClassify) for call in term.walk()):
+            raise CompileError(
+                "AI.CLASSIFY in WHERE must be tested with IN ('label', ...)")
         if _is_ai_score_comparison(term):
             predicate, options, aliases = \
                 b.parse_ai_score(term, SCORE_OPTION_KEYS)
@@ -516,21 +572,36 @@ def compile_sql(sql: str, catalog: Catalog,
         add_join_spec(predicate, options, aliases)
 
     columns = _compile_projection(b, tree.expressions)
-    projected_scores = tuple(
+    projected = tuple(
         column for column in columns if isinstance(column, Alias)
     )
+    projected_scores = tuple(
+        column for column in projected if column.expression.kind == "score"
+    )
     names_by_prompt = {}
-    for score in projected_scores:
+    for score in projected:
         if score.name in dict(b.tables):
             raise CompileError(
-                f"AI.SCORE output name {score.name!r} is also a table "
+                f"output name {score.name!r} is also a table "
                 f"alias; pick another AS name")
         names = names_by_prompt.setdefault(score.expression.prompt, [])
         if names:
             raise CompileError(
-                f"the same AI.SCORE expression is projected as "
+                f"the same AI expression is projected as "
                 f"{names[0]!r} and {score.name!r}; project it once")
         names.append(score.name)
+    # a label filter tests the projected column of the same call
+    named = {column.expression: column.name for column in projected
+             if column.expression.kind == "label"}
+    for alias, predicates in b.filters.items():
+        b.filters[alias] = [
+            FilterPredicate(
+                expression=replace(predicate.expression,
+                                   name=named[predicate.expression.call]),
+                selectivity=predicate.selectivity)
+            if isinstance(predicate.expression, LabelIn)
+            and predicate.expression.call in named else predicate
+            for predicate in predicates]
 
     for alias, equalities in conditions.items():
         if any(alias in score.expression.aliases()
@@ -561,7 +632,7 @@ def compile_sql(sql: str, catalog: Catalog,
             "in one query"
         )
 
-    if not b.joins and not b.filters and not projected_scores:
+    if not b.joins and not b.filters and not projected:
         raise CompileError("the query has no AI predicate; a plain "
                            "scan belongs in the database the ids came "
                            "from")
@@ -692,10 +763,17 @@ def _compile_projection(b: _Binder, expressions) -> list:
                 )
             columns.append(Alias(ModelCall(prompt, "score"), alias))
             continue
-        if any(_is_call(call, "AI_SCORE") for call in e.walk()):
+        if isinstance(e, exp.AIClassify):
+            if not alias:
+                raise CompileError("AI.CLASSIFY needs an AS name in SELECT")
+            call, _options, _aliases = b.parse_ai_classify(e)
+            columns.append(Alias(call, alias))
+            continue
+        if any(_is_call(call, "AI_SCORE") or isinstance(call, exp.AIClassify)
+               for call in e.walk()):
             raise CompileError(
-                "AI.SCORE in SELECT must be a direct expression with "
-                "an AS name"
+                "AI.SCORE and AI.CLASSIFY in SELECT must be direct "
+                "expressions with an AS name"
             )
         if not isinstance(e, exp.Column):
             raise CompileError(

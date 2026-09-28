@@ -63,16 +63,6 @@ TEXT_VLLM_BACKENDS = frozenset({
 })
 
 
-CLASSIFY_UNSUPPORTED = ("Quail runs AI.CLASSIFY only on one table without "
-                        "AI.IF yet")
-
-
-def runs_on_quail(spec: QuerySpec) -> bool:
-    """Whether Quail's runtime has every operator the query uses."""
-    plan = read_plan(spec.plan)
-    return not plan.classifies or (not plan.joins and not plan.filters)
-
-
 def register_tables(session, data_dir):
     """Register every Parquet file of a directory as a document table."""
     for path in sorted(Path(data_dir).glob("*.parquet")):
@@ -97,8 +87,6 @@ def queries(session) -> dict:
     """
     listed = {}
     for spec in query_specs(include_privacy=True).values():
-        if not runs_on_quail(spec):
-            continue
         plan = read_plan(spec.plan)
         if plan.classifies and session.config.backend != "quail":
             continue
@@ -342,11 +330,6 @@ def refused_queries(session, query_ids, data_dir) -> dict[str, str]:
     refused = {}
     for query_id in query_ids:
         spec = benchmark.get_query(query_id)
-        if not runs_on_quail(spec):
-            refused[query_id] = CLASSIFY_UNSUPPORTED
-            print(f"[quail-b] {query_id}: skipped: {CLASSIFY_UNSUPPORTED}",
-                  flush=True)
-            continue
         plan = build_query(session, spec).plan()
         if isinstance(plan, Refusal):
             refused[query_id] = " ".join(plan.reasons)
@@ -366,9 +349,6 @@ def run_suite(only=None, *, sf=0.1, config, data_dir=None,
     skipped = {}
     explicit = only is not None
     only = list(query_specs()) if only is None else list(only)
-    skipped.update({query_id: CLASSIFY_UNSUPPORTED for query_id in only
-                    if not runs_on_quail(benchmark.get_query(query_id))})
-    only = [query_id for query_id in only if query_id not in skipped]
     if explicit and only and data_dir is not None:
         with quail.Session(config) as preflight_session:
             skipped.update(refused_queries(preflight_session, only, data_dir))

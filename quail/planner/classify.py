@@ -51,10 +51,6 @@ def classification_refusal(context) -> Refusal | None:
     if model.canvas_tokens:
         reason = (f"AI.CLASSIFY is not supported on {model.name!r} yet: it "
                   f"reads answers from a canvas")
-    elif not model.tied_head:
-        reason = (f"AI.CLASSIFY needs the full output head, which Quail keeps "
-                  f"only for models whose head is tied to the embedding; "
-                  f"{model.name!r} has a separate head")
     elif context.tokenizer is None:
         reason = "AI.CLASSIFY planning needs the model's tokenizer"
     elif (context.label_scoring is not None

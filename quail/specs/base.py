@@ -137,9 +137,9 @@ class ModelSpec:
     def head_mem_bytes(self) -> float:
         """Bytes of an untied bf16 lm_head weight; 0 when tied.
 
-        The executor discards this matrix after retaining its TRUE/FALSE
-        rows. Both Qwen3 checkpoints store the
-        head in bf16, hence the 2 bytes per element.
+        The executor keeps this matrix for AI.CLASSIFY, so it stays
+        resident beside the other weights. Both Qwen3 checkpoints store
+        the head in bf16, hence the 2 bytes per element.
         """
         if self.tied_head:
             return 0.0
@@ -147,8 +147,8 @@ class ModelSpec:
 
     @property
     def W_resident(self) -> float:  # noqa: N802
-        """Weight bytes resident on the GPU after boot."""
-        return self.W_mem - self.head_mem_bytes
+        """Weight bytes resident on the GPU after boot, the head included."""
+        return self.W_mem
 
     @property
     def act_per_token(self) -> float:
