@@ -4,6 +4,10 @@
         2>&1 | tee /tmp/classify-check.log
     uv run modal run --detach -m experiments.cells.classify_labels::label \
         2>&1 | tee /tmp/classify-label.log
+
+`label` waits for every shard, then builds the collections. To rebuild
+them from finished shards alone:
+
     uv run modal run --detach -m experiments.cells.classify_labels::finish \
         --calls fc-...,fc-... 2>&1 | tee /tmp/classify-finish.log
 
@@ -75,11 +79,13 @@ SUMMARY_PATH = Path("/results/ablations/classify-reference-labels.json")
 CHECK_PATH = Path("/results/ablations/classify-reference-labels-check.json")
 PREDICTION_TEXT = (
     "At sf=1.0 the eight predicates need 435 million prompt tokens, 364 "
-    "million of them agent traces. At the 10,000 tokens per second assumed "
-    "for Qwen3 32B fp8 on vLLM, that is about 12 H100 hours, about 45 "
-    "minutes per container across 25 containers. The cross-check finds "
-    "every label score within 0.01 of a full-sequence prompt-logprob "
-    "computation and the same label for every document."
+    "million of them agent traces. At the 17,000 fresh tokens per second "
+    "the cross-check measured on reviews "
+    "(/results/ablations/classify-reference-labels-check.json), that is "
+    "about 7 H100 hours: under 30 minutes of scoring per agent-trace "
+    "container after a 6-minute boot, across 25 containers. Every label "
+    "set gets one label per document, and every classification query "
+    "loads its labels at all three scale factors."
 )
 
 
@@ -556,7 +562,7 @@ def check():
 
 @app.local_entrypoint()
 def label():
-    """Spawn one container per shard and print their function call ids."""
+    """Label every shard, one container each, then build the collections."""
     print(PREDICTION_TEXT, flush=True)
     rows = {"reviews": 50_000, "terms": 4_144, "claims": 5_000,
             "citation_contexts": 4_972, "agent_traces": 17_711}
@@ -568,6 +574,12 @@ def label():
             print(f"[classify] {spec.key} [{start}, {end}): {call.object_id}",
                   flush=True)
     print(f"[classify] calls: {','.join(calls)}", flush=True)
+    for call_id in calls:
+        result = modal.FunctionCall.from_id(call_id).get()
+        print(f"[classify] done {call_id}: {json.dumps(result)}", flush=True)
+    call = finish_run.spawn(",".join(calls))
+    print(f"[classify] finish function call id: {call.object_id}", flush=True)
+    print(json.dumps(call.get(), indent=2), flush=True)
 
 
 @app.local_entrypoint()
@@ -575,3 +587,4 @@ def finish(calls: str):
     """Build the collections once every shard has finished."""
     call = finish_run.spawn(calls)
     print(f"[classify] finish function call id: {call.object_id}", flush=True)
+    print(json.dumps(call.get(), indent=2), flush=True)
