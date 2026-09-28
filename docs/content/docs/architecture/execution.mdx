@@ -48,91 +48,21 @@ token budget and a KV page budget.
 
 ### Prefix sharing
 
-Quail uses **prefix caching** to reuse KV when different documents
-start with identical tokens. Filters can share document prefixes;
-joins can share prefixes between anchor documents on the same GPU.
+Quail uses **prefix caching** to avoid recomputing identical beginnings
+of documents. For example, agent traces saved after successive turns
+repeat earlier turns. Quail can reuse KV for those repeated tokens.
 
-#### Data structure
+- The planner enables caching automatically when its estimated compute
+  savings exceed the extra cost of writing KV.
+- Filters share document prefixes. Joins share prefixes between anchors.
+  Reuse is limited to documents on the same GPU.
+- If the needed KV is unavailable, Quail computes the tokens again.
+  Filters executing with a row limit skip sharing to preserve row order.
 
-[`PrefixTree`](https://github.com/fsdatalab/quail/blob/main/quail/execution/tokens.py)
-stores the sharing plan in three Python lists:
-
-| List | Contents |
-| --- | --- |
-| `order` | Document indices sorted by token sequence. |
-| `parent` | For each document, the earlier document that supplies its shared KV, or `None`. |
-| `shared` | For each document, the number of prefix tokens to reuse. |
-
-The parent links form a forest: one tree for each group of connected
-documents. The nodes are documents. This is not a radix tree with
-nodes for token sequences, and it does not store KV itself.
-
-Quail builds the lists before execution:
-
-1. Sort the documents by token sequence.
-2. Compare each document with the preceding document to find their
-   common prefix. Round its length down to whole KV pages, leaving
-   at least the current document's final token to compute.
-3. Select the preceding document as the parent. If it also reuses
-   that entire prefix, follow its parent links to the document that
-   supplies the prefix.
-
-For example, suppose documents 0, 1, and 2 contain the first 1,000,
-1,400, and 1,900 tokens of the same agent trace. With 16-token pages:
-
-```python
-order = [0, 1, 2]
-parent = [None, 0, 1]
-shared = [0, 992, 1392]
-```
-
-If the shared KV stays available, Quail computes 1,000 + 408 + 508 =
-1,916 document tokens, compared with 4,300 without sharing. These
-counts exclude question tokens.
-
-<Mermaid chart={`flowchart LR
-  D0["Document 0<br/>computes 1,000 tokens"]
-  D1["Document 1<br/>computes 408 tokens"]
-  D2["Document 2<br/>computes 508 tokens"]
-  D0 -->|"reuses 992 tokens of KV"| D1
-  D1 -->|"reuses 1,392 tokens of KV"| D2`} />
-
-#### Execution and memory
-
-- The executor considers documents in `order`. A document waits if
-  its parent has not yet entered execution.
-- The allocator stores a list of page IDs for each document. A
-  document reusing a prefix includes the parent's page IDs in its
-  own page table. The KV stays in GPU memory; it is not copied.
-- Each page has a reference count, the number of documents holding
-  it. Quail also protects parents needed by documents still waiting
-  to run. A page becomes free after its last holder releases it.
-- If a parent never runs or its required KV is unavailable, the
-  document computes the prefix again. Documents added after the
-  lists are built do not reuse prefixes through this plan.
-
-The allocator is in
-[`arena.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/arena.py).
-The [planner](/docs/architecture/planning#deciding-whether-to-share-prefixes)
-decides whether to enable sharing.
-
-#### Precedents
-
-The optimization is the same prefix caching used by
-[vLLM](https://docs.vllm.ai/en/latest/design/prefix_caching/) and
-[SGLang RadixAttention](https://www.lmsys.org/blog/2024-01-17-sglang/).
-The lookup structures differ:
-
-- vLLM looks up reusable blocks by hashes of their tokens and the
-  preceding prefix. See
-  [`get_computed_blocks`](https://github.com/vllm-project/vllm/blob/main/vllm/v1/core/kv_cache_manager.py).
-- SGLang searches and updates a radix tree as requests run. See
-  [`RadixCache`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/mem_cache/radix_cache.py).
-- Quail records parent links for its known input documents before
-  execution. Having the documents in advance allows this choice.
-
-SGLang also schedules requests to improve reuse. Neither prefix
-caching nor scheduling for reuse is new in Quail.
+See the [prefix caching design](/docs/architecture/prefix-caching)
+for the data structure, example, and precedents, and
+[Planning](/docs/architecture/planning#deciding-whether-to-share-prefixes)
+for the cost comparison.
 
 ### Join execution
 
@@ -200,17 +130,6 @@ Grouping reads can reduce memory traffic for shared KV. It also adds
 a call and a merge step, so it is not always faster. Actual memory
 reads depend on the attention kernel; grouping does not guarantee
 that each KV value is read from GPU memory only once.
-
-<Mermaid chart={`flowchart TB
-  subgraph U["Unified attention"]
-    U1["Separate sequence per document"] --> U2["One call over prefix and new tokens"]
-  end
-  subgraph T["Tree attention"]
-    T1["Group documents reading the same prefix"] --> T2["Attention to shared KV"]
-    T1 --> T3["Attention to each document's own tokens"]
-    T2 --> M["Combine results"]
-    T3 --> M
-  end`} />
 
 The planner enables the tree path only for models with FP8 weights
 and no canvas tokens, the extra rows used by DiffusionGemma. Other

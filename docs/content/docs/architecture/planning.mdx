@@ -84,9 +84,9 @@ saved_seconds = shared_tokens * 2 * model.params / device.peak_flops
 write_seconds = total_tokens * model.kappa / device.hbm_bw
 ```
 
-- `shared_tokens` is the sum of the `PrefixTree.shared` list. It
-  counts reusable token positions in complete pages, leaving each
-  document's final token to compute.
+- `shared_tokens` counts reusable token positions in complete pages,
+  leaving each document's final token to compute. It is the sum of
+  the [sharing plan's `shared` list](/docs/architecture/prefix-caching#data-structure).
 - `2 * model.params` estimates floating-point operations per token.
   `device.peak_flops` is the GPU's peak operations per second.
 - `total_tokens` counts all input document tokens for the filter.
@@ -105,15 +105,7 @@ If tokenization is still running when the first plan is built, Quail
 runs the physical rules again after it finishes. Prefix matching
 needs the token sequences, not just their lengths.
 
-<Mermaid chart={`flowchart LR
-  A["Build plan with estimated lengths"] --> B["Finish tokenization"]
-  B --> C["Find shared prefixes from token sequences"]
-  C --> D["Run physical rules again"]
-  D --> E["Execute plan"]`} />
-
 `explain(verbose=True)` shows the planner's choice as `share_prefixes`.
-A filter executing with a row limit skips sharing at runtime because
-sorting documents could change which rows it returns.
 
 Implementation:
 [`sharing_pays` and `PrefixSharing`](https://github.com/fsdatalab/quail/blob/main/quail/planner/physical_rules.py).
