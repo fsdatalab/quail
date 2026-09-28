@@ -198,8 +198,10 @@ class RoundScorer:
             depth = len(node)
             row = logprobs[i, depth]
             for label, ids in enumerate(self.label_ids):
+                # a label that is another's prefix is fully read at
+                # the node that spells it and has no token to add there
                 if (self.alive[doc, label] and self.read[doc, label] == depth
-                        and ids[:depth] == node):
+                        and len(ids) > depth and ids[:depth] == node):
                     self.partial[doc, label] += row[self.column[ids[depth]]]
                     self.read[doc, label] += 1
         alive = self.alive[doc]
@@ -222,3 +224,140 @@ class RoundScorer:
             if inside.all() or not inside.any():
                 bound = np.where(alive, self.partial[doc], -np.inf)
                 self.label[doc] = int(np.argmax(bound))
+
+
+def trace_key(model_name: str, template: str, labels, label_token_ids) -> str:
+    """Return the name of one classification's trace file.
+
+    A trace holds a model's scores for one prompt and label list, so
+    the key covers the model, the prompt template, and the labels with
+    their token ids.
+    """
+    import hashlib
+    import json
+
+    text = json.dumps([model_name, template, list(labels),
+                       [list(ids) for ids in label_token_ids]])
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
+
+
+def trace_scores(label_ids, paths, targets, logprobs) -> dict:
+    """Return one document's score at every label-trie node.
+
+    The score of a node is the summed log probability of its tokens
+    after the answer cue, the partial sum an adaptive rule bounds a
+    label by; the empty node scores 0 and a full label's node scores
+    the label.
+
+    Args:
+        label_ids: One token id sequence per label.
+        paths: The proper prefix each chain holds after the answer cue.
+        targets: The token ids, one per column of ``logprobs``.
+        logprobs: Shape (paths, rows, targets), as ``label_path_scores``
+            reads it.
+    """
+    where = {}
+    for chain, path in enumerate(paths):
+        for depth in range(len(path) + 1):
+            where.setdefault(tuple(path[:depth]), (chain, depth))
+    column = {token: index for index, token in enumerate(targets)}
+    scores = {(): 0.0}
+    for ids in label_ids:
+        for depth, token in enumerate(ids):
+            node = tuple(ids[:depth + 1])
+            if node in scores:
+                continue
+            chain, row = where[tuple(ids[:depth])]
+            scores[node] = (scores[tuple(ids[:depth])]
+                            + float(logprobs[chain, row, column[token]]))
+    return scores
+
+
+def write_label_traces(path, traces) -> None:
+    """Save documents' node scores as one Parquet file.
+
+    Args:
+        path: The file to write.
+        traces: One dict per document mapping each trie node, a tuple
+            of token ids, to its score.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    documents, nodes, scores = [], [], []
+    for document, trace in enumerate(traces):
+        for node, score in trace.items():
+            documents.append(document)
+            nodes.append(list(node))
+            scores.append(score)
+    pq.write_table(pa.table({
+        "document": pa.array(documents, pa.int32()),
+        "node": pa.array(nodes, pa.list_(pa.int32())),
+        "score": pa.array(scores, pa.float32()),
+    }), path)
+
+
+def read_label_traces(path) -> list[dict]:
+    """Load the documents' node scores ``write_label_traces`` saved."""
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(path)
+    traces = {}
+    for document, node, score in zip(table.column("document").to_pylist(),
+                                     table.column("node").to_pylist(),
+                                     table.column("score").to_pylist()):
+        traces.setdefault(document, {})[tuple(node)] = score
+    return [traces[document] for document in sorted(traces)]
+
+
+def replay_rounds(label_ids, traces, search=False, demand=None) -> list:
+    """Replay an adaptive rule on saved traces; returns each document's rounds.
+
+    The rule runs on the CPU with every read answered from the trace:
+    the log probability of a token after a node is the difference of
+    the two nodes' scores. A round is the list of chain lengths the
+    document sent, the answer cue and each requested node's tokens.
+
+    Args:
+        label_ids: One token id sequence per label.
+        traces: One dict per document mapping each trie node to its
+            score, as ``trace_scores`` builds it.
+        search: Replay ``trie_search``; else ``trie_rounds``.
+        demand: Indices of the labels a filter accepts, or None.
+
+    Returns:
+        A list with one entry per document: (rounds, label index).
+
+    Raises:
+        ValueError: A trace lacks a node the rule read.
+    """
+    trie = label_trie(label_ids)
+    targets = trie_targets(trie)
+    column = {token: i for i, token in enumerate(targets)}
+    scorer = RoundScorer(label_ids, targets, len(traces), search=search,
+                         demand=demand)
+    depth = max(len(node) for node in scorer.nodes) + 1
+    replayed = []
+    for doc, trace in enumerate(traces):
+        rounds = []
+        for round in range(scorer.rounds):
+            indices = scorer.requests(doc, round)
+            if indices is None:
+                break
+            if not indices:
+                continue
+            block = np.full((len(indices), depth, len(targets)), -np.inf)
+            for i, index in enumerate(indices):
+                node = scorer.nodes[index]
+                if node not in trace:
+                    raise ValueError(f"the trace lacks node {node}")
+                for token in trie[node]:
+                    child = node + (token,)
+                    if child not in trace:
+                        raise ValueError(f"the trace lacks node {child}")
+                    block[i, len(node), column[token]] = (
+                        trace[child] - trace[node])
+            rounds.append([len(scorer.nodes[index]) + 1 for index in indices])
+            scorer.update(doc, indices, block)
+        replayed.append((rounds, int(scorer.label[doc])))
+    return replayed

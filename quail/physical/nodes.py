@@ -517,7 +517,9 @@ class ClassifySpec(ScoreSpec):
     documents whose previous label its gate accepts. ``demand`` names
     the labels a filter accepts when the label is only tested for
     membership and never projected: an adaptive rule then stops once
-    membership is decided.
+    membership is decided. ``traced_documents`` counts the saved
+    exhaustive traces the planner replayed to choose the rule; 0 when
+    it had none and chose among exhaustive rules only.
     """
 
     labels: tuple[str, ...] = ()
@@ -526,6 +528,7 @@ class ClassifySpec(ScoreSpec):
     share_prefixes: bool = False
     stages: tuple["ClassifyStage", ...] = ()
     demand: tuple[str, ...] | None = None
+    traced_documents: int = 0
 
     @property
     def chain(self) -> tuple["ClassifySpec", ...]:
@@ -550,6 +553,7 @@ class ClassifySpec(ScoreSpec):
                          for stage in value.get("stages", ())),
             demand=(None if value.get("demand") is None
                     else tuple(str(label) for label in value["demand"])),
+            traced_documents=int(value.get("traced_documents", 0)),
         )
 
     def to_dict(self) -> dict:
@@ -561,6 +565,7 @@ class ClassifySpec(ScoreSpec):
             "share_prefixes": self.share_prefixes,
             "stages": [stage.to_dict() for stage in self.stages],
             "demand": None if self.demand is None else list(self.demand),
+            "traced_documents": self.traced_documents,
         }
 
 
@@ -612,6 +617,8 @@ class AiClassify(AiScore):
                                else self.spec.share_prefixes),
             "demand": (None if self.spec is None or self.spec.demand is None
                        else list(self.spec.demand)),
+            "traced_documents": (0 if self.spec is None
+                                 else self.spec.traced_documents),
             "stages": [] if self.spec is None else [
                 {"accepted": None if stage.accepted is None
                  else list(stage.accepted), "output": stage.spec.name}

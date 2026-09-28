@@ -29,6 +29,7 @@ the partner suffixes are:
 import logging
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
 
 import numpy as np
@@ -44,13 +45,19 @@ from quail.execution.labels import (
     label_path_scores,
     label_scores,
     label_trie,
+    trace_key,
+    trace_scores,
     trie_paths,
     trie_targets,
+    write_label_traces,
 )
 from quail.execution.reranker import RerankerBatch
 from quail.execution.tokens import chain_tokens, prefix_tree
 
 logger = logging.getLogger("quail")
+
+# documents whose node scores an exhaustive run saves as its trace
+TRACE_DOCUMENTS = 512
 
 
 @dataclass(frozen=True)
@@ -270,6 +277,8 @@ class QuailClassifier:
                     if labels[index][anchor] is None:
                         labels[index][anchor] = label_of(index, logprobs)
                 suffix_tokens = len(first) * sum(map(len, request.suffixes))
+                if state.get("label_traces") and specs[index].scoring == "trie_paths":
+                    self.save_traces(specs[index], request, first, readout_rows)
             label_tokens += suffix_tokens
             # a frame equal to the stage before's is already in KV
             written = index == 0 or request.frame != requests[index - 1].frame
@@ -292,3 +301,28 @@ class QuailClassifier:
             chunks=len(spans) if state.get("gpu_timing") else 0,
             later={stage.spec.name: labels[index + 1]
                    for index, stage in enumerate(spec.stages)})
+
+    def save_traces(self, spec, request, answers, readout_rows) -> None:
+        """Save a sample of documents' node scores for the planner.
+
+        The file is named by the model, prompt, and labels; an existing
+        file is kept, so the first exhaustive run of a classification
+        writes the trace every later plan replays.
+        """
+        state = self.state
+        directory = Path(state["label_traces"])
+        path = directory / (trace_key(
+            state.get("model_name", ""), spec.query_template, spec.labels,
+            spec.label_token_ids) + ".parquet")
+        if path.exists():
+            return
+        ids = spec.label_token_ids
+        paths = trie_paths(ids)
+        traces = []
+        for anchor in sorted(answers)[:TRACE_DOCUMENTS]:
+            logprobs = answers[anchor].reshape(len(paths), readout_rows, -1)
+            traces.append(trace_scores(ids, paths, request.targets, logprobs))
+        directory.mkdir(parents=True, exist_ok=True)
+        write_label_traces(path, traces)
+        logger.info("saved %s traces of %s to %s", len(traces), spec.name, path)
+

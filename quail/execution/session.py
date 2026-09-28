@@ -259,6 +259,27 @@ class Session:
                                          turn=self.model.turn))
 
     @property
+    def label_traces(self):
+        """Return the loader of saved classification traces, or None.
+
+        The loader takes a trace key and returns the traces saved under
+        the configured directory for it, or None when there are none.
+        """
+        directory = self.config.label_traces
+        if not directory:
+            return None
+
+        def load(key):
+            path = Path(directory) / f"{key}.parquet"
+            if not path.exists():
+                return None
+            from quail.execution.labels import read_label_traces
+
+            return read_label_traces(path)
+
+        return load
+
+    @property
     def tokenizer(self):
         """Return Gigatoken's encoder, loading it when first used."""
         if self._tok is None:
@@ -671,13 +692,19 @@ class Query:
                 order=self.order,
                 label_scoring=self.session.config.label_scoring,
                 attention=self.session.config.attention,
+                label_traces=self.session.label_traces,
                 backend=self.session.config.backend,
                 registry=self.session.registry,
                 tokenizer=self.session.tokenizer,
                 pair_fractions=pair_fractions)
+            extra = {}
             if self.session.config.gpu_timing:
+                extra["gpu_timing"] = True
+            if self.session.config.label_traces:
+                extra["label_traces"] = self.session.config.label_traces
+            if extra and not isinstance(self._plan, Refusal):
                 self._plan = replace(self._plan, settings={
-                    **self._plan.settings, "gpu_timing": True})
+                    **self._plan.settings, **extra})
             self._planning_finished_at = time.perf_counter()
         return self._plan
 
@@ -780,6 +807,7 @@ class Query:
                 gpus=self.session.config.gpus, order=self.order,
                 label_scoring=self.session.config.label_scoring,
                 attention=self.session.config.attention,
+                label_traces=self.session.label_traces,
                 backend=self.session.config.backend,
                 registry=self.session.registry,
                 tokenizer=self.session.tokenizer)

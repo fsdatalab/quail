@@ -679,20 +679,133 @@ def test_planner_demands_membership_for_filter_only_labels(session):
     encoded = encode_graph(plan.graph, session.registry.codecs)
     assert decode_graph(encoded, session.registry.codecs) == plan.graph
 
-    # the cost model: many long labels on short documents favor the
-    # search; one-token labels on long documents favor trie paths
+    # without traces the planner has only the exhaustive rule; with
+    # traces whose first label wins outright, the search reads one
+    # chain per document and the simulation prefers it
     from quail.cost import budgets
 
     chunk = budgets.chunk_budget(QWEN3_4B_FP8, H100_SXM)
-    table = _Table(alias="d", mean=200.0, longest=300, budget=chunk,
-                   chunk=chunk, scoring=None, backend_name="quail",
-                   model=QWEN3_4B_FP8, device=H100_SXM, tokenizer=_bytes)
+    capacity = budgets.arena_tokens(QWEN3_4B_FP8, H100_SXM, chunk)
     long_labels = tuple(tuple(range(100 + 5 * i, 104 + 5 * i))
                         for i in range(30))
-    assert table.choose(1000, 20, 30, long_labels, False) == "trie_search"
-    short_labels = ((1,), (2,), (3,))
-    long_documents = _Table(**{**table.__dict__, "mean": 3000.0})
-    assert long_documents.choose(1000, 20, 30, short_labels, False) == "trie_paths"
+    table = _Table(alias="d", mean=200.0, longest=300, budget=chunk,
+                   chunk=chunk, scoring=None, backend_name="quail",
+                   model=QWEN3_4B_FP8, device=H100_SXM, tokenizer=_bytes,
+                   capacity=capacity, lengths=(200,) * 1000)
+    scoring, simulated = table.choose(1000, 20, 30, long_labels, False)
+    assert scoring == "trie_paths"
+    assert simulated.rounds == 1
+    assert simulated.label_tokens == 1000 * sum(
+        1 + len(path) for path in trie_paths(long_labels))
+    trace = _winning_trace(long_labels, winner=0)
+    scoring, pruned = table.choose(1000, 20, 30, long_labels, False,
+                                   traces=[trace])
+    assert scoring == "trie_search"
+    assert pruned.label_tokens < simulated.label_tokens / 5
+    assert pruned.seconds < simulated.seconds
+    # a forced rule is the one candidate, priced at its worst case
+    forced = _Table(**{**table.__dict__, "scoring": "trie_rounds"})
+    scoring, worst = forced.choose(1000, 20, 30, long_labels, False)
+    assert scoring == "trie_rounds"
+    assert worst.rounds == 4
+
+
+def _winning_trace(label_ids, winner, gap=5.0):
+    """Node scores where every token of ``winner`` is far likelier."""
+    trace = {(): 0.0}
+    for index, ids in enumerate(label_ids):
+        for depth in range(len(ids)):
+            node = tuple(ids[:depth + 1])
+            step = -0.1 if index == winner else -gap
+            trace.setdefault(node, trace[tuple(ids[:depth])] + step)
+    return trace
+
+
+def _random_trace(label_ids, rng):
+    """Node scores from random next-token probabilities over the trie."""
+    trie = label_trie(label_ids)
+    trace = {(): 0.0}
+    for node in sorted(trie, key=len):
+        children = trie[node]
+        probabilities = rng.dirichlet(np.ones(len(children) + 1))[:-1]
+        for token, probability in zip(children, probabilities):
+            trace[node + (token,)] = trace[node] + float(np.log(probability))
+    return trace
+
+
+def test_replayed_rules_return_the_trace_winner():
+    from quail.execution.labels import replay_rounds
+
+    rng = np.random.default_rng(7)
+    labels = ((1, 2, 3), (1, 2, 4), (1, 5), (6, 7, 8), (6, 7), (9,))
+    traces = [_random_trace(labels, rng) for _ in range(200)]
+    winners = [best_label([trace[tuple(ids)] for ids in labels])
+               for trace in traces]
+    exhaustive = sum(1 + len(path) for path in trie_paths(labels))
+    # a chain per node repeats the prefixes the exhaustive paths share
+    every_node = sum(1 + len(node) for node in label_trie(labels))
+    for search in (False, True):
+        replayed = replay_rounds(labels, traces, search=search)
+        assert [label for _, label in replayed] == winners
+        tokens = [sum(map(sum, rounds)) for rounds, _ in replayed]
+        assert max(tokens) <= every_node
+        assert min(tokens) < exhaustive
+    # membership demand stops once the decision is known
+    accepted = [0, 1]
+    replayed = replay_rounds(labels, traces, search=True, demand=accepted)
+    assert [label in accepted for _, label in replayed] == [
+        winner in accepted for winner in winners]
+    assert (sum(sum(map(sum, rounds)) for rounds, _ in replayed)
+            <= sum(sum(map(sum, rounds))
+                   for rounds, _ in replay_rounds(labels, traces, search=True)))
+
+
+def test_trace_scores_and_files_round_trip(tmp_path):
+    from quail.execution.labels import (
+        read_label_traces,
+        trace_key,
+        trace_scores,
+        write_label_traces,
+    )
+
+    labels = ((1, 2), (1, 3), (4,))
+    paths = trie_paths(labels)
+    targets = sorted({token for ids in labels for token in ids})
+    logprobs = np.full((len(paths), 2, len(targets)), -9.0)
+    logprobs[0, 0, targets.index(1)] = -1.0
+    logprobs[0, 0, targets.index(4)] = -2.0
+    logprobs[0, 1, targets.index(2)] = -0.5
+    logprobs[0, 1, targets.index(3)] = -3.0
+    trace = trace_scores(labels, paths, targets, logprobs)
+    assert trace == {(): 0.0, (1,): -1.0, (4,): -2.0, (1, 2): -1.5, (1, 3): -4.0}
+    path = tmp_path / "t.parquet"
+    write_label_traces(path, [trace, trace])
+    assert read_label_traces(path) == [trace, trace]
+    assert trace_key("m", "t {0}", ("a", "b"), labels[:2]) != trace_key(
+        "m", "t {0}", ("a", "b"), labels[1:])
+
+
+def test_simulation_counts_passes_from_the_chunk_budget_and_rounds():
+    from quail.planner.classify import READOUT_LAG_CHUNKS, simulate
+
+    # three documents of 100 tokens, a chunk of 250: two chunks for
+    # the documents, then the second round of each document after the
+    # readout lag
+    prefixes = [100, 100, 100]
+    rounds = [[[3], [2]], [[3], [2]], [[3]]]
+    result = simulate(prefixes, 10, rounds, chunk=250, capacity=10_000,
+                      model=QWEN3_4B_FP8, device=H100_SXM)
+    assert result.passes == 3
+    assert result.rounds == 2
+    assert result.label_tokens == 3 * 3 + 2 * 2
+    assert result.work.tokens == 3 * 110 + 9 + 4
+    assert result.seconds > 0
+    # a full arena admits documents as earlier ones finish
+    tight = simulate(prefixes, 10, rounds, chunk=250, capacity=120,
+                     model=QWEN3_4B_FP8, device=H100_SXM)
+    assert tight.passes == 5
+    assert tight.seconds > result.seconds
+    assert READOUT_LAG_CHUNKS == 2
 
 
 def test_chained_classifications_share_one_node(session):

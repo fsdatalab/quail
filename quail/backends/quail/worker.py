@@ -335,6 +335,7 @@ def execute_single(state, payload: dict, registry, graph) -> dict:
         "device": registry.device(payload["physical_plan"]["device"]),
         "chunk_tokens": payload["chunk_tokens"],
         "gpu_timing": payload.get("gpu_timing", False),
+        "label_traces": payload.get("label_traces"),
     }
     return execute_single_graph(runtime_state, payload, graph)
 

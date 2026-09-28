@@ -917,7 +917,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                order: str | None = None, backend: str = "quail",
                registry=None, tokenizer=None, pair_fractions=None,
                label_scoring: str | None = None,
-               attention: str | None = None):
+               attention: str | None = None, label_traces=None):
     """Plan one query with the selected model backend.
 
     Args:
@@ -933,6 +933,9 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
             every classification; None lets the planner choose.
         attention: An attention path, "tree" or "unified", forced for
             every filter and join; None lets the planner choose.
+        label_traces: Callable(trace key) -> saved exhaustive traces of
+            a classification, or None; the planner replays the
+            adaptive rules on them.
         registry: Optional session extension registry.
         tokenizer: Optional callable (text -> token list) handed to the
             planning context.
@@ -975,6 +978,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         attention=attention,
         tokenizer=tokenizer,
         pair_fractions=dict(pair_fractions or {}),
+        label_traces=label_traces,
     )
     region = ModelRegion(plan)
     candidates = tuple(selected.plan(region, context))
@@ -1007,7 +1011,7 @@ def refine_plan(plan, *, model: ModelSpec, device: DeviceSpec,
                 registry=None, order: str | None = None,
                 tokenizer=None, pair_fractions=None,
                 label_scoring: str | None = None,
-                attention: str | None = None):
+                attention: str | None = None, label_traces=None):
     """Run the physical rules again over a plan once its inputs are exact.
 
     A plan made on estimated document lengths never saw the token
@@ -1031,6 +1035,7 @@ def refine_plan(plan, *, model: ModelSpec, device: DeviceSpec,
         attention=attention,
         tokenizer=tokenizer,
         pair_fractions=dict(pair_fractions or {}),
+        label_traces=label_traces,
     )
     return _apply_rules(plan, registry, context,
                         " once the documents were tokenized")

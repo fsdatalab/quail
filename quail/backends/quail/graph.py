@@ -218,7 +218,8 @@ def prepare_model_inputs(node, inputs, context: ExecutionContext):
     """Prepare Quail scheduler inputs from typed port values."""
     if isinstance(node, AiScore):
         return {"score_inputs": inputs, "documents": context.state["docs"],
-                "gpu_timing": context.state.get("gpu_timing", False)}
+                "gpu_timing": context.state.get("gpu_timing", False),
+                "label_traces": context.state.get("label_traces")}
     if not isinstance(node, (AiFilter, AiJoin)):
         return inputs
     return {

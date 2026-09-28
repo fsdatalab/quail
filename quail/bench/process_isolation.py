@@ -38,6 +38,7 @@ def run_backend_group(
     label_scoring: str | None = None,
     attention: str | None = None,
     gpu_timing: bool = False,
+    label_traces: str | None = None,
 ) -> dict:
     """Run backend methods while sharing one loaded model when possible."""
     from quail import EngineConfig
@@ -66,6 +67,7 @@ def run_backend_group(
                 label_scoring=label_scoring,
                 attention=attention,
                 gpu_timing=gpu_timing,
+                label_traces=label_traces,
             ),
             data_dir=Path(data_dir) / f"sf{sf}",
             ground_truth_collection=ground_truth_collection or None,

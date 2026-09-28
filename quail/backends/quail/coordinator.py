@@ -22,6 +22,7 @@ def _common_payload(payload: dict) -> dict:
         "filter_limit": payload.get("filter_limit"),
         "retention": payload.get("retention", {}),
         "gpu_timing": payload.get("gpu_timing", False),
+        "label_traces": payload.get("label_traces"),
     }
 
 

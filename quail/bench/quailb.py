@@ -424,6 +424,9 @@ def main():
                         help="force one attention path for filters and joins")
     parser.add_argument("--gpu-timing", action="store_true",
                         help="record GPU seconds per model node")
+    parser.add_argument("--label-traces",
+                        help="directory of saved classification traces the "
+                             "planner replays; an exhaustive run fills it")
     args = parser.parse_args()
     run_suite(
         [value.strip() for value in args.only.split(",")] if args.only else None,
@@ -436,6 +439,7 @@ def main():
             label_scoring=args.label_scoring,
             attention=args.attention,
             gpu_timing=args.gpu_timing,
+            label_traces=args.label_traces,
         ),
         data_dir=args.data_dir,
         ground_truth_collection=args.ground_truth_collection,

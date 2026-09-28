@@ -49,6 +49,10 @@ class PlanningContext:
     # the planner choose per node
     attention: str | None = None
     tokenizer: Callable[[str], Any] | None = None
+    # saved exhaustive classification traces by trace key, for the
+    # planner to replay the adaptive rules on; None when the session
+    # keeps none
+    label_traces: Callable[[str], Any] | None = None
     # join written position -> its equality pairs as a fraction of
     # the cross product; joins without conditions are absent
     pair_fractions: Mapping[int, float] = field(default_factory=dict)
