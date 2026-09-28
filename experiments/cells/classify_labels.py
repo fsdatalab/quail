@@ -493,11 +493,12 @@ def copy_labels(sf: float, spec: PredicateSpec, source: dict) -> dict:
 def check_collection(sf: float, collection_id: str) -> dict:
     """Load each classification query's labels and count its reference rows."""
     import quail_b as benchmark
-    from quail_b.queries import pending_query_ids
+    from quail_b.queries import queries
     from quail_b.scoring import expected_rows
 
     counts = {}
-    for query_id in pending_query_ids():
+    for query_id in (query_id for query_id, spec in queries().items()
+                     if spec._info.classifies):
         suite = benchmark.load_benchmark(
             [query_id], scale_factor=sf, collection_id=collection_id,
             root="/results")

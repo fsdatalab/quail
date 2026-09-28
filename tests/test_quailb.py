@@ -88,7 +88,9 @@ def test_all_queries_compile_and_plan(tmp_path, backend):
         "PRIV-1", "PRIV-2",
     }
     assert set(qdefs) == expected
-    assert set(QUERY_ORDER) == expected - {"PRIV-1", "PRIV-2"}
+    classify = {*(f"IMDB-{i}" for i in range(11, 15)), "BIO-5", "BIO-6",
+                "FEV-11", "LEP-6", "AGENT-3", "AGENT-4"}
+    assert set(QUERY_ORDER) == (expected | classify) - {"PRIV-1", "PRIV-2"}
     for qid, (_, build) in qdefs.items():
         query = build()
         operators = query.logical.operators()
