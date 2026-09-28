@@ -364,7 +364,7 @@ class JoinAdmission:
     def partner_indices(self, a, j, start, end):
         """Indices into stage j's partner list for one launched group."""
         lst = self._lists[a][j]
-        return list(range(start, end)) if lst is None else list(lst[start:end])
+        return range(start, end) if lst is None else lst[start:end]
 
     def _register(self, prefix, resident_pages, partners):
         """Record one anchor's costs; returns its index."""

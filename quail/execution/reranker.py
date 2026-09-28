@@ -118,6 +118,8 @@ class RerankerBatch:
     cached_tokens: int
     label_tokens: int = 0
     borrowed_tokens: int = 0
+    # host seconds spent building forward chunks
+    pack_s: float = 0.0
     # a classify chain's later stages: output name -> one label per
     # row, None for a row its gate stopped
     later: Mapping[str, Any] = field(default_factory=dict)
@@ -286,6 +288,7 @@ def score_in_batches(node, inputs, score_batches, shards: int = 1,
     metrics = NodeMetrics()
     label_tokens = 0
     borrowed = 0
+    pack_s = 0.0
     if batch_rows is None:
         batch_rows = max(1, len(rows))
     streams = [_batches_with_positions(part, batch_rows) for part in parts]
@@ -306,6 +309,7 @@ def score_in_batches(node, inputs, score_batches, shards: int = 1,
             label_tokens += result.metrics.extension.get("label_tokens", 0)
             borrowed += result.metrics.extension.get(
                 "borrowed_prefix_tokens", 0)
+            pack_s += result.metrics.extension.get("pack_s", 0.0)
             sink = answer_sink()
             if sink is not None and len(batch):
                 sink(scored_batch(node, batch, result.outputs["scores"]))
@@ -319,7 +323,8 @@ def score_in_batches(node, inputs, score_batches, shards: int = 1,
         extension={"output": node.spec.name, "aliases": list(node.spec.aliases),
                    "input_rows": len(rows),
                    **({"label_tokens": label_tokens,
-                       "borrowed_prefix_tokens": borrowed}
+                       "borrowed_prefix_tokens": borrowed,
+                       "pack_s": round(pack_s, 3)}
                       if isinstance(node.spec, ClassifySpec) else {})},
     ))
 
@@ -387,7 +392,8 @@ class RerankerModelExecution:
                     "aliases": list(spec.aliases),
                     "input_rows": count,
                     **({"label_tokens": batch.label_tokens,
-                        "borrowed_prefix_tokens": batch.borrowed_tokens}
+                        "borrowed_prefix_tokens": batch.borrowed_tokens,
+                        "pack_s": batch.pack_s}
                        if isinstance(spec, ClassifySpec) else {}),
                 },
             ),

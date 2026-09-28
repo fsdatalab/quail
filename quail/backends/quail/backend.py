@@ -161,13 +161,14 @@ class QuailModelExecution:
                 document_done=inputs.get("document_done"),
                 prefix_tree=tree,
                 attention_mode=node.attention or None,
-                stats=stats,
+                stats=stats, staging=_staging(self._state),
             )
             return filter_result(
                 node, answers, tokens, document_ids,
                 gpu_s=_gpu_seconds(torch, spans, inputs),
                 chunks=_chunks(spans, inputs),
-                borrowed_tokens=stats.get("borrowed_tokens", 0))
+                borrowed_tokens=stats.get("borrowed_tokens", 0),
+                pack_s=stats.get("pack_s", 0.0))
 
         stage_frames = inputs["stage_frames"]
         stream = inputs.get("anchor_stream")
@@ -231,7 +232,8 @@ class QuailModelExecution:
             torch, arena, pipeline, stages, prefixes, chunk_tokens,
             anchor_keys=anchor_keys, on_settled=on_settled,
             attention_mode=attention, prefix_tree=tree, stats=join_stats,
-            on_chunk=on_chunk, label=f"join ({len(join_stages)} stages)")
+            on_chunk=on_chunk, label=f"join ({len(join_stages)} stages)",
+            staging=_staging(self._state))
         answers = every[leading:]
         if stream is not None:
             filter_answers = {}
@@ -260,6 +262,7 @@ class QuailModelExecution:
                 gpu_s=_gpu_seconds(torch, filter_spans, inputs),
                 chunks=_chunks(filter_spans, inputs),
                 borrowed_tokens=join_stats.get("borrowed_tokens", 0),
+                pack_s=join_stats.get("pack_s", 0.0),
             ))
             join_stats = {}
             spans = [span for span in spans if span[0] >= leading]
@@ -314,9 +317,19 @@ class QuailModelExecution:
                     "answers": answers,
                     **({"borrowed_prefix_tokens": join_stats["borrowed_tokens"]}
                        if join_stats.get("borrowed_tokens") else {}),
+                    **({"pack_s": round(join_stats["pack_s"], 3)}
+                       if join_stats.get("pack_s") else {}),
                 },
             ),
         )
+
+
+def _staging(state):
+    """The node's reusable input transfer buffers."""
+    if "input_staging" not in state:
+        state["input_staging"] = loop.InputStaging(state["torch"])
+    state["input_staging"].fixed_tokens.clear()
+    return state["input_staging"]
 
 
 def _streamed_tokens(join_stages, answers, lists_for, anchor_keys) -> int:

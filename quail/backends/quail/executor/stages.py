@@ -14,6 +14,7 @@ chunk mixes documents at different stages, and a document's pages
 go free as soon as a decision drops it or its last stage answers.
 """
 
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -140,7 +141,8 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
         attention_mode: "tree" or "unified" as the plan chose; None
             and a model without tree attention run unified.
         prefix_tree: A PrefixTree over anchor_prefixes, or None.
-        stats: When given, receives borrowed_tokens.
+        stats: When given, receives borrowed_tokens and pack_s, the
+            host seconds spent building chunks.
         limit: Stop admitting documents once this many survived the
             last stage; the rest never run.
         paged: Whether documents' KV is written to arena pages. False
@@ -163,6 +165,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
     """
     from quail.backends.quail.executor.loop import (
         ArenaFullError,
+        Suffixes,
         _forward,
         attention_path,
         borrow_check,
@@ -182,8 +185,9 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
     if len(keys) != len(prefixes):
         raise ValueError("anchor_keys must match anchor_prefixes")
     frames = [list(stage.frame) for stage in stages]
+    frame_ids = [np.asarray(frame, dtype=np.int64) for frame in frames]
     writes = frame_writes(stages)
-    stage_suffixes = [stage.suffixes for stage in stages]
+    suffixes = [Suffixes.of(stage.suffixes) for stage in stages]
     # a stage's suffixes read their document: tree unless the plan says
     mode = attention_path(pipeline, attention_mode, default=default_attention)
     canvas = tuple(pipeline.canvas_ids)
@@ -191,9 +195,10 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
 
     def entry_rows(a, j, start, end, carried):
         f = len(prefixes[a])
-        sufs = [stage_suffixes[j][i]
-                for i in sched.partner_indices(a, j, start, end)]
-        rows = (f if carried else 0) + sum(len(s) + len(canvas) for s in sufs)
+        lengths = suffixes[j].lengths_at(
+            sched.partner_indices(a, j, start, end))
+        rows = ((f if carried else 0) + int(lengths.sum())
+                + len(canvas) * len(lengths))
         if writes[j] and start == 0:
             rows += len(frames[j]) + len(canvas)
         return rows
@@ -250,7 +255,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
 
     sched = JoinAdmission(
         [len(p) for p in prefixes],
-        [[len(s) for s in sufs] for sufs in stage_suffixes],
+        [s.lengths.tolist() for s in suffixes],
         budget,
         arena.n_pages if paged else 1 << 62,
         arena.page_tokens,
@@ -276,6 +281,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
     held = [keys[a] for a, n in enumerate(borrowers) if n]
     spans = []
     tokens = 0
+    pack_s = 0.0
     outstanding = []     # (groups, entries, handles) in launch order
     if label is None:
         label = " > ".join(stage.label or f"stage {j}"
@@ -315,10 +321,9 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
             prefix = None
             if carried:
                 prefix = prefixes[a][shared:] if shared else prefixes[a]
-            sufs = [stage_suffixes[j][i]
-                    for i in sched.partner_indices(a, j, start, end)]
+            sufs = suffixes[j].take(sched.partner_indices(a, j, start, end))
             read_all = stages[j].read_all_rows
-            rows = sum(map(len, sufs)) if read_all else len(sufs)
+            rows = int(sufs.lengths.sum()) if read_all else len(sufs)
             # under tree attention a borrowing document with one
             # suffix reads its parent's pages stacked with its siblings
             read_key = keys[parent] if shared and stages[j].single else None
@@ -327,14 +332,16 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                 # frame's rows are scattered into KV after the document
                 specs.append(dict(
                     key=key, prefix=prefix, start=shared, read_key=read_key,
-                    f=f, suffixes=[frame + list(sufs[0])],
+                    f=f, suffixes=Suffixes(
+                        np.concatenate([frame_ids[j], sufs.ids]),
+                        [len(frame) + int(sufs.lengths[0])]),
                     write_suffix_tokens=len(frame)))
             elif writes[j] and start == 0:
                 # frame entry: scatter the frame into KV after the
                 # document rows; its own answer row means nothing
                 specs.append(dict(
                     key=key, prefix=prefix, start=shared, read_key=read_key,
-                    f=f, suffixes=[frame],
+                    f=f, suffixes=Suffixes(frame_ids[j], [len(frame)]),
                     write_suffix_tokens=len(frame)))
                 entries.append((j, 1))
                 specs.append(dict(
@@ -461,8 +468,10 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
             run_part(part[half:])
 
     def run_one(part):
-        nonlocal tokens
+        nonlocal tokens, pack_s
+        started = time.perf_counter()
         chunk, entries = build(part)
+        pack_s += time.perf_counter() - started
         tokens += chunk.tokens
         e0 = torch.cuda.Event(enable_timing=True)
         e1 = torch.cuda.Event(enable_timing=True)
@@ -517,5 +526,6 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
     arena.drop_holds(held)
     if stats is not None:
         stats["borrowed_tokens"] = borrowing.borrowed_tokens
+        stats["pack_s"] = pack_s
     return sched.answers, spans, tokens
 

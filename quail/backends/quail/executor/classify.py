@@ -206,6 +206,7 @@ class QuailClassifier:
             labels[0], fresh_tokens=fresh, cached_tokens=total - fresh,
             label_tokens=label_tokens,
             borrowed_tokens=stats.get("borrowed_tokens", 0),
+            pack_s=stats.get("pack_s", 0.0),
             gpu_s=gpu_s,
             chunks=len(spans) if state.get("gpu_timing") else 0,
             later={stage.spec.name: labels[index + 1]

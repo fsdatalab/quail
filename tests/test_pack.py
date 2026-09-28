@@ -79,7 +79,7 @@ def _check_join_invariants(sched, chunks, events, truth, prefix,
             seen.add(a)
             assert end > start
             partners = sched.partner_indices(a, j, start, end)
-            assert partners == indices(a, j)[start:end]
+            assert list(partners) == indices(a, j)[start:end]
             tokens += (prefix[a] if carried else 0) \
                 + (frames[j] if start == 0 else 0) \
                 + sum(stages[j][i] for i in partners)

@@ -56,6 +56,76 @@ def _token_parts(sequence):
         yield from _token_parts(part)
 
 
+def _int64(part):
+    """One token part as an int64 array, without a copy where possible."""
+    if hasattr(part, "arrow_array"):
+        part = part.arrow_array.to_numpy(zero_copy_only=False)
+    elif hasattr(part, "numpy") and not isinstance(part, np.ndarray):
+        part = part.numpy()
+    return np.asarray(part, dtype=np.int64)
+
+
+class Suffixes:
+    """A group's suffix token lists as one flat array plus lengths.
+
+    Attributes:
+        ids: Every suffix's tokens back to back.
+        lengths: Tokens per suffix.
+        offsets: Where each suffix starts in ids, with a final entry
+            equal to the total.
+    """
+
+    __slots__ = ("ids", "lengths", "offsets")
+
+    def __init__(self, ids, lengths):
+        self.ids = np.asarray(ids, dtype=np.int64)
+        self.lengths = np.asarray(lengths, dtype=np.int64)
+        self.offsets = np.zeros(len(self.lengths) + 1, dtype=np.int64)
+        np.cumsum(self.lengths, out=self.offsets[1:])
+        if self.offsets[-1] != len(self.ids):
+            raise ValueError(
+                f"{len(self.ids)} suffix tokens for lengths summing to "
+                f"{self.offsets[-1]}")
+
+    @classmethod
+    def of(cls, sequences):
+        """Flatten token sequences, each possibly made of parts."""
+        lengths = [len(sequence) for sequence in sequences]
+        arrays = [_int64(part) for sequence in sequences
+                  for part in _token_parts(sequence) if len(part)]
+        ids = np.concatenate(arrays) if arrays else np.empty(0, dtype=np.int64)
+        return cls(ids, lengths)
+
+    def __len__(self):
+        return len(self.lengths)
+
+    def __iter__(self):
+        bounds = self.offsets.tolist()
+        for start, end in zip(bounds, bounds[1:]):
+            yield self.ids[start:end]
+
+    def lengths_at(self, indices):
+        """Tokens per suffix at these indices, in that order."""
+        if isinstance(indices, range) and indices.step == 1:
+            return self.lengths[indices.start:indices.stop]
+        return self.lengths[np.asarray(indices, dtype=np.int64)]
+
+    def take(self, indices):
+        """The suffixes at these indices, in that order."""
+        if isinstance(indices, range) and indices.step == 1:
+            return Suffixes(
+                self.ids[self.offsets[indices.start]:self.offsets[indices.stop]],
+                self.lengths[indices.start:indices.stop])
+        index = np.asarray(indices, dtype=np.int64)
+        lengths = self.lengths[index]
+        total = int(lengths.sum())
+        # each suffix's rows read from its start in ids
+        starts = np.cumsum(lengths) - lengths
+        rows = (np.repeat(self.offsets[index] - starts, lengths)
+                + np.arange(total, dtype=np.int64))
+        return Suffixes(self.ids[rows], lengths)
+
+
 class InputStaging:
     """Reuse CPU and GPU input buffers on the current CUDA stream."""
 
@@ -106,19 +176,9 @@ def _staged_token_parts(torch, sequences, total, pinned=True, staging=None):
     """
     host = (torch.empty(total, dtype=torch.int64, pin_memory=pinned)
             if staging is None else staging.host("tokens", total, torch.int64))
-    arrays = []
-    for sequence in sequences:
-        for part in _token_parts(sequence):
-            if not len(part):
-                continue
-            if hasattr(part, "arrow_array"):
-                arrays.append(part.arrow_array.to_numpy(zero_copy_only=False))
-            elif torch.is_tensor(part):
-                arrays.append(part.numpy())
-            else:
-                arrays.append(np.asarray(part, dtype=np.int64))
-    ids = (np.concatenate(arrays).astype(np.int64, copy=False) if arrays
-           else np.empty(0, dtype=np.int64))
+    arrays = [_int64(part) for sequence in sequences
+              for part in _token_parts(sequence) if len(part)]
+    ids = np.concatenate(arrays) if arrays else np.empty(0, dtype=np.int64)
     if len(ids) != total:
         raise AssertionError(
             f"packed {len(ids)} token ids into a {total}-token chunk")
@@ -269,10 +329,12 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     # unified scatters every fresh row through its own src/dst map, so
     # the reads and kv_writes bookkeeping below is tree only
     tree_path = attention_mode == "tree"
-    canvas_rows = []      # (first row, end row) per canvas
+    canvas_ids = np.asarray(canvas, dtype=np.int64)
+    canvas_starts = []    # per group, the first row of each canvas
     canvas_seq = []       # its sequence in the unified paged call
     id_parts, token_count = [], 0
-    pos, cu_a, finals = [], [0], []
+    pos, finals = [], []
+    cu_a = [np.zeros(1, dtype=np.int64)]
     rows_per_answer = []
     multi_row = False
     # rows that read resident KV in call B: a borrowing document's
@@ -291,16 +353,20 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         start = g.get("start", 0)
         paged = arena.is_resident(key)
         row0 = token_count
+        sufs = g["suffixes"]
+        if not isinstance(sufs, Suffixes):
+            sufs = Suffixes.of(sufs)
+        n = len(sufs)
         # a borrowing fresh group under tree attention reads the pages
         # before start in call B. With one suffix and a read_key the
         # group is one causal segment that reads the parent, stacked
         # with its siblings; otherwise the prefix is its own segment
         # reading the key's borrowed pages
         borrowing = fresh and start and tree_path
-        stacked = (borrowing and len(g["suffixes"]) == 1
-                   and g.get("read_key") is not None)
+        stacked = borrowing and n == 1 and g.get("read_key") is not None
+        prefix_len = 0
         if fresh:
-            if not paged and len(g["suffixes"]) > 1:
+            if not paged and n > 1:
                 raise ValueError(
                     f"group {key!r}: an unpaged fresh group packs "
                     f"[prefix | suffix] as one causal segment, which "
@@ -309,67 +375,71 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             if start and not paged:
                 raise ValueError(
                     f"group {key!r}: a borrowed prefix needs arena pages")
+            prefix_len = len(g["prefix"])
             id_parts.append(g["prefix"])
-            token_count += len(g["prefix"])
-            pos.append(np.arange(start, start + len(g["prefix"]),
-                                 dtype=np.int64))
-            if (paged or not g["suffixes"]) and not stacked:
-                cu_a.append(token_count)
+            token_count += prefix_len
+            pos.append(np.arange(start, start + prefix_len, dtype=np.int64))
+            if (paged or not n) and not stacked:
+                cu_a.append(np.array([token_count], dtype=np.int64))
             if borrowing and not stacked:
-                reader_rows.extend(range(row0, token_count))
-                cu_q.append(cu_q[-1] + token_count - row0)
+                reader_rows.append(np.arange(row0, token_count, dtype=np.int64))
+                cu_q.append(cu_q[-1] + prefix_len)
                 read_keys.append(key)
                 read_used.append(start)
-                max_q = max(max_q, token_count - row0)
+                max_q = max(max_q, prefix_len)
             if paged and tree_path:
-                kv_writes.append((key, row0, row0 + len(g["prefix"]),
-                                  start))
+                kv_writes.append((key, row0, token_count, start))
                 fresh_keys.append(key)
         prefix_end = token_count
         s_row0 = token_count
-        suffix_spans = []
         read_all = bool(g.get("read_all_rows"))
         if read_all and canvas:
             raise ValueError("a canvas answer is read at one row")
-        for si, suf in enumerate(g["suffixes"]):
-            srow = token_count
-            id_parts.append(suf)
-            token_count += len(suf)
-            pos.append(np.arange(f, f + len(suf), dtype=np.int64))
-            if canvas:
-                # the canvas continues the suffix's positions; its
-                # first row carries the answer
-                first = f + len(suf)
-                id_parts.append(canvas)
-                pos.append(np.arange(first, first + len(canvas),
-                                     dtype=np.int64))
-                canvas_rows.append((token_count, token_count + len(canvas)))
-                finals.append(token_count + answer_row)
-                token_count += len(canvas)
-                rows_per_answer.append(1)
-            elif read_all:
-                finals.extend(range(srow, token_count))
-                rows_per_answer.append(token_count - srow)
+        # every suffix's rows at once: positions restart at f for each
+        # suffix, and a canvas continues its suffix's positions
+        widths = sufs.lengths + len(canvas)
+        total = int(widths.sum())
+        ends = np.cumsum(widths)
+        begins = ends - widths
+        within = np.arange(total, dtype=np.int64) - np.repeat(begins, widths)
+        if n and canvas:
+            # row answer_row of each canvas carries the answer
+            past = within - np.repeat(sufs.lengths, widths)
+            source = np.where(
+                past >= 0, len(sufs.ids) + past,
+                np.repeat(sufs.offsets[:-1], widths) + within)
+            id_parts.append(np.concatenate([sufs.ids, canvas_ids])[source])
+            first = s_row0 + begins + sufs.lengths
+            canvas_starts.append(first)
+            finals.append(first + answer_row)
+            rows_per_answer.append(np.ones(n, dtype=np.int64))
+        elif n:
+            id_parts.append(sufs.ids)
+            if read_all:
+                finals.append(np.arange(s_row0, s_row0 + total, dtype=np.int64))
+                rows_per_answer.append(sufs.lengths)
                 multi_row = True
             else:
-                finals.append(token_count - 1)
-                rows_per_answer.append(1)
-            suffix_spans.append((srow, token_count))
-            cu_a.append(token_count)
+                finals.append(s_row0 + ends - 1)
+                rows_per_answer.append(np.ones(n, dtype=np.int64))
+        if n:
+            pos.append(f + within)
+            cu_a.append(s_row0 + ends)
+            token_count += total
             wst = g.get("write_suffix_tokens", 0)
-            if si == 0 and wst and paged and tree_path:
+            if wst and paged and tree_path:
                 # the shared question preamble joins the kept KV right
                 # after the document rows: after the fresh prefix, or
                 # after a kept document's f rows
-                dest = start + len(g["prefix"]) if fresh else f
-                kv_writes.append((key, srow, srow + wst, dest))
+                dest = start + prefix_len if fresh else f
+                kv_writes.append((key, s_row0, s_row0 + wst, dest))
         s_count = token_count - s_row0
-        layout.append((key, len(g["suffixes"])))
+        layout.append((key, n))
         if stacked:
             # every row of the group reads the parent's pages up to
             # start; siblings packed back to back share that read
             count = token_count - row0
-            reader_rows.extend(range(row0, token_count))
+            reader_rows.append(np.arange(row0, token_count, dtype=np.int64))
             read_key = g["read_key"]
             if read_keys and read_keys[-1] == read_key \
                     and read_used[-1] == start:
@@ -381,7 +451,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 read_used.append(start)
                 max_q = max(max_q, count)
         elif s_count and f and paged and tree_path:
-            reader_rows.extend(range(s_row0, token_count))
+            reader_rows.append(np.arange(s_row0, token_count, dtype=np.int64))
             cu_q.append(cu_q[-1] + s_count)
             read_keys.append(key)
             read_used.append(f)
@@ -391,30 +461,29 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 unified_groups.append(dict(
                     key=key, fresh=fresh, f=f, row0=row0, start=start,
                     prefix_end=prefix_end, row1=token_count,
-                    suffix_spans=suffix_spans))
+                    suffix_spans=(s_row0 + begins, s_row0 + ends)))
             elif not fresh:
                 raise ValueError(
                     "unified attention requires pages for a kept "
                     "group - an unpaged kept group has no KV to read")
+    cu_a = np.concatenate(cu_a)
 
     t = _tick(timing, "pack_py", t)
     reads = None
     if read_keys:
         table, _ = arena.block_table(read_keys)
         t = _tick(timing, "pack_blocktable", t)
-        used = _staged(torch, read_used, torch.int32, pinned)
-        reads = dict(
-            rows=_staged(torch, reader_rows, torch.int64, pinned),
-            cu_q=stage("unified_cu_q", cu_q, torch.int32),
-            max_q=max_q, used=used,
-            max_used=max(read_used), table=table)
+        rows = np.concatenate(reader_rows)
         # row -> its index in call B's output, -1 for rows that read
         # nothing resident; the fused merge kernel's map
-        source = [-1] * token_count
-        for i, row in enumerate(reader_rows):
-            source[row] = i
-        reads["source"] = _staged(
-            torch, source, torch.int32, pinned)
+        source = np.full(token_count, -1, dtype=np.int32)
+        source[rows] = np.arange(len(rows), dtype=np.int32)
+        reads = dict(
+            rows=_staged(torch, rows, torch.int64, pinned),
+            cu_q=stage("unified_cu_q", cu_q, torch.int32),
+            max_q=max_q, used=_staged(torch, read_used, torch.int32, pinned),
+            max_used=max(read_used), table=table,
+            source=_staged(torch, source, torch.int32, pinned))
     t = _tick(timing, "pack_reads", t)
 
     # all of the chunk's KV writes as one list of (source, destination)
@@ -441,7 +510,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 key = spec["key"]
                 f = spec["f"]
                 r0, r1 = spec["row0"], spec["row1"]
-                spans = spec["suffix_spans"]
+                begins, ends = spec["suffix_spans"]
                 logical_start = spec["start"] if spec["fresh"] else f
                 if spec["fresh"]:
                     fresh_keys.append(key)
@@ -453,10 +522,10 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                         arena.capacity_rows_sliding(key),
                         arena.owned_sliding_pages(key),
                         arena.sliding_start(key)))
-                direct = len(spans) == 1 and all(
+                direct = len(begins) == 1 and all(
                     logical_start + count - view.start <= view.rows.numel()
                     for view in views)
-                suffix_total = sum(e - s for s, e in spans)
+                suffix_total = int((ends - begins).sum())
                 if direct:
                     for pool, view in zip(pools, views):
                         pool.scatter_direct(view, r0, r1, logical_start)
@@ -476,7 +545,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                             f - view.start)
                     cu_q.append(cu_q[-1] + prefix_count)
 
-                for s0, s1 in spans:
+                for s0, s1 in zip(begins.tolist(), ends.tolist()):
                     suffix_tokens = s1 - s0
                     remainders = [(f - view.start) % page_tokens for view in views]
                     got = arena.alloc_temporary(
@@ -529,35 +598,34 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     # All current KV writes use one scatter.
     kv_src = kv_dst = None
     if kv_writes:
-        src = []
-        dst_parts = []
+        src, dst_parts = [], []
         for key, r0, r1, dest in kv_writes:
-            src.extend(range(r0, r1))
+            src.append(np.arange(r0, r1, dtype=np.int64))
             rows = arena.capacity_rows(key)[dest:dest + (r1 - r0)]
             if rows.numel() != r1 - r0:
                 raise AssertionError("KV write exceeds reserved rows")
             dst_parts.append(rows)
-        kv_src = _staged(torch, src, torch.int64, pinned)
+        kv_src = _staged(torch, np.concatenate(src), torch.int64, pinned)
         kv_dst = _staged(torch, torch.cat(dst_parts), torch.int64,
                          pinned)
     t = _tick(timing, "pack_kv", t)
 
     canvas_meta = None
-    if canvas_rows:
+    if canvas_starts:
+        starts = np.concatenate(canvas_starts)
         if (attention_mode == "unified" and unified is None
-                and len(canvas_rows) != len(cu_a) - 1):
+                and len(starts) != len(cu_a) - 1):
             raise ValueError(
                 "the unpaged canvas call pairs one canvas with each "
                 "causal segment; a group without a suffix has none")
-        cu_c = [0]
-        for a, b in canvas_rows:
-            cu_c.append(cu_c[-1] + b - a)
+        width = len(canvas)
         canvas_meta = dict(
-            rows=stage("canvas_rows", concatenate(
-                [np.arange(a, b, dtype=np.int64) for a, b in canvas_rows]),
-                torch.int64),
-            cu_q=stage("canvas_cu_q", cu_c, torch.int32),
-            max_q=len(canvas))
+            rows=stage("canvas_rows", np.repeat(starts, width) + np.tile(
+                np.arange(width, dtype=np.int64), len(starts)), torch.int64),
+            cu_q=stage("canvas_cu_q", np.arange(len(starts) + 1,
+                                                dtype=np.int64) * width,
+                       torch.int32),
+            max_q=width)
         if unified is not None:
             seq = stage("canvas_seq", canvas_seq, torch.int64)
             canvas_meta["table"] = unified["table"].index_select(0, seq)
@@ -573,16 +641,17 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         layer=0, kv_src=kv_src, kv_dst=kv_dst, reads=reads,
         unified=unified, canvas=canvas_meta,
         cu_a=stage("cu_a", cu_a, torch.int32),
-        max_a=max(cu_a[i + 1] - cu_a[i] for i in range(len(cu_a) - 1)))
+        max_a=int(np.diff(cu_a).max()) if len(cu_a) > 1 else 0)
     out = Chunk(
         input_ids=_staged_token_parts(
             torch, id_parts, token_count, pinned, staging),
         positions=stage("positions", concatenate(pos), torch.int64),
-        final_indices=stage("finals", finals, torch.int64),
+        final_indices=stage("finals", concatenate(finals), torch.int64),
         meta=meta, attention_mode=attention_mode, tokens=token_count,
         layout=layout, temporary_keys=tuple(temporary_keys),
         fresh_keys=tuple(fresh_keys),
-        rows_per_answer=tuple(rows_per_answer) if multi_row else ())
+        rows_per_answer=(tuple(np.concatenate(rows_per_answer).tolist())
+                         if multi_row else ()))
     _tick(timing, "pack_h2d", t)
     return out
 
@@ -931,7 +1000,8 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
                question_ids, budget, timing=None,
                pinned=True, limit=None, *, arena_writes,
                arena_keys=None, retain_survivors=(), attention_mode=None,
-               document_done=None, prefix_tree=None, stats=None):
+               document_done=None, prefix_tree=None, stats=None,
+               staging=None):
     """The filter chain run to the end on the stage scheduler.
 
     Args:
@@ -958,7 +1028,8 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
             stage asked, passed) tuples.
         prefix_tree: A PrefixTree over doc_ids, or None. Needs
             arena_writes.
-        stats: When given, receives borrowed_tokens.
+        stats: When given, receives borrowed_tokens and pack_s.
+        staging: Optional reusable input transfer buffers.
 
     Returns:
         (answers, spans, tokens): answers[d] = 0/1 list up to the
@@ -1007,7 +1078,7 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
         torch, arena, pipeline, stages, doc_ids, budget,
         anchor_keys=keys, on_settled=on_settled,
         attention_mode=attention_mode, prefix_tree=prefix_tree,
-        stats=stats, limit=limit, paged=arena_writes,
+        stats=stats, limit=limit, paged=arena_writes, staging=staging,
         label=f"filter ({k} stages)", default_attention="unified",
         on_chunk=on_chunk if document_done is not None else None)
     by_document = {}
