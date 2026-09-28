@@ -19,7 +19,12 @@ from quail.backends.quail.executor.readout import AsyncLabelLogprobs
 from quail.bench.quailb import run_output
 from quail.bench.substrait import read_plan
 from quail.catalog import DocumentProvider
-from quail.execution.labels import best_label, label_scores, label_trie
+from quail.execution.labels import (
+    best_label,
+    label_chain_scores,
+    label_scores,
+    label_trie,
+)
 from quail.execution.reranker import RerankerBatch
 from quail.logical import ColumnRef, CompileError, bind_classify_prompt, label_text
 from quail.physical import (
@@ -29,6 +34,7 @@ from quail.physical import (
     decode_graph,
     encode_graph,
 )
+from quail.planner.classify import suffix_lengths
 from quail.planner.plan import EngineConfig, Refusal
 from quail_b import rendering
 from quail_b.prompts import AGENT_OUTCOME, AGENT_OUTCOME_DESCRIPTIONS
@@ -59,6 +65,21 @@ def test_label_scores_sum_each_labels_tokens_and_ties_go_first():
     assert best_label([-1.0, -2.0, -1.0]) == 0
 
 
+def test_label_chain_scores_read_one_row_per_label_token():
+    targets = [1, 2, 3, 4]
+    nan = float("nan")
+    # chain i's row r scores token r of label i; rows past a label are NaN
+    logprobs = np.log([
+        [[0.6, nan, nan, nan], [nan, 0.3, nan, nan]],
+        [[0.6, nan, nan, nan], [nan, nan, 0.7, nan]],
+        [[nan, nan, nan, 0.4], [nan, nan, nan, nan]],
+    ])
+    scores = label_chain_scores(IDS, targets, logprobs)
+    assert np.allclose(np.exp(scores), [0.18, 0.42, 0.4])
+    assert suffix_lengths("label_chains", IDS) == [2, 2, 1]
+    assert suffix_lengths("trie_nodes", IDS) == [1, 2]
+
+
 def test_classify_prompt_is_quail_b_text_with_labels_after_it():
     ref = ColumnRef("t", "agent_traces", "trace")
     bound = bind_classify_prompt(AGENT_OUTCOME, (ref,), OUTCOMES,
@@ -84,6 +105,24 @@ def test_label_readout_is_log_softmax_over_the_whole_vocabulary():
     expected = torch.log_softmax(logits, dim=1)[:, [5, 17, 299]]
     assert torch.allclose(got, expected, atol=1e-5)
     assert readout.dtype.shape == (3,)
+
+
+def test_multi_row_label_readout_pads_each_suffix_to_its_rows():
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("pinned host copies need a GPU")
+    head = torch.randn(300, 8, dtype=torch.bfloat16, device="cuda")
+    hidden = torch.randn(5, 8, dtype=torch.bfloat16, device="cuda")
+    readout = AsyncLabelLogprobs(torch, torch.nn.functional, head, [5, 17],
+                                 rows=3)
+    assert readout.dtype.shape == (3, 2)
+    got = readout.result(readout.submit(hidden, rows_per_answer=[2, 3]))
+    flat = readout.logprobs(hidden).cpu().numpy()
+    assert got.shape == (2, 3, 2)
+    assert np.allclose(got[0, :2], flat[:2]) and np.isnan(got[0, 2]).all()
+    assert np.allclose(got[1], flat[2:])
+    with pytest.raises(ValueError, match="rows to read"):
+        readout.submit(hidden, rows_per_answer=[4, 1])
 
 
 def test_classifier_reads_every_trie_node_after_each_document(monkeypatch):
@@ -117,7 +156,8 @@ def test_classifier_reads_every_trie_node_after_each_document(monkeypatch):
 
     monkeypatch.setattr(loop, "pack_chunk", fake_pack)
     readout = SimpleNamespace(
-        targets=np.asarray(targets), dtype=np.dtype((np.float32, (4,))),
+        targets=np.asarray(targets), rows=1,
+        dtype=np.dtype((np.float32, (4,))),
         submit=lambda rows: rows, result=lambda rows: rows)
     state = {"torch": fake_torch(), "arena": cpu_arena(64),
              "pipeline": fake_pipeline(forward_chunk=forward),
@@ -127,6 +167,61 @@ def test_classifier_reads_every_trie_node_after_each_document(monkeypatch):
     assert list(batch.scores) == list(LABELS)
     # every row packs its prefix, the two-token frame, and two suffixes
     assert batch.fresh_tokens + batch.cached_tokens == (3 + 2 + 4) + 3 * (2 + 3)
+
+
+def test_classifier_reads_every_row_of_one_chain_per_label(monkeypatch):
+    spec = ClassifySpec(
+        name="topic", aliases=("d",), query_template="", arguments=(),
+        expected_inputs=2, estimated_seconds=0.0,
+        prompt_token_parts=((90,), (91, 92, 93)), labels=LABELS,
+        label_token_ids=IDS, scoring="label_chains")
+    documents = {"d": [[10, 11], [12]]}
+    prefixes, frame, suffixes, nodes, targets = classify_inputs(
+        spec, documents, [0, 1])
+    assert frame == [91, 92]
+    # the cue's last token, then every label token but its last
+    assert (nodes, suffixes) == (None, [[93, 1], [93, 1], [93]])
+    assert targets == [1, 2, 3, 4]
+
+    # document i prefers label i: after the cue and the first r tokens
+    # of a label, that label's token r gets log p = -1, others -5
+    def forward(chunk):
+        rows = []
+        for entry in chunk.specs:
+            document = entry["key"][2]
+            wanted = IDS[document]
+            for suffix in entry["suffixes"]:
+                count = len(suffix) if entry.get("read_all_rows") else 1
+                for row in range(count):
+                    seen = tuple(suffix[1:row + 1])
+                    rows.append([
+                        -1.0 if seen + (token,) == tuple(wanted[:row + 1])
+                        else -5.0 for token in targets])
+        return np.asarray(rows, dtype=np.float32)
+
+    def submit(rows, rows_per_answer=None):
+        rows_per_answer = rows_per_answer or [1] * len(rows)
+        padded = np.full((len(rows_per_answer), 2, 4), np.nan, np.float32)
+        start = 0
+        for answer, count in enumerate(rows_per_answer):
+            padded[answer, :count] = rows[start:start + count]
+            start += count
+        return padded
+
+    monkeypatch.setattr(loop, "pack_chunk", fake_pack)
+    readout = SimpleNamespace(
+        targets=np.asarray(targets), rows=2,
+        dtype=np.dtype((np.float32, (2, 4))),
+        submit=submit, result=lambda rows: rows)
+    state = {"torch": fake_torch(), "arena": cpu_arena(64),
+             "pipeline": fake_pipeline(forward_chunk=forward),
+             "chunk_tokens": 64, "label_readout": readout,
+             "input_staging": SimpleNamespace(fixed_tokens=set())}
+    batch = QuailClassifier(state).classify(spec, [[0], [1]], documents)
+    assert list(batch.scores) == list(LABELS[:2])
+    assert batch.label_tokens == 2 * (2 + 2 + 1)
+    # every row packs its prefix, the two-token frame, and three chains
+    assert batch.fresh_tokens + batch.cached_tokens == (3 + 2) + 2 * (2 + 5)
 
 
 @pytest.fixture()
@@ -203,6 +298,25 @@ def test_classify_refusals_and_builder_errors(session):
         name="x").select("d.id", "x")
     assert "AI.IF" in mixed.plan().reasons[0]
     assert not isinstance(query.plan(), Refusal)
+
+    # the plan setting picks the scoring rule; label chains by default
+    plan = query.plan()
+    (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
+    assert classify.spec.scoring == "label_chains"
+    assert plan.settings["label_scoring"] == "label_chains"
+    for rule in ("trie_nodes", "label_chains", "next_rule"):
+        ruled = quail.Session(EngineConfig(
+            model="qwen3-4b-fp8", device="h100-sxm", label_scoring=rule),
+            tokenizer=_bytes)
+        ruled.register("documents", session.catalog.get("documents"))
+        plan = _topic(ruled).plan()
+        if rule == "next_rule":
+            assert isinstance(plan, Refusal) and "unknown" in plan.reasons[0]
+        else:
+            (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
+            assert classify.spec.scoring == rule
+            assert plan.settings["label_scoring"] == rule
+        ruled.close()
 
     big = quail.Session(EngineConfig(model="qwen3-32b-fp8", device="h100-sxm"),
                         tokenizer=_bytes)

@@ -237,6 +237,9 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
       suffixes  List of suffix token lists.
       write_suffix_tokens  Leading rows of the first suffix to scatter
                 into the key's pages after the prefix.
+      read_all_rows  When true, every row of each suffix feeds the
+                readout, not only its last; the chunk's rows_per_answer
+                then says how many rows each answer has.
 
     A fresh group without arena pages packs [prefix | suffix] as one
     causal segment (no scatter, no paged read). This only works with
@@ -275,6 +278,8 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     canvas_seq = []       # its sequence in the unified paged call
     id_parts, token_count = [], 0
     pos, cu_a, finals = [], [0], []
+    rows_per_answer = []
+    multi_row = False
     # rows that read resident KV in call B: a borrowing document's
     # rows reading its parent, and a kept document's tail reading its
     # own prefix (wider than the planner's readers, which are children)
@@ -328,6 +333,9 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         prefix_end = token_count
         s_row0 = token_count
         suffix_spans = []
+        read_all = bool(g.get("read_all_rows"))
+        if read_all and canvas:
+            raise ValueError("a canvas answer is read at one row")
         for si, suf in enumerate(g["suffixes"]):
             srow = token_count
             id_parts.append(suf)
@@ -343,8 +351,14 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 canvas_rows.append((token_count, token_count + len(canvas)))
                 finals.append(token_count + answer_row)
                 token_count += len(canvas)
+                rows_per_answer.append(1)
+            elif read_all:
+                finals.extend(range(srow, token_count))
+                rows_per_answer.append(token_count - srow)
+                multi_row = True
             else:
                 finals.append(token_count - 1)
+                rows_per_answer.append(1)
             suffix_spans.append((srow, token_count))
             cu_a.append(token_count)
             wst = g.get("write_suffix_tokens", 0)
@@ -572,7 +586,8 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         final_indices=stage("finals", finals, torch.int64),
         meta=meta, attention_mode=attention_mode, tokens=token_count,
         layout=layout, temporary_keys=tuple(temporary_keys),
-        fresh_keys=tuple(fresh_keys))
+        fresh_keys=tuple(fresh_keys),
+        rows_per_answer=tuple(rows_per_answer) if multi_row else ())
     _tick(timing, "pack_h2d", t)
     return out
 
@@ -610,7 +625,8 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
              stage_suffixes, budget, stage_frames=None,
              anchor_keys=None, anchor_done=None, anchor_source=None,
              anchor_partners=None, anchor_batch=None, staging=None,
-             attention_mode=None, prefix_tree=None, stats=None):
+             attention_mode=None, prefix_tree=None, stats=None,
+             read_all_rows=False):
     """The join driver: stream partner lists against anchors.
 
     Survivors are gated between stages.
@@ -657,6 +673,10 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
             its shared length and packs only the tokens after it.
         stats: When given, receives borrowed_tokens: the anchor prefix
             tokens read from a parent's KV pages instead of computed.
+        read_all_rows: Feed every row of each partner suffix to the
+            readout, not only its last. The readout's submit then takes
+            rows_per_answer and returns one fixed-size record per
+            partner; a frame entry still reads one row.
 
     Returns:
         (ans, spans, tokens): ans[j][a] = 0/1 row over the stage-j
@@ -828,12 +848,12 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
                     write_suffix_tokens=len(frame)))
                 specs.append(dict(
                     key=key, prefix=None, f=f + len(frame),
-                    suffixes=sufs))
+                    suffixes=sufs, read_all_rows=read_all_rows))
             else:
                 specs.append(dict(
                     key=key, prefix=prefix, start=shared,
                     f=f + len(frame),
-                    suffixes=sufs))
+                    suffixes=sufs, read_all_rows=read_all_rows))
         return pack_chunk(torch, arena, specs, attention_mode=mode,
                           staging=staging, canvas=canvas,
                           answer_row=answer_row)
@@ -906,7 +926,9 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         for key in chunk.fresh_keys:
             arena.trim_window(key)
         spans.append((part[0][1], e0, e1))
-        outstanding.append((part, async_ans.submit(normed)))
+        handle = (async_ans.submit(normed, rows_per_answer=chunk.rows_per_answer)
+                  if chunk.rows_per_answer else async_ans.submit(normed))
+        outstanding.append((part, handle))
         # read the previous chunk's answers while this one runs
         while len(outstanding) > 1:
             report(outstanding.pop(0))

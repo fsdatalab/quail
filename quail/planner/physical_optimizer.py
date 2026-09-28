@@ -42,6 +42,9 @@ class PlanningContext:
     document_tokens: Mapping[str, Any]
     backend: str
     order: str | None = None
+    # an AI.CLASSIFY label scoring rule forced for every classification;
+    # None lets the planner choose
+    label_scoring: str | None = None
     tokenizer: Callable[[str], Any] | None = None
     # join written position -> its equality pairs as a fraction of
     # the cross product; joins without conditions are absent

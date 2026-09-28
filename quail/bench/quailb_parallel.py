@@ -72,7 +72,8 @@ def _methods(csv: str) -> list[str]:
 
 
 def _run_family(process_groups, result_name, model, sf, query_ids_csv,
-                run_dir, ground_truth_collection, root=None) -> str:
+                run_dir, ground_truth_collection, root=None,
+                label_scoring=None) -> str:
     """Run one query family's methods, one child process per group.
 
     Every group runs on the one GPU of this container, in a fresh
@@ -92,7 +93,7 @@ def _run_family(process_groups, result_name, model, sf, query_ids_csv,
         process_result = run_backend_group_in_fresh_process(
             data_dir=DATA_DIR, model=model, sf=sf, query_ids=query_ids,
             run_dir=run_dir, ground_truth_collection=ground_truth_collection,
-            methods=methods, root=root)
+            methods=methods, root=root, label_scoring=label_scoring)
         process_results.append(process_result)
         suites.update(process_result["suites"])
     gpu_uuids = {
@@ -142,11 +143,13 @@ def run_query_family(
     include_dumb_vllm: bool = False,
     baselines: str = "stock_vllm,pipelined_vllm",
     result_name: str = "",
+    label_scoring: str = "",
 ) -> str:
     """Run one query family through Quail and the vLLM baselines.
 
     baselines names the vLLM baseline methods that run when
-    include_baselines is set.
+    include_baselines is set. label_scoring forces one AI.CLASSIFY
+    label scoring rule; empty lets the planner choose.
     """
     process_groups = [("quail",)] if include_quail else []
     if include_baselines:
@@ -155,7 +158,8 @@ def run_query_family(
         process_groups.append(("dumb_vllm",))
     try:
         return _run_family(process_groups, result_name, model, sf, query_ids_csv,
-                           run_dir, ground_truth_collection)
+                           run_dir, ground_truth_collection,
+                           label_scoring=label_scoring or None)
     finally:
         results_vol.commit()
         kernel_cache.commit()
@@ -254,6 +258,7 @@ def run_all(
     include_quail: bool = True,
     include_dumb_vllm: bool = False,
     baselines: str = "stock_vllm,pipelined_vllm",
+    label_scoring: str = "",
 ):
     from quail_b import select_queries
 
@@ -271,6 +276,7 @@ def run_all(
         "started_at": started.isoformat(),
         "model": model,
         "sf": sf,
+        "label_scoring": label_scoring or None,
         "query_ids": list(query_ids),
         "summaries": {},
         "function_call_ids": {},
@@ -302,6 +308,7 @@ def run_all(
                     include_dumb_vllm=include_dumb_vllm,
                     baselines=baselines,
                     result_name=result_name,
+                    label_scoring=label_scoring,
                 )
                 family_calls.append((group, family_call))
                 call_ids[f"{group}:quail_vllm"] = family_call.object_id
@@ -454,6 +461,7 @@ def main(
     include_quail: bool = True,
     include_dumb_vllm: bool = False,
     baselines: str = "stock_vllm,pipelined_vllm",
+    label_scoring: str = "",
     finish: str = "",
 ):
     if finish:
@@ -479,6 +487,7 @@ def main(
         include_quail=include_quail,
         include_dumb_vllm=include_dumb_vllm,
         baselines=baselines,
+        label_scoring=label_scoring,
     )
     print(f"function call id: {call.object_id} (all families)", flush=True)
     print(call.get(), flush=True)

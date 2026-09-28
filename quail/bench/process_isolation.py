@@ -35,6 +35,7 @@ def run_backend_group(
     ground_truth_collection: str,
     methods: Sequence[str],
     root: str | None = None,
+    label_scoring: str | None = None,
 ) -> dict:
     """Run backend methods while sharing one loaded model when possible."""
     from quail import EngineConfig
@@ -60,6 +61,7 @@ def run_backend_group(
                 model=model,
                 backend=method,
                 device="h100-sxm",
+                label_scoring=label_scoring,
             ),
             data_dir=Path(data_dir) / f"sf{sf}",
             ground_truth_collection=ground_truth_collection or None,

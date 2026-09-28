@@ -507,11 +507,13 @@ class ClassifySpec(ScoreSpec):
 
     ``prompt_token_parts`` is (preamble ids, tail ids): the document
     goes between them. ``label_token_ids`` holds each label's ids as
-    scored after the tail, in label order.
+    scored after the tail, in label order. ``scoring`` names the label
+    scoring rule the executor runs: ``trie_nodes`` or ``label_chains``.
     """
 
     labels: tuple[str, ...] = ()
     label_token_ids: tuple[tuple[int, ...], ...] = ()
+    scoring: str = "trie_nodes"
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "ClassifySpec":
@@ -525,6 +527,7 @@ class ClassifySpec(ScoreSpec):
             label_token_ids=tuple(
                 tuple(int(token) for token in ids)
                 for ids in value["label_token_ids"]),
+            scoring=str(value.get("scoring", "trie_nodes")),
         )
 
     def to_dict(self) -> dict:
@@ -532,6 +535,7 @@ class ClassifySpec(ScoreSpec):
             **super().to_dict(),
             "labels": list(self.labels),
             "label_token_ids": [list(ids) for ids in self.label_token_ids],
+            "scoring": self.scoring,
         }
 
 
@@ -551,6 +555,7 @@ class AiClassify(AiScore):
         return {
             **super().explain_fields(),
             "labels": [] if self.spec is None else list(self.spec.labels),
+            "scoring": None if self.spec is None else self.spec.scoring,
         }
 
     @classmethod

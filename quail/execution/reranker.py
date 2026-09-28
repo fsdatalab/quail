@@ -105,11 +105,17 @@ class ScoreRows:
 
 @dataclass(frozen=True)
 class RerankerBatch:
-    """Scores, or AI.CLASSIFY labels, and token counts from one call."""
+    """Scores, or AI.CLASSIFY labels, and token counts from one call.
+
+    ``label_tokens`` counts the suffix tokens a classification packed
+    after the documents and frames: the label work the scoring rules
+    reduce.
+    """
 
     scores: np.ndarray
     fresh_tokens: int
     cached_tokens: int
+    label_tokens: int = 0
 
 
 def _value_type(spec) -> pa.DataType:
@@ -334,6 +340,8 @@ class RerankerModelExecution:
                     "output": spec.name,
                     "aliases": list(spec.aliases),
                     "input_rows": count,
+                    **({"label_tokens": batch.label_tokens}
+                       if isinstance(spec, ClassifySpec) else {}),
                 },
             ),
         )

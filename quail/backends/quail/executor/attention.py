@@ -59,6 +59,9 @@ class Chunk:
         temporary_keys: Arena keys the loop frees after the forward pass.
         fresh_keys: Keys whose prefix this chunk computes; the loop
             trims their sliding pages after the pass.
+        rows_per_answer: Rows of final_indices each answer takes, one
+            entry per suffix in chunk order, when some suffix reads
+            more than its last row; empty when every answer is one row.
     """
 
     input_ids: Any
@@ -70,6 +73,7 @@ class Chunk:
     layout: list
     temporary_keys: tuple = ()
     fresh_keys: tuple = ()
+    rows_per_answer: tuple = ()
 
 
 def flash_attention_version(capability: tuple[int, int]) -> int:

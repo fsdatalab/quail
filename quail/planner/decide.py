@@ -775,7 +775,8 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
 def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                device: DeviceSpec, doc_tokens: dict, gpus: int = 1,
                order: str | None = None, backend: str = "quail",
-               registry=None, tokenizer=None, pair_fractions=None):
+               registry=None, tokenizer=None, pair_fractions=None,
+               label_scoring: str | None = None):
     """Plan one query with the selected model backend.
 
     Args:
@@ -787,6 +788,8 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         order: Stage order rule, 'by_cost' or 'as_written'; None picks
             the default rule.
         backend: Registered model backend name.
+        label_scoring: An AI.CLASSIFY label scoring rule forced for
+            every classification; None lets the planner choose.
         registry: Optional session extension registry.
         tokenizer: Optional callable (text -> token list) handed to the
             planning context.
@@ -825,6 +828,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         document_tokens=doc_tokens,
         backend=backend,
         order=order,
+        label_scoring=label_scoring,
         tokenizer=tokenizer,
         pair_fractions=dict(pair_fractions or {}),
     )
@@ -857,7 +861,8 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
 def refine_plan(plan, *, model: ModelSpec, device: DeviceSpec,
                 doc_tokens: dict, gpus: int = 1, backend: str = "quail",
                 registry=None, order: str | None = None,
-                tokenizer=None, pair_fractions=None):
+                tokenizer=None, pair_fractions=None,
+                label_scoring: str | None = None):
     """Run the physical rules again over a plan once its inputs are exact.
 
     A plan made on estimated document lengths never saw the token
@@ -877,6 +882,7 @@ def refine_plan(plan, *, model: ModelSpec, device: DeviceSpec,
         document_tokens=doc_tokens,
         backend=backend,
         order=order,
+        label_scoring=label_scoring,
         tokenizer=tokenizer,
         pair_fractions=dict(pair_fractions or {}),
     )

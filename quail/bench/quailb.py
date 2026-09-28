@@ -391,6 +391,8 @@ def main():
     parser.add_argument("--data-dir", help="directory containing input Parquet files")
     parser.add_argument("--ground-truth-collection")
     parser.add_argument("--output-dir", required=True, help="new run directory")
+    parser.add_argument("--label-scoring",
+                        help="force one AI.CLASSIFY label scoring rule")
     args = parser.parse_args()
     run_suite(
         [value.strip() for value in args.only.split(",")] if args.only else None,
@@ -400,6 +402,7 @@ def main():
             model=args.model,
             backend=args.backend,
             device=args.device,
+            label_scoring=args.label_scoring,
         ),
         data_dir=args.data_dir,
         ground_truth_collection=args.ground_truth_collection,

@@ -93,17 +93,22 @@ class AsyncLabelLogprobs:
     head's dtype and normalized in float32, as vLLM computes returned
     log probabilities. Rows go through the head in blocks, so no rows
     by vocabulary matrix larger than one block is held.
+
+    With rows > 1 an answer is a (rows, targets) record: the rows of
+    one suffix in order, NaN past the suffix's own rows.
     """
 
     BLOCK_ROWS = 64    # rows per head block: 64 x 151,936 x 6 bytes = 58 MiB
 
-    def __init__(self, torch, F, head, targets):
+    def __init__(self, torch, F, head, targets, rows=1):
         self.torch = torch
         self.F = F
         self.head = head
         self.targets = torch.tensor(list(targets), device=head.device,
                                     dtype=torch.long)
-        self.dtype = np.dtype((np.float32, (len(targets),)))
+        self.rows = rows
+        self.dtype = np.dtype((np.float32, (rows, len(targets)) if rows > 1
+                               else (len(targets),)))
         self.available = []
 
     def logprobs(self, normed):
@@ -119,9 +124,30 @@ class AsyncLabelLogprobs:
                 logits.index_select(1, self.targets) - norm)
         return out
 
-    def submit(self, normed):
+    def submit(self, normed, rows_per_answer=None):
         torch = self.torch
         values = self.logprobs(normed)
+        if self.rows > 1:
+            if rows_per_answer is None:
+                rows_per_answer = [1] * values.shape[0]
+            if max(rows_per_answer) > self.rows:
+                raise ValueError(
+                    f"a suffix has {max(rows_per_answer)} rows to read; "
+                    f"the readout holds {self.rows}")
+            answers = torch.full((len(rows_per_answer), self.rows,
+                                  values.shape[1]), float("nan"),
+                                 dtype=torch.float32, device=values.device)
+            answer_index = torch.tensor(
+                [i for i, n in enumerate(rows_per_answer) for _ in range(n)],
+                device=values.device)
+            row_index = torch.tensor(
+                [r for n in rows_per_answer for r in range(n)],
+                device=values.device)
+            answers[answer_index, row_index] = values
+            values = answers
+        elif rows_per_answer is not None and any(
+                n != 1 for n in rows_per_answer):
+            raise ValueError("this readout holds one row per answer")
         host = self.available.pop() if self.available else None
         if host is None or host.shape[0] < values.shape[0]:
             host = torch.empty(values.shape, dtype=torch.float32,
