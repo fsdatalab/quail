@@ -152,6 +152,10 @@ class TreeAttention:
         if context is None:
             return None
         model, device = context.model, context.device
+        forced = context.attention
+        if forced is not None and forced not in ("tree", "unified"):
+            raise ValueError(
+                f"attention must be 'tree' or 'unified', got {forced!r}")
         tree_available = (model.weight_precision == "fp8"
                           and not model.canvas_tokens)
         nodes = []
@@ -180,6 +184,8 @@ class TreeAttention:
                     path = choose_attention_path(
                         model, device, readers=readers, reader_rows=rows,
                         node_tokens=_mean(lengths))
+            if path is not None and forced is not None:
+                path = forced
             if path is not None and path != node.attention:
                 node = replace(node, attention=path)
                 changed = True

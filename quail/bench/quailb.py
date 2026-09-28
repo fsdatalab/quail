@@ -449,6 +449,8 @@ def main():
     parser.add_argument("--output-dir", required=True, help="new run directory")
     parser.add_argument("--label-scoring",
                         help="force one AI.CLASSIFY label scoring rule")
+    parser.add_argument("--attention", choices=("tree", "unified"),
+                        help="force one attention path for filters and joins")
     parser.add_argument("--gpu-timing", action="store_true",
                         help="record GPU seconds per model node")
     args = parser.parse_args()
@@ -461,6 +463,7 @@ def main():
             backend=args.backend,
             device=args.device,
             label_scoring=args.label_scoring,
+            attention=args.attention,
             gpu_timing=args.gpu_timing,
         ),
         data_dir=args.data_dir,

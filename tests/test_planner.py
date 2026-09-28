@@ -720,3 +720,17 @@ def test_prefix_sharing_and_attention_path_follow_the_token_store(
     # anchors with nothing in common share nothing
     plan = _plan(logical, {"r": [401] * 20, "p": [20] * 20})
     assert not plan.graph.nodes_by_type(AiJoin.type_name)[0].share_prefixes
+
+
+def test_attention_setting_forces_every_filter_and_join(catalog):
+    filters = _five_filter_plan(catalog, (0.5,))
+    joins = _chain(catalog)
+    tokens = {"r": [40, 42, 3], "t": [50] * 4, "p": [100] * 3}
+    for path in ("tree", "unified"):
+        plan = _plan(filters, tokens, attention=path)
+        assert filter_chain(plan).attention == path
+        plan = _plan(joins, tokens, attention=path)
+        assert {node.attention for node in plan.nodes
+                if isinstance(node, AiJoin)} == {path}
+    with pytest.raises(ValueError, match="tree"):
+        _plan(filters, tokens, attention="both")

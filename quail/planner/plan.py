@@ -290,3 +290,7 @@ class EngineConfig:
     # force one AI.CLASSIFY label scoring rule for every classification,
     # so an ablation can run each rule; None lets the planner choose
     label_scoring: str | None = None
+    # force one attention path, "tree" or "unified", for every filter
+    # and join, so an ablation can run each path; None lets the
+    # planner choose per node
+    attention: str | None = None

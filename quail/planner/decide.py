@@ -776,7 +776,8 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                device: DeviceSpec, doc_tokens: dict, gpus: int = 1,
                order: str | None = None, backend: str = "quail",
                registry=None, tokenizer=None, pair_fractions=None,
-               label_scoring: str | None = None):
+               label_scoring: str | None = None,
+               attention: str | None = None):
     """Plan one query with the selected model backend.
 
     Args:
@@ -790,6 +791,8 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         backend: Registered model backend name.
         label_scoring: An AI.CLASSIFY label scoring rule forced for
             every classification; None lets the planner choose.
+        attention: An attention path, "tree" or "unified", forced for
+            every filter and join; None lets the planner choose.
         registry: Optional session extension registry.
         tokenizer: Optional callable (text -> token list) handed to the
             planning context.
@@ -829,6 +832,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         backend=backend,
         order=order,
         label_scoring=label_scoring,
+        attention=attention,
         tokenizer=tokenizer,
         pair_fractions=dict(pair_fractions or {}),
     )
@@ -862,7 +866,8 @@ def refine_plan(plan, *, model: ModelSpec, device: DeviceSpec,
                 doc_tokens: dict, gpus: int = 1, backend: str = "quail",
                 registry=None, order: str | None = None,
                 tokenizer=None, pair_fractions=None,
-                label_scoring: str | None = None):
+                label_scoring: str | None = None,
+                attention: str | None = None):
     """Run the physical rules again over a plan once its inputs are exact.
 
     A plan made on estimated document lengths never saw the token
@@ -883,6 +888,7 @@ def refine_plan(plan, *, model: ModelSpec, device: DeviceSpec,
         backend=backend,
         order=order,
         label_scoring=label_scoring,
+        attention=attention,
         tokenizer=tokenizer,
         pair_fractions=dict(pair_fractions or {}),
     )

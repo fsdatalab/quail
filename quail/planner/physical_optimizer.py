@@ -45,6 +45,9 @@ class PlanningContext:
     # an AI.CLASSIFY label scoring rule forced for every classification;
     # None lets the planner choose
     label_scoring: str | None = None
+    # an attention path forced for every filter and join; None lets
+    # the planner choose per node
+    attention: str | None = None
     tokenizer: Callable[[str], Any] | None = None
     # join written position -> its equality pairs as a fraction of
     # the cross product; joins without conditions are absent

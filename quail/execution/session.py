@@ -670,6 +670,7 @@ class Query:
                 gpus=self.session.config.gpus,
                 order=self.order,
                 label_scoring=self.session.config.label_scoring,
+                attention=self.session.config.attention,
                 backend=self.session.config.backend,
                 registry=self.session.registry,
                 tokenizer=self.session.tokenizer,
@@ -778,6 +779,7 @@ class Query:
                 device=self.session.device, doc_tokens=self._doc_tokens,
                 gpus=self.session.config.gpus, order=self.order,
                 label_scoring=self.session.config.label_scoring,
+                attention=self.session.config.attention,
                 backend=self.session.config.backend,
                 registry=self.session.registry,
                 tokenizer=self.session.tokenizer)
