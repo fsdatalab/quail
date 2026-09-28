@@ -21,8 +21,6 @@ from quail.backends.quail.executor.attention import (
 )
 from quail.backends.quail.executor.pack import (
     FilterAdmission,
-    JoinAdmission,
-    partner_pages,
 )
 from quail.progress import Progress, logger, quiet
 
@@ -687,299 +685,33 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         (stage, start_event, end_event) per forward; tokens = fresh
         tokens packed.
     """
+    from quail.backends.quail.executor.stages import Stage, run_stages
+
     k = len(stage_suffixes)
-    if anchor_source is not None:
-        if anchor_prefixes or anchor_keys:
-            raise ValueError(
-                "anchor_source fills anchor_prefixes and anchor_keys")
-        prefixes, keys = anchor_prefixes, anchor_keys
-    else:
-        prefixes = list(anchor_prefixes)
-        keys = (list(range(len(prefixes))) if anchor_keys is None
-                else list(anchor_keys))
-    if len(keys) != len(prefixes):
-        raise ValueError("anchor_keys must match anchor_prefixes")
     frames = stage_frames or [[] for _ in range(k)]
-    # a join's partners read their anchor: tree unless the plan says
-    mode = attention_path(pipeline, attention_mode, default="tree")
-    canvas = tuple(pipeline.canvas_ids)
-    answer_row = pipeline.canvas_answer_row
-
-    def entry_rows(a, j, start, end, carried):
-        f = len(prefixes[a])
-        frame = frames[j]
-        sufs = [stage_suffixes[j][i]
-                for i in sched.partner_indices(a, j, start, end)]
-        rows = (f if carried else 0) + sum(len(s) + len(canvas) for s in sufs)
-        if frame and start == 0:
-            rows += len(frame) + len(canvas)
-        return rows
-
-    if k == 0:
-        return [], [], 0
-    # a frame entry's canvas rows land in the anchor's pages after the
-    # frame, so the pages cover them
-    frame_max = max(len(f) + (len(canvas) if f else 0) for f in frames)
-    if anchor_source is not None and mode == "unified":
-        # the source leaves room for one partner's temporary rows, or
-        # held anchors could fill the arena before the join can run;
-        # the rows follow the anchor's last partial page, as the
-        # scheduler prices them
-        longest = [max((len(s) for s in suffixes), default=0) + len(canvas)
-                   for suffixes in stage_suffixes]
-        anchor_source.set_reserve(max(
-            (partner_pages(arena.page_cost, arena.page_tokens, len(doc),
-                           len(frame), rows)
-             for doc in anchor_source.doc_ids
-             for frame, rows in zip(frames, longest)), default=0))
-    def held_pages(key, prefix_tokens):
-        # the scheduler prices an anchor at page_cost(prefix + frames)
-        # less what it holds; a trimmed window holds fewer sliding
-        # pages than that price assumes, so count what growing takes
-        capacity = prefix_tokens + frame_max
-        return (arena.page_cost(capacity)
-                - arena.growth_cost(key, capacity))
-
-    resident = {a: held_pages(keys[a], len(prefixes[a]))
-                for a in range(len(keys)) if arena.is_resident(keys[a])}
-    # Every resident anchor stays available for the whole join while
-    # fresh admissions evict unrelated retained KV.
-    for a in resident:
-        arena.pin(keys[a])
-    def partners_of(key):
-        return None if anchor_partners is None else anchor_partners(key)
-
-    if prefix_tree is not None and not prefix_tree.shared_tokens:
-        prefix_tree = None
-    sched = JoinAdmission(
-        [len(p) for p in prefixes],
-        [[len(s) for s in sufs] for sufs in stage_suffixes],
-        budget, arena.n_pages, arena.page_tokens,
-        frame_tokens=[len(f) for f in frames], resident=resident,
-        anchor_partners={a: partners_of(keys[a]) for a in range(len(keys))},
-        # a windowed model may pack any chunk unified, so it reserves
-        # the unified path's temporary pages throughout
-        temporary_suffix_pages=mode == "unified",
-        answer_dtype=async_ans.dtype,
-        canvas_tokens=len(canvas),
-        page_cost=arena.page_cost,
-        tree=prefix_tree,
-        advance=advance,
-    )
-    borrowing = sched.borrowing
-    borrowing.can_borrow = borrow_check(arena, keys, borrowing)
-    # counted after resident anchors detach: they pack no prefix
-    borrowers = borrowing.borrowers()
-    lowest_borrow = lowest_borrows(borrowing)
-    held = [keys[a] for a, n in enumerate(borrowers) if n]
-    spans = []
-    tokens = 0
-    outstanding = []     # (groups, handle) in launch order
     scoring = async_ans.dtype is not None
-    label = "AI.SCORE" if scoring else f"join ({k} stages)"
-    total = (sum(sched._count(a, j) for a in range(len(prefixes)) for j in range(k))
-             if scoring else len(prefixes))
-    progress = Progress(
-        label, total=None if anchor_source is not None else total,
-        unit="scores" if scoring else "anchors")
-    finished = [0]
-
-    def admit(items):
-        if anchor_batch is not None and items:
-            kept = set(anchor_batch([key for key, _ in items]))
-            for key, _ in items:
-                if key not in kept and arena.is_resident(key):
-                    arena.free_key(key)
-            items = [(key, prefix) for key, prefix in items if key in kept]
-        for key, prefix in items:
-            if not arena.is_resident(key):
-                raise ValueError(
-                    f"streamed anchor {key!r} has no KV in the arena")
-            arena.pin(key)
-            keys.append(key)
-            prefixes.append(prefix)
-            sched.admit(len(prefix), held_pages(key, len(prefix)),
-                        partners=partners_of(key))
-
-    def pull(evict_retained=False, force=False):
-        """Run source chunks until a join chunk can fill or the source blocks.
-
-        Returns whether the source launched a chunk or handed over an
-        anchor.
-        """
-        moved = False
-        while not anchor_source.done and (
-                force or sched.buildable_tokens() < budget):
-            force = False
-            before = anchor_source.chunks
-            items, blocked = anchor_source.next(
-                evict_retained=evict_retained)
-            admit(items)
-            moved = moved or bool(items) or anchor_source.chunks > before
-            if blocked:
-                break
-        return moved
-
-    def build(chunk_groups):
-        specs = []
-        for a, j, start, end, carried in chunk_groups:
-            key = keys[a]
-            f = len(prefixes[a])
-            frame = frames[j]
-            parent, shared = ((borrowing.parent(a), borrowing.shared(a))
-                              if carried else (None, 0))
-            fresh = not arena.is_resident(key)
-            got = arena.activate(
-                key, f, capacity_tokens=f + frame_max, base_tokens=f,
-                borrow=(keys[parent], shared) if shared else None)
-            assert got is not None, \
-                "scheduler admitted an anchor the arena cannot hold"
-            if fresh and a < len(borrowers) and borrowers[a]:
-                arena.hold(key, borrowers[a])
-                arena.keep_window(key, lowest_borrow[a])
-            prefix = None
-            if carried:
-                prefix = prefixes[a][shared:] if shared else prefixes[a]
-            sufs = [stage_suffixes[j][i]
-                    for i in sched.partner_indices(a, j, start, end)]
-            if frame and start == 0:
-                # frame entry: scatter the frame into KV after the
-                # document rows. The pair entry reads doc + frame.
-                # The frame entry's answer bit is skipped by report().
-                specs.append(dict(
-                    key=key, prefix=prefix, start=shared,
-                    f=f, suffixes=[frame],
-                    write_suffix_tokens=len(frame)))
-                specs.append(dict(
-                    key=key, prefix=None, f=f + len(frame),
-                    suffixes=sufs, read_all_rows=read_all_rows))
-            else:
-                specs.append(dict(
-                    key=key, prefix=prefix, start=shared,
-                    f=f + len(frame),
-                    suffixes=sufs, read_all_rows=read_all_rows))
-        return pack_chunk(torch, arena, specs, attention_mode=mode,
-                          staging=staging, canvas=canvas,
-                          answer_row=answer_row)
-
-    def settle(anchor):
-        if anchor_done is None:
-            if arena.is_resident(keys[anchor]):
-                arena.free_key(keys[anchor])
-        else:
-            anchor_done(anchor, sched.answers[k - 1].get(anchor, []))
-
-    def event(kind, anchor):
-        if kind == "finished":
-            settle(anchor)
-            finished[0] += 1
-        elif arena.is_resident(keys[anchor]):
-            arena.free_key(keys[anchor])
-
-    def report(entry):
-        groups, handle = entry
-        bits = async_ans.result(handle)
-        pos = 0
-        for a, j, start, end, _ in groups:
-            if frames[j] and start == 0:
-                pos += 1        # the frame entry's bit means nothing
-            cnt = end - start
-            for kind, anchor in sched.report(
-                    a, j, start, end, bits[pos:pos + cnt]):
-                event(kind, anchor)
-            pos += cnt
-        progress.update(
-            progress.done + sum(end - start for _, _, start, end, _ in groups)
-            if scoring else finished[0])
-
-    def run_part(part):
-        """Run one chunk of groups, halving it when its pages do not fit.
-
-        The admission prices a chunk's temporary suffix pages, but the
-        packer takes them in both pools a page at a time, and on long
-        documents with many short suffixes the tighter pool can run
-        out. Halving costs only chunk efficiency.
-        """
-        try:
-            run_one(part)
-        except ArenaFullError as error:
-            # retained KV nothing here reads makes room first; it is
-            # a cache
-            need = arena.page_cost(sum(entry_rows(*e) for e in part))
-            if arena.evict_retained(need):
-                logger.info("join chunk of %d groups retried after "
-                            "evicting retained KV", len(part))
-                run_part(part)
-                return
-            if len(part) < 2:
-                raise
-            logger.info("join chunk of %d groups split: %s", len(part), error)
-            half = len(part) // 2
-            run_part(part[:half])
-            run_part(part[half:])
-
-    def run_one(part):
-        nonlocal tokens
-        chunk = build(part)
-        tokens += chunk.tokens
-        e0 = torch.cuda.Event(enable_timing=True)
-        e1 = torch.cuda.Event(enable_timing=True)
-        e0.record()
-        normed = _forward(pipeline, arena, chunk)
-        e1.record()
-        for key in chunk.fresh_keys:
-            arena.trim_window(key)
-        spans.append((part[0][1], e0, e1))
-        handle = (async_ans.submit(normed, rows_per_answer=chunk.rows_per_answer)
-                  if chunk.rows_per_answer else async_ans.submit(normed))
-        outstanding.append((part, handle))
-        # read the previous chunk's answers while this one runs
-        while len(outstanding) > 1:
-            report(outstanding.pop(0))
-
-    while True:
-        if anchor_source is not None and not anchor_source.done:
-            pull()
-        # anchors with no partner at their first stage never run
-        for kind, anchor in sched.take_settled():
-            event(kind, anchor)
-        if sched.done() and (anchor_source is None
-                             or anchor_source.done):
-            break
-        if sched.blocked_pages:
-            # the free list is short for the next fresh anchor:
-            # retained KV nothing here reads makes room
-            arena.evict_retained(sched.blocked_pages)
-        groups = sched.next_chunk(arena.free_pages)
-        if not groups:
-            if outstanding:
-                report(outstanding.pop(0))
-                continue
-            if anchor_source is not None and not anchor_source.done:
-                # the source has to move; it may evict retained KV to admit
-                if pull(evict_retained=True, force=True):
-                    continue
-            if sched.blocked_pages and arena.evict_retained(sched.blocked_pages):
-                continue
-            # parents freed but held for queued children hold the
-            # pages: the children pack their whole prefixes
-            if arena.drop_holds(held):
-                continue
-            raise AssertionError("nothing buildable and nothing in flight")
-        run_part(groups)
-        # the packed children hold their parents' pages now
-        for a, _, start, _, carried in groups:
-            parent = (borrowing.tree_parent[a]
-                      if a < len(borrowing.tree_parent) else None)
-            if carried and start == 0 and parent is not None:
-                arena.release(keys[parent])
-    while outstanding:
-        report(outstanding.pop(0))
-    progress.finish(f"{label} done", f"{tokens:,} fresh tokens")
-    arena.drop_holds(held)
-    if stats is not None:
-        stats["borrowed_tokens"] = borrowing.borrowed_tokens
-    return sched.answers, spans, tokens
+    stages = [
+        Stage(
+            suffixes=stage_suffixes[j], readout=async_ans, frame=frames[j],
+            requests=(None if anchor_partners is None
+                      else (lambda key, j=j: anchor_partners(key)[j])),
+            decide=(None if advance is None
+                    else (lambda a, row, j=j: advance(a, j, row))),
+            read_all_rows=read_all_rows)
+        for j in range(k)
+    ]
+    on_settled = None
+    if anchor_done is not None:
+        def on_settled(anchor, survived, row):
+            anchor_done(anchor, row)
+    return run_stages(
+        torch, arena, pipeline, stages, anchor_prefixes, budget,
+        anchor_keys=anchor_keys, on_settled=on_settled,
+        anchor_source=anchor_source, anchor_batch=anchor_batch,
+        staging=staging, attention_mode=attention_mode,
+        prefix_tree=prefix_tree, stats=stats,
+        unit="scores" if scoring else "anchors",
+        label="AI.SCORE" if scoring else f"join ({k} stages)")
 
 
 # ------------------------------------------------------------- warmup

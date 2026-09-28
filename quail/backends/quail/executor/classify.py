@@ -166,6 +166,8 @@ class QuailClassifier:
 
         def advance(anchor, stage, row):
             labels[stage][anchor] = label_of(stage, row)
+            if stage == len(spec.stages):
+                return True      # the last stage: every document survives
             accepted = spec.stages[stage].accepted
             return accepted is None or labels[stage][anchor] in accepted
 

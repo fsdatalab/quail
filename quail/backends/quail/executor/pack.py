@@ -242,9 +242,17 @@ class JoinAdmission:
             before a borrow; same_chunk says the parent is admitted in
             the chunk being built. None allows every borrow.
         advance: Callable(anchor, stage, row) -> bool deciding, once an
-            anchor's whole row at a stage before the last is in,
-            whether it goes on to the next stage. None advances an
-            anchor as soon as one answer in the row is true.
+            anchor's whole row at a stage is in, whether it goes on to
+            the next stage, or at the last stage whether it survives.
+            None advances an anchor as soon as one answer in the row
+            is true.
+        frame_writes: Per stage, whether its frame is written; a stage
+            whose frame is already in the anchor's KV from the stage
+            before packs no frame rows. None writes every frame.
+        limit: Stop admitting anchors once this many survived the last
+            stage; None runs every anchor.
+        answer_dtype: The answer array type, one for every stage or a
+            list per stage; None records 0/1 lists.
 
     Each chunk fills in priority order: partner streams cut by the
     previous chunk, then anchors starting their next stage, then
@@ -262,9 +270,16 @@ class JoinAdmission:
                  arena_pages, page_tokens, frame_tokens=None,
                  resident=None, anchor_partners=None, temporary_suffix_pages=False,
                  answer_dtype=None, canvas_tokens=0, page_cost=None,
-                 tree=None, can_borrow=None, advance=None):
-        self.answer_dtype = answer_dtype
+                 tree=None, can_borrow=None, advance=None,
+                 frame_writes=None, limit=None):
+        k = len(stage_suffixes)
+        self.answer_dtypes = (list(answer_dtype) if isinstance(answer_dtype, list)
+                              else [answer_dtype] * k)
+        if len(self.answer_dtypes) != k:
+            raise ValueError("answer_dtype must match stage_suffixes")
         self.advance = advance
+        self.limit = limit
+        self.survivors = 0
         n = len(prefix_tokens)
         self.borrowing = Borrowing(n, tree, can_borrow)
         # page_cost(tokens, base_tokens) prices a key in the arena's
@@ -283,7 +298,13 @@ class JoinAdmission:
                        else [0] * len(self.stages))
         if len(self.frames) != len(self.stages):
             raise ValueError("frame_tokens must match stage_suffixes")
-        self.frame_rows = [f + canvas_tokens if f else 0 for f in self.frames]
+        writes = ([True] * len(self.stages) if frame_writes is None
+                  else list(frame_writes))
+        if len(writes) != len(self.stages):
+            raise ValueError("frame_writes must match stage_suffixes")
+        self.frame_writes = writes
+        self.frame_rows = [f + canvas_tokens if f and write else 0
+                           for f, write in zip(self.frames, writes)]
         if not self.stages:
             raise ValueError("a join needs at least one stage")
         self.chunk_budget = chunk_budget
@@ -513,6 +534,8 @@ class JoinAdmission:
         buildable.
         """
         self.blocked_pages = 0
+        if self.limit_reached():
+            return []
         room = self.chunk_budget
         groups = []
         continued = []
@@ -596,20 +619,20 @@ class JoinAdmission:
         before the last answered FALSE, so the anchor's pages can go;
         ("finished", a) when its last-stage row is complete.
         """
-        if self.answer_dtype is None:
+        dtype = self.answer_dtypes[j]
+        if dtype is None:
             row = self.answers[j].setdefault(a, [])
             received = len(row)
         else:
             if a not in self.answers[j]:
-                self.answers[j][a] = np.empty(
-                    self._count(a, j), dtype=self.answer_dtype)
+                self.answers[j][a] = np.empty(self._count(a, j), dtype=dtype)
             row = self.answers[j][a]
             received = self._answer_counts[j].get(a, 0)
         if received != start or len(bits) != end - start:
             raise AssertionError(
                 f"anchor {a} stage {j}: answers for partners "
                 f"{start}:{end} arrived with {received} recorded")
-        if self.answer_dtype is None:
+        if dtype is None:
             row.extend(bits)
         else:
             row[start:end] = bits
@@ -619,9 +642,9 @@ class JoinAdmission:
         n_j = self._count(a, j)
         complete = end == n_j
         if self.advance is not None:
-            if complete and j + 1 < k:
+            if complete:
                 self._true[a][j] = bool(self.advance(a, j, row))
-        elif (any(bits) if self.answer_dtype is None else np.any(bits)):
+        elif (any(bits) if dtype is None else np.any(bits)):
             self._true[a][j] = True
         events = []
         if j == self._stage[a] and j + 1 < k:
@@ -642,12 +665,33 @@ class JoinAdmission:
                 events.append(("dropped", a))
         if j == k - 1 and complete:
             self._stage[a] = _DONE
+            if self._true[a][j]:
+                self.survivors += 1
             events.append(("finished", a))
         return events
+
+    def limit_reached(self) -> bool:
+        """Whether enough anchors survived the last stage to stop admitting."""
+        return self.limit is not None and self.survivors >= self.limit
+
+    def drain(self):
+        """Anchors still queued once the limit ends the run; they never run.
+
+        Returns their indices for the caller to free.
+        """
+        out = [a for a in self.ready if self._stage[a] != _DONE]
+        out.extend(a for a in self.pending if self._stage[a] != -1)
+        for a in out:
+            self._stage[a] = _DONE
+        self.ready.clear()
+        self.pending.clear()
+        return out
 
     # ---- progress ------------------------------------------------------
 
     def done(self):
+        if self.limit_reached():
+            return not self.in_flight and not self._settled
         return not self.pending and not self.ready \
             and not self.in_flight and not self._settled
 
