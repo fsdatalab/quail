@@ -5,14 +5,17 @@ from typing import Optional
 
 from quail.catalog import Catalog
 from quail.logical import (
+    Alias,
     ColumnRef,
     CompileError,
     Equality,
     FilterPredicate,
     JoinSpec,
+    LabelIn,
     LogicalPlan,
     LogicalPlanBuilder,
     ModelCall,
+    bind_classify_prompt,
     bind_join_prompt,
     bind_prompt,
 )
@@ -74,6 +77,7 @@ class Query:
         #                              its pairs
         self._applies = {}           # alias -> [(name, kind, ids, refs)]
         self._functions = {}         # name -> the Python function
+        self._labels = {}            # name -> Alias of an AI.CLASSIFY call
         self._limit = None
 
     # ---- scope -------------------------------------------------------
@@ -154,6 +158,61 @@ class Query:
         return self
 
     ai_if = ai_filter
+
+    def ai_classify(self, p: PromptSpec, labels, *, name: str,
+                    descriptions=None) -> "Query":
+        """Pick one label per document and name it as a result column.
+
+        The column can be returned by select() and tested with
+        label_in(). Each document gets the label with the highest sum
+        of its tokens' log probabilities after the prompt; a tie goes
+        to the earlier label.
+
+        Args:
+            p: Prompt over one table's document column.
+            labels: The labels, in the order the prompt lists them.
+            name: The result column's name.
+            descriptions: One description per label, empty for none.
+        """
+        if self._pending_join is not None:
+            raise CompileError(
+                "join() is waiting for the ai_filter over its pairs; "
+                "classify before joining")
+        if not name or "." in name:
+            raise CompileError(
+                f"a classification needs a column name without a dot, "
+                f"got {name!r}")
+        if name in self._labels or name in self._scope():
+            raise CompileError(f"the name {name!r} is already used")
+        labels = tuple(labels)
+        descriptions = tuple(descriptions or ())
+        refs = tuple(self._resolve(c) for c in p.cols)
+        bound = bind_classify_prompt(p.template, refs, labels, descriptions,
+                                     self._tokenizer, turn=self._turn)
+        self._note_doc_column(refs[0])
+        call = ModelCall(bound, "label", labels, descriptions)
+        call.validate()
+        self._labels[name] = Alias(call, name)
+        return self
+
+    def label_in(self, name: str, labels,
+                 selectivity: Optional[float] = None) -> "Query":
+        """Keep the documents whose classification is one of the labels.
+
+        Args:
+            name: A column named by ai_classify().
+            labels: The accepted labels.
+            selectivity: Fraction of documents expected to pass.
+        """
+        if name not in self._labels:
+            raise CompileError(f"no classification is named {name!r}")
+        call = self._labels[name].expression
+        test = LabelIn(call, tuple(labels), name)
+        test.validate()
+        (alias,) = call.aliases()
+        self._filters.setdefault(alias, []).append(
+            FilterPredicate(test, selectivity=selectivity))
+        return self
 
     def join(self, other: "Query", on=None) -> "Query":
         """Join one table on ordinary column equalities.
@@ -290,6 +349,9 @@ class Query:
                 raise CompileError(
                     "every joined side must be a single (optionally "
                     "filtered) docs(...) query")
+            if other._labels:
+                raise CompileError(
+                    "a joined side cannot carry an AI.CLASSIFY column yet")
             alias, provider = other._tables[0]
             if alias in self._scope():
                 raise CompileError(f"duplicate table alias {alias!r}")
@@ -392,12 +454,15 @@ class Query:
                 f"join() of {self._pending_join[0]} has no AI predicate "
                 f"over its pairs; a plain join belongs in the database "
                 f"the ids came from")
-        if not self._joins and not self._filters:
+        if not self._joins and not self._filters and not self._labels:
             raise CompileError("the query has no AI predicate; a plain "
                                "scan belongs in the database the ids "
                                "came from")
         columns = []
         for c in cols:
+            if isinstance(c, str) and c in self._labels:
+                columns.append(self._labels[c])
+                continue
             if c == "*":
                 for alias, provider in self._tables:
                     for name in self._catalog.get(provider).columns:

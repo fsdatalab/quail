@@ -19,15 +19,18 @@ from .codec import (
     plan_envelope,
 )
 from .nodes import (
+    AiClassify,
     AiFilter,
     AiJoin,
     AiScore,
     Barrier,
+    ClassifySpec,
     Exchange,
     FilterStage,
     Foreign,
     HashJoin,
     JoinStage,
+    LabelFilter,
     Limit,
     Project,
     Recombine,
@@ -41,8 +44,11 @@ from .nodes import (
 )
 
 __all__ = [
+    "AiClassify",
     "AiJoin",
     "AiScore",
+    "ClassifySpec",
+    "LabelFilter",
     "Scan",
     "Barrier",
     "Exchange",

@@ -9,6 +9,7 @@ from quail.logical import (
     CompileError,
     FilterPredicate,
     Join,
+    LabelIn,
     LogicalPlan,
     ModelCall,
     Project,
@@ -38,7 +39,16 @@ INVALID_PREDICATES = [
     (Compare(_filter_call("score"), "=", 0.5), "unsupported AI.SCORE comparison"),
     (Compare(_filter_call("score"), ">=", 1.5), "between 0 and 1"),
     (_filter_call("score"), "only when compared"),
-    (ModelCall(bind_prompt("q {0}", (R,)), "label"), "kind must be one of"),
+    (ModelCall(bind_prompt("q {0}", (R,)), "text"), "kind must be one of"),
+    (ModelCall(bind_prompt("q {0}", (R,)), "label"), "at least two labels"),
+    (ModelCall(bind_prompt("q {0}", (R,)), "label", ("a", "A")),
+     "differ ignoring case"),
+    (ModelCall(bind_prompt("q {0}", (R,)), "label", ("a", "b")),
+     "tested against a label list"),
+    (ModelCall(bind_prompt("q {0}", (R,)), "boolean", ("a", "b")),
+     "only an AI.CLASSIFY call has labels"),
+    (LabelIn(ModelCall(bind_prompt("q {0}", (R,)), "label", ("a", "b")),
+             ("c",)), "does not have"),
 ]
 
 

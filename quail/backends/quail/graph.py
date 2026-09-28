@@ -478,7 +478,7 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
         "backend_metrics": {"scores": [
             dict(value.metrics.extension)
             for node_id, value in result.nodes.items()
-            if graph.node(node_id).type_name == AiScore.type_name
+            if isinstance(graph.node(node_id), AiScore)
         ]},
         "node_metrics": scalar_node_metrics(result.nodes),
         "executed_join_plan": executed_join_plan(graph),

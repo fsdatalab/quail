@@ -28,6 +28,7 @@ from quail.bench.results import write_json
 from quail.bench.substrait import QueryPlan, read_plan
 from quail.planner.plan import Refusal
 from quail.specs import H100_USD_PER_HOUR, MODELS
+from quail_b.prompts import AGENT_OUTCOME, FEV_TOPIC, IMDB_SENTIMENT
 from quail_b.queries import (
     FILTER_SELECTIVITY_ESTIMATES,
     JOIN_SELECTIVITY_ESTIMATES,
@@ -39,9 +40,20 @@ from quail_b.queries import (
 from quail_b.queries import queries as query_specs
 from quail_b.scoring import RunOutput, reference_answer
 
-# the fixed planner inputs, by prompt; a predicate without an
-# estimate here gets the planner's default selectivity
-SELECTIVITY = {**FILTER_SELECTIVITY_ESTIMATES, **JOIN_SELECTIVITY_ESTIMATES}
+# Label filters pass these fractions of the scale factor 0.1
+# reference labels in collection gt_6d7ca88a74a30b665bfb67dcde76daff,
+# keyed by (classification prompt, accepted labels).
+LABEL_SELECTIVITY_ESTIMATES = {
+    (IMDB_SENTIMENT, frozenset({"negative", "mixed"})): 2923 / 5000,
+    (FEV_TOPIC, frozenset({"politics", "history"})): 46 / 500,
+    (AGENT_OUTCOME, frozenset({"not resolved"})): 1112 / 1772,
+}
+
+# the fixed planner inputs, by prompt, and by prompt and accepted
+# labels for a label filter; a predicate without an estimate here gets
+# the planner's default selectivity
+SELECTIVITY = {**FILTER_SELECTIVITY_ESTIMATES, **JOIN_SELECTIVITY_ESTIMATES,
+               **LABEL_SELECTIVITY_ESTIMATES}
 TEXT_VLLM_BACKENDS = frozenset({
     "dumb_vllm",
     "pipelined_vllm",
@@ -49,12 +61,14 @@ TEXT_VLLM_BACKENDS = frozenset({
 })
 
 
-CLASSIFY_UNSUPPORTED = "AI.CLASSIFY is not in Quail's runtime yet"
+CLASSIFY_UNSUPPORTED = ("Quail runs AI.CLASSIFY only on one table without "
+                        "AI.IF yet")
 
 
 def runs_on_quail(spec: QuerySpec) -> bool:
     """Whether Quail's runtime has every operator the query uses."""
-    return not spec._info.classifies
+    plan = read_plan(spec.plan)
+    return not plan.classifies or (not plan.joins and not plan.filters)
 
 
 def register_tables(session, data_dir):
@@ -84,6 +98,8 @@ def queries(session) -> dict:
         if not runs_on_quail(spec):
             continue
         plan = read_plan(spec.plan)
+        if plan.classifies and session.config.backend != "quail":
+            continue
         if all(relation.table in session.catalog for relation in plan.relations):
             listed[spec.id] = (
                 spec.description, lambda plan=plan: _build(session, plan))
@@ -137,9 +153,21 @@ def run_output(result, plan: QueryPlan, tables) -> RunOutput:
 
     filter_answers = {}
     for (alias, position), table in result.answer_tables["filters"].items():
-        filter_answers[plan.filter_id(alias, position)] = pa.table({
+        operator = _alias_filters(plan, alias)[position]
+        if isinstance(operator, substrait.LabelFilter):
+            # QUAIL-B scores a label filter from the classification's labels
+            continue
+        filter_answers[operator.id] = pa.table({
             alias: id_column(alias, table.column(alias)),
             "answer": table.column("answer"),
+        })
+    classify_answers = {}
+    for operator in plan.classifies:
+        table = result.answer_tables["classifies"][operator.output]
+        classify_answers[operator.id] = pa.table({
+            operator.alias: id_column(operator.alias,
+                                      table.column(operator.alias)),
+            "label": table.column(operator.output),
         })
     join_answers = {}
     for position, table in result.answer_tables["joins"].items():
@@ -149,19 +177,30 @@ def run_output(result, plan: QueryPlan, tables) -> RunOutput:
                for alias in join.aliases},
             "answer": table.column("answer"),
         })
-    aliases = []
+    outputs = {(operator.alias, operator.output)
+               for operator in plan.classifies}
+    names = []
     for name in plan.select:
         alias, column = name.split(".", 1)
-        if column != "id":
+        if column != "id" and (alias, column) not in outputs:
             raise NotImplementedError(
-                "QUAIL-B output accuracy needs id columns in the select list")
-        aliases.append(alias)
+                "QUAIL-B output accuracy needs id and label columns in the "
+                "select list")
+        names.append(alias if column == "id" else column)
     started = time.perf_counter()
     rows = result.collect()
     collection_s = time.perf_counter() - started
     return RunOutput(
-        filter_answers, join_answers, rows.rename_columns(aliases),
-        result.report["wall_s"], dict(result.report, collection_s=collection_s))
+        filter_answers, join_answers, rows.rename_columns(names),
+        result.report["wall_s"], dict(result.report, collection_s=collection_s),
+        classify_answers=classify_answers or None)
+
+
+def _alias_filters(plan: QueryPlan, alias: str) -> list:
+    """Return an alias's AI filters and label filters, in written order."""
+    return [operator for operator in plan.operators
+            if isinstance(operator, (substrait.Filter, substrait.LabelFilter))
+            and operator.alias == alias]
 
 
 def join_anchors(result) -> dict:
@@ -192,9 +231,12 @@ def prompt_pieces(query, plan: QueryPlan, anchors) -> dict:
     pieces = {"tokenizer": query.session.model.hf_name, "preamble": preamble,
               "filters": [], "joins": []}
     for alias, predicates in filters.items():
+        written = _alias_filters(plan, alias)
         for position, predicate in enumerate(predicates):
+            if isinstance(written[position], substrait.LabelFilter):
+                continue
             pieces["filters"].append({
-                "id": plan.filter_id(alias, position),
+                "id": written[position].id,
                 "tail": list(predicate.prompt.tail_token_ids)})
     for position, join in enumerate(joins):
         anchor = anchors[position]

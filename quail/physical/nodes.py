@@ -502,6 +502,70 @@ class AiScore(PhysicalNode):
 
 
 @dataclass(frozen=True)
+class ClassifySpec(ScoreSpec):
+    """One batched AI.CLASSIFY computation over one table's documents.
+
+    ``prompt_token_parts`` is (preamble ids, tail ids): the document
+    goes between them. ``label_token_ids`` holds each label's ids as
+    scored after the tail, in label order.
+    """
+
+    labels: tuple[str, ...] = ()
+    label_token_ids: tuple[tuple[int, ...], ...] = ()
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "ClassifySpec":
+        base = ScoreSpec.from_mapping(value)
+        return cls(
+            **{name: getattr(base, name) for name in (
+                "name", "aliases", "query_template", "arguments",
+                "expected_inputs", "estimated_seconds", "pair_fraction",
+                "prompt_token_parts")},
+            labels=tuple(str(label) for label in value["labels"]),
+            label_token_ids=tuple(
+                tuple(int(token) for token in ids)
+                for ids in value["label_token_ids"]),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            **super().to_dict(),
+            "labels": list(self.labels),
+            "label_token_ids": [list(ids) for ids in self.label_token_ids],
+        }
+
+
+@dataclass(frozen=True)
+class AiClassify(AiScore):
+    """Append one STRING label, chosen from a fixed list, to each document row.
+
+    Runs through the AI.SCORE runtime; the spec's labels make the
+    appended column a label instead of a score.
+    """
+
+    spec: ClassifySpec | None = None
+
+    type_name: ClassVar[str] = "quail.ai_classify"
+
+    def explain_fields(self) -> Mapping[str, Any]:
+        return {
+            **super().explain_fields(),
+            "labels": [] if self.spec is None else list(self.spec.labels),
+        }
+
+    @classmethod
+    def from_attributes(cls, node_id, inputs, attributes):
+        value = attributes["spec"]
+        return cls(
+            node_id=node_id,
+            inputs=inputs,
+            backend_name=str(attributes["backend_name"]),
+            model=str(attributes["model"]),
+            spec=None if value is None else ClassifySpec.from_mapping(value),
+        )
+
+
+@dataclass(frozen=True)
 class ScoreFilter(PhysicalNode):
     """Apply one numeric comparison while retaining the score column."""
 
@@ -564,6 +628,40 @@ class ScoreFilter(PhysicalNode):
             threshold=float(attributes["threshold"]),
             selectivity=attributes["selectivity"],
             written_pos=int(attributes["written_pos"]),
+        )
+
+
+@dataclass(frozen=True)
+class LabelFilter(ScoreFilter):
+    """Keep the rows whose label column holds one of the accepted labels."""
+
+    accepted: tuple[str, ...] = ()
+
+    type_name: ClassVar[str] = "quail.label_filter"
+
+    def attributes(self) -> dict:
+        return {**super().attributes(), "accepted": list(self.accepted)}
+
+    def explain_fields(self) -> Mapping[str, Any]:
+        return {
+            "label": self.score_name,
+            "accepted": list(self.accepted),
+            "selectivity": self.selectivity,
+            "aliases": list(self.aliases),
+        }
+
+    @classmethod
+    def from_attributes(cls, node_id, inputs, attributes):
+        return cls(
+            node_id=node_id,
+            inputs=inputs,
+            score_name=str(attributes["score_name"]),
+            aliases=tuple(attributes["aliases"]),
+            comparison=str(attributes["comparison"]),
+            threshold=float(attributes["threshold"]),
+            selectivity=attributes["selectivity"],
+            written_pos=int(attributes["written_pos"]),
+            accepted=tuple(str(label) for label in attributes["accepted"]),
         )
 
 

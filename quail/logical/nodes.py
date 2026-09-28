@@ -49,8 +49,9 @@ DEFAULT_SELECTIVITY = 0.2
 SCORE_COMPARISONS = ("<", "<=", ">", ">=")
 
 # what a model call answers: "boolean" is AI.IF, yes or no;
-# "score" is AI.SCORE, a float between 0 and 1
-MODEL_CALL_KINDS = ("boolean", "score")
+# "score" is AI.SCORE, a float between 0 and 1; "label" is
+# AI.CLASSIFY, one label from a fixed list
+MODEL_CALL_KINDS = ("boolean", "score", "label")
 
 
 def effective_selectivity(selectivity: Optional[float]) -> float:
@@ -67,6 +68,10 @@ class ModelCall:
     """
     prompt: Prompt
     kind: str = "boolean"
+    # a "label" call only: the labels in written order, and one
+    # description per label, empty for none
+    labels: tuple = ()
+    descriptions: tuple = ()
 
     type_name: ClassVar[str] = "quail.model_call"
 
@@ -79,6 +84,33 @@ class ModelCall:
             raise CompileError(
                 f"model call kind must be one of {MODEL_CALL_KINDS}, "
                 f"got {self.kind!r}")
+        if self.kind != "label":
+            if self.labels or self.descriptions:
+                raise CompileError("only an AI.CLASSIFY call has labels")
+            return
+        validate_labels(self.labels, self.descriptions)
+
+
+def validate_labels(labels: tuple, descriptions: tuple = ()) -> None:
+    """Check an AI.CLASSIFY label list and its descriptions.
+
+    Raises:
+        CompileError: Fewer than two labels, an empty label, two labels
+            equal ignoring case, or a description count that differs
+            from the label count.
+    """
+    if len(labels) < 2:
+        raise CompileError("AI.CLASSIFY needs at least two labels")
+    if any(not isinstance(label, str) or not label.strip()
+           for label in labels):
+        raise CompileError("every AI.CLASSIFY label is non-empty text")
+    folded = [label.casefold() for label in labels]
+    if len(set(folded)) != len(folded):
+        raise CompileError(
+            f"AI.CLASSIFY labels must differ ignoring case, got {list(labels)}")
+    if descriptions and len(descriptions) != len(labels):
+        raise CompileError(
+            "AI.CLASSIFY needs one description per label, empty for none")
 
 
 @dataclass(frozen=True)
@@ -102,6 +134,32 @@ class Compare:
 
 
 @dataclass(frozen=True)
+class LabelIn:
+    """An AI.CLASSIFY label tested against accepted labels; answers yes or no."""
+    call: ModelCall
+    accepted: tuple    # tuple[str, ...], each one of call.labels
+    name: str = ""     # the label column's name, when the query named it
+
+    type_name: ClassVar[str] = "quail.label_in"
+
+    def validate(self) -> None:
+        self.call.validate()
+        if self.call.kind != "label":
+            raise CompileError("only an AI.CLASSIFY label is tested for "
+                               "membership in a label list")
+        if not self.accepted:
+            raise CompileError("a label filter needs at least one label")
+        unknown = [label for label in self.accepted
+                   if label not in self.call.labels]
+        if unknown:
+            raise CompileError(
+                f"label filter names labels {unknown} that the "
+                f"classification does not have")
+        if len(set(self.accepted)) != len(self.accepted):
+            raise CompileError("a label filter lists a label twice")
+
+
+@dataclass(frozen=True)
 class Alias:
     """A model call returned as a named result column."""
     expression: ModelCall
@@ -119,7 +177,7 @@ def model_call(expression) -> ModelCall:
     """Return the model call inside a predicate or projected expression."""
     if isinstance(expression, ModelCall):
         return expression
-    if isinstance(expression, Compare):
+    if isinstance(expression, (Compare, LabelIn)):
         return expression.call
     if isinstance(expression, Alias):
         return expression.expression
@@ -131,17 +189,26 @@ def is_score(expression) -> bool:
     return model_call(expression).kind == "score"
 
 
+def is_label(expression) -> bool:
+    """Return whether the expression computes an AI.CLASSIFY label."""
+    return model_call(expression).kind == "label"
+
+
 def validate_predicate(expression) -> None:
     """Check that an expression answers yes or no for every row."""
-    if isinstance(expression, Compare):
+    if isinstance(expression, (Compare, LabelIn)):
         expression.validate()
         return
     if isinstance(expression, ModelCall):
         expression.validate()
-        if expression.kind != "boolean":
+        if expression.kind == "score":
             raise CompileError(
                 "an AI.SCORE call is a predicate only when compared with "
                 "a threshold")
+        if expression.kind == "label":
+            raise CompileError(
+                "an AI.CLASSIFY call is a predicate only when its label "
+                "is tested against a label list")
         return
     raise CompileError(
         f"a predicate is a model call or a comparison, got "
@@ -416,8 +483,13 @@ def _explain(expression) -> str:
     if isinstance(expression, Compare):
         return (f"{_explain(expression.call)} {expression.comparison} "
                 f"{expression.threshold}")
+    if isinstance(expression, LabelIn):
+        return f"{_explain(expression.call)} IN {list(expression.accepted)}"
     if isinstance(expression, Alias):
         return f"{_explain(expression.expression)} AS {expression.name}"
+    if expression.kind == "label":
+        return (f"AI.CLASSIFY({expression.prompt.template!r}, "
+                f"{list(expression.labels)})")
     function = "AI.SCORE" if expression.kind == "score" else "AI.IF"
     return f"{function}({expression.prompt.template!r})"
 

@@ -26,6 +26,7 @@ from quail.physical import (
     PhysicalNode,
 )
 from quail.planner import plan_quail
+from quail.planner.classify import has_label, plan_classify
 from quail.planner.physical_optimizer import (
     ModelRegion,
     PhysicalCandidate,
@@ -349,6 +350,13 @@ class QuailBackend:
         context: PlanningContext,
     ) -> tuple[PhysicalCandidate, ...]:
 
+        if has_label(region.logical_plan):
+            if context.model.role == "reranker":
+                return (PhysicalCandidate(None, Refusal(
+                    reasons=("a reranker model cannot run AI.CLASSIFY",),
+                    constraint="reranker_only_scores", needed=1, available=0,
+                    unit="AI.CLASSIFY expressions"), float("inf")),)
+            return plan_classify(region, context, backend_name=self.name)
         operators = region.logical_plan.operators()
         has_score = any(
             is_score(predicate.expression)

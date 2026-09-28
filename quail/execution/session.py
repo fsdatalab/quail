@@ -553,6 +553,15 @@ class BoundBuilder:
 
     ai_if = ai_filter
 
+    def ai_classify(self, p, labels, *, name, descriptions=None):
+        self._inner.ai_classify(p, labels, name=name,
+                                descriptions=descriptions)
+        return self
+
+    def label_in(self, name, labels, selectivity=None):
+        self._inner.label_in(name, labels, selectivity=selectivity)
+        return self
+
     def join(self, other, on=None):
         inner = other._inner if isinstance(other, BoundBuilder) else other
         self._inner.join(inner, on=on)
@@ -1004,7 +1013,15 @@ class Query:
             report["observers"] = observer_reports
         result.report = report
 
-        answer_tables = {"filters": {}, "joins": {}}
+        from quail.physical import AiClassify
+
+        # every classified document's label, before any label filter
+        answer_tables = {"filters": {}, "joins": {}, "classifies": {
+            node.spec.name: response.outputs[PortRef(node.node_id, "scores")]
+            for node in plan.nodes
+            if isinstance(node, AiClassify)
+            and PortRef(node.node_id, "scores") in response.outputs
+        }}
         survivors = {
             scan.alias: list(range(len(self._doc_tokens[scan.alias])))
             for scan in scans

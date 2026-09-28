@@ -2,10 +2,12 @@
 
 import numpy as np
 
+from quail.backends.quail.executor.classify import QuailClassifier
 from quail.backends.quail.executor.loop import InputStaging, run_join
 from quail.backends.quail.executor.readout import AsyncScores
 from quail.execution.reranker import RerankerBatch
 from quail.execution.tokens import chain_tokens
+from quail.physical import ClassifySpec
 
 
 class QuailScorer:
@@ -15,6 +17,8 @@ class QuailScorer:
         self.state = state
 
     def score(self, spec, rows, documents):
+        if isinstance(spec, ClassifySpec):
+            return QuailClassifier(self.state).classify(spec, rows, documents)
         state = self.state
         rows = np.asarray(rows, dtype=np.int32)
         parts = spec.prompt_token_parts

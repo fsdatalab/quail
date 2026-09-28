@@ -3,10 +3,12 @@
 A QUAIL-B query is a Substrait plan (a protocol buffer that describes
 a relational query): `ReadRel` scans, `FilterRel` calls to
 `ai_filter`, inner `JoinRel` calls to `ai_join` (joined with ordinary
-`equal` conditions by `and`), and a `ProjectRel` under the root that
-selects the id column of each relation. The alias of a relation and
+`equal` conditions by `and`), inner `ProjectRel` calls to
+`ai_classify` that add a label column, `FilterRel` label tests
+(`SingularOrList` over a label column), and a `ProjectRel` under the
+root that selects id and label columns. The alias of a relation and
 the id of an operator are the `RelCommon.hint.alias` of its node.
-Operator ids number filters and joins in post-order, inputs before the
+Operator ids number operators in post-order, inputs before the
 operator and left before right.
 """
 
@@ -21,6 +23,7 @@ import quail
 AI_URN = "extension:org.fsdatalab.quail_b:functions_ai"
 AI_FILTER = "ai_filter:str_str"
 AI_JOIN = "ai_join:str_str_str"
+AI_CLASSIFY = "ai_classify:str_str_list_list"
 EQUAL = "equal:any_any"
 AND = "and:bool"
 
@@ -64,17 +67,51 @@ class Join:
 
 
 @dataclass(frozen=True)
+class Classify:
+    """One `ai_classify` that adds a label column to one relation.
+
+    Attributes:
+        id: The operator id.
+        alias: The classified relation.
+        column: Its document column.
+        prompt: The classification prompt.
+        labels: The labels, in listed order.
+        descriptions: One description per label, empty for none.
+        output: The label column's name.
+    """
+
+    id: str
+    alias: str
+    column: str
+    prompt: str
+    labels: tuple[str, ...]
+    descriptions: tuple[str, ...]
+    output: str
+
+
+@dataclass(frozen=True)
+class LabelFilter:
+    """Keep the documents whose label column holds an accepted label."""
+
+    id: str
+    alias: str
+    output: str
+    accepted: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class QueryPlan:
     """A QUAIL-B query as its relations, operators, and projection.
 
     Attributes:
         relations: The scanned relations, in scan order.
-        operators: The filters and joins, in operator id order.
-        select: The projected columns, as "alias.column".
+        operators: Every operator, in operator id order.
+        select: The projected columns, as "alias.column"; a label
+            column is its relation's alias and the column's name.
     """
 
     relations: tuple[Relation, ...]
-    operators: tuple[Filter | Join, ...]
+    operators: tuple[Filter | Join | Classify | LabelFilter, ...]
     select: tuple[str, ...]
 
     @property
@@ -84,6 +121,14 @@ class QueryPlan:
     @property
     def joins(self) -> tuple[Join, ...]:
         return tuple(op for op in self.operators if isinstance(op, Join))
+
+    @property
+    def classifies(self) -> tuple[Classify, ...]:
+        return tuple(op for op in self.operators if isinstance(op, Classify))
+
+    @property
+    def label_filters(self) -> tuple[LabelFilter, ...]:
+        return tuple(op for op in self.operators if isinstance(op, LabelFilter))
 
     def filter_id(self, alias: str, position: int) -> str:
         """Return the id of an alias's filter at a written position."""
@@ -102,7 +147,7 @@ def _functions(plan: plan_pb2.Plan) -> dict[int, str]:
         if not declaration.HasField("extension_function"):
             continue
         function = declaration.extension_function
-        if function.name in (AI_FILTER, AI_JOIN) and (
+        if function.name in (AI_FILTER, AI_JOIN, AI_CLASSIFY) and (
                 urns.get(function.extension_urn_reference) != AI_URN):
             raise ValueError(f"{function.name} must come from {AI_URN}")
         names[function.function_anchor] = function.name
@@ -124,6 +169,13 @@ def _string(expression: algebra_pb2.Expression) -> str:
             "string"):
         raise ValueError("an AI prompt must be a string literal")
     return expression.literal.string
+
+
+def _strings(expression: algebra_pb2.Expression) -> tuple[str, ...]:
+    if (not expression.HasField("literal")
+            or expression.literal.WhichOneof("literal_type") != "list"):
+        raise ValueError("ai_classify labels must be a list literal")
+    return tuple(value.string for value in expression.literal.list.values)
 
 
 def _call(expression: algebra_pb2.Expression, functions) -> tuple[str, list]:
@@ -156,6 +208,29 @@ def _read(rel: algebra_pb2.Rel, functions):
             raise ValueError("a scan needs a table name and an alias hint")
         fields = tuple((alias, name) for name in read.base_schema.names)
         return [Relation(alias, read.named_table.names[-1])], [], fields
+    if kind == "project":
+        project = rel.project
+        relations, operators, fields = _read(project.input, functions)
+        if len(project.expressions) != 1:
+            raise ValueError("an inner projection adds one ai_classify column")
+        name, arguments = _call(project.expressions[0], functions)
+        if name != AI_CLASSIFY or len(arguments) != 4:
+            raise ValueError("an inner projection must call ai_classify("
+                             "prompt, document, labels, descriptions)")
+        alias, column = _field(fields, arguments[1])
+        output = project.common.hint.output_names[-1].partition(".")[2]
+        operators.append(Classify(
+            project.common.hint.alias, alias, column, _string(arguments[0]),
+            _strings(arguments[2]), _strings(arguments[3]), output))
+        return relations, operators, (*fields, (alias, output))
+    if kind == "filter" and rel.filter.condition.HasField("singular_or_list"):
+        relations, operators, fields = _read(rel.filter.input, functions)
+        test = rel.filter.condition.singular_or_list
+        alias, output = _field(fields, test.value)
+        operators.append(LabelFilter(
+            rel.filter.common.hint.alias, alias, output,
+            tuple(_string(option) for option in test.options)))
+        return relations, operators, fields
     if kind == "filter":
         relations, operators, fields = _read(rel.filter.input, functions)
         name, arguments = _call(rel.filter.condition, functions)
@@ -223,21 +298,38 @@ def build_query(session, plan: QueryPlan, selectivity=None,
         session: A session with every relation's table registered.
         plan: The plan as `read_plan` returns it.
         selectivity: Prompt -> the fraction of documents or pairs
-            expected to pass, given to the planner for ordering.
+            expected to pass, given to the planner for ordering; a label
+            filter's key is (classification prompt, frozenset of
+            accepted labels).
         order: The filter order rule `select` takes.
     """
     selectivity = selectivity or {}
     by_alias = {relation.alias: relation for relation in plan.relations}
-    filters = {}
-    for item in plan.filters:
-        filters.setdefault(item.alias, []).append(item)
+    per_alias = {}
+    for item in plan.operators:
+        if isinstance(item, (Filter, Classify, LabelFilter)):
+            per_alias.setdefault(item.alias, []).append(item)
+    prompts = {(item.alias, item.output): item.prompt
+               for item in plan.classifies}
 
     def relation_query(alias):
         query = session.docs(by_alias[alias].table).alias(alias)
-        for item in filters.get(alias, ()):
-            query = query.ai_filter(
-                quail.prompt(item.prompt, quail.col(f"{alias}.{item.column}")),
-                selectivity=selectivity.get(item.prompt))
+        for item in per_alias.get(alias, ()):
+            if isinstance(item, Filter):
+                query = query.ai_filter(
+                    quail.prompt(item.prompt,
+                                 quail.col(f"{alias}.{item.column}")),
+                    selectivity=selectivity.get(item.prompt))
+            elif isinstance(item, Classify):
+                query = query.ai_classify(
+                    quail.prompt(item.prompt,
+                                 quail.col(f"{alias}.{item.column}")),
+                    item.labels, name=item.output,
+                    descriptions=item.descriptions)
+            else:
+                key = (prompts[(alias, item.output)], frozenset(item.accepted))
+                query = query.label_in(item.output, item.accepted,
+                                       selectivity=selectivity.get(key))
         return query
 
     joined = {plan.relations[0].alias}
@@ -255,4 +347,8 @@ def build_query(session, plan: QueryPlan, selectivity=None,
                          quail.col(f"{right}.{join.columns[1]}")),
             selectivity=selectivity.get(join.prompt))
         joined.add(new[0])
-    return query.select(*plan.select, order=order)
+    outputs = {(item.alias, item.output) for item in plan.classifies}
+    columns = [name.split(".", 1)[1]
+               if tuple(name.split(".", 1)) in outputs else name
+               for name in plan.select]
+    return query.select(*columns, order=order)

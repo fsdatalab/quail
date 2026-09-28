@@ -65,6 +65,7 @@ from quail.planner import (
 from quail.planner import (
     join_specs as logical_join_specs,
 )
+from quail.planner.classify import has_label
 from quail.planner.joins import search_joins, summarize_alias
 from quail.planner.physical_optimizer import PhysicalCandidate, SupportResult
 from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
@@ -99,6 +100,16 @@ def plan_request_backend(
             plan=Refusal(
                 reasons=("apply() functions run on the Quail backend only",),
                 constraint="apply_needs_quail_backend",
+                needed=1, available=0, unit="backends"),
+            estimated_seconds=float("inf"),
+        ),)
+    if has_label(region.logical_plan):
+        return (PhysicalCandidate(
+            graph=None,
+            plan=Refusal(
+                reasons=(f"AI.CLASSIFY is not implemented on {backend_name} "
+                         f"yet",),
+                constraint="classify_needs_quail_backend",
                 needed=1, available=0, unit="backends"),
             estimated_seconds=float("inf"),
         ),)

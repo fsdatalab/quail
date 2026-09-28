@@ -114,9 +114,12 @@ def test_labels_copy_by_content_and_join_a_reused_collection(
                       .read_text())["collection_id"] == summary["collection_id"]
 
 
-def test_quail_runner_skips_classification_queries():
+def test_quail_runner_skips_classifications_it_cannot_run():
     from quail.bench import quailb
     from quail_b.queries import get_query
 
     assert quailb.runs_on_quail(get_query("IMDB-4"))
-    assert not quailb.runs_on_quail(get_query("IMDB-11"))
+    assert quailb.runs_on_quail(get_query("IMDB-11"))
+    # IMDB-12 classifies after an AI.IF filter; LEP-6 joins
+    assert not quailb.runs_on_quail(get_query("IMDB-12"))
+    assert not quailb.runs_on_quail(get_query("LEP-6"))

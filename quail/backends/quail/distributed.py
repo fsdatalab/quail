@@ -426,7 +426,7 @@ def execute_distributed_graph(payload, graph: PhysicalGraph, gpu_count: int,
         backend_metrics={"scores": [
             dict(value.metrics.extension)
             for node_id, value in result.nodes.items()
-            if graph.node(node_id).type_name == AiScore.type_name
+            if isinstance(graph.node(node_id), AiScore)
         ]},
         executed_join_plan=executed_join_plan(graph),
         node_metrics=scalar_node_metrics(result.nodes),

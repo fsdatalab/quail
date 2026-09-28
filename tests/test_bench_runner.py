@@ -230,7 +230,9 @@ def test_read_plan_reads_operators_and_rejects_other_extensions():
         assert len(plan.relations) == len(plan.joins) + 1, spec.id
         ids = [op.id for op in plan.operators]
         assert len(set(ids)) == len(ids), spec.id
-        assert all(name.endswith(".id") for name in plan.select), spec.id
+        labels = {f"{op.alias}.{op.output}" for op in plan.classifies}
+        assert all(name.endswith(".id") or name in labels
+                   for name in plan.select), spec.id
 
     plan = get_query("IMDB-1").plan
     plan.extension_urns[0].urn = AI_URN + ".other"

@@ -85,6 +85,60 @@ class AsyncAnswers:
         return [int(b) for b in host.tolist()]
 
 
+class AsyncLabelLogprobs:
+    """Non-blocking full-vocabulary log probabilities of chosen tokens.
+
+    Each row gets log p(t) for every target token t, normalized over
+    the whole vocabulary at temperature 1. Logits are computed in the
+    head's dtype and normalized in float32, as vLLM computes returned
+    log probabilities. Rows go through the head in blocks, so no rows
+    by vocabulary matrix larger than one block is held.
+    """
+
+    BLOCK_ROWS = 64    # rows per head block: 64 x 151,936 x 6 bytes = 58 MiB
+
+    def __init__(self, torch, F, head, targets):
+        self.torch = torch
+        self.F = F
+        self.head = head
+        self.targets = torch.tensor(list(targets), device=head.device,
+                                    dtype=torch.long)
+        self.dtype = np.dtype((np.float32, (len(targets),)))
+        self.available = []
+
+    def logprobs(self, normed):
+        """Per row, the target tokens' log probabilities, on the device."""
+        torch = self.torch
+        out = torch.empty((normed.shape[0], len(self.targets)),
+                          dtype=torch.float32, device=normed.device)
+        for start in range(0, normed.shape[0], self.BLOCK_ROWS):
+            block = normed[start:start + self.BLOCK_ROWS]
+            logits = self.F.linear(block.to(self.head.dtype), self.head).float()
+            norm = torch.logsumexp(logits, dim=1, keepdim=True)
+            out[start:start + block.shape[0]] = (
+                logits.index_select(1, self.targets) - norm)
+        return out
+
+    def submit(self, normed):
+        torch = self.torch
+        values = self.logprobs(normed)
+        host = self.available.pop() if self.available else None
+        if host is None or host.shape[0] < values.shape[0]:
+            host = torch.empty(values.shape, dtype=torch.float32,
+                               pin_memory=True)
+        host[:values.shape[0]].copy_(values, non_blocking=True)
+        event = torch.cuda.Event()
+        event.record()
+        return event, host, values.shape[0]
+
+    def result(self, handle):
+        event, host, count = handle
+        event.synchronize()
+        values = host[:count].numpy().copy()
+        self.available.append(host)
+        return values
+
+
 class AsyncScores:
     """Non-blocking yes-against-no sigmoid readout for AI.SCORE."""
 

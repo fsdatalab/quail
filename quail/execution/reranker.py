@@ -14,7 +14,7 @@ from quail.execution.runner import (
     NodeMetrics,
     NodeResult,
 )
-from quail.physical import AiScore, ScoreFilter, ValueType
+from quail.physical import AiScore, ClassifySpec, LabelFilter, ScoreFilter, ValueType
 from quail.progress import answer_sink
 
 # Rows scored per reranker call. Each call's scores reach the answer sink
@@ -105,19 +105,24 @@ class ScoreRows:
 
 @dataclass(frozen=True)
 class RerankerBatch:
-    """Scores and token counts returned by one reranker call."""
+    """Scores, or AI.CLASSIFY labels, and token counts from one call."""
 
     scores: np.ndarray
     fresh_tokens: int
     cached_tokens: int
 
 
-def _score_table(rows, aliases, name, scores) -> pa.Table:
+def _value_type(spec) -> pa.DataType:
+    """The appended column's type: a label for AI.CLASSIFY, else a score."""
+    return pa.string() if isinstance(spec, ClassifySpec) else pa.float64()
+
+
+def _score_table(rows, aliases, name, scores, value_type=None) -> pa.Table:
     arrays = {
         alias: pa.array(rows[:, index], type=pa.int32())
         for index, alias in enumerate(aliases)
     }
-    arrays[name] = pa.array(scores, type=pa.float64())
+    arrays[name] = pa.array(scores, type=value_type or pa.float64())
     return pa.table(arrays).replace_schema_metadata({
         b"quail.kind": b"score_rows",
         b"quail.aliases": ",".join(aliases).encode("utf-8"),
@@ -209,12 +214,14 @@ def scored_batch(node, rows, table) -> dict:
     ``scores`` line up with them.
     """
     rows = np.asarray(rows)
-    return {"kind": "score", "node": node.node_id, "output": node.spec.name,
-            "aliases": list(node.spec.aliases),
-            "rows": (rows[:, 0].tolist() if rows.shape[1] == 1
-                     else rows.tolist()),
-            "scores": [round(float(value), 4)
-                       for value in table.column(node.spec.name).to_pylist()]}
+    values = table.column(node.spec.name).to_pylist()
+    payload = {"kind": "score", "node": node.node_id,
+               "output": node.spec.name, "aliases": list(node.spec.aliases),
+               "rows": (rows[:, 0].tolist() if rows.shape[1] == 1
+                        else rows.tolist())}
+    if isinstance(node.spec, ClassifySpec):
+        return {**payload, "kind": "label", "labels": values}
+    return {**payload, "scores": [round(float(value), 4) for value in values]}
 
 
 def score_in_batches(node, inputs, score_batches, shards: int = 1,
@@ -300,11 +307,14 @@ class RerankerModelExecution:
                 "AI.SCORE needs one prompt argument per document relation"
             )
 
+        empty = np.empty(0, dtype=(
+            object if isinstance(spec, ClassifySpec) else np.float32))
         batch = (
             self.reranker.score(spec, rows, self.documents)
-            if len(rows) else RerankerBatch(np.empty(0, dtype=np.float32), 0, 0)
+            if len(rows) else RerankerBatch(empty, 0, 0)
         )
-        table = _score_table(rows, spec.aliases, spec.name, batch.scores)
+        table = _score_table(rows, spec.aliases, spec.name, batch.scores,
+                             _value_type(spec))
         count = len(rows)
         return NodeResult(
             {"scores": table},
@@ -352,9 +362,13 @@ class ScoreFilterRuntime:
         if len(inputs) != 1:
             raise ValueError("ScoreFilter needs one score input")
         table = next(iter(inputs.values()))
-        answers = compare_score(
-            table.column(node.score_name), node.comparison, node.threshold,
-        )
+        if isinstance(node, LabelFilter):
+            answers = pc.is_in(table.column(node.score_name),
+                               value_set=pa.array(node.accepted, pa.string()))
+        else:
+            answers = compare_score(
+                table.column(node.score_name), node.comparison, node.threshold,
+            )
         filtered = table.filter(answers)
         if len(node.aliases) == 1:
             answer_name = f"filter_answers:{node.aliases[0]}"

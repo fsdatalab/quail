@@ -236,6 +236,80 @@ def bind_prompt(template: str, args: tuple, tokenizer=None,
                   preamble_token_ids=pre_ids, tail_token_ids=tail_ids)
 
 
+CLASSIFY_INSTRUCTION = ("Answer with exactly one of the categories below "
+                        "for the following question: ")
+CATEGORIES_HEADER = "\n\nCategories:"
+# a label follows the answer cue after one space, as a word would
+LABEL_PREFIX = " "
+
+
+def render_categories(labels, descriptions=()) -> str:
+    """Return the category list, one `- label` or `- label: description` line each."""
+    descriptions = descriptions or ("",) * len(labels)
+    return CATEGORIES_HEADER + "".join(
+        f"\n- {label}" + (f": {description}" if description else "")
+        for label, description in zip(labels, descriptions))
+
+
+def render_classify_question(question: str, labels, descriptions=()) -> str:
+    """Wrap a classification question with its instruction, categories, and cue."""
+    content = question.lstrip("\n")
+    sep = question[:len(question) - len(content)] or "\n\n"
+    return (sep + CLASSIFY_INSTRUCTION + content
+            + render_categories(labels, descriptions) + ANSWER_CUE)
+
+
+def label_text(label: str) -> str:
+    """The text a label is scored as, appended after the answer cue."""
+    return LABEL_PREFIX + label
+
+
+def bind_classify_prompt(template: str, args: tuple, labels, descriptions=(),
+                         tokenizer=None,
+                         turn: tuple[str, str] = ("", "")) -> Prompt:
+    """Build an AI.CLASSIFY Prompt: the document, then the question and labels.
+
+    The layout is the filter layout with the classification
+    instruction, a category list, and the answer cue after the
+    question. Label text is not part of the tail; each label is scored
+    as ``label_text(label)`` after it.
+
+    Args:
+        template: Prompt template with one {0} placeholder.
+        args: The one column reference.
+        labels: The labels in written order.
+        descriptions: One description per label, empty for none.
+        tokenizer: Optional callable (text -> token list) for counting.
+        turn: The model's chat-turn text: the piece before the
+            preamble and the piece after the answer cue.
+    """
+    import re
+    _check_placeholders(template, len(args))
+    if len(args) != 1:
+        raise CompileError("AI.CLASSIFY reads one document per row")
+    frame, template = split_frame(template)
+    preamble, tail = split_template(template)
+    m = re.match(r"(\{\d+\})(.*)", tail, re.DOTALL)
+    if m is None:
+        raise CompileError(f"unexpected AI.CLASSIFY template: {template!r}")
+    tail = m.group(1) + render_classify_question(
+        m.group(2), labels, descriptions)
+    preamble = turn[0] + preamble
+    tail = tail + turn[1]
+    pre_tok = tail_tok = frame_tok = None
+    pre_ids = tail_ids = ()
+    if tokenizer is not None:
+        pre_ids = tuple(tokenizer(preamble))
+        pre_tok = len(pre_ids)
+        tail_ids = tuple(tokenizer(re.sub(r"\{\d+\}", "", tail)))
+        tail_tok = len(tail_ids)
+        frame_tok = len(tokenizer(f"\n\n{frame}")) if frame else 0
+    return Prompt(template=template, args=tuple(args), preamble=preamble,
+                  tail=tail, preamble_tokens=pre_tok, tail_tokens=tail_tok,
+                  frame=frame, frame_tokens=frame_tok,
+                  preamble_token_ids=pre_ids, tail_token_ids=tail_ids)
+
+
 def bind_score_prompt(template: str, args: tuple,
                       tokenizer=None,
                       turn: tuple[str, str] = ("", "")) -> Prompt:
