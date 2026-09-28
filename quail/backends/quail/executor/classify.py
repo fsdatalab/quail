@@ -16,6 +16,11 @@ the partner suffixes are:
   read and returns every label token, so the cue's row scores all
   one-token labels at once and labels sharing leading tokens share
   the rows after them.
+- ``trie_rounds``: one stage per trie depth. At depth d a document
+  sends the chains of the trie nodes its still-alive labels pass
+  through, and after each round a label whose partial score is below
+  a fully read label's score is pruned; a document resolved early
+  skips the remaining rounds (RoundScorer).
 """
 
 import logging
@@ -25,10 +30,12 @@ from typing import Callable
 
 import numpy as np
 
-from quail.backends.quail.executor.loop import InputStaging, run_join
+from quail.backends.quail.executor.loop import InputStaging
 from quail.backends.quail.executor.model import full_output_head
 from quail.backends.quail.executor.readout import AsyncLabelLogprobs
+from quail.backends.quail.executor.stages import Stage, run_stages
 from quail.execution.labels import (
+    RoundScorer,
     best_label,
     label_chain_scores,
     label_path_scores,
@@ -57,14 +64,18 @@ class LabelRequests:
             its last.
         score: Maps one document's log probabilities, shape
             (suffixes, rows, targets) with all rows read and
-            (suffixes, targets) otherwise, to one score per label.
+            (suffixes, targets) otherwise, to one score per label;
+            None under ``trie_rounds``, which scores as it reads.
+        rounds: Under ``trie_rounds``, the suffixes of each round, one
+            list per trie depth; ``suffixes`` is their concatenation.
     """
 
     frame: list
     suffixes: list
     targets: list
     read_all_rows: bool
-    score: Callable[[np.ndarray], np.ndarray]
+    score: Callable[[np.ndarray], np.ndarray] | None
+    rounds: tuple = ()
 
 
 def label_requests(spec, targets=None) -> LabelRequests:
@@ -93,6 +104,14 @@ def label_requests(spec, targets=None) -> LabelRequests:
         return LabelRequests(
             frame, [[cue, *path] for path in paths], targets, True,
             lambda logprobs: label_path_scores(ids, paths, targets, logprobs))
+    if spec.scoring == "trie_rounds":
+        trie = label_trie(ids)
+        rounds = tuple(
+            [[cue, *node] for node in sorted(n for n in trie if len(n) == depth)]
+            for depth in range(max(len(label) for label in ids)))
+        return LabelRequests(
+            frame, [suffix for chains in rounds for suffix in chains],
+            targets, True, None, rounds=rounds)
     trie = label_trie(ids)
     nodes = sorted(trie, key=lambda prefix: (len(prefix), prefix))
     return LabelRequests(
@@ -160,41 +179,94 @@ class QuailClassifier:
 
         labels = [np.full(len(rows), None, dtype=object) for _ in specs]
 
-        def label_of(stage, logprobs):
+        def label_of(index, logprobs):
             if read_all:
                 # a one-row readout returns (suffixes, targets)
                 logprobs = logprobs.reshape(
-                    len(requests[stage].suffixes), readout_rows, -1)
-            return specs[stage].labels[
-                best_label(requests[stage].score(logprobs))]
+                    len(requests[index].suffixes), readout_rows, -1)
+            return specs[index].labels[
+                best_label(requests[index].score(logprobs))]
 
-        def advance(anchor, stage, row):
-            labels[stage][anchor] = label_of(stage, row)
-            if stage == len(spec.stages):
-                return True      # the last stage: every document survives
-            accepted = spec.stages[stage].accepted
-            return accepted is None or labels[stage][anchor] in accepted
+        def gate(index, key):
+            """DROP when the filter before classification index rejects."""
+            accepted = spec.stages[index - 1].accepted
+            if accepted is not None and labels[index - 1][key[2]] not in accepted:
+                return Stage.DROP
+            return None
+
+        # one stage per classification, or one per trie depth under
+        # trie_rounds; a later classification's first stage gates
+        stages = []
+        scorers = {}
+        asked = {}       # (document, stage position) -> nodes requested
+        for index, (stage_spec, request) in enumerate(zip(specs, requests)):
+            if not request.rounds:
+                def whole(anchor, row, index=index):
+                    labels[index][anchor] = label_of(index, row)
+                    return True
+
+                stages.append(Stage(
+                    suffixes=request.suffixes, readout=readout,
+                    frame=request.frame, decide=whole,
+                    requests=((lambda key, index=index: gate(index, key))
+                              if index else None),
+                    read_all_rows=read_all, label=stage_spec.name))
+                continue
+            scorer = RoundScorer(stage_spec.label_token_ids, targets, len(rows))
+            scorers[index] = scorer
+            for depth, chains in enumerate(request.rounds):
+                position = len(stages)
+
+                def ask(key, index=index, depth=depth, position=position,
+                        scorer=scorer):
+                    document = key[2]
+                    if depth == 0 and index and gate(index, key) is Stage.DROP:
+                        return Stage.DROP
+                    nodes = scorer.requests(document, depth)
+                    if not nodes:
+                        return Stage.SKIP
+                    asked[document, position] = nodes
+                    return nodes
+
+                def round_read(anchor, row, index=index, depth=depth,
+                               position=position, scorer=scorer,
+                               names=stage_spec.labels):
+                    nodes = asked.pop((anchor, position))
+                    scorer.update(anchor, depth, nodes,
+                                  row.reshape(len(nodes), readout_rows, -1))
+                    if scorer.label[anchor] >= 0:
+                        labels[index][anchor] = names[scorer.label[anchor]]
+                    return True
+
+                stages.append(Stage(
+                    suffixes=chains, readout=readout, frame=request.frame,
+                    requests=ask, decide=round_read, read_all_rows=True,
+                    label=f"{stage_spec.name} round {depth}"))
 
         stats = {}
-        answers, spans, fresh = run_join(
-            state["torch"], state["arena"], state["pipeline"], readout,
-            prefixes, [request.suffixes for request in requests],
-            state["chunk_tokens"],
-            stage_frames=[request.frame for request in requests],
-            anchor_keys=keys, staging=state["input_staging"],
-            read_all_rows=read_all, prefix_tree=tree, stats=stats,
-            advance=advance if len(specs) > 1 else None,
-        )
+        answers, spans, fresh = run_stages(
+            state["torch"], state["arena"], state["pipeline"], stages,
+            prefixes, state["chunk_tokens"], anchor_keys=keys,
+            staging=state["input_staging"], prefix_tree=tree, stats=stats,
+            label=f"classify {spec.name}")
         label_tokens = 0
         streamed = 0     # frame and suffix tokens packed after documents
-        for stage, request in enumerate(requests):
-            for anchor, logprobs in answers[stage].items():
-                if labels[stage][anchor] is None:
-                    labels[stage][anchor] = label_of(stage, logprobs)
-            reached = len(answers[stage])
-            suffix_tokens = reached * sum(map(len, request.suffixes))
+        position = 0
+        for index, request in enumerate(requests):
+            first = answers[position]
+            if index in scorers:
+                suffix_tokens = scorers[index].tokens
+            else:
+                for anchor, logprobs in first.items():
+                    if labels[index][anchor] is None:
+                        labels[index][anchor] = label_of(index, logprobs)
+                suffix_tokens = len(first) * sum(map(len, request.suffixes))
             label_tokens += suffix_tokens
-            streamed += reached * len(request.frame) + suffix_tokens
+            # a frame equal to the stage before's is already in KV
+            written = index == 0 or request.frame != requests[index - 1].frame
+            streamed += suffix_tokens + (len(first) * len(request.frame)
+                                         if written else 0)
+            position += max(1, len(request.rounds))
         total = sum(map(len, prefixes)) + streamed
         gpu_s = 0.0
         if state.get("gpu_timing"):

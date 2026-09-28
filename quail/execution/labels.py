@@ -113,3 +113,86 @@ def label_chain_scores(label_ids, targets, logprobs) -> np.ndarray:
 def best_label(scores) -> int:
     """Return the index of the highest score; a tie goes to the earlier label."""
     return int(np.argmax(scores))
+
+
+class RoundScorer:
+    """Label scores read round by round over the trie, pruned by bounds.
+
+    Round d reads, for each document, the log probabilities after each
+    alive trie node of depth d: a chain of the answer cue and the
+    node's tokens, at its last row. A label's score is the sum of its
+    tokens' log probabilities, and a token not read yet adds at most
+    0, so a label's partial sum bounds its score from above. A label
+    is resolved once every token is read. After each round a label
+    whose bound is below a resolved label's score is pruned (a tie
+    goes to the earlier label), and a document is resolved once no
+    unresolved label is left: the best resolved label is its answer.
+
+    Args:
+        label_ids: One token id sequence per label.
+        targets: The token ids, one per column of the log probabilities.
+        documents: How many documents the scorer tracks.
+    """
+
+    def __init__(self, label_ids, targets, documents):
+        self.label_ids = [tuple(ids) for ids in label_ids]
+        self.lengths = np.array([len(ids) for ids in self.label_ids])
+        self.depth = int(self.lengths.max())
+        trie = label_trie(label_ids)
+        self.nodes = [sorted(node for node in trie if len(node) == depth)
+                      for depth in range(self.depth)]
+        self.index = [{node: i for i, node in enumerate(nodes)}
+                      for nodes in self.nodes]
+        self.column = {token: i for i, token in enumerate(targets)}
+        count = len(self.label_ids)
+        self.partial = np.zeros((documents, count))
+        self.read = np.zeros((documents, count), dtype=np.int64)
+        self.alive = np.ones((documents, count), dtype=bool)
+        self.label = np.full(documents, -1, dtype=np.int64)
+        self.tokens = 0     # chain tokens requested so far
+
+    def requests(self, doc, depth):
+        """Indices into nodes[depth] the document reads this round.
+
+        None once the document is resolved.
+        """
+        if self.label[doc] >= 0:
+            return None
+        wanted = {ids[:depth] for label, ids in enumerate(self.label_ids)
+                  if self.alive[doc, label] and len(ids) > depth}
+        indices = sorted(self.index[depth][node] for node in wanted)
+        self.tokens += (depth + 1) * len(indices)
+        return indices
+
+    def update(self, doc, depth, indices, logprobs):
+        """Add one round's reads and prune.
+
+        Args:
+            doc: The document.
+            depth: The round.
+            indices: The nodes requested, as requests() returned them.
+            logprobs: Shape (len(indices), rows, targets); row ``depth``
+                of block i was read after node indices[i].
+        """
+        for i, node_index in enumerate(indices):
+            node = self.nodes[depth][node_index]
+            row = logprobs[i, depth]
+            for label, ids in enumerate(self.label_ids):
+                if (self.alive[doc, label] and len(ids) > depth
+                        and ids[:depth] == node):
+                    self.partial[doc, label] += row[self.column[ids[depth]]]
+                    self.read[doc, label] += 1
+        alive = self.alive[doc]
+        resolved = alive & (self.read[doc] == self.lengths)
+        if not resolved.any():
+            return
+        scores = np.where(resolved, self.partial[doc], -np.inf)
+        best = int(np.argmax(scores))
+        bound = self.partial[doc]
+        earlier = np.arange(len(self.label_ids)) < best
+        keep = alive & ~resolved & (
+            (bound > scores[best]) | ((bound == scores[best]) & earlier))
+        self.alive[doc] = keep
+        self.alive[doc, best] = True
+        if not keep.any():
+            self.label[doc] = best

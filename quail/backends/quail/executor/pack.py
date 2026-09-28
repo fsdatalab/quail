@@ -174,6 +174,7 @@ class Borrowing:
 
 # an anchor's partner request that takes it out of the run at a stage
 DROP = object()
+SKIP = object()
 
 
 class JoinAdmission:
@@ -195,7 +196,10 @@ class JoinAdmission:
             whole list. Omitted anchors stream the whole list at every
             stage. An anchor's value may instead be a callable(stage)
             -> list, None, or DROP, asked when the anchor enters the
-            stage; DROP takes the anchor out of the run there.
+            stage; DROP takes the anchor out of the run there, and
+            SKIP passes it to the next stage with no request at this
+            one, finishing it at the last stage. The first stage
+            cannot be skipped.
         canvas_tokens: Rows a diffusion model adds after every suffix
             and after a frame entry. They take chunk room and page
             room but are never kept in the anchor's KV.
@@ -334,16 +338,40 @@ class JoinAdmission:
         lst = self._lists[a][j]
         return len(self.stages[j]) if lst is None else len(lst)
 
-    def _resolve(self, a, j):
-        """Ask a lazy anchor for its stage-j partners; returns False on DROP."""
+    def _enter(self, a, j):
+        """Move the anchor into stage j, past any stage its requests skip.
+
+        Returns None when the anchor has partners to stream at the
+        stage it lands in, else the event that settles it: "dropped"
+        when a stage's requests drop it or an earlier stage has no
+        partner, "finished" when it passes or skips the last stage.
+        """
+        k = len(self.stages)
         ask = self._lazy[a]
-        if ask is None:
-            return True
-        lst = ask(j)
-        if lst is DROP:
-            return False
-        self._lists[a][j], self._cums[a][j] = self._partner_list(a, j, lst)
-        return True
+        while True:
+            self._stage[a] = j
+            self._next[a] = 0
+            lst = None if ask is None else ask(j)
+            if lst is DROP:
+                self._stage[a] = _DONE
+                return "dropped"
+            if lst is SKIP:
+                self._true[a][j] = True
+                self._lists[a][j], self._cums[a][j] = [], [0]
+                if j + 1 == k:
+                    self._stage[a] = _DONE
+                    self.survivors += 1
+                    return "finished"
+                j += 1
+                continue
+            if ask is not None:
+                self._lists[a][j], self._cums[a][j] = self._partner_list(
+                    a, j, lst)
+            if self._count(a, j):
+                return None
+            # an empty row at the last stage, dropped otherwise
+            self._stage[a] = _DONE
+            return "finished" if j + 1 == k else "dropped"
 
     def _partner_list(self, a, j, lst):
         """One stage's partner index list and its cumulative token sums."""
@@ -380,6 +408,8 @@ class JoinAdmission:
             lists = [None] * k
             cums = [None] * k
             first = partners(0)
+            if first is SKIP:
+                raise ValueError(f"anchor {a}: the first stage cannot be skipped")
             if first is DROP:
                 first = []
             lists[0], cums[0] = self._partner_list(a, 0, first)
@@ -661,17 +691,11 @@ class JoinAdmission:
                 # the whole stream is launched, so every later chunk
                 # is behind it on the stream and the next stage's
                 # frame write cannot race a read of this stage's
-                self._stage[a] = j + 1
-                self._next[a] = 0
-                if not self._resolve(a, j + 1):
-                    self._stage[a] = _DONE
-                    events.append(("dropped", a))
-                elif self._count(a, j + 1):
+                settled = self._enter(a, j + 1)
+                if settled is None:
                     self.ready.append(a)
                 else:
-                    # an empty row at the last stage, dropped otherwise
-                    self._stage[a] = _DONE
-                    events.append(("finished" if j + 2 == k else "dropped", a))
+                    events.append((settled, a))
             elif complete and not self._true[a][j]:
                 self._stage[a] = _DONE
                 events.append(("dropped", a))

@@ -509,7 +509,7 @@ class ClassifySpec(ScoreSpec):
     goes between them. ``label_token_ids`` holds each label's ids as
     scored after the tail, in label order. ``scoring`` names the label
     scoring rule the executor runs: ``trie_nodes``, ``label_chains``,
-    or ``trie_paths``.
+    ``trie_paths``, or ``trie_rounds``.
     ``share_prefixes`` lets a document borrow the KV pages of a
     document sharing its token prefix (the prefix_sharing rule).
     ``stages`` are later classifications of the same documents, run

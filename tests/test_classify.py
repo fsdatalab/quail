@@ -22,6 +22,7 @@ from quail.bench.quailb import run_output
 from quail.bench.substrait import read_plan
 from quail.catalog import DocumentProvider
 from quail.execution.labels import (
+    RoundScorer,
     best_label,
     label_chain_scores,
     label_path_scores,
@@ -93,10 +94,42 @@ def test_label_chain_scores_read_one_row_per_label_token():
     # (1, 4)'s prefix (1,) is on the (1, 2) path, so it needs no chain
     assert trie_paths([(1, 2, 3), (1, 2), (1, 4), (5, 6)]) == [(5,), (1, 2)]
     assert suffix_lengths("trie_paths", IDS) == [2]
+    assert suffix_lengths("trie_rounds", IDS) == [1, 2]
     # its row 0 holds every first token, its row 1 every token after 1
     path_logprobs = np.log([[[0.6, nan, nan, 0.4], [nan, 0.3, 0.7, nan]]])
     scores = label_path_scores(IDS, [(1,)], targets, path_logprobs)
     assert np.allclose(np.exp(scores), [0.18, 0.42, 0.4])
+
+
+def test_round_scorer_prunes_by_bounds_and_resolves_documents():
+    targets = [1, 2, 3, 4]
+    scorer = RoundScorer(IDS, targets, documents=3)
+    assert scorer.nodes == [[()], [(1,)]]
+    # round 0 reads the row after the cue for every document
+    assert [scorer.requests(doc, 0) for doc in range(3)] == [[0], [0], [0]]
+    assert scorer.tokens == 3
+    # document 0: token 1 at -1 and token 4 at -3, so "shipping" is
+    # resolved at -3 and both "refund" labels stay alive above it
+    scorer.update(0, 0, [0], np.array([[[-1.0, -9.0, -9.0, -3.0]]]))
+    # document 1: token 4 at -0.5 beats every bound, resolved at once
+    scorer.update(1, 0, [0], np.array([[[-2.0, -9.0, -9.0, -0.5]]]))
+    # document 2: a tie at -1 keeps the earlier labels alive
+    scorer.update(2, 0, [0], np.array([[[-1.0, -9.0, -9.0, -1.0]]]))
+    assert scorer.label.tolist() == [-1, 2, -1]
+    assert scorer.alive.tolist() == [[True, True, True], [False, False, True],
+                                     [True, True, True]]
+    assert scorer.requests(1, 1) is None
+    assert scorer.requests(0, 1) == [0] and scorer.requests(2, 1) == [0]
+    assert scorer.tokens == 3 + 2 + 2
+    # rows: after the cue, then after token 1
+    scorer.update(0, 1, [0], np.array([[[-1.0, -9.0, -9.0, -3.0],
+                                        [-9.0, -1.0, -5.0, -9.0]]]))
+    scorer.update(2, 1, [0], np.array([[[-1.0, -9.0, -9.0, -1.0],
+                                        [-9.0, -5.0, -1.0, -9.0]]]))
+    # document 2's tied labels lose once read: "shipping" at -1 stays best
+    assert scorer.label.tolist() == [0, 2, 2]
+    assert scorer.partial[0].tolist() == [-2.0, -6.0, -3.0]
+    assert scorer.partial[2].tolist() == [-6.0, -2.0, -1.0]
 
 
 def test_classify_prompt_is_quail_b_text_with_labels_after_it():
@@ -278,6 +311,84 @@ def test_classifier_reads_every_row_of_one_chain_per_label(monkeypatch):
     batch = QuailClassifier(state).classify(paths, [[0], [1]], documents)
     assert list(batch.scores) == list(LABELS[:2])
     assert batch.label_tokens == 2 * 2
+
+
+def test_classifier_reads_rounds_and_skips_resolved_documents(monkeypatch):
+    spec = ClassifySpec(
+        name="topic", aliases=("d",), query_template="", arguments=(),
+        expected_inputs=3, estimated_seconds=0.0,
+        prompt_token_parts=((90,), (91, 92, 93)), labels=LABELS,
+        label_token_ids=IDS, scoring="trie_rounds")
+    tone = ClassifySpec(
+        name="tone", aliases=("d",), query_template="", arguments=(),
+        expected_inputs=3, estimated_seconds=0.0,
+        prompt_token_parts=((90,), (91, 92, 93)), labels=("a", "b"),
+        label_token_ids=((2,), (4,)), scoring="trie_rounds")
+    requests = label_requests(spec)
+    assert requests.rounds == ([[93]], [[93, 1]])
+    assert requests.suffixes == [[93], [93, 1]] and requests.score is None
+    spec = ClassifySpec(**{**spec.__dict__, "stages": (
+        ClassifyStage(spec=tone, accepted=("refund request",)),)})
+    documents = {"d": [[10, 11], [12], [13]]}
+    targets = [1, 2, 3, 4]
+    # document 0 wants "refund request", 1 "shipping" outright, 2
+    # "refund status": after the cue the wanted label's token gets -1
+    # (-0.5 for document 1), another label's first token -2 for token 1
+    # and -3 for token 4, and anything else -5
+    wanted = {0: IDS[0], 1: IDS[2], 2: IDS[1]}
+
+    def logprob(document, seen, token):
+        if seen + (token,) == tuple(wanted[document][:len(seen) + 1]):
+            return -0.5 if document == 1 else -1.0
+        if not seen and token in (1, 4):
+            return -2.0 if token == 1 else -3.0
+        return -5.0
+
+    packed = []
+
+    def forward(chunk):
+        rows = []
+        for entry in chunk.specs:
+            document = entry["key"][2]
+            for suffix in entry["suffixes"]:
+                packed.append((document, list(suffix)))
+                count = len(suffix) if entry.get("read_all_rows") else 1
+                for row in range(count):
+                    seen = tuple(suffix[1:row + 1])
+                    rows.append([logprob(document, seen, token)
+                                 for token in targets])
+        return np.asarray(rows, dtype=np.float32)
+
+    def submit(rows, rows_per_answer=None):
+        rows_per_answer = rows_per_answer or [1] * len(rows)
+        padded = np.full((len(rows_per_answer), 2, 4), np.nan, np.float32)
+        start = 0
+        for answer, count in enumerate(rows_per_answer):
+            padded[answer, :count] = rows[start:start + count]
+            start += count
+        return padded
+
+    monkeypatch.setattr(loop, "pack_chunk", fake_pack)
+    readout = SimpleNamespace(
+        targets=np.asarray(targets), rows=2,
+        dtype=np.dtype((np.float32, (2, 4))),
+        submit=submit, result=lambda rows: rows)
+    state = {"torch": fake_torch(), "arena": cpu_arena(64),
+             "pipeline": fake_pipeline(forward_chunk=forward),
+             "chunk_tokens": 64, "label_readout": readout,
+             "input_staging": SimpleNamespace(fixed_tokens=set())}
+    batch = QuailClassifier(state).classify(spec, [[0], [1], [2]], documents)
+    assert list(batch.scores) == ["refund request", "shipping", "refund status"]
+    # document 1 resolved after the cue's row and skipped the second
+    # round; only document 0 passed the gate into "tone", where token
+    # 4 outscores token 2 after the cue
+    assert sorted(packed) == sorted([
+        (0, [91, 92]), (1, [91, 92]), (2, [91, 92]),
+        (0, [93]), (1, [93]), (2, [93]), (0, [93, 1]), (2, [93, 1]),
+        (0, [93])])
+    assert list(batch.later["tone"]) == ["b", None, None]
+    assert batch.label_tokens == (1 + 2) + 1 + (1 + 2) + 1
+    assert batch.fresh_tokens + batch.cached_tokens == (3 + 2 + 2) + 3 * 2 + 8
 
 
 def test_classifier_borrows_shared_prefix_pages(monkeypatch):
@@ -527,7 +638,8 @@ def test_classify_refusals_and_builder_errors(session):
     (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
     assert classify.spec.scoring == "trie_paths"
     assert plan.settings["label_scoring"] == "trie_paths"
-    for rule in ("trie_nodes", "label_chains", "trie_paths", "next_rule"):
+    for rule in ("trie_nodes", "label_chains", "trie_paths", "trie_rounds",
+                 "next_rule"):
         ruled = quail.Session(EngineConfig(
             model="qwen3-4b-fp8", device="h100-sxm", label_scoring=rule),
             tokenizer=_bytes)

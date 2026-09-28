@@ -60,7 +60,7 @@ def has_label(logical) -> bool:
 
 # The label scoring rules the executor runs, in the order they were
 # added; each later rule must return the labels of the first.
-LABEL_SCORINGS = ("trie_nodes", "label_chains", "trie_paths")
+LABEL_SCORINGS = ("trie_nodes", "label_chains", "trie_paths", "trie_rounds")
 DEFAULT_LABEL_SCORING = "trie_paths"
 
 
@@ -72,12 +72,17 @@ def suffix_lengths(scoring: str, labels) -> list[int]:
     only its last row is read. Under ``label_chains`` it continues
     with all but a label's last token and every row is read. Under
     ``trie_paths`` it continues with one of the trie's deepest proper
-    prefixes and every row is read.
+    prefixes and every row is read. Under ``trie_rounds`` a document
+    sends one chain per trie depth, the cue and that many tokens,
+    assuming one label path stays alive after the first round; how
+    many stay alive is measured, not planned, until the cost model.
     """
     if scoring == "label_chains":
         return [len(ids) for ids in labels]
     if scoring == "trie_paths":
         return [1 + len(path) for path in trie_paths(labels)]
+    if scoring == "trie_rounds":
+        return [depth + 1 for depth in range(max(len(ids) for ids in labels))]
     return [1 + len(node) for node in label_trie(labels)]
 
 
