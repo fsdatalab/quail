@@ -295,6 +295,11 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
       read_all_rows  When true, every row of each suffix feeds the
                 readout, not only its last; the chunk's rows_per_answer
                 then says how many rows each answer has.
+      single    The group's one suffix is a stage's whole request. A
+                fresh, non-borrowing single group under tree attention
+                is one causal segment, [prefix | suffix], whose rows
+                write the key's pages without reading them back: the
+                computation an unpaged filter does.
 
     A fresh group without arena pages packs [prefix | suffix] as one
     causal segment (no scatter, no paged read). This only works with
@@ -364,6 +369,8 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         # reading the key's borrowed pages
         borrowing = fresh and start and tree_path
         stacked = borrowing and n == 1 and g.get("read_key") is not None
+        whole = (fresh and paged and tree_path and not start and n == 1
+                 and bool(g.get("single")))
         prefix_len = 0
         if fresh:
             if not paged and n > 1:
@@ -379,7 +386,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             id_parts.append(g["prefix"])
             token_count += prefix_len
             pos.append(np.arange(start, start + prefix_len, dtype=np.int64))
-            if (paged or not n) and not stacked:
+            if (paged or not n) and not stacked and not whole:
                 cu_a.append(np.array([token_count], dtype=np.int64))
             if borrowing and not stacked:
                 reader_rows.append(np.arange(row0, token_count, dtype=np.int64))
@@ -450,7 +457,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 read_keys.append(read_key)
                 read_used.append(start)
                 max_q = max(max_q, count)
-        elif s_count and f and paged and tree_path:
+        elif s_count and f and paged and tree_path and not whole:
             reader_rows.append(np.arange(s_row0, token_count, dtype=np.int64))
             cu_q.append(cu_q[-1] + s_count)
             read_keys.append(key)

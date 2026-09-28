@@ -335,7 +335,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                     f=f, suffixes=Suffixes(
                         np.concatenate([frame_ids[j], sufs.ids]),
                         [len(frame) + int(sufs.lengths[0])]),
-                    write_suffix_tokens=len(frame)))
+                    write_suffix_tokens=len(frame), single=True))
             elif writes[j] and start == 0:
                 # frame entry: scatter the frame into KV after the
                 # document rows; its own answer row means nothing
@@ -351,7 +351,8 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                 specs.append(dict(
                     key=key, prefix=prefix, start=shared, read_key=read_key,
                     f=f + len(frame),
-                    suffixes=sufs, read_all_rows=read_all))
+                    suffixes=sufs, read_all_rows=read_all,
+                    single=stages[j].single and end - start == 1))
             entries.append((j, rows))
         chunk = pack_chunk(torch, arena, specs, attention_mode=mode,
                            staging=staging, canvas=canvas,

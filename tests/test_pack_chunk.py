@@ -78,3 +78,23 @@ def test_pack_chunk_accepts_suffix_lists_and_a_frame_write(monkeypatch):
     # the prefix and the two frame rows land in the key's pages
     assert chunk.meta["kv_src"].tolist() == [0, 1, 2, 3, 4]
     assert chunk.meta["kv_dst"].tolist() == arena.capacity_rows(key)[:5].tolist()
+
+
+def test_a_fresh_single_group_is_one_causal_segment_under_tree(monkeypatch):
+    cpu_staging(monkeypatch)
+    arena = plain_arena()
+    key = ("d", 2)
+    arena.activate(key, 3, capacity_tokens=8, base_tokens=3)
+    group = dict(key=key, prefix=[7, 8, 9], f=3, suffixes=[[20, 21, 22]],
+                 write_suffix_tokens=2, single=True)
+    chunk = loop.pack_chunk(torch, arena, [group], attention_mode="tree")
+    # no segment boundary after the prefix and no read of the pages
+    assert chunk.meta["cu_a"].tolist() == [0, 6]
+    assert chunk.meta["reads"] is None
+    assert chunk.meta["kv_src"].tolist() == [0, 1, 2, 3, 4]
+    assert chunk.final_indices.tolist() == [5]
+    # a kept document's single suffix still reads its pages
+    chunk = loop.pack_chunk(
+        torch, arena, [dict(key=key, prefix=None, f=5, suffixes=[[30]],
+                            single=True)], attention_mode="tree")
+    assert chunk.meta["reads"]["used"].tolist() == [5]
