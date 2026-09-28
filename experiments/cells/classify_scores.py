@@ -14,7 +14,7 @@ four ways, for every disagreeing document and a sample that agreed:
 - quail_fp32: the production path with float32 logits;
 - vllm: stock vLLM's full-sequence prompt log probabilities.
 
-    uv run modal run --detach experiments/cells/classify_scores.py \
+    uv run modal run --detach experiments/cells/classify_scores.py::scores \
       2>&1 | tee classify-scores.log
 
 The summary goes to /results/ablations/classify-scores.json.
@@ -231,7 +231,7 @@ def compare(quail_call: str, vllm_call: str) -> dict:
 
 
 @app.local_entrypoint()
-def main():
+def scores():
     print(PREDICTION_TEXT, flush=True)
     quail_call = quail_scores.spawn()
     vllm_call = vllm_scores.spawn()
