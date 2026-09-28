@@ -8,15 +8,14 @@ import quail
 from quail.backends.quail.graph import execute_single_graph, filter_result
 from quail.bench import quailb
 from quail.execution.execute import execute_query
+from quail.execution.reranker import _score_table
 from quail.execution.runner import NodeMetrics, NodeResult, SurvivorStream
 from quail.execution.types import PhysicalResponse
-from quail.execution.reranker import _score_table
 from quail.physical import (
     AiClassify,
     AiFilter,
     AiJoin,
     Barrier,
-    LabelFilter,
     PortRef,
     Project,
     Scan,
