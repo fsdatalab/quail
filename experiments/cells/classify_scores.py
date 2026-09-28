@@ -230,6 +230,100 @@ def compare(quail_call: str, vllm_call: str) -> dict:
     return summary
 
 
+PROBE_DOCUMENTS = 40
+PROBE_PREDICTION_TEXT = (
+    "If requests packed into one forward pass affect each other, IMDB-11 "
+    "scores computed one review per forward pass agree with vLLM within "
+    "0.15 nats while packed reviews do not. If they do not, every variant "
+    "sits the same distance from vLLM."
+)
+
+
+@app.function(image=labeling.image, gpu="H100!", memory=98304, timeout=3600,
+              volumes=_volumes())
+def quail_probe() -> dict:
+    """Score IMDB-11's first probe reviews with the question in the prefix.
+
+    Variants: every review packed together on the tree path, on the
+    unified path, and one review per forward pass on each path.
+    """
+    import torch
+    from transformers import AutoTokenizer
+
+    from quail.backends.quail.executor.arena import KVArena
+    from quail.backends.quail.executor.loop import run_join
+    from quail.backends.quail.executor.model import full_output_head, load_model
+    from quail.backends.quail.executor.models import build_pipeline
+    from quail.backends.quail.executor.readout import AsyncLabelLogprobs
+    from quail.cost import budgets
+    from quail.execution.labels import label_scores, label_trie, trie_targets
+    from quail.specs import DEVICES, MODELS
+
+    labeling._mount()
+    spec = MODELS["qwen3-4b-fp8"]
+    device = DEVICES["h100-sxm"]
+    tokenizer = AutoTokenizer.from_pretrained(spec.hf_name,
+                                              revision=spec.revision)
+    model = load_model(spec.hf_name, revision=spec.revision)
+    head = full_output_head(model)
+    chunk = budgets.chunk_budget(spec, device)
+    arena = KVArena(n_layers=spec.layers,
+                    n_pages=budgets.arena_tokens(spec, device, chunk)
+                    // budgets.PAGE_TOKENS,
+                    page_tokens=budgets.PAGE_TOKENS, n_kv=spec.n_kv,
+                    d_head=spec.d_head, dtype=torch.bfloat16)
+    pipeline = build_pipeline(spec, model, arena)
+    operator, relation, documents, _ = _documents()["IMDB-11"]
+    documents = documents[:PROBE_DOCUMENTS]
+    tail, labels, contexts = _inputs(tokenizer, operator, relation, documents)
+    trie = label_trie(labels)
+    nodes = sorted(trie, key=lambda prefix: (len(prefix), prefix))
+    targets = trie_targets(trie)
+    readout = AsyncLabelLogprobs(torch, torch.nn.functional, head, targets)
+    suffixes = [[tail[-1], *node] for node in nodes]
+
+    def score(prefixes, mode):
+        answers, _, _ = run_join(
+            torch, arena, pipeline, readout, prefixes, [suffixes], chunk,
+            anchor_keys=[("probe", index) for index in range(len(prefixes))],
+            attention_mode=mode)
+        return [label_scores(labels, nodes, targets, answers[0][a]).tolist()
+                for a in range(len(prefixes))]
+
+    prefixes = [context + tail[:-1] for context in contexts]
+    out = {"ids": [doc for doc, _ in documents],
+           "prefix_tokens": [len(prefix) for prefix in prefixes]}
+    with torch.inference_mode():
+        for mode in ("tree", "unified"):
+            out[f"packed_{mode}"] = score(prefixes, mode)
+            out[f"single_{mode}"] = [score([prefix], mode)[0]
+                                     for prefix in prefixes]
+    return out
+
+
+@app.local_entrypoint()
+def probe(vllm_call: str):
+    """Compare the probe variants with vLLM scores from an earlier scores run."""
+    import numpy as np
+
+    print(PROBE_PREDICTION_TEXT, flush=True)
+    call = quail_probe.spawn()
+    print(f"[classify-scores] quail probe function call id: {call.object_id}",
+          flush=True)
+    quail = call.get()
+    vllm = modal.FunctionCall.from_id(vllm_call).get()["IMDB-11"]
+    assert vllm["ids"][:PROBE_DOCUMENTS] == quail["ids"]
+    reference = np.asarray(vllm["vllm"][:PROBE_DOCUMENTS])
+    lengths = np.asarray(quail["prefix_tokens"])
+    for name in ("packed_tree", "packed_unified", "single_tree",
+                 "single_unified"):
+        difference = np.abs(np.asarray(quail[name]) - reference).max(axis=1)
+        print(f"[classify-scores] {name} vs vllm: median "
+              f"{np.median(difference):.4f}, max {difference.max():.4f}, "
+              f"worst prefix {lengths[difference.argmax()]} tokens",
+              flush=True)
+
+
 @app.local_entrypoint()
 def scores():
     print(PREDICTION_TEXT, flush=True)
