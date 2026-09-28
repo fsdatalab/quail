@@ -30,7 +30,13 @@ from quail.bench.results import write_json
 from quail.bench.substrait import QueryPlan, read_plan
 from quail.planner.plan import Refusal
 from quail.specs import H100_USD_PER_HOUR, MODELS
-from quail_b.prompts import AGENT_OUTCOME, FEV_TOPIC, IMDB_SENTIMENT
+from quail_b.prompts import (
+    AGENT_OUTCOME,
+    BIO_ORGAN_CLASS,
+    FEV_TOPIC,
+    IMDB_SENTIMENT,
+    LEP_AREA,
+)
 from quail_b.queries import (
     FILTER_SELECTIVITY_ESTIMATES,
     JOIN_SELECTIVITY_ESTIMATES,
@@ -47,7 +53,10 @@ from quail_b.scoring import RunOutput, reference_answer
 # keyed by (classification prompt, accepted labels).
 LABEL_SELECTIVITY_ESTIMATES = {
     (IMDB_SENTIMENT, frozenset({"negative", "mixed"})): 2923 / 5000,
+    (BIO_ORGAN_CLASS, frozenset({"cardiac disorders", "vascular disorders"})):
+        109 / 1127,
     (FEV_TOPIC, frozenset({"politics", "history"})): 46 / 500,
+    (LEP_AREA, frozenset({"constitutional law", "criminal law"})): 159 / 500,
     (AGENT_OUTCOME, frozenset({"not resolved"})): 1112 / 1772,
 }
 
