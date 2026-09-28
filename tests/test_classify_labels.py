@@ -112,3 +112,11 @@ def test_labels_copy_by_content_and_join_a_reused_collection(
     assert labels.answer("s0") == "history"
     assert json.loads((root / "corpora/c_small/active_collection.raw-v1.json")
                       .read_text())["collection_id"] == summary["collection_id"]
+
+
+def test_quail_runner_skips_classification_queries():
+    from quail.bench import quailb
+    from quail_b.queries import get_query
+
+    assert quailb.runs_on_quail(get_query("IMDB-4"))
+    assert not quailb.runs_on_quail(get_query("IMDB-11"))
