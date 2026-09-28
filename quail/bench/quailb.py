@@ -16,6 +16,7 @@ import argparse
 import os
 import time
 from dataclasses import asdict
+from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
 
@@ -370,35 +371,67 @@ def run_suite(only=None, *, sf=0.1, config, data_dir=None,
         with quail.Session(config) as preflight_session:
             skipped.update(refused_queries(preflight_session, only, data_dir))
         only = [query_id for query_id in only if query_id not in skipped]
+    metadata = {
+        "engine": config.backend, "model": config.model,
+        "prompt_format": MODELS[config.model].prompt_format,
+        "configuration": asdict(config),
+        "warmup": "tokenizer, engine, and kernel startup excluded",
+        "timing_boundary": (
+            "raw document tables and query submission to answer"
+            if config.backend == "quail"
+            else "prompt text submission to answer"
+        ),
+        "cache_reuse": "one session per backend and query family",
+        "planning": {
+            "collection_id": SELECTIVITY_ESTIMATE_COLLECTION,
+            "corpus_id": SELECTIVITY_ESTIMATE_CORPUS,
+            "scale_factor": SELECTIVITY_ESTIMATE_SCALE_FACTOR,
+        },
+    }
+    if not only:
+        # every query was skipped: a record with no queries, in the
+        # shape a run of them would leave
+        return _empty_record(skipped, sf=sf, data_dir=data_dir,
+                             ground_truth_collection=ground_truth_collection,
+                             root=root, config=config, metadata=metadata,
+                             h100_usd_per_hour=h100_usd_per_hour,
+                             output_dir=output_dir)
     with quail.Session(config) as session:
         record = benchmark.run(
             partial(run_query, session), queries=only, scale_factor=sf,
             output_dir=output_dir, data_dir=data_dir,
             collection_id=ground_truth_collection, root=root,
             gpu_count=config.gpus, gpu_hourly_rate_usd=h100_usd_per_hour,
-            metadata={
-                "engine": config.backend, "model": config.model,
-                "prompt_format": MODELS[config.model].prompt_format,
-                "configuration": asdict(config),
-                "warmup": (
-                    "tokenizer, engine, and kernel startup excluded"
-                ),
-                "timing_boundary": (
-                    "raw document tables and query submission to answer"
-                    if config.backend == "quail"
-                    else "prompt text submission to answer"
-                ),
-                "cache_reuse": "one session per backend and query family",
-                "planning": {
-                    "collection_id": SELECTIVITY_ESTIMATE_COLLECTION,
-                    "corpus_id": SELECTIVITY_ESTIMATE_CORPUS,
-                    "scale_factor": SELECTIVITY_ESTIMATE_SCALE_FACTOR,
-                },
-            })
+            metadata=metadata)
         record["skipped_queries"] = skipped
         write_json(Path(output_dir) / "run.json", record)
         benchmark.report(output_dir, rescore=False)
         return record
+
+
+def _empty_record(skipped, *, sf, data_dir, ground_truth_collection, root,
+                  config, metadata, h100_usd_per_hour, output_dir) -> dict:
+    """The run record of a suite whose every query was skipped."""
+    from quail_b import __version__
+    from quail_b.run import RUN_SCHEMA_VERSION
+
+    suite = benchmark.load_benchmark(
+        sorted(skipped)[:1], scale_factor=sf, data_dir=data_dir,
+        collection_id=ground_truth_collection, root=root)
+    started = datetime.now(timezone.utc).isoformat()
+    record = {
+        "schema_version": RUN_SCHEMA_VERSION, "quail_b_version": __version__,
+        "scale_factor": sf, "corpus_id": suite.corpus_id,
+        "collection_id": suite.ground_truth.collection_id,
+        "reference_model": suite.ground_truth.reference_model,
+        "metadata": metadata, "gpu_count": config.gpus,
+        "gpu_hourly_rate_usd": h100_usd_per_hour,
+        "started_at": started, "finished_at": started, "status": "complete",
+        "queries": [], "skipped_queries": skipped,
+    }
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    write_json(Path(output_dir) / "run.json", record)
+    return record
 
 
 def main():
