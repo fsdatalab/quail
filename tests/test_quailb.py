@@ -73,10 +73,12 @@ def test_all_queries_compile_and_plan_and_answer_timing_adds_common_work(tmp_pat
         ) as sess:
             register_tables(sess, tmp_path)
             qdefs = queries(sess)
-            # Quail runs the one-table classifications without AI.IF
+            # Quail runs every classification query; the request
+            # backends run none. A lone classification chain plans on
+            # the classify planner, in written order
             runnable = {"IMDB-11", "IMDB-14", "BIO-5", "FEV-11", "AGENT-4"}
             assert set(qdefs) == (
-                expected | runnable if backend == "quail" else expected), backend
+                expected | classify if backend == "quail" else expected), backend
             for qid, (_, build) in qdefs.items():
                 case = f"{backend} {qid}"
                 query = build()
