@@ -27,7 +27,6 @@ from quail.cost import budgets
 from quail.execution.runner import ExecutionContext, SurvivorStream
 from quail.execution.tokens import (
     DocumentPrefixes,
-    chain_tokens,
     decode_payload_documents,
 )
 from quail.execution.types import PhysicalResponse
@@ -529,19 +528,18 @@ def _child_joins(state, sub):
             {int(position): {int(anchor): partners
                              for anchor, partners in rows.items()}
              for position, rows in sub.get("pairs", {}).items()})
+        prefixes = DocumentPrefixes(pre, anchor_docs, range(len(anchor_docs)))
+        anchor_keys = [(anchor_alias, g) for g in anchors_glob]
         if filter_node is None:
-            prefixes = [chain_tokens(pre, d) for d in anchor_docs]
-            anchor_keys = [(anchor_alias, g) for g in anchors_glob]
             round_kv = _join_round_kv(anchor_keys, arena)
             anchor_stream = None
         else:
-            # filled by the driver as this GPU's shard streams through
-            prefixes, anchor_keys = [], []
+            # every document of this GPU's shard is an anchor; the
+            # chain's stages lead the join's
             round_kv = None
             anchor_stream = {
                 "node": filter_node,
-                "documents": DocumentPrefixes(
-                    pre, anchor_docs, range(len(anchor_docs))),
+                "documents": prefixes,
                 "document_ids": anchors_glob,
                 "stream": SurvivorStream(filter_node, anchors_glob),
             }
@@ -582,7 +580,13 @@ def _child_joins(state, sub):
         ans = result.metrics.extension["answers"]
         filter_out = {}
         if filter_node is not None:
-            anchors_glob = [key[1] for key in anchor_keys]
+            # the join's anchors are the survivors that reached it
+            first = node.stages[0].written_pos
+            anchors_glob = list(
+                result.outputs[f"join_answers:{first}"]["anchor_index"])
+            position_of = {g: i for i, g in enumerate(anchor_keys)}
+            anchor_keys = [(anchor_alias, g) for g in anchors_glob]
+            prefixes = [prefixes[position_of[key]] for key in anchor_keys]
             round_kv = dict(hits=result.metrics.kv_hits,
                             misses=result.metrics.kv_misses)
             chain = anchor_stream["stream"].finalized_result()

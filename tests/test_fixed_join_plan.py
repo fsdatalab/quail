@@ -89,9 +89,6 @@ class FixedFeverAnswers:
                 # batch before admission and may drop survivors
                 keys = inputs["anchor_batch"](keys)
             anchor_ids = [key[1] for key in keys]
-            for key in keys:
-                inputs["anchor_keys"].append(key)
-                inputs["prefixes"].append([])
         live = set(range(len(anchor_ids)))
         all_answers = []
         lists_for = inputs.get("anchor_partners")

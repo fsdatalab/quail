@@ -1,17 +1,14 @@
 """Chunk packing and admission - no GPU, no torch, unit-tested.
 
-- JoinAdmission: continuous anchor admission for joins. Continuing
-  partner streams pack first, then anchors starting their next stage,
-  then fresh anchors whose pages fit the free list.
-- FilterAdmission: continuous admission for filter chains. Survivors
-  pack before fresh admissions; fresh documents admit when their
-  page-rounded tokens fit the free list.
+- JoinAdmission: continuous anchor admission for every stage list
+  (joins, filter chains, classifications). Continuing partner streams
+  pack first, then anchors starting their next stage, then fresh
+  anchors whose pages fit the free list.
 
 Length units are tokens. Suffixes are atomic and never split across
 chunks.
 """
 
-from array import array
 from bisect import bisect_right
 from collections import deque
 
@@ -72,40 +69,6 @@ def brute_force_triples(ans1_rows, ans2_rows):
 
 # --------------------------------------------- continuous admission
 
-
-class _CompactQueue:
-    """Keep ordered document positions in ranges or integer arrays."""
-
-    def __init__(self, count: int):
-        self._pieces = deque()
-        self._length = 0
-        if count:
-            self._pieces.append([range(count), 0])
-            self._length = count
-
-    def __bool__(self):
-        return bool(self._length)
-
-    def popleft(self) -> int:
-        if not self._pieces:
-            raise IndexError("pop from an empty document queue")
-        values, position = self._pieces[0]
-        value = values[position]
-        position += 1
-        self._length -= 1
-        if position == len(values):
-            self._pieces.popleft()
-        else:
-            self._pieces[0][1] = position
-        return value
-
-    def appendleft(self, value: int) -> None:
-        self.prepend(array("I", [value]))
-
-    def prepend(self, values) -> None:
-        if values:
-            self._pieces.appendleft([values, 0])
-            self._length += len(values)
 
 def pages_for(tokens: int, page_tokens: int) -> int:
     """Pages needed for `tokens` rows (suffix KV is never paged)."""
@@ -209,6 +172,10 @@ class Borrowing:
         return self.chosen.get(doc, (None, 0))[1]
 
 
+# an anchor's partner request that takes it out of the run at a stage
+DROP = object()
+
+
 class JoinAdmission:
     """Join scheduler: continuous anchor admission, stages mixed in one chunk.
 
@@ -226,7 +193,9 @@ class JoinAdmission:
         anchor_partners: anchor -> per stage, the indices into that
             stage's partner list the anchor streams, or None for the
             whole list. Omitted anchors stream the whole list at every
-            stage.
+            stage. An anchor's value may instead be a callable(stage)
+            -> list, None, or DROP, asked when the anchor enters the
+            stage; DROP takes the anchor out of the run there.
         canvas_tokens: Rows a diffusion model adds after every suffix
             and after a frame entry. They take chunk room and page
             room but are never kept in the anchor's KV.
@@ -330,6 +299,7 @@ class JoinAdmission:
             self._extra = max(self._extra, extra_tokens)
         self._lists = []           # per anchor, per stage: indices or None
         self._cums = []            # per anchor, per stage: cumulative sums
+        self._lazy = []            # per anchor: callable(stage) or None
         self._page_cost = []
         self._carried = []
         self._first = []           # per anchor: its first partner's cost
@@ -364,6 +334,30 @@ class JoinAdmission:
         lst = self._lists[a][j]
         return len(self.stages[j]) if lst is None else len(lst)
 
+    def _resolve(self, a, j):
+        """Ask a lazy anchor for its stage-j partners; returns False on DROP."""
+        ask = self._lazy[a]
+        if ask is None:
+            return True
+        lst = ask(j)
+        if lst is DROP:
+            return False
+        self._lists[a][j], self._cums[a][j] = self._partner_list(a, j, lst)
+        return True
+
+    def _partner_list(self, a, j, lst):
+        """One stage's partner index list and its cumulative token sums."""
+        if lst is None:
+            return None, None
+        lst = list(lst)
+        cum = [0]
+        for i in lst:
+            if not 0 <= i < len(self.stages[j]):
+                raise ValueError(
+                    f"anchor {a} stage {j}: partner {i} is out of range")
+            cum.append(cum[-1] + self.stages[j][i])
+        return lst, cum
+
     def _cum_of(self, a, j):
         return self._cum[j] if self._lists[a][j] is None else self._cums[a][j]
 
@@ -376,28 +370,30 @@ class JoinAdmission:
         """Record one anchor's costs; returns its index."""
         a = len(self.prefix)
         k = len(self.stages)
+        lazy = None
         if partners is None:
             lists = [None] * k
             cums = [None] * k
+        elif callable(partners):
+            # stage 0 now, later stages when the anchor reaches them
+            lazy = partners
+            lists = [None] * k
+            cums = [None] * k
+            first = partners(0)
+            if first is DROP:
+                first = []
+            lists[0], cums[0] = self._partner_list(a, 0, first)
         else:
-            lists = [None if lst is None else list(lst) for lst in partners]
-            if len(lists) != k:
+            if len(partners) != k:
                 raise ValueError(
-                    f"anchor {a}: partner lists for {len(lists)} stages, "
+                    f"anchor {a}: partner lists for {len(partners)} stages, "
                     f"the join has {k}")
-            cums = []
-            for j, lst in enumerate(lists):
-                if lst is None:
-                    cums.append(None)
-                    continue
-                cum = [0]
-                for i in lst:
-                    if not 0 <= i < len(self.stages[j]):
-                        raise ValueError(
-                            f"anchor {a} stage {j}: partner {i} is out "
-                            f"of range")
-                    cum.append(cum[-1] + self.stages[j][i])
+            lists, cums = [], []
+            for j, lst in enumerate(partners):
+                lst, cum = self._partner_list(a, j, lst)
+                lists.append(lst)
                 cums.append(cum)
+        self._lazy.append(lazy)
         need = self.page_cost(prefix + self._extra)
         if resident_pages is not None:
             need = max(0, need - resident_pages)
@@ -428,11 +424,19 @@ class JoinAdmission:
                 f"room for a partner in a {self.chunk_budget}-token "
                 f"chunk")
         if self.temporary_suffix_pages:
+            # a lazy anchor's later stages are bounded by the stage's
+            # largest suffix
             largest = max(
                 (self._suffix_page_cost(a, j, i)
-                 for j in range(k) for i in range(self._count(a, j))),
+                 for j in range(k) if lazy is None or j == 0
+                 for i in range(self._count(a, j))),
                 default=0,
             )
+            if lazy is not None:
+                largest = max([largest] + [
+                    partner_pages(self.page_cost, self.page_tokens, prefix,
+                                  self.frames[j], max(self.stages[j]))
+                    for j in range(1, k) if self.stages[j]])
             needed = self.page_cost(prefix + self._extra) + largest
             if needed > self.arena_pages:
                 raise ValueError("anchor and one suffix exceed the KV arena")
@@ -659,7 +663,10 @@ class JoinAdmission:
                 # frame write cannot race a read of this stage's
                 self._stage[a] = j + 1
                 self._next[a] = 0
-                if self._count(a, j + 1):
+                if not self._resolve(a, j + 1):
+                    self._stage[a] = _DONE
+                    events.append(("dropped", a))
+                elif self._count(a, j + 1):
                     self.ready.append(a)
                 else:
                     # an empty row at the last stage, dropped otherwise
@@ -699,195 +706,3 @@ class JoinAdmission:
             return not self.in_flight and not self._settled
         return not self.pending and not self.ready \
             and not self.in_flight and not self._settled
-
-
-class FilterAdmission:
-    """Filter chain scheduler: builds chunk groups in admission order.
-
-    Page accounting belongs to the arena: next_chunk takes its free
-    pages and admits documents whose own pages fit them.
-
-    Args:
-        doc_tokens: Per-document token counts.
-        stage_tokens: Per-stage question suffix token counts.
-        chunk_budget: Tokens per forward pass.
-        arena_pages: Pages in the arena, or None when nothing is written
-            to it (single-stage).
-        page_tokens: Tokens per arena page.
-        kept_extra_tokens: Extra tokens per document that must fit in
-            pages (shared preamble plus tail room).
-        limit: Stop after this many survivors.
-        page_cost: Callable(tokens, base_tokens) giving the pages a
-            document of that many rows takes, in the arena's every-token
-            pages; None prices one pool of page_tokens pages.
-        tree: A PrefixTree over the documents, or None. Documents are
-            admitted in tree order, and borrow as Borrowing decides.
-        can_borrow: As Borrowing takes it.
-
-    Survivor suffixes pack before fresh admissions. Pages are granted
-    in queue order; chunk room may be skipped. With a tree the
-    admission order is token-sorted, not table order, so a limit
-    takes the first survivors in that order.
-    """
-
-    def __init__(self, doc_tokens, stage_tokens, chunk_budget,
-                 arena_pages, page_tokens, kept_extra_tokens=0,
-                 limit=None, page_cost=None, tree=None, can_borrow=None):
-        self.page_cost = page_cost or (
-            lambda tokens, base_tokens=None: pages_for(tokens, page_tokens))
-        self.doc_tokens = doc_tokens
-        n = len(doc_tokens)
-        self.borrowing = Borrowing(n, tree, can_borrow)
-        self.stage_tokens = list(stage_tokens)
-        self.chunk_budget = chunk_budget
-        self.page_tokens = page_tokens
-        self.pages = arena_pages is not None
-        self.blocked_pages = 0
-        self.limit = limit
-        self._survivor_count = 0
-        # kept_extra_tokens: the shared question preamble that joins
-        # the document's kept KV after stage 1, so pages must cover it
-        self.kept_extra = kept_extra_tokens
-        if tree is not None and arena_pages is None:
-            raise ValueError("a prefix tree needs page accounting")
-        # a document packs whole when its parent has left, so the
-        # guard is on its full length
-        for d, t in enumerate(self.doc_tokens):
-            need = t + max(stage_tokens)
-            if need > chunk_budget:
-                raise ValueError(f"document {d} + question needs {need} "
-                                 f"tokens > chunk budget {chunk_budget}")
-            if arena_pages is not None and self.page_cost(
-                    t + kept_extra_tokens) > arena_pages:
-                raise ValueError(f"document {d} needs more pages than "
-                                 f"the arena holds")
-        if tree is None or list(tree.order) == list(range(n)):
-            self.pending = _CompactQueue(n)
-        else:
-            self.pending = _CompactQueue(0)
-            self.pending.prepend(array("I", tree.order))
-        self.ready = deque()       # (doc, stage) gated TRUE, next suffix
-        self.in_flight = set()     # docs inside a launched chunk
-        self.resident = set()      # admitted docs not yet released
-        self.answers = {}          # doc -> [0/1 per answered stage]
-
-    def own_tokens(self, doc) -> int:
-        """The document's tokens past its borrowed shared prefix."""
-        return self.doc_tokens[doc] - self.borrowing.shared(doc)
-
-    # ---- chunk building ------------------------------------------------
-
-    def next_chunk(self, free_pages=None):
-        """Groups for the next chunk: [(doc, stage, fresh)].
-
-        free_pages is the arena's free pages, in every-token pages;
-        None when nothing is written to the arena. fresh means the
-        document's tokens are packed and its KV is written to its
-        pages. Returns [] when nothing is buildable.
-        """
-        if self._limit_reached():
-            return []
-        self.blocked_pages = 0
-        room = self.chunk_budget
-        groups = []
-        admitted = set()
-        # 1) survivor suffixes, oldest first; one live stage per doc
-        n_ready = len(self.ready)
-        for _ in range(n_ready):
-            doc, stage = self.ready[0]
-            cost = self.stage_tokens[stage]
-            if cost > room:
-                break    # ready is FIFO; the chunk is nearly full
-            self.ready.popleft()
-            groups.append((doc, stage, False))
-            self.in_flight.add(doc)
-            room -= cost
-        # 2) fresh admissions: pages in queue order, chunk room may skip
-        skipped = array("I")
-        while self.pending:
-            doc = self.pending.popleft()
-            choice = self.borrowing.decide(doc, admitted)
-            if choice == Borrowing.WAIT:
-                # the parent is queued behind a full chunk
-                skipped.append(doc)
-                continue
-            own = self.doc_tokens[doc] - (choice[1] if choice else 0)
-            need_pages = 0
-            if free_pages is not None:
-                need_pages = self.page_cost(own + self.kept_extra)
-                if need_pages > free_pages:
-                    # pages are granted in order: put it back and stop
-                    # claiming pages behind it
-                    self.pending.appendleft(doc)
-                    self.blocked_pages = need_pages - free_pages
-                    break
-            cost = self.stage_tokens[0] + own
-            if cost > room:
-                skipped.append(doc)   # chunk room only; retry next chunk
-                continue
-            if free_pages is not None:
-                free_pages -= need_pages
-            self.borrowing.record(doc, choice)
-            self.resident.add(doc)
-            groups.append((doc, 0, True))
-            self.in_flight.add(doc)
-            admitted.add(doc)
-            room -= cost
-        self.pending.prepend(skipped)
-        return groups
-
-    # ---- gating --------------------------------------------------------
-
-    def report(self, doc, stage, passed, release=True):
-        """Record one answer.
-
-        Queues the next-stage suffix after TRUE at a stage before the
-        last. Otherwise the document is done: with release it returns
-        (doc,) for the caller to free, and without it the caller keeps
-        the document's KV.
-
-        Returns docs to free.
-        """
-        self.in_flight.discard(doc)
-        self.answers.setdefault(doc, []).append(1 if passed else 0)
-        last = stage == len(self.stage_tokens) - 1
-        if passed and last:
-            self._survivor_count += 1
-        if passed and not last:
-            self.ready.append((doc, stage + 1))
-            return ()
-        self.resident.discard(doc)
-        if not self.pages or not release:
-            return ()
-        return (doc,)
-
-    # ---- progress ------------------------------------------------------
-
-    def _limit_reached(self):
-        return (self.limit is not None
-                and self._survivor_count >= self.limit)
-
-    def done(self):
-        if self._limit_reached():
-            return not self.in_flight
-        return (not self.pending and not self.ready
-                and not self.in_flight)
-
-    def drain_ready(self):
-        """Docs still queued for a stage when the limit ends the run early.
-
-        Returns them for the caller to free.
-        """
-        out = []
-        while self.ready:
-            doc, _ = self.ready.popleft()
-            self.resident.discard(doc)
-            if self.pages:
-                out.append(doc)
-        return out
-
-    def survivors(self):
-        """Documents that answered TRUE at every stage."""
-        n = len(self.stage_tokens)
-        return sorted(d for d, row in self.answers.items()
-                      if len(row) == n and all(row))

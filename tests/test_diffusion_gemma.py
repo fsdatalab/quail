@@ -6,13 +6,14 @@ import types
 from types import SimpleNamespace
 
 import pytest
-from fakes import cpu_arena, cpu_staging, fake_pipeline, fake_torch
+from fakes import cpu_arena, cpu_staging, fake_pack, fake_pipeline, fake_torch
 
 from quail.backends.quail.executor import loop
 from quail.backends.quail.executor.models.diffusion_gemma import (
     DiffusionGemmaPipeline,
 )
 from quail.backends.quail.executor.pack import JoinAdmission
+from quail.backends.quail.executor.stages import filter_stages, frame_writes
 from quail.cost import budgets
 from quail.cost.dense_decoder_cost import mlp_params, mlp_weight_params
 from quail.logical.prompts import (
@@ -83,32 +84,51 @@ def test_spec_geometry_budgets_costs_and_turn_text():
 
 def test_canvas_rows_are_charged_in_filter_streams_and_packed_chunks(
         monkeypatch):
-    pipeline = fake_pipeline(canvas_ids=(1, 2, 3))
     answers = SimpleNamespace(submit=lambda v: v, result=lambda v: v, dtype=None)
     docs = [[5] * 20, [6] * 30]
     questions = [[40, 41, 42], [40, 41, 43, 44]]
-    stream = loop.FilterStream(
-        fake_torch(), cpu_arena(64), pipeline, answers, docs, questions, 200,
-        arena_writes=True, arena_keys=[("d", 0), ("d", 1)])
-    assert stream.preamble == 2
-    assert stream.sched.stage_tokens == [3 + 3, 2 + 3]
-    assert stream.capacity_extra == 2 + 2 + 3
-    assert stream.canvas == (1, 2, 3)
+    # the questions' shared preamble is the frame, written once; each
+    # stage's suffix is its question past it, and canvas rows follow
+    # every suffix
+    stages = filter_stages(questions, answers)
+    assert [stage.frame for stage in stages] == [[40, 41], [40, 41]]
+    assert [stage.suffixes for stage in stages] == [[[42]], [[43, 44]]]
+    assert frame_writes(stages) == [True, False]
+    sched = JoinAdmission([20, 30], [[1], [2]], 200, arena_pages=64,
+                          page_tokens=16, frame_tokens=[2, 2],
+                          frame_writes=[True, False], canvas_tokens=3)
+    assert sched.stages == [[1 + 3], [2 + 3]]
+    assert sched.frame_rows == [2 + 3, 0]
 
     sched = JoinAdmission([10], [[5, 5]], 100, arena_pages=100, page_tokens=16,
                           frame_tokens=[3], canvas_tokens=4)
     assert sched.stages == [[9, 9]]
     assert sched.frame_rows == [7]
 
-    paged = fake_pipeline(needs_pages=True)
+    # a model whose attention reads paged KV writes pages even when the
+    # plan skipped them; the retention cap set earlier stays
+    paged = fake_pipeline(
+        needs_pages=True, canvas_ids=(1, 2, 3),
+        forward_chunk=lambda chunk: [1 for spec in chunk.specs
+                                     for _ in spec["suffixes"]])
     arena = cpu_arena(64)
     arena.retention_cap_pages = 8
-    stream = loop.FilterStream(
-        fake_torch(), arena, paged, answers, docs[:1], questions[:1],
-        200, arena_writes=False, arena_keys=[("d", 0)])
-    assert stream.arena_writes
+    activated = []
+    real_activate = arena.activate
+
+    def activate(key, tokens, **kw):
+        activated.append(key)
+        return real_activate(key, tokens, **kw)
+
+    arena.activate = activate
+    real_pack = loop.pack_chunk
+    monkeypatch.setattr(loop, "pack_chunk", fake_pack)
+    loop.run_filter(fake_torch(), arena, paged, answers, docs[:1],
+                    questions[:1], 200, arena_writes=False,
+                    arena_keys=[("d", 0)])
+    monkeypatch.setattr(loop, "pack_chunk", real_pack)
+    assert activated == [("d", 0)]
     assert arena.retention_cap_pages == 8
-    assert stream.sched.pages
 
     # pack_chunk appends the canvas rows after each suffix
     torch = cpu_staging(monkeypatch)

@@ -11,6 +11,7 @@ from quail.backends.base import GpuContext
 from quail.backends.quail.executor import loop
 from quail.backends.quail.executor.models import supported_archs
 from quail.backends.quail.executor.score import QuailScorer
+from quail.backends.quail.executor.stages import Stage, filter_stages, run_stages
 from quail.backends.quail.graph import filter_result, stage_partner_lists
 from quail.backends.quail.worker import execute_quail_request, prepare_quail_request
 from quail.execution.reranker import RerankerModelExecution
@@ -170,63 +171,99 @@ class QuailModelExecution:
 
         stage_frames = inputs["stage_frames"]
         stream = inputs.get("anchor_stream")
-        source = None
-        if stream is not None:
-            filter_node = stream["node"]
-            # a pinned survivor's pages must cover the join's largest frame
-            source = loop.FilterStream(
-                torch,
-                arena,
-                pipeline,
-                async_answers,
-                stream["documents"],
-                [list(question)
-                 for question in filter_node.question_token_ids],
-                chunk_tokens,
-                arena_writes=True,
-                arena_keys=DocumentKeys(filter_node.alias,
-                                        stream["document_ids"]),
-                hold_survivors=True,
-                hold_extra_tokens=filter_node.hold_tokens,
-                document_done=stream.get("document_done"),
-                prefix_tree=_prefix_tree(
-                    filter_node, stream["documents"], arena),
-                attention_mode=filter_node.attention or None,
-            )
         lists_for = inputs.get("anchor_partners")
+        join_stages = [
+            Stage(suffixes=suffixes, readout=async_answers, frame=frame,
+                  requests=(None if lists_for is None
+                            else (lambda key, j=j: lists_for(key[1])[j])),
+                  label=f"join stage {j}")
+            for j, (suffixes, frame) in enumerate(
+                zip(inputs["stage_suffixes"], stage_frames))
+        ]
         join_stats = {}
-        answers, spans, tokens = loop.run_join(
-            torch,
-            arena,
-            pipeline,
-            async_answers,
-            inputs["prefixes"],
-            inputs["stage_suffixes"],
-            chunk_tokens,
-            stage_frames=stage_frames,
-            anchor_keys=inputs["anchor_keys"],
-            anchor_done=inputs["anchor_done"],
-            anchor_source=source,
-            anchor_partners=(
-                None if lists_for is None else lambda key: lists_for(key[1])),
-            anchor_batch=inputs.get("anchor_batch"),
-            attention_mode=node.attention or None,
-            prefix_tree=(None if source is not None else _prefix_tree(
-                node, inputs["prefixes"], arena)),
-            stats=join_stats,
-        )
-        if source is not None:
-            # admission order; a per-batch function may have dropped some
-            anchor_ids = [key[1] for key in inputs["anchor_keys"]]
-            kv_round = {"hits": len(anchor_ids), "misses": 0}
+        leading = 0
+        filter_done = None
+        if stream is not None:
+            # the filter chain's questions lead the join's stages: a
+            # survivor goes on to the join with its KV resident
+            filter_node = stream["node"]
+            filter_ids = stream["document_ids"]
+            stages = filter_stages(
+                [list(question) for question in filter_node.question_token_ids],
+                async_answers) + join_stages
+            leading = len(stages) - len(join_stages)
+            batch = inputs.get("anchor_batch")
+            first = join_stages[0].requests
+            if batch is not None:
+                # per-batch transforms between the chain and the join
+                # run on each survivor as it reaches the join
+                def gated(key, first=first):
+                    if not batch([key]):
+                        return Stage.DROP
+                    return None if first is None else first(key)
+                join_stages[0].requests = gated
+            prefixes = stream["documents"]
+            anchor_keys = DocumentKeys(filter_node.alias, filter_ids)
+            tree = _prefix_tree(filter_node, stream["documents"], arena)
+            attention = node.attention or filter_node.attention or None
+            filter_done = stream.get("document_done")
+        else:
+            stages = join_stages
+            prefixes = inputs["prefixes"]
+            anchor_keys = inputs["anchor_keys"]
+            tree = _prefix_tree(node, inputs["prefixes"], arena)
+            attention = node.attention or None
+        anchor_done = inputs["anchor_done"]
+        settled = set()
+
+        def on_settled(anchor, survived, row):
+            settled.add(anchor)
+            anchor_done(anchor, row)
+
+        def on_chunk(transitions):
+            finished = [(anchor, stage, passed)
+                        for anchor, stage, passed in transitions
+                        if stage < leading and (not passed or stage == leading - 1)]
+            if finished and filter_done is not None:
+                filter_done(finished)
+
+        every, spans, tokens = run_stages(
+            torch, arena, pipeline, stages, prefixes, chunk_tokens,
+            anchor_keys=anchor_keys, on_settled=on_settled,
+            attention_mode=attention, prefix_tree=tree, stats=join_stats,
+            on_chunk=on_chunk, label=f"join ({len(join_stages)} stages)")
+        answers = every[leading:]
+        if stream is not None:
+            filter_answers = {}
+            for stage in every[:leading]:
+                for document, row in stage.items():
+                    filter_answers.setdefault(document, []).append(int(row[0]))
+            # the join packs frames and partner suffixes; the rest is the chain's
+            join_tokens = _streamed_tokens(join_stages, answers, lists_for,
+                                           anchor_keys)
+            filter_spans = [span for span in spans if span[0] < leading]
+            # the join's anchors are the documents that reached it, in
+            # the chain's order: those with a first-stage row and those
+            # that settled there with no partner to ask; their rows are
+            # re-keyed to that order
+            reached = sorted(set(answers[0] if answers else ()) | settled)
+            local_of = {position: local for local, position in enumerate(reached)}
+            answers = [{local_of[position]: row for position, row in stage.items()}
+                       for stage in answers]
+            anchor_ids = [filter_ids[position] for position in reached]
+            kv_round = {"hits": len(reached), "misses": 0}
             stream["stream"].complete(filter_result(
                 filter_node,
-                source.answers,
-                source.tokens,
-                stream["document_ids"],
-                gpu_s=_gpu_seconds(torch, source.spans, inputs),
-                chunks=_chunks(source.spans, inputs),
+                filter_answers,
+                tokens - join_tokens,
+                filter_ids,
+                gpu_s=_gpu_seconds(torch, filter_spans, inputs),
+                chunks=_chunks(filter_spans, inputs),
+                borrowed_tokens=join_stats.get("borrowed_tokens", 0),
             ))
+            join_stats = {}
+            spans = [span for span in spans if span[0] >= leading]
+            tokens = join_tokens
         else:
             anchor_ids = list(inputs["anchor_ids"])
             kv_round = inputs.get("kv_round") or {}
@@ -280,6 +317,24 @@ class QuailModelExecution:
                 },
             ),
         )
+
+
+def _streamed_tokens(join_stages, answers, lists_for, anchor_keys) -> int:
+    """Tokens the join's stages packed: frames and partner suffixes."""
+    total = 0
+    previous = None
+    for j, (stage, rows) in enumerate(zip(join_stages, answers)):
+        frame = list(stage.frame)
+        writes = bool(frame) and frame != previous
+        previous = frame
+        lengths = [len(suffix) for suffix in stage.suffixes]
+        for anchor in rows:
+            indices = (None if lists_for is None
+                       else lists_for(anchor_keys[anchor][1])[j])
+            total += (len(frame) if writes else 0) + (
+                sum(lengths) if indices is None
+                else sum(lengths[i] for i in indices))
+    return total
 
 
 def _prefix_tree(node, documents, arena):

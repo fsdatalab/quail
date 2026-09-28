@@ -19,7 +19,7 @@ from typing import Any, Callable
 
 import numpy as np
 
-from quail.backends.quail.executor.pack import JoinAdmission, partner_pages
+from quail.backends.quail.executor.pack import DROP, JoinAdmission
 from quail.progress import Progress, logger
 
 
@@ -40,8 +40,10 @@ class Stage:
             the stage before's is already there and is not written
             again.
         requests: Callable(document key) -> indices into suffixes the
-            document sends, or None for all of them. None sends every
-            suffix to every document.
+            document sends, None for all of them, or DROP to take the
+            document out of the run at this stage. Asked when the
+            document reaches the stage. None sends every suffix to
+            every document.
         decide: Callable(document index, row) -> whether the document
             goes on to the next stage, or survives the last one. None
             takes any true answer.
@@ -54,6 +56,8 @@ class Stage:
             stacked with its siblings.
         label: The stage's name in progress lines.
     """
+
+    DROP = DROP
 
     suffixes: list
     readout: Any
@@ -112,11 +116,10 @@ def frame_writes(stages) -> list:
 
 
 def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
-               anchor_keys=None, on_settled=None, anchor_source=None,
-               anchor_batch=None, staging=None, attention_mode=None,
-               prefix_tree=None, stats=None, limit=None, paged=True,
-               unit="anchors", label=None, default_attention="tree",
-               on_chunk=None):
+               anchor_keys=None, on_settled=None, staging=None,
+               attention_mode=None, prefix_tree=None, stats=None,
+               limit=None, paged=True, unit="anchors", label=None,
+               default_attention="tree", on_chunk=None):
     """Run every stage over the documents with one admission.
 
     Args:
@@ -125,19 +128,14 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
         pipeline: ModelPipeline that runs each packed forward chunk.
         stages: The Stage list, in order.
         anchor_prefixes: Document index -> its prefix token list (head
-            and document). With anchor_source it must be an empty
-            list; the run appends each streamed document's prefix.
+            and document).
         budget: Chunk token budget.
         anchor_keys: Stable arena key per document; list positions
-            when omitted. With anchor_source it must be an empty list.
+            when omitted.
         on_settled: Optional callable(document index, survived, last
             row) run when a document finishes; it owns the document's
             retain or free decision. Without it a finished document's
             pages are freed.
-        anchor_source: Optional stream admitting documents while the
-            run goes, as run_join takes it.
-        anchor_batch: Optional callable(keys) -> the keys to admit from
-            a batch the source hands over.
         staging: Optional reusable input transfer buffers.
         attention_mode: "tree" or "unified" as the plan chose; None
             and a model without tree attention run unified.
@@ -175,19 +173,12 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
     k = len(stages)
     if k == 0:
         return [], [], 0
-    if not paged and (k > 1 or anchor_source is not None
-                      or prefix_tree is not None
+    if not paged and (k > 1 or prefix_tree is not None
                       or any(len(stage.suffixes) != 1 for stage in stages)):
         raise ValueError("the unpaged path runs one stage of one suffix")
-    if anchor_source is not None:
-        if anchor_prefixes or anchor_keys:
-            raise ValueError(
-                "anchor_source fills anchor_prefixes and anchor_keys")
-        prefixes, keys = anchor_prefixes, anchor_keys
-    else:
-        prefixes = list(anchor_prefixes)
-        keys = (list(range(len(prefixes))) if anchor_keys is None
-                else list(anchor_keys))
+    prefixes = anchor_prefixes
+    keys = (list(range(len(prefixes))) if anchor_keys is None
+            else anchor_keys)
     if len(keys) != len(prefixes):
         raise ValueError("anchor_keys must match anchor_prefixes")
     frames = [list(stage.frame) for stage in stages]
@@ -210,16 +201,6 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
     # a frame entry's canvas rows land in the document's pages after
     # the frame, so the pages cover them
     frame_max = max(len(f) + (len(canvas) if f else 0) for f in frames)
-    if anchor_source is not None and mode == "unified":
-        # the source leaves room for one suffix's temporary rows, or
-        # held documents could fill the arena before the run can go
-        longest = [max((len(s) for s in suffixes), default=0) + len(canvas)
-                   for suffixes in stage_suffixes]
-        anchor_source.set_reserve(max(
-            (partner_pages(arena.page_cost, arena.page_tokens, len(doc),
-                           len(frame), rows)
-             for doc in anchor_source.doc_ids
-             for frame, rows in zip(frames, longest)), default=0))
 
     # a stage sending one suffix to every document writes it straight
     # into the document's own pages on the unified path, so the pages
@@ -248,10 +229,14 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
     for a in resident:
         arena.pin(keys[a])
 
+    asking = any(stage.requests is not None for stage in stages)
+
     def requests_of(key):
-        lists = [None if stage.requests is None else stage.requests(key)
-                 for stage in stages]
-        return None if all(lst is None for lst in lists) else lists
+        """The document's per-stage requests, asked as it reaches each stage."""
+        if not asking:
+            return None
+        return lambda j: (None if stages[j].requests is None
+                          else stages[j].requests(key))
 
     if prefix_tree is not None and not prefix_tree.shared_tokens:
         prefix_tree = None
@@ -299,41 +284,8 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
     total = (sum(sched._count(a, j) for a in range(len(prefixes))
                  for j in range(k))
              if counting_answers else len(prefixes))
-    progress = Progress(
-        label, total=None if anchor_source is not None else total, unit=unit)
+    progress = Progress(label, total=total, unit=unit)
     finished = [0]
-
-    def admit(items):
-        if anchor_batch is not None and items:
-            kept = set(anchor_batch([key for key, _ in items]))
-            for key, _ in items:
-                if key not in kept and arena.is_resident(key):
-                    arena.free_key(key)
-            items = [(key, prefix) for key, prefix in items if key in kept]
-        for key, prefix in items:
-            if not arena.is_resident(key):
-                raise ValueError(
-                    f"streamed document {key!r} has no KV in the arena")
-            arena.pin(key)
-            keys.append(key)
-            prefixes.append(prefix)
-            sched.admit(len(prefix), held_pages(key, len(prefix)),
-                        partners=requests_of(key))
-
-    def pull(evict_retained=False, force=False):
-        """Run source chunks until a chunk can fill or the source blocks."""
-        moved = False
-        while not anchor_source.done and (
-                force or sched.buildable_tokens() < budget):
-            force = False
-            before = anchor_source.chunks
-            items, blocked = anchor_source.next(
-                evict_retained=evict_retained)
-            admit(items)
-            moved = moved or bool(items) or anchor_source.chunks > before
-            if blocked:
-                break
-        return moved
 
     def merged(j, start, end):
         """Whether a group's frame rides its suffix as a single entry."""
@@ -477,8 +429,9 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                 a, j, start, end, values[key][pos[key]:pos[key] + cnt])
             for kind, anchor in events:
                 event(kind, anchor)
-                transitions.append((anchor, j, kind == "finished"
-                                    and sched._true[anchor][k - 1]))
+                # the stage's own decision: a document the next stage's
+                # requests drop still passed this one
+                transitions.append((anchor, j, bool(sched._true[anchor][j])))
             if not events and sched._stage[a] != stage_before:
                 transitions.append((a, j, True))
             pos[key] += cnt
@@ -526,14 +479,10 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
             report(outstanding.pop(0))
 
     while True:
-        if anchor_source is not None and not anchor_source.done:
-            pull()
         # documents with nothing to send at their first stage never run
         for kind, anchor in sched.take_settled():
             event(kind, anchor)
-        if sched.done() and (anchor_source is None
-                             or anchor_source.done
-                             or sched.limit_reached()):
+        if sched.done():
             break
         if sched.blocked_pages:
             # the free list is short for the next fresh document:
@@ -544,10 +493,6 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
             if outstanding:
                 report(outstanding.pop(0))
                 continue
-            if anchor_source is not None and not anchor_source.done:
-                # the source has to move; it may evict retained KV to admit
-                if pull(evict_retained=True, force=True):
-                    continue
             if sched.blocked_pages and arena.evict_retained(sched.blocked_pages):
                 continue
             # parents freed but held for queued children hold the

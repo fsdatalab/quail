@@ -25,7 +25,7 @@ from quail.execution.runner import (
     compute_subgraph,
     scalar_node_metrics,
 )
-from quail.execution.tokens import DocumentPrefixes, chain_tokens
+from quail.execution.tokens import DocumentKeys, DocumentPrefixes, chain_tokens
 from quail.execution.types import export_physical_outputs
 from quail.physical import (
     AiFilter,
@@ -309,16 +309,17 @@ def _model_inputs(node, inputs, context: ExecutionContext) -> dict:
         state["kv_stats"]["join_anchor_misses"] += round_kv["misses"]
         anchor_stream = None
     else:
-        # filled by the driver as the chain hands anchors over
+        # every document of the chain is an anchor; the chain's stages
+        # lead the join's, so only its survivors reach them
         anchor_ids = None
-        prefixes = []
-        anchor_keys = []
-        round_kv = None
         anchor_stream = {
             "node": stream.node,
             **filter_inputs(state, stream.node, stream.document_ids),
             "stream": stream,
         }
+        prefixes = anchor_stream["documents"]
+        anchor_keys = DocumentKeys(stream.node.alias, stream.document_ids)
+        round_kv = None
 
     last = group[-1]
     last_tuples = tuple_indices[last["written_pos"]]
@@ -390,8 +391,8 @@ def record_model_result(node, result: NodeResult,
         prepared = state["prepared_join"]
         keys = prepared["anchor_keys"]
         if prepared["streamed"]:
-            # every streamed anchor read its KV from the chain: a hit
-            state["kv_stats"]["join_anchor_hits"] += len(keys)
+            # every survivor the chain handed over read its KV there
+            state["kv_stats"]["join_anchor_hits"] += result.metrics.kv_hits
         live = set(result.outputs[f"ids:{node.anchor}"])
         for key, prefix in zip(keys, prepared["prefixes"]):
             if state["arena"].is_resident(key):

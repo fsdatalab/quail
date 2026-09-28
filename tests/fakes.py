@@ -176,7 +176,18 @@ def expected_filter_rows(filter_truth):
 def run_streamed(monkeypatch, *, doc_lengths, filter_truth, partner_lengths,
                  join_truth, budget, pages, frame_tokens=3, stages=2,
                  anchor_partners=None):
-    """Drive a filter chain streamed into a join on a CPU arena."""
+    """Run a filter chain's stages and then a join's over the same documents.
+
+    Returns the chain's answers per document, the join's answers keyed
+    by the survivors' order, the keys of the survivors, and the keys
+    settled at the end.
+    """
+    from quail.backends.quail.executor.stages import (
+        Stage,
+        filter_stages,
+        run_stages,
+    )
+
     monkeypatch.setattr(loop, "pack_chunk", fake_pack)
     model = FakeModel(filter_truth, join_truth)
     pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
@@ -188,35 +199,31 @@ def run_streamed(monkeypatch, *, doc_lengths, filter_truth, partner_lengths,
     keys = [("r", d) for d in range(len(docs))]
     frame = [FRAME] * frame_tokens
     suffixes = [[PARTNER + i] * n for i, n in enumerate(partner_lengths)]
-    stream = loop.FilterStream(
-        fake_torch(), arena, pipeline, answers, docs, questions, budget,
-        arena_writes=True, arena_keys=keys, hold_survivors=True,
-        hold_extra_tokens=len(frame))
-    blocked_seen = []
-    real_next = stream.next
-
-    def counting_next(evict_retained=False):
-        items, blocked = real_next(evict_retained=evict_retained)
-        blocked_seen.append(blocked)
-        return items, blocked
-
-    stream.next = counting_next
-    anchor_keys, anchor_prefixes = [], []
     settled = {}
 
-    def anchor_done(local, row):
-        settled[anchor_keys[local]] = list(row)
-        arena.free_key(anchor_keys[local])
+    def on_settled(local, survived, row):
+        settled[keys[local]] = list(row)
+        arena.free_key(keys[local])
 
-    join_answers, _, join_tokens = loop.run_join(
-        fake_torch(), arena, pipeline, answers, anchor_prefixes,
-        [suffixes], budget, stage_frames=[frame], anchor_keys=anchor_keys,
-        anchor_done=anchor_done, anchor_source=stream,
-        anchor_partners=anchor_partners)
-    return dict(stream=stream, model=model, arena=arena,
-                join_answers=join_answers, join_tokens=join_tokens,
-                anchor_keys=anchor_keys, settled=settled,
-                blocked=blocked_seen)
+    stage_list = filter_stages(questions, answers) + [Stage(
+        suffixes=suffixes, readout=answers, frame=frame,
+        requests=(None if anchor_partners is None
+                  else (lambda key: anchor_partners(key)[0])))]
+    every, _, tokens = run_stages(
+        fake_torch(), arena, pipeline, stage_list, docs, budget,
+        anchor_keys=keys, on_settled=on_settled)
+    filter_answers = {}
+    for stage in every[:stages]:
+        for doc, row in stage.items():
+            filter_answers.setdefault(doc, []).append(int(row[0]))
+    survivors = [doc for doc, row in sorted(filter_answers.items())
+                 if len(row) == stages and all(row)]
+    join_answers = [{local: list(every[stages][doc])
+                     for local, doc in enumerate(survivors)
+                     if doc in every[stages]}]
+    return dict(model=model, arena=arena, filter_answers=filter_answers,
+                join_answers=join_answers, join_tokens=tokens,
+                anchor_keys=[keys[doc] for doc in survivors], settled=settled)
 
 
 def two_alias_graph(pin_survivors, *, stages=1, hash_join=False, foreign=None):
