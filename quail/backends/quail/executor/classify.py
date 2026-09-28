@@ -21,6 +21,9 @@ the partner suffixes are:
   through, and after each round a label whose partial score is below
   a fully read label's score is pruned; a document resolved early
   skips the remaining rounds (RoundScorer).
+- ``trie_search``: one stage per trie node. Each round a document
+  sends one chain, the next node of the label with the highest bound,
+  so the winning label resolves first and prunes the rest.
 """
 
 import logging
@@ -65,9 +68,11 @@ class LabelRequests:
         score: Maps one document's log probabilities, shape
             (suffixes, rows, targets) with all rows read and
             (suffixes, targets) otherwise, to one score per label;
-            None under ``trie_rounds``, which scores as it reads.
-        rounds: Under ``trie_rounds``, the suffixes of each round, one
-            list per trie depth; ``suffixes`` is their concatenation.
+            None under ``trie_rounds`` and ``trie_search``, which
+            score as they read.
+        rounds: Under ``trie_rounds`` and ``trie_search``, the number
+            of rounds a document may need; each round offers every
+            node's chain and a document picks its own.
     """
 
     frame: list
@@ -75,7 +80,7 @@ class LabelRequests:
     targets: list
     read_all_rows: bool
     score: Callable[[np.ndarray], np.ndarray] | None
-    rounds: tuple = ()
+    rounds: int = 0
 
 
 def label_requests(spec, targets=None) -> LabelRequests:
@@ -104,14 +109,13 @@ def label_requests(spec, targets=None) -> LabelRequests:
         return LabelRequests(
             frame, [[cue, *path] for path in paths], targets, True,
             lambda logprobs: label_path_scores(ids, paths, targets, logprobs))
-    if spec.scoring == "trie_rounds":
-        trie = label_trie(ids)
-        rounds = tuple(
-            [[cue, *node] for node in sorted(n for n in trie if len(n) == depth)]
-            for depth in range(max(len(label) for label in ids)))
+    if spec.scoring in ("trie_rounds", "trie_search"):
+        nodes = sorted(label_trie(ids), key=lambda n: (len(n), n))
+        rounds = (len(nodes) if spec.scoring == "trie_search"
+                  else max(len(label) for label in ids))
         return LabelRequests(
-            frame, [suffix for chains in rounds for suffix in chains],
-            targets, True, None, rounds=rounds)
+            frame, [[cue, *node] for node in nodes], targets, True, None,
+            rounds=rounds)
     trie = label_trie(ids)
     nodes = sorted(trie, key=lambda prefix: (len(prefix), prefix))
     return LabelRequests(
@@ -212,36 +216,37 @@ class QuailClassifier:
                               if index else None),
                     read_all_rows=read_all, label=stage_spec.name))
                 continue
-            scorer = RoundScorer(stage_spec.label_token_ids, targets, len(rows))
+            scorer = RoundScorer(stage_spec.label_token_ids, targets, len(rows),
+                                 search=stage_spec.scoring == "trie_search")
             scorers[index] = scorer
-            for depth, chains in enumerate(request.rounds):
+            for round in range(request.rounds):
                 position = len(stages)
 
-                def ask(key, index=index, depth=depth, position=position,
+                def ask(key, index=index, round=round, position=position,
                         scorer=scorer):
                     document = key[2]
-                    if depth == 0 and index and gate(index, key) is Stage.DROP:
+                    if round == 0 and index and gate(index, key) is Stage.DROP:
                         return Stage.DROP
-                    nodes = scorer.requests(document, depth)
+                    nodes = scorer.requests(document, round)
                     if not nodes:
                         return Stage.SKIP
                     asked[document, position] = nodes
                     return nodes
 
-                def round_read(anchor, row, index=index, depth=depth,
-                               position=position, scorer=scorer,
-                               names=stage_spec.labels):
+                def round_read(anchor, row, index=index, position=position,
+                               scorer=scorer, names=stage_spec.labels):
                     nodes = asked.pop((anchor, position))
-                    scorer.update(anchor, depth, nodes,
+                    scorer.update(anchor, nodes,
                                   row.reshape(len(nodes), readout_rows, -1))
                     if scorer.label[anchor] >= 0:
                         labels[index][anchor] = names[scorer.label[anchor]]
                     return True
 
                 stages.append(Stage(
-                    suffixes=chains, readout=readout, frame=request.frame,
-                    requests=ask, decide=round_read, read_all_rows=True,
-                    label=f"{stage_spec.name} round {depth}"))
+                    suffixes=request.suffixes, readout=readout,
+                    frame=request.frame, requests=ask, decide=round_read,
+                    read_all_rows=True,
+                    label=f"{stage_spec.name} round {round}"))
 
         stats = {}
         answers, spans, fresh = run_stages(
@@ -266,7 +271,7 @@ class QuailClassifier:
             written = index == 0 or request.frame != requests[index - 1].frame
             streamed += suffix_tokens + (len(first) * len(request.frame)
                                          if written else 0)
-            position += max(1, len(request.rounds))
+            position += max(1, request.rounds)
         total = sum(map(len, prefixes)) + streamed
         gpu_s = 0.0
         if state.get("gpu_timing"):

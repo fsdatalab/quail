@@ -95,6 +95,7 @@ def test_label_chain_scores_read_one_row_per_label_token():
     assert trie_paths([(1, 2, 3), (1, 2), (1, 4), (5, 6)]) == [(5,), (1, 2)]
     assert suffix_lengths("trie_paths", IDS) == [2]
     assert suffix_lengths("trie_rounds", IDS) == [1, 2]
+    assert suffix_lengths("trie_search", IDS) == [1, 2]
     # its row 0 holds every first token, its row 1 every token after 1
     path_logprobs = np.log([[[0.6, nan, nan, 0.4], [nan, 0.3, 0.7, nan]]])
     scores = label_path_scores(IDS, [(1,)], targets, path_logprobs)
@@ -104,32 +105,49 @@ def test_label_chain_scores_read_one_row_per_label_token():
 def test_round_scorer_prunes_by_bounds_and_resolves_documents():
     targets = [1, 2, 3, 4]
     scorer = RoundScorer(IDS, targets, documents=3)
-    assert scorer.nodes == [[()], [(1,)]]
+    assert scorer.nodes == [(), (1,)] and scorer.rounds == 2
     # round 0 reads the row after the cue for every document
     assert [scorer.requests(doc, 0) for doc in range(3)] == [[0], [0], [0]]
     assert scorer.tokens == 3
     # document 0: token 1 at -1 and token 4 at -3, so "shipping" is
     # resolved at -3 and both "refund" labels stay alive above it
-    scorer.update(0, 0, [0], np.array([[[-1.0, -9.0, -9.0, -3.0]]]))
+    scorer.update(0, [0], np.array([[[-1.0, -9.0, -9.0, -3.0]]]))
     # document 1: token 4 at -0.5 beats every bound, resolved at once
-    scorer.update(1, 0, [0], np.array([[[-2.0, -9.0, -9.0, -0.5]]]))
+    scorer.update(1, [0], np.array([[[-2.0, -9.0, -9.0, -0.5]]]))
     # document 2: a tie at -1 keeps the earlier labels alive
-    scorer.update(2, 0, [0], np.array([[[-1.0, -9.0, -9.0, -1.0]]]))
+    scorer.update(2, [0], np.array([[[-1.0, -9.0, -9.0, -1.0]]]))
     assert scorer.label.tolist() == [-1, 2, -1]
     assert scorer.alive.tolist() == [[True, True, True], [False, False, True],
                                      [True, True, True]]
     assert scorer.requests(1, 1) is None
-    assert scorer.requests(0, 1) == [0] and scorer.requests(2, 1) == [0]
+    assert scorer.requests(0, 1) == [1] and scorer.requests(2, 1) == [1]
     assert scorer.tokens == 3 + 2 + 2
     # rows: after the cue, then after token 1
-    scorer.update(0, 1, [0], np.array([[[-1.0, -9.0, -9.0, -3.0],
-                                        [-9.0, -1.0, -5.0, -9.0]]]))
-    scorer.update(2, 1, [0], np.array([[[-1.0, -9.0, -9.0, -1.0],
-                                        [-9.0, -5.0, -1.0, -9.0]]]))
+    scorer.update(0, [1], np.array([[[-1.0, -9.0, -9.0, -3.0],
+                                     [-9.0, -1.0, -5.0, -9.0]]]))
+    scorer.update(2, [1], np.array([[[-1.0, -9.0, -9.0, -1.0],
+                                     [-9.0, -5.0, -1.0, -9.0]]]))
     # document 2's tied labels lose once read: "shipping" at -1 stays best
     assert scorer.label.tolist() == [0, 2, 2]
     assert scorer.partial[0].tolist() == [-2.0, -6.0, -3.0]
     assert scorer.partial[2].tolist() == [-6.0, -2.0, -1.0]
+
+    # best first: labels (1, 2), (1, 3), (4, 5); after the cue token 1
+    # at -1 and token 4 at -3, the search follows (1,) and resolves
+    # (1, 2) at -2, which prunes (4, 5) unread; rounds read (4,) too
+    ids = ((1, 2), (1, 3), (4, 5))
+    after_cue = [[[-1.0, -9.0, -9.0, -3.0, -9.0]]]
+    after_one = [[[-1.0, -9.0, -9.0, -3.0, -9.0], [-9.0, -1.0, -5.0, -9.0, -9.0]]]
+    search = RoundScorer(ids, [1, 2, 3, 4, 5], documents=1, search=True)
+    assert search.nodes == [(), (1,), (4,)] and search.rounds == 3
+    assert search.requests(0, 0) == [0]
+    search.update(0, [0], np.array(after_cue))
+    assert search.requests(0, 1) == [1]
+    search.update(0, [1], np.array(after_one))
+    assert search.label.tolist() == [0] and search.tokens == 1 + 2
+    rounds = RoundScorer(ids, [1, 2, 3, 4, 5], documents=1)
+    rounds.update(0, rounds.requests(0, 0), np.array(after_cue))
+    assert rounds.requests(0, 1) == [1, 2] and rounds.tokens == 1 + 2 + 2
 
 
 def test_classify_prompt_is_quail_b_text_with_labels_after_it():
@@ -325,8 +343,10 @@ def test_classifier_reads_rounds_and_skips_resolved_documents(monkeypatch):
         prompt_token_parts=((90,), (91, 92, 93)), labels=("a", "b"),
         label_token_ids=((2,), (4,)), scoring="trie_rounds")
     requests = label_requests(spec)
-    assert requests.rounds == ([[93]], [[93, 1]])
+    assert requests.rounds == 2
     assert requests.suffixes == [[93], [93, 1]] and requests.score is None
+    assert label_requests(ClassifySpec(**{**spec.__dict__,
+                                          "scoring": "trie_search"})).rounds == 2
     spec = ClassifySpec(**{**spec.__dict__, "stages": (
         ClassifyStage(spec=tone, accepted=("refund request",)),)})
     documents = {"d": [[10, 11], [12], [13]]}
@@ -639,7 +659,7 @@ def test_classify_refusals_and_builder_errors(session):
     assert classify.spec.scoring == "trie_paths"
     assert plan.settings["label_scoring"] == "trie_paths"
     for rule in ("trie_nodes", "label_chains", "trie_paths", "trie_rounds",
-                 "next_rule"):
+                 "trie_search", "next_rule"):
         ruled = quail.Session(EngineConfig(
             model="qwen3-4b-fp8", device="h100-sxm", label_scoring=rule),
             tokenizer=_bytes)
