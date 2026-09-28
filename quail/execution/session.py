@@ -912,7 +912,7 @@ class Query:
         )
         scans_by_alias = {scan.alias: scan for scan in scans}
 
-        def project(node, value):
+        def project(node, value, labels=None):
             if not isinstance(node, Project):
                 raise TypeError(type(node).__name__)
             if node.inputs[0].value_type is ValueType.JOIN_ANSWERS:
@@ -933,6 +933,28 @@ class Query:
                     fields.append(pa.field(
                         name, relation.schema.field(name).type
                     ))
+                    continue
+                table = next((table for table in (labels or {}).values()
+                              if name in table.column_names), None)
+                if table is not None:
+                    # a label the graph computed for some of an alias's
+                    # documents, widened to every document of the alias
+                    alias = table.column_names[0]
+                    if alias not in relation.schema.names:
+                        raise CompileError(
+                            f"label column {name!r} belongs to {alias!r}, "
+                            f"which is not in the result")
+                    widened = [None] * len(self._doc_tokens[alias])
+                    for document, label in zip(
+                            table.column(alias).to_pylist(),
+                            table.column(name).to_pylist()):
+                        widened[document] = label
+                    values = pa.array(widened, pa.string())
+                    projection.append((alias, values))
+                    fields.append(pa.field(
+                        name, pa.string(), nullable=True,
+                        metadata={b"quail.alias": alias.encode("utf-8"),
+                                  b"quail.label": name.encode("utf-8")}))
                     continue
                 try:
                     alias, column = name.split(".", 1)

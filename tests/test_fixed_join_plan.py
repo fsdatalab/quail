@@ -1,5 +1,6 @@
 """Fixed join execution, filter retention, and answer reconstruction."""
 
+import numpy as np
 import pyarrow as pa
 from test_quail_backend import graph_state
 
@@ -9,7 +10,19 @@ from quail.bench import quailb
 from quail.execution.execute import execute_query
 from quail.execution.runner import NodeMetrics, NodeResult, SurvivorStream
 from quail.execution.types import PhysicalResponse
-from quail.physical import AiFilter, AiJoin, Barrier, Project, Scan, decode_graph
+from quail.execution.reranker import _score_table
+from quail.physical import (
+    AiClassify,
+    AiFilter,
+    AiJoin,
+    Barrier,
+    LabelFilter,
+    PortRef,
+    Project,
+    Scan,
+    decode_graph,
+    encode_graph,
+)
 from quail.planner.plan import EngineConfig
 from quail_b import prompts
 from quail_b.queries import FILTER_SELECTIVITY_ESTIMATES
@@ -43,6 +56,9 @@ def register_fever(session):
 
 
 class FixedFeverAnswers:
+    # the label a classification gives claims c0, c1, c2
+    labels = ("science", "sport", "science")
+
     def __init__(self, state, capacity, empty):
         self.state = state
         self.capacity = capacity
@@ -56,6 +72,15 @@ class FixedFeverAnswers:
         return answers, live
 
     def execute(self, node, inputs):
+        if isinstance(node, AiClassify):
+            (ids,) = inputs["score_inputs"].values()
+            rows = np.asarray([[int(document)] for document in ids],
+                              dtype=np.int32)
+            table = _score_table(
+                rows, node.spec.aliases, node.spec.name,
+                [self.labels[int(document)] for document in ids], pa.string())
+            return NodeResult({"scores": table}, NodeMetrics(
+                input_rows=len(ids), output_rows=len(ids)))
         if isinstance(node, AiFilter):
             if node.pin_survivors:
                 stream = SurvivorStream(node, inputs["document_ids"])
@@ -238,6 +263,60 @@ def test_fev9_executes_bound_and_edited_join_nodes_without_the_optimizer(
         assert f"barrier:{chain.alias}" in seen[1]
         assert f"barrier:{chain.alias}" not in seen[0]
         assert edited_result.collect().to_pylist() == rows.to_pylist() == FEV9_ROWS
+
+
+def test_classification_runs_beside_filters_and_joins(monkeypatch):
+    with _session() as session:
+        claims = session.docs("claims").alias("c")
+        evidence = session.docs("evidence").alias("e")
+        topic = quail.prompt("What is {0} about?", quail.col("c.claim"))
+        plausible = quail.prompt("Is {0} plausible?", quail.col("c.claim"))
+        # filter then classify: the label is computed for the survivors
+        query = (claims.ai_filter(plausible, selectivity=0.9)
+                 .ai_classify(topic, ["science", "sport"], name="topic")
+                 .select("c.id", "topic"))
+        plan = query.plan()
+        assert [type(node).__name__ for node in plan.nodes] == [
+            "Scan", "AiFilter", "AiClassify", "Project"]
+        classify = plan.nodes[2]
+        assert classify.inputs[0].source == PortRef(plan.nodes[1].node_id,
+                                                    "ids:c")
+        assert plan.settings["label_scoring"] == "cost model"
+        execute = fever_executor(session, monkeypatch, 1, capacity=10)
+        rows = execute_query(query, physical_executor=execute).collect()
+        assert rows.to_pylist() == [{"c.id": "c0", "topic": "science"},
+                                    {"c.id": "c1", "topic": "sport"}]
+
+        # classify, keep one label, then join: the join takes the
+        # accepted claims, and the label rides the output rows
+        claims = session.docs("claims").alias("c")
+        evidence = session.docs("evidence").alias("e")
+        query = (claims.ai_filter(plausible, selectivity=0.9)
+                 .ai_classify(topic, ["science", "sport"], name="topic")
+                 .label_in("topic", ["science"], selectivity=0.5)
+                 .ai_join(evidence, quail.prompt(
+                     "Does {1} support {0}?", quail.col("c.claim"),
+                     quail.col("e.text")), selectivity=0.5)
+                 .select("c.id", "e.id", "topic"))
+        plan = query.plan()
+        assert [type(node).__name__ for node in plan.nodes] == [
+            "Scan", "Scan", "AiFilter", "AiClassify", "LabelFilter", "AiJoin",
+            "Project"]
+        assert not plan.nodes[2].pin_survivors
+        test, join, project = plan.nodes[4], plan.nodes[5], plan.nodes[6]
+        (claims_port,) = [port.source for port in join.inputs
+                          if port.source.port == "ids:c"]
+        assert claims_port == PortRef(test.node_id, "ids:c")
+        assert [port.source.port for port in project.inputs] == [
+            "join_answers:0", "scores"]
+        codecs = session.registry.codecs
+        assert decode_graph(encode_graph(plan.graph, codecs), codecs) == plan.graph
+        execute = fever_executor(session, monkeypatch, 1, capacity=10)
+        result = execute_query(query, physical_executor=execute)
+        assert result.collect().to_pylist() == [
+            {"c.id": "c0", "e.id": "e0", "topic": "science"}]
+        labels = result.answer_tables["classifies"]["topic"]
+        assert labels.column("topic").to_pylist() == ["science", "sport"]
 
 
 def test_request_backends_plan_fev9_and_a_single_join():

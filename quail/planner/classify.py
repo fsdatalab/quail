@@ -45,6 +45,42 @@ def _refused(reason: str, constraint: str = "unsupported_classify_query",
     return (PhysicalCandidate(None, refusal, float("inf")),)
 
 
+def classification_refusal(context) -> Refusal | None:
+    """Why the context's model cannot classify, or None when it can."""
+    model = context.model
+    if model.canvas_tokens:
+        reason = (f"AI.CLASSIFY is not supported on {model.name!r} yet: it "
+                  f"reads answers from a canvas")
+    elif not model.tied_head:
+        reason = (f"AI.CLASSIFY needs the full output head, which Quail keeps "
+                  f"only for models whose head is tied to the embedding; "
+                  f"{model.name!r} has a separate head")
+    elif context.tokenizer is None:
+        reason = "AI.CLASSIFY planning needs the model's tokenizer"
+    elif (context.label_scoring is not None
+          and context.label_scoring not in LABEL_SCORINGS):
+        reason = (f"unknown label scoring rule {context.label_scoring!r}; "
+                  f"the rules are {LABEL_SCORINGS}")
+    else:
+        return None
+    return _refused(reason)[0].plan
+
+
+def classify_table(context, alias: str, backend_name: str) -> "_Table":
+    """The classification planner for one table of the context."""
+    lengths = [int(length) for length in context.document_tokens[alias]]
+    count = len(lengths)
+    total = sum(lengths)
+    chunk = budgets.chunk_budget(context.model, context.device)
+    capacity = budgets.arena_tokens(context.model, context.device, chunk)
+    return _Table(
+        alias=alias, mean=total / max(1, count),
+        longest=max(lengths, default=0), budget=min(chunk, capacity),
+        chunk=chunk, scoring=context.label_scoring,
+        backend_name=backend_name, model=context.model,
+        device=context.device, tokenizer=context.tokenizer)
+
+
 def has_label(logical) -> bool:
     """Return whether a logical plan classifies or tests a label."""
     operators = logical.operators()
@@ -159,7 +195,7 @@ class _Table:
                 is needed, else None.
 
         Raises:
-            _RefusedError: A document and its prompt exceed the budget.
+            ClassifyRefusedError: A document and its prompt exceed the budget.
         """
         head = self.head(call)
         tail = tuple(call.prompt.tail_token_ids)
@@ -172,7 +208,7 @@ class _Table:
         # suffix and the frame entry's own rows are packed beside them
         need = len(head) + self.longest + len(tail) + max(suffixes)
         if need > self.budget:
-            raise _RefusedError(
+            raise ClassifyRefusedError(
                 f"a document in {self.alias!r} needs {need} tokens with its "
                 f"classification prompt, but the forward pass budget is "
                 f"{self.budget} tokens", need, self.budget)
@@ -251,33 +287,16 @@ def plan_classify(region, context, *, backend_name: str):
     if not all(isinstance(p.expression, LabelIn) for p in predicates):
         return _refused(
             "AI.CLASSIFY cannot be mixed with AI.IF or AI.SCORE yet")
-    if model.canvas_tokens:
-        return _refused(
-            f"AI.CLASSIFY is not supported on {model.name!r} yet: it reads "
-            f"answers from a canvas")
-    if not model.tied_head:
-        return _refused(
-            f"AI.CLASSIFY needs the full output head, which Quail keeps "
-            f"only for models whose head is tied to the embedding; "
-            f"{model.name!r} has a separate head")
-    if context.tokenizer is None:
-        return _refused("AI.CLASSIFY planning needs the model's tokenizer")
+    refusal = classification_refusal(context)
+    if refusal is not None:
+        return (PhysicalCandidate(None, refusal, float("inf")),)
     # None lets the cost model choose per classification
     scoring = context.label_scoring
-    if scoring is not None and scoring not in LABEL_SCORINGS:
-        return _refused(f"unknown label scoring rule {scoring!r}; the rules "
-                        f"are {LABEL_SCORINGS}")
-
-    lengths = [int(length) for length in context.document_tokens[alias]]
-    count = len(lengths)
-    total = sum(lengths)
-    chunk = budgets.chunk_budget(model, context.device)
+    table = classify_table(context, alias, backend_name)
+    count = len(context.document_tokens[alias])
+    total = sum(int(length) for length in context.document_tokens[alias])
+    chunk = table.chunk
     capacity = budgets.arena_tokens(model, context.device, chunk)
-    table = _Table(
-        alias=alias, mean=total / max(1, count), longest=max(lengths, default=0),
-        budget=min(chunk, capacity), chunk=chunk, scoring=scoring,
-        backend_name=backend_name, model=model, device=context.device,
-        tokenizer=context.tokenizer)
 
     # the output column of each classified prompt
     named = {
@@ -326,9 +345,9 @@ def plan_classify(region, context, *, backend_name: str):
                 spec, step = table.classify(item, named[item], live,
                                             resident=joins,
                                             demand=demands.get(item))
-            except _RefusedError as refused:
-                return _refused(refused.reason, "suffix_over_chunk",
-                                refused.needed, refused.available, "tokens")
+            except ClassifyRefusedError as refused:
+                return (PhysicalCandidate(None, refused.refusal(),
+                                          float("inf")),)
             work += step
             seconds += spec.estimated_seconds
             if joins:
@@ -398,7 +417,14 @@ def plan_classify(region, context, *, backend_name: str):
     return (PhysicalCandidate(plan.graph, plan, seconds),)
 
 
-class _RefusedError(Exception):
+class ClassifyRefusedError(Exception):
+    """A classification the forward pass budget cannot hold."""
+
     def __init__(self, reason, needed, available):
         super().__init__(reason)
         self.reason, self.needed, self.available = reason, needed, available
+
+    def refusal(self) -> Refusal:
+        """The planning refusal this exception stands for."""
+        return _refused(self.reason, "suffix_over_chunk", self.needed,
+                        self.available, "tokens")[0].plan

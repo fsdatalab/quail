@@ -708,7 +708,9 @@ def test_classify_refusals_and_builder_errors(session):
         quail.prompt("Is {0} short?", quail.col("d.body"))).ai_classify(
         quail.prompt("{0}", quail.col("d.body")), ["a", "b"],
         name="x").select("d.id", "x")
-    assert "AI.IF" in mixed.plan().reasons[0]
+    # beside AI.IF the classification is a step of the general plan
+    assert [type(node).__name__ for node in mixed.plan().nodes] == [
+        "Scan", "AiFilter", "AiClassify", "Project"]
     assert not isinstance(query.plan(), Refusal)
 
     # the plan setting picks the scoring rule; the cost model by default

@@ -655,16 +655,23 @@ class RecombineRuntime:
 
 
 class ProjectRuntime:
-    """Run the configured result projection."""
+    """Run the configured result projection.
+
+    The first input is the relation to project; any others are label
+    tables whose columns the projection may name.
+    """
 
     def execute(self, node, inputs, context) -> NodeResult:
         if not isinstance(node, Project):
             raise TypeError(type(node).__name__)
-        if len(inputs) != 1:
+        if not inputs:
             raise ValueError("Project needs one input")
-        value = next(iter(inputs.values()))
+        first, *rest = node.inputs
+        value = inputs[first.name]
+        labels = {port.name: inputs[port.name] for port in rest}
         if context.project is not None:
-            value = context.project(node, value)
+            value = (context.project(node, value, labels) if labels
+                     else context.project(node, value))
         rows = _row_count(value) or 0
         return NodeResult({"rows": value},
                           NodeMetrics(input_rows=rows, output_rows=rows))

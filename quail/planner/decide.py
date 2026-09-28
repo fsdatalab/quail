@@ -1,6 +1,6 @@
 """Choose filter order, joins, anchors, and KV retention before execution."""
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 from quail.cost import budgets
 from quail.cost.retention import coefficients, retention_pages
@@ -8,13 +8,16 @@ from quail.cost.sol import speed_of_light, unrounded_seconds
 from quail.cost.work import Work, ask, scan
 from quail.logical import (
     DEFAULT_SELECTIVITY,
+    Alias,
     CompileError,
+    LabelIn,
     LogicalPlan,
     effective_selectivity,
     join_conditions,
     oriented_join_conditions,
 )
 from quail.physical import (
+    AiClassify,
     AiFilter,
     AiJoin,
     Barrier,
@@ -23,6 +26,7 @@ from quail.physical import (
     Foreign,
     HashJoin,
     JoinStage,
+    LabelFilter,
     Limit,
     PortRef,
     Recombine,
@@ -36,6 +40,11 @@ from quail.physical import (
 from quail.physical.base import input_ports
 from quail.planner import joins as joinsearch
 from quail.planner import retention
+from quail.planner.classify import (
+    ClassifyRefusedError,
+    classification_refusal,
+    classify_table,
+)
 from quail.planner.physical_optimizer import (
     ModelRegion,
     PlanningContext,
@@ -341,9 +350,58 @@ def contiguous_shards(doc_tokens, workers: int):
 
 # ---------------------------------------------------------- the planner
 
+@dataclass(frozen=True)
+class _Labels:
+    """The classifications a plan needs, from its label filters and columns.
+
+    Attributes:
+        calls: (AI.CLASSIFY call, alias) in plan order: the calls label
+            filters test, in written order, then projected labels.
+        names: Call -> its output column.
+        tests: Call -> written positions of the label filters testing it.
+        demands: Call -> the accepted labels, for a call that is never
+            projected and tested by filters with one accepted set.
+        projected: Call -> column name, for projected labels.
+    """
+
+    calls: tuple
+    names: dict
+    tests: dict
+    demands: dict
+    projected: dict
+
+
+def _label_work(plan, filters) -> _Labels:
+    projected = {column.expression: column.name
+                 for column in plan.root.columns
+                 if isinstance(column, Alias)}
+    names = dict(projected)
+    tests = {}
+    accepted = {}
+    calls = []
+    for alias, predicates in filters.items():
+        for position, predicate in enumerate(predicates):
+            test = predicate.expression
+            if not isinstance(test, LabelIn):
+                continue
+            names.setdefault(test.call,
+                             test.name or f"__label_{alias}_{position}")
+            if test.call not in tests:
+                calls.append((test.call, alias))
+            tests.setdefault(test.call, []).append(position)
+            accepted.setdefault(test.call, set()).add(tuple(test.accepted))
+    for call in projected:
+        if call not in tests:
+            calls.append((call, call.aliases()[0]))
+    demands = {call: next(iter(sets)) for call, sets in accepted.items()
+               if call not in projected and len(sets) == 1}
+    return _Labels(tuple(calls), names, tests, demands, projected)
+
+
 def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                 device: DeviceSpec, doc_tokens: dict, gpus: int = 1,
-                order: str | None = None, pair_fractions=None):
+                order: str | None = None, pair_fractions=None,
+                context: PlanningContext | None = None):
     """Compile a LogicalPlan into a PhysicalPlan or Refusal.
 
     Args:
@@ -356,10 +414,41 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
             the default rule.
         pair_fractions: join written position -> the fraction of the
             cross product its equality conditions keep.
+        context: The planning context, needed when the plan classifies
+            documents: an AI.CLASSIFY column or a label filter runs
+            after a table's AI.IF filters, before its joins.
     """
     operators = plan.operators()
     scans, filters, joins = operators.scans, operators.filters, operators.joins
     applies = operators.applies
+    # AI.IF predicates by written position; label filters and projected
+    # labels are classification work after the AI.IF chain
+    asks = {alias: [position for position, predicate in enumerate(predicates)
+                    if not isinstance(predicate.expression, LabelIn)]
+            for alias, predicates in filters.items()}
+    ask_filters = {alias: [filters[alias][position] for position in positions]
+                   for alias, positions in asks.items() if positions}
+    labels = _label_work(plan, filters)
+    classified = {alias for _, alias in labels.calls}
+    if labels.calls:
+        if context is None:
+            return Refusal(
+                reasons=("AI.CLASSIFY planning needs a planning context",),
+                constraint="unsupported_classify_query",
+                needed=1, available=0, unit="queries")
+        if gpus > 1:
+            return Refusal(
+                reasons=("AI.CLASSIFY beside AI.IF or joins runs on one GPU",),
+                constraint="unsupported_classify_query",
+                needed=1, available=gpus, unit="gpus")
+        if any(len(call.aliases()) != 1 for call, _ in labels.calls):
+            return Refusal(
+                reasons=("AI.CLASSIFY reads one document",),
+                constraint="unsupported_classify_query",
+                needed=1, available=0, unit="queries")
+        refusal = classification_refusal(context)
+        if refusal is not None:
+            return refusal
     alias_applies = {}
     join_applies = {}
     for apply in applies:
@@ -409,7 +498,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
         (st.mean_doc_tokens for st in stats.values()), default=None)
     arena_split = budgets.arena_pages(model, device, chunk, longest_mean)
     admission = arena_split[0] * budgets.PAGE_TOKENS
-    pre = preamble_tokens(filters, joins)
+    pre = preamble_tokens(ask_filters, joins)
     specs = join_specs(joins, pair_fractions, model.canvas_tokens)
 
     # ---- the order rule first: the search below needs it
@@ -417,11 +506,11 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
         default_order_rule(filters, joins)
     fixed = rule == "as_written"
     filter_orders = {
-        alias: order_filters_indexed(
-            predicates, rule,
+        alias: [asks[alias][index] for index in order_filters_indexed(
+            ask_filters.get(alias, []), rule,
             prefix_tokens=pre + stats[alias].mean_doc_tokens,
-            model=model, device=device, chunk_tokens=chunk)
-        for alias, predicates in filters.items()
+            model=model, device=device, chunk_tokens=chunk)]
+        for alias in filters
     }
 
     # ---- expected live counts after filters, and the fixed filter
@@ -488,7 +577,8 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     partner_before = set()
     for index, group in enumerate(sequence_groups):
         anchor = group[0][1]
-        if anchor in filters and anchor not in streamed \
+        if anchor in ask_filters and anchor not in classified \
+                and anchor not in streamed \
                 and anchor not in partner_before \
                 and anchor not in barrier_aliases:
             streamed[anchor] = index
@@ -521,7 +611,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     anchors = {wp: a for wp, a in found["seq"]}
     for s in scans:
         fq = max((_question_tokens(p.prompt, model.canvas_tokens)
-                  for p in filters.get(s.alias, ())), default=None)
+                  for p in ask_filters.get(s.alias, ())), default=None)
         if fq is None:
             continue
         need = pre + stats[s.alias].max_doc_tokens + fq
@@ -621,11 +711,57 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                 aliases=(alias,)))
             ids_src[alias] = PortRef(aid, f"ids:{alias}")
 
-    for s in scans:
-        if s.alias in filters and s.alias not in streamed:
-            emit_filter(s.alias)
-        elif s.alias not in filters:
-            emit_applies(s.alias)
+    # documents expected after a table's AI.IF filters, before its
+    # label filters
+    live_asked = {}
+    for alias, predicates in filters.items():
+        survival = 1.0
+        for position in asks[alias]:
+            survival *= effective_selectivity(predicates[position].selectivity)
+        live_asked[alias] = float(stats[alias].n_docs) * survival
+    classify_seconds = 0.0
+    label_ports = []
+
+    def emit_classify(alias):
+        """Classify the alias's documents, then keep the accepted labels."""
+        nonlocal classify_seconds
+        calls = [call for call, owner in labels.calls if owner == alias]
+        if not calls:
+            return
+        table = classify_table(context, alias, "quail")
+        live = live_asked.get(alias, float(stats[alias].n_docs))
+        for call in calls:
+            spec, _ = table.classify(call, labels.names[call], live,
+                                     demand=labels.demands.get(call))
+            node = table.node(spec, ids_src[alias],
+                              sum(isinstance(n, AiClassify) for n in nodes))
+            nodes.append(node)
+            classify_seconds += spec.estimated_seconds
+            scores = PortRef(node.node_id, "scores")
+            if call in labels.projected:
+                label_ports.append(scores)
+            for position in labels.tests.get(call, ()):
+                predicate = filters[alias][position]
+                lid = f"label_filter:{alias}:{position}"
+                nodes.append(LabelFilter(
+                    node_id=lid, inputs=input_ports((scores,)),
+                    score_name=labels.names[call], aliases=(alias,),
+                    comparison="in", threshold=0.0,
+                    selectivity=predicate.selectivity, written_pos=position,
+                    accepted=tuple(predicate.expression.accepted)))
+                scores = PortRef(lid, "scores")
+                ids_src[alias] = PortRef(lid, f"ids:{alias}")
+                live *= effective_selectivity(predicate.selectivity)
+
+    try:
+        for s in scans:
+            if s.alias in ask_filters and s.alias not in streamed:
+                emit_filter(s.alias)
+            elif s.alias not in ask_filters:
+                emit_applies(s.alias)
+            emit_classify(s.alias)
+    except ClassifyRefusedError as refused:
+        return refused.refusal()
 
     # group consecutive full stages on the same anchor; gates run
     # alone; anchor switches become barriers
@@ -735,8 +871,9 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
         sink_inputs = (ids_src[scans[0].alias],)
     nodes.append(PhysicalProject(
         node_id="project",
-        inputs=input_ports(tuple(sink_inputs)),
-        columns=tuple(f"{c.alias}.{c.column}" for c in plan.root.columns)))
+        inputs=input_ports(tuple(sink_inputs) + tuple(label_ports)),
+        columns=tuple(c.name if isinstance(c, Alias) else f"{c.alias}.{c.column}"
+                      for c in plan.root.columns)))
     if plan.root.limit is not None:
         nodes.append(Limit(
             node_id="limit",
@@ -746,7 +883,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
 
     estimate = speed_of_light(
         base_work + found["work"], model, device, chunk
-    ).seconds
+    ).seconds + classify_seconds
     stage_works = {record["written_pos"]: record["work"]
                    for record in found["records"]}
 
@@ -768,6 +905,8 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
             "order_rule": rule,
             "order_source": source,
             "search_seconds": estimate,
+            **({"label_scoring": context.label_scoring or "cost model"}
+               if labels.calls else {}),
         },
         estimator=estimator)
 

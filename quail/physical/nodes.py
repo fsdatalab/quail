@@ -698,11 +698,24 @@ class ScoreFilter(PhysicalNode):
 
 @dataclass(frozen=True)
 class LabelFilter(ScoreFilter):
-    """Keep the rows whose label column holds one of the accepted labels."""
+    """Keep the rows whose label column holds one of the accepted labels.
+
+    A one-table label filter also yields the accepted documents' ids,
+    so a join or a later filter can take them.
+    """
 
     accepted: tuple[str, ...] = ()
 
     type_name: ClassVar[str] = "quail.label_filter"
+
+    @property
+    def outputs(self) -> tuple[OutputPort, ...]:
+        ports = super().outputs
+        if len(self.aliases) == 1:
+            ports += (OutputPort(f"ids:{self.aliases[0]}",
+                                 ValueType.DOCUMENT_IDS,
+                                 schema=(self.aliases[0],)),)
+        return ports
 
     def attributes(self) -> dict:
         return {**super().attributes(), "accepted": list(self.accepted)}

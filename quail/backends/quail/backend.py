@@ -17,7 +17,7 @@ from quail.backends.quail.worker import execute_quail_request, prepare_quail_req
 from quail.execution.reranker import RerankerModelExecution
 from quail.execution.runner import NodeMetrics, NodeResult, SurvivorStream
 from quail.execution.tokens import DocumentKeys, prefix_tree
-from quail.logical import Alias, is_score, shared_preamble
+from quail.logical import Alias, LabelIn, is_score, shared_preamble
 from quail.logical.prompts import true_false_token_ids
 from quail.physical import (
     AiFilter,
@@ -420,20 +420,28 @@ class QuailBackend:
         context: PlanningContext,
     ) -> tuple[PhysicalCandidate, ...]:
 
+        operators = region.logical_plan.operators()
         if has_label(region.logical_plan):
             if context.model.role == "reranker":
                 return (PhysicalCandidate(None, Refusal(
                     reasons=("a reranker model cannot run AI.CLASSIFY",),
                     constraint="reranker_only_scores", needed=1, available=0,
                     unit="AI.CLASSIFY expressions"), float("inf")),)
-            return plan_classify(region, context, backend_name=self.name)
-        operators = region.logical_plan.operators()
+            asked = any(not isinstance(predicate.expression, LabelIn)
+                        for predicates in operators.filters.values()
+                        for predicate in predicates)
+            # a classification with nothing else runs on its own planner,
+            # which chains classifications; beside AI.IF or joins it is
+            # a step of the general plan
+            if not asked and not operators.joins \
+                    and len(operators.scans) == 1:
+                return plan_classify(region, context, backend_name=self.name)
         has_score = any(
             is_score(predicate.expression)
             for predicates in operators.filters.values()
             for predicate in predicates
         ) or any(is_score(join.predicate) for join in operators.joins) or any(
-            isinstance(expression, Alias)
+            isinstance(expression, Alias) and expression.expression.kind == "score"
             for expression in region.logical_plan.root.columns
         )
         if context.model.role == "reranker":
@@ -457,6 +465,7 @@ class QuailBackend:
             gpus=context.gpu_count,
             order=context.order,
             pair_fractions=context.pair_fractions,
+            context=context,
         )
         if not hasattr(plan, "graph"):
             return (

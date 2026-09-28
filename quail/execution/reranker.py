@@ -401,17 +401,20 @@ class RerankerModelExecution:
 
 
 def _filter_answer_table(node: ScoreFilter, table, answers) -> pa.Table:
+    """One answer row per document, in the layout of a filter's answers."""
     alias = node.aliases[0]
-    return pa.table({
-        alias: pc.cast(table.column(alias), pa.int32()),
-        "predicate": pa.array(
-            np.full(table.num_rows, node.written_pos, dtype=np.int32), type=pa.int32()
-        ),
-        "answer": pa.array(answers, type=pa.bool_()),
-    }).replace_schema_metadata({
-        b"quail.kind": b"filter_answers",
-        b"quail.alias": alias.encode("utf-8"),
-    })
+    schema = pa.schema(
+        [pa.field(alias, pa.int32(), nullable=False),
+         pa.field("predicate", pa.int32(), nullable=False),
+         pa.field("answer", pa.bool_(), nullable=False)],
+        metadata={b"quail.kind": b"filter_answers",
+                  b"quail.alias": alias.encode("utf-8")})
+    return pa.Table.from_arrays([
+        pc.cast(table.column(alias), pa.int32()),
+        pa.array(np.full(table.num_rows, node.written_pos, dtype=np.int32),
+                 type=pa.int32()),
+        pa.array(answers, type=pa.bool_()),
+    ], schema=schema)
 
 
 class ScoreFilterRuntime:
@@ -453,11 +456,12 @@ class ScoreFilterRuntime:
                     "threshold": node.threshold,
                 },
             )
+        outputs = {"scores": filtered, answer_name: answer_relation}
+        if isinstance(node, LabelFilter) and len(node.aliases) == 1:
+            outputs[f"ids:{node.aliases[0]}"] = (
+                filtered.column(node.aliases[0]).to_pylist())
         return NodeResult(
-            {
-                "scores": filtered,
-                answer_name: answer_relation,
-            },
+            outputs,
             NodeMetrics(
                 input_rows=table.num_rows,
                 output_rows=filtered.num_rows,
