@@ -241,11 +241,14 @@ PROBE_PREDICTION_TEXT = (
 
 @app.function(image=labeling.image, gpu="H100!", memory=98304, timeout=3600,
               volumes=_volumes())
-def quail_probe() -> dict:
+def quail_probe(kernels: str = "quail") -> dict:
     """Score IMDB-11's first probe reviews with the question in the prefix.
 
     Variants: every review packed together on the tree path, on the
     unified path, and one review per forward pass on each path.
+
+    Args:
+        kernels: "quail" for Quail's fused kernels, "vllm" for vLLM's.
     """
     import torch
     from transformers import AutoTokenizer
@@ -272,7 +275,7 @@ def quail_probe() -> dict:
                     // budgets.PAGE_TOKENS,
                     page_tokens=budgets.PAGE_TOKENS, n_kv=spec.n_kv,
                     d_head=spec.d_head, dtype=torch.bfloat16)
-    pipeline = build_pipeline(spec, model, arena)
+    pipeline = build_pipeline(spec, model, arena, kernels=kernels)
     operator, relation, documents, _ = _documents()["IMDB-11"]
     documents = documents[:PROBE_DOCUMENTS]
     tail, labels, contexts = _inputs(tokenizer, operator, relation, documents)
@@ -302,12 +305,12 @@ def quail_probe() -> dict:
 
 
 @app.local_entrypoint()
-def probe(vllm_call: str):
+def probe(vllm_call: str, kernels: str = "quail"):
     """Compare the probe variants with vLLM scores from an earlier scores run."""
     import numpy as np
 
     print(PROBE_PREDICTION_TEXT, flush=True)
-    call = quail_probe.spawn()
+    call = quail_probe.spawn(kernels)
     print(f"[classify-scores] quail probe function call id: {call.object_id}",
           flush=True)
     quail = call.get()
