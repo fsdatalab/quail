@@ -114,7 +114,7 @@ def test_kernel_cache_files_counts_each_cache_directory(tmp_path, monkeypatch):
     assert kernel_cache_files() == {}
     (tmp_path / "triton" / "a").mkdir(parents=True)
     (tmp_path / "triton" / "a" / "k.cubin").write_bytes(b"")
-    (tmp_path / "triton" / "a" / "k.json").write_bytes(b"")
+    (tmp_path / "triton" / "b").mkdir()
     (tmp_path / "deep_gemm").mkdir()
     (tmp_path / "marker.json").write_text("{}")
     monkeypatch.setenv("QUAIL_CACHE_DIR", str(tmp_path))

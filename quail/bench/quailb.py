@@ -274,26 +274,28 @@ def _submission_to_answer_s(
 
 
 def kernel_cache_files() -> dict[str, int]:
-    """Return the file count under each kernel cache directory.
+    """Return the entry count under each kernel cache directory.
 
     The caches live under QUAIL_CACHE_DIR (Triton, DeepGEMM, and vLLM
-    each in their own directory). A count that grows across a query
-    means kernels were compiled inside the query's time.
+    each in their own directory), one entry per compiled kernel. A
+    count that grows across a query means kernels were compiled inside
+    the query's time. Counts the top level only: the caches sit on a
+    network volume, where walking every file takes seconds.
     """
     root = Path(os.path.expanduser(
         os.environ.get("QUAIL_CACHE_DIR", "~/.cache/quail/kernels")))
     if not root.is_dir():
         return {}
     return {
-        child.name: sum(len(files) for _, _, files in os.walk(child))
+        child.name: sum(1 for _ in os.scandir(child))
         for child in sorted(root.iterdir()) if child.is_dir()
     }
 
 
 def run_query(session, spec: QuerySpec, tables) -> RunOutput:
     """Execute one query and return benchmark ids, answers, and measurements."""
+    cache_before = kernel_cache_files()     # before the timed window
     submitted = time.perf_counter()
-    cache_before = kernel_cache_files()
     for name, table in tables.items():
         if name not in session.catalog:
             session.register(

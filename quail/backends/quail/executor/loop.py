@@ -99,28 +99,30 @@ class InputStaging:
 
 
 def _staged_token_parts(torch, sequences, total, pinned=True, staging=None):
-    """Copy Arrow token views into one GPU input tensor."""
+    """Copy the chunk's token parts into one GPU input tensor.
+
+    The parts are joined on the host first, so the chunk takes one
+    copy into pinned memory however many suffixes it packs.
+    """
     host = (torch.empty(total, dtype=torch.int64, pin_memory=pinned)
             if staging is None else staging.host("tokens", total, torch.int64))
-    offset = 0
+    arrays = []
     for sequence in sequences:
         for part in _token_parts(sequence):
-            count = len(part)
-            if not count:
+            if not len(part):
                 continue
             if hasattr(part, "arrow_array"):
-                source = torch.from_dlpack(part.arrow_array)
+                arrays.append(part.arrow_array.to_numpy(zero_copy_only=False))
             elif torch.is_tensor(part):
-                source = part
-            elif staging is not None and isinstance(part, tuple):
-                source = staging.fixed(part)
+                arrays.append(part.numpy())
             else:
-                source = torch.as_tensor(part)
-            host[offset:offset + count].copy_(source)
-            offset += count
-    if offset != total:
+                arrays.append(np.asarray(part, dtype=np.int64))
+    ids = (np.concatenate(arrays).astype(np.int64, copy=False) if arrays
+           else np.empty(0, dtype=np.int64))
+    if len(ids) != total:
         raise AssertionError(
-            f"packed {offset} token ids into a {total}-token chunk")
+            f"packed {len(ids)} token ids into a {total}-token chunk")
+    host.copy_(torch.from_numpy(ids))
     if staging is not None:
         return staging.upload("tokens", total)
     return host.to("cuda", non_blocking=pinned)

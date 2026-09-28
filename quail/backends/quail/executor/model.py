@@ -123,8 +123,9 @@ def retain_answer_head(torch, model, token_ids):
     model.register_buffer("quail_answer_weights", weights, persistent=False)
     model.quail_answer_token_ids = allowed
     if _tied_to_embedding(model, weight):
-        # the embedding keeps this memory anyway; AI.CLASSIFY reads it
-        model.quail_full_head = weight.detach()
+        # AI.CLASSIFY reads the whole head; logits are computed in
+        # bf16, as vLLM computes them, and normalized in float32
+        model.quail_full_head = weight.detach().to(dtype=torch.bfloat16)
     # lm_head can be the same module as embed_tokens; drop only this reference.
     model.lm_head = None
 
