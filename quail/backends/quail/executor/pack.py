@@ -241,6 +241,10 @@ class JoinAdmission:
         can_borrow: Callable(anchor, parent, same_chunk) -> bool, asked
             before a borrow; same_chunk says the parent is admitted in
             the chunk being built. None allows every borrow.
+        advance: Callable(anchor, stage, row) -> bool deciding, once an
+            anchor's whole row at a stage before the last is in,
+            whether it goes on to the next stage. None advances an
+            anchor as soon as one answer in the row is true.
 
     Each chunk fills in priority order: partner streams cut by the
     previous chunk, then anchors starting their next stage, then
@@ -258,8 +262,9 @@ class JoinAdmission:
                  arena_pages, page_tokens, frame_tokens=None,
                  resident=None, anchor_partners=None, temporary_suffix_pages=False,
                  answer_dtype=None, canvas_tokens=0, page_cost=None,
-                 tree=None, can_borrow=None):
+                 tree=None, can_borrow=None, advance=None):
         self.answer_dtype = answer_dtype
+        self.advance = advance
         n = len(prefix_tokens)
         self.borrowing = Borrowing(n, tree, can_borrow)
         # page_cost(tokens, base_tokens) prices a key in the arena's
@@ -610,11 +615,14 @@ class JoinAdmission:
             row[start:end] = bits
             self._answer_counts[j][a] = end
         self.in_flight -= 1
-        if (any(bits) if self.answer_dtype is None else np.any(bits)):
-            self._true[a][j] = True
         k = len(self.stages)
         n_j = self._count(a, j)
         complete = end == n_j
+        if self.advance is not None:
+            if complete and j + 1 < k:
+                self._true[a][j] = bool(self.advance(a, j, row))
+        elif (any(bits) if self.answer_dtype is None else np.any(bits)):
+            self._true[a][j] = True
         events = []
         if j == self._stage[a] and j + 1 < k:
             if self._true[a][j] and self._next[a] == n_j:

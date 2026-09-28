@@ -2,7 +2,8 @@
 
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from typing import Any
 
 import numpy as np
 import pyarrow as pa
@@ -117,6 +118,9 @@ class RerankerBatch:
     cached_tokens: int
     label_tokens: int = 0
     borrowed_tokens: int = 0
+    # a classify chain's later stages: output name -> one label per
+    # row, None for a row its gate stopped
+    later: Mapping[str, Any] = field(default_factory=dict)
     # forward-chunk seconds on the GPU and chunks launched; both zero
     # unless the session asked for GPU timing
     gpu_s: float = 0.0
@@ -231,8 +235,26 @@ def scored_batch(node, rows, table) -> dict:
                "rows": (rows[:, 0].tolist() if rows.shape[1] == 1
                         else rows.tolist())}
     if isinstance(node.spec, ClassifySpec):
-        return {**payload, "kind": "label", "labels": values}
+        later = {stage.spec.name: table.column(stage.spec.name).to_pylist()
+                 for stage in node.spec.stages}
+        return {**payload, "kind": "label", "labels": values,
+                **({"stages": later} if later else {})}
     return {**payload, "scores": [round(float(value), 4) for value in values]}
+
+
+def classify_label_tables(spec, table) -> dict:
+    """Return each classification's label table from a classify node's scores.
+
+    The chain's first stage labels every row. A later stage's table
+    holds only the rows its gate let through, with its own label column.
+    """
+    tables = {spec.name: table}
+    (alias,) = spec.aliases
+    for stage in spec.stages:
+        name = stage.spec.name
+        rows = table.filter(pc.is_valid(table.column(name)))
+        tables[name] = rows.select([alias, name])
+    return tables
 
 
 def score_in_batches(node, inputs, score_batches, shards: int = 1,
@@ -341,6 +363,8 @@ class RerankerModelExecution:
         )
         table = _score_table(rows, spec.aliases, spec.name, batch.scores,
                              _value_type(spec))
+        for name, values in batch.later.items():
+            table = table.append_column(name, pa.array(values, pa.string()))
         count = len(rows)
         return NodeResult(
             {"scores": table},

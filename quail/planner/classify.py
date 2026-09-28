@@ -9,7 +9,7 @@ after it, and one short suffix per label-trie node reads the next
 token's log probabilities.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from quail.cost import budgets
 from quail.cost.sol import speed_of_light
@@ -26,6 +26,7 @@ from quail.logical import (
 from quail.physical import (
     AiClassify,
     ClassifySpec,
+    ClassifyStage,
     LabelFilter,
     Limit,
     PortRef,
@@ -81,14 +82,20 @@ def suffix_lengths(scoring: str, labels) -> list[int]:
 
 
 def classify_work(documents: float, mean_tokens: float, head_tokens: int,
-                  frame_tokens: int, suffixes) -> Work:
+                  frame_tokens: int, suffixes, resident: bool = False) -> Work:
     """Work to classify documents of a mean length.
 
     Each document computes its head, document, and frame once, then
-    streams the suffixes against them.
+    streams the suffixes against them. A resident document, a chain's
+    later stage, has its head and document in KV already and streams
+    the frame with the suffixes.
     """
-    prefix = head_tokens + mean_tokens + frame_tokens
-    per_document = scan(prefix, 0) + stream(prefix, suffixes)
+    if resident:
+        prefix = head_tokens + mean_tokens
+        per_document = stream(prefix, [frame_tokens, *suffixes])
+    else:
+        prefix = head_tokens + mean_tokens + frame_tokens
+        per_document = scan(prefix, 0) + stream(prefix, suffixes)
     return per_document * documents
 
 
@@ -117,20 +124,24 @@ class _Table:
     device: object
     tokenizer: object
 
-    def classify(self, call, name, input_port, live, index):
-        """Return an AiClassify node for one prompt and the work it does.
+    def head(self, call) -> tuple:
+        """The prompt tokens before the document."""
+        return tuple(self.tokenizer(call.prompt.preamble))
+
+    def classify(self, call, name, live, resident=False):
+        """Return a ClassifySpec for one prompt and the work it does.
 
         Args:
             call: The logical AI.CLASSIFY call.
             name: The output column.
-            input_port: The port carrying the documents still alive.
             live: How many documents are expected to reach it.
-            index: The node's position among the plan's classifications.
+            resident: Whether the documents' KV is resident from an
+                earlier stage of the same chain.
 
         Raises:
             _RefusedError: A document and its prompt exceed the budget.
         """
-        head = tuple(self.tokenizer(call.prompt.preamble))
+        head = self.head(call)
         tail = tuple(call.prompt.tail_token_ids)
         labels = tuple(tuple(self.tokenizer(label_text(label)))
                        for label in call.labels)
@@ -144,7 +155,7 @@ class _Table:
                 f"classification prompt, but the forward pass budget is "
                 f"{self.budget} tokens", need, self.budget)
         step = classify_work(live, self.mean, len(head), len(tail) - 1,
-                             suffixes)
+                             suffixes, resident=resident)
         estimate = speed_of_light(step, self.model, self.device,
                                   self.chunk).seconds
         spec = ClassifySpec(
@@ -155,11 +166,14 @@ class _Table:
             prompt_token_parts=(head, tail), labels=tuple(call.labels),
             label_token_ids=labels, scoring=self.scoring,
         )
-        node = AiClassify(node_id=f"ai-classify:{index}",
+        return spec, step
+
+    def node(self, spec, input_port, index) -> AiClassify:
+        """The plan node running a classification and its chained stages."""
+        return AiClassify(node_id=f"ai-classify:{index}",
                           inputs=input_ports((input_port,)),
-                          backend_name=self.backend_name, model=self.model.name,
-                          spec=spec)
-        return node, step
+                          backend_name=self.backend_name,
+                          model=self.model.name, spec=spec)
 
 
 def plan_classify(region, context, *, backend_name: str):
@@ -169,8 +183,14 @@ def plan_classify(region, context, *, backend_name: str):
     written order an AiClassify node (if that prompt has not been
     classified yet) and a LabelFilter node, then an AiClassify node for
     each projected label column not yet classified, then the projection.
-    Each AiClassify node gets a cost estimate from the documents
+    Each classification gets a cost estimate from the documents
     expected to reach it and the suffix lengths of its scoring rule.
+
+    A classification that follows another on the same documents, with
+    the same prompt head and at most one label filter between them
+    testing the earlier label, joins the earlier node as a stage: the
+    executor runs it on the documents the filter accepts while their
+    KV is still resident.
     """
     logical = region.logical_plan
     model = context.model
@@ -238,17 +258,37 @@ def plan_classify(region, context, *, backend_name: str):
     work = Work()
     seconds = 0.0
     live = float(count)
+    chain = None          # index in nodes of the open classify chain
+    last_call = None      # the chain's latest stage
+    since = []            # label filters since that stage
     for kind, item in steps:
         if kind == "classify":
+            joins = (chain is not None and len(since) <= 1
+                     and all(predicates[p].expression.call is last_call
+                             for p in since)
+                     and table.head(item) == table.head(last_call))
             try:
-                node, step = table.classify(item, named[item], current, live,
-                                            sum(isinstance(n, AiClassify)
-                                                for n in nodes))
+                spec, step = table.classify(item, named[item], live,
+                                            resident=joins)
             except _RefusedError as refused:
                 return _refused(refused.reason, "suffix_over_chunk",
                                 refused.needed, refused.available, "tokens")
             work += step
-            seconds += node.spec.estimated_seconds
+            seconds += spec.estimated_seconds
+            if joins:
+                gate = (tuple(predicates[since[0]].expression.accepted)
+                        if since else None)
+                root = nodes[chain]
+                nodes[chain] = replace(root, spec=replace(
+                    root.spec, stages=root.spec.stages
+                    + (ClassifyStage(spec=spec, accepted=gate),)))
+            else:
+                chain = len(nodes)
+                nodes.append(table.node(
+                    spec, current, sum(isinstance(n, AiClassify)
+                                       for n in nodes)))
+                current = PortRef(nodes[chain].node_id, "scores")
+            last_call, since = item, []
         else:
             predicate = predicates[item]
             node = LabelFilter(
@@ -259,8 +299,9 @@ def plan_classify(region, context, *, backend_name: str):
                 selectivity=predicate.selectivity, written_pos=item,
                 accepted=tuple(predicate.expression.accepted))
             live *= effective_selectivity(predicate.selectivity)
-        nodes.append(node)
-        current = PortRef(node.node_id, "scores")
+            nodes.append(node)
+            current = PortRef(node.node_id, "scores")
+            since.append(item)
 
     columns = tuple(
         column.name if isinstance(column, Alias)
@@ -287,7 +328,8 @@ def plan_classify(region, context, *, backend_name: str):
             "true_ids": true_ids,
             "false_ids": false_ids,
             "retained_kv_tokens": capacity,
-            "prefix_reuse": "document KV shared by every label suffix",
+            "prefix_reuse": "document KV shared by every label suffix and "
+                            "by every chained classification",
             "survivor_assumption": "uniform independent selection",
             "estimated_fresh_tokens": work.tokens,
             "estimated_attention_pairs": work.pairs,

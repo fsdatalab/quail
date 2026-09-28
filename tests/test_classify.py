@@ -34,6 +34,7 @@ from quail.logical import ColumnRef, CompileError, bind_classify_prompt, label_t
 from quail.physical import (
     AiClassify,
     ClassifySpec,
+    ClassifyStage,
     LabelFilter,
     decode_graph,
     encode_graph,
@@ -321,6 +322,82 @@ def test_classifier_borrows_shared_prefix_pages(monkeypatch):
     assert batch.fresh_tokens == (41 + 41 - 32) + 2 * (2 + 3)
 
 
+def test_classifier_runs_chained_stages_on_resident_documents(monkeypatch):
+    # stage 0 labels LABELS with the trie-path rule; the gate lets only
+    # "refund request" through to stage 1, which labels ("a", "b")
+    second = ClassifySpec(
+        name="kind", aliases=("d",), query_template="", arguments=(),
+        expected_inputs=1, estimated_seconds=0.0,
+        prompt_token_parts=((90,), (94, 95)), labels=("a", "b"),
+        label_token_ids=((5,), (6,)), scoring="trie_paths")
+    spec = ClassifySpec(
+        name="topic", aliases=("d",), query_template="", arguments=(),
+        expected_inputs=3, estimated_seconds=0.0,
+        prompt_token_parts=((90,), (91, 92, 93)), labels=LABELS,
+        label_token_ids=IDS, scoring="trie_paths",
+        stages=(ClassifyStage(spec=second, accepted=(LABELS[0],)),))
+    documents = {"d": [[10, 11], [12], [13, 14, 15]]}
+    packed = []
+
+    def recording_pack(torch, arena, specs, **kw):
+        packed.extend((entry["key"][2], entry["prefix"] is not None,
+                       [list(suffix) for suffix in entry["suffixes"]])
+                      for entry in specs)
+        return fake_pack(torch, arena, specs, **kw)
+
+    # document i prefers label i at stage 0 (one chain over (1,), two
+    # rows); at stage 1 every document prefers "b"
+    def forward(chunk):
+        rows = []
+        for entry in chunk.specs:
+            document = entry["key"][2]
+            for suffix in entry["suffixes"]:
+                count = len(suffix) if entry.get("read_all_rows") else 1
+                for row in range(count):
+                    if suffix[0] == 93:
+                        seen = tuple(suffix[1:row + 1])
+                        wanted = IDS[document]
+                        rows.append([
+                            -1.0 if seen + (t,) == tuple(wanted[:row + 1])
+                            else -5.0 for t in targets])
+                    else:
+                        rows.append([-1.0 if t == 6 else -5.0
+                                     for t in targets])
+        return np.asarray(rows, dtype=np.float32)
+
+    targets = [1, 2, 3, 4, 5, 6]
+
+    def submit(rows, rows_per_answer=None):
+        rows_per_answer = rows_per_answer or [1] * len(rows)
+        padded = np.full((len(rows_per_answer), 2, 6), np.nan, np.float32)
+        start = 0
+        for answer, count in enumerate(rows_per_answer):
+            padded[answer, :count] = rows[start:start + count]
+            start += count
+        return padded
+
+    monkeypatch.setattr(loop, "pack_chunk", recording_pack)
+    readout = SimpleNamespace(
+        targets=np.asarray(targets), rows=2,
+        dtype=np.dtype((np.float32, (2, 6))),
+        submit=submit, result=lambda rows: rows)
+    state = {"torch": fake_torch(), "arena": cpu_arena(64),
+             "pipeline": fake_pipeline(forward_chunk=forward),
+             "chunk_tokens": 64, "label_readout": readout,
+             "input_staging": SimpleNamespace(fixed_tokens=set())}
+    batch = QuailClassifier(state).classify(spec, [[0], [1], [2]], documents)
+    assert list(batch.scores) == list(LABELS)
+    assert list(batch.later["kind"]) == ["b", None, None]
+    # document 0 packs its prefix once: stage 1 streams frame and chain
+    assert [(doc, fresh) for doc, fresh, _ in packed].count((0, True)) == 1
+    assert ([suffixes for doc, _, suffixes in packed if doc == 0]
+            == [[[91, 92]], [[93, 1]], [[94]], [[95]]])
+    # stage 0: prefix, 2-token frame, one 2-token chain per document;
+    # stage 1: document 0's 1-token frame and 1-token chain
+    assert batch.fresh_tokens == (3 + 2 + 4) + 3 * (2 + 2) + (1 + 1)
+    assert batch.label_tokens == 3 * 2 + 1
+
+
 @pytest.fixture()
 def session(tmp_path):
     path = tmp_path / "documents.parquet"
@@ -351,8 +428,16 @@ class _Labels:
     def score(self, spec, rows, documents):
         assert isinstance(spec, ClassifySpec)
         values = np.asarray([self.labels[row[0]] for row in rows], dtype=object)
+        later = {}
+        for stage in spec.stages:
+            # a later stage labels the rows the gate accepts with its
+            # first label
+            later[stage.spec.name] = np.asarray([
+                stage.spec.labels[0]
+                if stage.accepted is None or label in stage.accepted else None
+                for label in values], dtype=object)
         return RerankerBatch(values, fresh_tokens=len(rows), cached_tokens=0,
-                             label_tokens=3 * len(rows))
+                             label_tokens=3 * len(rows), later=later)
 
 
 def test_classify_plans_filters_and_returns_labels(session):
@@ -380,6 +465,45 @@ def test_classify_plans_filters_and_returns_labels(session):
     result = _finish(plain, session, _Labels(["praise", "shipping"]))
     assert result.collect().column("topic").to_pylist() == [
         "praise", "shipping"]
+
+
+def _chain(session, *, filters=1):
+    query = session.docs("documents").alias("d").ai_classify(
+        quail.prompt("What is {0} about?", quail.col("d.body")),
+        ["refund", "shipping", "praise"], name="topic")
+    query = query.label_in("topic", ["refund", "shipping"], selectivity=0.5)
+    if filters > 1:
+        query = query.label_in("topic", ["refund"], selectivity=0.5)
+    return query.ai_classify(
+        quail.prompt("What kind of {0}?", quail.col("d.body")),
+        ["complaint", "question"], name="kind").select("d.id", "topic", "kind")
+
+
+def test_chained_classifications_share_one_node(session):
+    query = _chain(session)
+    plan = query.plan()
+    classifies = [n for n in plan.nodes if isinstance(n, AiClassify)]
+    assert len(classifies) == 1
+    (node,) = classifies
+    (stage,) = node.spec.stages
+    assert stage.spec.name == "kind" and stage.accepted == ("refund", "shipping")
+    assert node.explain_fields()["stages"] == [
+        {"accepted": ["refund", "shipping"], "output": "kind"}]
+    codecs = session.registry.codecs
+    assert decode_graph(encode_graph(plan.graph, codecs), codecs) == plan.graph
+    # the later stage streams only its frame and suffixes
+    assert stage.spec.estimated_seconds < node.spec.estimated_seconds
+
+    result = _finish(query, session, _Labels(["refund", "praise"]))
+    assert result.collect().to_pydict() == {
+        "d.id": [7], "topic": ["refund"], "kind": ["complaint"]}
+    labels = result.answer_tables["classifies"]
+    assert labels["topic"].column("topic").to_pylist() == ["refund", "praise"]
+    assert labels["kind"].to_pydict() == {"d": [0], "kind": ["complaint"]}
+
+    # a second filter between two classifications breaks the chain
+    split = _chain(session, filters=2)
+    assert sum(isinstance(n, AiClassify) for n in split.plan().nodes) == 2
 
 
 def test_classify_refusals_and_builder_errors(session):

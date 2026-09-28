@@ -626,7 +626,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
              anchor_keys=None, anchor_done=None, anchor_source=None,
              anchor_partners=None, anchor_batch=None, staging=None,
              attention_mode=None, prefix_tree=None, stats=None,
-             read_all_rows=False):
+             read_all_rows=False, advance=None):
     """The join driver: stream partner lists against anchors.
 
     Survivors are gated between stages.
@@ -677,6 +677,9 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
             readout, not only its last. The readout's submit then takes
             rows_per_answer and returns one fixed-size record per
             partner; a frame entry still reads one row.
+        advance: Optional callable(anchor, stage, row) -> bool deciding
+            from an anchor's complete row whether it goes on to the
+            next stage; None advances on any true answer.
 
     Returns:
         (ans, spans, tokens): ans[j][a] = 0/1 row over the stage-j
@@ -761,6 +764,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         canvas_tokens=len(canvas),
         page_cost=arena.page_cost,
         tree=prefix_tree,
+        advance=advance,
     )
     borrowing = sched.borrowing
     borrowing.can_borrow = borrow_check(arena, keys, borrowing)

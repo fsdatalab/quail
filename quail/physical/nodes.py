@@ -512,12 +512,21 @@ class ClassifySpec(ScoreSpec):
     or ``trie_paths``.
     ``share_prefixes`` lets a document borrow the KV pages of a
     document sharing its token prefix (the prefix_sharing rule).
+    ``stages`` are later classifications of the same documents, run
+    while each document's KV is still resident; a stage runs on the
+    documents whose previous label its gate accepts.
     """
 
     labels: tuple[str, ...] = ()
     label_token_ids: tuple[tuple[int, ...], ...] = ()
     scoring: str = "trie_nodes"
     share_prefixes: bool = False
+    stages: tuple["ClassifyStage", ...] = ()
+
+    @property
+    def chain(self) -> tuple["ClassifySpec", ...]:
+        """This classification and every later stage's, in order."""
+        return (self,) + tuple(stage.spec for stage in self.stages)
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "ClassifySpec":
@@ -533,6 +542,8 @@ class ClassifySpec(ScoreSpec):
                 for ids in value["label_token_ids"]),
             scoring=str(value.get("scoring", "trie_nodes")),
             share_prefixes=bool(value.get("share_prefixes", False)),
+            stages=tuple(ClassifyStage.from_mapping(stage)
+                         for stage in value.get("stages", ())),
         )
 
     def to_dict(self) -> dict:
@@ -542,6 +553,34 @@ class ClassifySpec(ScoreSpec):
             "label_token_ids": [list(ids) for ids in self.label_token_ids],
             "scoring": self.scoring,
             "share_prefixes": self.share_prefixes,
+            "stages": [stage.to_dict() for stage in self.stages],
+        }
+
+
+@dataclass(frozen=True)
+class ClassifyStage:
+    """A later classification in a chain and the gate before it.
+
+    ``accepted`` names the previous stage's labels that let a document
+    through; None lets every document through.
+    """
+
+    spec: ClassifySpec
+    accepted: tuple[str, ...] | None = None
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "ClassifyStage":
+        accepted = value.get("accepted")
+        return cls(
+            spec=ClassifySpec.from_mapping(value["spec"]),
+            accepted=None if accepted is None
+            else tuple(str(label) for label in accepted),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "spec": self.spec.to_dict(),
+            "accepted": None if self.accepted is None else list(self.accepted),
         }
 
 
@@ -564,6 +603,10 @@ class AiClassify(AiScore):
             "scoring": None if self.spec is None else self.spec.scoring,
             "share_prefixes": (False if self.spec is None
                                else self.spec.share_prefixes),
+            "stages": [] if self.spec is None else [
+                {"accepted": None if stage.accepted is None
+                 else list(stage.accepted), "output": stage.spec.name}
+                for stage in self.spec.stages],
         }
 
     @classmethod

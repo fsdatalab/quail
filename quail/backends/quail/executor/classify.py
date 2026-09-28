@@ -67,27 +67,34 @@ class LabelRequests:
     score: Callable[[np.ndarray], np.ndarray]
 
 
-def label_requests(spec) -> LabelRequests:
-    """Return the requests of the spec's scoring rule."""
+def label_requests(spec, targets=None) -> LabelRequests:
+    """Return the requests of the spec's scoring rule.
+
+    Args:
+        spec: The classification.
+        targets: The token ids the readout returns, sorted; None reads
+            the spec's own label tokens. A chain's stages share one
+            readout over every stage's label tokens.
+    """
     head, tail = spec.prompt_token_parts
     if len(tail) < 1:
         raise ValueError("AI.CLASSIFY needs a question after the document")
     cue, frame = tail[-1], list(tail[:-1])
     ids = spec.label_token_ids
+    if targets is None:
+        targets = (trie_targets(label_trie(ids)) if spec.scoring == "trie_nodes"
+                   else sorted({token for label in ids for token in label}))
     if spec.scoring == "label_chains":
-        targets = sorted({token for label in ids for token in label})
         return LabelRequests(
             frame, [[cue, *label[:-1]] for label in ids], targets, True,
             lambda logprobs: label_chain_scores(ids, targets, logprobs))
     if spec.scoring == "trie_paths":
         paths = trie_paths(ids)
-        targets = sorted({token for label in ids for token in label})
         return LabelRequests(
             frame, [[cue, *path] for path in paths], targets, True,
             lambda logprobs: label_path_scores(ids, paths, targets, logprobs))
     trie = label_trie(ids)
     nodes = sorted(trie, key=lambda prefix: (len(prefix), prefix))
-    targets = trie_targets(trie)
     return LabelRequests(
         frame, [[cue, *node] for node in nodes], targets, False,
         lambda logprobs: label_scores(ids, nodes, targets, logprobs))
@@ -107,15 +114,25 @@ class QuailClassifier:
         self.state = state
 
     def classify(self, spec, rows, documents) -> RerankerBatch:
-        """Return each row's label and the batch's fresh and cached tokens."""
+        """Return each row's labels and the batch's fresh and cached tokens.
+
+        A chain's stages run as the stages of one join call: a document
+        goes on to the next stage while its KV is resident if the gate
+        accepts its label, and every stage's requests share one readout.
+        """
         state = self.state
         rows = np.asarray(rows, dtype=np.int32).reshape(-1)
-        requests = label_requests(spec)
+        specs = spec.chain
+        targets = sorted({token for stage in specs
+                          for ids in stage.label_token_ids for token in ids})
+        requests = [label_requests(stage, targets) for stage in specs]
+        read_all = requests[0].read_all_rows
+        if any(request.read_all_rows != read_all for request in requests):
+            raise ValueError("a classify chain's stages read rows one way")
         prefixes = document_prefixes(spec, documents, rows)
-        frame, suffixes, targets = (
-            requests.frame, requests.suffixes, requests.targets)
-        readout_rows = (max(map(len, suffixes)) if requests.read_all_rows
-                        else 1)
+        readout_rows = (max(len(suffix) for request in requests
+                            for suffix in request.suffixes)
+                        if read_all else 1)
         readout = state.get("label_readout")
         if (readout is None or list(readout.targets.tolist()) != targets
                 or readout.rows != readout_rows):
@@ -136,33 +153,54 @@ class QuailClassifier:
                 "prefix sharing on %s: %s documents borrow %s tokens "
                 "(tree built in %.2f s)", spec.name, len(prefixes),
                 tree.shared_tokens, time.perf_counter() - started)
+
+        labels = [np.full(len(rows), None, dtype=object) for _ in specs]
+
+        def label_of(stage, logprobs):
+            if read_all:
+                # a one-row readout returns (suffixes, targets)
+                logprobs = logprobs.reshape(
+                    len(requests[stage].suffixes), readout_rows, -1)
+            return specs[stage].labels[
+                best_label(requests[stage].score(logprobs))]
+
+        def advance(anchor, stage, row):
+            labels[stage][anchor] = label_of(stage, row)
+            accepted = spec.stages[stage].accepted
+            return accepted is None or labels[stage][anchor] in accepted
+
         stats = {}
         answers, spans, fresh = run_join(
             state["torch"], state["arena"], state["pipeline"], readout,
-            prefixes, [suffixes], state["chunk_tokens"],
-            stage_frames=[frame], anchor_keys=keys,
-            staging=state["input_staging"],
-            read_all_rows=requests.read_all_rows,
-            prefix_tree=tree, stats=stats,
+            prefixes, [request.suffixes for request in requests],
+            state["chunk_tokens"],
+            stage_frames=[request.frame for request in requests],
+            anchor_keys=keys, staging=state["input_staging"],
+            read_all_rows=read_all, prefix_tree=tree, stats=stats,
+            advance=advance if len(specs) > 1 else None,
         )
-        labels = np.empty(len(rows), dtype=object)
-        for anchor, logprobs in answers[0].items():
-            if requests.read_all_rows:
-                # a one-row readout returns (suffixes, targets)
-                logprobs = logprobs.reshape(len(suffixes), readout_rows, -1)
-            labels[anchor] = spec.labels[best_label(requests.score(logprobs))]
-        label_tokens = len(rows) * sum(map(len, suffixes))
-        total = (sum(map(len, prefixes)) + len(rows) * len(frame)
-                 + label_tokens)
+        label_tokens = 0
+        streamed = 0     # frame and suffix tokens packed after documents
+        for stage, request in enumerate(requests):
+            for anchor, logprobs in answers[stage].items():
+                if labels[stage][anchor] is None:
+                    labels[stage][anchor] = label_of(stage, logprobs)
+            reached = len(answers[stage])
+            suffix_tokens = reached * sum(map(len, request.suffixes))
+            label_tokens += suffix_tokens
+            streamed += reached * len(request.frame) + suffix_tokens
+        total = sum(map(len, prefixes)) + streamed
         gpu_s = 0.0
         if state.get("gpu_timing"):
             # every chunk's answers were read, so its end event completed
             state["torch"].cuda.synchronize()
             gpu_s = sum(start.elapsed_time(end)
                         for _, start, end in spans) / 1000.0
-        return RerankerBatch(labels, fresh_tokens=fresh,
-                             cached_tokens=total - fresh,
-                             label_tokens=label_tokens,
-                             borrowed_tokens=stats.get("borrowed_tokens", 0),
-                             gpu_s=gpu_s,
-                             chunks=len(spans) if state.get("gpu_timing") else 0)
+        return RerankerBatch(
+            labels[0], fresh_tokens=fresh, cached_tokens=total - fresh,
+            label_tokens=label_tokens,
+            borrowed_tokens=stats.get("borrowed_tokens", 0),
+            gpu_s=gpu_s,
+            chunks=len(spans) if state.get("gpu_timing") else 0,
+            later={stage.spec.name: labels[index + 1]
+                   for index, stage in enumerate(spec.stages)})

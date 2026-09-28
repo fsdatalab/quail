@@ -1015,14 +1015,19 @@ class Query:
             report["observers"] = observer_reports
         result.report = report
 
+        from quail.execution.reranker import classify_label_tables
         from quail.physical import AiClassify
 
-        # every classified document's label, before any label filter
+        # every classified document's label, before any label filter;
+        # a chain's later stages label the documents their gate passed
         answer_tables = {"filters": {}, "joins": {}, "classifies": {
-            node.spec.name: response.outputs[PortRef(node.node_id, "scores")]
+            name: table
             for node in plan.nodes
             if isinstance(node, AiClassify)
             and PortRef(node.node_id, "scores") in response.outputs
+            for name, table in classify_label_tables(
+                node.spec, response.outputs[PortRef(node.node_id, "scores")]
+            ).items()
         }}
         survivors = {
             scan.alias: list(range(len(self._doc_tokens[scan.alias])))
