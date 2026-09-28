@@ -218,17 +218,17 @@ def write_part(path: Path, rows: list[dict]) -> None:
 
 
 class VLLMJudge:
-    """Qwen3 32B fp8 on stock vLLM, scoring label prefixes."""
+    """A model on stock vLLM scoring label prefixes; Qwen3 32B fp8 by default."""
 
-    def __init__(self):
+    def __init__(self, repo: str = MODEL_REPO, revision: str = MODEL_REVISION):
         from vllm import LLM
 
         from quail.backends.vllm import _capacity
 
         started = time.perf_counter()
         self.llm = LLM(
-            model=MODEL_REPO, revision=MODEL_REVISION,
-            tokenizer_revision=MODEL_REVISION, max_model_len=MAX_MODEL_LEN,
+            model=repo, revision=revision,
+            tokenizer_revision=revision, max_model_len=MAX_MODEL_LEN,
             enable_prefix_caching=True, gpu_memory_utilization=0.9,
             max_logprobs=MAX_LOGPROB_TOKEN_IDS, disable_log_stats=True,
             seed=0)
@@ -389,6 +389,74 @@ def check_run(documents_per_predicate: int = 12,
         },
     }
     labels._atomic_json(CHECK_PATH, result)
+    labels.results_vol.commit()
+    return result
+
+
+QUAIL_CHECK_PATH = Path("/results/ablations/classify-quail-same-model.json")
+QUAIL_CHECK_PREDICTION_TEXT = (
+    "Quail and stock vLLM run the same Qwen3 4B checkpoint, prompt text, "
+    "and label scoring. Quail tokenizes the preamble, document, and "
+    "question separately and vLLM tokenizes the prompt as one string, and "
+    "both compute bf16 logits, so a document whose two best labels are "
+    "within about 0.1 nats can differ. Expect at least 99% of labels to "
+    "agree, every disagreement inside that margin."
+)
+
+
+@app.function(image=labels.image, gpu="H100!", memory=98304, timeout=3600,
+              volumes=_volumes())
+def quail_check_run(run_dir: str, query_ids: str, sf: float = 0.1) -> dict:
+    """Label a Quail run's classified documents with vLLM and the same model.
+
+    Args:
+        run_dir: The QUAIL-B run directory on the volume, under /results.
+        query_ids: Comma-separated query ids the run classified.
+        sf: The run's scale factor.
+    """
+    import pyarrow.parquet as pq
+
+    import quail_b
+    from quail.specs import MODELS
+
+    labels._mount()
+    model = MODELS["qwen3-4b-fp8"]
+    judge = VLLMJudge(model.hf_name, model.revision)
+    by_template = {spec.template: spec for spec in SPECS}
+    checks = {}
+    for query_id in query_ids.split(","):
+        classifies = quail_b.get_query(query_id)._info.classifies
+        for index, operator in enumerate(classifies):
+            (path,) = Path(run_dir, "quail").glob(
+                f"*/{query_id}/classifications-{index}.parquet")
+            quail_labels = pq.read_table(path).to_pylist()
+            spec = by_template[operator.prompt]
+            _, rows = corpus_rows(sf, spec)
+            text = {row["id"]: row[spec.left_column] for row in rows}
+            alias = operator.relation
+            ids = [row[alias] for row in quail_labels]
+            labeled = judge.label(spec, [text[doc] for doc in ids])
+            disagreements = []
+            for doc, row, (label, scores) in zip(ids, quail_labels, labeled):
+                if row["label"] == label:
+                    continue
+                disagreements.append({
+                    "id": doc, "quail": row["label"], "vllm": label,
+                    "vllm_margin": max(scores)
+                    - scores[spec.labels.index(row["label"])],
+                })
+            checks[f"{query_id}:{operator.id}"] = {
+                "predicate": spec.key,
+                "documents": len(ids),
+                "same_label": len(ids) - len(disagreements),
+                "largest_margin": max(
+                    (item["vllm_margin"] for item in disagreements),
+                    default=0.0),
+                "disagreements": disagreements,
+            }
+    result = {"prediction": QUAIL_CHECK_PREDICTION_TEXT, "run_dir": run_dir,
+              "model": model.name, "sf": sf, "checks": checks}
+    labels._atomic_json(QUAIL_CHECK_PATH, result)
     labels.results_vol.commit()
     return result
 
@@ -559,6 +627,21 @@ def check():
     call = check_run.spawn()
     print(f"[classify] check function call id: {call.object_id}", flush=True)
     print(json.dumps(call.get(), indent=2), flush=True)
+
+
+@app.local_entrypoint()
+def quail_check(run_dir: str, query_ids: str, sf: float = 0.1):
+    """Compare a Quail run's labels with stock vLLM on the same model."""
+    print(QUAIL_CHECK_PREDICTION_TEXT, flush=True)
+    call = quail_check_run.spawn(run_dir, query_ids, sf)
+    print(f"[classify] quail check function call id: {call.object_id}",
+          flush=True)
+    result = call.get()
+    for name, check in result["checks"].items():
+        print(f"[classify] {name}: {check['same_label']}/{check['documents']} "
+              f"same, largest vLLM margin {check['largest_margin']:.4f}",
+              flush=True)
+    print(f"[classify] saved {QUAIL_CHECK_PATH}", flush=True)
 
 
 @app.local_entrypoint()
