@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from quail.cost.budgets import choose_attention_path
-from quail.physical import AiFilter, AiJoin, PhysicalGraph
+from quail.physical import AiClassify, AiFilter, AiJoin, PhysicalGraph
 from quail.planner.prefixes import page_tree
 
 
@@ -73,7 +73,8 @@ class PrefixSharing:
     worth more forward-pass time than the page writes the filter takes
     on. The filter then writes pages even when it has one stage, since
     borrowed pages must exist. A join always writes its anchors' KV,
-    so it fires for any join whose anchors share a whole page.
+    so it fires for any join whose anchors share a whole page; a
+    classification writes its documents' KV the same way.
     """
 
     name = "prefix_sharing"
@@ -103,6 +104,17 @@ class PrefixSharing:
                         shared_tokens=page_aligned_shared_tokens(store),
                         total_tokens=sum(lengths), writes_pages=True):
                     node = replace(node, share_prefixes=True)
+                    changed = True
+            elif (isinstance(node, AiClassify) and node.spec is not None
+                  and not node.spec.share_prefixes):
+                lengths = context.document_tokens.get(node.spec.aliases[0])
+                store = _token_store(lengths)
+                if store is not None and sharing_pays(
+                        context.model, context.device,
+                        shared_tokens=page_aligned_shared_tokens(store),
+                        total_tokens=sum(lengths), writes_pages=True):
+                    node = replace(node, spec=replace(
+                        node.spec, share_prefixes=True))
                     changed = True
             nodes.append(node)
         if not changed:

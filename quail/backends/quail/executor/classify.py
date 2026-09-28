@@ -13,6 +13,9 @@ the partner suffixes are:
   one suffix scores the whole label.
 """
 
+import logging
+import time
+
 import numpy as np
 
 from quail.backends.quail.executor.loop import InputStaging, run_join
@@ -26,7 +29,9 @@ from quail.execution.labels import (
     trie_targets,
 )
 from quail.execution.reranker import RerankerBatch
-from quail.execution.tokens import chain_tokens
+from quail.execution.tokens import chain_tokens, prefix_tree
+
+logger = logging.getLogger("quail")
 
 
 def classify_inputs(spec, documents, rows):
@@ -80,11 +85,21 @@ class QuailClassifier:
             state["input_staging"] = InputStaging(state["torch"])
         state["input_staging"].fixed_tokens.clear()
         keys = [("classify", spec.name, index) for index in range(len(rows))]
+        tree = None
+        if spec.share_prefixes:
+            started = time.perf_counter()
+            tree = prefix_tree(prefixes, state["arena"].page_tokens)
+            logger.info(
+                "prefix sharing on %s: %s documents borrow %s tokens "
+                "(tree built in %.2f s)", spec.name, len(prefixes),
+                tree.shared_tokens, time.perf_counter() - started)
+        stats = {}
         answers, _, fresh = run_join(
             state["torch"], state["arena"], state["pipeline"], readout,
             prefixes, [suffixes], state["chunk_tokens"],
             stage_frames=[frame], anchor_keys=keys,
             staging=state["input_staging"], read_all_rows=chains,
+            prefix_tree=tree, stats=stats,
         )
         labels = np.empty(len(rows), dtype=object)
         for anchor, logprobs in answers[0].items():
@@ -102,4 +117,5 @@ class QuailClassifier:
                  + label_tokens)
         return RerankerBatch(labels, fresh_tokens=fresh,
                              cached_tokens=total - fresh,
-                             label_tokens=label_tokens)
+                             label_tokens=label_tokens,
+                             borrowed_tokens=stats.get("borrowed_tokens", 0))

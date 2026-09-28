@@ -7,6 +7,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 from fakes import cpu_arena, fake_pack, fake_pipeline, fake_torch
+from test_planner import _token_store
 from test_score import _finish
 
 import quail
@@ -35,7 +36,10 @@ from quail.physical import (
     encode_graph,
 )
 from quail.planner.classify import suffix_lengths
+from quail.planner.physical_optimizer import PlanningContext
+from quail.planner.physical_rules import PrefixSharing
 from quail.planner.plan import EngineConfig, Refusal
+from quail.specs import H100_SXM, QWEN3_4B_FP8
 from quail_b import rendering
 from quail_b.prompts import AGENT_OUTCOME, AGENT_OUTCOME_DESCRIPTIONS
 from quail_b.prompts import AGENT_OUTCOME_LABELS as OUTCOMES
@@ -247,6 +251,48 @@ def test_classifier_reads_every_row_of_one_chain_per_label(monkeypatch):
     assert list(batch.scores) == ["a", "b"]
 
 
+def test_classifier_borrows_shared_prefix_pages(monkeypatch):
+    spec = ClassifySpec(
+        name="topic", aliases=("d",), query_template="", arguments=(),
+        expected_inputs=2, estimated_seconds=0.0,
+        prompt_token_parts=((90,), (91, 92, 93)), labels=LABELS,
+        label_token_ids=IDS, share_prefixes=True)
+    # after the head, document 1 shares two 16-token pages with document 0
+    documents = {"d": [[10] * 40, [10] * 32 + [11] * 8]}
+    packed = []
+
+    def recording_pack(torch, arena, specs, **kw):
+        packed.extend((spec["key"][2], spec.get("start", 0))
+                      for spec in specs if spec["prefix"] is not None)
+        return fake_pack(torch, arena, specs, **kw)
+
+    def forward(chunk):
+        rows = []
+        for entry in chunk.specs:
+            wanted = IDS[entry["key"][2]]
+            for suffix in entry["suffixes"]:
+                prefix = tuple(suffix[1:])
+                rows.append([
+                    -1.0 if prefix + (token,) == tuple(wanted[:len(prefix) + 1])
+                    else -5.0 for token in [1, 2, 3, 4]])
+        return np.asarray(rows, dtype=np.float32)
+
+    monkeypatch.setattr(loop, "pack_chunk", recording_pack)
+    readout = SimpleNamespace(
+        targets=np.asarray([1, 2, 3, 4]), rows=1,
+        dtype=np.dtype((np.float32, (4,))),
+        submit=lambda rows: rows, result=lambda rows: rows)
+    state = {"torch": fake_torch(), "arena": cpu_arena(64),
+             "pipeline": fake_pipeline(forward_chunk=forward),
+             "chunk_tokens": 64, "label_readout": readout,
+             "input_staging": SimpleNamespace(fixed_tokens=set())}
+    batch = QuailClassifier(state).classify(spec, [[0], [1]], documents)
+    assert list(batch.scores) == list(LABELS[:2])
+    assert packed == [(0, 0), (1, 32)]
+    assert batch.borrowed_tokens == 32 and batch.cached_tokens == 32
+    assert batch.fresh_tokens == (41 + 41 - 32) + 2 * (2 + 3)
+
+
 @pytest.fixture()
 def session(tmp_path):
     path = tmp_path / "documents.parquet"
@@ -355,6 +401,27 @@ def test_classify_refusals_and_builder_errors(session):
     vllm.register("documents", session.catalog.get("documents"))
     assert "not implemented on" in _topic(vllm).plan().reasons[0]
     vllm.close()
+
+
+def test_prefix_sharing_rule_fires_for_a_classification(session, tmp_path):
+    plan = _topic(session).plan()
+    shared = " ".join(str(i) for i in range(40))
+    store = _token_store(tmp_path / "shared.arrow",
+                         [shared, shared + " 99 98", "7 7 7"])
+    plain = _token_store(tmp_path / "plain.arrow", ["1 2 3", "4 5 6"])
+
+    def context(lengths):
+        return PlanningContext(
+            model=QWEN3_4B_FP8, device=H100_SXM, gpu_count=1,
+            document_tokens={"d": lengths}, backend="quail")
+
+    graph = PrefixSharing().rewrite(plan.graph, context(store.lengths))
+    (classify,) = [n for n in graph.nodes if isinstance(n, AiClassify)]
+    assert classify.spec.share_prefixes
+    assert classify.explain_fields()["share_prefixes"]
+    codecs = session.registry.codecs
+    assert decode_graph(encode_graph(graph, codecs), codecs) == graph
+    assert PrefixSharing().rewrite(plan.graph, context(plain.lengths)) is None
 
 
 def test_bench_reads_classify_plans_and_reports_labels_by_operator():

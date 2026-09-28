@@ -116,6 +116,7 @@ class RerankerBatch:
     fresh_tokens: int
     cached_tokens: int
     label_tokens: int = 0
+    borrowed_tokens: int = 0
 
 
 def _value_type(spec) -> pa.DataType:
@@ -231,7 +232,7 @@ def scored_batch(node, rows, table) -> dict:
 
 
 def score_in_batches(node, inputs, score_batches, shards: int = 1,
-                     batch_rows: int = SCORE_BATCH_ROWS) -> NodeResult:
+                     batch_rows: int | None = SCORE_BATCH_ROWS) -> NodeResult:
     """Score the node's candidate rows in bounded batches, in input order.
 
     Args:
@@ -243,7 +244,8 @@ def score_in_batches(node, inputs, score_batches, shards: int = 1,
         shards: Row shards scored side by side; rows that share a first
             document land in the same shard.
         batch_rows: Rows per call of ``score_batches``; each call's scores
-            go to the answer sink as one batch.
+            go to the answer sink as one batch. None scores every row
+            in one call.
     """
     if not isinstance(node, AiScore):
         raise TypeError(type(node).__name__)
@@ -257,6 +259,9 @@ def score_in_batches(node, inputs, score_batches, shards: int = 1,
     positions = []
     metrics = NodeMetrics()
     label_tokens = 0
+    borrowed = 0
+    if batch_rows is None:
+        batch_rows = max(1, len(rows))
     streams = [_batches_with_positions(part, batch_rows) for part in parts]
     while streams:
         rounds = [next(stream, None) for stream in streams]
@@ -273,6 +278,8 @@ def score_in_batches(node, inputs, score_batches, shards: int = 1,
             positions.append(where)
             metrics += result.metrics
             label_tokens += result.metrics.extension.get("label_tokens", 0)
+            borrowed += result.metrics.extension.get(
+                "borrowed_prefix_tokens", 0)
             sink = answer_sink()
             if sink is not None and len(batch):
                 sink(scored_batch(node, batch, result.outputs["scores"]))
@@ -285,7 +292,8 @@ def score_in_batches(node, inputs, score_batches, shards: int = 1,
         metrics, wall_s=time.perf_counter() - started,
         extension={"output": node.spec.name, "aliases": list(node.spec.aliases),
                    "input_rows": len(rows),
-                   **({"label_tokens": label_tokens}
+                   **({"label_tokens": label_tokens,
+                       "borrowed_prefix_tokens": borrowed}
                       if isinstance(node.spec, ClassifySpec) else {})},
     ))
 
@@ -302,9 +310,13 @@ class RerankerModelExecution:
         node: AiScore,
         inputs: Mapping[str, object],
     ) -> NodeResult:
+        # documents borrow prefix pages from documents in the same call
+        shares = (isinstance(node.spec, ClassifySpec)
+                  and node.spec.share_prefixes)
         return score_in_batches(
             node, inputs,
             lambda node, batches: [self.execute_rows(node, b) for b in batches],
+            batch_rows=None if shares else SCORE_BATCH_ROWS,
         )
 
     def execute_rows(self, node, rows):
@@ -344,7 +356,8 @@ class RerankerModelExecution:
                     "output": spec.name,
                     "aliases": list(spec.aliases),
                     "input_rows": count,
-                    **({"label_tokens": batch.label_tokens}
+                    **({"label_tokens": batch.label_tokens,
+                        "borrowed_prefix_tokens": batch.borrowed_tokens}
                        if isinstance(spec, ClassifySpec) else {}),
                 },
             ),
