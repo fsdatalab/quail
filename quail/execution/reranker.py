@@ -256,6 +256,7 @@ def score_in_batches(node, inputs, score_batches, shards: int = 1,
     tables = []
     positions = []
     metrics = NodeMetrics()
+    label_tokens = 0
     streams = [_batches_with_positions(part, batch_rows) for part in parts]
     while streams:
         rounds = [next(stream, None) for stream in streams]
@@ -271,6 +272,7 @@ def score_in_batches(node, inputs, score_batches, shards: int = 1,
             tables.append(result.outputs["scores"])
             positions.append(where)
             metrics += result.metrics
+            label_tokens += result.metrics.extension.get("label_tokens", 0)
             sink = answer_sink()
             if sink is not None and len(batch):
                 sink(scored_batch(node, batch, result.outputs["scores"]))
@@ -282,7 +284,9 @@ def score_in_batches(node, inputs, score_batches, shards: int = 1,
     return NodeResult({"scores": table}, replace(
         metrics, wall_s=time.perf_counter() - started,
         extension={"output": node.spec.name, "aliases": list(node.spec.aliases),
-                   "input_rows": len(rows)},
+                   "input_rows": len(rows),
+                   **({"label_tokens": label_tokens}
+                      if isinstance(node.spec, ClassifySpec) else {})},
     ))
 
 

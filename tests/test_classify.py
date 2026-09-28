@@ -277,7 +277,8 @@ class _Labels:
     def score(self, spec, rows, documents):
         assert isinstance(spec, ClassifySpec)
         values = np.asarray([self.labels[row[0]] for row in rows], dtype=object)
-        return RerankerBatch(values, fresh_tokens=len(rows), cached_tokens=0)
+        return RerankerBatch(values, fresh_tokens=len(rows), cached_tokens=0,
+                             label_tokens=3 * len(rows))
 
 
 def test_classify_plans_filters_and_returns_labels(session):
@@ -298,6 +299,7 @@ def test_classify_plans_filters_and_returns_labels(session):
     assert labels.column("topic").to_pylist() == ["refund", "praise"]
     (answers,) = result.answer_tables["filters"].values()
     assert answers.column("answer").to_pylist() == [True, False]
+    assert result.report["node_metrics"]["ai-classify:0"]["label_tokens"] == 6
 
     # a projected label with no filter classifies every document
     plain = _topic(session, accepted=())
