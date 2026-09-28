@@ -7,7 +7,7 @@ import pytest
 from quail.backends.quail.executor.arena import PageArena
 
 
-def test_allocation_preserves_page_ownership():
+def test_allocation_retention_rewind_and_pinning():
     a = PageArena(n_pages=10, page_tokens=16)
     pages = a.alloc("d0", 40)      # 3 pages
     assert len(pages) == 3
@@ -46,8 +46,6 @@ def test_allocation_preserves_page_ownership():
     assert a.grow("doc", 12) == 2
     assert a.grow("doc", 16) is None
 
-
-def test_retention_rewind_and_pinning():
     a = PageArena(n_pages=10, page_tokens=4)
     a.alloc("doc", 7, capacity_tokens=11)
     assert len(a.owned["doc"]) == 3

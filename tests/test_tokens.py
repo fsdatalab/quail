@@ -15,7 +15,7 @@ from quail.execution.tokens import (
 from quail.planner.prefixes import shared_prefix_tokens
 
 
-def test_token_views_chains_and_shared_prefixes():
+def test_token_views_store_chains_and_shared_prefixes(tmp_path):
     tokens = pa.chunked_array([
         pa.array([[1, 2, 3], [], [4, 5]], type=pa.large_list(pa.int32()))
     ])
@@ -44,8 +44,6 @@ def test_token_views_chains_and_shared_prefixes():
     assert sum(shared_prefix_lengths(sequences[::-1])) == sum(shared)
     assert shared_prefix_tokens([[1, 2, 3], [1, 2, 4], [9]]) == 2
 
-
-def test_token_store_and_file_reference_transport(tmp_path):
     schema = pa.schema({"id": pa.string(), "body": pa.string()})
     batches = [
         pa.record_batch([["a", "b"], ["one two", "three"]], schema=schema),
@@ -73,7 +71,7 @@ def test_token_store_and_file_reference_transport(tmp_path):
     assert len(restored[0]) == 1000
 
 
-def test_prefix_tree_borrows_whole_pages_from_the_predecessor():
+def test_prefix_tree_borrows_whole_pages_and_siblings_share_one_parent():
     docs = [list(range(40)), list(range(50)), list(range(32)) + [99] * 20,
             [7] * 20, [7] * 10]
     tree = prefix_tree(docs, 16)
@@ -94,8 +92,6 @@ def test_prefix_tree_borrows_whole_pages_from_the_predecessor():
     assert tree.parent == [None, None, None]
     assert tree.shared == [0, 0, 0]
 
-
-def test_prefix_tree_siblings_share_one_parent():
     header = list(range(64))
     docs = [header + [1] * 8, header + [2] * 8, header + [3] * 8,
             header + [3] * 8 + [4] * 40, header + [5] * 8]

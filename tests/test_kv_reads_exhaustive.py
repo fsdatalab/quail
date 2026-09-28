@@ -70,18 +70,14 @@ def described(check, docs, setup, *inputs, **options):
             f"{starts}, {setup}: {error}") from error
 
 
-def test_every_small_filter(arena_kind):
+def test_every_small_filter_and_join(arena_kind):
     first, second = [90, 91, 92, 93], [90, 91, 94]
+    frame, partners = [95, 96], [[97, 60, 98], [97, 61, 98]]
     for docs in corpora(16):
         # a question row, a canvas row, and the second question's tail
         setup = tightest(docs, arena_kind, len(first) + 2)
         described(check_filter, docs, setup, [first])
         described(check_filter, docs, setup, [first, second])
-
-
-def test_every_small_join(arena_kind):
-    frame, partners = [95, 96], [[97, 60, 98], [97, 61, 98]]
-    for docs in corpora(16):
         # the frame, one partner, and a canvas row after each
         setup = tightest(docs, arena_kind, len(frame) + len(partners[0]) + 2)
         described(check_join, docs, setup, frame, partners)

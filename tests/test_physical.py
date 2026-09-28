@@ -188,7 +188,9 @@ def test_physical_extensions_plan_validate_and_execute(monkeypatch):
     assert response.metrics == {"backend": "test.example", "nodes": ["input:d"]}
 
 
-def test_physical_explain_shows_shared_inputs_and_metrics():
+def test_physical_explain_shows_shared_inputs_and_scalar_metrics():
+    from quail.execution.runner import NodeMetrics, scalar_node_metrics
+    from quail.explain import physical_tree
     from quail.physical.base import input_ports
 
     source = Scan(node_id="input:d", alias="d", n_docs=100)
@@ -214,9 +216,6 @@ def test_physical_explain_shows_shared_inputs_and_metrics():
     assert "input:d" not in text
     assert "input:d[ids:d]" in graph.explain(verbose=True)
 
-    from quail.execution.runner import NodeMetrics
-    from quail.explain import physical_tree
-
     node = Scan(node_id="input:d", alias="d", n_docs=100)
     graph = PhysicalGraph((node,), PortRef(node.node_id, "ids:d"))
     assert "metrics unavailable" in physical_tree(graph, metrics={})
@@ -228,10 +227,6 @@ def test_physical_explain_shows_shared_inputs_and_metrics():
     assert "est. time" not in text
     assert "fresh_tokens=200" in physical_tree(
         graph, metrics=measured, verbose=True)
-
-
-def test_scalar_node_metrics_keeps_numeric_extension_values():
-    from quail.execution.runner import NodeMetrics, NodeResult, scalar_node_metrics
 
     nodes = {"ai_filter:r": NodeResult({}, NodeMetrics(
         fresh_tokens=10,

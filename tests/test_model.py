@@ -28,7 +28,7 @@ def _model(torch, tied=False):
     return model
 
 
-def test_retained_answer_weights_and_embedding_ownership(torch):
+def test_retained_answer_weights_ownership_and_answer_rows(torch):
     for tied in [False, True]:
         model = _model(torch, tied)
         embedding = model.model.embed_tokens.weight
@@ -60,8 +60,7 @@ def test_retained_answer_weights_and_embedding_ownership(torch):
         retain_answer_head(torch, model, [])
     assert model.lm_head is original
 
-
-def test_answer_rows_preserve_scores_and_share_retained_weights(torch):
+    # answer rows preserve the scores and share the retained weights
     model = _model(torch)
     hidden = torch.tensor([[1, 2, -1, 0], [0, 1, 3, -2]], dtype=torch.bfloat16)
     full_scores = torch.nn.functional.linear(hidden, model.lm_head.weight)
@@ -121,7 +120,7 @@ def clear_model_paths():
     model.resolve_model_path.cache_clear()
 
 
-def test_model_files_are_resolved_once_per_revision(
+def test_model_files_are_resolved_once_and_cached_before_children_start(
         monkeypatch, tmp_path, clear_model_paths):
     calls = []
 
@@ -137,8 +136,7 @@ def test_model_files_are_resolved_once_per_revision(
     assert all(call["repo_id"] == "Qwen/model" for call in calls)
     assert "*.safetensors" in calls[0]["allow_patterns"]
 
-
-def test_model_files_cached_before_gpu_children_start(monkeypatch, tmp_path):
+    # the files are cached before the GPU children start
     from quail.backends.quail import worker
 
     events = []

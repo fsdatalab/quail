@@ -149,93 +149,6 @@ def _random_join(rng):
     return prefix, stages, frames, budget, truth, lists
 
 
-def test_admission_invariants_over_random_shapes():
-    rng = random.Random(17)
-    for _ in range(80):
-        prefix, stages, frames, budget, truth, lists = _random_join(rng)
-        need = [pages_for(p + max(frames), 16) for p in prefix]
-        arena_pages = max(max(need), rng.randrange(4, 400))
-        resident = {a: rng.randrange(1, need[a] + 1)
-                    for a in range(len(prefix)) if rng.random() < 0.3}
-        while sum(need[a] for a in resident) > arena_pages:
-            resident.popitem()
-        sched = JoinAdmission(prefix, stages, budget, arena_pages,
-                              16, frame_tokens=frames,
-                              resident=resident,
-                              anchor_partners={
-                                  a: lists[a] for a in range(len(prefix))
-                                  if any(lst is not None for lst in lists[a])
-                              })
-        chunks, events = _drive_join(sched, truth, arena_pages,
-                                     resident, deliver_lag=1, rng=rng)
-        _check_join_invariants(sched, chunks, events, truth, prefix,
-                               stages, frames, budget, resident, lists)
-
-    rng = random.Random(23)
-    for trial in range(30):
-        n_docs = rng.randrange(5, 60)
-        n_stages = 1 if trial % 3 == 0 else rng.randrange(1, 6)
-        doc_tokens = [rng.randrange(20, 900) for _ in range(n_docs)]
-        stage_tokens = [rng.randrange(10, 60) for _ in range(n_stages)]
-        budget = max(doc_tokens) + max(stage_tokens) + rng.randrange(0, 2000)
-        arena_pages = max(pages_for(max(doc_tokens), 16), rng.randrange(4, 200))
-        if trial % 3 == 0:
-            arena_pages = None
-        truth = [[1 if rng.random() < 0.7 else 0
-                  for _ in range(n_stages)] for _ in range(n_docs)]
-        sched = FilterAdmission(doc_tokens, stage_tokens, budget, arena_pages, 16)
-        chunks = _drive(sched, truth, deliver_lag=rng.choice((0, 1)),
-                        arena_pages=arena_pages)
-        _check_invariants(sched, chunks, truth, doc_tokens, stage_tokens,
-                          budget, arena_pages)
-
-
-def test_join_order_page_capacity_and_resident_anchors():
-    # a cut stream's continuation leads the next chunk, ahead of a fresh anchor
-    sched = JoinAdmission([100, 50], [[400, 50]], 520, arena_pages=100, page_tokens=16)
-    assert sched.next_chunk(100) == [(0, 0, 0, 1, True)]
-    assert sched.next_chunk(100) == [(0, 0, 1, 2, False), (1, 0, 0, 1, True)]
-
-    # a resident anchor packs first, even while a fresh one waits for pages
-    sched = JoinAdmission([160, 160], [[10]], 400, arena_pages=10, page_tokens=16,
-                          resident={1: 10})
-    assert sched.next_chunk(0) == [(1, 0, 0, 1, False)]
-    assert sched.blocked_pages == 10
-    assert sched.report(1, 0, 0, 1, [1]) == [("finished", 1)]
-    assert sched.next_chunk(10) == [(0, 0, 0, 1, True)]
-
-    with pytest.raises(ValueError, match="at least one stage"):
-        JoinAdmission([100], [], 400, 100, 16)
-    with pytest.raises(ValueError, match="out of range"):
-        JoinAdmission([100], [[10]], 400, 100, 16, anchor_partners={0: [[1]]})
-    with pytest.raises(ValueError, match="partner lists for 2 stages"):
-        JoinAdmission([100], [[10]], 400, 100, 16,
-                      anchor_partners={0: [[0], None]})
-    with pytest.raises(ValueError, match="suffixes are atomic"):
-        JoinAdmission([100], [[1050]], 1000, 100, 16)
-    with pytest.raises(ValueError, match="no room for a partner"):
-        JoinAdmission([950], [[100]], 1000, 100, 16)
-    with pytest.raises(ValueError, match="anchor 0 needs 3 KV pages"):
-        JoinAdmission([33], [[10]], 1000, arena_pages=2, page_tokens=16)
-    JoinAdmission([33], [[10]], 1000, arena_pages=2, page_tokens=16,
-                  resident={0: 3})
-
-
-def test_gate_matches_assemble_vs_brute_force():
-    rng = random.Random(3)
-    for _ in range(30):
-        nA, nB, nC = (rng.randrange(1, 12) for _ in range(3))
-        ans1 = {b: [1 if rng.random() < 0.4 else 0 for _ in range(nA)]
-                for b in range(nB)}
-        survivors = gate(ans1)
-        ans2 = {b: [1 if rng.random() < 0.3 else 0 for _ in range(nC)]
-                for b in survivors}
-        assert assemble(ans1, ans2) == brute_force_triples(ans1, ans2)
-    rows = {0: [0, 0], 1: [0, 1]}
-    assert gate(rows) == [1]
-    assert matches(rows) == {0: [], 1: [1]}
-
-
 def _drive(sched, truth, deliver_lag=1, arena_pages=None):
     """Run a filter scheduler, freeing pages as an arena would."""
     chunks, outstanding = [], []
@@ -284,7 +197,145 @@ def _check_invariants(sched, chunks, truth, doc_tokens, stage_tokens,
     assert sched.survivors() == [d for d, row in enumerate(truth) if all(row)]
 
 
-def test_filter_admission_order_and_rewind():
+def _check_stream(out, filter_truth, pages):
+    stream = out["stream"]
+    assert stream.done
+    assert stream.answers == expected_filter_rows(filter_truth)
+    survivors = [d for d, truth in enumerate(filter_truth) if all(truth)]
+    assert sorted(key[1] for key in out["anchor_keys"]) == survivors
+    assert not out["arena"].accounting.owned
+    assert out["arena"].accounting.free_pages == pages
+    return survivors
+
+
+def test_admission_invariants_over_random_shapes():
+    rng = random.Random(17)
+    for _ in range(80):
+        prefix, stages, frames, budget, truth, lists = _random_join(rng)
+        need = [pages_for(p + max(frames), 16) for p in prefix]
+        arena_pages = max(max(need), rng.randrange(4, 400))
+        resident = {a: rng.randrange(1, need[a] + 1)
+                    for a in range(len(prefix)) if rng.random() < 0.3}
+        while sum(need[a] for a in resident) > arena_pages:
+            resident.popitem()
+        sched = JoinAdmission(prefix, stages, budget, arena_pages,
+                              16, frame_tokens=frames,
+                              resident=resident,
+                              anchor_partners={
+                                  a: lists[a] for a in range(len(prefix))
+                                  if any(lst is not None for lst in lists[a])
+                              })
+        chunks, events = _drive_join(sched, truth, arena_pages,
+                                     resident, deliver_lag=1, rng=rng)
+        _check_join_invariants(sched, chunks, events, truth, prefix,
+                               stages, frames, budget, resident, lists)
+
+    rng = random.Random(23)
+    for trial in range(30):
+        n_docs = rng.randrange(5, 60)
+        n_stages = 1 if trial % 3 == 0 else rng.randrange(1, 6)
+        doc_tokens = [rng.randrange(20, 900) for _ in range(n_docs)]
+        stage_tokens = [rng.randrange(10, 60) for _ in range(n_stages)]
+        budget = max(doc_tokens) + max(stage_tokens) + rng.randrange(0, 2000)
+        arena_pages = max(pages_for(max(doc_tokens), 16), rng.randrange(4, 200))
+        if trial % 3 == 0:
+            arena_pages = None
+        truth = [[1 if rng.random() < 0.7 else 0
+                  for _ in range(n_stages)] for _ in range(n_docs)]
+        sched = FilterAdmission(doc_tokens, stage_tokens, budget, arena_pages, 16)
+        chunks = _drive(sched, truth, deliver_lag=rng.choice((0, 1)),
+                        arena_pages=arena_pages)
+        _check_invariants(sched, chunks, truth, doc_tokens, stage_tokens,
+                          budget, arena_pages)
+
+
+def test_join_admission_order_capacity_room_and_answers():
+    # a cut stream's continuation leads the next chunk, ahead of a fresh anchor
+    sched = JoinAdmission([100, 50], [[400, 50]], 520, arena_pages=100, page_tokens=16)
+    assert sched.next_chunk(100) == [(0, 0, 0, 1, True)]
+    assert sched.next_chunk(100) == [(0, 0, 1, 2, False), (1, 0, 0, 1, True)]
+
+    # a resident anchor packs first, even while a fresh one waits for pages
+    sched = JoinAdmission([160, 160], [[10]], 400, arena_pages=10, page_tokens=16,
+                          resident={1: 10})
+    assert sched.next_chunk(0) == [(1, 0, 0, 1, False)]
+    assert sched.blocked_pages == 10
+    assert sched.report(1, 0, 0, 1, [1]) == [("finished", 1)]
+    assert sched.next_chunk(10) == [(0, 0, 0, 1, True)]
+
+    with pytest.raises(ValueError, match="at least one stage"):
+        JoinAdmission([100], [], 400, 100, 16)
+    with pytest.raises(ValueError, match="out of range"):
+        JoinAdmission([100], [[10]], 400, 100, 16, anchor_partners={0: [[1]]})
+    with pytest.raises(ValueError, match="partner lists for 2 stages"):
+        JoinAdmission([100], [[10]], 400, 100, 16,
+                      anchor_partners={0: [[0], None]})
+    with pytest.raises(ValueError, match="suffixes are atomic"):
+        JoinAdmission([100], [[1050]], 1000, 100, 16)
+    with pytest.raises(ValueError, match="no room for a partner"):
+        JoinAdmission([950], [[100]], 1000, 100, 16)
+    with pytest.raises(ValueError, match="anchor 0 needs 3 KV pages"):
+        JoinAdmission([33], [[10]], 1000, arena_pages=2, page_tokens=16)
+    JoinAdmission([33], [[10]], 1000, arena_pages=2, page_tokens=16,
+                  resident={0: 3})
+
+    sched = JoinAdmission([], [[10, 10, 10]], 100, 50, 16,
+                          frame_tokens=[5])
+    assert sched.done()
+    assert sched.buildable_tokens() == 0
+    assert sched.admit(40, resident_pages=3) == 0
+    assert sched.buildable_tokens() == 5 + 30
+    assert sched.admit(80) == 1
+    assert sched.buildable_tokens() == 100
+    groups = sched.next_chunk(free_pages=50)
+    assert groups[0] == (0, 0, 0, 3, False)
+    assert sched.report(0, 0, 0, 3, [0, 1, 0]) == [("finished", 0)]
+    assert sched.buildable_tokens() == 100
+    with pytest.raises(ValueError):
+        sched.admit(5000)
+
+    sched = JoinAdmission([31, 31], [[1, 1, 1, 1]], 256, 8, 16,
+                          temporary_suffix_pages=True)
+    groups = sched.next_chunk(8)
+    prefix_pages = sum(2 for *_, carried in groups if carried)
+    suffix_pages = sum(end - start for _, _, start, end, _ in groups)
+    assert prefix_pages + suffix_pages <= 8
+    assert suffix_pages < 8
+
+    sched = JoinAdmission([16], [[16, 16, 16, 16]], 48, 20, 16,
+                          answer_dtype=np.float32)
+    expected = np.array([0.0, 0.125, 0.5, 1.0], dtype=np.float32)
+    while not sched.done():
+        groups = sched.next_chunk(19)
+        assert groups
+        for a, j, start, end, _ in groups:
+            sched.report(a, j, start, end, expected[start:end])
+    assert sched.answers[0][0].dtype == np.float32
+    np.testing.assert_array_equal(sched.answers[0][0], expected)
+
+
+def test_join_admission_borrows_through_the_prefix_tree():
+    # anchor 0 has no partner at stage 0, so it settles without a
+    # chunk; anchor 1 borrows from it in the tree and cannot wait for it
+    tree = PrefixTree(order=[0, 1], parent=[None, 0], shared=[0, 16])
+    sched = JoinAdmission([40, 40], [[10]], 512, 64, 16,
+                          anchor_partners={0: [[]], 1: [[0]]}, tree=tree)
+    assert sched.take_settled() == [("finished", 0)]
+    assert sched.next_chunk(free_pages=64) == [(1, 0, 0, 1, True)]
+    assert sched.borrowing.shared(1) == 0
+    assert sched.report(1, 0, 0, 1, [1]) == [("finished", 1)]
+    assert sched.done()
+
+    # anchor 1 shares 80 of its 100 tokens with anchor 0: after anchor
+    # 0 packs 100 + 10 tokens, the 40 left hold anchor 1's 20 + 10
+    tree = PrefixTree(order=[0, 1], parent=[None, 0], shared=[0, 80])
+    sched = JoinAdmission([100, 100], [[10]], 150, 64, 16, tree=tree)
+    groups = sched.next_chunk(free_pages=64)
+    assert [g[0] for g in groups] == [0, 1]
+    assert sched.borrowing.shared(1) == 80
+
+
+def test_filter_admission_order_rewind_limits_and_whole_packing():
     # one resident survivor's next suffix packs before fresh docs
     sched = FilterAdmission([100, 100], [10, 10], 200,
                             arena_pages=100, page_tokens=16)
@@ -321,8 +372,6 @@ def test_filter_admission_order_and_rewind():
     assert sched.next_chunk() == [(0, 0, True)]
     assert sched.report(0, 0, False) == ()
 
-
-def test_filter_limit_drains_ready_documents():
     # the limit is met while docs 1 and 2 wait in ready; draining frees them
     sched = FilterAdmission([50, 50, 50], [10, 200], 250,
                             arena_pages=100, page_tokens=16, limit=1)
@@ -335,24 +384,37 @@ def test_filter_limit_drains_ready_documents():
     assert sched.drain_ready() == [1, 2]
     assert not sched.resident
 
+    # the limit stops admission early, with or without a page bin
+    for arena_pages in (None, 400):
+        sched = FilterAdmission([100] * 40, [10], 230, arena_pages, 16,
+                                limit=3)
+        chunks = _drive(sched, [[1]] * 40, deliver_lag=0,
+                        arena_pages=arena_pages)
+        assert len(sched.survivors()) >= 3, f"arena_pages {arena_pages}"
+        assert sum(len(groups) for groups in chunks) < 40, \
+            f"arena_pages {arena_pages}"
 
-@pytest.mark.parametrize("arena_pages", [None, 400])
-def test_filter_limit_stops_admission_early(arena_pages):
-    sched = FilterAdmission([100] * 40, [10], 230, arena_pages, 16, limit=3)
-    chunks = _drive(sched, [[1]] * 40, deliver_lag=0, arena_pages=arena_pages)
-    assert len(sched.survivors()) >= 3
-    assert sum(len(groups) for groups in chunks) < 40
+    tree = PrefixTree(order=[0, 1], parent=[None, 0], shared=[0, 32])
+    sched = FilterAdmission([64, 64], [10], 200, arena_pages=20,
+                            page_tokens=16, tree=tree,
+                            can_borrow=lambda doc, parent, same_chunk: False)
+    assert sched.next_chunk(20) == [(0, 0, True), (1, 0, True)]
+    assert sched.borrowing.shared(1) == 0 and sched.own_tokens(1) == 64
 
 
-def _check_stream(out, filter_truth, pages):
-    stream = out["stream"]
-    assert stream.done
-    assert stream.answers == expected_filter_rows(filter_truth)
-    survivors = [d for d, truth in enumerate(filter_truth) if all(truth)]
-    assert sorted(key[1] for key in out["anchor_keys"]) == survivors
-    assert not out["arena"].accounting.owned
-    assert out["arena"].accounting.free_pages == pages
-    return survivors
+def test_gate_matches_assemble_vs_brute_force():
+    rng = random.Random(3)
+    for _ in range(30):
+        nA, nB, nC = (rng.randrange(1, 12) for _ in range(3))
+        ans1 = {b: [1 if rng.random() < 0.4 else 0 for _ in range(nA)]
+                for b in range(nB)}
+        survivors = gate(ans1)
+        ans2 = {b: [1 if rng.random() < 0.3 else 0 for _ in range(nC)]
+                for b in survivors}
+        assert assemble(ans1, ans2) == brute_force_triples(ans1, ans2)
+    rows = {0: [0, 0], 1: [0, 1]}
+    assert gate(rows) == [1]
+    assert matches(rows) == {0: [], 1: [1]}
 
 
 def test_streamed_loop_random_shapes(monkeypatch):
@@ -387,55 +449,6 @@ def test_streamed_loop_random_shapes(monkeypatch):
         else:
             assert out["join_answers"] == [{}]
             assert set(out["settled"]) == set(out["anchor_keys"])
-
-
-def test_join_admission_admits_incrementally_and_prices_room():
-    sched = JoinAdmission([], [[10, 10, 10]], 100, 50, 16,
-                          frame_tokens=[5])
-    assert sched.done()
-    assert sched.buildable_tokens() == 0
-    assert sched.admit(40, resident_pages=3) == 0
-    assert sched.buildable_tokens() == 5 + 30
-    assert sched.admit(80) == 1
-    assert sched.buildable_tokens() == 100
-    groups = sched.next_chunk(free_pages=50)
-    assert groups[0] == (0, 0, 0, 3, False)
-    assert sched.report(0, 0, 0, 3, [0, 1, 0]) == [("finished", 0)]
-    assert sched.buildable_tokens() == 100
-    with pytest.raises(ValueError):
-        sched.admit(5000)
-
-
-def test_unified_join_accounts_for_suffix_pages():
-    sched = JoinAdmission([31, 31], [[1, 1, 1, 1]], 256, 8, 16,
-                          temporary_suffix_pages=True)
-    groups = sched.next_chunk(8)
-    prefix_pages = sum(2 for *_, carried in groups if carried)
-    suffix_pages = sum(end - start for _, _, start, end, _ in groups)
-    assert prefix_pages + suffix_pages <= 8
-    assert suffix_pages < 8
-
-
-def test_numeric_join_answers_preserve_values_across_chunks():
-    sched = JoinAdmission([16], [[16, 16, 16, 16]], 48, 20, 16,
-                          answer_dtype=np.float32)
-    expected = np.array([0.0, 0.125, 0.5, 1.0], dtype=np.float32)
-    while not sched.done():
-        groups = sched.next_chunk(19)
-        assert groups
-        for a, j, start, end, _ in groups:
-            sched.report(a, j, start, end, expected[start:end])
-    assert sched.answers[0][0].dtype == np.float32
-    np.testing.assert_array_equal(sched.answers[0][0], expected)
-
-
-def test_filter_admission_packs_whole_when_the_arena_cannot_serve_a_borrow():
-    tree = PrefixTree(order=[0, 1], parent=[None, 0], shared=[0, 32])
-    sched = FilterAdmission([64, 64], [10], 200, arena_pages=20,
-                            page_tokens=16, tree=tree,
-                            can_borrow=lambda doc, parent, same_chunk: False)
-    assert sched.next_chunk(20) == [(0, 0, True), (1, 0, True)]
-    assert sched.borrowing.shared(1) == 0 and sched.own_tokens(1) == 64
 
 
 def _tree_stream(monkeypatch, *, truth, budget, hold=False, retain=(),
@@ -487,7 +500,7 @@ def _run(stream, arena, free_handed=False):
     return handed
 
 
-def test_filter_stream_stacks_siblings_under_tree_attention(monkeypatch):
+def test_filter_stream_borrows_from_parents_and_stacks_siblings(monkeypatch):
     from fakes import DOC, fake_pack
 
     from quail.backends.quail.executor import loop
@@ -536,8 +549,6 @@ def test_filter_stream_stacks_siblings_under_tree_attention(monkeypatch):
     assert stream.tokens == 48 + 16 + 8 + 3
     assert arena.free_pages == 64 and not arena.accounting.owned
 
-
-def test_filter_stream_shares_pages_with_a_resident_parent(monkeypatch):
     # answers are read after the next chunk launches, so a child right
     # behind its parent still borrows even when the parent fails
     stream, arena = _tree_stream(
@@ -662,26 +673,3 @@ def test_join_anchors_borrow_a_resident_parents_pages(monkeypatch):
     assert (keys[1], 32, 32) in packed
     assert stats["borrowed_tokens"] == 32
     assert arena.free_pages == 64 and not arena.accounting.owned
-
-
-def test_join_child_of_an_anchor_with_no_partners_packs_whole():
-    # anchor 0 has no partner at stage 0, so it settles without a
-    # chunk; anchor 1 borrows from it in the tree and cannot wait for it
-    tree = PrefixTree(order=[0, 1], parent=[None, 0], shared=[0, 16])
-    sched = JoinAdmission([40, 40], [[10]], 512, 64, 16,
-                          anchor_partners={0: [[]], 1: [[0]]}, tree=tree)
-    assert sched.take_settled() == [("finished", 0)]
-    assert sched.next_chunk(free_pages=64) == [(1, 0, 0, 1, True)]
-    assert sched.borrowing.shared(1) == 0
-    assert sched.report(1, 0, 0, 1, [1]) == [("finished", 1)]
-    assert sched.done()
-
-
-def test_join_admission_gate_counts_a_borrowers_own_tokens():
-    # anchor 1 shares 80 of its 100 tokens with anchor 0: after anchor
-    # 0 packs 100 + 10 tokens, the 40 left hold anchor 1's 20 + 10
-    tree = PrefixTree(order=[0, 1], parent=[None, 0], shared=[0, 80])
-    sched = JoinAdmission([100, 100], [[10]], 150, 64, 16, tree=tree)
-    groups = sched.next_chunk(free_pages=64)
-    assert [g[0] for g in groups] == [0, 1]
-    assert sched.borrowing.shared(1) == 80

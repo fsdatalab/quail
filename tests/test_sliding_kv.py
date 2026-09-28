@@ -19,6 +19,11 @@ def cpu_arena(pages=64, sliding_pages=16):
                    sliding_window=WINDOW, n_sliding_pages=sliding_pages)
 
 
+def plain_arena(pages=64):
+    return KVArena(n_layers=1, n_pages=pages, page_tokens=16, n_kv=1, d_head=2,
+                   dtype=torch.float32, device="cpu")
+
+
 def test_window_origin_and_trim():
     arena = cpu_arena()
     assert arena.has_sliding
@@ -53,7 +58,7 @@ def test_window_origin_and_trim():
     assert arena.free_pages == 64
 
 
-def test_page_costs_use_the_tighter_pool():
+def test_page_costs_allocation_temporaries_and_resize():
     arena = cpu_arena(pages=64, sliding_pages=16)     # ratio 4
     # a short document is priced by the sliding pool: 2 pages x 4
     assert arena.page_cost(20) == 8
@@ -67,8 +72,7 @@ def test_page_costs_use_the_tighter_pool():
     assert arena.held_cost(key) == 28
     arena.trim_window(key)
     assert arena.held_cost(key) == 12
-    plain = KVArena(n_layers=1, n_pages=8, page_tokens=16, n_kv=1, d_head=2,
-                    dtype=torch.float32, device="cpu")
+    plain = plain_arena(pages=8)
     assert not plain.has_sliding
     assert plain.page_cost(100) == 7 and plain.page_cost(100, 100) == 7
     # without a sliding pool a trim releases nothing
@@ -76,8 +80,6 @@ def test_page_costs_use_the_tighter_pool():
     plain.trim_window(key)
     assert plain.held_cost(key) == 7
 
-
-def test_alloc_rollback_temporaries_and_resize():
     # 4 sliding pages hold 64 rows; a 100-row key needs 7 in each pool
     arena = cpu_arena(pages=64, sliding_pages=4)
     free = arena.accounting.free_pages
@@ -101,7 +103,7 @@ def test_alloc_rollback_temporaries_and_resize():
     arena.resize(32, 8)     # a no-op at the same sizes
 
 
-def test_a_held_key_waits_for_its_borrowers():
+def test_holds_and_the_window_floor():
     arena = cpu_arena(pages=64, sliding_pages=32)
     parent, child = ("d", 0), ("d", 1)
     arena.activate(parent, 100, capacity_tokens=110, base_tokens=100)
@@ -129,10 +131,6 @@ def test_a_held_key_waits_for_its_borrowers():
     assert arena.evict_retained(64) == (parent,)
     assert arena.free_pages == 64
 
-
-def test_the_window_floor_lifts_with_the_last_hold():
-    arena = cpu_arena(pages=64, sliding_pages=32)
-    parent, child = ("d", 0), ("d", 1)
     arena.activate(parent, 100, capacity_tokens=110, base_tokens=100)
     arena.hold(parent, 1)
     arena.keep_window(parent, 48)
@@ -162,7 +160,7 @@ def test_the_window_floor_lifts_with_the_last_hold():
     assert arena.free_pages == 64
 
 
-def test_pack_chunk_builds_both_pools(monkeypatch):
+def test_pack_chunk_builds_both_pools_and_reads_borrowed_pages(monkeypatch):
     cpu_staging(monkeypatch)
     arena = cpu_arena(pages=64, sliding_pages=32)
     key = ("d", 0)
@@ -215,13 +213,8 @@ def test_pack_chunk_builds_both_pools(monkeypatch):
     arena.free_key(key)
     assert arena.free_pages == 64
 
-
-def test_pack_chunk_reads_borrowed_pages_in_the_unified_call(monkeypatch):
-    cpu_staging(monkeypatch)
-    arena = KVArena(n_layers=1, n_pages=64, page_tokens=16, n_kv=1, d_head=2,
-                    dtype=torch.float32, device="cpu")
+    arena = plain_arena()
     parent, child = ("d", 0), ("d", 1)
-    doc = list(range(100))
     tail = [500]
     arena.activate(parent, 100, capacity_tokens=110, base_tokens=100)
     # the child shares 64 tokens (4 pages) and adds 30 of its own
@@ -263,15 +256,8 @@ def test_pack_chunk_reads_borrowed_pages_in_the_unified_call(monkeypatch):
     arena.free_key(child)
     assert arena.free_pages == 64
 
-
-def test_pack_chunk_stacks_borrowing_siblings_under_tree_attention(
-        monkeypatch):
-    cpu_staging(monkeypatch)
-    arena = KVArena(n_layers=1, n_pages=64, page_tokens=16, n_kv=1, d_head=2,
-                    dtype=torch.float32, device="cpu")
+    arena = plain_arena()
     parent, a, b = ("d", 0), ("d", 1), ("d", 2)
-    doc = list(range(100))
-    tail = [500]
     arena.activate(parent, 100, capacity_tokens=110, base_tokens=100)
     # two siblings share 64 tokens (4 pages) of the parent
     arena.activate(a, 74, capacity_tokens=84, base_tokens=74,
@@ -311,9 +297,9 @@ def test_pack_chunk_stacks_borrowing_siblings_under_tree_attention(
     assert arena.free_pages == 64
 
 
-def test_activate_with_a_borrow_evicts_retained_kv_first():
-    arena = KVArena(n_layers=1, n_pages=8, page_tokens=16, n_kv=1, d_head=2,
-                    dtype=torch.float32, device="cpu")
+def test_borrowing_in_the_arena_and_can_borrow(monkeypatch):
+    cpu_staging(monkeypatch)
+    arena = plain_arena(pages=8)
     parent, other, child = ("d", 0), ("d", 1), ("d", 2)
     assert arena.activate(parent, 64, base_tokens=64)          # 4 pages
     assert arena.activate(other, 48, base_tokens=48)           # 3 pages
@@ -329,9 +315,6 @@ def test_activate_with_a_borrow_evicts_retained_kv_first():
     arena.free_key(child)
     assert arena.free_pages == 8
 
-
-def test_sliding_pool_borrows_the_window_below_the_share(monkeypatch):
-    cpu_staging(monkeypatch)
     arena = cpu_arena(pages=64, sliding_pages=32)
     parent, child = ("d", 0), ("d", 1)
     doc = list(range(100))
@@ -385,8 +368,6 @@ def test_sliding_pool_borrows_the_window_below_the_share(monkeypatch):
     arena.free_key(parent)
     assert arena.free_pages == 64
 
-
-def test_can_borrow_needs_the_parent_window():
     arena = cpu_arena(pages=64, sliding_pages=32)
     root, middle = ("d", 0), ("d", 1)
     arena.activate(root, 100, capacity_tokens=110, base_tokens=100)

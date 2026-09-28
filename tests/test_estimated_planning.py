@@ -82,18 +82,23 @@ def test_estimated_planning_token_reuse_and_concurrent_boot(monkeypatch):
     session.close()
 
 
-def test_prefix_sharing_is_decided_once_the_tokens_are_exact(monkeypatch):
-    # a plan made on estimated lengths cannot see the token store; once
-    # tokenization finishes, the rules that read it run over the plan
-    shared = "pad " * 40
+def _table_session(bodies):
     table = pa.table({
-        "id": [f"d{i}" for i in range(4)],
-        "body": [shared + f"tail {i} " * (i + 1) for i in range(4)],
+        "id": [f"d{i}" for i in range(len(bodies))],
+        "body": bodies,
     })
     session = quail.Session(
         quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm"),
         tokenizer=str.split)
     session.register("docs", quail.DocumentProvider.from_table(table, id_col="id"))
+    return session
+
+
+def test_prefix_sharing_and_attention_path_are_decided_from_exact_tokens():
+    # a plan made on estimated lengths cannot see the token store; once
+    # tokenization finishes, the rules that read it run over the plan
+    shared = "pad " * 40
+    session = _table_session([shared + f"tail {i} " * (i + 1) for i in range(4)])
     query = session.sql(SQL)
     first = query.plan()
     chain = next(n for n in first.nodes if n.type_name == "quail.ai_filter")
@@ -109,20 +114,11 @@ def test_prefix_sharing_is_decided_once_the_tokens_are_exact(monkeypatch):
     assert query.plan() is refined
     session.close()
 
-
-def test_attention_path_is_chosen_from_the_exact_tokens(monkeypatch):
     # records after one long header: many short readers of one parent,
     # where the tree path wins. The first plan has only estimated
     # lengths, so the choice must be made again once tokens are exact
     header = " ".join(f"h{i}" for i in range(2048))
-    table = pa.table({
-        "id": [f"d{i}" for i in range(40)],
-        "body": [header + f" r{i}" * 8 for i in range(40)],
-    })
-    session = quail.Session(
-        quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm"),
-        tokenizer=str.split)
-    session.register("docs", quail.DocumentProvider.from_table(table, id_col="id"))
+    session = _table_session([header + f" r{i}" * 8 for i in range(40)])
     query = session.sql(SQL)
     query.plan()
     query.wait_for_tokens()

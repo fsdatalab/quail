@@ -49,7 +49,7 @@ def _count(registry):
     return rewritten.nodes[0].n_docs
 
 
-def test_extension_order_and_nested_registration(monkeypatch):
+def test_extension_order_nesting_and_rollback(monkeypatch):
     def register(registry):
         assert "double" in registry.physical_rules
         registry.register_physical_rule(ChangeCount("add_three", offset=3))
@@ -84,8 +84,7 @@ def test_extension_order_and_nested_registration(monkeypatch):
     assert registry.extension_modules == (outer.__name__, inner.__name__)
     assert calls == ["outer", "inner"]
 
-
-def test_failed_extension_registration_rolls_back(monkeypatch):
+    # a failed registration rolls the registry back
     registry = built_in_registry().register_physical_rule(ChangeCount("existing"))
 
     def register(registry):

@@ -90,56 +90,37 @@ def join_parts():
     return [95, 96], [[97, 60 + p, 98] for p in range(3)]
 
 
-@pytest.mark.parametrize("seed", range(6))
-def test_small_filters(arena_kind, seed):
-    rng = random.Random(seed)
-    docs, setup = small(rng, arena_kind, 40, (40, 80, 400), (24, 60))
-    check_filter(docs, questions(rng), setup)
+def named(case, check, *args, **options):
+    """Run a check, naming the case in any failure."""
+    try:
+        check(*args, **options)
+    except AssertionError as error:
+        raise AssertionError(f"{case}: {error}") from error
 
 
-@pytest.mark.parametrize("retain", [False, True], ids=["free", "retain"])
-@pytest.mark.parametrize("seed", range(6))
-def test_small_joins(arena_kind, seed, retain):
-    rng = random.Random(100 + seed)
-    docs, setup = small(rng, arena_kind, 30, (60, 400), (40, 80))
-    check_join(docs, *join_parts(), setup, retain=retain)
+def test_small_filters_joins_and_filters_feeding_joins(arena_kind):
+    """Short documents on arenas a few of them fill.
 
-
-@pytest.mark.parametrize("seed", range(6))
-def test_small_filters_feeding_joins(arena_kind, seed):
-    rng = random.Random(200 + seed)
-    docs, setup = small(rng, arena_kind, 40, (80, 400), (60, 120))
-    check_feed(docs, [90, 91, 92], *join_parts(), setup)
-
-
-@pytest.mark.parametrize("seed", range(2))
-def test_large_filters(arena_kind, seed):
-    rng = random.Random(300 + seed)
-    docs, setup = large(rng, arena_kind)
-    check_filter(docs, questions(rng), setup)
-
-
-@pytest.mark.parametrize("retain", [False, True], ids=["free", "retain"])
-@pytest.mark.parametrize("seed", range(2))
-def test_large_joins(arena_kind, seed, retain):
-    rng = random.Random(400 + seed)
-    docs, setup = large(rng, arena_kind)
-    check_join(docs, *join_parts(), setup, retain=retain)
-
-
-@pytest.mark.parametrize("seed", range(2))
-def test_large_filters_feeding_joins(arena_kind, seed):
-    rng = random.Random(500 + seed)
-    docs, setup = large(rng, arena_kind)
-    check_feed(docs, [90, 91, 92], *join_parts(), setup)
-
-
-def test_join_borrows_from_a_retained_anchor_of_an_earlier_join(arena_kind):
-    """A retained anchor trimmed its window; a child shares its first page.
-
-    On a sliding arena the child cannot borrow rows the anchor dropped,
-    so it packs whole; elsewhere it borrows the page.
+    A join whose child shares its first page with a retained anchor of
+    an earlier join runs last: the anchor trimmed its window, so on a
+    sliding arena the child cannot borrow the rows the anchor dropped
+    and packs whole; elsewhere it borrows the page.
     """
+    for seed in range(6):
+        rng = random.Random(seed)
+        docs, setup = small(rng, arena_kind, 40, (40, 80, 400), (24, 60))
+        named(f"filter seed {seed}", check_filter, docs, questions(rng),
+              setup)
+        for retain in (False, True):
+            rng = random.Random(100 + seed)
+            docs, setup = small(rng, arena_kind, 30, (60, 400), (40, 80))
+            named(f"join seed {seed} retain {retain}", check_join, docs,
+                  *join_parts(), setup, retain=retain)
+        rng = random.Random(200 + seed)
+        docs, setup = small(rng, arena_kind, 40, (80, 400), (60, 120))
+        named(f"feed seed {seed}", check_feed, docs, [90, 91, 92],
+              *join_parts(), setup)
+
     path, sliding, canvas = arena_kind
     parent = [1] * 64                  # four pages, two of them the window
     child = [1] * 16 + [3] * 5
@@ -147,3 +128,21 @@ def test_join_borrows_from_a_retained_anchor_of_an_earlier_join(arena_kind):
                   canvas=(99,) if canvas else (), pages=12,
                   sliding_pages=12, budget=200, page_tokens=16)
     check_join_after_join([parent, child], *join_parts(), setup)
+
+
+def test_large_filters_joins_and_filters_feeding_joins(arena_kind):
+    """Documents of thousands of tokens on a 1,024-token window."""
+    for seed in range(2):
+        rng = random.Random(300 + seed)
+        docs, setup = large(rng, arena_kind)
+        named(f"filter seed {seed}", check_filter, docs, questions(rng),
+              setup)
+        for retain in (False, True):
+            rng = random.Random(400 + seed)
+            docs, setup = large(rng, arena_kind)
+            named(f"join seed {seed} retain {retain}", check_join, docs,
+                  *join_parts(), setup, retain=retain)
+        rng = random.Random(500 + seed)
+        docs, setup = large(rng, arena_kind)
+        named(f"feed seed {seed}", check_feed, docs, [90, 91, 92],
+              *join_parts(), setup)
