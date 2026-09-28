@@ -89,8 +89,10 @@ class QuailClassifier:
         labels = np.empty(len(rows), dtype=object)
         for anchor, logprobs in answers[0].items():
             if chains:
-                scores = label_chain_scores(spec.label_token_ids, targets,
-                                            logprobs)
+                # a one-row readout returns (labels, targets)
+                scores = label_chain_scores(
+                    spec.label_token_ids, targets,
+                    logprobs.reshape(len(suffixes), readout_rows, -1))
             else:
                 scores = label_scores(spec.label_token_ids, nodes, targets,
                                       logprobs)

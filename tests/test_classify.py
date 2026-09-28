@@ -223,6 +223,29 @@ def test_classifier_reads_every_row_of_one_chain_per_label(monkeypatch):
     # every row packs its prefix, the two-token frame, and three chains
     assert batch.fresh_tokens + batch.cached_tokens == (3 + 2) + 2 * (2 + 5)
 
+    # one-token labels read one row per chain
+    single = ClassifySpec(
+        name="tone", aliases=("d",), query_template="", arguments=(),
+        expected_inputs=2, estimated_seconds=0.0,
+        prompt_token_parts=((90,), (91, 92, 93)), labels=("a", "b"),
+        label_token_ids=((2,), (4,)), scoring="label_chains")
+    readout = SimpleNamespace(
+        targets=np.asarray([2, 4]), rows=1,
+        dtype=np.dtype((np.float32, (2,))),
+        submit=lambda rows, rows_per_answer=None: rows,
+        result=lambda rows: rows)
+    state["label_readout"] = readout
+
+    def forward_single(chunk):
+        return np.asarray([
+            [-1.0, -5.0] if entry["key"][2] == 0 else [-5.0, -1.0]
+            for entry in chunk.specs for _ in entry["suffixes"]],
+            dtype=np.float32)
+
+    state["pipeline"] = fake_pipeline(forward_chunk=forward_single)
+    batch = QuailClassifier(state).classify(single, [[0], [1]], documents)
+    assert list(batch.scores) == ["a", "b"]
+
 
 @pytest.fixture()
 def session(tmp_path):
