@@ -370,9 +370,10 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
             on_settled(anchor, survived, sched.answers[k - 1].get(anchor, []))
 
     def event(kind, anchor):
+        # progress counts settled documents: a dropped one is done too
+        finished[0] += 1
         if kind == "finished":
             settle(anchor)
-            finished[0] += 1
         elif arena.is_resident(keys[anchor]):
             arena.free_key(keys[anchor])
 
