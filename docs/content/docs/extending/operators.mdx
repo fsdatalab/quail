@@ -110,21 +110,24 @@ to TRUE/FALSE.
 selects one. For example, a rule could fuse consecutive classify
 operators.
 
-Rule order:
+Rules run in this order:
 
-- Logical rules run in the order they were registered, built-in rules
-  first. Quail repeats them until the plan stops changing, up to
-  `MAX_PASSES` passes (a constant, set to four).
-- Physical rules run once each, in the order they were registered:
-  `prefix_sharing`, `tree_attention`, then extension rules.
-- On the first query over a table, the physical rules run again after
-  tokenization. A rule decides from the current plan and token counts,
-  not from what it chose before, and returns `None` if nothing changes.
+- Logical rules run in registration order, with built-in rules first.
+  Quail repeats the sequence until a pass leaves the plan unchanged
+  or it has run four passes (`MAX_PASSES`).
+- Physical rules run once per pass: `prefix_sharing`, then
+  `tree_attention`, then extension rules in registration order.
+- If the plan was built while tokenization was running, Quail runs
+  the physical rules again once the tokens are available. Return
+  `None` when your rule has no change to make. A repeated pass should
+  not duplicate a change already present in the plan.
 
-DataFusion does the same: logical rules repeat, up to three passes by
-default, and physical rules run once. Spark repeats its rules up to
-100 times by default. Both log a warning when they hit the limit;
-Quail does not.
+Repeated rule application is an established optimizer design.
+[DataFusion](https://datafusion.apache.org/library-user-guide/query-optimizer.html)
+also supports repeated logical optimization passes.
+[Spark's rule executor](https://github.com/apache/spark/blob/master/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/rules/RuleExecutor.scala)
+organizes rules into batches that run once or repeat until the plan
+stops changing or a configured limit is reached.
 
 See
 [`quail/planner/logical_optimizer.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/logical_optimizer.py)

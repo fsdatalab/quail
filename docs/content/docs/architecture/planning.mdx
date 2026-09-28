@@ -75,51 +75,86 @@ The planner also decides:
 
 ## Deciding whether to share prefixes
 
-The planner decides for each filter and join whether to share
-prefixes (see
-[Prefix sharing](/docs/architecture/execution#prefix-sharing)).
+The `prefix_sharing` rule enables
+[prefix caching](/docs/architecture/execution#prefix-sharing) when
+its estimated compute savings exceed the extra cost of writing KV:
 
-- Sharing needs every document's KV written to GPU memory, so later
-  documents can read it.
-- A join always writes its anchors' KV, so it shares whenever two
-  anchors have a page in common.
-- A filter with one predicate normally skips writing KV. It shares
-  only when the time saved on shared tokens is more than the time to
-  write KV for every document.
-- Under `LIMIT`, the planner does not share, because sharing changes
-  the order documents run in and `LIMIT` returns the first rows in
-  table order.
-- On the first query over a table, the planner decides again once the
-  documents are tokenized, because until then it only has estimated
-  lengths.
+```text
+saved_seconds = shared_tokens * 2 * model.params / device.peak_flops
+write_seconds = total_tokens * model.kappa / device.hbm_bw
+```
+
+- `shared_tokens` is the sum of the `PrefixTree.shared` list. It
+  counts reusable token positions in complete pages, leaving each
+  document's final token to compute.
+- `2 * model.params` estimates floating-point operations per token.
+  `device.peak_flops` is the GPU's peak operations per second.
+- `total_tokens` counts all input document tokens for the filter.
+  `model.kappa` is KV bytes per token across all layers.
+  `device.hbm_bw` is GPU memory bandwidth in bytes per second.
+- `write_seconds` is zero for operators that already write KV,
+  including joins. For other filters, the estimate includes writes
+  for all input documents.
+
+The rule enables sharing when there are shared tokens and
+`saved_seconds > write_seconds`. It does not include sorting,
+scheduling, attention, or recomputation after KV is freed. The
+comparison estimates whether to enable sharing, not total query time.
+
+If tokenization is still running when the first plan is built, Quail
+runs the physical rules again after it finishes. Prefix matching
+needs the token sequences, not just their lengths.
 
 <Mermaid chart={`flowchart LR
-  A["plan on estimated lengths"] --> B["physical rules"]
-  B --> C["documents tokenized"]
-  C --> D["physical rules again,<br/>on exact token counts"]
-  D --> E["run"]`} />
+  A["Build plan with estimated lengths"] --> B["Finish tokenization"]
+  B --> C["Find shared prefixes from token sequences"]
+  C --> D["Run physical rules again"]
+  D --> E["Execute plan"]`} />
 
-For example, imagine two single-predicate filters. One runs over
-movie reviews, where under 1% of tokens repeat: writing KV would cost
-more than it saves, so it does not share. The other runs over agent
-trace snapshots, where about two thirds of tokens repeat: it shares.
+`explain(verbose=True)` shows the planner's choice as `share_prefixes`.
+A filter executing with a row limit skips sharing at runtime because
+sorting documents could change which rows it returns.
 
-The rule is `prefix_sharing`; `explain(verbose=True)` shows its
-choice as `share_prefixes`.
+Implementation:
+[`sharing_pays` and `PrefixSharing`](https://github.com/fsdatalab/quail/blob/main/quail/planner/physical_rules.py).
 
 ## Choosing the attention path
 
-For each filter and join, the planner estimates the time of each
-[attention path](/docs/architecture/execution#attention-paths) with
-the roofline model below and picks the faster one. It uses:
+The `tree_attention` rule compares the cost of separate reads of a
+shared prefix with the cost of grouped reads plus a merge step.
+For a group of `r` documents, each adding `q` tokens after a prefix
+of `s` tokens:
 
-- how many documents read the same KV: an anchor's partners, or the
-  documents with the same parent;
-- how many tokens each of those documents adds;
-- how long the shared KV is.
+```text
+unified_seconds = r * attention_seconds(q, s)
+tree_seconds = attention_seconds(r * q, s) + merge_seconds
+```
 
-The rule is `tree_attention`; `explain(verbose=True)` shows its
-choice as `attention`.
+`attention_seconds(q, s)` estimates attention over `s` KV tokens for
+`q` new token positions. For each layer, it takes the larger of
+compute time and memory-transfer time, then sums over layers.
+`merge_seconds` estimates reading two partial outputs and writing
+one combined output across all layers.
+
+- A join uses its estimated partners per anchor, tokens per partner
+  prompt, and average anchor length.
+- A filter compares the paths for each group with the same parent
+  and shared-prefix length. Each group votes for the cheaper path,
+  weighted by its total reused tokens. The filter uses the path with
+  the larger weight; ties use unified.
+- Tree attention requires FP8 weights and no canvas tokens. The
+  rule chooses unified for other models.
+
+These estimates use peak hardware rates. The current attention
+estimate uses the FP8 compute rate even though attention runs in
+BF16, so it underestimates the compute portion on H100. It does not
+model kernel-launch overhead.
+
+`explain(verbose=True)` shows the choice as `attention`. See
+[`choose_attention_path`](https://github.com/fsdatalab/quail/blob/main/quail/cost/budgets.py)
+for the arithmetic and
+[`TreeAttention`](https://github.com/fsdatalab/quail/blob/main/quail/planner/physical_rules.py)
+for the operator settings.
 
 ## The roofline (speed-of-light) model
 

@@ -65,9 +65,10 @@ interests you, open an issue and we will help you get started.
   These require decode (generating multiple tokens), which the
   current engine does not do. See
   [Custom operators](/docs/extending/operators).
-- **Prefix sharing across GPU workers.** Each GPU worker shares
-  prefixes only among its own documents. Sending documents with the
-  same start to the same worker would let the whole table share.
+- **Assign documents to GPUs for prefix reuse.** Each GPU can reuse
+  KV only from documents on that GPU. Grouping documents with common
+  prefixes on the same GPU could increase reuse. The assignment must
+  also keep the work balanced across GPUs.
 
 ### Harder
 

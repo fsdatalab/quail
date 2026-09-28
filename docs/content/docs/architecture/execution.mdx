@@ -48,38 +48,91 @@ token budget and a KV page budget.
 
 ### Prefix sharing
 
-When documents start with the same tokens, Quail computes the KV for
-those tokens once and the other documents read it.
+Quail uses **prefix caching** to reuse KV when different documents
+start with identical tokens. Filters can share document prefixes;
+joins can share prefixes between anchor documents on the same GPU.
 
-- Quail sorts the documents by their tokens, so documents that start
-  the same way sit next to each other.
-- Each document gets a *parent*: an earlier document that already
-  computed the shared tokens.
-- A document reads its parent's KV pages and computes only its own
-  tokens after them.
-- A page is freed once no document uses it.
-- Filters and joins both do this. In a join, the anchors share with
-  each other.
+#### Data structure
 
-For example, imagine a table where each row is a snapshot of an
-agent's work, saved after every turn, so each snapshot repeats the
-one before it. For snapshots of 1,000, 1,400, and 1,900 tokens:
+[`PrefixTree`](https://github.com/fsdatalab/quail/blob/main/quail/execution/tokens.py)
+stores the sharing plan in three Python lists:
 
-- Without sharing, Quail computes 4,300 tokens.
-- With sharing, it computes 1,000 + 408 + 508 = 1,916 tokens.
-- The second and third counts are 408 and 508, not 400 and 500,
-  because KV is stored in pages of 16 tokens and a document can only
-  read another's pages whole.
+| List | Contents |
+| --- | --- |
+| `order` | Document indices sorted by token sequence. |
+| `parent` | For each document, the earlier document that supplies its shared KV, or `None`. |
+| `shared` | For each document, the number of prefix tokens to reuse. |
+
+The parent links form a forest: one tree for each group of connected
+documents. The nodes are documents. This is not a radix tree with
+nodes for token sequences, and it does not store KV itself.
+
+Quail builds the lists before execution:
+
+1. Sort the documents by token sequence.
+2. Compare each document with the preceding document to find their
+   common prefix. Round its length down to whole KV pages, leaving
+   at least the current document's final token to compute.
+3. Select the preceding document as the parent. If it also reuses
+   that entire prefix, follow its parent links to the document that
+   supplies the prefix.
+
+For example, suppose documents 0, 1, and 2 contain the first 1,000,
+1,400, and 1,900 tokens of the same agent trace. With 16-token pages:
+
+```python
+order = [0, 1, 2]
+parent = [None, 0, 1]
+shared = [0, 992, 1392]
+```
+
+If the shared KV stays available, Quail computes 1,000 + 408 + 508 =
+1,916 document tokens, compared with 4,300 without sharing. These
+counts exclude question tokens.
 
 <Mermaid chart={`flowchart LR
-  S1["Snapshot 1<br/>computes 1,000 tokens"]
-  S2["Snapshot 2<br/>computes 408 tokens"]
-  S3["Snapshot 3<br/>computes 508 tokens"]
-  S1 -->|"reads 992 tokens of KV"| S2
-  S2 -->|"reads 1,392 tokens of KV"| S3`} />
+  D0["Document 0<br/>computes 1,000 tokens"]
+  D1["Document 1<br/>computes 408 tokens"]
+  D2["Document 2<br/>computes 508 tokens"]
+  D0 -->|"reuses 992 tokens of KV"| D1
+  D1 -->|"reuses 1,392 tokens of KV"| D2`} />
 
-The planner decides when to share; see
-[Planning](/docs/architecture/planning#deciding-whether-to-share-prefixes).
+#### Execution and memory
+
+- The executor considers documents in `order`. A document waits if
+  its parent has not yet entered execution.
+- The allocator stores a list of page IDs for each document. A
+  document reusing a prefix includes the parent's page IDs in its
+  own page table. The KV stays in GPU memory; it is not copied.
+- Each page has a reference count, the number of documents holding
+  it. Quail also protects parents needed by documents still waiting
+  to run. A page becomes free after its last holder releases it.
+- If a parent never runs or its required KV is unavailable, the
+  document computes the prefix again. Documents added after the
+  lists are built do not reuse prefixes through this plan.
+
+The allocator is in
+[`arena.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/arena.py).
+The [planner](/docs/architecture/planning#deciding-whether-to-share-prefixes)
+decides whether to enable sharing.
+
+#### Precedents
+
+The optimization is the same prefix caching used by
+[vLLM](https://docs.vllm.ai/en/latest/design/prefix_caching/) and
+[SGLang RadixAttention](https://www.lmsys.org/blog/2024-01-17-sglang/).
+The lookup structures differ:
+
+- vLLM looks up reusable blocks by hashes of their tokens and the
+  preceding prefix. See
+  [`get_computed_blocks`](https://github.com/vllm-project/vllm/blob/main/vllm/v1/core/kv_cache_manager.py).
+- SGLang searches and updates a radix tree as requests run. See
+  [`RadixCache`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/mem_cache/radix_cache.py).
+- Quail records parent links for its known input documents before
+  execution. Having the documents in advance allows this choice.
+
+SGLang also schedules requests to improve reuse. Neither prefix
+caching nor scheduling for reuse is new in Quail.
 
 ### Join execution
 
@@ -132,43 +185,41 @@ model layer. For each layer:
 
 ### Attention paths
 
-Some rows in a forward pass read the same KV: every partner of a join
-anchor reads the anchor's KV, and every document with the same parent
-reads the parent's KV. Quail computes this attention one of two ways.
+Several documents can attend to the same KV. In a join, each partner
+attends to the anchor. With prefix caching, each document attends
+to the prefix supplied by its parent.
 
-- **Unified attention**: one attention call over all rows. Shared KV
-  is read from memory once for each document that needs it.
-- **Tree attention**: two calls, one over each document's own tokens
-  and one where all documents that read the same KV read it together,
-  once. A small kernel combines the two results.
+- **Unified attention** uses one call. Each document attends to its
+  prefix and its new tokens as a separate sequence.
+- **Tree attention** uses two calls. One handles attention to the
+  shared prefix, grouping documents that read the same KV. The other
+  handles attention to each document's own tokens. A GPU kernel
+  combines the results.
 
-For example, imagine a join where one 2,000-token anchor is compared
-with partner documents.
-
-- With 300 partners of 20 tokens each, unified attention reads the
-  anchor 300 times and tree attention reads it once. Tree is faster.
-- With 2 partners of 1,000 tokens each, the anchor is read twice
-  either way and most of the work is the partners' own tokens.
-  Unified is faster.
+Grouping reads can reduce memory traffic for shared KV. It also adds
+a call and a merge step, so it is not always faster. Actual memory
+reads depend on the attention kernel; grouping does not guarantee
+that each KV value is read from GPU memory only once.
 
 <Mermaid chart={`flowchart TB
-  subgraph U["Unified: one call"]
-    direction LR
-    U1["partner 1 rows"] --> UA1["anchor KV"]
-    U2["partner 2 rows"] --> UA2["anchor KV"]
-    U3["partner 3 rows"] --> UA3["anchor KV"]
+  subgraph U["Unified attention"]
+    U1["Separate sequence per document"] --> U2["One call over prefix and new tokens"]
   end
-  subgraph T["Tree: two calls"]
-    direction LR
-    T1["partner 1, 2, 3 rows"] --> TA["anchor KV, read once"]
-    T1 --> TO["each partner's own rows"]
-    TA --> M["combine"]
-    TO --> M
+  subgraph T["Tree attention"]
+    T1["Group documents reading the same prefix"] --> T2["Attention to shared KV"]
+    T1 --> T3["Attention to each document's own tokens"]
+    T2 --> M["Combine results"]
+    T3 --> M
   end`} />
 
-Tree attention needs FP8 weights; other models always use unified.
-The planner picks the path for each operator; see
-[Planning](/docs/architecture/planning#choosing-the-attention-path).
+The planner enables the tree path only for models with FP8 weights
+and no canvas tokens, the extra rows used by DiffusionGemma. Other
+models use unified attention. See the
+[attention cost comparison](/docs/architecture/planning#choosing-the-attention-path).
+
+The `tree` attention path is a choice of attention computation.
+SGLang's RadixAttention names a prefix caching mechanism; it is not
+another name for this path.
 
 Quail uses vLLM's model implementation and DeepGEMM for the main
 matrix multiplications, but writes its own Triton JIT kernels to

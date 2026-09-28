@@ -241,3 +241,65 @@ how they release and explain changes.
   to the saved run or to a plot on the report branch, pinned to a
   commit, for numbers; a mermaid diagram for a design or dataflow
   change.
+
+## PR description format
+
+Write for a reviewer who has not followed the conversation. Explain
+the problem, the reasoning behind the solution, and the evidence
+needed to assess it. Describe the final change, not the history of
+implementing it. Use these sections in order, omitting sections that
+add nothing for a small change:
+
+- **Problem.** State what is broken, missing, or unnecessarily costly.
+  Give a concrete example when it helps explain the need.
+- **Solution.** Explain the resulting behavior and the approach. For
+  a design or dataflow change, include a Mermaid diagram with precise
+  labels. If a decision uses a cost model, give the actual comparison,
+  define its inputs and units, and state its assumptions and omitted
+  costs. "Does sharing save time?" is not a sufficient explanation.
+- **Precedents.** Link to relevant existing designs and implementations.
+  Explain what Quail shares with them, what differs, and why the
+  differences fit the task. Using the same approach is fine. Do not
+  invent novelty or claim an advantage without evidence. For prefix
+  caching, discuss vLLM Automatic Prefix Caching and SGLang
+  RadixAttention, with links to their documentation and code.
+- **Scope and design decisions.** Explain important choices and
+  tradeoffs. Identify cleanup or other changes beyond the main
+  behavior. Keep each PR focused on a coherent change; recommend
+  separating unrelated work instead of hiding it in the description.
+- **Impact and risks.** Show the useful before-and-after evidence and
+  its source. State the configurations being compared. Keep unresolved
+  correctness or accuracy differences visible, and distinguish a
+  possible explanation from a demonstrated cause.
+- **Testing.** State what was checked, the results, and what those
+  checks establish. Distinguish checks run on the current change from
+  results copied from earlier runs. Do not imply that passing tests
+  establish more than they cover.
+- **Limits and follow-ups.** State remaining limitations and what
+  evidence or work would resolve open questions.
+- **Review order.** For a large change, give a short path through the
+  relevant code with links and concrete questions for the reviewer.
+
+- Use established terminology throughout the description. Define it
+  where needed; do not add a terminology section or rename an existing
+  technique to make Quail sound different.
+- Keep the main description concise. Put long measurement tables and
+  supporting details behind links or in a collapsible section.
+- A clearer description does not make a large, mixed change small.
+  Prefer focused changes that can be reviewed and integrated promptly.
+
+## Guidance behind the format
+
+- [Why we need pull request descriptions, and how to craft them][pr-writing]
+  explains why descriptions should preserve intent, decisions, risks,
+  testing, and limits.
+- Martin Fowler's [Pull Request][fowler-pr] discusses coherent
+  contributions, small PRs, and timely review.
+- Fowler's [Patterns for Managing Source Code Branches][fowler-branches]
+  explains frequent integration and the cost of delaying it. These
+  articles guide scope and review practice; they do not prescribe the
+  section template above.
+
+[pr-writing]: https://wsbctechnicalblog.github.io/pull-request-descriptions-empowered-by-engineering-practices.html
+[fowler-pr]: https://martinfowler.com/bliki/PullRequest.html
+[fowler-branches]: https://martinfowler.com/articles/branching-patterns.html
