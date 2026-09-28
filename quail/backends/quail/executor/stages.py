@@ -47,6 +47,11 @@ class Stage:
             takes any true answer.
         read_all_rows: Whether every row of a suffix feeds the readout,
             not only its last.
+        single: The stage sends its one suffix to every document, as a
+            filter does: the frame and the suffix pack as one entry
+            written straight into the document's pages, and under tree
+            attention a borrowing document reads its parent's pages
+            stacked with its siblings.
         label: The stage's name in progress lines.
     """
 
@@ -56,7 +61,43 @@ class Stage:
     requests: Callable | None = None
     decide: Callable | None = None
     read_all_rows: bool = False
+    single: bool = False
     label: str = ""
+
+
+def shared_preamble_tokens(question_ids) -> int:
+    """Longest common token prefix across the stage questions."""
+    if len(question_ids) < 2:
+        return 0
+    p = 0
+    while all(len(q) > p and q[p] == question_ids[0][p]
+              for q in question_ids):
+        p += 1
+    return p
+
+
+def filter_stages(question_ids, readout) -> list:
+    """One Stage per filter question: the shared preamble as a frame, then the tail.
+
+    The preamble common to every question is written into the
+    document's KV once, at the first stage; each stage's suffix is its
+    question past the preamble.
+
+    Raises:
+        ValueError: A question has no tokens past the shared preamble.
+    """
+    p = shared_preamble_tokens(question_ids)
+    frame = list(question_ids[0][:p])
+    stages = []
+    for index, question in enumerate(question_ids):
+        tail = list(question[p:])
+        if not tail:
+            raise ValueError(
+                f"stage {index} question has no tokens beyond the shared "
+                f"preamble ({p} tokens)")
+        stages.append(Stage(suffixes=[tail], readout=readout, frame=frame,
+                            single=True, label=f"filter stage {index}"))
+    return stages
 
 
 def frame_writes(stages) -> list:
@@ -74,7 +115,8 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                anchor_keys=None, on_settled=None, anchor_source=None,
                anchor_batch=None, staging=None, attention_mode=None,
                prefix_tree=None, stats=None, limit=None, paged=True,
-               unit="anchors", label=None):
+               unit="anchors", label=None, default_attention="tree",
+               on_chunk=None):
     """Run every stage over the documents with one admission.
 
     Args:
@@ -108,6 +150,12 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
             causal segment without pages: the filter fast path.
         unit: The progress unit.
         label: The progress label; None names the stages.
+        default_attention: The attention path when the plan chose none
+            and the model has tree attention.
+        on_chunk: Optional callable run after each chunk's answers are
+            read with the documents that completed a stage in it, as
+            (document index, stage, passed) tuples: passed says the
+            document went on to the next stage, or survived the last.
 
     Returns:
         (answers, spans, tokens): answers[j][a] = the row of stage j's
@@ -146,7 +194,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
     writes = frame_writes(stages)
     stage_suffixes = [stage.suffixes for stage in stages]
     # a stage's suffixes read their document: tree unless the plan says
-    mode = attention_path(pipeline, attention_mode, default="tree")
+    mode = attention_path(pipeline, attention_mode, default=default_attention)
     canvas = tuple(pipeline.canvas_ids)
     answer_row = pipeline.canvas_answer_row
 
@@ -173,11 +221,22 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
              for doc in anchor_source.doc_ids
              for frame, rows in zip(frames, longest)), default=0))
 
+    # a stage sending one suffix to every document writes it straight
+    # into the document's own pages on the unified path, so the pages
+    # cover the frame and that suffix; other stages' suffixes take
+    # temporary pages
+    capacity_extra = frame_max
+    if paged and mode == "unified":
+        capacity_extra = max(
+            [frame_max] + [len(frame) + len(stage.suffixes[0]) + len(canvas)
+                           for frame, stage in zip(frames, stages)
+                           if stage.single])
+
     def held_pages(key, prefix_tokens):
-        # the admission prices a document at page_cost(prefix + frames)
+        # the admission prices a document at page_cost(prefix + extra)
         # less what it holds; a trimmed window holds fewer sliding
         # pages than that price assumes, so count what growing takes
-        capacity = prefix_tokens + frame_max
+        capacity = prefix_tokens + capacity_extra
         return (arena.page_cost(capacity)
                 - arena.growth_cost(key, capacity))
 
@@ -222,6 +281,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
         advance=advance,
         frame_writes=writes,
         limit=limit,
+        extra_tokens=capacity_extra,
     )
     borrowing = sched.borrowing
     borrowing.can_borrow = borrow_check(arena, keys, borrowing)
@@ -275,6 +335,10 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                 break
         return moved
 
+    def merged(j, start, end):
+        """Whether a group's frame rides its suffix as a single entry."""
+        return stages[j].single and end - start == 1
+
     def build(chunk_groups):
         """Pack one chunk; returns it with (stage, answer rows) per entry."""
         specs = []
@@ -288,7 +352,8 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
             if paged:
                 fresh = not arena.is_resident(key)
                 got = arena.activate(
-                    key, f, capacity_tokens=f + frame_max, base_tokens=f,
+                    key, f, capacity_tokens=f + capacity_extra,
+                    base_tokens=f,
                     borrow=(keys[parent], shared) if shared else None)
                 assert got is not None, \
                     "the admission placed a document the arena cannot hold"
@@ -302,11 +367,21 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                     for i in sched.partner_indices(a, j, start, end)]
             read_all = stages[j].read_all_rows
             rows = sum(map(len, sufs)) if read_all else len(sufs)
-            if writes[j] and start == 0:
+            # under tree attention a borrowing document with one
+            # suffix reads its parent's pages stacked with its siblings
+            read_key = keys[parent] if shared and stages[j].single else None
+            if writes[j] and start == 0 and merged(j, start, end):
+                # the frame and the one suffix are one entry; the
+                # frame's rows are scattered into KV after the document
+                specs.append(dict(
+                    key=key, prefix=prefix, start=shared, read_key=read_key,
+                    f=f, suffixes=[frame + list(sufs[0])],
+                    write_suffix_tokens=len(frame)))
+            elif writes[j] and start == 0:
                 # frame entry: scatter the frame into KV after the
                 # document rows; its own answer row means nothing
                 specs.append(dict(
-                    key=key, prefix=prefix, start=shared,
+                    key=key, prefix=prefix, start=shared, read_key=read_key,
                     f=f, suffixes=[frame],
                     write_suffix_tokens=len(frame)))
                 entries.append((j, 1))
@@ -315,7 +390,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                     suffixes=sufs, read_all_rows=read_all))
             else:
                 specs.append(dict(
-                    key=key, prefix=prefix, start=shared,
+                    key=key, prefix=prefix, start=shared, read_key=read_key,
                     f=f + len(frame),
                     suffixes=sufs, read_all_rows=read_all))
             entries.append((j, rows))
@@ -339,25 +414,35 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
         elif arena.is_resident(keys[anchor]):
             arena.free_key(keys[anchor])
 
+    shared_readout = all(stage.readout is stages[0].readout
+                         for stage in stages)
+
+    def select_rows(normed, spans_j):
+        index = [r for start, end in spans_j for r in range(start, end)]
+        if hasattr(normed, "index_select"):
+            return normed.index_select(
+                0, torch.tensor(index, device=normed.device))
+        return [normed[r] for r in index]
+
     def submit(normed, entries, rows_per_answer):
-        """Hand each stage's answer rows to its readout; returns handles."""
+        """Hand each stage's answer rows to its readout; returns handles.
+
+        With one readout for every stage the whole chunk goes in one
+        call, keyed None; otherwise each stage's rows go to its own.
+        """
+        if shared_readout:
+            readout = stages[0].readout
+            return {None: (readout.submit(normed, rows_per_answer=rows_per_answer)
+                           if rows_per_answer else readout.submit(normed))}
         by_stage = {}
         row = 0
         for j, rows in entries:
             by_stage.setdefault(j, []).append((row, row + rows))
             row += rows
-        if len(by_stage) == 1:
-            (j,) = by_stage
-            readout = stages[j].readout
-            return {j: (readout.submit(normed, rows_per_answer=rows_per_answer)
-                        if rows_per_answer else readout.submit(normed))}
         handles = {}
         per_answer = list(rows_per_answer) if rows_per_answer else None
         for j, spans_j in by_stage.items():
-            index = torch.tensor(
-                [r for start, end in spans_j for r in range(start, end)],
-                device=normed.device)
-            part = normed.index_select(0, index)
+            part = select_rows(normed, spans_j)
             readout = stages[j].readout
             if per_answer is None:
                 handles[j] = readout.submit(part)
@@ -365,7 +450,6 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                 # answers of this stage, in entry order
                 counts = []
                 answer = 0
-                row = 0
                 for jj, rows in entries:
                     taken = 0
                     while taken < rows:
@@ -378,20 +462,31 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
 
     def report(entry):
         groups, entries, handles = entry
-        values = {j: stages[j].readout.result(handle)
+        values = {j: (stages[0].readout if j is None
+                      else stages[j].readout).result(handle)
                   for j, handle in handles.items()}
         pos = {j: 0 for j in handles}
+        transitions = []
         for a, j, start, end, _ in groups:
-            if writes[j] and start == 0:
-                pos[j] += 1        # the frame entry's answer means nothing
+            key = None if shared_readout else j
+            if writes[j] and start == 0 and not merged(j, start, end):
+                pos[key] += 1        # the frame entry's answer means nothing
             cnt = end - start
-            for kind, anchor in sched.report(
-                    a, j, start, end, values[j][pos[j]:pos[j] + cnt]):
+            stage_before = sched._stage[a]
+            events = sched.report(
+                a, j, start, end, values[key][pos[key]:pos[key] + cnt])
+            for kind, anchor in events:
                 event(kind, anchor)
-            pos[j] += cnt
+                transitions.append((anchor, j, kind == "finished"
+                                    and sched._true[anchor][k - 1]))
+            if not events and sched._stage[a] != stage_before:
+                transitions.append((a, j, True))
+            pos[key] += cnt
         progress.update(
             progress.done + sum(end - start for _, _, start, end, _ in groups)
             if counting_answers else finished[0])
+        if transitions and on_chunk is not None:
+            on_chunk(transitions)
 
     def run_part(part):
         """Run one chunk of groups, halving it when its pages do not fit."""

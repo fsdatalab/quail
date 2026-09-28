@@ -251,6 +251,9 @@ class JoinAdmission:
             before packs no frame rows. None writes every frame.
         limit: Stop admitting anchors once this many survived the last
             stage; None runs every anchor.
+        extra_tokens: Rows past the prefix an anchor's pages must
+            cover, when more than its largest frame: a stage whose
+            one suffix is written into the anchor's own pages.
         answer_dtype: The answer array type, one for every stage or a
             list per stage; None records 0/1 lists.
 
@@ -271,7 +274,7 @@ class JoinAdmission:
                  resident=None, anchor_partners=None, temporary_suffix_pages=False,
                  answer_dtype=None, canvas_tokens=0, page_cost=None,
                  tree=None, can_borrow=None, advance=None,
-                 frame_writes=None, limit=None):
+                 frame_writes=None, limit=None, extra_tokens=None):
         k = len(stage_suffixes)
         self.answer_dtypes = (list(answer_dtype) if isinstance(answer_dtype, list)
                               else [answer_dtype] * k)
@@ -323,6 +326,8 @@ class JoinAdmission:
                     f"exceeds the {chunk_budget}-token chunk budget "
                     f"(suffixes are atomic)")
         self._extra = max(self.frame_rows)
+        if extra_tokens is not None:
+            self._extra = max(self._extra, extra_tokens)
         self._lists = []           # per anchor, per stage: indices or None
         self._cums = []            # per anchor, per stage: cumulative sums
         self._page_cost = []

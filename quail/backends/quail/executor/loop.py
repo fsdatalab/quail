@@ -1301,23 +1301,86 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
                pinned=True, limit=None, *, arena_writes,
                arena_keys=None, retain_survivors=(), attention_mode=None,
                document_done=None, prefix_tree=None, stats=None):
-    """The filter chain run to the end; see FilterStream for the arguments.
+    """The filter chain run to the end on the stage scheduler.
 
-    stats, when given, receives borrowed_tokens: the document tokens
-    read from a parent's KV pages instead of computed.
+    Args:
+        torch: The torch module, imported by the caller.
+        arena: KVArena holding the documents' KV pages.
+        pipeline: ModelPipeline that runs each packed forward chunk.
+        async_ans: AsyncAnswers readout for TRUE/FALSE bits.
+        doc_ids: Per-document token lists.
+        question_ids: Per-stage question token lists.
+        budget: Chunk token budget.
+        timing: Unused; kept for callers that pass it.
+        pinned: Unused; kept for callers that pass it.
+        limit: Stop admitting documents after this many survivors.
+        arena_writes: Whether document KV is written to the arena.
+            Must be True with multiple stages.
+        arena_keys: Stable arena key for each document. List positions
+            are used when omitted.
+        retain_survivors: Passing document positions to keep for
+            joins, or True for all of them.
+        attention_mode: "tree" or "unified" as the plan chose; None
+            and a model without tree attention run unified.
+        document_done: Called after each chunk's answers are read with
+            the documents that finished in it, as (position, last
+            stage asked, passed) tuples.
+        prefix_tree: A PrefixTree over doc_ids, or None. Needs
+            arena_writes.
+        stats: When given, receives borrowed_tokens.
 
     Returns:
         (answers, spans, tokens): answers[d] = 0/1 list up to the
-        first FALSE; spans and tokens as in run_join.
+        first FALSE; spans and tokens as in run_stages.
     """
-    stream = FilterStream(
-        torch, arena, pipeline, async_ans, doc_ids, question_ids, budget,
-        timing=timing, pinned=pinned, limit=limit,
-        arena_writes=arena_writes, arena_keys=arena_keys,
-        retain_survivors=retain_survivors, attention_mode=attention_mode,
-        document_done=document_done, prefix_tree=prefix_tree)
-    while not stream.done:
-        stream.next()
-    if stats is not None:
-        stats["borrowed_tokens"] = stream.sched.borrowing.borrowed_tokens
-    return stream.answers, stream.spans, stream.tokens
+    from quail.backends.quail.executor.stages import filter_stages, run_stages
+
+    stages = filter_stages(question_ids, async_ans)
+    k = len(stages)
+    keys = list(range(len(doc_ids))) if arena_keys is None else arena_keys
+    if len(keys) != len(doc_ids):
+        raise ValueError("arena_keys must match doc_ids")
+    retain_all = retain_survivors is True
+    retain = set() if retain_all else set(retain_survivors)
+    # a model whose attention reads paged KV only writes pages even
+    # when the plan skipped them
+    arena_writes = arena_writes or pipeline.needs_pages
+    if not arena_writes and (k > 1 or retain_all or retain):
+        # a later stage re-reads the KV, which needs the pages this
+        # switch skips
+        raise ValueError("arena_writes=False needs a single stage")
+    if prefix_tree is not None and prefix_tree.shared_tokens:
+        if not arena_writes:
+            raise ValueError("a prefix tree needs arena writes")
+    else:
+        prefix_tree = None
+    if arena.retention_cap_pages is None:
+        arena.retention_cap_pages = max(
+            0, arena.n_pages - arena.pages_needed(2 * budget))
+
+    def on_settled(anchor, survived, row):
+        key = keys[anchor]
+        if survived and (retain_all or anchor in retain):
+            arena.retain(key, len(doc_ids[anchor]))
+        elif arena.is_resident(key):
+            arena.free_key(key)
+
+    def on_chunk(transitions):
+        finished = [(anchor, stage, passed)
+                    for anchor, stage, passed in transitions
+                    if not passed or stage == k - 1]
+        if finished:
+            document_done(finished)
+
+    answers, spans, tokens = run_stages(
+        torch, arena, pipeline, stages, doc_ids, budget,
+        anchor_keys=keys, on_settled=on_settled,
+        attention_mode=attention_mode, prefix_tree=prefix_tree,
+        stats=stats, limit=limit, paged=arena_writes,
+        label=f"filter ({k} stages)", default_attention="unified",
+        on_chunk=on_chunk if document_done is not None else None)
+    by_document = {}
+    for stage in answers:
+        for doc, row in stage.items():
+            by_document.setdefault(doc, []).append(int(row[0]))
+    return by_document, spans, tokens
