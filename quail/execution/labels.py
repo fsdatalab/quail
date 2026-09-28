@@ -52,6 +52,46 @@ def label_scores(label_ids, prefixes, targets, logprobs) -> np.ndarray:
     return scores
 
 
+def trie_paths(label_ids) -> list[tuple[int, ...]]:
+    """Return the label trie's deepest proper prefixes, shortest first.
+
+    A chain read row by row after one of them returns the log
+    probabilities after every shorter prefix too, so chains over these
+    prefixes together read every trie node. With one-token labels only,
+    the one path is the empty prefix: the answer cue's own row.
+    """
+    nodes = set(label_trie(label_ids))
+    deepest = [node for node in nodes
+               if not any(node + (token,) in nodes
+                          for token in label_trie(label_ids)[node])]
+    return sorted(deepest, key=lambda prefix: (len(prefix), prefix))
+
+
+def label_path_scores(label_ids, paths, targets, logprobs) -> np.ndarray:
+    """Return every label's summed log probability from chains over trie paths.
+
+    Args:
+        label_ids: One token id sequence per label.
+        paths: The proper prefix each chain holds after the answer cue;
+            every proper prefix of every label starts one of them.
+        targets: The token ids, one per column of ``logprobs``.
+        logprobs: Shape (paths, rows, targets). Row r of chain p holds
+            the log probabilities read after the answer cue and the
+            first r tokens of ``paths[p]``.
+    """
+    where = {}      # proper prefix -> (chain, row) that read after it
+    for chain, path in enumerate(paths):
+        for depth in range(len(path) + 1):
+            where.setdefault(tuple(path[:depth]), (chain, depth))
+    column = {token: index for index, token in enumerate(targets)}
+    scores = np.zeros(len(label_ids), dtype=np.float64)
+    for label, ids in enumerate(label_ids):
+        for depth, token in enumerate(ids):
+            chain, row = where[tuple(ids[:depth])]
+            scores[label] += logprobs[chain, row, column[token]]
+    return scores
+
+
 def label_chain_scores(label_ids, targets, logprobs) -> np.ndarray:
     """Return every label's summed log probability from one chain per label.
 

@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from quail.cost import budgets
 from quail.cost.sol import speed_of_light
 from quail.cost.work import Work, scan, stream
-from quail.execution.labels import label_trie
+from quail.execution.labels import label_trie, trie_paths
 from quail.logical import (
     Alias,
     Apply,
@@ -59,8 +59,8 @@ def has_label(logical) -> bool:
 
 # The label scoring rules the executor runs, in the order they were
 # added; each later rule must return the labels of the first.
-LABEL_SCORINGS = ("trie_nodes", "label_chains")
-DEFAULT_LABEL_SCORING = "label_chains"
+LABEL_SCORINGS = ("trie_nodes", "label_chains", "trie_paths")
+DEFAULT_LABEL_SCORING = "trie_paths"
 
 
 def suffix_lengths(scoring: str, labels) -> list[int]:
@@ -69,10 +69,14 @@ def suffix_lengths(scoring: str, labels) -> list[int]:
     Every suffix starts with the answer cue's last token. Under
     ``trie_nodes`` it continues with a label-trie node's tokens and
     only its last row is read. Under ``label_chains`` it continues
-    with all but a label's last token and every row is read.
+    with all but a label's last token and every row is read. Under
+    ``trie_paths`` it continues with one of the trie's deepest proper
+    prefixes and every row is read.
     """
     if scoring == "label_chains":
         return [len(ids) for ids in labels]
+    if scoring == "trie_paths":
+        return [1 + len(path) for path in trie_paths(labels)]
     return [1 + len(node) for node in label_trie(labels)]
 
 

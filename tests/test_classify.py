@@ -14,7 +14,8 @@ import quail
 from quail.backends.quail.executor import loop
 from quail.backends.quail.executor.classify import (
     QuailClassifier,
-    classify_inputs,
+    document_prefixes,
+    label_requests,
 )
 from quail.backends.quail.executor.readout import AsyncLabelLogprobs
 from quail.bench.quailb import run_output
@@ -23,8 +24,10 @@ from quail.catalog import DocumentProvider
 from quail.execution.labels import (
     best_label,
     label_chain_scores,
+    label_path_scores,
     label_scores,
     label_trie,
+    trie_paths,
 )
 from quail.execution.reranker import RerankerBatch
 from quail.logical import ColumnRef, CompileError, bind_classify_prompt, label_text
@@ -83,6 +86,17 @@ def test_label_chain_scores_read_one_row_per_label_token():
     assert suffix_lengths("label_chains", IDS) == [2, 2, 1]
     assert suffix_lengths("trie_nodes", IDS) == [1, 2]
 
+    # one chain over the deepest proper prefix (1,) reads both rows
+    assert trie_paths(IDS) == [(1,)]
+    assert trie_paths([(7,), (8,)]) == [()]
+    # (1, 4)'s prefix (1,) is on the (1, 2) path, so it needs no chain
+    assert trie_paths([(1, 2, 3), (1, 2), (1, 4), (5, 6)]) == [(5,), (1, 2)]
+    assert suffix_lengths("trie_paths", IDS) == [2]
+    # its row 0 holds every first token, its row 1 every token after 1
+    path_logprobs = np.log([[[0.6, nan, nan, 0.4], [nan, 0.3, 0.7, nan]]])
+    scores = label_path_scores(IDS, [(1,)], targets, path_logprobs)
+    assert np.allclose(np.exp(scores), [0.18, 0.42, 0.4])
+
 
 def test_classify_prompt_is_quail_b_text_with_labels_after_it():
     ref = ColumnRef("t", "agent_traces", "trace")
@@ -136,12 +150,13 @@ def test_classifier_reads_every_trie_node_after_each_document(monkeypatch):
         prompt_token_parts=((90,), (91, 92, 93)), labels=LABELS,
         label_token_ids=IDS)
     documents = {"d": [[10, 11], [12], [13, 14, 15]]}
-    prefixes, frame, suffixes, nodes, targets = classify_inputs(
-        spec, documents, [0, 2])
+    prefixes = document_prefixes(spec, documents, [0, 2])
     assert [list(prefix) for prefix in prefixes] == [
         [90, 10, 11], [90, 13, 14, 15]]
-    assert frame == [91, 92]
-    assert (nodes, suffixes) == ([(), (1,)], [[93], [93, 1]])
+    requests = label_requests(spec)
+    assert requests.frame == [91, 92] and not requests.read_all_rows
+    assert requests.suffixes == [[93], [93, 1]]
+    targets = requests.targets
     assert targets == [1, 2, 3, 4]
 
     # document i prefers label i: its label tokens get log p = -1,
@@ -180,11 +195,11 @@ def test_classifier_reads_every_row_of_one_chain_per_label(monkeypatch):
         prompt_token_parts=((90,), (91, 92, 93)), labels=LABELS,
         label_token_ids=IDS, scoring="label_chains")
     documents = {"d": [[10, 11], [12]]}
-    prefixes, frame, suffixes, nodes, targets = classify_inputs(
-        spec, documents, [0, 1])
-    assert frame == [91, 92]
+    requests = label_requests(spec)
+    assert requests.frame == [91, 92] and requests.read_all_rows
     # the cue's last token, then every label token but its last
-    assert (nodes, suffixes) == (None, [[93, 1], [93, 1], [93]])
+    assert requests.suffixes == [[93, 1], [93, 1], [93]]
+    targets = requests.targets
     assert targets == [1, 2, 3, 4]
 
     # document i prefers label i: after the cue and the first r tokens
@@ -213,13 +228,13 @@ def test_classifier_reads_every_row_of_one_chain_per_label(monkeypatch):
         return padded
 
     monkeypatch.setattr(loop, "pack_chunk", fake_pack)
-    readout = SimpleNamespace(
+    readout_chains = SimpleNamespace(
         targets=np.asarray(targets), rows=2,
         dtype=np.dtype((np.float32, (2, 4))),
         submit=submit, result=lambda rows: rows)
     state = {"torch": fake_torch(), "arena": cpu_arena(64),
              "pipeline": fake_pipeline(forward_chunk=forward),
-             "chunk_tokens": 64, "label_readout": readout,
+             "chunk_tokens": 64, "label_readout": readout_chains,
              "input_staging": SimpleNamespace(fixed_tokens=set())}
     batch = QuailClassifier(state).classify(spec, [[0], [1]], documents)
     assert list(batch.scores) == list(LABELS[:2])
@@ -249,6 +264,19 @@ def test_classifier_reads_every_row_of_one_chain_per_label(monkeypatch):
     state["pipeline"] = fake_pipeline(forward_chunk=forward_single)
     batch = QuailClassifier(state).classify(single, [[0], [1]], documents)
     assert list(batch.scores) == ["a", "b"]
+
+    # trie paths: one two-row chain over (1,) scores all three labels
+    paths = ClassifySpec(
+        name="topic", aliases=("d",), query_template="", arguments=(),
+        expected_inputs=2, estimated_seconds=0.0,
+        prompt_token_parts=((90,), (91, 92, 93)), labels=LABELS,
+        label_token_ids=IDS, scoring="trie_paths")
+    assert label_requests(paths).suffixes == [[93, 1]]
+    state["label_readout"] = readout_chains
+    state["pipeline"] = fake_pipeline(forward_chunk=forward)
+    batch = QuailClassifier(state).classify(paths, [[0], [1]], documents)
+    assert list(batch.scores) == list(LABELS[:2])
+    assert batch.label_tokens == 2 * 2
 
 
 def test_classifier_borrows_shared_prefix_pages(monkeypatch):
@@ -370,12 +398,12 @@ def test_classify_refusals_and_builder_errors(session):
     assert "AI.IF" in mixed.plan().reasons[0]
     assert not isinstance(query.plan(), Refusal)
 
-    # the plan setting picks the scoring rule; label chains by default
+    # the plan setting picks the scoring rule; trie paths by default
     plan = query.plan()
     (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
-    assert classify.spec.scoring == "label_chains"
-    assert plan.settings["label_scoring"] == "label_chains"
-    for rule in ("trie_nodes", "label_chains", "next_rule"):
+    assert classify.spec.scoring == "trie_paths"
+    assert plan.settings["label_scoring"] == "trie_paths"
+    for rule in ("trie_nodes", "label_chains", "trie_paths", "next_rule"):
         ruled = quail.Session(EngineConfig(
             model="qwen3-4b-fp8", device="h100-sxm", label_scoring=rule),
             tokenizer=_bytes)

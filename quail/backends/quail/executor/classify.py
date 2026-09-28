@@ -11,10 +11,17 @@ the partner suffixes are:
 - ``label_chains``: one suffix per label, the tail's last token
   followed by all but the label's last token. Every row is read, so
   one suffix scores the whole label.
+- ``trie_paths``: one suffix per deepest proper prefix of the label
+  trie, the tail's last token followed by the prefix. Every row is
+  read and returns every label token, so the cue's row scores all
+  one-token labels at once and labels sharing leading tokens share
+  the rows after them.
 """
 
 import logging
 import time
+from dataclasses import dataclass
+from typing import Callable
 
 import numpy as np
 
@@ -24,8 +31,10 @@ from quail.backends.quail.executor.readout import AsyncLabelLogprobs
 from quail.execution.labels import (
     best_label,
     label_chain_scores,
+    label_path_scores,
     label_scores,
     label_trie,
+    trie_paths,
     trie_targets,
 )
 from quail.execution.reranker import RerankerBatch
@@ -34,29 +43,61 @@ from quail.execution.tokens import chain_tokens, prefix_tree
 logger = logging.getLogger("quail")
 
 
-def classify_inputs(spec, documents, rows):
-    """Return the join loop's inputs for one batch of documents.
+@dataclass(frozen=True)
+class LabelRequests:
+    """What one scoring rule streams after each document, and how it scores.
 
-    Returns:
-        (prefixes, frame, suffixes, nodes, targets): one prefix per
-        row, the frame written after each, one suffix per trie node or
-        per label, the trie node each suffix reads after (None for
-        label chains), and the token ids every read returns.
+    Attributes:
+        frame: The classification tail but its last token, written once
+            after each document.
+        suffixes: The partner suffixes, each starting with the tail's
+            last token.
+        targets: The token ids every read returns, sorted.
+        read_all_rows: Whether every row of a suffix is read, or only
+            its last.
+        score: Maps one document's log probabilities, shape
+            (suffixes, rows, targets) with all rows read and
+            (suffixes, targets) otherwise, to one score per label.
     """
+
+    frame: list
+    suffixes: list
+    targets: list
+    read_all_rows: bool
+    score: Callable[[np.ndarray], np.ndarray]
+
+
+def label_requests(spec) -> LabelRequests:
+    """Return the requests of the spec's scoring rule."""
     head, tail = spec.prompt_token_parts
     if len(tail) < 1:
         raise ValueError("AI.CLASSIFY needs a question after the document")
-    (alias,) = spec.aliases
-    prefixes = [chain_tokens(head, documents[alias][doc]) for doc in rows]
+    cue, frame = tail[-1], list(tail[:-1])
+    ids = spec.label_token_ids
     if spec.scoring == "label_chains":
-        suffixes = [[tail[-1], *ids[:-1]] for ids in spec.label_token_ids]
-        targets = sorted({token for ids in spec.label_token_ids
-                          for token in ids})
-        return prefixes, list(tail[:-1]), suffixes, None, targets
-    trie = label_trie(spec.label_token_ids)
+        targets = sorted({token for label in ids for token in label})
+        return LabelRequests(
+            frame, [[cue, *label[:-1]] for label in ids], targets, True,
+            lambda logprobs: label_chain_scores(ids, targets, logprobs))
+    if spec.scoring == "trie_paths":
+        paths = trie_paths(ids)
+        targets = sorted({token for label in ids for token in label})
+        return LabelRequests(
+            frame, [[cue, *path] for path in paths], targets, True,
+            lambda logprobs: label_path_scores(ids, paths, targets, logprobs))
+    trie = label_trie(ids)
     nodes = sorted(trie, key=lambda prefix: (len(prefix), prefix))
-    suffixes = [[tail[-1], *node] for node in nodes]
-    return prefixes, list(tail[:-1]), suffixes, nodes, trie_targets(trie)
+    targets = trie_targets(trie)
+    return LabelRequests(
+        frame, [[cue, *node] for node in nodes], targets, False,
+        lambda logprobs: label_scores(ids, nodes, targets, logprobs))
+
+
+def document_prefixes(spec, documents, rows) -> list:
+    """Return each row's prompt head and document as one token sequence."""
+    head, _ = spec.prompt_token_parts
+    (alias,) = spec.aliases
+    return [chain_tokens(head, documents[alias][doc]) for doc in rows]
 
 
 class QuailClassifier:
@@ -69,10 +110,12 @@ class QuailClassifier:
         """Return each row's label and the batch's fresh and cached tokens."""
         state = self.state
         rows = np.asarray(rows, dtype=np.int32).reshape(-1)
-        prefixes, frame, suffixes, nodes, targets = classify_inputs(
-            spec, documents, rows)
-        chains = nodes is None
-        readout_rows = max(map(len, suffixes)) if chains else 1
+        requests = label_requests(spec)
+        prefixes = document_prefixes(spec, documents, rows)
+        frame, suffixes, targets = (
+            requests.frame, requests.suffixes, requests.targets)
+        readout_rows = (max(map(len, suffixes)) if requests.read_all_rows
+                        else 1)
         readout = state.get("label_readout")
         if (readout is None or list(readout.targets.tolist()) != targets
                 or readout.rows != readout_rows):
@@ -98,20 +141,16 @@ class QuailClassifier:
             state["torch"], state["arena"], state["pipeline"], readout,
             prefixes, [suffixes], state["chunk_tokens"],
             stage_frames=[frame], anchor_keys=keys,
-            staging=state["input_staging"], read_all_rows=chains,
+            staging=state["input_staging"],
+            read_all_rows=requests.read_all_rows,
             prefix_tree=tree, stats=stats,
         )
         labels = np.empty(len(rows), dtype=object)
         for anchor, logprobs in answers[0].items():
-            if chains:
-                # a one-row readout returns (labels, targets)
-                scores = label_chain_scores(
-                    spec.label_token_ids, targets,
-                    logprobs.reshape(len(suffixes), readout_rows, -1))
-            else:
-                scores = label_scores(spec.label_token_ids, nodes, targets,
-                                      logprobs)
-            labels[anchor] = spec.labels[best_label(scores)]
+            if requests.read_all_rows:
+                # a one-row readout returns (suffixes, targets)
+                logprobs = logprobs.reshape(len(suffixes), readout_rows, -1)
+            labels[anchor] = spec.labels[best_label(requests.score(logprobs))]
         label_tokens = len(rows) * sum(map(len, suffixes))
         total = (sum(map(len, prefixes)) + len(rows) * len(frame)
                  + label_tokens)
