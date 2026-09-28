@@ -414,6 +414,8 @@ def main():
     parser.add_argument("--output-dir", required=True, help="new run directory")
     parser.add_argument("--label-scoring",
                         help="force one AI.CLASSIFY label scoring rule")
+    parser.add_argument("--gpu-timing", action="store_true",
+                        help="record GPU seconds per model node")
     args = parser.parse_args()
     run_suite(
         [value.strip() for value in args.only.split(",")] if args.only else None,
@@ -424,6 +426,7 @@ def main():
             backend=args.backend,
             device=args.device,
             label_scoring=args.label_scoring,
+            gpu_timing=args.gpu_timing,
         ),
         data_dir=args.data_dir,
         ground_truth_collection=args.ground_truth_collection,

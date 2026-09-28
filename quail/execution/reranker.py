@@ -117,6 +117,10 @@ class RerankerBatch:
     cached_tokens: int
     label_tokens: int = 0
     borrowed_tokens: int = 0
+    # forward-chunk seconds on the GPU and chunks launched; both zero
+    # unless the session asked for GPU timing
+    gpu_s: float = 0.0
+    chunks: int = 0
 
 
 def _value_type(spec) -> pa.DataType:
@@ -352,6 +356,8 @@ class RerankerModelExecution:
                 ),
                 fresh_tokens=batch.fresh_tokens,
                 cached_tokens=batch.cached_tokens,
+                gpu_s=batch.gpu_s,
+                chunks=batch.chunks,
                 extension={
                     "output": spec.name,
                     "aliases": list(spec.aliases),

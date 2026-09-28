@@ -137,7 +137,7 @@ class QuailClassifier:
                 "(tree built in %.2f s)", spec.name, len(prefixes),
                 tree.shared_tokens, time.perf_counter() - started)
         stats = {}
-        answers, _, fresh = run_join(
+        answers, spans, fresh = run_join(
             state["torch"], state["arena"], state["pipeline"], readout,
             prefixes, [suffixes], state["chunk_tokens"],
             stage_frames=[frame], anchor_keys=keys,
@@ -154,7 +154,15 @@ class QuailClassifier:
         label_tokens = len(rows) * sum(map(len, suffixes))
         total = (sum(map(len, prefixes)) + len(rows) * len(frame)
                  + label_tokens)
+        gpu_s = 0.0
+        if state.get("gpu_timing"):
+            # every chunk's answers were read, so its end event completed
+            state["torch"].cuda.synchronize()
+            gpu_s = sum(start.elapsed_time(end)
+                        for _, start, end in spans) / 1000.0
         return RerankerBatch(labels, fresh_tokens=fresh,
                              cached_tokens=total - fresh,
                              label_tokens=label_tokens,
-                             borrowed_tokens=stats.get("borrowed_tokens", 0))
+                             borrowed_tokens=stats.get("borrowed_tokens", 0),
+                             gpu_s=gpu_s,
+                             chunks=len(spans) if state.get("gpu_timing") else 0)
