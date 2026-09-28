@@ -105,3 +105,17 @@ def test_all_queries_compile_and_plan_and_answer_timing_adds_common_work(tmp_pat
     assert _submission_to_answer_s(
         "pipelined_vllm", report, frontend_s=1.0, answer_prepare_s=0.75
     ) == 11.25
+
+
+def test_kernel_cache_files_counts_each_cache_directory(tmp_path, monkeypatch):
+    from quail.bench.quailb import kernel_cache_files
+
+    monkeypatch.setenv("QUAIL_CACHE_DIR", str(tmp_path / "missing"))
+    assert kernel_cache_files() == {}
+    (tmp_path / "triton" / "a").mkdir(parents=True)
+    (tmp_path / "triton" / "a" / "k.cubin").write_bytes(b"")
+    (tmp_path / "triton" / "a" / "k.json").write_bytes(b"")
+    (tmp_path / "deep_gemm").mkdir()
+    (tmp_path / "marker.json").write_text("{}")
+    monkeypatch.setenv("QUAIL_CACHE_DIR", str(tmp_path))
+    assert kernel_cache_files() == {"deep_gemm": 0, "triton": 2}

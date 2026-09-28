@@ -93,3 +93,24 @@ def test_warmup_failure_writes_no_marker_and_touch_warms_the_join_chunk(
                         lambda *args, **kwargs: calls.append(kwargs))
     loop.touch_kernels(None, None, None, None, 100)
     assert calls == [{"join_chunk": True}]
+
+
+def test_forward_warm_runs_a_classification_chunk(monkeypatch):
+    from types import SimpleNamespace
+
+    joins = []
+    monkeypatch.setattr(loop, "run_filter", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        loop, "run_join",
+        lambda torch, arena, pipeline, ans, docs, stages, budget, **kw:
+        joins.append((stages, kw)))
+    pipeline = SimpleNamespace(tree_attention=False, warm_tokens=())
+    loop._forward_warm(None, None, pipeline, None, 2048, join_chunk=True)
+    (join, classify) = joins
+    assert len(join[0][0]) == 8 and join[1] == {}
+    suffixes = classify[0][0]
+    question = list(range(10, 26))
+    # 26 suffixes of one to six tokens, after the question as the frame
+    assert len(suffixes) == 26 and {len(s) for s in suffixes} == set(range(1, 7))
+    assert all(s == question[:len(s)] for s in suffixes)
+    assert classify[1] == {"stage_frames": [question]}

@@ -13,6 +13,7 @@ no Modal or volume is involved:
 """
 
 import argparse
+import os
 import time
 from dataclasses import asdict
 from functools import partial
@@ -271,9 +272,27 @@ def _submission_to_answer_s(
     return runtime_s
 
 
+def kernel_cache_files() -> dict[str, int]:
+    """Return the file count under each kernel cache directory.
+
+    The caches live under QUAIL_CACHE_DIR (Triton, DeepGEMM, and vLLM
+    each in their own directory). A count that grows across a query
+    means kernels were compiled inside the query's time.
+    """
+    root = Path(os.path.expanduser(
+        os.environ.get("QUAIL_CACHE_DIR", "~/.cache/quail/kernels")))
+    if not root.is_dir():
+        return {}
+    return {
+        child.name: sum(len(files) for _, _, files in os.walk(child))
+        for child in sorted(root.iterdir()) if child.is_dir()
+    }
+
+
 def run_query(session, spec: QuerySpec, tables) -> RunOutput:
     """Execute one query and return benchmark ids, answers, and measurements."""
     submitted = time.perf_counter()
+    cache_before = kernel_cache_files()
     for name, table in tables.items():
         if name not in session.catalog:
             session.register(
@@ -300,6 +319,8 @@ def run_query(session, spec: QuerySpec, tables) -> RunOutput:
     )
     if session.config.backend == "quail":
         output.measurements["frontend_s"] = frontend_s
+        output.measurements["kernel_cache_files"] = {
+            "before": cache_before, "after": kernel_cache_files()}
     if session.config.backend in TEXT_VLLM_BACKENDS:
         output.measurements["input_tokens"] = (
             result.report["fresh_tokens"] + result.report["cached_tokens"]

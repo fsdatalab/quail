@@ -995,7 +995,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
 # Bump when either pass covers a different set of shapes. A bumped
 # version invalidates every marker, so the next boot re-runs the
 # compile pass and re-commits the cache.
-WARMUP_VERSION = 4
+WARMUP_VERSION = 5
 
 
 def _warm_inputs(budget):
@@ -1019,7 +1019,7 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
     """Run real forward passes over every attention path.
 
     Both modes with arena writes, plus the unpaged causal fast path.
-    join_chunk adds one run_join call.
+    join_chunk adds a join chunk and a classification chunk.
     """
     warm_docs, question, doc = _warm_inputs(budget)
     q_max = len(question)
@@ -1043,6 +1043,12 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
         logger.debug("kernels: warming join forward pass")
         run_join(torch, arena, pipeline, async_ans, warm_docs,
                  [[question] * 8], budget)
+        # a classification: the question as the frame after each
+        # document, then many short suffixes of mixed lengths
+        logger.debug("kernels: warming classification forward pass")
+        labels = [question[:1 + i % 6] for i in range(26)]
+        run_join(torch, arena, pipeline, async_ans, warm_docs,
+                 [labels], budget, stage_frames=[question])
     logger.debug("kernels: warming filter without KV writes")
     run_filter(torch, arena, pipeline, async_ans, warm_docs,
                [question], budget, arena_writes=False)
