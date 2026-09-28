@@ -5,7 +5,7 @@ the functions with the most cumulative and own time, so the host work
 between forward passes can be read off. The stats file goes to the
 results volume.
 
-    uv run modal run --detach experiments/cells/profile_query.py
+    uv run modal run --detach experiments/cells/profile_query.py::profile
         --query BIO-5 --label-scoring trie_paths
 """
 
@@ -67,7 +67,7 @@ def profile_query(query_id: str, sf: float, collection_id: str,
 
 
 @app.local_entrypoint()
-def main(query: str = "BIO-5", sf: float = 0.1,
+def profile(query: str = "BIO-5", sf: float = 0.1,
          label_scoring: str = "trie_paths", top: int = 35):
     data = ensure_data.spawn(sf, [query], "")
     print(f"function call id: {data.object_id} (data)", flush=True)
