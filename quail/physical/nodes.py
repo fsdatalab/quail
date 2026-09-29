@@ -7,7 +7,6 @@ from typing import Any, ClassVar, Mapping
 
 from .base import (
     ExecutionLocation,
-    GraphValidationError,
     OutputPort,
     PhysicalNode,
     ValueType,
@@ -659,9 +658,6 @@ class AiClassify(AiScore):
     """
 
     spec: ClassifySpec | None = None
-    # the labeled documents stream into the join anchored on the alias,
-    # their KV resident, instead of being handed over as a whole
-    pin_survivors: bool = False
 
     type_name: ClassVar[str] = "quail.ai_classify"
 
@@ -675,13 +671,9 @@ class AiClassify(AiScore):
                                  schema=(alias,)),)
         return ports
 
-    def attributes(self) -> dict:
-        return {**super().attributes(), "pin_survivors": self.pin_survivors}
-
     def explain_fields(self) -> Mapping[str, Any]:
         return {
             **super().explain_fields(),
-            "pin_survivors": self.pin_survivors,
             "labels": [] if self.spec is None else list(self.spec.labels),
             "scoring": None if self.spec is None else self.spec.scoring,
             "share_prefixes": (False if self.spec is None
@@ -701,7 +693,6 @@ class AiClassify(AiScore):
             backend_name=str(attributes["backend_name"]),
             model=str(attributes["model"]),
             spec=None if value is None else ClassifySpec.from_mapping(value),
-            pin_survivors=bool(attributes.get("pin_survivors", False)),
         )
 
 
@@ -825,8 +816,6 @@ class AiFilter(PhysicalNode):
     alias: str = ""
     arena_writes: bool = False
     keep_kv: bool = False
-    pin_survivors: bool = False
-    hold_tokens: int = 0
     stages: tuple[FilterStage, ...] = ()
     question_token_ids: tuple[tuple[Any, ...], ...] = ()
     # documents borrow the KV pages of a document that shares their
@@ -861,8 +850,6 @@ class AiFilter(PhysicalNode):
             "alias": self.alias,
             "arena_writes": self.arena_writes,
             "keep_kv": self.keep_kv,
-            "pin_survivors": self.pin_survivors,
-            "hold_tokens": self.hold_tokens,
             "stages": [stage.to_dict() for stage in self.stages],
             "question_token_ids": [
                 list(question) for question in self.question_token_ids
@@ -884,8 +871,6 @@ class AiFilter(PhysicalNode):
             alias=attributes["alias"],
             arena_writes=bool(attributes["arena_writes"]),
             keep_kv=bool(attributes["keep_kv"]),
-            pin_survivors=bool(attributes["pin_survivors"]),
-            hold_tokens=int(attributes["hold_tokens"]),
             stages=tuple(
                 FilterStage.from_mapping(stage)
                 for stage in attributes["stages"]
@@ -1003,9 +988,10 @@ class AiJoin(PhysicalNode):
 class Foreign(PhysicalNode):
     """Call a user function between two operators.
 
-    ``kind`` is ``per_batch`` (called on each batch a survivor stream
-    hands over, or once over a materialized input) or ``barrier``
-    (called once over every survivor; never on a stream). ``ids`` is
+    ``kind`` is ``per_batch`` (called on each document as it reaches
+    the function inside its table's pipeline, or once over a
+    materialized input) or ``barrier`` (called once over every
+    survivor, ending the pipeline before it). ``ids`` is
     ``preserve``, ``drop``, or ``pairs``; the function never invents an
     id. ``columns`` are (alias, column) pairs read as values.
     """
@@ -1217,72 +1203,3 @@ class Limit(PhysicalNode):
     @classmethod
     def from_attributes(cls, node_id, inputs, attributes):
         return cls(node_id=node_id, inputs=inputs, count=int(attributes["count"]))
-
-
-def validate_streams(graph) -> None:
-    """Check that pinned survivor streams reach their consumers as streams.
-
-    A filter that pins its survivors streams them into the join
-    anchored on its alias or into the classification of its alias; a
-    classification that pins its documents streams them into the join.
-    On that path only per-batch Foreign nodes, and after a
-    classification its label filters, may sit; a Barrier, a barrier
-    Foreign, or any other consumer would need the whole set at once,
-    which a stream never has. A projection reads a streamed
-    classification's labels once its stream has completed.
-    """
-    consumers: dict[tuple[str, str], list] = {}
-    for node in graph.nodes:
-        for port in node.inputs:
-            consumers.setdefault(
-                (port.source.node_id, port.source.port), []).append(node)
-    for node in graph.nodes:
-        if isinstance(node, AiFilter) and node.pin_survivors:
-            alias = node.alias
-            starts = [(node.node_id, f"ids:{alias}")]
-        elif isinstance(node, AiClassify) and node.pin_survivors \
-                and node.spec is not None:
-            # its label filters read the label rows; a join without
-            # one reads the ids
-            (alias,) = node.spec.aliases
-            starts = [(node.node_id, "scores"), (node.node_id, f"ids:{alias}")]
-        else:
-            continue
-        reached = []
-
-        def follow(port, node=node, alias=alias, reached=reached):
-            for consumer in consumers.get(port, ()):
-                if isinstance(consumer, AiJoin) and consumer.anchor == alias:
-                    reached.append(consumer)
-                    continue
-                if isinstance(consumer, AiClassify) and isinstance(node, AiFilter) \
-                        and consumer.spec is not None \
-                        and consumer.spec.aliases == (alias,):
-                    reached.append(consumer)
-                    continue
-                if isinstance(consumer, Foreign) \
-                        and consumer.kind == "per_batch":
-                    out = (f"pairs:{consumer.written_pos}"
-                           if consumer.ids == "pairs" else f"ids:{alias}")
-                    follow((consumer.node_id, out))
-                    continue
-                if isinstance(consumer, LabelFilter) \
-                        and isinstance(node, AiClassify) \
-                        and consumer.aliases == (alias,):
-                    follow((consumer.node_id, f"ids:{alias}"))
-                    continue
-                if isinstance(consumer, Project) and isinstance(node, AiClassify):
-                    # reads the labels once the stream has completed
-                    continue
-                raise GraphValidationError(
-                    f"{consumer.node_id!r} reads the pinned survivors of "
-                    f"{node.node_id!r}; only a per-batch apply, a label "
-                    f"filter, the classification of {alias!r}, or the join "
-                    f"anchored on {alias!r} can consume a survivor stream")
-
-        for start in starts:
-            follow(start)
-        if not reached:
-            raise GraphValidationError(
-                f"{node.node_id!r} pins its survivors but no join or "
-                f"classification on {alias!r} consumes them")

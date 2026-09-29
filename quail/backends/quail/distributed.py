@@ -17,7 +17,6 @@ from quail.execution.runner import (
     GenericRunner,
     NodeMetrics,
     NodeResult,
-    SurvivorStream,
     compute_subgraph,
     scalar_node_metrics,
 )
@@ -133,14 +132,6 @@ class DistributedQuailExecution:
     def _execute_filter(self, node, inputs):
 
         document_ids = next(iter(inputs.values()))
-        if node.pin_survivors:
-            stream = SurvivorStream(node, list(document_ids))
-
-            return NodeResult(
-                {f"ids:{node.alias}": stream,
-                 f"filter_answers:{node.alias}": {}},
-                finalize=stream.finalized_result,
-            )
         shards = self.shards
         complete = (
             isinstance(document_ids, range)
@@ -200,12 +191,7 @@ class DistributedQuailExecution:
 
         survivors = dict(inputs["survivors"])
         group = inputs["group"]
-        stream = inputs.get("anchor_stream")
         filtered_aliases = set(self.retained)
-        if stream is not None:
-            # the anchor's chain runs inside this round, over this GPU's shard
-            survivors[node.anchor] = list(stream.document_ids)
-            filtered_aliases.add(node.anchor)
         if not self.joins_started:
             self.snapshot_after_filters()
             self.joins_started = True
@@ -220,11 +206,6 @@ class DistributedQuailExecution:
             pair_tables=inputs.get("pairs"),
         )
         encoded_node = self.registry.codecs[node.type_name].encode(node)
-        encoded_filter = (
-            None if stream is None
-            else self.registry.codecs[stream.node.type_name].encode(
-                stream.node)
-        )
         for sub in subs:
             sub.pop("joins", None)
             sub.update(
@@ -233,35 +214,11 @@ class DistributedQuailExecution:
                     AiJoin.type_name)[-1].node_id,
                 start_query=not self.started,
                 physical_node=encoded_node,
-                stream_filter_node=encoded_filter,
             )
         started = time.perf_counter()
         outputs = self.round_fn("joins", subs)
         wall = time.perf_counter() - started
         self.started = True
-        if stream is not None:
-            merged = coordinator.merge_filter_round([
-                {
-                    "filters": output["filters"],
-                    "survivors": output["survivors"],
-                    "fresh_tokens": output["filter_fresh_tokens"],
-                }
-                for output in outputs
-            ])
-            answers = merged["filters"].get(node.anchor, {})
-            survivors = merged["survivors"].get(node.anchor, [])
-            stream.complete(NodeResult(
-                {
-                    f"ids:{node.anchor}": survivors,
-                    f"filter_answers:{node.anchor}": answers,
-                },
-                NodeMetrics(
-                    input_rows=len(stream.document_ids),
-                    output_rows=len(survivors),
-                    evaluated_documents=len(answers),
-                    fresh_tokens=merged["fresh_tokens"],
-                ),
-            ))
         stage_outputs = coordinator.merge_join_round(outputs)
         hits = 0
         misses = 0
@@ -353,7 +310,6 @@ _ONE_GPU_APPLY = ("per-batch apply() functions run on one GPU; the "
 def prepare_distributed_inputs(node, inputs, context):
     if isinstance(node, AiJoin):
         survivors = {}
-        stream = None
         pairs = {}
         for port in node.inputs:
             value = inputs[port.name]
@@ -362,20 +318,10 @@ def prepare_distributed_inputs(node, inputs, context):
                     raise TypeError(_ONE_GPU_APPLY)
                 pairs[int(port.source.port.split(":", 1)[1])] = value
                 continue
-            alias = port.source.port.split(":", 1)[1]
-            if isinstance(value, SurvivorStream):
-                if alias != node.anchor:
-                    raise TypeError(
-                        "only the anchor's filter chain streams into a join")
-                if value.transforms:
-                    raise TypeError(_ONE_GPU_APPLY)
-                stream = value
-            else:
-                survivors[alias] = list(value)
+            survivors[port.source.port.split(":", 1)[1]] = list(value)
         return {
             "survivors": survivors,
             "group": [stage.runtime_spec() for stage in node.stages],
-            "anchor_stream": stream,
             "pairs": pairs,
         }
     return inputs

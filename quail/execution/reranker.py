@@ -14,7 +14,6 @@ from quail.execution.result import DEFAULT_BATCH_ROWS, answer_table
 from quail.execution.runner import (
     NodeMetrics,
     NodeResult,
-    SurvivorStream,
 )
 from quail.physical import AiScore, ClassifySpec, LabelFilter, ScoreFilter, ValueType
 from quail.progress import answer_sink
@@ -443,74 +442,49 @@ class ScoreFilterRuntime:
         if len(inputs) != 1:
             raise ValueError("ScoreFilter needs one score input")
         table = next(iter(inputs.values()))
-        if isinstance(table, SurvivorStream):
-            return self._gate_stream(node, table)
-        return self._filter(node, table)
+        return filter_scores(node, table)
 
-    def _gate_stream(self, node, stream: SurvivorStream) -> NodeResult:
-        """Gate a streaming classification's documents on their labels.
 
-        The join the stream reaches asks each batch's labels once the
-        classification stage has answered them; the filter's own rows
-        and answers follow when the stream completes.
-        """
-        if not isinstance(node, LabelFilter) or len(node.aliases) != 1:
-            raise TypeError("only a one-table label filter gates a stream")
-        (alias,) = node.aliases
-        accepted = set(node.accepted)
-        labels = stream.labels
-
-        def batch(ids):
-            return [document for document in ids
-                    if labels.get(document) in accepted]
-
-        def finalize():
-            return self._filter(node, stream.finalized_result().outputs["scores"])
-
-        return NodeResult(
-            {"scores": stream, f"filter_answers:{alias}": {},
-             f"ids:{alias}": stream.with_transform(batch)},
-            finalize=finalize)
-
-    def _filter(self, node, table) -> NodeResult:
-        if isinstance(node, LabelFilter):
-            answers = pc.is_in(table.column(node.score_name),
-                               value_set=pa.array(node.accepted, pa.string()))
-        else:
-            answers = compare_score(
-                table.column(node.score_name), node.comparison, node.threshold,
-            )
-        filtered = table.filter(answers)
-        if len(node.aliases) == 1:
-            answer_name = f"filter_answers:{node.aliases[0]}"
-            answer_relation = _filter_answer_table(node, table, answers)
-        else:
-            left, right = node.aliases
-            answer_name = f"join_answers:{node.written_pos}"
-            answer_relation = answer_table(
-                {
-                    left: table.column(left),
-                    right: table.column(right),
-                },
-                answers,
-                "join_answers",
-                metadata={
-                    "written_pos": node.written_pos,
-                    "anchor": left,
-                    "partners": right,
-                    "semantics": "full",
-                    "comparison": node.comparison,
-                    "threshold": node.threshold,
-                },
-            )
-        outputs = {"scores": filtered, answer_name: answer_relation}
-        if isinstance(node, LabelFilter) and len(node.aliases) == 1:
-            outputs[f"ids:{node.aliases[0]}"] = (
-                filtered.column(node.aliases[0]).to_pylist())
-        return NodeResult(
-            outputs,
-            NodeMetrics(
-                input_rows=table.num_rows,
-                output_rows=filtered.num_rows,
-            ),
+def filter_scores(node, table) -> NodeResult:
+    """Apply a score filter to a table of scores or labels."""
+    if isinstance(node, LabelFilter):
+        answers = pc.is_in(table.column(node.score_name),
+                           value_set=pa.array(node.accepted, pa.string()))
+    else:
+        answers = compare_score(
+            table.column(node.score_name), node.comparison, node.threshold,
         )
+    filtered = table.filter(answers)
+    if len(node.aliases) == 1:
+        answer_name = f"filter_answers:{node.aliases[0]}"
+        answer_relation = _filter_answer_table(node, table, answers)
+    else:
+        left, right = node.aliases
+        answer_name = f"join_answers:{node.written_pos}"
+        answer_relation = answer_table(
+            {
+                left: table.column(left),
+                right: table.column(right),
+            },
+            answers,
+            "join_answers",
+            metadata={
+                "written_pos": node.written_pos,
+                "anchor": left,
+                "partners": right,
+                "semantics": "full",
+                "comparison": node.comparison,
+                "threshold": node.threshold,
+            },
+        )
+    outputs = {"scores": filtered, answer_name: answer_relation}
+    if isinstance(node, LabelFilter) and len(node.aliases) == 1:
+        outputs[f"ids:{node.aliases[0]}"] = (
+            filtered.column(node.aliases[0]).to_pylist())
+    return NodeResult(
+        outputs,
+        NodeMetrics(
+            input_rows=table.num_rows,
+            output_rows=filtered.num_rows,
+        ),
+    )

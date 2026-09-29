@@ -4,6 +4,7 @@ from collections import Counter
 from collections.abc import Mapping
 
 from quail import logical as logical_nodes
+from quail.execution.pipelines import build_pipelines
 from quail.logical import DEFAULT_SELECTIVITY, effective_selectivity
 from quail.physical import (
     AiClassify,
@@ -321,8 +322,6 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                 kv.append("KV rewind=on")
             if node.keep_kv:
                 kv.append("retain KV for later joins")
-            if node.pin_survivors:
-                kv.append("survivors stream into the join with KV pinned")
             details.append(", ".join(kv) if kv else
                            "KV: stored" if node.arena_writes else "KV: not stored")
             written = filters.get(node.alias, ())
@@ -359,13 +358,6 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
             source = {"none": "not resident", "filter": "from filters",
                       "kept": "from an earlier join"}.get(
                           node.anchor_resident, node.anchor_resident)
-            anchor_port = next(
-                (port for port in node.inputs
-                 if port.source.port == f"ids:{node.anchor}"), None)
-            producer = (graph.node(anchor_port.source.node_id)
-                        if anchor_port else None)
-            if isinstance(producer, AiFilter) and producer.pin_survivors:
-                source = "streamed from its filter"
             keep = "yes" if node.keep_anchor_kv else "no"
             details.append(f"KV: anchor={source}, retain after join={keep}")
             order = [stage.written_pos for stage in node.stages]
@@ -454,9 +446,9 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                 title += " (metrics unavailable)"
         if "release_recompute_tokens" in estimate:
             details.append(
-                ("if the KV were released here instead of pinned: "
-                 if node.pin_survivors else "expected recompute at the join: ")
-                + f"{estimate['release_recompute_tokens']:,} tokens, "
+                "expected recompute at the join if the chain's KV is "
+                "released: "
+                f"{estimate['release_recompute_tokens']:,} tokens, "
                 f"{estimate['release_recompute_seconds']:.3f} s")
         rows.append((pad + title, cells))
         rows.extend((pad + "  " + detail, {}) for detail in details)
@@ -479,6 +471,16 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
         if node.node_id not in visited:
             visit(node, 0)
     lines = _table(rows)
+    # the per-document operators of one table run as one pipeline
+    seen = set()
+    for member_id, pipeline in build_pipelines(graph).items():
+        if id(pipeline) in seen or len(pipeline.members) < 2:
+            continue
+        seen.add(id(pipeline))
+        lines.append(f"Pipeline on {pipeline.alias}: "
+                     + " -> ".join(pipeline.node_ids)
+                     + " (each document runs every operator with its KV "
+                     "resident)")
     if used_default:
         lines.append(DEFAULT_NOTE)
     return "\n".join(lines)

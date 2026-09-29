@@ -42,7 +42,6 @@ from .nodes import (
     Scan,
     ScoreFilter,
     ScoreSpec,
-    validate_streams,
 )
 
 __all__ = [
@@ -83,5 +82,4 @@ __all__ = [
     "decode_graph",
     "encode_graph",
     "plan_envelope",
-    "validate_streams",
 ]

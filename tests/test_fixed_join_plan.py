@@ -5,11 +5,12 @@ import pyarrow as pa
 from test_quail_backend import graph_state
 
 import quail
-from quail.backends.quail.graph import execute_single_graph, filter_result
+from quail.backends.quail.graph import execute_single_graph
 from quail.bench import quailb
 from quail.execution.execute import execute_query
+from quail.execution.pipelines import build_pipelines
 from quail.execution.reranker import _score_table
-from quail.execution.runner import NodeMetrics, NodeResult, SurvivorStream
+from quail.execution.runner import NodeMetrics, NodeResult
 from quail.execution.types import PhysicalResponse
 from quail.physical import (
     AiClassify,
@@ -70,13 +71,6 @@ class FixedFeverAnswers:
                 if all(answers[local])]
         return answers, live
 
-    def _drive(self, stream):
-        """Answer a filter chain's stream at once; returns its survivors."""
-        ids = list(stream.document_ids)
-        answers, live = self._answers(ids)
-        stream.complete(filter_result(stream.node, answers, 0, ids))
-        return live
-
     def _label_table(self, node, ids):
         # a document whose answer names no label has no row, as the
         # classify node drops it
@@ -93,27 +87,11 @@ class FixedFeverAnswers:
         if isinstance(node, AiClassify):
             (ids,) = inputs["score_inputs"].values()
             (alias,) = node.spec.aliases
-            if isinstance(ids, SurvivorStream):
-                # the filter chain's survivors, labeled with KV resident
-                ids = self._drive(ids)
-            if node.pin_survivors:
-                stream = SurvivorStream(node, list(ids))
-                stream.labels.update(
-                    (int(document), self.labels[int(document)])
-                    for document in ids)
-                return NodeResult({"scores": stream, f"ids:{alias}": stream},
-                                  finalize=stream.finalized_result)
             labeled, table = self._label_table(node, ids)
             return NodeResult(
                 {"scores": table, f"ids:{alias}": labeled},
                 NodeMetrics(input_rows=len(ids), output_rows=len(ids)))
         if isinstance(node, AiFilter):
-            if node.pin_survivors:
-                stream = SurvivorStream(node, inputs["document_ids"])
-                return NodeResult(
-                    {f"ids:{node.alias}": stream,
-                     f"filter_answers:{node.alias}": {}},
-                    finalize=stream.finalized_result)
             document_ids = list(inputs["document_ids"])
             answers, live = self._answers(document_ids)
             if inputs["retain_survivors"]:
@@ -127,30 +105,7 @@ class FixedFeverAnswers:
             })
 
         outputs = {}
-        stream = inputs.get("anchor_stream")
-        if stream is None:
-            anchor_ids = inputs["anchor_ids"]
-        elif isinstance(stream["node"], AiClassify):
-            # a streamed classification: its stream completes with the
-            # label rows; the label filter gates each batch
-            anchor_ids = list(stream["document_ids"])
-            labeled, table = self._label_table(stream["node"], anchor_ids)
-            stream["stream"].complete(NodeResult(
-                {"scores": table, f"ids:{node.anchor}": labeled},
-                NodeMetrics(input_rows=len(anchor_ids),
-                            output_rows=len(labeled))))
-            keys = [(node.anchor, document) for document in labeled]
-            if inputs.get("anchor_batch") is not None:
-                keys = inputs["anchor_batch"](keys)
-            anchor_ids = [key[1] for key in keys]
-        else:
-            anchor_ids = self._drive(stream["stream"])
-            keys = [(node.anchor, document) for document in anchor_ids]
-            if inputs.get("anchor_batch") is not None:
-                # like the real driver: per-batch functions run on each
-                # batch before admission and may drop survivors
-                keys = inputs["anchor_batch"](keys)
-            anchor_ids = [key[1] for key in keys]
+        anchor_ids = inputs["anchor_ids"]
         live = set(range(len(anchor_ids)))
         all_answers = []
         lists_for = inputs.get("anchor_partners")
@@ -275,15 +230,16 @@ def test_fev9_executes_bound_and_edited_join_nodes_without_the_optimizer(
     with _session() as session:
         query = quailb.queries(session)["FEV-9"][1]()
         plan = query.plan()
+        join = next(node for node in plan.nodes if isinstance(node, AiJoin))
         chain = next(node for node in plan.nodes
-                     if isinstance(node, AiFilter) and node.pin_survivors)
-        join = next(node for node in plan.nodes
-                    if isinstance(node, AiJoin) and node.anchor == chain.alias)
+                     if isinstance(node, AiFilter) and node.alias == join.anchor)
+        assert not chain.keep_kv
         edited = plan.insert(
             Barrier(node_id=f"barrier:{chain.alias}", next_anchor=chain.alias,
                     aliases=(chain.alias,)),
             between=(chain.node_id, join.node_id))
-        assert not edited.graph.node(chain.node_id).pin_survivors
+        # cut off from its join by the barrier, the chain retains KV
+        assert edited.graph.node(chain.node_id).keep_kv
         assert edited != plan
 
         seen = []
@@ -339,12 +295,13 @@ def test_classification_runs_beside_filters_and_joins(monkeypatch):
         assert [type(node).__name__ for node in plan.nodes] == [
             "Scan", "Scan", "AiFilter", "AiClassify", "LabelFilter", "AiJoin",
             "Project"]
-        # the chain streams into the classification: each claim is
-        # labeled with its KV resident; the classification streams on
-        # into the join only when the join anchors on the claims
+        # the chain, the classification, and its label filter run as
+        # one pipeline; the join joins it only when it anchors on the
+        # claims
         test, join, project = plan.nodes[4], plan.nodes[5], plan.nodes[6]
-        assert plan.nodes[2].pin_survivors
-        assert plan.nodes[3].pin_survivors == (join.anchor == "c")
+        members = build_pipelines(plan.graph)["ai_filter:c"].node_ids
+        assert members == (("ai_filter:c", "ai-classify:0", test.node_id)
+                           + ((join.node_id,) if join.anchor == "c" else ()))
         (claims_port,) = [port.source for port in join.inputs
                           if port.source.port == "ids:c"]
         assert claims_port == PortRef(test.node_id, "ids:c")

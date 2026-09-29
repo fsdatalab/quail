@@ -24,7 +24,7 @@ from quail.backends.quail.graph import (
 )
 from quail.backends.quail.retention import apply_retention, retain_after_join
 from quail.cost import budgets
-from quail.execution.runner import ExecutionContext, SurvivorStream
+from quail.execution.runner import ExecutionContext
 from quail.execution.tokens import (
     DocumentPrefixes,
     decode_payload_documents,
@@ -497,14 +497,6 @@ def _child_joins(state, sub):
     apply_retention(arena, config,
                     config.get("before", {}).get(node.node_id, {}), live)
     retain_anchor = bool(sub.get("retain_anchor"))
-    encoded_filter = sub.get("stream_filter_node")
-    filter_node = None
-    if encoded_filter is not None:
-        filter_node = registry.codecs[encoded_filter["type"]].decode(
-            encoded_filter)
-        if not isinstance(filter_node, AiFilter) \
-                or filter_node.alias != anchor_alias:
-            raise TypeError("the streamed chain must filter the anchor")
     out_joins, tokens_total = [], 0
     t0 = time.perf_counter()
     with torch.inference_mode():
@@ -530,19 +522,7 @@ def _child_joins(state, sub):
              for position, rows in sub.get("pairs", {}).items()})
         prefixes = DocumentPrefixes(pre, anchor_docs, range(len(anchor_docs)))
         anchor_keys = [(anchor_alias, g) for g in anchors_glob]
-        if filter_node is None:
-            round_kv = _join_round_kv(anchor_keys, arena)
-            anchor_stream = None
-        else:
-            # every document of this GPU's shard is an anchor; the
-            # chain's stages lead the join's
-            round_kv = None
-            anchor_stream = {
-                "node": filter_node,
-                "documents": prefixes,
-                "document_ids": anchors_glob,
-                "stream": SurvivorStream(filter_node, anchors_glob),
-            }
+        round_kv = _join_round_kv(anchor_keys, arena)
 
         def anchor_done(a, row):
             matched = any(row)
@@ -565,9 +545,9 @@ def _child_joins(state, sub):
                 ],
                 "anchor_keys": anchor_keys,
                 "anchor_done": anchor_done,
-                "anchor_stream": anchor_stream,
+                "chain": None,
                 "kv_round": round_kv,
-                "anchor_ids": None if filter_node else anchors_glob,
+                "anchor_ids": anchors_glob,
                 "partner_indices": {
                     stage.written_pos: tuples
                     for stage, tuples in zip(node.stages, tuple_globs)
@@ -578,27 +558,6 @@ def _child_joins(state, sub):
             runtime_context,
         )
         ans = result.metrics.extension["answers"]
-        filter_out = {}
-        if filter_node is not None:
-            # the join's anchors are the survivors that reached it
-            first = node.stages[0].written_pos
-            anchors_glob = list(
-                result.outputs[f"join_answers:{first}"]["anchor_index"])
-            position_of = {g: i for i, g in enumerate(anchor_keys)}
-            anchor_keys = [(anchor_alias, g) for g in anchors_glob]
-            prefixes = [prefixes[position_of[key]] for key in anchor_keys]
-            round_kv = dict(hits=result.metrics.kv_hits,
-                            misses=result.metrics.kv_misses)
-            chain = anchor_stream["stream"].finalized_result()
-            answers = chain.outputs[f"filter_answers:{anchor_alias}"]
-            filter_out = dict(
-                filters={anchor_alias: {
-                    int(document): row for document, row in answers.items()
-                }},
-                survivors={anchor_alias: list(
-                    chain.outputs[f"ids:{anchor_alias}"])},
-                filter_fresh_tokens=chain.metrics.fresh_tokens,
-            )
         last = ans[-1] if ans else {}
         for a, key in enumerate(anchor_keys):
             if not arena.is_resident(key):
@@ -630,7 +589,6 @@ def _child_joins(state, sub):
                 retained={alias: sorted(documents)
                           for alias, documents in retained.items()},
                 kv_round=round_kv,
-                **filter_out,
                 kv_totals=dict(
                     evicted_keys=arena.evicted_keys,
                     evicted_pages=arena.evicted_pages,

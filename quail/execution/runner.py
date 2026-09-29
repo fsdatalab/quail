@@ -101,82 +101,10 @@ def scalar_node_metrics(nodes: Mapping[str, "NodeResult"]) -> dict:
 
 @dataclass(frozen=True)
 class NodeResult:
-    """Outputs and metrics produced by one physical node.
-
-    A node that streams its output returns a provisional result and a
-    finalize callable; the runner calls it after the whole graph has
-    run and stores what it returns as the node's result.
-    """
+    """Outputs and metrics produced by one physical node."""
 
     outputs: Mapping[str, Any]
     metrics: NodeMetrics = NodeMetrics()
-    finalize: Callable[[], "NodeResult"] | None = None
-
-
-@dataclass
-class _SurvivorCompletion:
-    result: NodeResult | None = None
-
-
-@dataclass
-class SurvivorStream:
-    """Survivor ids a GPU operator hands its consumer as it produces them.
-
-    The consumer drives the producer's chain and completes the stream
-    with the producer's final result.
-    transforms are per-batch functions (ids -> kept ids) that
-    per-batch Foreign nodes between the producer and the consumer
-    added; the consumer runs them on each batch before admission.
-    upstream is the stream the producer itself consumed, when a
-    classification took a filter chain's survivors: the consumer
-    drives both chains and completes both streams. labels holds a
-    classification producer's label per document id as its stage
-    answers, so a label filter on the stream can gate a batch.
-    """
-
-    node: PhysicalNode
-    document_ids: Any
-    completion: _SurvivorCompletion = field(
-        default_factory=_SurvivorCompletion, repr=False)
-    transforms: tuple = ()
-    upstream: "SurvivorStream | None" = None
-    labels: dict = field(default_factory=dict, repr=False)
-
-    def with_transform(self, transform) -> "SurvivorStream":
-        """Return this stream with one more per-batch transform."""
-        return SurvivorStream(
-            self.node,
-            self.document_ids,
-            completion=self.completion,
-            transforms=self.transforms + (transform,),
-            upstream=self.upstream,
-            labels=self.labels,
-        )
-
-    def complete(self, result: NodeResult) -> None:
-        """Store the producer result after the consumer finishes."""
-        if self.completion.result is not None:
-            raise RuntimeError("survivor stream was completed twice")
-        self.completion.result = result
-
-    def finalized_result(self) -> NodeResult:
-        """Return the completed producer result."""
-        if self.completion.result is None:
-            raise RuntimeError("survivor stream was not completed")
-        return self.completion.result
-
-
-@dataclass
-class StreamedPairs:
-    """Pairs a per-batch Foreign node returns for a survivor stream.
-
-    The consuming join calls batch(ids) on each batch the stream
-    hands over, after the stream's own transforms, and reads the
-    anchor -> partner rows it fills into rows.
-    """
-
-    batch: Callable[[list], dict]
-    rows: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -228,6 +156,10 @@ class ExecutionContext:
     state: dict[str, Any] = field(default_factory=dict)
     observers: tuple[ExecutionObserver, ...] = ()
     functions: Mapping[str, Callable[..., Any]] = field(default_factory=dict)
+    # member node id -> the pipeline the executor runs it in, and the
+    # callable(pipeline, inputs by member, context) -> results by member
+    pipelines: Mapping[str, Any] = field(default_factory=dict)
+    run_pipeline: Callable[..., Mapping[str, "NodeResult"]] | None = None
 
     def execute_graph(self, graph: PhysicalGraph) -> RunResult:
         """Execute a child graph with the same model state."""
@@ -248,9 +180,10 @@ def _check_ports(node, result) -> None:
 class GenericRunner:
     """Execute nodes after all their inputs are available.
 
-    A node may return a SurvivorStream on an output port; its consumer
-    drives it. Such a node's result is provisional until the whole
-    graph has run, when the runner calls its finalize.
+    The per-document operators of one table run as a pipeline when
+    the context names one (context.pipelines): the pipeline runs at
+    its sink, once every member's outside inputs are ready, and every
+    member's result lands together.
     """
 
     def run(
@@ -267,7 +200,40 @@ class GenericRunner:
         }
         node_results: dict[str, NodeResult] = {}
 
+        def record(node, result, started=None):
+            if started is not None and result.metrics.wall_s == 0.0:
+                # runtimes that do not time themselves are timed here
+                result = replace(result, metrics=replace(
+                    result.metrics, wall_s=time.perf_counter() - started))
+            _check_ports(node, result)
+            for port, value in result.outputs.items():
+                values[(node.node_id, port)] = value
+            node_results[node.node_id] = result
+            for observer in context.observers:
+                observer.after_node(node, result)
+
+        pipelines = context.pipelines if context.run_pipeline else {}
         for node in graph.topological_nodes():
+            pipeline = pipelines.get(node.node_id)
+            if pipeline is not None and len(pipeline.members) > 1:
+                # a pipeline runs at its sink, once every member's
+                # outside inputs are ready; its members' results land
+                # together
+                if node is not pipeline.sink:
+                    continue
+                inside = set(pipeline.node_ids)
+                inputs = {
+                    member.node_id: {
+                        port.name: values[(port.source.node_id,
+                                           port.source.port)]
+                        for port in member.inputs
+                        if port.source.node_id not in inside}
+                    for member in pipeline.members}
+                started = time.perf_counter()
+                results = context.run_pipeline(pipeline, inputs, context)
+                for member in pipeline.members:
+                    record(member, results[member.node_id], started)
+                continue
             supplied = {
                 output.name: values[(node.node_id, output.name)]
                 for output in node.outputs
@@ -294,33 +260,14 @@ class GenericRunner:
                 result = context.runtimes[node.runtime_key].execute(
                     node, inputs, context
                 )
-                if result.metrics.wall_s == 0.0 and result.finalize is None:
-                    # runtimes that do not time themselves are timed here
-                    result = replace(result, metrics=replace(
-                        result.metrics,
-                        wall_s=time.perf_counter() - started,
-                    ))
-            _check_ports(node, result)
-            for port, value in result.outputs.items():
-                values[(node.node_id, port)] = value
-            node_results[node.node_id] = result
-            if result.finalize is None:
-                for observer in context.observers:
-                    observer.after_node(node, result)
+                record(node, result, started)
+                continue
+            record(node, result)
 
         root = (graph.root.node_id, graph.root.port)
         metrics = NodeMetrics()
         for node in graph.topological_nodes():
-            result = node_results[node.node_id]
-            if result.finalize is not None:
-                result = result.finalize()
-                _check_ports(node, result)
-                for port, value in result.outputs.items():
-                    values[(node.node_id, port)] = value
-                node_results[node.node_id] = result
-                for observer in context.observers:
-                    observer.after_node(node, result)
-            metrics = metrics + result.metrics
+            metrics = metrics + node_results[node.node_id].metrics
         return RunResult(values[root], node_results, metrics)
 
 
@@ -491,134 +438,116 @@ def alias_table(alias: str, ids, columns, names):
     return pa.table(arrays)
 
 
+def foreign_call(node, values, context):
+    """The apply() function of a Foreign node over ids, and its metrics.
+
+    Args:
+        node: The Foreign node.
+        values: alias -> the ids (or id table) it was given, for the
+            columns the function reads.
+        context: The execution context holding the functions and
+            column sources.
+
+    Returns:
+        (call, metrics): call(ids by alias) -> kept ids or pairs, as the
+        node's ``ids`` says, checked against what it was given;
+        metrics() -> the NodeMetrics of every call so far.
+    """
+    if not isinstance(node, Foreign):
+        raise TypeError(type(node).__name__)
+    function = context.functions.get(node.function)
+    if function is None:
+        raise KeyError(
+            f"apply() function {node.function!r} is not registered on "
+            f"this session")
+    missing = [alias for alias in node.aliases if alias not in values]
+    if missing:
+        raise GraphValidationError(
+            f"{node.node_id!r} has no id input for {missing}")
+    columns = {alias: context.sources.get(columns_key(alias))
+               for alias in node.aliases}
+    names = {alias: [column for owner, column in node.columns
+                     if owner == alias] for alias in node.aliases}
+    counters = dict(calls=0, input_rows=0, output_rows=0)
+
+    def call(ids_by_alias):
+        tables = {alias: alias_table(alias, ids, columns[alias],
+                                     names[alias])
+                  for alias, ids in ids_by_alias.items()}
+        counters["calls"] += 1
+        counters["input_rows"] += sum(
+            len(ids) for ids in ids_by_alias.values())
+        result = function(tables)
+        if node.ids == "pairs":
+            left, right = node.aliases
+            pairs = _pairs_of(result, left, right)
+            allowed = {alias: set(ids) for alias, ids in ids_by_alias.items()}
+            for a, b in pairs:
+                if a not in allowed[left] or b not in allowed[right]:
+                    raise ValueError(
+                        f"apply() {node.function!r} returned pair "
+                        f"({a}, {b}) outside its input ids")
+            counters["output_rows"] += len(pairs)
+            return pairs
+        (alias,) = node.aliases
+        kept = _ids_of(result)
+        given = set(ids_by_alias[alias])
+        if not set(kept) <= given:
+            raise ValueError(
+                f"apply() {node.function!r} returned ids it was not "
+                f"given; a function never invents an id")
+        if node.ids == "preserve" and set(kept) != given:
+            raise ValueError(
+                f"apply() {node.function!r} preserves ids but dropped "
+                f"{len(given) - len(set(kept))}")
+        counters["output_rows"] += len(kept)
+        return kept
+
+    def metrics():
+        return NodeMetrics(
+            input_rows=counters["input_rows"],
+            output_rows=counters["output_rows"],
+            extension={"calls": counters["calls"]})
+
+    return call, metrics
+
+
+def foreign_ids(node, inputs) -> dict:
+    """The ids a Foreign node was given, by alias."""
+    values = {}
+    for port in node.inputs:
+        if port.source.port.startswith("ids:"):
+            values[port.source.port.split(":", 1)[1]] = inputs[port.name]
+    return values
+
+
+def foreign_outputs(node, result) -> dict:
+    """A Foreign node's output port from what its function returned."""
+    if node.ids == "pairs":
+        return {f"pairs:{node.written_pos}":
+                pair_ids_table(*node.aliases, result)}
+    return {f"ids:{node.aliases[0]}": result}
+
+
 class ForeignRuntime:
-    """Call a user function on ids and values, once or per batch."""
+    """Call a user function once over every id it was given.
+
+    A per-batch Foreign inside a pipeline is called by the pipeline
+    on each document instead (see the executor).
+    """
 
     def execute(self, node, inputs, context) -> NodeResult:
         import pyarrow as pa
 
-        if not isinstance(node, Foreign):
-            raise TypeError(type(node).__name__)
-        function = context.functions.get(node.function)
-        if function is None:
-            raise KeyError(
-                f"apply() function {node.function!r} is not registered on "
-                f"this session")
-        values = {}
-        for port in node.inputs:
-            if port.source.port.startswith("ids:"):
-                values[port.source.port.split(":", 1)[1]] = inputs[port.name]
-        missing = [alias for alias in node.aliases if alias not in values]
-        if missing:
-            raise GraphValidationError(
-                f"{node.node_id!r} has no id input for {missing}")
-        columns = {alias: context.sources.get(columns_key(alias))
-                   for alias in node.aliases}
-        names = {alias: [column for owner, column in node.columns
-                         if owner == alias] for alias in node.aliases}
-        counters = dict(calls=0, input_rows=0, output_rows=0)
-
-        def call(ids_by_alias):
-            tables = {alias: alias_table(alias, ids, columns[alias],
-                                         names[alias])
-                      for alias, ids in ids_by_alias.items()}
-            counters["calls"] += 1
-            counters["input_rows"] += sum(
-                len(ids) for ids in ids_by_alias.values())
-            result = function(tables)
-            if node.ids == "pairs":
-                left, right = node.aliases
-                pairs = _pairs_of(result, left, right)
-                allowed = {alias: set(ids) for alias, ids in ids_by_alias.items()}
-                for a, b in pairs:
-                    if a not in allowed[left] or b not in allowed[right]:
-                        raise ValueError(
-                            f"apply() {node.function!r} returned pair "
-                            f"({a}, {b}) outside its input ids")
-                counters["output_rows"] += len(pairs)
-                return pairs
-            (alias,) = node.aliases
-            kept = _ids_of(result)
-            given = set(ids_by_alias[alias])
-            if not set(kept) <= given:
-                raise ValueError(
-                    f"apply() {node.function!r} returned ids it was not "
-                    f"given; a function never invents an id")
-            if node.ids == "preserve" and set(kept) != given:
-                raise ValueError(
-                    f"apply() {node.function!r} preserves ids but dropped "
-                    f"{len(given) - len(set(kept))}")
-            counters["output_rows"] += len(kept)
-            return kept
-
-        def metrics():
-            return NodeMetrics(
-                input_rows=counters["input_rows"],
-                output_rows=counters["output_rows"],
-                extension={"calls": counters["calls"]})
-
-        streams = {alias: value for alias, value in values.items()
-                   if isinstance(value, SurvivorStream)}
-        if len(streams) > 1:
-            raise GraphValidationError(
-                f"{node.node_id!r} reads two survivor streams")
-
-        if not streams:
-            ids_by_alias = {}
-            for alias in node.aliases:
-                value = values[alias]
-                if isinstance(value, pa.Table):
-                    value = value.column(alias).to_pylist()
-                ids_by_alias[alias] = list(value)
-            result = call(ids_by_alias)
-            if node.ids == "pairs":
-                outputs = {
-                    f"pairs:{node.written_pos}":
-                        pair_ids_table(*node.aliases, result)
-                }
-            else:
-                outputs = {f"ids:{node.aliases[0]}": result}
-            return NodeResult(outputs, metrics())
-
-        # per batch: the consuming join runs it on each batch
-        (stream_alias, stream), = streams.items()
-        produced = []
-        if node.ids == "pairs":
-            partner = next(alias for alias in node.aliases
-                           if alias != stream_alias)
-            partner_ids = list(values[partner])
-
-            def batch(ids):
-                pairs = call({stream_alias: ids, partner: partner_ids})
-                produced.extend(pairs)
-                rows = {}
-                for a, b in pairs:
-                    anchor, other = (a, b) if stream_alias == node.aliases[0] \
-                        else (b, a)
-                    rows.setdefault(anchor, []).append(other)
-                return rows
-
-            port = f"pairs:{node.written_pos}"
-            outputs = {port: StreamedPairs(batch)}
-
-            def finalize():
-                ordered = produced if stream_alias == node.aliases[0] \
-                    else [(b, a) for a, b in produced]
-                return NodeResult(
-                    {port: pair_ids_table(*node.aliases, ordered)}, metrics())
-        else:
-            def batch(ids):
-                kept = call({stream_alias: ids})
-                produced.extend(kept)
-                return kept
-
-            port = f"ids:{stream_alias}"
-            outputs = {port: stream.with_transform(batch)}
-
-            def finalize():
-                return NodeResult({port: sorted(produced)}, metrics())
-
-        return NodeResult(outputs, finalize=finalize)
+        values = foreign_ids(node, inputs)
+        call, metrics = foreign_call(node, values, context)
+        ids_by_alias = {}
+        for alias in node.aliases:
+            value = values[alias]
+            if isinstance(value, pa.Table):
+                value = value.column(alias).to_pylist()
+            ids_by_alias[alias] = list(value)
+        return NodeResult(foreign_outputs(node, call(ids_by_alias)), metrics())
 
 
 class RecombineRuntime:

@@ -93,14 +93,13 @@ def fused_graph():
         AiFilter(
             node_id="filter:r",
             inputs=input_ports((PortRef("input:r", "ids:r"),)),
-            alias="r", arena_writes=True, pin_survivors=True,
+            alias="r", arena_writes=True,
             stages=(FilterStage(0, 1, 0, 0.8, 14 * 0.8),),
             question_token_ids=((QUESTION,),)),
         AiClassify(
             node_id="classify:r",
             inputs=input_ports((PortRef("filter:r", "ids:r"),)),
-            backend_name="quail", model="qwen3-4b-fp8", spec=spec,
-            pin_survivors=True),
+            backend_name="quail", model="qwen3-4b-fp8", spec=spec),
         LabelFilter(
             node_id="label:r",
             inputs=input_ports((PortRef("classify:r", "scores"),)),

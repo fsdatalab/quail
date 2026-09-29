@@ -13,18 +13,17 @@ from quail.backends.quail import expected_join_stages
 from quail.catalog import Catalog, DocumentProvider
 from quail.cost.sol import speed_of_light
 from quail.cost.work import ask, scan, stream
+from quail.execution.pipelines import build_pipelines
 from quail.frontend.builder import col, docs, prompt
 from quail.physical import (
     AiFilter,
     AiJoin,
     Barrier,
     Foreign,
-    GraphValidationError,
     PhysicalGraph,
     PortRef,
     Project,
     Scan,
-    validate_streams,
 )
 from quail.physical.base import input_ports
 from quail.planner.decide import explain, filter_cost, order_filters, plan_query
@@ -514,14 +513,16 @@ def _apply_query(session, kind):
             .select("c.id", "e.id"))
 
 
-def test_foreign_node_placement_and_pinned_edge_validation():
+def test_foreign_node_placement_and_pipelines():
     # claims are the long side, so the planner anchors on them
     with _claims_session() as session:
         per_batch = _apply_query(session, "per_batch").plan()
         chain = per_batch.graph.node("ai_filter:c")
         foreign = per_batch.graph.node("apply:keep_even")
         join = per_batch.graph.nodes_by_type(AiJoin.type_name)[0]
-        assert chain.pin_survivors
+        # the chain, the per-batch apply, and the join run as one pipeline
+        assert build_pipelines(per_batch.graph)[chain.node_id].node_ids == (
+            chain.node_id, foreign.node_id, join.node_id)
         assert isinstance(foreign, Foreign) and foreign.kind == "per_batch"
         assert foreign.inputs[0].source == PortRef("ai_filter:c", "ids:c")
         assert PortRef("apply:keep_even", "ids:c") in {
@@ -531,7 +532,8 @@ def test_foreign_node_placement_and_pinned_edge_validation():
         assert "Foreign: keep_even (per_batch, drop) on c" in text
         # a barrier needs every survivor at once: the chain materializes
         barrier = _apply_query(session, "barrier").plan()
-        assert not barrier.graph.node("ai_filter:c").pin_survivors
+        assert build_pipelines(barrier.graph)["ai_filter:c"].node_ids == (
+            "ai_filter:c",)
         assert barrier.graph.node("apply:keep_even").kind == "barrier"
         request = _apply_query(session, "barrier")._prepare_physical()
         assert request.column_tables()["c"].column_names == ["c", "url"]
@@ -548,20 +550,27 @@ def test_foreign_node_placement_and_pinned_edge_validation():
         assert isinstance(plan, Refusal)
         assert plan.constraint == "apply_needs_quail_backend"
 
-    validate_streams(two_alias_graph(True, foreign=("per_batch", "drop")))
-    validate_streams(two_alias_graph(True, foreign=("per_batch", "pairs")))
-    with pytest.raises(GraphValidationError, match="per-batch apply"):
-        validate_streams(two_alias_graph(True, foreign=("barrier", "drop")))
-    with pytest.raises(GraphValidationError, match="per-batch apply"):
-        validate_streams(two_alias_graph(True, foreign=("barrier", "pairs")))
+    def chains(graph):
+        return sorted({pipeline.node_ids
+                       for pipeline in build_pipelines(graph).values()})
+
+    assert chains(two_alias_graph(True)) == [("filter:r", "group:0")]
+    assert chains(two_alias_graph(True, foreign=("per_batch", "drop"))) == [
+        ("filter:r", "apply:keep_even", "group:0")]
+    assert chains(two_alias_graph(True, foreign=("per_batch", "pairs"))) == [
+        ("filter:r", "apply:same_key", "group:0")]
+    # a barrier apply and a Barrier each need every survivor at once
+    assert chains(two_alias_graph(True, foreign=("barrier", "drop"))) == [
+        ("filter:r",), ("group:0",)]
+    assert chains(two_alias_graph(False)) == [("filter:r",), ("group:0",)]
     graph = two_alias_graph(True)
+    # a join reading the scan takes nothing from the chain
     orphan = PhysicalGraph(
         tuple(node for node in graph.nodes if node.node_id != "group:0")
         + (graph.node("group:0").with_inputs(input_ports(
             (PortRef("input:r", "ids:r"), PortRef("input:p", "ids:p")))),),
         graph.root)
-    with pytest.raises(GraphValidationError, match="no join or classification"):
-        validate_streams(orphan)
+    assert chains(orphan) == [("filter:r",), ("group:0",)]
 
 
 def _big_plan(catalog):
@@ -580,9 +589,10 @@ def test_node_ids_estimates_and_the_recompute_column(catalog):
     assert [node.node_id for node in plan.nodes] == [
         "scan:r", "scan:p", "ai_filter:r", "ai_join:r", "project"]
     chain = plan.graph.node("ai_filter:r")
-    assert chain.pin_survivors and not chain.keep_kv
+    assert not chain.keep_kv
+    assert build_pipelines(plan.graph)["ai_filter:r"].node_ids == (
+        "ai_filter:r", "ai_join:r")
     assert plan.graph.node("ai_join:r").anchor_resident == "filter"
-    assert any("streams its survivors" in r for r in plan.remarks)
     seconds = {node_id: entry["seconds"]
                for node_id, entry in plan.estimates.items()
                if "seconds" in entry}
@@ -598,10 +608,9 @@ def test_node_ids_estimates_and_the_recompute_column(catalog):
     assert recompute["release_recompute_seconds"] > 0
     text = explain(logical, plan)
     assert "est. time" in text
-    assert "if the KV were released here instead of pinned" in text
+    assert "expected recompute at the join if the chain's KV is released" in text
     assert "do not add up to the plan estimate" in text
-    assert "KV: anchor=streamed from its filter" in text
-    assert "survivors stream into the join with KV pinned" in text
+    assert "KV: anchor=from filters" in text
     assert _cell(text, "AiJoin: anchor=")[-1] in ("ms", "s")
     assert _cell(text, "join 1 full (")[-1] == "10%"
     assert "expected_tuples=" not in text
@@ -612,24 +621,24 @@ def test_node_ids_estimates_and_the_recompute_column(catalog):
     assert [node.node_id for node in edited.nodes] == [
         "scan:r", "scan:p", "ai_filter:r", "barrier:r", "ai_join:r", "project"]
     new_chain = edited.graph.node("ai_filter:r")
-    assert not new_chain.pin_survivors and new_chain.keep_kv
-    assert new_chain.hold_tokens == 0
+    assert new_chain.keep_kv
+    assert build_pipelines(edited.graph)["ai_filter:r"].node_ids == (
+        "ai_filter:r",)
     assert edited.graph.node("barrier:r").inputs[0].source.node_id == "ai_filter:r"
     assert [port.source.node_id for port in edited.graph.node("ai_join:r").inputs] == [
         "barrier:r", "scan:p"]
-    # unpinned, a survivor holds no frame room, so a few more fit
     assert edited.estimates["ai_filter:r"]["release_recompute_tokens"] == \
-        pytest.approx(recompute["release_recompute_tokens"], rel=0.01)
+        recompute["release_recompute_tokens"]
     assert "expected recompute at the join" in explain(logical, edited)
     assert edited.estimated_seconds == pytest.approx(
         plan.estimated_seconds
         + edited.estimates["ai_filter:r"]["release_recompute_seconds"])
-    assert plan.graph.node("ai_filter:r").pin_survivors
+    assert not plan.graph.node("ai_filter:r").keep_kv
     assert edited.remove("barrier:r") == plan
     moved = edited.move("barrier:r", between=("scan:r", "ai_filter:r"))
     assert [node.node_id for node in moved.nodes][:4] == [
         "scan:r", "scan:p", "barrier:r", "ai_filter:r"]
-    assert moved.graph.node("ai_filter:r").pin_survivors
+    assert not moved.graph.node("ai_filter:r").keep_kv
 
 
 def _int_tokens(text):

@@ -26,9 +26,15 @@ from quail.execution.reranker import (
     RerankerModelExecution,
     _score_table,
     classify_outputs,
+    filter_scores,
     scored_batch,
 )
-from quail.execution.runner import NodeMetrics, NodeResult, SurvivorStream
+from quail.execution.runner import (
+    NodeMetrics,
+    NodeResult,
+    foreign_call,
+    foreign_outputs,
+)
 from quail.execution.tokens import DocumentKeys, DocumentPrefixes, prefix_tree
 from quail.logical import Alias, LabelIn, is_score, shared_preamble
 from quail.logical.prompts import true_false_token_ids
@@ -38,6 +44,8 @@ from quail.physical import (
     AiJoin,
     AiScore,
     Barrier,
+    Foreign,
+    LabelFilter,
     PhysicalNode,
 )
 from quail.planner import plan_quail
@@ -102,10 +110,6 @@ class QuailModelExecution:
             self._state["model_spec"] = self.context.model
             if "score_rows" in inputs:
                 return execution.execute_rows(node, inputs["score_rows"])
-            if isinstance(node, AiClassify):
-                streamed = self._streamed_classify(node, inputs)
-                if streamed is not None:
-                    return streamed
             return execution.execute(node, inputs["score_inputs"])
         if not isinstance(node, (AiFilter, AiJoin)):
             raise TypeError(
@@ -128,75 +132,113 @@ class QuailModelExecution:
             self._reranker = execution
         return execution
 
-    def _streamed_classify(self, node: AiClassify, inputs) -> NodeResult | None:
-        """Run a classification that takes or hands over a survivor stream.
+    def execute_pipeline(self, pipeline, inputs, context) -> dict:
+        """Run one table's chain of per-document operators as one run.
 
-        A classification whose documents stream into the join anchored
-        on its alias returns a stream itself; the join drives its
-        stages. One that takes a filter chain's stream drives the
-        chain's stages ahead of its own, so a survivor is classified
-        with its KV resident. Returns None for a classification that
-        does neither.
+        The members' stages are concatenated and driven by one stage
+        scheduler over the documents the first member was given, so a
+        document goes through every operator with its KV resident. A
+        label filter or per-batch apply between two stages gates the
+        next stage; one after the last stage runs over the documents
+        that came out of it.
+
+        Args:
+            pipeline: The Pipeline (quail.execution.pipelines).
+            inputs: Member node id -> its inputs from outside the
+                pipeline, by port name.
+            context: The graph's execution context.
+
+        Returns:
+            Node id -> NodeResult for every member.
         """
-        (value,) = inputs["score_inputs"].values()
-        stream = value if isinstance(value, SurvivorStream) else None
-        (alias,) = node.spec.aliases
-        if node.pin_survivors:
-            ids = stream.document_ids if stream is not None else list(value)
-            out = SurvivorStream(node, ids, upstream=stream)
-            return NodeResult({"scores": out, f"ids:{alias}": out},
-                              finalize=out.finalized_result)
-        if stream is None:
-            return None
         state = self._state
-        async_answers = state["async_answers"]
-        parts = self._chain_parts(stream, async_answers)
-        own = self._classify_part(None, node, stream.document_ids)
-        stages = [stage for part in parts for stage in part.stages] + own.stages
-        prefixes = DocumentPrefixes(inputs["pre"], inputs["documents"][alias],
-                                    stream.document_ids)
-        root = parts[0].node
-        stats = {}
-        every, spans, tokens = run_stages(
-            state["torch"], state["arena"], state["pipeline"], stages,
-            prefixes, state["chunk_tokens"],
-            anchor_keys=DocumentKeys(alias, stream.document_ids),
-            attention_mode=getattr(root, "attention", None) or None,
-            prefix_tree=_prefix_tree(root, prefixes, state["arena"]),
-            stats=stats, staging=_staging(state),
-            on_chunk=lambda transitions: _report_chain_transitions(
-                parts, transitions),
-            label=f"classify {node.spec.name}")
-        return _complete_chain(parts + [own], every, spans, tokens, stats,
-                               state["torch"], inputs)
-
-    def _chain_parts(self, stream: SurvivorStream, async_answers) -> list:
-        """The chain a stream stands for, upstream first, as stage parts."""
+        state["gpu_timing"] = bool(context.state.get("gpu_timing", False))
+        members = list(pipeline.members)
+        alias = pipeline.alias
+        first = members[0]
+        (source,) = inputs[first.node_id].values()
+        ids = list(source)
+        gpu_inputs = {"gpu_timing": context.state.get("gpu_timing", False)}
+        # the members with stages, then the gates after the last of them
+        last_staged = max(index for index, member in enumerate(members)
+                          if isinstance(member, (AiFilter, AiClassify, AiJoin)))
+        staged, trailing = members[:last_staged + 1], members[last_staged + 1:]
         parts = []
-        if stream.upstream is not None:
-            parts = self._chain_parts(stream.upstream, async_answers)
-        node = stream.node
-        if isinstance(node, AiFilter):
-            parts.append(_FilterPart(stream, node, stream.document_ids,
-                                     async_answers))
-        elif isinstance(node, AiClassify):
-            parts.append(self._classify_part(stream, node, stream.document_ids))
+        for member in staged[:-1]:
+            parts.append(self._part(member, ids, parts, inputs, context))
+        prefixes = DocumentPrefixes(context.state["pre"],
+                                    context.state["docs"][alias], ids)
+        sink = staged[-1]
+        results = {}
+        if isinstance(sink, AiJoin):
+            chain = {"documents": prefixes, "document_ids": ids,
+                     "parts": parts,
+                     "pairs": {part.node.written_pos: part.rows
+                               for part in parts
+                               if isinstance(part, _ApplyGate)
+                               and part.node.ids == "pairs"}}
+            join_inputs = context.model_inputs(
+                sink, inputs[sink.node_id], context, chain)
+            results[sink.node_id] = self._execute_quail_node(sink, join_inputs)
+            context.model_result(sink, results[sink.node_id], context)
         else:
-            raise TypeError(
-                f"{node.type_name!r} does not stream its survivors")
-        return parts
+            own = self._part(sink, ids, parts, inputs, context)
+            stages = _gated_stages(parts + [own])
+            stats = {}
+            every, spans, tokens = run_stages(
+                state["torch"], state["arena"], state["pipeline"], stages,
+                prefixes, state["chunk_tokens"],
+                anchor_keys=DocumentKeys(alias, ids),
+                attention_mode=getattr(first, "attention", None) or None,
+                prefix_tree=_prefix_tree(first, prefixes, state["arena"]),
+                stats=stats, staging=_staging(state),
+                on_chunk=lambda transitions: _report_chain_transitions(
+                    parts + [own], transitions),
+                label=f"pipeline {alias} ({len(stages)} stages)")
+            _complete_chain(parts + [own], every, spans, tokens, stats,
+                            state["torch"], gpu_inputs)
+        for part in parts:
+            results[part.node.node_id] = part.result_value
+        if not isinstance(sink, AiJoin):
+            results[sink.node_id] = own.result_value
+        # gates after the last stage read the documents that came out
+        for member in trailing:
+            member_inputs = dict(inputs[member.node_id])
+            for port in member.inputs:
+                if port.source.node_id in results:
+                    member_inputs[port.name] = results[
+                        port.source.node_id].outputs[port.source.port]
+            results[member.node_id] = context.runtimes[
+                member.runtime_key].execute(member, member_inputs, context)
+        return results
 
-    def _classify_part(self, stream, node, ids) -> "_ClassifyPart":
-        position = {document: index for index, document in enumerate(ids)}
-        labels = stream.labels if stream is not None else None
-
-        def on_label(index, label):
-            if labels is not None:
-                labels[ids[index]] = label
-
-        plan = ClassifyStages(self._state, node.spec, len(ids),
-                              lambda key: position[key[1]], on_label)
-        return _ClassifyPart(stream, node, ids, plan)
+    def _part(self, node, ids, parts, inputs, context):
+        """The pipeline part for one member, after the parts before it."""
+        if isinstance(node, AiFilter):
+            return _FilterPart(node, ids, self._state["async_answers"])
+        if isinstance(node, AiClassify):
+            position = {document: index for index, document in enumerate(ids)}
+            plan = ClassifyStages(self._state, node.spec, len(ids),
+                                  lambda key: position[key[1]])
+            return _ClassifyPart(node, ids, plan)
+        if isinstance(node, LabelFilter):
+            labeled = next(part for part in reversed(parts)
+                           if isinstance(part, _ClassifyPart)
+                           and part.node.spec.name == node.score_name)
+            return _LabelGate(node, labeled)
+        if isinstance(node, Foreign):
+            values = {}
+            for port in node.inputs:
+                if not port.source.port.startswith("ids:"):
+                    continue
+                port_alias = port.source.port.split(":", 1)[1]
+                values[port_alias] = (
+                    ids if port.source.node_id in {
+                        part.node.node_id for part in parts}
+                    else inputs[node.node_id][port.name])
+            call, metrics = foreign_call(node, values, context)
+            return _ApplyGate(node, call, metrics, values)
+        raise TypeError(f"{node.type_name!r} is not a pipeline operator")
 
     def _execute_quail_node(
         self,
@@ -219,16 +261,6 @@ class QuailModelExecution:
 
         if isinstance(node, AiFilter):
             document_ids = inputs["document_ids"]
-            if node.pin_survivors:
-                stream = SurvivorStream(node, document_ids)
-
-                return NodeResult(
-                    outputs={
-                        f"ids:{node.alias}": stream,
-                        f"filter_answers:{node.alias}": {},
-                    },
-                    finalize=stream.finalized_result,
-                )
             retain_survivors = inputs.get("retain_survivors", ())
             if retain_survivors is False:
                 retain_survivors = ()
@@ -261,7 +293,7 @@ class QuailModelExecution:
                 pack_s=stats.get("pack_s", 0.0))
 
         stage_frames = inputs["stage_frames"]
-        stream = inputs.get("anchor_stream")
+        chain = inputs.get("chain")
         lists_for = inputs.get("anchor_partners")
         join_stages = [
             Stage(suffixes=suffixes, readout=async_answers, frame=frame,
@@ -274,27 +306,17 @@ class QuailModelExecution:
         join_stats = {}
         leading = 0
         parts = []
-        if stream is not None:
+        if chain is not None:
             # the chain's stages lead the join's: a survivor goes on to
-            # the join with its KV resident
-            filter_ids = stream["document_ids"]
-            parts = self._chain_parts(stream["stream"], async_answers)
-            stages = [stage for part in parts
-                      for stage in part.stages] + join_stages
+            # the join with its KV resident, past the chain's gates
+            filter_ids = chain["document_ids"]
+            parts = chain["parts"]
+            join_part = _StagesPart(join_stages)
+            stages = _gated_stages(parts + [join_part])
             leading = len(stages) - len(join_stages)
-            batch = inputs.get("anchor_batch")
-            first = join_stages[0].requests
-            if batch is not None:
-                # per-batch transforms between the chain and the join
-                # run on each survivor as it reaches the join
-                def gated(key, first=first):
-                    if not batch([key]):
-                        return Stage.DROP
-                    return None if first is None else first(key)
-                join_stages[0].requests = gated
-            root = parts[0].node
-            prefixes = stream["documents"]
-            anchor_keys = DocumentKeys(_stream_alias(root), filter_ids)
+            root = parts[0].node if parts else node
+            prefixes = chain["documents"]
+            anchor_keys = DocumentKeys(node.anchor, filter_ids)
             tree = _prefix_tree(root, prefixes, arena)
             attention = (node.attention or getattr(root, "attention", None)
                          or None)
@@ -321,7 +343,7 @@ class QuailModelExecution:
             on_chunk=on_chunk, label=f"join ({len(join_stages)} stages)",
             staging=_staging(self._state))
         answers = every[leading:]
-        if stream is not None:
+        if chain is not None:
             # the join packs frames and partner suffixes; the rest is the chain's
             join_tokens = _streamed_tokens(join_stages, answers, lists_for,
                                            anchor_keys)
@@ -337,6 +359,9 @@ class QuailModelExecution:
             kv_round = {"hits": len(reached), "misses": 0}
             _complete_chain(parts, every[:leading], spans, tokens - join_tokens,
                             join_stats, torch, inputs)
+            for part in parts:
+                if part.result_value is None:
+                    raise RuntimeError("a pipeline part finished without a result")
             join_stats = {}
             spans = [span for span in spans if span[0] >= leading]
             tokens = join_tokens
@@ -405,18 +430,31 @@ def _staging(state):
     return state["input_staging"]
 
 
-def _stream_alias(node) -> str:
-    """The alias whose documents a streaming node hands over."""
-    if isinstance(node, AiFilter):
-        return node.alias
-    return node.spec.aliases[0]
+class _StagesPart:
+    """Stages the sink of a pipeline adds after the parts before it."""
+
+    node = None
+    gate = None
+    document_done = None
+    result_value = None
+
+    def __init__(self, stages):
+        self.stages = stages
+
+    def finish(self, every):
+        return None
+
+    def result(self, tokens, gpu_s, chunks, stats):
+        return None
 
 
 class _FilterPart:
-    """A filter chain's stages inside a run its consumer drives."""
+    """A filter chain's stages inside a pipeline."""
 
-    def __init__(self, stream, node, ids, async_answers):
-        self.stream = stream
+    gate = None
+    result_value = None
+
+    def __init__(self, node, ids, async_answers):
         self.node = node
         self.ids = ids
         self.stages = filter_stages(
@@ -440,22 +478,25 @@ class _FilterPart:
 
 
 class _ClassifyPart:
-    """A classification's stages inside a run its consumer drives.
+    """A classification's stages inside a pipeline."""
 
-    Without a stream the part is the consumer's own classification
-    and its result is returned instead of completing a stream.
-    """
-
+    gate = None
     document_done = None
+    result_value = None
 
-    def __init__(self, stream, node, ids, plan: ClassifyStages):
-        self.stream = stream
+    def __init__(self, node, ids, plan: ClassifyStages):
         self.node = node
         self.ids = ids
         self.plan = plan
         self.stages = plan.stages
         self.reached = 0
         self.label_tokens = 0
+
+    def label(self, document) -> str | None:
+        """The document's label so far, by its id."""
+        return self.plan.labels[0][self.ids.index(document)] \
+            if not hasattr(self, "_position") else \
+            self.plan.labels[0][self._position[document]]
 
     def finish(self, every) -> int:
         """Label the documents; returns the frame and suffix tokens packed."""
@@ -494,6 +535,100 @@ class _ClassifyPart:
             }))
 
 
+class _LabelGate:
+    """A label filter between two stages: it gates on the label read."""
+
+    stages = ()
+    document_done = None
+    result_value = None
+
+    def __init__(self, node, labeled: _ClassifyPart):
+        self.node = node
+        self.labeled = labeled
+        self.accepted = set(node.accepted)
+        self.position = {document: index
+                         for index, document in enumerate(labeled.ids)}
+
+    def gate(self, key):
+        label = self.labeled.plan.labels[0][self.position[key[1]]]
+        return None if label in self.accepted else Stage.DROP
+
+    def finish(self, every):
+        return None
+
+    def result(self, tokens, gpu_s, chunks, stats) -> NodeResult:
+        return filter_scores(self.node,
+                             self.labeled.result_value.outputs["scores"])
+
+
+class _ApplyGate:
+    """A per-batch apply between two stages, called on each document."""
+
+    stages = ()
+    document_done = None
+    result_value = None
+
+    def __init__(self, node, call, metrics, values):
+        self.node = node
+        self.call = call
+        self.metrics = metrics
+        self.values = values
+        self.produced = []
+        self.rows = {}          # anchor -> partners, for pairs
+
+    def gate(self, key):
+        document = key[1]
+        node = self.node
+        if node.ids == "pairs":
+            partner = next(alias for alias in node.aliases
+                           if alias != key[0])
+            partners = list(self.values[partner])
+            pairs = self.call({key[0]: [document], partner: partners})
+            self.produced.extend(pairs)
+            mine = [b if a == document else a for a, b in pairs]
+            if not mine:
+                return Stage.DROP
+            self.rows[document] = mine
+            return None
+        kept = self.call({key[0]: [document]})
+        self.produced.extend(kept)
+        return None if kept else Stage.DROP
+
+    def finish(self, every):
+        return None
+
+    def result(self, tokens, gpu_s, chunks, stats) -> NodeResult:
+        return NodeResult(foreign_outputs(self.node, self.produced),
+                          self.metrics())
+
+
+def _gated_stages(parts) -> list:
+    """The parts' stages in order; each gate guards the next stage."""
+    stages = []
+    pending = []
+    for part in parts:
+        if not part.stages:
+            pending.append(part.gate)
+            continue
+        first = part.stages[0]
+        if pending:
+            gates = list(pending)
+            asked = first.requests
+
+            def guarded(key, gates=gates, asked=asked):
+                for gate in gates:
+                    if gate(key) is Stage.DROP:
+                        return Stage.DROP
+                return None if asked is None else asked(key)
+
+            first.requests = guarded
+            pending = []
+        stages.extend(part.stages)
+    if pending:
+        raise ValueError("a pipeline ends with a gate and no stage after it")
+    return stages
+
+
 def _part_slices(parts) -> list:
     offset = 0
     slices = []
@@ -517,30 +652,25 @@ def _report_chain_transitions(parts, transitions) -> None:
 
 
 def _complete_chain(parts, every, spans, tokens, stats, torch, inputs):
-    """Finish every part of a driven chain and complete its streams.
+    """Finish every part of a driven chain and store its result.
 
     tokens are the run's fresh tokens less the consumer's own. The
-    first part, which packed the documents, takes them less the frames
-    and suffixes of the parts after it; prefix borrowing and packing
-    time go to it as well. Returns the result of the part without a
-    stream, the consumer's own, when there is one.
+    first part with stages, which packed the documents, takes them
+    less the frames and suffixes of the parts after it; prefix
+    borrowing and packing time go to it as well.
     """
     slices = _part_slices(parts)
     own = [part.finish(every[low:high])
            for part, (low, high) in zip(parts, slices)]
-    remainder = tokens - sum(count for count in own[1:] if count)
-    returned = None
+    staged = [index for index, part in enumerate(parts) if part.stages]
+    remainder = tokens - sum(own[index] or 0 for index in staged[1:])
     for index, (part, (low, high)) in enumerate(zip(parts, slices)):
         part_spans = [span for span in spans if low <= span[0] < high]
-        result = part.result(
-            remainder if index == 0 else own[index],
+        part.result_value = part.result(
+            remainder if staged and index == staged[0] else (own[index] or 0),
             _gpu_seconds(torch, part_spans, inputs),
-            _chunks(part_spans, inputs), stats if index == 0 else {})
-        if part.stream is None:
-            returned = result
-        else:
-            part.stream.complete(result)
-    return returned
+            _chunks(part_spans, inputs), stats if staged and index == staged[0]
+            else {})
 
 
 def _streamed_tokens(join_stages, answers, lists_for, anchor_keys) -> int:

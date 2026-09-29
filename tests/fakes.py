@@ -22,6 +22,7 @@ from quail.builtins import built_in_registry
 from quail.physical import (
     AiFilter,
     AiJoin,
+    Barrier,
     FilterStage,
     Foreign,
     HashJoin,
@@ -194,64 +195,13 @@ def expected_filter_rows(filter_truth):
     return rows
 
 
-def run_streamed(monkeypatch, *, doc_lengths, filter_truth, partner_lengths,
-                 join_truth, budget, pages, frame_tokens=3, stages=2,
-                 anchor_partners=None):
-    """Run a filter chain's stages and then a join's over the same documents.
-
-    Returns the chain's answers per document, the join's answers keyed
-    by the survivors' order, the keys of the survivors, and the keys
-    settled at the end.
-    """
-    from quail.backends.quail.executor.stages import (
-        Stage,
-        filter_stages,
-        run_stages,
-    )
-
-    monkeypatch.setattr(loop, "pack_chunk", fake_pack)
-    model = FakeModel(filter_truth, join_truth)
-    pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
-    answers = SimpleNamespace(submit=lambda v: v, result=lambda v: v,
-                              dtype=None)
-    arena = cpu_arena(pages)
-    docs = [[DOC + d] * n for d, n in enumerate(doc_lengths)]
-    questions = [[QUESTION + s] for s in range(stages)]
-    keys = [("r", d) for d in range(len(docs))]
-    frame = [FRAME] * frame_tokens
-    suffixes = [[PARTNER + i] * n for i, n in enumerate(partner_lengths)]
-    settled = {}
-
-    def on_settled(local, survived, row):
-        settled[keys[local]] = list(row)
-        arena.free_key(keys[local])
-
-    stage_list = filter_stages(questions, answers) + [Stage(
-        suffixes=suffixes, readout=answers, frame=frame,
-        requests=(None if anchor_partners is None
-                  else (lambda key: anchor_partners(key)[0])))]
-    every, _, tokens = run_stages(
-        fake_torch(), arena, pipeline, stage_list, docs, budget,
-        anchor_keys=keys, on_settled=on_settled)
-    filter_answers = {}
-    for stage in every[:stages]:
-        for doc, row in stage.items():
-            filter_answers.setdefault(doc, []).append(int(row[0]))
-    survivors = [doc for doc, row in sorted(filter_answers.items())
-                 if len(row) == stages and all(row)]
-    join_answers = [{local: list(every[stages][doc])
-                     for local, doc in enumerate(survivors)
-                     if doc in every[stages]}]
-    return dict(model=model, arena=arena, filter_answers=filter_answers,
-                join_answers=join_answers, join_tokens=tokens,
-                anchor_keys=[keys[doc] for doc in survivors], settled=settled)
-
-
-def two_alias_graph(pin_survivors, *, stages=1, hash_join=False, foreign=None):
+def two_alias_graph(pipelined, *, stages=1, hash_join=False, foreign=None):
     """R's filter chain into a join with p.
 
     Args:
-        pin_survivors: Whether the chain streams into the join.
+        pipelined: Whether the chain and the join run as one pipeline;
+            otherwise a Barrier between them materializes the
+            survivors and the chain retains their KV.
         stages: Filter stages on r.
         hash_join: Pair r and p on their "key" columns with a HashJoin
             over the scans that feeds the join its pairs port.
@@ -261,14 +211,18 @@ def two_alias_graph(pin_survivors, *, stages=1, hash_join=False, foreign=None):
     chain = AiFilter(
         node_id="filter:r",
         inputs=input_ports((PortRef("input:r", "ids:r"),)),
-        alias="r", arena_writes=True, pin_survivors=pin_survivors,
-        keep_kv=not pin_survivors, hold_tokens=1 if pin_survivors else 0,
+        alias="r", arena_writes=True, keep_kv=not pipelined,
         stages=tuple(FilterStage(s, 1, 0, 0.8 - 0.1 * s, 14 * 0.8 ** s)
                      for s in range(stages)),
         question_token_ids=tuple((QUESTION + s,) for s in range(stages)))
     nodes = [Scan(node_id="input:r", alias="r", input_id="r"), chain,
              Scan(node_id="input:p", alias="p", input_id="p")]
     anchor_src = PortRef("filter:r", "ids:r")
+    if not pipelined:
+        nodes.append(Barrier(node_id="barrier:r",
+                             inputs=input_ports((anchor_src,)),
+                             next_anchor="r", aliases=("r",)))
+        anchor_src = PortRef("barrier:r", "ids:r")
     join_inputs = []
     pairs_from = ""
     if hash_join:
@@ -295,7 +249,7 @@ def two_alias_graph(pin_survivors, *, stages=1, hash_join=False, foreign=None):
             function="keep_even", kind=foreign[0], ids=foreign[1],
             columns=(), aliases=("r",)))
         anchor_src = PortRef("apply:keep_even", "ids:r")
-    resident = "filter" if pin_survivors else "none"
+    resident = "filter" if pipelined else "none"
     nodes.append(AiJoin(
         node_id="group:0", anchor="r", anchor_resident=resident,
         inputs=input_ports((anchor_src, PortRef("input:p", "ids:p"),

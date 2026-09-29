@@ -112,8 +112,9 @@ edited = plan.insert(
 ```
 
 In the edited plan, the barrier sits between the filter and the join.
-The filter's `pin_survivors` changes from `True` to `False` because
-survivors no longer stream directly into the join:
+The filter's `keep_kv` changes from `False` to `True`: the filter and
+the join no longer run as one pipeline, so the filter retains its
+survivors' KV for the join instead:
 
 ```text
       Barrier: next_anchor=c

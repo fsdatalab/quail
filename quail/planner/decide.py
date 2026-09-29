@@ -281,7 +281,7 @@ def node_estimates(graph, *, filter_works, stage_works, live, stats, pre,
             if node.alias in anchored:
                 mean = stats[node.alias].mean_doc_tokens
                 prefix = pre + mean
-                pages = -(-(prefix + node.hold_tokens) // budgets.PAGE_TOKENS)
+                pages = -(-prefix // budgets.PAGE_TOKENS)
                 fits = cap_pages // max(1, pages)
                 excess = max(0.0, live.get(node.alias, 0.0) - fits)
                 entry["release_recompute_tokens"] = round(excess * prefix)
@@ -595,32 +595,29 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
                    for apply in join_applies.get(spec["written_pos"], ())):
                 barrier_aliases.add(anchor)
     joined = {argument.alias for join in joins for argument in join.prompt.args}
-    # a classification's stages run inside the chain of its alias on
-    # one GPU with a causal model: the label readout serves its own
-    # stages, which a diffusion model's canvas readout cannot
-    fusable = {alias for alias in classified
-               if gpus == 1 and not model.canvas_tokens
-               and sum(owner == alias for _, owner in labels.calls) == 1}
-    # the classification sits between the alias's filters and its join
+    # a chain whose first use is the join anchored on it runs in that
+    # join's pipeline, on one GPU, unless a diffusion model's
+    # classification sits between them (its readout reads whole chunks,
+    # so it runs alone); such a chain's KV needs no retention pool
     between = {alias for alias in classified
                if not (classify_after_joins and alias in joined)}
-    streamed = {}
+    chained = set()
     partner_before = set()
-    for index, group in enumerate(sequence_groups):
+    for group in sequence_groups:
         anchor = group[0][1]
-        chain = ((anchor in ask_filters and anchor not in between)
-                 or (anchor in between and anchor in fusable))
-        if chain and anchor not in streamed \
+        if workers == 1 and anchor in ask_filters \
+                and not (anchor in between and model.canvas_tokens) \
+                and anchor not in chained \
                 and anchor not in partner_before \
                 and anchor not in barrier_aliases:
-            streamed[anchor] = index
+            chained.add(anchor)
         for spec, _ in group:
             for alias in spec["aliases"]:
-                if alias != anchor and alias not in streamed:
+                if alias != anchor and alias not in chained:
                     partner_before.add(alias)
     retention_plan["initial"] = {
         alias: use for alias, use in retention_plan["initial"].items()
-        if alias not in streamed
+        if alias not in chained
     }
     retention_plan.update(**costs, cap_pages=cap_pages)
     forced = sorted({s["anchor"] for s in specs
@@ -692,6 +689,12 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
         nodes.append(node)
         pairs_src[node.written_pos] = node
 
+    # aliases whose filter chain runs in one pipeline with the
+    # classification or join after it
+    pipelined = chained | {
+        alias for alias in ask_filters
+        if workers == 1 and alias in between and not model.canvas_tokens}
+
     def emit_filter(alias):
         order_idx = filter_orders[alias]
         n = stats[alias].n_docs
@@ -706,30 +709,17 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
                 expected_docs=round(n * surv, 1)))
             surv *= effective_selectivity(p.selectivity)
         keep = alias in retention_plan["initial"]
-        pinned = alias in streamed or alias in fused_filters
-        writes = len(stages) > 1 or keep or pinned
-        # pinned pages also cover the consuming join's largest frame
-        hold = max((spec["frame_tokens"][alias]
-                    for spec, _ in sequence_groups[streamed[alias]])
-                   if alias in streamed else (0,))
+        # a chain the classification or join of its alias follows in
+        # one pipeline reads the KV it wrote
+        writes = len(stages) > 1 or keep or alias in pipelined
         fid = f"ai_filter:{alias}"
         nodes.append(AiFilter(
             node_id=fid,
             inputs=input_ports((ids_src[alias],)),
-            alias=alias, arena_writes=writes,
-            keep_kv=keep, pin_survivors=pinned, hold_tokens=hold,
+            alias=alias, arena_writes=writes, keep_kv=keep,
             stages=tuple(stages)))
         ids_src[alias] = PortRef(fid, f"ids:{alias}")
-        if alias in fused_filters:
-            remarks.append(
-                f"filter on {alias!r} streams its survivors into its "
-                f"classification; each one is labeled with its KV resident")
-        elif pinned:
-            remarks.append(
-                f"filter on {alias!r} streams its survivors into "
-                f"the join anchored on it; each one's KV stays "
-                f"pinned until its tuples are answered")
-        elif not writes:
+        if not writes:
             remarks.append(
                 f"filter on {alias!r}: arena writes off (one "
                 f"stage - nothing reads the KV again)")
@@ -759,9 +749,6 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
     label_ports = []
 
     deferred = set()          # aliases classified after the joins
-    # a filter chain streams into the classification after it
-    fused_filters = {alias for alias in fusable & between
-                     if alias in ask_filters}
 
     def emit_classify(alias, live=None):
         """Classify the alias's documents, then keep the accepted labels."""
@@ -776,16 +763,14 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
         if live is None:
             live = live_asked.get(alias, float(stats[alias].n_docs))
         for call in calls:
+            # the first classification after the alias's filters reads
+            # the KV the chain wrote; a canvas model decodes alone
+            resident = (alias in pipelined and call is calls[0]
+                        and live is live_asked.get(alias))
             spec, _ = table.classify(call, labels.names[call], live,
-                                     resident=alias in fused_filters)
+                                     resident=resident)
             node = table.node(spec, ids_src[alias],
                               sum(isinstance(n, AiClassify) for n in nodes))
-            if alias in streamed:
-                node = replace(node, pin_survivors=True)
-                remarks.append(
-                    f"classification of {alias!r} streams its documents "
-                    f"into the join anchored on it; each one's KV stays "
-                    f"pinned until its tuples are answered")
             nodes.append(node)
             classify_seconds += spec.estimated_seconds
             scores = PortRef(node.node_id, "scores")
@@ -808,13 +793,11 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
 
     try:
         for s in scans:
-            if s.alias in ask_filters and s.alias not in streamed:
+            if s.alias in ask_filters:
                 emit_filter(s.alias)
-            elif s.alias not in ask_filters:
+            else:
                 emit_applies(s.alias)
-            # a streamed classification is emitted before its join
-            if not (s.alias in streamed and s.alias in between):
-                emit_classify(s.alias)
+            emit_classify(s.alias)
     except ClassifyRefusedError as refused:
         return refused.refusal()
 
@@ -849,13 +832,6 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
                 inputs=input_ports((ids_src[anchor],)),
                 anchor=anchor))
             ids_src[anchor] = PortRef(xid, f"ids:{anchor}")
-        if streamed.get(anchor) == g:
-            if anchor in ask_filters:
-                emit_filter(anchor)
-            try:
-                emit_classify(anchor)
-            except ClassifyRefusedError as refused:
-                return refused.refusal()
         gid = group_ids[g]
         stage_dicts = []
         in_aliases = [anchor]

@@ -3,8 +3,8 @@
 from dataclasses import dataclass, field, replace
 from typing import Any, Mapping
 
+from quail.execution.pipelines import build_pipelines
 from quail.physical import (
-    AiClassify,
     AiFilter,
     AiJoin,
     Barrier,
@@ -15,7 +15,6 @@ from quail.physical import (
     PhysicalGraph,
     PhysicalNode,
     PortRef,
-    validate_streams,
 )
 from quail.physical.codec import plan_envelope
 from quail.specs import MODELS
@@ -80,7 +79,6 @@ class PhysicalPlan:
         )
         graph = PhysicalGraph(tuple(self.nodes), root)
         graph.validate()
-        validate_streams(graph)
         object.__setattr__(self, "nodes", graph.nodes)
         object.__setattr__(self, "root", graph.root)
         object.__setattr__(self, "graph", graph)
@@ -105,14 +103,15 @@ class PhysicalPlan:
         return source, target, ports[0]
 
     def _rebuild(self, nodes) -> "PhysicalPlan":
-        """A new plan over nodes: pins re-derived, validated, re-estimated.
+        """A new plan over nodes: validated and re-estimated.
 
         The plan's seconds are the planner's search estimate plus the
-        recompute expected at every chain an edit unpinned (a chain
-        the planner itself left unpinned already retains its survivors
-        by schedule and is not counted twice).
+        recompute expected at every filter chain an edit cut off from
+        the join anchored on its alias (a chain the planner itself
+        left off the join's pipeline already retains its survivors by
+        schedule and is not counted twice).
         """
-        nodes = _rederive_pins(tuple(nodes))
+        nodes = _rederive_kv(tuple(nodes))
         try:
             edited = replace(self, nodes=nodes, root=None, estimates={})
         except GraphValidationError as error:
@@ -121,12 +120,13 @@ class PhysicalPlan:
         if base is None:
             return edited
         scheduled = set(self.settings.get("retention", {}).get("initial", {}))
+        pipelines = build_pipelines(edited.graph)
         recompute = sum(
             edited.estimates.get(node.node_id, {}).get(
                 "release_recompute_seconds", 0.0)
             for node in edited.nodes
-            if isinstance(node, AiFilter) and not node.pin_survivors
-            and node.alias not in scheduled)
+            if isinstance(node, AiFilter) and node.alias not in scheduled
+            and not isinstance(pipelines[node.node_id].sink, AiJoin))
         return replace(edited, estimated_seconds=base + recompute,
                        estimates=edited.estimates)
 
@@ -221,56 +221,25 @@ class PhysicalPlan:
             settings=self.settings,
         )
 
-def _rederive_pins(nodes: tuple) -> tuple:
-    """Re-derive pin_survivors, keep_kv, and hold_tokens from the shape.
+def _rederive_kv(nodes: tuple) -> tuple:
+    """Re-derive keep_kv and arena_writes from the shape after an edit.
 
-    A chain pins its survivors only when its stream reaches the join
-    anchored on its alias, or the classification of its alias, through
-    per-batch nodes alone; otherwise its survivors go through the
-    retention pool. A classification pins its documents when its
-    stream reaches the join through its label filters.
+    A filter chain whose pipeline no longer reaches the join anchored
+    on its alias (a Barrier was put between them) retains its
+    survivors for that join instead.
     """
     graph = PhysicalGraph(nodes, PortRef(nodes[-1].node_id,
                                          nodes[-1].outputs[0].name))
-    joins = {node.anchor: node for node in nodes if isinstance(node, AiJoin)}
-    classified = {node.spec.aliases[0] for node in nodes
-                  if isinstance(node, AiClassify) and node.spec is not None}
+    joins = {node.anchor for node in nodes if isinstance(node, AiJoin)}
+    pipelines = build_pipelines(graph)
     out = []
     for node in nodes:
-        if isinstance(node, AiClassify) and node.spec is not None \
-                and node.spec.aliases[0] in joins:
-            out.append(replace(node,
-                               pin_survivors=_stream_reaches(graph, node)))
-            continue
-        if not isinstance(node, AiFilter) or (
-                node.alias not in joins and node.alias not in classified):
+        if not isinstance(node, AiFilter) or node.alias not in joins:
             out.append(node)
             continue
-        pinnable = _stream_reaches(graph, node)
-        hold = max((stage.anchor_frame_tokens
-                    for stage in joins[node.alias].stages), default=0) \
-            if node.alias in joins else 0
-        out.append(replace(
-            node,
-            pin_survivors=pinnable,
-            keep_kv=not pinnable and node.alias in joins,
-            hold_tokens=hold if pinnable else 0,
-            arena_writes=True))
+        cut = not isinstance(pipelines[node.node_id].sink, AiJoin)
+        out.append(replace(node, keep_kv=cut, arena_writes=True))
     return tuple(out)
-
-
-def _stream_reaches(graph, chain) -> bool:
-    """Whether a node's survivors reach a consumer that drives its stages."""
-    # only this chain is pinned in the trial
-    trial = PhysicalGraph(tuple(
-        replace(node, pin_survivors=node.node_id == chain.node_id)
-        if isinstance(node, (AiFilter, AiClassify)) else node
-        for node in graph.nodes), graph.root)
-    try:
-        validate_streams(trial)
-    except GraphValidationError:
-        return False
-    return True
 
 
 def resolve_model(name: str, models=None):
