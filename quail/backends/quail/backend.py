@@ -577,6 +577,7 @@ class _ClassifyPart:
         self.kept = kept          # _KeptPairs, for joined rows
         self.stages = plan.stages
         self.reached = 0
+        self.suffix_tokens = 0
         self.label_tokens = 0
 
     def label(self, document) -> str | None:
@@ -588,7 +589,8 @@ class _ClassifyPart:
     def finish(self, every) -> int:
         """Label the documents; returns the frame and suffix tokens packed."""
         self.reached = len(every[0]) if every else 0
-        self.label_tokens, streamed = self.plan.finish(every)
+        self.suffix_tokens, self.label_tokens, streamed = self.plan.finish(
+            every)
         return streamed
 
     def result(self, tokens, gpu_s, chunks, stats) -> NodeResult:
@@ -611,6 +613,7 @@ class _ClassifyPart:
                 gpu_s=gpu_s, chunks=chunks,
                 extension={"output": spec.name, "aliases": list(spec.aliases),
                            "input_rows": len(pairs),
+                           "suffix_tokens": self.suffix_tokens,
                            "label_tokens": self.label_tokens}))
         # a document whose answer named no label has no row
         labeled = [index for index, label in enumerate(plan.labels[0])
@@ -639,6 +642,7 @@ class _ClassifyPart:
             extension={
                 "output": spec.name, "aliases": list(spec.aliases),
                 "input_rows": self.reached,
+                "suffix_tokens": self.suffix_tokens,
                 "label_tokens": self.label_tokens,
                 "borrowed_prefix_tokens": stats.get("borrowed_tokens", 0),
                 "pack_s": round(stats.get("pack_s", 0.0), 3),

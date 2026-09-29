@@ -191,14 +191,14 @@ class Simulated:
         seconds: The summed roofline time of every chunk.
         passes: Forward chunks launched.
         work: The token, attention, and KV work of every chunk.
-        label_tokens: Suffix tokens streamed after the documents.
+        suffix_tokens: Suffix tokens streamed after the documents.
         rounds: The most rounds any document ran.
     """
 
     seconds: float
     passes: int
     work: Work
-    label_tokens: float
+    suffix_tokens: float
     rounds: int
 
     def scaled(self, factor: float) -> "Simulated":
@@ -207,7 +207,7 @@ class Simulated:
             return self
         return Simulated(self.seconds * factor,
                          int(math.ceil(self.passes * factor)),
-                         self.work * factor, self.label_tokens * factor,
+                         self.work * factor, self.suffix_tokens * factor,
                          self.rounds)
 
 
@@ -308,7 +308,7 @@ def simulate(prefixes, frame: int, chains, chunk: int, capacity: int,
     seconds = 0.0
     passes = 0
     total = Work()
-    label_tokens = 0.0
+    suffix_tokens = 0.0
     most_rounds = 0
     held = 0
     waiting = deque()    # (first chunk it may enter, document, round)
@@ -326,7 +326,7 @@ def simulate(prefixes, frame: int, chains, chunk: int, capacity: int,
             room -= tokens
             work += suffix_work(document, round_)
             rows += read_rows(document, round_)
-            label_tokens += tokens
+            suffix_tokens += tokens
             launched.append((document, round_))
         while (next_document < n
                and (held + prefixes[next_document] + extra <= capacity
@@ -338,7 +338,7 @@ def simulate(prefixes, frame: int, chains, chunk: int, capacity: int,
             room -= first_tokens(document)
             work += first_work(document)
             rows += read_rows(document, 0)
-            label_tokens += sum(round_chains(document, 0))
+            suffix_tokens += sum(round_chains(document, 0))
             launched.append((document, 0))
         if not launched:
             # the waiting rounds' answers are read before anything packs
@@ -354,7 +354,7 @@ def simulate(prefixes, frame: int, chains, chunk: int, capacity: int,
                 held -= prefixes[document] + extra
         passes += 1
         total += work
-    return Simulated(seconds, passes, total, label_tokens, most_rounds)
+    return Simulated(seconds, passes, total, suffix_tokens, most_rounds)
 
 
 @dataclass(frozen=True)
@@ -561,7 +561,7 @@ class _Table:
                                 if scoring != LETTERS_SCORING else lettered)
             simulated = self.simulate(scoring, live, head, frame, ids,
                                       resident)
-            key = (simulated.seconds, simulated.label_tokens)
+            key = (simulated.seconds, simulated.suffix_tokens)
             if best is None or key < best[0]:
                 best = (key, scoring, simulated)
         return best[1], best[2]

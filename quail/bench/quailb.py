@@ -28,12 +28,13 @@ import quail_b as benchmark
 from quail.bench import substrait
 from quail.bench.results import write_json
 from quail.bench.substrait import QueryPlan, read_plan
+from quail.physical.nodes import AiClassify, RequestExecution
 from quail.planner.plan import Refusal
 from quail.specs import H100_USD_PER_HOUR, MODELS
 from quail_b.queries import (
     FILTER_SELECTIVITY_ESTIMATES,
+    IN_LIST_SELECTIVITY_ESTIMATES,
     JOIN_SELECTIVITY_ESTIMATES,
-    LABEL_SELECTIVITY_ESTIMATES,
     SELECTIVITY_ESTIMATE_COLLECTION,
     SELECTIVITY_ESTIMATE_CORPUS,
     SELECTIVITY_ESTIMATE_SCALE_FACTOR,
@@ -43,10 +44,10 @@ from quail_b.queries import queries as query_specs
 from quail_b.scoring import RunOutput, reference_answer
 
 # the fixed planner inputs, by prompt, and by prompt and accepted
-# labels for a label filter; a predicate without an estimate here gets
+# labels for an IN-list filter; a predicate without an estimate here gets
 # the planner's default selectivity
 SELECTIVITY = {**FILTER_SELECTIVITY_ESTIMATES, **JOIN_SELECTIVITY_ESTIMATES,
-               **LABEL_SELECTIVITY_ESTIMATES}
+               **IN_LIST_SELECTIVITY_ESTIMATES}
 TEXT_VLLM_BACKENDS = frozenset({
     "dumb_vllm",
     "pipelined_vllm",
@@ -133,8 +134,8 @@ def run_output(result, plan: QueryPlan, tables) -> RunOutput:
     filter_answers = {}
     for (alias, position), table in result.answer_tables["filters"].items():
         operator = _alias_filters(plan, alias)[position]
-        if isinstance(operator, substrait.LabelFilter):
-            # QUAIL-B scores a label filter from the classification's labels
+        if isinstance(operator, substrait.InList):
+            # QUAIL-B scores an IN-list filter from the classification's labels
             continue
         filter_answers[operator.id] = pa.table({
             alias: id_column(alias, table.column(alias)),
@@ -176,9 +177,9 @@ def run_output(result, plan: QueryPlan, tables) -> RunOutput:
 
 
 def _alias_filters(plan: QueryPlan, alias: str) -> list:
-    """Return an alias's AI filters and label filters, in written order."""
+    """Return an alias's AI filters and IN-list filters, in written order."""
     return [operator for operator in plan.operators
-            if isinstance(operator, (substrait.Filter, substrait.LabelFilter))
+            if isinstance(operator, (substrait.Filter, substrait.InList))
             and operator.alias == alias]
 
 
@@ -190,17 +191,21 @@ def join_anchors(result) -> dict:
     }
 
 
-def prompt_pieces(query, plan: QueryPlan, anchors) -> dict:
+def prompt_pieces(query, plan: QueryPlan, anchors, executed=None) -> dict:
     """Return the prompt token ids around each document, for QUAIL-B.
 
     QUAIL-B sizes the prefix trie of the run's requests from these
     pieces and the saved answer tables, after the run; nothing is
-    tracked while the query runs.
+    tracked while the query runs. A classification's pieces are the
+    ones its executed node sent, such as the lettered tail under the
+    letters rule.
 
     Args:
         query: The built query, with bound prompts.
         plan: The query's plan, for the operator ids.
         anchors: Written join position -> the anchor alias.
+        executed: The executed physical graph; needed when the query
+            classifies.
     """
     operators = query.logical.operators()
     filters, joins = operators.filters, operators.joins
@@ -208,11 +213,11 @@ def prompt_pieces(query, plan: QueryPlan, anchors) -> dict:
                      for prompt in operators.prompts
                      if prompt.preamble_token_ids), [])
     pieces = {"tokenizer": query.session.model.hf_name, "preamble": preamble,
-              "filters": [], "joins": []}
+              "filters": [], "joins": [], "classifies": []}
     for alias, predicates in filters.items():
         written = _alias_filters(plan, alias)
         for position, predicate in enumerate(predicates):
-            if isinstance(written[position], substrait.LabelFilter):
+            if isinstance(written[position], substrait.InList):
                 continue
             pieces["filters"].append({
                 "id": written[position].id,
@@ -226,7 +231,49 @@ def prompt_pieces(query, plan: QueryPlan, anchors) -> dict:
             "id": plan.join_id(position), "anchor": anchor,
             "frame": parts[anchor][1], "label": parts[partner][0],
             "tail": list(join.prompt.tail_token_ids)})
+    if plan.classifies:
+        sent = executed_classifications(executed)
+        for operator in plan.classifies:
+            head, anchor, tail, layout = sent[operator.output]
+            if head is not None and list(head) != preamble:
+                raise ValueError(
+                    f"classification {operator.id} sent a head that is not "
+                    f"the preamble")
+            piece = {"id": operator.id, "tail": list(tail)}
+            if layout is not None:
+                piece.update(anchor=anchor, frame=list(layout[0]),
+                             label=list(layout[1]))
+            pieces["classifies"].append(piece)
     return pieces
+
+
+def executed_classifications(graph) -> dict:
+    """Return label column -> (head, anchor alias, tail, join layout).
+
+    Reads each classification the executed graph ran: a Quail
+    classification node and its chained stages, or a request node's
+    classifications. The head is None for a request node, which sends
+    the preamble; the join layout is None for one document.
+    """
+    if graph is None:
+        raise ValueError("classification prompt pieces need the executed plan")
+    sent = {}
+    for node in graph.nodes:
+        if isinstance(node, AiClassify) and node.spec is not None:
+            for spec in node.spec.chain:
+                head, tail = spec.prompt_token_parts
+                sent[spec.name] = (head, spec.anchor, tail, spec.join_layout)
+        elif isinstance(node, RequestExecution):
+            for spec in node.classifies:
+                sent[spec.output] = (None, spec.alias, spec.tail_token_ids,
+                                     spec.join_layout_token_ids or None)
+    return sent
+
+
+def label_tokens(report) -> int:
+    """Return the positions fed after answer cues, summed over the nodes."""
+    return sum(int(metrics.get("label_tokens", 0))
+               for metrics in report.get("node_metrics", {}).values())
 
 
 def _submission_to_answer_s(
@@ -305,7 +352,9 @@ def run_query(session, spec: QuerySpec, tables) -> RunOutput:
         output.measurements["input_tokens"] = (
             result.report["fresh_tokens"] + result.report["cached_tokens"]
         )
-    output.prompt_pieces = prompt_pieces(query, plan, join_anchors(result))
+    output.prompt_pieces = prompt_pieces(query, plan, join_anchors(result),
+                                         result.plan)
+    output.measurements["label_tokens"] = label_tokens(result.report)
     return output
 
 

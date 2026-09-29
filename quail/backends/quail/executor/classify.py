@@ -356,45 +356,52 @@ class ClassifyStages:
             return Stage.DROP
         return None
 
-    def finish(self, answers) -> tuple[int, int]:
+    def finish(self, answers) -> tuple[int, int, int]:
         """Label every document from its answers; returns the token counts.
 
         Returns:
-            (label tokens, streamed tokens): the suffix tokens read, and
-            those plus the frames written after the documents.
+            (suffix tokens, label tokens, streamed tokens): the suffix
+            tokens read; the positions after the answer cue that each
+            request needs once, which are a trie's nodes below the cue,
+            a canvas's rows, or a decoded label's path without its last
+            token; and the suffix tokens plus the frames written after
+            the documents.
         """
         if self.partners is not None:
-            label_tokens = 0
-            streamed = 0
-            for anchor, partner in self.pair_labels:
-                label_tokens += 1
-                streamed += 1 + self.block_tokens[partner]
+            streamed = sum(1 + self.block_tokens[partner]
+                           for _, partner in self.pair_labels)
             anchors = {anchor for anchor, _ in self.pair_labels}
             streamed += len(anchors) * len(self.stages[0].frame)
-            return label_tokens, streamed
+            return len(self.pair_labels), 0, streamed
+        suffix_tokens = 0
         label_tokens = 0
         streamed = 0
         position = 0
         for index, request in enumerate(self.requests):
             first = answers[position]
             if index in self.decoders:
-                suffix_tokens = self.decoders[index].tokens
+                decoder = self.decoders[index]
+                stage_tokens = decoder.tokens
+                label_tokens += sum(len(decoder.label_ids[label]) - 1
+                                    for label in decoder.label if label >= 0)
             else:
                 for anchor, logprobs in first.items():
                     if self.labels[index][anchor] is None:
                         self.labels[index][anchor] = self.label_of(
                             index, logprobs)
                 # a letters stage on a canvas model streams its canvas too
-                suffix_tokens = len(first) * (sum(map(len, request.suffixes))
-                                              + self.canvas_rows)
-            label_tokens += suffix_tokens
+                stage_tokens = len(first) * (sum(map(len, request.suffixes))
+                                             + self.canvas_rows)
+                # every suffix starts with the cue
+                label_tokens += stage_tokens - len(first) * len(request.suffixes)
+            suffix_tokens += stage_tokens
             # a frame equal to the stage before's is already in KV
             written = (index == 0
                        or request.frame != self.requests[index - 1].frame)
-            streamed += suffix_tokens + (len(first) * len(request.frame)
-                                         if written else 0)
+            streamed += stage_tokens + (len(first) * len(request.frame)
+                                        if written else 0)
             position += max(1, request.rounds)
-        return label_tokens, streamed
+        return suffix_tokens, label_tokens, streamed
 
     def later(self) -> dict:
         """The chained classifications' labels by output name."""
@@ -440,12 +447,13 @@ class QuailClassifier:
             prefixes, state["chunk_tokens"], anchor_keys=keys,
             staging=state["input_staging"], prefix_tree=tree, stats=stats,
             label=f"classify {spec.name}")
-        label_tokens, streamed = plan.finish(answers)
+        suffix_tokens, label_tokens, streamed = plan.finish(answers)
         total = sum(map(len, prefixes)) + streamed
-        return self._batch(plan.labels[0], fresh, total - fresh, label_tokens,
-                           stats, spans, plan.later())
+        return self._batch(plan.labels[0], fresh, total - fresh,
+                           (suffix_tokens, label_tokens), stats, spans,
+                           plan.later())
 
-    def _batch(self, labels, fresh, cached, label_tokens, stats, spans,
+    def _batch(self, labels, fresh, cached, counts, stats, spans,
                later) -> RerankerBatch:
         """The labels and token counts of one run, with its GPU time when timed."""
         state = self.state
@@ -457,7 +465,7 @@ class QuailClassifier:
                         for _, _, start, end in spans) / 1000.0
         return RerankerBatch(
             labels, fresh_tokens=fresh, cached_tokens=cached,
-            label_tokens=label_tokens,
+            suffix_tokens=counts[0], label_tokens=counts[1],
             borrowed_tokens=stats.get("borrowed_tokens", 0),
             pack_s=stats.get("pack_s", 0.0),
             gpu_s=gpu_s,

@@ -108,14 +108,16 @@ class ScoreRows:
 class RerankerBatch:
     """Scores, or AI.CLASSIFY labels, and token counts from one call.
 
-    ``label_tokens`` counts the suffix tokens a classification packed
+    ``suffix_tokens`` counts the suffix tokens a classification packed
     after the documents and frames: the label work the scoring rules
-    reduce.
+    reduce. ``label_tokens`` counts the positions after the answer cue
+    that each request needs once, the count QUAIL-B adds to its minimum.
     """
 
     scores: np.ndarray
     fresh_tokens: int
     cached_tokens: int
+    suffix_tokens: int = 0
     label_tokens: int = 0
     borrowed_tokens: int = 0
     # host seconds spent building forward chunks
@@ -298,6 +300,7 @@ def score_in_batches(node, inputs, score_batches, shards: int = 1,
     tables = []
     positions = []
     metrics = NodeMetrics()
+    suffix_tokens = 0
     label_tokens = 0
     borrowed = 0
     pack_s = 0.0
@@ -318,6 +321,7 @@ def score_in_batches(node, inputs, score_batches, shards: int = 1,
             tables.append(result.outputs["scores"])
             positions.append(where)
             metrics += result.metrics
+            suffix_tokens += result.metrics.extension.get("suffix_tokens", 0)
             label_tokens += result.metrics.extension.get("label_tokens", 0)
             borrowed += result.metrics.extension.get(
                 "borrowed_prefix_tokens", 0)
@@ -340,7 +344,8 @@ def score_in_batches(node, inputs, score_batches, shards: int = 1,
         metrics, wall_s=time.perf_counter() - started,
         extension={"output": node.spec.name, "aliases": list(node.spec.aliases),
                    "input_rows": len(rows),
-                   **({"label_tokens": label_tokens,
+                   **({"suffix_tokens": suffix_tokens,
+                       "label_tokens": label_tokens,
                        "borrowed_prefix_tokens": borrowed,
                        "pack_s": round(pack_s, 3)}
                       if isinstance(node.spec, ClassifySpec) else {})},
@@ -409,7 +414,8 @@ class RerankerModelExecution:
                     "output": spec.name,
                     "aliases": list(spec.aliases),
                     "input_rows": count,
-                    **({"label_tokens": batch.label_tokens,
+                    **({"suffix_tokens": batch.suffix_tokens,
+                        "label_tokens": batch.label_tokens,
                         "borrowed_prefix_tokens": batch.borrowed_tokens,
                         "pack_s": batch.pack_s}
                        if isinstance(spec, ClassifySpec) else {}),

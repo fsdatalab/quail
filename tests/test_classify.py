@@ -196,7 +196,9 @@ def test_classifier_reads_the_letters_at_the_cue_row(monkeypatch):
              "input_staging": SimpleNamespace(fixed_tokens=set())}
     batch = QuailClassifier(state).classify(single, [[0], [1]], documents)
     assert list(batch.scores) == ["a", "b"]
-    assert batch.label_tokens == 2 * 1
+    assert batch.suffix_tokens == 2 * 1
+    # a letter is read at the cue: nothing follows it
+    assert batch.label_tokens == 0
     # every row packs its prefix, the two-token frame, and the cue
     assert batch.fresh_tokens + batch.cached_tokens == (3 + 2) + 2 * (2 + 1)
 
@@ -254,7 +256,10 @@ def test_classifier_decodes_one_token_per_round(monkeypatch):
     assert sorted(packed) == sorted([
         (0, [91, 92]), (1, [91, 92]), (2, [91, 92]),
         (0, [93]), (1, [93]), (2, [93]), (0, [93, 1]), (2, [93, 1])])
-    assert batch.label_tokens == 3 * 1 + 2 * 2
+    assert batch.suffix_tokens == 3 * 1 + 2 * 2
+    # each two-token label's first token, fed once; the cue sent again
+    # in round 1 is recomputation
+    assert batch.label_tokens == 2 * 1
 
 
 def test_classifier_borrows_shared_prefix_pages(monkeypatch):
@@ -360,7 +365,7 @@ def test_classifier_runs_chained_stages_on_resident_documents(monkeypatch):
     # stage 0: prefix, 2-token frame, the cue per document; stage 1:
     # document 0's 1-token frame and the cue
     assert batch.fresh_tokens == (3 + 2 + 4) + 3 * (2 + 1) + (1 + 1)
-    assert batch.label_tokens == 3 * 1 + 1
+    assert batch.suffix_tokens == 3 * 1 + 1
 
 
 @pytest.fixture()
@@ -403,7 +408,7 @@ class _Labels:
                 if stage.accepted is None or label in stage.accepted else None
                 for label in values], dtype=object)
         return RerankerBatch(values, fresh_tokens=len(rows), cached_tokens=0,
-                             label_tokens=3 * len(rows), later=later)
+                             suffix_tokens=3 * len(rows), later=later)
 
 
 def test_classify_plans_filters_and_returns_labels(session):
@@ -424,7 +429,7 @@ def test_classify_plans_filters_and_returns_labels(session):
     assert labels.column("topic").to_pylist() == ["refund", "praise"]
     (answers,) = result.answer_tables["filters"].values()
     assert answers.column("answer").to_pylist() == [True, False]
-    assert result.report["node_metrics"]["ai-classify:0"]["label_tokens"] == 6
+    assert result.report["node_metrics"]["ai-classify:0"]["suffix_tokens"] == 6
 
     # a projected label with no filter classifies every document
     plain = _topic(session, accepted=())
@@ -534,12 +539,12 @@ def test_planner_prices_the_rules_and_takes_the_cheapest():
     # letters one after a frame 30 tokens longer
     scoring, chosen = table.choose(1000, 20, 30, long_labels, True,
                                    lettered=(20, 60, letters))
-    assert scoring == "letters" and chosen.label_tokens == 1000
+    assert scoring == "letters" and chosen.suffix_tokens == 1000
     forced = _Table(**{**table.__dict__, "scoring": "trie_tree"})
     scoring, packed = forced.choose(1000, 20, 30, long_labels, True,
                                     lettered=(20, 60, letters))
     assert scoring == "trie_tree"
-    assert packed.label_tokens == 1000 * len(label_trie(long_labels))
+    assert packed.suffix_tokens == 1000 * len(label_trie(long_labels))
     assert chosen.seconds < packed.seconds
     # one-token labels: the trie reads the cue row too, after the
     # shorter prompt that names the labels
@@ -552,7 +557,7 @@ def test_planner_prices_the_rules_and_takes_the_cheapest():
     scoring, decoded = table.choose(1000, 20, 30, long_labels, False,
                                     lettered=(20, 60, letters))
     assert scoring == "trie_decode"
-    assert decoded.label_tokens == 1000 * (1 + 2 + 3 + 4)
+    assert decoded.suffix_tokens == 1000 * (1 + 2 + 3 + 4)
     fresh_trie = forced.choose(1000, 20, 30, long_labels, False)[1]
     assert decoded.rounds == 4 and decoded.seconds < fresh_trie.seconds
     # a decode cannot end at a label that is another label's prefix
@@ -579,14 +584,14 @@ def test_simulation_sends_a_decode_one_chain_per_round():
     result = simulate(prefixes, 10, chains, chunk=250, capacity=10_000,
                       model=QWEN3_4B_FP8, device=H100_SXM, one_per_round=True)
     assert result.rounds == 2 and result.passes == 4
-    assert result.label_tokens == 3 * 3 + 3 * 2
+    assert result.suffix_tokens == 3 * 3 + 3 * 2
     assert result.work.tokens == 3 * 110 + 3 * 3 + 3 * 2
     assert result.seconds > 0
     # one round sends both chains at once, in fewer chunks
     once = simulate(prefixes, 10, chains, chunk=250, capacity=10_000,
                     model=QWEN3_4B_FP8, device=H100_SXM)
     assert once.rounds == 1 and once.passes == 2
-    assert once.label_tokens == result.label_tokens
+    assert once.suffix_tokens == result.suffix_tokens
     # a full arena admits documents as earlier ones finish
     tight = simulate(prefixes, 10, chains, chunk=250, capacity=120,
                      model=QWEN3_4B_FP8, device=H100_SXM, one_per_round=True)
@@ -611,7 +616,7 @@ def test_simulation_credits_the_prefix_tokens_a_document_borrows():
     assert borrowed.work.kv_read == scratch.work.kv_read + 2 * 80
     assert borrowed.work.pairs < scratch.work.pairs
     assert borrowed.seconds < scratch.seconds
-    assert borrowed.label_tokens == scratch.label_tokens
+    assert borrowed.suffix_tokens == scratch.suffix_tokens
 
 
 def test_chained_classifications_share_one_node(session):
@@ -726,7 +731,7 @@ def test_prefix_sharing_rule_fires_for_a_classification(session, tmp_path):
 def test_bench_reads_classify_plans_and_reports_labels_by_operator():
     plan = read_plan(get_query("IMDB-14").plan)
     (sentiment, complaint) = plan.classifies
-    (critical,) = plan.label_filters
+    (critical,) = plan.in_lists
     assert (sentiment.output, complaint.output) == ("sentiment", "complaint")
     assert critical.accepted == ("negative", "mixed")
     assert plan.select == ("r.id", "r.sentiment", "r.complaint")
@@ -756,6 +761,62 @@ def test_bench_reads_classify_plans_and_reports_labels_by_operator():
         "r": ["a", "c"], "label": ["poor acting", "too long"]}
     assert output.classify_answers[sentiment.id].column("r").to_pylist() == [
         "a", "b", "c"]
+
+
+def test_bench_reports_the_pieces_each_classification_sent():
+    from quail.bench.quailb import (
+        executed_classifications,
+        label_tokens,
+        prompt_pieces,
+    )
+    from quail_b.minimum import validate_prompt_pieces
+
+    spec = get_query("IMDB-14")
+    plan = read_plan(spec.plan)
+
+    def classification(name, tail, stages=()):
+        return ClassifySpec(
+            name=name, aliases=("r",), query_template="", arguments=(),
+            expected_inputs=3, estimated_seconds=0.0,
+            prompt_token_parts=((1, 2), tail), labels=("a", "b"),
+            label_token_ids=((5,), (6,)), stages=stages)
+
+    complaint = classification("complaint", (7, 8, 9))
+    node = AiClassify(
+        node_id="ai-classify:0", inputs=(), backend_name="quail",
+        model="tiny", spec=classification("sentiment", (3, 4), stages=(
+            ClassifyStage(complaint, ("negative", "mixed")),)))
+    query = SimpleNamespace(
+        session=SimpleNamespace(model=SimpleNamespace(hf_name="tiny")),
+        logical=SimpleNamespace(operators=lambda: SimpleNamespace(
+            filters={}, joins=[], prompts=[
+                SimpleNamespace(preamble_token_ids=(1, 2))])))
+    pieces = prompt_pieces(query, plan, {}, SimpleNamespace(nodes=(node,)))
+    # a chained stage's tail is its own
+    assert pieces["classifies"] == [
+        {"id": "classify-1", "tail": [3, 4]},
+        {"id": "classify-2", "tail": [7, 8, 9]}]
+    assert validate_prompt_pieces(spec, pieces)["classifies"] == pieces[
+        "classifies"]
+    with pytest.raises(ValueError, match="executed plan"):
+        prompt_pieces(query, plan, {})
+    query.logical = SimpleNamespace(operators=lambda: SimpleNamespace(
+        filters={}, joins=[], prompts=[
+            SimpleNamespace(preamble_token_ids=(1,))]))
+    with pytest.raises(ValueError, match="not the preamble"):
+        prompt_pieces(query, plan, {}, SimpleNamespace(nodes=(node,)))
+    # joined rows: the anchor, and the note and partner label around them
+    joined = AiClassify(
+        node_id="ai-classify:1", inputs=(), backend_name="quail", model="tiny",
+        spec=ClassifySpec(
+            name="aspect_sentiment", aliases=("r", "a"), query_template="",
+            arguments=(), expected_inputs=1, estimated_seconds=0.0,
+            prompt_token_parts=((1, 2), (3, 4)), labels=("a", "b"),
+            label_token_ids=((5,), (6,)), join_layout=((10,), (11, 12))))
+    assert executed_classifications(SimpleNamespace(nodes=(joined,))) == {
+        "aspect_sentiment": ((1, 2), "r", (3, 4), ((10,), (11, 12)))}
+    assert label_tokens({"node_metrics": {
+        "ai-classify:0": {"label_tokens": 4}, "scan:r": {}}}) == 4
 
 
 
@@ -837,7 +898,7 @@ def test_planner_prices_the_letters_read_on_a_canvas_model():
     assert scoring == "letters"
     # every document sends the cue and the 16-row canvas once, and
     # computes its prompt once
-    assert simulated.label_tokens == 100 * 17
+    assert simulated.suffix_tokens == 100 * 17
     assert simulated.work.tokens == 100 * (20 + 200 + 30) + 100 * 17
     assert simulated.passes == 1
     # the canvas rows read the document a second time
@@ -1007,7 +1068,8 @@ def test_classifier_scores_the_packed_trie(monkeypatch):
         spec, [[0], [1]], {"d": [[10, 11], [12]]})
     assert list(batch.scores) == ["b", "d"]
     # the trie's five rows once per document
-    assert batch.label_tokens == 2 * 5
+    assert batch.suffix_tokens == 2 * 5
+    assert batch.label_tokens == 2 * 4
 
 
 def test_planner_packs_the_trie_without_a_lettered_prompt():
@@ -1029,7 +1091,7 @@ def test_planner_packs_the_trie_without_a_lettered_prompt():
     # a chained stage over resident documents packs the trie
     scoring, simulated = table.choose(500, 20, 30, shared, True)
     assert scoring == "trie_tree"
-    assert simulated.label_tokens == 500 * len(label_trie(shared))
+    assert simulated.suffix_tokens == 500 * len(label_trie(shared))
 
 
 def test_sql_category_forms_options_and_label_tables(session):
@@ -1241,7 +1303,7 @@ def test_planner_reads_letters_at_the_cue_row(tmp_path):
     long_labels = ((1, 2, 3, 4), (1, 2, 5, 6), (7, 8, 9, 10))
     scoring, simulated = table.choose(1000, 20, 30, long_labels, False,
                                       lettered=(20, 34, ((7,), (8,), (9,))))
-    assert scoring == "letters" and simulated.label_tokens == 1000
+    assert scoring == "letters" and simulated.suffix_tokens == 1000
     # the fresh documents of these labels can also be decoded
     assert table.choose(1000, 20, 30, long_labels, False)[0] == "trie_decode"
     with pytest.raises(ClassifyRefusedError, match="no label scoring rule"):
@@ -1302,5 +1364,6 @@ def test_classifier_reads_the_letter_at_the_first_canvas_row(monkeypatch):
         noise = np.random.default_rng((CANVAS_SEED, row, 0)).integers(0, vocab)
         assert packed[index] == [noise, 6, 0, 0]
     # the cue and the canvas after the prompt and the frame, once
-    assert batch.label_tokens == 2 * (1 + 4)
+    assert batch.suffix_tokens == 2 * (1 + 4)
+    assert batch.label_tokens == 2 * 4
     assert batch.fresh_tokens + batch.cached_tokens == (3 + 2) + 2 * (2 + 5)

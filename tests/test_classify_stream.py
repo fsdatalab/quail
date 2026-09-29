@@ -401,7 +401,7 @@ def test_streamed_classification_labels_survivors_with_their_kv_resident(
     # a one-token frame and the cue per survivor
     assert metrics["classify:r"]["fresh_tokens"] == 2 * len(passed)
     assert metrics["classify:r"]["evaluated_documents"] == len(passed)
-    assert metrics["classify:r"]["label_tokens"] == len(passed)
+    assert metrics["classify:r"]["suffix_tokens"] == len(passed)
     # some chunk held documents at the chain's stage beside documents
     # at the classification's or the join's
     heads = [{suffix[0] for spec in specs for suffix in spec["suffixes"]}

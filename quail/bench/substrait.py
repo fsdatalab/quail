@@ -101,7 +101,7 @@ class Classify:
 
 
 @dataclass(frozen=True)
-class LabelFilter:
+class InList:
     """Keep the documents whose label column holds an accepted label."""
 
     id: str
@@ -122,7 +122,7 @@ class QueryPlan:
     """
 
     relations: tuple[Relation, ...]
-    operators: tuple[Filter | Join | Classify | LabelFilter, ...]
+    operators: tuple[Filter | Join | Classify | InList, ...]
     select: tuple[str, ...]
 
     @property
@@ -138,8 +138,8 @@ class QueryPlan:
         return tuple(op for op in self.operators if isinstance(op, Classify))
 
     @property
-    def label_filters(self) -> tuple[LabelFilter, ...]:
-        return tuple(op for op in self.operators if isinstance(op, LabelFilter))
+    def in_lists(self) -> tuple[InList, ...]:
+        return tuple(op for op in self.operators if isinstance(op, InList))
 
     def filter_id(self, alias: str, position: int) -> str:
         """Return the id of an alias's filter at a written position."""
@@ -244,7 +244,7 @@ def _read(rel: algebra_pb2.Rel, functions):
         relations, operators, fields = _read(rel.filter.input, functions)
         test = rel.filter.condition.singular_or_list
         alias, output = _field(fields, test.value)
-        operators.append(LabelFilter(
+        operators.append(InList(
             rel.filter.common.hint.alias, alias, output,
             tuple(_string(option) for option in test.options)))
         return relations, operators, fields
@@ -326,7 +326,7 @@ def build_query(session, plan: QueryPlan, selectivity=None,
     for item in plan.operators:
         if isinstance(item, Classify) and item.partner is not None:
             continue    # labels a join's rows, so it follows the joins
-        if isinstance(item, (Filter, Classify, LabelFilter)):
+        if isinstance(item, (Filter, Classify, InList)):
             per_alias.setdefault(item.alias, []).append(item)
     prompts = {(item.alias, item.output): item.prompt
                for item in plan.classifies}
