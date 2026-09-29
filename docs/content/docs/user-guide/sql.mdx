@@ -269,40 +269,147 @@ labeled examples for your task.
 
 ### AI.CLASSIFY
 
-Categorize each document into one of a set of labels you provide,
+`AI.CLASSIFY` gives each document one label from a list you provide,
 like BigQuery's
 [AI.CLASSIFY](https://cloud.google.com/blog/products/data-analytics/sql-reimagined-for-the-ai-era-with-bigquery-ai-functions).
-Each document gets the label whose tokens the model scores highest
-after the prompt; a tie goes to the earlier label. The column can be
-returned, or tested with `= 'label'` or `IN (...)` in `WHERE`.
-Example:
+Use it in `SELECT` to return the label, or in `WHERE` to keep the
+documents with certain labels.
+
+For example, to find the negative and mixed reviews and return each
+one's sentiment:
 
 ```sql
-SELECT r.id, AI.CLASSIFY(r.body,
-    ARRAY['positive', 'negative', 'neutral']) AS sentiment
+SELECT r.id,
+       AI.CLASSIFY(PROMPT('What sentiment does this review express?\n\n{0}', r.body),
+                   ARRAY['positive', 'negative', 'neutral', 'mixed']) AS sentiment
 FROM reviews r
-WHERE AI.CLASSIFY(r.body, ARRAY['positive', 'negative', 'neutral'])
-    IN ('negative', 'neutral')
+WHERE AI.CLASSIFY(PROMPT('What sentiment does this review express?\n\n{0}', r.body),
+                  ARRAY['positive', 'negative', 'neutral', 'mixed'])
+      IN ('negative', 'mixed')
 ```
 
-A prompt with two placeholders, one from each side of a join,
-classifies each pair the join keeps: the anchor document stays in the
-KV cache from the join, and each kept partner's block and the
-question follow it. Example:
+The call in `SELECT` and the call in `WHERE` are the same, so Quail
+classifies each review once and uses its label for both.
+
+The model does not write the label as free text. Quail places each
+label after the prompt and scores it as the sum of the log
+probabilities of the label's tokens. The document gets the label with
+the highest score. A tie goes to the label listed first.
+DiffusionGemma decodes its answer instead. A document whose answer is
+not one of the labels is left out of the result.
+
+#### Return labels
+
+Give the label column a name with `AS`. `AI.CLASSIFY` must be a whole
+item of the `SELECT` list, not part of a larger expression.
+
+#### Filter rows
+
+Test the label with `=` or `IN`:
+
+```sql
+WHERE AI.CLASSIFY(PROMPT(...), ARRAY[...]) = 'negative'
+WHERE AI.CLASSIFY(PROMPT(...), ARRAY[...]) IN ('negative', 'mixed')
+```
+
+The label can be on either side of `=`. A label that is not in the
+list matches no rows. Any other comparison, such as `<`, raises
+`CompileError`.
+
+#### Labels
+
+The second argument lists the labels in one of these forms:
+
+- An array of labels: `ARRAY['refund', 'praise']`.
+- An array of (label, description) pairs, where `NULL` means no
+  description: `ARRAY[('refund', 'asks for money back'), ('praise', NULL)]`.
+- An array of objects with a `label` and an optional `description`:
+  `ARRAY[{'label': 'refund', 'description': 'asks for money back'}, {'label': 'praise'}]`.
+- The name of a registered table, such as `kinds`. The table has a
+  `label` column, an optional `description` column, and an optional
+  integer `ordinal` column. Labels follow `ordinal` when it exists,
+  and are sorted by label text otherwise.
+
+You can also name the argument, as in `categories => ARRAY[...]`.
+
+A list has at least two labels, and no two labels are equal ignoring
+case. A description has at most 25 words, and the prompt shows it
+next to its label.
+
+#### Input
+
+The first argument is a `PROMPT` or a document column alone, such as
+`AI.CLASSIFY(r.body, ARRAY['refund', 'praise'])`. With a column alone,
+the prompt has no question. The model sees the document, then the
+instruction and the labels. Add a question with the `task_description`
+option.
+
+#### Options
+
+An optional third argument sets options:
+
+```sql
+AI.CLASSIFY(PROMPT(...), ARRAY[...],
+            {'selectivity': 0.3, 'layout': 'labels_first',
+             'task_description': 'Pick the kind of request.',
+             'output_mode': 'single'})
+```
+
+- **`selectivity`**: optional. In `WHERE`, your estimate of the
+  fraction of documents whose label passes the test. Quail uses it to
+  decide which filters to run first. If you leave it out, Quail
+  assumes 20%.
+- **`layout`**: optional. `'document_first'`, the default, puts the
+  document before the question and labels, as `AI.IF` does.
+  `'labels_first'` puts the question and labels before the document,
+  so every document shares them as one prefix.
+- **`task_description`**: optional. Text of at most 50 words, added
+  after the question.
+- **`output_mode`**: optional. Only `'single'`, one label per
+  document, is supported.
+
+#### Classify pairs from a join
+
+A prompt with one column from each side of a join classifies each
+pair the join keeps. The label describes the two documents together.
+
+For example, to find the aspects each review discusses and the
+review's sentiment toward each one:
 
 ```sql
 SELECT r.id, a.id,
-    AI.CLASSIFY(PROMPT('Judge from the review in DOCUMENT {0} what '
-                       'sentiment it expresses about the movie aspect '
-                       'in DOCUMENT {1}.', r.body, a.aspect),
-                ARRAY['positive', 'negative', 'neutral', 'mixed'])
-        AS aspect_sentiment
-FROM reviews r JOIN aspects a
-    ON AI_FILTER(PROMPT('Does the review in DOCUMENT {0} discuss the '
-                        'movie aspect in DOCUMENT {1}?', r.body, a.aspect))
+       AI.CLASSIFY(
+           PROMPT('What sentiment does the review in DOCUMENT {0} express about the aspect in DOCUMENT {1}?',
+                  r.body, a.aspect),
+           ARRAY['positive', 'negative', 'neutral', 'mixed']) AS aspect_sentiment
+FROM reviews r
+JOIN aspects a
+  ON AI.IF(PROMPT('Does the review in DOCUMENT {0} discuss the aspect in DOCUMENT {1}?',
+                  r.body, a.aspect))
 ```
 
-A pair's label can be returned but not tested in `WHERE`.
+The join keeps a (review, aspect) pair when the review discusses the
+aspect. `AI.CLASSIFY` then labels only those pairs.
+
+Quail classifies the pairs on the join's anchor, the side the join
+processes first and keeps in GPU memory. Set it with the `anchor`
+option of the join's `AI.IF`, or let Quail choose. The anchor's
+documents are already in KV from the join. For each kept pair, the
+model reads only the partner, which is the pair's other document, then
+the question and the labels.
+
+The prompt shows the anchor document first, then a line naming it,
+such as `(The document above is DOCUMENT {0}.)`. The partner follows
+under its own heading, such as `DOCUMENT {1}:`. The question
+keeps `{0}` and `{1}` as written, so refer to the documents as
+`DOCUMENT {0}` and `DOCUMENT {1}`, as in the example.
+
+A pair classification has these limits:
+
+- The query must join the two tables with `AI.IF`. Otherwise it
+  raises `CompileError`, or Quail refuses to plan it.
+- A pair's label can be returned, but not tested in `WHERE`.
+- The layout is `'document_first'`.
 
 ### AI.EXTRACT
 
