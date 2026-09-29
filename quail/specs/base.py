@@ -65,6 +65,7 @@ class ModelSpec:
     canvas_end_text: str = ""     # the token the model writes to end
     #                               its answer, which ends every label
     #                               on the classification canvas
+    canvas_pad_text: str = ""     # the padding token after it
     turn_prefix: str = ""     # chat-turn text before every prompt
     turn_suffix: str = ""     # chat-turn text after the answer cue
     prompt_format: str = "raw-v1"    # names the turn layout in run records

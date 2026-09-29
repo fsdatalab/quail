@@ -15,13 +15,14 @@ the partner suffixes are:
   children. Each chain is a causal segment and reads the ancestors
   above it from earlier chains, so every node is computed once and
   every row is read.
-- ``canvas``: a diffusion model's rule. Every label ends with the
-  answer end token, and the canvas holds as many rows as the longest.
-  One suffix per label-trie node, the tail's last token followed by
-  the node's tokens, with the canvas rows left after them; the first
-  canvas row is read. Every suffix fills the same canvas, so no label
-  is favored for its length, and a row is conditioned on the node's
-  tokens written before it.
+- ``canvas``: a diffusion model's rule. Every label is padded to the
+  canvas with the answer end token and then pads. One suffix per
+  label-trie node, the tail's last token followed by the node's
+  tokens, with the canvas rows left after them; the first canvas row
+  is read. Every label's score is a product over every canvas row and
+  every suffix fills the same canvas, so no label is favored for its
+  length, and a row is conditioned on the node's tokens written
+  before it.
 """
 
 import logging

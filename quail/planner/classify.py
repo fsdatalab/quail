@@ -62,9 +62,10 @@ def classification_refusal(context) -> Refusal | None:
                   f"{forced!r} rule reads the rows of a causal chain")
     elif forced == "canvas" and not model.canvas_tokens:
         reason = f"{model.name!r} has no canvas to score labels on"
-    elif model.canvas_tokens and not model.canvas_end_text:
-        reason = (f"{model.name!r} names no answer end token for the "
-                  f"classification canvas")
+    elif model.canvas_tokens and not (model.canvas_end_text
+                                      and model.canvas_pad_text):
+        reason = (f"{model.name!r} names no answer end and pad tokens "
+                  f"for the classification canvas")
     else:
         return None
     return _refused(reason)[0].plan
@@ -371,20 +372,24 @@ class _Table:
         return spec, simulated.work
 
     def padded(self, labels) -> tuple:
-        """Every label followed by the answer end token.
+        """Every label padded to the canvas with the end token, then pads.
 
-        The canvas is as long as the longest label with its end token,
-        so a label's last scored row is the end token after it.
+        The canvas is one row longer than the longest label, so every
+        label is followed by at least the answer end token, and every
+        label's score is a product over the same number of rows.
 
         Raises:
-            ClassifyRefusedError: The end text is not one token.
+            ClassifyRefusedError: The end or pad text is not one token.
         """
         end = tuple(self.tokenizer(self.model.canvas_end_text))
-        if len(end) != 1:
+        pad = tuple(self.tokenizer(self.model.canvas_pad_text))
+        if len(end) != 1 or len(pad) != 1:
             raise ClassifyRefusedError(
-                f"the canvas end {self.model.canvas_end_text!r} must be "
-                f"one token", 1, 0)
-        return tuple(ids + end for ids in labels)
+                f"the canvas end {self.model.canvas_end_text!r} and pad "
+                f"{self.model.canvas_pad_text!r} must be one token each",
+                1, 0)
+        rows = max(len(ids) for ids in labels) + 1
+        return tuple(ids + end + pad * (rows - len(ids) - 1) for ids in labels)
 
     def simulate(self, scoring, live, head_tokens, frame_tokens, labels,
                  resident) -> Simulated:
