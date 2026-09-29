@@ -83,8 +83,7 @@ def test_trie_paths_cover_every_proper_prefix():
     targets = [1, 2, 3, 4]
     nan = float("nan")
     # on a canvas of two rows every trie node's suffix is the cue and
-    # the canvas: the root, (1,), and the labels' own first tokens
-    # before their end token, IDS being padded labels here
+    # the canvas: two nodes, the root and (1,)
     assert suffix_lengths("canvas", IDS) == [3, 3]
 
     # one chain over the deepest proper prefix (1,) reads both rows
@@ -678,9 +677,9 @@ def test_bench_reads_classify_plans_and_reports_labels_by_operator():
 
 
 def test_classifier_scores_each_trie_node_on_the_full_canvas(monkeypatch):
-    # labels a = [1, 2] and b = [3], padded to the three-row canvas
-    # with the end token 7 and then the pad 0
-    padded = ((1, 2, 7), (3, 7, 0))
+    # labels a = [1, 2] and b = [3], each ending with the end token 7;
+    # the canvas has three rows, the longest label with its end
+    padded = ((1, 2, 7), (3, 7))
     spec = ClassifySpec(
         name="topic", aliases=("d",), query_template="", arguments=(),
         expected_inputs=2, estimated_seconds=0.0,
@@ -688,12 +687,11 @@ def test_classifier_scores_each_trie_node_on_the_full_canvas(monkeypatch):
         label_token_ids=padded, scoring="canvas")
     requests = label_requests(spec)
     # one suffix per trie node, the cue and the node, and the canvas
-    # rows left after it: the root, (1,), (3,), (1, 2), (3, 7)
+    # rows left after it: the root, (1,), (3,), (1, 2)
     assert requests.frame == [91, 92]
-    assert requests.suffixes == [[93], [93, 1], [93, 3], [93, 1, 2], [93, 3, 7]]
-    assert requests.canvas_rows == 3
-    assert requests.canvas_widths == [3, 2, 2, 1, 1]
-    assert not requests.read_all_rows and requests.targets == [0, 1, 2, 3, 7]
+    assert requests.suffixes == [[93], [93, 1], [93, 3], [93, 1, 2]]
+    assert requests.canvas_rows == 3 and requests.canvas_widths == [3, 2, 2, 1]
+    assert not requests.read_all_rows and requests.targets == [1, 2, 3, 7]
     targets = requests.targets
 
     # the first canvas row after a node favors the wanted label's next
@@ -713,7 +711,7 @@ def test_classifier_scores_each_trie_node_on_the_full_canvas(monkeypatch):
     monkeypatch.setattr(loop, "pack_chunk", fake_pack)
     readout = SimpleNamespace(
         targets=np.asarray(targets), rows=1,
-        dtype=np.dtype((np.float32, (5,))),
+        dtype=np.dtype((np.float32, (4,))),
         submit=lambda rows, rows_per_answer=None: rows,
         result=lambda rows: rows)
     canvas_pipeline = fake_pipeline(
@@ -727,9 +725,9 @@ def test_classifier_scores_each_trie_node_on_the_full_canvas(monkeypatch):
     batch = QuailClassifier(state).classify(spec, [[0], [1]], documents)
     assert list(batch.scores) == ["a", "b"]
     # every suffix is the cue plus the three-row canvas
-    assert batch.label_tokens == 2 * 5 * 4
+    assert batch.label_tokens == 2 * 4 * 4
     # each document packs its prefix, the two-token frame, and the suffixes
-    assert batch.fresh_tokens + batch.cached_tokens == (3 + 2) + 2 * (2 + 20)
+    assert batch.fresh_tokens + batch.cached_tokens == (3 + 2) + 2 * (2 + 16)
 
 
 def test_pack_chunk_reads_every_canvas_row_when_asked():
@@ -766,8 +764,7 @@ def test_pack_chunk_reads_every_canvas_row_when_asked():
 def test_planner_pads_labels_to_the_canvas_on_a_diffusion_model(tmp_path):
     from quail.specs import DIFFUSION_GEMMA_26B_FP8
 
-    special = {DIFFUSION_GEMMA_26B_FP8.canvas_end_text: [7],
-               DIFFUSION_GEMMA_26B_FP8.canvas_pad_text: [0]}
+    special = {DIFFUSION_GEMMA_26B_FP8.canvas_end_text: [7]}
 
     def tokenizer(text):
         return special.get(text, _bytes(text))
@@ -778,16 +775,13 @@ def test_planner_pads_labels_to_the_canvas_on_a_diffusion_model(tmp_path):
         EngineConfig(model=DIFFUSION_GEMMA_26B_FP8.name, device="h100-sxm"),
         tokenizer=tokenizer)
     session.register("documents", DocumentProvider.from_parquet(path, id_col="id"))
-    # every label is padded to the canvas, one row longer than the
-    # longest label, with the end token and then pads
+    # every label ends with the answer end token; the canvas is as
+    # long as the longest
     plan = _topic(session).plan()
     (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
     assert classify.spec.scoring == "canvas"
-    rows = max(len(_bytes(label_text(label)))
-               for label in ("refund", "shipping", "praise")) + 1
-    for label, ids in zip(classify.spec.labels, classify.spec.label_token_ids):
-        text = _bytes(label_text(label))
-        assert list(ids) == text + [7] + [0] * (rows - len(text) - 1)
+    assert [list(ids) for ids in classify.spec.label_token_ids] == [
+        _bytes(label_text(label)) + [7] for label in classify.spec.labels]
     assert plan.settings["label_scoring"] == "cost model"
     # a chain's classifications stay separate nodes, each with its own
     # canvas length
