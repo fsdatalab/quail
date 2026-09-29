@@ -85,6 +85,7 @@ class QuailModelExecution:
             # the scorer reads the query's timing choice from the state
             self._state["gpu_timing"] = bool(inputs.get("gpu_timing", False))
             self._state["model_name"] = self.context.model.name
+            self._state["model_spec"] = self.context.model
             if "score_rows" in inputs:
                 return execution.execute_rows(node, inputs["score_rows"])
             return execution.execute(node, inputs["score_inputs"])
