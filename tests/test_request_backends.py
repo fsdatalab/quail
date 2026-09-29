@@ -452,6 +452,49 @@ def test_request_backends_drop_a_document_whose_answer_names_no_label():
     assert result.outputs["label_answers:kind"].num_rows == 2
 
 
+class _PairClient(_Client):
+    """Joins by token, and decodes a pair's label from its partner document."""
+
+    def decode_params(self, max_tokens):
+        return ("decode", max_tokens)
+
+    def generate(self, prompts, sampling_params, use_tqdm=False):
+        outputs = super().generate(prompts, sampling_params, use_tqdm)
+        if sampling_params != ("decode", 3):
+            return outputs
+        self.prompts = [tuple(prompt["prompt_token_ids"]) for prompt in prompts]
+        for output in outputs:
+            output.outputs[0].text = " a" if 20 in output.prompt_token_ids else " b"
+            output.outputs[0].token_ids = [1, 2]
+        return outputs
+
+
+def test_request_backends_decode_one_request_per_pair_the_join_keeps():
+    # anchor r0 matches both partners; r1 matches none
+    spec = RequestClassifySpec(
+        alias="r", output="kind", tail_token_ids=(90,),
+        labels=("a", "b", "c"), label_token_ids=((60, 62), (61, 62), (60, 63)),
+        partner="p", pair_token_ids=((70,), (71,)), join_written_pos=0)
+    node = replace(_join_node(), classifies=(spec,))
+    client = _PairClient()
+    execution = _execution({"r": [[10], [11]], "p": [[20], [21]]}, client=client)
+    result = execution.execute(node, {})
+    assert result.outputs["join_answers:0"].to_pydict() == {
+        "r": [0, 0, 1, 1], "p": [0, 1, 0, 1],
+        "answer": [True, True, False, False]}
+    # each kept pair: preamble, anchor, its note, the partner's label and
+    # document, then the question
+    assert client.prompts == [(3, 10, 70, 71, 20, 90), (3, 10, 70, 71, 21, 90)]
+    assert result.outputs["label_answers:kind"].to_pydict() == {
+        "r": [0, 0], "p": [0, 1], "kind": ["a", "b"]}
+    assert result.outputs["ids:r"] == [0]
+    join_step, classify_step = result.metrics.extension["steps"]
+    assert join_step["kind"] == "join"
+    assert (classify_step["alias"], classify_step["partner"]) == ("r", "p")
+    assert (classify_step["n_in"], classify_step["n_out"]) == (2, 2)
+    assert result.metrics.evaluated_document_pairs == 4 + 2
+
+
 def test_match_label_takes_the_longest_label_the_answer_starts_with():
     from quail.backends.request import match_label
 
