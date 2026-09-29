@@ -73,24 +73,27 @@ SHARDS = {
     "quailb.agent.trace.outcome": 8,
     "quailb.agent.trace.failure_mode": 8,
     "quailb.imdb.review.aspect_sentiment": 4,
+    "quailb.agent.trace.domain": 8,
+    "quailb.agent.trace.root_cause": 8,
 }
 # the published collections the new collections extend
 SOURCES = {
-    0.1: "gt_cd3ebdb784f64b9e028e50ea73cdedd0",
-    0.5: "gt_68f9ce9439bd7615de92b33d576dff9e",
-    1.0: "gt_e87691add604b02c4e43f0ff5bf0cc4f",
+    0.1: "gt_93e6532710832f1f11acf22f7baaa455",
+    0.5: "gt_d204ad99618b2d56f584950ab81fc46d",
+    1.0: "gt_ac3e48c5195c7007f96b35da621f7a2a",
 }
 SUMMARY_PATH = Path("/results/ablations/classify-reference-labels.json")
 CHECK_PATH = Path("/results/ablations/classify-reference-labels-check.json")
 PREDICTION_TEXT = (
-    "At sf=1.0 the eight predicates need 435 million prompt tokens, 364 "
-    "million of them agent traces. At the 17,000 fresh tokens per second "
-    "the cross-check measured on reviews "
+    "AGENT-5 adds two predicates, the PyPI topic and the defect type, over "
+    "the 17,711 agent traces at sf=1.0: 174 million prompt tokens each at "
+    "9,815 tokens per trace, 348 million in all. At the 17,000 fresh "
+    "tokens per second the cross-check measured on reviews "
     "(/results/ablations/classify-reference-labels-check.json), that is "
-    "about 7 H100 hours: under 30 minutes of scoring per agent-trace "
-    "container after a 6-minute boot, across 25 containers. Every label "
-    "set gets one label per document, and every classification query "
-    "loads its labels at all three scale factors."
+    "about 5.7 H100 hours: about 21 minutes of scoring per container "
+    "after a 6-minute boot, across 16 containers. Every trace gets one "
+    "label per predicate, and AGENT-5 loads its labels at all three scale "
+    "factors."
 )
 
 
