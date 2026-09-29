@@ -301,16 +301,23 @@ class ClassifyStages:
 
         def step(anchor, record):
             document = canvases[anchor]
-            if document.update(record[0]["tokens"], record[0]["entropy"]):
-                return True
-            text = answer_text(tokenizer, document.tokens,
-                               settings.stop_token_ids)
-            self._set(0, anchor, match_label(text, spec.labels), on_label)
-            conditioning.release(document.conditioning_row)
-            return False
+            if not document.update(record[0]["tokens"], record[0]["entropy"]):
+                text = answer_text(tokenizer, document.tokens,
+                                   settings.stop_token_ids)
+                self._set(0, anchor, match_label(text, spec.labels), on_label)
+                conditioning.release(document.conditioning_row)
+            return True
+
+        def ask(key):
+            # a settled canvas skips the steps left and goes on to
+            # whatever follows the classification
+            document = canvases.get(self.index_of(key))
+            return (Stage.SKIP if document is not None
+                    and document.tokens is not None else None)
 
         self.stages = [Stage(suffixes=[[cue]], readout=readout, frame=frame,
-                             decide=step, read_all_rows=True, single=True,
+                             requests=ask if number else None, decide=step,
+                             read_all_rows=True, single=True,
                              label=spec.name, canvas=canvas,
                              canvas_rows=settings.canvas_rows, step=number)
                        for number in range(settings.max_steps)]

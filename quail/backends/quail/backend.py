@@ -188,12 +188,6 @@ class QuailModelExecution:
             own = self._part(sink, ids, parts, inputs, context)
             stages = _gated_stages(parts + [own])
             stats = {}
-            # a canvas classification's denoising steps read and write
-            # its self-conditioning rows
-            conditioning = next(
-                (part.plan.conditioning for part in parts + [own]
-                 if isinstance(part, _ClassifyPart)
-                 and part.plan.conditioning is not None), None)
             every, spans, tokens = run_stages(
                 state["torch"], state["arena"], state["pipeline"], stages,
                 prefixes, state["chunk_tokens"],
@@ -204,7 +198,7 @@ class QuailModelExecution:
                 on_chunk=lambda transitions: _report_chain_transitions(
                     parts + [own], transitions),
                 label=f"pipeline {alias} ({len(stages)} stages)",
-                conditioning=conditioning)
+                conditioning=_chain_conditioning(parts + [own]))
             _complete_chain(parts + [own], every, spans, tokens, stats,
                             state["torch"], gpu_inputs)
         for part in parts:
@@ -357,7 +351,8 @@ class QuailModelExecution:
             anchor_keys=anchor_keys, on_settled=on_settled,
             attention_mode=attention, prefix_tree=tree, stats=join_stats,
             on_chunk=on_chunk, label=f"join ({len(join_stages)} stages)",
-            staging=_staging(self._state))
+            staging=_staging(self._state),
+            conditioning=_chain_conditioning(parts))
         answers = every[leading:]
         if chain is not None:
             # the join packs frames and partner suffixes; the rest is the chain's
@@ -622,6 +617,13 @@ class _ApplyGate:
     def result(self, tokens, gpu_s, chunks, stats) -> NodeResult:
         return NodeResult(foreign_outputs(self.node, self.produced),
                           self.metrics())
+
+
+def _chain_conditioning(parts):
+    """The ConditioningRows a chain's canvas classification denoises with."""
+    return next((part.plan.conditioning for part in parts
+                 if isinstance(part, _ClassifyPart)
+                 and part.plan.conditioning is not None), None)
 
 
 def _gated_stages(parts) -> list:

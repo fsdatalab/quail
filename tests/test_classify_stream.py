@@ -121,12 +121,15 @@ def fused_graph():
     return PhysicalGraph(tuple(nodes), PortRef("group:0", "ids:r"))
 
 
-def test_a_canvas_classification_runs_in_its_filter_chain_pipeline(monkeypatch):
+@pytest.mark.parametrize("joined", [False, True])
+def test_a_canvas_classification_runs_in_its_filter_chain_pipeline(
+        monkeypatch, joined):
     """A filter, then a diffusion model's classification: one run.
 
     Each survivor's denoising steps run over its resident KV, in
     chunks that also hold other documents' filter rows; the filter's
-    fixed canvas reads no self-conditioning input.
+    fixed canvas reads no self-conditioning input. With ``joined`` a
+    label filter and a join follow, in the same pipeline.
     """
     torch = pytest.importorskip("torch")
     from dataclasses import replace
@@ -161,9 +164,33 @@ def test_a_canvas_classification_runs_in_its_filter_chain_pipeline(monkeypatch):
             backend_name="quail", model="diffusion-gemma-26b-a4b-fp8",
             spec=spec),
     ]
-    graph = PhysicalGraph(tuple(nodes), PortRef("classify:r", "scores"))
+    root = PortRef("classify:r", "scores")
+    if joined:
+        nodes += [
+            Scan(node_id="input:p", alias="p", input_id="p"),
+            LabelFilter(
+                node_id="label:r",
+                inputs=input_ports((PortRef("classify:r", "scores"),)),
+                score_name="topic", aliases=("r",), comparison="in",
+                threshold=0.0, selectivity=0.5, written_pos=1,
+                accepted=("a",)),
+            AiJoin(
+                node_id="group:0", anchor="r", anchor_resident="filter",
+                inputs=input_ports((PortRef("label:r", "ids:r"),
+                                    PortRef("input:p", "ids:p"))),
+                stages=(JoinStage(
+                    written_pos=2, exec_idx=0, anchor="r", partners=("p",),
+                    semantics="full", selectivity=0.5, expected_tuples=1,
+                    anchor_frame_tokens=1, pair_tail_tokens=0,
+                    anchor_resident="filter", tuple_tokens=0, pairs_from="",
+                    frame_token_ids=(FRAME,), label_token_ids=(("p", ()),),
+                    tail_token_ids=()),)),
+        ]
+        root = PortRef("group:0", "ids:r")
+    graph = PhysicalGraph(tuple(nodes), root)
     chains = {pipeline.node_ids for pipeline in build_pipelines(graph).values()}
-    assert chains == {("filter:r", "classify:r")}
+    assert chains == {("filter:r", "classify:r", "label:r", "group:0")
+                      if joined else ("filter:r", "classify:r")}
 
     filter_truth = [[1], [0], [1], [1]]
     # a survivor's canvas settles on "a", "b", or a stop token first
@@ -194,6 +221,12 @@ def test_a_canvas_classification_runs_in_its_filter_chain_pipeline(monkeypatch):
                         row = torch.full((vocab,), -1000.0)
                         row[token] = 1000.0
                         rows.append(row)
+                elif suffix[0] >= FRAME:
+                    rows.append(torch.zeros(vocab))
+                elif suffix[0] >= PARTNER:
+                    # document 0 pairs with partner 1 only
+                    rows.append(torch.full(
+                        (vocab,), float(document == 0 and suffix[0] == PARTNER + 1)))
                 else:
                     # a filter row on the fixed canvas: TRUE is any
                     # nonzero
@@ -226,7 +259,8 @@ def test_a_canvas_classification_runs_in_its_filter_chain_pipeline(monkeypatch):
         model_spec=SimpleNamespace(name="tiny", vocab=vocab,
                                    denoising=settings),
         tokenizer=tokenizer)
-    docs = {"r": [[DOC + d] * (3 + d) for d in range(4)]}
+    docs = {"r": [[DOC + d] * (3 + d) for d in range(4)],
+            "p": [[PARTNER + d] for d in range(2)]}
     state = {
         "torch": torch, "arena": arena, "pipeline": pipeline,
         "model_execution": execution,
@@ -256,6 +290,14 @@ def test_a_canvas_classification_runs_in_its_filter_chain_pipeline(monkeypatch):
     assert metrics["classify:r"]["fresh_tokens"] == 3 * 2 + steps * 5
     assert metrics["classify:r"]["evaluated_documents"] == 3
     assert metrics["filter:r"]["fresh_tokens"] == sum(map(len, docs["r"])) + 4
+    if joined:
+        # the label filter keeps document 0, whose partner suffixes
+        # ran over its resident KV after its last denoising step
+        assert outputs[PortRef("label:r", "ids:r")].column("r").to_pylist() \
+            == [0]
+        joined_ids = outputs[PortRef("group:0", "ids:r")]
+        assert joined_ids.column("r").to_pylist() == [0]
+        assert metrics["group:0"]["fresh_tokens"] == 1 + 2
 
 
 def test_streamed_classification_labels_survivors_with_their_kv_resident(
