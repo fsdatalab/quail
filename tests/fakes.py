@@ -150,20 +150,39 @@ def fake_torch():
 
 
 def fake_pack(torch, arena, specs, **kw):
+    # a group's own canvas rows are packed; the chunk's are not counted
     tokens = sum(
         (len(spec["prefix"]) if spec["prefix"] is not None else 0)
-        + sum(len(suffix) for suffix in spec["suffixes"])
+        + sum(len(suffix) + len(spec.get("canvas", ()))
+              for suffix in spec["suffixes"])
         for spec in specs)
+
     # one row per suffix, every row of a suffix read whole, or every
     # row of the canvas after it
-    canvas = len(kw.get("canvas") or ())
+    def canvas_rows(spec):
+        own = spec.get("canvas")
+        return len(kw.get("canvas") or ()) if own is None else len(own)
+
     rows_per_answer = tuple(
-        (canvas or len(suffix)) if spec.get("read_all_rows") else 1
+        (canvas_rows(spec) or len(suffix)) if spec.get("read_all_rows") else 1
         for spec in specs for suffix in spec["suffixes"])
     if all(rows == 1 for rows in rows_per_answer):
         rows_per_answer = ()
+    meta = {}
+    if any(spec.get("conditioning") is not None for spec in specs):
+        import torch as real
+
+        # each canvas row reads its self-conditioning row, as pack_chunk
+        # gathers it
+        index = real.tensor([
+            spec["conditioning"] + row for spec in specs
+            for _ in spec["suffixes"] for row in range(len(spec["canvas"]))])
+        meta["canvas"] = dict(
+            conditioning_rows=index,
+            conditioning=kw["conditioning"].index_select(0, index))
     return SimpleNamespace(specs=specs, tokens=tokens, temporary_keys=(),
-                           fresh_keys=(), rows_per_answer=rows_per_answer)
+                           fresh_keys=(), rows_per_answer=rows_per_answer,
+                           meta=meta)
 
 
 def expected_filter_rows(filter_truth):

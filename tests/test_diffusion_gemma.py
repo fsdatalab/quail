@@ -417,3 +417,171 @@ def test_tuned_moe_configs_merge_upstream_or_fall_back(tmp_path):
         (folder / name).write_text("{}")
     write_configs(folder, tmp_path / "missing")
     assert list(folder.glob("*.json")) == []
+
+
+def test_denoising_settings_match_the_checkpoint_and_schedule_temperature():
+    from quail.backends.quail.executor.denoise import check_denoising
+
+    settings = SPEC.denoising
+    assert (settings.canvas_rows, settings.max_steps) == (16, 48)
+    # the checkpoint's generation_config.json and final_logit_softcapping
+    generation = {"confidence_threshold": 0.005, "eos_token_id": [1, 106, 50],
+                  "max_denoising_steps": 48,
+                  "sampler_config": {"_cls_name": "EntropyBoundSamplerConfig",
+                                     "entropy_bound": 0.1},
+                  "stability_threshold": 1, "t_max": 0.8, "t_min": 0.4}
+    check_denoising(settings, generation, 30.0)
+    with pytest.raises(ValueError, match="t_min"):
+        check_denoising(settings, dict(generation, t_min=0.5), 30.0)
+    with pytest.raises(ValueError, match="eos_token_id"):
+        check_denoising(settings, dict(generation, eos_token_id=1), 30.0)
+    with pytest.raises(ValueError, match="final_logit_softcapping"):
+        check_denoising(settings, generation, None)
+    # the temperature falls from t_max at the first step; the last
+    # steps keep one step of the range above t_min
+    assert settings.temperature(0) == pytest.approx(0.8)
+    assert settings.temperature(47) == pytest.approx(0.4 + 0.4 / 48)
+    assert settings.temperature(60) == settings.temperature(47)
+
+
+def test_denoising_steps_keep_low_entropy_rows_until_the_canvas_settles():
+    import numpy as np
+
+    from quail.backends.quail.executor.denoise import (
+        DocumentCanvas,
+        accepted_rows,
+        answer_text,
+    )
+    from quail.specs import Denoising
+
+    # rows are kept by rising entropy while the kept rows' sum, less the
+    # largest, is at most the bound: 0 + 0.04 + 0.05 of the first four
+    entropy = [0.05, 0.0, 0.2, 0.04, 0.3]
+    assert accepted_rows(entropy, 0.1).tolist() == [True, True, True, True,
+                                                     False]
+    assert accepted_rows([0.0] * 3, 0.1).all()
+
+    settings = Denoising(
+        canvas_rows=4, max_steps=4, t_min=0.4, t_max=0.8, entropy_bound=0.1,
+        confidence_threshold=0.005, stability_threshold=1, logit_softcap=30.0,
+        stop_token_ids=(0,))
+    document = DocumentCanvas(settings, 100, (0, 7), conditioning_row=32)
+    rng = np.random.default_rng((0, 7))
+    assert document.canvas.tolist() == rng.integers(0, 100, 4).tolist()
+    assert DocumentCanvas(settings, 100, (0, 8), 0).canvas.tolist() != \
+        document.canvas.tolist()
+    # the most uncertain row is drawn again: with it, the kept rows'
+    # entropy less the largest would be 1.0
+    uncertain = [0.0, 0.0, 1.0, 2.0]
+    assert document.update([5, 6, 7, 8], uncertain)
+    noise = rng.integers(0, 100, 4)
+    assert document.canvas.tolist() == [5, 6, 7, int(noise[3])]
+    # the same tokens again, but one row is still uncertain
+    assert document.update([5, 6, 7, 8], uncertain)
+    # stable and certain: the canvas is done with these tokens
+    assert not document.update([5, 6, 7, 8], [0.0] * 4)
+    assert document.tokens.tolist() == [5, 6, 7, 8] and document.steps == 3
+    # a canvas that never settles ends after max_steps
+    restless = DocumentCanvas(settings, 100, (0, 9), 0)
+    answers = [[1, 2, 3, 4], [2, 2, 3, 4], [1, 2, 3, 4], [3, 2, 3, 4]]
+    assert [restless.update(tokens, [0.0] * 4) for tokens in answers] == [
+        True, True, True, False]
+    assert restless.tokens.tolist() == [3, 2, 3, 4]
+
+    spelled = SimpleNamespace(decode=lambda ids, skip_special_tokens: ",".join(
+        str(i) for i in ids if not (skip_special_tokens and i == 9)))
+    assert answer_text(spelled, [3, 9, 4, 0, 5], (0, 1)) == "3,4"
+    assert answer_text(spelled, [3, 4], (0,)) == "3,4"
+
+
+def test_denoise_readout_follows_vllm_sampler_arithmetic():
+    torch = pytest.importorskip("torch")
+    from quail.backends.quail.executor.denoise import (
+        AsyncCanvasReadout,
+        ConditioningRows,
+        denoise_rows,
+    )
+    from quail.specs import Denoising
+
+    torch.manual_seed(0)
+    vocab, hidden = 40, 6
+    head = torch.randn(vocab, hidden, dtype=torch.bfloat16)
+    normed = torch.randn(7, hidden, dtype=torch.bfloat16) * 4
+    temperature = torch.linspace(0.4, 0.8, 7)
+    normalizer = torch.tensor(2.5, dtype=torch.bfloat16)
+    # two-row blocks give the same rows as one pass
+    tokens, entropy, soft = denoise_rows(
+        torch, torch.nn.functional, normed, head, normalizer, temperature,
+        30.0, block_rows=2)
+    logits = torch.nn.functional.linear(normed, head).float()
+    scaled = torch.tanh(logits / 30.0) * 30.0 / temperature[:, None]
+    logprobs = scaled.log_softmax(dim=1)
+    probs = logprobs.exp()
+    assert torch.equal(tokens, scaled.argmax(dim=1))
+    assert torch.allclose(entropy, -(probs * logprobs).sum(dim=1), atol=1e-5)
+    expected = (probs.to(torch.bfloat16) @ head) * normalizer
+    assert torch.allclose(soft.float(), expected.float(), atol=1e-2)
+
+    # the readout writes each canvas's next input into the rows it read
+    # and returns its tokens and entropies
+    settings = Denoising(
+        canvas_rows=2, max_steps=4, t_min=0.4, t_max=0.8, entropy_bound=0.1,
+        confidence_threshold=0.005, stability_threshold=1, logit_softcap=30.0,
+        stop_token_ids=(0,))
+    conditioning = ConditioningRows(torch, hidden, 2, torch.bfloat16, "cpu",
+                                    blocks=1)
+    first = conditioning.take()
+    conditioning.rows.fill_(1.0)
+    # a second block doubles the rows and keeps the first block's
+    second = conditioning.take()
+    assert (first, second) == (0, 2) and conditioning.rows.shape == (4, hidden)
+    assert conditioning.rows[:2].eq(1).all() and not conditioning.rows[2:].any()
+    readout = AsyncCanvasReadout(torch, torch.nn.functional, head, normalizer,
+                                 settings, conditioning)
+    chunk = SimpleNamespace(meta={"canvas": {
+        "conditioning_rows": torch.tensor([2, 3, 0, 1])}})
+    records = readout.result(readout.submit(normed[:4], chunk=chunk,
+                                            stages=[0, 3]))
+    temperature = torch.tensor([0.8, 0.8, settings.temperature(3),
+                                settings.temperature(3)])
+    tokens, entropy, soft = denoise_rows(
+        torch, torch.nn.functional, normed[:4], head, normalizer, temperature,
+        30.0, block_rows=256)
+    assert records["tokens"].tolist() == tokens.view(2, 2).tolist()
+    assert records["entropy"] == pytest.approx(entropy.view(2, 2).numpy())
+    assert torch.equal(conditioning.rows[2:], soft[:2])
+    assert torch.equal(conditioning.rows[:2], soft[2:])
+    with pytest.raises(ValueError, match="canvases"):
+        readout.submit(normed[:3], chunk=chunk, stages=[0, 1])
+    # a block given back is zeroed for the next document
+    conditioning.release(first)
+    assert conditioning.take() == 0 and not conditioning.rows[:2].any()
+
+
+def test_canvas_rows_add_the_self_conditioning_signal(monkeypatch):
+    torch = pytest.importorskip("torch")
+    _vllm_stubs(monkeypatch)
+    model = _fake_model(torch)
+    pre_norm = _Norm(torch.tensor(1.0))
+    model.self_conditioning.pre_norm = pre_norm
+    model.self_conditioning.gate_proj = lambda x: 2 * x
+    model.self_conditioning.up_proj = lambda x: x
+    model.self_conditioning.down_proj = lambda x: x
+    pipeline = DiffusionGemmaPipeline(model, None, spec=_spec_for(model),
+                                      engine_class=_Engine)
+    monkeypatch.setattr(pipeline, "_layers",
+                        lambda hidden, positions, meta: hidden)
+    rows = torch.tensor([1, 2])
+    chunk = SimpleNamespace(
+        input_ids=torch.zeros(3, dtype=torch.int64), positions=torch.arange(3),
+        meta={"layer": 0, "canvas": {"rows": rows}})
+    # every row embeds to 2; without conditioning a canvas row is the
+    # weightless norm of its embedding
+    assert pipeline.backbone_rows(chunk).tolist() == [[2.0] * 4] * 3
+    # a unit soft embedding adds down(gelu(gate(x)) * up(x))
+    chunk.meta["canvas"]["conditioning"] = torch.ones(2, 4)
+    signal = torch.nn.functional.gelu(torch.tensor(2.0),
+                                      approximate="tanh").item()
+    out = pipeline.backbone_rows(chunk)
+    assert out[0].tolist() == [2.0] * 4
+    assert out[1:].flatten().tolist() == pytest.approx([2.0 + signal] * 8)

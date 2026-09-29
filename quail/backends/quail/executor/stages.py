@@ -59,9 +59,13 @@ class Stage:
         chains: For a stage whose one suffix packs a label trie, the
             chains from ``trie_chains``: the packer makes each a causal
             segment and gathers the ancestors above it.
-        canvas_widths: Per suffix, the rows of the canvas packed after
-            it, at most the run's canvas; None packs the whole canvas
-            after every suffix.
+        canvas: For a diffusion model's denoising step, Callable(document
+            index) -> (token ids, conditioning row): the canvas the
+            document packs after each suffix in place of the pipeline's,
+            and the first of its rows in the run's conditioning rows.
+            Asked when the document's group is packed. None packs the
+            pipeline's canvas.
+        canvas_rows: The rows of every canvas ``canvas`` returns.
     """
 
     DROP = DROP
@@ -75,7 +79,8 @@ class Stage:
     single: bool = False
     label: str = ""
     chains: list | None = None
-    canvas_widths: list | None = None
+    canvas: Callable | None = None
+    canvas_rows: int = 0
 
 
 def shared_preamble_tokens(question_ids) -> int:
@@ -128,7 +133,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                anchor_keys=None, on_settled=None, staging=None,
                attention_mode=None, prefix_tree=None, stats=None,
                limit=None, paged=True, unit="anchors", label=None,
-               default_attention="tree", on_chunk=None, canvas=None):
+               default_attention="tree", on_chunk=None, conditioning=None):
     """Run every stage over the documents with one admission.
 
     Args:
@@ -164,9 +169,8 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
             read with the documents that completed a stage in it, as
             (document index, stage, passed) tuples: passed says the
             document went on to the next stage, or survived the last.
-        canvas: The token ids of the canvas packed after every suffix,
-            read whole by a classification; None packs the pipeline's
-            own canvas, a filter's one answer row.
+        conditioning: For denoising steps, the ConditioningRows every
+            stage's canvas names rows in; None otherwise.
 
     Returns:
         (answers, spans, tokens): answers[j][a] = the row of stage j's
@@ -201,21 +205,18 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
     suffixes = [Suffixes.of(stage.suffixes) for stage in stages]
     # a stage's suffixes read their document: tree unless the plan says
     mode = attention_path(pipeline, attention_mode, default=default_attention)
-    # a classification reads every row of its own, longer canvas
-    canvas = tuple(pipeline.canvas_ids if canvas is None else canvas)
+    canvas = tuple(pipeline.canvas_ids)
     answer_row = pipeline.canvas_answer_row
     # per stage, the canvas rows after each suffix
-    canvas_rows = [
-        np.asarray(stage.canvas_widths if stage.canvas_widths is not None
-                   else [len(canvas)] * len(stage.suffixes), dtype=np.int64)
-        for stage in stages]
+    canvas_rows = [len(canvas) if stage.canvas is None else stage.canvas_rows
+                   for stage in stages]
 
     def entry_rows(a, j, start, end, carried):
         f = len(prefixes[a])
         indices = sched.partner_indices(a, j, start, end)
         lengths = suffixes[j].lengths_at(indices)
         rows = ((f if carried else 0) + int(lengths.sum())
-                + int(canvas_rows[j][indices].sum()))
+                + canvas_rows[j] * len(lengths))
         if writes[j] and start == 0:
             rows += len(frames[j]) + len(canvas)
         return rows
@@ -231,8 +232,9 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
     capacity_extra = frame_max
     if paged and mode == "unified":
         capacity_extra = max(
-            [frame_max] + [len(frame) + len(stage.suffixes[0]) + len(canvas)
-                           for frame, stage in zip(frames, stages)
+            [frame_max] + [len(frame) + len(stage.suffixes[0]) + rows
+                           for frame, stage, rows in zip(frames, stages,
+                                                         canvas_rows)
                            if stage.single])
 
     def held_pages(key, prefix_tokens):
@@ -342,7 +344,12 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
             sufs = suffixes[j].take(indices)
             read_all = stages[j].read_all_rows
             rows = int(sufs.lengths.sum()) if read_all else len(sufs)
-            widths = canvas_rows[j][indices] if canvas else None
+            own = {}
+            if stages[j].canvas is not None:
+                ids, row = stages[j].canvas(a)
+                own = dict(canvas=ids, conditioning=row)
+                if read_all:
+                    rows = stages[j].canvas_rows * len(sufs)
             # under tree attention a borrowing document with one
             # suffix reads its parent's pages stacked with its siblings
             read_key = keys[parent] if shared and stages[j].single else None
@@ -354,7 +361,8 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                     f=f, suffixes=Suffixes(
                         np.concatenate([frame_ids[j], sufs.ids]),
                         [len(frame) + int(sufs.lengths[0])]),
-                    write_suffix_tokens=len(frame), single=True))
+                    write_suffix_tokens=len(frame), single=True,
+                    read_all_rows=read_all, **own))
             elif writes[j] and start == 0:
                 # frame entry: scatter the frame into KV after the
                 # document rows; its own answer row means nothing
@@ -366,18 +374,19 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                 specs.append(dict(
                     key=key, prefix=None, f=f + len(frame),
                     suffixes=sufs, read_all_rows=read_all,
-                    chains=stages[j].chains, canvas_widths=widths))
+                    chains=stages[j].chains, **own))
             else:
                 specs.append(dict(
                     key=key, prefix=prefix, start=shared, read_key=read_key,
                     f=f + len(frame),
                     suffixes=sufs, read_all_rows=read_all,
                     single=stages[j].single and end - start == 1,
-                    chains=stages[j].chains, canvas_widths=widths))
+                    chains=stages[j].chains, **own))
             entries.append((j, rows))
-        chunk = pack_chunk(torch, arena, specs, attention_mode=mode,
-                           staging=staging, canvas=canvas,
-                           answer_row=answer_row)
+        chunk = pack_chunk(
+            torch, arena, specs, attention_mode=mode, staging=staging,
+            canvas=canvas, answer_row=answer_row,
+            conditioning=None if conditioning is None else conditioning.rows)
         return chunk, entries
 
     def settle(anchor):
@@ -406,16 +415,33 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                 0, torch.tensor(index, device=normed.device))
         return [normed[r] for r in index]
 
-    def submit(normed, entries, rows_per_answer):
+    def answer_stages(part):
+        """The stage of every answer of a chunk's groups, in order."""
+        out = []
+        for a, j, start, end, _ in part:
+            if writes[j] and start == 0 and not merged(j, start, end):
+                out.append(j)        # the frame entry's answer
+            out.extend([j] * (end - start))
+        return out
+
+    def submit(normed, entries, chunk, part):
         """Hand each stage's answer rows to its readout; returns handles.
 
         With one readout for every stage the whole chunk goes in one
-        call, keyed None; otherwise each stage's rows go to its own.
+        call, keyed None; otherwise each stage's rows go to its own. A
+        readout with ``reads_chunk`` also takes the chunk and the stage
+        of every answer.
         """
+        rows_per_answer = chunk.rows_per_answer
         if shared_readout:
             readout = stages[0].readout
+            if getattr(readout, "reads_chunk", False):
+                return {None: readout.submit(normed, chunk=chunk,
+                                             stages=answer_stages(part))}
             return {None: (readout.submit(normed, rows_per_answer=rows_per_answer)
                            if rows_per_answer else readout.submit(normed))}
+        if any(getattr(stage.readout, "reads_chunk", False) for stage in stages):
+            raise ValueError("a readout that reads the chunk serves every stage")
         by_stage = {}
         row = 0
         for j, rows in entries:
@@ -504,7 +530,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
         for key in chunk.fresh_keys:
             arena.trim_window(key)
         spans.append((part[0][1], e0, e1))
-        handles = submit(normed, entries, chunk.rows_per_answer)
+        handles = submit(normed, entries, chunk, part)
         outstanding.append((part, entries, handles))
         # read the previous chunk's answers while this one runs
         while len(outstanding) > 1:

@@ -461,3 +461,11 @@ def test_match_label_takes_the_longest_label_the_answer_starts_with():
     assert match_label("  vascular disorders", labels) == "vascular disorders"
     assert match_label("none of these", labels) is None
     assert match_label("", labels) is None
+    # a leading "thought" line, then a leading "ANSWER:", are skipped
+    assert match_label("thought\nCardiac\n", labels) == "cardiac"
+    assert match_label("ANSWER: vascular disorders", labels) == \
+        "vascular disorders"
+    assert match_label("thought\n ANSWER:cardiac", labels) == "cardiac"
+    assert match_label("thought\nnone", labels) is None
+    assert match_label("thoughtful cardiac", labels) is None
+    assert match_label("cardiac\nthought", labels) == "cardiac"

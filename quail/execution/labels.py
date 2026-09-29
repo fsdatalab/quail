@@ -4,7 +4,8 @@ A label's score is the sum of its tokens' log probabilities after the
 prompt, each read at the position before the token. Labels that share
 leading tokens share those positions, so the positions to read are the
 proper prefixes of the labels' token sequences: a trie whose internal
-nodes are read once each.
+nodes are read once each. A decoded answer is matched to a label by
+its text instead (match_label).
 """
 
 import numpy as np
@@ -33,23 +34,30 @@ def trie_targets(trie) -> list[int]:
     return sorted({token for tokens in trie.values() for token in tokens})
 
 
-def label_scores(label_ids, prefixes, targets, logprobs) -> np.ndarray:
-    """Return every label's summed log probability.
+def match_label(text: str, labels) -> str | None:
+    """Return the label a decoded answer names, or None.
 
-    Args:
-        label_ids: One token id sequence per label.
-        prefixes: The trie prefixes, one per row of ``logprobs``.
-        targets: The token ids, one per column of ``logprobs``.
-        logprobs: Log probabilities of each target token read after
-            each prefix, shape (len(prefixes), len(targets)).
+    A leading "thought" line and then a leading "ANSWER:" are skipped:
+    DiffusionGemma may open an empty thinking channel, which reads
+    "thought" once its special tokens are removed, or repeat the answer
+    cue. The rest's first line, trimmed, must start with a label,
+    ignoring case; the longest such label wins, then the earlier one.
+    Anything else names no label.
     """
-    row = {prefix: index for index, prefix in enumerate(prefixes)}
-    column = {token: index for index, token in enumerate(targets)}
-    scores = np.zeros(len(label_ids), dtype=np.float64)
-    for label, ids in enumerate(label_ids):
-        for depth, token in enumerate(ids):
-            scores[label] += logprobs[row[tuple(ids[:depth])], column[token]]
-    return scores
+    answer = text.strip()
+    first, _, rest = answer.partition("\n")
+    if first.strip().casefold() == "thought":
+        answer = rest.strip()
+    if answer.casefold().startswith("answer:"):
+        answer = answer[len("answer:"):]
+    answer = answer.strip().split("\n", 1)[0].strip().casefold()
+    best = None
+    for index, label in enumerate(labels):
+        candidate = label.casefold()
+        if answer.startswith(candidate) and (
+                best is None or len(candidate) > len(labels[best].casefold())):
+            best = index
+    return None if best is None else labels[best]
 
 
 def trie_paths(label_ids) -> list[tuple[int, ...]]:

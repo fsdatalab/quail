@@ -272,7 +272,8 @@ class _PoolBuilder:
 
 
 def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
-               attention_mode, staging=None, canvas=(), answer_row=0):
+               attention_mode, staging=None, canvas=(), answer_row=0,
+               conditioning=None):
     """Build tensors for one chunk from groups in chunk order.
 
     Each group is a dict with keys:
@@ -300,6 +301,10 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 is one causal segment, [prefix | suffix], whose rows
                 write the key's pages without reading them back: the
                 computation an unpaged filter does.
+      canvas    The group's own canvas token ids, packed after each of
+                its suffixes in place of the chunk's canvas.
+      conditioning  The first of the group's canvas rows in the
+                conditioning tensor.
 
     A fresh group without arena pages packs [prefix | suffix] as one
     causal segment (no scatter, no paged read). This only works with
@@ -313,11 +318,15 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
 
     canvas is the token ids a diffusion model denoises: they follow
     every suffix as extra rows, and the answer row is canvas row
-    answer_row instead of the suffix's last row. Canvas KV goes
-    wherever the suffix's KV goes and is never kept. Canvas rows run
-    the unified path only. A group's canvas_widths, one per suffix,
-    shortens the canvas after each suffix to its leading rows; the
-    answer row must lie inside every width.
+    answer_row instead of the suffix's last row; with read_all_rows
+    every canvas row is read instead. Canvas KV goes wherever the
+    suffix's KV goes and is never kept. Canvas rows run the unified
+    path only.
+
+    conditioning holds the self-conditioning input of a denoising
+    step, one hidden row per canvas row. The chunk's canvas rows take
+    their rows from it in order, at each group's conditioning row;
+    every canvas in a chunk names its rows, or none does.
     """
     def stage(name, values, dtype):
         if staging is not None:
@@ -332,7 +341,8 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             f"attention_mode must be one of {ATTENTION_PATHS}, "
             f"got {attention_mode!r}")
     canvas = tuple(canvas)
-    if canvas and attention_mode != "unified":
+    if attention_mode != "unified" and (
+            canvas or any(g.get("canvas") is not None for g in groups)):
         raise ValueError("canvas rows run the unified attention path")
     if canvas and not 0 <= answer_row < len(canvas):
         raise ValueError(
@@ -343,8 +353,9 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     tree_path = attention_mode == "tree"
     canvas_ids = np.asarray(canvas, dtype=np.int64)
     canvas_starts = []    # per group, the first row of each canvas
-    canvas_widths = []    # per group, the rows of each canvas
+    canvas_sizes = []     # per group, the rows of each canvas
     canvas_seq = []       # its sequence in the unified paged call
+    conditioning_rows = []    # per group, each canvas row's input row
     id_parts, token_count = [], 0
     pos, finals = [], []
     cu_a = [np.zeros(1, dtype=np.int64)]
@@ -412,37 +423,38 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         # with a canvas, read_all_rows reads every canvas row instead
         # of the suffix's own rows
         read_all = bool(g.get("read_all_rows"))
+        own = g.get("canvas")
+        group_canvas = (canvas_ids if own is None
+                        else np.asarray(own, dtype=np.int64))
+        width = len(group_canvas)
+        if width and not read_all and answer_row >= width:
+            raise ValueError(
+                f"group {key!r}: answer_row {answer_row} is outside its "
+                f"{width}-row canvas")
         # every suffix's rows at once: positions restart at f for each
         # suffix, and a canvas continues its suffix's positions
-        rows_of = g.get("canvas_widths")
-        rows_of = (np.full(n, len(canvas), dtype=np.int64) if rows_of is None
-                   else np.asarray(rows_of, dtype=np.int64))
-        if canvas and n and (len(rows_of) != n or rows_of.min() <= answer_row
-                             or rows_of.max() > len(canvas)):
-            raise ValueError(
-                f"group {key!r}: canvas_widths must give each of the {n} "
-                f"suffixes between {answer_row + 1} and {len(canvas)} rows")
-        widths = sufs.lengths + (rows_of if canvas else 0)
+        widths = sufs.lengths + width
         total = int(widths.sum())
         ends = np.cumsum(widths)
         begins = ends - widths
         within = np.arange(total, dtype=np.int64) - np.repeat(begins, widths)
-        if n and canvas:
+        if n and width:
             # row answer_row of each canvas carries the answer
             past = within - np.repeat(sufs.lengths, widths)
             source = np.where(
                 past >= 0, len(sufs.ids) + past,
                 np.repeat(sufs.offsets[:-1], widths) + within)
-            id_parts.append(np.concatenate([sufs.ids, canvas_ids])[source])
+            id_parts.append(np.concatenate([sufs.ids, group_canvas])[source])
             first = s_row0 + begins + sufs.lengths
             canvas_starts.append(first)
-            canvas_widths.append(rows_of)
+            canvas_sizes.append(np.full(n, width, dtype=np.int64))
+            if g.get("conditioning") is not None:
+                conditioning_rows.append(np.tile(
+                    g["conditioning"] + np.arange(width, dtype=np.int64), n))
             if read_all:
-                cum = np.cumsum(rows_of)
-                finals.append(np.repeat(first, rows_of)
-                              + np.arange(int(cum[-1]), dtype=np.int64)
-                              - np.repeat(cum - rows_of, rows_of))
-                rows_per_answer.append(rows_of)
+                finals.append(np.repeat(first, width)
+                              + np.tile(np.arange(width, dtype=np.int64), n))
+                rows_per_answer.append(np.full(n, width, dtype=np.int64))
                 multi_row = True
             else:
                 finals.append(first + answer_row)
@@ -522,7 +534,8 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 unified_groups.append(dict(
                     key=key, fresh=fresh, f=f, row0=row0, start=start,
                     prefix_end=prefix_end, row1=token_count,
-                    suffix_spans=(s_row0 + begins, s_row0 + ends)))
+                    suffix_spans=(s_row0 + begins, s_row0 + ends),
+                    canvas=bool(n and width)))
             elif not fresh:
                 raise ValueError(
                     "unified attention requires pages for a kept "
@@ -607,7 +620,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                         pool.scatter_direct(view, r0, r1, logical_start)
                         pool.add_sequence(view.pages, f + suffix_total - view.start)
                     cu_q.append(cu_q[-1] + count)
-                    if canvas:
+                    if spec["canvas"]:
                         canvas_seq.append(len(cu_q) - 2)
                     continue
 
@@ -655,7 +668,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                             view.pages[:kept_pages] + temp.pages,
                             f - view.start + suffix_tokens)
                     cu_q.append(cu_q[-1] + suffix_tokens)
-                    if canvas:
+                    if spec["canvas"]:
                         canvas_seq.append(len(cu_q) - 2)
 
             built = [pool.build(arena, stage, torch, staging, index)
@@ -694,7 +707,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             raise ValueError(
                 "the unpaged canvas call pairs one canvas with each "
                 "causal segment; a group without a suffix has none")
-        widths = np.concatenate(canvas_widths)
+        widths = np.concatenate(canvas_sizes)
         cum = np.cumsum(widths)
         canvas_meta = dict(
             rows=stage("canvas_rows", np.repeat(starts, widths)
@@ -703,6 +716,15 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             cu_q=stage("canvas_cu_q", np.concatenate([[0], cum]),
                        torch.int32),
             max_q=int(widths.max()))
+        if conditioning_rows:
+            index = np.concatenate(conditioning_rows)
+            if len(index) != int(cum[-1]) or conditioning is None:
+                raise ValueError(
+                    "every canvas in a chunk reads its self-conditioning "
+                    "rows from the conditioning tensor, or none does")
+            index = stage("conditioning_rows", index, torch.int64)
+            canvas_meta["conditioning_rows"] = index
+            canvas_meta["conditioning"] = conditioning.index_select(0, index)
         if unified is not None:
             seq = stage("canvas_seq", canvas_seq, torch.int64)
             canvas_meta["table"] = unified["table"].index_select(0, seq)

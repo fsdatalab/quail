@@ -18,6 +18,7 @@ from quail.backends.request_scheduling import (
     true_bit,
 )
 from quail.cost import budgets
+from quail.execution.labels import match_label
 from quail.execution.pairs import (
     allowed_members,
     members_by_partner,
@@ -587,23 +588,6 @@ def _pipelined_filter(client, sampling_params, bodies, questions, read_answer,
         "stages": stages,
         "doc_cap": result["doc_cap"],
     }
-
-
-def match_label(text: str, labels) -> str | None:
-    """Return the label a decoded answer names, or None.
-
-    The answer's first line, trimmed, must start with a label, ignoring
-    case; the longest such label wins, then the earlier one. Anything
-    else names no label.
-    """
-    answer = text.strip().split("\n", 1)[0].strip().casefold()
-    best = None
-    for index, label in enumerate(labels):
-        candidate = label.casefold()
-        if answer.startswith(candidate) and (
-                best is None or len(candidate) > len(labels[best].casefold())):
-            best = index
-    return None if best is None else labels[best]
 
 
 def _classify_documents(client, spec, bodies) -> dict:

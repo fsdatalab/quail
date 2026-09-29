@@ -1,4 +1,4 @@
-from .base import ModelSpec
+from .base import Denoising, ModelSpec
 
 DIFFUSION_GEMMA_26B_FP8 = ModelSpec(
     name="diffusion-gemma-26b-a4b-fp8",
@@ -32,7 +32,14 @@ DIFFUSION_GEMMA_26B_FP8 = ModelSpec(
     arch="diffusion_gemma",
     # Prefill the empty thinking channel so the next position holds the answer.
     canvas_tokens=1,
-    canvas_end_text="<turn|>",
+    # canvas_rows is the 16-row canvas vLLM decoded AGENT-4 with; it
+    # holds the longest label after a "thought" line or "ANSWER:",
+    # which the model may write first
+    denoising=Denoising(
+        canvas_rows=16, max_steps=48, t_min=0.4, t_max=0.8,
+        entropy_bound=0.1, confidence_threshold=0.005,
+        stability_threshold=1, logit_softcap=30.0,
+        stop_token_ids=(1, 106, 50)),
     turn_prefix="<bos><|turn>user\n",
     turn_suffix="<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
     prompt_format="gemma4-chat-nonthinking-v1",

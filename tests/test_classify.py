@@ -24,7 +24,6 @@ from quail.catalog import DocumentProvider
 from quail.execution.labels import (
     best_label,
     label_path_scores,
-    label_scores,
     label_trie,
     trie_paths,
 )
@@ -64,27 +63,20 @@ def _bytes(text):
     return list(text.encode())
 
 
-def test_label_scores_sum_each_labels_tokens_and_ties_go_first():
+def test_label_trie_holds_each_proper_prefix_and_ties_go_first():
     trie = label_trie(IDS)
     assert trie == {(): [1, 4], (1,): [2, 3]}
     with pytest.raises(ValueError, match="no tokens"):
         label_trie([(1,), ()])
-    prefixes, targets = [(), (1,)], [1, 2, 3, 4]
-    unread = 1e-9    # tokens the trie never reads after that prefix
-    logprobs = np.log([[0.6, unread, unread, 0.4],
-                       [unread, 0.3, 0.7, unread]])
-    scores = label_scores(IDS, prefixes, targets, logprobs)
-    assert np.allclose(np.exp(scores), [0.18, 0.42, 0.4])
-    assert best_label(scores) == 1
+    assert best_label([-1.0, -0.5, -2.0]) == 1
     assert best_label([-1.0, -2.0, -1.0]) == 0
 
 
 def test_trie_paths_cover_every_proper_prefix():
     targets = [1, 2, 3, 4]
     nan = float("nan")
-    # on a canvas of two rows every trie node's suffix is the cue and
-    # the canvas: two nodes, the root and (1,)
-    assert suffix_lengths("canvas", IDS) == [3, 3]
+    # a denoising step sends the cue and the whole canvas
+    assert suffix_lengths("canvas", IDS, 16) == [17]
 
     # one chain over the deepest proper prefix (1,) reads both rows
     assert trie_paths(IDS) == [(1,)]
@@ -676,58 +668,95 @@ def test_bench_reads_classify_plans_and_reports_labels_by_operator():
         "a", "b", "c"]
 
 
-def test_classifier_scores_each_trie_node_on_the_full_canvas(monkeypatch):
-    # labels a = [1, 2] and b = [3], each ending with the end token 7;
-    # the canvas has three rows, the longest label with its end
-    padded = ((1, 2, 7), (3, 7))
+def test_classifier_decodes_each_document_with_denoising_steps(monkeypatch):
+    torch = pytest.importorskip("torch")
+    from quail.backends.quail.executor.denoise import CANVAS_SEED
+    from quail.specs import Denoising
+
+    # an eight-token vocabulary; 0 stops the answer and 7 is a special
+    # token
+    spelling = {1: "a", 2: "b", 3: "\n", 4: "thought", 5: "x", 6: " "}
+    tokenizer = SimpleNamespace(decode=lambda ids, skip_special_tokens: "".join(
+        spelling.get(i, "" if skip_special_tokens else "<7>") for i in ids))
+    settings = Denoising(
+        canvas_rows=4, max_steps=5, t_min=0.4, t_max=0.8, entropy_bound=0.1,
+        confidence_threshold=0.005, stability_threshold=1, logit_softcap=30.0,
+        stop_token_ids=(0,))
     spec = ClassifySpec(
         name="topic", aliases=("d",), query_template="", arguments=(),
-        expected_inputs=2, estimated_seconds=0.0,
+        expected_inputs=3, estimated_seconds=0.0,
         prompt_token_parts=((90,), (91, 92, 93)), labels=("a", "b"),
-        label_token_ids=padded, scoring="canvas")
-    requests = label_requests(spec)
-    # one suffix per trie node, the cue and the node, and the canvas
-    # rows left after it: the root, (1,), (3,), (1, 2)
-    assert requests.frame == [91, 92]
-    assert requests.suffixes == [[93], [93, 1], [93, 3], [93, 1, 2]]
-    assert requests.canvas_rows == 3 and requests.canvas_widths == [3, 2, 2, 1]
-    assert not requests.read_all_rows and requests.targets == [1, 2, 3, 7]
-    targets = requests.targets
+        label_token_ids=((1,), (2,)), scoring="canvas")
+    # document 0 answers "thought", a special token, then "a"; document 1
+    # answers "b" only from its second step on, document 2 never
+    # settles and answers "x"
+    answers = {0: [[4, 3, 7, 1]] * 5,
+               1: [[5, 5, 5, 5]] + [[6, 2, 0, 5]] * 4,
+               2: [[5, 5, 0, 5], [5, 6, 0, 5]] * 3}
+    vocab = 8
+    head = torch.eye(vocab, dtype=torch.bfloat16)
+    packed = {}
+    seen = {}
 
-    # the first canvas row after a node favors the wanted label's next
-    # token: a for document 0, b for document 1
     def forward(chunk):
         rows = []
-        for entry in chunk.specs:
+        for index, entry in enumerate(chunk.specs):
             document = entry["key"][2]
-            wanted = padded[document]
-            for suffix in entry["suffixes"]:
-                node = tuple(suffix[1:])
-                follows = (wanted[len(node)] if wanted[:len(node)] == node
-                           and len(node) < len(wanted) else None)
-                rows.append([-1.0 if t == follows else -5.0 for t in targets])
-        return np.asarray(rows, dtype=np.float32)
+            packed.setdefault(document, []).append(list(entry["canvas"]))
+            # the first step writes the frame before the cue
+            suffixes = [list(suffix) for suffix in entry["suffixes"]]
+            first = len(packed[document]) == 1
+            assert suffixes == ([[91, 92, 93]] if first else [[93]])
+            assert entry["read_all_rows"]
+            # the step's self-conditioning input is the soft embedding
+            # the step before wrote, zero at the first step
+            conditioning = chunk.meta["canvas"]["conditioning"][
+                4 * index:4 * index + 4].float()
+            seen.setdefault(document, []).append(conditioning)
+            wanted = answers[document][len(packed[document]) - 1]
+            for token in wanted:
+                row = torch.full((vocab,), -1000.0)
+                row[token] = 1000.0
+                rows.append(row)
+        return torch.stack(rows)
 
     monkeypatch.setattr(loop, "pack_chunk", fake_pack)
-    readout = SimpleNamespace(
-        targets=np.asarray(targets), rows=1,
-        dtype=np.dtype((np.float32, (4,))),
-        submit=lambda rows, rows_per_answer=None: rows,
-        result=lambda rows: rows)
-    canvas_pipeline = fake_pipeline(
-        forward_chunk=forward, canvas_ids=(50,), tree_attention=False,
-        canvas_rows=lambda rows: tuple(range(50, 50 + rows)))
-    state = {"torch": fake_torch(), "arena": cpu_arena(64),
-             "pipeline": canvas_pipeline,
-             "chunk_tokens": 64, "label_readout": readout,
+    monkeypatch.setattr(torch.cuda, "Event", lambda **kw: SimpleNamespace(
+        record=lambda: None, elapsed_time=lambda other: 2.0))
+    pipeline = fake_pipeline(forward_chunk=forward, canvas_ids=(7,),
+                             tree_attention=False,
+                             normalizer=torch.tensor(2.0, dtype=torch.bfloat16))
+    state = {"torch": torch, "arena": cpu_arena(64), "pipeline": pipeline,
+             "chunk_tokens": 64, "model": SimpleNamespace(quail_full_head=head),
+             "model_spec": SimpleNamespace(name="tiny", vocab=vocab,
+                                           denoising=settings),
+             "tokenizer": tokenizer,
              "input_staging": SimpleNamespace(fixed_tokens=set())}
-    documents = {"d": [[10, 11], [12]]}
-    batch = QuailClassifier(state).classify(spec, [[0], [1]], documents)
-    assert list(batch.scores) == ["a", "b"]
-    # every suffix is the cue plus the three-row canvas
-    assert batch.label_tokens == 2 * 4 * 4
-    # each document packs its prefix, the two-token frame, and the suffixes
-    assert batch.fresh_tokens + batch.cached_tokens == (3 + 2) + 2 * (2 + 16)
+    # rows 4, 5, and 6 of the table
+    documents = {"d": [[9]] * 4 + [[10, 11], [12], [13]]}
+    batch = QuailClassifier(state).classify(spec, [[4], [5], [6]], documents)
+    assert list(batch.scores) == ["a", "b", None]
+    # a canvas is done once its argmax tokens repeat with every row
+    # certain, or after max_steps steps
+    assert [len(packed[d]) for d in range(3)] == [2, 3, 5]
+    # the first canvas is drawn from the document's row; every row of
+    # a certain step is kept, so the next canvas is its argmax tokens
+    first = np.random.default_rng((CANVAS_SEED, 5)).integers(0, vocab, 4)
+    assert packed[1][0] == first.tolist()
+    assert packed[1][1:] == [[5, 5, 5, 5], [6, 2, 0, 5]]
+    assert packed[0][1] == [4, 3, 7, 1]
+    # the first step reads zero conditioning; a later step reads the
+    # step before's probabilities times the embedding and normalizer
+    assert not seen[1][0].any()
+    for step, tokens in enumerate(answers[1][:2]):
+        expected = 2.0 * torch.eye(vocab)[tokens]
+        assert torch.allclose(seen[1][step + 1], expected)
+    # the cue and the canvas each step, after the prompt and the frame
+    steps = 2 + 3 + 5
+    assert batch.label_tokens == steps * (1 + 4)
+    assert batch.fresh_tokens == (3 + 2 + 2) + 3 * 2 + steps * 5
+    assert batch.cached_tokens == 0
+    assert batch.later == {}
 
 
 def test_pack_chunk_reads_every_canvas_row_when_asked():
@@ -745,57 +774,119 @@ def test_pack_chunk_reads_every_canvas_row_when_asked():
     assert chunk.input_ids.tolist() == [1, 2, 10, *canvas, 4, 12, *canvas]
     assert chunk.final_indices.tolist() == [3, 4, 5, 8, 9, 10]
     assert chunk.rows_per_answer == (3, 3)
-    # a group's canvas_widths keep the leading rows of the canvas after
-    # each suffix, and the answer row is the first canvas row
+    # a group's own canvas replaces the chunk's, every row read, and
+    # its rows take their self-conditioning input from its rows of the
+    # conditioning tensor
+    conditioning = torch.arange(24, dtype=torch.float32).view(12, 2)
     groups = [dict(key=("d", 0), prefix=[1, 2], f=2, suffixes=[[10]],
-                   canvas_widths=[3]),
+                   read_all_rows=True, canvas=[80, 81], conditioning=4),
               dict(key=("d", 1), prefix=[4], f=1, suffixes=[[12]],
-                   canvas_widths=[1])]
+                   read_all_rows=True, canvas=[82, 83], conditioning=0)]
     chunk = loop.pack_chunk(torch, arena, groups, attention_mode="unified",
-                            canvas=canvas)
-    assert chunk.input_ids.tolist() == [1, 2, 10, 90, 91, 92, 4, 12, 90]
-    assert chunk.final_indices.tolist() == [3, 8]
-    assert chunk.meta["canvas"]["cu_q"].tolist() == [0, 3, 4]
-    with pytest.raises(ValueError, match="canvas_widths"):
-        loop.pack_chunk(torch, arena, [dict(groups[0], canvas_widths=[4])],
-                        attention_mode="unified", canvas=canvas)
+                            canvas=canvas, conditioning=conditioning)
+    assert chunk.input_ids.tolist() == [1, 2, 10, 80, 81, 4, 12, 82, 83]
+    assert chunk.final_indices.tolist() == [3, 4, 7, 8]
+    assert chunk.rows_per_answer == (2, 2)
+    assert chunk.meta["canvas"]["rows"].tolist() == [3, 4, 7, 8]
+    assert chunk.meta["canvas"]["conditioning_rows"].tolist() == [4, 5, 0, 1]
+    assert chunk.meta["canvas"]["conditioning"].tolist() == [
+        [8, 9], [10, 11], [0, 1], [2, 3]]
+    with pytest.raises(ValueError, match="self-conditioning"):
+        loop.pack_chunk(torch, arena, [groups[0], dict(groups[1],
+                                                       conditioning=None)],
+                        attention_mode="unified", conditioning=conditioning)
 
 
-def test_planner_pads_labels_to_the_canvas_on_a_diffusion_model(tmp_path):
+def test_planner_decodes_labels_on_a_diffusion_model(tmp_path):
     from quail.specs import DIFFUSION_GEMMA_26B_FP8
-
-    special = {DIFFUSION_GEMMA_26B_FP8.canvas_end_text: [7]}
-
-    def tokenizer(text):
-        return special.get(text, _bytes(text))
 
     path = tmp_path / "documents.parquet"
     pq.write_table(pa.table({"id": [1, 2], "body": ["ab", "cd"]}), path)
     session = quail.Session(
         EngineConfig(model=DIFFUSION_GEMMA_26B_FP8.name, device="h100-sxm"),
-        tokenizer=tokenizer)
+        tokenizer=_bytes)
     session.register("documents", DocumentProvider.from_parquet(path, id_col="id"))
-    # every label ends with the answer end token; the canvas is as
-    # long as the longest
+    # the labels are their own tokens; the model decodes its answer
     plan = _topic(session).plan()
     (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
     assert classify.spec.scoring == "canvas"
     assert [list(ids) for ids in classify.spec.label_token_ids] == [
-        _bytes(label_text(label)) + [7] for label in classify.spec.labels]
+        _bytes(label_text(label)) for label in classify.spec.labels]
+    assert classify.spec.estimated_seconds > 0
     assert plan.settings["label_scoring"] == "cost model"
-    # a chain's classifications stay separate nodes, each with its own
-    # canvas length
+    # a chain's classifications stay separate nodes
     chained = _chain(session).plan()
     classifies = [n for n in chained.nodes if isinstance(n, AiClassify)]
     assert len(classifies) == 2 and not any(n.spec.stages for n in classifies)
+    # a label longer than the canvas does not fit it
+    long_label = "x" * 20
+    refused = session.docs("documents").alias("d").ai_classify(
+        quail.prompt("What is {0} about?", quail.col("d.body")),
+        ["refund", long_label], name="topic").select("d.id", "topic").plan()
+    assert isinstance(refused, Refusal) and "16-row" in refused.reasons[0]
     forced = quail.Session(
         EngineConfig(model=DIFFUSION_GEMMA_26B_FP8.name, device="h100-sxm",
-                     label_scoring="trie_paths"), tokenizer=tokenizer)
+                     label_scoring="trie_paths"), tokenizer=_bytes)
     forced.register("documents", DocumentProvider.from_parquet(path, id_col="id"))
     refused = _topic(forced).plan()
     assert isinstance(refused, Refusal) and "canvas" in refused.reasons[0]
     forced.close()
     session.close()
+
+
+def test_planner_prices_the_canvas_rule_as_rounds_of_denoising_steps():
+    from quail.cost import budgets
+    from quail.planner.classify import _Table, simulate
+    from quail.specs import DIFFUSION_GEMMA_26B_FP8
+
+    model = DIFFUSION_GEMMA_26B_FP8
+    chunk = budgets.chunk_budget(model, H100_SXM)
+    capacity = budgets.arena_tokens(model, H100_SXM, chunk)
+    table = _Table(alias="d", mean=200.0, longest=300, budget=chunk,
+                   chunk=chunk, scoring=None, backend_name="quail",
+                   model=model, device=H100_SXM, tokenizer=_bytes,
+                   capacity=capacity, lengths=(200,) * 100)
+    scoring, simulated = table.choose(100, 20, 30, ((1, 2), (3,)), False)
+    assert scoring == "canvas"
+    # every document sends the cue and the 16-row canvas at each of the
+    # 48 steps, and computes its prompt once
+    steps = model.denoising.max_steps
+    assert simulated.label_tokens == 100 * steps * 17
+    assert simulated.work.tokens == 100 * (20 + 200 + 30) + 100 * steps * 17
+    # every document fits the first chunk, and each later chunk runs
+    # every document's next step
+    assert simulated.passes == steps
+    once = simulate([220] * 100, 30, [[17]] * 100, chunk, capacity, model,
+                    H100_SXM, canvas_rows=16)
+    assert once.passes == 1 and simulated.seconds > once.seconds
+
+    # a round's answers are read while the next chunk runs: document 0's
+    # second round waits a chunk that document 1's first round fills
+    rounds = simulate([100, 100], 10, [[17], [17]], chunk=130,
+                      capacity=10_000, model=model, device=H100_SXM,
+                      canvas_rows=16, rounds=2)
+    assert rounds.passes == 4 and rounds.label_tokens == 4 * 17
+    assert rounds.work.tokens == 2 * 110 + 4 * 17
+    # with nothing else to pack, the next round follows in the next chunk
+    alone = simulate([100], 10, [[17]], chunk=130, capacity=10_000,
+                     model=model, device=H100_SXM, canvas_rows=16, rounds=3)
+    assert alone.passes == 3
+    # the arena holds one document: the second starts after the first's
+    # last round
+    tight = simulate([100, 100], 10, [[17], [17]], chunk=1000, capacity=150,
+                     model=model, device=H100_SXM, canvas_rows=16, rounds=2)
+    assert tight.passes == 4
+
+
+def test_a_document_without_a_label_fails_every_label_filter(session):
+    # document 7's answer named no label
+    result = _finish(_topic(session), session, _Labels([None, "refund"]))
+    assert result.collect().column("topic").to_pylist() == ["refund"]
+    (answers,) = result.answer_tables["filters"].values()
+    assert answers.column("answer").to_pylist() == [False, True]
+    labels = result.answer_tables["classifies"]["topic"]
+    assert labels.column("topic").to_pylist() == ["refund"]
+    assert labels.column("d").to_pylist() == [1]
 
 
 def test_trie_chains_cover_every_node_once_and_gather_ancestors():

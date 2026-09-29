@@ -15,13 +15,12 @@ the partner suffixes are:
   children. Each chain is a causal segment and reads the ancestors
   above it from earlier chains, so every node is computed once and
   every row is read.
-- ``canvas``: a diffusion model's rule. Every label ends with the
-  answer end token, and the canvas holds as many rows as the longest.
-  One suffix per label-trie node, the tail's last token followed by
-  the node's tokens, with the canvas rows left after them; the first
-  canvas row is read. Every suffix fills the same canvas, so no label
-  is favored for its length, and a row is conditioned on the node's
-  tokens written before it.
+- ``canvas``: a diffusion model's rule. The model decodes its answer
+  with its own denoising steps (denoise.py), and the text is matched
+  to a label (match_label). Each step is a stage whose one suffix is
+  the tail's last token followed by the document's canvas; a document
+  goes on to the next step until its canvas is done. A document whose
+  answer names no label gets None.
 """
 
 import logging
@@ -31,6 +30,13 @@ from typing import Callable
 
 import numpy as np
 
+from quail.backends.quail.executor.denoise import (
+    CANVAS_SEED,
+    AsyncCanvasReadout,
+    ConditioningRows,
+    DocumentCanvas,
+    answer_text,
+)
 from quail.backends.quail.executor.loop import InputStaging
 from quail.backends.quail.executor.model import full_output_head
 from quail.backends.quail.executor.readout import AsyncLabelLogprobs
@@ -38,8 +44,7 @@ from quail.backends.quail.executor.stages import Stage, run_stages
 from quail.execution.labels import (
     best_label,
     label_path_scores,
-    label_scores,
-    label_trie,
+    match_label,
     tree_scores,
     trie_chains,
     trie_paths,
@@ -66,8 +71,6 @@ class LabelRequests:
             (suffixes, rows, targets) with all rows read and
             (suffixes, targets) otherwise, to one score per label.
         chains: Under ``trie_tree``, the chains the one suffix packs.
-        canvas_rows: Under ``canvas``, the rows of the canvas, and per
-            suffix the rows left after its node.
     """
 
     frame: list
@@ -76,8 +79,6 @@ class LabelRequests:
     read_all_rows: bool
     score: Callable[[np.ndarray], np.ndarray]
     chains: list | None = None
-    canvas_rows: int = 0
-    canvas_widths: list | None = None
 
 
 def label_requests(spec, targets=None) -> LabelRequests:
@@ -96,14 +97,6 @@ def label_requests(spec, targets=None) -> LabelRequests:
     ids = spec.label_token_ids
     if targets is None:
         targets = sorted({token for label in ids for token in label})
-    if spec.scoring == "canvas":
-        trie = label_trie(ids)
-        nodes = sorted(trie, key=lambda prefix: (len(prefix), prefix))
-        rows = max(len(label) for label in ids)
-        return LabelRequests(
-            frame, [[cue, *node] for node in nodes], targets, False,
-            lambda logprobs: label_scores(ids, nodes, targets, logprobs),
-            canvas_rows=rows, canvas_widths=[rows - len(node) for node in nodes])
     if spec.scoring == "trie_tree":
         chains = trie_chains(ids)
         tokens = [cue if node == () else node[-1]
@@ -117,6 +110,8 @@ def label_requests(spec, targets=None) -> LabelRequests:
         return LabelRequests(
             frame, [[cue, *path] for path in paths], targets, True,
             lambda logprobs: label_path_scores(ids, paths, targets, logprobs))
+    if spec.scoring == "canvas":
+        raise ValueError("the canvas rule decodes answers; it scores no labels")
     raise ValueError(f"unknown label scoring rule {spec.scoring!r}")
 
 
@@ -125,6 +120,21 @@ def document_prefixes(spec, documents, rows) -> list:
     head, _ = spec.prompt_token_parts
     (alias,) = spec.aliases
     return [chain_tokens(head, documents[alias][doc]) for doc in rows]
+
+
+def _tokenizer(state):
+    """The checkpoint's tokenizer, which decodes answers; kept on the model."""
+    if "tokenizer" in state:
+        return state["tokenizer"]
+    model = state["model"]
+    tokenizer = getattr(model, "quail_tokenizer", None)
+    if tokenizer is None:
+        from transformers import AutoTokenizer
+
+        path = model.quail_vllm_config.model_config.tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(path, local_files_only=True)
+        model.quail_tokenizer = tokenizer
+    return tokenizer
 
 
 class QuailClassifier:
@@ -139,9 +149,25 @@ class QuailClassifier:
         A chain's stages run as the stages of one join call: a document
         goes on to the next stage while its KV is resident if the gate
         accepts its label, and every stage's requests share one readout.
+        The ``canvas`` rule decodes instead (decode).
         """
         state = self.state
         rows = np.asarray(rows, dtype=np.int32).reshape(-1)
+        prefixes = document_prefixes(spec, documents, rows)
+        if "input_staging" not in state:
+            state["input_staging"] = InputStaging(state["torch"])
+        state["input_staging"].fixed_tokens.clear()
+        keys = [("classify", spec.name, index) for index in range(len(rows))]
+        tree = None
+        if spec.share_prefixes:
+            started = time.perf_counter()
+            tree = prefix_tree(prefixes, state["arena"].page_tokens)
+            logger.info(
+                "prefix sharing on %s: %s documents borrow %s tokens "
+                "(tree built in %.2f s)", spec.name, len(prefixes),
+                tree.shared_tokens, time.perf_counter() - started)
+        if spec.scoring == "canvas":
+            return self.decode(spec, rows, prefixes, keys, tree)
         specs = spec.chain
         targets = sorted({token for stage in specs
                           for ids in stage.label_token_ids for token in ids})
@@ -149,14 +175,6 @@ class QuailClassifier:
         read_all = requests[0].read_all_rows
         if any(request.read_all_rows != read_all for request in requests):
             raise ValueError("a classify chain's stages read rows one way")
-        prefixes = document_prefixes(spec, documents, rows)
-        canvas = None
-        if spec.scoring == "canvas":
-            # every suffix's canvas is a leading part of the run's; a
-            # canvas classification never chains, so one canvas length
-            if len(specs) > 1:
-                raise ValueError("a canvas classification runs alone")
-            canvas = state["pipeline"].canvas_rows(requests[0].canvas_rows)
         readout_rows = (max(len(suffix) for request in requests
                             for suffix in request.suffixes)
                         if read_all else 1)
@@ -180,18 +198,6 @@ class QuailClassifier:
                         str(head.dtype).replace("torch.", ""), len(targets),
                         readout_rows,
                         "normalized" if normalize else "targets' logits")
-        if "input_staging" not in state:
-            state["input_staging"] = InputStaging(state["torch"])
-        state["input_staging"].fixed_tokens.clear()
-        keys = [("classify", spec.name, index) for index in range(len(rows))]
-        tree = None
-        if spec.share_prefixes:
-            started = time.perf_counter()
-            tree = prefix_tree(prefixes, state["arena"].page_tokens)
-            logger.info(
-                "prefix sharing on %s: %s documents borrow %s tokens "
-                "(tree built in %.2f s)", spec.name, len(prefixes),
-                tree.shared_tokens, time.perf_counter() - started)
 
         labels = [np.full(len(rows), None, dtype=object) for _ in specs]
 
@@ -224,14 +230,14 @@ class QuailClassifier:
                 requests=((lambda key, index=index: gate(index, key))
                           if index else None),
                 read_all_rows=read_all, label=stage_spec.name,
-                chains=request.chains, canvas_widths=request.canvas_widths))
+                chains=request.chains))
 
         stats = {}
         answers, spans, fresh = run_stages(
             state["torch"], state["arena"], state["pipeline"], stages,
             prefixes, state["chunk_tokens"], anchor_keys=keys,
             staging=state["input_staging"], prefix_tree=tree, stats=stats,
-            label=f"classify {spec.name}", canvas=canvas)
+            label=f"classify {spec.name}")
         label_tokens = 0
         streamed = 0     # frame and suffix tokens packed after documents
         for index, request in enumerate(requests):
@@ -239,15 +245,93 @@ class QuailClassifier:
             for anchor, logprobs in first.items():
                 if labels[index][anchor] is None:
                     labels[index][anchor] = label_of(index, logprobs)
-            suffix_tokens = len(first) * (
-                sum(map(len, request.suffixes))
-                + sum(request.canvas_widths or ()))
+            suffix_tokens = len(first) * sum(map(len, request.suffixes))
             label_tokens += suffix_tokens
             # a frame equal to the stage before's is already in KV
             written = index == 0 or request.frame != requests[index - 1].frame
             streamed += suffix_tokens + (len(first) * len(request.frame)
                                          if written else 0)
         total = sum(map(len, prefixes)) + streamed
+        return self._batch(labels[0], fresh, total - fresh, label_tokens,
+                           stats, spans,
+                           {stage.spec.name: labels[index + 1]
+                            for index, stage in enumerate(spec.stages)})
+
+    def decode(self, spec, rows, prefixes, keys, tree) -> RerankerBatch:
+        """Label each row by decoding its answer with the model's denoising steps.
+
+        Each denoising step is a stage: the tail's last token and the
+        document's canvas, after the head, the document, and the rest
+        of the tail, which are computed once and stay in KV. A document
+        goes on to the next step until its canvas is done; its answer
+        text is then matched to a label, or None.
+        """
+        state = self.state
+        if spec.stages:
+            raise ValueError("a canvas classification runs alone")
+        model_spec = state["model_spec"]
+        settings = model_spec.denoising
+        if settings is None:
+            raise ValueError(f"{model_spec.name!r} has no denoising sampler")
+        _, tail = spec.prompt_token_parts
+        if len(tail) < 1:
+            raise ValueError("AI.CLASSIFY needs a question after the document")
+        cue, frame = tail[-1], list(tail[:-1])
+        torch = state["torch"]
+        pipeline = state["pipeline"]
+        head = full_output_head(state["model"])
+        conditioning = ConditioningRows(
+            torch, head.shape[1], settings.canvas_rows, head.dtype, head.device)
+        readout = AsyncCanvasReadout(torch, torch.nn.functional, head,
+                                     pipeline.normalizer, settings, conditioning)
+        tokenizer = _tokenizer(state)
+        canvases = {}
+        labels = np.full(len(rows), None, dtype=object)
+
+        def canvas(anchor):
+            document = canvases.get(anchor)
+            if document is None:
+                document = canvases[anchor] = DocumentCanvas(
+                    settings, model_spec.vocab, (CANVAS_SEED, int(rows[anchor])),
+                    conditioning.take())
+            return document.canvas, document.conditioning_row
+
+        def step(anchor, record):
+            document = canvases[anchor]
+            if document.update(record[0]["tokens"], record[0]["entropy"]):
+                return True
+            text = answer_text(tokenizer, document.tokens,
+                               settings.stop_token_ids)
+            labels[anchor] = match_label(text, spec.labels)
+            conditioning.release(document.conditioning_row)
+            return False
+
+        stages = [Stage(suffixes=[[cue]], readout=readout, frame=frame,
+                        decide=step, read_all_rows=True, single=True,
+                        label=spec.name, canvas=canvas,
+                        canvas_rows=settings.canvas_rows)
+                  for _ in range(settings.max_steps)]
+        stats = {}
+        _, spans, fresh = run_stages(
+            torch, state["arena"], pipeline, stages, prefixes,
+            state["chunk_tokens"], anchor_keys=keys,
+            staging=state["input_staging"], prefix_tree=tree, stats=stats,
+            label=f"classify {spec.name}", conditioning=conditioning)
+        steps = sum(document.steps for document in canvases.values())
+        unmatched = sum(label is None for label in labels)
+        logger.info("classify %s: %s denoising steps over %s documents; "
+                    "%s answers name no label", spec.name, steps,
+                    len(canvases), unmatched)
+        label_tokens = steps * (1 + settings.canvas_rows)
+        total = (sum(map(len, prefixes)) + len(canvases) * len(frame)
+                 + label_tokens)
+        return self._batch(labels, fresh, total - fresh, label_tokens, stats,
+                           spans, {})
+
+    def _batch(self, labels, fresh, cached, label_tokens, stats, spans,
+               later) -> RerankerBatch:
+        """The labels and token counts of one run, with its GPU time when timed."""
+        state = self.state
         gpu_s = 0.0
         if state.get("gpu_timing"):
             # every chunk's answers were read, so its end event completed
@@ -255,11 +339,10 @@ class QuailClassifier:
             gpu_s = sum(start.elapsed_time(end)
                         for _, start, end in spans) / 1000.0
         return RerankerBatch(
-            labels[0], fresh_tokens=fresh, cached_tokens=total - fresh,
+            labels, fresh_tokens=fresh, cached_tokens=cached,
             label_tokens=label_tokens,
             borrowed_tokens=stats.get("borrowed_tokens", 0),
             pack_s=stats.get("pack_s", 0.0),
             gpu_s=gpu_s,
             chunks=len(spans) if state.get("gpu_timing") else 0,
-            later={stage.spec.name: labels[index + 1]
-                   for index, stage in enumerate(spec.stages)})
+            later=later)

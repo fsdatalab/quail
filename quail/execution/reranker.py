@@ -247,10 +247,11 @@ def scored_batch(node, rows, table) -> dict:
 def classify_label_tables(spec, table) -> dict:
     """Return each classification's label table from a classify node's scores.
 
-    The chain's first stage labels every row. A later stage's table
-    holds only the rows its gate let through, with its own label column.
+    The chain's first stage labels every row but those whose decoded
+    answer named no label. A later stage's table holds only the rows
+    its gate let through, with its own label column.
     """
-    tables = {spec.name: table}
+    tables = {spec.name: table.filter(pc.is_valid(table.column(spec.name)))}
     (alias,) = spec.aliases
     for stage in spec.stages:
         name = stage.spec.name

@@ -574,7 +574,8 @@ class ClassifySpec(ScoreSpec):
     goes between them. ``label_token_ids`` holds each label's ids as
     scored after the tail, in label order. ``scoring`` names the label
     scoring rule the executor runs: ``trie_paths``, ``trie_tree``, or
-    ``canvas``.
+    ``canvas``, which decodes the answer with a diffusion model's
+    denoising steps and matches its text to a label.
     ``share_prefixes`` lets a document borrow the KV pages of a
     document sharing its token prefix (the prefix_sharing rule).
     ``stages`` are later classifications of the same documents, run

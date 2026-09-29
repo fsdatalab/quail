@@ -14,6 +14,45 @@ ACT_BYTES_PER_HIDDEN = 32
 
 
 @dataclass(frozen=True)
+class Denoising:
+    """A diffusion model's denoising sampler, as vLLM runs it.
+
+    The values come from the checkpoint: the logit cap from its
+    config.json, the rest but canvas_rows from its
+    generation_config.json. The executor checks them against the
+    loaded checkpoint.
+
+    Attributes:
+        canvas_rows: Rows of the answer canvas AI.CLASSIFY decodes.
+        max_steps: Denoising steps before the canvas is taken as is.
+        t_min: Temperature of the last step.
+        t_max: Temperature of the first step.
+        entropy_bound: Summed entropy of the rows a step keeps.
+        confidence_threshold: Mean row entropy below which a canvas is
+            confident.
+        stability_threshold: Steps in a row whose argmax canvas must
+            equal the one before for the canvas to be stable.
+        logit_softcap: Cap of the tanh applied to the output logits.
+        stop_token_ids: Token ids that end the decoded answer.
+    """
+
+    canvas_rows: int
+    max_steps: int
+    t_min: float
+    t_max: float
+    entropy_bound: float
+    confidence_threshold: float
+    stability_threshold: int
+    logit_softcap: float
+    stop_token_ids: tuple[int, ...]
+
+    def temperature(self, step: int) -> float:
+        """The temperature of denoising step ``step``, counted from 0."""
+        remaining = max(self.max_steps - step, 1)
+        return self.t_min + (self.t_max - self.t_min) * remaining / self.max_steps
+
+
+@dataclass(frozen=True)
 class ModelSpec:
     name: str
     params: float        # P: dense parameter count; 2P FLOPs per token
@@ -62,9 +101,9 @@ class ModelSpec:
     #                               later than 0 when the model opens
     #                               its turn with fixed tokens, such as
     #                               an empty thinking channel
-    canvas_end_text: str = ""     # the token the model writes to end
-    #                               its answer, which ends every label
-    #                               on the classification canvas
+    denoising: "Denoising | None" = None    # a diffusion model's
+    #                                        denoising sampler, which
+    #                                        AI.CLASSIFY decodes with
     turn_prefix: str = ""     # chat-turn text before every prompt
     turn_suffix: str = ""     # chat-turn text after the answer cue
     prompt_format: str = "raw-v1"    # names the turn layout in run records

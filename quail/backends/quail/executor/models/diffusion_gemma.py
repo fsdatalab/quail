@@ -1,24 +1,26 @@
 """Run one DiffusionGemma forward pass with Quail's batching and KV.
 
-Each prompt ends with a fixed canvas token. Its embedding receives the
-self-conditioning norm with zero conditioning, as in the first denoising
-step. The answer comes from TRUE/FALSE scores at that position.
+A filter's or join's prompt ends with a fixed canvas token, and the
+answer comes from TRUE/FALSE scores at that position. A classification
+denoises a longer canvas (denoise.py). Canvas rows take the
+self-conditioning input of their denoising step, or zero conditioning
+when a chunk gives none, as in the first step.
 """
 
 import numpy as np
 
 from quail.backends.quail.executor.attention import Engine
+from quail.backends.quail.executor.denoise import CANVAS_SEED, check_denoising
 from quail.backends.quail.executor.models.base import ModelPipeline
 from quail.backends.quail.executor.moe import FP8Experts
 from quail.cost import budgets
 
-# The canvas starts as random token ids, as vLLM's sampler starts it;
-# one fixed draw serves every document so answers are reproducible.
-CANVAS_SEED = 0
-
 
 def canvas_token_ids(vocab: int, tokens: int, seed: int = CANVAS_SEED) -> tuple:
-    """The fixed random token ids that fill every canvas."""
+    """The fixed random token ids that fill a filter's or join's canvas.
+
+    One draw serves every document, so answers are reproducible.
+    """
     rng = np.random.default_rng(seed)
     return tuple(int(i) for i in rng.integers(0, vocab, tokens))
 
@@ -46,7 +48,9 @@ class DiffusionGemmaPipeline(ModelPipeline):
         model: vLLM's DiffusionGemmaForConditionalGeneration module.
         arena: KVArena with one pool per layer at that layer's KV
             geometry (spec.kv_shapes).
-        spec: The ModelSpec, for the vocabulary size and canvas length.
+        spec: The ModelSpec, for the vocabulary size, the canvas
+            length, and the denoising settings, which must match the
+            checkpoint's.
         engine_class: Engine class, replaceable by tests.
     """
 
@@ -64,7 +68,7 @@ class DiffusionGemmaPipeline(ModelPipeline):
         self.embed = backbone.embed_tokens
         self.normalizer = backbone.normalizer
         self.final_norm = backbone.norm
-        self.canvas_norm = model.self_conditioning.post_norm
+        self.conditioning = model.self_conditioning
         self.vllm_config = model.quail_vllm_config
         self.window = spec.sliding_window
         attn = self.layers[0].self_attn
@@ -94,7 +98,12 @@ class DiffusionGemmaPipeline(ModelPipeline):
             raise ValueError("the fused qkv kernel expects a weightless v norm")
         self._fold_layer_scalars(model)
         self.scales = [float(layer.layer_scalar) for layer in self.layers]
-        self.vocab = spec.vocab
+        denoising = getattr(spec, "denoising", None)
+        if denoising is not None:
+            config = self.vllm_config.model_config
+            check_denoising(
+                denoising, config.try_get_generation_config(),
+                getattr(config.hf_text_config, "final_logit_softcapping", None))
         self.canvas_ids = canvas_token_ids(spec.vocab, spec.canvas_tokens)
         # an empty canvas reads the answer at the prompt's last row
         self.canvas_answer_row = (spec.canvas_answer_row
@@ -105,9 +114,16 @@ class DiffusionGemmaPipeline(ModelPipeline):
                         if layer.enable_moe_block else None
                         for layer in self.layers]
 
-    def canvas_rows(self, rows: int) -> tuple:
-        """The fixed canvas ids for a canvas of ``rows`` rows."""
-        return canvas_token_ids(self.vocab, rows)
+    def _conditioning_signal(self, soft):
+        """The self-conditioning MLP's output for the previous step's soft embeddings.
+
+        Zero rows give zero, as vLLM's first denoising step gets.
+        """
+        module = self.conditioning
+        x = self._norm(soft, module.pre_norm)
+        gelu = self.engine.torch.nn.functional.gelu
+        return module.down_proj(
+            gelu(module.gate_proj(x), approximate="tanh") * module.up_proj(x))
 
     def _norm(self, x, module):
         """One of the model's RMS norms, through the engine's kernel."""
@@ -154,8 +170,11 @@ class DiffusionGemmaPipeline(ModelPipeline):
         canvas = meta.get("canvas")
         if canvas is not None:
             rows = canvas["rows"]
-            hidden.index_copy_(
-                0, rows, self._norm(hidden.index_select(0, rows), self.canvas_norm))
+            x = hidden.index_select(0, rows)
+            soft = canvas.get("conditioning")
+            if soft is not None:
+                x = x + self._conditioning_signal(soft.to(x.dtype))
+            hidden.index_copy_(0, rows, self._norm(x, self.conditioning.post_norm))
         # the fused MoE kernels look their layer up in the forward
         # context
         with set_forward_context(None, self.vllm_config, num_tokens=n):
