@@ -70,20 +70,43 @@ class FixedFeverAnswers:
                 if all(answers[local])]
         return answers, live
 
+    def _drive(self, stream):
+        """Answer a filter chain's stream at once; returns its survivors."""
+        ids = list(stream.document_ids)
+        answers, live = self._answers(ids)
+        stream.complete(filter_result(stream.node, answers, 0, ids))
+        return live
+
+    def _label_table(self, node, ids):
+        # a document whose answer names no label has no row, as the
+        # classify node drops it
+        labeled = [int(document) for document in ids
+                   if self.labels[int(document)] is not None]
+        rows = np.asarray([[document] for document in labeled],
+                          dtype=np.int32).reshape(-1, 1)
+        table = _score_table(
+            rows, node.spec.aliases, node.spec.name,
+            [self.labels[document] for document in labeled], pa.string())
+        return labeled, table
+
     def execute(self, node, inputs):
         if isinstance(node, AiClassify):
             (ids,) = inputs["score_inputs"].values()
-            # a document whose answer names no label has no row, as
-            # the classify node drops it
-            labeled = [int(document) for document in ids
-                       if self.labels[int(document)] is not None]
-            rows = np.asarray([[document] for document in labeled],
-                              dtype=np.int32).reshape(-1, 1)
-            table = _score_table(
-                rows, node.spec.aliases, node.spec.name,
-                [self.labels[document] for document in labeled], pa.string())
-            return NodeResult({"scores": table}, NodeMetrics(
-                input_rows=len(ids), output_rows=len(ids)))
+            (alias,) = node.spec.aliases
+            if isinstance(ids, SurvivorStream):
+                # the filter chain's survivors, labeled with KV resident
+                ids = self._drive(ids)
+            if node.pin_survivors:
+                stream = SurvivorStream(node, list(ids))
+                stream.labels.update(
+                    (int(document), self.labels[int(document)])
+                    for document in ids)
+                return NodeResult({"scores": stream, f"ids:{alias}": stream},
+                                  finalize=stream.finalized_result)
+            labeled, table = self._label_table(node, ids)
+            return NodeResult(
+                {"scores": table, f"ids:{alias}": labeled},
+                NodeMetrics(input_rows=len(ids), output_rows=len(ids)))
         if isinstance(node, AiFilter):
             if node.pin_survivors:
                 stream = SurvivorStream(node, inputs["document_ids"])
@@ -107,10 +130,21 @@ class FixedFeverAnswers:
         stream = inputs.get("anchor_stream")
         if stream is None:
             anchor_ids = inputs["anchor_ids"]
+        elif isinstance(stream["node"], AiClassify):
+            # a streamed classification: its stream completes with the
+            # label rows; the label filter gates each batch
+            anchor_ids = list(stream["document_ids"])
+            labeled, table = self._label_table(stream["node"], anchor_ids)
+            stream["stream"].complete(NodeResult(
+                {"scores": table, f"ids:{node.anchor}": labeled},
+                NodeMetrics(input_rows=len(anchor_ids),
+                            output_rows=len(labeled))))
+            keys = [(node.anchor, document) for document in labeled]
+            if inputs.get("anchor_batch") is not None:
+                keys = inputs["anchor_batch"](keys)
+            anchor_ids = [key[1] for key in keys]
         else:
-            answers, anchor_ids = self._answers(list(stream["document_ids"]))
-            stream["stream"].complete(filter_result(
-                stream["node"], answers, 0, stream["document_ids"]))
+            anchor_ids = self._drive(stream["stream"])
             keys = [(node.anchor, document) for document in anchor_ids]
             if inputs.get("anchor_batch") is not None:
                 # like the real driver: per-batch functions run on each
@@ -305,8 +339,12 @@ def test_classification_runs_beside_filters_and_joins(monkeypatch):
         assert [type(node).__name__ for node in plan.nodes] == [
             "Scan", "Scan", "AiFilter", "AiClassify", "LabelFilter", "AiJoin",
             "Project"]
-        assert not plan.nodes[2].pin_survivors
+        # the chain streams into the classification: each claim is
+        # labeled with its KV resident; the classification streams on
+        # into the join only when the join anchors on the claims
         test, join, project = plan.nodes[4], plan.nodes[5], plan.nodes[6]
+        assert plan.nodes[2].pin_survivors
+        assert plan.nodes[3].pin_survivors == (join.anchor == "c")
         (claims_port,) = [port.source for port in join.inputs
                           if port.source.port == "ids:c"]
         assert claims_port == PortRef(test.node_id, "ids:c")

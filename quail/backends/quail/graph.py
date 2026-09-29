@@ -28,6 +28,7 @@ from quail.execution.runner import (
 from quail.execution.tokens import DocumentKeys, DocumentPrefixes, chain_tokens
 from quail.execution.types import export_physical_outputs
 from quail.physical import (
+    AiClassify,
     AiFilter,
     AiJoin,
     AiScore,
@@ -218,6 +219,7 @@ def prepare_model_inputs(node, inputs, context: ExecutionContext):
     """Prepare Quail scheduler inputs from typed port values."""
     if isinstance(node, AiScore):
         return {"score_inputs": inputs, "documents": context.state["docs"],
+                "pre": context.state.get("pre", []),
                 "gpu_timing": context.state.get("gpu_timing", False)}
     if not isinstance(node, (AiFilter, AiJoin)):
         return inputs
@@ -250,9 +252,10 @@ def _model_inputs(node, inputs, context: ExecutionContext) -> dict:
             continue
         alias = port.split(":", 1)[1]
         if isinstance(value, SurvivorStream):
-            if alias != node.anchor or not isinstance(value.node, AiFilter):
-                raise TypeError(
-                    "only the anchor's filter chain streams into a join")
+            if alias != node.anchor or not isinstance(
+                    value.node, (AiFilter, AiClassify)):
+                raise TypeError("only the anchor's filter chain or "
+                                "classification streams into a join")
             stream = value
         else:
             by_alias[alias] = list(value)
@@ -318,11 +321,13 @@ def _model_inputs(node, inputs, context: ExecutionContext) -> dict:
         anchor_ids = None
         anchor_stream = {
             "node": stream.node,
-            **filter_inputs(state, stream.node, stream.document_ids),
+            "documents": DocumentPrefixes(
+                state["pre"], state["docs"][node.anchor], stream.document_ids),
+            "document_ids": stream.document_ids,
             "stream": stream,
         }
         prefixes = anchor_stream["documents"]
-        anchor_keys = DocumentKeys(stream.node.alias, stream.document_ids)
+        anchor_keys = DocumentKeys(node.anchor, stream.document_ids)
         round_kv = None
 
     last = group[-1]

@@ -14,6 +14,7 @@ from quail.execution.result import DEFAULT_BATCH_ROWS, answer_table
 from quail.execution.runner import (
     NodeMetrics,
     NodeResult,
+    SurvivorStream,
 )
 from quail.physical import AiScore, ClassifySpec, LabelFilter, ScoreFilter, ValueType
 from quail.progress import answer_sink
@@ -244,6 +245,15 @@ def scored_batch(node, rows, table) -> dict:
     return {**payload, "scores": [round(float(value), 4) for value in values]}
 
 
+def classify_outputs(node, table) -> dict:
+    """A classify node's ports: its label rows and the labeled documents' ids."""
+    outputs = {"scores": table}
+    if len(node.spec.aliases) == 1:
+        (alias,) = node.spec.aliases
+        outputs[f"ids:{alias}"] = table.column(alias).to_pylist()
+    return outputs
+
+
 def classify_label_tables(spec, table) -> dict:
     """Return each classification's label table from a classify node's scores.
 
@@ -319,11 +329,13 @@ def score_in_batches(node, inputs, score_batches, shards: int = 1,
     if len(order) and np.any(np.diff(order) < 0):
         table = table.take(pa.array(np.argsort(order, kind="stable")))
     table = attach_prior_columns(table, priors)
+    outputs = {"scores": table}
     if isinstance(node.spec, ClassifySpec):
         # a document whose decoded answer names no label leaves the run
         table = table.filter(pc.is_valid(table.column(node.spec.name)))
         metrics = replace(metrics, output_rows=table.num_rows)
-    return NodeResult({"scores": table}, replace(
+        outputs = classify_outputs(node, table)
+    return NodeResult(outputs, replace(
         metrics, wall_s=time.perf_counter() - started,
         extension={"output": node.spec.name, "aliases": list(node.spec.aliases),
                    "input_rows": len(rows),
@@ -431,6 +443,36 @@ class ScoreFilterRuntime:
         if len(inputs) != 1:
             raise ValueError("ScoreFilter needs one score input")
         table = next(iter(inputs.values()))
+        if isinstance(table, SurvivorStream):
+            return self._gate_stream(node, table)
+        return self._filter(node, table)
+
+    def _gate_stream(self, node, stream: SurvivorStream) -> NodeResult:
+        """Gate a streaming classification's documents on their labels.
+
+        The join the stream reaches asks each batch's labels once the
+        classification stage has answered them; the filter's own rows
+        and answers follow when the stream completes.
+        """
+        if not isinstance(node, LabelFilter) or len(node.aliases) != 1:
+            raise TypeError("only a one-table label filter gates a stream")
+        (alias,) = node.aliases
+        accepted = set(node.accepted)
+        labels = stream.labels
+
+        def batch(ids):
+            return [document for document in ids
+                    if labels.get(document) in accepted]
+
+        def finalize():
+            return self._filter(node, stream.finalized_result().outputs["scores"])
+
+        return NodeResult(
+            {"scores": stream, f"filter_answers:{alias}": {},
+             f"ids:{alias}": stream.with_transform(batch)},
+            finalize=finalize)
+
+    def _filter(self, node, table) -> NodeResult:
         if isinstance(node, LabelFilter):
             answers = pc.is_in(table.column(node.score_name),
                                value_set=pa.array(node.accepted, pa.string()))

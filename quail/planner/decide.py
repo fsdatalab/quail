@@ -594,12 +594,23 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
             if any(apply.kind == "barrier"
                    for apply in join_applies.get(spec["written_pos"], ())):
                 barrier_aliases.add(anchor)
+    joined = {argument.alias for join in joins for argument in join.prompt.args}
+    # a classification's stages run inside the chain of its alias on
+    # one GPU with a causal model: the label readout serves its own
+    # stages, which a diffusion model's canvas readout cannot
+    fusable = {alias for alias in classified
+               if gpus == 1 and not model.canvas_tokens
+               and sum(owner == alias for _, owner in labels.calls) == 1}
+    # the classification sits between the alias's filters and its join
+    between = {alias for alias in classified
+               if not (classify_after_joins and alias in joined)}
     streamed = {}
     partner_before = set()
     for index, group in enumerate(sequence_groups):
         anchor = group[0][1]
-        if anchor in ask_filters and anchor not in classified \
-                and anchor not in streamed \
+        chain = ((anchor in ask_filters and anchor not in between)
+                 or (anchor in between and anchor in fusable))
+        if chain and anchor not in streamed \
                 and anchor not in partner_before \
                 and anchor not in barrier_aliases:
             streamed[anchor] = index
@@ -695,12 +706,12 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
                 expected_docs=round(n * surv, 1)))
             surv *= effective_selectivity(p.selectivity)
         keep = alias in retention_plan["initial"]
-        pinned = alias in streamed
+        pinned = alias in streamed or alias in fused_filters
         writes = len(stages) > 1 or keep or pinned
         # pinned pages also cover the consuming join's largest frame
         hold = max((spec["frame_tokens"][alias]
                     for spec, _ in sequence_groups[streamed[alias]])
-                   if pinned else (0,))
+                   if alias in streamed else (0,))
         fid = f"ai_filter:{alias}"
         nodes.append(AiFilter(
             node_id=fid,
@@ -709,7 +720,11 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
             keep_kv=keep, pin_survivors=pinned, hold_tokens=hold,
             stages=tuple(stages)))
         ids_src[alias] = PortRef(fid, f"ids:{alias}")
-        if pinned:
+        if alias in fused_filters:
+            remarks.append(
+                f"filter on {alias!r} streams its survivors into its "
+                f"classification; each one is labeled with its KV resident")
+        elif pinned:
             remarks.append(
                 f"filter on {alias!r} streams its survivors into "
                 f"the join anchored on it; each one's KV stays "
@@ -743,8 +758,10 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
     classify_seconds = 0.0
     label_ports = []
 
-    joined = {argument.alias for join in joins for argument in join.prompt.args}
     deferred = set()          # aliases classified after the joins
+    # a filter chain streams into the classification after it
+    fused_filters = {alias for alias in fusable & between
+                     if alias in ask_filters}
 
     def emit_classify(alias, live=None):
         """Classify the alias's documents, then keep the accepted labels."""
@@ -759,12 +776,21 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
         if live is None:
             live = live_asked.get(alias, float(stats[alias].n_docs))
         for call in calls:
-            spec, _ = table.classify(call, labels.names[call], live)
+            spec, _ = table.classify(call, labels.names[call], live,
+                                     resident=alias in fused_filters)
             node = table.node(spec, ids_src[alias],
                               sum(isinstance(n, AiClassify) for n in nodes))
+            if alias in streamed:
+                node = replace(node, pin_survivors=True)
+                remarks.append(
+                    f"classification of {alias!r} streams its documents "
+                    f"into the join anchored on it; each one's KV stays "
+                    f"pinned until its tuples are answered")
             nodes.append(node)
             classify_seconds += spec.estimated_seconds
             scores = PortRef(node.node_id, "scores")
+            # what follows reads the labeled documents
+            ids_src[alias] = PortRef(node.node_id, f"ids:{alias}")
             if call in labels.projected:
                 label_ports.append(scores)
             for position in labels.tests.get(call, ()):
@@ -786,7 +812,9 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
                 emit_filter(s.alias)
             elif s.alias not in ask_filters:
                 emit_applies(s.alias)
-            emit_classify(s.alias)
+            # a streamed classification is emitted before its join
+            if not (s.alias in streamed and s.alias in between):
+                emit_classify(s.alias)
     except ClassifyRefusedError as refused:
         return refused.refusal()
 
@@ -822,7 +850,12 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
                 anchor=anchor))
             ids_src[anchor] = PortRef(xid, f"ids:{anchor}")
         if streamed.get(anchor) == g:
-            emit_filter(anchor)
+            if anchor in ask_filters:
+                emit_filter(anchor)
+            try:
+                emit_classify(anchor)
+            except ClassifyRefusedError as refused:
+                return refused.refusal()
         gid = group_ids[g]
         stage_dicts = []
         in_aliases = [anchor]

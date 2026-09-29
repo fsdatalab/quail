@@ -560,7 +560,7 @@ def test_foreign_node_placement_and_pinned_edge_validation():
         + (graph.node("group:0").with_inputs(input_ports(
             (PortRef("input:r", "ids:r"), PortRef("input:p", "ids:p")))),),
         graph.root)
-    with pytest.raises(GraphValidationError, match="no join anchored"):
+    with pytest.raises(GraphValidationError, match="no join or classification"):
         validate_streams(orphan)
 
 

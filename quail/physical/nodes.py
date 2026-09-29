@@ -659,12 +659,29 @@ class AiClassify(AiScore):
     """
 
     spec: ClassifySpec | None = None
+    # the labeled documents stream into the join anchored on the alias,
+    # their KV resident, instead of being handed over as a whole
+    pin_survivors: bool = False
 
     type_name: ClassVar[str] = "quail.ai_classify"
+
+    @property
+    def outputs(self) -> tuple[OutputPort, ...]:
+        """The label rows, and the ids of the documents that got a label."""
+        ports = super().outputs
+        if self.spec is not None and len(self.spec.aliases) == 1:
+            (alias,) = self.spec.aliases
+            ports += (OutputPort(f"ids:{alias}", ValueType.DOCUMENT_IDS,
+                                 schema=(alias,)),)
+        return ports
+
+    def attributes(self) -> dict:
+        return {**super().attributes(), "pin_survivors": self.pin_survivors}
 
     def explain_fields(self) -> Mapping[str, Any]:
         return {
             **super().explain_fields(),
+            "pin_survivors": self.pin_survivors,
             "labels": [] if self.spec is None else list(self.spec.labels),
             "scoring": None if self.spec is None else self.spec.scoring,
             "share_prefixes": (False if self.spec is None
@@ -684,6 +701,7 @@ class AiClassify(AiScore):
             backend_name=str(attributes["backend_name"]),
             model=str(attributes["model"]),
             spec=None if value is None else ClassifySpec.from_mapping(value),
+            pin_survivors=bool(attributes.get("pin_survivors", False)),
         )
 
 
@@ -1202,12 +1220,16 @@ class Limit(PhysicalNode):
 
 
 def validate_streams(graph) -> None:
-    """Check that pinned survivor streams reach their joins as streams.
+    """Check that pinned survivor streams reach their consumers as streams.
 
     A filter that pins its survivors streams them into the join
-    anchored on its alias. On that path only per-batch Foreign nodes
-    may sit; a Barrier, a barrier Foreign, or any other consumer would
-    need the whole set at once, which a stream never has.
+    anchored on its alias or into the classification of its alias; a
+    classification that pins its documents streams them into the join.
+    On that path only per-batch Foreign nodes, and after a
+    classification its label filters, may sit; a Barrier, a barrier
+    Foreign, or any other consumer would need the whole set at once,
+    which a stream never has. A projection reads a streamed
+    classification's labels once its stream has completed.
     """
     consumers: dict[tuple[str, str], list] = {}
     for node in graph.nodes:
@@ -1215,14 +1237,27 @@ def validate_streams(graph) -> None:
             consumers.setdefault(
                 (port.source.node_id, port.source.port), []).append(node)
     for node in graph.nodes:
-        if not isinstance(node, AiFilter) or not node.pin_survivors:
+        if isinstance(node, AiFilter) and node.pin_survivors:
+            alias = node.alias
+            starts = [(node.node_id, f"ids:{alias}")]
+        elif isinstance(node, AiClassify) and node.pin_survivors \
+                and node.spec is not None:
+            # its label filters read the label rows; a join without
+            # one reads the ids
+            (alias,) = node.spec.aliases
+            starts = [(node.node_id, "scores"), (node.node_id, f"ids:{alias}")]
+        else:
             continue
-        alias = node.alias
         reached = []
 
-        def follow(port):
+        def follow(port, node=node, alias=alias, reached=reached):
             for consumer in consumers.get(port, ()):
                 if isinstance(consumer, AiJoin) and consumer.anchor == alias:
+                    reached.append(consumer)
+                    continue
+                if isinstance(consumer, AiClassify) and isinstance(node, AiFilter) \
+                        and consumer.spec is not None \
+                        and consumer.spec.aliases == (alias,):
                     reached.append(consumer)
                     continue
                 if isinstance(consumer, Foreign) \
@@ -1231,13 +1266,23 @@ def validate_streams(graph) -> None:
                            if consumer.ids == "pairs" else f"ids:{alias}")
                     follow((consumer.node_id, out))
                     continue
+                if isinstance(consumer, LabelFilter) \
+                        and isinstance(node, AiClassify) \
+                        and consumer.aliases == (alias,):
+                    follow((consumer.node_id, f"ids:{alias}"))
+                    continue
+                if isinstance(consumer, Project) and isinstance(node, AiClassify):
+                    # reads the labels once the stream has completed
+                    continue
                 raise GraphValidationError(
                     f"{consumer.node_id!r} reads the pinned survivors of "
-                    f"{node.node_id!r}; only a per-batch apply or the join "
+                    f"{node.node_id!r}; only a per-batch apply, a label "
+                    f"filter, the classification of {alias!r}, or the join "
                     f"anchored on {alias!r} can consume a survivor stream")
 
-        follow((node.node_id, f"ids:{alias}"))
+        for start in starts:
+            follow(start)
         if not reached:
             raise GraphValidationError(
-                f"{node.node_id!r} pins its survivors but no join anchored "
-                f"on {alias!r} consumes them")
+                f"{node.node_id!r} pins its survivors but no join or "
+                f"classification on {alias!r} consumes them")

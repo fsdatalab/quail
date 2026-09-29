@@ -127,6 +127,11 @@ class SurvivorStream:
     transforms are per-batch functions (ids -> kept ids) that
     per-batch Foreign nodes between the producer and the consumer
     added; the consumer runs them on each batch before admission.
+    upstream is the stream the producer itself consumed, when a
+    classification took a filter chain's survivors: the consumer
+    drives both chains and completes both streams. labels holds a
+    classification producer's label per document id as its stage
+    answers, so a label filter on the stream can gate a batch.
     """
 
     node: PhysicalNode
@@ -134,6 +139,8 @@ class SurvivorStream:
     completion: _SurvivorCompletion = field(
         default_factory=_SurvivorCompletion, repr=False)
     transforms: tuple = ()
+    upstream: "SurvivorStream | None" = None
+    labels: dict = field(default_factory=dict, repr=False)
 
     def with_transform(self, transform) -> "SurvivorStream":
         """Return this stream with one more per-batch transform."""
@@ -142,6 +149,8 @@ class SurvivorStream:
             self.document_ids,
             completion=self.completion,
             transforms=self.transforms + (transform,),
+            upstream=self.upstream,
+            labels=self.labels,
         )
 
     def complete(self, result: NodeResult) -> None:

@@ -4,6 +4,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Mapping
 
 from quail.physical import (
+    AiClassify,
     AiFilter,
     AiJoin,
     Barrier,
@@ -224,35 +225,46 @@ def _rederive_pins(nodes: tuple) -> tuple:
     """Re-derive pin_survivors, keep_kv, and hold_tokens from the shape.
 
     A chain pins its survivors only when its stream reaches the join
-    anchored on its alias through per-batch nodes alone; otherwise
-    its survivors go through the retention pool.
+    anchored on its alias, or the classification of its alias, through
+    per-batch nodes alone; otherwise its survivors go through the
+    retention pool. A classification pins its documents when its
+    stream reaches the join through its label filters.
     """
     graph = PhysicalGraph(nodes, PortRef(nodes[-1].node_id,
                                          nodes[-1].outputs[0].name))
     joins = {node.anchor: node for node in nodes if isinstance(node, AiJoin)}
+    classified = {node.spec.aliases[0] for node in nodes
+                  if isinstance(node, AiClassify) and node.spec is not None}
     out = []
     for node in nodes:
-        if not isinstance(node, AiFilter) or node.alias not in joins:
+        if isinstance(node, AiClassify) and node.spec is not None \
+                and node.spec.aliases[0] in joins:
+            out.append(replace(node,
+                               pin_survivors=_stream_reaches(graph, node)))
+            continue
+        if not isinstance(node, AiFilter) or (
+                node.alias not in joins and node.alias not in classified):
             out.append(node)
             continue
-        pinnable = _stream_reaches_join(graph, node)
+        pinnable = _stream_reaches(graph, node)
         hold = max((stage.anchor_frame_tokens
-                    for stage in joins[node.alias].stages), default=0)
+                    for stage in joins[node.alias].stages), default=0) \
+            if node.alias in joins else 0
         out.append(replace(
             node,
             pin_survivors=pinnable,
-            keep_kv=not pinnable,
+            keep_kv=not pinnable and node.alias in joins,
             hold_tokens=hold if pinnable else 0,
             arena_writes=True))
     return tuple(out)
 
 
-def _stream_reaches_join(graph, chain) -> bool:
-    """Whether a chain's survivors reach its join through per-batch nodes."""
+def _stream_reaches(graph, chain) -> bool:
+    """Whether a node's survivors reach a consumer that drives its stages."""
     # only this chain is pinned in the trial
     trial = PhysicalGraph(tuple(
         replace(node, pin_survivors=node.node_id == chain.node_id)
-        if isinstance(node, AiFilter) else node
+        if isinstance(node, (AiFilter, AiClassify)) else node
         for node in graph.nodes), graph.root)
     try:
         validate_streams(trial)
