@@ -8,9 +8,6 @@ the partner suffixes are:
 - ``trie_nodes``: one suffix per label-trie node, the tail's last token
   followed by the node's label tokens. Only its last row is read; it
   gives the log probabilities of the tokens that can follow the node.
-- ``label_chains``: one suffix per label, the tail's last token
-  followed by all but the label's last token. Every row is read, so
-  one suffix scores the whole label.
 - ``trie_paths``: one suffix per deepest proper prefix of the label
   trie, the tail's last token followed by the prefix. Every row is
   read and returns every label token, so the cue's row scores all
@@ -41,7 +38,6 @@ from quail.backends.quail.executor.stages import Stage, run_stages
 from quail.execution.labels import (
     best_label,
     canvas_scores,
-    label_chain_scores,
     label_path_scores,
     label_scores,
     label_trie,
@@ -103,10 +99,6 @@ def label_requests(spec, targets=None) -> LabelRequests:
         return LabelRequests(
             [], [list(tail)], targets, True,
             lambda logprobs: canvas_scores(ids, targets, logprobs[0]))
-    if spec.scoring == "label_chains":
-        return LabelRequests(
-            frame, [[cue, *label[:-1]] for label in ids], targets, True,
-            lambda logprobs: label_chain_scores(ids, targets, logprobs))
     if spec.scoring == "trie_tree":
         chains = trie_chains(ids)
         tokens = [cue if node == () else node[-1]

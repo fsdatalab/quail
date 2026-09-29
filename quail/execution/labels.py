@@ -92,24 +92,6 @@ def label_path_scores(label_ids, paths, targets, logprobs) -> np.ndarray:
     return scores
 
 
-def label_chain_scores(label_ids, targets, logprobs) -> np.ndarray:
-    """Return every label's summed log probability from one chain per label.
-
-    Args:
-        label_ids: One token id sequence per label.
-        targets: The token ids, one per column of ``logprobs``.
-        logprobs: Shape (labels, rows, targets). Row r of chain i holds
-            the log probabilities read after the answer cue and the
-            first r tokens of label i, so it scores the label's token r.
-    """
-    column = {token: index for index, token in enumerate(targets)}
-    scores = np.zeros(len(label_ids), dtype=np.float64)
-    for label, ids in enumerate(label_ids):
-        scores[label] = sum(logprobs[label, row, column[token]]
-                            for row, token in enumerate(ids))
-    return scores
-
-
 def canvas_scores(label_ids, targets, logprobs) -> np.ndarray:
     """Return every label's summed log probability over a diffusion canvas.
 

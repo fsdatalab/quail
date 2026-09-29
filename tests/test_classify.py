@@ -23,7 +23,6 @@ from quail.bench.substrait import read_plan
 from quail.catalog import DocumentProvider
 from quail.execution.labels import (
     best_label,
-    label_chain_scores,
     label_path_scores,
     label_scores,
     label_trie,
@@ -80,18 +79,9 @@ def test_label_scores_sum_each_labels_tokens_and_ties_go_first():
     assert best_label([-1.0, -2.0, -1.0]) == 0
 
 
-def test_label_chain_scores_read_one_row_per_label_token():
+def test_trie_paths_cover_every_proper_prefix():
     targets = [1, 2, 3, 4]
     nan = float("nan")
-    # chain i's row r scores token r of label i; rows past a label are NaN
-    logprobs = np.log([
-        [[0.6, nan, nan, nan], [nan, 0.3, nan, nan]],
-        [[0.6, nan, nan, nan], [nan, nan, 0.7, nan]],
-        [[nan, nan, nan, 0.4], [nan, nan, nan, nan]],
-    ])
-    scores = label_chain_scores(IDS, targets, logprobs)
-    assert np.allclose(np.exp(scores), [0.18, 0.42, 0.4])
-    assert suffix_lengths("label_chains", IDS) == [2, 2, 1]
     assert suffix_lengths("trie_nodes", IDS) == [1, 2]
 
     # one chain over the deepest proper prefix (1,) reads both rows
@@ -198,17 +188,18 @@ def test_classifier_reads_every_trie_node_after_each_document(monkeypatch):
     assert batch.fresh_tokens + batch.cached_tokens == (3 + 2 + 4) + 3 * (2 + 3)
 
 
-def test_classifier_reads_every_row_of_one_chain_per_label(monkeypatch):
+def test_classifier_reads_every_row_of_each_trie_path(monkeypatch):
+    # one two-row chain over the deepest proper prefix (1,) scores all
+    # three labels
     spec = ClassifySpec(
         name="topic", aliases=("d",), query_template="", arguments=(),
         expected_inputs=2, estimated_seconds=0.0,
         prompt_token_parts=((90,), (91, 92, 93)), labels=LABELS,
-        label_token_ids=IDS, scoring="label_chains")
+        label_token_ids=IDS, scoring="trie_paths")
     documents = {"d": [[10, 11], [12]]}
     requests = label_requests(spec)
     assert requests.frame == [91, 92] and requests.read_all_rows
-    # the cue's last token, then every label token but its last
-    assert requests.suffixes == [[93, 1], [93, 1], [93]]
+    assert requests.suffixes == [[93, 1]]
     targets = requests.targets
     assert targets == [1, 2, 3, 4]
 
@@ -248,16 +239,16 @@ def test_classifier_reads_every_row_of_one_chain_per_label(monkeypatch):
              "input_staging": SimpleNamespace(fixed_tokens=set())}
     batch = QuailClassifier(state).classify(spec, [[0], [1]], documents)
     assert list(batch.scores) == list(LABELS[:2])
-    assert batch.label_tokens == 2 * (2 + 2 + 1)
-    # every row packs its prefix, the two-token frame, and three chains
-    assert batch.fresh_tokens + batch.cached_tokens == (3 + 2) + 2 * (2 + 5)
+    assert batch.label_tokens == 2 * 2
+    # every row packs its prefix, the two-token frame, and the chain
+    assert batch.fresh_tokens + batch.cached_tokens == (3 + 2) + 2 * (2 + 2)
 
-    # one-token labels read one row per chain
+    # one-token labels read the cue's one row
     single = ClassifySpec(
         name="tone", aliases=("d",), query_template="", arguments=(),
         expected_inputs=2, estimated_seconds=0.0,
         prompt_token_parts=((90,), (91, 92, 93)), labels=("a", "b"),
-        label_token_ids=((2,), (4,)), scoring="label_chains")
+        label_token_ids=((2,), (4,)), scoring="trie_paths")
     readout = SimpleNamespace(
         targets=np.asarray([2, 4]), rows=1,
         dtype=np.dtype((np.float32, (2,))),
@@ -274,20 +265,7 @@ def test_classifier_reads_every_row_of_one_chain_per_label(monkeypatch):
     state["pipeline"] = fake_pipeline(forward_chunk=forward_single)
     batch = QuailClassifier(state).classify(single, [[0], [1]], documents)
     assert list(batch.scores) == ["a", "b"]
-
-    # trie paths: one two-row chain over (1,) scores all three labels
-    paths = ClassifySpec(
-        name="topic", aliases=("d",), query_template="", arguments=(),
-        expected_inputs=2, estimated_seconds=0.0,
-        prompt_token_parts=((90,), (91, 92, 93)), labels=LABELS,
-        label_token_ids=IDS, scoring="trie_paths")
-    assert label_requests(paths).suffixes == [[93, 1]]
-    state["label_readout"] = readout_chains
-    state["pipeline"] = fake_pipeline(forward_chunk=forward)
-    batch = QuailClassifier(state).classify(paths, [[0], [1]], documents)
-    assert list(batch.scores) == list(LABELS[:2])
-    assert batch.label_tokens == 2 * 2
-
+    assert batch.label_tokens == 2 * 1
 
 
 def test_classifier_borrows_shared_prefix_pages(monkeypatch):
@@ -644,8 +622,7 @@ def test_classify_refusals_and_builder_errors(session):
     (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
     assert classify.spec.scoring in ("trie_paths", "trie_tree")
     assert plan.settings["label_scoring"] == "cost model"
-    for rule in ("trie_nodes", "label_chains", "trie_paths", "trie_tree",
-                 "next_rule"):
+    for rule in ("trie_nodes", "trie_paths", "trie_tree", "next_rule"):
         ruled = quail.Session(EngineConfig(
             model="qwen3-4b-fp8", device="h100-sxm", label_scoring=rule),
             tokenizer=_bytes)
@@ -801,7 +778,8 @@ def test_planner_pads_labels_to_the_canvas_on_a_diffusion_model(tmp_path):
     from quail.specs import DIFFUSION_GEMMA_26B_FP8
 
     special = {DIFFUSION_GEMMA_26B_FP8.canvas_end_text: [7],
-               DIFFUSION_GEMMA_26B_FP8.canvas_pad_text: [0]}
+               DIFFUSION_GEMMA_26B_FP8.canvas_pad_text: [0],
+               label_text("a"): [11], label_text("b"): [12]}
 
     def tokenizer(text):
         return special.get(text, _bytes(text))
@@ -812,15 +790,38 @@ def test_planner_pads_labels_to_the_canvas_on_a_diffusion_model(tmp_path):
         EngineConfig(model=DIFFUSION_GEMMA_26B_FP8.name, device="h100-sxm"),
         tokenizer=tokenizer)
     session.register("documents", DocumentProvider.from_parquet(path, id_col="id"))
+    # labels of several tokens are scored one trie node at a time, each
+    # read at the one-row canvas after it, with unpadded labels: the
+    # one-pass canvas does not condition a row on the rows before it
     plan = _topic(session).plan()
     (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
+    assert classify.spec.scoring == "trie_nodes"
+    assert [list(ids) for ids in classify.spec.label_token_ids] == [
+        _bytes(label_text(label)) for label in classify.spec.labels]
+    assert plan.settings["label_scoring"] == "cost model"
+    # one-token labels are scored on the canvas in one pass, padded
+    # with the answer end token
+    single = (session.docs("documents").alias("d").ai_classify(
+        quail.prompt("What is {0} about?", quail.col("d.body")),
+        ["a", "b"], name="topic").select("d.id", "topic")).plan()
+    (classify,) = [n for n in single.nodes if isinstance(n, AiClassify)]
+    assert classify.spec.scoring == "canvas"
+    assert [list(ids) for ids in classify.spec.label_token_ids] == [
+        [11, 7], [12, 7]]
+    # the canvas forced on longer labels pads them to the longest plus one
+    padded = quail.Session(
+        EngineConfig(model=DIFFUSION_GEMMA_26B_FP8.name, device="h100-sxm",
+                     label_scoring="canvas"), tokenizer=tokenizer)
+    padded.register("documents", DocumentProvider.from_parquet(path, id_col="id"))
+    (classify,) = [n for n in _topic(padded).plan().nodes
+                   if isinstance(n, AiClassify)]
     assert classify.spec.scoring == "canvas"
     rows = max(len(_bytes(label_text(label)))
                for label in ("refund", "shipping", "praise")) + 1
     for label, ids in zip(classify.spec.labels, classify.spec.label_token_ids):
         text = _bytes(label_text(label))
         assert list(ids) == text + [7] + [0] * (rows - len(text) - 1)
-    assert plan.settings["label_scoring"] == "cost model"
+    padded.close()
     # a chain's classifications stay separate nodes, each with its own
     # canvas length
     chained = _chain(session).plan()
@@ -833,19 +834,6 @@ def test_planner_pads_labels_to_the_canvas_on_a_diffusion_model(tmp_path):
     refused = _topic(forced).plan()
     assert isinstance(refused, Refusal) and "canvas" in refused.reasons[0]
     forced.close()
-    # the sequential alternative: one trie node per request, read at
-    # the one-row canvas after it, with unpadded labels
-    sequential = quail.Session(
-        EngineConfig(model=DIFFUSION_GEMMA_26B_FP8.name, device="h100-sxm",
-                     label_scoring="trie_nodes"), tokenizer=tokenizer)
-    sequential.register("documents",
-                        DocumentProvider.from_parquet(path, id_col="id"))
-    (classify,) = [n for n in _topic(sequential).plan().nodes
-                   if isinstance(n, AiClassify)]
-    assert classify.spec.scoring == "trie_nodes"
-    assert [list(ids) for ids in classify.spec.label_token_ids] == [
-        _bytes(label_text(label)) for label in classify.spec.labels]
-    sequential.close()
     session.close()
 
 
