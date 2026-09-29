@@ -74,7 +74,10 @@ SERVER_PORT = 8011
 CANVAS = 64
 # the example server reads up to 16 question groups at once
 CLIENTS = 32
-MAX_SEQUENCES = 127
+# vLLM sizes an fp32 logits buffer of sequences x canvas rows x the
+# 262,144-token vocabulary at startup: 127 sequences need 7.9 GiB and
+# run out of memory beside the model and KV, 32 need 2 GiB
+MAX_SEQUENCES = 32
 
 
 def schema() -> dict:
