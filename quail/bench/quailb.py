@@ -28,7 +28,7 @@ import quail_b as benchmark
 from quail.bench import substrait
 from quail.bench.results import write_json
 from quail.bench.substrait import QueryPlan, read_plan
-from quail.physical.nodes import AiClassify, RequestExecution
+from quail.planner.decide import label_work
 from quail.planner.plan import Refusal
 from quail.specs import H100_USD_PER_HOUR, MODELS
 from quail_b.queries import (
@@ -191,21 +191,18 @@ def join_anchors(result) -> dict:
     }
 
 
-def prompt_pieces(query, plan: QueryPlan, anchors, executed=None) -> dict:
+def prompt_pieces(query, plan: QueryPlan, anchors) -> dict:
     """Return the prompt token ids around each document, for QUAIL-B.
 
     QUAIL-B sizes the prefix trie of the run's requests from these
     pieces and the saved answer tables, after the run; nothing is
-    tracked while the query runs. A classification's pieces are the
-    ones its executed node sent, such as the lettered tail under the
-    letters rule.
+    tracked while the query runs. A classification's pieces are its
+    prompt with the labels by name, whichever rule read its labels.
 
     Args:
         query: The built query, with bound prompts.
         plan: The query's plan, for the operator ids.
         anchors: Written join position -> the anchor alias.
-        executed: The executed physical graph; needed when the query
-            classifies.
     """
     operators = query.logical.operators()
     filters, joins = operators.filters, operators.joins
@@ -224,56 +221,31 @@ def prompt_pieces(query, plan: QueryPlan, anchors, executed=None) -> dict:
                 "tail": list(predicate.prompt.tail_token_ids)})
     for position, join in enumerate(joins):
         anchor = anchors[position]
-        parts = {alias: (list(label), list(frame))
-                 for alias, label, frame in join.prompt.label_token_ids}
-        (partner,) = [alias for alias in parts if alias != anchor]
         pieces["joins"].append({
             "id": plan.join_id(position), "anchor": anchor,
-            "frame": parts[anchor][1], "label": parts[partner][0],
-            "tail": list(join.prompt.tail_token_ids)})
+            **_pair_pieces(join.prompt, anchor)})
     if plan.classifies:
-        sent = executed_classifications(executed)
+        labels = label_work(query.logical, filters)
+        calls = {labels.names[call]: call for call, _ in labels.calls}
         for operator in plan.classifies:
-            head, anchor, tail, layout = sent[operator.output]
-            if head is not None and list(head) != preamble:
-                raise ValueError(
-                    f"classification {operator.id} sent a head that is not "
-                    f"the preamble")
-            piece = {"id": operator.id, "tail": list(tail)}
-            if layout is not None:
-                piece.update(anchor=anchor, frame=list(layout[0]),
-                             label=list(layout[1]))
-            pieces["classifies"].append(piece)
+            call = calls[operator.output]
+            if operator.partner is None:
+                piece = {"tail": list(call.prompt.tail_token_ids)}
+            else:
+                # the anchor is the call's first document
+                anchor = call.aliases()[0]
+                piece = {"anchor": anchor, **_pair_pieces(call.prompt, anchor)}
+            pieces["classifies"].append({"id": operator.id, **piece})
     return pieces
 
 
-def executed_classifications(graph) -> dict:
-    """Return label column -> (head, anchor alias, tail, join layout).
-
-    Reads each classification the executed graph ran: a Quail
-    classification node and its chained stages, or a request node's
-    classifications. The head is None for a request node, which sends
-    the preamble; the join layout is None for one document.
-    """
-    if graph is None:
-        raise ValueError("classification prompt pieces need the executed plan")
-    sent = {}
-    for node in graph.nodes:
-        if isinstance(node, AiClassify) and node.spec is not None:
-            for spec in node.spec.chain:
-                head, tail = spec.prompt_token_parts
-                sent[spec.name] = (head, spec.anchor, tail, spec.join_layout)
-        elif isinstance(node, RequestExecution):
-            for spec in node.classifies:
-                sent[spec.output] = (None, spec.alias, spec.tail_token_ids,
-                                     spec.join_layout_token_ids or None)
-    return sent
-
-
-def label_tokens(report) -> int:
-    """Return the positions fed after answer cues, summed over the nodes."""
-    return sum(int(metrics.get("label_tokens", 0))
-               for metrics in report.get("node_metrics", {}).values())
+def _pair_pieces(prompt, anchor) -> dict:
+    """Return the frame, partner label, and tail of a two-document prompt."""
+    parts = {alias: (list(label), list(frame))
+             for alias, label, frame in prompt.label_token_ids}
+    (partner,) = [alias for alias in parts if alias != anchor]
+    return {"frame": parts[anchor][1], "label": parts[partner][0],
+            "tail": list(prompt.tail_token_ids)}
 
 
 def _submission_to_answer_s(
@@ -352,9 +324,7 @@ def run_query(session, spec: QuerySpec, tables) -> RunOutput:
         output.measurements["input_tokens"] = (
             result.report["fresh_tokens"] + result.report["cached_tokens"]
         )
-    output.prompt_pieces = prompt_pieces(query, plan, join_anchors(result),
-                                         result.plan)
-    output.measurements["label_tokens"] = label_tokens(result.report)
+    output.prompt_pieces = prompt_pieces(query, plan, join_anchors(result))
     return output
 
 

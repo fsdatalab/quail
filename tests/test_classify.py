@@ -197,8 +197,6 @@ def test_classifier_reads_the_letters_at_the_cue_row(monkeypatch):
     batch = QuailClassifier(state).classify(single, [[0], [1]], documents)
     assert list(batch.scores) == ["a", "b"]
     assert batch.suffix_tokens == 2 * 1
-    # a letter is read at the cue: nothing follows it
-    assert batch.label_tokens == 0
     # every row packs its prefix, the two-token frame, and the cue
     assert batch.fresh_tokens + batch.cached_tokens == (3 + 2) + 2 * (2 + 1)
 
@@ -257,9 +255,6 @@ def test_classifier_decodes_one_token_per_round(monkeypatch):
         (0, [91, 92]), (1, [91, 92]), (2, [91, 92]),
         (0, [93]), (1, [93]), (2, [93]), (0, [93, 1]), (2, [93, 1])])
     assert batch.suffix_tokens == 3 * 1 + 2 * 2
-    # each two-token label's first token, fed once; the cue sent again
-    # in round 1 is recomputation
-    assert batch.label_tokens == 2 * 1
 
 
 def test_classifier_borrows_shared_prefix_pages(monkeypatch):
@@ -763,63 +758,6 @@ def test_bench_reads_classify_plans_and_reports_labels_by_operator():
         "a", "b", "c"]
 
 
-def test_bench_reports_the_pieces_each_classification_sent():
-    from quail.bench.quailb import (
-        executed_classifications,
-        label_tokens,
-        prompt_pieces,
-    )
-    from quail_b.minimum import validate_prompt_pieces
-
-    spec = get_query("IMDB-14")
-    plan = read_plan(spec.plan)
-
-    def classification(name, tail, stages=()):
-        return ClassifySpec(
-            name=name, aliases=("r",), query_template="", arguments=(),
-            expected_inputs=3, estimated_seconds=0.0,
-            prompt_token_parts=((1, 2), tail), labels=("a", "b"),
-            label_token_ids=((5,), (6,)), stages=stages)
-
-    complaint = classification("complaint", (7, 8, 9))
-    node = AiClassify(
-        node_id="ai-classify:0", inputs=(), backend_name="quail",
-        model="tiny", spec=classification("sentiment", (3, 4), stages=(
-            ClassifyStage(complaint, ("negative", "mixed")),)))
-    query = SimpleNamespace(
-        session=SimpleNamespace(model=SimpleNamespace(hf_name="tiny")),
-        logical=SimpleNamespace(operators=lambda: SimpleNamespace(
-            filters={}, joins=[], prompts=[
-                SimpleNamespace(preamble_token_ids=(1, 2))])))
-    pieces = prompt_pieces(query, plan, {}, SimpleNamespace(nodes=(node,)))
-    # a chained stage's tail is its own
-    assert pieces["classifies"] == [
-        {"id": "classify-1", "tail": [3, 4]},
-        {"id": "classify-2", "tail": [7, 8, 9]}]
-    assert validate_prompt_pieces(spec, pieces)["classifies"] == pieces[
-        "classifies"]
-    with pytest.raises(ValueError, match="executed plan"):
-        prompt_pieces(query, plan, {})
-    query.logical = SimpleNamespace(operators=lambda: SimpleNamespace(
-        filters={}, joins=[], prompts=[
-            SimpleNamespace(preamble_token_ids=(1,))]))
-    with pytest.raises(ValueError, match="not the preamble"):
-        prompt_pieces(query, plan, {}, SimpleNamespace(nodes=(node,)))
-    # joined rows: the anchor, and the note and partner label around them
-    joined = AiClassify(
-        node_id="ai-classify:1", inputs=(), backend_name="quail", model="tiny",
-        spec=ClassifySpec(
-            name="aspect_sentiment", aliases=("r", "a"), query_template="",
-            arguments=(), expected_inputs=1, estimated_seconds=0.0,
-            prompt_token_parts=((1, 2), (3, 4)), labels=("a", "b"),
-            label_token_ids=((5,), (6,)), join_layout=((10,), (11, 12))))
-    assert executed_classifications(SimpleNamespace(nodes=(joined,))) == {
-        "aspect_sentiment": ((1, 2), "r", (3, 4), ((10,), (11, 12)))}
-    assert label_tokens({"node_metrics": {
-        "ai-classify:0": {"label_tokens": 4}, "scan:r": {}}}) == 4
-
-
-
 def test_pack_chunk_reads_every_canvas_row_when_asked():
     from fakes import cpu_staging
 
@@ -1069,7 +1007,6 @@ def test_classifier_scores_the_packed_trie(monkeypatch):
     assert list(batch.scores) == ["b", "d"]
     # the trie's five rows once per document
     assert batch.suffix_tokens == 2 * 5
-    assert batch.label_tokens == 2 * 4
 
 
 def test_planner_packs_the_trie_without_a_lettered_prompt():
@@ -1365,5 +1302,4 @@ def test_classifier_reads_the_letter_at_the_first_canvas_row(monkeypatch):
         assert packed[index] == [noise, 6, 0, 0]
     # the cue and the canvas after the prompt and the frame, once
     assert batch.suffix_tokens == 2 * (1 + 4)
-    assert batch.label_tokens == 2 * 4
     assert batch.fresh_tokens + batch.cached_tokens == (3 + 2) + 2 * (2 + 5)

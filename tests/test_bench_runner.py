@@ -355,3 +355,30 @@ def test_benchmark_query_prompts_labels_and_raw_rendering():
             for anchor in (0, 1):
                 assert render_join_prompt(spec.template, documents, anchor) == (
                     render_join_prompt_text(prompt, documents, anchor))
+
+
+def test_classification_pieces_are_the_named_reference_prompt(tmp_path):
+    from quail_b.minimum import validate_prompt_pieces
+    from quail_b.rendering import render_classify_prompt
+
+    spec = get_query("IMDB-15")
+    plan = read_plan(spec.plan)
+    with _session(tmp_path, backend="stock_vllm") as sess:
+        # the byte tokenizer, so the pieces decode back to text
+        pieces = prompt_pieces(build_query(sess, spec), plan, {0: "r"})
+    assert validate_prompt_pieces(spec, pieces)["classifies"] == pieces[
+        "classifies"]
+
+    def text(ids):
+        return bytes(token - 1 for token in ids).decode("utf-8")
+
+    sentiment, aspect = plan.classifies
+    one, joined = pieces["classifies"]
+    assert text(pieces["preamble"]) + "good film" + text(one["tail"]) == (
+        render_classify_prompt(sentiment.prompt, "good film", sentiment.labels,
+                               sentiment.descriptions))
+    assert joined["anchor"] == "r"
+    assert (text(pieces["preamble"]) + "good film" + text(joined["frame"])
+            + text(joined["label"]) + "the acting" + text(joined["tail"])) == (
+        render_classify_prompt(aspect.prompt, "good film", aspect.labels,
+                               aspect.descriptions, partner="the acting"))

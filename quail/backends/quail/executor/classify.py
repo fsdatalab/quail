@@ -356,34 +356,26 @@ class ClassifyStages:
             return Stage.DROP
         return None
 
-    def finish(self, answers) -> tuple[int, int, int]:
+    def finish(self, answers) -> tuple[int, int]:
         """Label every document from its answers; returns the token counts.
 
         Returns:
-            (suffix tokens, label tokens, streamed tokens): the suffix
-            tokens read; the positions after the answer cue that each
-            request needs once, which are a trie's nodes below the cue,
-            a canvas's rows, or a decoded label's path without its last
-            token; and the suffix tokens plus the frames written after
-            the documents.
+            (suffix tokens, streamed tokens): the suffix tokens read, and
+            those plus the frames written after the documents.
         """
         if self.partners is not None:
             streamed = sum(1 + self.block_tokens[partner]
                            for _, partner in self.pair_labels)
             anchors = {anchor for anchor, _ in self.pair_labels}
             streamed += len(anchors) * len(self.stages[0].frame)
-            return len(self.pair_labels), 0, streamed
+            return len(self.pair_labels), streamed
         suffix_tokens = 0
-        label_tokens = 0
         streamed = 0
         position = 0
         for index, request in enumerate(self.requests):
             first = answers[position]
             if index in self.decoders:
-                decoder = self.decoders[index]
-                stage_tokens = decoder.tokens
-                label_tokens += sum(len(decoder.label_ids[label]) - 1
-                                    for label in decoder.label if label >= 0)
+                stage_tokens = self.decoders[index].tokens
             else:
                 for anchor, logprobs in first.items():
                     if self.labels[index][anchor] is None:
@@ -392,8 +384,6 @@ class ClassifyStages:
                 # a letters stage on a canvas model streams its canvas too
                 stage_tokens = len(first) * (sum(map(len, request.suffixes))
                                              + self.canvas_rows)
-                # every suffix starts with the cue
-                label_tokens += stage_tokens - len(first) * len(request.suffixes)
             suffix_tokens += stage_tokens
             # a frame equal to the stage before's is already in KV
             written = (index == 0
@@ -401,7 +391,7 @@ class ClassifyStages:
             streamed += stage_tokens + (len(first) * len(request.frame)
                                         if written else 0)
             position += max(1, request.rounds)
-        return suffix_tokens, label_tokens, streamed
+        return suffix_tokens, streamed
 
     def later(self) -> dict:
         """The chained classifications' labels by output name."""
@@ -447,13 +437,12 @@ class QuailClassifier:
             prefixes, state["chunk_tokens"], anchor_keys=keys,
             staging=state["input_staging"], prefix_tree=tree, stats=stats,
             label=f"classify {spec.name}")
-        suffix_tokens, label_tokens, streamed = plan.finish(answers)
+        suffix_tokens, streamed = plan.finish(answers)
         total = sum(map(len, prefixes)) + streamed
-        return self._batch(plan.labels[0], fresh, total - fresh,
-                           (suffix_tokens, label_tokens), stats, spans,
-                           plan.later())
+        return self._batch(plan.labels[0], fresh, total - fresh, suffix_tokens,
+                           stats, spans, plan.later())
 
-    def _batch(self, labels, fresh, cached, counts, stats, spans,
+    def _batch(self, labels, fresh, cached, suffix_tokens, stats, spans,
                later) -> RerankerBatch:
         """The labels and token counts of one run, with its GPU time when timed."""
         state = self.state
@@ -465,7 +454,7 @@ class QuailClassifier:
                         for _, _, start, end in spans) / 1000.0
         return RerankerBatch(
             labels, fresh_tokens=fresh, cached_tokens=cached,
-            suffix_tokens=counts[0], label_tokens=counts[1],
+            suffix_tokens=suffix_tokens,
             borrowed_tokens=stats.get("borrowed_tokens", 0),
             pack_s=stats.get("pack_s", 0.0),
             gpu_s=gpu_s,
