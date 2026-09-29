@@ -73,8 +73,7 @@ def _methods(csv: str) -> list[str]:
 
 def _run_family(process_groups, result_name, model, sf, query_ids_csv,
                 run_dir, ground_truth_collection, root=None,
-                label_scoring=None, attention=None, gpu_timing=False,
-                label_traces=None) -> str:
+                label_scoring=None, attention=None, gpu_timing=False) -> str:
     """Run one query family's methods, one child process per group.
 
     Every group runs on the one GPU of this container, in a fresh
@@ -95,8 +94,7 @@ def _run_family(process_groups, result_name, model, sf, query_ids_csv,
             data_dir=DATA_DIR, model=model, sf=sf, query_ids=query_ids,
             run_dir=run_dir, ground_truth_collection=ground_truth_collection,
             methods=methods, root=root, label_scoring=label_scoring,
-            attention=attention, gpu_timing=gpu_timing,
-            label_traces=label_traces)
+            attention=attention, gpu_timing=gpu_timing)
         process_results.append(process_result)
         suites.update(process_result["suites"])
     gpu_uuids = {
@@ -149,16 +147,13 @@ def run_query_family(
     label_scoring: str = "",
     attention: str = "",
     gpu_timing: bool = False,
-    label_traces: str = "",
 ) -> str:
     """Run one query family through Quail and the vLLM baselines.
 
     baselines names the vLLM baseline methods that run when
     include_baselines is set. label_scoring forces one AI.CLASSIFY
     label scoring rule and attention one attention path for filters
-    and joins; empty lets the planner choose. label_traces names a
-    directory on the results volume of saved classification traces
-    the planner replays; an exhaustive run fills it.
+    and joins; empty lets the planner choose.
     """
     process_groups = [("quail",)] if include_quail else []
     if include_baselines:
@@ -170,8 +165,7 @@ def run_query_family(
                            run_dir, ground_truth_collection,
                            label_scoring=label_scoring or None,
                            attention=attention or None,
-                           gpu_timing=gpu_timing,
-                           label_traces=label_traces or None)
+                           gpu_timing=gpu_timing)
     finally:
         results_vol.commit()
         kernel_cache.commit()
@@ -273,7 +267,6 @@ def run_all(
     label_scoring: str = "",
     attention: str = "",
     gpu_timing: bool = False,
-    label_traces: str = "",
 ):
     from quail_b import select_queries
 
@@ -293,7 +286,6 @@ def run_all(
         "sf": sf,
         "label_scoring": label_scoring or None,
         "attention": attention or None,
-        "label_traces": label_traces or None,
         "query_ids": list(query_ids),
         "summaries": {},
         "function_call_ids": {},
@@ -328,7 +320,6 @@ def run_all(
                     label_scoring=label_scoring,
                     attention=attention,
                     gpu_timing=gpu_timing,
-                    label_traces=label_traces,
                 )
                 family_calls.append((group, family_call))
                 call_ids[f"{group}:quail_vllm"] = family_call.object_id
@@ -487,7 +478,6 @@ def main(
     label_scoring: str = "",
     attention: str = "",
     gpu_timing: bool = False,
-    label_traces: str = "",
     finish: str = "",
 ):
     if finish:
@@ -516,7 +506,6 @@ def main(
         label_scoring=label_scoring,
         attention=attention,
         gpu_timing=gpu_timing,
-        label_traces=label_traces,
     )
     print(f"function call id: {call.object_id} (all families)", flush=True)
     print(call.get(), flush=True)

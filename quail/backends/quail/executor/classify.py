@@ -16,14 +16,6 @@ the partner suffixes are:
   read and returns every label token, so the cue's row scores all
   one-token labels at once and labels sharing leading tokens share
   the rows after them.
-- ``trie_rounds``: one stage per trie depth. At depth d a document
-  sends the chains of the trie nodes its still-alive labels pass
-  through, and after each round a label whose partial score is below
-  a fully read label's score is pruned; a document resolved early
-  skips the remaining rounds (RoundScorer).
-- ``trie_search``: one stage per trie node. Each round a document
-  sends one chain, the next node of the label with the highest bound,
-  so the winning label resolves first and prunes the rest.
 - ``trie_tree``: the whole trie as one suffix: the cue and every
   node's token once, split into chains that each follow first
   children. Each chain is a causal segment and reads the ancestors
@@ -38,7 +30,6 @@ the partner suffixes are:
 import logging
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Callable
 
 import numpy as np
@@ -48,28 +39,21 @@ from quail.backends.quail.executor.model import full_output_head
 from quail.backends.quail.executor.readout import AsyncLabelLogprobs
 from quail.backends.quail.executor.stages import Stage, run_stages
 from quail.execution.labels import (
-    RoundScorer,
     best_label,
     canvas_scores,
     label_chain_scores,
     label_path_scores,
     label_scores,
     label_trie,
-    trace_key,
-    trace_scores,
     tree_scores,
     trie_chains,
     trie_paths,
     trie_targets,
-    write_label_traces,
 )
 from quail.execution.reranker import RerankerBatch
 from quail.execution.tokens import chain_tokens, prefix_tree
 
 logger = logging.getLogger("quail")
-
-# documents whose node scores an exhaustive run saves as its trace
-TRACE_DOCUMENTS = 512
 
 
 @dataclass(frozen=True)
@@ -86,12 +70,7 @@ class LabelRequests:
             its last.
         score: Maps one document's log probabilities, shape
             (suffixes, rows, targets) with all rows read and
-            (suffixes, targets) otherwise, to one score per label;
-            None under ``trie_rounds`` and ``trie_search``, which
-            score as they read.
-        rounds: Under ``trie_rounds`` and ``trie_search``, the number
-            of rounds a document may need; each round offers every
-            node's chain and a document picks its own.
+            (suffixes, targets) otherwise, to one score per label.
         chains: Under ``trie_tree``, the chains the one suffix packs.
     """
 
@@ -99,8 +78,7 @@ class LabelRequests:
     suffixes: list
     targets: list
     read_all_rows: bool
-    score: Callable[[np.ndarray], np.ndarray] | None
-    rounds: int = 0
+    score: Callable[[np.ndarray], np.ndarray]
     chains: list | None = None
 
 
@@ -142,13 +120,6 @@ def label_requests(spec, targets=None) -> LabelRequests:
         return LabelRequests(
             frame, [[cue, *path] for path in paths], targets, True,
             lambda logprobs: label_path_scores(ids, paths, targets, logprobs))
-    if spec.scoring in ("trie_rounds", "trie_search"):
-        nodes = sorted(label_trie(ids), key=lambda n: (len(n), n))
-        rounds = (len(nodes) if spec.scoring == "trie_search"
-                  else max(len(label) for label in ids))
-        return LabelRequests(
-            frame, [[cue, *node] for node in nodes], targets, True, None,
-            rounds=rounds)
     trie = label_trie(ids)
     nodes = sorted(trie, key=lambda prefix: (len(prefix), prefix))
     return LabelRequests(
@@ -199,11 +170,10 @@ class QuailClassifier:
                                 for suffix in request.suffixes)
                             if read_all else 1)
         # every label read at the same rows needs no normalizer: one-token
-        # labels at the cue row, or the canvas; a trace needs true log
-        # probabilities
+        # labels at the cue row, or the canvas
         same_rows = (spec.scoring == "canvas" or all(
             len(ids) == 1 for stage in specs for ids in stage.label_token_ids))
-        normalize = not same_rows or bool(state.get("label_traces"))
+        normalize = not same_rows
         readout = state.get("label_readout")
         if (readout is None or list(readout.targets.tolist()) != targets
                 or readout.rows != readout_rows
@@ -249,61 +219,21 @@ class QuailClassifier:
                 return Stage.DROP
             return None
 
-        # one stage per classification, or one per trie depth under
-        # trie_rounds; a later classification's first stage gates
+        # one stage per classification; a later classification's stage
+        # gates on the label before it
         stages = []
-        scorers = {}
-        asked = {}       # (document, stage position) -> nodes requested
         for index, (stage_spec, request) in enumerate(zip(specs, requests)):
-            if not request.rounds:
-                def whole(anchor, row, index=index):
-                    labels[index][anchor] = label_of(index, row)
-                    return True
+            def whole(anchor, row, index=index):
+                labels[index][anchor] = label_of(index, row)
+                return True
 
-                stages.append(Stage(
-                    suffixes=request.suffixes, readout=readout,
-                    frame=request.frame, decide=whole,
-                    requests=((lambda key, index=index: gate(index, key))
-                              if index else None),
-                    read_all_rows=read_all, label=stage_spec.name,
-                    chains=request.chains))
-                continue
-            scorer = RoundScorer(
-                stage_spec.label_token_ids, targets, len(rows),
-                search=stage_spec.scoring == "trie_search",
-                demand=(None if stage_spec.demand is None else
-                        [stage_spec.labels.index(label)
-                         for label in stage_spec.demand
-                         if label in stage_spec.labels]))
-            scorers[index] = scorer
-            for round in range(request.rounds):
-                position = len(stages)
-
-                def ask(key, index=index, round=round, position=position,
-                        scorer=scorer):
-                    document = key[2]
-                    if round == 0 and index and gate(index, key) is Stage.DROP:
-                        return Stage.DROP
-                    nodes = scorer.requests(document, round)
-                    if not nodes:
-                        return Stage.SKIP
-                    asked[document, position] = nodes
-                    return nodes
-
-                def round_read(anchor, row, index=index, position=position,
-                               scorer=scorer, names=stage_spec.labels):
-                    nodes = asked.pop((anchor, position))
-                    scorer.update(anchor, nodes,
-                                  row.reshape(len(nodes), readout_rows, -1))
-                    if scorer.label[anchor] >= 0:
-                        labels[index][anchor] = names[scorer.label[anchor]]
-                    return True
-
-                stages.append(Stage(
-                    suffixes=request.suffixes, readout=readout,
-                    frame=request.frame, requests=ask, decide=round_read,
-                    read_all_rows=True,
-                    label=f"{stage_spec.name} round {round}"))
+            stages.append(Stage(
+                suffixes=request.suffixes, readout=readout,
+                frame=request.frame, decide=whole,
+                requests=((lambda key, index=index: gate(index, key))
+                          if index else None),
+                read_all_rows=read_all, label=stage_spec.name,
+                chains=request.chains))
 
         stats = {}
         answers, spans, fresh = run_stages(
@@ -313,25 +243,18 @@ class QuailClassifier:
             label=f"classify {spec.name}", canvas=canvas)
         label_tokens = 0
         streamed = 0     # frame and suffix tokens packed after documents
-        position = 0
         for index, request in enumerate(requests):
-            first = answers[position]
-            if index in scorers:
-                suffix_tokens = scorers[index].tokens
-            else:
-                for anchor, logprobs in first.items():
-                    if labels[index][anchor] is None:
-                        labels[index][anchor] = label_of(index, logprobs)
-                suffix_tokens = len(first) * (
-                    len(canvas) if canvas else sum(map(len, request.suffixes)))
-                if state.get("label_traces") and specs[index].scoring == "trie_paths":
-                    self.save_traces(specs[index], request, first, readout_rows)
+            first = answers[index]
+            for anchor, logprobs in first.items():
+                if labels[index][anchor] is None:
+                    labels[index][anchor] = label_of(index, logprobs)
+            suffix_tokens = len(first) * (
+                len(canvas) if canvas else sum(map(len, request.suffixes)))
             label_tokens += suffix_tokens
             # a frame equal to the stage before's is already in KV
             written = index == 0 or request.frame != requests[index - 1].frame
             streamed += suffix_tokens + (len(first) * len(request.frame)
                                          if written else 0)
-            position += max(1, request.rounds)
         total = sum(map(len, prefixes)) + streamed
         gpu_s = 0.0
         if state.get("gpu_timing"):
@@ -348,28 +271,3 @@ class QuailClassifier:
             chunks=len(spans) if state.get("gpu_timing") else 0,
             later={stage.spec.name: labels[index + 1]
                    for index, stage in enumerate(spec.stages)})
-
-    def save_traces(self, spec, request, answers, readout_rows) -> None:
-        """Save a sample of documents' node scores for the planner.
-
-        The file is named by the model, prompt, and labels; an existing
-        file is kept, so the first exhaustive run of a classification
-        writes the trace every later plan replays.
-        """
-        state = self.state
-        directory = Path(state["label_traces"])
-        path = directory / (trace_key(
-            state.get("model_name", ""), spec.query_template, spec.labels,
-            spec.label_token_ids) + ".parquet")
-        if path.exists():
-            return
-        ids = spec.label_token_ids
-        paths = trie_paths(ids)
-        traces = []
-        for anchor in sorted(answers)[:TRACE_DOCUMENTS]:
-            logprobs = answers[anchor].reshape(len(paths), readout_rows, -1)
-            traces.append(trace_scores(ids, paths, request.targets, logprobs))
-        directory.mkdir(parents=True, exist_ok=True)
-        write_label_traces(path, traces)
-        logger.info("saved %s traces of %s to %s", len(traces), spec.name, path)
-

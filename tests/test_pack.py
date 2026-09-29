@@ -2,14 +2,9 @@
 
 import random
 
-import pytest
 from fakes import expected_filter_rows
 
-from quail.backends.quail.executor.pack import (
-    SKIP,
-    JoinAdmission,
-    pages_for,
-)
+from quail.backends.quail.executor.pack import JoinAdmission, pages_for
 from quail.execution.tokens import PrefixTree
 
 
@@ -404,32 +399,3 @@ def test_join_anchors_borrow_a_resident_parents_pages(monkeypatch):
     assert (keys[1], 32, 32) in packed
     assert stats["borrowed_tokens"] == 32
     assert arena.free_pages == 64 and not arena.accounting.owned
-
-
-def test_join_admission_skips_the_stages_a_document_asks_to_skip():
-    asked = []
-
-    def partners(j):
-        asked.append(j)
-        return SKIP if j == 1 else [0]
-
-    sched = JoinAdmission([50], [[10], [10], [10]], 250, arena_pages=100,
-                          page_tokens=16, anchor_partners={0: partners})
-    assert [(a, j) for a, j, *_ in sched.next_chunk(100)] == [(0, 0)]
-    assert sched.report(0, 0, 0, 1, [1]) == []
-    # stage 1 is skipped and counts as passed; the anchor streams stage 2
-    assert asked == [0, 1, 2]
-    assert sched._true[0][1]
-    assert [(a, j) for a, j, *_ in sched.next_chunk(100)] == [(0, 2)]
-    assert sched.report(0, 2, 0, 1, [1]) == [("finished", 0)]
-    assert sched.survivors == 1 and sched.done()
-    # skipping the last stage finishes the anchor as a survivor
-    sched = JoinAdmission([50], [[10], [10]], 250, arena_pages=100,
-                          page_tokens=16,
-                          anchor_partners={0: lambda j: [0] if j == 0 else SKIP})
-    sched.next_chunk(100)
-    assert sched.report(0, 0, 0, 1, [1]) == [("finished", 0)]
-    assert sched.survivors == 1 and sched.done()
-    with pytest.raises(ValueError, match="first stage"):
-        JoinAdmission([50], [[10]], 250, arena_pages=100, page_tokens=16,
-                      anchor_partners={0: lambda j: SKIP})

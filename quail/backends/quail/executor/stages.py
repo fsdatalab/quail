@@ -20,7 +20,7 @@ from typing import Any, Callable
 
 import numpy as np
 
-from quail.backends.quail.executor.pack import DROP, SKIP, JoinAdmission
+from quail.backends.quail.executor.pack import DROP, JoinAdmission
 from quail.progress import Progress, logger
 
 
@@ -41,9 +41,8 @@ class Stage:
             the stage before's is already there and is not written
             again.
         requests: Callable(document key) -> indices into suffixes the
-            document sends, None for all of them, DROP to take the
-            document out of the run at this stage, or SKIP to pass it
-            to the next stage with no request here. Asked when the
+            document sends, None for all of them, or DROP to take the
+            document out of the run at this stage. Asked when the
             document reaches the stage. None sends every suffix to
             every document.
         decide: Callable(document index, row) -> whether the document
@@ -63,7 +62,6 @@ class Stage:
     """
 
     DROP = DROP
-    SKIP = SKIP
 
     suffixes: list
     readout: Any

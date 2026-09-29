@@ -294,7 +294,3 @@ class EngineConfig:
     # and join, so an ablation can run each path; None lets the
     # planner choose per node
     attention: str | None = None
-    # a directory of saved classification traces: the exhaustive
-    # rule records a sample of node scores there, and the planner
-    # replays the adaptive rules on them to choose; None keeps none
-    label_traces: str | None = None

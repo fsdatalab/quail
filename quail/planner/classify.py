@@ -9,8 +9,6 @@ after it, and one short suffix per label-trie node reads the next
 token's log probabilities.
 """
 
-import heapq
-from collections import deque
 from dataclasses import dataclass, replace
 
 import numpy as np
@@ -19,12 +17,7 @@ from quail.cost import budgets
 from quail.cost.dense_decoder_cost import dense_decoder_components
 from quail.cost.roofline import CostComponent, component_latencies
 from quail.cost.work import Work, ask, scan, stream
-from quail.execution.labels import (
-    label_trie,
-    replay_rounds,
-    trace_key,
-    trie_paths,
-)
+from quail.execution.labels import label_trie, trie_paths
 from quail.logical import (
     Alias,
     Apply,
@@ -103,7 +96,6 @@ def classify_table(context, alias: str, backend_name: str,
         backend_name=backend_name, model=context.model,
         device=context.device, tokenizer=context.tokenizer,
         capacity=capacity, lengths=tuple(lengths), shared=tuple(shared),
-        traces=getattr(context, "label_traces", None),
         tree=(context.model.weight_precision == "fp8"
               and not context.model.canvas_tokens
               and getattr(context, "attention", None) != "unified"))
@@ -124,16 +116,12 @@ def has_label(logical) -> bool:
 
 # The label scoring rules the executor runs, in the order they were
 # added; each later rule must return the labels of the first.
-LABEL_SCORINGS = ("trie_nodes", "label_chains", "trie_paths", "trie_rounds",
-                  "trie_search", "trie_tree", "canvas")
+LABEL_SCORINGS = ("trie_nodes", "label_chains", "trie_paths", "trie_tree",
+                  "canvas")
 
-# A round launched in one chunk has its answers read while the next
-# chunk runs, so a document's next round enters the chunk after that.
-READOUT_LAG_CHUNKS = 2
 EXHAUSTIVE_SCORING = "trie_paths"
 # every node once, in one request: fewest tokens, tree attention only
 TREE_SCORING = "trie_tree"
-ADAPTIVE_SCORINGS = ("trie_rounds", "trie_search")
 
 
 def suffix_lengths(scoring: str, labels) -> list[int]:
@@ -146,10 +134,11 @@ def suffix_lengths(scoring: str, labels) -> list[int]:
     only its last row is read. Under ``label_chains`` it continues
     with all but a label's last token and every row is read. Under
     ``trie_paths`` it continues with one of the trie's deepest proper
-    prefixes and every row is read. Under ``trie_rounds`` and
-    ``trie_search`` a document sends one chain per trie depth, the cue
-    and that many tokens, assuming one label path is read; how many
-    are read is measured, not planned, until the cost model.
+    prefixes and every row is read. Under ``trie_tree`` the one suffix
+    holds every trie node once.
+
+    Raises:
+        ValueError: The rule is not one of LABEL_SCORINGS.
     """
     if scoring == "canvas":
         return [len(labels[0])]
@@ -159,9 +148,14 @@ def suffix_lengths(scoring: str, labels) -> list[int]:
         return [len(ids) for ids in labels]
     if scoring == "trie_paths":
         return [1 + len(path) for path in trie_paths(labels)]
-    if scoring in ("trie_rounds", "trie_search"):
-        return [depth + 1 for depth in range(max(len(ids) for ids in labels))]
+    if scoring != "trie_nodes":
+        raise ValueError(f"unknown label scoring rule {scoring!r}")
     return [1 + len(node) for node in label_trie(labels)]
+
+
+def reads_all_rows(scoring: str) -> bool:
+    """Whether a rule reads every row of a suffix, or only its last."""
+    return scoring != "trie_nodes"
 
 
 def readout_component(rows: float, model) -> CostComponent:
@@ -190,36 +184,32 @@ class Simulated:
         passes: Forward chunks launched.
         work: The token, attention, and KV work of every chunk.
         label_tokens: Suffix tokens streamed after the documents.
-        rounds: The most rounds any document ran.
     """
 
     seconds: float
     passes: int
     work: Work
     label_tokens: float
-    rounds: int
 
 
-def simulate(prefixes, frame: int, rounds, chunk: int, capacity: int,
+def simulate(prefixes, frame: int, chains, chunk: int, capacity: int,
              model, device, resident: bool = False,
              read_all_rows: bool = True, canvas_rows: int = 0,
              shared=None) -> Simulated:
     """Replay the stage scheduler on the CPU and price each chunk.
 
     Documents are admitted in order while their reservation, the
-    prefix plus the frame and longest chain, fits the arena. A chunk
-    takes the rounds that are ready, then fresh documents, up to the
-    chunk budget; a round is atomic. A document's next round is ready
-    READOUT_LAG_CHUNKS chunks after the one that launched the round,
-    and a document leaves the arena after its last round. Each chunk
-    costs its roofline time with the weights streamed once, plus the
-    readout of the rows it reads.
+    prefix plus the frame and longest chain, fits the arena, and a
+    chunk takes documents up to the chunk budget; a document's request
+    is atomic, and the document leaves the arena once its chunk has
+    run. Each chunk costs its roofline time with the weights streamed
+    once, plus the readout of the rows it reads.
 
     Args:
         prefixes: Per document, the tokens before the frame (the prompt
             head and the document).
         frame: The frame tokens written once per document.
-        rounds: Per document, its rounds, each a list of chain lengths.
+        chains: Per document, the lengths of the chains it streams.
         chunk: The chunk budget in tokens.
         capacity: The arena's tokens.
         model: The ModelSpec.
@@ -235,31 +225,26 @@ def simulate(prefixes, frame: int, rounds, chunk: int, capacity: int,
     window = model.sliding_window
     n = len(prefixes)
     shared = [0] * n if shared is None else shared
-    longest = max((length for document in rounds for chains in document
-                   for length in chains), default=0)
+    longest = max((length for document in chains for length in document),
+                  default=0)
     extra = frame + longest
 
-    def item_tokens(document, index):
-        chains = rounds[document][index] if rounds[document] else []
-        tokens = sum(chains)
-        if index == 0:
-            tokens += frame + (0 if resident
-                               else prefixes[document] - shared[document])
+    def item_tokens(document):
+        tokens = sum(chains[document]) + frame
+        if not resident:
+            tokens += prefixes[document] - shared[document]
         return tokens
 
-    def item_work(document, index):
+    def item_work(document):
         prefix = prefixes[document]
-        chains = rounds[document][index] if rounds[document] else []
         # a canvas longer than one row reads the document a second
         # time, in the non-causal call every canvas row runs
-        suffixes = stream(prefix + frame, chains, window=window)
+        suffixes = stream(prefix + frame, chains[document], window=window)
         if canvas_rows > 1:
             suffixes = suffixes + Work(
                 pairs=suffixes.pairs, kv_read=suffixes.kv_read,
                 sliding_pairs=suffixes.sliding_pairs,
                 sliding_kv_read=suffixes.sliding_kv_read)
-        if index > 0:
-            return suffixes
         if resident:
             return ask(prefix, frame, window=window) + suffixes
         if shared[document]:
@@ -267,95 +252,31 @@ def simulate(prefixes, frame: int, rounds, chunk: int, capacity: int,
                        window=window) + suffixes
         return scan(prefix + frame, 0, window=window) + suffixes
 
-    ready = deque()
-    waiting = []           # heap of (ready chunk, document, round)
     next_document = 0
-    held = 0
     seconds = 0.0
     passes = 0
     total = Work()
     label_tokens = 0.0
-    most_rounds = 0
-    k = 0
-    while next_document < n or ready or waiting:
-        while waiting and waiting[0][0] <= k:
-            _, document, index = heapq.heappop(waiting)
-            ready.append((document, index))
+    while next_document < n:
         room = chunk
+        held = 0
         work = Work()
         rows = 0.0
-        launched = []
-        while ready and (item_tokens(*ready[0]) <= room or room == chunk):
-            document, index = ready.popleft()
-            room -= item_tokens(document, index)
-            work += item_work(document, index)
-            chains = rounds[document][index] if rounds[document] else []
-            rows += sum(chains) if read_all_rows else len(chains)
-            label_tokens += sum(chains)
-            launched.append((document, index))
         while (next_document < n
                and held + prefixes[next_document] + extra <= capacity
-               and (item_tokens(next_document, 0) <= room or room == chunk)):
+               and (item_tokens(next_document) <= room or room == chunk)):
             document = next_document
             next_document += 1
             held += prefixes[document] + extra
-            room -= item_tokens(document, 0)
-            work += item_work(document, 0)
-            chains = rounds[document][0] if rounds[document] else []
-            rows += sum(chains) if read_all_rows else len(chains)
-            label_tokens += sum(chains)
-            launched.append((document, 0))
-        if not launched:
-            # nothing is ready: the loop waits for the readouts in flight
-            k = waiting[0][0]
-            continue
+            room -= item_tokens(document)
+            work += item_work(document)
+            rows += (sum(chains[document]) if read_all_rows
+                     else len(chains[document]))
+            label_tokens += sum(chains[document])
         seconds += chunk_seconds(work, rows, model, device)
         passes += 1
         total += work
-        for document, index in launched:
-            most_rounds = max(most_rounds, index + 1)
-            if index + 1 < len(rounds[document]):
-                heapq.heappush(waiting,
-                               (k + READOUT_LAG_CHUNKS, document, index + 1))
-            else:
-                held -= prefixes[document] + extra
-        k += 1
-    return Simulated(seconds, passes, total, label_tokens, most_rounds)
-
-
-def rule_rounds(scoring: str, labels, traces=None, demand=None) -> tuple:
-    """The rounds each document runs under one rule, and how rows are read.
-
-    An exhaustive rule runs one round with the same chains for every
-    document. An adaptive rule's rounds come from replaying it on the
-    traces, one entry per traced document; without traces they are
-    its worst case, every trie node read.
-
-    Returns:
-        (rounds per document, read_all_rows).
-    """
-    if scoring == "canvas":
-        return [[[len(labels[0])]]], True
-    nodes = sorted(label_trie(labels), key=lambda node: (len(node), node))
-    if scoring == "trie_tree":
-        return [[[len(nodes)]]], True
-    if scoring == "trie_nodes":
-        return [[[1 + len(node) for node in nodes]]], False
-    if scoring == "label_chains":
-        return [[[len(ids) for ids in labels]]], True
-    if scoring == "trie_paths":
-        return [[[1 + len(path) for path in trie_paths(labels)]]], True
-    if scoring not in ADAPTIVE_SCORINGS:
-        raise ValueError(f"unknown label scoring rule {scoring!r}")
-    search = scoring == "trie_search"
-    if traces:
-        replayed = replay_rounds(labels, traces, search=search, demand=demand)
-        return [rounds for rounds, _ in replayed], True
-    if search:
-        return [[[1 + len(node)] for node in nodes]], True
-    depth = max(len(ids) for ids in labels)
-    return [[[1 + len(node) for node in nodes if len(node) == d]
-             for d in range(depth)]], True
+    return Simulated(seconds, passes, total, label_tokens)
 
 
 @dataclass(frozen=True)
@@ -377,8 +298,6 @@ class _Table:
             also has, which prefix sharing borrows from KV; empty when
             the plan does not share prefixes or the corpus is not
             tokenized yet.
-        traces: Callable(trace key) -> saved exhaustive traces, or
-            None when the session keeps none.
     """
 
     alias: str
@@ -394,7 +313,6 @@ class _Table:
     capacity: int = 0
     lengths: tuple = ()
     shared: tuple = ()
-    traces: object = None
     # whether the model runs the tree attention path, which the
     # packed trie needs: an fp8 model with the plan not forced unified
     tree: bool = False
@@ -421,7 +339,7 @@ class _Table:
         """The prompt tokens before the document."""
         return tuple(self.tokenizer(call.prompt.preamble))
 
-    def classify(self, call, name, live, resident=False, demand=None):
+    def classify(self, call, name, live, resident=False):
         """Return a ClassifySpec for one prompt and the work it does.
 
         Args:
@@ -430,8 +348,6 @@ class _Table:
             live: How many documents are expected to reach it.
             resident: Whether the documents' KV is resident from an
                 earlier stage of the same chain.
-            demand: The labels a filter accepts when only membership
-                is needed, else None.
 
         Raises:
             ClassifyRefusedError: A document and its prompt exceed the budget.
@@ -442,15 +358,8 @@ class _Table:
                        for label in call.labels)
         if self.model.canvas_tokens and self.scoring != "trie_nodes":
             labels = self.padded(labels)
-        traces = None
-        if self.traces is not None:
-            traces = self.traces(trace_key(
-                self.model.name, call.prompt.template, call.labels, labels))
-        demanded = (None if demand is None
-                    else [call.labels.index(label) for label in demand
-                          if label in call.labels])
         scoring, simulated = self.choose(live, len(head), len(tail) - 1,
-                                         labels, resident, traces, demanded)
+                                         labels, resident)
         suffixes = suffix_lengths(scoring, labels)
         # head, document, and frame stay resident while the longest
         # suffix and the frame entry's own rows are packed beside them
@@ -467,8 +376,6 @@ class _Table:
             expected_inputs=live, estimated_seconds=simulated.seconds,
             prompt_token_parts=(head, tail), labels=tuple(call.labels),
             label_token_ids=labels, scoring=scoring,
-            demand=None if demand is None else tuple(demand),
-            traced_documents=len(traces) if traces else 0,
         )
         return spec, simulated.work
 
@@ -492,19 +399,18 @@ class _Table:
         return tuple(ids + end + pad * (rows - len(ids) - 1) for ids in labels)
 
     def simulate(self, scoring, live, head_tokens, frame_tokens, labels,
-                 resident, traces=None, demand=None) -> Simulated:
+                 resident) -> Simulated:
         """Replay one rule over the documents expected and price it."""
-        per_document, read_all = rule_rounds(scoring, labels, traces, demand)
+        chains = suffix_lengths(scoring, labels)
         documents = self.sample(live)
         prefixes = [head_tokens + length for length, _ in documents]
         # a borrowed prefix includes the prompt head the documents share
         shared = [head_tokens + tokens if tokens else 0
                   for _, tokens in documents]
-        rounds = [per_document[i % len(per_document)]
-                  for i in range(len(prefixes))]
-        return simulate(prefixes, frame_tokens, rounds, self.chunk,
-                        self.capacity or self.budget, self.model, self.device,
-                        resident=resident, read_all_rows=read_all,
+        return simulate(prefixes, frame_tokens, [chains] * len(prefixes),
+                        self.chunk, self.capacity or self.budget, self.model,
+                        self.device, resident=resident,
+                        read_all_rows=reads_all_rows(scoring),
                         canvas_rows=(len(labels[0]) if scoring == "canvas"
                                      else self.model.canvas_tokens),
                         shared=shared)
@@ -519,27 +425,18 @@ class _Table:
         join estimates do.
         """
         head, tail = spec.prompt_token_parts
-        traces = None
-        if self.traces is not None:
-            traces = self.traces(trace_key(
-                self.model.name, spec.query_template, spec.labels,
-                spec.label_token_ids))
-        demand = (None if spec.demand is None
-                  else [spec.labels.index(label) for label in spec.demand])
         simulated = self.simulate(
             spec.scoring, spec.expected_inputs, len(head), len(tail) - 1,
-            spec.label_token_ids, False, traces, demand)
+            spec.label_token_ids, False)
         return replace(spec, estimated_seconds=simulated.seconds)
 
-    def choose(self, live, head_tokens, frame_tokens, labels, resident,
-               traces=None, demand=None) -> tuple[str, Simulated]:
+    def choose(self, live, head_tokens, frame_tokens, labels, resident
+               ) -> tuple[str, Simulated]:
         """The rule with the least simulated time, and its simulation.
 
-        A forced rule is the one candidate. Otherwise the exhaustive
-        rule is a candidate, and the adaptive rules are candidates
-        only with traces to replay, since their work is not known
-        without them. Ties go to fewer rounds, then fewer label
-        tokens, then the order listed.
+        A forced rule is the one candidate. Otherwise ``trie_paths``
+        is a candidate, and ``trie_tree`` under tree attention. Ties
+        go to fewer label tokens, then the order listed.
         """
         if self.model.canvas_tokens and self.scoring != "trie_nodes":
             candidates = ["canvas"]
@@ -549,13 +446,11 @@ class _Table:
             candidates = [EXHAUSTIVE_SCORING]
             if self.tree:
                 candidates.append(TREE_SCORING)
-            if traces:
-                candidates += list(ADAPTIVE_SCORINGS)
         best = None
         for scoring in candidates:
             simulated = self.simulate(scoring, live, head_tokens, frame_tokens,
-                                      labels, resident, traces, demand)
-            key = (simulated.seconds, simulated.rounds, simulated.label_tokens)
+                                      labels, resident)
+            key = (simulated.seconds, simulated.label_tokens)
             if best is None or key < best[0]:
                 best = (key, scoring, simulated)
         return best[1], best[2]
@@ -613,14 +508,6 @@ def plan_classify(region, context, *, backend_name: str):
         column.expression: column.name for column in logical.root.columns
         if isinstance(column, Alias)
     }
-    # a label that is only tested for membership, with one accepted
-    # set, is scored only as far as that decision needs
-    demands = {}
-    for predicate in predicates:
-        test = predicate.expression
-        demands.setdefault(test.call, set()).add(tuple(test.accepted))
-    demands = {call: next(iter(accepted)) for call, accepted in demands.items()
-               if call not in named and len(accepted) == 1}
     # ("classify", call) and ("filter", written position) in plan order:
     # a prompt is classified where it is first needed
     steps = []
@@ -656,8 +543,7 @@ def plan_classify(region, context, *, backend_name: str):
                      and table.head(item) == table.head(last_call))
             try:
                 spec, step = table.classify(item, named[item], live,
-                                            resident=joins,
-                                            demand=demands.get(item))
+                                            resident=joins)
             except ClassifyRefusedError as refused:
                 return (PhysicalCandidate(None, refused.refusal(),
                                           float("inf")),)

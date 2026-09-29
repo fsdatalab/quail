@@ -342,16 +342,10 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
         elif isinstance(node, AiClassify):
             spec = node.spec
             title += f": {spec.name} over {spec.aliases[0]}"
-            if spec.traced_documents:
-                source = f"{spec.traced_documents:,} traced documents replayed"
-            else:
-                source = "no traces: exhaustive rules only"
-            details.append(f"rule={spec.scoring} ({source}), "
+            details.append(f"rule={spec.scoring}, "
                            f"labels={len(spec.labels)}, "
                            f"label tokens="
-                           f"{sum(len(ids) for ids in spec.label_token_ids)}"
-                           + (f", demand={list(spec.demand)}"
-                              if spec.demand is not None else ""))
+                           f"{sum(len(ids) for ids in spec.label_token_ids)}")
             for stage in spec.stages:
                 details.append(
                     f"then {stage.spec.name}: rule={stage.spec.scoring}, "

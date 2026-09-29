@@ -574,17 +574,12 @@ class ClassifySpec(ScoreSpec):
     goes between them. ``label_token_ids`` holds each label's ids as
     scored after the tail, in label order. ``scoring`` names the label
     scoring rule the executor runs: ``trie_nodes``, ``label_chains``,
-    ``trie_paths``, ``trie_rounds``, or ``trie_search``.
+    ``trie_paths``, ``trie_tree``, or ``canvas``.
     ``share_prefixes`` lets a document borrow the KV pages of a
     document sharing its token prefix (the prefix_sharing rule).
     ``stages`` are later classifications of the same documents, run
     while each document's KV is still resident; a stage runs on the
-    documents whose previous label its gate accepts. ``demand`` names
-    the labels a filter accepts when the label is only tested for
-    membership and never projected: an adaptive rule then stops once
-    membership is decided. ``traced_documents`` counts the saved
-    exhaustive traces the planner replayed to choose the rule; 0 when
-    it had none and chose among exhaustive rules only.
+    documents whose previous label its gate accepts.
     """
 
     labels: tuple[str, ...] = ()
@@ -592,8 +587,6 @@ class ClassifySpec(ScoreSpec):
     scoring: str = "trie_nodes"
     share_prefixes: bool = False
     stages: tuple["ClassifyStage", ...] = ()
-    demand: tuple[str, ...] | None = None
-    traced_documents: int = 0
 
     @property
     def chain(self) -> tuple["ClassifySpec", ...]:
@@ -616,9 +609,6 @@ class ClassifySpec(ScoreSpec):
             share_prefixes=bool(value.get("share_prefixes", False)),
             stages=tuple(ClassifyStage.from_mapping(stage)
                          for stage in value.get("stages", ())),
-            demand=(None if value.get("demand") is None
-                    else tuple(str(label) for label in value["demand"])),
-            traced_documents=int(value.get("traced_documents", 0)),
         )
 
     def to_dict(self) -> dict:
@@ -629,8 +619,6 @@ class ClassifySpec(ScoreSpec):
             "scoring": self.scoring,
             "share_prefixes": self.share_prefixes,
             "stages": [stage.to_dict() for stage in self.stages],
-            "demand": None if self.demand is None else list(self.demand),
-            "traced_documents": self.traced_documents,
         }
 
 
@@ -680,10 +668,6 @@ class AiClassify(AiScore):
             "scoring": None if self.spec is None else self.spec.scoring,
             "share_prefixes": (False if self.spec is None
                                else self.spec.share_prefixes),
-            "demand": (None if self.spec is None or self.spec.demand is None
-                       else list(self.spec.demand)),
-            "traced_documents": (0 if self.spec is None
-                                 else self.spec.traced_documents),
             "stages": [] if self.spec is None else [
                 {"accepted": None if stage.accepted is None
                  else list(stage.accepted), "output": stage.spec.name}

@@ -359,15 +359,12 @@ class LabelWork:
             filters test, in written order, then projected labels.
         names: Call -> its output column.
         tests: Call -> written positions of the label filters testing it.
-        demands: Call -> the accepted labels, for a call that is never
-            projected and tested by filters with one accepted set.
         projected: Call -> column name, for projected labels.
     """
 
     calls: tuple
     names: dict
     tests: dict
-    demands: dict
     projected: dict
 
 
@@ -377,7 +374,6 @@ def label_work(plan, filters) -> LabelWork:
                  if isinstance(column, Alias)}
     names = dict(projected)
     tests = {}
-    accepted = {}
     calls = []
     for alias, predicates in filters.items():
         for position, predicate in enumerate(predicates):
@@ -389,13 +385,10 @@ def label_work(plan, filters) -> LabelWork:
             if test.call not in tests:
                 calls.append((test.call, alias))
             tests.setdefault(test.call, []).append(position)
-            accepted.setdefault(test.call, set()).add(tuple(test.accepted))
     for call in projected:
         if call not in tests:
             calls.append((call, call.aliases()[0]))
-    demands = {call: next(iter(sets)) for call, sets in accepted.items()
-               if call not in projected and len(sets) == 1}
-    return LabelWork(tuple(calls), names, tests, demands, projected)
+    return LabelWork(tuple(calls), names, tests, projected)
 
 
 def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
@@ -766,8 +759,7 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
         if live is None:
             live = live_asked.get(alias, float(stats[alias].n_docs))
         for call in calls:
-            spec, _ = table.classify(call, labels.names[call], live,
-                                     demand=labels.demands.get(call))
+            spec, _ = table.classify(call, labels.names[call], live)
             node = table.node(spec, ids_src[alias],
                               sum(isinstance(n, AiClassify) for n in nodes))
             nodes.append(node)
@@ -968,7 +960,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                order: str | None = None, backend: str = "quail",
                registry=None, tokenizer=None, pair_fractions=None,
                label_scoring: str | None = None,
-               attention: str | None = None, label_traces=None):
+               attention: str | None = None):
     """Plan one query with the selected model backend.
 
     Args:
@@ -984,9 +976,6 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
             every classification; None lets the planner choose.
         attention: An attention path, "tree" or "unified", forced for
             every filter and join; None lets the planner choose.
-        label_traces: Callable(trace key) -> saved exhaustive traces of
-            a classification, or None; the planner replays the
-            adaptive rules on them.
         registry: Optional session extension registry.
         tokenizer: Optional callable (text -> token list) handed to the
             planning context.
@@ -1029,7 +1018,6 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         attention=attention,
         tokenizer=tokenizer,
         pair_fractions=dict(pair_fractions or {}),
-        label_traces=label_traces,
     )
     region = ModelRegion(plan)
     candidates = tuple(selected.plan(region, context))
@@ -1062,7 +1050,7 @@ def refine_plan(plan, *, model: ModelSpec, device: DeviceSpec,
                 registry=None, order: str | None = None,
                 tokenizer=None, pair_fractions=None,
                 label_scoring: str | None = None,
-                attention: str | None = None, label_traces=None):
+                attention: str | None = None):
     """Run the physical rules again over a plan once its inputs are exact.
 
     A plan made on estimated document lengths never saw the token
@@ -1086,7 +1074,6 @@ def refine_plan(plan, *, model: ModelSpec, device: DeviceSpec,
         attention=attention,
         tokenizer=tokenizer,
         pair_fractions=dict(pair_fractions or {}),
-        label_traces=label_traces,
     )
     return _apply_rules(plan, registry, context,
                         " once the documents were tokenized")

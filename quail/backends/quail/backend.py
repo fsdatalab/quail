@@ -82,10 +82,8 @@ class QuailModelExecution:
     ) -> Any:
         if isinstance(node, AiScore):
             execution = self._reranker_execution(inputs["documents"])
-            # the scorer reads the query's timing choice and trace
-            # directory from the state
+            # the scorer reads the query's timing choice from the state
             self._state["gpu_timing"] = bool(inputs.get("gpu_timing", False))
-            self._state["label_traces"] = inputs.get("label_traces")
             self._state["model_name"] = self.context.model.name
             if "score_rows" in inputs:
                 return execution.execute_rows(node, inputs["score_rows"])
