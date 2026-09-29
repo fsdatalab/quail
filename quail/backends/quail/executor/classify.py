@@ -538,7 +538,7 @@ class QuailClassifier:
             # every chunk's answers were read, so its end event completed
             state["torch"].cuda.synchronize()
             gpu_s = sum(start.elapsed_time(end)
-                        for _, start, end in spans) / 1000.0
+                        for _, _, start, end in spans) / 1000.0
         return RerankerBatch(
             labels, fresh_tokens=fresh, cached_tokens=cached,
             label_tokens=label_tokens,

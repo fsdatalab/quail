@@ -417,14 +417,13 @@ class QuailModelExecution:
             for part in after:
                 high = low + len(part.stages)
                 own = part.finish(every[low:high]) or 0
-                part_spans = [span for span in spans if low <= span[0] < high]
+                part_spans = _part_spans(spans, low, high)
                 part.result_value = part.result(
                     own, _gpu_seconds(torch, part_spans, inputs),
                     _chunks(part_spans, inputs), {})
                 after_tokens += own
                 low = high
-            spans = [span for span in spans
-                     if span[0] < leading + len(join_stages)]
+            spans = _part_spans(spans, 0, leading + len(join_stages))
             tokens -= after_tokens
         if chain is not None:
             # the join packs frames and partner suffixes; the rest is the chain's
@@ -448,7 +447,7 @@ class QuailModelExecution:
                         raise RuntimeError(
                             "a pipeline part finished without a result")
                 join_stats = {}
-                spans = [span for span in spans if span[0] >= leading]
+                spans = _part_spans(spans, leading, len(stages))
                 tokens = join_tokens
             else:
                 # the join led the pipeline and packed the anchors itself
@@ -802,7 +801,7 @@ def _complete_chain(parts, every, spans, tokens, stats, torch, inputs):
     staged = [index for index, part in enumerate(parts) if part.stages]
     remainder = tokens - sum(own[index] or 0 for index in staged[1:])
     for index, (part, (low, high)) in enumerate(zip(parts, slices)):
-        part_spans = [span for span in spans if low <= span[0] < high]
+        part_spans = _part_spans(spans, low, high)
         part.result_value = part.result(
             remainder if staged and index == staged[0] else (own[index] or 0),
             _gpu_seconds(torch, part_spans, inputs),
@@ -845,17 +844,36 @@ def _prefix_tree(node, documents, arena):
     return tree
 
 
+def _part_spans(spans, low, high) -> list:
+    """The chunks that packed rows of stages low to high, with those rows.
+
+    A chunk's tokens stay whole, so a part's share of the chunk's time
+    is its rows over the chunk's tokens.
+    """
+    narrowed = []
+    for by_stage, tokens, start, end in spans:
+        rows = {j: n for j, n in by_stage.items() if low <= j < high}
+        if rows:
+            narrowed.append((rows, tokens, start, end))
+    return narrowed
+
+
 def _gpu_seconds(torch, spans, inputs) -> float:
-    """Seconds the loop's forward chunks ran on the GPU; 0.0 unless asked."""
+    """Seconds the chunks ran on the GPU, by the spans' share of rows.
+
+    0.0 unless timing was asked for.
+    """
     if not inputs.get("gpu_timing"):
         return 0.0
     # every chunk's answers were read, so its end event has completed
     torch.cuda.synchronize()
-    return sum(start.elapsed_time(end) for _, start, end in spans) / 1000.0
+    return sum(
+        start.elapsed_time(end) * min(1.0, sum(rows.values()) / tokens)
+        for rows, tokens, start, end in spans if tokens) / 1000.0
 
 
 def _chunks(spans, inputs) -> int:
-    """Forward chunks the loop launched; 0 unless timing was asked for."""
+    """Forward chunks the spans' rows ran in; 0 unless timing was asked for."""
     return len(spans) if inputs.get("gpu_timing") else 0
 
 

@@ -184,7 +184,9 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
 
     Returns:
         (answers, spans, tokens): answers[j][a] = the row of stage j's
-        answers for document a, in admission order; spans =
+        answers for document a, in admission order; spans = one
+        ({stage: rows packed}, chunk tokens, start event, end event)
+        per forward chunk;
         (stage, start_event, end_event) per forward; tokens = fresh
         tokens packed.
     """
@@ -584,7 +586,10 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
         e1.record()
         for key in chunk.fresh_keys:
             arena.trim_window(key)
-        spans.append((part[0][1], e0, e1))
+        by_stage = {}
+        for entry in part:
+            by_stage[entry[1]] = by_stage.get(entry[1], 0) + entry_rows(*entry)
+        spans.append((by_stage, chunk.tokens, e0, e1))
         handles = submit(normed, entries, chunk, part)
         outstanding.append((part, entries, handles))
         # read the previous chunk's answers while this one runs

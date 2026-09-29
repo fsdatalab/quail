@@ -212,13 +212,19 @@ def test_pair_join_and_gpu_timing_run_through_the_quail_graph(monkeypatch):
     # join chunks run before the filter chain finishes: one pipeline
     kinds = [kind for kind, _ in model.launched]
     assert kinds.index("join") < len(kinds) - 1 - kinds[::-1].index("filter")
-    # the fake torch reports 2 ms per event pair, one pair per chunk
-    per_node = [metrics["gpu_s"] for metrics in on["node_metrics"].values()]
-    assert on["gpu_s"] == pytest.approx(sum(per_node), abs=1e-3)
+    # the fake torch reports 2 ms per event pair, one pair per chunk; a
+    # chunk that packed rows of two nodes counts for each, and its time
+    # is split between them by rows, so the nodes' seconds sum to the
+    # pipeline's and their chunks to at least its chunk count
+    per_node = {name: metrics for name, metrics in on["node_metrics"].items()
+                if metrics["chunks"]}
+    assert on["gpu_s"] == pytest.approx(
+        sum(metrics["gpu_s"] for metrics in per_node.values()), abs=1e-3)
     assert on["gpu_s"] > 0
-    assert on["chunks"] == round(on["gpu_s"] / 0.002)
-    assert all(chunks == round(chunks)
-               for chunks in (seconds / 0.002 for seconds in per_node))
+    assert len(model.launched) == round(on["gpu_s"] / 0.002)
+    assert on["chunks"] >= len(model.launched)
+    assert all(0 < metrics["gpu_s"] <= metrics["chunks"] * 0.002 + 1e-9
+               for metrics in per_node.values())
 
 
 def _foreign_run(monkeypatch, graph, functions):
