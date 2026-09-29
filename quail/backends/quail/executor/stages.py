@@ -452,7 +452,8 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
         for j, spans_j in by_stage.items():
             part = select_rows(normed, spans_j)
             readout = stages[j].readout
-            if per_answer is None:
+            # a stage reading one row per answer takes no row counts
+            if per_answer is None or not stages[j].read_all_rows:
                 handles[j] = readout.submit(part)
             else:
                 # answers of this stage, in entry order

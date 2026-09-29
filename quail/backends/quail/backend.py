@@ -563,15 +563,18 @@ def _streamed_tokens(join_stages, answers, lists_for, anchor_keys) -> int:
 
 def _prefix_tree(node, documents, arena):
     """The node's prefix tree, or None when the plan did not ask for one."""
-    if not node.share_prefixes:
+    shares = (node.spec.share_prefixes if isinstance(node, AiClassify)
+              else node.share_prefixes)
+    if not shares:
         return None
     started = time.perf_counter()
     tree = prefix_tree(documents, arena.page_tokens)
     logger.info(
         "prefix sharing on %s: %s documents borrow %s tokens "
-        "(tree built in %.2f s)", getattr(node, "alias", None) or node.anchor,
-        len(documents),
-        tree.shared_tokens, time.perf_counter() - started)
+        "(tree built in %.2f s)",
+        node.spec.aliases[0] if isinstance(node, AiClassify)
+        else getattr(node, "alias", None) or node.anchor,
+        len(documents), tree.shared_tokens, time.perf_counter() - started)
     return tree
 
 
