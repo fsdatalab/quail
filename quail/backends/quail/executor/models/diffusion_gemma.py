@@ -173,7 +173,11 @@ class DiffusionGemmaPipeline(ModelPipeline):
             x = hidden.index_select(0, rows)
             soft = canvas.get("conditioning")
             if soft is not None:
-                x = x + self._conditioning_signal(soft.to(x.dtype))
+                conditioned = canvas.get("conditioned")
+                if conditioned is None:
+                    x = x + self._conditioning_signal(soft.to(x.dtype))
+                else:
+                    x[conditioned] += self._conditioning_signal(soft.to(x.dtype))
             hidden.index_copy_(0, rows, self._norm(x, self.conditioning.post_norm))
         # the fused MoE kernels look their layer up in the forward
         # context

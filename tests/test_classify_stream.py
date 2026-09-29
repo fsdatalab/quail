@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 from fakes import (
     DOC,
     FRAME,
@@ -120,21 +121,141 @@ def fused_graph():
     return PhysicalGraph(tuple(nodes), PortRef("group:0", "ids:r"))
 
 
-def test_a_canvas_classification_is_no_pipeline_member():
+def test_a_canvas_classification_runs_in_its_filter_chain_pipeline(monkeypatch):
+    """A filter, then a diffusion model's classification: one run.
+
+    Each survivor's denoising steps run over its resident KV, in
+    chunks that also hold other documents' filter rows; the filter's
+    fixed canvas reads no self-conditioning input.
+    """
+    torch = pytest.importorskip("torch")
     from dataclasses import replace
 
+    from quail.backends.quail.executor import classify as classify_module
     from quail.execution.pipelines import build_pipelines
+    from quail.specs import Denoising
 
-    graph = fused_graph()
+    settings = Denoising(
+        canvas_rows=4, max_steps=5, t_min=0.4, t_max=0.8, entropy_bound=0.1,
+        confidence_threshold=0.005, stability_threshold=1, logit_softcap=30.0,
+        stop_token_ids=(0,))
+    spelling = {1: "a", 2: "b", 3: "\n", 5: "x", 6: " "}
+    tokenizer = SimpleNamespace(decode=lambda ids, skip_special_tokens: "".join(
+        spelling.get(i, "") for i in ids))
+    spec = ClassifySpec(
+        name="topic", aliases=("r",), query_template="", arguments=(),
+        expected_inputs=4, estimated_seconds=0.0,
+        prompt_token_parts=((), (91, 92, 93)), labels=("a", "b"),
+        label_token_ids=((1,), (2,)), scoring="canvas")
+    nodes = [
+        Scan(node_id="input:r", alias="r", input_id="r"),
+        AiFilter(
+            node_id="filter:r",
+            inputs=input_ports((PortRef("input:r", "ids:r"),)),
+            alias="r", arena_writes=True,
+            stages=(FilterStage(0, 1, 0, 0.8, 4 * 0.8),),
+            question_token_ids=((QUESTION,),)),
+        AiClassify(
+            node_id="classify:r",
+            inputs=input_ports((PortRef("filter:r", "ids:r"),)),
+            backend_name="quail", model="diffusion-gemma-26b-a4b-fp8",
+            spec=spec),
+    ]
+    graph = PhysicalGraph(tuple(nodes), PortRef("classify:r", "scores"))
     chains = {pipeline.node_ids for pipeline in build_pipelines(graph).values()}
-    assert chains == {("filter:r", "classify:r", "label:r", "group:0")}
-    canvas = replace(graph.node("classify:r"),
-                     spec=replace(graph.node("classify:r").spec,
-                                  scoring="canvas"))
-    alone = PhysicalGraph(tuple(canvas if node.node_id == "classify:r" else node
-                                for node in graph.nodes), graph.root)
-    chains = {pipeline.node_ids for pipeline in build_pipelines(alone).values()}
-    assert chains == {("filter:r",), ("group:0",)}
+    assert chains == {("filter:r", "classify:r")}
+
+    filter_truth = [[1], [0], [1], [1]]
+    # a survivor's canvas settles on "a", "b", or a stop token first
+    answers = {0: [[1, 0, 5, 5]] * 5, 2: [[5, 5, 5, 5]] + [[2, 0, 6, 6]] * 4,
+               3: [[0, 5, 5, 5]] * 5}
+    vocab = 8
+    head = torch.eye(vocab, dtype=torch.bfloat16)
+    packed = {}
+    conditioned = {}
+
+    def forward(chunk):
+        rows = []
+        canvas_rows = 0
+        for index, entry in enumerate(chunk.specs):
+            document = entry["key"][1]
+            for suffix in entry["suffixes"]:
+                if entry.get("canvas") is not None:
+                    packed.setdefault(document, []).append(list(entry["canvas"]))
+                    assert entry["read_all_rows"]
+                    # the step reads the soft embedding the step before
+                    # wrote, zero at its first step
+                    soft = chunk.meta["canvas"]["conditioning"][
+                        canvas_rows:canvas_rows + 4].float()
+                    canvas_rows += 4
+                    conditioned.setdefault(document, []).append(soft)
+                    wanted = answers[document][len(packed[document]) - 1]
+                    for token in wanted:
+                        row = torch.full((vocab,), -1000.0)
+                        row[token] = 1000.0
+                        rows.append(row)
+                else:
+                    # a filter row on the fixed canvas: TRUE is any
+                    # nonzero
+                    assert suffix[0] == QUESTION
+                    rows.append(torch.full(
+                        (vocab,), float(filter_truth[document][0])))
+        return torch.stack(rows)
+
+    monkeypatch.setattr(loop, "pack_chunk", fake_pack)
+    monkeypatch.setattr(torch.cuda, "Event", lambda **kw: SimpleNamespace(
+        record=lambda: None, elapsed_time=lambda other: 2.0))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda: 0)
+    monkeypatch.setattr(classify_module, "full_output_head", lambda model: head)
+    pipeline = fake_pipeline(forward_chunk=forward, canvas_ids=(7,),
+                             tree_attention=False,
+                             normalizer=torch.tensor(2.0, dtype=torch.bfloat16))
+    arena = cpu_arena(64)
+    model_spec = replace(MODELS["qwen3-4b-fp8"], name="tiny")
+    execution = QuailModelExecution(SimpleNamespace(
+        model=model_spec, gpu_index=0, gpu_count=1, device=DEVICES["h100-sxm"]))
+    execution.bind_loaded_model(model=object(), arena=arena, pipeline=pipeline)
+    # the filter's readout takes its rows of the chunk's hidden rows
+    execution.bind_query(
+        torch=torch,
+        async_answers=SimpleNamespace(submit=lambda v: [int(row[0]) for row in v],
+                                      result=lambda v: v, dtype=None),
+        answer_rows=object(), chunk_tokens=64)
+    execution._state.update(
+        model_spec=SimpleNamespace(name="tiny", vocab=vocab,
+                                   denoising=settings),
+        tokenizer=tokenizer)
+    docs = {"r": [[DOC + d] * (3 + d) for d in range(4)]}
+    state = {
+        "torch": torch, "arena": arena, "pipeline": pipeline,
+        "model_execution": execution,
+        "runtimes": built_in_registry().runtimes,
+        "model_spec": model_spec, "device": DEVICES["h100-sxm"],
+        "chunk_tokens": 64, "docs": docs,
+    }
+    result = execute_single_graph(state, SETTINGS, graph)
+    assert not arena.accounting.owned
+    outputs = result["_outputs"]
+    metrics = result["node_metrics"]
+    assert outputs[PortRef("filter:r", "ids:r")].column("r").to_pylist() \
+        == [0, 2, 3]
+    labels = outputs[PortRef("classify:r", "scores")]
+    # document 3 answers a stop token first and names no label
+    assert labels.column("r").to_pylist() == [0, 2]
+    assert labels.column("topic").to_pylist() == ["a", "b"]
+    assert sorted(packed) == [0, 2, 3]
+    assert [len(packed[d]) for d in (0, 2, 3)] == [2, 3, 2]
+    # the first step reads zero conditioning; the next reads the step
+    # before's probabilities times the embedding and the normalizer
+    assert not conditioned[2][0].any()
+    assert torch.allclose(conditioned[2][1], 2.0 * torch.eye(vocab)[[5, 5, 5, 5]])
+    # the classification packed a frame, then a cue and a canvas per
+    # step, over the survivors' resident KV: no second prefill
+    steps = 2 + 3 + 2
+    assert metrics["classify:r"]["fresh_tokens"] == 3 * 2 + steps * 5
+    assert metrics["classify:r"]["evaluated_documents"] == 3
+    assert metrics["filter:r"]["fresh_tokens"] == sum(map(len, docs["r"])) + 4
 
 
 def test_streamed_classification_labels_survivors_with_their_kv_resident(

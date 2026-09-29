@@ -187,6 +187,12 @@ class QuailModelExecution:
             own = self._part(sink, ids, parts, inputs, context)
             stages = _gated_stages(parts + [own])
             stats = {}
+            # a canvas classification's denoising steps read and write
+            # its self-conditioning rows
+            conditioning = next(
+                (part.plan.conditioning for part in parts + [own]
+                 if isinstance(part, _ClassifyPart)
+                 and part.plan.conditioning is not None), None)
             every, spans, tokens = run_stages(
                 state["torch"], state["arena"], state["pipeline"], stages,
                 prefixes, state["chunk_tokens"],
@@ -196,7 +202,8 @@ class QuailModelExecution:
                 stats=stats, staging=_staging(state),
                 on_chunk=lambda transitions: _report_chain_transitions(
                     parts + [own], transitions),
-                label=f"pipeline {alias} ({len(stages)} stages)")
+                label=f"pipeline {alias} ({len(stages)} stages)",
+                conditioning=conditioning)
             _complete_chain(parts + [own], every, spans, tokens, stats,
                             state["torch"], gpu_inputs)
         for part in parts:
@@ -222,6 +229,7 @@ class QuailModelExecution:
             position = {document: index for index, document in enumerate(ids)}
             plan = ClassifyStages(self._state, node.spec, len(ids),
                                   lambda key: position[key[1]])
+            plan.seeds = ids
             by_node = {part.node.node_id: part for part in parts}
             priors = [(by_node[port.source.node_id], port.source.port)
                       for port in node.inputs

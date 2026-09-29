@@ -596,9 +596,8 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
                 barrier_aliases.add(anchor)
     joined = {argument.alias for join in joins for argument in join.prompt.args}
     # a chain whose first use is the join anchored on it runs in that
-    # join's pipeline, on one GPU, unless a diffusion model's
-    # classification sits between them (its readout reads whole chunks,
-    # so it runs alone); such a chain's KV needs no retention pool
+    # join's pipeline, on one GPU; such a chain's KV needs no
+    # retention pool
     between = {alias for alias in classified
                if not (classify_after_joins and alias in joined)}
     chained = set()
@@ -606,7 +605,6 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
     for group in sequence_groups:
         anchor = group[0][1]
         if workers == 1 and anchor in ask_filters \
-                and not (anchor in between and model.canvas_tokens) \
                 and anchor not in chained \
                 and anchor not in partner_before \
                 and anchor not in barrier_aliases:
@@ -692,8 +690,7 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
     # aliases whose filter chain runs in one pipeline with the
     # classification or join after it
     pipelined = chained | {
-        alias for alias in ask_filters
-        if workers == 1 and alias in between and not model.canvas_tokens}
+        alias for alias in ask_filters if workers == 1 and alias in between}
 
     def emit_filter(alias):
         order_idx = filter_orders[alias]
@@ -764,7 +761,7 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
             live = live_asked.get(alias, float(stats[alias].n_docs))
         for call in calls:
             # the first classification after the alias's filters reads
-            # the KV the chain wrote; a canvas model decodes alone
+            # the KV the chain wrote
             resident = (alias in pipelined and call is calls[0]
                         and live is live_asked.get(alias))
             spec, _ = table.classify(call, labels.names[call], live,

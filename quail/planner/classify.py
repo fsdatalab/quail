@@ -618,14 +618,15 @@ def plan_classify(region, context, *, backend_name: str):
         if kind == "classify":
             # a classification after another on the same documents
             # reads their resident KV (in one node, or in one pipeline
-            # of two nodes); a canvas model decodes each on its own
+            # of two nodes)
             follows = (chain is not None and len(since) <= 1
-                       and not model.canvas_tokens
                        and all(predicates[p].expression.call is last_call
                                for p in since)
                        and table.head(item) == table.head(last_call))
-            # a decoded classification's rounds are its own node's stages
-            joins = follows and nodes[chain].spec.scoring != DECODE_SCORING
+            # a decoded classification's rounds are its own node's
+            # stages, as are a canvas classification's denoising steps
+            joins = follows and nodes[chain].spec.scoring not in (
+                DECODE_SCORING, "canvas")
             try:
                 spec, step = table.classify(item, named[item], live,
                                             resident=follows)

@@ -281,18 +281,25 @@ class AsyncCanvasReadout:
         self.dtype = np.dtype([("tokens", np.int64, (rows,)),
                                ("entropy", np.float32, (rows,))])
 
-    def submit(self, normed, *, chunk, stages):
-        """Read one chunk's canvases; ``stages`` gives each canvas's step."""
+    def submit(self, normed, *, steps, conditioning_rows):
+        """Read the canvases' rows of one chunk.
+
+        Args:
+            normed: The canvases' final-normed rows, canvas_rows each.
+            steps: Each canvas's denoising step, in order.
+            conditioning_rows: Each row's row in the ConditioningRows,
+                where the next step's input is written.
+        """
         torch = self.torch
         rows = self.settings.canvas_rows
-        if normed.shape[0] != rows * len(stages):
+        if normed.shape[0] != rows * len(steps):
             raise ValueError(
-                f"{normed.shape[0]} rows read for {len(stages)} canvases "
+                f"{normed.shape[0]} rows read for {len(steps)} canvases "
                 f"of {rows} rows")
         on_gpu = normed.is_cuda
         # torch refuses pin_memory=True on a tensor built from numpy
         temperature = torch.as_tensor(
-            np.repeat([self.settings.temperature(step) for step in stages],
+            np.repeat([self.settings.temperature(step) for step in steps],
                       rows).astype(np.float32))
         if on_gpu:
             temperature = temperature.pin_memory()
@@ -300,8 +307,7 @@ class AsyncCanvasReadout:
         tokens, entropy, soft = denoise_rows(
             torch, self.F, normed, self.head, self.normalizer, temperature,
             self.settings.logit_softcap, self.BLOCK_ROWS)
-        self.conditioning.rows.index_copy_(
-            0, chunk.meta["canvas"]["conditioning_rows"], soft)
+        self.conditioning.rows.index_copy_(0, conditioning_rows, soft)
         host_tokens = torch.empty(tokens.shape, dtype=tokens.dtype,
                                   pin_memory=on_gpu)
         host_entropy = torch.empty(entropy.shape, dtype=entropy.dtype,
@@ -312,7 +318,7 @@ class AsyncCanvasReadout:
         if on_gpu:
             event = torch.cuda.Event()
             event.record()
-        return event, host_tokens, host_entropy, len(stages)
+        return event, host_tokens, host_entropy, len(steps)
 
     def result(self, handle):
         """One record per canvas: its tokens and row entropies."""

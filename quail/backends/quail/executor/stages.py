@@ -67,6 +67,8 @@ class Stage:
             Asked when the document's group is packed. None packs the
             pipeline's canvas.
         canvas_rows: The rows of every canvas ``canvas`` returns.
+        step: For a denoising step, its number, which sets the step's
+            temperature.
     """
 
     DROP = DROP
@@ -83,6 +85,7 @@ class Stage:
     chains: list | None = None
     canvas: Callable | None = None
     canvas_rows: int = 0
+    step: int = 0
 
 
 def shared_preamble_tokens(question_ids) -> int:
@@ -429,36 +432,54 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
             out.extend([j] * (end - start))
         return out
 
+    def canvas_conditioning(chunk, spans):
+        """The conditioning rows of the canvases at the chunk's canvas spans."""
+        meta = chunk.meta["canvas"]
+        cu_q = meta["cu_q"]
+        return torch.cat([meta["conditioning_rows"][int(cu_q[k0]):int(cu_q[k1])]
+                          for k0, k1 in spans])
+
     def submit(normed, entries, chunk, part):
         """Hand each stage's answer rows to its readout; returns handles.
 
         With one readout for every stage the whole chunk goes in one
         call, keyed None; otherwise each stage's rows go to its own. A
-        readout with ``reads_chunk`` also takes the chunk and the stage
-        of every answer.
+        readout with ``reads_chunk`` (a denoising step's) takes its
+        canvases' rows with each one's step and conditioning rows.
         """
         rows_per_answer = chunk.rows_per_answer
         if shared_readout:
             readout = stages[0].readout
             if getattr(readout, "reads_chunk", False):
-                return {None: readout.submit(normed, chunk=chunk,
-                                             stages=answer_stages(part))}
+                return {None: readout.submit(
+                    normed, steps=[stages[j].step for j in answer_stages(part)],
+                    conditioning_rows=chunk.meta["canvas"]["conditioning_rows"])}
             return {None: (readout.submit(normed, rows_per_answer=rows_per_answer)
                            if rows_per_answer else readout.submit(normed))}
-        if any(getattr(stage.readout, "reads_chunk", False) for stage in stages):
-            raise ValueError("a readout that reads the chunk serves every stage")
         by_stage = {}
+        canvases = {}       # stage -> its entries' spans of chunk canvases
         row = 0
+        seen = 0
         for j, rows in entries:
             by_stage.setdefault(j, []).append((row, row + rows))
             row += rows
+            # every suffix on a canvas model packs one canvas
+            count = (rows // canvas_rows[j]
+                     if stages[j].read_all_rows and canvas_rows[j] else rows)
+            canvases.setdefault(j, []).append((seen, seen + count))
+            seen += count
         handles = {}
         per_answer = list(rows_per_answer) if rows_per_answer else None
         for j, spans_j in by_stage.items():
             part = select_rows(normed, spans_j)
             readout = stages[j].readout
+            if getattr(readout, "reads_chunk", False):
+                spans = canvases[j]
+                handles[j] = readout.submit(
+                    part, steps=[stages[j].step] * sum(k1 - k0 for k0, k1 in spans),
+                    conditioning_rows=canvas_conditioning(chunk, spans))
             # a stage reading one row per answer takes no row counts
-            if per_answer is None or not stages[j].read_all_rows:
+            elif per_answer is None or not stages[j].read_all_rows:
                 handles[j] = readout.submit(part)
             else:
                 # answers of this stage, in entry order

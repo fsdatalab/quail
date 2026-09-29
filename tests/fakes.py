@@ -174,13 +174,19 @@ def fake_pack(torch, arena, specs, **kw):
         import torch as real
 
         # each canvas row reads its self-conditioning row, as pack_chunk
-        # gathers it
+        # gathers it; a canvas naming none reads -1
         index = real.tensor([
-            spec["conditioning"] + row for spec in specs
-            for _ in spec["suffixes"] for row in range(len(spec["canvas"]))])
+            -1 if spec.get("conditioning") is None else spec["conditioning"] + row
+            for spec in specs for _ in spec["suffixes"]
+            for row in range(canvas_rows(spec))])
+        named = index >= 0
+        widths = [canvas_rows(spec) for spec in specs for _ in spec["suffixes"]]
         meta["canvas"] = dict(
             conditioning_rows=index,
-            conditioning=kw["conditioning"].index_select(0, index))
+            conditioning=kw["conditioning"].index_select(0, index[named]),
+            cu_q=real.tensor([0] + list(real.cumsum(real.tensor(widths), 0))))
+        if not bool(named.all()):
+            meta["canvas"]["conditioned"] = named
     return SimpleNamespace(specs=specs, tokens=tokens, temporary_keys=(),
                            fresh_keys=(), rows_per_answer=rows_per_answer,
                            meta=meta)

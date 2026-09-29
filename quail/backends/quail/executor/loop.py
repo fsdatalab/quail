@@ -324,9 +324,9 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     path only.
 
     conditioning holds the self-conditioning input of a denoising
-    step, one hidden row per canvas row. The chunk's canvas rows take
-    their rows from it in order, at each group's conditioning row;
-    every canvas in a chunk names its rows, or none does.
+    step, one hidden row per canvas row. A group's canvas rows take
+    their rows from it in order, at the group's conditioning row; a
+    canvas of a group naming none reads no self-conditioning input.
     """
     def stage(name, values, dtype):
         if staging is not None:
@@ -448,8 +448,10 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             first = s_row0 + begins + sufs.lengths
             canvas_starts.append(first)
             canvas_sizes.append(np.full(n, width, dtype=np.int64))
-            if g.get("conditioning") is not None:
-                conditioning_rows.append(np.tile(
+            # a canvas without self-conditioning rows reads zeros
+            conditioning_rows.append(
+                np.full(n * width, -1, dtype=np.int64)
+                if g.get("conditioning") is None else np.tile(
                     g["conditioning"] + np.arange(width, dtype=np.int64), n))
             if read_all:
                 finals.append(np.repeat(first, width)
@@ -716,15 +718,21 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             cu_q=stage("canvas_cu_q", np.concatenate([[0], cum]),
                        torch.int32),
             max_q=int(widths.max()))
-        if conditioning_rows:
-            index = np.concatenate(conditioning_rows)
-            if len(index) != int(cum[-1]) or conditioning is None:
+        index = np.concatenate(conditioning_rows)
+        if (index >= 0).any():
+            if conditioning is None:
                 raise ValueError(
-                    "every canvas in a chunk reads its self-conditioning "
-                    "rows from the conditioning tensor, or none does")
+                    "a canvas names self-conditioning rows but the chunk "
+                    "has no conditioning tensor")
             index = stage("conditioning_rows", index, torch.int64)
             canvas_meta["conditioning_rows"] = index
-            canvas_meta["conditioning"] = conditioning.index_select(0, index)
+            named = index >= 0
+            canvas_meta["conditioning"] = conditioning.index_select(
+                0, index[named])
+            # the canvas rows the conditioning rows belong to, when
+            # some canvas in the chunk names none
+            if not bool(named.all()):
+                canvas_meta["conditioned"] = named
         if unified is not None:
             seq = stage("canvas_seq", canvas_seq, torch.int64)
             canvas_meta["table"] = unified["table"].index_select(0, seq)

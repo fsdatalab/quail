@@ -538,10 +538,9 @@ def test_denoise_readout_follows_vllm_sampler_arithmetic():
     assert conditioning.rows[:2].eq(1).all() and not conditioning.rows[2:].any()
     readout = AsyncCanvasReadout(torch, torch.nn.functional, head, normalizer,
                                  settings, conditioning)
-    chunk = SimpleNamespace(meta={"canvas": {
-        "conditioning_rows": torch.tensor([2, 3, 0, 1])}})
-    records = readout.result(readout.submit(normed[:4], chunk=chunk,
-                                            stages=[0, 3]))
+    rows = torch.tensor([2, 3, 0, 1])
+    records = readout.result(readout.submit(normed[:4], steps=[0, 3],
+                                            conditioning_rows=rows))
     temperature = torch.tensor([0.8, 0.8, settings.temperature(3),
                                 settings.temperature(3)])
     tokens, entropy, soft = denoise_rows(
@@ -552,7 +551,7 @@ def test_denoise_readout_follows_vllm_sampler_arithmetic():
     assert torch.equal(conditioning.rows[2:], soft[:2])
     assert torch.equal(conditioning.rows[:2], soft[2:])
     with pytest.raises(ValueError, match="canvases"):
-        readout.submit(normed[:3], chunk=chunk, stages=[0, 1])
+        readout.submit(normed[:3], steps=[0, 1], conditioning_rows=rows)
     # a block given back is zeroed for the next document
     conditioning.release(first)
     assert conditioning.take() == 0 and not conditioning.rows[:2].any()

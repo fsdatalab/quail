@@ -900,10 +900,18 @@ def test_pack_chunk_reads_every_canvas_row_when_asked():
     assert chunk.meta["canvas"]["conditioning_rows"].tolist() == [4, 5, 0, 1]
     assert chunk.meta["canvas"]["conditioning"].tolist() == [
         [8, 9], [10, 11], [0, 1], [2, 3]]
-    with pytest.raises(ValueError, match="self-conditioning"):
-        loop.pack_chunk(torch, arena, [groups[0], dict(groups[1],
-                                                       conditioning=None)],
-                        attention_mode="unified", conditioning=conditioning)
+    # a canvas naming no rows beside one that does reads no
+    # self-conditioning input: only the named rows carry one
+    chunk = loop.pack_chunk(torch, arena, [groups[0], dict(groups[1],
+                                                           conditioning=None)],
+                            attention_mode="unified", conditioning=conditioning)
+    assert chunk.meta["canvas"]["conditioning_rows"].tolist() == [4, 5, -1, -1]
+    assert chunk.meta["canvas"]["conditioned"].tolist() == [
+        True, True, False, False]
+    assert chunk.meta["canvas"]["conditioning"].tolist() == [[8, 9], [10, 11]]
+    with pytest.raises(ValueError, match="conditioning tensor"):
+        loop.pack_chunk(torch, arena, groups, attention_mode="unified",
+                        canvas=canvas)
 
 
 def test_planner_decodes_labels_on_a_diffusion_model(tmp_path):
