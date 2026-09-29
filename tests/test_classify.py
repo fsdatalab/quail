@@ -82,7 +82,9 @@ def test_label_scores_sum_each_labels_tokens_and_ties_go_first():
 def test_trie_paths_cover_every_proper_prefix():
     targets = [1, 2, 3, 4]
     nan = float("nan")
-    assert suffix_lengths("trie_nodes", IDS) == [1, 2]
+    # on a canvas of two rows every trie node's suffix is the cue and
+    # the canvas: two nodes, the root and (1,)
+    assert suffix_lengths("canvas", IDS) == [3, 3]
 
     # one chain over the deepest proper prefix (1,) reads both rows
     assert trie_paths(IDS) == [(1,)]
@@ -143,51 +145,6 @@ def test_multi_row_label_readout_pads_each_suffix_to_its_rows():
         readout.submit(hidden, rows_per_answer=[4, 1])
 
 
-def test_classifier_reads_every_trie_node_after_each_document(monkeypatch):
-    spec = ClassifySpec(
-        name="topic", aliases=("d",), query_template="", arguments=(),
-        expected_inputs=3, estimated_seconds=0.0,
-        prompt_token_parts=((90,), (91, 92, 93)), labels=LABELS,
-        label_token_ids=IDS)
-    documents = {"d": [[10, 11], [12], [13, 14, 15]]}
-    prefixes = document_prefixes(spec, documents, [0, 2])
-    assert [list(prefix) for prefix in prefixes] == [
-        [90, 10, 11], [90, 13, 14, 15]]
-    requests = label_requests(spec)
-    assert requests.frame == [91, 92] and not requests.read_all_rows
-    assert requests.suffixes == [[93], [93, 1]]
-    targets = requests.targets
-    assert targets == [1, 2, 3, 4]
-
-    # document i prefers label i: its label tokens get log p = -1,
-    # every other token -5; the frame entry's row is never read
-    def forward(chunk):
-        rows = []
-        for entry in chunk.specs:
-            document = entry["key"][2]
-            for suffix in entry["suffixes"]:
-                prefix = tuple(suffix[1:])
-                wanted = IDS[document]
-                rows.append([
-                    -1.0 if prefix + (token,) == tuple(wanted[:len(prefix) + 1])
-                    else -5.0 for token in targets])
-        return np.asarray(rows, dtype=np.float32)
-
-    monkeypatch.setattr(loop, "pack_chunk", fake_pack)
-    readout = SimpleNamespace(
-        targets=np.asarray(targets), rows=1,
-        dtype=np.dtype((np.float32, (4,))),
-        submit=lambda rows: rows, result=lambda rows: rows)
-    state = {"torch": fake_torch(), "arena": cpu_arena(64),
-             "pipeline": fake_pipeline(forward_chunk=forward),
-             "chunk_tokens": 64, "label_readout": readout,
-             "input_staging": SimpleNamespace(fixed_tokens=set())}
-    batch = QuailClassifier(state).classify(spec, [[0], [1], [2]], documents)
-    assert list(batch.scores) == list(LABELS)
-    # every row packs its prefix, the two-token frame, and two suffixes
-    assert batch.fresh_tokens + batch.cached_tokens == (3 + 2 + 4) + 3 * (2 + 3)
-
-
 def test_classifier_reads_every_row_of_each_trie_path(monkeypatch):
     # one two-row chain over the deepest proper prefix (1,) scores all
     # three labels
@@ -197,6 +154,8 @@ def test_classifier_reads_every_row_of_each_trie_path(monkeypatch):
         prompt_token_parts=((90,), (91, 92, 93)), labels=LABELS,
         label_token_ids=IDS, scoring="trie_paths")
     documents = {"d": [[10, 11], [12]]}
+    prefixes = document_prefixes(spec, documents, [0, 1])
+    assert [list(prefix) for prefix in prefixes] == [[90, 10, 11], [90, 12]]
     requests = label_requests(spec)
     assert requests.frame == [91, 92] and requests.read_all_rows
     assert requests.suffixes == [[93, 1]]
@@ -283,22 +242,27 @@ def test_classifier_borrows_shared_prefix_pages(monkeypatch):
                       for spec in specs if spec["prefix"] is not None)
         return fake_pack(torch, arena, specs, **kw)
 
+    # every row of the one trie-path chain [93, 1] is read
     def forward(chunk):
         rows = []
         for entry in chunk.specs:
             wanted = IDS[entry["key"][2]]
             for suffix in entry["suffixes"]:
-                prefix = tuple(suffix[1:])
-                rows.append([
-                    -1.0 if prefix + (token,) == tuple(wanted[:len(prefix) + 1])
-                    else -5.0 for token in [1, 2, 3, 4]])
+                for row in range(len(suffix)):
+                    seen = tuple(suffix[1:row + 1])
+                    rows.append([
+                        -1.0 if seen + (token,) == tuple(wanted[:row + 1])
+                        else -5.0 for token in [1, 2, 3, 4]])
         return np.asarray(rows, dtype=np.float32)
+
+    def submit(rows, rows_per_answer=None):
+        return rows.reshape(-1, 2, 4)
 
     monkeypatch.setattr(loop, "pack_chunk", recording_pack)
     readout = SimpleNamespace(
-        targets=np.asarray([1, 2, 3, 4]), rows=1,
-        dtype=np.dtype((np.float32, (4,))),
-        submit=lambda rows: rows, result=lambda rows: rows)
+        targets=np.asarray([1, 2, 3, 4]), rows=2,
+        dtype=np.dtype((np.float32, (2, 4))),
+        submit=submit, result=lambda rows: rows)
     state = {"torch": fake_torch(), "arena": cpu_arena(64),
              "pipeline": fake_pipeline(forward_chunk=forward),
              "chunk_tokens": 64, "label_readout": readout,
@@ -307,7 +271,7 @@ def test_classifier_borrows_shared_prefix_pages(monkeypatch):
     assert list(batch.scores) == list(LABELS[:2])
     assert packed == [(0, 0), (1, 32)]
     assert batch.borrowed_tokens == 32 and batch.cached_tokens == 32
-    assert batch.fresh_tokens == (41 + 41 - 32) + 2 * (2 + 3)
+    assert batch.fresh_tokens == (41 + 41 - 32) + 2 * (2 + 2)
 
 
 def test_classifier_runs_chained_stages_on_resident_documents(monkeypatch):
@@ -523,10 +487,9 @@ def test_planner_prices_the_exhaustive_rules_by_their_label_tokens():
     assert packed.label_tokens == 1000 * len(label_trie(long_labels))
     assert packed.seconds < simulated.seconds
     # a forced rule is the one candidate
-    forced = _Table(**{**table.__dict__, "scoring": "trie_nodes"})
-    scoring, nodes = forced.choose(1000, 20, 30, long_labels, False)
-    assert scoring == "trie_nodes"
-    assert nodes.label_tokens > simulated.label_tokens
+    forced = _Table(**{**tree.__dict__, "scoring": "trie_paths"})
+    scoring, _ = forced.choose(1000, 20, 30, long_labels, False)
+    assert scoring == "trie_paths"
 
 
 def test_simulation_counts_passes_from_the_chunk_budget_and_arena():
@@ -622,7 +585,7 @@ def test_classify_refusals_and_builder_errors(session):
     (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
     assert classify.spec.scoring in ("trie_paths", "trie_tree")
     assert plan.settings["label_scoring"] == "cost model"
-    for rule in ("trie_nodes", "trie_paths", "trie_tree", "next_rule"):
+    for rule in ("trie_paths", "trie_tree", "next_rule"):
         ruled = quail.Session(EngineConfig(
             model="qwen3-4b-fp8", device="h100-sxm", label_scoring=rule),
             tokenizer=_bytes)
@@ -713,34 +676,43 @@ def test_bench_reads_classify_plans_and_reports_labels_by_operator():
         "a", "b", "c"]
 
 
-def test_classifier_scores_padded_labels_over_a_canvas(monkeypatch):
-    # labels a = [1, 2] and b = [3], padded to a three-row canvas with
-    # the end token 7 and pad 0: a = [1, 2, 7], b = [3, 7, 0]
-    padded = ((1, 2, 7), (3, 7, 0))
+def test_classifier_scores_each_trie_node_on_the_full_canvas(monkeypatch):
+    # labels a = [1, 2] and b = [3], each ending with the end token 7;
+    # the canvas has three rows, the longest label with its end
+    padded = ((1, 2, 7), (3, 7))
     spec = ClassifySpec(
         name="topic", aliases=("d",), query_template="", arguments=(),
         expected_inputs=2, estimated_seconds=0.0,
         prompt_token_parts=((90,), (91, 92, 93)), labels=("a", "b"),
         label_token_ids=padded, scoring="canvas")
     requests = label_requests(spec)
-    assert requests.frame == [] and requests.suffixes == [[91, 92, 93]]
-    assert requests.read_all_rows and requests.targets == [0, 1, 2, 3, 7]
+    # one suffix per trie node, the cue and the node, and the canvas
+    # rows left after it: the root, (1,), (3,), (1, 2)
+    assert requests.frame == [91, 92]
+    assert requests.suffixes == [[93], [93, 1], [93, 3], [93, 1, 2]]
+    assert requests.canvas_rows == 3 and requests.canvas_widths == [3, 2, 2, 1]
+    assert not requests.read_all_rows and requests.targets == [1, 2, 3, 7]
     targets = requests.targets
 
-    # document 0's canvas rows favor a's tokens, document 1's favor b's
+    # the first canvas row after a node favors the wanted label's next
+    # token: a for document 0, b for document 1
     def forward(chunk):
         rows = []
         for entry in chunk.specs:
             document = entry["key"][2]
-            for row, token in enumerate(padded[document]):
-                rows.append([-1.0 if t == token else -5.0 for t in targets])
+            wanted = padded[document]
+            for suffix in entry["suffixes"]:
+                node = tuple(suffix[1:])
+                follows = (wanted[len(node)] if wanted[:len(node)] == node
+                           and len(node) < len(wanted) else None)
+                rows.append([-1.0 if t == follows else -5.0 for t in targets])
         return np.asarray(rows, dtype=np.float32)
 
     monkeypatch.setattr(loop, "pack_chunk", fake_pack)
     readout = SimpleNamespace(
-        targets=np.asarray(targets), rows=3,
-        dtype=np.dtype((np.float32, (3, 5))),
-        submit=lambda rows, rows_per_answer=None: rows.reshape(-1, 3, 5),
+        targets=np.asarray(targets), rows=1,
+        dtype=np.dtype((np.float32, (4,))),
+        submit=lambda rows, rows_per_answer=None: rows,
         result=lambda rows: rows)
     canvas_pipeline = fake_pipeline(
         forward_chunk=forward, canvas_ids=(50,), tree_attention=False,
@@ -752,9 +724,10 @@ def test_classifier_scores_padded_labels_over_a_canvas(monkeypatch):
     documents = {"d": [[10, 11], [12]]}
     batch = QuailClassifier(state).classify(spec, [[0], [1]], documents)
     assert list(batch.scores) == ["a", "b"]
-    assert batch.label_tokens == 2 * 3
-    # each document packs its prefix, the tail, and the three canvas rows
-    assert batch.fresh_tokens + batch.cached_tokens == (3 + 3) + (2 + 3)
+    # every suffix is the cue plus the three-row canvas
+    assert batch.label_tokens == 2 * 4 * 4
+    # each document packs its prefix, the two-token frame, and the suffixes
+    assert batch.fresh_tokens + batch.cached_tokens == (3 + 2) + 2 * (2 + 16)
 
 
 def test_pack_chunk_reads_every_canvas_row_when_asked():
@@ -772,14 +745,26 @@ def test_pack_chunk_reads_every_canvas_row_when_asked():
     assert chunk.input_ids.tolist() == [1, 2, 10, *canvas, 4, 12, *canvas]
     assert chunk.final_indices.tolist() == [3, 4, 5, 8, 9, 10]
     assert chunk.rows_per_answer == (3, 3)
+    # a group's canvas_widths keep the leading rows of the canvas after
+    # each suffix, and the answer row is the first canvas row
+    groups = [dict(key=("d", 0), prefix=[1, 2], f=2, suffixes=[[10]],
+                   canvas_widths=[3]),
+              dict(key=("d", 1), prefix=[4], f=1, suffixes=[[12]],
+                   canvas_widths=[1])]
+    chunk = loop.pack_chunk(torch, arena, groups, attention_mode="unified",
+                            canvas=canvas)
+    assert chunk.input_ids.tolist() == [1, 2, 10, 90, 91, 92, 4, 12, 90]
+    assert chunk.final_indices.tolist() == [3, 8]
+    assert chunk.meta["canvas"]["cu_q"].tolist() == [0, 3, 4]
+    with pytest.raises(ValueError, match="canvas_widths"):
+        loop.pack_chunk(torch, arena, [dict(groups[0], canvas_widths=[4])],
+                        attention_mode="unified", canvas=canvas)
 
 
 def test_planner_pads_labels_to_the_canvas_on_a_diffusion_model(tmp_path):
     from quail.specs import DIFFUSION_GEMMA_26B_FP8
 
-    special = {DIFFUSION_GEMMA_26B_FP8.canvas_end_text: [7],
-               DIFFUSION_GEMMA_26B_FP8.canvas_pad_text: [0],
-               label_text("a"): [11], label_text("b"): [12]}
+    special = {DIFFUSION_GEMMA_26B_FP8.canvas_end_text: [7]}
 
     def tokenizer(text):
         return special.get(text, _bytes(text))
@@ -790,38 +775,14 @@ def test_planner_pads_labels_to_the_canvas_on_a_diffusion_model(tmp_path):
         EngineConfig(model=DIFFUSION_GEMMA_26B_FP8.name, device="h100-sxm"),
         tokenizer=tokenizer)
     session.register("documents", DocumentProvider.from_parquet(path, id_col="id"))
-    # labels of several tokens are scored one trie node at a time, each
-    # read at the one-row canvas after it, with unpadded labels: the
-    # one-pass canvas does not condition a row on the rows before it
+    # every label ends with the answer end token; the canvas is as
+    # long as the longest
     plan = _topic(session).plan()
     (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
-    assert classify.spec.scoring == "trie_nodes"
+    assert classify.spec.scoring == "canvas"
     assert [list(ids) for ids in classify.spec.label_token_ids] == [
-        _bytes(label_text(label)) for label in classify.spec.labels]
+        _bytes(label_text(label)) + [7] for label in classify.spec.labels]
     assert plan.settings["label_scoring"] == "cost model"
-    # one-token labels are scored on the canvas in one pass, padded
-    # with the answer end token
-    single = (session.docs("documents").alias("d").ai_classify(
-        quail.prompt("What is {0} about?", quail.col("d.body")),
-        ["a", "b"], name="topic").select("d.id", "topic")).plan()
-    (classify,) = [n for n in single.nodes if isinstance(n, AiClassify)]
-    assert classify.spec.scoring == "canvas"
-    assert [list(ids) for ids in classify.spec.label_token_ids] == [
-        [11, 7], [12, 7]]
-    # the canvas forced on longer labels pads them to the longest plus one
-    padded = quail.Session(
-        EngineConfig(model=DIFFUSION_GEMMA_26B_FP8.name, device="h100-sxm",
-                     label_scoring="canvas"), tokenizer=tokenizer)
-    padded.register("documents", DocumentProvider.from_parquet(path, id_col="id"))
-    (classify,) = [n for n in _topic(padded).plan().nodes
-                   if isinstance(n, AiClassify)]
-    assert classify.spec.scoring == "canvas"
-    rows = max(len(_bytes(label_text(label)))
-               for label in ("refund", "shipping", "praise")) + 1
-    for label, ids in zip(classify.spec.labels, classify.spec.label_token_ids):
-        text = _bytes(label_text(label))
-        assert list(ids) == text + [7] + [0] * (rows - len(text) - 1)
-    padded.close()
     # a chain's classifications stay separate nodes, each with its own
     # canvas length
     chained = _chain(session).plan()

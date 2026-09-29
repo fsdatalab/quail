@@ -315,7 +315,9 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     every suffix as extra rows, and the answer row is canvas row
     answer_row instead of the suffix's last row. Canvas KV goes
     wherever the suffix's KV goes and is never kept. Canvas rows run
-    the unified path only.
+    the unified path only. A group's canvas_widths, one per suffix,
+    shortens the canvas after each suffix to its leading rows; the
+    answer row must lie inside every width.
     """
     def stage(name, values, dtype):
         if staging is not None:
@@ -341,6 +343,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     tree_path = attention_mode == "tree"
     canvas_ids = np.asarray(canvas, dtype=np.int64)
     canvas_starts = []    # per group, the first row of each canvas
+    canvas_widths = []    # per group, the rows of each canvas
     canvas_seq = []       # its sequence in the unified paged call
     id_parts, token_count = [], 0
     pos, finals = [], []
@@ -411,7 +414,15 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         read_all = bool(g.get("read_all_rows"))
         # every suffix's rows at once: positions restart at f for each
         # suffix, and a canvas continues its suffix's positions
-        widths = sufs.lengths + len(canvas)
+        rows_of = g.get("canvas_widths")
+        rows_of = (np.full(n, len(canvas), dtype=np.int64) if rows_of is None
+                   else np.asarray(rows_of, dtype=np.int64))
+        if canvas and n and (len(rows_of) != n or rows_of.min() <= answer_row
+                             or rows_of.max() > len(canvas)):
+            raise ValueError(
+                f"group {key!r}: canvas_widths must give each of the {n} "
+                f"suffixes between {answer_row + 1} and {len(canvas)} rows")
+        widths = sufs.lengths + (rows_of if canvas else 0)
         total = int(widths.sum())
         ends = np.cumsum(widths)
         begins = ends - widths
@@ -425,10 +436,13 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             id_parts.append(np.concatenate([sufs.ids, canvas_ids])[source])
             first = s_row0 + begins + sufs.lengths
             canvas_starts.append(first)
+            canvas_widths.append(rows_of)
             if read_all:
-                finals.append((first[:, None]
-                               + np.arange(len(canvas))).reshape(-1))
-                rows_per_answer.append(np.full(n, len(canvas), dtype=np.int64))
+                cum = np.cumsum(rows_of)
+                finals.append(np.repeat(first, rows_of)
+                              + np.arange(int(cum[-1]), dtype=np.int64)
+                              - np.repeat(cum - rows_of, rows_of))
+                rows_per_answer.append(rows_of)
                 multi_row = True
             else:
                 finals.append(first + answer_row)
@@ -680,14 +694,15 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             raise ValueError(
                 "the unpaged canvas call pairs one canvas with each "
                 "causal segment; a group without a suffix has none")
-        width = len(canvas)
+        widths = np.concatenate(canvas_widths)
+        cum = np.cumsum(widths)
         canvas_meta = dict(
-            rows=stage("canvas_rows", np.repeat(starts, width) + np.tile(
-                np.arange(width, dtype=np.int64), len(starts)), torch.int64),
-            cu_q=stage("canvas_cu_q", np.arange(len(starts) + 1,
-                                                dtype=np.int64) * width,
+            rows=stage("canvas_rows", np.repeat(starts, widths)
+                       + np.arange(int(cum[-1]), dtype=np.int64)
+                       - np.repeat(cum - widths, widths), torch.int64),
+            cu_q=stage("canvas_cu_q", np.concatenate([[0], cum]),
                        torch.int32),
-            max_q=width)
+            max_q=int(widths.max()))
         if unified is not None:
             seq = stage("canvas_seq", canvas_seq, torch.int64)
             canvas_meta["table"] = unified["table"].index_select(0, seq)

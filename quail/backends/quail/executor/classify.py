@@ -5,9 +5,6 @@ and the classification tail, all but its last token, is written once
 after them as the anchor's frame. The label scoring rule decides what
 the partner suffixes are:
 
-- ``trie_nodes``: one suffix per label-trie node, the tail's last token
-  followed by the node's label tokens. Only its last row is read; it
-  gives the log probabilities of the tokens that can follow the node.
 - ``trie_paths``: one suffix per deepest proper prefix of the label
   trie, the tail's last token followed by the prefix. Every row is
   read and returns every label token, so the cue's row scores all
@@ -18,10 +15,13 @@ the partner suffixes are:
   children. Each chain is a causal segment and reads the ancestors
   above it from earlier chains, so every node is computed once and
   every row is read.
-- ``canvas``: a diffusion model's rule. The whole tail is one suffix
-  and a canvas of one row per padded label token follows it; every
-  canvas row is read, and a label's score sums, row by row, the log
-  probabilities of its padded tokens.
+- ``canvas``: a diffusion model's rule. Every label ends with the
+  answer end token, and the canvas holds as many rows as the longest.
+  One suffix per label-trie node, the tail's last token followed by
+  the node's tokens, with the canvas rows left after them; the first
+  canvas row is read. Every suffix fills the same canvas, so no label
+  is favored for its length, and a row is conditioned on the node's
+  tokens written before it.
 """
 
 import logging
@@ -37,14 +37,12 @@ from quail.backends.quail.executor.readout import AsyncLabelLogprobs
 from quail.backends.quail.executor.stages import Stage, run_stages
 from quail.execution.labels import (
     best_label,
-    canvas_scores,
     label_path_scores,
     label_scores,
     label_trie,
     tree_scores,
     trie_chains,
     trie_paths,
-    trie_targets,
 )
 from quail.execution.reranker import RerankerBatch
 from quail.execution.tokens import chain_tokens, prefix_tree
@@ -68,6 +66,8 @@ class LabelRequests:
             (suffixes, rows, targets) with all rows read and
             (suffixes, targets) otherwise, to one score per label.
         chains: Under ``trie_tree``, the chains the one suffix packs.
+        canvas_rows: Under ``canvas``, the rows of the canvas, and per
+            suffix the rows left after its node.
     """
 
     frame: list
@@ -76,6 +76,8 @@ class LabelRequests:
     read_all_rows: bool
     score: Callable[[np.ndarray], np.ndarray]
     chains: list | None = None
+    canvas_rows: int = 0
+    canvas_widths: list | None = None
 
 
 def label_requests(spec, targets=None) -> LabelRequests:
@@ -93,12 +95,15 @@ def label_requests(spec, targets=None) -> LabelRequests:
     cue, frame = tail[-1], list(tail[:-1])
     ids = spec.label_token_ids
     if targets is None:
-        targets = (trie_targets(label_trie(ids)) if spec.scoring == "trie_nodes"
-                   else sorted({token for label in ids for token in label}))
+        targets = sorted({token for label in ids for token in label})
     if spec.scoring == "canvas":
+        trie = label_trie(ids)
+        nodes = sorted(trie, key=lambda prefix: (len(prefix), prefix))
+        rows = max(len(label) for label in ids)
         return LabelRequests(
-            [], [list(tail)], targets, True,
-            lambda logprobs: canvas_scores(ids, targets, logprobs[0]))
+            frame, [[cue, *node] for node in nodes], targets, False,
+            lambda logprobs: label_scores(ids, nodes, targets, logprobs),
+            canvas_rows=rows, canvas_widths=[rows - len(node) for node in nodes])
     if spec.scoring == "trie_tree":
         chains = trie_chains(ids)
         tokens = [cue if node == () else node[-1]
@@ -112,11 +117,7 @@ def label_requests(spec, targets=None) -> LabelRequests:
         return LabelRequests(
             frame, [[cue, *path] for path in paths], targets, True,
             lambda logprobs: label_path_scores(ids, paths, targets, logprobs))
-    trie = label_trie(ids)
-    nodes = sorted(trie, key=lambda prefix: (len(prefix), prefix))
-    return LabelRequests(
-        frame, [[cue, *node] for node in nodes], targets, False,
-        lambda logprobs: label_scores(ids, nodes, targets, logprobs))
+    raise ValueError(f"unknown label scoring rule {spec.scoring!r}")
 
 
 def document_prefixes(spec, documents, rows) -> list:
@@ -151,20 +152,18 @@ class QuailClassifier:
         prefixes = document_prefixes(spec, documents, rows)
         canvas = None
         if spec.scoring == "canvas":
-            # the canvas rows follow the tail and are the rows read; a
+            # every suffix's canvas is a leading part of the run's; a
             # canvas classification never chains, so one canvas length
             if len(specs) > 1:
                 raise ValueError("a canvas classification runs alone")
-            canvas = state["pipeline"].canvas_rows(len(spec.label_token_ids[0]))
-            readout_rows = len(canvas)
-        else:
-            readout_rows = (max(len(suffix) for request in requests
-                                for suffix in request.suffixes)
-                            if read_all else 1)
-        # every label read at the same rows needs no normalizer: one-token
-        # labels at the cue row, or the canvas
-        same_rows = (spec.scoring == "canvas" or all(
-            len(ids) == 1 for stage in specs for ids in stage.label_token_ids))
+            canvas = state["pipeline"].canvas_rows(requests[0].canvas_rows)
+        readout_rows = (max(len(suffix) for request in requests
+                            for suffix in request.suffixes)
+                        if read_all else 1)
+        # every label read at the same row needs no normalizer: one-token
+        # labels at the cue row
+        same_rows = all(len(ids) == 1 for stage in specs
+                        for ids in stage.label_token_ids)
         normalize = not same_rows
         readout = state.get("label_readout")
         if (readout is None or list(readout.targets.tolist()) != targets
@@ -225,7 +224,7 @@ class QuailClassifier:
                 requests=((lambda key, index=index: gate(index, key))
                           if index else None),
                 read_all_rows=read_all, label=stage_spec.name,
-                chains=request.chains))
+                chains=request.chains, canvas_widths=request.canvas_widths))
 
         stats = {}
         answers, spans, fresh = run_stages(
@@ -241,7 +240,8 @@ class QuailClassifier:
                 if labels[index][anchor] is None:
                     labels[index][anchor] = label_of(index, logprobs)
             suffix_tokens = len(first) * (
-                len(canvas) if canvas else sum(map(len, request.suffixes)))
+                sum(map(len, request.suffixes))
+                + sum(request.canvas_widths or ()))
             label_tokens += suffix_tokens
             # a frame equal to the stage before's is already in KV
             written = index == 0 or request.frame != requests[index - 1].frame

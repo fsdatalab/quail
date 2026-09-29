@@ -57,17 +57,14 @@ def classification_refusal(context) -> Refusal | None:
     elif forced is not None and forced not in LABEL_SCORINGS:
         reason = (f"unknown label scoring rule {forced!r}; "
                   f"the rules are {LABEL_SCORINGS}")
-    elif model.canvas_tokens and forced not in (None, "canvas", "trie_nodes"):
-        # trie_nodes is the sequential alternative: one node at a time,
-        # each read at the model's one-row canvas after it
+    elif model.canvas_tokens and forced not in (None, "canvas"):
         reason = (f"{model.name!r} scores labels on a canvas; the "
-                  f"{forced!r} rule reads every row of a chain")
+                  f"{forced!r} rule reads the rows of a causal chain")
     elif forced == "canvas" and not model.canvas_tokens:
         reason = f"{model.name!r} has no canvas to score labels on"
-    elif model.canvas_tokens and not (model.canvas_end_text
-                                      and model.canvas_pad_text):
-        reason = (f"{model.name!r} names no answer end and pad tokens "
-                  f"for the classification canvas")
+    elif model.canvas_tokens and not model.canvas_end_text:
+        reason = (f"{model.name!r} names no answer end token for the "
+                  f"classification canvas")
     else:
         return None
     return _refused(reason)[0].plan
@@ -116,7 +113,7 @@ def has_label(logical) -> bool:
 
 # The label scoring rules the executor runs, in the order they were
 # added; each later rule must return the labels of the first.
-LABEL_SCORINGS = ("trie_nodes", "trie_paths", "trie_tree", "canvas")
+LABEL_SCORINGS = ("trie_paths", "trie_tree", "canvas")
 
 EXHAUSTIVE_SCORING = "trie_paths"
 # every node once, in one request: fewest tokens, tree attention only
@@ -126,45 +123,30 @@ TREE_SCORING = "trie_tree"
 def suffix_lengths(scoring: str, labels) -> list[int]:
     """Tokens of each suffix a document streams under one scoring rule.
 
-    Under ``canvas`` the one suffix is the canvas: as many rows as the
-    padded labels are long. Otherwise every suffix starts with the
-    answer cue's last token. Under
-    ``trie_nodes`` it continues with a label-trie node's tokens and
-    only its last row is read. Under
+    Every suffix starts with the answer cue's last token. Under
     ``trie_paths`` it continues with one of the trie's deepest proper
     prefixes and every row is read. Under ``trie_tree`` the one suffix
-    holds every trie node once.
+    holds every trie node once. Under ``canvas`` there is one suffix
+    per trie node, the node's tokens and the canvas rows left after
+    them, so every suffix is the cue plus the canvas; its first canvas
+    row is read.
 
     Raises:
         ValueError: The rule is not one of LABEL_SCORINGS.
     """
     if scoring == "canvas":
-        return [len(labels[0])]
+        rows = max(len(ids) for ids in labels)
+        return [1 + rows] * len(label_trie(labels))
     if scoring == "trie_tree":
         return [len(label_trie(labels))]
     if scoring == "trie_paths":
         return [1 + len(path) for path in trie_paths(labels)]
-    if scoring != "trie_nodes":
-        raise ValueError(f"unknown label scoring rule {scoring!r}")
-    return [1 + len(node) for node in label_trie(labels)]
+    raise ValueError(f"unknown label scoring rule {scoring!r}")
 
 
 def reads_all_rows(scoring: str) -> bool:
-    """Whether a rule reads every row of a suffix, or only its last."""
-    return scoring != "trie_nodes"
-
-
-def canvas_rule(labels) -> str:
-    """The rule a canvas model scores labels with, unless one is forced.
-
-    The one-pass canvas predicts every row at once, so a row is not
-    conditioned on the label tokens before it; that is exact only when
-    every label is one token. Longer labels are scored one trie node
-    at a time, each read at the one-row canvas after it.
-    """
-    if all(len(ids) == 1 for ids in labels):
-        return "canvas"
-    return "trie_nodes"
+    """Whether a rule reads every row of a suffix, or only one."""
+    return scoring != "canvas"
 
 
 def readout_component(rows: float, model) -> CostComponent:
@@ -365,13 +347,10 @@ class _Table:
         tail = tuple(call.prompt.tail_token_ids)
         labels = tuple(tuple(self.tokenizer(label_text(label)))
                        for label in call.labels)
-        scoring = self.scoring
-        if self.model.canvas_tokens and scoring is None:
-            scoring = canvas_rule(labels)
-        if scoring == "canvas":
+        if self.model.canvas_tokens:
             labels = self.padded(labels)
         scoring, simulated = self.choose(live, len(head), len(tail) - 1,
-                                         labels, resident, scoring)
+                                         labels, resident)
         suffixes = suffix_lengths(scoring, labels)
         # head, document, and frame stay resident while the longest
         # suffix and the frame entry's own rows are packed beside them
@@ -392,23 +371,20 @@ class _Table:
         return spec, simulated.work
 
     def padded(self, labels) -> tuple:
-        """Every label padded to the canvas with the end token, then pads.
+        """Every label followed by the answer end token.
 
-        The canvas is one row longer than the longest label, so every
-        label is followed by at least the answer end token.
+        The canvas is as long as the longest label with its end token,
+        so a label's last scored row is the end token after it.
 
         Raises:
-            ClassifyRefusedError: The end or pad text is not one token.
+            ClassifyRefusedError: The end text is not one token.
         """
         end = tuple(self.tokenizer(self.model.canvas_end_text))
-        pad = tuple(self.tokenizer(self.model.canvas_pad_text))
-        if len(end) != 1 or len(pad) != 1:
+        if len(end) != 1:
             raise ClassifyRefusedError(
-                f"the canvas end {self.model.canvas_end_text!r} and pad "
-                f"{self.model.canvas_pad_text!r} must be one token each",
-                1, 0)
-        rows = max(len(ids) for ids in labels) + 1
-        return tuple(ids + end + pad * (rows - len(ids) - 1) for ids in labels)
+                f"the canvas end {self.model.canvas_end_text!r} must be "
+                f"one token", 1, 0)
+        return tuple(ids + end for ids in labels)
 
     def simulate(self, scoring, live, head_tokens, frame_tokens, labels,
                  resident) -> Simulated:
@@ -423,7 +399,8 @@ class _Table:
                         self.chunk, self.capacity or self.budget, self.model,
                         self.device, resident=resident,
                         read_all_rows=reads_all_rows(scoring),
-                        canvas_rows=(len(labels[0]) if scoring == "canvas"
+                        canvas_rows=(max(len(ids) for ids in labels)
+                                     if scoring == "canvas"
                                      else self.model.canvas_tokens),
                         shared=shared)
 
@@ -442,20 +419,19 @@ class _Table:
             spec.label_token_ids, False)
         return replace(spec, estimated_seconds=simulated.seconds)
 
-    def choose(self, live, head_tokens, frame_tokens, labels, resident,
-               scoring=None) -> tuple[str, Simulated]:
+    def choose(self, live, head_tokens, frame_tokens, labels, resident
+               ) -> tuple[str, Simulated]:
         """The rule with the least simulated time, and its simulation.
 
-        A forced rule, or the one ``scoring`` names, is the one
-        candidate. Otherwise ``trie_paths`` is a candidate, and
+        A forced rule is the one candidate, as is ``canvas`` on a
+        canvas model. Otherwise ``trie_paths`` is a candidate, and
         ``trie_tree`` under tree attention. Ties go to fewer label
         tokens, then the order listed.
         """
-        scoring = scoring or self.scoring
-        if scoring:
-            candidates = [scoring]
+        if self.scoring:
+            candidates = [self.scoring]
         elif self.model.canvas_tokens:
-            candidates = [canvas_rule(labels)]
+            candidates = ["canvas"]
         else:
             candidates = [EXHAUSTIVE_SCORING]
             if self.tree:

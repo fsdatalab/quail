@@ -59,6 +59,9 @@ class Stage:
         chains: For a stage whose one suffix packs a label trie, the
             chains from ``trie_chains``: the packer makes each a causal
             segment and gathers the ancestors above it.
+        canvas_widths: Per suffix, the rows of the canvas packed after
+            it, at most the run's canvas; None packs the whole canvas
+            after every suffix.
     """
 
     DROP = DROP
@@ -72,6 +75,7 @@ class Stage:
     single: bool = False
     label: str = ""
     chains: list | None = None
+    canvas_widths: list | None = None
 
 
 def shared_preamble_tokens(question_ids) -> int:
@@ -200,13 +204,18 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
     # a classification reads every row of its own, longer canvas
     canvas = tuple(pipeline.canvas_ids if canvas is None else canvas)
     answer_row = pipeline.canvas_answer_row
+    # per stage, the canvas rows after each suffix
+    canvas_rows = [
+        np.asarray(stage.canvas_widths if stage.canvas_widths is not None
+                   else [len(canvas)] * len(stage.suffixes), dtype=np.int64)
+        for stage in stages]
 
     def entry_rows(a, j, start, end, carried):
         f = len(prefixes[a])
-        lengths = suffixes[j].lengths_at(
-            sched.partner_indices(a, j, start, end))
+        indices = sched.partner_indices(a, j, start, end)
+        lengths = suffixes[j].lengths_at(indices)
         rows = ((f if carried else 0) + int(lengths.sum())
-                + len(canvas) * len(lengths))
+                + int(canvas_rows[j][indices].sum()))
         if writes[j] and start == 0:
             rows += len(frames[j]) + len(canvas)
         return rows
@@ -263,7 +272,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
 
     sched = JoinAdmission(
         [len(p) for p in prefixes],
-        [s.lengths.tolist() for s in suffixes],
+        [(s.lengths + rows).tolist() for s, rows in zip(suffixes, canvas_rows)],
         budget,
         arena.n_pages if paged else 1 << 62,
         arena.page_tokens,
@@ -273,7 +282,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
         # the unified path's temporary pages throughout
         temporary_suffix_pages=paged and mode == "unified",
         answer_dtype=[stage.readout.dtype for stage in stages],
-        canvas_tokens=len(canvas),
+        frame_canvas_tokens=len(canvas),
         page_cost=arena.page_cost if paged else (lambda *args: 0),
         tree=prefix_tree,
         advance=advance,
@@ -329,9 +338,11 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
             prefix = None
             if carried:
                 prefix = prefixes[a][shared:] if shared else prefixes[a]
-            sufs = suffixes[j].take(sched.partner_indices(a, j, start, end))
+            indices = sched.partner_indices(a, j, start, end)
+            sufs = suffixes[j].take(indices)
             read_all = stages[j].read_all_rows
             rows = int(sufs.lengths.sum()) if read_all else len(sufs)
+            widths = canvas_rows[j][indices] if canvas else None
             # under tree attention a borrowing document with one
             # suffix reads its parent's pages stacked with its siblings
             read_key = keys[parent] if shared and stages[j].single else None
@@ -355,14 +366,14 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                 specs.append(dict(
                     key=key, prefix=None, f=f + len(frame),
                     suffixes=sufs, read_all_rows=read_all,
-                    chains=stages[j].chains))
+                    chains=stages[j].chains, canvas_widths=widths))
             else:
                 specs.append(dict(
                     key=key, prefix=prefix, start=shared, read_key=read_key,
                     f=f + len(frame),
                     suffixes=sufs, read_all_rows=read_all,
                     single=stages[j].single and end - start == 1,
-                    chains=stages[j].chains))
+                    chains=stages[j].chains, canvas_widths=widths))
             entries.append((j, rows))
         chunk = pack_chunk(torch, arena, specs, attention_mode=mode,
                            staging=staging, canvas=canvas,

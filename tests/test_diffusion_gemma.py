@@ -94,14 +94,16 @@ def test_canvas_rows_are_charged_in_filter_streams_and_packed_chunks(
     assert [stage.frame for stage in stages] == [[40, 41], [40, 41]]
     assert [stage.suffixes for stage in stages] == [[[42]], [[43, 44]]]
     assert frame_writes(stages) == [True, False]
-    sched = JoinAdmission([20, 30], [[1], [2]], 200, arena_pages=64,
+    # the stages' suffix counts include their canvas rows; a frame
+    # entry's canvas is counted from frame_canvas_tokens
+    sched = JoinAdmission([20, 30], [[1 + 3], [2 + 3]], 200, arena_pages=64,
                           page_tokens=16, frame_tokens=[2, 2],
-                          frame_writes=[True, False], canvas_tokens=3)
+                          frame_writes=[True, False], frame_canvas_tokens=3)
     assert sched.stages == [[1 + 3], [2 + 3]]
     assert sched.frame_rows == [2 + 3, 0]
 
-    sched = JoinAdmission([10], [[5, 5]], 100, arena_pages=100, page_tokens=16,
-                          frame_tokens=[3], canvas_tokens=4)
+    sched = JoinAdmission([10], [[9, 9]], 100, arena_pages=100, page_tokens=16,
+                          frame_tokens=[3], frame_canvas_tokens=4)
     assert sched.stages == [[9, 9]]
     assert sched.frame_rows == [7]
 

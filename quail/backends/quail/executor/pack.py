@@ -196,9 +196,10 @@ class JoinAdmission:
             stage. An anchor's value may instead be a callable(stage)
             -> list, None, or DROP, asked when the anchor enters the
             stage; DROP takes the anchor out of the run there.
-        canvas_tokens: Rows a diffusion model adds after every suffix
-            and after a frame entry. They take chunk room and page
-            room but are never kept in the anchor's KV.
+        frame_canvas_tokens: Rows a diffusion model adds after a frame
+            entry. They take chunk room and page room but are never
+            kept in the anchor's KV. A suffix's canvas rows are part of
+            its count in stage_suffixes.
         page_cost: Callable(tokens, base_tokens) giving the pages a
             key of that many rows takes, in the arena's every-token pages; None
             prices one pool of page_tokens pages.
@@ -241,7 +242,7 @@ class JoinAdmission:
     def __init__(self, prefix_tokens, stage_suffixes, chunk_budget,
                  arena_pages, page_tokens, frame_tokens=None,
                  resident=None, anchor_partners=None, temporary_suffix_pages=False,
-                 answer_dtype=None, canvas_tokens=0, page_cost=None,
+                 answer_dtype=None, frame_canvas_tokens=0, page_cost=None,
                  tree=None, can_borrow=None, advance=None,
                  frame_writes=None, limit=None, extra_tokens=None):
         k = len(stage_suffixes)
@@ -263,7 +264,7 @@ class JoinAdmission:
         self._page_cums = {}
         self._page_reserve = 0
         self.prefix = []
-        self.stages = [[t + canvas_tokens for t in s] for s in stage_suffixes]
+        self.stages = [list(s) for s in stage_suffixes]
         # frames: the rows a frame entry keeps in the anchor's KV;
         # frame_rows: the rows it packs, canvas included
         self.frames = (list(frame_tokens) if frame_tokens
@@ -275,7 +276,7 @@ class JoinAdmission:
         if len(writes) != len(self.stages):
             raise ValueError("frame_writes must match stage_suffixes")
         self.frame_writes = writes
-        self.frame_rows = [f + canvas_tokens if f and write else 0
+        self.frame_rows = [f + frame_canvas_tokens if f and write else 0
                            for f, write in zip(self.frames, writes)]
         if not self.stages:
             raise ValueError("a join needs at least one stage")
