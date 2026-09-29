@@ -319,6 +319,10 @@ def score_in_batches(node, inputs, score_batches, shards: int = 1,
     if len(order) and np.any(np.diff(order) < 0):
         table = table.take(pa.array(np.argsort(order, kind="stable")))
     table = attach_prior_columns(table, priors)
+    if isinstance(node.spec, ClassifySpec):
+        # a document whose decoded answer names no label leaves the run
+        table = table.filter(pc.is_valid(table.column(node.spec.name)))
+        metrics = replace(metrics, output_rows=table.num_rows)
     return NodeResult({"scores": table}, replace(
         metrics, wall_s=time.perf_counter() - started,
         extension={"output": node.spec.name, "aliases": list(node.spec.aliases),

@@ -496,6 +496,13 @@ def test_classify_plans_filters_and_returns_labels(session):
     assert result.collect().column("topic").to_pylist() == [
         "praise", "shipping"]
 
+    # a document whose decoded answer names no label leaves the run
+    result = _finish(plain, session, _Labels(["praise", None]))
+    assert result.collect().column("topic").to_pylist() == ["praise"]
+    labels = result.answer_tables["classifies"]["topic"]
+    assert labels.column("topic").to_pylist() == ["praise"]
+    assert result.report["node_metrics"]["ai-classify:0"]["output_rows"] == 1
+
 
 def _chain(session, *, filters=1):
     query = session.docs("documents").alias("d").ai_classify(
@@ -981,11 +988,12 @@ def test_planner_prices_the_canvas_rule_as_rounds_of_denoising_steps():
 
 
 def test_a_document_without_a_label_fails_every_label_filter(session):
-    # document 7's answer named no label
+    # document 7's answer named no label: it leaves the run before the
+    # filter, as under the request backends
     result = _finish(_topic(session), session, _Labels([None, "refund"]))
     assert result.collect().column("topic").to_pylist() == ["refund"]
     (answers,) = result.answer_tables["filters"].values()
-    assert answers.column("answer").to_pylist() == [False, True]
+    assert answers.column("answer").to_pylist() == [True]
     labels = result.answer_tables["classifies"]["topic"]
     assert labels.column("topic").to_pylist() == ["refund"]
     assert labels.column("d").to_pylist() == [1]
