@@ -351,7 +351,7 @@ def contiguous_shards(doc_tokens, workers: int):
 # ---------------------------------------------------------- the planner
 
 @dataclass(frozen=True)
-class _Labels:
+class LabelWork:
     """The classifications a plan needs, from its label filters and columns.
 
     Attributes:
@@ -371,7 +371,7 @@ class _Labels:
     projected: dict
 
 
-def _label_work(plan, filters) -> _Labels:
+def label_work(plan, filters) -> LabelWork:
     projected = {column.expression: column.name
                  for column in plan.root.columns
                  if isinstance(column, Alias)}
@@ -395,7 +395,7 @@ def _label_work(plan, filters) -> _Labels:
             calls.append((call, call.aliases()[0]))
     demands = {call: next(iter(sets)) for call, sets in accepted.items()
                if call not in projected and len(sets) == 1}
-    return _Labels(tuple(calls), names, tests, demands, projected)
+    return LabelWork(tuple(calls), names, tests, demands, projected)
 
 
 def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
@@ -428,7 +428,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
             for alias, predicates in filters.items()}
     ask_filters = {alias: [filters[alias][position] for position in positions]
                    for alias, positions in asks.items() if positions}
-    labels = _label_work(plan, filters)
+    labels = label_work(plan, filters)
     classified = {alias for _, alias in labels.calls}
     if labels.calls:
         if context is None:

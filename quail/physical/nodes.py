@@ -162,6 +162,47 @@ class RequestFilterSpec:
 
 
 @dataclass(frozen=True)
+class RequestClassifySpec:
+    """One AI.CLASSIFY call submitted as one request per label-trie node.
+
+    ``tail_token_ids`` follow each document: the question, the
+    category list, and the answer cue. ``tests`` are the label filters
+    on this call, (written position, accepted labels), applied in
+    order after the documents are labeled.
+    """
+
+    alias: str
+    output: str
+    tail_token_ids: tuple[Any, ...]
+    labels: tuple[str, ...]
+    label_token_ids: tuple[tuple[Any, ...], ...]
+    tests: tuple[tuple[int, tuple[str, ...]], ...] = ()
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "RequestClassifySpec":
+        return cls(
+            alias=str(value["alias"]),
+            output=str(value["output"]),
+            tail_token_ids=tuple(value["tail_token_ids"]),
+            labels=tuple(str(label) for label in value["labels"]),
+            label_token_ids=tuple(tuple(ids) for ids in value["label_token_ids"]),
+            tests=tuple((int(position), tuple(str(label) for label in accepted))
+                        for position, accepted in value.get("tests", ())),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "alias": self.alias,
+            "output": self.output,
+            "tail_token_ids": list(self.tail_token_ids),
+            "labels": list(self.labels),
+            "label_token_ids": [list(ids) for ids in self.label_token_ids],
+            "tests": [[position, list(accepted)]
+                      for position, accepted in self.tests],
+        }
+
+
+@dataclass(frozen=True)
 class RequestJoinSpec:
     """One join predicate submitted over its complete cross product."""
 
@@ -321,6 +362,7 @@ class RequestExecution(PhysicalNode):
     preamble_text: str = ""
     filters: tuple[RequestFilterSpec, ...] = ()
     joins: tuple[RequestJoinSpec, ...] = ()
+    classifies: tuple[RequestClassifySpec, ...] = ()
 
     type_name: ClassVar[str] = "quail.request_execution"
     runtime_key: ClassVar[str] = type_name
@@ -357,6 +399,14 @@ class RequestExecution(PhysicalNode):
             )
             for spec in self.joins
         )
+        outputs.extend(
+            OutputPort(
+                f"label_answers:{spec.output}",
+                ValueType.LABEL_ANSWERS,
+                schema=(spec.alias, spec.output),
+            )
+            for spec in self.classifies
+        )
         return tuple(outputs)
 
     def attributes(self) -> dict:
@@ -367,6 +417,7 @@ class RequestExecution(PhysicalNode):
             "preamble_text": self.preamble_text,
             "filters": [spec.to_dict() for spec in self.filters],
             "joins": [spec.to_dict() for spec in self.joins],
+            "classifies": [spec.to_dict() for spec in self.classifies],
         }
 
     def explain_fields(self) -> Mapping[str, Any]:
@@ -375,6 +426,7 @@ class RequestExecution(PhysicalNode):
             "aliases": list(self.aliases),
             "filter_chains": len(self.filters),
             "joins": len(self.joins),
+            "classifications": len(self.classifies),
         }
 
     @classmethod
@@ -393,6 +445,10 @@ class RequestExecution(PhysicalNode):
             joins=tuple(
                 RequestJoinSpec.from_mapping(spec)
                 for spec in attributes["joins"]
+            ),
+            classifies=tuple(
+                RequestClassifySpec.from_mapping(spec)
+                for spec in attributes.get("classifies", ())
             ),
         )
 

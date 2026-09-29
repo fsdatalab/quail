@@ -79,8 +79,6 @@ def queries(session) -> dict:
     listed = {}
     for spec in query_specs(include_privacy=True).values():
         plan = read_plan(spec.plan)
-        if plan.classifies and session.config.backend != "quail":
-            continue
         if all(relation.table in session.catalog for relation in plan.relations):
             listed[spec.id] = (
                 spec.description, lambda plan=plan: _build(session, plan))

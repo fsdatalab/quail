@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Any, Mapping
 
+import numpy as np
 import pyarrow as pa
 
 from quail.backends.base import GpuContext
@@ -18,6 +19,12 @@ from quail.backends.request_scheduling import (
     true_bit,
 )
 from quail.cost import budgets
+from quail.execution.labels import (
+    best_label,
+    label_scores,
+    label_trie,
+    trie_targets,
+)
 from quail.execution.pairs import (
     allowed_members,
     members_by_partner,
@@ -36,11 +43,14 @@ from quail.execution.runner import (
 )
 from quail.execution.types import PhysicalResponse, export_physical_outputs
 from quail.logical import (
+    Alias,
     Apply,
+    LabelIn,
     effective_selectivity,
     filter_question_text,
     join_label,
     join_outer_input,
+    label_text,
     render_join_frame,
     shared_preamble,
 )
@@ -50,6 +60,7 @@ from quail.physical import (
     PortRef,
     Project,
     Recombine,
+    RequestClassifySpec,
     RequestExecution,
     RequestFilterSpec,
     RequestJoinSpec,
@@ -66,6 +77,7 @@ from quail.planner import (
     join_specs as logical_join_specs,
 )
 from quail.planner.classify import has_label
+from quail.planner.decide import label_work
 from quail.planner.joins import search_joins, summarize_alias
 from quail.planner.physical_optimizer import PhysicalCandidate, SupportResult
 from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
@@ -92,8 +104,19 @@ def plan_request_backend(
     backend_name: str,
     filter_submission: str,
     join_submission: str,
+    scores_labels: bool = False,
 ) -> tuple[PhysicalCandidate, ...]:
-    """Build one physical request plan for a request engine."""
+    """Build one physical request plan for a request engine.
+
+    Args:
+        region: The logical model region to plan.
+        context: The planning context.
+        backend_name: The backend the plan names.
+        filter_submission: How filter stages become requests.
+        join_submission: How join tuples become requests.
+        scores_labels: Whether the engine returns named tokens' next-token
+            log probabilities, which AI.CLASSIFY needs.
+    """
     if any(isinstance(node, Apply) for node in region.logical_plan.walk()):
         return (PhysicalCandidate(
             graph=None,
@@ -103,18 +126,33 @@ def plan_request_backend(
                 needed=1, available=0, unit="backends"),
             estimated_seconds=float("inf"),
         ),)
-    if has_label(region.logical_plan):
+    classifies = has_label(region.logical_plan)
+    if classifies and not (scores_labels and context.tokenizer is not None):
+        reason = (f"AI.CLASSIFY on {backend_name} needs next-token log "
+                  f"probabilities of named tokens, which its engine does "
+                  f"not return" if context.tokenizer is not None
+                  else "AI.CLASSIFY planning needs the model's tokenizer")
         return (PhysicalCandidate(
             graph=None,
             plan=Refusal(
-                reasons=(f"AI.CLASSIFY is not implemented on {backend_name} "
-                         f"yet",),
+                reasons=(reason,),
                 constraint="classify_needs_quail_backend",
                 needed=1, available=0, unit="backends"),
             estimated_seconds=float("inf"),
         ),)
     operators = region.logical_plan.operators()
     scans, filters, joins = operators.scans, operators.filters, operators.joins
+    # the AI.IF predicates by alias, with their written positions; a
+    # label filter runs after its classification instead
+    ask_filters = {
+        alias: [p for p in predicates
+                if not isinstance(p.expression, LabelIn)]
+        for alias, predicates in filters.items()}
+    ask_filters = {alias: ps for alias, ps in ask_filters.items() if ps}
+    ask_positions = {
+        alias: [i for i, p in enumerate(predicates)
+                if not isinstance(p.expression, LabelIn)]
+        for alias, predicates in filters.items()}
     stats = {
         alias: CorpusStats(
             n_docs=len(lengths),
@@ -146,11 +184,11 @@ def plan_request_backend(
         nodes.append(node)
         input_refs.append(PortRef(node.node_id, f"pairs:{node.written_pos}"))
 
-    rule = context.order or default_order_rule(filters, joins)[0]
+    rule = context.order or default_order_rule(ask_filters, joins)[0]
     chunk_tokens = budgets.chunk_budget(context.model, context.device)
-    preamble_count = preamble_tokens(filters, joins)
+    preamble_count = preamble_tokens(ask_filters, joins)
     filter_orders = {
-        alias: order_filters_indexed(
+        alias: [ask_positions[alias][i] for i in order_filters_indexed(
             predicates,
             rule,
             prefix_tokens=(
@@ -159,8 +197,8 @@ def plan_request_backend(
             model=context.model,
             device=context.device,
             chunk_tokens=chunk_tokens,
-        )
-        for alias, predicates in filters.items()
+        )]
+        for alias, predicates in ask_filters.items()
     }
     live = {
         alias: float(summary.n_docs) for alias, summary in stats.items()
@@ -195,9 +233,9 @@ def plan_request_backend(
     first_anchor = join_sequence[0][1] if join_sequence else None
     for alias in sorted(aliases, key=lambda alias: alias == first_anchor):
         predicates = filters.get(alias, ())
-        if not predicates:
+        if alias not in ask_filters:
             continue
-        prompts.extend(predicate.prompt for predicate in predicates)
+        prompts.extend(predicate.prompt for predicate in ask_filters[alias])
         written_positions = tuple(filter_orders[alias])
         questions = tuple(
             tuple(predicates[position].prompt.tail_token_ids)
@@ -214,6 +252,25 @@ def plan_request_backend(
             written_positions=written_positions,
             question_token_ids=questions,
             question_texts=question_texts,
+        ))
+
+    # each classification labels the alias's documents after its AI.IF
+    # chain; its label filters keep the accepted documents for the joins
+    label_plan = label_work(region.logical_plan, filters)
+    classify_specs = []
+    for call, alias in label_plan.calls:
+        prompts.append(call.prompt)
+        classify_specs.append(RequestClassifySpec(
+            alias=alias,
+            output=label_plan.names[call],
+            tail_token_ids=tuple(call.prompt.tail_token_ids),
+            labels=tuple(call.labels),
+            label_token_ids=tuple(
+                tuple(context.tokenizer(label_text(label)))
+                for label in call.labels),
+            tests=tuple(
+                (position, tuple(filters[alias][position].expression.accepted))
+                for position in label_plan.tests.get(call, ())),
         ))
 
     join_specs = []
@@ -289,6 +346,7 @@ def plan_request_backend(
         ),
         filters=tuple(filter_specs),
         joins=tuple(join_specs),
+        classifies=tuple(classify_specs),
     )
     nodes.append(request_node)
 
@@ -317,11 +375,16 @@ def plan_request_backend(
     else:
         sink_input = PortRef(request_node.node_id, f"ids:{aliases[0]}")
 
+    # projected labels ride beside the result rows
+    label_ports = tuple(
+        PortRef(request_node.node_id, f"label_answers:{name}")
+        for name in label_plan.projected.values())
     nodes.append(Project(
         node_id="project",
-        inputs=input_ports((sink_input,)),
+        inputs=input_ports((sink_input, *label_ports)),
         columns=tuple(
-            f"{column.alias}.{column.column}"
+            column.name if isinstance(column, Alias)
+            else f"{column.alias}.{column.column}"
             for column in region.logical_plan.root.columns
         ),
     ))
@@ -529,6 +592,56 @@ def _pipelined_filter(client, sampling_params, bodies, questions, read_answer,
     }
 
 
+def _classify_documents(client, spec, bodies) -> dict:
+    """Label documents with one request per label-trie node.
+
+    Every request is a document, the classification tail, and one
+    proper prefix of a label; it asks for the next-token log
+    probabilities of the tokens that can follow that prefix. A label's
+    score is the sum over its tokens, and a tie goes to the earlier
+    label, as on Quail. Requests go in document-major order so an
+    engine's prefix cache serves the document to every node's request.
+    """
+    trie = label_trie(spec.label_token_ids)
+    nodes = sorted(trie, key=lambda node: (len(node), node))
+    targets = trie_targets(trie)
+    column = {token: index for index, token in enumerate(targets)}
+    tail = _token_list(spec.tail_token_ids)
+    prompts = []
+    params = []
+    for body in bodies:
+        for node in nodes:
+            prompts.append({"prompt_token_ids": body + tail + list(node)})
+            params.append(client.label_params(trie[node]))
+    started = time.perf_counter()
+    outputs = client.generate(prompts, params, use_tqdm=False) if prompts else []
+    wall_s = time.perf_counter() - started
+    labels = []
+    prompt_tokens = cached_tokens = 0
+    for index in range(len(bodies)):
+        scores = np.full((len(nodes), len(targets)), -np.inf)
+        for row, node in enumerate(nodes):
+            output = outputs[index * len(nodes) + row]
+            prompt_tokens += len(output.prompt_token_ids)
+            cached_tokens += int(getattr(output, "num_cached_tokens", 0) or 0)
+            entries = output.outputs[0].logprobs[0]
+            for token in trie[node]:
+                if token not in entries:
+                    raise ValueError("the engine omitted a label token's "
+                                     "log probability")
+                scores[row, column[token]] = entries[token].logprob
+        labels.append(spec.labels[best_label(
+            label_scores(spec.label_token_ids, nodes, targets, scores))])
+    return {
+        "labels": labels,
+        "wall_s": wall_s,
+        "requests": len(prompts),
+        "prompt_tokens": prompt_tokens,
+        "cached_tokens": cached_tokens,
+        "fresh_tokens": prompt_tokens - cached_tokens,
+    }
+
+
 class RequestModelExecution:
     """Execute one request engine node with one loaded engine."""
 
@@ -664,6 +777,39 @@ class RequestModelExecution:
             fresh_tokens += result["fresh_tokens"]
             cached_tokens += result["cached_tokens"]
             evaluated_documents += result["requests"]
+
+        for spec in node.classifies:
+            document_ids = list(survivors[spec.alias])
+            result = _classify_documents(
+                self.client, spec, [
+                    _token_list(node.preamble_token_ids)
+                    + _token_list(self.documents[spec.alias][document])
+                    for document in document_ids])
+            outputs[f"label_answers:{spec.output}"] = pa.table({
+                spec.alias: pa.array(document_ids, pa.int32()),
+                spec.output: pa.array(result["labels"], pa.string()),
+            })
+            for position, accepted in spec.tests:
+                kept = set(accepted)
+                survivors[spec.alias] = [
+                    document for document, label
+                    in zip(document_ids, result["labels"])
+                    if label in kept and document in survivors[spec.alias]]
+            steps.append({
+                "kind": "classify",
+                "alias": spec.alias,
+                "output": spec.output,
+                "n_in": len(document_ids),
+                "n_out": len(survivors[spec.alias]),
+                "wall_s": result["wall_s"],
+                "requests": result["requests"],
+                "fresh_tokens": result["fresh_tokens"],
+                "cached_tokens": result["cached_tokens"],
+            })
+            requests += result["requests"]
+            fresh_tokens += result["fresh_tokens"]
+            cached_tokens += result["cached_tokens"]
+            evaluated_documents += len(document_ids)
 
         for spec in node.joins:
             alias_documents = {
@@ -975,6 +1121,7 @@ class RequestBackend:
             backend_name=self.name,
             filter_submission=self.filter_submission,
             join_submission=self.join_submission,
+            scores_labels=getattr(self.engine, "scores_labels", False),
         )
 
     def start(self, context):

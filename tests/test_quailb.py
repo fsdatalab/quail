@@ -73,12 +73,12 @@ def test_all_queries_compile_and_plan_and_answer_timing_adds_common_work(tmp_pat
         ) as sess:
             register_tables(sess, tmp_path)
             qdefs = queries(sess)
-            # Quail runs every classification query; the request
-            # backends run none. A lone classification chain plans on
-            # the classify planner, in written order
+            # every backend lists every query; SGLang refuses the
+            # classification queries at plan time, since it returns
+            # no named tokens' log probabilities. A lone classification
+            # chain plans on Quail's classify planner, in written order
             runnable = {"IMDB-11", "IMDB-14", "BIO-5", "FEV-11", "AGENT-4"}
-            assert set(qdefs) == (
-                expected | classify if backend == "quail" else expected), backend
+            assert set(qdefs) == expected | classify, backend
             for qid, (_, build) in qdefs.items():
                 case = f"{backend} {qid}"
                 query = build()
@@ -90,9 +90,14 @@ def test_all_queries_compile_and_plan_and_answer_timing_adds_common_work(tmp_pat
                 assert all((s is None) == qid.startswith("PRIV-")
                            for s in selectivities), case
                 plan = query.plan()
+                if backend == "pipelined_sglang" and qid in classify:
+                    assert isinstance(plan, Refusal), case
+                    assert plan.constraint == "classify_needs_quail_backend", case
+                    continue
                 assert not isinstance(plan, Refusal), f"{case} refused: {plan}"
                 assert plan.settings["order_rule"] == (
-                    "written order" if qid in runnable else "by_cost"), case
+                    "written order" if qid in runnable and backend == "quail"
+                    else "by_cost"), case
                 assert "physical:" in query.explain(), case
 
     report = {

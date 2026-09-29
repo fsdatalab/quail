@@ -37,6 +37,7 @@ from quail.physical import (
     ClassifySpec,
     ClassifyStage,
     LabelFilter,
+    RequestExecution,
     decode_graph,
     encode_graph,
 )
@@ -880,10 +881,13 @@ def test_classify_refusals_and_builder_errors(session):
     assert not isinstance(_topic(big).plan(), Refusal)
     big.close()
 
+    # stock vLLM classifies too, with one request per label-trie node
     vllm = quail.Session(EngineConfig(model="qwen3-4b-fp8", device="h100-sxm",
                                       backend="stock_vllm"), tokenizer=_bytes)
     vllm.register("documents", session.catalog.get("documents"))
-    assert "not implemented on" in _topic(vllm).plan().reasons[0]
+    request = next(node for node in _topic(vllm).plan().nodes
+                   if isinstance(node, RequestExecution))
+    assert [spec.output for spec in request.classifies] == ["topic"]
     vllm.close()
 
 

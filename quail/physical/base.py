@@ -21,6 +21,7 @@ class ValueType(str, Enum):
     DOCUMENT_IDS = "document_ids"
     FILTER_ANSWERS = "filter_answers"
     JOIN_ANSWERS = "join_answers"
+    LABEL_ANSWERS = "label_answers"
     PAIRS = "pairs"
     SCORES = "scores"
     ROWS = "rows"

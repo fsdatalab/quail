@@ -17,6 +17,8 @@ from quail.backends.sglang import SGLangClient
 from quail.backends.vllm import VLLMEngine, sampling_kwargs
 from quail.builtins import built_in_registry
 from quail.physical import (
+    Project,
+    RequestClassifySpec,
     RequestExecution,
     RequestFilterSpec,
     RequestJoinSpec,
@@ -350,3 +352,64 @@ def test_vllm_engine_settings_tokenizer_and_canvas_follow_the_model(monkeypatch)
     with diffusion_canvas(QWEN3_4B_FP8) as tokens:
         assert tokens == ()
         assert module.DiffusionGemmaRequestStates is States
+
+
+class _LabelClient(_Client):
+    """Scores label tokens: document 10 prefers label a, document 11 label b."""
+
+    def label_params(self, token_ids):
+        return ("labels", tuple(token_ids))
+
+    def generate(self, prompts, sampling_params, use_tqdm=False):
+        outputs = []
+        for prompt, params in zip(prompts, sampling_params):
+            kind, tokens = params
+            assert kind == "labels"
+            ids = prompt["prompt_token_ids"]
+            liked = 60 if 10 in ids else 61
+            outputs.append(SimpleNamespace(
+                prompt_token_ids=ids, num_cached_tokens=len(ids) - 1,
+                outputs=[SimpleNamespace(logprobs=[{
+                    token: SimpleNamespace(logprob=-0.5 if token == liked else -2.0)
+                    for token in tokens}])]))
+        return outputs
+
+
+def test_request_backends_classify_with_one_request_per_trie_node():
+    # labels a = [60, 62], b = [61, 62], c = [60, 63]: the trie has the
+    # root, [60], and [61]; label a wins at document 0 and b at 1
+    spec = RequestClassifySpec(
+        alias="d", output="kind", tail_token_ids=(90,),
+        labels=("a", "b", "c"), label_token_ids=((60, 62), (61, 62), (60, 63)),
+        tests=((0, ("b",)),))
+    node = RequestExecution(
+        node_id="request-model", backend_name="stock_vllm", aliases=("d",),
+        preamble_token_ids=(3,), classifies=(spec,))
+    execution = _execution({"d": [[10], [11]]}, client=_LabelClient())
+    result = execution.execute(node, {})
+    assert result.outputs["label_answers:kind"].to_pydict() == {
+        "d": [0, 1], "kind": ["a", "b"]}
+    assert result.outputs["ids:d"] == [1]
+    assert result.metrics.extension["requests"] == 6
+    (step,) = result.metrics.extension["steps"]
+    assert (step["kind"], step["n_in"], step["n_out"]) == ("classify", 2, 1)
+    assert result.metrics.fresh_tokens == 6
+
+    session = _session("stock_vllm", docs=DOCS)
+    query = (session.docs("docs").alias("d")
+             .ai_classify(quail.prompt("kind of {0}", quail.col("d.body")),
+                          ["a", "b", "c"], name="kind")
+             .label_in("kind", ["b"])
+             .select("d.id", "kind"))
+    plan = query.plan()
+    request_node = next(
+        node for node in plan.nodes if isinstance(node, RequestExecution))
+    (planned,) = request_node.classifies
+    assert planned.labels == ("a", "b", "c")
+    assert planned.tests == ((0, ("b",)),)
+    assert not request_node.filters
+    project = next(node for node in plan.nodes if isinstance(node, Project))
+    assert [port.source.port for port in project.inputs] == [
+        "ids:d", "label_answers:kind"]
+    assert project.columns == ("d.id", "kind")
+    session.close()
