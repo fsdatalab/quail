@@ -436,11 +436,6 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                 reasons=("AI.CLASSIFY planning needs a planning context",),
                 constraint="unsupported_classify_query",
                 needed=1, available=0, unit="queries")
-        if gpus > 1:
-            return Refusal(
-                reasons=("AI.CLASSIFY beside AI.IF or joins runs on one GPU",),
-                constraint="unsupported_classify_query",
-                needed=1, available=gpus, unit="gpus")
         if any(len(call.aliases()) != 1 for call, _ in labels.calls):
             return Refusal(
                 reasons=("AI.CLASSIFY reads one document",),

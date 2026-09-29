@@ -6,12 +6,14 @@ from collections.abc import Mapping
 from quail import logical as logical_nodes
 from quail.logical import DEFAULT_SELECTIVITY, effective_selectivity
 from quail.physical import (
+    AiClassify,
     AiFilter,
     AiJoin,
     Barrier,
     Exchange,
     Foreign,
     HashJoin,
+    LabelFilter,
     Limit,
     PortRef,
     Project,
@@ -337,6 +339,27 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                     stage.selectivity, stage.expected_docs,
                     stages.get(("filter", node.alias, stage.written_pos)),
                     "evaluated")))
+        elif isinstance(node, AiClassify):
+            spec = node.spec
+            title += f": {spec.name} over {spec.aliases[0]}"
+            if spec.traced_documents:
+                source = f"{spec.traced_documents:,} traced documents replayed"
+            else:
+                source = "no traces: exhaustive rules only"
+            details.append(f"rule={spec.scoring} ({source}), "
+                           f"labels={len(spec.labels)}, "
+                           f"label tokens="
+                           f"{sum(len(ids) for ids in spec.label_token_ids)}"
+                           + (f", demand={list(spec.demand)}"
+                              if spec.demand is not None else ""))
+            for stage in spec.stages:
+                details.append(
+                    f"then {stage.spec.name}: rule={stage.spec.scoring}, "
+                    f"labels={len(stage.spec.labels)}"
+                    + (f", after label in {list(stage.accepted)}"
+                       if stage.accepted is not None else ""))
+        elif isinstance(node, LabelFilter):
+            title += f": {node.score_name} in {list(node.accepted)}"
         elif isinstance(node, AiJoin):
             title += f": anchor={node.anchor}"
             source = {"none": "not resident", "filter": "from filters",

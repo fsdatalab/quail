@@ -1315,3 +1315,27 @@ def test_sql_category_forms_options_and_label_tables(session):
                 "FROM documents d"):
         with pytest.raises(CompileError):
             session.sql(bad)
+
+
+def test_explain_names_the_classification_rule_and_label_filter(session):
+    text = _topic(session).explain()
+    assert "AiClassify: topic over d" in text
+    # the byte tokenizer gives every label the same leading space, so
+    # the packed trie wins
+    assert "rule=trie_tree (no traces: exhaustive rules only), labels=3" in text
+    assert "LabelFilter: topic in ['refund', 'shipping']" in text
+
+
+def test_label_readout_projects_only_the_targets_when_unnormalized():
+    torch = pytest.importorskip("torch")
+    head = torch.randn(300, 8, dtype=torch.bfloat16)
+    hidden = torch.randn(7, 8, dtype=torch.bfloat16)
+    readout = AsyncLabelLogprobs(torch, torch.nn.functional, head, [5, 17, 299],
+                                 normalize=False)
+    got = readout.logprobs(hidden)
+    expected = torch.nn.functional.linear(hidden, head).float()[:, [5, 17, 299]]
+    assert torch.allclose(got, expected, atol=1e-5)
+    # the same ranking as the normalized readout, row by row
+    normalized = AsyncLabelLogprobs(torch, torch.nn.functional, head,
+                                    [5, 17, 299]).logprobs(hidden)
+    assert torch.equal(got.argmax(1), normalized.argmax(1))

@@ -198,18 +198,27 @@ class QuailClassifier:
             readout_rows = (max(len(suffix) for request in requests
                                 for suffix in request.suffixes)
                             if read_all else 1)
+        # every label read at the same rows needs no normalizer: one-token
+        # labels at the cue row, or the canvas; a trace needs true log
+        # probabilities
+        same_rows = (spec.scoring == "canvas" or all(
+            len(ids) == 1 for stage in specs for ids in stage.label_token_ids))
+        normalize = not same_rows or bool(state.get("label_traces"))
         readout = state.get("label_readout")
         if (readout is None or list(readout.targets.tolist()) != targets
-                or readout.rows != readout_rows):
+                or readout.rows != readout_rows
+                or getattr(readout, "normalize", normalize) != normalize):
             torch = state["torch"]
             head = full_output_head(state["model"])
             readout = AsyncLabelLogprobs(
-                torch, torch.nn.functional, head, targets, rows=readout_rows)
+                torch, torch.nn.functional, head, targets, rows=readout_rows,
+                normalize=normalize)
             state["label_readout"] = readout
             logger.info("label readout: head %s x %s in %s, %s targets, "
-                        "%s rows per request", *head.shape,
+                        "%s rows per request, %s", *head.shape,
                         str(head.dtype).replace("torch.", ""), len(targets),
-                        readout_rows)
+                        readout_rows,
+                        "normalized" if normalize else "targets' logits")
         if "input_staging" not in state:
             state["input_staging"] = InputStaging(state["torch"])
         state["input_staging"].fixed_tokens.clear()

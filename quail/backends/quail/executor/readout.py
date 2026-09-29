@@ -96,19 +96,27 @@ class AsyncLabelLogprobs:
 
     With rows > 1 an answer is a (rows, targets) record: the rows of
     one suffix in order, NaN past the suffix's own rows.
+
+    With ``normalize`` off the values are the targets' logits: when
+    every label is scored at the same rows the normalizer is the same
+    for every label and cancels, so only the targets' head rows are
+    projected (the design's SelectOneRow), not the whole vocabulary.
     """
 
     # rows per head block: every block reads the whole head, so few big
     # blocks; 512 x 151,936 logits in bf16 and float32 are 445 MiB
     BLOCK_ROWS = 512
 
-    def __init__(self, torch, F, head, targets, rows=1):
+    def __init__(self, torch, F, head, targets, rows=1, normalize=True):
         self.torch = torch
         self.F = F
         self.head = head
         self.targets = torch.tensor(list(targets), device=head.device,
                                     dtype=torch.long)
         self.rows = rows
+        self.normalize = normalize
+        self.head_rows = None if normalize else head.index_select(
+            0, self.targets)
         self.dtype = np.dtype((np.float32, (rows, len(targets)) if rows > 1
                                else (len(targets),)))
         self.available = []
@@ -116,6 +124,9 @@ class AsyncLabelLogprobs:
     def logprobs(self, normed):
         """Per row, the target tokens' log probabilities, on the device."""
         torch = self.torch
+        if not self.normalize:
+            return self.F.linear(normed.to(self.head.dtype),
+                                 self.head_rows).float()
         out = torch.empty((normed.shape[0], len(self.targets)),
                           dtype=torch.float32, device=normed.device)
         for start in range(0, normed.shape[0], self.BLOCK_ROWS):
