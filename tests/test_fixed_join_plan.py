@@ -73,11 +73,15 @@ class FixedFeverAnswers:
     def execute(self, node, inputs):
         if isinstance(node, AiClassify):
             (ids,) = inputs["score_inputs"].values()
-            rows = np.asarray([[int(document)] for document in ids],
-                              dtype=np.int32)
+            # a document whose answer names no label has no row, as
+            # the classify node drops it
+            labeled = [int(document) for document in ids
+                       if self.labels[int(document)] is not None]
+            rows = np.asarray([[document] for document in labeled],
+                              dtype=np.int32).reshape(-1, 1)
             table = _score_table(
                 rows, node.spec.aliases, node.spec.name,
-                [self.labels[int(document)] for document in ids], pa.string())
+                [self.labels[document] for document in labeled], pa.string())
             return NodeResult({"scores": table}, NodeMetrics(
                 input_rows=len(ids), output_rows=len(ids)))
         if isinstance(node, AiFilter):
@@ -316,6 +320,26 @@ def test_classification_runs_beside_filters_and_joins(monkeypatch):
             {"c.id": "c0", "e.id": "e0", "topic": "science"}]
         labels = result.answer_tables["classifies"]["topic"]
         assert labels.column("topic").to_pylist() == ["science", "sport"]
+
+
+def test_an_unlabeled_document_leaves_a_filtered_result(monkeypatch):
+    # claim c1's answer names no label: it has no label row and no
+    # result row, though the filter before the classification kept it
+    monkeypatch.setattr(FixedFeverAnswers, "labels", ("science", None, "science"))
+    with _session() as session:
+        claims = session.docs("claims").alias("c")
+        topic = quail.prompt("What is {0} about?", quail.col("c.claim"))
+        plausible = quail.prompt("Is {0} plausible?", quail.col("c.claim"))
+        query = (claims.ai_filter(plausible, selectivity=0.9)
+                 .ai_classify(topic, ["science", "sport"], name="topic")
+                 .select("c.id", "topic"))
+        execute = fever_executor(session, monkeypatch, 1, capacity=10)
+        result = execute_query(query, physical_executor=execute)
+        assert result.collect().to_pylist() == [
+            {"c.id": "c0", "topic": "science"}]
+        assert result.count() == 1
+        labels = result.answer_tables["classifies"]["topic"]
+        assert labels.column("c").to_pylist() == [0]
 
 
 def test_request_backends_plan_fev9_and_a_single_join():

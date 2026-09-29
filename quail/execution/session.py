@@ -13,6 +13,7 @@ from typing import Protocol, runtime_checkable
 
 import numpy as np
 import pyarrow as pa
+from pyarrow import acero
 from pyarrow import compute as pc
 
 from quail.builtins import built_in_registry
@@ -930,6 +931,7 @@ class Query:
                 raise TypeError("Project needs an index relation")
             projection = []
             fields = []
+            declaration = relation.declaration
             for name in node.columns:
                 if name in relation.schema.names:
                     # a score column the graph computed; document
@@ -951,6 +953,12 @@ class Query:
                             f"which is not in the result")
                     labeled = table.column(name).combine_chunks().cast(
                         pa.string())
+                    # a document whose answer named no label has no row
+                    # in the table, and leaves the result
+                    declaration = acero.Declaration(
+                        "filter", acero.FilterNodeOptions(
+                            pc.field(alias).isin(table.column(alias))),
+                        inputs=[declaration])
                     # position of each document's label, or the null
                     # appended past the labels for an unlabeled one
                     slots = np.full(len(self._doc_tokens[alias]), len(labeled),
@@ -1009,7 +1017,7 @@ class Query:
                 ))
             return QueryResult(
                 columns=list(node.columns),
-                declaration=relation.declaration,
+                declaration=declaration,
                 document_index_schema=relation.schema,
                 output_schema=pa.schema(
                     fields,
@@ -1018,6 +1026,7 @@ class Query:
                 projection=projection,
                 report={},
                 row_count=(value.num_rows if isinstance(value, pa.Table)
+                           and declaration is relation.declaration
                            else None),
             )
 
