@@ -203,7 +203,10 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
     frame_ids = [np.asarray(frame, dtype=np.int64) for frame in frames]
     writes = frame_writes(stages)
     suffixes = [Suffixes.of(stage.suffixes) for stage in stages]
-    # a stage's suffixes read their document: tree unless the plan says
+    # a stage's suffixes read their document: tree unless the plan says;
+    # a stage packing chains needs the tree path whatever the plan said
+    if any(stage.chains is not None for stage in stages):
+        attention_mode = "tree"
     mode = attention_path(pipeline, attention_mode, default=default_attention)
     canvas = tuple(pipeline.canvas_ids)
     answer_row = pipeline.canvas_answer_row
