@@ -44,6 +44,9 @@ CUE = 5000
 # read at both rows, beside filter and join rows read at one
 LABEL_IDS = ((13,), (14,))
 TARGETS = [13, 14]
+# two-token labels a greedy decode follows one round at a time
+DECODED_IDS = ((11, 13), (11, 14))
+DECODED_TARGETS = [11, 13, 14]
 
 
 # the anchor note (its frame) and partner label of a classification
@@ -524,12 +527,12 @@ def test_a_classification_of_joined_rows_runs_after_its_join_on_the_anchors_kv(
 
 
 def chained_graph():
-    """A classification, its label filter, and a second classification."""
+    """A decoded classification, its label filter, and a second classification."""
     first = ClassifySpec(
         name="topic", aliases=("r",), query_template="", arguments=(),
         expected_inputs=14, estimated_seconds=0.0,
         prompt_token_parts=((), (CLASSIFY_FRAME, CUE)), labels=("a", "b"),
-        label_token_ids=LABEL_IDS, scoring="letters")
+        label_token_ids=DECODED_IDS, scoring="trie_decode")
     second = ClassifySpec(
         name="kind", aliases=("r",), query_template="", arguments=(),
         expected_inputs=7, estimated_seconds=0.0,
@@ -554,7 +557,7 @@ def chained_graph():
     return PhysicalGraph(tuple(nodes), PortRef("classify2:r", "scores"))
 
 
-def test_a_classification_hands_its_documents_on_through_the_label_filter(
+def test_a_decoded_classification_hands_its_documents_on_through_the_label_filter(
         monkeypatch):
     from quail.backends.quail.executor import classify as classify_module
     from quail.execution.pipelines import build_pipelines
@@ -568,7 +571,7 @@ def test_a_classification_hands_its_documents_on_through_the_label_filter(
     docs = {"r": [[DOC + d] * (10 + 2 * d) for d in range(n_docs)]}
     label_truth = [d % 2 for d in range(n_docs)]           # even: "a"
 
-    class ChainModel(LabelingModel):
+    class DecodingModel(LabelingModel):
         def forward_chunk(self, chunk):
             rows = []
             for spec in chunk.specs:
@@ -576,15 +579,23 @@ def test_a_classification_hands_its_documents_on_through_the_label_filter(
                     if suffix[0] != CUE:
                         rows.append(0)
                         continue
-                    # the cue's row wants the document's letter
-                    (want,) = LABEL_IDS[self.label_truth[spec["key"][1]]]
+                    if spec.get("read_all_rows"):
+                        # the cue's row wants the document's letter
+                        (want,) = LABEL_IDS[self.label_truth[spec["key"][1]]]
+                        targets = TARGETS
+                    else:
+                        # a decode round's last row wants the next token
+                        # of the two-token label
+                        want = DECODED_IDS[self.label_truth[spec["key"][1]]][
+                            len(suffix) - 1]
+                        targets = DECODED_TARGETS
                     rows.append(np.asarray(
-                        [-1.0 if token == want else -5.0
-                         for token in TARGETS], np.float32))
+                        [-1.0 if token == want else -5.0 for token in targets],
+                        np.float32))
             self.launched.append(chunk.specs)
             return rows
 
-    model = ChainModel([], {}, label_truth)
+    model = DecodingModel([], {}, label_truth)
     torch = fake_torch()
     # the readout constructor is replaced below; its arguments are read
     torch.nn = SimpleNamespace(functional=None)

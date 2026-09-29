@@ -6,8 +6,10 @@ label's score is the sum of its tokens' log probabilities after the
 prompt, each read at the position before the token. Labels that share
 leading tokens share those positions, so the positions to read are the
 proper prefixes of the labels' token sequences: a trie whose internal
-nodes are read once each. A baseline's decoded answer is matched to a
-label by its text instead (match_label).
+nodes are read once each; a greedy decode over the trie follows the
+likeliest token one round at a time (GreedyDecoder). A baseline's
+decoded answer is matched to a label by its text instead
+(match_label).
 """
 
 import numpy as np
@@ -79,6 +81,74 @@ def letter_scores(label_ids, targets, logprobs) -> np.ndarray:
 def best_label(scores) -> int:
     """Return the index of the highest score; a tie goes to the earlier label."""
     return int(np.argmax(scores))
+
+
+class GreedyDecoder:
+    """Labels decoded one token per round along the label trie.
+
+    Each round reads, for a document, the log probabilities after the
+    trie node it has decoded so far, and appends the likeliest token
+    among the node's children; the document is resolved once its node
+    is a whole label. Nodes are indexed in ``nodes``, shortest first.
+    The decoded label is the greedy path, not the label with the
+    highest summed log probability.
+
+    Args:
+        label_ids: One token id sequence per label; no label may be a
+            proper prefix of another, since a decoded label ends only
+            at a leaf.
+        targets: The token ids, one per column of the log probabilities.
+        documents: How many documents the decoder tracks.
+
+    Raises:
+        ValueError: A label is a proper prefix of another.
+    """
+
+    def __init__(self, label_ids, targets, documents):
+        self.label_ids = [tuple(ids) for ids in label_ids]
+        self.trie = label_trie(label_ids)
+        self.nodes = sorted(self.trie, key=lambda node: (len(node), node))
+        self.index = {node: i for i, node in enumerate(self.nodes)}
+        self.leaf = {}
+        for label, ids in enumerate(self.label_ids):
+            self.leaf.setdefault(ids, label)
+        if any(node in self.leaf for node in self.trie):
+            raise ValueError("a label is a proper prefix of another label")
+        # a tie between children goes to the earlier label's token
+        self.order = {}
+        for label, ids in enumerate(self.label_ids):
+            for token in ids:
+                self.order.setdefault(token, label)
+        self.column = {token: i for i, token in enumerate(targets)}
+        self.rounds = max(len(ids) for ids in self.label_ids)
+        self.node = [()] * documents
+        self.label = np.full(documents, -1, dtype=np.int64)
+        self.tokens = 0     # chain tokens requested so far
+
+    def requests(self, doc):
+        """The index into nodes the document reads this round; None once resolved."""
+        if self.label[doc] >= 0:
+            return None
+        node = self.node[doc]
+        self.tokens += len(node) + 1
+        return [self.index[node]]
+
+    def update(self, doc, row):
+        """Append the likeliest child of the document's node.
+
+        Args:
+            doc: The document.
+            row: The log probabilities read after the node, one per
+                target.
+        """
+        node = self.node[doc]
+        best = min(self.trie[node],
+                   key=lambda token: (-float(row[self.column[token]]),
+                                      self.order[token]))
+        child = node + (best,)
+        self.node[doc] = child
+        if child in self.leaf:
+            self.label[doc] = self.leaf[child]
 
 
 def trie_chains(label_ids) -> list:

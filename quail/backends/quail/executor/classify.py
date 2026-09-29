@@ -17,6 +17,11 @@ the partner suffixes are:
   above it from earlier chains, so every node is computed once and
   every row is read; a label's score is the sum of its tokens' log
   probabilities.
+- ``trie_decode``: one stage per trie depth. Each round a document
+  sends the chain of the node it has decoded so far and appends the
+  likeliest child token read after it, until the node is a whole
+  label (GreedyDecoder); the label is the greedy path, and the
+  document skips the rounds left.
 """
 
 import logging
@@ -31,7 +36,9 @@ from quail.backends.quail.executor.model import full_output_head
 from quail.backends.quail.executor.readout import AsyncLabelLogprobs
 from quail.backends.quail.executor.stages import Stage, run_stages
 from quail.execution.labels import (
+    GreedyDecoder,
     best_label,
+    label_trie,
     letter_scores,
     tree_scores,
     trie_chains,
@@ -51,18 +58,27 @@ class LabelRequests:
         frame: The classification tail but its last token, written once
             after each document.
         suffixes: The partner suffixes, each starting with the tail's
-            last token; every row of a suffix is read.
+            last token.
         targets: The token ids every read returns, sorted.
+        read_all_rows: Whether every row of a suffix is read, or only
+            its last.
         score: Maps one document's log probabilities, shape
-            (suffixes, rows, targets), to one score per label.
+            (suffixes, rows, targets) with all rows read and
+            (suffixes, targets) otherwise, to one score per label;
+            None under ``trie_decode``, which decodes as it reads.
         chains: Under ``trie_tree``, the chains the one suffix packs.
+        rounds: Under ``trie_decode``, the rounds a document may need;
+            each round offers every node's chain and a document sends
+            the chain of the node it has decoded so far.
     """
 
     frame: list
     suffixes: list
     targets: list
-    score: Callable[[np.ndarray], np.ndarray]
+    read_all_rows: bool
+    score: Callable[[np.ndarray], np.ndarray] | None
     chains: list | None = None
+    rounds: int = 0
 
 
 def label_requests(spec, targets=None) -> LabelRequests:
@@ -86,13 +102,18 @@ def label_requests(spec, targets=None) -> LabelRequests:
         tokens = [cue if node == () else node[-1]
                   for nodes, _, _ in chains for node in nodes]
         return LabelRequests(
-            frame, [tokens], targets,
+            frame, [tokens], targets, True,
             lambda logprobs: tree_scores(ids, chains, targets, logprobs[0]),
             chains=chains)
     if spec.scoring == "letters":
         return LabelRequests(
-            frame, [[cue]], targets,
+            frame, [[cue]], targets, True,
             lambda logprobs: letter_scores(ids, targets, logprobs[0, 0]))
+    if spec.scoring == "trie_decode":
+        nodes = sorted(label_trie(ids), key=lambda prefix: (len(prefix), prefix))
+        return LabelRequests(
+            frame, [[cue, *node] for node in nodes], targets, False, None,
+            rounds=max(len(label) for label in ids))
     raise ValueError(f"unknown label scoring rule {spec.scoring!r}")
 
 
@@ -142,8 +163,9 @@ def _label_readout(state, targets, rows: int, normalize: bool):
 class ClassifyStages:
     """The stages one classification asks of each document, and its labels.
 
-    One stage per classification of the chain; a later
-    classification's stage gates on the label before it. The stages
+    One stage per classification of the chain, or one per trie depth
+    under ``trie_decode``; a later classification's first stage gates
+    on the label before it. The stages
     read the label readout kept on the state, rebuilt when the targets
     or rows change. A classification of joined rows has one stage: it
     sends each anchor, for every partner the join kept with it, the
@@ -178,8 +200,13 @@ class ClassifyStages:
                           for ids in stage.label_token_ids for token in ids})
         self.requests = requests = [label_requests(stage, targets)
                                     for stage in specs]
-        self.readout_rows = readout_rows = max(
-            len(suffix) for request in requests for suffix in request.suffixes)
+        read_all = requests[0].read_all_rows
+        if any(request.read_all_rows != read_all for request in requests):
+            raise ValueError("a classify chain's stages read rows one way")
+        self.read_all = read_all
+        self.readout_rows = readout_rows = (
+            max(len(suffix) for request in requests
+                for suffix in request.suffixes) if read_all else 1)
         # a letters stage on a canvas model reads its canvas's rows
         answer_canvas = getattr(state.get("model_spec"), "answer_canvas", None)
         if spec.scoring == "letters" and answer_canvas is not None:
@@ -192,21 +219,49 @@ class ClassifyStages:
         self.readout = readout = _label_readout(state, targets, readout_rows,
                                                 not same_rows)
         self.labels = [np.full(count, None, dtype=object) for _ in specs]
+        self.decoders = {}
         self.stages = []
         for index, (stage_spec, request) in enumerate(zip(specs, requests)):
-            def whole(anchor, row, index=index):
-                self._set(index, anchor, self.label_of(index, row), on_label)
-                return True
+            if not request.rounds:
+                def whole(anchor, row, index=index):
+                    self._set(index, anchor, self.label_of(index, row),
+                              on_label)
+                    return True
 
-            self.stages.append(Stage(
-                suffixes=request.suffixes, readout=readout,
-                frame=request.frame, decide=whole,
-                requests=((lambda key, index=index: self.gate(index, key))
-                          if index else None),
-                read_all_rows=True, label=stage_spec.name,
-                chains=request.chains,
-                **(self._letter_canvas(state, index)
-                   if self.canvas_rows else {})))
+                self.stages.append(Stage(
+                    suffixes=request.suffixes, readout=readout,
+                    frame=request.frame, decide=whole,
+                    requests=((lambda key, index=index: self.gate(index, key))
+                              if index else None),
+                    read_all_rows=read_all, label=stage_spec.name,
+                    chains=request.chains,
+                    **(self._letter_canvas(state, index)
+                       if self.canvas_rows else {})))
+                continue
+            decoder = GreedyDecoder(stage_spec.label_token_ids, targets, count)
+            self.decoders[index] = decoder
+            for round in range(request.rounds):
+                def ask(key, index=index, round=round, decoder=decoder):
+                    if round == 0 and index and self.gate(index, key) is Stage.DROP:
+                        return Stage.DROP
+                    nodes = decoder.requests(self.index_of(key))
+                    # a resolved document has nothing left to read
+                    # and goes on to whatever follows the rounds
+                    return Stage.SKIP if nodes is None else nodes
+
+                def round_read(anchor, row, index=index, decoder=decoder,
+                               names=stage_spec.labels):
+                    decoder.update(anchor, np.asarray(row).reshape(-1))
+                    if decoder.label[anchor] >= 0:
+                        self._set(index, anchor,
+                                  names[decoder.label[anchor]], on_label)
+                    return True
+
+                self.stages.append(Stage(
+                    suffixes=request.suffixes, readout=readout,
+                    frame=request.frame, requests=ask, decide=round_read,
+                    read_all_rows=False,
+                    label=f"{stage_spec.name} round {round}"))
 
     def _joined_stages(self, state, spec, count, partners):
         """One stage over the anchors: each partner's block, the question, the cue."""
@@ -224,9 +279,11 @@ class ClassifyStages:
         self.requests = [request]
         self.readout_rows = 1
         self.readout = readout = _label_readout(state, targets, 1, False)
+        self.read_all = True
         self.partners = partners
         self.pair_labels = {}
         self.labels = [np.full(count, None, dtype=object)]
+        self.decoders = {}
         question = list(request.frame)
         (cue,) = request.suffixes[0]
         # suffix p is partner p's block and the cue; its last row is read
@@ -284,9 +341,10 @@ class ClassifyStages:
 
     def label_of(self, index, logprobs):
         """The label classification ``index`` gives from its read rows."""
-        # a one-row readout returns (suffixes, targets)
-        logprobs = logprobs.reshape(
-            len(self.requests[index].suffixes), self.readout_rows, -1)
+        if self.read_all:
+            # a one-row readout returns (suffixes, targets)
+            logprobs = logprobs.reshape(
+                len(self.requests[index].suffixes), self.readout_rows, -1)
         return self.specs[index].labels[
             best_label(self.requests[index].score(logprobs))]
 
@@ -316,20 +374,26 @@ class ClassifyStages:
             return label_tokens, streamed
         label_tokens = 0
         streamed = 0
+        position = 0
         for index, request in enumerate(self.requests):
-            first = answers[index]
-            for anchor, logprobs in first.items():
-                if self.labels[index][anchor] is None:
-                    self.labels[index][anchor] = self.label_of(index, logprobs)
-            # a letters stage on a canvas model streams its canvas too
-            suffix_tokens = len(first) * (sum(map(len, request.suffixes))
-                                          + self.canvas_rows)
+            first = answers[position]
+            if index in self.decoders:
+                suffix_tokens = self.decoders[index].tokens
+            else:
+                for anchor, logprobs in first.items():
+                    if self.labels[index][anchor] is None:
+                        self.labels[index][anchor] = self.label_of(
+                            index, logprobs)
+                # a letters stage on a canvas model streams its canvas too
+                suffix_tokens = len(first) * (sum(map(len, request.suffixes))
+                                              + self.canvas_rows)
             label_tokens += suffix_tokens
             # a frame equal to the stage before's is already in KV
             written = (index == 0
                        or request.frame != self.requests[index - 1].frame)
             streamed += suffix_tokens + (len(first) * len(request.frame)
                                          if written else 0)
+            position += max(1, request.rounds)
         return label_tokens, streamed
 
     def later(self) -> dict:
