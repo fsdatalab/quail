@@ -1,18 +1,20 @@
-"""Decode DiffusionGemma's own AGENT-4 outcome answers with vLLM.
+"""Decode DiffusionGemma's own AGENT-4 answers with vLLM.
 
-The prompt is the one Quail scores: the outcome classification's
-prompt head, the trace, and its tail with the category list and the
-answer cue, in DiffusionGemma's chat turn. vLLM decodes the answer on
-a 16-row canvas with its default denoising steps; the answer text is
-matched to a label as the stock vLLM baseline matches it.
+The prompt is the one Quail scores: the classification's prompt head,
+the trace, and its tail with the category list and the answer cue, in
+DiffusionGemma's chat turn. vLLM decodes the answer on a 16-row canvas
+with its default denoising steps; the answer text is matched to a
+label as the stock vLLM baseline matches it.
 
     uv run modal run --detach -m experiments.cells.diffusion_decode_check \
         --prediction "State the expected result before starting." \
+        --classification outcome \
         2>&1 | tee <scratchpad>/diffusion-decode-check.log
 
-Writes /results/ablations/diffusion-gemma-agent4-decode.parquet, one
-row per trace (id, decoded text, matched label or null), and a JSON
-summary beside it.
+Writes /results/ablations/diffusion-gemma-agent4-<classification>.parquet
+(the outcome file keeps its earlier name, diffusion-gemma-agent4-decode),
+one row per trace (id, decoded text, matched label or null), and a
+JSON summary beside it.
 """
 
 from __future__ import annotations
@@ -37,15 +39,20 @@ volumes = {
 }
 
 OUT_DIR = Path("/results/ablations")
-ROWS_PATH = OUT_DIR / "diffusion-gemma-agent4-decode.parquet"
-SUMMARY_PATH = OUT_DIR / "diffusion-gemma-agent4-decode.json"
 CANVAS_ROWS = 16
+
+
+def output_paths(classification: str) -> tuple[Path, Path]:
+    """The rows and summary files for one classification's decode."""
+    stem = ("diffusion-gemma-agent4-decode" if classification == "outcome"
+            else f"diffusion-gemma-agent4-{classification}")
+    return OUT_DIR / f"{stem}.parquet", OUT_DIR / f"{stem}.json"
 # under vLLM's 128-sequence setting that caps a diffusion model at 8
 MAX_SEQUENCES = 127
 
 
-def outcome_prompt(limit: int):
-    """The outcome classification's labels and the first traces' prompt ids."""
+def classification_prompt(limit: int, classification: str):
+    """The classification's labels and the first traces' prompt ids."""
     import quail
     from quail import EngineConfig
     from quail.bench.quailb import _build
@@ -61,21 +68,22 @@ def outcome_prompt(limit: int):
     session.register("agent_traces",
                      quail.DocumentProvider.from_table(table, id_col="id"))
     plan = _build(session, read_plan(get_query("AGENT-4").plan)).plan()
-    outcome = next(node for node in plan.nodes
-                   if isinstance(node, AiClassify)).spec
-    head, tail = outcome.prompt_token_parts
+    spec = next(node.spec for node in plan.nodes
+                if isinstance(node, AiClassify)
+                and node.spec.name == classification)
+    head, tail = spec.prompt_token_parts
     encode = session.tokenizer
     ids = table.column("id").to_pylist()[:limit]
     traces = table.column("trace").to_pylist()[:limit]
     prompts = [list(head) + encode(trace) + list(tail) for trace in traces]
     session.close()
-    return outcome.labels, ids, prompts
+    return spec.labels, ids, prompts
 
 
 @app.function(image=image, gpu="H100!", memory=98304, timeout=2 * 3600,
               volumes=volumes)
-def decode(limit: int, prediction: str) -> dict:
-    """Decode the first ``limit`` traces' outcome answers and save them."""
+def decode(limit: int, prediction: str, classification: str) -> dict:
+    """Decode the first ``limit`` traces' answers and save them."""
     import pyarrow as pa
     import pyarrow.parquet as pq
     from vllm import LLM, SamplingParams
@@ -83,7 +91,8 @@ def decode(limit: int, prediction: str) -> dict:
     from quail.backends.request import match_label
     from quail.specs import DIFFUSION_GEMMA_26B_FP8
 
-    labels, ids, prompts = outcome_prompt(limit)
+    labels, ids, prompts = classification_prompt(limit, classification)
+    rows_path, summary_path = output_paths(classification)
     started = time.perf_counter()
     llm = LLM(model=DIFFUSION_GEMMA_26B_FP8.hf_name,
               diffusion_config={"canvas_length": CANVAS_ROWS},
@@ -102,12 +111,13 @@ def decode(limit: int, prediction: str) -> dict:
         "id": pa.array([str(i) for i in ids]),
         "text": pa.array(texts),
         "label": pa.array(matched, pa.string()),
-    }), ROWS_PATH)
+    }), rows_path)
     counts = {}
     for label in matched:
         counts[str(label)] = counts.get(str(label), 0) + 1
     summary = {
         "prediction": prediction,
+        "classification": classification,
         "model": DIFFUSION_GEMMA_26B_FP8.hf_name,
         "canvas_rows": CANVAS_ROWS,
         "traces": len(ids),
@@ -116,19 +126,20 @@ def decode(limit: int, prediction: str) -> dict:
         "prompt_tokens_mean": sum(map(len, prompts)) / max(1, len(prompts)),
         "boot_s": round(boot_s, 1),
         "decode_s": round(decode_s, 1),
-        "rows": str(ROWS_PATH),
+        "rows": str(rows_path),
     }
-    SUMMARY_PATH.write_text(json.dumps(summary, indent=2))
+    summary_path.write_text(json.dumps(summary, indent=2))
     results_vol.commit()
     print(json.dumps(summary, indent=2), flush=True)
     return summary
 
 
 @app.local_entrypoint()
-def main(prediction: str = "", limit: int = 500):
+def main(prediction: str = "", limit: int = 500,
+         classification: str = "outcome"):
     """Spawn the decode and print its function call id."""
     if not prediction:
         raise SystemExit("state the prediction with --prediction")
-    call = decode.spawn(limit, prediction)
+    call = decode.spawn(limit, prediction, classification)
     print(f"function call id: {call.object_id}", flush=True)
-    print(f"rows: {ROWS_PATH}", flush=True)
+    print(f"rows: {output_paths(classification)[0]}", flush=True)
