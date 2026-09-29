@@ -201,6 +201,21 @@ class Simulated:
     label_tokens: float
     rounds: int
 
+    def scaled(self, factor: float) -> "Simulated":
+        """The simulation of ``factor`` times as many documents alike."""
+        if factor == 1:
+            return self
+        return Simulated(self.seconds * factor,
+                         int(math.ceil(self.passes * factor)),
+                         self.work * factor, self.label_tokens * factor,
+                         self.rounds)
+
+
+# The documents a replay prices: past this many, an even sample over
+# the lengths is replayed and scaled, which moves the estimate of
+# AGENT-4 at sf 1.0 (17,711 traces) by under 0.3%
+SAMPLE_DOCUMENTS = 1000
+
 
 def simulate(prefixes, frame: int, chains, chunk: int, capacity: int,
              model, device, resident: bool = False, canvas_rows: int = 0,
@@ -380,23 +395,25 @@ class _Table:
     # packed trie needs: an fp8 model with the plan not forced unified
     tree: bool = False
 
-    def sample(self, live: float) -> list[tuple[int, int]]:
-        """The documents expected to reach a classification.
+    def sample(self, live: float) -> tuple[list[tuple[int, int]], float]:
+        """A sample of the documents expected to reach a classification.
 
-        Takes ``live`` documents spread evenly over the documents sorted
-        by length, so the sample keeps the table's length distribution.
+        Takes ``live`` documents, at most SAMPLE_DOCUMENTS, spread evenly
+        over the documents sorted by length, so the sample keeps the
+        table's length distribution.
 
         Returns:
             Per sampled document, its length and its shared prefix
-            tokens.
+            tokens; and how many expected documents each stands for.
         """
         shared = self.shared or (0,) * len(self.lengths)
         ordered = sorted(zip(self.lengths, shared))
-        count = min(len(ordered), max(1, int(round(live))))
         if not ordered:
-            return []
+            return [], 1.0
+        expected = max(1, int(round(live)))
+        count = min(len(ordered), expected, SAMPLE_DOCUMENTS)
         picks = np.linspace(0, len(ordered) - 1, count).round().astype(int)
-        return [ordered[i] for i in picks]
+        return [ordered[i] for i in picks], max(1.0, expected / count)
 
     def head(self, call) -> tuple:
         """The prompt tokens before the document."""
@@ -465,7 +482,7 @@ class _Table:
                  resident) -> Simulated:
         """Replay one rule over the documents expected and price it."""
         chains = suffix_lengths(scoring, labels, self.canvas_rows)
-        documents = self.sample(live)
+        documents, weight = self.sample(live)
         prefixes = [head_tokens + length for length, _ in documents]
         # a borrowed prefix includes the prompt head the documents share
         shared = [head_tokens + tokens if tokens else 0
@@ -477,7 +494,7 @@ class _Table:
                                      if scoring == LETTERS_SCORING
                                      else self.model.canvas_tokens),
                         one_per_round=scoring == DECODE_SCORING,
-                        shared=shared)
+                        shared=shared).scaled(weight)
 
     def reestimate(self, spec: ClassifySpec) -> ClassifySpec:
         """The spec with its seconds simulated again on this table.
@@ -596,12 +613,12 @@ class _Table:
         block = len(partner_label) + int(round(partner_tokens)) + len(tail) - 1
         chains = [block + length
                   for length in suffix_lengths(LETTERS_SCORING, labels)]
-        documents = self.sample(pairs)
+        documents, weight = self.sample(pairs)
         simulated = simulate(
             [len(head) + length for length, _ in documents], len(note),
             [chains] * len(documents), self.chunk,
             self.capacity or self.budget, self.model, self.device,
-            resident=True, canvas_rows=self.model.canvas_tokens)
+            resident=True, canvas_rows=self.model.canvas_tokens).scaled(weight)
         need = len(head) + self.longest + len(note) + max(chains)
         if need > self.budget:
             raise ClassifyRefusedError(
