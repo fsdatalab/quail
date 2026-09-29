@@ -51,6 +51,10 @@ class Stage:
             takes any true answer.
         read_all_rows: Whether every row of a suffix feeds the readout,
             not only its last.
+        read_rows: Per suffix, how many of its last rows feed the
+            readout; None reads by ``read_all_rows``. A pair
+            classification's suffixes carry a partner document before
+            the label path and read the path's rows only.
         single: The stage sends its one suffix to every document, as a
             filter does: the frame and the suffix pack as one entry
             written straight into the document's pages, and under tree
@@ -80,6 +84,7 @@ class Stage:
     requests: Callable | None = None
     decide: Callable | None = None
     read_all_rows: bool = False
+    read_rows: Any = None
     single: bool = False
     label: str = ""
     chains: list | None = None
@@ -208,6 +213,9 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
     frame_ids = [np.asarray(frame, dtype=np.int64) for frame in frames]
     writes = frame_writes(stages)
     suffixes = [Suffixes.of(stage.suffixes) for stage in stages]
+    read_rows = [None if stage.read_rows is None
+                 else np.asarray(stage.read_rows, dtype=np.int64)
+                 for stage in stages]
     # a stage's suffixes read their document: tree unless the plan says;
     # a stage packing chains needs the tree path whatever the plan said
     if any(stage.chains is not None for stage in stages):
@@ -353,6 +361,9 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
             read_all = stages[j].read_all_rows
             rows = int(sufs.lengths.sum()) if read_all else len(sufs)
             own = {}
+            if read_rows[j] is not None:
+                own["read_rows"] = read_rows[j][np.asarray(list(indices))]
+                rows = int(own["read_rows"].sum())
             if stages[j].canvas is not None:
                 ids, row = stages[j].canvas(a)
                 own = dict(canvas=ids, conditioning=row)
@@ -415,12 +426,24 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
 
     shared_readout = all(stage.readout is stages[0].readout
                          for stage in stages)
+    # stages sharing a readout submit together: a chunk holds documents
+    # at many stages (every denoising step is one), and one submit per
+    # stage costs a row selection each
+    groups_of = {}
+    group_key = {}
+    for j, stage in enumerate(stages):
+        group_key[j] = (None if shared_readout else groups_of.setdefault(
+            (id(stage.readout), stage.read_all_rows), len(groups_of)))
+    readout_of = {group_key[j]: stages[j].readout for j in range(len(stages))}
+    read_all_of = {group_key[j]: stages[j].read_all_rows
+                   for j in range(len(stages))}
 
     def select_rows(normed, spans_j):
-        index = [r for start, end in spans_j for r in range(start, end)]
+        index = np.concatenate([np.arange(start, end, dtype=np.int64)
+                                for start, end in spans_j])
         if hasattr(normed, "index_select"):
             return normed.index_select(
-                0, torch.tensor(index, device=normed.device))
+                0, torch.from_numpy(index).to(normed.device, non_blocking=True))
         return [normed[r] for r in index]
 
     def answer_stages(part):
@@ -435,17 +458,21 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
     def canvas_conditioning(chunk, spans):
         """The conditioning rows of the canvases at the chunk's canvas spans."""
         meta = chunk.meta["canvas"]
-        cu_q = meta["cu_q"]
-        return torch.cat([meta["conditioning_rows"][int(cu_q[k0]):int(cu_q[k1])]
-                          for k0, k1 in spans])
+        cu_q = meta["cu_q_host"]
+        index = np.concatenate([np.arange(cu_q[k0], cu_q[k1], dtype=np.int64)
+                                for k0, k1 in spans])
+        rows = meta["conditioning_rows"]
+        return rows.index_select(
+            0, torch.from_numpy(index).to(rows.device, non_blocking=True))
 
     def submit(normed, entries, chunk, part):
-        """Hand each stage's answer rows to its readout; returns handles.
+        """Hand each readout its answer rows; returns handles by readout group.
 
         With one readout for every stage the whole chunk goes in one
-        call, keyed None; otherwise each stage's rows go to its own. A
-        readout with ``reads_chunk`` (a denoising step's) takes its
-        canvases' rows with each one's step and conditioning rows.
+        call, keyed None; otherwise each readout's stages' rows go to
+        it in one call, selected with one index. A readout with
+        ``reads_chunk`` (a denoising step's) takes its canvases' rows
+        with each one's step and conditioning rows.
         """
         rows_per_answer = chunk.rows_per_answer
         if shared_readout:
@@ -456,54 +483,55 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                     conditioning_rows=chunk.meta["canvas"]["conditioning_rows"])}
             return {None: (readout.submit(normed, rows_per_answer=rows_per_answer)
                            if rows_per_answer else readout.submit(normed))}
-        by_stage = {}
-        canvases = {}       # stage -> its entries' spans of chunk canvases
+        spans = {}          # group -> its entries' row spans, in chunk order
+        canvases = {}       # group -> its entries' spans of chunk canvases
+        steps = {}          # group -> each canvas's step
         row = 0
         seen = 0
         for j, rows in entries:
-            by_stage.setdefault(j, []).append((row, row + rows))
+            key = group_key[j]
+            spans.setdefault(key, []).append((row, row + rows))
             row += rows
             # every suffix on a canvas model packs one canvas
             count = (rows // canvas_rows[j]
                      if stages[j].read_all_rows and canvas_rows[j] else rows)
-            canvases.setdefault(j, []).append((seen, seen + count))
+            canvases.setdefault(key, []).append((seen, seen + count))
+            steps.setdefault(key, []).extend([stages[j].step] * count)
             seen += count
         handles = {}
         per_answer = list(rows_per_answer) if rows_per_answer else None
-        for j, spans_j in by_stage.items():
-            part = select_rows(normed, spans_j)
-            readout = stages[j].readout
+        for key, spans_key in spans.items():
+            readout = readout_of[key]
+            selected = select_rows(normed, spans_key)
             if getattr(readout, "reads_chunk", False):
-                spans = canvases[j]
-                handles[j] = readout.submit(
-                    part, steps=[stages[j].step] * sum(k1 - k0 for k0, k1 in spans),
-                    conditioning_rows=canvas_conditioning(chunk, spans))
+                handles[key] = readout.submit(
+                    selected, steps=steps[key],
+                    conditioning_rows=canvas_conditioning(chunk, canvases[key]))
             # a stage reading one row per answer takes no row counts
-            elif per_answer is None or not stages[j].read_all_rows:
-                handles[j] = readout.submit(part)
+            elif per_answer is None or not read_all_of[key]:
+                handles[key] = readout.submit(selected)
             else:
-                # answers of this stage, in entry order
+                # answers of this readout's stages, in entry order
                 counts = []
                 answer = 0
                 for jj, rows in entries:
                     taken = 0
                     while taken < rows:
                         taken += per_answer[answer]
-                        if jj == j:
+                        if group_key[jj] == key:
                             counts.append(per_answer[answer])
                         answer += 1
-                handles[j] = readout.submit(part, rows_per_answer=counts)
+                handles[key] = readout.submit(selected, rows_per_answer=counts)
         return handles
 
     def report(entry):
         groups, entries, handles = entry
-        values = {j: (stages[0].readout if j is None
-                      else stages[j].readout).result(handle)
-                  for j, handle in handles.items()}
-        pos = {j: 0 for j in handles}
+        values = {key: readout_of[key].result(handle)
+                  for key, handle in handles.items()}
+        pos = {key: 0 for key in handles}
         transitions = []
         for a, j, start, end, _ in groups:
-            key = None if shared_readout else j
+            key = group_key[j]
             if writes[j] and start == 0 and not merged(j, start, end):
                 pos[key] += 1        # the frame entry's answer means nothing
             cnt = end - start

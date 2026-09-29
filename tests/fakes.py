@@ -10,6 +10,7 @@ from contextlib import nullcontext
 from itertools import takewhile
 from types import SimpleNamespace
 
+import numpy as np
 import pyarrow as pa
 
 import quail
@@ -165,8 +166,10 @@ def fake_pack(torch, arena, specs, **kw):
         return len(kw.get("canvas") or ()) if own is None else len(own)
 
     rows_per_answer = tuple(
-        (canvas_rows(spec) or len(suffix)) if spec.get("read_all_rows") else 1
-        for spec in specs for suffix in spec["suffixes"])
+        int(spec["read_rows"][index]) if spec.get("read_rows") is not None
+        else (canvas_rows(spec) or len(suffix)) if spec.get("read_all_rows")
+        else 1
+        for spec in specs for index, suffix in enumerate(spec["suffixes"]))
     if all(rows == 1 for rows in rows_per_answer):
         rows_per_answer = ()
     meta = {}
@@ -184,7 +187,7 @@ def fake_pack(torch, arena, specs, **kw):
         meta["canvas"] = dict(
             conditioning_rows=index,
             conditioning=kw["conditioning"].index_select(0, index[named]),
-            cu_q=real.tensor([0] + list(real.cumsum(real.tensor(widths), 0))))
+            cu_q_host=np.concatenate([[0], np.cumsum(widths)]))
         if not bool(named.all()):
             meta["canvas"]["conditioned"] = named
     return SimpleNamespace(specs=specs, tokens=tokens, temporary_keys=(),

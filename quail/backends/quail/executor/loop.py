@@ -301,6 +301,8 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 is one causal segment, [prefix | suffix], whose rows
                 write the key's pages without reading them back: the
                 computation an unpaged filter does.
+      read_rows Per suffix, how many of its last rows are read; a
+                group without it reads by read_all_rows.
       canvas    The group's own canvas token ids, packed after each of
                 its suffixes in place of the chunk's canvas.
       conditioning  The first of the group's canvas rows in the
@@ -461,6 +463,20 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             else:
                 finals.append(first + answer_row)
                 rows_per_answer.append(np.ones(n, dtype=np.int64))
+        elif n and g.get("read_rows") is not None:
+            # the last read_rows rows of each suffix carry the answers
+            id_parts.append(sufs.ids)
+            counts = np.asarray(g["read_rows"], dtype=np.int64)
+            if len(counts) != n or (counts > sufs.lengths).any():
+                raise ValueError(
+                    f"group {key!r}: read_rows must give each suffix at most "
+                    f"its length")
+            finals.append(np.repeat(s_row0 + ends, counts)
+                          - np.repeat(counts, counts)
+                          + (np.arange(int(counts.sum()), dtype=np.int64)
+                             - np.repeat(np.cumsum(counts) - counts, counts)))
+            rows_per_answer.append(counts)
+            multi_row = True
         elif n:
             id_parts.append(sufs.ids)
             if read_all:
@@ -717,6 +733,8 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                        - np.repeat(cum - widths, widths), torch.int64),
             cu_q=stage("canvas_cu_q", np.concatenate([[0], cum]),
                        torch.int32),
+            # the readouts slice canvases by their row offsets on the host
+            cu_q_host=np.concatenate([[0], cum]),
             max_q=int(widths.max()))
         index = np.concatenate(conditioning_rows)
         if (index >= 0).any():
