@@ -42,8 +42,13 @@ DATA_DIR = "/results/quailb_data"
 
 
 @app.function(image=image, timeout=1200, volumes=VOLUMES)
-def ensure_data(sf: float, query_ids: list[str], collection_id: str):
-    """Write the queries' tables to the volume and resolve the label collection."""
+def ensure_data(sf: float, query_ids: list[str], collection_id: str,
+                label_root: str = ""):
+    """Write the queries' tables to the volume and resolve the label collection.
+
+    label_root names a local mirror of the published labels, such as
+    the results volume, for a collection not yet in the public bucket.
+    """
     import pyarrow.parquet as pq
 
     import quail_b as benchmark
@@ -61,7 +66,7 @@ def ensure_data(sf: float, query_ids: list[str], collection_id: str):
             pq.write_table(benchmark.load_table(name, scale_factor=sf), path)
     suite = benchmark.load_benchmark(
         query_ids, scale_factor=sf, data_dir=directory,
-        collection_id=collection_id or None)
+        collection_id=collection_id or None, root=label_root or None)
     results_vol.commit()
     return suite.ground_truth.collection_id
 
@@ -148,13 +153,15 @@ def run_query_family(
     label_scoring: str = "",
     attention: str = "",
     gpu_timing: bool = False,
+    label_root: str = "",
 ) -> str:
     """Run one query family through Quail and the vLLM baselines.
 
     baselines names the vLLM baseline methods that run when
     include_baselines is set. label_scoring forces one AI.CLASSIFY
     label scoring rule and attention one attention path for filters
-    and joins; empty lets the planner choose.
+    and joins; empty lets the planner choose. label_root names a
+    local mirror of the published labels.
     """
     process_groups = [("quail",)] if include_quail else []
     if include_baselines:
@@ -164,6 +171,7 @@ def run_query_family(
     try:
         return _run_family(process_groups, result_name, model, sf, query_ids_csv,
                            run_dir, ground_truth_collection,
+                           root=label_root or None,
                            label_scoring=label_scoring or None,
                            attention=attention or None,
                            gpu_timing=gpu_timing)
@@ -268,6 +276,7 @@ def run_all(
     label_scoring: str = "",
     attention: str = "",
     gpu_timing: bool = False,
+    label_root: str = "",
 ):
     from quail_b import select_queries
 
@@ -296,7 +305,8 @@ def run_all(
     results_vol.commit()
 
     try:
-        data_call = ensure_data.spawn(sf, query_ids, ground_truth_collection)
+        data_call = ensure_data.spawn(sf, query_ids, ground_truth_collection,
+                                      label_root)
         manifest["function_call_ids"]["data"] = data_call.object_id
         print(f"function call id: {data_call.object_id} (data)", flush=True)
         ground_truth_collection = data_call.get()
@@ -321,6 +331,7 @@ def run_all(
                     label_scoring=label_scoring,
                     attention=attention,
                     gpu_timing=gpu_timing,
+                    label_root=label_root,
                 )
                 family_calls.append((group, family_call))
                 call_ids[f"{group}:quail_vllm"] = family_call.object_id
@@ -479,6 +490,7 @@ def main(
     label_scoring: str = "",
     attention: str = "",
     gpu_timing: bool = False,
+    label_root: str = "",
     finish: str = "",
 ):
     if finish:
@@ -507,6 +519,7 @@ def main(
         label_scoring=label_scoring,
         attention=attention,
         gpu_timing=gpu_timing,
+        label_root=label_root,
     )
     print(f"function call id: {call.object_id} (all families)", flush=True)
     print(call.get(), flush=True)
