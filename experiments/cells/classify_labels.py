@@ -33,7 +33,8 @@ from pathlib import Path
 import modal
 
 from quail.bench import labeling as labels
-from quail_b.data import PUBLISHED_CORPORA
+from quail_b import prompts
+from quail_b.data import GROUND_TRUTH_ROOT, PUBLISHED_CORPORA
 from quail_b.predicates import (
     CLASSIFY_PREDICATES,
     MAX_MODEL_LEN,
@@ -52,6 +53,9 @@ from quail_b.rendering import LABEL_PREFIX
 
 app = labels.app
 SPECS = CLASSIFY_PREDICATES
+# a classification of pairs labels the pairs its join keeps: the
+# predicate key -> the join's prompt template
+PAIR_JOINS = {"quailb.imdb.review.aspect_sentiment": prompts.DISCUSS_ASPECT}
 ROWS_PER_PART = 256
 # vLLM refuses more requested token ids than this per request
 MAX_LOGPROB_TOKEN_IDS = 128
@@ -68,6 +72,7 @@ SHARDS = {
     "quailb.lepard.excerpt.area_of_law": 1,
     "quailb.agent.trace.outcome": 8,
     "quailb.agent.trace.failure_mode": 8,
+    "quailb.imdb.review.aspect_sentiment": 4,
 }
 # the published collections the new collections extend
 SOURCES = {
@@ -149,20 +154,55 @@ def classify_identity(spec: PredicateSpec, corpus: dict) -> dict:
 
 
 def corpus_rows(sf: float, spec: PredicateSpec) -> tuple[dict, list[dict]]:
-    """Read one saved corpus's manifest and the predicate's table rows."""
+    """Read one saved corpus's manifest and the predicate's rows.
+
+    A one-document predicate's rows are its table's rows. A pair
+    classification's rows are the pairs its join's reference labels
+    answer TRUE, each with both documents, in (left id, right id) order.
+    """
     import pyarrow.parquet as pq
 
     directory = labels.ROOT / "corpora" / PUBLISHED_CORPORA[sf]
     manifest = json.loads((directory / "manifest.json").read_text())
     table = pq.read_table(directory / f"{spec.left_table}.parquet",
                           columns=["id", spec.left_column])
-    return manifest, table.to_pylist()
+    if spec.right_table is None:
+        return manifest, table.to_pylist()
+    from quail_b.labels import load_ground_truth
+
+    root = str(labels.ROOT)[:-len(GROUND_TRUTH_ROOT) - 1]
+    truth = load_ground_truth(
+        root, scale_factor=sf, corpus_id=PUBLISHED_CORPORA[sf],
+        collection_id=SOURCES[sf], templates=[PAIR_JOINS[spec.key]])
+    pairs = truth.predicates[
+        truth.key_for_template(PAIR_JOINS[spec.key])].true_pairs
+    right = pq.read_table(directory / f"{spec.right_table}.parquet",
+                          columns=["id", spec.right_column])
+    left_text = dict(zip(table["id"].to_pylist(),
+                         table[spec.left_column].to_pylist()))
+    right_text = dict(zip(right["id"].to_pylist(),
+                          right[spec.right_column].to_pylist()))
+    rows = sorted(zip(pairs["left_id"].to_pylist(),
+                      pairs["right_id"].to_pylist()))
+    return manifest, [
+        {"id": left, "right_id": right_id,
+         spec.left_column: left_text[left],
+         spec.right_column: right_text[right_id]}
+        for left, right_id in rows]
 
 
 def _label_row(spec, identity, corpus_id, row, label, scores) -> dict:
     operand = labels._operand(spec.left_role, spec.left_table, row,
                               spec.left_column)
-    example_id, example_full = example_identity(corpus_id, [operand])
+    operands = [operand]
+    partner = None
+    if spec.right_table is not None:
+        partner = labels._operand(spec.right_role, spec.right_table,
+                                  {"id": row["right_id"],
+                                   spec.right_column: row[spec.right_column]},
+                                  spec.right_column)
+        operands.append(partner)
+    example_id, example_full = example_identity(corpus_id, operands)
     return {
         "judgment_id": judgment_identity(identity["label_set_id"],
                                            example_full),
@@ -178,10 +218,11 @@ def _label_row(spec, identity, corpus_id, row, label, scores) -> dict:
         "left_table": spec.left_table,
         "left_id": str(row["id"]),
         "left_content_sha256": operand["content_sha256"],
-        "right_role": None,
-        "right_table": None,
-        "right_id": None,
-        "right_content_sha256": None,
+        "right_role": spec.right_role,
+        "right_table": spec.right_table,
+        "right_id": None if partner is None else partner["row_id"],
+        "right_content_sha256": (None if partner is None
+                                 else partner["content_sha256"]),
     }
 
 
@@ -264,15 +305,25 @@ class VLLMJudge:
                           for token in trie[prefix]})
         return found
 
-    def label(self, spec: PredicateSpec, documents: list[str]
+    def label(self, spec: PredicateSpec, documents: list[str],
+              partners: list[str] | None = None
               ) -> list[tuple[str, list[float]]]:
-        """Return each document's label and every label's score."""
+        """Return each document's label and every label's score.
+
+        Args:
+            spec: The classification predicate.
+            documents: The documents, or a pair classification's anchors.
+            partners: A pair classification's partner documents, one
+                per anchor.
+        """
         label_ids = self.label_ids(spec)
         trie = label_trie(label_ids)
         if max(map(len, trie.values())) > MAX_LOGPROB_TOKEN_IDS:
             raise ValueError(f"{spec.key} has too many labels after a prefix")
-        contexts = [self.encode(render_classify_prompt(spec, document))
-                    for document in documents]
+        if partners is None:
+            partners = [None] * len(documents)
+        contexts = [self.encode(render_classify_prompt(spec, document, partner))
+                    for document, partner in zip(documents, partners)]
         longest = max(map(len, label_ids))
         if max(map(len, contexts)) + longest > MAX_MODEL_LEN:
             raise ValueError(f"{spec.key}: a prompt exceeds the context")
@@ -480,7 +531,10 @@ def judge_shard(key: str, start: int, end: int) -> dict:
             skipped += 1
             continue
         part = rows[part_start:part_end]
-        labeled = judge.label(spec, [row[spec.left_column] for row in part])
+        labeled = judge.label(
+            spec, [row[spec.left_column] for row in part],
+            None if spec.right_table is None
+            else [row[spec.right_column] for row in part])
         write_part(path, [
             _label_row(spec, identity, manifest["corpus_id"], row, label,
                        scores)
@@ -504,10 +558,20 @@ def judge_shard(key: str, start: int, end: int) -> dict:
 
 def complete_manifest(spec: PredicateSpec, identity: dict,
                       rows: int) -> dict:
-    """Compact one label set's parts and write its manifest."""
+    """Compact one label set's parts and write its manifest.
+
+    A label set whose manifest is already complete is returned as is,
+    so a later pass over a new predicate leaves the published ones
+    untouched.
+    """
     import pyarrow.parquet as pq
 
     label_dir = labels._label_dir(spec, identity)
+    manifest_path = label_dir / "manifest.json"
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text())
+        if manifest.get("status") == "complete" and manifest["rows"] == rows:
+            return manifest
     parts = [labels._part_path(spec, identity, start, end)
              for start, end in part_bounds(rows)]
     compact_path, compact_rows = labels._compact_label_parts(label_dir, parts)
@@ -540,18 +604,30 @@ def copy_labels(sf: float, spec: PredicateSpec, source: dict) -> dict:
     manifest, rows = corpus_rows(sf, spec)
     identity = classify_identity(spec, manifest)
     table = pq.read_table(source["compact_path"], columns=[
-        "left_content_sha256", "label", "label_scores"])
-    by_content = dict(zip(table["left_content_sha256"].to_pylist(),
-                          zip(table["label"].to_pylist(),
-                              table["label_scores"].to_pylist())))
+        "left_content_sha256", "right_content_sha256", "label",
+        "label_scores"])
+    # a pair is keyed by both documents' content
+    by_content = dict(zip(
+        zip(table["left_content_sha256"].to_pylist(),
+            table["right_content_sha256"].to_pylist()),
+        zip(table["label"].to_pylist(), table["label_scores"].to_pylist())))
+
+    def key_of(row):
+        return (labels._content_hash(row, spec.left_column),
+                None if spec.right_table is None
+                else labels._content_hash(row, spec.right_column))
+
+    manifest_path = labels._label_dir(spec, identity) / "manifest.json"
+    if manifest_path.exists() and json.loads(
+            manifest_path.read_text()).get("status") == "complete":
+        return complete_manifest(spec, identity, len(rows))
     for start, end in part_bounds(len(rows)):
         path = labels._part_path(spec, identity, start, end)
         if path.exists():
             continue
         output = []
         for row in rows[start:end]:
-            label, scores = by_content[
-                labels._content_hash(row, spec.left_column)]
+            label, scores = by_content[key_of(row)]
             output.append(_label_row(spec, identity, manifest["corpus_id"],
                                      row, label, scores))
         write_part(path, output)
@@ -565,7 +641,8 @@ def check_collection(sf: float, collection_id: str) -> dict:
     from quail_b.scoring import expected_rows
 
     counts = {}
-    for query_id in (query_id for query_id, spec in queries().items()
+    for query_id in (query_id for query_id, spec
+                     in queries(include_pending=True).items()
                      if spec._info.classifies):
         suite = benchmark.load_benchmark(
             [query_id], scale_factor=sf, collection_id=collection_id,
@@ -644,15 +721,35 @@ def quail_check(run_dir: str, query_ids: str, sf: float = 0.1):
     print(f"[classify] saved {QUAIL_CHECK_PATH}", flush=True)
 
 
+@app.function(image=labels.publish_image, memory=32768, timeout=3600,
+              volumes={"/results": labels.results_vol})
+def count_rows(key: str) -> int:
+    """How many rows a predicate labels at sf=1.0."""
+    labels._mount()
+    _, rows = corpus_rows(1.0, PREDICATE_BY_KEY[key])
+    return len(rows)
+
+
 @app.local_entrypoint()
-def label():
-    """Label every shard, one container each, then build the collections."""
+def label(keys: str = ""):
+    """Label every shard, one container each, then build the collections.
+
+    Args:
+        keys: Comma-separated predicate keys to label; empty labels
+            every classification predicate. A part already on the
+            volume is skipped either way.
+    """
     print(PREDICTION_TEXT, flush=True)
     rows = {"reviews": 50_000, "terms": 4_144, "claims": 5_000,
             "citation_contexts": 4_972, "agent_traces": 17_711}
+    wanted = [spec for spec in SPECS
+              if not keys or spec.key in keys.split(",")]
     calls = []
-    for spec in SPECS:
-        for start, end in shard_bounds(rows[spec.left_table], SHARDS[spec.key]):
+    for spec in wanted:
+        count = (rows[spec.left_table] if spec.right_table is None
+                 else count_rows.remote(spec.key))
+        print(f"[classify] {spec.key}: {count} rows", flush=True)
+        for start, end in shard_bounds(count, SHARDS[spec.key]):
             call = judge_shard.spawn(spec.key, start, end)
             calls.append(call.object_id)
             print(f"[classify] {spec.key} [{start}, {end}): {call.object_id}",
