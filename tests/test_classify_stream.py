@@ -356,6 +356,8 @@ def test_a_decoded_classification_hands_its_documents_on_through_the_label_filte
     second = outputs[PortRef("classify2:r", "scores")]
     assert second.column("r").to_pylist() == accepted
     assert second.column("kind").to_pylist() == ["a"] * len(accepted)
+    # the first label rides along, so a projection can name it
+    assert second.column("topic").to_pylist() == ["a"] * len(accepted)
     # the first classification packed every document once; the second
     # packed only a frame and the label path per accepted document
     prefill = sum(len(docs["r"][d]) for d in range(n_docs))

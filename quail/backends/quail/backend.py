@@ -25,6 +25,7 @@ from quail.backends.quail.worker import execute_quail_request, prepare_quail_req
 from quail.execution.reranker import (
     RerankerModelExecution,
     _score_table,
+    attach_prior_columns,
     classify_outputs,
     filter_scores,
     scored_batch,
@@ -47,6 +48,7 @@ from quail.physical import (
     Foreign,
     LabelFilter,
     PhysicalNode,
+    ValueType,
 )
 from quail.planner import plan_quail
 from quail.planner.classify import has_label, plan_classify
@@ -220,7 +222,12 @@ class QuailModelExecution:
             position = {document: index for index, document in enumerate(ids)}
             plan = ClassifyStages(self._state, node.spec, len(ids),
                                   lambda key: position[key[1]])
-            return _ClassifyPart(node, ids, plan)
+            by_node = {part.node.node_id: part for part in parts}
+            priors = [(by_node[port.source.node_id], port.source.port)
+                      for port in node.inputs
+                      if port.value_type is ValueType.SCORES
+                      and port.source.node_id in by_node]
+            return _ClassifyPart(node, ids, plan, priors)
         if isinstance(node, LabelFilter):
             labeled = next(part for part in reversed(parts)
                            if isinstance(part, _ClassifyPart)
@@ -484,10 +491,11 @@ class _ClassifyPart:
     document_done = None
     result_value = None
 
-    def __init__(self, node, ids, plan: ClassifyStages):
+    def __init__(self, node, ids, plan: ClassifyStages, priors=()):
         self.node = node
         self.ids = ids
         self.plan = plan
+        self.priors = priors      # (part, port) of each label table read
         self.stages = plan.stages
         self.reached = 0
         self.label_tokens = 0
@@ -519,6 +527,11 @@ class _ClassifyPart:
             table = table.append_column(
                 name, pa.array([values[index] for index in labeled],
                                pa.string()))
+        # the labels the parts before it gave these documents, as a
+        # classify node on its own carries them from its scores input
+        table = attach_prior_columns(table, {
+            spec.aliases[0]: part.result_value.outputs[port]
+            for part, port in self.priors})
         sink = answer_sink()
         if sink is not None and len(rows):
             sink(scored_batch(self.node, rows, table))
