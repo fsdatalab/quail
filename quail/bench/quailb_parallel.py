@@ -421,7 +421,10 @@ def _finish_run(directory, manifest, family_calls, sglang_calls, query_ids,
         },
         summaries=paths,
     )
-    completed = reports["quail"]["queries"] if "quail" in reports else []
+    # several label scoring rules save one Quail suite per rule
+    completed = [item for name, report in reports.items()
+                 if name == "quail" or name.startswith("quail-")
+                 for item in report["queries"]]
     final = {
         "run_id": directory.name,
         "run_dir": str(directory),

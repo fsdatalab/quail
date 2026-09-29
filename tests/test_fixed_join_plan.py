@@ -360,3 +360,36 @@ def test_fev10_asks_the_model_about_same_page_pairs_only(monkeypatch):
             assert sorted(zip(answers.column("c").to_pylist(),
                               answers.column("e").to_pylist())) == [(0, 0), (1, 0)]
             assert result.collect().to_pylist() == [{"c.id": "c0", "e.id": "e0"}]
+
+
+def test_classification_moves_after_a_selective_join(monkeypatch):
+    with _session() as session:
+        topic = quail.prompt("What is {0} about?", quail.col("c.claim"))
+        claims = session.docs("claims").alias("c")
+        evidence = session.docs("evidence").alias("e")
+        # a join that almost nothing survives and a label filter that
+        # keeps almost everything: classifying the few matched claims
+        # after the join is cheaper than classifying every claim before
+        query = (claims
+                 .ai_classify(topic, ["science", "sport"], name="topic")
+                 .label_in("topic", ["science"], selectivity=0.99)
+                 .ai_join(evidence, quail.prompt(
+                     "Does {1} support {0}?", quail.col("c.claim"),
+                     quail.col("e.text")), selectivity=0.001)
+                 .select("c.id", "e.id", "topic"))
+        plan = query.plan()
+        assert plan.settings["classify_placement"] == "after joins"
+        names = [type(node).__name__ for node in plan.nodes]
+        assert names.index("AiJoin") < names.index("AiClassify") < names.index(
+            "LabelFilter") < names.index("Recombine")
+        execute = fever_executor(session, monkeypatch, 1, capacity=10)
+        result = execute_query(query, physical_executor=execute)
+        rows = result.collect().to_pylist()
+        # c0 and c2 are supported by e0 and labeled science; c1 is not
+        assert rows == [{"c.id": "c0", "e.id": "e0", "topic": "science"},
+                        {"c.id": "c2", "e.id": "e0", "topic": "science"}]
+        # the join matched every claim (c1 with e1 and e2), so every
+        # claim was classified after it and c1's sport rows fell out
+        labels = result.answer_tables["classifies"]["topic"]
+        assert labels.column("c").to_pylist() == [0, 1, 2]
+        assert labels.column("topic").to_pylist() == ["science", "sport", "science"]

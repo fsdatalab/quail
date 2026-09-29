@@ -193,7 +193,7 @@ class Simulated:
 
 def simulate(prefixes, frame: int, rounds, chunk: int, capacity: int,
              model, device, resident: bool = False,
-             read_all_rows: bool = True) -> Simulated:
+             read_all_rows: bool = True, canvas_rows: int = 0) -> Simulated:
     """Replay the stage scheduler on the CPU and price each chunk.
 
     Documents are admitted in order while their reservation, the
@@ -216,6 +216,8 @@ def simulate(prefixes, frame: int, rounds, chunk: int, capacity: int,
         device: The DeviceSpec.
         resident: Whether the prefixes are in KV already.
         read_all_rows: Whether every chain row is read, or only the last.
+        canvas_rows: The rows of a diffusion model's canvas, which read
+            the document twice when there is more than one.
     """
     window = model.sliding_window
     n = len(prefixes)
@@ -233,13 +235,19 @@ def simulate(prefixes, frame: int, rounds, chunk: int, capacity: int,
     def item_work(document, index):
         prefix = prefixes[document]
         chains = rounds[document][index] if rounds[document] else []
+        # a canvas longer than one row reads the document a second
+        # time, in the non-causal call every canvas row runs
+        suffixes = stream(prefix + frame, chains, window=window)
+        if canvas_rows > 1:
+            suffixes = suffixes + Work(
+                pairs=suffixes.pairs, kv_read=suffixes.kv_read,
+                sliding_pairs=suffixes.sliding_pairs,
+                sliding_kv_read=suffixes.sliding_kv_read)
         if index > 0:
-            return stream(prefix + frame, chains, window=window)
+            return suffixes
         if resident:
-            return (ask(prefix, frame, window=window)
-                    + stream(prefix + frame, chains, window=window))
-        return (scan(prefix + frame, 0, window=window)
-                + stream(prefix + frame, chains, window=window))
+            return ask(prefix, frame, window=window) + suffixes
+        return scan(prefix + frame, 0, window=window) + suffixes
 
     ready = deque()
     waiting = []           # heap of (ready chunk, document, round)
@@ -465,7 +473,9 @@ class _Table:
                   for i in range(len(prefixes))]
         return simulate(prefixes, frame_tokens, rounds, self.chunk,
                         self.capacity or self.budget, self.model, self.device,
-                        resident=resident, read_all_rows=read_all)
+                        resident=resident, read_all_rows=read_all,
+                        canvas_rows=(len(labels[0]) if scoring == "canvas"
+                                     else self.model.canvas_tokens))
 
     def choose(self, live, head_tokens, frame_tokens, labels, resident,
                traces=None, demand=None) -> tuple[str, Simulated]:

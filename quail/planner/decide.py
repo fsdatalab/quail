@@ -404,6 +404,11 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                 context: PlanningContext | None = None):
     """Compile a LogicalPlan into a PhysicalPlan or Refusal.
 
+    A table's classifications run after its AI.IF filters. When the
+    table also joins, they run either before the joins, so a label
+    filter removes rows early, or after them, over the documents the
+    joins matched; the placement with the smaller estimate wins.
+
     Args:
         plan: The logical plan to compile.
         model: Model spec.
@@ -415,9 +420,33 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
         pair_fractions: join written position -> the fraction of the
             cross product its equality conditions keep.
         context: The planning context, needed when the plan classifies
-            documents: an AI.CLASSIFY column or a label filter runs
-            after a table's AI.IF filters, before its joins.
+            documents.
     """
+    before = _plan_quail_placed(
+        plan, model=model, device=device, doc_tokens=doc_tokens, gpus=gpus,
+        order=order, pair_fractions=pair_fractions, context=context)
+    operators = plan.operators()
+    joined = {argument.alias for join in operators.joins
+              for argument in join.prompt.args}
+    labels = label_work(plan, operators.filters)
+    if isinstance(before, Refusal) or not any(
+            alias in joined for _, alias in labels.calls):
+        return before
+    after = _plan_quail_placed(
+        plan, model=model, device=device, doc_tokens=doc_tokens, gpus=gpus,
+        order=order, pair_fractions=pair_fractions, context=context,
+        classify_after_joins=True)
+    if isinstance(after, Refusal):
+        return before
+    return min((before, after), key=lambda candidate: candidate.estimated_seconds)
+
+
+def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
+                       device: DeviceSpec, doc_tokens: dict, gpus: int = 1,
+                       order: str | None = None, pair_fractions=None,
+                       context: PlanningContext | None = None,
+                       classify_after_joins: bool = False):
+    """Compile with classifications before or after the joins."""
     operators = plan.operators()
     scans, filters, joins = operators.scans, operators.filters, operators.joins
     applies = operators.applies
@@ -515,6 +544,9 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     for fs in filters.values():
         surv = 1.0
         for p in fs:
+            # a label filter after the joins thins nothing before them
+            if classify_after_joins and isinstance(p.expression, LabelIn):
+                continue
             surv *= effective_selectivity(p.selectivity)
         live0[_filter_alias(fs[0])] *= surv
     filter_works = {
@@ -718,14 +750,21 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     classify_seconds = 0.0
     label_ports = []
 
-    def emit_classify(alias):
+    joined = {argument.alias for join in joins for argument in join.prompt.args}
+    deferred = set()          # aliases classified after the joins
+
+    def emit_classify(alias, live=None):
         """Classify the alias's documents, then keep the accepted labels."""
         nonlocal classify_seconds
         calls = [call for call, owner in labels.calls if owner == alias]
         if not calls:
             return
+        if classify_after_joins and alias in joined and live is None:
+            deferred.add(alias)
+            return
         table = classify_table(context, alias, "quail")
-        live = live_asked.get(alias, float(stats[alias].n_docs))
+        if live is None:
+            live = live_asked.get(alias, float(stats[alias].n_docs))
         for call in calls:
             spec, _ = table.classify(call, labels.names[call], live,
                                      demand=labels.demands.get(call))
@@ -850,7 +889,22 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
             stages=tuple(stage_dicts)))
         ids_src[anchor] = PortRef(gid, f"ids:{anchor}")
 
-    if len(pairs_edges) == 1 and len(seq) == 1:
+    # classifications after the joins run over the documents the joins
+    # matched: a document with at least one true pair, expected as the
+    # join selectivity times the partners it met, at most every document
+    try:
+        for alias in sorted(deferred):
+            met = sum(
+                effective_selectivity(join.selectivity)
+                * sum(live0[argument.alias] for argument in join.prompt.args
+                      if argument.alias != alias)
+                for join in joins
+                if alias in {argument.alias for argument in join.prompt.args})
+            emit_classify(alias, live=live0[alias] * min(1.0, met))
+    except ClassifyRefusedError as refused:
+        return refused.refusal()
+
+    if len(pairs_edges) == 1 and len(seq) == 1 and not deferred:
         # one full join and nothing after it: its true pairs are the
         # result rows, so no recombination is needed
         sink_inputs = (pairs_edges[0],)
@@ -901,7 +955,9 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
             "order_rule": rule,
             "order_source": source,
             "search_seconds": estimate,
-            **({"label_scoring": context.label_scoring or "cost model"}
+            **({"label_scoring": context.label_scoring or "cost model",
+                "classify_placement": ("after joins" if classify_after_joins
+                                       else "before joins")}
                if labels.calls else {}),
         },
         estimator=estimator)
