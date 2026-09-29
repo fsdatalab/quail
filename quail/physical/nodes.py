@@ -407,6 +407,15 @@ class RequestExecution(PhysicalNode):
             )
             for spec in self.classifies
         )
+        # a label filter's answers, one relation per tested classification
+        outputs.extend(
+            OutputPort(
+                f"label_filter_answers:{spec.output}",
+                ValueType.FILTER_ANSWERS,
+                schema=(spec.alias, "predicate", "answer"),
+            )
+            for spec in self.classifies if spec.tests
+        )
         return tuple(outputs)
 
     def attributes(self) -> dict:

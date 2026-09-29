@@ -390,6 +390,8 @@ def test_request_backends_classify_with_one_request_per_trie_node():
     assert result.outputs["label_answers:kind"].to_pydict() == {
         "d": [0, 1], "kind": ["a", "b"]}
     assert result.outputs["ids:d"] == [1]
+    assert result.outputs["label_filter_answers:kind"].to_pydict() == {
+        "d": [0, 1], "predicate": [0, 0], "answer": [False, True]}
     assert result.metrics.extension["requests"] == 6
     (step,) = result.metrics.extension["steps"]
     assert (step["kind"], step["n_in"], step["n_out"]) == ("classify", 2, 1)

@@ -127,10 +127,14 @@ def plan_request_backend(
             estimated_seconds=float("inf"),
         ),)
     classifies = has_label(region.logical_plan)
+    scores_labels = scores_labels and not context.model.canvas_tokens
     if classifies and not (scores_labels and context.tokenizer is not None):
+        # vLLM 0.26's DiffusionGemma ignores the named tokens a request
+        # asks for and returns the whole vocabulary per canvas row
         reason = (f"AI.CLASSIFY on {backend_name} needs next-token log "
                   f"probabilities of named tokens, which its engine does "
-                  f"not return" if context.tokenizer is not None
+                  f"not return for {context.model.name!r}"
+                  if context.tokenizer is not None
                   else "AI.CLASSIFY planning needs the model's tokenizer")
         return (PhysicalCandidate(
             graph=None,
@@ -789,12 +793,22 @@ class RequestModelExecution:
                 spec.alias: pa.array(document_ids, pa.int32()),
                 spec.output: pa.array(result["labels"], pa.string()),
             })
-            for position, accepted in spec.tests:
+            test_answers = {}
+            for index, (position, accepted) in enumerate(spec.tests):
                 kept = set(accepted)
+                alive = set(survivors[spec.alias])
+                for document, label in zip(document_ids, result["labels"]):
+                    if document in alive:
+                        test_answers[(document, index)] = label in kept
                 survivors[spec.alias] = [
                     document for document, label
                     in zip(document_ids, result["labels"])
-                    if label in kept and document in survivors[spec.alias]]
+                    if label in kept and document in alive]
+            if spec.tests:
+                outputs[f"label_filter_answers:{spec.output}"] = (
+                    _filter_answer_table(
+                        spec.alias, [position for position, _ in spec.tests],
+                        test_answers))
             steps.append({
                 "kind": "classify",
                 "alias": spec.alias,
