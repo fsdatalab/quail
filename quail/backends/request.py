@@ -266,7 +266,7 @@ def plan_request_backend(
             parts = {part_alias: (label, frame)
                      for part_alias, label, frame in call.prompt.label_token_ids}
             written_pos = next(
-                (position for position, join in joins.items()
+                (position for position, join in enumerate(joins)
                  if {argument.alias for argument in join.prompt.args}
                  == set(call.aliases())), None)
             if written_pos is None:

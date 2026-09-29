@@ -4,7 +4,8 @@ A QUAIL-B query is a Substrait plan (a protocol buffer that describes
 a relational query): `ReadRel` scans, `FilterRel` calls to
 `ai_filter`, inner `JoinRel` calls to `ai_join` (joined with ordinary
 `equal` conditions by `and`), inner `ProjectRel` calls to
-`ai_classify` that add a label column, `FilterRel` label tests
+`ai_classify` that add a label column (over one document, or over
+the anchor and partner documents of a join), `FilterRel` label tests
 (`SingularOrList` over a label column), and a `ProjectRel` under the
 root that selects id and label columns. The alias of a relation and
 the id of an operator are the `RelCommon.hint.alias` of its node.
@@ -24,6 +25,7 @@ AI_URN = "extension:org.fsdatalab.quail_b:functions_ai"
 AI_FILTER = "ai_filter:str_str"
 AI_JOIN = "ai_join:str_str_str"
 AI_CLASSIFY = "ai_classify:str_str_list_list"
+AI_CLASSIFY_PAIR = "ai_classify:str_str_str_list_list"
 EQUAL = "equal:any_any"
 AND = "and:bool"
 
@@ -72,12 +74,14 @@ class Classify:
 
     Attributes:
         id: The operator id.
-        alias: The classified relation.
+        alias: The classified relation; for a pair, the anchor.
         column: Its document column.
         prompt: The classification prompt.
         labels: The labels, in listed order.
         descriptions: One description per label, empty for none.
         output: The label column's name.
+        partner: The (alias, document column) of the second document
+            when the call labels a join's pairs, else None.
     """
 
     id: str
@@ -87,6 +91,13 @@ class Classify:
     labels: tuple[str, ...]
     descriptions: tuple[str, ...]
     output: str
+    partner: tuple[str, str] | None = None
+
+    @property
+    def relations(self) -> tuple[str, ...]:
+        """The aliases a label row names: the anchor, then the partner."""
+        return (self.alias,) if self.partner is None else (
+            self.alias, self.partner[0])
 
 
 @dataclass(frozen=True)
@@ -147,7 +158,8 @@ def _functions(plan: plan_pb2.Plan) -> dict[int, str]:
         if not declaration.HasField("extension_function"):
             continue
         function = declaration.extension_function
-        if function.name in (AI_FILTER, AI_JOIN, AI_CLASSIFY) and (
+        if function.name in (AI_FILTER, AI_JOIN, AI_CLASSIFY,
+                             AI_CLASSIFY_PAIR) and (
                 urns.get(function.extension_urn_reference) != AI_URN):
             raise ValueError(f"{function.name} must come from {AI_URN}")
         names[function.function_anchor] = function.name
@@ -214,14 +226,19 @@ def _read(rel: algebra_pb2.Rel, functions):
         if len(project.expressions) != 1:
             raise ValueError("an inner projection adds one ai_classify column")
         name, arguments = _call(project.expressions[0], functions)
-        if name != AI_CLASSIFY or len(arguments) != 4:
+        documents = {AI_CLASSIFY: 1, AI_CLASSIFY_PAIR: 2}.get(name)
+        if documents is None or len(arguments) != documents + 3:
             raise ValueError("an inner projection must call ai_classify("
-                             "prompt, document, labels, descriptions)")
+                             "prompt, document, labels, descriptions) or "
+                             "ai_classify(prompt, anchor, partner, labels, "
+                             "descriptions)")
         alias, column = _field(fields, arguments[1])
+        partner = _field(fields, arguments[2]) if documents == 2 else None
         output = project.common.hint.output_names[-1].partition(".")[2]
         operators.append(Classify(
             project.common.hint.alias, alias, column, _string(arguments[0]),
-            _strings(arguments[2]), _strings(arguments[3]), output))
+            _strings(arguments[documents + 1]),
+            _strings(arguments[documents + 2]), output, partner))
         return relations, operators, (*fields, (alias, output))
     if kind == "filter" and rel.filter.condition.HasField("singular_or_list"):
         relations, operators, fields = _read(rel.filter.input, functions)
@@ -307,6 +324,8 @@ def build_query(session, plan: QueryPlan, selectivity=None,
     by_alias = {relation.alias: relation for relation in plan.relations}
     per_alias = {}
     for item in plan.operators:
+        if isinstance(item, Classify) and item.partner is not None:
+            continue    # labels a join's pairs, so it follows the joins
         if isinstance(item, (Filter, Classify, LabelFilter)):
             per_alias.setdefault(item.alias, []).append(item)
     prompts = {(item.alias, item.output): item.prompt
@@ -347,6 +366,14 @@ def build_query(session, plan: QueryPlan, selectivity=None,
                          quail.col(f"{right}.{join.columns[1]}")),
             selectivity=selectivity.get(join.prompt))
         joined.add(new[0])
+    for item in plan.classifies:
+        if item.partner is not None:
+            query = query.ai_classify(
+                quail.prompt(item.prompt,
+                             quail.col(f"{item.alias}.{item.column}"),
+                             quail.col(f"{item.partner[0]}.{item.partner[1]}")),
+                item.labels, name=item.output,
+                descriptions=item.descriptions)
     outputs = {(item.alias, item.output) for item in plan.classifies}
     columns = [name.split(".", 1)[1]
                if tuple(name.split(".", 1)) in outputs else name

@@ -145,7 +145,7 @@ def run_output(result, plan: QueryPlan, tables) -> RunOutput:
         table = result.answer_tables["classifies"][operator.output]
         classify_answers[operator.id] = pa.table({
             **{alias: id_column(alias, table.column(alias))
-               for alias in getattr(operator, "relations", (operator.alias,))},
+               for alias in operator.relations},
             "label": table.column(operator.output),
         })
     join_answers = {}

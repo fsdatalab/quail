@@ -217,6 +217,15 @@ def test_read_plan_reads_operators_and_rejects_other_extensions():
     assert plan.filter_id("r", 1) == "filter-2"
     assert plan.join_id(0) == "join-1"
 
+    # IMDB-15 labels the pairs its join keeps: the anchor and its partner
+    pairs = read_plan(get_query("IMDB-15").plan)
+    sentiment, pair = pairs.classifies
+    assert sentiment.partner is None and sentiment.relations == ("r",)
+    assert pair.alias == "r" and pair.column == "body"
+    assert pair.partner == ("a", "aspect") and pair.relations == ("r", "a")
+    assert pairs.operators.index(pair) > pairs.operators.index(pairs.joins[0])
+    assert pairs.select == ("r.id", "r.sentiment", "a.id", "r.aspect_sentiment")
+
     # FEV-10 asks SUPPORT only of a claim and its own Wikipedia page
     (join,) = read_plan(get_query("FEV-10").plan).joins
     assert join.aliases == ("c", "e")
