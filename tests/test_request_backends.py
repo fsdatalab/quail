@@ -114,6 +114,24 @@ def test_request_backends_plan_validate_and_execute(monkeypatch):
     assert result.report["backend_metrics"]["requests"] == 2
     joins = result.answer_tables["joins"][0].to_pydict()
     assert sorted(zip(*joins.values())) == [(0, 1, False), (1, 0, False)]
+
+    # a classification of the join's pairs: its label table names both
+    # aliases before the label column; the join kept no pair here
+    boot["client"] = _PairClient()
+    query = (
+        session.docs("docs").alias("d")
+        .join(session.docs("notes").alias("n"),
+              on=[quail.col("d.key") == quail.col("n.key")])
+        .ai_filter(quail.prompt("{0} matches {1}", quail.col("d.body"),
+                                quail.col("n.text")))
+        .ai_classify(quail.prompt("{0} about {1}", quail.col("d.body"),
+                                  quail.col("n.text")), ["a", "b"], name="kind")
+        .select("d.id", "n.id", "kind")
+    )
+    result = _run_stock_vllm(session, query)
+    labels = result.answer_tables["classifies"]["kind"]
+    assert labels.column_names == ["d", "n", "kind"]
+    assert labels.num_rows == 0 and result.count() == 0
     session.close()
 
 

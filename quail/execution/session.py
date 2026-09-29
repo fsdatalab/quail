@@ -1141,7 +1141,9 @@ class Query:
                     alias.decode("utf-8"), []
                 ).append(table)
             elif value_type is ValueType.LABEL_ANSWERS:
-                answer_tables["classifies"][table.column_names[1]] = table
+                # the label column follows the alias columns: one, or a
+                # pair classification's anchor and partner
+                answer_tables["classifies"][table.column_names[-1]] = table
             elif value_type is ValueType.JOIN_ANSWERS:
                 written_pos = metadata.get(b"quail.written_pos")
                 if written_pos is None:
