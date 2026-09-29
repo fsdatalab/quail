@@ -272,8 +272,7 @@ class _PoolBuilder:
 
 
 def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
-               attention_mode, staging=None, canvas=(), answer_row=0,
-               conditioning=None):
+               attention_mode, staging=None, canvas=(), answer_row=0):
     """Build tensors for one chunk from groups in chunk order.
 
     Each group is a dict with keys:
@@ -305,8 +304,6 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 group without it reads by read_all_rows.
       canvas    The group's own canvas token ids, packed after each of
                 its suffixes in place of the chunk's canvas.
-      conditioning  The first of the group's canvas rows in the
-                conditioning tensor.
 
     A fresh group without arena pages packs [prefix | suffix] as one
     causal segment (no scatter, no paged read). This only works with
@@ -324,11 +321,6 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     every canvas row is read instead. Canvas KV goes wherever the
     suffix's KV goes and is never kept. Canvas rows run the unified
     path only.
-
-    conditioning holds the self-conditioning input of a denoising
-    step, one hidden row per canvas row. A group's canvas rows take
-    their rows from it in order, at the group's conditioning row; a
-    canvas of a group naming none reads no self-conditioning input.
     """
     def stage(name, values, dtype):
         if staging is not None:
@@ -357,7 +349,6 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     canvas_starts = []    # per group, the first row of each canvas
     canvas_sizes = []     # per group, the rows of each canvas
     canvas_seq = []       # its sequence in the unified paged call
-    conditioning_rows = []    # per group, each canvas row's input row
     id_parts, token_count = [], 0
     pos, finals = [], []
     cu_a = [np.zeros(1, dtype=np.int64)]
@@ -450,11 +441,6 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             first = s_row0 + begins + sufs.lengths
             canvas_starts.append(first)
             canvas_sizes.append(np.full(n, width, dtype=np.int64))
-            # a canvas without self-conditioning rows reads zeros
-            conditioning_rows.append(
-                np.full(n * width, -1, dtype=np.int64)
-                if g.get("conditioning") is None else np.tile(
-                    g["conditioning"] + np.arange(width, dtype=np.int64), n))
             if read_all:
                 finals.append(np.repeat(first, width)
                               + np.tile(np.arange(width, dtype=np.int64), n))
@@ -736,21 +722,6 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             # the readouts slice canvases by their row offsets on the host
             cu_q_host=np.concatenate([[0], cum]),
             max_q=int(widths.max()))
-        index = np.concatenate(conditioning_rows)
-        if (index >= 0).any():
-            if conditioning is None:
-                raise ValueError(
-                    "a canvas names self-conditioning rows but the chunk "
-                    "has no conditioning tensor")
-            index = stage("conditioning_rows", index, torch.int64)
-            canvas_meta["conditioning_rows"] = index
-            named = index >= 0
-            canvas_meta["conditioning"] = conditioning.index_select(
-                0, index[named])
-            # the canvas rows the conditioning rows belong to, when
-            # some canvas in the chunk names none
-            if not bool(named.all()):
-                canvas_meta["conditioned"] = named
         if unified is not None:
             seq = stage("canvas_seq", canvas_seq, torch.int64)
             canvas_meta["table"] = unified["table"].index_select(0, seq)

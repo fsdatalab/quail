@@ -3,6 +3,7 @@
 import numpy as np
 import pyarrow as pa
 import pytest
+from fakes import letter_tokens
 from test_quail_backend import graph_state
 
 import quail
@@ -36,7 +37,7 @@ def _session(gpus=1, backend="quail"):
     session = quail.Session(
         EngineConfig(gpus=gpus, model="qwen3-4b-fp8", backend=backend,
                      device="h100-sxm"),
-        tokenizer=lambda text: list(text.encode()))
+        tokenizer=letter_tokens)
     register_fever(session)
     return session
 
@@ -371,7 +372,7 @@ def test_a_classification_of_joined_rows_follows_its_join(monkeypatch):
         assert classify.spec.aliases == (join.anchor,) + tuple(
             alias for alias in ("c", "e") if alias != join.anchor)
         assert classify.spec.join_layout is not None and classify.spec.scoring == \
-            "trie_paths"
+            "letters"
         assert classify.inputs[0].source == PortRef(join.node_id,
                                                     "join_answers:0")
         assert [port.source.port for port in project.inputs] == [

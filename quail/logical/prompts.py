@@ -439,28 +439,38 @@ def _bind_joined_classify_prompt(template, args, labels, descriptions,
         raise CompileError(
             "each placeholder of a classification of joined rows names a "
             "distinct table")
-    question = render_classify_question(template, labels, descriptions,
-                                        task_description)
-    preamble = shared_preamble(turn[0])
-    tail = question + turn[1]
-    frame = join_anchor_note(0)
-    pre_tok = tail_tok = frame_tok = None
-    pre_ids = tail_ids = ()
-    label_ids = ()
-    if tokenizer is not None:
-        pre_ids = tuple(tokenizer(preamble))
-        tail_ids = tuple(tokenizer(tail))
-        pre_tok, tail_tok = len(pre_ids), len(tail_ids)
-        frame_tok = len(tokenizer(frame))
-        label_ids = tuple(
-            (alias, tuple(tokenizer(join_label(index))),
-             tuple(tokenizer(join_anchor_note(index))))
-            for index, alias in enumerate(aliases))
-    return Prompt(template=template, args=tuple(args), preamble=preamble,
-                  tail=tail, preamble_tokens=pre_tok, tail_tokens=tail_tok,
-                  frame=frame, frame_tokens=frame_tok,
-                  preamble_token_ids=pre_ids, tail_token_ids=tail_ids,
-                  label_token_ids=label_ids, label_prefix=answer_prefix(turn))
+    prefix = answer_prefix(turn)
+
+    def bind(letters=()):
+        question = render_classify_question(template, labels, descriptions,
+                                            task_description, letters)
+        preamble = shared_preamble(turn[0])
+        tail = question + turn[1]
+        frame = join_anchor_note(0)
+        pre_tok = tail_tok = frame_tok = None
+        pre_ids = tail_ids = ()
+        label_ids = ()
+        if tokenizer is not None:
+            pre_ids = tuple(tokenizer(preamble))
+            tail_ids = tuple(tokenizer(tail))
+            pre_tok, tail_tok = len(pre_ids), len(tail_ids)
+            frame_tok = len(tokenizer(frame))
+            label_ids = tuple(
+                (alias, tuple(tokenizer(join_label(index))),
+                 tuple(tokenizer(join_anchor_note(index))))
+                for index, alias in enumerate(aliases))
+        return Prompt(template=template, args=tuple(args), preamble=preamble,
+                      tail=tail, preamble_tokens=pre_tok, tail_tokens=tail_tok,
+                      frame=frame, frame_tokens=frame_tok,
+                      preamble_token_ids=pre_ids, tail_token_ids=tail_ids,
+                      label_token_ids=label_ids, label_prefix=prefix,
+                      letters=tuple(letters))
+
+    named = bind()
+    letters = choice_letters(len(labels), tokenizer, prefix)
+    if len(letters) < len(labels):
+        return named
+    return replace(named, lettered=bind(letters))
 
 
 def render_joined_classify_prompt_text(prompt, anchor: str,

@@ -2,18 +2,18 @@
 
 A filter's or join's prompt ends with a fixed canvas token, and the
 answer comes from TRUE/FALSE scores at that position. A classification
-denoises a longer canvas (denoise.py). Canvas rows take the
-self-conditioning input of their denoising step, or zero conditioning
-when a chunk gives none, as in the first step.
+packs a seeded answer canvas and reads its first row. Canvas rows run
+one denoising step with zero self-conditioning input, as vLLM's first
+step does, through the self-conditioning module's output norm.
 """
 
 import numpy as np
 
 from quail.backends.quail.executor.attention import Engine
-from quail.backends.quail.executor.denoise import CANVAS_SEED, check_denoising
 from quail.backends.quail.executor.models.base import ModelPipeline
 from quail.backends.quail.executor.moe import FP8Experts
 from quail.cost import budgets
+from quail.specs.base import CANVAS_SEED
 
 
 def canvas_token_ids(vocab: int, tokens: int, seed: int = CANVAS_SEED) -> tuple:
@@ -98,12 +98,6 @@ class DiffusionGemmaPipeline(ModelPipeline):
             raise ValueError("the fused qkv kernel expects a weightless v norm")
         self._fold_layer_scalars(model)
         self.scales = [float(layer.layer_scalar) for layer in self.layers]
-        denoising = getattr(spec, "denoising", None)
-        if denoising is not None:
-            config = self.vllm_config.model_config
-            check_denoising(
-                denoising, config.try_get_generation_config(),
-                getattr(config.hf_text_config, "final_logit_softcapping", None))
         self.canvas_ids = canvas_token_ids(spec.vocab, spec.canvas_tokens)
         # an empty canvas reads the answer at the prompt's last row
         self.canvas_answer_row = (spec.canvas_answer_row
@@ -113,17 +107,6 @@ class DiffusionGemmaPipeline(ModelPipeline):
         self.experts = [FP8Experts(layer.moe.experts, self.engine)
                         if layer.enable_moe_block else None
                         for layer in self.layers]
-
-    def _conditioning_signal(self, soft):
-        """The self-conditioning MLP's output for the previous step's soft embeddings.
-
-        Zero rows give zero, as vLLM's first denoising step gets.
-        """
-        module = self.conditioning
-        x = self._norm(soft, module.pre_norm)
-        gelu = self.engine.torch.nn.functional.gelu
-        return module.down_proj(
-            gelu(module.gate_proj(x), approximate="tanh") * module.up_proj(x))
 
     def _norm(self, x, module):
         """One of the model's RMS norms, through the engine's kernel."""
@@ -171,13 +154,6 @@ class DiffusionGemmaPipeline(ModelPipeline):
         if canvas is not None:
             rows = canvas["rows"]
             x = hidden.index_select(0, rows)
-            soft = canvas.get("conditioning")
-            if soft is not None:
-                conditioned = canvas.get("conditioned")
-                if conditioned is None:
-                    x = x + self._conditioning_signal(soft.to(x.dtype))
-                else:
-                    x[conditioned] += self._conditioning_signal(soft.to(x.dtype))
             hidden.index_copy_(0, rows, self._norm(x, self.conditioning.post_norm))
         # the fused MoE kernels look their layer up in the forward
         # context

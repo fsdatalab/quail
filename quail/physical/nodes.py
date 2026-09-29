@@ -586,10 +586,9 @@ class ClassifySpec(ScoreSpec):
 
     ``prompt_token_parts`` is (preamble ids, tail ids): the document
     goes between them. ``label_token_ids`` holds each label's ids as
-    scored after the tail, in label order. ``scoring`` names the label
-    scoring rule the executor runs: ``trie_paths``, ``trie_tree``,
-    ``trie_decode``, or ``canvas``, which decodes the answer with a
-    diffusion model's denoising steps and matches its text to a label.
+    scored after the tail, in label order: under the ``letters`` rule
+    the letter standing for each label, one token; under ``trie_tree``
+    the label's own text. ``scoring`` names the rule the executor runs.
     ``share_prefixes`` lets a document borrow the KV pages of a
     document sharing its token prefix (the prefix_sharing rule).
     ``stages`` are later classifications of the same documents, run
@@ -603,7 +602,7 @@ class ClassifySpec(ScoreSpec):
 
     labels: tuple[str, ...] = ()
     label_token_ids: tuple[tuple[int, ...], ...] = ()
-    scoring: str = "trie_paths"
+    scoring: str = "letters"
     share_prefixes: bool = False
     stages: tuple["ClassifyStage", ...] = ()
     join_layout: tuple[tuple[int, ...], tuple[int, ...]] | None = None
@@ -635,7 +634,7 @@ class ClassifySpec(ScoreSpec):
             label_token_ids=tuple(
                 tuple(int(token) for token in ids)
                 for ids in value["label_token_ids"]),
-            scoring=str(value.get("scoring", "trie_paths")),
+            scoring=str(value.get("scoring", "letters")),
             share_prefixes=bool(value.get("share_prefixes", False)),
             stages=tuple(ClassifyStage.from_mapping(stage)
                          for stage in value.get("stages", ())),

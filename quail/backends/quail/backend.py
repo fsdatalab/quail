@@ -211,8 +211,7 @@ class QuailModelExecution:
                 stats=stats, staging=_staging(state),
                 on_chunk=lambda transitions: _report_chain_transitions(
                     parts + [own], transitions),
-                label=f"pipeline {alias} ({len(stages)} stages)",
-                conditioning=_chain_conditioning(parts + [own]))
+                label=f"pipeline {alias} ({len(stages)} stages)")
             _complete_chain(parts + [own], every, spans, tokens, stats,
                             state["torch"], gpu_inputs)
         for part in parts:
@@ -408,8 +407,7 @@ class QuailModelExecution:
             anchor_keys=anchor_keys, on_settled=on_settled,
             attention_mode=attention, prefix_tree=tree, stats=join_stats,
             on_chunk=on_chunk, label=f"join ({len(join_stages)} stages)",
-            staging=_staging(self._state),
-            conditioning=_chain_conditioning(parts))
+            staging=_staging(self._state))
         answers = every[leading:leading + len(join_stages)]
         after_tokens = 0
         if after:
@@ -729,13 +727,6 @@ class _ApplyGate:
     def result(self, tokens, gpu_s, chunks, stats) -> NodeResult:
         return NodeResult(foreign_outputs(self.node, self.produced),
                           self.metrics())
-
-
-def _chain_conditioning(parts):
-    """The ConditioningRows a chain's canvas classification denoises with."""
-    return next((part.plan.conditioning for part in parts
-                 if isinstance(part, _ClassifyPart)
-                 and part.plan.conditioning is not None), None)
 
 
 def _gated_stages(parts) -> list:

@@ -2,6 +2,7 @@
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+from fakes import letter_tokens
 
 import quail
 from quail.bench.quailb import (
@@ -69,7 +70,7 @@ def test_all_queries_compile_and_plan_and_answer_timing_adds_common_work(tmp_pat
         with quail.Session(
             EngineConfig(gpus=1, model="qwen3-4b-fp8", backend=backend,
                          device="h100-sxm"),
-            tokenizer=lambda text: list(text.encode()),
+            tokenizer=letter_tokens,
         ) as sess:
             register_tables(sess, tmp_path)
             qdefs = queries(sess)

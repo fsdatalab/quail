@@ -8,7 +8,7 @@ and the kernel warm-up run before the recording starts. The Chrome
 trace goes to the results volume.
 
     uv run modal run --detach experiments/cells/trace_query.py::trace
-        --query BIO-5 --label-scoring trie_paths
+        --query BIO-5 --label-scoring trie_tree
 """
 
 from quail.bench.quailb_parallel import (
@@ -123,7 +123,7 @@ def trace_query(query_id: str, sf: float, collection_id: str,
 
 @app.local_entrypoint()
 def trace(query: str = "BIO-5", sf: float = 0.1,
-          label_scoring: str = "trie_paths", top: int = 25):
+          label_scoring: str = "trie_tree", top: int = 25):
     data = ensure_data.spawn(sf, [query], "")
     print(f"function call id: {data.object_id} (data)", flush=True)
     collection = data.get()

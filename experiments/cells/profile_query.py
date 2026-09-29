@@ -6,7 +6,7 @@ between forward passes can be read off. The stats file goes to the
 results volume.
 
     uv run modal run --detach experiments/cells/profile_query.py::profile
-        --query BIO-5 --label-scoring trie_paths
+        --query BIO-5 --label-scoring trie_tree
     uv run modal run --detach experiments/cells/profile_query.py::profile
         --query IMDB-12 --model diffusion-gemma-26b-a4b-fp8 --label-scoring ""
 """
@@ -71,7 +71,7 @@ def profile_query(query_id: str, sf: float, collection_id: str,
 
 @app.local_entrypoint()
 def profile(query: str = "BIO-5", sf: float = 0.1,
-         label_scoring: str = "trie_paths", top: int = 35,
+         label_scoring: str = "trie_tree", top: int = 35,
          model: str = "qwen3-4b-fp8"):
     data = ensure_data.spawn(sf, [query], "")
     print(f"function call id: {data.object_id} (data)", flush=True)

@@ -42,8 +42,8 @@ CLASSIFY_FRAME = 4500
 CUE = 5000
 # two-token labels sharing a first token: the trie path [CUE, 11] is
 # read at both rows, beside filter and join rows read at one
-LABEL_IDS = ((11, 13), (11, 14))
-TARGETS = [11, 13, 14]
+LABEL_IDS = ((13,), (14,))
+TARGETS = [13, 14]
 
 
 # the anchor note (its frame) and partner label of a classification
@@ -68,8 +68,7 @@ class LabelingModel(FakeModel):
                 head = suffix[0]
                 if head == PARTNER_LABEL:
                     # a joined row's block: the partner label, its document,
-                    # the question, then the label path; the path's
-                    # rows are read
+                    # the question, then the cue, whose row is read
                     partner = suffix[1] - PARTNER
                     wanted = LABEL_IDS[self.joined_truth[(spec["key"][1], partner)]]
                     for depth in range(int(spec["read_rows"][index])):
@@ -107,7 +106,7 @@ def fused_graph():
         name="topic", aliases=("r",), query_template="", arguments=(),
         expected_inputs=14, estimated_seconds=0.0,
         prompt_token_parts=((), (CLASSIFY_FRAME, CUE)), labels=("a", "b"),
-        label_token_ids=LABEL_IDS, scoring="trie_paths", share_prefixes=True)
+        label_token_ids=LABEL_IDS, scoring="letters", share_prefixes=True)
     nodes = [
         Scan(node_id="input:r", alias="r", input_id="r"),
         Scan(node_id="input:p", alias="p", input_id="p"),
@@ -142,34 +141,26 @@ def fused_graph():
 
 
 @pytest.mark.parametrize("joined", [False, True])
-def test_a_canvas_classification_runs_in_its_filter_chain_pipeline(
+def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
         monkeypatch, joined):
     """A filter, then a diffusion model's classification: one run.
 
-    Each survivor's denoising steps run over its resident KV, in
-    chunks that also hold other documents' filter rows; the filter's
-    fixed canvas reads no self-conditioning input. With ``joined`` a
-    label filter and a join follow, in the same pipeline.
+    Each survivor's seeded canvas is read over its resident KV, in
+    chunks that also hold other documents' filter rows. With
+    ``joined`` a label filter and a join follow, in the same pipeline.
     """
-    torch = pytest.importorskip("torch")
     from dataclasses import replace
 
     from quail.backends.quail.executor import classify as classify_module
     from quail.execution.pipelines import build_pipelines
-    from quail.specs import Denoising
+    from quail.specs.base import AnswerCanvas
 
-    settings = Denoising(
-        canvas_rows=4, max_steps=5, t_min=0.4, t_max=0.8, entropy_bound=0.1,
-        confidence_threshold=0.005, stability_threshold=1, logit_softcap=30.0,
-        stop_token_ids=(0,), turn_close_id=106, pad_id=0)
-    spelling = {1: "a", 2: "b", 3: "\n", 5: "x", 6: " "}
-    tokenizer = SimpleNamespace(decode=lambda ids, skip_special_tokens: "".join(
-        spelling.get(i, "") for i in ids))
+    settings = AnswerCanvas(rows=4, turn_close_id=6, pad_id=0)
     spec = ClassifySpec(
         name="topic", aliases=("r",), query_template="", arguments=(),
         expected_inputs=4, estimated_seconds=0.0,
         prompt_token_parts=((), (91, 92, 93)), labels=("a", "b"),
-        label_token_ids=((1,), (2,)), scoring="canvas")
+        label_token_ids=((1,), (2,)), scoring="letters")
     nodes = [
         Scan(node_id="input:r", alias="r", input_id="r"),
         AiFilter(
@@ -213,72 +204,85 @@ def test_a_canvas_classification_runs_in_its_filter_chain_pipeline(
                       if joined else ("filter:r", "classify:r")}
 
     filter_truth = [[1], [0], [1], [1]]
-    # a survivor's canvas settles on "a", "b", or a stop token first
-    answers = {0: [[1, 0, 5, 5]] * 5, 2: [[5, 5, 5, 5]] + [[2, 0, 6, 6]] * 4,
-               3: [[0, 5, 5, 5]] * 5}
+    # the letter each survivor's first canvas row favors
+    answers = {0: 1, 2: 2, 3: 2}
     vocab = 8
-    head = torch.eye(vocab, dtype=torch.bfloat16)
     packed = {}
-    conditioned = {}
 
     def forward(chunk):
         rows = []
-        canvas_rows = 0
-        for index, entry in enumerate(chunk.specs):
+        for entry in chunk.specs:
             document = entry["key"][1]
             for suffix in entry["suffixes"]:
                 if entry.get("canvas") is not None:
                     packed.setdefault(document, []).append(list(entry["canvas"]))
                     assert entry["read_all_rows"]
-                    # the step reads the soft embedding the step before
-                    # wrote, zero at its first step
-                    soft = chunk.meta["canvas"]["conditioning"][
-                        canvas_rows:canvas_rows + 4].float()
-                    canvas_rows += 4
-                    conditioned.setdefault(document, []).append(soft)
-                    wanted = answers[document][len(packed[document]) - 1]
-                    for token in wanted:
-                        row = torch.full((vocab,), -1000.0)
-                        row[token] = 1000.0
-                        rows.append(row)
+                    # the frame and the cue pack as one entry before
+                    # the canvas
+                    assert list(suffix) == [91, 92, 93]
+                    for position in range(settings.rows):
+                        rows.append(np.asarray(
+                            [-1.0 if position == 0 and token == answers[document]
+                             else -5.0 for token in (1, 2)], np.float32))
                 elif suffix[0] >= FRAME:
-                    rows.append(torch.zeros(vocab))
+                    rows.append(0)
                 elif suffix[0] >= PARTNER:
                     # document 0 pairs with partner 1 only
-                    rows.append(torch.full(
-                        (vocab,), float(document == 0 and suffix[0] == PARTNER + 1)))
+                    rows.append(float(document == 0 and suffix[0] == PARTNER + 1))
                 else:
-                    # a filter row on the fixed canvas: TRUE is any
-                    # nonzero
+                    # a filter row on the fixed canvas
                     assert suffix[0] == QUESTION
-                    rows.append(torch.full(
-                        (vocab,), float(filter_truth[document][0])))
-        return torch.stack(rows)
+                    rows.append(float(filter_truth[document][0]))
+        return rows
+
+    class FakeReadout:
+        def __init__(self, targets, rows):
+            self.targets = np.asarray(targets)
+            self.rows = rows
+            self.dtype = np.dtype((np.float32, (rows, len(targets))))
+
+        def submit(self, rows, rows_per_answer=None):
+            rows_per_answer = rows_per_answer or [1] * len(rows)
+            padded = np.full((len(rows_per_answer), self.rows,
+                              len(self.targets)), np.nan, np.float32)
+            start = 0
+            for answer, count in enumerate(rows_per_answer):
+                for offset in range(count):
+                    row = rows[start + offset]
+                    padded[answer, offset] = (
+                        row if hasattr(row, "shape")
+                        else np.zeros(len(self.targets)))
+                start += count
+            return padded
+
+        def result(self, rows):
+            return rows
 
     monkeypatch.setattr(loop, "pack_chunk", fake_pack)
-    monkeypatch.setattr(torch.cuda, "Event", lambda **kw: SimpleNamespace(
-        record=lambda: None, elapsed_time=lambda other: 2.0))
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
-    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda: 0)
-    monkeypatch.setattr(classify_module, "full_output_head", lambda model: head)
+    monkeypatch.setattr(classify_module, "full_output_head",
+                        lambda model: SimpleNamespace(shape=(1, 1),
+                                                      dtype="fake"))
+    monkeypatch.setattr(
+        classify_module, "AsyncLabelLogprobs",
+        lambda torch, F, head, targets, rows, normalize: FakeReadout(
+            targets, rows))
+    torch = fake_torch()
+    torch.nn = SimpleNamespace(functional=None)
     pipeline = fake_pipeline(forward_chunk=forward, canvas_ids=(7,),
-                             tree_attention=False,
-                             normalizer=torch.tensor(2.0, dtype=torch.bfloat16))
+                             tree_attention=False)
     arena = cpu_arena(64)
     model_spec = replace(MODELS["qwen3-4b-fp8"], name="tiny")
     execution = QuailModelExecution(SimpleNamespace(
         model=model_spec, gpu_index=0, gpu_count=1, device=DEVICES["h100-sxm"]))
     execution.bind_loaded_model(model=object(), arena=arena, pipeline=pipeline)
-    # the filter's readout takes its rows of the chunk's hidden rows
     execution.bind_query(
         torch=torch,
-        async_answers=SimpleNamespace(submit=lambda v: [int(row[0]) for row in v],
-                                      result=lambda v: v, dtype=None),
+        async_answers=SimpleNamespace(submit=lambda v: v, result=lambda v: v,
+                                      dtype=None),
         answer_rows=object(), chunk_tokens=64)
     execution._state.update(
         model_spec=SimpleNamespace(name="tiny", vocab=vocab,
-                                   denoising=settings),
-        tokenizer=tokenizer)
+                                   answer_canvas=settings))
     docs = {"r": [[DOC + d] * (3 + d) for d in range(4)],
             "p": [[PARTNER + d] for d in range(2)]}
     state = {
@@ -295,24 +299,22 @@ def test_a_canvas_classification_runs_in_its_filter_chain_pipeline(
     assert outputs[PortRef("filter:r", "ids:r")].column("r").to_pylist() \
         == [0, 2, 3]
     labels = outputs[PortRef("classify:r", "scores")]
-    # document 3 answers a stop token first and names no label
-    assert labels.column("r").to_pylist() == [0, 2]
-    assert labels.column("topic").to_pylist() == ["a", "b"]
+    assert labels.column("r").to_pylist() == [0, 2, 3]
+    assert labels.column("topic").to_pylist() == ["a", "b", "b"]
+    # each survivor packed one canvas: a random token, the turn close,
+    # then padding
     assert sorted(packed) == [0, 2, 3]
-    assert [len(packed[d]) for d in (0, 2, 3)] == [2, 3, 2]
-    # the first step reads zero conditioning; the next reads the step
-    # before's probabilities times the embedding and the normalizer
-    assert not conditioned[2][0].any()
-    assert torch.allclose(conditioned[2][1], 2.0 * torch.eye(vocab)[[5, 5, 5, 5]])
-    # the classification packed a frame, then a cue and a canvas per
-    # step, over the survivors' resident KV: no second prefill
-    steps = 2 + 3 + 2
-    assert metrics["classify:r"]["fresh_tokens"] == 3 * 2 + steps * 5
+    for document in (0, 2, 3):
+        (canvas,) = packed[document]
+        assert 0 <= canvas[0] < vocab and canvas[1:] == [6, 0, 0]
+    # the classification packed a frame, the cue, and the canvas per
+    # survivor over its resident KV: no second prefill
+    assert metrics["classify:r"]["fresh_tokens"] == 3 * (2 + 1 + 4)
     assert metrics["classify:r"]["evaluated_documents"] == 3
     assert metrics["filter:r"]["fresh_tokens"] == sum(map(len, docs["r"])) + 4
     if joined:
         # the label filter keeps document 0, whose partner suffixes
-        # ran over its resident KV after its last denoising step
+        # ran over its resident KV after its read
         assert outputs[PortRef("label:r", "ids:r")].column("r").to_pylist() \
             == [0]
         joined_ids = outputs[PortRef("group:0", "ids:r")]
@@ -349,7 +351,7 @@ def test_streamed_classification_labels_survivors_with_their_kv_resident(
         # (answers, rows, targets), padded; a frame entry's one row is
         # not read and carries no log probabilities
         rows_per_answer = rows_per_answer or [1] * len(rows)
-        padded = np.full((len(rows_per_answer), 2, len(TARGETS)), np.nan,
+        padded = np.full((len(rows_per_answer), 1, len(TARGETS)), np.nan,
                          np.float32)
         start = 0
         for answer, count in enumerate(rows_per_answer):
@@ -361,8 +363,8 @@ def test_streamed_classification_labels_survivors_with_their_kv_resident(
         return padded
 
     execution.state["label_readout"] = SimpleNamespace(
-        targets=np.asarray(TARGETS), rows=2,
-        dtype=np.dtype((np.float32, (2, len(TARGETS)))), submit=submit,
+        targets=np.asarray(TARGETS), rows=1,
+        dtype=np.dtype((np.float32, (1, len(TARGETS)))), submit=submit,
         result=lambda rows: rows)
     state = {
         "torch": torch, "arena": arena, "pipeline": pipeline,
@@ -393,10 +395,10 @@ def test_streamed_classification_labels_survivors_with_their_kv_resident(
     # join packed only frames and suffixes after resident KV
     prefill = sum(len(docs["r"][d]) for d in range(n_docs))
     assert metrics["filter:r"]["fresh_tokens"] == prefill + n_docs
-    # a frame and the two-token path per survivor
-    assert metrics["classify:r"]["fresh_tokens"] == 3 * len(passed)
+    # a one-token frame and the cue per survivor
+    assert metrics["classify:r"]["fresh_tokens"] == 2 * len(passed)
     assert metrics["classify:r"]["evaluated_documents"] == len(passed)
-    assert metrics["classify:r"]["label_tokens"] == 2 * len(passed)
+    assert metrics["classify:r"]["label_tokens"] == len(passed)
     # some chunk held documents at the chain's stage beside documents
     # at the classification's or the join's
     heads = [{suffix[0] for spec in specs for suffix in spec["suffixes"]}
@@ -412,7 +414,7 @@ def joined_graph():
         name="stance", aliases=("r", "p"), query_template="", arguments=(),
         expected_inputs=3, estimated_seconds=0.0,
         prompt_token_parts=((), (CLASSIFY_FRAME, CUE)), labels=("a", "b"),
-        label_token_ids=LABEL_IDS, scoring="trie_paths",
+        label_token_ids=LABEL_IDS, scoring="letters",
         join_layout=((NOTE,), (PARTNER_LABEL,)))
     nodes = [
         Scan(node_id="input:r", alias="r", input_id="r"),
@@ -512,9 +514,9 @@ def test_a_classification_of_joined_rows_runs_after_its_join_on_the_anchors_kv(
     assert labels.column("stance").to_pylist() == ["a", "b", "a"]
     # the join packed the anchors once; the classification packed, per
     # anchor kept, its note and, per pair, the partner block, the
-    # question, and the path [CUE, 11]: no second prefill
+    # question, and the cue: no second prefill
     block = 1 + 2 + 1
-    assert metrics["classify:rp"]["fresh_tokens"] == 2 * 1 + 3 * (block + 2)
+    assert metrics["classify:rp"]["fresh_tokens"] == 2 * 1 + 3 * (block + 1)
     assert metrics["classify:rp"]["evaluated_document_pairs"] == 3
     # the join packed every anchor, its frame, and both partners' suffixes
     assert metrics["group:0"]["fresh_tokens"] == sum(map(len, docs["r"])) \
@@ -522,17 +524,17 @@ def test_a_classification_of_joined_rows_runs_after_its_join_on_the_anchors_kv(
 
 
 def chained_graph():
-    """A decoded classification, its label filter, and a second classification."""
+    """A classification, its label filter, and a second classification."""
     first = ClassifySpec(
         name="topic", aliases=("r",), query_template="", arguments=(),
         expected_inputs=14, estimated_seconds=0.0,
         prompt_token_parts=((), (CLASSIFY_FRAME, CUE)), labels=("a", "b"),
-        label_token_ids=LABEL_IDS, scoring="trie_decode")
+        label_token_ids=LABEL_IDS, scoring="letters")
     second = ClassifySpec(
         name="kind", aliases=("r",), query_template="", arguments=(),
         expected_inputs=7, estimated_seconds=0.0,
         prompt_token_parts=((), (CLASSIFY_FRAME, CUE)), labels=("a", "b"),
-        label_token_ids=LABEL_IDS, scoring="trie_paths")
+        label_token_ids=LABEL_IDS, scoring="letters")
     nodes = [
         Scan(node_id="input:r", alias="r", input_id="r"),
         AiClassify(
@@ -552,7 +554,7 @@ def chained_graph():
     return PhysicalGraph(tuple(nodes), PortRef("classify2:r", "scores"))
 
 
-def test_a_decoded_classification_hands_its_documents_on_through_the_label_filter(
+def test_a_classification_hands_its_documents_on_through_the_label_filter(
         monkeypatch):
     from quail.backends.quail.executor import classify as classify_module
     from quail.execution.pipelines import build_pipelines
@@ -566,7 +568,7 @@ def test_a_decoded_classification_hands_its_documents_on_through_the_label_filte
     docs = {"r": [[DOC + d] * (10 + 2 * d) for d in range(n_docs)]}
     label_truth = [d % 2 for d in range(n_docs)]           # even: "a"
 
-    class DecodingModel(LabelingModel):
+    class ChainModel(LabelingModel):
         def forward_chunk(self, chunk):
             rows = []
             for spec in chunk.specs:
@@ -574,20 +576,15 @@ def test_a_decoded_classification_hands_its_documents_on_through_the_label_filte
                     if suffix[0] != CUE:
                         rows.append(0)
                         continue
-                    wanted = LABEL_IDS[self.label_truth[spec["key"][1]]]
-                    count = len(suffix) if spec.get("read_all_rows") else 1
-                    for depth in range(count):
-                        # the last row of a decode round wants the next
-                        # token; every row of a path wants its own
-                        want = wanted[len(suffix) - 1] if count == 1 \
-                            else wanted[depth]
-                        rows.append(np.asarray(
-                            [-1.0 if token == want else -5.0
-                             for token in TARGETS], np.float32))
+                    # the cue's row wants the document's letter
+                    (want,) = LABEL_IDS[self.label_truth[spec["key"][1]]]
+                    rows.append(np.asarray(
+                        [-1.0 if token == want else -5.0
+                         for token in TARGETS], np.float32))
             self.launched.append(chunk.specs)
             return rows
 
-    model = DecodingModel([], {}, label_truth)
+    model = ChainModel([], {}, label_truth)
     torch = fake_torch()
     # the readout constructor is replaced below; its arguments are read
     torch.nn = SimpleNamespace(functional=None)
@@ -604,7 +601,7 @@ def test_a_decoded_classification_hands_its_documents_on_through_the_label_filte
         answer_rows=object(), chunk_tokens=120)
 
     class FakeReadout:
-        # the two classifications read one row and two rows per answer
+        # both classifications read one row per answer
         def __init__(self, targets, rows):
             self.targets = np.asarray(targets)
             self.rows = rows
@@ -657,8 +654,8 @@ def test_a_decoded_classification_hands_its_documents_on_through_the_label_filte
     # the first label rides along, so a projection can name it
     assert second.column("topic").to_pylist() == ["a"] * len(accepted)
     # the first classification packed every document once; the second
-    # packed only a frame and the label path per accepted document
+    # packed only a frame and the cue per accepted document
     prefill = sum(len(docs["r"][d]) for d in range(n_docs))
     assert metrics["classify:r"]["fresh_tokens"] >= prefill
-    assert metrics["classify2:r"]["fresh_tokens"] == 3 * len(accepted)
+    assert metrics["classify2:r"]["fresh_tokens"] == 2 * len(accepted)
     assert metrics["classify2:r"]["evaluated_documents"] == len(accepted)

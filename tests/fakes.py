@@ -63,9 +63,16 @@ def bare_arena(arena, pages):
     return arena
 
 
+def letter_tokens(text):
+    """Bytes, but a one- or two-letter answer after a space is one token."""
+    import re
+    if re.fullmatch(r" [A-Za-z]{1,2}", text):
+        return [10_000 * (len(text) - 1) + sum(map(ord, text[1:]))]
+    return list(text.encode())
+
+
 def cpu_staging(monkeypatch):
     """Stage packed chunks as plain CPU tensors; returns torch."""
-    import numpy as np
     import torch
 
     def staged(torch_, data, dtype, pinned=True):
@@ -173,23 +180,6 @@ def fake_pack(torch, arena, specs, **kw):
     if all(rows == 1 for rows in rows_per_answer):
         rows_per_answer = ()
     meta = {}
-    if any(spec.get("conditioning") is not None for spec in specs):
-        import torch as real
-
-        # each canvas row reads its self-conditioning row, as pack_chunk
-        # gathers it; a canvas naming none reads -1
-        index = real.tensor([
-            -1 if spec.get("conditioning") is None else spec["conditioning"] + row
-            for spec in specs for _ in spec["suffixes"]
-            for row in range(canvas_rows(spec))])
-        named = index >= 0
-        widths = [canvas_rows(spec) for spec in specs for _ in spec["suffixes"]]
-        meta["canvas"] = dict(
-            conditioning_rows=index,
-            conditioning=kw["conditioning"].index_select(0, index[named]),
-            cu_q_host=np.concatenate([[0], np.cumsum(widths)]))
-        if not bool(named.all()):
-            meta["canvas"]["conditioned"] = named
     return SimpleNamespace(specs=specs, tokens=tokens, temporary_keys=(),
                            fresh_keys=(), rows_per_answer=rows_per_answer,
                            meta=meta)

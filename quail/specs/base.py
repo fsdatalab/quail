@@ -13,48 +13,25 @@ Role = Literal["generative", "reranker"]
 ACT_BYTES_PER_HIDDEN = 32
 
 
-@dataclass(frozen=True)
-class Denoising:
-    """A diffusion model's denoising sampler, as vLLM runs it.
+# Every random canvas token comes from this seed: a filter's fixed
+# canvas, and a classified document's canvas with the document's row.
+CANVAS_SEED = 0
 
-    The values come from the checkpoint: the logit cap from its
-    config.json, the rest but canvas_rows from its
-    generation_config.json. The executor checks them against the
-    loaded checkpoint.
+
+@dataclass(frozen=True)
+class AnswerCanvas:
+    """A diffusion model's answer canvas, which the ``letters`` rule reads.
 
     Attributes:
-        canvas_rows: Rows of the answer canvas AI.CLASSIFY decodes.
-        max_steps: Denoising steps before the canvas is taken as is.
-        t_min: Temperature of the last step.
-        t_max: Temperature of the first step.
-        entropy_bound: Summed entropy of the rows a step keeps.
-        confidence_threshold: Mean row entropy below which a canvas is
-            confident.
-        stability_threshold: Steps in a row whose argmax canvas must
-            equal the one before for the canvas to be stable.
-        logit_softcap: Cap of the tanh applied to the output logits.
-        stop_token_ids: Token ids that end the decoded answer.
-        turn_close_id: The token that closes the model's turn, which
-            the ``letters`` rule seeds after the answer's row.
+        rows: Rows of the canvas packed after the classification cue.
+        turn_close_id: The token that closes the model's turn, seeded
+            after the answer's row.
         pad_id: The padding token, which fills the rows after it.
     """
 
-    canvas_rows: int
-    max_steps: int
-    t_min: float
-    t_max: float
-    entropy_bound: float
-    confidence_threshold: float
-    stability_threshold: int
-    logit_softcap: float
-    stop_token_ids: tuple[int, ...]
+    rows: int
     turn_close_id: int
     pad_id: int
-
-    def temperature(self, step: int) -> float:
-        """The temperature of denoising step ``step``, counted from 0."""
-        remaining = max(self.max_steps - step, 1)
-        return self.t_min + (self.t_max - self.t_min) * remaining / self.max_steps
 
 
 @dataclass(frozen=True)
@@ -106,9 +83,9 @@ class ModelSpec:
     #                               later than 0 when the model opens
     #                               its turn with fixed tokens, such as
     #                               an empty thinking channel
-    denoising: "Denoising | None" = None    # a diffusion model's
-    #                                        denoising sampler, which
-    #                                        AI.CLASSIFY decodes with
+    answer_canvas: "AnswerCanvas | None" = None    # a diffusion model's
+    #                                        answer canvas, which the
+    #                                        letters rule reads
     turn_prefix: str = ""     # chat-turn text before every prompt
     turn_suffix: str = ""     # chat-turn text after the answer cue
     prompt_format: str = "raw-v1"    # names the turn layout in run records
