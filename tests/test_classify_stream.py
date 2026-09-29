@@ -120,6 +120,23 @@ def fused_graph():
     return PhysicalGraph(tuple(nodes), PortRef("group:0", "ids:r"))
 
 
+def test_a_canvas_classification_is_no_pipeline_member():
+    from dataclasses import replace
+
+    from quail.execution.pipelines import build_pipelines
+
+    graph = fused_graph()
+    chains = {pipeline.node_ids for pipeline in build_pipelines(graph).values()}
+    assert chains == {("filter:r", "classify:r", "label:r", "group:0")}
+    canvas = replace(graph.node("classify:r"),
+                     spec=replace(graph.node("classify:r").spec,
+                                  scoring="canvas"))
+    alone = PhysicalGraph(tuple(canvas if node.node_id == "classify:r" else node
+                                for node in graph.nodes), graph.root)
+    chains = {pipeline.node_ids for pipeline in build_pipelines(alone).values()}
+    assert chains == {("filter:r",), ("group:0",)}
+
+
 def test_streamed_classification_labels_survivors_with_their_kv_resident(
         monkeypatch):
     monkeypatch.setattr(loop, "pack_chunk", fake_pack)

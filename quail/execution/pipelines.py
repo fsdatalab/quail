@@ -54,7 +54,10 @@ def operator_aliases(node: PhysicalNode) -> tuple[str, ...]:
     if isinstance(node, AiFilter):
         return (node.alias,)
     if isinstance(node, AiClassify):
-        if node.spec is None or len(node.spec.aliases) != 1:
+        # a diffusion model's classification decodes on its own: its
+        # readout reads whole chunks, which no other stage shares
+        if node.spec is None or len(node.spec.aliases) != 1 \
+                or node.spec.scoring == "canvas":
             return ()
         return tuple(node.spec.aliases)
     if isinstance(node, LabelFilter):
