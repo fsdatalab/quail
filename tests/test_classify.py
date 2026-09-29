@@ -1032,6 +1032,11 @@ def test_planner_pads_labels_to_the_canvas_on_a_diffusion_model(tmp_path):
         text = _bytes(label_text(label))
         assert list(ids) == text + [7] + [0] * (rows - len(text) - 1)
     assert plan.settings["label_scoring"] == "cost model"
+    # a chain's classifications stay separate nodes, each with its own
+    # canvas length
+    chained = _chain(session).plan()
+    classifies = [n for n in chained.nodes if isinstance(n, AiClassify)]
+    assert len(classifies) == 2 and not any(n.spec.stages for n in classifies)
     forced = quail.Session(
         EngineConfig(model=DIFFUSION_GEMMA_26B_FP8.name, device="h100-sxm",
                      label_scoring="trie_paths"), tokenizer=tokenizer)

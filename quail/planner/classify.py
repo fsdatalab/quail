@@ -566,7 +566,10 @@ def plan_classify(region, context, *, backend_name: str):
     since = []            # label filters since that stage
     for kind, item in steps:
         if kind == "classify":
+            # a canvas model's stages would need canvases of different
+            # lengths, so each classification runs as its own node
             joins = (chain is not None and len(since) <= 1
+                     and not model.canvas_tokens
                      and all(predicates[p].expression.call is last_call
                              for p in since)
                      and table.head(item) == table.head(last_call))

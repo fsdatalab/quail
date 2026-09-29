@@ -171,8 +171,11 @@ class QuailClassifier:
         prefixes = document_prefixes(spec, documents, rows)
         canvas = None
         if spec.scoring == "canvas":
-            # the canvas rows follow the tail and are the rows read
-            canvas = state["pipeline"].canvas_rows(len(specs[0].label_token_ids[0]))
+            # the canvas rows follow the tail and are the rows read; a
+            # canvas classification never chains, so one canvas length
+            if len(specs) > 1:
+                raise ValueError("a canvas classification runs alone")
+            canvas = state["pipeline"].canvas_rows(len(spec.label_token_ids[0]))
             readout_rows = len(canvas)
         else:
             readout_rows = (max(len(suffix) for request in requests
