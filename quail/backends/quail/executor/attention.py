@@ -85,6 +85,28 @@ def flash_attention_version(capability: tuple[int, int]) -> int:
     raise ValueError(f"Quail does not support CUDA capability {capability}")
 
 
+def merge_partial(out, lse, index, out_c, lse_c) -> None:
+    """Fold a partial attention result into rows of another, in place.
+
+    Both results are softmax-weighted sums over disjoint key sets of
+    the same queries, with their log-sum-exp; the merged rows are the
+    attention over the union. ``out`` is (rows, heads, dim) and
+    ``lse`` (heads, rows), as the attention kernels return them;
+    ``index`` names the rows of ``out`` that ``out_c`` covers.
+    """
+    lse_b = lse[:, index]
+    top = lse_b.maximum(lse_c)
+    w_b = (lse_b - top).exp()
+    w_c = (lse_c - top).exp()
+    total = w_b + w_c
+    weight_b = (w_b / total).transpose(0, 1).unsqueeze(-1)
+    weight_c = (w_c / total).transpose(0, 1).unsqueeze(-1)
+    merged = (out.index_select(0, index).float() * weight_b
+              + out_c.float() * weight_c)
+    out.index_copy_(0, index, merged.to(out.dtype))
+    lse[:, index] = top + total.log()
+
+
 class Engine:
     """Kernels, quantization, and shared-prefix attention over the paged arena.
 
@@ -866,6 +888,17 @@ class Engine:
             q_readers, kp, vp, reads["cu_q"], None,
             reads["max_q"], reads["max_used"], causal=False,
             block_table=reads["table"], seqused_k=reads["used"])
+        nodes = reads.get("nodes")
+        if nodes is not None:
+            # call C: chain rows over their ancestor rows in earlier
+            # chains of the chunk, merged into their call B result
+            out_c, lse_c = self._fa(
+                q3.index_select(0, nodes["rows"]),
+                k3.index_select(0, nodes["key_rows"]),
+                v3.index_select(0, nodes["key_rows"]),
+                nodes["cu_q"], nodes["cu_k"], nodes["max_q"], nodes["max_k"],
+                causal=False)
+            merge_partial(out_b, lse_b, nodes["b_index"], out_c, lse_c)
         lse_a = lse_a.transpose(0, 1)
         lse_b = lse_b.transpose(0, 1)
         q_out, scales = self.merge_attn_quant(

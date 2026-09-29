@@ -24,6 +24,11 @@ the partner suffixes are:
 - ``trie_search``: one stage per trie node. Each round a document
   sends one chain, the next node of the label with the highest bound,
   so the winning label resolves first and prunes the rest.
+- ``trie_tree``: the whole trie as one suffix: the cue and every
+  node's token once, split into chains that each follow first
+  children. Each chain is a causal segment and reads the ancestors
+  above it from earlier chains, so every node is computed once and
+  every row is read.
 - ``canvas``: a diffusion model's rule. The whole tail is one suffix
   and a canvas of one row per padded label token follows it; every
   canvas row is read, and a label's score sums, row by row, the log
@@ -52,6 +57,8 @@ from quail.execution.labels import (
     label_trie,
     trace_key,
     trace_scores,
+    tree_scores,
+    trie_chains,
     trie_paths,
     trie_targets,
     write_label_traces,
@@ -85,6 +92,7 @@ class LabelRequests:
         rounds: Under ``trie_rounds`` and ``trie_search``, the number
             of rounds a document may need; each round offers every
             node's chain and a document picks its own.
+        chains: Under ``trie_tree``, the chains the one suffix packs.
     """
 
     frame: list
@@ -93,6 +101,7 @@ class LabelRequests:
     read_all_rows: bool
     score: Callable[[np.ndarray], np.ndarray] | None
     rounds: int = 0
+    chains: list | None = None
 
 
 def label_requests(spec, targets=None) -> LabelRequests:
@@ -120,6 +129,14 @@ def label_requests(spec, targets=None) -> LabelRequests:
         return LabelRequests(
             frame, [[cue, *label[:-1]] for label in ids], targets, True,
             lambda logprobs: label_chain_scores(ids, targets, logprobs))
+    if spec.scoring == "trie_tree":
+        chains = trie_chains(ids)
+        tokens = [cue if node == () else node[-1]
+                  for nodes, _, _ in chains for node in nodes]
+        return LabelRequests(
+            frame, [tokens], targets, True,
+            lambda logprobs: tree_scores(ids, chains, targets, logprobs[0]),
+            chains=chains)
     if spec.scoring == "trie_paths":
         paths = trie_paths(ids)
         return LabelRequests(
@@ -239,7 +256,8 @@ class QuailClassifier:
                     frame=request.frame, decide=whole,
                     requests=((lambda key, index=index: gate(index, key))
                               if index else None),
-                    read_all_rows=read_all, label=stage_spec.name))
+                    read_all_rows=read_all, label=stage_spec.name,
+                    chains=request.chains))
                 continue
             scorer = RoundScorer(
                 stage_spec.label_token_ids, targets, len(rows),

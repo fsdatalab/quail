@@ -11,6 +11,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Protocol, runtime_checkable
 
+import numpy as np
 import pyarrow as pa
 from pyarrow import compute as pc
 
@@ -972,12 +973,17 @@ class Query:
                         raise CompileError(
                             f"label column {name!r} belongs to {alias!r}, "
                             f"which is not in the result")
-                    widened = [None] * len(self._doc_tokens[alias])
-                    for document, label in zip(
-                            table.column(alias).to_pylist(),
-                            table.column(name).to_pylist()):
-                        widened[document] = label
-                    values = pa.array(widened, pa.string())
+                    labeled = table.column(name).combine_chunks().cast(
+                        pa.string())
+                    # position of each document's label, or the null
+                    # appended past the labels for an unlabeled one
+                    slots = np.full(len(self._doc_tokens[alias]), len(labeled),
+                                    dtype=np.int64)
+                    slots[table.column(alias).to_numpy()] = np.arange(
+                        len(labeled))
+                    values = pc.take(
+                        pa.concat_arrays([labeled, pa.array([None], pa.string())]),
+                        pa.array(slots))
                     projection.append((alias, values))
                     fields.append(pa.field(
                         name, pa.string(), nullable=True,

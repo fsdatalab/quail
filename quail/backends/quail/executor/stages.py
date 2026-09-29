@@ -57,6 +57,9 @@ class Stage:
             attention a borrowing document reads its parent's pages
             stacked with its siblings.
         label: The stage's name in progress lines.
+        chains: For a stage whose one suffix packs a label trie, the
+            chains from ``trie_chains``: the packer makes each a causal
+            segment and gathers the ancestors above it.
     """
 
     DROP = DROP
@@ -70,6 +73,7 @@ class Stage:
     read_all_rows: bool = False
     single: bool = False
     label: str = ""
+    chains: list | None = None
 
 
 def shared_preamble_tokens(question_ids) -> int:
@@ -352,13 +356,15 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                 entries.append((j, 1))
                 specs.append(dict(
                     key=key, prefix=None, f=f + len(frame),
-                    suffixes=sufs, read_all_rows=read_all))
+                    suffixes=sufs, read_all_rows=read_all,
+                    chains=stages[j].chains))
             else:
                 specs.append(dict(
                     key=key, prefix=prefix, start=shared, read_key=read_key,
                     f=f + len(frame),
                     suffixes=sufs, read_all_rows=read_all,
-                    single=stages[j].single and end - start == 1))
+                    single=stages[j].single and end - start == 1,
+                    chains=stages[j].chains))
             entries.append((j, rows))
         chunk = pack_chunk(torch, arena, specs, attention_mode=mode,
                            staging=staging, canvas=canvas,

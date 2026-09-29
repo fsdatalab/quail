@@ -857,7 +857,7 @@ def test_classify_refusals_and_builder_errors(session):
     # the plan setting picks the scoring rule; the cost model by default
     plan = query.plan()
     (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
-    assert classify.spec.scoring in ("trie_paths", "trie_search")
+    assert classify.spec.scoring in ("trie_paths", "trie_tree", "trie_search")
     assert plan.settings["label_scoring"] == "cost model"
     for rule in ("trie_nodes", "label_chains", "trie_paths", "trie_rounds",
                  "trie_search", "next_rule"):
@@ -1044,4 +1044,189 @@ def test_planner_pads_labels_to_the_canvas_on_a_diffusion_model(tmp_path):
     refused = _topic(forced).plan()
     assert isinstance(refused, Refusal) and "canvas" in refused.reasons[0]
     forced.close()
+    # the sequential alternative: one trie node per request, read at
+    # the one-row canvas after it, with unpadded labels
+    sequential = quail.Session(
+        EngineConfig(model=DIFFUSION_GEMMA_26B_FP8.name, device="h100-sxm",
+                     label_scoring="trie_nodes"), tokenizer=tokenizer)
+    sequential.register("documents",
+                        DocumentProvider.from_parquet(path, id_col="id"))
+    (classify,) = [n for n in _topic(sequential).plan().nodes
+                   if isinstance(n, AiClassify)]
+    assert classify.spec.scoring == "trie_nodes"
+    assert [list(ids) for ids in classify.spec.label_token_ids] == [
+        _bytes(label_text(label)) for label in classify.spec.labels]
+    sequential.close()
     session.close()
+
+
+def test_trie_chains_cover_every_node_once_and_gather_ancestors():
+    from quail.execution.labels import tree_scores, trie_chains
+
+    # labels a=[1,2,3], b=[1,2,4], c=[1,5,6], d=[7,8]: the rows are the
+    # nodes with children, (), (1,), (1,2), (1,5), and (7,)
+    labels = ((1, 2, 3), (1, 2, 4), (1, 5, 6), (7, 8))
+    chains = trie_chains(labels)
+    assert [nodes for nodes, _, _ in chains] == [
+        [(), (1,), (1, 2)], [(1, 5)], [(7,)]]
+    assert [start for _, start, _ in chains] == [0, 2, 1]
+    # (1, 5) reads the cue row and the (1,) row; (7,) reads the cue row
+    assert [gathers for _, _, gathers in chains] == [[], [(0, 2)], [(0, 1)]]
+    nodes = [node for chain, _, _ in chains for node in chain]
+    assert sorted(nodes) == sorted(label_trie(labels))
+    # a label whose node is not on the first chain reads the right row
+    targets = [1, 2, 3, 4, 5, 6, 7, 8]
+    logprobs = np.full((len(nodes), len(targets)), -9.0)
+    logprobs[0, 0] = -1.0     # () -> 1
+    logprobs[0, 6] = -2.0     # () -> 7
+    logprobs[1, 1] = -0.5     # (1,) -> 2
+    logprobs[1, 4] = -0.25    # (1,) -> 5
+    logprobs[2, 2] = -3.0     # (1, 2) -> 3
+    logprobs[2, 3] = -0.1     # (1, 2) -> 4
+    logprobs[3, 5] = -0.5     # (1, 5) -> 6
+    logprobs[4, 7] = -0.3     # (7,) -> 8
+    scores = tree_scores(labels, chains, targets, logprobs)
+    assert scores.tolist() == [-4.5, -1.6, -1.75, -2.3]
+    assert best_label(scores) == 1
+    spec = ClassifySpec(
+        name="topic", aliases=("d",), query_template="", arguments=(),
+        expected_inputs=1, estimated_seconds=0.0,
+        prompt_token_parts=((90,), (91, 93)), labels=("a", "b", "c", "d"),
+        label_token_ids=labels, scoring="trie_tree")
+    requests = label_requests(spec)
+    # the cue, then each node's last token in chain order
+    assert requests.suffixes == [[93, 1, 2, 5, 7]]
+    assert requests.chains == chains and requests.read_all_rows
+
+
+def test_pack_chunk_packs_chains_as_segments_reading_ancestors(monkeypatch):
+    from fakes import cpu_staging
+    from test_sliding_kv import plain_arena
+
+    from quail.execution.labels import trie_chains
+
+    torch = cpu_staging(monkeypatch)
+    arena = plain_arena()
+    key = ("d", 0)
+    arena.activate(key, 4, capacity_tokens=16, base_tokens=4)
+    chains = trie_chains(((1, 2, 3), (1, 2, 4), (1, 5, 6), (7, 8)))
+    group = dict(key=key, prefix=None, f=4, suffixes=[[93, 1, 2, 5, 7]],
+                 read_all_rows=True, chains=chains)
+    chunk = loop.pack_chunk(torch, arena, [group], attention_mode="tree")
+    # rows: cue, (1,), (1,2) | (1,5) | (6,): positions past the frame
+    assert chunk.positions.tolist() == [4, 5, 6, 6, 5]
+    assert chunk.meta["cu_a"].tolist() == [0, 3, 4, 5]
+    reads = chunk.meta["reads"]
+    assert reads["rows"].tolist() == [0, 1, 2, 3, 4]
+    nodes = reads["nodes"]
+    assert nodes["rows"].tolist() == [3, 4]
+    assert nodes["key_rows"].tolist() == [0, 1, 0]
+    assert nodes["cu_q"].tolist() == [0, 1, 2]
+    assert nodes["cu_k"].tolist() == [0, 2, 3]
+    assert nodes["b_index"].tolist() == [3, 4]
+    assert chunk.final_indices.tolist() == [0, 1, 2, 3, 4]
+    assert chunk.rows_per_answer == (5,)
+    with pytest.raises(ValueError, match="tree attention"):
+        loop.pack_chunk(torch, arena, [group], attention_mode="unified")
+
+
+def test_merge_partial_equals_attention_over_the_union_of_keys():
+    torch = pytest.importorskip("torch")
+    from quail.backends.quail.executor.attention import merge_partial
+
+    torch.manual_seed(0)
+    heads, dim, keys = 2, 4, 6
+    q = torch.randn(3, heads, dim)
+    k = torch.randn(keys, heads, dim)
+    v = torch.randn(keys, heads, dim)
+
+    def attend(rows, key_slice):
+        scores = torch.einsum("rhd,khd->hrk", q[rows], k[key_slice])
+        weights = scores.softmax(-1)
+        out = torch.einsum("hrk,khd->rhd", weights, v[key_slice])
+        return out, scores.logsumexp(-1)
+
+    out_b, lse_b = attend(slice(0, 3), slice(0, 4))
+    out_c, lse_c = attend(slice(1, 3), slice(4, 6))
+    whole, _ = attend(slice(1, 3), slice(0, 6))
+    merge_partial(out_b, lse_b, torch.tensor([1, 2]), out_c, lse_c)
+    assert torch.allclose(out_b[1:], whole, atol=1e-5)
+    assert torch.allclose(out_b[0], attend(slice(0, 1), slice(0, 4))[0][0])
+
+
+def test_classifier_scores_the_packed_trie(monkeypatch):
+    from quail.execution.labels import trie_chains
+
+    labels = ((1, 2, 3), (1, 2, 4), (1, 5, 6), (7, 8))
+    chains = trie_chains(labels)
+    spec = ClassifySpec(
+        name="topic", aliases=("d",), query_template="", arguments=(),
+        expected_inputs=2, estimated_seconds=0.0,
+        prompt_token_parts=((90,), (91, 93)), labels=("a", "b", "c", "d"),
+        label_token_ids=labels, scoring="trie_tree")
+    targets = label_requests(spec).targets
+    nodes = [node for chain, _, _ in chains for node in chain]
+
+    # document 0 prefers label b, document 1 label d
+    def forward(chunk):
+        rows = []
+        for entry in chunk.specs:
+            document = entry["key"][2]
+            wanted = labels[1 if document == 0 else 3]
+            if entry.get("chains") is None:
+                rows.append([0.0] * len(targets))     # the frame entry
+                continue
+            assert entry["chains"] == chains
+            for node in nodes:
+                rows.append([
+                    -1.0 if node + (token,) == wanted[:len(node) + 1] else -5.0
+                    for token in targets])
+        return np.asarray(rows, dtype=np.float32)
+
+    monkeypatch.setattr(loop, "pack_chunk", fake_pack)
+    def submit(rows, rows_per_answer=None):
+        # one record per answer: the frame entry's one row, a suffix's five
+        out = np.full((len(rows_per_answer), len(nodes), len(targets)), np.nan)
+        row = 0
+        for index, count in enumerate(rows_per_answer):
+            out[index, :count] = rows[row:row + count]
+            row += count
+        return out
+
+    readout = SimpleNamespace(
+        targets=np.asarray(targets), rows=len(nodes),
+        dtype=np.dtype((np.float32, (len(nodes), len(targets)))),
+        submit=submit, result=lambda rows: rows)
+    state = {"torch": fake_torch(), "arena": cpu_arena(64),
+             "pipeline": fake_pipeline(forward_chunk=forward),
+             "chunk_tokens": 64, "label_readout": readout,
+             "input_staging": SimpleNamespace(fixed_tokens=set())}
+    batch = QuailClassifier(state).classify(
+        spec, [[0], [1]], {"d": [[10, 11], [12]]})
+    assert list(batch.scores) == ["b", "d"]
+    # the trie's five rows once per document
+    assert batch.label_tokens == 2 * 5
+
+
+def test_planner_prefers_the_packed_trie_when_labels_share_prefixes():
+    from quail.cost import budgets
+    from quail.planner.classify import _Table
+
+    chunk = budgets.chunk_budget(QWEN3_4B_FP8, H100_SXM)
+    capacity = budgets.arena_tokens(QWEN3_4B_FP8, H100_SXM, chunk)
+    table = _Table(alias="d", mean=200.0, longest=300, budget=chunk,
+                   chunk=chunk, scoring=None, backend_name="quail",
+                   model=QWEN3_4B_FP8, device=H100_SXM, tokenizer=_bytes,
+                   capacity=capacity, lengths=(200,) * 500, tree=True)
+    # twenty labels branching under one shared token: 22 trie rows
+    # against 20 chains of three tokens
+    shared = tuple((7, i, 1) for i in range(20))
+    scoring, simulated = table.choose(500, 20, 30, shared, False)
+    assert scoring == "trie_tree"
+    assert simulated.label_tokens == 500 * len(label_trie(shared))
+    # one-token labels: both rules read the cue row once; the tie
+    # keeps the chains
+    scoring, _ = table.choose(500, 20, 30, ((1,), (2,)), False)
+    assert scoring == "trie_paths"
+    unified = _Table(**{**table.__dict__, "tree": False})
+    assert unified.choose(500, 20, 30, shared, False)[0] == "trie_paths"

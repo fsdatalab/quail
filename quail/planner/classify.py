@@ -64,9 +64,11 @@ def classification_refusal(context) -> Refusal | None:
     elif forced is not None and forced not in LABEL_SCORINGS:
         reason = (f"unknown label scoring rule {forced!r}; "
                   f"the rules are {LABEL_SCORINGS}")
-    elif model.canvas_tokens and forced not in (None, "canvas"):
+    elif model.canvas_tokens and forced not in (None, "canvas", "trie_nodes"):
+        # trie_nodes is the sequential alternative: one node at a time,
+        # each read at the model's one-row canvas after it
         reason = (f"{model.name!r} scores labels on a canvas; the "
-                  f"{forced!r} rule reads left-to-right log probabilities")
+                  f"{forced!r} rule reads every row of a chain")
     elif forced == "canvas" and not model.canvas_tokens:
         reason = f"{model.name!r} has no canvas to score labels on"
     elif model.canvas_tokens and not (model.canvas_end_text
@@ -92,7 +94,10 @@ def classify_table(context, alias: str, backend_name: str) -> "_Table":
         backend_name=backend_name, model=context.model,
         device=context.device, tokenizer=context.tokenizer,
         capacity=capacity, lengths=tuple(lengths),
-        traces=getattr(context, "label_traces", None))
+        traces=getattr(context, "label_traces", None),
+        tree=(context.model.weight_precision == "fp8"
+              and not context.model.canvas_tokens
+              and getattr(context, "attention", None) != "unified"))
 
 
 def has_label(logical) -> bool:
@@ -111,12 +116,14 @@ def has_label(logical) -> bool:
 # The label scoring rules the executor runs, in the order they were
 # added; each later rule must return the labels of the first.
 LABEL_SCORINGS = ("trie_nodes", "label_chains", "trie_paths", "trie_rounds",
-                  "trie_search", "canvas")
+                  "trie_search", "trie_tree", "canvas")
 
 # A round launched in one chunk has its answers read while the next
 # chunk runs, so a document's next round enters the chunk after that.
 READOUT_LAG_CHUNKS = 2
 EXHAUSTIVE_SCORING = "trie_paths"
+# every node once, in one request: fewest tokens, tree attention only
+TREE_SCORING = "trie_tree"
 ADAPTIVE_SCORINGS = ("trie_rounds", "trie_search")
 
 
@@ -137,6 +144,8 @@ def suffix_lengths(scoring: str, labels) -> list[int]:
     """
     if scoring == "canvas":
         return [len(labels[0])]
+    if scoring == "trie_tree":
+        return [len(label_trie(labels))]
     if scoring == "label_chains":
         return [len(ids) for ids in labels]
     if scoring == "trie_paths":
@@ -302,6 +311,8 @@ def rule_rounds(scoring: str, labels, traces=None, demand=None) -> tuple:
     if scoring == "canvas":
         return [[[len(labels[0])]]], True
     nodes = sorted(label_trie(labels), key=lambda node: (len(node), node))
+    if scoring == "trie_tree":
+        return [[[len(nodes)]]], True
     if scoring == "trie_nodes":
         return [[[1 + len(node) for node in nodes]]], False
     if scoring == "label_chains":
@@ -353,6 +364,9 @@ class _Table:
     capacity: int = 0
     lengths: tuple = ()
     traces: object = None
+    # whether the model runs the tree attention path, which the
+    # packed trie needs: an fp8 model with the plan not forced unified
+    tree: bool = False
 
     def sample(self, live: float) -> list[int]:
         """The lengths of the documents expected to reach a classification.
@@ -390,7 +404,7 @@ class _Table:
         tail = tuple(call.prompt.tail_token_ids)
         labels = tuple(tuple(self.tokenizer(label_text(label)))
                        for label in call.labels)
-        if self.model.canvas_tokens:
+        if self.model.canvas_tokens and self.scoring != "trie_nodes":
             labels = self.padded(labels)
         traces = None
         if self.traces is not None:
@@ -462,12 +476,14 @@ class _Table:
         without them. Ties go to fewer rounds, then fewer label
         tokens, then the order listed.
         """
-        if self.model.canvas_tokens:
+        if self.model.canvas_tokens and self.scoring != "trie_nodes":
             candidates = ["canvas"]
         elif self.scoring:
             candidates = [self.scoring]
         else:
             candidates = [EXHAUSTIVE_SCORING]
+            if self.tree:
+                candidates.append(TREE_SCORING)
             if traces:
                 candidates += list(ADAPTIVE_SCORINGS)
         best = None

@@ -306,6 +306,11 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     at most one suffix. Under unified attention a chunk is either all
     paged or all unpaged.
 
+    A group may carry chains, from ``trie_chains``: its one suffix is
+    then several causal segments, each starting at its own position
+    past f, and a segment's rows also read the rows above it in
+    earlier segments through call C. Its document must be resident.
+
     canvas is the token ids a diffusion model denoises: they follow
     every suffix as extra rows, and the answer row is canvas row
     answer_row instead of the suffix's last row. Canvas KV goes
@@ -351,6 +356,8 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     read_keys, read_used, cu_q = [], [], [0]
     max_q = 0
     unified_groups = []
+    # call C: chain rows reading their off-chain ancestor rows
+    node_q, node_k, node_cu_q, node_cu_k = [], [], [0], [0]
     for g in groups:
         fresh = g.get("prefix") is not None
         f = g["f"]
@@ -435,7 +442,34 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             else:
                 finals.append(s_row0 + ends - 1)
                 rows_per_answer.append(np.ones(n, dtype=np.int64))
-        if n:
+        chains = g.get("chains")
+        if chains is not None:
+            if n != 1 or not read_all or not tree_path:
+                raise ValueError("chains pack one suffix, every row read, "
+                                 "under tree attention")
+            lengths = np.array([len(nodes) for nodes, _, _ in chains])
+            starts = np.array([start for _, start, _ in chains])
+            chain_ends = s_row0 + np.cumsum(lengths)
+            chain_row0 = chain_ends - lengths
+            pos.append(f + np.repeat(starts, lengths)
+                       + (np.arange(total, dtype=np.int64)
+                          - np.repeat(chain_row0 - s_row0, lengths)))
+            cu_a.append(chain_ends)
+            # a chain's rows read the rows above its first node, which
+            # earlier chains hold, in call C
+            for index, (_, _, gathers) in enumerate(chains):
+                if not gathers:
+                    continue
+                keys = np.concatenate([
+                    np.arange(chain_row0[c], chain_row0[c] + count,
+                              dtype=np.int64) for c, count in gathers])
+                node_q.append(np.arange(chain_row0[index], chain_ends[index],
+                                        dtype=np.int64))
+                node_k.append(keys)
+                node_cu_q.append(node_cu_q[-1] + int(lengths[index]))
+                node_cu_k.append(node_cu_k[-1] + len(keys))
+            token_count += total
+        elif n:
             pos.append(f + within)
             cu_a.append(s_row0 + ends)
             token_count += total
@@ -497,6 +531,21 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             max_q=max_q, used=_staged(torch, read_used, torch.int32, pinned),
             max_used=max(read_used), table=table,
             source=_staged(torch, source, torch.int32, pinned))
+        if node_q:
+            q_rows = np.concatenate(node_q)
+            reads["nodes"] = dict(
+                rows=_staged(torch, q_rows, torch.int64, pinned),
+                key_rows=_staged(torch, np.concatenate(node_k), torch.int64,
+                                 pinned),
+                cu_q=_staged(torch, node_cu_q, torch.int32, pinned),
+                cu_k=_staged(torch, node_cu_k, torch.int32, pinned),
+                max_q=int(np.diff(node_cu_q).max()),
+                max_k=int(np.diff(node_cu_k).max()),
+                # each node row's index among call B's rows
+                b_index=_staged(torch, source[q_rows], torch.int64, pinned))
+    elif node_q:
+        raise ValueError("chain rows read their document in call B; "
+                         "the document needs arena pages")
     t = _tick(timing, "pack_reads", t)
 
     # all of the chunk's KV writes as one list of (source, destination)
