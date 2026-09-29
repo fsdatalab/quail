@@ -251,12 +251,18 @@ def render_categories(labels, descriptions=()) -> str:
         for label, description in zip(labels, descriptions))
 
 
-def render_classify_question(question: str, labels, descriptions=()) -> str:
+def render_classify_question(question: str, labels, descriptions=(),
+                             task_description: str = "") -> str:
     """Wrap a classification question with its instruction, categories, and cue."""
     content = question.lstrip("\n")
     sep = question[:len(question) - len(content)] or "\n\n"
+    if task_description:
+        content = (content + "\n" if content else "") + task_description
     return (sep + CLASSIFY_INSTRUCTION + content
             + render_categories(labels, descriptions) + ANSWER_CUE)
+
+
+CLASSIFY_LAYOUTS = ("document_first", "labels_first")
 
 
 def label_text(label: str) -> str:
@@ -266,13 +272,18 @@ def label_text(label: str) -> str:
 
 def bind_classify_prompt(template: str, args: tuple, labels, descriptions=(),
                          tokenizer=None,
-                         turn: tuple[str, str] = ("", "")) -> Prompt:
+                         turn: tuple[str, str] = ("", ""),
+                         layout: str = "document_first",
+                         task_description: str = "") -> Prompt:
     """Build an AI.CLASSIFY Prompt: the document, then the question and labels.
 
     The layout is the filter layout with the classification
     instruction, a category list, and the answer cue after the
     question. Label text is not part of the tail; each label is scored
-    as ``label_text(label)`` after it.
+    as ``label_text(label)`` after it. Under the ``labels_first``
+    layout the instruction and categories come before the document in
+    the preamble, which every document then shares, and the tail is
+    the document and the answer cue.
 
     Args:
         template: Prompt template with one {0} placeholder.
@@ -282,20 +293,31 @@ def bind_classify_prompt(template: str, args: tuple, labels, descriptions=(),
         tokenizer: Optional callable (text -> token list) for counting.
         turn: The model's chat-turn text: the piece before the
             preamble and the piece after the answer cue.
+        layout: ``document_first`` or ``labels_first``.
+        task_description: Task text added after the question.
     """
     import re
     _check_placeholders(template, len(args))
     if len(args) != 1:
         raise CompileError("AI.CLASSIFY reads one document per row")
+    if layout not in CLASSIFY_LAYOUTS:
+        raise CompileError(
+            f"unknown AI.CLASSIFY layout {layout!r}; the layouts are "
+            f"{CLASSIFY_LAYOUTS}")
     frame, template = split_frame(template)
     preamble, tail = split_template(template)
     m = re.match(r"(\{\d+\})(.*)", tail, re.DOTALL)
     if m is None:
         raise CompileError(f"unexpected AI.CLASSIFY template: {template!r}")
-    tail = m.group(1) + render_classify_question(
-        m.group(2), labels, descriptions)
-    preamble = turn[0] + preamble
-    tail = tail + turn[1]
+    question = render_classify_question(
+        m.group(2), labels, descriptions, task_description)
+    if layout == "labels_first":
+        body = question[:len(question) - len(ANSWER_CUE)].lstrip("\n")
+        preamble = turn[0] + body + "\n\n" + preamble
+        tail = m.group(1) + ANSWER_CUE + turn[1]
+    else:
+        preamble = turn[0] + preamble
+        tail = m.group(1) + question + turn[1]
     pre_tok = tail_tok = frame_tok = None
     pre_ids = tail_ids = ()
     if tokenizer is not None:

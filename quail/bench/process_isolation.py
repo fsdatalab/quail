@@ -52,37 +52,47 @@ def run_backend_group(
     family = query_family_name(query_ids)
     run_dir = Path(run_dir)
     suites = {}
+    # several label scoring rules, comma-separated, run the Quail
+    # method once per rule in this one process, on this one GPU, so
+    # their times compare without container-to-container variance
+    rules = [rule.strip() for rule in (label_scoring or "").split(",")
+             if rule.strip()] or [None]
     for method in methods:
-        print(
-            f"[{family}] running {method} for {len(query_ids)} queries",
-            flush=True,
-        )
-        suite = run_suite(
-            query_ids, sf=sf,
-            config=EngineConfig(
-                gpus=1,
-                model=model,
-                backend=method,
-                device="h100-sxm",
-                label_scoring=label_scoring,
-                attention=attention,
-                gpu_timing=gpu_timing,
-                label_traces=label_traces,
-            ),
-            data_dir=Path(data_dir) / f"sf{sf}",
-            ground_truth_collection=ground_truth_collection or None,
-            root=root,
-            output_dir=run_dir / method / family,
-        )
-        suite["run_id"] = run_dir.name
-        suite["query_family"] = {"name": family, "query_ids": list(query_ids)}
-        suites[method] = suite
+        for rule in rules:
+            name = (method if rule is None or len(rules) == 1
+                    or method != "quail" else f"{method}-{rule}")
+            print(
+                f"[{family}] running {name} for {len(query_ids)} queries",
+                flush=True,
+            )
+            suite = run_suite(
+                query_ids, sf=sf,
+                config=EngineConfig(
+                    gpus=1,
+                    model=model,
+                    backend=method,
+                    device="h100-sxm",
+                    label_scoring=rule,
+                    attention=attention,
+                    gpu_timing=gpu_timing,
+                    label_traces=label_traces,
+                ),
+                data_dir=Path(data_dir) / f"sf{sf}",
+                ground_truth_collection=ground_truth_collection or None,
+                root=root,
+                output_dir=run_dir / name / family,
+            )
+            suite["run_id"] = run_dir.name
+            suite["query_family"] = {"name": family, "query_ids": list(query_ids)}
+            suites[name] = suite
+            if method != "quail":
+                break
     return {
         "query_family": family,
         "query_ids": list(query_ids),
-        "ground_truth_collection": suites[methods[0]]["collection_id"],
+        "ground_truth_collection": next(iter(suites.values()))["collection_id"],
         "gpu_uuids": list(visible_gpu_uuids()),
-        "methods": list(methods),
+        "methods": list(suites),
         "suites": suites,
     }
 

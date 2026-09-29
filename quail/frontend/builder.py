@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from quail.catalog import Catalog
+from quail.frontend.label_tables import read_label_table
 from quail.logical import (
     Alias,
     ColumnRef,
@@ -19,6 +20,7 @@ from quail.logical import (
     bind_join_prompt,
     bind_prompt,
 )
+from quail.logical.nodes import validate_task_description
 
 
 @dataclass(frozen=True, eq=False)
@@ -160,7 +162,8 @@ class Query:
     ai_if = ai_filter
 
     def ai_classify(self, p: PromptSpec, labels, *, name: str,
-                    descriptions=None) -> "Query":
+                    descriptions=None, layout: str = "document_first",
+                    task_description: str = "") -> "Query":
         """Pick one label per document and name it as a result column.
 
         The column can be returned by select() and tested with
@@ -170,9 +173,14 @@ class Query:
 
         Args:
             p: Prompt over one table's document column.
-            labels: The labels, in the order the prompt lists them.
+            labels: The labels in the order the prompt lists them, as
+                strings, as (label, description) pairs, or as the name
+                of a registered label table.
             name: The result column's name.
             descriptions: One description per label, empty for none.
+            layout: ``document_first``, or ``labels_first`` to put the
+                question and categories before every document.
+            task_description: Task text added after the question.
         """
         if self._pending_join is not None:
             raise CompileError(
@@ -184,11 +192,25 @@ class Query:
                 f"got {name!r}")
         if name in self._labels or name in self._scope():
             raise CompileError(f"the name {name!r} is already used")
-        labels = tuple(labels)
+        if isinstance(labels, str):
+            labels, table_descriptions = read_label_table(self._catalog, labels)
+            descriptions = descriptions or table_descriptions
+        else:
+            labels = tuple(labels)
+            if labels and all(isinstance(label, (tuple, list))
+                              for label in labels):
+                if descriptions:
+                    raise CompileError(
+                        "give descriptions in the pairs or separately, not both")
+                descriptions = tuple(description for _, description in labels)
+                labels = tuple(label for label, _ in labels)
         descriptions = tuple(descriptions or ())
+        validate_task_description(task_description)
         refs = tuple(self._resolve(c) for c in p.cols)
         bound = bind_classify_prompt(p.template, refs, labels, descriptions,
-                                     self._tokenizer, turn=self._turn)
+                                     self._tokenizer, turn=self._turn,
+                                     layout=layout,
+                                     task_description=task_description)
         self._note_doc_column(refs[0])
         call = ModelCall(bound, "label", labels, descriptions)
         call.validate()

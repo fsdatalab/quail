@@ -48,7 +48,7 @@ INVALID_PREDICATES = [
     (ModelCall(bind_prompt("q {0}", (R,)), "boolean", ("a", "b")),
      "only an AI.CLASSIFY call has labels"),
     (LabelIn(ModelCall(bind_prompt("q {0}", (R,)), "label", ("a", "b")),
-             ("c",)), "does not have"),
+             ("a", "a")), "lists a label twice"),
 ]
 
 

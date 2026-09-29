@@ -411,7 +411,8 @@ class _Table:
             traces = self.traces(trace_key(
                 self.model.name, call.prompt.template, call.labels, labels))
         demanded = (None if demand is None
-                    else [call.labels.index(label) for label in demand])
+                    else [call.labels.index(label) for label in demand
+                          if label in call.labels])
         scoring, simulated = self.choose(live, len(head), len(tail) - 1,
                                          labels, resident, traces, demanded)
         suffixes = suffix_lengths(scoring, labels)

@@ -39,6 +39,7 @@ from quail.extensions import ExtensionRegistry
 from quail.frontend.builder import Query as BuilderQuery
 from quail.frontend.sql import SQLDialect, compile_sql
 from quail.logical import (
+    Alias,
     CompileError,
     LogicalPlan,
     join_conditions,
@@ -981,12 +982,24 @@ class Query:
                                     dtype=np.int64)
                     slots[table.column(alias).to_numpy()] = np.arange(
                         len(labeled))
-                    values = pc.take(
+                    widened = pc.take(
                         pa.concat_arrays([labeled, pa.array([None], pa.string())]),
                         pa.array(slots))
+                    # a dictionary over the call's labels in their order
+                    call = next((column.expression
+                                 for column in self.logical.root.columns
+                                 if isinstance(column, Alias)
+                                 and column.name == name), None)
+                    if call is not None:
+                        order = pa.array(call.labels, pa.string())
+                        values = pa.DictionaryArray.from_arrays(
+                            pc.index_in(widened, order).cast(pa.int32()),
+                            order)
+                    else:
+                        values = widened
                     projection.append((alias, values))
                     fields.append(pa.field(
-                        name, pa.string(), nullable=True,
+                        name, values.type, nullable=True,
                         metadata={b"quail.alias": alias.encode("utf-8"),
                                   b"quail.label": name.encode("utf-8")}))
                     continue

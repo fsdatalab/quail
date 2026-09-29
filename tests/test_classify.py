@@ -31,7 +31,13 @@ from quail.execution.labels import (
     trie_paths,
 )
 from quail.execution.reranker import RerankerBatch
-from quail.logical import ColumnRef, CompileError, bind_classify_prompt, label_text
+from quail.logical import (
+    Alias,
+    ColumnRef,
+    CompileError,
+    bind_classify_prompt,
+    label_text,
+)
 from quail.physical import (
     AiClassify,
     ClassifySpec,
@@ -654,9 +660,14 @@ def test_sql_classifies_and_tests_labels(session):
     (predicate,) = filtered.logical.operators().filters["d"]
     assert predicate.selectivity == 0.5
     assert predicate.expression.accepted == ("praise",)
+    # equality is membership in one label, on either side
+    for form in (f"{call} = 'refund'", f"'refund' = {call}"):
+        equal = session.sql(f"SELECT d.id FROM documents d WHERE {form}")
+        (predicate,) = equal.logical.operators().filters["d"]
+        assert predicate.expression.accepted == ("refund",)
     for bad in (f"SELECT d.id, {call} FROM documents d",
-                f"SELECT d.id FROM documents d WHERE {call} = 'refund'",
-                f"SELECT d.id FROM documents d WHERE {call} IN ('other')"):
+                f"SELECT d.id FROM documents d WHERE {call} < 'refund'",
+                f"SELECT d.id FROM documents d WHERE {call} IN (1)"):
         with pytest.raises(CompileError):
             session.sql(bad)
 
@@ -838,10 +849,13 @@ def test_chained_classifications_share_one_node(session):
 
 def test_classify_refusals_and_builder_errors(session):
     query = _topic(session)
-    with pytest.raises(CompileError, match="does not have"):
-        session.docs("documents").alias("d").ai_classify(
-            quail.prompt("{0}", quail.col("d.body")), ["a", "b"],
-            name="x").label_in("x", ["c"])
+    # a label the classification cannot return matches no row; the
+    # filter is accepted and plans as a test nothing passes
+    none = (session.docs("documents").alias("d").ai_classify(
+        quail.prompt("{0}", quail.col("d.body")), ["a", "b"],
+        name="x").label_in("x", ["c"]).select("d.id"))
+    (test,) = [n for n in none.plan().nodes if isinstance(n, LabelFilter)]
+    assert test.accepted == ("c",)
     with pytest.raises(CompileError, match="differ ignoring case"):
         session.docs("documents").alias("d").ai_classify(
             quail.prompt("{0}", quail.col("d.body")), ["a", "A"], name="x")
@@ -1230,3 +1244,74 @@ def test_planner_prefers_the_packed_trie_when_labels_share_prefixes():
     assert scoring == "trie_paths"
     unified = _Table(**{**table.__dict__, "tree": False})
     assert unified.choose(500, 20, 30, shared, False)[0] == "trie_paths"
+
+
+def test_sql_category_forms_options_and_label_tables(session):
+    from quail.logical.prompts import CLASSIFY_INSTRUCTION
+
+    def call_of(sql):
+        query = session.sql(sql)
+        (column,) = [c for c in query.logical.root.columns if isinstance(c, Alias)]
+        return column.expression
+
+    plain = call_of("SELECT d.id, AI.CLASSIFY(PROMPT('What is {0} about?', "
+                    "d.body), ARRAY['refund', 'praise']) AS topic "
+                    "FROM documents d")
+    named = call_of("SELECT d.id, AI.CLASSIFY(PROMPT('What is {0} about?', "
+                    "d.body), categories => ARRAY['refund', 'praise']) AS topic "
+                    "FROM documents d")
+    assert named == plain
+    pairs = call_of("SELECT d.id, AI.CLASSIFY(d.body, ARRAY[('refund', 'money "
+                    "back'), ('praise', NULL)]) AS topic FROM documents d")
+    objects = call_of("SELECT d.id, AI.CLASSIFY(d.body, ARRAY[{'label': 'refund',"
+                      " 'description': 'money back'}, {'label': 'praise'}]) "
+                      "AS topic FROM documents d")
+    assert pairs == objects
+    assert pairs.labels == ("refund", "praise")
+    assert pairs.descriptions == ("money back", "")
+    assert "- refund: money back" in pairs.prompt.tail
+    # a bare column asks the default instruction; a task description
+    # follows it
+    assert pairs.prompt.tail.startswith("{0}\n\n" + CLASSIFY_INSTRUCTION)
+    tasked = call_of("SELECT d.id, AI.CLASSIFY(d.body, ARRAY['refund', 'praise'], "
+                     "{'task_description': 'Pick the request kind.', "
+                     "'output_mode': 'single'}) AS topic FROM documents d")
+    assert "Pick the request kind." in tasked.prompt.tail
+    # labels first: the question and categories go before the document
+    first = call_of("SELECT d.id, AI.CLASSIFY(PROMPT('What is {0} about?', "
+                    "d.body), ARRAY['refund', 'praise'], {'layout': "
+                    "'labels_first'}) AS topic FROM documents d")
+    assert first != plain
+    assert first.prompt.preamble.startswith(CLASSIFY_INSTRUCTION)
+    assert "- refund" in first.prompt.preamble
+    assert first.prompt.tail == "{0}\nANSWER:"
+    # a registered label table, in ordinal order, then by label text
+    session.register("kinds", DocumentProvider.from_table(pa.table({
+        "label": ["praise", "refund"], "description": [None, "money back"],
+        "ordinal": [2, 1]}), id_col="label"))
+    table = call_of("SELECT d.id, AI.CLASSIFY(d.body, kinds) AS topic "
+                    "FROM documents d")
+    assert table.labels == ("refund", "praise")
+    assert table.descriptions == ("money back", "")
+    session.register("plain_kinds", DocumentProvider.from_table(pa.table({
+        "label": ["refund", "praise"]}), id_col="label"))
+    assert call_of("SELECT d.id, AI.CLASSIFY(d.body, plain_kinds) AS topic "
+                   "FROM documents d").labels == ("praise", "refund")
+    built = (session.docs("documents").alias("d")
+             .ai_classify(quail.prompt("{0}", quail.col("d.body")), "kinds",
+                          name="topic").select("d.id", "topic"))
+    (column,) = [c for c in built.logical.root.columns if isinstance(c, Alias)]
+    assert column.expression == table
+    long_text = " ".join(["word"] * 26)
+    for bad in (f"SELECT d.id, AI.CLASSIFY(d.body, ARRAY[('refund', '{long_text}'),"
+                f" ('praise', NULL)]) AS topic FROM documents d",
+                "SELECT d.id, AI.CLASSIFY(d.body, ARRAY['refund', 'praise'], "
+                "{'output_mode': 'multi'}) AS topic FROM documents d",
+                "SELECT d.id, AI.CLASSIFY(d.body, ARRAY['refund', 'praise'], "
+                "{'examples': 'x'}) AS topic FROM documents d",
+                "SELECT d.id, AI.CLASSIFY(d.body, ARRAY['refund', 'praise'], "
+                "{'layout': 'sideways'}) AS topic FROM documents d",
+                "SELECT d.id, AI.CLASSIFY(d.body, ARRAY[1, 2]) AS topic "
+                "FROM documents d"):
+        with pytest.raises(CompileError):
+            session.sql(bad)

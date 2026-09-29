@@ -7,6 +7,7 @@ import sqlglot
 from sqlglot import exp
 
 from quail.catalog import Catalog
+from quail.frontend.label_tables import read_label_table
 from quail.logical import (
     Alias,
     ColumnRef,
@@ -24,7 +25,8 @@ from quail.logical import (
     bind_score_prompt,
     is_score,
 )
-from quail.logical.prompts import bind_classify_prompt
+from quail.logical.nodes import validate_task_description
+from quail.logical.prompts import CLASSIFY_LAYOUTS, bind_classify_prompt
 
 # Every relational operator except the projection, named and refused.
 # OR is rejected separately with its own message.
@@ -110,6 +112,19 @@ def _score_comparison(node):
             return left, node.this, node.expression
         if _is_call(node.expression, "AI_SCORE"):
             return right, node.expression, node.this
+    return None
+
+
+def _label_test(node):
+    """Return (AI.CLASSIFY call, accepted literals) for = or IN, else None."""
+    if isinstance(node, exp.In) and isinstance(node.this, exp.AIClassify):
+        return node.this, list(node.expressions)
+    if isinstance(node, exp.EQ):
+        left, right = node.this, node.expression
+        if isinstance(left, exp.AIClassify):
+            return left, [right]
+        if isinstance(right, exp.AIClassify):
+            return right, [left]
     return None
 
 
@@ -233,8 +248,20 @@ class _Binder:
         return out
 
     def parse_ai_call(self, node, function: str, allowed: set, scope=None,
-                      join=None, labels=None):
-        """Parse one AI prompt call into prompt, options, and aliases."""
+                      join=None, classify=None):
+        """Parse one AI prompt call into prompt, options, and aliases.
+
+        Args:
+            node: The call.
+            function: Its internal name.
+            allowed: The option keys it takes.
+            scope: The aliases in scope.
+            join: Whether the prompt reads a pair; None decides from
+                the aliases it reads.
+            classify: For AI.CLASSIFY, the keyword arguments of
+                bind_classify_prompt: labels, descriptions, layout,
+                and task_description.
+        """
         if not _is_call(node, function):
             raise CompileError(
                 f"only {function}(PROMPT(...)) predicates are "
@@ -274,9 +301,10 @@ class _Binder:
                 "an AI.SCORE pair prompt mentions {0} exactly once, as "
                 "the place its document is inserted; refer to it again "
                 "in words")
-        if labels is not None:
-            prompt = bind_classify_prompt(template, tuple(refs), labels, (),
-                                          self.tokenizer, turn=self.turn)
+        if classify is not None:
+            prompt = bind_classify_prompt(template, tuple(refs),
+                                          tokenizer=self.tokenizer,
+                                          turn=self.turn, **classify)
         else:
             if function == "AI_SCORE":
                 binder = bind_score_prompt
@@ -291,32 +319,137 @@ class _Binder:
     def parse_ai_classify(self, node, scope=None):
         """Parse an AI_CLASSIFY call into a label ModelCall, options, and aliases.
 
-        The call is AI_CLASSIFY(PROMPT('template', column),
-        ARRAY['label', ...]) with an optional options object after
-        the labels; sqlglot parses it as its AIClassify function.
+        The call is AI_CLASSIFY(input, categories[, config]): the
+        input is PROMPT('template', column) or a bare document column;
+        the categories are an ARRAY of labels, of (label, description)
+        pairs, or of {'label': ..., 'description': ...} objects, or the
+        name of a registered label table, given positionally or as
+        categories => ...; the config object takes selectivity,
+        layout, task_description, and output_mode.
         """
         categories = node.args.get("categories")
-        if not isinstance(categories, exp.Array):
-            raise CompileError(
-                "AI.CLASSIFY takes PROMPT('template', column) and an ARRAY "
-                "of labels")
-        labels = []
-        for item in categories.expressions:
-            if not (isinstance(item, exp.Literal) and item.is_string):
-                raise CompileError("AI.CLASSIFY labels must be string literals")
-            labels.append(str(item.this))
-        config = node.args.get("config")
-        call = exp.Anonymous(
-            this="AI_CLASSIFY",
-            expressions=[node.this] + ([config] if config is not None else []))
-        prompt, options, aliases = self.parse_ai_call(
-            call, "AI_CLASSIFY", {"selectivity"}, scope=scope, join=False,
-            labels=tuple(labels))
+        if isinstance(categories, exp.Kwarg):
+            if str(categories.this.name).lower() != "categories":
+                raise CompileError(
+                    f"AI.CLASSIFY takes categories => ..., got "
+                    f"{categories.this.name}")
+            categories = categories.expression
+        labels, descriptions = self.parse_categories(categories)
+        options = self.parse_classify_options(node.args.get("config"))
+        prompt_call = node.this
+        if isinstance(prompt_call, exp.Column):
+            # a bare document column uses the default instruction
+            prompt_call = exp.Anonymous(
+                this="PROMPT",
+                expressions=[exp.Literal.string("{0}"), prompt_call])
+        call = exp.Anonymous(this="AI_CLASSIFY", expressions=[prompt_call])
+        prompt, _, aliases = self.parse_ai_call(
+            call, "AI_CLASSIFY", set(), scope=scope, join=False,
+            classify=dict(
+                labels=labels, descriptions=descriptions,
+                layout=options.pop("layout", "document_first"),
+                task_description=options.pop("task_description", "")))
         if len(aliases) != 1:
             raise CompileError("AI.CLASSIFY reads one document column")
-        model_call = ModelCall(prompt, "label", tuple(labels), ())
+        model_call = ModelCall(prompt, "label", labels, descriptions)
         model_call.validate()
         return model_call, options, aliases
+
+    def parse_categories(self, node) -> tuple[tuple, tuple]:
+        """Return the labels and descriptions an AI.CLASSIFY call lists."""
+        if isinstance(node, exp.Column) and not node.table:
+            return read_label_table(self.catalog, str(node.name))
+        if not isinstance(node, exp.Array):
+            raise CompileError(
+                "AI.CLASSIFY categories are an ARRAY of labels, of (label, "
+                "description) pairs, or of {'label': ..., 'description': "
+                "...} objects, or a registered label table's name")
+        labels = []
+        descriptions = []
+        for item in node.expressions:
+            if isinstance(item, exp.Literal) and item.is_string:
+                labels.append(str(item.this))
+                descriptions.append("")
+                continue
+            if isinstance(item, exp.Tuple) and len(item.expressions) == 2:
+                label, description = item.expressions
+            elif isinstance(item, exp.Struct):
+                fields = {}
+                for prop in item.expressions:
+                    if not isinstance(prop, exp.PropertyEQ):
+                        raise CompileError(f"malformed category {item.sql()}")
+                    fields[str(prop.this.name).lower()] = prop.expression
+                unknown = set(fields) - {"label", "description"}
+                if unknown or "label" not in fields:
+                    raise CompileError(
+                        f"a category object has a label and an optional "
+                        f"description, got {item.sql()}")
+                label = fields["label"]
+                description = fields.get("description")
+            else:
+                raise CompileError(
+                    f"AI.CLASSIFY category {item.sql()} is not a label, a "
+                    f"(label, description) pair, or a category object")
+            if not (isinstance(label, exp.Literal) and label.is_string):
+                raise CompileError("AI.CLASSIFY labels are string literals")
+            if description is not None and not (
+                    isinstance(description, exp.Literal) and description.is_string
+                    or isinstance(description, exp.Null)):
+                raise CompileError(
+                    "an AI.CLASSIFY description is a string literal or NULL")
+            labels.append(str(label.this))
+            descriptions.append(
+                "" if description is None or isinstance(description, exp.Null)
+                else str(description.this))
+        if not any(descriptions):
+            descriptions = []
+        return tuple(labels), tuple(descriptions)
+
+    def parse_classify_options(self, node) -> dict:
+        """Return an AI.CLASSIFY config object's options.
+
+        Raises:
+            CompileError: An unknown key, output_mode other than
+                'single', or a value of the wrong type.
+        """
+        if node is None:
+            return {}
+        if not isinstance(node, exp.Struct):
+            raise CompileError(
+                f"AI.CLASSIFY's config is an object like "
+                f"{{'task_description': '...'}}, got {node.sql()}")
+        out = {}
+        for prop in node.expressions:
+            if not isinstance(prop, exp.PropertyEQ):
+                raise CompileError(f"malformed option {prop.sql()}")
+            key = str(prop.this.name).lower()
+            value = prop.expression
+            text = (str(value.this) if isinstance(value, exp.Literal)
+                    and value.is_string else None)
+            if key == "selectivity":
+                if not (isinstance(value, exp.Literal) and not value.is_string):
+                    raise CompileError("selectivity must be a number")
+                out[key] = float(value.this)
+            elif key == "layout":
+                if text not in CLASSIFY_LAYOUTS:
+                    raise CompileError(
+                        f"layout is one of {CLASSIFY_LAYOUTS}, got {value.sql()}")
+                out[key] = text
+            elif key == "task_description":
+                if text is None:
+                    raise CompileError("task_description is a string")
+                validate_task_description(text)
+                out[key] = text
+            elif key == "output_mode":
+                if text != "single":
+                    raise CompileError(
+                        "AI.CLASSIFY returns one label: output_mode is "
+                        "'single' or absent")
+            else:
+                raise CompileError(
+                    f"unknown AI.CLASSIFY option {key!r}; the options are "
+                    f"selectivity, layout, task_description, and output_mode")
+        return out
 
     def parse_ai_filter(self, node, allowed: set, scope=None, join=None):
         """Parse an AI_FILTER node into a boolean call, options, and aliases."""
@@ -531,13 +664,15 @@ def compile_sql(sql: str, catalog: Catalog,
         if anti:
             raise CompileError(f"NOT is only supported as NOT EXISTS, "
                                f"got NOT {node.sql()}")
-        if isinstance(node, exp.In) and isinstance(node.this, exp.AIClassify):
-            call, options, aliases = b.parse_ai_classify(node.this)
+        tested = _label_test(node)
+        if tested is not None:
+            classify_node, items = tested
+            call, options, aliases = b.parse_ai_classify(classify_node)
             accepted = []
-            for item in node.expressions:
+            for item in items:
                 if not (isinstance(item, exp.Literal) and item.is_string):
                     raise CompileError(
-                        "AI.CLASSIFY IN (...) lists string literals")
+                        "AI.CLASSIFY is compared with string literals")
                 accepted.append(str(item.this))
             predicate = LabelIn(call, tuple(accepted))
             predicate.validate()
@@ -547,7 +682,8 @@ def compile_sql(sql: str, catalog: Catalog,
             continue
         if any(isinstance(call, exp.AIClassify) for call in term.walk()):
             raise CompileError(
-                "AI.CLASSIFY in WHERE must be tested with IN ('label', ...)")
+                "AI.CLASSIFY in WHERE is tested with = 'label' or "
+                "IN ('label', ...)")
         if _is_ai_score_comparison(term):
             predicate, options, aliases = \
                 b.parse_ai_score(term, SCORE_OPTION_KEYS)

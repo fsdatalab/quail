@@ -264,7 +264,8 @@ class QuailClassifier:
                 search=stage_spec.scoring == "trie_search",
                 demand=(None if stage_spec.demand is None else
                         [stage_spec.labels.index(label)
-                         for label in stage_spec.demand]))
+                         for label in stage_spec.demand
+                         if label in stage_spec.labels]))
             scorers[index] = scorer
             for round in range(request.rounds):
                 position = len(stages)

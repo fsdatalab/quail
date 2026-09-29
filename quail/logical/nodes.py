@@ -111,6 +111,30 @@ def validate_labels(labels: tuple, descriptions: tuple = ()) -> None:
     if descriptions and len(descriptions) != len(labels):
         raise CompileError(
             "AI.CLASSIFY needs one description per label, empty for none")
+    for description in descriptions:
+        if not isinstance(description, str):
+            raise CompileError("an AI.CLASSIFY description is text or empty")
+        if len(description.split()) > DESCRIPTION_WORDS:
+            raise CompileError(
+                f"an AI.CLASSIFY description has at most {DESCRIPTION_WORDS} "
+                f"words, got {len(description.split())}")
+
+
+# the word limits Snowflake documents for AI_CLASSIFY
+DESCRIPTION_WORDS = 25
+TASK_DESCRIPTION_WORDS = 50
+
+
+def validate_task_description(text: str) -> None:
+    """Check an AI.CLASSIFY task description's length.
+
+    Raises:
+        CompileError: More than TASK_DESCRIPTION_WORDS words.
+    """
+    if len(text.split()) > TASK_DESCRIPTION_WORDS:
+        raise CompileError(
+            f"an AI.CLASSIFY task description has at most "
+            f"{TASK_DESCRIPTION_WORDS} words, got {len(text.split())}")
 
 
 @dataclass(frozen=True)
@@ -143,18 +167,12 @@ class LabelIn:
     type_name: ClassVar[str] = "quail.label_in"
 
     def validate(self) -> None:
+        # a label the classification cannot return matches no row, and
+        # an accepted set without any of its labels accepts no rows
         self.call.validate()
         if self.call.kind != "label":
             raise CompileError("only an AI.CLASSIFY label is tested for "
                                "membership in a label list")
-        if not self.accepted:
-            raise CompileError("a label filter needs at least one label")
-        unknown = [label for label in self.accepted
-                   if label not in self.call.labels]
-        if unknown:
-            raise CompileError(
-                f"label filter names labels {unknown} that the "
-                f"classification does not have")
         if len(set(self.accepted)) != len(self.accepted):
             raise CompileError("a label filter lists a label twice")
 
