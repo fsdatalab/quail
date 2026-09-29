@@ -13,15 +13,14 @@ from .nodes import (
     AiScore,
     Barrier,
     Exchange,
+    Filter,
     Foreign,
     HashJoin,
-    LabelFilter,
     Limit,
     Project,
     Recombine,
     RequestExecution,
     Scan,
-    ScoreFilter,
 )
 
 
@@ -140,9 +139,8 @@ def built_in_codecs() -> tuple[NodeCodec, ...]:
         AiFilter,
         RequestExecution,
         AiScore,
-        ScoreFilter,
+        Filter,
         AiClassify,
-        LabelFilter,
         Barrier,
         Exchange,
         Foreign,

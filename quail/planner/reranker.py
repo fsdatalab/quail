@@ -20,11 +20,12 @@ from quail.logical.prompts import (
 )
 from quail.physical import (
     AiScore,
+    Comparison,
+    Filter,
     Limit,
     PortRef,
     Project,
     Scan,
-    ScoreFilter,
     ScoreSpec,
 )
 from quail.physical.base import input_ports
@@ -483,13 +484,12 @@ def _plan_reranker(region, context, *, backend_name: str):
                     expected,
                     means[alias],
                 )
-            filtered = ScoreFilter(
-                node_id=f"score-filter:{alias}:{written_pos}",
+            filtered = Filter(
+                node_id=f"filter:{alias}:{written_pos}",
                 inputs=input_ports((score_ref,)),
-                score_name=name,
+                predicate=Comparison(name, predicate.expression.comparison,
+                                     predicate.expression.threshold),
                 aliases=(alias,),
-                comparison=predicate.expression.comparison,
-                threshold=predicate.expression.threshold,
                 selectivity=predicate.selectivity,
                 written_pos=written_pos,
             )
@@ -541,13 +541,13 @@ def _plan_reranker(region, context, *, backend_name: str):
         )
         if matching_join is not None:
             written_pos = joins.index(matching_join)
-            filtered = ScoreFilter(
-                node_id=f"score-filter:join:{written_pos}",
+            filtered = Filter(
+                node_id=f"filter:join:{written_pos}",
                 inputs=input_ports((score_ref,)),
-                score_name=spec.name,
+                predicate=Comparison(spec.name,
+                                     matching_join.predicate.comparison,
+                                     matching_join.predicate.threshold),
                 aliases=(left, right),
-                comparison=matching_join.predicate.comparison,
-                threshold=matching_join.predicate.threshold,
                 selectivity=matching_join.selectivity,
                 written_pos=written_pos,
             )

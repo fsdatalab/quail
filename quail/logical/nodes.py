@@ -188,7 +188,7 @@ class LabelIn:
             raise CompileError("only an AI.CLASSIFY label is tested for "
                                "membership in a label list")
         if len(set(self.accepted)) != len(self.accepted):
-            raise CompileError("a label filter lists a label twice")
+            raise CompileError("a filter on a label lists a label twice")
 
 
 @dataclass(frozen=True)

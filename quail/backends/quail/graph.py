@@ -14,7 +14,7 @@ from quail.execution.pairs import (
     partner_map,
 )
 from quail.execution.pipelines import build_pipelines
-from quail.execution.reranker import ScoreFilterRuntime
+from quail.execution.reranker import FilterRuntime
 from quail.execution.runner import (
     ExecutionContext,
     GenericRunner,
@@ -30,9 +30,9 @@ from quail.physical import (
     AiFilter,
     AiJoin,
     AiScore,
+    Filter,
     PhysicalGraph,
     Scan,
-    ScoreFilter,
 )
 from quail.progress import answer_sink
 
@@ -44,7 +44,7 @@ def quail_runtimes() -> dict:
         AiFilter.runtime_key: model_runtime,
         AiJoin.runtime_key: model_runtime,
         AiScore.runtime_key: model_runtime,
-        ScoreFilter.runtime_key: ScoreFilterRuntime(),
+        Filter.runtime_key: FilterRuntime(),
     }
 
 

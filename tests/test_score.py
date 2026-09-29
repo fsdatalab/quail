@@ -11,9 +11,9 @@ import quail
 from quail.catalog import Catalog, DocumentProvider
 from quail.execution.execute import execute_query
 from quail.execution.reranker import (
+    FilterRuntime,
     RerankerBatch,
     RerankerModelExecution,
-    ScoreFilterRuntime,
     ScoreRows,
     compare_score,
     score_in_batches,
@@ -27,7 +27,7 @@ from quail.execution.runner import (
 from quail.execution.types import PhysicalResponse, export_physical_outputs
 from quail.frontend.sql import compile_sql
 from quail.logical import CompileError, SemanticJoin
-from quail.physical import AiScore, ScoreFilter, decode_graph, encode_graph
+from quail.physical import AiScore, Comparison, Filter, decode_graph, encode_graph
 from quail.planner.plan import EngineConfig, Refusal
 
 PROJECTION_SQL = (
@@ -211,10 +211,9 @@ def test_score_plan_shape_query_text_and_round_trip(catalog):
     physical = query.plan()
     assert sum(isinstance(node, AiScore) for node in physical.nodes) == 1
     score_filter = next(
-        node for node in physical.nodes if isinstance(node, ScoreFilter)
+        node for node in physical.nodes if isinstance(node, Filter)
     )
-    assert score_filter.score_name == "score"
-    assert (score_filter.comparison, score_filter.threshold) == (">=", 0.7)
+    assert score_filter.predicate == Comparison("score", ">=", 0.7)
     graph = physical.graph
     decoded = decode_graph(
         encode_graph(graph, session.registry.codecs),
@@ -293,14 +292,14 @@ def test_score_cost_counts_canvas_rows_anchor_prefixes_and_throughput(catalog):
 
 
 def test_score_filters_compare_values_and_keep_pair_answers(catalog):
-    node = ScoreFilter(node_id="filter", score_name="score", aliases=("q", "d"),
-                       comparison=">", threshold=0.5, written_pos=0)
+    node = Filter(node_id="filter", predicate=Comparison("score", ">", 0.5),
+                  aliases=("q", "d"), written_pos=0)
     table = pa.table({
         "q": pa.array([0, 0, 1, 1], pa.int32()),
         "d": pa.array([0, 1, 0, 1], pa.int32()),
         "score": pa.array([0.9, 0.1, 0.2, 0.8], pa.float64()),
     })
-    result = ScoreFilterRuntime().execute(
+    result = FilterRuntime().execute(
         node, {"input:0": table}, ExecutionContext(runtimes={})
     )
     answers = result.outputs["join_answers:0"]
@@ -335,7 +334,7 @@ def test_score_filters_compare_values_and_keep_pair_answers(catalog):
     )
     physical = query.plan()
     assert sum(isinstance(node, AiScore) for node in physical.nodes) == 1
-    assert sum(isinstance(node, ScoreFilter) for node in physical.nodes) == 2
+    assert sum(isinstance(node, Filter) for node in physical.nodes) == 2
     reranker = _RowReranker()
     result = _finish(query, session, reranker)
     assert result.collect().to_pylist() == [{"d.id": 2, "s": 0.2}]
@@ -438,7 +437,7 @@ def test_native_and_distributed_scores_share_prefixes_and_keep_pair_order(
     request = query._prepare_physical()
     physical = query.plan()
     assert (physical.workers, physical.settings["data_parallel_copies"]) == (2, 2)
-    assert not any(isinstance(node, ScoreFilter) for node in physical.nodes)
+    assert not any(isinstance(node, Filter) for node in physical.nodes)
     node = next(node for node in physical.nodes if isinstance(node, AiScore))
     assert node.spec.aliases == ("q", "d")
     assert node.spec.expected_inputs == 4

@@ -2,10 +2,11 @@
 
 A pipeline is the longest chain of operators that each take one
 table's documents one at a time: its AI.IF filter chain, its
-classification, the label filters and per-batch applies on its
-documents, and the join anchored on it. The executor runs the whole
-chain over each document while its KV is resident, as DuckDB runs a
-vector through every operator of a pipeline before the next vector.
+classification, the filters on the classification's labels and the
+per-batch applies on its documents, and the join anchored on it. The
+executor runs the whole chain over each document while its KV is
+resident, as DuckDB runs a vector through every operator of a pipeline
+before the next vector.
 
 A chain ends at a breaker: a node that needs every document at once
 (Barrier, Exchange, a barrier apply, the recombination, a projection),
@@ -22,8 +23,8 @@ from quail.physical import (
     AiClassify,
     AiFilter,
     AiJoin,
+    Filter,
     Foreign,
-    LabelFilter,
     PhysicalGraph,
     PhysicalNode,
 )
@@ -60,7 +61,9 @@ def operator_aliases(node: PhysicalNode) -> tuple[str, ...]:
         if node.spec is None:
             return ()
         return (node.spec.anchor,)
-    if isinstance(node, LabelFilter):
+    if isinstance(node, Filter):
+        # a filter over one table's rows; it joins a chain only after
+        # the classification whose labels its predicate reads
         return tuple(node.aliases) if len(node.aliases) == 1 else ()
     if isinstance(node, Foreign):
         if node.kind != "per_batch":
@@ -73,7 +76,7 @@ def operator_aliases(node: PhysicalNode) -> tuple[str, ...]:
 
 def _document_ports(node: PhysicalNode, alias: str) -> tuple[str, ...]:
     """The output ports on which the operator hands the alias's documents on."""
-    if isinstance(node, (AiClassify, LabelFilter)):
+    if isinstance(node, (AiClassify, Filter)):
         return ("scores", f"ids:{alias}")
     if isinstance(node, Foreign) and node.ids == "pairs":
         return (f"pairs:{node.written_pos}",)
@@ -144,7 +147,7 @@ def build_pipelines(graph: PhysicalGraph) -> dict[str, Pipeline]:
         aliases = operator_aliases(node)
         if not aliases or node.node_id in followed:
             continue
-        # a label filter or apply left on its own reads a table
+        # a filter or apply left on its own reads a table
         if not isinstance(node, (AiFilter, AiClassify, AiJoin)):
             continue
         (alias,) = aliases

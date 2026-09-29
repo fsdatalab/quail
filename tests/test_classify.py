@@ -41,7 +41,8 @@ from quail.physical import (
     AiJoin,
     ClassifySpec,
     ClassifyStage,
-    LabelFilter,
+    Filter,
+    InList,
     RequestExecution,
     decode_graph,
     encode_graph,
@@ -409,10 +410,10 @@ def test_classify_plans_filters_and_returns_labels(session):
     query = _topic(session)
     plan = query.plan()
     (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
-    (test,) = [n for n in plan.nodes if isinstance(n, LabelFilter)]
+    (test,) = [n for n in plan.nodes if isinstance(n, Filter)]
     assert classify.spec.labels == ("refund", "shipping", "praise")
     assert classify.spec.label_token_ids[0] == tuple(_bytes(" refund"))
-    assert (test.score_name, test.accepted) == ("topic", ("refund", "shipping"))
+    assert test.predicate == InList("topic", ("refund", "shipping"))
     codecs = session.registry.codecs
     assert decode_graph(encode_graph(plan.graph, codecs), codecs) == plan.graph
 
@@ -462,9 +463,9 @@ def test_sql_classifies_and_tests_labels(session):
         ["refund", "shipping", "praise"], name="topic")
         .label_in("topic", ["refund", "shipping"]).select("d.id", "topic"))
     assert query.logical == built.logical
-    (test,) = [n for n in query.plan().nodes if isinstance(n, LabelFilter)]
-    assert (test.score_name, test.accepted) == ("topic", ("refund", "shipping"))
-    # a label filter alone, with a selectivity option
+    (test,) = [n for n in query.plan().nodes if isinstance(n, Filter)]
+    assert test.predicate == InList("topic", ("refund", "shipping"))
+    # a filter on the label alone, with a selectivity option
     filtered = session.sql(
         f"SELECT d.id FROM documents d WHERE {call[:-1]}, "
         f"{{'selectivity': 0.5}}) IN ('praise')")
@@ -507,7 +508,7 @@ def test_sql_classifies_the_rows_a_join_keeps(session, tmp_path):
     assert classify.spec.anchor == join.anchor
     assert classify.inputs[0].source.node_id == join.node_id
     # a joined row's label is not tested in WHERE
-    with pytest.raises(CompileError, match="one table|label filter"):
+    with pytest.raises(CompileError, match="one table|filter on a label"):
         session.sql(
             f"SELECT d.id, a.id FROM documents d JOIN aspects a "
             f"ON AI_FILTER(PROMPT('Does {{0}} mention {{1}}?', d.body, "
@@ -647,8 +648,8 @@ def test_classify_refusals_and_builder_errors(session):
     none = (session.docs("documents").alias("d").ai_classify(
         quail.prompt("{0}", quail.col("d.body")), ["a", "b"],
         name="x").label_in("x", ["c"]).select("d.id"))
-    (test,) = [n for n in none.plan().nodes if isinstance(n, LabelFilter)]
-    assert test.accepted == ("c",)
+    (test,) = [n for n in none.plan().nodes if isinstance(n, Filter)]
+    assert test.predicate == InList("x", ("c",))
     with pytest.raises(CompileError, match="differ ignoring case"):
         session.docs("documents").alias("d").ai_classify(
             quail.prompt("{0}", quail.col("d.body")), ["a", "A"], name="x")
@@ -849,7 +850,7 @@ def test_planner_prices_the_letters_read_on_a_canvas_model():
         table.choose(100, 20, 30, ((1, 2), (3,)), False)
 
 
-def test_a_document_without_a_label_fails_every_label_filter(session):
+def test_a_document_without_a_label_fails_every_filter_on_it(session):
     # document 7's answer named no label: it leaves the run before the
     # filter, as under the request backends
     result = _finish(_topic(session), session, _Labels([None, "refund"]))
@@ -1102,13 +1103,13 @@ def test_sql_category_forms_options_and_label_tables(session):
             session.sql(bad)
 
 
-def test_explain_names_the_classification_rule_and_label_filter(session):
+def test_explain_names_the_classification_rule_and_the_filter(session):
     text = _topic(session).explain()
     assert "AiClassify: topic over d" in text
     # three short labels: the packed trie's 22 rows cost less than the
     # lettered prompt's longer frame
     assert "rule=trie_tree, labels=3" in text
-    assert "LabelFilter: topic in ['refund', 'shipping']" in text
+    assert "Filter: topic IN ['refund', 'shipping']" in text
 
 
 def test_label_readout_projects_only_the_targets_when_unnormalized():

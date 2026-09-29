@@ -1105,7 +1105,7 @@ class Query:
         from quail.execution.reranker import classify_label_tables
         from quail.physical import AiClassify
 
-        # every classified document's label, before any label filter;
+        # every classified document's label, before any filter on it;
         # a chain's later stages label the documents their gate passed
         answer_tables = {"filters": {}, "joins": {}, "classifies": {
             name: table

@@ -45,8 +45,8 @@ from quail.physical import (
     AiJoin,
     AiScore,
     Barrier,
+    Filter,
     Foreign,
-    LabelFilter,
     PhysicalNode,
     ValueType,
 )
@@ -141,7 +141,7 @@ class QuailModelExecution:
         The members' stages are concatenated and driven by one stage
         scheduler over the documents the first member was given, so a
         document goes through every operator with its KV resident. A
-        label filter or per-batch apply between two stages gates the
+        filter on a label or per-batch apply between two stages gates the
         next stage; one after the last stage runs over the documents
         that came out of it.
 
@@ -244,10 +244,10 @@ class QuailModelExecution:
                       if port.value_type is ValueType.SCORES
                       and port.source.node_id in by_node]
             return _ClassifyPart(node, ids, plan, priors)
-        if isinstance(node, LabelFilter):
+        if isinstance(node, Filter):
             labeled = next(part for part in reversed(parts)
                            if isinstance(part, _ClassifyPart)
-                           and part.node.spec.name == node.score_name)
+                           and part.node.spec.name == node.column)
             return _LabelGate(node, labeled)
         if isinstance(node, Foreign):
             values = {}
@@ -663,7 +663,7 @@ class _KeptPairs:
 
 
 class _LabelGate:
-    """A label filter between two stages: it gates on the label read."""
+    """A filter on a label between two stages: it gates on the label read."""
 
     stages = ()
     document_done = None
@@ -672,13 +672,13 @@ class _LabelGate:
     def __init__(self, node, labeled: _ClassifyPart):
         self.node = node
         self.labeled = labeled
-        self.accepted = set(node.accepted)
+        self.predicate = node.predicate
         self.position = {document: index
                          for index, document in enumerate(labeled.ids)}
 
     def gate(self, key):
         label = self.labeled.plan.labels[0][self.position[key[1]]]
-        return None if label in self.accepted else Stage.DROP
+        return None if self.predicate.accepts(label) else Stage.DROP
 
     def finish(self, every):
         return None

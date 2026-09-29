@@ -26,9 +26,10 @@ from quail.physical import (
     AiFilter,
     AiJoin,
     ClassifySpec,
+    Filter,
     FilterStage,
+    InList,
     JoinStage,
-    LabelFilter,
     PhysicalGraph,
     PortRef,
     Scan,
@@ -104,7 +105,7 @@ class LabelingModel(FakeModel):
 
 
 def fused_graph():
-    """The r chain, its classification, a label filter, and a join with p."""
+    """The r chain, its classification, a filter on its label, and a join with p."""
     spec = ClassifySpec(
         name="topic", aliases=("r",), query_template="", arguments=(),
         expected_inputs=14, estimated_seconds=0.0,
@@ -123,11 +124,11 @@ def fused_graph():
             node_id="classify:r",
             inputs=input_ports((PortRef("filter:r", "ids:r"),)),
             backend_name="quail", model="qwen3-4b-fp8", spec=spec),
-        LabelFilter(
+        Filter(
             node_id="label:r",
             inputs=input_ports((PortRef("classify:r", "scores"),)),
-            score_name="topic", aliases=("r",), comparison="in",
-            threshold=0.0, selectivity=0.5, written_pos=1, accepted=("a",)),
+            predicate=InList("topic", ("a",)), aliases=("r",),
+            selectivity=0.5, written_pos=1),
         AiJoin(
             node_id="group:0", anchor="r", anchor_resident="filter",
             inputs=input_ports((PortRef("label:r", "ids:r"),
@@ -150,7 +151,7 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
 
     Each survivor's seeded canvas is read over its resident KV, in
     chunks that also hold other documents' filter rows. With
-    ``joined`` a label filter and a join follow, in the same pipeline.
+    ``joined`` a filter on the label and a join follow, in the same pipeline.
     """
     from dataclasses import replace
 
@@ -182,12 +183,11 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
     if joined:
         nodes += [
             Scan(node_id="input:p", alias="p", input_id="p"),
-            LabelFilter(
+            Filter(
                 node_id="label:r",
                 inputs=input_ports((PortRef("classify:r", "scores"),)),
-                score_name="topic", aliases=("r",), comparison="in",
-                threshold=0.0, selectivity=0.5, written_pos=1,
-                accepted=("a",)),
+                predicate=InList("topic", ("a",)), aliases=("r",),
+                selectivity=0.5, written_pos=1),
             AiJoin(
                 node_id="group:0", anchor="r", anchor_resident="filter",
                 inputs=input_ports((PortRef("label:r", "ids:r"),
@@ -316,7 +316,7 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
     assert metrics["classify:r"]["evaluated_documents"] == 3
     assert metrics["filter:r"]["fresh_tokens"] == sum(map(len, docs["r"])) + 4
     if joined:
-        # the label filter keeps document 0, whose partner suffixes
+        # the filter keeps document 0, whose partner suffixes
         # ran over its resident KV after its read
         assert outputs[PortRef("label:r", "ids:r")].column("r").to_pylist() \
             == [0]
@@ -527,7 +527,7 @@ def test_a_classification_of_joined_rows_runs_after_its_join_on_the_anchors_kv(
 
 
 def chained_graph():
-    """A decoded classification, its label filter, and a second classification."""
+    """A decoded classification, a filter on its label, and a second classification."""
     first = ClassifySpec(
         name="topic", aliases=("r",), query_template="", arguments=(),
         expected_inputs=14, estimated_seconds=0.0,
@@ -544,11 +544,11 @@ def chained_graph():
             node_id="classify:r",
             inputs=input_ports((PortRef("input:r", "ids:r"),)),
             backend_name="quail", model="qwen3-4b-fp8", spec=first),
-        LabelFilter(
+        Filter(
             node_id="label:r",
             inputs=input_ports((PortRef("classify:r", "scores"),)),
-            score_name="topic", aliases=("r",), comparison="in",
-            threshold=0.0, selectivity=0.5, written_pos=1, accepted=("a",)),
+            predicate=InList("topic", ("a",)), aliases=("r",),
+            selectivity=0.5, written_pos=1),
         AiClassify(
             node_id="classify2:r",
             inputs=input_ports((PortRef("label:r", "scores"),)),
@@ -557,7 +557,7 @@ def chained_graph():
     return PhysicalGraph(tuple(nodes), PortRef("classify2:r", "scores"))
 
 
-def test_a_decoded_classification_hands_its_documents_on_through_the_label_filter(
+def test_a_decoded_classification_hands_its_documents_through_the_filter(
         monkeypatch):
     from quail.backends.quail.executor import classify as classify_module
     from quail.execution.pipelines import build_pipelines

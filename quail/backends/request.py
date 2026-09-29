@@ -141,7 +141,7 @@ def plan_request_backend(
     operators = region.logical_plan.operators()
     scans, filters, joins = operators.scans, operators.filters, operators.joins
     # the AI.IF predicates by alias, with their written positions; a
-    # label filter runs after its classification instead
+    # filter on its label runs after its classification instead
     ask_filters = {
         alias: [p for p in predicates
                 if not isinstance(p.expression, LabelIn)]
@@ -253,7 +253,7 @@ def plan_request_backend(
         ))
 
     # each classification labels the alias's documents after its AI.IF
-    # chain; its label filters keep the accepted documents for the joins
+    # chain; the filters on its labels keep the accepted documents for the joins
     label_plan = label_work(region.logical_plan, filters)
     classify_specs = []
     for call, alias in label_plan.calls:
@@ -816,7 +816,7 @@ class RequestModelExecution:
                     document for document, label in labeled
                     if label in kept and document in alive]
             if spec.tests:
-                outputs[f"label_filter_answers:{spec.output}"] = (
+                outputs[f"label_in_answers:{spec.output}"] = (
                     _filter_answer_table(
                         spec.alias, [position for position, _ in spec.tests],
                         test_answers))

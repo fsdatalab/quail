@@ -232,7 +232,7 @@ class Query:
         call = self._labels[name].expression
         if len(call.aliases()) != 1:
             raise CompileError(
-                f"a label filter tests a one-document classification; "
+                f"a filter on a label tests a one-document classification; "
                 f"{name!r} classifies pairs of {call.aliases()}")
         test = LabelIn(call, tuple(labels), name)
         test.validate()

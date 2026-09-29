@@ -22,11 +22,12 @@ from quail.physical import (
     AiJoin,
     Barrier,
     Exchange,
+    Filter,
     FilterStage,
     Foreign,
     HashJoin,
+    InList,
     JoinStage,
-    LabelFilter,
     Limit,
     PortRef,
     Recombine,
@@ -352,13 +353,13 @@ def contiguous_shards(doc_tokens, workers: int):
 
 @dataclass(frozen=True)
 class LabelWork:
-    """The classifications a plan needs, from its label filters and columns.
+    """The classifications a plan needs, from the filters on its labels and its columns.
 
     Attributes:
         calls: (AI.CLASSIFY call, alias) in plan order: the calls label
             filters test, in written order, then projected labels.
         names: Call -> its output column.
-        tests: Call -> written positions of the label filters testing it.
+        tests: Call -> written positions of the filters testing its label.
         projected: Call -> column name, for projected labels.
     """
 
@@ -449,7 +450,7 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
     operators = plan.operators()
     scans, filters, joins = operators.scans, operators.filters, operators.joins
     applies = operators.applies
-    # AI.IF predicates by written position; label filters and projected
+    # AI.IF predicates by written position; filters on labels and projected
     # labels are classification work after the AI.IF chain
     asks = {alias: [position for position, predicate in enumerate(predicates)
                     if not isinstance(predicate.expression, LabelIn)]
@@ -544,7 +545,7 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
     for fs in filters.values():
         surv = 1.0
         for p in fs:
-            # a label filter after the joins thins nothing before them
+            # a filter on a label after the joins thins nothing before them
             if classify_after_joins and isinstance(p.expression, LabelIn):
                 continue
             surv *= effective_selectivity(p.selectivity)
@@ -742,7 +743,7 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
             ids_src[alias] = PortRef(aid, f"ids:{alias}")
 
     # documents expected after a table's AI.IF filters, before its
-    # label filters
+    # filters on labels
     live_asked = {}
     for alias, predicates in filters.items():
         survival = 1.0
@@ -758,10 +759,10 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
     for call, aliases in joined_classifies:
         if labels.tests.get(call):
             return Refusal(
-                reasons=("a label filter tests a one-document classification, "
+                reasons=("a filter on a label tests a one-document classification, "
                          f"not the classification of {aliases[0]!r} x "
                          f"{aliases[1]!r} joined rows",),
-                constraint="joined_label_filter", needed=1, available=0)
+                constraint="joined_label_in", needed=1, available=0)
         if not any({argument.alias for argument in join.prompt.args}
                    == set(aliases) for join in joins):
             return Refusal(
@@ -800,13 +801,13 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
                 label_ports.append(scores)
             for position in labels.tests.get(call, ()):
                 predicate = filters[alias][position]
-                lid = f"label_filter:{alias}:{position}"
-                nodes.append(LabelFilter(
+                lid = f"filter:{alias}:{position}"
+                nodes.append(Filter(
                     node_id=lid, inputs=input_ports((scores,)),
-                    score_name=labels.names[call], aliases=(alias,),
-                    comparison="in", threshold=0.0,
-                    selectivity=predicate.selectivity, written_pos=position,
-                    accepted=tuple(predicate.expression.accepted)))
+                    predicate=InList(labels.names[call],
+                                     tuple(predicate.expression.accepted)),
+                    aliases=(alias,), selectivity=predicate.selectivity,
+                    written_pos=position))
                 scores = PortRef(lid, "scores")
                 ids_src[alias] = PortRef(lid, f"ids:{alias}")
                 live *= effective_selectivity(predicate.selectivity)

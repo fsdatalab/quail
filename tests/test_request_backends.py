@@ -405,7 +405,7 @@ def test_request_backends_classify_with_one_request_per_trie_node():
     assert result.outputs["label_answers:kind"].to_pydict() == {
         "d": [0, 1], "kind": ["a", "b"]}
     assert result.outputs["ids:d"] == [1]
-    assert result.outputs["label_filter_answers:kind"].to_pydict() == {
+    assert result.outputs["label_in_answers:kind"].to_pydict() == {
         "d": [0, 1], "predicate": [0, 0], "answer": [False, True]}
     assert result.metrics.extension["requests"] == 2
     (step,) = result.metrics.extension["steps"]
@@ -454,11 +454,11 @@ def test_request_backends_drop_a_document_whose_answer_names_no_label():
         preamble_token_ids=(3,), classifies=(spec,))
     execution = _execution({"d": [[10], [11], [12]]}, client=_UnsureClient())
     result = execution.execute(node, {})
-    # document 2 has no label row, fails the label filter, and is gone
+    # document 2 has no label row, fails the filter on its label, and is gone
     assert result.outputs["label_answers:kind"].to_pydict() == {
         "d": [0, 1], "kind": ["a", "b"]}
     assert result.outputs["ids:d"] == [0, 1]
-    assert result.outputs["label_filter_answers:kind"].to_pydict() == {
+    assert result.outputs["label_in_answers:kind"].to_pydict() == {
         "d": [0, 1], "predicate": [0, 0], "answer": [True, True]}
     (step,) = result.metrics.extension["steps"]
     assert (step["n_in"], step["n_out"], step["unmatched"]) == (3, 2, 1)

@@ -324,9 +324,9 @@ def test_classification_runs_beside_filters_and_joins(monkeypatch):
                  .select("c.id", "e.id", "topic"))
         plan = query.plan()
         assert [type(node).__name__ for node in plan.nodes] == [
-            "Scan", "Scan", "AiFilter", "AiClassify", "LabelFilter", "AiJoin",
+            "Scan", "Scan", "AiFilter", "AiClassify", "Filter", "AiJoin",
             "Project"]
-        # the chain, the classification, and its label filter run as
+        # the chain, the classification, and the filter on its label run as
         # one pipeline; the join joins it only when it anchors on the
         # claims
         test, join, project = plan.nodes[4], plan.nodes[5], plan.nodes[6]
@@ -395,10 +395,10 @@ def test_a_classification_of_joined_rows_follows_its_join(monkeypatch):
         assert set(labels.column_names) == {"c", "e", "stance"}
         assert labels.column_names[0] == join.anchor
 
-        # a label filter on a joined row's label is refused
+        # a filter on a joined row's label is refused
         claims = session.docs("claims").alias("c")
         evidence = session.docs("evidence").alias("e")
-        with pytest.raises(CompileError, match="label filter"):
+        with pytest.raises(CompileError, match="filter on a label"):
             (claims.ai_join(evidence, quail.prompt(
                  "Does {1} support {0}?", quail.col("c.claim"),
                  quail.col("e.text")), selectivity=0.5)
@@ -475,7 +475,7 @@ def test_classification_moves_after_a_selective_join(monkeypatch):
         topic = quail.prompt("What is {0} about?", quail.col("c.claim"))
         claims = session.docs("claims").alias("c")
         evidence = session.docs("evidence").alias("e")
-        # a join that almost nothing survives and a label filter that
+        # a join that almost nothing survives and a filter on a label that
         # keeps almost everything: classifying the few matched claims
         # after the join is cheaper than classifying every claim before
         query = (claims
@@ -489,7 +489,7 @@ def test_classification_moves_after_a_selective_join(monkeypatch):
         assert plan.settings["classify_placement"] == "after joins"
         names = [type(node).__name__ for node in plan.nodes]
         assert names.index("AiJoin") < names.index("AiClassify") < names.index(
-            "LabelFilter") < names.index("Recombine")
+            "Filter") < names.index("Recombine")
         execute = fever_executor(session, monkeypatch, 1, capacity=10)
         result = execute_query(query, physical_executor=execute)
         rows = result.collect().to_pylist()

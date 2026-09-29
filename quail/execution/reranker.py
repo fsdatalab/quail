@@ -15,7 +15,7 @@ from quail.execution.runner import (
     NodeMetrics,
     NodeResult,
 )
-from quail.physical import AiScore, ClassifySpec, LabelFilter, ScoreFilter, ValueType
+from quail.physical import AiScore, ClassifySpec, Filter, InList, ValueType
 from quail.progress import answer_sink
 
 # Rows scored per reranker call. Each call's scores reach the answer sink
@@ -418,7 +418,7 @@ class RerankerModelExecution:
         )
 
 
-def _filter_answer_table(node: ScoreFilter, table, answers) -> pa.Table:
+def _filter_answer_table(node: Filter, table, answers) -> pa.Table:
     """One answer row per document, in the layout of a filter's answers."""
     alias = node.aliases[0]
     schema = pa.schema(
@@ -435,27 +435,28 @@ def _filter_answer_table(node: ScoreFilter, table, answers) -> pa.Table:
     ], schema=schema)
 
 
-class ScoreFilterRuntime:
-    """Apply a numeric score comparison and retain the score column."""
+class FilterRuntime:
+    """Keep the rows of a score or label table that pass the predicate."""
 
     def execute(self, node, inputs, context) -> NodeResult:
-        if not isinstance(node, ScoreFilter):
+        if not isinstance(node, Filter):
             raise TypeError(type(node).__name__)
         if len(inputs) != 1:
-            raise ValueError("ScoreFilter needs one score input")
+            raise ValueError("Filter needs one score or label input")
         table = next(iter(inputs.values()))
         return filter_scores(node, table)
 
 
+def evaluate_predicate(predicate, column):
+    """Whether each row of the column passes the predicate, as an Arrow array."""
+    if isinstance(predicate, InList):
+        return pc.is_in(column, value_set=pa.array(predicate.values, pa.string()))
+    return compare_score(column, predicate.op, predicate.value)
+
+
 def filter_scores(node, table) -> NodeResult:
-    """Apply a score filter to a table of scores or labels."""
-    if isinstance(node, LabelFilter):
-        answers = pc.is_in(table.column(node.score_name),
-                           value_set=pa.array(node.accepted, pa.string()))
-    else:
-        answers = compare_score(
-            table.column(node.score_name), node.comparison, node.threshold,
-        )
+    """Apply a filter to a table of scores or labels."""
+    answers = evaluate_predicate(node.predicate, table.column(node.column))
     filtered = table.filter(answers)
     if len(node.aliases) == 1:
         answer_name = f"filter_answers:{node.aliases[0]}"
@@ -475,12 +476,12 @@ def filter_scores(node, table) -> NodeResult:
                 "anchor": left,
                 "partners": right,
                 "semantics": "full",
-                "comparison": node.comparison,
-                "threshold": node.threshold,
+                "comparison": node.predicate.op,
+                "threshold": node.predicate.value,
             },
         )
     outputs = {"scores": filtered, answer_name: answer_relation}
-    if isinstance(node, LabelFilter) and len(node.aliases) == 1:
+    if len(node.aliases) == 1:
         outputs[f"ids:{node.aliases[0]}"] = (
             filtered.column(node.aliases[0]).to_pylist())
     return NodeResult(

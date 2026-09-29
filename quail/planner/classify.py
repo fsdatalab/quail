@@ -1,6 +1,6 @@
 """Physical planning for AI.CLASSIFY queries on one table.
 
-A plan scans the table, then for each label filter in written order
+A plan scans the table, then for each filter on a label in written order
 classifies the documents still alive and keeps those with an accepted
 label, then classifies what the projection still needs. Each document
 is scored the way the join path scores a pair: its prompt head and
@@ -37,7 +37,8 @@ from quail.physical import (
     AiClassify,
     ClassifySpec,
     ClassifyStage,
-    LabelFilter,
+    Filter,
+    InList,
     Limit,
     PortRef,
     Project,
@@ -619,17 +620,17 @@ class _Table:
 
 
 def plan_classify(region, context, *, backend_name: str):
-    """Build one Quail plan for a table's AI.CLASSIFY columns and label filters.
+    """Build one Quail plan for a table's AI.CLASSIFY columns and the filters on them.
 
-    The plan is a chain: scan the table, then for each label filter in
+    The plan is a chain: scan the table, then for each filter on a label in
     written order an AiClassify node (if that prompt has not been
-    classified yet) and a LabelFilter node, then an AiClassify node for
+    classified yet) and a Filter node over its labels, then an AiClassify node for
     each projected label column not yet classified, then the projection.
     Each classification gets a cost estimate from the documents
     expected to reach it and the suffix lengths of its scoring rule.
 
     A classification that follows another on the same documents, with
-    the same prompt head and at most one label filter between them
+    the same prompt head and at most one filter on the label between them
     testing the earlier label, joins the earlier node as a stage: the
     executor runs it on the documents the filter accepts while their
     KV is still resident.
@@ -686,7 +687,7 @@ def plan_classify(region, context, *, backend_name: str):
     live = float(count)
     chain = None          # index in nodes of the open classify chain
     last_call = None      # the chain's latest stage
-    since = []            # label filters since that stage
+    since = []            # filters on a label since that stage
     for kind, item in steps:
         if kind == "classify":
             # a classification after another on the same documents
@@ -723,13 +724,13 @@ def plan_classify(region, context, *, backend_name: str):
             last_call, since = item, []
         else:
             predicate = predicates[item]
-            node = LabelFilter(
-                node_id=f"label-filter:{alias}:{item}",
+            node = Filter(
+                node_id=f"filter:{alias}:{item}",
                 inputs=input_ports((current,)),
-                score_name=named[predicate.expression.call],
-                aliases=(alias,), comparison="in", threshold=0.0,
-                selectivity=predicate.selectivity, written_pos=item,
-                accepted=tuple(predicate.expression.accepted))
+                predicate=InList(named[predicate.expression.call],
+                                 tuple(predicate.expression.accepted)),
+                aliases=(alias,), selectivity=predicate.selectivity,
+                written_pos=item)
             live *= effective_selectivity(predicate.selectivity)
             nodes.append(node)
             current = PortRef(node.node_id, "scores")

@@ -727,7 +727,7 @@ def compile_sql(sql: str, catalog: Catalog,
                 f"the same AI expression is projected as "
                 f"{names[0]!r} and {score.name!r}; project it once")
         names.append(score.name)
-    # a label filter tests the projected column of the same call
+    # a filter on a label tests the projected column of the same call
     named = {column.expression: column.name for column in projected
              if column.expression.kind == "label"}
     for alias, predicates in b.filters.items():

@@ -165,7 +165,7 @@ class RequestClassifySpec:
     """One AI.CLASSIFY call submitted as one decoded answer per document.
 
     ``tail_token_ids`` follow each document: the question, the
-    category list, and the answer cue. ``tests`` are the label filters
+    category list, and the answer cue. ``tests`` are the filters on its label
     on this call, (written position, accepted labels), applied in
     order after the documents are labeled.
     """
@@ -421,10 +421,10 @@ class RequestExecution(PhysicalNode):
             )
             for spec in self.classifies
         )
-        # a label filter's answers, one relation per tested classification
+        # the answers of the filters on a label, one relation per tested classification
         outputs.extend(
             OutputPort(
-                f"label_filter_answers:{spec.output}",
+                f"label_in_answers:{spec.output}",
                 ValueType.FILTER_ANSWERS,
                 schema=(spec.alias, "predicate", "answer"),
             )
@@ -732,53 +732,112 @@ class AiClassify(AiScore):
 
 
 @dataclass(frozen=True)
-class ScoreFilter(PhysicalNode):
-    """Apply one numeric comparison while retaining the score column."""
+class InList:
+    """The predicate ``column IN (values)`` over a label column."""
 
-    score_name: str = ""
+    column: str
+    values: tuple[str, ...]
+
+    def accepts(self, value) -> bool:
+        """Whether one value passes."""
+        return value in self.values
+
+    def to_dict(self) -> dict:
+        return {"kind": "in_list", "column": self.column,
+                "values": list(self.values)}
+
+    def describe(self) -> str:
+        return f"{self.column} IN {list(self.values)}"
+
+
+@dataclass(frozen=True)
+class Comparison:
+    """The predicate ``column <op> value`` over a score column."""
+
+    column: str
+    op: str
+    value: float
+
+    def accepts(self, value) -> bool:
+        """Whether one value passes."""
+        import operator
+
+        compare = {"<": operator.lt, "<=": operator.le,
+                   ">": operator.gt, ">=": operator.ge}[self.op]
+        return bool(compare(value, self.value))
+
+    def to_dict(self) -> dict:
+        return {"kind": "comparison", "column": self.column, "op": self.op,
+                "value": self.value}
+
+    def describe(self) -> str:
+        return f"{self.column} {self.op} {self.value}"
+
+
+def predicate_from_mapping(value: Mapping[str, Any]) -> "InList | Comparison":
+    """The filter predicate a mapping encodes."""
+    if value["kind"] == "in_list":
+        return InList(str(value["column"]),
+                      tuple(str(item) for item in value["values"]))
+    if value["kind"] == "comparison":
+        return Comparison(str(value["column"]), str(value["op"]),
+                          float(value["value"]))
+    raise ValueError(f"unknown filter predicate {value['kind']!r}")
+
+
+@dataclass(frozen=True)
+class Filter(PhysicalNode):
+    """Keep the rows of a score or label table that pass a predicate.
+
+    The predicate reads a column a model call produced: ``InList`` for
+    an AI.CLASSIFY label tested with ``=`` or ``IN``, ``Comparison``
+    for an AI.SCORE score against a threshold. Over one table's rows
+    the filter also yields the kept documents' ids, so a join or a
+    later operator can take them; over a join's rows it yields the
+    join's answers.
+    """
+
+    predicate: InList | Comparison | None = None
     aliases: tuple[str, ...] = ()
-    comparison: str = ""
-    threshold: float = 0.0
     selectivity: float | None = None
     written_pos: int = 0
 
-    type_name: ClassVar[str] = "quail.score_filter"
+    type_name: ClassVar[str] = "quail.filter"
     runtime_key: ClassVar[str] = type_name
     location: ClassVar[ExecutionLocation] = ExecutionLocation.GPU_EXECUTOR
 
     @property
+    def column(self) -> str:
+        """The score or label column the predicate reads."""
+        return self.predicate.column
+
+    @property
     def outputs(self) -> tuple[OutputPort, ...]:
-        answers = (
-            OutputPort(
-                f"filter_answers:{self.aliases[0]}",
-                ValueType.FILTER_ANSWERS,
+        if len(self.aliases) == 1:
+            (alias,) = self.aliases
+            return (
+                OutputPort("scores", ValueType.SCORES),
+                OutputPort(f"filter_answers:{alias}", ValueType.FILTER_ANSWERS),
+                OutputPort(f"ids:{alias}", ValueType.DOCUMENT_IDS,
+                           schema=(alias,)),
             )
-            if len(self.aliases) == 1 else
-            OutputPort(
-                f"join_answers:{self.written_pos}",
-                ValueType.JOIN_ANSWERS,
-            )
-        )
         return (
             OutputPort("scores", ValueType.SCORES),
-            answers,
+            OutputPort(f"join_answers:{self.written_pos}",
+                       ValueType.JOIN_ANSWERS),
         )
 
     def attributes(self) -> dict:
         return {
-            "score_name": self.score_name,
+            "predicate": self.predicate.to_dict(),
             "aliases": list(self.aliases),
-            "comparison": self.comparison,
-            "threshold": self.threshold,
             "selectivity": self.selectivity,
             "written_pos": self.written_pos,
         }
 
     def explain_fields(self) -> Mapping[str, Any]:
         return {
-            "score": self.score_name,
-            "comparison": self.comparison,
-            "threshold": self.threshold,
+            "predicate": self.predicate.describe(),
             "selectivity": self.selectivity,
             "aliases": list(self.aliases),
         }
@@ -788,59 +847,10 @@ class ScoreFilter(PhysicalNode):
         return cls(
             node_id=node_id,
             inputs=inputs,
-            score_name=str(attributes["score_name"]),
+            predicate=predicate_from_mapping(attributes["predicate"]),
             aliases=tuple(attributes["aliases"]),
-            comparison=str(attributes["comparison"]),
-            threshold=float(attributes["threshold"]),
             selectivity=attributes["selectivity"],
             written_pos=int(attributes["written_pos"]),
-        )
-
-
-@dataclass(frozen=True)
-class LabelFilter(ScoreFilter):
-    """Keep the rows whose label column holds one of the accepted labels.
-
-    A one-table label filter also yields the accepted documents' ids,
-    so a join or a later filter can take them.
-    """
-
-    accepted: tuple[str, ...] = ()
-
-    type_name: ClassVar[str] = "quail.label_filter"
-
-    @property
-    def outputs(self) -> tuple[OutputPort, ...]:
-        ports = super().outputs
-        if len(self.aliases) == 1:
-            ports += (OutputPort(f"ids:{self.aliases[0]}",
-                                 ValueType.DOCUMENT_IDS,
-                                 schema=(self.aliases[0],)),)
-        return ports
-
-    def attributes(self) -> dict:
-        return {**super().attributes(), "accepted": list(self.accepted)}
-
-    def explain_fields(self) -> Mapping[str, Any]:
-        return {
-            "label": self.score_name,
-            "accepted": list(self.accepted),
-            "selectivity": self.selectivity,
-            "aliases": list(self.aliases),
-        }
-
-    @classmethod
-    def from_attributes(cls, node_id, inputs, attributes):
-        return cls(
-            node_id=node_id,
-            inputs=inputs,
-            score_name=str(attributes["score_name"]),
-            aliases=tuple(attributes["aliases"]),
-            comparison=str(attributes["comparison"]),
-            threshold=float(attributes["threshold"]),
-            selectivity=attributes["selectivity"],
-            written_pos=int(attributes["written_pos"]),
-            accepted=tuple(str(label) for label in attributes["accepted"]),
         )
 
 

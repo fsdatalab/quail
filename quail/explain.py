@@ -12,9 +12,9 @@ from quail.physical import (
     AiJoin,
     Barrier,
     Exchange,
+    Filter,
     Foreign,
     HashJoin,
-    LabelFilter,
     Limit,
     PortRef,
     Project,
@@ -351,8 +351,8 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                     f"labels={len(stage.spec.labels)}"
                     + (f", after label in {list(stage.accepted)}"
                        if stage.accepted is not None else ""))
-        elif isinstance(node, LabelFilter):
-            title += f": {node.score_name} in {list(node.accepted)}"
+        elif isinstance(node, Filter):
+            title += f": {node.predicate.describe()}"
         elif isinstance(node, AiJoin):
             title += f": anchor={node.anchor}"
             source = {"none": "not resident", "filter": "from filters",
