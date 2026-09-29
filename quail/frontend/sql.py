@@ -349,8 +349,9 @@ class _Binder:
                 labels=labels, descriptions=descriptions,
                 layout=options.pop("layout", "document_first"),
                 task_description=options.pop("task_description", "")))
-        if len(aliases) != 1:
-            raise CompileError("AI.CLASSIFY reads one document column")
+        if len(aliases) not in (1, 2):
+            raise CompileError("AI.CLASSIFY reads one document column, or "
+                               "one from each side of a join")
         model_call = ModelCall(prompt, "label", labels, descriptions)
         model_call.validate()
         return model_call, options, aliases

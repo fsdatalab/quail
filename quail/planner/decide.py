@@ -391,6 +391,12 @@ def label_work(plan, filters) -> LabelWork:
     return LabelWork(tuple(calls), names, tests, projected)
 
 
+def pair_calls(labels: LabelWork) -> list:
+    """The classifications of pairs, each with its anchor and partner alias."""
+    return [(call, call.aliases()) for call, _ in labels.calls
+            if len(call.aliases()) == 2]
+
+
 def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                 device: DeviceSpec, doc_tokens: dict, gpus: int = 1,
                 order: str | None = None, pair_fractions=None,
@@ -458,9 +464,10 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
                 reasons=("AI.CLASSIFY planning needs a planning context",),
                 constraint="unsupported_classify_query",
                 needed=1, available=0, unit="queries")
-        if any(len(call.aliases()) != 1 for call, _ in labels.calls):
+        if any(len(call.aliases()) not in (1, 2) for call, _ in labels.calls):
             return Refusal(
-                reasons=("AI.CLASSIFY reads one document",),
+                reasons=("AI.CLASSIFY reads one document, or one from each "
+                         "side of a join",),
                 constraint="unsupported_classify_query",
                 needed=1, available=0, unit="queries")
         refusal = classification_refusal(context)
@@ -747,10 +754,26 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
 
     deferred = set()          # aliases classified after the joins
 
+    pairs_to_label = pair_calls(labels)
+    for call, aliases in pairs_to_label:
+        if labels.tests.get(call):
+            return Refusal(
+                reasons=("a label filter tests a one-document classification, "
+                         f"not the classification of {aliases[0]!r} x "
+                         f"{aliases[1]!r} pairs",),
+                constraint="pair_label_filter", needed=1, available=0)
+        if not any({argument.alias for argument in join.prompt.args}
+                   == set(aliases) for join in joins):
+            return Refusal(
+                reasons=(f"the classification of {aliases[0]!r} x "
+                         f"{aliases[1]!r} pairs needs a join of the two",),
+                constraint="pair_classification_join", needed=1, available=0)
+
     def emit_classify(alias, live=None):
         """Classify the alias's documents, then keep the accepted labels."""
         nonlocal classify_seconds
-        calls = [call for call, owner in labels.calls if owner == alias]
+        calls = [call for call, owner in labels.calls
+                 if owner == alias and len(call.aliases()) == 1]
         if not calls:
             return
         if classify_after_joins and alias in joined and live is None:
@@ -886,6 +909,37 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
             keep_anchor_kv=anchor in retention_plan["after"][gid],
             stages=tuple(stage_dicts)))
         ids_src[anchor] = PortRef(gid, f"ids:{anchor}")
+
+    # a classification of pairs follows the join that keeps them, in
+    # the join's pipeline: each kept pair's partner block, question,
+    # and label paths run over the anchor's resident KV
+    try:
+        for call, aliases in pairs_to_label:
+            for g, group in enumerate(sequence_groups):
+                anchor = group[0][1]
+                stage = next((spec for spec, _ in group
+                              if set(spec["aliases"]) == set(aliases)), None)
+                if stage is not None:
+                    break
+            else:
+                raise AssertionError("a pair classification without its join")
+            partner = next(alias for alias in aliases if alias != anchor)
+            table = classify_table(context, anchor, "quail")
+            join = joins[stage["written_pos"]]
+            pairs = (effective_selectivity(join.selectivity)
+                     * live0[anchor] * live0[partner])
+            spec, _ = table.classify_pair(
+                call, labels.names[call], partner, pairs,
+                stats[partner].mean_doc_tokens)
+            node = table.node(
+                spec, PortRef(group_ids[g], f"join_answers:{stage['written_pos']}"),
+                sum(isinstance(n, AiClassify) for n in nodes))
+            nodes.append(node)
+            classify_seconds += spec.estimated_seconds
+            if call in labels.projected:
+                label_ports.append(PortRef(node.node_id, "scores"))
+    except ClassifyRefusedError as refused:
+        return refused.refusal()
 
     # classifications after the joins run over the documents the joins
     # matched: a document with at least one true pair, expected as the

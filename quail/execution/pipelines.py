@@ -10,7 +10,8 @@ vector through every operator of a pipeline before the next vector.
 A chain ends at a breaker: a node that needs every document at once
 (Barrier, Exchange, a barrier apply, the recombination, a projection),
 a join that reads the documents as partners, a second consumer of the
-same documents, or a join, which settles each anchor's KV itself.
+same documents, or a join, which settles each anchor's KV itself,
+unless a classification of the pairs it kept follows it.
 """
 
 from __future__ import annotations
@@ -54,9 +55,11 @@ def operator_aliases(node: PhysicalNode) -> tuple[str, ...]:
     if isinstance(node, AiFilter):
         return (node.alias,)
     if isinstance(node, AiClassify):
-        if node.spec is None or len(node.spec.aliases) != 1:
+        # a pair classification takes the join's anchors, with the
+        # partners the join paired them with
+        if node.spec is None:
             return ()
-        return tuple(node.spec.aliases)
+        return (node.spec.anchor,)
     if isinstance(node, LabelFilter):
         return tuple(node.aliases) if len(node.aliases) == 1 else ()
     if isinstance(node, Foreign):
@@ -74,7 +77,21 @@ def _document_ports(node: PhysicalNode, alias: str) -> tuple[str, ...]:
         return ("scores", f"ids:{alias}")
     if isinstance(node, Foreign) and node.ids == "pairs":
         return (f"pairs:{node.written_pos}",)
+    if isinstance(node, AiJoin):
+        # a pair classification reads the join's answers
+        return tuple(f"join_answers:{stage.written_pos}"
+                     for stage in node.stages) + (f"ids:{alias}",)
     return (f"ids:{alias}",)
+
+
+def _pairs_of(node: PhysicalNode, join: AiJoin) -> bool:
+    """Whether the node classifies the pairs the join keeps, on its anchor."""
+    if not isinstance(node, AiClassify) or node.spec is None:
+        return False
+    spec = node.spec
+    return (spec.partner is not None and spec.anchor == join.anchor
+            and any(set(spec.aliases) == {stage.anchor, *stage.partners}
+                    for stage in join.stages))
 
 
 def build_pipelines(graph: PhysicalGraph) -> dict[str, Pipeline]:
@@ -105,13 +122,14 @@ def build_pipelines(graph: PhysicalGraph) -> dict[str, Pipeline]:
         when each reads the one before it, as a per-batch apply
         returning pairs and the join reading those pairs do; any
         other fan-out needs the documents at once and ends the chain.
-        A join settles each anchor's KV itself and ends the chain.
+        A join settles each anchor's KV itself and ends the chain,
+        unless a classification of the pairs it kept follows it.
         """
-        if isinstance(node, AiJoin):
-            return []
         following = []
         for port in _document_ports(node, alias):
             for consumer in consumers.get((node.node_id, port), ()):
+                if isinstance(node, AiJoin) and not _pairs_of(consumer, node):
+                    continue
                 if takes(consumer, alias) and consumer not in following:
                     following.append(consumer)
         following.sort(key=lambda consumer: order[consumer.node_id])

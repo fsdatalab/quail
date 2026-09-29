@@ -943,6 +943,37 @@ class Query:
                     continue
                 table = next((table for table in (labels or {}).values()
                               if name in table.column_names), None)
+                if table is not None and table.column_names.index(name) == 2:
+                    # a label of pairs: each result row's pair looks its
+                    # label up; a pair without one leaves the result
+                    aliases = table.column_names[:2]
+                    if any(alias not in relation.schema.names
+                           for alias in aliases):
+                        raise CompileError(
+                            f"label column {name!r} belongs to the pairs of "
+                            f"{aliases}, not all in the result")
+                    call = next((column.expression
+                                 for column in self.logical.root.columns
+                                 if isinstance(column, Alias)
+                                 and column.name == name), None)
+                    order = (None if call is None
+                             else pa.array(call.labels, pa.string()))
+                    # a pair keyed as one integer: anchor index, partner index
+                    keys = _pair_keys(table.column(aliases[0]),
+                                      table.column(aliases[1]))
+                    declaration = acero.Declaration(
+                        "filter", acero.FilterNodeOptions(
+                            _pair_key_expression(*aliases).isin(keys)),
+                        inputs=[declaration])
+                    projection.append((tuple(aliases), (keys, table, order)))
+                    fields.append(pa.field(
+                        name,
+                        pa.string() if order is None
+                        else pa.dictionary(pa.int32(), pa.string()),
+                        nullable=True,
+                        metadata={b"quail.alias": aliases[0].encode("utf-8"),
+                                  b"quail.label": name.encode("utf-8")}))
+                    continue
                 if table is not None:
                     # a label the graph computed for some of an alias's
                     # documents, widened to every document of the alias
@@ -1243,3 +1274,17 @@ class Query:
         result.survivor_indices = survivors
         result.true_join_tables = true_join_tables
         return result
+
+
+
+def _pair_keys(anchors, partners) -> pa.Array:
+    """One int64 key per (anchor index, partner index) pair."""
+    keys = pc.add(pc.shift_left(pc.cast(anchors, pa.int64()), 32),
+                  pc.cast(partners, pa.int64()))
+    return keys.combine_chunks() if isinstance(keys, pa.ChunkedArray) else keys
+
+
+def _pair_key_expression(anchor: str, partner: str):
+    """The pair key of each row's anchor and partner columns."""
+    return pc.add(pc.shift_left(pc.field(anchor).cast(pa.int64()), 32),
+                  pc.field(partner).cast(pa.int64()))

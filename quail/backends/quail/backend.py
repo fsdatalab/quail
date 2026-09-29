@@ -12,7 +12,7 @@ import pyarrow as pa
 
 from quail.backends.base import GpuContext
 from quail.backends.quail.executor import loop
-from quail.backends.quail.executor.classify import ClassifyStages
+from quail.backends.quail.executor.classify import ClassifyStages, PairPartners
 from quail.backends.quail.executor.models import supported_archs
 from quail.backends.quail.executor.score import QuailScorer
 from quail.backends.quail.executor.stages import Stage, filter_stages, run_stages
@@ -159,31 +159,45 @@ class QuailModelExecution:
         members = list(pipeline.members)
         alias = pipeline.alias
         first = members[0]
-        (source,) = inputs[first.node_id].values()
+        # the first member's documents: its ids input, or its one input
+        anchor_port = next((port.name for port in first.inputs
+                            if port.source.port == f"ids:{alias}"), None)
+        source = (inputs[first.node_id][anchor_port] if anchor_port is not None
+                  else next(iter(inputs[first.node_id].values())))
         ids = list(source)
         gpu_inputs = {"gpu_timing": context.state.get("gpu_timing", False)}
         # the members with stages, then the gates after the last of them
         last_staged = max(index for index, member in enumerate(members)
                           if isinstance(member, (AiFilter, AiClassify, AiJoin)))
         staged, trailing = members[:last_staged + 1], members[last_staged + 1:]
+        joins = [index for index, member in enumerate(staged)
+                 if isinstance(member, AiJoin)]
         parts = []
-        for member in staged[:-1]:
+        for member in staged[:joins[0] if joins else -1]:
             parts.append(self._part(member, ids, parts, inputs, context))
         prefixes = DocumentPrefixes(context.state["pre"],
                                     context.state["docs"][alias], ids)
         sink = staged[-1]
         results = {}
-        if isinstance(sink, AiJoin):
+        if joins:
+            # the join settles each anchor's KV; a classification of
+            # the pairs it keeps runs as stages after the join's
+            join = staged[joins[0]]
             chain = {"documents": prefixes, "document_ids": ids,
-                     "parts": parts,
+                     "parts": parts, "after": [],
                      "pairs": {part.node.written_pos: part.rows
                                for part in parts
                                if isinstance(part, _ApplyGate)
                                and part.node.ids == "pairs"}}
             join_inputs = context.model_inputs(
-                sink, inputs[sink.node_id], context, chain)
-            results[sink.node_id] = self._execute_quail_node(sink, join_inputs)
-            context.model_result(sink, results[sink.node_id], context)
+                join, inputs[join.node_id], context, chain)
+            for member in staged[joins[0] + 1:]:
+                chain["after"].append(self._pair_part(
+                    member, join, ids, join_inputs, context))
+            results[join.node_id] = self._execute_quail_node(join, join_inputs)
+            context.model_result(join, results[join.node_id], context)
+            for part in chain["after"]:
+                results[part.node.node_id] = part.result_value
         else:
             own = self._part(sink, ids, parts, inputs, context)
             stages = _gated_stages(parts + [own])
@@ -203,7 +217,7 @@ class QuailModelExecution:
                             state["torch"], gpu_inputs)
         for part in parts:
             results[part.node.node_id] = part.result_value
-        if not isinstance(sink, AiJoin):
+        if not joins:
             results[sink.node_id] = own.result_value
         # gates after the last stage read the documents that came out
         for member in trailing:
@@ -249,6 +263,30 @@ class QuailModelExecution:
             call, metrics = foreign_call(node, values, context)
             return _ApplyGate(node, call, metrics, values)
         raise TypeError(f"{node.type_name!r} is not a pipeline operator")
+
+    def _pair_part(self, node, join, ids, join_inputs, context):
+        """The part classifying the pairs the join keeps, on its anchors."""
+        if not isinstance(node, AiClassify) or node.spec.partner is None:
+            raise TypeError(
+                f"{node.type_name!r} cannot follow a join in its pipeline")
+        spec = node.spec
+        stage = next(stage for stage in join.stages
+                     if set(spec.aliases) == {stage.anchor, *stage.partners})
+        # the join's partner tuples, one partner alias each
+        partner_ids = [int(entry[0]) if isinstance(entry, (tuple, list))
+                       else int(entry)
+                       for entry in join_inputs["partner_indices"][
+                           stage.written_pos]]
+        documents = context.state["docs"][spec.partner]
+        kept = _KeptPairs(join.stages.index(stage))
+        partners = PairPartners(
+            ids=partner_ids,
+            documents=[documents[partner] for partner in partner_ids],
+            kept=kept.of)
+        position = {document: index for index, document in enumerate(ids)}
+        plan = ClassifyStages(self._state, spec, len(ids),
+                              lambda key: position[key[1]], partners=partners)
+        return _ClassifyPart(node, ids, plan, kept=kept)
 
     def _execute_quail_node(
         self,
@@ -316,14 +354,18 @@ class QuailModelExecution:
         join_stats = {}
         leading = 0
         parts = []
+        after = []
         if chain is not None:
             # the chain's stages lead the join's: a survivor goes on to
-            # the join with its KV resident, past the chain's gates
+            # the join with its KV resident, past the chain's gates;
+            # a classification of the pairs kept follows the join's
             filter_ids = chain["document_ids"]
             parts = chain["parts"]
+            after = chain.get("after", [])
             join_part = _StagesPart(join_stages)
-            stages = _gated_stages(parts + [join_part])
-            leading = len(stages) - len(join_stages)
+            stages = _gated_stages(parts + [join_part] + after)
+            leading = len(stages) - len(join_stages) - sum(
+                len(part.stages) for part in after)
             root = parts[0].node if parts else node
             prefixes = chain["documents"]
             anchor_keys = DocumentKeys(node.anchor, filter_ids)
@@ -338,10 +380,25 @@ class QuailModelExecution:
             attention = node.attention or None
         anchor_done = inputs["anchor_done"]
         settled = set()
+        join_rows = {}
+        if after:
+            # the join's last stage records each anchor's kept partners
+            # for the parts after it, and its row settles the anchor
+            last = len(join_stages) - 1
+
+            def kept(a, row, stage=join_stages[last]):
+                indices = (None if lists_for is None
+                           else lists_for(anchor_keys[a][1])[last])
+                join_rows[a] = row
+                for part in after:
+                    part.kept.record(a, row, indices)
+                return bool(any(row))
+
+            join_stages[last].decide = kept
 
         def on_settled(anchor, survived, row):
             settled.add(anchor)
-            anchor_done(anchor, row)
+            anchor_done(anchor, join_rows.get(anchor, row) if after else row)
 
         def on_chunk(transitions):
             _report_chain_transitions(parts, transitions)
@@ -353,7 +410,22 @@ class QuailModelExecution:
             on_chunk=on_chunk, label=f"join ({len(join_stages)} stages)",
             staging=_staging(self._state),
             conditioning=_chain_conditioning(parts))
-        answers = every[leading:]
+        answers = every[leading:leading + len(join_stages)]
+        after_tokens = 0
+        if after:
+            low = leading + len(join_stages)
+            for part in after:
+                high = low + len(part.stages)
+                own = part.finish(every[low:high]) or 0
+                part_spans = [span for span in spans if low <= span[0] < high]
+                part.result_value = part.result(
+                    own, _gpu_seconds(torch, part_spans, inputs),
+                    _chunks(part_spans, inputs), {})
+                after_tokens += own
+                low = high
+            spans = [span for span in spans
+                     if span[0] < leading + len(join_stages)]
+            tokens -= after_tokens
         if chain is not None:
             # the join packs frames and partner suffixes; the rest is the chain's
             join_tokens = _streamed_tokens(join_stages, answers, lists_for,
@@ -367,15 +439,20 @@ class QuailModelExecution:
             answers = [{local_of[position]: row for position, row in stage.items()}
                        for stage in answers]
             anchor_ids = [filter_ids[position] for position in reached]
-            kv_round = {"hits": len(reached), "misses": 0}
-            _complete_chain(parts, every[:leading], spans, tokens - join_tokens,
-                            join_stats, torch, inputs)
-            for part in parts:
-                if part.result_value is None:
-                    raise RuntimeError("a pipeline part finished without a result")
-            join_stats = {}
-            spans = [span for span in spans if span[0] >= leading]
-            tokens = join_tokens
+            if parts:
+                kv_round = {"hits": len(reached), "misses": 0}
+                _complete_chain(parts, every[:leading], spans,
+                                tokens - join_tokens, join_stats, torch, inputs)
+                for part in parts:
+                    if part.result_value is None:
+                        raise RuntimeError(
+                            "a pipeline part finished without a result")
+                join_stats = {}
+                spans = [span for span in spans if span[0] >= leading]
+                tokens = join_tokens
+            else:
+                # the join led the pipeline and packed the anchors itself
+                kv_round = {"hits": 0, "misses": len(reached)}
         else:
             anchor_ids = list(inputs["anchor_ids"])
             kv_round = inputs.get("kv_round") or {}
@@ -495,11 +572,12 @@ class _ClassifyPart:
     document_done = None
     result_value = None
 
-    def __init__(self, node, ids, plan: ClassifyStages, priors=()):
+    def __init__(self, node, ids, plan: ClassifyStages, priors=(), kept=None):
         self.node = node
         self.ids = ids
         self.plan = plan
         self.priors = priors      # (part, port) of each label table read
+        self.kept = kept          # a pair classification's _KeptPairs
         self.stages = plan.stages
         self.reached = 0
         self.label_tokens = 0
@@ -519,6 +597,24 @@ class _ClassifyPart:
     def result(self, tokens, gpu_s, chunks, stats) -> NodeResult:
         spec = self.node.spec
         plan = self.plan
+        if plan.partners is not None:
+            pairs = sorted(plan.pair_labels)
+            rows = np.asarray(
+                [[self.ids[anchor], plan.partners.ids[partner]]
+                 for anchor, partner in pairs], dtype=np.int32).reshape(-1, 2)
+            table = _score_table(rows, spec.aliases, spec.name,
+                                 [plan.pair_labels[pair] for pair in pairs],
+                                 pa.string())
+            sink = answer_sink()
+            if sink is not None and len(rows):
+                sink(scored_batch(self.node, rows, table))
+            return NodeResult(classify_outputs(self.node, table), NodeMetrics(
+                input_rows=len(pairs), output_rows=len(pairs),
+                evaluated_document_pairs=len(pairs), fresh_tokens=tokens,
+                gpu_s=gpu_s, chunks=chunks,
+                extension={"output": spec.name, "aliases": list(spec.aliases),
+                           "input_rows": len(pairs),
+                           "label_tokens": self.label_tokens}))
         # a document whose answer named no label has no row
         labeled = [index for index, label in enumerate(plan.labels[0])
                    if label is not None]
@@ -550,6 +646,23 @@ class _ClassifyPart:
                 "borrowed_prefix_tokens": stats.get("borrowed_tokens", 0),
                 "pack_s": round(stats.get("pack_s", 0.0), 3),
             }))
+
+
+class _KeptPairs:
+    """The partners a join's last stage kept for each anchor."""
+
+    def __init__(self, stage: int):
+        self.stage = stage
+        self.partners = {}
+
+    def record(self, anchor, row, indices) -> None:
+        """Record the anchor's kept partners from its row of answers."""
+        self.partners[anchor] = [
+            position if indices is None else indices[position]
+            for position, bit in enumerate(row) if bit]
+
+    def of(self, anchor) -> list:
+        return self.partners.get(anchor, [])
 
 
 class _LabelGate:

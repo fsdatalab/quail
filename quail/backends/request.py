@@ -258,6 +258,25 @@ def plan_request_backend(
     classify_specs = []
     for call, alias in label_plan.calls:
         prompts.append(call.prompt)
+        pair = {}
+        if len(call.aliases()) == 2:
+            # a classification of the pairs a join keeps: decoded after
+            # that join, one request per pair
+            partner = call.aliases()[1]
+            parts = {part_alias: (label, frame)
+                     for part_alias, label, frame in call.prompt.label_token_ids}
+            written_pos = next(
+                (position for position, join in joins.items()
+                 if {argument.alias for argument in join.prompt.args}
+                 == set(call.aliases())), None)
+            if written_pos is None:
+                raise ValueError(
+                    f"the classification of {alias!r} x {partner!r} pairs "
+                    f"needs a join of the two")
+            pair = dict(partner=partner,
+                        pair_token_ids=(tuple(parts[alias][1]),
+                                        tuple(parts[partner][0])),
+                        join_written_pos=written_pos)
         classify_specs.append(RequestClassifySpec(
             alias=alias,
             output=label_plan.names[call],
@@ -269,6 +288,7 @@ def plan_request_backend(
             tests=tuple(
                 (position, tuple(filters[alias][position].expression.accepted))
                 for position in label_plan.tests.get(call, ())),
+            **pair,
         ))
 
     join_specs = []
@@ -766,6 +786,8 @@ class RequestModelExecution:
             evaluated_documents += result["requests"]
 
         for spec in node.classifies:
+            if spec.partner is not None:
+                continue
             document_ids = list(survivors[spec.alias])
             result = _classify_documents(
                 self.client, spec, [
@@ -967,6 +989,49 @@ class RequestModelExecution:
             evaluated_pairs += len(rows)
             fresh_tokens += result["fresh_tokens"]
             cached_tokens += result["cached_tokens"]
+
+        for spec in node.classifies:
+            if spec.partner is None:
+                continue
+            # the pairs the join kept, each decoded as anchor, note,
+            # partner block, and the question
+            answers = outputs[f"join_answers:{spec.join_written_pos}"]
+            kept = answers.filter(answers.column("answer"))
+            pairs = list(zip(kept.column(spec.alias).to_pylist(),
+                             kept.column(spec.partner).to_pylist()))
+            note, partner_label = (_token_list(ids) for ids in spec.pair_token_ids)
+            result = _classify_documents(
+                self.client, spec, [
+                    _token_list(node.preamble_token_ids)
+                    + _token_list(self.documents[spec.alias][anchor])
+                    + note + partner_label
+                    + _token_list(self.documents[spec.partner][partner])
+                    for anchor, partner in pairs])
+            labeled = [(pair, label) for pair, label
+                       in zip(pairs, result["labels"]) if label is not None]
+            outputs[f"label_answers:{spec.output}"] = pa.table({
+                spec.alias: pa.array([a for (a, _), _ in labeled], pa.int32()),
+                spec.partner: pa.array([p for (_, p), _ in labeled], pa.int32()),
+                spec.output: pa.array([label for _, label in labeled],
+                                      pa.string()),
+            })
+            steps.append({
+                "kind": "classify",
+                "alias": spec.alias,
+                "partner": spec.partner,
+                "output": spec.output,
+                "n_in": len(pairs),
+                "n_out": len(labeled),
+                "wall_s": result["wall_s"],
+                "requests": result["requests"],
+                "fresh_tokens": result["fresh_tokens"],
+                "cached_tokens": result["cached_tokens"],
+                "unmatched": result["unmatched"],
+            })
+            requests += result["requests"]
+            fresh_tokens += result["fresh_tokens"]
+            cached_tokens += result["cached_tokens"]
+            evaluated_pairs += result["requests"]
 
         for alias in node.aliases:
             outputs[f"ids:{alias}"] = survivors[alias]

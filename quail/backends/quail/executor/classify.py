@@ -154,13 +154,52 @@ def _tokenizer(state):
     return tokenizer
 
 
+@dataclass
+class PairPartners:
+    """A pair classification's partner documents and each anchor's partners.
+
+    Attributes:
+        ids: The partner documents' ids, in the order the suffixes take.
+        documents: Each partner document's token ids, in that order.
+        kept: Callable(anchor index) -> the indices into ``ids`` of the
+            partners the anchor is classified with; asked when the
+            anchor reaches the stage, after the join that pairs them.
+    """
+
+    ids: list
+    documents: list
+    kept: Callable[[int], list]
+
+
+def _label_readout(state, targets, rows: int, normalize: bool):
+    """The label readout kept on the state, rebuilt when its shape changes."""
+    readout = state.get("label_readout")
+    if (readout is None or list(readout.targets.tolist()) != targets
+            or readout.rows != rows
+            or getattr(readout, "normalize", normalize) != normalize):
+        torch = state["torch"]
+        head = full_output_head(state["model"])
+        readout = AsyncLabelLogprobs(
+            torch, torch.nn.functional, head, targets, rows=rows,
+            normalize=normalize)
+        state["label_readout"] = readout
+        logger.info("label readout: head %s x %s in %s, %s targets, "
+                    "%s rows per request, %s", *head.shape,
+                    str(head.dtype).replace("torch.", ""), len(targets),
+                    rows, "normalized" if normalize else "targets' logits")
+    return readout
+
+
 class ClassifyStages:
     """The stages one classification asks of each document, and its labels.
 
     One stage per classification of the chain, or one per trie depth
     under ``trie_decode``; a later classification's first stage gates
     on the label before it. The stages read the label readout kept on
-    the state, rebuilt when the targets or rows change.
+    the state, rebuilt when the targets or rows change. A pair
+    classification's one stage sends each anchor, for every partner
+    it is paired with, the partner's label and document, the question,
+    and the label paths; its labels are by (anchor, partner).
 
     Args:
         state: The executor state.
@@ -169,18 +208,25 @@ class ClassifyStages:
         index_of: Callable(admission key) -> the document's index.
         on_label: Optional callable(index, label) run when a document's
             first classification labels it.
+        partners: A pair classification's PairPartners; None otherwise.
     """
 
     conditioning = None     # a canvas classification's ConditioningRows
     seeds = None            # document index -> its canvas seed; the index itself
+    partners = None         # a pair classification's PairPartners
+    pair_labels = None      # (anchor index, partner index) -> label, for pairs
 
-    def __init__(self, state, spec, count, index_of, on_label=None):
+    def __init__(self, state, spec, count, index_of, on_label=None,
+                 partners=None):
         self.spec = spec
         self.specs = specs = spec.chain
         self.index_of = index_of
         self.canvases = None
         if spec.scoring == "canvas":
             self._denoising_stages(state, spec, count, on_label)
+            return
+        if spec.partner is not None:
+            self._pair_stages(state, spec, count, partners)
             return
         targets = sorted({token for stage in specs
                           for ids in stage.label_token_ids for token in ids})
@@ -197,23 +243,8 @@ class ClassifyStages:
         # labels at the cue row
         same_rows = all(len(ids) == 1 for stage in specs
                         for ids in stage.label_token_ids)
-        normalize = not same_rows
-        readout = state.get("label_readout")
-        if (readout is None or list(readout.targets.tolist()) != targets
-                or readout.rows != readout_rows
-                or getattr(readout, "normalize", normalize) != normalize):
-            torch = state["torch"]
-            head = full_output_head(state["model"])
-            readout = AsyncLabelLogprobs(
-                torch, torch.nn.functional, head, targets, rows=readout_rows,
-                normalize=normalize)
-            state["label_readout"] = readout
-            logger.info("label readout: head %s x %s in %s, %s targets, "
-                        "%s rows per request, %s", *head.shape,
-                        str(head.dtype).replace("torch.", ""), len(targets),
-                        readout_rows,
-                        "normalized" if normalize else "targets' logits")
-        self.readout = readout
+        self.readout = readout = _label_readout(state, targets, readout_rows,
+                                                not same_rows)
         self.labels = [np.full(count, None, dtype=object) for _ in specs]
         self.decoders = {}
         self.stages = []
@@ -256,6 +287,57 @@ class ClassifyStages:
                     frame=request.frame, requests=ask, decide=round_read,
                     read_all_rows=False,
                     label=f"{stage_spec.name} round {round}"))
+
+    def _pair_stages(self, state, spec, count, partners):
+        """One stage over the anchors: each partner's block, the question, the paths."""
+        if spec.stages:
+            raise ValueError("a pair classification runs alone")
+        if spec.scoring != "trie_paths":
+            raise ValueError("a pair classification scores label paths "
+                             f"(trie_paths), not {spec.scoring!r}")
+        if partners is None:
+            raise ValueError("a pair classification needs its partners")
+        note, partner_label = spec.pair
+        targets = sorted({token for ids in spec.label_token_ids for token in ids})
+        request = label_requests(spec, targets)
+        self.requests = [request]
+        paths = [list(path) for path in request.suffixes]
+        self.paths = len(paths)
+        self.readout_rows = max(map(len, paths))
+        self.read_all = True
+        same_rows = all(len(ids) == 1 for ids in spec.label_token_ids)
+        self.readout = readout = _label_readout(
+            state, targets, self.readout_rows, not same_rows)
+        self.partners = partners
+        self.pair_labels = {}
+        self.labels = [np.full(count, None, dtype=object)]
+        self.decoders = {}
+        question = list(request.frame)
+        # partner-major: suffix p * paths + q is partner p's path q
+        block = [list(partner_label) + list(document) + question
+                 for document in partners.documents]
+        self.block_tokens = [len(tokens) for tokens in block]
+        suffixes = [tokens + path for tokens in block for path in paths]
+        read_rows = [len(path) for _ in block for path in paths]
+        count_of = self.paths
+
+        def ask(key):
+            kept = partners.kept(self.index_of(key))
+            return [p * count_of + q for p in kept for q in range(count_of)]
+
+        def score(anchor, row):
+            kept = partners.kept(anchor)
+            logprobs = np.asarray(row).reshape(
+                len(kept), count_of, self.readout_rows, -1)
+            for position, partner in enumerate(kept):
+                self.pair_labels[(anchor, partner)] = spec.labels[
+                    best_label(request.score(logprobs[position]))]
+            return True
+
+        self.stages = [Stage(
+            suffixes=suffixes, readout=readout, frame=list(note),
+            requests=ask, decide=score, read_all_rows=True,
+            read_rows=read_rows, label=spec.name)]
 
     def _denoising_stages(self, state, spec, count, on_label):
         """One stage per denoising step, for the canvas rule.
@@ -355,6 +437,17 @@ class ClassifyStages:
             (label tokens, streamed tokens): the suffix tokens read, and
             those plus the frames written after the documents.
         """
+        if self.partners is not None:
+            label_tokens = 0
+            streamed = 0
+            paths = self.requests[0].suffixes
+            path_tokens = sum(map(len, paths))
+            for anchor, partner in self.pair_labels:
+                label_tokens += path_tokens
+                streamed += path_tokens + len(paths) * self.block_tokens[partner]
+            anchors = {anchor for anchor, _ in self.pair_labels}
+            streamed += len(anchors) * len(self.stages[0].frame)
+            return label_tokens, streamed
         if self.canvases is not None:
             settings = self.settings
             steps = sum(document.steps for document in self.canvases.values())

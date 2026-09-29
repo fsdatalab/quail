@@ -211,7 +211,8 @@ class Query:
                                      self._tokenizer, turn=self._turn,
                                      layout=layout,
                                      task_description=task_description)
-        self._note_doc_column(refs[0])
+        for ref in refs:
+            self._note_doc_column(ref)
         call = ModelCall(bound, "label", labels, descriptions)
         call.validate()
         self._labels[name] = Alias(call, name)
@@ -229,6 +230,10 @@ class Query:
         if name not in self._labels:
             raise CompileError(f"no classification is named {name!r}")
         call = self._labels[name].expression
+        if len(call.aliases()) != 1:
+            raise CompileError(
+                f"a label filter tests a one-document classification; "
+                f"{name!r} classifies pairs of {call.aliases()}")
         test = LabelIn(call, tuple(labels), name)
         test.validate()
         (alias,) = call.aliases()

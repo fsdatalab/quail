@@ -176,9 +176,16 @@ class RequestClassifySpec:
     labels: tuple[str, ...]
     label_token_ids: tuple[tuple[Any, ...], ...]
     tests: tuple[tuple[int, tuple[str, ...]], ...] = ()
+    # a pair classification: the partner alias, the anchor note and
+    # partner label token ids, and the join whose true pairs it labels
+    partner: str | None = None
+    pair_token_ids: tuple[tuple[Any, ...], ...] = ()
+    join_written_pos: int | None = None
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "RequestClassifySpec":
+        partner = value.get("partner")
+        join_written_pos = value.get("join_written_pos")
         return cls(
             alias=str(value["alias"]),
             output=str(value["output"]),
@@ -187,6 +194,11 @@ class RequestClassifySpec:
             label_token_ids=tuple(tuple(ids) for ids in value["label_token_ids"]),
             tests=tuple((int(position), tuple(str(label) for label in accepted))
                         for position, accepted in value.get("tests", ())),
+            partner=None if partner is None else str(partner),
+            pair_token_ids=tuple(tuple(ids)
+                                 for ids in value.get("pair_token_ids", ())),
+            join_written_pos=(None if join_written_pos is None
+                              else int(join_written_pos)),
         )
 
     def to_dict(self) -> dict:
@@ -198,6 +210,9 @@ class RequestClassifySpec:
             "label_token_ids": [list(ids) for ids in self.label_token_ids],
             "tests": [[position, list(accepted)]
                       for position, accepted in self.tests],
+            "partner": self.partner,
+            "pair_token_ids": [list(ids) for ids in self.pair_token_ids],
+            "join_written_pos": self.join_written_pos,
         }
 
 
@@ -579,7 +594,11 @@ class ClassifySpec(ScoreSpec):
     document sharing its token prefix (the prefix_sharing rule).
     ``stages`` are later classifications of the same documents, run
     while each document's KV is still resident; a stage runs on the
-    documents whose previous label its gate accepts.
+    documents whose previous label its gate accepts. A pair
+    classification has two aliases, the anchor and its partner, and
+    ``pair`` holds (the anchor note written after the anchor document,
+    the partner label written before each partner document); its tail
+    follows the partner.
     """
 
     labels: tuple[str, ...] = ()
@@ -587,6 +606,17 @@ class ClassifySpec(ScoreSpec):
     scoring: str = "trie_paths"
     share_prefixes: bool = False
     stages: tuple["ClassifyStage", ...] = ()
+    pair: tuple[tuple[int, ...], tuple[int, ...]] | None = None
+
+    @property
+    def anchor(self) -> str:
+        """The alias whose documents the classification is anchored on."""
+        return self.aliases[0]
+
+    @property
+    def partner(self) -> str | None:
+        """The partner alias of a pair classification, else None."""
+        return self.aliases[1] if len(self.aliases) == 2 else None
 
     @property
     def chain(self) -> tuple["ClassifySpec", ...]:
@@ -609,6 +639,8 @@ class ClassifySpec(ScoreSpec):
             share_prefixes=bool(value.get("share_prefixes", False)),
             stages=tuple(ClassifyStage.from_mapping(stage)
                          for stage in value.get("stages", ())),
+            pair=(None if value.get("pair") is None else tuple(
+                tuple(int(token) for token in part) for part in value["pair"])),
         )
 
     def to_dict(self) -> dict:
@@ -619,6 +651,8 @@ class ClassifySpec(ScoreSpec):
             "scoring": self.scoring,
             "share_prefixes": self.share_prefixes,
             "stages": [stage.to_dict() for stage in self.stages],
+            "pair": (None if self.pair is None
+                     else [list(part) for part in self.pair]),
         }
 
 

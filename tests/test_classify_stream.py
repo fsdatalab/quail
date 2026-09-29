@@ -46,19 +46,36 @@ LABEL_IDS = ((11, 13), (11, 14))
 TARGETS = [11, 13, 14]
 
 
+# a pair classification's anchor note (its frame) and partner label
+NOTE = 4600
+PARTNER_LABEL = 4700
+
+
 class LabelingModel(FakeModel):
     """Answer filter and join suffixes from truth, and label documents."""
 
-    def __init__(self, filter_truth, join_truth, label_truth):
+    def __init__(self, filter_truth, join_truth, label_truth,
+                 pair_truth=None):
         super().__init__(filter_truth, join_truth)
         self.label_truth = label_truth
+        self.pair_truth = pair_truth
 
     def forward_chunk(self, chunk):
         rows = []
         for spec in chunk.specs:
-            for suffix in spec["suffixes"]:
+            for index, suffix in enumerate(spec["suffixes"]):
                 head = suffix[0]
-                if head == CUE:
+                if head == PARTNER_LABEL:
+                    # a pair's block: the partner label, its document,
+                    # the question, then the label path; the path's
+                    # rows are read
+                    partner = suffix[1] - PARTNER
+                    wanted = LABEL_IDS[self.pair_truth[(spec["key"][1], partner)]]
+                    for depth in range(int(spec["read_rows"][index])):
+                        rows.append(np.asarray(
+                            [-1.0 if token == wanted[depth] else -5.0
+                             for token in TARGETS], np.float32))
+                elif head == CUE:
                     # each row's log probabilities over the targets: the
                     # document's label token at that depth wins
                     wanted = LABEL_IDS[self.label_truth[spec["key"][1]]]
@@ -74,7 +91,9 @@ class LabelingModel(FakeModel):
                     document = spec["key"][1]
                     rows.append(self.filter_truth[document][head - QUESTION])
             heads = [suffix[0] for suffix in spec["suffixes"]]
-            if spec["prefix"] is not None and heads and heads[0] != QUESTION:
+            # with a filter, a document's prefix packs at its stage
+            if (self.filter_truth and spec["prefix"] is not None and heads
+                    and heads[0] != QUESTION):
                 raise AssertionError(
                     "a document packed its prefix past the filter stage")
         self.launched.append(chunk.specs)
@@ -384,6 +403,121 @@ def test_streamed_classification_labels_survivors_with_their_kv_resident(
     assert any(QUESTION in chunk and (CUE in chunk or chunk & {FRAME})
                or CLASSIFY_FRAME in chunk and FRAME in chunk
                for chunk in heads)
+
+
+def pair_graph():
+    """A join of r with p, then a classification of the pairs it keeps."""
+    spec = ClassifySpec(
+        name="stance", aliases=("r", "p"), query_template="", arguments=(),
+        expected_inputs=3, estimated_seconds=0.0,
+        prompt_token_parts=((), (CLASSIFY_FRAME, CUE)), labels=("a", "b"),
+        label_token_ids=LABEL_IDS, scoring="trie_paths",
+        pair=((NOTE,), (PARTNER_LABEL,)))
+    nodes = [
+        Scan(node_id="input:r", alias="r", input_id="r"),
+        Scan(node_id="input:p", alias="p", input_id="p"),
+        AiJoin(
+            node_id="group:0", anchor="r", anchor_resident="fresh",
+            inputs=input_ports((PortRef("input:r", "ids:r"),
+                                PortRef("input:p", "ids:p"))),
+            stages=(JoinStage(
+                written_pos=2, exec_idx=0, anchor="r", partners=("p",),
+                semantics="full", selectivity=0.5, expected_tuples=3,
+                anchor_frame_tokens=1, pair_tail_tokens=0,
+                anchor_resident="fresh", tuple_tokens=0, pairs_from="",
+                frame_token_ids=(FRAME,), label_token_ids=(("p", ()),),
+                tail_token_ids=()),)),
+        AiClassify(
+            node_id="classify:rp",
+            inputs=input_ports((PortRef("group:0", "join_answers:2"),)),
+            backend_name="quail", model="qwen3-4b-fp8", spec=spec),
+    ]
+    return PhysicalGraph(tuple(nodes), PortRef("classify:rp", "scores"))
+
+
+def test_a_classification_of_pairs_runs_after_its_join_on_the_anchors_kv(
+        monkeypatch):
+    from quail.execution.pipelines import build_pipelines
+
+    graph = pair_graph()
+    chains = {pipeline.node_ids for pipeline in build_pipelines(graph).values()}
+    assert chains == {("group:0", "classify:rp")}
+
+    monkeypatch.setattr(loop, "pack_chunk", fake_pack)
+    docs = {"r": [[DOC + d] * (5 + d) for d in range(3)],
+            "p": [[PARTNER + d, PARTNER + d] for d in range(2)]}
+    # r0 pairs with both partners, r1 with p1 only, r2 with none
+    join_truth = {("r", 0): [1, 1], ("r", 1): [0, 1], ("r", 2): [0, 0]}
+    pair_truth = {(0, 0): 0, (0, 1): 1, (1, 1): 0}
+    model = LabelingModel([], join_truth, [], pair_truth)
+    torch = fake_torch()
+    torch.nn = SimpleNamespace(functional=None)
+    arena = cpu_arena(64)
+    pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
+    execution = QuailModelExecution(SimpleNamespace(
+        model=MODELS["qwen3-4b-fp8"], gpu_index=0, gpu_count=1,
+        device=DEVICES["h100-sxm"]))
+    execution.bind_loaded_model(model=object(), arena=arena, pipeline=pipeline)
+    execution.bind_query(
+        torch=torch,
+        async_answers=SimpleNamespace(submit=lambda v: v, result=lambda v: v,
+                                      dtype=None),
+        answer_rows=object(), chunk_tokens=120)
+    from quail.backends.quail.executor import classify as classify_module
+
+    class FakeReadout:
+        def __init__(self, targets, rows):
+            self.targets = np.asarray(targets)
+            self.rows = rows
+            self.dtype = np.dtype((np.float32, (rows, len(targets))))
+
+        def submit(self, rows, rows_per_answer=None):
+            rows_per_answer = rows_per_answer or [1] * len(rows)
+            padded = np.full((len(rows_per_answer), self.rows,
+                              len(self.targets)), np.nan, np.float32)
+            start = 0
+            for answer, count in enumerate(rows_per_answer):
+                for offset in range(count):
+                    padded[answer, offset] = rows[start + offset]
+                start += count
+            return padded
+
+        def result(self, rows):
+            return rows
+
+    monkeypatch.setattr(classify_module, "full_output_head",
+                        lambda model: SimpleNamespace(shape=(1, 1),
+                                                      dtype="fake"))
+    monkeypatch.setattr(
+        classify_module, "AsyncLabelLogprobs",
+        lambda torch, F, head, targets, rows, normalize: FakeReadout(
+            targets, rows))
+    state = {
+        "torch": torch, "arena": arena, "pipeline": pipeline,
+        "model_execution": execution,
+        "runtimes": built_in_registry().runtimes,
+        "model_spec": MODELS["qwen3-4b-fp8"], "device": DEVICES["h100-sxm"],
+        "chunk_tokens": 120, "docs": docs,
+    }
+    result = execute_single_graph(state, SETTINGS, graph)
+    assert not arena.accounting.owned
+    outputs = result["_outputs"]
+    metrics = result["node_metrics"]
+    assert outputs[PortRef("group:0", "ids:r")].column("r").to_pylist() \
+        == [0, 1]
+    labels = outputs[PortRef("classify:rp", "scores")]
+    assert labels.column("r").to_pylist() == [0, 0, 1]
+    assert labels.column("p").to_pylist() == [0, 1, 1]
+    assert labels.column("stance").to_pylist() == ["a", "b", "a"]
+    # the join packed the anchors once; the classification packed, per
+    # anchor kept, its note and, per pair, the partner block, the
+    # question, and the path [CUE, 11]: no second prefill
+    block = 1 + 2 + 1
+    assert metrics["classify:rp"]["fresh_tokens"] == 2 * 1 + 3 * (block + 2)
+    assert metrics["classify:rp"]["evaluated_document_pairs"] == 3
+    # the join packed every anchor, its frame, and both partners' suffixes
+    assert metrics["group:0"]["fresh_tokens"] == sum(map(len, docs["r"])) \
+        + 3 * 1 + 6 * 2
 
 
 def chained_graph():

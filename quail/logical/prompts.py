@@ -298,8 +298,13 @@ def bind_classify_prompt(template: str, args: tuple, labels, descriptions=(),
     """
     import re
     _check_placeholders(template, len(args))
+    if len(args) == 2:
+        return _bind_pair_classify_prompt(
+            template, args, labels, descriptions, tokenizer, turn, layout,
+            task_description)
     if len(args) != 1:
-        raise CompileError("AI.CLASSIFY reads one document per row")
+        raise CompileError("AI.CLASSIFY reads one document per row, or one "
+                           "from each side of a join")
     if layout not in CLASSIFY_LAYOUTS:
         raise CompileError(
             f"unknown AI.CLASSIFY layout {layout!r}; the layouts are "
@@ -330,6 +335,52 @@ def bind_classify_prompt(template: str, args: tuple, labels, descriptions=(),
                   tail=tail, preamble_tokens=pre_tok, tail_tokens=tail_tok,
                   frame=frame, frame_tokens=frame_tok,
                   preamble_token_ids=pre_ids, tail_token_ids=tail_ids)
+
+
+def _bind_pair_classify_prompt(template, args, labels, descriptions,
+                               tokenizer, turn, layout, task_description):
+    """Bind a classification of a pair: the join layout, then the question.
+
+    The anchor document (placeholder {0}) comes first, then the anchor
+    note, the partner's label and document, and the classification
+    question with its categories and cue. ``label_token_ids`` holds,
+    as for a join, each alias's partner label and the anchor note.
+    """
+    if layout != "document_first":
+        raise CompileError(
+            "a classification of a pair uses the document_first layout")
+    aliases = [r.alias for r in args]
+    if len(set(aliases)) != len(aliases):
+        raise CompileError(
+            "each placeholder of a pair classification names a distinct table")
+    question = render_classify_question(template, labels, descriptions,
+                                        task_description)
+    preamble = shared_preamble(turn[0])
+    tail = question + turn[1]
+    frame = join_anchor_note(0)
+    pre_tok = tail_tok = frame_tok = None
+    pre_ids = tail_ids = ()
+    label_ids = ()
+    if tokenizer is not None:
+        pre_ids = tuple(tokenizer(preamble))
+        tail_ids = tuple(tokenizer(tail))
+        pre_tok, tail_tok = len(pre_ids), len(tail_ids)
+        frame_tok = len(tokenizer(frame))
+        label_ids = tuple(
+            (alias, tuple(tokenizer(join_label(index))),
+             tuple(tokenizer(join_anchor_note(index))))
+            for index, alias in enumerate(aliases))
+    return Prompt(template=template, args=tuple(args), preamble=preamble,
+                  tail=tail, preamble_tokens=pre_tok, tail_tokens=tail_tok,
+                  frame=frame, frame_tokens=frame_tok,
+                  preamble_token_ids=pre_ids, tail_token_ids=tail_ids,
+                  label_token_ids=label_ids)
+
+
+def render_pair_classify_prompt_text(prompt, anchor: str, partner: str) -> str:
+    """The complete text of a pair classification's prompt for one pair."""
+    return (prompt.preamble + anchor + join_anchor_note(0) + join_label(1)
+            + partner + prompt.tail)
 
 
 def bind_score_prompt(template: str, args: tuple,

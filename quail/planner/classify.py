@@ -537,12 +537,66 @@ class _Table:
                 best = (key, scoring, simulated)
         return best[1], best[2]
 
-    def node(self, spec, input_port, index) -> AiClassify:
+    def node(self, spec, input_port, index, *ports) -> AiClassify:
         """The plan node running a classification and its chained stages."""
         return AiClassify(node_id=f"ai-classify:{index}",
-                          inputs=input_ports((input_port,)),
+                          inputs=input_ports((input_port, *ports)),
                           backend_name=self.backend_name,
                           model=self.model.name, spec=spec)
+
+    def classify_pair(self, call, name, partner, pairs, partner_tokens):
+        """Return a ClassifySpec for a classification of this table's pairs.
+
+        Each pair the join kept is priced as a suffix over the anchor's
+        resident KV: the partner's label and document, the question,
+        and the label paths (the ``trie_paths`` rule).
+
+        Args:
+            call: The logical AI.CLASSIFY call over the two aliases.
+            name: The output column.
+            partner: The partner table's alias.
+            pairs: How many pairs are expected to reach it.
+            partner_tokens: The partner documents' mean length.
+
+        Raises:
+            ClassifyRefusedError: A forced rule other than trie_paths.
+        """
+        if self.scoring not in (None, EXHAUSTIVE_SCORING):
+            raise ClassifyRefusedError(
+                f"a classification of pairs scores label paths "
+                f"({EXHAUSTIVE_SCORING}); the {self.scoring!r} rule was forced",
+                1, 0)
+        head = tuple(call.prompt.preamble_token_ids)
+        tail = tuple(call.prompt.tail_token_ids)
+        parts = {alias: (label, frame)
+                 for alias, label, frame in call.prompt.label_token_ids}
+        note, partner_label = parts[self.alias][1], parts[partner][0]
+        labels = tuple(tuple(self.tokenizer(label_text(label)))
+                       for label in call.labels)
+        block = len(partner_label) + int(round(partner_tokens)) + len(tail) - 1
+        chains = [block + length
+                  for length in suffix_lengths(EXHAUSTIVE_SCORING, labels)]
+        documents = self.sample(pairs)
+        simulated = simulate(
+            [len(head) + length for length, _ in documents], len(note),
+            [chains] * len(documents), self.chunk,
+            self.capacity or self.budget, self.model, self.device,
+            resident=True, canvas_rows=self.model.canvas_tokens)
+        need = len(head) + self.longest + len(note) + max(chains)
+        if need > self.budget:
+            raise ClassifyRefusedError(
+                f"a pair in {self.alias!r} x {partner!r} needs {need} tokens "
+                f"with its classification prompt, but the forward pass "
+                f"budget is {self.budget} tokens", need, self.budget)
+        return ClassifySpec(
+            name=name, aliases=(self.alias, partner),
+            query_template=call.prompt.template,
+            arguments=tuple((ref.alias, ref.column) for ref in call.prompt.args),
+            expected_inputs=pairs, estimated_seconds=simulated.seconds,
+            prompt_token_parts=(head, tail), labels=tuple(call.labels),
+            label_token_ids=labels, scoring=EXHAUSTIVE_SCORING,
+            pair=(tuple(note), tuple(partner_label)),
+        ), simulated.work
 
 
 def plan_classify(region, context, *, backend_name: str):

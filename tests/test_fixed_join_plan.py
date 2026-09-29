@@ -2,6 +2,7 @@
 
 import numpy as np
 import pyarrow as pa
+import pytest
 from test_quail_backend import graph_state
 
 import quail
@@ -12,6 +13,7 @@ from quail.execution.pipelines import build_pipelines
 from quail.execution.reranker import _score_table
 from quail.execution.runner import NodeMetrics, NodeResult
 from quail.execution.types import PhysicalResponse
+from quail.logical.nodes import CompileError
 from quail.physical import (
     AiClassify,
     AiFilter,
@@ -83,7 +85,35 @@ class FixedFeverAnswers:
             [self.labels[document] for document in labeled], pa.string())
         return labeled, table
 
+    # the stance a classification gives each (claim, evidence) pair
+    stances = {(0, 0): "supports", (1, 1): "refutes", (2, 0): "supports"}
+
     def execute(self, node, inputs):
+        if isinstance(node, AiClassify) and node.spec.partner is not None:
+            # the join's true pairs, labeled from the table above; a
+            # pair without a stance gets no row
+            (answers,) = inputs["score_inputs"].values()
+            pairs = []
+            for local, row in answers["rows"].items():
+                anchor = answers["anchor_index"][local]
+                members = (answers["anchor_partners"] or {}).get(local)
+                for position, bit in enumerate(row):
+                    if not bit:
+                        continue
+                    member = position if members is None else members[position]
+                    (partner,) = answers["partner_index"][member]
+                    pairs.append((int(anchor), int(partner)))
+            # the stances are keyed (claim, evidence) whichever the anchor
+            claim_first = node.spec.anchor.startswith("c")
+            labeled = [pair for pair in pairs
+                       if (pair if claim_first else pair[::-1]) in self.stances]
+            rows = np.asarray(labeled, dtype=np.int32).reshape(-1, 2)
+            table = _score_table(
+                rows, node.spec.aliases, node.spec.name,
+                [self.stances[pair if claim_first else pair[::-1]]
+                 for pair in labeled], pa.string())
+            return NodeResult({"scores": table}, NodeMetrics(
+                input_rows=len(pairs), output_rows=len(labeled)))
         if isinstance(node, AiClassify):
             (ids,) = inputs["score_inputs"].values()
             (alias,) = node.spec.aliases
@@ -315,6 +345,64 @@ def test_classification_runs_beside_filters_and_joins(monkeypatch):
             {"c.id": "c0", "e.id": "e0", "topic": "science"}]
         labels = result.answer_tables["classifies"]["topic"]
         assert labels.column("topic").to_pylist() == ["science", "sport"]
+
+
+def test_a_classification_of_pairs_follows_its_join(monkeypatch):
+    """A join, then a classification of each pair it keeps.
+
+    The classification runs in the join's pipeline on its anchor, its
+    label rides the output rows, and a pair without a label leaves
+    the result.
+    """
+    with _session() as session:
+        claims = session.docs("claims").alias("c")
+        evidence = session.docs("evidence").alias("e")
+        stance = quail.prompt("How does {1} bear on {0}?",
+                              quail.col("c.claim"), quail.col("e.text"))
+        query = (claims.ai_join(evidence, quail.prompt(
+                     "Does {1} support {0}?", quail.col("c.claim"),
+                     quail.col("e.text")), selectivity=0.5)
+                 .ai_classify(stance, ["supports", "refutes"], name="stance")
+                 .select("c.id", "e.id", "stance"))
+        plan = query.plan()
+        assert [type(node).__name__ for node in plan.nodes] == [
+            "Scan", "Scan", "AiJoin", "AiClassify", "Project"]
+        join, classify, project = plan.nodes[2], plan.nodes[3], plan.nodes[4]
+        assert classify.spec.aliases == (join.anchor,) + tuple(
+            alias for alias in ("c", "e") if alias != join.anchor)
+        assert classify.spec.pair is not None and classify.spec.scoring == \
+            "trie_paths"
+        assert classify.inputs[0].source == PortRef(join.node_id,
+                                                    "join_answers:0")
+        assert [port.source.port for port in project.inputs] == [
+            "join_answers:0", "scores"]
+        members = build_pipelines(plan.graph)[join.node_id].node_ids
+        assert members == (join.node_id, classify.node_id)
+        codecs = session.registry.codecs
+        assert decode_graph(encode_graph(plan.graph, codecs), codecs) == plan.graph
+        explained = query.explain()
+        assert "stance" in explained
+        execute = fever_executor(session, monkeypatch, 1, capacity=10)
+        result = execute_query(query, physical_executor=execute)
+        # (c1, e2) is a true pair with no stance and leaves the result
+        rows = result.collect().to_pylist()
+        assert sorted((row["c.id"], row["e.id"], row["stance"])
+                      for row in rows) == [
+            ("c0", "e0", "supports"), ("c1", "e1", "refutes"),
+            ("c2", "e0", "supports")]
+        labels = result.answer_tables["classifies"]["stance"]
+        assert set(labels.column_names) == {"c", "e", "stance"}
+        assert labels.column_names[0] == join.anchor
+
+        # a label filter on a pair label is refused
+        claims = session.docs("claims").alias("c")
+        evidence = session.docs("evidence").alias("e")
+        with pytest.raises(CompileError, match="label filter"):
+            (claims.ai_join(evidence, quail.prompt(
+                 "Does {1} support {0}?", quail.col("c.claim"),
+                 quail.col("e.text")), selectivity=0.5)
+             .ai_classify(stance, ["supports", "refutes"], name="stance")
+             .label_in("stance", ["supports"]))
 
 
 def test_an_unlabeled_document_leaves_a_filtered_result(monkeypatch):
