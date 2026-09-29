@@ -544,10 +544,10 @@ class _Table:
                           backend_name=self.backend_name,
                           model=self.model.name, spec=spec)
 
-    def classify_pair(self, call, name, partner, pairs, partner_tokens):
-        """Return a ClassifySpec for a classification of this table's pairs.
+    def classify_joined(self, call, name, partner, pairs, partner_tokens):
+        """Return a ClassifySpec for a classification of joined rows.
 
-        Each pair the join kept is priced as a suffix over the anchor's
+        Each row the join kept is priced as a suffix over the anchor's
         resident KV: the partner's label and document, the question,
         and the label paths (the ``trie_paths`` rule).
 
@@ -555,7 +555,7 @@ class _Table:
             call: The logical AI.CLASSIFY call over the two aliases.
             name: The output column.
             partner: The partner table's alias.
-            pairs: How many pairs are expected to reach it.
+            pairs: How many joined rows are expected to reach it.
             partner_tokens: The partner documents' mean length.
 
         Raises:
@@ -563,7 +563,7 @@ class _Table:
         """
         if self.scoring not in (None, EXHAUSTIVE_SCORING):
             raise ClassifyRefusedError(
-                f"a classification of pairs scores label paths "
+                f"a classification of joined rows scores label paths "
                 f"({EXHAUSTIVE_SCORING}); the {self.scoring!r} rule was forced",
                 1, 0)
         head = tuple(call.prompt.preamble_token_ids)
@@ -585,7 +585,7 @@ class _Table:
         need = len(head) + self.longest + len(note) + max(chains)
         if need > self.budget:
             raise ClassifyRefusedError(
-                f"a pair in {self.alias!r} x {partner!r} needs {need} tokens "
+                f"a row of {self.alias!r} x {partner!r} needs {need} tokens "
                 f"with its classification prompt, but the forward pass "
                 f"budget is {self.budget} tokens", need, self.budget)
         return ClassifySpec(
@@ -595,7 +595,7 @@ class _Table:
             expected_inputs=pairs, estimated_seconds=simulated.seconds,
             prompt_token_parts=(head, tail), labels=tuple(call.labels),
             label_token_ids=labels, scoring=EXHAUSTIVE_SCORING,
-            pair=(tuple(note), tuple(partner_label)),
+            join_layout=(tuple(note), tuple(partner_label)),
         ), simulated.work
 
 

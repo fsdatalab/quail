@@ -347,12 +347,12 @@ def test_classification_runs_beside_filters_and_joins(monkeypatch):
         assert labels.column("topic").to_pylist() == ["science", "sport"]
 
 
-def test_a_classification_of_pairs_follows_its_join(monkeypatch):
-    """A join, then a classification of each pair it keeps.
+def test_a_classification_of_joined_rows_follows_its_join(monkeypatch):
+    """A join, then a classification of each row it keeps.
 
     The classification runs in the join's pipeline on its anchor, its
-    label rides the output rows, and a pair without a label leaves
-    the result.
+    label rides the output rows, and a row without a label leaves the
+    result.
     """
     with _session() as session:
         claims = session.docs("claims").alias("c")
@@ -370,7 +370,7 @@ def test_a_classification_of_pairs_follows_its_join(monkeypatch):
         join, classify, project = plan.nodes[2], plan.nodes[3], plan.nodes[4]
         assert classify.spec.aliases == (join.anchor,) + tuple(
             alias for alias in ("c", "e") if alias != join.anchor)
-        assert classify.spec.pair is not None and classify.spec.scoring == \
+        assert classify.spec.join_layout is not None and classify.spec.scoring == \
             "trie_paths"
         assert classify.inputs[0].source == PortRef(join.node_id,
                                                     "join_answers:0")
@@ -394,7 +394,7 @@ def test_a_classification_of_pairs_follows_its_join(monkeypatch):
         assert set(labels.column_names) == {"c", "e", "stance"}
         assert labels.column_names[0] == join.anchor
 
-        # a label filter on a pair label is refused
+        # a label filter on a joined row's label is refused
         claims = session.docs("claims").alias("c")
         evidence = session.docs("evidence").alias("e")
         with pytest.raises(CompileError, match="label filter"):

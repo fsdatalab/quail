@@ -368,10 +368,12 @@ AI.CLASSIFY(PROMPT(...), ARRAY[...],
 - **`output_mode`**: optional. Only `'single'`, one label per
   document, is supported.
 
-#### Classify pairs from a join
+#### Classify joined rows
 
-A prompt with one column from each side of a join classifies each
-pair the join keeps. The label describes the two documents together.
+`AI.CLASSIFY` works on the rows of a join like any other `SELECT`
+expression: it labels each row the join returns. When its prompt reads
+one column from each table, the label describes the two documents
+together.
 
 For example, to find the aspects each review discusses and the
 review's sentiment toward each one:
@@ -388,15 +390,15 @@ JOIN aspects a
                   r.body, a.aspect))
 ```
 
-The join keeps a (review, aspect) pair when the review discusses the
-aspect. `AI.CLASSIFY` then labels only those pairs.
+The join returns a (review, aspect) row when the review discusses the
+aspect. `AI.CLASSIFY` then labels only those rows.
 
-Quail classifies the pairs on the join's anchor, the side the join
+Quail runs the classification on the join's anchor, the side the join
 processes first and keeps in GPU memory. Set it with the `anchor`
 option of the join's `AI.IF`, or let Quail choose. The anchor's
-documents are already in KV from the join. For each kept pair, the
-model reads only the partner, which is the pair's other document, then
-the question and the labels.
+documents are already in KV from the join. For each joined row, the
+model reads only the partner, which is the row's document from the
+other table, then the question and the labels.
 
 The prompt shows the anchor document first, then a line naming it,
 such as `(The document above is DOCUMENT {0}.)`. The partner follows
@@ -404,11 +406,11 @@ under its own heading, such as `DOCUMENT {1}:`. The question
 keeps `{0}` and `{1}` as written, so refer to the documents as
 `DOCUMENT {0}` and `DOCUMENT {1}`, as in the example.
 
-A pair classification has these limits:
+A classification of joined rows has these limits:
 
 - The query must join the two tables with `AI.IF`. Otherwise it
   raises `CompileError`, or Quail refuses to plan it.
-- A pair's label can be returned, but not tested in `WHERE`.
+- Its label can be returned, but not tested in `WHERE`.
 - The layout is `'document_first'`.
 
 ### AI.EXTRACT

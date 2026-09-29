@@ -155,8 +155,8 @@ def _tokenizer(state):
 
 
 @dataclass
-class PairPartners:
-    """A pair classification's partner documents and each anchor's partners.
+class JoinPartners:
+    """The partner documents of a join and each anchor's kept partners.
 
     Attributes:
         ids: The partner documents' ids, in the order the suffixes take.
@@ -196,10 +196,11 @@ class ClassifyStages:
     One stage per classification of the chain, or one per trie depth
     under ``trie_decode``; a later classification's first stage gates
     on the label before it. The stages read the label readout kept on
-    the state, rebuilt when the targets or rows change. A pair
-    classification's one stage sends each anchor, for every partner
-    it is paired with, the partner's label and document, the question,
-    and the label paths; its labels are by (anchor, partner).
+    the state, rebuilt when the targets or rows change. A
+    classification of joined rows has one stage: it sends each anchor,
+    for every partner the join kept with it, the partner's label and
+    document, the question, and the label paths; its labels are by
+    (anchor, partner).
 
     Args:
         state: The executor state.
@@ -208,13 +209,14 @@ class ClassifyStages:
         index_of: Callable(admission key) -> the document's index.
         on_label: Optional callable(index, label) run when a document's
             first classification labels it.
-        partners: A pair classification's PairPartners; None otherwise.
+        partners: The join's JoinPartners, for a classification of
+            joined rows; None otherwise.
     """
 
     conditioning = None     # a canvas classification's ConditioningRows
     seeds = None            # document index -> its canvas seed; the index itself
-    partners = None         # a pair classification's PairPartners
-    pair_labels = None      # (anchor index, partner index) -> label, for pairs
+    partners = None         # JoinPartners, for joined rows
+    pair_labels = None      # (anchor index, partner index) -> label, for joined rows
 
     def __init__(self, state, spec, count, index_of, on_label=None,
                  partners=None):
@@ -226,7 +228,7 @@ class ClassifyStages:
             self._denoising_stages(state, spec, count, on_label)
             return
         if spec.partner is not None:
-            self._pair_stages(state, spec, count, partners)
+            self._joined_stages(state, spec, count, partners)
             return
         targets = sorted({token for stage in specs
                           for ids in stage.label_token_ids for token in ids})
@@ -288,16 +290,17 @@ class ClassifyStages:
                     read_all_rows=False,
                     label=f"{stage_spec.name} round {round}"))
 
-    def _pair_stages(self, state, spec, count, partners):
+    def _joined_stages(self, state, spec, count, partners):
         """One stage over the anchors: each partner's block, the question, the paths."""
         if spec.stages:
-            raise ValueError("a pair classification runs alone")
+            raise ValueError("a classification of joined rows runs alone")
         if spec.scoring != "trie_paths":
-            raise ValueError("a pair classification scores label paths "
-                             f"(trie_paths), not {spec.scoring!r}")
+            raise ValueError("a classification of joined rows scores label "
+                             f"paths (trie_paths), not {spec.scoring!r}")
         if partners is None:
-            raise ValueError("a pair classification needs its partners")
-        note, partner_label = spec.pair
+            raise ValueError(
+                "a classification of joined rows needs the join's partners")
+        note, partner_label = spec.join_layout
         targets = sorted({token for ids in spec.label_token_ids for token in ids})
         request = label_requests(spec, targets)
         self.requests = [request]

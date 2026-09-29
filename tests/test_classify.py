@@ -550,7 +550,7 @@ def test_sql_classifies_and_tests_labels(session):
             session.sql(bad)
 
 
-def test_sql_classifies_the_pairs_a_join_keeps(session, tmp_path):
+def test_sql_classifies_the_rows_a_join_keeps(session, tmp_path):
     path = tmp_path / "aspects.parquet"
     pq.write_table(pa.table({"id": [1, 2], "aspect": ["price", "size"]}),
                    path)
@@ -573,7 +573,7 @@ def test_sql_classifies_the_pairs_a_join_keeps(session, tmp_path):
     assert classify.spec.partner is not None
     assert classify.spec.anchor == join.anchor
     assert classify.inputs[0].source.node_id == join.node_id
-    # a pair's label is not tested in WHERE
+    # a joined row's label is not tested in WHERE
     with pytest.raises(CompileError, match="one table|label filter"):
         session.sql(
             f"SELECT d.id, a.id FROM documents d JOIN aspects a "

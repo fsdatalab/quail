@@ -46,7 +46,8 @@ LABEL_IDS = ((11, 13), (11, 14))
 TARGETS = [11, 13, 14]
 
 
-# a pair classification's anchor note (its frame) and partner label
+# the anchor note (its frame) and partner label of a classification
+# of joined rows
 NOTE = 4600
 PARTNER_LABEL = 4700
 
@@ -55,10 +56,10 @@ class LabelingModel(FakeModel):
     """Answer filter and join suffixes from truth, and label documents."""
 
     def __init__(self, filter_truth, join_truth, label_truth,
-                 pair_truth=None):
+                 joined_truth=None):
         super().__init__(filter_truth, join_truth)
         self.label_truth = label_truth
-        self.pair_truth = pair_truth
+        self.joined_truth = joined_truth
 
     def forward_chunk(self, chunk):
         rows = []
@@ -66,11 +67,11 @@ class LabelingModel(FakeModel):
             for index, suffix in enumerate(spec["suffixes"]):
                 head = suffix[0]
                 if head == PARTNER_LABEL:
-                    # a pair's block: the partner label, its document,
+                    # a joined row's block: the partner label, its document,
                     # the question, then the label path; the path's
                     # rows are read
                     partner = suffix[1] - PARTNER
-                    wanted = LABEL_IDS[self.pair_truth[(spec["key"][1], partner)]]
+                    wanted = LABEL_IDS[self.joined_truth[(spec["key"][1], partner)]]
                     for depth in range(int(spec["read_rows"][index])):
                         rows.append(np.asarray(
                             [-1.0 if token == wanted[depth] else -5.0
@@ -405,14 +406,14 @@ def test_streamed_classification_labels_survivors_with_their_kv_resident(
                for chunk in heads)
 
 
-def pair_graph():
-    """A join of r with p, then a classification of the pairs it keeps."""
+def joined_graph():
+    """A join of r with p, then a classification of the rows it keeps."""
     spec = ClassifySpec(
         name="stance", aliases=("r", "p"), query_template="", arguments=(),
         expected_inputs=3, estimated_seconds=0.0,
         prompt_token_parts=((), (CLASSIFY_FRAME, CUE)), labels=("a", "b"),
         label_token_ids=LABEL_IDS, scoring="trie_paths",
-        pair=((NOTE,), (PARTNER_LABEL,)))
+        join_layout=((NOTE,), (PARTNER_LABEL,)))
     nodes = [
         Scan(node_id="input:r", alias="r", input_id="r"),
         Scan(node_id="input:p", alias="p", input_id="p"),
@@ -435,11 +436,11 @@ def pair_graph():
     return PhysicalGraph(tuple(nodes), PortRef("classify:rp", "scores"))
 
 
-def test_a_classification_of_pairs_runs_after_its_join_on_the_anchors_kv(
+def test_a_classification_of_joined_rows_runs_after_its_join_on_the_anchors_kv(
         monkeypatch):
     from quail.execution.pipelines import build_pipelines
 
-    graph = pair_graph()
+    graph = joined_graph()
     chains = {pipeline.node_ids for pipeline in build_pipelines(graph).values()}
     assert chains == {("group:0", "classify:rp")}
 
@@ -448,8 +449,8 @@ def test_a_classification_of_pairs_runs_after_its_join_on_the_anchors_kv(
             "p": [[PARTNER + d, PARTNER + d] for d in range(2)]}
     # r0 pairs with both partners, r1 with p1 only, r2 with none
     join_truth = {("r", 0): [1, 1], ("r", 1): [0, 1], ("r", 2): [0, 0]}
-    pair_truth = {(0, 0): 0, (0, 1): 1, (1, 1): 0}
-    model = LabelingModel([], join_truth, [], pair_truth)
+    joined_truth = {(0, 0): 0, (0, 1): 1, (1, 1): 0}
+    model = LabelingModel([], join_truth, [], joined_truth)
     torch = fake_torch()
     torch.nn = SimpleNamespace(functional=None)
     arena = cpu_arena(64)

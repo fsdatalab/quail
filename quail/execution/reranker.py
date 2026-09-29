@@ -262,7 +262,7 @@ def classify_label_tables(spec, table) -> dict:
     """
     tables = {spec.name: table.filter(pc.is_valid(table.column(spec.name)))}
     if len(spec.aliases) != 1:
-        return tables       # a classification of pairs has no stages
+        return tables       # a classification of joined rows has no stages
     (alias,) = spec.aliases
     for stage in spec.stages:
         name = stage.spec.name

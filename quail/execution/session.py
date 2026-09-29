@@ -944,21 +944,22 @@ class Query:
                 table = next((table for table in (labels or {}).values()
                               if name in table.column_names), None)
                 if table is not None and table.column_names.index(name) == 2:
-                    # a label of pairs: each result row's pair looks its
-                    # label up; a pair without one leaves the result
+                    # a label of joined rows: each result row looks its
+                    # label up by its two ids; a row without one leaves
+                    # the result
                     aliases = table.column_names[:2]
                     if any(alias not in relation.schema.names
                            for alias in aliases):
                         raise CompileError(
-                            f"label column {name!r} belongs to the pairs of "
-                            f"{aliases}, not all in the result")
+                            f"label column {name!r} belongs to the joined "
+                            f"rows of {aliases}, not all in the result")
                     call = next((column.expression
                                  for column in self.logical.root.columns
                                  if isinstance(column, Alias)
                                  and column.name == name), None)
                     order = (None if call is None
                              else pa.array(call.labels, pa.string()))
-                    # a pair keyed as one integer: anchor index, partner index
+                    # a row keyed as one integer: anchor index, partner index
                     keys = _pair_keys(table.column(aliases[0]),
                                       table.column(aliases[1]))
                     declaration = acero.Declaration(
@@ -1141,8 +1142,8 @@ class Query:
                     alias.decode("utf-8"), []
                 ).append(table)
             elif value_type is ValueType.LABEL_ANSWERS:
-                # the label column follows the alias columns: one, or a
-                # pair classification's anchor and partner
+                # the label column follows the alias columns: one, or
+                # the anchor and partner of a classification of joined rows
                 answer_tables["classifies"][table.column_names[-1]] = table
             elif value_type is ValueType.JOIN_ANSWERS:
                 written_pos = metadata.get(b"quail.written_pos")

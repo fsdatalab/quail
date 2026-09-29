@@ -327,7 +327,7 @@ class QueryResult:
                     arrays = []
                     for alias, values in self._projection:
                         if isinstance(alias, tuple):
-                            # a label of pairs, looked up by the row's pair
+                            # a label of joined rows, looked up by the row's ids
                             keys, table, order = values
                             positions = pc.index_in(
                                 _pair_keys(*(batch.column(

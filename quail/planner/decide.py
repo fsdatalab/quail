@@ -391,8 +391,8 @@ def label_work(plan, filters) -> LabelWork:
     return LabelWork(tuple(calls), names, tests, projected)
 
 
-def pair_calls(labels: LabelWork) -> list:
-    """The classifications of pairs, each with its anchor and partner alias."""
+def joined_calls(labels: LabelWork) -> list:
+    """The classifications of joined rows, each with its two aliases."""
     return [(call, call.aliases()) for call, _ in labels.calls
             if len(call.aliases()) == 2]
 
@@ -754,20 +754,20 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
 
     deferred = set()          # aliases classified after the joins
 
-    pairs_to_label = pair_calls(labels)
-    for call, aliases in pairs_to_label:
+    joined_classifies = joined_calls(labels)
+    for call, aliases in joined_classifies:
         if labels.tests.get(call):
             return Refusal(
                 reasons=("a label filter tests a one-document classification, "
                          f"not the classification of {aliases[0]!r} x "
-                         f"{aliases[1]!r} pairs",),
-                constraint="pair_label_filter", needed=1, available=0)
+                         f"{aliases[1]!r} joined rows",),
+                constraint="joined_label_filter", needed=1, available=0)
         if not any({argument.alias for argument in join.prompt.args}
                    == set(aliases) for join in joins):
             return Refusal(
                 reasons=(f"the classification of {aliases[0]!r} x "
-                         f"{aliases[1]!r} pairs needs a join of the two",),
-                constraint="pair_classification_join", needed=1, available=0)
+                         f"{aliases[1]!r} joined rows needs a join of the two",),
+                constraint="joined_classify_needs_join", needed=1, available=0)
 
     def emit_classify(alias, live=None):
         """Classify the alias's documents, then keep the accepted labels."""
@@ -910,11 +910,11 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
             stages=tuple(stage_dicts)))
         ids_src[anchor] = PortRef(gid, f"ids:{anchor}")
 
-    # a classification of pairs follows the join that keeps them, in
-    # the join's pipeline: each kept pair's partner block, question,
+    # a classification of joined rows follows the join that keeps them,
+    # in the join's pipeline: each kept row's partner block, question,
     # and label paths run over the anchor's resident KV
     try:
-        for call, aliases in pairs_to_label:
+        for call, aliases in joined_classifies:
             for g, group in enumerate(sequence_groups):
                 anchor = group[0][1]
                 stage = next((spec for spec, _ in group
@@ -922,13 +922,14 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
                 if stage is not None:
                     break
             else:
-                raise AssertionError("a pair classification without its join")
+                raise AssertionError(
+                    "a classification of joined rows without its join")
             partner = next(alias for alias in aliases if alias != anchor)
             table = classify_table(context, anchor, "quail")
             join = joins[stage["written_pos"]]
             pairs = (effective_selectivity(join.selectivity)
                      * live0[anchor] * live0[partner])
-            spec, _ = table.classify_pair(
+            spec, _ = table.classify_joined(
                 call, labels.names[call], partner, pairs,
                 stats[partner].mean_doc_tokens)
             node = table.node(

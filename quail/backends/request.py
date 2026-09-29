@@ -260,8 +260,8 @@ def plan_request_backend(
         prompts.append(call.prompt)
         pair = {}
         if len(call.aliases()) == 2:
-            # a classification of the pairs a join keeps: decoded after
-            # that join, one request per pair
+            # a classification of the rows a join keeps: decoded after
+            # that join, one request per row
             partner = call.aliases()[1]
             parts = {part_alias: (label, frame)
                      for part_alias, label, frame in call.prompt.label_token_ids}
@@ -274,7 +274,7 @@ def plan_request_backend(
                     f"the classification of {alias!r} x {partner!r} pairs "
                     f"needs a join of the two")
             pair = dict(partner=partner,
-                        pair_token_ids=(tuple(parts[alias][1]),
+                        join_layout_token_ids=(tuple(parts[alias][1]),
                                         tuple(parts[partner][0])),
                         join_written_pos=written_pos)
         classify_specs.append(RequestClassifySpec(
@@ -993,13 +993,14 @@ class RequestModelExecution:
         for spec in node.classifies:
             if spec.partner is None:
                 continue
-            # the pairs the join kept, each decoded as anchor, note,
+            # the rows the join kept, each decoded as anchor, note,
             # partner block, and the question
             answers = outputs[f"join_answers:{spec.join_written_pos}"]
             kept = answers.filter(answers.column("answer"))
             pairs = list(zip(kept.column(spec.alias).to_pylist(),
                              kept.column(spec.partner).to_pylist()))
-            note, partner_label = (_token_list(ids) for ids in spec.pair_token_ids)
+            note, partner_label = (
+                _token_list(ids) for ids in spec.join_layout_token_ids)
             result = _classify_documents(
                 self.client, spec, [
                     _token_list(node.preamble_token_ids)

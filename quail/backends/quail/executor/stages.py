@@ -52,9 +52,10 @@ class Stage:
         read_all_rows: Whether every row of a suffix feeds the readout,
             not only its last.
         read_rows: Per suffix, how many of its last rows feed the
-            readout; None reads by ``read_all_rows``. A pair
-            classification's suffixes carry a partner document before
-            the label path and read the path's rows only.
+            readout; None reads by ``read_all_rows``. A
+            classification of joined rows sends suffixes that carry a
+            partner document before the label path and reads the
+            path's rows only.
         single: The stage sends its one suffix to every document, as a
             filter does: the frame and the suffix pack as one entry
             written straight into the document's pages, and under tree

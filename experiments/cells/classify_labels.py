@@ -53,9 +53,9 @@ from quail_b.rendering import LABEL_PREFIX
 
 app = labels.app
 SPECS = CLASSIFY_PREDICATES
-# a classification of pairs labels the pairs its join keeps: the
+# a classification of joined rows labels the rows its join keeps: the
 # predicate key -> the join's prompt template
-PAIR_JOINS = {"quailb.imdb.review.aspect_sentiment": prompts.DISCUSS_ASPECT}
+JOIN_OF_CLASSIFY = {"quailb.imdb.review.aspect_sentiment": prompts.DISCUSS_ASPECT}
 ROWS_PER_PART = 256
 # vLLM refuses more requested token ids than this per request
 MAX_LOGPROB_TOKEN_IDS = 128
@@ -156,9 +156,10 @@ def classify_identity(spec: PredicateSpec, corpus: dict) -> dict:
 def corpus_rows(sf: float, spec: PredicateSpec) -> tuple[dict, list[dict]]:
     """Read one saved corpus's manifest and the predicate's rows.
 
-    A one-document predicate's rows are its table's rows. A pair
-    classification's rows are the pairs its join's reference labels
-    answer TRUE, each with both documents, in (left id, right id) order.
+    A one-document predicate's rows are its table's rows. A
+    classification of joined rows has one row per pair its join's
+    reference labels answer TRUE, with both documents, in (left id,
+    right id) order.
     """
     import pyarrow.parquet as pq
 
@@ -173,9 +174,9 @@ def corpus_rows(sf: float, spec: PredicateSpec) -> tuple[dict, list[dict]]:
     root = str(labels.ROOT)[:-len(GROUND_TRUTH_ROOT) - 1]
     truth = load_ground_truth(
         root, scale_factor=sf, corpus_id=PUBLISHED_CORPORA[sf],
-        collection_id=SOURCES[sf], templates=[PAIR_JOINS[spec.key]])
+        collection_id=SOURCES[sf], templates=[JOIN_OF_CLASSIFY[spec.key]])
     pairs = truth.predicates[
-        truth.key_for_template(PAIR_JOINS[spec.key])].true_pairs
+        truth.key_for_template(JOIN_OF_CLASSIFY[spec.key])].true_pairs
     right = pq.read_table(directory / f"{spec.right_table}.parquet",
                           columns=["id", spec.right_column])
     left_text = dict(zip(table["id"].to_pylist(),
@@ -312,8 +313,8 @@ class VLLMJudge:
 
         Args:
             spec: The classification predicate.
-            documents: The documents, or a pair classification's anchors.
-            partners: A pair classification's partner documents, one
+            documents: The documents, or the anchors of joined rows.
+            partners: The partner documents of joined rows, one
                 per anchor.
         """
         label_ids = self.label_ids(spec)

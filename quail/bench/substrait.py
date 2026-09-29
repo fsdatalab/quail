@@ -25,7 +25,7 @@ AI_URN = "extension:org.fsdatalab.quail_b:functions_ai"
 AI_FILTER = "ai_filter:str_str"
 AI_JOIN = "ai_join:str_str_str"
 AI_CLASSIFY = "ai_classify:str_str_list_list"
-AI_CLASSIFY_PAIR = "ai_classify:str_str_str_list_list"
+AI_CLASSIFY_JOINED = "ai_classify:str_str_str_list_list"
 EQUAL = "equal:any_any"
 AND = "and:bool"
 
@@ -74,14 +74,14 @@ class Classify:
 
     Attributes:
         id: The operator id.
-        alias: The classified relation; for a pair, the anchor.
+        alias: The classified relation; for joined rows, the anchor.
         column: Its document column.
         prompt: The classification prompt.
         labels: The labels, in listed order.
         descriptions: One description per label, empty for none.
         output: The label column's name.
         partner: The (alias, document column) of the second document
-            when the call labels a join's pairs, else None.
+            when the call labels a join's rows, else None.
     """
 
     id: str
@@ -159,7 +159,7 @@ def _functions(plan: plan_pb2.Plan) -> dict[int, str]:
             continue
         function = declaration.extension_function
         if function.name in (AI_FILTER, AI_JOIN, AI_CLASSIFY,
-                             AI_CLASSIFY_PAIR) and (
+                             AI_CLASSIFY_JOINED) and (
                 urns.get(function.extension_urn_reference) != AI_URN):
             raise ValueError(f"{function.name} must come from {AI_URN}")
         names[function.function_anchor] = function.name
@@ -226,7 +226,7 @@ def _read(rel: algebra_pb2.Rel, functions):
         if len(project.expressions) != 1:
             raise ValueError("an inner projection adds one ai_classify column")
         name, arguments = _call(project.expressions[0], functions)
-        documents = {AI_CLASSIFY: 1, AI_CLASSIFY_PAIR: 2}.get(name)
+        documents = {AI_CLASSIFY: 1, AI_CLASSIFY_JOINED: 2}.get(name)
         if documents is None or len(arguments) != documents + 3:
             raise ValueError("an inner projection must call ai_classify("
                              "prompt, document, labels, descriptions) or "
@@ -325,7 +325,7 @@ def build_query(session, plan: QueryPlan, selectivity=None,
     per_alias = {}
     for item in plan.operators:
         if isinstance(item, Classify) and item.partner is not None:
-            continue    # labels a join's pairs, so it follows the joins
+            continue    # labels a join's rows, so it follows the joins
         if isinstance(item, (Filter, Classify, LabelFilter)):
             per_alias.setdefault(item.alias, []).append(item)
     prompts = {(item.alias, item.output): item.prompt

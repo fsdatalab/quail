@@ -299,7 +299,7 @@ def bind_classify_prompt(template: str, args: tuple, labels, descriptions=(),
     import re
     _check_placeholders(template, len(args))
     if len(args) == 2:
-        return _bind_pair_classify_prompt(
+        return _bind_joined_classify_prompt(
             template, args, labels, descriptions, tokenizer, turn, layout,
             task_description)
     if len(args) != 1:
@@ -337,9 +337,9 @@ def bind_classify_prompt(template: str, args: tuple, labels, descriptions=(),
                   preamble_token_ids=pre_ids, tail_token_ids=tail_ids)
 
 
-def _bind_pair_classify_prompt(template, args, labels, descriptions,
-                               tokenizer, turn, layout, task_description):
-    """Bind a classification of a pair: the join layout, then the question.
+def _bind_joined_classify_prompt(template, args, labels, descriptions,
+                                 tokenizer, turn, layout, task_description):
+    """Bind a classification of joined rows: the join layout, then the question.
 
     The anchor document (placeholder {0}) comes first, then the anchor
     note, the partner's label and document, and the classification
@@ -348,11 +348,12 @@ def _bind_pair_classify_prompt(template, args, labels, descriptions,
     """
     if layout != "document_first":
         raise CompileError(
-            "a classification of a pair uses the document_first layout")
+            "a classification of joined rows uses the document_first layout")
     aliases = [r.alias for r in args]
     if len(set(aliases)) != len(aliases):
         raise CompileError(
-            "each placeholder of a pair classification names a distinct table")
+            "each placeholder of a classification of joined rows names a "
+            "distinct table")
     question = render_classify_question(template, labels, descriptions,
                                         task_description)
     preamble = shared_preamble(turn[0])
@@ -377,8 +378,9 @@ def _bind_pair_classify_prompt(template, args, labels, descriptions,
                   label_token_ids=label_ids)
 
 
-def render_pair_classify_prompt_text(prompt, anchor: str, partner: str) -> str:
-    """The complete text of a pair classification's prompt for one pair."""
+def render_joined_classify_prompt_text(prompt, anchor: str,
+                                       partner: str) -> str:
+    """The complete text of a classification prompt for one joined row."""
     return (prompt.preamble + anchor + join_anchor_note(0) + join_label(1)
             + partner + prompt.tail)
 

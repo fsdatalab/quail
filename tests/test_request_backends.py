@@ -117,7 +117,7 @@ def test_request_backends_plan_validate_and_execute(monkeypatch):
 
     # a classification of the join's pairs: its label table names both
     # aliases before the label column; the join kept no pair here
-    boot["client"] = _PairClient()
+    boot["client"] = _JoinedClient()
     query = (
         session.docs("docs").alias("d")
         .join(session.docs("notes").alias("n"),
@@ -470,8 +470,8 @@ def test_request_backends_drop_a_document_whose_answer_names_no_label():
     assert result.outputs["label_answers:kind"].num_rows == 2
 
 
-class _PairClient(_Client):
-    """Joins by token, and decodes a pair's label from its partner document."""
+class _JoinedClient(_Client):
+    """Joins by token, and decodes a joined row's label from its partner."""
 
     def decode_params(self, max_tokens):
         return ("decode", max_tokens)
@@ -487,14 +487,14 @@ class _PairClient(_Client):
         return outputs
 
 
-def test_request_backends_decode_one_request_per_pair_the_join_keeps():
+def test_request_backends_decode_one_request_per_row_the_join_keeps():
     # anchor r0 matches both partners; r1 matches none
     spec = RequestClassifySpec(
         alias="r", output="kind", tail_token_ids=(90,),
         labels=("a", "b", "c"), label_token_ids=((60, 62), (61, 62), (60, 63)),
-        partner="p", pair_token_ids=((70,), (71,)), join_written_pos=0)
+        partner="p", join_layout_token_ids=((70,), (71,)), join_written_pos=0)
     node = replace(_join_node(), classifies=(spec,))
-    client = _PairClient()
+    client = _JoinedClient()
     execution = _execution({"r": [[10], [11]], "p": [[20], [21]]}, client=client)
     result = execution.execute(node, {})
     assert result.outputs["join_answers:0"].to_pydict() == {

@@ -12,7 +12,7 @@ import pyarrow as pa
 
 from quail.backends.base import GpuContext
 from quail.backends.quail.executor import loop
-from quail.backends.quail.executor.classify import ClassifyStages, PairPartners
+from quail.backends.quail.executor.classify import ClassifyStages, JoinPartners
 from quail.backends.quail.executor.models import supported_archs
 from quail.backends.quail.executor.score import QuailScorer
 from quail.backends.quail.executor.stages import Stage, filter_stages, run_stages
@@ -181,7 +181,7 @@ class QuailModelExecution:
         results = {}
         if joins:
             # the join settles each anchor's KV; a classification of
-            # the pairs it keeps runs as stages after the join's
+            # the rows it keeps runs as stages after the join's
             join = staged[joins[0]]
             chain = {"documents": prefixes, "document_ids": ids,
                      "parts": parts, "after": [],
@@ -192,7 +192,7 @@ class QuailModelExecution:
             join_inputs = context.model_inputs(
                 join, inputs[join.node_id], context, chain)
             for member in staged[joins[0] + 1:]:
-                chain["after"].append(self._pair_part(
+                chain["after"].append(self._joined_part(
                     member, join, ids, join_inputs, context))
             results[join.node_id] = self._execute_quail_node(join, join_inputs)
             context.model_result(join, results[join.node_id], context)
@@ -264,8 +264,8 @@ class QuailModelExecution:
             return _ApplyGate(node, call, metrics, values)
         raise TypeError(f"{node.type_name!r} is not a pipeline operator")
 
-    def _pair_part(self, node, join, ids, join_inputs, context):
-        """The part classifying the pairs the join keeps, on its anchors."""
+    def _joined_part(self, node, join, ids, join_inputs, context):
+        """The part classifying the rows the join keeps, on its anchors."""
         if not isinstance(node, AiClassify) or node.spec.partner is None:
             raise TypeError(
                 f"{node.type_name!r} cannot follow a join in its pipeline")
@@ -279,7 +279,7 @@ class QuailModelExecution:
                            stage.written_pos]]
         documents = context.state["docs"][spec.partner]
         kept = _KeptPairs(join.stages.index(stage))
-        partners = PairPartners(
+        partners = JoinPartners(
             ids=partner_ids,
             documents=[documents[partner] for partner in partner_ids],
             kept=kept.of)
@@ -358,7 +358,7 @@ class QuailModelExecution:
         if chain is not None:
             # the chain's stages lead the join's: a survivor goes on to
             # the join with its KV resident, past the chain's gates;
-            # a classification of the pairs kept follows the join's
+            # a classification of the rows kept follows the join's
             filter_ids = chain["document_ids"]
             parts = chain["parts"]
             after = chain.get("after", [])
@@ -576,7 +576,7 @@ class _ClassifyPart:
         self.ids = ids
         self.plan = plan
         self.priors = priors      # (part, port) of each label table read
-        self.kept = kept          # a pair classification's _KeptPairs
+        self.kept = kept          # _KeptPairs, for joined rows
         self.stages = plan.stages
         self.reached = 0
         self.label_tokens = 0
