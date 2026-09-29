@@ -36,8 +36,10 @@ from quail.logical import (
     bind_classify_prompt,
     label_text,
 )
+from quail.logical.prompts import join_anchor_note
 from quail.physical import (
     AiClassify,
+    AiJoin,
     ClassifySpec,
     ClassifyStage,
     LabelFilter,
@@ -546,6 +548,38 @@ def test_sql_classifies_and_tests_labels(session):
                 f"SELECT d.id FROM documents d WHERE {call} IN (1)"):
         with pytest.raises(CompileError):
             session.sql(bad)
+
+
+def test_sql_classifies_the_pairs_a_join_keeps(session, tmp_path):
+    path = tmp_path / "aspects.parquet"
+    pq.write_table(pa.table({"id": [1, 2], "aspect": ["price", "size"]}),
+                   path)
+    session.register("aspects",
+                     DocumentProvider.from_parquet(str(path), id_col="id"))
+    stance = ("AI.CLASSIFY(PROMPT('What does DOCUMENT {0} say about "
+              "DOCUMENT {1}?', d.body, a.aspect), ARRAY['praise', 'complaint'])")
+    query = session.sql(
+        f"SELECT d.id, a.id, {stance} AS stance FROM documents d "
+        f"JOIN aspects a ON AI_FILTER(PROMPT('Does {{0}} mention {{1}}?', "
+        f"d.body, a.aspect))")
+    (call,) = [column.expression for column in query.logical.root.columns
+               if isinstance(column, Alias)]
+    assert call.kind == "label" and call.aliases() == ("d", "a")
+    assert call.prompt.frame == join_anchor_note(0)
+    assert call.prompt.tail.startswith("\n\nAnswer with exactly one")
+    plan = query.plan()
+    (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
+    (join,) = [n for n in plan.nodes if isinstance(n, AiJoin)]
+    assert classify.spec.partner is not None
+    assert classify.spec.anchor == join.anchor
+    assert classify.inputs[0].source.node_id == join.node_id
+    # a pair's label is not tested in WHERE
+    with pytest.raises(CompileError, match="one table|label filter"):
+        session.sql(
+            f"SELECT d.id, a.id FROM documents d JOIN aspects a "
+            f"ON AI_FILTER(PROMPT('Does {{0}} mention {{1}}?', d.body, "
+            f"a.aspect)) "
+            f"WHERE {stance} = 'praise'")
 
 
 def test_planner_prices_the_exhaustive_rules_by_their_label_tokens():
