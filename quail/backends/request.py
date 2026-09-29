@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Any, Mapping
 
-import numpy as np
 import pyarrow as pa
 
 from quail.backends.base import GpuContext
@@ -19,12 +18,6 @@ from quail.backends.request_scheduling import (
     true_bit,
 )
 from quail.cost import budgets
-from quail.execution.labels import (
-    best_label,
-    label_scores,
-    label_trie,
-    trie_targets,
-)
 from quail.execution.pairs import (
     allowed_members,
     members_by_partner,
@@ -114,8 +107,8 @@ def plan_request_backend(
         backend_name: The backend the plan names.
         filter_submission: How filter stages become requests.
         join_submission: How join tuples become requests.
-        scores_labels: Whether the engine returns named tokens' next-token
-            log probabilities, which AI.CLASSIFY needs.
+        scores_labels: Whether the engine decodes an answer as text,
+            which AI.CLASSIFY needs.
     """
     if any(isinstance(node, Apply) for node in region.logical_plan.walk()):
         return (PhysicalCandidate(
@@ -127,13 +120,13 @@ def plan_request_backend(
             estimated_seconds=float("inf"),
         ),)
     classifies = has_label(region.logical_plan)
+    # a diffusion model's vLLM canvas is sized for a filter's one
+    # answer token, not a label
     scores_labels = scores_labels and not context.model.canvas_tokens
     if classifies and not (scores_labels and context.tokenizer is not None):
-        # vLLM 0.26's DiffusionGemma ignores the named tokens a request
-        # asks for and returns the whole vocabulary per canvas row
-        reason = (f"AI.CLASSIFY on {backend_name} needs next-token log "
-                  f"probabilities of named tokens, which its engine does "
-                  f"not return for {context.model.name!r}"
+        reason = (f"AI.CLASSIFY on {backend_name} decodes each answer as "
+                  f"text, which its engine does not return for "
+                  f"{context.model.name!r}"
                   if context.tokenizer is not None
                   else "AI.CLASSIFY planning needs the model's tokenizer")
         return (PhysicalCandidate(
@@ -596,46 +589,52 @@ def _pipelined_filter(client, sampling_params, bodies, questions, read_answer,
     }
 
 
-def _classify_documents(client, spec, bodies) -> dict:
-    """Label documents with one request per label-trie node.
+def match_label(text: str, labels) -> str | None:
+    """Return the label a decoded answer names, or None.
 
-    Every request is a document, the classification tail, and one
-    proper prefix of a label; it asks for the next-token log
-    probabilities of the tokens that can follow that prefix. A label's
-    score is the sum over its tokens, and a tie goes to the earlier
-    label, as on Quail. Requests go in document-major order so an
-    engine's prefix cache serves the document to every node's request.
+    The answer's first line, trimmed, must start with a label, ignoring
+    case; the longest such label wins, then the earlier one. Anything
+    else names no label.
     """
-    trie = label_trie(spec.label_token_ids)
-    nodes = sorted(trie, key=lambda node: (len(node), node))
-    targets = trie_targets(trie)
-    column = {token: index for index, token in enumerate(targets)}
+    answer = text.strip().split("\n", 1)[0].strip().casefold()
+    best = None
+    for index, label in enumerate(labels):
+        candidate = label.casefold()
+        if answer.startswith(candidate) and (
+                best is None or len(candidate) > len(labels[best].casefold())):
+            best = index
+    return None if best is None else labels[best]
+
+
+def _classify_documents(client, spec, bodies) -> dict:
+    """Label documents by decoding each one's answer greedily.
+
+    One request per document: the document and the classification
+    tail, whose category list names the labels, decoded token by token
+    at temperature 0 for as many tokens as the longest label plus one.
+    The decoded answer is matched to a label; an answer that names no
+    label is kept as decoded and counted in ``unmatched``.
+    """
     tail = _token_list(spec.tail_token_ids)
-    prompts = []
-    params = []
-    for body in bodies:
-        for node in nodes:
-            prompts.append({"prompt_token_ids": body + tail + list(node)})
-            params.append(client.label_params(trie[node]))
+    longest = max(len(ids) for ids in spec.label_token_ids)
+    params = client.decode_params(longest + 1)
+    prompts = [{"prompt_token_ids": body + tail} for body in bodies]
     started = time.perf_counter()
     outputs = client.generate(prompts, params, use_tqdm=False) if prompts else []
     wall_s = time.perf_counter() - started
     labels = []
-    prompt_tokens = cached_tokens = 0
-    for index in range(len(bodies)):
-        scores = np.full((len(nodes), len(targets)), -np.inf)
-        for row, node in enumerate(nodes):
-            output = outputs[index * len(nodes) + row]
-            prompt_tokens += len(output.prompt_token_ids)
-            cached_tokens += int(getattr(output, "num_cached_tokens", 0) or 0)
-            entries = output.outputs[0].logprobs[0]
-            for token in trie[node]:
-                if token not in entries:
-                    raise ValueError("the engine omitted a label token's "
-                                     "log probability")
-                scores[row, column[token]] = entries[token].logprob
-        labels.append(spec.labels[best_label(
-            label_scores(spec.label_token_ids, nodes, targets, scores))])
+    unmatched = 0
+    prompt_tokens = cached_tokens = generated_tokens = 0
+    for output in outputs:
+        prompt_tokens += len(output.prompt_token_ids)
+        cached_tokens += int(getattr(output, "num_cached_tokens", 0) or 0)
+        generated_tokens += len(output.outputs[0].token_ids)
+        text = output.outputs[0].text or ""
+        label = match_label(text, spec.labels)
+        if label is None:
+            unmatched += 1
+            label = text.strip()
+        labels.append(label)
     return {
         "labels": labels,
         "wall_s": wall_s,
@@ -643,6 +642,8 @@ def _classify_documents(client, spec, bodies) -> dict:
         "prompt_tokens": prompt_tokens,
         "cached_tokens": cached_tokens,
         "fresh_tokens": prompt_tokens - cached_tokens,
+        "generated_tokens": generated_tokens,
+        "unmatched": unmatched,
     }
 
 
@@ -819,6 +820,8 @@ class RequestModelExecution:
                 "requests": result["requests"],
                 "fresh_tokens": result["fresh_tokens"],
                 "cached_tokens": result["cached_tokens"],
+                "generated_tokens": result["generated_tokens"],
+                "unmatched": result["unmatched"],
             })
             requests += result["requests"]
             fresh_tokens += result["fresh_tokens"]

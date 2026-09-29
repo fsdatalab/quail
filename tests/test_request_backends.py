@@ -355,23 +355,20 @@ def test_vllm_engine_settings_tokenizer_and_canvas_follow_the_model(monkeypatch)
 
 
 class _LabelClient(_Client):
-    """Scores label tokens: document 10 prefers label a, document 11 label b."""
+    """Decodes answers: document 10 says a, document 11 says B with a remark."""
 
-    def label_params(self, token_ids):
-        return ("labels", tuple(token_ids))
+    def decode_params(self, max_tokens):
+        return ("decode", max_tokens)
 
     def generate(self, prompts, sampling_params, use_tqdm=False):
+        assert sampling_params == ("decode", 3)
         outputs = []
-        for prompt, params in zip(prompts, sampling_params):
-            kind, tokens = params
-            assert kind == "labels"
+        for prompt in prompts:
             ids = prompt["prompt_token_ids"]
-            liked = 60 if 10 in ids else 61
+            text = " a\nbecause" if 10 in ids else " B, clearly"
             outputs.append(SimpleNamespace(
-                prompt_token_ids=ids, num_cached_tokens=len(ids) - 1,
-                outputs=[SimpleNamespace(logprobs=[{
-                    token: SimpleNamespace(logprob=-0.5 if token == liked else -2.0)
-                    for token in tokens}])]))
+                prompt_token_ids=ids, num_cached_tokens=0,
+                outputs=[SimpleNamespace(text=text, token_ids=[1, 2])]))
         return outputs
 
 
@@ -392,10 +389,11 @@ def test_request_backends_classify_with_one_request_per_trie_node():
     assert result.outputs["ids:d"] == [1]
     assert result.outputs["label_filter_answers:kind"].to_pydict() == {
         "d": [0, 1], "predicate": [0, 0], "answer": [False, True]}
-    assert result.metrics.extension["requests"] == 6
+    assert result.metrics.extension["requests"] == 2
     (step,) = result.metrics.extension["steps"]
     assert (step["kind"], step["n_in"], step["n_out"]) == ("classify", 2, 1)
-    assert result.metrics.fresh_tokens == 6
+    assert (step["generated_tokens"], step["unmatched"]) == (4, 0)
+    assert result.metrics.fresh_tokens == 2 * 3
 
     session = _session("stock_vllm", docs=DOCS)
     query = (session.docs("docs").alias("d")
@@ -415,3 +413,14 @@ def test_request_backends_classify_with_one_request_per_trie_node():
         "ids:d", "label_answers:kind"]
     assert project.columns == ("d.id", "kind")
     session.close()
+
+
+def test_match_label_takes_the_longest_label_the_answer_starts_with():
+    from quail.backends.request import match_label
+
+    labels = ("cardiac", "cardiac disorders", "vascular disorders")
+    assert match_label(" Cardiac disorders\nbecause", labels) == "cardiac disorders"
+    assert match_label("cardiac.", labels) == "cardiac"
+    assert match_label("  vascular disorders", labels) == "vascular disorders"
+    assert match_label("none of these", labels) is None
+    assert match_label("", labels) is None

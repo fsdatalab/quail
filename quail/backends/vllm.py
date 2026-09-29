@@ -141,12 +141,11 @@ class VLLMClient:
     def generate(self, prompts, sampling_params, use_tqdm=False):
         return self.llm.generate(prompts, sampling_params, use_tqdm=use_tqdm)
 
-    def label_params(self, token_ids):
-        """Sampling parameters returning the named tokens' next-token scores."""
+    def decode_params(self, max_tokens: int):
+        """Sampling parameters that decode an answer greedily as text."""
         from vllm import SamplingParams
 
-        return SamplingParams(max_tokens=1, temperature=0.0, detokenize=False,
-                              logprob_token_ids=list(token_ids))
+        return SamplingParams(max_tokens=max_tokens, temperature=0.0)
 
     def reset_prefix_cache(self):
         return self.llm.reset_prefix_cache()
@@ -177,7 +176,7 @@ class VLLMEngine:
     kind = "vllm"
     label = "vLLM"
     runtime_package = "vllm==0.26.0"
-    # a request can ask for named tokens' next-token log probabilities
+    # a request can decode an answer as text
     scores_labels = True
 
     def llm_kwargs(self, spec) -> dict:
@@ -200,9 +199,6 @@ class VLLMEngine:
             },
             "max_num_seqs": (DIFFUSION_SEQUENCES if spec.canvas_tokens == 1
                              else MAX_SEQUENCES),
-            # a classification request asks for as many next-token
-            # scores as a label-trie node has children; no cap
-            "max_logprobs": -1,
         }
         kwargs.update(diffusion_kwargs(spec))
         return kwargs

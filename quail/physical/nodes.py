@@ -163,7 +163,7 @@ class RequestFilterSpec:
 
 @dataclass(frozen=True)
 class RequestClassifySpec:
-    """One AI.CLASSIFY call submitted as one request per label-trie node.
+    """One AI.CLASSIFY call submitted as one decoded answer per document.
 
     ``tail_token_ids`` follow each document: the question, the
     category list, and the answer cue. ``tests`` are the label filters
