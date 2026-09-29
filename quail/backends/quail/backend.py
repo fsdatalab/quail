@@ -79,6 +79,9 @@ class QuailModelExecution:
     def bind_loaded_model(self, *, model, arena, pipeline) -> None:
         """Attach the loaded model objects owned by this executor."""
         self._state.update(model=model, arena=arena, pipeline=pipeline)
+        spec = getattr(self.context, "model", None)
+        if spec is not None:
+            self._state.update(model_name=spec.name, model_spec=spec)
 
     def close(self) -> None:
         """Drop every reference to the loaded model so its memory can go."""
@@ -108,8 +111,6 @@ class QuailModelExecution:
             execution = self._reranker_execution(inputs["documents"])
             # the scorer reads the query's timing choice from the state
             self._state["gpu_timing"] = bool(inputs.get("gpu_timing", False))
-            self._state["model_name"] = self.context.model.name
-            self._state["model_spec"] = self.context.model
             if "score_rows" in inputs:
                 return execution.execute_rows(node, inputs["score_rows"])
             return execution.execute(node, inputs["score_inputs"])
