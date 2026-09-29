@@ -820,6 +820,26 @@ def test_simulation_counts_passes_from_the_chunk_budget_and_rounds():
     assert READOUT_LAG_CHUNKS == 2
 
 
+def test_simulation_credits_the_prefix_tokens_a_document_borrows():
+    from quail.planner.classify import simulate
+
+    prefixes = [100, 100, 100]
+    rounds = [[[3]], [[3]], [[3]]]
+    scratch = simulate(prefixes, 10, rounds, chunk=250, capacity=10_000,
+                       model=QWEN3_4B_FP8, device=H100_SXM)
+    # the second and third documents borrow 80 of their 100 tokens
+    # from the first: they compute only the rest, the frame, and the
+    # chain, and read the borrowed KV
+    borrowed = simulate(prefixes, 10, rounds, chunk=250, capacity=10_000,
+                        model=QWEN3_4B_FP8, device=H100_SXM,
+                        shared=[0, 80, 80])
+    assert borrowed.work.tokens == scratch.work.tokens - 2 * 80
+    assert borrowed.work.kv_read == scratch.work.kv_read + 2 * 80
+    assert borrowed.work.pairs < scratch.work.pairs
+    assert borrowed.seconds < scratch.seconds
+    assert borrowed.label_tokens == scratch.label_tokens
+
+
 def test_chained_classifications_share_one_node(session):
     query = _chain(session)
     plan = query.plan()
@@ -921,6 +941,10 @@ def test_prefix_sharing_rule_fires_for_a_classification(session, tmp_path):
     (classify,) = [n for n in graph.nodes if isinstance(n, AiClassify)]
     assert classify.spec.share_prefixes
     assert classify.explain_fields()["share_prefixes"]
+    # the shared documents borrow their prefix, so the estimate falls
+    (planned,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
+    assert 0 < classify.spec.estimated_seconds < planned.spec.estimated_seconds
+    assert classify.spec.expected_inputs == planned.spec.expected_inputs
     codecs = session.registry.codecs
     assert decode_graph(encode_graph(graph, codecs), codecs) == graph
     assert PrefixSharing().rewrite(plan.graph, context(plain.lengths)) is None

@@ -1098,10 +1098,19 @@ def _apply_rules(plan, registry, context, when: str):
         plan.graph, tuple(registry.physical_rules.values()), context)
     if not changed:
         return plan
+    # a rule that re-estimates a classification moves the plan's total
+    # by the same amount
+    seconds = plan.estimated_seconds + (
+        _classify_seconds(graph.nodes) - _classify_seconds(plan.nodes))
     return replace(
-        plan, nodes=graph.nodes, root=graph.root,
+        plan, nodes=graph.nodes, root=graph.root, estimated_seconds=seconds,
         remarks=plan.remarks + tuple(
             f"physical rule {name} changed the plan{when}" for name in changed))
+
+
+def _classify_seconds(nodes) -> float:
+    return sum(node.spec.estimated_seconds for node in nodes
+               if isinstance(node, AiClassify) and node.spec is not None)
 
 
 def _filter_alias(pred_or_list):

@@ -612,8 +612,8 @@ def _classify_documents(client, spec, bodies) -> dict:
     One request per document: the document and the classification
     tail, whose category list names the labels, decoded token by token
     at temperature 0 for as many tokens as the longest label plus one.
-    The decoded answer is matched to a label; an answer that names no
-    label is kept as decoded and counted in ``unmatched``.
+    The decoded answer is matched to a label; a document whose answer
+    names no label gets None and is counted in ``unmatched``.
     """
     tail = _token_list(spec.tail_token_ids)
     longest = max(len(ids) for ids in spec.label_token_ids)
@@ -631,9 +631,7 @@ def _classify_documents(client, spec, bodies) -> dict:
         generated_tokens += len(output.outputs[0].token_ids)
         text = output.outputs[0].text or ""
         label = match_label(text, spec.labels)
-        if label is None:
-            unmatched += 1
-            label = text.strip()
+        unmatched += label is None
         labels.append(label)
     return {
         "labels": labels,
@@ -790,20 +788,26 @@ class RequestModelExecution:
                     _token_list(node.preamble_token_ids)
                     + _token_list(self.documents[spec.alias][document])
                     for document in document_ids])
+            # a document whose answer named no label has no label row
+            # and leaves the query
+            labeled = [(document, label) for document, label
+                       in zip(document_ids, result["labels"])
+                       if label is not None]
             outputs[f"label_answers:{spec.output}"] = pa.table({
-                spec.alias: pa.array(document_ids, pa.int32()),
-                spec.output: pa.array(result["labels"], pa.string()),
+                spec.alias: pa.array([d for d, _ in labeled], pa.int32()),
+                spec.output: pa.array([label for _, label in labeled],
+                                      pa.string()),
             })
+            survivors[spec.alias] = [document for document, _ in labeled]
             test_answers = {}
             for index, (position, accepted) in enumerate(spec.tests):
                 kept = set(accepted)
                 alive = set(survivors[spec.alias])
-                for document, label in zip(document_ids, result["labels"]):
+                for document, label in labeled:
                     if document in alive:
                         test_answers[(document, index)] = label in kept
                 survivors[spec.alias] = [
-                    document for document, label
-                    in zip(document_ids, result["labels"])
+                    document for document, label in labeled
                     if label in kept and document in alive]
             if spec.tests:
                 outputs[f"label_filter_answers:{spec.output}"] = (

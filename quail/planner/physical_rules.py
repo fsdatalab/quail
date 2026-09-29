@@ -13,7 +13,7 @@ from dataclasses import replace
 
 from quail.cost.budgets import choose_attention_path
 from quail.physical import AiClassify, AiFilter, AiJoin, PhysicalGraph
-from quail.planner.prefixes import page_tree
+from quail.planner.prefixes import document_shared_tokens, page_tree
 
 
 def _token_store(document_tokens):
@@ -113,13 +113,22 @@ class PrefixSharing:
                         context.model, context.device,
                         shared_tokens=page_aligned_shared_tokens(store),
                         total_tokens=sum(lengths), writes_pages=True):
-                    node = replace(node, spec=replace(
-                        node.spec, share_prefixes=True))
+                    node = replace(node, spec=_shared_classify_spec(
+                        node, context, store))
                     changed = True
             nodes.append(node)
         if not changed:
             return None
         return PhysicalGraph(tuple(nodes), graph.root)
+
+
+def _shared_classify_spec(node, context, store):
+    """The node's spec sharing prefixes, re-estimated on the token store."""
+    from quail.planner.classify import classify_table
+
+    table = classify_table(context, node.spec.aliases[0], node.backend_name,
+                           shared=document_shared_tokens(store))
+    return table.reestimate(replace(node.spec, share_prefixes=True))
 
 
 def _mean(values) -> float:

@@ -80,8 +80,17 @@ def classification_refusal(context) -> Refusal | None:
     return _refused(reason)[0].plan
 
 
-def classify_table(context, alias: str, backend_name: str) -> "_Table":
-    """The classification planner for one table of the context."""
+def classify_table(context, alias: str, backend_name: str,
+                   shared=()) -> "_Table":
+    """The classification planner for one table of the context.
+
+    Args:
+        context: The PlanningContext.
+        alias: The table's alias.
+        backend_name: The backend running the plan.
+        shared: Per document, the prefix tokens an earlier document
+            also has, when the plan shares prefixes; else empty.
+    """
     lengths = [int(length) for length in context.document_tokens[alias]]
     count = len(lengths)
     total = sum(lengths)
@@ -93,7 +102,7 @@ def classify_table(context, alias: str, backend_name: str) -> "_Table":
         chunk=chunk, scoring=context.label_scoring,
         backend_name=backend_name, model=context.model,
         device=context.device, tokenizer=context.tokenizer,
-        capacity=capacity, lengths=tuple(lengths),
+        capacity=capacity, lengths=tuple(lengths), shared=tuple(shared),
         traces=getattr(context, "label_traces", None),
         tree=(context.model.weight_precision == "fp8"
               and not context.model.canvas_tokens
@@ -193,7 +202,8 @@ class Simulated:
 
 def simulate(prefixes, frame: int, rounds, chunk: int, capacity: int,
              model, device, resident: bool = False,
-             read_all_rows: bool = True, canvas_rows: int = 0) -> Simulated:
+             read_all_rows: bool = True, canvas_rows: int = 0,
+             shared=None) -> Simulated:
     """Replay the stage scheduler on the CPU and price each chunk.
 
     Documents are admitted in order while their reservation, the
@@ -218,9 +228,13 @@ def simulate(prefixes, frame: int, rounds, chunk: int, capacity: int,
         read_all_rows: Whether every chain row is read, or only the last.
         canvas_rows: The rows of a diffusion model's canvas, which read
             the document twice when there is more than one.
+        shared: Per document, the leading prefix tokens an earlier
+            document already computed, which it borrows from KV
+            instead of computing; None when no prefix is shared.
     """
     window = model.sliding_window
     n = len(prefixes)
+    shared = [0] * n if shared is None else shared
     longest = max((length for document in rounds for chains in document
                    for length in chains), default=0)
     extra = frame + longest
@@ -229,7 +243,8 @@ def simulate(prefixes, frame: int, rounds, chunk: int, capacity: int,
         chains = rounds[document][index] if rounds[document] else []
         tokens = sum(chains)
         if index == 0:
-            tokens += frame + (0 if resident else prefixes[document])
+            tokens += frame + (0 if resident
+                               else prefixes[document] - shared[document])
         return tokens
 
     def item_work(document, index):
@@ -247,6 +262,9 @@ def simulate(prefixes, frame: int, rounds, chunk: int, capacity: int,
             return suffixes
         if resident:
             return ask(prefix, frame, window=window) + suffixes
+        if shared[document]:
+            return ask(shared[document], prefix - shared[document] + frame,
+                       window=window) + suffixes
         return scan(prefix + frame, 0, window=window) + suffixes
 
     ready = deque()
@@ -355,6 +373,10 @@ class _Table:
         scoring: The label scoring rule every classification uses, or
             None to choose per classification by simulated cost.
         lengths: Every document's length in tokens.
+        shared: Per document, the leading tokens an earlier document
+            also has, which prefix sharing borrows from KV; empty when
+            the plan does not share prefixes or the corpus is not
+            tokenized yet.
         traces: Callable(trace key) -> saved exhaustive traces, or
             None when the session keeps none.
     """
@@ -371,18 +393,24 @@ class _Table:
     tokenizer: object
     capacity: int = 0
     lengths: tuple = ()
+    shared: tuple = ()
     traces: object = None
     # whether the model runs the tree attention path, which the
     # packed trie needs: an fp8 model with the plan not forced unified
     tree: bool = False
 
-    def sample(self, live: float) -> list[int]:
-        """The lengths of the documents expected to reach a classification.
+    def sample(self, live: float) -> list[tuple[int, int]]:
+        """The documents expected to reach a classification.
 
-        Takes ``live`` lengths spread evenly over the sorted lengths, so
-        the sample keeps the table's length distribution.
+        Takes ``live`` documents spread evenly over the documents sorted
+        by length, so the sample keeps the table's length distribution.
+
+        Returns:
+            Per sampled document, its length and its shared prefix
+            tokens.
         """
-        ordered = sorted(self.lengths)
+        shared = self.shared or (0,) * len(self.lengths)
+        ordered = sorted(zip(self.lengths, shared))
         count = min(len(ordered), max(1, int(round(live))))
         if not ordered:
             return []
@@ -467,15 +495,41 @@ class _Table:
                  resident, traces=None, demand=None) -> Simulated:
         """Replay one rule over the documents expected and price it."""
         per_document, read_all = rule_rounds(scoring, labels, traces, demand)
-        lengths = self.sample(live)
-        prefixes = [head_tokens + length for length in lengths]
+        documents = self.sample(live)
+        prefixes = [head_tokens + length for length, _ in documents]
+        # a borrowed prefix includes the prompt head the documents share
+        shared = [head_tokens + tokens if tokens else 0
+                  for _, tokens in documents]
         rounds = [per_document[i % len(per_document)]
                   for i in range(len(prefixes))]
         return simulate(prefixes, frame_tokens, rounds, self.chunk,
                         self.capacity or self.budget, self.model, self.device,
                         resident=resident, read_all_rows=read_all,
                         canvas_rows=(len(labels[0]) if scoring == "canvas"
-                                     else self.model.canvas_tokens))
+                                     else self.model.canvas_tokens),
+                        shared=shared)
+
+    def reestimate(self, spec: ClassifySpec) -> ClassifySpec:
+        """The spec with its seconds simulated again on this table.
+
+        The plan is made before the corpus is tokenized, so its
+        estimate prices every document from scratch. Once the token
+        store is known and the plan shares prefixes, the documents
+        borrowing a prefix pay only for the rest, as the filter and
+        join estimates do.
+        """
+        head, tail = spec.prompt_token_parts
+        traces = None
+        if self.traces is not None:
+            traces = self.traces(trace_key(
+                self.model.name, spec.query_template, spec.labels,
+                spec.label_token_ids))
+        demand = (None if spec.demand is None
+                  else [spec.labels.index(label) for label in spec.demand])
+        simulated = self.simulate(
+            spec.scoring, spec.expected_inputs, len(head), len(tail) - 1,
+            spec.label_token_ids, False, traces, demand)
+        return replace(spec, estimated_seconds=simulated.seconds)
 
     def choose(self, live, head_tokens, frame_tokens, labels, resident,
                traces=None, demand=None) -> tuple[str, Simulated]:
