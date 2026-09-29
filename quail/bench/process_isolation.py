@@ -38,8 +38,14 @@ def run_backend_group(
     label_scoring: str | None = None,
     attention: str | None = None,
     gpu_timing: bool = False,
+    suite_name: str | None = None,
 ) -> dict:
-    """Run backend methods while sharing one loaded model when possible."""
+    """Run backend methods while sharing one loaded model when possible.
+
+    suite_name is the directory the suites go under per method; it
+    defaults to the queries' family, which two groups of one family
+    (BIO-5 and BIO-6) must not share.
+    """
     from quail import EngineConfig
     from quail.bench.quailb import run_suite
     from quail_b.queries import query_family_name
@@ -78,7 +84,7 @@ def run_backend_group(
                 data_dir=Path(data_dir) / f"sf{sf}",
                 ground_truth_collection=ground_truth_collection or None,
                 root=root,
-                output_dir=run_dir / name / family,
+                output_dir=run_dir / name / (suite_name or family),
             )
             suite["run_id"] = run_dir.name
             suite["query_family"] = {"name": family, "query_ids": list(query_ids)}

@@ -73,7 +73,7 @@ def operator_aliases(node: PhysicalNode) -> tuple[str, ...]:
 
 def _document_ports(node: PhysicalNode, alias: str) -> tuple[str, ...]:
     """The output ports on which the operator hands the alias's documents on."""
-    if isinstance(node, AiClassify):
+    if isinstance(node, (AiClassify, LabelFilter)):
         return ("scores", f"ids:{alias}")
     if isinstance(node, Foreign) and node.ids == "pairs":
         return (f"pairs:{node.written_pos}",)

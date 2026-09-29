@@ -94,7 +94,8 @@ def _run_family(process_groups, result_name, model, sf, query_ids_csv,
             data_dir=DATA_DIR, model=model, sf=sf, query_ids=query_ids,
             run_dir=run_dir, ground_truth_collection=ground_truth_collection,
             methods=methods, root=root, label_scoring=label_scoring,
-            attention=attention, gpu_timing=gpu_timing)
+            attention=attention, gpu_timing=gpu_timing,
+            suite_name=f"{family}{result_name}")
         process_results.append(process_result)
         suites.update(process_result["suites"])
     gpu_uuids = {

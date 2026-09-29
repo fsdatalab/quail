@@ -174,6 +174,9 @@ class Borrowing:
 
 # an anchor's partner request that takes it out of the run at a stage
 DROP = object()
+# an anchor's partner request that passes it on to the next stage
+# with nothing asked at this one
+SKIP = object()
 
 
 class JoinAdmission:
@@ -194,8 +197,10 @@ class JoinAdmission:
             stage's partner list the anchor streams, or None for the
             whole list. Omitted anchors stream the whole list at every
             stage. An anchor's value may instead be a callable(stage)
-            -> list, None, or DROP, asked when the anchor enters the
-            stage; DROP takes the anchor out of the run there.
+            -> list, None, DROP, or SKIP, asked when the anchor enters
+            the stage; DROP takes the anchor out of the run there,
+            SKIP passes it to the next stage with nothing asked (a
+            stage after the first only).
         frame_canvas_tokens: Rows a diffusion model adds after a frame
             entry. They take chunk room and page room but are never
             kept in the anchor's KV. A suffix's canvas rows are part of
@@ -352,6 +357,15 @@ class JoinAdmission:
             if lst is DROP:
                 self._stage[a] = _DONE
                 return "dropped"
+            if lst is SKIP:
+                # nothing asked here: the anchor passes this stage
+                self._true[a][j] = True
+                if j + 1 == k:
+                    self._stage[a] = _DONE
+                    self.survivors += 1
+                    return "finished"
+                j += 1
+                continue
             if ask is not None:
                 self._lists[a][j], self._cums[a][j] = self._partner_list(
                     a, j, lst)
@@ -396,6 +410,9 @@ class JoinAdmission:
             lists = [None] * k
             cums = [None] * k
             first = partners(0)
+            if first is SKIP:
+                raise ValueError(
+                    f"anchor {a}: the first stage cannot be skipped")
             if first is DROP:
                 first = []
             lists[0], cums[0] = self._partner_list(a, 0, first)

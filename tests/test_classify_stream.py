@@ -221,3 +221,144 @@ def test_streamed_classification_labels_survivors_with_their_kv_resident(
     assert any(QUESTION in chunk and (CUE in chunk or chunk & {FRAME})
                or CLASSIFY_FRAME in chunk and FRAME in chunk
                for chunk in heads)
+
+
+def chained_graph():
+    """A decoded classification, its label filter, and a second classification."""
+    first = ClassifySpec(
+        name="topic", aliases=("r",), query_template="", arguments=(),
+        expected_inputs=14, estimated_seconds=0.0,
+        prompt_token_parts=((), (CLASSIFY_FRAME, CUE)), labels=("a", "b"),
+        label_token_ids=LABEL_IDS, scoring="trie_decode")
+    second = ClassifySpec(
+        name="kind", aliases=("r",), query_template="", arguments=(),
+        expected_inputs=7, estimated_seconds=0.0,
+        prompt_token_parts=((), (CLASSIFY_FRAME, CUE)), labels=("a", "b"),
+        label_token_ids=LABEL_IDS, scoring="trie_paths")
+    nodes = [
+        Scan(node_id="input:r", alias="r", input_id="r"),
+        AiClassify(
+            node_id="classify:r",
+            inputs=input_ports((PortRef("input:r", "ids:r"),)),
+            backend_name="quail", model="qwen3-4b-fp8", spec=first),
+        LabelFilter(
+            node_id="label:r",
+            inputs=input_ports((PortRef("classify:r", "scores"),)),
+            score_name="topic", aliases=("r",), comparison="in",
+            threshold=0.0, selectivity=0.5, written_pos=1, accepted=("a",)),
+        AiClassify(
+            node_id="classify2:r",
+            inputs=input_ports((PortRef("label:r", "scores"),)),
+            backend_name="quail", model="qwen3-4b-fp8", spec=second),
+    ]
+    return PhysicalGraph(tuple(nodes), PortRef("classify2:r", "scores"))
+
+
+def test_a_decoded_classification_hands_its_documents_on_through_the_label_filter(
+        monkeypatch):
+    from quail.backends.quail.executor import classify as classify_module
+    from quail.execution.pipelines import build_pipelines
+
+    graph = chained_graph()
+    chains = {pipeline.node_ids for pipeline in build_pipelines(graph).values()}
+    assert chains == {("classify:r", "label:r", "classify2:r")}
+
+    monkeypatch.setattr(loop, "pack_chunk", fake_pack)
+    n_docs = 14
+    docs = {"r": [[DOC + d] * (10 + 2 * d) for d in range(n_docs)]}
+    label_truth = [d % 2 for d in range(n_docs)]           # even: "a"
+
+    class DecodingModel(LabelingModel):
+        def forward_chunk(self, chunk):
+            rows = []
+            for spec in chunk.specs:
+                for suffix in spec["suffixes"]:
+                    if suffix[0] != CUE:
+                        rows.append(0)
+                        continue
+                    wanted = LABEL_IDS[self.label_truth[spec["key"][1]]]
+                    count = len(suffix) if spec.get("read_all_rows") else 1
+                    for depth in range(count):
+                        # the last row of a decode round wants the next
+                        # token; every row of a path wants its own
+                        want = wanted[len(suffix) - 1] if count == 1 \
+                            else wanted[depth]
+                        rows.append(np.asarray(
+                            [-1.0 if token == want else -5.0
+                             for token in TARGETS], np.float32))
+            self.launched.append(chunk.specs)
+            return rows
+
+    model = DecodingModel([], {}, label_truth)
+    torch = fake_torch()
+    # the readout constructor is replaced below; its arguments are read
+    torch.nn = SimpleNamespace(functional=None)
+    arena = cpu_arena(64)
+    pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
+    execution = QuailModelExecution(SimpleNamespace(
+        model=MODELS["qwen3-4b-fp8"], gpu_index=0, gpu_count=1,
+        device=DEVICES["h100-sxm"]))
+    execution.bind_loaded_model(model=object(), arena=arena, pipeline=pipeline)
+    execution.bind_query(
+        torch=torch,
+        async_answers=SimpleNamespace(submit=lambda v: v, result=lambda v: v,
+                                      dtype=None),
+        answer_rows=object(), chunk_tokens=120)
+
+    class FakeReadout:
+        # the two classifications read one row and two rows per answer
+        def __init__(self, targets, rows):
+            self.targets = np.asarray(targets)
+            self.rows = rows
+            self.dtype = np.dtype((np.float32, (rows, len(targets))))
+
+        def submit(self, rows, rows_per_answer=None):
+            rows_per_answer = rows_per_answer or [1] * len(rows)
+            padded = np.full((len(rows_per_answer), self.rows,
+                              len(self.targets)), np.nan, np.float32)
+            start = 0
+            for answer, count in enumerate(rows_per_answer):
+                for offset in range(count):
+                    row = rows[start + offset]
+                    padded[answer, offset] = (
+                        row if hasattr(row, "shape")
+                        else np.zeros(len(self.targets)))
+                start += count
+            return padded
+
+        def result(self, rows):
+            return rows
+
+    monkeypatch.setattr(classify_module, "full_output_head",
+                        lambda model: SimpleNamespace(shape=(1, 1),
+                                                      dtype="fake"))
+    monkeypatch.setattr(
+        classify_module, "AsyncLabelLogprobs",
+        lambda torch, F, head, targets, rows, normalize: FakeReadout(
+            targets, rows))
+    state = {
+        "torch": torch, "arena": arena, "pipeline": pipeline,
+        "model_execution": execution,
+        "runtimes": built_in_registry().runtimes,
+        "model_spec": MODELS["qwen3-4b-fp8"], "device": DEVICES["h100-sxm"],
+        "chunk_tokens": 120, "docs": docs,
+    }
+    result = execute_single_graph(state, SETTINGS, graph)
+    assert not arena.accounting.owned
+    outputs = result["_outputs"]
+    metrics = result["node_metrics"]
+    accepted = [d for d in range(n_docs) if label_truth[d] == 0]
+    labels = outputs[PortRef("classify:r", "scores")]
+    assert labels.column("topic").to_pylist() == [
+        ("a", "b")[label_truth[d]] for d in range(n_docs)]
+    assert outputs[PortRef("label:r", "ids:r")].column("r").to_pylist() \
+        == accepted
+    second = outputs[PortRef("classify2:r", "scores")]
+    assert second.column("r").to_pylist() == accepted
+    assert second.column("kind").to_pylist() == ["a"] * len(accepted)
+    # the first classification packed every document once; the second
+    # packed only a frame and the label path per accepted document
+    prefill = sum(len(docs["r"][d]) for d in range(n_docs))
+    assert metrics["classify:r"]["fresh_tokens"] >= prefill
+    assert metrics["classify2:r"]["fresh_tokens"] == 3 * len(accepted)
+    assert metrics["classify2:r"]["evaluated_documents"] == len(accepted)

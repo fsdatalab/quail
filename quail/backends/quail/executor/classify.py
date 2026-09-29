@@ -13,7 +13,8 @@ the partner suffixes are:
 - ``trie_decode``: one stage per trie depth. Each round a document
   sends the chain of the node it has decoded so far and appends the
   likeliest child token read after it, until the node is a whole
-  label (GreedyDecoder); the label is the greedy path.
+  label (GreedyDecoder); the label is the greedy path, and the
+  document skips the rounds left.
 - ``trie_tree``: the whole trie as one suffix: the cue and every
   node's token once, split into chains that each follow first
   children. Each chain is a causal segment and reads the ancestors
@@ -232,7 +233,8 @@ class ClassifyStages:
                         return Stage.DROP
                     nodes = decoder.requests(self.index_of(key))
                     # a resolved document has nothing left to read
-                    return Stage.DROP if nodes is None else nodes
+                    # and goes on to whatever follows the rounds
+                    return Stage.SKIP if nodes is None else nodes
 
                 def round_read(anchor, row, index=index, decoder=decoder,
                                names=stage_spec.labels):

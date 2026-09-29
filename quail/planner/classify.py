@@ -616,18 +616,19 @@ def plan_classify(region, context, *, backend_name: str):
     since = []            # label filters since that stage
     for kind, item in steps:
         if kind == "classify":
-            # a canvas model decodes each classification on its own
-            # a decoded classification drops a document from the run
-            # once its label is decoded, so no stage follows it
-            joins = (chain is not None and len(since) <= 1
-                     and not model.canvas_tokens
-                     and nodes[chain].spec.scoring != DECODE_SCORING
-                     and all(predicates[p].expression.call is last_call
-                             for p in since)
-                     and table.head(item) == table.head(last_call))
+            # a classification after another on the same documents
+            # reads their resident KV (in one node, or in one pipeline
+            # of two nodes); a canvas model decodes each on its own
+            follows = (chain is not None and len(since) <= 1
+                       and not model.canvas_tokens
+                       and all(predicates[p].expression.call is last_call
+                               for p in since)
+                       and table.head(item) == table.head(last_call))
+            # a decoded classification's rounds are its own node's stages
+            joins = follows and nodes[chain].spec.scoring != DECODE_SCORING
             try:
                 spec, step = table.classify(item, named[item], live,
-                                            resident=joins)
+                                            resident=follows)
             except ClassifyRefusedError as refused:
                 return (PhysicalCandidate(None, refused.refusal(),
                                           float("inf")),)
