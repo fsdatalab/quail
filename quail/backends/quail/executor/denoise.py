@@ -290,11 +290,13 @@ class AsyncCanvasReadout:
                 f"{normed.shape[0]} rows read for {len(stages)} canvases "
                 f"of {rows} rows")
         on_gpu = normed.is_cuda
-        temperature = torch.tensor(
+        # torch refuses pin_memory=True on a tensor built from numpy
+        temperature = torch.as_tensor(
             np.repeat([self.settings.temperature(step) for step in stages],
-                      rows),
-            dtype=torch.float32, pin_memory=on_gpu).to(
-                normed.device, non_blocking=on_gpu)
+                      rows).astype(np.float32))
+        if on_gpu:
+            temperature = temperature.pin_memory()
+        temperature = temperature.to(normed.device, non_blocking=on_gpu)
         tokens, entropy, soft = denoise_rows(
             torch, self.F, normed, self.head, self.normalizer, temperature,
             self.settings.logit_softcap, self.BLOCK_ROWS)
