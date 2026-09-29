@@ -22,6 +22,7 @@ from quail.bench.quailb import run_output
 from quail.bench.substrait import read_plan
 from quail.catalog import DocumentProvider
 from quail.execution.labels import (
+    GreedyDecoder,
     best_label,
     label_path_scores,
     label_trie,
@@ -77,6 +78,10 @@ def test_trie_paths_cover_every_proper_prefix():
     nan = float("nan")
     # a denoising step sends the cue and the whole canvas
     assert suffix_lengths("canvas", IDS, 16) == [17]
+    # a decode sends the cue, then the cue and one token, for as many
+    # rounds as the mean label length rounded up
+    assert suffix_lengths("trie_decode", IDS) == [1, 2]
+
 
     # one chain over the deepest proper prefix (1,) reads both rows
     assert trie_paths(IDS) == [(1,)]
@@ -90,6 +95,32 @@ def test_trie_paths_cover_every_proper_prefix():
     path_logprobs = np.log([[[0.6, nan, nan, 0.4], [nan, 0.3, 0.7, nan]]])
     scores = label_path_scores(IDS, [(1,)], targets, path_logprobs)
     assert np.allclose(np.exp(scores), [0.18, 0.42, 0.4])
+
+
+def test_greedy_decoder_follows_the_likeliest_child_to_a_label():
+    targets = [1, 2, 3, 4]
+    decoder = GreedyDecoder(IDS, targets, documents=2)
+    assert decoder.nodes == [(), (1,)] and decoder.rounds == 2
+    # round 0 reads the row after the cue for both documents
+    assert [decoder.requests(doc) for doc in range(2)] == [[0], [0]]
+    assert decoder.tokens == 2
+    # document 0 follows token 1, document 1 takes the one-token label 4
+    decoder.update(0, np.array([-1.0, -9.0, -9.0, -3.0]))
+    decoder.update(1, np.array([-2.0, -9.0, -9.0, -0.5]))
+    assert decoder.label.tolist() == [-1, 2]
+    assert decoder.requests(1) is None and decoder.requests(0) == [1]
+    assert decoder.tokens == 2 + 2
+    # after token 1, token 3 beats token 2: "refund status"
+    decoder.update(0, np.array([-9.0, -5.0, -1.0, -9.0]))
+    assert decoder.label.tolist() == [1, 2]
+    # a tie goes to the earlier label's token
+    tied = GreedyDecoder(IDS, targets, documents=1)
+    tied.requests(0)
+    tied.update(0, np.array([-1.0, -9.0, -9.0, -1.0]))
+    assert tied.node[0] == (1,)
+    with pytest.raises(ValueError, match="prefix"):
+        GreedyDecoder(((1, 2), (1,)), [1, 2], documents=1)
+
 
 
 def test_classify_prompt_is_quail_b_text_with_labels_after_it():
@@ -217,6 +248,61 @@ def test_classifier_reads_every_row_of_each_trie_path(monkeypatch):
     batch = QuailClassifier(state).classify(single, [[0], [1]], documents)
     assert list(batch.scores) == ["a", "b"]
     assert batch.label_tokens == 2 * 1
+
+
+def test_classifier_decodes_one_token_per_round(monkeypatch):
+    spec = ClassifySpec(
+        name="topic", aliases=("d",), query_template="", arguments=(),
+        expected_inputs=3, estimated_seconds=0.0,
+        prompt_token_parts=((90,), (91, 92, 93)), labels=LABELS,
+        label_token_ids=IDS, scoring="trie_decode")
+    requests = label_requests(spec)
+    assert requests.rounds == 2 and requests.score is None
+    assert requests.suffixes == [[93], [93, 1]] and not requests.read_all_rows
+    documents = {"d": [[10, 11], [12], [13]]}
+    targets = [1, 2, 3, 4]
+    # document 0 wants "refund request", 1 "shipping" outright, 2
+    # "refund status": the wanted label's next token gets -1, another
+    # label's first token -2 for token 1 and -3 for token 4, else -5
+    wanted = {0: IDS[0], 1: IDS[2], 2: IDS[1]}
+
+    def logprob(document, seen, token):
+        if seen + (token,) == tuple(wanted[document][:len(seen) + 1]):
+            return -1.0
+        if not seen and token in (1, 4):
+            return -2.0 if token == 1 else -3.0
+        return -5.0
+
+    packed = []
+
+    def forward(chunk):
+        rows = []
+        for entry in chunk.specs:
+            document = entry["key"][2]
+            for suffix in entry["suffixes"]:
+                packed.append((document, list(suffix)))
+                seen = tuple(suffix[1:])
+                rows.append([logprob(document, seen, token) for token in targets])
+        return np.asarray(rows, dtype=np.float32)
+
+    monkeypatch.setattr(loop, "pack_chunk", fake_pack)
+    readout = SimpleNamespace(
+        targets=np.asarray(targets), rows=1,
+        dtype=np.dtype((np.float32, (4,))),
+        submit=lambda rows, rows_per_answer=None: rows,
+        result=lambda rows: rows)
+    state = {"torch": fake_torch(), "arena": cpu_arena(64),
+             "pipeline": fake_pipeline(forward_chunk=forward),
+             "chunk_tokens": 64, "label_readout": readout,
+             "input_staging": SimpleNamespace(fixed_tokens=set())}
+    batch = QuailClassifier(state).classify(spec, [[0], [1], [2]], documents)
+    assert list(batch.scores) == ["refund request", "shipping", "refund status"]
+    # document 1 decoded its one-token label in round 0 and sent
+    # nothing more; the others sent the cue and token 1 in round 1
+    assert sorted(packed) == sorted([
+        (0, [91, 92]), (1, [91, 92]), (2, [91, 92]),
+        (0, [93]), (1, [93]), (2, [93]), (0, [93, 1]), (2, [93, 1])])
+    assert batch.label_tokens == 3 * 1 + 2 * 2
 
 
 def test_classifier_borrows_shared_prefix_pages(monkeypatch):
@@ -467,40 +553,56 @@ def test_planner_prices_the_exhaustive_rules_by_their_label_tokens():
                    chunk=chunk, scoring=None, backend_name="quail",
                    model=QWEN3_4B_FP8, device=H100_SXM, tokenizer=_bytes,
                    capacity=capacity, lengths=(200,) * 1000)
-    scoring, simulated = table.choose(1000, 20, 30, long_labels, False)
+    # thirty four-token labels sharing nothing: a greedy decode sends
+    # the cue and then one token a round, ten tokens over four rounds,
+    # against 150 for the paths and 91 for the packed trie
+    scoring, decoded = table.choose(1000, 20, 30, long_labels, False)
+    assert scoring == "trie_decode"
+    assert decoded.label_tokens == 1000 * (1 + 2 + 3 + 4)
+    assert decoded.rounds == 4
+    forced = _Table(**{**table.__dict__, "scoring": "trie_paths"})
+    scoring, simulated = forced.choose(1000, 20, 30, long_labels, False)
     assert scoring == "trie_paths"
     assert simulated.label_tokens == 1000 * sum(
         1 + len(path) for path in trie_paths(long_labels))
+    assert simulated.rounds == 1 and decoded.seconds < simulated.seconds
     # under tree attention the packed trie computes each node once
-    # and costs less
-    tree = _Table(**{**table.__dict__, "tree": True})
+    # and costs less than the paths
+    tree = _Table(**{**table.__dict__, "tree": True, "scoring": "trie_tree"})
     scoring, packed = tree.choose(1000, 20, 30, long_labels, False)
     assert scoring == "trie_tree"
     assert packed.label_tokens == 1000 * len(label_trie(long_labels))
     assert packed.seconds < simulated.seconds
-    # a forced rule is the one candidate
-    forced = _Table(**{**tree.__dict__, "scoring": "trie_paths"})
-    scoring, _ = forced.choose(1000, 20, 30, long_labels, False)
-    assert scoring == "trie_paths"
+    # a decode cannot end at a label that is another label's prefix,
+    # and the documents of a chained stage are not decoded
+    prefixed = long_labels[:-1] + (long_labels[0][:2],)
+    assert table.choose(1000, 20, 30, prefixed, False)[0] == "trie_paths"
+    assert table.choose(1000, 20, 30, long_labels, True)[0] == "trie_paths"
 
 
-def test_simulation_counts_passes_from_the_chunk_budget_and_arena():
+def test_simulation_sends_a_decode_one_chain_per_round():
     from quail.planner.classify import simulate
 
-    # three documents of 100 tokens with two chains, a chunk of 250:
-    # two documents fit a chunk, the third takes a second one
+    # three documents of 100 tokens, a chunk of 250: two chunks for
+    # the documents' first round, then the second round of each
+    # document two chunks after the one that launched it
     prefixes = [100, 100, 100]
     chains = [[3, 2], [3, 2], [3, 2]]
     result = simulate(prefixes, 10, chains, chunk=250, capacity=10_000,
-                      model=QWEN3_4B_FP8, device=H100_SXM)
-    assert result.passes == 2
-    assert result.label_tokens == 3 * 5
-    assert result.work.tokens == 3 * 115
+                      model=QWEN3_4B_FP8, device=H100_SXM, one_per_round=True)
+    assert result.rounds == 2 and result.passes == 4
+    assert result.label_tokens == 3 * 3 + 3 * 2
+    assert result.work.tokens == 3 * 110 + 3 * 3 + 3 * 2
     assert result.seconds > 0
-    # an arena holding one document's reservation runs one a chunk
+    # one round sends both chains at once, in fewer chunks
+    once = simulate(prefixes, 10, chains, chunk=250, capacity=10_000,
+                    model=QWEN3_4B_FP8, device=H100_SXM)
+    assert once.rounds == 1 and once.passes == 2
+    assert once.label_tokens == result.label_tokens
+    # a full arena admits documents as earlier ones finish
     tight = simulate(prefixes, 10, chains, chunk=250, capacity=120,
-                     model=QWEN3_4B_FP8, device=H100_SXM)
-    assert tight.passes == 3
+                     model=QWEN3_4B_FP8, device=H100_SXM, one_per_round=True)
+    assert tight.passes > result.passes
     assert tight.seconds > result.seconds
 
 
@@ -575,9 +677,9 @@ def test_classify_refusals_and_builder_errors(session):
     # the plan setting picks the scoring rule; the cost model by default
     plan = query.plan()
     (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
-    assert classify.spec.scoring in ("trie_paths", "trie_tree")
+    assert classify.spec.scoring in ("trie_paths", "trie_tree", "trie_decode")
     assert plan.settings["label_scoring"] == "cost model"
-    for rule in ("trie_paths", "trie_tree", "next_rule"):
+    for rule in ("trie_paths", "trie_tree", "trie_decode", "next_rule"):
         ruled = quail.Session(EngineConfig(
             model="qwen3-4b-fp8", device="h100-sxm", label_scoring=rule),
             tokenizer=_bytes)
@@ -1048,17 +1150,23 @@ def test_planner_prefers_the_packed_trie_when_labels_share_prefixes():
                    model=QWEN3_4B_FP8, device=H100_SXM, tokenizer=_bytes,
                    capacity=capacity, lengths=(200,) * 500, tree=True)
     # twenty labels branching under one shared token: 22 trie rows
-    # against 20 chains of three tokens
+    # against 20 chains of three tokens; a greedy decode's six tokens
+    # over three rounds cost least of all
     shared = tuple((7, i, 1) for i in range(20))
-    scoring, simulated = table.choose(500, 20, 30, shared, False)
+    scoring, decoded = table.choose(500, 20, 30, shared, False)
+    assert scoring == "trie_decode" and decoded.rounds == 3
+    # among the one-round rules the packed trie wins under tree
+    # attention, the chains without it
+    resident = _Table(**{**table.__dict__})
+    scoring, simulated = resident.choose(500, 20, 30, shared, True)
     assert scoring == "trie_tree"
     assert simulated.label_tokens == 500 * len(label_trie(shared))
-    # one-token labels: both rules read the cue row once; the tie
+    unified = _Table(**{**table.__dict__, "tree": False})
+    assert unified.choose(500, 20, 30, shared, True)[0] == "trie_paths"
+    # one-token labels: every rule reads the cue row once; the tie
     # keeps the chains
     scoring, _ = table.choose(500, 20, 30, ((1,), (2,)), False)
     assert scoring == "trie_paths"
-    unified = _Table(**{**table.__dict__, "tree": False})
-    assert unified.choose(500, 20, 30, shared, False)[0] == "trie_paths"
 
 
 def test_sql_category_forms_options_and_label_tables(session):

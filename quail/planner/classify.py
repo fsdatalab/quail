@@ -11,6 +11,7 @@ instead: every denoising step sends the answer canvas after the
 resident prompt (the ``canvas`` rule).
 """
 
+import math
 from collections import deque
 from dataclasses import dataclass, replace
 
@@ -116,11 +117,25 @@ def has_label(logical) -> bool:
 
 # The label scoring rules the executor runs, in the order they were
 # added; each later rule must return the labels of the first.
-LABEL_SCORINGS = ("trie_paths", "trie_tree", "canvas")
+LABEL_SCORINGS = ("trie_paths", "trie_tree", "trie_decode", "canvas")
 
 EXHAUSTIVE_SCORING = "trie_paths"
 # every node once, in one request: fewest tokens, tree attention only
 TREE_SCORING = "trie_tree"
+# one token per round along the greedy path: fewest tokens, most rounds
+DECODE_SCORING = "trie_decode"
+
+
+def decodable(labels) -> bool:
+    """Whether a greedy decode over the trie ends at a whole label.
+
+    A label that is a proper prefix of another label would need the
+    decode to choose between stopping and continuing, which the
+    rules score no end token for.
+    """
+    ids = {tuple(label) for label in labels}
+    return not any(tuple(label[:depth]) in ids
+                   for label in labels for depth in range(1, len(label)))
 
 
 def suffix_lengths(scoring: str, labels, canvas_rows: int = 0) -> list[int]:
@@ -129,13 +144,20 @@ def suffix_lengths(scoring: str, labels, canvas_rows: int = 0) -> list[int]:
     Every suffix starts with the answer cue's last token. Under
     ``trie_paths`` it continues with one of the trie's deepest proper
     prefixes, and under ``trie_tree`` the one suffix holds every trie
-    node once; every row is read. Under ``canvas`` the one suffix is
-    the cue and the ``canvas_rows`` rows of the answer canvas, sent
-    once per denoising step; the canvas rows are read.
+    node once; every row is read. Under ``trie_decode`` a document
+    sends one chain per round, the cue and the tokens decoded so far,
+    for as many rounds as the mean label length rounded up, and reads
+    each chain's last row; how many rounds it needs is decided as it
+    runs. Under ``canvas`` the one suffix is the cue and the
+    ``canvas_rows`` rows of the answer canvas, sent once per denoising
+    step; the canvas rows are read.
 
     Raises:
         ValueError: The rule is not one of LABEL_SCORINGS.
     """
+    if scoring == "trie_decode":
+        rounds = math.ceil(sum(len(ids) for ids in labels) / len(labels))
+        return [1 + depth for depth in range(rounds)]
     if scoring == "canvas":
         return [1 + canvas_rows]
     if scoring == "trie_tree":
@@ -178,29 +200,34 @@ class Simulated:
         passes: Forward chunks launched.
         work: The token, attention, and KV work of every chunk.
         label_tokens: Suffix tokens streamed after the documents.
+        rounds: The most rounds any document ran.
     """
 
     seconds: float
     passes: int
     work: Work
     label_tokens: float
+    rounds: int
 
 
 def simulate(prefixes, frame: int, chains, chunk: int, capacity: int,
              model, device, resident: bool = False, canvas_rows: int = 0,
-             rounds: int = 1, shared=None) -> Simulated:
+             rounds: int = 1, one_per_round: bool = False,
+             shared=None) -> Simulated:
     """Replay the stage scheduler on the CPU and price each chunk.
 
     Documents are admitted in order while their reservation, the
     prefix plus the frame and longest chain, fits the arena, and a
     chunk takes documents up to the chunk budget; a document's request
     is atomic. A document sends its chains ``rounds`` times, once per
-    denoising step. A round's answers are read while the next chunk
-    runs, so the document's next round enters the chunk after that, or
-    the next chunk when nothing else is ready; waiting rounds enter a
-    chunk before fresh documents. A document leaves the arena once its
-    last round's chunk has run. Each chunk costs its roofline time with
-    the weights streamed once, plus the readout of every row it reads.
+    denoising step, or with ``one_per_round`` one of its chains per
+    round, in order, reading only that chain's last row. A round's
+    answers are read while the next chunk runs, so the document's next
+    round enters the chunk after that, or the next chunk when nothing
+    else is ready; waiting rounds enter a chunk before fresh
+    documents. A document leaves the arena once its last round's chunk
+    has run. Each chunk costs its roofline time with the weights
+    streamed once, plus the readout of every row it reads.
 
     The self-conditioning MLP on the canvas rows (three hidden by
     intermediate GEMMs per row) is left out: it is under 1% of a
@@ -221,7 +248,10 @@ def simulate(prefixes, frame: int, chains, chunk: int, capacity: int,
             reads, which read the document a second time; 0 for a rule
             that reads its suffixes' rows.
         rounds: The denoising steps of every document; 1 for a rule
-            that reads its answers once.
+            that reads its answers once. With ``one_per_round`` the
+            rounds are the document's chains.
+        one_per_round: Each round sends one of the document's chains,
+            in order, and reads its last row.
         shared: Per document, the leading prefix tokens an earlier
             document already computed, which it borrows from KV
             instead of computing; None when no prefix is shared.
@@ -233,17 +263,26 @@ def simulate(prefixes, frame: int, chains, chunk: int, capacity: int,
                   default=0)
     extra = frame + longest
 
+    def round_chains(document, round_):
+        if one_per_round:
+            return [chains[document][round_]]
+        return chains[document]
+
+    def round_count(document):
+        return len(chains[document]) if one_per_round else rounds
+
     def first_tokens(document):
-        tokens = sum(chains[document]) + frame
+        tokens = sum(round_chains(document, 0)) + frame
         if not resident:
             tokens += prefixes[document] - shared[document]
         return tokens
 
-    def suffix_work(document):
+    def suffix_work(document, round_):
         prefix = prefixes[document]
         # a canvas longer than one row reads the document a second
         # time, in the non-causal call every canvas row runs
-        suffixes = stream(prefix + frame, chains[document], window=window)
+        suffixes = stream(prefix + frame, round_chains(document, round_),
+                          window=window)
         if canvas_rows > 1:
             suffixes = suffixes + Work(
                 pairs=suffixes.pairs, kv_read=suffixes.kv_read,
@@ -251,11 +290,9 @@ def simulate(prefixes, frame: int, chains, chunk: int, capacity: int,
                 sliding_kv_read=suffixes.sliding_kv_read)
         return suffixes
 
-    rounds_work = [suffix_work(document) for document in range(n)]
-
     def first_work(document):
         prefix = prefixes[document]
-        suffixes = rounds_work[document]
+        suffixes = suffix_work(document, 0)
         if resident:
             return ask(prefix, frame, window=window) + suffixes
         if shared[document]:
@@ -263,7 +300,9 @@ def simulate(prefixes, frame: int, chains, chunk: int, capacity: int,
                        window=window) + suffixes
         return scan(prefix + frame, 0, window=window) + suffixes
 
-    def read_rows(document):
+    def read_rows(document, round_):
+        if one_per_round:
+            return 1
         return canvas_rows or sum(chains[document])
 
     next_document = 0
@@ -271,6 +310,7 @@ def simulate(prefixes, frame: int, chains, chunk: int, capacity: int,
     passes = 0
     total = Work()
     label_tokens = 0.0
+    most_rounds = 0
     held = 0
     waiting = deque()    # (first chunk it may enter, document, round)
     while next_document < n or waiting:
@@ -280,13 +320,13 @@ def simulate(prefixes, frame: int, chains, chunk: int, capacity: int,
         launched = []
         while waiting and waiting[0][0] <= passes:
             _, document, round_ = waiting[0]
-            tokens = sum(chains[document])
+            tokens = sum(round_chains(document, round_))
             if tokens > room and room != chunk:
                 break
             waiting.popleft()
             room -= tokens
-            work += rounds_work[document]
-            rows += read_rows(document)
+            work += suffix_work(document, round_)
+            rows += read_rows(document, round_)
             label_tokens += tokens
             launched.append((document, round_))
         while (next_document < n
@@ -298,8 +338,8 @@ def simulate(prefixes, frame: int, chains, chunk: int, capacity: int,
             held += prefixes[document] + extra
             room -= first_tokens(document)
             work += first_work(document)
-            rows += read_rows(document)
-            label_tokens += sum(chains[document])
+            rows += read_rows(document, 0)
+            label_tokens += sum(round_chains(document, 0))
             launched.append((document, 0))
         if not launched:
             # the waiting rounds' answers are read before anything packs
@@ -309,13 +349,14 @@ def simulate(prefixes, frame: int, chains, chunk: int, capacity: int,
         seconds += chunk_seconds(work, rows, model, device,
                                  gemms=2 if canvas_rows else 1)
         for document, round_ in launched:
-            if round_ + 1 < rounds:
+            most_rounds = max(most_rounds, round_ + 1)
+            if round_ + 1 < round_count(document):
                 waiting.append((passes + 2, document, round_ + 1))
             else:
                 held -= prefixes[document] + extra
         passes += 1
         total += work
-    return Simulated(seconds, passes, total, label_tokens)
+    return Simulated(seconds, passes, total, label_tokens, most_rounds)
 
 
 @dataclass(frozen=True)
@@ -397,6 +438,11 @@ class _Table:
                        for label in call.labels)
         scoring, simulated = self.choose(live, len(head), len(tail) - 1,
                                          labels, resident)
+        if scoring == DECODE_SCORING and not decodable(labels):
+            raise ClassifyRefusedError(
+                f"the {scoring!r} rule cannot decode the labels of "
+                f"{name!r}: one label is a proper prefix of another",
+                1, 0)
         suffixes = suffix_lengths(scoring, labels, self.canvas_rows)
         if scoring == "canvas" and max(map(len, labels)) > self.canvas_rows:
             raise ClassifyRefusedError(
@@ -443,6 +489,7 @@ class _Table:
                                      else self.model.canvas_tokens),
                         rounds=(self.model.denoising.max_steps
                                 if scoring == "canvas" else 1),
+                        one_per_round=scoring == DECODE_SCORING,
                         shared=shared)
 
     def reestimate(self, spec: ClassifySpec) -> ClassifySpec:
@@ -465,9 +512,11 @@ class _Table:
         """The rule with the least simulated time, and its simulation.
 
         A forced rule is the one candidate, as is ``canvas`` on a
-        canvas model. Otherwise ``trie_paths`` is a candidate, and
-        ``trie_tree`` under tree attention. Ties go to fewer label
-        tokens, then the order listed.
+        canvas model. Otherwise ``trie_paths`` is a candidate,
+        ``trie_tree`` under tree attention, and ``trie_decode`` for a
+        classification whose documents are not resident from an
+        earlier stage and whose labels a greedy decode can end at.
+        Ties go to fewer label tokens, then the order listed.
         """
         if self.scoring:
             candidates = [self.scoring]
@@ -477,6 +526,8 @@ class _Table:
             candidates = [EXHAUSTIVE_SCORING]
             if self.tree:
                 candidates.append(TREE_SCORING)
+            if not resident and decodable(labels):
+                candidates.append(DECODE_SCORING)
         best = None
         for scoring in candidates:
             simulated = self.simulate(scoring, live, head_tokens, frame_tokens,
@@ -566,8 +617,11 @@ def plan_classify(region, context, *, backend_name: str):
     for kind, item in steps:
         if kind == "classify":
             # a canvas model decodes each classification on its own
+            # a decoded classification drops a document from the run
+            # once its label is decoded, so no stage follows it
             joins = (chain is not None and len(since) <= 1
                      and not model.canvas_tokens
+                     and nodes[chain].spec.scoring != DECODE_SCORING
                      and all(predicates[p].expression.call is last_call
                              for p in since)
                      and table.head(item) == table.head(last_call))

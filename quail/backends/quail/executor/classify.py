@@ -10,6 +10,10 @@ the partner suffixes are:
   read and returns every label token, so the cue's row scores all
   one-token labels at once and labels sharing leading tokens share
   the rows after them.
+- ``trie_decode``: one stage per trie depth. Each round a document
+  sends the chain of the node it has decoded so far and appends the
+  likeliest child token read after it, until the node is a whole
+  label (GreedyDecoder); the label is the greedy path.
 - ``trie_tree``: the whole trie as one suffix: the cue and every
   node's token once, split into chains that each follow first
   children. Each chain is a causal segment and reads the ancestors
@@ -42,8 +46,10 @@ from quail.backends.quail.executor.model import full_output_head
 from quail.backends.quail.executor.readout import AsyncLabelLogprobs
 from quail.backends.quail.executor.stages import Stage, run_stages
 from quail.execution.labels import (
+    GreedyDecoder,
     best_label,
     label_path_scores,
+    label_trie,
     match_label,
     tree_scores,
     trie_chains,
@@ -69,16 +75,21 @@ class LabelRequests:
             its last.
         score: Maps one document's log probabilities, shape
             (suffixes, rows, targets) with all rows read and
-            (suffixes, targets) otherwise, to one score per label.
+            (suffixes, targets) otherwise, to one score per label;
+            None under ``trie_decode``, which decodes as it reads.
         chains: Under ``trie_tree``, the chains the one suffix packs.
+        rounds: Under ``trie_decode``, the rounds a document may need;
+            each round offers every node's chain and a document sends
+            the chain of the node it has decoded so far.
     """
 
     frame: list
     suffixes: list
     targets: list
     read_all_rows: bool
-    score: Callable[[np.ndarray], np.ndarray]
+    score: Callable[[np.ndarray], np.ndarray] | None
     chains: list | None = None
+    rounds: int = 0
 
 
 def label_requests(spec, targets=None) -> LabelRequests:
@@ -110,6 +121,11 @@ def label_requests(spec, targets=None) -> LabelRequests:
         return LabelRequests(
             frame, [[cue, *path] for path in paths], targets, True,
             lambda logprobs: label_path_scores(ids, paths, targets, logprobs))
+    if spec.scoring == "trie_decode":
+        nodes = sorted(label_trie(ids), key=lambda prefix: (len(prefix), prefix))
+        return LabelRequests(
+            frame, [[cue, *node] for node in nodes], targets, False, None,
+            rounds=max(len(label) for label in ids))
     if spec.scoring == "canvas":
         raise ValueError("the canvas rule decodes answers; it scores no labels")
     raise ValueError(f"unknown label scoring rule {spec.scoring!r}")
@@ -216,21 +232,49 @@ class QuailClassifier:
                 return Stage.DROP
             return None
 
-        # one stage per classification; a later classification's stage
-        # gates on the label before it
+        # one stage per classification, or one per trie depth under
+        # trie_decode; a later classification's first stage gates on
+        # the label before it
         stages = []
+        decoders = {}
         for index, (stage_spec, request) in enumerate(zip(specs, requests)):
-            def whole(anchor, row, index=index):
-                labels[index][anchor] = label_of(index, row)
-                return True
+            if not request.rounds:
+                def whole(anchor, row, index=index):
+                    labels[index][anchor] = label_of(index, row)
+                    return True
 
-            stages.append(Stage(
-                suffixes=request.suffixes, readout=readout,
-                frame=request.frame, decide=whole,
-                requests=((lambda key, index=index: gate(index, key))
-                          if index else None),
-                read_all_rows=read_all, label=stage_spec.name,
-                chains=request.chains))
+                stages.append(Stage(
+                    suffixes=request.suffixes, readout=readout,
+                    frame=request.frame, decide=whole,
+                    requests=((lambda key, index=index: gate(index, key))
+                              if index else None),
+                    read_all_rows=read_all, label=stage_spec.name,
+                    chains=request.chains))
+                continue
+            decoder = GreedyDecoder(stage_spec.label_token_ids, targets,
+                                    len(rows))
+            decoders[index] = decoder
+            for round in range(request.rounds):
+                def ask(key, index=index, round=round, decoder=decoder):
+                    document = key[2]
+                    if round == 0 and index and gate(index, key) is Stage.DROP:
+                        return Stage.DROP
+                    nodes = decoder.requests(document)
+                    # a resolved document has nothing left to read
+                    return Stage.DROP if nodes is None else nodes
+
+                def round_read(anchor, row, index=index, decoder=decoder,
+                               names=stage_spec.labels):
+                    decoder.update(anchor, np.asarray(row).reshape(-1))
+                    if decoder.label[anchor] >= 0:
+                        labels[index][anchor] = names[decoder.label[anchor]]
+                    return True
+
+                stages.append(Stage(
+                    suffixes=request.suffixes, readout=readout,
+                    frame=request.frame, requests=ask, decide=round_read,
+                    read_all_rows=False,
+                    label=f"{stage_spec.name} round {round}"))
 
         stats = {}
         answers, spans, fresh = run_stages(
@@ -240,17 +284,22 @@ class QuailClassifier:
             label=f"classify {spec.name}")
         label_tokens = 0
         streamed = 0     # frame and suffix tokens packed after documents
+        position = 0
         for index, request in enumerate(requests):
-            first = answers[index]
-            for anchor, logprobs in first.items():
-                if labels[index][anchor] is None:
-                    labels[index][anchor] = label_of(index, logprobs)
-            suffix_tokens = len(first) * sum(map(len, request.suffixes))
+            first = answers[position]
+            if index in decoders:
+                suffix_tokens = decoders[index].tokens
+            else:
+                for anchor, logprobs in first.items():
+                    if labels[index][anchor] is None:
+                        labels[index][anchor] = label_of(index, logprobs)
+                suffix_tokens = len(first) * sum(map(len, request.suffixes))
             label_tokens += suffix_tokens
             # a frame equal to the stage before's is already in KV
             written = index == 0 or request.frame != requests[index - 1].frame
             streamed += suffix_tokens + (len(first) * len(request.frame)
                                          if written else 0)
+            position += max(1, request.rounds)
         total = sum(map(len, prefixes)) + streamed
         return self._batch(labels[0], fresh, total - fresh, label_tokens,
                            stats, spans,
