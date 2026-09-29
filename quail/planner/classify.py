@@ -58,15 +58,21 @@ def _refused(reason: str, constraint: str = "unsupported_classify_query",
 def classification_refusal(context) -> Refusal | None:
     """Why the context's model cannot classify, or None when it can."""
     model = context.model
-    if model.canvas_tokens:
-        reason = (f"AI.CLASSIFY is not supported on {model.name!r} yet: it "
-                  f"reads answers from a canvas")
-    elif context.tokenizer is None:
+    forced = context.label_scoring
+    if context.tokenizer is None:
         reason = "AI.CLASSIFY planning needs the model's tokenizer"
-    elif (context.label_scoring is not None
-          and context.label_scoring not in LABEL_SCORINGS):
-        reason = (f"unknown label scoring rule {context.label_scoring!r}; "
+    elif forced is not None and forced not in LABEL_SCORINGS:
+        reason = (f"unknown label scoring rule {forced!r}; "
                   f"the rules are {LABEL_SCORINGS}")
+    elif model.canvas_tokens and forced not in (None, "canvas"):
+        reason = (f"{model.name!r} scores labels on a canvas; the "
+                  f"{forced!r} rule reads left-to-right log probabilities")
+    elif forced == "canvas" and not model.canvas_tokens:
+        reason = f"{model.name!r} has no canvas to score labels on"
+    elif model.canvas_tokens and not (model.canvas_end_text
+                                      and model.canvas_pad_text):
+        reason = (f"{model.name!r} names no answer end and pad tokens "
+                  f"for the classification canvas")
     else:
         return None
     return _refused(reason)[0].plan
@@ -105,7 +111,7 @@ def has_label(logical) -> bool:
 # The label scoring rules the executor runs, in the order they were
 # added; each later rule must return the labels of the first.
 LABEL_SCORINGS = ("trie_nodes", "label_chains", "trie_paths", "trie_rounds",
-                  "trie_search")
+                  "trie_search", "canvas")
 
 # A round launched in one chunk has its answers read while the next
 # chunk runs, so a document's next round enters the chunk after that.
@@ -117,7 +123,9 @@ ADAPTIVE_SCORINGS = ("trie_rounds", "trie_search")
 def suffix_lengths(scoring: str, labels) -> list[int]:
     """Tokens of each suffix a document streams under one scoring rule.
 
-    Every suffix starts with the answer cue's last token. Under
+    Under ``canvas`` the one suffix is the canvas: as many rows as the
+    padded labels are long. Otherwise every suffix starts with the
+    answer cue's last token. Under
     ``trie_nodes`` it continues with a label-trie node's tokens and
     only its last row is read. Under ``label_chains`` it continues
     with all but a label's last token and every row is read. Under
@@ -127,6 +135,8 @@ def suffix_lengths(scoring: str, labels) -> list[int]:
     and that many tokens, assuming one label path is read; how many
     are read is measured, not planned, until the cost model.
     """
+    if scoring == "canvas":
+        return [len(labels[0])]
     if scoring == "label_chains":
         return [len(ids) for ids in labels]
     if scoring == "trie_paths":
@@ -289,6 +299,8 @@ def rule_rounds(scoring: str, labels, traces=None, demand=None) -> tuple:
     Returns:
         (rounds per document, read_all_rows).
     """
+    if scoring == "canvas":
+        return [[[len(labels[0])]]], True
     nodes = sorted(label_trie(labels), key=lambda node: (len(node), node))
     if scoring == "trie_nodes":
         return [[[1 + len(node) for node in nodes]]], False
@@ -378,6 +390,8 @@ class _Table:
         tail = tuple(call.prompt.tail_token_ids)
         labels = tuple(tuple(self.tokenizer(label_text(label)))
                        for label in call.labels)
+        if self.model.canvas_tokens:
+            labels = self.padded(labels)
         traces = None
         if self.traces is not None:
             traces = self.traces(trace_key(
@@ -407,6 +421,25 @@ class _Table:
         )
         return spec, simulated.work
 
+    def padded(self, labels) -> tuple:
+        """Every label padded to the canvas with the end token, then pads.
+
+        The canvas is one row longer than the longest label, so every
+        label is followed by at least the answer end token.
+
+        Raises:
+            ClassifyRefusedError: The end or pad text is not one token.
+        """
+        end = tuple(self.tokenizer(self.model.canvas_end_text))
+        pad = tuple(self.tokenizer(self.model.canvas_pad_text))
+        if len(end) != 1 or len(pad) != 1:
+            raise ClassifyRefusedError(
+                f"the canvas end {self.model.canvas_end_text!r} and pad "
+                f"{self.model.canvas_pad_text!r} must be one token each",
+                1, 0)
+        rows = max(len(ids) for ids in labels) + 1
+        return tuple(ids + end + pad * (rows - len(ids) - 1) for ids in labels)
+
     def simulate(self, scoring, live, head_tokens, frame_tokens, labels,
                  resident, traces=None, demand=None) -> Simulated:
         """Replay one rule over the documents expected and price it."""
@@ -429,7 +462,9 @@ class _Table:
         without them. Ties go to fewer rounds, then fewer label
         tokens, then the order listed.
         """
-        if self.scoring:
+        if self.model.canvas_tokens:
+            candidates = ["canvas"]
+        elif self.scoring:
             candidates = [self.scoring]
         else:
             candidates = [EXHAUSTIVE_SCORING]

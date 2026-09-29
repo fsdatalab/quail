@@ -34,6 +34,10 @@ class ModelPipeline:
     tree_attention = True
     gemm_warmup = True
 
+    def canvas_rows(self, rows: int) -> tuple:
+        """The canvas token ids for a canvas of ``rows`` rows; empty here."""
+        return ()
+
     def forward_chunk(self, chunk):
         """Return the final-normed hidden state of chunk.final_indices.
 

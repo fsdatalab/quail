@@ -32,6 +32,8 @@ DIFFUSION_GEMMA_26B_FP8 = ModelSpec(
     arch="diffusion_gemma",
     # Prefill the empty thinking channel so the next position holds the answer.
     canvas_tokens=1,
+    canvas_end_text="<turn|>",
+    canvas_pad_text="<pad>",
     turn_prefix="<bos><|turn>user\n",
     turn_suffix="<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
     prompt_format="gemma4-chat-nonthinking-v1",

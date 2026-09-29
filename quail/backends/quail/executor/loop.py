@@ -399,9 +399,9 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 fresh_keys.append(key)
         prefix_end = token_count
         s_row0 = token_count
+        # with a canvas, read_all_rows reads every canvas row instead
+        # of the suffix's own rows
         read_all = bool(g.get("read_all_rows"))
-        if read_all and canvas:
-            raise ValueError("a canvas answer is read at one row")
         # every suffix's rows at once: positions restart at f for each
         # suffix, and a canvas continues its suffix's positions
         widths = sufs.lengths + len(canvas)
@@ -418,8 +418,14 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             id_parts.append(np.concatenate([sufs.ids, canvas_ids])[source])
             first = s_row0 + begins + sufs.lengths
             canvas_starts.append(first)
-            finals.append(first + answer_row)
-            rows_per_answer.append(np.ones(n, dtype=np.int64))
+            if read_all:
+                finals.append((first[:, None]
+                               + np.arange(len(canvas))).reshape(-1))
+                rows_per_answer.append(np.full(n, len(canvas), dtype=np.int64))
+                multi_row = True
+            else:
+                finals.append(first + answer_row)
+                rows_per_answer.append(np.ones(n, dtype=np.int64))
         elif n:
             id_parts.append(sufs.ids)
             if read_all:

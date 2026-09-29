@@ -154,9 +154,11 @@ def fake_pack(torch, arena, specs, **kw):
         (len(spec["prefix"]) if spec["prefix"] is not None else 0)
         + sum(len(suffix) for suffix in spec["suffixes"])
         for spec in specs)
-    # one row per suffix, or every row of a suffix read whole
+    # one row per suffix, every row of a suffix read whole, or every
+    # row of the canvas after it
+    canvas = len(kw.get("canvas") or ())
     rows_per_answer = tuple(
-        len(suffix) if spec.get("read_all_rows") else 1
+        (canvas or len(suffix)) if spec.get("read_all_rows") else 1
         for spec in specs for suffix in spec["suffixes"])
     if all(rows == 1 for rows in rows_per_answer):
         rows_per_answer = ()

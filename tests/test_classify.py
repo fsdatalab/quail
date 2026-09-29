@@ -945,3 +945,98 @@ def test_bench_reads_classify_plans_and_reports_labels_by_operator():
         "r": ["a", "c"], "label": ["poor acting", "too long"]}
     assert output.classify_answers[sentiment.id].column("r").to_pylist() == [
         "a", "b", "c"]
+
+
+def test_classifier_scores_padded_labels_over_a_canvas(monkeypatch):
+    # labels a = [1, 2] and b = [3], padded to a three-row canvas with
+    # the end token 7 and pad 0: a = [1, 2, 7], b = [3, 7, 0]
+    padded = ((1, 2, 7), (3, 7, 0))
+    spec = ClassifySpec(
+        name="topic", aliases=("d",), query_template="", arguments=(),
+        expected_inputs=2, estimated_seconds=0.0,
+        prompt_token_parts=((90,), (91, 92, 93)), labels=("a", "b"),
+        label_token_ids=padded, scoring="canvas")
+    requests = label_requests(spec)
+    assert requests.frame == [] and requests.suffixes == [[91, 92, 93]]
+    assert requests.read_all_rows and requests.targets == [0, 1, 2, 3, 7]
+    targets = requests.targets
+
+    # document 0's canvas rows favor a's tokens, document 1's favor b's
+    def forward(chunk):
+        rows = []
+        for entry in chunk.specs:
+            document = entry["key"][2]
+            for row, token in enumerate(padded[document]):
+                rows.append([-1.0 if t == token else -5.0 for t in targets])
+        return np.asarray(rows, dtype=np.float32)
+
+    monkeypatch.setattr(loop, "pack_chunk", fake_pack)
+    readout = SimpleNamespace(
+        targets=np.asarray(targets), rows=3,
+        dtype=np.dtype((np.float32, (3, 5))),
+        submit=lambda rows, rows_per_answer=None: rows.reshape(-1, 3, 5),
+        result=lambda rows: rows)
+    canvas_pipeline = fake_pipeline(
+        forward_chunk=forward, canvas_ids=(50,), tree_attention=False,
+        canvas_rows=lambda rows: tuple(range(50, 50 + rows)))
+    state = {"torch": fake_torch(), "arena": cpu_arena(64),
+             "pipeline": canvas_pipeline,
+             "chunk_tokens": 64, "label_readout": readout,
+             "input_staging": SimpleNamespace(fixed_tokens=set())}
+    documents = {"d": [[10, 11], [12]]}
+    batch = QuailClassifier(state).classify(spec, [[0], [1]], documents)
+    assert list(batch.scores) == ["a", "b"]
+    assert batch.label_tokens == 2 * 3
+    # each document packs its prefix, the tail, and the three canvas rows
+    assert batch.fresh_tokens + batch.cached_tokens == (3 + 3) + (2 + 3)
+
+
+def test_pack_chunk_reads_every_canvas_row_when_asked():
+    from fakes import cpu_staging
+
+    torch = cpu_staging(pytest.MonkeyPatch())
+    arena = cpu_arena(64)
+    canvas = (90, 91, 92)
+    groups = [dict(key=("d", 0), prefix=[1, 2], f=2, suffixes=[[10]],
+                   read_all_rows=True),
+              dict(key=("d", 1), prefix=[4], f=1, suffixes=[[12]],
+                   read_all_rows=True)]
+    chunk = loop.pack_chunk(torch, arena, groups, attention_mode="unified",
+                            canvas=canvas)
+    assert chunk.input_ids.tolist() == [1, 2, 10, *canvas, 4, 12, *canvas]
+    assert chunk.final_indices.tolist() == [3, 4, 5, 8, 9, 10]
+    assert chunk.rows_per_answer == (3, 3)
+
+
+def test_planner_pads_labels_to_the_canvas_on_a_diffusion_model(tmp_path):
+    from quail.specs import DIFFUSION_GEMMA_26B_FP8
+
+    special = {DIFFUSION_GEMMA_26B_FP8.canvas_end_text: [7],
+               DIFFUSION_GEMMA_26B_FP8.canvas_pad_text: [0]}
+
+    def tokenizer(text):
+        return special.get(text, _bytes(text))
+
+    path = tmp_path / "documents.parquet"
+    pq.write_table(pa.table({"id": [1, 2], "body": ["ab", "cd"]}), path)
+    session = quail.Session(
+        EngineConfig(model=DIFFUSION_GEMMA_26B_FP8.name, device="h100-sxm"),
+        tokenizer=tokenizer)
+    session.register("documents", DocumentProvider.from_parquet(path, id_col="id"))
+    plan = _topic(session).plan()
+    (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
+    assert classify.spec.scoring == "canvas"
+    rows = max(len(_bytes(label_text(label)))
+               for label in ("refund", "shipping", "praise")) + 1
+    for label, ids in zip(classify.spec.labels, classify.spec.label_token_ids):
+        text = _bytes(label_text(label))
+        assert list(ids) == text + [7] + [0] * (rows - len(text) - 1)
+    assert plan.settings["label_scoring"] == "cost model"
+    forced = quail.Session(
+        EngineConfig(model=DIFFUSION_GEMMA_26B_FP8.name, device="h100-sxm",
+                     label_scoring="trie_paths"), tokenizer=tokenizer)
+    forced.register("documents", DocumentProvider.from_parquet(path, id_col="id"))
+    refused = _topic(forced).plan()
+    assert isinstance(refused, Refusal) and "canvas" in refused.reasons[0]
+    forced.close()
+    session.close()

@@ -110,6 +110,24 @@ def label_chain_scores(label_ids, targets, logprobs) -> np.ndarray:
     return scores
 
 
+def canvas_scores(label_ids, targets, logprobs) -> np.ndarray:
+    """Return every label's summed log probability over a diffusion canvas.
+
+    Args:
+        label_ids: One token id sequence per label, each padded to the
+            canvas length with the answer end token and pad tokens.
+        targets: The token ids, one per column of ``logprobs``.
+        logprobs: Shape (canvas rows, targets): row j holds the log
+            probabilities the canvas row j predicts.
+    """
+    column = {token: index for index, token in enumerate(targets)}
+    scores = np.zeros(len(label_ids), dtype=np.float64)
+    for label, ids in enumerate(label_ids):
+        scores[label] = sum(logprobs[row, column[token]]
+                            for row, token in enumerate(ids))
+    return scores
+
+
 def best_label(scores) -> int:
     """Return the index of the highest score; a tie goes to the earlier label."""
     return int(np.argmax(scores))

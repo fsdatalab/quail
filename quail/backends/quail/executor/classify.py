@@ -24,6 +24,10 @@ the partner suffixes are:
 - ``trie_search``: one stage per trie node. Each round a document
   sends one chain, the next node of the label with the highest bound,
   so the winning label resolves first and prunes the rest.
+- ``canvas``: a diffusion model's rule. The whole tail is one suffix
+  and a canvas of one row per padded label token follows it; every
+  canvas row is read, and a label's score sums, row by row, the log
+  probabilities of its padded tokens.
 """
 
 import logging
@@ -41,6 +45,7 @@ from quail.backends.quail.executor.stages import Stage, run_stages
 from quail.execution.labels import (
     RoundScorer,
     best_label,
+    canvas_scores,
     label_chain_scores,
     label_path_scores,
     label_scores,
@@ -107,6 +112,10 @@ def label_requests(spec, targets=None) -> LabelRequests:
     if targets is None:
         targets = (trie_targets(label_trie(ids)) if spec.scoring == "trie_nodes"
                    else sorted({token for label in ids for token in label}))
+    if spec.scoring == "canvas":
+        return LabelRequests(
+            [], [list(tail)], targets, True,
+            lambda logprobs: canvas_scores(ids, targets, logprobs[0]))
     if spec.scoring == "label_chains":
         return LabelRequests(
             frame, [[cue, *label[:-1]] for label in ids], targets, True,
@@ -160,9 +169,15 @@ class QuailClassifier:
         if any(request.read_all_rows != read_all for request in requests):
             raise ValueError("a classify chain's stages read rows one way")
         prefixes = document_prefixes(spec, documents, rows)
-        readout_rows = (max(len(suffix) for request in requests
-                            for suffix in request.suffixes)
-                        if read_all else 1)
+        canvas = None
+        if spec.scoring == "canvas":
+            # the canvas rows follow the tail and are the rows read
+            canvas = state["pipeline"].canvas_rows(len(specs[0].label_token_ids[0]))
+            readout_rows = len(canvas)
+        else:
+            readout_rows = (max(len(suffix) for request in requests
+                                for suffix in request.suffixes)
+                            if read_all else 1)
         readout = state.get("label_readout")
         if (readout is None or list(readout.targets.tolist()) != targets
                 or readout.rows != readout_rows):
@@ -264,7 +279,7 @@ class QuailClassifier:
             state["torch"], state["arena"], state["pipeline"], stages,
             prefixes, state["chunk_tokens"], anchor_keys=keys,
             staging=state["input_staging"], prefix_tree=tree, stats=stats,
-            label=f"classify {spec.name}")
+            label=f"classify {spec.name}", canvas=canvas)
         label_tokens = 0
         streamed = 0     # frame and suffix tokens packed after documents
         position = 0
@@ -276,7 +291,8 @@ class QuailClassifier:
                 for anchor, logprobs in first.items():
                     if labels[index][anchor] is None:
                         labels[index][anchor] = label_of(index, logprobs)
-                suffix_tokens = len(first) * sum(map(len, request.suffixes))
+                suffix_tokens = len(first) * (
+                    len(canvas) if canvas else sum(map(len, request.suffixes)))
                 if state.get("label_traces") and specs[index].scoring == "trie_paths":
                     self.save_traces(specs[index], request, first, readout_rows)
             label_tokens += suffix_tokens

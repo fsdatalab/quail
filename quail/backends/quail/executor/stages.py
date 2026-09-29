@@ -122,7 +122,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                anchor_keys=None, on_settled=None, staging=None,
                attention_mode=None, prefix_tree=None, stats=None,
                limit=None, paged=True, unit="anchors", label=None,
-               default_attention="tree", on_chunk=None):
+               default_attention="tree", on_chunk=None, canvas=None):
     """Run every stage over the documents with one admission.
 
     Args:
@@ -158,6 +158,9 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
             read with the documents that completed a stage in it, as
             (document index, stage, passed) tuples: passed says the
             document went on to the next stage, or survived the last.
+        canvas: The token ids of the canvas packed after every suffix,
+            read whole by a classification; None packs the pipeline's
+            own canvas, a filter's one answer row.
 
     Returns:
         (answers, spans, tokens): answers[j][a] = the row of stage j's
@@ -192,7 +195,8 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
     suffixes = [Suffixes.of(stage.suffixes) for stage in stages]
     # a stage's suffixes read their document: tree unless the plan says
     mode = attention_path(pipeline, attention_mode, default=default_attention)
-    canvas = tuple(pipeline.canvas_ids)
+    # a classification reads every row of its own, longer canvas
+    canvas = tuple(pipeline.canvas_ids if canvas is None else canvas)
     answer_row = pipeline.canvas_answer_row
 
     def entry_rows(a, j, start, end, carried):

@@ -94,6 +94,7 @@ class DiffusionGemmaPipeline(ModelPipeline):
             raise ValueError("the fused qkv kernel expects a weightless v norm")
         self._fold_layer_scalars(model)
         self.scales = [float(layer.layer_scalar) for layer in self.layers]
+        self.vocab = spec.vocab
         self.canvas_ids = canvas_token_ids(spec.vocab, spec.canvas_tokens)
         # an empty canvas reads the answer at the prompt's last row
         self.canvas_answer_row = (spec.canvas_answer_row
@@ -103,6 +104,10 @@ class DiffusionGemmaPipeline(ModelPipeline):
         self.experts = [FP8Experts(layer.moe.experts, self.engine)
                         if layer.enable_moe_block else None
                         for layer in self.layers]
+
+    def canvas_rows(self, rows: int) -> tuple:
+        """The fixed canvas ids for a canvas of ``rows`` rows."""
+        return canvas_token_ids(self.vocab, rows)
 
     def _norm(self, x, module):
         """One of the model's RMS norms, through the engine's kernel."""
