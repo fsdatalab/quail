@@ -1082,7 +1082,8 @@ class Query:
             ).items()
         }}
         survivors = {
-            scan.alias: list(range(len(self._doc_tokens[scan.alias])))
+            scan.alias: pa.array(range(len(self._doc_tokens[scan.alias])),
+                                 pa.int32())
             for scan in scans
         }
 
@@ -1151,13 +1152,15 @@ class Query:
                         "a document id relation needs one alias column"
                     )
                 alias = table.column_names[0]
-                survivors[alias] = table.column(alias).to_pylist()
+                survivors[alias] = (
+                    table.column(alias).combine_chunks().cast(pa.int32()))
 
         for alias, relations in filter_relations.items():
             table = relations[0] if len(relations) == 1 else \
                 pa.concat_tables(relations)
-            positions = table.column("predicate").to_pylist()
-            predicate_order = list(dict.fromkeys(int(pos) for pos in positions))
+            # predicates in the order their first answers appear
+            predicate_order = [
+                int(pos) for pos in pc.unique(table.column("predicate")).to_pylist()]
             predicate_order.extend(
                 position for position in range(len(logical_filters[alias]))
                 if position not in predicate_order
@@ -1165,9 +1168,8 @@ class Query:
             for index, written_pos in enumerate(predicate_order):
                 mask = pc.equal(table.column("predicate"), written_pos)
                 stage_table = table.filter(mask)
-                answered = stage_table.column(alias).to_pylist()
-                answers = stage_table.column("answer").to_pylist()
-                passed = sum(bool(answer) for answer in answers)
+                evaluated = stage_table.num_rows
+                passed = pc.sum(stage_table.column("answer")).as_py() or 0
                 answer_tables["filters"][(alias, written_pos)] = stage_table
                 report["stages"].append(dict(
                     op="filter", alias=alias, stage=index,
@@ -1176,9 +1178,9 @@ class Query:
                         logical_filters[alias][written_pos].selectivity
                     ),
                     observed_selectivity=round(
-                        passed / max(1, len(answered)), 4
+                        passed / max(1, evaluated), 4
                     ),
-                    evaluated=len(answered),
+                    evaluated=evaluated,
                 ))
 
         true_join_tables = {}
@@ -1234,11 +1236,7 @@ class Query:
             ))
             if semantics == "full":
                 true_join_tables[written_pos] = true_answer_rows(table)
-        survivor_arrays = {
-            alias: pa.array(indices, type=pa.int32())
-            for alias, indices in survivors.items()
-        }
         result.answer_tables = answer_tables
-        result.survivor_indices = survivor_arrays
+        result.survivor_indices = survivors
         result.true_join_tables = true_join_tables
         return result
