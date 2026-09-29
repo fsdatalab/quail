@@ -161,7 +161,7 @@ def test_a_canvas_classification_runs_in_its_filter_chain_pipeline(
     settings = Denoising(
         canvas_rows=4, max_steps=5, t_min=0.4, t_max=0.8, entropy_bound=0.1,
         confidence_threshold=0.005, stability_threshold=1, logit_softcap=30.0,
-        stop_token_ids=(0,))
+        stop_token_ids=(0,), turn_close_id=106, pad_id=0)
     spelling = {1: "a", 2: "b", 3: "\n", 5: "x", 6: " "}
     tokenizer = SimpleNamespace(decode=lambda ids, skip_special_tokens: "".join(
         spelling.get(i, "") for i in ids))

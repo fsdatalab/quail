@@ -34,6 +34,9 @@ class Denoising:
             equal the one before for the canvas to be stable.
         logit_softcap: Cap of the tanh applied to the output logits.
         stop_token_ids: Token ids that end the decoded answer.
+        turn_close_id: The token that closes the model's turn, which
+            the ``letters`` rule seeds after the answer's row.
+        pad_id: The padding token, which fills the rows after it.
     """
 
     canvas_rows: int
@@ -45,6 +48,8 @@ class Denoising:
     stability_threshold: int
     logit_softcap: float
     stop_token_ids: tuple[int, ...]
+    turn_close_id: int
+    pad_id: int
 
     def temperature(self, step: int) -> float:
         """The temperature of denoising step ``step``, counted from 0."""

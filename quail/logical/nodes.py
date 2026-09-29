@@ -17,12 +17,23 @@ class ColumnRef:
     type_name: ClassVar[str] = "quail.column_ref"
 
 
+# the text before a label scored after the answer cue, as a word
+# follows a colon
+LABEL_PREFIX = " "
+
+
 @dataclass(frozen=True)
 class Prompt:
     """A bound PROMPT call, split into preamble, frame, and tail.
 
     Token counts are filled at bind time when a tokenizer is given;
     None means the planner must supply counts.
+
+    An AI.CLASSIFY prompt scores each label as ``label_prefix`` and
+    the label's text after the tail. ``lettered`` is the same prompt
+    with its categories lettered, whose labels are the letters in
+    ``letters``; None when the tokenizer has no one-token letter for
+    every label, or for a classification of joined rows.
     """
     template: str
     args: tuple    # tuple[ColumnRef, ...] in placeholder order
@@ -38,6 +49,9 @@ class Prompt:
     preamble_token_ids: tuple = ()
     tail_token_ids: tuple = ()
     label_token_ids: tuple = ()
+    label_prefix: str = LABEL_PREFIX
+    letters: tuple = ()
+    lettered: Optional["Prompt"] = None
 
     type_name: ClassVar[str] = "quail.prompt"
 

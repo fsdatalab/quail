@@ -464,7 +464,7 @@ def test_denoising_steps_keep_low_entropy_rows_until_the_canvas_settles():
     settings = Denoising(
         canvas_rows=4, max_steps=4, t_min=0.4, t_max=0.8, entropy_bound=0.1,
         confidence_threshold=0.005, stability_threshold=1, logit_softcap=30.0,
-        stop_token_ids=(0,))
+        stop_token_ids=(0,), turn_close_id=106, pad_id=0)
     document = DocumentCanvas(settings, 100, (0, 7), conditioning_row=32)
     rng = np.random.default_rng((0, 7))
     assert document.canvas.tolist() == rng.integers(0, 100, 4).tolist()
@@ -527,7 +527,7 @@ def test_denoise_readout_follows_vllm_sampler_arithmetic():
     settings = Denoising(
         canvas_rows=2, max_steps=4, t_min=0.4, t_max=0.8, entropy_bound=0.1,
         confidence_threshold=0.005, stability_threshold=1, logit_softcap=30.0,
-        stop_token_ids=(0,))
+        stop_token_ids=(0,), turn_close_id=106, pad_id=0)
     conditioning = ConditioningRows(torch, hidden, 2, torch.bfloat16, "cpu",
                                     blocks=1)
     first = conditioning.take()

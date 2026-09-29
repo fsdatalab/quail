@@ -5,10 +5,12 @@ classifies the documents still alive and keeps those with an accepted
 label, then classifies what the projection still needs. Each document
 is scored the way the join path scores a pair: its prompt head and
 document stay in KV, the question and category list are written once
-after it, and short suffixes over the label trie read the next
-token's log probabilities. A diffusion model decodes its answer
-instead: every denoising step sends the answer canvas after the
-resident prompt (the ``canvas`` rule).
+after it, and a suffix reads the next token's log probabilities.
+Under the ``letters`` rule the categories are lettered, so every
+label is one token and the cue's row scores them all; the trie rules
+score the labels' own text over short suffixes. A diffusion model
+reads the letter at the first row of a seeded answer canvas, or
+decodes its answer with every denoising step (the ``canvas`` rule).
 """
 
 import math
@@ -61,7 +63,8 @@ def classification_refusal(context) -> Refusal | None:
     elif forced is not None and forced not in LABEL_SCORINGS:
         reason = (f"unknown label scoring rule {forced!r}; "
                   f"the rules are {LABEL_SCORINGS}")
-    elif model.canvas_tokens and forced not in (None, "canvas"):
+    elif model.canvas_tokens and forced not in (None, LETTERS_SCORING,
+                                                "canvas"):
         reason = (f"{model.name!r} scores labels on a canvas; the "
                   f"{forced!r} rule reads the rows of a causal chain")
     elif forced == "canvas" and not model.canvas_tokens:
@@ -115,10 +118,13 @@ def has_label(logical) -> bool:
     )
 
 
-# The label scoring rules the executor runs, in the order they were
-# added; each later rule must return the labels of the first.
-LABEL_SCORINGS = ("trie_paths", "trie_tree", "trie_decode", "canvas")
+# The label scoring rules the executor runs; each rule returns one of
+# the classification's labels.
+LABEL_SCORINGS = ("letters", "trie_paths", "trie_tree", "trie_decode",
+                  "canvas")
 
+# the lettered categories: every label one token, read at one row
+LETTERS_SCORING = "letters"
 EXHAUSTIVE_SCORING = "trie_paths"
 # every node once, in one request: fewest tokens, tree attention only
 TREE_SCORING = "trie_tree"
@@ -142,19 +148,24 @@ def suffix_lengths(scoring: str, labels, canvas_rows: int = 0) -> list[int]:
     """Tokens of each suffix a document streams under one scoring rule.
 
     Every suffix starts with the answer cue's last token. Under
-    ``trie_paths`` it continues with one of the trie's deepest proper
-    prefixes, and under ``trie_tree`` the one suffix holds every trie
-    node once; every row is read. Under ``trie_decode`` a document
-    sends one chain per round, the cue and the tokens decoded so far,
-    for as many rounds as the mean label length rounded up, and reads
-    each chain's last row; how many rounds it needs is decided as it
-    runs. Under ``canvas`` the one suffix is the cue and the
-    ``canvas_rows`` rows of the answer canvas, sent once per denoising
-    step; the canvas rows are read.
+    ``letters`` the one suffix is the cue alone, whose row scores every
+    letter, followed on a canvas model by the ``canvas_rows`` rows of
+    the seeded canvas whose first row is read. Under ``trie_paths`` it
+    continues with one of the trie's deepest proper prefixes, and
+    under ``trie_tree`` the one suffix holds every trie node once;
+    every row is read. Under ``trie_decode`` a document sends one
+    chain per round, the cue and the tokens decoded so far, for as
+    many rounds as the mean label length rounded up, and reads each
+    chain's last row; how many rounds it needs is decided as it runs.
+    Under ``canvas`` the one suffix is the cue and the ``canvas_rows``
+    rows of the answer canvas, sent once per denoising step; the
+    canvas rows are read.
 
     Raises:
         ValueError: The rule is not one of LABEL_SCORINGS.
     """
+    if scoring == LETTERS_SCORING:
+        return [1 + canvas_rows]
     if scoring == "trie_decode":
         rounds = math.ceil(sum(len(ids) for ids in labels) / len(labels))
         return [1 + depth for depth in range(rounds)]
@@ -434,10 +445,20 @@ class _Table:
         """
         head = self.head(call)
         tail = tuple(call.prompt.tail_token_ids)
-        labels = tuple(tuple(self.tokenizer(label_text(label)))
+        prefix = call.prompt.label_prefix
+        labels = tuple(tuple(self.tokenizer(label_text(label, prefix)))
                        for label in call.labels)
+        lettered = None
+        if call.prompt.lettered is not None:
+            letter_head = tuple(self.tokenizer(call.prompt.lettered.preamble))
+            letter_tail = tuple(call.prompt.lettered.tail_token_ids)
+            letter_ids = tuple(tuple(self.tokenizer(label_text(letter, prefix)))
+                               for letter in call.prompt.lettered.letters)
+            lettered = (len(letter_head), len(letter_tail) - 1, letter_ids)
         scoring, simulated = self.choose(live, len(head), len(tail) - 1,
-                                         labels, resident)
+                                         labels, resident, lettered)
+        if scoring == LETTERS_SCORING:
+            head, tail, labels = letter_head, letter_tail, letter_ids
         if scoring == DECODE_SCORING and not decodable(labels):
             raise ClassifyRefusedError(
                 f"the {scoring!r} rule cannot decode the labels of "
@@ -485,7 +506,8 @@ class _Table:
         return simulate(prefixes, frame_tokens, [chains] * len(prefixes),
                         self.chunk, self.capacity or self.budget, self.model,
                         self.device, resident=resident,
-                        canvas_rows=(self.canvas_rows if scoring == "canvas"
+                        canvas_rows=(self.canvas_rows
+                                     if scoring in (LETTERS_SCORING, "canvas")
                                      else self.model.canvas_tokens),
                         rounds=(self.model.denoising.max_steps
                                 if scoring == "canvas" else 1),
@@ -507,19 +529,38 @@ class _Table:
             spec.label_token_ids, False)
         return replace(spec, estimated_seconds=simulated.seconds)
 
-    def choose(self, live, head_tokens, frame_tokens, labels, resident
-               ) -> tuple[str, Simulated]:
+    def choose(self, live, head_tokens, frame_tokens, labels, resident,
+               lettered=None) -> tuple[str, Simulated]:
         """The rule with the least simulated time, and its simulation.
 
-        A forced rule is the one candidate, as is ``canvas`` on a
-        canvas model. Otherwise ``trie_paths`` is a candidate,
-        ``trie_tree`` under tree attention, and ``trie_decode`` for a
-        classification whose documents are not resident from an
-        earlier stage and whose labels a greedy decode can end at.
-        Ties go to fewer label tokens, then the order listed.
+        A forced rule is the one candidate, as is ``letters`` when the
+        prompt has a lettered form: every answer is one token, so the
+        rule reads every label set the same way on every model, and
+        its lettered prompt is priced as written. Without one,
+        ``canvas`` is the candidate on a canvas model, and on a causal
+        model ``trie_paths``, ``trie_tree`` under tree attention, and
+        ``trie_decode`` for a classification whose documents are not
+        resident from an earlier stage and whose labels a greedy
+        decode can end at. Ties go to fewer label tokens, then the
+        order listed.
+
+        Args:
+            live: How many documents are expected.
+            head_tokens: The prompt head's tokens.
+            frame_tokens: The tail's tokens but its last.
+            labels: Each label's token ids.
+            resident: Whether the documents' KV is resident already.
+            lettered: (head tokens, frame tokens, letter token ids) of
+                the lettered prompt; None when the prompt has none.
+
+        Raises:
+            ClassifyRefusedError: ``letters`` is forced without a
+                lettered prompt.
         """
         if self.scoring:
             candidates = [self.scoring]
+        elif lettered is not None:
+            candidates = [LETTERS_SCORING]
         elif self.model.canvas_tokens:
             candidates = ["canvas"]
         else:
@@ -528,10 +569,16 @@ class _Table:
                 candidates.append(TREE_SCORING)
             if not resident and decodable(labels):
                 candidates.append(DECODE_SCORING)
+        if lettered is None and LETTERS_SCORING in candidates:
+            raise ClassifyRefusedError(
+                "the letters rule needs a one-token letter for every "
+                "label, which the tokenizer does not have", 1, 0)
         best = None
         for scoring in candidates:
-            simulated = self.simulate(scoring, live, head_tokens, frame_tokens,
-                                      labels, resident)
+            head, frame, ids = ((head_tokens, frame_tokens, labels)
+                                if scoring != LETTERS_SCORING else lettered)
+            simulated = self.simulate(scoring, live, head, frame, ids,
+                                      resident)
             key = (simulated.seconds, simulated.label_tokens)
             if best is None or key < best[0]:
                 best = (key, scoring, simulated)
@@ -571,8 +618,9 @@ class _Table:
         parts = {alias: (label, frame)
                  for alias, label, frame in call.prompt.label_token_ids}
         note, partner_label = parts[self.alias][1], parts[partner][0]
-        labels = tuple(tuple(self.tokenizer(label_text(label)))
-                       for label in call.labels)
+        labels = tuple(
+            tuple(self.tokenizer(label_text(label, call.prompt.label_prefix)))
+            for label in call.labels)
         block = len(partner_label) + int(round(partner_tokens)) + len(tail) - 1
         chains = [block + length
                   for length in suffix_lengths(EXHAUSTIVE_SCORING, labels)]
@@ -677,10 +725,6 @@ def plan_classify(region, context, *, backend_name: str):
                        and all(predicates[p].expression.call is last_call
                                for p in since)
                        and table.head(item) == table.head(last_call))
-            # a decoded classification's rounds are its own node's
-            # stages, as are a canvas classification's denoising steps
-            joins = follows and nodes[chain].spec.scoring not in (
-                DECODE_SCORING, "canvas")
             try:
                 spec, step = table.classify(item, named[item], live,
                                             resident=follows)
@@ -689,6 +733,11 @@ def plan_classify(region, context, *, backend_name: str):
                                           float("inf")),)
             work += step
             seconds += spec.estimated_seconds
+            # a decoded classification's rounds are its own node's
+            # stages, as are a canvas classification's denoising steps
+            joins = follows and not any(
+                rule in (DECODE_SCORING, "canvas")
+                for rule in (nodes[chain].spec.scoring, spec.scoring))
             if joins:
                 gate = (tuple(predicates[since[0]].expression.accepted)
                         if since else None)

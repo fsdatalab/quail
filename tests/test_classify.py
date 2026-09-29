@@ -824,7 +824,7 @@ def test_classifier_decodes_each_document_with_denoising_steps(monkeypatch):
     settings = Denoising(
         canvas_rows=4, max_steps=5, t_min=0.4, t_max=0.8, entropy_bound=0.1,
         confidence_threshold=0.005, stability_threshold=1, logit_softcap=30.0,
-        stop_token_ids=(0,))
+        stop_token_ids=(0,), turn_close_id=106, pad_id=0)
     spec = ClassifySpec(
         name="topic", aliases=("d",), query_template="", arguments=(),
         expected_inputs=3, estimated_seconds=0.0,
@@ -948,7 +948,7 @@ def test_pack_chunk_reads_every_canvas_row_when_asked():
                         canvas=canvas)
 
 
-def test_planner_decodes_labels_on_a_diffusion_model(tmp_path):
+def test_planner_reads_letters_on_a_diffusion_model(tmp_path):
     from quail.specs import DIFFUSION_GEMMA_26B_FP8
 
     path = tmp_path / "documents.parquet"
@@ -957,24 +957,43 @@ def test_planner_decodes_labels_on_a_diffusion_model(tmp_path):
         EngineConfig(model=DIFFUSION_GEMMA_26B_FP8.name, device="h100-sxm"),
         tokenizer=_bytes)
     session.register("documents", DocumentProvider.from_parquet(path, id_col="id"))
-    # the labels are their own tokens; the model decodes its answer
+    # the reply opens after the turn suffix, so a letter is scored
+    # without a leading space; one read beats 48 denoising steps
     plan = _topic(session).plan()
+    (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
+    assert classify.spec.scoring == "letters"
+    assert [list(ids) for ids in classify.spec.label_token_ids] == [
+        _bytes(letter) for letter in "ABC"[:len(classify.spec.labels)]]
+    assert classify.spec.estimated_seconds > 0
+    assert plan.settings["label_scoring"] == "cost model"
+    # a chain's classifications are one node's stages
+    chained = _chain(session).plan()
+    classifies = [n for n in chained.nodes if isinstance(n, AiClassify)]
+    assert len(classifies) == 1 and len(classifies[0].spec.stages) == 1
+    session.close()
+
+    forced = quail.Session(
+        EngineConfig(model=DIFFUSION_GEMMA_26B_FP8.name, device="h100-sxm",
+                     label_scoring="canvas"), tokenizer=_bytes)
+    forced.register("documents", DocumentProvider.from_parquet(path, id_col="id"))
+    # the labels are their own tokens; the model decodes its answer
+    plan = _topic(forced).plan()
     (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
     assert classify.spec.scoring == "canvas"
     assert [list(ids) for ids in classify.spec.label_token_ids] == [
-        _bytes(label_text(label)) for label in classify.spec.labels]
-    assert classify.spec.estimated_seconds > 0
-    assert plan.settings["label_scoring"] == "cost model"
+        _bytes(label_text(label, "")) for label in classify.spec.labels]
     # a chain's classifications stay separate nodes
-    chained = _chain(session).plan()
+    chained = _chain(forced).plan()
     classifies = [n for n in chained.nodes if isinstance(n, AiClassify)]
     assert len(classifies) == 2 and not any(n.spec.stages for n in classifies)
     # a label longer than the canvas does not fit it
     long_label = "x" * 20
-    refused = session.docs("documents").alias("d").ai_classify(
+    refused = forced.docs("documents").alias("d").ai_classify(
         quail.prompt("What is {0} about?", quail.col("d.body")),
         ["refund", long_label], name="topic").select("d.id", "topic").plan()
     assert isinstance(refused, Refusal) and "16-row" in refused.reasons[0]
+    forced.close()
+
     forced = quail.Session(
         EngineConfig(model=DIFFUSION_GEMMA_26B_FP8.name, device="h100-sxm",
                      label_scoring="trie_paths"), tokenizer=_bytes)
@@ -982,7 +1001,6 @@ def test_planner_decodes_labels_on_a_diffusion_model(tmp_path):
     refused = _topic(forced).plan()
     assert isinstance(refused, Refusal) and "canvas" in refused.reasons[0]
     forced.close()
-    session.close()
 
 
 def test_planner_prices_the_canvas_rule_as_rounds_of_denoising_steps():
@@ -1312,3 +1330,179 @@ def test_label_readout_projects_only_the_targets_when_unnormalized():
     normalized = AsyncLabelLogprobs(torch, torch.nn.functional, head,
                                     [5, 17, 299]).logprobs(hidden)
     assert torch.equal(got.argmax(1), normalized.argmax(1))
+
+
+def _letter_tokens(text):
+    """Bytes, but a one- or two-letter answer after a space is one token."""
+    import re
+    if re.fullmatch(r" [A-Za-z]{1,2}", text):
+        return [10_000 * (len(text) - 1) + sum(map(ord, text[1:]))]
+    return _bytes(text)
+
+
+def test_choice_letters_are_one_token_each_and_capped():
+    from quail.logical.prompts import MAX_LETTERS, choice_letters
+
+    assert choice_letters(30) == tuple("ABCDEFGHIJKLMNOPQRSTUVWXYZabcd")
+    assert choice_letters(60)[52:56] == ("AA", "AB", "AC", "AD")
+    # a two-letter answer is three bytes, so the byte tokenizer
+    # runs out after the single letters
+    same = lambda text: [1] if len(text) == 2 else _bytes(text)  # noqa: E731
+    assert choice_letters(60, same) == ("A",)    # one token id for all
+    assert len(choice_letters(60, _letter_tokens)) == 60
+    assert choice_letters(60, _bytes) == ()
+    # without a prefix a single letter is one byte
+    assert len(choice_letters(60, _bytes, prefix="")) == 52
+    with pytest.raises(CompileError, match="at most"):
+        choice_letters(MAX_LETTERS + 1)
+
+
+def test_classify_prompt_letters_its_categories():
+    from quail.logical.prompts import LETTERS_INSTRUCTION, answer_prefix
+
+    ref = ColumnRef("t", "agent_traces", "trace")
+    bound = bind_classify_prompt(AGENT_OUTCOME, (ref,), OUTCOMES,
+                                 AGENT_OUTCOME_DESCRIPTIONS)
+    lettered = bound.lettered
+    assert lettered.letters == tuple("ABCD") and bound.letters == ()
+    assert lettered.preamble == bound.preamble
+    assert LETTERS_INSTRUCTION in lettered.tail
+    for letter, label, description in zip(
+            "ABCD", OUTCOMES, AGENT_OUTCOME_DESCRIPTIONS):
+        assert f"\n- {letter}: {label} ({description})" in lettered.tail
+        assert f"\n- {label}: {description}" in bound.tail
+    assert lettered.lettered is None
+    # a label follows the answer cue after a space; a reply that opens
+    # a model turn starts without one
+    assert bound.label_prefix == " " and answer_prefix(("", "")) == " "
+    turned = bind_classify_prompt(AGENT_OUTCOME, (ref,), OUTCOMES,
+                                  turn=("<user>", "<model>"))
+    assert turned.label_prefix == "" and turned.lettered.tail.endswith("<model>")
+    # no lettered prompt when the tokenizer has no one-token letters
+    assert bind_classify_prompt(AGENT_OUTCOME, (ref,), OUTCOMES,
+                                tokenizer=_bytes).lettered is None
+    tokenized = bind_classify_prompt(AGENT_OUTCOME, (ref,), OUTCOMES,
+                                     tokenizer=_letter_tokens)
+    assert list(tokenized.lettered.tail_token_ids) == _bytes(
+        tokenized.lettered.tail.replace("{0}", ""))
+
+
+def test_planner_reads_letters_at_the_cue_row(tmp_path):
+    from quail.cost import budgets
+    from quail.planner.classify import _Table
+
+    path = tmp_path / "documents.parquet"
+    pq.write_table(pa.table({"id": [1, 2], "body": ["ab", "cd"]}), path)
+    session = quail.Session(EngineConfig(model="qwen3-4b-fp8", device="h100-sxm"),
+                            tokenizer=_letter_tokens)
+    session.register("documents", DocumentProvider.from_parquet(path, id_col="id"))
+    plan = _topic(session).plan()
+    (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
+    assert classify.spec.scoring == "letters"
+    assert classify.spec.labels == ("refund", "shipping", "praise")
+    assert [list(ids) for ids in classify.spec.label_token_ids] == [
+        _letter_tokens(" A"), _letter_tokens(" B"), _letter_tokens(" C")]
+    head, tail = classify.spec.prompt_token_parts
+    assert bytes(tail).decode().endswith(
+        "\n- A: refund\n- B: shipping\n- C: praise\nANSWER:")
+    # a chain reads the letters of both classifications at their cues
+    chained = _chain(session).plan()
+    (node,) = [n for n in chained.nodes if isinstance(n, AiClassify)]
+    assert node.spec.scoring == "letters" and len(node.spec.stages) == 1
+    assert node.spec.stages[0].spec.scoring == "letters"
+    session.close()
+    # the trie rules keep the prompt that names the labels
+    forced = quail.Session(EngineConfig(model="qwen3-4b-fp8", device="h100-sxm",
+                                        label_scoring="trie_paths"),
+                           tokenizer=_letter_tokens)
+    forced.register("documents", DocumentProvider.from_parquet(path, id_col="id"))
+    (classify,) = [n for n in _topic(forced).plan().nodes
+                   if isinstance(n, AiClassify)]
+    assert classify.spec.scoring == "trie_paths"
+    assert bytes(classify.spec.prompt_token_parts[1]).decode().endswith(
+        "\n- refund\n- shipping\n- praise\nANSWER:")
+    forced.close()
+    # forced letters without a lettered prompt is refused
+    forced = quail.Session(EngineConfig(model="qwen3-4b-fp8", device="h100-sxm",
+                                        label_scoring="letters"),
+                           tokenizer=_bytes)
+    forced.register("documents", DocumentProvider.from_parquet(path, id_col="id"))
+    refused = _topic(forced).plan()
+    assert isinstance(refused, Refusal) and "one-token letter" in refused.reasons[0]
+    forced.close()
+
+    # the letters rule streams the cue alone
+    model = QWEN3_4B_FP8
+    chunk = budgets.chunk_budget(model, H100_SXM)
+    table = _Table(alias="d", mean=200.0, longest=300, budget=chunk,
+                   chunk=chunk, scoring=None, backend_name="quail",
+                   model=model, device=H100_SXM, tokenizer=_bytes,
+                   capacity=budgets.arena_tokens(model, H100_SXM, chunk),
+                   lengths=(200,) * 1000)
+    long_labels = ((1, 2, 3, 4), (1, 2, 5, 6), (7, 8, 9, 10))
+    scoring, simulated = table.choose(1000, 20, 30, long_labels, False,
+                                      lettered=(20, 34, ((7,), (8,), (9,))))
+    assert scoring == "letters" and simulated.label_tokens == 1000
+    assert table.choose(1000, 20, 30, long_labels, False)[0] != "letters"
+
+
+def test_classifier_reads_the_letter_at_the_first_canvas_row(monkeypatch):
+    from quail.backends.quail.executor.denoise import CANVAS_SEED
+    from quail.specs.base import Denoising
+
+    settings = Denoising(
+        canvas_rows=4, max_steps=5, t_min=0.4, t_max=0.8, entropy_bound=0.1,
+        confidence_threshold=0.005, stability_threshold=1, logit_softcap=30.0,
+        stop_token_ids=(0,), turn_close_id=6, pad_id=0)
+    spec = ClassifySpec(
+        name="topic", aliases=("d",), query_template="", arguments=(),
+        expected_inputs=2, estimated_seconds=0.0,
+        prompt_token_parts=((90,), (91, 92, 93)), labels=("a", "b"),
+        label_token_ids=((1,), (2,)), scoring="letters")
+    vocab = 8
+    wanted = {0: 1, 1: 2}      # document index -> the letter its first row favors
+    packed = {}
+
+    def forward(chunk):
+        rows = []
+        for entry in chunk.specs:
+            row = entry["key"][2]
+            packed[row] = list(entry["canvas"])
+            # the frame and the cue pack as one entry before the canvas
+            assert [list(s) for s in entry["suffixes"]] == [[91, 92, 93]]
+            assert entry["read_all_rows"] and entry.get("conditioning") is None
+            for position in range(settings.canvas_rows):
+                rows.append([-1.0 if position == 0 and token == wanted[row]
+                             else -5.0 for token in (1, 2)])
+        return np.asarray(rows, dtype=np.float32)
+
+    def submit(rows, rows_per_answer=None):
+        padded = np.full((len(rows_per_answer), 4, 2), np.nan, np.float32)
+        start = 0
+        for answer, count in enumerate(rows_per_answer):
+            padded[answer, :count] = rows[start:start + count]
+            start += count
+        return padded
+
+    monkeypatch.setattr(loop, "pack_chunk", fake_pack)
+    readout = SimpleNamespace(targets=np.asarray([1, 2]), rows=4,
+                              dtype=np.dtype((np.float32, (4, 2))),
+                              submit=submit, result=lambda rows: rows)
+    state = {"torch": fake_torch(), "arena": cpu_arena(64),
+             "pipeline": fake_pipeline(forward_chunk=forward, canvas_ids=(7,),
+                                       tree_attention=False),
+             "chunk_tokens": 64, "label_readout": readout,
+             "model_spec": SimpleNamespace(name="tiny", vocab=vocab,
+                                           denoising=settings),
+             "input_staging": SimpleNamespace(fixed_tokens=set())}
+    documents = {"d": [[9]] * 4 + [[10, 11], [12]]}
+    batch = QuailClassifier(state).classify(spec, [[4], [5]], documents)
+    assert list(batch.scores) == ["a", "b"]
+    # each canvas: a random token from the document's row, the turn
+    # close, then padding
+    for index, row in enumerate((4, 5)):
+        noise = np.random.default_rng((CANVAS_SEED, row, 0)).integers(0, vocab)
+        assert packed[index] == [noise, 6, 0, 0]
+    # the cue and the canvas after the prompt and the frame, once
+    assert batch.label_tokens == 2 * (1 + 4)
+    assert batch.fresh_tokens + batch.cached_tokens == (3 + 2) + 2 * (2 + 5)

@@ -39,7 +39,7 @@ DIFFUSION_GEMMA_26B_FP8 = ModelSpec(
         canvas_rows=16, max_steps=48, t_min=0.4, t_max=0.8,
         entropy_bound=0.1, confidence_threshold=0.005,
         stability_threshold=1, logit_softcap=30.0,
-        stop_token_ids=(1, 106, 50)),
+        stop_token_ids=(1, 106, 50), turn_close_id=106, pad_id=0),
     turn_prefix="<bos><|turn>user\n",
     turn_suffix="<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
     prompt_format="gemma4-chat-nonthinking-v1",

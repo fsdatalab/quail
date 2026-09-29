@@ -291,12 +291,22 @@ WHERE AI.CLASSIFY(PROMPT('What sentiment does this review express?\n\n{0}', r.bo
 The call in `SELECT` and the call in `WHERE` are the same, so Quail
 classifies each review once and uses its label for both.
 
-The model does not write the label as free text. Quail places each
-label after the prompt and scores it as the sum of the log
-probabilities of the label's tokens. The document gets the label with
-the highest score. A tie goes to the label listed first.
-DiffusionGemma decodes its answer instead. A document whose answer is
-not one of the labels is left out of the result.
+The model does not write the label as free text. Quail letters the
+categories (`A: refund`, `B: praise`, ...), asks for the letter, and
+reads the letters' probabilities at the answer's first token in one
+forward pass. The document gets the letter with the highest
+probability; a tie goes to the label listed first. Past `Z` the
+letters continue with `a` to `z` and then `AA` onward, up to 255
+labels. On DiffusionGemma the answer's first token is the first row
+of a seeded answer canvas, read in one denoising step. Every document
+gets a label.
+
+Two other rules stay available through `EngineConfig(label_scoring=...)`:
+`trie_paths` and `trie_tree` score each label's own text as the sum
+of its tokens' log probabilities, and `trie_decode` decodes the label
+token by token; `canvas` has DiffusionGemma decode its answer with
+its own denoising steps, and a document whose answer is not one of
+the labels is left out of the result.
 
 #### Return labels
 

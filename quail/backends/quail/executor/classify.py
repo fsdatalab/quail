@@ -5,6 +5,12 @@ and the classification tail, all but its last token, is written once
 after them as the anchor's frame. The label scoring rule decides what
 the partner suffixes are:
 
+- ``letters``: the categories are lettered, so every label is one
+  token and the one suffix is the tail's last token, whose row scores
+  them all. On a diffusion model the suffix packs a seeded canvas
+  after the cue: a random token at the reply's first row, the turn
+  close, and padding; one read-only denoising step, and the first
+  row's log probabilities score the letters.
 - ``trie_paths``: one suffix per deepest proper prefix of the label
   trie, the tail's last token followed by the prefix. Every row is
   read and returns every label token, so the cue's row scores all
@@ -117,7 +123,8 @@ def label_requests(spec, targets=None) -> LabelRequests:
             frame, [tokens], targets, True,
             lambda logprobs: tree_scores(ids, chains, targets, logprobs[0]),
             chains=chains)
-    if spec.scoring == "trie_paths":
+    if spec.scoring in ("trie_paths", "letters"):
+        # one-token labels give the one path (): the cue alone
         paths = trie_paths(ids)
         return LabelRequests(
             frame, [[cue, *path] for path in paths], targets, True,
@@ -214,6 +221,7 @@ class ClassifyStages:
     """
 
     conditioning = None     # a canvas classification's ConditioningRows
+    canvas_rows = 0         # rows of a letters stage's canvas on a canvas model
     seeds = None            # document index -> its canvas seed; the index itself
     partners = None         # JoinPartners, for joined rows
     pair_labels = None      # (anchor index, partner index) -> label, for joined rows
@@ -241,6 +249,12 @@ class ClassifyStages:
             max(len(suffix) for request in requests
                 for suffix in request.suffixes) if read_all else 1)
         self.read_all = read_all
+        # a letters stage on a canvas model reads its canvas's rows
+        self.canvas_rows = 0
+        denoising = getattr(state.get("model_spec"), "denoising", None)
+        if spec.scoring == "letters" and denoising is not None:
+            self.canvas_rows = denoising.canvas_rows
+            self.readout_rows = readout_rows = self.canvas_rows
         # every label read at the same row needs no normalizer: one-token
         # labels at the cue row
         same_rows = all(len(ids) == 1 for stage in specs
@@ -263,7 +277,9 @@ class ClassifyStages:
                     requests=((lambda key, index=index: self.gate(index, key))
                               if index else None),
                     read_all_rows=read_all, label=stage_spec.name,
-                    chains=request.chains))
+                    chains=request.chains,
+                    **(self._letter_canvas(state, index)
+                       if self.canvas_rows else {})))
                 continue
             decoder = GreedyDecoder(stage_spec.label_token_ids, targets, count)
             self.decoders[index] = decoder
@@ -407,6 +423,28 @@ class ClassifyStages:
                              canvas_rows=settings.canvas_rows, step=number)
                        for number in range(settings.max_steps)]
 
+    def _letter_canvas(self, state, index) -> dict:
+        """The Stage fields of a letters stage on a canvas model.
+
+        The stage's one suffix, the cue, packs a canvas after it as one
+        entry: a random token at the reply's first row, the turn close,
+        and padding. The random token is drawn from the document's row
+        and the stage's index, so an answer is the same in any batch.
+        """
+        model_spec = state["model_spec"]
+        settings = model_spec.denoising
+        template = np.full(settings.canvas_rows, settings.pad_id, dtype=np.int64)
+        template[1] = settings.turn_close_id
+
+        def canvas(anchor):
+            rng = np.random.default_rng((CANVAS_SEED, self.seed(anchor), index))
+            ids = template.copy()
+            ids[0] = rng.integers(0, model_spec.vocab)
+            return ids, None
+
+        return dict(single=True, canvas=canvas,
+                    canvas_rows=settings.canvas_rows)
+
     def seed(self, anchor) -> int:
         """The document's canvas seed: its index unless ``seeds`` says."""
         return int(anchor if self.seeds is None else self.seeds[anchor])
@@ -472,7 +510,9 @@ class ClassifyStages:
                     if self.labels[index][anchor] is None:
                         self.labels[index][anchor] = self.label_of(
                             index, logprobs)
-                suffix_tokens = len(first) * sum(map(len, request.suffixes))
+                # a letters stage on a canvas model streams its canvas too
+                suffix_tokens = len(first) * (sum(map(len, request.suffixes))
+                                              + self.canvas_rows)
             label_tokens += suffix_tokens
             # a frame equal to the stage before's is already in KV
             written = (index == 0
