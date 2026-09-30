@@ -336,9 +336,8 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
         async_answers=SimpleNamespace(submit=lambda v: v, result=lambda v: v,
                                       dtype=None),
         answer_rows=object(), chunk_tokens=64)
-    execution._state.update(
-        model_spec=SimpleNamespace(name="tiny", vocab=vocab,
-                                   answer_canvas=settings))
+    execution.loaded_model.model_spec = SimpleNamespace(
+        name="tiny", vocab=vocab, answer_canvas=settings)
     docs = {"r": [[DOC + d] * (3 + d) for d in range(4)],
             "p": [[PARTNER + d] for d in range(2)]}
     state = {
@@ -438,7 +437,7 @@ def test_streamed_classification_labels_survivors_with_their_kv_resident(
             start += count
         return padded
 
-    execution.state["label_readout"] = SimpleNamespace(
+    execution.loaded_model.label_readout = SimpleNamespace(
         targets=np.asarray(TARGETS), rows=1,
         dtype=np.dtype((np.float32, (1, len(TARGETS)))), submit=submit,
         result=lambda rows: rows)

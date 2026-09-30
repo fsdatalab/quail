@@ -4,17 +4,18 @@ import time
 
 from quail.backends.quail.executor import loop
 from quail.backends.quail.executor.stages import Stage
+from quail.backends.quail.executor.state import QueryExecutionState
 from quail.execution.tokens import prefix_tree
 from quail.physical import AiClassify
 from quail.progress import logger
 
 
-def input_staging(state):
-    """The node's reusable input transfer buffers."""
-    if "input_staging" not in state:
-        state["input_staging"] = loop.InputStaging(state["torch"])
-    state["input_staging"].fixed_tokens.clear()
-    return state["input_staging"]
+def input_staging(state: QueryExecutionState):
+    """Return reusable transfer buffers with an empty fixed-token cache."""
+    if state.loaded_model.input_staging is None:
+        state.loaded_model.input_staging = loop.InputStaging(state.torch)
+    state.loaded_model.input_staging.fixed_tokens.clear()
+    return state.loaded_model.input_staging
 
 
 class StagesPart:
@@ -154,14 +155,3 @@ def gpu_seconds(torch, spans, inputs) -> float:
 def chunks(spans, inputs) -> int:
     """Forward chunks the spans' rows ran in; 0 unless timing was asked for."""
     return len(spans) if inputs.get("gpu_timing") else 0
-
-
-def require_execution_state(state) -> None:
-    """Check that the model and query have been attached."""
-    missing = {
-        "torch", "async_answers", "chunk_tokens",
-        "arena", "pipeline",
-    } - set(state)
-    if missing:
-        raise RuntimeError(
-            f"Quail model execution is missing state {sorted(missing)}")

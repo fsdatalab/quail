@@ -35,10 +35,11 @@ from typing import Callable
 
 import numpy as np
 
-from quail.backends.quail.executor.loop import InputStaging
 from quail.backends.quail.executor.model import full_output_head
+from quail.backends.quail.executor.parts import input_staging
 from quail.backends.quail.executor.readout import AsyncLabelLogprobs
 from quail.backends.quail.executor.stages import Stage, run_stages
+from quail.backends.quail.executor.state import QueryExecutionState
 from quail.execution.labels import (
     GreedyDecoder,
     best_label,
@@ -145,18 +146,18 @@ class JoinPartners:
     kept: Callable[[int], list]
 
 
-def _label_readout(state, targets, rows: int, normalize: bool):
-    """The label readout kept on the state, rebuilt when its shape changes."""
-    readout = state.get("label_readout")
+def _label_readout(state: QueryExecutionState, targets, rows: int, normalize: bool):
+    """Return the model's label readout, matching targets and shape."""
+    readout = state.loaded_model.label_readout
     if (readout is None or list(readout.targets.tolist()) != targets
             or readout.rows != rows
             or getattr(readout, "normalize", normalize) != normalize):
-        torch = state["torch"]
-        head = full_output_head(state["model"])
+        torch = state.torch
+        head = full_output_head(state.loaded_model.model)
         readout = AsyncLabelLogprobs(
             torch, torch.nn.functional, head, targets, rows=rows,
             normalize=normalize)
-        state["label_readout"] = readout
+        state.loaded_model.label_readout = readout
         logger.info("label readout: head %s x %s in %s, %s targets, "
                     "%s rows per request, %s", *head.shape,
                     str(head.dtype).replace("torch.", ""), len(targets),
@@ -169,14 +170,14 @@ class ClassifyStages:
 
     One stage for scoring all labels, or one per trie depth under
     ``trie_decode``. The stages
-    read the label readout kept on the state, rebuilt when the targets
+    read the label readout kept on the model, rebuilt when the targets
     or rows change. A classification of joined rows has one stage: it
     sends each anchor, for every partner the join kept with it, the
     partner's label and document, the question, and the cue; its
     labels are by (anchor, partner).
 
     Args:
-        state: The executor state.
+        state: The bound query and its loaded model.
         spec: The classification.
         count: How many documents the stages run over.
         index_of: Callable(admission key) -> the document's index.
@@ -191,7 +192,7 @@ class ClassifyStages:
     partners = None         # JoinPartners, for joined rows
     pair_labels = None      # (anchor index, partner index) -> label, for joined rows
 
-    def __init__(self, state, spec, count, index_of, on_label=None,
+    def __init__(self, state: QueryExecutionState, spec, count, index_of, on_label=None,
                  partners=None):
         self.spec = spec
         self.index_of = index_of
@@ -205,7 +206,7 @@ class ClassifyStages:
         self.readout_rows = readout_rows = (
             max(map(len, request.suffixes)) if read_all else 1)
         # a letters stage on a canvas model reads its canvas's rows
-        answer_canvas = getattr(state.get("model_spec"), "answer_canvas", None)
+        answer_canvas = getattr(state.loaded_model.model_spec, "answer_canvas", None)
         if spec.scoring == "letters" and answer_canvas is not None:
             self.canvas_rows = answer_canvas.rows
             self.readout_rows = readout_rows = self.canvas_rows
@@ -256,7 +257,7 @@ class ClassifyStages:
                 frame=request.frame, requests=ask, decide=round_read,
                 read_all_rows=False, label=f"{spec.name} round {round}"))
 
-    def _joined_stages(self, state, spec, count, partners):
+    def _joined_stages(self, state: QueryExecutionState, spec, count, partners):
         """One stage over the anchors: each partner's block, the question, the cue."""
         if spec.scoring != "letters":
             raise ValueError("a classification of joined rows reads letters, "
@@ -300,7 +301,7 @@ class ClassifyStages:
             requests=ask, decide=score, read_all_rows=True,
             read_rows=[1] * len(suffixes), label=spec.name)]
 
-    def _letter_canvas(self, state) -> Callable[[int, int], np.ndarray]:
+    def _letter_canvas(self, state: QueryExecutionState) -> Callable[[int, int], np.ndarray]:
         """Callable(document index, draw) -> the canvas a letters read packs.
 
         The canvas follows the cue: a random token at the reply's first
@@ -308,7 +309,7 @@ class ClassifyStages:
         from the document's row and the draw, so an answer is the same
         in any batch.
         """
-        model_spec = state["model_spec"]
+        model_spec = state.loaded_model.model_spec
         settings = model_spec.answer_canvas
         template = np.full(settings.rows, settings.pad_id, dtype=np.int64)
         template[1] = settings.turn_close_id
@@ -417,7 +418,7 @@ class ClassifyStages:
 class QuailClassifier:
     """Classify document rows with Quail's token admission and KV arena."""
 
-    def __init__(self, state):
+    def __init__(self, state: QueryExecutionState):
         self.state = state
 
     def classify(self, spec, rows, documents) -> RerankerBatch:
@@ -428,14 +429,12 @@ class QuailClassifier:
         state = self.state
         rows = np.asarray(rows, dtype=np.int32).reshape(-1)
         prefixes = document_prefixes(spec, documents, rows)
-        if "input_staging" not in state:
-            state["input_staging"] = InputStaging(state["torch"])
-        state["input_staging"].fixed_tokens.clear()
+        staging = input_staging(state)
         keys = [("classify", spec.name, index) for index in range(len(rows))]
         tree = None
         if spec.share_prefixes:
             started = time.perf_counter()
-            tree = prefix_tree(prefixes, state["arena"].page_tokens)
+            tree = prefix_tree(prefixes, state.loaded_model.arena.page_tokens)
             logger.info(
                 "prefix sharing on %s: %s documents borrow %s tokens "
                 "(tree built in %.2f s)", spec.name, len(prefixes),
@@ -446,9 +445,10 @@ class QuailClassifier:
         plan.seeds = rows
         stats = {}
         answers, spans, fresh = run_stages(
-            state["torch"], state["arena"], state["pipeline"], plan.stages,
-            prefixes, state["chunk_tokens"], anchor_keys=keys,
-            staging=state["input_staging"], prefix_tree=tree, stats=stats,
+            state.torch, state.loaded_model.arena, state.loaded_model.pipeline,
+            plan.stages,
+            prefixes, state.chunk_tokens, anchor_keys=keys,
+            staging=staging, prefix_tree=tree, stats=stats,
             label=f"classify {spec.name}")
         suffix_tokens, streamed = plan.finish(answers)
         total = sum(map(len, prefixes)) + streamed
@@ -460,9 +460,9 @@ class QuailClassifier:
         """The labels and token counts of one run, with its GPU time when timed."""
         state = self.state
         gpu_s = 0.0
-        if state.get("gpu_timing"):
+        if state.gpu_timing:
             # every chunk's answers were read, so its end event completed
-            state["torch"].cuda.synchronize()
+            state.torch.cuda.synchronize()
             gpu_s = sum(start.elapsed_time(end)
                         for _, _, start, end in spans) / 1000.0
         return RerankerBatch(
@@ -471,4 +471,4 @@ class QuailClassifier:
             borrowed_tokens=stats.get("borrowed_tokens", 0),
             pack_s=stats.get("pack_s", 0.0),
             gpu_s=gpu_s,
-            chunks=len(spans) if state.get("gpu_timing") else 0)
+            chunks=len(spans) if state.gpu_timing else 0)

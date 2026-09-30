@@ -16,11 +16,12 @@ from quail.backends.quail.executor.parts import (
     report_chain_transitions,
 )
 from quail.backends.quail.executor.stages import run_stages
+from quail.backends.quail.executor.state import QueryExecutionState
 from quail.execution.tokens import DocumentKeys, DocumentPrefixes
 from quail.physical import AiClassify, AiFilter, AiJoin, Filter, Foreign
 
 
-def execute_pipeline(state, pipeline, inputs, context) -> dict:
+def execute_pipeline(state: QueryExecutionState, pipeline, inputs, context) -> dict:
     """Run one table's chain of per-document operators as one run.
 
     The members' stages are concatenated and driven by one stage
@@ -40,7 +41,7 @@ def execute_pipeline(state, pipeline, inputs, context) -> dict:
     Returns:
         Node id -> NodeResult for every member.
     """
-    state["gpu_timing"] = bool(context.state.get("gpu_timing", False))
+    state.gpu_timing = bool(context.state.get("gpu_timing", False))
     members = list(pipeline.members)
     alias = pipeline.alias
     first = members[0]
@@ -92,17 +93,18 @@ def execute_pipeline(state, pipeline, inputs, context) -> dict:
         stages = gated_stages(parts + [own])
         stats = {}
         every, spans, tokens = run_stages(
-            state["torch"], state["arena"], state["pipeline"], stages,
-            prefixes, state["chunk_tokens"],
+            state.torch, state.loaded_model.arena, state.loaded_model.pipeline, stages,
+            prefixes, state.chunk_tokens,
             anchor_keys=DocumentKeys(alias, ids),
             attention_mode=getattr(first, "attention", None) or None,
-            prefix_tree=execution_prefix_tree(first, prefixes, state["arena"]),
+            prefix_tree=execution_prefix_tree(
+                first, prefixes, state.loaded_model.arena),
             stats=stats, staging=input_staging(state),
             on_chunk=lambda transitions: report_chain_transitions(
                 parts + [own], transitions),
             label=f"pipeline {alias} ({len(stages)} stages)")
         complete_chain(parts + [own], every, spans, tokens, stats,
-                       state["torch"], gpu_inputs)
+                       state.torch, gpu_inputs)
     for part in parts:
         results[part.node.node_id] = part.result_value
     if not joins:
@@ -119,10 +121,10 @@ def execute_pipeline(state, pipeline, inputs, context) -> dict:
     return results
 
 
-def _part(state, node, ids, parts, inputs, context):
+def _part(state: QueryExecutionState, node, ids, parts, inputs, context):
     """The pipeline part for one member, after the parts before it."""
     if isinstance(node, AiFilter):
-        return FilterPart(node, ids, state["async_answers"])
+        return FilterPart(node, ids, state.async_answers)
     if isinstance(node, AiClassify):
         return classification_part(state, node, ids, parts)
     if isinstance(node, Filter):

@@ -9,23 +9,22 @@ from quail.backends.quail.executor.parts import (
     gpu_seconds,
     input_staging,
     report_chain_transitions,
-    require_execution_state,
     stage_spans,
 )
 from quail.backends.quail.executor.stages import Stage, run_stages
+from quail.backends.quail.executor.state import QueryExecutionState
 from quail.backends.quail.graph import stage_partner_lists
 from quail.execution.runner import NodeMetrics, NodeResult
 from quail.execution.tokens import DocumentKeys
 
 
-def execute_join(state, node, inputs) -> NodeResult:
+def execute_join(state: QueryExecutionState, node, inputs) -> NodeResult:
     """Run a join with any preceding and following pipeline parts."""
-    require_execution_state(state)
-    torch = state["torch"]
-    arena = state["arena"]
-    pipeline = state["pipeline"]
-    async_answers = state["async_answers"]
-    chunk_tokens = state["chunk_tokens"]
+    torch = state.torch
+    arena = state.loaded_model.arena
+    pipeline = state.loaded_model.pipeline
+    async_answers = state.async_answers
+    chunk_tokens = state.chunk_tokens
 
     stage_frames = inputs["stage_frames"]
     chain = inputs.get("chain")

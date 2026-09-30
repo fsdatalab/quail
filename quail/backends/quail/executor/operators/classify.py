@@ -4,6 +4,7 @@ import numpy as np
 import pyarrow as pa
 
 from quail.backends.quail.executor.classify import ClassifyStages, JoinPartners
+from quail.backends.quail.executor.state import QueryExecutionState
 from quail.execution.reranker import (
     _score_table,
     attach_prior_columns,
@@ -15,7 +16,7 @@ from quail.physical import AiClassify, ValueType
 from quail.progress import answer_sink
 
 
-def classification_part(state, node, ids, parts):
+def classification_part(state: QueryExecutionState, node, ids, parts):
     """Prepare a classification with the labels its inputs provide."""
     position = {document: index for index, document in enumerate(ids)}
     plan = ClassifyStages(state, node.spec, len(ids),
@@ -29,7 +30,8 @@ def classification_part(state, node, ids, parts):
     return ClassifyPart(node, ids, plan, priors)
 
 
-def joined_classification(state, node, join, ids, join_inputs, context):
+def joined_classification(state: QueryExecutionState, node, join, ids,
+                          join_inputs, context):
     """The part classifying the rows the join keeps, on its anchors."""
     if not isinstance(node, AiClassify) or node.spec.partner is None:
         raise TypeError(

@@ -17,6 +17,7 @@ from quail.backends.quail.executor.classify import (
     label_requests,
 )
 from quail.backends.quail.executor.readout import AsyncLabelLogprobs
+from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
 from quail.bench.quailb import run_output
 from quail.bench.substrait import read_plan
 from quail.catalog import DocumentProvider
@@ -134,10 +135,19 @@ def test_classifier_reads_the_letters_at_the_cue_row(monkeypatch):
             dtype=np.float32)
 
     monkeypatch.setattr(loop, "pack_chunk", fake_pack)
-    state = {"torch": fake_torch(), "arena": cpu_arena(64),
-             "pipeline": fake_pipeline(forward_chunk=forward_single),
-             "chunk_tokens": 64, "label_readout": readout,
-             "input_staging": SimpleNamespace(fixed_tokens=set())}
+    state = QueryExecutionState(
+        loaded_model=LoadedModelState(
+            arena=cpu_arena(64),
+            pipeline=fake_pipeline(forward_chunk=forward_single),
+            label_readout=readout,
+            input_staging=SimpleNamespace(fixed_tokens=set()),
+            model=object(),
+        ),
+        torch=fake_torch(),
+        chunk_tokens=64,
+        answer_rows=object(),
+        async_answers=object(),
+    )
     batch = QuailClassifier(state).classify(single, [[0], [1]], documents)
     assert list(batch.scores) == ["a", "b"]
     assert batch.suffix_tokens == 2 * 1
@@ -187,10 +197,19 @@ def test_classifier_decodes_one_token_per_round(monkeypatch):
         dtype=np.dtype((np.float32, (4,))),
         submit=lambda rows, rows_per_answer=None: rows,
         result=lambda rows: rows)
-    state = {"torch": fake_torch(), "arena": cpu_arena(64),
-             "pipeline": fake_pipeline(forward_chunk=forward),
-             "chunk_tokens": 64, "label_readout": readout,
-             "input_staging": SimpleNamespace(fixed_tokens=set())}
+    state = QueryExecutionState(
+        loaded_model=LoadedModelState(
+            arena=cpu_arena(64),
+            pipeline=fake_pipeline(forward_chunk=forward),
+            label_readout=readout,
+            input_staging=SimpleNamespace(fixed_tokens=set()),
+            model=object(),
+        ),
+        torch=fake_torch(),
+        chunk_tokens=64,
+        answer_rows=object(),
+        async_answers=object(),
+    )
     batch = QuailClassifier(state).classify(spec, [[0], [1], [2]], documents)
     assert list(batch.scores) == ["refund request", "shipping", "refund status"]
     # document 1 decoded its one-token label in round 0 and sent
@@ -716,10 +735,19 @@ def test_classifier_scores_the_packed_trie(monkeypatch):
         targets=np.asarray(targets), rows=len(nodes),
         dtype=np.dtype((np.float32, (len(nodes), len(targets)))),
         submit=submit, result=lambda rows: rows)
-    state = {"torch": fake_torch(), "arena": cpu_arena(64),
-             "pipeline": fake_pipeline(forward_chunk=forward),
-             "chunk_tokens": 64, "label_readout": readout,
-             "input_staging": SimpleNamespace(fixed_tokens=set())}
+    state = QueryExecutionState(
+        loaded_model=LoadedModelState(
+            arena=cpu_arena(64),
+            pipeline=fake_pipeline(forward_chunk=forward),
+            label_readout=readout,
+            input_staging=SimpleNamespace(fixed_tokens=set()),
+            model=object(),
+        ),
+        torch=fake_torch(),
+        chunk_tokens=64,
+        answer_rows=object(),
+        async_answers=object(),
+    )
     batch = QuailClassifier(state).classify(
         spec, [[0], [1]], {"d": [[10, 11], [12]]})
     assert list(batch.scores) == ["b", "d"]
@@ -884,13 +912,22 @@ def test_classifier_reads_the_letter_at_the_first_canvas_row(monkeypatch):
     readout = SimpleNamespace(targets=np.asarray([1, 2]), rows=4,
                               dtype=np.dtype((np.float32, (4, 2))),
                               submit=submit, result=lambda rows: rows)
-    state = {"torch": fake_torch(), "arena": cpu_arena(64),
-             "pipeline": fake_pipeline(forward_chunk=forward, canvas_ids=(7,),
-                                       tree_attention=False),
-             "chunk_tokens": 64, "label_readout": readout,
-             "model_spec": SimpleNamespace(name="tiny", vocab=vocab,
-                                           answer_canvas=settings),
-             "input_staging": SimpleNamespace(fixed_tokens=set())}
+    state = QueryExecutionState(
+        loaded_model=LoadedModelState(
+            arena=cpu_arena(64),
+            pipeline=fake_pipeline(forward_chunk=forward, canvas_ids=(7,),
+                                   tree_attention=False),
+            model_spec=SimpleNamespace(name="tiny", vocab=vocab,
+                                       answer_canvas=settings),
+            label_readout=readout,
+            input_staging=SimpleNamespace(fixed_tokens=set()),
+            model=object(),
+        ),
+        torch=fake_torch(),
+        chunk_tokens=64,
+        answer_rows=object(),
+        async_answers=object(),
+    )
     documents = {"d": [[9]] * 4 + [[10, 11], [12]]}
     batch = QuailClassifier(state).classify(spec, [[4], [5]], documents)
     assert list(batch.scores) == ["a", "b"]

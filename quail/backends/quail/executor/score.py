@@ -3,9 +3,11 @@
 import numpy as np
 
 from quail.backends.quail.executor.classify import QuailClassifier
-from quail.backends.quail.executor.loop import InputStaging, run_join
+from quail.backends.quail.executor.loop import run_join
+from quail.backends.quail.executor.parts import input_staging
 from quail.backends.quail.executor.readout import AsyncScores
 from quail.backends.quail.executor.stages import Stage, run_stages
+from quail.backends.quail.executor.state import QueryExecutionState
 from quail.execution.reranker import RerankerBatch
 from quail.execution.tokens import DocumentPrefixes, chain_tokens
 from quail.physical import ClassifySpec
@@ -15,7 +17,7 @@ from quail.specs.base import CANVAS_ENTROPY_NATS, CANVAS_SEED
 class QuailScorer:
     """Score document rows with Quail's token admission and KV arena."""
 
-    def __init__(self, state):
+    def __init__(self, state: QueryExecutionState):
         self.state = state
 
     def score(self, spec, rows, documents):
@@ -27,7 +29,7 @@ class QuailScorer:
         if len(parts) != len(spec.aliases) + 1:
             raise ValueError("AI.SCORE needs tokenized prompt parts")
         if (len(spec.aliases) == 1 and spec.draws > 1
-                and state["pipeline"].canvas_ids):
+                and state.loaded_model.pipeline.canvas_ids):
             return self._drawn(spec, rows, documents)
         if len(spec.aliases) == 1:
             prefixes = [parts[0]]
@@ -55,12 +57,14 @@ class QuailScorer:
                         + suffix_lengths[candidate_index].sum())
         keys = [("score", spec.name, index) for index in range(len(prefixes))]
         async_scores = self._scores()
+        staging = state.loaded_model.input_staging
         answers, _, fresh = run_join(
-            state["torch"], state["arena"], state["pipeline"], async_scores,
-            prefixes, [suffixes], state["chunk_tokens"], anchor_keys=keys,
+            state.torch, state.loaded_model.arena, state.loaded_model.pipeline,
+            async_scores,
+            prefixes, [suffixes], state.chunk_tokens, anchor_keys=keys,
             anchor_partners=(None if partners is None
                              else lambda key: [partners[key[2]]]),
-            staging=state["input_staging"],
+            staging=staging,
         )
         scores = np.empty(len(rows), dtype=np.float32)
         for anchor, values in answers[0].items():
@@ -70,14 +74,12 @@ class QuailScorer:
     def _scores(self) -> AsyncScores:
         """The score readout kept on the state, with the input staging cleared."""
         state = self.state
-        answer_rows = state["answer_rows"]
-        async_scores = state.get("async_scores")
+        answer_rows = state.answer_rows
+        async_scores = state.async_scores
         if async_scores is None or async_scores.rows is not answer_rows:
-            async_scores = AsyncScores(state["torch"], answer_rows)
-            state["async_scores"] = async_scores
-        if "input_staging" not in state:
-            state["input_staging"] = InputStaging(state["torch"])
-        state["input_staging"].fixed_tokens.clear()
+            async_scores = AsyncScores(state.torch, answer_rows)
+            state.async_scores = async_scores
+        input_staging(state)
         return async_scores
 
     def _drawn(self, spec, rows, documents) -> RerankerBatch:
@@ -91,8 +93,8 @@ class QuailScorer:
         its own canvas, and its score is the mean over the draws.
         """
         state = self.state
-        pipeline = state["pipeline"]
-        vocab = state["model_spec"].vocab
+        pipeline = state.loaded_model.pipeline
+        vocab = state.loaded_model.model_spec.vocab
         (alias,) = spec.aliases
         head, tail = spec.prompt_token_parts
         docs = rows[:, 0]
@@ -136,10 +138,10 @@ class QuailScorer:
         ]
         prefixes = DocumentPrefixes(head, documents[alias], docs)
         _, _, fresh = run_stages(
-            state["torch"], state["arena"], pipeline, stages, prefixes,
-            state["chunk_tokens"],
+            state.torch, state.loaded_model.arena, pipeline, stages, prefixes,
+            state.chunk_tokens,
             anchor_keys=[("score", spec.name, index) for index in range(len(docs))],
-            staging=state["input_staging"], label=f"score {spec.name}")
+            staging=state.loaded_model.input_staging, label=f"score {spec.name}")
         read = len(cue) + width
         total = (sum(len(head) + len(documents[alias][doc]) for doc in docs)
                  + len(docs) * (len(tail) - 1 + read) + extended[0] * more * read)

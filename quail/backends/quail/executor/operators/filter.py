@@ -6,23 +6,22 @@ from quail.backends.quail.executor.parts import (
     execution_prefix_tree,
     gpu_seconds,
     input_staging,
-    require_execution_state,
 )
 from quail.backends.quail.executor.stages import Stage, filter_stages
+from quail.backends.quail.executor.state import QueryExecutionState
 from quail.backends.quail.graph import filter_document_sink, filter_result
 from quail.execution.reranker import filter_scores
 from quail.execution.runner import NodeResult
 from quail.execution.tokens import DocumentKeys
 
 
-def execute_filter(state, node, inputs) -> NodeResult:
+def execute_filter(state: QueryExecutionState, node, inputs) -> NodeResult:
     """Run one model filter and collect its results."""
-    require_execution_state(state)
-    torch = state["torch"]
-    arena = state["arena"]
-    pipeline = state["pipeline"]
-    async_answers = state["async_answers"]
-    chunk_tokens = state["chunk_tokens"]
+    torch = state.torch
+    arena = state.loaded_model.arena
+    pipeline = state.loaded_model.pipeline
+    async_answers = state.async_answers
+    chunk_tokens = state.chunk_tokens
 
     document_ids = inputs["document_ids"]
     retain_survivors = inputs.get("retain_survivors", ())

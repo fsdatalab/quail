@@ -9,6 +9,7 @@ import pytest
 
 import quail
 from quail.backends.quail.executor.stages import Stage
+from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
 from quail.catalog import Catalog, DocumentProvider
 from quail.execution.execute import execute_query
 from quail.execution.reranker import (
@@ -414,8 +415,17 @@ def test_native_and_distributed_scores_share_prefixes_and_keep_pair_order(
         name="score", aliases=("a", "b"),
         prompt_token_parts=((1,), (2,), (3,)),
     )
-    state = dict(torch=object(), arena=object(), pipeline=object(),
-                 answer_rows=object(), chunk_tokens=1234)
+    state = QueryExecutionState(
+        loaded_model=LoadedModelState(
+            arena=object(),
+            pipeline=object(),
+            model=object(),
+        ),
+        torch=object(),
+        answer_rows=object(),
+        chunk_tokens=1234,
+        async_answers=object(),
+    )
     monkeypatch.setattr(module, "AsyncScores", lambda *args: object())
 
     def run_join(*args, **kwargs):
@@ -437,9 +447,13 @@ def test_native_and_distributed_scores_share_prefixes_and_keep_pair_order(
     # uncertain first score takes three more draws and their mean
     drawn = SimpleNamespace(name="score", aliases=("b",), draws=4,
                             prompt_token_parts=((1,), (2, 3)))
-    state = dict(torch=object(), arena=object(), answer_rows=object(),
-                 pipeline=SimpleNamespace(canvas_ids=(7,)),
-                 model_spec=SimpleNamespace(vocab=50), chunk_tokens=1234)
+    state = QueryExecutionState(
+        loaded_model=LoadedModelState(
+            model=object(), arena=object(),
+            pipeline=SimpleNamespace(canvas_ids=(7,)),
+            model_spec=SimpleNamespace(vocab=50)),
+        torch=object(), async_answers=object(), answer_rows=object(),
+        chunk_tokens=1234)
 
     def run_stages(torch, arena, pipeline, stages, prefixes, budget, **kwargs):
         first, more = stages

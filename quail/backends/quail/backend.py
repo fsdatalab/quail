@@ -12,6 +12,7 @@ from quail.backends.quail.executor.operators.filter import execute_filter
 from quail.backends.quail.executor.operators.join import execute_join
 from quail.backends.quail.executor.pipeline import execute_pipeline
 from quail.backends.quail.executor.score import QuailScorer
+from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
 from quail.backends.quail.worker import execute_quail_request, prepare_quail_request
 from quail.execution.reranker import RerankerModelExecution
 from quail.logical import Alias, is_score, shared_preamble
@@ -34,25 +35,29 @@ class QuailModelExecution:
 
     def __init__(self, context: GpuContext):
         self.context = context
-        self._state: dict[str, Any] = {}
+        self.loaded_model: LoadedModelState | None = None
+        self._query: QueryExecutionState | None = None
         self._reranker: RerankerModelExecution | None = None
 
     @property
-    def state(self) -> Mapping[str, Any]:
-        """Return Quail's private loaded model state."""
-        return self._state
+    def query(self) -> QueryExecutionState:
+        """Return the bound query or fail before execution starts."""
+        if self._query is None:
+            raise RuntimeError("Quail model execution has no bound query")
+        return self._query
 
     def bind_loaded_model(self, *, model, arena, pipeline) -> None:
-        """Attach the loaded model objects owned by this executor."""
-        self._state.update(model=model, arena=arena, pipeline=pipeline)
-        spec = getattr(self.context, "model", None)
-        if spec is not None:
-            self._state.update(model_name=spec.name, model_spec=spec)
+        """Attach the loaded model and discard the previous model's caches."""
+        self.close()
+        self.loaded_model = LoadedModelState(
+            model=model, arena=arena, pipeline=pipeline,
+            model_spec=getattr(self.context, "model", None))
 
     def close(self) -> None:
         """Drop every reference to the loaded model so its memory can go."""
-        self._state.clear()
         self._reranker = None
+        self._query = None
+        self.loaded_model = None
 
     def bind_query(self, *, torch, async_answers, answer_rows,
                    chunk_tokens: int) -> None:
@@ -61,7 +66,15 @@ class QuailModelExecution:
         answer_rows are the retained output rows every readout scores
         against; async_answers is the TRUE/FALSE readout over them.
         """
-        self._state.update(
+        loaded = self.loaded_model
+        if loaded is None:
+            raise RuntimeError("Quail model execution has no loaded model")
+        if loaded.input_staging is not None:
+            # Retain allocated transfer buffers, not the previous query's tokens.
+            loaded.input_staging.fixed_tokens.clear()
+        self._reranker = None
+        self._query = QueryExecutionState(
+            loaded_model=loaded,
             torch=torch,
             async_answers=async_answers,
             answer_rows=answer_rows,
@@ -75,8 +88,7 @@ class QuailModelExecution:
     ) -> Any:
         if isinstance(node, AiScore):
             execution = self._reranker_execution(inputs["documents"])
-            # the scorer reads the query's timing choice from the state
-            self._state["gpu_timing"] = bool(inputs.get("gpu_timing", False))
+            self.query.gpu_timing = bool(inputs.get("gpu_timing", False))
             if "score_rows" in inputs:
                 return execution.execute_rows(node, inputs["score_rows"])
             return execution.execute(node, inputs["score_inputs"])
@@ -84,8 +96,8 @@ class QuailModelExecution:
             raise TypeError(
                 f"Quail cannot execute physical node {node.type_name!r}")
         if isinstance(node, AiFilter):
-            return execute_filter(self._state, node, inputs)
-        return execute_join(self._state, node, inputs)
+            return execute_filter(self.query, node, inputs)
+        return execute_join(self.query, node, inputs)
 
     def _reranker_execution(self, documents) -> RerankerModelExecution:
         """Return the reranker bound to this query's document tokens."""
@@ -97,7 +109,7 @@ class QuailModelExecution:
                 model=self.context.model, device=self.context.device,
                 query_settings={
                     "documents": documents,
-                    "reranker": QuailScorer(self._state),
+                    "reranker": QuailScorer(self.query),
                 },
             ))
             self._reranker = execution
@@ -105,7 +117,7 @@ class QuailModelExecution:
 
     def execute_pipeline(self, pipeline, inputs, context) -> dict:
         """Execute a model pipeline with this executor's loaded state."""
-        return execute_pipeline(self._state, pipeline, inputs, context)
+        return execute_pipeline(self.query, pipeline, inputs, context)
 
 
 def expected_join_nodes(plan) -> tuple[PhysicalNode, ...]:
