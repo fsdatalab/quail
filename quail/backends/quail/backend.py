@@ -175,8 +175,12 @@ class QuailModelExecution:
         parts = []
         for member in staged[:joins[0] if joins else -1]:
             parts.append(self._part(member, ids, parts, inputs, context))
-        prefixes = DocumentPrefixes(context.state["pre"],
-                                    context.state["docs"][alias], ids)
+        # a pipeline that starts with a classification writes the
+        # documents' KV under that classification's own prompt head;
+        # a classification plan's settings carry no shared preamble
+        head = (list(first.spec.prompt_token_parts[0])
+                if isinstance(first, AiClassify) else context.state["pre"])
+        prefixes = DocumentPrefixes(head, context.state["docs"][alias], ids)
         sink = staged[-1]
         results = {}
         if joins:

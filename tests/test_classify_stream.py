@@ -144,14 +144,17 @@ def fused_graph():
     return PhysicalGraph(tuple(nodes), PortRef("group:0", "ids:r"))
 
 
-@pytest.mark.parametrize("joined", [False, True])
+@pytest.mark.parametrize("shape", ["filter", "joined", "classify_first"])
 def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
-        monkeypatch, joined):
+        monkeypatch, shape):
     """A filter, then a diffusion model's classification: one run.
 
     Each survivor's seeded canvas is read over its resident KV, in
-    chunks that also hold other documents' filter rows. With
-    ``joined`` a filter on the label and a join follow, in the same pipeline.
+    chunks that also hold other documents' filter rows. When ``joined``
+    a filter on the label and a join follow, in the same pipeline. When
+    ``classify_first`` the pipeline starts with the classification,
+    whose plan settings carry no shared preamble, so the documents pack
+    under the classification's own prompt head.
     """
     from dataclasses import replace
 
@@ -160,27 +163,36 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
     from quail.specs.base import AnswerCanvas
 
     settings = AnswerCanvas(rows=4, turn_close_id=6, pad_id=0)
+    first = shape == "classify_first"
+    head = (80, 81) if first else ()
     spec = ClassifySpec(
         name="topic", aliases=("r",), query_template="", arguments=(),
         expected_inputs=4, estimated_seconds=0.0,
-        prompt_token_parts=((), (91, 92, 93)), labels=("a", "b"),
+        prompt_token_parts=(head, (91, 92, 93)), labels=("a", "b"),
         label_token_ids=((1,), (2,)), scoring="letters")
-    nodes = [
-        Scan(node_id="input:r", alias="r", input_id="r"),
-        AiFilter(
+    nodes = [Scan(node_id="input:r", alias="r", input_id="r")]
+    if not first:
+        nodes.append(AiFilter(
             node_id="filter:r",
             inputs=input_ports((PortRef("input:r", "ids:r"),)),
             alias="r", arena_writes=True,
             stages=(FilterStage(0, 1, 0, 0.8, 4 * 0.8),),
-            question_token_ids=((QUESTION,),)),
-        AiClassify(
-            node_id="classify:r",
-            inputs=input_ports((PortRef("filter:r", "ids:r"),)),
-            backend_name="quail", model="diffusion-gemma-26b-a4b-fp8",
-            spec=spec),
-    ]
+            question_token_ids=((QUESTION,),)))
+    nodes.append(AiClassify(
+        node_id="classify:r",
+        inputs=input_ports((PortRef("input:r" if first else "filter:r",
+                                    "ids:r"),)),
+        backend_name="quail", model="diffusion-gemma-26b-a4b-fp8",
+        spec=spec))
     root = PortRef("classify:r", "scores")
-    if joined:
+    if first:
+        nodes.append(Filter(
+            node_id="label:r",
+            inputs=input_ports((PortRef("classify:r", "scores"),)),
+            predicate=InList("topic", ("b",)), aliases=("r",),
+            selectivity=0.5, written_pos=1))
+        root = PortRef("label:r", "ids:r")
+    if shape == "joined":
         nodes += [
             Scan(node_id="input:p", alias="p", input_id="p"),
             Filter(
@@ -203,19 +215,24 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
         root = PortRef("group:0", "ids:r")
     graph = PhysicalGraph(tuple(nodes), root)
     chains = {pipeline.node_ids for pipeline in build_pipelines(graph).values()}
-    assert chains == {("filter:r", "classify:r", "label:r", "group:0")
-                      if joined else ("filter:r", "classify:r")}
+    assert chains == {{
+        "filter": ("filter:r", "classify:r"),
+        "joined": ("filter:r", "classify:r", "label:r", "group:0"),
+        "classify_first": ("classify:r", "label:r")}[shape]}
 
     filter_truth = [[1], [0], [1], [1]]
     # the letter each survivor's first canvas row favors
-    answers = {0: 1, 2: 2, 3: 2}
+    answers = {0: 1, 1: 1, 2: 2, 3: 2}
     vocab = 8
     packed = {}
+    prefixes = {}
 
     def forward(chunk):
         rows = []
         for entry in chunk.specs:
             document = entry["key"][1]
+            if entry["prefix"] is not None:
+                prefixes[document] = list(entry["prefix"])
             for suffix in entry["suffixes"]:
                 if entry.get("canvas") is not None:
                     packed.setdefault(document, []).append(list(entry["canvas"]))
@@ -295,13 +312,20 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
         "model_spec": model_spec, "device": DEVICES["h100-sxm"],
         "chunk_tokens": 64, "docs": docs,
     }
+    # the settings' shared preamble is empty, as a classification plan's is
+    assert SETTINGS["pre_ids"] == []
     result = execute_single_graph(state, SETTINGS, graph)
     assert not arena.accounting.owned
     outputs = result["_outputs"]
     metrics = result["node_metrics"]
+    labels = outputs[PortRef("classify:r", "scores")]
+    if first:
+        assert labels.column("topic").to_pylist() == ["a", "a", "b", "b"]
+        assert outputs[root].column("r").to_pylist() == [2, 3]
+        assert prefixes == {d: list(head) + docs["r"][d] for d in range(4)}
+        return
     assert outputs[PortRef("filter:r", "ids:r")].column("r").to_pylist() \
         == [0, 2, 3]
-    labels = outputs[PortRef("classify:r", "scores")]
     assert labels.column("r").to_pylist() == [0, 2, 3]
     assert labels.column("topic").to_pylist() == ["a", "b", "b"]
     # each survivor packed one canvas: a random token, the turn close,
@@ -315,7 +339,7 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
     assert metrics["classify:r"]["fresh_tokens"] == 3 * (2 + 1 + 4)
     assert metrics["classify:r"]["evaluated_documents"] == 3
     assert metrics["filter:r"]["fresh_tokens"] == sum(map(len, docs["r"])) + 4
-    if joined:
+    if shape == "joined":
         # the filter keeps document 0, whose partner suffixes
         # ran over its resident KV after its read
         assert outputs[PortRef("label:r", "ids:r")].column("r").to_pylist() \
