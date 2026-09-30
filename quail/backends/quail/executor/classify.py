@@ -43,13 +43,13 @@ from quail.backends.quail.executor.state import QueryExecutionState
 from quail.execution.labels import (
     GreedyDecoder,
     best_label,
-    label_trie,
     letter_scores,
     tree_scores,
     trie_chains,
 )
 from quail.execution.reranker import RerankerBatch
 from quail.execution.tokens import chain_tokens, prefix_tree
+from quail.labels import label_trie
 from quail.specs.base import CANVAS_ENTROPY_NATS, CANVAS_SEED
 
 logger = logging.getLogger("quail")

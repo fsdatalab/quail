@@ -14,23 +14,7 @@ decoded answer is matched to a label by its text instead
 
 import numpy as np
 
-
-def label_trie(label_ids) -> dict[tuple[int, ...], list[int]]:
-    """Return each proper label prefix and the tokens that can follow it.
-
-    Args:
-        label_ids: One token id sequence per label.
-
-    Raises:
-        ValueError: A label has no tokens.
-    """
-    children = {}
-    for ids in label_ids:
-        if not ids:
-            raise ValueError("a label has no tokens")
-        for depth in range(len(ids)):
-            children.setdefault(tuple(ids[:depth]), set()).add(ids[depth])
-    return {prefix: sorted(tokens) for prefix, tokens in children.items()}
+from quail.labels import label_trie
 
 
 def trie_targets(trie) -> list[int]:

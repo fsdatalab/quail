@@ -24,10 +24,10 @@ from quail.catalog import DocumentProvider
 from quail.execution.labels import (
     GreedyDecoder,
     best_label,
-    label_trie,
 )
 from quail.execution.pipelines import build_pipelines
 from quail.execution.reranker import RerankerBatch
+from quail.labels import label_trie
 from quail.logical import (
     Alias,
     ColumnRef,
