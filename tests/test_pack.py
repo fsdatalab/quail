@@ -200,11 +200,12 @@ def _tree_filter(monkeypatch, *, truth, budget, retain=(), limit=None,
         fake_torch,
     )
 
+    from quail.backends.quail.executor import chunk as chunk_mod
     from quail.backends.quail.executor import loop
 
     # a test recording the packed specs keeps its own pack_chunk
-    if not getattr(loop.pack_chunk, "recording", False):
-        monkeypatch.setattr(loop, "pack_chunk", fake_pack)
+    if not getattr(chunk_mod.pack_chunk, "recording", False):
+        monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
     model = FakeModel(truth, {})
     pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
     answers = SimpleNamespace(submit=lambda v: v, result=lambda v: v, dtype=None)
@@ -228,7 +229,7 @@ def _tree_filter(monkeypatch, *, truth, budget, retain=(), limit=None,
 def test_filter_borrows_from_parents_and_stacks_siblings(monkeypatch):
     from fakes import DOC, fake_pack
 
-    from quail.backends.quail.executor import loop
+    from quail.backends.quail.executor import chunk as chunk_mod
 
     packed = []
 
@@ -238,7 +239,7 @@ def test_filter_borrows_from_parents_and_stacks_siblings(monkeypatch):
         return fake_pack(torch, arena, specs, **kw)
 
     recording_pack.recording = True
-    monkeypatch.setattr(loop, "pack_chunk", recording_pack)
+    monkeypatch.setattr(chunk_mod, "pack_chunk", recording_pack)
 
     # two siblings and another root packed in one chunk under tree
     # attention: the siblings follow their parent in one run, each
@@ -272,7 +273,7 @@ def test_filter_borrows_from_parents_and_stacks_siblings(monkeypatch):
                        (("r", 1), 64, ("r", 0))]]
     assert tokens == 48 + 16 + 8 + 3
     assert arena.free_pages == 64 and not arena.accounting.owned
-    monkeypatch.setattr(loop, "pack_chunk", fake_pack)
+    monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
 
     # answers are read after the next chunk launches, so a child right
     # behind its parent still borrows even when the parent fails
@@ -358,6 +359,7 @@ def test_join_anchors_borrow_a_resident_parents_pages(monkeypatch):
         fake_torch,
     )
 
+    from quail.backends.quail.executor import chunk as chunk_mod
     from quail.backends.quail.executor import loop
 
     packed = []
@@ -368,7 +370,7 @@ def test_join_anchors_borrow_a_resident_parents_pages(monkeypatch):
                       for s in specs if s["prefix"] is not None)
         return fake_pack(torch, arena, specs, **kw)
 
-    monkeypatch.setattr(loop, "pack_chunk", recording_pack)
+    monkeypatch.setattr(chunk_mod, "pack_chunk", recording_pack)
     keys = [("a", d) for d in range(3)]
     # anchor 1 shares 32 tokens (2 pages) with anchor 0; anchor 2 none
     prefixes = [[DOC] * 64, [DOC] * 32 + [DOC + 1] * 32, [DOC + 2] * 64]

@@ -4,8 +4,8 @@ import pytest
 from fakes import cpu_staging
 from test_sliding_kv import plain_arena
 
-from quail.backends.quail.executor import loop
-from quail.backends.quail.executor.loop import Suffixes
+from quail.backends.quail.executor import chunk as chunk_mod
+from quail.backends.quail.executor.chunk import Suffixes
 
 torch = pytest.importorskip("torch")
 
@@ -16,7 +16,7 @@ def test_pack_chunk_rows_for_many_suffixes(monkeypatch):
     key = ("d", 0)
     arena.activate(key, 4, capacity_tokens=8, base_tokens=4)
     sufs = Suffixes.of([[10, 11], [12], [13, 14, 15]])
-    chunk = loop.pack_chunk(
+    chunk = chunk_mod.pack_chunk(
         torch, arena,
         [dict(key=key, prefix=[1, 2, 3, 4], f=4, suffixes=sufs,
               read_all_rows=True)],
@@ -34,7 +34,7 @@ def test_pack_chunk_rows_for_many_suffixes(monkeypatch):
     assert chunk.meta["kv_src"].tolist() == [0, 1, 2, 3]
     # a kept document: the last row of each suffix answers, and every
     # suffix row reads the kept prefix
-    chunk = loop.pack_chunk(
+    chunk = chunk_mod.pack_chunk(
         torch, arena, [dict(key=key, prefix=None, f=4, suffixes=sufs)],
         attention_mode="tree")
     assert chunk.input_ids.tolist() == [10, 11, 12, 13, 14, 15]
@@ -55,14 +55,14 @@ def test_a_fresh_single_group_is_one_causal_segment_under_tree(monkeypatch):
     arena.activate(key, 3, capacity_tokens=8, base_tokens=3)
     group = dict(key=key, prefix=[7, 8, 9], f=3, suffixes=[[20, 21, 22]],
                  write_suffix_tokens=2, single=True)
-    chunk = loop.pack_chunk(torch, arena, [group], attention_mode="tree")
+    chunk = chunk_mod.pack_chunk(torch, arena, [group], attention_mode="tree")
     # no segment boundary after the prefix and no read of the pages
     assert chunk.meta["cu_a"].tolist() == [0, 6]
     assert chunk.meta["reads"] is None
     assert chunk.meta["kv_src"].tolist() == [0, 1, 2, 3, 4]
     assert chunk.final_indices.tolist() == [5]
     # a kept document's single suffix still reads its pages
-    chunk = loop.pack_chunk(
+    chunk = chunk_mod.pack_chunk(
         torch, arena, [dict(key=key, prefix=None, f=5, suffixes=[[30]],
                             single=True)], attention_mode="tree")
     assert chunk.meta["reads"]["used"].tolist() == [5]

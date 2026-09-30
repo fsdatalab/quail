@@ -10,7 +10,7 @@ from fakes import cpu_arena, fake_pack, fake_pipeline, fake_torch, letter_tokens
 from test_score import _finish
 
 import quail
-from quail.backends.quail.executor import loop
+from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor.classify import (
     QuailClassifier,
     document_prefixes,
@@ -134,7 +134,7 @@ def test_classifier_reads_the_letters_at_the_cue_row(monkeypatch):
             for entry in chunk.specs for _ in entry["suffixes"]],
             dtype=np.float32)
 
-    monkeypatch.setattr(loop, "pack_chunk", fake_pack)
+    monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
     state = QueryExecutionState(
         loaded_model=LoadedModelState(
             arena=cpu_arena(64),
@@ -191,7 +191,7 @@ def test_classifier_decodes_one_token_per_round(monkeypatch):
                 rows.append([logprob(document, seen, token) for token in targets])
         return np.asarray(rows, dtype=np.float32)
 
-    monkeypatch.setattr(loop, "pack_chunk", fake_pack)
+    monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
     readout = SimpleNamespace(
         targets=np.asarray(targets), rows=1,
         dtype=np.dtype((np.float32, (4,))),
@@ -650,7 +650,7 @@ def test_pack_chunk_packs_chains_as_segments_reading_ancestors(monkeypatch):
     chains = trie_chains(((1, 2, 3), (1, 2, 4), (1, 5, 6), (7, 8)))
     group = dict(key=key, prefix=None, f=4, suffixes=[[93, 1, 2, 5, 7]],
                  read_all_rows=True, chains=chains)
-    chunk = loop.pack_chunk(torch, arena, [group], attention_mode="tree")
+    chunk = chunk_mod.pack_chunk(torch, arena, [group], attention_mode="tree")
     # rows: cue, (1,), (1,2) | (1,5) | (6,): positions past the frame
     assert chunk.positions.tolist() == [4, 5, 6, 6, 5]
     assert chunk.meta["cu_a"].tolist() == [0, 3, 4, 5]
@@ -665,7 +665,7 @@ def test_pack_chunk_packs_chains_as_segments_reading_ancestors(monkeypatch):
     assert chunk.final_indices.tolist() == [0, 1, 2, 3, 4]
     assert chunk.rows_per_answer == (5,)
     with pytest.raises(ValueError, match="tree attention"):
-        loop.pack_chunk(torch, arena, [group], attention_mode="unified")
+        chunk_mod.pack_chunk(torch, arena, [group], attention_mode="unified")
 
 
 def test_merge_partial_equals_attention_over_the_union_of_keys():
@@ -721,7 +721,7 @@ def test_classifier_scores_the_packed_trie(monkeypatch):
                     for token in targets])
         return np.asarray(rows, dtype=np.float32)
 
-    monkeypatch.setattr(loop, "pack_chunk", fake_pack)
+    monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
     def submit(rows, rows_per_answer=None):
         # one record per answer: the frame entry's one row, a suffix's five
         out = np.full((len(rows_per_answer), len(nodes), len(targets)), np.nan)
@@ -908,7 +908,7 @@ def test_classifier_reads_the_letter_at_the_first_canvas_row(monkeypatch):
             start += count
         return padded
 
-    monkeypatch.setattr(loop, "pack_chunk", fake_pack)
+    monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
     readout = SimpleNamespace(targets=np.asarray([1, 2]), rows=4,
                               dtype=np.dtype((np.float32, (4, 2))),
                               submit=submit, result=lambda rows: rows)

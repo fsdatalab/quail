@@ -11,10 +11,10 @@ import time
 from quail.backends.base import GpuContext
 from quail.backends.quail.distributed import execute_distributed_graph
 from quail.backends.quail.executor.arena import KVArena
-from quail.backends.quail.executor.loop import warm_kernels
 from quail.backends.quail.executor.model import load_model, resolve_model_path
 from quail.backends.quail.executor.models import build_pipeline
 from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers
+from quail.backends.quail.executor.warmup import warm_kernels
 from quail.backends.quail.graph import (
     _join_round_kv,
     _tuple_suffix,

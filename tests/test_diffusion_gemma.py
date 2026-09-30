@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 from fakes import cpu_arena, cpu_staging, fake_pack, fake_pipeline, fake_torch
 
+from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor import loop
 from quail.backends.quail.executor.models.diffusion_gemma import (
     DiffusionGemmaPipeline,
@@ -123,12 +124,12 @@ def test_canvas_rows_are_charged_in_filter_streams_and_packed_chunks(
         return real_activate(key, tokens, **kw)
 
     arena.activate = activate
-    real_pack = loop.pack_chunk
-    monkeypatch.setattr(loop, "pack_chunk", fake_pack)
+    real_pack = chunk_mod.pack_chunk
+    monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
     loop.run_filter(fake_torch(), arena, paged, answers, docs[:1],
                     questions[:1], 200, arena_writes=False,
                     arena_keys=[("d", 0)])
-    monkeypatch.setattr(loop, "pack_chunk", real_pack)
+    monkeypatch.setattr(chunk_mod, "pack_chunk", real_pack)
     assert activated == [("d", 0)]
     assert arena.retention_cap_pages == 8
 
@@ -138,8 +139,8 @@ def test_canvas_rows_are_charged_in_filter_streams_and_packed_chunks(
     canvas = (90, 91, 92, 93)
     groups = [dict(key=("d", 0), prefix=[1, 2, 3], f=3, suffixes=[[10, 11]]),
               dict(key=("d", 1), prefix=[4, 5], f=2, suffixes=[[12]])]
-    chunk = loop.pack_chunk(torch, arena, groups, attention_mode="unified",
-                            canvas=canvas)
+    chunk = chunk_mod.pack_chunk(torch, arena, groups, attention_mode="unified",
+                                 canvas=canvas)
     assert chunk.tokens == 3 + 2 + 4 + 2 + 1 + 4
     assert chunk.input_ids.tolist() == [1, 2, 3, 10, 11, *canvas, 4, 5, 12, *canvas]
     assert chunk.positions.tolist() == [0, 1, 2, 3, 4, 5, 6, 7, 8, 0, 1, 2, 3, 4, 5, 6]
@@ -152,19 +153,19 @@ def test_canvas_rows_are_charged_in_filter_streams_and_packed_chunks(
     assert meta["canvas"]["cu_q"].tolist() == [0, 4, 8]
     assert meta["canvas"]["max_q"] == 4
 
-    later = loop.pack_chunk(torch, arena, groups, attention_mode="unified",
-                            canvas=canvas, answer_row=2)
+    later = chunk_mod.pack_chunk(torch, arena, groups, attention_mode="unified",
+                                 canvas=canvas, answer_row=2)
     assert later.final_indices.tolist() == [7, 14]
     with pytest.raises(ValueError, match="answer_row"):
-        loop.pack_chunk(torch, arena, groups, attention_mode="unified",
-                        canvas=canvas, answer_row=4)
+        chunk_mod.pack_chunk(torch, arena, groups, attention_mode="unified",
+                             canvas=canvas, answer_row=4)
 
-    plain = loop.pack_chunk(torch, arena, groups, attention_mode="unified")
+    plain = chunk_mod.pack_chunk(torch, arena, groups, attention_mode="unified")
     assert plain.meta["canvas"] is None
     assert plain.final_indices.tolist() == [4, 7]
     with pytest.raises(ValueError, match="unified"):
-        loop.pack_chunk(torch, arena, groups, attention_mode="tree",
-                        canvas=canvas)
+        chunk_mod.pack_chunk(torch, arena, groups, attention_mode="tree",
+                             canvas=canvas)
 
 
 class _Norm:
@@ -349,8 +350,8 @@ def test_pipeline_layer_order_and_one_row_canvas_attention(monkeypatch):
     for canvas, calls in [((90,), 1), ((90, 91), 2)]:
         arena = cpu_arena(64)
         groups = [dict(key=("d", 0), prefix=[1, 2, 3], f=3, suffixes=[[10, 11]])]
-        chunk = loop.pack_chunk(torch, arena, groups, attention_mode="unified",
-                                canvas=canvas)
+        chunk = chunk_mod.pack_chunk(torch, arena, groups, attention_mode="unified",
+                                     canvas=canvas)
         engine = Engine.__new__(Engine)
         engine.arena = arena
         engine.torch = torch

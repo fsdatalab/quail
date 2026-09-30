@@ -15,7 +15,7 @@ import pyarrow as pa
 
 import quail
 from quail.backends.quail import QuailModelExecution
-from quail.backends.quail.executor import loop
+from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor.arena import KVArena, PageArena
 from quail.backends.quail.executor.models.base import ModelPipeline
 from quail.backends.quail.graph import execute_single_graph
@@ -81,13 +81,13 @@ def cpu_staging(monkeypatch):
         return torch.tensor(data, dtype=dtype)
 
     def token_parts(torch_, sequences, total, pinned=True, staging=None):
-        ids = [int(t) for seq in sequences for part in loop._token_parts(seq)
+        ids = [int(t) for seq in sequences for part in chunk_mod._token_parts(seq)
                for t in part]
         assert len(ids) == total
         return torch.tensor(ids, dtype=torch.int64)
 
-    monkeypatch.setattr(loop, "_staged", staged)
-    monkeypatch.setattr(loop, "_staged_token_parts", token_parts)
+    monkeypatch.setattr(chunk_mod, "_staged", staged)
+    monkeypatch.setattr(chunk_mod, "_staged_token_parts", token_parts)
     return torch
 
 
@@ -277,7 +277,7 @@ def run_graph_on_arena(monkeypatch, graph, *, n_docs=14, n_partners=4,
         (result, model, filter_truth, join_truth); the arena is empty
         afterwards.
     """
-    monkeypatch.setattr(loop, "pack_chunk", fake_pack)
+    monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
     rng = random.Random(seed)
     docs = {
         "r": [[DOC + d] * rng.randrange(10, 40) for d in range(n_docs)],

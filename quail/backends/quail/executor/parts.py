@@ -2,7 +2,7 @@
 
 import time
 
-from quail.backends.quail.executor import loop
+from quail.backends.quail.executor.chunk import InputStaging
 from quail.backends.quail.executor.stages import Stage
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.execution.tokens import prefix_tree
@@ -13,7 +13,7 @@ from quail.progress import logger
 def input_staging(state: QueryExecutionState):
     """Return reusable transfer buffers with an empty fixed-token cache."""
     if state.loaded_model.input_staging is None:
-        state.loaded_model.input_staging = loop.InputStaging(state.torch)
+        state.loaded_model.input_staging = InputStaging(state.torch)
     state.loaded_model.input_staging.fixed_tokens.clear()
     return state.loaded_model.input_staging
 

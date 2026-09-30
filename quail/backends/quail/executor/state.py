@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from quail.backends.quail.executor.arena import KVArena
-    from quail.backends.quail.executor.loop import InputStaging
+    from quail.backends.quail.executor.chunk import InputStaging
     from quail.backends.quail.executor.models.base import ModelPipeline
     from quail.backends.quail.executor.readout import (
         AnswerRows,

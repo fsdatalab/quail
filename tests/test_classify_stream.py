@@ -19,7 +19,7 @@ from fakes import (
 )
 
 from quail.backends.quail import QuailModelExecution
-from quail.backends.quail.executor import loop
+from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.graph import execute_single_graph
 from quail.builtins import built_in_registry
 from quail.physical import (
@@ -314,7 +314,7 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
         def result(self, rows):
             return rows
 
-    monkeypatch.setattr(loop, "pack_chunk", fake_pack)
+    monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
     monkeypatch.setattr(classify_module, "full_output_head",
                         lambda model: SimpleNamespace(shape=(1, 1),
                                                       dtype="fake"))
@@ -398,7 +398,7 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
 @pytest.mark.parametrize("classify_only", [False, True])
 def test_streamed_classification_labels_survivors_with_their_kv_resident(
         monkeypatch, classify_only):
-    monkeypatch.setattr(loop, "pack_chunk", fake_pack)
+    monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
     n_docs, n_partners = 14, 4
     docs = {
         "r": [[DOC + d] * (10 + 2 * d) for d in range(n_docs)],
@@ -533,7 +533,7 @@ def test_a_classification_of_joined_rows_runs_after_its_join_on_the_anchors_kv(
     chains = {pipeline.node_ids for pipeline in build_pipelines(graph).values()}
     assert chains == {("group:0", "classify:rp")}
 
-    monkeypatch.setattr(loop, "pack_chunk", fake_pack)
+    monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
     docs = {"r": [[DOC + d] * (5 + d) for d in range(3)],
             "p": [[PARTNER + d, PARTNER + d] for d in range(2)]}
     # r0 pairs with both partners, r1 with p1 only, r2 with none

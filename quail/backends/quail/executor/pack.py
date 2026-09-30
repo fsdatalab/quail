@@ -1,4 +1,6 @@
-"""Chunk packing and admission - no GPU, no torch, unit-tested.
+"""Admit groups into chunks within token and page budgets.
+
+Tensor construction is in chunk.py. Admission runs without GPU or torch.
 
 - JoinAdmission: continuous anchor admission for every stage list
   (joins, filter chains, classifications). Continuing partner streams

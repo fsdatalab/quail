@@ -24,9 +24,6 @@ rotary, as Qwen3 and Gemma 4 have; qkv_norm_rope_heads is its form
 for any head geometry, with Gemma's weightless per-head V norm.
 """
 
-from dataclasses import dataclass
-from typing import Any
-
 GROUP = 128            # fp8 quant group size, matches the engine
 # FlashAttention 3's widest head; wider heads run FlashAttention 4,
 # whose Hopper build takes heads up to 512, over arena pages.
@@ -40,40 +37,6 @@ FA_MAX_HEAD_DIM = 256
 # The tree path needs the fp8 kernels, so only pipelines that set
 # tree_attention run it.
 ATTENTION_PATHS = ("unified", "tree")
-
-
-@dataclass
-class Chunk:
-    """One packed forward pass: token rows plus attention bookkeeping.
-
-    Attributes:
-        input_ids: Token ids, one per packed row, on the GPU.
-        positions: Rotary position of each row.
-        final_indices: Rows whose hidden state feeds the answer readout.
-        meta: Attention-path bookkeeping built by pack_chunk: the layer
-            counter, KV scatter maps, block tables, and sequence bounds.
-        attention_mode: "unified" or "tree", the path the packer laid
-            the chunk out for.
-        tokens: Rows in the chunk.
-        layout: (arena key, suffix count) per group in chunk order.
-        temporary_keys: Arena keys the loop frees after the forward pass.
-        fresh_keys: Keys whose prefix this chunk computes; the loop
-            trims their sliding pages after the pass.
-        rows_per_answer: Rows of final_indices each answer takes, one
-            entry per suffix in chunk order, when some suffix reads
-            more than its last row; empty when every answer is one row.
-    """
-
-    input_ids: Any
-    positions: Any
-    final_indices: Any
-    meta: dict
-    attention_mode: str
-    tokens: int
-    layout: list
-    temporary_keys: tuple = ()
-    fresh_keys: tuple = ()
-    rows_per_answer: tuple = ()
 
 
 def flash_attention_version(capability: tuple[int, int]) -> int:

@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from quail.backends.quail import worker
-from quail.backends.quail.executor.loop import InputStaging
+from quail.backends.quail.executor.chunk import InputStaging
 from quail.backends.quail.worker import LoadedGpu
 from quail.builtins import built_in_registry
 

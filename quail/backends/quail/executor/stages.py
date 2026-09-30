@@ -211,8 +211,8 @@ class _StageExecutor:
     def __init__(self, torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                  anchor_keys, on_settled, staging, attention_mode, prefix_tree,
                  stats, limit, paged, unit, label, default_attention, on_chunk):
+        from quail.backends.quail.executor.chunk import Suffixes
         from quail.backends.quail.executor.loop import (
-            Suffixes,
             attention_path,
             borrow_check,
             lowest_borrows,
@@ -367,7 +367,7 @@ class _StageExecutor:
 
     def _build(self, chunk_groups):
         """Pack one chunk; returns it with (stage, answer rows) per entry."""
-        from quail.backends.quail.executor.loop import Suffixes, pack_chunk
+        from quail.backends.quail.executor.chunk import Suffixes, pack_chunk
 
         specs = []
         entries = []
@@ -533,7 +533,7 @@ class _StageExecutor:
 
     def _run_part(self, part):
         """Run one chunk of groups, halving it when its pages do not fit."""
-        from quail.backends.quail.executor.loop import ArenaFullError
+        from quail.backends.quail.executor.chunk import ArenaFullError
 
         try:
             self._run_one(part)
