@@ -327,9 +327,6 @@ def render_classify_question(question: str, labels, descriptions=(),
             + render_categories(labels, descriptions, letters) + ANSWER_CUE)
 
 
-CLASSIFY_LAYOUTS = ("document_first", "labels_first")
-
-
 def label_text(label: str, prefix: str = LABEL_PREFIX) -> str:
     """The text a label is scored as, appended after the answer cue."""
     return prefix + label
@@ -338,17 +335,13 @@ def label_text(label: str, prefix: str = LABEL_PREFIX) -> str:
 def bind_classify_prompt(template: str, args: tuple, labels, descriptions=(),
                          tokenizer=None,
                          turn: tuple[str, str] = ("", ""),
-                         layout: str = "document_first",
                          task_description: str = "") -> Prompt:
     """Build an AI.CLASSIFY Prompt: the document, then the question and labels.
 
     The layout is the filter layout with the classification
     instruction, a category list, and the answer cue after the
     question. Label text is not part of the tail; each label is scored
-    as ``label_text(label, prefix)`` after it. Under the
-    ``labels_first`` layout the instruction and categories come before
-    the document in the preamble, which every document then shares,
-    and the tail is the document and the answer cue. The prompt's
+    as ``label_text(label, prefix)`` after it. The prompt's
     ``lettered`` is the same prompt with the categories lettered, for
     the ``letters`` scoring rule.
 
@@ -360,36 +353,31 @@ def bind_classify_prompt(template: str, args: tuple, labels, descriptions=(),
         tokenizer: Optional callable (text -> token list) for counting.
         turn: The model's chat-turn text: the piece before the
             preamble and the piece after the answer cue.
-        layout: ``document_first`` or ``labels_first``.
         task_description: Task text added after the question.
     """
     _check_placeholders(template, len(args))
     if len(args) == 2:
         return _bind_joined_classify_prompt(
-            template, args, labels, descriptions, tokenizer, turn, layout,
+            template, args, labels, descriptions, tokenizer, turn,
             task_description)
     if len(args) != 1:
         raise CompileError("AI.CLASSIFY reads one document per row, or one "
                            "from each side of a join")
-    if layout not in CLASSIFY_LAYOUTS:
-        raise CompileError(
-            f"unknown AI.CLASSIFY layout {layout!r}; the layouts are "
-            f"{CLASSIFY_LAYOUTS}")
     prefix = answer_prefix(turn)
     named = _bind_document_classify_prompt(
-        template, args, labels, descriptions, tokenizer, turn, layout,
+        template, args, labels, descriptions, tokenizer, turn,
         task_description, prefix)
     letters = choice_letters(len(labels), tokenizer, prefix)
     if len(letters) < len(labels):
         return named
     lettered = _bind_document_classify_prompt(
-        template, args, labels, descriptions, tokenizer, turn, layout,
+        template, args, labels, descriptions, tokenizer, turn,
         task_description, prefix, letters)
     return replace(named, lettered=lettered)
 
 
 def _bind_document_classify_prompt(template, args, labels, descriptions,
-                                   tokenizer, turn, layout, task_description,
+                                   tokenizer, turn, task_description,
                                    prefix, letters=()):
     """Bind one AI.CLASSIFY prompt over one document, lettered when asked."""
     import re
@@ -400,13 +388,8 @@ def _bind_document_classify_prompt(template, args, labels, descriptions,
         raise CompileError(f"unexpected AI.CLASSIFY template: {template!r}")
     question = render_classify_question(
         m.group(2), labels, descriptions, task_description, letters)
-    if layout == "labels_first":
-        body = question[:len(question) - len(ANSWER_CUE)].lstrip("\n")
-        preamble = turn[0] + body + "\n\n" + preamble
-        tail = m.group(1) + ANSWER_CUE + turn[1]
-    else:
-        preamble = turn[0] + preamble
-        tail = m.group(1) + question + turn[1]
+    preamble = turn[0] + preamble
+    tail = m.group(1) + question + turn[1]
     pre_tok = tail_tok = frame_tok = None
     pre_ids = tail_ids = ()
     if tokenizer is not None:
@@ -423,7 +406,7 @@ def _bind_document_classify_prompt(template, args, labels, descriptions,
 
 
 def _bind_joined_classify_prompt(template, args, labels, descriptions,
-                                 tokenizer, turn, layout, task_description):
+                                 tokenizer, turn, task_description):
     """Bind a classification of joined rows: the join layout, then the question.
 
     The anchor document (placeholder {0}) comes first, then the anchor
@@ -431,9 +414,6 @@ def _bind_joined_classify_prompt(template, args, labels, descriptions,
     question with its categories and cue. ``label_token_ids`` holds,
     as for a join, each alias's partner label and the anchor note.
     """
-    if layout != "document_first":
-        raise CompileError(
-            "a classification of joined rows uses the document_first layout")
     aliases = [r.alias for r in args]
     if len(set(aliases)) != len(aliases):
         raise CompileError(

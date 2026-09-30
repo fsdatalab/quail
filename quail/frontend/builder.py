@@ -162,7 +162,7 @@ class Query:
     ai_if = ai_filter
 
     def ai_classify(self, p: PromptSpec, labels, *, name: str,
-                    descriptions=None, layout: str = "document_first",
+                    descriptions=None,
                     task_description: str = "") -> "Query":
         """Pick one label per document and name it as a result column.
 
@@ -178,8 +178,6 @@ class Query:
                 of a registered label table.
             name: The result column's name.
             descriptions: One description per label, empty for none.
-            layout: ``document_first``, or ``labels_first`` to put the
-                question and categories before every document.
             task_description: Task text added after the question.
         """
         if self._pending_join is not None:
@@ -209,7 +207,6 @@ class Query:
         refs = tuple(self._resolve(c) for c in p.cols)
         bound = bind_classify_prompt(p.template, refs, labels, descriptions,
                                      self._tokenizer, turn=self._turn,
-                                     layout=layout,
                                      task_description=task_description)
         for ref in refs:
             self._note_doc_column(ref)

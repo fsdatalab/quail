@@ -26,7 +26,7 @@ from quail.logical import (
     is_score,
 )
 from quail.logical.nodes import validate_task_description
-from quail.logical.prompts import CLASSIFY_LAYOUTS, bind_classify_prompt
+from quail.logical.prompts import bind_classify_prompt
 
 # Every relational operator except the projection, named and refused.
 # OR is rejected separately with its own message.
@@ -259,8 +259,8 @@ class _Binder:
             join: Whether the prompt reads a pair; None decides from
                 the aliases it reads.
             classify: For AI.CLASSIFY, the keyword arguments of
-                bind_classify_prompt: labels, descriptions, layout,
-                and task_description.
+                bind_classify_prompt: labels, descriptions, and
+                task_description.
         """
         if not _is_call(node, function):
             raise CompileError(
@@ -325,7 +325,7 @@ class _Binder:
         pairs, or of {'label': ..., 'description': ...} objects, or the
         name of a registered label table, given positionally or as
         categories => ...; the config object takes selectivity,
-        layout, task_description, and output_mode.
+        task_description, and output_mode.
         """
         categories = node.args.get("categories")
         if isinstance(categories, exp.Kwarg):
@@ -347,7 +347,6 @@ class _Binder:
             call, "AI_CLASSIFY", set(), scope=scope, join=False,
             classify=dict(
                 labels=labels, descriptions=descriptions,
-                layout=options.pop("layout", "document_first"),
                 task_description=options.pop("task_description", "")))
         if len(aliases) not in (1, 2):
             raise CompileError("AI.CLASSIFY reads one document column, or "
@@ -431,11 +430,6 @@ class _Binder:
                 if not (isinstance(value, exp.Literal) and not value.is_string):
                     raise CompileError("selectivity must be a number")
                 out[key] = float(value.this)
-            elif key == "layout":
-                if text not in CLASSIFY_LAYOUTS:
-                    raise CompileError(
-                        f"layout is one of {CLASSIFY_LAYOUTS}, got {value.sql()}")
-                out[key] = text
             elif key == "task_description":
                 if text is None:
                     raise CompileError("task_description is a string")
@@ -449,7 +443,7 @@ class _Binder:
             else:
                 raise CompileError(
                     f"unknown AI.CLASSIFY option {key!r}; the options are "
-                    f"selectivity, layout, task_description, and output_mode")
+                    f"selectivity, task_description, and output_mode")
         return out
 
     def parse_ai_filter(self, node, allowed: set, scope=None, join=None):

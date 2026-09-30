@@ -748,14 +748,6 @@ def test_sql_category_forms_options_and_label_tables(session):
                      "{'task_description': 'Pick the request kind.', "
                      "'output_mode': 'single'}) AS topic FROM documents d")
     assert "Pick the request kind." in tasked.prompt.tail
-    # labels first: the question and categories go before the document
-    first = call_of("SELECT d.id, AI.CLASSIFY(PROMPT('What is {0} about?', "
-                    "d.body), ARRAY['refund', 'praise'], {'layout': "
-                    "'labels_first'}) AS topic FROM documents d")
-    assert first != plain
-    assert first.prompt.preamble.startswith(CLASSIFY_INSTRUCTION)
-    assert "- refund" in first.prompt.preamble
-    assert first.prompt.tail == "{0}\nANSWER:"
     # a registered label table, in ordinal order, then by label text
     session.register("kinds", DocumentProvider.from_table(pa.table({
         "label": ["praise", "refund"], "description": [None, "money back"],
@@ -781,7 +773,7 @@ def test_sql_category_forms_options_and_label_tables(session):
                 "SELECT d.id, AI.CLASSIFY(d.body, ARRAY['refund', 'praise'], "
                 "{'examples': 'x'}) AS topic FROM documents d",
                 "SELECT d.id, AI.CLASSIFY(d.body, ARRAY['refund', 'praise'], "
-                "{'layout': 'sideways'}) AS topic FROM documents d",
+                "{'layout': 'labels_first'}) AS topic FROM documents d",
                 "SELECT d.id, AI.CLASSIFY(d.body, ARRAY[1, 2]) AS topic "
                 "FROM documents d"):
         with pytest.raises(CompileError):

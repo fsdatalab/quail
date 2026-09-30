@@ -363,7 +363,7 @@ An optional third argument sets options:
 
 ```sql
 AI.CLASSIFY(PROMPT(...), ARRAY[...],
-            {'selectivity': 0.3, 'layout': 'labels_first',
+            {'selectivity': 0.3,
              'task_description': 'Pick the kind of request.',
              'output_mode': 'single'})
 ```
@@ -372,10 +372,6 @@ AI.CLASSIFY(PROMPT(...), ARRAY[...],
   fraction of documents whose label passes the test. Quail uses it to
   decide which filters to run first. If you leave it out, Quail
   assumes 20%.
-- **`layout`**: optional. `'document_first'`, the default, puts the
-  document before the question and labels, as `AI.IF` does.
-  `'labels_first'` puts the question and labels before the document,
-  so every document shares them as one prefix.
 - **`task_description`**: optional. Text of at most 50 words, added
   after the question.
 - **`output_mode`**: optional. Only `'single'`, one label per
@@ -424,7 +420,6 @@ A classification of joined rows has these limits:
 - The query must join the two tables with `AI.IF`. Otherwise it
   raises `CompileError`, or Quail refuses to plan it.
 - Its label can be returned, but not tested in `WHERE`.
-- The layout is `'document_first'`.
 
 ### AI.EXTRACT
 
