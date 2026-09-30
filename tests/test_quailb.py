@@ -64,7 +64,7 @@ def test_all_queries_compile_and_plan_and_answer_timing_adds_common_work(tmp_pat
         "PRIV-1", "PRIV-2",
     }
     classify = {*(f"IMDB-{i}" for i in range(11, 16)), "BIO-5", "BIO-6",
-                "FEV-11", "LEP-6", "AGENT-3", "AGENT-4"}
+                "FEV-11", "LEP-6", "AGENT-3", "AGENT-4", "AGENT-5"}
     assert set(QUERY_ORDER) == (expected | classify) - {"PRIV-1", "PRIV-2"}
     for backend in ("quail", "stock_vllm", "pipelined_vllm", "pipelined_sglang"):
         with quail.Session(
@@ -78,7 +78,8 @@ def test_all_queries_compile_and_plan_and_answer_timing_adds_common_work(tmp_pat
             # classification queries at plan time, since it returns
             # no named tokens' log probabilities. A lone classification
             # chain plans on Quail's classify planner, in written order
-            runnable = {"IMDB-11", "IMDB-14", "BIO-5", "FEV-11", "AGENT-4"}
+            runnable = {"IMDB-11", "IMDB-14", "BIO-5", "FEV-11", "AGENT-4",
+                        "AGENT-5"}
             assert set(qdefs) == expected | classify, backend
             for qid, (_, build) in qdefs.items():
                 case = f"{backend} {qid}"
