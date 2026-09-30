@@ -25,6 +25,7 @@ from quail.execution.labels import (
     best_label,
     label_trie,
 )
+from quail.execution.pipelines import build_pipelines
 from quail.execution.reranker import RerankerBatch
 from quail.logical import (
     Alias,
@@ -227,20 +228,16 @@ def _topic(session, *, accepted=("refund", "shipping")):
 class _Labels:
     def __init__(self, labels):
         self.labels = labels
+        self.calls = []
 
     def score(self, spec, rows, documents):
         assert isinstance(spec, ClassifySpec)
-        values = np.asarray([self.labels[row[0]] for row in rows], dtype=object)
-        later = {}
-        for stage in spec.stages:
-            # a later stage labels the rows the gate accepts with its
-            # first label
-            later[stage.spec.name] = np.asarray([
-                stage.spec.labels[0]
-                if stage.accepted is None or label in stage.accepted else None
-                for label in values], dtype=object)
+        self.calls.append((spec.name, rows.tolist()))
+        values = np.asarray([
+            spec.labels[0] if spec.name == "kind" else self.labels[row[0]]
+            for row in rows], dtype=object)
         return RerankerBatch(values, fresh_tokens=len(rows), cached_tokens=0,
-                             suffix_tokens=3 * len(rows), later=later)
+                             suffix_tokens=3 * len(rows))
 
 
 def test_classify_plans_filters_and_returns_labels(session):
@@ -277,16 +274,19 @@ def test_classify_plans_filters_and_returns_labels(session):
     assert result.report["node_metrics"]["ai-classify:0"]["output_rows"] == 1
 
 
-def _chain(session, *, filters=1):
+def _chain(session, *, filters=1, later_filters=()):
     query = session.docs("documents").alias("d").ai_classify(
         quail.prompt("What is {0} about?", quail.col("d.body")),
         ["refund", "shipping", "praise"], name="topic")
     query = query.label_in("topic", ["refund", "shipping"], selectivity=0.5)
     if filters > 1:
         query = query.label_in("topic", ["refund"], selectivity=0.5)
-    return query.ai_classify(
+    query = query.ai_classify(
         quail.prompt("What kind of {0}?", quail.col("d.body")),
-        ["complaint", "question"], name="kind").select("d.id", "topic", "kind")
+        ["complaint", "question"], name="kind")
+    for name, accepted in later_filters:
+        query = query.label_in(name, accepted, selectivity=0.5)
+    return query.select("d.id", "topic", "kind")
 
 
 def test_sql_classifies_and_tests_labels(session):
@@ -405,31 +405,40 @@ def test_planner_prices_the_rules_and_takes_the_cheapest():
         unified.choose(1000, 20, 30, prefixed, True)
 
 
-def test_chained_classifications_share_one_node(session):
+def test_chained_classifications_share_one_pipeline(session):
     query = _chain(session)
     plan = query.plan()
     classifies = [n for n in plan.nodes if isinstance(n, AiClassify)]
-    assert len(classifies) == 1
-    (node,) = classifies
-    (stage,) = node.spec.stages
-    assert stage.spec.name == "kind" and stage.accepted == ("refund", "shipping")
-    assert node.explain_fields()["stages"] == [
-        {"accepted": ["refund", "shipping"], "output": "kind"}]
+    topic, kind = classifies
+    assert [node.spec.name for node in classifies] == ["topic", "kind"]
+    assert build_pipelines(plan.graph)[topic.node_id].node_ids == (
+        topic.node_id, "filter:d:0", kind.node_id)
     codecs = session.registry.codecs
     assert decode_graph(encode_graph(plan.graph, codecs), codecs) == plan.graph
-    # the later stage streams only its frame and suffixes
-    assert stage.spec.estimated_seconds < node.spec.estimated_seconds
+    assert kind.spec.estimated_seconds < topic.spec.estimated_seconds
 
-    result = _finish(query, session, _Labels(["refund", "praise"]))
+    scorer = _Labels(["refund", "praise"])
+    result = _finish(query, session, scorer)
     assert result.collect().to_pydict() == {
         "d.id": [7], "topic": ["refund"], "kind": ["complaint"]}
     labels = result.answer_tables["classifies"]
     assert labels["topic"].column("topic").to_pylist() == ["refund", "praise"]
-    assert labels["kind"].to_pydict() == {"d": [0], "kind": ["complaint"]}
+    assert labels["kind"].select(["d", "kind"]).to_pydict() == {
+        "d": [0], "kind": ["complaint"]}
+    assert scorer.calls == [("topic", [[0], [1]]), ("kind", [[0]])]
 
-    # a second filter between two classifications breaks the chain
     split = _chain(session, filters=2)
-    assert sum(isinstance(n, AiClassify) for n in split.plan().nodes) == 2
+    assert build_pipelines(split.plan().graph)[topic.node_id].node_ids == (
+        topic.node_id, "filter:d:0", "filter:d:1", kind.node_id)
+
+    interleaved = _chain(session, later_filters=(
+        ("kind", ("complaint",)), ("topic", ("refund",))))
+    assert build_pipelines(interleaved.plan().graph)[topic.node_id].node_ids == (
+        topic.node_id, "filter:d:0", kind.node_id, "filter:d:1", "filter:d:2")
+    scorer = _Labels(["shipping", "praise"])
+    result = _finish(interleaved, session, scorer)
+    assert result.collect().num_rows == 0
+    assert scorer.calls == [("topic", [[0], [1]]), ("kind", [[0]])]
 
 
 def test_classify_refusals_and_builder_errors(session):
@@ -542,10 +551,11 @@ def test_planner_reads_letters_on_a_diffusion_model(tmp_path):
         _bytes(letter) for letter in "ABC"[:len(classify.spec.labels)]]
     assert classify.spec.estimated_seconds > 0
     assert plan.settings["label_scoring"] == "cost model"
-    # a chain's classifications are one node's stages
     chained = _chain(session).plan()
     classifies = [n for n in chained.nodes if isinstance(n, AiClassify)]
-    assert len(classifies) == 1 and len(classifies[0].spec.stages) == 1
+    assert len(classifies) == 2
+    assert build_pipelines(chained.graph)[classifies[0].node_id].node_ids == (
+        classifies[0].node_id, "filter:d:0", classifies[1].node_id)
     session.close()
 
     forced = quail.Session(

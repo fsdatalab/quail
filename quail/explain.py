@@ -345,12 +345,6 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                            f"labels={len(spec.labels)}, "
                            f"label tokens="
                            f"{sum(len(ids) for ids in spec.label_token_ids)}")
-            for stage in spec.stages:
-                details.append(
-                    f"then {stage.spec.name}: rule={stage.spec.scoring}, "
-                    f"labels={len(stage.spec.labels)}"
-                    + (f", after label in {list(stage.accepted)}"
-                       if stage.accepted is not None else ""))
         elif isinstance(node, Filter):
             title += f": {node.predicate.describe()}"
         elif isinstance(node, AiJoin):

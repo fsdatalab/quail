@@ -781,25 +781,34 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
             deferred.add(alias)
             return
         table = classify_table(context, alias, "quail")
+        resident = alias in pipelined and live is None
         if live is None:
             live = live_asked.get(alias, float(stats[alias].n_docs))
-        for call in calls:
-            # the first classification after the alias's filters reads
-            # the KV the chain wrote
-            resident = (alias in pipelined and call is calls[0]
-                        and live is live_asked.get(alias))
-            spec, _ = table.classify(call, labels.names[call], live,
-                                     resident=resident)
-            node = table.node(spec, ids_src[alias],
-                              sum(isinstance(n, AiClassify) for n in nodes))
-            nodes.append(node)
-            classify_seconds += spec.estimated_seconds
-            scores = PortRef(node.node_id, "scores")
-            # what follows reads the labeled documents
-            ids_src[alias] = PortRef(node.node_id, f"ids:{alias}")
-            if call in labels.projected:
-                label_ports.append(scores)
-            for position in labels.tests.get(call, ()):
+        steps = [(predicate.expression.call, position)
+                 for position, predicate in enumerate(filters.get(alias, ()))
+                 if isinstance(predicate.expression, LabelIn)]
+        steps.extend((call, None) for call in calls if call not in labels.tests)
+        classified_calls = set()
+        scores = None
+        previous = None
+        for call, position in steps:
+            if call not in classified_calls:
+                if previous is not None:
+                    resident = (workers == 1
+                                and table.head(call) == table.head(previous))
+                spec, _ = table.classify(call, labels.names[call], live,
+                                         resident=resident)
+                node = table.node(spec, scores or ids_src[alias],
+                                  sum(isinstance(n, AiClassify) for n in nodes))
+                nodes.append(node)
+                classify_seconds += spec.estimated_seconds
+                scores = PortRef(node.node_id, "scores")
+                ids_src[alias] = PortRef(node.node_id, f"ids:{alias}")
+                if call in labels.projected:
+                    label_ports.append(scores)
+                classified_calls.add(call)
+                previous = call
+            if position is not None:
                 predicate = filters[alias][position]
                 lid = f"filter:{alias}:{position}"
                 nodes.append(Filter(

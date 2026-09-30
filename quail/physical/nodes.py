@@ -592,10 +592,7 @@ class ClassifySpec(ScoreSpec):
     rule the executor runs.
     ``share_prefixes`` lets a document borrow the KV pages of a
     document sharing its token prefix (the prefix_sharing rule).
-    ``stages`` are later classifications of the same documents, run
-    while each document's KV is still resident; a stage runs on the
-    documents whose previous label its gate accepts. A classification
-    of joined rows has two aliases, the anchor and its partner, and
+    A classification of joined rows has two aliases, the anchor and its partner.
     ``join_layout`` holds (the anchor note written after the anchor
     document, the partner label written before each partner
     document); its tail follows the partner.
@@ -605,7 +602,6 @@ class ClassifySpec(ScoreSpec):
     label_token_ids: tuple[tuple[int, ...], ...] = ()
     scoring: str = "letters"
     share_prefixes: bool = False
-    stages: tuple["ClassifyStage", ...] = ()
     join_layout: tuple[tuple[int, ...], tuple[int, ...]] | None = None
 
     @property
@@ -618,13 +614,11 @@ class ClassifySpec(ScoreSpec):
         """The partner alias of a classification of joined rows, else None."""
         return self.aliases[1] if len(self.aliases) == 2 else None
 
-    @property
-    def chain(self) -> tuple["ClassifySpec", ...]:
-        """This classification and every later stage's, in order."""
-        return (self,) + tuple(stage.spec for stage in self.stages)
-
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "ClassifySpec":
+        if value.get("stages"):
+            raise ValueError(
+                "nested classification stages are unsupported; replan query")
         base = ScoreSpec.from_mapping(value)
         return cls(
             **{name: getattr(base, name) for name in (
@@ -637,8 +631,6 @@ class ClassifySpec(ScoreSpec):
                 for ids in value["label_token_ids"]),
             scoring=str(value.get("scoring", "letters")),
             share_prefixes=bool(value.get("share_prefixes", False)),
-            stages=tuple(ClassifyStage.from_mapping(stage)
-                         for stage in value.get("stages", ())),
             join_layout=(None if value.get("join_layout") is None else tuple(
                 tuple(int(token) for token in part)
                 for part in value["join_layout"])),
@@ -651,36 +643,8 @@ class ClassifySpec(ScoreSpec):
             "label_token_ids": [list(ids) for ids in self.label_token_ids],
             "scoring": self.scoring,
             "share_prefixes": self.share_prefixes,
-            "stages": [stage.to_dict() for stage in self.stages],
             "join_layout": (None if self.join_layout is None
                             else [list(part) for part in self.join_layout]),
-        }
-
-
-@dataclass(frozen=True)
-class ClassifyStage:
-    """A later classification in a chain and the gate before it.
-
-    ``accepted`` names the previous stage's labels that let a document
-    through; None lets every document through.
-    """
-
-    spec: ClassifySpec
-    accepted: tuple[str, ...] | None = None
-
-    @classmethod
-    def from_mapping(cls, value: Mapping[str, Any]) -> "ClassifyStage":
-        accepted = value.get("accepted")
-        return cls(
-            spec=ClassifySpec.from_mapping(value["spec"]),
-            accepted=None if accepted is None
-            else tuple(str(label) for label in accepted),
-        )
-
-    def to_dict(self) -> dict:
-        return {
-            "spec": self.spec.to_dict(),
-            "accepted": None if self.accepted is None else list(self.accepted),
         }
 
 
@@ -713,10 +677,6 @@ class AiClassify(AiScore):
             "scoring": None if self.spec is None else self.spec.scoring,
             "share_prefixes": (False if self.spec is None
                                else self.spec.share_prefixes),
-            "stages": [] if self.spec is None else [
-                {"accepted": None if stage.accepted is None
-                 else list(stage.accepted), "output": stage.spec.name}
-                for stage in self.spec.stages],
         }
 
     @classmethod

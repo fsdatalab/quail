@@ -1,11 +1,7 @@
-"""Physical planning for AI.CLASSIFY queries on one table.
+"""Prompt preparation and scoring costs for AI.CLASSIFY operators.
 
-A plan scans the table, then for each filter on a label in written order
-classifies the documents still alive and keeps those with an accepted
-label, then classifies what the projection still needs. Each document
-is scored the way the join path scores a pair: its prompt head and
-document stay in KV, the question and category list are written once
-after it, and a suffix reads the next token's log probabilities.
+The prompt head and document stay in KV, the question and category list
+are written once after it, and a suffix reads the next token's log probabilities.
 Under the ``letters`` rule the categories are lettered, so every
 label is one token and the cue's row scores them all; under
 ``trie_tree`` the one suffix holds the labels' own tokens as a trie,
@@ -27,33 +23,15 @@ from quail.cost.work import Work, ask, scan, stream
 from quail.execution.labels import label_trie
 from quail.logical import (
     Alias,
-    Apply,
     LabelIn,
-    effective_selectivity,
     label_text,
-    true_false_token_ids,
 )
 from quail.physical import (
     AiClassify,
     ClassifySpec,
-    ClassifyStage,
-    Filter,
-    InList,
-    Limit,
-    PortRef,
-    Project,
-    Scan,
 )
 from quail.physical.base import input_ports
-from quail.planner.physical_optimizer import PhysicalCandidate
-from quail.planner.plan import PhysicalPlan, Refusal
-
-
-def _refused(reason: str, constraint: str = "unsupported_classify_query",
-             needed: int = 1, available: int = 0, unit: str = "queries"):
-    refusal = Refusal(reasons=(reason,), constraint=constraint,
-                      needed=needed, available=available, unit=unit)
-    return (PhysicalCandidate(None, refusal, float("inf")),)
+from quail.planner.plan import Refusal
 
 
 def classification_refusal(context) -> Refusal | None:
@@ -72,12 +50,13 @@ def classification_refusal(context) -> Refusal | None:
         reason = f"{model.name!r} names no answer canvas to read labels on"
     else:
         return None
-    return _refused(reason)[0].plan
+    return Refusal(reasons=(reason,), constraint="unsupported_classify_query",
+                   needed=1, available=0, unit="queries")
 
 
 def classify_table(context, alias: str, backend_name: str,
                    shared=()) -> "_Table":
-    """The classification planner for one table of the context.
+    """Prepare prompts and estimate classification work for one table.
 
     Args:
         context: The PlanningContext.
@@ -496,19 +475,16 @@ class _Table:
                         one_per_round=scoring == DECODE_SCORING,
                         shared=shared).scaled(weight)
 
-    def reestimate(self, spec: ClassifySpec) -> ClassifySpec:
+    def reestimate(self, spec: ClassifySpec, *, resident=False) -> ClassifySpec:
         """The spec with its seconds simulated again on this table.
 
-        The plan is made before the corpus is tokenized, so its
-        estimate prices every document from scratch. Once the token
-        store is known and the plan shares prefixes, the documents
-        borrowing a prefix pay only for the rest, as the filter and
-        join estimates do.
+        Documents borrowing a prefix pay only for the rest. A later
+        classification in a pipeline reads resident document KV.
         """
         head, tail = spec.prompt_token_parts
         simulated = self.simulate(
             spec.scoring, spec.expected_inputs, len(head), len(tail) - 1,
-            spec.label_token_ids, False)
+            spec.label_token_ids, resident)
         return replace(spec, estimated_seconds=simulated.seconds)
 
     def choose(self, live, head_tokens, frame_tokens, labels, resident,
@@ -567,7 +543,7 @@ class _Table:
         return best[1], best[2]
 
     def node(self, spec, input_port, index, *ports) -> AiClassify:
-        """The plan node running a classification and its chained stages."""
+        """The plan node running one classification."""
         return AiClassify(node_id=f"ai-classify:{index}",
                           inputs=input_ports((input_port, *ports)),
                           backend_name=self.backend_name,
@@ -636,162 +612,6 @@ class _Table:
         ), simulated.work
 
 
-def plan_classify(region, context, *, backend_name: str):
-    """Build one Quail plan for a table's AI.CLASSIFY columns and the filters on them.
-
-    The plan is a chain: scan the table, then for each filter on a label in
-    written order an AiClassify node (if that prompt has not been
-    classified yet) and a Filter node over its labels, then an AiClassify node for
-    each projected label column not yet classified, then the projection.
-    Each classification gets a cost estimate from the documents
-    expected to reach it and the suffix lengths of its scoring rule.
-
-    A classification that follows another on the same documents, with
-    the same prompt head and at most one filter on the label between them
-    testing the earlier label, joins the earlier node as a stage: the
-    executor runs it on the documents the filter accepts while their
-    KV is still resident.
-    """
-    logical = region.logical_plan
-    model = context.model
-    if any(isinstance(node, Apply) for node in logical.walk()):
-        return _refused("AI.CLASSIFY cannot be mixed with apply() yet")
-    operators = logical.operators()
-    if operators.joins or len(operators.scans) != 1:
-        return _refused("AI.CLASSIFY runs on one table without joins for now")
-    (source,) = operators.scans
-    alias = source.alias
-    predicates = operators.filters.get(alias, ())
-    if not all(isinstance(p.expression, LabelIn) for p in predicates):
-        return _refused(
-            "AI.CLASSIFY cannot be mixed with AI.IF or AI.SCORE yet")
-    refusal = classification_refusal(context)
-    if refusal is not None:
-        return (PhysicalCandidate(None, refusal, float("inf")),)
-    # None lets the cost model choose per classification
-    scoring = context.label_scoring
-    table = classify_table(context, alias, backend_name)
-    count = len(context.document_tokens[alias])
-    total = sum(int(length) for length in context.document_tokens[alias])
-    chunk = table.chunk
-    capacity = budgets.arena_tokens(model, context.device, chunk)
-
-    # the output column of each classified prompt
-    named = {
-        column.expression: column.name for column in logical.root.columns
-        if isinstance(column, Alias)
-    }
-    # ("classify", call) and ("filter", written position) in plan order:
-    # a prompt is classified where it is first needed
-    steps = []
-    classified = set()
-    for written_pos, predicate in enumerate(predicates):
-        test = predicate.expression
-        if test.call not in classified:
-            named.setdefault(test.call,
-                             test.name or f"__label_{alias}_{written_pos}")
-            classified.add(test.call)
-            steps.append(("classify", test.call))
-        steps.append(("filter", written_pos))
-    steps.extend(("classify", call) for call in named if call not in classified)
-
-    nodes = [Scan(node_id=f"scan:{alias}", alias=alias, input_id=alias,
-                  n_docs=count, total_tokens=total, shard_ranges=((0, count),),
-                  shard_token_loads=(total,))]
-    current = PortRef(nodes[0].node_id, f"ids:{alias}")
-    work = Work()
-    seconds = 0.0
-    live = float(count)
-    chain = None          # index in nodes of the open classify chain
-    last_call = None      # the chain's latest stage
-    since = []            # filters on a label since that stage
-    for kind, item in steps:
-        if kind == "classify":
-            # a classification after another on the same documents
-            # reads their resident KV (in one node, or in one pipeline
-            # of two nodes)
-            follows = (chain is not None and len(since) <= 1
-                       and all(predicates[p].expression.call is last_call
-                               for p in since)
-                       and table.head(item) == table.head(last_call))
-            try:
-                spec, step = table.classify(item, named[item], live,
-                                            resident=follows)
-            except ClassifyRefusedError as refused:
-                return (PhysicalCandidate(None, refused.refusal(),
-                                          float("inf")),)
-            work += step
-            seconds += spec.estimated_seconds
-            # a decoded classification's rounds are its own node's stages
-            joins = follows and DECODE_SCORING not in (
-                nodes[chain].spec.scoring, spec.scoring)
-            if joins:
-                gate = (tuple(predicates[since[0]].expression.accepted)
-                        if since else None)
-                root = nodes[chain]
-                nodes[chain] = replace(root, spec=replace(
-                    root.spec, stages=root.spec.stages
-                    + (ClassifyStage(spec=spec, accepted=gate),)))
-            else:
-                chain = len(nodes)
-                nodes.append(table.node(
-                    spec, current, sum(isinstance(n, AiClassify)
-                                       for n in nodes)))
-                current = PortRef(nodes[chain].node_id, "scores")
-            last_call, since = item, []
-        else:
-            predicate = predicates[item]
-            node = Filter(
-                node_id=f"filter:{alias}:{item}",
-                inputs=input_ports((current,)),
-                predicate=InList(named[predicate.expression.call],
-                                 tuple(predicate.expression.accepted)),
-                aliases=(alias,), selectivity=predicate.selectivity,
-                written_pos=item)
-            live *= effective_selectivity(predicate.selectivity)
-            nodes.append(node)
-            current = PortRef(node.node_id, "scores")
-            since.append(item)
-
-    columns = tuple(
-        column.name if isinstance(column, Alias)
-        else f"{column.alias}.{column.column}"
-        for column in logical.root.columns)
-    nodes.append(Project(node_id="project", inputs=input_ports((current,)),
-                         columns=columns))
-    if logical.root.limit is not None:
-        nodes.append(Limit(node_id="limit",
-                           inputs=input_ports((PortRef("project", "rows"),)),
-                           count=logical.root.limit))
-    # the GPU boots with the TRUE/FALSE rows every Quail query retains,
-    # so a loaded model serves filters and classifications alike
-    true_ids, false_ids = true_false_token_ids(context.tokenizer)
-    plan = PhysicalPlan(
-        model=model.name,
-        device=context.device.name,
-        workers=context.gpu_count,
-        backend=backend_name,
-        estimated_seconds=seconds,
-        nodes=tuple(nodes),
-        settings={
-            "chunk_tokens": chunk,
-            "true_ids": true_ids,
-            "false_ids": false_ids,
-            "retained_kv_tokens": capacity,
-            "prefix_reuse": "document KV shared by every label suffix and "
-                            "by every chained classification",
-            "survivor_assumption": "uniform independent selection",
-            "estimated_fresh_tokens": work.tokens,
-            "estimated_attention_pairs": work.pairs,
-            "batching": "token_based_admission",
-            "data_parallel_copies": context.gpu_count,
-            "label_scoring": scoring or "cost model",
-            "order_rule": "written order",
-        },
-    )
-    return (PhysicalCandidate(plan.graph, plan, seconds),)
-
-
 class ClassifyRefusedError(Exception):
     """A classification the forward pass budget cannot hold."""
 
@@ -801,5 +621,5 @@ class ClassifyRefusedError(Exception):
 
     def refusal(self) -> Refusal:
         """The planning refusal this exception stands for."""
-        return _refused(self.reason, "suffix_over_chunk", self.needed,
-                        self.available, "tokens")[0].plan
+        return Refusal(reasons=(self.reason,), constraint="suffix_over_chunk",
+                       needed=self.needed, available=self.available, unit="tokens")

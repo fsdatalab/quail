@@ -2,8 +2,7 @@
 
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass, field, replace
-from typing import Any
+from dataclasses import dataclass, replace
 
 import numpy as np
 import pyarrow as pa
@@ -120,9 +119,6 @@ class RerankerBatch:
     borrowed_tokens: int = 0
     # host seconds spent building forward chunks
     pack_s: float = 0.0
-    # a classify chain's later stages: output name -> one label per
-    # row, None for a row its gate stopped
-    later: Mapping[str, Any] = field(default_factory=dict)
     # forward-chunk seconds on the GPU and chunks launched; both zero
     # unless the session asked for GPU timing
     gpu_s: float = 0.0
@@ -237,10 +233,7 @@ def scored_batch(node, rows, table) -> dict:
                "rows": (rows[:, 0].tolist() if rows.shape[1] == 1
                         else rows.tolist())}
     if isinstance(node.spec, ClassifySpec):
-        later = {stage.spec.name: table.column(stage.spec.name).to_pylist()
-                 for stage in node.spec.stages}
-        return {**payload, "kind": "label", "labels": values,
-                **({"stages": later} if later else {})}
+        return {**payload, "kind": "label", "labels": values}
     return {**payload, "scores": [round(float(value), 4) for value in values]}
 
 
@@ -254,21 +247,9 @@ def classify_outputs(node, table) -> dict:
 
 
 def classify_label_tables(spec, table) -> dict:
-    """Return each classification's label table from a classify node's scores.
-
-    The chain's first stage labels every row but those whose decoded
-    answer named no label. A later stage's table holds only the rows
-    its gate let through, with its own label column.
-    """
-    tables = {spec.name: table.filter(pc.is_valid(table.column(spec.name)))}
-    if len(spec.aliases) != 1:
-        return tables       # a classification of joined rows has no stages
-    (alias,) = spec.aliases
-    for stage in spec.stages:
-        name = stage.spec.name
-        rows = table.filter(pc.is_valid(table.column(name)))
-        tables[name] = rows.select([alias, name])
-    return tables
+    """Return the classification's label table, excluding rows without a label."""
+    labels = table.select([*spec.aliases, spec.name])
+    return {spec.name: labels.filter(pc.is_valid(labels.column(spec.name)))}
 
 
 def score_in_batches(node, inputs, score_batches, shards: int = 1,
@@ -386,8 +367,6 @@ class RerankerModelExecution:
         )
         table = _score_table(rows, spec.aliases, spec.name, batch.scores,
                              _value_type(spec))
-        for name, values in batch.later.items():
-            table = table.append_column(name, pa.array(values, pa.string()))
         count = len(rows)
         return NodeResult(
             {"scores": table},

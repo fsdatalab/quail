@@ -37,7 +37,7 @@ from quail.execution.runner import (
     foreign_outputs,
 )
 from quail.execution.tokens import DocumentKeys, DocumentPrefixes, prefix_tree
-from quail.logical import Alias, LabelIn, is_score, shared_preamble
+from quail.logical import Alias, is_score, shared_preamble
 from quail.logical.prompts import true_false_token_ids
 from quail.physical import (
     AiClassify,
@@ -51,7 +51,7 @@ from quail.physical import (
     ValueType,
 )
 from quail.planner import plan_quail
-from quail.planner.classify import has_label, plan_classify
+from quail.planner.classify import has_label
 from quail.planner.physical_optimizer import (
     ModelRegion,
     PhysicalCandidate,
@@ -252,7 +252,9 @@ class QuailModelExecution:
             labeled = next(part for part in reversed(parts)
                            if isinstance(part, _ClassifyPart)
                            and part.node.spec.name == node.column)
-            return _LabelGate(node, labeled)
+            source = next(part for part in parts
+                          if part.node.node_id == node.inputs[0].source.node_id)
+            return _LabelGate(node, labeled, source)
         if isinstance(node, Foreign):
             values = {}
             for port in node.inputs:
@@ -585,9 +587,9 @@ class _ClassifyPart:
 
     def label(self, document) -> str | None:
         """The document's label so far, by its id."""
-        return self.plan.labels[0][self.ids.index(document)] \
+        return self.plan.labels[self.ids.index(document)] \
             if not hasattr(self, "_position") else \
-            self.plan.labels[0][self._position[document]]
+            self.plan.labels[self._position[document]]
 
     def finish(self, every) -> int:
         """Label the documents; returns the frame and suffix tokens packed."""
@@ -617,17 +619,13 @@ class _ClassifyPart:
                            "input_rows": len(pairs),
                            "suffix_tokens": self.suffix_tokens}))
         # a document whose answer named no label has no row
-        labeled = [index for index, label in enumerate(plan.labels[0])
+        labeled = [index for index, label in enumerate(plan.labels)
                    if label is not None]
         rows = np.asarray([[self.ids[index]] for index in labeled],
                           dtype=np.int32).reshape(-1, 1)
         table = _score_table(rows, spec.aliases, spec.name,
-                             [plan.labels[0][index] for index in labeled],
+                             [plan.labels[index] for index in labeled],
                              pa.string())
-        for name, values in plan.later().items():
-            table = table.append_column(
-                name, pa.array([values[index] for index in labeled],
-                               pa.string()))
         # the labels the parts before it gave these documents, as a
         # classify node on its own carries them from its scores input
         table = attach_prior_columns(table, {
@@ -673,15 +671,16 @@ class _LabelGate:
     document_done = None
     result_value = None
 
-    def __init__(self, node, labeled: _ClassifyPart):
+    def __init__(self, node, labeled: _ClassifyPart, source):
         self.node = node
         self.labeled = labeled
+        self.source = source
         self.predicate = node.predicate
         self.position = {document: index
                          for index, document in enumerate(labeled.ids)}
 
     def gate(self, key):
-        label = self.labeled.plan.labels[0][self.position[key[1]]]
+        label = self.labeled.plan.labels[self.position[key[1]]]
         return None if self.predicate.accepts(label) else Stage.DROP
 
     def finish(self, every):
@@ -689,7 +688,7 @@ class _LabelGate:
 
     def result(self, tokens, gpu_s, chunks, stats) -> NodeResult:
         return filter_scores(self.node,
-                             self.labeled.result_value.outputs["scores"])
+                             self.source.result_value.outputs["scores"])
 
 
 class _ApplyGate:
@@ -921,15 +920,6 @@ class QuailBackend:
                     reasons=("a reranker model cannot run AI.CLASSIFY",),
                     constraint="reranker_only_scores", needed=1, available=0,
                     unit="AI.CLASSIFY expressions"), float("inf")),)
-            asked = any(not isinstance(predicate.expression, LabelIn)
-                        for predicates in operators.filters.values()
-                        for predicate in predicates)
-            # a classification with nothing else runs on its own planner,
-            # which chains classifications; beside AI.IF or joins it is
-            # a step of the general plan
-            if not asked and not operators.joins \
-                    and len(operators.scans) == 1:
-                return plan_classify(region, context, backend_name=self.name)
         has_score = any(
             is_score(predicate.expression)
             for predicates in operators.filters.values()

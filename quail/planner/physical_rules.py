@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from quail.cost.budgets import choose_attention_path
+from quail.execution.pipelines import build_pipelines
 from quail.physical import AiClassify, AiFilter, AiJoin, PhysicalGraph
 from quail.planner.prefixes import document_shared_tokens, page_tree
 
@@ -84,6 +85,7 @@ class PrefixSharing:
             return None
         nodes = []
         changed = False
+        pipelines = build_pipelines(graph) if context.gpu_count == 1 else {}
         for node in graph.nodes:
             if isinstance(node, AiFilter) and not node.share_prefixes:
                 lengths = context.document_tokens.get(node.alias)
@@ -113,8 +115,11 @@ class PrefixSharing:
                         context.model, context.device,
                         shared_tokens=page_aligned_shared_tokens(store),
                         total_tokens=sum(lengths), writes_pages=True):
+                    pipeline = pipelines.get(node.node_id)
+                    resident = (pipeline is not None
+                                and pipeline.members[0].node_id != node.node_id)
                     node = replace(node, spec=_shared_classify_spec(
-                        node, context, store))
+                        node, context, store, resident=resident))
                     changed = True
             nodes.append(node)
         if not changed:
@@ -122,13 +127,13 @@ class PrefixSharing:
         return PhysicalGraph(tuple(nodes), graph.root)
 
 
-def _shared_classify_spec(node, context, store):
+def _shared_classify_spec(node, context, store, *, resident=False):
     """The node's spec sharing prefixes, re-estimated on the token store."""
     from quail.planner.classify import classify_table
 
     table = classify_table(context, node.spec.aliases[0], node.backend_name,
                            shared=document_shared_tokens(store))
-    return table.reestimate(replace(node.spec, share_prefixes=True))
+    return table.reestimate(replace(node.spec, share_prefixes=True), resident=resident)
 
 
 def _mean(values) -> float:

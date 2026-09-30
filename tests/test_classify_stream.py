@@ -1,5 +1,6 @@
 """A classification's stages inside the chain and join of its table."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -104,8 +105,8 @@ class LabelingModel(FakeModel):
         return rows
 
 
-def fused_graph():
-    """The r chain, its classification, a filter on its label, and a join with p."""
+def fused_graph(*, classify_only=False):
+    """Two classifications and a label filter, optionally with AI.IF and a join."""
     spec = ClassifySpec(
         name="topic", aliases=("r",), query_template="", arguments=(),
         expected_inputs=14, estimated_seconds=0.0,
@@ -129,9 +130,20 @@ def fused_graph():
             inputs=input_ports((PortRef("classify:r", "scores"),)),
             predicate=InList("topic", ("a",)), aliases=("r",),
             selectivity=0.5, written_pos=1),
+        Filter(
+            node_id="label:again",
+            inputs=input_ports((PortRef("label:r", "scores"),)),
+            predicate=InList("topic", ("a",)), aliases=("r",),
+            selectivity=1.0, written_pos=2),
+        AiClassify(
+            node_id="classify:kind",
+            inputs=input_ports((PortRef("label:again", "scores"),)),
+            backend_name="quail", model="qwen3-4b-fp8",
+            spec=replace(spec, name="kind", labels=("b", "a"),
+                         prompt_token_parts=((), (CLASSIFY_FRAME + 1, CUE)))),
         AiJoin(
             node_id="group:0", anchor="r", anchor_resident="filter",
-            inputs=input_ports((PortRef("label:r", "ids:r"),
+            inputs=input_ports((PortRef("classify:kind", "ids:r"),
                                 PortRef("input:p", "ids:p"))),
             stages=(JoinStage(
                 written_pos=2, exec_idx=0, anchor="r", partners=("p",),
@@ -141,6 +153,12 @@ def fused_graph():
                 frame_token_ids=(FRAME,), label_token_ids=(("p", ()),),
                 tail_token_ids=()),)),
     ]
+    if classify_only:
+        nodes = [node for node in nodes if node.node_id not in (
+            "input:p", "filter:r", "group:0")]
+        nodes = [replace(node, inputs=input_ports((PortRef("input:r", "ids:r"),)))
+                 if node.node_id == "classify:r" else node for node in nodes]
+        return PhysicalGraph(tuple(nodes), PortRef("classify:kind", "scores"))
     return PhysicalGraph(tuple(nodes), PortRef("group:0", "ids:r"))
 
 
@@ -349,8 +367,9 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
         assert metrics["group:0"]["fresh_tokens"] == 1 + 2
 
 
+@pytest.mark.parametrize("classify_only", [False, True])
 def test_streamed_classification_labels_survivors_with_their_kv_resident(
-        monkeypatch):
+        monkeypatch, classify_only):
     monkeypatch.setattr(loop, "pack_chunk", fake_pack)
     n_docs, n_partners = 14, 4
     docs = {
@@ -361,7 +380,8 @@ def test_streamed_classification_labels_survivors_with_their_kv_resident(
     label_truth = [d % 2 for d in range(n_docs)]           # even: "a"
     join_truth = {("r", d): [(d + i) % 3 == 0 for i in range(n_partners)]
                   for d in range(n_docs)}
-    model = LabelingModel(filter_truth, join_truth, label_truth)
+    model = LabelingModel([] if classify_only else filter_truth,
+                          join_truth, label_truth)
     torch = fake_torch()
     arena = cpu_arena(64)
     pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
@@ -400,10 +420,11 @@ def test_streamed_classification_labels_survivors_with_their_kv_resident(
         "model_spec": MODELS["qwen3-4b-fp8"], "device": DEVICES["h100-sxm"],
         "chunk_tokens": 120, "docs": docs,
     }
-    result = execute_single_graph(state, SETTINGS, fused_graph())
+    result = execute_single_graph(
+        state, SETTINGS, fused_graph(classify_only=classify_only))
     assert not arena.accounting.owned
 
-    passed = [d for d in range(n_docs) if filter_truth[d][0]]
+    passed = [d for d in range(n_docs) if classify_only or filter_truth[d][0]]
     accepted = [d for d in passed if label_truth[d] == 0]
     matched = [d for d in accepted if any(join_truth[("r", d)])]
     outputs = result["_outputs"]
@@ -416,23 +437,34 @@ def test_streamed_classification_labels_survivors_with_their_kv_resident(
         == passed
     assert outputs[PortRef("label:r", "ids:r")].column("r").to_pylist() \
         == accepted
-    assert outputs[PortRef("group:0", "ids:r")].column("r").to_pylist() \
-        == matched
-    # the chain packed every document once; the classification and the
-    # join packed only frames and suffixes after resident KV
+    assert metrics["label:again"]["input_rows"] == len(accepted)
+    later = outputs[PortRef("classify:kind", "scores")]
+    assert later.to_pydict() == {
+        "r": accepted, "kind": ["b"] * len(accepted),
+        "topic": ["a"] * len(accepted)}
     prefill = sum(len(docs["r"][d]) for d in range(n_docs))
-    assert metrics["filter:r"]["fresh_tokens"] == prefill + n_docs
-    # a one-token frame and the cue per survivor
-    assert metrics["classify:r"]["fresh_tokens"] == 2 * len(passed)
+    if classify_only:
+        assert metrics["classify:r"]["fresh_tokens"] == prefill + 2 * n_docs
+    else:
+        assert outputs[PortRef("group:0", "ids:r")].column("r").to_pylist() \
+            == matched
+        assert metrics["filter:r"]["fresh_tokens"] == prefill + n_docs
+        assert metrics["classify:r"]["fresh_tokens"] == 2 * len(passed)
+    prefills = [entry["key"][1] for chunk in model.launched for entry in chunk
+                if entry["prefix"] is not None]
+    assert sorted(prefills) == list(range(n_docs))
     assert metrics["classify:r"]["evaluated_documents"] == len(passed)
     assert metrics["classify:r"]["suffix_tokens"] == len(passed)
+    assert metrics["classify:kind"]["fresh_tokens"] == 2 * len(accepted)
+    assert metrics["classify:kind"]["evaluated_documents"] == len(accepted)
     # some chunk held documents at the chain's stage beside documents
     # at the classification's or the join's
     heads = [{suffix[0] for spec in specs for suffix in spec["suffixes"]}
              for specs in model.launched]
-    assert any(QUESTION in chunk and (CUE in chunk or chunk & {FRAME})
-               or CLASSIFY_FRAME in chunk and FRAME in chunk
-               for chunk in heads)
+    if not classify_only:
+        assert any(QUESTION in chunk and (CUE in chunk or chunk & {FRAME})
+                   or CLASSIFY_FRAME in chunk and FRAME in chunk
+                   for chunk in heads)
 
 
 def joined_graph():
@@ -548,5 +580,3 @@ def test_a_classification_of_joined_rows_runs_after_its_join_on_the_anchors_kv(
     # the join packed every anchor, its frame, and both partners' suffixes
     assert metrics["group:0"]["fresh_tokens"] == sum(map(len, docs["r"])) \
         + 3 * 1 + 6 * 2
-
-
