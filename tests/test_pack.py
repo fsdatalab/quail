@@ -5,7 +5,14 @@ import random
 import pytest
 from fakes import expected_filter_rows
 
-from quail.backends.quail.executor.pack import SKIP, JoinAdmission, pages_for
+from quail.backends.quail.executor.pack import (
+    DROP,
+    SKIP,
+    AdmissionReport,
+    JoinAdmission,
+    Settlement,
+    pages_for,
+)
 from quail.execution.tokens import PrefixTree
 
 
@@ -23,9 +30,10 @@ def _drive_join(sched, truth, arena_pages, resident=None,
         free += held.pop(a, 0)
 
     while not sched.done():
-        for kind, anchor in sched.take_settled():
-            events.append((kind, anchor))
-            settle(anchor)
+        for settlement in sched.take_settled():
+            assert not settlement.survived
+            events.append((settlement.kind, settlement.anchor))
+            settle(settlement.anchor)
         groups = sched.next_chunk(free)
         if groups:
             for a, j, start, end, carried in groups:
@@ -50,9 +58,10 @@ def _drive_join(sched, truth, arena_pages, resident=None,
         while len(outstanding) > lag:
             for a, j, start, end, _ in outstanding.pop(0):
                 bits = truth[a][j][start:end]
-                for kind, anchor in sched.report(a, j, start, end, bits):
-                    events.append((kind, anchor))
-                    settle(anchor)
+                report = sched.report(a, j, start, end, bits)
+                for settlement in report.settlements:
+                    events.append((settlement.kind, settlement.anchor))
+                    settle(settlement.anchor)
     assert free == arena_pages, "pages leaked or freed twice"
     return chunks, events
 
@@ -412,13 +421,61 @@ def test_a_skipped_stage_passes_the_anchor_on_with_nothing_asked():
                           anchor_partners=asks)
     groups = sched.next_chunk(100)
     assert [(a, j) for a, j, *_ in groups] == [(0, 0), (1, 0)]
-    assert sched.report(0, 0, 0, 1, [1]) == []
-    assert sched.report(1, 0, 0, 1, [1]) == []
+    assert sched.report(0, 0, 0, 1, [1]) == AdmissionReport(
+        transitions=((0, 0, True),))
+    assert sched.report(1, 0, 0, 1, [1]) == AdmissionReport(
+        transitions=((1, 0, True),))
     assert [(a, j) for a, j, *_ in sched.next_chunk(100)] == [(0, 2), (1, 1)]
-    assert sched.report(0, 2, 0, 1, [1]) == [("finished", 0)]
-    assert sched.report(1, 1, 0, 1, [1]) == [("finished", 1)]
+    assert sched.report(0, 2, 0, 1, [1]) == AdmissionReport(
+        (Settlement("finished", 0, True),), ((0, 2, True),))
+    assert sched.report(1, 1, 0, 1, [1]) == AdmissionReport(
+        (Settlement("finished", 1, True),), ((1, 1, True),))
     assert sched.done() and sched.survivors == 2
     assert sched.answers[1] == {1: [1]} and sched.answers[2] == {0: [1]}
     with pytest.raises(ValueError, match="first stage cannot be skipped"):
         JoinAdmission([50], [[10]], 250, arena_pages=100, page_tokens=16,
                       anchor_partners={0: lambda j: SKIP})
+
+
+@pytest.mark.parametrize("custom_decision", [False, True])
+def test_stage_transition_waits_for_launches_and_respects_custom_decision(
+        custom_decision):
+    sched = JoinAdmission(
+        [8], [[8, 8, 8, 8], [8]], 16, arena_pages=20, page_tokens=16,
+        advance=(lambda a, j, row: all(row)) if custom_decision else None)
+    assert sched.next_chunk(20) == [(0, 0, 0, 1, True)]
+    # Even a TRUE answer cannot advance before all requests are launched.
+    assert sched.report(0, 0, 0, 1, [1]) == AdmissionReport()
+    assert sched.next_chunk(20) == [(0, 0, 1, 3, False)]
+    assert sched.next_chunk(20) == [(0, 0, 3, 4, False)]
+    partial = sched.report(0, 0, 1, 3, [0, 0])
+    if custom_decision:
+        # A custom decision can reject a row despite its first TRUE answer.
+        assert partial == AdmissionReport()
+        assert sched.next_chunk(20) == []
+        assert sched.report(0, 0, 3, 4, [0]) == AdmissionReport(
+            (Settlement("dropped", 0, False),), ((0, 0, False),))
+    else:
+        # The next stage starts before the rest of the prior row returns.
+        assert partial == AdmissionReport(transitions=((0, 0, True),))
+        assert sched.next_chunk(20) == [(0, 1, 0, 1, False)]
+        assert sched.report(0, 0, 3, 4, [0]) == AdmissionReport()
+        assert sched.report(0, 1, 0, 1, [1]) == AdmissionReport(
+            (Settlement("finished", 0, True),), ((0, 1, True),))
+    assert sched.done()
+
+
+@pytest.mark.parametrize("selection, stages, kind", [
+    (DROP, 2, "dropped"),
+    ([], 2, "finished"),
+    ([], 3, "dropped"),
+])
+def test_next_stage_settlement_preserves_the_answered_stage_decision(
+        selection, stages, kind):
+    sched = JoinAdmission(
+        [8], [[8]] * stages, 16, arena_pages=20, page_tokens=16,
+        anchor_partners={0: lambda j: None if j == 0 else selection})
+    assert sched.next_chunk(20) == [(0, 0, 0, 1, True)]
+    assert sched.report(0, 0, 0, 1, [1]) == AdmissionReport(
+        (Settlement(kind, 0, False),), ((0, 0, True),))
+    assert sched.done() and sched.survivors == 0

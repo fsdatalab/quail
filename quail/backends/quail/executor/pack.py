@@ -11,6 +11,7 @@ chunks.
 
 from bisect import bisect_right
 from collections import deque
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -179,6 +180,29 @@ DROP = object()
 SKIP = object()
 
 
+@dataclass(frozen=True)
+class Settlement:
+    """A settled document and whether it survived the last stage."""
+
+    kind: str
+    anchor: int
+    survived: bool
+
+
+@dataclass(frozen=True)
+class AdmissionReport:
+    """Settlements and stage decisions caused by one group's answers.
+
+    Each transition is (anchor, reported stage, passed). Passing a stage
+    remains true when requests at the next stage drop the document.
+    Skipped stages do not add transitions, and late answers for a stage
+    that already advanced do not repeat its transition.
+    """
+
+    settlements: tuple[Settlement, ...] = ()
+    transitions: tuple[tuple[int, int, bool], ...] = ()
+
+
 class JoinAdmission:
     """Join scheduler: continuous anchor admission, stages mixed in one chunk.
 
@@ -336,7 +360,11 @@ class JoinAdmission:
             self.borrowing.detach(a)
 
 
-    def _count(self, a, j):
+    def partner_count(self, a, j):
+        """Number of requests at a stage, before or after lazy selection.
+
+        A lazy stage not yet entered counts its full suffix list.
+        """
         lst = self._lists[a][j]
         return len(self.stages[j]) if lst is None else len(lst)
 
@@ -369,7 +397,7 @@ class JoinAdmission:
             if ask is not None:
                 self._lists[a][j], self._cums[a][j] = self._partner_list(
                     a, j, lst)
-            if self._count(a, j):
+            if self.partner_count(a, j):
                 return None
             # an empty row at the last stage, dropped otherwise
             self._stage[a] = _DONE
@@ -443,11 +471,12 @@ class JoinAdmission:
         self._stage.append(-1)
         self._next.append(0)
         self._true.append([False] * k)
-        if self._count(a, 0) == 0:
+        if self.partner_count(a, 0) == 0:
             # nothing to evaluate: the anchor settles without a chunk
             self._first.append(0)
             self._stage[a] = _DONE
-            self._settled.append(("finished" if k == 1 else "dropped", a))
+            self._settled.append(Settlement(
+                "finished" if k == 1 else "dropped", a, False))
             self.borrowing.skip(a)
             return a
         first = self.frame_rows[0] + self._suffix(a, 0, 0)
@@ -462,7 +491,7 @@ class JoinAdmission:
             largest = max(
                 (self._suffix_page_cost(a, j, i)
                  for j in range(k) if lazy is None or j == 0
-                 for i in range(self._count(a, j))),
+                 for i in range(self.partner_count(a, j))),
                 default=0,
             )
             if lazy is not None:
@@ -505,8 +534,8 @@ class JoinAdmission:
     def take_settled(self):
         """Events for anchors that settled without running a chunk.
 
-        Returns ("finished", a) or ("dropped", a) pairs, as report()
-        does, and clears them.
+        Returns Settlement records, as report().settlements does,
+        and clears them.
         """
         events, self._settled = self._settled, []
         return events
@@ -551,7 +580,7 @@ class JoinAdmission:
             key = (a, j)
             if key not in self._page_cums:
                 costs = [0]
-                for index in range(self._count(a, j)):
+                for index in range(self.partner_count(a, j)):
                     costs.append(costs[-1] + self._suffix_page_cost(a, j, index))
                 self._page_cums[key] = costs
             costs = self._page_cums[key]
@@ -563,7 +592,7 @@ class JoinAdmission:
         """Record a launched group; True when the stream continues."""
         self._next[a] = end
         self.in_flight += 1
-        return end < self._count(a, j)
+        return end < self.partner_count(a, j)
 
     def next_chunk(self, free_pages):
         """Groups for the next chunk: [(anchor, stage, start, end, carried)].
@@ -657,9 +686,10 @@ class JoinAdmission:
     def report(self, a, j, start, end, bits):
         """Record one group's answers.
 
-        Returns events: ("dropped", a) when every partner at a stage
-        before the last answered FALSE, so the anchor's pages can go;
-        ("finished", a) when its last-stage row is complete.
+        Returns an AdmissionReport with settlements and stage transitions.
+        A transition records this stage's decision even if requests at a
+        later stage immediately settle the document. Settlements include
+        final survival, including a skipped last stage.
         """
         dtype = self.answer_dtypes[j]
         if dtype is None:
@@ -667,7 +697,7 @@ class JoinAdmission:
             received = len(row)
         else:
             if a not in self.answers[j]:
-                self.answers[j][a] = np.empty(self._count(a, j), dtype=dtype)
+                self.answers[j][a] = np.empty(self.partner_count(a, j), dtype=dtype)
             row = self.answers[j][a]
             received = self._answer_counts[j].get(a, 0)
         if received != start or len(bits) != end - start:
@@ -681,33 +711,39 @@ class JoinAdmission:
             self._answer_counts[j][a] = end
         self.in_flight -= 1
         k = len(self.stages)
-        n_j = self._count(a, j)
+        n_j = self.partner_count(a, j)
         complete = end == n_j
         if self.advance is not None:
             if complete:
                 self._true[a][j] = bool(self.advance(a, j, row))
         elif (any(bits) if dtype is None else np.any(bits)):
             self._true[a][j] = True
-        events = []
+        settlements = []
+        transitions = []
         if j == self._stage[a] and j + 1 < k:
             if self._true[a][j] and self._next[a] == n_j:
                 # the whole stream is launched, so every later chunk
                 # is behind it on the stream and the next stage's
                 # frame write cannot race a read of this stage's
+                transitions.append((a, j, True))
                 settled = self._enter(a, j + 1)
                 if settled is None:
                     self.ready.append(a)
                 else:
-                    events.append((settled, a))
+                    settlements.append(Settlement(
+                        settled, a, bool(self._true[a][-1])))
             elif complete and not self._true[a][j]:
                 self._stage[a] = _DONE
-                events.append(("dropped", a))
+                transitions.append((a, j, False))
+                settlements.append(Settlement("dropped", a, False))
         if j == k - 1 and complete:
             self._stage[a] = _DONE
             if self._true[a][j]:
                 self.survivors += 1
-            events.append(("finished", a))
-        return events
+            survived = bool(self._true[a][j])
+            transitions.append((a, j, survived))
+            settlements.append(Settlement("finished", a, survived))
+        return AdmissionReport(tuple(settlements), tuple(transitions))
 
     def limit_reached(self) -> bool:
         """Whether enough anchors survived the last stage to stop admitting."""

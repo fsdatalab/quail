@@ -16,6 +16,7 @@ go free as soon as a decision drops it or its last stage answers.
 
 import time
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any, Callable
 
 import numpy as np
@@ -136,6 +137,14 @@ def frame_writes(stages) -> list:
     return writes
 
 
+def _advance_stage(stages, a, j, row):
+    """Apply the stage's decision after its complete row has returned."""
+    stage = stages[j]
+    if stage.decide is None:
+        return bool(any(row) if stage.readout.dtype is None else np.any(row))
+    return bool(stage.decide(a, row))
+
+
 def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                anchor_keys=None, on_settled=None, staging=None,
                attention_mode=None, prefix_tree=None, stats=None,
@@ -185,275 +194,282 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
         (stage, start_event, end_event) per forward; tokens = fresh
         tokens packed.
     """
-    from quail.backends.quail.executor.loop import (
-        ArenaFullError,
-        Suffixes,
-        _forward,
-        attention_path,
-        borrow_check,
-        lowest_borrows,
-        pack_chunk,
-    )
-
-    k = len(stages)
-    if k == 0:
+    if not stages:
         return [], [], 0
-    if not paged and (k > 1 or prefix_tree is not None
-                      or any(len(stage.suffixes) != 1 for stage in stages)):
-        raise ValueError("the unpaged path runs one stage of one suffix")
-    prefixes = anchor_prefixes
-    keys = (list(range(len(prefixes))) if anchor_keys is None
-            else anchor_keys)
-    if len(keys) != len(prefixes):
-        raise ValueError("anchor_keys must match anchor_prefixes")
-    frames = [list(stage.frame) for stage in stages]
-    frame_ids = [np.asarray(frame, dtype=np.int64) for frame in frames]
-    writes = frame_writes(stages)
-    suffixes = [Suffixes.of(stage.suffixes) for stage in stages]
-    read_rows = [None if stage.read_rows is None
-                 else np.asarray(stage.read_rows, dtype=np.int64)
-                 for stage in stages]
-    # a stage's suffixes read their document: tree unless the plan says;
-    # a stage packing chains needs the tree path whatever the plan said
-    if any(stage.chains is not None for stage in stages):
-        attention_mode = "tree"
-    mode = attention_path(pipeline, attention_mode, default=default_attention)
-    canvas = tuple(pipeline.canvas_ids)
-    answer_row = pipeline.canvas_answer_row
-    # per stage, the canvas rows after each suffix
-    canvas_rows = [len(canvas) if stage.canvas is None else stage.canvas_rows
-                   for stage in stages]
+    return _StageExecutor(
+        torch, arena, pipeline, stages, anchor_prefixes, budget,
+        anchor_keys=anchor_keys, on_settled=on_settled, staging=staging,
+        attention_mode=attention_mode, prefix_tree=prefix_tree, stats=stats,
+        limit=limit, paged=paged, unit=unit, label=label,
+        default_attention=default_attention, on_chunk=on_chunk,
+    ).run()
 
-    def entry_rows(a, j, start, end, carried):
-        f = len(prefixes[a])
-        indices = sched.partner_indices(a, j, start, end)
-        lengths = suffixes[j].lengths_at(indices)
+
+class _StageExecutor:
+    """Own one run's admission, packed inputs, pending answers, and metrics."""
+
+    def __init__(self, torch, arena, pipeline, stages, anchor_prefixes, budget, *,
+                 anchor_keys, on_settled, staging, attention_mode, prefix_tree,
+                 stats, limit, paged, unit, label, default_attention, on_chunk):
+        from quail.backends.quail.executor.loop import (
+            Suffixes,
+            attention_path,
+            borrow_check,
+            lowest_borrows,
+        )
+
+        self.torch = torch
+        self.arena = arena
+        self.pipeline = pipeline
+        self.stages = stages
+        self.on_settled = on_settled
+        self.staging = staging
+        self.stats = stats
+        self.paged = paged
+        self.on_chunk = on_chunk
+        self.label = label
+
+        k = len(self.stages)
+        if not self.paged and (
+                k > 1 or prefix_tree is not None
+                or any(len(stage.suffixes) != 1 for stage in self.stages)):
+            raise ValueError("the unpaged path runs one stage of one suffix")
+        self.prefixes = anchor_prefixes
+        self.keys = (list(range(len(self.prefixes))) if anchor_keys is None
+                     else anchor_keys)
+        if len(self.keys) != len(self.prefixes):
+            raise ValueError("anchor_keys must match anchor_prefixes")
+        self.frames = [list(stage.frame) for stage in self.stages]
+        self.frame_ids = [np.asarray(frame, dtype=np.int64) for frame in self.frames]
+        self.writes = frame_writes(self.stages)
+        self.suffixes = [Suffixes.of(stage.suffixes) for stage in self.stages]
+        self.read_rows = [None if stage.read_rows is None
+                          else np.asarray(stage.read_rows, dtype=np.int64)
+                          for stage in self.stages]
+        # Stages packing label chains always need tree attention.
+        if any(stage.chains is not None for stage in self.stages):
+            attention_mode = "tree"
+        self.mode = attention_path(
+            self.pipeline, attention_mode, default=default_attention)
+        self.canvas = tuple(self.pipeline.canvas_ids)
+        self.answer_row = self.pipeline.canvas_answer_row
+        self.canvas_rows = [len(self.canvas) if stage.canvas is None
+                            else stage.canvas_rows for stage in self.stages]
+
+        # A frame's canvas occupies document pages after the frame.
+        frame_max = max(len(f) + (len(self.canvas) if f else 0) for f in self.frames)
+        # A single suffix also occupies document pages on the unified path.
+        self.capacity_extra = frame_max
+        if self.paged and self.mode == "unified":
+            self.capacity_extra = max(
+                [frame_max] + [len(frame) + len(stage.suffixes[0]) + rows
+                               for frame, stage, rows in zip(
+                                   self.frames, self.stages, self.canvas_rows)
+                               if stage.single])
+
+        resident = ({a: self._held_pages(self.keys[a], len(self.prefixes[a]))
+                     for a, key in enumerate(self.keys)
+                     if self.arena.is_resident(key)}
+                    if self.paged else {})
+        # Pin resident documents while fresh admissions evict retained KV.
+        for a in resident:
+            self.arena.pin(self.keys[a])
+
+        self.asking = any(stage.requests is not None for stage in self.stages)
+        if prefix_tree is not None and not prefix_tree.shared_tokens:
+            prefix_tree = None
+        self.sched = JoinAdmission(
+            [len(p) for p in self.prefixes],
+            [(s.lengths + rows).tolist()
+             for s, rows in zip(self.suffixes, self.canvas_rows)],
+            budget,
+            self.arena.n_pages if self.paged else 1 << 62,
+            self.arena.page_tokens,
+            frame_tokens=[len(f) for f in self.frames], resident=resident,
+            anchor_partners={a: self._requests_of(key)
+                             for a, key in enumerate(self.keys)},
+            # a windowed model may pack any chunk unified, so it reserves
+            # the unified path's temporary pages throughout
+            temporary_suffix_pages=self.paged and self.mode == "unified",
+            answer_dtype=[stage.readout.dtype for stage in self.stages],
+            frame_canvas_tokens=len(self.canvas),
+            page_cost=self.arena.page_cost if self.paged else (lambda *args: 0),
+            tree=prefix_tree,
+            advance=partial(_advance_stage, stages),
+            frame_writes=self.writes,
+            limit=limit,
+            extra_tokens=self.capacity_extra,
+        )
+        self.borrowing = self.sched.borrowing
+        self.borrowing.can_borrow = borrow_check(self.arena, self.keys, self.borrowing)
+        # Residents have detached because they pack no prefix.
+        self.borrowers = self.borrowing.borrowers()
+        self.lowest_borrow = lowest_borrows(self.borrowing)
+        self.held = [self.keys[a] for a, n in enumerate(self.borrowers) if n]
+
+        self.spans = []
+        self.tokens = 0
+        self.pack_s = 0.0
+        self.outstanding = []     # (groups, handles) in launch order
+
+        if self.label is None:
+            self.label = " > ".join(stage.label or f"stage {j}"
+                                   for j, stage in enumerate(self.stages))
+        self.counting_answers = unit != "anchors"
+        total = (sum(self.sched.partner_count(a, j) for a in range(len(self.prefixes))
+                     for j in range(k))
+                 if self.counting_answers else len(self.prefixes))
+        self.progress = Progress(self.label, total=total, unit=unit)
+        self.finished = 0
+
+        # Combine stages sharing a readout in one submission per chunk.
+        self.shared_readout = all(stage.readout is self.stages[0].readout
+                                  for stage in self.stages)
+        groups_of = {}
+        self.group_key = {}
+        for j, stage in enumerate(self.stages):
+            self.group_key[j] = (None if self.shared_readout else groups_of.setdefault(
+                (id(stage.readout), stage.read_all_rows), len(groups_of)))
+        self.readout_of = {self.group_key[j]: stage.readout
+                           for j, stage in enumerate(self.stages)}
+        self.read_all_of = {self.group_key[j]: stage.read_all_rows
+                            for j, stage in enumerate(self.stages)}
+
+    def _entry_rows(self, a, j, start, end, carried):
+        f = len(self.prefixes[a])
+        indices = self.sched.partner_indices(a, j, start, end)
+        lengths = self.suffixes[j].lengths_at(indices)
         rows = ((f if carried else 0) + int(lengths.sum())
-                + canvas_rows[j] * len(lengths))
-        if writes[j] and start == 0:
-            rows += len(frames[j]) + len(canvas)
+                + self.canvas_rows[j] * len(lengths))
+        if self.writes[j] and start == 0:
+            rows += len(self.frames[j]) + len(self.canvas)
         return rows
 
-    # a frame entry's canvas rows land in the document's pages after
-    # the frame, so the pages cover them
-    frame_max = max(len(f) + (len(canvas) if f else 0) for f in frames)
-
-    # a stage sending one suffix to every document writes it straight
-    # into the document's own pages on the unified path, so the pages
-    # cover the frame and that suffix; other stages' suffixes take
-    # temporary pages
-    capacity_extra = frame_max
-    if paged and mode == "unified":
-        capacity_extra = max(
-            [frame_max] + [len(frame) + len(stage.suffixes[0]) + rows
-                           for frame, stage, rows in zip(frames, stages,
-                                                         canvas_rows)
-                           if stage.single])
-
-    def held_pages(key, prefix_tokens):
+    def _held_pages(self, key, prefix_tokens):
         # the admission prices a document at page_cost(prefix + extra)
         # less what it holds; a trimmed window holds fewer sliding
         # pages than that price assumes, so count what growing takes
-        capacity = prefix_tokens + capacity_extra
-        return (arena.page_cost(capacity)
-                - arena.growth_cost(key, capacity))
+        capacity = prefix_tokens + self.capacity_extra
+        return (self.arena.page_cost(capacity)
+                - self.arena.growth_cost(key, capacity))
 
-    resident = ({a: held_pages(keys[a], len(prefixes[a]))
-                 for a in range(len(keys)) if arena.is_resident(keys[a])}
-                if paged else {})
-    # every resident document stays available for the whole run while
-    # fresh admissions evict unrelated retained KV
-    for a in resident:
-        arena.pin(keys[a])
-
-    asking = any(stage.requests is not None for stage in stages)
-
-    def requests_of(key):
+    def _requests_of(self, key):
         """The document's per-stage requests, asked as it reaches each stage."""
-        if not asking:
+        if not self.asking:
             return None
+        stages = self.stages
         return lambda j: (None if stages[j].requests is None
                           else stages[j].requests(key))
 
-    if prefix_tree is not None and not prefix_tree.shared_tokens:
-        prefix_tree = None
-
-    def advance(a, j, row):
-        decide = stages[j].decide
-        if decide is None:
-            return bool(any(row) if stages[j].readout.dtype is None
-                        else np.any(row))
-        return bool(decide(a, row))
-
-    sched = JoinAdmission(
-        [len(p) for p in prefixes],
-        [(s.lengths + rows).tolist() for s, rows in zip(suffixes, canvas_rows)],
-        budget,
-        arena.n_pages if paged else 1 << 62,
-        arena.page_tokens,
-        frame_tokens=[len(f) for f in frames], resident=resident,
-        anchor_partners={a: requests_of(keys[a]) for a in range(len(keys))},
-        # a windowed model may pack any chunk unified, so it reserves
-        # the unified path's temporary pages throughout
-        temporary_suffix_pages=paged and mode == "unified",
-        answer_dtype=[stage.readout.dtype for stage in stages],
-        frame_canvas_tokens=len(canvas),
-        page_cost=arena.page_cost if paged else (lambda *args: 0),
-        tree=prefix_tree,
-        advance=advance,
-        frame_writes=writes,
-        limit=limit,
-        extra_tokens=capacity_extra,
-    )
-    borrowing = sched.borrowing
-    borrowing.can_borrow = borrow_check(arena, keys, borrowing)
-    # counted after resident documents detach: they pack no prefix
-    borrowers = borrowing.borrowers()
-    lowest_borrow = lowest_borrows(borrowing)
-    held = [keys[a] for a, n in enumerate(borrowers) if n]
-    spans = []
-    tokens = 0
-    pack_s = 0.0
-    outstanding = []     # (groups, entries, handles) in launch order
-    if label is None:
-        label = " > ".join(stage.label or f"stage {j}"
-                           for j, stage in enumerate(stages))
-    counting_answers = unit != "anchors"
-    total = (sum(sched._count(a, j) for a in range(len(prefixes))
-                 for j in range(k))
-             if counting_answers else len(prefixes))
-    progress = Progress(label, total=total, unit=unit)
-    finished = [0]
-
-    def merged(j, start, end):
+    def _merged(self, j, start, end):
         """Whether a group's frame rides its suffix as a single entry."""
-        return stages[j].single and end - start == 1
+        return self.stages[j].single and end - start == 1
 
-    def build(chunk_groups):
+    def _build(self, chunk_groups):
         """Pack one chunk; returns it with (stage, answer rows) per entry."""
+        from quail.backends.quail.executor.loop import Suffixes, pack_chunk
+
         specs = []
         entries = []
         for a, j, start, end, carried in chunk_groups:
-            key = keys[a]
-            f = len(prefixes[a])
-            frame = frames[j]
-            parent, shared = ((borrowing.parent(a), borrowing.shared(a))
+            key = self.keys[a]
+            f = len(self.prefixes[a])
+            frame = self.frames[j]
+            parent, shared = ((self.borrowing.parent(a), self.borrowing.shared(a))
                               if carried else (None, 0))
-            if paged:
-                fresh = not arena.is_resident(key)
-                got = arena.activate(
-                    key, f, capacity_tokens=f + capacity_extra,
+            if self.paged:
+                fresh = not self.arena.is_resident(key)
+                got = self.arena.activate(
+                    key, f, capacity_tokens=f + self.capacity_extra,
                     base_tokens=f,
-                    borrow=(keys[parent], shared) if shared else None)
+                    borrow=(self.keys[parent], shared) if shared else None)
                 assert got is not None, \
                     "the admission placed a document the arena cannot hold"
-                if fresh and a < len(borrowers) and borrowers[a]:
-                    arena.hold(key, borrowers[a])
-                    arena.keep_window(key, lowest_borrow[a])
+                if fresh and a < len(self.borrowers) and self.borrowers[a]:
+                    self.arena.hold(key, self.borrowers[a])
+                    self.arena.keep_window(key, self.lowest_borrow[a])
             prefix = None
             if carried:
-                prefix = prefixes[a][shared:] if shared else prefixes[a]
-            indices = sched.partner_indices(a, j, start, end)
-            sufs = suffixes[j].take(indices)
-            read_all = stages[j].read_all_rows
+                prefix = self.prefixes[a][shared:] if shared else self.prefixes[a]
+            indices = self.sched.partner_indices(a, j, start, end)
+            sufs = self.suffixes[j].take(indices)
+            read_all = self.stages[j].read_all_rows
             rows = int(sufs.lengths.sum()) if read_all else len(sufs)
             own = {}
-            if read_rows[j] is not None:
-                own["read_rows"] = read_rows[j][np.asarray(list(indices))]
+            if self.read_rows[j] is not None:
+                own["read_rows"] = self.read_rows[j][np.asarray(list(indices))]
                 rows = int(own["read_rows"].sum())
-            if stages[j].canvas is not None:
-                ids = np.asarray(stages[j].canvas(a))
+            if self.stages[j].canvas is not None:
+                ids = np.asarray(self.stages[j].canvas(a))
                 if ids.ndim == 2:
                     ids = ids[np.asarray(list(indices), dtype=np.int64)]
                 own = dict(canvas=ids)
                 if read_all:
-                    rows = stages[j].canvas_rows * len(sufs)
+                    rows = self.stages[j].canvas_rows * len(sufs)
             # under tree attention a borrowing document with one
             # suffix reads its parent's pages stacked with its siblings
-            read_key = keys[parent] if shared and stages[j].single else None
-            if writes[j] and start == 0 and merged(j, start, end):
+            read_key = self.keys[parent] if shared and self.stages[j].single else None
+            if self.writes[j] and start == 0 and self._merged(j, start, end):
                 # the frame and the one suffix are one entry; the
                 # frame's rows are scattered into KV after the document
                 specs.append(dict(
                     key=key, prefix=prefix, start=shared, read_key=read_key,
                     f=f, suffixes=Suffixes(
-                        np.concatenate([frame_ids[j], sufs.ids]),
+                        np.concatenate([self.frame_ids[j], sufs.ids]),
                         [len(frame) + int(sufs.lengths[0])]),
                     write_suffix_tokens=len(frame), single=True,
                     read_all_rows=read_all, **own))
-            elif writes[j] and start == 0:
+            elif self.writes[j] and start == 0:
                 # frame entry: scatter the frame into KV after the
                 # document rows; its own answer row means nothing
                 specs.append(dict(
                     key=key, prefix=prefix, start=shared, read_key=read_key,
-                    f=f, suffixes=Suffixes(frame_ids[j], [len(frame)]),
+                    f=f, suffixes=Suffixes(self.frame_ids[j], [len(frame)]),
                     write_suffix_tokens=len(frame)))
                 entries.append((j, 1))
                 specs.append(dict(
                     key=key, prefix=None, f=f + len(frame),
                     suffixes=sufs, read_all_rows=read_all,
-                    chains=stages[j].chains, **own))
+                    chains=self.stages[j].chains, **own))
             else:
                 specs.append(dict(
                     key=key, prefix=prefix, start=shared, read_key=read_key,
                     f=f + len(frame),
                     suffixes=sufs, read_all_rows=read_all,
-                    single=stages[j].single and end - start == 1,
-                    chains=stages[j].chains, **own))
+                    single=self.stages[j].single and end - start == 1,
+                    chains=self.stages[j].chains, **own))
             entries.append((j, rows))
         chunk = pack_chunk(
-            torch, arena, specs, attention_mode=mode, staging=staging,
-            canvas=canvas, answer_row=answer_row)
+            self.torch, self.arena, specs, attention_mode=self.mode,
+            staging=self.staging, canvas=self.canvas, answer_row=self.answer_row)
         return chunk, entries
 
-    def settle(anchor):
-        survived = sched._true[anchor][k - 1]
-        if on_settled is None:
-            if arena.is_resident(keys[anchor]):
-                arena.free_key(keys[anchor])
+    def _settle(self, settlement):
+        anchor = settlement.anchor
+        if self.on_settled is None:
+            if self.arena.is_resident(self.keys[anchor]):
+                self.arena.free_key(self.keys[anchor])
         else:
-            on_settled(anchor, survived, sched.answers[k - 1].get(anchor, []))
+            self.on_settled(
+                anchor, settlement.survived, self.sched.answers[-1].get(anchor, []))
 
-    def event(kind, anchor):
-        # progress counts settled documents: a dropped one is done too
-        finished[0] += 1
-        if kind == "finished":
-            settle(anchor)
-        elif arena.is_resident(keys[anchor]):
-            arena.free_key(keys[anchor])
+    def _event(self, settlement):
+        # Progress counts settled documents: a dropped one is done too.
+        self.finished += 1
+        if settlement.kind == "finished":
+            self._settle(settlement)
+        elif self.arena.is_resident(self.keys[settlement.anchor]):
+            self.arena.free_key(self.keys[settlement.anchor])
 
-    shared_readout = all(stage.readout is stages[0].readout
-                         for stage in stages)
-    # stages sharing a readout submit together: a chunk holds documents
-    # at many stages (every denoising step is one), and one submit per
-    # stage costs a row selection each
-    groups_of = {}
-    group_key = {}
-    for j, stage in enumerate(stages):
-        group_key[j] = (None if shared_readout else groups_of.setdefault(
-            (id(stage.readout), stage.read_all_rows), len(groups_of)))
-    readout_of = {group_key[j]: stages[j].readout for j in range(len(stages))}
-    read_all_of = {group_key[j]: stages[j].read_all_rows
-                   for j in range(len(stages))}
-
-    def select_rows(normed, spans_j):
+    def _select_rows(self, normed, spans_j):
         index = np.concatenate([np.arange(start, end, dtype=np.int64)
                                 for start, end in spans_j])
         if hasattr(normed, "index_select"):
             return normed.index_select(
-                0, torch.from_numpy(index).to(normed.device, non_blocking=True))
+                0, self.torch.from_numpy(index).to(normed.device, non_blocking=True))
         return [normed[r] for r in index]
 
-    def answer_stages(part):
-        """The stage of every answer of a chunk's groups, in order."""
-        out = []
-        for a, j, start, end, _ in part:
-            if writes[j] and start == 0 and not merged(j, start, end):
-                out.append(j)        # the frame entry's answer
-            out.extend([j] * (end - start))
-        return out
-
-    def submit(normed, entries, chunk, part):
+    def _submit(self, normed, entries, chunk):
         """Hand each readout its answer rows; returns handles by readout group.
 
         With one readout for every stage the whole chunk goes in one
@@ -461,22 +477,22 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
         it in one call, selected with one index.
         """
         rows_per_answer = chunk.rows_per_answer
-        if shared_readout:
-            readout = stages[0].readout
+        if self.shared_readout:
+            readout = self.stages[0].readout
             return {None: (readout.submit(normed, rows_per_answer=rows_per_answer)
                            if rows_per_answer else readout.submit(normed))}
         spans = {}          # group -> its entries' row spans, in chunk order
         row = 0
         for j, rows in entries:
-            spans.setdefault(group_key[j], []).append((row, row + rows))
+            spans.setdefault(self.group_key[j], []).append((row, row + rows))
             row += rows
         handles = {}
         per_answer = list(rows_per_answer) if rows_per_answer else None
         for key, spans_key in spans.items():
-            readout = readout_of[key]
-            selected = select_rows(normed, spans_key)
+            readout = self.readout_of[key]
+            selected = self._select_rows(normed, spans_key)
             # a stage reading one row per answer takes no row counts
-            if per_answer is None or not read_all_of[key]:
+            if per_answer is None or not self.read_all_of[key]:
                 handles[key] = readout.submit(selected)
             else:
                 # answers of this readout's stages, in entry order
@@ -486,121 +502,122 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                     taken = 0
                     while taken < rows:
                         taken += per_answer[answer]
-                        if group_key[jj] == key:
+                        if self.group_key[jj] == key:
                             counts.append(per_answer[answer])
                         answer += 1
                 handles[key] = readout.submit(selected, rows_per_answer=counts)
         return handles
 
-    def report(entry):
-        groups, entries, handles = entry
-        values = {key: readout_of[key].result(handle)
+    def _report(self, entry):
+        groups, handles = entry
+        values = {key: self.readout_of[key].result(handle)
                   for key, handle in handles.items()}
         pos = {key: 0 for key in handles}
         transitions = []
         for a, j, start, end, _ in groups:
-            key = group_key[j]
-            if writes[j] and start == 0 and not merged(j, start, end):
+            key = self.group_key[j]
+            if self.writes[j] and start == 0 and not self._merged(j, start, end):
                 pos[key] += 1        # the frame entry's answer means nothing
             cnt = end - start
-            stage_before = sched._stage[a]
-            events = sched.report(
+            result = self.sched.report(
                 a, j, start, end, values[key][pos[key]:pos[key] + cnt])
-            for kind, anchor in events:
-                event(kind, anchor)
-                # the stage's own decision: a document the next stage's
-                # requests drop still passed this one
-                transitions.append((anchor, j, bool(sched._true[anchor][j])))
-            if not events and sched._stage[a] != stage_before:
-                transitions.append((a, j, True))
+            for settlement in result.settlements:
+                self._event(settlement)
+            transitions.extend(result.transitions)
             pos[key] += cnt
-        progress.update(
-            progress.done + sum(end - start for _, _, start, end, _ in groups)
-            if counting_answers else finished[0])
-        if transitions and on_chunk is not None:
-            on_chunk(transitions)
+        self.progress.update(
+            self.progress.done + sum(end - start for _, _, start, end, _ in groups)
+            if self.counting_answers else self.finished)
+        if transitions and self.on_chunk is not None:
+            self.on_chunk(transitions)
 
-    def run_part(part):
+    def _run_part(self, part):
         """Run one chunk of groups, halving it when its pages do not fit."""
+        from quail.backends.quail.executor.loop import ArenaFullError
+
         try:
-            run_one(part)
+            self._run_one(part)
         except ArenaFullError as error:
             # retained KV nothing here reads makes room first
-            need = arena.page_cost(sum(entry_rows(*e) for e in part))
-            if arena.evict_retained(need):
+            need = self.arena.page_cost(sum(self._entry_rows(*e) for e in part))
+            if self.arena.evict_retained(need):
                 logger.info("chunk of %d groups retried after evicting "
                             "retained KV", len(part))
-                run_part(part)
+                self._run_part(part)
                 return
             if len(part) < 2:
                 raise
             logger.info("chunk of %d groups split: %s", len(part), error)
             half = len(part) // 2
-            run_part(part[:half])
-            run_part(part[half:])
+            self._run_part(part[:half])
+            self._run_part(part[half:])
 
-    def run_one(part):
-        nonlocal tokens, pack_s
+    def _run_one(self, part):
+        from quail.backends.quail.executor.loop import _forward
+
         started = time.perf_counter()
-        chunk, entries = build(part)
-        pack_s += time.perf_counter() - started
-        tokens += chunk.tokens
-        e0 = torch.cuda.Event(enable_timing=True)
-        e1 = torch.cuda.Event(enable_timing=True)
+        chunk, entries = self._build(part)
+        self.pack_s += time.perf_counter() - started
+        self.tokens += chunk.tokens
+        e0 = self.torch.cuda.Event(enable_timing=True)
+        e1 = self.torch.cuda.Event(enable_timing=True)
         e0.record()
-        normed = _forward(pipeline, arena, chunk)
+        normed = _forward(self.pipeline, self.arena, chunk)
         e1.record()
         for key in chunk.fresh_keys:
-            arena.trim_window(key)
+            self.arena.trim_window(key)
         by_stage = {}
         for entry in part:
-            by_stage[entry[1]] = by_stage.get(entry[1], 0) + entry_rows(*entry)
-        spans.append((by_stage, chunk.tokens, e0, e1))
-        handles = submit(normed, entries, chunk, part)
-        outstanding.append((part, entries, handles))
+            by_stage[entry[1]] = by_stage.get(entry[1], 0) + self._entry_rows(*entry)
+        self.spans.append((by_stage, chunk.tokens, e0, e1))
+        handles = self._submit(normed, entries, chunk)
+        self.outstanding.append((part, handles))
         # read the previous chunk's answers while this one runs
-        while len(outstanding) > 1:
-            report(outstanding.pop(0))
+        while len(self.outstanding) > 1:
+            self._report(self.outstanding.pop(0))
 
-    while True:
-        # documents with nothing to send at their first stage never run
-        for kind, anchor in sched.take_settled():
-            event(kind, anchor)
-        if sched.done():
-            break
-        if sched.blocked_pages:
-            # the free list is short for the next fresh document:
-            # retained KV nothing here reads makes room
-            arena.evict_retained(sched.blocked_pages)
-        groups = sched.next_chunk(arena.free_pages if paged else 1 << 62)
-        if not groups:
-            if outstanding:
-                report(outstanding.pop(0))
-                continue
-            if sched.blocked_pages and arena.evict_retained(sched.blocked_pages):
-                continue
-            # parents freed but held for queued children hold the
-            # pages: the children pack their whole prefixes
-            if arena.drop_holds(held):
-                continue
-            raise AssertionError("nothing buildable and nothing in flight")
-        run_part(groups)
-        # the packed children hold their parents' pages now
-        for a, _, start, _, carried in groups:
-            parent = (borrowing.tree_parent[a]
-                      if a < len(borrowing.tree_parent) else None)
-            if carried and start == 0 and parent is not None:
-                arena.release(keys[parent])
-    while outstanding:
-        report(outstanding.pop(0))
-    # a limit ends the run with documents still queued
-    for anchor in sched.drain():
-        if arena.is_resident(keys[anchor]):
-            arena.free_key(keys[anchor])
-    progress.finish(f"{label} done", f"{tokens:,} fresh tokens")
-    arena.drop_holds(held)
-    if stats is not None:
-        stats["borrowed_tokens"] = borrowing.borrowed_tokens
-        stats["pack_s"] = pack_s
-    return sched.answers, spans, tokens
-
+    def run(self):
+        """Drive admission and drain the launched answer handles in order."""
+        while True:
+            # documents with nothing to send at their first stage never run
+            for settlement in self.sched.take_settled():
+                self._event(settlement)
+            if self.sched.done():
+                break
+            if self.sched.blocked_pages:
+                # the free list is short for the next fresh document:
+                # retained KV nothing here reads makes room
+                self.arena.evict_retained(self.sched.blocked_pages)
+            groups = self.sched.next_chunk(
+                self.arena.free_pages if self.paged else 1 << 62)
+            if not groups:
+                if self.outstanding:
+                    self._report(self.outstanding.pop(0))
+                    continue
+                if (self.sched.blocked_pages
+                        and self.arena.evict_retained(self.sched.blocked_pages)):
+                    continue
+                # parents freed but held for queued children hold the
+                # pages: the children pack their whole prefixes
+                if self.arena.drop_holds(self.held):
+                    continue
+                raise AssertionError("nothing buildable and nothing in flight")
+            self._run_part(groups)
+            # the packed children hold their parents' pages now
+            for a, _, start, _, carried in groups:
+                parent = (self.borrowing.tree_parent[a]
+                          if a < len(self.borrowing.tree_parent) else None)
+                if carried and start == 0 and parent is not None:
+                    self.arena.release(self.keys[parent])
+        while self.outstanding:
+            self._report(self.outstanding.pop(0))
+        # a limit ends the run with documents still queued
+        for anchor in self.sched.drain():
+            if self.arena.is_resident(self.keys[anchor]):
+                self.arena.free_key(self.keys[anchor])
+        self.progress.finish(f"{self.label} done", f"{self.tokens:,} fresh tokens")
+        self.arena.drop_holds(self.held)
+        if self.stats is not None:
+            self.stats["borrowed_tokens"] = self.borrowing.borrowed_tokens
+            self.stats["pack_s"] = self.pack_s
+        return self.sched.answers, self.spans, self.tokens
