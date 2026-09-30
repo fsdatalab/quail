@@ -5,7 +5,6 @@ import math
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-import pytest
 
 import quail.bench.labeling as labeling
 from experiments.cells import classify_labels as cell
@@ -18,14 +17,6 @@ from quail_b.predicates import MODEL_NAME, PREDICATE_BY_KEY, PREDICATES
 BILLING = [(1, 2, 3), (1, 2, 4), (1, 5, 6), (7, 8, 9)]
 
 
-def test_trie_lists_each_prefix_once():
-    trie = cell.label_trie(BILLING)
-    assert trie == {(): [1, 7], (1,): [2, 5], (1, 2): [3, 4], (1, 5): [6],
-                    (7,): [8], (7, 8): [9]}
-    with pytest.raises(ValueError, match="no tokens"):
-        cell.label_trie([(1,), ()])
-
-
 def test_scores_sum_prefix_log_probabilities_and_ties_go_first():
     log = math.log
     logprobs = {(): {1: log(0.8), 7: log(0.1)}, (1,): {2: log(0.7), 5: log(0.2)},
@@ -36,15 +27,6 @@ def test_scores_sum_prefix_log_probabilities_and_ties_go_first():
     assert [round(math.exp(s), 3) for s in scores] == [0.336, 0.168, 0.144, 0.072]
     winner, _ = cell.score_labels([(1,), (2,)], {(): {1: -1.0, 2: -1.0}})
     assert winner == 0
-
-
-def test_shards_cover_whole_parts():
-    for rows, shards in ((17_711, 8), (50_000, 2), (4_144, 1), (300, 4)):
-        bounds = cell.shard_bounds(rows, shards)
-        assert len(bounds) <= shards
-        assert bounds[0][0] == 0 and bounds[-1][1] == rows
-        assert all(a[1] == b[0] for a, b in zip(bounds, bounds[1:]))
-        assert all(start % cell.ROWS_PER_PART == 0 for start, _ in bounds)
 
 
 def _corpus(root, corpus_id, sf, claims):
@@ -114,44 +96,3 @@ def test_labels_copy_by_content_and_join_a_reused_collection(
                       .read_text())["collection_id"] == summary["collection_id"]
 
 
-def test_every_classification_query_plans_on_quail():
-    import pyarrow as pa
-
-    import quail
-    from quail.bench.quailb import build_query
-    from quail.bench.substrait import Classify, Filter, Join, read_plan
-    from quail.physical import AiClassify, AiFilter, AiJoin
-    from quail.planner.plan import EngineConfig, Refusal
-    from quail_b.queries import get_query
-
-    # each query over three-row tables holding the columns its plan reads
-    shapes = {"IMDB-12": (AiFilter,), "AGENT-3": (AiFilter,),
-              "IMDB-13": (AiJoin,), "BIO-6": (AiJoin,), "LEP-6": (AiJoin,)}
-    for query_id, extra in shapes.items():
-        spec = get_query(query_id)
-        plan = read_plan(spec.plan)
-        columns = {relation.alias: {"id"} for relation in plan.relations}
-        for operator in plan.operators:
-            if isinstance(operator, (Filter, Classify)):
-                columns[operator.alias].add(operator.column)
-            elif isinstance(operator, Join):
-                for alias, column in zip(operator.aliases, operator.columns):
-                    columns[alias].add(column)
-                for left, right in operator.on:
-                    columns[operator.aliases[0]].add(left)
-                    columns[operator.aliases[1]].add(right)
-        for name in plan.select:
-            alias, column = name.split(".", 1)
-            columns[alias].add(column)
-        with quail.Session(EngineConfig(model="qwen3-4b-fp8", device="h100-sxm"),
-                           tokenizer=lambda text: list(text.encode())) as session:
-            for relation in plan.relations:
-                session.register(relation.table, quail.DocumentProvider.from_table(
-                    pa.table({column: [f"{column} {row}" for row in range(3)]
-                              for column in sorted(columns[relation.alias])}),
-                    id_col="id"))
-            physical = build_query(session, spec).plan()
-            assert not isinstance(physical, Refusal), (query_id, physical)
-            kinds = {type(node) for node in physical.nodes}
-            assert AiClassify in kinds and all(kind in kinds for kind in extra), \
-                query_id

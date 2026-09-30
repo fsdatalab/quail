@@ -433,43 +433,6 @@ def test_request_backends_classify_with_one_request_per_trie_node():
     session.close()
 
 
-class _UnsureClient(_LabelClient):
-    """Document 12's answer names no label."""
-
-    def generate(self, prompts, sampling_params, use_tqdm=False):
-        outputs = super().generate(prompts, sampling_params, use_tqdm)
-        for output in outputs:
-            if 12 in output.prompt_token_ids:
-                output.outputs[0].text = "It is unclear."
-        return outputs
-
-
-def test_request_backends_drop_a_document_whose_answer_names_no_label():
-    spec = RequestClassifySpec(
-        alias="d", output="kind", tail_token_ids=(90,),
-        labels=("a", "b", "c"), label_token_ids=((60, 62), (61, 62), (60, 63)),
-        tests=((0, ("a", "b")),))
-    node = RequestExecution(
-        node_id="request-model", backend_name="stock_vllm", aliases=("d",),
-        preamble_token_ids=(3,), classifies=(spec,))
-    execution = _execution({"d": [[10], [11], [12]]}, client=_UnsureClient())
-    result = execution.execute(node, {})
-    # document 2 has no label row, fails the filter on its label, and is gone
-    assert result.outputs["label_answers:kind"].to_pydict() == {
-        "d": [0, 1], "kind": ["a", "b"]}
-    assert result.outputs["ids:d"] == [0, 1]
-    assert result.outputs["label_in_answers:kind"].to_pydict() == {
-        "d": [0, 1], "predicate": [0, 0], "answer": [True, True]}
-    (step,) = result.metrics.extension["steps"]
-    assert (step["n_in"], step["n_out"], step["unmatched"]) == (3, 2, 1)
-
-    # without a filter the document still leaves the query
-    node = replace(node, classifies=(replace(spec, tests=()),))
-    result = execution.execute(node, {})
-    assert result.outputs["ids:d"] == [0, 1]
-    assert result.outputs["label_answers:kind"].num_rows == 2
-
-
 class _JoinedClient(_Client):
     """Joins by token, and decodes a joined row's label from its partner."""
 

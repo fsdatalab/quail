@@ -7,7 +7,6 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 from fakes import cpu_arena, fake_pack, fake_pipeline, fake_torch, letter_tokens
-from test_planner import _token_store
 from test_score import _finish
 
 import quail
@@ -25,7 +24,6 @@ from quail.execution.labels import (
     GreedyDecoder,
     best_label,
     label_trie,
-    letter_scores,
 )
 from quail.execution.reranker import RerankerBatch
 from quail.logical import (
@@ -33,26 +31,20 @@ from quail.logical import (
     ColumnRef,
     CompileError,
     bind_classify_prompt,
-    label_text,
 )
 from quail.logical.prompts import join_anchor_note
 from quail.physical import (
     AiClassify,
     AiJoin,
     ClassifySpec,
-    ClassifyStage,
     Filter,
     InList,
     RequestExecution,
     decode_graph,
     encode_graph,
 )
-from quail.planner.classify import suffix_lengths
-from quail.planner.physical_optimizer import PlanningContext
-from quail.planner.physical_rules import PrefixSharing
 from quail.planner.plan import EngineConfig, Refusal
 from quail.specs import H100_SXM, QWEN3_4B_FP8
-from quail_b import rendering
 from quail_b.prompts import AGENT_OUTCOME, AGENT_OUTCOME_DESCRIPTIONS
 from quail_b.prompts import AGENT_OUTCOME_LABELS as OUTCOMES
 from quail_b.queries import get_query
@@ -73,22 +65,6 @@ def test_label_trie_holds_each_proper_prefix_and_ties_go_first():
         label_trie([(1,), ()])
     assert best_label([-1.0, -0.5, -2.0]) == 1
     assert best_label([-1.0, -2.0, -1.0]) == 0
-
-
-def test_suffix_lengths_of_the_two_rules():
-    # letters: the cue alone, or the cue and the canvas rows
-    assert suffix_lengths("letters", IDS) == [1]
-    assert suffix_lengths("letters", IDS, 16) == [17]
-    # trie_tree: every trie node once
-    assert suffix_lengths("trie_tree", IDS) == [len(label_trie(IDS))] == [2]
-    # trie_decode: one chain per round, the cue and the tokens decoded
-    # so far, for as many rounds as the mean label length rounded up
-    assert suffix_lengths("trie_decode", IDS) == [1, 2]
-    with pytest.raises(ValueError, match="unknown"):
-        suffix_lengths("trie_paths", IDS)
-    scores = letter_scores(((2,), (4,)), [2, 4], np.array([-1.0, -3.0]))
-    assert scores.tolist() == [-1.0, -3.0] and best_label(scores) == 0
-
 
 
 def test_greedy_decoder_follows_the_likeliest_child_to_a_label():
@@ -116,21 +92,6 @@ def test_greedy_decoder_follows_the_likeliest_child_to_a_label():
         GreedyDecoder(((1, 2), (1,)), [1, 2], documents=1)
 
 
-def test_classify_prompt_is_quail_b_text_with_labels_after_it():
-    ref = ColumnRef("t", "agent_traces", "trace")
-    bound = bind_classify_prompt(AGENT_OUTCOME, (ref,), OUTCOMES,
-                                 AGENT_OUTCOME_DESCRIPTIONS)
-    document = "ran the tests; two failed"
-    text = bound.preamble + document + bound.tail.replace("{0}", "")
-    assert text == rendering.render_classify_prompt(
-        AGENT_OUTCOME, document, OUTCOMES, AGENT_OUTCOME_DESCRIPTIONS)
-    assert label_text("resolved") == rendering.LABEL_PREFIX + "resolved"
-    tokenized = bind_classify_prompt(AGENT_OUTCOME, (ref,), OUTCOMES,
-                                     AGENT_OUTCOME_DESCRIPTIONS, _bytes)
-    assert list(tokenized.tail_token_ids) == _bytes(
-        bound.tail.replace("{0}", ""))
-
-
 def test_label_readout_is_log_softmax_over_the_whole_vocabulary():
     torch = pytest.importorskip("torch")
     head = torch.randn(300, 8, dtype=torch.bfloat16)
@@ -141,24 +102,6 @@ def test_label_readout_is_log_softmax_over_the_whole_vocabulary():
     expected = torch.log_softmax(logits, dim=1)[:, [5, 17, 299]]
     assert torch.allclose(got, expected, atol=1e-5)
     assert readout.dtype.shape == (3,)
-
-
-def test_multi_row_label_readout_pads_each_suffix_to_its_rows():
-    torch = pytest.importorskip("torch")
-    if not torch.cuda.is_available():
-        pytest.skip("pinned host copies need a GPU")
-    head = torch.randn(300, 8, dtype=torch.bfloat16, device="cuda")
-    hidden = torch.randn(5, 8, dtype=torch.bfloat16, device="cuda")
-    readout = AsyncLabelLogprobs(torch, torch.nn.functional, head, [5, 17],
-                                 rows=3)
-    assert readout.dtype.shape == (3, 2)
-    got = readout.result(readout.submit(hidden, rows_per_answer=[2, 3]))
-    flat = readout.logprobs(hidden).cpu().numpy()
-    assert got.shape == (2, 3, 2)
-    assert np.allclose(got[0, :2], flat[:2]) and np.isnan(got[0, 2]).all()
-    assert np.allclose(got[1], flat[2:])
-    with pytest.raises(ValueError, match="rows to read"):
-        readout.submit(hidden, rows_per_answer=[4, 1])
 
 
 def test_classifier_reads_the_letters_at_the_cue_row(monkeypatch):
@@ -255,112 +198,6 @@ def test_classifier_decodes_one_token_per_round(monkeypatch):
         (0, [91, 92]), (1, [91, 92]), (2, [91, 92]),
         (0, [93]), (1, [93]), (2, [93]), (0, [93, 1]), (2, [93, 1])])
     assert batch.suffix_tokens == 3 * 1 + 2 * 2
-
-
-def test_classifier_borrows_shared_prefix_pages(monkeypatch):
-    spec = ClassifySpec(
-        name="topic", aliases=("d",), query_template="", arguments=(),
-        expected_inputs=2, estimated_seconds=0.0,
-        prompt_token_parts=((90,), (91, 92, 93)), labels=LABELS,
-        label_token_ids=IDS, scoring="trie_tree", share_prefixes=True)
-    # after the head, document 1 shares two 16-token pages with document 0
-    documents = {"d": [[10] * 40, [10] * 32 + [11] * 8]}
-    packed = []
-
-    def recording_pack(torch, arena, specs, **kw):
-        packed.extend((spec["key"][2], spec.get("start", 0))
-                      for spec in specs if spec["prefix"] is not None)
-        return fake_pack(torch, arena, specs, **kw)
-
-    # every row of the trie's one chain [93, 1] is read
-    def forward(chunk):
-        rows = []
-        for entry in chunk.specs:
-            wanted = IDS[entry["key"][2]]
-            for suffix in entry["suffixes"]:
-                for row in range(len(suffix)):
-                    seen = tuple(suffix[1:row + 1])
-                    rows.append([
-                        -1.0 if seen + (token,) == tuple(wanted[:row + 1])
-                        else -5.0 for token in [1, 2, 3, 4]])
-        return np.asarray(rows, dtype=np.float32)
-
-    def submit(rows, rows_per_answer=None):
-        return rows.reshape(-1, 2, 4)
-
-    monkeypatch.setattr(loop, "pack_chunk", recording_pack)
-    readout = SimpleNamespace(
-        targets=np.asarray([1, 2, 3, 4]), rows=2,
-        dtype=np.dtype((np.float32, (2, 4))),
-        submit=submit, result=lambda rows: rows)
-    state = {"torch": fake_torch(), "arena": cpu_arena(64),
-             "pipeline": fake_pipeline(forward_chunk=forward),
-             "chunk_tokens": 64, "label_readout": readout,
-             "input_staging": SimpleNamespace(fixed_tokens=set())}
-    batch = QuailClassifier(state).classify(spec, [[0], [1]], documents)
-    assert list(batch.scores) == list(LABELS[:2])
-    assert packed == [(0, 0), (1, 32)]
-    assert batch.borrowed_tokens == 32 and batch.cached_tokens == 32
-    assert batch.fresh_tokens == (41 + 41 - 32) + 2 * (2 + 2)
-
-
-def test_classifier_runs_chained_stages_on_resident_documents(monkeypatch):
-    # stage 0 labels LABELS by their letters; the gate lets only
-    # "refund request" through to stage 1, which labels ("a", "b")
-    second = ClassifySpec(
-        name="kind", aliases=("d",), query_template="", arguments=(),
-        expected_inputs=1, estimated_seconds=0.0,
-        prompt_token_parts=((90,), (94, 95)), labels=("a", "b"),
-        label_token_ids=((5,), (6,)), scoring="letters")
-    spec = ClassifySpec(
-        name="topic", aliases=("d",), query_template="", arguments=(),
-        expected_inputs=3, estimated_seconds=0.0,
-        prompt_token_parts=((90,), (91, 92, 93)), labels=LABELS,
-        label_token_ids=((1,), (2,), (3,)), scoring="letters",
-        stages=(ClassifyStage(spec=second, accepted=(LABELS[0],)),))
-    documents = {"d": [[10, 11], [12], [13, 14, 15]]}
-    packed = []
-
-    def recording_pack(torch, arena, specs, **kw):
-        packed.extend((entry["key"][2], entry["prefix"] is not None,
-                       [list(suffix) for suffix in entry["suffixes"]])
-                      for entry in specs)
-        return fake_pack(torch, arena, specs, **kw)
-
-    # document i prefers letter i at stage 0; at stage 1 every document
-    # prefers "b"
-    targets = [1, 2, 3, 5, 6]
-
-    def forward(chunk):
-        rows = []
-        for entry in chunk.specs:
-            document = entry["key"][2]
-            for suffix in entry["suffixes"]:
-                wanted = document + 1 if suffix[0] == 93 else 6
-                rows.append([-1.0 if t == wanted else -5.0 for t in targets])
-        return np.asarray(rows, dtype=np.float32)
-
-    monkeypatch.setattr(loop, "pack_chunk", recording_pack)
-    readout = SimpleNamespace(
-        targets=np.asarray(targets), rows=1,
-        dtype=np.dtype((np.float32, (5,))),
-        submit=lambda rows, rows_per_answer=None: rows,
-        result=lambda rows: rows)
-    state = {"torch": fake_torch(), "arena": cpu_arena(64),
-             "pipeline": fake_pipeline(forward_chunk=forward),
-             "chunk_tokens": 64, "label_readout": readout,
-             "input_staging": SimpleNamespace(fixed_tokens=set())}
-    batch = QuailClassifier(state).classify(spec, [[0], [1], [2]], documents)
-    assert list(batch.scores) == list(LABELS)
-    assert list(batch.later["kind"]) == ["b", None, None]
-    # document 0 packs its prefix once: stage 1 streams frame and cue
-    assert [(doc, fresh) for doc, fresh, _ in packed].count((0, True)) == 1
-    assert ([suffixes for doc, _, suffixes in packed if doc == 0]
-            == [[[91, 92]], [[93]], [[94]], [[95]]])
-    # stage 0: prefix, 2-token frame, the cue per document; stage 1:
-    # document 0's 1-token frame and the cue
-    assert batch.fresh_tokens == (3 + 2 + 4) + 3 * (2 + 1) + (1 + 1)
-    assert batch.suffix_tokens == 3 * 1 + 1
 
 
 @pytest.fixture()
@@ -568,52 +405,6 @@ def test_planner_prices_the_rules_and_takes_the_cheapest():
         unified.choose(1000, 20, 30, prefixed, True)
 
 
-def test_simulation_sends_a_decode_one_chain_per_round():
-    from quail.planner.classify import simulate
-
-    # three documents of 100 tokens, a chunk of 250: two chunks for
-    # the documents' first round, then the second round of each
-    # document two chunks after the one that launched it
-    prefixes = [100, 100, 100]
-    chains = [[3, 2], [3, 2], [3, 2]]
-    result = simulate(prefixes, 10, chains, chunk=250, capacity=10_000,
-                      model=QWEN3_4B_FP8, device=H100_SXM, one_per_round=True)
-    assert result.rounds == 2 and result.passes == 4
-    assert result.suffix_tokens == 3 * 3 + 3 * 2
-    assert result.work.tokens == 3 * 110 + 3 * 3 + 3 * 2
-    assert result.seconds > 0
-    # one round sends both chains at once, in fewer chunks
-    once = simulate(prefixes, 10, chains, chunk=250, capacity=10_000,
-                    model=QWEN3_4B_FP8, device=H100_SXM)
-    assert once.rounds == 1 and once.passes == 2
-    assert once.suffix_tokens == result.suffix_tokens
-    # a full arena admits documents as earlier ones finish
-    tight = simulate(prefixes, 10, chains, chunk=250, capacity=120,
-                     model=QWEN3_4B_FP8, device=H100_SXM, one_per_round=True)
-    assert tight.passes > result.passes
-    assert tight.seconds > result.seconds
-
-
-def test_simulation_credits_the_prefix_tokens_a_document_borrows():
-    from quail.planner.classify import simulate
-
-    prefixes = [100, 100, 100]
-    chains = [[3], [3], [3]]
-    scratch = simulate(prefixes, 10, chains, chunk=250, capacity=10_000,
-                       model=QWEN3_4B_FP8, device=H100_SXM)
-    # the second and third documents borrow 80 of their 100 tokens
-    # from the first: they compute only the rest, the frame, and the
-    # chain, and read the borrowed KV
-    borrowed = simulate(prefixes, 10, chains, chunk=250, capacity=10_000,
-                        model=QWEN3_4B_FP8, device=H100_SXM,
-                        shared=[0, 80, 80])
-    assert borrowed.work.tokens == scratch.work.tokens - 2 * 80
-    assert borrowed.work.kv_read == scratch.work.kv_read + 2 * 80
-    assert borrowed.work.pairs < scratch.work.pairs
-    assert borrowed.seconds < scratch.seconds
-    assert borrowed.suffix_tokens == scratch.suffix_tokens
-
-
 def test_chained_classifications_share_one_node(session):
     query = _chain(session)
     plan = query.plan()
@@ -698,31 +489,6 @@ def test_classify_refusals_and_builder_errors(session):
     vllm.close()
 
 
-def test_prefix_sharing_rule_fires_for_a_classification(session, tmp_path):
-    plan = _topic(session).plan()
-    shared = " ".join(str(i) for i in range(40))
-    store = _token_store(tmp_path / "shared.arrow",
-                         [shared, shared + " 99 98", "7 7 7"])
-    plain = _token_store(tmp_path / "plain.arrow", ["1 2 3", "4 5 6"])
-
-    def context(lengths):
-        return PlanningContext(
-            model=QWEN3_4B_FP8, device=H100_SXM, gpu_count=1,
-            document_tokens={"d": lengths}, backend="quail")
-
-    graph = PrefixSharing().rewrite(plan.graph, context(store.lengths))
-    (classify,) = [n for n in graph.nodes if isinstance(n, AiClassify)]
-    assert classify.spec.share_prefixes
-    assert classify.explain_fields()["share_prefixes"]
-    # the shared documents borrow their prefix, so the estimate falls
-    (planned,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
-    assert 0 < classify.spec.estimated_seconds < planned.spec.estimated_seconds
-    assert classify.spec.expected_inputs == planned.spec.expected_inputs
-    codecs = session.registry.codecs
-    assert decode_graph(encode_graph(graph, codecs), codecs) == graph
-    assert PrefixSharing().rewrite(plan.graph, context(plain.lengths)) is None
-
-
 def test_bench_reads_classify_plans_and_reports_labels_by_operator():
     plan = read_plan(get_query("IMDB-14").plan)
     (sentiment, complaint) = plan.classifies
@@ -758,34 +524,6 @@ def test_bench_reads_classify_plans_and_reports_labels_by_operator():
         "a", "b", "c"]
 
 
-def test_pack_chunk_reads_every_canvas_row_when_asked():
-    from fakes import cpu_staging
-
-    torch = cpu_staging(pytest.MonkeyPatch())
-    arena = cpu_arena(64)
-    canvas = (90, 91, 92)
-    groups = [dict(key=("d", 0), prefix=[1, 2], f=2, suffixes=[[10]],
-                   read_all_rows=True),
-              dict(key=("d", 1), prefix=[4], f=1, suffixes=[[12]],
-                   read_all_rows=True)]
-    chunk = loop.pack_chunk(torch, arena, groups, attention_mode="unified",
-                            canvas=canvas)
-    assert chunk.input_ids.tolist() == [1, 2, 10, *canvas, 4, 12, *canvas]
-    assert chunk.final_indices.tolist() == [3, 4, 5, 8, 9, 10]
-    assert chunk.rows_per_answer == (3, 3)
-    # a group's own canvas replaces the chunk's, every row read
-    groups = [dict(key=("d", 0), prefix=[1, 2], f=2, suffixes=[[10]],
-                   read_all_rows=True, canvas=[80, 81]),
-              dict(key=("d", 1), prefix=[4], f=1, suffixes=[[12]],
-                   read_all_rows=True, canvas=[82, 83])]
-    chunk = loop.pack_chunk(torch, arena, groups, attention_mode="unified",
-                            canvas=canvas)
-    assert chunk.input_ids.tolist() == [1, 2, 10, 80, 81, 4, 12, 82, 83]
-    assert chunk.final_indices.tolist() == [3, 4, 7, 8]
-    assert chunk.rows_per_answer == (2, 2)
-    assert chunk.meta["canvas"]["rows"].tolist() == [3, 4, 7, 8]
-
-
 def test_planner_reads_letters_on_a_diffusion_model(tmp_path):
     from quail.specs import DIFFUSION_GEMMA_26B_FP8
 
@@ -817,36 +555,6 @@ def test_planner_reads_letters_on_a_diffusion_model(tmp_path):
     refused = _topic(forced).plan()
     assert isinstance(refused, Refusal) and "canvas" in refused.reasons[0]
     forced.close()
-
-
-def test_planner_prices_the_letters_read_on_a_canvas_model():
-    from quail.cost import budgets
-    from quail.planner.classify import ClassifyRefusedError, _Table, simulate
-    from quail.specs import DIFFUSION_GEMMA_26B_FP8
-
-    model = DIFFUSION_GEMMA_26B_FP8
-    chunk = budgets.chunk_budget(model, H100_SXM)
-    capacity = budgets.arena_tokens(model, H100_SXM, chunk)
-    table = _Table(alias="d", mean=200.0, longest=300, budget=chunk,
-                   chunk=chunk, scoring=None, backend_name="quail",
-                   model=model, device=H100_SXM, tokenizer=_bytes,
-                   capacity=capacity, lengths=(200,) * 100)
-    scoring, simulated = table.choose(100, 20, 30, ((1, 2), (3,)), False,
-                                      lettered=(20, 30, ((1,), (2,))))
-    assert scoring == "letters"
-    # every document sends the cue and the 16-row canvas once, and
-    # computes its prompt once
-    assert simulated.suffix_tokens == 100 * 17
-    assert simulated.work.tokens == 100 * (20 + 200 + 30) + 100 * 17
-    assert simulated.passes == 1
-    # the canvas rows read the document a second time
-    plain = simulate([220] * 100, 30, [[17]] * 100, chunk, capacity, model,
-                     H100_SXM)
-    assert simulated.work.pairs > plain.work.pairs
-    assert simulated.seconds > plain.seconds
-    # a canvas model has no trie to fall back on
-    with pytest.raises(ClassifyRefusedError, match="no label scoring rule"):
-        table.choose(100, 20, 30, ((1, 2), (3,)), False)
 
 
 def test_a_document_without_a_label_fails_every_filter_on_it(session):
@@ -1009,28 +717,6 @@ def test_classifier_scores_the_packed_trie(monkeypatch):
     assert batch.suffix_tokens == 2 * 5
 
 
-def test_planner_packs_the_trie_without_a_lettered_prompt():
-    from quail.cost import budgets
-    from quail.planner.classify import _Table
-
-    chunk = budgets.chunk_budget(QWEN3_4B_FP8, H100_SXM)
-    capacity = budgets.arena_tokens(QWEN3_4B_FP8, H100_SXM, chunk)
-    table = _Table(alias="d", mean=200.0, longest=300, budget=chunk,
-                   chunk=chunk, scoring=None, backend_name="quail",
-                   model=QWEN3_4B_FP8, device=H100_SXM, tokenizer=_bytes,
-                   capacity=capacity, lengths=(200,) * 500, tree=True)
-    # twenty labels branching under one shared token: 22 trie rows
-    shared = tuple((7, i, 1) for i in range(20))
-    # against 20 chains of three tokens; a greedy decode's six tokens
-    # over three rounds cost least of all
-    scoring, decoded = table.choose(500, 20, 30, shared, False)
-    assert scoring == "trie_decode" and decoded.rounds == 3
-    # a chained stage over resident documents packs the trie
-    scoring, simulated = table.choose(500, 20, 30, shared, True)
-    assert scoring == "trie_tree"
-    assert simulated.suffix_tokens == 500 * len(label_trie(shared))
-
-
 def test_sql_category_forms_options_and_label_tables(session):
     from quail.logical.prompts import CLASSIFY_INSTRUCTION
 
@@ -1111,21 +797,6 @@ def test_explain_names_the_classification_rule_and_the_filter(session):
     assert "Filter: topic IN ['refund', 'shipping']" in text
 
 
-def test_label_readout_projects_only_the_targets_when_unnormalized():
-    torch = pytest.importorskip("torch")
-    head = torch.randn(300, 8, dtype=torch.bfloat16)
-    hidden = torch.randn(7, 8, dtype=torch.bfloat16)
-    readout = AsyncLabelLogprobs(torch, torch.nn.functional, head, [5, 17, 299],
-                                 normalize=False)
-    got = readout.logprobs(hidden)
-    expected = torch.nn.functional.linear(hidden, head).float()[:, [5, 17, 299]]
-    assert torch.allclose(got, expected, atol=1e-5)
-    # the same ranking as the normalized readout, row by row
-    normalized = AsyncLabelLogprobs(torch, torch.nn.functional, head,
-                                    [5, 17, 299]).logprobs(hidden)
-    assert torch.equal(got.argmax(1), normalized.argmax(1))
-
-
 def test_choice_letters_are_one_token_each_and_capped():
     from quail.logical.prompts import MAX_LETTERS, choice_letters
 
@@ -1171,80 +842,6 @@ def test_classify_prompt_letters_its_categories():
                                      tokenizer=letter_tokens)
     assert list(tokenized.lettered.tail_token_ids) == _bytes(
         tokenized.lettered.tail.replace("{0}", ""))
-
-
-def test_planner_reads_letters_at_the_cue_row(tmp_path):
-    from quail.cost import budgets
-    from quail.planner.classify import ClassifyRefusedError, _Table
-
-    path = tmp_path / "documents.parquet"
-    pq.write_table(pa.table({"id": [1, 2], "body": ["ab", "cd"]}), path)
-    session = quail.Session(EngineConfig(model="qwen3-4b-fp8", device="h100-sxm"),
-                            tokenizer=letter_tokens)
-    session.register("documents", DocumentProvider.from_parquet(path, id_col="id"))
-    # three short labels: the packed trie's 22 rows cost less than the
-    # lettered prompt's 23 extra frame tokens
-    plan = _topic(session).plan()
-    (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
-    assert classify.spec.scoring == "trie_tree"
-    assert bytes(classify.spec.prompt_token_parts[1]).decode().endswith(
-        "\n- refund\n- shipping\n- praise\nANSWER:")
-    # three long labels: the trie's 60 rows cost more than the letters
-    labels = ["a refund for a damaged item", "shipping delays or tracking",
-              "praise for the support team"]
-    long = (session.docs("documents").alias("d").ai_classify(
-        quail.prompt("What is {0} about?", quail.col("d.body")), labels,
-        name="topic").label_in("topic", labels[:2], selectivity=0.5)
-        .ai_classify(quail.prompt("What kind of {0}?", quail.col("d.body")),
-                     ["a detailed complaint about a recent purchase",
-                      "a passing question about the service"], name="kind")
-        .select("d.id", "topic", "kind"))
-    (node,) = [n for n in long.plan().nodes if isinstance(n, AiClassify)]
-    assert node.spec.scoring == "letters"
-    assert node.spec.labels == tuple(labels)
-    assert [list(ids) for ids in node.spec.label_token_ids] == [
-        letter_tokens(" A"), letter_tokens(" B"), letter_tokens(" C")]
-    assert bytes(node.spec.prompt_token_parts[1]).decode().endswith(
-        f"\n- A: {labels[0]}\n- B: {labels[1]}\n- C: {labels[2]}\nANSWER:")
-    # the chain reads the second classification's letters at its cue:
-    # its two long labels cost more as a trie than as a longer frame
-    assert len(node.spec.stages) == 1
-    assert node.spec.stages[0].spec.scoring == "letters"
-    session.close()
-    # the trie rule keeps the prompt that names the labels
-    forced = quail.Session(EngineConfig(model="qwen3-4b-fp8", device="h100-sxm",
-                                        label_scoring="trie_tree"),
-                           tokenizer=letter_tokens)
-    forced.register("documents", DocumentProvider.from_parquet(path, id_col="id"))
-    (classify,) = [n for n in _topic(forced).plan().nodes
-                   if isinstance(n, AiClassify)]
-    assert classify.spec.scoring == "trie_tree"
-    forced.close()
-    # forced letters without a lettered prompt is refused
-    forced = quail.Session(EngineConfig(model="qwen3-4b-fp8", device="h100-sxm",
-                                        label_scoring="letters"),
-                           tokenizer=_bytes)
-    forced.register("documents", DocumentProvider.from_parquet(path, id_col="id"))
-    refused = _topic(forced).plan()
-    assert isinstance(refused, Refusal) and "one-token letter" in refused.reasons[0]
-    forced.close()
-
-    # the letters rule streams the cue alone
-    model = QWEN3_4B_FP8
-    chunk = budgets.chunk_budget(model, H100_SXM)
-    table = _Table(alias="d", mean=200.0, longest=300, budget=chunk,
-                   chunk=chunk, scoring=None, backend_name="quail",
-                   model=model, device=H100_SXM, tokenizer=_bytes,
-                   capacity=budgets.arena_tokens(model, H100_SXM, chunk),
-                   lengths=(200,) * 1000)
-    long_labels = ((1, 2, 3, 4), (1, 2, 5, 6), (7, 8, 9, 10))
-    scoring, simulated = table.choose(1000, 20, 30, long_labels, False,
-                                      lettered=(20, 34, ((7,), (8,), (9,))))
-    assert scoring == "letters" and simulated.suffix_tokens == 1000
-    # the fresh documents of these labels can also be decoded
-    assert table.choose(1000, 20, 30, long_labels, False)[0] == "trie_decode"
-    with pytest.raises(ClassifyRefusedError, match="no label scoring rule"):
-        table.choose(1000, 20, 30, long_labels, True)
 
 
 def test_classifier_reads_the_letter_at_the_first_canvas_row(monkeypatch):

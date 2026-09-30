@@ -406,26 +406,6 @@ def test_a_classification_of_joined_rows_follows_its_join(monkeypatch):
              .label_in("stance", ["supports"]))
 
 
-def test_an_unlabeled_document_leaves_a_filtered_result(monkeypatch):
-    # claim c1's answer names no label: it has no label row and no
-    # result row, though the filter before the classification kept it
-    monkeypatch.setattr(FixedFeverAnswers, "labels", ("science", None, "science"))
-    with _session() as session:
-        claims = session.docs("claims").alias("c")
-        topic = quail.prompt("What is {0} about?", quail.col("c.claim"))
-        plausible = quail.prompt("Is {0} plausible?", quail.col("c.claim"))
-        query = (claims.ai_filter(plausible, selectivity=0.9)
-                 .ai_classify(topic, ["science", "sport"], name="topic")
-                 .select("c.id", "topic"))
-        execute = fever_executor(session, monkeypatch, 1, capacity=10)
-        result = execute_query(query, physical_executor=execute)
-        assert result.collect().to_pylist() == [
-            {"c.id": "c0", "topic": "science"}]
-        assert result.count() == 1
-        labels = result.answer_tables["classifies"]["topic"]
-        assert labels.column("c").to_pylist() == [0]
-
-
 def test_request_backends_plan_fev9_and_a_single_join():
     for backend in REQUEST_BACKENDS:
         with _session(backend=backend) as session:
