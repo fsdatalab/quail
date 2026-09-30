@@ -300,7 +300,8 @@ labels' probabilities in one forward pass, with one of two rules:
   with `a` to `z` and then `AA` onward, up to 255 labels. On
   DiffusionGemma the answer's first token is the first row of an
   answer canvas that starts with a random token, read in one
-  denoising step. When that read's entropy is above 0.1 nats, the
+  denoising step. When the entropy of that read's label
+  probabilities, among the labels, is above 0.1 nats, the
   document reads three more canvases, each with its own random token,
   and takes the label with the highest mean probability, as vLLM's
   DiffusionGemma structured server does by default.

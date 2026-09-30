@@ -271,7 +271,7 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
                     # the frame and the cue pack as one entry before
                     # the first canvas; a later draw sends the cue alone
                     assert list(suffix) == ([93] if later else [91, 92, 93])
-                    favored, other = sure.get(document, (-1.0, -5.0))
+                    favored, other = sure.get(document, (-1.0, -2.0))
                     answer = answers[document]
                     if later and document == 2:
                         answer, favored, other = 1, -0.001, -12.0

@@ -11,7 +11,8 @@ the partner suffixes are:
   after the cue: a random token at the reply's first row, the turn
   close, and padding; one read-only denoising step, and the first
   row's log probabilities score the letters. A document whose first
-  draw has entropy above CANVAS_ENTROPY_NATS takes up to
+  draw's letter probabilities, among the letters, have entropy above
+  CANVAS_ENTROPY_NATS takes up to
   ``spec.draws - 1`` more canvases, each with its own random token,
   and its label is the best of the draws' mean label probabilities.
 - ``trie_tree``: the whole label trie as one suffix: the cue and every
@@ -210,10 +211,10 @@ class ClassifyStages:
             self.readout_rows = readout_rows = self.canvas_rows
             self.draws = max(1, spec.draws)
         # every label read at the same row needs no normalizer: one-token
-        # labels at the cue row. A draw's entropy needs probabilities.
+        # labels at the cue row
         same_rows = all(len(ids) == 1 for ids in spec.label_token_ids)
-        self.readout = readout = _label_readout(
-            state, targets, readout_rows, not same_rows or self.draws > 1)
+        self.readout = readout = _label_readout(state, targets, readout_rows,
+                                                not same_rows)
         self.labels = np.full(count, None, dtype=object)
         self.decoder = None
         self.stages = []
@@ -349,18 +350,18 @@ class ClassifyStages:
                 [canvas(anchor, draw) for draw in range(1, self.draws)]),
             canvas_rows=self.canvas_rows)
 
-    def _probs(self, logprobs, draws) -> tuple[np.ndarray, np.ndarray]:
-        """Per draw, the labels' probabilities renormalized, and their entropy.
+    def _probs(self, logits, draws) -> tuple[np.ndarray, np.ndarray]:
+        """Per draw, the label probabilities among the labels, and their entropy.
 
-        The entropy is over the labels' own probabilities before
-        renormalizing, in nats.
+        The entropy is in nats.
         """
-        logprobs = np.asarray(logprobs).reshape(draws, self.readout_rows, -1)
-        raw = np.exp(np.stack([
-            self.request.score(logprobs[draw:draw + 1])
-            for draw in range(draws)]))
-        entropy = -np.sum(raw * np.log(np.maximum(raw, 1e-30)), axis=1)
-        return raw / raw.sum(axis=1, keepdims=True), entropy
+        logits = np.asarray(logits).reshape(draws, self.readout_rows, -1)
+        scores = np.stack([self.request.score(logits[draw:draw + 1])
+                           for draw in range(draws)])
+        scores = scores - scores.max(axis=1, keepdims=True)
+        probs = np.exp(scores) / np.exp(scores).sum(axis=1, keepdims=True)
+        entropy = -np.sum(probs * np.log(np.maximum(probs, 1e-30)), axis=1)
+        return probs, entropy
 
     def _first_draw(self, anchor, row, on_label) -> None:
         """Label a document its first draw is sure of; keep the rest's probabilities."""
