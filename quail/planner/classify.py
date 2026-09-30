@@ -74,6 +74,7 @@ def classify_table(context, alias: str, backend_name: str,
         alias=alias, mean=total / max(1, count),
         longest=max(lengths, default=0), budget=min(chunk, capacity),
         chunk=chunk, scoring=context.label_scoring,
+        draws=context.canvas_draws if context.model.answer_canvas else 1,
         backend_name=backend_name, model=context.model,
         device=context.device, tokenizer=context.tokenizer,
         capacity=capacity, lengths=tuple(lengths), shared=tuple(shared),
@@ -119,13 +120,16 @@ def decodable(labels) -> bool:
                    for label in labels for depth in range(1, len(label)))
 
 
-def suffix_lengths(scoring: str, labels, canvas_rows: int = 0) -> list[int]:
+def suffix_lengths(scoring: str, labels, canvas_rows: int = 0,
+                   draws: int = 1) -> list[int]:
     """Tokens of each suffix a document streams under one scoring rule.
 
     Every suffix starts with the answer cue's last token. Under
     ``letters`` the one suffix is the cue alone, whose row scores every
     letter, followed on a canvas model by the ``canvas_rows`` rows of
-    the seeded canvas whose first row is read. Under ``trie_tree`` the
+    the seeded canvas whose first row is read; on a canvas model a
+    document may send one such suffix per noise draw, and every draw
+    is priced. Under ``trie_tree`` the
     one suffix holds every trie node once; every row is read. Under
     ``trie_decode`` a document sends one chain per round, the cue and
     the tokens decoded so far, for as many rounds as the mean label
@@ -136,7 +140,7 @@ def suffix_lengths(scoring: str, labels, canvas_rows: int = 0) -> list[int]:
         ValueError: The rule is not one of LABEL_SCORINGS.
     """
     if scoring == LETTERS_SCORING:
-        return [1 + canvas_rows]
+        return [1 + canvas_rows] * (draws if canvas_rows else 1)
     if scoring == TREE_SCORING:
         return [len(label_trie(labels))]
     if scoring == DECODE_SCORING:
@@ -350,6 +354,8 @@ class _Table:
         capacity: The arena's tokens.
         scoring: The label scoring rule every classification uses, or
             None to choose per classification by simulated cost.
+        draws: The noise draws a letters read on a canvas model may
+            average; 1 on a causal model.
         lengths: Every document's length in tokens.
         shared: Per document, the leading tokens an earlier document
             also has, which prefix sharing borrows from KV; empty when
@@ -368,6 +374,7 @@ class _Table:
     device: object
     tokenizer: object
     capacity: int = 0
+    draws: int = 1
     lengths: tuple = ()
     shared: tuple = ()
     # whether the model runs the tree attention path, which the
@@ -448,6 +455,7 @@ class _Table:
             expected_inputs=live, estimated_seconds=simulated.seconds,
             prompt_token_parts=(head, tail), labels=tuple(call.labels),
             label_token_ids=labels, scoring=scoring,
+            draws=self.draws if scoring == LETTERS_SCORING else 1,
         )
         return spec, simulated.work
 
@@ -460,7 +468,7 @@ class _Table:
     def simulate(self, scoring, live, head_tokens, frame_tokens, labels,
                  resident) -> Simulated:
         """Replay one rule over the documents expected and price it."""
-        chains = suffix_lengths(scoring, labels, self.canvas_rows)
+        chains = suffix_lengths(scoring, labels, self.canvas_rows, self.draws)
         documents, weight = self.sample(live)
         prefixes = [head_tokens + length for length, _ in documents]
         # a borrowed prefix includes the prompt head the documents share

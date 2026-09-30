@@ -1022,6 +1022,8 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
                 "classify_placement": ("after joins" if classify_after_joins
                                        else "before joins")}
                if labels.calls else {}),
+            **({"canvas_draws": context.canvas_draws}
+               if labels.calls and model.answer_canvas else {}),
         },
         estimator=estimator)
 
@@ -1031,6 +1033,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                order: str | None = None, backend: str = "quail",
                registry=None, tokenizer=None, pair_fractions=None,
                label_scoring: str | None = None,
+               canvas_draws: int = 4,
                attention: str | None = None):
     """Plan one query with the selected model backend.
 
@@ -1045,6 +1048,8 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         backend: Registered model backend name.
         label_scoring: An AI.CLASSIFY label scoring rule forced for
             every classification; None lets the planner choose.
+        canvas_draws: The most noise draws a diffusion model averages
+            per letters read and per one-table AI.SCORE; 1 reads one.
         attention: An attention path, "tree" or "unified", forced for
             every filter and join; None lets the planner choose.
         registry: Optional session extension registry.
@@ -1053,6 +1058,10 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         pair_fractions: join written position -> the fraction of the
             cross product its equality conditions keep.
     """
+    if canvas_draws < 1:
+        return Refusal(
+            reasons=(f"canvas_draws must be at least 1, got {canvas_draws}",),
+            constraint="canvas_draws", needed=1, available=canvas_draws)
     if registry is None:
         # the built in registry imports every backend, and backends
         # import this planner; build it only when no session gave one
@@ -1086,6 +1095,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         backend=backend,
         order=order,
         label_scoring=label_scoring,
+        canvas_draws=canvas_draws,
         attention=attention,
         tokenizer=tokenizer,
         pair_fractions=dict(pair_fractions or {}),
@@ -1121,6 +1131,7 @@ def refine_plan(plan, *, model: ModelSpec, device: DeviceSpec,
                 registry=None, order: str | None = None,
                 tokenizer=None, pair_fractions=None,
                 label_scoring: str | None = None,
+                canvas_draws: int = 4,
                 attention: str | None = None):
     """Run the physical rules again over a plan once its inputs are exact.
 
@@ -1142,6 +1153,7 @@ def refine_plan(plan, *, model: ModelSpec, device: DeviceSpec,
         backend=backend,
         order=order,
         label_scoring=label_scoring,
+        canvas_draws=canvas_draws,
         attention=attention,
         tokenizer=tokenizer,
         pair_fractions=dict(pair_fractions or {}),

@@ -78,7 +78,8 @@ def _methods(csv: str) -> list[str]:
 
 def _run_family(process_groups, result_name, model, sf, query_ids_csv,
                 run_dir, ground_truth_collection, root=None,
-                label_scoring=None, attention=None, gpu_timing=False) -> str:
+                label_scoring=None, attention=None, gpu_timing=False,
+                canvas_draws=None) -> str:
     """Run one query family's methods, one child process per group.
 
     Every group runs on the one GPU of this container, in a fresh
@@ -100,7 +101,7 @@ def _run_family(process_groups, result_name, model, sf, query_ids_csv,
             run_dir=run_dir, ground_truth_collection=ground_truth_collection,
             methods=methods, root=root, label_scoring=label_scoring,
             attention=attention, gpu_timing=gpu_timing,
-            suite_name=f"{family}{result_name}")
+            suite_name=f"{family}{result_name}", canvas_draws=canvas_draws)
         process_results.append(process_result)
         suites.update(process_result["suites"])
     gpu_uuids = {
@@ -154,14 +155,17 @@ def run_query_family(
     attention: str = "",
     gpu_timing: bool = False,
     label_root: str = "",
+    canvas_draws: str = "",
 ) -> str:
     """Run one query family through Quail and the vLLM baselines.
 
     baselines names the vLLM baseline methods that run when
     include_baselines is set. label_scoring forces one AI.CLASSIFY
     label scoring rule and attention one attention path for filters
-    and joins; empty lets the planner choose. label_root names a
-    local mirror of the published labels.
+    and joins; empty lets the planner choose. canvas_draws lists the
+    most noise draws a diffusion model averages, comma-separated, one
+    Quail run each; empty keeps the default. label_root names a local
+    mirror of the published labels.
     """
     process_groups = [("quail",)] if include_quail else []
     if include_baselines:
@@ -174,7 +178,8 @@ def run_query_family(
                            root=label_root or None,
                            label_scoring=label_scoring or None,
                            attention=attention or None,
-                           gpu_timing=gpu_timing)
+                           gpu_timing=gpu_timing,
+                           canvas_draws=canvas_draws or None)
     finally:
         results_vol.commit()
         kernel_cache.commit()
@@ -277,6 +282,7 @@ def run_all(
     attention: str = "",
     gpu_timing: bool = False,
     label_root: str = "",
+    canvas_draws: str = "",
 ):
     from quail_b import select_queries
 
@@ -296,6 +302,7 @@ def run_all(
         "sf": sf,
         "label_scoring": label_scoring or None,
         "attention": attention or None,
+        "canvas_draws": canvas_draws or None,
         "query_ids": list(query_ids),
         "summaries": {},
         "function_call_ids": {},
@@ -332,6 +339,7 @@ def run_all(
                     attention=attention,
                     gpu_timing=gpu_timing,
                     label_root=label_root,
+                    canvas_draws=canvas_draws,
                 )
                 family_calls.append((group, family_call))
                 call_ids[f"{group}:quail_vllm"] = family_call.object_id
@@ -492,6 +500,7 @@ def main(
     gpu_timing: bool = False,
     label_root: str = "",
     finish: str = "",
+    canvas_draws: str = "",
 ):
     if finish:
         # finish an earlier run whose orchestrator died
@@ -520,6 +529,7 @@ def main(
         attention=attention,
         gpu_timing=gpu_timing,
         label_root=label_root,
+        canvas_draws=canvas_draws,
     )
     print(f"function call id: {call.object_id} (all families)", flush=True)
     print(call.get(), flush=True)

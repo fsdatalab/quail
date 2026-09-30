@@ -298,8 +298,14 @@ labels' probabilities in one forward pass, with one of two rules:
   ...), the prompt asks for the letter, and the letters' probabilities
   are read at the answer's first token. Past `Z` the letters continue
   with `a` to `z` and then `AA` onward, up to 255 labels. On
-  DiffusionGemma the answer's first token is the first row of a seeded
-  answer canvas, read in one denoising step.
+  DiffusionGemma the answer's first token is the first row of an
+  answer canvas that starts with a random token, read in one
+  denoising step. When that read's entropy is above 0.1 nats, the
+  document reads three more canvases, each with its own random token,
+  and takes the label with the highest mean probability, as vLLM's
+  DiffusionGemma structured server does by default.
+  `EngineConfig(canvas_draws=1)` reads one canvas; the default is 4.
+  `AI.SCORE` over one table averages its TRUE probability the same way.
 - `trie_tree`: the categories are named, and each label's score is
   the sum of its tokens' log probabilities after the prompt, computed
   over the labels' token trie in one request.

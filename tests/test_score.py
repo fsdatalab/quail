@@ -8,6 +8,7 @@ import pyarrow.parquet as pq
 import pytest
 
 import quail
+from quail.backends.quail.executor.stages import Stage
 from quail.catalog import Catalog, DocumentProvider
 from quail.execution.execute import execute_query
 from quail.execution.reranker import (
@@ -257,11 +258,15 @@ def test_score_cost_counts_canvas_rows_anchor_prefixes_and_throughput(catalog):
         session = _session(catalog, model=model, tokenizer=list)
         physical = session.sql(_score_sql(False)[1]).plan()
         session.close()
-        head, tail = next(node for node in physical.nodes
-                          if isinstance(node, AiScore)).spec.prompt_token_parts
+        spec = next(node for node in physical.nodes
+                    if isinstance(node, AiScore)).spec
+        head, tail = spec.prompt_token_parts
+        assert spec.draws == (4 if canvas else 1), model
         documents = len("refund please") + len("all good")
-        # the second document reads the shared head from KV
-        expected = documents + 2 * (len(head) + len(tail) + canvas) - len(head)
+        # the second document reads the shared head from KV; each later
+        # noise draw is the cue and its canvas
+        expected = (documents + 2 * (len(head) + len(tail) + canvas) - len(head)
+                    + 2 * (spec.draws - 1) * (1 + canvas))
         assert physical.settings["estimated_fresh_tokens"] == \
             pytest.approx(expected), model
 
@@ -427,6 +432,36 @@ def test_native_and_distributed_scores_share_prefixes_and_keep_pair_order(
     np.testing.assert_allclose(result.scores, [0.9, 0.2])
     assert result.fresh_tokens == 8
     assert result.cached_tokens == 4
+
+    # one table on a canvas model: each document's KV, then one draw; an
+    # uncertain first score takes three more draws and their mean
+    drawn = SimpleNamespace(name="score", aliases=("b",), draws=4,
+                            prompt_token_parts=((1,), (2, 3)))
+    state = dict(torch=object(), arena=object(), answer_rows=object(),
+                 pipeline=SimpleNamespace(canvas_ids=(7,)),
+                 model_spec=SimpleNamespace(vocab=50), chunk_tokens=1234)
+
+    def run_stages(torch, arena, pipeline, stages, prefixes, budget, **kwargs):
+        first, more = stages
+        assert [list(prefix) for prefix in prefixes] == [[1, 30], [1, 20]]
+        assert (first.frame, first.suffixes, more.suffixes) == (
+            [2], [[3]], [[3]] * 3)
+        assert np.shape(first.canvas(0)) == (1,)
+        assert np.shape(more.canvas(1)) == (3, 1)
+        keys = kwargs["anchor_keys"]
+        first.decide(0, [0.999])
+        first.decide(1, [0.6])
+        assert more.requests(keys[0]) is Stage.SKIP
+        assert more.requests(keys[1]) is None
+        more.decide(1, [0.2, 0.2, 0.2])
+        return [], [], 9
+
+    monkeypatch.setattr(module, "run_stages", run_stages)
+    result = module.QuailScorer(state).score(drawn, [(1,), (0,)], documents)
+    np.testing.assert_allclose(result.scores, [0.999, 0.3], rtol=1e-6)
+    # heads and documents, then each frame, cue, and canvas, then the
+    # second document's three later draws
+    assert (result.fresh_tokens, result.cached_tokens) == (9, 4 + 6 + 6 - 9)
 
     batches = ScoreRows.batches
     monkeypatch.setattr(ScoreRows, "batches",

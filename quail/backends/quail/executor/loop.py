@@ -419,7 +419,12 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         own = g.get("canvas")
         group_canvas = (canvas_ids if own is None
                         else np.asarray(own, dtype=np.int64))
-        width = len(group_canvas)
+        # a two-dimensional canvas holds one canvas per suffix
+        per_suffix = group_canvas.ndim == 2
+        if per_suffix and len(group_canvas) != n:
+            raise ValueError(
+                f"group {key!r}: {len(group_canvas)} canvases for {n} suffixes")
+        width = group_canvas.shape[-1]
         if width and not read_all and answer_row >= width:
             raise ValueError(
                 f"group {key!r}: answer_row {answer_row} is outside its "
@@ -434,10 +439,14 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         if n and width:
             # row answer_row of each canvas carries the answer
             past = within - np.repeat(sufs.lengths, widths)
+            # suffix s reads canvas row s of a two-dimensional canvas
+            first_row = (np.repeat(np.arange(n) * width, widths) if per_suffix
+                         else 0)
             source = np.where(
-                past >= 0, len(sufs.ids) + past,
+                past >= 0, len(sufs.ids) + first_row + past,
                 np.repeat(sufs.offsets[:-1], widths) + within)
-            id_parts.append(np.concatenate([sufs.ids, group_canvas])[source])
+            id_parts.append(
+                np.concatenate([sufs.ids, group_canvas.ravel()])[source])
             first = s_row0 + begins + sufs.lengths
             canvas_starts.append(first)
             canvas_sizes.append(np.full(n, width, dtype=np.int64))

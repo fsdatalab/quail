@@ -478,7 +478,11 @@ class RequestExecution(PhysicalNode):
 
 @dataclass(frozen=True)
 class ScoreSpec:
-    """One batched AI.SCORE computation."""
+    """One batched AI.SCORE computation.
+
+    ``draws`` is how many noise draws a diffusion model's answer is
+    averaged over; 1 on an autoregressive model.
+    """
 
     name: str
     aliases: tuple[str, ...]
@@ -488,6 +492,7 @@ class ScoreSpec:
     estimated_seconds: float
     pair_fraction: float = 1.0
     prompt_token_parts: tuple[tuple[int, ...], ...] = ()
+    draws: int = 1
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "ScoreSpec":
@@ -505,6 +510,7 @@ class ScoreSpec:
             prompt_token_parts=tuple(
                 tuple(part) for part in value.get("prompt_token_parts", ())
             ),
+            draws=int(value.get("draws", 1)),
         )
 
     def to_dict(self) -> dict:
@@ -517,6 +523,7 @@ class ScoreSpec:
             "estimated_seconds": self.estimated_seconds,
             "pair_fraction": self.pair_fraction,
             "prompt_token_parts": [list(part) for part in self.prompt_token_parts],
+            "draws": self.draws,
         }
 
 
@@ -624,7 +631,7 @@ class ClassifySpec(ScoreSpec):
             **{name: getattr(base, name) for name in (
                 "name", "aliases", "query_template", "arguments",
                 "expected_inputs", "estimated_seconds", "pair_fraction",
-                "prompt_token_parts")},
+                "prompt_token_parts", "draws")},
             labels=tuple(str(label) for label in value["labels"]),
             label_token_ids=tuple(
                 tuple(int(token) for token in ids)
@@ -677,6 +684,7 @@ class AiClassify(AiScore):
             "scoring": None if self.spec is None else self.spec.scoring,
             "share_prefixes": (False if self.spec is None
                                else self.spec.share_prefixes),
+            "draws": 1 if self.spec is None else self.spec.draws,
         }
 
     @classmethod

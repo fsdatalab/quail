@@ -344,7 +344,9 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
             details.append(f"rule={spec.scoring}, "
                            f"labels={len(spec.labels)}, "
                            f"label tokens="
-                           f"{sum(len(ids) for ids in spec.label_token_ids)}")
+                           f"{sum(len(ids) for ids in spec.label_token_ids)}"
+                           + (f", up to {spec.draws} noise draws"
+                              if spec.draws > 1 else ""))
         elif isinstance(node, Filter):
             title += f": {node.predicate.describe()}"
         elif isinstance(node, AiJoin):

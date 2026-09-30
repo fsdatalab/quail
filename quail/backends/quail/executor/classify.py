@@ -10,7 +10,10 @@ the partner suffixes are:
   them all. On a diffusion model the suffix packs a seeded canvas
   after the cue: a random token at the reply's first row, the turn
   close, and padding; one read-only denoising step, and the first
-  row's log probabilities score the letters.
+  row's log probabilities score the letters. A document whose first
+  draw has entropy above CANVAS_ENTROPY_NATS takes up to
+  ``spec.draws - 1`` more canvases, each with its own random token,
+  and its label is the best of the draws' mean label probabilities.
 - ``trie_tree``: the whole label trie as one suffix: the cue and every
   node's token once, split into chains that each follow first
   children. Each chain is a causal segment and reads the ancestors
@@ -45,7 +48,7 @@ from quail.execution.labels import (
 )
 from quail.execution.reranker import RerankerBatch
 from quail.execution.tokens import chain_tokens, prefix_tree
-from quail.specs.base import CANVAS_SEED
+from quail.specs.base import CANVAS_ENTROPY_NATS, CANVAS_SEED
 
 logger = logging.getLogger("quail")
 
@@ -182,6 +185,7 @@ class ClassifyStages:
     """
 
     canvas_rows = 0         # rows of a letters stage's canvas on a canvas model
+    draws = 1               # noise draws a canvas letters read may average
     seeds = None            # document index -> its canvas seed; the index itself
     partners = None         # JoinPartners, for joined rows
     pair_labels = None      # (anchor index, partner index) -> label, for joined rows
@@ -204,25 +208,34 @@ class ClassifyStages:
         if spec.scoring == "letters" and answer_canvas is not None:
             self.canvas_rows = answer_canvas.rows
             self.readout_rows = readout_rows = self.canvas_rows
+            self.draws = max(1, spec.draws)
         # every label read at the same row needs no normalizer: one-token
-        # labels at the cue row
+        # labels at the cue row. A draw's entropy needs probabilities.
         same_rows = all(len(ids) == 1 for ids in spec.label_token_ids)
-        self.readout = readout = _label_readout(state, targets, readout_rows,
-                                                not same_rows)
+        self.readout = readout = _label_readout(
+            state, targets, readout_rows, not same_rows or self.draws > 1)
         self.labels = np.full(count, None, dtype=object)
         self.decoder = None
         self.stages = []
         if not request.rounds:
             def whole(anchor, row):
-                self._set(anchor, self.label_of(row), on_label)
+                if self.draws > 1:
+                    self._first_draw(anchor, row, on_label)
+                else:
+                    self._set(anchor, self.label_of(row), on_label)
                 return True
 
+            canvas = self._letter_canvas(state) if self.canvas_rows else None
             self.stages.append(Stage(
                 suffixes=request.suffixes, readout=readout,
                 frame=request.frame, decide=whole,
                 read_all_rows=read_all, label=spec.name,
                 chains=request.chains,
-                **(self._letter_canvas(state) if self.canvas_rows else {})))
+                **({} if canvas is None else dict(
+                    single=True, canvas=lambda anchor: canvas(anchor, 0),
+                    canvas_rows=self.canvas_rows))))
+            if self.draws > 1:
+                self.stages.append(self._more_draws(canvas, on_label))
             return
         self.decoder = decoder = GreedyDecoder(spec.label_token_ids, targets, count)
 
@@ -286,26 +299,75 @@ class ClassifyStages:
             requests=ask, decide=score, read_all_rows=True,
             read_rows=[1] * len(suffixes), label=spec.name)]
 
-    def _letter_canvas(self, state) -> dict:
-        """The Stage fields of a letters stage on a canvas model.
+    def _letter_canvas(self, state) -> Callable[[int, int], np.ndarray]:
+        """Callable(document index, draw) -> the canvas a letters read packs.
 
-        The stage's one suffix, the cue, packs a canvas after it as one
-        entry: a random token at the reply's first row, the turn close,
-        and padding. The random token is drawn from the document's row,
-        so an answer is the same in any batch.
+        The canvas follows the cue: a random token at the reply's first
+        row, the turn close, and padding. The random token is drawn
+        from the document's row and the draw, so an answer is the same
+        in any batch.
         """
         model_spec = state["model_spec"]
         settings = model_spec.answer_canvas
         template = np.full(settings.rows, settings.pad_id, dtype=np.int64)
         template[1] = settings.turn_close_id
 
-        def canvas(anchor):
-            rng = np.random.default_rng((CANVAS_SEED, self.seed(anchor), 0))
+        def canvas(anchor, draw):
+            rng = np.random.default_rng((CANVAS_SEED, self.seed(anchor), draw))
             ids = template.copy()
             ids[0] = rng.integers(0, model_spec.vocab)
             return ids
 
-        return dict(single=True, canvas=canvas, canvas_rows=settings.rows)
+        return canvas
+
+    def _more_draws(self, canvas, on_label) -> Stage:
+        """The stage sending an uncertain document its remaining draws.
+
+        Each draw is the cue and its own canvas after the document's
+        resident KV; a document its first draw labeled skips it.
+        """
+        more = self.draws - 1
+        self.draw_probs = {}
+        self.extended = 0
+
+        def ask(key):
+            return (Stage.SKIP if self.labels[self.index_of(key)] is not None
+                    else None)
+
+        def average(anchor, row):
+            probs = self._probs(row, more)[0]
+            self.extended += 1
+            mean = (self.draw_probs[anchor] + probs.sum(axis=0)) / self.draws
+            self._set(anchor, self.spec.labels[best_label(mean)], on_label)
+            return True
+
+        return Stage(
+            suffixes=self.request.suffixes * more, readout=self.readout,
+            frame=self.request.frame, requests=ask, decide=average,
+            read_all_rows=True, label=f"{self.spec.name} draws",
+            canvas=lambda anchor: np.stack(
+                [canvas(anchor, draw) for draw in range(1, self.draws)]),
+            canvas_rows=self.canvas_rows)
+
+    def _probs(self, logprobs, draws) -> tuple[np.ndarray, np.ndarray]:
+        """Per draw, the labels' probabilities renormalized, and their entropy.
+
+        The entropy is over the labels' own probabilities before
+        renormalizing, in nats.
+        """
+        logprobs = np.asarray(logprobs).reshape(draws, self.readout_rows, -1)
+        raw = np.exp(np.stack([
+            self.request.score(logprobs[draw:draw + 1])
+            for draw in range(draws)]))
+        entropy = -np.sum(raw * np.log(np.maximum(raw, 1e-30)), axis=1)
+        return raw / raw.sum(axis=1, keepdims=True), entropy
+
+    def _first_draw(self, anchor, row, on_label) -> None:
+        """Label a document its first draw is sure of; keep the rest's probabilities."""
+        probs, entropy = self._probs(row, 1)
+        self.draw_probs[anchor] = probs[0]
+        if entropy[0] <= CANVAS_ENTROPY_NATS:
+            self._set(anchor, self.spec.labels[best_label(probs[0])], on_label)
 
     def seed(self, anchor) -> int:
         """The document's canvas seed: its index unless ``seeds`` says."""
@@ -344,8 +406,10 @@ class ClassifyStages:
             for anchor, logprobs in first.items():
                 if self.labels[anchor] is None:
                     self.labels[anchor] = self.label_of(logprobs)
-            suffix_tokens = len(first) * (sum(map(len, self.request.suffixes))
-                                         + self.canvas_rows)
+            read = sum(map(len, self.request.suffixes)) + self.canvas_rows
+            suffix_tokens = len(first) * read
+            if self.draws > 1:
+                suffix_tokens += self.extended * (self.draws - 1) * read
         return suffix_tokens, suffix_tokens + len(first) * len(self.request.frame)
 
 

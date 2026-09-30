@@ -204,7 +204,11 @@ def _score_spec(
         token_parts_by_prompt[prompt] = token_parts
     aliases = _prompt_aliases(prompt)
     lengths = [context.document_tokens[alias] for alias in aliases]
-    fixed_tokens = sum(map(len, token_parts)) + context.model.canvas_tokens
+    canvas = context.model.canvas_tokens
+    # a one-table score on a canvas model may average noise draws, each
+    # the cue and its canvas after the document's KV; every draw is priced
+    draws = context.canvas_draws if canvas and len(aliases) == 1 else 1
+    fixed_tokens = sum(map(len, token_parts)) + canvas + (draws - 1) * (1 + canvas)
     shared = len(token_parts[0])
     prefix = float(shared)
     prefix_variance = 0.0
@@ -243,6 +247,7 @@ def _score_spec(
         estimated_seconds=estimate,
         pair_fraction=pair_fraction,
         prompt_token_parts=token_parts,
+        draws=draws,
     ), work
 
 

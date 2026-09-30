@@ -39,6 +39,7 @@ def run_backend_group(
     attention: str | None = None,
     gpu_timing: bool = False,
     suite_name: str | None = None,
+    canvas_draws: str | None = None,
 ) -> dict:
     """Run backend methods while sharing one loaded model when possible.
 
@@ -62,10 +63,17 @@ def run_backend_group(
     # their times compare without container-to-container variance
     rules = [rule.strip() for rule in (label_scoring or "").split(",")
              if rule.strip()] or [None]
+    # so do several canvas draw counts
+    draw_counts = [int(count) for count in (canvas_draws or "").split(",")
+                   if count.strip()] or [None]
+    settings = [(rule, draws) for rule in rules for draws in draw_counts]
     for method in methods:
-        for rule in rules:
-            name = (method if rule is None or len(rules) == 1
-                    or method != "quail" else f"{method}-{rule}")
+        for rule, draws in settings:
+            name = method
+            if method == "quail" and len(rules) > 1:
+                name += f"-{rule}"
+            if method == "quail" and len(draw_counts) > 1:
+                name += f"-draws{draws}"
             print(
                 f"[{family}] running {name} for {len(query_ids)} queries",
                 flush=True,
@@ -80,6 +88,7 @@ def run_backend_group(
                     label_scoring=rule,
                     attention=attention,
                     gpu_timing=gpu_timing,
+                    **({} if draws is None else {"canvas_draws": draws}),
                 ),
                 data_dir=Path(data_dir) / f"sf{sf}",
                 ground_truth_collection=ground_truth_collection or None,

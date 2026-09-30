@@ -159,18 +159,22 @@ def fake_torch():
 
 
 def fake_pack(torch, arena, specs, **kw):
-    # a group's own canvas rows are packed; the chunk's are not counted
+    # a group's own canvas rows are packed, one canvas per suffix; the
+    # chunk's are not counted
+    def own_rows(spec):
+        own = spec.get("canvas")
+        return 0 if own is None else np.shape(own)[-1]
+
     tokens = sum(
         (len(spec["prefix"]) if spec["prefix"] is not None else 0)
-        + sum(len(suffix) + len(spec.get("canvas", ()))
-              for suffix in spec["suffixes"])
+        + sum(len(suffix) + own_rows(spec) for suffix in spec["suffixes"])
         for spec in specs)
 
     # one row per suffix, every row of a suffix read whole, or every
     # row of the canvas after it
     def canvas_rows(spec):
         own = spec.get("canvas")
-        return len(kw.get("canvas") or ()) if own is None else len(own)
+        return len(kw.get("canvas") or ()) if own is None else own_rows(spec)
 
     rows_per_answer = tuple(
         int(spec["read_rows"][index]) if spec.get("read_rows") is not None

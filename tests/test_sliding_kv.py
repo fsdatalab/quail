@@ -210,6 +210,23 @@ def test_pack_chunk_builds_both_pools_and_reads_borrowed_pages(monkeypatch):
     assert sliding["tail_src"].numel() == 2 * (36 % 16)
     for temp in chunk.temporary_keys:
         arena.free_key(temp)
+    # each suffix may carry its own canvas
+    chunk = loop.pack_chunk(
+        torch, arena, [dict(key=key, prefix=None, f=100,
+                            suffixes=[[600], [601, 602]],
+                            canvas=[[900, 901], [910, 911]])],
+        attention_mode="unified", canvas=canvas)
+    assert chunk.input_ids.tolist() == [600, 900, 901, 601, 602, 910, 911]
+    assert chunk.positions.tolist() == [100, 101, 102, 100, 101, 102, 103]
+    assert chunk.final_indices.tolist() == [1, 5]
+    assert chunk.meta["unified"]["used"].tolist() == [103, 104]
+    for temp in chunk.temporary_keys:
+        arena.free_key(temp)
+    with pytest.raises(ValueError, match="1 canvases for 2 suffixes"):
+        loop.pack_chunk(
+            torch, arena, [dict(key=key, prefix=None, f=100,
+                                suffixes=[[600], [601]], canvas=[[900, 901]])],
+            attention_mode="unified", canvas=canvas)
     arena.free_key(key)
     assert arena.free_pages == 64
 

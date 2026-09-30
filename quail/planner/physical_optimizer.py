@@ -45,6 +45,9 @@ class PlanningContext:
     # an AI.CLASSIFY label scoring rule forced for every classification;
     # None lets the planner choose
     label_scoring: str | None = None
+    # the most noise draws a diffusion model averages per letters read
+    # and per one-table AI.SCORE
+    canvas_draws: int = 4
     # an attention path forced for every filter and join; None lets
     # the planner choose per node
     attention: str | None = None

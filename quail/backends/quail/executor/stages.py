@@ -67,8 +67,9 @@ class Stage:
             segment and gathers the ancestors above it.
         canvas: On a diffusion model, Callable(document index) -> the
             token ids of the canvas the document packs after each suffix
-            in place of the pipeline's. Asked when the document's group
-            is packed. None packs the pipeline's canvas.
+            in place of the pipeline's, or one row of ids per suffix.
+            Asked when the document's group is packed. None packs the
+            pipeline's canvas.
         canvas_rows: The rows of every canvas ``canvas`` returns.
     """
 
@@ -361,7 +362,10 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                 own["read_rows"] = read_rows[j][np.asarray(list(indices))]
                 rows = int(own["read_rows"].sum())
             if stages[j].canvas is not None:
-                own = dict(canvas=stages[j].canvas(a))
+                ids = np.asarray(stages[j].canvas(a))
+                if ids.ndim == 2:
+                    ids = ids[np.asarray(list(indices), dtype=np.int64)]
+                own = dict(canvas=ids)
                 if read_all:
                     rows = stages[j].canvas_rows * len(sufs)
             # under tree attention a borrowing document with one

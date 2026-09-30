@@ -441,6 +441,8 @@ def main():
                         help="force one attention path for filters and joins")
     parser.add_argument("--gpu-timing", action="store_true",
                         help="record GPU seconds per model node")
+    parser.add_argument("--canvas-draws", type=int, default=4,
+                        help="most noise draws a diffusion model averages")
     args = parser.parse_args()
     run_suite(
         [value.strip() for value in args.only.split(",")] if args.only else None,
@@ -453,6 +455,7 @@ def main():
             label_scoring=args.label_scoring,
             attention=args.attention,
             gpu_timing=args.gpu_timing,
+            canvas_draws=args.canvas_draws,
         ),
         data_dir=args.data_dir,
         ground_truth_collection=args.ground_truth_collection,

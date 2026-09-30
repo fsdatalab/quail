@@ -37,6 +37,7 @@ from quail.physical import (
 )
 from quail.physical.base import input_ports
 from quail.specs import DEVICES, MODELS
+from quail.specs.base import CANVAS_SEED
 
 # the classification frame is written after the document like a join
 # frame; the cue is the tail's last token
@@ -162,7 +163,8 @@ def fused_graph(*, classify_only=False):
     return PhysicalGraph(tuple(nodes), PortRef("group:0", "ids:r"))
 
 
-@pytest.mark.parametrize("shape", ["filter", "joined", "classify_first"])
+@pytest.mark.parametrize("shape", ["filter", "joined", "classify_first",
+                                   "draws"])
 def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
         monkeypatch, shape):
     """A filter, then a diffusion model's classification: one run.
@@ -172,7 +174,9 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
     a filter on the label and a join follow, in the same pipeline. When
     ``classify_first`` the pipeline starts with the classification,
     whose plan settings carry no shared preamble, so the documents pack
-    under the classification's own prompt head.
+    under the classification's own prompt head. When ``draws`` a
+    survivor whose first draw is uncertain reads three more canvases
+    and takes the label of the mean probabilities.
     """
     from dataclasses import replace
 
@@ -187,7 +191,8 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
         name="topic", aliases=("r",), query_template="", arguments=(),
         expected_inputs=4, estimated_seconds=0.0,
         prompt_token_parts=(head, (91, 92, 93)), labels=("a", "b"),
-        label_token_ids=((1,), (2,)), scoring="letters")
+        label_token_ids=((1,), (2,)), scoring="letters",
+        draws=4 if shape == "draws" else 1)
     nodes = [Scan(node_id="input:r", alias="r", input_id="r")]
     if not first:
         nodes.append(AiFilter(
@@ -235,12 +240,17 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
     chains = {pipeline.node_ids for pipeline in build_pipelines(graph).values()}
     assert chains == {{
         "filter": ("filter:r", "classify:r"),
+        "draws": ("filter:r", "classify:r"),
         "joined": ("filter:r", "classify:r", "label:r", "group:0"),
         "classify_first": ("classify:r", "label:r")}[shape]}
 
     filter_truth = [[1], [0], [1], [1]]
     # the letter each survivor's first canvas row favors
     answers = {0: 1, 1: 1, 2: 2, 3: 2}
+    # log probabilities (favored, other) at a first draw's row; with
+    # draws, document 3's first draw is sure and document 2's later
+    # draws favor letter 1
+    sure = {3: (-0.001, -12.0)} if shape == "draws" else {}
     vocab = 8
     packed = {}
     prefixes = {}
@@ -251,17 +261,25 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
             document = entry["key"][1]
             if entry["prefix"] is not None:
                 prefixes[document] = list(entry["prefix"])
-            for suffix in entry["suffixes"]:
+            for index, suffix in enumerate(entry["suffixes"]):
                 if entry.get("canvas") is not None:
-                    packed.setdefault(document, []).append(list(entry["canvas"]))
+                    canvas = np.asarray(entry["canvas"])
+                    later = canvas.ndim == 2
+                    packed.setdefault(document, []).append(
+                        (canvas[index] if later else canvas).tolist())
                     assert entry["read_all_rows"]
                     # the frame and the cue pack as one entry before
-                    # the canvas
-                    assert list(suffix) == [91, 92, 93]
+                    # the first canvas; a later draw sends the cue alone
+                    assert list(suffix) == ([93] if later else [91, 92, 93])
+                    favored, other = sure.get(document, (-1.0, -5.0))
+                    answer = answers[document]
+                    if later and document == 2:
+                        answer, favored, other = 1, -0.001, -12.0
                     for position in range(settings.rows):
                         rows.append(np.asarray(
-                            [-1.0 if position == 0 and token == answers[document]
-                             else -5.0 for token in (1, 2)], np.float32))
+                            [favored if position == 0 and token == answer
+                             else other if position == 0 else -5.0
+                             for token in (1, 2)], np.float32))
                 elif suffix[0] >= FRAME:
                     rows.append(0)
                 elif suffix[0] >= PARTNER:
@@ -345,6 +363,17 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
     assert outputs[PortRef("filter:r", "ids:r")].column("r").to_pylist() \
         == [0, 2, 3]
     assert labels.column("r").to_pylist() == [0, 2, 3]
+    if shape == "draws":
+        # document 2's three later draws outvote its first; document 3
+        # was sure at its first draw and sent no more
+        assert labels.column("topic").to_pylist() == ["a", "a", "b"]
+        assert [len(packed[d]) for d in (0, 2, 3)] == [4, 4, 1]
+        seeds = [[int(np.random.default_rng((CANVAS_SEED, 2, draw))
+                      .integers(0, vocab)), 6, 0, 0] for draw in range(4)]
+        assert packed[2] == seeds
+        assert metrics["classify:r"]["fresh_tokens"] == \
+            3 * (2 + 1 + 4) + 2 * 3 * (1 + 4)
+        return
     assert labels.column("topic").to_pylist() == ["a", "b", "b"]
     # each survivor packed one canvas: a random token, the turn close,
     # then padding
