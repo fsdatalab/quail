@@ -227,12 +227,6 @@ def document_page(title, queries, relations):
         cell.PAD = 0.02
         if row == 0:
             cell.set_text_props(weight="bold")
-    note_text = (
-        "Each alias lists its full input before filters. Repeated aliases can "
-        "refer to the same underlying set.\n"
-        "Counts come from the saved corpus manifest. SoL uses the same inputs "
-        "and the saved reference labels for survivors.")
-    figure.text(0.055, 0.075, note_text, fontsize=11, linespacing=1.5)
     return figure
 
 
@@ -262,12 +256,6 @@ def plot_comparison(title, queries, rows, relations, sol, name, overview=False):
             figure.subplots_adjust(left=0.075, right=0.97, top=0.83,
                                    bottom=0.14 if overview else 0.10, hspace=0.60,
                                    wspace=0.28)
-            note = "Raw prompts. References: Qwen3 32B FP8 and dataset annotations."
-            empty = [q for q in queries if q in rows["quail"]
-                     and not rows["quail"][q]["expected_rows"]]
-            if empty:
-                note += " Empty reference output: " + ", ".join(empty) + "."
-            figure.text(0.075, 0.02, note + " x = not measured.", fontsize=9)
             pdf.savefig(figure, bbox_inches=None)
             plt.close(figure)
         figure = document_page(title, queries, relations)
@@ -612,6 +600,8 @@ def main(workdir):
     bio4_sf1_speedup = (
         bio4[1.0]["rows"]["pipelined_vllm"]["runtime_s"]
         / bio4[1.0]["rows"]["quail"]["runtime_s"])
+    empty = [q for q in QUERY_ORDER if q in rows["quail"]
+             and not rows["quail"][q]["expected_rows"]]
     report_text = [
         "# QUAIL-B comparison", "",
         "- All 31 queries use raw document/question prompts ending in `ANSWER:`.",
@@ -666,6 +656,9 @@ def main(workdir):
         f"  BIO-4 estimate: `{bio4[0.1]['sol']['volume_path']}`.",
         "- PDFs show latency, fresh input tokens, recomputed KV tokens, and answer",
         "  agreement. Each PDF lists input counts separately for every alias.",
+        "  Input counts come from the saved corpus manifest, before filters.",
+        "  Repeated aliases can refer to the same underlying set.",
+        *([f"  Empty reference output: {', '.join(empty)}."] if empty else []),
         "  SoL uses lines for latency and token totals. Measurements use bars.",
         "  A dash marks zero. An x marks a missing measurement.", "",
         "[Main comparison PDF](plots/quailb_main.pdf)", "",

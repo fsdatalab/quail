@@ -49,6 +49,8 @@
   BIO-4 estimate: `/results/sol/2026-09-20-bio4-qwen3-4b-sf0.1.json`.
 - PDFs show latency, fresh input tokens, recomputed KV tokens, and answer
   agreement. Each PDF lists input counts separately for every alias.
+  Input counts come from the saved corpus manifest, before filters.
+  Repeated aliases can refer to the same underlying set.
   SoL uses lines for latency and token totals. Measurements use bars.
   A dash marks zero. An x marks a missing measurement.
 
