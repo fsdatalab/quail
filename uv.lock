@@ -2583,7 +2583,7 @@ wheels = [
 [[package]]
 name = "quail-b"
 version = "0.7.0"
-source = { git = "https://github.com/fsdatalab/quail-bench.git?rev=c85e89d#c85e89da3fb2657f95ada026cc7772f31e84377a" }
+source = { git = "https://github.com/fsdatalab/quail-bench.git?rev=a16d111#a16d1117786e3d715b8f4243d7303e4efcf6e14a" }
 dependencies = [
     { name = "awkward" },
     { name = "datasets" },
@@ -2658,7 +2658,7 @@ dev = [
     { name = "modal", extras = ["api-proxy-support"], specifier = "==1.5.4" },
     { name = "pandas", specifier = "==3.0.5" },
     { name = "pytest", specifier = "==9.1.1" },
-    { name = "quail-b", git = "https://github.com/fsdatalab/quail-bench.git?rev=c85e89d" },
+    { name = "quail-b", git = "https://github.com/fsdatalab/quail-bench.git?rev=a16d111" },
     { name = "ruff", specifier = "==0.12.9" },
     { name = "vulture", specifier = "==2.16" },
 ]

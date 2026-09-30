@@ -45,8 +45,8 @@ from quail.physical import (
 )
 from quail.planner.plan import EngineConfig, Refusal
 from quail.specs import H100_SXM, QWEN3_4B_FP8
-from quail_b.prompts import AGENT_OUTCOME, AGENT_OUTCOME_DESCRIPTIONS
-from quail_b.prompts import AGENT_OUTCOME_LABELS as OUTCOMES
+from quail_b.prompts import AGENT_PROGRESS, AGENT_PROGRESS_DESCRIPTIONS
+from quail_b.prompts import AGENT_PROGRESS_LABELS as STAGES
 from quail_b.queries import get_query
 
 # refund request, refund status, shipping, one token per word
@@ -810,27 +810,27 @@ def test_classify_prompt_letters_its_categories():
     from quail.logical.prompts import LETTERS_INSTRUCTION, answer_prefix
 
     ref = ColumnRef("t", "agent_traces", "trace")
-    bound = bind_classify_prompt(AGENT_OUTCOME, (ref,), OUTCOMES,
-                                 AGENT_OUTCOME_DESCRIPTIONS)
+    bound = bind_classify_prompt(AGENT_PROGRESS, (ref,), STAGES,
+                                 AGENT_PROGRESS_DESCRIPTIONS)
     lettered = bound.lettered
-    assert lettered.letters == tuple("ABCD") and bound.letters == ()
+    assert lettered.letters == tuple("ABCDE") and bound.letters == ()
     assert lettered.preamble == bound.preamble
     assert LETTERS_INSTRUCTION in lettered.tail
     for letter, label, description in zip(
-            "ABCD", OUTCOMES, AGENT_OUTCOME_DESCRIPTIONS):
+            "ABCDE", STAGES, AGENT_PROGRESS_DESCRIPTIONS):
         assert f"\n- {letter}: {label} ({description})" in lettered.tail
         assert f"\n- {label}: {description}" in bound.tail
     assert lettered.lettered is None
     # a label follows the answer cue after a space; a reply that opens
     # a model turn starts without one
     assert bound.label_prefix == " " and answer_prefix(("", "")) == " "
-    turned = bind_classify_prompt(AGENT_OUTCOME, (ref,), OUTCOMES,
+    turned = bind_classify_prompt(AGENT_PROGRESS, (ref,), STAGES,
                                   turn=("<user>", "<model>"))
     assert turned.label_prefix == "" and turned.lettered.tail.endswith("<model>")
     # no lettered prompt when the tokenizer has no one-token letters
-    assert bind_classify_prompt(AGENT_OUTCOME, (ref,), OUTCOMES,
+    assert bind_classify_prompt(AGENT_PROGRESS, (ref,), STAGES,
                                 tokenizer=_bytes).lettered is None
-    tokenized = bind_classify_prompt(AGENT_OUTCOME, (ref,), OUTCOMES,
+    tokenized = bind_classify_prompt(AGENT_PROGRESS, (ref,), STAGES,
                                      tokenizer=letter_tokens)
     assert list(tokenized.lettered.tail_token_ids) == _bytes(
         tokenized.lettered.tail.replace("{0}", ""))

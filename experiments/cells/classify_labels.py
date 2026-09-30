@@ -70,31 +70,30 @@ SHARDS = {
     "quailb.biodex.reaction.organ_class": 1,
     "quailb.fever.claim.topic": 1,
     "quailb.lepard.excerpt.area_of_law": 1,
-    "quailb.agent.trace.outcome": 8,
-    "quailb.agent.trace.failure_mode": 8,
+    "quailb.agent.trace.progress": 8,
+    "quailb.agent.trace.test_result": 8,
     "quailb.imdb.review.aspect_sentiment": 4,
     "quailb.agent.trace.domain": 8,
     "quailb.agent.trace.root_cause": 8,
 }
 # the published collections the new collections extend
 SOURCES = {
-    0.1: "gt_93e6532710832f1f11acf22f7baaa455",
-    0.5: "gt_d204ad99618b2d56f584950ab81fc46d",
-    1.0: "gt_ac3e48c5195c7007f96b35da621f7a2a",
+    0.1: "gt_9b8e7f5a649d715d64a5fa4646855a4d",
+    0.5: "gt_a0faa81557f0f7c98b6eb4c170ce3716",
+    1.0: "gt_cc042e13f1a6512ee51882e65d5d3456",
 }
 SUMMARY_PATH = Path("/results/ablations/classify-reference-labels.json")
 CHECK_PATH = Path("/results/ablations/classify-reference-labels-check.json")
 PREDICTION_TEXT = (
-    "AGENT-5 adds two predicates, the PyPI topic and the defect type, over "
-    "the 17,711 agent traces at sf=1.0: 174 million prompt tokens each at "
-    "9,815 tokens per trace, 348 million in all. At the 17,000 fresh "
-    "tokens per second the cross-check measured on reviews "
-    "(/results/ablations/classify-reference-labels-check.json), that is "
-    "about 5.7 H100 hours: about 21 minutes of scoring per container "
-    "after a 6-minute boot, across 16 containers. Every trace gets one "
-    "label per predicate, and AGENT-5 loads its labels at all three scale "
-    "factors."
-)
+    "The AGENT queries replace outcome and failure mode with progress and "
+    "test result, two predicates over the 17,711 agent traces at sf=1.0: "
+    "174 million prompt tokens each at 9,815 tokens per trace. AGENT-5's "
+    "two predicates took about 5.7 H100 hours over 16 containers, so this "
+    "should take about the same: about 20 to 30 minutes per container "
+    "after a 6-minute boot. On the 100-trace screen Qwen3 32B put 65 "
+    "percent of traces on 'located the relevant code' and 75 percent on "
+    "'bug still occurs'; expect those shares within 15 points at sf=1.0, "
+    "and 15 to 30 percent of traces in a 'changed the code' stage.")
 
 
 def label_trie(label_ids: list[tuple[int, ...]]) -> dict:
