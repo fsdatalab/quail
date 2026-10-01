@@ -69,7 +69,7 @@ repeat earlier turns. Quail can reuse KV for those repeated tokens.
   Filters executing with a row limit skip sharing to preserve row order.
 
 See the [prefix caching design](/docs/architecture/prefix-caching)
-for the data structure and an example, and
+for the data structure, example, and precedents, and
 [Planning](/docs/architecture/planning#deciding-whether-to-share-prefixes)
 for the cost comparison.
 
@@ -187,6 +187,10 @@ The planner enables the tree path only for models with FP8 weights
 and no canvas tokens, the extra rows used by DiffusionGemma. Other
 models use unified attention. See the
 [attention cost comparison](/docs/architecture/planning#choosing-the-attention-path).
+
+The `tree` attention path is a choice of attention computation.
+SGLang's RadixAttention names a prefix caching mechanism; it is not
+another name for this path.
 
 Quail uses vLLM's model implementation and DeepGEMM for the main
 matrix multiplications, but writes its own Triton JIT kernels to

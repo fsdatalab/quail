@@ -145,13 +145,13 @@ write_seconds = total_tokens * model.kappa / device.hbm_bw
   for all input documents.
 
 The rule enables sharing when there are shared tokens and
-`saved_seconds > write_seconds`. The comparison excludes sorting,
-scheduling, attention, and recomputation after KV is freed, so it
-only estimates the savings from prefix reuse.
+`saved_seconds > write_seconds`. It does not include sorting,
+scheduling, attention, or recomputation after KV is freed. The
+comparison estimates whether to enable sharing, not total query time.
 
-If the first plan is built before tokenization finishes, Quail runs
-the physical rules again once the tokens are available. Prefix matching
-requires the token sequences.
+If tokenization is still running when the first plan is built, Quail
+runs the physical rules again after it finishes. Prefix matching
+needs the token sequences, not just their lengths.
 
 `explain(verbose=True)` shows the planner's choice as `share_prefixes`.
 
@@ -178,14 +178,14 @@ one combined output across all layers.
 
 - A join uses its estimated partners per anchor, tokens per partner
   prompt, and average anchor length.
-- A filter groups documents with the same parent and shared prefix
-  length. For each path, Quail sums the reused tokens in groups where
-  that path is cheaper. It chooses the path with the larger sum,
-  using unified attention when the sums tie.
+- A filter compares the paths for each group with the same parent
+  and shared-prefix length. Each group votes for the cheaper path,
+  weighted by its total reused tokens. The filter uses the path with
+  the larger weight; ties use unified.
 - Tree attention requires FP8 weights and no canvas tokens. The
   rule chooses unified for other models.
 
-The estimates use peak hardware rates. The current attention
+These estimates use peak hardware rates. The current attention
 estimate uses the FP8 compute rate even though attention runs in
 BF16, so it underestimates the compute portion on H100. It does not
 model kernel-launch overhead.

@@ -2,31 +2,51 @@
 title: SQL reference
 ---
 
-## AI-SQL
+## What is AI-SQL?
 
-Quail can filter, score, and classify documents in SQL. It accepts two
-SQL dialects:
+AI-SQL extends standard SQL with operators that call a language model
+during query execution. You can filter rows, join tables, and match
+documents using natural language conditions instead of exact column
+comparisons.
 
-```python
-session.sql(text, dialect="snowflake")  # AI_FILTER
-session.sql(text, dialect="bq")         # AI.IF
+For example, to find reviews that discuss the ending of a movie:
+
+```sql
+SELECT r.id
+FROM reviews r
+WHERE AI.IF(PROMPT('Does this review discuss the ending of the movie?\n\n{0}', r.body))
 ```
 
-The examples below use `dialect="bq"`.
+The model reads each review and returns TRUE or FALSE. Quail keeps
+the rows where the answer is TRUE.
+
+Major database vendors define their own AI-SQL syntax, including
+[Snowflake Cortex AISQL](https://docs.snowflake.com/en/user-guide/snowflake-cortex/aisql),
+[BigQuery AI functions](https://cloud.google.com/blog/products/data-analytics/sql-reimagined-for-the-ai-era-with-bigquery-ai-functions),
+and [Databricks AI Functions](https://docs.databricks.com/aws/en/large-language-models/ai-functions).
+Quail supports two of these dialects:
+
+```python
+session.sql(text, dialect="snowflake")  # AI_FILTER syntax
+session.sql(text, dialect="bq")         # AI.IF syntax
+```
+
+Both compile to the same plan. The rest of this page uses the
+BigQuery dialect.
 
 ## PROMPT
 
-`PROMPT(template, column, ...)` defines a question about the supplied
-columns. `{0}` refers to the first column, `{1}` to the second, and so on.
-For generative models, Quail places documents before the question so
-later questions can reuse their saved model state. See
-[prompt binding](/docs/architecture/logical-plans#prompt-binding).
+`PROMPT` writes the question that the model answers for each row.
+You write a template with `{0}`, `{1}`, etc. as placeholders for
+column values, and Quail substitutes each row's data in.
 
 For a filter, the prompt references one column:
 
 ```sql
 PROMPT('Does this review discuss the ending of the movie?\n\n{0}', r.body)
 ```
+
+Here `{0}` is replaced with each review's `body` text.
 
 For a join, the prompt references one column from each table:
 
@@ -35,22 +55,15 @@ PROMPT('Does the review discuss this aspect?\n\nReview: {0}\nAspect: {1}',
        r.body, a.aspect)
 ```
 
-The model evaluates the question for each document pair.
+Here `{0}` is the review and `{1}` is the aspect, and the model
+answers for every pair.
 
 ## AI operators
 
-| Function | Description | Return type |
-| --- | --- | --- |
-| `AI.IF(prompt[, options])` | Tests a condition on a document or document pair. | `BOOLEAN` |
-| `AI.SCORE(prompt[, options])` | Scores a document or document pair against a condition. | `FLOAT64` |
-| `AI.CLASSIFY(input, categories[, options])` | Assigns a label from a category list. | `STRING` |
-
 ### AI.IF
 
-`AI.IF(prompt[, options])`
-
-Returns `TRUE` or `FALSE` for a condition on a document or document pair.
-The Snowflake dialect uses `AI_FILTER`.
+`AI.IF` takes a `PROMPT` and evaluates it on each row or each pair
+of rows. The model returns TRUE or FALSE.
 
 #### Filtering
 
@@ -149,13 +162,12 @@ AI_FILTER(PROMPT(...), {'selectivity': 0.3, 'anchor': 'r'})
 
 ### AI.SCORE
 
-`AI.SCORE(prompt[, options])`
-
-Returns a `FLOAT64` between 0 and 1. Higher scores mean the model
-favors "yes" more strongly. Return scores in `SELECT` or compare them
+`AI.SCORE(PROMPT(...))` returns a score between 0 and 1 as a
+`FLOAT64`. Higher scores mean the model more strongly favors "yes" over
+"no" for the prompt. Use it in `SELECT` to return scores, or compare it
 with a threshold in `WHERE` or `JOIN ... ON`.
 
-All supported models can run `AI.SCORE`, including rerankers:
+Every model runs `AI.SCORE`:
 
 ```python
 config = quail.EngineConfig(
@@ -164,11 +176,18 @@ config = quail.EngineConfig(
 )
 ```
 
-- Rerankers use a prompt that asks whether the document meets the
-  query's requirements, with "yes" and "no" as the answers.
-- Generative models use the `AI.IF` prompt and compare TRUE with FALSE.
-  `AI.SCORE` and `AI.IF` run through different execution code, so a
-  score above 0.5 can disagree with an `AI.IF` answer.
+- The rerankers, `qwen3-reranker-0.6b-bf16` and
+  `qwen3-reranker-4b-bf16`, use their own prompt layout. The system
+  message says, "You are performing a data processing task." It asks
+  the model to judge whether the document meets the query's
+  requirements and answer "yes" or "no".
+- The generative models, `qwen3-4b-fp8`, `qwen3-32b-fp8`, and
+  `diffusion-gemma-26b-a4b-fp8`, use the `AI.IF` prompt for the same
+  template and compare TRUE with FALSE. `AI.SCORE` runs that prompt
+  through a different execution path than `AI.IF`, so a score above
+  0.5 and the `AI.IF` answer can differ on some rows. On four QUAIL-B
+  filters they differed on 0% to 2.4% of rows for Qwen3 32B and
+  DiffusionGemma, and on 1.7% to 10% of rows for Qwen3 4B.
 
 Use `gpus` to run a model copy on each GPU.
 
@@ -197,15 +216,17 @@ WHERE AI.SCORE(
 ) >= 0.75
 ```
 
-`selectivity` estimates how many rows pass the threshold. Quail uses
-it to order filters and defaults to `0.2`. It does not affect the scores.
+The optional `selectivity` hint estimates the fraction of rows that pass
+the comparison. Quail uses it to order filters and assumes 20% if omitted.
+The hint does not change the scores or threshold.
 
 #### Join tables
 
-For a two-document prompt, a reranker includes the first document in its
-query and scores the second document against it. A generative model uses
-the `AI.IF` join layout. Use `{0}` once in the template. Refer to that document by name if you
-need to mention it again:
+For a prompt with two document arguments, a reranker includes the first in
+its query and uses the second as its candidate document. A generative
+model reads the pair in the `AI.IF` join layout. The
+template mentions `{0}` once, where that document is inserted; refer to
+it again in words:
 
 ```sql
 SELECT q.id, d.id
@@ -215,16 +236,19 @@ JOIN documents d ON AI.SCORE(
 ) >= 0.8
 ```
 
-To return a score for every document pair, use `CROSS JOIN`. To restrict
-pairs by column equality, put both the equality and score comparison
-in `ON`.
+A pair score returned in `SELECT` without a comparison runs over
+every pair, so write the tables with `CROSS JOIN`. An `ON` column
+equality narrows the pairs only when the score is compared in `ON`.
 
-For rerankers, a placeholder at the start or end of the template is
-removed because the document is passed separately. Inside a sentence,
-the placeholder becomes "this document".
+In the reranker's query text, a placeholder that stands alone at the
+start or end of the template marks where the document goes and is
+left out, since the reranker holds the document in its own field. A
+placeholder inside a sentence reads "this document".
 
-When the same `AI.SCORE` call appears more than once, Quail evaluates
-it once per document or pair. A query cannot combine `AI.SCORE` with `AI.IF`.
+When the same score appears in `SELECT`, a filter, or a join condition,
+Quail computes it once. Two comparisons of one score, such as a range,
+share that one computation. A query cannot combine `AI.SCORE` with
+`AI.IF`.
 
 #### Score definition
 
@@ -234,11 +258,11 @@ Quail computes the score from the model's `yes` and `no` logits:
 score = exp(yes_logit) / (exp(yes_logit) + exp(no_logit))
 ```
 
-For generative models, `yes_logit` is the highest TRUE token logit
-and `no_logit` is the highest FALSE token logit, including alternative
-spellings and space-prefixed forms. Rerankers are trained to produce
-these scores. The same threshold can select different rows on
-different models.
+A generative model uses its highest TRUE and FALSE logits, over the
+spellings `TRUE`, `True`, and their space-prefixed forms, in place of
+`yes` and `no`. A reranker is trained to give this score; a generative
+model is not, so the same threshold can select different fractions of
+rows on different models.
 
 A score of 0.75 does not mean 75% accuracy. Choose the threshold using
 labeled examples for your task.
@@ -376,7 +400,7 @@ classification with `AI.SCORE`. See
 
 ### AI.EXTRACT
 
-<Callout type="info">Not implemented.</Callout>
+<Callout type="info">Coming soon</Callout>
 
 Pull structured fields out of each document, like Snowflake's
 [AI_EXTRACT](https://docs.snowflake.com/en/user-guide/snowflake-cortex/aisql).
@@ -389,7 +413,7 @@ FROM reviews r
 
 ### AI.MAP
 
-<Callout type="info">Not implemented.</Callout>
+<Callout type="info">Coming soon</Callout>
 
 Run a free-form instruction on each document and return the generated
 text, like Snowflake's
@@ -403,7 +427,7 @@ FROM reviews r
 
 ## SELECT, FROM, JOIN, LIMIT
 
-The following SQL clauses are supported:
+These work the way you expect from standard SQL:
 
 - **`SELECT`** lists columns and named `AI.SCORE` or `AI.CLASSIFY`
   outputs. `*` expands to all table columns. Other computed expressions
@@ -413,12 +437,12 @@ The following SQL clauses are supported:
   `RIGHT`, `FULL`) are not.
 - **`LIMIT`** takes a positive integer.
 
-## Unsupported SQL operators
+## Unsupported SQL operators (for now)
 
 - `GROUP BY`, `ORDER BY`, `DISTINCT`, `HAVING`, window functions
 - `UNION`, `EXCEPT`, `INTERSECT`, `OFFSET`
 - `OR` between AI predicates
-- Queries with no AI predicate
+- Queries with no AI operator
 - `JOIN` with only relational predicates (no AI operator)
 - Outer joins (`LEFT`, `RIGHT`, `FULL`)
 

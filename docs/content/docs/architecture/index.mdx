@@ -2,11 +2,14 @@
 title: Overview
 ---
 
-Quail compiles SQL and Python queries into logical plans. It chooses
-the physical plan with the lowest estimated cost, then executes it.
-Operators in one GPU pipeline can reuse a document's saved key and
-value state (KV). The executor batches documents into model forward
-passes.
+Quail is structured like a traditional query engine: it parses a
+query into a logical plan, optimizes it, lowers it to a physical
+plan, and executes the physical plan. Execution is pull-based
+(Volcano-style), with documents pipelining through operators in
+large batches sized to saturate the GPU. The two performance goals
+are to keep the GPU busy (minimize idle time between forward passes)
+and to minimize KV regret (document state that was evicted from GPU
+memory and needs to be recomputed).
 
 ## Query lifecycle
 
@@ -26,13 +29,15 @@ passes.
 
 ## Packages
 
+Each package imports only from the ones below it.
+
 | Package | What it does | Source |
 | --- | --- | --- |
 | `quail.frontend` | SQL compiler and Python builder. | [frontend/](https://github.com/fsdatalab/quail/tree/main/quail/frontend) |
 | `quail.logical` | Logical plan nodes and prompt binding. | [logical/](https://github.com/fsdatalab/quail/tree/main/quail/logical) |
 | `quail.physical` | Physical plan nodes. | [physical/](https://github.com/fsdatalab/quail/tree/main/quail/physical) |
-| `quail.planner` | Logical rules, operator ordering, classification rule selection, and KV retention. | [planner/](https://github.com/fsdatalab/quail/tree/main/quail/planner) |
-| `quail.cost` | Work and time estimates from model and device specs. | [cost/](https://github.com/fsdatalab/quail/tree/main/quail/cost) |
+| `quail.planner` | Logical rules, filter and join ordering, classification rule selection, KV retention. | [planner/](https://github.com/fsdatalab/quail/tree/main/quail/planner) |
+| `quail.cost` | Cost model over the model and device specs. | [cost/](https://github.com/fsdatalab/quail/tree/main/quail/cost) |
 | `quail.execution` | Session, runner, token store, results. | [execution/](https://github.com/fsdatalab/quail/tree/main/quail/execution) |
 | `quail.backends` | Quail's GPU code (`backends/quail/executor/`) and the vLLM and SGLang baselines. | [backends/](https://github.com/fsdatalab/quail/tree/main/quail/backends) |
 | `quail.specs` | Model and device constants. | [specs/](https://github.com/fsdatalab/quail/tree/main/quail/specs) |

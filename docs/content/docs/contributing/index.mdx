@@ -59,13 +59,15 @@ interests you, open an issue and we will help you get started.
 
 ### Medium
 
-- **New AI-SQL operators.** Add `AI.EXTRACT` for structured fields
-  and `AI.MAP` for generated text. The current decoder only chooses
-  from fixed classification labels. See
+- **New AI-SQL operators.** `AI.EXTRACT` (pull structured fields
+  from a document) and `AI.MAP` (run a free-form instruction and
+  return the result). These require open-ended generation, which
+  the current engine does not support. See
   [Custom operators](/docs/extending/operators).
-- **Assign documents to GPUs for prefix reuse.** Group documents
-  with common prefixes on the same GPU so they can reuse KV. Keep
-  the work balanced across GPUs.
+- **Assign documents to GPUs for prefix reuse.** Each GPU can reuse
+  KV only from documents on that GPU. Grouping documents with common
+  prefixes on the same GPU could increase reuse. The assignment must
+  also keep the work balanced across GPUs.
 
 ### Harder
 

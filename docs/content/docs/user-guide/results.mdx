@@ -56,9 +56,11 @@ physical: backend=quail, model=qwen3-4b-fp8, workers=1
 ```
 
 <Callout type="info">
-Time estimates assume peak GPU throughput and exclude host overhead.
-Use `explain(analyze=True)` on a GPU to compare estimates with measured
-execution time.
+The time estimates assume peak GPU throughput with no host overhead.
+Actual runtimes are longer, for many reasons, such as kernel launch
+latency and low MFU. Use `explain(analyze=True)` on a GPU to see
+measured times next to the estimates. We are working on better
+latency estimates.
 </Callout>
 
 On an operator line, `est. rows` is how many rows the planner expects
@@ -198,9 +200,9 @@ return that same plan.
 
 **Returns**
 
-`PhysicalPlan | Refusal`. A plan includes the model, worker count,
-and estimated execution time. A refusal explains why the query cannot
-run. Running a refused query raises `quail.RefusalError`.
+`PhysicalPlan | Refusal`. The plan the executor will run, including
+the model, worker count, and estimated seconds. A `Refusal` explains why
+the query cannot run. Running a refused query raises `quail.RefusalError`.
 
 ##### explain
 
@@ -358,7 +360,7 @@ asks for them.
       type: 'dict',
       required: true,
       description:
-        "Model answer tables. filters keys are (table alias, predicate position). joins keys are join positions in the query. classifies keys are label column names.",
+        "Per-predicate Arrow tables. filters is keyed by (alias, position). joins is keyed by the join's position in the query text. classifies is keyed by the label column name.",
     },
   }}
 />

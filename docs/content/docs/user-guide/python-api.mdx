@@ -228,10 +228,9 @@ result = query.collect()
 You can also use `apply` after a filter to drop rows with custom
 Python logic before the next AI operator runs.
 
-With `kind="per_batch"` (the default), the function can run as documents
-pass through a pipeline. Outside a pipeline, it receives all input rows.
-Batch sizes can vary. Use `apply_table()` for calculations that need
-all rows at once.
+`kind="per_batch"` (default) runs the function on each batch as
+rows stream through a pipeline. Outside a pipeline, the function receives
+all input rows. Use `apply_table()` when the function needs all rows at once.
 
 ### apply_table
 
@@ -241,7 +240,10 @@ Like `apply`, but waits for the preceding stage to finish and calls
 `fn` once with all surviving rows. Equivalent to
 `apply(..., kind="barrier")`.
 
-Use `apply_table()` when the function needs all surviving rows at once.
+Use this when your function needs to see every surviving row at once.
+Within a pipeline, `apply` receives rows in batches. With
+`apply_table`, Quail finishes the preceding stage first, then calls
+your function once with all the results.
 
 ```python
 def deduplicate(tables):
@@ -258,7 +260,8 @@ query = (
 result = query.collect()
 ```
 
-The planner will not move operators across an `apply_table()` call.
+Note that `apply_table` fixes the execution order at that point in
+the query. The planner will not reorder operators across it.
 
 ## Errors
 
