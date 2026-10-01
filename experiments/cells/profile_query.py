@@ -6,9 +6,9 @@ between forward passes can be read off. The stats file goes to the
 results volume.
 
     uv run modal run --detach experiments/cells/profile_query.py::profile
-        --query BIO-5 --label-scoring trie_tree
+        --query BIO-5
     uv run modal run --detach experiments/cells/profile_query.py::profile
-        --query IMDB-12 --model diffusion-gemma-26b-a4b-fp8 --label-scoring ""
+        --query IMDB-12 --model diffusion-gemma-26b-a4b-fp8
 """
 
 from quail.bench.quailb_parallel import (
@@ -26,7 +26,7 @@ PROFILE_DIR = "/results/ablations/profiles"
 @app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
               volumes=VOLUMES)
 def profile_query(query_id: str, sf: float, collection_id: str,
-                  label_scoring: str, top: int,
+                  top: int,
                   model: str = "qwen3-4b-fp8") -> str:
     """Run the query under cProfile; returns the top functions as text."""
     import cProfile
@@ -39,7 +39,7 @@ def profile_query(query_id: str, sf: float, collection_id: str,
     from quail.bench.quailb import run_suite
 
     config = EngineConfig(gpus=1, model=model, backend="quail",
-                          device="h100-sxm", label_scoring=label_scoring or None,
+                          device="h100-sxm",
                           gpu_timing=True)
     output = Path(tempfile.mkdtemp()) / "run"
     profiler = cProfile.Profile()
@@ -50,7 +50,7 @@ def profile_query(query_id: str, sf: float, collection_id: str,
                       output_dir=output)
     profiler.disable()
     Path(PROFILE_DIR).mkdir(parents=True, exist_ok=True)
-    stats_path = Path(PROFILE_DIR) / f"{query_id}-{model}-{label_scoring}.prof"
+    stats_path = Path(PROFILE_DIR) / f"{query_id}-{model}.prof"
     profiler.dump_stats(str(stats_path))
     results_vol.commit()
     text = io.StringIO()
@@ -71,12 +71,12 @@ def profile_query(query_id: str, sf: float, collection_id: str,
 
 @app.local_entrypoint()
 def profile(query: str = "BIO-5", sf: float = 0.1,
-         label_scoring: str = "trie_tree", top: int = 35,
+         top: int = 35,
          model: str = "qwen3-4b-fp8"):
     data = ensure_data.spawn(sf, [query], "")
     print(f"function call id: {data.object_id} (data)", flush=True)
     collection = data.get()
-    call = profile_query.spawn(query, sf, collection, label_scoring, top,
+    call = profile_query.spawn(query, sf, collection, top,
                                model)
     print(f"function call id: {call.object_id} (profile {query})", flush=True)
     print(call.get(), flush=True)

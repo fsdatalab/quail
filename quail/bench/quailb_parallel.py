@@ -78,7 +78,7 @@ def _methods(csv: str) -> list[str]:
 
 def _run_family(process_groups, result_name, model, sf, query_ids_csv,
                 run_dir, ground_truth_collection, root=None,
-                label_scoring=None, attention=None, gpu_timing=False,
+                attention=None, gpu_timing=False,
                 canvas_draws=None) -> str:
     """Run one query family's methods, one child process per group.
 
@@ -99,7 +99,7 @@ def _run_family(process_groups, result_name, model, sf, query_ids_csv,
         process_result = run_backend_group_in_fresh_process(
             data_dir=DATA_DIR, model=model, sf=sf, query_ids=query_ids,
             run_dir=run_dir, ground_truth_collection=ground_truth_collection,
-            methods=methods, root=root, label_scoring=label_scoring,
+            methods=methods, root=root,
             attention=attention, gpu_timing=gpu_timing,
             suite_name=f"{family}{result_name}", canvas_draws=canvas_draws)
         process_results.append(process_result)
@@ -151,7 +151,6 @@ def run_query_family(
     include_dumb_vllm: bool = False,
     baselines: str = "stock_vllm,pipelined_vllm",
     result_name: str = "",
-    label_scoring: str = "",
     attention: str = "",
     gpu_timing: bool = False,
     label_root: str = "",
@@ -160,8 +159,7 @@ def run_query_family(
     """Run one query family through Quail and the vLLM baselines.
 
     baselines names the vLLM baseline methods that run when
-    include_baselines is set. label_scoring forces one AI.CLASSIFY
-    label scoring rule and attention one attention path for filters
+    include_baselines is set. attention forces one attention path for filters
     and joins; empty lets the planner choose. canvas_draws lists the
     most noise draws a diffusion model averages, comma-separated, one
     Quail run each; empty keeps the default. label_root names a local
@@ -176,7 +174,6 @@ def run_query_family(
         return _run_family(process_groups, result_name, model, sf, query_ids_csv,
                            run_dir, ground_truth_collection,
                            root=label_root or None,
-                           label_scoring=label_scoring or None,
                            attention=attention or None,
                            gpu_timing=gpu_timing,
                            canvas_draws=canvas_draws or None)
@@ -278,7 +275,6 @@ def run_all(
     include_quail: bool = True,
     include_dumb_vllm: bool = False,
     baselines: str = "stock_vllm,pipelined_vllm",
-    label_scoring: str = "",
     attention: str = "",
     gpu_timing: bool = False,
     label_root: str = "",
@@ -300,7 +296,6 @@ def run_all(
         "started_at": started.isoformat(),
         "model": model,
         "sf": sf,
-        "label_scoring": label_scoring or None,
         "attention": attention or None,
         "canvas_draws": canvas_draws or None,
         "query_ids": list(query_ids),
@@ -335,7 +330,6 @@ def run_all(
                     include_dumb_vllm=include_dumb_vllm,
                     baselines=baselines,
                     result_name=result_name,
-                    label_scoring=label_scoring,
                     attention=attention,
                     gpu_timing=gpu_timing,
                     label_root=label_root,
@@ -432,7 +426,7 @@ def _finish_run(directory, manifest, family_calls, sglang_calls, query_ids,
         },
         summaries=paths,
     )
-    # several label scoring rules save one Quail suite per rule
+    # Multiple canvas draw counts save separate Quail suites.
     completed = [item for name, report in reports.items()
                  if name == "quail" or name.startswith("quail-")
                  for item in report["queries"]]
@@ -495,7 +489,6 @@ def main(
     include_quail: bool = True,
     include_dumb_vllm: bool = False,
     baselines: str = "stock_vllm,pipelined_vllm",
-    label_scoring: str = "",
     attention: str = "",
     gpu_timing: bool = False,
     label_root: str = "",
@@ -525,7 +518,6 @@ def main(
         include_quail=include_quail,
         include_dumb_vllm=include_dumb_vllm,
         baselines=baselines,
-        label_scoring=label_scoring,
         attention=attention,
         gpu_timing=gpu_timing,
         label_root=label_root,

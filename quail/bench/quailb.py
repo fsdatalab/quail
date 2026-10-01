@@ -434,8 +434,6 @@ def main():
     parser.add_argument("--data-dir", help="directory containing input Parquet files")
     parser.add_argument("--ground-truth-collection")
     parser.add_argument("--output-dir", required=True, help="new run directory")
-    parser.add_argument("--label-scoring",
-                        help="force one AI.CLASSIFY label scoring rule")
     parser.add_argument("--attention", choices=("tree", "unified"),
                         help="force one attention path for filters and joins")
     parser.add_argument("--gpu-timing", action="store_true",
@@ -451,7 +449,6 @@ def main():
             model=args.model,
             backend=args.backend,
             device=args.device,
-            label_scoring=args.label_scoring,
             attention=args.attention,
             gpu_timing=args.gpu_timing,
             canvas_draws=args.canvas_draws,

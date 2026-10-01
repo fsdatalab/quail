@@ -42,9 +42,6 @@ class PlanningContext:
     document_tokens: Mapping[str, Any]
     backend: str
     order: str | None = None
-    # an AI.CLASSIFY label scoring rule forced for every classification;
-    # None lets the planner choose
-    label_scoring: str | None = None
     # the most noise draws a diffusion model averages per letters read
     # and per one-table AI.SCORE
     canvas_draws: int = 4

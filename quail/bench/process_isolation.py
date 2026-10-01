@@ -35,7 +35,6 @@ def run_backend_group(
     ground_truth_collection: str,
     methods: Sequence[str],
     root: str | None = None,
-    label_scoring: str | None = None,
     attention: str | None = None,
     gpu_timing: bool = False,
     suite_name: str | None = None,
@@ -58,20 +57,12 @@ def run_backend_group(
     family = query_family_name(query_ids)
     run_dir = Path(run_dir)
     suites = {}
-    # several label scoring rules, comma-separated, run the Quail
-    # method once per rule in this one process, on this one GPU, so
-    # their times compare without container-to-container variance
-    rules = [rule.strip() for rule in (label_scoring or "").split(",")
-             if rule.strip()] or [None]
-    # so do several canvas draw counts
+    # Run each canvas draw count in the same process.
     draw_counts = [int(count) for count in (canvas_draws or "").split(",")
                    if count.strip()] or [None]
-    settings = [(rule, draws) for rule in rules for draws in draw_counts]
     for method in methods:
-        for rule, draws in settings:
+        for draws in draw_counts:
             name = method
-            if method == "quail" and len(rules) > 1:
-                name += f"-{rule}"
             if method == "quail" and len(draw_counts) > 1:
                 name += f"-draws{draws}"
             print(
@@ -85,7 +76,6 @@ def run_backend_group(
                     model=model,
                     backend=method,
                     device="h100-sxm",
-                    label_scoring=rule,
                     attention=attention,
                     gpu_timing=gpu_timing,
                     **({} if draws is None else {"canvas_draws": draws}),

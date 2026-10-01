@@ -43,7 +43,7 @@ All node types are defined in
 | [`Recombine`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Joins TRUE answer tables using Arrow. |
 | [`Project`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Reads the selected columns for surviving rows. |
 | [`Limit`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Truncates the result. |
-| `Filter` | Tests an already computed score or label column. |
+| `Filter` | Keeps rows matching a condition, such as `score >= 0.8` or `label IN ['refund']`. |
 
 **Quail backend nodes**:
 
@@ -51,24 +51,8 @@ All node types are defined in
 | --- | --- |
 | [`AiFilter`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Runs filter stages on the GPU. |
 | [`AiJoin`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Runs join stages on the GPU. |
-| `AiScore` | Computes numeric scores using a `ScoreSpec`. |
-| `AiClassify` | Computes labels using a `ClassifySpec`. |
-
-### Classification nodes
-
-Classification and label predicates use separate physical nodes:
-
-```text
-Scan(reviews)
-  -> AiClassify(sentiment)
-  -> Filter(sentiment IN ['negative'])
-  -> Project(r.id, sentiment)
-```
-
-Each `AiClassify` has a `ClassifySpec` with its scoring rule, prompt
-tokens, and labels. `Filter` tests the labels that `AiClassify` returns.
-Score and label columns pass through later operators so `Project` can
-return them.
+| `AiScore` | Returns a numeric score for each document or document pair. |
+| `AiClassify` | Chooses one of the supplied labels for each document or document pair. |
 
 ### Node ids
 

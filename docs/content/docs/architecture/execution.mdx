@@ -91,10 +91,10 @@ sharing one anchor's KV.
 ### Classification execution
 
 Classification uses the same token and KV page budgets as filters and
-joins. Compatible operators run in one pipeline and reuse document KV.
-Letter and tree scoring use one stage. Greedy decoding chooses one token
-at a time until it reaches a supplied label, with all rounds inside one
-`AiClassify` node. See [scoring methods](/docs/architecture/planning#choosing-classification-scoring).
+joins. It can run after a filter in the same pipeline, reusing the
+document's KV. Greedy decoding may need several model passes to finish
+a label. All passes belong to one `AiClassify` node. See
+[scoring methods](/docs/architecture/planning#choosing-classification-scoring).
 
 #### Classifying joined rows
 
@@ -161,14 +161,14 @@ RoPE, SiLU + FP8 quantize, and the attention merge + FP8 quantize
 for joins. These fused kernels reduce the number of GPU kernel
 launches per layer.
 
-Boolean predicates compare TRUE and FALSE token logits. Multiple
-spellings count, including space-prefixed forms. The predicate passes
-when its best TRUE logit exceeds its best FALSE logit.
+For a Boolean condition, Quail compares the model's scores for TRUE
+and FALSE. Several spellings count, including forms with a leading
+space. The condition passes when the highest TRUE score exceeds the
+highest FALSE score.
 
-The loaded model retains its output head for classification. Boolean
-readout projects the TRUE and FALSE rows. Letter classification projects
-the candidate code rows. Multi-token label scoring also needs the
-full-vocabulary normalization used to compute token log probabilities.
+Quail keeps the full vocabulary matrix so it can also score label
+tokens. For labels with several tokens, it computes token probabilities
+using scores for the entire vocabulary.
 
 Quail uses [FlashAttention 3](https://arxiv.org/abs/2407.08608) on
 H100 and FlashAttention 2 on Blackwell GPUs.
@@ -203,8 +203,8 @@ Use these files to change how Quail runs your query.
 | GPU kernels and attention calculations | [`attention.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/attention.py) |
 | The Qwen3 forward pass | [`models/qwen3.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/models/qwen3.py) |
 | How filter, join, and classification batches run | [`stages.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/stages.py) |
-| How classification scoring and decoder rounds become stages | [`classify.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/classify.py) |
-| How model outputs become Boolean answers, numeric scores, or label scores | [`readout.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/readout.py) |
+| How Quail scores labels and chooses the next label token | [`classify.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/classify.py) |
+| How Quail reads answers, scores, and labels from the model | [`readout.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/readout.py) |
 | How Quail loads model weights through vLLM | [`model.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/model.py) |
 
 If you add a model architecture, put its forward pass in `models/`.

@@ -305,7 +305,6 @@ def test_classification_runs_beside_filters_and_joins(monkeypatch):
         classify = plan.nodes[2]
         assert classify.inputs[0].source == PortRef(plan.nodes[1].node_id,
                                                     "ids:c")
-        assert plan.settings["label_scoring"] == "cost model"
         execute = fever_executor(session, monkeypatch, 1, capacity=10)
         rows = execute_query(query, physical_executor=execute).collect()
         assert rows.to_pylist() == [{"c.id": "c0", "topic": "science"},

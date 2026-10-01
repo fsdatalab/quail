@@ -984,8 +984,7 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
             "order_rule": rule,
             "order_source": source,
             "search_seconds": estimate,
-            **({"label_scoring": context.label_scoring or "cost model",
-                "classify_placement": ("after joins" if classify_after_joins
+            **({"classify_placement": ("after joins" if classify_after_joins
                                        else "before joins")}
                if labels.calls else {}),
             **({"canvas_draws": context.canvas_draws}
@@ -998,7 +997,6 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                device: DeviceSpec, doc_tokens: dict, gpus: int = 1,
                order: str | None = None, backend: str = "quail",
                registry=None, tokenizer=None, pair_fractions=None,
-               label_scoring: str | None = None,
                canvas_draws: int = 4,
                attention: str | None = None):
     """Plan one query with the selected model backend.
@@ -1012,8 +1010,6 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         order: Stage order rule, 'by_cost' or 'as_written'; None picks
             the default rule.
         backend: Registered model backend name.
-        label_scoring: An AI.CLASSIFY label scoring rule forced for
-            every classification; None lets the planner choose.
         canvas_draws: The most noise draws a diffusion model averages
             per letters read and per one-table AI.SCORE; 1 reads one.
         attention: An attention path, "tree" or "unified", forced for
@@ -1060,7 +1056,6 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         document_tokens=doc_tokens,
         backend=backend,
         order=order,
-        label_scoring=label_scoring,
         canvas_draws=canvas_draws,
         attention=attention,
         tokenizer=tokenizer,
@@ -1096,7 +1091,6 @@ def refine_plan(plan, *, model: ModelSpec, device: DeviceSpec,
                 doc_tokens: dict, gpus: int = 1, backend: str = "quail",
                 registry=None, order: str | None = None,
                 tokenizer=None, pair_fractions=None,
-                label_scoring: str | None = None,
                 canvas_draws: int = 4,
                 attention: str | None = None):
     """Run the physical rules again over a plan once its inputs are exact.
@@ -1118,7 +1112,6 @@ def refine_plan(plan, *, model: ModelSpec, device: DeviceSpec,
         document_tokens=doc_tokens,
         backend=backend,
         order=order,
-        label_scoring=label_scoring,
         canvas_draws=canvas_draws,
         attention=attention,
         tokenizer=tokenizer,

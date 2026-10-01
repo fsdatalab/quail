@@ -393,9 +393,9 @@ JOIN aspects a
 ```
 
 With the Quail backend, pair classification must run on one GPU in the
-same pipeline as its AI join. You cannot filter pair labels in `WHERE`,
-return multiple independent pair classifications, or combine pair
-classification with `AI.SCORE`. See
+same pipeline as its AI join. You cannot filter pair labels in `WHERE`
+or combine pair classification with `AI.SCORE`. Pair classifiers that
+run in separate pipelines are unsupported. See
 [joined classification execution](/docs/architecture/execution#classifying-joined-rows).
 
 ### AI.EXTRACT

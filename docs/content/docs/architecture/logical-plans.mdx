@@ -58,7 +58,7 @@ function arrives.
 | `ColumnRef(alias, provider, column)` | A column of a table. |
 | `ModelCall(prompt, kind, labels, descriptions)` | One prompt asked of every row. `kind` is `boolean` for `AI.IF`, `score` for `AI.SCORE`, or `label` for `AI.CLASSIFY`. Classification calls include labels and optional descriptions. |
 | `Compare(call, comparison, threshold)` | A score compared with a threshold. Answers yes or no. |
-| `LabelIn(call, labels)` | Tests whether a classification result is in the accepted label list. |
+| `LabelIn(call, labels)` | Checks whether the label is in a given list, such as `['refund', 'praise']`. |
 | `Alias(expression, name)` | A model call returned as a named result column. |
 
 A predicate on a `SemanticFilter` or `SemanticJoin` answers yes or
@@ -70,10 +70,9 @@ classification. Pair label tests are unsupported.
 `LogicalPlan.operators()` is the one walk that turns the tree into
 what the planner reads: the scans, each alias's filter predicates in
 written order, the joins in written order, and the applies.
-It also collects named model outputs. `LabelWork` records classification
-calls, output names, and label tests. See
-[classification nodes](/docs/architecture/physical-plans#classification-nodes)
-for the physical graph.
+It also collects calls that return scores or labels, their column names,
+and conditions that filter by label. See
+[physical node types](/docs/architecture/physical-plans#node-types).
 
 
 ## Prompt binding

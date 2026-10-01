@@ -431,7 +431,7 @@ def test_planner_prices_the_rules_and_takes_the_cheapest():
                         for i in range(30))
     letters = tuple((200 + i,) for i in range(30))
     table = _Table(alias="d", mean=200.0, longest=300, budget=chunk,
-                   chunk=chunk, scoring=None, backend_name="quail",
+                   chunk=chunk, backend_name="quail",
                    model=QWEN3_4B_FP8, device=H100_SXM, tokenizer=_bytes,
                    capacity=capacity, lengths=(200,) * 1000, tree=True)
     # thirty four-token labels sharing nothing, on resident documents
@@ -440,9 +440,7 @@ def test_planner_prices_the_rules_and_takes_the_cheapest():
     scoring, chosen = table.choose(1000, 20, 30, long_labels, True,
                                    lettered=(20, 60, letters))
     assert scoring == "letters" and chosen.suffix_tokens == 1000
-    forced = _Table(**{**table.__dict__, "scoring": "trie_tree"})
-    scoring, packed = forced.choose(1000, 20, 30, long_labels, True,
-                                    lettered=(20, 60, letters))
+    scoring, packed = table.choose(1000, 20, 30, long_labels, True)
     assert scoring == "trie_tree"
     assert packed.suffix_tokens == 1000 * len(label_trie(long_labels))
     assert chosen.seconds < packed.seconds
@@ -458,7 +456,7 @@ def test_planner_prices_the_rules_and_takes_the_cheapest():
                                     lettered=(20, 60, letters))
     assert scoring == "trie_decode"
     assert decoded.suffix_tokens == 1000 * (1 + 2 + 3 + 4)
-    fresh_trie = forced.choose(1000, 20, 30, long_labels, False)[1]
+    fresh_trie = table.simulate("trie_tree", 1000, 20, 30, long_labels, False)
     assert decoded.rounds == 4 and decoded.seconds < fresh_trie.seconds
     # a decode cannot end at a label that is another label's prefix
     prefixed = long_labels[:-1] + (long_labels[0][:2],)
@@ -530,33 +528,10 @@ def test_classify_refusals_and_builder_errors(session):
         "Scan", "AiFilter", "AiClassify", "Project"]
     assert not isinstance(query.plan(), Refusal)
 
-    # the plan setting picks the scoring rule; the cost model by default
+    # The planner chooses a supported scoring method automatically.
     plan = query.plan()
     (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
     assert classify.spec.scoring in ("letters", "trie_tree", "trie_decode")
-    assert plan.settings["label_scoring"] == "cost model"
-    for rule in ("trie_tree", "trie_decode", "next_rule"):
-        ruled = quail.Session(EngineConfig(
-            model="qwen3-4b-fp8", device="h100-sxm", label_scoring=rule),
-            tokenizer=_bytes)
-        ruled.register("documents", session.catalog.get("documents"))
-        plan = _topic(ruled).plan()
-        if rule == "next_rule":
-            assert isinstance(plan, Refusal) and "unknown" in plan.reasons[0]
-        else:
-            (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
-            assert classify.spec.scoring == rule
-            assert plan.settings["label_scoring"] == rule
-        if rule == "trie_decode":
-            # a greedy decode scores one label, so it has no probabilities
-            probable = ruled.docs("documents").alias("d").ai_classify(
-                quail.prompt("{0}", quail.col("d.body")), ["a", "b"],
-                name="x", probabilities=True).select("d.id", "x")
-            refused = probable.plan()
-            assert isinstance(refused, Refusal)
-            assert "probabilities" in refused.reasons[0]
-        ruled.close()
-
     # Qwen3 32B keeps its separate output head, so it classifies too
     big = quail.Session(EngineConfig(model="qwen3-32b-fp8", device="h100-sxm"),
                         tokenizer=_bytes)
@@ -631,21 +606,12 @@ def test_planner_reads_letters_on_a_diffusion_model(tmp_path):
     assert [list(ids) for ids in classify.spec.label_token_ids] == [
         _bytes(letter) for letter in "ABC"[:len(classify.spec.labels)]]
     assert classify.spec.estimated_seconds > 0
-    assert plan.settings["label_scoring"] == "cost model"
     chained = _chain(session).plan()
     classifies = [n for n in chained.nodes if isinstance(n, AiClassify)]
     assert len(classifies) == 2
     assert build_pipelines(chained.graph)[classifies[0].node_id].node_ids == (
         classifies[0].node_id, "filter:d:0", classifies[1].node_id)
     session.close()
-
-    forced = quail.Session(
-        EngineConfig(model=DIFFUSION_GEMMA_26B_FP8.name, device="h100-sxm",
-                     label_scoring="trie_tree"), tokenizer=_bytes)
-    forced.register("documents", DocumentProvider.from_parquet(path, id_col="id"))
-    refused = _topic(forced).plan()
-    assert isinstance(refused, Refusal) and "canvas" in refused.reasons[0]
-    forced.close()
 
 
 def test_a_document_without_a_label_fails_every_filter_on_it(session):

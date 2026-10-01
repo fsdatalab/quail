@@ -268,9 +268,6 @@ class EngineConfig:
     # sum the CUDA event pair each forward chunk records into gpu_s;
     # off by default so a run never pays for a measurement it does not read
     gpu_timing: bool = False
-    # force one AI.CLASSIFY label scoring rule for every classification,
-    # so an ablation can run each rule; None lets the planner choose
-    label_scoring: str | None = None
     # the most noise draws a diffusion model averages per AI.CLASSIFY
     # letters read and per one-table AI.SCORE: an answer whose first
     # draw is uncertain takes the rest, as vLLM PR 57250's structured

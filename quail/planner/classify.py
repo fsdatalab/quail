@@ -17,7 +17,6 @@ from quail.cost import classify as classify_cost
 from quail.execution.pipelines import build_pipelines
 from quail.labels import (
     DECODE_SCORING,
-    LABEL_SCORINGS,
     LETTERS_SCORING,
     TREE_SCORING,
     decodable,
@@ -39,15 +38,8 @@ from quail.planner.plan import Refusal
 def classification_refusal(context) -> Refusal | None:
     """Why the context's model cannot classify, or None when it can."""
     model = context.model
-    forced = context.label_scoring
     if context.tokenizer is None:
         reason = "AI.CLASSIFY planning needs the model's tokenizer"
-    elif forced is not None and forced not in LABEL_SCORINGS:
-        reason = (f"unknown label scoring rule {forced!r}; "
-                  f"the rules are {LABEL_SCORINGS}")
-    elif model.canvas_tokens and forced not in (None, LETTERS_SCORING):
-        reason = (f"{model.name!r} reads labels on a canvas; the "
-                  f"{forced!r} rule reads the rows of a causal chain")
     elif model.canvas_tokens and model.answer_canvas is None:
         reason = f"{model.name!r} names no answer canvas to read labels on"
     else:
@@ -96,7 +88,7 @@ def classify_table(context, alias: str, backend_name: str,
     return _Table(
         alias=alias, mean=total / max(1, count),
         longest=max(lengths, default=0), budget=min(chunk, capacity),
-        chunk=chunk, scoring=context.label_scoring,
+        chunk=chunk,
         draws=context.canvas_draws if context.model.answer_canvas else 1,
         backend_name=backend_name, model=context.model,
         device=context.device, tokenizer=context.tokenizer,
@@ -131,8 +123,6 @@ class _Table:
             chunk budget and the KV arena.
         chunk: The chunk budget in tokens.
         capacity: The arena's tokens.
-        scoring: The label scoring rule every classification uses, or
-            None to choose per classification by simulated cost.
         draws: The noise draws a letters read on a canvas model may
             average; 1 on a causal model.
         lengths: Every document's length in tokens.
@@ -147,7 +137,6 @@ class _Table:
     longest: int
     budget: int
     chunk: int
-    scoring: str | None
     backend_name: str
     model: object
     device: object
@@ -274,28 +263,14 @@ class _Table:
                 label's probability.
 
         Raises:
-            ClassifyRefusedError: No rule can run: ``letters`` without a
-                lettered prompt, ``trie_tree`` without tree attention,
-                or ``trie_decode`` forced for label probabilities.
+            ClassifyRefusedError: No supported scoring method can run.
         """
-        if self.scoring == DECODE_SCORING and probabilities:
-            raise ClassifyRefusedError(
-                f"the {DECODE_SCORING!r} rule decodes one label and scores "
-                f"no other, so it cannot return the labels' probabilities",
-                1, 0)
-        if self.scoring:
-            candidates = [self.scoring]
-        else:
-            candidates = [LETTERS_SCORING] if lettered is not None else []
-            if self.tree:
-                candidates.append(TREE_SCORING)
-            if (not self.model.canvas_tokens and not resident
-                    and not probabilities and decodable(labels)):
-                candidates.append(DECODE_SCORING)
-        if lettered is None and LETTERS_SCORING in candidates:
-            raise ClassifyRefusedError(
-                "the letters rule needs a one-token letter for every "
-                "label, which the tokenizer does not have", 1, 0)
+        candidates = [LETTERS_SCORING] if lettered is not None else []
+        if self.tree:
+            candidates.append(TREE_SCORING)
+        if (not self.model.canvas_tokens and not resident
+                and not probabilities and decodable(labels)):
+            candidates.append(DECODE_SCORING)
         if not candidates:
             raise ClassifyRefusedError(
                 "no label scoring rule can run: no one-token letter for "
@@ -336,14 +311,9 @@ class _Table:
             partner_tokens: The partner documents' mean length.
 
         Raises:
-            ClassifyRefusedError: A forced rule other than letters, or
-                a prompt without a lettered form.
+            ClassifyRefusedError: Probabilities requested for joined rows,
+                or a prompt without a lettered form.
         """
-        if self.scoring not in (None, LETTERS_SCORING):
-            raise ClassifyRefusedError(
-                f"a classification of joined rows reads letters "
-                f"({LETTERS_SCORING}); the {self.scoring!r} rule was forced",
-                1, 0)
         if call.probabilities:
             raise ClassifyRefusedError(
                 f"a classification of joined rows returns its label only; "
