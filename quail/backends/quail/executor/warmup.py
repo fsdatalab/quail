@@ -3,6 +3,7 @@
 import time
 
 from quail.backends.quail.executor.loop import run_filter, run_join
+from quail.backends.quail.executor.model import full_output_head
 from quail.progress import Progress, logger, quiet
 
 # ------------------------------------------------------------- warmup
@@ -81,6 +82,36 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
                [question], budget, arena_writes=False)
 
 
+def warm_label_readout(torch, head):
+    """Run the label readout in each form, at several row and target counts.
+
+    Loads the readout's kernels into the process: the head projection,
+    log-sum-exp, the target selection, and the row scatter of a
+    many-row answer.
+
+    Args:
+        torch: The torch module.
+        head: The model's whole output head.
+    """
+    from quail.backends.quail.executor.readout import AsyncLabelLogprobs
+
+    block = AsyncLabelLogprobs.BLOCK_ROWS
+    hidden = torch.zeros((block + 300, head.shape[1]), dtype=torch.bfloat16,
+                         device=head.device)
+    # a kernel's first launch waits for the GPU's queued work, which in
+    # a query is a whole forward pass; PyTorch selects up to 16 indices
+    # with one kernel and more with another
+    for targets in (16, 128):
+        for normalize, rows in ((True, 1), (True, 4), (False, 1)):
+            readout = AsyncLabelLogprobs(torch, torch.nn.functional, head,
+                                         list(range(targets)), rows=rows,
+                                         normalize=normalize)
+            for count in (1, 37, 200, block, block + 300):
+                readout.result(readout.submit(
+                    hidden[:count],
+                    rows_per_answer=[1] * count if rows > 1 else None))
+
+
 def compile_kernels(torch, arena, pipeline, async_ans, budget):
     """Build every DeepGEMM kernel configuration, then warm every path.
 
@@ -156,8 +187,19 @@ def _marker_identity(torch, model_name, budget):
 
 
 def warm_kernels(torch, arena, pipeline, async_ans, budget, *,
-                 model_name, force_compile=False):
+                 model_name, force_compile=False, model=None):
     """Compile once under a file lock, then warm each GPU process.
+
+    Args:
+        torch: The torch module.
+        arena: The KV arena the warm passes write.
+        pipeline: The model pipeline.
+        async_ans: The TRUE/FALSE readout of the warm passes.
+        budget: Chunk token budget.
+        model_name: The model's name, for the compile marker.
+        force_compile: Run the compile pass even when the marker matches.
+        model: The loaded model; when given, its label readout is
+            warmed too.
 
     Returns:
         A dict with the selected tier and elapsed warmup seconds.
@@ -199,6 +241,8 @@ def warm_kernels(torch, arena, pipeline, async_ans, budget, *,
         if tier == "touch":
             logger.info("kernels: warming cached filter and join kernels")
             touch_kernels(torch, arena, pipeline, async_ans, budget)
+        if model is not None:
+            warm_label_readout(torch, full_output_head(model))
         torch.cuda.synchronize()
         warm_s = round(time.perf_counter() - t0 - wait_s, 2)
         wait_s = round(wait_s, 2)

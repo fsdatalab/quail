@@ -85,6 +85,21 @@ class AsyncAnswers:
         return [int(b) for b in host.tolist()]
 
 
+def answer_rows(rows_per_answer) -> tuple[np.ndarray, np.ndarray]:
+    """Return each read row's answer and its row within that answer.
+
+    Args:
+        rows_per_answer: The rows each answer reads, in order.
+
+    Returns:
+        (answer index, row index), one entry per read row.
+    """
+    counts = np.asarray(rows_per_answer, dtype=np.int64)
+    starts = np.repeat(np.cumsum(counts) - counts, counts)
+    return (np.repeat(np.arange(len(counts)), counts),
+            np.arange(int(counts.sum())) - starts)
+
+
 class AsyncLabelLogprobs:
     """Non-blocking full-vocabulary log probabilities of chosen tokens.
 
@@ -150,12 +165,12 @@ class AsyncLabelLogprobs:
             answers = torch.full((len(rows_per_answer), self.rows,
                                   values.shape[1]), float("nan"),
                                  dtype=torch.float32, device=values.device)
-            answer_index = torch.tensor(
-                [i for i, n in enumerate(rows_per_answer) for _ in range(n)],
-                device=values.device)
-            row_index = torch.tensor(
-                [r for n in rows_per_answer for r in range(n)],
-                device=values.device)
+            # copied from pinned memory, so the host does not wait for
+            # the forward pass ahead of the copy on the stream
+            answer_index, row_index = (
+                torch.from_numpy(index).pin_memory().to(
+                    values.device, non_blocking=True)
+                for index in answer_rows(rows_per_answer))
             answers[answer_index, row_index] = values
             values = answers
         elif rows_per_answer is not None and any(

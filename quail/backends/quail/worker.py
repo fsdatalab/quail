@@ -134,7 +134,8 @@ class LoadedGpu:
         with self.torch.inference_mode():
             warm = warm_kernels(self.torch, self.arena, self.pipeline,
                                 self.async_ans, self.chunk_tokens,
-                                model_name=self.spec.hf_name)
+                                model_name=self.spec.hf_name,
+                                model=self.model)
         self.torch.cuda.synchronize()
         warm_s = time.perf_counter() - t0
         self._warmed = True
