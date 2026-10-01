@@ -93,10 +93,6 @@ With `probabilities=true`, Quail scores every label, so `trie_decode`
 is unavailable. The returned probabilities sum to 1 across the labels.
 When scores tie, Quail favors the label listed first.
 
-The planner refuses methods that the model or query cannot run, and
-prompts that exceed the token or KV budgets. The vLLM and SGLang backends
-ask their own model engines to generate label text.
-
 Implementation:
 [`planner/classify.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/classify.py)
 builds prompts and physical nodes.
