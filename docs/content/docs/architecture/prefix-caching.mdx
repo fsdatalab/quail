@@ -67,7 +67,7 @@ for scheduling and
 [`PageArena`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/arena.py)
 for page ownership and release.
 
-## Precedents
+## Related implementations
 
 The optimization is the same prefix caching used by
 [vLLM](https://docs.vllm.ai/en/latest/design/prefix_caching/) and
@@ -81,6 +81,3 @@ The lookup structures differ:
   [`RadixCache`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/mem_cache/radix_cache.py).
 - Quail records parent links for its known input documents before
   execution. Having the documents in advance allows this choice.
-
-SGLang also schedules requests to improve reuse. Neither prefix
-caching nor scheduling for reuse is new in Quail.

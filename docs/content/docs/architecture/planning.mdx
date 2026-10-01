@@ -62,17 +62,43 @@ KV reads).
 
 ## Choosing classification scoring
 
-For `AI.CLASSIFY`, the planner checks supported scoring rules and
-compares their estimated work and execution time. Prompt preparation
-and graph construction live in `planner/classify.py`; work and time
-calculations live in `cost/classify.py`.
+The classification planner selects the supported scoring rule with the
+lowest estimated execution time.
 
-The resulting graph uses an `AiClassify` node for each classification
-and ordinary `Filter` nodes for label tests. Pipeline construction then
-groups compatible operators. Unsupported model, budget, or joined
-classification configurations produce a refusal before execution.
-See [classification](/docs/architecture/classification) for the rules
-and execution requirements.
+| Rule | Scoring | Requirements |
+| --- | --- | --- |
+| `letters` | Highest-scoring one-token category code. | One distinct single-token code per category. |
+| `trie_tree` | Highest sum of token log probabilities for a complete label. | FP8 model without canvas tokens; attention not forced to `unified`. |
+| `trie_decode` | Greedy token selection along allowed label sequences. | Causal model; no label token sequence that is a proper prefix of another. |
+
+A trie stores shared prefixes of label token sequences once. Tree
+scoring compares complete label scores; greedy decoding selects one
+continuation at each step. The rules can return different labels.
+Ties select the earlier category or token branch in the supplied list.
+
+Automatic selection considers greedy decoding only when document KV is
+not already resident from an earlier stage. Diffusion models and joined
+classification use `letters`.
+
+The `label_scoring` setting forces a rule:
+
+```python
+config = quail.EngineConfig(
+    model="qwen3-4b-fp8",
+    device="h100-sxm",
+    label_scoring="letters",
+)
+```
+
+Unsupported scoring rules, prompts exceeding token or KV budgets, and
+unsupported pair classification plans produce a planning refusal.
+Request backends use their own classification execution.
+
+Implementation:
+[`planner/classify.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/classify.py)
+constructs prompts and physical nodes;
+[`cost/classify.py`](https://github.com/fsdatalab/quail/blob/main/quail/cost/classify.py)
+estimates work and execution time.
 
 ## Deciding token budget and KV capacity
 

@@ -2,55 +2,31 @@
 title: SQL reference
 ---
 
-## What is AI-SQL?
+## AI-SQL
 
-AI-SQL extends standard SQL with operators that call a language model
-during query execution. You can filter rows, join tables, and match
-documents using natural language conditions instead of exact column
-comparisons.
-
-For example, to find reviews that discuss the ending of a movie:
-
-```sql
-SELECT r.id
-FROM reviews r
-WHERE AI.IF(PROMPT('Does this review discuss the ending of the movie?\n\n{0}', r.body))
-```
-
-The model reads each review and returns TRUE or FALSE. Quail keeps
-the rows where the answer is TRUE.
-
-Major database vendors define their own AI-SQL syntax, including
-[Snowflake Cortex AISQL](https://docs.snowflake.com/en/user-guide/snowflake-cortex/aisql),
-[BigQuery AI functions](https://cloud.google.com/blog/products/data-analytics/sql-reimagined-for-the-ai-era-with-bigquery-ai-functions),
-and [Databricks AI Functions](https://docs.databricks.com/aws/en/large-language-models/ai-functions).
-Quail supports two of these dialects:
+Quail supports model predicates, numeric scores, and classification in
+SQL queries. The SQL compiler accepts two dialects:
 
 ```python
-session.sql(text, dialect="snowflake")  # AI_FILTER syntax
-session.sql(text, dialect="bq")         # AI.IF syntax
+session.sql(text, dialect="snowflake")  # AI_FILTER
+session.sql(text, dialect="bq")         # AI.IF
 ```
 
-Both compile to the same plan. The rest of this page uses the
-BigQuery dialect.
+The examples below use `dialect="bq"`.
 
 ## PROMPT
 
-`PROMPT` writes the question that the model answers for each row.
-You write a template with `{0}`, `{1}`, etc. as placeholders for
-column values. Quail binds the template to a model prompt layout;
-it is not ordinary string substitution. For the generative model
-layouts, documents precede the question so their saved model state
-can be reused. See [prompt binding](/docs/architecture/logical-plans#prompt-binding)
-for the layouts.
+`PROMPT(template, column, ...)` binds a question to document columns.
+Placeholders `{0}`, `{1}`, etc. refer to the columns in argument order.
+Generative model prompts place documents before the question to reuse
+their saved model state. See
+[prompt binding](/docs/architecture/logical-plans#prompt-binding).
 
 For a filter, the prompt references one column:
 
 ```sql
 PROMPT('Does this review discuss the ending of the movie?\n\n{0}', r.body)
 ```
-
-Here `{0}` identifies the review's `body` column.
 
 For a join, the prompt references one column from each table:
 
@@ -59,15 +35,22 @@ PROMPT('Does the review discuss this aspect?\n\nReview: {0}\nAspect: {1}',
        r.body, a.aspect)
 ```
 
-Here `{0}` is the review and `{1}` is the aspect, and the model
-answers for every pair.
+The model evaluates the question for each document pair.
 
 ## AI operators
 
+| Function | Description | Return type |
+| --- | --- | --- |
+| `AI.IF(prompt[, options])` | Tests a condition on a document or document pair. | `BOOLEAN` |
+| `AI.SCORE(prompt[, options])` | Scores a document or document pair against a condition. | `FLOAT64` |
+| `AI.CLASSIFY(input, categories[, options])` | Assigns a label from a category list. | `STRING` |
+
 ### AI.IF
 
-`AI.IF` takes a `PROMPT` and evaluates it on each row or each pair
-of rows. The model returns TRUE or FALSE.
+`AI.IF(prompt[, options])`
+
+Returns `TRUE` or `FALSE` for a condition on a document or document pair.
+The Snowflake dialect uses `AI_FILTER`.
 
 #### Filtering
 
@@ -166,12 +149,13 @@ AI_FILTER(PROMPT(...), {'selectivity': 0.3, 'anchor': 'r'})
 
 ### AI.SCORE
 
-`AI.SCORE(PROMPT(...))` returns a score between 0 and 1 as a
-`FLOAT64`. Higher scores mean the model more strongly favors "yes" over
-"no" for the prompt. Use it in `SELECT` to return scores, or compare it
-with a threshold in `WHERE` or `JOIN ... ON`.
+`AI.SCORE(prompt[, options])`
 
-Every model runs `AI.SCORE`:
+Returns a `FLOAT64` between 0 and 1. Higher scores indicate a stronger
+model preference for "yes" over "no". Scores can be projected in
+`SELECT` or compared with a threshold in `WHERE` and `JOIN ... ON`.
+
+All supported models can run `AI.SCORE`, including rerankers:
 
 ```python
 config = quail.EngineConfig(
@@ -189,9 +173,7 @@ config = quail.EngineConfig(
   `diffusion-gemma-26b-a4b-fp8`, use the `AI.IF` prompt for the same
   template and compare TRUE with FALSE. `AI.SCORE` runs that prompt
   through a different execution path than `AI.IF`, so a score above
-  0.5 and the `AI.IF` answer can differ on some rows. On four QUAIL-B
-  filters they differed on 0% to 2.4% of rows for Qwen3 32B and
-  DiffusionGemma, and on 1.7% to 10% of rows for Qwen3 4B.
+  0.5 and the `AI.IF` answer can differ.
 
 Use `gpus` to run a model copy on each GPU.
 
@@ -273,23 +255,56 @@ labeled examples for your task.
 
 ### AI.CLASSIFY
 
-`AI.CLASSIFY` returns one of your labels as a `STRING`. You can return
-labels in `SELECT`, filter documents by label in `WHERE`, or do both.
+`AI.CLASSIFY(input, categories[, options])`
+
+Returns a category label as a `STRING`. Classification can be projected
+in `SELECT` or tested with `=` and `IN` in `WHERE`. Identical calls in
+the projection and predicate share one computation.
+
+#### Parameters
+
+| Parameter | Description |
+| --- | --- |
+| `input` | A document column or `PROMPT`. A prompt over two tables classifies a document pair. |
+| `categories` | A list of 2 to 255 nonempty labels, distinct ignoring case, or a registered label table. |
+| `options` | Optional task description, selectivity estimate, and output mode. |
+
+Categories support the following forms:
+
+| Form | Example |
+| --- | --- |
+| Strings | `ARRAY['refund', 'praise']` |
+| Label and description pairs | `ARRAY[('refund', 'asks for money back'), ('praise', NULL)]` |
+| Objects | `ARRAY[{'label': 'refund', 'description': 'asks for money back'}, {'label': 'praise'}]` |
+| Registered table | `kinds` |
+
+Descriptions may contain at most 25 words. A label table requires a
+`label` column and may include `description` and integer `ordinal`
+columns. Labels are ordered by `ordinal` when present, otherwise by
+label text. The category argument also accepts the named form
+`categories => ARRAY['refund', 'praise']`.
+
+#### Options
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `task_description` | Empty | Task text appended to the question, at most 50 words. |
+| `selectivity` | `0.2` | Estimated fraction of documents passing a label predicate. |
+| `output_mode` | `'single'` | Only `'single'` is supported. |
+
+#### Examples
+
+Return one sentiment label per review:
 
 ```sql
 SELECT r.id,
        AI.CLASSIFY(
            PROMPT('What sentiment does this review express? {0}', r.body),
            ARRAY['positive', 'negative', 'neutral', 'mixed']) AS sentiment
-FROM reviews r
+FROM reviews r;
 ```
 
-Give the output a name with `AS`. The classification must be a complete
-item in the `SELECT` list. You cannot use it inside another expression.
-
-#### Filter by label
-
-Use `=` or `IN` to select documents with particular labels:
+Return labels and filter by the same classification:
 
 ```sql
 SELECT r.id,
@@ -298,83 +313,29 @@ SELECT r.id,
 FROM reviews r
 WHERE AI.CLASSIFY(PROMPT('What sentiment does this review express? {0}', r.body),
                   ARRAY['positive', 'negative', 'neutral', 'mixed'])
-      IN ('negative', 'mixed')
+      IN ('negative', 'mixed');
 ```
 
-The calls in `SELECT` and `WHERE` are identical, so Quail classifies
-once per document and uses the label for both. Equality works with the
-label on either side. A label outside the category list matches no
-rows. Comparisons such as `<` raise `CompileError`.
-
-#### Inputs and categories
-
-The first argument is a `PROMPT` or a document column. With a column,
-you can supply the task in the options:
+Classify a document column with a task description:
 
 ```sql
 SELECT r.id,
        AI.CLASSIFY(r.body, ARRAY['refund', 'praise'],
                    {'task_description': 'Classify the customer request.'}) AS kind
-FROM reviews r
+FROM reviews r;
 ```
 
-The category list must have 2 to 255 nonempty labels. Labels must
-be distinct ignoring case. Descriptions are optional and may contain
-at most 25 words each.
-
-| Category argument | Example |
-| --- | --- |
-| Label strings | `ARRAY['refund', 'praise']` |
-| Label and description pairs | `ARRAY[('refund', 'asks for money back'), ('praise', NULL)]` |
-| Objects with label and description fields | `ARRAY[{'label': 'refund', 'description': 'asks for money back'}, {'label': 'praise'}]` |
-| A registered label table | `kinds` |
-
-A label table needs a `label` column. It may also have `description`
-and integer `ordinal` columns. Quail orders labels by `ordinal` when
-present, and by label text otherwise. You may name the category
-argument, as in `categories => ARRAY['refund', 'praise']`.
-
-#### Options
-
-Pass options as the third argument:
-
-```sql
-AI.CLASSIFY(r.body, ARRAY['refund', 'praise'],
-            {'task_description': 'Classify the customer request.',
-             'selectivity': 0.3,
-             'output_mode': 'single'})
-```
-
-| Option | Meaning |
-| --- | --- |
-| `task_description` | Task text added to the prompt. It may contain at most 50 words. |
-| `selectivity` | In a label filter, the estimated fraction of documents that pass. The default estimate is 0.2. |
-| `output_mode` | Only `'single'` is supported. |
-
-The label list order resolves ties. The scoring method depends on the
-model and plan. A greedy decode that does not finish at an allowed
-label removes that document from the result. See
-[classification execution](/docs/architecture/classification) for the
-scoring methods and configuration.
-
-#### Return scores and labels together
-
-On a generative model, you can return `AI.SCORE` and `AI.CLASSIFY` in
-one query. Each expression retains its own output type:
+Return a numeric score and a label:
 
 ```sql
 SELECT r.id,
        AI.SCORE(PROMPT('Does the customer request a refund? {0}', r.body)) AS refund_score,
        AI.CLASSIFY(PROMPT('What is the request about? {0}', r.body),
                    ARRAY['refund', 'shipping', 'praise']) AS topic
-FROM reviews r
+FROM reviews r;
 ```
 
-Reranker models support `AI.SCORE` but cannot run `AI.CLASSIFY`.
-
-#### Classify a document pair
-
-A classification after an AI join can describe each matched pair:
+Classify pairs returned by an AI join:
 
 ```sql
 SELECT r.id, a.id,
@@ -384,25 +345,31 @@ SELECT r.id, a.id,
            ARRAY['positive', 'negative', 'neutral', 'mixed']) AS aspect_sentiment
 FROM reviews r
 JOIN aspects a
-  ON AI.IF(PROMPT('Does DOCUMENT {0} discuss DOCUMENT {1}?', r.body, a.aspect))
+  ON AI.IF(PROMPT('Does DOCUMENT {0} discuss DOCUMENT {1}?', r.body, a.aspect));
 ```
 
-In the Quail backend, pair classification runs in the same pipeline
-as its AI join on one GPU. The planner refuses configurations that
-would run the pair classifier separately, including multiple
-independent classification outputs after a join and multiple GPUs.
-A pair classification cannot be tested in `WHERE` or combined with
-`AI.SCORE`. Each prompt must read one column from each of the two
-tables.
+#### Limitations
 
-The join prompt layout identifies documents as `DOCUMENT {0}` and
-`DOCUMENT {1}`. Use those names in the pair classification question,
-as in the example. See [joined classification](/docs/architecture/classification#classifying-joined-rows)
-for how the executor reuses the join's document state.
+- Projected classifications require `AS` and must be complete items in
+  the `SELECT` list. Other expressions around a classification are unsupported.
+- Label predicates support `=` and `IN`. A label outside the category
+  list matches no rows. Other comparisons raise `CompileError`.
+- Reranker models cannot run classification.
+- In the Quail backend, pair classification requires one GPU and a
+  pipeline shared with its AI join. Multiple independent pair classification
+  outputs, pair label predicates, and pair classification with `AI.SCORE`
+  are unsupported.
+- Pair prompts must read one column from each table. Refer to the
+  documents as `DOCUMENT {0}` and `DOCUMENT {1}`.
+
+Ties select the earlier category. Greedy decoding can omit a document
+if it does not produce an allowed label. See
+[classification scoring](/docs/architecture/planning#choosing-classification-scoring)
+and [execution](/docs/architecture/execution#classification-execution).
 
 ### AI.EXTRACT
 
-<Callout type="info">Coming soon</Callout>
+<Callout type="info">Not implemented.</Callout>
 
 Pull structured fields out of each document, like Snowflake's
 [AI_EXTRACT](https://docs.snowflake.com/en/user-guide/snowflake-cortex/aisql).
@@ -415,7 +382,7 @@ FROM reviews r
 
 ### AI.MAP
 
-<Callout type="info">Coming soon</Callout>
+<Callout type="info">Not implemented.</Callout>
 
 Run a free-form instruction on each document and return the generated
 text, like Snowflake's
@@ -429,7 +396,7 @@ FROM reviews r
 
 ## SELECT, FROM, JOIN, LIMIT
 
-These work the way you expect from standard SQL:
+The following SQL clauses are supported:
 
 - **`SELECT`** lists columns and named `AI.SCORE` or `AI.CLASSIFY`
   outputs. `*` expands to all table columns. Other computed expressions
@@ -439,7 +406,7 @@ These work the way you expect from standard SQL:
   `RIGHT`, `FULL`) are not.
 - **`LIMIT`** takes a positive integer.
 
-## Unsupported SQL operators (for now)
+## Unsupported SQL operators
 
 - `GROUP BY`, `ORDER BY`, `DISTINCT`, `HAVING`, window functions
 - `UNION`, `EXCEPT`, `INTERSECT`, `OFFSET`

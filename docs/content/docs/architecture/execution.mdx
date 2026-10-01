@@ -99,17 +99,44 @@ sharing one anchor's KV.
 
 ### Classification execution
 
-An `AiClassify` produces a string label column. A following `Filter`
-tests those labels, and another model operator can consume the
-surviving documents in the same pipeline. Queries that also return
-numeric scores retain separate `AiScore` nodes and score columns.
+`AiClassify` produces a string label column. A following `Filter` tests
+the computed labels. Compatible operators can run in one pipeline and
+reuse document KV. Numeric scores use separate `AiScore` nodes, with
+both score and label columns retained for projection.
 
-The classification executor converts its scoring specification into
-internal stages. Greedy label decoding may need several stages, but
-the physical graph still contains one node per classification. The
-shared stage scheduler packs ready requests into GPU forward passes.
-See [classification](/docs/architecture/classification) for scoring
-rules, diffusion draws, and the joined classification restrictions.
+Letter and tree scoring each use one internal stage. Greedy decoding
+uses successive stages to select label tokens. Decoder stages belong
+to one `AiClassify` node. The shared scheduler packs ready requests
+into forward passes within the token and KV page budgets. A stage may
+require multiple forward passes over its input.
+
+A document without an allowed label is omitted from the output.
+Scoring rules are described in
+[planning](/docs/architecture/planning#choosing-classification-scoring).
+
+#### Diffusion draws
+
+DiffusionGemma reads category logits from the first row of an answer
+canvas. The canvas starts with a random token seeded by document row
+index and draw number.
+
+If the category probability entropy exceeds 0.1 nats, the executor
+runs the remaining draws and selects the category with the highest
+mean probability. The maximum draw count is `EngineConfig(canvas_draws=4)`
+by default. Set `canvas_draws=1` for one draw.
+
+The setting also applies to one-document `AI.SCORE`, which averages
+TRUE probabilities. Joined classification uses one draw.
+
+#### Classifying joined rows
+
+A pair classifier uses the matches from its corresponding join stage.
+The executor retains the anchor's document KV and appends the matched
+partner document and classification question for each pair.
+
+The classifier and AI join must share a pipeline on one GPU. The
+planner refuses pair classification that would execute independently.
+The executor has no standalone pair classification path.
 
 ## Model forward pass
 

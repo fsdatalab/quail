@@ -2,13 +2,9 @@
 title: Editing physical plans
 ---
 
-Quail's planner picks the filter order, join anchors, and KV retention
-for you. Sometimes you want to change the plan, e.g. run a user
-defined function between two operators.
-
-In this example, we'll inspect a physical plan, edit it, and insert a
-user function. Note that we don't need a GPU here because we only plan
-the query, we don't execute it.
+Physical plans can be inspected and edited before execution. The
+example inserts a barrier and a Python function between operators.
+Planning and editing do not require a GPU.
 
 The full example is in
 [`demos/plan_walkthrough.py`][demoscript].
@@ -21,18 +17,13 @@ uv run python demos/plan_walkthrough.py
 
 ## The query
 
-We'll use a small version of a
-[FEVER](https://fever.ai/) query from
-[QUAIL-B](/docs/contributing/benchmark). In FEVER, each claim is a
-factual statement and each evidence passage is a Wikipedia paragraph.
-The goal is to find which passages support which claims.
+The example uses three claims and three evidence passages from a
+[FEVER](https://fever.ai/) query in
+[QUAIL-B](/docs/contributing/benchmark). An AI filter selects claims
+about a person. An AI join tests whether each candidate passage supports
+the claim. Candidate pairs are restricted by the evidence page URL.
 
-Here we have three claims and three evidence passages. We filter
-claims ("is the claim about a person?") and then check surviving
-claims against their evidence ("does the evidence support the
-claim?").
-
-We build the query with the [Python builder API](/docs/user-guide/python-api):
+The query uses the [Python builder API](/docs/user-guide/python-api):
 
 ```python
 from quail import col, prompt
@@ -60,15 +51,12 @@ evidence the model evaluates.
 
 ## Inspect the plan
 
-We call `query.explain()`. The physical plan shows how the engine
-would execute the query:
+`query.explain()` shows the physical plan:
 
 <Callout type="info">
-The time estimates assume peak GPU throughput with no host overhead.
-Actual runtimes are longer, for many reasons, such as kernel launch
-latency and low MFU. Use `explain(analyze=True)` on a GPU to see
-measured times next to the estimates. We are working on better
-latency estimates.
+Time estimates assume peak GPU throughput and exclude host overhead.
+Use `explain(analyze=True)` on a GPU to compare estimates with measured
+execution time.
 </Callout>
 
 ```text
@@ -97,9 +85,7 @@ and the join overlap.
 
 ## Insert a barrier
 
-If we want the filter to finish *all* claims before the join starts,
-we insert a `Barrier`. A barrier is a synchronization point: the
-engine collects all filter survivors, then begins the join.
+A `Barrier` collects all filter survivors before starting the join:
 
 ```python
 from quail.physical import Barrier
@@ -122,17 +108,15 @@ survivors' KV for the join instead:
           retain KV for later joins
 ```
 
-We can remove the barrier and get back the original plan:
+Removing the barrier restores the original plan:
 
 ```python
 assert edited.remove("barrier:c") == plan
 ```
 
-You can only remove nodes that don't change the query's results.
-`Barrier`, `Foreign`, and `Exchange` nodes are safe to remove because
-they control execution order or add user logic, not query semantics.
-Removing a filter or join would change which rows come back, so Quail
-refuses:
+The editing API allows removal of `Barrier`, `Foreign`, and `Exchange`
+nodes. Removing a `Foreign` node also removes its Python function, which
+can change the candidate rows or pairs. Model nodes cannot be removed:
 
 ```text
 PlanEditError: 'ai_filter:c' is a AiFilter; removing it would change
@@ -141,8 +125,7 @@ what the query means
 
 ## Insert a user function
 
-With `.apply()`, we can run our own Python function between operators.
-The full signature is:
+`apply()` inserts a Python function between operators:
 
 ```python
 query.apply(fn, columns=(), *, name=None, ids=None, kind="per_batch")
@@ -156,11 +139,11 @@ query.apply(fn, columns=(), *, name=None, ids=None, kind="per_batch")
   (e.g. `c` and `e`) selecting which combinations the next AI
   predicate evaluates.
 - Without a preceding `.join()`, `fn` returns the ids to keep.
-- `kind="per_batch"` runs on each batch as survivors stream through.
-  `kind="barrier"` waits for all survivors, then runs once.
+- `kind="per_batch"` can run as documents pass through a pipeline.
+  An independent node receives materialized input. `kind="barrier"`
+  waits for all survivors and runs once.
 
-For example, instead of an `ON` clause, we can match claims to
-evidence with an Arrow join inside our function:
+An Arrow join in the function can select candidate pairs by URL:
 
 ```python
 def match_by_url(tables):
@@ -182,10 +165,6 @@ query = (
     .select("c.id", "e.id")
 )
 ```
-
-We could do anything in `match_by_url`: filter by recency, sample a
-subset, or call an external service. Quail only sees the returned
-index table.
 
 In the physical plan, `match_by_url` appears as a `Foreign` node:
 

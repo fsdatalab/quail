@@ -6,7 +6,6 @@
     "physical-plans",
     "planning",
     "execution",
-    "classification",
     "prefix-caching"
   ],
   "defaultOpen": false

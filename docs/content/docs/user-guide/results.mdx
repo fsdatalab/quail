@@ -56,11 +56,9 @@ physical: backend=quail, model=qwen3-4b-fp8, workers=1
 ```
 
 <Callout type="info">
-The time estimates assume peak GPU throughput with no host overhead.
-Actual runtimes are longer, for many reasons, such as kernel launch
-latency and low MFU. Use `explain(analyze=True)` on a GPU to see
-measured times next to the estimates. We are working on better
-latency estimates.
+Time estimates assume peak GPU throughput and exclude host overhead.
+Use `explain(analyze=True)` on a GPU to compare estimates with measured
+execution time.
 </Callout>
 
 On an operator line, `est. rows` is how many rows the planner expects

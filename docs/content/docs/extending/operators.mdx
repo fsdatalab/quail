@@ -2,94 +2,67 @@
 title: Custom operators
 ---
 
-Quail includes `AI.IF`, `AI.SCORE`, and `AI.CLASSIFY`. To add another
-operation, define what it means in the logical plan, choose physical
-nodes for its execution, and register a runtime for any new node type.
+Custom operators require a logical representation, a physical plan,
+and a runtime for any new physical node. For Python functions between
+existing operators, use [`apply`](/docs/user-guide/python-api#apply).
 
-If you only need Python logic to filter documents or select candidate
-pairs, use [`apply`](/docs/user-guide/python-api#apply). It already has
-a logical node, a physical node, and execution support.
+## Logical expressions
 
-## Start with the logical expression
+Model calls are expressions within logical operators. `AI.CLASSIFY`,
+for example, is a `ModelCall` with `kind="label"`. It appears as an
+`Alias` in a projection or as the call tested by `LabelIn` in a filter.
 
-Model calls are expressions within logical operators. For example,
-`AI.CLASSIFY` is a `ModelCall` with `kind="label"`. The front ends put
-it in a projection to return a label, or inside `LabelIn` to filter
-on that label. It does not require a separate logical classification
-node.
+Add a logical node when the operation requires new inputs or an output
+schema. Logical nodes implement `children()`, `expressions()`, validation,
+and immutable rewrite methods. The protocol is described in
+[logical plans](/docs/architecture/logical-plans).
 
-Decide whether your operation needs a new expression or a new node.
-An expression represents a computed value. A node represents a query
-operation with inputs and an output schema. Logical nodes implement
-`children`, `expressions`, validation, and immutable rewrite methods.
-See [logical plans](/docs/architecture/logical-plans) for the protocol.
+SQL and Python syntax must produce equivalent logical representations.
 
-Update the SQL compiler and Python builder together when adding
-public syntax. They should produce equivalent logical plans for the
-same operation.
+## Physical nodes
 
-## Define physical inputs and outputs
+A physical node declares typed input and output ports, a `type_name`,
+a runtime lookup key, and an execution location. Serialization uses
+`attributes()` and `from_attributes()`.
 
-A physical node describes one executable operation. Its typed ports
-state which values it consumes and produces. An `AiClassify`, for
-example, consumes document ids or earlier score tables and produces
-a label table. A one-document classifier also produces the ids of
-documents that received a label.
-
-For a new node type, define:
-
-- Its input and output ports, including their value types and schemas.
-- A unique `type_name` and a `runtime_key` for runtime lookup.
-- An execution location, either the coordinator or a GPU executor.
-- `attributes()` and `from_attributes()` for serialization.
-
-The runtime implements `execute(node, inputs, context)` and returns
-a `NodeResult`. Its output dictionary must match the node's declared
-ports. Register the node and runtime together:
+The runtime implements `execute(node, inputs, context)` and returns a
+`NodeResult` with the declared output ports. Register the node and runtime
+on an [extension registry](/docs/extending):
 
 ```python
 registry.register_node(MyNode, runtime=MyRuntime())
 ```
 
-See the [extension overview](/docs/extending) for creating a registry
-and passing it to a session.
+`register_node()` supplies a `NodeCodec` by default. A custom codec may
+be provided for another encoding. The
+[`FirstDocuments` example](https://github.com/fsdatalab/quail/blob/main/tests/test_physical.py)
+includes a node, runtime, planner, and registration that run without a GPU.
 
-`register_node` supplies a `NodeCodec` by default. Supply a custom codec
-when the node needs a different encoding. The
-[`FirstDocuments` example in `tests/test_physical.py`](https://github.com/fsdatalab/quail/blob/main/tests/test_physical.py)
-shows a complete node, runtime, planner, and registration that run
-without a GPU.
+## Planning
 
-## Plan and estimate the operation
+A physical planner produces `PhysicalCandidate` values containing a
+graph, a plan, and an estimated execution time. The candidate with the
+lowest estimate is selected. Unsupported configurations must be rejected
+during planning.
 
-The backend planner or an extension planner constructs physical
-candidates from the logical request. A `PhysicalCandidate` contains
-a graph, a plan, and its estimated execution time. Quail selects the
-candidate with the lowest estimate.
-
-Keep prompt preparation and graph construction in the planner.
-Keep calculations of tokens, attention work, and execution time in
-`quail.cost`. For classification, those responsibilities are in
+Tokenized prompt preparation and physical graph construction belong
+in `quail.planner`.
+Work counts and execution time estimates belong in `quail.cost`.
+Classification uses
 [`planner/classify.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/classify.py)
 and [`cost/classify.py`](https://github.com/fsdatalab/quail/blob/main/quail/cost/classify.py).
 
-Reject an unsupported configuration during planning. Pair
-classification is one example. The Quail backend rejects a plan
-when the pair classifier cannot run in its AI join pipeline.
+## Pipelines
 
-## Add pipeline support when needed
+An operator runtime can execute independently or participate in a
+pipeline. Pipeline support defines which adjacent operators can execute
+together and which document state they can reuse.
 
-A runtime that executes a node independently is the starting point.
-If the operation should also execute with adjacent operators, define
-when they can share a pipeline and which input state is reusable.
-
-The current pipeline builder is
-[`execution/pipelines.py`](https://github.com/fsdatalab/quail/blob/main/quail/execution/pipelines.py).
-Model pipeline execution is in
-[`executor/pipeline.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/pipeline.py),
-and operator implementations are in `executor/operators/`.
-Classification decoder rounds remain inside the classification
-executor. The physical graph still contains one node per classification.
+[`execution/pipelines.py`](https://github.com/fsdatalab/quail/blob/main/quail/execution/pipelines.py)
+groups physical nodes.
+[`executor/pipeline.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/pipeline.py)
+executes the groups using `executor/operators/`.
+Internal decoder rounds remain within one physical node.
 
 ## Optimizer rules
 
@@ -110,5 +83,6 @@ duplicating its changes.
 The rule protocols are in
 [`logical_optimizer.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/logical_optimizer.py)
 and [`physical_optimizer.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/physical_optimizer.py).
-See [classification](/docs/architecture/classification) for the existing
-operator's plan and execution structure.
+See [physical plans](/docs/architecture/physical-plans#classification-nodes)
+and [execution](/docs/architecture/execution#classification-execution)
+for the existing classification implementation.

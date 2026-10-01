@@ -56,6 +56,24 @@ All node types are defined in
 | `AiScore` | Produces numeric scores according to a `ScoreSpec`. |
 | `AiClassify` | Produces labels according to a `ClassifySpec`. |
 
+### Classification nodes
+
+Classification and label predicates use separate physical nodes:
+
+```text
+Scan(reviews)
+  -> AiClassify(sentiment)
+  -> Filter(sentiment IN ['negative'])
+  -> Project(r.id, sentiment)
+```
+
+`ClassifySpec` holds the chosen scoring rule, tokenized prompt parts,
+and labels for one `AiClassify`. Each later classification is another
+graph node. `Filter` tests a label already computed by its input.
+
+Numeric scores use `AiScore` with a `ScoreSpec`. Score and label columns
+are retained through later operators for projection.
+
 ### Node ids
 
 Node ids are readable names like `ai_filter:r`, `ai_join:r`,

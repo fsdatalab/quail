@@ -54,8 +54,15 @@ the written order.
 
 `ai_classify(prompt, labels, *, name, descriptions=None)`
 
-Compute a string label and give its output column a name. Return that
-column with `select()`, or filter on it with `label_in()`:
+Adds a classification column. The column can be returned with `select()`
+and tested with `label_in()`.
+
+| Parameter | Description |
+| --- | --- |
+| `prompt` | A prompt bound to document columns. |
+| `labels` | Label strings, `(label, description)` pairs, or a registered label table name. |
+| `name` | Output column name. |
+| `descriptions` | Optional descriptions corresponding to label strings. |
 
 ```python
 query = (
@@ -70,34 +77,21 @@ query = (
 result = query.collect()
 ```
 
-`labels` accepts a sequence of strings, `(label, description)` pairs,
-or the name of a registered label table. For a sequence of strings,
-you may supply a matching sequence of `descriptions`. Give descriptions
-in the pairs or the separate argument, not both. A label table requires
-`label` and may also contain `description` and `ordinal` columns.
-
-Supply 2 to 255 nonempty labels, distinct ignoring case. Each description
-may contain at most 25 words. The scoring method depends on the model
-and plan. Ties select the earlier label. A greedy decode that does not
-finish at an allowed label omits that document from the result.
-
-See the [SQL reference](/docs/user-guide/sql#aiclassify) for category
-forms and joined classification limits, and
-[classification execution](/docs/architecture/classification) for
-scoring methods.
+Descriptions must be provided in the label pairs or the `descriptions`
+argument, not both. Category validation, label table ordering, and model
+restrictions are described in the
+[SQL reference](/docs/user-guide/sql#aiclassify).
 
 ### label_in
 
 `label_in(name, labels, selectivity=None)`
 
-Keep documents whose named classification matches an accepted label.
-Call `ai_classify()` with that name first. The filter uses the computed
-label without classifying the document again. You may omit the label
-column from `select()` if you only want matching document columns.
+Filters documents by a previously named classification. `name` must
+refer to an earlier `ai_classify()` call. The label is computed once,
+even when it is both filtered and projected.
 
-`selectivity` estimates the fraction of documents that pass; the default
-estimate is 0.2. The estimate changes planning, not which labels match.
-Filtering a two-document classification with `label_in()` is unsupported.
+`selectivity` estimates the fraction of documents that pass. The default
+estimate is `0.2`. Pair classification predicates are unsupported.
 
 ### ai_join
 
