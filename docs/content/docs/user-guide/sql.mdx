@@ -269,135 +269,137 @@ labeled examples for your task.
 
 ### AI.CLASSIFY
 
+Assigns each document one of the categories you provide. For example,
+classify reviews as positive, negative, or mixed.
+
+```sql
+SELECT r.id,
+       AI.CLASSIFY(r.body, ARRAY['positive', 'negative', 'mixed']) AS sentiment
+FROM reviews r;
+```
+
+#### Syntax
+
 `AI.CLASSIFY(input, categories[, options])`
 
-Returns one of the supplied labels as a `STRING`. Use it in `SELECT`
-to return labels, or with `=` and `IN` in `WHERE` to filter rows.
-When the same `AI.CLASSIFY` call appears in `SELECT` and `WHERE`,
-Quail evaluates it once per document. Classification requires a
-generative model.
+#### Arguments
 
-#### Parameters
+| Argument | Type | Description |
+| --- | --- | --- |
+| `input` | `STRING` column or `PROMPT` | Document to classify. Use `PROMPT` to include a question or refer to two documents. |
+| `categories` | `ARRAY` or table name | Between 2 and 255 labels, optionally with descriptions. Labels must be nonempty and unique ignoring case. |
+| `options` | Object | Optional settings, such as `{'probabilities': true}`. |
 
-| Parameter | Description |
-| --- | --- |
-| `input` | A document column or `PROMPT`. Use a two-document prompt to classify pairs. |
-| `categories` | A list or registered table of 2 to 255 nonempty labels. Labels must be unique ignoring case. |
-| `options` | Optional task description, selectivity estimate, and label probabilities. |
-
-Categories can be supplied as:
+Supply `categories` in any of these forms:
 
 - Strings: `ARRAY['refund', 'praise']`.
 - Label and description pairs: `ARRAY[('refund', 'asks for money back'), ('praise', NULL)]`.
 - Objects: `ARRAY[{'label': 'refund', 'description': 'asks for money back'}, {'label': 'praise'}]`.
-- A registered label table: `kinds`.
+- A registered table name: `kinds`. The table needs a `label` column and
+  may have `description` and integer `ordinal` columns. Labels are sorted
+  by `ordinal` when present, otherwise by label text.
 
-Each description may contain up to 25 words. A label table needs a
-`label` column. Optional columns are `description` and an integer
-`ordinal`. Quail sorts labels by `ordinal` if present, otherwise by
-label text. You can also name the category argument:
+Descriptions explain what a category means and may contain up to 25
+words each. You can also name the argument:
 `categories => ARRAY['refund', 'praise']`.
 
-#### Options
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `task_description` | `STRING` | Empty | Extra instructions, up to 50 words. |
+| `selectivity` | `FLOAT` | `0.2` | Estimated fraction of rows kept by a `WHERE` condition on the classification result. |
+| `probabilities` | `BOOLEAN` | `false` | Also returns the probability of each category. |
 
-| Option | Default | Description |
-| --- | --- | --- |
-| `task_description` | Empty | Extra instructions added after the question, up to 50 words. |
-| `selectivity` | `0.2` | Estimated fraction of rows kept by a `WHERE` condition on the classification result. |
-| `probabilities` | `false` | Adds `<name>_probabilities`, a `MAP<STRING, DOUBLE>` from each label to its probability. |
+#### Output
 
-When label scores tie, Quail chooses the label listed first. See
+Returns a `STRING` containing one of the supplied labels. Use `AS` to
+name the result column. With `probabilities` set to `true`, Quail also
+returns `<name>_probabilities`, a `MAP<STRING, DOUBLE>`. Its values sum
+to 1 across the supplied labels.
+
+Classification requires a generative model. With vLLM or SGLang, a
+row is omitted if the generated answer matches no supplied label.
+When scores tie, Quail chooses the label listed first. See
 [scoring methods](/docs/architecture/planning#choosing-classification-scoring).
-
-The vLLM and SGLang backends generate label text. If Quail cannot
-match the answer to a supplied label, it leaves that row out of the
-result. For example, "other" matches neither "refund" nor "praise".
 
 #### Examples
 
-Return each review's sentiment. Use `AS` to name the label column.
-The `AI.CLASSIFY` call must be a separate item in `SELECT`. It cannot
-be nested inside another expression.
+##### Classify reviews
+
+Ask for each review's sentiment and return the label alongside its text:
 
 ```sql
-SELECT r.id,
+SELECT r.id, r.body,
        AI.CLASSIFY(
            PROMPT('What sentiment does this review express? {0}', r.body),
-           ARRAY['positive', 'negative', 'neutral', 'mixed']) AS sentiment
+           ARRAY['positive', 'negative', 'mixed']) AS sentiment
 FROM reviews r;
 ```
 
-Return sentiment labels and keep negative or mixed reviews. Use `=`
-or `IN` in `WHERE` to keep rows with the labels you want. A label
-outside the supplied list matches no rows. Other comparisons raise
-`CompileError`.
+Example output:
+
+```text
+id  body                                     sentiment
+1   The food was delicious.                   positive
+2   My order arrived cold.                    negative
+3   Great food, but the delivery was late.    mixed
+```
+
+##### Keep selected categories
+
+Use `IN` in `WHERE` to keep negative or mixed reviews:
 
 ```sql
 SELECT r.id,
        AI.CLASSIFY(PROMPT('What sentiment does this review express? {0}', r.body),
-                   ARRAY['positive', 'negative', 'neutral', 'mixed']) AS sentiment
+                   ARRAY['positive', 'negative', 'mixed']) AS sentiment
 FROM reviews r
 WHERE AI.CLASSIFY(PROMPT('What sentiment does this review express? {0}', r.body),
-                  ARRAY['positive', 'negative', 'neutral', 'mixed'])
+                  ARRAY['positive', 'negative', 'mixed'])
       IN ('negative', 'mixed');
 ```
 
-Classify a document column with a task description:
+Example output for the same reviews:
+
+```text
+id  sentiment
+2   negative
+3   mixed
+```
+
+You can also use `=` to keep one category. Other comparisons raise
+`CompileError`. A category outside the supplied list matches no rows.
+Quail uses each review's classification both to decide whether to keep
+the row and to fill the `sentiment` column.
+In `SELECT`, the call must be a separate item, rather than part of
+another expression.
+
+##### Return probabilities
+
+Set `probabilities` to `true` to include a probability for every category:
 
 ```sql
 SELECT r.id,
-       AI.CLASSIFY(r.body, ARRAY['refund', 'praise'],
-                   {'task_description': 'Classify the customer request.'}) AS kind
+       AI.CLASSIFY(PROMPT('What sentiment does this review express? {0}', r.body),
+                   ARRAY['positive', 'negative', 'mixed'],
+                   {'probabilities': true}) AS sentiment
 FROM reviews r;
 ```
 
-Set `probabilities` to `true` to return a probability for every label.
-The example adds `topic_probabilities` beside `topic`, such as
-`{'refund': 0.91, 'shipping': 0.07, 'praise': 0.02}`. The probabilities
-sum to 1 across the supplied labels. Returning probabilities does not
-require another model forward pass.
+One example output row:
 
-Probabilities are unsupported for document pairs and on the vLLM and
-SGLang backends.
-
-```sql
-SELECT r.id,
-       AI.CLASSIFY(PROMPT('What is the request about? {0}', r.body),
-                   ARRAY['refund', 'shipping', 'praise'],
-                   {'probabilities': true}) AS topic
-FROM reviews r;
+```text
+id  sentiment  sentiment_probabilities
+1   positive   {'positive': 0.90, 'negative': 0.03, 'mixed': 0.07}
 ```
 
-Return a numeric score and a label:
+Probabilities are supported for individual documents with the Quail
+backend. They are unsupported for document pairs, vLLM, and SGLang.
 
-```sql
-SELECT r.id,
-       AI.SCORE(PROMPT('Does the customer request a refund? {0}', r.body)) AS refund_score,
-       AI.CLASSIFY(PROMPT('What is the request about? {0}', r.body),
-                   ARRAY['refund', 'shipping', 'praise']) AS topic
-FROM reviews r;
-```
-
-Classify each review's sentiment about a matched aspect. Each prompt
-uses one column from each table. Refer to the documents as
-`DOCUMENT {0}` and `DOCUMENT {1}`.
-
-```sql
-SELECT r.id, a.id,
-       AI.CLASSIFY(
-           PROMPT('What sentiment does DOCUMENT {0} express about DOCUMENT {1}?',
-                  r.body, a.aspect),
-           ARRAY['positive', 'negative', 'neutral', 'mixed']) AS aspect_sentiment
-FROM reviews r
-JOIN aspects a
-  ON AI.IF(PROMPT('Does DOCUMENT {0} discuss DOCUMENT {1}?', r.body, a.aspect));
-```
-
-With the Quail backend, pair classification must run on one GPU in the
-same pipeline as its AI join. You cannot filter pair labels in `WHERE`
-or combine pair classification with `AI.SCORE`. Pair classifiers that
-run in separate pipelines are unsupported. See
-[joined classification execution](/docs/architecture/execution#classifying-joined-rows).
+For joined documents, use a prompt referring to both documents. With
+the Quail backend, classification must run with its AI join on one GPU.
+You cannot use the pair's classification result in `WHERE` or combine
+pair classification with `AI.SCORE`. See
+[classifying joined rows](/docs/architecture/execution#classifying-joined-rows).
 
 ### AI.EXTRACT
 

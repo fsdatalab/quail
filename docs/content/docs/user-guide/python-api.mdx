@@ -57,14 +57,14 @@ the written order.
 Assigns a label to each document. Use `select()` to return the label
 column. Use `label_in()` to keep documents with particular labels.
 
-| Parameter | Description |
-| --- | --- |
-| `prompt` | The question and the document columns it refers to. |
-| `labels` | Label strings, `(label, description)` pairs, or a registered label table name. |
-| `name` | Output column name. |
-| `descriptions` | Optional descriptions, one per label in the same order. |
-| `task_description` | Extra instructions added after the question, up to 50 words. |
-| `probabilities` | `True` also returns `<name>_probabilities`, a map from each label to its probability. |
+| Parameter | Type | Description |
+| --- | --- | --- |
+| `prompt` | `Prompt` | Question and document columns, built with `prompt()`. |
+| `labels` | `Iterable[str]`, `Iterable[tuple[str, str \| None]]`, or `str` | Labels, label and description pairs, or a registered label table name. |
+| `name` | `str` | Name of the result column. |
+| `descriptions` | `Iterable[str \| None]` or `None` | Optional description for each label, in the same order. |
+| `task_description` | `str` | Extra instructions, up to 50 words. Defaults to `""`. |
+| `probabilities` | `bool` | Also returns `<name>_probabilities`, a map from each label to its probability. Defaults to `False`. |
 
 ```python
 query = (
