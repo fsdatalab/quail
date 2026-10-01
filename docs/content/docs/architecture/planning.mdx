@@ -87,6 +87,18 @@ a forced `trie_decode`. The `letters` rule computes a softmax over the
 category code scores. The `trie_tree` rule sums each label's token log
 probabilities, exponentiates the sums, and normalizes across labels.
 
+For DiffusionGemma, Quail reads category logits from the first row of
+an answer canvas. The canvas starts with a random token seeded by the
+document row index and draw number. Quail measures uncertainty using
+the entropy of the category probabilities.
+
+If entropy exceeds 0.1 nats, Quail runs the remaining draws and chooses
+the category with the highest mean probability. With `probabilities=true`,
+the output includes the probabilities used to choose the label, averaged
+over the draws performed. One-document `AI.SCORE` averages TRUE
+probabilities. See [DiffusionGemma settings](/docs/user-guide/models#diffusiongemma)
+for the draw count.
+
 The `label_scoring` setting forces a rule:
 
 ```python

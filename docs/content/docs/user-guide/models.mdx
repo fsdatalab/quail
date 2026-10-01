@@ -21,7 +21,8 @@ attention on H100.
 
 ### DiffusionGemma
 
-DiffusionGemma supports filter and join predicates and `AI.SCORE`. Quail uses the
+DiffusionGemma supports filter and join predicates, `AI.SCORE`, and
+`AI.CLASSIFY`. Quail uses the
 `RedHatAI/diffusiongemma-26B-A4B-it-FP8-dynamic` checkpoint and reads
 one TRUE or FALSE answer without generating a thinking response.
 
@@ -43,6 +44,12 @@ config = quail.EngineConfig(
     device="h100-sxm",
 )
 ```
+
+For one-document classification and `AI.SCORE`, `canvas_draws` allows
+up to four draws by default. Set `canvas_draws=1` in `EngineConfig`
+for one draw per document. Joined classification uses one draw.
+See [classification scoring](/docs/architecture/planning#choosing-classification-scoring)
+for how Quail chooses a label across draws.
 
 [diffusion-report]: https://github.com/fsdatalab/quail/blob/3e09be9564e60183a0018b3908b05cd77cbd0d77/reports/2026-09-19-diffusion-gemma-quailb.md
 [qwen-report]: https://github.com/fsdatalab/quail/blob/bbf18747238f504866e1ca7518d23d375f97f920/reports/quailb-comparison.md

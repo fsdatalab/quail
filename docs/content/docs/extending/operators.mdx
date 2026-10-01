@@ -2,87 +2,87 @@
 title: Custom operators
 ---
 
-Quail supports `AI.IF` (Snowflake: `AI_FILTER`), which returns
-TRUE or FALSE, `AI.SCORE`, which returns a numeric score, and
-`AI.CLASSIFY`, which returns a label. Adding a new operator requires
-changes at three levels: a logical representation, a physical node,
-and planning logic.
+Adding a new operator requires a physical node, a runtime, and planning
+logic. If it introduces a new operation in SQL or the Python builder,
+it also needs a logical representation.
 
-We use `AI.CLASSIFY` as a running example. `AI.CLASSIFY` categorizes
-each document into one of N labels instead of returning TRUE/FALSE.
-The planner chooses among letter scoring, tree scoring, and greedy
-decoding. See [classification scoring](/docs/architecture/planning#choosing-classification-scoring).
+The example below defines `FirstDocuments`, a custom operator that
+keeps the first N document IDs. The
+[complete example](https://github.com/fsdatalab/quail/blob/main/tests/test_physical.py)
+includes a planner, registration, serialization, and execution without a GPU.
 
 ## Logical node
 
 A logical node defines what the operator means in the query plan.
-Classification uses a `ModelCall` expression within existing nodes.
-For a bound `prompt`, the call holds the allowed labels:
-
-```python
-from quail.logical import ModelCall
-
-call = ModelCall(prompt, kind="label", labels=("refund", "praise"))
-```
-
-An `Alias` in `Project` names the output column. `LabelIn` in a
-`SemanticFilter` tests the label against an accepted list. SQL and
-Python syntax produce the same logical expressions.
-
 For a new logical node, implement the inputs, expressions, output schema,
 validation, and immutable rewrite methods described in the
 [node protocol](/docs/architecture/logical-plans#the-node-protocol).
+SQL and Python syntax should produce the same logical representation.
 
 See
 [`SemanticFilter`](https://github.com/fsdatalab/quail/blob/main/quail/logical/nodes.py)
-for how the existing filter node is built.
+for how an existing logical node is built.
 
 ## Physical node
 
-A physical node specifies how the operator runs. `AiClassify` holds a
-`ClassifySpec` with the tokenized prompt, labels, and scoring rule.
-Given a `spec` built by the planner:
+A physical node declares its input and output ports, execution location,
+and serialization methods. `FirstDocuments` runs on the CPU and returns
+an `ids:<alias>` output. Its runtime reads document IDs from the input
+and keeps the first `count` IDs:
 
 ```python
-from quail.physical import AiClassify
+from dataclasses import dataclass
+from typing import ClassVar
 
-node = AiClassify(
-    node_id="classify:topic", backend_name="quail",
-    model="qwen3-4b-fp8", spec=spec)
+from quail.execution.runner import NodeResult
+from quail.physical import (
+    ExecutionLocation, OutputPort, PhysicalNode, ValueType,
+)
+
+@dataclass(frozen=True)
+class FirstDocuments(PhysicalNode):
+    alias: str = ""
+    count: int = 1
+
+    type_name: ClassVar[str] = "example.first_documents"
+    runtime_key: ClassVar[str] = type_name
+    location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
+
+    @property
+    def outputs(self):
+        return (OutputPort(f"ids:{self.alias}", ValueType.DOCUMENT_IDS,
+                           schema=(self.alias,)),)
+
+    def attributes(self):
+        return {"alias": self.alias, "count": self.count}
+
+    @classmethod
+    def from_attributes(cls, node_id, inputs, attributes):
+        return cls(node_id=node_id, inputs=inputs, alias=attributes["alias"],
+                   count=int(attributes["count"]))
+
+
+class FirstDocumentsRuntime:
+    def execute(self, node, inputs, context):
+        documents = next(iter(inputs.values()))
+        return NodeResult({f"ids:{node.alias}": documents[:node.count]})
 ```
 
-`AiClassify` uses the `AiScore` runtime. A later `Filter` tests its
-labels. See [classification nodes](/docs/architecture/physical-plans#classification-nodes)
-for the physical graph.
-
-Each physical node also needs:
-
-- A **codec** to serialize the node across the process boundary.
-  `register_node()` supplies a `NodeCodec` by default.
-- A **runtime** that implements `execute(node, inputs, context)` and
-  returns the Arrow output tables.
-
-See
-[`AiFilter`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py)
-for how the existing filter physical node is built, and
-[`tests/test_physical.py`](https://github.com/fsdatalab/quail/blob/main/tests/test_physical.py)
-for a complete working example of a custom node with its codec,
-runtime, and planner.
+`attributes()` and `from_attributes()` serialize and restore the node's
+fields. `register_node()` supplies a `NodeCodec` by default. The runtime
+implements `execute(node, inputs, context)` and returns a `NodeResult`
+with the node's declared outputs.
 
 ## Planning
 
-Adding a new operator to the planner means teaching the existing
-Quail backend how to plan and cost the new node. Concretely:
+A planner constructs the physical graph and estimates its execution
+time. For an LLM operator:
 
 1. **Work counting.** Add a function that counts fresh tokens,
    attention pairs, KV written, and KV read for the new operator.
    Pass `window=model.sliding_window` to `scan`, `ask`, or `stream`
    so you also count pairs and KV reads for sliding-window layers.
-   Classification counts depend on the chosen scoring rule. Letter
-   scoring reads category codes, tree scoring compares complete label
-   sequences, and greedy decoding adds one token at a time. See
-   [`quail/cost/classify.py`](https://github.com/fsdatalab/quail/blob/main/quail/cost/classify.py)
-   for classification work counts and
+   See
    [`quail/cost/work.py`](https://github.com/fsdatalab/quail/blob/main/quail/cost/work.py).
 2. **Cost estimation.** Pass the work counts through the
    [roofline model](/docs/architecture/planning#the-roofline-speed-of-light-model)
@@ -94,9 +94,7 @@ Quail backend how to plan and cost the new node. Concretely:
    constructs the full physical graph (scans, filters, joins,
    barriers, projection) and returns a `PhysicalCandidate` with the
    graph and estimated time. The new node would be placed in the
-   graph alongside the existing node types. Classification prompt
-   preparation and graph construction are in
-   [`quail/planner/classify.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/classify.py).
+   graph alongside the existing node types.
 
 ## Pipelines
 
@@ -108,7 +106,6 @@ and which document state they can reuse.
 groups physical nodes.
 [`executor/pipeline.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/pipeline.py)
 executes the groups using `executor/operators/`.
-For classification, decoder rounds run inside one physical node.
 
 ## Optional: logical and physical rules
 
@@ -146,15 +143,13 @@ for the rule protocols.
 
 ## Registration
 
-Register your node, runtime, planner, and rules on the session's
-`ExtensionRegistry`:
+Register the node and runtime on the session's `ExtensionRegistry`:
 
 ```python
 registry = quail.ExtensionRegistry.with_built_ins()
-registry.register_node(MyNode, runtime=MyRuntime())
-registry.register_physical_planner(MyPlanner())
-registry.register_logical_rule(MyLogicalRule())
+registry.register_node(FirstDocuments, runtime=FirstDocumentsRuntime())
 ```
 
-See the [Overview](/docs/extending) for how to create and pass a
-registry.
+Register a planner with `register_physical_planner()` and optional rules
+with `register_logical_rule()` or `register_physical_rule()`. See the
+[Overview](/docs/extending) for how to create and pass a registry.

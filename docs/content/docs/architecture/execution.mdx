@@ -23,15 +23,6 @@ Relational nodes such as `Filter`, `Recombine`, `Project`, and `Limit`
 run on the CPU using Arrow. LLM nodes include `AiFilter`, `AiJoin`,
 `AiScore`, and `AiClassify`.
 
-On one GPU, compatible operators can run in a pipeline. A document
-can reach the next operator before the previous operator finishes all
-documents, and the next operator can reuse its document KV.
-
-The pipeline builder groups nodes along their document dependencies.
-An operator that needs all input rows, or a branch with independent
-consumers, can end the pipeline. Each operator keeps its own physical
-node and metrics.
-
 ## Operator execution
 
 ### Filter execution
@@ -99,46 +90,17 @@ sharing one anchor's KV.
 
 ### Classification execution
 
-`AiClassify` produces a string label column. A following `Filter` tests
-the computed labels. Compatible operators can run in one pipeline and
-reuse document KV. Numeric scores use separate `AiScore` nodes.
-A query can return both score and label columns.
-
-Letter and tree scoring each use one internal stage. Greedy decoding
-chooses one token at a time from the supplied label sequences until
-it reaches a complete label. All decoder stages belong to one
-`AiClassify` node.
-
-The scheduler batches ready requests within the token and KV page
-budgets. A stage may need several forward passes to process its input.
-See the scoring rules in
-[planning](/docs/architecture/planning#choosing-classification-scoring).
-
-#### Diffusion draws
-
-DiffusionGemma reads category logits from the first row of an answer
-canvas. The canvas starts with a random token seeded by document row
-index and draw number.
-
-The executor measures uncertainty using the entropy of the category
-probabilities. If entropy exceeds 0.1 nats, it runs additional draws
-and selects the category with the highest mean probability.
-`EngineConfig(canvas_draws=4)` allows up to four draws by default.
-Set `canvas_draws=1` for one draw per document. With
-`probabilities=true`, the result includes the category probabilities
-used to choose the label, averaged over the draws performed.
-
-The setting also applies to one-document `AI.SCORE`, which averages
-TRUE probabilities. Joined classification uses one draw.
+Classification uses the same token and KV page budgets as filters and
+joins. Compatible operators run in one pipeline and reuse document KV.
+Letter and tree scoring use one stage. Greedy decoding chooses one token
+at a time until it reaches a supplied label, with all rounds inside one
+`AiClassify` node. See [scoring methods](/docs/architecture/planning#choosing-classification-scoring).
 
 #### Classifying joined rows
 
-A pair classifier uses the matches from its corresponding join stage.
-The executor retains the anchor's document KV and appends the matched
-partner document and classification question for each pair.
-
-The classifier and AI join must share a pipeline on one GPU. The
-planner refuses pair classification that would execute independently.
+For each match from the corresponding join, the classifier reuses the
+anchor's document KV and appends the partner document and question.
+The classifier runs in the same pipeline as the join.
 
 ## Model forward pass
 
@@ -207,8 +169,6 @@ The loaded model retains its output head for classification. Boolean
 readout projects the TRUE and FALSE rows. Letter classification projects
 the candidate code rows. Multi-token label scoring also needs the
 full-vocabulary normalization used to compute token log probabilities.
-`readout.py` owns those conversions from hidden states to answers,
-numeric scores, and label scores.
 
 Quail uses [FlashAttention 3](https://arxiv.org/abs/2407.08608) on
 H100 and FlashAttention 2 on Blackwell GPUs.
@@ -242,13 +202,9 @@ Use these files to change how Quail runs your query.
 | How Quail allocates, keeps, and frees KV pages | [`arena.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/arena.py) |
 | GPU kernels and attention calculations | [`attention.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/attention.py) |
 | The Qwen3 forward pass | [`models/qwen3.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/models/qwen3.py) |
-| How ready stages are scheduled and GPU chunks run | [`stages.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/stages.py) |
-| How admitted requests become GPU input buffers | [`chunk.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/chunk.py) |
-| How physical operators execute together | [`pipeline.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/pipeline.py) and [`operators/`](https://github.com/fsdatalab/quail/tree/main/quail/backends/quail/executor/operators) |
+| How filter, join, and classification batches run | [`stages.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/stages.py) |
 | How classification scoring and decoder rounds become stages | [`classify.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/classify.py) |
 | How model outputs become Boolean answers, numeric scores, or label scores | [`readout.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/readout.py) |
-| Which resources live with a loaded model or one query | [`state.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/state.py) |
-| Which kernel shapes are compiled during startup | [`warmup.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/warmup.py) |
 | How Quail loads model weights through vLLM | [`model.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/model.py) |
 
 If you add a model architecture, put its forward pass in `models/`.
@@ -264,17 +220,6 @@ Keep KV allocation and cleanup in the stage scheduler and arena. Your model's
 forward pass should only compute the requested hidden states. Use
 `chunk.attention_mode` for the attention path chosen when the chunk
 was packed.
-
-## State lifetimes
-
-`LoadedModelState` owns the model, KV arena, model pipeline, and reusable
-input and label readout buffers. It remains available while the model
-is loaded.
-
-`QueryExecutionState` holds one query's answer and score readouts,
-chunk budget, and timing settings. The executor creates a new query
-state for each query and reuses the loaded model resources. Operators
-receive both states as arguments.
 
 ## Lifetime and limits
 
