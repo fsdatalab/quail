@@ -259,13 +259,16 @@ labeled examples for your task.
 
 Returns a category label as a `STRING`. Classification can be projected
 in `SELECT` or tested with `=` and `IN` in `WHERE`. Identical calls in
-the projection and predicate share one computation.
+the projection and predicate share one computation. Classification
+requires a generative model.
 
 #### Parameters
 
-`input` is a document column or a `PROMPT`. A prompt over two tables
-classifies a document pair. `categories` must contain 2 to 255 nonempty
-labels, distinct ignoring case.
+| Parameter | Description |
+| --- | --- |
+| `input` | A document column or `PROMPT`. A prompt over two tables classifies a document pair. |
+| `categories` | A list of 2 to 255 nonempty labels, distinct ignoring case, or a registered label table. |
+| `options` | Optional task description, selectivity estimate, and output mode. |
 
 Categories can be supplied as:
 
@@ -282,17 +285,21 @@ label text. The category argument also accepts the named form
 
 #### Options
 
-The optional third argument accepts:
+| Option | Default | Description |
+| --- | --- | --- |
+| `task_description` | Empty | Task text appended to the question, at most 50 words. |
+| `selectivity` | `0.2` | Estimated fraction of documents passing a label predicate. |
+| `output_mode` | `'single'` | Only `'single'` is supported. |
 
-- `task_description`: task text appended to the question, at most 50
-  words. The default is empty.
-- `selectivity`: estimated fraction of documents passing a label
-  predicate. The default is `0.2`.
-- `output_mode`: only `'single'` is supported and is the default.
+Ties select the earlier category. Greedy decoding can omit a document
+if it does not produce an allowed label. Scoring methods are described
+in [planning](/docs/architecture/planning#choosing-classification-scoring).
 
 #### Examples
 
-Return one sentiment label per review:
+Return one sentiment label per review. Projected classifications require
+`AS` and must be complete items in the `SELECT` list. Other expressions
+around a classification are unsupported.
 
 ```sql
 SELECT r.id,
@@ -302,7 +309,9 @@ SELECT r.id,
 FROM reviews r;
 ```
 
-Return labels and filter by the same classification:
+Return labels and filter by the same classification. Label predicates
+support `=` and `IN`. A label outside the category list matches no rows.
+Other comparisons raise `CompileError`.
 
 ```sql
 SELECT r.id,
@@ -333,7 +342,9 @@ SELECT r.id,
 FROM reviews r;
 ```
 
-Classify pairs returned by an AI join:
+Classify pairs returned by an AI join. Each prompt reads one column
+from each table and refers to the documents as `DOCUMENT {0}` and
+`DOCUMENT {1}`.
 
 ```sql
 SELECT r.id, a.id,
@@ -346,24 +357,11 @@ JOIN aspects a
   ON AI.IF(PROMPT('Does DOCUMENT {0} discuss DOCUMENT {1}?', r.body, a.aspect));
 ```
 
-#### Limitations
-
-- Projected classifications require `AS` and must be complete items in
-  the `SELECT` list. Other expressions around a classification are unsupported.
-- Label predicates support `=` and `IN`. A label outside the category
-  list matches no rows. Other comparisons raise `CompileError`.
-- Reranker models cannot run classification.
-- In the Quail backend, pair classification requires one GPU and a
-  pipeline shared with its AI join. Multiple independent pair classification
-  outputs, pair label predicates, and pair classification with `AI.SCORE`
-  are unsupported.
-- Pair prompts must read one column from each table. Refer to the
-  documents as `DOCUMENT {0}` and `DOCUMENT {1}`.
-
-Ties select the earlier category. Greedy decoding can omit a document
-if it does not produce an allowed label. See
-[classification scoring](/docs/architecture/planning#choosing-classification-scoring)
-and [execution](/docs/architecture/execution#classification-execution).
+In the Quail backend, pair classification requires one GPU and a
+pipeline shared with its AI join. Multiple independent pair classification
+outputs, pair label predicates, and pair classification combined with
+`AI.SCORE` are unsupported. See
+[joined classification execution](/docs/architecture/execution#classifying-joined-rows).
 
 ### AI.EXTRACT
 
