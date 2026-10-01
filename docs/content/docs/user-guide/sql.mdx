@@ -303,7 +303,7 @@ label text. You can also name the category argument:
 | Option | Default | Description |
 | --- | --- | --- |
 | `task_description` | Empty | Extra instructions added after the question, up to 50 words. |
-| `selectivity` | `0.2` | Estimated fraction of rows kept by a label filter. |
+| `selectivity` | `0.2` | Estimated fraction of rows kept by a `WHERE` condition on the classification result. |
 | `probabilities` | `false` | Adds `<name>_probabilities`, a `MAP<STRING, DOUBLE>` from each label to its probability. |
 
 When label scores tie, Quail chooses the label listed first. See
@@ -327,9 +327,10 @@ SELECT r.id,
 FROM reviews r;
 ```
 
-Return sentiment labels and keep negative or mixed reviews. Label
-filters support `=` and `IN`. A label outside the supplied list matches
-no rows. Other comparisons raise `CompileError`.
+Return sentiment labels and keep negative or mixed reviews. Use `=`
+or `IN` in `WHERE` to keep rows with the labels you want. A label
+outside the supplied list matches no rows. Other comparisons raise
+`CompileError`.
 
 ```sql
 SELECT r.id,

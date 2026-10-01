@@ -52,8 +52,9 @@ the nodes shown in `explain()` output.
 
 With the vLLM and SGLang backends, `evaluated_documents` can exceed
 `output_rows` if a generated answer matches no supplied label.
-Label filters have their own `Filter` node metrics. Operators may also
-report extra fields such as packing time (`pack_s`).
+When a condition such as `sentiment IN ('negative', 'mixed')` removes
+rows, its metrics appear under a separate `Filter` node. Operators may
+also report extra fields such as packing time (`pack_s`).
 
 ## Boot details
 
