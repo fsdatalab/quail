@@ -29,12 +29,13 @@ def suffix_lengths(scoring: str, labels, canvas_rows: int = 0,
     Every suffix starts with the answer cue's last token. Under
     ``letters`` the one suffix is the cue alone, whose row scores every
     letter, followed on a canvas model by the ``canvas_rows`` rows of
-    the seeded canvas whose first row is read. Under ``trie_tree`` the
-    one suffix holds every trie node once; every row is read. Under
-    ``trie_decode`` a document sends one chain per round, the cue and
-    the tokens decoded so far, for as many rounds as the mean label
-    length rounded up, and reads each chain's last row; how many
-    rounds it needs is decided as it runs.
+    the seeded canvas whose first row is read; on a canvas model a
+    document may send one such suffix per noise draw, and every draw
+    is priced. Under ``trie_tree`` the one suffix holds every trie node
+    once; every row is read. Under ``trie_decode`` a document sends one
+    chain per round, the cue and the tokens decoded so far, for as many
+    rounds as the mean label length rounded up, and reads each chain's
+    last row; how many rounds it needs is decided as it runs.
 
     Raises:
         ValueError: The rule is not one of LABEL_SCORINGS.

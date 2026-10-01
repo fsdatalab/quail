@@ -212,7 +212,7 @@ def test_pack_chunk_builds_both_pools_and_reads_borrowed_pages(monkeypatch):
     for temp in chunk.temporary_keys:
         arena.free_key(temp)
     # each suffix may carry its own canvas
-    chunk = loop.pack_chunk(
+    chunk = chunk_mod.pack_chunk(
         torch, arena, [dict(key=key, prefix=None, f=100,
                             suffixes=[[600], [601, 602]],
                             canvas=[[900, 901], [910, 911]])],
@@ -224,7 +224,7 @@ def test_pack_chunk_builds_both_pools_and_reads_borrowed_pages(monkeypatch):
     for temp in chunk.temporary_keys:
         arena.free_key(temp)
     with pytest.raises(ValueError, match="1 canvases for 2 suffixes"):
-        loop.pack_chunk(
+        chunk_mod.pack_chunk(
             torch, arena, [dict(key=key, prefix=None, f=100,
                                 suffixes=[[600], [601]], canvas=[[900, 901]])],
             attention_mode="unified", canvas=canvas)

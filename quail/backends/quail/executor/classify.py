@@ -301,7 +301,8 @@ class ClassifyStages:
             requests=ask, decide=score, read_all_rows=True,
             read_rows=[1] * len(suffixes), label=spec.name)]
 
-    def _letter_canvas(self, state: QueryExecutionState) -> Callable[[int, int], np.ndarray]:
+    def _letter_canvas(
+            self, state: QueryExecutionState) -> Callable[[int, int], np.ndarray]:
         """Callable(document index, draw) -> the canvas a letters read packs.
 
         The canvas follows the cue: a random token at the reply's first
