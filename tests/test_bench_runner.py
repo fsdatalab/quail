@@ -27,7 +27,7 @@ from quail.planner.plan import EngineConfig, Refusal
 from quail.specs import QWEN3_4B_FP8
 from quail_b.labels import GroundTruthCollection, PredicateLabels
 from quail_b.minimum import DocumentTokens, token_metrics
-from quail_b.predicates import PREDICATES, predicate_payload
+from quail_b.predicates import PREDICATE_BY_KEY, PREDICATES, predicate_payload
 from quail_b.prompts import DISCUSS_ASPECT, F1, F4, F11, F13, REFUTE, SUPPORT
 from quail_b.queries import get_query
 from quail_b.queries import queries as query_specs
@@ -368,7 +368,28 @@ def test_classification_pieces_are_the_named_reference_prompt(tmp_path, case):
     plan = read_plan(spec.plan)
     with _session(tmp_path, backend="stock_vllm") as sess:
         # the byte tokenizer, so the pieces decode back to text
-        pieces = prompt_pieces(build_query(sess, spec), plan, {0: "r"})
+        query = build_query(sess, spec)
+        pieces = prompt_pieces(query, plan, {0: "r"})
+    # the estimate's oracle returns each classification's reference label
+    calls = [call for call, _ in query.logical.operators().labels.calls]
+    predicates = {}
+    for operator in plan.classifies:
+        (item,) = [item for item in PREDICATE_BY_KEY.values()
+                   if item.template == operator.prompt]
+        partners = (CORPUS[item.right_table]["id"].to_pylist()
+                    if item.right_table else [None])
+        predicates[item.key] = PredicateLabels(
+            item.key, f"ls_{item.key}", predicate_payload(item),
+            {(left, right): operator.labels[-1]
+             for left in CORPUS["reviews"]["id"].to_pylist()
+             for right in partners}, {})
+    answer = answer_oracle(
+        GroundTruthCollection("gt_classify", "c_classify", 0.1, None, predicates),
+        CORPUS)
+    assert len(calls) == len(plan.classifies)
+    for call, operator in zip(calls, plan.classifies):
+        assignment = {alias: 1 for alias in call.aliases()}
+        assert answer(call.prompt, assignment) == operator.labels[-1]
     assert validate_prompt_pieces(spec, pieces)["classifies"] == pieces[
         "classifies"]
 

@@ -3,10 +3,23 @@
 The estimate prices the ideal execution of a query on one device: every
 distinct document prefix computed once and kept in KV without limit,
 forward passes packed across the whole query, and no host, scheduling,
-or kernel overhead. Filters run first in the planner's order. Joins
-are searched over every feasible eager binary full left deep plan and
-anchor choice, with exact survivors from a caller supplied answer
-oracle at every step.
+or kernel overhead. On each alias the AI.IF filters run first in the
+planner's order, then its classifications, each followed by the label
+filters that test it. Joins are searched over every feasible eager
+binary full left deep plan and anchor choice, with exact survivors from
+caller supplied answer and label oracles at every step. A
+classification of joined rows follows its join on the join's anchor.
+
+A classification is priced as one question per live document: the
+reference prompt's tail (the question, the labels by name, and the
+answer cue) over the document's prefix, read at the cue's row as a
+filter's answer is. The rows a scoring rule appends to read the label
+(a letter, a trie, or decode rounds) are an execution choice and are
+not counted.
+
+Every operator in the plan is priced or refused: an Apply, an AI.SCORE
+predicate or column, a LIMIT, or a join without full semantics raises
+NotImplementedError.
 
 The equations are in docs/content/docs/architecture/planning.mdx. The
 work counting and component pricing are the planner's own
@@ -25,12 +38,17 @@ from quail.cost import budgets
 from quail.cost.sol import SpeedOfLight, speed_of_light
 from quail.cost.work import Work, ask, scan, triangle
 from quail.execution.pairs import pair_table
-from quail.logical import oriented_join_conditions
-from quail.planner.decide import (
-    default_order_rule,
-    order_filters_indexed,
-    preamble_tokens,
+from quail.logical import (
+    Join,
+    LabelIn,
+    ModelCall,
+    Project,
+    Scan,
+    SemanticFilter,
+    SemanticJoin,
+    oriented_join_conditions,
 )
+from quail.planner.decide import default_order_rule, order_filters_indexed
 from quail.planner.leftdeep import Extension, optimize_left_deep
 from quail.planner.live_rows import PairRelation, exact_live_rows
 from quail.planner.prefixes import document_shared_tokens
@@ -39,6 +57,16 @@ from quail.specs import DeviceSpec, ModelSpec
 # answer(prompt, assignment) -> bool, where assignment maps each alias
 # in the prompt to a row index of that alias's corpus table
 AnswerOracle = Callable[[object, Mapping[str, int]], bool]
+# label(prompt, assignment) -> str, the reference label of an
+# AI.CLASSIFY prompt for one row assignment
+LabelOracle = Callable[[object, Mapping[str, int]], str]
+
+# the operators of one alias, as the stage records name them
+FILTER = "AI.IF"
+CLASSIFY = "AI.CLASSIFY"
+LABEL_IN = "IN"
+
+_PRICED_NODES = (Scan, SemanticFilter, Join, SemanticJoin, Project)
 
 
 @dataclass(frozen=True)
@@ -79,7 +107,17 @@ class SpeedOfLightEstimate:
 
     @property
     def filter_evaluations(self) -> int:
-        return sum(stage["evaluated"] for stage in self.filter_stages)
+        return sum(stage["evaluated"] for stage in self.filter_stages
+                   if stage["operator"] == FILTER)
+
+    @property
+    def classification_evaluations(self) -> int:
+        """Documents and joined rows the classifications labeled."""
+        return sum(stage["evaluated"] for stage in self.filter_stages
+                   if stage["operator"] == CLASSIFY) + sum(
+            classification["pairs"]
+            for stage in self.join_stages
+            for classification in stage["classifications"])
 
     @property
     def join_pair_evaluations(self) -> int:
@@ -90,11 +128,18 @@ class SpeedOfLightEstimate:
         return {
             "persistent_kv_capacity": "unlimited",
             "gpu_count": 1,
-            "survivors": "exact, from the caller's answers",
-            "filter_order": "the planner's rule for this query",
+            "survivors": "exact, from the caller's answers and labels",
+            "filter_order": (
+                "the planner's rule for this query; an alias's "
+                "classifications follow its AI.IF filters"),
+            "classification": (
+                "the reference prompt's tail per document or joined row, "
+                "read at the answer cue; a scoring rule's extra rows are "
+                "not counted"),
             "plan_space": "all feasible eager binary full left deep plans",
             "cached_values": (
-                "document prefixes used by filters or as anchors"),
+                "document prefixes used by filters, classifications, "
+                "or as anchors"),
             "cross_alias_prefix_reuse": (
                 "an anchor row whose column another alias filtered, or "
                 "whose row is live under another cached alias of the "
@@ -149,6 +194,7 @@ class SpeedOfLightEstimate:
             "input_document_rows": self.input_document_rows,
             "post_filter_counts": dict(self.post_filter_counts),
             "filter_evaluations": self.filter_evaluations,
+            "classification_evaluations": self.classification_evaluations,
             "join_pair_evaluations": self.join_pair_evaluations,
             "filter_stages": [dict(stage) for stage in self.filter_stages],
             "join_stages": [dict(stage) for stage in self.join_stages],
@@ -167,23 +213,97 @@ class _AliasData:
 
 
 def _prompt_token_counts(prompt):
-    labels_by_alias = {
-        alias: {"label": label_tokens, "frame": frame_tokens}
-        for alias, label_tokens, frame_tokens in prompt.labels}
+    """Return each alias's partner label and anchor frame tokens, and the tail.
+
+    A join prompt carries the counts; a classification of joined rows
+    carries the token ids.
+    """
+    if prompt.labels:
+        labels_by_alias = {
+            alias: {"label": label_tokens, "frame": frame_tokens}
+            for alias, label_tokens, frame_tokens in prompt.labels}
+    else:
+        labels_by_alias = {
+            alias: {"label": len(label_ids), "frame": len(frame_ids)}
+            for alias, label_ids, frame_ids in prompt.label_token_ids}
+    if not labels_by_alias or prompt.tail_tokens is None:
+        raise ValueError(
+            "prompts were bound without a tokenizer; the estimate needs "
+            "token counts")
     return labels_by_alias, prompt.tail_tokens
 
 
+def _refuse_unpriced(logical) -> None:
+    """Raise NotImplementedError for any operator the estimate cannot price."""
+    for node in logical.walk():
+        if not isinstance(node, _PRICED_NODES):
+            raise NotImplementedError(
+                f"the speed of light estimate does not price {node.type_name}")
+        if isinstance(node, Project) and node.limit is not None:
+            raise NotImplementedError(
+                "the speed of light estimate does not price LIMIT")
+    operators = logical.operators()
+    for alias, predicates in operators.filters.items():
+        for predicate in predicates:
+            expression = predicate.expression
+            if isinstance(expression, LabelIn):
+                continue
+            if not (isinstance(expression, ModelCall)
+                    and expression.kind == "boolean"):
+                raise NotImplementedError(
+                    f"the speed of light estimate does not price the "
+                    f"{type(expression).__name__} filter on {alias!r}; "
+                    f"it prices AI.IF and label filters")
+    for join in operators.joins:
+        if not (isinstance(join.predicate, ModelCall)
+                and join.predicate.kind == "boolean"):
+            raise NotImplementedError(
+                f"the speed of light estimate does not price a join on "
+                f"{type(join.predicate).__name__}; it prices AI.IF joins")
+        if join.semantics != "full":
+            raise NotImplementedError(
+                f"the speed of light estimate does not price "
+                f"{join.semantics!r} joins; it prices full joins")
+        if len({arg.alias for arg in join.prompt.args}) != 2:
+            raise NotImplementedError(
+                "the speed of light estimate prices binary join predicates")
+    for column in operators.projections:
+        if column.expression.kind != "label":
+            raise NotImplementedError(
+                f"the speed of light estimate does not price the "
+                f"{column.expression.kind!r} column {column.name!r}; it "
+                f"prices AI.CLASSIFY columns")
+    joined = [frozenset(arg.alias for arg in join.prompt.args)
+              for join in operators.joins]
+    for call, _ in operators.labels.calls:
+        aliases = call.aliases()
+        if len(aliases) == 1:
+            continue
+        name = operators.labels.names[call]
+        if len(aliases) != 2 or frozenset(aliases) not in joined:
+            raise NotImplementedError(
+                f"the classification {name!r} reads {list(aliases)}; the "
+                f"speed of light estimate prices a classification of one "
+                f"document or of one join's rows")
+        if operators.labels.tests.get(call):
+            raise NotImplementedError(
+                f"the speed of light estimate does not price a label "
+                f"filter on {name!r}, a classification of joined rows")
+
+
 class _Search:
-    """One estimate's state: corpus tokens, the oracle, and the credit.
+    """One estimate's state: corpus tokens, the oracles, and the credit.
 
     The credit is the shared prefix counted as read from KV rather
     than computed, when credit_shared is on.
     """
 
-    def __init__(self, query, answer: AnswerOracle, model: ModelSpec,
-                 device: DeviceSpec, chunk_tokens: int,
+    def __init__(self, query, answer: AnswerOracle, label: LabelOracle | None,
+                 model: ModelSpec, device: DeviceSpec, chunk_tokens: int,
                  credit_shared: bool):
+        _refuse_unpriced(query.logical)
         self.answer = answer
+        self.label = label
         self.model = model
         self.device = device
         self.chunk_tokens = chunk_tokens
@@ -197,14 +317,26 @@ class _Search:
         self.scans, self.filters, self.joins = (
             operators.scans, operators.filters, operators.joins
         )
+        self.labels = operators.labels
+        if self.labels.calls and label is None:
+            raise ValueError(
+                "the query classifies documents; pass label=(prompt, "
+                "assignment) -> str giving each row's reference label")
+        # classifications of joined rows, by the aliases they read
+        self.joined_classifications: dict[frozenset, list] = {}
+        for call, _ in self.labels.calls:
+            if len(call.aliases()) == 2:
+                self.joined_classifications.setdefault(
+                    frozenset(call.aliases()), []).append(call)
         self.order = query.order
-        self.pre = preamble_tokens(self.filters, self.joins)
+        self.pre = next((prompt.preamble_tokens for prompt in operators.prompts
+                         if prompt.preamble_tokens is not None), 0)
         self.aliases: dict[str, _AliasData] = {}
         for scan_node in self.scans:
             store = stores[scan_node.alias]
             tokens = [int(length) for length in store.lengths]
             shared = (document_shared_tokens(store) if credit_shared
-                       else [0] * len(tokens))
+                      else [0] * len(tokens))
             self.aliases[scan_node.alias] = _AliasData(
                 column=f"{scan_node.provider}.{scan_node.column}",
                 tokens=tokens,
@@ -253,6 +385,28 @@ class _Search:
             return scan(prefix, suffix, window=self.window)
         resident = self.pre + shared_tokens
         return ask(resident, prefix - resident + suffix, window=self.window)
+
+    def question_work(self, alias: str, live, tail: int, first: bool) -> Work:
+        """Return the work of one question asked of every live document.
+
+        The first question on an alias computes each document's prefix
+        unless another alias of the column already did; later questions
+        attach the tail to the resident prefix.
+        """
+        tokens = self.aliases[alias].tokens
+        computed = self.computed_rows_by_column.setdefault(
+            self.aliases[alias].column, set())
+        suffix = tail + self.canvas
+        work = Work()
+        for row in live:
+            if first and not (self.credit_shared and row in computed):
+                work = work + self.first_use(alias, row, suffix)
+            else:
+                prefix = self.pre + tokens[row]
+                work = work + ask(prefix, suffix, window=self.window)
+        if first:
+            computed.update(live)
+        return work
 
     def join_stage_work(self, anchor, partners, survivors, prompt,
                         resident_rows, cross_resident_rows=(),
@@ -317,13 +471,18 @@ class _Search:
             )
         return work
 
-    # ---- filters ---------------------------------------------------
+    # ---- filters and classifications --------------------------------
 
     def run_filters(self):
-        """Apply every filter in the planner's order with exact answers.
+        """Apply each alias's filters and classifications with exact answers.
+
+        The AI.IF filters run first in the planner's order. Then each
+        classification runs once over the live documents, followed by
+        the label filters that test it, in written order; the
+        classifications no label filter tests follow.
 
         Returns:
-            (survivors by alias, work, filter stage records).
+            (survivors by alias, work, stage records).
         """
         rule = (self.order if self.order is not None else
                 default_order_rule(self.filters, self.joins)[0])
@@ -332,46 +491,69 @@ class _Search:
             for alias, data in self.aliases.items()}
         work = Work()
         stages = []
-        for alias, predicates in self.filters.items():
+        for scan_node in self.scans:
+            alias = scan_node.alias
+            predicates = self.filters.get(alias, ())
+            asks = [position for position, predicate in enumerate(predicates)
+                    if not isinstance(predicate.expression, LabelIn)]
+            calls = [call for call, owner in self.labels.calls
+                     if owner == alias and len(call.aliases()) == 1]
+            if not asks and not calls:
+                continue
             tokens = self.aliases[alias].tokens
             mean_tokens = sum(tokens) / len(tokens) if tokens else 0
-            order = order_filters_indexed(
-                predicates, rule,
+            order = [asks[index] for index in order_filters_indexed(
+                [predicates[position] for position in asks], rule,
                 prefix_tokens=self.pre + mean_tokens,
                 model=self.model, device=self.device,
-                chunk_tokens=self.chunk_tokens)
+                chunk_tokens=self.chunk_tokens)] if asks else []
             live = survivors[alias]
-            column = self.aliases[alias].column
-            computed = self.computed_rows_by_column.setdefault(column, set())
-            for stage_index, written_pos in enumerate(order):
+            first = True
+            for written_pos in order:
                 predicate = predicates[written_pos]
-                question_tokens = predicate.prompt.tail_tokens
-                suffix = question_tokens + self.canvas
-                for row in live:
-                    if stage_index == 0 and not (
-                            self.credit_shared and row in computed):
-                        work = work + self.first_use(alias, row, suffix)
-                    else:
-                        prefix = self.pre + tokens[row]
-                        work = work + ask(prefix, suffix, window=self.window)
-                if stage_index == 0:
-                    computed.update(live)
+                stage_work = self.question_work(
+                    alias, live, predicate.prompt.tail_tokens, first)
+                first = False
+                work = work + stage_work
                 passed = [
                     row for row in live
                     if self.answer(predicate.prompt, {alias: row})
                 ]
-                stages.append({
-                    "alias": alias,
-                    "template": predicate.prompt.template,
-                    "written_pos": written_pos,
-                    "question_tokens": question_tokens,
-                    "provided_selectivity": predicate.selectivity,
-                    "evaluated": len(live),
-                    "passed": len(passed),
-                    "selectivity": (round(len(passed) / len(live), 6)
-                                    if live else 0.0),
-                })
+                stages.append(_stage(
+                    FILTER, alias, predicate.prompt.template, written_pos,
+                    predicate.prompt.tail_tokens, predicate.selectivity,
+                    live, passed, stage_work))
                 live = passed
+            steps = [(predicate.expression.call, position)
+                     for position, predicate in enumerate(predicates)
+                     if isinstance(predicate.expression, LabelIn)]
+            steps.extend((call, None) for call in calls
+                         if call not in self.labels.tests)
+            classified = set()
+            for call, position in steps:
+                if call not in classified:
+                    stage_work = self.question_work(
+                        alias, live, call.prompt.tail_tokens, first)
+                    first = False
+                    work = work + stage_work
+                    stages.append(_stage(
+                        CLASSIFY, alias, call.prompt.template, None,
+                        call.prompt.tail_tokens, None, live, live,
+                        stage_work, name=self.labels.names[call]))
+                    classified.add(call)
+                if position is not None:
+                    predicate = predicates[position]
+                    accepted = set(predicate.expression.accepted)
+                    passed = [
+                        row for row in live
+                        if self.label(call.prompt, {alias: row}) in accepted
+                    ]
+                    stages.append(_stage(
+                        LABEL_IN, alias, call.prompt.template, position, 0,
+                        predicate.selectivity, live, passed, Work(),
+                        name=self.labels.names[call],
+                        accepted=list(predicate.expression.accepted)))
+                    live = passed
             survivors[alias] = live
         return survivors, work, stages
 
@@ -417,6 +599,35 @@ class _Search:
                 rows.update(live[other])
         return rows
 
+    def joined_classification_work(self, call, anchor, partner, live,
+                                   relation) -> tuple[Work, dict]:
+        """Price one classification of the pairs a join kept, on its anchor.
+
+        Each anchor row with a kept pair attaches the classification's
+        anchor note to its resident prefix, then streams one suffix per
+        kept pair: the partner label, the partner document, and the
+        tail.
+        """
+        kept = {}
+        for left_row, right_row in relation.pairs:
+            anchor_row, partner_row = ((left_row, right_row)
+                                       if relation.left == anchor
+                                       else (right_row, left_row))
+            kept.setdefault(anchor_row, set()).add(partner_row)
+        live_partners = set(live[partner])
+        anchor_rows = [row for row in live[anchor]
+                       if kept.get(row, set()) & live_partners]
+        work = self.join_stage_work(
+            anchor, [partner], {anchor: anchor_rows, partner: live[partner]},
+            call.prompt, anchor_rows, allowed=kept)
+        pairs = sum(len(kept[row] & live_partners) for row in anchor_rows)
+        return work, {
+            "name": self.labels.names[call],
+            "template": call.prompt.template,
+            "pairs": pairs,
+            "fresh_tokens": work.tokens,
+        }
+
     def run_joins(self, base_rows, resident, base_work):
         """Search every feasible left deep plan over the filtered rows.
 
@@ -427,14 +638,8 @@ class _Search:
         edge_relations = []
         edge_aliases = []
         for join in joins:
-            stage_aliases = tuple(arg.alias for arg in join.prompt.args)
-            if join.semantics != "full":
-                raise NotImplementedError(
-                    "the speed of light search needs full join semantics")
-            if len(stage_aliases) != 2:
-                raise NotImplementedError(
-                    "the speed of light search needs binary join predicates")
-            left, right = stage_aliases
+            left, right = tuple(dict.fromkeys(
+                arg.alias for arg in join.prompt.args))
             allowed = self.allowed_pairs.get(len(edge_relations), {}).get(
                 left)
             passing = frozenset(
@@ -491,11 +696,14 @@ class _Search:
                 edge_index = order[position]
                 join = joins[edge_index]
                 relation = edge_relations[edge_index]
-                stage_aliases = tuple(
-                    arg.alias for arg in join.prompt.args)
+                stage_aliases = (relation.left, relation.right)
+                classifications = self.joined_classifications.get(
+                    frozenset(stage_aliases), ())
                 for anchor in stage_aliases:
-                    if not self.anchor_fits(
-                            join.prompt, anchor, stage_aliases, live):
+                    if not all(
+                            self.anchor_fits(prompt, anchor, stage_aliases, live)
+                            for prompt in [join.prompt] + [
+                                call.prompt for call in classifications]):
                         continue
                     partners = [alias for alias in stage_aliases
                                 if alias != anchor]
@@ -507,6 +715,12 @@ class _Search:
                         self.cross_resident(anchor, live, cached_now),
                         allowed=allowed,
                     )
+                    classified = []
+                    for call in classifications:
+                        call_work, record = self.joined_classification_work(
+                            call, anchor, partners[0], live, relation)
+                        stage_work = stage_work + call_work
+                        classified.append(record)
                     next_edges = active_edges | {edge_index}
                     next_cache = cached_now | {anchor}
                     passing = sum(
@@ -531,6 +745,7 @@ class _Search:
                                 for row in live[anchor])),
                         "passing_pairs": passing,
                         "fresh_tokens": stage_work.tokens,
+                        "classifications": classified,
                         "cached_prefixes_after": sorted(next_cache),
                     }
                     visit_edges(
@@ -573,10 +788,29 @@ class _Search:
         return best, search
 
 
+def _stage(operator, alias, template, written_pos, question_tokens,
+           selectivity, live, passed, work, **extra) -> dict:
+    """Return one alias stage's record."""
+    return {
+        "operator": operator,
+        "alias": alias,
+        "template": template,
+        "written_pos": written_pos,
+        "question_tokens": question_tokens,
+        "provided_selectivity": selectivity,
+        "evaluated": len(live),
+        "passed": len(passed),
+        "selectivity": (round(len(passed) / len(live), 6) if live else 0.0),
+        "fresh_tokens": work.tokens,
+        **extra,
+    }
+
+
 def speed_of_light_estimate(
     query,
     answer: AnswerOracle,
     *,
+    label: LabelOracle | None = None,
     model: ModelSpec | None = None,
     device: DeviceSpec | None = None,
     chunk_tokens: int | None = None,
@@ -591,6 +825,10 @@ def speed_of_light_estimate(
             answer of a filter or join prompt for one row assignment,
             where assignment maps each alias in the prompt to a row
             index. Survivors at every stage come from it.
+        label: Callable (prompt, assignment) -> str giving the reference
+            label of an AI.CLASSIFY prompt for one row assignment. A
+            label filter keeps the rows whose label it accepts. Required
+            when the query classifies.
         model: Model to price; the session's model by default.
         device: Device to price; the session's device by default.
         chunk_tokens: Forward pass size; the planner's chunk budget for
@@ -599,15 +837,21 @@ def speed_of_light_estimate(
             prefix once across documents and aliases of one column.
             False computes each alias's document once and reuses it
             only across that document's own questions.
+
+    Raises:
+        NotImplementedError: The plan holds an operator the estimate
+            does not price, named in the message.
+        ValueError: The query classifies and no label oracle was given.
     """
     model = model or query.session.model
     device = device or query.session.device
     if chunk_tokens is None:
         chunk_tokens = budgets.chunk_budget(model, device)
-    search = _Search(query, answer, model, device, chunk_tokens,
+    search = _Search(query, answer, label, model, device, chunk_tokens,
                      credit_shared_prefixes)
     survivors, filter_work, filter_stages = search.run_filters()
-    resident = frozenset(search.filters)
+    resident = frozenset(stage["alias"] for stage in filter_stages
+                         if stage["operator"] != LABEL_IN)
     base_rows = {alias: tuple(rows) for alias, rows in survivors.items()}
     best, result = search.run_joins(base_rows, resident, filter_work)
     return SpeedOfLightEstimate(
