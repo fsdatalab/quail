@@ -194,7 +194,7 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
         expected_inputs=4, estimated_seconds=0.0,
         prompt_token_parts=(head, (91, 92, 93)), labels=("a", "b"),
         label_token_ids=((1,), (2,)), scoring="letters",
-        draws=4 if shape == "draws" else 1)
+        draws=4 if shape == "draws" else 1, probabilities=shape == "draws")
     nodes = [Scan(node_id="input:r", alias="r", input_id="r")]
     if not first:
         nodes.append(AiFilter(
@@ -396,6 +396,15 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
         # document 2's three later draws outvote its first; document 3
         # was sure at its first draw and sent no more
         assert labels.column("topic").to_pylist() == ["a", "a", "b"]
+        # each label's probability among the labels: a sure first draw's,
+        # or the mean over the four draws
+        first = 1 / (1 + np.exp(-1.0))
+        probabilities = [dict(row) for row in
+                         labels.column("topic_probabilities").to_pylist()]
+        assert probabilities[0]["a"] == pytest.approx(first)
+        assert probabilities[1]["a"] == pytest.approx((1 - first + 3) / 4,
+                                                      abs=1e-4)
+        assert probabilities[2]["b"] == pytest.approx(1.0, abs=1e-4)
         assert [len(packed[d]) for d in (0, 2, 3)] == [4, 4, 1]
         seeds = [[int(np.random.default_rng((CANVAS_SEED, 2, draw))
                       .integers(0, vocab)), 6, 0, 0] for draw in range(4)]

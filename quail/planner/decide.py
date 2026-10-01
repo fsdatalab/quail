@@ -8,6 +8,7 @@ from quail.cost.sol import speed_of_light, unrounded_seconds
 from quail.cost.work import Work, ask, scan
 from quail.logical import (
     DEFAULT_SELECTIVITY,
+    PROBABILITIES_SUFFIX,
     Alias,
     CompileError,
     LabelIn,
@@ -942,11 +943,16 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
         sink_inputs = (PortRef("recombine", "tuples"),)
     else:
         sink_inputs = (ids_src[scans[0].alias],)
+    columns = []
+    for c in plan.root.columns:
+        columns.append(c.name if isinstance(c, Alias)
+                       else f"{c.alias}.{c.column}")
+        if isinstance(c, Alias) and getattr(c.expression, "probabilities", False):
+            columns.append(c.name + PROBABILITIES_SUFFIX)
     nodes.append(PhysicalProject(
         node_id="project",
         inputs=input_ports(tuple(sink_inputs) + tuple(label_ports)),
-        columns=tuple(c.name if isinstance(c, Alias) else f"{c.alias}.{c.column}"
-                      for c in plan.root.columns)))
+        columns=tuple(columns)))
     if plan.root.limit is not None:
         nodes.append(Limit(
             node_id="limit",

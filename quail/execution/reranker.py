@@ -14,6 +14,7 @@ from quail.execution.runner import (
     NodeMetrics,
     NodeResult,
 )
+from quail.logical import PROBABILITIES_SUFFIX
 from quail.physical import AiScore, ClassifySpec, Filter, InList, ValueType
 from quail.progress import answer_sink
 
@@ -123,11 +124,29 @@ class RerankerBatch:
     # unless the session asked for GPU timing
     gpu_s: float = 0.0
     chunks: int = 0
+    # a classification asked for them: per row, each label's probability
+    probabilities: np.ndarray | None = None
 
 
 def _value_type(spec) -> pa.DataType:
     """The appended column's type: a label for AI.CLASSIFY, else a score."""
     return pa.string() if isinstance(spec, ClassifySpec) else pa.float64()
+
+
+def probability_column(labels, probabilities) -> pa.MapArray:
+    """Each row's label probabilities as a map from label to probability.
+
+    A row whose probabilities are NaN, a document without an answer, is
+    null.
+    """
+    probabilities = np.asarray(probabilities, dtype=np.float64).reshape(
+        -1, len(labels))
+    count, width = probabilities.shape
+    return pa.MapArray.from_arrays(
+        pa.array(np.arange(0, count * width + 1, width), pa.int32()),
+        pa.array(np.tile(np.asarray(labels, dtype=object), count), pa.string()),
+        pa.array(np.nan_to_num(probabilities).ravel(), pa.float64()),
+        mask=pa.array(np.isnan(probabilities).any(axis=1)))
 
 
 def _score_table(rows, aliases, name, scores, value_type=None) -> pa.Table:
@@ -367,6 +386,12 @@ class RerankerModelExecution:
         )
         table = _score_table(rows, spec.aliases, spec.name, batch.scores,
                              _value_type(spec))
+        if isinstance(spec, ClassifySpec) and spec.probabilities:
+            table = table.append_column(
+                spec.name + PROBABILITIES_SUFFIX, probability_column(
+                    spec.labels,
+                    np.full((len(rows), len(spec.labels)), np.nan)
+                    if batch.probabilities is None else batch.probabilities))
         count = len(rows)
         return NodeResult(
             {"scores": table},

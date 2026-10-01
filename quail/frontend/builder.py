@@ -163,7 +163,8 @@ class Query:
 
     def ai_classify(self, p: PromptSpec, labels, *, name: str,
                     descriptions=None,
-                    task_description: str = "") -> "Query":
+                    task_description: str = "",
+                    probabilities: bool = False) -> "Query":
         """Pick one label per document and name it as a result column.
 
         The column can be returned by select() and tested with
@@ -179,6 +180,9 @@ class Query:
             name: The result column's name.
             descriptions: One description per label, empty for none.
             task_description: Task text added after the question.
+            probabilities: Whether the result also has the column
+                ``<name>_probabilities``: each label's probability,
+                among the labels.
         """
         if self._pending_join is not None:
             raise CompileError(
@@ -210,7 +214,8 @@ class Query:
                                      task_description=task_description)
         for ref in refs:
             self._note_doc_column(ref)
-        call = ModelCall(bound, "label", labels, descriptions)
+        call = ModelCall(bound, "label", labels, descriptions,
+                         probabilities=probabilities)
         call.validate()
         self._labels[name] = Alias(call, name)
         return self

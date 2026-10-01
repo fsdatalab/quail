@@ -122,7 +122,8 @@ index and draw number.
 
 If the category probability entropy exceeds 0.1 nats, the executor
 runs the remaining draws and selects the category with the highest
-mean probability. The maximum draw count is `EngineConfig(canvas_draws=4)`
+mean probability, which is also the probability a classification
+with `{'probabilities': true}` returns. The maximum draw count is `EngineConfig(canvas_draws=4)`
 by default. Set `canvas_draws=1` for one draw.
 
 The setting also applies to one-document `AI.SCORE`, which averages

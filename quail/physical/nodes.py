@@ -599,6 +599,9 @@ class ClassifySpec(ScoreSpec):
     rule the executor runs.
     ``share_prefixes`` lets a document borrow the KV pages of a
     document sharing its token prefix (the prefix_sharing rule).
+    ``probabilities`` adds each label's probability among the labels
+    to the scores, as a map column named ``name`` plus
+    PROBABILITIES_SUFFIX.
     A classification of joined rows has two aliases, the anchor and its partner.
     ``join_layout`` holds (the anchor note written after the anchor
     document, the partner label written before each partner
@@ -609,6 +612,7 @@ class ClassifySpec(ScoreSpec):
     label_token_ids: tuple[tuple[int, ...], ...] = ()
     scoring: str = "letters"
     share_prefixes: bool = False
+    probabilities: bool = False
     join_layout: tuple[tuple[int, ...], tuple[int, ...]] | None = None
 
     @property
@@ -638,6 +642,7 @@ class ClassifySpec(ScoreSpec):
                 for ids in value["label_token_ids"]),
             scoring=str(value.get("scoring", "letters")),
             share_prefixes=bool(value.get("share_prefixes", False)),
+            probabilities=bool(value.get("probabilities", False)),
             join_layout=(None if value.get("join_layout") is None else tuple(
                 tuple(int(token) for token in part)
                 for part in value["join_layout"])),
@@ -650,6 +655,7 @@ class ClassifySpec(ScoreSpec):
             "label_token_ids": [list(ids) for ids in self.label_token_ids],
             "scoring": self.scoring,
             "share_prefixes": self.share_prefixes,
+            "probabilities": self.probabilities,
             "join_layout": (None if self.join_layout is None
                             else [list(part) for part in self.join_layout]),
         }
@@ -685,6 +691,8 @@ class AiClassify(AiScore):
             "share_prefixes": (False if self.spec is None
                                else self.spec.share_prefixes),
             "draws": 1 if self.spec is None else self.spec.draws,
+            "probabilities": (False if self.spec is None
+                              else self.spec.probabilities),
         }
 
     @classmethod

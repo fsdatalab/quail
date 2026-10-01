@@ -290,6 +290,7 @@ label text. The category argument also accepts the named form
 | `task_description` | Empty | Task text appended to the question, at most 50 words. |
 | `selectivity` | `0.2` | Estimated fraction of documents passing a label predicate. |
 | `output_mode` | `'single'` | Only `'single'` is supported. |
+| `probabilities` | `false` | `true` adds `<name>_probabilities`, a `MAP<STRING, DOUBLE>` of each label's probability among the labels. |
 
 Ties select the earlier category. Greedy decoding can omit a document
 if it does not produce an allowed label. Scoring methods are described
@@ -329,6 +330,20 @@ Classify a document column with a task description:
 SELECT r.id,
        AI.CLASSIFY(r.body, ARRAY['refund', 'praise'],
                    {'task_description': 'Classify the customer request.'}) AS kind
+FROM reviews r;
+```
+
+Return each label's probability beside the label. A row gets, for
+example, `topic = 'refund'` and `topic_probabilities = {'refund': 0.91,
+'shipping': 0.07, 'praise': 0.02}`. The probabilities come from the
+read that picks the label, at no extra GPU cost. They are unsupported
+for document pair classifications and on the vLLM and SGLang baselines.
+
+```sql
+SELECT r.id,
+       AI.CLASSIFY(PROMPT('What is the request about? {0}', r.body),
+                   ARRAY['refund', 'shipping', 'praise'],
+                   {'probabilities': true}) AS topic
 FROM reviews r;
 ```
 

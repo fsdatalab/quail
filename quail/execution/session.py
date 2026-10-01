@@ -556,9 +556,12 @@ class BoundBuilder:
 
     ai_if = ai_filter
 
-    def ai_classify(self, p, labels, *, name, descriptions=None):
+    def ai_classify(self, p, labels, *, name, descriptions=None,
+                    task_description="", probabilities=False):
         self._inner.ai_classify(p, labels, name=name,
-                                descriptions=descriptions)
+                                descriptions=descriptions,
+                                task_description=task_description,
+                                probabilities=probabilities)
         return self
 
     def label_in(self, name, labels, selectivity=None):
@@ -945,7 +948,8 @@ class Query:
                     continue
                 table = next((table for table in (labels or {}).values()
                               if name in table.column_names), None)
-                if table is not None and table.column_names.index(name) == 2:
+                if (table is not None and table.column_names.index(name) == 2
+                        and pa.types.is_integer(table.schema.field(1).type)):
                     # a label of joined rows: each result row looks its
                     # label up by its two ids; a row without one leaves
                     # the result
@@ -985,8 +989,9 @@ class Query:
                         raise CompileError(
                             f"label column {name!r} belongs to {alias!r}, "
                             f"which is not in the result")
-                    labeled = table.column(name).combine_chunks().cast(
-                        pa.string())
+                    labeled = table.column(name).combine_chunks()
+                    if not pa.types.is_map(labeled.type):
+                        labeled = labeled.cast(pa.string())
                     # a document whose answer named no label has no row
                     # in the table, and leaves the result
                     declaration = acero.Declaration(
@@ -1000,7 +1005,7 @@ class Query:
                     slots[table.column(alias).to_numpy()] = np.arange(
                         len(labeled))
                     widened = pc.take(
-                        pa.concat_arrays([labeled, pa.array([None], pa.string())]),
+                        pa.concat_arrays([labeled, pa.array([None], labeled.type)]),
                         pa.array(slots))
                     # a dictionary over the call's labels in their order
                     call = next((column.expression

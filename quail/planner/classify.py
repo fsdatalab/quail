@@ -190,7 +190,8 @@ class _Table:
                                for letter in call.prompt.lettered.letters)
             lettered = (len(letter_head), len(letter_tail) - 1, letter_ids)
         scoring, simulated = self.choose(live, len(head), len(tail) - 1,
-                                         labels, resident, lettered)
+                                         labels, resident, lettered,
+                                         probabilities=call.probabilities)
         if scoring == LETTERS_SCORING:
             head, tail, labels = letter_head, letter_tail, letter_ids
         if scoring == DECODE_SCORING and not decodable(labels):
@@ -215,6 +216,7 @@ class _Table:
             prompt_token_parts=(head, tail), labels=tuple(call.labels),
             label_token_ids=labels, scoring=scoring,
             draws=self.draws if scoring == LETTERS_SCORING else 1,
+            probabilities=call.probabilities,
         )
         return spec, simulated.work
 
@@ -246,7 +248,8 @@ class _Table:
         return replace(spec, estimated_seconds=simulated.seconds)
 
     def choose(self, live, head_tokens, frame_tokens, labels, resident,
-               lettered=None) -> tuple[str, classify_cost.Simulated]:
+               lettered=None, probabilities=False
+               ) -> tuple[str, classify_cost.Simulated]:
         """The rule with the least simulated time, and its simulation.
 
         A forced rule is the one candidate. Otherwise ``letters`` is a
@@ -254,8 +257,10 @@ class _Table:
         prompt; on a causal model ``trie_tree`` under tree attention,
         and ``trie_decode`` for a classification whose documents are
         not resident from an earlier stage and whose labels a greedy
-        decode can end at; a canvas model reads letters only. Ties go
-        to fewer label tokens, then the order listed.
+        decode can end at; a canvas model reads letters only. A
+        classification returning its labels' probabilities scores every
+        label, so ``trie_decode`` is not a candidate. Ties go to fewer
+        label tokens, then the order listed.
 
         Args:
             live: How many documents are expected.
@@ -265,11 +270,19 @@ class _Table:
             resident: Whether the documents' KV is resident already.
             lettered: (head tokens, frame tokens, letter token ids) of
                 the lettered prompt; None when the prompt has none.
+            probabilities: Whether the classification returns every
+                label's probability.
 
         Raises:
             ClassifyRefusedError: No rule can run: ``letters`` without a
-                lettered prompt, or ``trie_tree`` without tree attention.
+                lettered prompt, ``trie_tree`` without tree attention,
+                or ``trie_decode`` forced for label probabilities.
         """
+        if self.scoring == DECODE_SCORING and probabilities:
+            raise ClassifyRefusedError(
+                f"the {DECODE_SCORING!r} rule decodes one label and scores "
+                f"no other, so it cannot return the labels' probabilities",
+                1, 0)
         if self.scoring:
             candidates = [self.scoring]
         else:
@@ -277,7 +290,7 @@ class _Table:
             if self.tree:
                 candidates.append(TREE_SCORING)
             if (not self.model.canvas_tokens and not resident
-                    and decodable(labels)):
+                    and not probabilities and decodable(labels)):
                 candidates.append(DECODE_SCORING)
         if lettered is None and LETTERS_SCORING in candidates:
             raise ClassifyRefusedError(
@@ -331,6 +344,10 @@ class _Table:
                 f"a classification of joined rows reads letters "
                 f"({LETTERS_SCORING}); the {self.scoring!r} rule was forced",
                 1, 0)
+        if call.probabilities:
+            raise ClassifyRefusedError(
+                f"a classification of joined rows returns its label only; "
+                f"{name!r} asks for the labels' probabilities", 1, 0)
         prompt = call.prompt.lettered
         if prompt is None:
             raise ClassifyRefusedError(

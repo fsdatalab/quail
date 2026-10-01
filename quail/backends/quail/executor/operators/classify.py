@@ -9,9 +9,11 @@ from quail.execution.reranker import (
     _score_table,
     attach_prior_columns,
     classify_outputs,
+    probability_column,
     scored_batch,
 )
 from quail.execution.runner import NodeMetrics, NodeResult
+from quail.logical import PROBABILITIES_SUFFIX
 from quail.physical import AiClassify, ValueType
 from quail.progress import answer_sink
 
@@ -119,6 +121,10 @@ class ClassifyPart:
         table = _score_table(rows, spec.aliases, spec.name,
                              [plan.labels[index] for index in labeled],
                              pa.string())
+        if plan.probabilities is not None:
+            table = table.append_column(
+                spec.name + PROBABILITIES_SUFFIX,
+                probability_column(spec.labels, plan.probabilities[labeled]))
         # the labels the parts before it gave these documents, as a
         # classify node on its own carries them from its scores input
         priors = {spec.aliases[0]: prior for prior in self.prior_tables}

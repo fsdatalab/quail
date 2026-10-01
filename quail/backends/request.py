@@ -120,6 +120,18 @@ def plan_request_backend(
             estimated_seconds=float("inf"),
         ),)
     classifies = has_label(region.logical_plan)
+    if any(isinstance(column, Alias)
+           and getattr(column.expression, "probabilities", False)
+           for column in region.logical_plan.root.columns):
+        return (PhysicalCandidate(
+            graph=None,
+            plan=Refusal(
+                reasons=(f"AI.CLASSIFY on {backend_name} decodes the label "
+                         f"as text and has no probability for the others",),
+                constraint="classify_probabilities_need_quail_backend",
+                needed=1, available=0, unit="backends"),
+            estimated_seconds=float("inf"),
+        ),)
     # a diffusion model's vLLM canvas is sized for a filter's one
     # answer token, not a label
     scores_labels = scores_labels and not context.model.canvas_tokens

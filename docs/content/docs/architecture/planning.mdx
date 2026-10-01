@@ -80,6 +80,13 @@ Automatic selection considers greedy decoding only when document KV is
 not already resident from an earlier stage. Diffusion models and joined
 classification use `letters`.
 
+A classification that returns its label probabilities
+(`{'probabilities': true}`) scores every label, so automatic selection
+leaves greedy decoding out and a forced `trie_decode` is refused. Under
+`letters` a label's probability is the softmax of the codes' scores;
+under `trie_tree` it is the label's summed token log probability,
+exponentiated and renormalized over the labels.
+
 The `label_scoring` setting forces a rule:
 
 ```python

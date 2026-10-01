@@ -255,8 +255,14 @@ class _Labels:
         values = np.asarray([
             spec.labels[0] if spec.name == "kind" else self.labels[row[0]]
             for row in rows], dtype=object)
+        # 0.8 on the label given, 0.1 on each other
+        probabilities = np.asarray([
+            [np.nan] * len(spec.labels) if value is None
+            else [0.8 if label == value else 0.1 for label in spec.labels]
+            for value in values]) if spec.probabilities else None
         return RerankerBatch(values, fresh_tokens=len(rows), cached_tokens=0,
-                             suffix_tokens=3 * len(rows))
+                             suffix_tokens=3 * len(rows),
+                             probabilities=probabilities)
 
 
 def test_classify_plans_filters_and_returns_labels(session):
@@ -291,6 +297,28 @@ def test_classify_plans_filters_and_returns_labels(session):
     labels = result.answer_tables["classifies"]["topic"]
     assert labels.column("topic").to_pylist() == ["praise"]
     assert result.report["node_metrics"]["ai-classify:0"]["output_rows"] == 1
+
+    # with probabilities, a map of each label's probability beside the
+    # label, from a rule that scores every label
+    probable = session.sql(
+        "SELECT d.id, AI.CLASSIFY(PROMPT('What is {0} about?', d.body), "
+        "ARRAY['refund', 'shipping', 'praise'], {'probabilities': true}) "
+        "AS topic FROM documents d")
+    built = (session.docs("documents").alias("d").ai_classify(
+        quail.prompt("What is {0} about?", quail.col("d.body")),
+        ["refund", "shipping", "praise"], name="topic", probabilities=True)
+        .select("d.id", "topic"))
+    assert probable.logical == built.logical
+    plan = probable.plan()
+    (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
+    assert classify.spec.probabilities
+    assert classify.spec.scoring != "trie_decode"
+    assert plan.nodes[-1].columns == ("d.id", "topic", "topic_probabilities")
+    rows = _finish(probable, session,
+                   _Labels(["praise", "shipping"])).collect()
+    assert rows.column("topic_probabilities").to_pylist() == [
+        [("refund", 0.1), ("shipping", 0.1), ("praise", 0.8)],
+        [("refund", 0.1), ("shipping", 0.8), ("praise", 0.1)]]
 
 
 def _chain(session, *, filters=1, later_filters=()):
@@ -519,6 +547,14 @@ def test_classify_refusals_and_builder_errors(session):
             (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
             assert classify.spec.scoring == rule
             assert plan.settings["label_scoring"] == rule
+        if rule == "trie_decode":
+            # a greedy decode scores one label, so it has no probabilities
+            probable = ruled.docs("documents").alias("d").ai_classify(
+                quail.prompt("{0}", quail.col("d.body")), ["a", "b"],
+                name="x", probabilities=True).select("d.id", "x")
+            refused = probable.plan()
+            assert isinstance(refused, Refusal)
+            assert "probabilities" in refused.reasons[0]
         ruled.close()
 
     # Qwen3 32B keeps its separate output head, so it classifies too
@@ -535,6 +571,11 @@ def test_classify_refusals_and_builder_errors(session):
     request = next(node for node in _topic(vllm).plan().nodes
                    if isinstance(node, RequestExecution))
     assert [spec.output for spec in request.classifies] == ["topic"]
+    # it decodes the label as text, so it has no label probabilities
+    probable = vllm.docs("documents").alias("d").ai_classify(
+        quail.prompt("{0}", quail.col("d.body")), ["a", "b"],
+        name="x", probabilities=True).select("d.id", "x")
+    assert probable.plan().constraint == "classify_probabilities_need_quail_backend"
     vllm.close()
 
 
@@ -833,6 +874,8 @@ def test_sql_category_forms_options_and_label_tables(session):
                 "{'examples': 'x'}) AS topic FROM documents d",
                 "SELECT d.id, AI.CLASSIFY(d.body, ARRAY['refund', 'praise'], "
                 "{'layout': 'labels_first'}) AS topic FROM documents d",
+                "SELECT d.id, AI.CLASSIFY(d.body, ARRAY['refund', 'praise'], "
+                "{'probabilities': 'yes'}) AS topic FROM documents d",
                 "SELECT d.id, AI.CLASSIFY(d.body, ARRAY[1, 2]) AS topic "
                 "FROM documents d"):
         with pytest.raises(CompileError):

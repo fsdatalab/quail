@@ -73,6 +73,11 @@ def effective_selectivity(selectivity: Optional[float]) -> float:
     return DEFAULT_SELECTIVITY if selectivity is None else selectivity
 
 
+# The suffix of the column holding each label's probability, beside an
+# AI.CLASSIFY label column
+PROBABILITIES_SUFFIX = "_probabilities"
+
+
 @dataclass(frozen=True)
 class ModelCall:
     """One prompt asked of every row; the model answers with a value.
@@ -86,6 +91,10 @@ class ModelCall:
     # description per label, empty for none
     labels: tuple = ()
     descriptions: tuple = ()
+    # a "label" call only: whether the result also carries each label's
+    # probability, as the column named after the label column plus
+    # PROBABILITIES_SUFFIX
+    probabilities: bool = False
 
     type_name: ClassVar[str] = "quail.model_call"
 
@@ -99,7 +108,7 @@ class ModelCall:
                 f"model call kind must be one of {MODEL_CALL_KINDS}, "
                 f"got {self.kind!r}")
         if self.kind != "label":
-            if self.labels or self.descriptions:
+            if self.labels or self.descriptions or self.probabilities:
                 raise CompileError("only an AI.CLASSIFY call has labels")
             return
         validate_labels(self.labels, self.descriptions)

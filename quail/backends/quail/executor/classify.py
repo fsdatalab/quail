@@ -165,6 +165,13 @@ def _label_readout(state: QueryExecutionState, targets, rows: int, normalize: bo
     return readout
 
 
+def _softmax(scores) -> np.ndarray:
+    """Probabilities among the labels from their scores, on the last axis."""
+    scores = np.asarray(scores, dtype=np.float64)
+    scores = np.exp(scores - scores.max(axis=-1, keepdims=True))
+    return scores / scores.sum(axis=-1, keepdims=True)
+
+
 class ClassifyStages:
     """The stages one classification asks of each document, and its labels.
 
@@ -188,6 +195,7 @@ class ClassifyStages:
 
     canvas_rows = 0         # rows of a letters stage's canvas on a canvas model
     draws = 1               # noise draws a canvas letters read may average
+    probabilities = None    # (documents, labels) label probabilities, when asked
     seeds = None            # document index -> its canvas seed; the index itself
     partners = None         # JoinPartners, for joined rows
     pair_labels = None      # (anchor index, partner index) -> label, for joined rows
@@ -217,6 +225,8 @@ class ClassifyStages:
         self.readout = readout = _label_readout(state, targets, readout_rows,
                                                 not same_rows)
         self.labels = np.full(count, None, dtype=object)
+        if spec.probabilities:
+            self.probabilities = np.full((count, len(spec.labels)), np.nan)
         self.decoder = None
         self.stages = []
         if not request.rounds:
@@ -224,7 +234,7 @@ class ClassifyStages:
                 if self.draws > 1:
                     self._first_draw(anchor, row, on_label)
                 else:
-                    self._set(anchor, self.label_of(row), on_label)
+                    self._choose(anchor, _softmax(self._scores(row)), on_label)
                 return True
 
             canvas = self._letter_canvas(state) if self.canvas_rows else None
@@ -341,7 +351,7 @@ class ClassifyStages:
             probs = self._probs(row, more)[0]
             self.extended += 1
             mean = (self.draw_probs[anchor] + probs.sum(axis=0)) / self.draws
-            self._set(anchor, self.spec.labels[best_label(mean)], on_label)
+            self._choose(anchor, mean, on_label)
             return True
 
         return Stage(
@@ -358,10 +368,8 @@ class ClassifyStages:
         The entropy is in nats.
         """
         logits = np.asarray(logits).reshape(draws, self.readout_rows, -1)
-        scores = np.stack([self.request.score(logits[draw:draw + 1])
-                           for draw in range(draws)])
-        scores = scores - scores.max(axis=1, keepdims=True)
-        probs = np.exp(scores) / np.exp(scores).sum(axis=1, keepdims=True)
+        probs = _softmax(np.stack([self.request.score(logits[draw:draw + 1])
+                                   for draw in range(draws)]))
         entropy = -np.sum(probs * np.log(np.maximum(probs, 1e-30)), axis=1)
         return probs, entropy
 
@@ -370,7 +378,7 @@ class ClassifyStages:
         probs, entropy = self._probs(row, 1)
         self.draw_probs[anchor] = probs[0]
         if entropy[0] <= CANVAS_ENTROPY_NATS:
-            self._set(anchor, self.spec.labels[best_label(probs[0])], on_label)
+            self._choose(anchor, probs[0], on_label)
 
     def seed(self, anchor) -> int:
         """The document's canvas seed: its index unless ``seeds`` says."""
@@ -381,13 +389,19 @@ class ClassifyStages:
         if on_label is not None:
             on_label(anchor, label)
 
-    def label_of(self, logprobs):
-        """The label the classification gives from its read rows."""
+    def _choose(self, anchor, probs, on_label):
+        """Label the document by its labels' probabilities, keeping them when asked."""
+        if self.probabilities is not None:
+            self.probabilities[anchor] = probs
+        self._set(anchor, self.spec.labels[best_label(probs)], on_label)
+
+    def _scores(self, logprobs):
+        """Each label's score from the read rows."""
         if self.read_all:
             # a one-row readout returns (suffixes, targets)
             logprobs = logprobs.reshape(
                 len(self.request.suffixes), self.readout_rows, -1)
-        return self.spec.labels[best_label(self.request.score(logprobs))]
+        return self.request.score(logprobs)
 
     def finish(self, answers) -> tuple[int, int]:
         """Label every document from its answers; returns the token counts.
@@ -408,7 +422,7 @@ class ClassifyStages:
         else:
             for anchor, logprobs in first.items():
                 if self.labels[anchor] is None:
-                    self.labels[anchor] = self.label_of(logprobs)
+                    self._choose(anchor, _softmax(self._scores(logprobs)), None)
             read = sum(map(len, self.request.suffixes)) + self.canvas_rows
             suffix_tokens = len(first) * read
             if self.draws > 1:
@@ -454,10 +468,10 @@ class QuailClassifier:
         suffix_tokens, streamed = plan.finish(answers)
         total = sum(map(len, prefixes)) + streamed
         return self._batch(plan.labels, fresh, total - fresh, suffix_tokens,
-                           stats, spans)
+                           stats, spans, plan.probabilities)
 
     def _batch(self, labels, fresh, cached, suffix_tokens, stats,
-               spans) -> RerankerBatch:
+               spans, probabilities=None) -> RerankerBatch:
         """The labels and token counts of one run, with its GPU time when timed."""
         state = self.state
         gpu_s = 0.0
@@ -472,4 +486,5 @@ class QuailClassifier:
             borrowed_tokens=stats.get("borrowed_tokens", 0),
             pack_s=stats.get("pack_s", 0.0),
             gpu_s=gpu_s,
-            chunks=len(spans) if state.gpu_timing else 0)
+            chunks=len(spans) if state.gpu_timing else 0,
+            probabilities=probabilities)

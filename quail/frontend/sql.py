@@ -325,7 +325,7 @@ class _Binder:
         pairs, or of {'label': ..., 'description': ...} objects, or the
         name of a registered label table, given positionally or as
         categories => ...; the config object takes selectivity,
-        task_description, and output_mode.
+        task_description, output_mode, and probabilities.
         """
         categories = node.args.get("categories")
         if isinstance(categories, exp.Kwarg):
@@ -351,7 +351,8 @@ class _Binder:
         if len(aliases) not in (1, 2):
             raise CompileError("AI.CLASSIFY reads one document column, or "
                                "one from each side of a join")
-        model_call = ModelCall(prompt, "label", labels, descriptions)
+        model_call = ModelCall(prompt, "label", labels, descriptions,
+                               probabilities=options.pop("probabilities", False))
         model_call.validate()
         return model_call, options, aliases
 
@@ -440,10 +441,15 @@ class _Binder:
                     raise CompileError(
                         "AI.CLASSIFY returns one label: output_mode is "
                         "'single' or absent")
+            elif key == "probabilities":
+                if not isinstance(value, exp.Boolean):
+                    raise CompileError("probabilities is true or false")
+                out[key] = bool(value.this)
             else:
                 raise CompileError(
                     f"unknown AI.CLASSIFY option {key!r}; the options are "
-                    f"selectivity, task_description, and output_mode")
+                    f"selectivity, task_description, output_mode, and "
+                    f"probabilities")
         return out
 
     def parse_ai_filter(self, node, allowed: set, scope=None, join=None):
