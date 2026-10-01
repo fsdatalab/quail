@@ -1,0 +1,143 @@
+---
+title: Classification
+---
+
+`AI.CLASSIFY` returns a label from a fixed list. The SQL and Python
+front ends describe that request with the same logical expression.
+The physical planner chooses a scoring method and creates an
+`AiClassify` node. The executor evaluates that node and returns an
+Arrow string column.
+
+For query syntax and examples, see the [SQL reference](/docs/user-guide/sql#aiclassify)
+and [Python API](/docs/user-guide/python-api#ai_classify).
+
+## Logical and physical plans
+
+A classification is a `ModelCall` with `kind="label"`. The call
+contains a bound prompt, the allowed labels, and optional descriptions.
+A projected label is an `Alias` in `Project.columns`. A filter on a
+label is a `LabelIn` expression in a `SemanticFilter`.
+
+For a query that returns sentiment and keeps negative reviews, the
+physical graph contains ordinary operators:
+
+```text
+Scan(reviews)
+  -> AiClassify(sentiment)
+  -> Filter(sentiment IN ['negative'])
+  -> Project(r.id, sentiment)
+```
+
+`ClassifySpec` holds the chosen scoring rule, tokenized prompt parts,
+and labels for one `AiClassify`. Each later classification is another
+graph node. `Filter` tests a label already computed by its input.
+
+A query that returns scores and labels still uses `AiClassify` with a
+`ClassifySpec` for labels. A numeric score has an `AiScore` node with a
+`ScoreSpec`.
+The executor carries earlier score and label columns through later
+operators so both are available to the final projection.
+
+## Scoring methods
+
+The Quail backend supports the following rules:
+
+| Rule | How the executor selects a label | Requirements |
+| --- | --- | --- |
+| `letters` | The prompt assigns each category a distinct one-token code. The code with the highest score selects the corresponding label. | The tokenizer must supply a distinct one-token code for every category. |
+| `trie_tree` | The executor scores the allowed label token sequences together. It selects the label with the highest sum of token log probabilities. | An FP8 model without canvas tokens, with attention not forced to `unified`. |
+| `trie_decode` | The executor greedily chooses the next token among the allowed continuations until it reaches a label. | A causal model, and no label token sequence that is a proper prefix of another. |
+
+A trie is a tree of token sequences that stores a shared token prefix
+once. For example, labels `refund request` and `refund status` can
+share the tokens for `refund` before their paths branch.
+
+The methods can return different labels. `trie_decode` chooses a
+path token by token, while `trie_tree` compares complete label scores.
+Ties select the earlier label or token branch in the supplied list.
+If a greedy decode finishes without an allowed label, the executor
+omits that document from its output.
+
+The planner compares estimated costs among supported rules. Automatic
+selection considers `trie_decode` only when document KV is not already
+resident from an earlier stage. The planner also
+checks whether the document and classification prompt fit the token
+and KV budgets. You can force a rule when comparing behavior:
+
+```python
+config = quail.EngineConfig(
+    model="qwen3-4b-fp8",
+    device="h100-sxm",
+    label_scoring="letters",
+)
+```
+
+An unsupported forced rule produces a planning refusal. Diffusion
+models use `letters`. Joined classification in the Quail backend also
+requires `letters`. Request backends implement classification through
+their own requests, so the Quail scoring configuration does not define
+their execution.
+
+## Pipelines and decoder rounds
+
+On one GPU, the runner groups compatible operators into pipelines.
+A document can pass through a classification, a filter on its label,
+and another classification while its document KV remains available.
+KV is the model's saved key and value state for previously computed
+tokens.
+
+The pipeline builder reads the physical graph. The classification
+executor then creates the requests needed for each scoring rule.
+`letters` and `trie_tree` use one scoring stage. `trie_decode` uses
+stages for successive token choices. Multiple diffusion draws add a
+later stage for uncertain documents.
+
+The decoder stages stay inside execution of one `AiClassify` node.
+They do not create another physical plan. The shared stage scheduler
+packs requests from ready documents into forward passes, subject to
+the token budget and available KV pages. One scoring stage can
+therefore require several GPU forward passes over a large input.
+
+## Diffusion models
+
+A one-document classification on DiffusionGemma reads the first row
+of an answer canvas, a short sequence of tokens processed by the
+model's denoising pass. The canvas starts with a random token. Its
+seed depends on the document's row index and draw number.
+
+Quail converts the letter logits into probabilities over the allowed
+letters. If their entropy exceeds 0.1 nats, the executor runs the
+remaining draws and chooses the label with the highest mean
+probability. Low entropy means that most probability is concentrated
+on one label.
+
+`EngineConfig(canvas_draws=4)` is the default maximum. Set it to `1`
+to use one draw per document. The draw setting also applies to
+one-document `AI.SCORE`, which averages its TRUE probabilities.
+The setting does not enable multiple draws for joined classification.
+
+## Classifying joined rows
+
+A joined classification reads the two documents named in its prompt.
+The Quail executor keeps the join's anchor document in KV and appends
+the matched partner document and classification question for each
+pair. A classification of an earlier join uses that join stage's
+matches even if the same anchor participates in a later join.
+
+Pair classification requires the classifier and its AI join to share
+a pipeline on one GPU. Independent consumers can end that pipeline.
+The planner rejects a pair classifier that would have to execute on
+its own. The current executor has no standalone pair classification
+path.
+
+## Source files
+
+| Responsibility | File |
+| --- | --- |
+| Bind category lists and classification prompts | [`logical/prompts.py`](https://github.com/fsdatalab/quail/blob/main/quail/logical/prompts.py) |
+| Choose a rule and construct `ClassifySpec` and `AiClassify` | [`planner/classify.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/classify.py) |
+| Estimate classification work and time | [`cost/classify.py`](https://github.com/fsdatalab/quail/blob/main/quail/cost/classify.py) |
+| Group physical operators into pipelines | [`execution/pipelines.py`](https://github.com/fsdatalab/quail/blob/main/quail/execution/pipelines.py) |
+| Create scoring requests and decoder stages | [`executor/classify.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/classify.py) |
+| Produce classification output tables within a pipeline | [`executor/operators/classify.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/operators/classify.py) |
+| Schedule and run scoring stages | [`executor/stages.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/stages.py) |

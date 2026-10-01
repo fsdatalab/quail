@@ -13,7 +13,8 @@ can be validated, serialized, and edited before execution.
 
 Each node has typed input and output ports. An `InputPort` reads
 from one `OutputPort` of another node. Value types include
-`DOCUMENT_IDS`, `FILTER_ANSWERS`, `JOIN_ANSWERS`, and `ROWS`. The
+`DOCUMENT_IDS`, `FILTER_ANSWERS`, `JOIN_ANSWERS`, `SCORES`, and `ROWS`.
+`SCORES` carries numeric score columns or string label columns. The
 graph validates that connected ports have matching types.
 
 ```python
@@ -42,6 +43,9 @@ All node types are defined in
 | [`Recombine`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Joins TRUE answer tables using Arrow. |
 | [`Project`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Reads the selected columns for surviving rows. |
 | [`Limit`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Truncates the result. |
+| `Filter` | Tests an already computed score or label column. |
+| `HashJoin` | Restricts candidate document pairs using column equalities. |
+| `Foreign` | Calls a registered Python function for `apply` or `apply_table`. |
 
 **Quail backend nodes**:
 
@@ -49,6 +53,8 @@ All node types are defined in
 | --- | --- |
 | [`AiFilter`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Runs filter stages on the GPU. |
 | [`AiJoin`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Runs join stages on the GPU. |
+| `AiScore` | Produces numeric scores according to a `ScoreSpec`. |
+| `AiClassify` | Produces labels according to a `ClassifySpec`. |
 
 ### Node ids
 
@@ -97,10 +103,10 @@ a `Scan`, `AiFilter`, or `AiJoin` would change what the query
 computes.
 
 ```python
-plan4 = plan3.move("apply:same_page", between=("barrier:e", "ai_join:e"))
+plan4 = plan2.move("apply:same_page", between=("barrier:e", "ai_join:e"))
 ```
 
-Move a node from its current position to a new edge.
+Alternatively, move the node in `plan2` to a new edge instead of removing it.
 
 ```python
 result = query.run(plan=plan4)

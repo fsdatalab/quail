@@ -56,17 +56,25 @@ function arrives.
 | Expression | Value |
 | --- | --- |
 | `ColumnRef(alias, provider, column)` | A column of a table. |
-| `ModelCall(prompt, kind)` | One prompt asked of every row. `kind` is `boolean` for `AI.IF`, which answers yes or no, or `score` for `AI.SCORE`, which answers a float between 0 and 1. |
+| `ModelCall(prompt, kind, labels, descriptions)` | A model expression. `kind` is `boolean` for `AI.IF`, `score` for `AI.SCORE`, or `label` for `AI.CLASSIFY`. Label calls hold their categories and optional descriptions. |
 | `Compare(call, comparison, threshold)` | A score compared with a threshold. Answers yes or no. |
+| `LabelIn(call, labels)` | A computed classification tested against accepted labels. Answers yes or no. |
 | `Alias(expression, name)` | A model call returned as a named result column. |
 
 A predicate on a `SemanticFilter` or `SemanticJoin` answers yes or
-no: a boolean `ModelCall`, or a `Compare` around a score call.
+no: a boolean `ModelCall`, a `Compare` around a score call, or a
+`LabelIn` around a one-document classification. Pair label tests are
+unsupported.
 `Project.columns` holds `ColumnRef` and `Alias` values.
 
 `LogicalPlan.operators()` is the one walk that turns the tree into
 what the planner reads: the scans, each alias's filter predicates in
-written order, the joins in written order, and the applies.
+written order, the joins in written order, and the applies. The
+inventory also includes named model projections and a `LabelWork`
+record for classification calls, names, and label tests. The planner
+uses that shared inventory for classification and mixed score queries.
+See [classification](/docs/architecture/classification) for the lowering
+to physical nodes.
 
 
 ## Prompt binding
@@ -197,7 +205,7 @@ A rule gets the whole plan and returns a new root, or `None` if
 nothing changed. `apply_logical_rules` runs the rules in order and
 repeats until a pass leaves the plan unchanged or four passes have
 run. The limit is `MAX_PASSES` in `logical_optimizer.py`. See
-[rule order and precedents](/docs/extending/operators#optional-logical-and-physical-rules).
+[optimizer rule order](/docs/extending/operators#optimizer-rules).
 
 Quail includes one built-in logical rule:
 

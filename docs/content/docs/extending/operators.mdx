@@ -2,149 +2,113 @@
 title: Custom operators
 ---
 
-Quail currently supports one AI operator: `AI.IF` (Snowflake: `AI_FILTER`),
-which returns TRUE or FALSE. Adding a new operator requires changes
-at three levels: a logical node, a physical node, and planning
-logic.
+Quail includes `AI.IF`, `AI.SCORE`, and `AI.CLASSIFY`. To add another
+operation, define what it means in the logical plan, choose physical
+nodes for its execution, and register a runtime for any new node type.
 
-We use `AI.CLASSIFY` as a running example. `AI.CLASSIFY` categorizes
-each document into one of N labels instead of returning TRUE/FALSE.
-It also requires decode (the model generates multiple tokens).
+If you only need Python logic to filter documents or select candidate
+pairs, use [`apply`](/docs/user-guide/python-api#apply). It already has
+a logical node, a physical node, and execution support.
 
-## Logical node
+## Start with the logical expression
 
-A logical node defines what the operator means in the query plan.
-For `AI.CLASSIFY`, the node holds the input, the prompt, and the
-allowed categories:
+Model calls are expressions within logical operators. For example,
+`AI.CLASSIFY` is a `ModelCall` with `kind="label"`. The front ends put
+it in a projection to return a label, or inside `LabelIn` to filter
+on that label. It does not require a separate logical classification
+node.
 
-```python
-@dataclass(frozen=True)
-class SemanticClassify:
-    input: LogicalNode
-    prompt: Prompt
-    categories: tuple[str, ...]
+Decide whether your operation needs a new expression or a new node.
+An expression represents a computed value. A node represents a query
+operation with inputs and an output schema. Logical nodes implement
+`children`, `expressions`, validation, and immutable rewrite methods.
+See [logical plans](/docs/architecture/logical-plans) for the protocol.
 
-    type_name: ClassVar[str] = "quail.semantic_classify"
+Update the SQL compiler and Python builder together when adding
+public syntax. They should produce equivalent logical plans for the
+same operation.
 
-    def children(self):
-        return (self.input,)
+## Define physical inputs and outputs
 
-    def expressions(self):
-        return (self.prompt, self.categories)
+A physical node describes one executable operation. Its typed ports
+state which values it consumes and produces. An `AiClassify`, for
+example, consumes document ids or earlier score tables and produces
+a label table. A one-document classifier also produces the ids of
+documents that received a label.
 
-    def output_schema(self):
-        return self.input.output_schema()
+For a new node type, define:
 
-    def validate(self):
-        if not self.categories:
-            raise CompileError("AI.CLASSIFY needs at least one category")
-```
+- Its input and output ports, including their value types and schemas.
+- A unique `type_name` and a `runtime_key` for runtime lookup.
+- An execution location, either the coordinator or a GPU executor.
+- `attributes()` and `from_attributes()` for serialization.
 
-See
-[`SemanticFilter`](https://github.com/fsdatalab/quail/blob/main/quail/logical/nodes.py)
-for how the existing filter node is built.
-
-## Physical node
-
-A physical node specifies how the operator runs on the GPU. For
-`AI.CLASSIFY`, the physical node holds the tokenized category labels:
+The runtime implements `execute(node, inputs, context)` and returns
+a `NodeResult`. Its output dictionary must match the node's declared
+ports. Register the node and runtime together:
 
 ```python
-@dataclass(frozen=True)
-class AiClassify(PhysicalNode):
-    alias: str = ""
-    category_token_ids: tuple = ()
-
-    type_name: ClassVar[str] = "quail.ai_classify"
-    runtime_key: ClassVar[str] = type_name
-    location: ClassVar[ExecutionLocation] = ExecutionLocation.GPU_EXECUTOR
+registry.register_node(MyNode, runtime=MyRuntime())
 ```
 
-Each physical node also needs:
+See the [extension overview](/docs/extending) for creating a registry
+and passing it to a session.
 
-- A **codec** to serialize the node across the process boundary.
-- A **runtime** that implements `execute(node, inputs, context)` and
-  returns the Arrow output tables.
+`register_node` supplies a `NodeCodec` by default. Supply a custom codec
+when the node needs a different encoding. The
+[`FirstDocuments` example in `tests/test_physical.py`](https://github.com/fsdatalab/quail/blob/main/tests/test_physical.py)
+shows a complete node, runtime, planner, and registration that run
+without a GPU.
 
-See
-[`AiFilter`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py)
-for how the existing filter physical node is built, and
-[`tests/test_physical.py`](https://github.com/fsdatalab/quail/blob/main/tests/test_physical.py)
-for a complete working example of a custom node with its codec,
-runtime, and planner.
+## Plan and estimate the operation
 
-## Planning
+The backend planner or an extension planner constructs physical
+candidates from the logical request. A `PhysicalCandidate` contains
+a graph, a plan, and its estimated execution time. Quail selects the
+candidate with the lowest estimate.
 
-Adding a new operator to the planner means teaching the existing
-Quail backend how to plan and cost the new node. Concretely:
+Keep prompt preparation and graph construction in the planner.
+Keep calculations of tokens, attention work, and execution time in
+`quail.cost`. For classification, those responsibilities are in
+[`planner/classify.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/classify.py)
+and [`cost/classify.py`](https://github.com/fsdatalab/quail/blob/main/quail/cost/classify.py).
 
-1. **Work counting.** Add a function that counts fresh tokens,
-   attention pairs, KV written, and KV read for the new operator.
-   Pass `window=model.sliding_window` to `scan`, `ask`, or `stream`
-   so you also count pairs and KV reads for sliding-window layers.
-   For `AI.CLASSIFY`, the prefill work per document is the same as
-   `AI.IF`. The difference is decode: generating each label
-   token is an additional forward pass that attends to all previous
-   tokens. See
-   [`quail/cost/work.py`](https://github.com/fsdatalab/quail/blob/main/quail/cost/work.py).
-2. **Cost estimation.** Pass the work counts through the
-   [roofline model](/docs/architecture/planning#the-roofline-speed-of-light-model)
-   to get estimated seconds. See
-   [`quail/cost/sol.py`](https://github.com/fsdatalab/quail/blob/main/quail/cost/sol.py).
-3. **Graph construction.** Include the new physical node in the graph
-   the planner builds. The planner in
-   [`quail/planner/decide.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/decide.py)
-   constructs the full physical graph (scans, filters, joins,
-   barriers, projection) and returns a `PhysicalCandidate` with the
-   graph and estimated time. The new node would be placed in the
-   graph alongside the existing node types.
+Reject an unsupported configuration during planning. Pair
+classification is one example. The Quail backend rejects a plan
+when the pair classifier cannot run in its AI join pipeline.
 
-## Optional: logical and physical rules
+## Add pipeline support when needed
 
-**Logical rules** rewrite the logical plan before physical planning.
-For example, a rule could rewrite `AI.CLASSIFY` with exactly two
-categories into an `AI.IF`, since two categories is equivalent
-to TRUE/FALSE.
+A runtime that executes a node independently is the starting point.
+If the operation should also execute with adjacent operators, define
+when they can share a pipeline and which input state is reusable.
 
-**Physical rules** rewrite the physical graph after the planner
-selects one. For example, a rule could fuse consecutive classify
-operators.
+The current pipeline builder is
+[`execution/pipelines.py`](https://github.com/fsdatalab/quail/blob/main/quail/execution/pipelines.py).
+Model pipeline execution is in
+[`executor/pipeline.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/pipeline.py),
+and operator implementations are in `executor/operators/`.
+Classification decoder rounds remain inside the classification
+executor. The physical graph still contains one node per classification.
 
-Rules run in this order:
+## Optimizer rules
 
-- Logical rules run in registration order, with built-in rules first.
-  Quail repeats the sequence until a pass leaves the plan unchanged
-  or it has run four passes (`MAX_PASSES`).
-- Physical rules run once per pass: `prefix_sharing`, then
-  `tree_attention`, then extension rules in registration order.
-- If the plan was built while tokenization was running, Quail runs
-  the physical rules again once the tokens are available. Return
-  `None` when your rule has no change to make. A repeated pass should
-  not duplicate a change already present in the plan.
+Register a logical rule to rewrite the logical tree, or a physical
+rule to rewrite the selected graph. Return `None` when no rewrite is
+needed.
 
-Repeated rule application is an established optimizer design.
-[DataFusion](https://datafusion.apache.org/library-user-guide/query-optimizer.html)
-also supports repeated logical optimization passes.
-[Spark's rule executor](https://github.com/apache/spark/blob/master/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/rules/RuleExecutor.scala)
-organizes rules into batches that run once or repeat until the plan
-stops changing or a configured limit is reached.
+Logical rules run in registration order until a pass makes no change,
+with a maximum of four passes. Physical rules run once in registration
+order. The built-in physical rules are `prefix_sharing`, followed by
+`tree_attention`.
 
-See
-[`quail/planner/logical_optimizer.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/logical_optimizer.py)
-and
-[`quail/planner/physical_optimizer.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/physical_optimizer.py)
-for the rule protocols.
+Quail may first plan with estimated document lengths while
+tokenization continues. After the tokens are available, it runs the
+physical rules again. A rule must handle repeated application without
+duplicating its changes.
 
-## Registration
-
-All pieces are registered on the session's `ExtensionRegistry`:
-
-```python
-registry = quail.ExtensionRegistry.with_built_ins()
-registry.register_node(AiClassify, runtime=AiClassifyRuntime())
-registry.register_physical_planner(ClassifyPlanner())
-registry.register_logical_rule(SimplifyBinaryClassify())
-```
-
-See the [Overview](/docs/extending) for how to create and pass a
-registry.
+The rule protocols are in
+[`logical_optimizer.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/logical_optimizer.py)
+and [`physical_optimizer.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/physical_optimizer.py).
+See [classification](/docs/architecture/classification) for the existing
+operator's plan and execution structure.

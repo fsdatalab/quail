@@ -60,6 +60,20 @@ state with the same joined tables does less work in all four
 quantities tracked by the roofline model (tokens, pairs, KV writes,
 KV reads).
 
+## Choosing classification scoring
+
+For `AI.CLASSIFY`, the planner checks supported scoring rules and
+compares their estimated work and execution time. Prompt preparation
+and graph construction live in `planner/classify.py`; work and time
+calculations live in `cost/classify.py`.
+
+The resulting graph uses an `AiClassify` node for each classification
+and ordinary `Filter` nodes for label tests. Pipeline construction then
+groups compatible operators. Unsupported model, budget, or joined
+classification configurations produce a refusal before execution.
+See [classification](/docs/architecture/classification) for the rules
+and execution requirements.
+
 ## Deciding token budget and KV capacity
 
 The planner also decides:

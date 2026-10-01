@@ -19,9 +19,18 @@ walks the physical plan's nodes in topological order. For each node
 it calls the registered runtime, checks the output ports, records
 metrics, and notifies any observers.
 
-Relational nodes (`Recombine`, `Project`, `Limit`) run on the CPU
-using Arrow. Model nodes (`AiFilter`, `AiJoin`) run on the GPU
-using the execution loop described below.
+Relational nodes such as `Filter`, `Recombine`, `Project`, and `Limit`
+run on the CPU using Arrow. Model nodes include `AiFilter`, `AiJoin`,
+`AiScore`, and `AiClassify`.
+
+On one GPU, the runner can execute several compatible nodes as one
+pipeline. The pipeline builder follows document dependencies in the
+physical graph and checks which operators can run together. Each
+operator still has its own physical node and metrics; grouping them
+changes how they execute.
+A materialization barrier or independent consumers can end the pipeline.
+The executor can then process ready documents across operators while
+reusing their document KV.
 
 ## Operator execution
 
@@ -88,6 +97,20 @@ sharing one anchor's KV.
   runs out, Quail evicts the least valuable KV and reprocesses the
   document later.
 
+### Classification execution
+
+An `AiClassify` produces a string label column. A following `Filter`
+tests those labels, and another model operator can consume the
+surviving documents in the same pipeline. Queries that also return
+numeric scores retain separate `AiScore` nodes and score columns.
+
+The classification executor converts its scoring specification into
+internal stages. Greedy label decoding may need several stages, but
+the physical graph still contains one node per classification. The
+shared stage scheduler packs ready requests into GPU forward passes.
+See [classification](/docs/architecture/classification) for scoring
+rules, diffusion draws, and the joined classification restrictions.
+
 ## Model forward pass
 
 A single filter or join operator may require hundreds or thousands
@@ -147,13 +170,16 @@ RoPE, SiLU + FP8 quantize, and the attention merge + FP8 quantize
 for joins. These fused kernels reduce the number of GPU kernel
 launches per layer.
 
-Every predicate returns a single token: TRUE or FALSE. Multiple
-tokenizations count (e.g., "TRUE", " TRUE", "True"), so there are
-several token IDs per side. At model load time, Quail keeps only
-the vocabulary matrix rows for all TRUE and FALSE token IDs and
-discards the rest of the output head. Each forward pass scores only
-those rows. The predicate passes if the best TRUE token scores
-higher than the best FALSE token.
+Boolean predicates compare TRUE and FALSE token logits. Multiple
+spellings count, including space-prefixed forms. The predicate passes
+when its best TRUE logit exceeds its best FALSE logit.
+
+The loaded model retains its output head for classification. Boolean
+readout projects the TRUE and FALSE rows; letter classification projects
+the candidate code rows. Multi-token label scoring also needs the
+full-vocabulary normalization used to compute token log probabilities.
+`readout.py` owns those conversions from hidden states to answers,
+numeric scores, and label scores.
 
 Quail uses [FlashAttention 3](https://arxiv.org/abs/2407.08608) on
 H100 and FlashAttention 2 on Blackwell GPUs.
@@ -187,8 +213,13 @@ Use these files to change how Quail runs your query.
 | How Quail allocates, keeps, and frees KV pages | [`arena.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/arena.py) |
 | GPU kernels and attention calculations | [`attention.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/attention.py) |
 | The Qwen3 forward pass | [`models/qwen3.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/models/qwen3.py) |
-| How filter and join batches run | [`loop.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/loop.py) |
-| How model outputs become Boolean answers or `AI.SCORE` values | [`readout.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/readout.py) |
+| How ready stages are scheduled and GPU chunks run | [`stages.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/stages.py) |
+| How admitted requests become GPU input buffers | [`chunk.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/chunk.py) |
+| How physical operators execute together | [`pipeline.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/pipeline.py) and [`operators/`](https://github.com/fsdatalab/quail/tree/main/quail/backends/quail/executor/operators) |
+| How classification scoring and decoder rounds become stages | [`classify.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/classify.py) |
+| How model outputs become Boolean answers, numeric scores, or label scores | [`readout.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/readout.py) |
+| Which resources live with a loaded model or one query | [`state.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/state.py) |
+| Which kernel shapes are compiled during startup | [`warmup.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/warmup.py) |
 | How Quail loads model weights through vLLM | [`model.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/model.py) |
 
 If you add a model architecture, put its forward pass in `models/`.
@@ -200,10 +231,22 @@ Before you reuse the fused kernels in `attention.py`, check your
 model's operations. The kernels assume QK-norm before RoPE, a gated
 SiLU MLP, and FP8 block-quantized weights.
 
-Keep KV allocation and cleanup in the execution loop. Your model's
+Keep KV allocation and cleanup in the stage scheduler and arena. Your model's
 forward pass should only compute the requested hidden states. Use
 `chunk.attention_mode` for the attention path chosen when the chunk
 was packed.
+
+## State lifetimes
+
+`LoadedModelState` owns the model, KV arena, model pipeline, and reusable
+input and label readout buffers. It remains available while the model
+is loaded.
+
+`QueryExecutionState` holds the active query's answer and score
+readouts, chunk budget, and timing settings. The executor binds a new
+query state for each query while retaining the loaded model resources.
+Operator implementations receive those explicit states rather than
+attaching query fields to the backend object.
 
 ## Lifetime and limits
 

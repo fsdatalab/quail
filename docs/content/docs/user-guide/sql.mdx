@@ -38,7 +38,11 @@ BigQuery dialect.
 
 `PROMPT` writes the question that the model answers for each row.
 You write a template with `{0}`, `{1}`, etc. as placeholders for
-column values, and Quail substitutes each row's data in.
+column values. Quail binds the template to a model prompt layout;
+it is not ordinary string substitution. For the generative model
+layouts, documents precede the question so their saved model state
+can be reused. See [prompt binding](/docs/architecture/logical-plans#prompt-binding)
+for the layouts.
 
 For a filter, the prompt references one column:
 
@@ -46,7 +50,7 @@ For a filter, the prompt references one column:
 PROMPT('Does this review discuss the ending of the movie?\n\n{0}', r.body)
 ```
 
-Here `{0}` is replaced with each review's `body` text.
+Here `{0}` identifies the review's `body` column.
 
 For a join, the prompt references one column from each table:
 
@@ -269,164 +273,132 @@ labeled examples for your task.
 
 ### AI.CLASSIFY
 
-`AI.CLASSIFY` gives each document one label from a list you provide,
-like BigQuery's
-[AI.CLASSIFY](https://cloud.google.com/blog/products/data-analytics/sql-reimagined-for-the-ai-era-with-bigquery-ai-functions).
-Use it in `SELECT` to return the label, or in `WHERE` to keep the
-documents with certain labels.
-
-For example, to find the negative and mixed reviews and return each
-one's sentiment:
+`AI.CLASSIFY` returns one of your labels as a `STRING`. You can return
+labels in `SELECT`, filter documents by label in `WHERE`, or do both.
 
 ```sql
 SELECT r.id,
-       AI.CLASSIFY(PROMPT('What sentiment does this review express?\n\n{0}', r.body),
+       AI.CLASSIFY(
+           PROMPT('What sentiment does this review express? {0}', r.body),
+           ARRAY['positive', 'negative', 'neutral', 'mixed']) AS sentiment
+FROM reviews r
+```
+
+Give the output a name with `AS`. The classification must be a complete
+item in the `SELECT` list. You cannot use it inside another expression.
+
+#### Filter by label
+
+Use `=` or `IN` to select documents with particular labels:
+
+```sql
+SELECT r.id,
+       AI.CLASSIFY(PROMPT('What sentiment does this review express? {0}', r.body),
                    ARRAY['positive', 'negative', 'neutral', 'mixed']) AS sentiment
 FROM reviews r
-WHERE AI.CLASSIFY(PROMPT('What sentiment does this review express?\n\n{0}', r.body),
+WHERE AI.CLASSIFY(PROMPT('What sentiment does this review express? {0}', r.body),
                   ARRAY['positive', 'negative', 'neutral', 'mixed'])
       IN ('negative', 'mixed')
 ```
 
-The call in `SELECT` and the call in `WHERE` are the same, so Quail
-classifies each review once and uses its label for both.
+The calls in `SELECT` and `WHERE` are identical, so Quail classifies
+once per document and uses the label for both. Equality works with the
+label on either side. A label outside the category list matches no
+rows. Comparisons such as `<` raise `CompileError`.
 
-The model does not write the label as free text. Quail reads the
-labels' probabilities in one forward pass, with one of two rules:
+#### Inputs and categories
 
-- `letters`: the categories are lettered (`A: refund`, `B: praise`,
-  ...), the prompt asks for the letter, and the letters' probabilities
-  are read at the answer's first token. Past `Z` the letters continue
-  with `a` to `z` and then `AA` onward, up to 255 labels. On
-  DiffusionGemma the answer's first token is the first row of an
-  answer canvas that starts with a random token, read in one
-  denoising step. When the entropy of that read's label
-  probabilities, among the labels, is above 0.1 nats, the
-  document reads three more canvases, each with its own random token,
-  and takes the label with the highest mean probability, as vLLM's
-  DiffusionGemma structured server does by default.
-  `EngineConfig(canvas_draws=1)` reads one canvas; the default is 4.
-  `AI.SCORE` over one table averages its TRUE probability the same way.
-- `trie_tree`: the categories are named, and each label's score is
-  the sum of its tokens' log probabilities after the prompt, computed
-  over the labels' token trie in one request.
-
-The document gets the label with the highest score; a tie goes to the
-label listed first. Every document gets a label. DiffusionGemma reads
-letters. On Qwen3 the planner prices both rules for each
-classification, the lettered prompt's extra tokens against the trie's
-label tokens, and takes the cheaper; short labels usually make that
-the trie. `EngineConfig(label_scoring=...)` forces a rule.
-
-#### Return labels
-
-Give the label column a name with `AS`. `AI.CLASSIFY` must be a whole
-item of the `SELECT` list, not part of a larger expression.
-
-#### Filter rows
-
-Test the label with `=` or `IN`:
+The first argument is a `PROMPT` or a document column. With a column,
+you can supply the task in the options:
 
 ```sql
-WHERE AI.CLASSIFY(PROMPT(...), ARRAY[...]) = 'negative'
-WHERE AI.CLASSIFY(PROMPT(...), ARRAY[...]) IN ('negative', 'mixed')
+SELECT r.id,
+       AI.CLASSIFY(r.body, ARRAY['refund', 'praise'],
+                   {'task_description': 'Classify the customer request.'}) AS kind
+FROM reviews r
 ```
 
-The label can be on either side of `=`. A label that is not in the
-list matches no rows. Any other comparison, such as `<`, raises
-`CompileError`.
+The category list must have 2 to 255 nonempty labels. Labels must
+be distinct ignoring case. Descriptions are optional and may contain
+at most 25 words each.
 
-#### Labels
+| Category argument | Example |
+| --- | --- |
+| Label strings | `ARRAY['refund', 'praise']` |
+| Label and description pairs | `ARRAY[('refund', 'asks for money back'), ('praise', NULL)]` |
+| Objects with label and description fields | `ARRAY[{'label': 'refund', 'description': 'asks for money back'}, {'label': 'praise'}]` |
+| A registered label table | `kinds` |
 
-The second argument lists the labels in one of these forms:
-
-- An array of labels: `ARRAY['refund', 'praise']`.
-- An array of (label, description) pairs, where `NULL` means no
-  description: `ARRAY[('refund', 'asks for money back'), ('praise', NULL)]`.
-- An array of objects with a `label` and an optional `description`:
-  `ARRAY[{'label': 'refund', 'description': 'asks for money back'}, {'label': 'praise'}]`.
-- The name of a registered table, such as `kinds`. The table has a
-  `label` column, an optional `description` column, and an optional
-  integer `ordinal` column. Labels follow `ordinal` when it exists,
-  and are sorted by label text otherwise.
-
-You can also name the argument, as in `categories => ARRAY[...]`.
-
-A list has at least two labels, and no two labels are equal ignoring
-case. A description has at most 25 words, and the prompt shows it
-next to its label.
-
-#### Input
-
-The first argument is a `PROMPT` or a document column alone, such as
-`AI.CLASSIFY(r.body, ARRAY['refund', 'praise'])`. With a column alone,
-the prompt has no question. The model sees the document, then the
-instruction and the labels. Add a question with the `task_description`
-option.
+A label table needs a `label` column. It may also have `description`
+and integer `ordinal` columns. Quail orders labels by `ordinal` when
+present, and by label text otherwise. You may name the category
+argument, as in `categories => ARRAY['refund', 'praise']`.
 
 #### Options
 
-An optional third argument sets options:
+Pass options as the third argument:
 
 ```sql
-AI.CLASSIFY(PROMPT(...), ARRAY[...],
-            {'selectivity': 0.3,
-             'task_description': 'Pick the kind of request.',
+AI.CLASSIFY(r.body, ARRAY['refund', 'praise'],
+            {'task_description': 'Classify the customer request.',
+             'selectivity': 0.3,
              'output_mode': 'single'})
 ```
 
-- **`selectivity`**: optional. In `WHERE`, your estimate of the
-  fraction of documents whose label passes the test. Quail uses it to
-  decide which filters to run first. If you leave it out, Quail
-  assumes 20%.
-- **`task_description`**: optional. Text of at most 50 words, added
-  after the question.
-- **`output_mode`**: optional. Only `'single'`, one label per
-  document, is supported.
+| Option | Meaning |
+| --- | --- |
+| `task_description` | Task text added to the prompt. It may contain at most 50 words. |
+| `selectivity` | In a label filter, the estimated fraction of documents that pass. The default estimate is 0.2. |
+| `output_mode` | Only `'single'` is supported. |
 
-#### Classify joined rows
+The label list order resolves ties. The scoring method depends on the
+model and plan. A greedy decode that does not finish at an allowed
+label removes that document from the result. See
+[classification execution](/docs/architecture/classification) for the
+scoring methods and configuration.
 
-`AI.CLASSIFY` works on the rows of a join like any other `SELECT`
-expression: it labels each row the join returns. When its prompt reads
-one column from each table, the label describes the two documents
-together.
+#### Return scores and labels together
 
-For example, to find the aspects each review discusses and the
-review's sentiment toward each one:
+On a generative model, you can return `AI.SCORE` and `AI.CLASSIFY` in
+one query. Each expression retains its own output type:
+
+```sql
+SELECT r.id,
+       AI.SCORE(PROMPT('Does the customer request a refund? {0}', r.body)) AS refund_score,
+       AI.CLASSIFY(PROMPT('What is the request about? {0}', r.body),
+                   ARRAY['refund', 'shipping', 'praise']) AS topic
+FROM reviews r
+```
+
+Reranker models support `AI.SCORE` but cannot run `AI.CLASSIFY`.
+
+#### Classify a document pair
+
+A classification after an AI join can describe each matched pair:
 
 ```sql
 SELECT r.id, a.id,
        AI.CLASSIFY(
-           PROMPT('What sentiment does the review in DOCUMENT {0} express about the aspect in DOCUMENT {1}?',
+           PROMPT('What sentiment does DOCUMENT {0} express about DOCUMENT {1}?',
                   r.body, a.aspect),
            ARRAY['positive', 'negative', 'neutral', 'mixed']) AS aspect_sentiment
 FROM reviews r
 JOIN aspects a
-  ON AI.IF(PROMPT('Does the review in DOCUMENT {0} discuss the aspect in DOCUMENT {1}?',
-                  r.body, a.aspect))
+  ON AI.IF(PROMPT('Does DOCUMENT {0} discuss DOCUMENT {1}?', r.body, a.aspect))
 ```
 
-The join returns a (review, aspect) row when the review discusses the
-aspect. `AI.CLASSIFY` then labels only those rows.
+In the Quail backend, pair classification runs in the same pipeline
+as its AI join on one GPU. The planner refuses configurations that
+would run the pair classifier separately, including multiple
+independent classification outputs after a join and multiple GPUs.
+A pair classification cannot be tested in `WHERE` or combined with
+`AI.SCORE`. Each prompt must read one column from each of the two
+tables.
 
-Quail runs the classification on the join's anchor, the side the join
-processes first and keeps in GPU memory. Set it with the `anchor`
-option of the join's `AI.IF`, or let Quail choose. The anchor's
-documents are already in KV from the join. For each joined row, the
-model reads only the partner, which is the row's document from the
-other table, then the question and the labels.
-
-The prompt shows the anchor document first, then a line naming it,
-such as `(The document above is DOCUMENT {0}.)`. The partner follows
-under its own heading, such as `DOCUMENT {1}:`. The question
-keeps `{0}` and `{1}` as written, so refer to the documents as
-`DOCUMENT {0}` and `DOCUMENT {1}`, as in the example.
-
-A classification of joined rows has these limits:
-
-- The query must join the two tables with `AI.IF`. Otherwise it
-  raises `CompileError`, or Quail refuses to plan it.
-- Its label can be returned, but not tested in `WHERE`.
+The join prompt layout identifies documents as `DOCUMENT {0}` and
+`DOCUMENT {1}`. Use those names in the pair classification question,
+as in the example. See [joined classification](/docs/architecture/classification#classifying-joined-rows)
+for how the executor reuses the join's document state.
 
 ### AI.EXTRACT
 
@@ -459,8 +431,9 @@ FROM reviews r
 
 These work the way you expect from standard SQL:
 
-- **`SELECT`** lists columns. `*` expands to all columns. No
-  expressions or computed aliases.
+- **`SELECT`** lists columns and named `AI.SCORE` or `AI.CLASSIFY`
+  outputs. `*` expands to all table columns. Other computed expressions
+  are unsupported.
 - **`FROM`** names a registered table, with an optional alias.
 - **`JOIN`** and `CROSS JOIN` are supported. Outer joins (`LEFT`,
   `RIGHT`, `FULL`) are not.

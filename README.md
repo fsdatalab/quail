@@ -103,9 +103,9 @@ See [Quail Server](https://fsdatalab.github.io/quail/docs/user-guide/server).
 
 ## Supported operators
 
-Quail currently supports AI-powered filters, joins, and
-`EXISTS` / `NOT EXISTS`. We are actively adding more operators
-(`AI.CLASSIFY`, `AI.EXTRACT`, `AI.MAP`).
+Quail supports AI-powered filters, joins, `EXISTS` / `NOT EXISTS`,
+numeric scores (`AI.SCORE`), and classification (`AI.CLASSIFY`).
+`AI.EXTRACT` and `AI.MAP` are planned additions.
 
 We support two AI-SQL dialects:
 [Snowflake `AI_FILTER`](https://docs.snowflake.com/en/user-guide/snowflake-cortex/aisql)

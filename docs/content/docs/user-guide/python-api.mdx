@@ -50,6 +50,55 @@ multiple `ai_if` calls. Quail reorders them by estimated cost to
 reduce total work. Pass `order="as_written"` to `select()` to keep
 the written order.
 
+### ai_classify
+
+`ai_classify(prompt, labels, *, name, descriptions=None)`
+
+Compute a string label and give its output column a name. Return that
+column with `select()`, or filter on it with `label_in()`:
+
+```python
+query = (
+    session.docs("reviews").alias("r")
+    .ai_classify(
+        prompt('What sentiment does this review express? {0}', col("r.body")),
+        ["positive", "negative", "neutral", "mixed"],
+        name="sentiment")
+    .label_in("sentiment", ["negative", "mixed"], selectivity=0.3)
+    .select("r.id", "sentiment")
+)
+result = query.collect()
+```
+
+`labels` accepts a sequence of strings, `(label, description)` pairs,
+or the name of a registered label table. For a sequence of strings,
+you may supply a matching sequence of `descriptions`. Give descriptions
+in the pairs or the separate argument, not both. A label table requires
+`label` and may also contain `description` and `ordinal` columns.
+
+Supply 2 to 255 nonempty labels, distinct ignoring case. Each description
+may contain at most 25 words. The scoring method depends on the model
+and plan. Ties select the earlier label. A greedy decode that does not
+finish at an allowed label omits that document from the result.
+
+See the [SQL reference](/docs/user-guide/sql#aiclassify) for category
+forms and joined classification limits, and
+[classification execution](/docs/architecture/classification) for
+scoring methods.
+
+### label_in
+
+`label_in(name, labels, selectivity=None)`
+
+Keep documents whose named classification matches an accepted label.
+Call `ai_classify()` with that name first. The filter uses the computed
+label without classifying the document again. You may omit the label
+column from `select()` if you only want matching document columns.
+
+`selectivity` estimates the fraction of documents that pass; the default
+estimate is 0.2. The estimate changes planning, not which labels match.
+Filtering a two-document classification with `label_in()` is unsupported.
+
 ### ai_join
 
 `ai_join(others, prompt, selectivity=None, anchor=None, semantics="full")`
@@ -184,8 +233,10 @@ result = query.collect()
 You can also use `apply` after a filter to drop rows with custom
 Python logic before the next AI operator runs.
 
-`kind="per_batch"` (default) runs the function on each batch as
-they stream through.
+With `kind="per_batch"` (the default), the function can run as rows
+arrive within a GPU pipeline. When the node runs independently, it
+receives the materialized input. Do not depend on a particular batch
+size or use the callback to compute a result across all rows.
 
 ### apply_table
 
@@ -196,18 +247,14 @@ Like `apply`, but waits for the preceding stage to finish and calls
 `apply(..., kind="barrier")`.
 
 Use this when your function needs to see every surviving row at once.
-With `apply`, rows arrive in batches as they stream through. With
-`apply_table`, Quail finishes the preceding stage first, then calls
-your function once with all the results.
+`apply_table` finishes the preceding stage first, then calls your
+function once with all the results.
 
 ```python
-import pyarrow.compute as pc
-
 def deduplicate(tables):
     reviews = tables["r"]
-    unique = pc.unique(reviews.column("body"))
-    mask = pc.is_in(reviews.column("body"), unique)
-    return reviews.filter(mask).column("r")
+    groups = reviews.group_by("body").aggregate([("r", "min")])
+    return groups.column("r_min")
 
 query = (
     session.docs("reviews").alias("r")
@@ -218,7 +265,7 @@ query = (
 result = query.collect()
 ```
 
-Note that `apply_table` fixes the execution order at that point in
+`apply_table` fixes the execution order at that point in
 the query. The planner will not reorder operators across it.
 
 ## Errors

@@ -43,10 +43,18 @@ the nodes shown in `explain()` output.
 | Field | Description |
 | --- | --- |
 | `input_rows` | How many rows or pairs entered this node. |
-| `output_rows` | How many passed. |
+| `output_rows` | Rows or pairs the node produced. |
 | `fresh_tokens` | Input tokens this node processed. |
-| `evaluated_documents` | Documents evaluated (filters only). |
-| `borrowed_prefix_tokens` | Token positions reused from another document's prefix KV. Reported by filters and joins when the count is nonzero. |
+| `evaluated_documents` | Documents evaluated by a filter, score, or classification node. |
+| `evaluated_document_pairs` | Pairs evaluated by a join or pair classifier. |
+| `suffix_tokens` | Question and classification continuation tokens reported by score and classification nodes. |
+| `borrowed_prefix_tokens` | Token positions reused from another document's prefix KV, when reported by the node. |
+
+Classification has its own physical node metrics. A node can evaluate
+more documents than it returns if decoding does not produce an allowed
+label. A later `Filter` node records which computed labels passed its
+test. Operator-specific numeric metrics, such as classification packing
+time in `pack_s`, appear beside the common fields when provided.
 
 ## Boot details
 

@@ -200,8 +200,10 @@ return that same plan.
 
 **Returns**
 
-`PhysicalPlan`. The plan the executor will run, including the model,
-the worker count, and the estimated seconds.
+`PhysicalPlan | Refusal`. A supported plan includes the model,
+worker count, and estimated seconds. A `Refusal` explains why the
+planner cannot execute the query. `run()` raises `quail.RefusalError`
+for a refused query.
 
 ##### explain
 
@@ -359,7 +361,7 @@ asks for them.
       type: 'dict',
       required: true,
       description:
-        "Per-predicate Arrow tables. filters is keyed by (alias, position). joins is keyed by the join's position in the query text.",
+        "Arrow answer tables. filters is keyed by (alias, position); joins by the join's written position; classifies by classification output name.",
     },
   }}
 />
@@ -480,6 +482,23 @@ operators.
 
 `str`. The text is `no physical plan was executed` when `plan` is
 `None`.
+
+### Classification answers
+
+`collect()` returns projected label columns as Arrow strings. To inspect
+the classifier's answers before later filters, use the answer table:
+
+```python
+result = query.run()
+labels = result.answer_tables["classifies"]["sentiment"]
+print(labels.to_pydict())
+```
+
+For a classifier over alias `r`, the table contains internal document
+indices in `r` and labels in `sentiment`. A joined classifier also has
+the partner alias's indices. The table can contain documents or pairs
+removed by later operators, so its row count need not match the final
+query result.
 
 ### Execution report
 
