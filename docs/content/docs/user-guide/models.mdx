@@ -45,23 +45,32 @@ config = quail.EngineConfig(
 )
 ```
 
-DiffusionGemma uses the `letters` method for classification. For
-one-document classification and `AI.SCORE`, `canvas_draws` allows up to
-four attempts per document by default. Set `canvas_draws=1` in
-`EngineConfig` for one attempt. Classification of document pairs uses
-one attempt.
+Quail follows the approach for structured answers in
+[vLLM PR #57250: Jev-like DiffusionGemma support](https://github.com/vllm-project/vllm/pull/57250),
+implemented in Quail's own executor. Classification works as follows:
 
-If the first answer is uncertain, Quail runs the remaining attempts
-and chooses the label with the highest average probability. Quail
-measures uncertainty using entropy, which measures how spread out the
-label probabilities are, and repeats when entropy exceeds 0.1 nats.
-With `probabilities=true`, it returns the averaged label probabilities.
-For `AI.SCORE`, it averages TRUE probabilities.
+- Assign a letter to each category, such as A for "refund" and B for
+  "praise".
+- Start the answer with a random token and run one denoising step.
+  Read the category letters' probabilities at the first answer position.
+- Measure uncertainty using entropy, which measures how spread out the
+  category probabilities are. If entropy is at most 0.1 nats, choose
+  the category with the highest probability.
+- Otherwise, run the remaining attempts with different random tokens,
+  average each category's probabilities, and choose the category with
+  the highest average.
+- With `probabilities=true`, return the probabilities used to choose
+  the category, averaged over the attempts performed.
 
-Each attempt starts with a random token determined by the document's
-row index and attempt number. Quail reads label scores from the first
-answer position. See
-[`classify.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/classify.py)
+`canvas_draws` sets the maximum number of attempts per document and
+defaults to four. Set `canvas_draws=1` in `EngineConfig` for one
+attempt. Classification of document pairs always uses one attempt.
+`AI.SCORE` uses the same procedure and averages
+TRUE probabilities.
+
+Each random token is determined by the document's row index and
+attempt number, so changing the batch does not change the random choices.
+See [`classify.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/classify.py)
 for the implementation.
 
 [diffusion-report]: https://github.com/fsdatalab/quail/blob/3e09be9564e60183a0018b3908b05cd77cbd0d77/reports/2026-09-19-diffusion-gemma-quailb.md
