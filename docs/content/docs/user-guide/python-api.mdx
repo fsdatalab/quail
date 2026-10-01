@@ -55,7 +55,7 @@ the written order.
 `ai_classify(prompt, labels, *, name, descriptions=None, task_description="", probabilities=False)`
 
 Assigns a label to each document. Use `select()` to return the label
-column and `label_in()` to filter by it.
+column. Use `label_in()` to keep documents with particular labels.
 
 | Parameter | Description |
 | --- | --- |
@@ -87,9 +87,12 @@ label requirements, table ordering, and supported models.
 
 `label_in(name, labels, selectivity=None)`
 
-Keeps documents whose label is in `labels`. `name` must match the name
-given to an earlier `ai_classify()` call. Filtering a label and returning
-it with `select()` does not classify the document twice.
+Keeps documents whose classification result matches any label in
+`labels`, using the same membership check as SQL `IN`. `name` is the
+column name given to an earlier `ai_classify()` call.
+
+For example, `label_in("sentiment", ["negative", "mixed"])` keeps only
+reviews classified as "negative" or "mixed".
 
 `selectivity` estimates the fraction of documents that pass and defaults
 to `0.2`. `label_in()` cannot filter classifications of document pairs.
