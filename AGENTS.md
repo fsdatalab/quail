@@ -177,40 +177,44 @@ how they release and explain changes.
 
 ## QUAIL-B plots
 
-- One main plot over all queries and one plot per dataset, each
-  including every query; no separate single-query figures.
-  `reports/make_quailb_comparison_plots.py` makes them all.
-- Save them as vector PDFs (`reports/plots/quailb_main.pdf`,
-  `quailb_<dataset>.pdf`) with embedded fonts; commit the PDFs only,
-  and link them from the report.
-- Use grouped bars, readable page sizes, and one page per metric group.
-  Keep method order, colors, and metric definitions the same in every
-  plot.
-- Show the speed-of-light estimate as a horizontal line across each
-  query's bars in latency and token plots. Label it as an estimate,
-  give its KV capacity and survivor assumptions, and never give it an
-  accuracy. It is the distinct-prefix estimate: every shared prefix
-  computed once across requests, documents, and repeated aliases.
-  Check the query definitions and corpus before reusing an estimate;
-  recompute stale ones on the CPU from saved inputs.
-- For each query and configuration, show:
-  - latency in seconds, without model startup or result collection;
-  - recomputed KV tokens (`regret_tokens`): fresh tokens minus the
-    fewest input tokens the requests need with unlimited KV (each
-    document once, each question tail and anchor frame once per
-    document, each partner suffix once after its anchor). quail-bench
-    computes it (`quail_b.minimum`) from saved answer tables after the
-    run; a run without it shows as not measured, never as zero;
-  - fresh tokens (`fresh_tokens`): input token positions run through a
-    forward pass instead of read from KV, counting repeats. Recomputed
-    tokens are part of fresh tokens;
-  - accuracy as agreement with the saved reference labels, naming the
-    reference model, plus final output precision and recall;
-  - input document counts per alias before filters, with survivor
-    counts labeled separately.
+- One vector PDF per model, such as
+  `reports/plots/classify_sf05_qwen3_4b.pdf`, with embedded fonts.
+  Each is one page with every query of the run; no separate
+  single-query figures. One script per report,
+  `reports/make_<slug>_plots.py`, makes them all. Commit the PDFs only.
+- The page has four panels, top to bottom. Each shows grouped bars per
+  query, Quail first and then stock vLLM, in the same colors on every
+  page; name stock vLLM's submission strategy in the legend.
+  1. Latency in seconds, including planning and without model startup,
+     on a log scale. Write stock vLLM's time over Quail's and the SoL
+     seconds above each query.
+  2. Throughput in input tokens per second (`input_tokens_per_second`),
+     on a log scale.
+  3. KV regret (`regret_tokens`), on a log scale: fresh tokens minus the
+     fewest input tokens the requests need with unlimited KV (each
+     document once, each question tail and anchor frame once per
+     document, each partner suffix once after its anchor). quail-bench
+     computes it (`quail_b.minimum`) from saved answer tables after the
+     run. Say in the panel title when an engine's regret is approximate
+     and that SoL's is 0.
+  4. Accuracy: agreement with the saved reference labels, naming the
+     reference model (label agreement for classification queries).
+- Draw the speed-of-light (SoL) estimate as a horizontal line across
+  each query's bars in the latency and throughput panels. Compute it on
+  the CPU with `quail.speed_of_light_estimate`, passing the saved
+  reference labels as the answer and label oracles
+  (`quail.bench.quailb.answer_oracle`), and save it to the results
+  volume. Its throughput is the Quail run's input tokens over the SoL
+  seconds. Label it as an estimate, give its KV capacity and survivor
+  assumptions, and never give it an accuracy. Check the query
+  definitions and corpus before reusing an estimate; recompute stale
+  ones from saved inputs.
+- Put the run ID, the SoL source and survivor assumption, and the
+  meaning of each marker in a footer line. Mark a missing value with
+  an x and a zero with a dash; never show a missing value as zero, and
+  label a baseline that was not run as not run.
 - Reuse saved results unless asked to rerun, and name the source run.
-  Leave out measurements from an older query definition and label
-  missing baselines; never show a missing value as zero.
+  Leave out measurements from an older query definition.
 - When the layout changes, delete the old figures and scripts and
   update every reference.
 
