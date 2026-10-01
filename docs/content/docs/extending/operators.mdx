@@ -2,15 +2,15 @@
 title: Custom operators
 ---
 
-Custom operators require a logical representation, a physical plan,
-and a runtime for any new physical node. For Python functions between
-existing operators, use [`apply`](/docs/user-guide/python-api#apply).
+To add an operator, define its logical representation and physical
+plan. Add a runtime for each new physical node. For Python functions
+between existing operators, use [`apply`](/docs/user-guide/python-api#apply).
 
 ## Logical expressions
 
 Model calls are expressions within logical operators. `AI.CLASSIFY`,
-for example, is a `ModelCall` with `kind="label"`. It appears as an
-`Alias` in a projection or as the call tested by `LabelIn` in a filter.
+for example, is a `ModelCall` with `kind="label"`. In `SELECT`, the
+call is wrapped in an `Alias`. In a label filter, `LabelIn` tests the call.
 
 Add a logical node when the operation requires new inputs or an output
 schema. Logical nodes implement `children()`, `expressions()`, validation,
@@ -33,8 +33,8 @@ on an [extension registry](/docs/extending):
 registry.register_node(MyNode, runtime=MyRuntime())
 ```
 
-`register_node()` supplies a `NodeCodec` by default. A custom codec may
-be provided for another encoding. The
+`register_node()` supplies a `NodeCodec` by default. Supply a custom codec
+if the node needs another encoding. The
 [`FirstDocuments` example](https://github.com/fsdatalab/quail/blob/main/tests/test_physical.py)
 includes a node, runtime, planner, and registration that run without a GPU.
 
@@ -54,15 +54,15 @@ and [`cost/classify.py`](https://github.com/fsdatalab/quail/blob/main/quail/cost
 
 ## Pipelines
 
-An operator runtime can execute independently or participate in a
-pipeline. Pipeline support defines which adjacent operators can execute
-together and which document state they can reuse.
+An operator runtime can execute independently or in a pipeline.
+To support pipelines, define which adjacent operators can run together
+and which document state they can reuse.
 
 [`execution/pipelines.py`](https://github.com/fsdatalab/quail/blob/main/quail/execution/pipelines.py)
 groups physical nodes.
 [`executor/pipeline.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/pipeline.py)
 executes the groups using `executor/operators/`.
-Internal decoder rounds remain within one physical node.
+For classification, decoder rounds run inside one physical node.
 
 ## Optimizer rules
 

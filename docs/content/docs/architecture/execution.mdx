@@ -23,14 +23,14 @@ Relational nodes such as `Filter`, `Recombine`, `Project`, and `Limit`
 run on the CPU using Arrow. Model nodes include `AiFilter`, `AiJoin`,
 `AiScore`, and `AiClassify`.
 
-On one GPU, the runner can execute several compatible nodes as one
-pipeline. The pipeline builder follows document dependencies in the
-physical graph and checks which operators can run together. Each
-operator still has its own physical node and metrics; grouping them
-changes how they execute.
-A materialization barrier or independent consumers can end the pipeline.
-The executor can then process ready documents across operators while
-reusing their document KV.
+On one GPU, compatible operators can run in a pipeline. A document
+can reach the next operator before the previous operator finishes all
+documents, and the next operator can reuse its document KV.
+
+The pipeline builder groups nodes along their document dependencies.
+An operator that needs all input rows, or a branch with independent
+consumers, can end the pipeline. Each operator keeps its own physical
+node and metrics.
 
 ## Operator execution
 
@@ -69,7 +69,7 @@ repeat earlier turns. Quail can reuse KV for those repeated tokens.
   Filters executing with a row limit skip sharing to preserve row order.
 
 See the [prefix caching design](/docs/architecture/prefix-caching)
-for the data structure, example, and precedents, and
+for the data structure and an example, and
 [Planning](/docs/architecture/planning#deciding-whether-to-share-prefixes)
 for the cost comparison.
 
@@ -101,17 +101,17 @@ sharing one anchor's KV.
 
 `AiClassify` produces a string label column. A following `Filter` tests
 the computed labels. Compatible operators can run in one pipeline and
-reuse document KV. Numeric scores use separate `AiScore` nodes, with
-both score and label columns retained for projection.
+reuse document KV. Numeric scores use separate `AiScore` nodes.
+A query can return both score and label columns.
 
 Letter and tree scoring each use one internal stage. Greedy decoding
-uses successive stages to select label tokens. Decoder stages belong
-to one `AiClassify` node. The shared scheduler packs ready requests
-into forward passes within the token and KV page budgets. A stage may
-require multiple forward passes over its input.
+chooses one token at a time from the supplied label sequences until
+it reaches a complete label. All decoder stages belong to one
+`AiClassify` node.
 
-A document without an allowed label is omitted from the output.
-Scoring rules are described in
+The scheduler batches ready requests within the token and KV page
+budgets. A stage may need several forward passes to process its input.
+See the scoring rules in
 [planning](/docs/architecture/planning#choosing-classification-scoring).
 
 #### Diffusion draws
@@ -120,11 +120,13 @@ DiffusionGemma reads category logits from the first row of an answer
 canvas. The canvas starts with a random token seeded by document row
 index and draw number.
 
-If the category probability entropy exceeds 0.1 nats, the executor
-runs the remaining draws and selects the category with the highest
-mean probability, which is also the probability a classification
-with `{'probabilities': true}` returns. The maximum draw count is `EngineConfig(canvas_draws=4)`
-by default. Set `canvas_draws=1` for one draw.
+The executor measures uncertainty using the entropy of the category
+probabilities. If entropy exceeds 0.1 nats, it runs additional draws
+and selects the category with the highest mean probability.
+`EngineConfig(canvas_draws=4)` allows up to four draws by default.
+Set `canvas_draws=1` for one draw per document. With
+`probabilities=true`, the result includes the category probabilities
+used to choose the label, averaged over the draws performed.
 
 The setting also applies to one-document `AI.SCORE`, which averages
 TRUE probabilities. Joined classification uses one draw.
@@ -137,7 +139,6 @@ partner document and classification question for each pair.
 
 The classifier and AI join must share a pipeline on one GPU. The
 planner refuses pair classification that would execute independently.
-The executor has no standalone pair classification path.
 
 ## Model forward pass
 
@@ -187,10 +188,6 @@ and no canvas tokens, the extra rows used by DiffusionGemma. Other
 models use unified attention. See the
 [attention cost comparison](/docs/architecture/planning#choosing-the-attention-path).
 
-The `tree` attention path is a choice of attention computation.
-SGLang's RadixAttention names a prefix caching mechanism; it is not
-another name for this path.
-
 Quail uses vLLM's model implementation and DeepGEMM for the main
 matrix multiplications, but writes its own Triton JIT kernels to
 fuse several small operations: RMSNorm + FP8 quantize, QK-norm +
@@ -203,7 +200,7 @@ spellings count, including space-prefixed forms. The predicate passes
 when its best TRUE logit exceeds its best FALSE logit.
 
 The loaded model retains its output head for classification. Boolean
-readout projects the TRUE and FALSE rows; letter classification projects
+readout projects the TRUE and FALSE rows. Letter classification projects
 the candidate code rows. Multi-token label scoring also needs the
 full-vocabulary normalization used to compute token log probabilities.
 `readout.py` owns those conversions from hidden states to answers,
@@ -270,11 +267,10 @@ was packed.
 input and label readout buffers. It remains available while the model
 is loaded.
 
-`QueryExecutionState` holds the active query's answer and score
-readouts, chunk budget, and timing settings. The executor binds a new
-query state for each query while retaining the loaded model resources.
-Operator implementations receive those explicit states rather than
-attaching query fields to the backend object.
+`QueryExecutionState` holds one query's answer and score readouts,
+chunk budget, and timing settings. The executor creates a new query
+state for each query and reuses the loaded model resources. Operators
+receive both states as arguments.
 
 ## Lifetime and limits
 

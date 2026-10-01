@@ -4,8 +4,8 @@ title: SQL reference
 
 ## AI-SQL
 
-Quail supports model predicates, numeric scores, and classification in
-SQL queries. The SQL compiler accepts two dialects:
+Quail can filter, score, and classify documents in SQL. It accepts two
+SQL dialects:
 
 ```python
 session.sql(text, dialect="snowflake")  # AI_FILTER
@@ -16,10 +16,10 @@ The examples below use `dialect="bq"`.
 
 ## PROMPT
 
-`PROMPT(template, column, ...)` binds a question to document columns.
-Placeholders `{0}`, `{1}`, etc. refer to the columns in argument order.
-Generative model prompts place documents before the question to reuse
-their saved model state. See
+`PROMPT(template, column, ...)` defines a question about the supplied
+columns. `{0}` refers to the first column, `{1}` to the second, and so on.
+For generative models, Quail places documents before the question so
+later questions can reuse their saved model state. See
 [prompt binding](/docs/architecture/logical-plans#prompt-binding).
 
 For a filter, the prompt references one column:
@@ -151,9 +151,9 @@ AI_FILTER(PROMPT(...), {'selectivity': 0.3, 'anchor': 'r'})
 
 `AI.SCORE(prompt[, options])`
 
-Returns a `FLOAT64` between 0 and 1. Higher scores indicate a stronger
-model preference for "yes" over "no". Scores can be projected in
-`SELECT` or compared with a threshold in `WHERE` and `JOIN ... ON`.
+Returns a `FLOAT64` between 0 and 1. Higher scores mean the model
+favors "yes" more strongly. Return scores in `SELECT` or compare them
+with a threshold in `WHERE` or `JOIN ... ON`.
 
 All supported models can run `AI.SCORE`, including rerankers:
 
@@ -164,16 +164,11 @@ config = quail.EngineConfig(
 )
 ```
 
-- The rerankers, `qwen3-reranker-0.6b-bf16` and
-  `qwen3-reranker-4b-bf16`, use their own prompt layout. The system
-  message says, "You are performing a data processing task." It asks
-  the model to judge whether the document meets the query's
-  requirements and answer "yes" or "no".
-- The generative models, `qwen3-4b-fp8`, `qwen3-32b-fp8`, and
-  `diffusion-gemma-26b-a4b-fp8`, use the `AI.IF` prompt for the same
-  template and compare TRUE with FALSE. `AI.SCORE` runs that prompt
-  through a different execution path than `AI.IF`, so a score above
-  0.5 and the `AI.IF` answer can differ.
+- Rerankers use a prompt that asks whether the document meets the
+  query's requirements, with "yes" and "no" as the answers.
+- Generative models use the `AI.IF` prompt and compare TRUE with FALSE.
+  `AI.SCORE` and `AI.IF` run through different execution code, so a
+  score above 0.5 can disagree with an `AI.IF` answer.
 
 Use `gpus` to run a model copy on each GPU.
 
@@ -202,17 +197,15 @@ WHERE AI.SCORE(
 ) >= 0.75
 ```
 
-The optional `selectivity` hint estimates the fraction of rows that pass
-the comparison. Quail uses it to order filters and assumes 20% if omitted.
-The hint does not change the scores or threshold.
+`selectivity` estimates how many rows pass the threshold. Quail uses
+it to order filters and defaults to `0.2`. It does not affect the scores.
 
 #### Join tables
 
-For a prompt with two document arguments, a reranker includes the first in
-its query and uses the second as its candidate document. A generative
-model reads the pair in the `AI.IF` join layout. The
-template mentions `{0}` once, where that document is inserted; refer to
-it again in words:
+For a two-document prompt, a reranker includes the first document in its
+query and scores the second document against it. A generative model uses
+the `AI.IF` join layout. Use `{0}` once in the template. Refer to that document by name if you
+need to mention it again:
 
 ```sql
 SELECT q.id, d.id
@@ -222,19 +215,16 @@ JOIN documents d ON AI.SCORE(
 ) >= 0.8
 ```
 
-A pair score returned in `SELECT` without a comparison runs over
-every pair, so write the tables with `CROSS JOIN`. An `ON` column
-equality narrows the pairs only when the score is compared in `ON`.
+To return a score for every document pair, use `CROSS JOIN`. To restrict
+pairs by column equality, put both the equality and score comparison
+in `ON`.
 
-In the reranker's query text, a placeholder that stands alone at the
-start or end of the template marks where the document goes and is
-left out, since the reranker holds the document in its own field. A
-placeholder inside a sentence reads "this document".
+For rerankers, a placeholder at the start or end of the template is
+removed because the document is passed separately. Inside a sentence,
+the placeholder becomes "this document".
 
-When the same score appears in `SELECT`, a filter, or a join condition,
-Quail computes it once. Two comparisons of one score, such as a range,
-share that one computation. A query cannot combine `AI.SCORE` with
-`AI.IF`.
+When the same `AI.SCORE` call appears more than once, Quail evaluates
+it once per document or pair. A query cannot combine `AI.SCORE` with `AI.IF`.
 
 #### Score definition
 
@@ -244,11 +234,11 @@ Quail computes the score from the model's `yes` and `no` logits:
 score = exp(yes_logit) / (exp(yes_logit) + exp(no_logit))
 ```
 
-A generative model uses its highest TRUE and FALSE logits, over the
-spellings `TRUE`, `True`, and their space-prefixed forms, in place of
-`yes` and `no`. A reranker is trained to give this score; a generative
-model is not, so the same threshold can select different fractions of
-rows on different models.
+For generative models, `yes_logit` is the highest TRUE token logit
+and `no_logit` is the highest FALSE token logit, including alternative
+spellings and space-prefixed forms. Rerankers are trained to produce
+these scores. The same threshold can select different rows on
+different models.
 
 A score of 0.75 does not mean 75% accuracy. Choose the threshold using
 labeled examples for your task.
@@ -257,17 +247,18 @@ labeled examples for your task.
 
 `AI.CLASSIFY(input, categories[, options])`
 
-Returns a category label as a `STRING`. Classification can be projected
-in `SELECT` or tested with `=` and `IN` in `WHERE`. Identical calls in
-the projection and predicate share one computation. Classification
-requires a generative model.
+Returns one of the supplied labels as a `STRING`. Use it in `SELECT`
+to return labels, or with `=` and `IN` in `WHERE` to filter rows.
+When the same `AI.CLASSIFY` call appears in `SELECT` and `WHERE`,
+Quail evaluates it once per document. Classification requires a
+generative model.
 
 #### Parameters
 
 | Parameter | Description |
 | --- | --- |
-| `input` | A document column or `PROMPT`. A prompt over two tables classifies a document pair. |
-| `categories` | A list of 2 to 255 nonempty labels, distinct ignoring case, or a registered label table. |
+| `input` | A document column or `PROMPT`. Use a two-document prompt to classify pairs. |
+| `categories` | A list or registered table of 2 to 255 nonempty labels. Labels must be unique ignoring case. |
 | `options` | Optional task description, selectivity estimate, and output mode. |
 
 Categories can be supplied as:
@@ -277,30 +268,33 @@ Categories can be supplied as:
 - Objects: `ARRAY[{'label': 'refund', 'description': 'asks for money back'}, {'label': 'praise'}]`.
 - A registered label table: `kinds`.
 
-Descriptions may contain at most 25 words. A label table requires a
-`label` column and may include `description` and integer `ordinal`
-columns. Labels are ordered by `ordinal` when present, otherwise by
-label text. The category argument also accepts the named form
+Each description may contain up to 25 words. A label table needs a
+`label` column. Optional columns are `description` and an integer
+`ordinal`. Quail sorts labels by `ordinal` if present, otherwise by
+label text. You can also name the category argument:
 `categories => ARRAY['refund', 'praise']`.
 
 #### Options
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `task_description` | Empty | Task text appended to the question, at most 50 words. |
-| `selectivity` | `0.2` | Estimated fraction of documents passing a label predicate. |
-| `output_mode` | `'single'` | Only `'single'` is supported. |
-| `probabilities` | `false` | `true` adds `<name>_probabilities`, a `MAP<STRING, DOUBLE>` of each label's probability among the labels. |
+| `task_description` | Empty | Extra instructions added after the question, up to 50 words. |
+| `selectivity` | `0.2` | Estimated fraction of rows kept by a label filter. |
+| `output_mode` | `'single'` | One label per document. Other modes are unsupported. |
+| `probabilities` | `false` | Adds `<name>_probabilities`, a `MAP<STRING, DOUBLE>` from each label to its probability. |
 
-Ties select the earlier category. Greedy decoding can omit a document
-if it does not produce an allowed label. Scoring methods are described
-in [planning](/docs/architecture/planning#choosing-classification-scoring).
+When label scores tie, Quail chooses the label listed first. See
+[scoring methods](/docs/architecture/planning#choosing-classification-scoring).
+
+The vLLM and SGLang backends generate label text. If Quail cannot
+match the answer to a supplied label, it leaves that row out of the
+result. For example, "other" matches neither "refund" nor "praise".
 
 #### Examples
 
-Return one sentiment label per review. Projected classifications require
-`AS` and must be complete items in the `SELECT` list. Other expressions
-around a classification are unsupported.
+Return each review's sentiment. Use `AS` to name the label column.
+The `AI.CLASSIFY` call must be a separate item in `SELECT`. It cannot
+be nested inside another expression.
 
 ```sql
 SELECT r.id,
@@ -310,9 +304,9 @@ SELECT r.id,
 FROM reviews r;
 ```
 
-Return labels and filter by the same classification. Label predicates
-support `=` and `IN`. A label outside the category list matches no rows.
-Other comparisons raise `CompileError`.
+Return sentiment labels and keep negative or mixed reviews. Label
+filters support `=` and `IN`. A label outside the supplied list matches
+no rows. Other comparisons raise `CompileError`.
 
 ```sql
 SELECT r.id,
@@ -333,11 +327,14 @@ SELECT r.id,
 FROM reviews r;
 ```
 
-Return each label's probability beside the label. A row gets, for
-example, `topic = 'refund'` and `topic_probabilities = {'refund': 0.91,
-'shipping': 0.07, 'praise': 0.02}`. The probabilities come from the
-read that picks the label, at no extra GPU cost. They are unsupported
-for document pair classifications and on the vLLM and SGLang baselines.
+Set `probabilities` to `true` to return a probability for every label.
+The example adds `topic_probabilities` beside `topic`, such as
+`{'refund': 0.91, 'shipping': 0.07, 'praise': 0.02}`. The probabilities
+sum to 1 across the supplied labels. Returning probabilities does not
+require another model forward pass.
+
+Probabilities are unsupported for document pairs and on the vLLM and
+SGLang backends.
 
 ```sql
 SELECT r.id,
@@ -357,9 +354,9 @@ SELECT r.id,
 FROM reviews r;
 ```
 
-Classify pairs returned by an AI join. Each prompt reads one column
-from each table and refers to the documents as `DOCUMENT {0}` and
-`DOCUMENT {1}`.
+Classify each review's sentiment about a matched aspect. Each prompt
+uses one column from each table. Refer to the documents as
+`DOCUMENT {0}` and `DOCUMENT {1}`.
 
 ```sql
 SELECT r.id, a.id,
@@ -372,10 +369,10 @@ JOIN aspects a
   ON AI.IF(PROMPT('Does DOCUMENT {0} discuss DOCUMENT {1}?', r.body, a.aspect));
 ```
 
-In the Quail backend, pair classification requires one GPU and a
-pipeline shared with its AI join. Multiple independent pair classification
-outputs, pair label predicates, and pair classification combined with
-`AI.SCORE` are unsupported. See
+With the Quail backend, pair classification must run on one GPU in the
+same pipeline as its AI join. You cannot filter pair labels in `WHERE`,
+return multiple independent pair classifications, or combine pair
+classification with `AI.SCORE`. See
 [joined classification execution](/docs/architecture/execution#classifying-joined-rows).
 
 ### AI.EXTRACT

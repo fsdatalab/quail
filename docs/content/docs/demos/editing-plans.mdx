@@ -2,9 +2,9 @@
 title: Editing physical plans
 ---
 
-Physical plans can be inspected and edited before execution. The
-example inserts a barrier and a Python function between operators.
-Planning and editing do not require a GPU.
+Inspect and edit a physical plan before running it. The example adds
+a barrier and a Python function between operators. No GPU is needed
+to plan or edit the query.
 
 The full example is in
 [`demos/plan_walkthrough.py`][demoscript].
@@ -20,8 +20,8 @@ uv run python demos/plan_walkthrough.py
 The example uses three claims and three evidence passages from a
 [FEVER](https://fever.ai/) query in
 [QUAIL-B](/docs/contributing/benchmark). An AI filter selects claims
-about a person. An AI join tests whether each candidate passage supports
-the claim. Candidate pairs are restricted by the evidence page URL.
+about a person. An AI join tests whether a passage supports a claim.
+The page URL determines which claim and passage pairs are tested.
 
 The query uses the [Python builder API](/docs/user-guide/python-api):
 
@@ -97,10 +97,9 @@ edited = plan.insert(
 )
 ```
 
-In the edited plan, the barrier sits between the filter and the join.
-The filter's `keep_kv` changes from `False` to `True`: the filter and
-the join no longer run as one pipeline, so the filter retains its
-survivors' KV for the join instead:
+The barrier separates the filter and join into two pipelines.
+The filter sets `keep_kv=True` to retain surviving documents' KV
+until the join starts:
 
 ```text
       Barrier: next_anchor=c
@@ -114,9 +113,9 @@ Removing the barrier restores the original plan:
 assert edited.remove("barrier:c") == plan
 ```
 
-The editing API allows removal of `Barrier`, `Foreign`, and `Exchange`
-nodes. Removing a `Foreign` node also removes its Python function, which
-can change the candidate rows or pairs. Model nodes cannot be removed:
+Only `Barrier`, `Foreign`, and `Exchange` nodes can be removed.
+Removing `Foreign` also removes its Python function and can change
+the results. Removing a model node raises an error:
 
 ```text
 PlanEditError: 'ai_filter:c' is a AiFilter; removing it would change
@@ -140,8 +139,8 @@ query.apply(fn, columns=(), *, name=None, ids=None, kind="per_batch")
   predicate evaluates.
 - Without a preceding `.join()`, `fn` returns the ids to keep.
 - `kind="per_batch"` can run as documents pass through a pipeline.
-  An independent node receives materialized input. `kind="barrier"`
-  waits for all survivors and runs once.
+  Outside a pipeline, it receives all input rows. `kind="barrier"`
+  runs once after all surviving rows are available.
 
 An Arrow join in the function can select candidate pairs by URL:
 

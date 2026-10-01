@@ -198,10 +198,9 @@ return that same plan.
 
 **Returns**
 
-`PhysicalPlan | Refusal`. A supported plan includes the model,
-worker count, and estimated seconds. A `Refusal` explains why the
-planner cannot execute the query. `run()` raises `quail.RefusalError`
-for a refused query.
+`PhysicalPlan | Refusal`. A plan includes the model, worker count,
+and estimated execution time. A refusal explains why the query cannot
+run. Running a refused query raises `quail.RefusalError`.
 
 ##### explain
 
@@ -359,7 +358,7 @@ asks for them.
       type: 'dict',
       required: true,
       description:
-        "Arrow answer tables. filters is keyed by (alias, position); joins by the join's written position; classifies by classification output name.",
+        "Model answer tables. filters keys are (table alias, predicate position). joins keys are join positions in the query. classifies keys are label column names.",
     },
   }}
 />
@@ -483,8 +482,8 @@ operators.
 
 ### Classification answers
 
-`collect()` returns projected label columns as Arrow strings. To inspect
-the classifier's answers before later filters, use the answer table:
+`result.collect()` returns selected label columns as Arrow strings.
+To see labels before later filters remove rows, read the answer table:
 
 ```python
 result = query.run()
@@ -492,11 +491,10 @@ labels = result.answer_tables["classifies"]["sentiment"]
 print(labels.to_pydict())
 ```
 
-For a classifier over alias `r`, the table contains internal document
-indices in `r` and labels in `sentiment`. A joined classifier also has
-the partner alias's indices. The table can contain documents or pairs
-removed by later operators, so its row count need not match the final
-query result.
+The table contains zero-based document indices in `r` and labels in
+`sentiment`. A pair classifier includes both tables' indices. Answer
+tables can include rows removed by later filters, so they may contain
+more rows than the query result.
 
 ### Execution report
 

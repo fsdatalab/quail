@@ -54,17 +54,17 @@ the written order.
 
 `ai_classify(prompt, labels, *, name, descriptions=None, task_description="", probabilities=False)`
 
-Adds a classification column. The column can be returned with `select()`
-and tested with `label_in()`.
+Assigns a label to each document. Use `select()` to return the label
+column and `label_in()` to filter by it.
 
 | Parameter | Description |
 | --- | --- |
-| `prompt` | A prompt bound to document columns. |
+| `prompt` | The question and the document columns it refers to. |
 | `labels` | Label strings, `(label, description)` pairs, or a registered label table name. |
 | `name` | Output column name. |
-| `descriptions` | Optional descriptions corresponding to label strings. |
-| `task_description` | Task text appended to the question, at most 50 words. |
-| `probabilities` | `True` also returns `<name>_probabilities`, a map from each label to its probability among the labels. |
+| `descriptions` | Optional descriptions, one per label in the same order. |
+| `task_description` | Extra instructions added after the question, up to 50 words. |
+| `probabilities` | `True` also returns `<name>_probabilities`, a map from each label to its probability. |
 
 ```python
 query = (
@@ -79,21 +79,20 @@ query = (
 result = query.collect()
 ```
 
-Descriptions must be provided in the label pairs or the `descriptions`
-argument, not both. Category validation, label table ordering, and model
-restrictions are described in the
-[SQL reference](/docs/user-guide/sql#aiclassify).
+Supply descriptions in the label pairs or the `descriptions` argument,
+not both. See the [SQL reference](/docs/user-guide/sql#aiclassify) for
+label requirements, table ordering, and supported models.
 
 ### label_in
 
 `label_in(name, labels, selectivity=None)`
 
-Filters documents by a previously named classification. `name` must
-refer to an earlier `ai_classify()` call. The label is computed once,
-even when it is both filtered and projected.
+Keeps documents whose label is in `labels`. `name` must match the name
+given to an earlier `ai_classify()` call. Filtering a label and returning
+it with `select()` does not classify the document twice.
 
-`selectivity` estimates the fraction of documents that pass. The default
-estimate is `0.2`. Pair classification predicates are unsupported.
+`selectivity` estimates the fraction of documents that pass and defaults
+to `0.2`. `label_in()` cannot filter classifications of document pairs.
 
 ### ai_join
 
@@ -229,10 +228,10 @@ result = query.collect()
 You can also use `apply` after a filter to drop rows with custom
 Python logic before the next AI operator runs.
 
-With `kind="per_batch"` (the default), the function can run as rows
-arrive within a GPU pipeline. When the node runs independently, it
-receives the materialized input. Do not depend on a particular batch
-size or use the callback to compute a result across all rows.
+With `kind="per_batch"` (the default), the function can run as documents
+pass through a pipeline. Outside a pipeline, it receives all input rows.
+Batch sizes can vary. Use `apply_table()` for calculations that need
+all rows at once.
 
 ### apply_table
 
@@ -242,9 +241,7 @@ Like `apply`, but waits for the preceding stage to finish and calls
 `fn` once with all surviving rows. Equivalent to
 `apply(..., kind="barrier")`.
 
-Use this when your function needs to see every surviving row at once.
-`apply_table` finishes the preceding stage first, then calls your
-function once with all the results.
+Use `apply_table()` when the function needs all surviving rows at once.
 
 ```python
 def deduplicate(tables):
@@ -261,8 +258,7 @@ query = (
 result = query.collect()
 ```
 
-`apply_table` fixes the execution order at that point in
-the query. The planner will not reorder operators across it.
+The planner will not move operators across an `apply_table()` call.
 
 ## Errors
 

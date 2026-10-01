@@ -14,7 +14,7 @@ can be validated, serialized, and edited before execution.
 Each node has typed input and output ports. An `InputPort` reads
 from one `OutputPort` of another node. Value types include
 `DOCUMENT_IDS`, `FILTER_ANSWERS`, `JOIN_ANSWERS`, `SCORES`, and `ROWS`.
-`SCORES` carries numeric score columns or string label columns. The
+`SCORES` tables contain numeric scores or string labels. The
 graph validates that connected ports have matching types.
 
 ```python
@@ -44,7 +44,7 @@ All node types are defined in
 | [`Project`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Reads the selected columns for surviving rows. |
 | [`Limit`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Truncates the result. |
 | `Filter` | Tests an already computed score or label column. |
-| `HashJoin` | Restricts candidate document pairs using column equalities. |
+| `HashJoin` | Selects document pairs with equal column values. |
 | `Foreign` | Calls a registered Python function for `apply` or `apply_table`. |
 
 **Quail backend nodes**:
@@ -53,8 +53,8 @@ All node types are defined in
 | --- | --- |
 | [`AiFilter`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Runs filter stages on the GPU. |
 | [`AiJoin`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Runs join stages on the GPU. |
-| `AiScore` | Produces numeric scores according to a `ScoreSpec`. |
-| `AiClassify` | Produces labels according to a `ClassifySpec`. |
+| `AiScore` | Computes numeric scores using a `ScoreSpec`. |
+| `AiClassify` | Computes labels using a `ClassifySpec`. |
 
 ### Classification nodes
 
@@ -67,12 +67,10 @@ Scan(reviews)
   -> Project(r.id, sentiment)
 ```
 
-`ClassifySpec` holds the chosen scoring rule, tokenized prompt parts,
-and labels for one `AiClassify`. Each later classification is another
-graph node. `Filter` tests a label already computed by its input.
-
-Numeric scores use `AiScore` with a `ScoreSpec`. Score and label columns
-are retained through later operators for projection.
+Each `AiClassify` has a `ClassifySpec` with its scoring rule, prompt
+tokens, and labels. `Filter` tests the labels that `AiClassify` returns.
+Score and label columns pass through later operators so `Project` can
+return them.
 
 ### Node ids
 

@@ -56,23 +56,19 @@ function arrives.
 | Expression | Value |
 | --- | --- |
 | `ColumnRef(alias, provider, column)` | A column of a table. |
-| `ModelCall(prompt, kind, labels, descriptions)` | A model expression. `kind` is `boolean` for `AI.IF`, `score` for `AI.SCORE`, or `label` for `AI.CLASSIFY`. Label calls hold their categories and optional descriptions. |
+| `ModelCall(prompt, kind, labels, descriptions)` | A call to `AI.IF` (`boolean`), `AI.SCORE` (`score`), or `AI.CLASSIFY` (`label`). Classification calls include labels and optional descriptions. |
 | `Compare(call, comparison, threshold)` | A score compared with a threshold. Answers yes or no. |
-| `LabelIn(call, labels)` | A computed classification tested against accepted labels. Answers yes or no. |
+| `LabelIn(call, labels)` | Tests whether a classification result is in the accepted label list. |
 | `Alias(expression, name)` | A model call returned as a named result column. |
 
-A predicate on a `SemanticFilter` or `SemanticJoin` answers yes or
-no: a boolean `ModelCall`, a `Compare` around a score call, or a
-`LabelIn` around a one-document classification. Pair label tests are
-unsupported.
-`Project.columns` holds `ColumnRef` and `Alias` values.
+`SemanticFilter` and `SemanticJoin` accept Boolean model calls or score
+comparisons. `SemanticFilter` also accepts `LabelIn` for one-document
+classification. `Project.columns` holds `ColumnRef` and `Alias` values.
 
-`LogicalPlan.operators()` is the one walk that turns the tree into
-what the planner reads: the scans, each alias's filter predicates in
-written order, the joins in written order, and the applies. The
-inventory also includes named model projections and a `LabelWork`
-record for classification calls, names, and label tests. The planner
-uses that shared inventory for classification and mixed score queries.
+`LogicalPlan.operators()` walks the tree once to collect scans, filters,
+joins, Python functions, and named model calls for the planner. Filters
+and joins keep their written order. `LabelWork` records classification
+calls, output names, and label tests.
 See [classification nodes](/docs/architecture/physical-plans#classification-nodes)
 for the physical graph.
 
@@ -203,8 +199,8 @@ class LogicalOptimizerRule(Protocol):
 
 A rule gets the whole plan and returns a new root, or `None` if
 nothing changed. `apply_logical_rules` runs the rules in order and
-repeats until a pass leaves the plan unchanged or four passes have
-run. The limit is `MAX_PASSES` in `logical_optimizer.py`. See
+repeats until the plan stops changing, up to four passes
+(`MAX_PASSES` in `logical_optimizer.py`). See
 [optimizer rule order](/docs/extending/operators#optimizer-rules).
 
 Quail includes one built-in logical rule:

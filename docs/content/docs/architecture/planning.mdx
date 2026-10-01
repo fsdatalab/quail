@@ -72,20 +72,20 @@ lowest estimated execution time.
 | `trie_decode` | Greedy token selection along allowed label sequences. | Causal model; no label token sequence that is a proper prefix of another. |
 
 A trie stores shared prefixes of label token sequences once. Tree
-scoring compares complete label scores; greedy decoding selects one
-continuation at each step. The rules can return different labels.
+scoring compares complete label scores. Greedy decoding chooses one
+token at each step from the allowed continuations. The rules can
+return different labels.
 Ties select the earlier category or token branch in the supplied list.
 
 Automatic selection considers greedy decoding only when document KV is
 not already resident from an earlier stage. Diffusion models and joined
 classification use `letters`.
 
-A classification that returns its label probabilities
-(`{'probabilities': true}`) scores every label, so automatic selection
-leaves greedy decoding out and a forced `trie_decode` is refused. Under
-`letters` a label's probability is the softmax of the codes' scores;
-under `trie_tree` it is the label's summed token log probability,
-exponentiated and renormalized over the labels.
+Returning probabilities requires scoring every label. When
+`probabilities=true`, the planner excludes greedy decoding and refuses
+a forced `trie_decode`. The `letters` rule computes a softmax over the
+category code scores. The `trie_tree` rule sums each label's token log
+probabilities, exponentiates the sums, and normalizes across labels.
 
 The `label_scoring` setting forces a rule:
 
@@ -97,13 +97,14 @@ config = quail.EngineConfig(
 )
 ```
 
-Unsupported scoring rules, prompts exceeding token or KV budgets, and
-unsupported pair classification plans produce a planning refusal.
-Request backends use their own classification execution.
+The planner refuses unsupported scoring rules and pair classification
+plans. It also refuses prompts that exceed the token or KV budgets.
+The vLLM and SGLang backends generate label text through their own
+model engines.
 
 Implementation:
 [`planner/classify.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/classify.py)
-constructs prompts and physical nodes;
+constructs prompts and physical nodes.
 [`cost/classify.py`](https://github.com/fsdatalab/quail/blob/main/quail/cost/classify.py)
 estimates work and execution time.
 
@@ -144,13 +145,13 @@ write_seconds = total_tokens * model.kappa / device.hbm_bw
   for all input documents.
 
 The rule enables sharing when there are shared tokens and
-`saved_seconds > write_seconds`. It does not include sorting,
-scheduling, attention, or recomputation after KV is freed. The
-comparison estimates whether to enable sharing, not total query time.
+`saved_seconds > write_seconds`. The comparison excludes sorting,
+scheduling, attention, and recomputation after KV is freed, so it
+only estimates the savings from prefix reuse.
 
-If tokenization is still running when the first plan is built, Quail
-runs the physical rules again after it finishes. Prefix matching
-needs the token sequences, not just their lengths.
+If the first plan is built before tokenization finishes, Quail runs
+the physical rules again once the tokens are available. Prefix matching
+requires the token sequences.
 
 `explain(verbose=True)` shows the planner's choice as `share_prefixes`.
 
@@ -177,14 +178,14 @@ one combined output across all layers.
 
 - A join uses its estimated partners per anchor, tokens per partner
   prompt, and average anchor length.
-- A filter compares the paths for each group with the same parent
-  and shared-prefix length. Each group votes for the cheaper path,
-  weighted by its total reused tokens. The filter uses the path with
-  the larger weight; ties use unified.
+- A filter groups documents with the same parent and shared prefix
+  length. For each path, Quail sums the reused tokens in groups where
+  that path is cheaper. It chooses the path with the larger sum,
+  using unified attention when the sums tie.
 - Tree attention requires FP8 weights and no canvas tokens. The
   rule chooses unified for other models.
 
-These estimates use peak hardware rates. The current attention
+The estimates use peak hardware rates. The current attention
 estimate uses the FP8 compute rate even though attention runs in
 BF16, so it underestimates the compute portion on H100. It does not
 model kernel-launch overhead.

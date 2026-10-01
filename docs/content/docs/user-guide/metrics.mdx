@@ -47,14 +47,13 @@ the nodes shown in `explain()` output.
 | `fresh_tokens` | Input tokens this node processed. |
 | `evaluated_documents` | Documents evaluated by a filter, score, or classification node. |
 | `evaluated_document_pairs` | Pairs evaluated by a join or pair classifier. |
-| `suffix_tokens` | Question and classification continuation tokens reported by score and classification nodes. |
-| `borrowed_prefix_tokens` | Token positions reused from another document's prefix KV, when reported by the node. |
+| `suffix_tokens` | Question and label continuation tokens processed by score and classification nodes. |
+| `borrowed_prefix_tokens` | Token positions reused from another document's saved prefix. |
 
-Classification metrics are reported per node. `evaluated_documents`
-may exceed `output_rows` when decoding omits documents without an
-allowed label. Label predicates have separate `Filter` node metrics.
-Additional numeric fields, such as packing time in `pack_s`, are
-included when reported by the operator.
+With the vLLM and SGLang backends, `evaluated_documents` can exceed
+`output_rows` if a generated answer matches no supplied label.
+Label filters have their own `Filter` node metrics. Operators may also report extra fields such
+as packing time (`pack_s`).
 
 ## Boot details
 

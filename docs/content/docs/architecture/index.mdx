@@ -2,11 +2,11 @@
 title: Overview
 ---
 
-Quail compiles SQL and Python queries into logical plans, selects a
-physical plan by estimated cost, and executes the physical graph.
-Compatible operators can run in one GPU pipeline. The executor packs
-ready documents into forward passes and retains their key and value
-state (KV) for reuse by later operators.
+Quail compiles SQL and Python queries into logical plans. It chooses
+the physical plan with the lowest estimated cost, then executes it.
+Operators in one GPU pipeline can reuse a document's saved key and
+value state (KV). The executor batches documents into model forward
+passes.
 
 ## Query lifecycle
 
