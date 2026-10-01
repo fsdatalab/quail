@@ -85,17 +85,21 @@ label requirements, table ordering, and supported models.
 
 ### label_in
 
-`label_in(name, labels, selectivity=None)`
+`label_in(name: str, labels: Iterable[str], selectivity: float | None = None)`
 
 Keeps documents whose classification result matches any label in
-`labels`, using the same membership check as SQL `IN`. `name` is the
-column name given to an earlier `ai_classify()` call.
+`labels`, using the same membership check as SQL `IN`.
+
+| Parameter | Type | Description |
+| --- | --- | --- |
+| `name` | `str` | Column name given to an earlier `ai_classify()` call. |
+| `labels` | `Iterable[str]` | Labels to keep, such as `["negative", "mixed"]`. A list or tuple of strings works. |
+| `selectivity` | `float` or `None` | Estimated fraction of documents kept. `None` uses the default estimate of `0.2`. |
 
 For example, `label_in("sentiment", ["negative", "mixed"])` keeps only
 reviews classified as "negative" or "mixed".
 
-`selectivity` estimates the fraction of documents that pass and defaults
-to `0.2`. `label_in()` cannot filter classifications of document pairs.
+`label_in()` cannot filter classifications of document pairs.
 
 ### ai_join
 
