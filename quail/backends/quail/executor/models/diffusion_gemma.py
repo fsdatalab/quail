@@ -17,9 +17,9 @@ from quail.specs.base import CANVAS_SEED
 
 
 def canvas_token_ids(vocab: int, tokens: int, seed: int = CANVAS_SEED) -> tuple:
-    """The fixed random token ids that fill a filter's or join's canvas.
+    """Return fixed random canvas tokens for filter and join requests.
 
-    One draw serves every document, so answers are reproducible.
+    The same tokens are reused for every document to keep answers reproducible.
     """
     rng = np.random.default_rng(seed)
     return tuple(int(i) for i in rng.integers(0, vocab, tokens))

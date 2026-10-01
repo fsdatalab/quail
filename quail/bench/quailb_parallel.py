@@ -44,10 +44,16 @@ DATA_DIR = "/results/quailb_data"
 @app.function(image=image, timeout=1200, volumes=VOLUMES)
 def ensure_data(sf: float, query_ids: list[str], collection_id: str,
                 label_root: str = ""):
-    """Write the queries' tables to the volume and resolve the label collection.
+    """Prepare query tables and resolve the reference label collection.
 
-    label_root names a local mirror of the published labels, such as
-    the results volume, for a collection not yet in the public bucket.
+    Args:
+        sf: Dataset scale factor.
+        query_ids: Query IDs whose tables are required.
+        collection_id: Reference collection ID, or empty to use the default.
+        label_root: Optional local mirror of published reference labels.
+
+    Returns:
+        The resolved reference collection ID after committing data to the volume.
     """
     import pyarrow.parquet as pq
 
@@ -156,14 +162,27 @@ def run_query_family(
     label_root: str = "",
     canvas_draws: str = "",
 ) -> str:
-    """Run one query family through Quail and the vLLM baselines.
+    """Run one query family through the selected benchmark methods.
 
-    baselines names the vLLM baseline methods that run when
-    include_baselines is set. attention forces one attention path for filters
-    and joins; empty lets the planner choose. canvas_draws lists the
-    most noise draws a diffusion model averages, comma-separated, one
-    Quail run each; empty keeps the default. label_root names a local
-    mirror of the published labels.
+    Args:
+        model: Model name.
+        sf: Dataset scale factor.
+        query_ids_csv: Comma-separated query IDs in one family.
+        run_dir: Directory for this benchmark run.
+        ground_truth_collection: Reference label collection ID.
+        include_baselines: Whether to run the methods listed in baselines.
+        include_quail: Whether to run the Quail backend.
+        include_dumb_vllm: Whether to include the naive vLLM baseline.
+        baselines: Comma-separated vLLM baseline method names.
+        result_name: Suffix distinguishing groups from the same query family.
+        attention: Forced attention path, or empty for automatic selection.
+        gpu_timing: Whether to record GPU execution time.
+        label_root: Optional local mirror of reference labels.
+        canvas_draws: Comma-separated maximum diffusion draw counts. Empty
+            keeps the default; multiple counts create separate Quail runs.
+
+    Returns:
+        Path to the saved family result on the results volume.
     """
     process_groups = [("quail",)] if include_quail else []
     if include_baselines:

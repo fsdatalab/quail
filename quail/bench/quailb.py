@@ -269,13 +269,12 @@ def _submission_to_answer_s(
 
 
 def kernel_cache_files() -> dict[str, int]:
-    """Return the entry count under each kernel cache directory.
+    """Count top-level entries in each kernel cache directory.
 
-    The caches live under QUAIL_CACHE_DIR (Triton, DeepGEMM, and vLLM
-    each in their own directory), one entry per compiled kernel. A
-    count that grows across a query means kernels were compiled inside
-    the query's time. Counts the top level only: the caches sit on a
-    network volume, where walking every file takes seconds.
+    Returns:
+        Entry counts for the Triton, DeepGEMM, and vLLM directories under
+        QUAIL_CACHE_DIR. Counts can be compared before and after a query to
+        detect compilation during execution.
     """
     root = Path(os.path.expanduser(
         os.environ.get("QUAIL_CACHE_DIR", "~/.cache/quail/kernels")))
@@ -400,7 +399,7 @@ def run_suite(only=None, *, sf=0.1, config, data_dir=None,
 
 def _empty_record(skipped, *, sf, data_dir, ground_truth_collection, root,
                   config, metadata, h100_usd_per_hour, output_dir) -> dict:
-    """The run record of a suite whose every query was skipped."""
+    """Build a run record for a suite in which every query was skipped."""
     from quail_b import __version__
     from quail_b.run import RUN_SCHEMA_VERSION
 

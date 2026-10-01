@@ -41,7 +41,11 @@ class QuailModelExecution:
 
     @property
     def query(self) -> QueryExecutionState:
-        """Return the bound query or fail before execution starts."""
+        """Return the current query state.
+
+        Raises:
+            RuntimeError: No query has been bound to this executor.
+        """
         if self._query is None:
             raise RuntimeError("Quail model execution has no bound query")
         return self._query

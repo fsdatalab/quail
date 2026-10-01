@@ -1,14 +1,9 @@
-"""Admit groups into chunks within token and page budgets.
+"""Schedule document requests within token and KV page budgets.
 
-Tensor construction is in chunk.py. Admission runs without GPU or torch.
-
-- JoinAdmission: continuous anchor admission for every stage list
-  (joins, filter chains, classifications). Continuing partner streams
-  pack first, then anchors starting their next stage, then fresh
-  anchors whose pages fit the free list.
-
-Length units are tokens. Suffixes are atomic and never split across
-chunks.
+JoinAdmission serves joins, filter sequences, and classifications.
+It prioritizes unfinished requests, then documents entering their next
+stage, then new documents. Suffix requests are never split across chunks.
+Tensor construction is handled by chunk.py.
 """
 
 from bisect import bisect_right
@@ -184,7 +179,7 @@ SKIP = object()
 
 @dataclass(frozen=True)
 class Settlement:
-    """A settled document and whether it survived the last stage."""
+    """Completion record indicating whether a document survived the last stage."""
 
     kind: str
     anchor: int
@@ -193,7 +188,7 @@ class Settlement:
 
 @dataclass(frozen=True)
 class AdmissionReport:
-    """Settlements and stage decisions caused by one group's answers.
+    """Stage transitions and document completions caused by a group's answers.
 
     Each transition is (anchor, reported stage, passed). Passing a stage
     remains true when requests at the next stage drop the document.
@@ -206,7 +201,7 @@ class AdmissionReport:
 
 
 class JoinAdmission:
-    """Join scheduler: continuous anchor admission, stages mixed in one chunk.
+    """Scheduler that mixes documents at different stages within each chunk.
 
     Args:
         prefix_tokens: Per-anchor prefix token counts.
@@ -363,7 +358,7 @@ class JoinAdmission:
 
 
     def partner_count(self, a, j):
-        """Number of requests at a stage, before or after lazy selection.
+        """Return the request count before or after lazy partner selection.
 
         A lazy stage not yet entered counts its full suffix list.
         """
@@ -371,12 +366,16 @@ class JoinAdmission:
         return len(self.stages[j]) if lst is None else len(lst)
 
     def _enter(self, a, j):
-        """Move the anchor into stage j, past any stage its requests skip.
+        """Advance a document past skipped stages to its next request.
 
-        Returns None when the anchor has partners to stream at the
-        stage it lands in, else the event that settles it: "dropped"
-        when a stage's requests drop it or an earlier stage has no
-        partner, "finished" when it passes or skips the last stage.
+        Args:
+            a: Anchor document index.
+            j: Stage index to enter.
+
+        Returns:
+            None if the document has requests to run. Otherwise, the completion
+            event: "dropped" for removal or an empty intermediate stage, and
+            "finished" when the document completes its final stage.
         """
         k = len(self.stages)
         ask = self._lazy[a]
@@ -406,7 +405,7 @@ class JoinAdmission:
             return "finished" if j + 1 == k else "dropped"
 
     def _partner_list(self, a, j, lst):
-        """One stage's partner index list and its cumulative token sums."""
+        """Return partner indices and cumulative request token counts for a stage."""
         if lst is None:
             return None, None
         lst = list(lst)
@@ -534,10 +533,10 @@ class JoinAdmission:
         return a
 
     def take_settled(self):
-        """Events for anchors that settled without running a chunk.
+        """Remove and return documents settled without a forward pass.
 
-        Returns Settlement records, as report().settlements does,
-        and clears them.
+        Returns:
+            Settlement records, using the same format as report().settlements.
         """
         events, self._settled = self._settled, []
         return events
@@ -686,12 +685,13 @@ class JoinAdmission:
     # ---- gating --------------------------------------------------------
 
     def report(self, a, j, start, end, bits):
-        """Record one group's answers.
+        """Record a group's answers and update document progress.
 
-        Returns an AdmissionReport with settlements and stage transitions.
-        A transition records this stage's decision even if requests at a
-        later stage immediately settle the document. Settlements include
-        final survival, including a skipped last stage.
+        Returns:
+            An AdmissionReport containing stage transitions and document
+            settlements. A transition records the stage's decision even if the
+            next stage immediately removes the document. Settlements record
+            whether the document survived its final stage.
         """
         dtype = self.answer_dtypes[j]
         if dtype is None:
@@ -748,13 +748,15 @@ class JoinAdmission:
         return AdmissionReport(tuple(settlements), tuple(transitions))
 
     def limit_reached(self) -> bool:
-        """Whether enough anchors survived the last stage to stop admitting."""
+        """Return whether enough documents survived to stop new admissions."""
         return self.limit is not None and self.survivors >= self.limit
 
     def drain(self):
-        """Anchors still queued once the limit ends the run; they never run.
+        """Remove queued documents after the result limit is reached.
 
-        Returns their indices for the caller to free.
+        Returns:
+            Document indices whose KV the caller must release. These documents
+            have not run through the remaining stages.
         """
         out = [a for a in self.ready if self._stage[a] != _DONE]
         out.extend(a for a in self.pending if self._stage[a] != -1)

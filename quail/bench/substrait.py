@@ -95,7 +95,7 @@ class Classify:
 
     @property
     def relations(self) -> tuple[str, ...]:
-        """The aliases a label row names: the anchor, then the partner."""
+        """Return the anchor alias followed by the partner alias, when present."""
         return (self.alias,) if self.partner is None else (
             self.alias, self.partner[0])
 
@@ -309,7 +309,7 @@ def read_plan(plan: plan_pb2.Plan) -> QueryPlan:
 
 def build_query(session, plan: QueryPlan, selectivity=None,
                 order: str | None = None):
-    """Build the Quail query of a plan on a session.
+    """Build a Quail query from the parsed Substrait plan.
 
     Args:
         session: A session with every relation's table registered.

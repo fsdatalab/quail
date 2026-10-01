@@ -19,7 +19,7 @@ def input_staging(state: QueryExecutionState):
 
 
 class StagesPart:
-    """Stages the sink of a pipeline adds after the parts before it."""
+    """Additional stages contributed by a pipeline's final operator."""
 
     node = None
     gate = None
@@ -37,7 +37,18 @@ class StagesPart:
 
 
 def gated_stages(parts) -> list:
-    """The parts' stages in order; each gate guards the next stage."""
+    """Combine operator stages and attach intervening conditions.
+
+    Args:
+        parts: Pipeline parts in execution order. Parts without stages
+            contribute a condition checked before the next stage.
+
+    Returns:
+        The combined Stage list, with conditions attached to stage requests.
+
+    Raises:
+        ValueError: A trailing condition has no following stage.
+    """
     stages = []
     pending = []
     for part in parts:
@@ -73,7 +84,13 @@ def _part_slices(parts) -> list:
 
 
 def report_chain_transitions(parts, transitions) -> None:
-    """Hand each filter part the documents that settled at its stages."""
+    """Notify filter parts when documents pass or fail their final stage.
+
+    Args:
+        parts: Pipeline parts in execution order.
+        transitions: (document index, stage index, passed) completion records.
+            Intermediate successful stages do not complete a filter part.
+    """
     for part, (low, high) in zip(parts, _part_slices(parts)):
         if part.document_done is None:
             continue
@@ -86,12 +103,20 @@ def report_chain_transitions(parts, transitions) -> None:
 
 
 def complete_chain(parts, every, spans, tokens, stats, torch, inputs):
-    """Finish every part of a driven chain and store its result.
+    """Finalize pipeline parts and store each operator's result.
 
-    tokens are the run's fresh tokens less the consumer's own. The
-    first part with stages, which packed the documents, takes them
-    less the frames and suffixes of the parts after it; prefix
-    borrowing and packing time go to it as well.
+    The first part with stages receives document token costs, prefix-sharing
+    counts, and packing time. Later parts receive their own frame and suffix
+    token costs. GPU time is apportioned by the rows each part processed.
+
+    Args:
+        parts: Pipeline parts in execution order.
+        every: Answer mappings for all stages.
+        spans: Per-chunk row counts and timing events.
+        tokens: Fresh token count excluding the final consumer's own work.
+        stats: Packing time and prefix-sharing counts.
+        torch: Torch module used to synchronize timing events.
+        inputs: Execution settings, including whether GPU timing is enabled.
     """
     slices = _part_slices(parts)
     own = [part.finish(every[low:high])
@@ -108,7 +133,7 @@ def complete_chain(parts, every, spans, tokens, stats, torch, inputs):
 
 
 def execution_prefix_tree(node, documents, arena):
-    """The node's prefix tree, or None when the plan did not ask for one."""
+    """Build the requested prefix tree, or return None if sharing is disabled."""
     shares = (node.spec.share_prefixes if isinstance(node, AiClassify)
               else node.share_prefixes)
     if not shares:
@@ -125,10 +150,16 @@ def execution_prefix_tree(node, documents, arena):
 
 
 def stage_spans(spans, low, high) -> list:
-    """The chunks that packed rows of stages low to high, with those rows.
+    """Select chunk timing spans covering a range of stages.
 
-    A chunk's tokens stay whole, so a part's share of the chunk's time
-    is its rows over the chunk's tokens.
+    Args:
+        spans: Tuples of stage row counts, chunk tokens, and CUDA events.
+        low: First included stage index.
+        high: First excluded stage index.
+
+    Returns:
+        Spans with only the selected stage row counts. Total chunk token
+        counts remain unchanged for proportional GPU time accounting.
     """
     narrowed = []
     for by_stage, tokens, start, end in spans:
@@ -139,9 +170,16 @@ def stage_spans(spans, low, high) -> list:
 
 
 def gpu_seconds(torch, spans, inputs) -> float:
-    """Seconds the chunks ran on the GPU, by the spans' share of rows.
+    """Calculate GPU seconds attributable to the selected stage rows.
 
-    0.0 unless timing was asked for.
+    Args:
+        torch: Torch module used to synchronize CUDA events.
+        spans: Selected stage row counts and timing events per chunk.
+        inputs: Execution settings, including gpu_timing.
+
+    Returns:
+        GPU seconds weighted by each span's fraction of chunk rows, or 0.0
+        if GPU timing is disabled.
     """
     if not inputs.get("gpu_timing"):
         return 0.0
@@ -153,5 +191,5 @@ def gpu_seconds(torch, spans, inputs) -> float:
 
 
 def chunks(spans, inputs) -> int:
-    """Forward chunks the spans' rows ran in; 0 unless timing was asked for."""
+    """Return the number of timed forward chunks, or zero if timing is disabled."""
     return len(spans) if inputs.get("gpu_timing") else 0

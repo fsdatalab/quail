@@ -64,7 +64,7 @@ def bare_arena(arena, pages):
 
 
 def letter_tokens(text):
-    """Bytes, but a one- or two-letter answer after a space is one token."""
+    """Tokenize text as bytes, treating short answer letters as one token."""
     import re
     if re.fullmatch(r" [A-Za-z]{1,2}", text):
         return [10_000 * (len(text) - 1) + sum(map(ord, text[1:]))]

@@ -27,7 +27,7 @@ WARMUP_VERSION = 5
 
 
 def _warm_inputs(budget):
-    """Synthetic warmup tokens: a 512-id document and a 16-id question suffix.
+    """Generate synthetic document and question tokens for kernel warmup.
 
     Cycled to any length the passes need. Fixed small ids; only the
     counts matter to the kernels.

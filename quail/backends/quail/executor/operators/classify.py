@@ -37,7 +37,7 @@ def classification_part(state: QueryExecutionState, node, ids, parts, inputs):
 
 def joined_classification(state: QueryExecutionState, node, join, ids,
                           join_inputs, context):
-    """The part classifying the rows the join keeps, on its anchors."""
+    """Build classification stages for the pairs retained by a join."""
     if not isinstance(node, AiClassify) or node.spec.partner is None:
         raise TypeError(
             f"{node.type_name!r} cannot follow a join in its pipeline")
@@ -62,7 +62,7 @@ def joined_classification(state: QueryExecutionState, node, join, ids,
 
 
 class ClassifyPart:
-    """A classification's stages inside a pipeline."""
+    """Classification stages and result tables within a pipeline."""
 
     gate = None
     document_done = None
@@ -81,13 +81,21 @@ class ClassifyPart:
         self.suffix_tokens = 0
 
     def label(self, document) -> str | None:
-        """The document's label so far, by its id."""
+        """Return the category assigned to a document ID, or None if unresolved."""
         return self.plan.labels[self.ids.index(document)] \
             if not hasattr(self, "_position") else \
             self.plan.labels[self._position[document]]
 
     def finish(self, every) -> int:
-        """Label the documents; returns the frame and suffix tokens packed."""
+        """Finalize labels and count the frame and suffix tokens processed.
+
+        Args:
+            every: Per-stage answer mappings for this classification.
+
+        Returns:
+            Total streamed tokens, including the classification frame. Stores
+            suffix token counts separately for reporting.
+        """
         self.reached = len(every[0]) if every else 0
         self.suffix_tokens, streamed = self.plan.finish(every)
         return streamed
@@ -148,7 +156,7 @@ class ClassifyPart:
 
 
 class KeptPairs:
-    """The partners the classification's join stage kept for each anchor."""
+    """Partner indices retained by the join for each anchor document."""
 
     def __init__(self, stage: int):
         self.stage = stage

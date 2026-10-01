@@ -1,26 +1,18 @@
-"""Label the QUAIL-B classifications with stock vLLM and add them to collections.
+"""Create classification reference labels with stock vLLM.
 
-    uv run modal run -m experiments.cells.classify_labels::check \
-        2>&1 | tee /tmp/classify-check.log
-    uv run modal run --detach -m experiments.cells.classify_labels::label \
-        2>&1 | tee /tmp/classify-label.log
+Each label is scored by summing its token log probabilities. Requests
+sharing a label prefix reuse the document's cached prompt. Labels are
+computed at sf=1.0 and copied by document content to smaller corpora.
+Outputs are stored on the quail-results volume.
 
-`label` waits for every shard, then builds the collections. To rebuild
-them from finished shards alone:
+Run the validation or labeling entry point:
 
-    uv run modal run --detach -m experiments.cells.classify_labels::finish \
-        --calls fc-...,fc-... 2>&1 | tee /tmp/classify-finish.log
+    uv run modal run -m experiments.cells.classify_labels::check
+    uv run modal run --detach -m experiments.cells.classify_labels::label
 
-A document's reference label is the label with the largest sum of
-label-token log probabilities (quail_b.predicates.CLASSIFY_JUDGE_SPEC).
-vLLM scores it with one request per shared label prefix: the prompt plus
-that prefix, asking for the log probabilities of the tokens that can
-follow it. The first request of each document fills the prefix cache, so
-the others reuse the document and category list.
-
-Labels are computed at sf=1.0 and copied by document content to sf=0.5
-and sf=0.1. Label sets and collections stay on the quail-results volume;
-the summary is /results/ablations/classify-reference-labels.json.
+To build collections from completed shards, use finish with the saved
+function call IDs. The label entry point waits for its shards and builds
+the collections automatically.
 """
 
 from __future__ import annotations
@@ -156,12 +148,16 @@ def classify_identity(spec: PredicateSpec, corpus: dict) -> dict:
 
 
 def corpus_rows(sf: float, spec: PredicateSpec) -> tuple[dict, list[dict]]:
-    """Read one saved corpus's manifest and the predicate's rows.
+    """Read a corpus manifest and the documents to classify.
 
-    A one-document predicate's rows are its table's rows. A
-    classification of joined rows has one row per pair its join's
-    reference labels answer TRUE, with both documents, in (left id,
-    right id) order.
+    Args:
+        sf: Published corpus scale factor.
+        spec: Classification predicate specification.
+
+    Returns:
+        A tuple of the manifest and input rows. Individual classifications
+        have one row per document. Pair classifications include both documents
+        for each reference join match, ordered by left and right document ID.
     """
     import pyarrow.parquet as pq
 
@@ -367,7 +363,7 @@ class VLLMJudge:
 
     def sequence_scores(self, spec: PredicateSpec, document: str
                         ) -> list[float]:
-        """Every label's score from full-sequence prompt log probabilities."""
+        """Return each label's score from full-sequence prompt log probabilities."""
         from vllm import SamplingParams
 
         context = self.encode(render_classify_prompt(spec, document))
@@ -727,7 +723,7 @@ def quail_check(run_dir: str, query_ids: str, sf: float = 0.1):
 @app.function(image=labels.publish_image, memory=32768, timeout=3600,
               volumes={"/results": labels.results_vol})
 def count_rows(key: str) -> int:
-    """How many rows a predicate labels at sf=1.0."""
+    """Count the rows a predicate classifies at scale factor 1.0."""
     labels._mount()
     _, rows = corpus_rows(1.0, PREDICATE_BY_KEY[key])
     return len(rows)

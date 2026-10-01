@@ -354,7 +354,7 @@ def contiguous_shards(doc_tokens, workers: int):
 # ---------------------------------------------------------- the planner
 
 def joined_calls(labels: LabelWork) -> list:
-    """The classifications of joined rows, each with its two aliases."""
+    """Return classifications of document pairs and their table aliases."""
     return [(call, call.aliases()) for call, _ in labels.calls
             if len(call.aliases()) == 2]
 
@@ -365,10 +365,9 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                 context: PlanningContext | None = None):
     """Compile a LogicalPlan into a PhysicalPlan or Refusal.
 
-    A table's classifications run after its AI.IF filters. When the
-    table also joins, they run either before the joins, so a label
-    filter removes rows early, or after them, over the documents the
-    joins matched; the placement with the smaller estimate wins.
+    Classifications run after the table's AI.IF conditions. When the
+    table participates in a join, the planner compares classification before
+    and after the join and chooses the lower estimated execution time.
 
     Args:
         plan: The logical plan to compile.
@@ -382,6 +381,9 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
             cross product its equality conditions keep.
         context: The planning context, needed when the plan classifies
             documents.
+
+    Returns:
+        A PhysicalPlan, or a Refusal explaining why the query cannot run.
     """
     before = _plan_quail_placed(
         plan, model=model, device=device, doc_tokens=doc_tokens, gpus=gpus,
@@ -1010,8 +1012,8 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         order: Stage order rule, 'by_cost' or 'as_written'; None picks
             the default rule.
         backend: Registered model backend name.
-        canvas_draws: The most noise draws a diffusion model averages
-            per letters read and per one-table AI.SCORE; 1 reads one.
+        canvas_draws: Maximum diffusion draws per individual-document
+            classification or score. One disables repeated draws.
         attention: An attention path, "tree" or "unified", forced for
             every filter and join; None lets the planner choose.
         registry: Optional session extension registry.
@@ -1019,6 +1021,9 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
             planning context.
         pair_fractions: join written position -> the fraction of the
             cross product its equality conditions keep.
+
+    Returns:
+        A PhysicalPlan, or a Refusal explaining why the query cannot run.
     """
     if canvas_draws < 1:
         return Refusal(

@@ -40,11 +40,30 @@ def run_backend_group(
     suite_name: str | None = None,
     canvas_draws: str | None = None,
 ) -> dict:
-    """Run backend methods while sharing one loaded model when possible.
+    """Run backend methods in one process, sharing a model when possible.
 
-    suite_name is the directory the suites go under per method; it
-    defaults to the queries' family, which two groups of one family
-    (BIO-5 and BIO-6) must not share.
+    Args:
+        data_dir: Root directory containing scale-factor data directories.
+        model: Model name.
+        sf: Dataset scale factor.
+        query_ids: Query IDs belonging to one benchmark family.
+        run_dir: Directory for this benchmark run.
+        ground_truth_collection: Reference label collection, or empty for default.
+        methods: Backend method names in execution order.
+        root: Optional local mirror of reference labels.
+        attention: Optional forced attention path.
+        gpu_timing: Whether to record GPU execution time.
+        suite_name: Directory name per method, defaulting to the query family.
+            Separate groups from the same family need distinct names.
+        canvas_draws: Comma-separated maximum diffusion draw counts, or None
+            to keep the default. Multiple counts create separate Quail suites.
+
+    Returns:
+        A dictionary containing the family, queries, collection ID, GPU IDs,
+        method names, and per-method suite results.
+
+    Raises:
+        ValueError: No backend methods were supplied.
     """
     from quail import EngineConfig
     from quail.bench.quailb import run_suite

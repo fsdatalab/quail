@@ -13,7 +13,7 @@ DECODE_SCORING = "trie_decode"
 
 
 def decodable(labels) -> bool:
-    """Whether a greedy decode over the trie ends at a whole label.
+    """Return whether every category can terminate at a trie leaf.
 
     A label that is a proper prefix of another label would need the
     decode to choose between stopping and continuing, which the

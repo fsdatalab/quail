@@ -1286,13 +1286,13 @@ class Query:
 
 
 def _pair_keys(anchors, partners) -> pa.Array:
-    """One int64 key per (anchor index, partner index) pair."""
+    """Encode each anchor and partner index pair as one int64 key."""
     keys = pc.add(pc.shift_left(pc.cast(anchors, pa.int64()), 32),
                   pc.cast(partners, pa.int64()))
     return keys.combine_chunks() if isinstance(keys, pa.ChunkedArray) else keys
 
 
 def _pair_key_expression(anchor: str, partner: str):
-    """The pair key of each row's anchor and partner columns."""
+    """Build an Arrow expression encoding anchor and partner indices."""
     return pc.add(pc.shift_left(pc.field(anchor).cast(pa.int64()), 32),
                   pc.field(partner).cast(pa.int64()))

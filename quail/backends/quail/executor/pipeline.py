@@ -125,7 +125,7 @@ def execute_pipeline(state: QueryExecutionState, pipeline, inputs, context) -> d
 
 
 def _part(state: QueryExecutionState, node, ids, parts, inputs, context):
-    """The pipeline part for one member, after the parts before it."""
+    """Build a pipeline member's execution part using preceding parts."""
     if isinstance(node, AiFilter):
         return FilterPart(node, ids, state.async_answers)
     if isinstance(node, AiClassify):

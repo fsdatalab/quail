@@ -1,13 +1,8 @@
-"""Prompt preparation and scoring rule selection for AI.CLASSIFY operators.
+"""Prepare classification prompts and choose a scoring method.
 
-The prompt head and document stay in KV, the question and category list
-are written once after it, and a suffix reads the next token's log probabilities.
-Under the ``letters`` rule the categories are lettered, so every
-label is one token and the cue's row scores them all; under
-``trie_tree`` the one suffix holds the labels' own tokens as a trie,
-and under ``trie_decode`` a document decodes its label one token a
-round along the trie. A diffusion model reads the letter at the first
-row of a seeded answer canvas in one denoising step.
+The planner compares estimated execution times for letters, trie_tree,
+and trie_decode. It emits one AiClassify node for each classification;
+decoder rounds are handled by the executor.
 """
 
 from dataclasses import dataclass, replace
@@ -36,7 +31,14 @@ from quail.planner.plan import Refusal
 
 
 def classification_refusal(context) -> Refusal | None:
-    """Why the context's model cannot classify, or None when it can."""
+    """Check whether the model supports classification planning.
+
+    Args:
+        context: Planning context with the tokenizer and model specification.
+
+    Returns:
+        A Refusal describing missing support, or None if planning can proceed.
+    """
     model = context.model
     if context.tokenizer is None:
         reason = "AI.CLASSIFY planning needs the model's tokenizer"
@@ -49,7 +51,16 @@ def classification_refusal(context) -> Refusal | None:
 
 
 def joined_classification_refusal(graph, workers: int) -> Refusal | None:
-    """Refuse pair classifications the selected execution cannot run."""
+    """Check that each pair classification can run in its join's pipeline.
+
+    Args:
+        graph: Physical operator graph.
+        workers: Number of model workers.
+
+    Returns:
+        A Refusal if a pair classification cannot share its source join's
+        pipeline on one worker, or None if every pair classification can run.
+    """
     pipelines = build_pipelines(graph) if workers == 1 else {}
     for node in graph.nodes:
         if not isinstance(node, AiClassify) or node.spec.partner is None:
@@ -113,23 +124,23 @@ def has_label(logical) -> bool:
 
 @dataclass(frozen=True)
 class _Table:
-    """The one table a classification plan scans, and the budgets it plans under.
+    """Document lengths, model settings, and execution budgets for one table.
 
     Attributes:
-        alias: The table's alias in the query.
+        alias: Table alias in the query.
         mean: Mean document length in tokens.
-        longest: Longest document in tokens.
-        budget: Tokens one forward pass may hold: the smaller of the
-            chunk budget and the KV arena.
-        chunk: The chunk budget in tokens.
-        capacity: The arena's tokens.
-        draws: The noise draws a letters read on a canvas model may
-            average; 1 on a causal model.
-        lengths: Every document's length in tokens.
-        shared: Per document, the leading tokens an earlier document
-            also has, which prefix sharing borrows from KV; empty when
-            the plan does not share prefixes or the corpus is not
-            tokenized yet.
+        longest: Maximum document length in tokens.
+        budget: Smaller of the forward-pass token budget and KV capacity.
+        chunk: Maximum tokens per forward pass.
+        backend_name: Backend executing the classification.
+        model: Model specification.
+        device: Device specification.
+        tokenizer: Callable mapping text to token IDs.
+        capacity: KV arena capacity in tokens.
+        draws: Maximum diffusion draws per document; one for causal models.
+        lengths: Document lengths in tokens.
+        shared: Shared prefix length per document, or an empty tuple.
+        tree: Whether tree attention is available for packed label scoring.
     """
 
     alias: str
@@ -150,21 +161,24 @@ class _Table:
     tree: bool = False
 
     def head(self, call) -> tuple:
-        """The prompt tokens before the document."""
+        """Return the prompt token sequence before the document."""
         return tuple(self.tokenizer(call.prompt.preamble))
 
     def classify(self, call, name, live, resident=False):
-        """Return a ClassifySpec for one prompt and the work it does.
+        """Build a classification specification and estimate its work.
 
         Args:
-            call: The logical AI.CLASSIFY call.
-            name: The output column.
-            live: How many documents are expected to reach it.
-            resident: Whether the documents' KV is resident from an
-                earlier stage of the same chain.
+            call: Logical AI.CLASSIFY call.
+            name: Result column name.
+            live: Expected number of documents to classify.
+            resident: Whether document KV is available from an earlier operator.
+
+        Returns:
+            A tuple containing the ClassifySpec and estimated Work.
 
         Raises:
-            ClassifyRefusedError: A document and its prompt exceed the budget.
+            ClassifyRefusedError: No scoring method can run, or the document and
+                prompt exceed a token or KV budget.
         """
         head = self.head(call)
         tail = tuple(call.prompt.tail_token_ids)
@@ -211,13 +225,25 @@ class _Table:
 
     @property
     def canvas_rows(self) -> int:
-        """The rows of the model's answer canvas; 0 without one."""
+        """Return the number of answer canvas rows, or zero without a canvas."""
         canvas = self.model.answer_canvas
         return canvas.rows if canvas is not None else 0
 
     def simulate(self, scoring, live, head_tokens, frame_tokens, labels,
                  resident) -> classify_cost.Simulated:
-        """Price a prepared scoring candidate under this table's budgets."""
+        """Estimate one scoring method using this table's lengths and budgets.
+
+        Args:
+            scoring: Scoring method name.
+            live: Expected number of documents to classify.
+            head_tokens: Number of prompt tokens before each document.
+            frame_tokens: Number of prompt tokens written after each document.
+            labels: Token sequence for each category.
+            resident: Whether document KV is already available.
+
+        Returns:
+            Estimated execution time, work, and token counts.
+        """
         return classify_cost.estimate(
             scoring, live, head_tokens, frame_tokens, labels,
             lengths=self.lengths, shared=self.shared, chunk=self.chunk,
@@ -225,10 +251,14 @@ class _Table:
             device=self.device, resident=resident, draws=self.draws)
 
     def reestimate(self, spec: ClassifySpec, *, resident=False) -> ClassifySpec:
-        """The spec with its seconds simulated again on this table.
+        """Update a classification's estimated time for this table.
 
-        Documents borrowing a prefix pay only for the rest. A later
-        classification in a pipeline reads resident document KV.
+        Args:
+            spec: Classification specification to update.
+            resident: Whether document KV is already available.
+
+        Returns:
+            A copy of spec with estimated_seconds recalculated.
         """
         head, tail = spec.prompt_token_parts
         simulated = self.simulate(
@@ -239,28 +269,28 @@ class _Table:
     def choose(self, live, head_tokens, frame_tokens, labels, resident,
                lettered=None, probabilities=False
                ) -> tuple[str, classify_cost.Simulated]:
-        """The rule with the least simulated time, and its simulation.
+        """Choose the supported scoring method with the lowest estimated time.
 
-        A forced rule is the one candidate. Otherwise ``letters`` is a
-        candidate when the prompt has a lettered form, priced with that
-        prompt; on a causal model ``trie_tree`` under tree attention,
-        and ``trie_decode`` for a classification whose documents are
-        not resident from an earlier stage and whose labels a greedy
-        decode can end at; a canvas model reads letters only. A
-        classification returning its labels' probabilities scores every
-        label, so ``trie_decode`` is not a candidate. Ties go to fewer
-        label tokens, then the order listed.
+        Letters requires a prompt with one distinct token per category. Tree
+        scoring requires tree attention. Greedy decoding requires documents
+        without resident KV and labels that do not contain another label's
+        complete token sequence as a prefix. Greedy decoding is excluded when
+        probabilities are requested. Ties favor fewer suffix tokens, then the
+        first candidate.
 
         Args:
-            live: How many documents are expected.
-            head_tokens: The prompt head's tokens.
-            frame_tokens: The tail's tokens but its last.
-            labels: Each label's token ids.
-            resident: Whether the documents' KV is resident already.
-            lettered: (head tokens, frame tokens, letter token ids) of
-                the lettered prompt; None when the prompt has none.
-            probabilities: Whether the classification returns every
-                label's probability.
+            live: Expected number of documents to classify.
+            head_tokens: Number of prompt tokens before the document.
+            frame_tokens: Number of prompt tokens after the document, excluding
+                the final answer cue token.
+            labels: Token sequence for each category.
+            resident: Whether document KV is available from an earlier operator.
+            lettered: Tuple of head length, frame length, and category letter
+                token sequences, or None if the prompt has no lettered form.
+            probabilities: Whether every category's probability is required.
+
+        Returns:
+            A tuple containing the method name and its simulated cost.
 
         Raises:
             ClassifyRefusedError: No supported scoring method can run.
@@ -289,30 +319,30 @@ class _Table:
         return best[1], best[2]
 
     def node(self, spec, input_port, index, *ports) -> AiClassify:
-        """The plan node running one classification."""
+        """Build the physical node for one classification."""
         return AiClassify(node_id=f"ai-classify:{index}",
                           inputs=input_ports((input_port, *ports)),
                           backend_name=self.backend_name,
                           model=self.model.name, spec=spec)
 
     def classify_joined(self, call, name, partner, pairs, partner_tokens):
-        """Return a ClassifySpec for a classification of joined rows.
+        """Build a classification specification for joined document pairs.
 
-        Each row the join kept is priced as a suffix over the anchor's
-        resident KV: the partner's label and document, the question,
-        and the cue, whose row scores the letters (the ``letters``
-        rule).
+        Pair classification uses letters and reuses the anchor document's KV.
 
         Args:
-            call: The logical AI.CLASSIFY call over the two aliases.
-            name: The output column.
-            partner: The partner table's alias.
-            pairs: How many joined rows are expected to reach it.
-            partner_tokens: The partner documents' mean length.
+            call: Logical AI.CLASSIFY call referring to both documents.
+            name: Result column name.
+            partner: Partner table alias.
+            pairs: Expected number of joined pairs to classify.
+            partner_tokens: Mean partner document length in tokens.
+
+        Returns:
+            A tuple containing the ClassifySpec and estimated Work.
 
         Raises:
-            ClassifyRefusedError: Probabilities requested for joined rows,
-                or a prompt without a lettered form.
+            ClassifyRefusedError: Probabilities are requested, the prompt lacks
+                a lettered form, or its tokens exceed an execution budget.
         """
         if call.probabilities:
             raise ClassifyRefusedError(
@@ -360,13 +390,13 @@ class _Table:
 
 
 class ClassifyRefusedError(Exception):
-    """A classification the forward pass budget cannot hold."""
+    """A classification cannot run within the selected execution constraints."""
 
     def __init__(self, reason, needed, available):
         super().__init__(reason)
         self.reason, self.needed, self.available = reason, needed, available
 
     def refusal(self) -> Refusal:
-        """The planning refusal this exception stands for."""
+        """Convert this exception to a planning Refusal."""
         return Refusal(reasons=(self.reason,), constraint="suffix_over_chunk",
                        needed=self.needed, available=self.available, unit="tokens")

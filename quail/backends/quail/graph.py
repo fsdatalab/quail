@@ -141,11 +141,20 @@ def stage_partner_lists(group, lists_for, anchor_ids) -> list:
 def filter_result(node, answers, tokens, document_ids,
                   gpu_s: float = 0.0, chunks: int = 0,
                   borrowed_tokens: int = 0, pack_s: float = 0.0) -> NodeResult:
-    """Build one filter chain's node result from its local answers.
+    """Build a filter result using global document IDs and execution metrics.
 
-    borrowed_tokens are document tokens read from another document's
-    KV pages instead of computed (prefix sharing); pack_s is the host
-    seconds spent building forward chunks.
+    Args:
+        node: Physical filter node.
+        answers: Mapping from local document index to Boolean stage answers.
+        tokens: Fresh tokens processed by the model.
+        document_ids: Global document IDs in local index order.
+        gpu_s: Forward-pass GPU seconds.
+        chunks: Number of timed forward passes.
+        borrowed_tokens: Prefix tokens read from another document's KV.
+        pack_s: Host seconds spent building forward chunks.
+
+    Returns:
+        A NodeResult containing surviving IDs, filter answers, and metrics.
     """
     global_answers = {
         document_ids[int(local)]: row
@@ -215,12 +224,18 @@ def filter_inputs(state, node, document_ids) -> dict:
 
 def prepare_model_inputs(node, inputs, context: ExecutionContext,
                          chain=None):
-    """Prepare Quail scheduler inputs from typed port values.
+    """Convert graph input ports into backend scheduler inputs.
 
-    chain, for a join at the end of a pipeline, holds the documents
-    the chain packed ("documents", "document_ids"), the chain's parts,
-    and "pairs": written position -> the anchor -> partner rows a
-    per-batch apply in the chain fills as documents reach the join.
+    Args:
+        node: Physical operator to execute.
+        inputs: Port values supplied by preceding operators.
+        context: Execution context containing document tokens and settings.
+        chain: Optional preceding pipeline state for a join, containing its
+            documents, document IDs, operator parts, and selected pairs.
+
+    Returns:
+        A scheduler input mapping for filters, joins, and scores. Other
+        operators receive the original input mapping.
     """
     if isinstance(node, AiScore):
         return {"score_inputs": inputs, "documents": context.state["docs"],

@@ -451,6 +451,6 @@ class QueryResult:
 
 
 def _pair_keys(anchors, partners) -> pa.Array:
-    """One int64 key per (anchor index, partner index) pair."""
+    """Encode each anchor and partner index pair as one int64 key."""
     return pc.add(pc.shift_left(pc.cast(anchors, pa.int64()), 32),
                   pc.cast(partners, pa.int64()))

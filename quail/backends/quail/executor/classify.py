@@ -1,31 +1,8 @@
-"""AI.CLASSIFY labels through Quail's join loop.
+"""Execute classification with the shared stage scheduler.
 
-Each document is an anchor: its prompt head and document stay in KV,
-and the classification tail, all but its last token, is written once
-after them as the anchor's frame. The label scoring rule decides what
-the partner suffixes are:
-
-- ``letters``: the categories are lettered, so every label is one
-  token and the one suffix is the tail's last token, whose row scores
-  them all. On a diffusion model the suffix packs a seeded canvas
-  after the cue: a random token at the reply's first row, the turn
-  close, and padding; one read-only denoising step, and the first
-  row's log probabilities score the letters. A document whose first
-  draw's letter probabilities, among the letters, have entropy above
-  CANVAS_ENTROPY_NATS takes up to
-  ``spec.draws - 1`` more canvases, each with its own random token,
-  and its label is the best of the draws' mean label probabilities.
-- ``trie_tree``: the whole label trie as one suffix: the cue and every
-  node's token once, split into chains that each follow first
-  children. Each chain is a causal segment and reads the ancestors
-  above it from earlier chains, so every node is computed once and
-  every row is read; a label's score is the sum of its tokens' log
-  probabilities.
-- ``trie_decode``: one stage per trie depth. Each round a document
-  sends the chain of the node it has decoded so far and appends the
-  likeliest child token read after it, until the node is a whole
-  label (GreedyDecoder); the label is the greedy path, and the
-  document skips the rounds left.
+Letters scores category letters in one pass. Tree scoring evaluates all
+label token sequences. Greedy decoding chooses one allowed token per
+round. All rounds reuse the document's KV within one AiClassify node.
 """
 
 import logging
@@ -57,24 +34,20 @@ logger = logging.getLogger("quail")
 
 @dataclass(frozen=True)
 class LabelRequests:
-    """What one scoring rule streams after each document, and how it scores.
+    """Token requests and scoring callbacks for one classification method.
 
     Attributes:
-        frame: The classification tail but its last token, written once
-            after each document.
-        suffixes: The partner suffixes, each starting with the tail's
-            last token.
-        targets: The token ids every read returns, sorted.
-        read_all_rows: Whether every row of a suffix is read, or only
-            its last.
-        score: Maps one document's log probabilities, shape
-            (suffixes, rows, targets) with all rows read and
-            (suffixes, targets) otherwise, to one score per label;
-            None under ``trie_decode``, which decodes as it reads.
-        chains: Under ``trie_tree``, the chains the one suffix packs.
-        rounds: Under ``trie_decode``, the rounds a document may need;
-            each round offers every node's chain and a document sends
-            the chain of the node it has decoded so far.
+        frame: Prompt tail tokens before the final answer cue token, written
+            once after each document.
+        suffixes: Request token sequences beginning with the answer cue.
+        targets: Sorted token IDs returned by the readout.
+        read_all_rows: Whether every suffix row is read, rather than its last.
+        score: Callback converting one document's readout values to category
+            scores. Values have shape (suffixes, rows, targets) when all rows
+            are read, otherwise (suffixes, targets). None uses greedy decoding.
+        chains: Optional trie chains packed into the sole suffix for tree scoring.
+        rounds: Maximum decoder rounds. Each round requests the chain for the
+            document's current trie node. Zero scores all labels in one stage.
     """
 
     frame: list
@@ -87,13 +60,18 @@ class LabelRequests:
 
 
 def label_requests(spec, targets=None) -> LabelRequests:
-    """Return the requests of the spec's scoring rule.
+    """Build token requests and a score function for a classification.
 
     Args:
-        spec: The classification.
-        targets: The token ids the readout returns, sorted; None reads
-            the spec's own label tokens. A chain's stages share one
-            readout over every stage's label tokens.
+        spec: ClassifySpec containing the prompt and category token sequences.
+        targets: Sorted token IDs returned by the readout. None uses all token
+            IDs present in the category sequences.
+
+    Returns:
+        LabelRequests describing the frame, suffixes, and scoring procedure.
+
+    Raises:
+        ValueError: The prompt has no tail tokens or scoring is unknown.
     """
     head, tail = spec.prompt_token_parts
     if len(tail) < 1:
@@ -123,7 +101,16 @@ def label_requests(spec, targets=None) -> LabelRequests:
 
 
 def document_prefixes(spec, documents, rows) -> list:
-    """Return each row's prompt head and document as one token sequence."""
+    """Combine the prompt head and document tokens for each input row.
+
+    Args:
+        spec: Single-document classification specification.
+        documents: Tokenized documents indexed by table alias and document ID.
+        rows: Document IDs to classify, in input order.
+
+    Returns:
+        One token sequence per input row.
+    """
     head, _ = spec.prompt_token_parts
     (alias,) = spec.aliases
     return [chain_tokens(head, documents[alias][doc]) for doc in rows]
@@ -131,7 +118,7 @@ def document_prefixes(spec, documents, rows) -> list:
 
 @dataclass
 class JoinPartners:
-    """The partner documents of a join and each anchor's kept partners.
+    """Partner documents and the pairs retained by a join.
 
     Attributes:
         ids: The partner documents' ids, in the order the suffixes take.
@@ -166,31 +153,28 @@ def _label_readout(state: QueryExecutionState, targets, rows: int, normalize: bo
 
 
 def _softmax(scores) -> np.ndarray:
-    """Probabilities among the labels from their scores, on the last axis."""
+    """Normalize category scores into probabilities along the last axis."""
     scores = np.asarray(scores, dtype=np.float64)
     scores = np.exp(scores - scores.max(axis=-1, keepdims=True))
     return scores / scores.sum(axis=-1, keepdims=True)
 
 
 class ClassifyStages:
-    """The stages one classification asks of each document, and its labels.
+    """Classification stages and the labels they produce.
 
-    One stage for scoring all labels, or one per trie depth under
-    ``trie_decode``. The stages
-    read the label readout kept on the model, rebuilt when the targets
-    or rows change. A classification of joined rows has one stage: it
-    sends each anchor, for every partner the join kept with it, the
-    partner's label and document, the question, and the cue; its
-    labels are by (anchor, partner).
+    Tree and letter scoring use one stage. Greedy decoding uses one stage
+    per token depth and skips remaining stages after selecting a label.
+    Diffusion models can add a stage for repeated draws. Pair classification
+    uses one stage over the partner documents retained by the join.
 
     Args:
-        state: The bound query and its loaded model.
-        spec: The classification.
-        count: How many documents the stages run over.
-        index_of: Callable(admission key) -> the document's index.
-        on_label: Optional callable(index, label) run when a document is labeled.
-        partners: The join's JoinPartners, for a classification of
-            joined rows; None otherwise.
+        state: Current query settings and loaded model resources.
+        spec: Classification specification.
+        count: Number of anchor documents.
+        index_of: Callable mapping an admission key to a document index.
+        on_label: Optional callback receiving a document index and its label.
+        partners: JoinPartners for pair classification, or None for individual
+            documents.
     """
 
     canvas_rows = 0         # rows of a letters stage's canvas on a canvas model
@@ -268,7 +252,7 @@ class ClassifyStages:
                 read_all_rows=False, label=f"{spec.name} round {round}"))
 
     def _joined_stages(self, state: QueryExecutionState, spec, count, partners):
-        """One stage over the anchors: each partner's block, the question, the cue."""
+        """Initialize one classification stage over the pairs retained by a join."""
         if spec.scoring != "letters":
             raise ValueError("a classification of joined rows reads letters, "
                              f"not {spec.scoring!r}")
@@ -313,12 +297,14 @@ class ClassifyStages:
 
     def _letter_canvas(
             self, state: QueryExecutionState) -> Callable[[int, int], np.ndarray]:
-        """Callable(document index, draw) -> the canvas a letters read packs.
+        """Build a callable that creates reproducible answer canvas tokens.
 
-        The canvas follows the cue: a random token at the reply's first
-        row, the turn close, and padding. The random token is drawn
-        from the document's row and the draw, so an answer is the same
-        in any batch.
+        Args:
+            state: Query state containing the model's answer canvas settings.
+
+        Returns:
+            A callable taking a document index and draw number and returning
+            canvas token IDs. Its seed is independent of batch membership.
         """
         model_spec = state.loaded_model.model_spec
         settings = model_spec.answer_canvas
@@ -334,10 +320,18 @@ class ClassifyStages:
         return canvas
 
     def _more_draws(self, canvas, on_label) -> Stage:
-        """The stage sending an uncertain document its remaining draws.
+        """Build a stage that repeats uncertain diffusion classifications.
 
-        Each draw is the cue and its own canvas after the document's
-        resident KV; a document its first draw labeled skips it.
+        Documents labeled by the first draw skip this stage. Other documents
+        run the remaining draws and use the mean category probabilities.
+
+        Args:
+            canvas: Callable taking a document index and draw number and returning
+                canvas tokens.
+            on_label: Optional callback receiving the document index and label.
+
+        Returns:
+            A Stage that submits the remaining draws and records the final label.
         """
         more = self.draws - 1
         self.draw_probs = {}
@@ -363,9 +357,15 @@ class ClassifyStages:
             canvas_rows=self.canvas_rows)
 
     def _probs(self, logits, draws) -> tuple[np.ndarray, np.ndarray]:
-        """Per draw, the label probabilities among the labels, and their entropy.
+        """Compute category probabilities and entropy for each draw.
 
-        The entropy is in nats.
+        Args:
+            logits: Readout values for all draws, rows, and target tokens.
+            draws: Number of draws represented in logits.
+
+        Returns:
+            A tuple of probabilities with shape (draws, labels) and entropy
+            values with shape (draws,). Entropy is measured in nats.
         """
         logits = np.asarray(logits).reshape(draws, self.readout_rows, -1)
         probs = _softmax(np.stack([self.request.score(logits[draw:draw + 1])
@@ -374,14 +374,20 @@ class ClassifyStages:
         return probs, entropy
 
     def _first_draw(self, anchor, row, on_label) -> None:
-        """Label a document its first draw is sure of; keep the rest's probabilities."""
+        """Record the first draw and label the document if entropy is low.
+
+        Args:
+            anchor: Document index.
+            row: Readout values for the first draw.
+            on_label: Optional callback receiving the document index and label.
+        """
         probs, entropy = self._probs(row, 1)
         self.draw_probs[anchor] = probs[0]
         if entropy[0] <= CANVAS_ENTROPY_NATS:
             self._choose(anchor, probs[0], on_label)
 
     def seed(self, anchor) -> int:
-        """The document's canvas seed: its index unless ``seeds`` says."""
+        """Return the configured document seed, or its index if none is set."""
         return int(anchor if self.seeds is None else self.seeds[anchor])
 
     def _set(self, anchor, label, on_label):
@@ -390,13 +396,13 @@ class ClassifyStages:
             on_label(anchor, label)
 
     def _choose(self, anchor, probs, on_label):
-        """Label the document by its labels' probabilities, keeping them when asked."""
+        """Record the most probable category and optionally its probabilities."""
         if self.probabilities is not None:
             self.probabilities[anchor] = probs
         self._set(anchor, self.spec.labels[best_label(probs)], on_label)
 
     def _scores(self, logprobs):
-        """Each label's score from the read rows."""
+        """Compute one score per category from the readout values."""
         if self.read_all:
             # a one-row readout returns (suffixes, targets)
             logprobs = logprobs.reshape(
@@ -404,11 +410,15 @@ class ClassifyStages:
         return self.request.score(logprobs)
 
     def finish(self, answers) -> tuple[int, int]:
-        """Label every document from its answers; returns the token counts.
+        """Finalize labels and count tokens processed after the documents.
+
+        Args:
+            answers: Per-stage mappings from document index to readout values.
 
         Returns:
-            (suffix tokens, streamed tokens): the suffix tokens read, and
-            those plus the frames written after the documents.
+            A tuple of suffix tokens and total streamed tokens, including frames.
+            For pair classification, the first value counts classified pairs
+            instead of suffix tokens.
         """
         if self.partners is not None:
             streamed = sum(1 + self.block_tokens[partner]
@@ -437,9 +447,16 @@ class QuailClassifier:
         self.state = state
 
     def classify(self, spec, rows, documents) -> RerankerBatch:
-        """Return each row's labels and the batch's fresh and cached tokens.
+        """Classify document rows using the shared scheduler and KV arena.
 
-        Decoder rounds share the document's resident KV.
+        Args:
+            spec: Classification specification.
+            rows: Document IDs to classify, in input order.
+            documents: Tokenized documents indexed by table alias and document ID.
+
+        Returns:
+            A RerankerBatch containing labels, optional category probabilities,
+            token counts, and execution metrics.
         """
         state = self.state
         rows = np.asarray(rows, dtype=np.int32).reshape(-1)
@@ -472,7 +489,7 @@ class QuailClassifier:
 
     def _batch(self, labels, fresh, cached, suffix_tokens, stats,
                spans, probabilities=None) -> RerankerBatch:
-        """The labels and token counts of one run, with its GPU time when timed."""
+        """Build a classification batch with token counts and optional GPU timing."""
         state = self.state
         gpu_s = 0.0
         if state.gpu_timing:

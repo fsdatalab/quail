@@ -1,17 +1,8 @@
-"""One scheduler for every model operator on a table's documents.
+"""Schedule LLM operator stages while retaining each document's KV.
 
-A model operator asks something of each document: a filter asks a
-question, a join asks about each partner, a classification scores
-label suffixes. Each of those is a Stage: the frame it writes after
-the document, the suffixes it sends, the readout that turns the final
-hidden rows into answers, and the decision that reads a document's
-answers and says whether it goes on to the next stage.
-
-run_stages drives a list of stages over a set of documents with one
-admission (JoinAdmission): a document's head and document tokens are
-computed once and stay in KV while it moves through the stages, a
-chunk mixes documents at different stages, and a document's pages
-go free as soon as a decision drops it or its last stage answers.
+Filters, joins, and classifications describe their work as Stage objects.
+The shared admission scheduler combines documents at different stages in
+each forward pass and releases KV when a document finishes or is removed.
 """
 
 import time
@@ -27,51 +18,31 @@ from quail.progress import Progress, logger
 
 @dataclass
 class Stage:
-    """What one model operator asks of each document at one step.
+    """Token requests, answer readout, and advancement condition for one step.
 
     Attributes:
-        suffixes: The stage's request token lists, shared by every
-            document; each starts right after the frame.
-        readout: Turns final hidden rows into answers: AsyncAnswers
-            for TRUE/FALSE bits, AsyncScores for numbers,
-            AsyncLabelLogprobs for label log probabilities. Its dtype
-            is the answer array type per document; None keeps 0/1
-            lists.
-        frame: Tokens written into the document's KV right after the
-            document before this stage's suffixes. A frame equal to
-            the stage before's is already there and is not written
-            again.
-        requests: Callable(document key) -> indices into suffixes the
-            document sends, None for all of them, DROP to take the
-            document out of the run at this stage, or SKIP to pass it
-            on to the next stage with nothing asked. Asked when the
-            document reaches the stage. None sends every suffix to
-            every document.
-        decide: Callable(document index, row) -> whether the document
-            goes on to the next stage, or survives the last one. None
-            takes any true answer.
-        read_all_rows: Whether every row of a suffix feeds the readout,
-            not only its last.
-        read_rows: Per suffix, how many of its last rows feed the
-            readout; None reads by ``read_all_rows``. A
-            classification of joined rows sends suffixes that carry a
-            partner document before the label path and reads the
-            path's rows only.
-        single: The stage sends its one suffix to every document, as a
-            filter does: the frame and the suffix pack as one entry
-            written straight into the document's pages, and under tree
-            attention a borrowing document reads its parent's pages
-            stacked with its siblings.
-        label: The stage's name in progress lines.
-        chains: For a stage whose one suffix packs a label trie, the
-            chains from ``trie_chains``: the packer makes each a causal
-            segment and gathers the ancestors above it.
-        canvas: On a diffusion model, Callable(document index) -> the
-            token ids of the canvas the document packs after each suffix
-            in place of the pipeline's, or one row of ids per suffix.
-            Asked when the document's group is packed. None packs the
-            pipeline's canvas.
-        canvas_rows: The rows of every canvas ``canvas`` returns.
+        suffixes: Token sequences processed after each document and frame.
+        readout: Converts selected hidden states to Boolean answers, scores,
+            or category token values. Its dtype determines the answer array.
+        frame: Tokens retained after the document. Consecutive identical
+            frames are written only once.
+        requests: Optional callback from document key to suffix indices.
+            None selects all suffixes; DROP removes the document; SKIP
+            advances it without a request.
+        decide: Optional callback from document index and answer row to a
+            Boolean. True advances the document or retains it at the final
+            stage. Without a callback, any true answer is sufficient.
+        read_all_rows: Whether to read every suffix row rather than its last.
+        read_rows: Optional count of trailing rows to read per suffix,
+            overriding read_all_rows.
+        single: Whether each document has one request that can be packed
+            with its prefix and frame as one entry.
+        label: Name displayed in progress messages.
+        chains: Optional trie chains and ancestor references from trie_chains().
+        canvas: Optional callback from document index to diffusion canvas
+            tokens, shared by its suffixes or supplied per suffix. None uses
+            the pipeline's default canvas.
+        canvas_rows: Number of rows in each canvas returned by canvas.
     """
 
     DROP = DROP
@@ -92,7 +63,7 @@ class Stage:
 
 
 def shared_preamble_tokens(question_ids) -> int:
-    """Longest common token prefix across the stage questions."""
+    """Return the length of the token prefix shared by multiple questions."""
     if len(question_ids) < 2:
         return 0
     p = 0
@@ -103,7 +74,7 @@ def shared_preamble_tokens(question_ids) -> int:
 
 
 def filter_stages(question_ids, readout) -> list:
-    """One Stage per filter question: the shared preamble as a frame, then the tail.
+    """Build one filter stage per question with a shared prompt frame.
 
     The preamble common to every question is written into the
     document's KV once, at the first stage; each stage's suffix is its
@@ -127,7 +98,7 @@ def filter_stages(question_ids, readout) -> list:
 
 
 def frame_writes(stages) -> list:
-    """Per stage, whether its frame is written: not when the stage before wrote it."""
+    """Return which stages need to write a frame not retained by the prior stage."""
     writes = []
     previous = None
     for stage in stages:
@@ -187,12 +158,10 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
             document went on to the next stage, or survived the last.
 
     Returns:
-        (answers, spans, tokens): answers[j][a] = the row of stage j's
-        answers for document a, in admission order; spans = one
-        ({stage: rows packed}, chunk tokens, start event, end event)
-        per forward chunk;
-        (stage, start_event, end_event) per forward; tokens = fresh
-        tokens packed.
+        A tuple of answers, timing spans, and fresh token count. Answers is
+        one document-indexed mapping per stage. Each span contains a mapping
+        of stage indices to packed row counts, the chunk token count, and
+        start and end CUDA events.
     """
     if not stages:
         return [], [], 0
@@ -206,7 +175,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
 
 
 class _StageExecutor:
-    """Own one run's admission, packed inputs, pending answers, and metrics."""
+    """Admission state, packed inputs, pending answers, and metrics for one run."""
 
     def __init__(self, torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                  anchor_keys, on_settled, staging, attention_mode, prefix_tree,
@@ -356,7 +325,7 @@ class _StageExecutor:
                 - self.arena.growth_cost(key, capacity))
 
     def _requests_of(self, key):
-        """The document's per-stage requests, asked as it reaches each stage."""
+        """Return a stage request selector, or None if every request is selected."""
         if not self.asking:
             return None
         stages = self.stages
@@ -364,11 +333,11 @@ class _StageExecutor:
                           else stages[j].requests(key))
 
     def _merged(self, j, start, end):
-        """Whether a group's frame rides its suffix as a single entry."""
+        """Return whether the group packs its frame and suffix as one entry."""
         return self.stages[j].single and end - start == 1
 
     def _build(self, chunk_groups):
-        """Pack one chunk; returns it with (stage, answer rows) per entry."""
+        """Pack a chunk and identify each entry's stage and answer row count."""
         from quail.backends.quail.executor.chunk import Suffixes, pack_chunk
 
         specs = []
@@ -472,7 +441,7 @@ class _StageExecutor:
         return [normed[r] for r in index]
 
     def _submit(self, normed, entries, chunk):
-        """Hand each readout its answer rows; returns handles by readout group.
+        """Submit answer rows to readouts and return handles by readout group.
 
         With one readout for every stage the whole chunk goes in one
         call, keyed None; otherwise each readout's stages' rows go to

@@ -24,7 +24,7 @@ CANVAS_ENTROPY_NATS = 0.1
 
 @dataclass(frozen=True)
 class AnswerCanvas:
-    """A diffusion model's answer canvas, which the ``letters`` rule reads.
+    """Token layout for a diffusion model's classification answer.
 
     Attributes:
         rows: Rows of the canvas packed after the classification cue.
@@ -163,7 +163,7 @@ class ModelSpec:
 
     @property
     def head_mem_bytes(self) -> float:
-        """Bytes of an untied bf16 lm_head weight; 0 when tied.
+        """Return untied output-head memory in bytes, or zero for tied weights.
 
         The executor keeps this matrix for AI.CLASSIFY, so it stays
         resident beside the other weights. Both Qwen3 checkpoints store
@@ -175,7 +175,7 @@ class ModelSpec:
 
     @property
     def W_resident(self) -> float:  # noqa: N802
-        """Weight bytes resident on the GPU after boot, the head included."""
+        """Return model weight bytes resident on the GPU, including the output head."""
         return self.W_mem
 
     @property

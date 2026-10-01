@@ -116,7 +116,7 @@ def _score_comparison(node):
 
 
 def _label_test(node):
-    """Return (AI.CLASSIFY call, accepted literals) for = or IN, else None."""
+    """Extract the classification call and categories from an equality or IN test."""
     if isinstance(node, exp.In) and isinstance(node.this, exp.AIClassify):
         return node.this, list(node.expressions)
     if isinstance(node, exp.EQ):
@@ -317,15 +317,18 @@ class _Binder:
         return prompt, options, aliases
 
     def parse_ai_classify(self, node, scope=None):
-        """Parse an AI_CLASSIFY call into a label ModelCall, options, and aliases.
+        """Parse an AI.CLASSIFY expression and bind its document references.
 
-        The call is AI_CLASSIFY(input, categories[, config]): the
-        input is PROMPT('template', column) or a bare document column;
-        the categories are an ARRAY of labels, of (label, description)
-        pairs, or of {'label': ..., 'description': ...} objects, or the
-        name of a registered label table, given positionally or as
-        categories => ...; the config object takes selectivity,
-        task_description, and probabilities.
+        Args:
+            node: SQLGlot AIClassify expression.
+            scope: Optional set of table aliases allowed in this expression.
+
+        Returns:
+            A tuple of the label ModelCall, planner options, and referenced aliases.
+
+        Raises:
+            CompileError: The input, categories, options, or document references
+                are invalid.
         """
         categories = node.args.get("categories")
         if isinstance(categories, exp.Kwarg):
@@ -357,7 +360,19 @@ class _Binder:
         return model_call, options, aliases
 
     def parse_categories(self, node) -> tuple[tuple, tuple]:
-        """Return the labels and descriptions an AI.CLASSIFY call lists."""
+        """Read category strings and descriptions from a SQL expression.
+
+        Args:
+            node: Array of strings, label-description pairs, category objects,
+                or an unqualified registered table name.
+
+        Returns:
+            A tuple of category strings and optional descriptions in category order.
+
+        Raises:
+            CompileError: The categories have an invalid shape or value type,
+                or the registered category table is invalid.
+        """
         if isinstance(node, exp.Column) and not node.table:
             return read_label_table(self.catalog, str(node.name))
         if not isinstance(node, exp.Array):
@@ -407,10 +422,18 @@ class _Binder:
         return tuple(labels), tuple(descriptions)
 
     def parse_classify_options(self, node) -> dict:
-        """Return an AI.CLASSIFY config object's options.
+        """Validate and extract the options for AI.CLASSIFY.
+
+        Args:
+            node: SQLGlot Struct expression, or None for no options.
+
+        Returns:
+            A dictionary of supplied selectivity, task_description, and
+            probabilities values. Defaults are applied by the caller.
 
         Raises:
-            CompileError: An unknown key or a value of the wrong type.
+            CompileError: The object is malformed, a key is unknown, a value has
+                the wrong type, or the task description exceeds its word limit.
         """
         if node is None:
             return {}

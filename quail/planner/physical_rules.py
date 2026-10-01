@@ -128,7 +128,7 @@ class PrefixSharing:
 
 
 def _shared_classify_spec(node, context, store, *, resident=False):
-    """The node's spec sharing prefixes, re-estimated on the token store."""
+    """Enable prefix sharing and update the classification cost estimate."""
     from quail.planner.classify import classify_table
 
     table = classify_table(context, node.spec.aliases[0], node.backend_name,

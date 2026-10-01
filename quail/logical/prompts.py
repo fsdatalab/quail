@@ -248,7 +248,7 @@ MAX_LETTERS = 255
 
 
 def letter_candidates() -> list[str]:
-    """A to Z, then a to z, then AA to ZZ."""
+    """Yield candidate category letters: A to Z, a to z, then AA to ZZ."""
     upper = [chr(code) for code in range(ord("A"), ord("Z") + 1)]
     lower = [chr(code) for code in range(ord("a"), ord("z") + 1)]
     return upper + lower + [first + second for first in upper for second in upper]
@@ -256,20 +256,20 @@ def letter_candidates() -> list[str]:
 
 def choice_letters(count: int, tokenizer=None,
                    prefix: str = LABEL_PREFIX) -> tuple[str, ...]:
-    """The letters standing for ``count`` labels, in order.
-
-    Each letter is one token after ``prefix`` under the tokenizer, and
-    that token differs from the earlier letters'; without a tokenizer
-    the candidates are taken in order. Fewer than ``count`` letters
-    come back when the tokenizer has no more one-token letters.
+    """Choose distinct one-token strings to represent the categories.
 
     Args:
-        count: How many labels need a letter.
-        tokenizer: Optional callable (text -> token list).
-        prefix: The text before a scored label.
+        count: Number of category letters needed.
+        tokenizer: Optional callable mapping text to token IDs. Without one,
+            candidate strings are returned in their original order.
+        prefix: Text immediately before the scored category letter.
+
+    Returns:
+        Category letters in order. The result may contain fewer than count
+        entries if the tokenizer has too few distinct one-token candidates.
 
     Raises:
-        CompileError: More labels than MAX_LETTERS.
+        CompileError: The requested count exceeds MAX_LETTERS.
     """
     if count > MAX_LETTERS:
         raise CompileError(
@@ -288,7 +288,7 @@ def choice_letters(count: int, tokenizer=None,
 
 
 def answer_prefix(turn: tuple[str, str]) -> str:
-    """The text before a scored label under the model's chat turn.
+    """Return the spacing before a label in the model's answer.
 
     A label after the answer cue follows a space, as a word would; a
     model whose turn suffix opens its reply after the cue starts the
@@ -328,7 +328,7 @@ def render_classify_question(question: str, labels, descriptions=(),
 
 
 def label_text(label: str, prefix: str = LABEL_PREFIX) -> str:
-    """The text a label is scored as, appended after the answer cue."""
+    """Return the label text with its answer prefix."""
     return prefix + label
 
 
@@ -336,24 +336,27 @@ def bind_classify_prompt(template: str, args: tuple, labels, descriptions=(),
                          tokenizer=None,
                          turn: tuple[str, str] = ("", ""),
                          task_description: str = "") -> Prompt:
-    """Build an AI.CLASSIFY Prompt: the document, then the question and labels.
+    """Bind a classification prompt to one or two document columns.
 
-    The layout is the filter layout with the classification
-    instruction, a category list, and the answer cue after the
-    question. Label text is not part of the tail; each label is scored
-    as ``label_text(label, prefix)`` after it. The prompt's
-    ``lettered`` is the same prompt with the categories lettered, for
-    the ``letters`` scoring rule.
+    Single-document prompts include both named categories and, when possible,
+    a lettered version for one-token scoring. Pair prompts use the join
+    document layout followed by the classification question and categories.
 
     Args:
-        template: Prompt template with one {0} placeholder.
-        args: The one column reference.
-        labels: The labels in written order.
-        descriptions: One description per label, empty for none.
-        tokenizer: Optional callable (text -> token list) for counting.
-        turn: The model's chat-turn text: the piece before the
-            preamble and the piece after the answer cue.
-        task_description: Task text added after the question.
+        template: Prompt text with one placeholder per document column.
+        args: One column reference, or two references for joined documents.
+        labels: Category strings in query order.
+        descriptions: Optional descriptions in category order.
+        tokenizer: Optional callable mapping text to token IDs.
+        turn: Chat text before the prompt and after the answer cue.
+        task_description: Additional classification instructions.
+
+    Returns:
+        A Prompt containing the document layout, category text, and token IDs.
+
+    Raises:
+        CompileError: The placeholders or number of document columns are
+            invalid, or the category count exceeds the supported maximum.
     """
     _check_placeholders(template, len(args))
     if len(args) == 2:
@@ -455,7 +458,7 @@ def _bind_joined_classify_prompt(template, args, labels, descriptions,
 
 def render_joined_classify_prompt_text(prompt, anchor: str,
                                        partner: str) -> str:
-    """The complete text of a classification prompt for one joined row."""
+    """Render the complete classification prompt for one joined row."""
     return (prompt.preamble + anchor + join_anchor_note(0) + join_label(1)
             + partner + prompt.tail)
 

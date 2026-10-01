@@ -1,4 +1,4 @@
-"""The chunk packer's rows, positions, and readout rows from flat suffix arrays."""
+"""Test packed token rows, positions, and answer rows from flattened suffixes."""
 
 import pytest
 from fakes import cpu_staging

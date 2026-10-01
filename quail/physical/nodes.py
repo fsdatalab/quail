@@ -162,12 +162,11 @@ class RequestFilterSpec:
 
 @dataclass(frozen=True)
 class RequestClassifySpec:
-    """One AI.CLASSIFY call submitted as one decoded answer per document.
+    """Specification for one decoded classification answer per document.
 
-    ``tail_token_ids`` follow each document: the question, the
-    category list, and the answer cue. ``tests`` are the filters on its label
-    on this call, (written position, accepted labels), applied in
-    order after the documents are labeled.
+    The tail_token_ids follow the document and contain the question,
+    categories, and answer cue. Tests contains (written position, accepted
+    labels) pairs applied in order after classification.
     """
 
     alias: str
@@ -478,10 +477,10 @@ class RequestExecution(PhysicalNode):
 
 @dataclass(frozen=True)
 class ScoreSpec:
-    """One batched AI.SCORE computation.
+    """Specification for a batched AI.SCORE computation.
 
-    ``draws`` is how many noise draws a diffusion model's answer is
-    averaged over; 1 on an autoregressive model.
+    The draws field limits diffusion draws per document. Low-entropy answers
+    can use fewer draws. Autoregressive models always use one answer.
     """
 
     name: str
@@ -589,23 +588,18 @@ class AiScore(PhysicalNode):
 
 @dataclass(frozen=True)
 class ClassifySpec(ScoreSpec):
-    """One batched AI.CLASSIFY computation over one table's documents.
+    """Specification for classifying individual documents or joined pairs.
 
-    ``prompt_token_parts`` is (preamble ids, tail ids): the document
-    goes between them. ``label_token_ids`` holds each label's ids as
-    scored after the tail, in label order: under the ``letters`` rule
-    the letter standing for each label, one token; under ``trie_tree``
-    and ``trie_decode`` the label's own text. ``scoring`` names the
-    rule the executor runs.
-    ``share_prefixes`` lets a document borrow the KV pages of a
-    document sharing its token prefix (the prefix_sharing rule).
-    ``probabilities`` adds each label's probability among the labels
-    to the scores, as a map column named ``name`` plus
-    PROBABILITIES_SUFFIX.
-    A classification of joined rows has two aliases, the anchor and its partner.
-    ``join_layout`` holds (the anchor note written after the anchor
-    document, the partner label written before each partner
-    document); its tail follows the partner.
+    Attributes:
+        labels: Category strings in query order.
+        label_token_ids: Token sequence for each category. Letters scoring
+            uses the category's assigned letter; trie methods use its text.
+        scoring: Selected scoring method: letters, trie_tree, or trie_decode.
+        share_prefixes: Whether documents may reuse shared prefix KV pages.
+        probabilities: Whether to add a name + "_probabilities" map column.
+        join_layout: Anchor note and partner label token sequences for pair
+            classification, or None for individual documents. The question
+            follows the partner document.
     """
 
     labels: tuple[str, ...] = ()
@@ -617,12 +611,12 @@ class ClassifySpec(ScoreSpec):
 
     @property
     def anchor(self) -> str:
-        """The alias whose documents the classification is anchored on."""
+        """Return the anchor table alias."""
         return self.aliases[0]
 
     @property
     def partner(self) -> str | None:
-        """The partner alias of a classification of joined rows, else None."""
+        """Return the partner table alias, or None for individual documents."""
         return self.aliases[1] if len(self.aliases) == 2 else None
 
     @classmethod
@@ -663,10 +657,10 @@ class ClassifySpec(ScoreSpec):
 
 @dataclass(frozen=True)
 class AiClassify(AiScore):
-    """Append one STRING label, chosen from a fixed list, to each document row.
+    """Physical operator that appends a category string to each input row.
 
-    Runs through the AI.SCORE runtime; the spec's labels make the
-    appended column a label instead of a score.
+    ClassifySpec selects the scoring method. The backend executes any decoder
+    rounds within this node and returns the labels through its scores port.
     """
 
     spec: ClassifySpec | None = None
@@ -675,7 +669,7 @@ class AiClassify(AiScore):
 
     @property
     def outputs(self) -> tuple[OutputPort, ...]:
-        """The label rows, and the ids of the documents that got a label."""
+        """Return ports for category rows and the IDs of classified documents."""
         ports = super().outputs
         if self.spec is not None and len(self.spec.aliases) == 1:
             (alias,) = self.spec.aliases
@@ -715,7 +709,7 @@ class InList:
     values: tuple[str, ...]
 
     def accepts(self, value) -> bool:
-        """Whether one value passes."""
+        """Return whether the value is in the accepted category list."""
         return value in self.values
 
     def to_dict(self) -> dict:
@@ -735,7 +729,7 @@ class Comparison:
     value: float
 
     def accepts(self, value) -> bool:
-        """Whether one value passes."""
+        """Return whether the value satisfies the score comparison."""
         import operator
 
         compare = {"<": operator.lt, "<=": operator.le,
@@ -751,7 +745,7 @@ class Comparison:
 
 
 def predicate_from_mapping(value: Mapping[str, Any]) -> "InList | Comparison":
-    """The filter predicate a mapping encodes."""
+    """Decode a filter predicate from its serialized mapping."""
     if value["kind"] == "in_list":
         return InList(str(value["column"]),
                       tuple(str(item) for item in value["values"]))
@@ -763,14 +757,11 @@ def predicate_from_mapping(value: Mapping[str, Any]) -> "InList | Comparison":
 
 @dataclass(frozen=True)
 class Filter(PhysicalNode):
-    """Keep the rows of a score or label table that pass a predicate.
+    """Physical operator that keeps rows matching a score or category condition.
 
-    The predicate reads a column a model call produced: ``InList`` for
-    an AI.CLASSIFY label tested with ``=`` or ``IN``, ``Comparison``
-    for an AI.SCORE score against a threshold. Over one table's rows
-    the filter also yields the kept documents' ids, so a join or a
-    later operator can take them; over a join's rows it yields the
-    join's answers.
+    InList tests a category produced by AI.CLASSIFY. Comparison tests a score
+    produced by AI.SCORE. Single-document filters also return the kept
+    document IDs; filters over joined pairs return join answers.
     """
 
     predicate: InList | Comparison | None = None
@@ -784,7 +775,7 @@ class Filter(PhysicalNode):
 
     @property
     def column(self) -> str:
-        """The score or label column the predicate reads."""
+        """Return the column tested by the predicate."""
         return self.predicate.column
 
     @property
@@ -1007,14 +998,12 @@ class AiJoin(PhysicalNode):
 
 @dataclass(frozen=True)
 class Foreign(PhysicalNode):
-    """Call a user function between two operators.
+    """Physical operator that calls a user function on document IDs or pairs.
 
-    ``kind`` is ``per_batch`` (called on each document as it reaches
-    the function inside its table's pipeline, or once over a
-    materialized input) or ``barrier`` (called once over every
-    survivor, ending the pipeline before it). ``ids`` is
-    ``preserve``, ``drop``, or ``pairs``; the function never invents an
-    id. ``columns`` are (alias, column) pairs read as values.
+    Per-batch functions run as documents reach them in a pipeline, or once
+    over a materialized input. Barrier functions run once over all surviving
+    rows and end the preceding pipeline. The function may preserve or remove
+    input IDs, or return pairs of input IDs; it cannot create new IDs.
     """
 
     function: str = ""

@@ -106,11 +106,18 @@ class ScoreRows:
 
 @dataclass(frozen=True)
 class RerankerBatch:
-    """Scores, or AI.CLASSIFY labels, and token counts from one call.
+    """Values and execution metrics from one score or classification batch.
 
-    ``suffix_tokens`` counts the suffix tokens a classification packed
-    after the documents and frames: the label work the scoring rules
-    reduce.
+    Attributes:
+        scores: Numeric scores or category strings, in input row order.
+        fresh_tokens: Token positions computed by the model.
+        cached_tokens: Token positions reused from KV.
+        suffix_tokens: Classification tokens processed after document frames.
+        borrowed_tokens: Prefix tokens reused from another document's KV.
+        pack_s: Host seconds spent building forward chunks.
+        gpu_s: Forward-pass GPU seconds, or zero when timing is disabled.
+        chunks: Timed forward passes, or zero when timing is disabled.
+        probabilities: Optional array of category probabilities per input row.
     """
 
     scores: np.ndarray
@@ -129,15 +136,20 @@ class RerankerBatch:
 
 
 def _value_type(spec) -> pa.DataType:
-    """The appended column's type: a label for AI.CLASSIFY, else a score."""
+    """Return the Arrow type for a category string or numeric score."""
     return pa.string() if isinstance(spec, ClassifySpec) else pa.float64()
 
 
 def probability_column(labels, probabilities) -> pa.MapArray:
-    """Each row's label probabilities as a map from label to probability.
+    """Build an Arrow map column of category probabilities.
 
-    A row whose probabilities are NaN, a document without an answer, is
-    null.
+    Args:
+        labels: Category strings in probability-column order.
+        probabilities: Array with shape (documents, labels).
+
+    Returns:
+        A MapArray from category to probability for each document. Rows with
+        NaN probabilities are null because the document has no answer.
     """
     probabilities = np.asarray(probabilities, dtype=np.float64).reshape(
         -1, len(labels))
@@ -257,7 +269,7 @@ def scored_batch(node, rows, table) -> dict:
 
 
 def classify_outputs(node, table) -> dict:
-    """A classify node's ports: its label rows and the labeled documents' ids."""
+    """Build output ports for category rows and classified document IDs."""
     outputs = {"scores": table}
     if len(node.spec.aliases) == 1:
         (alias,) = node.spec.aliases
@@ -423,7 +435,7 @@ class RerankerModelExecution:
 
 
 def _filter_answer_table(node: Filter, table, answers) -> pa.Table:
-    """One answer row per document, in the layout of a filter's answers."""
+    """Build one answer row per document using the filter answer schema."""
     alias = node.aliases[0]
     schema = pa.schema(
         [pa.field(alias, pa.int32(), nullable=False),
@@ -452,7 +464,7 @@ class FilterRuntime:
 
 
 def evaluate_predicate(predicate, column):
-    """Whether each row of the column passes the predicate, as an Arrow array."""
+    """Return an Arrow Boolean array indicating which values pass."""
     if isinstance(predicate, InList):
         return pc.is_in(column, value_set=pa.array(predicate.values, pa.string()))
     return compare_score(column, predicate.op, predicate.value)

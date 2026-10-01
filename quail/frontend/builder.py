@@ -165,24 +165,28 @@ class Query:
                     descriptions=None,
                     task_description: str = "",
                     probabilities: bool = False) -> "Query":
-        """Pick one label per document and name it as a result column.
+        """Assign one category to each document and name the result column.
 
-        The column can be returned by select() and tested with
-        label_in(). Each document gets the label with the highest sum
-        of its tokens' log probabilities after the prompt; a tie goes
-        to the earlier label.
+        Use select() to return the column and label_in() to keep documents
+        with selected categories. The planner chooses the scoring method.
 
         Args:
-            p: Prompt over one table's document column.
-            labels: The labels in the order the prompt lists them, as
-                strings, as (label, description) pairs, or as the name
-                of a registered label table.
-            name: The result column's name.
-            descriptions: One description per label, empty for none.
-            task_description: Task text added after the question.
-            probabilities: Whether the result also has the column
-                ``<name>_probabilities``: each label's probability,
-                among the labels.
+            p: Prompt identifying the documents to classify.
+            labels: Category strings, (label, description) pairs, or the name
+                of a registered category table.
+            name: Result column name, without a dot.
+            descriptions: Optional descriptions in the same order as labels.
+                Do not supply these when labels already contains descriptions.
+            task_description: Additional instructions, up to 50 words.
+            probabilities: Whether to also return a map of category probabilities
+                in the column named name + "_probabilities".
+
+        Returns:
+            This query builder, with the classification added.
+
+        Raises:
+            CompileError: The name, categories, descriptions, or prompt are
+                invalid, or a pending join has no AI predicate.
         """
         if self._pending_join is not None:
             raise CompileError(
@@ -222,12 +226,21 @@ class Query:
 
     def label_in(self, name: str, labels,
                  selectivity: Optional[float] = None) -> "Query":
-        """Keep the documents whose classification is one of the labels.
+        """Keep documents whose classification matches any supplied category.
+
+        This uses the same membership check as SQL IN.
 
         Args:
-            name: A column named by ai_classify().
-            labels: The accepted labels.
-            selectivity: Fraction of documents expected to pass.
+            name: Column name from an earlier ai_classify() call.
+            labels: Iterable of category strings to keep.
+            selectivity: Estimated fraction of documents kept. None uses 0.2.
+
+        Returns:
+            This query builder, with the condition added.
+
+        Raises:
+            CompileError: No classification has this name, the classification
+                refers to document pairs, or labels contains duplicates.
         """
         if name not in self._labels:
             raise CompileError(f"no classification is named {name!r}")

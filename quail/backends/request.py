@@ -622,13 +622,18 @@ def _pipelined_filter(client, sampling_params, bodies, questions, read_answer,
 
 
 def _classify_documents(client, spec, bodies) -> dict:
-    """Label documents by decoding each one's answer greedily.
+    """Generate one category answer per document using greedy decoding.
 
-    One request per document: the document and the classification
-    tail, whose category list names the labels, decoded token by token
-    at temperature 0 for as many tokens as the longest label plus one.
-    The decoded answer is matched to a label; a document whose answer
-    names no label gets None and is counted in ``unmatched``.
+    Args:
+        client: Backend client providing sampling parameters and generation.
+        spec: RequestClassifySpec with category text and prompt tail tokens.
+        bodies: Document token sequences, including any prompt head.
+
+    Returns:
+        A mapping containing labels, request counts, token counts, and elapsed
+        generation time. Unmatched answers have label None and increment
+        unmatched. Generation uses temperature zero and a token limit one
+        greater than the longest category token sequence.
     """
     tail = _token_list(spec.tail_token_ids)
     longest = max(len(ids) for ids in spec.label_token_ids)

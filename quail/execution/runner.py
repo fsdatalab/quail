@@ -178,12 +178,11 @@ def _check_ports(node, result) -> None:
 
 
 class GenericRunner:
-    """Execute nodes after all their inputs are available.
+    """Graph runner that executes operators after their inputs are ready.
 
-    The per-document operators of one table run as a pipeline when
-    the context names one (context.pipelines): the pipeline runs at
-    its sink, once every member's outside inputs are ready, and every
-    member's result lands together.
+    When context.pipelines groups operators, the pipeline runs at its final
+    operator once all external inputs are ready. Results for every pipeline
+    member are recorded together.
     """
 
     def run(
@@ -439,7 +438,7 @@ def alias_table(alias: str, ids, columns, names):
 
 
 def foreign_call(node, values, context):
-    """The apply() function of a Foreign node over ids, and its metrics.
+    """Bind a user function to its input columns and collect call metrics.
 
     Args:
         node: The Foreign node.
@@ -513,7 +512,7 @@ def foreign_call(node, values, context):
 
 
 def foreign_ids(node, inputs) -> dict:
-    """The ids a Foreign node was given, by alias."""
+    """Return the input IDs for a Foreign node, indexed by table alias."""
     values = {}
     for port in node.inputs:
         if port.source.port.startswith("ids:"):
@@ -522,7 +521,7 @@ def foreign_ids(node, inputs) -> dict:
 
 
 def foreign_outputs(node, result) -> dict:
-    """A Foreign node's output port from what its function returned."""
+    """Build a Foreign node's output ports from its function result."""
     if node.ids == "pairs":
         return {f"pairs:{node.written_pos}":
                 pair_ids_table(*node.aliases, result)}

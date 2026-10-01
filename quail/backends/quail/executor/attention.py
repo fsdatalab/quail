@@ -49,13 +49,16 @@ def flash_attention_version(capability: tuple[int, int]) -> int:
 
 
 def merge_partial(out, lse, index, out_c, lse_c) -> None:
-    """Fold a partial attention result into rows of another, in place.
+    """Merge attention over two disjoint key sets into the selected rows.
 
-    Both results are softmax-weighted sums over disjoint key sets of
-    the same queries, with their log-sum-exp; the merged rows are the
-    attention over the union. ``out`` is (rows, heads, dim) and
-    ``lse`` (heads, rows), as the attention kernels return them;
-    ``index`` names the rows of ``out`` that ``out_c`` covers.
+    Updates out and lse in place using log-sum-exp weights.
+
+    Args:
+        out: Existing output tensor with shape (rows, heads, dimension).
+        lse: Existing log-sum-exp tensor with shape (heads, rows).
+        index: Indices of the output rows to update.
+        out_c: Partial output for the same queries over another key set.
+        lse_c: Log-sum-exp values corresponding to out_c.
     """
     lse_b = lse[:, index]
     top = lse_b.maximum(lse_c)

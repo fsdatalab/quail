@@ -16,7 +16,7 @@ from quail.backends.quail.executor.attention import ATTENTION_PATHS
 
 @dataclass
 class Chunk:
-    """One packed forward pass: token rows plus attention bookkeeping.
+    """Token tensors and attention metadata for one packed forward pass.
 
     Attributes:
         input_ids: Token ids, one per packed row, on the GPU.
@@ -49,7 +49,7 @@ class Chunk:
 
 
 class ArenaFullError(RuntimeError):
-    """A chunk's suffix pages do not fit the free KV arena."""
+    """The KV arena has too few free pages to pack the chunk."""
 
 
 def _tick(timing, key, t0):
@@ -59,7 +59,7 @@ def _tick(timing, key, t0):
 
 
 def _staged(torch, data, dtype, pinned=True):
-    """Host data to device through pinned memory, non-blocking.
+    """Copy host data to the device, using pinned memory when enabled.
 
     pinned=False reverts to pageable blocking copies.
     """
@@ -85,7 +85,7 @@ def _token_parts(sequence):
 
 
 def _int64(part):
-    """One token part as an int64 array, without a copy where possible."""
+    """Convert token values to an int64 array, avoiding copies when possible."""
     if hasattr(part, "arrow_array"):
         part = part.arrow_array.to_numpy(zero_copy_only=False)
     elif hasattr(part, "numpy") and not isinstance(part, np.ndarray):
@@ -94,7 +94,7 @@ def _int64(part):
 
 
 class Suffixes:
-    """A group's suffix token lists as one flat array plus lengths.
+    """Flattened suffix token sequences with their lengths and offsets.
 
     Attributes:
         ids: Every suffix's tokens back to back.
@@ -133,13 +133,13 @@ class Suffixes:
             yield self.ids[start:end]
 
     def lengths_at(self, indices):
-        """Tokens per suffix at these indices, in that order."""
+        """Return suffix lengths at the given indices, in index order."""
         if isinstance(indices, range) and indices.step == 1:
             return self.lengths[indices.start:indices.stop]
         return self.lengths[np.asarray(indices, dtype=np.int64)]
 
     def take(self, indices):
-        """The suffixes at these indices, in that order."""
+        """Return suffix token sequences at the given indices, in index order."""
         if isinstance(indices, range) and indices.step == 1:
             return Suffixes(
                 self.ids[self.offsets[indices.start]:self.offsets[indices.stop]],
@@ -219,7 +219,7 @@ def _staged_token_parts(torch, sequences, total, pinned=True, staging=None):
 # ------------------------------------------------------- chunk packing
 
 class _PoolView:
-    """One key's rows and pages in one pool.
+    """Rows and pages owned by one KV key in one arena pool.
 
     start is the logical row the pool's first page holds: 0 on the
     every-token pool, the window origin on a trimmed key's sliding
@@ -235,7 +235,7 @@ class _PoolView:
 
 
 class _PoolBuilder:
-    """The scatter map, block table, and lengths of one pool for a chunk."""
+    """KV scatter indices, block tables, and sequence lengths for one pool."""
 
     def __init__(self):
         self.page_rows = []
@@ -250,7 +250,7 @@ class _PoolBuilder:
         self.lengths.append(kv_tokens)
 
     def scatter_direct(self, view, r0, r1, logical_start):
-        """Rows r0..r1 land at logical_start.. in the key's own pages.
+        """Map input rows to the key's KV pages at the given logical position.
 
         Rows before the pool's start are not stored there.
         """
@@ -263,7 +263,7 @@ class _PoolBuilder:
         self.dst.append(view.rows[offset:offset + (r1 - r0 - skip)].numpy())
 
     def scatter_suffix(self, view, temp, s0, s1, f, remainder, page_tokens):
-        """Suffix rows go to a temporary, after a copy of the kept tail."""
+        """Map suffix rows to temporary pages and copy any retained partial page."""
         suffix_tokens = s1 - s0
         self.src.append(np.arange(s0, s1, dtype=np.int64))
         self.dst.append(temp.rows[remainder:remainder + suffix_tokens].numpy())
@@ -301,54 +301,42 @@ class _PoolBuilder:
 
 def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                attention_mode, staging=None, canvas=(), answer_row=0):
-    """Build tensors for one chunk from groups in chunk order.
+    """Pack scheduled document groups into tensors for one forward pass.
 
-    Each group is a dict with keys:
-      key       Arena key for KV reads/writes.
-      prefix    Fresh prefix token list, or None when KV is resident.
-      start     Logical position of the first fresh prefix token; the
-                key's pages before it are borrowed from a parent and
-                already hold KV. 0 when absent.
-      read_key  Under tree attention, for a group with one suffix,
-                the parent whose pages the fresh rows read for
-                positions before start; the rows still write the
-                group's own key. Consecutive groups with one read_key
-                and start share one read of it. Without it, the fresh
-                prefix reads the key's own borrowed pages and each
-                suffix reads the whole key as usual.
-      f         Kept-context length (suffix positions start here).
-      suffixes  List of suffix token lists.
-      write_suffix_tokens  Leading rows of the first suffix to scatter
-                into the key's pages after the prefix.
-      read_all_rows  When true, every row of each suffix feeds the
-                readout, not only its last; the chunk's rows_per_answer
-                then says how many rows each answer has.
-      single    The group's one suffix is a stage's whole request. A
-                fresh, non-borrowing single group under tree attention
-                is one causal segment, [prefix | suffix], whose rows
-                write the key's pages without reading them back: the
-                computation an unpaged filter does.
-      read_rows Per suffix, how many of its last rows are read; a
-                group without it reads by read_all_rows.
-      canvas    The group's own canvas token ids, packed after each of
-                its suffixes in place of the chunk's canvas.
+    Groups remain in scheduler order. Each group contains key, prefix, f
+    (retained context length), and suffixes. Optional group fields are:
 
-    A fresh group without arena pages packs [prefix | suffix] as one
-    causal segment (no scatter, no paged read). This only works with
-    at most one suffix. Under unified attention a chunk is either all
-    paged or all unpaged.
+    * start: First fresh token position, after any borrowed prefix KV.
+    * read_key: Parent key read by a single-suffix tree-attention group.
+    * write_suffix_tokens: Leading suffix tokens to retain in the key's KV.
+    * read_all_rows: Whether every suffix row feeds the answer readout.
+    * read_rows: Number of trailing rows to read from each suffix.
+    * single: Whether the prefix and sole suffix form one request.
+    * chains: Trie chains and ancestor rows from trie_chains(). The document
+      KV must already be resident.
+    * canvas: Per-group answer canvas tokens, overriding the default canvas.
 
-    A group may carry chains, from ``trie_chains``: its one suffix is
-    then several causal segments, each starting at its own position
-    past f, and a segment's rows also read the rows above it in
-    earlier segments through call C. Its document must be resident.
+    Fresh groups without arena pages must have at most one suffix. Unified
+    attention cannot mix paged and unpaged groups. Canvas rows use unified
+    attention and their KV is not retained.
 
-    canvas is the token ids a diffusion model denoises: they follow
-    every suffix as extra rows, and the answer row is canvas row
-    answer_row instead of the suffix's last row; with read_all_rows
-    every canvas row is read instead. Canvas KV goes wherever the
-    suffix's KV goes and is never kept. Canvas rows run the unified
-    path only.
+    Args:
+        torch: Torch module.
+        arena: KV arena holding document pages.
+        groups: Scheduled group mappings with the fields described above.
+        timing: Optional mapping receiving elapsed packing times.
+        pinned: Whether host-to-device copies use pinned memory.
+        attention_mode: Attention path, either tree or unified.
+        staging: Optional reusable host and device transfer buffers.
+        canvas: Default diffusion answer canvas token IDs.
+        answer_row: Canvas row used for the answer when not reading all rows.
+
+    Returns:
+        A Chunk containing token tensors, attention metadata, and readout rows.
+
+    Raises:
+        ValueError: The attention path, canvas row, or group layout is invalid.
+        ArenaFullError: The arena has too few free pages for suffixes.
     """
     def stage(name, values, dtype):
         if staging is not None:

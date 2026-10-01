@@ -103,13 +103,18 @@ class PhysicalPlan:
         return source, target, ports[0]
 
     def _rebuild(self, nodes) -> "PhysicalPlan":
-        """A new plan over nodes: validated and re-estimated.
+        """Validate the edited nodes and rebuild the plan with updated costs.
 
-        The plan's seconds are the planner's search estimate plus the
-        recompute expected at every filter chain an edit cut off from
-        the join anchored on its alias (a chain the planner itself
-        left off the join's pipeline already retains its survivors by
-        schedule and is not counted twice).
+        Args:
+            nodes: Replacement physical operators.
+
+        Returns:
+            A validated plan with updated KV retention and execution estimates.
+            The estimate includes recomputation when an edit separates filters
+            from a following join and their survivors were not already retained.
+
+        Raises:
+            PlanEditError: The edited operator graph is invalid.
         """
         nodes = _rederive_kv(tuple(nodes))
         try:

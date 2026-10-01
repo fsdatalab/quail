@@ -1,4 +1,4 @@
-"""Execute model filters and label gates."""
+"""Execute LLM filters and conditions on classification results."""
 
 from quail.backends.quail.executor import loop
 from quail.backends.quail.executor.parts import (
@@ -57,7 +57,7 @@ def execute_filter(state: QueryExecutionState, node, inputs) -> NodeResult:
 
 
 class FilterPart:
-    """A filter chain's stages inside a pipeline."""
+    """Filter stages and result tables within a pipeline."""
 
     gate = None
     result_value = None
@@ -72,7 +72,7 @@ class FilterPart:
         self.answers = {}
 
     def finish(self, every) -> int | None:
-        """Record the chain's answers; its tokens are the run's remainder."""
+        """Record filter answers and leave token accounting to the pipeline."""
         for stage in every:
             for document, row in stage.items():
                 self.answers.setdefault(document, []).append(int(row[0]))
@@ -86,7 +86,7 @@ class FilterPart:
 
 
 class LabelGate:
-    """A filter on a label between two stages: it gates on the label read."""
+    """Pipeline condition that keeps documents with selected categories."""
 
     stages = ()
     document_done = None

@@ -142,7 +142,7 @@ class VLLMClient:
         return self.llm.generate(prompts, sampling_params, use_tqdm=use_tqdm)
 
     def decode_params(self, max_tokens: int):
-        """Sampling parameters that decode an answer greedily as text."""
+        """Build sampling parameters for greedy text generation."""
         from vllm import SamplingParams
 
         return SamplingParams(max_tokens=max_tokens, temperature=0.0)

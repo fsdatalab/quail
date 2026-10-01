@@ -72,7 +72,7 @@ class QuailScorer:
         return RerankerBatch(scores, fresh_tokens=fresh, cached_tokens=total - fresh)
 
     def _scores(self) -> AsyncScores:
-        """The score readout kept on the state, with the input staging cleared."""
+        """Return the cached score readout and clear its input staging cache."""
         state = self.state
         answer_rows = state.answer_rows
         async_scores = state.async_scores
@@ -83,14 +83,18 @@ class QuailScorer:
         return async_scores
 
     def _drawn(self, spec, rows, documents) -> RerankerBatch:
-        """Score one table's rows on a canvas model, averaging noise draws.
+        """Score documents with reproducible diffusion draws.
 
-        Each document's prompt head and document stay in KV with the
-        tail but its last token written after them. The first draw is
-        the cue and a canvas of random tokens drawn from the document's
-        row; a document whose first score has binary entropy above
-        CANVAS_ENTROPY_NATS sends ``spec.draws - 1`` more, each with
-        its own canvas, and its score is the mean over the draws.
+        A low-entropy first answer uses one draw. Other documents run the remaining
+        draws and use the mean TRUE probability. Draws share each document's KV.
+
+        Args:
+            spec: Single-document score specification.
+            rows: Input row indices with shape (documents, 1).
+            documents: Tokenized documents indexed by table alias and document ID.
+
+        Returns:
+            A RerankerBatch of scores and execution metrics.
         """
         state = self.state
         pipeline = state.loaded_model.pipeline

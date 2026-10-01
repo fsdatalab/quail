@@ -1,18 +1,9 @@
-"""Pipelines: chains of per-document operators a graph runs as one.
+"""Group compatible per-document operators into execution pipelines.
 
-A pipeline is the longest chain of operators that each take one
-table's documents one at a time: its AI.IF filter chain, its
-classification, the filters on the classification's labels and the
-per-batch applies on its documents, and the join anchored on it. The
-executor runs the whole chain over each document while its KV is
-resident, as DuckDB runs a vector through every operator of a pipeline
-before the next vector.
-
-A chain ends at a breaker: a node that needs every document at once
-(Barrier, Exchange, a barrier apply, the recombination, a projection),
-a join that reads the documents as partners, a second consumer of the
-same documents, or a join, which settles each anchor's KV itself,
-unless a classification of the rows it kept follows it.
+A pipeline processes each document through its filters, classifications,
+and per-batch functions while its KV remains available. Materializing
+operators, incompatible prompt heads, and independent consumers end a
+pipeline. A join can continue into classification of the pairs it keeps.
 """
 
 from __future__ import annotations
@@ -39,7 +30,7 @@ class Pipeline:
 
     @property
     def sink(self) -> PhysicalNode:
-        """The last member; the pipeline runs when its inputs are ready."""
+        """Return the last operator in the pipeline."""
         return self.members[-1]
 
     @property
@@ -48,10 +39,15 @@ class Pipeline:
 
 
 def operator_aliases(node: PhysicalNode) -> tuple[str, ...]:
-    """The aliases whose documents a per-document operator can take.
+    """Return the document aliases an operator can process incrementally.
 
-    Empty for a node that needs every document at once. A per-batch
-    apply returning pairs takes either of its two aliases' documents.
+    Args:
+        node: Physical operator.
+
+    Returns:
+        Document aliases, or an empty tuple for an operator requiring
+        materialized input. A per-batch function returning pairs can process
+        either of its two aliases.
     """
     if isinstance(node, AiFilter):
         return (node.alias,)
@@ -75,7 +71,7 @@ def operator_aliases(node: PhysicalNode) -> tuple[str, ...]:
 
 
 def _document_ports(node: PhysicalNode, alias: str) -> tuple[str, ...]:
-    """The output ports on which the operator hands the alias's documents on."""
+    """Return output ports carrying documents for the given alias."""
     if isinstance(node, (AiClassify, Filter)):
         return ("scores", f"ids:{alias}")
     if isinstance(node, Foreign) and node.ids == "pairs":
@@ -88,7 +84,7 @@ def _document_ports(node: PhysicalNode, alias: str) -> tuple[str, ...]:
 
 
 def _classifies_rows_of(node: PhysicalNode, join: AiJoin) -> bool:
-    """Whether the node classifies the rows the join keeps, on its anchor."""
+    """Return whether the node classifies the pairs produced by the join."""
     if not isinstance(node, AiClassify) or node.spec is None:
         return False
     spec = node.spec
@@ -98,10 +94,13 @@ def _classifies_rows_of(node: PhysicalNode, join: AiJoin) -> bool:
 
 
 def build_pipelines(graph: PhysicalGraph) -> dict[str, Pipeline]:
-    """Group the graph's per-document operators into pipelines.
+    """Group compatible per-document operators into pipelines.
+
+    Args:
+        graph: Physical operator graph.
 
     Returns:
-        Member node id -> its pipeline, for every member.
+        A mapping from each member node ID to its Pipeline.
     """
     consumers: dict[tuple[str, str], list[PhysicalNode]] = {}
     for node in graph.nodes:
@@ -119,7 +118,7 @@ def build_pipelines(graph: PhysicalGraph) -> dict[str, Pipeline]:
                    for port in consumer.inputs)
 
     def continuation(node: PhysicalNode, alias: str) -> list[PhysicalNode]:
-        """The operators that take the documents on from node, in order.
+        """Find consumers that can continue this operator's pipeline.
 
         One consumer continues the chain. Several continue it only
         when each reads the one before it, as a per-batch apply
@@ -167,7 +166,7 @@ def build_pipelines(graph: PhysicalGraph) -> dict[str, Pipeline]:
 
 
 def external_inputs(pipeline: Pipeline, member: PhysicalNode) -> tuple:
-    """The member's input ports fed from outside the pipeline."""
+    """Return member input ports whose sources are outside the pipeline."""
     inside = set(pipeline.node_ids)
     return tuple(port for port in member.inputs
                  if port.source.node_id not in inside)

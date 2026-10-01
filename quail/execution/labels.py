@@ -1,15 +1,8 @@
-"""AI.CLASSIFY label scoring from per-position log probabilities.
+"""Score category tokens and match decoded text to categories.
 
-Under the letters rule every label is one token and its score is that
-token's log probability at the answer's row. Under the trie rule a
-label's score is the sum of its tokens' log probabilities after the
-prompt, each read at the position before the token. Labels that share
-leading tokens share those positions, so the positions to read are the
-proper prefixes of the labels' token sequences: a trie whose internal
-nodes are read once each; a greedy decode over the trie follows the
-likeliest token one round at a time (GreedyDecoder). A baseline's
-decoded answer is matched to a label by its text instead
-(match_label).
+Letter scoring reads one token per category. Tree scoring sums token
+log probabilities for each complete category. GreedyDecoder selects
+one allowed token per round without comparing complete label scores.
 """
 
 import numpy as np
@@ -23,14 +16,18 @@ def trie_targets(trie) -> list[int]:
 
 
 def match_label(text: str, labels) -> str | None:
-    """Return the label a decoded answer names, or None.
+    """Match the first answer line to a supplied category.
 
-    A leading "thought" line and then a leading "ANSWER:" are skipped:
-    DiffusionGemma may open an empty thinking channel, which reads
-    "thought" once its special tokens are removed, or repeat the answer
-    cue. The rest's first line, trimmed, must start with a label,
-    ignoring case; the longest such label wins, then the earlier one.
-    Anything else names no label.
+    A leading "thought" line and "ANSWER:" prefix are removed before matching.
+    Matching ignores case and accepts text starting with a category. When
+    several categories match, the longest wins, then the first in the list.
+
+    Args:
+        text: Decoded model answer.
+        labels: Category strings in query order.
+
+    Returns:
+        The matching category string, or None if no category matches.
     """
     answer = text.strip()
     first, _, rest = answer.partition("\n")
@@ -49,13 +46,15 @@ def match_label(text: str, labels) -> str | None:
 
 
 def letter_scores(label_ids, targets, logprobs) -> np.ndarray:
-    """Return every one-token label's log probability at the answer's row.
+    """Return each category letter's log probability at the answer position.
 
     Args:
-        label_ids: One token id per label, each a one-element sequence.
-        targets: The token ids, one per column of ``logprobs``.
-        logprobs: Shape (targets,): the log probabilities read at the
-            answer's row.
+        label_ids: One single-token sequence per category.
+        targets: Token IDs in readout-column order.
+        logprobs: One-dimensional array of values for the target tokens.
+
+    Returns:
+        Scores in category order, using the same scale as logprobs.
     """
     column = {token: index for index, token in enumerate(targets)}
     return np.asarray([float(logprobs[column[ids[0]]]) for ids in label_ids],
@@ -63,29 +62,24 @@ def letter_scores(label_ids, targets, logprobs) -> np.ndarray:
 
 
 def best_label(scores) -> int:
-    """Return the index of the highest score; a tie goes to the earlier label."""
+    """Return the first index with the highest score."""
     return int(np.argmax(scores))
 
 
 class GreedyDecoder:
-    """Labels decoded one token per round along the label trie.
+    """Per-document state for choosing one allowed label token per round.
 
-    Each round reads, for a document, the log probabilities after the
-    trie node it has decoded so far, and appends the likeliest token
-    among the node's children; the document is resolved once its node
-    is a whole label. Nodes are indexed in ``nodes``, shortest first.
-    The decoded label is the greedy path, not the label with the
-    highest summed log probability.
+    Each round selects the highest-scoring child of the current trie node.
+    Decoding finishes at a complete category. Nodes are ordered by depth.
 
     Args:
-        label_ids: One token id sequence per label; no label may be a
-            proper prefix of another, since a decoded label ends only
-            at a leaf.
-        targets: The token ids, one per column of the log probabilities.
-        documents: How many documents the decoder tracks.
+        label_ids: Token sequence for each category. No complete sequence may
+            be the prefix of another category's sequence.
+        targets: Token IDs corresponding to the readout columns.
+        documents: Number of documents to track.
 
     Raises:
-        ValueError: A label is a proper prefix of another.
+        ValueError: One category's token sequence is a prefix of another.
     """
 
     def __init__(self, label_ids, targets, documents):
@@ -110,7 +104,15 @@ class GreedyDecoder:
         self.tokens = 0     # chain tokens requested so far
 
     def requests(self, doc):
-        """The index into nodes the document reads this round; None once resolved."""
+        """Return the current trie-node request and count its tokens.
+
+        Args:
+            doc: Document index.
+
+        Returns:
+            A one-element list containing the current node index, or None if
+            the document already has a label.
+        """
         if self.label[doc] >= 0:
             return None
         node = self.node[doc]
@@ -118,12 +120,11 @@ class GreedyDecoder:
         return [self.index[node]]
 
     def update(self, doc, row):
-        """Append the likeliest child of the document's node.
+        """Advance a document to its highest-scoring allowed token.
 
         Args:
-            doc: The document.
-            row: The log probabilities read after the node, one per
-                target.
+            doc: Document index.
+            row: Token log probabilities in target-column order.
         """
         node = self.node[doc]
         best = min(self.trie[node],

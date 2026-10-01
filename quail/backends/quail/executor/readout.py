@@ -101,21 +101,20 @@ def answer_rows(rows_per_answer) -> tuple[np.ndarray, np.ndarray]:
 
 
 class AsyncLabelLogprobs:
-    """Non-blocking full-vocabulary log probabilities of chosen tokens.
+    """Asynchronous readout of selected tokens' log probabilities or logits.
 
-    Each row gets log p(t) for every target token t, normalized over
-    the whole vocabulary at temperature 1. Logits are computed in the
-    head's dtype and normalized in float32, as vLLM computes returned
-    log probabilities. Rows go through the head in blocks, so no rows
-    by vocabulary matrix larger than one block is held.
+    With normalize=True, each token's log probability is normalized over
+    the full vocabulary at temperature 1. Computation uses blocks of rows
+    to bound memory usage. With normalize=False, only the selected output
+    head rows are evaluated and the results are unnormalized logits.
 
-    With rows > 1 an answer is a (rows, targets) record: the rows of
-    one suffix in order, NaN past the suffix's own rows.
-
-    With ``normalize`` off the values are the targets' logits: when
-    every label is scored at the same rows the normalizer is the same
-    for every label and cancels, so only the targets' head rows are
-    projected (the design's SelectOneRow), not the whole vocabulary.
+    Args:
+        torch: Torch module.
+        F: Torch functional module.
+        head: Full output head with shape (vocabulary, hidden size).
+        targets: Token IDs to return, in column order.
+        rows: Maximum rows per answer. Unused rows are filled with NaN.
+        normalize: Whether to normalize against the full vocabulary.
     """
 
     # rows per head block: every block reads the whole head, so few big
@@ -137,7 +136,16 @@ class AsyncLabelLogprobs:
         self.available = []
 
     def logprobs(self, normed):
-        """Per row, the target tokens' log probabilities, on the device."""
+        """Compute selected token values from normalized hidden states.
+
+        Args:
+            normed: Hidden states with shape (rows, hidden size).
+
+        Returns:
+            A float32 device tensor with shape (rows, targets). Values are
+            full-vocabulary log probabilities when normalize is enabled and
+            unnormalized logits otherwise.
+        """
         torch = self.torch
         if not self.normalize:
             return self.F.linear(normed.to(self.head.dtype),

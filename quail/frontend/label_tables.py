@@ -7,16 +7,22 @@ from quail.logical import CompileError
 
 
 def read_label_table(catalog: Catalog, name: str) -> tuple[tuple, tuple]:
-    """Return the labels and descriptions a registered table lists.
+    """Read category labels and descriptions from a registered table.
 
-    The table has a non-null ``label`` column, an optional
-    ``description`` column (null means none), and an optional unique
-    integer ``ordinal`` column. Labels come in ascending ordinal order
-    when that column exists, else in ascending UTF-8 order.
+    Labels are sorted by ordinal when present, otherwise by label text.
+    Null descriptions are converted to empty strings.
+
+    Args:
+        catalog: Catalog containing the registered category table.
+        name: Registered table name.
+
+    Returns:
+        A tuple of labels and descriptions in the same order. Descriptions
+        is empty if the table has no description column.
 
     Raises:
-        CompileError: The table is not registered or lacks a label
-            column, or its ordinals repeat.
+        CompileError: The table is unregistered, lacks a label column, has a
+            null label, or has a null or duplicated ordinal.
     """
     provider = catalog.get(name)
     columns = provider.columns

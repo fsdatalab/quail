@@ -24,16 +24,12 @@ LABEL_PREFIX = " "
 
 @dataclass(frozen=True)
 class Prompt:
-    """A bound PROMPT call, split into preamble, frame, and tail.
+    """Bound prompt text and token layout for one LLM call.
 
-    Token counts are filled at bind time when a tokenizer is given;
-    None means the planner must supply counts.
-
-    An AI.CLASSIFY prompt scores each label as ``label_prefix`` and
-    the label's text after the tail. ``lettered`` is the same prompt
-    with its categories lettered, whose labels are the letters in
-    ``letters``; None when the tokenizer has no one-token letter for
-    every label, or for a classification of joined rows.
+    Token counts are filled when a tokenizer is available; None means the
+    planner must calculate them. Classification stores the spacing before
+    label text in label_prefix. Its optional lettered prompt maps categories
+    to distinct one-token strings for letters scoring.
     """
     template: str
     args: tuple    # tuple[ColumnRef, ...] in placeholder order
@@ -182,7 +178,7 @@ class Compare:
 
 @dataclass(frozen=True)
 class LabelIn:
-    """An AI.CLASSIFY label tested against accepted labels; answers yes or no."""
+    """Membership condition on the category returned by AI.CLASSIFY."""
     call: ModelCall
     accepted: tuple    # tuple[str, ...], each one of call.labels
     name: str = ""     # the label column's name, when the query named it
@@ -676,14 +672,14 @@ class Project:
 
 @dataclass(frozen=True)
 class LabelWork:
-    """The classifications a plan needs, from the filters on its labels and its columns.
+    """Classification calls, result columns, and membership conditions in a plan.
 
     Attributes:
-        calls: (AI.CLASSIFY call, alias) in plan order: the calls label
-            filters test, in written order, then projected labels.
-        names: Call -> its output column.
-        tests: Call -> written positions of the filters testing its label.
-        projected: Call -> column name, for projected labels.
+        calls: (classification call, anchor alias) pairs. Calls used in conditions
+            appear first in condition order, followed by calls returned in SELECT.
+        names: Mapping from classification call to its assigned column name.
+        tests: Written filter positions for conditions on each classification.
+        projected: Mapping from classifications returned in SELECT to column names.
     """
 
     calls: tuple
@@ -785,7 +781,7 @@ class Operators:
 
     @property
     def prompts(self) -> tuple:
-        """Every prompt, from filters, joins, then remaining projected calls."""
+        """Return filter, join, and remaining result-column prompts in order."""
         calls = tuple(
             model_call(predicate.expression)
             for predicates in self.filters.values()

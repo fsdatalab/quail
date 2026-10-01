@@ -40,7 +40,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
              anchor_partners=None, staging=None,
              attention_mode=None, prefix_tree=None, stats=None,
              read_all_rows=False, advance=None):
-    """The join driver: stream partner lists against anchors.
+    """Stream each stage's selected partner requests against anchor documents.
 
     Survivors are gated between stages.
 
@@ -81,10 +81,9 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
             next stage; None advances on any true answer.
 
     Returns:
-        (ans, spans, tokens): ans[j][a] = 0/1 row over the stage-j
-        partners anchor a streams, with a in admission order; spans =
-        (stage, start_event, end_event) per forward; tokens = fresh
-        tokens packed.
+        A tuple of per-stage partner answers, chunk timing spans, and fresh
+        token count. Each stage maps anchor indices to answer rows for their
+        selected partners. Timing spans use the format from run_stages().
     """
     from quail.backends.quail.executor.stages import Stage, run_stages
 
@@ -149,7 +148,7 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
                arena_keys=None, retain_survivors=(), attention_mode=None,
                document_done=None, prefix_tree=None, stats=None,
                staging=None):
-    """The filter chain run to the end on the stage scheduler.
+    """Run a sequence of Boolean filters with the shared stage scheduler.
 
     Args:
         torch: The torch module, imported by the caller.
@@ -179,8 +178,9 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
         staging: Optional reusable input transfer buffers.
 
     Returns:
-        (answers, spans, tokens): answers[d] = 0/1 list up to the
-        first FALSE; spans and tokens as in run_stages.
+        A tuple of per-document Boolean answers, chunk timing spans, and
+        fresh token count. Each document's answers end at its first failed
+        filter. Timing spans use the format returned by run_stages().
     """
     from quail.backends.quail.executor.stages import filter_stages, run_stages
 

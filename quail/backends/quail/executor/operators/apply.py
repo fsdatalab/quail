@@ -20,7 +20,7 @@ def apply_part(node, ids, parts, inputs, context):
 
 
 class ApplyGate:
-    """A per-batch apply between two stages, called on each document."""
+    """User function applied as each document reaches this pipeline position."""
 
     stages = ()
     document_done = None

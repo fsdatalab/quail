@@ -1,32 +1,16 @@
-"""Profile the timed window of QUAIL-B queries on Modal.
+"""Profile QUAIL-B query execution on Modal, excluding model startup.
 
-Each query runs in a fresh process, as the benchmark runs it: boot,
-then one run of the query per mode in `--modes`, in one session. Only
-the model window (the graph run that `model_wall_s` times) is
-profiled, so startup does not show. Per run it prints the timing
-fields of the query time, the forward-chunk GPU seconds, the caching
-allocator's counters, and a digest of the answer tables and result
-rows. A mode is `plain` (no profiler), `cprofile` (top functions by
-own and cumulative time), `sample` (a thread that samples the main
-thread's stack every millisecond; py-spy cannot read process memory
-in a Modal container), `trace`
-(torch.profiler: GPU busy and idle seconds in the window and the
-longest idle gaps), or `timeline` (host
-seconds per executor step, GPU busy and idle seconds of the chunks
-and readouts, each step's spans, and what the host did in each long
-GPU gap). `--env` sets KEY=VALUE pairs in the query processes.
+Queries run in fresh processes. Modes are plain (no profiler), cprofile,
+sample (Python stack sampling), trace (torch.profiler), and timeline
+(executor-step and GPU event timing). Each run prints timing, allocation,
+and result-digest fields. The env option sets child-process variables.
 
-With QUAIL_BEFORE_SOURCE set to a directory holding a second copy of
-the `quail` package, such as one exported from an earlier commit, that
-copy is mounted and every query also runs on it in the same
-container, the order alternating by repeat, to compare two commits on
-one GPU.
+Set QUAIL_BEFORE_SOURCE to a directory containing an earlier copy of
+quail to compare both versions on the same GPU. Run order alternates
+between repetitions.
 
-    uv run modal run --detach experiments/cells/profile_query.py::profile \
+    uv run modal run --detach experiments/cells/profile_query.py::profile
         --queries BIO-5,FEV-11 --modes plain,cprofile,trace
-    QUAIL_BEFORE_SOURCE=/tmp/before uv run modal run --detach \
-        experiments/cells/profile_query.py::profile --queries BIO-5,FEV-11 \
-        --modes plain,plain --repeats 2
 """
 
 import json
@@ -61,7 +45,7 @@ image = gpu_image(*([(BEFORE_LOCAL, BEFORE_REMOTE)]
 
 
 def _digest(output) -> str:
-    """A hash of every answer table and result row, in id order."""
+    """Hash answer tables and result rows in document ID order."""
     import hashlib
 
     digest = hashlib.sha256()
@@ -79,7 +63,7 @@ def _digest(output) -> str:
 
 
 def _gpu_gaps(prof, top: int) -> dict:
-    """GPU busy and idle seconds in a torch.profiler window, with its longest gaps."""
+    """Measure GPU busy and idle time, including the longest idle gaps."""
     from torch.autograd import DeviceType
 
     events = list(prof.events())
@@ -181,7 +165,7 @@ class Timeline:
         self.active = False
 
     def summary(self, top: int) -> dict:
-        """Host seconds per step, GPU busy and idle, and the longest GPU gaps."""
+        """Summarize host execution steps, GPU activity, and idle intervals."""
         host = {}
         gpu = []
         steps = []
@@ -210,7 +194,7 @@ class Timeline:
         gaps.sort(reverse=True)
 
         def doing(start, end):
-            """Host seconds per step inside a span of the window."""
+            """Calculate host time per execution step within an interval."""
             spent = {}
             for kind, began, ended, *_ in self.entries:
                 overlap = (min(ended - self.started, end)
@@ -278,7 +262,7 @@ class Sampler:
             time.sleep(self.interval)
 
     def summary(self, top: int) -> dict:
-        """Milliseconds by leaf frame and by quail frame, inside the runner's call."""
+        """Summarize sampled time by leaf frame and Quail frame."""
         leaf, inclusive, total = {}, {}, 0.0
         for stack, count in self.stacks.items():
             inside = [index for index, frame in enumerate(stack)
@@ -432,9 +416,21 @@ def child(arguments: str) -> None:
 def profile_query(query_ids: list[str], sf: float, collection_id: str,
                   model: str, modes: list[str], top: int, repeats: int,
                   tag: str, env: str = "") -> str:
-    """Run each query in fresh processes; returns the RESULT lines.
+    """Profile each query in fresh processes and return its RESULT lines.
 
-    `env` holds comma-separated KEY=VALUE settings for the child processes.
+    Args:
+        query_ids: QUAIL-B query IDs to run.
+        sf: Dataset scale factor.
+        collection_id: Reference label collection.
+        model: Model name.
+        modes: Profiling modes, one per run within each fresh process.
+        top: Number of entries displayed in profiler summaries.
+        repeats: Number of repetitions per query and code version.
+        tag: Prefix for saved profile filenames.
+        env: Comma-separated KEY=VALUE variables for child processes.
+
+    Returns:
+        Collected RESULT lines from all query processes.
     """
     env_items = [item for item in env.split(",") if item]
     versions = [("after", "/root")]

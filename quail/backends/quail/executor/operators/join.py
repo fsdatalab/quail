@@ -198,7 +198,7 @@ def execute_join(state: QueryExecutionState, node, inputs) -> NodeResult:
 
 
 def _streamed_tokens(join_stages, answers, lists_for, anchor_keys) -> int:
-    """Tokens the join's stages packed: frames and partner suffixes."""
+    """Count frame and partner suffix tokens processed by the join stages."""
     total = 0
     previous = None
     for j, (stage, rows) in enumerate(zip(join_stages, answers)):

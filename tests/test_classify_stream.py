@@ -1,4 +1,4 @@
-"""A classification's stages inside the chain and join of its table."""
+"""Test classification within filter and join pipelines."""
 
 from dataclasses import replace
 from types import SimpleNamespace
@@ -109,7 +109,7 @@ class LabelingModel(FakeModel):
 
 
 def fused_graph(*, classify_only=False):
-    """Two classifications and a label filter, optionally with AI.IF and a join."""
+    """Build two classifications with an IN condition and optional filter and join."""
     spec = ClassifySpec(
         name="topic", aliases=("r",), query_template="", arguments=(),
         expected_inputs=14, estimated_seconds=0.0,
@@ -535,7 +535,7 @@ def test_streamed_classification_labels_survivors_with_their_kv_resident(
 
 
 def joined_graph(two_joins=False):
-    """A join of r with p, then a classification of the rows it keeps."""
+    """Build a join followed by classification of its retained pairs."""
     spec = ClassifySpec(
         name="stance", aliases=("r", "p"), query_template="", arguments=(),
         expected_inputs=3, estimated_seconds=0.0,

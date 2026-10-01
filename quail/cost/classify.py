@@ -1,4 +1,4 @@
-"""Classification work and time from sampled CPU scheduler replay.
+"""Estimate classification work and time by replaying sampled requests on the CPU.
 
 The cost helpers take prepared token counts and model and device specs.
 Prompt preparation, scoring rule selection, and plan construction belong
@@ -24,21 +24,20 @@ from quail.labels import (
 
 def suffix_lengths(scoring: str, labels, canvas_rows: int = 0,
                    draws: int = 1) -> list[int]:
-    """Tokens of each suffix a document streams under one scoring rule.
+    """Estimate the request lengths for a classification scoring method.
 
-    Every suffix starts with the answer cue's last token. Under
-    ``letters`` the one suffix is the cue alone, whose row scores every
-    letter, followed on a canvas model by the ``canvas_rows`` rows of
-    the seeded canvas whose first row is read; on a canvas model a
-    document may send one such suffix per noise draw, and every draw
-    is priced. Under ``trie_tree`` the one suffix holds every trie node
-    once; every row is read. Under ``trie_decode`` a document sends one
-    chain per round, the cue and the tokens decoded so far, for as many
-    rounds as the mean label length rounded up, and reads each chain's
-    last row; how many rounds it needs is decided as it runs.
+    Args:
+        scoring: Method name: letters, trie_tree, or trie_decode.
+        labels: Token sequence for each category.
+        canvas_rows: Number of diffusion answer canvas rows.
+        draws: Maximum number of diffusion draws per document.
+
+    Returns:
+        Request lengths in tokens, including the answer cue. Greedy decoding
+        uses the rounded-up mean label length to estimate its round count.
 
     Raises:
-        ValueError: The rule is not one of LABEL_SCORINGS.
+        ValueError: The scoring method is unknown.
     """
     if scoring == LETTERS_SCORING:
         return [1 + canvas_rows] * (draws if canvas_rows else 1)
@@ -51,7 +50,7 @@ def suffix_lengths(scoring: str, labels, canvas_rows: int = 0,
 
 
 def readout_component(rows: float, model) -> CostComponent:
-    """The label readout: every read row through the whole output head."""
+    """Estimate computation and memory reads for the full output head."""
     return CostComponent(
         name="readout", flops=2.0 * model.hidden * model.vocab * rows,
         # the bf16 head streams from memory once per chunk that reads
@@ -60,7 +59,7 @@ def readout_component(rows: float, model) -> CostComponent:
 
 
 def chunk_seconds(work: Work, rows: float, model, device) -> float:
-    """Price one forward chunk at the roofline: weights stream once."""
+    """Estimate one forward pass in seconds using the GPU roofline model."""
     components = dense_decoder_components(work, model, passes=1.0)
     components += (readout_component(rows, model),)
     return sum(component.seconds
@@ -69,7 +68,7 @@ def chunk_seconds(work: Work, rows: float, model, device) -> float:
 
 @dataclass(frozen=True)
 class Simulated:
-    """What a scoring rule costs on a table, from the replayed scheduler.
+    """Estimated time, work, and token counts from a scheduler replay.
 
     Attributes:
         seconds: The summed roofline time of every chunk.
@@ -86,7 +85,7 @@ class Simulated:
     rounds: int
 
     def scaled(self, factor: float) -> "Simulated":
-        """The simulation of ``factor`` times as many documents alike."""
+        """Scale estimated time, work, and passes by the document-count factor."""
         if factor == 1:
             return self
         return Simulated(self.seconds * factor,
@@ -104,40 +103,30 @@ SAMPLE_DOCUMENTS = 1000
 def simulate(prefixes, frame: int, chains, chunk: int, capacity: int,
              model, device, resident: bool = False, canvas_rows: int = 0,
              one_per_round: bool = False, shared=None) -> Simulated:
-    """Replay the stage scheduler on the CPU and price each chunk.
+    """Replay classification scheduling on the CPU and estimate execution time.
 
-    Documents are admitted in order while their reservation, the
-    prefix plus the frame and longest chain, fits the arena, and a
-    chunk takes documents up to the chunk budget; a document's request
-    is atomic. A document sends its chains once, or with
-    ``one_per_round`` one of its chains per round, in order, reading
-    only that chain's last row. A round's answers are read while the
-    next chunk runs, so the document's next round enters the chunk
-    after that, or the next chunk when nothing else is ready; waiting
-    rounds enter a chunk before fresh documents. A document leaves the
-    arena once its last round's chunk has run. Each chunk costs its
-    roofline time with the weights streamed once, plus the readout of
-    every row it reads. Every document is priced at every round; a
-    decode that ends sooner takes fewer.
+    Requests are kept whole within chunks. Documents reserve KV until their
+    last round finishes. Waiting rounds run before new documents. Each
+    chunk's estimate includes one read of the model weights and the output
+    head work for its answer rows.
 
     Args:
-        prefixes: Per document, the tokens before the frame (the prompt
-            head and the document).
-        frame: The frame tokens written once per document.
-        chains: Per document, the lengths of the chains it streams.
-        chunk: The chunk budget in tokens.
-        capacity: The arena's tokens.
-        model: The ModelSpec.
-        device: The DeviceSpec.
-        resident: Whether the prefixes are in KV already.
-        canvas_rows: The rows of the answer canvas a document's suffix
-            packs, which read the document a second time and are the
-            rows read; 0 for a rule that reads its suffixes' rows.
-        one_per_round: Each round sends one of the document's chains,
-            in order, and reads its last row.
-        shared: Per document, the leading prefix tokens an earlier
-            document already computed, which it borrows from KV
-            instead of computing; None when no prefix is shared.
+        prefixes: Prompt head and document lengths, in tokens, per document.
+        frame: Number of tokens written after each document before requests.
+        chains: Request lengths in tokens for each document.
+        chunk: Maximum tokens per forward pass.
+        capacity: KV arena capacity in tokens.
+        model: Model specification.
+        device: Device specification.
+        resident: Whether document prefixes are already in KV.
+        canvas_rows: Number of answer canvas rows. Zero uses suffix rows
+            for the readout.
+        one_per_round: Whether to send one chain per round and read its last
+            row, instead of sending all chains in one round.
+        shared: Shared prefix length per document. None means no sharing.
+
+    Returns:
+        Simulated execution time, forward-pass count, work, and suffix tokens.
     """
     window = model.sliding_window
     n = len(prefixes)
@@ -243,15 +232,17 @@ def simulate(prefixes, frame: int, chains, chunk: int, capacity: int,
 
 def sample_documents(
         lengths, shared, live: float) -> tuple[list[tuple[int, int]], float]:
-    """A sample of the documents expected to reach a classification.
+    """Sample documents across the table's sorted length distribution.
 
-    Takes ``live`` documents, at most SAMPLE_DOCUMENTS, spread evenly
-    over the documents sorted by length, so the sample keeps the
-    table's length distribution.
+    Args:
+        lengths: Document lengths in tokens.
+        shared: Shared prefix length per document, or an empty sequence.
+        live: Expected number of documents reaching the classification.
 
     Returns:
-        Per sampled document, its length and its shared prefix
-        tokens; and how many expected documents each stands for.
+        A tuple of sampled (length, shared prefix length) pairs and the
+        number of expected documents represented by each sample. The sample
+        contains at most SAMPLE_DOCUMENTS entries.
     """
     shared = shared or (0,) * len(lengths)
     ordered = sorted(zip(lengths, shared))
@@ -268,10 +259,25 @@ def estimate_chains(head_tokens: int, frame_tokens: int, chains, *,
                     model, device, resident: bool = False,
                     canvas_rows: int = 0,
                     one_per_round: bool = False) -> Simulated:
-    """Sample a table, replay prepared suffix chains, and scale their cost.
+    """Estimate classification cost from a sample of document lengths.
 
-    The planner supplies the prompt head, frame, and suffix lengths.
-    Shared document prefixes include the prompt head when replayed.
+    Args:
+        head_tokens: Number of prompt tokens before each document.
+        frame_tokens: Number of prompt tokens written after each document.
+        chains: Request lengths in tokens, shared by all documents.
+        live: Expected number of documents to classify.
+        lengths: Document lengths in tokens.
+        shared: Shared document prefix lengths.
+        chunk: Maximum tokens per forward pass.
+        capacity: KV arena capacity in tokens.
+        model: Model specification.
+        device: Device specification.
+        resident: Whether document KV is already available.
+        canvas_rows: Number of answer canvas rows.
+        one_per_round: Whether each request runs in a separate decoder round.
+
+    Returns:
+        Simulated cost scaled to the expected document count.
     """
     documents, weight = sample_documents(lengths, shared, live)
     prefixes = [head_tokens + length for length, _ in documents]
@@ -287,7 +293,29 @@ def estimate_chains(head_tokens: int, frame_tokens: int, chains, *,
 def estimate(scoring: str, live: float, head_tokens: int, frame_tokens: int,
              labels, *, lengths, shared, chunk: int, capacity: int,
              model, device, resident: bool = False, draws: int = 1) -> Simulated:
-    """Replay one scoring rule over the expected documents and price it."""
+    """Estimate the cost of one classification scoring method.
+
+    Args:
+        scoring: Scoring method name.
+        live: Expected number of documents to classify.
+        head_tokens: Number of prompt tokens before each document.
+        frame_tokens: Number of prompt tokens written after each document.
+        labels: Token sequence for each category.
+        lengths: Document lengths in tokens.
+        shared: Shared document prefix lengths.
+        chunk: Maximum tokens per forward pass.
+        capacity: KV arena capacity in tokens.
+        model: Model specification.
+        device: Device specification.
+        resident: Whether document KV is already available.
+        draws: Maximum number of diffusion draws per document.
+
+    Returns:
+        Estimated execution time, work, and token counts.
+
+    Raises:
+        ValueError: The scoring method is unknown.
+    """
     canvas = model.answer_canvas
     canvas_rows = canvas.rows if canvas is not None else 0
     chains = suffix_lengths(scoring, labels, canvas_rows, draws)
