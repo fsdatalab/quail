@@ -845,8 +845,8 @@ def test_sql_category_forms_options_and_label_tables(session):
     # follows it
     assert pairs.prompt.tail.startswith("{0}\n\n" + CLASSIFY_INSTRUCTION)
     tasked = call_of("SELECT d.id, AI.CLASSIFY(d.body, ARRAY['refund', 'praise'], "
-                     "{'task_description': 'Pick the request kind.', "
-                     "'output_mode': 'single'}) AS topic FROM documents d")
+                     "{'task_description': 'Pick the request kind.'}) AS topic "
+                     "FROM documents d")
     assert "Pick the request kind." in tasked.prompt.tail
     # a registered label table, in ordinal order, then by label text
     session.register("kinds", DocumentProvider.from_table(pa.table({
@@ -868,8 +868,6 @@ def test_sql_category_forms_options_and_label_tables(session):
     long_text = " ".join(["word"] * 26)
     for bad in (f"SELECT d.id, AI.CLASSIFY(d.body, ARRAY[('refund', '{long_text}'),"
                 f" ('praise', NULL)]) AS topic FROM documents d",
-                "SELECT d.id, AI.CLASSIFY(d.body, ARRAY['refund', 'praise'], "
-                "{'output_mode': 'multi'}) AS topic FROM documents d",
                 "SELECT d.id, AI.CLASSIFY(d.body, ARRAY['refund', 'praise'], "
                 "{'examples': 'x'}) AS topic FROM documents d",
                 "SELECT d.id, AI.CLASSIFY(d.body, ARRAY['refund', 'praise'], "

@@ -325,7 +325,7 @@ class _Binder:
         pairs, or of {'label': ..., 'description': ...} objects, or the
         name of a registered label table, given positionally or as
         categories => ...; the config object takes selectivity,
-        task_description, output_mode, and probabilities.
+        task_description, and probabilities.
         """
         categories = node.args.get("categories")
         if isinstance(categories, exp.Kwarg):
@@ -410,8 +410,7 @@ class _Binder:
         """Return an AI.CLASSIFY config object's options.
 
         Raises:
-            CompileError: An unknown key, output_mode other than
-                'single', or a value of the wrong type.
+            CompileError: An unknown key or a value of the wrong type.
         """
         if node is None:
             return {}
@@ -436,11 +435,6 @@ class _Binder:
                     raise CompileError("task_description is a string")
                 validate_task_description(text)
                 out[key] = text
-            elif key == "output_mode":
-                if text != "single":
-                    raise CompileError(
-                        "AI.CLASSIFY returns one label: output_mode is "
-                        "'single' or absent")
             elif key == "probabilities":
                 if not isinstance(value, exp.Boolean):
                     raise CompileError("probabilities is true or false")
@@ -448,7 +442,7 @@ class _Binder:
             else:
                 raise CompileError(
                     f"unknown AI.CLASSIFY option {key!r}; the options are "
-                    f"selectivity, task_description, output_mode, and "
+                    f"selectivity, task_description, and "
                     f"probabilities")
         return out
 
