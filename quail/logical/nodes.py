@@ -666,6 +666,47 @@ class Project:
 
 
 @dataclass(frozen=True)
+class LabelWork:
+    """The classifications a plan needs, from the filters on its labels and its columns.
+
+    Attributes:
+        calls: (AI.CLASSIFY call, alias) in plan order: the calls label
+            filters test, in written order, then projected labels.
+        names: Call -> its output column.
+        tests: Call -> written positions of the filters testing its label.
+        projected: Call -> column name, for projected labels.
+    """
+
+    calls: tuple
+    names: dict
+    tests: dict
+    projected: dict
+
+
+def _label_work(columns, filters) -> LabelWork:
+    projected = {column.expression: column.name
+                 for column in columns
+                 if isinstance(column, Alias)}
+    names = dict(projected)
+    tests = {}
+    calls = []
+    for alias, predicates in filters.items():
+        for position, predicate in enumerate(predicates):
+            test = predicate.expression
+            if not isinstance(test, LabelIn):
+                continue
+            names.setdefault(test.call,
+                             test.name or f"__label_{alias}_{position}")
+            if test.call not in tests:
+                calls.append((test.call, alias))
+            tests.setdefault(test.call, []).append(position)
+    for call in projected:
+        if call not in tests:
+            calls.append((call, call.aliases()[0]))
+    return LabelWork(tuple(calls), names, tests, projected)
+
+
+@dataclass(frozen=True)
 class LogicalPlan:
     root: LogicalNode
 
@@ -709,6 +750,9 @@ class LogicalPlan:
             filters={alias: tuple(value) for alias, value in filters.items()},
             joins=tuple(joins),
             applies=tuple(applies),
+            labels=_label_work(
+                self.root.columns if isinstance(self.root, Project) else (),
+                filters),
         )
 
 
@@ -724,15 +768,19 @@ class Operators:
     filters: dict          # alias -> tuple[FilterPredicate, ...]
     joins: tuple           # tuple[SemanticJoin, ...]
     applies: tuple         # tuple[Apply, ...]
+    labels: LabelWork
 
     @property
     def prompts(self) -> tuple:
-        """Every prompt the plan asks, filters first, then joins."""
-        return tuple(
-            predicate.prompt
+        """Every prompt, from filters, joins, then remaining projected calls."""
+        calls = tuple(
+            model_call(predicate.expression)
             for predicates in self.filters.values()
             for predicate in predicates
-        ) + tuple(join.prompt for join in self.joins)
+        ) + tuple(model_call(join.predicate) for join in self.joins)
+        return tuple(call.prompt for call in calls) + tuple(
+            call.prompt for call in self.labels.projected if call not in calls
+        )
 
 
 def join_outer_input(join: "SemanticJoin") -> "LogicalNode":

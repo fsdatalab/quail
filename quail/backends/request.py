@@ -71,7 +71,6 @@ from quail.planner import (
     join_specs as logical_join_specs,
 )
 from quail.planner.classify import has_label
-from quail.planner.decide import label_work
 from quail.planner.joins import search_joins, summarize_alias
 from quail.planner.physical_optimizer import PhysicalCandidate, SupportResult
 from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
@@ -254,7 +253,7 @@ def plan_request_backend(
 
     # each classification labels the alias's documents after its AI.IF
     # chain; the filters on its labels keep the accepted documents for the joins
-    label_plan = label_work(region.logical_plan, filters)
+    label_plan = operators.labels
     classify_specs = []
     for call, alias in label_plan.calls:
         prompts.append(call.prompt)

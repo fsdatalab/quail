@@ -1,6 +1,6 @@
 """Choose filter order, joins, anchors, and KV retention before execution."""
 
-from dataclasses import dataclass, replace
+from dataclasses import replace
 
 from quail.cost import budgets
 from quail.cost.retention import coefficients, retention_pages
@@ -11,6 +11,7 @@ from quail.logical import (
     Alias,
     CompileError,
     LabelIn,
+    LabelWork,
     LogicalPlan,
     effective_selectivity,
     join_conditions,
@@ -351,47 +352,6 @@ def contiguous_shards(doc_tokens, workers: int):
 
 # ---------------------------------------------------------- the planner
 
-@dataclass(frozen=True)
-class LabelWork:
-    """The classifications a plan needs, from the filters on its labels and its columns.
-
-    Attributes:
-        calls: (AI.CLASSIFY call, alias) in plan order: the calls label
-            filters test, in written order, then projected labels.
-        names: Call -> its output column.
-        tests: Call -> written positions of the filters testing its label.
-        projected: Call -> column name, for projected labels.
-    """
-
-    calls: tuple
-    names: dict
-    tests: dict
-    projected: dict
-
-
-def label_work(plan, filters) -> LabelWork:
-    projected = {column.expression: column.name
-                 for column in plan.root.columns
-                 if isinstance(column, Alias)}
-    names = dict(projected)
-    tests = {}
-    calls = []
-    for alias, predicates in filters.items():
-        for position, predicate in enumerate(predicates):
-            test = predicate.expression
-            if not isinstance(test, LabelIn):
-                continue
-            names.setdefault(test.call,
-                             test.name or f"__label_{alias}_{position}")
-            if test.call not in tests:
-                calls.append((test.call, alias))
-            tests.setdefault(test.call, []).append(position)
-    for call in projected:
-        if call not in tests:
-            calls.append((call, call.aliases()[0]))
-    return LabelWork(tuple(calls), names, tests, projected)
-
-
 def joined_calls(labels: LabelWork) -> list:
     """The classifications of joined rows, each with its two aliases."""
     return [(call, call.aliases()) for call, _ in labels.calls
@@ -428,7 +388,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     operators = plan.operators()
     joined = {argument.alias for join in operators.joins
               for argument in join.prompt.args}
-    labels = label_work(plan, operators.filters)
+    labels = operators.labels
     if isinstance(before, Refusal) or not any(
             alias in joined for _, alias in labels.calls):
         return before
@@ -457,7 +417,7 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
             for alias, predicates in filters.items()}
     ask_filters = {alias: [filters[alias][position] for position in positions]
                    for alias, positions in asks.items() if positions}
-    labels = label_work(plan, filters)
+    labels = operators.labels
     classified = {alias for _, alias in labels.calls}
     if labels.calls:
         if context is None:

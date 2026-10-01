@@ -357,11 +357,14 @@ def test_benchmark_query_prompts_labels_and_raw_rendering():
                     render_join_prompt_text(prompt, documents, anchor))
 
 
-def test_classification_pieces_are_the_named_reference_prompt(tmp_path):
+@pytest.mark.parametrize("case", ("IMDB-11", "IMDB-14", "IMDB-15"))
+def test_classification_pieces_are_the_named_reference_prompt(tmp_path, case):
     from quail_b.minimum import validate_prompt_pieces
     from quail_b.rendering import render_classify_prompt
 
-    spec = get_query("IMDB-15")
+    # IMDB-11 only projects labels; IMDB-14 also filters them;
+    # IMDB-15 includes a classification over joined rows.
+    spec = get_query(case)
     plan = read_plan(spec.plan)
     with _session(tmp_path, backend="stock_vllm") as sess:
         # the byte tokenizer, so the pieces decode back to text
@@ -372,13 +375,15 @@ def test_classification_pieces_are_the_named_reference_prompt(tmp_path):
     def text(ids):
         return bytes(token - 1 for token in ids).decode("utf-8")
 
-    sentiment, aspect = plan.classifies
-    one, joined = pieces["classifies"]
-    assert text(pieces["preamble"]) + "good film" + text(one["tail"]) == (
-        render_classify_prompt(sentiment.prompt, "good film", sentiment.labels,
-                               sentiment.descriptions))
-    assert joined["anchor"] == "r"
-    assert (text(pieces["preamble"]) + "good film" + text(joined["frame"])
-            + text(joined["label"]) + "the acting" + text(joined["tail"])) == (
-        render_classify_prompt(aspect.prompt, "good film", aspect.labels,
-                               aspect.descriptions, partner="the acting"))
+    assert len(pieces["classifies"]) == len(plan.classifies)
+    for operator, piece in zip(plan.classifies, pieces["classifies"]):
+        assert piece["id"] == operator.id
+        rendered = text(pieces["preamble"]) + "good film"
+        partner = None
+        if operator.partner is not None:
+            assert piece["anchor"] == operator.alias
+            partner = "the acting"
+            rendered += text(piece["frame"]) + text(piece["label"]) + partner
+        assert rendered + text(piece["tail"]) == render_classify_prompt(
+            operator.prompt, "good film", operator.labels,
+            operator.descriptions, partner=partner)

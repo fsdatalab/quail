@@ -28,7 +28,6 @@ import quail_b as benchmark
 from quail.bench import substrait
 from quail.bench.results import write_json
 from quail.bench.substrait import QueryPlan, read_plan
-from quail.planner.decide import label_work
 from quail.planner.plan import Refusal
 from quail.specs import H100_USD_PER_HOUR, MODELS
 from quail_b.queries import (
@@ -225,7 +224,7 @@ def prompt_pieces(query, plan: QueryPlan, anchors) -> dict:
             "id": plan.join_id(position), "anchor": anchor,
             **_pair_pieces(join.prompt, anchor)})
     if plan.classifies:
-        labels = label_work(query.logical, filters)
+        labels = operators.labels
         calls = {labels.names[call]: call for call, _ in labels.calls}
         for operator in plan.classifies:
             call = calls[operator.output]

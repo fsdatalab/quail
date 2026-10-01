@@ -104,3 +104,30 @@ def test_operators_walk_lists_each_operator_in_written_order():
     assert plan.root.explain_fields()["columns"] == [
         "r.id", "AI.SCORE('DOCUMENT:\\n{0}\\n\\nq') AS s",
     ]
+
+    # Projection names win over filter names; repeated tests share a call.
+    named = ModelCall(bind_prompt("category {0}", (R,)), "label", ("a", "b"))
+    hidden = ModelCall(bind_prompt("hidden {0}", (R,)), "label", ("a", "b"))
+    pair = ModelCall(bind_join_prompt("pair {0} {1}", (R, P)),
+                     "label", ("a", "b"))
+    filtered = SemanticFilter(r, (
+        first, FilterPredicate(LabelIn(named, ("a",), "filter_name")),
+        FilterPredicate(LabelIn(named, ("b",))),
+        FilterPredicate(LabelIn(hidden, ("a",))),
+    ))
+    joined = SemanticJoin(Join(filtered, p), _pair_call())
+    operators = LogicalPlan(Project(joined, (
+        Alias(named, "projected_name"), Alias(pair, "pair_label"),
+    ))).operators()
+    assert operators.labels.calls == ((named, "r"), (hidden, "r"), (pair, "r"))
+    assert operators.labels.names == {
+        named: "projected_name", hidden: "__label_r_3", pair: "pair_label"}
+    assert operators.labels.tests == {named: [1, 2], hidden: [3]}
+    assert operators.labels.projected == {
+        named: "projected_name", pair: "pair_label"}
+    assert operators.prompts == (
+        first.prompt, named.prompt, named.prompt, hidden.prompt,
+        joined.prompt, pair.prompt,
+    )
+    assert LogicalPlan(filtered).operators().labels.names == {
+        named: "filter_name", hidden: "__label_r_3"}
