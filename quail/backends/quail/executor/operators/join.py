@@ -68,19 +68,22 @@ def execute_join(state: QueryExecutionState, node, inputs) -> NodeResult:
     settled = set()
     join_rows = {}
     if after:
-        # the join's last stage records each anchor's kept partners
-        # for the parts after it, and its row settles the anchor
         last = len(join_stages) - 1
+        for j, stage in enumerate(join_stages):
+            recorders = [part.kept for part in after if part.kept.stage == j]
+            if not recorders and j != last:
+                continue
 
-        def kept(a, row, stage=join_stages[last]):
-            indices = (None if lists_for is None
-                       else lists_for(anchor_keys[a][1])[last])
-            join_rows[a] = row
-            for part in after:
-                part.kept.record(a, row, indices)
-            return bool(any(row))
+            def kept(a, row, j=j, recorders=recorders):
+                indices = (None if lists_for is None
+                           else lists_for(anchor_keys[a][1])[j])
+                for recorder in recorders:
+                    recorder.record(a, row, indices)
+                if j == last:
+                    join_rows[a] = row
+                return bool(any(row))
 
-        join_stages[last].decide = kept
+            stage.decide = kept
 
     def on_settled(anchor, survived, row):
         settled.add(anchor)

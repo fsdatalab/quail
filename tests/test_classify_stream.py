@@ -26,6 +26,7 @@ from quail.physical import (
     AiClassify,
     AiFilter,
     AiJoin,
+    AiScore,
     ClassifySpec,
     Filter,
     FilterStage,
@@ -34,6 +35,7 @@ from quail.physical import (
     PhysicalGraph,
     PortRef,
     Scan,
+    ScoreSpec,
 )
 from quail.physical.base import input_ports
 from quail.specs import DEVICES, MODELS
@@ -164,7 +166,7 @@ def fused_graph(*, classify_only=False):
 
 
 @pytest.mark.parametrize("shape", ["filter", "joined", "classify_first",
-                                   "draws"])
+                                   "draws", "score_first"])
 def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
         monkeypatch, shape):
     """A filter, then a diffusion model's classification: one run.
@@ -185,7 +187,7 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
     from quail.specs.base import AnswerCanvas
 
     settings = AnswerCanvas(rows=4, turn_close_id=6, pad_id=0)
-    first = shape == "classify_first"
+    first = shape in {"classify_first", "score_first"}
     head = (80, 81) if first else ()
     spec = ClassifySpec(
         name="topic", aliases=("r",), query_template="", arguments=(),
@@ -201,10 +203,17 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
             alias="r", arena_writes=True,
             stages=(FilterStage(0, 1, 0, 0.8, 4 * 0.8),),
             question_token_ids=((QUESTION,),)))
+    if shape == "score_first":
+        nodes.append(AiScore(
+            node_id="score:r", inputs=input_ports((PortRef("input:r", "ids:r"),)),
+            backend_name="quail", model="diffusion-gemma-26b-a4b-fp8",
+            spec=ScoreSpec(name="score", aliases=("r",), query_template="",
+                           arguments=(), expected_inputs=4, estimated_seconds=0)))
     nodes.append(AiClassify(
         node_id="classify:r",
-        inputs=input_ports((PortRef("input:r" if first else "filter:r",
-                                    "ids:r"),)),
+        inputs=input_ports((PortRef(
+            "score:r" if shape == "score_first" else "input:r" if first else "filter:r",
+            "scores" if shape == "score_first" else "ids:r"),)),
         backend_name="quail", model="diffusion-gemma-26b-a4b-fp8",
         spec=spec))
     root = PortRef("classify:r", "scores")
@@ -242,7 +251,10 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
         "filter": ("filter:r", "classify:r"),
         "draws": ("filter:r", "classify:r"),
         "joined": ("filter:r", "classify:r", "label:r", "group:0"),
-        "classify_first": ("classify:r", "label:r")}[shape]}
+        "classify_first": ("classify:r", "label:r"),
+        "score_first": ("classify:r", "label:r")}[shape]}
+    if shape == "score_first":
+        assert ("score:r",) not in chains
 
     filter_truth = [[1], [0], [1], [1]]
     # the letter each survivor's first canvas row favors
@@ -349,6 +361,20 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
     }
     # the settings' shared preamble is empty, as a classification plan's is
     assert SETTINGS["pre_ids"] == []
+    if shape == "score_first":
+        from quail.execution.reranker import _score_table
+        from quail.execution.runner import NodeResult
+
+        execute = execution.execute
+
+        def with_score(node, inputs):
+            if node.node_id == "score:r":
+                rows = np.arange(4, dtype=np.int32).reshape(-1, 1)
+                return NodeResult({"scores": _score_table(
+                    rows, ("r",), "score", [0.1, 0.2, 0.3, 0.4])})
+            return execute(node, inputs)
+
+        monkeypatch.setattr(execution, "execute", with_score)
     result = execute_single_graph(state, SETTINGS, graph)
     assert not arena.accounting.owned
     outputs = result["_outputs"]
@@ -357,6 +383,10 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
     if first:
         assert labels.column("topic").to_pylist() == ["a", "a", "b", "b"]
         assert outputs[root].column("r").to_pylist() == [2, 3]
+        if shape == "score_first":
+            assert labels.column("score").to_pylist() == [0.1, 0.2, 0.3, 0.4]
+            filtered = outputs[PortRef("label:r", "scores")]
+            assert filtered.column("score").to_pylist() == [0.3, 0.4]
         assert prefixes == {d: list(head) + docs["r"][d] for d in range(4)}
         return
     assert outputs[PortRef("filter:r", "ids:r")].column("r").to_pylist() \
@@ -495,7 +525,7 @@ def test_streamed_classification_labels_survivors_with_their_kv_resident(
                    for chunk in heads)
 
 
-def joined_graph():
+def joined_graph(two_joins=False):
     """A join of r with p, then a classification of the rows it keeps."""
     spec = ClassifySpec(
         name="stance", aliases=("r", "p"), query_template="", arguments=(),
@@ -522,14 +552,25 @@ def joined_graph():
             inputs=input_ports((PortRef("group:0", "join_answers:2"),)),
             backend_name="quail", model="qwen3-4b-fp8", spec=spec),
     ]
+    if two_joins:
+        nodes.insert(2, Scan(node_id="input:q", alias="q", input_id="q"))
+        join = nodes[3]
+        nodes[3] = replace(
+            join,
+            inputs=input_ports(tuple(port.source for port in join.inputs)
+                               + (PortRef("input:q", "ids:q"),)),
+            stages=join.stages + (replace(
+                join.stages[0], written_pos=3, exec_idx=1, partners=("q",),
+                frame_token_ids=(FRAME + 1,), label_token_ids=(("q", ()),)),))
     return PhysicalGraph(tuple(nodes), PortRef("classify:rp", "scores"))
 
 
+@pytest.mark.parametrize("two_joins", [False, True])
 def test_a_classification_of_joined_rows_runs_after_its_join_on_the_anchors_kv(
-        monkeypatch):
+        monkeypatch, two_joins):
     from quail.execution.pipelines import build_pipelines
 
-    graph = joined_graph()
+    graph = joined_graph(two_joins)
     chains = {pipeline.node_ids for pipeline in build_pipelines(graph).values()}
     assert chains == {("group:0", "classify:rp")}
 
@@ -538,6 +579,10 @@ def test_a_classification_of_joined_rows_runs_after_its_join_on_the_anchors_kv(
             "p": [[PARTNER + d, PARTNER + d] for d in range(2)]}
     # r0 pairs with both partners, r1 with p1 only, r2 with none
     join_truth = {("r", 0): [1, 1], ("r", 1): [0, 1], ("r", 2): [0, 0]}
+    if two_joins:
+        # The second join keeps q0. Classification still reads p1 for r1.
+        docs["q"] = [[PARTNER + 2] * 2]
+        join_truth = {key: values + [1] for key, values in join_truth.items()}
     joined_truth = {(0, 0): 0, (0, 1): 1, (1, 1): 0}
     model = LabelingModel([], join_truth, [], joined_truth)
     torch = fake_torch()
@@ -607,4 +652,4 @@ def test_a_classification_of_joined_rows_runs_after_its_join_on_the_anchors_kv(
     assert metrics["classify:rp"]["evaluated_document_pairs"] == 3
     # the join packed every anchor, its frame, and both partners' suffixes
     assert metrics["group:0"]["fresh_tokens"] == sum(map(len, docs["r"])) \
-        + 3 * 1 + 6 * 2
+        + 3 * 1 + 6 * 2 + (2 * (1 + 2) if two_joins else 0)

@@ -118,6 +118,7 @@ def test_operators_walk_lists_each_operator_in_written_order():
     joined = SemanticJoin(Join(filtered, p), _pair_call())
     operators = LogicalPlan(Project(joined, (
         Alias(named, "projected_name"), Alias(pair, "pair_label"),
+        Alias(_filter_call("score"), "score"),
     ))).operators()
     assert operators.labels.calls == ((named, "r"), (hidden, "r"), (pair, "r"))
     assert operators.labels.names == {
@@ -127,7 +128,7 @@ def test_operators_walk_lists_each_operator_in_written_order():
         named: "projected_name", pair: "pair_label"}
     assert operators.prompts == (
         first.prompt, named.prompt, named.prompt, hidden.prompt,
-        joined.prompt, pair.prompt,
+        joined.prompt, pair.prompt, _filter_call("score").prompt,
     )
     assert LogicalPlan(filtered).operators().labels.names == {
         named: "filter_name", hidden: "__label_r_3"}

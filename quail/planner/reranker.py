@@ -9,6 +9,7 @@ from quail.cost.work import Work, triangle
 from quail.logical import (
     Alias,
     Apply,
+    LabelIn,
     SemanticJoin,
     effective_selectivity,
     is_score,
@@ -19,9 +20,11 @@ from quail.logical.prompts import (
     true_false_token_ids,
 )
 from quail.physical import (
+    AiClassify,
     AiScore,
     Comparison,
     Filter,
+    InList,
     Limit,
     PortRef,
     Project,
@@ -30,6 +33,11 @@ from quail.physical import (
 )
 from quail.physical.base import input_ports
 from quail.planner import hash_join_nodes
+from quail.planner.classify import (
+    ClassifyRefusedError,
+    classification_refusal,
+    classify_table,
+)
 from quail.planner.physical_optimizer import PhysicalCandidate
 from quail.planner.plan import PhysicalPlan, Refusal
 from quail.reranker import render_qwen3_reranker_input
@@ -255,7 +263,7 @@ def _projection_scores(logical) -> tuple[Alias, ...]:
     return tuple(
         expression
         for expression in logical.root.columns
-        if isinstance(expression, Alias)
+        if isinstance(expression, Alias) and expression.expression.kind == "score"
     )
 
 
@@ -269,7 +277,9 @@ def _score_name(prompt, projected, fallback: str) -> str:
 
 def _ordered_filters(predicates, count, mean_tokens, context, chunk,
                      token_parts_by_prompt):
-    remaining = list(enumerate(predicates))
+    remaining = [(position, predicate)
+                 for position, predicate in enumerate(predicates)
+                 if not isinstance(predicate.expression, LabelIn)]
     ordered = []
     live = float(count)
     scored = set()
@@ -312,6 +322,8 @@ def plan_reranker(region, context, *, backend_name: str):
         return _plan_reranker(region, context, backend_name=backend_name)
     except _RefusedError as refused:
         return (PhysicalCandidate(None, refused.refusal, float("inf")),)
+    except ClassifyRefusedError as refused:
+        return (PhysicalCandidate(None, refused.refusal(), float("inf")),)
 
 
 def _plan_reranker(region, context, *, backend_name: str):
@@ -323,6 +335,16 @@ def _plan_reranker(region, context, *, backend_name: str):
     operators = logical.operators()
     scans, filters, joins = operators.scans, operators.filters, operators.joins
     projected = _projection_scores(logical)
+    labels = operators.labels
+    if labels.calls:
+        refusal = classification_refusal(context)
+        if refusal is not None:
+            raise _RefusedError(refusal)
+        if any(len(call.aliases()) != 1 for call, _ in labels.calls):
+            raise _RefusedError(_refusal(
+                "AI.CLASSIFY over a document pair needs its AI join pipeline "
+                "on one GPU; AI.SCORE plans cannot execute that classification",
+                "joined_classify_pipeline"))
     predicates = [
         predicate
         for values in filters.values()
@@ -341,7 +363,10 @@ def _plan_reranker(region, context, *, backend_name: str):
         )
         return (PhysicalCandidate(None, refusal, float("inf")),)
     if not all(is_score(item.predicate if isinstance(item, SemanticJoin)
-                        else item.expression) for item in predicates):
+                        else item.expression)
+               or (not isinstance(item, SemanticJoin)
+                   and isinstance(item.expression, LabelIn))
+               for item in predicates):
         refusal = _refusal(
             "AI.SCORE cannot be mixed with generative AI predicates"
         )
@@ -515,6 +540,42 @@ def _plan_reranker(region, context, *, backend_name: str):
                 live[alias],
                 means[alias],
             )
+
+        calls = [call for call, owner in labels.calls if owner == alias]
+        if calls:
+            table = classify_table(context, alias, backend_name)
+            steps = [(predicate.expression.call, position)
+                     for position, predicate in enumerate(filters.get(alias, ()))
+                     if isinstance(predicate.expression, LabelIn)]
+            steps.extend((call, None) for call in calls if call not in labels.tests)
+            classified = set()
+            previous = None
+            for call, position in steps:
+                if call not in classified:
+                    resident = (context.gpu_count == 1 and previous is not None
+                                and table.head(call) == table.head(previous))
+                    spec, work = table.classify(
+                        call, labels.names[call], live[alias], resident=resident)
+                    node = table.node(spec, current[alias],
+                                      sum(isinstance(n, AiClassify) for n in nodes))
+                    nodes.append(node)
+                    total_work += work
+                    total_seconds += spec.estimated_seconds
+                    current[alias] = PortRef(node.node_id, "scores")
+                    classified.add(call)
+                    previous = call
+                if position is not None:
+                    predicate = filters[alias][position]
+                    filtered = Filter(
+                        node_id=f"filter:{alias}:{position}",
+                        inputs=input_ports((current[alias],)),
+                        predicate=InList(labels.names[call],
+                                         tuple(predicate.expression.accepted)),
+                        aliases=(alias,), selectivity=predicate.selectivity,
+                        written_pos=position)
+                    nodes.append(filtered)
+                    current[alias] = PortRef(filtered.node_id, "scores")
+                    live[alias] *= effective_selectivity(predicate.selectivity)
 
     pair_prompt = pair_prompts[0] if pair_prompts else None
     sink = current[scans[0].alias]

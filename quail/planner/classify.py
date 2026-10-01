@@ -14,6 +14,7 @@ from dataclasses import dataclass, replace
 
 from quail.cost import budgets
 from quail.cost import classify as classify_cost
+from quail.execution.pipelines import build_pipelines
 from quail.labels import (
     DECODE_SCORING,
     LABEL_SCORINGS,
@@ -28,6 +29,7 @@ from quail.logical import (
 )
 from quail.physical import (
     AiClassify,
+    AiJoin,
     ClassifySpec,
 )
 from quail.physical.base import input_ports
@@ -52,6 +54,27 @@ def classification_refusal(context) -> Refusal | None:
         return None
     return Refusal(reasons=(reason,), constraint="unsupported_classify_query",
                    needed=1, available=0, unit="queries")
+
+
+def joined_classification_refusal(graph, workers: int) -> Refusal | None:
+    """Refuse pair classifications the selected execution cannot run."""
+    pipelines = build_pipelines(graph) if workers == 1 else {}
+    for node in graph.nodes:
+        if not isinstance(node, AiClassify) or node.spec.partner is None:
+            continue
+        pipeline = pipelines.get(node.node_id)
+        if pipeline is not None and any(
+                isinstance(member, AiJoin)
+                and any(port.source.node_id == member.node_id for port in node.inputs)
+                for member in pipeline.members):
+            continue
+        return Refusal(
+            reasons=(f"AI.CLASSIFY {node.spec.name!r} over a document pair "
+                     "must run in its join's pipeline on one GPU; this plan "
+                     "requires unsupported standalone pair classification",),
+            constraint="joined_classify_pipeline", needed=1, available=0,
+            unit="supported join pipelines")
+    return None
 
 
 def classify_table(context, alias: str, backend_name: str,

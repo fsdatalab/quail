@@ -6,6 +6,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from fakes import letter_tokens
 
 import quail
 from quail.backends.quail.executor.stages import Stage
@@ -29,7 +30,16 @@ from quail.execution.runner import (
 from quail.execution.types import PhysicalResponse, export_physical_outputs
 from quail.frontend.sql import compile_sql
 from quail.logical import CompileError, SemanticJoin
-from quail.physical import AiScore, Comparison, Filter, decode_graph, encode_graph
+from quail.physical import (
+    AiClassify,
+    AiScore,
+    ClassifySpec,
+    Comparison,
+    Filter,
+    InList,
+    decode_graph,
+    encode_graph,
+)
 from quail.planner.plan import EngineConfig, Refusal
 
 PROJECTION_SQL = (
@@ -347,6 +357,58 @@ def test_score_filters_compare_values_and_keep_pair_answers(catalog):
     assert result.schema.field("s").type == pa.float64()
     assert result.report["estimated_seconds"] > 0
     assert reranker.calls == 1
+    session.close()
+
+
+def test_scores_and_labels_keep_their_types_and_prior_columns(catalog):
+    class MixedOutputs(_RowReranker):
+        def score(self, spec, rows, documents):
+            if isinstance(spec, ClassifySpec):
+                labels = [spec.labels[int(row[0]) % 2] for row in rows]
+                return RerankerBatch(labels, fresh_tokens=len(rows), cached_tokens=0)
+            return super().score(spec, rows, documents)
+
+    session = _session(catalog, model="qwen3-4b-fp8", tokenizer=letter_tokens)
+    score = "AI.SCORE(PROMPT('Refund? {0}', d.body))"
+    label = "AI.CLASSIFY(PROMPT('Topic {0}', d.body), ARRAY['refund','praise'])"
+    for columns in (f"{score} AS s, {label} AS topic",
+                    f"{label} AS topic, {score} AS s"):
+        for predicate, expected in (
+                ("", [(1, "refund"), (2, "praise")]),
+                (f"WHERE {score} >= 0.15", [(2, "praise")]),
+                (f"WHERE {label} IN ('praise') AND {score} >= 0.15",
+                 [(2, "praise")])):
+            query = session.sql(
+                f"SELECT d.id, {columns} FROM documents d {predicate}")
+            physical = query.plan()
+            classifications = [node for node in physical.nodes
+                               if isinstance(node, AiClassify)]
+            assert len(classifications) == 1
+            assert classifications[0].spec.labels == ("refund", "praise")
+            assert sum(type(node) is AiScore for node in physical.nodes) == 1
+            if "IN" in predicate:
+                assert any(isinstance(node, Filter)
+                           and node.predicate == InList("topic", ("praise",))
+                           for node in physical.nodes)
+            decoded = decode_graph(
+                encode_graph(physical.graph, session.registry.codecs),
+                session.registry.codecs)
+            assert decoded == physical.graph
+            result = _finish(query, session, MixedOutputs())
+            rows = result.collect()
+            assert list(zip(rows.column("d.id").to_pylist(),
+                            rows.column("topic").to_pylist())) == expected
+            assert rows.column("s").to_pylist() == pytest.approx(
+                [document / 10 for document, _ in expected])
+            assert rows.schema.field("topic").type == pa.string()
+            assert rows.schema.field("s").type == pa.float64()
+    # A pair score retains a one-document classification from its input.
+    query = session.sql(
+        f"SELECT q.id, d.id, {label} AS topic, "
+        "AI.SCORE(PROMPT('Relevance {0} {1}', q.text, d.body)) AS relevance "
+        "FROM queries q CROSS JOIN documents d")
+    assert _finish(query, session, MixedOutputs()).collect().column(
+        "topic").to_pylist() == ["refund", "praise", "refund", "praise"]
     session.close()
 
 

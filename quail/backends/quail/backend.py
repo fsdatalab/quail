@@ -19,7 +19,7 @@ from quail.logical import Alias, is_score, shared_preamble
 from quail.logical.prompts import true_false_token_ids
 from quail.physical import AiFilter, AiJoin, AiScore, Barrier, PhysicalNode
 from quail.planner import plan_quail
-from quail.planner.classify import has_label
+from quail.planner.classify import has_label, joined_classification_refusal
 from quail.planner.physical_optimizer import (
     ModelRegion,
     PhysicalCandidate,
@@ -208,6 +208,9 @@ class QuailBackend:
                     estimated_seconds=float("inf"),
                 ),
             )
+        refusal = joined_classification_refusal(plan.graph, context.gpu_count)
+        if refusal is not None:
+            return (PhysicalCandidate(None, refusal, float("inf")),)
         plan = self._bind_runtime_data(plan, region, context)
         return (
             PhysicalCandidate(

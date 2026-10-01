@@ -686,7 +686,7 @@ class LabelWork:
 def _label_work(columns, filters) -> LabelWork:
     projected = {column.expression: column.name
                  for column in columns
-                 if isinstance(column, Alias)}
+                 if isinstance(column, Alias) and column.expression.kind == "label"}
     names = dict(projected)
     tests = {}
     calls = []
@@ -750,6 +750,9 @@ class LogicalPlan:
             filters={alias: tuple(value) for alias, value in filters.items()},
             joins=tuple(joins),
             applies=tuple(applies),
+            projections=tuple(column for column in self.root.columns
+                              if isinstance(column, Alias))
+            if isinstance(self.root, Project) else (),
             labels=_label_work(
                 self.root.columns if isinstance(self.root, Project) else (),
                 filters),
@@ -769,6 +772,7 @@ class Operators:
     joins: tuple           # tuple[SemanticJoin, ...]
     applies: tuple         # tuple[Apply, ...]
     labels: LabelWork
+    projections: tuple = ()     # named model calls in SELECT order
 
     @property
     def prompts(self) -> tuple:
@@ -779,7 +783,8 @@ class Operators:
             for predicate in predicates
         ) + tuple(model_call(join.predicate) for join in self.joins)
         return tuple(call.prompt for call in calls) + tuple(
-            call.prompt for call in self.labels.projected if call not in calls
+            column.expression.prompt for column in self.projections
+            if column.expression not in calls
         )
 
 

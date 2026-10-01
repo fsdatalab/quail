@@ -16,7 +16,7 @@ from quail.physical import AiClassify, ValueType
 from quail.progress import answer_sink
 
 
-def classification_part(state: QueryExecutionState, node, ids, parts):
+def classification_part(state: QueryExecutionState, node, ids, parts, inputs):
     """Prepare a classification with the labels its inputs provide."""
     position = {document: index for index, document in enumerate(ids)}
     plan = ClassifyStages(state, node.spec, len(ids),
@@ -27,7 +27,10 @@ def classification_part(state: QueryExecutionState, node, ids, parts):
               for port in node.inputs
               if port.value_type is ValueType.SCORES
               and port.source.node_id in by_node]
-    return ClassifyPart(node, ids, plan, priors)
+    prior_tables = [inputs[port.name] for port in node.inputs
+                    if port.value_type is ValueType.SCORES
+                    and port.source.node_id not in by_node]
+    return ClassifyPart(node, ids, plan, priors, prior_tables=prior_tables)
 
 
 def joined_classification(state: QueryExecutionState, node, join, ids,
@@ -63,11 +66,13 @@ class ClassifyPart:
     document_done = None
     result_value = None
 
-    def __init__(self, node, ids, plan: ClassifyStages, priors=(), kept=None):
+    def __init__(self, node, ids, plan: ClassifyStages, priors=(), kept=None,
+                 prior_tables=()):
         self.node = node
         self.ids = ids
         self.plan = plan
         self.priors = priors      # (part, port) of each label table read
+        self.prior_tables = prior_tables
         self.kept = kept          # KeptPairs, for joined rows
         self.stages = plan.stages
         self.reached = 0
@@ -116,9 +121,10 @@ class ClassifyPart:
                              pa.string())
         # the labels the parts before it gave these documents, as a
         # classify node on its own carries them from its scores input
-        table = attach_prior_columns(table, {
-            spec.aliases[0]: part.result_value.outputs[port]
-            for part, port in self.priors})
+        priors = {spec.aliases[0]: prior for prior in self.prior_tables}
+        priors.update({spec.aliases[0]: part.result_value.outputs[port]
+                       for part, port in self.priors})
+        table = attach_prior_columns(table, priors)
         sink = answer_sink()
         if sink is not None and len(rows):
             sink(scored_batch(self.node, rows, table))
@@ -136,7 +142,7 @@ class ClassifyPart:
 
 
 class KeptPairs:
-    """The partners a join's last stage kept for each anchor."""
+    """The partners the classification's join stage kept for each anchor."""
 
     def __init__(self, stage: int):
         self.stage = stage

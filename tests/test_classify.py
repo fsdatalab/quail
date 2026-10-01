@@ -363,6 +363,27 @@ def test_sql_classifies_the_rows_a_join_keeps(session, tmp_path):
     assert classify.spec.partner is not None
     assert classify.spec.anchor == join.anchor
     assert classify.inputs[0].source.node_id == join.node_id
+    # More than one independent label consumer ends the join pipeline.
+    other = stance.replace("What does DOCUMENT", "How does DOCUMENT")
+    refused = session.sql(
+        f"SELECT d.id, a.id, {stance} AS stance, {other} AS other "
+        "FROM documents d JOIN aspects a "
+        "ON AI_FILTER(PROMPT('Does {0} mention {1}?', d.body, a.aspect))").plan()
+    assert isinstance(refused, Refusal)
+    assert refused.constraint == "joined_classify_pipeline"
+    assert "standalone pair classification" in refused.reasons[0]
+    distributed = quail.Session(
+        EngineConfig(model="qwen3-4b-fp8", device="h100-sxm", gpus=2),
+        tokenizer=letter_tokens)
+    for name in ("documents", "aspects"):
+        distributed.register(name, session.catalog.get(name))
+    refused = distributed.sql(
+        f"SELECT d.id, a.id, {stance} AS stance FROM documents d "
+        "JOIN aspects a ON AI_FILTER(PROMPT('Does {0} mention {1}?', "
+        "d.body, a.aspect))").plan()
+    assert isinstance(refused, Refusal)
+    assert refused.constraint == "joined_classify_pipeline"
+    distributed.close()
     # a joined row's label is not tested in WHERE
     with pytest.raises(CompileError, match="one table|filter on a label"):
         session.sql(

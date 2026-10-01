@@ -1,5 +1,7 @@
 """Assemble and execute model pipelines over one table's documents."""
 
+import pyarrow as pa
+
 from quail.backends.quail.executor.operators.apply import ApplyGate, apply_part
 from quail.backends.quail.executor.operators.classify import (
     ClassifyPart,
@@ -50,7 +52,8 @@ def execute_pipeline(state: QueryExecutionState, pipeline, inputs, context) -> d
                         if port.source.port == f"ids:{alias}"), None)
     source = (inputs[first.node_id][anchor_port] if anchor_port is not None
               else next(iter(inputs[first.node_id].values())))
-    ids = list(source)
+    ids = (source.column(alias).to_pylist() if isinstance(source, pa.Table)
+           else list(source))
     gpu_inputs = {"gpu_timing": context.state.get("gpu_timing", False)}
     # the members with stages, then the gates after the last of them
     last_staged = max(index for index, member in enumerate(members)
@@ -126,7 +129,7 @@ def _part(state: QueryExecutionState, node, ids, parts, inputs, context):
     if isinstance(node, AiFilter):
         return FilterPart(node, ids, state.async_answers)
     if isinstance(node, AiClassify):
-        return classification_part(state, node, ids, parts)
+        return classification_part(state, node, ids, parts, inputs[node.node_id])
     if isinstance(node, Filter):
         labeled = next(part for part in reversed(parts)
                        if isinstance(part, ClassifyPart)

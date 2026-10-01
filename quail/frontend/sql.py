@@ -755,6 +755,7 @@ def compile_sql(sql: str, catalog: Catalog,
     ]
     score_flags = [
         is_score(predicate.expression) for predicate in filter_predicates
+        if not isinstance(predicate.expression, LabelIn)
     ] + [is_score(join.predicate) for join in b.joins] \
         + [True for _ in projected_scores]
     if any(score_flags) and not all(score_flags):
