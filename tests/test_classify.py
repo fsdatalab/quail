@@ -16,7 +16,7 @@ from quail.backends.quail.executor.classify import (
     document_prefixes,
     label_requests,
 )
-from quail.backends.quail.executor.readout import AsyncLabelLogprobs
+from quail.backends.quail.executor.readout import AsyncLabelLogprobs, answer_rows
 from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
 from quail.bench.quailb import run_output
 from quail.bench.substrait import read_plan
@@ -104,6 +104,10 @@ def test_label_readout_is_log_softmax_over_the_whole_vocabulary():
     expected = torch.log_softmax(logits, dim=1)[:, [5, 17, 299]]
     assert torch.allclose(got, expected, atol=1e-5)
     assert readout.dtype.shape == (3,)
+    # a many-row answer's rows land at (answer, row within it)
+    answers, rows = answer_rows([2, 1, 3])
+    assert answers.tolist() == [0, 0, 1, 2, 2, 2]
+    assert rows.tolist() == [0, 1, 0, 0, 1, 2]
 
 
 def test_classifier_reads_the_letters_at_the_cue_row(monkeypatch):

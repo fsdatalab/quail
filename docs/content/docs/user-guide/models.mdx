@@ -197,7 +197,11 @@ def run_query():
 Quail's own cache is controlled by `QUAIL_CACHE_DIR` (default
 `~/.cache/quail/kernels`). Other libraries use their own environment
 variables: `HF_HOME`, `DG_CACHE_DIR`, `TRITON_CACHE_DIR`,
-`VLLM_CACHE_ROOT`.
+`VLLM_CACHE_ROOT`. FlashAttention 4, which runs heads wider than 256
+such as DiffusionGemma's, saves its compiled kernels only with
+`FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1`, under
+`FLASH_ATTENTION_CUTE_DSL_CACHE_DIR`; without it every process
+compiles them again, some inside the first query.
 
 ### Submit and retrieve
 

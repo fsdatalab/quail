@@ -235,6 +235,8 @@ class _StageExecutor:
                 or any(len(stage.suffixes) != 1 for stage in self.stages)):
             raise ValueError("the unpaged path runs one stage of one suffix")
         self.prefixes = anchor_prefixes
+        # a prefix is built on each access, so its length is read once
+        self.prefix_lengths = [len(prefix) for prefix in self.prefixes]
         self.keys = (list(range(len(self.prefixes))) if anchor_keys is None
                      else anchor_keys)
         if len(self.keys) != len(self.prefixes):
@@ -267,7 +269,7 @@ class _StageExecutor:
                                    self.frames, self.stages, self.canvas_rows)
                                if stage.single])
 
-        resident = ({a: self._held_pages(self.keys[a], len(self.prefixes[a]))
+        resident = ({a: self._held_pages(self.keys[a], self.prefix_lengths[a])
                      for a, key in enumerate(self.keys)
                      if self.arena.is_resident(key)}
                     if self.paged else {})
@@ -279,7 +281,7 @@ class _StageExecutor:
         if prefix_tree is not None and not prefix_tree.shared_tokens:
             prefix_tree = None
         self.sched = JoinAdmission(
-            [len(p) for p in self.prefixes],
+            self.prefix_lengths,
             [(s.lengths + rows).tolist()
              for s, rows in zip(self.suffixes, self.canvas_rows)],
             budget,
@@ -336,7 +338,7 @@ class _StageExecutor:
                             for j, stage in enumerate(self.stages)}
 
     def _entry_rows(self, a, j, start, end, carried):
-        f = len(self.prefixes[a])
+        f = self.prefix_lengths[a]
         indices = self.sched.partner_indices(a, j, start, end)
         lengths = self.suffixes[j].lengths_at(indices)
         rows = ((f if carried else 0) + int(lengths.sum())
@@ -373,7 +375,7 @@ class _StageExecutor:
         entries = []
         for a, j, start, end, carried in chunk_groups:
             key = self.keys[a]
-            f = len(self.prefixes[a])
+            f = self.prefix_lengths[a]
             frame = self.frames[j]
             parent, shared = ((self.borrowing.parent(a), self.borrowing.shared(a))
                               if carried else (None, 0))
