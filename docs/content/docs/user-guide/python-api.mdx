@@ -57,12 +57,10 @@ the written order.
 Adds a classification column. The column can be returned with `select()`
 and tested with `label_in()`.
 
-| Parameter | Description |
-| --- | --- |
-| `prompt` | A prompt bound to document columns. |
-| `labels` | Label strings, `(label, description)` pairs, or a registered label table name. |
-| `name` | Output column name. |
-| `descriptions` | Optional descriptions corresponding to label strings. |
+`prompt` binds the question to document columns. `labels` accepts label
+strings, `(label, description)` pairs, or a registered label table name.
+`name` sets the output column name. For label strings, `descriptions`
+may supply a corresponding sequence of descriptions.
 
 ```python
 query = (

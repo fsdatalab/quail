@@ -263,20 +263,16 @@ the projection and predicate share one computation.
 
 #### Parameters
 
-| Parameter | Description |
-| --- | --- |
-| `input` | A document column or `PROMPT`. A prompt over two tables classifies a document pair. |
-| `categories` | A list of 2 to 255 nonempty labels, distinct ignoring case, or a registered label table. |
-| `options` | Optional task description, selectivity estimate, and output mode. |
+`input` is a document column or a `PROMPT`. A prompt over two tables
+classifies a document pair. `categories` must contain 2 to 255 nonempty
+labels, distinct ignoring case.
 
-Categories support the following forms:
+Categories can be supplied as:
 
-| Form | Example |
-| --- | --- |
-| Strings | `ARRAY['refund', 'praise']` |
-| Label and description pairs | `ARRAY[('refund', 'asks for money back'), ('praise', NULL)]` |
-| Objects | `ARRAY[{'label': 'refund', 'description': 'asks for money back'}, {'label': 'praise'}]` |
-| Registered table | `kinds` |
+- Strings: `ARRAY['refund', 'praise']`.
+- Label and description pairs: `ARRAY[('refund', 'asks for money back'), ('praise', NULL)]`.
+- Objects: `ARRAY[{'label': 'refund', 'description': 'asks for money back'}, {'label': 'praise'}]`.
+- A registered label table: `kinds`.
 
 Descriptions may contain at most 25 words. A label table requires a
 `label` column and may include `description` and integer `ordinal`
@@ -286,11 +282,13 @@ label text. The category argument also accepts the named form
 
 #### Options
 
-| Option | Default | Description |
-| --- | --- | --- |
-| `task_description` | Empty | Task text appended to the question, at most 50 words. |
-| `selectivity` | `0.2` | Estimated fraction of documents passing a label predicate. |
-| `output_mode` | `'single'` | Only `'single'` is supported. |
+The optional third argument accepts:
+
+- `task_description`: task text appended to the question, at most 50
+  words. The default is empty.
+- `selectivity`: estimated fraction of documents passing a label
+  predicate. The default is `0.2`.
+- `output_mode`: only `'single'` is supported and is the default.
 
 #### Examples
 
