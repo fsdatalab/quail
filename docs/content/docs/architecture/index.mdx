@@ -22,7 +22,7 @@ memory and needs to be recomputed).
    proposes one or more physical plans with cost estimates. The
    cheapest one is selected.
 4. The [runner](https://github.com/fsdatalab/quail/blob/main/quail/execution/runner.py)
-   executes the physical graph. Model nodes run on the GPU.
+   executes the physical graph. LLM nodes run on the GPU.
    Relational nodes run with Arrow on the CPU.
 5. The query returns the matching rows as a `pyarrow.Table` and an
    execution report with timing and token counts.

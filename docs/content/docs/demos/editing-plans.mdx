@@ -129,7 +129,7 @@ assert edited.remove("barrier:c") == plan
 
 Only `Barrier`, `Foreign`, and `Exchange` nodes can be removed.
 Removing `Foreign` also removes its Python function and can change
-the results. Removing a model node raises an error:
+the results. Removing an LLM node raises an error:
 
 ```text
 PlanEditError: 'ai_filter:c' is a AiFilter; removing it would change
