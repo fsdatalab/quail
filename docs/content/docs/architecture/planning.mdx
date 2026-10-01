@@ -325,50 +325,6 @@ tokens and the resident anchor context, plus self-attention among
 the suffix tokens. Suffixes do not attend to each other
 ([executor/pack.py](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/pack.py)).
 
-### Work per classification
-
-A classification of one table's documents is one more question on
-each document. Its tail $q_c$ is the reference prompt after the
-document: the question, the labels by name, and the answer cue. The
-label is read at the cue's row, as a filter's answer is; the rows a
-scoring rule appends to read it (a letter, a trie, or decode rounds)
-are an execution choice and are not counted.
-
-On each table the AI.IF filters run first, in the planner's order.
-Each classification then runs once over the documents still live,
-followed by the filters on its label (`IN`), which keep the documents
-whose reference label is in the accepted list and cost no tokens. A
-classification no label filter tests runs after those.
-
-**Classification of $A_c$ live documents**, with the document KV
-already resident:
-
-$$
-\mathrm{tokens} = |A_c| \cdot q_c, \quad
-\mathrm{pairs} = \sum_{i \in A_c} \bigl[ q_c \cdot (p + d_i) + T(q_c) \bigr]
-$$
-
-When the classification is the table's first question, it is priced
-as filter stage 1 with $q_c$ in place of $q_1$.
-
-**Classification of joined rows** (a prompt that reads one document
-from each side of a join) follows its join on the join's anchor and is
-priced as one more join stage over the pairs the join kept: the
-anchor note $f_a$ over the anchor's resident prefix, then one suffix
-per kept pair, $u_b$ being the partner label, the partner document,
-and the classification tail.
-
-<Callout type="info">
-**Example.** A query filters 5,000 reviews with one AI.IF predicate
-(51 question tokens), classifies the 1,218 survivors into four
-sentiments (a 60 token tail), keeps the 400 labeled "negative", and
-joins them with 20 aspects. The filter scans every review: 1,729,233
-fresh tokens. The classification adds $1{,}218 \times 60 = 73{,}080$
-fresh tokens over the survivors' resident prefixes. The label filter
-adds none. The join then pairs 400 reviews with 20 aspects, compared
-with 1,218 reviews without the label filter.
-</Callout>
-
 ### Computing the cost of a plan
 
 When the planner evaluates a particular filter ordering or join
@@ -460,9 +416,3 @@ You can follow a plan's cost estimate through these files.
 - Peak GPU throughput on every operation.
 - Zero host overhead, scheduling cost, and kernel launch gaps.
 - Left-deep binary full joins only (no bushy plans).
-- A classification pays its reference tail only; the scoring rule's
-  extra rows are not counted.
-- Every operator is priced or refused: the standalone estimate raises
-  `NotImplementedError` for an `apply()`, an `AI.SCORE` predicate or
-  column, a `LIMIT`, or an `EXISTS` or anti join, instead of leaving
-  it out of the count.

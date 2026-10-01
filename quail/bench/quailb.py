@@ -28,6 +28,7 @@ import quail_b as benchmark
 from quail.bench import substrait
 from quail.bench.results import write_json
 from quail.bench.substrait import QueryPlan, read_plan
+from quail.logical.prompts import bind_classify_prompt
 from quail.planner.plan import Refusal
 from quail.specs import H100_USD_PER_HOUR, MODELS
 from quail_b.queries import (
@@ -92,11 +93,17 @@ def canonical_templates(ground_truth) -> dict[str, str]:
         predicate = labels.predicate
         left = quail.ColumnRef(
             "left", predicate["left_table"], predicate["left_column"])
+        right = (quail.ColumnRef("right", predicate["right_table"],
+                                 predicate["right_column"])
+                 if predicate.get("right_table") else None)
         if predicate["kind"] == "filter":
             bound = quail.bind_prompt(predicate["template"], (left,))
+        elif predicate["kind"] == "classify":
+            bound = bind_classify_prompt(
+                predicate["template"],
+                (left,) if right is None else (left, right),
+                predicate["labels"])
         else:
-            right = quail.ColumnRef(
-                "right", predicate["right_table"], predicate["right_column"])
             bound = quail.bind_join_prompt(
                 predicate["template"], (left, right))
         canonical[bound.template] = predicate["template"]
@@ -108,7 +115,12 @@ def _ids(table: pa.Table) -> list[str]:
 
 
 def answer_oracle(ground_truth, tables):
-    """Return the `answer(prompt, assignment)` callable Quail's estimate takes."""
+    """Return the oracle Quail's speed of light estimate takes.
+
+    The callable maps (prompt, assignment) to the saved reference answer:
+    TRUE or FALSE for an AI.IF prompt and the label for an AI.CLASSIFY
+    prompt, so it serves as both the `answer` and the `label` oracle.
+    """
     templates = canonical_templates(ground_truth)
     ids_by_table = {name: _ids(table) for name, table in tables.items()}
 
