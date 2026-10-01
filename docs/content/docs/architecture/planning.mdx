@@ -64,10 +64,9 @@ KV reads).
 
 Quail chooses the supported method with the lowest estimated execution time.
 
-For example, classify customer messages using the question "Is this a
-refund request or praise?" and the labels `['refund', 'praise']`.
-For the message "Please refund my order", each method chooses a label
-as follows. The scores below are examples.
+Imagine we have a query with an `AI.CLASSIFY` operator that assigns
+customer messages one of the labels `['refund', 'praise']`. For the
+message "Please refund my order":
 
 - `letters`: Assigns A to "refund" and B to "praise", then compares the
   LLM's scores for A and B. If A scores 0.8 and B scores 0.2, Quail
