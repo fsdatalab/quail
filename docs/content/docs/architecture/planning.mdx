@@ -62,21 +62,28 @@ KV reads).
 
 ## Choosing classification scoring
 
-Quail chooses the supported method with the lowest estimated execution time:
+Quail chooses the supported method with the lowest estimated execution time.
 
-- `letters`: Assigns a letter to each label, such as A for "refund" and
-  B for "praise". It compares the LLM's scores for those letters and
-  returns the label for the highest-scoring letter. Each letter must
-  fit in one token.
-- `trie_tree`: Scores every complete label by multiplying the
-  probabilities of its tokens, then chooses the highest-scoring label.
-  Labels that start with the same tokens share that part of the
-  computation. Requires an FP8 model that generates tokens in order,
-  with attention not forced to `unified`.
-- `trie_decode`: Builds a label one token at a time. At each step, it
-  chooses the highest-scoring next token that can still complete one
-  of the supplied labels. It cannot use a label whose tokens are the
-  start of a longer label's token sequence.
+For example, classify customer messages using the question "Is this a
+refund request or praise?" and the labels `['refund', 'praise']`.
+For the message "Please refund my order", each method chooses a label
+as follows. The scores below are examples.
+
+- `letters`: Assigns A to "refund" and B to "praise", then compares the
+  LLM's scores for A and B. If A scores 0.8 and B scores 0.2, Quail
+  returns "refund". Each letter must fit in one token.
+- `trie_tree`: Scores both "refund" and "praise" by multiplying the
+  probabilities of each label's tokens. Suppose "refund" takes two
+  tokens with probabilities 0.8 and 0.6. Its score is 0.48. If "praise"
+  scores 0.3, Quail returns "refund". Labels that start with the same
+  tokens share that part of the computation. Requires an FP8 model
+  that generates tokens in order, with attention not forced to `unified`.
+- `trie_decode`: Chooses the label one token at a time, allowing only
+  tokens that can complete one of the supplied labels. Suppose the
+  tokenizer splits "refund" into "re" and "fund". If the LLM chooses
+  "re" first, Quail continues with "fund" and returns "refund". It
+  cannot use a label whose tokens are the start of a longer label's
+  token sequence.
 
 The planner considers `trie_decode` automatically only when an earlier
 operator has not already saved the document's KV. Classification of
