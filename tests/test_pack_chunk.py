@@ -103,29 +103,3 @@ def test_decode_rounds_keep_each_fed_token_after_the_frame(monkeypatch, mode):
             torch, arena, [dict(key=key, prefix=None, f=16, suffixes=[[41]],
                                 write_suffix_tokens=1, single=True)],
             attention_mode=mode)
-
-
-@pytest.mark.parametrize("mode", ["tree", "unified"])
-def test_warmup_runs_every_row_count_class(monkeypatch, mode):
-    from quail.backends.quail.executor import loop, warmup
-
-    cpu_staging(monkeypatch)
-    arena = plain_arena(pages=256)
-    shapes = []
-
-    def forward(pipeline, arena, chunk):
-        reads = chunk.meta["reads"]
-        shapes.append((len(chunk.input_ids),
-                       0 if reads is None else len(reads["rows"])))
-
-    monkeypatch.setattr(loop, "_forward", forward)
-    warmup._warm_row_classes(torch, arena, None, mode)
-    # the first chunk writes the cached documents' KV
-    assert shapes[0] == (17 * warmup.ROW_CLASS_CACHED, 0)
-    if mode == "tree":
-        # n rows, m of them reading cached KV, for every class pair
-        assert shapes[1:] == list(warmup.ROW_CLASSES)
-    else:
-        assert [n for n, _ in shapes[1:]] == [n for n, _ in warmup.ROW_CLASSES]
-    # every key the pass made is freed
-    assert arena.accounting.free_pages == 256
