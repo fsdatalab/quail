@@ -375,9 +375,7 @@ def test_vllm_engine_settings_tokenizer_and_canvas_follow_the_model(monkeypatch)
 class _LabelClient(_Client):
     """Decodes answers: document 10 says a, document 11 says B with a remark."""
 
-    def decode_params(self, max_tokens, choices=()):
-        # the answer is limited to the labels, each after its answer prefix
-        assert choices == (" a", " b", " c")
+    def decode_params(self, max_tokens):
         return ("decode", max_tokens)
 
     def generate(self, prompts, sampling_params, use_tqdm=False):
@@ -438,8 +436,7 @@ def test_request_backends_classify_with_one_request_per_trie_node():
 class _JoinedClient(_Client):
     """Joins by token, and decodes a joined row's label from its partner."""
 
-    def decode_params(self, max_tokens, choices=()):
-        self.choices = choices
+    def decode_params(self, max_tokens):
         return ("decode", max_tokens)
 
     def generate(self, prompts, sampling_params, use_tqdm=False):
@@ -469,8 +466,6 @@ def test_request_backends_decode_one_request_per_row_the_join_keeps():
     # each kept pair: preamble, anchor, its note, the partner's label and
     # document, then the question
     assert client.prompts == [(3, 10, 70, 71, 20, 90), (3, 10, 70, 71, 21, 90)]
-    # the answer is limited to the labels, each after its answer prefix
-    assert client.choices == (" a", " b", " c")
     assert result.outputs["label_answers:kind"].to_pydict() == {
         "r": [0, 0], "p": [0, 1], "kind": ["a", "b"]}
     assert result.outputs["ids:r"] == [0]
