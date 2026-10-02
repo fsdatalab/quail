@@ -23,7 +23,17 @@ from quail.progress import Progress, logger, quiet
 # Bump when either pass covers a different set of shapes. A bumped
 # version invalidates every marker, so the next boot re-runs the
 # compile pass and re-commits the cache.
-WARMUP_VERSION = 5
+WARMUP_VERSION = 6
+
+# Triton compiles one copy of a kernel for each class of its integer
+# arguments: equal to 1, a multiple of 16, or neither. Quail's row
+# dependent strides come from a chunk's row count n and, under tree
+# attention, the count m of its rows that read cached KV (m <= n).
+# These (n, m) pairs cover every class pair.
+ROW_CLASSES = ((1, 1), (32, 1), (32, 16), (32, 17),
+               (33, 1), (33, 16), (33, 17))
+# tokens of each cached document the reading rows attend to
+ROW_CLASS_CACHED = 64
 
 
 def _warm_inputs(budget):
@@ -67,6 +77,9 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
             run_filter(torch, arena, pipeline, async_ans, [body],
                        [question], budget, arena_writes=True,
                        attention_mode=mode)
+        if not pipeline.canvas_ids:
+            logger.debug("kernels: warming %s attention row classes", mode)
+            _warm_row_classes(torch, arena, pipeline, mode)
     if join_chunk:
         logger.debug("kernels: warming join forward pass")
         run_join(torch, arena, pipeline, async_ans, warm_docs,
@@ -80,6 +93,54 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
     logger.debug("kernels: warming filter without KV writes")
     run_filter(torch, arena, pipeline, async_ans, warm_docs,
                [question], budget, arena_writes=False)
+
+
+def _warm_row_classes(torch, arena, pipeline, mode):
+    """Run one chunk for each row-count class pair in ROW_CLASSES.
+
+    Each chunk holds m one-token rows that read a cached document and
+    keep their token's KV, as greedy decode rounds do, and one fresh
+    filler document that brings the chunk to n rows.
+
+    Args:
+        torch: The torch module.
+        arena: The KV arena the passes write.
+        pipeline: The model pipeline.
+        mode: The attention path, "tree" or "unified".
+    """
+    from quail.backends.quail.executor.chunk import pack_chunk
+    from quail.backends.quail.executor.loop import _forward
+
+    cached = ROW_CLASS_CACHED
+    readers = max(m for _, m in ROW_CLASSES)
+    keys = [("warm-rows", index) for index in range(readers)]
+    prefix = list(range(10, 10 + cached))
+    for key in keys:
+        arena.activate(key, cached, capacity_tokens=cached + 1,
+                       base_tokens=cached)
+    try:
+        _forward(pipeline, arena, pack_chunk(
+            torch, arena, [dict(key=key, prefix=prefix, f=cached, suffixes=[])
+                           for key in keys], attention_mode=mode))
+        for n, m in ROW_CLASSES:
+            groups = [dict(key=key, prefix=None, f=cached, suffixes=[[11]],
+                           write_suffix_tokens=1, single=True)
+                      for key in keys[:m]]
+            filler = ("warm-rows", "filler", n, m)
+            if n > m:
+                arena.activate(filler, n - m, base_tokens=n - m)
+                groups.append(dict(key=filler, prefix=prefix[:n - m],
+                                   f=n - m, suffixes=[]))
+            try:
+                _forward(pipeline, arena, pack_chunk(
+                    torch, arena, groups, attention_mode=mode))
+            finally:
+                if arena.is_resident(filler):
+                    arena.free_key(filler)
+    finally:
+        for key in keys:
+            if arena.is_resident(key):
+                arena.free_key(key)
 
 
 def warm_label_readout(torch, head):
