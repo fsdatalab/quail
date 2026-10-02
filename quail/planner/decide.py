@@ -686,7 +686,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                order: str | None = None, backend: str = "quail",
                registry=None, tokenizer=None, pair_fractions=None,
                canvas_draws: int = 4,
-               attention: str | None = None, remarks=(), memo=None):
+               attention: str | None = None, memo=None):
     """Plan one query with the selected model backend.
 
     Args:
@@ -707,8 +707,6 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
             planning context.
         pair_fractions: join written position -> the fraction of the
             cross product its equality conditions keep.
-        remarks: The logical rules' remarks, placed before the
-            physical planner's.
         memo: Results the logical rules computed for this plan, such
             as its statistics, for the physical planner to reuse.
 
@@ -781,11 +779,8 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         raise ValueError(
             f"physical planner returned backend {selected_plan.backend!r} "
             f"for selected backend {backend!r}")
-    if remarks:
-        selected_plan = replace(
-            selected_plan, remarks=tuple(remarks) + selected_plan.remarks)
     return _apply_rules(selected_plan, tuple(registry.physical_rules.values()),
-                        context, "")
+                        context)
 
 
 def refine_plan(plan, *, model: ModelSpec, device: DeviceSpec,
@@ -818,24 +813,21 @@ def refine_plan(plan, *, model: ModelSpec, device: DeviceSpec,
         tokenizer=tokenizer,
         pair_fractions=dict(pair_fractions or {}),
     )
-    return _apply_rules(plan, tuple(registry.physical_rules.values()), context,
-                        " once the documents were tokenized")
+    return _apply_rules(plan, tuple(registry.physical_rules.values()), context)
 
 
-def _apply_rules(plan, rules, context, when: str):
-    """Apply physical rules in order; a remark names each that fired.
+def _apply_rules(plan, rules, context):
+    """Apply physical rules in order.
 
     The rules see the plan's settings on the context and may add to
-    them and leave remarks; a classification no rule can score refuses
-    the plan.
+    them; a classification no rule can score refuses the plan.
     """
-    context = replace(context, settings=dict(plan.settings), remarks=[])
+    context = replace(context, settings=dict(plan.settings))
     try:
         graph, changed = apply_physical_rules(plan.graph, rules, context)
     except ClassifyRefusedError as refused:
         return refused.refusal()
-    if not changed and not context.remarks \
-            and context.settings == dict(plan.settings):
+    if not changed and context.settings == dict(plan.settings):
         return plan
     # a rule that re-estimates a classification moves the plan's total
     # by the same amount
@@ -843,9 +835,7 @@ def _apply_rules(plan, rules, context, when: str):
         _classify_seconds(graph.nodes) - _classify_seconds(plan.nodes))
     return replace(
         plan, nodes=graph.nodes, root=graph.root, estimated_seconds=seconds,
-        settings=context.settings,
-        remarks=plan.remarks + tuple(context.remarks) + tuple(
-            f"physical rule {name} changed the plan{when}" for name in changed))
+        settings=context.settings)
 
 
 def _classify_seconds(nodes) -> float:
@@ -921,5 +911,4 @@ def explain(logical: LogicalPlan, physical, *, verbose: bool = False,
                               **physical.settings}, 1))
         if physical.backend == "quail":
             lines.append("  KV dtype=bf16")
-        lines.extend(f"  remark: {remark}" for remark in physical.remarks)
     return "\n".join(lines)

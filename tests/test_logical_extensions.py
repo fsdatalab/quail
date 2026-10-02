@@ -135,7 +135,7 @@ def test_session_rules_read_statistics_from_the_context():
         id_col="id"))
     query = session.sql(
         "SELECT d.id FROM docs d WHERE AI_FILTER(PROMPT('ok {0}', d.body))")
-    plan = query.plan()
+    query.plan()
     query.wait_for_tokens()
 
     # the rules ran before the physical planner, on document lengths
@@ -151,5 +151,4 @@ def test_session_rules_read_statistics_from_the_context():
     assert context.tokenizer is session.tokenizer
     assert dict(context.pair_fractions) == {}
     assert context.physical_context().document_tokens is context.document_tokens
-    assert "logical rule projection_pushdown changed the plan" in plan.remarks
     session.close()

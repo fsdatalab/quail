@@ -61,7 +61,6 @@ class PhysicalPlan:
     backend: str = "quail"
     estimated_seconds: float = 0.0
     nodes: tuple = ()          # typed nodes in topological order
-    remarks: tuple = ()
     settings: Mapping[str, Any] = field(default_factory=dict, repr=False)
     root: PortRef | None = None
     estimates: Mapping[str, Mapping[str, float]] = field(

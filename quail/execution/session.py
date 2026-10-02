@@ -687,9 +687,6 @@ class Query:
 
                 future.add_done_callback(record_finished)
                 self._token_futures[s.alias] = future
-            remarks = tuple(
-                f"logical rule {name} changed the plan" for name in changed
-            ) + tuple(context.remarks)
             self._plan = plan_query(
                 self.logical, model=self.session.model,
                 device=self.session.device,
@@ -702,7 +699,7 @@ class Query:
                 registry=self.session.registry,
                 tokenizer=self.session.tokenizer,
                 pair_fractions=pair_fractions,
-                remarks=remarks, memo=context.memo)
+                memo=context.memo)
             extra = {}
             if config.gpu_timing:
                 extra["gpu_timing"] = True
@@ -923,7 +920,7 @@ class Query:
             kv_manager=out.get("kv_manager"),
             node_metrics=out.get("node_metrics", {}),
             backend_metrics=out.get("backend_metrics"),
-            remarks=list(plan.remarks) + list(self.session.notes))
+            remarks=list(self.session.notes))
         for key in ("gpu_s", "chunks"):
             if key in out:
                 report[key] = out[key]

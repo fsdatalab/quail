@@ -33,16 +33,12 @@ def physical_plan(logical: LogicalPlan, context):
     Returns:
         A PhysicalPlan, or a Refusal when the plan cannot run.
     """
-    from dataclasses import replace
-
     from quail.planner.logical_rules import FilterOrder, JoinOrder, undecided
 
     key = ("physical_plan", undecided(logical.root))
     if key not in context.memo:
-        # the candidate's own remarks are not the plan's
         decided, _ = apply_logical_rules(
-            logical, (FilterOrder(), JoinOrder()),
-            replace(context, remarks=[]))
+            logical, (FilterOrder(), JoinOrder()), context)
         physical_context = context.physical_context(decided)
         physical = plan_quail(
             decided, model=context.model, device=context.device,
@@ -51,7 +47,7 @@ def physical_plan(logical: LogicalPlan, context):
             context=physical_context)
         if not isinstance(physical, Refusal):
             physical = _apply_rules(
-                physical, (LabelScoring(),), physical_context, "")
+                physical, (LabelScoring(),), physical_context)
         context.memo[key] = physical
     return context.memo[key]
 

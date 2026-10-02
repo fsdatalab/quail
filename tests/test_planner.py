@@ -89,25 +89,21 @@ def _optimize(logical, doc_tokens, model=QWEN3_4B_FP8, **kwargs):
     """Run the built in logical rules as a session would.
 
     Returns:
-        The optimized plan and the remarks a session would pass on.
+        The optimized plan and the names of the rules that changed it.
     """
     context = LogicalPlanningContext(
         None, None, model=model, device=H100_SXM,
         gpu_count=kwargs.get("gpus", 1), document_tokens=doc_tokens,
         order=kwargs.get("order"), tokenizer=tok,
         pair_fractions=kwargs.get("pair_fractions") or {})
-    optimized, changed = apply_logical_rules(
-        logical, built_in_logical_rules(), context)
-    return optimized, tuple(
-        f"logical rule {name} changed the plan" for name in changed
-    ) + tuple(context.remarks)
+    return apply_logical_rules(logical, built_in_logical_rules(), context)
 
 
 def _plan(logical, doc_tokens, model=QWEN3_4B_FP8, **kwargs):
     """Plan as a session would: the logical rules, then the physical planner."""
-    optimized, remarks = _optimize(logical, doc_tokens, model, **kwargs)
+    optimized, _ = _optimize(logical, doc_tokens, model, **kwargs)
     return plan_query(optimized, model=model, device=H100_SXM,
-                      doc_tokens=doc_tokens, remarks=remarks, **kwargs)
+                      doc_tokens=doc_tokens, **kwargs)
 
 
 def _five_filter_plan(catalog, sels):
@@ -152,10 +148,10 @@ def test_filter_ordering_and_kv_writes(catalog):
     assert by_cost.settings["order_rule"] == "by_cost"
     assert chain.stages[0].selectivity == 0.2
     assert chain.stages[1].expected_docs == pytest.approx(20.0)
-    # the filter_order rule records the order on the logical node and
-    # names itself; the physical planner reads it
-    assert "logical rule filter_order changed the plan" in by_cost.remarks
-    optimized, _ = _optimize(logical, toks)
+    # the filter_order rule records the order on the logical node; the
+    # physical planner reads it
+    optimized, changed = _optimize(logical, toks)
+    assert "filter_order" in changed
     assert optimized.root.input.order == tuple(
         stage.written_pos for stage in chain.stages)
     assert optimized.root.input.order[0] == 2
@@ -164,8 +160,8 @@ def test_filter_ordering_and_kv_writes(catalog):
     as_written = _plan(logical, toks, order="as_written")
     assert [stage.selectivity for stage in filter_chain(as_written).stages] \
         == list(sels)
-    assert not any("filter_order" in r for r in as_written.remarks)
-    optimized, _ = _optimize(logical, toks, order="as_written")
+    optimized, changed = _optimize(logical, toks, order="as_written")
+    assert "filter_order" not in changed
     assert optimized.root.input.order == ()
 
     class Predicate:
@@ -225,13 +221,11 @@ def test_filter_ordering_and_kv_writes(catalog):
     plan = _plan(single, {"r": [400] * 100})
     chain = filter_chain(plan)
     assert chain.arena_writes is False
-    assert any("arena writes off" in r for r in plan.remarks)
     assert "arena_writes=False" in explain(single, plan, verbose=True)
 
     plan = _plan(_five_filter_plan(catalog, (0.9, 0.9)), {"r": [400] * 100})
     chain = filter_chain(plan)
     assert chain.arena_writes is True
-    assert not any("arena writes off" in r for r in plan.remarks)
 
     logical = (docs(catalog, "reviews", tok).alias("r")
                .ai_filter(prompt("a: {0}", col("r.review")))
@@ -377,9 +371,9 @@ def test_join_anchors_groups_forced_order_and_later_kv_reuse(catalog):
     assert [s["anchor"] for s in stages] == ["r", "p"]
     assert [s["written_pos"] for s in stages] == [0, 1]
     # the join_order rule records the stage order and anchors on the
-    # SemanticJoins and names itself; the physical planner reads them
-    assert "logical rule join_order changed the plan" in plan.remarks
-    optimized, _ = _optimize(_chain(catalog), toks, order="as_written")
+    # SemanticJoins; the physical planner reads them
+    optimized, changed = _optimize(_chain(catalog), toks, order="as_written")
+    assert "join_order" in changed
     joins = [node for node in optimized.walk() if isinstance(node, SemanticJoin)]
     assert [(join.exec_idx, join.exec_anchor) for join in joins] == [
         (0, "r"), (1, "p")]
@@ -405,15 +399,12 @@ def test_join_anchors_groups_forced_order_and_later_kv_reuse(catalog):
     kinds = node_kinds(plan)
     assert (kinds.count("AiJoin"), kinds.count("Barrier")) == (1, 0)
 
-    # a forced anchor is honored, and the remark names the cheaper free plan
+    # a forced anchor is honored
     toks = {"r": [3000] * 10, "t": [50] * 8, "p": [100] * 6}
     plan = _plan(_chain(catalog, anchors=("t", None)), toks, order="as_written")
     assert join_stages(plan)[0]["anchor"] == "t"
-    assert any("prices lower" in r for r in plan.remarks)
-
     same = _plan(_chain(catalog, anchors=("r", None)), toks, order="as_written")
     assert join_stages(same)[0]["anchor"] == "r"
-    assert not any("prices lower" in r for r in same.remarks)
 
     # by_cost runs the cheap .01 exists gate before the .9 full join
     logical = (docs(catalog, "reviews", tok).alias("r")
@@ -476,7 +467,6 @@ def test_kv_retention_rule_schedules_the_kv_later_stages_read(
     # one search decides the plan: pricing its candidates and the
     # registered rule share the context's memo
     assert searches == [True]
-    assert "physical rule kv_retention changed the plan" in plan.remarks
     retention = plan.settings["retention"]
     assert set(retention) >= {"initial", "before", "after", "cap_pages",
                               "linear_seconds", "pair_seconds"}
@@ -510,12 +500,12 @@ def test_kv_retention_rule_schedules_the_kv_later_stages_read(
     chain = filter_chain(two, "r")
     assert (chain.keep_kv, chain.arena_writes) == (True, True)
 
-    # a forced anchor costs the free search too; refining a planned
-    # query on exact tokens keeps the schedule it was made with
+    # a forced anchor takes one search too; refining a planned query
+    # on exact tokens keeps the schedule it was made with
     searches.clear()
     toks = {"r": [3000] * 10, "t": [50] * 8, "p": [100] * 6}
     forced = _plan(_chain(catalog, anchors=("t", None)), toks)
-    assert searches == [True, False]
+    assert searches == [True]
     refined = refine_plan(
         forced, model=QWEN3_4B_FP8, device=H100_SXM, doc_tokens=toks)
     assert refined.settings["retention"] == forced.settings["retention"]
@@ -799,7 +789,6 @@ def test_prefix_sharing_and_attention_path_follow_the_token_store(
     plan = _plan(logical, {"r": store.lengths})
     chain = filter_chain(plan)
     assert chain.share_prefixes and chain.arena_writes
-    assert "physical rule prefix_sharing changed the plan" in plan.remarks
     assert "share_prefixes=True" in explain(logical, plan, verbose=True)
 
     plan = _plan(logical, {"r": plain.lengths})

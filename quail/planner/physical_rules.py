@@ -46,8 +46,7 @@ class KvRetention:
     that join in one pipeline on one GPU; a join keeps its anchor's KV
     (keep_anchor_kv) when a later group anchors on the same table. A
     chain writes KV pages only when something reads them: a later
-    stage, the next operator of its pipeline, or the retention pool;
-    the rule remarks on a chain that writes none.
+    stage, the next operator of its pipeline, or the retention pool.
 
     Fires once, when the plan is first made: it reads the logical plan
     on the context and leaves a plan that has a schedule alone, so a
@@ -98,10 +97,6 @@ class KvRetention:
             if isinstance(node, AiFilter):
                 keep = node.alias in schedule["initial"]
                 writes = node.arena_writes or keep
-                if not writes:
-                    context.remarks.append(
-                        f"filter on {node.alias!r}: arena writes off (one "
-                        f"stage - nothing reads the KV again)")
                 node = replace(node, keep_kv=keep, arena_writes=writes)
             elif isinstance(node, AiJoin):
                 node = replace(node, keep_anchor_kv=(

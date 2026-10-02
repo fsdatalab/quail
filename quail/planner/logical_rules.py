@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import replace
 
 from quail.cost import budgets
-from quail.cost.sol import speed_of_light
 from quail.cost.work import Work
 from quail.logical import (
     Alias,
@@ -421,8 +420,7 @@ class JoinOrder:
     is honored; with order="as_written" only the anchors are chosen.
     When no connected left-deep order exists the written order is
     priced. The rule records each join's execution position and
-    anchor on its SemanticJoin, and leaves a remark when a free anchor
-    choice would price lower than the written anchors.
+    anchor on its SemanticJoin.
     """
 
     name = "join_order"
@@ -434,7 +432,7 @@ class JoinOrder:
         joins = plan.operators().joins
         if not joins:
             return None
-        found, remark = self._search(plan, context)
+        found = self._search(plan, context)
         decided = {position: anchor for position, anchor in found["seq"]}
         exec_idx = {position: index
                     for index, (position, _) in enumerate(found["seq"])}
@@ -455,12 +453,10 @@ class JoinOrder:
         rewritten = visit(root)
         if rewritten == root:
             return None
-        if remark is not None:
-            context.remarks.append(remark)
         return rewritten
 
-    def _search(self, plan, context) -> tuple:
-        """Run the search once per plan and filter order; return (found, remark)."""
+    def _search(self, plan, context) -> dict:
+        """Run the search once per plan and filter order; return its result."""
         key = ("join_order", undecided(plan.root),
                tuple(sorted((alias, tuple(order)) for alias, order
                             in filter_orders(plan).items())))
@@ -473,38 +469,17 @@ class JoinOrder:
         filtered = set(plan.operators().filters)
         fixed = _order_rule(context) == "as_written"
 
-        def search(honor_forced=True):
+        found = joinsearch.search_joins(
+            statistics.specs, live, statistics.lengths, filtered,
+            statistics.pre, statistics.chunk, model, device,
+            base_work=base_work, fixed_order=fixed)
+        if found is None:
             found = joinsearch.search_joins(
                 statistics.specs, live, statistics.lengths, filtered,
                 statistics.pre, statistics.chunk, model, device,
-                base_work=base_work, fixed_order=fixed,
-                honor_forced=honor_forced)
-            if found is None:
-                found = joinsearch.search_joins(
-                    statistics.specs, live, statistics.lengths, filtered,
-                    statistics.pre, statistics.chunk, model, device,
-                    base_work=base_work, fixed_order=True,
-                    honor_forced=honor_forced)
-            return found
-
-        found = search()
-        remark = None
-        forced = sorted({s["anchor"] for s in statistics.specs
-                         if s["semantics"] == "full" and not s["anchor_free"]})
-        if forced:
-            free = search(honor_forced=False)
-            honored_s = speed_of_light(
-                base_work + found["work"], model, device, statistics.chunk
-            ).seconds
-            free_s = speed_of_light(
-                base_work + free["work"], model, device, statistics.chunk
-            ).seconds
-            if free_s < honored_s:
-                remark = (f"anchors {forced} were forced; a free choice "
-                          f"prices lower ({free_s:.3f} vs {honored_s:.3f} "
-                          f"predicted seconds)")
-        context.memo[key] = (found, remark)
-        return found, remark
+                base_work=base_work, fixed_order=True)
+        context.memo[key] = found
+        return found
 
 
 def built_in_logical_rules() -> tuple:

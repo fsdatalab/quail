@@ -479,8 +479,9 @@ def test_rules_place_and_score_classifications(session, tmp_path):
     assert [rule.name for rule in built_in_physical_rules()] == [
         "kv_retention", "label_scoring", "prefix_sharing", "tree_attention"]
     plan = _topic(session).plan()
-    assert "physical rule label_scoring changed the plan" in plan.remarks
-    assert not any("classify_placement" in remark for remark in plan.remarks)
+    # label_scoring chose every classification's scoring rule
+    assert all(node.spec.scoring for node in plan.nodes
+               if isinstance(node, AiClassify))
     assert plan.settings["classify_placement"] == "before joins"
 
     # sixty long reviews and three aspects; the values are the ones the
@@ -506,7 +507,6 @@ def test_rules_place_and_score_classifications(session, tmp_path):
              .select("r.id", "a.id", "topic"))
     written = after.logical.root
     plan = after.plan()
-    assert "logical rule classify_placement changed the plan" in plan.remarks
     assert plan.settings["classify_placement"] == "after joins"
     assert [node.node_id for node in plan.nodes] == [
         "scan:r", "scan:a", "ai_join:r", "ai-classify:0", "filter:r:0",
@@ -552,7 +552,6 @@ def test_rules_place_and_score_classifications(session, tmp_path):
               .select("r.id", "a.id", "topic"))
     plan = before.plan()
     assert plan.settings["classify_placement"] == "before joins"
-    assert not any("classify_placement" in remark for remark in plan.remarks)
     assert [node.node_id for node in plan.nodes] == [
         "scan:r", "scan:a", "ai_filter:r", "ai-classify:0", "filter:r:1",
         "ai_join:a", "project"]

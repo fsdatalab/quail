@@ -40,8 +40,6 @@ class LogicalPlanningContext:
         tokenizer: Callable (text -> token list) for prompts.
         pair_fractions: join written position -> the fraction of the
             cross product its equality conditions keep.
-        remarks: Advice the rules leave for the physical plan's
-            remarks, such as a cheaper plan a forced setting ruled out.
         memo: Results a rule computed for one plan root, so a later
             pass or another rule pricing the same root reuses them.
     """
@@ -58,7 +56,6 @@ class LogicalPlanningContext:
     attention: str | None = None
     tokenizer: Callable[[str], Any] | None = None
     pair_fractions: Mapping[int, float] = field(default_factory=dict)
-    remarks: list = field(default_factory=list, compare=False, repr=False)
     memo: dict = field(default_factory=dict, compare=False, repr=False)
 
     def physical_context(self, logical_plan=None) -> PlanningContext:
