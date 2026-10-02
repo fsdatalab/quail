@@ -75,19 +75,14 @@ def test_corpus_identity_label_reuse_and_saved_parts(monkeypatch, tmp_path):
 
     # saved label parts resume a run and compact once
     spec = _spec("quailb.imdb.review.discusses_ending")
-    # rows per part follow from how many filters read the review column
-    (step,) = [n for _table, members, n in labeling.filter_groups(
-        labeling.workload_specs("imdb"), labeling.LEGACY_PROMPTS_PER_CALL)
-        if spec in members]
     parts = tmp_path / "label_sets" / spec.workload / spec.slug / "ls_test" / "parts"
     parts.mkdir(parents=True)
     saved = [{"answer": i % 2 == 0, "label_source": MODEL_NAME,
-              "left_id": f"rv{i}", "right_id": None} for i in range(step)]
+              "left_id": f"rv{i}", "right_id": None} for i in range(85)]
     # only the first of two parts is on disk, the resume case
-    pq.write_table(pa.Table.from_pylist(saved),
-                   parts / f"part_000000_{step:06d}.parquet")
+    pq.write_table(pa.Table.from_pylist(saved), parts / "part_000000_000085.parquet")
     corpus = {"reviews": [{"id": f"rv{i}", "body": f"review {i}"}
-                          for i in range(2 * step)]}
+                          for i in range(170)]}
 
     sample = _saved_verification_sample(
         corpus, {spec.key: {"label_set_id": "ls_test"}}, specs=(spec,))
