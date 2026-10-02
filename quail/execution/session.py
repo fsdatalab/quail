@@ -629,35 +629,56 @@ class Query:
         return self._token_inputs
 
     def plan(self):
+        """Plan the query once and return its physical plan or refusal.
+
+        Each scanned table's document lengths come first, exact when
+        the column is tokenized and estimated from a sample while a
+        background thread tokenizes it; the logical rules read them
+        through the planning context. The token stores are then opened
+        with the value columns the optimized scans keep, and the
+        physical planner runs on the decided logical plan.
+        """
         if self._plan is None:
             self._planning_started_at = time.perf_counter()
-            self.logical, _ = apply_logical_rules(
-                self.logical,
-                tuple(self.session.registry.logical_rules.values()),
-                LogicalPlanningContext(
-                    self.session.catalog, self.session.config
-                ),
-            )
+            config = self.session.config
             operators = self.logical.operators()
-            scans, joins = operators.scans, operators.joins
             self._doc_tokens = {}
             self._token_inputs = {}
             estimated = []
-            for s in scans:
-                columns = s.columns
-                if self.session.config.backend in {
-                    "stock_vllm", "pipelined_vllm", "dumb_vllm"
-                }:
-                    columns = tuple(dict.fromkeys((*columns, s.column)))
+            for s in operators.scans:
                 exact = self.session.token_lengths(s.provider, s.column)
                 if exact is not None:
-                    store = self.session.tokenize(
-                        s.provider, s.column, columns)
-                    self._token_inputs[s.alias] = store
-                    self._doc_tokens[s.alias] = store.lengths
+                    self._doc_tokens[s.alias] = exact
                     continue
                 self._doc_tokens[s.alias] = self.session.estimate_lengths(
                     s.provider, s.column)
+                estimated.append(s.alias)
+            self._estimated = tuple(estimated)
+            pair_fractions = self._pair_fractions(
+                operators.scans, operators.joins)
+            context = LogicalPlanningContext(
+                self.session.catalog, config,
+                model=self.session.model, device=self.session.device,
+                gpu_count=config.gpus, document_tokens=self._doc_tokens,
+                backend=config.backend, order=self.order,
+                canvas_draws=config.canvas_draws,
+                attention=config.attention,
+                tokenizer=self.session.tokenizer,
+                pair_fractions=pair_fractions)
+            self.logical, changed = apply_logical_rules(
+                self.logical,
+                tuple(self.session.registry.logical_rules.values()),
+                context)
+            for s in self.logical.operators().scans:
+                columns = s.columns
+                if config.backend in {
+                    "stock_vllm", "pipelined_vllm", "dumb_vllm"
+                }:
+                    columns = tuple(dict.fromkeys((*columns, s.column)))
+                if s.alias not in self._estimated:
+                    self._token_inputs[s.alias] = self.session.tokenize(
+                        s.provider, s.column, columns)
+                    continue
                 future = self.session.tokenize_async(
                     s.provider, s.column, columns)
 
@@ -666,23 +687,24 @@ class Query:
 
                 future.add_done_callback(record_finished)
                 self._token_futures[s.alias] = future
-                estimated.append(s.alias)
-            self._estimated = tuple(estimated)
-            pair_fractions = self._pair_fractions(scans, joins)
+            remarks = tuple(
+                f"logical rule {name} changed the plan" for name in changed
+            ) + tuple(context.remarks)
             self._plan = plan_query(
                 self.logical, model=self.session.model,
                 device=self.session.device,
                 doc_tokens=self._doc_tokens,
-                gpus=self.session.config.gpus,
+                gpus=config.gpus,
                 order=self.order,
-                canvas_draws=self.session.config.canvas_draws,
-                attention=self.session.config.attention,
-                backend=self.session.config.backend,
+                canvas_draws=config.canvas_draws,
+                attention=config.attention,
+                backend=config.backend,
                 registry=self.session.registry,
                 tokenizer=self.session.tokenizer,
-                pair_fractions=pair_fractions)
+                pair_fractions=pair_fractions,
+                remarks=remarks)
             extra = {}
-            if self.session.config.gpu_timing:
+            if config.gpu_timing:
                 extra["gpu_timing"] = True
             if extra and not isinstance(self._plan, Refusal):
                 self._plan = replace(self._plan, settings={

@@ -49,14 +49,11 @@ from quail.planner.classify import (
     classification_refusal,
     classify_table,
 )
-from quail.planner.logical_optimizer import apply_logical_rules
-from quail.planner.logical_rules import ClassifyPlacement
 from quail.planner.physical_optimizer import (
     ModelRegion,
     PlanningContext,
     apply_physical_rules,
 )
-from quail.planner.physical_rules import LabelScoring
 from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
 from quail.specs import DeviceSpec, ModelSpec
 
@@ -369,14 +366,13 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                 context: PlanningContext | None = None):
     """Compile a LogicalPlan into a PhysicalPlan or Refusal.
 
-    Two named rules decide the classification steps. The logical rule
-    classify_placement keeps a joined table's classifications on the
-    table, after its AI.IF filters, or moves them above the joins,
-    whichever plan prices lower. The physical rule label_scoring picks
-    each classification's scoring rule and completes the plan's
-    estimate. Both run here: the placement needs this planner's prices,
-    and the estimate must count the scoring rule before plans are
-    compared. A remark names each rule that changed the plan.
+    The logical rules have placed each classification: a one-table
+    classification above a SemanticJoin runs after the joins, over the
+    documents the joins matched; one on its table runs after the
+    table's AI.IF filters. Each classification's scoring rule is left
+    for the label_scoring physical rule, so the estimate and
+    ``search_seconds`` count the filters, the joins, and the
+    classifications of joined rows only.
 
     Args:
         plan: The logical plan to compile.
@@ -394,62 +390,16 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     Returns:
         A PhysicalPlan, or a Refusal explaining why the query cannot run.
     """
-    assembled = {}
-
-    def assemble(logical):
-        if logical.root not in assembled:
-            physical = _assemble(
-                logical, model=model, device=device, doc_tokens=doc_tokens,
-                gpus=gpus, order=order, pair_fractions=pair_fractions,
-                context=context)
-            assembled[logical.root] = _score_labels(physical, logical, context)
-        return assembled[logical.root]
-
-    def cost(logical):
-        physical = assemble(logical)
-        return None if isinstance(physical, Refusal) else physical.estimated_seconds
-
-    placed, changed = apply_logical_rules(
-        plan, (ClassifyPlacement(cost),), context)
-    physical = assemble(placed)
-    if isinstance(physical, Refusal) or not changed:
-        return physical
-    return replace(physical, remarks=tuple(
-        f"logical rule {name} changed the plan" for name in changed
-    ) + physical.remarks)
-
-
-def _score_labels(physical, logical, context):
-    """Apply the label_scoring rule and add its seconds to the estimate."""
-    if isinstance(physical, Refusal):
-        return physical
-    scoring_context = (None if context is None
-                       else replace(context, logical_plan=logical))
-    try:
-        graph, changed = apply_physical_rules(
-            physical.graph, (LabelScoring(),), scoring_context)
-    except ClassifyRefusedError as refused:
-        return refused.refusal()
-    seconds = physical.settings["search_seconds"] + _classify_seconds(graph.nodes)
-    return replace(
-        physical, nodes=graph.nodes, root=graph.root, estimated_seconds=seconds,
-        settings={**physical.settings, "search_seconds": seconds},
-        remarks=physical.remarks + tuple(
-            f"physical rule {name} changed the plan" for name in changed))
+    return _assemble(
+        plan, model=model, device=device, doc_tokens=doc_tokens, gpus=gpus,
+        order=order, pair_fractions=pair_fractions, context=context)
 
 
 def _assemble(plan: LogicalPlan, *, model: ModelSpec,
               device: DeviceSpec, doc_tokens: dict, gpus: int = 1,
               order: str | None = None, pair_fractions=None,
               context: PlanningContext | None = None):
-    """Build the physical plan of one logical plan, as placed.
-
-    A one-table classification above a SemanticJoin runs after the
-    joins, over the documents the joins matched; one on its table runs
-    after the table's AI.IF filters. Its scoring rule is left for the
-    label_scoring rule, so the estimate and ``search_seconds`` count
-    the filters and joins only.
-    """
+    """Build the physical plan of one logical plan, as placed."""
     operators = plan.operators()
     scans, filters, joins = operators.scans, operators.filters, operators.joins
     applies = operators.applies
@@ -970,7 +920,8 @@ def _assemble(plan: LogicalPlan, *, model: ModelSpec,
             count=plan.root.limit,
         ))
 
-    estimate = speed_of_light(base_work + found["work"], model, device, chunk).seconds
+    estimate = (speed_of_light(base_work + found["work"], model, device,
+                               chunk).seconds + _classify_seconds(nodes))
     stage_works = {record["written_pos"]: record["work"]
                    for record in found["records"]}
 
@@ -1006,11 +957,11 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                order: str | None = None, backend: str = "quail",
                registry=None, tokenizer=None, pair_fractions=None,
                canvas_draws: int = 4,
-               attention: str | None = None):
+               attention: str | None = None, remarks=()):
     """Plan one query with the selected model backend.
 
     Args:
-        plan: The logical plan to plan.
+        plan: The logical plan to plan, as the logical rules left it.
         model: Model spec.
         device: Device spec.
         doc_tokens: Per document token counts for each table alias.
@@ -1027,6 +978,8 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
             planning context.
         pair_fractions: join written position -> the fraction of the
             cross product its equality conditions keep.
+        remarks: The logical rules' remarks, placed before the
+            physical planner's.
 
     Returns:
         A PhysicalPlan, or a Refusal explaining why the query cannot run.
@@ -1096,6 +1049,9 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         raise ValueError(
             f"physical planner returned backend {selected_plan.backend!r} "
             f"for selected backend {backend!r}")
+    if remarks:
+        selected_plan = replace(
+            selected_plan, remarks=tuple(remarks) + selected_plan.remarks)
     return _apply_rules(selected_plan, tuple(registry.physical_rules.values()),
                         context, "")
 
@@ -1135,8 +1091,17 @@ def refine_plan(plan, *, model: ModelSpec, device: DeviceSpec,
 
 
 def _apply_rules(plan, rules, context, when: str):
-    """Apply physical rules in order; a remark names each that fired."""
-    graph, changed = apply_physical_rules(plan.graph, rules, context)
+    """Apply physical rules in order; a remark names each that fired.
+
+    The rules see the plan's settings on the context and may add to
+    them and leave remarks; a classification no rule can score refuses
+    the plan.
+    """
+    context = replace(context, settings=dict(plan.settings), remarks=[])
+    try:
+        graph, changed = apply_physical_rules(plan.graph, rules, context)
+    except ClassifyRefusedError as refused:
+        return refused.refusal()
     if not changed:
         return plan
     # a rule that re-estimates a classification moves the plan's total
@@ -1145,7 +1110,8 @@ def _apply_rules(plan, rules, context, when: str):
         _classify_seconds(graph.nodes) - _classify_seconds(plan.nodes))
     return replace(
         plan, nodes=graph.nodes, root=graph.root, estimated_seconds=seconds,
-        remarks=plan.remarks + tuple(
+        settings=context.settings,
+        remarks=plan.remarks + tuple(context.remarks) + tuple(
             f"physical rule {name} changed the plan{when}" for name in changed))
 
 

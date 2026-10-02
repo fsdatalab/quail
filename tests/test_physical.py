@@ -143,7 +143,9 @@ def test_physical_extensions_plan_validate_and_execute(monkeypatch):
     assert backend.called
     assert planner.called
     assert plan.settings["planner_source"] == "preferred planner"
-    assert "physical rule keep_first_document" in plan.remarks[0]
+    assert plan.remarks == (
+        "logical rule projection_pushdown changed the plan",
+        "physical rule keep_first_document changed the plan")
     assert decode_graph(envelope["graph"], registry.codecs) == plan.graph
 
     registry = built_in_registry()

@@ -42,11 +42,13 @@ class LabelScoring:
     head. A classification of joined rows always uses letters and
     arrives chosen.
 
-    The Quail planner applies this rule itself when it assembles a
-    plan, so the plan's estimate counts the chosen rule before plans
-    are compared and a classification no rule can run refuses the
-    plan; it needs the logical plan on the context for the calls'
-    prompts.
+    The chosen rule's seconds complete the plan's estimate: the rule
+    adds them to the ``search_seconds`` setting, the planner's
+    estimate of the plan as planned. The classify_placement logical
+    rule prices each candidate plan with this rule applied
+    (quail.planner.pricing), so plans are compared with their scoring
+    counted and a classification no rule can run refuses the plan. It
+    needs the logical plan on the context for the calls' prompts.
     """
 
     name = "label_scoring"
@@ -74,6 +76,10 @@ class LabelScoring:
             resident = _resident(node, graph, context, calls, after_joins, table)
             chosen[node.node_id] = replace(node, spec=table.choose_scoring(
                 node.spec, calls[node.spec.name], resident))
+        context.settings["search_seconds"] = (
+            context.settings.get("search_seconds", 0.0)
+            + sum(node.spec.estimated_seconds for node in chosen.values())
+            - sum(node.spec.estimated_seconds for node in pending))
         return PhysicalGraph(
             tuple(chosen.get(node.node_id, node) for node in graph.nodes),
             graph.root)

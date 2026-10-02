@@ -55,6 +55,12 @@ class PlanningContext:
     # the logical plan the graph was planned from; None when the rules
     # run again over a finished plan
     logical_plan: Any = None
+    # the plan's settings as the rules see them; a rule adds what the
+    # executor needs for its decision, such as the KV retention
+    # schedule, and the planner puts the result on the plan
+    settings: dict = field(default_factory=dict, compare=False, repr=False)
+    # advice a rule leaves beside the plan's remarks
+    remarks: list = field(default_factory=list, compare=False, repr=False)
 
 
 @dataclass(frozen=True)

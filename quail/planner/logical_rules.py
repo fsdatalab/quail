@@ -23,6 +23,7 @@ from quail.logical import (
     SemanticJoin,
     model_call,
 )
+from quail.planner import pricing
 
 
 def _column_refs(expression) -> tuple[ColumnRef, ...]:
@@ -92,6 +93,119 @@ class ProjectionPushdown:
     def rewrite(self, root, context):
         rewritten = push_down_projection(root)
         return None if rewritten is root else rewritten
+
+
+def _movable_filter_alias(node) -> str | None:
+    """The table a cheap one-table filter reads, or None for other nodes.
+
+    A cheap filter is an Apply returning ids, or a SemanticFilter
+    testing labels a SemanticClassify below it computed. An AI.IF
+    filter asks the model and is not moved.
+    """
+    if isinstance(node, Apply) and node.ids != "pairs":
+        return node.aliases[0]
+    if isinstance(node, SemanticFilter) and all(
+            isinstance(p.expression, LabelIn) for p in node.predicates):
+        return model_call(node.predicates[0].expression).aliases()[0]
+    return None
+
+
+def _lets_through(node, alias: str) -> bool:
+    """Whether a filter on one table may sit below node instead of above.
+
+    True for a Join, a full SemanticJoin, a classification of joined
+    rows, and any node working on another table. False at the table's
+    own chain, at a gate (exists or anti join) and at an Apply
+    returning the pairs a join asks about, whose rows the filter would
+    change.
+    """
+    if isinstance(node, Join):
+        return True
+    if isinstance(node, SemanticJoin):
+        return node.semantics == "full"
+    if isinstance(node, SemanticClassify):
+        return len(node.call.aliases()) == 2 or node.alias != alias
+    if isinstance(node, Apply):
+        return node.ids != "pairs" and node.aliases[0] != alias
+    if isinstance(node, SemanticFilter):
+        return _movable_filter_alias(node) != alias and all(
+            model_call(p.expression).aliases()[0] != alias
+            for p in node.predicates)
+    return False
+
+
+def _place_filter(filter_node, node, alias: str):
+    """Put a one-table filter below the joins above its table.
+
+    Returns:
+        The subtree under node with the filter as low as it goes, or
+        None when a gate, an Apply returning pairs, or the table's own
+        chain stops it before any Join.
+    """
+    if isinstance(node, Join):
+        left = {field.alias for field in node.left.output_schema()}
+        side = "left" if alias in left else "right"
+        child = getattr(node, side)
+        placed = _place_filter(filter_node, child, alias)
+        if placed is None:
+            placed = filter_node.with_children((child,))
+        return replace(node, **{side: placed})
+    if _lets_through(node, alias):
+        (child,) = node.children()
+        placed = _place_filter(filter_node, child, alias)
+        return None if placed is None else node.with_children((placed,))
+    return None
+
+
+def push_down_filters(root: LogicalNode) -> LogicalNode | None:
+    """Move every cheap one-table filter below the joins above its table.
+
+    An Apply returning ids and a SemanticFilter testing labels read one
+    table, so they commute with the joins, the classifications of
+    joined rows, and the other tables' operators above that table.
+    Each moves down to the top of its own table's chain, below the
+    nodes it passed, keeping its order with the other filters of the
+    table. A filter stays where it is when a gate (an exists or anti
+    join) or an Apply returning a join's pairs sits between it and
+    the first Join below.
+
+    Returns:
+        The rewritten root, or None when no filter moved.
+    """
+    moved = False
+
+    def visit(node):
+        nonlocal moved
+        children = tuple(visit(child) for child in node.children())
+        if children != node.children():
+            node = node.with_children(children)
+        alias = _movable_filter_alias(node)
+        if alias is None:
+            return node
+        placed = _place_filter(node, node.input, alias)
+        if placed is None:
+            return node
+        moved = True
+        return placed
+
+    rewritten = visit(root)
+    return rewritten if moved else None
+
+
+class FilterPushdown:
+    """Push cheap one-table filters below the joins above their table.
+
+    Like Catalyst's PushDownPredicates, the move is unconditional: an
+    Apply returning ids and a filter on a label cost nothing the model
+    runs, so they thin a table before the joins read it. Both front
+    ends already place such filters on their table, so the rule
+    rewrites plans built another way.
+    """
+
+    name = "filter_pushdown"
+
+    def rewrite(self, root, context):
+        return push_down_filters(root)
 
 
 def _label_chain(node) -> tuple:
@@ -174,35 +288,45 @@ class ClassifyPlacement:
     table's classifications above the joins (lift_classifications)
     costs less.
 
-    The cost is a whole physical plan's estimated seconds, which needs
-    each table's token counts, the model and device specs, and the
-    join search. The logical optimizer context carries none of these,
-    and the session tokenizes after the logical rules run, so the
-    Quail planner applies this rule itself with its cost function.
+    The cost is a whole physical plan's estimated seconds
+    (quail.planner.pricing): the Quail planner's plan for the
+    candidate, with the label_scoring rule applied so each
+    classification's scoring rule is counted. It reads the model and
+    device specs, the document token counts, and the pair fractions
+    from the logical planning context, so the rule does nothing on a
+    context without statistics or for another backend.
     """
 
     name = "classify_placement"
 
-    def __init__(self, cost):
-        """Make the rule with the planner's cost function.
+    def __init__(self, cost=None):
+        """Make the rule with a cost function.
 
         Args:
-            cost: Callable mapping a LogicalPlan to its physical plan's
-                estimated seconds, or None when the plan is refused.
+            cost: Callable mapping a LogicalPlan and the context to the
+                plan's estimated seconds, or None when the plan is
+                refused. The default prices the Quail planner's plan.
         """
-        self.cost = cost
+        self.cost = pricing.estimated_seconds if cost is None else cost
 
     def rewrite(self, root, context):
+        if context is not None and (
+                context.model is None or context.backend != "quail"):
+            return None
         lifted = lift_classifications(root)
         if lifted is None:
             return None
-        before = self.cost(LogicalPlan(root))
-        after = self.cost(LogicalPlan(lifted))
+        before = self.cost(LogicalPlan(root), context)
+        after = self.cost(LogicalPlan(lifted), context)
         if before is None or after is None or not after < before:
             return None
         return lifted
 
 
 def built_in_logical_rules() -> tuple:
-    """Return the logical rules registered with the built in registry."""
-    return (ProjectionPushdown(),)
+    """Return the logical rules registered with the built in registry.
+
+    In order: projection_pushdown, filter_pushdown, and
+    classify_placement.
+    """
+    return (ProjectionPushdown(), FilterPushdown(), ClassifyPlacement())

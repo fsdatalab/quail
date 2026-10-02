@@ -464,9 +464,16 @@ def _corpus(session, tmp_path, name, column, rows, words):
 
 def test_rules_place_and_score_classifications(session, tmp_path):
     from quail.logical import classified_above_joins
-    from quail.planner.logical_rules import ClassifyPlacement, lift_classifications
+    from quail.planner.logical_rules import (
+        ClassifyPlacement,
+        built_in_logical_rules,
+        lift_classifications,
+        push_down_projection,
+    )
     from quail.planner.physical_rules import built_in_physical_rules
 
+    assert [rule.name for rule in built_in_logical_rules()] == [
+        "projection_pushdown", "filter_pushdown", "classify_placement"]
     assert [rule.name for rule in built_in_physical_rules()] == [
         "label_scoring", "prefix_sharing", "tree_attention"]
     plan = _topic(session).plan()
@@ -495,6 +502,7 @@ def test_rules_place_and_score_classifications(session, tmp_path):
     after = (classified().label_in("topic", labels[:11], selectivity=0.95)
              .ai_join(session.docs("aspects").alias("a"), join, selectivity=0.01)
              .select("r.id", "a.id", "topic"))
+    written = after.logical.root
     plan = after.plan()
     assert "logical rule classify_placement changed the plan" in plan.remarks
     assert plan.settings["classify_placement"] == "after joins"
@@ -507,26 +515,29 @@ def test_rules_place_and_score_classifications(session, tmp_path):
     assert classify.spec.expected_inputs == pytest.approx(1.8)
     assert round(plan.estimated_seconds, 3) == 0.071
     assert plan.settings["search_seconds"] == plan.estimated_seconds
-    lifted = lift_classifications(after.logical.root)
+    # the query's logical plan is the one the rules left: the
+    # classification sits above the join
+    lifted = lift_classifications(written)
+    assert after.logical.root == lift_classifications(
+        push_down_projection(written))
     assert [type(node).__name__ for node in LogicalPlan(lifted).walk()] == [
         "Scan", "Scan", "Join", "SemanticJoin", "SemanticClassify",
         "SemanticFilter", "Project"]
     assert classified_above_joins(lifted) == {"r"}
-    assert classified_above_joins(after.logical.root) == frozenset()
+    assert classified_above_joins(written) == frozenset()
     assert lift_classifications(lifted) is None
     assert lift_classifications(_topic(session).logical.root) is None
 
     # the rule moves the classifications only when the lifted plan
     # prices lower, and never onto a refused plan
-    root = after.logical.root
-
     def cost(above, below):
-        return lambda plan: above if classified_above_joins(plan.root) else below
+        return lambda plan, context: (
+            above if classified_above_joins(plan.root) else below)
 
-    assert ClassifyPlacement(cost(1.0, 2.0)).rewrite(root, None) == lifted
-    assert ClassifyPlacement(cost(2.0, 1.0)).rewrite(root, None) is None
-    assert ClassifyPlacement(cost(1.0, 1.0)).rewrite(root, None) is None
-    assert ClassifyPlacement(cost(None, 2.0)).rewrite(root, None) is None
+    assert ClassifyPlacement(cost(1.0, 2.0)).rewrite(written, None) == lifted
+    assert ClassifyPlacement(cost(2.0, 1.0)).rewrite(written, None) is None
+    assert ClassifyPlacement(cost(1.0, 1.0)).rewrite(written, None) is None
+    assert ClassifyPlacement(cost(None, 2.0)).rewrite(written, None) is None
 
     # a filtered partner on a forced anchor stays classified before the
     # join, over the filter's survivors with their KV resident

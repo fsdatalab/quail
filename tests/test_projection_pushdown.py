@@ -1,5 +1,6 @@
-"""Projection pushdown rule tests."""
+"""Projection and filter pushdown rule tests."""
 
+from dataclasses import replace
 from pathlib import Path
 
 import pyarrow as pa
@@ -8,9 +9,29 @@ import pytest
 from test_session import _run, fake_tok, make_executor
 
 import quail
-from quail.logical import ColumnRef, Scan, bind_join_prompt, bind_prompt
+from quail.catalog import Catalog
+from quail.frontend.builder import col, docs, prompt
+from quail.logical import (
+    Apply,
+    ColumnRef,
+    LogicalPlan,
+    Scan,
+    SemanticClassify,
+    SemanticFilter,
+    SemanticJoin,
+    bind_join_prompt,
+    bind_prompt,
+)
 from quail.physical import Recombine
-from quail.planner.logical_rules import push_down_projection
+from quail.planner.logical_optimizer import (
+    LogicalPlanningContext,
+    apply_logical_rules,
+)
+from quail.planner.logical_rules import (
+    built_in_logical_rules,
+    push_down_filters,
+    push_down_projection,
+)
 from quail.planner.plan import EngineConfig
 
 
@@ -172,3 +193,86 @@ def test_failed_scans_and_tokenization_leave_no_partial_cache(tmp_path):
     assert session._token_directory is None or not list(
         Path(session._token_directory.name).iterdir())
     session.close()
+
+
+def _pair_catalog():
+    catalog = Catalog()
+    catalog.register("reviews", quail.DocumentProvider.from_table(
+        pa.table({"id": ["r0", "r1"], "review": ["good one", "bad one"],
+                  "stars": [5, 1]}), id_col="id"))
+    catalog.register("products", quail.DocumentProvider.from_table(
+        pa.table({"asin": ["p0"], "description": ["a thing"]}),
+        id_col="asin"))
+    return catalog
+
+
+def _joined(catalog, semantics="full"):
+    return (docs(catalog, "reviews", fake_tok).alias("r")
+            .ai_join(docs(catalog, "products", fake_tok).alias("p"),
+                     prompt("same {0} {1}", col("r.review"),
+                            col("p.description")),
+                     semantics=semantics)
+            .select("r.id", "p.asin"))
+
+
+def _stars_apply(node):
+    return Apply(node, function="keep", kind="per_batch", ids="drop",
+                 columns=(ColumnRef("r", "reviews", "stars"),),
+                 aliases=("r",))
+
+
+def test_filter_pushdown_moves_cheap_one_table_filters_below_joins():
+    catalog = _pair_catalog()
+    plan = _joined(catalog)
+    joined = plan.root.input
+    assert isinstance(joined, SemanticJoin)
+
+    # an apply returning ids above the join moves onto its table's
+    # scan, below the join
+    above = replace(plan.root, input=_stars_apply(joined))
+    pushed = push_down_filters(above)
+    assert isinstance(pushed.input, SemanticJoin)
+    assert pushed.input.input.left == _stars_apply(joined.input.left)
+    assert pushed.input.input.right == joined.input.right
+    LogicalPlan(pushed).validate()
+    optimized, changed = apply_logical_rules(
+        LogicalPlan(above), built_in_logical_rules(),
+        LogicalPlanningContext(catalog, None))
+    assert changed == ("projection_pushdown", "filter_pushdown")
+    assert optimized.root == push_down_projection(pushed)
+
+    # both front ends place the filter on its table, so the rule
+    # leaves their plans alone
+    assert push_down_filters(plan.root) is None
+    assert push_down_filters(pushed) is None
+
+    # a filter on a label returns to its table, above the
+    # classification that computes the label
+    labelled = (docs(catalog, "reviews", fake_tok).alias("r")
+                .ai_classify(prompt("topic of {0}", col("r.review")),
+                             ["a", "b"], name="topic")
+                .label_in("topic", ["a"])
+                .ai_join(docs(catalog, "products", fake_tok).alias("p"),
+                         prompt("same {0} {1}", col("r.review"),
+                                col("p.description")))
+                .select("r.id", "p.asin", "topic"))
+    joined = labelled.root.input
+    label_filter = joined.input.left
+    assert isinstance(label_filter, SemanticFilter)
+    assert isinstance(label_filter.input, SemanticClassify)
+    lifted = replace(labelled.root, input=replace(
+        label_filter, input=replace(joined, input=replace(
+            joined.input, left=label_filter.input))))
+    LogicalPlan(lifted).validate()
+    assert push_down_filters(lifted) == labelled.root
+
+    # a gate's inner table and an apply returning pairs keep their
+    # filters above them
+    gate = _joined(catalog, semantics="exists")
+    above = replace(gate.root, input=_stars_apply(gate.root.input))
+    assert push_down_filters(above) is None
+    pairs = replace(joined, input=Apply(
+        joined.input, function="pairs", kind="barrier", ids="pairs",
+        columns=(), aliases=("r", "p"), written_pos=0))
+    above = replace(labelled.root, input=_stars_apply(pairs))
+    assert push_down_filters(above) is None
