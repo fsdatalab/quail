@@ -15,7 +15,6 @@ from quail.logical import (
     Equality,
     FilterPredicate,
     JoinSpec,
-    LabelIn,
     LogicalPlan,
     LogicalPlanBuilder,
     ModelCall,
@@ -168,6 +167,7 @@ class _Binder:
         self.tables = []          # (alias, provider) in appearance order
         self.doc_columns = {}     # alias -> document column
         self.filters = {}         # alias -> [FilterPredicate]
+        self.label_tests = {}     # alias -> [(call, labels, selectivity)]
         self.joins = []           # [JoinSpec]
 
     # ---- scope ------------------------------------------------------
@@ -695,11 +695,11 @@ def compile_sql(sql: str, catalog: Catalog,
                     raise CompileError(
                         "AI.CLASSIFY is compared with string literals")
                 accepted.append(str(item.this))
-            predicate = LabelIn(call, tuple(accepted))
-            predicate.validate()
-            b.filters.setdefault(aliases[0], []).append(
-                FilterPredicate(expression=predicate,
-                                selectivity=options.get("selectivity")))
+            if len(set(accepted)) != len(accepted):
+                raise CompileError(
+                    "a filter on a label lists a label twice")
+            b.label_tests.setdefault(aliases[0], []).append(
+                (call, tuple(accepted), options.get("selectivity")))
             continue
         if any(isinstance(call, exp.AIClassify) for call in term.walk()):
             raise CompileError(
@@ -753,11 +753,9 @@ def compile_sql(sql: str, catalog: Catalog,
     named = {column.expression: column.name for column in projected
              if column.expression.kind == "label"}
     labels = {}
-    for alias, predicates in b.filters.items():
-        asks = sum(not isinstance(p.expression, LabelIn) for p in predicates)
-        tests = [p.expression.call for p in predicates
-                 if isinstance(p.expression, LabelIn)]
-        for index, call in enumerate(tests):
+    for alias, tests in b.label_tests.items():
+        asks = len(b.filters.get(alias, ()))
+        for index, (call, _, _) in enumerate(tests):
             labels.setdefault(alias, {}).setdefault(
                 call, named.get(call, f"__label_{alias}_{asks + index}"))
     for call, name in named.items():
@@ -785,7 +783,6 @@ def compile_sql(sql: str, catalog: Catalog,
     ]
     score_flags = [
         is_score(predicate.expression) for predicate in filter_predicates
-        if not isinstance(predicate.expression, LabelIn)
     ] + [is_score(join.predicate) for join in b.joins] \
         + [True for _ in projected_scores]
     if any(score_flags) and not all(score_flags):
@@ -794,7 +791,7 @@ def compile_sql(sql: str, catalog: Catalog,
             "in one query"
         )
 
-    if not b.joins and not b.filters and not projected:
+    if not b.joins and not b.filters and not b.label_tests and not projected:
         raise CompileError("the query has no AI predicate; a plain "
                            "scan belongs in the database the ids came "
                            "from")
@@ -807,6 +804,9 @@ def compile_sql(sql: str, catalog: Catalog,
             b.doc_columns.get(alias, ""),
             tuple(b.filters.get(alias, ())),
             labels=tuple(labels.get(alias, {}).items()),
+            label_filters=tuple(
+                (labels[alias][call], accepted, selectivity)
+                for call, accepted, selectivity in b.label_tests.get(alias, ())),
         )
     for join in b.joins:
         logical.add_join(join)

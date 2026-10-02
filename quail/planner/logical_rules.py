@@ -12,9 +12,10 @@ from quail.logical import (
     ColumnRef,
     Compare,
     Equality,
+    Filter,
     FilterPredicate,
+    InList,
     Join,
-    LabelIn,
     LogicalNode,
     LogicalPlan,
     ModelCall,
@@ -45,8 +46,10 @@ def _column_refs(expression) -> tuple[ColumnRef, ...]:
         return (expression,)
     if isinstance(expression, FilterPredicate):
         return _column_refs(expression.expression)
-    if isinstance(expression, (ModelCall, Compare, LabelIn, Alias)):
+    if isinstance(expression, (ModelCall, Compare, Alias)):
         return tuple(model_call(expression).prompt.args)
+    if isinstance(expression, InList):
+        return (expression.column,)
     if isinstance(expression, Equality):
         return (expression.left, expression.right)
     return ()
@@ -81,6 +84,10 @@ def push_down_projection(root: LogicalNode) -> LogicalNode:
         for expression in node.expressions():
             for ref in _column_refs(expression):
                 needed.setdefault(ref.alias, {})[ref.column] = None
+        if isinstance(node, SemanticClassify):
+            # the label columns a classification adds are not read below it
+            for field in node.output_schema()[len(node.input.output_schema()):]:
+                needed.get(field.alias, {}).pop(field.column, None)
         if isinstance(node, Scan):
             columns = tuple(
                 column for column in needed.get(node.alias, ())
@@ -111,15 +118,14 @@ class ProjectionPushdown:
 def _movable_filter_alias(node) -> str | None:
     """The table a cheap one-table filter reads, or None for other nodes.
 
-    A cheap filter is an Apply returning ids, or a SemanticFilter
-    testing labels a SemanticClassify below it computed. An AI.IF
-    filter asks the model and is not moved.
+    A cheap filter is an Apply returning ids, or a Filter on a label a
+    SemanticClassify below it computed. An AI.IF filter asks the model
+    and is not moved.
     """
     if isinstance(node, Apply) and node.ids != "pairs":
         return node.aliases[0]
-    if isinstance(node, SemanticFilter) and all(
-            isinstance(p.expression, LabelIn) for p in node.predicates):
-        return model_call(node.predicates[0].expression).aliases()[0]
+    if isinstance(node, Filter):
+        return node.condition.column.alias
     return None
 
 
@@ -140,10 +146,11 @@ def _lets_through(node, alias: str) -> bool:
         return len(node.call.aliases()) == 2 or node.alias != alias
     if isinstance(node, Apply):
         return node.ids != "pairs" and node.aliases[0] != alias
+    if isinstance(node, Filter):
+        return node.condition.column.alias != alias
     if isinstance(node, SemanticFilter):
-        return _movable_filter_alias(node) != alias and all(
-            model_call(p.expression).aliases()[0] != alias
-            for p in node.predicates)
+        return all(model_call(p.expression).aliases()[0] != alias
+                   for p in node.predicates)
     return False
 
 
@@ -173,7 +180,7 @@ def _place_filter(filter_node, node, alias: str):
 def push_down_filters(root: LogicalNode) -> LogicalNode | None:
     """Move every cheap one-table filter below the joins above its table.
 
-    An Apply returning ids and a SemanticFilter testing labels read one
+    An Apply returning ids and a Filter on a label column read one
     table, so they commute with the joins, the classifications of
     joined rows, and the other tables' operators above that table.
     Each moves down to the top of its own table's chain, below the
@@ -209,8 +216,8 @@ class FilterPushdown:
     """Push cheap one-table filters below the joins above their table.
 
     Like Catalyst's PushDownPredicates, the move is unconditional: an
-    Apply returning ids and a filter on a label cost nothing the model
-    runs, so they thin a table before the joins read it. Both front
+    Apply returning ids and a Filter on a label column cost nothing
+    the model runs, so they thin a table before the joins read it. Both front
     ends already place such filters on their table, so the rule
     rewrites plans built another way.
     """
@@ -229,9 +236,7 @@ def _label_chain(node) -> tuple:
         SemanticClassify and label filter nodes above it, lowest first.
     """
     lifted = []
-    while isinstance(node, SemanticClassify) or (
-            isinstance(node, SemanticFilter)
-            and all(isinstance(p.expression, LabelIn) for p in node.predicates)):
+    while isinstance(node, (SemanticClassify, Filter)):
         lifted.append(node)
         node = node.input
     return node, tuple(reversed(lifted))
@@ -241,14 +246,14 @@ def _chain_alias(node) -> str:
     """The table alias a classification or label filter node works on."""
     if isinstance(node, SemanticClassify):
         return node.alias
-    return model_call(node.predicates[0].expression).aliases()[0]
+    return node.condition.column.alias
 
 
 def lift_classifications(root: LogicalNode) -> LogicalNode | None:
     """Move every joined table's classifications above the joins.
 
     Each one-table SemanticClassify of a table a SemanticJoin reads,
-    with the SemanticFilters testing its label, leaves the table's
+    with the Filters on its label column, leaves the table's
     chain and sits above the topmost join under the root Project, in
     scan order. A classification of a table no join reads stays.
 
@@ -389,18 +394,14 @@ class FilterOrder:
                 node = node.with_children(children)
             if not isinstance(node, SemanticFilter):
                 return node
-            asks = [index for index, predicate in enumerate(node.predicates)
-                    if not isinstance(predicate.expression, LabelIn)]
-            if not asks or rule == "as_written":
+            if rule == "as_written":
                 return node if not node.order else replace(node, order=())
-            (alias,) = model_call(node.predicates[asks[0]].expression).aliases()
-            ordered = [asks[index] for index in order_filters_indexed(
-                [node.predicates[index] for index in asks], rule,
+            (alias,) = model_call(node.predicates[0].expression).aliases()
+            ordered = order_filters_indexed(
+                list(node.predicates), rule,
                 prefix_tokens=(statistics.pre
                                + statistics.stats[alias].mean_doc_tokens),
-                model=model, device=device, chunk_tokens=statistics.chunk)]
-            ordered.extend(index for index in range(len(node.predicates))
-                           if index not in asks)
+                model=model, device=device, chunk_tokens=statistics.chunk)
             order = () if ordered == list(range(len(ordered))) else tuple(ordered)
             return node if order == node.order else replace(node, order=order)
 
@@ -466,7 +467,7 @@ class JoinOrder:
         model, device = context.model, context.device
         base_work = sum(filter_works(plan, statistics, model).values(), Work())
         live = live_after_filters(plan, statistics)
-        filtered = set(plan.operators().filters)
+        filtered = set(plan.operators().all_filters())
         fixed = _order_rule(context) == "as_written"
 
         found = joinsearch.search_joins(

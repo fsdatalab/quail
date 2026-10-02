@@ -11,8 +11,8 @@ from quail.logical import (
     CompileError,
     Equality,
     FilterPredicate,
+    InList,
     JoinSpec,
-    LabelIn,
     LogicalPlan,
     LogicalPlanBuilder,
     ModelCall,
@@ -73,6 +73,7 @@ class Query:
         self._tables = [(provider, provider)]   # (alias, provider)
         self._doc_columns = {}
         self._filters = {}
+        self._label_filters = {}     # alias -> [(name, labels, selectivity)]
         self._joins = []
         self._pending_join = None    # (new aliases, conditions, applies)
         #                              awaiting the AI predicate over
@@ -85,7 +86,8 @@ class Query:
     # ---- scope -------------------------------------------------------
 
     def alias(self, a: str) -> "Query":
-        if self._joins or self._filters or len(self._tables) != 1:
+        if (self._joins or self._filters or self._label_filters
+                or len(self._tables) != 1):
             raise CompileError("alias() must come right after docs()")
         self._tables[0] = (a, self._tables[0][1])
         return self
@@ -249,11 +251,11 @@ class Query:
             raise CompileError(
                 f"a filter on a label tests a one-document classification; "
                 f"{name!r} classifies pairs of {call.aliases()}")
-        test = LabelIn(call, tuple(labels))
-        test.validate()
         (alias,) = call.aliases()
-        self._filters.setdefault(alias, []).append(
-            FilterPredicate(test, selectivity=selectivity))
+        labels = tuple(labels)
+        InList(ColumnRef(alias, self._scope()[alias], name), labels).validate()
+        self._label_filters.setdefault(alias, []).append(
+            (name, labels, selectivity))
         return self
 
     def join(self, other: "Query", on=None) -> "Query":
@@ -401,6 +403,8 @@ class Query:
             self._tables.append((alias, provider))
             for a, preds in other._filters.items():
                 self._filters.setdefault(a, []).extend(preds)
+            for a, tests in other._label_filters.items():
+                self._label_filters.setdefault(a, []).extend(tests)
             for a, applies in other._applies.items():
                 self._applies.setdefault(a, []).extend(applies)
             for name, fn in other._functions.items():
@@ -517,13 +521,10 @@ class Query:
             columns.append(self._resolve(spec))
         # a classification is planned when the query returns or tests
         # its label
-        tested = {
-            predicate.expression.call
-            for predicates in self._filters.values()
-            for predicate in predicates
-            if isinstance(predicate.expression, LabelIn)}
+        tested = {name for tests in self._label_filters.values()
+                  for name, _, _ in tests}
         wanted = [column for column in self._labels.values()
-                  if column in columns or column.expression in tested]
+                  if column in columns or column.name in tested]
         logical = LogicalPlanBuilder()
         for alias, provider in self._tables:
             logical.add_scan(
@@ -534,6 +535,7 @@ class Query:
                 tuple(self._applies.get(alias, ())),
                 tuple((column.expression, column.name) for column in wanted
                       if column.expression.aliases() == (alias,)),
+                tuple(self._label_filters.get(alias, ())),
             )
         for join in self._joins:
             logical.add_join(join)

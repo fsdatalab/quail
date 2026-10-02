@@ -39,8 +39,8 @@ from quail.cost.sol import SpeedOfLight, speed_of_light
 from quail.cost.work import Work, ask, scan, triangle
 from quail.execution.pairs import pair_table
 from quail.logical import (
+    Filter,
     Join,
-    LabelIn,
     ModelCall,
     Project,
     Scan,
@@ -67,8 +67,8 @@ FILTER = "AI.IF"
 CLASSIFY = "AI.CLASSIFY"
 LABEL_IN = "IN"
 
-_PRICED_NODES = (Scan, SemanticFilter, SemanticClassify, Join, SemanticJoin,
-                 Project)
+_PRICED_NODES = (Scan, SemanticFilter, SemanticClassify, Filter, Join,
+                 SemanticJoin, Project)
 
 
 @dataclass(frozen=True)
@@ -248,8 +248,6 @@ def _refuse_unpriced(logical) -> None:
     for alias, predicates in operators.filters.items():
         for predicate in predicates:
             expression = predicate.expression
-            if isinstance(expression, LabelIn):
-                continue
             if not (isinstance(expression, ModelCall)
                     and expression.kind == "boolean"):
                 raise NotImplementedError(
@@ -320,6 +318,7 @@ class _Search:
             operators.scans, operators.filters, operators.joins
         )
         self.labels = operators.labels
+        self.label_filters = operators.label_filters
         if self.labels.calls and label is None:
             raise ValueError(
                 "the query classifies documents; pass label=(prompt, "
@@ -496,8 +495,7 @@ class _Search:
         for scan_node in self.scans:
             alias = scan_node.alias
             predicates = self.filters.get(alias, ())
-            asks = [position for position, predicate in enumerate(predicates)
-                    if not isinstance(predicate.expression, LabelIn)]
+            asks = list(range(len(predicates)))
             calls = [call for call, owner in self.labels.calls
                      if owner == alias and len(call.aliases()) == 1]
             if not asks and not calls:
@@ -526,13 +524,12 @@ class _Search:
                     predicate.prompt.tail_tokens, predicate.selectivity,
                     live, passed, stage_work))
                 live = passed
-            steps = [(predicate.expression.call, position)
-                     for position, predicate in enumerate(predicates)
-                     if isinstance(predicate.expression, LabelIn)]
+            steps = [(test.call, test)
+                     for test in self.label_filters.get(alias, ())]
             steps.extend((call, None) for call in calls
                          if call not in self.labels.tests)
             classified = set()
-            for call, position in steps:
+            for call, test in steps:
                 if call not in classified:
                     stage_work = self.question_work(
                         alias, live, call.prompt.tail_tokens, first)
@@ -543,18 +540,17 @@ class _Search:
                         call.prompt.tail_tokens, None, live, live,
                         stage_work, name=self.labels.names[call]))
                     classified.add(call)
-                if position is not None:
-                    predicate = predicates[position]
-                    accepted = set(predicate.expression.accepted)
+                if test is not None:
+                    accepted = set(test.values)
                     passed = [
                         row for row in live
                         if self.label(call.prompt, {alias: row}) in accepted
                     ]
                     stages.append(_stage(
-                        LABEL_IN, alias, call.prompt.template, position, 0,
-                        predicate.selectivity, live, passed, Work(),
+                        LABEL_IN, alias, call.prompt.template, test.position,
+                        0, test.selectivity, live, passed, Work(),
                         name=self.labels.names[call],
-                        accepted=list(predicate.expression.accepted)))
+                        accepted=list(test.values)))
                     live = passed
             survivors[alias] = live
         return survivors, work, stages

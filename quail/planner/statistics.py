@@ -13,7 +13,6 @@ from quail.cost import budgets
 from quail.cost.retention import retention_pages
 from quail.cost.work import Work, ask, scan
 from quail.logical import (
-    LabelIn,
     LogicalPlan,
     SemanticFilter,
     SemanticJoin,
@@ -123,13 +122,8 @@ class PlanStatistics:
 
 
 def ask_positions(filters) -> dict:
-    """Return alias -> written positions of its AI.IF predicates.
-
-    Filters on labels and projected labels are classification work
-    after the AI.IF chain.
-    """
-    return {alias: [position for position, predicate in enumerate(predicates)
-                    if not isinstance(predicate.expression, LabelIn)]
+    """Return alias -> written positions of its AI.IF predicates."""
+    return {alias: list(range(len(predicates)))
             for alias, predicates in filters.items()}
 
 
@@ -233,8 +227,7 @@ def filter_orders(plan: LogicalPlan) -> dict:
             counted[alias] = counted[alias] + 1 if alias in counted else 1
         for index in node.order or range(len(node.predicates)):
             alias, position = positions[index]
-            if not isinstance(node.predicates[index].expression, LabelIn):
-                orders.setdefault(alias, []).append(position)
+            orders.setdefault(alias, []).append(position)
     return orders
 
 
@@ -245,14 +238,15 @@ def live_after_filters(plan: LogicalPlan, statistics: PlanStatistics) -> dict:
     nothing before them.
     """
     after_joins = classified_above_joins(plan.root)
+    operators = plan.operators()
     live = {a: float(st.n_docs) for a, st in statistics.stats.items()}
-    for alias, predicates in plan.operators().filters.items():
+    for alias in operators.all_filters():
         survival = 1.0
-        for predicate in predicates:
-            if alias in after_joins and isinstance(predicate.expression,
-                                                   LabelIn):
-                continue
+        for predicate in operators.filters.get(alias, ()):
             survival *= effective_selectivity(predicate.selectivity)
+        if alias not in after_joins:
+            for test in operators.label_filters.get(alias, ()):
+                survival *= effective_selectivity(test.selectivity)
         live[alias] *= survival
     return live
 

@@ -39,7 +39,6 @@ from quail.execution.types import PhysicalResponse, export_physical_outputs
 from quail.logical import (
     Alias,
     Apply,
-    LabelIn,
     effective_selectivity,
     filter_question_text,
     join_label,
@@ -151,17 +150,7 @@ def plan_request_backend(
         ),)
     operators = region.logical_plan.operators()
     scans, filters, joins = operators.scans, operators.filters, operators.joins
-    # the AI.IF predicates by alias, with their written positions; a
-    # filter on its label runs after its classification instead
-    ask_filters = {
-        alias: [p for p in predicates
-                if not isinstance(p.expression, LabelIn)]
-        for alias, predicates in filters.items()}
-    ask_filters = {alias: ps for alias, ps in ask_filters.items() if ps}
-    ask_positions = {
-        alias: [i for i, p in enumerate(predicates)
-                if not isinstance(p.expression, LabelIn)]
-        for alias, predicates in filters.items()}
+    ask_filters = {alias: list(ps) for alias, ps in filters.items() if ps}
     stats = {
         alias: CorpusStats(
             n_docs=len(lengths),
@@ -197,7 +186,7 @@ def plan_request_backend(
     chunk_tokens = budgets.chunk_budget(context.model, context.device)
     preamble_count = preamble_tokens(ask_filters, joins)
     filter_orders = {
-        alias: [ask_positions[alias][i] for i in order_filters_indexed(
+        alias: order_filters_indexed(
             predicates,
             rule,
             prefix_tokens=(
@@ -206,13 +195,13 @@ def plan_request_backend(
             model=context.model,
             device=context.device,
             chunk_tokens=chunk_tokens,
-        )]
+        )
         for alias, predicates in ask_filters.items()
     }
     live = {
         alias: float(summary.n_docs) for alias, summary in stats.items()
     }
-    for alias, predicates in filters.items():
+    for alias, predicates in operators.all_filters().items():
         for predicate in predicates:
             live[alias] *= effective_selectivity(predicate.selectivity)
     search_specs = logical_join_specs(joins, context.pair_fractions)
@@ -297,8 +286,9 @@ def plan_request_backend(
                 tuple(context.tokenizer(label_text(label)))
                 for label in call.labels),
             tests=tuple(
-                (position, tuple(filters[alias][position].expression.accepted))
-                for position in label_plan.tests.get(call, ())),
+                (test.position, test.values)
+                for test in operators.label_filters.get(alias, ())
+                if test.call == call),
             **pair,
         ))
 

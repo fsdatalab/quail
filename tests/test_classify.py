@@ -387,14 +387,15 @@ def test_sql_classifies_and_tests_labels(session):
     filtered = session.sql(
         f"SELECT d.id FROM documents d WHERE {call[:-1]}, "
         f"{{'selectivity': 0.5}}) IN ('praise')")
-    (predicate,) = filtered.logical.operators().filters["d"]
+    (predicate,) = filtered.logical.operators().label_filters["d"]
     assert predicate.selectivity == 0.5
-    assert predicate.expression.accepted == ("praise",)
+    assert predicate.values == ("praise",)
+    assert "d" not in filtered.logical.operators().filters
     # equality is membership in one label, on either side
     for form in (f"{call} = 'refund'", f"'refund' = {call}"):
         equal = session.sql(f"SELECT d.id FROM documents d WHERE {form}")
-        (predicate,) = equal.logical.operators().filters["d"]
-        assert predicate.expression.accepted == ("refund",)
+        (predicate,) = equal.logical.operators().label_filters["d"]
+        assert predicate.values == ("refund",)
     for bad in (f"SELECT d.id, {call} FROM documents d",
                 f"SELECT d.id FROM documents d WHERE {call} < 'refund'",
                 f"SELECT d.id FROM documents d WHERE {call} IN (1)"):
@@ -410,11 +411,12 @@ def test_frontends_place_classifications_on_their_table(session):
     query.plan()
     plan = query.logical
     kinds = [type(node).__name__ for node in plan.walk()]
-    assert kinds == ["Scan", "SemanticClassify", "SemanticFilter",
-                     "SemanticClassify", "SemanticFilter", "Project"]
+    assert kinds == ["Scan", "SemanticClassify", "Filter",
+                     "SemanticClassify", "Filter", "Project"]
     topic, kind = plan.operators().classifies
     assert (topic.name, topic.alias, kind.name) == ("topic", "d", "kind")
-    assert [p.expression.call for p in plan.root.input.predicates] == [kind.call]
+    assert plan.root.input.condition == quail.logical.InList(
+        ColumnRef("d", "documents", "kind"), ("complaint",))
     assert plan.operators().labels.tests == {topic.call: [0], kind.call: [1]}
     # projection pushdown reaches the scan through the classifications
     assert push_down_projection(plan.root) is plan.root
@@ -426,11 +428,11 @@ def test_frontends_place_classifications_on_their_table(session):
                           name="x")
              .label_in("x", ["a"]).select("d.id"))
     assert [type(node).__name__ for node in mixed.logical.walk()] == [
-        "Scan", "SemanticFilter", "SemanticClassify", "SemanticFilter",
-        "Project"]
+        "Scan", "SemanticFilter", "SemanticClassify", "Filter", "Project"]
+    operators = mixed.logical.operators()
     assert [type(p.expression).__name__
-            for p in mixed.logical.operators().filters["d"]] == [
-        "ModelCall", "LabelIn"]
+            for p in operators.filters["d"]] == ["ModelCall"]
+    assert [test.position for test in operators.label_filters["d"]] == [1]
     # SQL names a classification only tested after its filter position
     hidden = session.sql(
         "SELECT d.id FROM documents d WHERE AI_FILTER(PROMPT('Is {0} short?', "
@@ -439,8 +441,7 @@ def test_frontends_place_classifications_on_their_table(session):
     (node,) = hidden.logical.operators().classifies
     assert node.name == "__label_d_1"
     assert [type(node).__name__ for node in hidden.logical.walk()] == [
-        "Scan", "SemanticFilter", "SemanticClassify", "SemanticFilter",
-        "Project"]
+        "Scan", "SemanticFilter", "SemanticClassify", "Filter", "Project"]
     # a classification the query neither returns nor tests is not planned
     unused = (session.docs("documents").alias("d")
               .ai_filter(quail.prompt("Is {0} short?", quail.col("d.body")))
@@ -449,7 +450,8 @@ def test_frontends_place_classifications_on_their_table(session):
     assert unused.logical.operators().classifies == ()
     text = _topic(session).explain()
     assert "SemanticClassify: topic" in text
-    assert "SemanticFilter" in text.split("SemanticClassify")[0]
+    assert ("Filter: d.topic IN ['refund', 'shipping'] (selectivity=50%)"
+            in text.split("SemanticClassify")[0])
     assert "Project: d.id, topic" in text
 
 
@@ -526,7 +528,7 @@ def test_rules_place_and_score_classifications(session, tmp_path):
     assert (staged.exec_idx, staged.exec_anchor) == (0, "r")
     assert [type(node).__name__ for node in LogicalPlan(lifted).walk()] == [
         "Scan", "Scan", "Join", "SemanticJoin", "SemanticClassify",
-        "SemanticFilter", "Project"]
+        "Filter", "Project"]
     assert classified_above_joins(lifted) == {"r"}
     assert classified_above_joins(written) == frozenset()
     assert lift_classifications(lifted) is None

@@ -14,10 +14,10 @@ from quail.frontend.builder import col, docs, prompt
 from quail.logical import (
     Apply,
     ColumnRef,
+    Filter,
     LogicalPlan,
     Scan,
     SemanticClassify,
-    SemanticFilter,
     SemanticJoin,
     bind_join_prompt,
     bind_prompt,
@@ -258,7 +258,7 @@ def test_filter_pushdown_moves_cheap_one_table_filters_below_joins():
                 .select("r.id", "p.asin", "topic"))
     joined = labelled.root.input
     label_filter = joined.input.left
-    assert isinstance(label_filter, SemanticFilter)
+    assert isinstance(label_filter, Filter)
     assert isinstance(label_filter.input, SemanticClassify)
     lifted = replace(labelled.root, input=replace(
         label_filter, input=replace(joined, input=replace(

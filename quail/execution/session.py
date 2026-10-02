@@ -936,7 +936,7 @@ class Query:
 
         operators = self.logical.operators()
         scans, logical_filters, logical_joins = (
-            operators.scans, operators.filters, operators.joins
+            operators.scans, operators.all_filters(), operators.joins
         )
         scans_by_alias = {scan.alias: scan for scan in scans}
 

@@ -1,6 +1,6 @@
 """Logical plan nodes and the plan builder."""
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, ClassVar, Optional, Protocol
 
 
@@ -177,26 +177,19 @@ class Compare:
 
 
 @dataclass(frozen=True)
-class LabelIn:
-    """Membership condition on the category returned by AI.CLASSIFY.
+class InList:
+    """A column's value is one of the listed values, as SQL IN."""
+    column: ColumnRef
+    values: tuple    # tuple[str, ...]
 
-    The SemanticClassify that computes the label sits below the
-    SemanticFilter holding this condition.
-    """
-    call: ModelCall
-    accepted: tuple    # tuple[str, ...], each one of call.labels
-
-    type_name: ClassVar[str] = "quail.label_in"
+    type_name: ClassVar[str] = "quail.in_list"
 
     def validate(self) -> None:
-        # a label the classification cannot return matches no row, and
-        # an accepted set without any of its labels accepts no rows
-        self.call.validate()
-        if self.call.kind != "label":
-            raise CompileError("only an AI.CLASSIFY label is tested for "
-                               "membership in a label list")
-        if len(set(self.accepted)) != len(self.accepted):
-            raise CompileError("a filter on a label lists a label twice")
+        # a value the column never holds matches no row
+        if len(set(self.values)) != len(self.values):
+            raise CompileError(
+                f"{self.column.alias}.{self.column.column} IN lists a "
+                f"value twice")
 
 
 @dataclass(frozen=True)
@@ -217,7 +210,7 @@ def model_call(expression) -> ModelCall:
     """Return the model call inside a predicate or projected expression."""
     if isinstance(expression, ModelCall):
         return expression
-    if isinstance(expression, (Compare, LabelIn)):
+    if isinstance(expression, Compare):
         return expression.call
     if isinstance(expression, Alias):
         return expression.expression
@@ -249,7 +242,7 @@ def has_score(plan) -> bool:
 
 def validate_predicate(expression) -> None:
     """Check that an expression answers yes or no for every row."""
-    if isinstance(expression, (Compare, LabelIn)):
+    if isinstance(expression, Compare):
         expression.validate()
         return
     if isinstance(expression, ModelCall):
@@ -260,8 +253,8 @@ def validate_predicate(expression) -> None:
                 "a threshold")
         if expression.kind == "label":
             raise CompileError(
-                "an AI.CLASSIFY call is a predicate only when its label "
-                "is tested against a label list")
+                "an AI.CLASSIFY label is tested by a Filter on its "
+                "column, not by a SemanticFilter")
         return
     raise CompileError(
         f"a predicate is a model call or a comparison, got "
@@ -392,17 +385,11 @@ class SemanticFilter:
             raise CompileError(
                 f"a filter's order lists each predicate position once, "
                 f"got {list(self.order)} for {len(self.predicates)} predicates")
-        computed = {node.call for node in classifications(self.input)}
         for predicate in self.predicates:
             validate_predicate(predicate.expression)
             if len(model_call(predicate.expression).aliases()) != 1:
                 raise CompileError(
                     "a SemanticFilter predicate reads one table")
-            if isinstance(predicate.expression, LabelIn) \
-                    and predicate.expression.call not in computed:
-                raise CompileError(
-                    "a filter on a label sits above the SemanticClassify "
-                    "that computes the label")
 
     def with_children(self, children: tuple[LogicalNode, ...]):
         if len(children) != 1:
@@ -420,6 +407,57 @@ class SemanticFilter:
             "selectivities": [p.selectivity for p in self.predicates],
             "expressions": [_explain(p.expression) for p in self.predicates],
             "order": list(self.order),
+        }
+
+
+@dataclass(frozen=True)
+class Filter:
+    """Rows whose condition holds, decided without the model.
+
+    The condition tests the label column a one-table SemanticClassify
+    below adds.
+    """
+    input: LogicalNode
+    condition: InList
+    selectivity: Optional[float] = None   # fraction of rows that pass;
+    #                                       None means not given
+
+    type_name: ClassVar[str] = "quail.filter"
+
+    def children(self) -> tuple[LogicalNode, ...]:
+        return (self.input,)
+
+    def expressions(self) -> tuple:
+        return (self.condition,)
+
+    def output_schema(self) -> tuple[ColumnRef, ...]:
+        return self.input.output_schema()
+
+    def validate(self) -> None:
+        self.condition.validate()
+        column = self.condition.column
+        if not any(node.alias == column.alias and node.name == column.column
+                   and len(node.call.aliases()) == 1
+                   for node in classifications(self.input)):
+            raise CompileError(
+                f"a Filter tests the label column of a one-table "
+                f"classification below it; nothing below computes "
+                f"{column.alias}.{column.column}")
+
+    def with_children(self, children: tuple[LogicalNode, ...]):
+        if len(children) != 1:
+            raise CompileError("Filter needs one child")
+        return replace(self, input=children[0])
+
+    def with_expressions(self, expressions: tuple):
+        if len(expressions) != 1:
+            raise CompileError("Filter needs one condition")
+        return replace(self, condition=expressions[0])
+
+    def explain_fields(self) -> dict:
+        return {
+            "condition": _explain(self.condition),
+            "selectivity": self.selectivity,
         }
 
 
@@ -575,8 +613,8 @@ class SemanticClassify:
     PROBABILITIES_SUFFIX, holds each label's probability. A call over
     one table sits on that table above its AI.IF SemanticFilter and
     below any join; a call over two tables sits above the SemanticJoin
-    of the two. A SemanticFilter testing the label with LabelIn sits
-    above this node, and the root Project returns the column through
+    of the two. A Filter testing the label column sits above this
+    node, and the root Project returns the column through
     an Alias of the same call.
     """
     input: LogicalNode
@@ -690,8 +728,9 @@ def _explain(expression) -> str:
     if isinstance(expression, Compare):
         return (f"{_explain(expression.call)} {expression.comparison} "
                 f"{expression.threshold}")
-    if isinstance(expression, LabelIn):
-        return f"{_explain(expression.call)} IN {list(expression.accepted)}"
+    if isinstance(expression, InList):
+        return (f"{expression.column.alias}.{expression.column.column} "
+                f"IN {list(expression.values)}")
     if isinstance(expression, Alias):
         if expression.expression.kind == "label":
             # the SemanticClassify below computes the column
@@ -851,15 +890,34 @@ class Project:
 
 
 @dataclass(frozen=True)
-class LabelWork:
-    """Classification calls, result columns, and membership conditions in a plan.
+class LabelFilter:
+    """A Filter on a one-table classification's label, as the planner reads it.
 
     Attributes:
-        calls: (classification call, anchor alias) pairs. Calls used in conditions
-            appear first in condition order, followed by calls returned in SELECT.
+        call: The classification that computes the label.
+        values: The labels the Filter keeps.
+        selectivity: The Filter's selectivity hint, or None.
+        position: Its written position among the table's filters,
+            counted after the table's AI.IF predicates.
+    """
+
+    call: "ModelCall"
+    values: tuple
+    selectivity: Optional[float]
+    position: int
+
+
+@dataclass(frozen=True)
+class LabelWork:
+    """Classification calls, result columns, and label filters in a plan.
+
+    Attributes:
+        calls: (classification call, anchor alias) pairs. Calls a Filter
+            tests appear first in filter order, followed by calls
+            returned in SELECT.
         names: Mapping from classification call to its column name, as the
             SemanticClassify nodes name them.
-        tests: Written filter positions for conditions on each classification.
+        tests: Written filter positions of the Filters on each classification.
         projected: Mapping from classifications returned in SELECT to column names.
     """
 
@@ -869,21 +927,18 @@ class LabelWork:
     projected: dict
 
 
-def _label_work(classifies, columns, filters) -> LabelWork:
+def _label_work(classifies, columns, label_filters) -> LabelWork:
     projected = {column.expression: column.name
                  for column in columns
                  if isinstance(column, Alias) and column.expression.kind == "label"}
     names = {node.call: node.name for node in classifies}
     tests = {}
     calls = []
-    for alias, predicates in filters.items():
-        for position, predicate in enumerate(predicates):
-            test = predicate.expression
-            if not isinstance(test, LabelIn):
-                continue
+    for alias, label_filters_of_alias in label_filters.items():
+        for test in label_filters_of_alias:
             if test.call not in tests:
                 calls.append((test.call, alias))
-            tests.setdefault(test.call, []).append(position)
+            tests.setdefault(test.call, []).append(test.position)
     for call in projected:
         if call not in tests:
             calls.append((call, call.aliases()[0]))
@@ -918,6 +973,7 @@ class LogicalPlan:
     def operators(self) -> "Operators":
         """Return the plan's operators as the planner reads them."""
         scans, filters, joins, applies, classifies = [], {}, [], [], []
+        tested, aliases = {}, []
         for node in self.walk():
             if isinstance(node, Scan):
                 scans.append(node)
@@ -925,21 +981,41 @@ class LogicalPlan:
                 for predicate in node.predicates:
                     (alias,) = model_call(predicate.expression).aliases()
                     filters.setdefault(alias, []).append(predicate)
+                    if alias not in aliases:
+                        aliases.append(alias)
+            elif isinstance(node, Filter):
+                alias = node.condition.column.alias
+                tested.setdefault(alias, []).append(node)
+                if alias not in aliases:
+                    aliases.append(alias)
             elif isinstance(node, SemanticJoin):
                 joins.append(node)
             elif isinstance(node, Apply):
                 applies.append(node)
             elif isinstance(node, SemanticClassify):
                 classifies.append(node)
+        calls = {(node.alias, node.name): node.call for node in classifies
+                 if len(node.call.aliases()) == 1}
+        label_filters = {
+            alias: tuple(
+                LabelFilter(
+                    call=calls[(alias, node.condition.column.column)],
+                    values=node.condition.values,
+                    selectivity=node.selectivity,
+                    position=len(filters.get(alias, ())) + index)
+                for index, node in enumerate(tested[alias]))
+            for alias in aliases if alias in tested}
         columns = self.root.columns if isinstance(self.root, Project) else ()
         return Operators(
             scans=tuple(scans),
-            filters={alias: tuple(value) for alias, value in filters.items()},
+            filters={alias: tuple(filters[alias]) for alias in aliases
+                     if alias in filters},
+            label_filters=label_filters,
             joins=tuple(joins),
             applies=tuple(applies),
             projections=tuple(column for column in columns
                               if isinstance(column, Alias)),
-            labels=_label_work(classifies, columns, filters),
+            labels=_label_work(classifies, columns, label_filters),
             classifies=tuple(classifies),
         )
 
@@ -949,9 +1025,9 @@ class Operators:
     """The operators of one plan, in the order the plan was written.
 
     ``walk`` lists children before parents, so scans, joins, applies,
-    and classifications follow written order and each alias's filters
-    keep the order of their predicates: its AI.IF predicates, then its
-    filters on labels.
+    and classifications follow written order, each alias's AI.IF
+    predicates keep their order, and each alias's label filters keep
+    theirs.
     """
     scans: tuple           # tuple[Scan, ...]
     filters: dict          # alias -> tuple[FilterPredicate, ...]
@@ -960,14 +1036,28 @@ class Operators:
     labels: LabelWork
     projections: tuple = ()     # named model calls in SELECT order
     classifies: tuple = ()      # tuple[SemanticClassify, ...]
+    label_filters: dict = field(default_factory=dict)
+    #                     alias -> tuple[LabelFilter, ...]
+
+    def all_filters(self) -> dict:
+        """Return alias -> its AI.IF predicates, then its LabelFilters."""
+        aliases = [*self.filters, *(alias for alias in self.label_filters
+                                    if alias not in self.filters)]
+        return {alias: (*self.filters.get(alias, ()),
+                        *self.label_filters.get(alias, ()))
+                for alias in aliases}
 
     @property
     def prompts(self) -> tuple:
-        """Return filter, join, and remaining result-column prompts in order."""
+        """Return filter, label, join, and remaining result-column prompts in order."""
         calls = tuple(
             model_call(predicate.expression)
             for predicates in self.filters.values()
             for predicate in predicates
+        ) + tuple(
+            test.call
+            for tests in self.label_filters.values()
+            for test in tests
         ) + tuple(model_call(join.predicate) for join in self.joins)
         return tuple(call.prompt for call in calls) + tuple(
             column.expression.prompt for column in self.projections
@@ -1057,6 +1147,7 @@ class LogicalPlanBuilder:
         predicates: tuple[FilterPredicate, ...] = (),
         applies: tuple = (),
         labels: tuple = (),
+        label_filters: tuple = (),
     ) -> None:
         """Add one table with its filters, applies, and classifications.
 
@@ -1064,41 +1155,39 @@ class LogicalPlanBuilder:
             alias: The table's alias in the query.
             provider: The registered provider name.
             column: The document column.
-            predicates: The table's filter predicates in written order,
-                AI.IF and filters on labels alike.
+            predicates: The table's AI.IF predicates in written order.
             applies: (function, kind, ids, columns) per apply, in order.
             labels: (call, name) per one-table classification. One a
-                predicate tests sits below the first filter testing it;
-                the others sit above the last filter, in the order given.
+                label filter tests sits below the first Filter testing
+                it; the others sit above the last Filter, in the order
+                given.
+            label_filters: (name, values, selectivity) per Filter on a
+                classification's label column, in written order.
+
+        Raises:
+            CompileError: The alias is taken, or a label filter names a
+                column no classification in labels computes.
         """
         if alias in self._nodes:
             raise CompileError(f"duplicate table alias {alias!r}")
-        asks = [p for p in predicates if not isinstance(p.expression, LabelIn)]
-        tests = [p for p in predicates if isinstance(p.expression, LabelIn)]
         node = Scan(provider=provider, alias=alias, column=column)
-        if asks:
-            node = SemanticFilter(node, tuple(asks))
+        if predicates:
+            node = SemanticFilter(node, tuple(predicates))
         for function, kind, ids, columns in applies:
             node = Apply(node, function=function, kind=kind, ids=ids,
                          columns=tuple(columns), aliases=(alias,))
-        names = dict(labels)
+        calls = {name: call for call, name in labels}
         classified = []
-        pending = []
-        for predicate in tests:
-            call = predicate.expression.call
-            if call not in classified:
-                if call not in names:
-                    raise CompileError(
-                        f"a filter on a label of {alias!r} tests a "
-                        f"classification the query does not name")
-                if pending:
-                    node = SemanticFilter(node, tuple(pending))
-                    pending = []
-                node = SemanticClassify(node, call, names[call])
-                classified.append(call)
-            pending.append(predicate)
-        if pending:
-            node = SemanticFilter(node, tuple(pending))
+        for name, values, selectivity in label_filters:
+            if name not in calls:
+                raise CompileError(
+                    f"a filter on a label of {alias!r} tests a "
+                    f"classification the query does not name")
+            if calls[name] not in classified:
+                node = SemanticClassify(node, calls[name], name)
+                classified.append(calls[name])
+            node = Filter(node, InList(ColumnRef(alias, provider, name),
+                                       tuple(values)), selectivity)
         for call, name in labels:
             if call not in classified:
                 node = SemanticClassify(node, call, name)

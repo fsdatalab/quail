@@ -9,9 +9,10 @@ from quail.logical import (
     ColumnRef,
     Compare,
     CompileError,
+    Filter,
     FilterPredicate,
+    InList,
     Join,
-    LabelIn,
     LogicalPlan,
     ModelCall,
     Project,
@@ -47,11 +48,11 @@ INVALID_PREDICATES = [
     (ModelCall(bind_prompt("q {0}", (R,)), "label", ("a", "A")),
      "differ ignoring case"),
     (ModelCall(bind_prompt("q {0}", (R,)), "label", ("a", "b")),
-     "tested against a label list"),
+     "tested by a Filter on its"),
     (ModelCall(bind_prompt("q {0}", (R,)), "boolean", ("a", "b")),
      "only an AI.CLASSIFY call has labels"),
-    (LabelIn(ModelCall(bind_prompt("q {0}", (R,)), "label", ("a", "b")),
-             ("a", "a")), "lists a label twice"),
+    (InList(ColumnRef("r", "reviews", "tone"), ("a",)),
+     "a model call or a comparison"),
 ]
 
 
@@ -74,6 +75,8 @@ def test_model_calls_and_predicates_validate_kind_comparison_and_input():
             assert message in str(error), expression
         else:
             raise AssertionError(f"validated: {expression}")
+    with pytest.raises(CompileError, match="lists a value twice"):
+        InList(ColumnRef("r", "reviews", "tone"), ("a", "a")).validate()
 
     r = Scan("reviews", "r", "review")
     p = Scan("products", "p", "description")
@@ -117,11 +120,12 @@ def test_operators_walk_lists_each_operator_in_written_order():
                      "label", ("a", "b"))
     classified = SemanticClassify(SemanticFilter(r, (first,)), named,
                                   "projected_name")
-    tested = SemanticFilter(classified, (
-        FilterPredicate(LabelIn(named, ("a",))),
-        FilterPredicate(LabelIn(named, ("b",)))))
+    named_column = ColumnRef("r", "reviews", "projected_name")
+    tested = Filter(Filter(classified, InList(named_column, ("a",))),
+                    InList(named_column, ("b",)))
     hidden_node = SemanticClassify(tested, hidden, "__label_r_3")
-    chain = SemanticFilter(hidden_node, (FilterPredicate(LabelIn(hidden, ("a",))),))
+    chain = Filter(hidden_node,
+                   InList(ColumnRef("r", "reviews", "__label_r_3"), ("a",)))
     joined = SemanticJoin(Join(chain, p), _pair_call())
     pair_node = SemanticClassify(joined, pair, "pair_label")
     plan = LogicalPlan(Project(pair_node, (
@@ -161,8 +165,10 @@ def test_operators_walk_lists_each_operator_in_written_order():
         ColumnRef("r", "reviews", "pair_label"))
 
     # a label is tested or returned only above the node computing it
-    with pytest.raises(CompileError, match="above the SemanticClassify"):
-        SemanticFilter(r, (FilterPredicate(LabelIn(named, ("a",))),)).validate()
+    with pytest.raises(CompileError, match="nothing below computes"):
+        Filter(r, InList(named_column, ("a",))).validate()
+    assert chain.explain_fields() == {
+        "condition": "r.__label_r_3 IN ['a']", "selectivity": None}
     with pytest.raises(CompileError, match="needs a SemanticClassify"):
         Project(classified, (Alias(hidden, "x"),)).validate()
     with pytest.raises(CompileError, match="already used"):

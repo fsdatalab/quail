@@ -9,7 +9,6 @@ from quail.cost.work import Work, triangle
 from quail.logical import (
     Alias,
     Apply,
-    LabelIn,
     SemanticJoin,
     effective_selectivity,
     is_score,
@@ -277,9 +276,7 @@ def _score_name(prompt, projected, fallback: str) -> str:
 
 def _ordered_filters(predicates, count, mean_tokens, context, chunk,
                      token_parts_by_prompt):
-    remaining = [(position, predicate)
-                 for position, predicate in enumerate(predicates)
-                 if not isinstance(predicate.expression, LabelIn)]
+    remaining = list(enumerate(predicates))
     ordered = []
     live = float(count)
     scored = set()
@@ -350,11 +347,14 @@ def _plan_reranker(region, context, *, backend_name: str):
         for values in filters.values()
         for predicate in values
     ] + list(joins)
-    if not predicates and not projected:
+    tests = [test for values in operators.label_filters.values()
+             for test in values]
+    if not predicates and not tests and not projected:
         refusal = _refusal("a reranker model can only be used with AI.SCORE",
                            "reranker_only_scores")
         return (PhysicalCandidate(None, refusal, float("inf")),)
     prompts = [predicate.prompt for predicate in predicates] + [
+        test.call.prompt for test in tests] + [
         score.expression.prompt for score in projected
     ]
     if any(len(_prompt_aliases(prompt)) > 2 for prompt in prompts):
@@ -364,8 +364,6 @@ def _plan_reranker(region, context, *, backend_name: str):
         return (PhysicalCandidate(None, refusal, float("inf")),)
     if not all(is_score(item.predicate if isinstance(item, SemanticJoin)
                         else item.expression)
-               or (not isinstance(item, SemanticJoin)
-                   and isinstance(item.expression, LabelIn))
                for item in predicates):
         refusal = _refusal(
             "AI.SCORE cannot be mixed with generative AI predicates"
@@ -544,13 +542,12 @@ def _plan_reranker(region, context, *, backend_name: str):
         calls = [call for call, owner in labels.calls if owner == alias]
         if calls:
             table = classify_table(context, alias, backend_name)
-            steps = [(predicate.expression.call, position)
-                     for position, predicate in enumerate(filters.get(alias, ()))
-                     if isinstance(predicate.expression, LabelIn)]
+            steps = [(test.call, test)
+                     for test in operators.label_filters.get(alias, ())]
             steps.extend((call, None) for call in calls if call not in labels.tests)
             classified = set()
             previous = None
-            for call, position in steps:
+            for call, test in steps:
                 if call not in classified:
                     resident = (context.gpu_count == 1 and previous is not None
                                 and table.head(call) == table.head(previous))
@@ -565,18 +562,16 @@ def _plan_reranker(region, context, *, backend_name: str):
                     current[alias] = PortRef(node.node_id, "scores")
                     classified.add(call)
                     previous = call
-                if position is not None:
-                    predicate = filters[alias][position]
+                if test is not None:
                     filtered = Filter(
-                        node_id=f"filter:{alias}:{position}",
+                        node_id=f"filter:{alias}:{test.position}",
                         inputs=input_ports((current[alias],)),
-                        predicate=InList(labels.names[call],
-                                         tuple(predicate.expression.accepted)),
-                        aliases=(alias,), selectivity=predicate.selectivity,
-                        written_pos=position)
+                        predicate=InList(labels.names[call], test.values),
+                        aliases=(alias,), selectivity=test.selectivity,
+                        written_pos=test.position)
                     nodes.append(filtered)
                     current[alias] = PortRef(filtered.node_id, "scores")
-                    live[alias] *= effective_selectivity(predicate.selectivity)
+                    live[alias] *= effective_selectivity(test.selectivity)
 
     pair_prompt = pair_prompts[0] if pair_prompts else None
     sink = current[scans[0].alias]

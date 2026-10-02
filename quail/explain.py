@@ -76,6 +76,9 @@ def logical_tree(logical):
             if node.order:
                 title += " order=" + ",".join(
                     str(position + 1) for position in node.order)
+        elif isinstance(node, logical_nodes.Filter):
+            title = (f"Filter: {node.explain_fields()['condition']} "
+                     f"(selectivity={_selectivity(node.selectivity)})")
         elif isinstance(node, logical_nodes.SemanticJoin):
             title = f"SemanticJoin ({node.semantics})"
             details = [f"{_prompt(node.prompt)} "

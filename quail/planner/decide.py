@@ -9,7 +9,6 @@ from quail.logical import (
     PROBABILITIES_SUFFIX,
     Alias,
     CompileError,
-    LabelIn,
     LabelWork,
     LogicalPlan,
     classified_above_joins,
@@ -289,7 +288,7 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
     ask_filters = {alias: [filters[alias][position] for position in positions]
                    for alias, positions in asks.items() if positions}
     rule, source = (order, f"user: order={order!r}") if order else \
-        default_order_rule(filters, joins)
+        default_order_rule(operators.all_filters(), joins)
     orders = filter_orders(plan)
 
     # ---- expected live counts after filters, and the filter work
@@ -301,7 +300,8 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
     # ---- the stages as decided: their work and expected tuples
     seq = sequence_specs(plan, statistics)
     stage_work, stage_records = joinsearch.walk(
-        seq, live0, statistics.lengths, set(filters), pre, model, device)
+        seq, live0, statistics.lengths, set(operators.all_filters()), pre,
+        model, device)
     # a second group on the same anchor gets :2, a third :3
     sequence_groups = retention.group_sequence(seq)
     group_ids = []
@@ -444,13 +444,12 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
         table = classify_table(context, alias, "quail")
         if live is None:
             live = live_asked.get(alias, float(stats[alias].n_docs))
-        steps = [(predicate.expression.call, position)
-                 for position, predicate in enumerate(filters.get(alias, ()))
-                 if isinstance(predicate.expression, LabelIn)]
+        steps = [(test.call, test)
+                 for test in operators.label_filters.get(alias, ())]
         steps.extend((call, None) for call in calls if call not in labels.tests)
         classified_calls = set()
         scores = None
-        for call, position in steps:
+        for call, test in steps:
             if call not in classified_calls:
                 spec = table.prepare(call, labels.names[call], live)
                 node = table.node(spec, scores or ids_src[alias],
@@ -461,18 +460,16 @@ def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
                 if call in labels.projected:
                     label_ports.append(scores)
                 classified_calls.add(call)
-            if position is not None:
-                predicate = filters[alias][position]
-                lid = f"filter:{alias}:{position}"
+            if test is not None:
+                lid = f"filter:{alias}:{test.position}"
                 nodes.append(Filter(
                     node_id=lid, inputs=input_ports((scores,)),
-                    predicate=InList(labels.names[call],
-                                     tuple(predicate.expression.accepted)),
-                    aliases=(alias,), selectivity=predicate.selectivity,
-                    written_pos=position))
+                    predicate=InList(labels.names[call], test.values),
+                    aliases=(alias,), selectivity=test.selectivity,
+                    written_pos=test.position))
                 scores = PortRef(lid, "scores")
                 ids_src[alias] = PortRef(lid, f"ids:{alias}")
-                live *= effective_selectivity(predicate.selectivity)
+                live *= effective_selectivity(test.selectivity)
 
     try:
         for s in scans:
