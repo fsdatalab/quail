@@ -39,7 +39,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
              anchor_keys=None, anchor_done=None,
              anchor_partners=None, staging=None,
              attention_mode=None, prefix_tree=None, stats=None,
-             read_all_rows=False, advance=None):
+             read_all_rows=False, advance=None, on_answers=None):
     """Stream each stage's selected partner requests against anchor documents.
 
     Survivors are gated between stages.
@@ -79,6 +79,8 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         advance: Optional callable(anchor, stage, row) -> bool deciding
             from an anchor's complete row whether it goes on to the
             next stage; None advances on any true answer.
+        on_answers: Optional callable(anchor, stage, start, end, rows)
+            run as each chunk's answers are read; see run_stages().
 
     Returns:
         A tuple of per-stage partner answers, chunk timing spans, and fresh
@@ -110,7 +112,8 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         staging=staging, attention_mode=attention_mode,
         prefix_tree=prefix_tree, stats=stats,
         unit="scores" if scoring else "anchors",
-        label="AI.SCORE" if scoring else f"join ({k} stages)")
+        label="AI.SCORE" if scoring else f"join ({k} stages)",
+        on_answers=on_answers)
 
 
 # ---------------------------------------------------------- the filter

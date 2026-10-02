@@ -442,19 +442,63 @@ class ClassifyStages:
         return suffix_tokens, suffix_tokens + len(first) * len(self.request.frame)
 
 
+class AnswerStream:
+    """Send documents' finished answers to a callback, each document once.
+
+    Args:
+        on_answers: Callable(document positions, values), or None to send
+            nothing.
+    """
+
+    def __init__(self, on_answers):
+        self.on_answers = on_answers
+        self.sent = set()
+
+    def chunk(self, value_of):
+        """Return an on_chunk callback for run_stages, or None.
+
+        Args:
+            value_of: Callable(document position) -> its answer, or None
+                while it has none.
+        """
+        if self.on_answers is None:
+            return None
+        return lambda transitions: self.send(
+            sorted({anchor for anchor, _, _ in transitions}), value_of)
+
+    def send(self, anchors, value_of):
+        """Send the answers of the anchors that have one and were not sent."""
+        ready = []
+        for anchor in anchors:
+            value = None if anchor in self.sent else value_of(anchor)
+            if value is not None:
+                ready.append((anchor, value))
+        if ready:
+            self.sent.update(anchor for anchor, _ in ready)
+            self.on_answers(np.asarray([anchor for anchor, _ in ready]),
+                            [value for _, value in ready])
+
+    def finish(self, anchors, value_of):
+        """Send every remaining answer after the run."""
+        if self.on_answers is not None:
+            self.send(anchors, value_of)
+
+
 class QuailClassifier:
     """Classify document rows with Quail's token admission and KV arena."""
 
     def __init__(self, state: QueryExecutionState):
         self.state = state
 
-    def classify(self, spec, rows, documents) -> RerankerBatch:
+    def classify(self, spec, rows, documents, on_answers=None) -> RerankerBatch:
         """Classify document rows using the shared scheduler and KV arena.
 
         Args:
             spec: Classification specification.
             rows: Document IDs to classify, in input order.
             documents: Tokenized documents indexed by table alias and document ID.
+            on_answers: Optional callable(row positions, labels) run with each
+                chunk's newly labeled rows.
 
         Returns:
             A RerankerBatch containing labels, optional category probabilities,
@@ -478,13 +522,16 @@ class QuailClassifier:
         # the same in any batch
         plan.seeds = rows
         stats = {}
+        stream = AnswerStream(on_answers)
         answers, spans, fresh = run_stages(
             state.torch, state.loaded_model.arena, state.loaded_model.pipeline,
             plan.stages,
             prefixes, state.chunk_tokens, anchor_keys=keys,
             staging=staging, prefix_tree=tree, stats=stats,
-            label=f"classify {spec.name}")
+            label=f"classify {spec.name}",
+            on_chunk=stream.chunk(lambda anchor: plan.labels[anchor]))
         suffix_tokens, streamed = plan.finish(answers)
+        stream.finish(range(len(rows)), lambda anchor: plan.labels[anchor])
         total = sum(map(len, prefixes)) + streamed
         return self._batch(plan.labels, fresh, total - fresh, suffix_tokens,
                            stats, spans, plan.probabilities)

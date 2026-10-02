@@ -233,8 +233,14 @@ def test_classifier_decodes_one_token_per_round(monkeypatch):
         return activate(key, tokens, capacity_tokens=capacity_tokens, **kw)
 
     monkeypatch.setattr(arena, "activate", recording_activate)
-    batch = QuailClassifier(state).classify(spec, [[0], [1], [2]], documents)
+    sent = []
+    batch = QuailClassifier(state).classify(
+        spec, [[0], [1], [2]], documents,
+        on_answers=lambda rows, labels: sent.append((rows.tolist(), labels)))
     assert list(batch.scores) == ["refund request", "shipping", "refund status"]
+    # each label streams once, as the chunk that decides it is read
+    assert sent == [([1], ["shipping"]),
+                    ([0, 2], ["refund request", "refund status"])]
     # each document reserves its prefix, the two-token frame, and one
     # kept token per round: the cue and the first label token
     assert reserved == {0: 3 + 2 + 2, 1: 2 + 2 + 2, 2: 2 + 2 + 2}

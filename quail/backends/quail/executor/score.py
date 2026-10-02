@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from quail.backends.quail.executor.classify import QuailClassifier
+from quail.backends.quail.executor.classify import AnswerStream, QuailClassifier
 from quail.backends.quail.executor.loop import run_join
 from quail.backends.quail.executor.parts import input_staging
 from quail.backends.quail.executor.readout import AsyncScores
@@ -17,12 +17,28 @@ from quail.specs.base import CANVAS_ENTROPY_NATS, CANVAS_SEED
 class QuailScorer:
     """Score document rows with Quail's token admission and KV arena."""
 
+    # score() reports answers through on_answers while it runs
+    streams_answers = True
+
     def __init__(self, state: QueryExecutionState):
         self.state = state
 
-    def score(self, spec, rows, documents):
+    def score(self, spec, rows, documents, on_answers=None):
+        """Score or classify the rows.
+
+        Args:
+            spec: Score or classification specification.
+            rows: Document indices, one column per alias.
+            documents: Tokenized documents indexed by table alias and document ID.
+            on_answers: Optional callable(row positions, values) run as each
+                chunk's answers are read.
+
+        Returns:
+            A RerankerBatch with one value per row, in row order.
+        """
         if isinstance(spec, ClassifySpec):
-            return QuailClassifier(self.state).classify(spec, rows, documents)
+            return QuailClassifier(self.state).classify(
+                spec, rows, documents, on_answers=on_answers)
         state = self.state
         rows = np.asarray(rows, dtype=np.int32)
         parts = spec.prompt_token_parts
@@ -30,7 +46,7 @@ class QuailScorer:
             raise ValueError("AI.SCORE needs tokenized prompt parts")
         if (len(spec.aliases) == 1 and spec.draws > 1
                 and state.loaded_model.pipeline.canvas_ids):
-            return self._drawn(spec, rows, documents)
+            return self._drawn(spec, rows, documents, on_answers)
         if len(spec.aliases) == 1:
             prefixes = [parts[0]]
             suffixes = [chain_tokens(documents[spec.aliases[0]][doc], parts[1])
@@ -58,6 +74,11 @@ class QuailScorer:
         keys = [("score", spec.name, index) for index in range(len(prefixes))]
         async_scores = self._scores()
         staging = state.loaded_model.input_staging
+
+        def report(anchor, stage, start, end, values):
+            first = offsets[anchor]
+            on_answers(order[first + start:first + end], np.asarray(values))
+
         answers, _, fresh = run_join(
             state.torch, state.loaded_model.arena, state.loaded_model.pipeline,
             async_scores,
@@ -65,6 +86,7 @@ class QuailScorer:
             anchor_partners=(None if partners is None
                              else lambda key: [partners[key[2]]]),
             staging=staging,
+            on_answers=None if on_answers is None else report,
         )
         scores = np.empty(len(rows), dtype=np.float32)
         for anchor, values in answers[0].items():
@@ -82,7 +104,7 @@ class QuailScorer:
         input_staging(state)
         return async_scores
 
-    def _drawn(self, spec, rows, documents) -> RerankerBatch:
+    def _drawn(self, spec, rows, documents, on_answers=None) -> RerankerBatch:
         """Score documents with reproducible diffusion draws.
 
         A low-entropy first answer uses one draw. Other documents run the remaining
@@ -92,6 +114,8 @@ class QuailScorer:
             spec: Single-document score specification.
             rows: Input row indices with shape (documents, 1).
             documents: Tokenized documents indexed by table alias and document ID.
+            on_answers: Optional callable(row positions, values) run with each
+                chunk's finished scores.
 
         Returns:
             A RerankerBatch of scores and execution metrics.
@@ -141,11 +165,15 @@ class QuailScorer:
                   canvas_rows=width),
         ]
         prefixes = DocumentPrefixes(head, documents[alias], docs)
+        stream = AnswerStream(on_answers)
         _, _, fresh = run_stages(
             state.torch, state.loaded_model.arena, pipeline, stages, prefixes,
             state.chunk_tokens,
             anchor_keys=[("score", spec.name, index) for index in range(len(docs))],
-            staging=state.loaded_model.input_staging, label=f"score {spec.name}")
+            staging=state.loaded_model.input_staging, label=f"score {spec.name}",
+            on_chunk=stream.chunk(lambda anchor: (
+                None if np.isnan(scores[anchor]) else scores[anchor])))
+        stream.finish(range(len(docs)), lambda anchor: scores[anchor])
         read = len(cue) + width
         total = (sum(len(head) + len(documents[alias][doc]) for doc in docs)
                  + len(docs) * (len(tail) - 1 + read) + extended[0] * more * read)

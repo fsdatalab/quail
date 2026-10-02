@@ -18,11 +18,6 @@ from quail.logical import PROBABILITIES_SUFFIX
 from quail.physical import AiScore, ClassifySpec, Filter, InList, ValueType
 from quail.progress import answer_sink
 
-# Rows scored per reranker call. Each call's scores reach the answer sink
-# together, so this bounds how long a listener waits between batches; the
-# cost of a smaller batch is one partly filled chunk at the end of each call.
-SCORE_BATCH_ROWS = 2048
-
 # one kernel per entry of quail.logical.SCORE_COMPARISONS
 _COMPARE = {
     "<": pc.less, "<=": pc.less_equal,
@@ -250,15 +245,15 @@ def _batches_with_positions(rows: ScoreRows, size: int):
         start = end
 
 
-def scored_batch(node, rows, table) -> dict:
-    """The answer-sink payload for one scored batch.
+def scored_batch(node, rows, values) -> dict:
+    """The answer-sink payload for one batch of scored rows.
 
     ``rows`` are the batch's row indices into each alias table, one int
     per row for a single alias and one list per row for a pair;
-    ``scores`` line up with them.
+    ``values`` are their scores or labels, in the same order.
     """
     rows = np.asarray(rows)
-    values = table.column(node.spec.name).to_pylist()
+    values = list(values)
     payload = {"kind": "score", "node": node.node_id,
                "output": node.spec.name, "aliases": list(node.spec.aliases),
                "rows": (rows[:, 0].tolist() if rows.shape[1] == 1
@@ -284,8 +279,11 @@ def classify_label_tables(spec, table) -> dict:
 
 
 def score_in_batches(node, inputs, score_batches, shards: int = 1,
-                     batch_rows: int | None = SCORE_BATCH_ROWS) -> NodeResult:
-    """Score the node's candidate rows in bounded batches, in input order.
+                     streamed: bool = False) -> NodeResult:
+    """Score the node's candidate rows, in input order.
+
+    Each shard's rows are scored in one call of ``score_batches``. A
+    Cartesian product is scored in batches of DEFAULT_BATCH_ROWS pairs.
 
     Args:
         node: The AiScore node.
@@ -295,9 +293,9 @@ def score_in_batches(node, inputs, score_batches, shards: int = 1,
             "scores" table holding one row per input row in order.
         shards: Row shards scored side by side; rows that share a first
             document land in the same shard.
-        batch_rows: Rows per call of ``score_batches``; each call's scores
-            go to the answer sink as one batch. None scores every row
-            in one call.
+        streamed: Whether ``score_batches`` sends its answers to the
+            answer sink itself. Otherwise each batch's answers are sent
+            when the batch is scored.
     """
     if not isinstance(node, AiScore):
         raise TypeError(type(node).__name__)
@@ -313,9 +311,11 @@ def score_in_batches(node, inputs, score_batches, shards: int = 1,
     suffix_tokens = 0
     borrowed = 0
     pack_s = 0.0
-    if batch_rows is None:
-        batch_rows = max(1, len(rows))
-    streams = [_batches_with_positions(part, batch_rows) for part in parts]
+    # a product's pairs are built per batch: the whole product may not
+    # fit in host memory
+    streams = [_batches_with_positions(
+        part, DEFAULT_BATCH_ROWS if part.product else max(1, len(part)))
+        for part in parts]
     while streams:
         rounds = [next(stream, None) for stream in streams]
         if all(item is None for item in rounds):
@@ -335,8 +335,10 @@ def score_in_batches(node, inputs, score_batches, shards: int = 1,
                 "borrowed_prefix_tokens", 0)
             pack_s += result.metrics.extension.get("pack_s", 0.0)
             sink = answer_sink()
-            if sink is not None and len(batch):
-                sink(scored_batch(node, batch, result.outputs["scores"]))
+            if sink is not None and not streamed and len(batch):
+                sink(scored_batch(
+                    node, batch,
+                    result.outputs["scores"].column(node.spec.name).to_pylist()))
     table = pa.concat_tables(tables)
     order = np.concatenate(positions)
     if len(order) and np.any(np.diff(order) < 0):
@@ -371,13 +373,10 @@ class RerankerModelExecution:
         node: AiScore,
         inputs: Mapping[str, object],
     ) -> NodeResult:
-        # documents borrow prefix pages from documents in the same call
-        shares = (isinstance(node.spec, ClassifySpec)
-                  and node.spec.share_prefixes)
         return score_in_batches(
             node, inputs,
             lambda node, batches: [self.execute_rows(node, b) for b in batches],
-            batch_rows=None if shares else SCORE_BATCH_ROWS,
+            streamed=True,
         )
 
     def execute_rows(self, node, rows):
@@ -392,10 +391,19 @@ class RerankerModelExecution:
 
         empty = np.empty(0, dtype=(
             object if isinstance(spec, ClassifySpec) else np.float32))
+        sink = answer_sink()
+        streams = (sink is not None and len(rows)
+                   and getattr(self.reranker, "streams_answers", False))
+        extra = {}
+        if streams:
+            extra["on_answers"] = lambda positions, values: sink(
+                scored_batch(node, rows[positions], values))
         batch = (
-            self.reranker.score(spec, rows, self.documents)
+            self.reranker.score(spec, rows, self.documents, **extra)
             if len(rows) else RerankerBatch(empty, 0, 0)
         )
+        if sink is not None and len(rows) and not streams:
+            sink(scored_batch(node, rows, batch.scores))
         table = _score_table(rows, spec.aliases, spec.name, batch.scores,
                              _value_type(spec))
         if isinstance(spec, ClassifySpec) and spec.probabilities:

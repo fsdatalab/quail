@@ -124,7 +124,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                anchor_keys=None, on_settled=None, staging=None,
                attention_mode=None, prefix_tree=None, stats=None,
                limit=None, paged=True, unit="anchors", label=None,
-               default_attention="tree", on_chunk=None):
+               default_attention="tree", on_chunk=None, on_answers=None):
     """Run every stage over the documents with one admission.
 
     Args:
@@ -160,6 +160,10 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
             read with the documents that completed a stage in it, as
             (document index, stage, passed) tuples: passed says the
             document went on to the next stage, or survived the last.
+        on_answers: Optional callable(document index, stage, start, end,
+            rows) run as each chunk's answers are read, with the
+            document's answer rows for its requests start to end at
+            the stage.
 
     Returns:
         A tuple of answers, timing spans, and fresh token count. Answers is
@@ -175,6 +179,7 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
         attention_mode=attention_mode, prefix_tree=prefix_tree, stats=stats,
         limit=limit, paged=paged, unit=unit, label=label,
         default_attention=default_attention, on_chunk=on_chunk,
+        on_answers=on_answers,
     ).run()
 
 
@@ -183,7 +188,8 @@ class _StageExecutor:
 
     def __init__(self, torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                  anchor_keys, on_settled, staging, attention_mode, prefix_tree,
-                 stats, limit, paged, unit, label, default_attention, on_chunk):
+                 stats, limit, paged, unit, label, default_attention, on_chunk,
+                 on_answers):
         from quail.backends.quail.executor.chunk import Suffixes
         from quail.backends.quail.executor.loop import (
             attention_path,
@@ -200,6 +206,7 @@ class _StageExecutor:
         self.stats = stats
         self.paged = paged
         self.on_chunk = on_chunk
+        self.on_answers = on_answers
         self.label = label
 
         k = len(self.stages)
@@ -519,8 +526,10 @@ class _StageExecutor:
             if self.writes[j] and start == 0 and not self._merged(j, start, end):
                 pos[key] += 1        # the frame entry's answer means nothing
             cnt = end - start
-            result = self.sched.report(
-                a, j, start, end, values[key][pos[key]:pos[key] + cnt])
+            rows = values[key][pos[key]:pos[key] + cnt]
+            result = self.sched.report(a, j, start, end, rows)
+            if self.on_answers is not None:
+                self.on_answers(a, j, start, end, rows)
             for settlement in result.settlements:
                 self._event(settlement)
             transitions.extend(result.transitions)

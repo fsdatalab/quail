@@ -412,7 +412,19 @@ def test_scores_and_labels_keep_their_types_and_prior_columns(catalog):
     session.close()
 
 
-def test_scores_stream_per_batch_and_score_rows_shard_in_order(catalog):
+class _StreamingReranker(_RowReranker):
+    """Reports each row's score while scoring, one row at a time."""
+
+    streams_answers = True
+
+    def score(self, spec, rows, documents, on_answers=None):
+        batch = super().score(spec, rows, documents)
+        for position, value in enumerate(batch.scores):
+            on_answers(np.array([position]), [value])
+        return batch
+
+
+def test_scores_stream_while_scoring_and_score_rows_shard_in_order(catalog):
     from quail.progress import set_answer_sink
 
     session = _session(catalog)
@@ -424,18 +436,24 @@ def test_scores_stream_per_batch_and_score_rows_shard_in_order(catalog):
             session, query, query._prepare_physical(), _RowReranker())
         score_node = next(
             node for node in graph.nodes if isinstance(node, AiScore))
+        inputs = {port.name: np.arange(2, dtype=np.int32)
+                  for port in score_node.inputs}
+        # a reranker that reports while scoring streams each answer once
+        model.reranker = _StreamingReranker()
         result = score_in_batches(
-            score_node,
-            {port.name: np.arange(2, dtype=np.int32) for port in score_node.inputs},
+            score_node, inputs,
             lambda node, batches: [model.execute_rows(node, b) for b in batches],
-            batch_rows=1)
+            streamed=True)
     finally:
         set_answer_sink(None)
     session.close()
+    # a reranker that cannot report while scoring sends its call's
+    # answers when the call ends: all rows in one call
     assert streamed[0] == {
         "kind": "score", "node": score_node.node_id, "output": "score",
         "aliases": ["d"], "rows": [0, 1], "scores": [0.1, 0.2]}
-    assert [entry["rows"] for entry in streamed[1:]] == [[0], [1]]
+    assert [(entry["rows"], entry["scores"]) for entry in streamed[1:]] == [
+        ([0], [0.1]), ([1], [0.2])]
     assert result.outputs["scores"].column("d").to_pylist() == [0, 1]
 
     rows = ScoreRows((np.arange(100_000), np.arange(100_000)), product=True)
