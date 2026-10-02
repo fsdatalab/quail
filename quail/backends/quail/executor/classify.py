@@ -275,8 +275,7 @@ class ClassifyStages:
         question = list(request.frame)
         (cue,) = request.suffixes[0]
         # suffix p is partner p's block and the cue; its last row is read
-        blocks = [list(partner_label) + list(document) + question
-                  for document in partners.documents]
+        blocks = [list(document) + question for document in partners.documents]
         self.block_tokens = [len(tokens) for tokens in blocks]
         suffixes = [tokens + [cue] for tokens in blocks]
 
@@ -293,7 +292,8 @@ class ClassifyStages:
             return True
 
         self.stages = [Stage(
-            suffixes=suffixes, readout=readout, frame=list(note),
+            suffixes=suffixes, readout=readout,
+            frame=list(note) + list(partner_label),
             requests=ask, decide=score, read_all_rows=True,
             read_rows=[1] * len(suffixes), label=spec.name)]
 

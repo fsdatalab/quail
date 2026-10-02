@@ -113,7 +113,16 @@ class JoinStage:
         }
 
     def runtime_spec(self) -> dict:
-        """Return the bound prompt and predicate for the join driver."""
+        """Return the bound prompt and predicate for the join driver.
+
+        The first partner's label directly follows the frame in every
+        pair, so it is part of the frame, written once per anchor.
+        """
+        labels = dict(self.label_token_ids)
+        frame = tuple(self.frame_token_ids)
+        if self.partners and self.partners[0] in labels:
+            frame += tuple(labels[self.partners[0]])
+            labels[self.partners[0]] = ()
         return {
             "anchor": self.anchor,
             "partners": list(self.partners),
@@ -121,8 +130,8 @@ class JoinStage:
             "selectivity": self.selectivity,
             "written_pos": self.written_pos,
             "pairs_from": self.pairs_from,
-            "frame": self.frame_token_ids,
-            "labels": dict(self.label_token_ids),
+            "frame": frame,
+            "labels": labels,
             "tail": self.tail_token_ids,
         }
 

@@ -424,16 +424,18 @@ class _Search:
         labels_by_alias, tail = _prompt_token_counts(prompt)
         partner_rows = list(itertools.product(
             *[survivors[alias] for alias in partners]))
+        # the first partner's label is written with the frame, once per anchor
         suffixes = [
             tail + self.canvas
-            + sum(labels_by_alias[alias]["label"]
-                  + self.aliases[alias].tokens[row]
-                  for alias, row in zip(partners, partner_row))
+            + sum(self.aliases[alias].tokens[row]
+                  + (labels_by_alias[alias]["label"] if index else 0)
+                  for index, (alias, row) in enumerate(zip(partners, partner_row)))
             for partner_row in partner_rows
         ]
         all_tokens = sum(suffixes)
         all_triangles = sum(triangle(suffix) for suffix in suffixes)
-        frame = labels_by_alias[anchor]["frame"]
+        frame = labels_by_alias[anchor]["frame"] + (
+            labels_by_alias[partners[0]]["label"] if partners else 0)
         resident_rows = set(resident_rows)
         if self.credit_shared:
             resident_rows |= set(cross_resident_rows)
@@ -602,8 +604,8 @@ class _Search:
         """Price one classification of the pairs a join kept, on its anchor.
 
         Each anchor row with a kept pair attaches the classification's
-        anchor note to its resident prefix, then streams one suffix per
-        kept pair: the partner label, the partner document, and the
+        anchor note and partner label to its resident prefix, then
+        streams one suffix per kept pair: the partner document and the
         tail.
         """
         kept = {}

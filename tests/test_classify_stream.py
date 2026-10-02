@@ -74,10 +74,11 @@ class LabelingModel(FakeModel):
         for spec in chunk.specs:
             for index, suffix in enumerate(spec["suffixes"]):
                 head = suffix[0]
-                if head == PARTNER_LABEL:
-                    # a joined row's block: the partner label, its document,
-                    # the question, then the cue, whose row is read
-                    partner = suffix[1] - PARTNER
+                if suffix[-1] == CUE and head != CUE:
+                    # a joined row's block: the partner document, the
+                    # question, then the cue, whose row is read; the partner
+                    # label is in the frame
+                    partner = head - PARTNER
                     wanted = LABEL_IDS[self.joined_truth[(spec["key"][1], partner)]]
                     for depth in range(int(spec["read_rows"][index])):
                         rows.append(np.asarray(
@@ -654,11 +655,30 @@ def test_a_classification_of_joined_rows_runs_after_its_join_on_the_anchors_kv(
     assert labels.column("p").to_pylist() == [0, 1, 1]
     assert labels.column("stance").to_pylist() == ["a", "b", "a"]
     # the join packed the anchors once; the classification packed, per
-    # anchor kept, its note and, per pair, the partner block, the
-    # question, and the cue: no second prefill
-    block = 1 + 2 + 1
-    assert metrics["classify:rp"]["fresh_tokens"] == 2 * 1 + 3 * (block + 1)
+    # anchor kept, its note and the partner label and, per pair, the
+    # partner document, the question, and the cue: no second prefill
+    block = 2 + 1
+    assert metrics["classify:rp"]["fresh_tokens"] == 2 * (1 + 1) + 3 * (block + 1)
     assert metrics["classify:rp"]["evaluated_document_pairs"] == 3
     # the join packed every anchor, its frame, and both partners' suffixes
     assert metrics["group:0"]["fresh_tokens"] == sum(map(len, docs["r"])) \
         + 3 * 1 + 6 * 2 + (2 * (1 + 2) if two_joins else 0)
+
+
+def test_a_join_writes_its_first_partner_label_with_the_frame():
+    from quail.backends.quail.graph import _tuple_suffix
+
+    stage = JoinStage(
+        written_pos=0, exec_idx=0, anchor="r", partners=("p", "q"),
+        semantics="full", selectivity=0.5, expected_tuples=1,
+        anchor_frame_tokens=2, pair_tail_tokens=1, anchor_resident="fresh",
+        tuple_tokens=0, frame_token_ids=(1, 2),
+        label_token_ids=(("p", (3, 4)), ("q", (5,))), tail_token_ids=(9,))
+    spec = stage.runtime_spec()
+
+    assert spec["frame"] == (1, 2, 3, 4)
+    assert spec["labels"] == {"p": (), "q": (5,)}
+    # the tokens after the anchor are the same; only the frame holds more
+    docs = {"p": [[PARTNER]], "q": [[PARTNER + 1, PARTNER + 1]]}
+    pair = list(spec["frame"]) + list(_tuple_suffix(spec, docs, (0, 0)))
+    assert pair == [1, 2, 3, 4, PARTNER, 5, PARTNER + 1, PARTNER + 1, 9]

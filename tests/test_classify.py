@@ -517,7 +517,7 @@ def test_rules_place_and_score_classifications(session, tmp_path):
     assert classify.inputs[0].source.node_id == "ai_join:r"
     assert classify.spec.scoring == "trie_tree"
     assert classify.spec.expected_inputs == pytest.approx(1.8)
-    assert round(plan.estimated_seconds, 3) == 0.071
+    assert round(plan.estimated_seconds, 3) == 0.063
     assert plan.settings["search_seconds"] == plan.estimated_seconds
     # the query's logical plan is the one the rules left: the
     # classification sits above the join, which carries its stage
@@ -560,7 +560,7 @@ def test_rules_place_and_score_classifications(session, tmp_path):
     (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
     assert (classify.spec.scoring, classify.spec.expected_inputs) == (
         "trie_tree", 30.0)
-    assert round(plan.estimated_seconds, 3) == 0.413
+    assert round(plan.estimated_seconds, 3) == 0.410
 
 
 def test_sql_classifies_the_rows_a_join_keeps(session, tmp_path):

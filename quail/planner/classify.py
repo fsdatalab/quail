@@ -384,13 +384,14 @@ class _Table:
         labels = tuple(
             tuple(self.tokenizer(label_text(letter, prompt.label_prefix)))
             for letter in prompt.letters)
-        block = len(partner_label) + int(round(partner_tokens)) + len(tail) - 1
+        block = int(round(partner_tokens)) + len(tail) - 1
         chains = [
             block + length
             for length in classify_cost.suffix_lengths(LETTERS_SCORING, labels)
         ]
         simulated = classify_cost.estimate_chains(
-            len(head), len(note), chains, live=pairs, lengths=self.lengths,
+            len(head), len(note) + len(partner_label), chains, live=pairs,
+            lengths=self.lengths,
             shared=self.shared, chunk=self.chunk,
             capacity=self.capacity or self.budget, model=self.model,
             device=self.device, resident=True,
