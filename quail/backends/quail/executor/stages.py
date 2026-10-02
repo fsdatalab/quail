@@ -37,6 +37,9 @@ class Stage:
             overriding read_all_rows.
         single: Whether each document has one request that can be packed
             with its prefix and frame as one entry.
+        append: Whether the request's tokens join the document's KV after
+            the frame and any tokens earlier append stages added, so the
+            next append stage reads them instead of feeding them again.
         label: Name displayed in progress messages.
         chains: Optional trie chains and ancestor references from trie_chains().
         canvas: Optional callback from document index to diffusion canvas
@@ -56,6 +59,7 @@ class Stage:
     read_all_rows: bool = False
     read_rows: Any = None
     single: bool = False
+    append: bool = False
     label: str = ""
     chains: list | None = None
     canvas: Callable | None = None
@@ -203,6 +207,8 @@ class _StageExecutor:
                 k > 1 or prefix_tree is not None
                 or any(len(stage.suffixes) != 1 for stage in self.stages)):
             raise ValueError("the unpaged path runs one stage of one suffix")
+        if any(stage.append and not stage.single for stage in self.stages):
+            raise ValueError("an append stage sends one request per document")
         self.prefixes = anchor_prefixes
         # a prefix is built on each access, so its length is read once
         self.prefix_lengths = [len(prefix) for prefix in self.prefixes]
@@ -237,6 +243,18 @@ class _StageExecutor:
                                for frame, stage, rows in zip(
                                    self.frames, self.stages, self.canvas_rows)
                                if stage.single])
+        # an append stage's tokens stay in document pages after the
+        # frame, so admission reserves the frame and every append round
+        for frame, stage in zip(self.frames, self.stages):
+            if stage.append:
+                kept = sum(int(other.lengths.max())
+                           for f, other, s in zip(self.frames, self.suffixes,
+                                                  self.stages)
+                           if s.append and f == frame)
+                self.capacity_extra = max(self.capacity_extra,
+                                          len(frame) + kept)
+        # path tokens each document holds after its frame
+        self.appended = [0] * len(self.prefixes)
 
         resident = ({a: self._held_pages(self.keys[a], self.prefix_lengths[a])
                      for a, key in enumerate(self.keys)
@@ -342,10 +360,14 @@ class _StageExecutor:
 
         specs = []
         entries = []
+        appended = {}
         for a, j, start, end, carried in chunk_groups:
             key = self.keys[a]
             f = self.prefix_lengths[a]
             frame = self.frames[j]
+            append = self.stages[j].append
+            # a written frame replaces any path an earlier stage kept
+            path = 0 if self.writes[j] and start == 0 else self.appended[a]
             parent, shared = ((self.borrowing.parent(a), self.borrowing.shared(a))
                               if carried else (None, 0))
             if self.paged:
@@ -380,6 +402,9 @@ class _StageExecutor:
             # under tree attention a borrowing document with one
             # suffix reads its parent's pages stacked with its siblings
             read_key = self.keys[parent] if shared and self.stages[j].single else None
+            kept = int(sufs.lengths.sum()) if append else 0
+            if append or (self.writes[j] and start == 0):
+                appended[a] = path + kept
             if self.writes[j] and start == 0 and self._merged(j, start, end):
                 # the frame and the one suffix are one entry; the
                 # frame's rows are scattered into KV after the document
@@ -388,7 +413,7 @@ class _StageExecutor:
                     f=f, suffixes=Suffixes(
                         np.concatenate([self.frame_ids[j], sufs.ids]),
                         [len(frame) + int(sufs.lengths[0])]),
-                    write_suffix_tokens=len(frame), single=True,
+                    write_suffix_tokens=len(frame) + kept, single=True,
                     read_all_rows=read_all, **own))
             elif self.writes[j] and start == 0:
                 # frame entry: scatter the frame into KV after the
@@ -401,18 +426,22 @@ class _StageExecutor:
                 specs.append(dict(
                     key=key, prefix=None, f=f + len(frame),
                     suffixes=sufs, read_all_rows=read_all,
+                    write_suffix_tokens=kept,
                     chains=self.stages[j].chains, **own))
             else:
                 specs.append(dict(
                     key=key, prefix=prefix, start=shared, read_key=read_key,
-                    f=f + len(frame),
+                    f=f + len(frame) + path,
                     suffixes=sufs, read_all_rows=read_all,
+                    write_suffix_tokens=kept,
                     single=self.stages[j].single and end - start == 1,
                     chains=self.stages[j].chains, **own))
             entries.append((j, rows))
         chunk = pack_chunk(
             self.torch, self.arena, specs, attention_mode=self.mode,
             staging=self.staging, canvas=self.canvas, answer_row=self.answer_row)
+        for a, tokens in appended.items():
+            self.appended[a] = tokens
         return chunk, entries
 
     def _settle(self, settlement):

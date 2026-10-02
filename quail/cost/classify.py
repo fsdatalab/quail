@@ -34,7 +34,7 @@ def suffix_lengths(scoring: str, labels, canvas_rows: int = 0,
 
     Returns:
         Request lengths in tokens, including the answer cue. Greedy decoding
-        uses the rounded-up mean label length to estimate its round count.
+        feeds one token per round, for as many rounds as the longest label.
 
     Raises:
         ValueError: The scoring method is unknown.
@@ -44,8 +44,7 @@ def suffix_lengths(scoring: str, labels, canvas_rows: int = 0,
     if scoring == TREE_SCORING:
         return [len(label_trie(labels))]
     if scoring == DECODE_SCORING:
-        rounds = math.ceil(sum(len(ids) for ids in labels) / len(labels))
-        return [1 + depth for depth in range(rounds)]
+        return [1] * max(len(ids) for ids in labels)
     raise ValueError(f"unknown label scoring rule {scoring!r}")
 
 
@@ -122,7 +121,8 @@ def simulate(prefixes, frame: int, chains, chunk: int, capacity: int,
         canvas_rows: Number of answer canvas rows. Zero uses suffix rows
             for the readout.
         one_per_round: Whether to send one chain per round and read its last
-            row, instead of sending all chains in one round.
+            row, instead of sending all chains in one round. Each round's
+            tokens stay in KV, so later rounds read them as context.
         shared: Shared prefix length per document. None means no sharing.
 
     Returns:
@@ -131,8 +131,11 @@ def simulate(prefixes, frame: int, chains, chunk: int, capacity: int,
     window = model.sliding_window
     n = len(prefixes)
     shared = [0] * n if shared is None else shared
-    longest = max((length for document in chains for length in document),
-                  default=0)
+    if one_per_round:
+        longest = max(map(sum, chains), default=0)
+    else:
+        longest = max((length for document in chains for length in document),
+                      default=0)
     extra = frame + longest
 
     def round_chains(document, round_):
@@ -151,6 +154,8 @@ def simulate(prefixes, frame: int, chains, chunk: int, capacity: int,
 
     def suffix_work(document, round_):
         prefix = prefixes[document]
+        if one_per_round:
+            prefix += sum(chains[document][:round_])
         # a canvas longer than one row reads the document a second
         # time, in the non-causal call every canvas row runs
         suffixes = stream(prefix + frame, round_chains(document, round_),
@@ -258,7 +263,7 @@ def estimate_chains(head_tokens: int, frame_tokens: int, chains, *,
                     live: float, lengths, shared, chunk: int, capacity: int,
                     model, device, resident: bool = False,
                     canvas_rows: int = 0,
-                    one_per_round: bool = False) -> Simulated:
+                    one_per_round: bool = False, depths=None) -> Simulated:
     """Estimate classification cost from a sample of document lengths.
 
     Args:
@@ -275,6 +280,8 @@ def estimate_chains(head_tokens: int, frame_tokens: int, chains, *,
         resident: Whether document KV is already available.
         canvas_rows: Number of answer canvas rows.
         one_per_round: Whether each request runs in a separate decoder round.
+        depths: Optional rounds per document, given to the sampled
+            documents in turn. None runs every round for every document.
 
     Returns:
         Simulated cost scaled to the expected document count.
@@ -284,7 +291,10 @@ def estimate_chains(head_tokens: int, frame_tokens: int, chains, *,
     # a borrowed prefix includes the prompt head the documents share
     shared_prefixes = [head_tokens + tokens if tokens else 0
                        for _, tokens in documents]
-    return simulate(prefixes, frame_tokens, [chains] * len(prefixes),
+    rounds = ([chains] * len(prefixes) if depths is None
+              else [chains[:depths[i % len(depths)]]
+                    for i in range(len(prefixes))])
+    return simulate(prefixes, frame_tokens, rounds,
                     chunk, capacity, model, device, resident=resident,
                     canvas_rows=canvas_rows, one_per_round=one_per_round,
                     shared=shared_prefixes).scaled(weight)
@@ -325,4 +335,7 @@ def estimate(scoring: str, live: float, head_tokens: int, frame_tokens: int,
         device=device, resident=resident,
         canvas_rows=(canvas_rows if scoring == LETTERS_SCORING
                      else model.canvas_tokens),
-        one_per_round=scoring == DECODE_SCORING)
+        one_per_round=scoring == DECODE_SCORING,
+        # a document stops decoding at its label's last token
+        depths=([len(ids) for ids in labels] if scoring == DECODE_SCORING
+                else None))

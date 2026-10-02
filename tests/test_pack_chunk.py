@@ -66,3 +66,40 @@ def test_a_fresh_single_group_is_one_causal_segment_under_tree(monkeypatch):
         torch, arena, [dict(key=key, prefix=None, f=5, suffixes=[[30]],
                             single=True)], attention_mode="tree")
     assert chunk.meta["reads"]["used"].tolist() == [5]
+
+
+@pytest.mark.parametrize("mode", ["tree", "unified"])
+def test_decode_rounds_keep_each_fed_token_after_the_frame(monkeypatch, mode):
+    cpu_staging(monkeypatch)
+    arena = plain_arena()
+    key = ("d", 3)
+    # a three-token document, a two-token frame, the cue, and room for
+    # two decoded tokens: 3 + 2 + 1 + 2 = 8 rows reserved
+    arena.activate(key, 3, capacity_tokens=8, base_tokens=3)
+    rows = arena.capacity_rows(key)
+
+    def written(chunk):
+        if mode == "tree":
+            return chunk.meta["kv_dst"].tolist()
+        return chunk.meta["unified"]["dst"].tolist()
+
+    # round 0 packs the document, frame, and cue and keeps all six rows
+    chunk = chunk_mod.pack_chunk(
+        torch, arena, [dict(key=key, prefix=[7, 8, 9], f=3,
+                            suffixes=[[91, 92, 93]], write_suffix_tokens=3,
+                            single=True)], attention_mode=mode)
+    assert written(chunk) == rows[:6].tolist()
+    # round 1 feeds one token at position 6, reads the six kept rows,
+    # and keeps it at row 6
+    chunk = chunk_mod.pack_chunk(
+        torch, arena, [dict(key=key, prefix=None, f=6, suffixes=[[40]],
+                            write_suffix_tokens=1, single=True)],
+        attention_mode=mode)
+    assert chunk.positions.tolist() == [6]
+    assert written(chunk) == rows[6:7].tolist()
+    # a kept token past the key's one 16-row page is refused, not dropped
+    with pytest.raises((AssertionError, ValueError)):
+        chunk_mod.pack_chunk(
+            torch, arena, [dict(key=key, prefix=None, f=16, suffixes=[[41]],
+                                write_suffix_tokens=1, single=True)],
+            attention_mode=mode)

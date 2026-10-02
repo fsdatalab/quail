@@ -72,16 +72,17 @@ def test_label_trie_holds_each_proper_prefix_and_ties_go_first():
 def test_greedy_decoder_follows_the_likeliest_child_to_a_label():
     targets = [1, 2, 3, 4]
     decoder = GreedyDecoder(IDS, targets, documents=2)
-    assert decoder.nodes == [(), (1,)] and decoder.rounds == 2
-    # round 0 reads the row after the cue for both documents
+    assert decoder.rounds == 2
+    # round 0 feeds the cue, request 0, for both documents
     assert [decoder.requests(doc) for doc in range(2)] == [[0], [0]]
     assert decoder.tokens == 2
     # document 0 follows token 1, document 1 takes the one-token label 4
     decoder.update(0, np.array([-1.0, -9.0, -9.0, -3.0]))
     decoder.update(1, np.array([-2.0, -9.0, -9.0, -0.5]))
     assert decoder.label.tolist() == [-1, 2]
+    # round 1 feeds only token 1, request 1 plus its target column 0
     assert decoder.requests(1) is None and decoder.requests(0) == [1]
-    assert decoder.tokens == 2 + 2
+    assert decoder.tokens == 2 + 1
     # after token 1, token 3 beats token 2: "refund status"
     decoder.update(0, np.array([-9.0, -5.0, -1.0, -9.0]))
     assert decoder.label.tolist() == [1, 2]
@@ -168,7 +169,8 @@ def test_classifier_decodes_one_token_per_round(monkeypatch):
         label_token_ids=IDS, scoring="trie_decode")
     requests = label_requests(spec)
     assert requests.rounds == 2 and requests.score is None
-    assert requests.suffixes == [[93], [93, 1]] and not requests.read_all_rows
+    assert requests.suffixes == [[93], [1], [2], [3], [4]]
+    assert not requests.read_all_rows
     documents = {"d": [[10, 11], [12], [13]]}
     targets = [1, 2, 3, 4]
     # document 0 wants "refund request", 1 "shipping" outright, 2
@@ -184,15 +186,20 @@ def test_classifier_decodes_one_token_per_round(monkeypatch):
         return -5.0
 
     packed = []
+    path = {}
 
     def forward(chunk):
         rows = []
         for entry in chunk.specs:
             document = entry["key"][2]
             for suffix in entry["suffixes"]:
-                packed.append((document, list(suffix)))
-                seen = tuple(suffix[1:])
-                rows.append([logprob(document, seen, token) for token in targets])
+                packed.append((document, list(suffix), entry["f"],
+                               entry.get("write_suffix_tokens", 0)))
+                # the cue starts the path; a fed token extends it
+                path[document] = (() if suffix[-1] == 93
+                                  else path[document] + tuple(suffix))
+                rows.append([logprob(document, path[document], token)
+                             for token in targets])
         return np.asarray(rows, dtype=np.float32)
 
     monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
@@ -214,14 +221,28 @@ def test_classifier_decodes_one_token_per_round(monkeypatch):
         answer_rows=object(),
         async_answers=object(),
     )
+    arena = state.loaded_model.arena
+    reserved = {}
+    activate = arena.activate
+
+    def recording_activate(key, tokens, capacity_tokens=None, **kw):
+        reserved[key[2]] = capacity_tokens
+        return activate(key, tokens, capacity_tokens=capacity_tokens, **kw)
+
+    monkeypatch.setattr(arena, "activate", recording_activate)
     batch = QuailClassifier(state).classify(spec, [[0], [1], [2]], documents)
     assert list(batch.scores) == ["refund request", "shipping", "refund status"]
-    # document 1 decoded its one-token label in round 0 and sent
-    # nothing more; the others sent the cue and token 1 in round 1
+    # each document reserves its prefix, the two-token frame, and one
+    # kept token per round: the cue and the first label token
+    assert reserved == {0: 3 + 2 + 2, 1: 2 + 2 + 2, 2: 2 + 2 + 2}
+    # round 0 packs the frame and cue after each document (3 tokens for
+    # document 0, 2 for the others) and keeps all three in KV; document
+    # 1 decoded its one-token label there. Round 1 feeds only token 1,
+    # after the kept frame and cue, and keeps it
     assert sorted(packed) == sorted([
-        (0, [91, 92]), (1, [91, 92]), (2, [91, 92]),
-        (0, [93]), (1, [93]), (2, [93]), (0, [93, 1]), (2, [93, 1])])
-    assert batch.suffix_tokens == 3 * 1 + 2 * 2
+        (0, [91, 92, 93], 3, 3), (1, [91, 92, 93], 2, 3),
+        (2, [91, 92, 93], 2, 3), (0, [1], 3 + 3, 1), (2, [1], 2 + 3, 1)])
+    assert batch.suffix_tokens == 3 * 1 + 2 * 1
 
 
 @pytest.fixture()
@@ -454,12 +475,12 @@ def test_planner_prices_the_rules_and_takes_the_cheapest():
     scoring, _ = table.choose(1000, 20, 30, ones, True,
                               lettered=(20, 60, letters[:3]))
     assert scoring == "trie_tree"
-    # fresh documents: a greedy decode sends the cue and then one token
-    # a round, ten tokens over four rounds, and costs least of all
+    # fresh documents: a greedy decode feeds the cue and then one token
+    # a round, kept in KV, four tokens over four rounds, and costs least
     scoring, decoded = table.choose(1000, 20, 30, long_labels, False,
                                     lettered=(20, 60, letters))
     assert scoring == "trie_decode"
-    assert decoded.suffix_tokens == 1000 * (1 + 2 + 3 + 4)
+    assert decoded.suffix_tokens == 1000 * 4
     fresh_trie = table.simulate("trie_tree", 1000, 20, 30, long_labels, False)
     assert decoded.rounds == 4 and decoded.seconds < fresh_trie.seconds
     # a decode cannot end at a label that is another label's prefix

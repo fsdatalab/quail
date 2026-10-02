@@ -70,7 +70,7 @@ class GreedyDecoder:
     """Per-document state for choosing one allowed label token per round.
 
     Each round selects the highest-scoring child of the current trie node.
-    Decoding finishes at a complete category. Nodes are ordered by depth.
+    Decoding finishes at a complete category.
 
     Args:
         label_ids: Token sequence for each category. No complete sequence may
@@ -85,8 +85,6 @@ class GreedyDecoder:
     def __init__(self, label_ids, targets, documents):
         self.label_ids = [tuple(ids) for ids in label_ids]
         self.trie = label_trie(label_ids)
-        self.nodes = sorted(self.trie, key=lambda node: (len(node), node))
-        self.index = {node: i for i, node in enumerate(self.nodes)}
         self.leaf = {}
         for label, ids in enumerate(self.label_ids):
             self.leaf.setdefault(ids, label)
@@ -101,23 +99,27 @@ class GreedyDecoder:
         self.rounds = max(len(ids) for ids in self.label_ids)
         self.node = [()] * documents
         self.label = np.full(documents, -1, dtype=np.int64)
-        self.tokens = 0     # chain tokens requested so far
+        self.tokens = 0     # tokens requested so far
 
     def requests(self, doc):
-        """Return the current trie-node request and count its tokens.
+        """Return the request that feeds the document's next token.
+
+        Round 0 feeds the answer cue. Each later round feeds only the token
+        chosen in the round before; the earlier path is already in KV.
 
         Args:
             doc: Document index.
 
         Returns:
-            A one-element list containing the current node index, or None if
-            the document already has a label.
+            A one-element list holding 0 for the cue, or 1 plus the chosen
+            token's target column, or None if the document already has a
+            label.
         """
         if self.label[doc] >= 0:
             return None
         node = self.node[doc]
-        self.tokens += len(node) + 1
-        return [self.index[node]]
+        self.tokens += 1
+        return [0 if not node else 1 + self.column[node[-1]]]
 
     def update(self, doc, row):
         """Advance a document to its highest-scoring allowed token.

@@ -564,7 +564,8 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                     key=key, fresh=fresh, f=f, row0=row0, start=start,
                     prefix_end=prefix_end, row1=token_count,
                     suffix_spans=(s_row0 + begins, s_row0 + ends),
-                    canvas=bool(n and width)))
+                    canvas=bool(n and width),
+                    keeps=bool(g.get("write_suffix_tokens"))))
             elif not fresh:
                 raise ValueError(
                     "unified attention requires pages for a kept "
@@ -644,6 +645,11 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                     logical_start + count - view.start <= view.rows.numel()
                     for view in views)
                 suffix_total = int((ends - begins).sum())
+                if spec["keeps"] and not direct:
+                    raise ValueError(
+                        f"group {key!r} keeps suffix KV but its pages hold "
+                        f"{views[0].rows.numel()} rows, not "
+                        f"{logical_start + count}")
                 if direct:
                     for pool, view in zip(pools, views):
                         pool.scatter_direct(view, r0, r1, logical_start)

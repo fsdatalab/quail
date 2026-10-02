@@ -2,7 +2,7 @@
 
 Letters scores category letters in one pass. Tree scoring evaluates all
 label token sequences. Greedy decoding chooses one allowed token per
-round. All rounds reuse the document's KV within one AiClassify node.
+round, keeping the chosen path in the document's KV after the frame.
 """
 
 import logging
@@ -26,7 +26,6 @@ from quail.execution.labels import (
 )
 from quail.execution.reranker import RerankerBatch
 from quail.execution.tokens import chain_tokens, prefix_tree
-from quail.labels import label_trie
 from quail.specs.base import CANVAS_ENTROPY_NATS, CANVAS_SEED
 
 logger = logging.getLogger("quail")
@@ -39,15 +38,18 @@ class LabelRequests:
     Attributes:
         frame: Prompt tail tokens before the final answer cue token, written
             once after each document.
-        suffixes: Request token sequences beginning with the answer cue.
+        suffixes: Request token sequences. Scoring rules begin each with the
+            answer cue; greedy decoding has the cue, then one single-token
+            request per target.
         targets: Sorted token IDs returned by the readout.
         read_all_rows: Whether every suffix row is read, rather than its last.
         score: Callback converting one document's readout values to category
             scores. Values have shape (suffixes, rows, targets) when all rows
             are read, otherwise (suffixes, targets). None uses greedy decoding.
         chains: Optional trie chains packed into the sole suffix for tree scoring.
-        rounds: Maximum decoder rounds. Each round requests the chain for the
-            document's current trie node. Zero scores all labels in one stage.
+        rounds: Maximum decoder rounds. Each round feeds one token, kept in
+            the document's KV after the frame. Zero scores all labels in one
+            stage.
     """
 
     frame: list
@@ -93,10 +95,9 @@ def label_requests(spec, targets=None) -> LabelRequests:
             frame, [[cue]], targets, True,
             lambda logprobs: letter_scores(ids, targets, logprobs[0, 0]))
     if spec.scoring == "trie_decode":
-        nodes = sorted(label_trie(ids), key=lambda prefix: (len(prefix), prefix))
         return LabelRequests(
-            frame, [[cue, *node] for node in nodes], targets, False, None,
-            rounds=max(len(label) for label in ids))
+            frame, [[cue], *([token] for token in targets)], targets, False,
+            None, rounds=max(len(label) for label in ids))
     raise ValueError(f"unknown label scoring rule {spec.scoring!r}")
 
 
@@ -249,7 +250,8 @@ class ClassifyStages:
             self.stages.append(Stage(
                 suffixes=request.suffixes, readout=readout,
                 frame=request.frame, requests=ask, decide=round_read,
-                read_all_rows=False, label=f"{spec.name} round {round}"))
+                read_all_rows=False, single=True, append=True,
+                label=f"{spec.name} round {round}"))
 
     def _joined_stages(self, state: QueryExecutionState, spec, count, partners):
         """Initialize one classification stage over the pairs retained by a join."""
