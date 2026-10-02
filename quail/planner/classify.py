@@ -17,8 +17,7 @@ from quail.labels import (
     decodable,
 )
 from quail.logical import (
-    Alias,
-    LabelIn,
+    SemanticClassify,
     label_text,
 )
 from quail.physical import (
@@ -110,16 +109,8 @@ def classify_table(context, alias: str, backend_name: str,
 
 
 def has_label(logical) -> bool:
-    """Return whether a logical plan classifies or tests a label."""
-    operators = logical.operators()
-    return any(
-        isinstance(predicate.expression, LabelIn)
-        for predicates in operators.filters.values()
-        for predicate in predicates
-    ) or any(
-        isinstance(column, Alias) and column.expression.kind == "label"
-        for column in logical.root.columns
-    )
+    """Return whether a logical plan classifies documents or joined rows."""
+    return any(isinstance(node, SemanticClassify) for node in logical.walk())
 
 
 @dataclass(frozen=True)

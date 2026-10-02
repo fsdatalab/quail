@@ -32,6 +32,7 @@ from quail.logical import (
     Alias,
     ColumnRef,
     CompileError,
+    Scan,
     bind_classify_prompt,
 )
 from quail.logical.prompts import join_anchor_note
@@ -45,6 +46,7 @@ from quail.physical import (
     decode_graph,
     encode_graph,
 )
+from quail.planner.logical_rules import push_down_projection
 from quail.planner.plan import EngineConfig, Refusal
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 from quail_b.prompts import AGENT_PROGRESS, AGENT_PROGRESS_DESCRIPTIONS
@@ -393,6 +395,57 @@ def test_sql_classifies_and_tests_labels(session):
             session.sql(bad)
 
 
+def test_frontends_place_classifications_on_their_table(session):
+    # a classification sits above its table's AI.IF filters, below the
+    # first filter on its label; a later classification sits above
+    # that filter
+    query = _chain(session, later_filters=(("kind", ("complaint",)),))
+    query.plan()
+    plan = query.logical
+    kinds = [type(node).__name__ for node in plan.walk()]
+    assert kinds == ["Scan", "SemanticClassify", "SemanticFilter",
+                     "SemanticClassify", "SemanticFilter", "Project"]
+    topic, kind = plan.operators().classifies
+    assert (topic.name, topic.alias, kind.name) == ("topic", "d", "kind")
+    assert [p.expression.call for p in plan.root.input.predicates] == [kind.call]
+    assert plan.operators().labels.tests == {topic.call: [0], kind.call: [1]}
+    # projection pushdown reaches the scan through the classifications
+    assert push_down_projection(plan.root) is plan.root
+    (scan,) = [node for node in plan.walk() if isinstance(node, Scan)]
+    assert scan.columns == ("id", "body")
+    mixed = (session.docs("documents").alias("d")
+             .ai_filter(quail.prompt("Is {0} short?", quail.col("d.body")))
+             .ai_classify(quail.prompt("{0}", quail.col("d.body")), ["a", "b"],
+                          name="x")
+             .label_in("x", ["a"]).select("d.id"))
+    assert [type(node).__name__ for node in mixed.logical.walk()] == [
+        "Scan", "SemanticFilter", "SemanticClassify", "SemanticFilter",
+        "Project"]
+    assert [type(p.expression).__name__
+            for p in mixed.logical.operators().filters["d"]] == [
+        "ModelCall", "LabelIn"]
+    # SQL names a classification only tested after its filter position
+    hidden = session.sql(
+        "SELECT d.id FROM documents d WHERE AI_FILTER(PROMPT('Is {0} short?', "
+        "d.body)) AND AI.CLASSIFY(PROMPT('{0}', d.body), ARRAY['a', 'b']) "
+        "IN ('a')")
+    (node,) = hidden.logical.operators().classifies
+    assert node.name == "__label_d_1"
+    assert [type(node).__name__ for node in hidden.logical.walk()] == [
+        "Scan", "SemanticFilter", "SemanticClassify", "SemanticFilter",
+        "Project"]
+    # a classification the query neither returns nor tests is not planned
+    unused = (session.docs("documents").alias("d")
+              .ai_filter(quail.prompt("Is {0} short?", quail.col("d.body")))
+              .ai_classify(quail.prompt("{0}", quail.col("d.body")), ["a", "b"],
+                           name="x").select("d.id"))
+    assert unused.logical.operators().classifies == ()
+    text = _topic(session).explain()
+    assert "SemanticClassify: topic" in text
+    assert "SemanticFilter" in text.split("SemanticClassify")[0]
+    assert "Project: d.id, topic" in text
+
+
 def test_sql_classifies_the_rows_a_join_keeps(session, tmp_path):
     path = tmp_path / "aspects.parquet"
     pq.write_table(pa.table({"id": [1, 2], "aspect": ["price", "size"]}),
@@ -410,6 +463,10 @@ def test_sql_classifies_the_rows_a_join_keeps(session, tmp_path):
     assert call.kind == "label" and call.aliases() == ("d", "a")
     assert call.prompt.frame == join_anchor_note(0)
     assert call.prompt.tail.startswith("\n\nAnswer with exactly one")
+    # the classification sits above the join of the two tables
+    assert [type(node).__name__ for node in query.logical.walk()] == [
+        "Scan", "Scan", "Join", "SemanticJoin", "SemanticClassify", "Project"]
+    assert query.logical.root.input.call is call
     plan = query.plan()
     (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
     (join,) = [n for n in plan.nodes if isinstance(n, AiJoin)]

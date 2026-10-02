@@ -249,7 +249,7 @@ class Query:
             raise CompileError(
                 f"a filter on a label tests a one-document classification; "
                 f"{name!r} classifies pairs of {call.aliases()}")
-        test = LabelIn(call, tuple(labels), name)
+        test = LabelIn(call, tuple(labels))
         test.validate()
         (alias,) = call.aliases()
         self._filters.setdefault(alias, []).append(
@@ -515,6 +515,15 @@ class Query:
                 continue
             spec = col(c) if isinstance(c, str) else c
             columns.append(self._resolve(spec))
+        # a classification is planned when the query returns or tests
+        # its label
+        tested = {
+            predicate.expression.call
+            for predicates in self._filters.values()
+            for predicate in predicates
+            if isinstance(predicate.expression, LabelIn)}
+        wanted = [column for column in self._labels.values()
+                  if column in columns or column.expression in tested]
         logical = LogicalPlanBuilder()
         for alias, provider in self._tables:
             logical.add_scan(
@@ -523,9 +532,14 @@ class Query:
                 self._doc_columns.get(alias, ""),
                 tuple(self._filters.get(alias, ())),
                 tuple(self._applies.get(alias, ())),
+                tuple((column.expression, column.name) for column in wanted
+                      if column.expression.aliases() == (alias,)),
             )
         for join in self._joins:
             logical.add_join(join)
+        for column in wanted:
+            if len(column.expression.aliases()) == 2:
+                logical.add_classify(column.expression, column.name)
         return logical.project(tuple(columns), self._limit)
 
 

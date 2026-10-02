@@ -44,6 +44,7 @@ from quail.logical import (
     ModelCall,
     Project,
     Scan,
+    SemanticClassify,
     SemanticFilter,
     SemanticJoin,
     oriented_join_conditions,
@@ -66,7 +67,8 @@ FILTER = "AI.IF"
 CLASSIFY = "AI.CLASSIFY"
 LABEL_IN = "IN"
 
-_PRICED_NODES = (Scan, SemanticFilter, Join, SemanticJoin, Project)
+_PRICED_NODES = (Scan, SemanticFilter, SemanticClassify, Join, SemanticJoin,
+                 Project)
 
 
 @dataclass(frozen=True)

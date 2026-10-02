@@ -1,6 +1,5 @@
 """Parse supported Snowflake and BigQuery AI SQL into a LogicalPlan."""
 
-from dataclasses import replace
 from enum import StrEnum
 
 import sqlglot
@@ -686,6 +685,10 @@ def compile_sql(sql: str, catalog: Catalog,
         if tested is not None:
             classify_node, items = tested
             call, options, aliases = b.parse_ai_classify(classify_node)
+            if len(aliases) != 1:
+                raise CompileError(
+                    f"a filter on a label tests a one-document "
+                    f"classification; this one classifies pairs of {aliases}")
             accepted = []
             for item in items:
                 if not (isinstance(item, exp.Literal) and item.is_string):
@@ -744,18 +747,22 @@ def compile_sql(sql: str, catalog: Catalog,
                 f"the same AI expression is projected as "
                 f"{names[0]!r} and {score.name!r}; project it once")
         names.append(score.name)
-    # a filter on a label tests the projected column of the same call
+    # a filter on a label tests the projected column of the same call;
+    # a classification only tested is named after its first test's
+    # position among the alias's filters
     named = {column.expression: column.name for column in projected
              if column.expression.kind == "label"}
+    labels = {}
     for alias, predicates in b.filters.items():
-        b.filters[alias] = [
-            FilterPredicate(
-                expression=replace(predicate.expression,
-                                   name=named[predicate.expression.call]),
-                selectivity=predicate.selectivity)
-            if isinstance(predicate.expression, LabelIn)
-            and predicate.expression.call in named else predicate
-            for predicate in predicates]
+        asks = sum(not isinstance(p.expression, LabelIn) for p in predicates)
+        tests = [p.expression.call for p in predicates
+                 if isinstance(p.expression, LabelIn)]
+        for index, call in enumerate(tests):
+            labels.setdefault(alias, {}).setdefault(
+                call, named.get(call, f"__label_{alias}_{asks + index}"))
+    for call, name in named.items():
+        if len(call.aliases()) == 1:
+            labels.setdefault(call.aliases()[0], {}).setdefault(call, name)
 
     for alias, equalities in conditions.items():
         if any(alias in score.expression.aliases()
@@ -799,12 +806,16 @@ def compile_sql(sql: str, catalog: Catalog,
             provider,
             b.doc_columns.get(alias, ""),
             tuple(b.filters.get(alias, ())),
+            labels=tuple(labels.get(alias, {}).items()),
         )
     for join in b.joins:
         logical.add_join(join)
     for alias in joined_aliases:
         if alias not in claimed:
             logical.add_cross_join(alias)
+    for call, name in named.items():
+        if len(call.aliases()) == 2:
+            logical.add_classify(call, name)
     return logical.project(tuple(columns), limit)
 
 

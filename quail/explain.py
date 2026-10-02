@@ -79,6 +79,12 @@ def logical_tree(logical):
                        f"(selectivity={_selectivity(node.selectivity)})"]
             if node.anchor is not None:
                 title += f" anchor={node.anchor}"
+        elif isinstance(node, logical_nodes.SemanticClassify):
+            title = f"SemanticClassify: {node.name}"
+            if node.probabilities:
+                title += f", {node.name}{logical_nodes.PROBABILITIES_SUFFIX}"
+            details = [f"{_prompt(node.call.prompt)} "
+                       f"labels={list(node.call.labels)}"]
         elif isinstance(node, logical_nodes.Join):
             title = "Join"
             details = ([f"on {condition}" for condition in node.on]

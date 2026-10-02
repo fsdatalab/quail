@@ -178,10 +178,13 @@ class Compare:
 
 @dataclass(frozen=True)
 class LabelIn:
-    """Membership condition on the category returned by AI.CLASSIFY."""
+    """Membership condition on the category returned by AI.CLASSIFY.
+
+    The SemanticClassify that computes the label sits below the
+    SemanticFilter holding this condition.
+    """
     call: ModelCall
     accepted: tuple    # tuple[str, ...], each one of call.labels
-    name: str = ""     # the label column's name, when the query named it
 
     type_name: ClassVar[str] = "quail.label_in"
 
@@ -365,11 +368,17 @@ class SemanticFilter:
     def validate(self) -> None:
         if not self.predicates:
             raise CompileError("SemanticFilter needs at least one predicate")
+        computed = {node.call for node in classifications(self.input)}
         for predicate in self.predicates:
             validate_predicate(predicate.expression)
             if len(model_call(predicate.expression).aliases()) != 1:
                 raise CompileError(
                     "a SemanticFilter predicate reads one table")
+            if isinstance(predicate.expression, LabelIn) \
+                    and predicate.expression.call not in computed:
+                raise CompileError(
+                    "a filter on a label sits above the SemanticClassify "
+                    "that computes the label")
 
     def with_children(self, children: tuple[LogicalNode, ...]):
         if len(children) != 1:
@@ -516,6 +525,114 @@ class SemanticJoin:
         }
 
 
+@dataclass(frozen=True)
+class SemanticClassify:
+    """One AI.CLASSIFY call over its input rows, adding the label column.
+
+    Every input row passes through with its label in the column named
+    ``name``; with ``probabilities`` a second column, ``name`` plus
+    PROBABILITIES_SUFFIX, holds each label's probability. A call over
+    one table sits on that table above its AI.IF SemanticFilter and
+    below any join; a call over two tables sits above the SemanticJoin
+    of the two. A SemanticFilter testing the label with LabelIn sits
+    above this node, and the root Project returns the column through
+    an Alias of the same call.
+    """
+    input: LogicalNode
+    call: ModelCall
+    name: str
+
+    type_name: ClassVar[str] = "quail.semantic_classify"
+
+    @property
+    def probabilities(self) -> bool:
+        """Whether the probabilities column is added beside the label."""
+        return self.call.probabilities
+
+    @property
+    def alias(self) -> str:
+        """The table alias the label column belongs to."""
+        return self.call.aliases()[0]
+
+    def children(self) -> tuple[LogicalNode, ...]:
+        return (self.input,)
+
+    def expressions(self) -> tuple:
+        return (self.call,)
+
+    def output_schema(self) -> tuple[ColumnRef, ...]:
+        fields = self.input.output_schema()
+        provider = next((field.provider for field in fields
+                         if field.alias == self.alias), "")
+        added = [ColumnRef(self.alias, provider, self.name)]
+        if self.probabilities:
+            added.append(ColumnRef(self.alias, provider,
+                                   self.name + PROBABILITIES_SUFFIX))
+        return fields + tuple(added)
+
+    def validate(self) -> None:
+        self.call.validate()
+        if self.call.kind != "label":
+            raise CompileError("SemanticClassify needs an AI.CLASSIFY call")
+        if not self.name or "." in self.name:
+            raise CompileError(
+                f"a classification needs a column name without a dot, "
+                f"got {self.name!r}")
+        aliases = self.call.aliases()
+        if len(aliases) not in (1, 2):
+            raise CompileError(
+                "AI.CLASSIFY reads one document, or one from each side "
+                "of a join")
+        present = {field.alias for field in self.input.output_schema()}
+        missing = set(aliases) - present
+        if missing:
+            raise CompileError(
+                f"the classification reads {sorted(missing)}, which its "
+                f"input does not produce ({sorted(present)})")
+        if any(field.alias == self.alias and field.column == self.name
+               for field in self.input.output_schema()):
+            raise CompileError(f"the name {self.name!r} is already used")
+        if len(aliases) == 2 and not any(
+                isinstance(node, SemanticJoin)
+                and set(model_call(node.predicate).aliases()) == set(aliases)
+                for node in _subtree(self.input)):
+            raise CompileError(
+                f"the classification of {aliases[0]!r} x {aliases[1]!r} "
+                f"joined rows needs a join of the two")
+
+    def with_children(self, children: tuple[LogicalNode, ...]):
+        if len(children) != 1:
+            raise CompileError("SemanticClassify needs one input")
+        return replace(self, input=children[0])
+
+    def with_expressions(self, expressions: tuple):
+        if len(expressions) != 1:
+            raise CompileError("SemanticClassify needs one call")
+        return replace(self, call=expressions[0])
+
+    def explain_fields(self) -> dict:
+        return {
+            "name": self.name,
+            "expression": _explain(self.call),
+            "probabilities": self.probabilities,
+        }
+
+
+def _subtree(node) -> tuple:
+    """Return the node and every node below it, children first."""
+    nodes = []
+    for child in node.children():
+        nodes.extend(_subtree(child))
+    nodes.append(node)
+    return tuple(nodes)
+
+
+def classifications(node) -> tuple:
+    """Return the SemanticClassify nodes at or below a node, children first."""
+    return tuple(found for found in _subtree(node)
+                 if isinstance(found, SemanticClassify))
+
+
 def _explain(expression) -> str:
     if isinstance(expression, Compare):
         return (f"{_explain(expression.call)} {expression.comparison} "
@@ -523,6 +640,9 @@ def _explain(expression) -> str:
     if isinstance(expression, LabelIn):
         return f"{_explain(expression.call)} IN {list(expression.accepted)}"
     if isinstance(expression, Alias):
+        if expression.expression.kind == "label":
+            # the SemanticClassify below computes the column
+            return expression.name
         return f"{_explain(expression.expression)} AS {expression.name}"
     if expression.kind == "label":
         return (f"AI.CLASSIFY({expression.prompt.template!r}, "
@@ -632,9 +752,16 @@ class Project:
     def validate(self) -> None:
         if not self.columns:
             raise CompileError("Project needs at least one column")
+        computed = {(node.call, node.name)
+                    for node in classifications(self.input)}
         for column in self.columns:
             if isinstance(column, Alias):
                 column.validate()
+                if column.expression.kind == "label" \
+                        and (column.expression, column.name) not in computed:
+                    raise CompileError(
+                        f"the label column {column.name!r} needs a "
+                        f"SemanticClassify below the Project")
             elif not isinstance(column, ColumnRef):
                 raise CompileError(
                     f"a projected column is a column reference or a named "
@@ -677,7 +804,8 @@ class LabelWork:
     Attributes:
         calls: (classification call, anchor alias) pairs. Calls used in conditions
             appear first in condition order, followed by calls returned in SELECT.
-        names: Mapping from classification call to its assigned column name.
+        names: Mapping from classification call to its column name, as the
+            SemanticClassify nodes name them.
         tests: Written filter positions for conditions on each classification.
         projected: Mapping from classifications returned in SELECT to column names.
     """
@@ -688,11 +816,11 @@ class LabelWork:
     projected: dict
 
 
-def _label_work(columns, filters) -> LabelWork:
+def _label_work(classifies, columns, filters) -> LabelWork:
     projected = {column.expression: column.name
                  for column in columns
                  if isinstance(column, Alias) and column.expression.kind == "label"}
-    names = dict(projected)
+    names = {node.call: node.name for node in classifies}
     tests = {}
     calls = []
     for alias, predicates in filters.items():
@@ -700,8 +828,6 @@ def _label_work(columns, filters) -> LabelWork:
             test = predicate.expression
             if not isinstance(test, LabelIn):
                 continue
-            names.setdefault(test.call,
-                             test.name or f"__label_{alias}_{position}")
             if test.call not in tests:
                 calls.append((test.call, alias))
             tests.setdefault(test.call, []).append(position)
@@ -738,7 +864,7 @@ class LogicalPlan:
 
     def operators(self) -> "Operators":
         """Return the plan's operators as the planner reads them."""
-        scans, filters, joins, applies = [], {}, [], []
+        scans, filters, joins, applies, classifies = [], {}, [], [], []
         for node in self.walk():
             if isinstance(node, Scan):
                 scans.append(node)
@@ -750,17 +876,18 @@ class LogicalPlan:
                 joins.append(node)
             elif isinstance(node, Apply):
                 applies.append(node)
+            elif isinstance(node, SemanticClassify):
+                classifies.append(node)
+        columns = self.root.columns if isinstance(self.root, Project) else ()
         return Operators(
             scans=tuple(scans),
             filters={alias: tuple(value) for alias, value in filters.items()},
             joins=tuple(joins),
             applies=tuple(applies),
-            projections=tuple(column for column in self.root.columns
-                              if isinstance(column, Alias))
-            if isinstance(self.root, Project) else (),
-            labels=_label_work(
-                self.root.columns if isinstance(self.root, Project) else (),
-                filters),
+            projections=tuple(column for column in columns
+                              if isinstance(column, Alias)),
+            labels=_label_work(classifies, columns, filters),
+            classifies=tuple(classifies),
         )
 
 
@@ -768,9 +895,10 @@ class LogicalPlan:
 class Operators:
     """The operators of one plan, in the order the plan was written.
 
-    ``walk`` lists children before parents, so scans, joins, and
-    applies follow written order and each alias's filters keep the
-    order of their predicates.
+    ``walk`` lists children before parents, so scans, joins, applies,
+    and classifications follow written order and each alias's filters
+    keep the order of their predicates: its AI.IF predicates, then its
+    filters on labels.
     """
     scans: tuple           # tuple[Scan, ...]
     filters: dict          # alias -> tuple[FilterPredicate, ...]
@@ -778,6 +906,7 @@ class Operators:
     applies: tuple         # tuple[Apply, ...]
     labels: LabelWork
     projections: tuple = ()     # named model calls in SELECT order
+    classifies: tuple = ()      # tuple[SemanticClassify, ...]
 
     @property
     def prompts(self) -> tuple:
@@ -874,20 +1003,83 @@ class LogicalPlanBuilder:
         column: str,
         predicates: tuple[FilterPredicate, ...] = (),
         applies: tuple = (),
+        labels: tuple = (),
     ) -> None:
-        """Add one table; applies are (function, kind, ids, columns)."""
+        """Add one table with its filters, applies, and classifications.
+
+        Args:
+            alias: The table's alias in the query.
+            provider: The registered provider name.
+            column: The document column.
+            predicates: The table's filter predicates in written order,
+                AI.IF and filters on labels alike.
+            applies: (function, kind, ids, columns) per apply, in order.
+            labels: (call, name) per one-table classification. One a
+                predicate tests sits below the first filter testing it;
+                the others sit above the last filter, in the order given.
+        """
         if alias in self._nodes:
             raise CompileError(f"duplicate table alias {alias!r}")
+        asks = [p for p in predicates if not isinstance(p.expression, LabelIn)]
+        tests = [p for p in predicates if isinstance(p.expression, LabelIn)]
         node = Scan(provider=provider, alias=alias, column=column)
-        if predicates:
-            node = SemanticFilter(node, tuple(predicates))
+        if asks:
+            node = SemanticFilter(node, tuple(asks))
         for function, kind, ids, columns in applies:
             node = Apply(node, function=function, kind=kind, ids=ids,
                          columns=tuple(columns), aliases=(alias,))
+        names = dict(labels)
+        classified = []
+        pending = []
+        for predicate in tests:
+            call = predicate.expression.call
+            if call not in classified:
+                if call not in names:
+                    raise CompileError(
+                        f"a filter on a label of {alias!r} tests a "
+                        f"classification the query does not name")
+                if pending:
+                    node = SemanticFilter(node, tuple(pending))
+                    pending = []
+                node = SemanticClassify(node, call, names[call])
+                classified.append(call)
+            pending.append(predicate)
+        if pending:
+            node = SemanticFilter(node, tuple(pending))
+        for call, name in labels:
+            if call not in classified:
+                node = SemanticClassify(node, call, name)
+                classified.append(call)
         self._tables.append(alias)
         self._nodes[alias] = node
         if self._root is None:
             self._root = node
+
+    def add_classify(self, call: ModelCall, name: str) -> None:
+        """Classify the rows of the join the call reads.
+
+        The node sits directly above the SemanticJoin over the call's
+        two tables.
+        """
+        aliases = set(call.aliases())
+
+        def insert(node):
+            if isinstance(node, SemanticJoin) \
+                    and set(model_call(node.predicate).aliases()) == aliases:
+                return SemanticClassify(node, call, name)
+            if isinstance(node, (SemanticJoin, SemanticClassify, Apply)):
+                return replace(node, input=insert(node.input))
+            if isinstance(node, Join):
+                return replace(node, left=insert(node.left))
+            raise CompileError(
+                f"the classification of {call.aliases()[0]!r} x "
+                f"{call.aliases()[1]!r} joined rows needs a join of the two")
+
+        if self._root is None or len(aliases) != 2:
+            raise CompileError(
+                "a classification of joined rows reads one document from "
+                "each side of a join")
+        self._root = insert(self._root)
 
     def add_join(self, join: JoinSpec) -> None:
         """Join each new table onto the tree, then ask the prompt.
