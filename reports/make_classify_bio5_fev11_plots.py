@@ -2,7 +2,8 @@ r"""Plot BIO-5 and FEV-11 on Qwen3 4B before and after the trie_decode changes.
 
 One page, four panels: latency, input tokens per second, KV regret,
 and label agreement, for Quail before the changes, Quail after them,
-and stock vLLM, with the SoL estimate as a line. Pull the files, then
+and stock vLLM, with the SoL estimate as a line; a second, wide page
+holds the first three panels side by side. Pull the files, then
 run from the repository root:
 
     W=/tmp/classify-bio5-fev11; mkdir -p "$W"
@@ -32,6 +33,8 @@ from plot_colors import BLUE, DARK, GRAY, ORANGE
 
 HERE = Path(__file__).resolve().parent
 OUT = HERE / "plots" / "classify_bio5_fev11_qwen3_4b.pdf"
+# the slide version: latency, throughput, and KV regret side by side
+SLIDE = HERE / "plots" / "classify_bio5_fev11_qwen3_4b_slide.pdf"
 QUERIES = ["BIO-5", "FEV-11"]
 # (key, legend label, color, files holding its query records)
 METHODS = [
@@ -78,18 +81,18 @@ def load(workdir):
     return rows
 
 
-def label(value, metric):
-    """Format a bar's value label."""
+def label(value, metric, compact=False):
+    """Format a bar's value label; compact drops units and rounds to thousands."""
     if metric == "agreement":
         return f"{value:.1f}%"
     if metric == "seconds":
-        return f"{value:.2f} s"
-    if metric == "tokens_per_second":
-        return f"{value / 1e3:.0f}k"
+        return f"{value:.2f}" if compact else f"{value:.2f} s"
+    if metric == "tokens_per_second" or compact:
+        return f"{value / 1e3:.0f}k" if value >= 1e4 else f"{value / 1e3:.1f}k"
     return f"{value:,.0f}"
 
 
-def panel(axis, rows, metric, title, unit, log, sol=False):
+def panel(axis, rows, metric, title, unit, log, sol=False, compact=False):
     """Draw one metric as grouped bars per query, with an optional SoL line."""
     width = 0.8 / len(METHODS)
     values = [rows[key][q][metric] for key, *_ in METHODS for q in QUERIES]
@@ -107,7 +110,7 @@ def panel(axis, rows, metric, title, unit, log, sol=False):
             x = position - 0.4 + (index + 0.5) * width
             record = rows[key][query]
             value = record[metric]
-            text = label(value, metric)
+            text = label(value, metric, compact)
             # note an engine that left at least 1% of rows unlabeled
             if (metric == "agreement"
                     and record["evaluated"] < 0.99 * record["rows"]):
@@ -115,13 +118,13 @@ def panel(axis, rows, metric, title, unit, log, sol=False):
             axis.bar(x, value, width=width * 0.9, color=color)
             axis.annotate(text, (x, value), xytext=(0, 3),
                           textcoords="offset points", ha="center",
-                          va="bottom", fontsize=9)
+                          va="bottom", fontsize=8 if compact else 9)
     if sol:
         for position, query in zip(POSITIONS, QUERIES):
             value = rows["sol"][query][metric]
             axis.hlines(value, position - 0.42, position + 0.42, color=DARK,
                         linewidth=2, linestyle="--", zorder=3)
-            axis.annotate(f"SoL\n{label(value, metric)}",
+            axis.annotate(f"SoL\n{label(value, metric, compact)}",
                           (position + 0.42, value), xytext=(5, 0),
                           textcoords="offset points", va="center",
                           fontsize=9, color=DARK)
@@ -130,8 +133,65 @@ def panel(axis, rows, metric, title, unit, log, sol=False):
     axis.set_title(title, fontsize=12, loc="left")
 
 
+def legend_handles():
+    """Return the legend entries shared by both pages."""
+    handles = [Patch(facecolor=color, label=name)
+               for _, name, color, _ in METHODS]
+    handles.append(Line2D([0], [0], color=DARK, linewidth=2, linestyle="--",
+                          label="SoL estimate"))
+    return handles
+
+
+def speedups(axis, rows):
+    """Write stock vLLM time over Quail time, and Quail over SoL, per query."""
+    for position, query in zip(POSITIONS, QUERIES):
+        vllm = rows["stock_vllm"][query]["seconds"]
+        now = rows["now"][query]["seconds"]
+        sol = rows["sol"][query]["seconds"]
+        axis.annotate(
+            f"stock vLLM / Quail now: {vllm / now:.2f}x\n"
+            f"Quail now / SoL: {now / sol:.1f}x",
+            (position, axis.get_ylim()[1]), xytext=(0, -6),
+            textcoords="offset points", ha="center", va="top", fontsize=9)
+
+
+def slide(rows):
+    """Write the wide three-panel page for slides."""
+    figure, axes = plt.subplots(1, 3, figsize=(13.33, 4.8))
+    panel(axes[0], rows, "seconds", "Latency (lower is better)", "seconds",
+          log=True, sol=True, compact=True)
+    for position, query in zip(POSITIONS, QUERIES):
+        vllm = rows["stock_vllm"][query]["seconds"]
+        now = rows["now"][query]["seconds"]
+        axes[0].annotate(f"Quail {vllm / now:.2f}x faster than vLLM",
+                         (position, axes[0].get_ylim()[1]), xytext=(0, -6),
+                         textcoords="offset points", ha="center", va="top",
+                         fontsize=10, weight="bold", color=BLUE)
+    panel(axes[1], rows, "tokens_per_second", "Throughput (higher is better)",
+          "input tokens per second", log=True, sol=True, compact=True)
+    panel(axes[2], rows, "regret_tokens", "KV regret (lower is better)",
+          "tokens", log=True, compact=True)
+    figure.suptitle("BIO-5 and FEV-11, Qwen3 4B FP8, sf 0.5, one H100",
+                    y=0.985, fontsize=14, weight="bold")
+    figure.legend(handles=legend_handles(), loc="upper center", ncol=4,
+                  bbox_to_anchor=(0.5, 0.925), fontsize=10, frameon=False)
+    figure.text(
+        0.5, 0.01,
+        "Latency includes planning, not model startup. Throughput is every "
+        "prompt's input tokens over query time. KV regret is fresh tokens "
+        "minus the token minimum; SoL's is 0 and stock vLLM's is "
+        "approximate. SoL: reference-label survivors, unlimited KV.",
+        ha="center", va="bottom", fontsize=8, color="#555555")
+    figure.subplots_adjust(left=0.06, right=0.97, top=0.78, bottom=0.12,
+                           wspace=0.35)
+    with PdfPages(SLIDE) as pdf:
+        pdf.savefig(figure)
+    plt.close(figure)
+    print(SLIDE)
+
+
 def main():
-    """Write the one-page PDF."""
+    """Write the one-page PDF and its slide version."""
     workdir = Path(sys.argv[1])
     plt.style.use(HERE / "quail.mplstyle")
     plt.rcParams["figure.autolayout"] = False
@@ -140,15 +200,7 @@ def main():
     panel(axes[0], rows, "seconds", "Latency: query time with planning, "
           "without model startup (lower is better)", "seconds", log=True,
           sol=True)
-    for position, query in zip(POSITIONS, QUERIES):
-        vllm = rows["stock_vllm"][query]["seconds"]
-        now = rows["now"][query]["seconds"]
-        sol = rows["sol"][query]["seconds"]
-        axes[0].annotate(
-            f"stock vLLM / Quail now: {vllm / now:.2f}x\n"
-            f"Quail now / SoL: {now / sol:.1f}x",
-            (position, axes[0].get_ylim()[1]), xytext=(0, -6),
-            textcoords="offset points", ha="center", va="top", fontsize=9)
+    speedups(axes[0], rows)
     panel(axes[1], rows, "tokens_per_second", "Throughput: every prompt's "
           "input tokens over query time (higher is better)",
           "input tokens per second", log=True, sol=True)
@@ -157,10 +209,7 @@ def main():
           "approximate", "tokens", log=True)
     panel(axes[3], rows, "agreement", "Label agreement with Qwen3 32B "
           "reference labels (higher is better)", "percent", log=False)
-    handles = [Patch(facecolor=color, label=name)
-               for _, name, color, _ in METHODS]
-    handles.append(Line2D([0], [0], color=DARK, linewidth=2, linestyle="--",
-                          label="SoL estimate"))
+    handles = legend_handles()
     figure.suptitle("BIO-5 and FEV-11, Qwen3 4B FP8, sf 0.5, one H100",
                     y=0.985, fontsize=14, weight="bold")
     figure.legend(handles=handles, loc="upper center", ncol=4,
@@ -181,6 +230,7 @@ def main():
         pdf.savefig(figure)
     plt.close(figure)
     print(OUT)
+    slide(rows)
 
 
 if __name__ == "__main__":
