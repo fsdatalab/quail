@@ -104,8 +104,14 @@ def test_forward_warm_runs_a_classification_chunk(monkeypatch):
         warmup, "run_join",
         lambda torch, arena, pipeline, ans, docs, stages, budget, **kw:
         joins.append((stages, kw)))
-    pipeline = SimpleNamespace(tree_attention=False, warm_tokens=())
+    classes = []
+    monkeypatch.setattr(warmup, "_warm_row_classes",
+                        lambda torch, arena, pipeline, mode: classes.append(mode))
+    pipeline = SimpleNamespace(tree_attention=False, warm_tokens=(),
+                               canvas_ids=())
     warmup._forward_warm(None, None, pipeline, None, 2048, join_chunk=True)
+    # the row-count classes run on each attention path the model has
+    assert classes == ["unified"]
     (join, classify) = joins
     assert len(join[0][0]) == 8 and join[1] == {}
     suffixes = classify[0][0]
