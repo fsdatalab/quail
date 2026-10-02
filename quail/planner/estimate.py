@@ -49,7 +49,7 @@ from quail.logical import (
     SemanticJoin,
     oriented_join_conditions,
 )
-from quail.planner.decide import default_order_rule, order_filters_indexed
+from quail.planner.filters import default_order_rule, order_filters_indexed
 from quail.planner.leftdeep import Extension, optimize_left_deep
 from quail.planner.live_rows import PairRelation, exact_live_rows
 from quail.planner.prefixes import document_shared_tokens

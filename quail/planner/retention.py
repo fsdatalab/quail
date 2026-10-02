@@ -16,6 +16,30 @@ def group_sequence(seq):
     return groups
 
 
+def chained_aliases(groups, ask_aliases, barrier_aliases, workers: int) -> set:
+    """Aliases whose filter chain runs in the pipeline of the join anchored on it.
+
+    On one GPU, a chain whose first use is the join anchored on it
+    streams its survivors into that join, so its KV needs no retention
+    pool. A chain a join reads as a partner first, or one a barrier
+    apply cuts, is not chained.
+    """
+    chained = set()
+    partner_before = set()
+    for group in groups:
+        anchor = group[0][1]
+        if workers == 1 and anchor in ask_aliases \
+                and anchor not in chained \
+                and anchor not in partner_before \
+                and anchor not in barrier_aliases:
+            chained.add(anchor)
+        for spec, _ in group:
+            for alias in spec["aliases"]:
+                if alias != anchor and alias not in chained:
+                    partner_before.add(alias)
+    return chained
+
+
 def schedule(seq, live, group_ids=None):
     """Record the next anchor use and conditional survival at each boundary.
 

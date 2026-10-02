@@ -471,11 +471,13 @@ def test_rules_place_and_score_classifications(session, tmp_path):
         push_down_projection,
     )
     from quail.planner.physical_rules import built_in_physical_rules
+    from quail.planner.statistics import undecided
 
     assert [rule.name for rule in built_in_logical_rules()] == [
-        "projection_pushdown", "filter_pushdown", "classify_placement"]
+        "projection_pushdown", "filter_pushdown", "classify_placement",
+        "filter_order", "join_order"]
     assert [rule.name for rule in built_in_physical_rules()] == [
-        "label_scoring", "prefix_sharing", "tree_attention"]
+        "kv_retention", "label_scoring", "prefix_sharing", "tree_attention"]
     plan = _topic(session).plan()
     assert "physical rule label_scoring changed the plan" in plan.remarks
     assert not any("classify_placement" in remark for remark in plan.remarks)
@@ -516,10 +518,12 @@ def test_rules_place_and_score_classifications(session, tmp_path):
     assert round(plan.estimated_seconds, 3) == 0.071
     assert plan.settings["search_seconds"] == plan.estimated_seconds
     # the query's logical plan is the one the rules left: the
-    # classification sits above the join
+    # classification sits above the join, which carries its stage
     lifted = lift_classifications(written)
-    assert after.logical.root == lift_classifications(
+    assert undecided(after.logical.root) == lift_classifications(
         push_down_projection(written))
+    staged = after.logical.root.input.input.input
+    assert (staged.exec_idx, staged.exec_anchor) == (0, "r")
     assert [type(node).__name__ for node in LogicalPlan(lifted).walk()] == [
         "Scan", "Scan", "Join", "SemanticJoin", "SemanticClassify",
         "SemanticFilter", "Project"]

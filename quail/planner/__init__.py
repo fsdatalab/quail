@@ -10,17 +10,15 @@ The names below are the planning interface a model backend uses.
 
 from .decide import (
     balanced_shards,
-    default_order_rule,
     explain,
     hash_join_nodes,
-    join_specs,
-    order_filters_indexed,
     plan_quail,
     plan_query,
-    preamble_tokens,
     refine_plan,
 )
+from .filters import default_order_rule, order_filters_indexed
 from .plan import CorpusStats, EngineConfig, PhysicalPlan, Refusal
+from .statistics import join_specs, preamble_tokens
 
 __all__ = [
     "CorpusStats",

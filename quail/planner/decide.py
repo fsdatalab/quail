@@ -1,13 +1,11 @@
-"""Choose filter order, joins, anchors, and KV retention before execution."""
+"""Build the physical plan of a decided logical plan."""
 
 from dataclasses import replace
 
 from quail.cost import budgets
-from quail.cost.retention import coefficients, retention_pages
-from quail.cost.sol import speed_of_light, unrounded_seconds
-from quail.cost.work import Work, ask, scan
+from quail.cost.sol import speed_of_light
+from quail.cost.work import Work, scan
 from quail.logical import (
-    DEFAULT_SELECTIVITY,
     PROBABILITIES_SUFFIX,
     Alias,
     CompileError,
@@ -16,7 +14,6 @@ from quail.logical import (
     LogicalPlan,
     classified_above_joins,
     effective_selectivity,
-    join_conditions,
     oriented_join_conditions,
 )
 from quail.physical import (
@@ -49,171 +46,22 @@ from quail.planner.classify import (
     classification_refusal,
     classify_table,
 )
+from quail.planner.filters import default_order_rule
 from quail.planner.physical_optimizer import (
     ModelRegion,
     PlanningContext,
     apply_physical_rules,
 )
-from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
+from quail.planner.plan import PhysicalPlan, Refusal
+from quail.planner.statistics import (
+    cached_statistics,
+    filter_orders,
+    filter_works,
+    live_after_filters,
+    question_tokens,
+    sequence_specs,
+)
 from quail.specs import DeviceSpec, ModelSpec
-
-# ---------------------------------------------------------- tree walk
-
-def _question_tokens(prompt, canvas: int = 0) -> int:
-    """Token count of the prompt's per-evaluation tail.
-
-    canvas is the rows a diffusion model appends to every evaluation
-    to answer on; a decoder answers on the tail's last row.
-    """
-    if prompt.tail_tokens is None or prompt.preamble_tokens is None:
-        raise ValueError(
-            "prompts were bound without a tokenizer; the planner "
-            "needs token counts (pass one to compile_sql / docs)")
-    return prompt.tail_tokens + canvas
-
-
-def preamble_tokens(filters, joins) -> int:
-    """Return the engine preamble's token count from any bound prompt."""
-    for fs in filters.values():
-        for p in fs:
-            if p.prompt.preamble_tokens is not None:
-                return p.prompt.preamble_tokens
-    for j in joins:
-        if j.prompt.preamble_tokens is not None:
-            return j.prompt.preamble_tokens
-    return 0
-
-
-# --------------------------------------------------------- filter order
-
-def default_order_rule(filters, joins) -> tuple[str, str]:
-    """Return (rule, source).
-
-    Always 'by_cost'; a predicate without a selectivity is priced with
-    DEFAULT_SELECTIVITY. Pass order="as_written" to keep written order.
-    """
-    missing = any(p.selectivity is None for fs in filters.values()
-                  for p in fs) or any(j.selectivity is None for j in joins)
-    if missing:
-        return "by_cost", (
-            "default: by cost, with selectivity "
-            f"{DEFAULT_SELECTIVITY:g} for predicates without one")
-    return "by_cost", "default: by cost"
-
-
-def filter_cost(predicate, prefix_tokens: float, model: ModelSpec,
-                device: DeviceSpec, chunk_tokens: int, *, first: bool) -> float:
-    """Return ideal time for one filter evaluation."""
-    operation = scan if first else ask
-    work = operation(prefix_tokens,
-                     _question_tokens(predicate.prompt, model.canvas_tokens),
-                     window=model.sliding_window)
-    return unrounded_seconds(work, model, device, chunk_tokens)
-
-
-def order_filters_indexed(predicates, rule: str, *, prefix_tokens: float,
-                          model: ModelSpec, device: DeviceSpec,
-                          chunk_tokens: int):
-    """Return written positions of predicates in execution order.
-
-    'by_cost' minimizes ideal expected time. It sorts the asks once,
-    then prices each predicate as the first scan. Written order breaks
-    ties.
-    """
-    idx = list(range(len(predicates)))
-    if rule == "as_written":
-        return idx
-
-    def selectivity(i):
-        return effective_selectivity(predicates[i].selectivity)
-
-    ask_costs = [
-        filter_cost(p, prefix_tokens, model, device, chunk_tokens,
-                    first=False)
-        for p in predicates
-    ]
-    scan_costs = [
-        filter_cost(p, prefix_tokens, model, device, chunk_tokens,
-                    first=True)
-        for p in predicates
-    ]
-
-    def score(i):
-        killed = 1.0 - selectivity(i)
-        if killed <= 0:
-            return float("inf")
-        return ask_costs[i] / killed
-
-    ask_order = sorted(idx, key=score)
-    prefix_live = [1.0]
-    prefix_cost = [0.0]
-    for i in ask_order:
-        prefix_cost.append(
-            prefix_cost[-1] + prefix_live[-1] * ask_costs[i])
-        prefix_live.append(prefix_live[-1] * selectivity(i))
-
-    total_ask_cost = prefix_cost[-1]
-    candidates = []
-    for position, first in enumerate(ask_order):
-        expected = (
-            scan_costs[first]
-            + selectivity(first) * prefix_cost[position]
-            + total_ask_cost - prefix_cost[position + 1]
-        )
-        candidates.append((expected, first))
-
-    first = min(candidates)[1]
-    return [first, *(i for i in ask_order if i != first)]
-
-
-def order_filters(predicates, rule: str, *, prefix_tokens: float,
-                  model: ModelSpec, device: DeviceSpec,
-                  chunk_tokens: int):
-    return [predicates[i] for i in order_filters_indexed(
-        predicates, rule, prefix_tokens=prefix_tokens,
-        model=model, device=device, chunk_tokens=chunk_tokens)]
-
-
-def _join_aliases(join) -> list:
-    """Return the join's table aliases in placeholder order."""
-    return [r.alias for r in join.prompt.args]
-
-
-def _label_counts(join) -> dict:
-    """Return alias -> (block_label_tokens, anchor_frame_tokens)."""
-    out = {a: (lt, nt) for a, lt, nt in join.prompt.labels}
-    if any(lt is None for lt, _ in out.values()):
-        raise ValueError(
-            "join prompts were bound without a tokenizer; the planner "
-            "needs token counts (pass one to compile_sql / docs)")
-    return out
-
-
-def join_specs(joins, pair_fractions=None, canvas: int = 0) -> list:
-    """The joins as the search's spec dicts, in written order.
-
-    pair_fractions maps a written position to the fraction of the
-    cross product its equality conditions keep; a join with
-    conditions but no entry is priced as the full cross product.
-    canvas is the rows a diffusion model appends to every pair.
-    """
-    pair_fractions = pair_fractions or {}
-    out = []
-    for i, j in enumerate(joins):
-        labels = _label_counts(j)
-        conditions = join_conditions(j)
-        out.append(dict(
-            written_pos=i, aliases=_join_aliases(j), anchor=j.anchor,
-            anchor_free=(j.anchor is None and j.semantics == "full"),
-            semantics=j.semantics, selectivity=j.selectivity,
-            frame_tokens={a: nt for a, (lt, nt) in labels.items()},
-            label_tokens={a: lt for a, (lt, nt) in labels.items()},
-            tail_tokens=_question_tokens(j.prompt, canvas),
-            on=[(c.left.alias, c.left.column, c.right.alias, c.right.column)
-                for c in conditions],
-            pair_fraction=(pair_fractions.get(i, 1.0) if conditions
-                           else 1.0)))
-    return out
 
 
 def hash_join_nodes(joins, pair_fractions, scan_ports) -> list:
@@ -247,20 +95,6 @@ def hash_join_nodes(joins, pair_fractions, scan_ports) -> list:
             pair_fraction=pair_fractions.get(position, 1.0)))
     return nodes
 
-
-def _filter_alias_work(preds, stats, order, pre: int,
-                       canvas: int = 0, window: int = 0) -> Work:
-    """Expected Work of one filter chain: a scan, then asks over KV."""
-    total = Work()
-    mean = stats.mean_doc_tokens
-    n = float(stats.n_docs)
-    for si, predicate_index in enumerate(order):
-        p = preds[predicate_index]
-        q = _question_tokens(p.prompt, canvas)
-        op = scan if si == 0 else ask
-        total = total + op(pre + mean, q, window=window) * n
-        n *= effective_selectivity(p.selectivity)
-    return total
 
 
 def node_estimates(graph, *, filter_works, stage_works, live, stats, pre,
@@ -364,15 +198,18 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                 device: DeviceSpec, doc_tokens: dict, gpus: int = 1,
                 order: str | None = None, pair_fractions=None,
                 context: PlanningContext | None = None):
-    """Compile a LogicalPlan into a PhysicalPlan or Refusal.
+    """Compile a decided LogicalPlan into a PhysicalPlan or Refusal.
 
-    The logical rules have placed each classification: a one-table
-    classification above a SemanticJoin runs after the joins, over the
-    documents the joins matched; one on its table runs after the
-    table's AI.IF filters. Each classification's scoring rule is left
-    for the label_scoring physical rule, so the estimate and
-    ``search_seconds`` count the filters, the joins, and the
-    classifications of joined rows only.
+    The logical rules have made every choice the plan records: each
+    table's filter order, the joins' stage order and anchors, and
+    where each classification sits. A one-table classification above
+    a SemanticJoin runs after the joins, over the documents the joins
+    matched; one on its table runs after the table's AI.IF filters. A
+    plan without recorded orders and anchors runs as written. Each
+    classification's scoring rule is left for the label_scoring
+    physical rule and which KV stays resident for kv_retention, so the
+    estimate and ``search_seconds`` count the filters, the joins, and
+    the classifications of joined rows only.
 
     Args:
         plan: The logical plan to compile.
@@ -381,7 +218,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
         doc_tokens: alias -> list of per-document token counts.
         gpus: GPU count; one model copy runs per GPU.
         order: Stage order rule, 'by_cost' or 'as_written'; None picks
-            the default rule.
+            the default rule. Reported in the plan's settings.
         pair_fractions: join written position -> the fraction of the
             cross product its equality conditions keep.
         context: The planning context, needed when the plan classifies
@@ -390,26 +227,9 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     Returns:
         A PhysicalPlan, or a Refusal explaining why the query cannot run.
     """
-    return _assemble(
-        plan, model=model, device=device, doc_tokens=doc_tokens, gpus=gpus,
-        order=order, pair_fractions=pair_fractions, context=context)
-
-
-def _assemble(plan: LogicalPlan, *, model: ModelSpec,
-              device: DeviceSpec, doc_tokens: dict, gpus: int = 1,
-              order: str | None = None, pair_fractions=None,
-              context: PlanningContext | None = None):
-    """Build the physical plan of one logical plan, as placed."""
     operators = plan.operators()
     scans, filters, joins = operators.scans, operators.filters, operators.joins
     applies = operators.applies
-    # AI.IF predicates by written position; filters on labels and projected
-    # labels are classification work after the AI.IF chain
-    asks = {alias: [position for position, predicate in enumerate(predicates)
-                    if not isinstance(predicate.expression, LabelIn)]
-            for alias, predicates in filters.items()}
-    ask_filters = {alias: [filters[alias][position] for position in positions]
-                   for alias, positions in asks.items() if positions}
     labels = operators.labels
     classified = {alias for _, alias in labels.calls}
     after_joins = classified_above_joins(plan.root)
@@ -447,17 +267,6 @@ def _assemble(plan: LogicalPlan, *, model: ModelSpec,
                      "use apply_table() or set gpus=1",),
             constraint="per_batch_apply_needs_one_gpu",
             needed=1, available=gpus, unit="gpus")
-    length_stats = {a: joinsearch.summarize_alias(t, model.sliding_window)
-                    for a, t in doc_tokens.items()}
-    stats = {
-        a: CorpusStats(n_docs=s.count, total_tokens=s.total,
-                       max_doc_tokens=s.maximum)
-        for a, s in length_stats.items()
-    }
-    for s in scans:
-        if s.alias not in stats:
-            raise ValueError(f"no doc_tokens for alias {s.alias!r}")
-    remarks = []
 
     # ---- refusals first
     weight_gpus = budgets.minimum_weight_gpus(model, device)
@@ -471,65 +280,28 @@ def _assemble(plan: LogicalPlan, *, model: ModelSpec,
             needed=weight_gpus, available=1, unit="cards")
     workers = gpus
 
-    chunk = budgets.chunk_budget(model, device)
-    # the longest documents bind the sliding-pool split
-    longest_mean = max(
-        (st.mean_doc_tokens for st in stats.values()), default=None)
-    arena_split = budgets.arena_pages(model, device, chunk, longest_mean)
-    admission = arena_split[0] * budgets.PAGE_TOKENS
-    pre = preamble_tokens(ask_filters, joins)
-    specs = join_specs(joins, pair_fractions, model.canvas_tokens)
-
-    # ---- the order rule first: the search below needs it
+    statistics = cached_statistics(
+        plan, {} if context is None else context.memo, model=model,
+        device=device, doc_tokens=doc_tokens, pair_fractions=pair_fractions)
+    stats, chunk, pre = statistics.stats, statistics.chunk, statistics.pre
+    specs = statistics.specs
+    asks = statistics.asks
+    ask_filters = {alias: [filters[alias][position] for position in positions]
+                   for alias, positions in asks.items() if positions}
     rule, source = (order, f"user: order={order!r}") if order else \
         default_order_rule(filters, joins)
-    fixed = rule == "as_written"
-    filter_orders = {
-        alias: [asks[alias][index] for index in order_filters_indexed(
-            ask_filters[alias], rule,
-            prefix_tokens=pre + stats[alias].mean_doc_tokens,
-            model=model, device=device, chunk_tokens=chunk)]
-        if alias in ask_filters else []
-        for alias in filters
-    }
+    orders = filter_orders(plan)
 
-    # ---- expected live counts after filters, and the fixed filter
-    # work every candidate join plan shares
-    live0 = {a: float(st.n_docs) for a, st in stats.items()}
-    for alias, fs in filters.items():
-        surv = 1.0
-        for p in fs:
-            # a filter on a label after the joins thins nothing before them
-            if alias in after_joins and isinstance(p.expression, LabelIn):
-                continue
-            surv *= effective_selectivity(p.selectivity)
-        live0[alias] *= surv
-    filter_works = {
-        alias: _filter_alias_work(preds, stats[alias], filter_orders[alias],
-                                  pre, model.canvas_tokens, model.sliding_window)
-        for alias, preds in filters.items()
-    }
-    base_work = sum(filter_works.values(), Work())
+    # ---- expected live counts after filters, and the filter work
+    # every stage's price sits on
+    live0 = live_after_filters(plan, statistics)
+    works = filter_works(plan, statistics, model)
+    base_work = sum(works.values(), Work())
 
-    cap_pages = retention_pages(admission, chunk, budgets.PAGE_TOKENS)
-    costs = coefficients(model, device)
-    # KV reuse is priced as unlimited
-    filtered = set(filters)
-
-    def run_search(honor_forced=True):
-        found = joinsearch.search_joins(
-            specs, live0, length_stats, filtered, pre,
-            chunk, model, device, base_work=base_work,
-            fixed_order=fixed, honor_forced=honor_forced)
-        if found is None:
-            found = joinsearch.search_joins(
-                specs, live0, length_stats, filtered, pre, chunk, model,
-                device, base_work=base_work, fixed_order=True,
-                honor_forced=honor_forced)
-        return found
-
-    found = run_search()
-    seq = [(specs[position], anchor) for position, anchor in found["seq"]]
+    # ---- the stages as decided: their work and expected tuples
+    seq = sequence_specs(plan, statistics)
+    stage_work, stage_records = joinsearch.walk(
+        seq, live0, statistics.lengths, set(filters), pre, model, device)
     # a second group on the same anchor gets :2, a third :3
     sequence_groups = retention.group_sequence(seq)
     group_ids = []
@@ -545,7 +317,6 @@ def _assemble(plan: LogicalPlan, *, model: ModelSpec,
         seen_ids[key] = seen_ids.get(key, 0) + 1
         return key if seen_ids[key] == 1 else f"{key}:{seen_ids[key]}"
 
-    retention_plan = retention.schedule(seq, live0, group_ids)
     # a chain streams only into its alias's first use, and never through
     # a barrier apply
     barrier_aliases = {alias for alias, group in alias_applies.items()
@@ -556,48 +327,13 @@ def _assemble(plan: LogicalPlan, *, model: ModelSpec,
             if any(apply.kind == "barrier"
                    for apply in join_applies.get(spec["written_pos"], ())):
                 barrier_aliases.add(anchor)
-    # a chain whose first use is the join anchored on it runs in that
-    # join's pipeline, on one GPU; such a chain's KV needs no
-    # retention pool
-    between = classified - after_joins
-    chained = set()
-    partner_before = set()
-    for group in sequence_groups:
-        anchor = group[0][1]
-        if workers == 1 and anchor in ask_filters \
-                and anchor not in chained \
-                and anchor not in partner_before \
-                and anchor not in barrier_aliases:
-            chained.add(anchor)
-        for spec, _ in group:
-            for alias in spec["aliases"]:
-                if alias != anchor and alias not in chained:
-                    partner_before.add(alias)
-    retention_plan["initial"] = {
-        alias: use for alias, use in retention_plan["initial"].items()
-        if alias not in chained
-    }
-    retention_plan.update(**costs, cap_pages=cap_pages)
-    forced = sorted({s["anchor"] for s in specs
-                     if s["semantics"] == "full"
-                     and not s["anchor_free"]})
-    if forced:
-        free = run_search(honor_forced=False)
-        honored_s = speed_of_light(
-            base_work + found["work"], model, device, chunk).seconds
-        free_s = speed_of_light(
-            base_work + free["work"], model, device, chunk).seconds
-        if free_s < honored_s:
-            remarks.append(
-                f"anchors {forced} were forced; a free choice prices "
-                f"lower ({free_s:.3f} vs {honored_s:.3f} predicted "
-                f"seconds)")
-    stage_records = found["records"]
+    chained = retention.chained_aliases(
+        sequence_groups, set(ask_filters), barrier_aliases, workers)
 
     # ---- refusal checks on the predicted plan
-    anchors = {wp: a for wp, a in found["seq"]}
+    anchors = {spec["written_pos"]: anchor for spec, anchor in seq}
     for s in scans:
-        fq = max((_question_tokens(p.prompt, model.canvas_tokens)
+        fq = max((question_tokens(p.prompt, model.canvas_tokens)
                   for p in ask_filters.get(s.alias, ())), default=None)
         if fq is None:
             continue
@@ -649,37 +385,32 @@ def _assemble(plan: LogicalPlan, *, model: ModelSpec,
 
     # aliases whose filter chain runs in one pipeline with the
     # classification or join after it
+    between = classified - after_joins
     pipelined = chained | {
         alias for alias in ask_filters if workers == 1 and alias in between}
 
     def emit_filter(alias):
-        order_idx = filter_orders[alias]
         n = stats[alias].n_docs
         stages, surv = [], 1.0
-        for i in order_idx:
+        for i in orders[alias]:
             p = filters[alias][i]
             stages.append(FilterStage(
                 written_pos=i,
-                question_tokens=_question_tokens(p.prompt, model.canvas_tokens),
+                question_tokens=question_tokens(p.prompt, model.canvas_tokens),
                 preamble_tokens=p.prompt.preamble_tokens,
                 selectivity=p.selectivity,
                 expected_docs=round(n * surv, 1)))
             surv *= effective_selectivity(p.selectivity)
-        keep = alias in retention_plan["initial"]
-        # a chain the classification or join of its alias follows in
-        # one pipeline reads the KV it wrote
-        writes = len(stages) > 1 or keep or alias in pipelined
+        # a later stage, or the classification or join of its alias in
+        # the same pipeline, reads the KV the chain wrote
+        writes = len(stages) > 1 or alias in pipelined
         fid = f"ai_filter:{alias}"
         nodes.append(AiFilter(
             node_id=fid,
             inputs=input_ports((ids_src[alias],)),
-            alias=alias, arena_writes=writes, keep_kv=keep,
+            alias=alias, arena_writes=writes,
             stages=tuple(stages)))
         ids_src[alias] = PortRef(fid, f"ids:{alias}")
-        if not writes:
-            remarks.append(
-                f"filter on {alias!r}: arena writes off (one "
-                f"stage - nothing reads the KV again)")
         emit_applies(alias)
 
     def emit_applies(alias):
@@ -838,7 +569,6 @@ def _assemble(plan: LogicalPlan, *, model: ModelSpec,
                                + tuple(pair_inputs)),
             anchor=anchor,
             anchor_resident=group[0][1]["resident"],
-            keep_anchor_kv=anchor in retention_plan["after"][gid],
             stages=tuple(stage_dicts)))
         ids_src[anchor] = PortRef(gid, f"ids:{anchor}")
 
@@ -920,26 +650,25 @@ def _assemble(plan: LogicalPlan, *, model: ModelSpec,
             count=plan.root.limit,
         ))
 
-    estimate = (speed_of_light(base_work + found["work"], model, device,
+    estimate = (speed_of_light(base_work + stage_work, model, device,
                                chunk).seconds + _classify_seconds(nodes))
     stage_works = {record["written_pos"]: record["work"]
-                   for record in found["records"]}
+                   for record in stage_records}
 
     def estimator(graph):
         return node_estimates(
-            graph, filter_works=filter_works, stage_works=stage_works,
-            live=live0, stats=stats, pre=pre, cap_pages=cap_pages,
+            graph, filter_works=works, stage_works=stage_works,
+            live=live0, stats=stats, pre=pre, cap_pages=statistics.cap_pages,
             model=model, device=device, chunk=chunk)
 
     return PhysicalPlan(
         model=model.name, device=device.name, workers=workers,
         backend="quail", estimated_seconds=estimate,
-        nodes=tuple(nodes), remarks=tuple(remarks),
+        nodes=tuple(nodes),
         settings={
             "chunk_tokens": chunk,
-            "arena_pages": list(arena_split),
-            "admission_tokens": admission,
-            "retention": retention_plan,
+            "arena_pages": list(statistics.arena_pages),
+            "admission_tokens": statistics.admission,
             "order_rule": rule,
             "order_source": source,
             "search_seconds": estimate,
@@ -957,7 +686,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
                order: str | None = None, backend: str = "quail",
                registry=None, tokenizer=None, pair_fractions=None,
                canvas_draws: int = 4,
-               attention: str | None = None, remarks=()):
+               attention: str | None = None, remarks=(), memo=None):
     """Plan one query with the selected model backend.
 
     Args:
@@ -980,6 +709,8 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
             cross product its equality conditions keep.
         remarks: The logical rules' remarks, placed before the
             physical planner's.
+        memo: Results the logical rules computed for this plan, such
+            as its statistics, for the physical planner to reuse.
 
     Returns:
         A PhysicalPlan, or a Refusal explaining why the query cannot run.
@@ -1025,6 +756,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         tokenizer=tokenizer,
         pair_fractions=dict(pair_fractions or {}),
         logical_plan=plan,
+        memo={} if memo is None else memo,
     )
     region = ModelRegion(plan)
     candidates = tuple(selected.plan(region, context))
@@ -1102,7 +834,8 @@ def _apply_rules(plan, rules, context, when: str):
         graph, changed = apply_physical_rules(plan.graph, rules, context)
     except ClassifyRefusedError as refused:
         return refused.refusal()
-    if not changed:
+    if not changed and not context.remarks \
+            and context.settings == dict(plan.settings):
         return plan
     # a rule that re-estimates a classification moves the plan's total
     # by the same amount

@@ -1,5 +1,9 @@
 """Built in physical optimizer rules.
 
+- kv_retention: the KV later operators read stays resident, within
+  the retention pool's page cap: a filter chain keeps its survivors'
+  KV for a join anchored on its table, and a join keeps its anchor's
+  KV for a later group on the same anchor.
 - label_scoring: each classification gets the label scoring rule
   (letters, trie_tree, or trie_decode) whose simulated time is lowest.
 - prefix_sharing: documents that share a token prefix with another
@@ -14,6 +18,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from quail.cost.budgets import choose_attention_path
+from quail.cost.retention import coefficients
 from quail.execution.pipelines import build_pipelines
 from quail.logical import classified_above_joins
 from quail.physical import (
@@ -24,7 +29,86 @@ from quail.physical import (
     Foreign,
     PhysicalGraph,
 )
+from quail.planner import retention
 from quail.planner.prefixes import document_shared_tokens, page_tree
+from quail.planner.statistics import cached_statistics, live_after_filters
+
+
+class KvRetention:
+    """Keep the KV later operators read resident, within the page cap.
+
+    The schedule (quail.planner.retention.schedule) records, at each
+    execution boundary, which aliases a later stage anchors on and how
+    likely each document is to survive to that use; the executor's
+    retention pool pins their KV by that priority, up to the pool's
+    page cap. A filter chain keeps its survivors' KV (keep_kv) when a
+    later join anchors on its table, unless the chain streams into
+    that join in one pipeline on one GPU; a join keeps its anchor's KV
+    (keep_anchor_kv) when a later group anchors on the same table. A
+    chain writes KV pages only when something reads them: a later
+    stage, the next operator of its pipeline, or the retention pool;
+    the rule remarks on a chain that writes none.
+
+    Fires once, when the plan is first made: it reads the logical plan
+    on the context and leaves a plan that has a schedule alone, so a
+    later pass over exact tokens keeps the schedule the plan was made
+    with. The schedule, the retention coefficients, and the cap go in
+    the plan's ``retention`` setting.
+    """
+
+    name = "kv_retention"
+
+    def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
+        if context is None or context.logical_plan is None \
+                or "retention" in context.settings:
+            return None
+        logical = context.logical_plan
+        statistics = cached_statistics(
+            logical, context.memo, model=context.model, device=context.device,
+            doc_tokens=context.document_tokens,
+            pair_fractions=context.pair_fractions)
+        joins = [node for node in graph.nodes if isinstance(node, AiJoin)]
+        groups = [[(statistics.specs[stage.written_pos], stage.anchor)
+                   for stage in node.stages] for node in joins]
+        schedule = retention.schedule(
+            [stage for group in groups for stage in group],
+            live_after_filters(logical, statistics),
+            [node.node_id for node in joins])
+        ask_aliases = {node.alias for node in graph.nodes
+                       if isinstance(node, AiFilter)}
+        barriers = [node for node in graph.nodes
+                    if isinstance(node, Foreign) and node.kind == "barrier"]
+        barrier_aliases = {node.aliases[0] for node in barriers
+                           if node.ids != "pairs"}
+        for node in joins:
+            positions = {stage.written_pos for stage in node.stages}
+            if any(barrier.ids == "pairs" and barrier.written_pos in positions
+                   for barrier in barriers):
+                barrier_aliases.add(node.anchor)
+        chained = retention.chained_aliases(
+            groups, ask_aliases, barrier_aliases, context.gpu_count)
+        schedule["initial"] = {
+            alias: use for alias, use in schedule["initial"].items()
+            if alias not in chained
+        }
+        schedule.update(**coefficients(context.model, context.device),
+                        cap_pages=statistics.cap_pages)
+        nodes = []
+        for node in graph.nodes:
+            if isinstance(node, AiFilter):
+                keep = node.alias in schedule["initial"]
+                writes = node.arena_writes or keep
+                if not writes:
+                    context.remarks.append(
+                        f"filter on {node.alias!r}: arena writes off (one "
+                        f"stage - nothing reads the KV again)")
+                node = replace(node, keep_kv=keep, arena_writes=writes)
+            elif isinstance(node, AiJoin):
+                node = replace(node, keep_anchor_kv=(
+                    node.anchor in schedule["after"][node.node_id]))
+            nodes.append(node)
+        context.settings["retention"] = schedule
+        return PhysicalGraph(tuple(nodes), graph.root)
 
 
 class LabelScoring:
@@ -297,5 +381,12 @@ class TreeAttention:
 
 
 def built_in_physical_rules() -> tuple:
-    """Return the physical rules registered with the built in registry."""
-    return (LabelScoring(), PrefixSharing(), TreeAttention())
+    """Return the physical rules registered with the built in registry.
+
+    In order: kv_retention, label_scoring, prefix_sharing, and
+    tree_attention. prefix_sharing follows kv_retention because it
+    weighs the page writes a chain already makes, and tree_attention
+    follows prefix_sharing because a filter's attention path depends
+    on the prefixes it shares.
+    """
+    return (KvRetention(), LabelScoring(), PrefixSharing(), TreeAttention())

@@ -73,12 +73,18 @@ def logical_tree(logical):
             details = [f"{_prompt(p.prompt)} "
                        f"(selectivity={_selectivity(p.selectivity)})"
                        for p in node.predicates]
+            if node.order:
+                title += " order=" + ",".join(
+                    str(position + 1) for position in node.order)
         elif isinstance(node, logical_nodes.SemanticJoin):
             title = f"SemanticJoin ({node.semantics})"
             details = [f"{_prompt(node.prompt)} "
                        f"(selectivity={_selectivity(node.selectivity)})"]
             if node.anchor is not None:
                 title += f" anchor={node.anchor}"
+            if node.exec_idx is not None:
+                title += (f" stage={node.exec_idx + 1}"
+                          f" exec_anchor={node.exec_anchor}")
         elif isinstance(node, logical_nodes.SemanticClassify):
             title = f"SemanticClassify: {node.name}"
             if node.probabilities:

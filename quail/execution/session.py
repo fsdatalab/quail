@@ -702,7 +702,7 @@ class Query:
                 registry=self.session.registry,
                 tokenizer=self.session.tokenizer,
                 pair_fractions=pair_fractions,
-                remarks=remarks)
+                remarks=remarks, memo=context.memo)
             extra = {}
             if config.gpu_timing:
                 extra["gpu_timing"] = True

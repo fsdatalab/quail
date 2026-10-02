@@ -1,17 +1,21 @@
 """Price a logical plan as the Quail planner would run it.
 
 A cost-based logical rule compares candidate plans by the estimated
-seconds of the physical plan each would get: the Quail planner's
-plan, with the label_scoring rule applied so every classification's
-scoring rule is counted. The plans are memoized on the logical
-planning context by their root, so two rules pricing the same
-candidate, or one rule pricing it on a later pass, build it once.
+seconds of the physical plan each would get: the filter_order and
+join_order rules decide the candidate's filter orders, stage order,
+and anchors, the Quail planner builds the physical plan, and the
+label_scoring rule picks each classification's scoring rule so its
+seconds are counted. The plans are memoized on the logical planning
+context by the candidate's root with those decisions cleared, so two
+rules pricing the same candidate, or one rule pricing it on a later
+pass, build it once.
 """
 
 from __future__ import annotations
 
 from quail.logical import LogicalPlan
 from quail.planner.decide import _apply_rules, plan_quail
+from quail.planner.logical_optimizer import apply_logical_rules
 from quail.planner.physical_rules import LabelScoring
 from quail.planner.plan import Refusal
 
@@ -29,11 +33,19 @@ def physical_plan(logical: LogicalPlan, context):
     Returns:
         A PhysicalPlan, or a Refusal when the plan cannot run.
     """
-    key = ("physical_plan", logical.root)
+    from dataclasses import replace
+
+    from quail.planner.logical_rules import FilterOrder, JoinOrder, undecided
+
+    key = ("physical_plan", undecided(logical.root))
     if key not in context.memo:
-        physical_context = context.physical_context(logical)
+        # the candidate's own remarks are not the plan's
+        decided, _ = apply_logical_rules(
+            logical, (FilterOrder(), JoinOrder()),
+            replace(context, remarks=[]))
+        physical_context = context.physical_context(decided)
         physical = plan_quail(
-            logical, model=context.model, device=context.device,
+            decided, model=context.model, device=context.device,
             doc_tokens=context.document_tokens, gpus=context.gpu_count,
             order=context.order, pair_fractions=context.pair_fractions,
             context=physical_context)

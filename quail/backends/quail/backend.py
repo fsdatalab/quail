@@ -15,7 +15,7 @@ from quail.backends.quail.executor.score import QuailScorer
 from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
 from quail.backends.quail.worker import execute_quail_request, prepare_quail_request
 from quail.execution.reranker import RerankerModelExecution
-from quail.logical import Alias, is_score, shared_preamble
+from quail.logical import has_score, shared_preamble
 from quail.logical.prompts import true_false_token_ids
 from quail.physical import AiFilter, AiJoin, AiScore, Barrier, PhysicalNode
 from quail.planner import plan_quail
@@ -166,23 +166,15 @@ class QuailBackend:
         context: PlanningContext,
     ) -> tuple[PhysicalCandidate, ...]:
 
-        operators = region.logical_plan.operators()
         if has_label(region.logical_plan):
             if context.model.role == "reranker":
                 return (PhysicalCandidate(None, Refusal(
                     reasons=("a reranker model cannot run AI.CLASSIFY",),
                     constraint="reranker_only_scores", needed=1, available=0,
                     unit="AI.CLASSIFY expressions"), float("inf")),)
-        has_score = any(
-            is_score(predicate.expression)
-            for predicates in operators.filters.values()
-            for predicate in predicates
-        ) or any(is_score(join.predicate) for join in operators.joins) or any(
-            isinstance(expression, Alias) and expression.expression.kind == "score"
-            for expression in region.logical_plan.root.columns
-        )
+        scored = has_score(region.logical_plan)
         if context.model.role == "reranker":
-            if not has_score:
+            if not scored:
                 refusal = Refusal(
                     reasons=("a reranker model can only be used with AI.SCORE",),
                     constraint="reranker_only_scores",
@@ -191,7 +183,7 @@ class QuailBackend:
                     unit="AI.SCORE expressions",
                 )
                 return (PhysicalCandidate(None, refusal, float("inf")),)
-        if has_score:
+        if scored:
             return plan_reranker(region, context, backend_name=self.name)
 
         plan = plan_quail(

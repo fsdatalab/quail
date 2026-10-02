@@ -234,6 +234,19 @@ def is_label(expression) -> bool:
     return model_call(expression).kind == "label"
 
 
+def has_score(plan) -> bool:
+    """Return whether a logical plan computes an AI.SCORE value anywhere."""
+    operators = plan.operators()
+    return any(
+        is_score(predicate.expression)
+        for predicates in operators.filters.values()
+        for predicate in predicates
+    ) or any(is_score(join.predicate) for join in operators.joins) or any(
+        isinstance(expression, Alias) and expression.expression.kind == "score"
+        for expression in operators.projections
+    )
+
+
 def validate_predicate(expression) -> None:
     """Check that an expression answers yes or no for every row."""
     if isinstance(expression, (Compare, LabelIn)):
@@ -351,8 +364,15 @@ class Scan:
 
 @dataclass(frozen=True)
 class SemanticFilter:
+    """Predicates over one table's documents, in written order.
+
+    ``order`` is the predicates' execution order, as positions in
+    ``predicates``, once the filter_order rule has chosen one; empty
+    means as written.
+    """
     input: LogicalNode
     predicates: tuple    # tuple[FilterPredicate, ...], written order
+    order: tuple = ()    # tuple[int, ...]
 
     type_name: ClassVar[str] = "quail.semantic_filter"
 
@@ -368,6 +388,10 @@ class SemanticFilter:
     def validate(self) -> None:
         if not self.predicates:
             raise CompileError("SemanticFilter needs at least one predicate")
+        if self.order and sorted(self.order) != list(range(len(self.predicates))):
+            raise CompileError(
+                f"a filter's order lists each predicate position once, "
+                f"got {list(self.order)} for {len(self.predicates)} predicates")
         computed = {node.call for node in classifications(self.input)}
         for predicate in self.predicates:
             validate_predicate(predicate.expression)
@@ -395,6 +419,7 @@ class SemanticFilter:
             "predicates": len(self.predicates),
             "selectivities": [p.selectivity for p in self.predicates],
             "expressions": [_explain(p.expression) for p in self.predicates],
+            "order": list(self.order),
         }
 
 
@@ -468,7 +493,11 @@ class SemanticJoin:
     """One model predicate over the pairs its input Join produces.
 
     A query that joins three or more tables has one SemanticJoin per
-    pair, each feeding the Join of the next.
+    pair, each feeding the Join of the next. ``exec_idx`` and
+    ``exec_anchor`` are the join_order rule's decision: the join's
+    position among the query's joins in execution order and the table
+    whose KV its stage keeps, ``anchor`` when one was written. Both
+    are None before the rule runs.
     """
     input: LogicalNode                 # a Join, under any Apply that
     #                                    returns its pairs
@@ -477,6 +506,8 @@ class SemanticJoin:
     selectivity: Optional[float] = None    # fraction of tuples that pass
     anchor: Optional[str] = None       # table alias whose KV is kept;
     #                                    None = planner picks
+    exec_idx: Optional[int] = None
+    exec_anchor: Optional[str] = None
 
     type_name: ClassVar[str] = "quail.semantic_join"
 
@@ -500,11 +531,19 @@ class SemanticJoin:
                 f"unknown join semantics {self.semantics!r}")
         validate_predicate(self.predicate)
         present = {field.alias for field in self.input.output_schema()}
-        missing = set(model_call(self.predicate).aliases()) - present
+        aliases = model_call(self.predicate).aliases()
+        missing = set(aliases) - present
         if missing:
             raise CompileError(
                 f"the join predicate reads {sorted(missing)}, which its "
                 f"input does not produce ({sorted(present)})")
+        if (self.exec_idx is None) != (self.exec_anchor is None):
+            raise CompileError(
+                "a planned join has both an execution position and an anchor")
+        if self.exec_anchor is not None and self.exec_anchor not in aliases:
+            raise CompileError(
+                f"the planned anchor {self.exec_anchor!r} is not a table "
+                f"of the join ({list(aliases)})")
 
     def with_children(self, children: tuple[LogicalNode, ...]):
         if len(children) != 1:
@@ -522,6 +561,8 @@ class SemanticJoin:
             "selectivity": self.selectivity,
             "anchor": self.anchor,
             "expression": _explain(self.predicate),
+            "exec_idx": self.exec_idx,
+            "exec_anchor": self.exec_anchor,
         }
 
 

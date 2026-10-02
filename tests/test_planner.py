@@ -15,6 +15,7 @@ from quail.cost.sol import speed_of_light
 from quail.cost.work import ask, scan, stream
 from quail.execution.pipelines import build_pipelines
 from quail.frontend.builder import col, docs, prompt
+from quail.logical import SemanticJoin
 from quail.physical import (
     AiFilter,
     AiJoin,
@@ -26,7 +27,13 @@ from quail.physical import (
     Scan,
 )
 from quail.physical.base import input_ports
-from quail.planner.decide import explain, filter_cost, order_filters, plan_query
+from quail.planner.decide import explain, plan_query, refine_plan
+from quail.planner.filters import filter_cost, order_filters
+from quail.planner.logical_optimizer import (
+    LogicalPlanningContext,
+    apply_logical_rules,
+)
+from quail.planner.logical_rules import built_in_logical_rules
 from quail.planner.plan import EngineConfig, Refusal
 from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8
 
@@ -78,9 +85,29 @@ def _cell(text, title):
     raise AssertionError(f"no row starts with {title!r}")
 
 
-def _plan(logical, doc_tokens, **kwargs):
-    return plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
-                      doc_tokens=doc_tokens, **kwargs)
+def _optimize(logical, doc_tokens, model=QWEN3_4B_FP8, **kwargs):
+    """Run the built in logical rules as a session would.
+
+    Returns:
+        The optimized plan and the remarks a session would pass on.
+    """
+    context = LogicalPlanningContext(
+        None, None, model=model, device=H100_SXM,
+        gpu_count=kwargs.get("gpus", 1), document_tokens=doc_tokens,
+        order=kwargs.get("order"), tokenizer=tok,
+        pair_fractions=kwargs.get("pair_fractions") or {})
+    optimized, changed = apply_logical_rules(
+        logical, built_in_logical_rules(), context)
+    return optimized, tuple(
+        f"logical rule {name} changed the plan" for name in changed
+    ) + tuple(context.remarks)
+
+
+def _plan(logical, doc_tokens, model=QWEN3_4B_FP8, **kwargs):
+    """Plan as a session would: the logical rules, then the physical planner."""
+    optimized, remarks = _optimize(logical, doc_tokens, model, **kwargs)
+    return plan_query(optimized, model=model, device=H100_SXM,
+                      doc_tokens=doc_tokens, remarks=remarks, **kwargs)
 
 
 def _five_filter_plan(catalog, sels):
@@ -95,8 +122,7 @@ def test_gpu_copies_and_memory_refusals(catalog):
     logical = _five_filter_plan(catalog, (0.5,))
     for model in (QWEN3_4B_FP8, QWEN3_32B_FP8):
         for gpus in (1, 2, 4, 8):
-            plan = plan_query(logical, model=model, device=H100_SXM,
-                              doc_tokens={"r": [100] * 8}, gpus=gpus)
+            plan = _plan(logical, {"r": [100] * 8}, model=model, gpus=gpus)
             assert plan.model == model.name
             assert plan.workers == gpus
             scan_node = next(node for node in plan.nodes if isinstance(node, Scan))
@@ -105,8 +131,7 @@ def test_gpu_copies_and_memory_refusals(catalog):
     big = replace(QWEN3_4B_FP8, w_mem_bytes=150e9)
     logical = _five_filter_plan(catalog, (0.9,))
     for gpus in (1, 8):
-        result = plan_query(logical, model=big, device=H100_SXM,
-                            doc_tokens={"r": [100] * 10}, gpus=gpus)
+        result = _plan(logical, {"r": [100] * 10}, model=big, gpus=gpus)
         assert isinstance(result, Refusal)
         assert result.constraint == "weights_need_more_cards"
         assert result.needed > result.available
@@ -127,10 +152,21 @@ def test_filter_ordering_and_kv_writes(catalog):
     assert by_cost.settings["order_rule"] == "by_cost"
     assert chain.stages[0].selectivity == 0.2
     assert chain.stages[1].expected_docs == pytest.approx(20.0)
+    # the filter_order rule records the order on the logical node and
+    # names itself; the physical planner reads it
+    assert "logical rule filter_order changed the plan" in by_cost.remarks
+    optimized, _ = _optimize(logical, toks)
+    assert optimized.root.input.order == tuple(
+        stage.written_pos for stage in chain.stages)
+    assert optimized.root.input.order[0] == 2
+    assert "SemanticFilter order=3," in explain(optimized, by_cost)
 
     as_written = _plan(logical, toks, order="as_written")
     assert [stage.selectivity for stage in filter_chain(as_written).stages] \
         == list(sels)
+    assert not any("filter_order" in r for r in as_written.remarks)
+    optimized, _ = _optimize(logical, toks, order="as_written")
+    assert optimized.root.input.order == ()
 
     class Predicate:
         def __init__(self, tail, selectivity):
@@ -340,6 +376,16 @@ def test_join_anchors_groups_forced_order_and_later_kv_reuse(catalog):
     stages = join_stages(plan)
     assert [s["anchor"] for s in stages] == ["r", "p"]
     assert [s["written_pos"] for s in stages] == [0, 1]
+    # the join_order rule records the stage order and anchors on the
+    # SemanticJoins and names itself; the physical planner reads them
+    assert "logical rule join_order changed the plan" in plan.remarks
+    optimized, _ = _optimize(_chain(catalog), toks, order="as_written")
+    joins = [node for node in optimized.walk() if isinstance(node, SemanticJoin)]
+    assert [(join.exec_idx, join.exec_anchor) for join in joins] == [
+        (0, "r"), (1, "p")]
+    assert [join.anchor for join in joins] == [None, None]
+    text = explain(optimized, plan)
+    assert "stage=1 exec_anchor=r" in text and "stage=2 exec_anchor=p" in text
     assert stages[0]["partners"] == stages[1]["partners"] == ["t"]
     assert stages[0]["expected_tuples"] == 10 * 8
     assert stages[1]["expected_tuples"] < 8 * 6
@@ -383,6 +429,10 @@ def test_join_anchors_groups_forced_order_and_later_kv_reuse(catalog):
     toks = {"r": [400] * 100, "p": [100] * 100, "t": [100] * 100}
     plan = _plan(logical, toks)
     assert join_stages(plan)[0]["selectivity"] == 0.01
+    optimized, _ = _optimize(logical, toks)
+    joins = [node for node in optimized.walk() if isinstance(node, SemanticJoin)]
+    assert [(join.exec_idx, join.exec_anchor) for join in joins] == [
+        (1, "r"), (0, "r")]
 
     as_written = _plan(logical, toks, order="as_written")
     assert join_stages(as_written)[0]["selectivity"] == 0.9
@@ -394,6 +444,82 @@ def test_join_anchors_groups_forced_order_and_later_kv_reuse(catalog):
     assert groups[0].keep_anchor_kv is True
     assert groups[1].keep_anchor_kv is False
     assert groups[1].anchor_resident == "kept"
+
+
+def test_kv_retention_rule_schedules_the_kv_later_stages_read(
+        catalog, monkeypatch):
+    import quail.planner.joins as joinsearch
+
+    searches = []
+    search_joins = joinsearch.search_joins
+
+    def counting_search(*args, **kwargs):
+        searches.append(kwargs.get("honor_forced", True))
+        return search_joins(*args, **kwargs)
+
+    monkeypatch.setattr(joinsearch, "search_joins", counting_search)
+
+    # the gate runs first and the full join after it, both anchored on
+    # r: the first group keeps r's KV for the second
+    logical = (docs(catalog, "reviews", tok).alias("r")
+               .ai_join(docs(catalog, "products", tok).alias("p"),
+                        prompt("m {0} {1}", col("r.review"),
+                               col("p.description")),
+                        selectivity=0.9)
+               .ai_join(docs(catalog, "threads", tok).alias("t"),
+                        prompt("m {0} {1}", col("r.review"),
+                               col("t.thread")),
+                        selectivity=0.01, semantics="exists")
+               .select("r.id"))
+    toks = {"r": [400] * 100, "p": [100] * 100, "t": [100] * 100}
+    plan = _plan(logical, toks)
+    # one search decides the plan: pricing its candidates and the
+    # registered rule share the context's memo
+    assert searches == [True]
+    assert "physical rule kv_retention changed the plan" in plan.remarks
+    retention = plan.settings["retention"]
+    assert set(retention) >= {"initial", "before", "after", "cap_pages",
+                              "linear_seconds", "pair_seconds"}
+    groups = plan.graph.nodes_by_type(AiJoin.type_name)
+    assert [group.anchor for group in groups] == ["r", "r"]
+    assert set(retention["after"]) == set(retention["before"]) == {
+        group.node_id for group in groups}
+    assert retention["initial"] == {"r": [1.0, 0]}
+    assert retention["after"][groups[0].node_id] == {"r": [1.0, 1]}
+    assert retention["after"][groups[1].node_id] == {}
+    assert [group.keep_anchor_kv for group in groups] == [True, False]
+
+    # on one GPU a filtered anchor streams into its join, so its chain
+    # keeps no KV; on two GPUs the chain keeps its survivors for the
+    # join, and writes KV pages to do so
+    filtered = (docs(catalog, "reviews", tok).alias("r")
+                .ai_filter(prompt("negative: {0}", col("r.review")),
+                           selectivity=0.5)
+                .ai_join(docs(catalog, "products", tok).alias("p"),
+                         prompt("about {0} {1}", col("r.review"),
+                                col("p.description")), selectivity=0.1)
+                .select("r.id", "p.asin"))
+    one = _plan(filtered, toks)
+    assert one.settings["retention"]["initial"] == {}
+    chain = filter_chain(one, "r")
+    assert (chain.keep_kv, chain.arena_writes) == (False, True)
+    assert build_pipelines(one.graph)[chain.node_id].node_ids == (
+        "ai_filter:r", "ai_join:r")
+    two = _plan(filtered, toks, gpus=2)
+    assert two.settings["retention"]["initial"] == {"r": [1.0, 0]}
+    chain = filter_chain(two, "r")
+    assert (chain.keep_kv, chain.arena_writes) == (True, True)
+
+    # a forced anchor costs the free search too; refining a planned
+    # query on exact tokens keeps the schedule it was made with
+    searches.clear()
+    toks = {"r": [3000] * 10, "t": [50] * 8, "p": [100] * 6}
+    forced = _plan(_chain(catalog, anchors=("t", None)), toks)
+    assert searches == [True, False]
+    refined = refine_plan(
+        forced, model=QWEN3_4B_FP8, device=H100_SXM, doc_tokens=toks)
+    assert refined.settings["retention"] == forced.settings["retention"]
+    assert refined.nodes == forced.nodes
 
 
 def _join_search_spec(position, aliases, anchor):

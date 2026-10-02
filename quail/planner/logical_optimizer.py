@@ -69,7 +69,7 @@ class LogicalPlanningContext:
             order=self.order, canvas_draws=self.canvas_draws,
             attention=self.attention, tokenizer=self.tokenizer,
             pair_fractions=dict(self.pair_fractions),
-            logical_plan=logical_plan)
+            logical_plan=logical_plan, memo=self.memo)
 
 
 class LogicalOptimizerRule(Protocol):

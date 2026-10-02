@@ -61,6 +61,9 @@ class PlanningContext:
     settings: dict = field(default_factory=dict, compare=False, repr=False)
     # advice a rule leaves beside the plan's remarks
     remarks: list = field(default_factory=list, compare=False, repr=False)
+    # results computed once per query, such as the plan's statistics,
+    # shared with the logical rules that planned it
+    memo: dict = field(default_factory=dict, compare=False, repr=False)
 
 
 @dataclass(frozen=True)
