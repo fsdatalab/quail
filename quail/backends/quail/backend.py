@@ -18,7 +18,7 @@ from quail.execution.reranker import RerankerModelExecution
 from quail.logical import has_score, shared_preamble
 from quail.logical.prompts import true_false_token_ids
 from quail.physical import AiFilter, AiJoin, AiScore, Barrier, PhysicalNode
-from quail.planner import plan_quail
+from quail.planner import build_physical_plan
 from quail.planner.classify import has_label, joined_classification_refusal
 from quail.planner.physical_optimizer import (
     ModelRegion,
@@ -186,7 +186,7 @@ class QuailBackend:
         if scored:
             return plan_reranker(region, context, backend_name=self.name)
 
-        plan = plan_quail(
+        plan = build_physical_plan(
             region.logical_plan,
             model=context.model,
             device=context.device,

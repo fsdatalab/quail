@@ -194,10 +194,10 @@ def joined_calls(labels: LabelWork) -> list:
             if len(call.aliases()) == 2]
 
 
-def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
-                device: DeviceSpec, doc_tokens: dict, gpus: int = 1,
-                order: str | None = None, pair_fractions=None,
-                context: PlanningContext | None = None):
+def build_physical_plan(plan: LogicalPlan, *, model: ModelSpec,
+                        device: DeviceSpec, doc_tokens: dict, gpus: int = 1,
+                        order: str | None = None, pair_fractions=None,
+                        context: PlanningContext | None = None):
     """Compile a decided LogicalPlan into a PhysicalPlan or Refusal.
 
     The logical rules have made every choice the plan records: each

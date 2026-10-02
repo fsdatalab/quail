@@ -10,9 +10,9 @@ The names below are the planning interface a model backend uses.
 
 from .decide import (
     balanced_shards,
+    build_physical_plan,
     explain,
     hash_join_nodes,
-    plan_quail,
     plan_query,
     refine_plan,
 )
@@ -26,12 +26,12 @@ __all__ = [
     "PhysicalPlan",
     "Refusal",
     "balanced_shards",
+    "build_physical_plan",
     "default_order_rule",
     "hash_join_nodes",
     "explain",
     "join_specs",
     "order_filters_indexed",
-    "plan_quail",
     "plan_query",
     "preamble_tokens",
     "refine_plan",

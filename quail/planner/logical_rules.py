@@ -302,7 +302,7 @@ class ClassifyPlacement:
     costs less.
 
     The cost is a whole physical plan's estimated seconds
-    (quail.planner.pricing): the Quail planner's plan for the
+    (quail.planner.pricing): build_physical_plan's plan for the
     candidate, with the label_scoring rule applied so each
     classification's scoring rule is counted. It reads the model and
     device specs, the document token counts, and the pair fractions
@@ -318,7 +318,7 @@ class ClassifyPlacement:
         Args:
             cost: Callable mapping a LogicalPlan and the context to the
                 plan's estimated seconds, or None when the plan is
-                refused. The default prices the Quail planner's plan.
+                refused. The default prices build_physical_plan's plan.
         """
         self.cost = pricing.estimated_seconds if cost is None else cost
 

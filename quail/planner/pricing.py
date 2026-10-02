@@ -1,9 +1,9 @@
-"""Price a logical plan as the Quail planner would run it.
+"""Price a logical plan as Quail would run it.
 
 A cost-based logical rule compares candidate plans by the estimated
 seconds of the physical plan each would get: the filter_order and
 join_order rules decide the candidate's filter orders, stage order,
-and anchors, the Quail planner builds the physical plan, and the
+and anchors, build_physical_plan builds the physical plan, and the
 label_scoring rule picks each classification's scoring rule so its
 seconds are counted. The plans are memoized on the logical planning
 context by the candidate's root with those decisions cleared, so two
@@ -14,14 +14,14 @@ pass, build it once.
 from __future__ import annotations
 
 from quail.logical import LogicalPlan
-from quail.planner.decide import _apply_rules, plan_quail
+from quail.planner.decide import _apply_rules, build_physical_plan
 from quail.planner.logical_optimizer import apply_logical_rules
 from quail.planner.physical_rules import LabelScoring
 from quail.planner.plan import Refusal
 
 
 def physical_plan(logical: LogicalPlan, context):
-    """Return the Quail planner's physical plan of a logical plan.
+    """Return build_physical_plan's plan for a logical plan.
 
     The plan carries every classification's scoring rule; the other
     physical rules, which refine a finished plan, are not applied.
@@ -40,7 +40,7 @@ def physical_plan(logical: LogicalPlan, context):
         decided, _ = apply_logical_rules(
             logical, (FilterOrder(), JoinOrder()), context)
         physical_context = context.physical_context(decided)
-        physical = plan_quail(
+        physical = build_physical_plan(
             decided, model=context.model, device=context.device,
             doc_tokens=context.document_tokens, gpus=context.gpu_count,
             order=context.order, pair_fractions=context.pair_fractions,

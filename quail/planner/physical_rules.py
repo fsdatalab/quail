@@ -110,7 +110,7 @@ class LabelScoring:
     """Pick each classification's label scoring rule by simulated time.
 
     Fires for every AiClassify whose spec has no scoring rule yet, as
-    the Quail planner emits them, and leaves chosen ones alone, so a
+    build_physical_plan emits them, and leaves chosen ones alone, so a
     later pass over exact tokens keeps the rule the plan was made
     with. The candidates are the letters rule when the prompt has a
     one-token letter per label, the packed trie under tree attention,
