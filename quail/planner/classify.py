@@ -1,8 +1,9 @@
 """Prepare classification prompts and choose a scoring method.
 
-The planner compares estimated execution times for letters, trie_tree,
-and trie_decode. It emits one AiClassify node for each classification;
-decoder rounds are handled by the executor.
+The planner emits one AiClassify node for each classification; the
+label_scoring physical rule compares estimated execution times for
+letters, trie_tree, and trie_decode and picks one. Decoder rounds are
+handled by the executor.
 """
 
 from dataclasses import dataclass, replace
@@ -155,27 +156,53 @@ class _Table:
         """Return the prompt token sequence before the document."""
         return tuple(self.tokenizer(call.prompt.preamble))
 
-    def classify(self, call, name, live, resident=False):
-        """Build a classification specification and estimate its work.
+    def prepare(self, call, name, live) -> ClassifySpec:
+        """Build a classification specification without a scoring rule.
+
+        The specification carries the prompt that names the labels; the
+        label_scoring rule picks the scoring rule, swaps in the
+        lettered prompt when it picks letters, and fills the estimate.
 
         Args:
             call: Logical AI.CLASSIFY call.
             name: Result column name.
             live: Expected number of documents to classify.
+        """
+        prefix = call.prompt.label_prefix
+        return ClassifySpec(
+            name=name, aliases=(self.alias,),
+            query_template=call.prompt.template,
+            arguments=tuple((ref.alias, ref.column) for ref in call.prompt.args),
+            expected_inputs=live, estimated_seconds=0.0,
+            prompt_token_parts=(self.head(call),
+                                tuple(call.prompt.tail_token_ids)),
+            labels=tuple(call.labels),
+            label_token_ids=tuple(
+                tuple(self.tokenizer(label_text(label, prefix)))
+                for label in call.labels),
+            scoring="", probabilities=call.probabilities,
+        )
+
+    def choose_scoring(self, spec: ClassifySpec, call,
+                       resident: bool) -> ClassifySpec:
+        """Pick the scoring rule for a prepared specification.
+
+        Args:
+            spec: A specification from prepare().
+            call: Its logical AI.CLASSIFY call.
             resident: Whether document KV is available from an earlier operator.
 
         Returns:
-            A tuple containing the ClassifySpec and estimated Work.
+            The specification with its scoring rule, token parts, draws,
+            and estimated seconds.
 
         Raises:
             ClassifyRefusedError: No scoring method can run, or the document and
                 prompt exceed a token or KV budget.
         """
-        head = self.head(call)
-        tail = tuple(call.prompt.tail_token_ids)
+        head, tail = spec.prompt_token_parts
+        labels = spec.label_token_ids
         prefix = call.prompt.label_prefix
-        labels = tuple(tuple(self.tokenizer(label_text(label, prefix)))
-                       for label in call.labels)
         lettered = None
         if call.prompt.lettered is not None:
             letter_head = tuple(self.tokenizer(call.prompt.lettered.preamble))
@@ -183,15 +210,16 @@ class _Table:
             letter_ids = tuple(tuple(self.tokenizer(label_text(letter, prefix)))
                                for letter in call.prompt.lettered.letters)
             lettered = (len(letter_head), len(letter_tail) - 1, letter_ids)
-        scoring, simulated = self.choose(live, len(head), len(tail) - 1,
-                                         labels, resident, lettered,
-                                         probabilities=call.probabilities)
+        scoring, simulated = self.choose(spec.expected_inputs, len(head),
+                                         len(tail) - 1, labels, resident,
+                                         lettered,
+                                         probabilities=spec.probabilities)
         if scoring == LETTERS_SCORING:
             head, tail, labels = letter_head, letter_tail, letter_ids
         if scoring == DECODE_SCORING and not decodable(labels):
             raise ClassifyRefusedError(
                 f"the {scoring!r} rule cannot decode the labels of "
-                f"{name!r}: one label is a proper prefix of another",
+                f"{spec.name!r}: one label is a proper prefix of another",
                 1, 0)
         suffixes = classify_cost.suffix_lengths(scoring, labels, self.canvas_rows)
         # head, document, and frame stay resident while the longest
@@ -202,17 +230,11 @@ class _Table:
                 f"a document in {self.alias!r} needs {need} tokens with its "
                 f"classification prompt, but the forward pass budget is "
                 f"{self.budget} tokens", need, self.budget)
-        spec = ClassifySpec(
-            name=name, aliases=(self.alias,),
-            query_template=call.prompt.template,
-            arguments=tuple((ref.alias, ref.column) for ref in call.prompt.args),
-            expected_inputs=live, estimated_seconds=simulated.seconds,
-            prompt_token_parts=(head, tail), labels=tuple(call.labels),
-            label_token_ids=labels, scoring=scoring,
-            draws=self.draws if scoring == LETTERS_SCORING else 1,
-            probabilities=call.probabilities,
-        )
-        return spec, simulated.work
+        return replace(
+            spec, estimated_seconds=simulated.seconds,
+            prompt_token_parts=(head, tail), label_token_ids=labels,
+            scoring=scoring,
+            draws=self.draws if scoring == LETTERS_SCORING else 1)
 
     @property
     def canvas_rows(self) -> int:
@@ -241,6 +263,19 @@ class _Table:
             capacity=self.capacity or self.budget, model=self.model,
             device=self.device, resident=resident, draws=self.draws)
 
+    def simulated(self, spec: ClassifySpec,
+                  resident=False) -> classify_cost.Simulated:
+        """Simulate a specification's chosen scoring rule on this table.
+
+        Args:
+            spec: Classification specification with its scoring rule.
+            resident: Whether document KV is already available.
+        """
+        head, tail = spec.prompt_token_parts
+        return self.simulate(
+            spec.scoring, spec.expected_inputs, len(head), len(tail) - 1,
+            spec.label_token_ids, resident)
+
     def reestimate(self, spec: ClassifySpec, *, resident=False) -> ClassifySpec:
         """Update a classification's estimated time for this table.
 
@@ -251,11 +286,8 @@ class _Table:
         Returns:
             A copy of spec with estimated_seconds recalculated.
         """
-        head, tail = spec.prompt_token_parts
-        simulated = self.simulate(
-            spec.scoring, spec.expected_inputs, len(head), len(tail) - 1,
-            spec.label_token_ids, resident)
-        return replace(spec, estimated_seconds=simulated.seconds)
+        return replace(spec,
+                       estimated_seconds=self.simulated(spec, resident).seconds)
 
     def choose(self, live, head_tokens, frame_tokens, labels, resident,
                lettered=None, probabilities=False

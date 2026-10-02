@@ -594,7 +594,8 @@ class ClassifySpec(ScoreSpec):
         labels: Category strings in query order.
         label_token_ids: Token sequence for each category. Letters scoring
             uses the category's assigned letter; trie methods use its text.
-        scoring: Selected scoring method: letters, trie_tree, or trie_decode.
+        scoring: Selected scoring method: letters, trie_tree, or trie_decode;
+            empty until the label_scoring rule picks one.
         share_prefixes: Whether documents may reuse shared prefix KV pages.
         probabilities: Whether to add a name + "_probabilities" map column.
         join_layout: Anchor note and partner label token sequences for pair

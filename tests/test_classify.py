@@ -32,6 +32,7 @@ from quail.logical import (
     Alias,
     ColumnRef,
     CompileError,
+    LogicalPlan,
     Scan,
     bind_classify_prompt,
 )
@@ -444,6 +445,100 @@ def test_frontends_place_classifications_on_their_table(session):
     assert "SemanticClassify: topic" in text
     assert "SemanticFilter" in text.split("SemanticClassify")[0]
     assert "Project: d.id, topic" in text
+
+
+def _corpus(session, tmp_path, name, column, rows, words):
+    path = tmp_path / f"{name}.parquet"
+    pq.write_table(pa.table({
+        "id": [f"{name}{i}" for i in range(rows)],
+        column: [" ".join(f"w{i}x{j}" for j in range(words)) for i in range(rows)],
+    }), path)
+    session.register(name, DocumentProvider.from_parquet(str(path), id_col="id"))
+
+
+def test_rules_place_and_score_classifications(session, tmp_path):
+    from quail.logical import classified_above_joins
+    from quail.planner.logical_rules import ClassifyPlacement, lift_classifications
+    from quail.planner.physical_rules import built_in_physical_rules
+
+    assert [rule.name for rule in built_in_physical_rules()] == [
+        "label_scoring", "prefix_sharing", "tree_attention"]
+    plan = _topic(session).plan()
+    assert "physical rule label_scoring changed the plan" in plan.remarks
+    assert not any("classify_placement" in remark for remark in plan.remarks)
+    assert plan.settings["classify_placement"] == "before joins"
+
+    # sixty long reviews and three aspects; the values are the ones the
+    # planner chose before the rules were named
+    _corpus(session, tmp_path, "reviews", "body", 60, 120)
+    _corpus(session, tmp_path, "aspects", "aspect", 3, 4)
+    labels = [f"label number {i}" for i in range(12)]
+    r, a = quail.col("r.body"), quail.col("a.aspect")
+    join = quail.prompt("Does {0} mention {1}?", r, a)
+
+    def classified(filtered=False):
+        query = session.docs("reviews").alias("r")
+        if filtered:
+            query = query.ai_filter(quail.prompt("Is {0} long?", r),
+                                    selectivity=0.5)
+        return query.ai_classify(quail.prompt("Topic of {0}?", r), labels,
+                                 name="topic")
+
+    # a join keeping one pair in a hundred: classifying the matched
+    # documents after it beats classifying all sixty before it
+    after = (classified().label_in("topic", labels[:11], selectivity=0.95)
+             .ai_join(session.docs("aspects").alias("a"), join, selectivity=0.01)
+             .select("r.id", "a.id", "topic"))
+    plan = after.plan()
+    assert "logical rule classify_placement changed the plan" in plan.remarks
+    assert plan.settings["classify_placement"] == "after joins"
+    assert [node.node_id for node in plan.nodes] == [
+        "scan:r", "scan:a", "ai_join:r", "ai-classify:0", "filter:r:0",
+        "recombine", "project"]
+    (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
+    assert classify.inputs[0].source.node_id == "ai_join:r"
+    assert classify.spec.scoring == "trie_tree"
+    assert classify.spec.expected_inputs == pytest.approx(1.8)
+    assert round(plan.estimated_seconds, 3) == 0.071
+    assert plan.settings["search_seconds"] == plan.estimated_seconds
+    lifted = lift_classifications(after.logical.root)
+    assert [type(node).__name__ for node in LogicalPlan(lifted).walk()] == [
+        "Scan", "Scan", "Join", "SemanticJoin", "SemanticClassify",
+        "SemanticFilter", "Project"]
+    assert classified_above_joins(lifted) == {"r"}
+    assert classified_above_joins(after.logical.root) == frozenset()
+    assert lift_classifications(lifted) is None
+    assert lift_classifications(_topic(session).logical.root) is None
+
+    # the rule moves the classifications only when the lifted plan
+    # prices lower, and never onto a refused plan
+    root = after.logical.root
+
+    def cost(above, below):
+        return lambda plan: above if classified_above_joins(plan.root) else below
+
+    assert ClassifyPlacement(cost(1.0, 2.0)).rewrite(root, None) == lifted
+    assert ClassifyPlacement(cost(2.0, 1.0)).rewrite(root, None) is None
+    assert ClassifyPlacement(cost(1.0, 1.0)).rewrite(root, None) is None
+    assert ClassifyPlacement(cost(None, 2.0)).rewrite(root, None) is None
+
+    # a filtered partner on a forced anchor stays classified before the
+    # join, over the filter's survivors with their KV resident
+    before = (classified(filtered=True)
+              .label_in("topic", labels[:6], selectivity=0.5)
+              .ai_join(session.docs("aspects").alias("a"), join,
+                       selectivity=0.3, anchor="a")
+              .select("r.id", "a.id", "topic"))
+    plan = before.plan()
+    assert plan.settings["classify_placement"] == "before joins"
+    assert not any("classify_placement" in remark for remark in plan.remarks)
+    assert [node.node_id for node in plan.nodes] == [
+        "scan:r", "scan:a", "ai_filter:r", "ai-classify:0", "filter:r:1",
+        "ai_join:a", "project"]
+    (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
+    assert (classify.spec.scoring, classify.spec.expected_inputs) == (
+        "trie_tree", 30.0)
+    assert round(plan.estimated_seconds, 3) == 0.413
 
 
 def test_sql_classifies_the_rows_a_join_keeps(session, tmp_path):

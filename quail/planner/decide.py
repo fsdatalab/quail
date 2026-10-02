@@ -14,6 +14,7 @@ from quail.logical import (
     LabelIn,
     LabelWork,
     LogicalPlan,
+    classified_above_joins,
     effective_selectivity,
     join_conditions,
     oriented_join_conditions,
@@ -48,11 +49,14 @@ from quail.planner.classify import (
     classification_refusal,
     classify_table,
 )
+from quail.planner.logical_optimizer import apply_logical_rules
+from quail.planner.logical_rules import ClassifyPlacement
 from quail.planner.physical_optimizer import (
     ModelRegion,
     PlanningContext,
     apply_physical_rules,
 )
+from quail.planner.physical_rules import LabelScoring
 from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
 from quail.specs import DeviceSpec, ModelSpec
 
@@ -365,9 +369,14 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
                 context: PlanningContext | None = None):
     """Compile a LogicalPlan into a PhysicalPlan or Refusal.
 
-    Classifications run after the table's AI.IF conditions. When the
-    table participates in a join, the planner compares classification before
-    and after the join and chooses the lower estimated execution time.
+    Two named rules decide the classification steps. The logical rule
+    classify_placement keeps a joined table's classifications on the
+    table, after its AI.IF filters, or moves them above the joins,
+    whichever plan prices lower. The physical rule label_scoring picks
+    each classification's scoring rule and completes the plan's
+    estimate. Both run here: the placement needs this planner's prices,
+    and the estimate must count the scoring rule before plans are
+    compared. A remark names each rule that changed the plan.
 
     Args:
         plan: The logical plan to compile.
@@ -385,31 +394,62 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     Returns:
         A PhysicalPlan, or a Refusal explaining why the query cannot run.
     """
-    before = _plan_quail_placed(
-        plan, model=model, device=device, doc_tokens=doc_tokens, gpus=gpus,
-        order=order, pair_fractions=pair_fractions, context=context)
-    operators = plan.operators()
-    joined = {argument.alias for join in operators.joins
-              for argument in join.prompt.args}
-    labels = operators.labels
-    if isinstance(before, Refusal) or not any(
-            alias in joined for _, alias in labels.calls):
-        return before
-    after = _plan_quail_placed(
-        plan, model=model, device=device, doc_tokens=doc_tokens, gpus=gpus,
-        order=order, pair_fractions=pair_fractions, context=context,
-        classify_after_joins=True)
-    if isinstance(after, Refusal):
-        return before
-    return min((before, after), key=lambda candidate: candidate.estimated_seconds)
+    assembled = {}
+
+    def assemble(logical):
+        if logical.root not in assembled:
+            physical = _assemble(
+                logical, model=model, device=device, doc_tokens=doc_tokens,
+                gpus=gpus, order=order, pair_fractions=pair_fractions,
+                context=context)
+            assembled[logical.root] = _score_labels(physical, logical, context)
+        return assembled[logical.root]
+
+    def cost(logical):
+        physical = assemble(logical)
+        return None if isinstance(physical, Refusal) else physical.estimated_seconds
+
+    placed, changed = apply_logical_rules(
+        plan, (ClassifyPlacement(cost),), context)
+    physical = assemble(placed)
+    if isinstance(physical, Refusal) or not changed:
+        return physical
+    return replace(physical, remarks=tuple(
+        f"logical rule {name} changed the plan" for name in changed
+    ) + physical.remarks)
 
 
-def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
-                       device: DeviceSpec, doc_tokens: dict, gpus: int = 1,
-                       order: str | None = None, pair_fractions=None,
-                       context: PlanningContext | None = None,
-                       classify_after_joins: bool = False):
-    """Compile with classifications before or after the joins."""
+def _score_labels(physical, logical, context):
+    """Apply the label_scoring rule and add its seconds to the estimate."""
+    if isinstance(physical, Refusal):
+        return physical
+    scoring_context = (None if context is None
+                       else replace(context, logical_plan=logical))
+    try:
+        graph, changed = apply_physical_rules(
+            physical.graph, (LabelScoring(),), scoring_context)
+    except ClassifyRefusedError as refused:
+        return refused.refusal()
+    seconds = physical.settings["search_seconds"] + _classify_seconds(graph.nodes)
+    return replace(
+        physical, nodes=graph.nodes, root=graph.root, estimated_seconds=seconds,
+        settings={**physical.settings, "search_seconds": seconds},
+        remarks=physical.remarks + tuple(
+            f"physical rule {name} changed the plan" for name in changed))
+
+
+def _assemble(plan: LogicalPlan, *, model: ModelSpec,
+              device: DeviceSpec, doc_tokens: dict, gpus: int = 1,
+              order: str | None = None, pair_fractions=None,
+              context: PlanningContext | None = None):
+    """Build the physical plan of one logical plan, as placed.
+
+    A one-table classification above a SemanticJoin runs after the
+    joins, over the documents the joins matched; one on its table runs
+    after the table's AI.IF filters. Its scoring rule is left for the
+    label_scoring rule, so the estimate and ``search_seconds`` count
+    the filters and joins only.
+    """
     operators = plan.operators()
     scans, filters, joins = operators.scans, operators.filters, operators.joins
     applies = operators.applies
@@ -422,6 +462,7 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
                    for alias, positions in asks.items() if positions}
     labels = operators.labels
     classified = {alias for _, alias in labels.calls}
+    after_joins = classified_above_joins(plan.root)
     if labels.calls:
         if context is None:
             return Refusal(
@@ -505,14 +546,14 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
     # ---- expected live counts after filters, and the fixed filter
     # work every candidate join plan shares
     live0 = {a: float(st.n_docs) for a, st in stats.items()}
-    for fs in filters.values():
+    for alias, fs in filters.items():
         surv = 1.0
         for p in fs:
             # a filter on a label after the joins thins nothing before them
-            if classify_after_joins and isinstance(p.expression, LabelIn):
+            if alias in after_joins and isinstance(p.expression, LabelIn):
                 continue
             surv *= effective_selectivity(p.selectivity)
-        live0[_filter_alias(fs[0])] *= surv
+        live0[alias] *= surv
     filter_works = {
         alias: _filter_alias_work(preds, stats[alias], filter_orders[alias],
                                   pre, model.canvas_tokens, model.sliding_window)
@@ -565,12 +606,10 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
             if any(apply.kind == "barrier"
                    for apply in join_applies.get(spec["written_pos"], ())):
                 barrier_aliases.add(anchor)
-    joined = {argument.alias for join in joins for argument in join.prompt.args}
     # a chain whose first use is the join anchored on it runs in that
     # join's pipeline, on one GPU; such a chain's KV needs no
     # retention pool
-    between = {alias for alias in classified
-               if not (classify_after_joins and alias in joined)}
+    between = classified - after_joins
     chained = set()
     partner_before = set()
     for group in sequence_groups:
@@ -713,38 +752,15 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
         for position in asks[alias]:
             survival *= effective_selectivity(predicates[position].selectivity)
         live_asked[alias] = float(stats[alias].n_docs) * survival
-    classify_seconds = 0.0
     label_ports = []
-
-    deferred = set()          # aliases classified after the joins
-
-    joined_classifies = joined_calls(labels)
-    for call, aliases in joined_classifies:
-        if labels.tests.get(call):
-            return Refusal(
-                reasons=("a filter on a label tests a one-document classification, "
-                         f"not the classification of {aliases[0]!r} x "
-                         f"{aliases[1]!r} joined rows",),
-                constraint="joined_label_in", needed=1, available=0)
-        if not any({argument.alias for argument in join.prompt.args}
-                   == set(aliases) for join in joins):
-            return Refusal(
-                reasons=(f"the classification of {aliases[0]!r} x "
-                         f"{aliases[1]!r} joined rows needs a join of the two",),
-                constraint="joined_classify_needs_join", needed=1, available=0)
 
     def emit_classify(alias, live=None):
         """Classify the alias's documents, then keep the accepted labels."""
-        nonlocal classify_seconds
         calls = [call for call, owner in labels.calls
                  if owner == alias and len(call.aliases()) == 1]
-        if not calls:
-            return
-        if classify_after_joins and alias in joined and live is None:
-            deferred.add(alias)
+        if not calls or (alias in after_joins and live is None):
             return
         table = classify_table(context, alias, "quail")
-        resident = alias in pipelined and live is None
         if live is None:
             live = live_asked.get(alias, float(stats[alias].n_docs))
         steps = [(predicate.expression.call, position)
@@ -753,24 +769,17 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
         steps.extend((call, None) for call in calls if call not in labels.tests)
         classified_calls = set()
         scores = None
-        previous = None
         for call, position in steps:
             if call not in classified_calls:
-                if previous is not None:
-                    resident = (workers == 1
-                                and table.head(call) == table.head(previous))
-                spec, _ = table.classify(call, labels.names[call], live,
-                                         resident=resident)
+                spec = table.prepare(call, labels.names[call], live)
                 node = table.node(spec, scores or ids_src[alias],
                                   sum(isinstance(n, AiClassify) for n in nodes))
                 nodes.append(node)
-                classify_seconds += spec.estimated_seconds
                 scores = PortRef(node.node_id, "scores")
                 ids_src[alias] = PortRef(node.node_id, f"ids:{alias}")
                 if call in labels.projected:
                     label_ports.append(scores)
                 classified_calls.add(call)
-                previous = call
             if position is not None:
                 predicate = filters[alias][position]
                 lid = f"filter:{alias}:{position}"
@@ -887,7 +896,7 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
     # in the join's pipeline: each kept row's partner block, question,
     # and label paths run over the anchor's resident KV
     try:
-        for call, aliases in joined_classifies:
+        for call, aliases in joined_calls(labels):
             for g, group in enumerate(sequence_groups):
                 anchor = group[0][1]
                 stage = next((spec for spec, _ in group
@@ -909,7 +918,6 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
                 spec, PortRef(group_ids[g], f"join_answers:{stage['written_pos']}"),
                 sum(isinstance(n, AiClassify) for n in nodes))
             nodes.append(node)
-            classify_seconds += spec.estimated_seconds
             if call in labels.projected:
                 label_ports.append(PortRef(node.node_id, "scores"))
     except ClassifyRefusedError as refused:
@@ -919,7 +927,7 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
     # matched: a document with at least one true pair, expected as the
     # join selectivity times the partners it met, at most every document
     try:
-        for alias in sorted(deferred):
+        for alias in sorted(after_joins):
             met = sum(
                 effective_selectivity(join.selectivity)
                 * sum(live0[argument.alias] for argument in join.prompt.args
@@ -930,7 +938,7 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
     except ClassifyRefusedError as refused:
         return refused.refusal()
 
-    if len(pairs_edges) == 1 and len(seq) == 1 and not deferred:
+    if len(pairs_edges) == 1 and len(seq) == 1 and not after_joins:
         # one full join and nothing after it: its true pairs are the
         # result rows, so no recombination is needed
         sink_inputs = (pairs_edges[0],)
@@ -962,9 +970,7 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
             count=plan.root.limit,
         ))
 
-    estimate = speed_of_light(
-        base_work + found["work"], model, device, chunk
-    ).seconds + classify_seconds
+    estimate = speed_of_light(base_work + found["work"], model, device, chunk).seconds
     stage_works = {record["written_pos"]: record["work"]
                    for record in found["records"]}
 
@@ -986,7 +992,7 @@ def _plan_quail_placed(plan: LogicalPlan, *, model: ModelSpec,
             "order_rule": rule,
             "order_source": source,
             "search_seconds": estimate,
-            **({"classify_placement": ("after joins" if classify_after_joins
+            **({"classify_placement": ("after joins" if after_joins
                                        else "before joins")}
                if labels.calls else {}),
             **({"canvas_draws": context.canvas_draws}
@@ -1065,6 +1071,7 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         attention=attention,
         tokenizer=tokenizer,
         pair_fractions=dict(pair_fractions or {}),
+        logical_plan=plan,
     )
     region = ModelRegion(plan)
     candidates = tuple(selected.plan(region, context))
@@ -1089,7 +1096,8 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         raise ValueError(
             f"physical planner returned backend {selected_plan.backend!r} "
             f"for selected backend {backend!r}")
-    return _apply_rules(selected_plan, registry, context, "")
+    return _apply_rules(selected_plan, tuple(registry.physical_rules.values()),
+                        context, "")
 
 
 def refine_plan(plan, *, model: ModelSpec, device: DeviceSpec,
@@ -1122,14 +1130,13 @@ def refine_plan(plan, *, model: ModelSpec, device: DeviceSpec,
         tokenizer=tokenizer,
         pair_fractions=dict(pair_fractions or {}),
     )
-    return _apply_rules(plan, registry, context,
+    return _apply_rules(plan, tuple(registry.physical_rules.values()), context,
                         " once the documents were tokenized")
 
 
-def _apply_rules(plan, registry, context, when: str):
-    """Apply the registered physical rules; a remark names each that fired."""
-    graph, changed = apply_physical_rules(
-        plan.graph, tuple(registry.physical_rules.values()), context)
+def _apply_rules(plan, rules, context, when: str):
+    """Apply physical rules in order; a remark names each that fired."""
+    graph, changed = apply_physical_rules(plan.graph, rules, context)
     if not changed:
         return plan
     # a rule that re-estimates a classification moves the plan's total
@@ -1145,11 +1152,6 @@ def _apply_rules(plan, registry, context, when: str):
 def _classify_seconds(nodes) -> float:
     return sum(node.spec.estimated_seconds for node in nodes
                if isinstance(node, AiClassify) and node.spec is not None)
-
-
-def _filter_alias(pred_or_list):
-    p = pred_or_list[0] if isinstance(pred_or_list, list) else pred_or_list
-    return p.prompt.args[0].alias
 
 
 # ------------------------------------------------------------- explain

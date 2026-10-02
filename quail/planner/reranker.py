@@ -554,12 +554,13 @@ def _plan_reranker(region, context, *, backend_name: str):
                 if call not in classified:
                     resident = (context.gpu_count == 1 and previous is not None
                                 and table.head(call) == table.head(previous))
-                    spec, work = table.classify(
-                        call, labels.names[call], live[alias], resident=resident)
+                    spec = table.choose_scoring(
+                        table.prepare(call, labels.names[call], live[alias]),
+                        call, resident)
                     node = table.node(spec, current[alias],
                                       sum(isinstance(n, AiClassify) for n in nodes))
                     nodes.append(node)
-                    total_work += work
+                    total_work += table.simulated(spec, resident).work
                     total_seconds += spec.estimated_seconds
                     current[alias] = PortRef(node.node_id, "scores")
                     classified.add(call)

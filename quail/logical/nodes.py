@@ -633,6 +633,18 @@ def classifications(node) -> tuple:
                  if isinstance(found, SemanticClassify))
 
 
+def classified_above_joins(root) -> frozenset:
+    """Return the aliases whose one-table classification sits above a join.
+
+    The planner runs such a classification after the joins, over the
+    documents the joins matched.
+    """
+    return frozenset(
+        node.alias for node in classifications(root)
+        if len(node.call.aliases()) == 1
+        and any(isinstance(below, SemanticJoin) for below in _subtree(node.input)))
+
+
 def _explain(expression) -> str:
     if isinstance(expression, Compare):
         return (f"{_explain(expression.call)} {expression.comparison} "

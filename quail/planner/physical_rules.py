@@ -1,5 +1,7 @@
 """Built in physical optimizer rules.
 
+- label_scoring: each classification gets the label scoring rule
+  (letters, trie_tree, or trie_decode) whose simulated time is lowest.
 - prefix_sharing: documents that share a token prefix with another
   document borrow its KV pages for the shared part instead of
   computing it again.
@@ -13,8 +15,87 @@ from dataclasses import replace
 
 from quail.cost.budgets import choose_attention_path
 from quail.execution.pipelines import build_pipelines
-from quail.physical import AiClassify, AiFilter, AiJoin, PhysicalGraph
+from quail.logical import classified_above_joins
+from quail.physical import (
+    AiClassify,
+    AiFilter,
+    AiJoin,
+    Filter,
+    Foreign,
+    PhysicalGraph,
+)
 from quail.planner.prefixes import document_shared_tokens, page_tree
+
+
+class LabelScoring:
+    """Pick each classification's label scoring rule by simulated time.
+
+    Fires for every AiClassify whose spec has no scoring rule yet, as
+    the Quail planner emits them, and leaves chosen ones alone, so a
+    later pass over exact tokens keeps the rule the plan was made
+    with. The candidates are the letters rule when the prompt has a
+    one-token letter per label, the packed trie under tree attention,
+    and a greedy decode over fresh documents (_Table.choose). The
+    documents count as resident, with their KV in the arena, when the
+    classification continues its table's filter chain on one GPU
+    before any join, or follows a classification with the same prompt
+    head. A classification of joined rows always uses letters and
+    arrives chosen.
+
+    The Quail planner applies this rule itself when it assembles a
+    plan, so the plan's estimate counts the chosen rule before plans
+    are compared and a classification no rule can run refuses the
+    plan; it needs the logical plan on the context for the calls'
+    prompts.
+    """
+
+    name = "label_scoring"
+
+    def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
+        if context is None:
+            return None
+        pending = [node for node in graph.nodes
+                   if isinstance(node, AiClassify) and node.spec is not None
+                   and not node.spec.scoring]
+        if not pending:
+            return None
+        if context.logical_plan is None:
+            raise ValueError(
+                "label_scoring needs the logical plan on the planning context "
+                "to score a classification without a scoring rule")
+        from quail.planner.classify import classify_table
+
+        logical = context.logical_plan
+        calls = {node.name: node.call for node in logical.operators().classifies}
+        after_joins = classified_above_joins(logical.root)
+        chosen = {}
+        for node in pending:
+            table = classify_table(context, node.spec.anchor, node.backend_name)
+            resident = _resident(node, graph, context, calls, after_joins, table)
+            chosen[node.node_id] = replace(node, spec=table.choose_scoring(
+                node.spec, calls[node.spec.name], resident))
+        return PhysicalGraph(
+            tuple(chosen.get(node.node_id, node) for node in graph.nodes),
+            graph.root)
+
+
+def _resident(node, graph, context, calls, after_joins, table) -> bool:
+    """Whether a classification's documents have their KV in the arena.
+
+    True on one GPU when the classification continues its table's
+    AI.IF filter chain before any join, through any filters on labels
+    and applies between them, or follows a classification whose prompt
+    head is the same.
+    """
+    if context.gpu_count != 1:
+        return False
+    source = graph.node(node.inputs[0].source.node_id)
+    while isinstance(source, (Filter, Foreign)):
+        source = graph.node(source.inputs[0].source.node_id)
+    if isinstance(source, AiClassify) and source.spec is not None:
+        return (table.head(calls[source.spec.name])
+                == table.head(calls[node.spec.name]))
+    return isinstance(source, AiFilter) and node.spec.anchor not in after_joins
 
 
 def _token_store(document_tokens):
@@ -211,4 +292,4 @@ class TreeAttention:
 
 def built_in_physical_rules() -> tuple:
     """Return the physical rules registered with the built in registry."""
-    return (PrefixSharing(), TreeAttention())
+    return (LabelScoring(), PrefixSharing(), TreeAttention())
