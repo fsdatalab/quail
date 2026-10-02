@@ -163,7 +163,7 @@ def slide(rows):
     for position, query in zip(POSITIONS, QUERIES):
         vllm = rows["stock_vllm"][query]["seconds"]
         now = rows["now"][query]["seconds"]
-        axes[0].annotate(f"Quail {vllm / now:.2f}x faster than vLLM",
+        axes[0].annotate(f"Quail {vllm / now:.2f}x\nfaster than vLLM",
                          (position, axes[0].get_ylim()[1]), xytext=(0, -6),
                          textcoords="offset points", ha="center", va="top",
                          fontsize=10, weight="bold", color=BLUE)
