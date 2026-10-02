@@ -123,8 +123,9 @@ def _advance_stage(stages, a, j, row):
 def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                anchor_keys=None, on_settled=None, staging=None,
                attention_mode=None, prefix_tree=None, stats=None,
-               limit=None, paged=True, unit="anchors", label=None,
-               default_attention="tree", on_chunk=None, on_answers=None):
+               limit=None, paged=True, unit="documents", count_answers=False,
+               label=None, default_attention="tree", on_chunk=None,
+               on_answers=None):
     """Run every stage over the documents with one admission.
 
     Args:
@@ -153,6 +154,8 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
             runs one stage of one suffix per document as a single
             causal segment without pages: the filter fast path.
         unit: The progress unit.
+        count_answers: Whether progress counts answers, one per partner
+            of each document at each stage, instead of finished documents.
         label: The progress label; None names the stages.
         default_attention: The attention path when the plan chose none
             and the model has tree attention.
@@ -177,8 +180,8 @@ def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
         torch, arena, pipeline, stages, anchor_prefixes, budget,
         anchor_keys=anchor_keys, on_settled=on_settled, staging=staging,
         attention_mode=attention_mode, prefix_tree=prefix_tree, stats=stats,
-        limit=limit, paged=paged, unit=unit, label=label,
-        default_attention=default_attention, on_chunk=on_chunk,
+        limit=limit, paged=paged, unit=unit, count_answers=count_answers,
+        label=label, default_attention=default_attention, on_chunk=on_chunk,
         on_answers=on_answers,
     ).run()
 
@@ -188,8 +191,8 @@ class _StageExecutor:
 
     def __init__(self, torch, arena, pipeline, stages, anchor_prefixes, budget, *,
                  anchor_keys, on_settled, staging, attention_mode, prefix_tree,
-                 stats, limit, paged, unit, label, default_attention, on_chunk,
-                 on_answers):
+                 stats, limit, paged, unit, count_answers, label,
+                 default_attention, on_chunk, on_answers):
         from quail.backends.quail.executor.chunk import Suffixes
         from quail.backends.quail.executor.loop import (
             attention_path,
@@ -311,7 +314,7 @@ class _StageExecutor:
         if self.label is None:
             self.label = " > ".join(stage.label or f"stage {j}"
                                    for j, stage in enumerate(self.stages))
-        self.counting_answers = unit != "anchors"
+        self.counting_answers = count_answers
         total = (sum(self.sched.partner_count(a, j) for a in range(len(self.prefixes))
                      for j in range(k))
                  if self.counting_answers else len(self.prefixes))

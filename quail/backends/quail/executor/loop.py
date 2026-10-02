@@ -111,7 +111,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
         anchor_keys=anchor_keys, on_settled=on_settled,
         staging=staging, attention_mode=attention_mode,
         prefix_tree=prefix_tree, stats=stats,
-        unit="scores" if scoring else "anchors",
+        unit="scores" if scoring else "documents", count_answers=scoring,
         label="AI.SCORE" if scoring else f"join ({k} stages)",
         on_answers=on_answers)
 
