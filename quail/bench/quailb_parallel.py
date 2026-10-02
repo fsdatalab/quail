@@ -226,24 +226,24 @@ def run_sglang_query_family(
         kernel_cache.commit()
 
 
-def _merge_suites(parts, query_ids, run_id, started, elapsed,
+def _merge_suites(parts, directories, query_ids, run_id, started, elapsed,
                   function_call_ids, methods):
     base = parts[0]
     fields = ("scale_factor", "corpus_id", "collection_id", "metadata",
               "gpu_count", "gpu_hourly_rate_usd")
     by_query = {}
     skipped = {}
-    for part in parts:
+    for part, directory in zip(parts, directories, strict=True):
         if part["run_id"] != run_id:
             raise ValueError("query families disagree on run_id")
         for field in fields:
             if part[field] != base[field]:
                 raise ValueError(f"query families disagree on {field}")
-        family = part["query_family"]["name"]
         for item in part["queries"]:
             if item["id"] in by_query:
                 raise ValueError(f"duplicate query {item['id']}")
-            by_query[item["id"]] = dict(item, directory=f"{family}/{item['id']}")
+            by_query[item["id"]] = dict(
+                item, directory=f"{directory}/{item['id']}")
         skipped.update(part.get("skipped_queries", {}))
     if set(by_query) | set(skipped) != set(query_ids):
         raise ValueError("completed queries do not match the requested queries")
@@ -423,6 +423,8 @@ def _finish_run(directory, manifest, family_calls, sglang_calls, query_ids,
         parts = sglang_parts if method == "pipelined_sglang" else family_parts
         reports[method] = _merge_suites(
             [part["suites"][method] for part in parts],
+            # a family split into groups saves each group in its own folder
+            [Path(part["result_path"]).stem for part in parts],
             query_ids, directory.name, started, elapsed, call_ids,
             tuple(item for group in parts[0]["process_groups"]
                   for item in group))
