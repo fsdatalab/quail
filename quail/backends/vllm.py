@@ -141,11 +141,24 @@ class VLLMClient:
     def generate(self, prompts, sampling_params, use_tqdm=False):
         return self.llm.generate(prompts, sampling_params, use_tqdm=use_tqdm)
 
-    def decode_params(self, max_tokens: int):
-        """Build sampling parameters for greedy text generation."""
-        from vllm import SamplingParams
+    def decode_params(self, max_tokens: int, choices=()):
+        """Build sampling parameters for greedy text generation.
 
-        return SamplingParams(max_tokens=max_tokens, temperature=0.0)
+        Args:
+            max_tokens: Most tokens to generate.
+            choices: Texts the output must be one of; empty allows any text.
+                A diffusion canvas model ignores them.
+        """
+        from vllm import SamplingParams
+        from vllm.sampling_params import StructuredOutputsParams
+
+        # the grammar masks one sampled token per step; a canvas
+        # denoises many positions at once
+        constrained = choices and not self.capacity.get("canvas_length")
+        structured = (StructuredOutputsParams(choice=list(choices))
+                      if constrained else None)
+        return SamplingParams(max_tokens=max_tokens, temperature=0.0,
+                              structured_outputs=structured)
 
     def reset_prefix_cache(self):
         return self.llm.reset_prefix_cache()

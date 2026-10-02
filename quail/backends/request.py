@@ -622,7 +622,7 @@ def _pipelined_filter(client, sampling_params, bodies, questions, read_answer,
 
 
 def _classify_documents(client, spec, bodies) -> dict:
-    """Generate one category answer per document using greedy decoding.
+    """Generate one category answer per document using constrained greedy decoding.
 
     Args:
         client: Backend client providing sampling parameters and generation.
@@ -632,12 +632,14 @@ def _classify_documents(client, spec, bodies) -> dict:
     Returns:
         A mapping containing labels, request counts, token counts, and elapsed
         generation time. Unmatched answers have label None and increment
-        unmatched. Generation uses temperature zero and a token limit one
-        greater than the longest category token sequence.
+        unmatched. Generation uses temperature zero, may only produce one of
+        the category texts, and has a token limit one greater than the
+        longest category token sequence.
     """
     tail = _token_list(spec.tail_token_ids)
     longest = max(len(ids) for ids in spec.label_token_ids)
-    params = client.decode_params(longest + 1)
+    params = client.decode_params(
+        longest + 1, choices=tuple(label_text(label) for label in spec.labels))
     prompts = [{"prompt_token_ids": body + tail} for body in bodies]
     started = time.perf_counter()
     outputs = client.generate(prompts, params, use_tqdm=False) if prompts else []
