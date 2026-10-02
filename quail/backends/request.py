@@ -621,9 +621,11 @@ def _classify_documents(client, spec, bodies) -> dict:
 
     Returns:
         A mapping containing labels, request counts, token counts, and elapsed
-        generation time. Unmatched answers have label None and increment
-        unmatched. Generation uses temperature zero and a token limit one
-        greater than the longest category token sequence.
+        generation time. Fresh tokens count the uncached prompt tokens and
+        every generated token fed back to decode the next one. Unmatched
+        answers have label None and increment unmatched. Generation uses
+        temperature zero and a token limit one greater than the longest
+        category token sequence.
     """
     tail = _token_list(spec.tail_token_ids)
     longest = max(len(ids) for ids in spec.label_token_ids)
@@ -634,11 +636,14 @@ def _classify_documents(client, spec, bodies) -> dict:
     wall_s = time.perf_counter() - started
     labels = []
     unmatched = 0
-    prompt_tokens = cached_tokens = generated_tokens = 0
+    prompt_tokens = cached_tokens = generated_tokens = fed_back = 0
     for output in outputs:
         prompt_tokens += len(output.prompt_token_ids)
         cached_tokens += int(getattr(output, "num_cached_tokens", 0) or 0)
-        generated_tokens += len(output.outputs[0].token_ids)
+        generated = len(output.outputs[0].token_ids)
+        generated_tokens += generated
+        # each generated token but the last is fed back through the model
+        fed_back += max(generated - 1, 0)
         text = output.outputs[0].text or ""
         label = match_label(text, spec.labels)
         unmatched += label is None
@@ -649,7 +654,7 @@ def _classify_documents(client, spec, bodies) -> dict:
         "requests": len(prompts),
         "prompt_tokens": prompt_tokens,
         "cached_tokens": cached_tokens,
-        "fresh_tokens": prompt_tokens - cached_tokens,
+        "fresh_tokens": prompt_tokens - cached_tokens + fed_back,
         "generated_tokens": generated_tokens,
         "unmatched": unmatched,
     }

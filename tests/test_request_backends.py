@@ -411,7 +411,8 @@ def test_request_backends_classify_with_one_request_per_trie_node():
     (step,) = result.metrics.extension["steps"]
     assert (step["kind"], step["n_in"], step["n_out"]) == ("classify", 2, 1)
     assert (step["generated_tokens"], step["unmatched"]) == (4, 0)
-    assert result.metrics.fresh_tokens == 2 * 3
+    # two 3-token prompts, and each answer's first token fed back
+    assert result.metrics.fresh_tokens == 2 * 3 + 2 * (2 - 1)
 
     session = _session("stock_vllm", docs=DOCS)
     query = (session.docs("docs").alias("d")
