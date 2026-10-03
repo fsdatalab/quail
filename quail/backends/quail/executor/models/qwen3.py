@@ -3,8 +3,8 @@
 Layer order: input RMSNorm, fused QKV projection, per-head Q and K
 RMSNorm with rotary, attention, output projection, post-attention
 RMSNorm, gate_up projection, SiLU-gated product, down projection.
-The Qwen3 rerankers are this architecture with bf16 weights and run
-through this file too.
+The Qwen3 rerankers and the Decision 2.0 backbone are this
+architecture with bf16 weights and run through this file too.
 """
 
 from quail.backends.quail.executor.attention import Engine
@@ -15,7 +15,7 @@ class Qwen3Pipeline(ModelPipeline):
     """Forward passes for Qwen3 checkpoints loaded by vLLM."""
 
     def __init__(self, model, arena, *, spec, kernels="quail",
-                 engine_class=Engine):
+                 engine_class=Engine, answer_offsets=(0,)):
         import torch
 
         self.layers = model.model.layers
@@ -36,6 +36,21 @@ class Qwen3Pipeline(ModelPipeline):
                          layer.mlp.gate_up_proj.weight.shape[0])
                      for layer in self.layers)
         self.max_chunk_tokens = (2**31 - 1) // widest
+        self.answer_offsets = tuple(answer_offsets)
+        self._offsets = None
+        if self.answer_offsets != (0,):
+            self._offsets = torch.tensor(self.answer_offsets,
+                                         dtype=torch.int64,
+                                         device=self.embed.weight.device)
+
+    def answer_indices(self, final):
+        """The rows the readout reads: per final index, one per answer offset."""
+        if self._offsets is None:
+            return final
+        rows = (final[:, None] - self._offsets[None, :]).reshape(-1)
+        # a join's frame entry can start the chunk with fewer rows than
+        # the offsets reach; the loop discards its answer
+        return rows.clamp(min=0)
 
     def linears(self):
         # every layer has the same four shapes
@@ -69,7 +84,7 @@ class Qwen3Pipeline(ModelPipeline):
             gate_up = engine.gemm(g_in, g_scale, layer.mlp.gate_up_proj)
             d_in, d_scale = engine.activation_quant(gate_up)
             hidden = engine.gemm(d_in, d_scale, layer.mlp.down_proj)
-        final = chunk.final_indices
+        final = self.answer_indices(chunk.final_indices)
         last_hidden = hidden.index_select(0, final)
         last_residual = residual.index_select(0, final)
         normed, _ = engine.fused_add_rms_norm(

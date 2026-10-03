@@ -232,7 +232,7 @@ class Session:
                                dialect=SQLDialect(dialect).value)
         logical = compile_sql(
             text, self.catalog, self.tokenizer, dialect=dialect,
-            turn=self.model.turn,
+            turn=self.model.turn, layout=self.model.prompt_layout,
         )
         return Query(self, logical, order=order)
 
@@ -256,7 +256,8 @@ class Session:
         return BoundBuilder(self,
                             BuilderQuery(self.catalog, name,
                                          self.tokenizer,
-                                         turn=self.model.turn))
+                                         turn=self.model.turn,
+                                         layout=self.model.prompt_layout))
 
     @property
     def tokenizer(self):

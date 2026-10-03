@@ -12,9 +12,14 @@ from quail.backends.base import GpuContext
 from quail.backends.quail.distributed import execute_distributed_graph
 from quail.backends.quail.executor.arena import KVArena
 from quail.backends.quail.executor.loop import warm_kernels
-from quail.backends.quail.executor.model import load_model, resolve_model_path
+from quail.backends.quail.executor.model import checkpoint_path, load_model
 from quail.backends.quail.executor.models import build_pipeline
-from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers
+from quail.backends.quail.executor.readout import (
+    AnswerRows,
+    AsyncAnswers,
+    AsyncDecisions,
+    DecisionHead,
+)
 from quail.backends.quail.graph import (
     _join_round_kv,
     _tuple_suffix,
@@ -95,7 +100,14 @@ class LoadedGpu:
         self.arena_s = time.perf_counter() - t0
 
         t0 = time.perf_counter()
-        self.pipeline = build_pipeline(spec, self.model, self.arena)
+        self.decision_head = None
+        options = {}
+        if spec.role == "decision":
+            path = checkpoint_path(model_path or spec.hf_name,
+                                   None if model_path else spec.revision)
+            self.decision_head = DecisionHead.load(torch, F, path)
+            options["answer_offsets"] = decision_offsets(spec, path)
+        self.pipeline = build_pipeline(spec, self.model, self.arena, **options)
         self.pipeline_s = time.perf_counter() - t0
 
         self.execution = backend.start(context)
@@ -114,7 +126,10 @@ class LoadedGpu:
         if arena_pages is not None:
             self.arena.resize(*arena_pages, free_resident=True)
         rows = AnswerRows(self.torch, self.F, self.model, true_ids, false_ids)
-        self.async_ans = AsyncAnswers(self.torch, rows)
+        if self.decision_head is not None:
+            self.async_ans = AsyncDecisions(self.torch, self.decision_head)
+        else:
+            self.async_ans = AsyncAnswers(self.torch, rows)
         self.chunk_tokens = chunk_tokens
         self.execution.bind_query(
             torch=self.torch,
@@ -146,6 +161,25 @@ class LoadedGpu:
         close_fn = getattr(self.execution, "close", None)
         if callable(close_fn):
             close_fn()
+
+
+def decision_offsets(spec, path) -> tuple[int, ...]:
+    """The rows a decision readout reads, as distances before the last row."""
+    from transformers import AutoTokenizer
+
+    from quail.logical import answer_row_offsets
+
+    tokenizer = AutoTokenizer.from_pretrained(path, local_files_only=True)
+    offsets = answer_row_offsets(
+        spec.prompt_layout,
+        lambda text: tokenizer(text, add_special_tokens=False)["input_ids"],
+        spec.turn_suffix)
+    if len(offsets) != 3:
+        raise ValueError(
+            f"{spec.name}: the decision readout reads a no row, a yes row, "
+            f"and the last row; layout {spec.prompt_layout!r} gives "
+            f"{len(offsets)} rows")
+    return offsets
 
 
 def _boot_record(gpu, cold, warm_s, warm_tier, t_boot):
@@ -676,7 +710,7 @@ def execute_quail_multi(payload, registry, graph):
     gpu_count = payload["workers"]
     spec = registry.model(payload["model"])
     started = time.perf_counter()
-    model_path = resolve_model_path(spec.hf_name, spec.revision)
+    model_path = checkpoint_path(spec.hf_name, spec.revision)
     model_files_s = time.perf_counter() - started
     _ensure_children(gpu_count)
     setup = {key: payload[key] for key in (

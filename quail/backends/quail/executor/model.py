@@ -8,11 +8,19 @@ kernels), nothing more.
 After load, only the TRUE/FALSE output rows are retained. The full
 output head is discarded; shared input embeddings remain available.
 
+A Decision 2.0 checkpoint keeps its Qwen3 backbone in a subfolder
+under its own tensor names. It is converted once into a Qwen3
+checkpoint folder beside the Hugging Face cache, with bf16 weights and
+its decision head copied alongside, and loads from there.
+
 get_model reads tensor-parallel group objects. Those collectives are
 no-ops at world size 1, so this path installs single-rank stubs
 instead of starting NCCL or gloo.
 """
 
+import json
+import os
+import shutil
 from functools import lru_cache
 from pathlib import Path
 
@@ -35,6 +43,74 @@ def resolve_model_path(model_name: str, revision: str | None = None) -> str:
     )
     say(f"model files ready: {path}")
     return path
+
+
+# files a converted Decision 2.0 checkpoint keeps from the original;
+# vLLM loads every safetensors file at the top level as model weights,
+# so the head goes in a subfolder
+DECISION2_COPIED = {"tokenizer.json": "tokenizer.json",
+                    "tokenizer_config.json": "tokenizer_config.json",
+                    "decision_config.json": "decision_config.json",
+                    "decision_head.safetensors": "head/decision_head.safetensors"}
+# names the converted layout; a new layout converts again
+DECISION2_FORMAT = "qwen3-bf16-v1"
+
+
+def is_decision2(path) -> bool:
+    """Whether a checkpoint directory holds a Decision 2.0 package."""
+    config = Path(path) / "config.json"
+    return (config.is_file()
+            and json.loads(config.read_text()).get("model_type") == "decision2")
+
+
+@lru_cache(maxsize=8)
+def checkpoint_path(model_name: str, revision: str | None = None) -> str:
+    """The local directory vLLM loads for a model, converted when needed."""
+    path = resolve_model_path(model_name, revision)
+    if not is_decision2(path):
+        return path
+    hf_home = os.environ.get("HF_HOME", "~/.cache/huggingface")
+    snapshot = Path(path).resolve()
+    dest = (Path(hf_home).expanduser() / "quail-checkpoints" / DECISION2_FORMAT
+            / snapshot.parent.parent.name / snapshot.name)
+    if not (dest / "model.safetensors").is_file():
+        say(f"converting {model_name} to a Qwen3 checkpoint at {dest}")
+        convert_decision2(snapshot, dest)
+    return str(dest)
+
+
+def convert_decision2(src, dest) -> None:
+    """Write a Decision 2.0 package as a bf16 Qwen3ForCausalLM checkpoint.
+
+    Args:
+        src: The package directory, with backbone/config.json and
+            backbone/model.safetensors.
+        dest: The directory to create. It appears only once complete.
+    """
+    import torch
+    from safetensors.torch import load_file, save_file
+
+    src, dest = Path(src), Path(dest)
+    config = json.loads((src / "backbone" / "config.json").read_text())
+    if config.get("model_type") != "qwen3":
+        raise ValueError(
+            f"{src}: the backbone is {config.get('model_type')!r}, not 'qwen3'")
+    config.update(architectures=["Qwen3ForCausalLM"], torch_dtype="bfloat16",
+                  dtype="bfloat16")
+    tensors = {
+        f"model.{name}": tensor.to(torch.bfloat16).contiguous()
+        for name, tensor in load_file(
+            str(src / "backbone" / "model.safetensors")).items()}
+    tmp = dest.with_name(dest.name + ".tmp")
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    (tmp / "config.json").write_text(json.dumps(config, indent=2))
+    save_file(tensors, str(tmp / "model.safetensors"))
+    (tmp / "head").mkdir()
+    for name, copy in DECISION2_COPIED.items():
+        shutil.copyfile(src / name, tmp / copy)
+    shutil.rmtree(dest, ignore_errors=True)
+    tmp.rename(dest)
 
 
 class _SingleRank:
@@ -160,7 +236,7 @@ def load_model(model_name: str, revision: str | None = None, *,
         folder = write_configs(
             Path(tempfile.gettempdir()) / "quail-moe-configs", base)
         os.environ["VLLM_TUNED_CONFIG_FOLDER"] = str(folder)
-    model_path = resolve_model_path(model_name, revision)
+    model_path = checkpoint_path(model_name, revision)
     args = dict(model=model_path, dtype="auto", enforce_eager=True)
     if max_batched_tokens is not None:
         args["max_num_batched_tokens"] = int(max_batched_tokens)

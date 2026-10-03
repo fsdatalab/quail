@@ -368,6 +368,16 @@ class QuailBackend:
                     unit="AI.SCORE expressions",
                 )
                 return (PhysicalCandidate(None, refusal, float("inf")),)
+        if context.model.role == "decision" and has_score:
+            refusal = Refusal(
+                reasons=("a decision model answers AI.IF filters and joins, "
+                         "not AI.SCORE",),
+                constraint="decision_no_scores",
+                needed=0,
+                available=1,
+                unit="AI.SCORE expressions",
+            )
+            return (PhysicalCandidate(None, refusal, float("inf")),)
         if has_score:
             return plan_reranker(region, context, backend_name=self.name)
 
@@ -441,7 +451,8 @@ class QuailBackend:
             else ([], []))
         prompts = operators.prompts
         pre_ids = (
-            list(tokenizer(shared_preamble(context.model.turn_prefix)))
+            list(tokenizer(shared_preamble(context.model.turn_prefix,
+                                           context.model.prompt_layout)))
             if tokenizer is not None else
             list(prompts[0].preamble_token_ids) if prompts else []
         )

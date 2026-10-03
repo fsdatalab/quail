@@ -676,6 +676,11 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
                 else list(anchor_keys))
     if len(keys) != len(prefixes):
         raise ValueError("anchor_keys must match anchor_prefixes")
+    reach = max(pipeline.answer_offsets)
+    if reach and any(len(s) <= reach for sufs in stage_suffixes for s in sufs):
+        raise ValueError(
+            f"a join suffix is not longer than the {reach} rows the "
+            f"readout reads back")
     frames = stage_frames or [[] for _ in range(k)]
     # a join's partners read their anchor: tree unless the plan says
     mode = attention_path(pipeline, attention_mode, default="tree")
@@ -976,14 +981,14 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
 WARMUP_VERSION = 4
 
 
-def _warm_inputs(budget):
-    """Synthetic warmup tokens: a 512-id document and a 16-id question suffix.
+def _warm_inputs(budget, question_tokens=16):
+    """Synthetic warmup tokens: a 512-id document and a question suffix.
 
     Cycled to any length the passes need. Fixed small ids; only the
     counts matter to the kernels.
     """
     doc = [10 + (i % 500) for i in range(512)]
-    question = list(range(10, 26))
+    question = [10 + (i % 500) for i in range(question_tokens)]
     q_max = len(question)
     warm_docs, used = [], 0
     while used + len(doc) + q_max <= budget:
@@ -999,7 +1004,8 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
     Both modes with arena writes, plus the unpaged causal fast path.
     join_chunk adds one run_join call.
     """
-    warm_docs, question, doc = _warm_inputs(budget)
+    warm_docs, question, doc = _warm_inputs(
+        budget, max(16, max(pipeline.answer_offsets) + 1))
     q_max = len(question)
     modes = ("unified", "tree") if pipeline.tree_attention else ("unified",)
     for mode in modes:
@@ -1262,11 +1268,16 @@ class FilterStream:
         stage_tokens = [len(question_ids[0]) + c] \
             + [len(q) - p + c for q in question_ids[1:]]
         tails = [question_ids[0]] + [q[p:] for q in question_ids[1:]]
+        reach = max(pipeline.answer_offsets)
         for i, t in enumerate(tails):
             if not t:
                 raise ValueError(
                     f"stage {i} question has no tokens beyond the shared "
                     f"preamble ({p} tokens)")
+            if len(t) <= reach:
+                raise ValueError(
+                    f"stage {i} question has {len(t)} tokens beyond the "
+                    f"shared preamble; the readout reads {reach} rows back")
         if not arena_writes and (
             len(question_ids) > 1 or retain_all or retain or hold_survivors
         ):

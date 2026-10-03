@@ -14,6 +14,7 @@ page will be updated as new configurations become available.
 | DiffusionGemma 26B-A4B | `"diffusion-gemma-26b-a4b-fp8"` | 26B total, 4B active per token | FP8 weights, BF16 KV |
 | Qwen3 Reranker 0.6B | `"qwen3-reranker-0.6b-bf16"` | 0.6B | BF16 |
 | Qwen3 Reranker 4B | `"qwen3-reranker-4b-bf16"` | 4B | BF16 |
+| Decision 2.0 Kai 0.6B | `"decision-2.0-kai-0.6b-bf16"` | 0.6B | BF16 |
 
 The Qwen3 FP8 models use the Quail execution engine, including
 DeepGEMM for matrix multiplications and FlashAttention 3 for
@@ -61,6 +62,39 @@ separately, then joins the token lists. Where the prompt text meets
 a document, the tokens can differ from tokenizing the joined string,
 so a score can differ slightly from the reference implementation.
 Scores near a threshold can select different rows.
+
+### Decision 2.0 Kai 0.6B
+
+[Decision-2.0-Kai-0.6B](https://huggingface.co/vllm-sr/Decision-2.0-Kai-0.6B)
+is a decision model from vLLM Semantic Router. It supports filter and
+join predicates. It does not support `AI.SCORE`, and the stock vLLM
+and SGLang backends do not run it.
+
+The model is a Qwen3-0.6B network with a separate classifier head.
+It does not answer by generating a token. Quail writes each prompt in
+the model's yes/no question format: the document after `Context:`,
+the question, then a `No` option block and a `Yes` option block.
+Quail reads three final hidden states: the last token of each option
+block and the last token of the prompt. The head scores both options
+in FP32 and the predicate is true when `Yes` scores higher.
+
+On first use Quail converts the checkpoint once. It renames the
+backbone tensors, casts them to BF16, and saves a standard Qwen3
+folder under `$HF_HOME/quail-checkpoints/`. Later loads read that
+folder. Weights, activations, and KV use BF16. The model's own code
+keeps FP32 weights under BF16 autocast, so answers near a tie can
+differ.
+
+As with the rerankers, Quail tokenizes each document separately from
+the fixed prompt text, so tokens can differ from the model's own
+tokenization where the two meet.
+
+```python
+config = quail.EngineConfig(
+    model="decision-2.0-kai-0.6b-bf16",
+    device="h100-sxm",
+)
+```
 
 ## GPUs
 

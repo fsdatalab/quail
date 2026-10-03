@@ -23,6 +23,9 @@ class ModelPipeline:
     reads paged KV only. warm_tokens are the chunk sizes the warmup
     builds one small chunk of: a gated chain's trailing chunks are
     100-500 tokens, a shape the full-size warm chunks do not cover.
+    answer_offsets are the rows the readout reads per answer row, as
+    distances before it; (0,) reads the answer row alone. Every suffix
+    must be longer than the largest offset.
     """
 
     engine = None
@@ -33,9 +36,14 @@ class ModelPipeline:
     needs_pages = False
     tree_attention = True
     gemm_warmup = True
+    answer_offsets = (0,)
 
     def forward_chunk(self, chunk):
         """Return the final-normed hidden state of chunk.final_indices.
+
+        With answer_offsets other than (0,), returns len(answer_offsets)
+        rows per final index, the rows at those distances before it, in
+        order.
 
         The loop owns the chunk's pages, temporaries included; this
         only computes.

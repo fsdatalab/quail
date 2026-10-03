@@ -60,11 +60,12 @@ def prompt(template: str, *cols: ColSpec) -> PromptSpec:
 
 class Query:
     def __init__(self, catalog: Catalog, provider: str, tokenizer=None,
-                 turn: tuple[str, str] = ("", "")):
+                 turn: tuple[str, str] = ("", ""), layout: str = "ai-if"):
         catalog.get(provider)     # unknown provider -> CompileError
         self._catalog = catalog
         self._tokenizer = tokenizer
         self._turn = turn
+        self._layout = layout
         self._tables = [(provider, provider)]   # (alias, provider)
         self._doc_columns = {}
         self._filters = {}
@@ -122,7 +123,8 @@ class Query:
     def _bind(self, p: PromptSpec, join: bool = False):
         refs = tuple(self._resolve(c) for c in p.cols)
         binder = bind_join_prompt if join else bind_prompt
-        bound = binder(p.template, refs, self._tokenizer, turn=self._turn)
+        bound = binder(p.template, refs, self._tokenizer, turn=self._turn,
+                       layout=self._layout)
         for r in refs:
             self._note_doc_column(r)
         aliases = []
@@ -422,5 +424,5 @@ class Query:
 
 
 def docs(catalog: Catalog, provider: str, tokenizer=None,
-         turn: tuple[str, str] = ("", "")) -> Query:
-    return Query(catalog, provider, tokenizer, turn)
+         turn: tuple[str, str] = ("", ""), layout: str = "ai-if") -> Query:
+    return Query(catalog, provider, tokenizer, turn, layout)

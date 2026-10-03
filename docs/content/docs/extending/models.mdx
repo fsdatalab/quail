@@ -41,12 +41,51 @@ The planner uses derived properties: `kappa` (KV bytes per token),
 `W_resident` (weight bytes on GPU after discarding the full output
 head), and `act_per_token` (activation memory per token).
 
+### Qwen3 checkpoints
+
+`qwen3_spec` builds the `ModelSpec` of any Qwen3 checkpoint from its
+`config.json`. It reads the layer count, the hidden size, the head
+counts and head dim, the MLP width, the vocabulary, whether the
+output head is tied to the embedding, and the weight precision. For
+example, imagine registering a Qwen3 fine-tune that Quail does not
+ship a spec for:
+
+```python
+import quail
+from quail.specs import qwen3_spec
+
+spec = qwen3_spec(
+    "my-qwen3-1.7b",                 # the model= value
+    "Org/My-Qwen3-1.7B",             # the Hugging Face repo
+    revision="<commit hash>",
+)
+registry = quail.ExtensionRegistry.with_built_ins()
+registry.register_model(spec)
+session = quail.Session(
+    quail.EngineConfig(model="my-qwen3-1.7b", device="h100-sxm"),
+    registry=registry,
+)
+```
+
+Source:
+[quail/specs/qwen3.py](https://github.com/fsdatalab/quail/blob/main/quail/specs/qwen3.py).
+
+The checkpoint needs bf16 weights, or fp8 weights in 128 x 128
+blocks (the layout DeepGEMM reads). `qwen3_spec` raises `ValueError`
+for any other weight format, for a sliding attention window, and for
+a model type other than `qwen3`. Keyword arguments set any other
+`ModelSpec` field, such as a measured `w_mem_bytes`.
+
+`params` counts the attention and MLP projections and the norms. It
+leaves out the embedding table and the output head, because a query
+reads only the output head's TRUE and FALSE rows.
+
 ### Which models work with a spec alone
 
 The Quail executor's GPU kernels are written for the Qwen3
-architecture (QK-norm, gated SiLU MLP, FP8 block-quantized weights).
-Any Qwen3-family FP8 checkpoint can be added by registering a
-`ModelSpec` with the correct dimensions.
+architecture (QK-norm, gated SiLU MLP). FP8 checkpoints run DeepGEMM
+and both attention paths; bf16 checkpoints run cuBLAS and unified
+attention.
 
 A model with a different architecture (different attention layout,
 different activation function, different weight format) would need

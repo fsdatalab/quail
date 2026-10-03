@@ -6,8 +6,9 @@ from typing import Literal
 Precision = Literal["fp8", "bf16"]
 # What a model answers with: a generative model scores TRUE against
 # FALSE for AI_FILTER and AI_JOIN; a reranker scores yes against no
-# for AI.SCORE.
-Role = Literal["generative", "reranker"]
+# for AI.SCORE; a decision model scores its yes and no options with
+# its own head for AI_FILTER and AI_JOIN.
+Role = Literal["generative", "reranker", "decision"]
 
 # Peak per-token activation bytes per hidden dim.
 ACT_BYTES_PER_HIDDEN = 32
@@ -65,6 +66,8 @@ class ModelSpec:
     turn_prefix: str = ""     # chat-turn text before every prompt
     turn_suffix: str = ""     # chat-turn text after the answer cue
     prompt_format: str = "raw-v1"    # names the turn layout in run records
+    prompt_layout: str = "ai-if"     # the PROMPT_LAYOUTS entry AI.IF
+    #                                  prompts are written in
     chunk_cap_tokens: int = 0    # upper bound on tokens per chunk; 0
     #                              leaves the memory and kernel bounds
     moe_backend: str | None = None    # vLLM's moe_backend setting, one
