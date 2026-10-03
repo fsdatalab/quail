@@ -1,0 +1,81 @@
+---
+title: Cost model
+---
+
+The cost model estimates the time of a plan on the GPU. The
+[optimizer](/docs/architecture/optimizer) uses it to compare
+candidate plans. The reports use it for the speed-of-light (SoL)
+estimate, the lower bound of a query's time.
+
+The blog post
+[How to Cost Your AI-Powered Filters](https://fsdatalab.github.io/blog/ai-filter-cost-estimates/)
+gives the full model for filters, with an example. Pages for joins
+and classification are in progress.
+
+## The roofline model
+
+The model counts the work of each operator in four numbers:
+
+- **Tokens**: the token positions that the model computes.
+- **Attention pairs**: the (query token, key token) pairs that
+  attention computes.
+- **KV writes**: the token positions whose KV is written to GPU
+  memory.
+- **KV reads**: the token positions whose KV is read from GPU memory.
+
+It converts the counts to time for each part of the forward pass:
+the attention projections, attention, and the MLP. Each part takes
+the larger of its compute time and its memory time:
+
+```text
+time = max(FLOPs / peak FLOP/s, bytes moved / memory bandwidth)
+```
+
+- The projections and the MLP use the FP8 peak. Their weights are
+  read one time per forward pass.
+- Attention uses the BF16 peak. Its bytes are the KV writes and KV
+  reads.
+- The time of a plan is the sum of the times of the parts.
+
+The peaks and the bandwidth come from the
+[`DeviceSpec`](/docs/extending/models). The layer sizes come from the
+[`ModelSpec`](/docs/extending/models). The model has no fitted
+parameters.
+
+For a model with sliding-window layers, such as DiffusionGemma, the
+model counts the attention pairs and KV reads of those layers
+separately.
+
+## Classification
+
+A classification can need more than one forward pass per document,
+for example with `trie_decode`. A closed-form count does not fit it.
+The model replays the packing of the classification's requests into
+forward passes on the CPU, then prices each forward pass with the
+roofline model. For a large table, it replays a sample of the
+documents and scales the result.
+
+## Speed-of-light estimate
+
+`quail.speed_of_light_estimate` applies the roofline model to an
+ideal run of one query:
+
+- The GPU runs at its peak rates.
+- KV capacity has no limit, so Quail computes each document prefix
+  one time.
+- Host work, scheduling, and kernel launches take no time.
+- The survivors of each operator come from the answers that the
+  caller gives, for example saved reference labels. Estimated
+  selectivities are not used.
+- Joins are left-deep binary joins.
+
+## Code
+
+| Step | File |
+| --- | --- |
+| Count tokens, attention pairs, KV writes, and KV reads. | [`cost/work.py`](https://github.com/fsdatalab/quail/blob/main/quail/cost/work.py) |
+| Count FLOPs and bytes from the model's layer sizes. | [`cost/dense_decoder_cost.py`](https://github.com/fsdatalab/quail/blob/main/quail/cost/dense_decoder_cost.py) |
+| Convert FLOPs and bytes to time. | [`cost/roofline.py`](https://github.com/fsdatalab/quail/blob/main/quail/cost/roofline.py) |
+| Count forward passes and add the part times. | [`cost/sol.py`](https://github.com/fsdatalab/quail/blob/main/quail/cost/sol.py) |
+| Replay a classification. | [`cost/classify.py`](https://github.com/fsdatalab/quail/blob/main/quail/cost/classify.py) |
+| Estimate the time of a whole query. | [`planner/estimate.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/estimate.py) |

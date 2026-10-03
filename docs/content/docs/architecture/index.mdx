@@ -18,9 +18,10 @@ memory and needs to be recomputed).
    query) into a logical plan.
 2. The session reads Arrow batches from each registered table and
    tokenizes the document columns.
-3. The [planner](https://github.com/fsdatalab/quail/blob/main/quail/planner/decide.py)
-   proposes one or more physical plans with cost estimates. The
-   cheapest one is selected.
+3. The [optimizer](/docs/architecture/optimizer) rewrites the logical
+   plan with named rules and builds the physical plan. The
+   [cost model](/docs/architecture/cost-model) estimates the time of
+   each candidate plan.
 4. The [runner](https://github.com/fsdatalab/quail/blob/main/quail/execution/runner.py)
    executes the physical graph. LLM nodes run on the GPU.
    Relational nodes run with Arrow on the CPU.

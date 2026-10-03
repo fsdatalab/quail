@@ -21,7 +21,7 @@ Every operator in the plan is priced or refused: an Apply, an AI.SCORE
 predicate or column, a LIMIT, or a join without full semantics raises
 NotImplementedError.
 
-The equations are in docs/content/docs/architecture/planning.mdx. The
+docs/content/docs/architecture/cost-model.mdx describes the model. The
 work counting and component pricing are the planner's own
 (quail.cost.work, quail.cost.sol); the search does not call or
 simulate the production planner.

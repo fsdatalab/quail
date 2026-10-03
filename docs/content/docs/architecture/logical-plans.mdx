@@ -195,32 +195,7 @@ tokenization difference.
 
 ## Logical rules
 
-```python
-class LogicalOptimizerRule(Protocol):
-    name: str
-    def rewrite(self, root, context) -> LogicalNode | None: ...
-```
-
-A rule gets the whole plan and returns a new root, or `None` if
-nothing changed. `apply_logical_rules` runs the rules in order and
-repeats until a pass leaves the plan unchanged or four passes have
-run. The limit is `MAX_PASSES` in `logical_optimizer.py`. See
-[rule order and precedents](/docs/extending/operators#optional-logical-and-physical-rules).
-
-Quail has five built-in logical rules, in
-[`logical_rules.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/logical_rules.py).
-They run in this order:
-
-| Rule | What it does |
-| --- | --- |
-| `projection_pushdown` | Each `Scan` loads only the columns that the query uses. |
-| `filter_pushdown` | Moves a filter that does not use the model, such as an `Apply` or a label `Filter`, below the joins, onto its table. |
-| `classify_placement` | For a joined table, puts its classifications before the joins or after them, whichever plan has the lower estimated time. |
-| `filter_order` | Orders each table's `AI.IF` predicates by expected cost. |
-| `join_order` | Chooses the join order and the anchor of each join by expected cost. |
-
-The last three rules use cost estimates from the model and device
-specs. See [Planning](/docs/architecture/planning).
-
-Extensions can register additional rules through
-`registry.register_logical_rule(...)`.
+Logical rules rewrite the logical plan before Quail builds the
+physical plan. For the built-in rules and their order, see the
+[optimizer](/docs/architecture/optimizer#rules). To write a rule, see
+[Rules](/docs/extending/rules).
