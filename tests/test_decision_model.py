@@ -382,23 +382,64 @@ def test_stock_vllm_plans_decision_readouts_from_the_layout(session):
     vllm.close()
 
 
-def test_vllm_decision_head_scores_the_rows_at_each_request_offsets():
+class _PoolingState:
+    def __init__(self):
+        self.hidden_states_cache = []
+
+    def clean(self):
+        self.hidden_states_cache.clear()
+
+
+def test_vllm_decision_pooler_reads_offsets_across_prefill_chunks():
     torch = pytest.importorskip("torch")
-    from quail.backends.vllm_decision import score_requests
+    from quail.backends.vllm_decision import pool_decision_rows
 
     head = SimpleNamespace(scores=lambda options, last: options[..., 0]
                            * 100 + last[:, None, 0])
     rows = torch.arange(10.0)[:, None].repeat(1, 2)
+    states = [_PoolingState(), _PoolingState()]
 
     def params(offsets):
         return SimpleNamespace(extra_kwargs={"decision_offsets": offsets})
 
-    # request 1 is still prefilling; request 3 is vLLM's profiling run
-    partial, done, short, probe = score_requests(
-        torch, head, [None, rows[:8], rows[:4], rows[:6]],
-        [params([3, 1, 0]), params([3, 1, 0]), params([2, 0]),
-         SimpleNamespace(extra_kwargs=None)])
-    assert partial is None
+    # request 0 prefills rows 0-4 then 5-7; request 1 starts from a
+    # prefix-cache hit and computes only its last row
+    assert pool_decision_rows(torch, head, [rows[:5]], [False],
+                              [params([3, 1, 0])], states[:1]) == [None]
+    done, missing = pool_decision_rows(
+        torch, head, [rows[5:8], rows[9:10]], [True, True],
+        [params([3, 1, 0]), params([2, 0])], states)
     assert done.tolist() == [4 * 100 + 7, 6 * 100 + 7]
-    assert short.tolist() == [1 * 100 + 3]
-    assert probe.tolist() == [5.0]
+    assert torch.isnan(missing).all()
+    assert all(not state.hidden_states_cache for state in states)
+
+
+def test_vllm_decision_client_reruns_a_request_without_its_rows():
+    from quail.backends import vllm_decision
+
+    def output(request_id, data):
+        return SimpleNamespace(request_id=request_id, finished=True,
+                               outputs=SimpleNamespace(data=data))
+
+    torch = pytest.importorskip("torch")
+    added = []
+
+    class Engine:
+        def add_request(self, request_id, prompt, params):
+            added.append((request_id, params.skip_reading_prefix_cache))
+
+        def step(self):
+            request_id, uncached = added[-1]
+            nan = torch.tensor([float("nan"), float("nan")])
+            return [output(request_id, torch.tensor([0.0, 1.0])
+                           if uncached else nan)]
+
+    params = SimpleNamespace(skip_reading_prefix_cache=False)
+    params.clone = lambda: SimpleNamespace(**vars(params))
+    client = vllm_decision.VLLMDecisionClient(
+        SimpleNamespace(llm_engine=Engine()), {})
+    (result,) = client.generate([{"prompt_token_ids": [1, 2]}], params)
+    assert [uncached for _, uncached in added] == [False, True]
+    assert result.request_id == added[0][0]
+    assert vllm_decision.decision_bit(result) == 1
+    assert client.recomputed == 1

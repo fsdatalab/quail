@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import os
 import time
 from contextlib import contextmanager
@@ -171,22 +170,6 @@ class VLLMClient:
         )
 
 
-class VLLMDecisionClient(VLLMClient):
-    """A VLLMClient whose requests pool a decision model's option scores.
-
-    Prompts are token ids: the layout tokenizes each segment apart, so
-    rendering text and tokenizing it again would change the prompt.
-    """
-
-    accepts_text = False
-
-    def generate(self, prompts, pooling_params, use_tqdm=False):
-        from quail.backends.vllm_decision import TASK
-
-        return self.llm.encode(prompts, pooling_params, use_tqdm=use_tqdm,
-                               pooling_task=TASK)
-
-
 class VLLMEngine:
     """Boot vLLM for a request backend, with Quail's tuned engine settings."""
 
@@ -225,7 +208,9 @@ class VLLMEngine:
     def boot(self, spec, allowed_ids: list[int]) -> tuple[dict, dict]:
         """Load the spec's model and return the engine state and boot record."""
         if spec.role == "decision":
-            return self._boot_decision(spec)
+            from quail.backends.vllm_decision import boot_decision
+
+            return boot_decision(spec, self.llm_kwargs(spec))
         from vllm import LLM, SamplingParams
         from vllm.renderers.registry import RENDERER_REGISTRY
         from vllm.tokenizers import TokenizerRegistry
@@ -279,49 +264,6 @@ class VLLMEngine:
                 "kv_profile_s": None,
                 "boot_s": round(boot_s, 2),
             },
-        )
-
-    def _boot_decision(self, spec) -> tuple[dict, dict]:
-        """Load a decision checkpoint on the pooling runner.
-
-        Each query sets its own pooling parameters from its plan.
-        Prompts arrive as token ids, so vLLM's own tokenizer is never
-        used.
-        """
-        from vllm import LLM
-
-        from quail.backends.quail.executor.model import checkpoint_path
-        from quail.backends.vllm_decision import (
-            ARCHITECTURE,
-            pooling_params,
-            register,
-        )
-
-        register()
-        llm_kwargs = {key: value for key, value in self.llm_kwargs(spec).items()
-                      if key != "tokenizer_mode"}
-        started = time.perf_counter()
-        llm = LLM(model=checkpoint_path(spec.hf_name, spec.revision),
-                  runner="pooling",
-                  hf_overrides={"architectures": [ARCHITECTURE]}, **llm_kwargs)
-        boot_s = time.perf_counter() - started
-        config = llm.llm_engine.vllm_config
-        params = pooling_params((1, 0))
-        params.verify(config.model_config)
-        capacity = _capacity(llm)
-        capacity.update(
-            enable_prefix_caching=config.cache_config.enable_prefix_caching,
-            prefix_cache_reads=not params.skip_reading_prefix_cache,
-            enable_chunked_prefill=config.scheduler_config.enable_chunked_prefill,
-            runner="pooling", architecture=ARCHITECTURE)
-        client = VLLMDecisionClient(llm, capacity)
-        (warm,) = client.generate([{"prompt_token_ids": [0, 0]}], params)
-        if not all(math.isfinite(float(v)) for v in warm.outputs.data):
-            raise RuntimeError("the decision pooler returned no scores")
-        return (
-            {"client": client, "sampling_params": params, "capacity": capacity},
-            {"kind": "cold", "llm_init_s": round(boot_s, 2), "weight_load_s": None,
-             "kv_profile_s": None, "boot_s": round(boot_s, 2)},
         )
 
 
