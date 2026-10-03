@@ -106,7 +106,11 @@ class AsyncScores:
         logits = rows.F.linear(normed.float(), self.weights)
         yes = logits.index_select(1, rows.true_cols).amax(dim=1)
         no = logits.index_select(1, rows.false_cols).amax(dim=1)
-        scores = torch.sigmoid(yes - no)
+        return self._copy(torch.sigmoid(yes - no))
+
+    def _copy(self, scores):
+        """Copy scores to a pinned host buffer behind an event."""
+        torch = self.torch
         host = self.available.pop() if self.available else None
         if host is None or host.numel() < scores.shape[0]:
             host = torch.empty(scores.shape[0], dtype=torch.float32, pin_memory=True)
@@ -202,3 +206,21 @@ class AsyncDecisions:
         return event, host
 
     result = staticmethod(AsyncAnswers.result)
+
+
+class AsyncDecisionScores(AsyncScores):
+    """Non-blocking AI.SCORE readout of a decision head: P(yes) over No and Yes.
+
+    Takes the same three rows per answer as AsyncDecisions.
+    """
+
+    def __init__(self, torch, head):
+        self.torch = torch
+        self.head = head
+        self.rows = None
+        self.available = []
+
+    def submit(self, normed):
+        rows = normed.view(-1, 3, normed.shape[-1])
+        scores = self.head.scores(rows[:, :2], rows[:, 2])
+        return self._copy(self.torch.sigmoid(scores[:, 1] - scores[:, 0]))

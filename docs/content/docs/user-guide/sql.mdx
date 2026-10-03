@@ -188,6 +188,9 @@ config = quail.EngineConfig(
   0.5 and the `AI.IF` answer can differ on some rows. On four QUAIL-B
   filters they differed on 0% to 2.4% of rows for Qwen3 32B and
   DiffusionGemma, and on 1.7% to 10% of rows for Qwen3 4B.
+- The decision model, `decision-2.0-kai-0.6b-bf16`, uses its own
+  yes/no question layout and returns its head's probability of `Yes`
+  over `No`.
 
 Use `gpus` to run a model copy on each GPU.
 

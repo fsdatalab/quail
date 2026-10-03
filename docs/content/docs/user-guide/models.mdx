@@ -67,7 +67,8 @@ Scores near a threshold can select different rows.
 
 [Decision-2.0-Kai-0.6B](https://huggingface.co/vllm-sr/Decision-2.0-Kai-0.6B)
 is a decision model from vLLM Semantic Router. It supports filter and
-join predicates. It does not support `AI.SCORE`, and the stock vLLM
+join predicates and `AI.SCORE`, whose score is the head's probability
+of `Yes` over `No`. The stock vLLM
 and SGLang backends do not run it.
 
 The model is a Qwen3-0.6B network with a separate classifier head.

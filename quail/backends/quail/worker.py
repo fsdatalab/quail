@@ -18,6 +18,7 @@ from quail.backends.quail.executor.readout import (
     AnswerRows,
     AsyncAnswers,
     AsyncDecisions,
+    AsyncDecisionScores,
     DecisionHead,
 )
 from quail.backends.quail.graph import (
@@ -126,8 +127,10 @@ class LoadedGpu:
         if arena_pages is not None:
             self.arena.resize(*arena_pages, free_resident=True)
         rows = AnswerRows(self.torch, self.F, self.model, true_ids, false_ids)
+        async_scores = None
         if self.decision_head is not None:
             self.async_ans = AsyncDecisions(self.torch, self.decision_head)
+            async_scores = AsyncDecisionScores(self.torch, self.decision_head)
         else:
             self.async_ans = AsyncAnswers(self.torch, rows)
         self.chunk_tokens = chunk_tokens
@@ -136,6 +139,7 @@ class LoadedGpu:
             async_answers=self.async_ans,
             answer_rows=rows,
             chunk_tokens=chunk_tokens,
+            async_scores=async_scores,
         )
 
     def warm(self):

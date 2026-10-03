@@ -60,17 +60,21 @@ class QuailModelExecution:
         self._reranker = None
 
     def bind_query(self, *, torch, async_answers, answer_rows,
-                   chunk_tokens: int) -> None:
+                   chunk_tokens: int, async_scores=None) -> None:
         """Attach state that is valid for the current query.
 
         answer_rows are the retained output rows every readout scores
         against; async_answers is the TRUE/FALSE readout over them.
+        async_scores is the AI.SCORE readout of a model that does not
+        score with answer rows, or None to score yes against no over
+        answer_rows.
         """
         self._state.update(
             torch=torch,
             async_answers=async_answers,
             answer_rows=answer_rows,
             chunk_tokens=chunk_tokens,
+            score_readout=async_scores,
         )
 
     def execute(
@@ -368,16 +372,6 @@ class QuailBackend:
                     unit="AI.SCORE expressions",
                 )
                 return (PhysicalCandidate(None, refusal, float("inf")),)
-        if context.model.role == "decision" and has_score:
-            refusal = Refusal(
-                reasons=("a decision model answers AI.IF filters and joins, "
-                         "not AI.SCORE",),
-                constraint="decision_no_scores",
-                needed=0,
-                available=1,
-                unit="AI.SCORE expressions",
-            )
-            return (PhysicalCandidate(None, refusal, float("inf")),)
         if has_score:
             return plan_reranker(region, context, backend_name=self.name)
 

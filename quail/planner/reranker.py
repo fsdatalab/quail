@@ -599,10 +599,10 @@ def _plan_reranker(region, context, *, backend_name: str):
             "estimated_attention_pairs": total_work.pairs,
             "batching": "token_based_admission",
             "data_parallel_copies": context.gpu_count,
-            "score_normalization": (
-                "yes_no_softmax" if context.model.role == "reranker"
-                else "true_false_softmax"
-            ),
+            "score_normalization": {
+                "reranker": "yes_no_softmax",
+                "decision": "decision_head_softmax",
+            }.get(context.model.role, "true_false_softmax"),
             "order_rule": "cost_per_expected_rejection",
         },
     )

@@ -45,11 +45,13 @@ class QuailScorer:
             total = int(prefix_lengths[anchor_index].sum()
                         + suffix_lengths[candidate_index].sum())
         keys = [("score", spec.name, index) for index in range(len(prefixes))]
-        answer_rows = state["answer_rows"]
-        async_scores = state.get("async_scores")
-        if async_scores is None or async_scores.rows is not answer_rows:
-            async_scores = AsyncScores(state["torch"], answer_rows)
-            state["async_scores"] = async_scores
+        async_scores = state.get("score_readout")
+        if async_scores is None:
+            answer_rows = state["answer_rows"]
+            async_scores = state.get("async_scores")
+            if async_scores is None or async_scores.rows is not answer_rows:
+                async_scores = AsyncScores(state["torch"], answer_rows)
+                state["async_scores"] = async_scores
         if "input_staging" not in state:
             state["input_staging"] = InputStaging(state["torch"])
         state["input_staging"].fixed_tokens.clear()

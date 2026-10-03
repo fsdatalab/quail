@@ -25,7 +25,7 @@ from quail.logical import (
     render_join_prompt_ids,
     render_join_prompt_text,
 )
-from quail.physical import AiFilter, AiJoin
+from quail.physical import AiFilter, AiJoin, AiScore
 from quail.planner.plan import EngineConfig, Refusal
 from quail.specs import DECISION_2_KAI_0_6B_BF16, H100_SXM
 
@@ -195,7 +195,7 @@ def session(tmp_path):
     value.close()
 
 
-def test_plans_carry_the_decision_layout_and_refuse_scores(session):
+def test_plans_carry_the_decision_layout(session):
     plan = session.sql(
         "SELECT d.id FROM documents d "
         "WHERE AI_FILTER(PROMPT('Asks for a refund? {0}', d.body))").plan()
@@ -217,8 +217,12 @@ def test_plans_carry_the_decision_layout_and_refuse_scores(session):
     plan = session.sql(
         "SELECT d.id, AI.SCORE(PROMPT('Refund? {0}', d.body)) AS s "
         "FROM documents d").plan()
-    assert isinstance(plan, Refusal)
-    assert plan.constraint == "decision_no_scores"
+    assert not isinstance(plan, Refusal)
+    assert plan.settings["score_normalization"] == "decision_head_softmax"
+    (score,) = [n for n in plan.nodes if isinstance(n, AiScore)]
+    preamble, tail = score.spec.prompt_token_parts
+    assert "".join(preamble) == "Context:\n"
+    assert "".join(tail).endswith(OPTIONS + CLOSING)
 
     engine = SimpleNamespace(label="stock vLLM", kind="vllm")
     backend = RequestBackend(name="stock", engine=engine,
