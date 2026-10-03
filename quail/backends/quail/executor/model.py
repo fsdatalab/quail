@@ -216,7 +216,7 @@ def load_model(model_name: str, revision: str | None = None, *,
         from quail.backends.vllm_decision import register
 
         register()
-    args = dict(dtype="auto", enforce_eager=True, **engine_args(model_path))
+    args = {"dtype": "auto", "enforce_eager": True} | engine_args(model_path)
     if max_batched_tokens is not None:
         args["max_num_batched_tokens"] = int(max_batched_tokens)
     if moe_backend is not None:
