@@ -7,6 +7,7 @@ from quail.catalog import Catalog
 from quail.frontend.label_tables import read_label_table
 from quail.logical import (
     Alias,
+    ColumnPredicate,
     ColumnRef,
     CompileError,
     Equality,
@@ -30,10 +31,37 @@ class ColSpec:
     column: str
 
     def __eq__(self, other):
-        """``col("c.url") == col("e.url")`` is a join condition."""
-        if not isinstance(other, ColSpec):
-            return NotImplemented
-        return EqualsSpec(self, other)
+        """``col("c.url") == col("e.url")`` is a join condition.
+
+        Compared with a literal, it is a column test for ``where()``.
+        """
+        if isinstance(other, ColSpec):
+            return EqualsSpec(self, other)
+        return PredicateSpec(self, "=", other)
+
+    def __ne__(self, other):
+        return PredicateSpec(self, "<>", other)
+
+    def __lt__(self, other):
+        return PredicateSpec(self, "<", other)
+
+    def __le__(self, other):
+        return PredicateSpec(self, "<=", other)
+
+    def __gt__(self, other):
+        return PredicateSpec(self, ">", other)
+
+    def __ge__(self, other):
+        return PredicateSpec(self, ">=", other)
+
+    def isin(self, values) -> "PredicateSpec":
+        return PredicateSpec(self, "in", tuple(values))
+
+    def is_null(self) -> "PredicateSpec":
+        return PredicateSpec(self, "is null")
+
+    def is_not_null(self) -> "PredicateSpec":
+        return PredicateSpec(self, "is not null")
 
     def asc(self) -> "SortSpec":
         return SortSpec(self)
@@ -87,6 +115,14 @@ class EqualsSpec:
 
 
 @dataclass(frozen=True)
+class PredicateSpec:
+    """An unresolved column test for ``where()``."""
+    col: ColSpec
+    comparison: str
+    value: object = None
+
+
+@dataclass(frozen=True)
 class PromptSpec:
     template: str
     cols: tuple
@@ -123,6 +159,7 @@ class Query:
         self._applies = {}           # alias -> [(name, kind, ids, refs)]
         self._functions = {}         # name -> the Python function
         self._labels = {}            # name -> Alias of an AI.CLASSIFY call
+        self._column_predicates = {}  # alias -> [ColumnPredicate]
         self._limit = None
         self._order = []             # (column or name, descending, nulls_first)
         self._offset = 0
@@ -537,6 +574,25 @@ class Query:
                                     anchor=anchor))
         return self
 
+    def where(self, *tests) -> "Query":
+        """Keep the documents that pass column tests, before any model call.
+
+        Args:
+            tests: Comparisons of a ``col(...)`` with a literal, such as
+                ``col("r.year") > 2020``, or ``col(...).isin([...])``,
+                ``col(...).is_null()``, or ``col(...).is_not_null()``.
+        """
+        for test in tests:
+            if not isinstance(test, PredicateSpec):
+                raise CompileError(
+                    f"where() takes column tests such as col('r.year') > "
+                    f"2020, got {test!r}")
+            ref = self._resolve(test.col)
+            predicate = ColumnPredicate(ref, test.comparison, test.value)
+            predicate.validate()
+            self._column_predicates.setdefault(ref.alias, []).append(predicate)
+        return self
+
     def limit(self, n: int) -> "Query":
         if not isinstance(n, int) or n <= 0:
             raise CompileError("LIMIT must be a positive integer")
@@ -593,7 +649,7 @@ class Query:
             if isinstance(c, str) and c in self._labels:
                 columns.append(self._labels[c])
                 continue
-            if c == "*":
+            if isinstance(c, str) and c == "*":
                 for alias, provider in self._tables:
                     for name in self._catalog.get(provider).columns:
                         columns.append(ColumnRef(alias=alias,
@@ -619,6 +675,8 @@ class Query:
                 tuple((column.expression, column.name) for column in wanted
                       if column.expression.aliases() == (alias,)),
                 tuple(self._label_filters.get(alias, ())),
+                column_predicates=tuple(
+                    self._column_predicates.get(alias, ())),
             )
         for join in self._joins:
             logical.add_join(join)
