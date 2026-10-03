@@ -282,6 +282,13 @@ class _Table:
             resident: Whether document KV is already available.
         """
         head, tail = spec.prompt_token_parts
+        if spec.scoring == DECISION_SCORING:
+            return classify_cost.estimate_chains(
+                len(head), spec.frame_tokens, [len(tail) - spec.frame_tokens],
+                live=spec.expected_inputs, lengths=self.lengths,
+                shared=self.shared, chunk=self.chunk,
+                capacity=self.capacity or self.budget, model=self.model,
+                device=self.device, resident=resident)
         return self.simulate(
             spec.scoring, spec.expected_inputs, len(head), len(tail) - 1,
             spec.label_token_ids, resident)

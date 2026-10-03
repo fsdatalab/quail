@@ -280,3 +280,19 @@ def test_decision2_package_converts_once_to_a_bf16_qwen3_checkpoint(
     assert sorted(p.name for p in (tmp_path / dest).glob("*.safetensors")) == [
         "model.safetensors"]
     assert not model.is_decision2(dest)
+
+
+def test_a_decision_classification_is_reestimated(session):
+    from quail.planner.classify import _Table
+
+    plan = session.sql(
+        "SELECT d.id, AI.CLASSIFY(d.body, ARRAY['x', 'y']) AS c "
+        "FROM documents d").plan()
+    (node,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
+    table = _Table(alias="d", mean=100, longest=100, budget=65_536,
+                   chunk=65_536, backend_name="quail",
+                   model=DECISION_2_KAI_0_6B_BF16, device=H100_SXM,
+                   tokenizer=_tokens, capacity=1_000_000,
+                   lengths=(100,) * 50, shared=(0,) + (60,) * 49)
+    spec = table.reestimate(node.spec, resident=True)
+    assert spec.scoring == "decision_choice" and spec.estimated_seconds > 0
