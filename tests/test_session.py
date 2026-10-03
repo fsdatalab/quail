@@ -347,6 +347,14 @@ def test_order_by_offset_and_distinct_run_on_the_result():
         "'q2: {0}', r.review)) ORDER BY r.stars LIMIT 2"
     ), make_executor({"r": {"q2:": [1, 1, 1, 1, 1, 1]}}))
     assert result.to_rows() == [(1,), (2,)]
+
+    from quail.frontend.builder import col, prompt
+    built = (session.docs("reviews").alias("r")
+             .ai_filter(prompt("q2: {0}", col("r.review")))
+             .order_by(("r.stars", "desc", "nulls last")).offset(1).distinct()
+             .limit(2).select("r.stars"))
+    result = _run(built, make_executor({"r": {"q2:": [1, 1, 1, 1, 1, 1]}}))
+    assert result.to_rows() == [(4,), (3,)]
     session.close()
 
 

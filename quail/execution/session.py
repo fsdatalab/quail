@@ -595,6 +595,18 @@ class BoundBuilder:
         self._inner.limit(n)
         return self
 
+    def order_by(self, *keys):
+        self._inner.order_by(*keys)
+        return self
+
+    def offset(self, n):
+        self._inner.offset(n)
+        return self
+
+    def distinct(self):
+        self._inner.distinct()
+        return self
+
     def select(self, *cols, order=None) -> "Query":
         return Query(self._session, self._inner.select(*cols),
                      order=order)
