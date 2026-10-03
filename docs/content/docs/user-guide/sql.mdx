@@ -51,14 +51,12 @@ PROMPT('Does the review discuss this aspect?\n\nReview: {0}\nAspect: {1}',
 
 Here `{0}` is the review and `{1}` is the aspect.
 
-## AI operators
-
-### AI.IF
+## AI.IF
 
 `AI.IF` takes a `PROMPT` and evaluates it on each row or each pair
 of rows. The model returns TRUE or FALSE.
 
-#### Filtering
+### Filtering
 
 Use `AI.IF` in a `WHERE` clause to filter rows:
 
@@ -72,7 +70,7 @@ WHERE AI.IF(PROMPT('Does this review mention a positive aspect?\n\n{0}', r.body)
 Use `AND` to combine filters. All AI filters on one table must read the
 same document column.
 
-#### Joining
+### Joining
 
 Use `AI.IF` to join two tables with a natural language condition:
 
@@ -98,7 +96,7 @@ JOIN evidence e
 
 The model evaluates only pairs where `c.wiki_url = e.id`.
 
-#### EXISTS and NOT EXISTS
+### EXISTS and NOT EXISTS
 
 `EXISTS` keeps a row if the subquery returns at least one match.
 `NOT EXISTS` keeps it if the subquery returns no matches.
@@ -127,7 +125,7 @@ WHERE NOT EXISTS (
 
 The subquery must be `SELECT 1 FROM <table> WHERE AI.IF(...)`.
 
-#### Options
+### Options
 
 Both `AI.IF` and `AI_FILTER` accept an optional second argument with
 planning hints:
@@ -145,13 +143,13 @@ AI_FILTER(PROMPT(...), {'selectivity': 0.3, 'anchor': 'r'})
   selects the anchor using estimated query time. See
   [Joins](/docs/architecture/execution#joins).
 
-### AI.SCORE
+## AI.SCORE
 
 Unlike `AI.IF`, which returns only TRUE or FALSE, `AI.SCORE(PROMPT(...))`
 returns a score between 0 and 1 as a `FLOAT64`. Higher scores indicate a
 stronger model preference for a positive answer to your question.
 
-#### Return scores
+### Return scores
 
 For example, imagine a `documents` table where each row is a customer
 support request. Its `body` column contains the request text. Return the
@@ -166,7 +164,7 @@ FROM documents d
 
 A score in `SELECT` requires a column alias with `AS`.
 
-#### Filter rows
+### Filter rows
 
 Compare the score with `<`, `<=`, `>`, or `>=`. For the same support
 requests, keep rows with a refund score of at least 0.75:
@@ -187,7 +185,7 @@ The optional `selectivity` hint estimates the fraction of rows that pass
 the comparison. It defaults to `0.2` and does not change the scores.
 See [Options](#options).
 
-#### Join tables
+### Join tables
 
 For example, imagine a `queries` table of search queries and a `documents`
 table of articles. Match each query with articles whose relevance score
@@ -207,7 +205,7 @@ once. Refer to that document in words if you need to mention it again.
 To return a score for every pair without filtering, use `CROSS JOIN`
 and put `AI.SCORE` in `SELECT`.
 
-#### Model behavior
+### Model behavior
 
 All [supported models](/docs/user-guide/models) can run `AI.SCORE`:
 
@@ -224,7 +222,7 @@ Quail computes a repeated score once when it appears in `SELECT` and a
 condition, or in several comparisons. A query cannot combine `AI.SCORE`
 with `AI.IF`.
 
-### AI.CLASSIFY
+## AI.CLASSIFY
 
 `AI.CLASSIFY` returns one of your supplied categories as a `STRING`.
 For example, imagine a `reviews` table with review text in `body`. Return
@@ -239,81 +237,51 @@ FROM reviews r;
 A classification in `SELECT` requires a column alias with `AS`. The call
 must be a separate item, rather than part of a larger expression.
 
-#### Required arguments
+### Arguments
 
 `AI.CLASSIFY(input, categories[, options])`
 
 | Argument | Type | Description |
 | --- | --- | --- |
-| `input` | `STRING` column or `PROMPT` | The document to classify. A `PROMPT` can add a question or refer to two documents. |
-| `categories` | `ARRAY` or table name | 2 to 255 labels. Labels must not be empty, and two labels must not differ only in case. |
+| `input` | `STRING` column or `PROMPT` | The document to classify. Use `PROMPT` to add instructions or refer to two documents. |
+| `categories` | `ARRAY` or table name | 2 to 255 labels. Labels must not be empty or differ only in case. |
+| `options` | Object | Optional parameters listed below. |
 
-Supply labels as strings, such as `ARRAY['refund', 'praise']`.
-When labels have the same score, Quail returns the first in the list.
-You can also specify the argument with
-`categories => ARRAY['refund', 'praise']`.
+Each category can have a description of up to 25 words. For example,
+`ARRAY[('refund', 'asks for money back'), ('praise', 'expresses approval')]`.
+If labels have the same score, Quail returns the first in the list.
 
-##### Category descriptions
+<details>
+<summary>Other category formats</summary>
 
-Each label can have a description of up to 25 words that explains what
-the category means. Use label and description pairs or objects:
+You can supply categories as objects:
 
 ```sql
-ARRAY[('refund', 'asks for money back'), ('praise', NULL)]
 ARRAY[{'label': 'refund', 'description': 'asks for money back'}, {'label': 'praise'}]
 ```
 
-##### Categories from a table
+You can also use a registered table with a `label` column and optional
+`description` and integer `ordinal` columns. Quail sorts by `ordinal`
+if present, otherwise by label text.
 
-You can pass a registered table, such as `kinds`, as `categories`.
-The table must have a `label` column. It can also have a `description`
-column and an integer `ordinal` column. Quail sorts by `ordinal` if
-present, otherwise by label text.
+</details>
 
-#### Optional parameters
+### Optional parameters
 
-Pass an object as the third argument to set these parameters.
+Pass an object as the third argument, such as `{'probabilities': true}`.
 
-##### Task description
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `task_description` | Empty | Extra instructions, up to 50 words. |
+| `selectivity` | `0.2` | Estimated fraction of rows kept by a condition on the label. Does not change model answers. |
+| `probabilities` | `false` | Return each category's probability in `<name>_probabilities`, a `MAP<STRING, DOUBLE>`. |
 
-`task_description` adds instructions of up to 50 words. It is empty by
-default. For example,
-`{'task_description': 'Classify the sentiment about the acting.'}`.
+The probabilities sum to 1. They are available for individual documents;
+classifications of joined rows return labels only.
 
-##### Selectivity
+### Query examples
 
-`selectivity` estimates the fraction of rows kept by a `WHERE` condition
-on the label. It defaults to `0.2` and does not change the labels.
-See [Options](#options) for how Quail uses this hint.
-
-##### Probabilities
-
-Set `probabilities` to `true` to return `<name>_probabilities` alongside
-the label column. The value is a `MAP<STRING, DOUBLE>` from each category
-to its probability. The probabilities sum to 1 and describe the model's
-preference among the supplied categories. The default is `false`.
-
-```sql
-SELECT r.id,
-       AI.CLASSIFY(PROMPT('What sentiment does this review express? {0}', r.body),
-                   ARRAY['positive', 'negative', 'mixed'],
-                   {'probabilities': true}) AS sentiment
-FROM reviews r;
-```
-
-One example output row:
-
-```text
-id  sentiment  sentiment_probabilities
-1   positive   {'positive': 0.90, 'negative': 0.03, 'mixed': 0.07}
-```
-
-Probabilities are available for classifications of individual documents.
-Classifications of joined rows return labels only.
-
-#### Query examples
-
-##### Filter by category
+#### Filter by category
 
 Use `IN` in `WHERE` to keep negative or mixed reviews:
 
@@ -332,7 +300,7 @@ WHERE AI.CLASSIFY(PROMPT('What sentiment does this review express? {0}', r.body)
 - Quail evaluates the repeated classification once and uses its label
   in both `SELECT` and `WHERE`.
 
-##### Classify joined rows
+#### Classify joined rows
 
 Use a `PROMPT` that refers to both documents to classify joined rows.
 For example, imagine a `reviews` table of movie reviews and an `aspects`
@@ -356,23 +324,10 @@ These limits apply:
 - A `WHERE` condition cannot test the label of a joined row.
 - A query cannot classify joined rows and also use `AI.SCORE`.
 
-#### Classification answers
-
-After running a classification query, read all computed labels from
-`result.answer_tables`. The table includes labels for rows removed by a
-later filter. For the sentiment query:
-
-```python
-labels = result.answer_tables["classifies"]["sentiment"]
-print(labels.to_pydict())
-```
-
-The table contains `r` and `sentiment`. The `r` values are input row
-indices starting at zero, rather than the review IDs in `r.id`.
-For joined rows, the table has an index column for each table alias.
-
-See [Label scoring](/docs/architecture/execution#label-scoring) for how
-Quail selects a label.
+For labels computed before later filters, see
+[Classification answers](/docs/user-guide/results#classification-answers).
+For the scoring methods, see
+[Label scoring](/docs/architecture/execution#label-scoring).
 
 ## SELECT, FROM, JOIN, LIMIT
 
