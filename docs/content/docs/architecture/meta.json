@@ -3,10 +3,10 @@
   "pages": [
     "index",
     "logical-plans",
+    "optimizer",
     "physical-plans",
-    "planning",
     "execution",
-    "prefix-caching"
+    "kv"
   ],
   "defaultOpen": false
 }

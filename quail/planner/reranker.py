@@ -19,16 +19,24 @@ from quail.logical.prompts import (
     true_false_token_ids,
 )
 from quail.physical import (
+    AiClassify,
     AiScore,
+    Comparison,
+    Filter,
+    InList,
     Limit,
     PortRef,
     Project,
     Scan,
-    ScoreFilter,
     ScoreSpec,
 )
 from quail.physical.base import input_ports
 from quail.planner import hash_join_nodes
+from quail.planner.classify import (
+    ClassifyRefusedError,
+    classification_refusal,
+    classify_table,
+)
 from quail.planner.physical_optimizer import PhysicalCandidate
 from quail.planner.plan import PhysicalPlan, Refusal
 from quail.reranker import render_qwen3_reranker_input
@@ -206,7 +214,11 @@ def _score_spec(
         token_parts_by_prompt[prompt] = token_parts
     aliases = _prompt_aliases(prompt)
     lengths = [context.document_tokens[alias] for alias in aliases]
-    fixed_tokens = sum(map(len, token_parts)) + context.model.canvas_tokens
+    canvas = context.model.canvas_tokens
+    # a one-table score on a canvas model may average noise draws, each
+    # the cue and its canvas after the document's KV; every draw is priced
+    draws = context.canvas_draws if canvas and len(aliases) == 1 else 1
+    fixed_tokens = sum(map(len, token_parts)) + canvas + (draws - 1) * (1 + canvas)
     shared = len(token_parts[0])
     prefix = float(shared)
     prefix_variance = 0.0
@@ -245,6 +257,7 @@ def _score_spec(
         estimated_seconds=estimate,
         pair_fraction=pair_fraction,
         prompt_token_parts=token_parts,
+        draws=draws,
     ), work
 
 
@@ -252,7 +265,7 @@ def _projection_scores(logical) -> tuple[Alias, ...]:
     return tuple(
         expression
         for expression in logical.root.columns
-        if isinstance(expression, Alias)
+        if isinstance(expression, Alias) and expression.expression.kind == "score"
     )
 
 
@@ -309,6 +322,8 @@ def plan_reranker(region, context, *, backend_name: str):
         return _plan_reranker(region, context, backend_name=backend_name)
     except _RefusedError as refused:
         return (PhysicalCandidate(None, refused.refusal, float("inf")),)
+    except ClassifyRefusedError as refused:
+        return (PhysicalCandidate(None, refused.refusal(), float("inf")),)
 
 
 def _plan_reranker(region, context, *, backend_name: str):
@@ -320,16 +335,29 @@ def _plan_reranker(region, context, *, backend_name: str):
     operators = logical.operators()
     scans, filters, joins = operators.scans, operators.filters, operators.joins
     projected = _projection_scores(logical)
+    labels = operators.labels
+    if labels.calls:
+        refusal = classification_refusal(context)
+        if refusal is not None:
+            raise _RefusedError(refusal)
+        if any(len(call.aliases()) != 1 for call, _ in labels.calls):
+            raise _RefusedError(_refusal(
+                "AI.CLASSIFY over a document pair needs its AI join pipeline "
+                "on one GPU; AI.SCORE plans cannot execute that classification",
+                "joined_classify_pipeline"))
     predicates = [
         predicate
         for values in filters.values()
         for predicate in values
     ] + list(joins)
-    if not predicates and not projected:
+    tests = [test for values in operators.label_filters.values()
+             for test in values]
+    if not predicates and not tests and not projected:
         refusal = _refusal("a reranker model can only be used with AI.SCORE",
                            "reranker_only_scores")
         return (PhysicalCandidate(None, refusal, float("inf")),)
     prompts = [predicate.prompt for predicate in predicates] + [
+        test.call.prompt for test in tests] + [
         score.expression.prompt for score in projected
     ]
     if any(len(_prompt_aliases(prompt)) > 2 for prompt in prompts):
@@ -338,7 +366,8 @@ def _plan_reranker(region, context, *, backend_name: str):
         )
         return (PhysicalCandidate(None, refusal, float("inf")),)
     if not all(is_score(item.predicate if isinstance(item, SemanticJoin)
-                        else item.expression) for item in predicates):
+                        else item.expression)
+               for item in predicates):
         refusal = _refusal(
             "AI.SCORE cannot be mixed with generative AI predicates"
         )
@@ -486,13 +515,12 @@ def _plan_reranker(region, context, *, backend_name: str):
                     expected,
                     means[alias],
                 )
-            filtered = ScoreFilter(
-                node_id=f"score-filter:{alias}:{written_pos}",
+            filtered = Filter(
+                node_id=f"filter:{alias}:{written_pos}",
                 inputs=input_ports((score_ref,)),
-                score_name=name,
+                predicate=Comparison(name, predicate.expression.comparison,
+                                     predicate.expression.threshold),
                 aliases=(alias,),
-                comparison=predicate.expression.comparison,
-                threshold=predicate.expression.threshold,
                 selectivity=predicate.selectivity,
                 written_pos=written_pos,
             )
@@ -513,6 +541,40 @@ def _plan_reranker(region, context, *, backend_name: str):
                 live[alias],
                 means[alias],
             )
+
+        calls = [call for call, owner in labels.calls if owner == alias]
+        if calls:
+            table = classify_table(context, alias, backend_name)
+            steps = [(test.call, test)
+                     for test in operators.label_filters.get(alias, ())]
+            steps.extend((call, None) for call in calls if call not in labels.tests)
+            classified = set()
+            previous = None
+            for call, test in steps:
+                if call not in classified:
+                    resident = (context.gpu_count == 1 and previous is not None
+                                and table.head(call) == table.head(previous))
+                    spec = table.choose_scoring(
+                        table.prepare(call, labels.names[call], live[alias]),
+                        call, resident)
+                    node = table.node(spec, current[alias],
+                                      sum(isinstance(n, AiClassify) for n in nodes))
+                    nodes.append(node)
+                    total_work += table.simulated(spec, resident).work
+                    total_seconds += spec.estimated_seconds
+                    current[alias] = PortRef(node.node_id, "scores")
+                    classified.add(call)
+                    previous = call
+                if test is not None:
+                    filtered = Filter(
+                        node_id=f"filter:{alias}:{test.position}",
+                        inputs=input_ports((current[alias],)),
+                        predicate=InList(labels.names[call], test.values),
+                        aliases=(alias,), selectivity=test.selectivity,
+                        written_pos=test.position)
+                    nodes.append(filtered)
+                    current[alias] = PortRef(filtered.node_id, "scores")
+                    live[alias] *= effective_selectivity(test.selectivity)
 
     pair_prompt = pair_prompts[0] if pair_prompts else None
     sink = current[scans[0].alias]
@@ -544,13 +606,13 @@ def _plan_reranker(region, context, *, backend_name: str):
         )
         if matching_join is not None:
             written_pos = joins.index(matching_join)
-            filtered = ScoreFilter(
-                node_id=f"score-filter:join:{written_pos}",
+            filtered = Filter(
+                node_id=f"filter:join:{written_pos}",
                 inputs=input_ports((score_ref,)),
-                score_name=spec.name,
+                predicate=Comparison(spec.name,
+                                     matching_join.predicate.comparison,
+                                     matching_join.predicate.threshold),
                 aliases=(left, right),
-                comparison=matching_join.predicate.comparison,
-                threshold=matching_join.predicate.threshold,
                 selectivity=matching_join.selectivity,
                 written_pos=written_pos,
             )

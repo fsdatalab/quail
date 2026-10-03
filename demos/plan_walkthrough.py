@@ -85,9 +85,8 @@ def main():
         edited = plan.insert(
             Barrier(node_id="barrier:c", next_anchor="c", aliases=("c",)),
             between=("ai_filter:c", "ai_join:c"))
-        print("pin_survivors before:",
-              plan.graph.node("ai_filter:c").pin_survivors,
-              "after:", edited.graph.node("ai_filter:c").pin_survivors)
+        print("keep_kv before:", plan.graph.node("ai_filter:c").keep_kv,
+              "after:", edited.graph.node("ai_filter:c").keep_kv)
         print(f"edited.estimated_seconds = {edited.estimated_seconds:.4f}")
         print(explain(query.logical, edited))
         print("remove gives back the same plan:",

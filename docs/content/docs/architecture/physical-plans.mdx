@@ -2,135 +2,83 @@
 title: Physical plans
 ---
 
-The planner converts the logical plan into a physical plan: a
-graph of typed nodes that specifies exactly what the GPU and CPU
-execute. Each node has typed input and output ports, so the graph
-can be validated, serialized, and edited before execution.
+A physical plan specifies which operators execute a query, what data each
+operator receives, and what data it produces. An operator performs one
+part of the query, such as classifying reviews or selecting result columns.
+The plan also records execution settings, such as the
+[attention path](/docs/architecture/execution#attention-paths) used by a model operator.
 
-## Structure
+The [optimizer](/docs/architecture/optimizer) builds the physical plan
+from a logical plan. The logical plan describes the requested operations.
+The physical plan specifies how the selected backend executes them.
 
-### Nodes and ports
+## Execute a review query
 
-Each node has typed input and output ports. An `InputPort` reads
-from one `OutputPort` of another node. Value types include
-`DOCUMENT_IDS`, `FILTER_ANSWERS`, `JOIN_ANSWERS`, and `ROWS`. The
-graph validates that connected ports have matching types.
+For example, imagine a `reviews` table with an `id` column for review
+identifiers and a `body` column for review text. This query classifies
+each review as positive or negative and returns only negative reviews:
 
-```python
-@dataclass(frozen=True)
-class PhysicalNode:
-    node_id: str
-    inputs: tuple[InputPort, ...] = ()
-
-    type_name: ClassVar[str]
-    runtime_key: ClassVar[str]
-    location: ClassVar[ExecutionLocation]
+```sql
+SELECT r.id,
+       AI.CLASSIFY(
+           PROMPT('What sentiment does this review express? {0}', r.body),
+           ARRAY['positive', 'negative']) AS sentiment
+FROM reviews r
+WHERE AI.CLASSIFY(
+    PROMPT('What sentiment does this review express? {0}', r.body),
+    ARRAY['positive', 'negative']) IN ('negative');
 ```
 
-### Node types
+Before execution, Quail tokenizes the review text. During execution,
+it identifies each review by its row position in the input table,
+starting at zero. Quail calls this position a document ID. It is separate
+from the value in `reviews.id`.
 
-All node types are defined in
-[physical/nodes.py](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py).
+The Quail backend uses four operators to execute this query. Each box
+represents an operator. Each arrow shows the data passed between operators.
 
-**Generic nodes** (used by all backends):
+<Mermaid chart={`flowchart TD
+    scan["Scan"]
+    classify["AiClassify"]
+    filter["Filter"]
+    project["Project"]
+    scan -->|Document IDs| classify
+    classify -->|Document IDs and labels| filter
+    filter -->|Document IDs for negative reviews| project
+    classify -->|Document IDs and labels| project
+`} />
 
-| Node | What it does |
-| --- | --- |
-| [`Scan`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Names one tokenized input by alias. |
-| [`Barrier`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Materializes survivor ids between join steps. |
-| [`Exchange`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Routes documents across GPUs. |
-| [`Recombine`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Joins TRUE answer tables using Arrow. |
-| [`Project`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Reads the selected columns for surviving rows. |
-| [`Limit`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Truncates the result. |
+1. **Scan** returns the document IDs for the `reviews` input.
+2. **AiClassify** receives these IDs and uses the model to classify the
+   corresponding reviews. It produces a table of document IDs and labels.
+3. **Filter** reads that table and keeps the document IDs whose label is
+   `negative`. This comparison runs on the CPU.
+4. **Project** receives the selected document IDs and the classification
+   table. It reads `reviews.id` for each selected review and adds the
+   classification label. The result has `id` and `sentiment` columns.
 
-**Quail backend nodes**:
+The `SELECT` and `WHERE` expressions use the same classification output.
+Quail does not classify each review again for the `SELECT` expression.
 
-| Node | What it does |
-| --- | --- |
-| [`AiFilter`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Runs filter stages on the GPU. |
-| [`AiJoin`](https://github.com/fsdatalab/quail/blob/main/quail/physical/nodes.py) | Runs join stages on the GPU. |
+The arrows show which inputs each operator needs. Compatible operators
+can pass batches to each other before they finish processing all rows.
+See [Execution](/docs/architecture/execution#pipelines-and-batches) for
+how Quail groups and schedules these operators.
 
-### Node ids
+## Inspect the plan
 
-Node ids are readable names like `ai_filter:r`, `ai_join:r`,
-`scan:r`, `barrier:e`, `apply:same_page`, `project`.
+Call `query.explain()` to inspect the plan without running model inference.
+The output shows the operators, their execution settings, and estimated work.
 
 ## Editing a plan
 
-Physical plans are inspectable and editable. You get the plan,
-modify it, and run the modified version. Every edit returns a new
-immutable plan; the original is unchanged.
+Call `query.plan()` to get a plan that you can edit before execution.
+Each edit returns a new plan. You can execute it with
+`query.run(plan=edited)`.
 
-This is useful for:
+See [Editing physical plans](/docs/user-guide/editing-plans) for a complete
+example that inspects a plan, inserts an operator, and removes it.
 
-- **Database integration.** Another query engine can call Quail's
-  planner, inspect the physical plan, insert or remove nodes, and
-  then execute the modified plan. The plan is a typed graph with a
-  serialization format, so it can cross process boundaries.
-- **Custom operators.** You can insert a user-defined `Foreign` node
-  between two operators, or remove one that the planner added.
-- **Debugging.** Inspect the plan with `explain()`, edit it, and
-  compare the execution of different plans.
-
-### API
-
-```python
-plan = query.plan()
-```
-
-Get the physical plan without running it.
-
-```python
-plan2 = plan.insert(node, between=("ai_filter:c", "ai_join:e"))
-```
-
-Insert a node on the edge between two existing nodes. The new node
-must have one output of the same value type as the edge.
-
-```python
-plan3 = plan2.remove("apply:same_page")
-```
-
-Remove a node and rewire its consumers to its producer. Only
-`Foreign`, `Barrier`, and `Exchange` nodes can be removed — removing
-a `Scan`, `AiFilter`, or `AiJoin` would change what the query
-computes.
-
-```python
-plan4 = plan3.move("apply:same_page", between=("barrier:e", "ai_join:e"))
-```
-
-Move a node from its current position to a new edge.
-
-```python
-result = query.run(plan=plan4)
-```
-
-Run the edited plan. After each edit, Quail re-validates the graph
-(ports, types, cycles) and re-estimates every node. An illegal edit
-raises `PlanEditError`.
-
-### Example: inserting a custom operator
-
-```python
-from quail.physical.nodes import Foreign
-
-plan = query.plan()
-
-custom = Foreign(
-    node_id="apply:my_filter",
-    function="my_filter",
-    kind="per_batch",
-)
-edited = plan.insert(custom, between=("ai_filter:r", "ai_join:r"))
-result = query.run(plan=edited)
-```
-
-See [Execution](/docs/architecture/execution) for how the plan runs
-on the GPU.
-
-## Serialization
-
-Each node type has a `NodeCodec` for encoding and decoding across
-the process boundary. `plan_envelope` wraps the encoded graph with
-the backend, model, device, and worker count.
+To implement an operator, see
+[Custom operators](/docs/extending/operators). That guide explains how
+operator classes declare their inputs, outputs, and execution code.

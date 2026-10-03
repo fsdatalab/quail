@@ -1,15 +1,31 @@
 """Fixed join execution, filter retention, and answer reconstruction."""
 
+import numpy as np
 import pyarrow as pa
+import pytest
+from fakes import letter_tokens
 from test_quail_backend import graph_state
 
 import quail
-from quail.backends.quail.graph import execute_single_graph, filter_result
+from quail.backends.quail.graph import execute_single_graph
 from quail.bench import quailb
 from quail.execution.execute import execute_query
-from quail.execution.runner import NodeMetrics, NodeResult, SurvivorStream
+from quail.execution.pipelines import build_pipelines
+from quail.execution.reranker import _score_table
+from quail.execution.runner import NodeMetrics, NodeResult
 from quail.execution.types import PhysicalResponse
-from quail.physical import AiFilter, AiJoin, Barrier, Project, Scan, decode_graph
+from quail.logical.nodes import CompileError
+from quail.physical import (
+    AiClassify,
+    AiFilter,
+    AiJoin,
+    Barrier,
+    PortRef,
+    Project,
+    Scan,
+    decode_graph,
+    encode_graph,
+)
 from quail.planner.plan import EngineConfig
 from quail_b import prompts
 from quail_b.queries import FILTER_SELECTIVITY_ESTIMATES
@@ -21,7 +37,7 @@ def _session(gpus=1, backend="quail"):
     session = quail.Session(
         EngineConfig(gpus=gpus, model="qwen3-4b-fp8", backend=backend,
                      device="h100-sxm"),
-        tokenizer=lambda text: list(text.encode()))
+        tokenizer=letter_tokens)
     register_fever(session)
     return session
 
@@ -43,6 +59,9 @@ def register_fever(session):
 
 
 class FixedFeverAnswers:
+    # the label a classification gives claims c0, c1, c2
+    labels = ("science", "sport", "science")
+
     def __init__(self, state, capacity, empty):
         self.state = state
         self.capacity = capacity
@@ -55,14 +74,55 @@ class FixedFeverAnswers:
                 if all(answers[local])]
         return answers, live
 
+    def _label_table(self, node, ids):
+        # a document whose answer names no label has no row, as the
+        # classify node drops it
+        labeled = [int(document) for document in ids
+                   if self.labels[int(document)] is not None]
+        rows = np.asarray([[document] for document in labeled],
+                          dtype=np.int32).reshape(-1, 1)
+        table = _score_table(
+            rows, node.spec.aliases, node.spec.name,
+            [self.labels[document] for document in labeled], pa.string())
+        return labeled, table
+
+    # the stance a classification gives each (claim, evidence) pair
+    stances = {(0, 0): "supports", (1, 1): "refutes", (2, 0): "supports"}
+
     def execute(self, node, inputs):
+        if isinstance(node, AiClassify) and node.spec.partner is not None:
+            # the join's true pairs, labeled from the table above; a
+            # pair without a stance gets no row
+            (answers,) = inputs["score_inputs"].values()
+            pairs = []
+            for local, row in answers["rows"].items():
+                anchor = answers["anchor_index"][local]
+                members = (answers["anchor_partners"] or {}).get(local)
+                for position, bit in enumerate(row):
+                    if not bit:
+                        continue
+                    member = position if members is None else members[position]
+                    (partner,) = answers["partner_index"][member]
+                    pairs.append((int(anchor), int(partner)))
+            # the stances are keyed (claim, evidence) whichever the anchor
+            claim_first = node.spec.anchor.startswith("c")
+            labeled = [pair for pair in pairs
+                       if (pair if claim_first else pair[::-1]) in self.stances]
+            rows = np.asarray(labeled, dtype=np.int32).reshape(-1, 2)
+            table = _score_table(
+                rows, node.spec.aliases, node.spec.name,
+                [self.stances[pair if claim_first else pair[::-1]]
+                 for pair in labeled], pa.string())
+            return NodeResult({"scores": table}, NodeMetrics(
+                input_rows=len(pairs), output_rows=len(labeled)))
+        if isinstance(node, AiClassify):
+            (ids,) = inputs["score_inputs"].values()
+            (alias,) = node.spec.aliases
+            labeled, table = self._label_table(node, ids)
+            return NodeResult(
+                {"scores": table, f"ids:{alias}": labeled},
+                NodeMetrics(input_rows=len(ids), output_rows=len(ids)))
         if isinstance(node, AiFilter):
-            if node.pin_survivors:
-                stream = SurvivorStream(node, inputs["document_ids"])
-                return NodeResult(
-                    {f"ids:{node.alias}": stream,
-                     f"filter_answers:{node.alias}": {}},
-                    finalize=stream.finalized_result)
             document_ids = list(inputs["document_ids"])
             answers, live = self._answers(document_ids)
             if inputs["retain_survivors"]:
@@ -76,22 +136,7 @@ class FixedFeverAnswers:
             })
 
         outputs = {}
-        stream = inputs.get("anchor_stream")
-        if stream is None:
-            anchor_ids = inputs["anchor_ids"]
-        else:
-            answers, anchor_ids = self._answers(list(stream["document_ids"]))
-            stream["stream"].complete(filter_result(
-                stream["node"], answers, 0, stream["document_ids"]))
-            keys = [(node.anchor, document) for document in anchor_ids]
-            if inputs.get("anchor_batch") is not None:
-                # like the real driver: per-batch functions run on each
-                # batch before admission and may drop survivors
-                keys = inputs["anchor_batch"](keys)
-            anchor_ids = [key[1] for key in keys]
-            for key in keys:
-                inputs["anchor_keys"].append(key)
-                inputs["prefixes"].append([])
+        anchor_ids = inputs["anchor_ids"]
         live = set(range(len(anchor_ids)))
         all_answers = []
         lists_for = inputs.get("anchor_partners")
@@ -216,15 +261,16 @@ def test_fev9_executes_bound_and_edited_join_nodes_without_the_optimizer(
     with _session() as session:
         query = quailb.queries(session)["FEV-9"][1]()
         plan = query.plan()
+        join = next(node for node in plan.nodes if isinstance(node, AiJoin))
         chain = next(node for node in plan.nodes
-                     if isinstance(node, AiFilter) and node.pin_survivors)
-        join = next(node for node in plan.nodes
-                    if isinstance(node, AiJoin) and node.anchor == chain.alias)
+                     if isinstance(node, AiFilter) and node.alias == join.anchor)
+        assert not chain.keep_kv
         edited = plan.insert(
             Barrier(node_id=f"barrier:{chain.alias}", next_anchor=chain.alias,
                     aliases=(chain.alias,)),
             between=(chain.node_id, join.node_id))
-        assert not edited.graph.node(chain.node_id).pin_survivors
+        # cut off from its join by the barrier, the chain retains KV
+        assert edited.graph.node(chain.node_id).keep_kv
         assert edited != plan
 
         seen = []
@@ -241,6 +287,122 @@ def test_fev9_executes_bound_and_edited_join_nodes_without_the_optimizer(
         assert f"barrier:{chain.alias}" in seen[1]
         assert f"barrier:{chain.alias}" not in seen[0]
         assert edited_result.collect().to_pylist() == rows.to_pylist() == FEV9_ROWS
+
+
+def test_classification_runs_beside_filters_and_joins(monkeypatch):
+    with _session() as session:
+        claims = session.docs("claims").alias("c")
+        evidence = session.docs("evidence").alias("e")
+        topic = quail.prompt("What is {0} about?", quail.col("c.claim"))
+        plausible = quail.prompt("Is {0} plausible?", quail.col("c.claim"))
+        # filter then classify: the label is computed for the survivors
+        query = (claims.ai_filter(plausible, selectivity=0.9)
+                 .ai_classify(topic, ["science", "sport"], name="topic")
+                 .select("c.id", "topic"))
+        plan = query.plan()
+        assert [type(node).__name__ for node in plan.nodes] == [
+            "Scan", "AiFilter", "AiClassify", "Project"]
+        classify = plan.nodes[2]
+        assert classify.inputs[0].source == PortRef(plan.nodes[1].node_id,
+                                                    "ids:c")
+        execute = fever_executor(session, monkeypatch, 1, capacity=10)
+        rows = execute_query(query, physical_executor=execute).collect()
+        assert rows.to_pylist() == [{"c.id": "c0", "topic": "science"},
+                                    {"c.id": "c1", "topic": "sport"}]
+
+        # classify, keep one label, then join: the join takes the
+        # accepted claims, and the label rides the output rows
+        claims = session.docs("claims").alias("c")
+        evidence = session.docs("evidence").alias("e")
+        query = (claims.ai_filter(plausible, selectivity=0.9)
+                 .ai_classify(topic, ["science", "sport"], name="topic")
+                 .label_in("topic", ["science"], selectivity=0.5)
+                 .ai_join(evidence, quail.prompt(
+                     "Does {1} support {0}?", quail.col("c.claim"),
+                     quail.col("e.text")), selectivity=0.5)
+                 .select("c.id", "e.id", "topic"))
+        plan = query.plan()
+        assert [type(node).__name__ for node in plan.nodes] == [
+            "Scan", "Scan", "AiFilter", "AiClassify", "Filter", "AiJoin",
+            "Project"]
+        # the chain, the classification, and the filter on its label run as
+        # one pipeline; the join joins it only when it anchors on the
+        # claims
+        test, join, project = plan.nodes[4], plan.nodes[5], plan.nodes[6]
+        members = build_pipelines(plan.graph)["ai_filter:c"].node_ids
+        assert members == (("ai_filter:c", "ai-classify:0", test.node_id)
+                           + ((join.node_id,) if join.anchor == "c" else ()))
+        (claims_port,) = [port.source for port in join.inputs
+                          if port.source.port == "ids:c"]
+        assert claims_port == PortRef(test.node_id, "ids:c")
+        assert [port.source.port for port in project.inputs] == [
+            "join_answers:0", "scores"]
+        codecs = session.registry.codecs
+        assert decode_graph(encode_graph(plan.graph, codecs), codecs) == plan.graph
+        execute = fever_executor(session, monkeypatch, 1, capacity=10)
+        result = execute_query(query, physical_executor=execute)
+        assert result.collect().to_pylist() == [
+            {"c.id": "c0", "e.id": "e0", "topic": "science"}]
+        labels = result.answer_tables["classifies"]["topic"]
+        assert labels.column("topic").to_pylist() == ["science", "sport"]
+
+
+def test_a_classification_of_joined_rows_follows_its_join(monkeypatch):
+    """A join, then a classification of each row it keeps.
+
+    The classification runs in the join's pipeline on its anchor, its
+    label rides the output rows, and a row without a label leaves the
+    result.
+    """
+    with _session() as session:
+        claims = session.docs("claims").alias("c")
+        evidence = session.docs("evidence").alias("e")
+        stance = quail.prompt("How does {1} bear on {0}?",
+                              quail.col("c.claim"), quail.col("e.text"))
+        query = (claims.ai_join(evidence, quail.prompt(
+                     "Does {1} support {0}?", quail.col("c.claim"),
+                     quail.col("e.text")), selectivity=0.5)
+                 .ai_classify(stance, ["supports", "refutes"], name="stance")
+                 .select("c.id", "e.id", "stance"))
+        plan = query.plan()
+        assert [type(node).__name__ for node in plan.nodes] == [
+            "Scan", "Scan", "AiJoin", "AiClassify", "Project"]
+        join, classify, project = plan.nodes[2], plan.nodes[3], plan.nodes[4]
+        assert classify.spec.aliases == (join.anchor,) + tuple(
+            alias for alias in ("c", "e") if alias != join.anchor)
+        assert classify.spec.join_layout is not None and classify.spec.scoring == \
+            "letters"
+        assert classify.inputs[0].source == PortRef(join.node_id,
+                                                    "join_answers:0")
+        assert [port.source.port for port in project.inputs] == [
+            "join_answers:0", "scores"]
+        members = build_pipelines(plan.graph)[join.node_id].node_ids
+        assert members == (join.node_id, classify.node_id)
+        codecs = session.registry.codecs
+        assert decode_graph(encode_graph(plan.graph, codecs), codecs) == plan.graph
+        explained = query.explain()
+        assert "stance" in explained
+        execute = fever_executor(session, monkeypatch, 1, capacity=10)
+        result = execute_query(query, physical_executor=execute)
+        # (c1, e2) is a true pair with no stance and leaves the result
+        rows = result.collect().to_pylist()
+        assert sorted((row["c.id"], row["e.id"], row["stance"])
+                      for row in rows) == [
+            ("c0", "e0", "supports"), ("c1", "e1", "refutes"),
+            ("c2", "e0", "supports")]
+        labels = result.answer_tables["classifies"]["stance"]
+        assert set(labels.column_names) == {"c", "e", "stance"}
+        assert labels.column_names[0] == join.anchor
+
+        # a filter on a joined row's label is refused
+        claims = session.docs("claims").alias("c")
+        evidence = session.docs("evidence").alias("e")
+        with pytest.raises(CompileError, match="filter on a label"):
+            (claims.ai_join(evidence, quail.prompt(
+                 "Does {1} support {0}?", quail.col("c.claim"),
+                 quail.col("e.text")), selectivity=0.5)
+             .ai_classify(stance, ["supports", "refutes"], name="stance")
+             .label_in("stance", ["supports"]))
 
 
 def test_request_backends_plan_fev9_and_a_single_join():
@@ -285,3 +447,36 @@ def test_fev10_asks_the_model_about_same_page_pairs_only(monkeypatch):
             assert sorted(zip(answers.column("c").to_pylist(),
                               answers.column("e").to_pylist())) == [(0, 0), (1, 0)]
             assert result.collect().to_pylist() == [{"c.id": "c0", "e.id": "e0"}]
+
+
+def test_classification_moves_after_a_selective_join(monkeypatch):
+    with _session() as session:
+        topic = quail.prompt("What is {0} about?", quail.col("c.claim"))
+        claims = session.docs("claims").alias("c")
+        evidence = session.docs("evidence").alias("e")
+        # a join that almost nothing survives and a filter on a label that
+        # keeps almost everything: classifying the few matched claims
+        # after the join is cheaper than classifying every claim before
+        query = (claims
+                 .ai_classify(topic, ["science", "sport"], name="topic")
+                 .label_in("topic", ["science"], selectivity=0.99)
+                 .ai_join(evidence, quail.prompt(
+                     "Does {1} support {0}?", quail.col("c.claim"),
+                     quail.col("e.text")), selectivity=0.001)
+                 .select("c.id", "e.id", "topic"))
+        plan = query.plan()
+        assert plan.settings["classify_placement"] == "after joins"
+        names = [type(node).__name__ for node in plan.nodes]
+        assert names.index("AiJoin") < names.index("AiClassify") < names.index(
+            "Filter") < names.index("Recombine")
+        execute = fever_executor(session, monkeypatch, 1, capacity=10)
+        result = execute_query(query, physical_executor=execute)
+        rows = result.collect().to_pylist()
+        # c0 and c2 are supported by e0 and labeled science; c1 is not
+        assert rows == [{"c.id": "c0", "e.id": "e0", "topic": "science"},
+                        {"c.id": "c2", "e.id": "e0", "topic": "science"}]
+        # the join matched every claim (c1 with e1 and e2), so every
+        # claim was classified after it and c1's sport rows fell out
+        labels = result.answer_tables["classifies"]["topic"]
+        assert labels.column("c").to_pylist() == [0, 1, 2]
+        assert labels.column("topic").to_pylist() == ["science", "sport", "science"]

@@ -2,95 +2,106 @@
 title: Supported models and GPUs
 ---
 
-We are actively adding support for more models and hardware. This
-page will be updated as new configurations become available.
+Set `model` to the model you want to run and `device` to your GPU type.
 
 ## Models
 
-| Model | `model=` value | Parameters | Precision |
+| Model | `model` value | Weight precision | AI functions |
 | --- | --- | --- | --- |
-| Qwen3 4B | `"qwen3-4b-fp8"` | 4B | FP8 weights, BF16 KV |
-| Qwen3 32B | `"qwen3-32b-fp8"` | 32B | FP8 weights, BF16 KV |
-| DiffusionGemma 26B-A4B | `"diffusion-gemma-26b-a4b-fp8"` | 26B total, 4B active per token | FP8 weights, BF16 KV |
-| Qwen3 Reranker 0.6B | `"qwen3-reranker-0.6b-bf16"` | 0.6B | BF16 |
-| Qwen3 Reranker 4B | `"qwen3-reranker-4b-bf16"` | 4B | BF16 |
-| Decision 2.0 Kai 0.6B | `"decision-2.0-kai-0.6b-bf16"` | 0.6B | BF16 |
+| Qwen3 4B | `"qwen3-4b-fp8"` | FP8 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY` |
+| Qwen3 32B | `"qwen3-32b-fp8"` | FP8 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY` |
+| DiffusionGemma 26B-A4B | `"diffusion-gemma-26b-a4b-fp8"` | FP8 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY` |
+| Qwen3 Reranker 0.6B | `"qwen3-reranker-0.6b-bf16"` | BF16 | `AI.SCORE` |
+| Qwen3 Reranker 4B | `"qwen3-reranker-4b-bf16"` | BF16 | `AI.SCORE` |
+| Decision 2.0 Kai 0.6B | `"decision-2.0-kai-0.6b-bf16"` | BF16 | `AI.IF`, `AI.SCORE` |
 
-The Qwen3 FP8 models use the Quail execution engine, including
-DeepGEMM for matrix multiplications and FlashAttention 3 for
-attention on H100.
+*FP8* is an 8 bit floating point format. *BF16* is a 16 bit floating point
+format. All listed models store KV in BF16.
 
-### DiffusionGemma
+`AI.IF` supports filters and joins. `AI.SCORE` returns a score, and
+`AI.CLASSIFY` assigns a label. See the
+[SQL reference](/docs/user-guide/sql#ai-operators) for examples.
 
-DiffusionGemma supports filter and join predicates and `AI.SCORE`. Quail uses the
-`RedHatAI/diffusiongemma-26B-A4B-it-FP8-dynamic` checkpoint and reads
-one TRUE or FALSE answer without generating a thinking response.
+## GPUs
 
-DiffusionGemma can improve accuracy at the cost of longer query
-times. Check both models on a labeled sample because the result
-depends on the predicate. On IMDB-2 in QUAIL-B, DiffusionGemma
-matched 88.89% of the Qwen3 32B reference answers, compared with
-76.41% for Qwen3 4B. The query took 32.41 seconds with
-DiffusionGemma and 21.20 seconds with Qwen3 4B on one H100. Each
-model used its own prompt format. See the full
-[DiffusionGemma report][diffusion-report] and
-[Qwen3 4B report][qwen-report] for the results and test setup.
+| GPU | `device` value |
+| --- | --- |
+| NVIDIA H100 SXM | `"h100-sxm"` |
+| NVIDIA RTX PRO 6000 Blackwell Server Edition | `"rtx-pro-6000-blackwell-server"` |
 
-Select DiffusionGemma with the `model` setting:
+## Configure a session
+
+For example, to run Qwen3 4B on one H100 SXM:
+
+```python
+import quail
+
+config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
+```
+
+Pass `config` to `quail.Session`. Quail downloads the model weights
+when they are not already available.
+
+### Use multiple GPUs
+
+Set `gpus` to 1, 2, 4, or 8 GPUs on one machine. The default is one.
+Each GPU holds a complete model copy and processes part of the input.
+Quail does not split a model's weights across GPUs.
+
+```python
+config = quail.EngineConfig(
+    model="qwen3-4b-fp8",
+    device="h100-sxm",
+    gpus=4,
+)
+```
+
+## DiffusionGemma
+
+DiffusionGemma uses the
+`RedHatAI/diffusiongemma-26B-A4B-it-FP8-dynamic` checkpoint.
+Set `HF_TOKEN` before running it because access to the weights is gated.
+
+For `AI.CLASSIFY` and `AI.SCORE`, `canvas_draws` limits the number of
+attempts per document. The default is four. Quail can make additional
+attempts when the first answer's probabilities are spread across labels.
+It averages the probabilities from those attempts.
+
+Set `canvas_draws=1` to use one attempt per document:
 
 ```python
 config = quail.EngineConfig(
     model="diffusion-gemma-26b-a4b-fp8",
     device="h100-sxm",
+    canvas_draws=1,
 )
 ```
 
-[diffusion-report]: https://github.com/fsdatalab/quail/blob/3e09be9564e60183a0018b3908b05cd77cbd0d77/reports/2026-09-19-diffusion-gemma-quailb.md
-[qwen-report]: https://github.com/fsdatalab/quail/blob/bbf18747238f504866e1ca7518d23d375f97f920/reports/quailb-comparison.md
+Classification of joined rows always uses one attempt.
+The setting does not change `AI.IF` execution.
 
-### Rerankers
-
-The reranker models use the same Quail executor for `AI.SCORE`.
-The generative models also run `AI.SCORE`; see
-[AI.SCORE](/docs/user-guide/sql#aiscore) for how their score is read.
-Weights, activations, and KV use BF16. The final `yes` and `no`
-projection and score normalization use FP32. Each input produces
-one score between 0 and 1 without generating tokens.
-
-Quail tokenizes each document once and the fixed prompt text
-separately, then joins the token lists. Where the prompt text meets
-a document, the tokens can differ from tokenizing the joined string,
-so a score can differ slightly from the reference implementation.
-Scores near a threshold can select different rows.
-
-### Decision 2.0 Kai 0.6B
+## Decision 2.0 Kai 0.6B
 
 [Decision-2.0-Kai-0.6B](https://huggingface.co/vllm-sr/Decision-2.0-Kai-0.6B)
-is a decision model from vLLM Semantic Router. It supports filter and
-join predicates and `AI.SCORE`, whose score is the head's probability
-of `Yes` over `No`. The stock vLLM
-and SGLang backends do not run it.
+is a decision model from vLLM Semantic Router: a Qwen3-0.6B network
+with a separate classifier head. It answers `AI.IF` filters and joins
+and `AI.SCORE`, where the score is the head's probability of `Yes` over
+`No`. It does not run `AI.CLASSIFY`, and the stock vLLM and SGLang
+backends do not run it.
 
-The model is a Qwen3-0.6B network with a separate classifier head.
-It does not answer by generating a token. Quail writes each prompt in
-the model's yes/no question format: the document after `Context:`,
-the question, then a `No` option block and a `Yes` option block. In
-a join the question follows the anchor document, so it is computed
-once per anchor; the option blocks follow the partner document.
-Quail reads three final hidden states: the last token of each option
-block and the last token of the prompt. The head scores both options
-in FP32 and the predicate is true when `Yes` scores higher.
+Quail writes each prompt in the model's yes/no question format: the
+document after `Context:`, the question, a `No` option block, a `Yes`
+option block, and a closing line. In a join the question follows the
+anchor document, so it is computed once per anchor; the option blocks
+follow the partner document. Quail reads the last token of each option
+block and the last token of the prompt, and the head scores both
+options in FP32.
 
-On first use Quail converts the checkpoint once. It renames the
-backbone tensors, casts them to BF16, and saves a standard Qwen3
-folder under `$HF_HOME/quail-checkpoints/`. Later loads read that
-folder. Weights, activations, and KV use BF16. The model's own code
-keeps FP32 weights under BF16 autocast, so answers near a tie can
-differ.
-
-As with the rerankers, Quail tokenizes each document separately from
-the fixed prompt text, so tokens can differ from the model's own
-tokenization where the two meet.
+On first use Quail converts the checkpoint once to a BF16 Qwen3 folder
+under `$HF_HOME/quail-checkpoints/`. The model's own code keeps FP32
+weights under BF16 autocast, and Quail tokenizes each document
+separately from the fixed prompt text, so answers near a tie can
+differ from the model's own code.
 
 ```python
 config = quail.EngineConfig(
@@ -99,66 +110,44 @@ config = quail.EngineConfig(
 )
 ```
 
-## GPUs
-
-| Device | `device=` value | Notes |
-| --- | --- | --- |
-| NVIDIA H100 SXM | `"h100-sxm"` | Tested. FlashAttention 3. |
-| NVIDIA RTX PRO 6000 Blackwell Server Edition | `"rtx-pro-6000-blackwell-server"` | FlashAttention 2. |
-
-The `device` setting must match the hardware where the model runs.
-Quail uses the device's memory, bandwidth, and FLOP specs to plan
-the query.
-
-## GPU count
-
-Quail supports 1, 2, 4, or 8 GPUs on one host. Each GPU holds one
-complete model copy. Quail does not split one model across GPUs.
-
-```python
-quail.Session(config=quail.EngineConfig(
-    model="qwen3-4b-fp8",
-    device="h100-sxm",
-    gpus=4,
-))
-```
-
-Quail partitions the work across GPUs so each GPU processes a
-different subset of the documents. Results are combined after each
-operator.
-
 ## No local GPU? Use Modal
 
-If you don't have a CUDA GPU, you can run Quail inside a
-[Modal](https://modal.com) GPU function. Quail does not depend on
-Modal. You write the Modal function, and Quail runs inside it.
-
-Install Modal on the machine you submit from:
+You can run Quail in a [Modal](https://modal.com) GPU function.
+Install Modal and authenticate on the machine that submits the function:
 
 ```bash
 uv pip install modal==1.5.4
 modal setup
 ```
 
-The image below installs Quail 0.1.0 from PyPI. Quail declares its
-Python dependencies, including
-vLLM, PyArrow, and its tokenizer. You do not need to install those
-packages separately. CUDA comes from the base image.
-
-Save this example as `run_quail.py`:
+For example, the program below selects movie reviews that praise the
+acting. Save it as `run_quail.py`. It runs on one H100 and saves model
+weights and compiled kernels on Modal volumes for later runs.
 
 ```python
 import modal
 
 app = modal.App("quail-engine")
+weights = modal.Volume.from_name("quail-hf-cache", create_if_missing=True)
+kernels = modal.Volume.from_name("quail-kernel-cache", create_if_missing=True)
 image = (
     modal.Image.from_registry(
         "nvidia/cuda:13.0.1-devel-ubuntu24.04", add_python="3.12")
     .entrypoint([])
     .uv_pip_install("quail-engine==0.1.0")
+    .env({
+        "HF_HOME": "/model-cache",
+        "QUAIL_CACHE_DIR": "/kernel-cache/quail",
+    })
 )
 
-@app.function(image=image, gpu="H100!", memory=32768, timeout=1200)
+@app.function(
+    image=image,
+    gpu="H100!",
+    memory=98304,
+    timeout=1200,
+    volumes={"/model-cache": weights, "/kernel-cache": kernels},
+)
 def run_query():
     import pyarrow as pa
     import quail
@@ -178,47 +167,7 @@ def run_query():
                 PROMPT('Does this review praise the acting? {0}', r.body))
         """, dialect="bq").run()
         return result.collect(), result.report
-```
 
-The imports inside `run_query` use the packages installed in the GPU
-image. PyArrow is used here to create the sample input table. Quail
-loads vLLM and its other execution dependencies internally.
-
-The session, data registration, and execution all happen inside the
-GPU function. For large datasets, pass a path and open it there
-instead of sending an Arrow table.
-
-### Cache volumes
-
-Mount [Modal volumes](https://modal.com/docs/guide/volumes) to
-persist model weights and compiled kernels across runs:
-
-```python
-weights = modal.Volume.from_name("quail-hf-cache", create_if_missing=True)
-kernels = modal.Volume.from_name("quail-kernel-cache", create_if_missing=True)
-
-image = image.env({
-    "HF_HOME": "/model-cache",
-    "QUAIL_CACHE_DIR": "/kernel-cache/quail",
-})
-
-@app.function(
-    image=image, gpu="H100!", memory=98304, timeout=1200,
-    volumes={"/model-cache": weights, "/kernel-cache": kernels},
-)
-def run_query():
-    # Use the same run_query body from above.
-    ...
-```
-
-Quail's own cache is controlled by `QUAIL_CACHE_DIR` (default
-`~/.cache/quail/kernels`). Other libraries use their own environment
-variables: `HF_HOME`, `DG_CACHE_DIR`, `TRITON_CACHE_DIR`,
-`VLLM_CACHE_ROOT`.
-
-### Submit and retrieve
-
-```python
 @app.local_entrypoint()
 def main():
     call = run_query.spawn()
@@ -228,27 +177,26 @@ def main():
     print(report)
 ```
 
-Run the file from the machine where you installed Modal:
+The example installs Quail 0.1.0 in the GPU image.
+Collect the rows inside the session before returning from the function.
+
+### Run and retrieve the result
 
 ```bash
 modal run --detach run_quail.py 2>&1 | tee run_quail.log
 ```
 
-Keep the function call id. After a disconnect, retrieve the result
-with `modal.FunctionCall.from_id("fc-...").get()`. For long runs,
-use `modal run --detach`.
-
-The function should return the results before the session closes:
+Keep the function call ID printed in the log. If you disconnect, retrieve
+the result with that ID:
 
 ```python
-return result.collect(), result.report
+rows, report = modal.FunctionCall.from_id("fc-...").get()
 ```
 
-If you want to save results to a Modal volume, write them to the
-mounted path and call `volume.commit()` inside the function. Quail
-does not do this automatically.
+The example returns rows and a report. To save them on a Modal volume,
+write them to its mounted path and call `volume.commit()` in the function.
 
-## Adding a model or device
+## Add a model or device
 
-See [Extending Quail](/docs/extending/models) for how to register a
-new model or device.
+See [Custom models and GPUs](/docs/extending/models) to register another
+model or device.

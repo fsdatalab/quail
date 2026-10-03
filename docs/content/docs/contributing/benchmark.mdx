@@ -2,27 +2,21 @@
 title: Benchmarks
 ---
 
-[QUAIL-B](https://github.com/fsdatalab/quail-bench) is a benchmark of
-AI-SQL filter and join queries over six datasets at three scale
-factors (0.1, 0.5, 1.0). It has 30+ queries. We are actively adding
-queries and datasets.
-
-| Family | Dataset | Queries |
-| --- | --- | --- |
-| IMDB | [stanfordnlp/imdb](https://huggingface.co/datasets/stanfordnlp/imdb) | 10 |
-| BIO | [BioDEX/BioDEX-Reactions](https://huggingface.co/datasets/BioDEX/BioDEX-Reactions) | 4 |
-| FEV | [fever/fever](https://huggingface.co/datasets/fever/fever) | 10 |
-| LEP | [rmahari/LePaRD](https://huggingface.co/datasets/rmahari/LePaRD) | 5 |
-| AGENT | [TIGER-Lab/SWE-Next-SFT-Trajectories](https://huggingface.co/datasets/TIGER-Lab/SWE-Next-SFT-Trajectories) | 2 |
-| PRIV | [mukund/PrivacyPolicies](https://huggingface.co/datasets/mukund/PrivacyPolicies) | 2 |
-
-PRIV queries are optional and run at larger scale. Pass `--privacy`
-to include them. The query count tracks the pinned `quail_b` version
-in `pyproject.toml`.
+[quail-b](https://github.com/fsdatalab/quail-bench) provides query
+definitions, datasets, and saved reference answers for evaluating Quail.
+Here we show how to run a query and use the results to check a change.
+You can run Quail on a local GPU or on Modal.
 
 ## Run a query
 
-On your GPU:
+Choose a query that tests your change. Before running it, record the
+expected effect on execution time or results.
+
+### On a local GPU
+
+The following command runs `IMDB-4` with Qwen3 4B fp8 at scale factor
+`0.1` on one H100. A *scale factor* controls the dataset size relative
+to the full benchmark dataset.
 
 ```bash
 uv run python -m quail.bench.quailb --sf 0.1 --only IMDB-4 \
@@ -30,32 +24,90 @@ uv run python -m quail.bench.quailb --sf 0.1 --only IMDB-4 \
   --output-dir results/quailb/imdb-4
 ```
 
-On Modal, with the vLLM baselines:
+Results are saved in the specified output directory.
+Use a new output directory for each run.
+
+### On Modal
+
+If you have not configured Modal, run `uv run modal setup` first.
+The following command runs the same query with Quail and stock vLLM.
+It uses two vLLM submission strategies: one operator at a time and
+pipelining. Each configuration uses one H100.
 
 ```bash
+mkdir -p results/benchmark
+run_log="results/benchmark/quailb-$(date -u +%Y%m%dT%H%M%SZ).log"
 uv run modal run --detach -m quail.bench.quailb_parallel \
   --sf 0.1 --model qwen3-4b-fp8 --query IMDB-4 \
-  --output-dir /results/benchmarks/quailb \
-  2>&1 | tee results/benchmark/quailb.log
+  --no-include-sglang --output-dir /results/benchmarks/quailb \
+  2>&1 | tee "$run_log"
 ```
 
-Omit `--only` / `--query` to run all queries. Add `--no-include-baselines`
-to run Quail alone on Modal. Modal results are saved to the
-`quail-results` volume under `/results/benchmarks/quailb/<run-id>/`.
+The log includes the function call ID and run directory.
+Results are saved on the `quail-results` volume under
+`/results/benchmarks/quailb/<run-id>/`.
 
-## Generate a report
+Download the run directory to read the results locally.
+Replace `<run-id>` with the ID from the log:
+
+```bash
+uv run modal volume get quail-results \
+  "benchmarks/quailb/<run-id>/" "./results/<run-id>/"
+```
+
+The Modal run has separate directories for Quail and each baseline.
+The downloaded Quail results are in `results/<run-id>/quail/`.
+
+## Read the results
+
+Each result directory contains `run.json` and `report.md`.
+For the local GPU example, read `results/quailb/imdb-4/report.md`.
+The reports include execution measurements and comparisons with the saved
+reference answers.
+
+You can regenerate a report from saved outputs without running inference:
 
 ```bash
 uv run quail-b report results/quailb/imdb-4
 ```
 
-For a Modal run, download it first:
+## Compare a change
 
-```bash
-uv run modal volume get quail-results \
-  "benchmarks/quailb/<run-id>/" "./results/<run-id>/"
-uv run quail-b report "./results/<run-id>/quail"
-```
+Run the relevant query before and after the change. Record the Quail
+commit for each run. Keep the query definition, scale factor, model,
+device, and reference answers the same.
 
-This writes `report.md` next to `run.json`. Reports use saved labels
-and do not rerun inference.
+Report these measurements for each configuration:
+
+| Measurement | Meaning |
+| --- | --- |
+| Query time | Execution time in seconds, excluding model startup and result collection. |
+| Input tokens per second | Full input prompt tokens divided by query time. Count shared prefixes each time they occur in a prompt. |
+| GPU cost per query | Query time in hours multiplied by GPU count and the hourly GPU price. |
+
+Include the input document and pair counts. Report agreement with the
+saved reference labels and identify the reference model.
+Report model startup separately if it affects the comparison.
+
+State the execution settings used by Quail and each baseline.
+If Quail uses a setting that the baseline supports, configure the baseline
+with the equivalent setting. Compare the measurements with your prediction
+and keep correctness differences visible.
+
+Link to the saved result paths in the pull request.
+Keep generated result files out of the repository.
+
+## Add a benchmark query
+
+Benchmark queries are stored as [*Substrait*](https://substrait.io/) plans.
+Substrait is a standard format for describing query operations and their
+inputs. Quail's benchmark runner reads these plans and builds Quail queries.
+
+Query definitions and reference labels belong in
+[quail-bench](https://github.com/fsdatalab/quail-bench).
+Quail's runner is in
+[`quail/bench/`](https://github.com/fsdatalab/quail/tree/main/quail/bench).
+
+Add or change the query in quail-bench first. Then update the `quail-b`
+commit in `pyproject.toml` and update `uv.lock`.
+Check that Quail's runner can load and execute the revised query.

@@ -2,64 +2,73 @@
 title: Observers
 ---
 
-Observers let you run code after each physical node executes. The
-runner calls every registered observer once per node, in execution
-order.
+An *execution observer* is an extension that receives each operator's
+result. You can implement an observer when Quail's standard query report
+does not contain the information you need. The observer can read operator
+outputs and metrics, then add its own report to the query result.
 
-## When you need one
+Here we show how to implement an observer, register it with a session,
+and read its report.
 
-Most of the time, `result.report` and `result.node_metrics` have
-everything you need after a query finishes (see
-[Metrics](/docs/user-guide/metrics)). Use an observer when you need
-something to happen *during* execution, for example logging progress
-or streaming metrics to an external system.
+Quail calls observers after model execution, while it prepares the query
+result. These calls do not provide progress updates
+during GPU execution.
 
-## Protocol
+## Implement the observer
 
-```python
-class ExecutionObserver(Protocol):
-    name: str
-    def after_node(self, node, result) -> None: ...
-    def report(self) -> Mapping[str, Any]: ...
-```
-
-- `after_node` receives the physical node and its output after
-  execution. It cannot modify values.
-- `report` returns a dict that is attached to
-  `result.report["observers"][name]` after the query finishes.
-
-Source:
-[`quail/execution/runner.py`](https://github.com/fsdatalab/quail/blob/main/quail/execution/runner.py).
-
-## Example
+The example below records operator IDs and includes them in a report.
+You can define a class with `name`, `after_node()`, and `report()`:
 
 ```python
-import logging
-
-class ProgressObserver:
-    name = "progress"
+class CompletedOperators:
+    name = "completed_operators"
 
     def __init__(self):
-        self.log = []
+        self.node_ids = []
 
     def after_node(self, node, result):
-        logging.info("%s: %.2fs", node.node_id, result.metrics.wall_s)
-        self.log.append(node.node_id)
+        self.node_ids.append(node.node_id)
 
     def report(self):
-        return {"nodes": self.log}
+        return {"node_ids": self.node_ids}
 ```
 
-## Registration
+- `name` identifies the observer's report in the query result.
+- `after_node(node, result)` receives a physical node and its `NodeResult`.
+  You can read the outputs and metrics from `result`.
+  Do not change the operator's outputs.
+- `report()` returns a dictionary with the values you want to include in
+  the query report.
 
-Register the class on the session's registry. The runner creates a
-fresh instance for each query.
+See the
+[`ExecutionObserver` interface](https://github.com/fsdatalab/quail/blob/main/quail/execution/runner.py).
+
+## Register the observer
+
+Register the class with the [extension registry](/docs/extending#registration).
+Quail creates a new instance for each query, so values collected for one
+query do not appear in the next query's report.
 
 ```python
-registry = quail.ExtensionRegistry.with_built_ins()
-registry.register_observer(ProgressObserver)
+import quail
 
+registry = quail.ExtensionRegistry.with_built_ins()
+registry.register_observer(CompletedOperators)
+config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
 session = quail.Session(config=config, registry=registry)
-result = session.sql(..., dialect="snowflake").run()
-result.report["observers"]["progress"]  # {"nodes": ["ai_filter:r", ...]}
 ```
+
+## Read the report
+
+Create a query with this session. After running it, call
+`result.observer()` with the observer class to read its report:
+
+```python
+result = query.run()
+print(result.observer(CompletedOperators))
+session.close()
+```
+
+The report contains the `node_ids` list returned by `report()`.
+For Quail's standard execution measurements, see
+[Metrics](/docs/user-guide/metrics).

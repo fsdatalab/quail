@@ -42,8 +42,19 @@ DATA_DIR = "/results/quailb_data"
 
 
 @app.function(image=image, timeout=1200, volumes=VOLUMES)
-def ensure_data(sf: float, query_ids: list[str], collection_id: str):
-    """Write the queries' tables to the volume and resolve the label collection."""
+def ensure_data(sf: float, query_ids: list[str], collection_id: str,
+                label_root: str = ""):
+    """Prepare query tables and resolve the reference label collection.
+
+    Args:
+        sf: Dataset scale factor.
+        query_ids: Query IDs whose tables are required.
+        collection_id: Reference collection ID, or empty to use the default.
+        label_root: Optional local mirror of published reference labels.
+
+    Returns:
+        The resolved reference collection ID after committing data to the volume.
+    """
     import pyarrow.parquet as pq
 
     import quail_b as benchmark
@@ -61,7 +72,7 @@ def ensure_data(sf: float, query_ids: list[str], collection_id: str):
             pq.write_table(benchmark.load_table(name, scale_factor=sf), path)
     suite = benchmark.load_benchmark(
         query_ids, scale_factor=sf, data_dir=directory,
-        collection_id=collection_id or None)
+        collection_id=collection_id or None, root=label_root or None)
     results_vol.commit()
     return suite.ground_truth.collection_id
 
@@ -72,7 +83,9 @@ def _methods(csv: str) -> list[str]:
 
 
 def _run_family(process_groups, result_name, model, sf, query_ids_csv,
-                run_dir, ground_truth_collection, root=None) -> str:
+                run_dir, ground_truth_collection, root=None,
+                attention=None, gpu_timing=False,
+                canvas_draws=None) -> str:
     """Run one query family's methods, one child process per group.
 
     Every group runs on the one GPU of this container, in a fresh
@@ -92,7 +105,9 @@ def _run_family(process_groups, result_name, model, sf, query_ids_csv,
         process_result = run_backend_group_in_fresh_process(
             data_dir=DATA_DIR, model=model, sf=sf, query_ids=query_ids,
             run_dir=run_dir, ground_truth_collection=ground_truth_collection,
-            methods=methods, root=root)
+            methods=methods, root=root,
+            attention=attention, gpu_timing=gpu_timing,
+            suite_name=f"{family}{result_name}", canvas_draws=canvas_draws)
         process_results.append(process_result)
         suites.update(process_result["suites"])
     gpu_uuids = {
@@ -142,11 +157,32 @@ def run_query_family(
     include_dumb_vllm: bool = False,
     baselines: str = "stock_vllm,pipelined_vllm",
     result_name: str = "",
+    attention: str = "",
+    gpu_timing: bool = False,
+    label_root: str = "",
+    canvas_draws: str = "",
 ) -> str:
-    """Run one query family through Quail and the vLLM baselines.
+    """Run one query family through the selected benchmark methods.
 
-    baselines names the vLLM baseline methods that run when
-    include_baselines is set.
+    Args:
+        model: Model name.
+        sf: Dataset scale factor.
+        query_ids_csv: Comma-separated query IDs in one family.
+        run_dir: Directory for this benchmark run.
+        ground_truth_collection: Reference label collection ID.
+        include_baselines: Whether to run the methods listed in baselines.
+        include_quail: Whether to run the Quail backend.
+        include_dumb_vllm: Whether to include the naive vLLM baseline.
+        baselines: Comma-separated vLLM baseline method names.
+        result_name: Suffix distinguishing groups from the same query family.
+        attention: Forced attention path, or empty for automatic selection.
+        gpu_timing: Whether to record GPU execution time.
+        label_root: Optional local mirror of reference labels.
+        canvas_draws: Comma-separated maximum diffusion draw counts. Empty
+            keeps the default; multiple counts create separate Quail runs.
+
+    Returns:
+        Path to the saved family result on the results volume.
     """
     process_groups = [("quail",)] if include_quail else []
     if include_baselines:
@@ -155,7 +191,11 @@ def run_query_family(
         process_groups.append(("dumb_vllm",))
     try:
         return _run_family(process_groups, result_name, model, sf, query_ids_csv,
-                           run_dir, ground_truth_collection)
+                           run_dir, ground_truth_collection,
+                           root=label_root or None,
+                           attention=attention or None,
+                           gpu_timing=gpu_timing,
+                           canvas_draws=canvas_draws or None)
     finally:
         results_vol.commit()
         kernel_cache.commit()
@@ -186,24 +226,24 @@ def run_sglang_query_family(
         kernel_cache.commit()
 
 
-def _merge_suites(parts, query_ids, run_id, started, elapsed,
+def _merge_suites(parts, directories, query_ids, run_id, started, elapsed,
                   function_call_ids, methods):
     base = parts[0]
     fields = ("scale_factor", "corpus_id", "collection_id", "metadata",
               "gpu_count", "gpu_hourly_rate_usd")
     by_query = {}
     skipped = {}
-    for part in parts:
+    for part, directory in zip(parts, directories, strict=True):
         if part["run_id"] != run_id:
             raise ValueError("query families disagree on run_id")
         for field in fields:
             if part[field] != base[field]:
                 raise ValueError(f"query families disagree on {field}")
-        family = part["query_family"]["name"]
         for item in part["queries"]:
             if item["id"] in by_query:
                 raise ValueError(f"duplicate query {item['id']}")
-            by_query[item["id"]] = dict(item, directory=f"{family}/{item['id']}")
+            by_query[item["id"]] = dict(
+                item, directory=f"{directory}/{item['id']}")
         skipped.update(part.get("skipped_queries", {}))
     if set(by_query) | set(skipped) != set(query_ids):
         raise ValueError("completed queries do not match the requested queries")
@@ -254,6 +294,10 @@ def run_all(
     include_quail: bool = True,
     include_dumb_vllm: bool = False,
     baselines: str = "stock_vllm,pipelined_vllm",
+    attention: str = "",
+    gpu_timing: bool = False,
+    label_root: str = "",
+    canvas_draws: str = "",
 ):
     from quail_b import select_queries
 
@@ -271,6 +315,8 @@ def run_all(
         "started_at": started.isoformat(),
         "model": model,
         "sf": sf,
+        "attention": attention or None,
+        "canvas_draws": canvas_draws or None,
         "query_ids": list(query_ids),
         "summaries": {},
         "function_call_ids": {},
@@ -280,7 +326,8 @@ def run_all(
     results_vol.commit()
 
     try:
-        data_call = ensure_data.spawn(sf, query_ids, ground_truth_collection)
+        data_call = ensure_data.spawn(sf, query_ids, ground_truth_collection,
+                                      label_root)
         manifest["function_call_ids"]["data"] = data_call.object_id
         print(f"function call id: {data_call.object_id} (data)", flush=True)
         ground_truth_collection = data_call.get()
@@ -302,6 +349,10 @@ def run_all(
                     include_dumb_vllm=include_dumb_vllm,
                     baselines=baselines,
                     result_name=result_name,
+                    attention=attention,
+                    gpu_timing=gpu_timing,
+                    label_root=label_root,
+                    canvas_draws=canvas_draws,
                 )
                 family_calls.append((group, family_call))
                 call_ids[f"{group}:quail_vllm"] = family_call.object_id
@@ -372,6 +423,8 @@ def _finish_run(directory, manifest, family_calls, sglang_calls, query_ids,
         parts = sglang_parts if method == "pipelined_sglang" else family_parts
         reports[method] = _merge_suites(
             [part["suites"][method] for part in parts],
+            # a family split into groups saves each group in its own folder
+            [Path(part["result_path"]).stem for part in parts],
             query_ids, directory.name, started, elapsed, call_ids,
             tuple(item for group in parts[0]["process_groups"]
                   for item in group))
@@ -394,7 +447,10 @@ def _finish_run(directory, manifest, family_calls, sglang_calls, query_ids,
         },
         summaries=paths,
     )
-    completed = reports["quail"]["queries"] if "quail" in reports else []
+    # several canvas draw counts save one Quail suite per count
+    completed = [item for name, report in reports.items()
+                 if name == "quail" or name.startswith("quail-")
+                 for item in report["queries"]]
     final = {
         "run_id": directory.name,
         "run_dir": str(directory),
@@ -454,7 +510,11 @@ def main(
     include_quail: bool = True,
     include_dumb_vllm: bool = False,
     baselines: str = "stock_vllm,pipelined_vllm",
+    attention: str = "",
+    gpu_timing: bool = False,
+    label_root: str = "",
     finish: str = "",
+    canvas_draws: str = "",
 ):
     if finish:
         # finish an earlier run whose orchestrator died
@@ -479,6 +539,10 @@ def main(
         include_quail=include_quail,
         include_dumb_vllm=include_dumb_vllm,
         baselines=baselines,
+        attention=attention,
+        gpu_timing=gpu_timing,
+        label_root=label_root,
+        canvas_draws=canvas_draws,
     )
     print(f"function call id: {call.object_id} (all families)", flush=True)
     print(call.get(), flush=True)

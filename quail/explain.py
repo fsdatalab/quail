@@ -4,12 +4,15 @@ from collections import Counter
 from collections.abc import Mapping
 
 from quail import logical as logical_nodes
+from quail.execution.pipelines import build_pipelines
 from quail.logical import DEFAULT_SELECTIVITY, effective_selectivity
 from quail.physical import (
+    AiClassify,
     AiFilter,
     AiJoin,
     Barrier,
     Exchange,
+    Filter,
     Foreign,
     HashJoin,
     Limit,
@@ -70,12 +73,27 @@ def logical_tree(logical):
             details = [f"{_prompt(p.prompt)} "
                        f"(selectivity={_selectivity(p.selectivity)})"
                        for p in node.predicates]
+            if node.order:
+                title += " order=" + ",".join(
+                    str(position + 1) for position in node.order)
+        elif isinstance(node, logical_nodes.Filter):
+            title = (f"Filter: {node.explain_fields()['condition']} "
+                     f"(selectivity={_selectivity(node.selectivity)})")
         elif isinstance(node, logical_nodes.SemanticJoin):
             title = f"SemanticJoin ({node.semantics})"
             details = [f"{_prompt(node.prompt)} "
                        f"(selectivity={_selectivity(node.selectivity)})"]
             if node.anchor is not None:
                 title += f" anchor={node.anchor}"
+            if node.exec_idx is not None:
+                title += (f" stage={node.exec_idx + 1}"
+                          f" exec_anchor={node.exec_anchor}")
+        elif isinstance(node, logical_nodes.SemanticClassify):
+            title = f"SemanticClassify: {node.name}"
+            if node.probabilities:
+                title += f", {node.name}{logical_nodes.PROBABILITIES_SUFFIX}"
+            details = [f"{_prompt(node.call.prompt)} "
+                       f"labels={list(node.call.labels)}"]
         elif isinstance(node, logical_nodes.Join):
             title = "Join"
             details = ([f"on {condition}" for condition in node.on]
@@ -319,8 +337,6 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                 kv.append("KV rewind=on")
             if node.keep_kv:
                 kv.append("retain KV for later joins")
-            if node.pin_survivors:
-                kv.append("survivors stream into the join with KV pinned")
             details.append(", ".join(kv) if kv else
                            "KV: stored" if node.arena_writes else "KV: not stored")
             written = filters.get(node.alias, ())
@@ -337,18 +353,22 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                     stage.selectivity, stage.expected_docs,
                     stages.get(("filter", node.alias, stage.written_pos)),
                     "evaluated")))
+        elif isinstance(node, AiClassify):
+            spec = node.spec
+            title += f": {spec.name} over {spec.aliases[0]}"
+            details.append(f"rule={spec.scoring}, "
+                           f"labels={len(spec.labels)}, "
+                           f"label tokens="
+                           f"{sum(len(ids) for ids in spec.label_token_ids)}"
+                           + (f", up to {spec.draws} noise draws"
+                              if spec.draws > 1 else ""))
+        elif isinstance(node, Filter):
+            title += f": {node.predicate.describe()}"
         elif isinstance(node, AiJoin):
             title += f": anchor={node.anchor}"
             source = {"none": "not resident", "filter": "from filters",
                       "kept": "from an earlier join"}.get(
                           node.anchor_resident, node.anchor_resident)
-            anchor_port = next(
-                (port for port in node.inputs
-                 if port.source.port == f"ids:{node.anchor}"), None)
-            producer = (graph.node(anchor_port.source.node_id)
-                        if anchor_port else None)
-            if isinstance(producer, AiFilter) and producer.pin_survivors:
-                source = "streamed from its filter"
             keep = "yes" if node.keep_anchor_kv else "no"
             details.append(f"KV: anchor={source}, retain after join={keep}")
             order = [stage.written_pos for stage in node.stages]
@@ -437,9 +457,9 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
                 title += " (metrics unavailable)"
         if "release_recompute_tokens" in estimate:
             details.append(
-                ("if the KV were released here instead of pinned: "
-                 if node.pin_survivors else "expected recompute at the join: ")
-                + f"{estimate['release_recompute_tokens']:,} tokens, "
+                "expected recompute at the join if the chain's KV is "
+                "released: "
+                f"{estimate['release_recompute_tokens']:,} tokens, "
                 f"{estimate['release_recompute_seconds']:.3f} s")
         rows.append((pad + title, cells))
         rows.extend((pad + "  " + detail, {}) for detail in details)
@@ -462,6 +482,15 @@ def physical_tree(graph, *, logical=None, verbose=False, metrics=None,
         if node.node_id not in visited:
             visit(node, 0)
     lines = _table(rows)
+    seen = set()
+    for member_id, pipeline in build_pipelines(graph).items():
+        if id(pipeline) in seen or len(pipeline.members) < 2:
+            continue
+        seen.add(id(pipeline))
+        lines.append(f"Pipeline on {pipeline.alias}: "
+                     + " -> ".join(pipeline.node_ids)
+                     + " (each document runs every operator with its KV "
+                     "resident)")
     if used_default:
         lines.append(DEFAULT_NOTE)
     return "\n".join(lines)

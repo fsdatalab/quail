@@ -113,10 +113,10 @@ def _boot_state(model, **pipeline_kwargs):
     from transformers import AutoTokenizer
 
     from quail.backends.quail.executor.arena import KVArena
-    from quail.backends.quail.executor.loop import warm_kernels
     from quail.backends.quail.executor.model import load_model
     from quail.backends.quail.executor.models import build_pipeline
     from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers
+    from quail.backends.quail.executor.warmup import warm_kernels
     from quail.cost import budgets
     from quail.specs import DEVICES, MODELS
 

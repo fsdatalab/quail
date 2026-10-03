@@ -2583,10 +2583,12 @@ wheels = [
 [[package]]
 name = "quail-b"
 version = "0.7.0"
-source = { git = "https://github.com/fsdatalab/quail-bench.git?rev=a4a08bbcecb38aeb7933188a322a1ec3d0570ea2#a4a08bbcecb38aeb7933188a322a1ec3d0570ea2" }
+source = { git = "https://github.com/fsdatalab/quail-bench.git?rev=4298e7a#4298e7a5297934ae52a54403363d7ec63d6fd503" }
 dependencies = [
+    { name = "awkward" },
     { name = "datasets" },
     { name = "duckdb" },
+    { name = "gigatoken" },
     { name = "huggingface-hub" },
     { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
     { name = "numpy", version = "2.5.2", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'emscripten' or sys_platform == 'win32'" },
@@ -2656,7 +2658,7 @@ dev = [
     { name = "modal", extras = ["api-proxy-support"], specifier = "==1.5.4" },
     { name = "pandas", specifier = "==3.0.5" },
     { name = "pytest", specifier = "==9.1.1" },
-    { name = "quail-b", git = "https://github.com/fsdatalab/quail-bench.git?rev=a4a08bbcecb38aeb7933188a322a1ec3d0570ea2" },
+    { name = "quail-b", git = "https://github.com/fsdatalab/quail-bench.git?rev=4298e7a" },
     { name = "ruff", specifier = "==0.12.9" },
     { name = "vulture", specifier = "==2.16" },
 ]

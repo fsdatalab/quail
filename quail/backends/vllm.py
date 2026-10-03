@@ -141,6 +141,12 @@ class VLLMClient:
     def generate(self, prompts, sampling_params, use_tqdm=False):
         return self.llm.generate(prompts, sampling_params, use_tqdm=use_tqdm)
 
+    def decode_params(self, max_tokens: int):
+        """Build sampling parameters for greedy text generation."""
+        from vllm import SamplingParams
+
+        return SamplingParams(max_tokens=max_tokens, temperature=0.0)
+
     def reset_prefix_cache(self):
         return self.llm.reset_prefix_cache()
 
@@ -170,6 +176,8 @@ class VLLMEngine:
     kind = "vllm"
     label = "vLLM"
     runtime_package = "vllm==0.26.0"
+    # a request can decode an answer as text
+    scores_labels = True
 
     def llm_kwargs(self, spec) -> dict:
         """Return the LLM constructor arguments beyond the model name.

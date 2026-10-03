@@ -1058,8 +1058,20 @@ def finalize_collection(sf: float, corpus_id: str,
 def activate_reused_collection(
         sf: float, target_corpus_id: str, source_collection_id: str,
         relabeled_workloads: str, *,
-        relabeled_predicates: tuple[str, ...] = ()) -> dict:
-    """Build one collection from new labels and verified unchanged tables."""
+        relabeled_predicates: tuple[str, ...] = (),
+        new_specs: tuple[PredicateSpec, ...] = ()) -> dict:
+    """Build one collection from new labels and verified unchanged tables.
+
+    Args:
+        sf: The scale factor.
+        target_corpus_id: The corpus the collection labels.
+        source_collection_id: The collection whose label sets are reused.
+        relabeled_workloads: Comma-separated workloads with new labels.
+        relabeled_predicates: Keys of other predicates with new labels.
+        new_specs: Predicates outside PREDICATES, such as classifications,
+            whose finished label sets the collection adds. Their label-set
+            ids use quail_b's own judge for their kind.
+    """
     with open(ROOT / "corpora" / target_corpus_id / "manifest.json") as f:
         target_corpus = json.load(f)
     source_collection_path = (
@@ -1096,11 +1108,18 @@ def activate_reused_collection(
     identities = {}
     manifests = {}
     reused = {}
-    for spec in PREDICATES:
-        if spec.workload in names or spec.key in relabeled_predicates:
+    for spec in PREDICATES + tuple(new_specs):
+        if spec in new_specs:
+            identity = _label_set_identity(
+                spec, target_corpus["corpus_id"],
+                target_corpus["corpus_full_hash"])
+        elif spec.workload in names or spec.key in relabeled_predicates:
             identity = label_set_identity(
                 spec, target_corpus["corpus_id"],
                 target_corpus["corpus_full_hash"])
+        else:
+            identity = None
+        if identity is not None:
             _, manifest = _label_manifest(identity["label_set_id"])
             if (manifest.get("status") != "complete"
                     or manifest.get("corpus_id")
@@ -1141,8 +1160,8 @@ def activate_reused_collection(
         "relabeled_workloads": sorted(names),
         "relabeled_predicates": sorted(relabeled_predicates),
         "reused_predicates": len(reused),
-        "new_predicates": len(PREDICATES) - len(reused),
-        "predicate_count": len(PREDICATES),
+        "new_predicates": len(identities) - len(reused),
+        "predicate_count": len(identities),
         "qwen_judgments": qwen_rows,
         "source_labels": total_rows - qwen_rows,
         "total_labels": total_rows,
@@ -1150,7 +1169,8 @@ def activate_reused_collection(
             key: {
                 "label_set_id": manifest["label_set_id"],
                 "rows": manifest["rows"],
-                "true_rows": manifest["true_rows"],
+                "true_rows": manifest.get("true_rows"),
+                "label_rows": manifest.get("label_rows"),
                 "source_rows": manifest["source_rows"],
                 "reused": key in reused,
             }

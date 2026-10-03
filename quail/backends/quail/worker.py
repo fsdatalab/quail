@@ -11,7 +11,6 @@ import time
 from quail.backends.base import GpuContext
 from quail.backends.quail.distributed import execute_distributed_graph
 from quail.backends.quail.executor.arena import KVArena
-from quail.backends.quail.executor.loop import warm_kernels
 from quail.backends.quail.executor.model import checkpoint_path, load_model
 from quail.backends.quail.executor.models import build_pipeline
 from quail.backends.quail.executor.readout import (
@@ -21,6 +20,7 @@ from quail.backends.quail.executor.readout import (
     AsyncDecisionScores,
     DecisionHead,
 )
+from quail.backends.quail.executor.warmup import warm_kernels
 from quail.backends.quail.graph import (
     _join_round_kv,
     _tuple_suffix,
@@ -30,10 +30,9 @@ from quail.backends.quail.graph import (
 )
 from quail.backends.quail.retention import apply_retention, retain_after_join
 from quail.cost import budgets
-from quail.execution.runner import ExecutionContext, SurvivorStream
+from quail.execution.runner import ExecutionContext
 from quail.execution.tokens import (
     DocumentPrefixes,
-    chain_tokens,
     decode_payload_documents,
 )
 from quail.execution.types import PhysicalResponse
@@ -154,7 +153,8 @@ class LoadedGpu:
         with self.torch.inference_mode():
             warm = warm_kernels(self.torch, self.arena, self.pipeline,
                                 self.async_ans, self.chunk_tokens,
-                                model_name=self.spec.hf_name)
+                                model_name=self.spec.hf_name,
+                                model=self.model)
         self.torch.cuda.synchronize()
         warm_s = time.perf_counter() - t0
         self._warmed = True
@@ -536,14 +536,6 @@ def _child_joins(state, sub):
     apply_retention(arena, config,
                     config.get("before", {}).get(node.node_id, {}), live)
     retain_anchor = bool(sub.get("retain_anchor"))
-    encoded_filter = sub.get("stream_filter_node")
-    filter_node = None
-    if encoded_filter is not None:
-        filter_node = registry.codecs[encoded_filter["type"]].decode(
-            encoded_filter)
-        if not isinstance(filter_node, AiFilter) \
-                or filter_node.alias != anchor_alias:
-            raise TypeError("the streamed chain must filter the anchor")
     out_joins, tokens_total = [], 0
     t0 = time.perf_counter()
     with torch.inference_mode():
@@ -567,22 +559,9 @@ def _child_joins(state, sub):
             {int(position): {int(anchor): partners
                              for anchor, partners in rows.items()}
              for position, rows in sub.get("pairs", {}).items()})
-        if filter_node is None:
-            prefixes = [chain_tokens(pre, d) for d in anchor_docs]
-            anchor_keys = [(anchor_alias, g) for g in anchors_glob]
-            round_kv = _join_round_kv(anchor_keys, arena)
-            anchor_stream = None
-        else:
-            # filled by the driver as this GPU's shard streams through
-            prefixes, anchor_keys = [], []
-            round_kv = None
-            anchor_stream = {
-                "node": filter_node,
-                "documents": DocumentPrefixes(
-                    pre, anchor_docs, range(len(anchor_docs))),
-                "document_ids": anchors_glob,
-                "stream": SurvivorStream(filter_node, anchors_glob),
-            }
+        prefixes = DocumentPrefixes(pre, anchor_docs, range(len(anchor_docs)))
+        anchor_keys = [(anchor_alias, g) for g in anchors_glob]
+        round_kv = _join_round_kv(anchor_keys, arena)
 
         def anchor_done(a, row):
             matched = any(row)
@@ -605,9 +584,9 @@ def _child_joins(state, sub):
                 ],
                 "anchor_keys": anchor_keys,
                 "anchor_done": anchor_done,
-                "anchor_stream": anchor_stream,
+                "chain": None,
                 "kv_round": round_kv,
-                "anchor_ids": None if filter_node else anchors_glob,
+                "anchor_ids": anchors_glob,
                 "partner_indices": {
                     stage.written_pos: tuples
                     for stage, tuples in zip(node.stages, tuple_globs)
@@ -618,21 +597,6 @@ def _child_joins(state, sub):
             runtime_context,
         )
         ans = result.metrics.extension["answers"]
-        filter_out = {}
-        if filter_node is not None:
-            anchors_glob = [key[1] for key in anchor_keys]
-            round_kv = dict(hits=result.metrics.kv_hits,
-                            misses=result.metrics.kv_misses)
-            chain = anchor_stream["stream"].finalized_result()
-            answers = chain.outputs[f"filter_answers:{anchor_alias}"]
-            filter_out = dict(
-                filters={anchor_alias: {
-                    int(document): row for document, row in answers.items()
-                }},
-                survivors={anchor_alias: list(
-                    chain.outputs[f"ids:{anchor_alias}"])},
-                filter_fresh_tokens=chain.metrics.fresh_tokens,
-            )
         last = ans[-1] if ans else {}
         for a, key in enumerate(anchor_keys):
             if not arena.is_resident(key):
@@ -664,7 +628,6 @@ def _child_joins(state, sub):
                 retained={alias: sorted(documents)
                           for alias, documents in retained.items()},
                 kv_round=round_kv,
-                **filter_out,
                 kv_totals=dict(
                     evicted_keys=arena.evicted_keys,
                     evicted_pages=arena.evicted_pages,

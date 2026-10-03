@@ -5,7 +5,14 @@ line. qwen3_spec builds the spec of any Qwen3 checkpoint from its
 config.json.
 """
 
-from .base import ACT_BYTES_PER_HIDDEN, DeviceSpec, ModelSpec, Precision, Role
+from .base import (
+    ACT_BYTES_PER_HIDDEN,
+    AnswerCanvas,
+    DeviceSpec,
+    ModelSpec,
+    Precision,
+    Role,
+)
 from .decision_2_kai_0_6b import DECISION_2_KAI_0_6B_BF16
 from .diffusion_gemma_26b import DIFFUSION_GEMMA_26B_FP8
 from .h100_sxm import H100_PRICE_SOURCE, H100_SXM, H100_USD_PER_HOUR
@@ -29,8 +36,8 @@ DEVICES = {device.name: device for device in (
 MODAL_GPU_USD_PER_HOUR = {
     name: device.usd_per_hour for name, device in DEVICES.items()}
 
-__all__ = ["ACT_BYTES_PER_HIDDEN", "DeviceSpec", "ModelSpec", "Precision",
-           "Role", "MODELS", "DEVICES", "QWEN3_4B_FP8", "QWEN3_32B_FP8",
+__all__ = ["ACT_BYTES_PER_HIDDEN", "AnswerCanvas", "DeviceSpec", "ModelSpec",
+           "Precision", "Role", "MODELS", "DEVICES", "QWEN3_4B_FP8", "QWEN3_32B_FP8",
            "QWEN3_RERANKER_0_6B_BF16",
            "QWEN3_RERANKER_4B_BF16", "DIFFUSION_GEMMA_26B_FP8",
            "DECISION_2_KAI_0_6B_BF16",

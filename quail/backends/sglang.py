@@ -126,6 +126,7 @@ class SGLangEngine:
     """Boot SGLang for a request backend."""
 
     kind = "sglang"
+    scores_labels = False
     label = "SGLang"
     runtime_package = "sglang==0.5.18"
 

@@ -1,8 +1,10 @@
 """Run one DiffusionGemma forward pass with Quail's batching and KV.
 
-Each prompt ends with a fixed canvas token. Its embedding receives the
-self-conditioning norm with zero conditioning, as in the first denoising
-step. The answer comes from TRUE/FALSE scores at that position.
+A filter's or join's prompt ends with a fixed canvas token, and the
+answer comes from TRUE/FALSE scores at that position. A classification
+packs a seeded answer canvas and reads its first row. Canvas rows run
+one denoising step with zero self-conditioning input, as vLLM's first
+step does, through the self-conditioning module's output norm.
 """
 
 import numpy as np
@@ -11,14 +13,14 @@ from quail.backends.quail.executor.attention import Engine
 from quail.backends.quail.executor.models.base import ModelPipeline
 from quail.backends.quail.executor.moe import FP8Experts
 from quail.cost import budgets
-
-# The canvas starts as random token ids, as vLLM's sampler starts it;
-# one fixed draw serves every document so answers are reproducible.
-CANVAS_SEED = 0
+from quail.specs.base import CANVAS_SEED
 
 
 def canvas_token_ids(vocab: int, tokens: int, seed: int = CANVAS_SEED) -> tuple:
-    """The fixed random token ids that fill every canvas."""
+    """Return fixed random canvas tokens for filter and join requests.
+
+    The same tokens are reused for every document to keep answers reproducible.
+    """
     rng = np.random.default_rng(seed)
     return tuple(int(i) for i in rng.integers(0, vocab, tokens))
 
@@ -46,7 +48,9 @@ class DiffusionGemmaPipeline(ModelPipeline):
         model: vLLM's DiffusionGemmaForConditionalGeneration module.
         arena: KVArena with one pool per layer at that layer's KV
             geometry (spec.kv_shapes).
-        spec: The ModelSpec, for the vocabulary size and canvas length.
+        spec: The ModelSpec, for the vocabulary size, the canvas
+            length, and the denoising settings, which must match the
+            checkpoint's.
         engine_class: Engine class, replaceable by tests.
     """
 
@@ -64,7 +68,7 @@ class DiffusionGemmaPipeline(ModelPipeline):
         self.embed = backbone.embed_tokens
         self.normalizer = backbone.normalizer
         self.final_norm = backbone.norm
-        self.canvas_norm = model.self_conditioning.post_norm
+        self.conditioning = model.self_conditioning
         self.vllm_config = model.quail_vllm_config
         self.window = spec.sliding_window
         attn = self.layers[0].self_attn
@@ -149,8 +153,8 @@ class DiffusionGemmaPipeline(ModelPipeline):
         canvas = meta.get("canvas")
         if canvas is not None:
             rows = canvas["rows"]
-            hidden.index_copy_(
-                0, rows, self._norm(hidden.index_select(0, rows), self.canvas_norm))
+            x = hidden.index_select(0, rows)
+            hidden.index_copy_(0, rows, self._norm(x, self.conditioning.post_norm))
         # the fused MoE kernels look their layer up in the forward
         # context
         with set_forward_context(None, self.vllm_config, num_tokens=n):

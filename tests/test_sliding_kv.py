@@ -3,6 +3,7 @@
 import pytest
 from fakes import cpu_staging
 
+from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor import loop
 from quail.backends.quail.executor.arena import KVArena
 
@@ -168,7 +169,7 @@ def test_pack_chunk_builds_both_pools_and_reads_borrowed_pages(monkeypatch):
     tail = [500, 501]
     canvas = (900, 901)
     arena.activate(key, 100, capacity_tokens=120, base_tokens=100)
-    chunk = loop.pack_chunk(
+    chunk = chunk_mod.pack_chunk(
         torch, arena, [dict(key=key, prefix=doc, f=100, suffixes=[tail])],
         attention_mode="unified", canvas=canvas)
     assert chunk.fresh_keys == (key,)
@@ -181,7 +182,7 @@ def test_pack_chunk_builds_both_pools_and_reads_borrowed_pages(monkeypatch):
     assert chunk.meta["canvas"]["sliding"]["used"].tolist() == [104]
     arena.trim_window(key)
     # a later stage reads the kept rows: the sliding pool from row 64
-    chunk = loop.pack_chunk(
+    chunk = chunk_mod.pack_chunk(
         torch, arena, [dict(key=key, prefix=None, f=100, suffixes=[[600]])],
         attention_mode="unified", canvas=canvas)
     assert chunk.fresh_keys == ()
@@ -197,7 +198,7 @@ def test_pack_chunk_builds_both_pools_and_reads_borrowed_pages(monkeypatch):
         arena.capacity_rows_sliding(key)[36:39].tolist()
     assert chunk.meta["canvas"]["sliding"]["used"].tolist() == [39]
     # two suffixes take temporaries after a copy of each partial last page
-    chunk = loop.pack_chunk(
+    chunk = chunk_mod.pack_chunk(
         torch, arena, [dict(key=key, prefix=None, f=100,
                             suffixes=[[600], [601, 602]])],
         attention_mode="unified")
@@ -210,6 +211,23 @@ def test_pack_chunk_builds_both_pools_and_reads_borrowed_pages(monkeypatch):
     assert sliding["tail_src"].numel() == 2 * (36 % 16)
     for temp in chunk.temporary_keys:
         arena.free_key(temp)
+    # each suffix may carry its own canvas
+    chunk = chunk_mod.pack_chunk(
+        torch, arena, [dict(key=key, prefix=None, f=100,
+                            suffixes=[[600], [601, 602]],
+                            canvas=[[900, 901], [910, 911]])],
+        attention_mode="unified", canvas=canvas)
+    assert chunk.input_ids.tolist() == [600, 900, 901, 601, 602, 910, 911]
+    assert chunk.positions.tolist() == [100, 101, 102, 100, 101, 102, 103]
+    assert chunk.final_indices.tolist() == [1, 5]
+    assert chunk.meta["unified"]["used"].tolist() == [103, 104]
+    for temp in chunk.temporary_keys:
+        arena.free_key(temp)
+    with pytest.raises(ValueError, match="1 canvases for 2 suffixes"):
+        chunk_mod.pack_chunk(
+            torch, arena, [dict(key=key, prefix=None, f=100,
+                                suffixes=[[600], [601]], canvas=[[900, 901]])],
+            attention_mode="unified", canvas=canvas)
     arena.free_key(key)
     assert arena.free_pages == 64
 
@@ -221,7 +239,7 @@ def test_pack_chunk_builds_both_pools_and_reads_borrowed_pages(monkeypatch):
     arena.activate(child, 94, capacity_tokens=104, base_tokens=94,
                    borrow=(parent, 64))
     assert arena.owned_pages(child)[:4] == arena.owned_pages(parent)[:4]
-    chunk = loop.pack_chunk(
+    chunk = chunk_mod.pack_chunk(
         torch, arena,
         [dict(key=parent, prefix=doc, f=100, suffixes=[tail]),
          dict(key=child, prefix=doc[64:94], start=64, f=94, suffixes=[tail])],
@@ -243,7 +261,7 @@ def test_pack_chunk_builds_both_pools_and_reads_borrowed_pages(monkeypatch):
     # under tree attention without a read_key, the fresh rows read the
     # child's own first 64 rows (the borrowed pages) and the suffix
     # reads all 94
-    chunk = loop.pack_chunk(
+    chunk = chunk_mod.pack_chunk(
         torch, arena,
         [dict(key=child, prefix=doc[64:94], start=64, f=94,
               suffixes=[tail, [501]])],
@@ -264,7 +282,7 @@ def test_pack_chunk_builds_both_pools_and_reads_borrowed_pages(monkeypatch):
                    borrow=(parent, 64))
     arena.activate(b, 70, capacity_tokens=80, base_tokens=70,
                    borrow=(parent, 64))
-    chunk = loop.pack_chunk(
+    chunk = chunk_mod.pack_chunk(
         torch, arena,
         [dict(key=parent, prefix=doc, f=100, suffixes=[tail]),
          dict(key=a, prefix=doc[64:74], start=64, read_key=parent, f=74,
@@ -331,7 +349,7 @@ def test_borrowing_in_the_arena_and_can_borrow(monkeypatch):
         arena.owned_sliding_pages(parent)[2:4]
     # the child's sliding pages: 2 borrowed + pages for [64, 104) = 3 own
     assert len(arena.owned_sliding_pages(child)) == 5
-    chunk = loop.pack_chunk(
+    chunk = chunk_mod.pack_chunk(
         torch, arena,
         [dict(key=parent, prefix=doc, f=100, suffixes=[tail]),
          dict(key=child, prefix=doc[64:94], start=64, f=94, suffixes=[tail])],

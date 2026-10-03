@@ -5,7 +5,7 @@
     "table-providers",
     "models",
     "operators",
-    "backends",
+    "rules",
     "observers"
   ],
   "defaultOpen": false

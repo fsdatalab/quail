@@ -186,7 +186,7 @@ def _install_single_rank_groups(torch):
 
 
 def retain_answer_head(torch, model, token_ids):
-    """Keep the answer rows and release the full output head."""
+    """Keep the TRUE/FALSE answer rows and the full output head in bf16."""
     allowed = tuple(sorted(set(token_ids)))
     if not allowed:
         raise ValueError("TRUE/FALSE token ids must not be empty")
@@ -198,8 +198,24 @@ def retain_answer_head(torch, model, token_ids):
     weights = weight.detach().index_select(0, indices).to(dtype=torch.bfloat16)
     model.register_buffer("quail_answer_weights", weights, persistent=False)
     model.quail_answer_token_ids = allowed
+    # AI.CLASSIFY reads the whole head: bf16 logits, as in vLLM,
+    # normalized in float32. A head tied to the embedding shares its
+    # memory; the model spec prices an untied head into the KV arena.
+    model.quail_full_head = weight.detach().to(dtype=torch.bfloat16)
     # lm_head can be the same module as embed_tokens; drop only this reference.
     model.lm_head = None
+
+
+def full_output_head(model):
+    """Return the whole output head for full-vocabulary log probabilities.
+
+    Raises:
+        ValueError: The model booted without keeping its head.
+    """
+    head = getattr(model, "quail_full_head", None)
+    if head is None:
+        raise ValueError("this model's full output head was not kept")
+    return head
 
 
 def answer_weights(model, token_ids):
@@ -213,7 +229,7 @@ def answer_weights(model, token_ids):
 def load_model(model_name: str, revision: str | None = None, *,
                answer_token_ids=None, max_batched_tokens=None,
                moe_backend=None):
-    """Load model weights and retain only TRUE/FALSE output rows.
+    """Load model weights and retain the answer rows and the full output head.
 
     max_batched_tokens is the largest chunk the model will see. vLLM's
     fused MoE kernels size their scratch buffers from it; a dense model

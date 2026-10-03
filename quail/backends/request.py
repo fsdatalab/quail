@@ -18,6 +18,7 @@ from quail.backends.request_scheduling import (
     true_bit,
 )
 from quail.cost import budgets
+from quail.execution.labels import match_label
 from quail.execution.pairs import (
     allowed_members,
     members_by_partner,
@@ -36,11 +37,13 @@ from quail.execution.runner import (
 )
 from quail.execution.types import PhysicalResponse, export_physical_outputs
 from quail.logical import (
+    Alias,
     Apply,
     effective_selectivity,
     filter_question_text,
     join_label,
     join_outer_input,
+    label_text,
     render_join_frame,
     shared_preamble,
 )
@@ -50,6 +53,7 @@ from quail.physical import (
     PortRef,
     Project,
     Recombine,
+    RequestClassifySpec,
     RequestExecution,
     RequestFilterSpec,
     RequestJoinSpec,
@@ -65,6 +69,7 @@ from quail.planner import (
 from quail.planner import (
     join_specs as logical_join_specs,
 )
+from quail.planner.classify import has_label
 from quail.planner.joins import search_joins, summarize_alias
 from quail.planner.physical_optimizer import PhysicalCandidate, SupportResult
 from quail.planner.plan import CorpusStats, PhysicalPlan, Refusal
@@ -91,8 +96,19 @@ def plan_request_backend(
     backend_name: str,
     filter_submission: str,
     join_submission: str,
+    scores_labels: bool = False,
 ) -> tuple[PhysicalCandidate, ...]:
-    """Build one physical request plan for a request engine."""
+    """Build one physical request plan for a request engine.
+
+    Args:
+        region: The logical model region to plan.
+        context: The planning context.
+        backend_name: The backend the plan names.
+        filter_submission: How filter stages become requests.
+        join_submission: How join tuples become requests.
+        scores_labels: Whether the engine decodes an answer as text,
+            which AI.CLASSIFY needs.
+    """
     if any(isinstance(node, Apply) for node in region.logical_plan.walk()):
         return (PhysicalCandidate(
             graph=None,
@@ -102,8 +118,39 @@ def plan_request_backend(
                 needed=1, available=0, unit="backends"),
             estimated_seconds=float("inf"),
         ),)
+    classifies = has_label(region.logical_plan)
+    if any(isinstance(column, Alias)
+           and getattr(column.expression, "probabilities", False)
+           for column in region.logical_plan.root.columns):
+        return (PhysicalCandidate(
+            graph=None,
+            plan=Refusal(
+                reasons=(f"AI.CLASSIFY on {backend_name} decodes the label "
+                         f"as text and has no probability for the others",),
+                constraint="classify_probabilities_need_quail_backend",
+                needed=1, available=0, unit="backends"),
+            estimated_seconds=float("inf"),
+        ),)
+    # a diffusion model's vLLM canvas is sized for a filter's one
+    # answer token, not a label
+    scores_labels = scores_labels and not context.model.canvas_tokens
+    if classifies and not (scores_labels and context.tokenizer is not None):
+        reason = (f"AI.CLASSIFY on {backend_name} decodes each answer as "
+                  f"text, which its engine does not return for "
+                  f"{context.model.name!r}"
+                  if context.tokenizer is not None
+                  else "AI.CLASSIFY planning needs the model's tokenizer")
+        return (PhysicalCandidate(
+            graph=None,
+            plan=Refusal(
+                reasons=(reason,),
+                constraint="classify_needs_quail_backend",
+                needed=1, available=0, unit="backends"),
+            estimated_seconds=float("inf"),
+        ),)
     operators = region.logical_plan.operators()
     scans, filters, joins = operators.scans, operators.filters, operators.joins
+    ask_filters = {alias: list(ps) for alias, ps in filters.items() if ps}
     stats = {
         alias: CorpusStats(
             n_docs=len(lengths),
@@ -135,9 +182,9 @@ def plan_request_backend(
         nodes.append(node)
         input_refs.append(PortRef(node.node_id, f"pairs:{node.written_pos}"))
 
-    rule = context.order or default_order_rule(filters, joins)[0]
+    rule = context.order or default_order_rule(ask_filters, joins)[0]
     chunk_tokens = budgets.chunk_budget(context.model, context.device)
-    preamble_count = preamble_tokens(filters, joins)
+    preamble_count = preamble_tokens(ask_filters, joins)
     filter_orders = {
         alias: order_filters_indexed(
             predicates,
@@ -149,12 +196,12 @@ def plan_request_backend(
             device=context.device,
             chunk_tokens=chunk_tokens,
         )
-        for alias, predicates in filters.items()
+        for alias, predicates in ask_filters.items()
     }
     live = {
         alias: float(summary.n_docs) for alias, summary in stats.items()
     }
-    for alias, predicates in filters.items():
+    for alias, predicates in operators.all_filters().items():
         for predicate in predicates:
             live[alias] *= effective_selectivity(predicate.selectivity)
     search_specs = logical_join_specs(joins, context.pair_fractions)
@@ -184,9 +231,9 @@ def plan_request_backend(
     first_anchor = join_sequence[0][1] if join_sequence else None
     for alias in sorted(aliases, key=lambda alias: alias == first_anchor):
         predicates = filters.get(alias, ())
-        if not predicates:
+        if alias not in ask_filters:
             continue
-        prompts.extend(predicate.prompt for predicate in predicates)
+        prompts.extend(predicate.prompt for predicate in ask_filters[alias])
         written_positions = tuple(filter_orders[alias])
         questions = tuple(
             tuple(predicates[position].prompt.tail_token_ids)
@@ -203,6 +250,46 @@ def plan_request_backend(
             written_positions=written_positions,
             question_token_ids=questions,
             question_texts=question_texts,
+        ))
+
+    # each classification labels the alias's documents after its AI.IF
+    # chain; the filters on its labels keep the accepted documents for the joins
+    label_plan = operators.labels
+    classify_specs = []
+    for call, alias in label_plan.calls:
+        prompts.append(call.prompt)
+        pair = {}
+        if len(call.aliases()) == 2:
+            # a classification of the rows a join keeps: decoded after
+            # that join, one request per row
+            partner = call.aliases()[1]
+            parts = {part_alias: (label, frame)
+                     for part_alias, label, frame in call.prompt.label_token_ids}
+            written_pos = next(
+                (position for position, join in enumerate(joins)
+                 if {argument.alias for argument in join.prompt.args}
+                 == set(call.aliases())), None)
+            if written_pos is None:
+                raise ValueError(
+                    f"the classification of {alias!r} x {partner!r} pairs "
+                    f"needs a join of the two")
+            pair = dict(partner=partner,
+                        join_layout_token_ids=(tuple(parts[alias][1]),
+                                        tuple(parts[partner][0])),
+                        join_written_pos=written_pos)
+        classify_specs.append(RequestClassifySpec(
+            alias=alias,
+            output=label_plan.names[call],
+            tail_token_ids=tuple(call.prompt.tail_token_ids),
+            labels=tuple(call.labels),
+            label_token_ids=tuple(
+                tuple(context.tokenizer(label_text(label)))
+                for label in call.labels),
+            tests=tuple(
+                (test.position, test.values)
+                for test in operators.label_filters.get(alias, ())
+                if test.call == call),
+            **pair,
         ))
 
     join_specs = []
@@ -278,6 +365,7 @@ def plan_request_backend(
         ),
         filters=tuple(filter_specs),
         joins=tuple(join_specs),
+        classifies=tuple(classify_specs),
     )
     nodes.append(request_node)
 
@@ -306,11 +394,15 @@ def plan_request_backend(
     else:
         sink_input = PortRef(request_node.node_id, f"ids:{aliases[0]}")
 
+    label_ports = tuple(
+        PortRef(request_node.node_id, f"label_answers:{name}")
+        for name in label_plan.projected.values())
     nodes.append(Project(
         node_id="project",
-        inputs=input_ports((sink_input,)),
+        inputs=input_ports((sink_input, *label_ports)),
         columns=tuple(
-            f"{column.alias}.{column.column}"
+            column.name if isinstance(column, Alias)
+            else f"{column.alias}.{column.column}"
             for column in region.logical_plan.root.columns
         ),
     ))
@@ -518,6 +610,55 @@ def _pipelined_filter(client, sampling_params, bodies, questions, read_answer,
     }
 
 
+def _classify_documents(client, spec, bodies) -> dict:
+    """Decode one label per prompt body with greedy generation.
+
+    Generation stops after one more token than the longest label has.
+
+    Args:
+        client: The engine client.
+        spec: The RequestClassifySpec with the labels and the prompt tail.
+        bodies: Token ids for each prompt before the tail, preamble included.
+
+    Returns:
+        A dict with one label per body (None when the answer names no label),
+        the unmatched count, the request and token counts, and the generation
+        seconds. Fresh tokens count the uncached prompt tokens and each
+        generated token fed back to decode the next one.
+    """
+    tail = _token_list(spec.tail_token_ids)
+    longest = max(len(ids) for ids in spec.label_token_ids)
+    params = client.decode_params(longest + 1)
+    prompts = [{"prompt_token_ids": body + tail} for body in bodies]
+    started = time.perf_counter()
+    outputs = client.generate(prompts, params, use_tqdm=False) if prompts else []
+    wall_s = time.perf_counter() - started
+    labels = []
+    unmatched = 0
+    prompt_tokens = cached_tokens = generated_tokens = fed_back = 0
+    for output in outputs:
+        prompt_tokens += len(output.prompt_token_ids)
+        cached_tokens += int(getattr(output, "num_cached_tokens", 0) or 0)
+        generated = len(output.outputs[0].token_ids)
+        generated_tokens += generated
+        # each generated token but the last is fed back through the model
+        fed_back += max(generated - 1, 0)
+        text = output.outputs[0].text or ""
+        label = match_label(text, spec.labels)
+        unmatched += label is None
+        labels.append(label)
+    return {
+        "labels": labels,
+        "wall_s": wall_s,
+        "requests": len(prompts),
+        "prompt_tokens": prompt_tokens,
+        "cached_tokens": cached_tokens,
+        "fresh_tokens": prompt_tokens - cached_tokens + fed_back,
+        "generated_tokens": generated_tokens,
+        "unmatched": unmatched,
+    }
+
+
 class RequestModelExecution:
     """Execute one request engine node with one loaded engine."""
 
@@ -653,6 +794,59 @@ class RequestModelExecution:
             fresh_tokens += result["fresh_tokens"]
             cached_tokens += result["cached_tokens"]
             evaluated_documents += result["requests"]
+
+        for spec in node.classifies:
+            if spec.partner is not None:
+                continue
+            document_ids = list(survivors[spec.alias])
+            result = _classify_documents(
+                self.client, spec, [
+                    _token_list(node.preamble_token_ids)
+                    + _token_list(self.documents[spec.alias][document])
+                    for document in document_ids])
+            # a document whose answer names no label has no label row
+            # and leaves the query
+            labeled = [(document, label) for document, label
+                       in zip(document_ids, result["labels"])
+                       if label is not None]
+            outputs[f"label_answers:{spec.output}"] = pa.table({
+                spec.alias: pa.array([d for d, _ in labeled], pa.int32()),
+                spec.output: pa.array([label for _, label in labeled],
+                                      pa.string()),
+            })
+            survivors[spec.alias] = [document for document, _ in labeled]
+            test_answers = {}
+            for index, (position, accepted) in enumerate(spec.tests):
+                kept = set(accepted)
+                alive = set(survivors[spec.alias])
+                for document, label in labeled:
+                    if document in alive:
+                        test_answers[(document, index)] = label in kept
+                survivors[spec.alias] = [
+                    document for document, label in labeled
+                    if label in kept and document in alive]
+            if spec.tests:
+                outputs[f"label_in_answers:{spec.output}"] = (
+                    _filter_answer_table(
+                        spec.alias, [position for position, _ in spec.tests],
+                        test_answers))
+            steps.append({
+                "kind": "classify",
+                "alias": spec.alias,
+                "output": spec.output,
+                "n_in": len(document_ids),
+                "n_out": len(survivors[spec.alias]),
+                "wall_s": result["wall_s"],
+                "requests": result["requests"],
+                "fresh_tokens": result["fresh_tokens"],
+                "cached_tokens": result["cached_tokens"],
+                "generated_tokens": result["generated_tokens"],
+                "unmatched": result["unmatched"],
+            })
+            requests += result["requests"]
+            fresh_tokens += result["fresh_tokens"]
+            cached_tokens += result["cached_tokens"]
+            evaluated_documents += len(document_ids)
 
         for spec in node.joins:
             alias_documents = {
@@ -805,6 +999,50 @@ class RequestModelExecution:
             evaluated_pairs += len(rows)
             fresh_tokens += result["fresh_tokens"]
             cached_tokens += result["cached_tokens"]
+
+        for spec in node.classifies:
+            if spec.partner is None:
+                continue
+            # the rows the join kept, each decoded as anchor, note,
+            # partner block, and the question
+            answers = outputs[f"join_answers:{spec.join_written_pos}"]
+            kept = answers.filter(answers.column("answer"))
+            pairs = list(zip(kept.column(spec.alias).to_pylist(),
+                             kept.column(spec.partner).to_pylist()))
+            note, partner_label = (
+                _token_list(ids) for ids in spec.join_layout_token_ids)
+            result = _classify_documents(
+                self.client, spec, [
+                    _token_list(node.preamble_token_ids)
+                    + _token_list(self.documents[spec.alias][anchor])
+                    + note + partner_label
+                    + _token_list(self.documents[spec.partner][partner])
+                    for anchor, partner in pairs])
+            labeled = [(pair, label) for pair, label
+                       in zip(pairs, result["labels"]) if label is not None]
+            outputs[f"label_answers:{spec.output}"] = pa.table({
+                spec.alias: pa.array([a for (a, _), _ in labeled], pa.int32()),
+                spec.partner: pa.array([p for (_, p), _ in labeled], pa.int32()),
+                spec.output: pa.array([label for _, label in labeled],
+                                      pa.string()),
+            })
+            steps.append({
+                "kind": "classify",
+                "alias": spec.alias,
+                "partner": spec.partner,
+                "output": spec.output,
+                "n_in": len(pairs),
+                "n_out": len(labeled),
+                "wall_s": result["wall_s"],
+                "requests": result["requests"],
+                "fresh_tokens": result["fresh_tokens"],
+                "cached_tokens": result["cached_tokens"],
+                "unmatched": result["unmatched"],
+            })
+            requests += result["requests"]
+            fresh_tokens += result["fresh_tokens"]
+            cached_tokens += result["cached_tokens"]
+            evaluated_pairs += result["requests"]
 
         for alias in node.aliases:
             outputs[f"ids:{alias}"] = survivors[alias]
@@ -964,6 +1202,7 @@ class RequestBackend:
             backend_name=self.name,
             filter_submission=self.filter_submission,
             join_submission=self.join_submission,
+            scores_labels=getattr(self.engine, "scores_labels", False),
         )
 
     def start(self, context):

@@ -10,11 +10,12 @@ from contextlib import nullcontext
 from itertools import takewhile
 from types import SimpleNamespace
 
+import numpy as np
 import pyarrow as pa
 
 import quail
 from quail.backends.quail import QuailModelExecution
-from quail.backends.quail.executor import loop
+from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor.arena import KVArena, PageArena
 from quail.backends.quail.executor.models.base import ModelPipeline
 from quail.backends.quail.graph import execute_single_graph
@@ -22,6 +23,7 @@ from quail.builtins import built_in_registry
 from quail.physical import (
     AiFilter,
     AiJoin,
+    Barrier,
     FilterStage,
     Foreign,
     HashJoin,
@@ -61,9 +63,16 @@ def bare_arena(arena, pages):
     return arena
 
 
+def letter_tokens(text):
+    """Tokenize text as bytes, treating short answer letters as one token."""
+    import re
+    if re.fullmatch(r" [A-Za-z]{1,2}", text):
+        return [10_000 * (len(text) - 1) + sum(map(ord, text[1:]))]
+    return list(text.encode())
+
+
 def cpu_staging(monkeypatch):
     """Stage packed chunks as plain CPU tensors; returns torch."""
-    import numpy as np
     import torch
 
     def staged(torch_, data, dtype, pinned=True):
@@ -72,13 +81,13 @@ def cpu_staging(monkeypatch):
         return torch.tensor(data, dtype=dtype)
 
     def token_parts(torch_, sequences, total, pinned=True, staging=None):
-        ids = [int(t) for seq in sequences for part in loop._token_parts(seq)
+        ids = [int(t) for seq in sequences for part in chunk_mod._token_parts(seq)
                for t in part]
         assert len(ids) == total
         return torch.tensor(ids, dtype=torch.int64)
 
-    monkeypatch.setattr(loop, "_staged", staged)
-    monkeypatch.setattr(loop, "_staged_token_parts", token_parts)
+    monkeypatch.setattr(chunk_mod, "_staged", staged)
+    monkeypatch.setattr(chunk_mod, "_staged_token_parts", token_parts)
     return torch
 
 
@@ -150,12 +159,34 @@ def fake_torch():
 
 
 def fake_pack(torch, arena, specs, **kw):
+    # a group's own canvas rows are packed, one canvas per suffix; the
+    # chunk's are not counted
+    def own_rows(spec):
+        own = spec.get("canvas")
+        return 0 if own is None else np.shape(own)[-1]
+
     tokens = sum(
         (len(spec["prefix"]) if spec["prefix"] is not None else 0)
-        + sum(len(suffix) for suffix in spec["suffixes"])
+        + sum(len(suffix) + own_rows(spec) for suffix in spec["suffixes"])
         for spec in specs)
+
+    # one row per suffix, every row of a suffix read whole, or every
+    # row of the canvas after it
+    def canvas_rows(spec):
+        own = spec.get("canvas")
+        return len(kw.get("canvas") or ()) if own is None else own_rows(spec)
+
+    rows_per_answer = tuple(
+        int(spec["read_rows"][index]) if spec.get("read_rows") is not None
+        else (canvas_rows(spec) or len(suffix)) if spec.get("read_all_rows")
+        else 1
+        for spec in specs for index, suffix in enumerate(spec["suffixes"]))
+    if all(rows == 1 for rows in rows_per_answer):
+        rows_per_answer = ()
+    meta = {}
     return SimpleNamespace(specs=specs, tokens=tokens, temporary_keys=(),
-                           fresh_keys=())
+                           fresh_keys=(), rows_per_answer=rows_per_answer,
+                           meta=meta)
 
 
 def expected_filter_rows(filter_truth):
@@ -167,57 +198,13 @@ def expected_filter_rows(filter_truth):
     return rows
 
 
-def run_streamed(monkeypatch, *, doc_lengths, filter_truth, partner_lengths,
-                 join_truth, budget, pages, frame_tokens=3, stages=2,
-                 anchor_partners=None):
-    """Drive a filter chain streamed into a join on a CPU arena."""
-    monkeypatch.setattr(loop, "pack_chunk", fake_pack)
-    model = FakeModel(filter_truth, join_truth)
-    pipeline = fake_pipeline(forward_chunk=model.forward_chunk)
-    answers = SimpleNamespace(submit=lambda v: v, result=lambda v: v,
-                              dtype=None)
-    arena = cpu_arena(pages)
-    docs = [[DOC + d] * n for d, n in enumerate(doc_lengths)]
-    questions = [[QUESTION + s] for s in range(stages)]
-    keys = [("r", d) for d in range(len(docs))]
-    frame = [FRAME] * frame_tokens
-    suffixes = [[PARTNER + i] * n for i, n in enumerate(partner_lengths)]
-    stream = loop.FilterStream(
-        fake_torch(), arena, pipeline, answers, docs, questions, budget,
-        arena_writes=True, arena_keys=keys, hold_survivors=True,
-        hold_extra_tokens=len(frame))
-    blocked_seen = []
-    real_next = stream.next
-
-    def counting_next(evict_retained=False):
-        items, blocked = real_next(evict_retained=evict_retained)
-        blocked_seen.append(blocked)
-        return items, blocked
-
-    stream.next = counting_next
-    anchor_keys, anchor_prefixes = [], []
-    settled = {}
-
-    def anchor_done(local, row):
-        settled[anchor_keys[local]] = list(row)
-        arena.free_key(anchor_keys[local])
-
-    join_answers, _, join_tokens = loop.run_join(
-        fake_torch(), arena, pipeline, answers, anchor_prefixes,
-        [suffixes], budget, stage_frames=[frame], anchor_keys=anchor_keys,
-        anchor_done=anchor_done, anchor_source=stream,
-        anchor_partners=anchor_partners)
-    return dict(stream=stream, model=model, arena=arena,
-                join_answers=join_answers, join_tokens=join_tokens,
-                anchor_keys=anchor_keys, settled=settled,
-                blocked=blocked_seen)
-
-
-def two_alias_graph(pin_survivors, *, stages=1, hash_join=False, foreign=None):
+def two_alias_graph(pipelined, *, stages=1, hash_join=False, foreign=None):
     """R's filter chain into a join with p.
 
     Args:
-        pin_survivors: Whether the chain streams into the join.
+        pipelined: Whether the chain and the join run as one pipeline;
+            otherwise a Barrier between them materializes the
+            survivors and the chain retains their KV.
         stages: Filter stages on r.
         hash_join: Pair r and p on their "key" columns with a HashJoin
             over the scans that feeds the join its pairs port.
@@ -227,14 +214,18 @@ def two_alias_graph(pin_survivors, *, stages=1, hash_join=False, foreign=None):
     chain = AiFilter(
         node_id="filter:r",
         inputs=input_ports((PortRef("input:r", "ids:r"),)),
-        alias="r", arena_writes=True, pin_survivors=pin_survivors,
-        keep_kv=not pin_survivors, hold_tokens=1 if pin_survivors else 0,
+        alias="r", arena_writes=True, keep_kv=not pipelined,
         stages=tuple(FilterStage(s, 1, 0, 0.8 - 0.1 * s, 14 * 0.8 ** s)
                      for s in range(stages)),
         question_token_ids=tuple((QUESTION + s,) for s in range(stages)))
     nodes = [Scan(node_id="input:r", alias="r", input_id="r"), chain,
              Scan(node_id="input:p", alias="p", input_id="p")]
     anchor_src = PortRef("filter:r", "ids:r")
+    if not pipelined:
+        nodes.append(Barrier(node_id="barrier:r",
+                             inputs=input_ports((anchor_src,)),
+                             next_anchor="r", aliases=("r",)))
+        anchor_src = PortRef("barrier:r", "ids:r")
     join_inputs = []
     pairs_from = ""
     if hash_join:
@@ -261,7 +252,7 @@ def two_alias_graph(pin_survivors, *, stages=1, hash_join=False, foreign=None):
             function="keep_even", kind=foreign[0], ids=foreign[1],
             columns=(), aliases=("r",)))
         anchor_src = PortRef("apply:keep_even", "ids:r")
-    resident = "filter" if pin_survivors else "none"
+    resident = "filter" if pipelined else "none"
     nodes.append(AiJoin(
         node_id="group:0", anchor="r", anchor_resident=resident,
         inputs=input_ports((anchor_src, PortRef("input:p", "ids:p"),
@@ -286,7 +277,7 @@ def run_graph_on_arena(monkeypatch, graph, *, n_docs=14, n_partners=4,
         (result, model, filter_truth, join_truth); the arena is empty
         afterwards.
     """
-    monkeypatch.setattr(loop, "pack_chunk", fake_pack)
+    monkeypatch.setattr(chunk_mod, "pack_chunk", fake_pack)
     rng = random.Random(seed)
     docs = {
         "r": [[DOC + d] * rng.randrange(10, 40) for d in range(n_docs)],

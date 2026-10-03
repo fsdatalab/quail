@@ -1,5 +1,11 @@
 """Built in physical optimizer rules.
 
+- kv_retention: the KV later operators read stays resident, within
+  the retention pool's page cap: a filter chain keeps its survivors'
+  KV for a join anchored on its table, and a join keeps its anchor's
+  KV for a later group on the same anchor.
+- label_scoring: each classification gets the label scoring rule
+  (letters, trie_tree, or trie_decode) whose simulated time is lowest.
 - prefix_sharing: documents that share a token prefix with another
   document borrow its KV pages for the shared part instead of
   computing it again.
@@ -12,8 +18,165 @@ from __future__ import annotations
 from dataclasses import replace
 
 from quail.cost.budgets import choose_attention_path, tree_attention_allowed
-from quail.physical import AiFilter, AiJoin, PhysicalGraph
-from quail.planner.prefixes import page_tree
+from quail.cost.retention import coefficients
+from quail.execution.pipelines import build_pipelines
+from quail.logical import classified_above_joins
+from quail.physical import (
+    AiClassify,
+    AiFilter,
+    AiJoin,
+    Filter,
+    Foreign,
+    PhysicalGraph,
+)
+from quail.planner import retention
+from quail.planner.prefixes import document_shared_tokens, page_tree
+from quail.planner.statistics import cached_statistics, live_after_filters
+
+
+class KvRetention:
+    """Keep the KV that later operators read resident, within the page cap.
+
+    The schedule (quail.planner.retention.schedule) records, at each
+    execution boundary, which aliases a later stage anchors on and how
+    likely each document is to survive to that use. The executor's
+    retention pool keeps their KV by that priority, up to the page cap.
+
+    - A filter chain keeps its survivors' KV (keep_kv) when a later join
+      anchors on its table, unless the chain streams into that join in
+      one pipeline on one GPU.
+    - A join keeps its anchor's KV (keep_anchor_kv) when a later group
+      anchors on the same table.
+    - A chain writes KV pages only when a later stage, the next operator
+      of its pipeline, or the retention pool reads them.
+
+    The rule needs the logical plan on the context and fires only on a
+    plan without a ``retention`` setting, so a later pass keeps the
+    first schedule. It puts the schedule, the retention coefficients,
+    and the page cap in the ``retention`` setting.
+    """
+
+    name = "kv_retention"
+
+    def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
+        if context is None or context.logical_plan is None \
+                or "retention" in context.settings:
+            return None
+        logical = context.logical_plan
+        statistics = cached_statistics(
+            logical, context.memo, model=context.model, device=context.device,
+            doc_tokens=context.document_tokens,
+            pair_fractions=context.pair_fractions)
+        joins = [node for node in graph.nodes if isinstance(node, AiJoin)]
+        groups = [[(statistics.specs[stage.written_pos], stage.anchor)
+                   for stage in node.stages] for node in joins]
+        schedule = retention.schedule(
+            [stage for group in groups for stage in group],
+            live_after_filters(logical, statistics),
+            [node.node_id for node in joins])
+        ask_aliases = {node.alias for node in graph.nodes
+                       if isinstance(node, AiFilter)}
+        barriers = [node for node in graph.nodes
+                    if isinstance(node, Foreign) and node.kind == "barrier"]
+        barrier_aliases = {node.aliases[0] for node in barriers
+                           if node.ids != "pairs"}
+        for node in joins:
+            positions = {stage.written_pos for stage in node.stages}
+            if any(barrier.ids == "pairs" and barrier.written_pos in positions
+                   for barrier in barriers):
+                barrier_aliases.add(node.anchor)
+        chained = retention.chained_aliases(
+            groups, ask_aliases, barrier_aliases, context.gpu_count)
+        schedule["initial"] = {
+            alias: use for alias, use in schedule["initial"].items()
+            if alias not in chained
+        }
+        schedule.update(**coefficients(context.model, context.device),
+                        cap_pages=statistics.cap_pages)
+        nodes = []
+        for node in graph.nodes:
+            if isinstance(node, AiFilter):
+                keep = node.alias in schedule["initial"]
+                writes = node.arena_writes or keep
+                node = replace(node, keep_kv=keep, arena_writes=writes)
+            elif isinstance(node, AiJoin):
+                node = replace(node, keep_anchor_kv=(
+                    node.anchor in schedule["after"][node.node_id]))
+            nodes.append(node)
+        context.settings["retention"] = schedule
+        return PhysicalGraph(tuple(nodes), graph.root)
+
+
+class LabelScoring:
+    """Pick each classification's label scoring rule by simulated time.
+
+    Fires for every AiClassify whose spec has no scoring rule yet and
+    leaves chosen ones alone, so a later pass keeps the first choice.
+    The candidates are letters, when the prompt has a one-token letter
+    per label; trie_tree, under the tree attention path; and
+    trie_decode, over documents without resident KV (_Table.choose).
+    The documents count as resident, with their KV in the arena, when
+    the classification continues its table's filter chain on one GPU
+    before any join, or follows a classification with the same prompt
+    head. A classification of joined rows always uses letters and
+    arrives chosen.
+
+    The rule adds the chosen rules' seconds to the ``search_seconds``
+    setting. It needs the logical plan on the context for the calls'
+    prompts.
+    """
+
+    name = "label_scoring"
+
+    def rewrite(self, graph: PhysicalGraph, context) -> PhysicalGraph | None:
+        if context is None:
+            return None
+        pending = [node for node in graph.nodes
+                   if isinstance(node, AiClassify) and node.spec is not None
+                   and not node.spec.scoring]
+        if not pending:
+            return None
+        if context.logical_plan is None:
+            raise ValueError(
+                "label_scoring needs the logical plan on the planning context "
+                "to score a classification without a scoring rule")
+        from quail.planner.classify import classify_table
+
+        logical = context.logical_plan
+        calls = {node.name: node.call for node in logical.operators().classifies}
+        after_joins = classified_above_joins(logical.root)
+        chosen = {}
+        for node in pending:
+            table = classify_table(context, node.spec.anchor, node.backend_name)
+            resident = _resident(node, graph, context, calls, after_joins, table)
+            chosen[node.node_id] = replace(node, spec=table.choose_scoring(
+                node.spec, calls[node.spec.name], resident))
+        context.settings["search_seconds"] = (
+            context.settings.get("search_seconds", 0.0)
+            + sum(node.spec.estimated_seconds for node in chosen.values())
+            - sum(node.spec.estimated_seconds for node in pending))
+        return PhysicalGraph(
+            tuple(chosen.get(node.node_id, node) for node in graph.nodes),
+            graph.root)
+
+
+def _resident(node, graph, context, calls, after_joins, table) -> bool:
+    """Return whether a classification's documents have their KV in the arena.
+
+    True on one GPU when the classification continues its table's
+    AI.IF filter chain before any join, through any filters on labels
+    and applies between them, or follows a classification whose prompt
+    head is the same.
+    """
+    if context.gpu_count != 1:
+        return False
+    source = graph.node(node.inputs[0].source.node_id)
+    while isinstance(source, (Filter, Foreign)):
+        source = graph.node(source.inputs[0].source.node_id)
+    if isinstance(source, AiClassify) and source.spec is not None:
+        return (table.head(calls[source.spec.name])
+                == table.head(calls[node.spec.name]))
+    return isinstance(source, AiFilter) and node.spec.anchor not in after_joins
 
 
 def _token_store(document_tokens):
@@ -73,7 +236,8 @@ class PrefixSharing:
     worth more forward-pass time than the page writes the filter takes
     on. The filter then writes pages even when it has one stage, since
     borrowed pages must exist. A join always writes its anchors' KV,
-    so it fires for any join whose anchors share a whole page.
+    so it fires for any join whose anchors share a whole page; a
+    classification writes its documents' KV the same way.
     """
 
     name = "prefix_sharing"
@@ -83,6 +247,7 @@ class PrefixSharing:
             return None
         nodes = []
         changed = False
+        pipelines = build_pipelines(graph) if context.gpu_count == 1 else {}
         for node in graph.nodes:
             if isinstance(node, AiFilter) and not node.share_prefixes:
                 lengths = context.document_tokens.get(node.alias)
@@ -104,10 +269,33 @@ class PrefixSharing:
                         total_tokens=sum(lengths), writes_pages=True):
                     node = replace(node, share_prefixes=True)
                     changed = True
+            elif (isinstance(node, AiClassify) and node.spec is not None
+                  and not node.spec.share_prefixes):
+                lengths = context.document_tokens.get(node.spec.aliases[0])
+                store = _token_store(lengths)
+                if store is not None and sharing_pays(
+                        context.model, context.device,
+                        shared_tokens=page_aligned_shared_tokens(store),
+                        total_tokens=sum(lengths), writes_pages=True):
+                    pipeline = pipelines.get(node.node_id)
+                    resident = (pipeline is not None
+                                and pipeline.members[0].node_id != node.node_id)
+                    node = replace(node, spec=_shared_classify_spec(
+                        node, context, store, resident=resident))
+                    changed = True
             nodes.append(node)
         if not changed:
             return None
         return PhysicalGraph(tuple(nodes), graph.root)
+
+
+def _shared_classify_spec(node, context, store, *, resident=False):
+    """Enable prefix sharing and update the classification cost estimate."""
+    from quail.planner.classify import classify_table
+
+    table = classify_table(context, node.spec.aliases[0], node.backend_name,
+                           shared=document_shared_tokens(store))
+    return table.reestimate(replace(node.spec, share_prefixes=True), resident=resident)
 
 
 def _mean(values) -> float:
@@ -140,6 +328,10 @@ class TreeAttention:
         if context is None:
             return None
         model, device = context.model, context.device
+        forced = context.attention
+        if forced is not None and forced not in ("tree", "unified"):
+            raise ValueError(
+                f"attention must be 'tree' or 'unified', got {forced!r}")
         tree_available = tree_attention_allowed(model)
         nodes = []
         changed = False
@@ -167,6 +359,8 @@ class TreeAttention:
                     path = choose_attention_path(
                         model, device, readers=readers, reader_rows=rows,
                         node_tokens=_mean(lengths))
+            if path is not None and forced is not None:
+                path = forced
             if path is not None and path != node.attention:
                 node = replace(node, attention=path)
                 changed = True
@@ -177,5 +371,12 @@ class TreeAttention:
 
 
 def built_in_physical_rules() -> tuple:
-    """Return the physical rules registered with the built in registry."""
-    return (PrefixSharing(), TreeAttention())
+    """Return the physical rules registered with the built in registry.
+
+    In order: kv_retention, label_scoring, prefix_sharing, and
+    tree_attention. prefix_sharing follows kv_retention because it
+    weighs the page writes a chain already makes, and tree_attention
+    follows prefix_sharing because a filter's attention path depends
+    on the prefixes it shares.
+    """
+    return (KvRetention(), LabelScoring(), PrefixSharing(), TreeAttention())

@@ -2,24 +2,51 @@
 
 import numpy as np
 
-from quail.backends.quail.executor.loop import InputStaging, run_join
+from quail.backends.quail.executor.classify import AnswerStream, QuailClassifier
+from quail.backends.quail.executor.loop import run_join
+from quail.backends.quail.executor.parts import input_staging
 from quail.backends.quail.executor.readout import AsyncScores
+from quail.backends.quail.executor.stages import Stage, run_stages
+from quail.backends.quail.executor.state import QueryExecutionState
 from quail.execution.reranker import RerankerBatch
-from quail.execution.tokens import chain_tokens
+from quail.execution.tokens import DocumentPrefixes, chain_tokens
+from quail.physical import ClassifySpec
+from quail.specs.base import CANVAS_ENTROPY_NATS, CANVAS_SEED
 
 
 class QuailScorer:
     """Score document rows with Quail's token admission and KV arena."""
 
-    def __init__(self, state):
+    # score() reports answers through on_answers while it runs
+    streams_answers = True
+
+    def __init__(self, state: QueryExecutionState):
         self.state = state
 
-    def score(self, spec, rows, documents):
+    def score(self, spec, rows, documents, on_answers=None):
+        """Score or classify the rows.
+
+        Args:
+            spec: Score or classification specification.
+            rows: Document indices, one column per alias.
+            documents: Tokenized documents indexed by table alias and document ID.
+            on_answers: Optional callable(row positions, values) run as each
+                chunk's answers are read.
+
+        Returns:
+            A RerankerBatch with one value per row, in row order.
+        """
+        if isinstance(spec, ClassifySpec):
+            return QuailClassifier(self.state).classify(
+                spec, rows, documents, on_answers=on_answers)
         state = self.state
         rows = np.asarray(rows, dtype=np.int32)
         parts = spec.prompt_token_parts
         if len(parts) != len(spec.aliases) + 1:
             raise ValueError("AI.SCORE needs tokenized prompt parts")
+        if (len(spec.aliases) == 1 and spec.draws > 1
+                and state.loaded_model.pipeline.canvas_ids):
+            return self._drawn(spec, rows, documents, on_answers)
         if len(spec.aliases) == 1:
             prefixes = [parts[0]]
             suffixes = [chain_tokens(documents[spec.aliases[0]][doc], parts[1])
@@ -45,24 +72,113 @@ class QuailScorer:
             total = int(prefix_lengths[anchor_index].sum()
                         + suffix_lengths[candidate_index].sum())
         keys = [("score", spec.name, index) for index in range(len(prefixes))]
-        async_scores = state.get("score_readout")
-        if async_scores is None:
-            answer_rows = state["answer_rows"]
-            async_scores = state.get("async_scores")
-            if async_scores is None or async_scores.rows is not answer_rows:
-                async_scores = AsyncScores(state["torch"], answer_rows)
-                state["async_scores"] = async_scores
-        if "input_staging" not in state:
-            state["input_staging"] = InputStaging(state["torch"])
-        state["input_staging"].fixed_tokens.clear()
+        async_scores = self._scores()
+        staging = state.loaded_model.input_staging
+
+        def report(anchor, stage, start, end, values):
+            first = offsets[anchor]
+            on_answers(order[first + start:first + end], np.asarray(values))
+
         answers, _, fresh = run_join(
-            state["torch"], state["arena"], state["pipeline"], async_scores,
-            prefixes, [suffixes], state["chunk_tokens"], anchor_keys=keys,
+            state.torch, state.loaded_model.arena, state.loaded_model.pipeline,
+            async_scores,
+            prefixes, [suffixes], state.chunk_tokens, anchor_keys=keys,
             anchor_partners=(None if partners is None
                              else lambda key: [partners[key[2]]]),
-            staging=state["input_staging"],
+            staging=staging,
+            on_answers=None if on_answers is None else report,
         )
         scores = np.empty(len(rows), dtype=np.float32)
         for anchor, values in answers[0].items():
             scores[order[offsets[anchor]:offsets[anchor + 1]]] = values
         return RerankerBatch(scores, fresh_tokens=fresh, cached_tokens=total - fresh)
+
+    def _scores(self) -> AsyncScores:
+        """Return the cached score readout and clear its input staging cache."""
+        state = self.state
+        if state.score_readout is not None:
+            input_staging(state)
+            return state.score_readout
+        answer_rows = state.answer_rows
+        async_scores = state.async_scores
+        if async_scores is None or async_scores.rows is not answer_rows:
+            async_scores = AsyncScores(state.torch, answer_rows)
+            state.async_scores = async_scores
+        input_staging(state)
+        return async_scores
+
+    def _drawn(self, spec, rows, documents, on_answers=None) -> RerankerBatch:
+        """Score documents with reproducible diffusion draws.
+
+        A low-entropy first answer uses one draw. Other documents run the remaining
+        draws and use the mean TRUE probability. Draws share each document's KV.
+
+        Args:
+            spec: Single-document score specification.
+            rows: Input row indices with shape (documents, 1).
+            documents: Tokenized documents indexed by table alias and document ID.
+            on_answers: Optional callable(row positions, values) run with each
+                chunk's finished scores.
+
+        Returns:
+            A RerankerBatch of scores and execution metrics.
+        """
+        state = self.state
+        pipeline = state.loaded_model.pipeline
+        vocab = state.loaded_model.model_spec.vocab
+        (alias,) = spec.aliases
+        head, tail = spec.prompt_token_parts
+        docs = rows[:, 0]
+        width = len(pipeline.canvas_ids)
+        more = spec.draws - 1
+        scores = np.full(len(docs), np.nan, dtype=np.float32)
+        first = np.zeros(len(docs), dtype=np.float64)
+        extended = [0]
+
+        def canvas(anchor, draw):
+            rng = np.random.default_rng((CANVAS_SEED, int(docs[anchor]), draw))
+            return rng.integers(0, vocab, width)
+
+        def settle(anchor, row):
+            p = float(row[0])
+            first[anchor] = p
+            q = min(max(p, 1e-12), 1 - 1e-12)
+            if -(q * np.log(q) + (1 - q) * np.log(1 - q)) <= CANVAS_ENTROPY_NATS:
+                scores[anchor] = p
+            return True
+
+        def average(anchor, row):
+            extended[0] += 1
+            scores[anchor] = (first[anchor] + float(np.sum(row))) / spec.draws
+            return True
+
+        cue = [tail[-1]]
+        readout = self._scores()
+        stages = [
+            Stage(suffixes=[cue], readout=readout, frame=list(tail[:-1]),
+                  decide=settle, single=True, label=f"score {spec.name}",
+                  canvas=lambda anchor: canvas(anchor, 0), canvas_rows=width),
+            Stage(suffixes=[cue] * more, readout=readout,
+                  frame=list(tail[:-1]), decide=average,
+                  requests=lambda key: (None if np.isnan(scores[key[2]])
+                                        else Stage.SKIP),
+                  label=f"score {spec.name} draws",
+                  canvas=lambda anchor: np.stack(
+                      [canvas(anchor, draw) for draw in range(1, spec.draws)]),
+                  canvas_rows=width),
+        ]
+        prefixes = DocumentPrefixes(head, documents[alias], docs)
+        stream = AnswerStream(on_answers)
+        _, _, fresh = run_stages(
+            state.torch, state.loaded_model.arena, pipeline, stages, prefixes,
+            state.chunk_tokens,
+            anchor_keys=[("score", spec.name, index) for index in range(len(docs))],
+            staging=state.loaded_model.input_staging, label=f"score {spec.name}",
+            on_chunk=stream.chunk(lambda anchor: (
+                None if np.isnan(scores[anchor]) else scores[anchor])))
+        stream.finish(range(len(docs)), lambda anchor: scores[anchor])
+        read = len(cue) + width
+        total = (sum(len(head) + len(documents[alias][doc]) for doc in docs)
+                 + len(docs) * (len(tail) - 1 + read) + extended[0] * more * read)
+        return RerankerBatch(scores, fresh_tokens=fresh,
+                             cached_tokens=total - fresh)

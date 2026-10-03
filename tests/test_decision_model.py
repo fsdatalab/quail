@@ -116,10 +116,9 @@ def test_pipeline_reads_each_answer_offset_and_clamps_at_the_chunk_start():
 def test_streams_refuse_suffixes_the_readout_reads_past():
     pipeline = fake_pipeline(answer_offsets=(4, 2, 0))
     answers = SimpleNamespace(submit=lambda v: v, result=lambda v: v, dtype=None)
-    with pytest.raises(ValueError, match="reads 4 rows back"):
-        loop.FilterStream(fake_torch(), cpu_arena(64), pipeline, answers,
-                          [[5] * 20], [[40, 41, 42]], 200, arena_writes=True,
-                          arena_keys=[("d", 0)])
+    with pytest.raises(ValueError, match="4 rows the readout reads back"):
+        loop.run_filter(fake_torch(), cpu_arena(64), pipeline, answers,
+                        [[5] * 20], [[40, 41, 42]], 200, arena_writes=True)
     with pytest.raises(ValueError, match="4 rows the readout reads back"):
         loop.run_join(fake_torch(), cpu_arena(64), pipeline, answers,
                       [[5] * 20], [[[1, 2, 3, 4]]], 200)
@@ -223,6 +222,12 @@ def test_plans_carry_the_decision_layout(session):
     preamble, tail = score.spec.prompt_token_parts
     assert "".join(preamble) == "Context:\n"
     assert "".join(tail).endswith(OPTIONS + CLOSING)
+
+    plan = session.sql(
+        "SELECT d.id, AI.CLASSIFY(d.body, ARRAY['refund', 'other']) AS c "
+        "FROM documents d").plan()
+    assert isinstance(plan, Refusal)
+    assert plan.constraint == "decision_no_classify"
 
     engine = SimpleNamespace(label="stock vLLM", kind="vllm")
     backend = RequestBackend(name="stock", engine=engine,

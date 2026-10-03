@@ -14,6 +14,30 @@ Role = Literal["generative", "reranker", "decision"]
 ACT_BYTES_PER_HIDDEN = 32
 
 
+# Every random canvas token comes from this seed: a filter's fixed
+# canvas, and a classified document's canvas with the document's row.
+CANVAS_SEED = 0
+# A canvas answer whose first draw is less certain than this, in nats,
+# takes the rest of its noise draws and averages them.
+CANVAS_ENTROPY_NATS = 0.1
+
+
+@dataclass(frozen=True)
+class AnswerCanvas:
+    """Token layout for a diffusion model's classification answer.
+
+    Attributes:
+        rows: Rows of the canvas packed after the classification cue.
+        turn_close_id: The token that closes the model's turn, seeded
+            after the answer's row.
+        pad_id: The padding token, which fills the rows after it.
+    """
+
+    rows: int
+    turn_close_id: int
+    pad_id: int
+
+
 @dataclass(frozen=True)
 class ModelSpec:
     name: str
@@ -63,6 +87,9 @@ class ModelSpec:
     #                               later than 0 when the model opens
     #                               its turn with fixed tokens, such as
     #                               an empty thinking channel
+    answer_canvas: "AnswerCanvas | None" = None    # a diffusion model's
+    #                                        answer canvas, which the
+    #                                        letters rule reads
     turn_prefix: str = ""     # chat-turn text before every prompt
     turn_suffix: str = ""     # chat-turn text after the answer cue
     prompt_format: str = "raw-v1"    # names the turn layout in run records
@@ -138,11 +165,11 @@ class ModelSpec:
 
     @property
     def head_mem_bytes(self) -> float:
-        """Bytes of an untied bf16 lm_head weight; 0 when tied.
+        """Return untied output-head memory in bytes, or zero for tied weights.
 
-        The executor discards this matrix after retaining its TRUE/FALSE
-        rows. Both Qwen3 checkpoints store the
-        head in bf16, hence the 2 bytes per element.
+        The executor keeps this matrix for AI.CLASSIFY, so it stays
+        resident beside the other weights. Both Qwen3 checkpoints store
+        the head in bf16, hence the 2 bytes per element.
         """
         if self.tied_head:
             return 0.0
@@ -150,8 +177,8 @@ class ModelSpec:
 
     @property
     def W_resident(self) -> float:  # noqa: N802
-        """Weight bytes resident on the GPU after boot."""
-        return self.W_mem - self.head_mem_bytes
+        """Return model weight bytes resident on the GPU, including the output head."""
+        return self.W_mem
 
     @property
     def act_per_token(self) -> float:

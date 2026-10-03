@@ -2,21 +2,30 @@
 title: Custom models and GPUs
 ---
 
-Every planning decision in Quail comes from a `ModelSpec` and a
-`DeviceSpec`. Adding support for a new model or GPU means registering
-a spec.
+Quail uses model and GPU specifications to estimate query time and set
+execution limits. The inference backend must also support the model
+architecture and GPU you select. See
+[Supported models and GPUs](/docs/user-guide/models) for the included
+configurations.
 
-## ModelSpec
+## Model specifications
 
-A `ModelSpec` describes the model architecture. Every field except
-`params` and `w_mem_bytes` comes from the checkpoint's `config.json`.
+A *model specification* records a checkpoint, model dimensions, and
+numerical formats. Quail represents it with `ModelSpec`.
+
+For example, imagine that you have fine tuned Qwen3 4B and saved a complete
+FP8 checkpoint in `/models/review-qwen3-4b-fp8`. The checkpoint contains the
+weights, model configuration, and tokenizer files. Its model dimensions,
+tokenizer, and weight format match the original checkpoint.
+
+Create a `ModelSpec` for the checkpoint:
 
 ```python
 from quail.specs import ModelSpec
 
 MY_MODEL = ModelSpec(
-    name="qwen3-4b-fp8",
-    params=4.0e9,
+    name="review-qwen3-4b-fp8",
+    params=3.6e9,
     layers=36,
     hidden=2560,
     n_q=32,
@@ -24,31 +33,35 @@ MY_MODEL = ModelSpec(
     d_head=128,
     ffn_width=19456,
     w_bytes=1.0,
-    hf_name="Qwen/Qwen3-4B-FP8",
-    revision="96b30dc...",
+    hf_name="/models/review-qwen3-4b-fp8",
+    w_mem_bytes=4.5e9,
     vocab=151936,
     tied_head=True,
+    arch="qwen3",
 )
 ```
 
-Source:
-[quail/specs/base.py](https://github.com/fsdatalab/quail/blob/main/quail/specs/base.py).
+The checkpoint directory must be available in the process that loads the
+model. For a Hugging Face checkpoint, use its repository ID in `hf_name`
+and commit ID in `revision`.
 
-`revision` pins the Hugging Face hub commit so the worker resolves
-weights from cache without network round trips.
+If the dimensions, tokenizer, or weight format changed, update the
+specification to match. Use the checkpoint's `config.json` and weight
+files for the values. Measure loaded weight memory for `w_mem_bytes`;
+its default estimate uses `params * w_bytes`.
 
-The planner uses derived properties: `kappa` (KV bytes per token),
-`W_resident` (weight bytes on GPU after discarding the full output
-head), and `act_per_token` (activation memory per token).
+See [`ModelSpec`](https://github.com/fsdatalab/quail/blob/main/quail/specs/base.py)
+for the fields and
+[the Qwen3 4B specification](https://github.com/fsdatalab/quail/blob/main/quail/specs/qwen3_4b.py)
+for a complete configuration.
 
-### Qwen3 checkpoints
+### Qwen3 checkpoints from `config.json`
 
-`qwen3_spec` builds the `ModelSpec` of any Qwen3 checkpoint from its
-`config.json`. It reads the layer count, the hidden size, the head
-counts and head dim, the MLP width, the vocabulary, whether the
-output head is tied to the embedding, and the weight precision. For
-example, imagine registering a Qwen3 fine-tune that Quail does not
-ship a spec for:
+`qwen3_spec` builds a Qwen3 checkpoint's `ModelSpec` from its
+`config.json`: the layer count, hidden size, head counts and head
+dim, MLP width, vocabulary, whether the output head is tied to the
+embedding, and the weight precision. For example, imagine registering
+a Qwen3 fine-tune published on Hugging Face:
 
 ```python
 import quail
@@ -58,6 +71,7 @@ spec = qwen3_spec(
     "my-qwen3-1.7b",                 # the model= value
     "Org/My-Qwen3-1.7B",             # the Hugging Face repo
     revision="<commit hash>",
+    w_mem_bytes=3.4e9,               # optional; measured after loading
 )
 registry = quail.ExtensionRegistry.with_built_ins()
 registry.register_model(spec)
@@ -67,72 +81,95 @@ session = quail.Session(
 )
 ```
 
-Source:
+The checkpoint needs BF16 weights, or FP8 weights in 128 x 128 blocks.
+`qwen3_spec` raises `ValueError` for any other weight format, for a
+sliding attention window, and for a model type other than `qwen3`.
+`params` counts the attention and MLP projections and the norms, not
+the embedding table or the output head. Keyword arguments set any
+other `ModelSpec` field. See
 [quail/specs/qwen3.py](https://github.com/fsdatalab/quail/blob/main/quail/specs/qwen3.py).
 
-The checkpoint needs bf16 weights, or fp8 weights in 128 x 128
-blocks (the layout DeepGEMM reads). `qwen3_spec` raises `ValueError`
-for any other weight format, for a sliding attention window, and for
-a model type other than `qwen3`. Keyword arguments set any other
-`ModelSpec` field, such as a measured `w_mem_bytes`.
+## GPU specifications
 
-`params` counts the attention and MLP projections and the norms. It
-leaves out the embedding table and the output head, because a query
-reads only the output head's TRUE and FALSE rows.
+A *GPU specification* records memory capacity, memory bandwidth, and
+compute rates. Quail represents it with `DeviceSpec`.
 
-### Which models work with a spec alone
+| Field | Value and unit |
+| --- | --- |
+| `name` | The name used in `EngineConfig.device`. |
+| `mem_bytes` | GPU memory capacity in bytes. |
+| `hbm_bw` | GPU memory bandwidth in bytes per second. |
+| `peak_flops` | Peak dense FP8 operations per second. |
+| `bf16_flops` | Peak dense BF16 operations per second. |
 
-The Quail executor's GPU kernels are written for the Qwen3
-architecture (QK-norm, gated SiLU MLP). FP8 checkpoints run DeepGEMM
-and both attention paths; bf16 checkpoints run cuBLAS and unified
-attention.
+All values describe one GPU. Use compute rates without structured
+sparsity. The
+[H100 specification](https://github.com/fsdatalab/quail/blob/main/quail/specs/h100_sxm.py)
+is a complete example.
 
-A model with a different architecture (different attention layout,
-different activation function, different weight format) would need
-new GPU kernels in
-[quail/backends/quail/executor/](https://github.com/fsdatalab/quail/tree/main/quail/backends/quail/executor),
-or could run through a [custom inference engine](/docs/extending/backends)
-like vLLM or SGLang, which handle model loading independently.
-
-## DeviceSpec
-
-A `DeviceSpec` describes the GPU hardware.
-
-```python
-from quail.specs import DeviceSpec
-
-MY_DEVICE = DeviceSpec(
-    name="h100-sxm",
-    mem_bytes=80e9,
-    hbm_bw=3.35e12,
-    peak_flops=1.979e15,
-    bf16_flops=0.989e15,
-)
-```
-
-Source:
-[quail/specs/base.py](https://github.com/fsdatalab/quail/blob/main/quail/specs/base.py).
-
-All values are per GPU. `peak_flops` is the dense FP8 rate.
-The [H100 datasheet](https://resources.nvidia.com/en-us-tensor-core)
-quotes rates with 2:1 structured sparsity; divide by 2 for the dense
-rate Quail uses. `bf16_flops` is the dense BF16 rate, used for
-attention (FlashAttention runs in BF16).
+Register a new specification with `registry.register_device(spec)`.
+The backend must accept its device name and provide compatible execution
+code. The Quail backend currently accepts `h100-sxm` and
+`rtx-pro-6000-blackwell-server`. Its checks are in
+[`backend.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/backend.py).
 
 ## Registration
 
+Register the checkpoint specification and select it in `EngineConfig`:
+
 ```python
+import quail
+
 registry = quail.ExtensionRegistry.with_built_ins()
 registry.register_model(MY_MODEL)
-registry.register_device(MY_DEVICE)
+config = quail.EngineConfig(model=MY_MODEL.name, device="h100-sxm")
+session = quail.Session(config=config, registry=registry)
+session.close()
 ```
 
-Then use the registered names in `EngineConfig`:
+The example creates and closes a session without running model inference.
+Each model or device name must be unique within its registry.
 
-```python
-config = quail.EngineConfig(
-    model="my-model",
-    device="my-device",
-    gpus=1,
-)
-```
+## Implementing a model architecture
+
+The Quail executor implements the Qwen3 and DiffusionGemma architectures.
+
+Quail loads the checkpoint through vLLM, then selects its forward pass
+using `ModelSpec.arch`. Supporting another architecture requires both a
+compatible model loader and a forward pass that works with Quail's executor.
+
+1. Confirm that vLLM can load the checkpoint. Quail's
+   [loader](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/model.py)
+   also expects the loaded model to expose an `lm_head` output layer.
+2. Define a `ModelSpec` with the model dimensions, KV shapes, weight
+   format, and prompt format. The executor uses these values to allocate
+   memory and prepare model inputs.
+3. Implement a subclass of `ModelPipeline` in
+   `quail/backends/quail/executor/models/`. Its constructor receives
+   `(model, arena, *, spec)`: the loaded model, KV memory allocator,
+   and specification. Its `forward_chunk()` method returns hidden states
+   after the model's final normalization, for `chunk.final_indices`.
+4. Configure the pipeline's attention support and KV requirements with
+   `tree_attention` and `needs_pages`. If `gemm_warmup` is enabled,
+   implement `linears()` and provide an `engine` with the `quant()` and
+   `gemm()` methods used to prepare kernels. Models with extra answer
+   positions also need the canvas settings described in the interface.
+5. Add the class to `PIPELINES` in that directory's `__init__.py` and
+   set `ModelSpec.arch` to the corresponding key.
+
+The executor allocates and releases KV pages. The forward pass computes
+outputs using the supplied pages and the selected attention path.
+Before reusing a kernel, check its operation, input shapes, and number
+formats against the model. For example, Qwen3's activation kernel computes
+`SiLU(gate) * up`. For a model that uses GELU, use that model's GELU
+implementation in the forward pass.
+
+Check the forward pass on a GPU against the model's reference
+implementation using identical input tokens and positions. Check both
+fresh inputs and inputs that reuse saved KV.
+
+See the
+[`ModelPipeline` interface](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/models/base.py)
+and the
+[Qwen3 implementation](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/models/qwen3.py)
+for the execution requirements.

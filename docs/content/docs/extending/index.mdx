@@ -2,77 +2,46 @@
 title: Overview
 ---
 
-Quail's behavior can be extended by registering objects on an
-`ExtensionRegistry`. The registry holds models, devices, inference
-engines, node types, optimizer rules, and observers. Built-in
-components register through the same interface.
+Quail is an extensible query engine. This section explains how to
+implement extensions and use them in a session.
 
-## Creating a registry
+## Extension types
 
-```python
-import quail
-
-registry = quail.ExtensionRegistry.with_built_ins()
-```
-
-`with_built_ins()` populates the registry with Quail's included
-models, devices, backends, node codecs, and node runtimes. No model
-weights are loaded at registration time.
-
-## Registering extensions
-
-Each `register_*` method returns the registry, so calls can be
-chained:
-
-```python
-registry = (
-    quail.ExtensionRegistry.with_built_ins()
-    .register_model(MY_MODEL)
-    .register_device(MY_DEVICE)
-    .register_observer(MyObserver)
-)
-```
-
-Pass the registry when creating a session:
-
-```python
-session = quail.Session(config=config, registry=registry)
-```
-
-## What can be registered
-
-| Method | What it registers |
+| Task | Guide |
 | --- | --- |
-| `register_model(spec)` | A [`ModelSpec`](/docs/extending/models). |
-| `register_device(spec)` | A [`DeviceSpec`](/docs/extending/models). |
-| `register_backend(backend)` | A [custom inference engine](/docs/extending/backends). |
-| `register_observer(factory)` | An [execution observer](/docs/extending/observers). |
-| `register_logical_rule(rule)` | A logical plan rewrite rule. |
-| `register_physical_planner(planner)` | A planner that proposes physical plans. |
-| `register_physical_rule(rule)` | A physical graph rewrite rule. |
-| `register_node(node_type, runtime=...)` | A physical node type with its codec and runtime. |
+| Read tables from another storage system. | [Custom data sources](/docs/extending/table-providers) |
+| Add a model or GPU specification, or implement another model architecture. | [Custom models and GPUs](/docs/extending/models) |
+| Add a query operation. | [Custom operators](/docs/extending/operators) |
+| Change query planning decisions. | [Custom Rules](/docs/extending/rules) |
+| Run code after an operator finishes. | [Observers](/docs/extending/observers) |
 
-Every name is checked for duplicates. Registering the same name
+## Registration
+
+An *extension registry* holds the implementations available to a session.
+Use `ExtensionRegistry.with_built_ins()` to create a registry containing
+Quail's included implementations.
+
+To add an extension:
+
+1. Implement the interface described in its guide.
+2. Register the implementation with the appropriate `register_*` method,
+   such as `register_model()` or `register_observer()`.
+3. Pass the registry to `Session(config=config, registry=registry)`.
+
+Each guide includes an example of implementation and registration.
+Registration does not load model weights or run inference. A duplicate
+name within the same extension type raises `ValueError`.
+
+Data sources use `session.register(name, provider)` directly.
+See [Custom data sources](/docs/extending/table-providers).
+
+## Extension modules
+
+A Python package can register its extensions through a
+`register_quail_extension(registry)` function. The function receives the
+registry and calls the registration methods for the package's extensions.
+
+Call `registry.load_extension(module_name)` to import the module and run
+its registration function. The module must be importable in the process
+that creates the registry. Loading the same module into the same registry
 twice raises `ValueError`.
-
-Table providers are registered on the session with
-`session.register(name, provider)`. They do not go through the
-extension registry.
-
-## On Modal
-
-Create the registry inside the GPU function. Add extension packages
-to the Modal image:
-
-```python
-image = image.pip_install("my-extension==1.0.0")
-image = image.add_local_python_source("my_package")
-```
-
-## Advanced extension points
-
-Logical rules, physical planners, physical rules, and custom node
-types are available for advanced use cases. The source code and test
-suite (especially
-[`tests/test_physical.py`](https://github.com/fsdatalab/quail/blob/main/tests/test_physical.py))
-are the best reference for these interfaces.

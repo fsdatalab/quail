@@ -17,6 +17,8 @@ from quail.backends.sglang import SGLangClient
 from quail.backends.vllm import VLLMEngine, sampling_kwargs
 from quail.builtins import built_in_registry
 from quail.physical import (
+    Project,
+    RequestClassifySpec,
     RequestExecution,
     RequestFilterSpec,
     RequestJoinSpec,
@@ -112,6 +114,24 @@ def test_request_backends_plan_validate_and_execute(monkeypatch):
     assert result.report["backend_metrics"]["requests"] == 2
     joins = result.answer_tables["joins"][0].to_pydict()
     assert sorted(zip(*joins.values())) == [(0, 1, False), (1, 0, False)]
+
+    # a classification of the join's pairs: its label table names both
+    # aliases before the label column; the join kept no pair here
+    boot["client"] = _JoinedClient()
+    query = (
+        session.docs("docs").alias("d")
+        .join(session.docs("notes").alias("n"),
+              on=[quail.col("d.key") == quail.col("n.key")])
+        .ai_filter(quail.prompt("{0} matches {1}", quail.col("d.body"),
+                                quail.col("n.text")))
+        .ai_classify(quail.prompt("{0} about {1}", quail.col("d.body"),
+                                  quail.col("n.text")), ["a", "b"], name="kind")
+        .select("d.id", "n.id", "kind")
+    )
+    result = _run_stock_vllm(session, query)
+    labels = result.answer_tables["classifies"]["kind"]
+    assert labels.column_names == ["d", "n", "kind"]
+    assert labels.num_rows == 0 and result.count() == 0
     session.close()
 
 
@@ -350,3 +370,127 @@ def test_vllm_engine_settings_tokenizer_and_canvas_follow_the_model(monkeypatch)
     with diffusion_canvas(QWEN3_4B_FP8) as tokens:
         assert tokens == ()
         assert module.DiffusionGemmaRequestStates is States
+
+
+class _LabelClient(_Client):
+    """Decodes answers: document 10 says a, document 11 says B with a remark."""
+
+    def decode_params(self, max_tokens):
+        return ("decode", max_tokens)
+
+    def generate(self, prompts, sampling_params, use_tqdm=False):
+        assert sampling_params == ("decode", 3)
+        outputs = []
+        for prompt in prompts:
+            ids = prompt["prompt_token_ids"]
+            text = " a\nbecause" if 10 in ids else " B, clearly"
+            outputs.append(SimpleNamespace(
+                prompt_token_ids=ids, num_cached_tokens=0,
+                outputs=[SimpleNamespace(text=text, token_ids=[1, 2])]))
+        return outputs
+
+
+def test_request_backends_classify_with_one_decode_request_per_document():
+    # labels of at most two tokens, so each document's request decodes
+    # up to three; document 0 decodes a and document 1 decodes B
+    spec = RequestClassifySpec(
+        alias="d", output="kind", tail_token_ids=(90,),
+        labels=("a", "b", "c"), label_token_ids=((60, 62), (61, 62), (60, 63)),
+        tests=((0, ("b",)),))
+    node = RequestExecution(
+        node_id="request-model", backend_name="stock_vllm", aliases=("d",),
+        preamble_token_ids=(3,), classifies=(spec,))
+    execution = _execution({"d": [[10], [11]]}, client=_LabelClient())
+    result = execution.execute(node, {})
+    assert result.outputs["label_answers:kind"].to_pydict() == {
+        "d": [0, 1], "kind": ["a", "b"]}
+    assert result.outputs["ids:d"] == [1]
+    assert result.outputs["label_in_answers:kind"].to_pydict() == {
+        "d": [0, 1], "predicate": [0, 0], "answer": [False, True]}
+    assert result.metrics.extension["requests"] == 2
+    (step,) = result.metrics.extension["steps"]
+    assert (step["kind"], step["n_in"], step["n_out"]) == ("classify", 2, 1)
+    assert (step["generated_tokens"], step["unmatched"]) == (4, 0)
+    # two 3-token prompts, and each answer's first token fed back
+    assert result.metrics.fresh_tokens == 2 * 3 + 2 * (2 - 1)
+
+    session = _session("stock_vllm", docs=DOCS)
+    query = (session.docs("docs").alias("d")
+             .ai_classify(quail.prompt("kind of {0}", quail.col("d.body")),
+                          ["a", "b", "c"], name="kind")
+             .label_in("kind", ["b"])
+             .select("d.id", "kind"))
+    plan = query.plan()
+    request_node = next(
+        node for node in plan.nodes if isinstance(node, RequestExecution))
+    (planned,) = request_node.classifies
+    assert planned.labels == ("a", "b", "c")
+    assert planned.tests == ((0, ("b",)),)
+    assert not request_node.filters
+    project = next(node for node in plan.nodes if isinstance(node, Project))
+    assert [port.source.port for port in project.inputs] == [
+        "ids:d", "label_answers:kind"]
+    assert project.columns == ("d.id", "kind")
+    session.close()
+
+
+class _JoinedClient(_Client):
+    """Joins by token, and decodes a joined row's label from its partner."""
+
+    def decode_params(self, max_tokens):
+        return ("decode", max_tokens)
+
+    def generate(self, prompts, sampling_params, use_tqdm=False):
+        outputs = super().generate(prompts, sampling_params, use_tqdm)
+        if sampling_params != ("decode", 3):
+            return outputs
+        self.prompts = [tuple(prompt["prompt_token_ids"]) for prompt in prompts]
+        for output in outputs:
+            output.outputs[0].text = " a" if 20 in output.prompt_token_ids else " b"
+            output.outputs[0].token_ids = [1, 2]
+        return outputs
+
+
+def test_request_backends_decode_one_request_per_row_the_join_keeps():
+    # anchor r0 matches both partners; r1 matches none
+    spec = RequestClassifySpec(
+        alias="r", output="kind", tail_token_ids=(90,),
+        labels=("a", "b", "c"), label_token_ids=((60, 62), (61, 62), (60, 63)),
+        partner="p", join_layout_token_ids=((70,), (71,)), join_written_pos=0)
+    node = replace(_join_node(), classifies=(spec,))
+    client = _JoinedClient()
+    execution = _execution({"r": [[10], [11]], "p": [[20], [21]]}, client=client)
+    result = execution.execute(node, {})
+    assert result.outputs["join_answers:0"].to_pydict() == {
+        "r": [0, 0, 1, 1], "p": [0, 1, 0, 1],
+        "answer": [True, True, False, False]}
+    # each kept pair: preamble, anchor, its note, the partner's label and
+    # document, then the question
+    assert client.prompts == [(3, 10, 70, 71, 20, 90), (3, 10, 70, 71, 21, 90)]
+    assert result.outputs["label_answers:kind"].to_pydict() == {
+        "r": [0, 0], "p": [0, 1], "kind": ["a", "b"]}
+    assert result.outputs["ids:r"] == [0]
+    join_step, classify_step = result.metrics.extension["steps"]
+    assert join_step["kind"] == "join"
+    assert (classify_step["alias"], classify_step["partner"]) == ("r", "p")
+    assert (classify_step["n_in"], classify_step["n_out"]) == (2, 2)
+    assert result.metrics.evaluated_document_pairs == 4 + 2
+
+
+def test_match_label_takes_the_longest_label_the_answer_starts_with():
+    from quail.backends.request import match_label
+
+    labels = ("cardiac", "cardiac disorders", "vascular disorders")
+    assert match_label(" Cardiac disorders\nbecause", labels) == "cardiac disorders"
+    assert match_label("cardiac.", labels) == "cardiac"
+    assert match_label("  vascular disorders", labels) == "vascular disorders"
+    assert match_label("none of these", labels) is None
+    assert match_label("", labels) is None
+    # a leading "thought" line, then a leading "ANSWER:", are skipped
+    assert match_label("thought\nCardiac\n", labels) == "cardiac"
+    assert match_label("ANSWER: vascular disorders", labels) == \
+        "vascular disorders"
+    assert match_label("thought\n ANSWER:cardiac", labels) == "cardiac"
+    assert match_label("thought\nnone", labels) is None
+    assert match_label("thoughtful cardiac", labels) is None
+    assert match_label("cardiac\nthought", labels) == "cardiac"

@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from quail.backends.quail.executor import loop
+from quail.backends.quail.executor import warmup
 
 
 def _stub_torch():
@@ -17,8 +17,8 @@ def _stub_torch():
 
 
 def _concurrent_warmup(path, start, touch, compiles, results):
-    loop._marker_path = lambda *args: path
-    loop._marker_identity = lambda *args: {"version": 1}
+    warmup._marker_path = lambda *args: path
+    warmup._marker_identity = lambda *args: {"version": 1}
 
     def compile_once(*args):
         with compiles.get_lock():
@@ -28,11 +28,11 @@ def _concurrent_warmup(path, start, touch, compiles, results):
         # both cached workers must warm outside the compilation lock
         touch.wait(timeout=10)
 
-    loop.compile_kernels = compile_once
-    loop.touch_kernels = touch_together
+    warmup.compile_kernels = compile_once
+    warmup.touch_kernels = touch_together
     start.wait(timeout=10)
-    result = loop.warm_kernels(_stub_torch(), None, None, None, 100,
-                               model_name="model")
+    result = warmup.warm_kernels(_stub_torch(), None, None, None, 100,
+                                 model_name="model")
     results.put(result["tier"])
 
 
@@ -66,30 +66,66 @@ def test_concurrent_processes_compile_once_and_touch_in_parallel(tmp_path):
 def test_warmup_failure_writes_no_marker_and_touch_warms_the_join_chunk(
         monkeypatch, tmp_path):
     path = tmp_path / "warm.json"
-    monkeypatch.setattr(loop, "_marker_path", lambda *args: str(path))
-    monkeypatch.setattr(loop, "_marker_identity", lambda *args: {"version": 1})
+    monkeypatch.setattr(warmup, "_marker_path", lambda *args: str(path))
+    monkeypatch.setattr(warmup, "_marker_identity", lambda *args: {"version": 1})
 
     def fail(*args):
         raise RuntimeError("GPU failed")
 
     for failure in ("compile", "synchronize"):
         torch = _stub_torch()
-        monkeypatch.setattr(loop, "compile_kernels",
+        monkeypatch.setattr(warmup, "compile_kernels",
                             fail if failure == "compile" else lambda *args: None)
         if failure == "synchronize":
             torch.cuda.synchronize = fail
         with pytest.raises(RuntimeError, match="GPU failed"):
-            loop.warm_kernels(torch, None, None, None, 100, model_name="model")
+            warmup.warm_kernels(torch, None, None, None, 100, model_name="model")
         assert not path.exists(), failure
 
         torch.cuda.synchronize = lambda: None
-        monkeypatch.setattr(loop, "compile_kernels", lambda *args: None)
-        assert loop.warm_kernels(torch, None, None, None, 100,
-                                 model_name="model")["tier"] == "compile", failure
+        monkeypatch.setattr(warmup, "compile_kernels", lambda *args: None)
+        assert warmup.warm_kernels(torch, None, None, None, 100,
+                                   model_name="model")["tier"] == "compile", failure
         path.unlink()
 
     calls = []
-    monkeypatch.setattr(loop, "_forward_warm",
+    monkeypatch.setattr(warmup, "_forward_warm",
                         lambda *args, **kwargs: calls.append(kwargs))
-    loop.touch_kernels(None, None, None, None, 100)
+    warmup.touch_kernels(None, None, None, None, 100)
     assert calls == [{"join_chunk": True}]
+
+
+def test_forward_warm_runs_a_classification_chunk(monkeypatch):
+    from types import SimpleNamespace
+
+    joins = []
+    monkeypatch.setattr(warmup, "run_filter", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        warmup, "run_join",
+        lambda torch, arena, pipeline, ans, docs, stages, budget, **kw:
+        joins.append((stages, kw)))
+    classes = []
+    monkeypatch.setattr(warmup, "_warm_row_classes",
+                        lambda torch, arena, pipeline, mode: classes.append(mode))
+    pipeline = SimpleNamespace(tree_attention=False, warm_tokens=(),
+                               canvas_ids=(), answer_offsets=(0,))
+    warmup._forward_warm(None, None, pipeline, None, 2048, join_chunk=True)
+    # the row-count classes run on each attention path the model has
+    assert classes == ["unified"]
+    (join, classify) = joins
+    assert len(join[0][0]) == 8 and join[1] == {}
+    suffixes = classify[0][0]
+    question = list(range(10, 26))
+    # 26 suffixes of one to six tokens, after the question as the frame
+    assert len(suffixes) == 26 and {len(s) for s in suffixes} == set(range(1, 7))
+    assert all(s == question[:len(s)] for s in suffixes)
+    assert classify[1] == {"stage_frames": [question]}
+
+    # a decision pipeline reads rows before each answer row: its
+    # warmup question reaches past them, and it does not classify
+    joins.clear()
+    decision = SimpleNamespace(tree_attention=False, warm_tokens=(),
+                               canvas_ids=(), answer_offsets=(30, 15, 0))
+    warmup._forward_warm(None, None, decision, None, 2048, join_chunk=True)
+    ((stages, _),) = joins
+    assert len(stages[0][0]) == 31

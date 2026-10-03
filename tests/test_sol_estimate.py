@@ -129,3 +129,153 @@ def test_planner_and_estimate_price_hybrid_queries_and_prefix_reuse(tmp_path):
     assert exact.work.sliding_pairs - shared.work.sliding_pairs == sum(
         min(position, 1024) for position in range(1, pre + 1031))
     assert shared.as_dict()["sliding_pairs"] == shared.work.sliding_pairs
+
+
+CLASSIFY = "Judge the review's tone.\n\n{0}"
+JOINED_CLASSIFY = "How does the review in DOCUMENT {0} treat DOCUMENT {1}?"
+
+
+def _label(prompt, assignment):
+    return "good" if assignment["r"] == 0 else "bad"
+
+
+def _classification(query):
+    ((call, _),) = query.logical.operators().labels.calls
+    return call
+
+
+def test_classifications_and_label_filters_price_like_filters(tmp_path):
+    with _session(tmp_path) as sess:
+        classified = (sess.docs("reviews").alias("r")
+                      .ai_classify(quail.prompt(CLASSIFY, quail.col("r.body")),
+                                   ["good", "bad"], name="tone"))
+        query = classified.select("r.id", "tone")
+        call = _classification(query)
+        tail, preamble = call.prompt.tail_tokens, call.prompt.preamble_tokens
+        distinct = quail.speed_of_light_estimate(query, _answer, label=_label)
+        per_document = quail.speed_of_light_estimate(
+            query, _answer, label=_label, credit_shared_prefixes=False)
+        with pytest.raises(ValueError, match="label="):
+            quail.speed_of_light_estimate(query, _answer)
+
+        # an AI.IF filter first, then the classification over its
+        # survivors, then the label filter, then the join over the
+        # label's survivors
+        query = (sess.docs("reviews").alias("r")
+                 .ai_filter(quail.prompt(FILTER, quail.col("r.body")))
+                 .ai_classify(quail.prompt(CLASSIFY, quail.col("r.body")),
+                              ["good", "bad"], name="tone")
+                 .label_in("tone", ["good"])
+                 .ai_join(sess.docs("aspects").alias("a"),
+                          quail.prompt(JOIN, quail.col("r.body"),
+                                       quail.col("a.aspect")))
+                 .select("r.id", "a.id", "tone"))
+        filters = query.logical.operators().filters
+        question = filters["r"][0].prompt.tail_tokens
+        estimate = quail.speed_of_light_estimate(
+            query, _answer, label=_label, credit_shared_prefixes=False)
+
+    # one question per document: the reference tail over each document
+    assert per_document.fresh_tokens == 3 * (preamble + 2 + tail)
+    assert distinct.fresh_tokens == per_document.fresh_tokens - preamble - 1
+    assert [stage["operator"] for stage in distinct.filter_stages] == [
+        "AI.CLASSIFY"]
+    assert distinct.filter_stages[0]["name"] == "tone"
+    assert distinct.filter_stages[0]["evaluated"] == 3
+    assert distinct.classification_evaluations == 3
+    assert distinct.filter_evaluations == 0
+    assert distinct.post_filter_counts == {"r": 3}
+    assert distinct.as_dict()["classification_evaluations"] == 3
+
+    stages = estimate.filter_stages
+    assert [stage["operator"] for stage in stages] == [
+        "AI.IF", "AI.CLASSIFY", "IN"]
+    assert [(stage["evaluated"], stage["passed"]) for stage in stages] == [
+        (3, 2), (2, 2), (2, 1)]
+    assert stages[2]["accepted"] == ["good"]
+    assert stages[2]["fresh_tokens"] == 0
+    # the filter scans every document; the classification asks its tail
+    # of the two survivors over their resident prefixes
+    assert stages[0]["fresh_tokens"] == 3 * (preamble + 2 + question)
+    assert stages[1]["fresh_tokens"] == 2 * tail
+    assert estimate.post_filter_counts == {"r": 1, "a": 2}
+    # the join pairs only the label's survivor with every aspect
+    assert estimate.join_pair_evaluations == 1 * 2
+    assert estimate.join_stages[0]["classifications"] == []
+    assert estimate.fresh_tokens == (
+        stages[0]["fresh_tokens"] + stages[1]["fresh_tokens"]
+        + estimate.join_stages[0]["fresh_tokens"])
+
+
+def test_a_classification_of_joined_rows_is_priced_per_kept_pair(tmp_path):
+    with _session(tmp_path) as sess:
+        join = quail.prompt(JOIN, quail.col("r.body"), quail.col("a.aspect"))
+        joined = (sess.docs("reviews").alias("r")
+                  .ai_join(sess.docs("aspects").alias("a"), join))
+        join_only = quail.speed_of_light_estimate(
+            joined.select("r.id", "a.id"), _answer)
+        query = (sess.docs("reviews").alias("r")
+                 .ai_join(sess.docs("aspects").alias("a"), join)
+                 .ai_classify(quail.prompt(JOINED_CLASSIFY, quail.col("r.body"),
+                                           quail.col("a.aspect")),
+                              ["praises", "pans"], name="stance")
+                 .select("r.id", "a.id", "stance"))
+        call = _classification(query)
+        estimate = quail.speed_of_light_estimate(query, _answer, label=_label)
+
+    (stage,) = estimate.join_stages
+    anchor = stage["anchor"]
+    partner = "a" if anchor == "r" else "r"
+    assert join_only.join_stages[0]["anchor"] == anchor
+    parts = {alias: (len(label), len(note))
+             for alias, label, note in call.prompt.label_token_ids}
+    # the one kept pair (r0, a0): the anchor note over the anchor's
+    # resident prefix, then the partner label, the partner document,
+    # and the classification tail
+    partner_tokens = {"r": 2, "a": 1}[partner]
+    pair_tokens = parts[partner][0] + partner_tokens + call.prompt.tail_tokens
+    (classification,) = stage["classifications"]
+    assert classification["name"] == "stance"
+    assert classification["pairs"] == 1
+    assert classification["fresh_tokens"] == parts[anchor][1] + pair_tokens
+    assert estimate.classification_evaluations == 1
+    assert estimate.fresh_tokens == (
+        join_only.fresh_tokens + classification["fresh_tokens"])
+    assert stage["fresh_tokens"] == (
+        join_only.join_stages[0]["fresh_tokens"] + classification["fresh_tokens"])
+
+
+def test_unpriced_operators_are_refused(tmp_path):
+    def keep(tables):
+        return tables["r"]
+
+    with _session(tmp_path) as sess:
+        filtered = (sess.docs("reviews").alias("r")
+                    .ai_filter(quail.prompt(FILTER, quail.col("r.body"))))
+        with pytest.raises(NotImplementedError, match="quail.apply"):
+            quail.speed_of_light_estimate(
+                filtered.apply(keep, quail.col("r.id")).select("r.id"),
+                _answer)
+        limited = (sess.docs("reviews").alias("r")
+                   .ai_filter(quail.prompt(FILTER, quail.col("r.body")))
+                   .limit(1).select("r.id"))
+        with pytest.raises(NotImplementedError, match="LIMIT"):
+            quail.speed_of_light_estimate(limited, _answer)
+        scored = sess.sql(
+            "SELECT r.id, AI.SCORE(PROMPT('Rate {0}', r.body)) AS score "
+            "FROM reviews AS r")
+        with pytest.raises(NotImplementedError, match="'score' column"):
+            quail.speed_of_light_estimate(scored, _answer)
+        compared = sess.sql(
+            "SELECT r.id FROM reviews AS r "
+            "WHERE AI.SCORE(PROMPT('Rate {0}', r.body)) > 0.5")
+        with pytest.raises(NotImplementedError, match="Compare filter"):
+            quail.speed_of_light_estimate(compared, _answer)
+        exists = (sess.docs("reviews").alias("r")
+                  .ai_join(sess.docs("aspects").alias("a"),
+                           quail.prompt(JOIN, quail.col("r.body"),
+                                        quail.col("a.aspect")),
+                           semantics="exists")
+                  .select("r.id"))
+        with pytest.raises(NotImplementedError, match="'exists' joins"):
+            quail.speed_of_light_estimate(exists, _answer)

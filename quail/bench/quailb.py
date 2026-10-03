@@ -13,8 +13,10 @@ no Modal or volume is involved:
 """
 
 import argparse
+import os
 import time
 from dataclasses import asdict
+from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
 
@@ -26,10 +28,12 @@ import quail_b as benchmark
 from quail.bench import substrait
 from quail.bench.results import write_json
 from quail.bench.substrait import QueryPlan, read_plan
+from quail.logical.prompts import bind_classify_prompt
 from quail.planner.plan import Refusal
 from quail.specs import H100_USD_PER_HOUR, MODELS
 from quail_b.queries import (
     FILTER_SELECTIVITY_ESTIMATES,
+    IN_LIST_SELECTIVITY_ESTIMATES,
     JOIN_SELECTIVITY_ESTIMATES,
     SELECTIVITY_ESTIMATE_COLLECTION,
     SELECTIVITY_ESTIMATE_CORPUS,
@@ -39,9 +43,11 @@ from quail_b.queries import (
 from quail_b.queries import queries as query_specs
 from quail_b.scoring import RunOutput, reference_answer
 
-# the fixed planner inputs, by prompt; a predicate without an
-# estimate here gets the planner's default selectivity
-SELECTIVITY = {**FILTER_SELECTIVITY_ESTIMATES, **JOIN_SELECTIVITY_ESTIMATES}
+# the fixed planner inputs, by prompt, and by prompt and accepted
+# labels for an IN-list filter; a predicate without an estimate here gets
+# the planner's default selectivity
+SELECTIVITY = {**FILTER_SELECTIVITY_ESTIMATES, **JOIN_SELECTIVITY_ESTIMATES,
+               **IN_LIST_SELECTIVITY_ESTIMATES}
 TEXT_VLLM_BACKENDS = frozenset({
     "dumb_vllm",
     "pipelined_vllm",
@@ -87,11 +93,17 @@ def canonical_templates(ground_truth) -> dict[str, str]:
         predicate = labels.predicate
         left = quail.ColumnRef(
             "left", predicate["left_table"], predicate["left_column"])
+        right = (quail.ColumnRef("right", predicate["right_table"],
+                                 predicate["right_column"])
+                 if predicate.get("right_table") else None)
         if predicate["kind"] == "filter":
             bound = quail.bind_prompt(predicate["template"], (left,))
+        elif predicate["kind"] == "classify":
+            bound = bind_classify_prompt(
+                predicate["template"],
+                (left,) if right is None else (left, right),
+                predicate["labels"])
         else:
-            right = quail.ColumnRef(
-                "right", predicate["right_table"], predicate["right_column"])
             bound = quail.bind_join_prompt(
                 predicate["template"], (left, right))
         canonical[bound.template] = predicate["template"]
@@ -103,7 +115,12 @@ def _ids(table: pa.Table) -> list[str]:
 
 
 def answer_oracle(ground_truth, tables):
-    """Return the `answer(prompt, assignment)` callable Quail's estimate takes."""
+    """Return the oracle Quail's speed of light estimate takes.
+
+    The callable maps (prompt, assignment) to the saved reference answer:
+    TRUE or FALSE for an AI.IF prompt and the label for an AI.CLASSIFY
+    prompt, so it serves as both the `answer` and the `label` oracle.
+    """
     templates = canonical_templates(ground_truth)
     ids_by_table = {name: _ids(table) for name, table in tables.items()}
 
@@ -127,9 +144,21 @@ def run_output(result, plan: QueryPlan, tables) -> RunOutput:
 
     filter_answers = {}
     for (alias, position), table in result.answer_tables["filters"].items():
-        filter_answers[plan.filter_id(alias, position)] = pa.table({
+        operator = _alias_filters(plan, alias)[position]
+        if isinstance(operator, substrait.InList):
+            # QUAIL-B scores an IN-list filter from the classification's labels
+            continue
+        filter_answers[operator.id] = pa.table({
             alias: id_column(alias, table.column(alias)),
             "answer": table.column("answer"),
+        })
+    classify_answers = {}
+    for operator in plan.classifies:
+        table = result.answer_tables["classifies"][operator.output]
+        classify_answers[operator.id] = pa.table({
+            **{alias: id_column(alias, table.column(alias))
+               for alias in operator.relations},
+            "label": table.column(operator.output),
         })
     join_answers = {}
     for position, table in result.answer_tables["joins"].items():
@@ -139,19 +168,30 @@ def run_output(result, plan: QueryPlan, tables) -> RunOutput:
                for alias in join.aliases},
             "answer": table.column("answer"),
         })
-    aliases = []
+    outputs = {(operator.alias, operator.output)
+               for operator in plan.classifies}
+    names = []
     for name in plan.select:
         alias, column = name.split(".", 1)
-        if column != "id":
+        if column != "id" and (alias, column) not in outputs:
             raise NotImplementedError(
-                "QUAIL-B output accuracy needs id columns in the select list")
-        aliases.append(alias)
+                "QUAIL-B output accuracy needs id and label columns in the "
+                "select list")
+        names.append(alias if column == "id" else column)
     started = time.perf_counter()
     rows = result.collect()
     collection_s = time.perf_counter() - started
     return RunOutput(
-        filter_answers, join_answers, rows.rename_columns(aliases),
-        result.report["wall_s"], dict(result.report, collection_s=collection_s))
+        filter_answers, join_answers, rows.rename_columns(names),
+        result.report["wall_s"], dict(result.report, collection_s=collection_s),
+        classify_answers=classify_answers or None)
+
+
+def _alias_filters(plan: QueryPlan, alias: str) -> list:
+    """Return an alias's AI filters and IN-list filters, in written order."""
+    return [operator for operator in plan.operators
+            if isinstance(operator, (substrait.Filter, substrait.InList))
+            and operator.alias == alias]
 
 
 def join_anchors(result) -> dict:
@@ -167,7 +207,8 @@ def prompt_pieces(query, plan: QueryPlan, anchors) -> dict:
 
     QUAIL-B sizes the prefix trie of the run's requests from these
     pieces and the saved answer tables, after the run; nothing is
-    tracked while the query runs.
+    tracked while the query runs. A classification's pieces come from
+    its prompt, which names every label, whatever rule reads the label.
 
     Args:
         query: The built query, with bound prompts.
@@ -180,22 +221,42 @@ def prompt_pieces(query, plan: QueryPlan, anchors) -> dict:
                      for prompt in operators.prompts
                      if prompt.preamble_token_ids), [])
     pieces = {"tokenizer": query.session.model.hf_name, "preamble": preamble,
-              "filters": [], "joins": []}
+              "filters": [], "joins": [], "classifies": []}
     for alias, predicates in filters.items():
+        written = _alias_filters(plan, alias)
         for position, predicate in enumerate(predicates):
+            if isinstance(written[position], substrait.InList):
+                continue
             pieces["filters"].append({
-                "id": plan.filter_id(alias, position),
+                "id": written[position].id,
                 "tail": list(predicate.prompt.tail_token_ids)})
     for position, join in enumerate(joins):
         anchor = anchors[position]
-        parts = {alias: (list(label), list(frame))
-                 for alias, label, frame in join.prompt.label_token_ids}
-        (partner,) = [alias for alias in parts if alias != anchor]
         pieces["joins"].append({
             "id": plan.join_id(position), "anchor": anchor,
-            "frame": parts[anchor][1], "label": parts[partner][0],
-            "tail": list(join.prompt.tail_token_ids)})
+            **_pair_pieces(join.prompt, anchor)})
+    if plan.classifies:
+        labels = operators.labels
+        calls = {labels.names[call]: call for call, _ in labels.calls}
+        for operator in plan.classifies:
+            call = calls[operator.output]
+            if operator.partner is None:
+                piece = {"tail": list(call.prompt.tail_token_ids)}
+            else:
+                # the anchor is the call's first document
+                anchor = call.aliases()[0]
+                piece = {"anchor": anchor, **_pair_pieces(call.prompt, anchor)}
+            pieces["classifies"].append({"id": operator.id, **piece})
     return pieces
+
+
+def _pair_pieces(prompt, anchor) -> dict:
+    """Return the frame, partner label, and tail of a two-document prompt."""
+    parts = {alias: (list(label), list(frame))
+             for alias, label, frame in prompt.label_token_ids}
+    (partner,) = [alias for alias in parts if alias != anchor]
+    return {"frame": parts[anchor][1], "label": parts[partner][0],
+            "tail": list(prompt.tail_token_ids)}
 
 
 def _submission_to_answer_s(
@@ -219,8 +280,27 @@ def _submission_to_answer_s(
     return runtime_s
 
 
+def kernel_cache_files() -> dict[str, int]:
+    """Count top-level entries in each kernel cache directory.
+
+    Returns:
+        The entry count of each subdirectory of QUAIL_CACHE_DIR (default
+        ``~/.cache/quail/kernels``), by name, or an empty dict when it is
+        missing. A count that grows across a query shows a compile inside it.
+    """
+    root = Path(os.path.expanduser(
+        os.environ.get("QUAIL_CACHE_DIR", "~/.cache/quail/kernels")))
+    if not root.is_dir():
+        return {}
+    return {
+        child.name: sum(1 for _ in os.scandir(child))
+        for child in sorted(root.iterdir()) if child.is_dir()
+    }
+
+
 def run_query(session, spec: QuerySpec, tables) -> RunOutput:
     """Execute one query and return benchmark ids, answers, and measurements."""
+    cache_before = kernel_cache_files()     # before the timed window
     submitted = time.perf_counter()
     for name, table in tables.items():
         if name not in session.catalog:
@@ -248,6 +328,8 @@ def run_query(session, spec: QuerySpec, tables) -> RunOutput:
     )
     if session.config.backend == "quail":
         output.measurements["frontend_s"] = frontend_s
+        output.measurements["kernel_cache_files"] = {
+            "before": cache_before, "after": kernel_cache_files()}
     if session.config.backend in TEXT_VLLM_BACKENDS:
         output.measurements["input_tokens"] = (
             result.report["fresh_tokens"] + result.report["cached_tokens"]
@@ -265,7 +347,8 @@ def refused_queries(session, query_ids, data_dir) -> dict[str, str]:
     register_tables(session, data_dir)
     refused = {}
     for query_id in query_ids:
-        plan = build_query(session, benchmark.get_query(query_id)).plan()
+        spec = benchmark.get_query(query_id)
+        plan = build_query(session, spec).plan()
         if isinstance(plan, Refusal):
             refused[query_id] = " ".join(plan.reasons)
             print(f"[quail-b] {query_id}: skipped on {session.config.backend}: "
@@ -282,39 +365,73 @@ def run_suite(only=None, *, sf=0.1, config, data_dir=None,
     listed under `skipped_queries` in the returned record.
     """
     skipped = {}
-    if only and data_dir is not None:
+    explicit = only is not None
+    only = list(query_specs()) if only is None else list(only)
+    if explicit and only and data_dir is not None:
         with quail.Session(config) as preflight_session:
-            skipped = refused_queries(preflight_session, only, data_dir)
+            skipped.update(refused_queries(preflight_session, only, data_dir))
         only = [query_id for query_id in only if query_id not in skipped]
+    metadata = {
+        "engine": config.backend, "model": config.model,
+        "prompt_format": MODELS[config.model].prompt_format,
+        "configuration": asdict(config),
+        "warmup": "tokenizer, engine, and kernel startup excluded",
+        "timing_boundary": (
+            "raw document tables and query submission to answer"
+            if config.backend == "quail"
+            else "prompt text submission to answer"
+        ),
+        "cache_reuse": "one session per backend and query family",
+        "planning": {
+            "collection_id": SELECTIVITY_ESTIMATE_COLLECTION,
+            "corpus_id": SELECTIVITY_ESTIMATE_CORPUS,
+            "scale_factor": SELECTIVITY_ESTIMATE_SCALE_FACTOR,
+        },
+    }
+    if not only:
+        # every query was skipped: a record with no queries, in the
+        # shape a run of them would leave
+        return _empty_record(skipped, sf=sf, data_dir=data_dir,
+                             ground_truth_collection=ground_truth_collection,
+                             root=root, config=config, metadata=metadata,
+                             h100_usd_per_hour=h100_usd_per_hour,
+                             output_dir=output_dir)
     with quail.Session(config) as session:
         record = benchmark.run(
             partial(run_query, session), queries=only, scale_factor=sf,
             output_dir=output_dir, data_dir=data_dir,
             collection_id=ground_truth_collection, root=root,
             gpu_count=config.gpus, gpu_hourly_rate_usd=h100_usd_per_hour,
-            metadata={
-                "engine": config.backend, "model": config.model,
-                "prompt_format": MODELS[config.model].prompt_format,
-                "configuration": asdict(config),
-                "warmup": (
-                    "tokenizer, engine, and kernel startup excluded"
-                ),
-                "timing_boundary": (
-                    "raw document tables and query submission to answer"
-                    if config.backend == "quail"
-                    else "prompt text submission to answer"
-                ),
-                "cache_reuse": "one session per backend and query family",
-                "planning": {
-                    "collection_id": SELECTIVITY_ESTIMATE_COLLECTION,
-                    "corpus_id": SELECTIVITY_ESTIMATE_CORPUS,
-                    "scale_factor": SELECTIVITY_ESTIMATE_SCALE_FACTOR,
-                },
-            })
+            metadata=metadata)
         record["skipped_queries"] = skipped
         write_json(Path(output_dir) / "run.json", record)
         benchmark.report(output_dir, rescore=False)
         return record
+
+
+def _empty_record(skipped, *, sf, data_dir, ground_truth_collection, root,
+                  config, metadata, h100_usd_per_hour, output_dir) -> dict:
+    """Build a run record for a suite in which every query was skipped."""
+    from quail_b import __version__
+    from quail_b.run import RUN_SCHEMA_VERSION
+
+    suite = benchmark.load_benchmark(
+        sorted(skipped)[:1], scale_factor=sf, data_dir=data_dir,
+        collection_id=ground_truth_collection, root=root)
+    started = datetime.now(timezone.utc).isoformat()
+    record = {
+        "schema_version": RUN_SCHEMA_VERSION, "quail_b_version": __version__,
+        "scale_factor": sf, "corpus_id": suite.corpus_id,
+        "collection_id": suite.ground_truth.collection_id,
+        "reference_model": suite.ground_truth.reference_model,
+        "metadata": metadata, "gpu_count": config.gpus,
+        "gpu_hourly_rate_usd": h100_usd_per_hour,
+        "started_at": started, "finished_at": started, "status": "complete",
+        "queries": [], "skipped_queries": skipped,
+    }
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    write_json(Path(output_dir) / "run.json", record)
+    return record
 
 
 def main():
@@ -328,6 +445,12 @@ def main():
     parser.add_argument("--data-dir", help="directory containing input Parquet files")
     parser.add_argument("--ground-truth-collection")
     parser.add_argument("--output-dir", required=True, help="new run directory")
+    parser.add_argument("--attention", choices=("tree", "unified"),
+                        help="force one attention path for filters and joins")
+    parser.add_argument("--gpu-timing", action="store_true",
+                        help="record GPU seconds per model node")
+    parser.add_argument("--canvas-draws", type=int, default=4,
+                        help="most noise draws a diffusion model averages")
     args = parser.parse_args()
     run_suite(
         [value.strip() for value in args.only.split(",")] if args.only else None,
@@ -337,6 +460,9 @@ def main():
             model=args.model,
             backend=args.backend,
             device=args.device,
+            attention=args.attention,
+            gpu_timing=args.gpu_timing,
+            canvas_draws=args.canvas_draws,
         ),
         data_dir=args.data_dir,
         ground_truth_collection=args.ground_truth_collection,

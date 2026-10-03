@@ -1,4 +1,4 @@
-from .base import ModelSpec
+from .base import AnswerCanvas, ModelSpec
 
 DIFFUSION_GEMMA_26B_FP8 = ModelSpec(
     name="diffusion-gemma-26b-a4b-fp8",
@@ -32,6 +32,9 @@ DIFFUSION_GEMMA_26B_FP8 = ModelSpec(
     arch="diffusion_gemma",
     # Prefill the empty thinking channel so the next position holds the answer.
     canvas_tokens=1,
+    # the 16-row canvas vLLM decodes with; the letters rule reads its
+    # first row after seeding the turn close and padding behind it
+    answer_canvas=AnswerCanvas(rows=16, turn_close_id=106, pad_id=0),
     turn_prefix="<bos><|turn>user\n",
     turn_suffix="<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
     prompt_format="gemma4-chat-nonthinking-v1",

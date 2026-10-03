@@ -11,7 +11,9 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Protocol, runtime_checkable
 
+import numpy as np
 import pyarrow as pa
+from pyarrow import acero
 from pyarrow import compute as pc
 
 from quail.builtins import built_in_registry
@@ -38,6 +40,7 @@ from quail.extensions import ExtensionRegistry
 from quail.frontend.builder import Query as BuilderQuery
 from quail.frontend.sql import SQLDialect, compile_sql
 from quail.logical import (
+    Alias,
     CompileError,
     LogicalPlan,
     join_conditions,
@@ -554,6 +557,18 @@ class BoundBuilder:
 
     ai_if = ai_filter
 
+    def ai_classify(self, p, labels, *, name, descriptions=None,
+                    task_description="", probabilities=False):
+        self._inner.ai_classify(p, labels, name=name,
+                                descriptions=descriptions,
+                                task_description=task_description,
+                                probabilities=probabilities)
+        return self
+
+    def label_in(self, name, labels, selectivity=None):
+        self._inner.label_in(name, labels, selectivity=selectivity)
+        return self
+
     def join(self, other, on=None):
         inner = other._inner if isinstance(other, BoundBuilder) else other
         self._inner.join(inner, on=on)
@@ -615,35 +630,57 @@ class Query:
         return self._token_inputs
 
     def plan(self):
+        """Plan the query once and return its physical plan or refusal.
+
+        Document lengths are exact for a tokenized column. For any other
+        column they are estimated from a sample while a background thread
+        tokenizes it. The logical rules and the physical planner both read
+        these lengths.
+
+        Returns:
+            The physical plan, or a Refusal when no backend can run it.
+        """
         if self._plan is None:
             self._planning_started_at = time.perf_counter()
-            self.logical, _ = apply_logical_rules(
-                self.logical,
-                tuple(self.session.registry.logical_rules.values()),
-                LogicalPlanningContext(
-                    self.session.catalog, self.session.config
-                ),
-            )
+            config = self.session.config
             operators = self.logical.operators()
-            scans, joins = operators.scans, operators.joins
             self._doc_tokens = {}
             self._token_inputs = {}
             estimated = []
-            for s in scans:
-                columns = s.columns
-                if self.session.config.backend in {
-                    "stock_vllm", "pipelined_vllm", "dumb_vllm"
-                }:
-                    columns = tuple(dict.fromkeys((*columns, s.column)))
+            for s in operators.scans:
                 exact = self.session.token_lengths(s.provider, s.column)
                 if exact is not None:
-                    store = self.session.tokenize(
-                        s.provider, s.column, columns)
-                    self._token_inputs[s.alias] = store
-                    self._doc_tokens[s.alias] = store.lengths
+                    self._doc_tokens[s.alias] = exact
                     continue
                 self._doc_tokens[s.alias] = self.session.estimate_lengths(
                     s.provider, s.column)
+                estimated.append(s.alias)
+            self._estimated = tuple(estimated)
+            pair_fractions = self._pair_fractions(
+                operators.scans, operators.joins)
+            context = LogicalPlanningContext(
+                self.session.catalog, config,
+                model=self.session.model, device=self.session.device,
+                gpu_count=config.gpus, document_tokens=self._doc_tokens,
+                backend=config.backend, order=self.order,
+                canvas_draws=config.canvas_draws,
+                attention=config.attention,
+                tokenizer=self.session.tokenizer,
+                pair_fractions=pair_fractions)
+            self.logical, changed = apply_logical_rules(
+                self.logical,
+                tuple(self.session.registry.logical_rules.values()),
+                context)
+            for s in self.logical.operators().scans:
+                columns = s.columns
+                if config.backend in {
+                    "stock_vllm", "pipelined_vllm", "dumb_vllm"
+                }:
+                    columns = tuple(dict.fromkeys((*columns, s.column)))
+                if s.alias not in self._estimated:
+                    self._token_inputs[s.alias] = self.session.tokenize(
+                        s.provider, s.column, columns)
+                    continue
                 future = self.session.tokenize_async(
                     s.provider, s.column, columns)
 
@@ -652,22 +689,25 @@ class Query:
 
                 future.add_done_callback(record_finished)
                 self._token_futures[s.alias] = future
-                estimated.append(s.alias)
-            self._estimated = tuple(estimated)
-            pair_fractions = self._pair_fractions(scans, joins)
             self._plan = plan_query(
                 self.logical, model=self.session.model,
                 device=self.session.device,
                 doc_tokens=self._doc_tokens,
-                gpus=self.session.config.gpus,
+                gpus=config.gpus,
                 order=self.order,
-                backend=self.session.config.backend,
+                canvas_draws=config.canvas_draws,
+                attention=config.attention,
+                backend=config.backend,
                 registry=self.session.registry,
                 tokenizer=self.session.tokenizer,
-                pair_fractions=pair_fractions)
-            if self.session.config.gpu_timing:
+                pair_fractions=pair_fractions,
+                memo=context.memo)
+            extra = {}
+            if config.gpu_timing:
+                extra["gpu_timing"] = True
+            if extra and not isinstance(self._plan, Refusal):
                 self._plan = replace(self._plan, settings={
-                    **self._plan.settings, "gpu_timing": True})
+                    **self._plan.settings, **extra})
             self._planning_finished_at = time.perf_counter()
         return self._plan
 
@@ -768,6 +808,8 @@ class Query:
                 self._plan, model=self.session.model,
                 device=self.session.device, doc_tokens=self._doc_tokens,
                 gpus=self.session.config.gpus, order=self.order,
+                canvas_draws=self.session.config.canvas_draws,
+                attention=self.session.config.attention,
                 backend=self.session.config.backend,
                 registry=self.session.registry,
                 tokenizer=self.session.tokenizer)
@@ -880,7 +922,7 @@ class Query:
             kv_manager=out.get("kv_manager"),
             node_metrics=out.get("node_metrics", {}),
             backend_metrics=out.get("backend_metrics"),
-            remarks=list(plan.remarks) + list(self.session.notes))
+            remarks=list(self.session.notes))
         for key in ("gpu_s", "chunks"):
             if key in out:
                 report[key] = out[key]
@@ -896,11 +938,11 @@ class Query:
 
         operators = self.logical.operators()
         scans, logical_filters, logical_joins = (
-            operators.scans, operators.filters, operators.joins
+            operators.scans, operators.all_filters(), operators.joins
         )
         scans_by_alias = {scan.alias: scan for scan in scans}
 
-        def project(node, value):
+        def project(node, value, labels=None):
             if not isinstance(node, Project):
                 raise TypeError(type(node).__name__)
             if node.inputs[0].value_type is ValueType.JOIN_ANSWERS:
@@ -913,6 +955,7 @@ class Query:
                 raise TypeError("Project needs an index relation")
             projection = []
             fields = []
+            declaration = relation.declaration
             for name in node.columns:
                 if name in relation.schema.names:
                     # a score column the graph computed; document
@@ -921,6 +964,83 @@ class Query:
                     fields.append(pa.field(
                         name, relation.schema.field(name).type
                     ))
+                    continue
+                table = next((table for table in (labels or {}).values()
+                              if name in table.column_names), None)
+                if (table is not None and table.column_names.index(name) == 2
+                        and pa.types.is_integer(table.schema.field(1).type)):
+                    # a label of joined rows: each result row looks its
+                    # label up by its two ids; a row without one leaves
+                    # the result
+                    aliases = table.column_names[:2]
+                    if any(alias not in relation.schema.names
+                           for alias in aliases):
+                        raise CompileError(
+                            f"label column {name!r} belongs to the joined "
+                            f"rows of {aliases}, not all in the result")
+                    call = next((column.expression
+                                 for column in self.logical.root.columns
+                                 if isinstance(column, Alias)
+                                 and column.name == name), None)
+                    order = (None if call is None
+                             else pa.array(call.labels, pa.string()))
+                    keys = _pair_keys(table.column(aliases[0]),
+                                      table.column(aliases[1]))
+                    declaration = acero.Declaration(
+                        "filter", acero.FilterNodeOptions(
+                            _pair_key_expression(*aliases).isin(keys)),
+                        inputs=[declaration])
+                    projection.append((tuple(aliases), (keys, table, order)))
+                    fields.append(pa.field(
+                        name,
+                        pa.string() if order is None
+                        else pa.dictionary(pa.int32(), pa.string()),
+                        nullable=True,
+                        metadata={b"quail.alias": aliases[0].encode("utf-8"),
+                                  b"quail.label": name.encode("utf-8")}))
+                    continue
+                if table is not None:
+                    # a label the graph computed for some of an alias's
+                    # documents, widened to every document of the alias
+                    alias = table.column_names[0]
+                    if alias not in relation.schema.names:
+                        raise CompileError(
+                            f"label column {name!r} belongs to {alias!r}, "
+                            f"which is not in the result")
+                    labeled = table.column(name).combine_chunks()
+                    if not pa.types.is_map(labeled.type):
+                        labeled = labeled.cast(pa.string())
+                    # a document whose answer names no label has no row
+                    # in the table, and leaves the result
+                    declaration = acero.Declaration(
+                        "filter", acero.FilterNodeOptions(
+                            pc.field(alias).isin(table.column(alias))),
+                        inputs=[declaration])
+                    # position of each document's label, or the null
+                    # appended past the labels for an unlabeled one
+                    slots = np.full(len(self._doc_tokens[alias]), len(labeled),
+                                    dtype=np.int64)
+                    slots[table.column(alias).to_numpy()] = np.arange(
+                        len(labeled))
+                    widened = pc.take(
+                        pa.concat_arrays([labeled, pa.array([None], labeled.type)]),
+                        pa.array(slots))
+                    call = next((column.expression
+                                 for column in self.logical.root.columns
+                                 if isinstance(column, Alias)
+                                 and column.name == name), None)
+                    if call is not None:
+                        order = pa.array(call.labels, pa.string())
+                        values = pa.DictionaryArray.from_arrays(
+                            pc.index_in(widened, order).cast(pa.int32()),
+                            order)
+                    else:
+                        values = widened
+                    projection.append((alias, values))
+                    fields.append(pa.field(
+                        name, values.type, nullable=True,
+                        metadata={b"quail.alias": alias.encode("utf-8"),
+                                  b"quail.label": name.encode("utf-8")}))
                     continue
                 try:
                     alias, column = name.split(".", 1)
@@ -953,7 +1073,7 @@ class Query:
                 ))
             return QueryResult(
                 columns=list(node.columns),
-                declaration=relation.declaration,
+                declaration=declaration,
                 document_index_schema=relation.schema,
                 output_schema=pa.schema(
                     fields,
@@ -962,6 +1082,7 @@ class Query:
                 projection=projection,
                 report={},
                 row_count=(value.num_rows if isinstance(value, pa.Table)
+                           and declaration is relation.declaration
                            else None),
             )
 
@@ -1005,9 +1126,23 @@ class Query:
             report["observers"] = observer_reports
         result.report = report
 
-        answer_tables = {"filters": {}, "joins": {}}
+        from quail.execution.reranker import classify_label_tables
+        from quail.physical import AiClassify
+
+        # every classified document's label, before any filter on it;
+        # a chain's later stages label the documents their gate passed
+        answer_tables = {"filters": {}, "joins": {}, "classifies": {
+            name: table
+            for node in plan.nodes
+            if isinstance(node, AiClassify)
+            and PortRef(node.node_id, "scores") in response.outputs
+            for name, table in classify_label_tables(
+                node.spec, response.outputs[PortRef(node.node_id, "scores")]
+            ).items()
+        }}
         survivors = {
-            scan.alias: list(range(len(self._doc_tokens[scan.alias])))
+            scan.alias: pa.array(range(len(self._doc_tokens[scan.alias])),
+                                 pa.int32())
             for scan in scans
         }
 
@@ -1030,6 +1165,10 @@ class Query:
                 filter_relations.setdefault(
                     alias.decode("utf-8"), []
                 ).append(table)
+            elif value_type is ValueType.LABEL_ANSWERS:
+                # the label column follows the alias columns: one, or
+                # the anchor and partner of a classification of joined rows
+                answer_tables["classifies"][table.column_names[-1]] = table
             elif value_type is ValueType.JOIN_ANSWERS:
                 written_pos = metadata.get(b"quail.written_pos")
                 if written_pos is None:
@@ -1074,13 +1213,15 @@ class Query:
                         "a document id relation needs one alias column"
                     )
                 alias = table.column_names[0]
-                survivors[alias] = table.column(alias).to_pylist()
+                survivors[alias] = (
+                    table.column(alias).combine_chunks().cast(pa.int32()))
 
         for alias, relations in filter_relations.items():
             table = relations[0] if len(relations) == 1 else \
                 pa.concat_tables(relations)
-            positions = table.column("predicate").to_pylist()
-            predicate_order = list(dict.fromkeys(int(pos) for pos in positions))
+            # predicates in the order their first answers appear
+            predicate_order = [
+                int(pos) for pos in pc.unique(table.column("predicate")).to_pylist()]
             predicate_order.extend(
                 position for position in range(len(logical_filters[alias]))
                 if position not in predicate_order
@@ -1088,9 +1229,8 @@ class Query:
             for index, written_pos in enumerate(predicate_order):
                 mask = pc.equal(table.column("predicate"), written_pos)
                 stage_table = table.filter(mask)
-                answered = stage_table.column(alias).to_pylist()
-                answers = stage_table.column("answer").to_pylist()
-                passed = sum(bool(answer) for answer in answers)
+                evaluated = stage_table.num_rows
+                passed = pc.sum(stage_table.column("answer")).as_py() or 0
                 answer_tables["filters"][(alias, written_pos)] = stage_table
                 report["stages"].append(dict(
                     op="filter", alias=alias, stage=index,
@@ -1099,9 +1239,9 @@ class Query:
                         logical_filters[alias][written_pos].selectivity
                     ),
                     observed_selectivity=round(
-                        passed / max(1, len(answered)), 4
+                        passed / max(1, evaluated), 4
                     ),
-                    evaluated=len(answered),
+                    evaluated=evaluated,
                 ))
 
         true_join_tables = {}
@@ -1157,11 +1297,21 @@ class Query:
             ))
             if semantics == "full":
                 true_join_tables[written_pos] = true_answer_rows(table)
-        survivor_arrays = {
-            alias: pa.array(indices, type=pa.int32())
-            for alias, indices in survivors.items()
-        }
         result.answer_tables = answer_tables
-        result.survivor_indices = survivor_arrays
+        result.survivor_indices = survivors
         result.true_join_tables = true_join_tables
         return result
+
+
+
+def _pair_keys(anchors, partners) -> pa.Array:
+    """Encode each anchor and partner index pair as one int64 key."""
+    keys = pc.add(pc.shift_left(pc.cast(anchors, pa.int64()), 32),
+                  pc.cast(partners, pa.int64()))
+    return keys.combine_chunks() if isinstance(keys, pa.ChunkedArray) else keys
+
+
+def _pair_key_expression(anchor: str, partner: str):
+    """Build an Arrow expression encoding anchor and partner indices."""
+    return pc.add(pc.shift_left(pc.field(anchor).cast(pa.int64()), 32),
+                  pc.field(partner).cast(pa.int64()))

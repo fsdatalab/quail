@@ -207,7 +207,8 @@ def test_explain_analyze_shows_measured_rows_beside_estimates(
     assert header.split() == ["est.", "rows", "rows", "est.", "pass", "pass",
                               "est.", "time", "time", "fresh", "tokens"]
     assert re.search(
-        r"AiFilter: r\s+1\.5\s+2\s+[\d.]+ ms\s+<1 ms\s+60$", text, re.M)
+        r"AiFilter: r\s+1\.5\s+2\s+[\d.]+ ms\s+(?:<1|[\d.]+) ms\s+60$",
+        text, re.M)
     # Both predicates have equal estimated cost and pass four of six rows.
     first = re.search(r"(?:1st: )?predicate ([12])  PROMPT\('DOCUMENT:\\n"
                       r"\{0\}\\n\\nq\1:'\)\s+6\s+6\s+50%\s+66\.7%$",

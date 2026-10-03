@@ -199,9 +199,10 @@ def stage_work(spec: dict, anchor: str, live: dict, lengths: dict,
     The length sums make the calculation constant time in the number
     of documents without a window. With a window, it also visits the
     distinct lengths below that window. A resident prefix pays its
-    frame only. A missing prefix scans the preamble, document, and frame.
-    Every tuple then
-    carries partner labels, partner documents, and the answer cue.
+    frame only. A missing prefix scans the preamble, document, and frame;
+    the frame includes the first partner's label. Every tuple then
+    carries the other partner labels, partner documents, and the answer
+    cue.
     """
     stats = lengths[anchor]
     if window != stats.window:
@@ -211,9 +212,12 @@ def stage_work(spec: dict, anchor: str, live: dict, lengths: dict,
     if stats.count == 0 or n <= 0:
         return Work()
     partners = [a for a in spec["aliases"] if a != anchor]
+    # matches JoinStage.runtime_spec: the first label is in the frame
     u = spec["tail_tokens"] + sum(
-        spec["label_tokens"][p] + lengths[p].mean for p in partners)
-    frame = spec["frame_tokens"][anchor]
+        spec["label_tokens"][p] + lengths[p].mean for p in partners[1:]
+    ) + (lengths[partners[0]].mean if partners else 0.0)
+    frame = spec["frame_tokens"][anchor] + (
+        spec["label_tokens"][partners[0]] if partners else 0)
     per_anchor = tuples / n
     frac = n / stats.count
 

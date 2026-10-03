@@ -166,12 +166,12 @@ def test_pair_join_and_gpu_timing_run_through_the_quail_graph(monkeypatch):
     # document with key 0 pairs with both and one with key 3 with none
     columns = _key_columns([d % 4 for d in range(14)], [0, 1, 2, 0])
     allowed = {d: [i for i in range(4) if d % 4 == i % 3] for d in range(14)}
-    for pin_survivors in (True, False):
+    for pipelined in (True, False):
         result, _, filter_truth, join_truth = run_graph_on_arena(
-            monkeypatch, two_alias_graph(pin_survivors, hash_join=True),
+            monkeypatch, two_alias_graph(pipelined, hash_join=True),
             columns=columns)
         cross, _, _, _ = run_graph_on_arena(
-            monkeypatch, two_alias_graph(pin_survivors))
+            monkeypatch, two_alias_graph(pipelined))
         survivors = [d for d, truth in enumerate(filter_truth) if all(truth)]
         stage = result["joins"][0]
         assert sorted(stage["anchor_index"]) == survivors
@@ -209,16 +209,22 @@ def test_pair_join_and_gpu_timing_run_through_the_quail_graph(monkeypatch):
                for metrics in off["node_metrics"].values())
     on, model, _, _ = run_graph_on_arena(
         monkeypatch, two_alias_graph(True), pages=48, gpu_timing=True)
-    # join chunks run before the streamed filter chain finishes
+    # join chunks run before the filter chain finishes: one pipeline
     kinds = [kind for kind, _ in model.launched]
     assert kinds.index("join") < len(kinds) - 1 - kinds[::-1].index("filter")
-    # the fake torch reports 2 ms per event pair, one pair per chunk
-    per_node = [metrics["gpu_s"] for metrics in on["node_metrics"].values()]
-    assert on["gpu_s"] == pytest.approx(sum(per_node), abs=1e-3)
+    # the fake torch reports 2 ms per event pair, one pair per chunk; a
+    # chunk that packed rows of two nodes counts for each, and its time
+    # is split between them by rows, so the nodes' seconds sum to the
+    # pipeline's and their chunks to at least its chunk count
+    per_node = {name: metrics for name, metrics in on["node_metrics"].items()
+                if metrics["chunks"]}
+    assert on["gpu_s"] == pytest.approx(
+        sum(metrics["gpu_s"] for metrics in per_node.values()), abs=1e-3)
     assert on["gpu_s"] > 0
-    assert on["chunks"] == round(on["gpu_s"] / 0.002)
-    assert all(chunks == round(chunks)
-               for chunks in (seconds / 0.002 for seconds in per_node))
+    assert len(model.launched) == round(on["gpu_s"] / 0.002)
+    assert on["chunks"] >= len(model.launched)
+    assert all(0 < metrics["gpu_s"] <= metrics["chunks"] * 0.002 + 1e-9
+               for metrics in per_node.values())
 
 
 def _foreign_run(monkeypatch, graph, functions):
@@ -232,7 +238,7 @@ def _foreign_run(monkeypatch, graph, functions):
 
 def test_foreign_runs_per_batch_or_once_as_a_barrier_and_are_checked(monkeypatch):
     functions = {"keep_even": keep_even, "same_key": same_key}
-    # a per-batch drop on the pinned chain: only even survivors reach the join
+    # a per-batch drop inside the pipeline: only even survivors reach the join
     result, survivors, join_truth = _foreign_run(
         monkeypatch, two_alias_graph(True, foreign=("per_batch", "drop")),
         functions)
