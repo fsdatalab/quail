@@ -273,8 +273,13 @@ def reference_side(quail_out: dict) -> dict:
 
 
 @app.local_entrypoint()
-def main(quail_call: str = ""):
-    """Run both sides; --quail-call fc-... reuses a finished Quail side."""
+def main(quail_call: str = "", quail_only: bool = False):
+    """Run both sides.
+
+    Args:
+        quail_call: A finished Quail side's function call id to reuse.
+        quail_only: Stop after the Quail side, for its timings alone.
+    """
     if not quail_call:
         quail_call = quail_side.spawn(time.strftime("%Y%m%d-%H%M%S")).object_id
     print(f"quail_side function call id: {quail_call}", flush=True)
@@ -288,6 +293,8 @@ def main(quail_call: str = ""):
     print(f"join: wall_s={rep.get('wall_s')}, "
           f"pairs={len(quail_out['join_run']['pairs'])}, "
           f"anchor={quail_out['join_anchor']}", flush=True)
+    if quail_only:
+        return
     ref = reference_side.spawn(quail_out)
     print(f"reference_side function call id: {ref.object_id}", flush=True)
     print(json.dumps(ref.get(), indent=2), flush=True)
