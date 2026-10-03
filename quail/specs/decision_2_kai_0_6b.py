@@ -14,9 +14,9 @@ DECISION_2_KAI_0_6B_BF16 = ModelSpec(
     hf_name="vllm-sr/Decision-2.0-Kai-0.6B",
     revision="881bee413681d80ebeac86afcda8b4138dae516e",
     kv_bytes=2.0,
-    w_mem_bytes=1_196_313_424,    # 596,049,920 bf16 backbone weights,
-    #                               embedding included, plus the fp32
-    #                               decision head file; not measured
+    w_mem_bytes=1_204_713_984,    # measured backbone as loaded on an
+    #                               H100 (1,200,503,296 bytes) plus the
+    #                               fp32 decision head (4,210,688 bytes)
     vocab=151_936,
     tied_head=True,
     weight_precision="bf16",
