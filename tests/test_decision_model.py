@@ -25,7 +25,7 @@ from quail.logical import (
     render_join_prompt_ids,
     render_join_prompt_text,
 )
-from quail.physical import AiClassify, AiFilter, AiJoin, AiScore
+from quail.physical import AiClassify, AiFilter, AiJoin, AiScore, RequestExecution
 from quail.planner.plan import EngineConfig, Refusal
 from quail.specs import DECISION_2_KAI_0_6B_BF16, H100_SXM
 
@@ -343,3 +343,103 @@ def test_choice_stage_reads_each_option_end_and_the_last_row(session):
                for o in offsets[:-1])
     stage.decide(0, np.array([0.1, 2.0, 0.3], dtype=np.float32))
     assert labeled == ["yy"]
+
+
+def test_stock_vllm_plans_decision_readouts_from_the_layout(session):
+    vocab = {}
+
+    def ids(text):
+        return [vocab.setdefault(token, len(vocab)) for token in _tokens(text)]
+
+    words = {}
+
+    def text(token_ids):
+        if not words:
+            words.update((i, token) for token, i in vocab.items())
+        return "".join(words[i] for i in token_ids)
+
+    vllm = quail.Session(
+        EngineConfig(model=DECISION_2_KAI_0_6B_BF16.name, device="h100-sxm",
+                     backend="stock_vllm"), tokenizer=ids)
+    vllm.register("documents", session.catalog.get("documents"))
+    plan = vllm.sql(
+        "SELECT d.id, AI.CLASSIFY(d.body, ARRAY['refund', 'other']) AS c "
+        "FROM documents d WHERE AI_FILTER(PROMPT('Refund? {0}', d.body))").plan()
+    (request,) = [n for n in plan.nodes if isinstance(n, RequestExecution)]
+    offsets = plan.settings["decision_offsets"]
+    assert offsets == list(answer_row_offsets(LAYOUT, ids))
+    (question,) = request.filters[0].question_token_ids
+    ends = [text(question[:len(question) - offset]) for offset in offsets]
+    assert ends[0].endswith('"false"}\n</option>')
+    assert ends[1].endswith('"true"}\n</option>')
+    assert ends[2].endswith("Decision:")
+    (classify,) = request.classifies
+    tail = classify.tail_token_ids
+    ends = [text(tail[:len(tail) - offset]) for offset in classify.option_offsets]
+    assert ends[0].endswith('"key":"refund"}\n</option>')
+    assert ends[1].endswith('"key":"other"}\n</option>')
+    assert ends[2] == text(tail)
+    vllm.close()
+
+
+class _PoolingState:
+    def __init__(self):
+        self.hidden_states_cache = []
+
+    def clean(self):
+        self.hidden_states_cache.clear()
+
+
+def test_vllm_decision_pooler_reads_offsets_across_prefill_chunks():
+    torch = pytest.importorskip("torch")
+    from quail.backends.vllm_decision import pool_decision_rows
+
+    head = SimpleNamespace(scores=lambda options, last: options[..., 0]
+                           * 100 + last[:, None, 0])
+    rows = torch.arange(10.0)[:, None].repeat(1, 2)
+    states = [_PoolingState(), _PoolingState()]
+
+    def params(offsets):
+        return SimpleNamespace(extra_kwargs={"decision_offsets": offsets})
+
+    # request 0 prefills rows 0-4 then 5-7; request 1 starts from a
+    # prefix-cache hit and computes only its last row
+    assert pool_decision_rows(torch, head, [rows[:5]], [False],
+                              [params([3, 1, 0])], states[:1]) == [None]
+    done, missing = pool_decision_rows(
+        torch, head, [rows[5:8], rows[9:10]], [True, True],
+        [params([3, 1, 0]), params([2, 0])], states)
+    assert done.tolist() == [4 * 100 + 7, 6 * 100 + 7]
+    assert torch.isnan(missing).all()
+    assert all(not state.hidden_states_cache for state in states)
+
+
+def test_vllm_decision_client_reruns_a_request_without_its_rows():
+    from quail.backends import vllm_decision
+
+    def output(request_id, data):
+        return SimpleNamespace(request_id=request_id, finished=True,
+                               outputs=SimpleNamespace(data=data))
+
+    torch = pytest.importorskip("torch")
+    added = []
+
+    class Engine:
+        def add_request(self, request_id, prompt, params):
+            added.append((request_id, params.skip_reading_prefix_cache))
+
+        def step(self):
+            request_id, uncached = added[-1]
+            nan = torch.tensor([float("nan"), float("nan")])
+            return [output(request_id, torch.tensor([0.0, 1.0])
+                           if uncached else nan)]
+
+    params = SimpleNamespace(skip_reading_prefix_cache=False)
+    params.clone = lambda: SimpleNamespace(**vars(params))
+    client = vllm_decision.VLLMDecisionClient(
+        SimpleNamespace(llm_engine=Engine()), {})
+    (result,) = client.generate([{"prompt_token_ids": [1, 2]}], params)
+    assert [uncached for _, uncached in added] == [False, True]
+    assert result.request_id == added[0][0]
+    assert vllm_decision.decision_bit(result) == 1
+    assert client.recomputed == 1

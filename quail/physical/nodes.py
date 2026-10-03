@@ -189,6 +189,9 @@ class RequestClassifySpec:
     partner: str | None = None
     join_layout_token_ids: tuple[tuple[Any, ...], ...] = ()
     join_written_pos: int | None = None
+    # a decision model's scored options: distances before the prompt's
+    # last row of each option block's end, then 0
+    option_offsets: tuple[int, ...] = ()
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "RequestClassifySpec":
@@ -207,6 +210,8 @@ class RequestClassifySpec:
                                  for ids in value.get("join_layout_token_ids", ())),
             join_written_pos=(None if join_written_pos is None
                               else int(join_written_pos)),
+            option_offsets=tuple(int(offset)
+                                 for offset in value.get("option_offsets", ())),
         )
 
     def to_dict(self) -> dict:
@@ -221,6 +226,7 @@ class RequestClassifySpec:
             "partner": self.partner,
             "join_layout_token_ids": [list(ids) for ids in self.join_layout_token_ids],
             "join_written_pos": self.join_written_pos,
+            "option_offsets": list(self.option_offsets),
         }
 
 
