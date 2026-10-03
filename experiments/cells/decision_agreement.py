@@ -166,6 +166,7 @@ def reference_side(quail_out: dict) -> dict:
         DecisionModel,
         collate,
         encode,
+        segments,
     )
 
     model, tokenizer = DecisionModel.from_checkpoint(path)
@@ -207,16 +208,28 @@ def reference_side(quail_out: dict) -> dict:
     anchor = quail_out["join_anchor"]
     pairs = [(i, j) for i in range(len(left)) for j in range(len(right))]
 
-    def join_state(i, j):
+    def join_segments(i, j):
+        """Quail's join layout as text segments, tokenized one by one."""
         docs = {"a": left[i][0], "b": right[j][0]}
         index = {"a": 0, "b": 1}
         other = "b" if anchor == "a" else "a"
-        return (f"{docs[anchor]}\n\n(The document above is DOCUMENT "
-                f"{{{index[anchor]}}}.)\n\nDOCUMENT {{{index[other]}}}:\n"
-                f"{docs[other]}")
+        options = [segments(row(0, "", ""))[1][k] for k in (0, 1)]
+        return [f"Context:\n{docs[anchor]}\n\n(The document above is "
+                f"DOCUMENT {{{index[anchor]}}}.)\n\nTask type: noul\n"
+                f"Question:\n{JOIN_TEMPLATE}\n\nDOCUMENT "
+                f"{{{index[other]}}}:\n{docs[other]}\nOptions:",
+                *options, segments(row(0, "", ""))[2]]
 
-    join_text = answer([encode(row(k, join_state(i, j), JOIN_TEMPLATE),
-                               tokenizer, 8192)
+    def from_segments(k, parts):
+        ids, ends = [], []
+        for part in parts:
+            ids += tokenizer.encode(part, add_special_tokens=False)
+            ends.append(len(ids) - 1)
+        last = len(ids) - 1
+        return from_ids(k, ids) | {"candidate_positions": ends[1:3],
+                                   "query_position": last}
+
+    join_text = answer([from_segments(k, join_segments(i, j))
                         for k, (i, j) in enumerate(pairs)])
     join_ids = answer([from_ids(k, ids)
                        for k, ids in enumerate(quail_out["join_ids"])])

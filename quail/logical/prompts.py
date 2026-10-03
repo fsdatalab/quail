@@ -69,10 +69,11 @@ class PromptLayout:
     A filter prompt is the document label, the document, the question
     separator, the question label, the question, the question end,
     then the answer segments. A join prompt puts the anchor document
-    after the label, then the anchor note, the partner blocks, and the
-    question. The question text through the question end is tokenized
-    as one segment and each answer segment on its own; the token lists
-    are joined.
+    after the label, then the anchor note and the question label and
+    question (the anchor frame, kept in the anchor's KV), then the
+    partner blocks, the question end, and the answer segments. The
+    text through the question end is tokenized as one segment and
+    each answer segment on its own; the token lists are joined.
 
     Attributes:
         name: The ModelSpec.prompt_layout value that selects this layout.
@@ -83,9 +84,6 @@ class PromptLayout:
             separately tokenized segment.
         question_separator: The text between a document and the question
             label. None keeps the separator a filter template wrote.
-        question_in_join_frame: Whether a join writes the question into
-            the anchor frame, before the partner blocks, instead of
-            after the last partner.
         answer_rows: The answer segments whose last token the readout
             reads, besides the prompt's last token.
     """
@@ -96,7 +94,6 @@ class PromptLayout:
     question_end: str = ANSWER_CUE
     answer_segments: tuple[str, ...] = ()
     question_separator: str | None = None
-    question_in_join_frame: bool = True
     answer_rows: tuple[int, ...] = ()
 
     def question_segments(self, question: str, separator: str) -> list[str]:
@@ -132,7 +129,6 @@ PROMPT_LAYOUTS = {layout.name: layout for layout in (
             "and instructions.\nDecision:",
         ),
         question_separator="\n\n",
-        question_in_join_frame=False,
         answer_rows=(0, 1),
     ),
 )}
@@ -185,8 +181,6 @@ def render_join_question(template: str, layout: str = "ai-if") -> str:
 def render_join_frame(template: str, placeholder: int,
                       layout: str = "ai-if") -> str:
     """The complete anchor frame, tokenized as one string."""
-    if not PROMPT_LAYOUTS[layout].question_in_join_frame:
-        return join_anchor_note(placeholder)
     return join_anchor_note(placeholder) + render_join_question(template, layout)
 
 
@@ -422,10 +416,7 @@ def bind_join_prompt(template: str, args: tuple,
     spec = PROMPT_LAYOUTS[layout]
     question = render_join_question(template, layout)
     preamble = shared_preamble(turn[0], layout)
-    if spec.question_in_join_frame:
-        segments = [spec.question_end, *spec.answer_segments]
-    else:
-        segments = spec.question_segments(template, JOIN_QUESTION_SEP)
+    segments = [spec.question_end, *spec.answer_segments]
     segments[-1] += turn[1]
     segments = tuple(segments)
     tail = "".join(segments)

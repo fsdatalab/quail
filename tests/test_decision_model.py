@@ -67,15 +67,17 @@ def test_filter_prompt_is_the_decision2_noul_format_tokenized_by_segment():
         '{"description":"No","key":"false"}\n')
 
 
-def test_join_prompt_puts_the_question_after_the_last_partner():
+def test_join_prompt_keeps_the_question_in_the_anchor_frame():
     prompt = bind_join_prompt("Does {1} answer {0}?", PAIR, _tokens,
                               layout=LAYOUT)
     assert render_join_prompt_text(prompt, ["Where is it?", "In the box."], 0) == (
         "Context:\nWhere is it?\n\n(The document above is DOCUMENT {0}.)"
-        "\n\nDOCUMENT {1}:\nIn the box.\n\nTask type: noul\nQuestion:\n"
-        "Does {1} answer {0}?\nOptions:" + OPTIONS + CLOSING)
+        "\n\nTask type: noul\nQuestion:\nDoes {1} answer {0}?"
+        "\n\nDOCUMENT {1}:\nIn the box.\nOptions:" + OPTIONS + CLOSING)
     frames = {alias: frame for alias, _, frame in prompt.label_token_ids}
-    assert "".join(frames["q"]) == "\n\n(The document above is DOCUMENT {0}.)"
+    assert "".join(frames["q"]) == (
+        "\n\n(The document above is DOCUMENT {0}.)"
+        "\n\nTask type: noul\nQuestion:\nDoes {1} answer {0}?")
     ids = render_join_prompt_ids(prompt, [_tokens("Where is it?"),
                                           _tokens("In the box.")], 0, _tokens)
     assert tuple(ids[-len(prompt.tail_token_ids):]) == prompt.tail_token_ids
@@ -209,7 +211,8 @@ def test_plans_carry_the_decision_layout_and_refuse_scores(session):
     (node,) = [n for n in plan.nodes if isinstance(n, AiJoin)]
     (stage,) = node.stages
     assert "".join(stage.tail_token_ids).endswith(OPTIONS + CLOSING)
-    assert "Question" not in "".join(stage.frame_token_ids)
+    assert "".join(stage.frame_token_ids).endswith("Does {1} answer {0}?")
+    assert "".join(stage.tail_token_ids).startswith("\nOptions:")
 
     plan = session.sql(
         "SELECT d.id, AI.SCORE(PROMPT('Refund? {0}', d.body)) AS s "

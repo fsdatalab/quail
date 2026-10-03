@@ -73,7 +73,9 @@ and SGLang backends do not run it.
 The model is a Qwen3-0.6B network with a separate classifier head.
 It does not answer by generating a token. Quail writes each prompt in
 the model's yes/no question format: the document after `Context:`,
-the question, then a `No` option block and a `Yes` option block.
+the question, then a `No` option block and a `Yes` option block. In
+a join the question follows the anchor document, so it is computed
+once per anchor; the option blocks follow the partner document.
 Quail reads three final hidden states: the last token of each option
 block and the last token of the prompt. The head scores both options
 in FP32 and the predicate is true when `Yes` scores higher.
