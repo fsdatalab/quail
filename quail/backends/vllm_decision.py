@@ -1,6 +1,6 @@
 """Decision 2.0 checkpoints on vLLM's pooling runner.
 
-The converted Qwen3 backbone runs as a vLLM pooling model. Its pooler
+The package's Qwen3 backbone runs as a vLLM pooling model. Its pooler
 keeps each request's trailing rows across prefill chunks and, when the
 prompt finishes, returns the decision head's fp32 option scores. The
 backend reads an answer from the scores as the Quail readout does.
@@ -12,17 +12,19 @@ import math
 import time
 
 ARCHITECTURE = "Qwen3DecisionModel"
+BACKBONE_ARCHITECTURE = "Decision2ForCausalLM"
 TASK = "token_classify"
 OFFSETS_KEY = "decision_offsets"
 
 
 def register() -> None:
-    """Register the pooling model class with vLLM's model registry."""
+    """Register the Decision 2.0 model classes with vLLM's model registry."""
     from vllm import ModelRegistry
 
-    if ARCHITECTURE not in ModelRegistry.get_supported_archs():
-        ModelRegistry.register_model(
-            ARCHITECTURE, "quail.backends.vllm_decision_model:Qwen3DecisionModel")
+    for name in (ARCHITECTURE, BACKBONE_ARCHITECTURE):
+        if name not in ModelRegistry.get_supported_archs():
+            ModelRegistry.register_model(
+                name, f"quail.backends.vllm_decision_model:{name}")
 
 
 def pooling_params(offsets, *, read_cache: bool = True):
@@ -214,16 +216,15 @@ def boot_decision(spec, llm_kwargs: dict) -> tuple[dict, dict]:
     """
     from vllm import LLM
 
-    from quail.backends.quail.executor.model import checkpoint_path
+    from quail.backends.quail.executor.model import engine_args, resolve_model_path
     from quail.backends.vllm import _capacity
 
     register()
-    path = checkpoint_path(spec.hf_name, spec.revision)
+    path = resolve_model_path(spec.hf_name, spec.revision)
     llm_kwargs = {key: value for key, value in llm_kwargs.items()
                   if key != "tokenizer_mode"}
     started = time.perf_counter()
-    llm = LLM(model=path, runner="pooling",
-              hf_overrides={"architectures": [ARCHITECTURE]}, **llm_kwargs)
+    llm = LLM(runner="pooling", **engine_args(path, ARCHITECTURE), **llm_kwargs)
     boot_s = time.perf_counter() - started
     config = llm.llm_engine.vllm_config
     capacity = _capacity(llm)

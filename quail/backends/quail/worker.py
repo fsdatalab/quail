@@ -11,7 +11,7 @@ import time
 from quail.backends.base import GpuContext
 from quail.backends.quail.distributed import execute_distributed_graph
 from quail.backends.quail.executor.arena import KVArena
-from quail.backends.quail.executor.model import checkpoint_path, load_model
+from quail.backends.quail.executor.model import load_model, resolve_model_path
 from quail.backends.quail.executor.models import build_pipeline
 from quail.backends.quail.executor.readout import (
     AnswerRows,
@@ -102,8 +102,8 @@ class LoadedGpu:
         t0 = time.perf_counter()
         self.decision_head = None
         if spec.role == "decision":
-            path = checkpoint_path(model_path or spec.hf_name,
-                                   None if model_path else spec.revision)
+            path = resolve_model_path(model_path or spec.hf_name,
+                                      None if model_path else spec.revision)
             self.decision_head = DecisionHead.load(torch, F, path)
             self.decision_offsets = decision_offsets(spec, path)
         self.pipeline = build_pipeline(spec, self.model, self.arena)
@@ -679,7 +679,7 @@ def execute_quail_multi(payload, registry, graph):
     gpu_count = payload["workers"]
     spec = registry.model(payload["model"])
     started = time.perf_counter()
-    model_path = checkpoint_path(spec.hf_name, spec.revision)
+    model_path = resolve_model_path(spec.hf_name, spec.revision)
     model_files_s = time.perf_counter() - started
     _ensure_children(gpu_count)
     setup = {key: payload[key] for key in (

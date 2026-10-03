@@ -18,7 +18,7 @@ def test_qwen3_spec_matches_built_in(name):
     built_in = MODELS[name]
     config = json.loads((CONFIGS / f"{name}.json").read_text())
     if built_in.role == "decision":
-        # the float32 backbone as convert_decision2 rewrites it
+        # the float32 backbone, which vLLM loads as bfloat16
         config.update(torch_dtype="bfloat16", dtype="bfloat16")
     spec = qwen3_spec(name, built_in.hf_name, built_in.revision,
                       config=config, role=built_in.role)

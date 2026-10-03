@@ -233,54 +233,18 @@ def test_plans_carry_the_decision_layout(session):
     assert not backend.supports(DECISION_2_KAI_0_6B_BF16, H100_SXM, 1).supported
 
 
-def _package(tmp_path):
-    torch = pytest.importorskip("torch")
-    from safetensors.torch import save_file
-
-    src = tmp_path / "models--org--decision" / "snapshots" / "abc123"
-    (src / "backbone").mkdir(parents=True)
-    (src / "config.json").write_text(json.dumps({"model_type": "decision2"}))
-    (src / "backbone" / "config.json").write_text(json.dumps({
-        "architectures": ["Qwen3Model"], "model_type": "qwen3",
-        "dtype": "float32"}))
-    save_file({"embed_tokens.weight": torch.ones(4, 2),
-               "layers.0.mlp.down_proj.weight": torch.ones(2, 2,
-                                                           dtype=torch.bfloat16)},
-              str(src / "backbone" / "model.safetensors"))
-    for name in model.DECISION2_COPIED:
-        (src / name).write_text(name)
-    return src
-
-
-def test_decision2_package_converts_once_to_a_bf16_qwen3_checkpoint(
-        tmp_path, monkeypatch):
-    torch = pytest.importorskip("torch")
-    from safetensors.torch import load_file
-
-    src = _package(tmp_path)
-    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
-    monkeypatch.setattr(model, "resolve_model_path", lambda name, rev: str(src))
-    model.checkpoint_path.cache_clear()
-    try:
-        dest = model.checkpoint_path("org/decision", "abc123")
-    finally:
-        model.checkpoint_path.cache_clear()
-    assert dest == str(tmp_path / "hf" / "quail-checkpoints"
-                       / model.DECISION2_FORMAT / "models--org--decision"
-                       / "abc123")
-    config = json.loads((tmp_path / dest / "config.json").read_text())
-    assert config["architectures"] == ["Qwen3ForCausalLM"]
-    assert config["torch_dtype"] == config["dtype"] == "bfloat16"
-    tensors = load_file(f"{dest}/model.safetensors")
-    assert sorted(tensors) == ["model.embed_tokens.weight",
-                               "model.layers.0.mlp.down_proj.weight"]
-    assert {t.dtype for t in tensors.values()} == {torch.bfloat16}
-    for name, copy in model.DECISION2_COPIED.items():
-        assert (tmp_path / dest / copy).read_text() == name
-    # vLLM loads every top-level safetensors file as model weights
-    assert sorted(p.name for p in (tmp_path / dest).glob("*.safetensors")) == [
-        "model.safetensors"]
-    assert not model.is_decision2(dest)
+def test_vllm_loads_a_decision2_backbone_in_place(tmp_path):
+    package = tmp_path / "snapshot"
+    (package / "backbone").mkdir(parents=True)
+    (package / "config.json").write_text(json.dumps({"model_type": "decision2"}))
+    args = model.engine_args(package, "Qwen3DecisionModel")
+    assert args == {"model": str(package / "backbone"), "tokenizer": str(package),
+                    "dtype": "bfloat16",
+                    "hf_overrides": {"architectures": ["Qwen3DecisionModel"]}}
+    plain = tmp_path / "qwen3"
+    plain.mkdir()
+    (plain / "config.json").write_text(json.dumps({"model_type": "qwen3"}))
+    assert model.engine_args(plain) == {"model": str(plain)}
 
 
 def test_a_decision_classification_is_reestimated(session):

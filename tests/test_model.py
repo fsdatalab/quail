@@ -169,7 +169,7 @@ def test_model_files_are_resolved_once_and_cached_before_children_start(
 
     clock = iter([10.0, 12.0, 15.0])
     monkeypatch.setattr(worker.time, "perf_counter", lambda: next(clock))
-    monkeypatch.setattr(worker, "checkpoint_path", resolve)
+    monkeypatch.setattr(worker, "resolve_model_path", resolve)
     monkeypatch.setattr(worker, "_ensure_children", ensure)
     monkeypatch.setattr(worker, "_round", round_fn)
     monkeypatch.setattr(worker, "execute_distributed_graph", run_graph)

@@ -263,11 +263,11 @@ class DecisionHead:
 
     @classmethod
     def load(cls, torch, F, path, device="cuda"):
-        """Load head/decision_head.safetensors from a converted checkpoint."""
+        """Load decision_head.safetensors from a Decision 2.0 package."""
         from safetensors.torch import load_file
 
         return cls(torch, F, load_file(
-            str(Path(path) / "head" / "decision_head.safetensors"),
+            str(Path(path) / "decision_head.safetensors"),
             device=device))
 
     def scores(self, options, last):
