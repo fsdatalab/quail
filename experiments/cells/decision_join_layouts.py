@@ -148,6 +148,7 @@ def _pairs():
     import tempfile
 
     import pyarrow.parquet as pq
+
     import quail_b
 
     directory = tempfile.mkdtemp()
