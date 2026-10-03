@@ -7,7 +7,6 @@ from typing import Any, ClassVar, Mapping
 
 from .base import (
     ExecutionLocation,
-    GraphValidationError,
     OutputPort,
     PhysicalNode,
     ValueType,
@@ -114,7 +113,16 @@ class JoinStage:
         }
 
     def runtime_spec(self) -> dict:
-        """Return the bound prompt and predicate for the join driver."""
+        """Return the bound prompt and predicate for the join driver.
+
+        The frame includes the first partner's label, which every pair
+        of the anchor shares.
+        """
+        labels = dict(self.label_token_ids)
+        frame = tuple(self.frame_token_ids)
+        if self.partners and self.partners[0] in labels:
+            frame += tuple(labels[self.partners[0]])
+            labels[self.partners[0]] = ()
         return {
             "anchor": self.anchor,
             "partners": list(self.partners),
@@ -122,8 +130,8 @@ class JoinStage:
             "selectivity": self.selectivity,
             "written_pos": self.written_pos,
             "pairs_from": self.pairs_from,
-            "frame": self.frame_token_ids,
-            "labels": dict(self.label_token_ids),
+            "frame": frame,
+            "labels": labels,
             "tail": self.tail_token_ids,
         }
 
@@ -158,6 +166,61 @@ class RequestFilterSpec:
                 list(question) for question in self.question_token_ids
             ],
             "question_texts": list(self.question_texts),
+        }
+
+
+@dataclass(frozen=True)
+class RequestClassifySpec:
+    """Specification for one decoded classification answer per document or row.
+
+    The tail_token_ids follow the document and contain the question, the
+    label list, and the answer cue. Tests contains (written position,
+    accepted labels) pairs applied in order after classification.
+    """
+
+    alias: str
+    output: str
+    tail_token_ids: tuple[Any, ...]
+    labels: tuple[str, ...]
+    label_token_ids: tuple[tuple[Any, ...], ...]
+    tests: tuple[tuple[int, tuple[str, ...]], ...] = ()
+    # a classification of joined rows: the partner alias, the anchor
+    # note and partner label token ids, and the join whose rows it labels
+    partner: str | None = None
+    join_layout_token_ids: tuple[tuple[Any, ...], ...] = ()
+    join_written_pos: int | None = None
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "RequestClassifySpec":
+        partner = value.get("partner")
+        join_written_pos = value.get("join_written_pos")
+        return cls(
+            alias=str(value["alias"]),
+            output=str(value["output"]),
+            tail_token_ids=tuple(value["tail_token_ids"]),
+            labels=tuple(str(label) for label in value["labels"]),
+            label_token_ids=tuple(tuple(ids) for ids in value["label_token_ids"]),
+            tests=tuple((int(position), tuple(str(label) for label in accepted))
+                        for position, accepted in value.get("tests", ())),
+            partner=None if partner is None else str(partner),
+            join_layout_token_ids=tuple(tuple(ids)
+                                 for ids in value.get("join_layout_token_ids", ())),
+            join_written_pos=(None if join_written_pos is None
+                              else int(join_written_pos)),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "alias": self.alias,
+            "output": self.output,
+            "tail_token_ids": list(self.tail_token_ids),
+            "labels": list(self.labels),
+            "label_token_ids": [list(ids) for ids in self.label_token_ids],
+            "tests": [[position, list(accepted)]
+                      for position, accepted in self.tests],
+            "partner": self.partner,
+            "join_layout_token_ids": [list(ids) for ids in self.join_layout_token_ids],
+            "join_written_pos": self.join_written_pos,
         }
 
 
@@ -321,6 +384,7 @@ class RequestExecution(PhysicalNode):
     preamble_text: str = ""
     filters: tuple[RequestFilterSpec, ...] = ()
     joins: tuple[RequestJoinSpec, ...] = ()
+    classifies: tuple[RequestClassifySpec, ...] = ()
 
     type_name: ClassVar[str] = "quail.request_execution"
     runtime_key: ClassVar[str] = type_name
@@ -357,6 +421,23 @@ class RequestExecution(PhysicalNode):
             )
             for spec in self.joins
         )
+        outputs.extend(
+            OutputPort(
+                f"label_answers:{spec.output}",
+                ValueType.LABEL_ANSWERS,
+                schema=(spec.alias, spec.output),
+            )
+            for spec in self.classifies
+        )
+        # the answers of the filters on a label, one relation per tested classification
+        outputs.extend(
+            OutputPort(
+                f"label_in_answers:{spec.output}",
+                ValueType.FILTER_ANSWERS,
+                schema=(spec.alias, "predicate", "answer"),
+            )
+            for spec in self.classifies if spec.tests
+        )
         return tuple(outputs)
 
     def attributes(self) -> dict:
@@ -367,6 +448,7 @@ class RequestExecution(PhysicalNode):
             "preamble_text": self.preamble_text,
             "filters": [spec.to_dict() for spec in self.filters],
             "joins": [spec.to_dict() for spec in self.joins],
+            "classifies": [spec.to_dict() for spec in self.classifies],
         }
 
     def explain_fields(self) -> Mapping[str, Any]:
@@ -375,6 +457,7 @@ class RequestExecution(PhysicalNode):
             "aliases": list(self.aliases),
             "filter_chains": len(self.filters),
             "joins": len(self.joins),
+            "classifications": len(self.classifies),
         }
 
     @classmethod
@@ -394,12 +477,21 @@ class RequestExecution(PhysicalNode):
                 RequestJoinSpec.from_mapping(spec)
                 for spec in attributes["joins"]
             ),
+            classifies=tuple(
+                RequestClassifySpec.from_mapping(spec)
+                for spec in attributes.get("classifies", ())
+            ),
         )
 
 
 @dataclass(frozen=True)
 class ScoreSpec:
-    """One batched AI.SCORE computation."""
+    """Specification for a batched AI.SCORE computation.
+
+    draws is the most noise draws a diffusion model averages per answer;
+    an answer whose first draw is certain enough uses one. An
+    autoregressive model always uses one.
+    """
 
     name: str
     aliases: tuple[str, ...]
@@ -409,6 +501,7 @@ class ScoreSpec:
     estimated_seconds: float
     pair_fraction: float = 1.0
     prompt_token_parts: tuple[tuple[int, ...], ...] = ()
+    draws: int = 1
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "ScoreSpec":
@@ -426,6 +519,7 @@ class ScoreSpec:
             prompt_token_parts=tuple(
                 tuple(part) for part in value.get("prompt_token_parts", ())
             ),
+            draws=int(value.get("draws", 1)),
         )
 
     def to_dict(self) -> dict:
@@ -438,6 +532,7 @@ class ScoreSpec:
             "estimated_seconds": self.estimated_seconds,
             "pair_fraction": self.pair_fraction,
             "prompt_token_parts": [list(part) for part in self.prompt_token_parts],
+            "draws": self.draws,
         }
 
 
@@ -502,53 +597,226 @@ class AiScore(PhysicalNode):
 
 
 @dataclass(frozen=True)
-class ScoreFilter(PhysicalNode):
-    """Apply one numeric comparison while retaining the score column."""
+class ClassifySpec(ScoreSpec):
+    """Specification for classifying individual documents or joined pairs.
 
-    score_name: str = ""
+    Attributes:
+        labels: Labels in query order.
+        label_token_ids: Token ids for each label: its letter for the
+            letters rule, its text for the trie rules.
+        scoring: The label scoring rule: letters, trie_tree, or trie_decode.
+            The planner leaves it empty until the label_scoring rule
+            picks one.
+        share_prefixes: Whether documents may reuse shared prefix KV pages.
+        probabilities: Whether to add a name + "_probabilities" map column.
+        join_layout: Anchor note and partner label token sequences for pair
+            classification, or None for individual documents. The question
+            follows the partner document.
+    """
+
+    labels: tuple[str, ...] = ()
+    label_token_ids: tuple[tuple[int, ...], ...] = ()
+    scoring: str = "letters"
+    share_prefixes: bool = False
+    probabilities: bool = False
+    join_layout: tuple[tuple[int, ...], tuple[int, ...]] | None = None
+
+    @property
+    def anchor(self) -> str:
+        """Return the anchor table alias."""
+        return self.aliases[0]
+
+    @property
+    def partner(self) -> str | None:
+        """Return the partner table alias, or None for individual documents."""
+        return self.aliases[1] if len(self.aliases) == 2 else None
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "ClassifySpec":
+        if value.get("stages"):
+            raise ValueError(
+                "nested classification stages are unsupported; replan query")
+        base = ScoreSpec.from_mapping(value)
+        return cls(
+            **{name: getattr(base, name) for name in (
+                "name", "aliases", "query_template", "arguments",
+                "expected_inputs", "estimated_seconds", "pair_fraction",
+                "prompt_token_parts", "draws")},
+            labels=tuple(str(label) for label in value["labels"]),
+            label_token_ids=tuple(
+                tuple(int(token) for token in ids)
+                for ids in value["label_token_ids"]),
+            scoring=str(value.get("scoring", "letters")),
+            share_prefixes=bool(value.get("share_prefixes", False)),
+            probabilities=bool(value.get("probabilities", False)),
+            join_layout=(None if value.get("join_layout") is None else tuple(
+                tuple(int(token) for token in part)
+                for part in value["join_layout"])),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            **super().to_dict(),
+            "labels": list(self.labels),
+            "label_token_ids": [list(ids) for ids in self.label_token_ids],
+            "scoring": self.scoring,
+            "share_prefixes": self.share_prefixes,
+            "probabilities": self.probabilities,
+            "join_layout": (None if self.join_layout is None
+                            else [list(part) for part in self.join_layout]),
+        }
+
+
+@dataclass(frozen=True)
+class AiClassify(AiScore):
+    """Physical operator that appends a label to each input row.
+
+    The spec names the label scoring rule. The backend runs any decode
+    rounds within this node and returns the labels through its scores port.
+    """
+
+    spec: ClassifySpec | None = None
+
+    type_name: ClassVar[str] = "quail.ai_classify"
+
+    @property
+    def outputs(self) -> tuple[OutputPort, ...]:
+        """Return ports for label rows and the IDs of labeled documents."""
+        ports = super().outputs
+        if self.spec is not None and len(self.spec.aliases) == 1:
+            (alias,) = self.spec.aliases
+            ports += (OutputPort(f"ids:{alias}", ValueType.DOCUMENT_IDS,
+                                 schema=(alias,)),)
+        return ports
+
+    def explain_fields(self) -> Mapping[str, Any]:
+        return {
+            **super().explain_fields(),
+            "labels": [] if self.spec is None else list(self.spec.labels),
+            "scoring": None if self.spec is None else self.spec.scoring,
+            "share_prefixes": (False if self.spec is None
+                               else self.spec.share_prefixes),
+            "draws": 1 if self.spec is None else self.spec.draws,
+            "probabilities": (False if self.spec is None
+                              else self.spec.probabilities),
+        }
+
+    @classmethod
+    def from_attributes(cls, node_id, inputs, attributes):
+        value = attributes["spec"]
+        return cls(
+            node_id=node_id,
+            inputs=inputs,
+            backend_name=str(attributes["backend_name"]),
+            model=str(attributes["model"]),
+            spec=None if value is None else ClassifySpec.from_mapping(value),
+        )
+
+
+@dataclass(frozen=True)
+class InList:
+    """The predicate ``column IN (values)`` over a label column."""
+
+    column: str
+    values: tuple[str, ...]
+
+    def accepts(self, value) -> bool:
+        """Return whether the value is one of the accepted labels."""
+        return value in self.values
+
+    def to_dict(self) -> dict:
+        return {"kind": "in_list", "column": self.column,
+                "values": list(self.values)}
+
+    def describe(self) -> str:
+        return f"{self.column} IN {list(self.values)}"
+
+
+@dataclass(frozen=True)
+class Comparison:
+    """The predicate ``column <op> value`` over a score column."""
+
+    column: str
+    op: str
+    value: float
+
+    def accepts(self, value) -> bool:
+        """Return whether the value satisfies the score comparison."""
+        import operator
+
+        compare = {"<": operator.lt, "<=": operator.le,
+                   ">": operator.gt, ">=": operator.ge}[self.op]
+        return bool(compare(value, self.value))
+
+    def to_dict(self) -> dict:
+        return {"kind": "comparison", "column": self.column, "op": self.op,
+                "value": self.value}
+
+    def describe(self) -> str:
+        return f"{self.column} {self.op} {self.value}"
+
+
+def predicate_from_mapping(value: Mapping[str, Any]) -> "InList | Comparison":
+    """Decode a filter predicate from its serialized mapping."""
+    if value["kind"] == "in_list":
+        return InList(str(value["column"]),
+                      tuple(str(item) for item in value["values"]))
+    if value["kind"] == "comparison":
+        return Comparison(str(value["column"]), str(value["op"]),
+                          float(value["value"]))
+    raise ValueError(f"unknown filter predicate {value['kind']!r}")
+
+
+@dataclass(frozen=True)
+class Filter(PhysicalNode):
+    """Physical operator that keeps rows matching a score or label condition.
+
+    InList tests a label produced by AI.CLASSIFY. Comparison tests a score
+    produced by AI.SCORE. Single-document filters also return the kept
+    document IDs; filters over joined pairs return join answers.
+    """
+
+    predicate: InList | Comparison | None = None
     aliases: tuple[str, ...] = ()
-    comparison: str = ""
-    threshold: float = 0.0
     selectivity: float | None = None
     written_pos: int = 0
 
-    type_name: ClassVar[str] = "quail.score_filter"
+    type_name: ClassVar[str] = "quail.filter"
     runtime_key: ClassVar[str] = type_name
     location: ClassVar[ExecutionLocation] = ExecutionLocation.GPU_EXECUTOR
 
     @property
+    def column(self) -> str:
+        """Return the column tested by the predicate."""
+        return self.predicate.column
+
+    @property
     def outputs(self) -> tuple[OutputPort, ...]:
-        answers = (
-            OutputPort(
-                f"filter_answers:{self.aliases[0]}",
-                ValueType.FILTER_ANSWERS,
+        if len(self.aliases) == 1:
+            (alias,) = self.aliases
+            return (
+                OutputPort("scores", ValueType.SCORES),
+                OutputPort(f"filter_answers:{alias}", ValueType.FILTER_ANSWERS),
+                OutputPort(f"ids:{alias}", ValueType.DOCUMENT_IDS,
+                           schema=(alias,)),
             )
-            if len(self.aliases) == 1 else
-            OutputPort(
-                f"join_answers:{self.written_pos}",
-                ValueType.JOIN_ANSWERS,
-            )
-        )
         return (
             OutputPort("scores", ValueType.SCORES),
-            answers,
+            OutputPort(f"join_answers:{self.written_pos}",
+                       ValueType.JOIN_ANSWERS),
         )
 
     def attributes(self) -> dict:
         return {
-            "score_name": self.score_name,
+            "predicate": self.predicate.to_dict(),
             "aliases": list(self.aliases),
-            "comparison": self.comparison,
-            "threshold": self.threshold,
             "selectivity": self.selectivity,
             "written_pos": self.written_pos,
         }
 
     def explain_fields(self) -> Mapping[str, Any]:
         return {
-            "score": self.score_name,
-            "comparison": self.comparison,
-            "threshold": self.threshold,
+            "predicate": self.predicate.describe(),
             "selectivity": self.selectivity,
             "aliases": list(self.aliases),
         }
@@ -558,10 +826,8 @@ class ScoreFilter(PhysicalNode):
         return cls(
             node_id=node_id,
             inputs=inputs,
-            score_name=str(attributes["score_name"]),
+            predicate=predicate_from_mapping(attributes["predicate"]),
             aliases=tuple(attributes["aliases"]),
-            comparison=str(attributes["comparison"]),
-            threshold=float(attributes["threshold"]),
             selectivity=attributes["selectivity"],
             written_pos=int(attributes["written_pos"]),
         )
@@ -574,8 +840,6 @@ class AiFilter(PhysicalNode):
     alias: str = ""
     arena_writes: bool = False
     keep_kv: bool = False
-    pin_survivors: bool = False
-    hold_tokens: int = 0
     stages: tuple[FilterStage, ...] = ()
     question_token_ids: tuple[tuple[Any, ...], ...] = ()
     # documents borrow the KV pages of a document that shares their
@@ -610,8 +874,6 @@ class AiFilter(PhysicalNode):
             "alias": self.alias,
             "arena_writes": self.arena_writes,
             "keep_kv": self.keep_kv,
-            "pin_survivors": self.pin_survivors,
-            "hold_tokens": self.hold_tokens,
             "stages": [stage.to_dict() for stage in self.stages],
             "question_token_ids": [
                 list(question) for question in self.question_token_ids
@@ -633,8 +895,6 @@ class AiFilter(PhysicalNode):
             alias=attributes["alias"],
             arena_writes=bool(attributes["arena_writes"]),
             keep_kv=bool(attributes["keep_kv"]),
-            pin_survivors=bool(attributes["pin_survivors"]),
-            hold_tokens=int(attributes["hold_tokens"]),
             stages=tuple(
                 FilterStage.from_mapping(stage)
                 for stage in attributes["stages"]
@@ -750,13 +1010,12 @@ class AiJoin(PhysicalNode):
 
 @dataclass(frozen=True)
 class Foreign(PhysicalNode):
-    """Call a user function between two operators.
+    """Physical operator that calls a user function on document IDs or pairs.
 
-    ``kind`` is ``per_batch`` (called on each batch a survivor stream
-    hands over, or once over a materialized input) or ``barrier``
-    (called once over every survivor; never on a stream). ``ids`` is
-    ``preserve``, ``drop``, or ``pairs``; the function never invents an
-    id. ``columns`` are (alias, column) pairs read as values.
+    Per-batch functions run as documents reach them in a pipeline, or once
+    over a materialized input. Barrier functions run once over all surviving
+    rows and end the preceding pipeline. The function may preserve or remove
+    input IDs, or return pairs of input IDs; it cannot create new IDs.
     """
 
     function: str = ""
@@ -966,45 +1225,3 @@ class Limit(PhysicalNode):
     @classmethod
     def from_attributes(cls, node_id, inputs, attributes):
         return cls(node_id=node_id, inputs=inputs, count=int(attributes["count"]))
-
-
-def validate_streams(graph) -> None:
-    """Check that pinned survivor streams reach their joins as streams.
-
-    A filter that pins its survivors streams them into the join
-    anchored on its alias. On that path only per-batch Foreign nodes
-    may sit; a Barrier, a barrier Foreign, or any other consumer would
-    need the whole set at once, which a stream never has.
-    """
-    consumers: dict[tuple[str, str], list] = {}
-    for node in graph.nodes:
-        for port in node.inputs:
-            consumers.setdefault(
-                (port.source.node_id, port.source.port), []).append(node)
-    for node in graph.nodes:
-        if not isinstance(node, AiFilter) or not node.pin_survivors:
-            continue
-        alias = node.alias
-        reached = []
-
-        def follow(port):
-            for consumer in consumers.get(port, ()):
-                if isinstance(consumer, AiJoin) and consumer.anchor == alias:
-                    reached.append(consumer)
-                    continue
-                if isinstance(consumer, Foreign) \
-                        and consumer.kind == "per_batch":
-                    out = (f"pairs:{consumer.written_pos}"
-                           if consumer.ids == "pairs" else f"ids:{alias}")
-                    follow((consumer.node_id, out))
-                    continue
-                raise GraphValidationError(
-                    f"{consumer.node_id!r} reads the pinned survivors of "
-                    f"{node.node_id!r}; only a per-batch apply or the join "
-                    f"anchored on {alias!r} can consume a survivor stream")
-
-        follow((node.node_id, f"ids:{alias}"))
-        if not reached:
-            raise GraphValidationError(
-                f"{node.node_id!r} pins its survivors but no join anchored "
-                f"on {alias!r} consumes them")

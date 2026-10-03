@@ -18,8 +18,10 @@ with quail.Session(config=config) as session:
 
 `gpus` defaults to 1 and `backend` to `"quail"`.
 
-The session is a context manager. It releases token files and
-background work when it closes.
+The session is a context manager. Collect result rows before closing it:
+result collection reads from the session's temporary files. Those files
+must fit on local disk. `Session.close()` waits for background tokenization
+and removes the temporary files.
 
 ## Registering tables
 
@@ -64,13 +66,13 @@ result_2 = session.sql("""
 
 The first query loads the model onto the GPU. Later queries on the
 same session reuse that model, the compiled kernels, and the tokenized
-documents. `sql()` returns a [`Query`](/docs/user-guide/results#query).
+documents. `sql()` returns a [`Query`](/docs/user-guide/results#read-the-results).
 
 ## Running on Quail Server
 
 Pass a [Quail Server](/docs/user-guide/server) URL as `endpoint`.
 `sql()` then returns a
-[`RemoteQuery`](/docs/user-guide/server#remotequery). Submitted queries
+[`RemoteQuery`](/docs/user-guide/server#submit-a-query). Submitted queries
 continue after the client exits. Another client can retrieve the saved
 record by its query id.
 

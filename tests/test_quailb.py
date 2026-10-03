@@ -2,6 +2,7 @@
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+from fakes import letter_tokens
 
 import quail
 from quail.bench.quailb import (
@@ -62,16 +63,21 @@ def test_all_queries_compile_and_plan_and_answer_timing_adds_common_work(tmp_pat
         "AGENT-1", "AGENT-2",
         "PRIV-1", "PRIV-2",
     }
-    assert set(QUERY_ORDER) == expected - {"PRIV-1", "PRIV-2"}
+    classify = {*(f"IMDB-{i}" for i in range(11, 16)), "BIO-5", "BIO-6",
+                "FEV-11", "LEP-6", "AGENT-3", "AGENT-4", "AGENT-5"}
+    assert set(QUERY_ORDER) == (expected | classify) - {"PRIV-1", "PRIV-2"}
     for backend in ("quail", "stock_vllm", "pipelined_vllm", "pipelined_sglang"):
         with quail.Session(
             EngineConfig(gpus=1, model="qwen3-4b-fp8", backend=backend,
                          device="h100-sxm"),
-            tokenizer=lambda text: list(text.encode()),
+            tokenizer=letter_tokens,
         ) as sess:
             register_tables(sess, tmp_path)
             qdefs = queries(sess)
-            assert set(qdefs) == expected, backend
+            # every backend lists every query; SGLang refuses the
+            # classification queries at plan time, since its engine
+            # returns no decoded answer text.
+            assert set(qdefs) == expected | classify, backend
             for qid, (_, build) in qdefs.items():
                 case = f"{backend} {qid}"
                 query = build()
@@ -83,6 +89,10 @@ def test_all_queries_compile_and_plan_and_answer_timing_adds_common_work(tmp_pat
                 assert all((s is None) == qid.startswith("PRIV-")
                            for s in selectivities), case
                 plan = query.plan()
+                if backend == "pipelined_sglang" and qid in classify:
+                    assert isinstance(plan, Refusal), case
+                    assert plan.constraint == "classify_needs_quail_backend", case
+                    continue
                 assert not isinstance(plan, Refusal), f"{case} refused: {plan}"
                 assert plan.settings["order_rule"] == "by_cost", case
                 assert "physical:" in query.explain(), case
@@ -99,3 +109,17 @@ def test_all_queries_compile_and_plan_and_answer_timing_adds_common_work(tmp_pat
     assert _submission_to_answer_s(
         "pipelined_vllm", report, frontend_s=1.0, answer_prepare_s=0.75
     ) == 11.25
+
+
+def test_kernel_cache_files_counts_each_cache_directory(tmp_path, monkeypatch):
+    from quail.bench.quailb import kernel_cache_files
+
+    monkeypatch.setenv("QUAIL_CACHE_DIR", str(tmp_path / "missing"))
+    assert kernel_cache_files() == {}
+    (tmp_path / "triton" / "a").mkdir(parents=True)
+    (tmp_path / "triton" / "a" / "k.cubin").write_bytes(b"")
+    (tmp_path / "triton" / "b").mkdir()
+    (tmp_path / "deep_gemm").mkdir()
+    (tmp_path / "marker.json").write_text("{}")
+    monkeypatch.setenv("QUAIL_CACHE_DIR", str(tmp_path))
+    assert kernel_cache_files() == {"deep_gemm": 0, "triton": 2}

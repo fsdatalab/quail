@@ -326,6 +326,23 @@ class QueryResult:
                 for batch in indices:
                     arrays = []
                     for alias, values in self._projection:
+                        if isinstance(alias, tuple):
+                            # a label of joined rows, looked up by the row's ids
+                            keys, table, order = values
+                            positions = pc.index_in(
+                                _pair_keys(*(batch.column(
+                                    batch.schema.get_field_index(name))
+                                    for name in alias)),
+                                value_set=keys)
+                            labels = pc.take(
+                                table.column(table.column_names[2])
+                                .combine_chunks().cast(pa.string()), positions)
+                            if order is not None:
+                                labels = pa.DictionaryArray.from_arrays(
+                                    pc.index_in(labels, order).cast(pa.int32()),
+                                    order)
+                            arrays.append(labels)
+                            continue
                         column = batch.column(
                             batch.schema.get_field_index(alias))
                         # a computed column such as a score is carried as is
@@ -430,3 +447,10 @@ class QueryResult:
 
     def __len__(self) -> int:
         return self.count()
+
+
+
+def _pair_keys(anchors, partners) -> pa.Array:
+    """Encode each anchor and partner index pair as one int64 key."""
+    return pc.add(pc.shift_left(pc.cast(anchors, pa.int64()), 32),
+                  pc.cast(partners, pa.int64()))

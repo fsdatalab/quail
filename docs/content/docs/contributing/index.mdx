@@ -1,30 +1,58 @@
 ---
-title: Contributing
+title: Overview
 ---
 
-## How to contribute
+Here we explain how to report a bug or submit a change to Quail.
 
-1. Open an [issue](https://github.com/fsdatalab/quail/issues)
-   proposing what you want to work on, or comment on an existing
-   issue to claim it.
-2. We will read and respond. Once there is agreement on the
-   approach, go ahead and open a PR.
-3. If you are adding new operators or functionality, also add
-   queries to [QUAIL-B](https://github.com/fsdatalab/quail-bench)
-   to test the new feature.
+## Report a bug
 
-## Repository layout
+If you find a bug, please
+[open an issue](https://github.com/fsdatalab/quail/issues).
+Include:
+
+- A minimal example that reproduces the bug.
+- The expected behavior and what happened.
+- The Quail version or commit. For an inference error, include the model,
+  device, and backend configuration.
+
+## Prepare the repository
+
+Quail requires Python 3.12. Clone the repository and install the development
+dependencies:
+
+```bash
+git clone https://github.com/fsdatalab/quail.git
+cd quail
+uv sync --frozen
+```
+
+The development dependencies include
+[quail-b](https://github.com/fsdatalab/quail-bench).
+You need access to that repository to install them.
+
+## Make a change
+
+For a new feature or a substantial change, open an issue to discuss the
+approach before implementation.
+Include the tests and documentation needed to check and use your change.
 
 | Path | Contents |
 | --- | --- |
-| [`quail/`](https://github.com/fsdatalab/quail/tree/main/quail) | The engine. |
-| [`quail/bench/`](https://github.com/fsdatalab/quail/tree/main/quail/bench) | QUAIL-B runner. |
-| [`tests/`](https://github.com/fsdatalab/quail/tree/main/tests) | CPU tests (no GPU needed). |
-| [`experiments/`](https://github.com/fsdatalab/quail/tree/main/experiments) | Modal GPU scripts. |
-| [`demos/`](https://github.com/fsdatalab/quail/tree/main/demos) | Runnable examples. |
-| [`docs/`](https://github.com/fsdatalab/quail/tree/main/docs) | This site (Fumadocs + Next.js). |
+| `quail/frontend/` | SQL parsing and the Python query API. |
+| `quail/logical/`, `quail/physical/` | Logical and physical plan definitions. |
+| `quail/planner/`, `quail/cost/`, `quail/specs/` | Planning rules, cost estimates, and model and device specifications. |
+| `quail/execution/`, `quail/backends/` | Query execution and inference engines. |
+| `tests/`, `experiments/` | CPU tests and Modal GPU scripts. |
+| `docs/`, `demos/` | Documentation and examples. |
 
-## Running tests
+See [Architecture](/docs/architecture) for the query execution flow.
+See [Extending Quail](/docs/extending) for the extension interfaces.
+
+## Check the change
+
+### Code checks
+
+Run these commands from the repository root:
 
 ```bash
 uv run ruff check quail tests experiments tools
@@ -33,67 +61,34 @@ uv run vulture
 uv run pytest -q
 ```
 
-All four must pass before pushing.
+All four checks must pass before pushing. These checks do not require a GPU.
 
-## Running the docs site locally
+For changes to model execution, run the relevant GPU tests.
+The script
+[`experiments/run_gpu_tests.py`](https://github.com/fsdatalab/quail/blob/main/experiments/run_gpu_tests.py)
+runs these tests on Modal.
+For performance changes, use the [benchmark guide](/docs/contributing/benchmark).
+
+### Documentation checks
+
+Install the documentation dependencies and start the site:
 
 ```bash
-cd docs
-pnpm install
-pnpm dev
+pnpm --dir docs install --frozen-lockfile
+pnpm --dir docs dev
 ```
 
-## Roadmap
+Open [the local site](http://localhost:3000/quail).
+Check the changed pages, then run:
 
-We are looking for contributors on all of these. If something here
-interests you, open an issue and we will help you get started.
+```bash
+pnpm --dir docs types:check
+pnpm --dir docs build
+```
 
-### Simpler
+## Submit a pull request
 
-- **More models.** Add `ModelSpec` entries for other Qwen3 sizes or
-  other model families. See
-  [Custom models and GPUs](/docs/extending/models).
-- **More GPU types.** Add `DeviceSpec` entries for other NVIDIA GPUs
-  (e.g., A100, L40S, B200). Each spec needs the memory, bandwidth,
-  and peak FLOP rates from the datasheet.
-
-### Medium
-
-- **New AI-SQL operators.** `AI.CLASSIFY` (return one of N labels),
-  `AI.EXTRACT` (pull structured fields from a document), and
-  `AI.MAP` (run a free-form instruction and return the result).
-  These require decode (generating multiple tokens), which the
-  current engine does not do. See
-  [Custom operators](/docs/extending/operators).
-- **Assign documents to GPUs for prefix reuse.** Each GPU can reuse
-  KV only from documents on that GPU. Grouping documents with common
-  prefixes on the same GPU could increase reuse. The assignment must
-  also keep the work balanced across GPUs.
-
-### Harder
-
-- **Hierarchical KV management.** Spill evicted document KV to host
-  CPU memory or disk instead of recomputing from scratch. The
-  tradeoff is recompute cost vs. PCIe/NVMe transfer time.
-- **Higher model FLOP utilization (MFU).** Quail uses DeepGEMM and
-  FlashAttention but has not optimized the GPU kernels beyond
-  fusing small operations. Higher MFU means faster forward passes
-  for the same hardware. This builds on work in the ML inference
-  community (e.g.,
-  [Sail Research on TPU v6e](https://www.sailresearch.com/blog/tpu-v6e-gemma)).
-- **Indexing to avoid full document scans.** A query that filters
-  100,000 documents currently evaluates every one. An index (e.g.,
-  embedding-based or keyword-based) could skip documents that
-  cannot pass, reducing the number of LLM calls.
-- **Online model training during query execution.** Fine-tune a
-  smaller model on the fly using the answers the large model
-  produces during the current query, then use the fine-tuned model
-  to complete the rest of the query or future queries over the same
-  predicate. This is related to
-  [Google's work on proxy models for AI-SQL](https://arxiv.org/abs/2603.15970).
-- **Integration with relational query engines.** A query engine like
-  DataFusion or DuckDB could use Quail as a backend for its AI-SQL
-  operators, passing a physical plan to Quail and getting Arrow
-  results back. Quail's
-  [plan editing API](/docs/architecture/physical-plans#editing-a-plan)
-  is a starting point for this.
+Describe the problem, what your change does, and why.
+List the checks you ran and their results.
+For a performance change, include the configurations, measurements, and
+saved result paths. State any remaining limitations.

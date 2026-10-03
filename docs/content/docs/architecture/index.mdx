@@ -2,43 +2,48 @@
 title: Overview
 ---
 
-Quail is structured like a traditional query engine: it parses a
-query into a logical plan, optimizes it, lowers it to a physical
-plan, and executes the physical plan. Execution is pull-based
-(Volcano-style), with documents pipelining through operators in
-large batches sized to saturate the GPU. The two performance goals
-are to keep the GPU busy (minimize idle time between forward passes)
-and to minimize KV regret (document state that was evicted from GPU
-memory and needs to be recomputed).
+Quail converts a SQL or Python query into a plan, executes the plan, and
+returns the results. A plan describes the operations needed to answer
+the query.
 
-## Query lifecycle
+## How Quail executes a query
 
-1. Quail [parses](https://github.com/fsdatalab/quail/blob/main/quail/frontend/sql.py)
-   the user's SQL (or [Python builder](https://github.com/fsdatalab/quail/blob/main/quail/frontend/builder.py)
-   query) into a logical plan.
-2. The session reads Arrow batches from each registered table and
-   tokenizes the document columns.
-3. The [planner](https://github.com/fsdatalab/quail/blob/main/quail/planner/decide.py)
-   proposes one or more physical plans with cost estimates. The
-   cheapest one is selected.
-4. The [runner](https://github.com/fsdatalab/quail/blob/main/quail/execution/runner.py)
-   executes the physical graph. Model nodes run on the GPU.
-   Relational nodes run with Arrow on the CPU.
-5. The query returns the matching rows as a `pyarrow.Table` and an
-   execution report with timing and token counts.
+For example, imagine a `reviews` table with review identifiers in `id`
+and review text in `body`. A query classifies each review as positive or
+negative and returns the identifiers and labels of negative reviews.
+Quail processes this query in five steps:
 
-## Packages
+<Mermaid minWidth={720} chart={`%%{init: {"flowchart": {"rankSpacing": 20, "nodeSpacing": 15, "padding": 10}}}%%
+flowchart LR
+    logical["Build logical plan"]
+    optimize["Optimize plan"]
+    physical["Build physical plan"]
+    execute["Execute plan"]
+    collect["Collect rows"]
+    logical --> optimize --> physical --> execute --> collect
+`} />
 
-Each package imports only from the ones below it.
+1. **Build the logical plan.** The logical plan describes the requested
+   operations and their inputs. For this query, those operations are
+   classification, filtering by label, and selecting result columns.
+   See [Logical plans](/docs/architecture/logical-plans).
+2. **Optimize the plan.** The optimizer applies rules that remove
+   unnecessary work or compare ways to execute the query. When a rule
+   compares execution time, it uses an estimate of GPU time.
+   See [Optimizer](/docs/architecture/optimizer) for the rules and estimates.
+3. **Build the physical plan.** The physical plan selects the operators
+   that will execute the query and records their settings. An operator
+   performs one part of the query. For this query, separate operators
+   identify the input reviews, classify them, test their labels, and
+   select the result columns. See [Physical plans](/docs/architecture/physical-plans).
+4. **Execute the plan.** Quail runs each operator when its input is
+   available. The model classifies the reviews on the GPU. The CPU tests
+   the labels and selects result columns. See
+   [Execution](/docs/architecture/execution).
+5. **Read the results.** Execution returns a `QueryResult` with timing
+   and token counts. Calling `collect()` reads its result rows into an
+   Arrow table. In this example, each result row contains a review
+   identifier and the label `negative`. See [Results](/docs/user-guide/results).
 
-| Package | What it does | Source |
-| --- | --- | --- |
-| `quail.frontend` | SQL compiler and Python builder. | [frontend/](https://github.com/fsdatalab/quail/tree/main/quail/frontend) |
-| `quail.logical` | Logical plan nodes and prompt binding. | [logical/](https://github.com/fsdatalab/quail/tree/main/quail/logical) |
-| `quail.physical` | Physical plan nodes. | [physical/](https://github.com/fsdatalab/quail/tree/main/quail/physical) |
-| `quail.planner` | Logical rules, filter and join ordering, KV retention. | [planner/](https://github.com/fsdatalab/quail/tree/main/quail/planner) |
-| `quail.cost` | Cost model over the model and device specs. | [cost/](https://github.com/fsdatalab/quail/tree/main/quail/cost) |
-| `quail.execution` | Session, runner, token store, results. | [execution/](https://github.com/fsdatalab/quail/tree/main/quail/execution) |
-| `quail.backends` | Quail's GPU code (`backends/quail/executor/`) and the vLLM and SGLang baselines. | [backends/](https://github.com/fsdatalab/quail/tree/main/quail/backends) |
-| `quail.specs` | Model and device constants. | [specs/](https://github.com/fsdatalab/quail/tree/main/quail/specs) |
-
+For how Quail stores and reuses model data in GPU memory, see
+[KV](/docs/architecture/kv).

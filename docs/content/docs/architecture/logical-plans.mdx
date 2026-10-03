@@ -2,9 +2,34 @@
 title: Logical plans
 ---
 
-A logical plan describes what a query does. Both front ends (SQL and
-the Python builder) produce one through `LogicalPlanBuilder`, so
-they always generate the same plan for the same query.
+A logical plan describes the operations a query requests and the data they
+read. It does not specify GPU batches or attention settings. The SQL parser
+and Python builder both use `LogicalPlanBuilder` to construct this plan.
+The [optimizer](/docs/architecture/optimizer) then rewrites it before
+building a physical plan.
+
+This page describes the plan representation for contributors working on
+query syntax, validation, or optimizer rules.
+
+## Plan structure
+
+The plan is a tree. Each node represents an operation, and its children
+are the operations that supply its inputs. Data flows from scans toward
+the root.
+
+For example, imagine a query that classifies reviews by sentiment and
+returns only negative reviews. Its logical plan has these operations:
+
+```text
+Project: r.id, sentiment
+  Filter: sentiment IN ('negative')
+    SemanticClassify: sentiment
+      Scan: reviews as r
+```
+
+`SemanticClassify` calls the model and adds a label column. `Filter` tests
+that column without calling the model. Keeping the two operations separate
+lets the planner reason about their placement and cost.
 
 ## The node protocol
 
@@ -23,196 +48,173 @@ class LogicalNode(Protocol):
     def explain_fields(self) -> dict[str, Any]: ...
 ```
 
-`children()` returns the node's inputs in the plan tree. For
-example, a `SemanticFilter`'s child is its `Scan`, and a `Project`'s
-child is the filter or join below it. `expressions()` returns the
-expressions attached to the node: for a `SemanticFilter` these are
-its `FilterPredicate` objects, each holding a predicate expression and
-a selectivity hint, and for a `Project` these are the output columns.
+- `children()` returns the node's inputs.
+- `expressions()` returns the expressions attached to the operation.
+  A `SemanticFilter` holds `FilterPredicate` objects, which include a
+  predicate and a selectivity hint. A `Project` holds output expressions.
+- `output_schema()` describes the columns available after the operation.
+- `validate()` checks the node's constraints.
+- `explain_fields()` supplies fields for the plan's text representation.
 
-Nodes are frozen dataclasses. Since they are immutable,
-`with_children` and `with_expressions` return a new node with the
-specified fields replaced. Logical rules (see below) use these
-methods to transform the plan. `LogicalPlan.walk()` visits children
-before parents.
+Nodes are frozen dataclasses. Rewrites use `with_children()`,
+`with_expressions()`, or `dataclasses.replace()` to return new nodes.
+`LogicalPlan.walk()` visits children before their parents.
 
 ## Node types
 
-| Node | What it represents |
+| Node | Meaning |
 | --- | --- |
-| `Scan(provider, alias, column)` | Read one document column from a registered table. |
-| `SemanticFilter(input, predicates)` | One or more model predicates over one table. |
-| `Join(left, right, on)` | The pairs of two inputs, narrowed by ordinary column equalities. No `on` means every pair. |
-| `SemanticJoin(input, predicate, semantics, selectivity, anchor)` | One model predicate over the pairs its input `Join` produces. `semantics` is `full`, `exists`, or `anti`. A query joining three or more tables has one `SemanticJoin` per pair. |
-| `Apply(input, function, kind, ids, columns, aliases)` | A registered Python function between two operators. |
-| `Project(input, columns, limit)` | Column projection and optional limit. Always the root. |
+| `Scan(provider, alias, column)` | Read a document column from a registered table. |
+| `SemanticFilter(input, predicates)` | Evaluate model predicates over one table and keep passing rows. |
+| `Join(left, right, on)` | Form pairs from two inputs. Optional column equalities restrict the pairs. Without `on`, it forms every pair. |
+| `SemanticJoin(input, predicate, semantics, selectivity, anchor)` | Evaluate a model predicate over the pairs from a `Join`. The semantics are `full`, `exists`, or `anti`. |
+| `SemanticClassify(input, call, name)` | Evaluate an `AI.CLASSIFY` call and add the label column `name`. |
+| `Filter(input, condition, selectivity)` | Keep rows that satisfy a condition on a computed label. |
+| `Apply(input, function, kind, ids, columns, aliases)` | Run a registered Python function on input rows or pairs. |
+| `Project(input, columns, limit)` | Select result columns and optionally limit the result. This is the root node. |
+
+A query joining three or more tables uses one `SemanticJoin` for each
+binary join. A classification may read one document or both documents
+of a joined pair. Conditions on labels of joined pairs are unsupported.
 
 ## Expressions
 
-The AI functions of the language are expressions, not operators. An
-operator holds expressions and does not change when a new AI
-function arrives.
+Expressions describe the values an operator computes or tests. For
+example, a `ModelCall` represents a prompt evaluated on each input row.
+A `Compare` tests a score returned by that call.
 
 | Expression | Value |
 | --- | --- |
-| `ColumnRef(alias, provider, column)` | A column of a table. |
-| `ModelCall(prompt, kind)` | One prompt asked of every row. `kind` is `boolean` for `AI.IF`, which answers yes or no, or `score` for `AI.SCORE`, which answers a float between 0 and 1. |
-| `Compare(call, comparison, threshold)` | A score compared with a threshold. Answers yes or no. |
-| `Alias(expression, name)` | A model call returned as a named result column. |
+| `ColumnRef(alias, provider, column)` | A reference to a table column. |
+| `ModelCall(prompt, kind, labels, descriptions)` | A model call. Its kind is `boolean` for `AI.IF`, `score` for `AI.SCORE`, or `label` for `AI.CLASSIFY`. |
+| `Compare(call, comparison, threshold)` | A TRUE or FALSE comparison of a model score with a threshold. |
+| `InList(column, values)` | A TRUE or FALSE test of whether a column value is in a list. |
+| `Alias(expression, name)` | A result expression with a column name. |
 
-A predicate on a `SemanticFilter` or `SemanticJoin` answers yes or
-no: a boolean `ModelCall`, or a `Compare` around a score call.
-`Project.columns` holds `ColumnRef` and `Alias` values.
+`SemanticFilter` and `SemanticJoin` hold predicates that return TRUE or
+FALSE. A predicate can be a boolean `ModelCall` or a `Compare` around
+a score call. A label condition uses `InList` in a separate `Filter`.
+`Project.columns` holds `ColumnRef` and `Alias` expressions.
 
-`LogicalPlan.operators()` is the one walk that turns the tree into
-what the planner reads: the scans, each alias's filter predicates in
-written order, the joins in written order, and the applies.
-
+`LogicalPlan.operators()` collects the tree's operations for planning.
+It includes scans, predicates and joins in written order, Python
+functions, score and classification calls, and label conditions.
 
 ## Prompt binding
 
-When the parser sees a `PROMPT(...)`, it creates a `Prompt` object
-that rearranges the template into a fixed layout.
+Prompt binding converts a user's template and column references into the
+layout the model receives. Quail places document text before the question
+so questions about the same document can reuse its KV. KV is the key and
+value vectors saved for previously processed tokens.
 
-All model task instructions include "You are performing a data processing
-task." `AI.IF` filters and joins place it before the question in their
-completion prompt. `AI.SCORE` places it in the reranker's system message.
-Quail and the stock vLLM backend use the same instruction text.
+A template is therefore not treated as a plain string substitution.
+For example, `PROMPT('Does {0} praise the acting?', r.body)` identifies
+`r.body` as the document, but Quail sends that document before the question.
 
-**For a filter**, `bind_prompt` produces:
+### Filters
 
-1. **Preamble**: `DOCUMENT:\n`
-2. **Document text**: the value of the column for this row.
-3. **Question**: the instruction from the template, wrapped in an
-   evaluation prompt.
-4. **Answer cue**: `\nANSWER:`
+A bound filter prompt contains, in order:
 
-<details>
-<summary>Example: filter prompt layout</summary>
+1. A document heading.
+2. The document text.
+3. The task instruction and question.
+4. The answer cue.
+
+For example, for a review with body "The acting was excellent.", this
+call:
+
+```sql
+PROMPT('Does this review praise the acting? {0}', r.body)
+```
+
+uses this layout:
 
 ```text
-PROMPT('Does this review mention a positive aspect?\n\n{0}', r.body)
-
-Sent to the model as:
-
 DOCUMENT:
-A beautiful film with outstanding performances...
+The acting was excellent.
 You are performing a data processing task.
 Evaluate TRUE or FALSE for the following question:
-Does this review mention a positive aspect?
+Does this review praise the acting?
 ANSWER:
 ```
 
-</details>
+### Joins
 
-**For a join**, `bind_join_prompt` produces:
+The join layout places the anchor document first. The anchor is the side
+whose KV remains available while Quail evaluates its partners.
 
-1. **Preamble**: `DOCUMENT {0}:\n`
-2. **Anchor document text** (e.g., `r.body`).
-3. **Anchor frame**: a label identifying the document, followed by
-   the full question. This stays in the anchor's KV.
-4. **Partner label and document** (`DOCUMENT {1}:\n` + e.g.,
-   `a.aspect`).
-5. **Answer cue**: `\nANSWER:`
+The prompt contains, in order:
 
-The anchor's preamble, document, and frame are computed once. For
-each partner, only the partner label, partner document, and answer
-cue are new.
+1. A heading and the anchor document.
+2. The anchor frame, which identifies the anchor and states the question.
+3. A heading and the partner document.
+4. The answer cue.
 
-<details>
-<summary>Example: join prompt layout</summary>
+The frame is fixed for all partners of an anchor. In the Quail executor,
+the first partner heading is also stored with that frame, once per anchor.
+Each pair then adds its partner document and answer cue. See
+[Join execution](/docs/architecture/execution#joins).
+
+### Classification
+
+A classification prompt includes the document, question, and allowed
+categories. Quail prepares both category text and letter choices when
+one distinct token is available for each letter. The
+[label scoring rule](/docs/architecture/optimizer#label-scoring) chooses
+which version to use.
+
+For example, suppose `reviews.body` contains "The acting was excellent."
+This call supplies two sentiment categories:
+
+```sql
+AI.CLASSIFY(
+    PROMPT('What sentiment does this review express? {0}', r.body),
+    ARRAY['positive', 'negative'])
+```
+
+The version with letter choices has this layout before model chat
+formatting is added:
 
 ```text
-PROMPT('Does the review discuss this aspect?\n\n{0}\n\n{1}', r.body, a.aspect)
-anchor: r
+DOCUMENT:
+The acting was excellent.
 
-Sent to the model as:
+Answer with the letter of exactly one of the categories below for the following question: What sentiment does this review express?
 
-DOCUMENT {0}:                                      ← anchor (r.body)
-A beautiful film with outstanding performances...
-                                                    ← anchor frame (computed once)
-(The document above is DOCUMENT {0}.)
-You are performing a data processing task.
-Evaluate TRUE or FALSE for the following question:
-Does the review discuss this aspect?
-Review: {0}
-Aspect: {1}
-
-DOCUMENT {1}:                                      ← partner (a.aspect)
-the acting
+Categories:
+- A: positive
+- B: negative
 ANSWER:
 ```
 
-Everything above `DOCUMENT {1}:` is the anchor's KV, computed once.
-Each partner adds only `DOCUMENT {1}:` onward.
-
-</details>
-
-In both cases, the document is placed before the question. This way,
-the document's KV is the same regardless of which question follows,
-which is what makes KV rewind possible.
-
-<Callout type="info">
-`PROMPT('Does {0} mention...', r.body)` is not a simple format
-string where the document is inserted at `{0}`. Quail rearranges
-the template so the document always comes first, even if the user
-wrote the question before the placeholder.
-</Callout>
-
-Token counts and ids are stored on the `Prompt` so the planner and
-executor do not re-tokenize.
+The document precedes the question and category list, so another question
+can reuse the same document KV. When the model selects A, Quail returns
+the category text `positive` in the result column.
 
 ### Tokenization
 
-Quail tokenizes documents separately from the fixed prompt text so
-document tokens can be reused across queries. The executor combines
-the token sequences without tokenizing the combined text again.
-Both `AI.IF` and `AI.SCORE` use this approach. `AI.SCORE` uses the
-reranker's prompt format, with fixed parts tokenized by `_token_parts`.
+Quail tokenizes documents separately from fixed prompt text. The executor
+joins the token sequences without tokenizing the complete text again.
+This lets it reuse document tokens across queries. Bound prompts store
+fixed token IDs and counts for the planner and executor.
 
-For a single-document score, the input is:
+For a score over one document, the input is:
 
 ```python
 tokenize(before_document) + tokenize(document) + tokenize(after_document)
 ```
 
-This can differ from tokenizing the complete prompt string. A token
-can span a boundary between parts, such as a space before the
-document and its first word. Separate tokenization prevents that
-combination and can change model scores.
+Separate tokenization can produce different tokens from tokenizing the
+complete string. A token can span the boundary between fixed text and
+the document, such as a space and the first word. Splitting at that
+boundary prevents the combination and can change model scores.
 
-When comparing model implementations, pass the same token ids to
-both. Comparing with a complete prompt string also tests this
-tokenization difference.
+When comparing implementations, use identical token IDs to compare model
+execution. A comparison against an implementation that tokenizes the
+complete string also measures the effect of tokenization.
 
 ## Logical rules
 
-```python
-class LogicalOptimizerRule(Protocol):
-    name: str
-    def rewrite(self, root, context) -> LogicalNode | None: ...
-```
-
-A rule gets the whole plan and returns a new root, or `None` if
-nothing changed. `apply_logical_rules` runs the rules in order and
-repeats until a pass leaves the plan unchanged or four passes have
-run. The limit is `MAX_PASSES` in `logical_optimizer.py`. See
-[rule order and precedents](/docs/extending/operators#optional-logical-and-physical-rules).
-
-Quail includes one built-in logical rule:
-
-- **[Projection pushdown](https://github.com/fsdatalab/quail/blob/main/quail/planner/logical_rules.py)**
-  (`ProjectionPushdown`): rewrites each `Scan` to load only the
-  columns the query actually uses.
-
-Other optimizations like filter ordering and join ordering currently
-happen in the [planner](/docs/architecture/planning), because they
-depend on cost estimates from the model and device specs. They could
-also be expressed as logical rules.
-
-Filter placement (filters above their scans, before joins) is
-handled during plan construction in
-[`LogicalPlanBuilder`](https://github.com/fsdatalab/quail/blob/main/quail/logical/nodes.py).
-
-Extensions can register additional rules through
-`registry.register_logical_rule(...)`.
+Logical rules rewrite the plan before physical planning. See the
+[optimizer](/docs/architecture/optimizer#built-in-rules) for the built-in rules
+and [Rules](/docs/extending/rules) for the extension interface.

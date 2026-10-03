@@ -2,216 +2,183 @@
 title: Execution
 ---
 
-All queries run inside a
-[session](/docs/user-guide/sessions). The session loads the model,
-allocates the KV arena, and keeps tokenized documents in memory.
-When `run()` or `collect()` is called, the
-[planner](/docs/architecture/planning) produces a physical plan and
-the execution engine runs it.
+Quail executes the operators selected by the physical plan. The CPU
+coordinates their inputs and outputs. The GPU performs model inference.
 
-The engine overlaps CPU and GPU work: while the GPU processes the
-current forward pass, the CPU prepares the next one.
+This page explains how the Quail backend schedules document and pair
+evaluations and reuses saved model data between operations. See [Physical plans](/docs/architecture/physical-plans) for an
+example plan.
 
-## The runner
+## Operator scheduling
 
-[`GenericRunner`](https://github.com/fsdatalab/quail/blob/main/quail/execution/runner.py)
-walks the physical plan's nodes in topological order. For each node
-it calls the registered runtime, checks the output ports, records
-metrics, and notifies any observers.
+### The runner
 
-Relational nodes (`Recombine`, `Project`, `Limit`) run on the CPU
-using Arrow. Model nodes (`AiFilter`, `AiJoin`) run on the GPU
-using the execution loop described below.
+The *runner* coordinates the operators in the plan. It runs an operator
+when the operator's required inputs are available.
 
-## Operator execution
+- Model operators, such as classification, use the GPU.
+- Operations that test computed labels or select result columns use
+  Apache Arrow on the CPU.
+- Compatible operators can pass documents to one another before they
+  finish processing the whole input table.
 
-### Filter execution
+### Pipelines and batches
 
-The filter loop fills each GPU forward pass using two budgets: a
-token budget and a KV page budget.
+A *pipeline* is a group of operators that can pass documents to one
+another before they finish processing the whole input table.
+*KV* is the key and value vectors saved for tokens the model has already
+processed. Quail can keep a document's KV available as it passes through
+the pipeline.
 
-- **Pipelining.** A document that passes one predicate enters the
-  next forward pass with its next predicate immediately. It does not
-  wait for every other document to finish the current predicate.
-- **Token-based admission.** The engine packs documents into each
-  forward pass until the token budget or the KV page budget is full
-  (the token budget is the bottleneck for queries with many short
-  documents; the KV page budget is the bottleneck for queries with
-  fewer long documents). A forward pass with short documents fits
-  more documents than a forward pass with long documents.
-- **KV rewind.** Each predicate appends question tokens after the
-  document. Once the model answers, Quail drops the KV for the
-  question tokens and keeps only the KV for the document prefix.
-  The next predicate reuses the document prefix KV and appends its
-  own question tokens. A document that fails (returns FALSE) or
-  won't be used again in the query has all its KV freed.
+For example, imagine a `reviews` table containing review text. A query
+first keeps reviews that discuss the acting, then classifies their
+sentiment, then keeps negative reviews. In a pipeline:
 
-### Prefix sharing
+1. A review reaches classification as soon as it passes the first filter.
+2. Classification reuses the review's KV and adds the sentiment question.
+3. The CPU tests the returned label and keeps the review if it is negative.
 
-Quail uses **prefix caching** to avoid recomputing identical beginnings
-of documents. For example, agent traces saved after successive turns
-repeat earlier turns. Quail can reuse KV for those repeated tokens.
+A *model request* is the model computation needed for one document or
+pair at one stage of execution. A *batch* combines model requests that
+can be processed together. Requests from different pipeline stages can
+share a batch.
 
-- The planner enables caching automatically when its estimated compute
-  savings exceed the extra cost of writing KV.
-- Filters share document prefixes. Joins share prefixes between anchors.
-  Reuse is limited to documents on the same GPU.
-- If the needed KV is unavailable, Quail computes the tokens again.
-  Filters executing with a row limit skip sharing to preserve row order.
+A *forward pass* processes a batch's new tokens through the model,
+using any saved KV. The CPU prepares the next batch while the GPU
+processes the current batch.
 
-See the [prefix caching design](/docs/architecture/prefix-caching)
-for the data structure, example, and precedents, and
-[Planning](/docs/architecture/planning#deciding-whether-to-share-prefixes)
-for the cost comparison.
+Quail limits each batch by token count and available KV memory:
 
-### Join execution
+- The *token budget* limits how many new token positions a forward pass
+  can process. Shorter requests allow more documents to fit in a batch.
+- The *KV budget* limits the GPU memory used for saved KV. Long documents
+  can fill that memory before the token budget is reached.
 
-Recall from [Planning](/docs/architecture/planning#deciding-join-order-and-anchors)
-that the planner picks one side of a join as the *anchor* (the table
-with longer documents, whose KV stays in GPU memory) and the other
-as the *partner* (the table whose documents stream past). During
-execution, Quail processes each anchor document once, keeps its KV
-in the GPU arena, and then evaluates the join prompt for each
-partner by appending only the partner's tokens to the anchor's
-resident KV. Multiple partners fit in the same forward pass, all
-sharing one anchor's KV.
+An operator that requires all its input rows ends a pipeline. Later
+operators wait until those rows are available.
 
-- **Streaming from filters.** A document that passes its last filter
-  predicate does not wait for the filter to finish over all
-  documents. Quail keeps the document's KV pinned and starts
-  evaluating join partners against it right away.
-- **Gating.** After evaluating all partners for a group of anchors,
-  Quail drops any anchor that matched no partner and frees its KV.
-- **KV retention across joins.** When a query has multiple joins in
-  sequence, Quail keeps anchor document KV from earlier joins so it
-  can be reused in later joins without reprocessing. If GPU memory
-  runs out, Quail evicts the least valuable KV and reprocesses the
-  document later.
+## Query operations
 
-## Model forward pass
+### Filters
 
-A single filter or join operator may require hundreds or thousands
-of model forward passes. The operator loops above pack documents
-(for filters) or anchor-partner pairs (for joins) into batches and
-submit each batch as one forward pass on the GPU.
+A model filter can ask several TRUE or FALSE questions about each document.
+Quail processes the document and the first question together. A document
+that fails a question stops there. A document that passes continues to the
+next question.
 
-Quail loads the model using
-[vLLM's weight loader](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/model.py),
-which handles checkpoint download, weight merging (QKV and gate-up
-projections), and FP8 quantization layout for DeepGEMM. No vLLM
-engine, scheduler, or KV pool is used — Quail uses vLLM only as a
-library for loading weights and running GPU kernels.
+After each answer, Quail removes the question's KV and keeps the document's
+KV. Removing the added KV while keeping the document's KV is called
+*KV rewind*. The next question reuses the document's KV.
 
-Each forward pass processes a packed chunk of tokens through every
-model layer. For each layer:
+A passing document can reach a later operator in the same pipeline without
+waiting for the filter to finish over the rest of the table.
+See [KV](/docs/architecture/kv) for how Quail stores and reuses KV.
 
-1. **RMSNorm + FP8 quantize** the input hidden state.
-2. **QKV projection** via DeepGEMM (FP8 matrix multiply).
-3. **QK-norm and RoPE** to produce query and key vectors.
-4. **Attention** over the new tokens and any resident KV in the
-   arena, by one of the two [attention paths](#attention-paths).
-5. **Output projection** via DeepGEMM.
-6. **MLP** (gate-up projection, SiLU activation, down projection).
+### Joins
+
+A model join evaluates a question about a pair of documents. The planner
+chooses one side as the *anchor*, whose document KV remains available
+while Quail evaluates documents from the other side. A document from the
+other side is a *partner*.
+
+For example, imagine joining a `reviews` table with an `aspects` table.
+Each aspect describes a subject such as acting or plot. The join asks
+whether each review discusses each aspect. If reviews are the anchors,
+Quail processes a review and the fixed join instructions once, then reuses
+that KV when evaluating its aspects. The result contains review and
+aspect pairs for which the model answers TRUE.
+
+Several partners can be evaluated in the same batch. Each partner uses
+the anchor's KV and its own tokens. Partners do not use one another's tokens.
+
+An anchor that passes a filter in the same pipeline can enter the join
+with its document KV already available. A later join can also reuse that
+KV if the plan keeps it. See [KV retention](/docs/architecture/kv#kv-retention).
+
+### Classification
+
+Classification assigns one of the supplied labels to each input row.
+It can run in a pipeline and reuse document KV from preceding operators.
+The selected scoring method determines whether classification needs one
+or several forward passes.
+
+#### Label scoring
+
+*Label scoring* determines how the model selects one of the supplied
+classification labels. Quail supports three methods. The
+[optimizer selects a method](/docs/architecture/optimizer#label-scoring)
+using estimated GPU time. The methods can return different labels because
+they score the choices differently.
+
+For example, imagine classifying customer messages as `refund` or `praise`.
+Quail can select between these labels in three ways:
+
+| Method | How it selects a label | Requirement |
+| --- | --- | --- |
+| `letters` | Give each label a distinct letter in the prompt, then compare the model's scores for those letters. | Each letter must be one token. |
+| `trie_tree` | Score each label's token sequence and choose the highest sequence probability. Labels with common starting tokens share computation. | [Tree attention](#attention-paths) must be available. |
+| `trie_decode` | Choose the allowed token with the highest score at each step until a label is complete. Only tokens that continue a supplied label are allowed. | No label's token sequence can be the start of another label's token sequence. |
+
+A *trie* is a tree of token sequences in which common starting tokens are
+stored together. `trie_tree` evaluates every label sequence.
+`trie_decode` follows one sequence, so it can choose a different label
+from the one with the highest probability for its complete sequence.
+
+For example, suppose `refund` has two tokens. The first has probability
+0.8, and the second has probability 0.6 after the first. The sequence
+probability is 0.48. If the single token label `praise` has probability
+0.3, `trie_tree` selects `refund`.
+
+Additional requirements apply:
+
+- `trie_decode` requires a model without extra answer positions and a
+  classification that does not reuse document KV from an earlier operator.
+- Requesting probabilities excludes `trie_decode`, because it does not
+  score every label.
+- Classifications of joined pairs use `letters`.
+- DiffusionGemma uses `letters` with its extra answer positions. See
+  [DiffusionGemma](/docs/user-guide/models#diffusiongemma) for configuration.
+
+#### Classifying joined rows
+
+Classification can also read both documents of a joined pair. It runs
+in the join's pipeline, on one GPU, and classifies only pairs that the
+join kept. It reuses the anchor's KV when processing each pair.
+
+## GPU execution
 
 ### Attention paths
 
-Several documents can attend to the same KV. In a join, each partner
-attends to the anchor. With prefix caching, each document attends
-to the prefix supplied by its parent.
+During *attention*, the model combines information from the current token
+and earlier tokens. A *prefix* is the token sequence at the start of a
+request. Quail supports two attention paths for filters and joins:
 
-- **Unified attention** uses one call. Each document attends to its
-  prefix and its new tokens as a separate sequence.
-- **Tree attention** uses two calls. One handles attention to the
-  shared prefix, grouping documents that read the same KV. The other
-  handles attention to each document's own tokens. A GPU kernel
-  combines the results.
+- *Unified attention* processes a request's saved prefix and new tokens
+  in one attention call.
+- *Tree attention* processes shared prefixes in one call and each
+  request's own tokens in another. Quail combines the two results.
 
-Grouping reads can reduce memory traffic for shared KV. It also adds
-a call and a merge step, so it is not always faster. Actual memory
-reads depend on the attention kernel; grouping does not guarantee
-that each KV value is read from GPU memory only once.
+Tree attention groups requests that use the same saved KV. Grouping can
+reduce memory reads, but the additional call and combination take time.
+The [planner compares those costs](/docs/architecture/optimizer#attention-path)
+when choosing a path.
 
-The planner enables the tree path only for models with FP8 weights
-and no canvas tokens, the extra rows used by DiffusionGemma. Other
-models use unified attention. See the
-[attention cost comparison](/docs/architecture/planning#choosing-the-attention-path).
+*FP8* is a number format that uses eight bits per value. Tree attention
+requires FP8 weights and a model without extra answer positions.
+DiffusionGemma uses extra answer positions, so it uses unified attention. See [Supported models](/docs/user-guide/models).
 
-The `tree` attention path is a choice of attention computation.
-SGLang's RadixAttention names a prefix caching mechanism; it is not
-another name for this path.
+### Multiple GPUs
 
-Quail uses vLLM's model implementation and DeepGEMM for the main
-matrix multiplications, but writes its own Triton JIT kernels to
-fuse several small operations: RMSNorm + FP8 quantize, QK-norm +
-RoPE, SiLU + FP8 quantize, and the attention merge + FP8 quantize
-for joins. These fused kernels reduce the number of GPU kernel
-launches per layer.
+Each GPU holds a complete model copy and its own KV. A *coordinator* is
+the process that divides the work among GPU workers and collects their
+results.
 
-Every predicate returns a single token: TRUE or FALSE. Multiple
-tokenizations count (e.g., "TRUE", " TRUE", "True"), so there are
-several token IDs per side. At model load time, Quail keeps only
-the vocabulary matrix rows for all TRUE and FALSE token IDs and
-discards the rest of the output head. Each forward pass scores only
-those rows. The predicate passes if the best TRUE token scores
-higher than the best FALSE token.
+- For filters, it assigns documents using their token lengths to balance
+  work across GPUs.
+- For joins, anchors stay on the GPU that filtered them so their KV can
+  be reused. Each GPU receives the partner documents needed for its anchors.
+- Between groups of joins, it combines the results and distributes the
+  next group's anchors.
 
-Quail uses [FlashAttention 3](https://arxiv.org/abs/2407.08608) on
-H100 and FlashAttention 2 on Blackwell GPUs.
-
-## Multiple GPUs
-
-When a session uses multiple GPUs (e.g., `gpus=4`), each GPU loads
-its own copy of the model and has its own KV arena. A coordinator
-CPU process divides the work and collects results.
-
-- **Filters**: the coordinator splits the documents across GPUs by
-  token length, so each GPU processes a roughly equal amount of
-  work. Each GPU runs the filter independently on its shard.
-- **Joins**: each anchor document stays on the GPU that filtered it
-  (so its KV is already resident). The coordinator sends all
-  surviving partner documents to every GPU, so each GPU can evaluate
-  its anchors against all partners.
-- **Between join groups**: the coordinator collects the results from
-  all GPUs, drops documents that matched no partner, and
-  redistributes the next join group's anchor documents across GPUs.
-
-## Change the GPU execution code
-
-You can find the GPU executor in
-[quail/backends/quail/executor/](https://github.com/fsdatalab/quail/tree/main/quail/backends/quail/executor).
-Use these files to change how Quail runs your query.
-
-| To change | Edit |
-| --- | --- |
-| Which documents and pairs enter a batch | [`pack.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/pack.py) |
-| How Quail allocates, keeps, and frees KV pages | [`arena.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/arena.py) |
-| GPU kernels and attention calculations | [`attention.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/attention.py) |
-| The Qwen3 forward pass | [`models/qwen3.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/models/qwen3.py) |
-| How filter and join batches run | [`loop.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/loop.py) |
-| How model outputs become Boolean answers or `AI.SCORE` values | [`readout.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/readout.py) |
-| How Quail loads model weights through vLLM | [`model.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/model.py) |
-
-If you add a model architecture, put its forward pass in `models/`.
-Register it in `models/__init__.py` and set `ModelSpec.arch` to that
-name. You also need kernels for any operations the current engine
-does not support.
-
-Before you reuse the fused kernels in `attention.py`, check your
-model's operations. The kernels assume QK-norm before RoPE, a gated
-SiLU MLP, and FP8 block-quantized weights.
-
-Keep KV allocation and cleanup in the execution loop. Your model's
-forward pass should only compute the requested hidden states. Use
-`chunk.attention_mode` for the attention path chosen when the chunk
-was packed.
-
-## Lifetime and limits
-
-Within one session, the model stays loaded in GPU memory and
-tokenized documents are reused across queries. Collect results
-before closing the session, because row projection reads from the
-session's temporary files. `Session.close()` waits for background
-tokenization and releases temporary files.
-
-- Temporary token files must fit on local disk.
-- At most 8 GPUs in one host.
+Quail supports up to eight GPUs on one host. Each GPU holds all model
+weights; the weights are not divided between GPUs.

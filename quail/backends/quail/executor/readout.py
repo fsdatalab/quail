@@ -85,6 +85,122 @@ class AsyncAnswers:
         return [int(b) for b in host.tolist()]
 
 
+def answer_rows(rows_per_answer) -> tuple[np.ndarray, np.ndarray]:
+    """Return each read row's answer and its row within that answer.
+
+    Args:
+        rows_per_answer: The rows each answer reads, in order.
+
+    Returns:
+        (answer index, row index), one entry per read row.
+    """
+    counts = np.asarray(rows_per_answer, dtype=np.int64)
+    starts = np.repeat(np.cumsum(counts) - counts, counts)
+    return (np.repeat(np.arange(len(counts)), counts),
+            np.arange(int(counts.sum())) - starts)
+
+
+class AsyncLabelLogprobs:
+    """Asynchronous readout of selected tokens' log probabilities or logits.
+
+    With normalize=True, each token's log probability is normalized over
+    the full vocabulary at temperature 1. Computation uses blocks of rows
+    to bound memory usage. With normalize=False, only the selected output
+    head rows are evaluated and the results are unnormalized logits.
+
+    Args:
+        torch: Torch module.
+        F: Torch functional module.
+        head: Full output head with shape (vocabulary, hidden size).
+        targets: Token IDs to return, in column order.
+        rows: Maximum rows per answer. Unused rows are filled with NaN.
+        normalize: Whether to normalize against the full vocabulary.
+    """
+
+    # rows per head block: every block reads the whole head, so few big
+    # blocks; 512 x 151,936 logits in bf16 and float32 are 445 MiB
+    BLOCK_ROWS = 512
+
+    def __init__(self, torch, F, head, targets, rows=1, normalize=True):
+        self.torch = torch
+        self.F = F
+        self.head = head
+        self.targets = torch.tensor(list(targets), device=head.device,
+                                    dtype=torch.long)
+        self.rows = rows
+        self.normalize = normalize
+        self.head_rows = None if normalize else head.index_select(
+            0, self.targets)
+        self.dtype = np.dtype((np.float32, (rows, len(targets)) if rows > 1
+                               else (len(targets),)))
+        self.available = []
+
+    def logprobs(self, normed):
+        """Compute selected token values from normalized hidden states.
+
+        Args:
+            normed: Hidden states with shape (rows, hidden size).
+
+        Returns:
+            A float32 device tensor with shape (rows, targets). Values are
+            full-vocabulary log probabilities when normalize is enabled and
+            unnormalized logits otherwise.
+        """
+        torch = self.torch
+        if not self.normalize:
+            return self.F.linear(normed.to(self.head.dtype),
+                                 self.head_rows).float()
+        out = torch.empty((normed.shape[0], len(self.targets)),
+                          dtype=torch.float32, device=normed.device)
+        for start in range(0, normed.shape[0], self.BLOCK_ROWS):
+            block = normed[start:start + self.BLOCK_ROWS]
+            logits = self.F.linear(block.to(self.head.dtype), self.head).float()
+            norm = torch.logsumexp(logits, dim=1, keepdim=True)
+            out[start:start + block.shape[0]] = (
+                logits.index_select(1, self.targets) - norm)
+        return out
+
+    def submit(self, normed, rows_per_answer=None):
+        torch = self.torch
+        values = self.logprobs(normed)
+        if self.rows > 1:
+            if rows_per_answer is None:
+                rows_per_answer = [1] * values.shape[0]
+            if max(rows_per_answer) > self.rows:
+                raise ValueError(
+                    f"a suffix has {max(rows_per_answer)} rows to read; "
+                    f"the readout holds {self.rows}")
+            answers = torch.full((len(rows_per_answer), self.rows,
+                                  values.shape[1]), float("nan"),
+                                 dtype=torch.float32, device=values.device)
+            # copied from pinned memory, so the host does not wait for
+            # the forward pass ahead of the copy on the stream
+            answer_index, row_index = (
+                torch.from_numpy(index).pin_memory().to(
+                    values.device, non_blocking=True)
+                for index in answer_rows(rows_per_answer))
+            answers[answer_index, row_index] = values
+            values = answers
+        elif rows_per_answer is not None and any(
+                n != 1 for n in rows_per_answer):
+            raise ValueError("this readout holds one row per answer")
+        host = self.available.pop() if self.available else None
+        if host is None or host.shape[0] < values.shape[0]:
+            host = torch.empty(values.shape, dtype=torch.float32,
+                               pin_memory=True)
+        host[:values.shape[0]].copy_(values, non_blocking=True)
+        event = torch.cuda.Event()
+        event.record()
+        return event, host, values.shape[0]
+
+    def result(self, handle):
+        event, host, count = handle
+        event.synchronize()
+        values = host[:count].numpy().copy()
+        self.available.append(host)
+        return values
+
+
 class AsyncScores:
     """Non-blocking yes-against-no sigmoid readout for AI.SCORE."""
 

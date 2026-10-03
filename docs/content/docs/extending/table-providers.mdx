@@ -2,38 +2,36 @@
 title: Custom data sources
 ---
 
-A table provider supplies documents from any storage system. Implement
-the `TableProvider` protocol and register it on the session.
+A *table provider* supplies table data to Quail as Arrow record batches.
+Implement `TableProvider` when your source needs its own reader.
+For Arrow tables, Parquet, Arrow IPC, and Hugging Face datasets, use the
+[built-in providers](/docs/user-guide/sessions#registering-tables).
 
-## The protocol
+## Implement a provider
+
+Quail saves tokenized document text for reuse in later queries.
+A *content identity* is a string that identifies the version of the data
+used to produce those tokens. If the data changes, the identity must change
+so Quail reads and tokenizes the updated data.
+
+For example, imagine that an application stores reviews as Python
+dictionaries with `id` and `body` fields. The following provider keeps a
+fixed snapshot of those rows and reads requested columns in batches:
 
 ```python
+from uuid import uuid4
+
 import pyarrow as pa
-from quail.catalog import ScanRequest, TableStatistics
+
+from quail.catalog import ScanRequest, TableProvider, TableStatistics
 
 
-class TableProvider:
-    id_col: str
-
-    @property
-    def columns(self) -> tuple[str, ...]: ...
-    def schema(self) -> pa.Schema: ...
-    def content_identity(self) -> str: ...
-    def statistics(self) -> TableStatistics: ...
-    def scan(self, request: ScanRequest) -> pa.RecordBatchReader: ...
-```
-
-Source:
-[quail/catalog.py](https://github.com/fsdatalab/quail/blob/main/quail/catalog.py).
-
-## Example: Arrow rows
-
-```python
-class RowsProvider:
+class RowsProvider(TableProvider):
     id_col = "id"
 
     def __init__(self, rows: list[dict]):
         self._table = pa.Table.from_pylist(rows)
+        self._identity = f"rows:{uuid4().hex}"
 
     @property
     def columns(self):
@@ -43,29 +41,47 @@ class RowsProvider:
         return self._table.schema
 
     def content_identity(self):
-        return f"rows:{len(self._table)}"
+        return self._identity
 
     def statistics(self):
-        return TableStatistics(row_count=len(self._table))
+        return TableStatistics(
+            row_count=self._table.num_rows,
+            byte_count=self._table.nbytes,
+        )
 
     def scan(self, request: ScanRequest):
+        if request.filter is not None:
+            raise ValueError("RowsProvider does not support scan filters")
         table = self._table.select(list(request.columns))
         if request.limit is not None:
             table = table.slice(0, request.limit)
         return table.to_reader(max_chunksize=request.batch_rows)
-
-
-session.register("docs", RowsProvider(rows))
 ```
 
-## Key points
+## Register the provider
 
-- `content_identity()` must change when the content changes. The
-  session uses it to decide whether to re-tokenize.
-- `scan()` returns bounded batches for only the columns in
-  `request.columns`. The session tokenizes the document column and
-  writes tokens and projected columns to a temporary file. Batches
-  are released as they are written, so the source can be larger than
-  process memory.
-- On Modal, create providers inside the GPU function. Attach
-  credentials through the function's `secrets` argument.
+With an existing session, register the provider as a table:
+
+```python
+session.register("reviews", RowsProvider([
+    {"id": "r1", "body": "The acting was excellent."},
+    {"id": "r2", "body": "The plot was confusing."},
+]))
+```
+
+The table name `reviews` is available to SQL and the Python query builder.
+
+## Requirements
+
+- `content_identity()` must change when the values, row order, or schema
+  change. The example gives each fixed snapshot a distinct identity.
+  If the reviews change, pass the updated rows to a new `RowsProvider`.
+- `scan()` must return the requested columns, respect the row limit,
+  and keep batches within `request.batch_rows`.
+- Apply supported scan filters before the row limit. Reject unsupported
+  filters instead of ignoring them.
+- For sources that do not fit in memory, read the source in batches.
+  The example keeps its source table in memory.
+
+See [`quail/catalog.py`](https://github.com/fsdatalab/quail/blob/main/quail/catalog.py)
+for the interface and built-in implementations.

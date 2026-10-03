@@ -13,27 +13,26 @@ from quail.execution.pairs import (
     pair_partner,
     partner_map,
 )
-from quail.execution.reranker import ScoreFilterRuntime
+from quail.execution.pipelines import build_pipelines
+from quail.execution.reranker import FilterRuntime
 from quail.execution.runner import (
     ExecutionContext,
     GenericRunner,
     ModelNodeRuntime,
     NodeMetrics,
     NodeResult,
-    StreamedPairs,
-    SurvivorStream,
     compute_subgraph,
     scalar_node_metrics,
 )
-from quail.execution.tokens import DocumentPrefixes, chain_tokens
+from quail.execution.tokens import DocumentKeys, DocumentPrefixes, chain_tokens
 from quail.execution.types import export_physical_outputs
 from quail.physical import (
     AiFilter,
     AiJoin,
     AiScore,
+    Filter,
     PhysicalGraph,
     Scan,
-    ScoreFilter,
 )
 from quail.progress import answer_sink
 
@@ -45,7 +44,7 @@ def quail_runtimes() -> dict:
         AiFilter.runtime_key: model_runtime,
         AiJoin.runtime_key: model_runtime,
         AiScore.runtime_key: model_runtime,
-        ScoreFilter.runtime_key: ScoreFilterRuntime(),
+        Filter.runtime_key: FilterRuntime(),
     }
 
 
@@ -141,11 +140,21 @@ def stage_partner_lists(group, lists_for, anchor_ids) -> list:
 
 def filter_result(node, answers, tokens, document_ids,
                   gpu_s: float = 0.0, chunks: int = 0,
-                  borrowed_tokens: int = 0) -> NodeResult:
-    """Build one filter chain's node result from its local answers.
+                  borrowed_tokens: int = 0, pack_s: float = 0.0) -> NodeResult:
+    """Build a filter result using global document IDs and execution metrics.
 
-    borrowed_tokens are document tokens read from another document's
-    KV pages instead of computed (prefix sharing).
+    Args:
+        node: Physical filter node.
+        answers: Mapping from local document index to Boolean stage answers.
+        tokens: Fresh tokens processed by the model.
+        document_ids: Global document IDs in local index order.
+        gpu_s: Forward-pass GPU seconds.
+        chunks: Number of timed forward passes.
+        borrowed_tokens: Prefix tokens read from another document's KV.
+        pack_s: Host seconds spent building forward chunks.
+
+    Returns:
+        A NodeResult containing surviving IDs, filter answers, and metrics.
     """
     global_answers = {
         document_ids[int(local)]: row
@@ -168,8 +177,11 @@ def filter_result(node, answers, tokens, document_ids,
             fresh_tokens=tokens,
             gpu_s=gpu_s,
             chunks=chunks,
-            extension=({"borrowed_prefix_tokens": borrowed_tokens}
-                       if borrowed_tokens else {}),
+            extension={
+                **({"borrowed_prefix_tokens": borrowed_tokens}
+                   if borrowed_tokens else {}),
+                **({"pack_s": round(pack_s, 3)} if pack_s else {}),
+            },
         ),
     )
 
@@ -210,47 +222,52 @@ def filter_inputs(state, node, document_ids) -> dict:
     }
 
 
-def prepare_model_inputs(node, inputs, context: ExecutionContext):
-    """Prepare Quail scheduler inputs from typed port values."""
+def prepare_model_inputs(node, inputs, context: ExecutionContext,
+                         chain=None):
+    """Convert graph input ports into backend scheduler inputs.
+
+    Args:
+        node: Physical operator to execute.
+        inputs: Port values supplied by preceding operators.
+        context: Execution context containing document tokens and settings.
+        chain: Optional preceding pipeline state for a join, containing its
+            documents, document IDs, operator parts, and selected pairs.
+
+    Returns:
+        A scheduler input mapping for filters, joins, and scores. Other
+        operators receive the original input mapping.
+    """
     if isinstance(node, AiScore):
-        return {"score_inputs": inputs, "documents": context.state["docs"]}
+        return {"score_inputs": inputs, "documents": context.state["docs"],
+                "pre": context.state.get("pre", []),
+                "gpu_timing": context.state.get("gpu_timing", False)}
     if not isinstance(node, (AiFilter, AiJoin)):
         return inputs
     return {
-        **_model_inputs(node, inputs, context),
+        **_model_inputs(node, inputs, context, chain),
         "gpu_timing": context.state.get("gpu_timing", False),
     }
 
 
-def _model_inputs(node, inputs, context: ExecutionContext) -> dict:
+def _model_inputs(node, inputs, context: ExecutionContext, chain=None) -> dict:
     state = context.state
     if isinstance(node, AiFilter):
         return filter_inputs(state, node, next(iter(inputs.values())))
 
-    stream = None
     by_alias = {}
     port_pairs = {}        # written position -> pair table from a port
-    streamed_pairs = {}    # written position -> StreamedPairs
+    chain_pairs = {} if chain is None else chain["pairs"]
     for input_port in node.inputs:
         port = input_port.source.port
+        if input_port.name not in inputs:
+            continue           # fed by the chain itself
         value = inputs[input_port.name]
         if port.startswith("pairs:"):
-            position = int(port.split(":", 1)[1])
-            if isinstance(value, StreamedPairs):
-                streamed_pairs[position] = value
-            else:
-                port_pairs[position] = value
+            port_pairs[int(port.split(":", 1)[1])] = value
             continue
         if not port.startswith("ids:"):
             continue
-        alias = port.split(":", 1)[1]
-        if isinstance(value, SurvivorStream):
-            if alias != node.anchor or not isinstance(value.node, AiFilter):
-                raise TypeError(
-                    "only the anchor's filter chain streams into a join")
-            stream = value
-        else:
-            by_alias[alias] = list(value)
+        by_alias[port.split(":", 1)[1]] = list(value)
     if not state["joins_started"]:
         state["joins_started"] = True
         arena = state["arena"]
@@ -279,24 +296,14 @@ def _model_inputs(node, inputs, context: ExecutionContext) -> dict:
             _tuple_suffix(join, state["docs"], member)
             for member in tuples
         ])
-    # pairs come from the request, a Foreign table, or a per-batch Foreign
-    maps = partner_maps(group, port_pairs, streamed=set(streamed_pairs))
-    for position, pairs in streamed_pairs.items():
-        maps[position] = pairs.rows
+    # pairs come from the request, a Foreign table, or a per-batch
+    # apply in the chain, which fills its rows as documents reach the join
+    maps = partner_maps(group, port_pairs, streamed=set(chain_pairs))
+    maps.update(chain_pairs)
     lists_for = partner_list_builder(
         group, [tuple_indices[stage.written_pos] for stage in node.stages],
         maps)
-    anchor_batch = None
-    if stream is not None and (stream.transforms or streamed_pairs):
-        def anchor_batch(keys, stream=stream):
-            ids = [key[1] for key in keys]
-            for transform in stream.transforms:
-                ids = list(transform(ids))
-            for pairs in streamed_pairs.values():
-                pairs.rows.update(pairs.batch(ids))
-            kept = set(ids)
-            return [key for key in keys if key[1] in kept]
-    if stream is None:
+    if chain is None:
         anchor_ids = by_alias[node.anchor]
         prefixes = [
             chain_tokens(state["pre"], state["docs"][node.anchor][document])
@@ -306,18 +313,13 @@ def _model_inputs(node, inputs, context: ExecutionContext) -> dict:
         round_kv = _join_round_kv(anchor_keys, state["arena"])
         state["kv_stats"]["join_anchor_hits"] += round_kv["hits"]
         state["kv_stats"]["join_anchor_misses"] += round_kv["misses"]
-        anchor_stream = None
     else:
-        # filled by the driver as the chain hands anchors over
+        # every document of the chain is an anchor; the chain's stages
+        # lead the join's, so only its survivors reach them
         anchor_ids = None
-        prefixes = []
-        anchor_keys = []
+        prefixes = chain["documents"]
+        anchor_keys = DocumentKeys(node.anchor, chain["document_ids"])
         round_kv = None
-        anchor_stream = {
-            "node": stream.node,
-            **filter_inputs(state, stream.node, stream.document_ids),
-            "stream": stream,
-        }
 
     last = group[-1]
     last_tuples = tuple_indices[last["written_pos"]]
@@ -363,7 +365,7 @@ def _model_inputs(node, inputs, context: ExecutionContext) -> dict:
         "anchor_keys": anchor_keys,
         "prefixes": prefixes,
         "tuple_indices": tuple_indices,
-        "streamed": stream is not None,
+        "chained": chain is not None,
     }
     return {
         "prefixes": prefixes,
@@ -371,12 +373,11 @@ def _model_inputs(node, inputs, context: ExecutionContext) -> dict:
         "stage_frames": [join.get("frame") or [] for join in group],
         "anchor_keys": anchor_keys,
         "anchor_done": anchor_done,
-        "anchor_stream": anchor_stream,
+        "chain": chain,
         "kv_round": round_kv,
         "anchor_ids": anchor_ids,
         "partner_indices": tuple_indices,
         "anchor_partners": lists_for,
-        "anchor_batch": anchor_batch,
         "group": group,
     }
 
@@ -388,9 +389,9 @@ def record_model_result(node, result: NodeResult,
     if isinstance(node, AiJoin):
         prepared = state["prepared_join"]
         keys = prepared["anchor_keys"]
-        if prepared["streamed"]:
-            # every streamed anchor read its KV from the chain: a hit
-            state["kv_stats"]["join_anchor_hits"] += len(keys)
+        if prepared["chained"]:
+            # every survivor the chain handed over read its KV there
+            state["kv_stats"]["join_anchor_hits"] += result.metrics.kv_hits
         live = set(result.outputs[f"ids:{node.anchor}"])
         for key, prefix in zip(keys, prepared["prefixes"]):
             if state["arena"].is_resident(key):
@@ -436,14 +437,17 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
             "join_anchor_misses": 0,
         },
     }
+    execution = state["model_execution"]
     context = ExecutionContext(
         runtimes=state["runtimes"],
-        model_execution=state["model_execution"],
+        model_execution=execution,
         sources=sources,
         model_inputs=prepare_model_inputs,
         model_result=record_model_result,
         state=runtime_state,
         functions=state.get("functions", {}),
+        pipelines=build_pipelines(graph),
+        run_pipeline=getattr(execution, "execute_pipeline", None),
     )
     started = time.perf_counter()
     with torch.inference_mode():
@@ -478,7 +482,7 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
         "backend_metrics": {"scores": [
             dict(value.metrics.extension)
             for node_id, value in result.nodes.items()
-            if graph.node(node_id).type_name == AiScore.type_name
+            if isinstance(graph.node(node_id), AiScore)
         ]},
         "node_metrics": scalar_node_metrics(result.nodes),
         "executed_join_plan": executed_join_plan(graph),

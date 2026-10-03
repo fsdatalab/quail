@@ -18,6 +18,7 @@ from fakes import fake_pipeline, fake_torch
 
 from quail.backends.quail.executor import loop
 from quail.backends.quail.executor.arena import KVArena
+from quail.backends.quail.executor.stages import Stage, filter_stages, run_stages
 from quail.execution.tokens import prefix_tree
 
 
@@ -403,24 +404,20 @@ def check_feed(docs, question, frame, partners, setup):
         h = chain(doc + question + tail)
         answers[h] = answer(h >> 3)
     run = Run(setup, answers)
-    source = loop.FilterStream(
-        run.torch, run.arena, run.pipeline, passthrough(), docs, [question],
-        setup.budget, arena_writes=True,
-        arena_keys=[("d", i) for i in range(len(docs))],
-        hold_survivors=True, hold_extra_tokens=len(frame) + len(tail),
-        prefix_tree=run.tree(docs), attention_mode=setup.path)
-    keys = []
-    out, _, _ = loop.run_join(
-        run.torch, run.arena, run.pipeline, passthrough(), [], [partners],
-        setup.budget, stage_frames=[frame], anchor_keys=keys,
-        anchor_source=source, attention_mode=setup.path)
+    keys = [("d", i) for i in range(len(docs))]
+    stage_list = filter_stages([question], passthrough()) + [
+        Stage(suffixes=partners, readout=passthrough(), frame=frame)]
+    out, _, _ = run_stages(
+        run.torch, run.arena, run.pipeline, stage_list, docs, setup.budget,
+        anchor_keys=keys, prefix_tree=run.tree(docs),
+        attention_mode=setup.path)
     survivors = {d for d, doc in enumerate(docs)
                  if answers[chain(doc + question + tail)]}
-    assert {key[1] for key in keys} == survivors
-    for a, key in enumerate(keys):
-        doc = docs[key[1]]
-        assert out[0][a] == [answers[chain(doc + frame + p + tail)]
-                             for p in partners], f"anchor {key[1]}"
+    assert set(out[1]) == survivors
+    for d in survivors:
+        doc = docs[d]
+        assert out[1][d] == [answers[chain(doc + frame + p + tail)]
+                             for p in partners], f"anchor {d}"
     assert not run.arena.accounting.owned
 
 

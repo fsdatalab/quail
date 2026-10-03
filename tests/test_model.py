@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 from fakes import cpu_arena, fake_pipeline, fake_torch
 
+from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor import loop, model
 from quail.backends.quail.executor.model import answer_weights, retain_answer_head
 from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers, AsyncScores
@@ -89,14 +90,16 @@ def test_run_join_evicts_then_halves_a_chunk_that_does_not_fit(monkeypatch):
     def pack(torch, arena, specs, **kw):
         if len(specs) > 1 and not failed:
             failed.append(len(specs))
-            raise loop.ArenaFullError("unified suffix pages exceed the free KV arena")
+            raise chunk_mod.ArenaFullError(
+                "unified suffix pages exceed the free KV arena")
         sizes.append(len(specs))
         modes.add(kw["attention_mode"])
         return SimpleNamespace(specs=specs, tokens=len(specs),
                                attention_mode=kw["attention_mode"],
-                               temporary_keys=(), fresh_keys=())
+                               temporary_keys=(), fresh_keys=(),
+                               rows_per_answer=())
 
-    monkeypatch.setattr(loop, "pack_chunk", pack)
+    monkeypatch.setattr(chunk_mod, "pack_chunk", pack)
     arena = cpu_arena(64)
     evictions = []
     monkeypatch.setattr(arena, "evict_retained",

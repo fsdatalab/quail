@@ -105,3 +105,50 @@ def test_rules_that_never_settle_stop_at_the_pass_cap():
 
     assert optimized.root.input.tag == "c"
     assert len(changed) == 5
+
+
+class RecordContext:
+    """Keep the context a session hands its logical rules."""
+
+    name = "record_context"
+
+    def __init__(self):
+        self.seen = []
+
+    def rewrite(self, root, context):
+        self.seen.append(context)
+        return None
+
+
+def test_session_rules_read_statistics_from_the_context():
+    import pyarrow as pa
+
+    import quail
+
+    recorder = RecordContext()
+    session = quail.Session(
+        quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm"),
+        tokenizer=str.split)
+    session.registry.register_logical_rule(recorder)
+    session.register("docs", quail.DocumentProvider.from_table(
+        pa.table({"id": ["a", "b"], "body": ["one", "two three"]}),
+        id_col="id"))
+    query = session.sql(
+        "SELECT d.id FROM docs d WHERE AI_FILTER(PROMPT('ok {0}', d.body))")
+    query.plan()
+    query.wait_for_tokens()
+
+    # the rules ran before the physical planner, on document lengths
+    # estimated while the background thread tokenized the table
+    assert len(recorder.seen) >= 1
+    context = recorder.seen[0]
+    assert context.catalog is session.catalog
+    assert context.engine_config is session.config
+    assert context.model is session.model
+    assert context.device is session.device
+    assert (context.gpu_count, context.backend) == (1, "quail")
+    assert list(context.document_tokens["d"]) == [1, 2]
+    assert context.tokenizer is session.tokenizer
+    assert dict(context.pair_fractions) == {}
+    assert context.physical_context().document_tokens is context.document_tokens
+    session.close()

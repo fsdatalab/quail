@@ -3,11 +3,13 @@
 import contextlib
 import sys
 import types
+import weakref
 from types import SimpleNamespace
 
 import pytest
 
 from quail.backends.quail import worker
+from quail.backends.quail.executor.chunk import InputStaging
 from quail.backends.quail.worker import LoadedGpu
 from quail.builtins import built_in_registry
 
@@ -83,10 +85,35 @@ def test_prepared_boot_is_handed_to_the_query_and_used_once(
     assert gpu.prepared_boot is None
     assert len(boots) == 1
 
+    execution = gpu.execution
+    loaded = execution.loaded_model
+    loaded.label_readout = object()
+    readout = loaded.label_readout
+    staging = loaded.input_staging = InputStaging(gpu.torch)
+    buffers = staging.buffers
+    buffers["tokens"] = object()
+    staging.fixed_tokens[1] = object()
+    query = execution.query
+    query.async_scores = SimpleNamespace(rows=query.answer_rows)
+    query.gpu_timing = True
+    old_query = weakref.ref(query)
+    reranker = execution._reranker_execution({"d": [[1]]})
+    old_reranker = weakref.ref(reranker)
+    del query, reranker
+
     second = worker.execute_quail_payload(
         PAYLOAD, registry, object(), backend, runtime_state)
 
     assert second.metrics["boot_kind"] == "warm"
+    assert old_query() is None and old_reranker() is None
+    assert execution.query.loaded_model is loaded
+    assert execution.query.async_answers is gpu.async_ans
+    assert execution.query.async_scores is None
+    assert execution.query.gpu_timing is False
+    assert loaded.label_readout is readout
+    assert loaded.input_staging is staging
+    assert staging.buffers is buffers and "tokens" in buffers
+    assert not staging.fixed_tokens
     assert len(boots) == 2
     assert runtime_state[("quail", "qwen3-4b-fp8")] is gpu
     resized = []
@@ -94,6 +121,16 @@ def test_prepared_boot_is_handed_to_the_query_and_used_once(
         resize=lambda *pages, **kw: resized.append((pages, kw)))
     gpu.bind_query([1], [2], 4096, arena_pages=(8, 2))
     assert resized == [((8, 2), {"free_resident": True})]
+    execution.bind_loaded_model(model=object(), arena=gpu.arena,
+                                pipeline=gpu.pipeline)
+    assert execution.loaded_model is not loaded
+    assert execution.loaded_model.label_readout is None
+    assert execution.loaded_model.input_staging is None
+    with pytest.raises(RuntimeError, match="no bound query"):
+        execution.query
+    replacement = weakref.ref(execution.loaded_model)
+    execution.close()
+    assert replacement() is None
 
 
 def test_release_clears_cuda_state_and_a_new_model_boot_triggers_it(monkeypatch):

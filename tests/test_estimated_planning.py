@@ -107,8 +107,6 @@ def test_prefix_sharing_and_attention_path_are_decided_from_exact_tokens():
     refined = query.plan()
     chain = next(n for n in refined.nodes if n.type_name == "quail.ai_filter")
     assert chain.share_prefixes and chain.arena_writes
-    assert any("once the documents were tokenized" in remark
-               for remark in refined.remarks)
     # nothing left to refine: the plan is stable
     query.wait_for_tokens()
     assert query.plan() is refined

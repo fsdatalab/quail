@@ -42,10 +42,26 @@ class PlanningContext:
     document_tokens: Mapping[str, Any]
     backend: str
     order: str | None = None
+    # the most noise draws a diffusion model averages per letters read
+    # and per one-table AI.SCORE
+    canvas_draws: int = 4
+    # an attention path forced for every filter and join; None lets
+    # the planner choose per node
+    attention: str | None = None
     tokenizer: Callable[[str], Any] | None = None
     # join written position -> its equality pairs as a fraction of
     # the cross product; joins without conditions are absent
     pair_fractions: Mapping[int, float] = field(default_factory=dict)
+    # the logical plan the graph was planned from; None when the rules
+    # run again over a finished plan
+    logical_plan: Any = None
+    # the plan's settings as the rules see them; a rule adds what the
+    # executor needs for its decision, such as the KV retention
+    # schedule, and the planner puts the result on the plan
+    settings: dict = field(default_factory=dict, compare=False, repr=False)
+    # results computed once per query, such as the plan's statistics,
+    # shared with the logical rules that planned it
+    memo: dict = field(default_factory=dict, compare=False, repr=False)
 
 
 @dataclass(frozen=True)

@@ -143,7 +143,9 @@ def test_physical_extensions_plan_validate_and_execute(monkeypatch):
     assert backend.called
     assert planner.called
     assert plan.settings["planner_source"] == "preferred planner"
-    assert "physical rule keep_first_document" in plan.remarks[0]
+    # the registered extension rule rewrote the planner's node
+    firsts = [node for node in plan.nodes if isinstance(node, FirstDocuments)]
+    assert firsts and all(node.count == 1 for node in firsts)
     assert decode_graph(envelope["graph"], registry.codecs) == plan.graph
 
     registry = built_in_registry()

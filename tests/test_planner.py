@@ -13,21 +13,27 @@ from quail.backends.quail import expected_join_stages
 from quail.catalog import Catalog, DocumentProvider
 from quail.cost.sol import speed_of_light
 from quail.cost.work import ask, scan, stream
+from quail.execution.pipelines import build_pipelines
 from quail.frontend.builder import col, docs, prompt
+from quail.logical import SemanticJoin
 from quail.physical import (
     AiFilter,
     AiJoin,
     Barrier,
     Foreign,
-    GraphValidationError,
     PhysicalGraph,
     PortRef,
     Project,
     Scan,
-    validate_streams,
 )
 from quail.physical.base import input_ports
-from quail.planner.decide import explain, filter_cost, order_filters, plan_query
+from quail.planner.decide import explain, plan_query, refine_plan
+from quail.planner.filters import filter_cost, order_filters
+from quail.planner.logical_optimizer import (
+    LogicalPlanningContext,
+    apply_logical_rules,
+)
+from quail.planner.logical_rules import built_in_logical_rules
 from quail.planner.plan import EngineConfig, Refusal
 from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8
 
@@ -79,8 +85,24 @@ def _cell(text, title):
     raise AssertionError(f"no row starts with {title!r}")
 
 
-def _plan(logical, doc_tokens, **kwargs):
-    return plan_query(logical, model=QWEN3_4B_FP8, device=H100_SXM,
+def _optimize(logical, doc_tokens, model=QWEN3_4B_FP8, **kwargs):
+    """Run the built in logical rules as a session would.
+
+    Returns:
+        The optimized plan and the names of the rules that changed it.
+    """
+    context = LogicalPlanningContext(
+        None, None, model=model, device=H100_SXM,
+        gpu_count=kwargs.get("gpus", 1), document_tokens=doc_tokens,
+        order=kwargs.get("order"), tokenizer=tok,
+        pair_fractions=kwargs.get("pair_fractions") or {})
+    return apply_logical_rules(logical, built_in_logical_rules(), context)
+
+
+def _plan(logical, doc_tokens, model=QWEN3_4B_FP8, **kwargs):
+    """Plan as a session would: the logical rules, then the physical planner."""
+    optimized, _ = _optimize(logical, doc_tokens, model, **kwargs)
+    return plan_query(optimized, model=model, device=H100_SXM,
                       doc_tokens=doc_tokens, **kwargs)
 
 
@@ -96,8 +118,7 @@ def test_gpu_copies_and_memory_refusals(catalog):
     logical = _five_filter_plan(catalog, (0.5,))
     for model in (QWEN3_4B_FP8, QWEN3_32B_FP8):
         for gpus in (1, 2, 4, 8):
-            plan = plan_query(logical, model=model, device=H100_SXM,
-                              doc_tokens={"r": [100] * 8}, gpus=gpus)
+            plan = _plan(logical, {"r": [100] * 8}, model=model, gpus=gpus)
             assert plan.model == model.name
             assert plan.workers == gpus
             scan_node = next(node for node in plan.nodes if isinstance(node, Scan))
@@ -106,8 +127,7 @@ def test_gpu_copies_and_memory_refusals(catalog):
     big = replace(QWEN3_4B_FP8, w_mem_bytes=150e9)
     logical = _five_filter_plan(catalog, (0.9,))
     for gpus in (1, 8):
-        result = plan_query(logical, model=big, device=H100_SXM,
-                            doc_tokens={"r": [100] * 10}, gpus=gpus)
+        result = _plan(logical, {"r": [100] * 10}, model=big, gpus=gpus)
         assert isinstance(result, Refusal)
         assert result.constraint == "weights_need_more_cards"
         assert result.needed > result.available
@@ -128,10 +148,21 @@ def test_filter_ordering_and_kv_writes(catalog):
     assert by_cost.settings["order_rule"] == "by_cost"
     assert chain.stages[0].selectivity == 0.2
     assert chain.stages[1].expected_docs == pytest.approx(20.0)
+    # the filter_order rule records the order on the logical node; the
+    # physical planner reads it
+    optimized, changed = _optimize(logical, toks)
+    assert "filter_order" in changed
+    assert optimized.root.input.order == tuple(
+        stage.written_pos for stage in chain.stages)
+    assert optimized.root.input.order[0] == 2
+    assert "SemanticFilter order=3," in explain(optimized, by_cost)
 
     as_written = _plan(logical, toks, order="as_written")
     assert [stage.selectivity for stage in filter_chain(as_written).stages] \
         == list(sels)
+    optimized, changed = _optimize(logical, toks, order="as_written")
+    assert "filter_order" not in changed
+    assert optimized.root.input.order == ()
 
     class Predicate:
         def __init__(self, tail, selectivity):
@@ -190,13 +221,11 @@ def test_filter_ordering_and_kv_writes(catalog):
     plan = _plan(single, {"r": [400] * 100})
     chain = filter_chain(plan)
     assert chain.arena_writes is False
-    assert any("arena writes off" in r for r in plan.remarks)
     assert "arena_writes=False" in explain(single, plan, verbose=True)
 
     plan = _plan(_five_filter_plan(catalog, (0.9, 0.9)), {"r": [400] * 100})
     chain = filter_chain(plan)
     assert chain.arena_writes is True
-    assert not any("arena writes off" in r for r in plan.remarks)
 
     logical = (docs(catalog, "reviews", tok).alias("r")
                .ai_filter(prompt("a: {0}", col("r.review")))
@@ -341,6 +370,16 @@ def test_join_anchors_groups_forced_order_and_later_kv_reuse(catalog):
     stages = join_stages(plan)
     assert [s["anchor"] for s in stages] == ["r", "p"]
     assert [s["written_pos"] for s in stages] == [0, 1]
+    # the join_order rule records the stage order and anchors on the
+    # SemanticJoins; the physical planner reads them
+    optimized, changed = _optimize(_chain(catalog), toks, order="as_written")
+    assert "join_order" in changed
+    joins = [node for node in optimized.walk() if isinstance(node, SemanticJoin)]
+    assert [(join.exec_idx, join.exec_anchor) for join in joins] == [
+        (0, "r"), (1, "p")]
+    assert [join.anchor for join in joins] == [None, None]
+    text = explain(optimized, plan)
+    assert "stage=1 exec_anchor=r" in text and "stage=2 exec_anchor=p" in text
     assert stages[0]["partners"] == stages[1]["partners"] == ["t"]
     assert stages[0]["expected_tuples"] == 10 * 8
     assert stages[1]["expected_tuples"] < 8 * 6
@@ -360,15 +399,12 @@ def test_join_anchors_groups_forced_order_and_later_kv_reuse(catalog):
     kinds = node_kinds(plan)
     assert (kinds.count("AiJoin"), kinds.count("Barrier")) == (1, 0)
 
-    # a forced anchor is honored, and the remark names the cheaper free plan
+    # a forced anchor is honored
     toks = {"r": [3000] * 10, "t": [50] * 8, "p": [100] * 6}
     plan = _plan(_chain(catalog, anchors=("t", None)), toks, order="as_written")
     assert join_stages(plan)[0]["anchor"] == "t"
-    assert any("prices lower" in r for r in plan.remarks)
-
     same = _plan(_chain(catalog, anchors=("r", None)), toks, order="as_written")
     assert join_stages(same)[0]["anchor"] == "r"
-    assert not any("prices lower" in r for r in same.remarks)
 
     # by_cost runs the cheap .01 exists gate before the .9 full join
     logical = (docs(catalog, "reviews", tok).alias("r")
@@ -384,6 +420,10 @@ def test_join_anchors_groups_forced_order_and_later_kv_reuse(catalog):
     toks = {"r": [400] * 100, "p": [100] * 100, "t": [100] * 100}
     plan = _plan(logical, toks)
     assert join_stages(plan)[0]["selectivity"] == 0.01
+    optimized, _ = _optimize(logical, toks)
+    joins = [node for node in optimized.walk() if isinstance(node, SemanticJoin)]
+    assert [(join.exec_idx, join.exec_anchor) for join in joins] == [
+        (1, "r"), (0, "r")]
 
     as_written = _plan(logical, toks, order="as_written")
     assert join_stages(as_written)[0]["selectivity"] == 0.9
@@ -395,6 +435,81 @@ def test_join_anchors_groups_forced_order_and_later_kv_reuse(catalog):
     assert groups[0].keep_anchor_kv is True
     assert groups[1].keep_anchor_kv is False
     assert groups[1].anchor_resident == "kept"
+
+
+def test_kv_retention_rule_schedules_the_kv_later_stages_read(
+        catalog, monkeypatch):
+    import quail.planner.joins as joinsearch
+
+    searches = []
+    search_joins = joinsearch.search_joins
+
+    def counting_search(*args, **kwargs):
+        searches.append(kwargs.get("honor_forced", True))
+        return search_joins(*args, **kwargs)
+
+    monkeypatch.setattr(joinsearch, "search_joins", counting_search)
+
+    # the gate runs first and the full join after it, both anchored on
+    # r: the first group keeps r's KV for the second
+    logical = (docs(catalog, "reviews", tok).alias("r")
+               .ai_join(docs(catalog, "products", tok).alias("p"),
+                        prompt("m {0} {1}", col("r.review"),
+                               col("p.description")),
+                        selectivity=0.9)
+               .ai_join(docs(catalog, "threads", tok).alias("t"),
+                        prompt("m {0} {1}", col("r.review"),
+                               col("t.thread")),
+                        selectivity=0.01, semantics="exists")
+               .select("r.id"))
+    toks = {"r": [400] * 100, "p": [100] * 100, "t": [100] * 100}
+    plan = _plan(logical, toks)
+    # one search decides the plan: pricing its candidates and the
+    # registered rule share the context's memo
+    assert searches == [True]
+    retention = plan.settings["retention"]
+    assert set(retention) >= {"initial", "before", "after", "cap_pages",
+                              "linear_seconds", "pair_seconds"}
+    groups = plan.graph.nodes_by_type(AiJoin.type_name)
+    assert [group.anchor for group in groups] == ["r", "r"]
+    assert set(retention["after"]) == set(retention["before"]) == {
+        group.node_id for group in groups}
+    assert retention["initial"] == {"r": [1.0, 0]}
+    assert retention["after"][groups[0].node_id] == {"r": [1.0, 1]}
+    assert retention["after"][groups[1].node_id] == {}
+    assert [group.keep_anchor_kv for group in groups] == [True, False]
+
+    # on one GPU a filtered anchor streams into its join, so its chain
+    # keeps no KV; on two GPUs the chain keeps its survivors for the
+    # join, and writes KV pages to do so
+    filtered = (docs(catalog, "reviews", tok).alias("r")
+                .ai_filter(prompt("negative: {0}", col("r.review")),
+                           selectivity=0.5)
+                .ai_join(docs(catalog, "products", tok).alias("p"),
+                         prompt("about {0} {1}", col("r.review"),
+                                col("p.description")), selectivity=0.1)
+                .select("r.id", "p.asin"))
+    one = _plan(filtered, toks)
+    assert one.settings["retention"]["initial"] == {}
+    chain = filter_chain(one, "r")
+    assert (chain.keep_kv, chain.arena_writes) == (False, True)
+    assert build_pipelines(one.graph)[chain.node_id].node_ids == (
+        "ai_filter:r", "ai_join:r")
+    two = _plan(filtered, toks, gpus=2)
+    assert two.settings["retention"]["initial"] == {"r": [1.0, 0]}
+    chain = filter_chain(two, "r")
+    assert (chain.keep_kv, chain.arena_writes) == (True, True)
+
+    # a forced anchor takes one search too; refining a planned query
+    # on exact tokens keeps the schedule it was made with
+    searches.clear()
+    toks = {"r": [3000] * 10, "t": [50] * 8, "p": [100] * 6}
+    forced = _plan(_chain(catalog, anchors=("t", None)), toks)
+    assert searches == [True]
+    refined = refine_plan(
+        forced, model=QWEN3_4B_FP8, device=H100_SXM, doc_tokens=toks)
+    assert refined.settings["retention"] == forced.settings["retention"]
+    assert refined.nodes == forced.nodes
 
 
 def _join_search_spec(position, aliases, anchor):
@@ -514,14 +629,16 @@ def _apply_query(session, kind):
             .select("c.id", "e.id"))
 
 
-def test_foreign_node_placement_and_pinned_edge_validation():
+def test_foreign_node_placement_and_pipelines():
     # claims are the long side, so the planner anchors on them
     with _claims_session() as session:
         per_batch = _apply_query(session, "per_batch").plan()
         chain = per_batch.graph.node("ai_filter:c")
         foreign = per_batch.graph.node("apply:keep_even")
         join = per_batch.graph.nodes_by_type(AiJoin.type_name)[0]
-        assert chain.pin_survivors
+        # the chain, the per-batch apply, and the join run as one pipeline
+        assert build_pipelines(per_batch.graph)[chain.node_id].node_ids == (
+            chain.node_id, foreign.node_id, join.node_id)
         assert isinstance(foreign, Foreign) and foreign.kind == "per_batch"
         assert foreign.inputs[0].source == PortRef("ai_filter:c", "ids:c")
         assert PortRef("apply:keep_even", "ids:c") in {
@@ -531,7 +648,8 @@ def test_foreign_node_placement_and_pinned_edge_validation():
         assert "Foreign: keep_even (per_batch, drop) on c" in text
         # a barrier needs every survivor at once: the chain materializes
         barrier = _apply_query(session, "barrier").plan()
-        assert not barrier.graph.node("ai_filter:c").pin_survivors
+        assert build_pipelines(barrier.graph)["ai_filter:c"].node_ids == (
+            "ai_filter:c",)
         assert barrier.graph.node("apply:keep_even").kind == "barrier"
         request = _apply_query(session, "barrier")._prepare_physical()
         assert request.column_tables()["c"].column_names == ["c", "url"]
@@ -548,20 +666,27 @@ def test_foreign_node_placement_and_pinned_edge_validation():
         assert isinstance(plan, Refusal)
         assert plan.constraint == "apply_needs_quail_backend"
 
-    validate_streams(two_alias_graph(True, foreign=("per_batch", "drop")))
-    validate_streams(two_alias_graph(True, foreign=("per_batch", "pairs")))
-    with pytest.raises(GraphValidationError, match="per-batch apply"):
-        validate_streams(two_alias_graph(True, foreign=("barrier", "drop")))
-    with pytest.raises(GraphValidationError, match="per-batch apply"):
-        validate_streams(two_alias_graph(True, foreign=("barrier", "pairs")))
+    def chains(graph):
+        return sorted({pipeline.node_ids
+                       for pipeline in build_pipelines(graph).values()})
+
+    assert chains(two_alias_graph(True)) == [("filter:r", "group:0")]
+    assert chains(two_alias_graph(True, foreign=("per_batch", "drop"))) == [
+        ("filter:r", "apply:keep_even", "group:0")]
+    assert chains(two_alias_graph(True, foreign=("per_batch", "pairs"))) == [
+        ("filter:r", "apply:same_key", "group:0")]
+    # a barrier apply and a Barrier each need every survivor at once
+    assert chains(two_alias_graph(True, foreign=("barrier", "drop"))) == [
+        ("filter:r",), ("group:0",)]
+    assert chains(two_alias_graph(False)) == [("filter:r",), ("group:0",)]
     graph = two_alias_graph(True)
+    # a join reading the scan takes nothing from the chain
     orphan = PhysicalGraph(
         tuple(node for node in graph.nodes if node.node_id != "group:0")
         + (graph.node("group:0").with_inputs(input_ports(
             (PortRef("input:r", "ids:r"), PortRef("input:p", "ids:p")))),),
         graph.root)
-    with pytest.raises(GraphValidationError, match="no join anchored"):
-        validate_streams(orphan)
+    assert chains(orphan) == [("filter:r",), ("group:0",)]
 
 
 def _big_plan(catalog):
@@ -580,9 +705,10 @@ def test_node_ids_estimates_and_the_recompute_column(catalog):
     assert [node.node_id for node in plan.nodes] == [
         "scan:r", "scan:p", "ai_filter:r", "ai_join:r", "project"]
     chain = plan.graph.node("ai_filter:r")
-    assert chain.pin_survivors and not chain.keep_kv
+    assert not chain.keep_kv
+    assert build_pipelines(plan.graph)["ai_filter:r"].node_ids == (
+        "ai_filter:r", "ai_join:r")
     assert plan.graph.node("ai_join:r").anchor_resident == "filter"
-    assert any("streams its survivors" in r for r in plan.remarks)
     seconds = {node_id: entry["seconds"]
                for node_id, entry in plan.estimates.items()
                if "seconds" in entry}
@@ -598,10 +724,9 @@ def test_node_ids_estimates_and_the_recompute_column(catalog):
     assert recompute["release_recompute_seconds"] > 0
     text = explain(logical, plan)
     assert "est. time" in text
-    assert "if the KV were released here instead of pinned" in text
+    assert "expected recompute at the join if the chain's KV is released" in text
     assert "do not add up to the plan estimate" in text
-    assert "KV: anchor=streamed from its filter" in text
-    assert "survivors stream into the join with KV pinned" in text
+    assert "KV: anchor=from filters" in text
     assert _cell(text, "AiJoin: anchor=")[-1] in ("ms", "s")
     assert _cell(text, "join 1 full (")[-1] == "10%"
     assert "expected_tuples=" not in text
@@ -612,24 +737,24 @@ def test_node_ids_estimates_and_the_recompute_column(catalog):
     assert [node.node_id for node in edited.nodes] == [
         "scan:r", "scan:p", "ai_filter:r", "barrier:r", "ai_join:r", "project"]
     new_chain = edited.graph.node("ai_filter:r")
-    assert not new_chain.pin_survivors and new_chain.keep_kv
-    assert new_chain.hold_tokens == 0
+    assert new_chain.keep_kv
+    assert build_pipelines(edited.graph)["ai_filter:r"].node_ids == (
+        "ai_filter:r",)
     assert edited.graph.node("barrier:r").inputs[0].source.node_id == "ai_filter:r"
     assert [port.source.node_id for port in edited.graph.node("ai_join:r").inputs] == [
         "barrier:r", "scan:p"]
-    # unpinned, a survivor holds no frame room, so a few more fit
     assert edited.estimates["ai_filter:r"]["release_recompute_tokens"] == \
-        pytest.approx(recompute["release_recompute_tokens"], rel=0.01)
+        recompute["release_recompute_tokens"]
     assert "expected recompute at the join" in explain(logical, edited)
     assert edited.estimated_seconds == pytest.approx(
         plan.estimated_seconds
         + edited.estimates["ai_filter:r"]["release_recompute_seconds"])
-    assert plan.graph.node("ai_filter:r").pin_survivors
+    assert not plan.graph.node("ai_filter:r").keep_kv
     assert edited.remove("barrier:r") == plan
     moved = edited.move("barrier:r", between=("scan:r", "ai_filter:r"))
     assert [node.node_id for node in moved.nodes][:4] == [
         "scan:r", "scan:p", "barrier:r", "ai_filter:r"]
-    assert moved.graph.node("ai_filter:r").pin_survivors
+    assert not moved.graph.node("ai_filter:r").keep_kv
 
 
 def _int_tokens(text):
@@ -664,7 +789,6 @@ def test_prefix_sharing_and_attention_path_follow_the_token_store(
     plan = _plan(logical, {"r": store.lengths})
     chain = filter_chain(plan)
     assert chain.share_prefixes and chain.arena_writes
-    assert "physical rule prefix_sharing changed the plan" in plan.remarks
     assert "share_prefixes=True" in explain(logical, plan, verbose=True)
 
     plan = _plan(logical, {"r": plain.lengths})
@@ -720,3 +844,17 @@ def test_prefix_sharing_and_attention_path_follow_the_token_store(
     # anchors with nothing in common share nothing
     plan = _plan(logical, {"r": [401] * 20, "p": [20] * 20})
     assert not plan.graph.nodes_by_type(AiJoin.type_name)[0].share_prefixes
+
+
+def test_attention_setting_forces_every_filter_and_join(catalog):
+    filters = _five_filter_plan(catalog, (0.5,))
+    joins = _chain(catalog)
+    tokens = {"r": [40, 42, 3], "t": [50] * 4, "p": [100] * 3}
+    for path in ("tree", "unified"):
+        plan = _plan(filters, tokens, attention=path)
+        assert filter_chain(plan).attention == path
+        plan = _plan(joins, tokens, attention=path)
+        assert {node.attention for node in plan.nodes
+                if isinstance(node, AiJoin)} == {path}
+    with pytest.raises(ValueError, match="tree"):
+        _plan(filters, tokens, attention="both")

@@ -27,7 +27,7 @@ from quail.planner.plan import EngineConfig, Refusal
 from quail.specs import QWEN3_4B_FP8
 from quail_b.labels import GroundTruthCollection, PredicateLabels
 from quail_b.minimum import DocumentTokens, token_metrics
-from quail_b.predicates import PREDICATES, predicate_payload
+from quail_b.predicates import PREDICATE_BY_KEY, PREDICATES, predicate_payload
 from quail_b.prompts import DISCUSS_ASPECT, F1, F4, F11, F13, REFUTE, SUPPORT
 from quail_b.queries import get_query
 from quail_b.queries import queries as query_specs
@@ -217,6 +217,15 @@ def test_read_plan_reads_operators_and_rejects_other_extensions():
     assert plan.filter_id("r", 1) == "filter-2"
     assert plan.join_id(0) == "join-1"
 
+    # IMDB-15 labels the pairs its join keeps: the anchor and its partner
+    pairs = read_plan(get_query("IMDB-15").plan)
+    sentiment, pair = pairs.classifies
+    assert sentiment.partner is None and sentiment.relations == ("r",)
+    assert pair.alias == "r" and pair.column == "body"
+    assert pair.partner == ("a", "aspect") and pair.relations == ("r", "a")
+    assert pairs.operators.index(pair) > pairs.operators.index(pairs.joins[0])
+    assert pairs.select == ("r.id", "r.sentiment", "a.id", "r.aspect_sentiment")
+
     # FEV-10 asks SUPPORT only of a claim and its own Wikipedia page
     (join,) = read_plan(get_query("FEV-10").plan).joins
     assert join.aliases == ("c", "e")
@@ -227,7 +236,9 @@ def test_read_plan_reads_operators_and_rejects_other_extensions():
         assert len(plan.relations) == len(plan.joins) + 1, spec.id
         ids = [op.id for op in plan.operators]
         assert len(set(ids)) == len(ids), spec.id
-        assert all(name.endswith(".id") for name in plan.select), spec.id
+        labels = {f"{op.alias}.{op.output}" for op in plan.classifies}
+        assert all(name.endswith(".id") or name in labels
+                   for name in plan.select), spec.id
 
     plan = get_query("IMDB-1").plan
     plan.extension_urns[0].urn = AI_URN + ".other"
@@ -344,3 +355,56 @@ def test_benchmark_query_prompts_labels_and_raw_rendering():
             for anchor in (0, 1):
                 assert render_join_prompt(spec.template, documents, anchor) == (
                     render_join_prompt_text(prompt, documents, anchor))
+
+
+@pytest.mark.parametrize("case", ("IMDB-11", "IMDB-14", "IMDB-15"))
+def test_classification_pieces_are_the_named_reference_prompt(tmp_path, case):
+    from quail_b.minimum import validate_prompt_pieces
+    from quail_b.rendering import render_classify_prompt
+
+    # IMDB-11 only projects labels; IMDB-14 also filters them;
+    # IMDB-15 includes a classification over joined rows.
+    spec = get_query(case)
+    plan = read_plan(spec.plan)
+    with _session(tmp_path, backend="stock_vllm") as sess:
+        # the byte tokenizer, so the pieces decode back to text
+        query = build_query(sess, spec)
+        pieces = prompt_pieces(query, plan, {0: "r"})
+    # the estimate's oracle returns each classification's reference label
+    calls = [call for call, _ in query.logical.operators().labels.calls]
+    predicates = {}
+    for operator in plan.classifies:
+        (item,) = [item for item in PREDICATE_BY_KEY.values()
+                   if item.template == operator.prompt]
+        partners = (CORPUS[item.right_table]["id"].to_pylist()
+                    if item.right_table else [None])
+        predicates[item.key] = PredicateLabels(
+            item.key, f"ls_{item.key}", predicate_payload(item),
+            {(left, right): operator.labels[-1]
+             for left in CORPUS["reviews"]["id"].to_pylist()
+             for right in partners}, {})
+    answer = answer_oracle(
+        GroundTruthCollection("gt_classify", "c_classify", 0.1, None, predicates),
+        CORPUS)
+    assert len(calls) == len(plan.classifies)
+    for call, operator in zip(calls, plan.classifies):
+        assignment = {alias: 1 for alias in call.aliases()}
+        assert answer(call.prompt, assignment) == operator.labels[-1]
+    assert validate_prompt_pieces(spec, pieces)["classifies"] == pieces[
+        "classifies"]
+
+    def text(ids):
+        return bytes(token - 1 for token in ids).decode("utf-8")
+
+    assert len(pieces["classifies"]) == len(plan.classifies)
+    for operator, piece in zip(plan.classifies, pieces["classifies"]):
+        assert piece["id"] == operator.id
+        rendered = text(pieces["preamble"]) + "good film"
+        partner = None
+        if operator.partner is not None:
+            assert piece["anchor"] == operator.alias
+            partner = "the acting"
+            rendered += text(piece["frame"]) + text(piece["label"]) + partner
+        assert rendered + text(piece["tail"]) == render_classify_prompt(
+            operator.prompt, "good film", operator.labels,
+            operator.descriptions, partner=partner)

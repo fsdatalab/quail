@@ -4,18 +4,23 @@ from dataclasses import dataclass
 from typing import Optional
 
 from quail.catalog import Catalog
+from quail.frontend.label_tables import read_label_table
 from quail.logical import (
+    Alias,
     ColumnRef,
     CompileError,
     Equality,
     FilterPredicate,
+    InList,
     JoinSpec,
     LogicalPlan,
     LogicalPlanBuilder,
     ModelCall,
+    bind_classify_prompt,
     bind_join_prompt,
     bind_prompt,
 )
+from quail.logical.nodes import validate_task_description
 
 
 @dataclass(frozen=True, eq=False)
@@ -68,18 +73,21 @@ class Query:
         self._tables = [(provider, provider)]   # (alias, provider)
         self._doc_columns = {}
         self._filters = {}
+        self._label_filters = {}     # alias -> [(name, labels, selectivity)]
         self._joins = []
         self._pending_join = None    # (new aliases, conditions, applies)
         #                              awaiting the AI predicate over
         #                              its pairs
         self._applies = {}           # alias -> [(name, kind, ids, refs)]
         self._functions = {}         # name -> the Python function
+        self._labels = {}            # name -> Alias of an AI.CLASSIFY call
         self._limit = None
 
     # ---- scope -------------------------------------------------------
 
     def alias(self, a: str) -> "Query":
-        if self._joins or self._filters or len(self._tables) != 1:
+        if (self._joins or self._filters or self._label_filters
+                or len(self._tables) != 1):
             raise CompileError("alias() must come right after docs()")
         self._tables[0] = (a, self._tables[0][1])
         return self
@@ -154,6 +162,102 @@ class Query:
         return self
 
     ai_if = ai_filter
+
+    def ai_classify(self, p: PromptSpec, labels, *, name: str,
+                    descriptions=None,
+                    task_description: str = "",
+                    probabilities: bool = False) -> "Query":
+        """Give each document one of the labels, in a named result column.
+
+        Use select() to return the column and label_in() to keep documents
+        with chosen labels. The planner chooses how to score the labels.
+
+        Args:
+            p: The prompt over one document column, or over the anchor and
+                partner columns of a join's rows.
+            labels: Label strings, (label, description) pairs, or the name
+                of a registered label table.
+            name: Result column name, without a dot.
+            descriptions: Optional descriptions in the same order as labels.
+                Leave empty when labels holds (label, description) pairs.
+            task_description: Additional instructions, up to 50 words.
+            probabilities: Whether to also return a map of label probabilities
+                in the column named name + "_probabilities".
+
+        Returns:
+            This query builder, with the classification added.
+
+        Raises:
+            CompileError: The name, labels, descriptions, or prompt are
+                invalid, or a pending join has no AI predicate yet.
+        """
+        if self._pending_join is not None:
+            raise CompileError(
+                "join() is waiting for the ai_filter over its pairs; "
+                "classify before joining")
+        if not name or "." in name:
+            raise CompileError(
+                f"a classification needs a column name without a dot, "
+                f"got {name!r}")
+        if name in self._labels or name in self._scope():
+            raise CompileError(f"the name {name!r} is already used")
+        if isinstance(labels, str):
+            labels, table_descriptions = read_label_table(self._catalog, labels)
+            descriptions = descriptions or table_descriptions
+        else:
+            labels = tuple(labels)
+            if labels and all(isinstance(label, (tuple, list))
+                              for label in labels):
+                if descriptions:
+                    raise CompileError(
+                        "give descriptions in the pairs or separately, not both")
+                descriptions = tuple(description for _, description in labels)
+                labels = tuple(label for label, _ in labels)
+        descriptions = tuple(descriptions or ())
+        validate_task_description(task_description)
+        refs = tuple(self._resolve(c) for c in p.cols)
+        bound = bind_classify_prompt(p.template, refs, labels, descriptions,
+                                     self._tokenizer, turn=self._turn,
+                                     task_description=task_description)
+        for ref in refs:
+            self._note_doc_column(ref)
+        call = ModelCall(bound, "label", labels, descriptions,
+                         probabilities=probabilities)
+        call.validate()
+        self._labels[name] = Alias(call, name)
+        return self
+
+    def label_in(self, name: str, labels,
+                 selectivity: Optional[float] = None) -> "Query":
+        """Keep documents whose label is one of the given labels.
+
+        This uses the same membership check as SQL IN.
+
+        Args:
+            name: Column name from an earlier ai_classify() call.
+            labels: Labels to keep.
+            selectivity: Estimated fraction of documents kept. None uses 0.2.
+
+        Returns:
+            This query builder, with the condition added.
+
+        Raises:
+            CompileError: No classification has this name, the classification
+                refers to document pairs, or labels contains duplicates.
+        """
+        if name not in self._labels:
+            raise CompileError(f"no classification is named {name!r}")
+        call = self._labels[name].expression
+        if len(call.aliases()) != 1:
+            raise CompileError(
+                f"a filter on a label tests a one-document classification; "
+                f"{name!r} classifies pairs of {call.aliases()}")
+        (alias,) = call.aliases()
+        labels = tuple(labels)
+        InList(ColumnRef(alias, self._scope()[alias], name), labels).validate()
+        self._label_filters.setdefault(alias, []).append(
+            (name, labels, selectivity))
+        return self
 
     def join(self, other: "Query", on=None) -> "Query":
         """Join one table on ordinary column equalities.
@@ -293,9 +397,15 @@ class Query:
             alias, provider = other._tables[0]
             if alias in self._scope():
                 raise CompileError(f"duplicate table alias {alias!r}")
+            for name, column in other._labels.items():
+                if name in self._labels or name in self._scope():
+                    raise CompileError(f"the name {name!r} is already used")
+                self._labels[name] = column
             self._tables.append((alias, provider))
             for a, preds in other._filters.items():
                 self._filters.setdefault(a, []).extend(preds)
+            for a, tests in other._label_filters.items():
+                self._label_filters.setdefault(a, []).extend(tests)
             for a, applies in other._applies.items():
                 self._applies.setdefault(a, []).extend(applies)
             for name, fn in other._functions.items():
@@ -392,12 +502,15 @@ class Query:
                 f"join() of {self._pending_join[0]} has no AI predicate "
                 f"over its pairs; a plain join belongs in the database "
                 f"the ids came from")
-        if not self._joins and not self._filters:
+        if not self._joins and not self._filters and not self._labels:
             raise CompileError("the query has no AI predicate; a plain "
                                "scan belongs in the database the ids "
                                "came from")
         columns = []
         for c in cols:
+            if isinstance(c, str) and c in self._labels:
+                columns.append(self._labels[c])
+                continue
             if c == "*":
                 for alias, provider in self._tables:
                     for name in self._catalog.get(provider).columns:
@@ -407,6 +520,12 @@ class Query:
                 continue
             spec = col(c) if isinstance(c, str) else c
             columns.append(self._resolve(spec))
+        # a classification is planned when the query returns or tests
+        # its label
+        tested = {name for tests in self._label_filters.values()
+                  for name, _, _ in tests}
+        wanted = [column for column in self._labels.values()
+                  if column in columns or column.name in tested]
         logical = LogicalPlanBuilder()
         for alias, provider in self._tables:
             logical.add_scan(
@@ -415,9 +534,15 @@ class Query:
                 self._doc_columns.get(alias, ""),
                 tuple(self._filters.get(alias, ())),
                 tuple(self._applies.get(alias, ())),
+                tuple((column.expression, column.name) for column in wanted
+                      if column.expression.aliases() == (alias,)),
+                tuple(self._label_filters.get(alias, ())),
             )
         for join in self._joins:
             logical.add_join(join)
+        for column in wanted:
+            if len(column.expression.aliases()) == 2:
+                logical.add_classify(column.expression, column.name)
         return logical.project(tuple(columns), self._limit)
 
 

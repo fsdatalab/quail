@@ -7,11 +7,13 @@ from typing import Any, Mapping
 
 from .base import InputPort, PhysicalGraph, PhysicalNode, PortRef, ValueType
 from .nodes import (
+    AiClassify,
     AiFilter,
     AiJoin,
     AiScore,
     Barrier,
     Exchange,
+    Filter,
     Foreign,
     HashJoin,
     Limit,
@@ -19,7 +21,6 @@ from .nodes import (
     Recombine,
     RequestExecution,
     Scan,
-    ScoreFilter,
 )
 
 
@@ -138,7 +139,8 @@ def built_in_codecs() -> tuple[NodeCodec, ...]:
         AiFilter,
         RequestExecution,
         AiScore,
-        ScoreFilter,
+        Filter,
+        AiClassify,
         Barrier,
         Exchange,
         Foreign,

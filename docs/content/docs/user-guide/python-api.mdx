@@ -2,14 +2,25 @@
 title: Python API
 ---
 
-You can build queries with Python method calls instead of writing
-SQL. Import `col` and `prompt` to get started:
+The Python builder supports the same query operations as SQL. Start
+with a table registered on a `Session`, add operators, and call `select()`
+to create a query. The model runs when you call `run()` or `collect()`.
+
+The examples below use an existing `session`. See
+[Sessions](/docs/user-guide/sessions) for session creation and
+[table registration](/docs/user-guide/sessions#registering-tables) for registering inputs.
+
+Import `col` to refer to columns and `prompt` to write model questions:
 
 ```python
 from quail import col, prompt
 ```
 
 ## Example
+
+For example, suppose `reviews` contains review text in `body`, and
+`aspects` contains movie aspects in `aspect`. This query keeps positive
+reviews, then returns each review paired with the aspects it discusses:
 
 ```python
 query = (
@@ -49,6 +60,66 @@ result = query.collect()
 multiple `ai_if` calls. Quail reorders them by estimated cost to
 reduce total work. Pass `order="as_written"` to `select()` to keep
 the written order.
+
+### ai_classify
+
+`ai_classify(prompt, labels, *, name, descriptions=None, task_description="", probabilities=False)`
+
+Assign one supplied label to each document. `name` sets the label column's
+name. Include that name in `select()` to return it, or use `label_in()`
+to keep only documents with selected labels.
+
+| Parameter | Type | Description |
+| --- | --- | --- |
+| `prompt` | `Prompt` | Question and document columns, built with `prompt()`. |
+| `labels` | `Iterable[str]`, `Iterable[tuple[str, str \| None]]`, or `str` | Labels, label and description pairs, or a registered label table name. |
+| `name` | `str` | Name of the result column. |
+| `descriptions` | `Iterable[str \| None]` or `None` | Optional description for each label, in the same order. |
+| `task_description` | `str` | Extra instructions, up to 50 words. Defaults to `""`. |
+| `probabilities` | `bool` | Also returns `<name>_probabilities`, a map from each label to its probability. Defaults to `False`. |
+
+```python
+query = (
+    session.docs("reviews").alias("r")
+    .ai_classify(
+        prompt('What sentiment does this review express? {0}', col("r.body")),
+        ["positive", "negative", "neutral", "mixed"],
+        name="sentiment")
+    .label_in("sentiment", ["negative", "mixed"], selectivity=0.3)
+    .select("r.id", "sentiment")
+)
+result = query.collect()
+```
+
+In this example, Quail classifies each review once. It keeps negative
+and mixed reviews, then returns their IDs and sentiment labels. The
+`selectivity=0.3` hint estimates that 30% of reviews pass the label
+condition; it does not change which labels pass.
+
+Provide descriptions through either label pairs or `descriptions`.
+Using both raises a compilation error. The
+[SQL reference](/docs/user-guide/sql#aiclassify) lists label requirements,
+probability output, and limits on classifications of joined rows.
+
+### label_in
+
+`label_in(name: str, labels: Iterable[str], selectivity: float | None = None)`
+
+Keep documents whose computed label matches one of the supplied values.
+Call `ai_classify()` first to create the label column. `label_in()`
+tests that column without calling the model again.
+
+| Parameter | Type | Description |
+| --- | --- | --- |
+| `name` | `str` | Column name given to an earlier `ai_classify()` call. |
+| `labels` | `Iterable[str]` | Labels to keep, such as `["negative", "mixed"]`. A list or tuple of strings works. |
+| `selectivity` | `float` or `None` | Estimated fraction of documents kept. `None` uses the default estimate of `0.2`. |
+
+For example, after classifying reviews into the `sentiment` column,
+`label_in("sentiment", ["negative", "mixed"])` keeps reviews with either
+of those labels.
+
+`label_in()` does not work on a classification of joined rows.
 
 ### ai_join
 
@@ -184,8 +255,10 @@ result = query.collect()
 You can also use `apply` after a filter to drop rows with custom
 Python logic before the next AI operator runs.
 
-`kind="per_batch"` (default) runs the function on each batch as
-they stream through.
+`kind="per_batch"` (the default) runs the function on each batch of
+rows in a pipeline. Outside a pipeline, the function gets all input rows
+in one call. Use `apply_table()` when the function needs all rows at
+once.
 
 ### apply_table
 
@@ -196,18 +269,15 @@ Like `apply`, but waits for the preceding stage to finish and calls
 `apply(..., kind="barrier")`.
 
 Use this when your function needs to see every surviving row at once.
-With `apply`, rows arrive in batches as they stream through. With
-`apply_table`, Quail finishes the preceding stage first, then calls
-your function once with all the results.
+In a pipeline, `apply` gets the rows in batches. With `apply_table`,
+Quail first finishes the stage before it, then calls your function one
+time with all the rows.
 
 ```python
-import pyarrow.compute as pc
-
 def deduplicate(tables):
     reviews = tables["r"]
-    unique = pc.unique(reviews.column("body"))
-    mask = pc.is_in(reviews.column("body"), unique)
-    return reviews.filter(mask).column("r")
+    groups = reviews.group_by("body").aggregate([("r", "min")])
+    return groups.column("r_min")
 
 query = (
     session.docs("reviews").alias("r")
@@ -218,8 +288,8 @@ query = (
 result = query.collect()
 ```
 
-Note that `apply_table` fixes the execution order at that point in
-the query. The planner will not reorder operators across it.
+The planner preserves the order of operators around `apply_table()`.
+It does not move an operator across the function call.
 
 ## Errors
 

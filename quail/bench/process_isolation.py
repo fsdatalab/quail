@@ -35,8 +35,37 @@ def run_backend_group(
     ground_truth_collection: str,
     methods: Sequence[str],
     root: str | None = None,
+    attention: str | None = None,
+    gpu_timing: bool = False,
+    suite_name: str | None = None,
+    canvas_draws: str | None = None,
 ) -> dict:
-    """Run backend methods while sharing one loaded model when possible."""
+    """Run backend methods in one process, sharing a model when possible.
+
+    Args:
+        data_dir: Root directory containing scale-factor data directories.
+        model: Model name.
+        sf: Dataset scale factor.
+        query_ids: Query IDs belonging to one benchmark family.
+        run_dir: Directory for this benchmark run.
+        ground_truth_collection: Reference label collection, or empty for default.
+        methods: Backend method names in execution order.
+        root: Optional local mirror of reference labels.
+        attention: Optional forced attention path.
+        gpu_timing: Whether to record GPU execution time.
+        suite_name: Directory name per method, defaulting to the query family.
+            Separate groups from the same family need distinct names.
+        canvas_draws: Comma-separated maximum diffusion draw counts, or None
+            to keep the default. Each count runs its own Quail suite, named
+            ``quail-draws<count>`` when there is more than one.
+
+    Returns:
+        A dictionary containing the family, queries, collection ID, GPU IDs,
+        suite names, and the suite result for each name.
+
+    Raises:
+        ValueError: No backend methods were supplied.
+    """
     from quail import EngineConfig
     from quail.bench.quailb import run_suite
     from quail_b.queries import query_family_name
@@ -48,33 +77,44 @@ def run_backend_group(
     family = query_family_name(query_ids)
     run_dir = Path(run_dir)
     suites = {}
+    draw_counts = [int(count) for count in (canvas_draws or "").split(",")
+                   if count.strip()] or [None]
     for method in methods:
-        print(
-            f"[{family}] running {method} for {len(query_ids)} queries",
-            flush=True,
-        )
-        suite = run_suite(
-            query_ids, sf=sf,
-            config=EngineConfig(
-                gpus=1,
-                model=model,
-                backend=method,
-                device="h100-sxm",
-            ),
-            data_dir=Path(data_dir) / f"sf{sf}",
-            ground_truth_collection=ground_truth_collection or None,
-            root=root,
-            output_dir=run_dir / method / family,
-        )
-        suite["run_id"] = run_dir.name
-        suite["query_family"] = {"name": family, "query_ids": list(query_ids)}
-        suites[method] = suite
+        for draws in draw_counts:
+            name = method
+            if method == "quail" and len(draw_counts) > 1:
+                name += f"-draws{draws}"
+            print(
+                f"[{family}] running {name} for {len(query_ids)} queries",
+                flush=True,
+            )
+            suite = run_suite(
+                query_ids, sf=sf,
+                config=EngineConfig(
+                    gpus=1,
+                    model=model,
+                    backend=method,
+                    device="h100-sxm",
+                    attention=attention,
+                    gpu_timing=gpu_timing,
+                    **({} if draws is None else {"canvas_draws": draws}),
+                ),
+                data_dir=Path(data_dir) / f"sf{sf}",
+                ground_truth_collection=ground_truth_collection or None,
+                root=root,
+                output_dir=run_dir / name / (suite_name or family),
+            )
+            suite["run_id"] = run_dir.name
+            suite["query_family"] = {"name": family, "query_ids": list(query_ids)}
+            suites[name] = suite
+            if method != "quail":
+                break
     return {
         "query_family": family,
         "query_ids": list(query_ids),
-        "ground_truth_collection": suites[methods[0]]["collection_id"],
+        "ground_truth_collection": next(iter(suites.values()))["collection_id"],
         "gpu_uuids": list(visible_gpu_uuids()),
-        "methods": list(methods),
+        "methods": list(suites),
         "suites": suites,
     }
 

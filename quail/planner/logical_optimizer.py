@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Protocol
+from dataclasses import dataclass, field
+from typing import Any, Callable, Mapping, Protocol
 
 from quail.logical import LogicalNode, LogicalPlan
+from quail.planner.physical_optimizer import PlanningContext
 
 # Rounds over the rule list before giving up on convergence. Two rules
 # that undo each other would otherwise loop forever.
@@ -14,10 +15,54 @@ MAX_PASSES = 4
 
 @dataclass(frozen=True)
 class LogicalPlanningContext:
-    """Session values available to logical optimizer rules."""
+    """Session values and statistics available to logical optimizer rules.
+
+    Document token counts are exact when the column is tokenized, else
+    estimated from a sample. A cost-based rule prices a predicate
+    written without a selectivity with the default selectivity.
+
+    Attributes:
+        catalog: The session catalog.
+        engine_config: The session's EngineConfig.
+        model: Model spec; None when no cost-based rule will run.
+        device: Device spec; None when no cost-based rule will run.
+        gpu_count: GPU count; one model copy runs per GPU.
+        document_tokens: alias -> per-document token counts.
+        backend: Registered model backend name.
+        order: Stage order rule, 'by_cost' or 'as_written'; None picks
+            the default rule.
+        canvas_draws: Maximum diffusion draws per classification.
+        attention: An attention path forced for every filter and join.
+        tokenizer: Callable (text -> token list) for prompts.
+        pair_fractions: join written position -> the fraction of the
+            cross product its equality conditions keep.
+        memo: Results a rule computed for one plan root, so a later
+            pass or another rule pricing the same root reuses them.
+    """
 
     catalog: Any
     engine_config: Any
+    model: Any = None
+    device: Any = None
+    gpu_count: int = 1
+    document_tokens: Mapping[str, Any] = field(default_factory=dict)
+    backend: str = "quail"
+    order: str | None = None
+    canvas_draws: int = 4
+    attention: str | None = None
+    tokenizer: Callable[[str], Any] | None = None
+    pair_fractions: Mapping[int, float] = field(default_factory=dict)
+    memo: dict = field(default_factory=dict, compare=False, repr=False)
+
+    def physical_context(self, logical_plan=None) -> PlanningContext:
+        """Return the physical planning context with the same inputs."""
+        return PlanningContext(
+            model=self.model, device=self.device, gpu_count=self.gpu_count,
+            document_tokens=self.document_tokens, backend=self.backend,
+            order=self.order, canvas_draws=self.canvas_draws,
+            attention=self.attention, tokenizer=self.tokenizer,
+            pair_fractions=dict(self.pair_fractions),
+            logical_plan=logical_plan, memo=self.memo)
 
 
 class LogicalOptimizerRule(Protocol):

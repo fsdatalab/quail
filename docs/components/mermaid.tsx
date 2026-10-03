@@ -4,7 +4,7 @@ import { useEffect, useId, useState } from 'react';
 
 // Mermaid renders in the browser only; the page tree is prerendered
 // without it and the diagram appears after hydration.
-export function Mermaid({ chart }: { chart: string }) {
+export function Mermaid({ chart, minWidth }: { chart: string; minWidth?: number }) {
   const id = useId().replace(/:/g, '');
   const [svg, setSvg] = useState<string>('');
 
@@ -34,9 +34,12 @@ export function Mermaid({ chart }: { chart: string }) {
     );
   }
   return (
-    <div
-      className="my-6 flex justify-center overflow-x-auto"
-      dangerouslySetInnerHTML={{ __html: svg }}
-    />
+    <div className="my-6 overflow-x-auto">
+      <div
+        className="flex justify-center"
+        style={{ minWidth }}
+        dangerouslySetInnerHTML={{ __html: svg }}
+      />
+    </div>
   );
 }

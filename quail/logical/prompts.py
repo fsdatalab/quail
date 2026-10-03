@@ -1,6 +1,8 @@
 """Prompt text, prompt token ids, and template binding."""
 
-from quail.logical.nodes import CompileError, Prompt
+from dataclasses import replace
+
+from quail.logical.nodes import LABEL_PREFIX, CompileError, Prompt
 
 # Fixed preamble before every document. Must be a formatting label,
 # not an instruction; instruction text here biases short-document
@@ -234,6 +236,232 @@ def bind_prompt(template: str, args: tuple, tokenizer=None,
                   tail=tail, preamble_tokens=pre_tok, tail_tokens=tail_tok,
                   frame=frame, frame_tokens=frame_tok,
                   preamble_token_ids=pre_ids, tail_token_ids=tail_ids)
+
+
+CLASSIFY_INSTRUCTION = ("Answer with exactly one of the categories below "
+                        "for the following question: ")
+LETTERS_INSTRUCTION = ("Answer with the letter of exactly one of the "
+                       "categories below for the following question: ")
+CATEGORIES_HEADER = "\n\nCategories:"
+# Jev's limit on one choice's options, which OpenJev keeps
+MAX_LETTERS = 255
+
+
+def letter_candidates() -> list[str]:
+    """Return candidate label letters: A to Z, a to z, then AA to ZZ."""
+    upper = [chr(code) for code in range(ord("A"), ord("Z") + 1)]
+    lower = [chr(code) for code in range(ord("a"), ord("z") + 1)]
+    return upper + lower + [first + second for first in upper for second in upper]
+
+
+def choice_letters(count: int, tokenizer=None,
+                   prefix: str = LABEL_PREFIX) -> tuple[str, ...]:
+    """Choose distinct one-token letters to stand for the labels.
+
+    Args:
+        count: Number of letters needed, one per label.
+        tokenizer: Optional callable mapping text to token IDs. Without one,
+            candidate strings are returned in their original order.
+        prefix: Text immediately before the scored letter.
+
+    Returns:
+        Letters in label order. The result may contain fewer than count
+        entries if the tokenizer has too few distinct one-token candidates.
+
+    Raises:
+        CompileError: The requested count exceeds MAX_LETTERS.
+    """
+    if count > MAX_LETTERS:
+        raise CompileError(
+            f"AI.CLASSIFY takes at most {MAX_LETTERS} labels, got {count}")
+    letters, seen = [], set()
+    for letter in letter_candidates():
+        if tokenizer is not None:
+            ids = tuple(tokenizer(prefix + letter))
+            if len(ids) != 1 or ids[0] in seen:
+                continue
+            seen.add(ids[0])
+        letters.append(letter)
+        if len(letters) == count:
+            break
+    return tuple(letters)
+
+
+def answer_prefix(turn: tuple[str, str]) -> str:
+    """Return the spacing before a label in the model's answer.
+
+    A label after the answer cue follows a space, as a word would; a
+    model whose turn suffix opens its reply after the cue starts the
+    reply without one.
+    """
+    return "" if turn[1] else LABEL_PREFIX
+
+
+def render_categories(labels, descriptions=(), letters=()) -> str:
+    """Return the category list, one line per label.
+
+    A line is ``- label``, or ``- label: description``; lettered,
+    ``- A: label`` or ``- A: label (description)``.
+    """
+    descriptions = descriptions or ("",) * len(labels)
+    if letters:
+        return CATEGORIES_HEADER + "".join(
+            f"\n- {letter}: {label}"
+            + (f" ({description})" if description else "")
+            for letter, label, description in zip(letters, labels, descriptions))
+    return CATEGORIES_HEADER + "".join(
+        f"\n- {label}" + (f": {description}" if description else "")
+        for label, description in zip(labels, descriptions))
+
+
+def render_classify_question(question: str, labels, descriptions=(),
+                             task_description: str = "",
+                             letters=()) -> str:
+    """Wrap a classification question with its instruction, categories, and cue."""
+    content = question.lstrip("\n")
+    sep = question[:len(question) - len(content)] or "\n\n"
+    if task_description:
+        content = (content + "\n" if content else "") + task_description
+    instruction = LETTERS_INSTRUCTION if letters else CLASSIFY_INSTRUCTION
+    return (sep + instruction + content
+            + render_categories(labels, descriptions, letters) + ANSWER_CUE)
+
+
+def label_text(label: str, prefix: str = LABEL_PREFIX) -> str:
+    """Return the label text with its answer prefix."""
+    return prefix + label
+
+
+def bind_classify_prompt(template: str, args: tuple, labels, descriptions=(),
+                         tokenizer=None,
+                         turn: tuple[str, str] = ("", ""),
+                         task_description: str = "") -> Prompt:
+    """Bind a classification prompt to one or two document columns.
+
+    The prompt names the labels and, when every label gets a distinct
+    one-token letter, holds a lettered version for the letters rule. A
+    prompt over joined rows uses the join document layout, then the
+    classification question and the label list.
+
+    Args:
+        template: Prompt text with one placeholder per document column.
+        args: One column reference, or two references for joined documents.
+        labels: Labels in query order.
+        descriptions: Optional descriptions in label order.
+        tokenizer: Optional callable mapping text to token IDs.
+        turn: Chat text before the prompt and after the answer cue.
+        task_description: Additional classification instructions.
+
+    Returns:
+        A Prompt containing the document layout, label list, and token IDs.
+
+    Raises:
+        CompileError: The placeholders or number of document columns are
+            invalid, or there are more than MAX_LETTERS labels.
+    """
+    _check_placeholders(template, len(args))
+    if len(args) == 2:
+        return _bind_joined_classify_prompt(
+            template, args, labels, descriptions, tokenizer, turn,
+            task_description)
+    if len(args) != 1:
+        raise CompileError("AI.CLASSIFY reads one document per row, or one "
+                           "from each side of a join")
+    prefix = answer_prefix(turn)
+    named = _bind_document_classify_prompt(
+        template, args, labels, descriptions, tokenizer, turn,
+        task_description, prefix)
+    letters = choice_letters(len(labels), tokenizer, prefix)
+    if len(letters) < len(labels):
+        return named
+    lettered = _bind_document_classify_prompt(
+        template, args, labels, descriptions, tokenizer, turn,
+        task_description, prefix, letters)
+    return replace(named, lettered=lettered)
+
+
+def _bind_document_classify_prompt(template, args, labels, descriptions,
+                                   tokenizer, turn, task_description,
+                                   prefix, letters=()):
+    """Bind one AI.CLASSIFY prompt over one document, lettered when asked."""
+    import re
+    frame, template = split_frame(template)
+    preamble, tail = split_template(template)
+    m = re.match(r"(\{\d+\})(.*)", tail, re.DOTALL)
+    if m is None:
+        raise CompileError(f"unexpected AI.CLASSIFY template: {template!r}")
+    question = render_classify_question(
+        m.group(2), labels, descriptions, task_description, letters)
+    preamble = turn[0] + preamble
+    tail = m.group(1) + question + turn[1]
+    pre_tok = tail_tok = frame_tok = None
+    pre_ids = tail_ids = ()
+    if tokenizer is not None:
+        pre_ids = tuple(tokenizer(preamble))
+        pre_tok = len(pre_ids)
+        tail_ids = tuple(tokenizer(re.sub(r"\{\d+\}", "", tail)))
+        tail_tok = len(tail_ids)
+        frame_tok = len(tokenizer(f"\n\n{frame}")) if frame else 0
+    return Prompt(template=template, args=tuple(args), preamble=preamble,
+                  tail=tail, preamble_tokens=pre_tok, tail_tokens=tail_tok,
+                  frame=frame, frame_tokens=frame_tok,
+                  preamble_token_ids=pre_ids, tail_token_ids=tail_ids,
+                  label_prefix=prefix, letters=tuple(letters))
+
+
+def _bind_joined_classify_prompt(template, args, labels, descriptions,
+                                 tokenizer, turn, task_description):
+    """Bind a classification of joined rows: the join layout, then the question.
+
+    The anchor document (placeholder {0}) comes first, then the anchor
+    note, the partner's label and document, and the classification
+    question with its categories and cue. ``label_token_ids`` holds,
+    as for a join, each alias's partner label and the anchor note.
+    """
+    aliases = [r.alias for r in args]
+    if len(set(aliases)) != len(aliases):
+        raise CompileError(
+            "each placeholder of a classification of joined rows names a "
+            "distinct table")
+    prefix = answer_prefix(turn)
+
+    def bind(letters=()):
+        question = render_classify_question(template, labels, descriptions,
+                                            task_description, letters)
+        preamble = shared_preamble(turn[0])
+        tail = question + turn[1]
+        frame = join_anchor_note(0)
+        pre_tok = tail_tok = frame_tok = None
+        pre_ids = tail_ids = ()
+        label_ids = ()
+        if tokenizer is not None:
+            pre_ids = tuple(tokenizer(preamble))
+            tail_ids = tuple(tokenizer(tail))
+            pre_tok, tail_tok = len(pre_ids), len(tail_ids)
+            frame_tok = len(tokenizer(frame))
+            label_ids = tuple(
+                (alias, tuple(tokenizer(join_label(index))),
+                 tuple(tokenizer(join_anchor_note(index))))
+                for index, alias in enumerate(aliases))
+        return Prompt(template=template, args=tuple(args), preamble=preamble,
+                      tail=tail, preamble_tokens=pre_tok, tail_tokens=tail_tok,
+                      frame=frame, frame_tokens=frame_tok,
+                      preamble_token_ids=pre_ids, tail_token_ids=tail_ids,
+                      label_token_ids=label_ids, label_prefix=prefix,
+                      letters=tuple(letters))
+
+    named = bind()
+    letters = choice_letters(len(labels), tokenizer, prefix)
+    if len(letters) < len(labels):
+        return named
+    return replace(named, lettered=bind(letters))
+
+
+def render_joined_classify_prompt_text(prompt, anchor: str,
+                                       partner: str) -> str:
+    """Render the complete classification prompt for one joined row."""
+    return (prompt.preamble + anchor + join_anchor_note(0) + join_label(1)
+            + partner + prompt.tail)
 
 
 def bind_score_prompt(template: str, args: tuple,

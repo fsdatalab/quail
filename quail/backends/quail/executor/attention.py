@@ -24,9 +24,6 @@ rotary, as Qwen3 and Gemma 4 have; qkv_norm_rope_heads is its form
 for any head geometry, with Gemma's weightless per-head V norm.
 """
 
-from dataclasses import dataclass
-from typing import Any
-
 GROUP = 128            # fp8 quant group size, matches the engine
 # FlashAttention 3's widest head; wider heads run FlashAttention 4,
 # whose Hopper build takes heads up to 512, over arena pages.
@@ -42,36 +39,6 @@ FA_MAX_HEAD_DIM = 256
 ATTENTION_PATHS = ("unified", "tree")
 
 
-@dataclass
-class Chunk:
-    """One packed forward pass: token rows plus attention bookkeeping.
-
-    Attributes:
-        input_ids: Token ids, one per packed row, on the GPU.
-        positions: Rotary position of each row.
-        final_indices: Rows whose hidden state feeds the answer readout.
-        meta: Attention-path bookkeeping built by pack_chunk: the layer
-            counter, KV scatter maps, block tables, and sequence bounds.
-        attention_mode: "unified" or "tree", the path the packer laid
-            the chunk out for.
-        tokens: Rows in the chunk.
-        layout: (arena key, suffix count) per group in chunk order.
-        temporary_keys: Arena keys the loop frees after the forward pass.
-        fresh_keys: Keys whose prefix this chunk computes; the loop
-            trims their sliding pages after the pass.
-    """
-
-    input_ids: Any
-    positions: Any
-    final_indices: Any
-    meta: dict
-    attention_mode: str
-    tokens: int
-    layout: list
-    temporary_keys: tuple = ()
-    fresh_keys: tuple = ()
-
-
 def flash_attention_version(capability: tuple[int, int]) -> int:
     """Select the attention implementation for a supported CUDA architecture."""
     if capability == (9, 0):
@@ -79,6 +46,31 @@ def flash_attention_version(capability: tuple[int, int]) -> int:
     if capability == (12, 0):
         return 2
     raise ValueError(f"Quail does not support CUDA capability {capability}")
+
+
+def merge_partial(out, lse, index, out_c, lse_c) -> None:
+    """Merge attention over two disjoint key sets into the selected rows.
+
+    Updates out and lse in place using log-sum-exp weights.
+
+    Args:
+        out: Existing output tensor with shape (rows, heads, dimension).
+        lse: Existing log-sum-exp tensor with shape (heads, rows).
+        index: Indices of the output rows to update.
+        out_c: Partial output for the same queries over another key set.
+        lse_c: Log-sum-exp values corresponding to out_c.
+    """
+    lse_b = lse[:, index]
+    top = lse_b.maximum(lse_c)
+    w_b = (lse_b - top).exp()
+    w_c = (lse_c - top).exp()
+    total = w_b + w_c
+    weight_b = (w_b / total).transpose(0, 1).unsqueeze(-1)
+    weight_c = (w_c / total).transpose(0, 1).unsqueeze(-1)
+    merged = (out.index_select(0, index).float() * weight_b
+              + out_c.float() * weight_c)
+    out.index_copy_(0, index, merged.to(out.dtype))
+    lse[:, index] = top + total.log()
 
 
 class Engine:
@@ -862,6 +854,17 @@ class Engine:
             q_readers, kp, vp, reads["cu_q"], None,
             reads["max_q"], reads["max_used"], causal=False,
             block_table=reads["table"], seqused_k=reads["used"])
+        nodes = reads.get("nodes")
+        if nodes is not None:
+            # call C: chain rows over their ancestor rows in earlier
+            # chains of the chunk, merged into their call B result
+            out_c, lse_c = self._fa(
+                q3.index_select(0, nodes["rows"]),
+                k3.index_select(0, nodes["key_rows"]),
+                v3.index_select(0, nodes["key_rows"]),
+                nodes["cu_q"], nodes["cu_k"], nodes["max_q"], nodes["max_k"],
+                causal=False)
+            merge_partial(out_b, lse_b, nodes["b_index"], out_c, lse_c)
         lse_a = lse_a.transpose(0, 1)
         lse_b = lse_b.transpose(0, 1)
         q_out, scales = self.merge_attn_quant(
