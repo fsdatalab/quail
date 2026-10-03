@@ -21,10 +21,10 @@ attention on H100.
 
 ### DiffusionGemma
 
-DiffusionGemma supports filter and join predicates, `AI.SCORE`, and
+DiffusionGemma supports `AI.IF` filters and joins, `AI.SCORE`, and
 `AI.CLASSIFY`. Quail uses the
-`RedHatAI/diffusiongemma-26B-A4B-it-FP8-dynamic` checkpoint and reads
-answers directly without generating a thinking response.
+`RedHatAI/diffusiongemma-26B-A4B-it-FP8-dynamic` checkpoint. It reads
+each answer directly, without a thinking response.
 
 DiffusionGemma can improve accuracy at the cost of longer query
 times. Check both models on a labeled sample because the result
@@ -45,33 +45,30 @@ config = quail.EngineConfig(
 )
 ```
 
-Quail follows the approach for structured answers in
-[vLLM PR #57250: Jev-like DiffusionGemma support](https://github.com/vllm-project/vllm/pull/57250),
-implemented in Quail's own executor. Classification works as follows:
+Quail classifies with DiffusionGemma as
+[vLLM PR #57250](https://github.com/vllm-project/vllm/pull/57250) does:
 
-- Assign a letter to each category, such as A for "refund" and B for
-  "praise".
-- Start the answer with a random token and run one denoising step.
-  Read the category letters' probabilities at the first answer position.
-- Measure uncertainty using entropy, which measures how spread out the
-  category probabilities are. If entropy is at most 0.1 nats, choose
-  the category with the highest probability.
-- Otherwise, run the remaining attempts with different random tokens,
-  average each category's probabilities, and choose the category with
-  the highest average.
-- With `probabilities=true`, return the probabilities used to choose
-  the category, averaged over the attempts performed.
+- Quail gives each category a letter, for example A for "refund" and B
+  for "praise".
+- Quail fills the answer with random tokens and runs one denoising
+  step. It then reads the probability of each letter at the first answer
+  position.
+- If the entropy of these probabilities is 0.1 nats or less, Quail
+  returns the most probable category. Entropy shows how spread out the
+  probabilities are.
+- If the entropy is higher, Quail runs more attempts, each with
+  different random tokens. It averages each category's probability over
+  the attempts and returns the category with the highest average.
 
-`canvas_draws` sets the maximum number of attempts per document and
-defaults to four. Set `canvas_draws=1` in `EngineConfig` for one
-attempt. Classification of document pairs always uses one attempt.
-`AI.SCORE` uses the same procedure and averages
-TRUE probabilities.
+| Setting | Effect |
+| --- | --- |
+| `EngineConfig(canvas_draws=4)` | The maximum number of attempts for each document. The default is 4. `canvas_draws=1` gives one attempt. |
+| `{'probabilities': true}` | Returns the averaged probabilities beside the label. |
 
-Each random token is determined by the document's row index and
-attempt number, so changing the batch does not change the random choices.
-See [`classify.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/executor/classify.py)
-for the implementation.
+A classification of joined rows always uses one attempt. `AI.SCORE`
+uses the same steps and averages the probability of TRUE. The random
+tokens depend only on the row and the attempt number, so a different
+batch gives the same answers.
 
 [diffusion-report]: https://github.com/fsdatalab/quail/blob/3e09be9564e60183a0018b3908b05cd77cbd0d77/reports/2026-09-19-diffusion-gemma-quailb.md
 [qwen-report]: https://github.com/fsdatalab/quail/blob/bbf18747238f504866e1ca7518d23d375f97f920/reports/quailb-comparison.md
@@ -206,11 +203,12 @@ def run_query():
 Quail's own cache is controlled by `QUAIL_CACHE_DIR` (default
 `~/.cache/quail/kernels`). Other libraries use their own environment
 variables: `HF_HOME`, `DG_CACHE_DIR`, `TRITON_CACHE_DIR`,
-`VLLM_CACHE_ROOT`. FlashAttention 4, which runs heads wider than 256
-such as DiffusionGemma's, saves its compiled kernels only with
-`FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1`, under
-`FLASH_ATTENTION_CUTE_DSL_CACHE_DIR`; without it every process
-compiles them again, some inside the first query.
+`VLLM_CACHE_ROOT`. FlashAttention 4 runs the attention heads that are
+wider than 256, such as DiffusionGemma's. It keeps its compiled kernels
+only when `FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1`, in
+`FLASH_ATTENTION_CUTE_DSL_CACHE_DIR`. Without this setting, each process
+compiles the kernels again, and part of this work occurs in the first
+query.
 
 ### Submit and retrieve
 

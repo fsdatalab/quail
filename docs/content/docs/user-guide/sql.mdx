@@ -269,8 +269,8 @@ labeled examples for your task.
 
 ### AI.CLASSIFY
 
-Assigns each document one of the categories you provide. For example,
-classify reviews as positive, negative, or mixed.
+Gives each document one of the categories that you supply. For
+example, it labels each review as positive, negative, or mixed.
 
 ```sql
 SELECT r.id,
@@ -286,22 +286,22 @@ FROM reviews r;
 
 | Argument | Type | Description |
 | --- | --- | --- |
-| `input` | `STRING` column or `PROMPT` | Document to classify. Use `PROMPT` to include a question or refer to two documents. |
-| `categories` | `ARRAY` or table name | Between 2 and 255 labels, optionally with descriptions. Labels must be nonempty and unique ignoring case. |
+| `input` | `STRING` column or `PROMPT` | The document to classify. A `PROMPT` can add a question or refer to two documents. |
+| `categories` | `ARRAY` or table name | 2 to 255 labels, each with an optional description. Labels must not be empty, and two labels must not differ only in case. |
 | `options` | Object | Optional settings, such as `{'probabilities': true}`. |
 
-Supply `categories` in any of these forms:
+`categories` can have one of these forms:
 
 - Strings: `ARRAY['refund', 'praise']`.
 - Label and description pairs: `ARRAY[('refund', 'asks for money back'), ('praise', NULL)]`.
 - Objects: `ARRAY[{'label': 'refund', 'description': 'asks for money back'}, {'label': 'praise'}]`.
-- A registered table name: `kinds`. The table needs a `label` column and
-  may have `description` and integer `ordinal` columns. Labels are sorted
-  by `ordinal` when present, otherwise by label text.
+- A registered table name: `kinds`. The table has a `label` column, and
+  it can have a `description` column and an integer `ordinal` column.
+  Quail sorts the labels by `ordinal` if the column exists, and by label
+  text if not.
 
-Descriptions explain what a category means and may contain up to 25
-words each. You can also name the argument:
-`categories => ARRAY['refund', 'praise']`.
+A description tells what a category means, in 25 words or fewer. You
+can also name the argument: `categories => ARRAY['refund', 'praise']`.
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -311,14 +311,17 @@ words each. You can also name the argument:
 
 #### Output
 
-Returns a `STRING` containing one of the supplied labels. Use `AS` to
-name the result column. With `probabilities` set to `true`, Quail also
-returns `<name>_probabilities`, a `MAP<STRING, DOUBLE>`. Its values sum
-to 1 across the supplied labels.
+A `STRING`: one of the supplied labels. `AS` names the result column.
+With `probabilities` set to `true`, Quail also returns
+`<name>_probabilities`, a `MAP<STRING, DOUBLE>` from each label to its
+probability. The probabilities sum to 1.
 
-Classification requires a generative model. With vLLM or SGLang, a
-row is omitted if the generated answer matches no supplied label.
-When scores tie, Quail chooses the label listed first. See
+- When two labels have the same score, Quail returns the label that is
+  first in the list.
+- With vLLM or SGLang, a row whose generated answer matches no label is
+  not in the result.
+
+For how Quail reads the label, see
 [scoring methods](/docs/architecture/planning#choosing-classification-scoring).
 
 #### Examples
@@ -366,12 +369,12 @@ id  sentiment
 3   mixed
 ```
 
-You can also use `=` to keep one category. Other comparisons raise
-`CompileError`. A category outside the supplied list matches no rows.
-Quail uses each review's classification both to decide whether to keep
-the row and to fill the `sentiment` column.
-In `SELECT`, the call must be a separate item, rather than part of
-another expression.
+- `=` keeps one category. Other comparisons raise `CompileError`.
+- A category that is not in the list matches no rows.
+- Quail classifies each review one time. The same label decides the
+  `WHERE` condition and fills the `sentiment` column.
+- In `SELECT`, the call must be its own item, not part of a larger
+  expression.
 
 ##### Return probabilities
 
@@ -392,14 +395,21 @@ id  sentiment  sentiment_probabilities
 1   positive   {'positive': 0.90, 'negative': 0.03, 'mixed': 0.07}
 ```
 
-Probabilities are supported for individual documents with the Quail
-backend. They are unsupported for document pairs, vLLM, and SGLang.
+Only the Quail backend returns probabilities, and only for a
+classification of one document. It does not return them for joined
+rows, or with vLLM or SGLang.
 
-For joined documents, use a prompt referring to both documents. With
-the Quail backend, classification must run with its AI join on one GPU.
-You cannot use the pair's classification result in `WHERE` or combine
-pair classification with `AI.SCORE`. See
-[classifying joined rows](/docs/architecture/execution#classifying-joined-rows).
+##### Classify joined rows
+
+To classify joined rows, use a `PROMPT` that refers to both documents.
+These limits apply:
+
+- With the Quail backend, the classification and its `AI.IF` join run on
+  one GPU.
+- A `WHERE` condition cannot test the label of a joined row.
+- A query cannot classify joined rows and also use `AI.SCORE`.
+
+See [classifying joined rows](/docs/architecture/execution#classifying-joined-rows).
 
 ### AI.EXTRACT
 

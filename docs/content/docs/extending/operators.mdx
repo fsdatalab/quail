@@ -25,10 +25,10 @@ for how an existing logical node is built.
 
 ## Physical node
 
-A physical node declares its input and output ports, execution location,
-and serialization methods. `FirstDocuments` runs on the CPU and returns
-an `ids:<alias>` output. Its runtime reads document IDs from the input
-and keeps the first `count` IDs:
+A physical node declares its input and output ports, where it runs,
+and how it is serialized. `FirstDocuments` runs on the CPU and has one
+output, `ids:<alias>`. Its runtime reads the document IDs and keeps the
+first `count` of them:
 
 ```python
 from dataclasses import dataclass
@@ -68,8 +68,8 @@ class FirstDocumentsRuntime:
         return NodeResult({f"ids:{node.alias}": documents[:node.count]})
 ```
 
-`attributes()` and `from_attributes()` serialize and restore the node's
-fields. `register_node()` supplies a `NodeCodec` by default. The runtime
+`attributes()` and `from_attributes()` save and restore the node's
+fields. `register_node()` gives a default `NodeCodec`. The runtime
 implements `execute(node, inputs, context)` and returns a `NodeResult`
 with the node's declared outputs.
 
@@ -98,9 +98,10 @@ time. For an LLM operator:
 
 ## Pipelines
 
-An operator runtime can execute independently or in a pipeline.
-To support pipelines, define which adjacent operators can run together
-and which document state they can reuse.
+An operator can run alone or in a pipeline with the operators next to
+it. A pipeline lets an operator use the document KV of the operator
+before it. To run in a pipeline, an operator must state which
+neighbors it can run with and which document state it uses again.
 
 [`execution/pipelines.py`](https://github.com/fsdatalab/quail/blob/main/quail/execution/pipelines.py)
 groups physical nodes.
@@ -121,8 +122,9 @@ Rules run in this order:
 - Logical rules run in registration order, with built-in rules first.
   Quail repeats the sequence until a pass leaves the plan unchanged
   or it has run four passes (`MAX_PASSES`).
-- Physical rules run once per pass: `prefix_sharing`, then
-  `tree_attention`, then extension rules in registration order.
+- Physical rules run one time each, in this order: `kv_retention`,
+  `label_scoring`, `prefix_sharing`, `tree_attention`, then extension
+  rules in registration order.
 - If the plan was built while tokenization was running, Quail runs
   the physical rules again once the tokens are available. Return
   `None` when your rule has no change to make. A repeated pass should

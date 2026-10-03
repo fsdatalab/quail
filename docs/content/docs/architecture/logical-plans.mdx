@@ -44,6 +44,8 @@ before parents.
 | `SemanticFilter(input, predicates)` | One or more model predicates over one table. |
 | `Join(left, right, on)` | The pairs of two inputs, narrowed by ordinary column equalities. No `on` means every pair. |
 | `SemanticJoin(input, predicate, semantics, selectivity, anchor)` | One model predicate over the pairs its input `Join` produces. `semantics` is `full`, `exists`, or `anti`. A query joining three or more tables has one `SemanticJoin` per pair. |
+| `SemanticClassify(input, call, name)` | One `AI.CLASSIFY` call. It adds a label column, `name`, to each input row. A call over one table is above that table's `SemanticFilter`. A call over two tables is above their `SemanticJoin`. |
+| `Filter(input, condition, selectivity)` | The rows whose label is in a list. The model is not used. |
 | `Apply(input, function, kind, ids, columns, aliases)` | A registered Python function between two operators. |
 | `Project(input, columns, limit)` | Column projection and optional limit. Always the root. |
 
@@ -58,20 +60,20 @@ function arrives.
 | `ColumnRef(alias, provider, column)` | A column of a table. |
 | `ModelCall(prompt, kind, labels, descriptions)` | One prompt asked of every row. `kind` is `boolean` for `AI.IF`, `score` for `AI.SCORE`, or `label` for `AI.CLASSIFY`. Classification calls include labels and optional descriptions. |
 | `Compare(call, comparison, threshold)` | A score compared with a threshold. Answers yes or no. |
-| `LabelIn(call, labels)` | Checks whether the label is in a given list, such as `['refund', 'praise']`. |
+| `InList(column, values)` | The column's value is one of the listed values, as SQL `IN`. A `Filter` uses it to test a label column. |
 | `Alias(expression, name)` | A model call returned as a named result column. |
 
 A predicate on a `SemanticFilter` or `SemanticJoin` answers yes or
-no: a boolean `ModelCall`, or a `Compare` around a score call.
-A `SemanticFilter` can also use `LabelIn` to test a one-document
-classification. Pair label tests are unsupported.
-`Project.columns` holds `ColumnRef` and `Alias` values.
+no: a boolean `ModelCall`, or a `Compare` around a score call. A
+condition on a label is not a model predicate. It is a `Filter` with an
+`InList`, above the `SemanticClassify` that adds the label. A label of
+joined rows cannot be tested. `Project.columns` holds `ColumnRef` and
+`Alias` values.
 
 `LogicalPlan.operators()` is the one walk that turns the tree into
 what the planner reads: the scans, each alias's filter predicates in
-written order, the joins in written order, and the applies.
-It also collects calls that return scores or labels, their column names,
-and conditions that filter by label. See
+written order, the joins in written order, the applies, the score and
+label calls with their column names, and the label filters. See
 [physical node types](/docs/architecture/physical-plans#node-types).
 
 
@@ -205,20 +207,20 @@ repeats until a pass leaves the plan unchanged or four passes have
 run. The limit is `MAX_PASSES` in `logical_optimizer.py`. See
 [rule order and precedents](/docs/extending/operators#optional-logical-and-physical-rules).
 
-Quail includes one built-in logical rule:
+Quail has five built-in logical rules, in
+[`logical_rules.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/logical_rules.py).
+They run in this order:
 
-- **[Projection pushdown](https://github.com/fsdatalab/quail/blob/main/quail/planner/logical_rules.py)**
-  (`ProjectionPushdown`): rewrites each `Scan` to load only the
-  columns the query actually uses.
+| Rule | What it does |
+| --- | --- |
+| `projection_pushdown` | Each `Scan` loads only the columns that the query uses. |
+| `filter_pushdown` | Moves a filter that does not use the model, such as an `Apply` or a label `Filter`, below the joins, onto its table. |
+| `classify_placement` | For a joined table, puts its classifications before the joins or after them, whichever plan has the lower estimated time. |
+| `filter_order` | Orders each table's `AI.IF` predicates by expected cost. |
+| `join_order` | Chooses the join order and the anchor of each join by expected cost. |
 
-Other optimizations like filter ordering and join ordering currently
-happen in the [planner](/docs/architecture/planning), because they
-depend on cost estimates from the model and device specs. They could
-also be expressed as logical rules.
-
-Filter placement (filters above their scans, before joins) is
-handled during plan construction in
-[`LogicalPlanBuilder`](https://github.com/fsdatalab/quail/blob/main/quail/logical/nodes.py).
+The last three rules use cost estimates from the model and device
+specs. See [Planning](/docs/architecture/planning).
 
 Extensions can register additional rules through
 `registry.register_logical_rule(...)`.

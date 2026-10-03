@@ -200,9 +200,10 @@ return that same plan.
 
 **Returns**
 
-`PhysicalPlan | Refusal`. The plan the executor will run, including
-the model, worker count, and estimated seconds. A `Refusal` explains why
-the query cannot run. Running a refused query raises `quail.RefusalError`.
+`PhysicalPlan | Refusal`. A `PhysicalPlan` is the plan that the executor
+runs, with the model, the worker count, and the estimated seconds. A
+`Refusal` tells why Quail cannot run the query. A run of a refused query
+raises `quail.RefusalError`.
 
 ##### explain
 
@@ -484,8 +485,9 @@ operators.
 
 ### Classification answers
 
-`result.collect()` returns selected label columns as Arrow strings.
-To see labels before later filters remove rows, read the answer table:
+`result.collect()` returns the selected label columns as Arrow strings.
+To see the labels before later filters remove rows, read the answer
+table:
 
 ```python
 result = query.run()
@@ -493,10 +495,10 @@ labels = result.answer_tables["classifies"]["sentiment"]
 print(labels.to_pydict())
 ```
 
-The table contains zero-based document indices in `r` and labels in
-`sentiment`. A pair classifier includes both tables' indices. Answer
-tables can include rows removed by later filters, so they may contain
-more rows than the query result.
+The table has the zero-based document index in `r` and the label in
+`sentiment`. A classification of joined rows has the index of each
+table. An answer table keeps the rows that later filters remove, so it
+can have more rows than the query result.
 
 ### Execution report
 

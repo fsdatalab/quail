@@ -11,6 +11,27 @@ KV. Each decision is guided by a cost estimate.
 Implementation:
 [quail/planner/decide.py](https://github.com/fsdatalab/quail/blob/main/quail/planner/decide.py).
 
+## Steps
+
+The planner works in this order:
+
+1. `Query.plan()` gets the token length of each document. If
+   tokenization is not finished, it estimates each length from the
+   tokens per byte of the first 1,024 documents.
+2. The [logical rules](/docs/architecture/logical-plans#logical-rules)
+   rewrite the logical plan: `projection_pushdown`, `filter_pushdown`,
+   `classify_placement`, `filter_order`, `join_order`. The planner
+   repeats them until a pass changes nothing, with a maximum of four
+   passes.
+3. `build_physical_plan` makes the physical plan from the logical plan.
+4. The physical rules set how each node runs, one time each, in this
+   order: `kv_retention`, `label_scoring`, `prefix_sharing`,
+   `tree_attention`.
+5. When tokenization finishes, the physical rules run again on the
+   exact tokens. The logical decisions do not change.
+
+The sections below describe each decision.
+
 ## Inputs
 
 The planner receives:
@@ -62,36 +83,37 @@ KV reads).
 
 ## Choosing classification scoring
 
-Quail chooses the supported method with the lowest estimated execution time.
+The `label_scoring` rule chooses how each classification reads its
+label. It estimates the time of each method that the model supports
+and uses the fastest one.
 
-Imagine we have a query with an `AI.CLASSIFY` operator that assigns
-customer messages one of the labels `['refund', 'praise']`. For the
-message "Please refund my order":
+For example, a classification gives each customer message one of the
+labels `['refund', 'praise']`. For the message "Please refund my order":
 
-- `letters`: Assigns A to "refund" and B to "praise", then compares the
-  LLM's scores for A and B. If A scores 0.8 and B scores 0.2, Quail
-  returns "refund". Each letter must fit in one token.
-- `trie_tree`: Scores both "refund" and "praise" by multiplying the
-  probabilities of each label's tokens. Suppose "refund" takes two
-  tokens with probabilities 0.8 and 0.6. Its score is 0.48. If "praise"
-  scores 0.3, Quail returns "refund". Labels that start with the same
-  tokens share that part of the computation. Requires an FP8 model
-  that generates tokens in order, with attention not forced to `unified`.
-- `trie_decode`: Chooses the label one token at a time, allowing only
-  tokens that can complete one of the supplied labels. Suppose the
-  tokenizer splits "refund" into "re" and "fund". If the LLM chooses
-  "re" first, Quail continues with "fund" and returns "refund". It
-  cannot use a label whose tokens are the start of a longer label's
-  token sequence.
+- `letters`: The prompt gives each label a letter: A for "refund" and B
+  for "praise". Quail compares the model's scores for A and B. If A has
+  0.8 and B has 0.2, Quail returns "refund". Each letter must be one
+  token.
+- `trie_tree`: Quail scores each label as the product of the
+  probabilities of its tokens. If "refund" has two tokens with
+  probabilities 0.8 and 0.6, its score is 0.48. If "praise" has 0.3,
+  Quail returns "refund". Labels that start with the same tokens share
+  that part of the work. This method needs an FP8 model that generates
+  tokens in order, and attention that is not forced to `unified`.
+- `trie_decode`: Quail chooses the label one token at a time. At each
+  step it allows only the tokens that continue one of the labels. If the
+  tokenizer splits "refund" into "re" and "fund", and the model chooses
+  "re", Quail continues with "fund" and returns "refund". This method
+  cannot use a label whose tokens are the start of a longer label.
 
-The planner considers `trie_decode` automatically only when an earlier
-operator has not already saved the document's KV. Classification of
-joined documents uses `letters`. See [DiffusionGemma](/docs/user-guide/models#diffusiongemma)
-for that model's classification behavior.
+These limits apply:
 
-With `probabilities=true`, Quail scores every label, so `trie_decode`
-is unavailable. The returned probabilities sum to 1 across the labels.
-When scores tie, Quail favors the label listed first.
+- The planner considers `trie_decode` only when no earlier operator
+  keeps the document's KV.
+- A classification of joined rows uses `letters`.
+- With `probabilities=true`, Quail scores every label, so it does not
+  use `trie_decode`.
+- For DiffusionGemma, see [DiffusionGemma](/docs/user-guide/models#diffusiongemma).
 
 Implementation:
 [`planner/classify.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/classify.py)
