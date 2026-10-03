@@ -119,8 +119,8 @@ and
 [`physical_rules.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/physical_rules.py).
 
 Logical rules that compare costs leave the plan unchanged when model
-specifications are unavailable, the backend is not `quail`, or the model
-does not fit on one GPU. Queries containing `AI.SCORE` use the reranker planner instead.
+specifications are unavailable or the model does not fit on one GPU.
+Queries containing `AI.SCORE` use the reranker planner instead.
 
 Call `explain(verbose=True)` to inspect physical settings, including
 `share_prefixes` and `attention`.
@@ -294,8 +294,9 @@ outputs and write the combined output.
 - For filters, the rule compares paths for each group of documents
   sharing a parent prefix. It chooses the path preferred by the most
   reused tokens. Ties choose unified attention.
-- Tree attention requires FP8 weights and no canvas tokens. Other
-  configurations use unified attention.
+- Tree attention supports BF16 and FP8 weights. It requires at least
+  two billion parameters, excluding embeddings and output layers, and
+  no extra answer positions. Other configurations use unified attention.
 
 The current comparison uses the FP8 compute rate for attention, although
 the kernel runs in BF16. It therefore underestimates attention compute

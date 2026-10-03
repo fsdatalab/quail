@@ -83,9 +83,15 @@ The setting does not change `AI.IF` execution.
 ## Decision 2.0 Kai 0.6B
 
 [Decision 2.0 Kai 0.6B](https://huggingface.co/vllm-sr/Decision-2.0-Kai-0.6B)
-is a Qwen3 model trained to select an answer from supplied choices.
-It supports `AI.IF`, `AI.SCORE`, and `AI.CLASSIFY` on the Quail and
-stock vLLM backends. The SGLang backend does not support it.
+is a model from the vLLM Semantic Router team. It is fine tuned from
+Qwen3 0.6B to score supplied answers and return their probabilities in
+one forward pass.
+
+Quail uses the model for these functions:
+
+- `AI.IF` selects between "Yes" and "No" for a filter or join condition.
+- `AI.SCORE` returns the probability of "Yes" for that condition.
+- `AI.CLASSIFY` selects the supplied label with the highest score.
 
 ```python
 config = quail.EngineConfig(
@@ -94,14 +100,18 @@ config = quail.EngineConfig(
 )
 ```
 
-Use the same query syntax as for the other models. Quail formats the
-prompt for this model. For `AI.SCORE`, the score is the model's probability
-for "Yes" when choosing between "Yes" and "No".
+Use the existing SQL and Python query syntax. Quail prepares the prompt
+for the model.
 
-On first use, Quail converts and saves the checkpoint for loading.
-Later sessions reuse that copy. The weight format and prompt tokenization
-differ from the model's reference implementation, so answers near a tie
-can differ.
+*Calibration* describes how closely predicted probabilities match
+observed answer frequencies. Check calibration on labeled examples from
+your task before choosing a score threshold.
+
+See the vLLM Semantic Router team's
+[blog post introducing decision models](https://vllm-sr.ai/blog/decision-models/)
+for the approach. The post covers Decision 1.0; the
+[Kai 2.0 model card](https://huggingface.co/vllm-sr/Decision-2.0-Kai-0.6B)
+describes the model supported here.
 
 ## No local GPU? Use Modal
 

@@ -10,7 +10,7 @@ The plan also records execution settings, such as the
 
 The [optimizer](/docs/architecture/optimizer) builds the physical plan
 from a logical plan. The logical plan describes the requested operations.
-The physical plan specifies how the selected backend executes them.
+The physical plan specifies how Quail executes them.
 
 ## Execute a review query
 
@@ -34,7 +34,7 @@ it identifies each review by its row position in the input table,
 starting at zero. Quail calls this position a document ID. It is separate
 from the value in `reviews.id`.
 
-The Quail backend uses four operators to execute this query. Each box
+Quail uses four operators to execute this query. Each box
 represents an operator. Each arrow shows the data passed between operators.
 
 <Mermaid chart={`flowchart TD
