@@ -101,6 +101,25 @@ Using both raises a compilation error. The
 [SQL reference](/docs/user-guide/sql#aiclassify) lists label requirements,
 probability output, and limits on classifications of joined rows.
 
+### ai_score
+
+`ai_score(prompt, name=...)`
+
+Add a named `AI.SCORE` column: the model's belief, between 0 and 1,
+that the prompt is true of the row. Use the name in `select()`,
+`order_by()`, and as an `agg()` argument.
+
+```python
+query = (
+    session.docs("reviews").alias("r")
+    .ai_score(prompt('Does the customer request a refund?\n\n{0}',
+                     col("r.body")), name="refund_score")
+    .order_by(col("refund_score").desc())
+    .limit(10)
+    .select("r.id", "refund_score")
+)
+```
+
 ### label_in
 
 `label_in(name: str, labels: Iterable[str], selectivity: float | None = None)`
@@ -247,6 +266,32 @@ applies after sorting.
 
 Sorting columns need not appear in `select()`, except when using
 `distinct()`.
+
+### group_by, agg, having
+
+`group_by(*keys)`, `agg(**aggregates)`, `having(*tests)`
+
+Group the result rows by columns or by the names of `ai_classify`
+outputs, compute named aggregates with `count()`, `count_distinct()`,
+`sum_()`, `avg()`, `min_()`, and `max_()` from `quail.frontend.builder`,
+and keep the groups whose aggregates pass tests. `select()` then lists
+keys and aggregate names.
+
+```python
+from quail.frontend.builder import avg, col, count, prompt
+
+query = (
+    session.docs("reviews").alias("r")
+    .ai_classify(prompt('What is the sentiment of this review?\n\n{0}',
+                        col("r.body")),
+                 ["positive", "negative", "mixed"], name="sentiment")
+    .group_by("sentiment")
+    .agg(n=count(), mean_stars=avg("r.stars"))
+    .having(count() > 10)
+    .order_by(col("n").desc())
+    .select("sentiment", "n", "mean_stars")
+)
+```
 
 ### offset
 

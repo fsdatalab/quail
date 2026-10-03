@@ -8,6 +8,8 @@ from sqlglot import exp
 from quail.catalog import Catalog
 from quail.frontend.label_tables import read_label_table
 from quail.logical import (
+    AggregateCall,
+    Aggregation,
     Alias,
     ColumnPredicate,
     ColumnRef,
@@ -15,6 +17,7 @@ from quail.logical import (
     CompileError,
     Equality,
     FilterPredicate,
+    HavingTest,
     JoinSpec,
     LogicalPlan,
     LogicalPlanBuilder,
@@ -31,8 +34,6 @@ from quail.logical.prompts import bind_classify_prompt
 # Every relational operator outside the language, named and refused.
 # OR is rejected separately with its own message.
 FORBIDDEN = (
-    (exp.Group, "GROUP BY"),
-    (exp.Having, "HAVING"),
     (exp.Qualify, "QUALIFY"),
     (exp.Window, "window functions"),
     (exp.Union, "UNION"),
@@ -650,13 +651,17 @@ def _parse_distinct(tree) -> bool:
     return True
 
 
-def _parse_order(tree, b: "_Binder", columns: list) -> tuple:
+def _parse_order(tree, b: "_Binder", columns: list,
+                 aggregation: Aggregation | None = None) -> tuple:
     """Bind each ORDER BY term to a projected name or a source column."""
     order = tree.args.get("order")
     if order is None:
         return ()
     named = {column.name: column for column in columns
              if isinstance(column, Alias)}
+    if aggregation is not None:
+        named.update({aggregate.name: aggregate
+                      for aggregate in aggregation.aggregates})
     keys = []
     for term in order.expressions:
         target = term.this
@@ -866,8 +871,8 @@ def compile_sql(sql: str, catalog: Catalog,
         # BigQuery style: tables cross-joined in FROM, filtered here
         add_join_spec(predicate, options, aliases)
 
-    columns = _compile_projection(b, tree.expressions)
-    order = _parse_order(tree, b, columns)
+    columns, aggregation = _compile_select(b, tree)
+    order = _parse_order(tree, b, columns, aggregation)
     projected = tuple(
         column for column in columns if isinstance(column, Alias)
     )
@@ -957,7 +962,8 @@ def compile_sql(sql: str, catalog: Catalog,
         if len(call.aliases()) == 2:
             logical.add_classify(call, name)
     return logical.project(tuple(columns), limit, order=order,
-                           offset=offset, distinct=distinct)
+                           offset=offset, distinct=distinct,
+                           aggregation=aggregation)
 
 
 def _check_join_coverage(
@@ -1042,6 +1048,159 @@ def _compile_exists(b: _Binder, node: exp.Exists, anti: bool) -> None:
                             semantics="anti" if anti else "exists",
                             selectivity=options.get("selectivity"),
                             anchor=outer))
+
+
+_AGGREGATE_CLASSES = {
+    exp.Count: "count", exp.Sum: "sum", exp.Avg: "avg",
+    exp.Min: "min", exp.Max: "max",
+}
+
+
+def _column_name(column) -> str:
+    return (f"{column.alias}.{column.column}"
+            if isinstance(column, ColumnRef) else column.name)
+
+
+def _project_argument(b: _Binder, node, columns: list, hidden: str) -> str:
+    """Bind an aggregate's or key's expression to a projected column name.
+
+    A column or AI expression not yet projected is appended to
+    ``columns``, an AI expression under the ``hidden`` name.
+    """
+    names = {column.name: column for column in columns
+             if isinstance(column, Alias)}
+    if isinstance(node, exp.Column):
+        if not node.table and node.name in names:
+            return node.name
+        ref = b.resolve_column(node)
+        if ref not in columns:
+            columns.append(ref)
+        return _column_name(ref)
+    if _is_call(node, "AI_SCORE"):
+        prompt, _options, aliases = b.parse_ai_call(node, "AI_SCORE", set())
+        call = ModelCall(prompt, "score")
+    elif isinstance(node, exp.AIClassify):
+        call, _options, _aliases = b.parse_ai_classify(node)
+    else:
+        raise CompileError(
+            f"{node.sql()} is not a column or an AI expression")
+    for name, column in names.items():
+        if column.expression == call:
+            return name
+    columns.append(Alias(call, hidden))
+    return hidden
+
+
+def _aggregate_call(b: _Binder, node, columns: list, name: str,
+                    hidden: str) -> AggregateCall:
+    """Bind one COUNT, SUM, AVG, MIN, or MAX call."""
+    function = _AGGREGATE_CLASSES[type(node)]
+    argument = node.this
+    if isinstance(argument, exp.Star):
+        if function != "count":
+            raise CompileError(f"{node.sql()} needs a column")
+        return AggregateCall("count", None, name)
+    if isinstance(argument, exp.Distinct):
+        if function != "count" or len(argument.expressions) != 1:
+            raise CompileError(
+                "DISTINCT inside an aggregate is COUNT(DISTINCT column)")
+        function, argument = "count_distinct", argument.expressions[0]
+    return AggregateCall(
+        function, _project_argument(b, argument, columns, hidden), name)
+
+
+def _compile_select(b: _Binder, tree) -> tuple:
+    """Bind the SELECT list, GROUP BY, and HAVING.
+
+    Returns:
+        The projected columns and the Aggregation, or None without
+        GROUP BY and aggregates.
+    """
+    plain, aggregates, output = [], [], []
+    columns = []
+    for index, e in enumerate(tree.expressions):
+        node = e.this if isinstance(e, exp.Alias) else e
+        if type(node) in _AGGREGATE_CLASSES:
+            if not isinstance(e, exp.Alias) or not e.alias:
+                raise CompileError(f"{node.sql()} needs an AS name in SELECT")
+            aggregate = _aggregate_call(b, node, columns, e.alias,
+                                        f"__agg_{index}")
+            aggregates.append(aggregate)
+            output.append(aggregate.name)
+            continue
+        if any(type(call) in _AGGREGATE_CLASSES for call in node.walk()):
+            raise CompileError(
+                "an aggregate in SELECT is a direct COUNT, SUM, AVG, MIN, "
+                "or MAX call with an AS name")
+        before = len(columns)
+        columns.extend(_compile_projection(b, [e]))
+        plain.extend(_column_name(column) for column in columns[before:])
+        output.extend(_column_name(column) for column in columns[before:])
+    group = tree.args.get("group")
+    keys = []
+    for index, node in enumerate(group.expressions if group else ()):
+        if isinstance(node, exp.Literal) and not node.is_string:
+            position = int(node.this)
+            if not 1 <= position <= len(output):
+                raise CompileError(f"GROUP BY {position} is out of range")
+            keys.append(output[position - 1])
+            continue
+        keys.append(_project_argument(b, node, columns, f"__key_{index}"))
+    having = tree.args.get("having")
+    tests = []
+    for index, term in enumerate(_conjuncts(having.this) if having else []):
+        comparison = _PLAIN_HAVING.get(type(term))
+        if comparison is None:
+            raise CompileError(
+                f"HAVING compares an aggregate with a number, got "
+                f"{term.sql()}")
+        left, right = term.this, term.expression
+        if not isinstance(right, (exp.Literal, exp.Neg)):
+            left, right, comparison = right, left, _FLIPPED[comparison]
+        if type(left) in _AGGREGATE_CLASSES:
+            candidate = _aggregate_call(b, left, columns, f"__having_{index}",
+                                        f"__agg_having_{index}")
+            same = next((a for a in aggregates
+                         if (a.function, a.argument)
+                         == (candidate.function, candidate.argument)), None)
+            if same is None:
+                aggregates.append(candidate)
+                same = candidate
+        elif isinstance(left, exp.Column) and not left.table:
+            same = next((a for a in aggregates if a.name == left.name), None)
+            if same is None:
+                raise CompileError(
+                    f"HAVING {left.name} is not an aggregate of this SELECT")
+        else:
+            raise CompileError(
+                f"HAVING tests an aggregate, got {term.sql()}")
+        tests.append(HavingTest(same, comparison, _number(right)))
+    if not aggregates and not keys and not tests:
+        return columns, None
+    for name in plain:
+        if name not in keys:
+            raise CompileError(
+                f"{name} is in SELECT but not in GROUP BY and not "
+                f"aggregated")
+    return columns, Aggregation(tuple(keys), tuple(aggregates),
+                                tuple(output), tuple(tests))
+
+
+_PLAIN_HAVING = {
+    exp.EQ: "=", exp.NEQ: "<>", exp.LT: "<", exp.LTE: "<=",
+    exp.GT: ">", exp.GTE: ">=",
+}
+_FLIPPED = {"<": ">", "<=": ">=", ">": "<", ">=": "<=", "=": "=", "<>": "<>"}
+
+
+def _number(node):
+    """Return the number a literal names, or raise."""
+    if isinstance(node, exp.Neg):
+        return -_number(node.this)
+    if isinstance(node, exp.Literal) and not node.is_string:
+        text = str(node.this)
+        return float(text) if "." in text or "e" in text.lower() else int(text)
+    raise CompileError(f"HAVING compares with a number, got {node.sql()}")
 
 
 def _compile_projection(b: _Binder, expressions) -> list:

@@ -19,6 +19,7 @@ from .codec import (
     plan_envelope,
 )
 from .nodes import (
+    Aggregate,
     AiClassify,
     AiFilter,
     AiJoin,
@@ -46,6 +47,7 @@ from .nodes import (
 )
 
 __all__ = [
+    "Aggregate",
     "AiClassify",
     "AiJoin",
     "AiScore",
