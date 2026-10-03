@@ -13,7 +13,7 @@ Set `model` to the model you want to run and `device` to your GPU type.
 | DiffusionGemma 26B-A4B | `"diffusion-gemma-26b-a4b-fp8"` | FP8 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY` |
 | Qwen3 Reranker 0.6B | `"qwen3-reranker-0.6b-bf16"` | BF16 | `AI.SCORE` |
 | Qwen3 Reranker 4B | `"qwen3-reranker-4b-bf16"` | BF16 | `AI.SCORE` |
-| Decision 2.0 Kai 0.6B | `"decision-2.0-kai-0.6b-bf16"` | BF16 | `AI.IF`, `AI.SCORE` |
+| Decision 2.0 Kai 0.6B | `"decision-2.0-kai-0.6b-bf16"` | BF16 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY` |
 
 *FP8* is an 8 bit floating point format. *BF16* is a 16 bit floating point
 format. All listed models store KV in BF16.
@@ -82,26 +82,10 @@ The setting does not change `AI.IF` execution.
 
 ## Decision 2.0 Kai 0.6B
 
-[Decision-2.0-Kai-0.6B](https://huggingface.co/vllm-sr/Decision-2.0-Kai-0.6B)
-is a decision model from vLLM Semantic Router: a Qwen3-0.6B network
-with a separate classifier head. It answers `AI.IF` filters and joins
-and `AI.SCORE`, where the score is the head's probability of `Yes` over
-`No`. It does not run `AI.CLASSIFY`, and the stock vLLM and SGLang
-backends do not run it.
-
-Quail writes each prompt in the model's yes/no question format: the
-document after `Context:`, the question, a `No` option block, a `Yes`
-option block, and a closing line. In a join the question follows the
-anchor document, so it is computed once per anchor; the option blocks
-follow the partner document. Quail reads the last token of each option
-block and the last token of the prompt, and the head scores both
-options in FP32.
-
-On first use Quail converts the checkpoint once to a BF16 Qwen3 folder
-under `$HF_HOME/quail-checkpoints/`. The model's own code keeps FP32
-weights under BF16 autocast, and Quail tokenizes each document
-separately from the fixed prompt text, so answers near a tie can
-differ from the model's own code.
+[Decision 2.0 Kai 0.6B](https://huggingface.co/vllm-sr/Decision-2.0-Kai-0.6B)
+is a Qwen3 model trained to select an answer from supplied choices.
+It supports `AI.IF`, `AI.SCORE`, and `AI.CLASSIFY` on the Quail and
+stock vLLM backends. The SGLang backend does not support it.
 
 ```python
 config = quail.EngineConfig(
@@ -109,6 +93,15 @@ config = quail.EngineConfig(
     device="h100-sxm",
 )
 ```
+
+Use the same query syntax as for the other models. Quail formats the
+prompt for this model. For `AI.SCORE`, the score is the model's probability
+for "Yes" when choosing between "Yes" and "No".
+
+On first use, Quail converts and saves the checkpoint for loading.
+Later sessions reuse that copy. The weight format and prompt tokenization
+differ from the model's reference implementation, so answers near a tie
+can differ.
 
 ## No local GPU? Use Modal
 

@@ -182,8 +182,8 @@ config = quail.EngineConfig(
 
 Rerankers score the model's preference for "yes" over "no". The Qwen3
 FP8 models and DiffusionGemma score TRUE against FALSE using the `AI.IF`
-prompt layout. The decision model scores `Yes` against `No` with its
-own head, using its yes/no question layout.
+prompt layout. [Decision 2.0 Kai](/docs/user-guide/models#decision-20-kai-06b)
+returns the probability of "Yes" when choosing between "Yes" and "No".
 
 `AI.SCORE(...) > 0.5` can select different rows from `AI.IF(...)`, because
 they use different execution paths. Validate the chosen operator and

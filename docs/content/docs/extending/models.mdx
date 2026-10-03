@@ -13,81 +13,58 @@ configurations.
 A *model specification* records a checkpoint, model dimensions, and
 numerical formats. Quail represents it with `ModelSpec`.
 
+### Register a Qwen3 checkpoint
+
+Use `qwen3_spec` to read the model dimensions and weight format from the
+checkpoint's `config.json`.
+
 For example, imagine that you have fine tuned Qwen3 4B and saved a complete
-FP8 checkpoint in `/models/review-qwen3-4b-fp8`. The checkpoint contains the
-weights, model configuration, and tokenizer files. Its model dimensions,
-tokenizer, and weight format match the original checkpoint.
-
-Create a `ModelSpec` for the checkpoint:
-
-```python
-from quail.specs import ModelSpec
-
-MY_MODEL = ModelSpec(
-    name="review-qwen3-4b-fp8",
-    params=3.6e9,
-    layers=36,
-    hidden=2560,
-    n_q=32,
-    n_kv=8,
-    d_head=128,
-    ffn_width=19456,
-    w_bytes=1.0,
-    hf_name="/models/review-qwen3-4b-fp8",
-    w_mem_bytes=4.5e9,
-    vocab=151936,
-    tied_head=True,
-    arch="qwen3",
-)
-```
-
-The checkpoint directory must be available in the process that loads the
-model. For a Hugging Face checkpoint, use its repository ID in `hf_name`
-and commit ID in `revision`.
-
-If the dimensions, tokenizer, or weight format changed, update the
-specification to match. Use the checkpoint's `config.json` and weight
-files for the values. Measure loaded weight memory for `w_mem_bytes`;
-its default estimate uses `params * w_bytes`.
-
-See [`ModelSpec`](https://github.com/fsdatalab/quail/blob/main/quail/specs/base.py)
-for the fields and
-[the Qwen3 4B specification](https://github.com/fsdatalab/quail/blob/main/quail/specs/qwen3_4b.py)
-for a complete configuration.
-
-### Qwen3 checkpoints from `config.json`
-
-`qwen3_spec` builds a Qwen3 checkpoint's `ModelSpec` from its
-`config.json`: the layer count, hidden size, head counts and head
-dim, MLP width, vocabulary, whether the output head is tied to the
-embedding, and the weight precision. For example, imagine registering
-a Qwen3 fine-tune published on Hugging Face:
+checkpoint in `/models/review-qwen3-4b`. The directory contains the weights,
+model configuration, and tokenizer files.
 
 ```python
 import quail
 from quail.specs import qwen3_spec
 
 spec = qwen3_spec(
-    "my-qwen3-1.7b",                 # the model= value
-    "Org/My-Qwen3-1.7B",             # the Hugging Face repo
-    revision="<commit hash>",
-    w_mem_bytes=3.4e9,               # optional; measured after loading
+    name="review-qwen3-4b",
+    hf_name="/models/review-qwen3-4b",
+    config="/models/review-qwen3-4b/config.json",
 )
 registry = quail.ExtensionRegistry.with_built_ins()
 registry.register_model(spec)
-session = quail.Session(
-    quail.EngineConfig(model="my-qwen3-1.7b", device="h100-sxm"),
-    registry=registry,
-)
+config = quail.EngineConfig(model=spec.name, device="h100-sxm")
+session = quail.Session(config=config, registry=registry)
+session.close()
 ```
 
-The checkpoint needs BF16 weights, or FP8 weights in 128 x 128 blocks.
-`qwen3_spec` raises `ValueError` for any other weight format, for a
-sliding attention window, and for a model type other than `qwen3`.
-`params` counts the attention and MLP projections and the norms, not
-the embedding table or the output head. Keyword arguments set any
-other `ModelSpec` field. See
-[quail/specs/qwen3.py](https://github.com/fsdatalab/quail/blob/main/quail/specs/qwen3.py).
+The example registers the checkpoint and creates a session. It does not
+run a query. The checkpoint directory must be available in the process
+that loads the model.
+
+For a Hugging Face checkpoint, set `hf_name` to its repository ID and
+`revision` to its commit ID. Omit `config` to download `config.json`.
+
+The checkpoint must use BF16 weights or FP8 weights stored in blocks of
+128 by 128 values. Models that use sliding window attention are not
+supported. See [weight formats](/docs/user-guide/models#models).
+
+You can pass additional `ModelSpec` fields to `qwen3_spec`. For example,
+set `w_mem_bytes` to the measured GPU memory used by the loaded weights.
+See [`qwen3_spec`](https://github.com/fsdatalab/quail/blob/main/quail/specs/qwen3.py)
+for its arguments.
+
+### Other architectures
+
+For another architecture, you can define a `ModelSpec` and register it
+with `registry.register_model(spec)`. The specification must match the
+checkpoint's dimensions, weight format, and prompt format. Registering a
+specification does not add execution support for the architecture.
+
+See [`ModelSpec`](https://github.com/fsdatalab/quail/blob/main/quail/specs/base.py)
+for the fields and
+[Implementing a model architecture](#implementing-a-model-architecture)
+for the execution requirements.
 
 ## GPU specifications
 
@@ -112,23 +89,6 @@ The backend must accept its device name and provide compatible execution
 code. The Quail backend currently accepts `h100-sxm` and
 `rtx-pro-6000-blackwell-server`. Its checks are in
 [`backend.py`](https://github.com/fsdatalab/quail/blob/main/quail/backends/quail/backend.py).
-
-## Registration
-
-Register the checkpoint specification and select it in `EngineConfig`:
-
-```python
-import quail
-
-registry = quail.ExtensionRegistry.with_built_ins()
-registry.register_model(MY_MODEL)
-config = quail.EngineConfig(model=MY_MODEL.name, device="h100-sxm")
-session = quail.Session(config=config, registry=registry)
-session.close()
-```
-
-The example creates and closes a session without running model inference.
-Each model or device name must be unique within its registry.
 
 ## Implementing a model architecture
 

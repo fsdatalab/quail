@@ -240,6 +240,8 @@ chooses the one with the lowest estimated GPU time. It considers the
 model, label tokens, requested output, and whether earlier operators
 already provide document KV.
 
+Decision 2.0 Kai uses its own scoring method, `decision_choice`, so the
+rule does not compare alternative methods for that model.
 See [Label scoring](/docs/architecture/execution#label-scoring) for how
 the methods select labels and their requirements.
 

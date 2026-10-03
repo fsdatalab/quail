@@ -105,13 +105,13 @@ or several forward passes.
 #### Label scoring
 
 *Label scoring* determines how the model selects one of the supplied
-classification labels. Quail supports three methods. The
+classification labels. For Qwen3 generative models, the
 [optimizer selects a method](/docs/architecture/optimizer#label-scoring)
 using estimated GPU time. The methods can return different labels because
 they score the choices differently.
 
 For example, imagine classifying customer messages as `refund` or `praise`.
-Quail can select between these labels in three ways:
+The generative models can select between these labels in three ways:
 
 | Method | How it selects a label | Requirement |
 | --- | --- | --- |
@@ -135,9 +135,14 @@ Additional requirements apply:
   classification that does not reuse document KV from an earlier operator.
 - Requesting probabilities excludes `trie_decode`, because it does not
   score every label.
-- Classifications of joined pairs use `letters`.
+- Classifications of joined pairs use `letters` for generative models.
 - DiffusionGemma uses `letters` with its extra answer positions. See
   [DiffusionGemma](/docs/user-guide/models#diffusiongemma) for configuration.
+
+Decision 2.0 Kai uses `decision_choice`. It scores each supplied label
+as an option and selects the option with the highest score. The model
+processes all options in one request. It can also return label
+probabilities for classifications of individual documents.
 
 #### Classifying joined rows
 
@@ -163,9 +168,11 @@ reduce memory reads, but the additional call and combination take time.
 The [planner compares those costs](/docs/architecture/optimizer#attention-path)
 when choosing a path.
 
-*FP8* is a number format that uses eight bits per value. Tree attention
-requires FP8 weights and a model without extra answer positions.
-DiffusionGemma uses extra answer positions, so it uses unified attention. See [Supported models](/docs/user-guide/models).
+Tree attention supports BF16 and FP8 weights. Quail enables it for models
+with at least two billion parameters, excluding embeddings and output
+layers. Smaller models use unified attention. DiffusionGemma also uses
+unified attention because it requires extra answer positions. See
+[Supported models](/docs/user-guide/models).
 
 ### Multiple GPUs
 
