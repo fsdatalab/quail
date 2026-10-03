@@ -20,7 +20,7 @@ from fakes import (
 
 from quail.backends.quail import QuailModelExecution
 from quail.backends.quail.executor import chunk as chunk_mod
-from quail.backends.quail.graph import execute_single_graph
+from quail.backends.quail.graph import _tuple_suffix, execute_single_graph
 from quail.builtins import built_in_registry
 from quail.physical import (
     AiClassify,
@@ -666,8 +666,6 @@ def test_a_classification_of_joined_rows_runs_after_its_join_on_the_anchors_kv(
 
 
 def test_a_join_writes_its_first_partner_label_with_the_frame():
-    from quail.backends.quail.graph import _tuple_suffix
-
     stage = JoinStage(
         written_pos=0, exec_idx=0, anchor="r", partners=("p", "q"),
         semantics="full", selectivity=0.5, expected_tuples=1,

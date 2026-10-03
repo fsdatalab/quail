@@ -212,7 +212,7 @@ def stage_work(spec: dict, anchor: str, live: dict, lengths: dict,
     if stats.count == 0 or n <= 0:
         return Work()
     partners = [a for a in spec["aliases"] if a != anchor]
-    # the first partner's label is written with the frame, once per anchor
+    # matches JoinStage.runtime_spec: the first label is in the frame
     u = spec["tail_tokens"] + sum(
         spec["label_tokens"][p] + lengths[p].mean for p in partners[1:]
     ) + (lengths[partners[0]].mean if partners else 0.0)

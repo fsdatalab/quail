@@ -115,8 +115,8 @@ class JoinStage:
     def runtime_spec(self) -> dict:
         """Return the bound prompt and predicate for the join driver.
 
-        The first partner's label directly follows the frame in every
-        pair, so it is part of the frame, written once per anchor.
+        The frame includes the first partner's label, which every pair
+        of the anchor shares.
         """
         labels = dict(self.label_token_ids)
         frame = tuple(self.frame_token_ids)

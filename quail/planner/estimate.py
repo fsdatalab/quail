@@ -424,7 +424,7 @@ class _Search:
         labels_by_alias, tail = _prompt_token_counts(prompt)
         partner_rows = list(itertools.product(
             *[survivors[alias] for alias in partners]))
-        # the first partner's label is written with the frame, once per anchor
+        # matches JoinStage.runtime_spec: the first label is in the frame
         suffixes = [
             tail + self.canvas
             + sum(self.aliases[alias].tokens[row]
