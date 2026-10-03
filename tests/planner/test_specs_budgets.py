@@ -6,6 +6,8 @@ import pytest
 
 from quail.cost import budgets
 from quail.specs import (
+    B200,
+    L40S,
     DIFFUSION_GEMMA_26B_FP8,
     H100_SXM,
     QWEN3_4B_FP8,
@@ -40,6 +42,13 @@ def test_model_weights_and_kv_memory_budgets():
     for model in (QWEN3_4B_FP8, QWEN3_32B_FP8):
         assert budgets.arena_tokens(model, RTX_PRO_6000_BLACKWELL_SERVER) \
             > budgets.arena_tokens(model, H100_SXM)
+
+
+def test_device_memory_budgets():
+    for model in (QWEN3_4B_FP8, QWEN3_32B_FP8):
+        assert budgets.arena_tokens(model, B200) > budgets.arena_tokens(model, H100_SXM)
+        assert budgets.arena_tokens(model, L40S) < budgets.arena_tokens(model, H100_SXM)
+    assert budgets.minimum_weight_gpus(QWEN3_32B_FP8, L40S) == 1
 
 
 def test_arena_pages_needs_room_for_one_chunk_of_sliding_kv():

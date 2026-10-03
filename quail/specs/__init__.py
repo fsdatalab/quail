@@ -5,6 +5,7 @@ line. qwen3_spec builds the spec of any Qwen3 checkpoint from its
 config.json.
 """
 
+from .b200 import B200
 from .base import (
     ACT_BYTES_PER_HIDDEN,
     AnswerCanvas,
@@ -17,6 +18,7 @@ from .base import (
 from .decision_2_kai_0_6b import DECISION_2_KAI_0_6B_BF16
 from .diffusion_gemma_26b import DIFFUSION_GEMMA_26B_FP8
 from .h100_sxm import H100_PRICE_SOURCE, H100_SXM, H100_USD_PER_HOUR
+from .l40s import L40S
 from .lfm2_2_6b import LFM2_2_6B_BF16
 from .qwen3 import qwen3_spec
 from .qwen3_4b import QWEN3_4B_FP8
@@ -42,7 +44,7 @@ MODELS = {QWEN3_4B_FP8.name: QWEN3_4B_FP8,
          DIFFUSION_GEMMA_26B_FP8.name: DIFFUSION_GEMMA_26B_FP8,
          DECISION_2_KAI_0_6B_BF16.name: DECISION_2_KAI_0_6B_BF16}
 DEVICES = {device.name: device for device in (
-    H100_SXM, RTX_PRO_6000_BLACKWELL_SERVER,
+    H100_SXM, L40S, B200, RTX_PRO_6000_BLACKWELL_SERVER,
 )}
 # hourly rental price of one device, keyed by device name
 MODAL_GPU_USD_PER_HOUR = {
@@ -57,5 +59,6 @@ __all__ = ["ACT_BYTES_PER_HIDDEN", "AnswerCanvas", "DeviceSpec", "LayerKind",
            "QWEN3_RERANKER_4B_BF16", "DIFFUSION_GEMMA_26B_FP8",
            "DECISION_2_KAI_0_6B_BF16",
            "H100_SXM", "H100_USD_PER_HOUR", "H100_PRICE_SOURCE",
-           "RTX_PRO_6000_BLACKWELL_SERVER", "MODAL_GPU_USD_PER_HOUR",
+           "L40S", "B200", "RTX_PRO_6000_BLACKWELL_SERVER",
+           "MODAL_GPU_USD_PER_HOUR",
            "qwen3_spec"]
