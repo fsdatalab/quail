@@ -5,6 +5,7 @@ import math
 import re
 from types import SimpleNamespace
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -296,3 +297,49 @@ def test_a_decision_classification_is_reestimated(session):
                    lengths=(100,) * 50, shared=(0,) + (60,) * 49)
     spec = table.reestimate(node.spec, resident=True)
     assert spec.scoring == "decision_choice" and spec.estimated_seconds > 0
+
+
+def test_decision_readouts_return_their_host_values():
+    torch = pytest.importorskip("torch")
+    from quail.backends.quail.executor.readout import (
+        AsyncDecisionChoices,
+        AsyncDecisionScores,
+    )
+
+    event = SimpleNamespace(synchronize=lambda: None)
+    values = torch.tensor([[0.5, 1.5]])
+    choices = AsyncDecisionChoices(torch, None, (4, 2, 0))
+    assert choices.dtype == np.dtype((np.float32, (2,)))
+    assert choices.result((event, values)).tolist() == [[0.5, 1.5]]
+    scores = AsyncDecisionScores(torch, None, (2, 0, 0))
+    assert scores.result((event, values[0])).tolist() == [0.5, 1.5]
+
+
+def test_choice_stage_reads_each_option_end_and_the_last_row(session):
+    torch = pytest.importorskip("torch")
+    from quail.backends.quail.executor.classify import ClassifyStages
+
+    plan = session.sql(
+        "SELECT d.id, AI.CLASSIFY(d.body, ARRAY['x', 'yy', 'zzz']) AS c "
+        "FROM documents d").plan()
+    (node,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
+    spec = node.spec
+    state = SimpleNamespace(torch=torch, loaded_model=SimpleNamespace(
+        decision_head=object(), model_spec=None))
+    labeled = []
+    stages = ClassifyStages(state, spec, 2, lambda key: key,
+                            on_label=lambda anchor, label: labeled.append(label))
+    (stage,) = stages.stages
+    _, tail = spec.prompt_token_parts
+    request = list(tail[spec.frame_tokens:])
+    assert stage.frame == list(tail[:spec.frame_tokens])
+    assert stage.suffixes == [request]
+    # every row from the first option's end to the last row is read
+    offsets = stages.readout.offsets.tolist()
+    blocks = [len(block) for block in spec.label_token_ids]
+    assert offsets == [len(request) - sum(blocks[:i + 1]) for i in range(3)] + [0]
+    assert stage.read_rows == [max(offsets) + 1]
+    assert all("".join(request[len(request) - 1 - o]) == "</option>"
+               for o in offsets[:-1])
+    stage.decide(0, np.array([0.1, 2.0, 0.3], dtype=np.float32))
+    assert labeled == ["yy"]

@@ -385,4 +385,4 @@ class AsyncDecisionChoices(DecisionRows):
     def submit(self, normed, rows_per_answer=None):
         return self._copy(self.scores(normed, rows_per_answer), self.torch.float32)
 
-    result = AsyncDecisionScores.result
+    result = staticmethod(AsyncDecisionScores.result)
