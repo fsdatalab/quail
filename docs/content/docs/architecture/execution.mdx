@@ -99,8 +99,9 @@ several model passes. All of them belong to one `AiClassify` node. See
 #### Classifying joined rows
 
 The classification of joined rows runs in the same pipeline as its
-join. For each pair that the join keeps, it uses the anchor's KV again
-and adds the partner label, the partner document, and the question.
+join. It uses the anchor's KV again and writes the partner label one
+time for each anchor. For each pair that the join keeps, it adds the
+partner document and the question.
 
 ## Model forward pass
 

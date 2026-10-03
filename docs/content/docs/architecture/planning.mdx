@@ -234,7 +234,7 @@ Implementation:
 | $p$ | Shared preamble tokens (on every document) | 2 | 2 |
 | $d_i$ | Tokens in document $i$ | corpus | corpus |
 | $q_s$ | Tokens in filter stage $s$'s question | 41–62 | 41–62 |
-| $f_a$ | Join frame tokens after anchor $a$ | 36–42 | 36–42 |
+| $f_a$ | Join frame tokens after anchor $a$, with the partner label | 42–48 | 42–48 |
 | $u_b$ | One join tuple suffix for partner $b$ | corpus | corpus |
 | $A_s$ | Documents entering stage $s$ | $A_1$ = all | $A_1$ = all |
 | $T(n)$ | $\frac{n(n+1)}{2}$, causal self-attention pairs | | |
@@ -311,9 +311,10 @@ provide.
 ### Work per join stage
 
 One side is the **anchor**. Its prefix KV stays resident while every
-partner's suffix is evaluated. The anchor frame is $f_a$ tokens
-(anchor label + question). Each tuple suffix is $u_b$ tokens
-(partner label + partner document + answer cue).
+partner's suffix is evaluated. The anchor frame is $f_a$ tokens: the
+question and the partner label, which is the same for every pair of
+the anchor. Each tuple suffix is $u_b$ tokens: the partner document and
+the answer cue.
 
 **Per anchor, when no filter ran on that side** (prefix computed
 here):
