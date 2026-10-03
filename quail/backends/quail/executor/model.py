@@ -266,11 +266,11 @@ def load_model(model_name: str, revision: str | None = None, *,
     # built from this config
     model.quail_vllm_config = config
     if answer_token_ids is None:
-        from transformers import AutoTokenizer
+        from gigatoken import Tokenizer
 
         from quail.logical import true_false_ids
 
-        tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
+        tokenizer = Tokenizer(model_path).as_hf()
         true_ids, false_ids = true_false_ids(tokenizer)
         answer_token_ids = true_ids | false_ids
     retain_answer_head(torch, model, answer_token_ids)

@@ -17,7 +17,8 @@ IMAGE_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
 image = (
     modal.Image.from_registry(IMAGE_BASE, add_python="3.12")
     .entrypoint([])
-    .pip_install("vllm==0.26.0", "huggingface_hub", "numpy", "pyarrow")
+    .pip_install("vllm==0.26.0", "gigatoken==0.10.0",
+                 "huggingface_hub", "numpy", "pyarrow")
     .env({"VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
           "VLLM_LOGGING_LEVEL": "WARNING",
           "VLLM_USE_FLASHINFER_SAMPLER": "0",
@@ -69,7 +70,7 @@ def probe(model_name: str) -> str:
 
     import torch
     import torch.nn.functional as F
-    from transformers import AutoTokenizer
+    from gigatoken import Tokenizer
 
     from quail.backends.quail.executor.arena import KVArena
     from quail.backends.quail.executor.loop import run_filter
@@ -86,7 +87,7 @@ def probe(model_name: str) -> str:
     torch.cuda.reset_peak_memory_stats()
     baseline = torch.cuda.memory_allocated()
 
-    tokenizer = AutoTokenizer.from_pretrained(spec.hf_name)
+    tokenizer = Tokenizer(spec.hf_name).as_hf()
     model = load_model(spec.hf_name, revision=spec.revision)
     allocated = torch.cuda.memory_allocated() - baseline
     head_device = model.quail_answer_weights.device.type

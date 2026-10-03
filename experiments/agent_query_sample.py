@@ -206,10 +206,11 @@ def prepare_sample() -> str:
 def judge_sample(model_name: str, sample_full_hash: str) -> str:
     """Judge the saved sample with one model."""
     import pyarrow.parquet as pq
-    from transformers import AutoTokenizer
+    from gigatoken import Tokenizer
     from vllm import LLM, SamplingParams
 
     from quail import true_false_ids
+    from quail.backends.quail.executor.model import resolve_model_path
     from quail_b import data
 
     if model_name not in MODELS:
@@ -223,8 +224,8 @@ def judge_sample(model_name: str, sample_full_hash: str) -> str:
 
     t_total = time.perf_counter()
     t_boot = time.perf_counter()
-    tokenizer = AutoTokenizer.from_pretrained(
-        spec["repo"], revision=spec["revision"])
+    tokenizer = Tokenizer(resolve_model_path(
+        spec["repo"], spec["revision"])).as_hf()
     true_ids, false_ids = true_false_ids(tokenizer)
     allowed = sorted(true_ids | false_ids)
     llm = LLM(

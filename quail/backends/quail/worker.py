@@ -171,11 +171,11 @@ class LoadedGpu:
 
 def decision_offsets(spec, path) -> tuple[int, ...]:
     """The rows a decision readout reads, as distances before the last row."""
-    from transformers import AutoTokenizer
+    from gigatoken import Tokenizer
 
     from quail.logical import answer_row_offsets
 
-    tokenizer = AutoTokenizer.from_pretrained(path, local_files_only=True)
+    tokenizer = Tokenizer(path).as_hf()
     offsets = answer_row_offsets(
         spec.prompt_layout,
         lambda text: tokenizer(text, add_special_tokens=False)["input_ids"],
