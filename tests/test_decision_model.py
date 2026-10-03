@@ -3,6 +3,7 @@
 import json
 import math
 import re
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -90,6 +91,42 @@ def test_ai_if_layout_keeps_one_tail_segment():
         "\n\nEvaluate TRUE or FALSE for the following question: "
         "Is it positive?\nANSWER:",)
     assert answer_row_offsets("ai-if", _tokens) == (0,)
+
+
+def test_worker_answer_offsets_match_session_tokens(tmp_path):
+    from gigatoken import Tokenizer
+
+    from quail.backends.quail.worker import decision_offsets
+
+    visible = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
+    missing = [byte for byte in range(256) if byte not in visible]
+    alphabet = [chr(byte) for byte in visible] + [
+        chr(256 + index) for index in range(len(missing))]
+    byte_level = {"type": "ByteLevel", "add_prefix_space": False,
+                  "trim_offsets": True, "use_regex": True}
+    (tmp_path / "tokenizer.json").write_text(json.dumps({
+        "version": "1.0", "added_tokens": [], "normalizer": None,
+        "pre_tokenizer": byte_level, "post_processor": None,
+        "decoder": byte_level, "model": {"type": "BPE", "merges": [],
+        "vocab": {char: index for index, char in enumerate(alphabet)}}}))
+    spec = replace(DECISION_2_KAI_0_6B_BF16, name="local-decision",
+                   hf_name=str(tmp_path), turn_suffix="\nEND")
+    registry = quail.ExtensionRegistry.with_built_ins()
+    registry.register_model(spec)
+    with quail.Session(EngineConfig(model=spec.name, device="h100-sxm"),
+                       registry=registry) as session:
+        offsets = decision_offsets(spec, str(tmp_path))
+        prompt = bind_prompt("Refund? {0}", (REF,), session.tokenizer,
+                             layout=LAYOUT, turn=spec.turn)
+        ids = render_filter_prompt_ids(
+            prompt, session.tokenizer("Please refund this."), session.tokenizer)
+        assert offsets == answer_row_offsets(
+            LAYOUT, session.tokenizer, spec.turn_suffix)
+        tokenizer = Tokenizer(tmp_path).as_hf()
+        ends = [tokenizer.decode(ids[:len(ids) - offset]) for offset in offsets]
+        assert ends[0].endswith('"false"}\n</option>')
+        assert ends[1].endswith('"true"}\n</option>')
+        assert ends[2].endswith("Decision:\nEND")
 
 
 def test_decision_rows_read_offsets_from_each_answers_trailing_rows():

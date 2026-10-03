@@ -59,7 +59,8 @@ IMAGE_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
 image = (
     modal.Image.from_registry(IMAGE_BASE, add_python="3.12")
     .entrypoint([])
-    .pip_install("vllm==0.26.0", "huggingface_hub", "numpy", "pyarrow")
+    .pip_install("vllm==0.26.0", "gigatoken==0.10.0",
+                 "huggingface_hub", "numpy", "pyarrow")
     .env({"VLLM_CACHE_ROOT": "/root/.cache/kernels/vllm",
           "VLLM_LOGGING_LEVEL": "WARNING",
           "VLLM_USE_FLASHINFER_SAMPLER": "0",
@@ -123,11 +124,12 @@ def _profile(model_name: str, revision: str | None) -> dict:
     _install_single_rank_groups(torch)
     with set_current_vllm_config(config):
         model = get_model(vllm_config=config)
-    from transformers import AutoTokenizer
+    from gigatoken import Tokenizer
 
     from quail import true_false_ids
+    from quail.backends.quail.executor.model import resolve_model_path
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name, revision=revision)
+    tokenizer = Tokenizer(resolve_model_path(model_name, revision)).as_hf()
     true_ids, false_ids = true_false_ids(tokenizer)
     retain_answer_head(torch, model, true_ids | false_ids)
     torch.cuda.empty_cache()

@@ -223,6 +223,7 @@ def boot_decision(spec, llm_kwargs: dict) -> tuple[dict, dict]:
     path = resolve_model_path(spec.hf_name, spec.revision)
     llm_kwargs = {key: value for key, value in llm_kwargs.items()
                   if key != "tokenizer_mode"}
+    llm_kwargs["skip_tokenizer_init"] = True
     started = time.perf_counter()
     llm = LLM(runner="pooling", **engine_args(path, ARCHITECTURE), **llm_kwargs)
     boot_s = time.perf_counter() - started
