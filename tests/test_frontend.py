@@ -355,8 +355,6 @@ REJECTED = [
     ("SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('x: {0}', "
      "r.review)) LIMIT 'five'", ""),
     ("SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('x {0}', "
-     "r.review)) GROUP BY r.id", "GROUP BY"),
-    ("SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('x {0}', "
      "r.review)) ORDER BY r.id + 1", "not a column"),
     ("SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('x {0}', "
      "r.review)) ORDER BY AI_SCORE(PROMPT('x {0}', r.review))",

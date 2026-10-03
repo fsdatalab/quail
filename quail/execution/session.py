@@ -599,6 +599,18 @@ class BoundBuilder:
         self._inner.order_by(*keys)
         return self
 
+    def group_by(self, *keys):
+        self._inner.group_by(*keys)
+        return self
+
+    def agg(self, **aggregates):
+        self._inner.agg(**aggregates)
+        return self
+
+    def having(self, *tests):
+        self._inner.having(*tests)
+        return self
+
     def offset(self, n):
         self._inner.offset(n)
         return self

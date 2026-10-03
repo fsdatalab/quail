@@ -119,12 +119,13 @@ def plan_request_backend(
             estimated_seconds=float("inf"),
         ),)
     root = region.logical_plan.root
-    if root.order or root.distinct or root.offset:
+    if root.order or root.distinct or root.offset \
+            or root.aggregation is not None:
         return (PhysicalCandidate(
             graph=None,
             plan=Refusal(
-                reasons=("ORDER BY, DISTINCT, and OFFSET run on the Quail "
-                         "backend only",),
+                reasons=("ORDER BY, DISTINCT, OFFSET, and GROUP BY run on "
+                         "the Quail backend only",),
                 constraint="sort_needs_quail_backend",
                 needed=1, available=0, unit="backends"),
             estimated_seconds=float("inf"),

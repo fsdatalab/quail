@@ -203,6 +203,32 @@ query = (
 )
 ```
 
+### group_by, agg, having
+
+`group_by(*keys)`, `agg(**aggregates)`, `having(*tests)`
+
+Group the result rows by columns or by the names of `ai_classify`
+outputs, compute named aggregates with `count()`, `count_distinct()`,
+`sum_()`, `avg()`, `min_()`, and `max_()` from `quail.frontend.builder`,
+and keep the groups whose aggregates pass tests. `select()` then lists
+keys and aggregate names.
+
+```python
+from quail.frontend.builder import avg, col, count, prompt
+
+query = (
+    session.docs("reviews").alias("r")
+    .ai_classify(prompt('What is the sentiment of this review?\n\n{0}',
+                        col("r.body")),
+                 ["positive", "negative", "mixed"], name="sentiment")
+    .group_by("sentiment")
+    .agg(n=count(), mean_stars=avg("r.stars"))
+    .having(count() > 10)
+    .order_by(("n", "desc"))
+    .select("sentiment", "n", "mean_stars")
+)
+```
+
 ### offset
 
 `offset(n)`

@@ -508,12 +508,43 @@ ORDER BY refund_score DESC
 LIMIT 10
 ```
 
-`ORDER BY`, `DISTINCT`, and `OFFSET` run on the Quail backend; the stock
-vLLM and SGLang backends refuse them.
+`ORDER BY`, `DISTINCT`, `OFFSET`, and `GROUP BY` run on the Quail
+backend; the stock vLLM and SGLang backends refuse them.
+
+## GROUP BY and HAVING
+
+`GROUP BY` groups the result rows and `COUNT`, `SUM`, `AVG`, `MIN`,
+and `MAX` compute one value per group. Each aggregate needs an `AS`
+name. A group key is a table column or the `AS` name of an
+`AI.CLASSIFY` output, and every plain column in `SELECT` must be a
+key. An aggregate's argument is a column, a named `AI.SCORE` or
+`AI.CLASSIFY` output, or an `AI.SCORE` call written inline. `HAVING`
+compares an aggregate, by name or as a call, with a number. For
+example, this counts the reviews per predicted sentiment and keeps the
+sentiments with more than ten reviews:
+
+```sql
+SELECT AI.CLASSIFY(PROMPT('What is the sentiment of this review? {0}', r.body),
+                   ['positive', 'negative', 'mixed']) AS sentiment,
+       COUNT(*) AS n,
+       AVG(r.stars) AS mean_stars
+FROM reviews r
+WHERE AI.IF(PROMPT('Is this review about a purchase? {0}', r.body))
+GROUP BY sentiment
+HAVING COUNT(*) > 10
+ORDER BY n DESC
+```
+
+The aggregation runs on the coordinator after the model work, so a
+`LIMIT` on a grouped query does not shorten the run. A null argument
+value is left out of every aggregate but `COUNT(*)`. `COUNT(DISTINCT
+column)` is supported; other `DISTINCT` aggregates are not. Groups
+come out in the order their first rows appear unless `ORDER BY` names
+a key or an aggregate.
 
 ## Unsupported SQL operators (for now)
 
-- `GROUP BY`, `HAVING`, window functions
+- Window functions, `QUALIFY`
 - `UNION`, `EXCEPT`, `INTERSECT`
 - `OR` between AI predicates
 - Queries with no AI operator

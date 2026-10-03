@@ -242,9 +242,10 @@ def _refuse_unpriced(logical) -> None:
             raise NotImplementedError(
                 f"the speed of light estimate does not price {node.type_name}")
         if isinstance(node, Project) and node.limit is not None \
-                and not (node.order or node.distinct or node.offset):
-            # a sorted, distinct, or offset result runs every document,
-            # which the estimate prices; a bare LIMIT stops early
+                and not (node.order or node.distinct or node.offset
+                         or node.aggregation is not None):
+            # a sorted, distinct, offset, or grouped result runs every
+            # document, which the estimate prices; a bare LIMIT stops early
             raise NotImplementedError(
                 "the speed of light estimate does not price LIMIT")
     operators = logical.operators()

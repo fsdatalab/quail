@@ -22,6 +22,7 @@ from quail.cost.retention import coefficients
 from quail.execution.pipelines import build_pipelines
 from quail.logical import classified_above_joins
 from quail.physical import (
+    Aggregate,
     AiClassify,
     AiFilter,
     AiJoin,
@@ -44,11 +45,11 @@ class LimitPushdown:
     executor reads to stop admitting documents once that many survived
     the chain's last stage. The pushdown keeps the first survivors to
     finish, so it is sound only when those are the rows the query
-    returns: the graph ends in a Limit and has no Sort (an ORDER BY,
-    DISTINCT, or OFFSET needs every survivor), no AiJoin (survivors are
-    settled per join round), and no AiScore (a score comparison after
-    the chain can drop survivors). Otherwise the rule removes the
-    setting.
+    returns: the graph ends in a Limit and has no Sort or Aggregate (an
+    ORDER BY, DISTINCT, OFFSET, or GROUP BY needs every survivor), no
+    AiJoin (survivors are settled per join round), and no AiScore (a
+    score comparison after the chain can drop survivors). Otherwise the
+    rule removes the setting.
     """
 
     name = "limit_pushdown"
@@ -58,7 +59,7 @@ class LimitPushdown:
             return None
         limit = next((node for node in graph.nodes
                       if isinstance(node, Limit)), None)
-        blocked = any(isinstance(node, (Sort, AiJoin, AiScore))
+        blocked = any(isinstance(node, (Sort, Aggregate, AiJoin, AiScore))
                       for node in graph.nodes)
         if limit is None or blocked:
             context.settings.pop("filter_limit", None)
