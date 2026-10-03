@@ -45,8 +45,7 @@ from quail.specs.base import CANVAS_SEED
 # frame; the cue is the tail's last token
 CLASSIFY_FRAME = 4500
 CUE = 5000
-# two-token labels sharing a first token: the trie path [CUE, 11] is
-# read at both rows, beside filter and join rows read at one
+# one-token labels, read at the cue row
 LABEL_IDS = ((13,), (14,))
 TARGETS = [13, 14]
 # two-token labels a greedy decode follows one round at a time
@@ -110,7 +109,12 @@ class LabelingModel(FakeModel):
 
 
 def fused_graph(*, classify_only=False):
-    """Build two classifications with an IN condition and optional filter and join."""
+    """Build two classifications with label filters between them.
+
+    Args:
+        classify_only: Leave out the AI filter before the classifications
+            and the join after them.
+    """
     spec = ClassifySpec(
         name="topic", aliases=("r",), query_template="", arguments=(),
         expected_inputs=14, estimated_seconds=0.0,
@@ -170,16 +174,13 @@ def fused_graph(*, classify_only=False):
                                    "draws", "score_first"])
 def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
         monkeypatch, shape):
-    """A filter, then a diffusion model's classification: one run.
+    """Read each survivor's seeded canvas over its resident KV.
 
-    Each survivor's seeded canvas is read over its resident KV, in
-    chunks that also hold other documents' filter rows. When ``joined``
-    a filter on the label and a join follow, in the same pipeline. When
-    ``classify_first`` the pipeline starts with the classification,
-    whose plan settings carry no shared preamble, so the documents pack
-    under the classification's own prompt head. When ``draws`` a
-    survivor whose first draw is uncertain reads three more canvases
-    and takes the label of the mean probabilities.
+    ``joined`` adds a label filter and a join to the pipeline.
+    ``classify_first`` and ``score_first`` start the pipeline at the
+    classification, so documents pack under its own prompt head.
+    ``draws`` reads three more canvases for a survivor whose first draw
+    is uncertain and takes the label of the mean probabilities.
     """
     from dataclasses import replace
 
@@ -395,7 +396,7 @@ def test_a_letters_read_on_a_canvas_model_runs_in_its_filter_chain_pipeline(
     assert labels.column("r").to_pylist() == [0, 2, 3]
     if shape == "draws":
         # document 2's three later draws outvote its first; document 3
-        # was sure at its first draw and sent no more
+        # is sure at its first draw and sends no more
         assert labels.column("topic").to_pylist() == ["a", "a", "b"]
         # each label's probability among the labels: a sure first draw's,
         # or the mean over the four draws
@@ -590,7 +591,7 @@ def test_a_classification_of_joined_rows_runs_after_its_join_on_the_anchors_kv(
     # r0 pairs with both partners, r1 with p1 only, r2 with none
     join_truth = {("r", 0): [1, 1], ("r", 1): [0, 1], ("r", 2): [0, 0]}
     if two_joins:
-        # The second join keeps q0. Classification still reads p1 for r1.
+        # the second join keeps q0; the classification reads p1 for r1
         docs["q"] = [[PARTNER + 2] * 2]
         join_truth = {key: values + [1] for key, values in join_truth.items()}
     joined_truth = {(0, 0): 0, (0, 1): 1, (1, 1): 0}

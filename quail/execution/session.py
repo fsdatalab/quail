@@ -631,12 +631,13 @@ class Query:
     def plan(self):
         """Plan the query once and return its physical plan or refusal.
 
-        Each scanned table's document lengths come first, exact when
-        the column is tokenized and estimated from a sample while a
-        background thread tokenizes it; the logical rules read them
-        through the planning context. The token stores are then opened
-        with the value columns the optimized scans keep, and the
-        physical planner runs on the decided logical plan.
+        Document lengths are exact for a tokenized column. For any other
+        column they are estimated from a sample while a background thread
+        tokenizes it. The logical rules and the physical planner both read
+        these lengths.
+
+        Returns:
+            The physical plan, or a Refusal when no backend can run it.
         """
         if self._plan is None:
             self._planning_started_at = time.perf_counter()
@@ -982,7 +983,6 @@ class Query:
                                  and column.name == name), None)
                     order = (None if call is None
                              else pa.array(call.labels, pa.string()))
-                    # a row keyed as one integer: anchor index, partner index
                     keys = _pair_keys(table.column(aliases[0]),
                                       table.column(aliases[1]))
                     declaration = acero.Declaration(
@@ -1009,7 +1009,7 @@ class Query:
                     labeled = table.column(name).combine_chunks()
                     if not pa.types.is_map(labeled.type):
                         labeled = labeled.cast(pa.string())
-                    # a document whose answer named no label has no row
+                    # a document whose answer names no label has no row
                     # in the table, and leaves the result
                     declaration = acero.Declaration(
                         "filter", acero.FilterNodeOptions(
@@ -1024,7 +1024,6 @@ class Query:
                     widened = pc.take(
                         pa.concat_arrays([labeled, pa.array([None], labeled.type)]),
                         pa.array(slots))
-                    # a dictionary over the call's labels in their order
                     call = next((column.expression
                                  for column in self.logical.root.columns
                                  if isinstance(column, Alias)

@@ -358,7 +358,7 @@ class JoinAdmission:
 
 
     def partner_count(self, a, j):
-        """Return the request count before or after lazy partner selection.
+        """Return the number of partner requests anchor a streams at stage j.
 
         A lazy stage not yet entered counts its full suffix list.
         """

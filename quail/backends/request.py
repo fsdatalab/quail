@@ -394,7 +394,6 @@ def plan_request_backend(
     else:
         sink_input = PortRef(request_node.node_id, f"ids:{aliases[0]}")
 
-    # projected labels ride beside the result rows
     label_ports = tuple(
         PortRef(request_node.node_id, f"label_answers:{name}")
         for name in label_plan.projected.values())
@@ -612,20 +611,20 @@ def _pipelined_filter(client, sampling_params, bodies, questions, read_answer,
 
 
 def _classify_documents(client, spec, bodies) -> dict:
-    """Generate one category answer per document using greedy decoding.
+    """Decode one label per prompt body with greedy generation.
+
+    Generation stops after one more token than the longest label has.
 
     Args:
-        client: Backend client providing sampling parameters and generation.
-        spec: RequestClassifySpec with category text and prompt tail tokens.
-        bodies: Document token sequences, including any prompt head.
+        client: The engine client.
+        spec: The RequestClassifySpec with the labels and the prompt tail.
+        bodies: Token ids for each prompt before the tail, preamble included.
 
     Returns:
-        A mapping containing labels, request counts, token counts, and elapsed
-        generation time. Fresh tokens count the uncached prompt tokens and
-        every generated token fed back to decode the next one. Unmatched
-        answers have label None and increment unmatched. Generation uses
-        temperature zero and a token limit one greater than the longest
-        category token sequence.
+        A dict with one label per body (None when the answer names no label),
+        the unmatched count, the request and token counts, and the generation
+        seconds. Fresh tokens count the uncached prompt tokens and each
+        generated token fed back to decode the next one.
     """
     tail = _token_list(spec.tail_token_ids)
     longest = max(len(ids) for ids in spec.label_token_ids)
@@ -805,7 +804,7 @@ class RequestModelExecution:
                     _token_list(node.preamble_token_ids)
                     + _token_list(self.documents[spec.alias][document])
                     for document in document_ids])
-            # a document whose answer named no label has no label row
+            # a document whose answer names no label has no label row
             # and leaves the query
             labeled = [(document, label) for document, label
                        in zip(document_ids, result["labels"])

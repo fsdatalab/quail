@@ -447,7 +447,7 @@ def _finish_run(directory, manifest, family_calls, sglang_calls, query_ids,
         },
         summaries=paths,
     )
-    # Multiple canvas draw counts save separate Quail suites.
+    # several canvas draw counts save one Quail suite per count
     completed = [item for name, report in reports.items()
                  if name == "quail" or name.startswith("quail-")
                  for item in report["queries"]]

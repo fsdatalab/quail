@@ -17,8 +17,8 @@ class ColumnRef:
     type_name: ClassVar[str] = "quail.column_ref"
 
 
-# the text before a label scored after the answer cue, as a word
-# follows a colon
+# the text between the answer cue and a scored label: one space, as
+# after a colon
 LABEL_PREFIX = " "
 
 
@@ -27,9 +27,9 @@ class Prompt:
     """Bound prompt text and token layout for one LLM call.
 
     Token counts are filled when a tokenizer is available; None means the
-    planner must calculate them. Classification stores the spacing before
-    label text in label_prefix. Its optional lettered prompt maps categories
-    to distinct one-token strings for letters scoring.
+    planner must calculate them. A classification prompt keeps the text
+    before each label in label_prefix. Its optional lettered prompt names
+    each label with a distinct one-token letter for the letters rule.
     """
     template: str
     args: tuple    # tuple[ColumnRef, ...] in placeholder order
@@ -185,7 +185,8 @@ class InList:
     type_name: ClassVar[str] = "quail.in_list"
 
     def validate(self) -> None:
-        # a value the column never holds matches no row
+        # only a repeated value is an error; a value the column never
+        # holds matches no row
         if len(set(self.values)) != len(self.values):
             raise CompileError(
                 f"{self.column.alias}.{self.column.column} IN lists a "
@@ -611,11 +612,12 @@ class SemanticClassify:
     Every input row passes through with its label in the column named
     ``name``; with ``probabilities`` a second column, ``name`` plus
     PROBABILITIES_SUFFIX, holds each label's probability. A call over
-    one table sits on that table above its AI.IF SemanticFilter and
-    below any join; a call over two tables sits above the SemanticJoin
-    of the two. A Filter testing the label column sits above this
-    node, and the root Project returns the column through
-    an Alias of the same call.
+    one table starts on that table above its AI.IF SemanticFilter and
+    below any join; the lift_classifications rule moves it above the
+    joins when a join reads the table. A call over two tables sits
+    above the SemanticJoin of the two. A Filter testing the label
+    column sits above this node, and the root Project returns the
+    column through an Alias of the same call.
     """
     input: LogicalNode
     call: ModelCall
@@ -1157,10 +1159,10 @@ class LogicalPlanBuilder:
             column: The document column.
             predicates: The table's AI.IF predicates in written order.
             applies: (function, kind, ids, columns) per apply, in order.
-            labels: (call, name) per one-table classification. One a
-                label filter tests sits below the first Filter testing
-                it; the others sit above the last Filter, in the order
-                given.
+            labels: (call, name) per one-table classification. A call
+                that a label filter tests sits below the first Filter
+                testing it; the others sit above the last Filter, in the
+                order given.
             label_filters: (name, values, selectivity) per Filter on a
                 classification's label column, in written order.
 

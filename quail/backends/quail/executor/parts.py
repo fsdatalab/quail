@@ -19,7 +19,7 @@ def input_staging(state: QueryExecutionState):
 
 
 class StagesPart:
-    """Additional stages contributed by a pipeline's final operator."""
+    """Pipeline part that adds stages and produces no result."""
 
     node = None
     gate = None
@@ -183,7 +183,7 @@ def gpu_seconds(torch, spans, inputs) -> float:
     """
     if not inputs.get("gpu_timing"):
         return 0.0
-    # every chunk's answers were read, so its end event has completed
+    # elapsed_time needs every end event to have completed
     torch.cuda.synchronize()
     return sum(
         start.elapsed_time(end) * min(1.0, sum(rows.values()) / tokens)

@@ -104,7 +104,7 @@ class RerankerBatch:
     """Values and execution metrics from one score or classification batch.
 
     Attributes:
-        scores: Numeric scores or category strings, in input row order.
+        scores: Numeric scores or labels, in input row order.
         fresh_tokens: Token positions computed by the model.
         cached_tokens: Token positions reused from KV.
         suffix_tokens: Classification tokens processed after document frames.
@@ -112,7 +112,8 @@ class RerankerBatch:
         pack_s: Host seconds spent building forward chunks.
         gpu_s: Forward-pass GPU seconds, or zero when timing is disabled.
         chunks: Timed forward passes, or zero when timing is disabled.
-        probabilities: Optional array of category probabilities per input row.
+        probabilities: Each label's probability per input row when the
+            classification asks for them, else None.
     """
 
     scores: np.ndarray
@@ -120,31 +121,27 @@ class RerankerBatch:
     cached_tokens: int
     suffix_tokens: int = 0
     borrowed_tokens: int = 0
-    # host seconds spent building forward chunks
     pack_s: float = 0.0
-    # forward-chunk seconds on the GPU and chunks launched; both zero
-    # unless the session asked for GPU timing
     gpu_s: float = 0.0
     chunks: int = 0
-    # a classification asked for them: per row, each label's probability
     probabilities: np.ndarray | None = None
 
 
 def _value_type(spec) -> pa.DataType:
-    """Return the Arrow type for a category string or numeric score."""
+    """Return the Arrow type for a label or a numeric score."""
     return pa.string() if isinstance(spec, ClassifySpec) else pa.float64()
 
 
 def probability_column(labels, probabilities) -> pa.MapArray:
-    """Build an Arrow map column of category probabilities.
+    """Build an Arrow map column of label probabilities.
 
     Args:
-        labels: Category strings in probability-column order.
+        labels: Labels in probability-column order.
         probabilities: Array with shape (documents, labels).
 
     Returns:
-        A MapArray from category to probability for each document. Rows with
-        NaN probabilities are null because the document has no answer.
+        A MapArray from label to probability for each document. A row with
+        a NaN probability is null: its document has no answer.
     """
     probabilities = np.asarray(probabilities, dtype=np.float64).reshape(
         -1, len(labels))
@@ -264,7 +261,7 @@ def scored_batch(node, rows, values) -> dict:
 
 
 def classify_outputs(node, table) -> dict:
-    """Build output ports for category rows and classified document IDs."""
+    """Return the label table and, for one alias, the labeled document IDs."""
     outputs = {"scores": table}
     if len(node.spec.aliases) == 1:
         (alias,) = node.spec.aliases
@@ -346,7 +343,7 @@ def score_in_batches(node, inputs, score_batches, shards: int = 1,
     table = attach_prior_columns(table, priors)
     outputs = {"scores": table}
     if isinstance(node.spec, ClassifySpec):
-        # a document whose decoded answer names no label leaves the run
+        # a document whose decoded answer names no label leaves the query
         table = table.filter(pc.is_valid(table.column(node.spec.name)))
         metrics = replace(metrics, output_rows=table.num_rows)
         outputs = classify_outputs(node, table)

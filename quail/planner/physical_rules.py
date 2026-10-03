@@ -35,24 +35,25 @@ from quail.planner.statistics import cached_statistics, live_after_filters
 
 
 class KvRetention:
-    """Keep the KV later operators read resident, within the page cap.
+    """Keep the KV that later operators read resident, within the page cap.
 
     The schedule (quail.planner.retention.schedule) records, at each
     execution boundary, which aliases a later stage anchors on and how
-    likely each document is to survive to that use; the executor's
-    retention pool pins their KV by that priority, up to the pool's
-    page cap. A filter chain keeps its survivors' KV (keep_kv) when a
-    later join anchors on its table, unless the chain streams into
-    that join in one pipeline on one GPU; a join keeps its anchor's KV
-    (keep_anchor_kv) when a later group anchors on the same table. A
-    chain writes KV pages only when something reads them: a later
-    stage, the next operator of its pipeline, or the retention pool.
+    likely each document is to survive to that use. The executor's
+    retention pool keeps their KV by that priority, up to the page cap.
 
-    Fires once, when the plan is first made: it reads the logical plan
-    on the context and leaves a plan that has a schedule alone, so a
-    later pass over exact tokens keeps the schedule the plan was made
-    with. The schedule, the retention coefficients, and the cap go in
-    the plan's ``retention`` setting.
+    - A filter chain keeps its survivors' KV (keep_kv) when a later join
+      anchors on its table, unless the chain streams into that join in
+      one pipeline on one GPU.
+    - A join keeps its anchor's KV (keep_anchor_kv) when a later group
+      anchors on the same table.
+    - A chain writes KV pages only when a later stage, the next operator
+      of its pipeline, or the retention pool reads them.
+
+    The rule needs the logical plan on the context and fires only on a
+    plan without a ``retention`` setting, so a later pass keeps the
+    first schedule. It puts the schedule, the retention coefficients,
+    and the page cap in the ``retention`` setting.
     """
 
     name = "kv_retention"
@@ -109,25 +110,20 @@ class KvRetention:
 class LabelScoring:
     """Pick each classification's label scoring rule by simulated time.
 
-    Fires for every AiClassify whose spec has no scoring rule yet, as
-    build_physical_plan emits them, and leaves chosen ones alone, so a
-    later pass over exact tokens keeps the rule the plan was made
-    with. The candidates are the letters rule when the prompt has a
-    one-token letter per label, the packed trie under tree attention,
-    and a greedy decode over fresh documents (_Table.choose). The
-    documents count as resident, with their KV in the arena, when the
-    classification continues its table's filter chain on one GPU
+    Fires for every AiClassify whose spec has no scoring rule yet and
+    leaves chosen ones alone, so a later pass keeps the first choice.
+    The candidates are letters, when the prompt has a one-token letter
+    per label; trie_tree, under the tree attention path; and
+    trie_decode, over documents without resident KV (_Table.choose).
+    The documents count as resident, with their KV in the arena, when
+    the classification continues its table's filter chain on one GPU
     before any join, or follows a classification with the same prompt
     head. A classification of joined rows always uses letters and
     arrives chosen.
 
-    The chosen rule's seconds complete the plan's estimate: the rule
-    adds them to the ``search_seconds`` setting, the planner's
-    estimate of the plan as planned. The classify_placement logical
-    rule prices each candidate plan with this rule applied
-    (quail.planner.pricing), so plans are compared with their scoring
-    counted and a classification no rule can run refuses the plan. It
-    needs the logical plan on the context for the calls' prompts.
+    The rule adds the chosen rules' seconds to the ``search_seconds``
+    setting. It needs the logical plan on the context for the calls'
+    prompts.
     """
 
     name = "label_scoring"
@@ -165,7 +161,7 @@ class LabelScoring:
 
 
 def _resident(node, graph, context, calls, after_joins, table) -> bool:
-    """Whether a classification's documents have their KV in the arena.
+    """Return whether a classification's documents have their KV in the arena.
 
     True on one GPU when the classification continues its table's
     AI.IF filter chain before any join, through any filters on labels

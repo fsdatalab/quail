@@ -4,7 +4,7 @@
 # the classification's labels.
 LABEL_SCORINGS = ("letters", "trie_tree", "trie_decode")
 
-# the lettered categories: every label one token, read at one row
+# every label is one letter token, read at one row
 LETTERS_SCORING = "letters"
 # every trie node once, in one request: tree attention only
 TREE_SCORING = "trie_tree"
@@ -13,11 +13,11 @@ DECODE_SCORING = "trie_decode"
 
 
 def decodable(labels) -> bool:
-    """Return whether every category can terminate at a trie leaf.
+    """Return whether every label's token sequence ends at a trie leaf.
 
-    A label that is a proper prefix of another label would need the
-    decode to choose between stopping and continuing, which the
-    rules score no end token for.
+    A label that is a proper prefix of another would make the decode
+    choose between stopping and continuing, and no rule scores an end
+    token.
     """
     ids = {tuple(label) for label in labels}
     return not any(tuple(label[:depth]) in ids

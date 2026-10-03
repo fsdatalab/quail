@@ -161,8 +161,8 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
         doc_ids: Per-document token lists.
         question_ids: Per-stage question token lists.
         budget: Chunk token budget.
-        timing: Unused; kept for callers that pass it.
-        pinned: Unused; kept for callers that pass it.
+        timing: Unused.
+        pinned: Unused.
         limit: Stop admitting documents after this many survivors.
         arena_writes: Whether document KV is written to the arena.
             Must be True with multiple stages.
@@ -194,12 +194,12 @@ def run_filter(torch, arena, pipeline, async_ans, doc_ids,
         raise ValueError("arena_keys must match doc_ids")
     retain_all = retain_survivors is True
     retain = set() if retain_all else set(retain_survivors)
-    # a model whose attention reads paged KV only writes pages even
-    # when the plan skipped them
+    # a model whose attention reads only paged KV writes pages even
+    # when the plan skips them
     arena_writes = arena_writes or pipeline.needs_pages
     if not arena_writes and (k > 1 or retain_all or retain):
-        # a later stage re-reads the KV, which needs the pages this
-        # switch skips
+        # a later stage or a retained survivor re-reads the KV, which
+        # needs the pages this switch skips
         raise ValueError("arena_writes=False needs a single stage")
     if prefix_tree is not None and prefix_tree.shared_tokens:
         if not arena_writes:

@@ -124,7 +124,7 @@ def build_pipelines(graph: PhysicalGraph) -> dict[str, Pipeline]:
         when each reads the one before it, as a per-batch apply
         returning pairs and the join reading those pairs do; any
         other fan-out needs the documents at once and ends the chain.
-        A join settles each anchor's KV itself and ends the chain,
+        A join manages each anchor's KV itself and ends the chain,
         unless a classification of the rows it kept follows it.
         """
         following = []
@@ -146,7 +146,7 @@ def build_pipelines(graph: PhysicalGraph) -> dict[str, Pipeline]:
         aliases = operator_aliases(node)
         if not aliases or node.node_id in followed:
             continue
-        # a filter or apply left on its own reads a table
+        # only an AI filter, classification, or join starts a pipeline
         if not isinstance(node, (AiFilter, AiClassify, AiJoin)):
             continue
         (alias,) = aliases

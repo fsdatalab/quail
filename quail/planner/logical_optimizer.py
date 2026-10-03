@@ -17,13 +17,9 @@ MAX_PASSES = 4
 class LogicalPlanningContext:
     """Session values and statistics available to logical optimizer rules.
 
-    A cost-based rule prices a plan with the model and device specs,
-    each scanned table's document token counts (exact when the column
-    is tokenized, else estimated from a sample), the fraction of each
-    join's cross product its equality conditions keep, and the
-    tokenizer for prompts it builds. Selectivity estimates are the
-    predicates' own: a predicate written without one is priced with
-    the default selectivity.
+    Document token counts are exact when the column is tokenized, else
+    estimated from a sample. A cost-based rule prices a predicate
+    written without a selectivity with the default selectivity.
 
     Attributes:
         catalog: The session catalog.

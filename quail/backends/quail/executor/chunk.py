@@ -59,9 +59,10 @@ def _tick(timing, key, t0):
 
 
 def _staged(torch, data, dtype, pinned=True):
-    """Copy host data to the device, using pinned memory when enabled.
+    """Copy host data to the device.
 
-    pinned=False reverts to pageable blocking copies.
+    With pinned=True the copy goes through pinned memory and does not
+    block; with pinned=False it is a pageable, blocking copy.
     """
     if isinstance(data, np.ndarray):
         data = torch.as_tensor(data, dtype=dtype)
@@ -605,9 +606,6 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                          "the document needs arena pages")
     t = _tick(timing, "pack_reads", t)
 
-    # all of the chunk's KV writes as one list of (source, destination)
-    # row pairs: the attention pass scatters them with a single kernel
-    # launch per layer (kv_row_scatter)
     unified = None
     temporary_keys = []
     if attention_mode == "unified" and unified_groups:
@@ -719,7 +717,9 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 arena.free_key(key)
             raise
 
-    # All current KV writes use one scatter.
+    # the tree path's KV writes as one list of (source, destination)
+    # row pairs: the attention pass scatters them with a single kernel
+    # launch per layer (kv_row_scatter)
     kv_src = kv_dst = None
     if kv_writes:
         src, dst_parts = [], []

@@ -8,21 +8,17 @@ from quail.progress import Progress, logger, quiet
 
 # ------------------------------------------------------------- warmup
 #
-# Three cost tiers:
-#   1. JIT compile (nvcc/Triton) of a kernel configuration: paid once
-#      ever per (software stack, GPU, model, budget) by compile_kernels.
-#      Cached in the library's configured kernel directories;
-#      a marker file records that the pass ran.
-#   2. Loading a cached binary into the process: paid once per process
-#      by touch_kernels.
-#   3. The launch itself: every call, unavoidable.
+# compile_kernels JIT-compiles (nvcc/Triton) each kernel configuration
+# once per (software stack, GPU, model, budget) into the libraries'
+# kernel directories; a marker file records that the pass ran.
+# touch_kernels loads the cached binaries once per GPU process.
 #
 # Kernels key on token counts and model constants, never on token
 # values, so both passes run on synthetic ids.
 
 # Bump when either pass covers a different set of shapes. A bumped
 # version invalidates every marker, so the next boot re-runs the
-# compile pass and re-commits the cache.
+# compile pass.
 WARMUP_VERSION = 6
 
 # Triton compiles one copy of a kernel for each class of its integer
@@ -56,8 +52,9 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
                   join_chunk):
     """Run real forward passes over every attention path.
 
-    Both modes with arena writes, plus the unpaged causal fast path.
-    join_chunk adds a join chunk and a classification chunk.
+    Runs each attention path the model has with arena writes, then the
+    unpaged causal fast path. join_chunk adds a join chunk and a
+    classification chunk.
     """
     warm_docs, question, doc = _warm_inputs(budget)
     q_max = len(question)
@@ -179,12 +176,10 @@ def warm_label_readout(torch, head):
 def compile_kernels(torch, arena, pipeline, async_ans, budget):
     """Build every DeepGEMM kernel configuration, then warm every path.
 
-    Configurations go up to the budget; the warm pass runs forward
-    passes over every attention-path shape.
-
-    Runs once per (software stack, GPU, model, budget). Uses vLLM's
-    config heuristic generator to enumerate every token count at
-    which the chosen GEMM configuration changes.
+    Uses vLLM's warmup heuristic to list every token count up to the
+    budget at which the chosen GEMM configuration changes. A pipeline
+    without gemm_warmup skips the GEMM sweep. Runs once per (software
+    stack, GPU, model, budget).
     """
     if not pipeline.gemm_warmup:
         _forward_warm(torch, arena, pipeline, async_ans, budget,
@@ -266,7 +261,8 @@ def warm_kernels(torch, arena, pipeline, async_ans, budget, *,
             warmed too.
 
     Returns:
-        A dict with the selected tier and elapsed warmup seconds.
+        A dict with tier ("compile" or "touch"), warm_s (warmup
+        seconds), and wait_s (seconds spent waiting for the lock).
     """
     import fcntl
     import json

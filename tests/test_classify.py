@@ -54,7 +54,7 @@ from quail_b.prompts import AGENT_PROGRESS, AGENT_PROGRESS_DESCRIPTIONS
 from quail_b.prompts import AGENT_PROGRESS_LABELS as STAGES
 from quail_b.queries import get_query
 
-# refund request, refund status, shipping, one token per word
+# one token per word: refund=1, request=2, status=3, shipping=4
 LABELS = ("refund request", "refund status", "shipping")
 IDS = ((1, 2), (1, 3), (4,))
 
@@ -244,10 +244,10 @@ def test_classifier_decodes_one_token_per_round(monkeypatch):
     # each document reserves its prefix, the two-token frame, and one
     # kept token per round: the cue and the first label token
     assert reserved == {0: 3 + 2 + 2, 1: 2 + 2 + 2, 2: 2 + 2 + 2}
-    # round 0 packs the frame and cue after each document (3 tokens for
-    # document 0, 2 for the others) and keeps all three in KV; document
-    # 1 decoded its one-token label there. Round 1 feeds only token 1,
-    # after the kept frame and cue, and keeps it
+    # round 0 packs the frame and cue after each document's prefix (3
+    # tokens for document 0, 2 for the others) and keeps all three in KV;
+    # document 1 decodes its one-token label there. Round 1 feeds only
+    # token 1, after the kept frame and cue, and keeps it
     assert sorted(packed) == sorted([
         (0, [91, 92, 93], 3, 3), (1, [91, 92, 93], 2, 3),
         (2, [91, 92, 93], 2, 3), (0, [1], 3 + 3, 1), (2, [1], 2 + 3, 1)])
@@ -289,7 +289,6 @@ class _Labels:
         values = np.asarray([
             spec.labels[0] if spec.name == "kind" else self.labels[row[0]]
             for row in rows], dtype=object)
-        # 0.8 on the label given, 0.1 on each other
         probabilities = np.asarray([
             [np.nan] * len(spec.labels) if value is None
             else [0.8 if label == value else 0.1 for label in spec.labels]
@@ -486,8 +485,7 @@ def test_rules_place_and_score_classifications(session, tmp_path):
                if isinstance(node, AiClassify))
     assert plan.settings["classify_placement"] == "before joins"
 
-    # sixty long reviews and three aspects; the values are the ones the
-    # planner chose before the rules were named
+    # sixty long reviews and three aspects
     _corpus(session, tmp_path, "reviews", "body", 60, 120)
     _corpus(session, tmp_path, "aspects", "aspect", 3, 4)
     labels = [f"label number {i}" for i in range(12)]
@@ -727,7 +725,6 @@ def test_classify_refusals_and_builder_errors(session):
         "Scan", "AiFilter", "AiClassify", "Project"]
     assert not isinstance(query.plan(), Refusal)
 
-    # The planner chooses a supported scoring method automatically.
     plan = query.plan()
     (classify,) = [n for n in plan.nodes if isinstance(n, AiClassify)]
     assert classify.spec.scoring in ("letters", "trie_tree", "trie_decode")
@@ -738,7 +735,7 @@ def test_classify_refusals_and_builder_errors(session):
     assert not isinstance(_topic(big).plan(), Refusal)
     big.close()
 
-    # stock vLLM classifies too, with one request per label-trie node
+    # stock vLLM classifies too, with one decode request per document
     vllm = quail.Session(EngineConfig(model="qwen3-4b-fp8", device="h100-sxm",
                                       backend="stock_vllm"), tokenizer=_bytes)
     vllm.register("documents", session.catalog.get("documents"))
@@ -878,7 +875,7 @@ def test_pack_chunk_packs_chains_as_segments_reading_ancestors(monkeypatch):
     group = dict(key=key, prefix=None, f=4, suffixes=[[93, 1, 2, 5, 7]],
                  read_all_rows=True, chains=chains)
     chunk = chunk_mod.pack_chunk(torch, arena, [group], attention_mode="tree")
-    # rows: cue, (1,), (1,2) | (1,5) | (6,): positions past the frame
+    # rows: cue, (1,), (1,2) | (1,5) | (7,): positions past the frame
     assert chunk.positions.tolist() == [4, 5, 6, 6, 5]
     assert chunk.meta["cu_a"].tolist() == [0, 3, 4, 5]
     reads = chunk.meta["reads"]
@@ -1048,7 +1045,7 @@ def test_sql_category_forms_options_and_label_tables(session):
 def test_explain_names_the_classification_rule_and_the_filter(session):
     text = _topic(session).explain()
     assert "AiClassify: topic over d" in text
-    # three short labels: the packed trie's 22 rows cost less than the
+    # three short labels: the packed trie's 19 rows cost less than the
     # lettered prompt's longer frame
     assert "rule=trie_tree, labels=3" in text
     assert "Filter: topic IN ['refund', 'shipping']" in text
@@ -1059,8 +1056,8 @@ def test_choice_letters_are_one_token_each_and_capped():
 
     assert choice_letters(30) == tuple("ABCDEFGHIJKLMNOPQRSTUVWXYZabcd")
     assert choice_letters(60)[52:56] == ("AA", "AB", "AC", "AD")
-    # a two-letter answer is three bytes, so the byte tokenizer
-    # runs out after the single letters
+    # every single letter maps to one shared id, and a two-letter
+    # answer is three bytes
     same = lambda text: [1] if len(text) == 2 else _bytes(text)  # noqa: E731
     assert choice_letters(60, same) == ("A",)    # one token id for all
     assert len(choice_letters(60, letter_tokens)) == 60

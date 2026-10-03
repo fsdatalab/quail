@@ -390,9 +390,9 @@ class _LabelClient(_Client):
         return outputs
 
 
-def test_request_backends_classify_with_one_request_per_trie_node():
-    # labels a = [60, 62], b = [61, 62], c = [60, 63]: the trie has the
-    # root, [60], and [61]; label a wins at document 0 and b at 1
+def test_request_backends_classify_with_one_decode_request_per_document():
+    # labels of at most two tokens, so each document's request decodes
+    # up to three; document 0 decodes a and document 1 decodes B
     spec = RequestClassifySpec(
         alias="d", output="kind", tail_token_ids=(90,),
         labels=("a", "b", "c"), label_token_ids=((60, 62), (61, 62), (60, 63)),

@@ -1,4 +1,4 @@
-"""Tests for JoinAdmission and gate/assemble against brute force."""
+"""Tests for JoinAdmission and filter runs over a prefix tree."""
 
 import random
 
@@ -186,7 +186,7 @@ def _tree_filter(monkeypatch, *, truth, budget, retain=(), limit=None,
                  docs=None, tree=None):
     """Run a one-question filter over three documents.
 
-    Document 1 shares 32 tokens with document 0.
+    By default, document 1 shares its first 32 tokens with document 0.
     """
     from types import SimpleNamespace
 
@@ -325,7 +325,7 @@ def test_filter_borrows_from_parents_and_stacks_siblings(monkeypatch):
 
 def test_join_admission_limit_ends_the_run_and_drains_the_queue():
     # three anchors of one suffix each, a limit of one survivor: the
-    # first finishes, the others still queued drain and never run
+    # first finishes, and the others already launched drain
     sched = JoinAdmission([50, 50, 50], [[10]], 250, arena_pages=100,
                           page_tokens=16, limit=1)
     groups = sched.next_chunk(100)

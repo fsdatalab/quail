@@ -1,14 +1,12 @@
-"""Price a logical plan as Quail would run it.
+"""Price a logical plan by the estimated seconds of its physical plan.
 
-A cost-based logical rule compares candidate plans by the estimated
-seconds of the physical plan each would get: the filter_order and
-join_order rules decide the candidate's filter orders, stage order,
-and anchors, build_physical_plan builds the physical plan, and the
-label_scoring rule picks each classification's scoring rule so its
-seconds are counted. The plans are memoized on the logical planning
-context by the candidate's root with those decisions cleared, so two
-rules pricing the same candidate, or one rule pricing it on a later
-pass, build it once.
+Cost-based logical rules compare candidate plans with these functions.
+The filter_order and join_order rules decide each candidate's filter
+orders, stage order, and anchors. build_physical_plan builds the
+physical plan, and the label_scoring rule picks each classification's
+scoring rule so its seconds are counted. Plans are memoized on the
+logical planning context, keyed by the candidate's root with those
+decisions cleared, so each candidate is built once per query.
 """
 
 from __future__ import annotations

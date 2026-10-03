@@ -87,14 +87,13 @@ class ClassifyPart:
             self.plan.labels[self._position[document]]
 
     def finish(self, every) -> int:
-        """Finalize labels and count the frame and suffix tokens processed.
+        """Finalize labels, set reached and suffix_tokens, and count tokens.
 
         Args:
             every: Per-stage answer mappings for this classification.
 
         Returns:
-            Total streamed tokens, including the classification frame. Stores
-            suffix token counts separately for reporting.
+            Total streamed tokens, including the classification frame.
         """
         self.reached = len(every[0]) if every else 0
         self.suffix_tokens, streamed = self.plan.finish(every)

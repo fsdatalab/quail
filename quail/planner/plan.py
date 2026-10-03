@@ -226,11 +226,10 @@ class PhysicalPlan:
         )
 
 def _rederive_kv(nodes: tuple) -> tuple:
-    """Re-derive keep_kv and arena_writes from the shape after an edit.
+    """Set keep_kv and arena_writes on each filter whose alias anchors a join.
 
-    A filter chain whose pipeline no longer reaches the join anchored
-    on its alias (a Barrier was put between them) retains its
-    survivors for that join instead.
+    A filter whose pipeline does not end at that join, for example
+    because a Barrier sits between them, keeps its survivors' KV for it.
     """
     graph = PhysicalGraph(nodes, PortRef(nodes[-1].node_id,
                                          nodes[-1].outputs[0].name))
@@ -273,12 +272,10 @@ class EngineConfig:
     # off by default so a run never pays for a measurement it does not read
     gpu_timing: bool = False
     # the most noise draws a diffusion model averages per AI.CLASSIFY
-    # letters read and per one-table AI.SCORE: an answer whose first
-    # draw is uncertain takes the rest, as vLLM PR 57250's structured
-    # server does by default. 1 reads one draw; an autoregressive
-    # model reads one answer whatever this says
+    # letters read and per one-table AI.SCORE; an answer whose first
+    # draw is uncertain takes the rest. An autoregressive model reads
+    # one answer whatever this says
     canvas_draws: int = 4
-    # force one attention path, "tree" or "unified", for every filter
-    # and join, so an ablation can run each path; None lets the
-    # planner choose per node
+    # one attention path, "tree" or "unified", forced for every filter
+    # and join; None lets the planner choose per node
     attention: str | None = None
