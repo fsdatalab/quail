@@ -275,12 +275,10 @@ def reference_side(quail_out: dict) -> dict:
 @app.local_entrypoint()
 def main(quail_call: str = ""):
     """Run both sides; --quail-call fc-... reuses a finished Quail side."""
-    if quail_call:
-        call = modal.FunctionCall.from_id(quail_call)
-    else:
-        call = quail_side.spawn(time.strftime("%Y%m%d-%H%M%S"))
-    print(f"quail_side function call id: {call.object_id}", flush=True)
-    quail_out = call.get()
+    if not quail_call:
+        quail_call = quail_side.spawn(time.strftime("%Y%m%d-%H%M%S")).object_id
+    print(f"quail_side function call id: {quail_call}", flush=True)
+    quail_out = modal.FunctionCall.from_id(quail_call).get()
     for r in quail_out["filter_runs"]:
         rep = r["report"]
         print(f"filter: {r['seconds']:.2f} s client, wall_s={rep.get('wall_s')}, "
